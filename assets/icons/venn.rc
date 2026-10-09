@@ -1,0 +1,9 @@
+/* venn engine window / taskbar icon (Windows resource).
+ *
+ * Compiled into both Editor.exe and Sandbox.exe with windres. This is what
+ * Explorer shows for the .exe, and what the taskbar falls back to before the
+ * program has called glfwSetWindowIcon (see core/Window::setIconFromFile).
+ *
+ * Keep this file pure ASCII: windres is not told about any code page.
+ */
+1 ICON "venn.ico"

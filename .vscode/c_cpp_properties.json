@@ -1,0 +1,44 @@
+{
+    "version": 4,
+    "configurations": [
+        {
+            "name": "MinGW-GCC-x64",
+            "includePath": [
+                "${workspaceFolder}/engine",
+                "${workspaceFolder}/editor",
+                "${workspaceFolder}/assets",
+
+                "${workspaceFolder}/third_party/glfw/include",
+                "${workspaceFolder}/third_party/glm",
+                "${workspaceFolder}/third_party/stb",
+                "${workspaceFolder}/third_party/tinyobjloader",
+                "${workspaceFolder}/third_party/tinygltf",
+                "${workspaceFolder}/third_party/imgui",
+                "${workspaceFolder}/third_party/imgui/backends",
+                "${workspaceFolder}/third_party/VulkanMemoryAllocator/include",
+
+                "E:/code/vulkan/core/Include"
+            ],
+            "defines": [
+                "VK_USE_PLATFORM_WIN32_KHR",
+                "GLFW_INCLUDE_NONE",
+                "UNICODE",
+                "_UNICODE"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "compilerPath": "C:/msys64/ucrt64/bin/g++.exe",
+            "intelliSenseMode": "windows-gcc-x64",
+            "compileCommands": "${workspaceFolder}/compile_commands.json",
+            "browse": {
+                "path": [
+                    "${workspaceFolder}/engine",
+                    "${workspaceFolder}/editor",
+                    "${workspaceFolder}/third_party",
+                    "E:/code/vulkan/core/Include"
+                ],
+                "limitSymbolsToIncludedHeaders": true
+            }
+        }
+    ]
+}

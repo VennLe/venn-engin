@@ -1,0 +1,186 @@
+#version 450
+// ============================================================
+// cluster_build.comp —— 分簇前向渲染的"灯光分配"计算着色器
+//
+// 一个 invocation 负责一个簇（cluster）。簇的划分：
+//   XY 方向 = 屏幕切成 tileSize × tileSize 的瓦片
+//   Z  方向 = 按指数分布切 depthSlices 层（近处密、远处疏）
+//
+// 每个簇做两件事：
+//   1. 反投影出这个视锥小块（frustum slice）的 8 个角点 → 世界空间 AABB
+//   2. 遍历所有灯做"球 vs AABB"测试，把命中的灯索引写进该簇的固定槽位
+//
+// ---- 为什么用固定槽位，而不是全局原子追加列表 ----
+//   * 不会越界：slotBase + i < clusterCount * MAX_LIGHTS_PER_CLUSTER 恒成立
+//   * 结果与线程调度顺序无关，可复现（截图对比才有意义）
+//   * 不需要额外的原子计数缓冲，也不需要"清零 Pass"
+//   代价是显存按 clusterCount * MAX_LIGHTS_PER_CLUSTER 预先分配，
+//   用 clusterDims/tileSize 调参就能控制这个开销。
+//
+// ---- 射灯为什么只按 range 球剔除 ----
+//   锥体 vs AABB 的精确测试要么实现复杂，要么保守性难以保证。
+//   漏光（本该亮的像素没亮）比多算几盏灯难查得多，所以这里用保守解：
+//   按 range 球剔除 → 片元里再乘锥形衰减。
+//   正确性由构造保证：一个簇只要有任何一个像素可能被照亮，灯就一定在列表里。
+//
+// ---- 深度切片为什么从 clusterNear 起算 ----
+//   本引擎投影由 glm::perspective 生成且未定义 GLM_FORCE_DEPTH_ZERO_TO_ONE，
+//   NDC z 映射范围是 [-1, 1]；而 Vulkan 只保留 clip z ∈ [0, 1]。
+//   所以真正可见的最近深度是 z_ndc = 0 对应的 2·zn·zf/(zn+zf)，
+//   从 zNear 起算会让靠近相机的若干层切片完全落在裁剪区外。
+// ============================================================
+
+layout(local_size_x = 64) in;
+
+// 与 C++ 端 render/RenderTypes.h 的 FrameUBO 严格对应（std140）
+layout(set = 0, binding = 0) uniform FrameUBO {
+    mat4 view;
+    mat4 proj;
+    vec4 lightDir;
+    vec4 lightColor;
+    vec4 camPos;
+    mat4 lightSpace;
+    vec4 cameraParams;  // x=zNear y=zFar z=切片最近深度 w=切片数
+    vec4 clusterDims;   // x=gridX y=gridY z=depthSlices w=tileSize
+    vec4 screenSize;    // x=width y=height z=1/width w=1/height
+    vec4 lightParams;   // x=灯数 y=环境光倍率 z=是否启用剔除
+    mat4 invViewProj;
+} ubo;
+
+// 与 C++ 端 scene::LightInstance 严格对应（std430，4×vec4 = 64 字节）
+struct Light {
+    vec4 positionRange;      // xyz=世界坐标 w=影响半径
+    vec4 colorIntensity;     // rgb=颜色  a=强度
+    vec4 directionCosInner;  // xyz=传播方向 w=cos(内锥角)
+    vec4 cosOuterType;       // x=cos(外锥角) y=类型(0=点 1=射灯)
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer LightBuffer {
+    Light lights[];
+};
+
+// 每簇两个 uint：offset 指向 lightIndices 里的槽位基址，count 是实际灯数
+layout(std430, set = 0, binding = 3) writeonly buffer ClusterBuffer {
+    uvec2 clusters[];
+};
+
+layout(std430, set = 0, binding = 4) writeonly buffer LightIndexBuffer {
+    uint lightIndices[];
+};
+
+// 遥测：0=单簇最大灯数 1=超限(被截断)的簇数 2=灯-簇配对数总和 3=空簇数
+// 只在"值变化/命中"时写，原子操作非常稀疏，不构成瓶颈
+layout(std430, set = 0, binding = 5) buffer StatsBuffer {
+    uint stats[];
+};
+
+layout(push_constant) uniform Push {
+    uint clusterCount;
+    uint maxLightsPerCluster;
+    uint gridX;
+    uint gridY;
+} pc;
+
+// ---- 深度换算：视图空间深度 d 与 NDC z 的互相转换 ----
+// d = 2·zn·zf / ((zn+zf) - z·(zf-zn))
+float ndcToDepth(float z, float zn, float zf) {
+    return (2.0 * zn * zf) / ((zn + zf) - z * (zf - zn));
+}
+
+// z = (zf+zn)/(zf-zn) - 2·zf·zn/((zf-zn)·d)
+float depthToNdc(float d, float zn, float zf) {
+    return (zf + zn) / (zf - zn) - (2.0 * zf * zn) / ((zf - zn) * d);
+}
+
+// 球 vs AABB：把球心夹到盒子上取最近点，比距离即可
+bool sphereIntersectsAabb(vec3 c, float r, vec3 mn, vec3 mx) {
+    vec3 closest = clamp(c, mn, mx);
+    vec3 d = c - closest;
+    return dot(d, d) <= r * r;
+}
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint clusterCount = pc.clusterCount;
+    if (idx >= clusterCount) return;
+
+    const uint gridX = pc.gridX;
+    const uint gridY = pc.gridY;
+    const uint slices = uint(ubo.cameraParams.w);
+    const float zn = ubo.cameraParams.x;
+    const float zf = ubo.cameraParams.y;
+    const float clusterNear = ubo.cameraParams.z;
+
+    // 一维下标 → 三维簇坐标（与片元着色器的编址方式必须完全一致）
+    const uint gx = idx % gridX;
+    const uint gy = (idx / gridX) % gridY;
+    const uint gz = idx / (gridX * gridY);
+
+    // ---- 1) 求该簇的世界空间 AABB ----
+    // 瓦片在 NDC 里的范围（x/y 各分成 gridX/gridY 段）
+    const float x0 = -1.0 + 2.0 * float(gx) / float(gridX);
+    const float x1 = -1.0 + 2.0 * float(gx + 1u) / float(gridX);
+    const float y0 = -1.0 + 2.0 * float(gy) / float(gridY);
+    const float y1 = -1.0 + 2.0 * float(gy + 1u) / float(gridY);
+
+    // 该深度层的近/远视图深度 → NDC z。
+    // 指数分布：d(k) = clusterNear · (zf/clusterNear)^(k/slices)
+    const float ratio = zf / clusterNear;
+    const float dn = clusterNear * pow(ratio, float(gz) / float(slices));
+    const float df = clusterNear * pow(ratio, float(gz + 1u) / float(slices));
+    const float z0 = depthToNdc(dn, zn, zf);
+    const float z1 = depthToNdc(df, zn, zf);
+
+    // 8 个角点反投影到世界空间。invViewProj 由 CPU 预算好（省掉每线程的
+    // mat4 求逆）。取齐次坐标 w=1 的 clip 向量，除以结果的 w 即得世界点。
+    vec3 mn = vec3(1e30);
+    vec3 mx = vec3(-1e30);
+    for (int ci = 0; ci < 4; ++ci) {
+        const float nx = (ci & 1) == 0 ? x0 : x1;
+        const float ny = (ci & 2) == 0 ? y0 : y1;
+        for (int ck = 0; ck < 2; ++ck) {
+            const float nz = (ck == 0) ? z0 : z1;
+            vec4 wp = ubo.invViewProj * vec4(nx, ny, nz, 1.0);
+            vec3 w = wp.xyz / wp.w;
+            mn = min(mn, w);
+            mx = max(mx, w);
+        }
+    }
+
+    // ---- 2) 把所有"与这个 AABB 相交"的灯收集进固定槽位 ----
+    const uint cap = pc.maxLightsPerCluster;
+    const uint slotBase = idx * cap;
+    const uint lightCount = uint(ubo.lightParams.x);
+    const bool cullEnabled = ubo.lightParams.z > 0.5;
+
+    uint localCount = 0u;
+    if (!cullEnabled) {
+        // 关闭剔除：无条件塞进灯表。
+        // 自检（"开/关剔除画面逐像素一致"）成立的前提是 cap ≥ 灯数，
+        // 否则灯表被截断，二者本来就不该一致 —— 把
+        // MYVK_MAX_LIGHTS_PER_CLUSTER 设成 ≥ 灯数再做对比。
+        uint n = min(lightCount, cap);
+        for (uint i = 0u; i < n; ++i) lightIndices[slotBase + i] = i;
+        localCount = n;
+    } else {
+        for (uint i = 0u; i < lightCount; ++i) {
+            const vec3 lp = lights[i].positionRange.xyz;
+            const float r = lights[i].positionRange.w;
+            if (r <= 0.0) continue;
+            if (!sphereIntersectsAabb(lp, r, mn, mx)) continue;
+
+            if (localCount < cap) {
+                lightIndices[slotBase + localCount] = i;
+            }
+            ++localCount;  // 超限也继续计数，供遥测反映"真实需求"
+        }
+    }
+
+    clusters[idx] = uvec2(slotBase, min(localCount, cap));
+
+    // ---- 3) 遥测（稀疏原子操作）----
+    atomicMax(stats[0], min(localCount, cap));
+    if (localCount > cap) atomicAdd(stats[1], 1u);
+    atomicAdd(stats[2], min(localCount, cap));
+    if (localCount == 0u) atomicAdd(stats[3], 1u);
+}

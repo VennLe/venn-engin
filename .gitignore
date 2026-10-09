@@ -1,0 +1,42 @@
+# 构建产物
+build/
+build-*/
+out/
+bin/
+dist/                  # make package 产出的发布包
+
+# 编译中间物
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.spv
+
+# 着色器编译输出（保留源码，spv 由构建生成）
+assets/shaders/*.spv
+
+# IDE
+.vs/
+.idea/
+*.user
+# .vscode：忽略临时文件，但保留 IntelliSense / CMake 配置（对项目可复现性至关重要）
+.vscode/*
+!.vscode/c_cpp_properties.json
+!.vscode/settings.json
+!.vscode/extensions.json
+CMakeUserPresets.json
+compile_commands.json
+.cache/
+
+# 运行时写出的界面状态（ImGui 窗口布局，路径跟着进程的工作目录走）
+imgui.ini
+
+# 截图工具（tools/capture_window.py）的默认输出落在仓库根目录。
+# 只忽略根目录的 png，assets/ 下的贴图不受影响。
+/*.png
+
+# 系统杂项
+.DS_Store
+Thumbs.db
+_*.txt

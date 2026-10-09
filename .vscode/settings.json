@@ -1,0 +1,37 @@
+{
+    // ---- C/C++ IntelliSense ----
+    "C_Cpp.default.cppStandard": "c++17",
+    "C_Cpp.default.cStandard": "c17",
+    "C_Cpp.default.intelliSenseMode": "windows-gcc-x64",
+    "C_Cpp.default.compilerPath": "C:/msys64/ucrt64/bin/g++.exe",
+
+    // ---- CMake Tools ----
+    // 固化 configure 参数：MinGW 编译器 + CMake 4.x 编 GLFW 3.4 所需的 policy 兼容开关
+    "cmake.generator": "Ninja",
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "cmake.configureArgs": [
+        "-DCMAKE_C_COMPILER=C:/msys64/ucrt64/bin/gcc.exe",
+        "-DCMAKE_CXX_COMPILER=C:/msys64/ucrt64/bin/g++.exe",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+    ],
+    "cmake.configureSettings": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+    },
+    "cmake.copyCompileCommands": "${workspaceFolder}/compile_commands.json",
+
+    // ---- 文件关联 / 杂项 ----
+    "files.associations": {
+        "*.vert": "glsl",
+        "*.frag": "glsl",
+        "*.comp": "glsl",
+        "*.glsl": "glsl"
+    },
+    "files.exclude": {
+        "**/build": true
+    },
+    "search.exclude": {
+        "**/build": true,
+        "**/third_party": true
+    }
+}
