@@ -210,6 +210,11 @@ PickResult PickingSystem::pick(scene::Scene& scene, const Ray& ray) {
 
     scene.forEachRenderable([&](ecs::Entity e, ecs::MeshComponent&,
                                 ecs::MaterialComponent&) {
+        // 上锁的实体（自带地面）不参与点选：它是参照物，不该被选中 / 变换。
+        // 跳过而不是"排在最后"—— 否则点在空地上也会选中地面，右键视角
+        // 一转就发现选中变了，很烦躁。
+        if (scene.world().has<ecs::LockedComponent>(e)) return;
+
         const Aabb b = worldAabb(scene, e);
         if (!b.valid) return;
 

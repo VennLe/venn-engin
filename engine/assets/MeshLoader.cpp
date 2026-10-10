@@ -435,6 +435,14 @@ std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
     auto model = std::make_unique<Model>();
     model->name = name;
 
+    // glTF 规范是 **Y-up**；引擎世界是 **Z-up** 右手系。
+    // 在节点树根部预乘一个"绕 X +90°"的旋转：(x,y,z) → (x,-z,y)，
+    // glTF 的 +Y(up)/+Z(forward) 就变成引擎的 +Z(up)/-Y(forward)。
+    // 旋转保持手性，法线与绕序无需特殊处理；子节点的局部 TRS 也随之
+    // 一并转换（decompose 出来的还是正确的 Z-up 姿态）。
+    const glm::mat4 kYupToZup =
+        glm::rotate(glm::mat4(1.0f), 1.57079637f, glm::vec3(1, 0, 0));
+
     glm::vec3 bmin(1e30f), bmax(-1e30f);
 
     std::function<void(int, const glm::mat4&, int)> walk =
@@ -570,10 +578,10 @@ std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
     if (gm.defaultScene >= 0 &&
         gm.defaultScene < static_cast<int>(gm.scenes.size())) {
         for (int n : gm.scenes[gm.defaultScene].nodes)
-            walk(n, glm::mat4(1.0f), 0);
+            walk(n, kYupToZup, 0);
     } else {
         for (size_t n = 0; n < gm.nodes.size(); ++n)
-            walk(static_cast<int>(n), glm::mat4(1.0f), 0);
+            walk(static_cast<int>(n), kYupToZup, 0);
     }
 
     if (bmin.x <= bmax.x) {

@@ -1,9 +1,49 @@
 /* venn engine window / taskbar icon (Windows resource).
  *
- * Compiled into both Editor.exe and Sandbox.exe with windres. This is what
- * Explorer shows for the .exe, and what the taskbar falls back to before the
- * program has called glfwSetWindowIcon (see core/Window::setIconFromFile).
+ * Compiled into Editor.exe with windres. Two jobs:
+ *
+ *   1. RT_GROUP_ICON #1 -> the icon Explorer shows for the .exe, AND the
+ *      source core/Window::applyIconFromResource() pulls multi-size HICONs
+ *      from at startup (SM_CXICON for ICON_BIG, SM_CXSMICON for ICON_SMALL).
+ *      Keeping all 7 frames matters: the 16x16 title-bar icon comes straight
+ *      from here instead of being a shrunk 512x512.
+ *
+ *   2. VERSIONINFO -> Explorer's Details tab, and it gives the shell a
+ *      version to compare against when deciding whether its icon cache is
+ *      stale (a bare icon change with no version bump can keep showing the
+ *      old icon until the cache is rebuilt).
  *
  * Keep this file pure ASCII: windres is not told about any code page.
  */
+
 1 ICON "venn.ico"
+
+1 VERSIONINFO
+FILEVERSION    0,2,0,0
+PRODUCTVERSION 0,2,0,0
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         0x40004L
+FILETYPE       0x1L
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "venn"
+            VALUE "FileDescription",  "venn engine editor"
+            VALUE "FileVersion",      "0.2.0.0"
+            VALUE "InternalName",     "Editor"
+            VALUE "LegalCopyright",   "MIT"
+            VALUE "OriginalFilename", "Editor.exe"
+            VALUE "ProductName",      "venn"
+            VALUE "ProductVersion",   "0.2.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+

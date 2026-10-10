@@ -32,6 +32,13 @@ namespace scene {
 
 class Camera {
 public:
+    // 俯仰上限（弧度）。**不能取到正负 90°**：viewMatrix() 用 up = (0,0,1)
+    // （Z 朝上的右手系），视线一旦和 worldUp 平行，glm::lookAt 的基就退化了
+    // （画面翻转 / 抖动，rightAxis() 也会掉进它自己的兜底分支）。
+    // 留 1° 余量 = 89°，肉眼就是"正俯视"，数值上仍然稳。
+    // 导航球（Navigation Gizmo）点 Top / Bottom 用的就是这个值。
+    static constexpr float kPitchLimit = 1.5533f;  // 89°
+
     Camera();
 
     // 处理输入（每帧调用；内部读取 core::Input 静态状态）
@@ -59,7 +66,7 @@ public:
     // 目标打转 —— 那是"环绕观察"，不是"转头"。
     void look(float dYawRad, float dPitchRad);
 
-    // 沿相机本地轴平移：x = 右, y = 世界上方, z = 视线前方（单位：米）
+    // 沿相机本地轴平移：x = 右, y = 世界 up（+Z）, z = 视线前方（单位：米）
     void moveLocal(const glm::vec3& delta);
 
     glm::vec3 forwardAxis() const;  // 视线方向（单位向量）
@@ -79,6 +86,21 @@ public:
     // 某物体"（Focus）在飞行模式下就会看着像没反应。实现里两种模式都照顾到。
     void setTarget(const glm::vec3& t);
     void setDistance(float d);
+
+    // 直接设定相机位置（朝向不变）。
+    // 飞行模式（Play 态的游戏视角）就是改 m_flyPos；轨道模式下没有独立的
+    // 位置，等价动作是把 m_target 平移同样的位移 —— 两种模式下"相机去哪"
+    // 的语义一致。
+    //
+    // 调用方：运行态碰撞求解（相机不穿墙，见 physics::resolveCamera）。
+    void setPosition(const glm::vec3& p) {
+        if (m_fly) {
+            m_flyPos = p;
+            syncFlyTarget();
+        } else {
+            m_target += (p - position());
+        }
+    }
     void setFov(float fov) { m_fovY = glm::clamp(fov, 10.0f, 120.0f); }
     // 改朝向的两个 setter 同样要照顾飞行模式：位置不动、目标点跟着转，
     // 否则 Inspector 面板里的 Yaw / Pitch 滑块会"能拖，但画面没反应"。
@@ -87,7 +109,7 @@ public:
         if (m_fly) syncFlyTarget();
     }
     void setPitch(float p) {
-        m_pitch = glm::clamp(p, -1.52f, 1.52f);
+        m_pitch = glm::clamp(p, -kPitchLimit, kPitchLimit);
         if (m_fly) syncFlyTarget();
     }
     float fov() const { return m_fovY; }
@@ -100,8 +122,8 @@ private:
     // 把 m_target 重新摆到"相机正前方 distance 米"处（飞行模式下位置/朝向一变就调）
     void syncFlyTarget();
 
-    glm::vec3 m_target{0.0f, 0.5f, 0.0f};
-    float m_yaw = -0.8f;    // 水平角（弧度）
+    glm::vec3 m_target{0.0f, 0.0f, 0.5f};
+    float m_yaw = -0.8f;    // 水平角（弧度，绕世界 +Z）
     float m_pitch = 0.45f;  // 俯仰角（弧度），正 = 相机在上方俯视
     float m_distance = 7.0f;
     float m_fovY = 45.0f;

@@ -110,8 +110,15 @@ void EditorContext::play() {
     m_playTime = 0.0f;
     m_play = PlayState::Playing;
 
+    // 动画与 Run 互斥：进 Run 时丢掉动画快照（当前（可能已被动画改过）的
+    // 编辑场景就是要被复制的那一份，无需恢复）
+    m_anim = AnimState::Stopped;
+    m_animTime = 0.0f;
+    m_animSnapshot.clear();
+
     // 运行态的实体句柄与编辑态不同，选择先放下（名字留着，Stop 时接回来）
     m_selection = ecs::Entity{};
+    m_colliderEdit = false;  // 运行态不该带着"在编辑碰撞体"的状态回来
 
     VK_LOG_INFO("Editor: PLAY in viewport (runtime scene = %zu entities, "
                 "editor untouched)",
@@ -149,11 +156,84 @@ void EditorContext::togglePlayPause() {
     }
 }
 
+// ---------------------------------------------------------------- 动画控制
+//
+// 编辑态脚本当成动画用：Play 直接在编辑场景上跑脚本，Stop 用 JSON 快照
+// 把场景恢复成按下 Play 时的样子。与 Run（运行态副本）互斥 —— 游戏跑着
+// 的时候动画按钮是禁用的（播放条上做了 BeginDisabled，这里再挡一层）。
+
+void EditorContext::animPlay() {
+    if (!isEditing()) {
+        setStatus("Animation unavailable while Run is active");
+        return;
+    }
+    if (m_anim == AnimState::Playing) return;
+
+    if (m_anim == AnimState::Paused) {
+        m_anim = AnimState::Playing;
+        setStatus("Animation resumed");
+        return;
+    }
+
+    // Stopped → Playing：先拍快照（Stop 时恢复）
+    const scene::SceneIoResult saved = scene::sceneToJson(m_editorScene, m_animSnapshot);
+    if (!saved.ok) {
+        VK_LOG_ERROR("Anim play failed: cannot snapshot scene: %s",
+                     saved.error.c_str());
+        setStatus("Anim failed: " + saved.error);
+        return;
+    }
+
+    m_animTime = 0.0f;
+    m_anim = AnimState::Playing;
+    VK_LOG_INFO("Editor: ANIM play (editing the live scene; Stop restores "
+                "the snapshot)");
+    setStatus("Animation playing");
+}
+
+void EditorContext::animPause() {
+    if (m_anim != AnimState::Playing) return;
+    m_anim = AnimState::Paused;
+    setStatus("Animation paused");
+}
+
+void EditorContext::animStop() {
+    if (m_anim == AnimState::Stopped) return;
+
+    m_anim = AnimState::Stopped;
+    m_animTime = 0.0f;
+
+    // 脚本可能改过任何东西（实体/组件/变换），用快照整体恢复编辑场景。
+    if (!m_animSnapshot.empty()) {
+        const scene::SceneIoResult loaded =
+            scene::sceneFromJson(m_editorScene, m_assets, m_animSnapshot);
+        if (!loaded.ok) {
+            VK_LOG_ERROR("Anim stop: snapshot restore FAILED: %s",
+                         loaded.error.c_str());
+        }
+        m_animSnapshot.clear();
+    }
+
+    // 快照里带着相机 → 恢复后重设回编辑态相机模式；undo 历史里的实体
+    // 句柄已经不可信（场景被整体重建），一并清掉。
+    applyEditorCameraMode();
+    validateSelection();
+    m_commands.clear();
+    m_dirty = true;
+
+    VK_LOG_INFO("Editor: ANIM stop (scene restored from snapshot)");
+    setStatus("Animation stopped");
+}
+
 void EditorContext::onSceneReplaced() {
     // 换场景必然要先丢掉正在跑的运行态副本 —— 否则视口里还是**旧**场景的
     // 游戏画面，而编辑态已经是新的了，两边对不上。
     stop();
     m_playTime = 0.0f;
+    // 动画快照属于旧场景，一并作废
+    m_anim = AnimState::Stopped;
+    m_animTime = 0.0f;
+    m_animSnapshot.clear();
     clearSelection();
     m_commands.clear();
     m_dirty = false;
@@ -164,8 +244,20 @@ void EditorContext::onSceneReplaced() {
 // ---------------------------------------------------------------- 选择
 
 void EditorContext::select(ecs::Entity e) {
+    select(e, /*fromViewport=*/false);
+}
+
+void EditorContext::selectFromViewport(ecs::Entity e) {
+    select(e, /*fromViewport=*/true);
+}
+
+void EditorContext::select(ecs::Entity e, bool fromViewport) {
     if (e.valid() && !activeScene().world().alive(e)) e = ecs::Entity{};
     m_selection = e;
+    m_selectionFromViewport = fromViewport && e.valid();
+    // 换了选中项，"手柄是否作用在碰撞体上"必须复位 —— 否则新选中的物体
+    // 会莫名其妙地拖到旧物体的碰撞体上（或者干脆拖不动）。
+    m_colliderEdit = false;
     if (e.valid()) {
         if (const std::string* n = activeScene().world().name(e))
             m_selectionName = *n;
@@ -177,6 +269,8 @@ void EditorContext::select(ecs::Entity e) {
 void EditorContext::clearSelection() {
     m_selection = ecs::Entity{};
     m_selectionName.clear();
+    m_selectionFromViewport = false;
+    m_colliderEdit = false;
 }
 
 bool EditorContext::hasSelection() const {
@@ -195,6 +289,8 @@ void EditorContext::validateSelection() {
     // 句柄失效 —— 撤销删除 / Play / Stop 之后都会走到这里。
     // 名字是跨"场景重建"唯一稳定的标识，按它找回来。
     m_selection = ecs::Entity{};
+    // 新建出来的组件是全新的，手柄不能再指着一个"已经不存在的碰撞体"
+    m_colliderEdit = false;
     if (!m_selectionName.empty()) {
         const ecs::Entity found = sc.find(m_selectionName);
         if (found.valid()) m_selection = found;

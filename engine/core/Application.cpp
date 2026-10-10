@@ -31,9 +31,10 @@ assets::AssetManager& Application::assets() {
 int Application::run(uint64_t maxFrames) {
     VK_LOG_INFO("Application starting...");
 
-    // 窗口图标（venn 的豚鼠 logo）：标题栏 + 任务栏。
-    // 放在渲染器初始化之前 —— 它只碰 GLFW 窗口，和 Vulkan 无关，
-    // 早一点设上，启动过程中任务栏就已经是正确图标了。
+    // 窗口图标的**兜底**路径：Window 的构造函数已经试过用可执行文件里
+    // 内嵌的多尺寸 .ico 设过图标了（而且是在窗口显示之前，见 Window.cpp）。
+    // 只有那一步失败（RC 没编进去）时这里才会真正生效 —— 用单张 PNG 走
+    // glfwSetWindowIcon。已经设好的话这个调用会直接跳过并打一行 INFO。
     m_window->setIconFromFile(assets::resolveAssetPath("icons/venn_icon.png"));
 
     // 引擎初始化（Vulkan 资源）

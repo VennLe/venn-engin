@@ -64,13 +64,26 @@ public:
     GLFWwindow* handle() const { return m_window; }
 
     // ---------------------------------------------------------- 窗口图标
-    // 从 PNG 设置窗口图标（Windows 上同时作用于**标题栏左上角**和
-    // **任务栏**按钮）。读不到文件就只打一条 WARN，不影响启动。
     //
-    // 注意这不是唯一入口：可执行文件的资源里也内嵌了同一个 .ico
-    // （assets/icons/venn.rc），所以在程序还没跑到这里之前、
-    // 以及资源管理器里看到的也是正确的图标。
+    // 两条路，**优先走 exe 内嵌资源**：
+    //
+    //   1. 构造函数里（窗口还没显示之前）就调 applyIconFromResource()：
+    //      Windows 从可执行文件自己的 RT_GROUP_ICON #1 里按目标尺寸各取
+    //      一张 HICON（SM_CXICON 给 ICON_BIG、SM_CXSMICON 给 ICON_SMALL），
+    //      同时写 WM_SETICON 和窗口类图标（GCLP_HICON）。这是**唯一**
+    //      能让 16×16 标题栏图标清晰的做法 —— 让 Windows 用它自己的
+    //      ICO 多尺寸挑选逻辑，而不是把一张 512×512 硬缩下去。
+    //
+    //   2. setIconFromFile(png)：兜底。只有内嵌资源不可用时才生效
+    //      （比如 windres 没找到、RC 没编进去）。此时退回 GLFW 的
+    //      glfwSetWindowIcon，把 PNG 当单尺寸图用。
+    //
+    // 之所以要"窗口创建时就先设好图标"，见 Window.cpp 里构造函数那段的
+    // 注释：任务栏按钮是在窗口第一次显示时建的，那之后再改图标只是"补救"。
     void setIconFromFile(const std::string& pngPath);
+
+    // 图标是否已经由可执行文件的内嵌资源设好了
+    bool iconFromResource() const { return m_iconFromResource; }
 
     // Vulkan 表面（由 Renderer 在初始化时创建/销毁）
     VkSurfaceKHR createSurface(VkInstance instance) const;
@@ -80,12 +93,27 @@ private:
     static void windowIconifyCallback(GLFWwindow* w, int iconified);
     static void windowCloseCallback(GLFWwindow* w);
 
+    // 用可执行文件内嵌的 .ico 资源设图标。Windows 专用；其它平台直接
+    // 返回 false（交给 setIconFromFile 的 PNG 路径）。
+    bool applyIconFromResource();
+
+    // 进程级的任务栏身份（AppUserModelID）。必须在**任何窗口创建之前**
+    // 调用；Windows 专用。
+    void applyAppUserModelId();
+
     GLFWwindow* m_window = nullptr;
     std::string m_title;
     int m_width = 0;
     int m_height = 0;
     bool m_resized = false;
     bool m_shouldClose = false;
+    bool m_iconFromResource = false;
+
+    // 从资源里 LoadImageW 出来的 HICON：不带 LR_SHARED 的话由调用方负责
+    // 销毁，而窗口活着的全过程都要用它们，所以留到析构再 DestroyIcon。
+    // 声明成 void* 是为了不在这个头里拖进 <windows.h>。
+    void* m_hiconBig = nullptr;
+    void* m_hiconSmall = nullptr;
 
     // 全屏状态 + 进入全屏前的窗口几何（退出时恢复）
     bool m_fullscreen = false;

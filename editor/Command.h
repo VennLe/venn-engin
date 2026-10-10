@@ -35,7 +35,8 @@
 
 #include <glm/glm.hpp>
 
-#include "ecs/Entity.h"  // Entity 按值持有，需要完整类型
+#include "ecs/Entity.h"       // Entity 按值持有，需要完整类型
+#include "ecs/Components.h"  // PrimitiveEditCommand 按值持有 MeshComponent
 
 namespace assets {
 class AssetManager;
@@ -197,7 +198,62 @@ private:
     TransformSnapshot m_after;
 };
 
-// 结构性改动：整场景 JSON 快照
+// 碰撞体的 TRS 编辑（W/E/R 拖手柄、Inspector 里的数值框）。
+//
+// 为什么不复用 TransformEditCommand：它写的是实体的 TransformComponent，
+// 而碰撞体是自己的三个分量（CollisionComponent::position/rotation/scale）。
+// 三个分量的类型与语义完全一样，所以复用同一个快照结构体，只是落点不同。
+class ColliderEditCommand : public Command {
+public:
+    ColliderEditCommand(std::string name, scene::Scene* scene, ecs::Entity e,
+                        TransformSnapshot before, TransformSnapshot after)
+        : m_name(std::move(name)), m_scene(scene), m_entity(e),
+          m_before(before), m_after(after) {}
+
+    void undo() override;
+    void redo() override;
+    const char* name() const override { return m_name.c_str(); }
+
+private:
+    std::string m_name;
+    scene::Scene* m_scene = nullptr;
+    ecs::Entity m_entity{};
+    TransformSnapshot m_before;
+    TransformSnapshot m_after;
+};
+
+// ---------------------------------------------------------------- 图元生成参数
+//
+// 内置图元的半径 / 分段数这类参数，改一下就要**重建几何**，所以不能用
+// RawBytesEditCommand —— 那个只按字节回滚参数，回滚完 mesh 还停在
+// 新几何上，参数和几何就对不上了。
+//
+// 这条命令把两者一起回滚：整体把 MeshComponent 拷回去，再让
+// AssetManager 按缓存键重取一遍。因为 AssetManager 从不淘汰资源，
+// "回到旧参数"拿回来的就是当初那颗一模一样的 mesh（连指针都相同）。
+class PrimitiveEditCommand : public Command {
+public:
+    PrimitiveEditCommand(std::string name, ecs::MeshComponent* comp,
+                         assets::AssetManager* assets,
+                         ecs::MeshComponent before, ecs::MeshComponent after)
+        : m_name(std::move(name)), m_comp(comp), m_assets(assets),
+          m_before(std::move(before)), m_after(std::move(after)) {}
+
+    void undo() override;
+    void redo() override;
+    const char* name() const override { return m_name.c_str(); }
+
+private:
+    void apply(const ecs::MeshComponent& snap);
+
+    std::string m_name;
+    ecs::MeshComponent* m_comp = nullptr;
+    assets::AssetManager* m_assets = nullptr;
+    ecs::MeshComponent m_before;
+    ecs::MeshComponent m_after;
+};
+
+// ---------------------------------------------------------------- 场景快照
 //
 // 为什么不做"按名字恢复选择"：撤销删除之后，回滚出来的实体句柄是全新的，
 // 命令对象无从知道编辑器当前选中了什么。把这件事故意留给 EditorContext ——

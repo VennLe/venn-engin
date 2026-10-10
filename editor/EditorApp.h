@@ -77,10 +77,20 @@ private:
     // F11：只切窗口全屏（面板照旧），编辑态也能用
     void toggleWindowFullscreen();
     // 把编辑态场景引用到的脚本全部加载 + 编译一遍（只为在面板上暴露错误；
-    // 真正执行它们的地方在下面的 runRuntimeScripts）
+    // 真正执行它们的地方在下面的 runScriptsOn）
     void preloadScripts();
-    // 每帧在**运行态副本**上执行一遍脚本（只在 Play 态调用）
+    // 脚本执行内核：Run（运行态副本）与动画（编辑场景）共用
+    void runScriptsOn(scene::Scene& sc, double t, float dt,
+                      std::unordered_map<unsigned, std::string>& errors,
+                      const char* tag, uint64_t& summaryFrame);
+    // 每帧在**运行态副本**上执行一遍脚本（只在 Run 态调用）
     void runRuntimeScripts(float dt);
+    // 每帧在**运行态副本**上做碰撞求解（只在 Run 态、脚本之后调用）：
+    //   1) 带碰撞体的实体两两分离 —— "不能互相穿过"
+    //   2) 相机当成一个球推出碰撞体 —— "相机视角也不允许穿过"
+    void runCollision(float dt);
+    // 每帧在**编辑场景**上执行脚本（动画 Play 态调用；Pause 不调）
+    void runAnimScripts(float dt);
     // 游戏全屏：视口独占整窗，其余面板一律不画。返回是否处于该状态。
     bool drawFullscreenGame();
 
@@ -89,6 +99,9 @@ private:
     void drawEnginePanel();
     void drawStatusBar();
     void drawSettingsPanel();
+    // 视口正下方那一行播放条（Run = 运行游戏；Play/Pause/Stop = 动画）。
+    // 按钮在这一行的水平正中。
+    void drawTransportBar();
 
     std::unique_ptr<EditorContext> m_ctx;
     std::unique_ptr<Toolbar> m_toolbar;
@@ -108,8 +121,23 @@ private:
     uint64_t m_runtimeFrames = 0;
     // 脚本运行期错误去重：同一个实体同一条错误只打一次日志
     std::unordered_map<unsigned, std::string> m_scriptErrors;
+    // 动画（编辑场景脚本）的帧计数与错误表 —— 与运行态分开，互不干扰
+    uint64_t m_animFrames = 0;
+    std::unordered_map<unsigned, std::string> m_animErrors;
     // 脚本 print() 的滚动日志
     std::vector<std::string> m_printLog;
+
+    // 碰撞求解的详细日志预算。每帧都打的话长时间 Play 会把日志刷爆 ——
+    // 但自动化测试又需要看到"到底推开了谁"。折中：前 N 帧逐条打，
+    // 之后只每 60 帧打一条汇总。
+    //
+    // 初值必须是 240 而不是 0：`MYVK_EDITOR_PLAY=1` 是**在启动时**就进
+    // Play 的，走不到"回到编辑态"那条复位分支（复位写在那儿）。预算若从
+    // 0 起步，第一次 Play 的碰撞会一条日志都不留 —— 求解明明做对了，却
+    // 因为"没到每 60 帧的汇总点"而被 `pairs==0` 提前 return 掉。
+    // 每次新 Play 开始也会重新灌满（见 EditorApp::onUpdate）。
+    int m_collisionLogBudget = 240;
+    uint64_t m_collisionFrames = 0;
 
     // 已经同步给 GLFW 窗口的全屏状态（边沿检测用，见 syncWindowFullscreen）
     bool m_appliedWindowFullscreen = false;

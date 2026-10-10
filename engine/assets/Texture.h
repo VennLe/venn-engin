@@ -49,7 +49,7 @@ struct TextureSource {
     uint32_t cell = 32;                        // Checker 格子边长（像素）
     uint32_t size = 512;                       // Checker / Solid 边长
     std::string path;                          // File
-    bool srgb = true;                          // File
+    bool srgb = true;                          // File / Solid：色彩空间
 };
 
 class Texture {
@@ -76,8 +76,10 @@ public:
                           uint8_t b[4]);
 
     // 程序化纯色
+    // srgb=true  → R8G8B8A8_SRGB  （albedo / emissive 等"颜色"贴图）
+    // srgb=false → R8G8B8A8_UNORM （normal / ORM 等"数据"贴图，不能做 gamma）
     void makeSolid(const TextureContext& ctx, uint8_t color[4],
-                   uint32_t size = 4);
+                   uint32_t size = 4, bool srgb = true);
 
     VkImageView view() const { return m_view; }
     VkSampler sampler() const { return m_sampler; }

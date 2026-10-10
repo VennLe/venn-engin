@@ -220,16 +220,26 @@ void ShadowPass::updateLightMatrix(const glm::vec3& direction,
     const float distance = radius * 2.0f;
     const glm::vec3 lightPos = center - d * distance;
 
-    glm::vec3 up(0.0f, 1.0f, 0.0f);
+    glm::vec3 up(0.0f, 0.0f, 1.0f);  // Z-up
     // 光方向接近垂直时 lookAt 会退化（up 与视线共线），换用另一个轴
     if (std::abs(glm::dot(d, up)) > 0.99f) {
-        up = glm::vec3(0.0f, 0.0f, 1.0f);
+        up = glm::vec3(0.0f, 1.0f, 0.0f);
     }
 
     const glm::mat4 view = glm::lookAt(lightPos, center, up);
-    // 正交范围 = 场景包围球；近远平面紧贴包围球以提升深度精度
-    const glm::mat4 proj = glm::ortho(-radius, radius, -radius, radius,
-                                      distance - radius, distance + radius);
+    // 正交范围 = 场景包围球；近远平面紧贴包围球以提升深度精度。
+    //
+    // ⚠ 深度必须是 **0→1（Zero-to-One）** 约定，不能用 glm::ortho：
+    //   · Vulkan 的 clip/NDC 深度范围是 [0, 1]，glm::ortho 给的是
+    //     OpenGL 约定 [-1, 1]；
+    //   · 若用 GL 约定，阴影图**写入**的深度是 ndc_z∈[-1,1] 被裁剪后
+    //     的一半（z<0 的几何整段被裁掉），而 pbr.frag **采样**时算出的
+    //     参考深度又是另一套映射 —— 两侧不在同一深度空间，整个覆盖区
+    //     会被判成"被遮挡"，屏幕上就是一块边界笔直的暗色四边形。
+    //   · glm::orthoRH_ZO 把近平面映到 0、远平面映到 1，与 Vulkan 一致；
+    //     相应地 pbr.frag 里对 proj.z **不再**做 *0.5+0.5（只有 xy 需要）。
+    const glm::mat4 proj = glm::orthoRH_ZO(-radius, radius, -radius, radius,
+                                           distance - radius, distance + radius);
 
     m_lightSpace = proj * view;
 }

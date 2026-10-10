@@ -45,6 +45,7 @@
 // 面板期间视口是空白的，换来的是永远不会出现 use-after-free。
 // ============================================================
 
+#include "ColliderView.h"
 #include "EditorContext.h"
 #include "GizmoController.h"
 #include "PickingSystem.h"
@@ -52,6 +53,7 @@
 #include <glm/glm.hpp>
 
 #include <cstdint>
+#include <functional>
 
 struct ImDrawList;
 
@@ -70,6 +72,15 @@ public:
     // 手柄是否正在拖拽（Toolbar 之类的状态显示用）
     bool gizmoDragging() const { return m_gizmo.dragging(); }
 
+    // 视图方向快捷键（Blender 小键盘那一套：1/3/7 + Ctrl 反向，2/4/6/8 步进）。
+    // 由 EditorApp::handleShortcuts 每帧调一次；内部自带"仅编辑态"判断。
+    void handleViewShortcuts();
+
+    // 数字键 0：把选中的物体**竖直**落地（x / y 不动，只让世界包围盒底部
+    // 贴到 z = 0 的地面）。只对"在 3D 视口里左键点中"的选中生效
+    // （见 EditorContext::selectionFromViewport）。
+    void dropSelectionToGround();
+
 private:
     void drawToolbar();
     // 工具栏第二行：平移 / 旋转 / 缩放各自的吸附开关 + 步长 + UE 预设
@@ -80,14 +91,36 @@ private:
     void handleNavigation(bool hovered) const;
     // 编辑态右上角浮层：灵敏度 + 栅格开关 + 操作提示
     void drawNavHud(const glm::vec2& vpPos, const glm::vec2& vpSize);
+    // 编辑态左下角导航球：拖拽转视角 / 点轴端小球吸附到正视图
+    void drawNavGizmo(const glm::vec2& vpPos, const glm::vec2& vpSize);
     // 运行态右上角浮层：全屏 / 恢复按钮 + 播放状态（不提供任何导航）
     void drawPlayHud(const glm::vec2& vpPos, const glm::vec2& vpSize);
+    // Shift+A 添加菜单（Blender 的 Add 菜单）：鼠标处弹出 Mesh / Light
+    // 两个子菜单。菜单里加出来的物体落在 m_addSpot（打开菜单那一刻
+    // 鼠标射线与地面的交点）—— 弹出后就固定住，不跟着菜单里的鼠标走。
+    void drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
+                     bool hovered);
+    // 执行"往场景里加一个物体"并选中新实体（Inspector 随之显示它的参数）
+    void addEntity(const char* what, const std::function<ecs::Entity()>& create);
     void focusSelection() const;
+
+    // 选中物体上的**右键菜单**：添加 / 移除碰撞体、切换"手柄编辑碰撞体"。
+    //
+    // 和右键导航（按住右键转头）共存的判定：按下与松开之间鼠标几乎没动
+    // （< 6px）才算"点击"。UE 的视口就是这么分这两件事的 —— 动一下是
+    // 转头，没动就是上下文菜单。
+    void drawObjectMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
+                        bool hovered);
+
+    // 给实体装碰撞体 / 拆掉（都走 structuralEdit，可撤销）
+    void addCollisionBody(ecs::Entity e, ecs::ColliderShape shape);
+    void removeCollisionBody(ecs::Entity e);
 
     EditorContext& m_ctx;
     render::Renderer& m_renderer;
     PickingSystem m_picking;
     GizmoController m_gizmo;
+    ColliderView m_colliders;
 
     std::uint32_t m_requestedW = 0;
     std::uint32_t m_requestedH = 0;
@@ -95,6 +128,32 @@ private:
 
     bool m_showOverlay = true;
     bool m_showGizmo = true;
+
+    // ---- 导航球（Navigation Gizmo）的拖拽状态 ----
+    // m_navPressDir：按下时命中的轴端（ViewDir 枚举，-1 = 没点在小球上）。
+    // 松手时若位移没超过阈值就当成"点击"→ 吸附到那个正视图；否则算"拖拽"。
+    bool m_navDragging = false;
+    bool m_navMoved = false;
+    int m_navPressDir = -1;
+    glm::vec2 m_navPressPos{0.0f, 0.0f};
+
+    // ---- Shift+A 添加菜单 ----
+    // 打开菜单那一刻鼠标射线与 z=0 地面的交点（新增物体的落点）
+    glm::vec3 m_addSpot{0.0f, 0.0f, 0.0f};
+
+    // "第几次打开这个菜单"。菜单项矩形是按 logRect 打的，而 logRect 会**按
+    // 矩形去抖** —— 同一个位置第二次打开菜单时矩形没变，就一行都不会再打。
+    // 自动化脚本据此定位时会直接拿到上一次的陈旧坐标，于是在子菜单真正展
+    // 开之前就点了下去（实测：第一次加 Cube 成功，第二次加 Sphere 必失败，
+    // 因为 VP-ADD-Sphere 的坐标是上一次留下的）。把序号拼进 tag 就能让每
+    // 一次打开都重新打点，脚本按"最后一个序号"取到的永远是新鲜的。
+    int m_addMenuSeq = 0;
+
+    // ---- 选中物体的右键菜单 ----
+    glm::vec2 m_ctxPressPos{0.0f, 0.0f};      // 按下右键的位置
+    glm::vec2 m_ctxMenuPos{0.0f, 0.0f};       // 弹出位置（按下时的鼠标位置）
+    bool m_ctxPressOnSelected = false;        // 按下时鼠标是否落在选中物体上
+    int m_ctxMenuSeq = 0;                     // 和 Add 菜单同理：矩形日志按序号去抖
 };
 
 } // namespace editor

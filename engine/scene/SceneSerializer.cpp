@@ -8,6 +8,7 @@
 #include "assets/Texture.h"
 #include "core/Logger.h"
 #include "ecs/Components.h"
+#include "physics/CollisionWorld.h"
 #include "scene/Scene.h"
 
 #include <nlohmann/json.hpp>
@@ -171,6 +172,10 @@ json materialToJson(const assets::Material* mat) {
     j["albedo"] = textureSourceToJson(mat->albedoMap);
     j["normal"] = textureSourceToJson(mat->normalMap);
     j["orm"] = textureSourceToJson(mat->ormMap);
+    // 单因子贴图槽（白/白/黑 是"未绑定"的中性值，各自与因子相乘或相加）
+    j["roughnessMap"] = textureSourceToJson(mat->roughnessMap);
+    j["metallicMap"] = textureSourceToJson(mat->metallicMap);
+    j["emissiveMap"] = textureSourceToJson(mat->emissiveMap);
     return j;
 }
 
@@ -217,12 +222,21 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
         am, jm.contains("normal") ? jm["normal"] : json(nullptr));
     assets::Texture* orm =
         resolveTexture(am, jm.contains("orm") ? jm["orm"] : json(nullptr));
+    assets::Texture* roughnessMap = resolveTexture(
+        am, jm.contains("roughnessMap") ? jm["roughnessMap"] : json(nullptr));
+    assets::Texture* metallicMap = resolveTexture(
+        am, jm.contains("metallicMap") ? jm["metallicMap"] : json(nullptr));
+    assets::Texture* emissiveMap = resolveTexture(
+        am, jm.contains("emissiveMap") ? jm["emissiveMap"] : json(nullptr));
 
     assets::Material* mat = am.makeMaterialPBR(
         name, albedo, normal, orm, baseColor, roughness, metallic, emissive,
         doubleSided);
     if (mat) {
         // makeMaterialPBR 未覆盖这几项，补齐以保证往返一致
+        mat->roughnessMap = roughnessMap;
+        mat->metallicMap = metallicMap;
+        mat->emissiveMap = emissiveMap;
         mat->normalScale = normalScale;
         mat->ao = ao;
         mat->alphaMode = jm.value("alphaBlend", false)
@@ -236,6 +250,56 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
 // 网格来源
 // ============================================================
 
+// ---- 内置图元的生成参数（编辑器可回改的那一份，见 ecs::MeshComponent）----
+//
+// 注意这里和 MeshSource 是**两回事**：
+//   * MeshSource 描述"这颗 mesh 是哪来的"，序列化后靠它重建几何；
+//   * MeshComponent::primitive 是编辑器在几何之上记的一份意图，
+//     Inspector 拿它决定"这个物体该显示哪些参数栏"。
+// 两者在正常流程里是同步的（改参数时两个一起改），但分开存 ——
+// 万一 mesh 被换成别的东西（比如外部模型），参数栏就跟着消失了。
+
+const char* primitiveKindToStr(ecs::MeshPrimitive k) {
+    switch (k) {
+        case ecs::MeshPrimitive::Cube: return "cube";
+        case ecs::MeshPrimitive::Plane: return "plane";
+        case ecs::MeshPrimitive::Sphere: return "sphere";
+        case ecs::MeshPrimitive::Cylinder: return "cylinder";
+        case ecs::MeshPrimitive::None: break;
+    }
+    return "none";
+}
+
+ecs::MeshPrimitive primitiveKindFromStr(const std::string& s) {
+    if (s == "cube") return ecs::MeshPrimitive::Cube;
+    if (s == "plane") return ecs::MeshPrimitive::Plane;
+    if (s == "sphere") return ecs::MeshPrimitive::Sphere;
+    if (s == "cylinder") return ecs::MeshPrimitive::Cylinder;
+    return ecs::MeshPrimitive::None;
+}
+
+json primitiveParamsToJson(const ecs::MeshComponent& mc) {
+    const ecs::MeshPrimitiveParams& p = mc.params;
+    if (!p.isBuiltin()) return nullptr;
+    json j;
+    j["kind"] = primitiveKindToStr(p.primitive);
+    j["size"] = p.size;
+    j["radius"] = p.radius;
+    j["segments"] = p.segments;
+    j["rings"] = p.rings;
+    return j;
+}
+
+void primitiveParamsFromJson(ecs::MeshComponent& mc, const json& jp) {
+    if (!jp.is_object()) return;
+    ecs::MeshPrimitiveParams& p = mc.params;
+    p.primitive = primitiveKindFromStr(jp.value("kind", std::string("none")));
+    p.size = jp.value("size", p.size);
+    p.radius = jp.value("radius", p.radius);
+    p.segments = jp.value("segments", p.segments);
+    p.rings = jp.value("rings", p.rings);
+}
+
 json meshSourceToJson(const assets::Mesh* mesh) {
     if (!mesh) return nullptr;
     const assets::MeshSource& s = mesh->source();
@@ -246,6 +310,10 @@ json meshSourceToJson(const assets::Mesh* mesh) {
             j["kind"] = "builtin";
             j["shape"] = s.shape;
             j["size"] = s.size;
+            // 细分参数：改了图元生成参数的网格，缓存键里带着这组值，
+            // 重建时必须原样喂回去（0 = 用生成器默认值）
+            if (s.segments > 0) j["segments"] = s.segments;
+            if (s.rings > 0) j["rings"] = s.rings;
             j["name"] = s.name;
             return j;
         case assets::MeshSource::Kind::OBJ:
@@ -275,9 +343,13 @@ assets::Mesh* resolveMesh(assets::AssetManager& am, const json& jm) {
         const float size = jm.value("size", 1.0f);
         const std::string name =
             jm.value("name", shape.empty() ? std::string("mesh") : shape);
+        // 细分参数：省略时用生成器的默认档（老场景文件里没有这两个字段）
+        const int segments = jm.value("segments", 48);
+        const int rings = jm.value("rings", 24);
         if (shape == "cube") return am.cube(size, name);
         if (shape == "plane") return am.plane(size, name);
-        if (shape == "sphere") return am.sphere(size, name);
+        if (shape == "sphere") return am.sphere(size, name, segments, rings);
+        if (shape == "cylinder") return am.cylinder(size, name, segments);
         VK_LOG_WARN("SceneSerializer: unknown builtin shape '%s'", shape.c_str());
         return nullptr;
     }
@@ -411,6 +483,70 @@ ecs::SpotLightComponent spotLightFromJson(const json& j) {
     return L;
 }
 
+// ---- 实体级方向光 ----
+// 场景级太阳不经过这条路（它是 Scene 顶层的 "light" 字段）；这里只
+// 序列化用户手动摆进场景的方向光实体。太阳实体没有 TransformComponent，
+// 不会出现在实体列表里，因此不存在"太阳被存两遍"的问题。
+json directionalLightToJson(const ecs::DirectionalLightComponent& L) {
+    return json{
+        {"direction", vec3ToJson(L.direction)},
+        {"color", vec3ToJson(L.color)},
+        {"intensity", L.intensity},
+    };
+}
+
+ecs::DirectionalLightComponent directionalLightFromJson(const json& j) {
+    ecs::DirectionalLightComponent L;
+    if (!j.is_object()) return L;
+    L.direction = vec3FromJson(
+        j.contains("direction") ? j["direction"] : json(nullptr), L.direction);
+    L.color = vec3FromJson(j.contains("color") ? j["color"] : json(nullptr),
+                           L.color);
+    L.intensity = j.value("intensity", L.intensity);
+    // 实体级方向光固定不投影（阴影只有场景级太阳有）、不贡献环境光
+    L.castsShadow = false;
+    L.ambientScale = 0.0f;
+    return L;
+}
+
+// ---- 碰撞体 ----
+// 只存"来源 + 摆放"：形状、相对实体的 TRS、胶囊参数、开关。
+// **凸包顶点不存** —— 那是从网格顶点算出来的派生数据，读盘时按 mesh 重建
+// （和网格来源 / 材质来源是同一条思路）。存下来的话，几百个顶点会让场景
+// 文件里每个物体多出几 KB 纯冗余。
+json collisionToJson(const ecs::CollisionComponent& c) {
+    json j;
+    j["shape"] = (c.shape == ecs::ColliderShape::ConvexHull) ? "convex"
+                                                            : "capsule";
+    j["position"] = vec3ToJson(c.position);
+    j["rotation"] = vec3ToJson(c.rotation);
+    j["scale"] = vec3ToJson(c.scale);
+    j["capsuleRadius"] = c.capsuleRadius;
+    j["capsuleHalfHeight"] = c.capsuleHalfHeight;
+    j["solid"] = c.solid;
+    return j;
+}
+
+ecs::CollisionComponent collisionFromJson(const json& j) {
+    ecs::CollisionComponent c;
+    if (!j.is_object()) return c;
+    const std::string shape = j.value("shape", std::string("capsule"));
+    c.shape = (shape == "convex") ? ecs::ColliderShape::ConvexHull
+                                  : ecs::ColliderShape::Capsule;
+    c.position = vec3FromJson(j.contains("position") ? j["position"]
+                                                     : json(nullptr),
+                              c.position);
+    c.rotation = vec3FromJson(j.contains("rotation") ? j["rotation"]
+                                                     : json(nullptr),
+                              c.rotation);
+    c.scale = vec3FromJson(j.contains("scale") ? j["scale"] : json(nullptr),
+                           c.scale);
+    c.capsuleRadius = j.value("capsuleRadius", c.capsuleRadius);
+    c.capsuleHalfHeight = j.value("capsuleHalfHeight", c.capsuleHalfHeight);
+    c.solid = j.value("solid", true);
+    return c;
+}
+
 // ============================================================
 // 场景 → JSON（文件版与内存版共用的核心）
 // ============================================================
@@ -456,6 +592,9 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
             je["castShadow"] = vis->castShadow;
         }
 
+        // 编辑器锁定（"看得见、动不了"；自带地面就是靠它固定的）
+        if (w.has<ecs::LockedComponent>(it.entity)) je["locked"] = true;
+
         int parentIndex = -1;
         if (const auto* h = w.get<ecs::HierarchyComponent>(it.entity)) {
             if (h->parent != ecs::kInvalidEntity) {
@@ -471,12 +610,24 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         const auto* matc = w.get<ecs::MaterialComponent>(it.entity);
         je["mesh"] = meshSourceToJson(mc ? mc->mesh : nullptr);
         je["material"] = materialToJson(matc ? matc->material : nullptr);
+        // 内置图元的生成参数（编辑器可回改，见 ecs::MeshComponent::primitive）
+        if (mc) {
+            json jp = primitiveParamsToJson(*mc);
+            if (!jp.is_null()) je["primitive"] = jp;
+        }
 
         // 局部光源（位置在 transform 里，已经存过了）
         if (const auto* pl = w.get<ecs::PointLightComponent>(it.entity))
             je["pointLight"] = pointLightToJson(*pl);
         if (const auto* sl = w.get<ecs::SpotLightComponent>(it.entity))
             je["spotLight"] = spotLightToJson(*sl);
+        // 实体级方向光（补光；场景级太阳走顶层 "light" 字段）
+        if (const auto* dl = w.get<ecs::DirectionalLightComponent>(it.entity))
+            je["directionalLight"] = directionalLightToJson(*dl);
+
+        // 碰撞体（几何是派生数据，只存来源与摆放，见 collisionToJson）
+        if (const auto* cc = w.get<ecs::CollisionComponent>(it.entity))
+            je["collision"] = collisionToJson(*cc);
 
         // 脚本（只有路径与开关，脚本源码本身是独立文件）
         if (const auto* sc = w.get<ecs::ScriptComponent>(it.entity)) {
@@ -554,6 +705,10 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
             vis->castShadow = je.value("castShadow", true);
         }
 
+        if (je.value("locked", false)) {
+            if (!w.has<ecs::LockedComponent>(e)) w.add<ecs::LockedComponent>(e);
+        }
+
         created.push_back(e);
     }
 
@@ -583,10 +738,17 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
             assets, je.contains("material") ? je["material"] : json(nullptr));
 
         if (mesh) {
-            if (auto* mc = w.get<ecs::MeshComponent>(e))
+            if (!w.has<ecs::MeshComponent>(e)) {
+                ecs::MeshComponent fresh;
+                fresh.mesh = mesh;
+                w.add<ecs::MeshComponent>(e, fresh);
+            }
+            if (auto* mc = w.get<ecs::MeshComponent>(e)) {
                 mc->mesh = mesh;
-            else
-                w.add<ecs::MeshComponent>(e, ecs::MeshComponent{mesh});
+                // 图元生成参数（没有就是默认值 —— 老场景文件也走这条）
+                if (je.contains("primitive"))
+                    primitiveParamsFromJson(*mc, je["primitive"]);
+            }
         }
         if (mat) {
             if (auto* matc = w.get<ecs::MaterialComponent>(e))
@@ -612,6 +774,15 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
             else
                 w.add<ecs::SpotLightComponent>(e, sl);
         }
+        if (je.contains("directionalLight") &&
+            je["directionalLight"].is_object()) {
+            const ecs::DirectionalLightComponent dl =
+                directionalLightFromJson(je["directionalLight"]);
+            if (auto* p = w.get<ecs::DirectionalLightComponent>(e))
+                *p = dl;
+            else
+                w.add<ecs::DirectionalLightComponent>(e, dl);
+        }
 
         // 脚本
         if (je.contains("script") && je["script"].is_object()) {
@@ -626,6 +797,20 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 else
                     w.add<ecs::ScriptComponent>(e, sc);
             }
+        }
+
+        // 碰撞体。position/rotation/scale 从文件读；**凸包顶点按网格重建**
+        // —— 它没进 JSON（见 collisionToJson 的说明）。
+        if (je.contains("collision") && je["collision"].is_object()) {
+            ecs::CollisionComponent cc = collisionFromJson(je["collision"]);
+            if (cc.shape == ecs::ColliderShape::ConvexHull) {
+                const auto* mc = w.get<ecs::MeshComponent>(e);
+                if (mc && mc->mesh) physics::refreshHullGeometry(*mc->mesh, cc);
+            }
+            if (auto* p = w.get<ecs::CollisionComponent>(e))
+                *p = cc;
+            else
+                w.add<ecs::CollisionComponent>(e, cc);
         }
 
         if (!mesh && !mat) ++r.skipped;

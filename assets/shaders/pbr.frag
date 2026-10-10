@@ -52,7 +52,7 @@ struct Light {
     vec4 positionRange;      // xyz=世界坐标 w=影响半径
     vec4 colorIntensity;     // rgb=颜色  a=强度
     vec4 directionCosInner;  // xyz=传播方向 w=cos(内锥角)
-    vec4 cosOuterType;       // x=cos(外锥角) y=类型(0=点 1=射灯)
+    vec4 cosOuterType;       // x=cos(外锥角) y=类型(0=点 1=射灯 2=方向光)
 };
 
 layout(std430, set = 0, binding = 2) readonly buffer LightBuffer {
@@ -70,6 +70,14 @@ layout(std430, set = 0, binding = 4) readonly buffer LightIndexBuffer {
 layout(set = 1, binding = 0) uniform sampler2D albedoMap;
 layout(set = 2, binding = 0) uniform sampler2D normalMap;
 layout(set = 3, binding = 0) uniform sampler2D ormMap;  // R=AO G=Rough B=Metal
+
+// 单因子贴图（UE5 风格：每个因子旁边可以再单独挂一张）。
+// 与 ormMap 是**相乘**关系，未绑定时绑的是内置纯白 → 乘法恒等。
+// 只读 R 通道（灰度），按线性采样（粗糙度/金属度是物理量，不是颜色）。
+layout(set = 4, binding = 0) uniform sampler2D roughnessMap;
+layout(set = 5, binding = 0) uniform sampler2D metallicMap;
+// 自发光贴图：与因子**相加**，未绑定时绑内置纯黑 → 加法恒等。
+layout(set = 6, binding = 0) uniform sampler2D emissiveMap;
 
 layout(push_constant) uniform Push {
     mat4 model;
@@ -116,7 +124,11 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
 // 这样金属反射会随法线朝向变化 —— 朝上的面反射天空、朝下的面反射地面，
 // 这是让金属"看起来像金属"的关键（常量环境色会把金属压成一块死色）。
 vec3 envColor(vec3 dir) {
-    float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+    // ⚠ 本引擎是 **Z-up**（地面 = z = 0，光源 up 轴 = +Z），所以"朝上"
+    // 对应的是 dir.z，不是 dir.y。用 dir.y 的话梯度方向会落到世界 +Y —
+    // 那是水平方向，地面上的环境光就变成沿 Y 轴的一条明暗带：近处暗、
+    // 远处亮，中间还有一条笔直的硬边，看起来就像地面上多了一块阴影。
+    float t = clamp(dir.z * 0.5 + 0.5, 0.0, 1.0);
     vec3 ground = vec3(0.10, 0.09, 0.09);
     vec3 sky = vec3(0.55, 0.70, 0.95);
     return mix(ground, sky, t * t);
@@ -143,7 +155,11 @@ mat3 cotangentFrame(vec3 N, vec3 p, vec2 uv) {
 // 3×3 PCF 软阴影。单点采样会得到锯齿状硬边，对邻域取平均后边缘自然柔和
 float shadowFactor(vec4 lightSpacePos, float NdotL) {
     vec3 proj = lightSpacePos.xyz / lightSpacePos.w;
-    proj = proj * 0.5 + 0.5;  // NDC [-1,1] → 纹理坐标 [0,1]
+    // 只有 xy 需要从 NDC [-1,1] 映射到纹理坐标 [0,1]。
+    // ⚠ z **不能**再 *0.5+0.5：光源投影是 Zero-to-One 约定（近=0 远=1，
+    // 见 ShadowPass::updateLightMatrix），深度已经是 Vulkan 的 [0,1]。
+    // 再压一次会把参考深度变成实际深度的一半，整片覆盖区都会被误判成阴影。
+    proj.xy = proj.xy * 0.5 + 0.5;
 
     // 落在光源视野之外 → 视为无遮挡
     if (proj.z > 1.0 || proj.z < 0.0 || proj.x < 0.0 || proj.x > 1.0 ||
@@ -220,28 +236,40 @@ float spotAttenuation(float cosAngle, float cosInner, float cosOuter) {
 }
 
 // 单盏局部光源的完整 BRDF 贡献。
+// 类型：0 = 点光，1 = 射灯，2 = 方向光（实体级补光：无衰减、无阴影，
+//       L 直接取 -direction；分簇剔除靠它 10⁵ 米的"影响球"保证全覆盖）。
 // 注意：灯列表是 compute 侧"保守剔除"的结果，可能包含实际照不到
 // 这里的灯（尤其是射灯 —— 只按 range 球剔除），所以这里每一步
 // 都要老老实实判断并提前退出。
 vec3 shadeLocalLight(Light L, vec3 N, vec3 V, vec3 worldPos, vec3 albedo,
                      vec3 F0, float roughness, float metallic) {
-    vec3 toLight = L.positionRange.xyz - worldPos;
-    float dist = length(toLight);
-    float range = L.positionRange.w;
-    if (dist >= range) return vec3(0.0);
+    vec3 Ld;
+    float att;
 
-    vec3 Ld = toLight / max(dist, 1e-5);
+    if (L.cosOuterType.y > 1.5) {
+        // ---- 方向光 ----
+        Ld = normalize(-L.directionCosInner.xyz);
+        att = 1.0;
+    } else {
+        // ---- 点光 / 射灯 ----
+        vec3 toLight = L.positionRange.xyz - worldPos;
+        float dist = length(toLight);
+        float range = L.positionRange.w;
+        if (dist >= range) return vec3(0.0);
+
+        Ld = toLight / max(dist, 1e-5);
+        att = distanceAttenuation(dist, range);
+
+        if (L.cosOuterType.y > 0.5) {  // 射灯
+            float cosAngle = dot(-Ld, L.directionCosInner.xyz);
+            float s = spotAttenuation(cosAngle, L.directionCosInner.w,
+                                      L.cosOuterType.x);
+            att *= s * s;  // 平方一下让边缘收得更利落
+        }
+    }
+
     float NdotL = dot(N, Ld);
     if (NdotL <= 0.0) return vec3(0.0);
-
-    float att = distanceAttenuation(dist, range);
-
-    if (L.cosOuterType.y > 0.5) {  // 射灯
-        float cosAngle = dot(-Ld, L.directionCosInner.xyz);
-        float s = spotAttenuation(cosAngle, L.directionCosInner.w,
-                                  L.cosOuterType.x);
-        att *= s * s;  // 平方一下让边缘收得更利落
-    }
     if (att <= 0.0) return vec3(0.0);
 
     vec3 H = normalize(V + Ld);
@@ -275,6 +303,13 @@ void main() {
     ao *= orm.r;
     roughness *= orm.g;
     metallic *= orm.b;
+
+    // 单因子贴图再乘一层（未绑定时是纯白，等于没乘）。
+    // 于是 glTF 那种打包 ORM 与"一张一张单独指定"两种用法可以共存：
+    // 想单独换粗糙度，只需要在粗糙度槽里放一张图，不用去动 ORM。
+    roughness *= texture(roughnessMap, vUV).r;
+    metallic *= texture(metallicMap, vUV).r;
+
     roughness = clamp(roughness, 0.04, 1.0);
     metallic = clamp(metallic, 0.0, 1.0);
 
@@ -350,7 +385,11 @@ void main() {
 
     vec3 ambient = ambientDiffuse + ambientSpecular;
 
-    vec3 color = ambient + direct + localLights + push.emissive.rgb;
+    // 自发光 = 因子 + 贴图。贴图槽空着时绑的是内置纯黑，加法恒等；
+    // 放一张图进去立刻发光（因子保留 0 也亮），不用两头调。
+    vec3 emissive = push.emissive.rgb + texture(emissiveMap, vUV).rgb;
+
+    vec3 color = ambient + direct + localLights + emissive;
 
     // alpha 参与混合：透明材质走 baseline blend 管线
     outColor = vec4(color, alpha);

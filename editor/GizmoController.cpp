@@ -1,7 +1,9 @@
 #include "GizmoController.h"
 
+#include "DebugRects.h"
 #include "EditorContext.h"
 
+#include "core/Logger.h"
 #include "ecs/Components.h"
 #include "scene/Camera.h"
 #include "scene/Scene.h"
@@ -78,8 +80,9 @@ glm::vec3 eulerFromRotation(const glm::mat3& m) {
 
 void planeBasis(const glm::vec3& n, glm::vec3& u, glm::vec3& v) {
     const glm::vec3 nn = glm::normalize(n);
+    // 参考轴选"与法线夹角最大的世界轴"（Z-up：先试 +Z，不行换 +X）
     const glm::vec3 ref =
-        std::fabs(nn.y) < 0.9f ? glm::vec3(0, 1, 0) : glm::vec3(1, 0, 0);
+        std::fabs(nn.z) < 0.9f ? glm::vec3(0, 0, 1) : glm::vec3(1, 0, 0);
     u = glm::normalize(glm::cross(ref, nn));
     v = glm::cross(nn, u);
 }
@@ -207,6 +210,12 @@ void GizmoController::drawGizmo(EditorContext& ctx, ImDrawList* draw,
     const ImVec2 o(m_originScreen.x, m_originScreen.y);
     const GizmoMode mode = ctx.gizmoMode();
 
+    // 自动化探针：手柄中心 + 三根轴的端点。
+    // 脚本靠这些矩形精确点中"哪一根轴"，而不是在截图里猜坐标 ——
+    // 轴的颜色/位置会随相机变，写死坐标必然踩坑（见 DebugRects.h 的说明）。
+    logRect("GZ-ORIGIN", ImVec2(o.x - 5.0f, o.y - 5.0f),
+            ImVec2(o.x + 5.0f, o.y + 5.0f));
+
     const auto axisColor = [&](int i) {
         return (i == static_cast<int>(highlight)) ? colHot : colAxis[i];
     };
@@ -237,11 +246,22 @@ void GizmoController::drawGizmo(EditorContext& ctx, ImDrawList* draw,
         case GizmoMode::Translate:
         case GizmoMode::Scale: {
             // ---- 平面方片（双轴）----
+            static const char* kPlaneTag[3] = {"GZ-PLANE-YZ", "GZ-PLANE-XZ",
+                                               "GZ-PLANE-XY"};
             for (int i = 0; i < 3; ++i) {
                 if (!m_planeValid[i]) continue;
                 ImVec2 pts[4];
                 for (int k = 0; k < 4; ++k) {
                     pts[k] = ImVec2(m_planePts[i][k].x, m_planePts[i][k].y);
+                }
+                // 自动化探针：方片中心（凸四边形的重心一定在内部，点它必中）
+                {
+                    const ImVec2 c((pts[0].x + pts[1].x + pts[2].x + pts[3].x) *
+                                       0.25f,
+                                   (pts[0].y + pts[1].y + pts[2].y + pts[3].y) *
+                                       0.25f);
+                    logRect(kPlaneTag[i], ImVec2(c.x - 5.0f, c.y - 5.0f),
+                            ImVec2(c.x + 5.0f, c.y + 5.0f));
                 }
                 const bool hot = planeHot(i);
                 // 填充半亮、悬停时更亮；描边用满色 → 即使被 3D 画面盖住也看得清
@@ -255,6 +275,8 @@ void GizmoController::drawGizmo(EditorContext& ctx, ImDrawList* draw,
             }
 
             // ---- 单轴 ----
+            static const char* kAxisTag[3] = {"GZ-AXIS-X", "GZ-AXIS-Y",
+                                              "GZ-AXIS-Z"};
             for (int i = 0; i < 3; ++i) {
                 glm::vec2 tip;
                 if (!PickingSystem::worldToScreen(
@@ -262,6 +284,9 @@ void GizmoController::drawGizmo(EditorContext& ctx, ImDrawList* draw,
                         m_origin + m_axisDir[i] * m_worldLen, tip)) {
                     continue;
                 }
+                // 轴端的可点区域（和绘制出来的小方块/箭头同一位置）
+                logRect(kAxisTag[i], ImVec2(tip.x - 7.0f, tip.y - 7.0f),
+                        ImVec2(tip.x + 7.0f, tip.y + 7.0f));
                 const bool hot = (highlight == static_cast<Handle>(i));
                 const ImU32 c = axisColor(i);
                 const float th = hot ? 4.0f : 2.5f;
@@ -291,15 +316,31 @@ void GizmoController::drawGizmo(EditorContext& ctx, ImDrawList* draw,
         }
         case GizmoMode::Rotate: {
             // ---- 三根轴的旋转环 ----
+            // 自动化探针：环上**离中心最远**的那一点。
+            // 旋转模式没有 GZ-AXIS-*（轴端被环取代了），脚本就没有可点的
+            // 锚点；取"离中心最远"而不是固定第 0 个点，是因为环是投影成
+            // 椭圆的 —— 离中心最远处离别的环最远，点它最不容易抓错。
+            static const char* kRingTag[3] = {"GZ-RING-X", "GZ-RING-Y",
+                                              "GZ-RING-Z"};
             for (int i = 0; i < 3; ++i) {
                 if (!m_ringValid[i]) continue;
                 const ImU32 c = axisColor(i);
                 const float th = (highlight == static_cast<Handle>(i)) ? 4.0f
                                                                       : 2.5f;
                 ImVec2 pts[kRingSegments];
+                float farD = -1.0f;
+                glm::vec2 farPt = m_originScreen;
                 for (int k = 0; k < kRingSegments; ++k) {
                     pts[k] = ImVec2(m_ringPoints[i][k].x, m_ringPoints[i][k].y);
+                    const float d = glm::length(m_ringPoints[i][k] -
+                                                m_originScreen);
+                    if (d > farD) {
+                        farD = d;
+                        farPt = m_ringPoints[i][k];
+                    }
                 }
+                logRect(kRingTag[i], ImVec2(farPt.x - 6.0f, farPt.y - 6.0f),
+                        ImVec2(farPt.x + 6.0f, farPt.y + 6.0f));
                 // 闭合环：把最后一段单独补上
                 draw->AddPolyline(pts, kRingSegments, c, 0, th);
                 draw->AddLine(pts[kRingSegments - 1], pts[0], c, th);
@@ -390,19 +431,49 @@ Handle GizmoController::hitTest(const glm::vec2& mouse) const {
 
 // ---------------------------------------------------------------- 拖拽
 
+GizmoController::TrsPointers GizmoController::trsOf(scene::Scene& scene,
+                                                    ecs::Entity e,
+                                                    bool onCollider) {
+    TrsPointers p;
+    if (onCollider) {
+        auto* cc = scene.world().get<ecs::CollisionComponent>(e);
+        if (!cc) return p;
+        p.pos = &cc->position;
+        p.rot = &cc->rotation;
+        p.scale = &cc->scale;
+        return p;
+    }
+    auto* t = scene.world().get<ecs::TransformComponent>(e);
+    if (!t) return p;
+    p.pos = &t->position;
+    p.rot = &t->rotation;
+    p.scale = &t->scale;
+    return p;
+}
+
+glm::mat4 GizmoController::targetWorld(scene::Scene& scene,
+                                       ecs::Entity e) const {
+    glm::mat4 m = scene.worldMatrix(e);
+    if (m_onCollider) {
+        if (const auto* cc = scene.world().get<ecs::CollisionComponent>(e))
+            m = m * cc->localMatrix();
+    }
+    return m;
+}
+
 void GizmoController::beginDrag(EditorContext& ctx, scene::Scene& scene,
                                 ecs::Entity e, const Ray& ray,
                                 const glm::vec2& mouse) {
-    auto* t = scene.world().get<ecs::TransformComponent>(e);
-    if (!t) return;
+    const TrsPointers tp = trsOf(scene, e, m_onCollider);
+    if (!tp.valid()) return;
 
     m_entity = e;
     m_mode = ctx.gizmoMode();
     m_worldSpace = (ctx.gizmoSpace() == GizmoSpace::World);
-    m_before = TransformSnapshot::capture(scene, e);
-    m_startPos = t->position;
-    m_startRot = t->rotation;
-    m_startScale = t->scale;
+    m_before = TransformSnapshot{*tp.pos, *tp.rot, *tp.scale};
+    m_startPos = *tp.pos;
+    m_startRot = *tp.rot;
+    m_startScale = *tp.scale;
     m_startMouse = mouse;
     m_changed = false;
     m_dragging = true;
@@ -414,6 +485,7 @@ void GizmoController::beginDrag(EditorContext& ctx, scene::Scene& scene,
     m_dragOrigin = m_origin;
     m_dragWorldLen = m_worldLen;
     m_dragViewNormal = m_viewNormal;
+    for (int i = 0; i < 3; ++i) m_dragLocalAxes[i] = m_localAxisWorld[i];
 
     const int axis = axisOfHandle(m_dragHandles);
     const int planeN = planeNormalOfHandle(m_dragHandles);
@@ -447,14 +519,40 @@ void GizmoController::beginDrag(EditorContext& ctx, scene::Scene& scene,
         glm::vec3 hit(0.0f);
         if (planeHit(ray, m_dragOrigin, m_dragAxis, hit)) m_startHit = hit;
     }
+
+    // 自动化探针：把"抓到了哪根手柄、对应世界哪个方向"落成一行日志。
+    // 这是排查"拖 Y 却在 Z 方向变形"这类问题的唯一可靠依据 ——
+    // 界面上的读数只能证明代码自认为抓到了什么，证明不了它抓得对不对。
+    // 后面三个局部轴也一起打：断言"物体沿拖拽方向长大"需要它
+    // （缩放作用在局部轴上，判断实际长大方向必须把两者结合起来）。
+    // target= 追加在行尾 —— 日志是自动化的"接口"，verify_gizmo_scale.py
+    // 的正则锁定了 space= 后紧跟 axis= 的旧次序，插中间会打断它。
+    VK_LOG_INFO("gizmo begin: handle=%s mode=%s space=%s "
+                "axis=(%.3f,%.3f,%.3f) localX=(%.3f,%.3f,%.3f) "
+                "localY=(%.3f,%.3f,%.3f) localZ=(%.3f,%.3f,%.3f) "
+                "target=%s",
+                handleName(), modeName(), m_worldSpace ? "world" : "local",
+                static_cast<double>(m_dragAxis.x),
+                static_cast<double>(m_dragAxis.y),
+                static_cast<double>(m_dragAxis.z),
+                static_cast<double>(m_dragLocalAxes[0].x),
+                static_cast<double>(m_dragLocalAxes[0].y),
+                static_cast<double>(m_dragLocalAxes[0].z),
+                static_cast<double>(m_dragLocalAxes[1].x),
+                static_cast<double>(m_dragLocalAxes[1].y),
+                static_cast<double>(m_dragLocalAxes[1].z),
+                static_cast<double>(m_dragLocalAxes[2].x),
+                static_cast<double>(m_dragLocalAxes[2].y),
+                static_cast<double>(m_dragLocalAxes[2].z),
+                targetName());
 }
 
 void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
                                const Ray& ray, const glm::vec2& mouse) {
     if (m_dragHandles == Handle::None) return;
 
-    auto* t = scene.world().get<ecs::TransformComponent>(m_entity);
-    if (!t) return;
+    const TrsPointers tp = trsOf(scene, m_entity, m_onCollider);
+    if (!tp.valid()) return;
 
     // 全程用**拖拽开始时冻结**的轴心 / 轴向 / 手柄长度 —— 见文件头的说明。
     const glm::vec3 axis = m_dragAxis;
@@ -508,7 +606,7 @@ void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
                 }
             }
 
-            t->position = m_startPos + localDelta;
+            *tp.pos = m_startPos + localDelta;
             m_changed = true;
 
             char buf[128];
@@ -566,22 +664,50 @@ void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
             factor = glm::max(factor, 0.01f);
 
             glm::vec3 sc = m_startScale;
+
+            // ---- 拖拽方向 → 局部轴的缩放权重 ----
+            //
+            // 这里是用户报的"拖 Y 却在 Z 方向拉伸"的根因所在。
+            //
+            // 手柄拖的是**世界**里的某一根轴（世界空间下就是世界轴本身），
+            // 而 TransformComponent::scale 是**局部**的（M = T·R·S）——
+            // 它作用在物体自己的三根轴上。物体一转，两套轴就不再重合：
+            //   物体绕 X 转 +90° 后，它的局部 Y 正指着世界的 Z。
+            //   于是"拖绿轴（世界 Y）"写进 scale.y，物体却沿着世界 Z 长；
+            //   "拖蓝轴（世界 Z）"写进 scale.z=局部 Z=世界 -Y，又朝着 Y 长。
+            // 表现就是两根轴"换了位置"。
+            //
+            // 正确做法：把拖拽方向投影到物体的三根**局部**轴上，按投影强度
+            // 分配缩放量。轴对齐时（绝大多数情况、也是旧代码唯一做对的情况）
+            // 投影恰好是 0/1，公式退化成"只改对得上那一维"，与旧行为一致；
+            // 物体转过之后则自动落到真正对得上的那一维上。
+            glm::vec3 w(0.0f);
             if (axisIdx >= 0) {
-                sc[axisIdx] = m_startScale[axisIdx] * factor;
+                for (int i = 0; i < 3; ++i)
+                    w[i] = std::fabs(glm::dot(axis, m_dragLocalAxes[i]));
             } else if (planeN >= 0) {
-                for (int i = 0; i < 3; ++i) {
-                    if (i != planeN) sc[i] = m_startScale[i] * factor;
-                }
-            } else {
-                sc = m_startScale * factor;   // 等比
+                // 平面手柄：两根腿的方向各算一次，加起来（对角拖 = 两根一起放大）
+                for (int i = 0; i < 3; ++i)
+                    w[i] = std::fabs(glm::dot(m_dragU, m_dragLocalAxes[i])) +
+                           std::fabs(glm::dot(m_dragV, m_dragLocalAxes[i]));
             }
-            t->scale = sc;
+
+            if (axisIdx >= 0 || planeN >= 0) {
+                for (int i = 0; i < 3; ++i)
+                    sc[i] = m_startScale[i] * (1.0f + (factor - 1.0f) * w[i]);
+            } else {
+                sc = m_startScale * factor;   // 整体等比：与朝向无关
+            }
+            *tp.scale = sc;
             m_changed = true;
 
+            // 读数报**倍率**而不是那一维的绝对值 —— 旋转过的物体会把缩放
+            // 摊到局部轴上，某个分量的绝对值已经没有"这就是你拖出来的量"
+            // 的含义了，倍率才是用户手上真正做出来的动作。
             char buf[128];
             if (axisIdx >= 0) {
                 std::snprintf(buf, sizeof(buf), "Scale %s: x%.3f%s", handleName(),
-                              static_cast<double>(sc[axisIdx]),
+                              static_cast<double>(factor),
                               snap ? "  [snap]" : "");
             } else if (planeN >= 0) {
                 std::snprintf(buf, sizeof(buf),
@@ -648,7 +774,7 @@ void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
             // 自由旋转（arcball）的轴是**世界系**算出来的，所以固定走世界空间
             const bool worldApply = m_worldSpace || screenHandle;
             const glm::mat3 R = worldApply ? (D * R0) : (R0 * D);
-            t->rotation = eulerFromRotation(R);
+            *tp.rot = eulerFromRotation(R);
             m_changed = true;
 
             char buf[128];
@@ -662,15 +788,19 @@ void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
 }
 
 void GizmoController::endDrag(EditorContext& ctx, scene::Scene& scene) {
+    // 先把"刚拖的是哪个手柄"拷出来：下面要清 m_dragHandles，而日志/状态栏
+    // 还等着用它（handleName() 读的就是它，清完只能打出 "-"）。
+    const std::string draggedHandle = handleName();
+
     m_dragging = false;
     m_dragHandles = Handle::None;
     m_readout.clear();
 
     if (!m_changed) return;
-    auto* t = scene.world().get<ecs::TransformComponent>(m_entity);
-    if (!t) return;
+    const TrsPointers tp = trsOf(scene, m_entity, m_onCollider);
+    if (!tp.valid()) return;
 
-    const TransformSnapshot after = TransformSnapshot::capture(scene, m_entity);
+    const TransformSnapshot after{*tp.pos, *tp.rot, *tp.scale};
 
     // 值没变（拖了一圈又回到原点）就不进历史
     const bool same =
@@ -681,10 +811,36 @@ void GizmoController::endDrag(EditorContext& ctx, scene::Scene& scene) {
 
     const std::string* nm = scene.world().name(m_entity);
     const std::string label =
-        std::string(modeName()) + " " + (nm ? *nm : std::string("Object"));
+        std::string(modeName()) + " " +
+        (m_onCollider ? "collider of " : "") +
+        (nm ? *nm : std::string("Object"));
 
-    ctx.commands().pushAlreadyApplied(std::make_unique<TransformEditCommand>(
-        label, &scene, m_entity, m_before, after));
+    // 自动化探针：拖拽结束后的落地值。断言"拖 X 只改 scale.x"这类
+    // 不变量就靠它（读数是界面文案，这条是数据）。
+    VK_LOG_INFO("gizmo end: handle=%s '%s' pos=(%.3f,%.3f,%.3f) "
+                "rot=(%.3f,%.3f,%.3f) scale=(%.3f,%.3f,%.3f) target=%s",
+                draggedHandle.c_str(),
+                nm ? nm->c_str() : "Object",
+                static_cast<double>(after.position.x),
+                static_cast<double>(after.position.y),
+                static_cast<double>(after.position.z),
+                static_cast<double>(after.rotation.x),
+                static_cast<double>(after.rotation.y),
+                static_cast<double>(after.rotation.z),
+                static_cast<double>(after.scale.x),
+                static_cast<double>(after.scale.y),
+                static_cast<double>(after.scale.z),
+                targetName());
+
+    // 碰撞体用另一条命令：它写的是 CollisionComponent 的三个分量，
+    // 不是实体的 TransformComponent（见 ColliderEditCommand 的说明）。
+    if (m_onCollider) {
+        ctx.commands().pushAlreadyApplied(std::make_unique<ColliderEditCommand>(
+            label, &scene, m_entity, m_before, after));
+    } else {
+        ctx.commands().pushAlreadyApplied(std::make_unique<TransformEditCommand>(
+            label, &scene, m_entity, m_before, after));
+    }
     ctx.setStatus(label);
     ctx.dirty() = true;
     m_changed = false;
@@ -724,7 +880,33 @@ bool GizmoController::update(EditorContext& ctx, const scene::Camera& camera,
         return false;
     }
 
-    m_origin = glm::vec3(sc.worldMatrix(e)[3]);
+    // 手柄这次作用在哪一组 TRS 上？
+    //   · ctx.colliderEdit() 为真 **且** 选中项真的有碰撞体 → 碰撞体
+    //   · 否则退回实体（哪怕开关还开着 —— 选中项被删了碰撞体也要能用）
+    m_onCollider =
+        ctx.colliderEdit() && sc.world().has<ecs::CollisionComponent>(e);
+
+    // 上锁的实体（自带地面）**不给手柄** —— 它固定不动，画个能拖的手柄
+    // 只会误导（拖了没反应）。视口点选本来就会跳过它，这里挡的是"从
+    // 层级树里选中"这条路径。
+    if (sc.world().has<ecs::LockedComponent>(e)) {
+        if (!m_lockedNotified) {
+            m_lockedNotified = true;
+            const std::string* nm = sc.world().name(e);
+            VK_LOG_INFO("gizmo: '%s' is locked -> no transform handle",
+                        nm ? nm->c_str() : "?");
+        }
+        m_dragging = false;
+        m_dragHandles = Handle::None;
+        m_hover = Handle::None;
+        return false;
+    }
+    m_lockedNotified = false;
+
+    // 手柄的世界矩阵：作用在实体上就是实体世界矩阵；作用在碰撞体上还要
+    // 再乘一层碰撞体自己的局部矩阵（于是手柄画在碰撞体的中心、轴也跟它转）。
+    const glm::mat4 handleXform = targetWorld(sc, e);
+    m_origin = glm::vec3(handleXform[3]);
 
     // 手柄的世界长度：让它在屏幕上恒为 ~90px
     if (!PickingSystem::worldToScreen(m_viewProj, viewportPos, viewportSize,
@@ -740,7 +922,7 @@ bool GizmoController::update(EditorContext& ctx, const scene::Camera& camera,
     glm::vec3 fwd = camera.target() - camera.position();
     if (glm::length(fwd) < 1e-5f) fwd = glm::vec3(0, 0, -1);
     fwd = glm::normalize(fwd);
-    glm::vec3 right = glm::cross(fwd, glm::vec3(0, 1, 0));
+    glm::vec3 right = glm::cross(fwd, glm::vec3(0, 0, 1));  // Z-up 世界参考
     if (glm::length(right) < 1e-5f) right = glm::vec3(1, 0, 0);
     right = glm::normalize(right);
     const glm::vec3 up = glm::normalize(glm::cross(right, fwd));
@@ -757,8 +939,12 @@ bool GizmoController::update(EditorContext& ctx, const scene::Camera& camera,
     }
     m_worldLen = kGizmoPixels / m_pxPerUnit;
 
-    extractBasisXform(sc.worldMatrix(e),
-                      ctx.gizmoSpace() == GizmoSpace::Local, m_axisDir);
+    extractBasisXform(handleXform, ctx.gizmoSpace() == GizmoSpace::Local,
+                      m_axisDir);
+    // 同一份世界矩阵的列，**恒定**当成局部轴取一遍：缩放换算要用它
+    // （见 applyDrag 的 Scale 分支）。世界空间下手柄画的是世界轴，
+    // 但 scale 永远作用在局部轴上，这两件事必须分开记。
+    extractBasisXform(handleXform, /*local=*/true, m_localAxisWorld);
 
     m_mode = ctx.gizmoMode();
     const float L = m_worldLen;

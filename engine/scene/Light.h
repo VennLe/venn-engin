@@ -37,8 +37,12 @@ struct LightInstance {
 
     // 类型编码，写进 cosOuterType.y 供着色器分支。
     // 注意：C++ 的 enum 底层类型必须是整型（不能是 float），
-    // 转成浮点是在 makePointLight/makeSpotLight 里做的。
-    enum class Type : int { Point = 0, Spot = 1 };
+    // 转成浮点是在 makePointLight/makeSpotLight/makeDirectionalLight 里做的。
+    //
+    // Directional（=2）是**实体级方向光**（不加阴影、无衰减，只参与
+    // 分簇前向的局部光通道）。场景级太阳走的是另一条通道
+    // （ShadowPass + 着色器里的 sun UBO），不在这里。
+    enum class Type : int { Point = 0, Spot = 1, Directional = 2 };
 };
 
 // 与着色器 Light 结构体（4×vec4 = 64 字节）必须严格一致
@@ -70,6 +74,23 @@ inline LightInstance makeSpotLight(const glm::vec3& pos,
     li.cosOuterType = glm::vec4(std::cos(sl.outerAngle),
                                 static_cast<float>(LightInstance::Type::Spot),
                                 0.0f, 0.0f);
+    return li;
+}
+
+// 实体级方向光：无衰减、不投射阴影，照亮整个场景。
+// 分簇剔除按"影响球"做 —— 给一个足够大的 range（10⁵ 米），方向光就会
+// 落进每一个簇里；着色器看到 type=2 时直接用方向求值，不再做距离衰减。
+inline LightInstance makeDirectionalLight(
+    const glm::vec3& pos, const ecs::DirectionalLightComponent& dl) {
+    LightInstance li;
+    li.positionRange = glm::vec4(pos, 1e5f);
+    li.colorIntensity = glm::vec4(dl.color, dl.intensity);
+    const glm::vec3 d = glm::length(dl.direction) > 1e-6f
+                            ? glm::normalize(dl.direction)
+                            : glm::vec3(0.0f, 0.0f, -1.0f);
+    li.directionCosInner = glm::vec4(d, 0.0f);
+    li.cosOuterType = glm::vec4(
+        0.0f, static_cast<float>(LightInstance::Type::Directional), 0.0f, 0.0f);
     return li;
 }
 

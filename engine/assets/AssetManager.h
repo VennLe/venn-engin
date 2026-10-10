@@ -24,9 +24,19 @@ public:
     ~AssetManager() = default;  // unique_ptr 自动释放
 
     // ---- 网格 ----
+    // 注意参数顺序：name 排在细分参数**前面**。这样 `sphere(0.5f)`、
+    // `sphere(0.5f, "editor.sphere")` 这些既有写法都不用改，想改细分参数
+    // 再往后加 `, segments, rings` 即可。
+    //
+    // name 同时是缓存键：**参数不同就必须给不同的键**，否则第二次调用会
+    // 直接命中缓存、拿着旧参数的网格回去。编辑器里改图元生成参数走的就是
+    // 这条路（见 editor/PrimitiveBuilder.h 的 primitiveKey）。
     Mesh* cube(float size = 1.0f, const std::string& name = "cube");
     Mesh* plane(float size = 10.0f, const std::string& name = "plane");
-    Mesh* sphere(float radius = 1.0f, const std::string& name = "sphere");
+    Mesh* sphere(float radius = 1.0f, const std::string& name = "sphere",
+                 int segments = 48, int rings = 24);
+    Mesh* cylinder(float radius = 0.5f, const std::string& name = "cylinder",
+                   int segments = 48);
     Mesh* loadModel(const std::string& path,
                     const std::string& name = "model");
 
@@ -87,11 +97,14 @@ namespace assets {
 
 // 便捷：给内置程序化网格补上"来源描述"（序列化重建用）
 inline void tagBuiltinMesh(Mesh* mesh, const char* shape, float size,
-                           const std::string& name) {
+                           const std::string& name, int segments = 0,
+                           int rings = 0) {
     MeshSource src;
     src.kind = MeshSource::Kind::Builtin;
     src.shape = shape;
     src.size = size;
+    src.segments = segments;
+    src.rings = rings;
     src.name = name;
     mesh->setSource(src);
 }
@@ -120,14 +133,34 @@ inline Mesh* AssetManager::plane(float size, const std::string& name) {
     return raw;
 }
 
-inline Mesh* AssetManager::sphere(float radius, const std::string& name) {
+inline Mesh* AssetManager::sphere(float radius, const std::string& name,
+                                  int segments, int rings) {
     auto it = m_meshes.find(name);
     if (it != m_meshes.end()) return it->second.get();
+    // 细分参数兜底：0 或负数会让生成器出现除零 / 空网格
+    if (segments < 3) segments = 3;
+    if (rings < 2) rings = 2;
     auto mesh = std::make_unique<Mesh>();
-    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, makeSphereVertices(radius),
-                 makeSphereIndices());
+    mesh->upload(*m_ctx.device, *m_ctx.cmdPool,
+                 makeSphereVertices(radius, segments, rings),
+                 makeSphereIndices(segments, rings));
     Mesh* raw = mesh.get();
-    tagBuiltinMesh(raw, "sphere", radius, name);
+    tagBuiltinMesh(raw, "sphere", radius, name, segments, rings);
+    m_meshes[name] = std::move(mesh);
+    return raw;
+}
+
+inline Mesh* AssetManager::cylinder(float radius, const std::string& name,
+                                    int segments) {
+    auto it = m_meshes.find(name);
+    if (it != m_meshes.end()) return it->second.get();
+    if (segments < 3) segments = 3;
+    auto mesh = std::make_unique<Mesh>();
+    mesh->upload(*m_ctx.device, *m_ctx.cmdPool,
+                 makeCylinderVertices(radius, segments),
+                 makeCylinderIndices(segments));
+    Mesh* raw = mesh.get();
+    tagBuiltinMesh(raw, "cylinder", radius, name, segments, 0);
     m_meshes[name] = std::move(mesh);
     return raw;
 }

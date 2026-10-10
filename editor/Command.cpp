@@ -1,5 +1,7 @@
 #include "Command.h"
 
+#include "PrimitiveBuilder.h"
+
 #include "assets/AssetManager.h"
 #include "core/Logger.h"
 #include "ecs/Components.h"
@@ -101,6 +103,44 @@ void TransformEditCommand::undo() {
 void TransformEditCommand::redo() {
     if (m_scene) m_after.apply(*m_scene, m_entity);
 }
+
+// ---------------------------------------------------------------- 碰撞体变换
+
+namespace {
+
+// 把快照写进实体的 CollisionComponent（没有组件就什么都不做 —— 比如
+// 撤销到碰撞体已被删除之前/之后的状态）。hullPoints 是派生数据，不动。
+void applyColliderSnapshot(scene::Scene& scene, ecs::Entity e,
+                           const TransformSnapshot& s) {
+    auto* cc = scene.world().get<ecs::CollisionComponent>(e);
+    if (!cc) return;
+    cc->position = s.position;
+    cc->rotation = s.rotation;
+    cc->scale = s.scale;
+}
+
+} // namespace
+
+void ColliderEditCommand::undo() {
+    if (m_scene) applyColliderSnapshot(*m_scene, m_entity, m_before);
+}
+
+void ColliderEditCommand::redo() {
+    if (m_scene) applyColliderSnapshot(*m_scene, m_entity, m_after);
+}
+
+// ---------------------------------------------------------------- 图元生成参数
+
+void PrimitiveEditCommand::apply(const ecs::MeshComponent& snap) {
+    if (!m_comp) return;
+    // 参数先整体拷回去（指针也是旧的那颗，但下面会再按缓存键确认一次 ——
+    // 两道都做是为了即使 AssetManager 换了实例也能自愈）
+    *m_comp = snap;
+    if (m_assets) rebuildPrimitive(*m_assets, *m_comp);
+}
+
+void PrimitiveEditCommand::undo() { apply(m_before); }
+void PrimitiveEditCommand::redo() { apply(m_after); }
 
 // ---------------------------------------------------------------- 场景快照
 

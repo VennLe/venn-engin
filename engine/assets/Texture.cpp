@@ -101,7 +101,7 @@ void Texture::makeCheckerboard(const TextureContext& ctx, uint32_t width,
 }
 
 void Texture::makeSolid(const TextureContext& ctx, uint8_t color[4],
-                        uint32_t size) {
+                        uint32_t size, bool srgb) {
     std::vector<uint8_t> pixels(static_cast<size_t>(size) * size * 4);
     for (uint32_t i = 0; i < size * size; ++i) {
         pixels[i * 4 + 0] = color[0];
@@ -109,12 +109,13 @@ void Texture::makeSolid(const TextureContext& ctx, uint8_t color[4],
         pixels[i * 4 + 2] = color[2];
         pixels[i * 4 + 3] = color[3];
     }
-    fromPixels(ctx, pixels.data(), size, size);
+    fromPixels(ctx, pixels.data(), size, size, srgb);
 
     m_source = TextureSource{};
     m_source.kind = TextureSource::Kind::Solid;
     for (int i = 0; i < 4; ++i) m_source.color[i] = color[i];
     m_source.size = size;
+    m_source.srgb = srgb;
 }
 
 void Texture::uploadAndFinish(const TextureContext& ctx, const uint8_t* pixels,

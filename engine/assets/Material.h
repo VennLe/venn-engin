@@ -63,6 +63,27 @@ struct Material {
     Texture* normalMap = nullptr;  // 默认 (0.5,0.5,1) → 平坦法线
     Texture* ormMap = nullptr;     // 默认白 → ao/rough/metallic 均为 1
 
+    // ---- 单通道因子贴图（UE5 风格：每个因子旁边可以再挂一张图）----
+    //
+    // 与上面的 ormMap 是**相乘**关系，不是二选一：
+    //     rough = roughnessFactor × ormMap.g × roughnessMap.r
+    //     metal = metallicFactor  × ormMap.b × metallicMap.r
+    // 未绑定时绑定内置的纯白（1,1,1）→ 乘法退化成恒等，行为与加这两个槽
+    // 之前逐像素一致。glTF 导进来的材质走打包的 ORM，手工搭的材质则可以
+    // 一张一张单独指定（只有粗糙度图、没有金属度图是很常见的）。
+    //
+    // 只读 R 通道（灰度图），所以按 **线性** 采样（srgb=false）：粗糙度是
+    // 一个物理量，不是颜色，做 sRGB 解码会把数值整体抬亮。
+    Texture* roughnessMap = nullptr;   // 默认白 → 只吃 roughnessFactor
+    Texture* metallicMap = nullptr;    // 默认白 → 只吃 metallicFactor
+
+    // 自发光贴图（RGB 颜色贴图，srgb=true）。
+    // 这里是**相加**而不是相乘：emissive 因子默认是 0（不发光），若做乘法
+    // 那么"拖一张自发光图进来却什么都不亮"，得先去把因子调上去才知道生效。
+    //     emissive = emissiveFactor + emissiveMap.rgb
+    // 未绑定时绑定内置纯黑（0,0,0）→ 加法退化成恒等。
+    Texture* emissiveMap = nullptr;    // 默认黑
+
     // glTF 双面标记（当前管线仍按背面剔除处理，留作扩展）
     bool doubleSided = false;
 

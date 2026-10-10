@@ -1,15 +1,14 @@
 #pragma once
 // ============================================================
-// editor/Toolbar —— 主菜单 + 播放控制条
+// editor/Toolbar —— 主菜单 + 撤销/重做条
 //
-// 播放按钮是"EditorScene / RuntimeScene 分离"的操作入口：
-//
-//   Play  → EditorContext::play()   把编辑态整份复制成运行态并开跑
-//   Pause → 冻结运行态的更新（保留全部状态）
-//   Stop  → 直接丢弃运行态
-//
-// 因此 Stop 之后编辑态一定是你离开时的样子 —— 不需要任何回滚。
-// 按钮上会把这一点直接写出来，免得用户以为"停止会重置场景"。
+// 历史上这条工具栏塞过 Save/New/手柄模式/播放按钮；现在全部移走：
+//   · Save / New       → File 菜单（Ctrl+S / Ctrl+N 一直都在）
+//   · Move/Rotate/Scale → 视口工具条（W / E / R），工具栏里是重复入口
+//   · Fullscreen       → F / F11 快捷键 + View 菜单
+//   · Run / Play/Pause/Stop → 视口正下方那一行播放条
+//     （Run=运行游戏；Play/Pause/Stop=编辑态脚本动画，见 EditorContext）
+// 工具栏只剩右对齐的 Undo / Redo。
 // ============================================================
 
 #include "EditorContext.h"
@@ -27,7 +26,7 @@ public:
 
 private:
     void drawMenuBar();
-    void drawPlayControls();
+    void drawBar();
     // 工具栏分组之间的竖线（比 TextUnformatted("|") 更像 UE5 的分组线）
     static void toolbarSeparator();
 

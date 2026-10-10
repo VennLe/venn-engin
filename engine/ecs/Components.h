@@ -60,18 +60,112 @@ struct HierarchyComponent {
 };
 
 // ---------------- 渲染 ----------------
+
+// 内置图元的**生成参数**。只描述"这颗 mesh 是怎么生出来的"，不参与渲染。
+//
+// 为什么要存这个：Blender 里加完一个图元，半径 / 分段数这些生成参数是
+// 可以回头再改的（改完重建几何）。这里就是同一套 —— MeshComponent 记住
+// 当初用的是什么参数，Inspector 把参数显示出来、允许拖拽调整，调完按新
+// 参数重新生成一颗 mesh。OBJ / glTF 没有这些参数（几何由文件决定），
+// 所以 primitive 是 None。
+//
+// ⚠ 别和 editor::PrimitiveKind 搞混：那个是"Add 菜单里能点什么"（还包含
+// PointLight / SpotLight / Empty），这个只是网格几何的生成方式。
+//
+// 单独拆成 struct 是为了让撤销命令能整体按值拷贝（见
+// editor::PrimitiveEditCommand）—— 参数和几何必须一起回滚。
+enum class MeshPrimitive : int {
+    None = 0,  // 非内置图元（OBJ / glTF / 未知）
+    Cube,      // size
+    Plane,     // size
+    Sphere,    // radius, segments, rings
+    Cylinder,  // radius, segments
+};
+
+struct MeshPrimitiveParams {
+    MeshPrimitive primitive = MeshPrimitive::None;
+    float size = 1.0f;     // Cube / Plane：边长
+    float radius = 0.5f;   // Sphere / Cylinder
+    int segments = 48;     // Sphere / Cylinder：经向分段
+    int rings = 24;        // Sphere：纬向分段
+
+    bool isBuiltin() const { return primitive != MeshPrimitive::None; }
+};
+
 struct MeshComponent {
     assets::Mesh* mesh = nullptr;
+    MeshPrimitiveParams params;  // 只有内置图元才有意义
 };
 
 struct MaterialComponent {
     assets::Material* material = nullptr;
 };
 
+// ---------------- 碰撞体 ----------------
+//
+// 碰撞体是**独立于渲染网格**的一块凸几何：默认按网格生成（凸包紧紧包住
+// 模型 / 胶囊套住最长轴），之后用 W/E/R 手柄单独摆它 —— 这就是"碰撞框
+// 可以调，但创建时刚好包裹住物体"的实现方式。
+//
+// 几何存在**自己的局部空间、且已经按自身中心居中**，位置/旋转/缩放分开
+// 存。居中这一步很关键：否则缩放手柄会把碰撞体从实体原点往外拉，而不是
+// 绕它自己放大。
+//
+// 凸包顶点是**派生数据**（由网格顶点经 QuickHull 算出），不进场景 JSON：
+// 读盘时按 mesh 重新生成。和网格 / 材质"只存来源、读时重建"是同一条思路。
+enum class ColliderShape : int {
+    ConvexHull = 0,  // 按网格几何求凸包（QuickHull）
+    Capsule = 1,     // 胶囊体（轴 = 碰撞体局部 +Z）
+};
+
+struct CollisionComponent {
+    ColliderShape shape = ColliderShape::Capsule;
+
+    // 碰撞体相对实体的 TRS（默认 = 刚好包裹物体）
+    glm::vec3 position{0.0f};
+    glm::vec3 rotation{0.0f};  // 欧拉角（弧度），顺序 X→Y→Z，与 Transform 一致
+    glm::vec3 scale{1.0f};
+
+    // 胶囊参数（shape == Capsule 时有效）
+    float capsuleRadius = 0.5f;
+    float capsuleHalfHeight = 0.5f;  // 圆柱段半高，不含两端半球
+
+    // 凸包顶点（碰撞体局部空间，已居中）。派生数据，见上面的说明。
+    std::vector<glm::vec3> hullPoints;
+    // 凸包的边（索引进 hullPoints；无向、已去重）。
+    // 只有**线框绘制**要用它：凸包的面是三角形，直接画面等于画一团糊，
+    // 而画边才是"碰撞框"该有的样子。同样是派生数据。
+    std::vector<glm::uvec2> hullEdges;
+
+    // 参与"不能互相穿过"的求解。关掉就是纯触发器 —— 仍然可视化、
+    // 仍然能被相机挡住，但不会推开别的物体。
+    bool solid = true;
+
+    glm::mat4 localMatrix() const {
+        glm::mat4 m(1.0f);
+        m = glm::translate(m, position);
+        m = glm::rotate(m, rotation.x, glm::vec3(1, 0, 0));
+        m = glm::rotate(m, rotation.y, glm::vec3(0, 1, 0));
+        m = glm::rotate(m, rotation.z, glm::vec3(0, 0, 1));
+        m = glm::scale(m, scale);
+        return m;
+    }
+};
+
 struct VisibilityComponent {
     bool visible = true;      // 参与主渲染
     bool castShadow = true;   // 参与阴影贴图渲染
 };
+
+// ---------------- 编辑器锁定（纯标记）----------------
+// 上锁的实体：**视口点选会跳过它**，选中了也不给变换手柄 —— 也就是
+// "看得见、但动不了"。
+//
+// 引擎自带的**地面**就是靠它固定住的：地面 + 栅格是编辑器的参照物，
+// 不该被平移 / 缩放 / 旋转（用户明确要求），否则"参考系"本身就会跑掉。
+//
+// 只影响编辑器交互：渲染、脚本、将来的物理都不看它。
+struct LockedComponent {};
 
 // ---------------- 光照 ----------------
 struct DirectionalLightComponent {

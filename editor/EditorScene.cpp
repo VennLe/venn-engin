@@ -1,6 +1,7 @@
 #include "EditorScene.h"
 
 #include "PickingSystem.h"
+#include "PrimitiveBuilder.h"
 
 #include "assets/AssetManager.h"
 #include "assets/AssetPath.h"
@@ -28,7 +29,22 @@ namespace {
 
 void attachRenderable(ecs::World& w, ecs::Entity e, assets::Mesh* mesh,
                       assets::Material* mat) {
-    w.add<ecs::MeshComponent>(e, ecs::MeshComponent{mesh});
+    ecs::MeshComponent mc;
+    mc.mesh = mesh;   // params 保持 None：几何由文件决定
+    w.add<ecs::MeshComponent>(e, mc);
+    w.add<ecs::MaterialComponent>(e, ecs::MaterialComponent{mat});
+}
+
+// 内置图元：几何 + 材质 + **生成参数**。
+// 参数那一份是给 Inspector 用的 —— 加了之后那颗 Cube 的边长、球的
+// 半径/分段数都能在右侧面板里回头改（见 editor/PrimitiveBuilder.h）。
+// OBJ / glTF 走 attachRenderable，params 保持 None（几何由文件决定）。
+void attachPrimitive(ecs::World& w, ecs::Entity e, assets::AssetManager& am,
+                     ecs::MeshPrimitive kind, assets::Material* mat) {
+    ecs::MeshComponent mc;
+    mc.params = defaultPrimitiveParams(kind);
+    rebuildPrimitive(am, mc);
+    w.add<ecs::MeshComponent>(e, mc);
     w.add<ecs::MaterialComponent>(e, ecs::MaterialComponent{mat});
 }
 
@@ -64,11 +80,23 @@ const char* primitiveKindName(PrimitiveKind k) {
         case PrimitiveKind::Cube: return "Cube";
         case PrimitiveKind::Sphere: return "Sphere";
         case PrimitiveKind::Plane: return "Plane";
+        case PrimitiveKind::Cylinder: return "Cylinder";
         case PrimitiveKind::PointLight: return "PointLight";
         case PrimitiveKind::SpotLight: return "SpotLight";
         case PrimitiveKind::Empty: return "Empty";
     }
     return "Object";
+}
+
+// 半高：网格类把中心抬这么高，底部就正好贴在 groundSpot.z 上
+static float primitiveHalfHeight(PrimitiveKind kind) {
+    switch (kind) {
+        case PrimitiveKind::Cube: return 0.5f;      // cube(1.0)
+        case PrimitiveKind::Sphere: return 0.5f;    // sphere(0.5)
+        case PrimitiveKind::Cylinder: return 0.5f;  // cylinder(0.5) → 高 1
+        case PrimitiveKind::Plane: return 0.0f;     // 平面就贴在面上
+        default: return 0.0f;
+    }
 }
 
 ecs::Entity createPrimitive(scene::Scene& scene, assets::AssetManager& assets,
@@ -79,19 +107,24 @@ ecs::Entity createPrimitive(scene::Scene& scene, assets::AssetManager& assets,
 
     switch (kind) {
         case PrimitiveKind::Cube:
-            attachRenderable(w, e, assets.cube(1.0f),
-                             paletteMaterial(assets, "editor_cube_default",
-                                             200, 200, 205, 0.55f, 0.0f));
+            attachPrimitive(w, e, assets, ecs::MeshPrimitive::Cube,
+                            paletteMaterial(assets, "editor_cube_default",
+                                            200, 200, 205, 0.55f, 0.0f));
             break;
         case PrimitiveKind::Sphere:
-            attachRenderable(w, e, assets.sphere(0.5f),
-                             paletteMaterial(assets, "editor_sphere_default",
-                                             210, 180, 120, 0.25f, 1.0f));
+            attachPrimitive(w, e, assets, ecs::MeshPrimitive::Sphere,
+                            paletteMaterial(assets, "editor_sphere_default",
+                                            210, 180, 120, 0.25f, 1.0f));
+            break;
+        case PrimitiveKind::Cylinder:
+            attachPrimitive(w, e, assets, ecs::MeshPrimitive::Cylinder,
+                            paletteMaterial(assets, "editor_cylinder_default",
+                                            185, 200, 170, 0.45f, 0.0f));
             break;
         case PrimitiveKind::Plane:
-            attachRenderable(w, e, assets.plane(2.0f),
-                             paletteMaterial(assets, "editor_plane_default",
-                                             170, 172, 178, 0.85f, 0.0f));
+            attachPrimitive(w, e, assets, ecs::MeshPrimitive::Plane,
+                            paletteMaterial(assets, "editor_plane_default",
+                                            170, 172, 178, 0.85f, 0.0f));
             break;
         case PrimitiveKind::PointLight: {
             ecs::PointLightComponent pl;
@@ -106,13 +139,62 @@ ecs::Entity createPrimitive(scene::Scene& scene, assets::AssetManager& assets,
             sl.color = glm::vec3(0.92f, 0.96f, 1.0f);
             sl.intensity = 32.0f;
             sl.range = 9.0f;
-            sl.direction = glm::vec3(0.0f, -1.0f, 0.0f);
+            sl.direction = glm::vec3(0.0f, 0.0f, -1.0f);  // Z-up：朝下照
             w.add<ecs::SpotLightComponent>(e, sl);
             break;
         }
         case PrimitiveKind::Empty:
             break;
     }
+    return e;
+}
+
+ecs::Entity createPrimitiveOnGround(scene::Scene& scene,
+                                    assets::AssetManager& assets,
+                                    PrimitiveKind kind,
+                                    const glm::vec3& groundSpot) {
+    glm::vec3 pos = groundSpot;
+    switch (kind) {
+        case PrimitiveKind::PointLight:
+            pos.z += 1.6f;   // 挂在半空，别埋进地板
+            break;
+        case PrimitiveKind::SpotLight:
+            pos.z += 2.6f;   // 射灯默认朝下照，放高一点才有光斑
+            break;
+        default:
+            pos.z += primitiveHalfHeight(kind);
+            break;
+    }
+    return createPrimitive(scene, assets, kind, pos);
+}
+
+// ---------------------------------------------------------------- 特殊灯光
+
+ecs::Entity createSunlight(scene::Scene& scene) {
+    // 日照预设（与 resetToEmptyScene 的默认太阳一致：
+    // 暖白光、从上前方打下、开阴影、开阔场景的环境光强度）
+    scene::Light& sun = scene.light();   // 没有就懒创建
+    sun.direction = glm::normalize(glm::vec3(-0.38f, -0.42f, -1.0f));
+    sun.color = glm::vec3(1.0f, 0.97f, 0.92f);
+    sun.intensity = 1.6f;
+    sun.castsShadow = true;
+    sun.ambientScale = 0.55f;
+    return scene.lightEntity();
+}
+
+ecs::Entity createDirectionalLight(scene::Scene& scene,
+                                   const glm::vec3& position) {
+    ecs::World& w = scene.world();
+    ecs::Entity e = scene.createObject("Directional Light");
+    if (auto* t = w.get<ecs::TransformComponent>(e)) t->position = position;
+
+    ecs::DirectionalLightComponent dl;
+    dl.direction = glm::vec3(0.0f, 0.0f, -1.0f);  // 默认竖直向下
+    dl.color = glm::vec3(1.0f);
+    dl.intensity = 1.0f;
+    dl.castsShadow = false;   // 阴影只有场景级太阳有
+    dl.ambientScale = 0.0f;
+    w.add<ecs::DirectionalLightComponent>(e, dl);
     return e;
 }
 
@@ -201,8 +283,9 @@ void alignImportToGround(scene::Scene& scene, PickingSystem& picking,
 
     glm::vec3 shift(0.0f);
     if (box.valid) {
+        // Z-up：把包围盒的 **min.z**（底部）贴到 target.z（栅格面 z=0）
         const glm::vec3 c = (box.min + box.max) * 0.5f;
-        shift = glm::vec3(target.x - c.x, target.y - box.min.y, target.z - c.z);
+        shift = glm::vec3(target.x - c.x, target.y - c.y, target.z - box.min.z);
     } else {
         VK_LOG_WARN("alignImportToGround: no CPU-side mesh bounds, "
                     "placing root at the ray hit without ground snapping");
@@ -210,34 +293,59 @@ void alignImportToGround(scene::Scene& scene, PickingSystem& picking,
 
     if (auto* t = scene.world().get<ecs::TransformComponent>(imported.root)) {
         t->position += shift;
-        // 自动化断言用：算完之后"底部"应当**正好**等于 target.y。
+        // 自动化断言用：算完之后"底部"应当**正好**等于 target.z。
         // （tools/verify_asset_drag.py 解析这一行来验证贴地是否生效。）
         VK_LOG_INFO(
-            "alignImportToGround: box.min.y=%.4f -> bottom=%.4f "
-            "(target.y=%.4f) root=(%.3f, %.3f, %.3f)",
-            box.valid ? box.min.y : 0.0f,
-            box.valid ? box.min.y + shift.y : 0.0f, target.y, t->position.x,
+            "alignImportToGround: box.min.z=%.4f -> bottom=%.4f "
+            "(target.z=%.4f) root=(%.3f, %.3f, %.3f)",
+            box.valid ? box.min.z : 0.0f,
+            box.valid ? box.min.z + shift.z : 0.0f, target.z, t->position.x,
             t->position.y, t->position.z);
     }
 }
 
 // ---------------------------------------------------------------- 空场景
 
-void resetToEmptyScene(scene::Scene& scene) {
+void resetToEmptyScene(scene::Scene& scene, assets::AssetManager& assets) {
     scene.clear();
 
     // 空场景也得"看得见东西"：一盏方向光（否则一片死黑，用户会以为坏了）
-    // + 一个能一眼看到原点的相机机位。
-    scene.light().direction = glm::normalize(glm::vec3(-0.42f, -1.0f, -0.38f));
+    // + 一个能一眼看到原点的相机机位。Z-up：光从上前方打下来。
+    scene.light().direction = glm::normalize(glm::vec3(-0.38f, -0.42f, -1.0f));
     scene.light().color = glm::vec3(1.0f, 0.97f, 0.92f);
     scene.light().intensity = 1.6f;
     scene.light().castsShadow = true;
     scene.light().ambientScale = 0.55f;   // 开阔场景，环境光给足
 
-    scene.camera().setTarget(glm::vec3(0.0f, 0.5f, 0.0f));
+    scene.camera().setTarget(glm::vec3(0.0f, 0.0f, 0.5f));
     scene.camera().setDistance(9.0f);
     scene.camera().setYaw(0.62f);
     scene.camera().setPitch(0.30f);
+
+    // ---- 自带地面（UE5 手感的不透明平面）----
+    // 尺寸与栅格的 extent（半边长 60 → 120×120）对齐：栅格正好铺满整块地面，
+    // 边缘不会出现"线飘在没有地板的地方"。
+    {
+        constexpr float kGroundSize = 120.0f;   // 边长（米）
+        ecs::World& w = scene.world();
+        ecs::Entity ground = scene.createObject("Ground");
+        if (auto* t = w.get<ecs::TransformComponent>(ground)) {
+            t->position = glm::vec3(0.0f);   // 平面单面、居中于 z = 0 → 顶面 = 栅格面
+            t->scale = glm::vec3(kGroundSize, kGroundSize, 1.0f);
+        }
+        attachRenderable(w, ground, assets.plane(1.0f, "editor_ground"),
+                         paletteMaterial(assets, "editor_ground_default",
+                                         105, 108, 114, 0.9f, 0.0f));
+        // 地面只**接收**阴影、不投影：地板自投影只会引入 acne 条纹，
+        // 而它本来也挡不住什么光（这也是 UE5 里 Floor 的默认设置）。
+        if (auto* v = w.get<ecs::VisibilityComponent>(ground)) {
+            v->castShadow = false;
+        }
+        // **地面固定不动**：它是编辑器的参照系，不该被平移 / 缩放 / 旋转。
+        // LockedComponent 让视口点选跳过它、选中也不给变换手柄（工程里
+        // 所有实体都支持这个标记，地面只是默认带上的那一个）。
+        w.add<ecs::LockedComponent>(ground);
+    }
 
     VK_LOG_INFO("Venn editor: empty scene (%zu entities)", scene.objectCount());
 }

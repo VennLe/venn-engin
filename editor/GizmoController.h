@@ -3,7 +3,7 @@
 // editor/GizmoController —— 视口里的移动 / 旋转 / 缩放手柄
 //
 // 为什么不用 ImGuizmo：third_party 里没有，而它自带一份需要长期维护的
-// 源码 + 它的坐标系约定（右手 Y-up、深度朝 -Z）与本引擎的相机/裁剪约定
+// 源码 + 它的坐标系约定（右手 Z-up、深度朝 -Z）与本引擎的相机/裁剪约定
 // 并不完全一致，接进来反而要写一层适配。这里用手柄自绘 + 射线数学，
 // 一共两个文件，行为完全可控。
 //
@@ -113,6 +113,13 @@ public:
     const char* handleName() const;
     const char* modeName() const;
 
+    // 手柄当前作用在哪一组 TRS 上（"entity" / "collider"）。
+    // 供状态栏与自动化日志断言用。
+    const char* targetName() const {
+        return m_onCollider ? "collider" : "entity";
+    }
+    bool editingCollider() const { return m_onCollider; }
+
     // 拖拽过程中的实时读数（"Move X: +0.30 m" / "Move XY: +0.30 / +0.10 m" /
     // "Rotate Z: +45.0deg" / "Scale all: x1.10"，吸附打开时末尾带 " [snap]"）。
     // 擦除后为空串。
@@ -136,6 +143,27 @@ private:
     // 平面手柄（法线 = 轴 index）在平面内用的两个基向量：index 之外的另两轴
     void planeBasisForHandles(int normalIdx, glm::vec3& u, glm::vec3& v) const;
 
+    // 手柄这次要读写哪一组 TRS。
+    //
+    // 实体的 TransformComponent 与实体的 CollisionComponent 里，
+    // position / rotation / scale 三个字段的名字、类型、欧拉角顺序**完全
+    // 一致**，所以平移 / 旋转 / 缩放那套数学一行都不用改 —— 只需要在
+    // 读写的那一刻换一组指针。这里就是那个"换指针"的地方。
+    //
+    // 返回空指针组表示"该目标不存在"（比如选中项没有碰撞体）。
+    struct TrsPointers {
+        glm::vec3* pos = nullptr;
+        glm::vec3* rot = nullptr;
+        glm::vec3* scale = nullptr;
+        bool valid() const { return pos && rot && scale; }
+    };
+    static TrsPointers trsOf(scene::Scene& scene, ecs::Entity e,
+                             bool onCollider);
+
+    // 手柄的世界矩阵：实体世界矩阵（作用在实体上）
+    // 或 实体世界矩阵 × 碰撞体局部矩阵（作用在碰撞体上）
+    glm::mat4 targetWorld(scene::Scene& scene, ecs::Entity e) const;
+
     // 投影缓存：每帧算一次，绘制与命中测试共用
     glm::vec2 m_originScreen{0.0f};
     glm::mat4 m_viewProj{1.0f};
@@ -143,6 +171,13 @@ private:
     glm::vec2 m_viewportSize{1.0f};
     glm::vec3 m_axisDir[3]{glm::vec3(1, 0, 0), glm::vec3(0, 1, 0),
                            glm::vec3(0, 0, 1)};
+    // 物体**自己的**三根局部轴在世界里的方向（= 世界矩阵的三列，归一化）。
+    // 和 m_axisDir 的区别：m_axisDir 是"手柄画出来/被点中的"那套轴，随
+    // GizmoSpace 在"世界轴"和"局部轴"之间切换；这一份**恒定是局部轴**，
+    // 专门给缩放的换算用 —— TransformComponent::scale 是局部的，而手柄
+    // 拖的是世界里的方向，两者对旋转过的物体并不重合。详见 applyDrag。
+    glm::vec3 m_localAxisWorld[3]{glm::vec3(1, 0, 0), glm::vec3(0, 1, 0),
+                                  glm::vec3(0, 0, 1)};
     glm::vec3 m_camRight{1.0f, 0.0f, 0.0f};
     glm::vec3 m_camUp{0.0f, 1.0f, 0.0f};
     glm::vec3 m_viewNormal{0.0f, 0.0f, 1.0f};  // 相机视线方向
@@ -167,6 +202,8 @@ private:
 
     ecs::Entity m_entity{};
     GizmoMode m_mode = GizmoMode::Translate;
+    // 这次（拖拽期间冻结）作用在碰撞体上？
+    bool m_onCollider = false;
     TransformSnapshot m_before;
     glm::vec3 m_startPos{0.0f};
     glm::vec3 m_startRot{0.0f};
@@ -178,12 +215,18 @@ private:
     glm::vec3 m_dragU{1.0f, 0.0f, 0.0f};      // 平面内基向量 1
     glm::vec3 m_dragV{0.0f, 1.0f, 0.0f};      // 平面内基向量 2
     glm::vec3 m_dragViewNormal{0.0f, 0.0f, 1.0f};
+    // 拖拽开始时的局部轴（缩放换算用；和上面几个一样必须冻结）
+    glm::vec3 m_dragLocalAxes[3]{glm::vec3(1, 0, 0), glm::vec3(0, 1, 0),
+                                 glm::vec3(0, 0, 1)};
     float m_dragWorldLen = 1.0f;
     float m_startParam = 0.0f;      // 单轴：最近点参数
     glm::vec3 m_startHit{0.0f};     // 平面 / 屏幕：按下时的交点
     float m_startAngle = 0.0f;      // 单轴旋转：按下时的方位角
     glm::vec2 m_startMouse{0.0f};
     std::string m_readout;
+    // 上锁实体的"不给手柄"提示只打一次日志（否则每帧一行刷屏）；
+    // 离开锁定状态时复位，下次再选中它还会提示。
+    bool m_lockedNotified = false;
 };
 
 } // namespace editor

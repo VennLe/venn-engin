@@ -1,6 +1,7 @@
 #include "SceneHierarchy.h"
 
 #include "DebugRects.h"
+#include "EditorDragDrop.h"
 #include "EditorIcons.h"
 #include "ecs/Components.h"
 #include "scene/Camera.h"
@@ -138,12 +139,14 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
     const auto* scp = w.get<ecs::ScriptComponent>(e);
     const auto* vis = w.get<ecs::VisibilityComponent>(e);
     const auto* dl = w.get<ecs::DirectionalLightComponent>(e);
+    const bool locked = w.has<ecs::LockedComponent>(e);
 
-    std::snprintf(label, sizeof(label), "%s%s%s%s%s%s%s", name.c_str(),
+    std::snprintf(label, sizeof(label), "%s%s%s%s%s%s%s%s", name.c_str(),
                   mc ? "  [mesh]" : "", dl ? "  [sun]" : "",
                   (pl || sl) ? "  [light]" : "", scp ? "  [script]" : "",
                   (vis && !vis->visible) ? "  [hidden]" : "",
-                  (vis && !vis->castShadow) ? "  [noshadow]" : "");
+                  (vis && !vis->castShadow) ? "  [noshadow]" : "",
+                  locked ? "  [locked]" : "");
 
     // 是不是"文件夹"（纯分组节点）：Hierarchy 里给它画目录图标 + 暖色名字
     const bool isGroup = h && h->group;
@@ -202,13 +205,13 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
 
     // ---- 拖拽重挂父级 ----
     if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
-        ImGui::SetDragDropPayload("EDITOR_ENTITY", &e.id, sizeof(ecs::EntityId));
+        ImGui::SetDragDropPayload(drag::kEntity, &e.id, sizeof(ecs::EntityId));
         ImGui::TextUnformatted(name.c_str());
         ImGui::EndDragDropSource();
     }
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload* p =
-                ImGui::AcceptDragDropPayload("EDITOR_ENTITY")) {
+                ImGui::AcceptDragDropPayload(drag::kEntity)) {
             ecs::EntityId childId = ecs::kInvalidEntity;
             if (p->DataSize == sizeof(ecs::EntityId)) {
                 std::memcpy(&childId, p->Data, sizeof(ecs::EntityId));

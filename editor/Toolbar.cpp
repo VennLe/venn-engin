@@ -18,9 +18,8 @@ namespace editor {
 namespace {
 
 // 播放控制按钮的配色（绿=播放、黄=暂停、红=停止）
-constexpr ImVec4 kPlayCol(0.20f, 0.52f, 0.26f, 1.0f);
-constexpr ImVec4 kPauseCol(0.62f, 0.50f, 0.16f, 1.0f);
-constexpr ImVec4 kStopCol(0.48f, 0.22f, 0.22f, 1.0f);
+// 播放条配色（Run / Play / Pause / Stop）现在由 ContentBrowser 底部的
+// 播放行使用 —— 颜色常量跟着搬过去了，这里不再需要。
 
 } // namespace
 
@@ -28,7 +27,7 @@ constexpr ImVec4 kStopCol(0.48f, 0.22f, 0.22f, 1.0f);
 
 void Toolbar::newScene() {
     m_ctx.stop();
-    resetToEmptyScene(m_ctx.editorScene());
+    resetToEmptyScene(m_ctx.editorScene(), m_ctx.assets());
     // onSceneReplaced() 里会把相机重设成编辑态模式（显式输入 + 自由飞行）
     m_ctx.onSceneReplaced();
     m_ctx.notify("New empty scene");
@@ -117,7 +116,8 @@ void Toolbar::drawMenuBar() {
         ImGui::EndDisabled();
 
         ImGui::Separator();
-        if (ImGui::MenuItem("Settings...")) m_ctx.showSettings() = true;
+        if (ImGui::MenuItem("Preferences...", nullptr, false, true))
+            m_ctx.showSettings() = true;
 
         // 历史列表（最近 12 条，倒序）
         const auto names = m_ctx.commands().historyNames();
@@ -137,8 +137,9 @@ void Toolbar::drawMenuBar() {
     if (ImGui::BeginMenu("GameObject")) {
         static const PrimitiveKind kinds[] = {
             PrimitiveKind::Cube,      PrimitiveKind::Sphere,
-            PrimitiveKind::Plane,     PrimitiveKind::PointLight,
-            PrimitiveKind::SpotLight, PrimitiveKind::Empty};
+            PrimitiveKind::Cylinder,  PrimitiveKind::Plane,
+            PrimitiveKind::PointLight, PrimitiveKind::SpotLight,
+            PrimitiveKind::Empty};
         for (PrimitiveKind k : kinds) {
             if (ImGui::MenuItem(primitiveKindName(k))) {
                 ecs::Entity created{};
@@ -150,6 +151,22 @@ void Toolbar::drawMenuBar() {
                     });
                 if (created.valid()) m_ctx.select(created);
             }
+        }
+        // 特殊灯光条目（语义不在 PrimitiveKind 里，见 EditorScene.h）
+        ImGui::Separator();
+        if (ImGui::MenuItem("Sunlight")) {
+            ecs::Entity sun{};
+            m_ctx.structuralEdit("Add Sunlight", [&]() {
+                sun = createSunlight(m_ctx.editorScene());
+            });
+            if (sun.valid()) m_ctx.select(sun);
+        }
+        if (ImGui::MenuItem("Directional Light")) {
+            ecs::Entity created{};
+            m_ctx.structuralEdit("Add Directional Light", [&]() {
+                created = createDirectionalLight(m_ctx.editorScene());
+            });
+            if (created.valid()) m_ctx.select(created);
         }
         ImGui::EndMenu();
     }
@@ -203,6 +220,8 @@ void Toolbar::drawMenuBar() {
             nullptr, false, false);
         ImGui::MenuItem("F: focus selection   Del: delete", nullptr, false,
                         false);
+        ImGui::MenuItem("Shift+A (in viewport): add menu (Mesh / Light)",
+                        nullptr, false, false);
         ImGui::MenuItem("F2: rename (Hierarchy)   Ctrl+D: duplicate", nullptr,
                         false, false);
         ImGui::MenuItem("Ctrl+Z / Ctrl+Y: undo / redo", nullptr, false, false);
@@ -240,9 +259,12 @@ void Toolbar::drawMenuBar() {
     ImGui::EndMainMenuBar();
 }
 
-// ---------------------------------------------------------------- 播放条
+// ---------------------------------------------------------------- 工具条
+//
+// 只剩右对齐的 Undo / Redo（Save/New/手柄模式/全屏/播放控制都已移走，
+// 见 Toolbar.h 顶部的去向说明）。
 
-void Toolbar::drawPlayControls() {
+void Toolbar::drawBar() {
     const LayoutRects& L = m_ctx.layout();
     // 全宽固定条：窗口缩放时跟随宽度
     ImGui::SetNextWindowPos(ImVec2(L.toolbar.x, L.toolbar.y),
@@ -277,118 +299,24 @@ void Toolbar::drawPlayControls() {
         return ImGui::CalcTextSize(label).x + st.FramePadding.x * 2.0f + 12.0f;
     };
 
-    const bool playing = m_ctx.isPlaying();
-    const bool paused = m_ctx.isPaused();
-
-    // 把窗口内容宽度扣掉左右内边距，下面按它做居中 / 右对齐
+    // 把窗口内容宽度扣掉左右内边距，下面按它做右对齐
     const float barW = ImGui::GetWindowWidth() - pad.x * 2.0f;
     const float rowY = ImGui::GetCursorPosY();
 
-    // ================================================================
-    // 左组：文件操作
-    // ================================================================
-    if (ImGui::Button("Save", ImVec2(btnW("Save"), btnH)))
-        saveScene(m_ctx.scenePath());
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Save scene (Ctrl+S)\n%s%s", m_ctx.scenePath().c_str(),
-                          m_ctx.dirty() ? "  *unsaved" : "");
+    // 左侧：当前手柄模式提示（轻量文字，不占按钮 —— 模式切换在视口工具条）
+    const char* modeName = "Move";
+    switch (m_ctx.gizmoMode()) {
+        case GizmoMode::Translate: modeName = "Move"; break;
+        case GizmoMode::Rotate:    modeName = "Rotate"; break;
+        case GizmoMode::Scale:     modeName = "Scale"; break;
     }
-    ImGui::SameLine();
-    if (ImGui::Button("New", ImVec2(btnW("New"), btnH))) newScene();
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Throw the scene away and start from an\n"
-                          "empty scene (Ctrl+N).");
-    }
-    const float leftW = ImGui::GetItemRectMax().x - pad.x;
-
-    // ================================================================
-    // 中组：手柄模式 + 播放控制（整组水平居中）
-    // ================================================================
-    const GizmoMode mode = m_ctx.gizmoMode();
-    const char* kModes[3] = {"Move", "Rotate", "Scale"};
-    const GizmoMode kModeVals[3] = {GizmoMode::Translate, GizmoMode::Rotate,
-                                    GizmoMode::Scale};
-
-    // 先量宽度，再决定从哪里开始画
-    float centerW = btnW("Play") + btnW("Pause") + btnW("Stop") +
-                    btnW("Fullscreen");
-    for (const char* m : kModes) centerW += btnW(m);
-    centerW += st.ItemSpacing.x * 7.0f + 34.0f;   // 7 个间隔 + 两条分隔符
-
-    const float rightW = btnW("Undo") + btnW("Redo") + st.ItemSpacing.x;
-    const float centerX = std::max(leftW + 24.0f,
-                                   (barW - centerW) * 0.5f);
-
-    ImGui::SetCursorPos(ImVec2(pad.x + centerX, rowY));
-
-    // ---- 手柄模式（和视口工具栏 / W E R 是同一份状态）----
-    for (int i = 0; i < 3; ++i) {
-        if (i > 0) ImGui::SameLine();
-        const bool on = (mode == kModeVals[i]);
-        ImGui::PushStyleColor(ImGuiCol_Button,
-                              on ? ImVec4(0.216f, 0.400f, 0.706f, 1.0f)
-                                 : ImVec4(0.200f, 0.211f, 0.231f, 1.0f));
-        if (ImGui::Button(kModes[i], ImVec2(btnW(kModes[i]), btnH)))
-            m_ctx.setGizmoMode(kModeVals[i]);
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s gizmo  (%c)", kModes[i],
-                              i == 0 ? 'W' : (i == 1 ? 'E' : 'R'));
-        }
-    }
-
-    ImGui::SameLine();
-    toolbarSeparator();
-    ImGui::SameLine();
-
-    // ---- Play / Pause / Stop：三个独立按钮（UE5 就是分开的）----
-    ImGui::BeginDisabled(playing);
-    ImGui::PushStyleColor(ImGuiCol_Button, kPlayCol);
-    if (ImGui::Button("Play", ImVec2(btnW("Play"), btnH))) m_ctx.play();
-    ImGui::PopStyleColor();
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Play in the viewport (game logic runs on a copy;\n"
-                          "the editor scene is left untouched).  Space");
-    }
-
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!playing);
-    ImGui::PushStyleColor(ImGuiCol_Button, kPauseCol);
-    if (ImGui::Button("Pause", ImVec2(btnW("Pause"), btnH))) m_ctx.pause();
-    ImGui::PopStyleColor();
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Pause the running game.  Space");
-    }
-
-    ImGui::SameLine();
-    ImGui::BeginDisabled(m_ctx.isEditing());
-    ImGui::PushStyleColor(ImGuiCol_Button, kStopCol);
-    if (ImGui::Button("Stop", ImVec2(btnW("Stop"), btnH))) m_ctx.stop();
-    ImGui::PopStyleColor();
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Stop and throw the runtime copy away.\n"
-                          "The editor scene is exactly as it was before Play.");
-    }
-
-    // 全屏（只在 Play 期间可用；视口右上角还有个同款按钮）
-    ImGui::SameLine();
-    ImGui::BeginDisabled(m_ctx.isEditing());
-    if (ImGui::Button(m_ctx.gameFullscreen() ? "Exit Full" : "Fullscreen",
-                      ImVec2(btnW("Fullscreen"), btnH))) {
-        m_ctx.toggleGameFullscreen();
-    }
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered() && !m_ctx.isEditing()) {
-        ImGui::SetTooltip("Window goes fullscreen and only the game is\n"
-                          "drawn (F). Esc also leaves fullscreen.");
-    }
+    ImGui::SetCursorPos(ImVec2(pad.x, rowY + (btnH - ImGui::GetTextLineHeight()) * 0.5f));
+    ImGui::TextDisabled("%s   (W / E / R)", modeName);
 
     // ================================================================
     // 右组：撤销 / 重做（右对齐）
     // ================================================================
+    const float rightW = btnW("Undo") + btnW("Redo") + st.ItemSpacing.x;
     ImGui::SetCursorPos(ImVec2(pad.x + barW - rightW, rowY));
 
     ImGui::BeginDisabled(!m_ctx.commands().canUndo());
@@ -422,7 +350,7 @@ void Toolbar::toolbarSeparator() {
 
 void Toolbar::draw() {
     drawMenuBar();
-    drawPlayControls();
+    drawBar();
 }
 
 } // namespace editor

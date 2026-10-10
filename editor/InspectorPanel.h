@@ -21,6 +21,7 @@
 // ============================================================
 
 #include "EditorContext.h"
+#include "ThumbnailCache.h"
 
 #include "ecs/Entity.h"
 
@@ -37,7 +38,13 @@
 
 namespace assets {
 class Material;
-}
+class Texture;
+} // namespace assets
+
+namespace ecs {
+struct MeshComponent;
+struct MeshPrimitiveParams;
+} // namespace ecs
 
 namespace editor {
 
@@ -52,9 +59,28 @@ private:
     void drawTransform(ecs::Entity e);
     void drawVisibility(ecs::Entity e);
     void drawMeshAndMaterial(ecs::Entity e);
+    void drawMeshSection(ecs::Entity e);
+    void drawMaterialSection(ecs::Entity e);
+    // 碰撞体段落：只在实体**已经有**碰撞组件时出现（添加走视口右键菜单）。
+    // 不显示"Add"按钮是有意的 —— 碰撞体的默认形状要按网格算（凸包 / 胶囊），
+    // 那需要有 mesh，视口菜单能顺手把 mesh 检查掉。
+    void drawCollisionSection(ecs::Entity e);
     void drawLights(ecs::Entity e);
     void drawScript(ecs::Entity e);
     void drawAddRemove(ecs::Entity e);
+
+    // 内置图元的生成参数拖完了：重建几何 + 入撤销栈
+    void commitPrimitiveEdit(ecs::Entity e, const ecs::MeshComponent& before);
+
+    // 一个材质纹理槽（"小方块 + 加号"）。挨着对应的因子控件放一行，
+    // 从 Content 面板把图片拖进来即可绑定；绑定后方块里放缩略图、右边
+    // 显示**文件名**，再点右键可以清空。返回 true 表示本帧改过。
+    //   slotId   —— 同时也是日志 tag（MAT-SLOT <slotId>）与 PushID
+    //   srgb     —— 颜色贴图传 true（albedo / emissive），数据贴图传 false。
+    //               这个参数同时决定缓存键的后缀，见 .cpp 里的 slotCacheKey
+    //   maxWidth —— 这一行剩下的水平空间：文件名按它裁剪，避免把窗口撑出去
+    bool drawTextureChip(const char* slotId, const char* hintText,
+                         assets::Texture** slot, bool srgb, float maxWidth);
 
     // ---- 撤销辅助（定义在头里，模板需要可见）----
     //
@@ -103,6 +129,10 @@ private:
 
     EditorContext& m_ctx;
 
+    // 材质纹理槽的缩略图。和 ContentBrowser 共用同一份实现（同一张 GPU
+    // 纹理 + ImGui 句柄的生命周期管理），见 ThumbnailCache.h。
+    ThumbnailCache m_thumbs;
+
     // 正在拖拽的控件（ImGui 同时只有一个 active item，单槽位足够）
     const void* m_armTarget = nullptr;
     std::size_t m_armSize = 0;
@@ -112,6 +142,15 @@ private:
     // 脚本路径的输入缓冲（跟着选中项走）
     ecs::Entity m_scriptBufFor{};
     char m_scriptBuf[256] = {0};
+
+    // Mesh / Light 面板"这一帧到底画了哪些参数"的签名。
+    //
+    // 用途有两个：一是**验证**（tools/verify_mesh_params.py 靠这行日志断言
+    // "Cube 只有 Size、Sphere 多出 Segments/Rings"这类结构性差异，比去截图
+    // 里认控件靠谱得多）；二是排查"为什么这个属性没出现"。
+    // 只在签名变化时打一行，不会刷屏 —— 和 logRect 的去抖是同一个思路。
+    std::string m_lastMeshParamSig;
+    std::string m_lastLightParamSig;
 };
 
 } // namespace editor

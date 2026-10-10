@@ -67,6 +67,9 @@ public:
     // ---- 方向光（懒创建：首次调用时自动建实体）----
     Light& light();
     const Light& light() const;
+    // 太阳实体的句柄（编辑器选中它时 Inspector 就能显示太阳参数）。
+    // 注意：light() 尚未被调用过时句柄可能无效 —— 先调一次 light()。
+    ecs::Entity lightEntity() const { return m_lightEntity; }
 
     // ---- 局部光源收集（分簇前向渲染）----
     // 把所有 enabled 的点光/射灯展平成 LightInstance（位置取世界矩阵平移）。

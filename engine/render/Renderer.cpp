@@ -85,6 +85,7 @@ Renderer::~Renderer() {
         m_lightGizmoMesh.reset();
         m_defaultFlatNormal.reset();
         m_defaultWhite.reset();
+        m_defaultBlack.reset();
 
         // 每帧资源（栅栏/信号量/UBO/描述符集）
         for (auto& f : m_frames) {
@@ -256,15 +257,30 @@ void Renderer::createDescriptorLayouts() {
 void Renderer::createDefaultTextures() {
     assets::TextureContext ctx = textureContext();
 
+    // ⚠ 这两张都是 **数据贴图**，必须走 UNORM（srgb=false）。
+    // 若按颜色贴图建成 SRGB，硬件采样时会做 sRGB→线性解码：
+    //   平坦法线 (128,128,255) → 解码后 (0.216,0.216,1.0)
+    //   → nSample = (x,y,z)*2-1 = (-0.568, -0.568, 1.0)
+    //   即"平坦法线"其实被整体扳了约 39°，于是地平面这类大面片的着色
+    //   会随切线基（TBN）的退化与否整块变色，屏幕上就是一道笔直的硬边。
+    // 颜色贴图（albedo / emissive）才需要 srgb=true。
+
     // 白色：albedo 与 ORM 的中性值（乘上因子即等于因子本身）
     uint8_t white[4] = {255, 255, 255, 255};
     m_defaultWhite = std::make_unique<assets::Texture>();
-    m_defaultWhite->makeSolid(ctx, white);
+    m_defaultWhite->makeSolid(ctx, white, 4, /*srgb=*/false);
 
     // 平坦法线：切线空间法线的"无扰动"值 (0, 0, 1) → 编码后 (0.5, 0.5, 1.0)
     uint8_t flatN[4] = {128, 128, 255, 255};
     m_defaultFlatNormal = std::make_unique<assets::Texture>();
-    m_defaultFlatNormal->makeSolid(ctx, flatN);
+    m_defaultFlatNormal->makeSolid(ctx, flatN, 4, /*srgb=*/false);
+
+    // 黑色：emissive 的中性值。自发光在着色器里是**加法**
+    // （emissive = factor + map），没绑图时加 0 才是"不发光"。
+    // 用白色当默认的话，所有没绑自发光图的材质会整片发白光。
+    uint8_t black[4] = {0, 0, 0, 255};
+    m_defaultBlack = std::make_unique<assets::Texture>();
+    m_defaultBlack->makeSolid(ctx, black, 4, /*srgb=*/false);
 }
 
 void Renderer::createLightGizmoMesh() {
@@ -443,8 +459,10 @@ static void fillForwardPipelineDesc(rhi::PipelineDesc& desc,
     desc.fragSpv = vkutil::readFile(resolveShaderPath("pbr.frag.spv"));
     desc.vertexBindings.push_back(assets::Vertex::bindingDescription());
     desc.vertexAttributes = assets::Vertex::attributeDescriptions();
-    // set 0 = FrameUBO + 阴影图 + 灯数据，set 1/2/3 = albedo/normal/orm
-    desc.setLayouts = {globalSet, texSet, texSet, texSet};
+    // set 0 = FrameUBO + 阴影图 + 灯数据，
+    // set 1..6 = albedo / normal / orm / roughness / metallic / emissive
+    desc.setLayouts = {globalSet, texSet, texSet, texSet,
+                       texSet,   texSet, texSet};
     desc.pushConstant.stageFlags =
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     desc.pushConstant.offset = 0;
@@ -537,7 +555,9 @@ void Renderer::createPipelines() {
         desc.vertSpv = vkutil::readFile(resolveShaderPath("grid.vert.spv"));
         desc.fragSpv = vkutil::readFile(resolveShaderPath("grid.frag.spv"));
         desc.setLayouts = {m_globalSetLayout, m_textureSetLayout,
-                           m_textureSetLayout, m_textureSetLayout};
+                           m_textureSetLayout, m_textureSetLayout,
+                           m_textureSetLayout, m_textureSetLayout,
+                           m_textureSetLayout};
         desc.pushConstant.stageFlags =
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         desc.pushConstant.offset = 0;
@@ -723,12 +743,19 @@ void Renderer::drawMesh(VkCommandBuffer cmd, VkPipelineLayout layout,
                            VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(PushConstants), &push);
 
-    // set 1/2/3：albedo / normal / ORM（缺省时绑定中性贴图）
+    // set 1..6：albedo / normal / orm / roughness / metallic / emissive
+    // （缺省时绑定中性贴图：白 / 平坦法线 / 白 / 白 / 白 / 黑）
     VkDescriptorSet texSets[kTextureSetCount] = {
         (mat.albedoMap ? mat.albedoMap : m_defaultWhite.get())->descriptorSet(),
         (mat.normalMap ? mat.normalMap : m_defaultFlatNormal.get())
             ->descriptorSet(),
         (mat.ormMap ? mat.ormMap : m_defaultWhite.get())->descriptorSet(),
+        (mat.roughnessMap ? mat.roughnessMap : m_defaultWhite.get())
+            ->descriptorSet(),
+        (mat.metallicMap ? mat.metallicMap : m_defaultWhite.get())
+            ->descriptorSet(),
+        (mat.emissiveMap ? mat.emissiveMap : m_defaultBlack.get())
+            ->descriptorSet(),
     };
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1,
                             kTextureSetCount, texSets, 0, nullptr);
@@ -941,14 +968,18 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                           m_gridPipeline->get());
 
-        // 淡出距离要收在远平面以内，否则"淡出"永远发生不了，
-        // 地平线处会突然截断成一条硬边。
+        // 淡出距离收在栅格自己的边界（extent）与远平面以内：
+        //   · 超过 extent → 淡出在方块外面才走完，方块的边会留一条硬边；
+        //   · 超过远平面 → "淡出"永远发生不了，地平线处会突然截断。
+        // 这两个都是**距栅格中心**的距离（见 GridSettings 的注释）。
         const float far = scene.camera().farPlane();
-        const float fadeEnd = std::min(m_grid.fadeEnd, far * 0.95f);
+        const float fadeEnd =
+            std::min(std::min(m_grid.fadeEnd, m_grid.extent), far * 0.95f);
 
         GridPushConstants gpc;
         gpc.params = glm::vec4(m_grid.extent, glm::max(m_grid.minorStep, 1e-3f),
-                               glm::max(m_grid.majorStep, 1e-3f), m_grid.yOffset);
+                               glm::max(m_grid.majorStep, 1e-3f),
+                               m_grid.planeOffset);
         gpc.color = glm::vec4(m_grid.color, m_grid.alpha);
         gpc.fade = glm::vec4(std::min(m_grid.fadeStart, fadeEnd * 0.9f),
                              fadeEnd, glm::max(m_grid.lineWidthPx, 0.5f),
@@ -1059,20 +1090,48 @@ void Renderer::drawFrame(scene::Scene& scene) {
     VkSemaphore renderFinished = m_renderFinished[imageIndex];
 
     // ---- 场景包围盒 → 光源正交投影范围 ----
-    // 用实体世界原点近似包围盒，再留出余量；范围贴合得越紧，
-    // 深度精度越高，阴影边缘越干净
+    // 两个要点：
+    //   1) 用**网格自身的世界空间 AABB**（局部盒 × 世界矩阵），而不是实体
+    //      原点。原点忽略物体尺寸/缩放，单个物体算出来的包围盒退化成一个
+    //      点 → 半径只剩 2m，阴影贴图只覆盖原点周围一小块，屏幕上就会出现
+    //      一块边界笔直的方形阴影区。
+    //   2) 只统计**投射阴影**的物体。像 120×120 的地面这种"只接收不投射"
+    //      的物体（castShadow=false）若参与，正交范围会被撑到 ±85m，
+    //      深度精度全浪费在空地上。
     glm::vec3 bmin(1e30f), bmax(-1e30f);
-    scene.forEachRenderable([&](ecs::Entity e, ecs::MeshComponent&,
-                                ecs::MaterialComponent&) {
-        const glm::vec3 p = glm::vec3(scene.worldMatrix(e)[3]);
-        bmin = glm::min(bmin, p);
-        bmax = glm::max(bmax, p);
+    size_t casterCount = 0;
+    scene.forEachShadowCaster([&](ecs::Entity e, ecs::MeshComponent& mc) {
+        if (!mc.mesh || !mc.mesh->valid() || !mc.mesh->hasBounds()) return;
+        ++casterCount;
+        const glm::mat4 m = scene.worldMatrix(e);
+        const glm::vec3 lo = mc.mesh->boundsMin();
+        const glm::vec3 hi = mc.mesh->boundsMax();
+        const glm::vec3 corners[8] = {
+            {lo.x, lo.y, lo.z}, {hi.x, lo.y, lo.z}, {lo.x, hi.y, lo.z},
+            {hi.x, hi.y, lo.z}, {lo.x, lo.y, hi.z}, {hi.x, lo.y, hi.z},
+            {lo.x, hi.y, hi.z}, {hi.x, hi.y, hi.z},
+        };
+        for (const glm::vec3& c : corners) {
+            const glm::vec3 w = glm::vec3(m * glm::vec4(c, 1.0f));
+            bmin = glm::min(bmin, w);
+            bmax = glm::max(bmax, w);
+        }
     });
     const bool hasBounds = bmin.x <= bmax.x;
-    const glm::vec3 center = hasBounds ? (bmin + bmax) * 0.5f
-                                       : glm::vec3(0.0f);
+    // 没有投影物体时以相机焦点为中心给一块默认范围。用原点 + 2m 这种
+    // 退化范围的话，视口里那条方形边界会正好落在镜头内。
+    const glm::vec3 center =
+        hasBounds ? (bmin + bmax) * 0.5f : scene.camera().target();
     const float radius =
-        hasBounds ? glm::length(bmax - bmin) * 0.5f + 2.0f : 12.0f;
+        hasBounds ? glm::length(bmax - bmin) * 0.5f + 2.0f : 25.0f;
+
+    if (std::getenv("MYVK_SHADOW_DBG")) {
+        VK_LOG_INFO("SHADOW-DBG casters=%llu center=(%.2f,%.2f,%.2f) "
+                    "radius=%.2f dir=(%.2f,%.2f,%.2f)",
+                    static_cast<unsigned long long>(casterCount), center.x,
+                    center.y, center.z, radius, scene.light().direction.x,
+                    scene.light().direction.y, scene.light().direction.z);
+    }
 
     m_shadowPass->updateLightMatrix(scene.light().direction, center, radius);
 

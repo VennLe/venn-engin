@@ -96,17 +96,22 @@ struct GridSettings {
     // 最小格 / 主格（米）。用户要求"最小基本单位 1 m"，主格取 10 m
     float minorStep = 1.0f;
     float majorStep = 10.0f;
-    // 平面高度：正好在地板所在平面上（靠着色器里的深度偏移压 z-fighting）
-    float yOffset = 0.0f;
+    // 平面高度：正好在地板所在平面上（Z-up：地平面是 z=0；靠着色器里的
+    // 深度偏移压 z-fighting）
+    float planeOffset = 0.0f;
     // 线色与总不透明度（线性空间 —— 这个 pass 输出到 HDR 目标，不做 gamma）
     glm::vec3 color{0.72f, 0.76f, 0.82f};
     float alpha = 0.55f;
     // 最小格线的相对强度（主格固定 1.0）
     float minorStrength = 0.55f;
-    // 线宽（像素）与整体淡出范围（米）
+    // 线宽（像素）与**边界淡出**范围（米）——
+    // 注意 fadeStart / fadeEnd 是"距栅格中心"的距离，**不是**距相机的距离：
+    // 栅格是固定不动的一块地，它的样子不该因为相机挪动就变（按相机距离
+    // 淡出等于让一圈"没有栅格的环"跟着相机跑，飞行时非常显眼）。
+    // 实际用的终点还会被 extent 与远平面夹一次，见 Renderer::recordFrame。
     float lineWidthPx = 1.4f;
-    float fadeStart = 25.0f;
-    float fadeEnd = 55.0f;
+    float fadeStart = 45.0f;
+    float fadeEnd = 60.0f;
 };
 
 class Renderer {
@@ -242,6 +247,7 @@ private:
     // 缺省贴图：材质未指定某张纹理时绑定它们，保证描述符始终有效
     std::unique_ptr<assets::Texture> m_defaultWhite;       // (1,1,1,1)
     std::unique_ptr<assets::Texture> m_defaultFlatNormal;  // (0.5,0.5,1)
+    std::unique_ptr<assets::Texture> m_defaultBlack;       // (0,0,0,1)
 
     // 灯光可视化：每盏灯画一个小自发光球（由 Renderer 自己建网格，
     // 不经过 AssetManager —— 它是渲染器的调试设施，不是场景资产）

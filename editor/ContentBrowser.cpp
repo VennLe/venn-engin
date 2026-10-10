@@ -1,6 +1,7 @@
 #include "ContentBrowser.h"
 
 #include "DebugRects.h"
+#include "EditorDragDrop.h"
 #include "EditorIcons.h"
 #include "EditorScene.h"
 
@@ -269,16 +270,8 @@ void paintPlus(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
 
 } // namespace
 
-ContentBrowser::~ContentBrowser() {
-    // 注销所有缩略图纹理。这里必须还在 ImGui 后端存活期内
-    // （EditorApp 的成员先于 Renderer 释放，满足这个前提）。
-    for (auto& kv : m_thumbs) {
-        if (kv.second.ds != VK_NULL_HANDLE) {
-            ImGui_ImplVulkan_RemoveTexture(kv.second.ds);
-        }
-    }
-    m_thumbs.clear();
-}
+// 缩略图纹理的注销交给 ThumbnailCache 的析构（原来这里有一份手写的循环，
+// 现在和 InspectorPanel 的材质槽共用同一份实现）。
 
 // ---------------------------------------------------------------- 目录
 
@@ -344,41 +337,15 @@ void ContentBrowser::refresh() {
 
 // ---------------------------------------------------------------- 缩略图
 
-VkDescriptorSet ContentBrowser::thumbnail(const std::string& absPath) {
-    auto it = m_thumbs.find(absPath);
-    if (it != m_thumbs.end()) return it->second.ds;
-    if (m_thumbFailed.count(absPath)) return VK_NULL_HANDLE;
-
-    assets::Texture* tex = nullptr;
-    try {
-        // 用绝对路径当缓存键，避免同名文件互相覆盖
-        tex = m_ctx.assets().loadTexture(absPath, absPath, true);
-    } catch (const std::exception& ex) {
-        VK_LOG_WARN("ContentBrowser: thumbnail failed (%s): %s",
-                    absPath.c_str(), ex.what());
-    }
-
-    if (!tex || tex->view() == VK_NULL_HANDLE) {
-        m_thumbFailed[absPath] = true;
-        return VK_NULL_HANDLE;
-    }
-
-    Thumb t;
-    t.ds = ImGui_ImplVulkan_AddTexture(tex->view(),
-                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    t.w = static_cast<float>(tex->width() ? tex->width() : 1u);
-    t.h = static_cast<float>(tex->height() ? tex->height() : 1u);
-    m_thumbs.emplace(absPath, t);
-    return t.ds;
+const ThumbnailCache::Entry* ContentBrowser::thumbnail(
+    const std::string& absPath) {
+    // 实现全在 ThumbnailCache 里（InspectorPanel 的材质槽用同一份）。
+    // 这里传绝对路径当缓存键，避免同名文件互相覆盖。
+    return m_thumbs.get(m_ctx.assets(), absPath);
 }
 
 void ContentBrowser::invalidateThumb(const std::string& absPath) {
-    auto it = m_thumbs.find(absPath);
-    if (it != m_thumbs.end()) {
-        ImGui_ImplVulkan_RemoveTexture(it->second.ds);
-        m_thumbs.erase(it);
-    }
-    m_thumbFailed.erase(absPath);
+    m_thumbs.erase(absPath);
 }
 
 void ContentBrowser::invalidateThumbTree(const std::string& absPath) {
@@ -388,20 +355,7 @@ void ContentBrowser::invalidateThumbTree(const std::string& absPath) {
     if (!prefix.empty() && prefix.back() != '/' && prefix.back() != '\\') {
         prefix.push_back('/');
     }
-    for (auto it = m_thumbs.begin(); it != m_thumbs.end();) {
-        if (it->first.compare(0, prefix.size(), prefix) == 0) {
-            ImGui_ImplVulkan_RemoveTexture(it->second.ds);
-            it = m_thumbs.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    for (auto it = m_thumbFailed.begin(); it != m_thumbFailed.end();) {
-        if (it->first.compare(0, prefix.size(), prefix) == 0)
-            it = m_thumbFailed.erase(it);
-        else
-            ++it;
-    }
+    m_thumbs.eraseTree(prefix);
 }
 
 // ---------------------------------------------------------------- 导航
@@ -548,17 +502,16 @@ void ContentBrowser::drawEntry(const DirEntry& ent, float cellW, float cellH) {
     if (ent.isDir) {
         drawFolderIcon(dl, iconPos, iconBox);
     } else if (isImage(ent.name)) {
-        const VkDescriptorSet ds = thumbnail(ent.absPath);
-        if (ds != VK_NULL_HANDLE) {
+        const ThumbnailCache::Entry* t = thumbnail(ent.absPath);
+        if (t && t->ds != VK_NULL_HANDLE) {
             // 等比例裁剪（aspect-fill）：按较长的边取 UV，避免缩略图被拉变形
-            const Thumb& t = m_thumbs[ent.absPath];
             float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
-            if (t.w > t.h) {
-                const float k = t.h / t.w;
+            if (t->w > t->h) {
+                const float k = t->h / t->w;
                 u0 = (1.0f - k) * 0.5f;
                 u1 = 1.0f - u0;
-            } else if (t.h > t.w) {
-                const float k = t.w / t.h;
+            } else if (t->h > t->w) {
+                const float k = t->w / t->h;
                 v0 = (1.0f - k) * 0.5f;
                 v1 = 1.0f - v0;
             }
@@ -566,7 +519,7 @@ void ContentBrowser::drawEntry(const DirEntry& ent, float cellW, float cellH) {
                               ImVec2(iconPos.x + iconBox, iconPos.y + iconBox),
                               IM_COL32(30, 32, 36, 255), 3.0f);
             dl->AddImage(static_cast<ImTextureID>(
-                             reinterpret_cast<std::uintptr_t>(ds)),
+                             reinterpret_cast<std::uintptr_t>(t->ds)),
                          iconPos, ImVec2(iconPos.x + iconBox, iconPos.y + iconBox),
                          ImVec2(u0, v0), ImVec2(u1, v1));
             dl->AddRect(iconPos,
@@ -674,20 +627,28 @@ void ContentBrowser::drawEntry(const DirEntry& ent, float cellW, float cellH) {
         }
     }
 
-    // ---- 拖拽：网格文件 → 视口 ----
-    // **只有模型**（.gltf / .glb / .obj）能拖：视口那边只认"网格资产"这一种
-    // 载荷，拖图片 / 脚本过去也只会得到一句 "Failed to import"，不如干脆
-    // 不给拖（想挂脚本就双击）。
+    // ---- 拖拽：资产 → 视口 / 材质槽 ----
+    // 载荷统一是"相对资产根的路径字符串"（editor/EditorDragDrop.h 的
+    // drag::kAsset），接收端到现在有两个：
+    //   * 视口           —— 模型文件实例化到鼠标落点（贴地）
+    //   * Inspector 材质槽 —— 图片文件绑到 albedo / normal / orm
+    // 所以模型和图片**都能拖**；两个接收端各自认自己认得的扩展名，
+    // 拖错的组合（模型拖到材质槽上）那边会拒绝并提示。
     //
     // 缩略图条目是 Image()/Dummy() 这类"无唯一交互 ID"的 item，
     // BeginDragDropSource() 不带该标志会对 g.LastItemData.ID==0 直接
     // IM_ASSERT(0) 崩溃（imgui.cpp:15137）。必须显式允许空 ID。
-    if (!ent.isDir && isModel(ent.name) &&
+    const bool draggable = !ent.isDir && (isModel(ent.name) || isImage(ent.name));
+    if (draggable &&
         ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
         const std::string rel = assets::makeAssetRelative(ent.absPath);
-        ImGui::SetDragDropPayload("EDITOR_ASSET", rel.c_str(), rel.size() + 1);
+        ImGui::SetDragDropPayload(drag::kAsset, rel.c_str(), rel.size() + 1);
         ImGui::Text("%s", ent.name.c_str());
-        ImGui::TextDisabled("drop in the viewport -> bottom sits on the grid");
+        if (isImage(ent.name)) {
+            ImGui::TextDisabled("drop on a Material texture slot to bind");
+        } else {
+            ImGui::TextDisabled("drop in the viewport -> bottom sits on the grid");
+        }
         ImGui::EndDragDropSource();
     }
 
@@ -1085,8 +1046,12 @@ void ContentBrowser::draw() {
     ImGui::Separator();
     drawGrid();
     ImGui::Separator();
-    ImGui::TextDisabled("%zu entries  |  %s", m_entries.size(),
-                        m_rel.empty() ? "(root)" : m_rel.c_str());
+
+    // 统计文字（原来的底行：播放条已移到视口正下方，这里保持原状）
+    char stat[512];
+    std::snprintf(stat, sizeof(stat), "%zu entries  |  %s", m_entries.size(),
+                  m_rel.empty() ? "(root)" : m_rel.c_str());
+    ImGui::TextDisabled("%s", stat);
 
     // 键盘：Backspace 上一级；F2 重命名；Delete 删除（都对选中项）
     const ImGuiIO& io = ImGui::GetIO();

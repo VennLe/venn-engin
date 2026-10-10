@@ -45,7 +45,7 @@ RECT_RE = re.compile(
     r"(CB-CELL [^=]+|VP-RECT|HIER-RECT row0)"
     r"=\((-?\d+),(-?\d+)\)-\((-?\d+),(-?\d+)\)"
 )
-ALIGN_RE = re.compile(r"alignImportToGround: box\.min\.y=(-?[\d.]+) -> bottom=(-?[\d.]+)")
+ALIGN_RE = re.compile(r"alignImportToGround: box.min.z=(-?[\d.]+) -> bottom=(-?[\d.]+)")
 
 
 class LogTap:
@@ -55,7 +55,7 @@ class LogTap:
         self.proc = proc
         self.rects = {}          # tag -> (x0, y0, x1, y1)
         self.lines = []
-        self.align = None        # (min_y, bottom_y)
+        self.align = None        # (min_z, bottom_z)
         self.lock = threading.Lock()
         self.t = threading.Thread(target=self._pump, daemon=True)
         self.t.start()
@@ -114,15 +114,43 @@ def force_foreground(hwnd):
 
     SetForegroundWindow 有一条硬规则：只有当前前台进程（或被它启动的进程）
     才允许改前台窗口。从后台脚本里直接调多半会**静默失败**，而窗口一旦不是
-    活动窗口，ImGui 的拖拽就完全收不到输入（鼠标消息还是会来，但键盘/焦点
-    相关的路径不对，实测就是"点了没反应"）。
-    办法：先按下再松开一次 ALT —— 系统就认为"用户在操作"，随后的
-    SetForegroundWindow 才会被放行。这是 Windows 上很老的绕法，但有效。
+    活动窗口，真实的键盘/鼠标事件就送不进去 —— 症状通常是"点了/按了没反应"，
+    而且看起来像功能坏了（实测：脚本单独跑 3/3 通过，跟在别的命令后面连着
+    跑就偶发全挂）。
+
+    两条路一起上，按可靠性排序：
+
+    1. **attach-thread-input**：把自己的线程输入队列临时挂到当前前台线程
+       上，让系统认为"是前台窗口在请求"，再调 SetForegroundWindow。
+       这是最可靠的一条，绝大多数情况下一次就成。
+    2. ALT 点一下：按下再松开一次 ALT，系统就认为"用户在操作"，随后的
+       SetForegroundWindow 会被放行。很老的绕法，作为兜底。
+
+    两条都失败就返回 False —— 调用方应该把失败**当成失败**处理（重试或
+    报错），别继续往下发事件，否则只会得到一堆似是而非的断言失败。
     """
     if user32.GetForegroundWindow() == hwnd:
         return True
-    user32.keybd_event(VK_MENU, 0, 0, 0)          # ALT down
+
     user32.ShowWindow(hwnd, 9)                    # SW_RESTORE
+
+    # ---- 路 1：attach-thread-input ----
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    fg = user32.GetForegroundWindow()
+    if fg:
+        tid_fg = user32.GetWindowThreadProcessId(fg, None)
+        tid_me = kernel32.GetCurrentThreadId()
+        if tid_fg and tid_fg != tid_me:
+            if user32.AttachThreadInput(tid_me, tid_fg, True):
+                user32.SetForegroundWindow(hwnd)
+                user32.BringWindowToTop(hwnd)
+                user32.AttachThreadInput(tid_me, tid_fg, False)
+    if user32.GetForegroundWindow() == hwnd:
+        time.sleep(0.25)
+        return True
+
+    # ---- 路 2：ALT 绕法 ----
+    user32.keybd_event(VK_MENU, 0, 0, 0)          # ALT down
     user32.SetForegroundWindow(hwnd)
     user32.BringWindowToTop(hwnd)
     user32.keybd_event(VK_MENU, 0, 0x0002, 0)     # ALT up (KEYEVENTF_KEYUP)
@@ -141,7 +169,9 @@ def main():
     ap.add_argument("--exe", default=DEFAULT_EXE)
     ap.add_argument("--asset", default="box01.glb",
                     help="Content 里要拖的那个模型文件名")
-    ap.add_argument("--out", default=os.path.join(ROOT, "verify_asset_drag.png"))
+    # 验证产物一律写到项目外的 _venn_verify/，别往仓库里丢截图
+    ap.add_argument("--out", default=os.path.join(
+        os.path.dirname(ROOT), "_venn_verify", "asset_drag.png"))
     ap.add_argument("--debug-shot", default="",
                     help="额外存一张拖到一半的截图，用来判断拖拽有没有点火")
     ap.add_argument("--size", default="1600x900")
@@ -238,7 +268,7 @@ def main():
 
         if tap.align:
             miny, bottom = tap.align
-            print("alignImportToGround: box.min.y=%.4f bottom=%.4f" % (miny, bottom))
+            print("alignImportToGround: box.min.z=%.4f bottom=%.4f" % (miny, bottom))
             print("贴地断言: %s (|bottom| < 1e-3)"
                   % ("PASS" if abs(bottom) < 1e-3 else "FAIL"))
         else:

@@ -10,6 +10,10 @@ namespace scene {
 
 using core::Input;
 
+// 世界 up 轴：**Z 朝上**的右手系（与 Blender / 3ds Max 一致）。
+// 相机相关的所有 up 假设都从这里取，改坐标系只动这一行。
+static const glm::vec3 kWorldUp{0.0f, 0.0f, 1.0f};
+
 Camera::Camera() = default;
 
 void Camera::update(float dt) {
@@ -46,7 +50,7 @@ void Camera::update(float dt) {
     if (Input::mouseDown(GLFW_MOUSE_BUTTON_LEFT)) {
         m_yaw -= static_cast<float>(dx) * 0.005f;
         m_pitch -= static_cast<float>(dy) * 0.005f;
-        m_pitch = glm::clamp(m_pitch, -1.52f, 1.52f);
+        m_pitch = glm::clamp(m_pitch, -kPitchLimit, kPitchLimit);
     }
 
     // 缩放：滚轮
@@ -59,14 +63,14 @@ void Camera::update(float dt) {
     // 平移：WASD（相机相对）+ QE（世界升降）
     float speed = m_moveSpeed * dt * (Input::keyDown(GLFW_KEY_LEFT_SHIFT) ? 3.0f : 1.0f);
     glm::vec3 forwardDir = glm::normalize(glm::vec3(m_target - position()));
-    glm::vec3 rightDir = glm::normalize(glm::cross(forwardDir, glm::vec3(0, 1, 0)));
+    glm::vec3 rightDir = glm::normalize(glm::cross(forwardDir, kWorldUp));
 
     if (Input::keyDown(GLFW_KEY_W)) m_target += forwardDir * speed;
     if (Input::keyDown(GLFW_KEY_S)) m_target -= forwardDir * speed;
     if (Input::keyDown(GLFW_KEY_D)) m_target += rightDir * speed;
     if (Input::keyDown(GLFW_KEY_A)) m_target -= rightDir * speed;
-    if (Input::keyDown(GLFW_KEY_E)) m_target += glm::vec3(0, 1, 0) * speed;
-    if (Input::keyDown(GLFW_KEY_Q)) m_target -= glm::vec3(0, 1, 0) * speed;
+    if (Input::keyDown(GLFW_KEY_E)) m_target += kWorldUp * speed;
+    if (Input::keyDown(GLFW_KEY_Q)) m_target -= kWorldUp * speed;
 }
 
 // ---------------------------------------------------------------- 显式控制
@@ -78,7 +82,7 @@ void Camera::update(float dt) {
 
 void Camera::orbit(float dYawRad, float dPitchRad) {
     m_yaw += dYawRad;
-    m_pitch = glm::clamp(m_pitch + dPitchRad, -1.52f, 1.52f);
+    m_pitch = glm::clamp(m_pitch + dPitchRad, -kPitchLimit, kPitchLimit);
     if (m_fly) syncFlyTarget();  // 位置不动、目标点转 → 原地转头
 }
 
@@ -147,8 +151,12 @@ void Camera::setDistance(float d) {
 // 都不会跳 —— 见下面的实现，两种切换都只用一行赋值。
 
 glm::vec3 Camera::angleDir() const {
+    // Z-up 右手系：yaw 在水平面 XY 里转（yaw=0 → 相机在 +X 一侧），
+    // pitch 是相对水平面的仰角（正 = 相机在上方俯视）。
+    // yaw 增大 = 视线向右转：forward = -angleDir，d(forward)/d(yaw) 在
+    // yaw=0 时 = (0, +cp, 0)，而看向 -X 时相机右方恰好是 +Y —— 自洽。
     const float cp = std::cos(m_pitch);
-    return {cp * std::cos(m_yaw), std::sin(m_pitch), cp * std::sin(m_yaw)};
+    return {cp * std::cos(m_yaw), -cp * std::sin(m_yaw), std::sin(m_pitch)};
 }
 
 void Camera::syncFlyTarget() {
@@ -179,12 +187,13 @@ void Camera::look(float dYawRad, float dPitchRad) {
     //
     //   视线 forward = -angleDir()
     //   d(forward)/d(yaw) ∝ normalize(cross(forward, 世界up)) = 相机右方向
-    //   forward.y = -sin(pitch) → pitch 变小 ⇒ 抬高视线（往上看）
+    //     （Z-up 下 up = (0,0,1)，该恒等式依然成立）
+    //   forward.z = -sin(pitch) → pitch 变小 ⇒ 抬高视线（往上看）
     //
     // 于是鼠标右移(dx>0)配 +yaw 就是"往右看"，鼠标上移(dy<0)配 +pitch
     // 就是"往上看" —— 与 UE 视口按住鼠标转头的手感一致。
     m_yaw += dYawRad;
-    m_pitch = glm::clamp(m_pitch + dPitchRad, -1.52f, 1.52f);
+    m_pitch = glm::clamp(m_pitch + dPitchRad, -kPitchLimit, kPitchLimit);
     if (m_fly) syncFlyTarget();
 }
 
@@ -194,7 +203,7 @@ glm::vec3 Camera::forwardAxis() const {
 
 glm::vec3 Camera::rightAxis() const {
     const glm::vec3 f = forwardAxis();
-    glm::vec3 r = glm::cross(f, glm::vec3(0.0f, 1.0f, 0.0f));
+    glm::vec3 r = glm::cross(f, kWorldUp);
     if (glm::length(r) < 1e-5f) return glm::vec3(1.0f, 0.0f, 0.0f);
     return glm::normalize(r);
 }
@@ -205,13 +214,12 @@ void Camera::moveLocal(const glm::vec3& delta) {
         m_target += delta;
         return;
     }
-    m_flyPos += rightAxis() * delta.x + glm::vec3(0.0f, 1.0f, 0.0f) * delta.y +
-                forwardAxis() * delta.z;
+    m_flyPos += rightAxis() * delta.x + kWorldUp * delta.y + forwardAxis() * delta.z;
     syncFlyTarget();
 }
 
 glm::mat4 Camera::viewMatrix() const {
-    return glm::lookAt(position(), m_target, glm::vec3(0, 1, 0));
+    return glm::lookAt(position(), m_target, kWorldUp);
 }
 
 glm::mat4 Camera::projMatrix(float aspect) const {

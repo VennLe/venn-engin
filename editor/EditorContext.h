@@ -96,6 +96,13 @@ enum class GizmoSpace : int { World = 0, Local = 1 };
 // 播放状态机
 enum class PlayState : int { Stopped = 0, Playing = 1, Paused = 2 };
 
+// 动画控制（编辑态脚本）的独立状态机。与 Run（PlayState）**互斥使用**：
+//   Run = 把编辑场景复制成运行态副本跑游戏逻辑（EditorContext::play）；
+//   Play/Pause/Stop = 直接在**编辑场景自身**上跑/冻结脚本（当动画用），
+//   Stop 用 JSON 快照把场景恢复成按下动画 Play 时的样子。
+// 两套状态机的按钮分开放：Run 在播放条绿色按钮，动画三键在它旁边。
+enum class AnimState : int { Stopped = 0, Playing = 1, Paused = 2 };
+
 // 面板矩形（像素，屏幕空间）。编辑器没有用 ImGui 的 docking 分支，
 // 改成"每帧算一遍矩形、面板各自 FirstUseEver 落位"—— 效果接近，
 // 且不依赖 imgui 的具体分支版本。
@@ -107,7 +114,10 @@ struct Rect {
 };
 
 struct LayoutRects {
-    Rect menu, toolbar, hierarchy, content, inspector, viewport, status;
+    // transport = 视口正下方那一行播放条（Run / Play / Pause / Stop），
+    // 高度从 viewport 里扣出来 —— 视口的 3D 画面在这行上方结束。
+    Rect menu, toolbar, hierarchy, content, inspector, viewport, status,
+         transport;
 };
 
 class EditorContext {
@@ -139,6 +149,18 @@ public:
     void pause();   // Playing → Paused
     void stop();    // 任意 → Stopped（丢弃运行态）
     void togglePlayPause();
+
+    // ---- 动画（编辑态脚本，见 AnimState 的说明）----
+    AnimState animState() const { return m_anim; }
+    // 动画是否正在走（只有 Playing；Paused 不走）
+    bool animPlaying() const { return m_anim == AnimState::Playing; }
+    // 动画是否被"占用"（Playing 或 Paused —— Stop 按钮/互斥判断用）
+    bool animActive() const { return m_anim != AnimState::Stopped; }
+    void animPlay();    // Stopped → Playing（先拍快照）；Paused → Playing
+    void animPause();   // Playing → Paused
+    void animStop();    // 任意 → Stopped（用快照恢复编辑场景）
+    float animTime() const { return m_animTime; }
+    void advanceAnimTime(float dt) { m_animTime += dt; }
 
     // 整个场景被替换（新建 / 打开文件）后调用：清选择、清历史
     void onSceneReplaced();
@@ -179,8 +201,29 @@ public:
     // ---------------------------------------------------------- 选择
     ecs::Entity selection() const { return m_selection; }
     void select(ecs::Entity e);
+    // "在 3D 视口里用左键点中的选中" —— 与 select() 的唯一区别是记下了出处。
+    // 少数操作只认这种选中（目前是数字键 0 的"落地"，见
+    // ViewportPanel::dropSelectionToGround），因为在层级树 / 内容浏览器里
+    // 选中的东西并不一定在视口里看得见，"落地"对它没有意义。
+    void selectFromViewport(ecs::Entity e);
     void clearSelection();
     bool hasSelection() const;
+    bool selectionFromViewport() const { return m_selectionFromViewport; }
+
+    // ---------------------------------------------------------- 碰撞体编辑
+    // 当前 W/E/R 手柄作用在**哪儿**：
+    //   false → 实体的 TransformComponent（常规）
+    //   true  → 选中实体身上的 CollisionComponent（点视口里的碰撞框、
+    //           或勾 Inspector 里的 "Edit collider" 都会切过来）
+    //
+    // 为什么放在这里而不是 CollisionComponent 上：它是**编辑器状态**。
+    // 存进组件就会被 Play 的整场景复制带进运行态、还会写进场景文件 ——
+    // 那两条路都不该关心"编辑器当前在编辑谁"。
+    //
+    // 选择一变就复位（见 select() / clearSelection()），语义是"这个开关
+    // 永远只对当前选中项有效"。
+    bool colliderEdit() const { return m_colliderEdit; }
+    void setColliderEdit(bool on) { m_colliderEdit = on; }
 
     // 帧校验：句柄失效时按名字找回，找不回就清空。
     // （撤销删除、Play/Stop 之后都会依赖它把选择"接上"）
@@ -324,11 +367,24 @@ private:
     PlayState m_play = PlayState::Stopped;
     float m_playTime = 0.0f;
 
+    // ---- 动画状态 ----
+    AnimState m_anim = AnimState::Stopped;
+    float m_animTime = 0.0f;
+    std::string m_animSnapshot;  // 按下动画 Play 时的场景 JSON（Stop 恢复用）
+
     bool m_gameFullscreen = false;
     float m_navSensitivity = 1.0f;
 
+    // 选中项的两个参数版本（select / selectFromViewport 都转发到它）——
+    // 只有它能改 m_selectionFromViewport，所以放在私有区。
+    void select(ecs::Entity e, bool fromViewport);
+
     ecs::Entity m_selection{};
     std::string m_selectionName;
+    // 当前选中项是不是"在 3D 视口里用左键点中的"（见 selectionFromViewport）
+    bool m_selectionFromViewport = false;
+    // W/E/R 手柄作用在碰撞体上？（见 colliderEdit()）
+    bool m_colliderEdit = false;
 
     CommandStack m_commands;
 

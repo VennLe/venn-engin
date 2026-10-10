@@ -22,14 +22,16 @@
 //
 // 缩略图句柄在析构时统一注销（必须在 ImGui 后端 shutdown 之前 ——
 // EditorApp 的成员先于 Application 里的 Renderer 释放，这个顺序天然成立）。
+// 这部分逻辑已经抽到 editor/ThumbnailCache，InspectorPanel 的材质纹理槽
+// 跟这里共用同一份实现。
 // ============================================================
 
 #include "EditorContext.h"
 #include "PickingSystem.h"   // m_picking：双击模型时算包围盒做"贴地"
+#include "ThumbnailCache.h"
 
 #include <cstdint>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -39,7 +41,7 @@ namespace editor {
 class ContentBrowser {
 public:
     explicit ContentBrowser(EditorContext& ctx) : m_ctx(ctx) {}
-    ~ContentBrowser();
+    ~ContentBrowser() = default;
 
     void draw();
 
@@ -51,13 +53,6 @@ private:
         std::uintmax_t size = 0;
     };
 
-    // 缩略图缓存项：ImGui 句柄 + 原图尺寸（做等比例裁剪用）
-    struct Thumb {
-        VkDescriptorSet ds = VK_NULL_HANDLE;
-        float w = 1.0f;
-        float h = 1.0f;
-    };
-
     void refresh();
 
     // ---- 三段式 UI：导航行 / 搜索行 / 网格 ----
@@ -66,7 +61,8 @@ private:
     void drawGrid();
     void drawEntry(const DirEntry& ent, float cellW, float cellH);
 
-    VkDescriptorSet thumbnail(const std::string& absPath);
+    // 取缩略图（缓存命中/失败都在内部处理，返回 nullptr = 画不了）
+    const ThumbnailCache::Entry* thumbnail(const std::string& absPath);
 
     // ---- 文件系统操作（都做完整错误处理 + 刷新 + 提示）----
     void navigateTo(const std::string& rel);
@@ -133,10 +129,8 @@ private:
     // 新建文件夹：建完立刻进入重命名
     bool m_newFolderRequest = false;
 
-    // 缩略图缓存：绝对路径 → ImGui 纹理句柄
-    std::unordered_map<std::string, Thumb> m_thumbs;
-    // 加载失败的路径（避免每帧重试）
-    std::unordered_map<std::string, bool> m_thumbFailed;
+    // 缩略图缓存：绝对路径 → ImGui 纹理句柄（共享实现，见 ThumbnailCache.h）
+    ThumbnailCache m_thumbs;
 
     char m_pathBuf[512] = {0};
 };

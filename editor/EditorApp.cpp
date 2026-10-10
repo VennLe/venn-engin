@@ -1,6 +1,7 @@
 #include "EditorApp.h"
 
 #include "ContentBrowser.h"
+#include "DebugRects.h"
 #include "EditorContext.h"
 #include "EditorScene.h"
 #include "InspectorPanel.h"
@@ -14,6 +15,7 @@
 #include "core/Logger.h"
 #include "core/WindowGeometry.h"
 #include "ecs/Components.h"
+#include "physics/CollisionWorld.h"
 #include "render/Renderer.h"
 #include "scene/Camera.h"
 #include "scene/Scene.h"
@@ -37,6 +39,18 @@ namespace {
 // 已交给 SplitLayout 分栏树按比例自适应；这里只保留横贯全宽的固定条
 // 与浮动调试面板的尺寸常量。
 constexpr float kStatusH = 26.0f;
+// 视口正下方播放条（Run / Play / Pause / Stop）的高度。
+// "刚刚好一行"：一行按钮（28px）+ 上下各 3px 内边距。
+constexpr float kTransportH = 34.0f;
+// 视口最小渲染尺寸（与 ViewportPanel 的同名常量保持一致）
+constexpr float kMinViewport = 64.0f;
+
+// 运行态相机的碰撞半径（米）。
+//
+// 相机碰撞是"球 vs 凸体"：这个球必须比 0 大，否则相机是个点 —— 点在
+// 凸体内部才有穿透可言，贴着墙面走时就会一半身体插进墙里。取 0.25 米
+// 大约是"人眼到墙的舒适距离"，也和近平面（0.1）一个量级。
+constexpr float kPlayCameraRadius = 0.25f;
 
 // 浮动调试面板（Stats / Scripts）的排布：右下角**竖向码放**，互不重叠。
 // 它们不走布局矩形，所以位置只能自己算；用一个 FirstUseEver 落位，
@@ -85,9 +99,17 @@ void EditorApp::onInit() {
     // 之后 = 上次关闭时的位置 / 大小（见 core/WindowGeometry）。
     // 尺寸变化会置 resize 标志，Renderer 在下一帧重建交换链 —— 和用户
     // 手动拖窗口走的是同一条路，所以不用在别处再做特殊处理。
-    core::applyStartupGeometry(window(), kStartupScreenFraction,
-                               kWindowStateFile, kFallbackWindowW,
-                               kFallbackWindowH);
+    //
+    // ⚠ 自动化跑（MYVK_FRAMES / MYVK_NO_WINDOW_SAVE）**读也别读**：存档
+    //   可能是上次手动会话留下的全屏几何（3840x2054），而脚本启动后马上
+    //   会把窗口缩到自己的尺寸 —— 首帧按全屏居中的 Appearing 窗口
+    //   （Preferences 等）就会停在旧坐标上，缩窗后"飞到"客户区角落
+    //   （实测踩过）。脚本随后自己 SetWindowPos，用默认 1600x900 即可。
+    if (!automationRun()) {
+        core::applyStartupGeometry(window(), kStartupScreenFraction,
+                                   kWindowStateFile, kFallbackWindowW,
+                                   kFallbackWindowH);
+    }
 
     // 注意顺序：AssetManager 里存的是 renderer().textureContext() 的**拷贝**，
     // 而 TextureContext 全是裸指针 —— 必须在 Renderer::init() 之后才有效。
@@ -103,31 +125,39 @@ void EditorApp::onInit() {
     m_inspector = std::make_unique<InspectorPanel>(*m_ctx);
     m_content = std::make_unique<ContentBrowser>(*m_ctx);
 
-    // 启动场景 = **一张白纸**：没有实体，只有一盏方向光和一个默认机位。
+    // 启动场景 = **一张白纸**：一块不透明地面 + 一盏方向光 + 一个默认机位。
     // 这里以前会搭出一整套内置演示内容，2026-10-09 按用户要求连同独立的
     // Sandbox 示例程序一起删掉了 —— venn 启动不再加载任何样例。
-    resetToEmptyScene(m_ctx->editorScene());
+    resetToEmptyScene(m_ctx->editorScene(), am);
     // 视口导航相机：显式输入 + 自由飞行（UE 视口手感，见 ViewportPanel）
     m_ctx->applyEditorCameraMode();
 
-    // ---- 自动化钩子（截图 / 回归测试；正常使用不设这两个变量就没有任何影响）----
+    // ---- 自动化钩子（截图 / 回归测试；正常使用不设这些变量就没有任何影响）----
     //   MYVK_EDITOR_SCENE=路径   启动即打开指定场景，而不是空场景
-    //   MYVK_EDITOR_SELECT=名字  启动后按名字选中一个实体（让手柄/检查器有内容）
-    // 有它们才能把"层级图标 / 手柄三种粒度"这类界面做成可脚本化的截图验证，
-    // 否则只能靠人手点。改成别的场景在 File 菜单里一样能做，这只是个快捷入口。
+    //   MYVK_EDITOR_SELECT=名字  启动后按名字选中一个实体
+    //   MYVK_EDITOR_CAM="x,y,z,yawDeg,pitchDeg"   把视口相机摆到指定位姿
+    //   MYVK_EDITOR_GIZMO=move|rotate|scale   启动即切手柄模式
+    //   MYVK_EDITOR_COLLIDER=hull|capsule     给选中项加碰撞体并进入碰撞体编辑
+    //   MYVK_EDITOR_PREFS=1      启动即打开 Preferences 窗口（截图验证用）
     if (const char* envScene = std::getenv("MYVK_EDITOR_SCENE")) {
         if (envScene[0] != '\0') {
             const std::string abs = assets::resolveAssetPath(envScene);
             const scene::SceneIoResult r =
                 scene::loadScene(m_ctx->editorScene(), am, abs);
+            // scenePath 无论加载成败都要设：它表示"这个编辑器当前开着哪个
+            // 文档"，而不是"哪个文件读过"。路径不存在时就是一份新文档，
+            // Ctrl+S 应该存到**这个**路径，而不是悄悄落到默认的
+            // assets/scenes/scene.json 上去。（自动化测试也依赖这一点：
+            // 它用一个临时路径起步，跑完直接读那个临时文件做断言。）
+            m_ctx->scenePath() = envScene;
             if (r.ok) {
                 m_ctx->onSceneReplaced();
-                m_ctx->scenePath() = envScene;
                 VK_LOG_INFO("Editor: auto-opened scene '%s' (%zu entities)",
                             envScene, m_ctx->editorScene().objectCount());
             } else {
-                VK_LOG_WARN("Editor: auto-open failed for '%s': %s", envScene,
-                            r.error.c_str());
+                VK_LOG_WARN("Editor: auto-open failed for '%s': %s (treated as "
+                            "a new document at that path)",
+                            envScene, r.error.c_str());
             }
         }
     }
@@ -142,6 +172,31 @@ void EditorApp::onInit() {
             }
         }
     }
+
+    // ---- MYVK_EDITOR_CAM="x,y,z,yawDeg,pitchDeg"：把视口相机摆到指定位姿 ----
+    // 自动化截图 / 交互测试专用：有些机位人手摆不准（"贴到离地 40 cm 平视"
+    // 复现栅格问题、或"让某个物体正好落在视口中心好让脚本点得到"）。
+    //
+    // ⚠ 必须放在 MYVK_EDITOR_SCENE **之后** —— 加载场景会连相机一起覆盖，
+    //   顺序反了这个钩子就白设了。
+    if (const char* envCam = std::getenv("MYVK_EDITOR_CAM")) {
+        float x = 0.0f, y = 0.0f, z = 0.0f, yawDeg = 0.0f, pitchDeg = 0.0f;
+        if (std::sscanf(envCam, "%f,%f,%f,%f,%f", &x, &y, &z, &yawDeg,
+                        &pitchDeg) == 5) {
+            scene::Camera& cam = m_ctx->editorScene().camera();
+            cam.setYaw(glm::radians(yawDeg));
+            cam.setPitch(glm::radians(pitchDeg));
+            // 飞行模式下 setTarget 会把相机重摆到 target + angleDir*distance，
+            // 所以传 "eye + forward*distance" 正好让 position 落在 eye 上。
+            cam.setTarget(glm::vec3(x, y, z) + cam.forwardAxis() * cam.distance());
+            VK_LOG_INFO("Editor: camera eye=(%.2f,%.2f,%.2f) yaw=%.1f pitch=%.1f",
+                        x, y, z, yawDeg, pitchDeg);
+        } else {
+            VK_LOG_WARN("MYVK_EDITOR_CAM 解析失败: '%s'（期望 x,y,z,yawDeg,pitchDeg）",
+                        envCam);
+        }
+    }
+
     // MYVK_EDITOR_GIZMO=move|rotate|scale：启动就把手柄切到某个模式，
     // 这样三种粒度的界面（轴向 / 平面 / 整体）都能被截图覆盖到。
     if (const char* envGizmo = std::getenv("MYVK_EDITOR_GIZMO")) {
@@ -152,6 +207,89 @@ void EditorApp::onInit() {
             m_ctx->setGizmoMode(GizmoMode::Rotate);
         else if (g == "scale")
             m_ctx->setGizmoMode(GizmoMode::Scale);
+    }
+
+    // MYVK_EDITOR_SPACE=world|local：启动就把手柄坐标系切过去。
+    // 世界轴和局部轴对**旋转过的物体**是两套不同的方向，缩放的行为
+    // 也随之外观不同 —— 自动化要能分别覆盖，不能只测默认那一套。
+    if (const char* envSpace = std::getenv("MYVK_EDITOR_SPACE")) {
+        const std::string s = envSpace;
+        if (s == "local")
+            m_ctx->setGizmoSpace(GizmoSpace::Local);
+        else if (s == "world")
+            m_ctx->setGizmoSpace(GizmoSpace::World);
+    }
+    if (std::getenv("MYVK_EDITOR_PREFS")) m_ctx->showSettings() = true;
+
+    // MYVK_EDITOR_COLLIDER=hull|capsule：给**当前选中项**加一个碰撞体，并
+    // 直接进入"编辑碰撞体"状态（手柄立刻作用在碰撞框上）。
+    //
+    // 为什么需要它：验证"碰撞框能用 W/E/R 调整"需要一个已经存在的碰撞体，
+    // 而"加碰撞体"那条路（视口右键菜单）另有脚本专门覆盖。这里只负责把
+    // 前置状态摆好，让手柄用例专注于手柄本身 —— 免得每个用例都要先演一遍
+    // 右键→悬停子菜单→点菜单项。
+    if (const char* envColl = std::getenv("MYVK_EDITOR_COLLIDER")) {
+        const std::string c = envColl;
+        if (c == "hull" || c == "capsule") {
+            const ecs::Entity e = m_ctx->selection();
+            ecs::World& w = m_ctx->editorScene().world();
+            auto* mc = e.valid() ? w.get<ecs::MeshComponent>(e) : nullptr;
+            if (mc && mc->mesh) {
+                ecs::CollisionComponent cc;
+                const bool hull = (c == "hull");
+                const bool ok = hull
+                                    ? physics::setupHullCollider(*mc->mesh, cc)
+                                    : physics::setupCapsuleCollider(*mc->mesh,
+                                                                    cc);
+                if (ok) {
+                    if (auto* p = w.get<ecs::CollisionComponent>(e)) *p = cc;
+                    else w.add<ecs::CollisionComponent>(e, cc);
+                    m_ctx->setColliderEdit(true);
+                    const std::string* nm = w.name(e);
+                    VK_LOG_INFO("Editor auto-collider (%s): '%s' points=%zu "
+                                "edges=%zu radius=%.3f halfHeight=%.3f",
+                                hull ? "hull" : "capsule",
+                                nm ? nm->c_str() : "?", cc.hullPoints.size(),
+                                cc.hullEdges.size(),
+                                static_cast<double>(cc.capsuleRadius),
+                                static_cast<double>(cc.capsuleHalfHeight));
+                    // "创建时默认刚好包裹住物体"的可断言形式 —— 与视口右键
+                    // 菜单那条路打同一格式的 `collision: fit`，于是验证脚本
+                    // 不管碰撞体是点菜单建的还是这个钩子建的，都读同一行。
+                    glm::vec3 mmn, mmx, cmn, cmx;
+                    if (physics::meshAabb(*mc->mesh, mmn, mmx) &&
+                        physics::colliderLocalAabb(cc, cmn, cmx)) {
+                        const glm::vec3 ms = mmx - mmn;
+                        const glm::vec3 cs = cmx - cmn;
+                        VK_LOG_INFO(
+                            "collision: fit '%s' shape=%s "
+                            "mesh=(%.4f,%.4f,%.4f) collider=(%.4f,%.4f,%.4f) "
+                            "ratio=(%.4f,%.4f,%.4f)",
+                            nm ? nm->c_str() : "?",
+                            hull ? "convex" : "capsule",
+                            static_cast<double>(ms.x),
+                            static_cast<double>(ms.y),
+                            static_cast<double>(ms.z),
+                            static_cast<double>(cs.x),
+                            static_cast<double>(cs.y),
+                            static_cast<double>(cs.z),
+                            ms.x > 0.0f ? static_cast<double>(cs.x / ms.x) : 0.0,
+                            ms.y > 0.0f ? static_cast<double>(cs.y / ms.y) : 0.0,
+                            ms.z > 0.0f ? static_cast<double>(cs.z / ms.z)
+                                        : 0.0);
+                    }
+                } else {
+                    VK_LOG_WARN("Editor auto-collider (%s): build failed "
+                                "(empty mesh?)", c.c_str());
+                }
+            } else {
+                VK_LOG_WARN("Editor auto-collider (%s): selection has no mesh",
+                            c.c_str());
+            }
+        } else {
+            VK_LOG_WARN("MYVK_EDITOR_COLLIDER 只认 hull|capsule，收到 '%s'",
+                        envColl);
+        }
     }
 
 
@@ -205,17 +343,34 @@ void EditorApp::onUpdate(float dt) {
         }
     }
 
-    // ---- 游戏逻辑只在 Play 态跑，而且跑在**运行态副本**上 ----
-    // 渲染那一边不用额外做什么：activeScene() 在 Play 期间已经返回运行态，
+    // ---- Run：游戏逻辑跑在**运行态副本**上；动画跑在编辑场景上 ----
+    // 渲染那一边不用额外做什么：activeScene() 在 Run 期间已经返回运行态，
     // 视口自然会显示这份世界。
     if (m_ctx->isPlaying()) {
+        // 一次新的 Play 开始（上一段 Play 的帧计数已被下面的 else 归零，
+        // 或者这是启动即 Play、计数器还是初值）→ 把详细日志预算灌满。
+        if (m_collisionFrames == 0) m_collisionLogBudget = 240;
         m_ctx->advancePlayTime(dt);
         runRuntimeScripts(dt);
+        // 碰撞必须在脚本**之后**：脚本负责让物体动，碰撞负责不让它们穿过去。
+        // 反过来（先碰撞后脚本）等于每一帧结束时都留一次穿透。
+        runCollision(dt);
     } else {
-        // 回到编辑态/暂停态就把帧计数归零，这样每次重新 Play
+        // 回到编辑态/暂停态就把帧计数归零，这样每次重新 Run
         // 都会重新打一条脚本执行汇总
         m_runtimeFrames = 0;
         m_scriptErrors.clear();
+        m_collisionFrames = 0;
+        m_collisionLogBudget = 240;
+    }
+
+    // ---- 动画（编辑态脚本）：Play 走、Pause 冻结、Stop 恢复快照 ----
+    if (m_ctx->isEditing() && m_ctx->animPlaying()) {
+        m_ctx->advanceAnimTime(dt);
+        runAnimScripts(dt);
+    } else {
+        m_animFrames = 0;
+        m_animErrors.clear();
     }
 }
 
@@ -270,14 +425,13 @@ void EditorApp::toggleWindowFullscreen() {
 
 // ---------------------------------------------------------------- 脚本执行
 
-// 在**运行态副本**上执行所有启用了 ScriptComponent 的实体。
-// 这里与 PlayerApp 时代的那份实现完全一致，只是对象换成了内存里的
-// m_runtimeScene —— 不再有跨进程的编译结果/日志分裂问题。
-void EditorApp::runRuntimeScripts(float dt) {
-    scene::Scene& sc = m_ctx->runtimeScene();
+// 在指定场景上执行所有启用了 ScriptComponent 的实体。
+// 运行态（Run）与动画（编辑场景）共用这一个内核，只有目标场景/时间源/
+// 错误表不同 —— 复制两份循环迟早会改出分叉。
+void EditorApp::runScriptsOn(scene::Scene& sc, double t, float dt,
+                             std::unordered_map<unsigned, std::string>& errors,
+                             const char* tag, uint64_t& summaryFrame) {
     ecs::World& w = sc.world();
-
-    const double t = static_cast<double>(m_ctx->playTime());
     const uint64_t frame = time().frameCount();
     const double dtd = static_cast<double>(dt);
 
@@ -295,9 +449,9 @@ void EditorApp::runRuntimeScripts(float dt) {
             if (!prog || !prog->valid()) {
                 // 编译就没过：只在错误内容变化时报一次，别刷屏
                 const std::string msg = asset->lastError().toString();
-                auto it = m_scriptErrors.find(e.id);
-                if (it == m_scriptErrors.end() || it->second != msg) {
-                    m_scriptErrors[e.id] = msg;
+                auto it = errors.find(e.id);
+                if (it == errors.end() || it->second != msg) {
+                    errors[e.id] = msg;
                     m_scripts->logLine("[compile] " + scomp.path + " > " + msg);
                     VK_LOG_WARN("Script not runnable (%s): %s", scomp.path.c_str(),
                                 msg.c_str());
@@ -316,9 +470,9 @@ void EditorApp::runRuntimeScripts(float dt) {
 
             if (!ok) {
                 const std::string msg = err.toString();
-                auto it = m_scriptErrors.find(e.id);
-                if (it == m_scriptErrors.end() || it->second != msg) {
-                    m_scriptErrors[e.id] = msg;
+                auto it = errors.find(e.id);
+                if (it == errors.end() || it->second != msg) {
+                    errors[e.id] = msg;
                     m_scripts->logLine("[runtime] " + scomp.path + " > " + msg);
                     VK_LOG_WARN("Script runtime error (%s): %s",
                                 scomp.path.c_str(), msg.c_str());
@@ -326,7 +480,7 @@ void EditorApp::runRuntimeScripts(float dt) {
                 ++failed;
                 return;
             }
-            m_scriptErrors.erase(e.id);
+            errors.erase(e.id);
             ++executed;
 
             // print() 的输出累积成滚动日志（run() 每次会清空 prints）
@@ -341,12 +495,85 @@ void EditorApp::runRuntimeScripts(float dt) {
             }
         });
 
-    // Play 的第一帧打一条汇总：冒烟测试据此确认"运行态场景 + 脚本执行"
-    // 这条链路真的通了（只看"没有 WARN"证明力不够）
-    if (++m_runtimeFrames == 1) {
-        VK_LOG_INFO("Runtime scripts: %d executed, %d failed (t=%.3fs)",
-                    executed, failed, static_cast<double>(m_ctx->playTime()));
+    // 第一帧打一条汇总：冒烟测试据此确认"场景 + 脚本执行"链路真的通了
+    // （只看"没有 WARN"证明力不够）
+    if (++summaryFrame == 1) {
+        VK_LOG_INFO("%s scripts: %d executed, %d failed (t=%.3fs)", tag,
+                    executed, failed, t);
     }
+}
+
+void EditorApp::runRuntimeScripts(float dt) {
+    runScriptsOn(m_ctx->runtimeScene(), static_cast<double>(m_ctx->playTime()),
+                 dt, m_scriptErrors, "Runtime", m_runtimeFrames);
+}
+
+// ---------------------------------------------------------------- 运行态碰撞
+//
+// 两件事，都在**运行态副本**上做（编辑态一个字节都不动，所以 Stop 之后
+// 场景永远回到播放前的样子）：
+//
+//   1. resolveBodyOverlaps —— 所有带碰撞体的实体两两分离。
+//      GJK 判"有没有插进去"，EPA 给出"插了多深、往哪个方向退"，
+//      然后把两个实体各推一半。跑 4 轮，墙角那种被夹住的情况也能推开。
+//
+//   2. resolveCamera —— 相机当成一个半径 kPlayCameraRadius 的球，
+//      用同一套 GJK/EPA 推出所有碰撞体。于是"镜头不会飞进墙里"。
+//
+// 顺序很重要：脚本先跑（它负责让物体动），碰撞后跑（它负责不让物体重合）。
+void EditorApp::runCollision(float dt) {
+    (void)dt;
+    scene::Scene& sc = m_ctx->runtimeScene();
+
+    std::vector<physics::BodyContact> contacts;
+    const int pairs = physics::resolveBodyOverlaps(sc, 4, &contacts);
+
+    const glm::vec3 camBefore = sc.camera().position();
+    const bool camPushed =
+        physics::resolveCamera(sc, sc.camera(), kPlayCameraRadius);
+    const glm::vec3 camAfter = sc.camera().position();
+
+    ++m_collisionFrames;
+    if (pairs == 0 && !camPushed) return;
+
+    const bool verbose = m_collisionLogBudget > 0;
+    if (!verbose && (m_collisionFrames % 60) != 0) return;
+
+    if (pairs > 0) {
+        VK_LOG_INFO("collision: %d overlapping pair(s) resolved (frame %llu)",
+                    pairs, static_cast<unsigned long long>(m_collisionFrames));
+        if (verbose) {
+            for (const physics::BodyContact& c : contacts) {
+                const std::string* na = sc.world().name(c.a);
+                const std::string* nb = sc.world().name(c.b);
+                VK_LOG_INFO("collision: '%s' <-> '%s' depth=%.4f "
+                            "normal=(%.3f,%.3f,%.3f)",
+                            na ? na->c_str() : "?",
+                            nb ? nb->c_str() : "?", 
+                            static_cast<double>(c.depth),
+                            static_cast<double>(c.normal.x),
+                            static_cast<double>(c.normal.y),
+                            static_cast<double>(c.normal.z));
+            }
+        }
+    }
+    if (camPushed) {
+        VK_LOG_INFO("collision: camera blocked, pushed (%.3f,%.3f,%.3f) -> "
+                    "(%.3f,%.3f,%.3f)",
+                    static_cast<double>(camBefore.x),
+                    static_cast<double>(camBefore.y),
+                    static_cast<double>(camBefore.z),
+                    static_cast<double>(camAfter.x),
+                    static_cast<double>(camAfter.y),
+                    static_cast<double>(camAfter.z));
+    }
+    if (verbose) --m_collisionLogBudget;
+}
+
+// 动画：直接在**编辑场景**上跑脚本（Play 走 / Pause 冻结 / Stop 恢复快照）
+void EditorApp::runAnimScripts(float dt) {
+    runScriptsOn(m_ctx->editorScene(), static_cast<double>(m_ctx->animTime()),
+                 dt, m_animErrors, "Anim", m_animFrames);
 }
 
 // ---------------------------------------------------------------- 脚本预编译
@@ -391,6 +618,13 @@ void EditorApp::computeLayout() {
     m_split->setToolbarHeight(m_ctx->toolbarHeight());
     m_split->beginFrame(io.DisplaySize.x, io.DisplaySize.y);
     m_split->apply(m_ctx->layout());
+
+    // 视口正下方腾出"刚刚好一行"播放条：从视口矩形底部扣掉一行，
+    // 扣出来的就是 transport 条。3D 画面的渲染高度随之自然缩小。
+    LayoutRects& L = m_ctx->layout();
+    L.transport = {L.viewport.x, L.viewport.y + L.viewport.h - kTransportH,
+                   L.viewport.w, kTransportH};
+    L.viewport.h = std::max(L.viewport.h - kTransportH, kMinViewport);
 }
 
 // ---------------------------------------------------------------- 快捷键
@@ -403,6 +637,11 @@ void EditorApp::handleShortcuts() {
     // ---- F11：窗口全屏（任何模式都可用，面板照旧显示）----
     // 与 Play 态的 F 分工：F = "全屏 + 只看游戏"，F11 = 只是把窗口铺满显示器。
     if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) toggleWindowFullscreen();
+
+    // ---- 视图方向快捷键（Blender 小键盘那一套：1/3/7 + Ctrl 反向，2/4/6/8 步进）----
+    // 必须放在下面 Ctrl 分支**之前** —— 那个分支末尾会直接 return，
+    // 会把 Ctrl+1/3/7（Back / Left / Bottom）一起吞掉。
+    m_viewport->handleViewShortcuts();
 
     if (io.KeyCtrl) {
         if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) m_ctx->undo();
@@ -419,8 +658,12 @@ void EditorApp::handleShortcuts() {
             if (r.ok) {
                 m_ctx->dirty() = false;
                 m_ctx->notify("Saved " + m_ctx->scenePath());
+                // 落到日志里：自动化脚本靠它确认"真的存了、存到哪了"
+                VK_LOG_INFO("Scene saved: '%s'", abs.c_str());
             } else {
                 m_ctx->notify("Save failed: " + r.error);
+                VK_LOG_WARN("Scene save failed for '%s': %s", abs.c_str(),
+                            r.error.c_str());
             }
         }
         return;  // 带 Ctrl 的组合键到此为止
@@ -468,6 +711,16 @@ void EditorApp::handleShortcuts() {
     }
 
     if (!m_ctx->hasSelection()) return;
+
+    // ---- 数字键 0：把选中的物体"落地" ----
+    // x / y 一个像素都不动，只把世界包围盒的底部贴到 z = 0 的地面上。
+    // 只认"在 3D 视口里左键点中"的选中（ViewportPanel::dropSelectionToGround
+    // 内部会判断，非视口选中时只在状态栏提示一句）。
+    // 上排数字 0 与小键盘 0 都收 —— 和 1/3/7 那套视图快捷键的处理一致。
+    if (ImGui::IsKeyPressed(ImGuiKey_0, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_Keypad0, false)) {
+        m_viewport->dropSelectionToGround();
+    }
 
     // 聚焦（Esc 顺手取消选择）
     if (ImGui::IsKeyPressed(ImGuiKey_F, false)) {
@@ -534,6 +787,7 @@ void EditorApp::onImGui() {
     m_inspector->draw();
     m_content->draw();
     m_viewport->draw();
+    drawTransportBar();
 
     if (m_ctx->panels().stats) drawStatsPanel();
     if (m_ctx->panels().scripts) drawScriptPanel();
@@ -643,6 +897,121 @@ void EditorApp::drawStatusBar() {
 
     ImGui::End();
     ImGui::PopStyleVar();
+}
+
+// ---------------------------------------------------------------- 播放条
+//
+// 视口正下方那一行（LayoutRects::transport，高度由 computeLayout 从视口
+// 底部扣出来）：Run = 运行游戏（编辑场景复制成运行态副本）；Play / Pause /
+// Stop = **动画**：直接在编辑场景上跑/冻结脚本，Stop 用 JSON 快照恢复
+// （见 EditorContext::anim*）。四个按钮在这一行的水平正中。
+void EditorApp::drawTransportBar() {
+    const LayoutRects& L = m_ctx->layout();
+    if (L.transport.w < 120.0f) return;   // 面板被折叠到极窄就不画了
+
+    // 自动化用（MYVK_LOG_RECTS=1）：播放条矩形 + 各按钮矩形，
+    // 脚本据此断言"这一行在视口正下方、按钮居中"。
+    logRect("TR-BAR", ImVec2(L.transport.x, L.transport.y),
+            ImVec2(L.transport.x + L.transport.w,
+                   L.transport.y + L.transport.h));
+
+    ImGui::SetNextWindowPos(ImVec2(L.transport.x, L.transport.y),
+                            ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(L.transport.w, L.transport.h),
+                             ImGuiCond_Always);
+
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+    // 与工具栏同色，看起来是视口下方一体的"控制条"
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,
+                          ImVec4(0.113f, 0.117f, 0.125f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 3.0f));
+    if (!ImGui::Begin("##transport", nullptr, flags)) {
+        ImGui::End();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    constexpr ImVec4 kRunCol(0.20f, 0.52f, 0.26f, 1.0f);   // Run 绿
+    constexpr ImVec4 kExitCol(0.48f, 0.22f, 0.22f, 1.0f);  // Exit Run 红
+    constexpr ImVec4 kPlayCol(0.16f, 0.42f, 0.52f, 1.0f);  // 动画 Play 青蓝
+    constexpr ImVec4 kPauseCol(0.62f, 0.50f, 0.16f, 1.0f); // Pause 琥珀
+    constexpr ImVec4 kStopCol(0.48f, 0.22f, 0.22f, 1.0f);  // Stop 红
+
+    const bool runActive = m_ctx->isPlaying();
+    const char* runLabel = runActive ? "Exit Run" : "Run";
+    const char* labels[4] = {runLabel, "Play", "Pause", "Stop"};
+
+    const ImGuiStyle& st = ImGui::GetStyle();
+    auto btnW = [&](const char* s) {
+        return ImGui::CalcTextSize(s).x + st.FramePadding.x * 2.0f + 12.0f;
+    };
+
+    // 居中：总宽 = 4 个按钮 + 3 个间隔（其中一个是分隔线）
+    const float sepW = ImGui::CalcTextSize("|").x;
+    const float totalW = btnW(labels[0]) + btnW(labels[1]) + btnW(labels[2]) +
+                         btnW(labels[3]) + sepW + st.ItemSpacing.x * 3.0f;
+    const float centerX =
+        (ImGui::GetWindowWidth() - totalW) * 0.5f;
+    ImGui::SetCursorPosX(std::max(centerX, 4.0f));
+
+    // ---- Run ----
+    ImGui::PushStyleColor(ImGuiCol_Button, runActive ? kExitCol : kRunCol);
+    if (ImGui::Button(runLabel, ImVec2(btnW(runLabel), 28.0f))) {
+        runActive ? m_ctx->stop() : m_ctx->play();
+    }
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(runActive
+            ? "Stop the running game (editor scene was never touched)."
+            : "Run the game in the viewport (logic runs on a copy;\n"
+              "the editor scene is left untouched).  Space");
+    }
+
+    // ---- 动画 Play / Pause / Stop ----
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+
+    ImGui::SameLine();
+    ImGui::BeginDisabled(runActive || m_ctx->animPlaying());
+    ImGui::PushStyleColor(ImGuiCol_Button, kPlayCol);
+    if (ImGui::Button("Play", ImVec2(btnW("Play"), 28.0f))) m_ctx->animPlay();
+    ImGui::PopStyleColor();
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered() && !runActive) {
+        ImGui::SetTooltip("Run scripts as an animation **on the editing "
+                          "scene**.\nStop restores the scene from a snapshot.");
+    }
+
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!m_ctx->animPlaying());
+    ImGui::PushStyleColor(ImGuiCol_Button, kPauseCol);
+    if (ImGui::Button("Pause", ImVec2(btnW("Pause"), 28.0f)))
+        m_ctx->animPause();
+    ImGui::PopStyleColor();
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Freeze the animation (state is kept).");
+    }
+
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!m_ctx->animActive());
+    ImGui::PushStyleColor(ImGuiCol_Button, kStopCol);
+    if (ImGui::Button("Stop", ImVec2(btnW("Stop"), 28.0f))) m_ctx->animStop();
+    ImGui::PopStyleColor();
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Stop the animation and restore the scene to\n"
+                          "how it looked when Play was pressed.");
+    }
+
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
 }
 
 // ---------------------------------------------------------------- 统计面板
@@ -867,7 +1236,7 @@ void EditorApp::drawEnginePanel() {
     // 开关**不在这里**：它由视口右上角的浮层 / View 菜单控制，并且每帧
     // 由 onUpdate 按"编辑态"同步给渲染器（Play 期间强制关）。这个面板
     // 只放那些"调起来才知道合不合适"的细节参数。
-    ImGui::SeparatorText("Viewport grid (y = 0)");
+    ImGui::SeparatorText("Viewport grid (z = 0)");
     {
         render::GridSettings& g = r.gridSettings();
         ImGui::SetNextItemWidth(90.0f);
@@ -886,7 +1255,16 @@ void EditorApp::drawEnginePanel() {
                          "%.2f");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90.0f);
-        ImGui::DragFloat("Fade end (m)", &g.fadeEnd, 1.0f, 5.0f, 300.0f, "%.0f");
+        ImGui::DragFloat("Edge fade start (m)", &g.fadeStart, 1.0f, 0.0f, 300.0f,
+                         "%.0f");
+        ImGui::SetNextItemWidth(90.0f);
+        ImGui::DragFloat("Edge fade end (m)", &g.fadeEnd, 1.0f, 5.0f, 300.0f,
+                         "%.0f");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("淡出用的是**距栅格中心**的距离（不是距相机），\n"
+                              "所以栅格的样子不会随镜头移动而变。\n"
+                              "终点会被 extent 与远平面夹住。");
+        }
         ImGui::TextDisabled("Toggle: viewport top-right HUD / View menu");
     }
 
@@ -908,67 +1286,242 @@ void EditorApp::drawEnginePanel() {
 }
 
 // ---------------------------------------------------------------- 设置
-
+//
+// Preferences：对标 Blender 首选项的"大窗口"布局 ——
+//   左侧一列分类标签（Interface / Viewport / Editing / Keymap / Scene），
+//   右侧是该分类的内容页。窗口可缩放、内容区跟随滚动。
+// 现有设置全部立即生效（没有"保存偏好"落盘，窗口底部有说明）。
 void EditorApp::drawSettingsPanel() {
-    // 设置弹窗：字体缩放 + 工具栏高度。居中显示，带确定/关闭按钮。
     const ImGuiIO& io = ImGui::GetIO();
 
+    // 居中弹出，尺寸接近 Blender 首选项（可拖动缩放）
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f,
                                    io.DisplaySize.y * 0.5f),
                             ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(360.0f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(920.0f, 620.0f), ImGuiCond_Appearing);
 
-    if (!ImGui::Begin("Settings###settings", &m_ctx->showSettings(),
+    // ⚠ 窗口 ID 用 ###prefs（ImGui 取 ### 之后做稳定 ID）：以前的小设置
+    //   面板也叫 "settings"，imgui.ini 里残留它的 Pos/Size —— 沿用旧 ID
+    //   会让新大窗口继承一个陈旧位置（甚至被 clamp 到屏幕角落，实测踩过）。
+    //   换新 ID 与旧记录切割，首帧 Appearing 居中才生效。
+    if (!ImGui::Begin("Preferences###prefs", &m_ctx->showSettings(),
                       ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
     }
 
-    ImGui::SeparatorText("Interface");
+    // 自动化用（MYVK_LOG_RECTS=1）：窗口实际矩形 + DisplaySize，
+    // 截图脚本核对"居中弹出"是否成立。
+    logRect("PREFS-WIN", ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
+                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
+    VK_LOG_INFO("PREFS-DBG DisplaySize=(%.0f,%.0f) ViewportPos=(%.0f,%.0f) "
+                "ViewportSize=(%.0f,%.0f)",
+                io.DisplaySize.x, io.DisplaySize.y,
+                ImGui::GetMainViewport()->Pos.x,
+                ImGui::GetMainViewport()->Pos.y,
+                ImGui::GetMainViewport()->Size.x,
+                ImGui::GetMainViewport()->Size.y);
 
-    // ---- 字体缩放 ----
-    float fontScale = m_ctx->fontScale();
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 90.0f);
-    if (ImGui::SliderFloat("Font scale", &fontScale, 0.75f, 2.0f, "%.2f")) {
-        m_ctx->fontScale() = fontScale;
+    // ---- 左侧分类标签 ----
+    static int page = 0;
+    static const char* kPages[] = {"Interface", "Viewport", "Editing",
+                                   "Keymap",    "Scene"};
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                          ImVec4(0.09f, 0.095f, 0.105f, 1.0f));
+    ImGui::BeginChild("##prefs_nav", ImVec2(168.0f, 0.0f),
+                      ImGuiChildFlags_Borders);
+    ImGui::PopStyleColor();
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 3.0f));
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    for (int i = 0; i < 5; ++i) {
+        if (ImGui::Selectable(kPages[i], page == i)) {
+            page = i;
+        }
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(%.0f%%)", fontScale * 100.0f);
+    ImGui::PopStyleVar();
+    ImGui::EndChild();
 
-    // 快速恢复按钮
-    if (ImGui::SmallButton("Reset to 1.00")) m_ctx->fontScale() = 1.0f;
     ImGui::SameLine();
-    if (ImGui::SmallButton("+0.10")) {
-        m_ctx->fontScale() = std::min(2.0f, m_ctx->fontScale() + 0.10f);
+    ImGui::BeginChild("##prefs_content", ImVec2(0.0f, 0.0f),
+                      ImGuiChildFlags_Borders);
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+
+    // ================================================================
+    if (page == 0) {
+        // ---- Interface ----
+        ImGui::SeparatorText("Interface");
+
+        float fontScale = m_ctx->fontScale();
+        ImGui::SetNextItemWidth(300.0f);
+        if (ImGui::SliderFloat("Font scale", &fontScale, 0.75f, 2.0f, "%.2f")) {
+            m_ctx->fontScale() = fontScale;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%.0f%%)", fontScale * 100.0f);
+        if (ImGui::SmallButton("Reset to 1.00")) m_ctx->fontScale() = 1.0f;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("+0.10"))
+            m_ctx->fontScale() = std::min(2.0f, m_ctx->fontScale() + 0.10f);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("-0.10"))
+            m_ctx->fontScale() = std::max(0.75f, m_ctx->fontScale() - 0.10f);
+
+        ImGui::Spacing();
+        float toolbarH = m_ctx->toolbarHeight();
+        ImGui::SetNextItemWidth(300.0f);
+        if (ImGui::SliderFloat("Toolbar height", &toolbarH, 42.0f, 84.0f,
+                               "%.0f px")) {
+            m_ctx->toolbarHeight() = toolbarH;
+        }
+        if (ImGui::SmallButton("Reset to 46")) m_ctx->toolbarHeight() = 46.0f;
+
+        ImGui::Spacing();
+        ImGui::TextWrapped("%s",
+                           "Font scale applies immediately (globally). "
+                           "Toolbar height adjusts the top bar "
+                           "(44 px is the tightest that still fits).");
     }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("-0.10")) {
-        m_ctx->fontScale() = std::max(0.75f, m_ctx->fontScale() - 0.10f);
+
+    // ================================================================
+    if (page == 1) {
+        // ---- Viewport ----
+        ImGui::SeparatorText("Navigation");
+        float sens = m_ctx->navSensitivity();
+        ImGui::SetNextItemWidth(300.0f);
+        if (ImGui::SliderFloat("Sensitivity", &sens,
+                               EditorContext::kMinSensitivity,
+                               EditorContext::kMaxSensitivity, "x%.2f")) {
+            m_ctx->navSensitivityRef() = sens;
+        }
+        if (ImGui::SmallButton("Reset to x1.00")) m_ctx->navSensitivityRef() = 1.0f;
+        ImGui::SameLine();
+        ImGui::TextDisabled("(also editable in the viewport HUD; "
+                            "hold RMB + wheel to adjust)");
+
+        ImGui::Spacing();
+        ImGui::SeparatorText("Ground grid (z = 0)");
+        ImGui::Checkbox("Show grid", &m_ctx->showGridRef());
+        render::GridSettings& g = renderer().gridSettings();
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::DragFloat("Minor step (m)", &g.minorStep, 0.05f, 0.1f, 10.0f,
+                         "%.2f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::DragFloat("Major (m)", &g.majorStep, 0.5f, 1.0f, 100.0f, "%.1f");
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::DragFloat("Extent (m)", &g.extent, 1.0f, 5.0f, 500.0f, "%.0f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::DragFloat("Alpha", &g.alpha, 0.01f, 0.0f, 1.0f, "%.2f");
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::DragFloat("Line width (px)", &g.lineWidthPx, 0.05f, 0.5f, 5.0f,
+                         "%.2f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::DragFloat("Edge fade start (m)", &g.fadeStart, 1.0f, 0.0f, 300.0f,
+                         "%.0f");
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::DragFloat("Edge fade end (m)", &g.fadeEnd, 1.0f, 5.0f, 300.0f,
+                         "%.0f");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("淡出用的是**距栅格中心**的距离（不是距相机）。");
+        }
+
+        ImGui::Spacing();
+        ImGui::SeparatorText("Light gizmos");
+        ImGui::Checkbox("Draw light gizmos", &renderer().lightGizmosEnabled());
+        if (renderer().lightGizmosEnabled()) {
+            ImGui::SetNextItemWidth(140.0f);
+            ImGui::DragFloat("Gizmo scale", &renderer().lightGizmoScale(),
+                             0.002f, 0.01f, 0.25f, "%.3f");
+        }
     }
 
-    ImGui::Separator();
+    // ================================================================
+    if (page == 2) {
+        // ---- Editing（吸附三件套，UE5 预设）----
+        ImGui::SeparatorText("Snapping (per tool, UE5 defaults)");
+        ImGui::TextDisabled("Toggle with G for the current tool.");
+        ImGui::Spacing();
 
-    // ---- 工具栏高度 ----
-    float toolbarH = m_ctx->toolbarHeight();
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 90.0f);
-    if (ImGui::SliderFloat("Toolbar height", &toolbarH, 42.0f, 84.0f, "%.0f px")) {
-        m_ctx->toolbarHeight() = toolbarH;
+        ImGui::Checkbox("Move snapping", &m_ctx->snapMoveRef());
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::DragFloat("Move step (m)", &m_ctx->snapMoveStepRef(), 0.01f,
+                         0.01f, 10.0f, "%.2f");
+        ImGui::Checkbox("Rotate snapping", &m_ctx->snapRotateRef());
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::DragFloat("Rotate step (deg)", &m_ctx->snapRotateStepRef(), 1.0f,
+                         1.0f, 90.0f, "%.0f");
+        ImGui::Checkbox("Scale snapping", &m_ctx->snapScaleRef());
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::DragFloat("Scale step", &m_ctx->snapScaleStepRef(), 0.01f, 0.01f,
+                         1.0f, "%.2f");
+
+        ImGui::Spacing();
+        if (ImGui::Button("Restore UE5 defaults")) {
+            m_ctx->snapMoveRef() = false;
+            m_ctx->snapMoveStepRef() = 0.1f;
+            m_ctx->snapRotateRef() = false;
+            m_ctx->snapRotateStepRef() = 10.0f;
+            m_ctx->snapScaleRef() = false;
+            m_ctx->snapScaleStepRef() = 0.1f;
+        }
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("px");
 
-    if (ImGui::SmallButton("Reset to 46")) m_ctx->toolbarHeight() = 46.0f;
+    // ================================================================
+    if (page == 3) {
+        // ---- Keymap（只读速查）----
+        ImGui::SeparatorText("Viewport navigation (edit mode)");
+        ImGui::BulletText("Hold RMB + drag: look around");
+        ImGui::BulletText("Hold RMB + WASD: fly   Q / E: down / up");
+        ImGui::BulletText("Hold MMB + drag: pan   Shift: fly faster");
+        ImGui::BulletText("Wheel: dolly in / out   RMB + wheel: sensitivity");
+        ImGui::SeparatorText("Editing");
+        ImGui::BulletText("LMB: select / drag gizmo handle");
+        ImGui::BulletText("W / E / R: gizmo mode   X: world / local");
+        ImGui::BulletText("G: snapping on/off for the current tool");
+        ImGui::BulletText("Shift+A (in viewport): add menu (Mesh / Light)");
+        ImGui::BulletText("1 / 3 / 7: Front / Right / Top (+Ctrl = opposite)");
+        ImGui::BulletText("2 / 4 / 6 / 8: orbit step (Blender numpad)");
+        ImGui::BulletText("F: focus selection   Del: delete   F2: rename");
+        ImGui::BulletText("Ctrl+Z / Ctrl+Y: undo / redo");
+        ImGui::SeparatorText("Scene & playback");
+        ImGui::BulletText("Ctrl+S: save   Ctrl+N: new scene");
+        ImGui::BulletText("Space: run / pause   F: game fullscreen (in run)");
+        ImGui::BulletText("F11: window fullscreen (any mode)");
+    }
+
+    // ================================================================
+    if (page == 4) {
+        // ---- Scene（信息页）----
+        ImGui::SeparatorText("Scene");
+        ImGui::Text("Path: %s%s", m_ctx->scenePath().c_str(),
+                    m_ctx->dirty() ? "  (unsaved changes)" : "");
+        if (m_ctx->dirty())
+            ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.4f, 1.0f),
+                               "There are unsaved changes - Ctrl+S to save.");
+        ImGui::Text("Entities: %zu (editor %zu / runtime %zu)",
+                    m_ctx->activeScene().objectCount(),
+                    m_ctx->editorScene().objectCount(),
+                    m_ctx->runtimeScene().objectCount());
+        const scene::Scene::LightStats ls = m_ctx->editorScene().lightStats();
+        ImGui::Text("Local lights: %zu (%zu point / %zu spot)",
+                    ls.pointLights + ls.spotLights, ls.pointLights,
+                    ls.spotLights);
+        ImGui::Spacing();
+        ImGui::TextWrapped("Save / open with the File menu (Ctrl+S / Ctrl+N). "
+                           "The transport row below the viewport holds Run "
+                           "(game) and Play / Pause / Stop (animation).");
+    }
 
     ImGui::Spacing();
-    ImGui::TextDisabled("Font scale applies immediately (global).");
-    ImGui::TextDisabled("Toolbar height adjusts the play-control bar\n"
-                        "(44 px is the tightest that still fits the buttons).");
-
     ImGui::Separator();
-    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 90.0f);
-    if (ImGui::Button("Close", ImVec2(80.0f, 0.0f)))
-        m_ctx->showSettings() = false;
+    ImGui::TextDisabled("Preferences apply immediately. They are not persisted "
+                        "between sessions yet.");
 
+    ImGui::EndChild();
     ImGui::End();
 }
 

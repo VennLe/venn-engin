@@ -83,6 +83,11 @@ struct GridPushConstants {
 };
 
 static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
-static constexpr uint32_t kTextureSetCount = 3;  // albedo / normal / orm
+// 每个物体在 set 1..N 各绑一张纹理（一个 set = 一个 binding=0 的 sampler）。
+// 之所以一张纹理一个 set，是因为描述符集属于 **Texture 对象本身**（见
+// Texture::descriptorSet()）：把多张图塞进同一个 set 就变成"组合"才拥有
+// 描述符，缓存与生命周期都要重做。多绑几个 set 的代价远小于那笔复杂度。
+//   1 albedo  2 normal  3 orm  4 roughness  5 metallic  6 emissive
+static constexpr uint32_t kTextureSetCount = 6;
 
 } // namespace render

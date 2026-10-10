@@ -107,6 +107,17 @@ void Scene::collectLights(std::vector<LightInstance>& out) const {
             const glm::vec3 pos = glm::vec3(worldMatrix(e)[3]);
             out.push_back(makeSpotLight(pos, sl));
         });
+
+    // 实体级方向光（编辑器可以摆多盏，作为"补光"用 —— 无阴影、无衰减）。
+    // 场景级太阳（m_lightEntity）不在这里：它走 ShadowPass + sun UBO
+    // 的独立通道，混进局部光列表会照两遍。
+    m_world.each<ecs::DirectionalLightComponent>(
+        [&](ecs::Entity e, const ecs::DirectionalLightComponent& dl) {
+            if (e == m_lightEntity) return;
+            if (dl.intensity <= 0.0f) return;
+            const glm::vec3 pos = glm::vec3(worldMatrix(e)[3]);
+            out.push_back(makeDirectionalLight(pos, dl));
+        });
 }
 
 Scene::LightStats Scene::lightStats() const {
