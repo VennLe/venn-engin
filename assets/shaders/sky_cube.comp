@@ -1,0 +1,44 @@
+#version 450
+// ============================================================
+// sky_cube.comp —— 把程序化天空烘焙进一张立方体贴图
+//
+// 这是整个 IBL 链的**源头**：背景 pass（sky.frag）与两条卷积
+// （irradiance / prefilter）都只读这张图。天空模型只有一份，
+// 在 common.glsl 的 vennSkyColor() 里。
+//
+// 为什么用 compute 而不是"渲染 6 个面"：
+//   面号 → 方向是一张纯查表函数（vennCubeDir），一趟 compute 就能
+//   把 6 个面写满，不需要 6 个 Framebuffer、6 次 RenderPass，
+//   也没有光栅化 / 深度 / 视口状态要配。
+//
+// 线程布局：一个 invocation 写一个像素。
+//   x, y = 面内像素；z = 面号（dispatch 的 z 维 = 6）
+//
+// ⚠ #include 放在所有 layout 声明**之后**：compute 的 local_size
+//   必须在其它声明之前出现，而 #include 是纯文本展开。
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// 输出：整个立方体（Vulkan 里立方体就是 6 层的 2D 数组）
+layout(set = 0, binding = 0, rgba32f) uniform writeonly image2DArray skyOut;
+
+layout(push_constant) uniform Push {
+    vec4 zenith;   // rgb = 天顶色（线性 HDR）
+    vec4 ground;   // rgb = 地面色
+} pc;
+
+#include "common.glsl"
+
+void main() {
+    const int face = int(gl_GlobalInvocationID.z);
+    if (face >= 6) return;
+
+    const ivec2 size = imageSize(skyOut).xy;
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    const vec3 dir = vennCubeDir(face, vennCubeFaceUv(pixel, size));
+    const vec3 color = vennSkyColor(dir, pc.zenith.rgb, pc.ground.rgb);
+    imageStore(skyOut, ivec3(pixel, face), vec4(color, 1.0));
+}

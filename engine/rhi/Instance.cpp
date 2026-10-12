@@ -80,7 +80,17 @@ bool Instance::create() {
     app.applicationVersion = VK_MAKE_VERSION(0, 2, 0);
     app.pEngineName = "Venn";
     app.engineVersion = VK_MAKE_VERSION(0, 1, 0);
-    app.apiVersion = VK_API_VERSION_1_0;
+    // 请求 1.2：屏幕空间效果链（HdrTarget 共享深度方案）依赖
+    // separateDepthStencilLayouts —— 它的查询（vkGetPhysicalDeviceFeatures2）
+    // 与启用（VkPhysicalDeviceVulkan12Features）都要求实例 ≥ 1.1。
+    // 实例还停在 1.0 时 Features2 查询是无效调用（验证层报 ERROR、
+    // 结果全 0），Device 侧会误判"设备不支持"。取 loader 支持版本与
+    // 1.2 的较小者：老 loader 上退到它支持的版本，缺特性时 Device
+    // 会明确报错而不是悄悄走错路。
+    uint32_t instVer = VK_API_VERSION_1_0;
+    vkEnumerateInstanceVersion(&instVer);  // Vulkan 1.1+ loader 提供
+    const uint32_t kWantApi = VK_MAKE_VERSION(1, 2, 0);
+    app.apiVersion = (instVer >= kWantApi) ? kWantApi : instVer;
 
     // GLFW 需要的实例扩展
     uint32_t glfwExtCount = 0;

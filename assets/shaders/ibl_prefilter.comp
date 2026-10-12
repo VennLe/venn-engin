@@ -1,0 +1,88 @@
+#version 450
+// ============================================================
+// ibl_prefilter.comp —— 镜面预过滤（IBL 第二条通道）
+//
+// 目标：对每个输出方向 R 与给定粗糙度 α，求
+//
+//     Prefilter(R, α) = ∫ L(ω)·D(ω,α)·(N·ω) dω  /  ∫ D·(N·ω) dω
+//
+// 也就是"把环境按 GGX 波瓣糊一遍"。roughness = 0 时波瓣退化成
+// 一根针 → 结果就是原图（镜面）；roughness → 1 时糊成一片 →
+// 接近辐照度。
+//
+// ---- 为什么按 mip 分级 ----
+//   每个 mip 烘一个粗糙度：mip m 对应 α = m/(mips-1)。片元里
+//   textureLod(prefilter, R, roughness*maxMip) 直接取，采样器
+//   再补一次三线性 —— 粗糙度连续变化时看不到台阶。
+//
+// ---- 为什么按 D 重要性采样 ----
+//   D 就是"反射能量往哪个方向集中"的分布。按它采样意味着
+//   高概率方向恰好是贡献大的方向，几百个样本就收敛；
+//   均匀采样要上万样本才有同等质量。
+//
+// 线程布局：(x, y) = 该 mip 的面内像素，z = 面号。
+// 每个 mip 一个独立 dispatch（输出视图绑的是**单个** mip ——
+// imageStore 不能指定 mip 层级）。
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform samplerCube skyMap;
+// 只写了一级 mip 的立方体视图（baseMipLevel = 本 mip）
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray prefOut;
+
+layout(push_constant) uniform Push {
+    vec4 params;   // x=粗糙度 y=源立方体边长 z=样本数 w=mip 序号
+} pc;
+
+#include "common.glsl"
+
+void main() {
+    const int face = int(gl_GlobalInvocationID.z);
+    if (face >= 6) return;
+
+    const ivec2 size = imageSize(prefOut).xy;
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    const vec3 N = vennCubeDir(face, vennCubeFaceUv(pixel, size));
+    const vec3 R = N;
+    const vec3 V = R;   // split-sum 的标准假设：观察方向 = 反射方向
+
+    const float roughness = clamp(pc.params.x, 0.0, 1.0);
+    const float srcSize = max(pc.params.y, 1.0);
+    const uint sampleCount = uint(max(pc.params.z, 1.0));
+
+    // 源图一个纹素覆盖的立体角。用来挑 mip：某个样本的 pdf 很小
+    // （覆盖面积比纹素还大）时改查更粗的 mip，否则会出现亮点闪烁
+    // （欠采样）。
+    const float saTexel = 4.0 * VENN_PI / (6.0 * srcSize * srcSize);
+
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+
+    for (uint i = 0u; i < sampleCount; ++i) {
+        const vec2 xi = vennHammersley(i, sampleCount);
+        const vec3 H = vennImportanceSampleGGX(xi, N, roughness);
+        const vec3 L = normalize(2.0 * dot(V, H) * H - V);
+        const float NdotL = max(dot(N, L), 0.0);
+        if (NdotL <= 0.0) continue;
+
+        const float NdotH = max(dot(N, H), 0.0);
+        const float HdotV = max(dot(H, V), 0.0);
+        const float D = vennDistributionGGX(NdotH, roughness);
+
+        // pdf：GGX 半程向量采样 → 反射方向的概率密度
+        const float pdf = max(D * NdotH / max(4.0 * HdotV, 1e-4), 1e-4);
+        const float saSample = 1.0 / (float(sampleCount) * pdf + 1e-4);
+        const float mip = roughness <= 1e-4 ? 0.0 : 0.5 * log2(saSample / saTexel);
+
+        sum += textureLod(skyMap, L, mip).rgb * NdotL;
+        weight += NdotL;
+    }
+
+    // 按 NdotL 加权平均（漫反射由 irradiance 通道负责，
+    // 这里的 NdotL 只是重要性权重，不再乘进结果）
+    const vec3 result = weight > 1e-4 ? sum / weight : texture(skyMap, R).rgb;
+    imageStore(prefOut, ivec3(pixel, face), vec4(result, 1.0));
+}

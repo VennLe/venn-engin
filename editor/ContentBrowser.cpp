@@ -51,7 +51,7 @@ bool isImage(const std::string& name) {
 
 bool isModel(const std::string& name) {
     const std::string e = lowerExt(name);
-    return e == ".gltf" || e == ".glb" || e == ".obj";
+    return e == ".gltf" || e == ".glb" || e == ".obj" || e == ".fbx";
 }
 
 bool isScript(const std::string& name) { return lowerExt(name) == ".vks"; }

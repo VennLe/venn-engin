@@ -12,6 +12,7 @@
 #include "core/Logger.h"
 #include "ecs/Components.h"
 #include "physics/CollisionWorld.h"
+#include "render/ShaderKeywords.h"
 #include "scene/Camera.h"
 #include "scene/Light.h"
 #include "scene/Scene.h"
@@ -366,16 +367,38 @@ void InspectorPanel::drawCollisionSection(ecs::Entity e) {
 
     // ---- 手柄目标开关 ----
     bool editColl = m_ctx.colliderEdit();
-    if (ImGui::Checkbox("Edit with W/E/R", &editColl))
+    if (ImGui::Checkbox("Edit with W/E/R", &editColl)) {
         m_ctx.setColliderEdit(editColl);
+        // 自动化需要"编辑态到底切没切上"的回执 —— 勾选框点击在这台机器
+        // 上偶发落空（坑点 #32），盲目重试 toggle 会把状态勾回去。
+        if (std::getenv("MYVK_LOG_RECTS"))
+            VK_LOG_INFO("INS-COLLIDER-EDIT-SET %d", editColl ? 1 : 0);
+    }
+    logRect("INS-COLLIDER-EDIT", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
     ImGui::SameLine();
     bool solid = cc->solid;
-    if (ImGui::Checkbox("Solid", &solid))
+    if (ImGui::Checkbox("Solid", &solid)) {
+        cc->solid = solid;   // discreteEdit 的契约：*target 已持有新值
         discreteEdit(m_ctx, "Collider Solid", &cc->solid, !solid);
+    }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Solid = blocks other colliders and the camera.\n"
                           "Off = a pure trigger (still visible, still blocks "
                           "the camera while flying through it).");
+
+    // ---- 线框显隐（默认显示；W/E/R 编辑中无论如何都强制显示）----
+    bool showWire = cc->showWireframe;
+    if (ImGui::Checkbox("Show Wireframe", &showWire)) {
+        cc->showWireframe = showWire;   // discreteEdit 只压撤销栈，不赋值
+        discreteEdit(m_ctx, "Collider Wireframe", &cc->showWireframe,
+                     !showWire);
+    }
+    logRect("INS-COLLIDER-SHOW", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show/hide the collision wireframe in the viewport.\n"
+                          "Always visible while editing with W/E/R.");
 
     // ---- 摆放（相对实体）----
     const glm::vec3 p0 = cc->position;
@@ -1035,6 +1058,40 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
         const bool ob = mat->doubleSided;
         mat->doubleSided = ds;
         discreteEdit(m_ctx, "Material Double Sided", &mat->doubleSided, ob);
+    }
+
+    // ---- 这个材质会被编成哪个着色器变体（见 render/ShaderKeywords.h）----
+    // 只读。上面三个控件（Double Sided / Alpha Mode / Normal 槽位）的组合
+    // 结果直接写出来，省得去猜"双面 + 挂了法线图"到底是哪一份 .spv ——
+    // 也省得在改了开关后看不出"到底有没有生效"。
+    //
+    // 这一行就是关键字系统的用户可见面：材质属性 → 掩码 → 变体文件，
+    // 一条规则，三处（CMake 的 -D / pbr.frag 的 #if / 管线固定状态）共用。
+    //
+    // 排版：值列只放 `k5` —— 值列到面板右边只剩 ~216px，把名字也塞进去时
+    // 全开三个关键字（`k7 (double-sided|alpha-blend|normal-map)` 约 294px）
+    // 会被 ImGui 直接裁掉、还不报错。名字另起一行、跟着值列对齐写，
+    // 宽了就自己换行。变体文件名放 tooltip。
+    {
+        const render::KeywordMask kw = render::keywordsOf(*mat);
+        // 标签必须 <= 12 字符：标签列只有 kLabelWidth(88) px，写
+        // "Shader Variant"(14) 会和值列挤在一起（实测粘成 "Shader Variantk5"）。
+        rowBegin("Shader Var");
+        ImGui::TextDisabled("k%u", kw);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "%s\n\n"
+                "关键字位（与 CMakeLists.txt 的 SHADER_KEYWORDS 一一对应）：\n"
+                "  bit0  double-sided  VENN_DOUBLE_SIDED  关背面剔除\n"
+                "  bit1  alpha-blend   VENN_ALPHA_BLEND   走混合、不写深度\n"
+                "  bit2  normal-map    VENN_NORMAL_MAP    采样法线贴图 + TBN\n"
+                "\n没挂法线图时 bit2 为 0：那段采样与 TBN 会被整段编掉，"
+                "改为绑一张内置平坦法线，两者像素等价。\n"
+                "\n若设了 MYVK_SHADER_FORCE_MASK，实际用的变体会被强制覆盖，"
+                "Stats 面板会标出 FORCED。",
+                render::variantShaderFile("pbr.frag", kw).c_str());
+        }
+        ImGui::TextDisabled("  %s", render::keywordNames(kw).c_str());
     }
 }
 

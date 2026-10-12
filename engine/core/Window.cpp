@@ -188,9 +188,13 @@ bool Window::applyIconFromResource() {
 
     if (big) SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
     if (small) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small));
-    // ICON_SMALL2：Vista 起任务栏/Alt+Tab 在某些 DPI 下优先看它
-    SendMessageW(hwnd, WM_SETICON, ICON_SMALL2,
-                 reinterpret_cast<LPARAM>(small ? small : big));
+    // 注意：**不要**再给 ICON_SMALL2(=2) 发 WM_SETICON。MSDN 只定义了
+    // WM_SETICON 的 wParam 取 ICON_SMALL/ICON_BIG；传 2 是未定义行为——
+    // 在 Win11 上实测它会把 small 句柄写进 ICON_BIG 的 slot，把上面刚设
+    // 好的 48 档大图标覆盖成 24 档（Alt+Tab 图标因此变小变糊，2026-10-11
+    // 用外部探针定位：重设 ICON_BIG 后 6 秒稳定，证明覆盖来自进程自身）。
+    // ICON_SMALL2 只在 **WM_GETICON** 查询时有意义（shell 取 Alt+Tab 图标），
+    // 系统会自己从 BIG/SMALL 组合，不需要应用去设置。
 
     // WM_SETICON 只作用于窗口；Alt+Tab 和一部分 shell 细节走的是**窗口类**
     // 图标（GCLP_HICON/HICONSM）。两处都设上才算真的处处都对。原来 GLFW

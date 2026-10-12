@@ -1,5 +1,6 @@
 #include "EditorApp.h"
 
+#include "CharacterWindow.h"
 #include "ContentBrowser.h"
 #include "DebugRects.h"
 #include "EditorContext.h"
@@ -124,6 +125,7 @@ void EditorApp::onInit() {
     m_hierarchy = std::make_unique<SceneHierarchy>(*m_ctx);
     m_inspector = std::make_unique<InspectorPanel>(*m_ctx);
     m_content = std::make_unique<ContentBrowser>(*m_ctx);
+    m_characterWindow = std::make_unique<CharacterWindow>(*m_ctx, renderer());
 
     // 启动场景 = **一张白纸**：一块不透明地面 + 一盏方向光 + 一个默认机位。
     // 这里以前会搭出一整套内置演示内容，2026-10-09 按用户要求连同独立的
@@ -139,6 +141,10 @@ void EditorApp::onInit() {
     //   MYVK_EDITOR_GIZMO=move|rotate|scale   启动即切手柄模式
     //   MYVK_EDITOR_COLLIDER=hull|capsule     给选中项加碰撞体并进入碰撞体编辑
     //   MYVK_EDITOR_PREFS=1      启动即打开 Preferences 窗口（截图验证用）
+    //   MYVK_EDITOR_NO_HUD=1     关掉视口里的统计 / 导航叠加层，纯 3D 出图。
+    //       自动化截图的像素断言需要"同一配置两次运行背景逐像素相同"，而
+    //       叠加层里的 FPS / 帧时间每次都不同，会在背景上留下几阶噪声。
+    if (std::getenv("MYVK_EDITOR_NO_HUD")) m_viewport->setHudVisible(false);
     if (const char* envScene = std::getenv("MYVK_EDITOR_SCENE")) {
         if (envScene[0] != '\0') {
             const std::string abs = assets::resolveAssetPath(envScene);
@@ -352,6 +358,9 @@ void EditorApp::onUpdate(float dt) {
         if (m_collisionFrames == 0) m_collisionLogBudget = 240;
         m_ctx->advancePlayTime(dt);
         runRuntimeScripts(dt);
+        // 玩家在脚本之后 / 碰撞之前：脚本可能挪物体，玩家再动自己，
+        // 碰撞最后保证谁都不穿谁（玩家也被墙挡）。
+        runPlayers(dt);
         // 碰撞必须在脚本**之后**：脚本负责让物体动，碰撞负责不让它们穿过去。
         // 反过来（先碰撞后脚本）等于每一帧结束时都留一次穿透。
         runCollision(dt);
@@ -521,6 +530,187 @@ void EditorApp::runRuntimeScripts(float dt) {
 //      用同一套 GJK/EPA 推出所有碰撞体。于是"镜头不会飞进墙里"。
 //
 // 顺序很重要：脚本先跑（它负责让物体动），碰撞后跑（它负责不让物体重合）。
+// ---------------------------------------------------------------- 玩家
+//
+// 运行态驱动 Shift+A 加进来的 Player（第一人称 / 第三人称）。手感对齐
+// 市面游戏，两种视角的鼠标语义刻意不同：
+//   第一人称 —— 鼠标 = 转动**视野**；WASD 沿视线（水平分量）走。
+//   第三人称 —— 鼠标 = **环绕角色**的轨道相机；WASD 沿相机朝向走，
+//               角色平滑转身朝移动方向、边走边摆腿（walk 动画）。
+// 输入来源就是 ImGui IO：鼠标要在视口里才转视角；键盘全窗口生效
+// （游戏习惯）。玩家带胶囊碰撞体 → 移动后由 runCollision 保证不穿墙。
+void EditorApp::runPlayers(float dt) {
+    scene::Scene& sc = m_ctx->runtimeScene();
+    ecs::World& w = sc.world();
+
+    std::vector<ecs::Entity> players;
+    w.each<ecs::PlayerComponent>(
+        [&](ecs::Entity e, ecs::PlayerComponent&) { players.push_back(e); });
+    if (players.empty()) return;
+
+    const ImGuiIO& io = ImGui::GetIO();
+    const bool mouseInViewport =
+        m_ctx->mouseInViewport(glm::vec2(io.MousePos.x, io.MousePos.y));
+    const bool keysActive = !io.WantTextInput;
+
+    for (ecs::Entity e : players) {
+        auto* pc = w.get<ecs::PlayerComponent>(e);
+        auto* tc = w.get<ecs::TransformComponent>(e);
+        if (!pc || !tc) continue;
+
+        const bool firstPerson =
+            pc->mode == ecs::PlayerMode::FirstPerson;
+
+        // ---- 鼠标 ----
+        // pitch 是**视线仰角**（正 = 抬头）：io.MouseDelta.y 向下为正，
+        // 所以"鼠标往上"= 负值 = pitch 增大 = 抬头。市面游戏就是这样，
+        // 第一/第三人称同一套语义。
+        if (mouseInViewport) {
+            pc->yaw += io.MouseDelta.x * pc->lookSpeed;
+            pc->pitch -= io.MouseDelta.y * pc->lookSpeed;
+        }
+        pc->pitch = glm::clamp(pc->pitch, -1.45f, 1.45f);
+
+        // ---- WASD（(forward, right) 键位组合）----
+        glm::vec2 wish(0.0f);
+        if (keysActive) {
+            if (ImGui::IsKeyDown(ImGuiKey_W)) wish.x += 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_S)) wish.x -= 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_D)) wish.y += 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_A)) wish.y -= 1.0f;
+        }
+        const bool moving = (wish.x != 0.0f || wish.y != 0.0f);
+        const float speed = pc->moveSpeed * (io.KeyShift ? 2.0f : 1.0f);
+
+        // 相机系水平基（与 Camera::angleDir 同约定：yaw=0 → +X，
+        // yaw 增大向右转）。第一人称：forward = 视线水平分量；
+        // 第三人称：相机在角色 +dir 方位上、看向角色 →
+        // W（远离相机）= -方位向量的水平分量。
+        const float cy = std::cos(pc->yaw), sy = std::sin(pc->yaw);
+        const glm::vec3 fwdH =
+            firstPerson ? glm::vec3(cy, -sy, 0.0f)
+                        : glm::vec3(-cy, sy, 0.0f);
+        const glm::vec3 rightH = firstPerson
+                                     ? glm::vec3(-sy, -cy, 0.0f)
+                                     : glm::vec3(sy, cy, 0.0f);
+
+        if (moving) {
+            const glm::vec2 dir2 = glm::normalize(wish);
+            tc->position +=
+                (fwdH * dir2.x + rightH * dir2.y) * (speed * dt);
+        }
+
+        // ---- 第三人称：转身 + walk 摆腿 ----
+        if (!firstPerson) {
+            if (!pc->started) pc->bodyYaw = pc->yaw;
+            if (moving) {
+                const glm::vec3 dir =
+                    glm::normalize(fwdH * wish.x + rightH * wish.y);
+                // 面朝方向的 yaw：dir=(cos b, -sin b) → b = atan2(-y, x)
+                const float targetYaw = std::atan2(-dir.y, dir.x);
+                float diff = targetYaw - pc->bodyYaw;
+                // 最短角差（bodyYaw 会一直增大，先 wrap 到 [-π,π]）
+                constexpr float kTwoPi = 6.28318530718f;
+                diff = std::fmod(diff, kTwoPi);
+                if (diff > 3.14159265f) diff -= kTwoPi;
+                if (diff < -3.14159265f) diff += kTwoPi;
+                pc->bodyYaw +=
+                    diff * std::min(1.0f, pc->turnSpeed * dt);
+                // 角色建模面朝 +X：绕 Z 转 -bodyYaw 把 +X 转到面朝方向
+                tc->rotation.z = -pc->bodyYaw;
+                pc->walkPhase += speed * 3.2f * dt;
+            } else {
+                // 停下：摆动相位衰减回 0（四肢滑回直立）
+                pc->walkPhase *= 1.0f - std::min(1.0f, 10.0f * dt);
+            }
+
+            // 摆四肢：关节是 root 的**直接子节点**（Hierarchy.parent 判属主），
+            // 转关节的局部 rotation.y = 肢体绕肩/髋前后摆。
+            // 2026-10-11：程序化小人已删除，这里只在有 PlayerLimbComponent
+            // 时才摆动（骨骼网格角色走 Skeleton 采样路径，不经过这里）。
+            const float swing = std::sin(pc->walkPhase) * 0.65f;
+            w.each<ecs::PlayerLimbComponent>(
+                [&](ecs::Entity le, ecs::PlayerLimbComponent& limb) {
+                    const auto* h = w.get<ecs::HierarchyComponent>(le);
+                    if (!h || h->parent != e.id) return;  // 别的玩家的
+                    auto* lt = w.get<ecs::TransformComponent>(le);
+                    if (!lt) return;
+                    switch (limb.kind) {
+                        case ecs::PlayerLimbComponent::ArmL:
+                            lt->rotation.y = swing;
+                            break;
+                        case ecs::PlayerLimbComponent::ArmR:
+                            lt->rotation.y = -swing;
+                            break;
+                        case ecs::PlayerLimbComponent::LegL:
+                            lt->rotation.y = -swing;
+                            break;
+                        case ecs::PlayerLimbComponent::LegR:
+                            lt->rotation.y = swing;
+                            break;
+                        default:  // 躯干 / 头不摆
+                            break;
+                    }
+                });
+        }
+        pc->started = true;
+
+        // ---- 相机 ----
+        // Camera 不变式：position = target + angleDir * distance。
+        // 把 target / distance / yaw / pitch 全部显式设置，
+        // 相机就精确落在我们要的位置（不依赖上一帧状态）。
+        scene::Camera& cam = sc.camera();
+        if (firstPerson) {
+            const float cp = std::cos(pc->pitch);
+            const glm::vec3 dir(std::cos(pc->yaw) * cp,
+                                -std::sin(pc->yaw) * cp,
+                                std::sin(pc->pitch));
+            const glm::vec3 eye =
+                tc->position + glm::vec3(0.0f, 0.0f, pc->eyeHeight);
+            cam.setTarget(eye + dir);   // 看向眼前 1m → 相机正好在眼睛
+            cam.setDistance(1.0f);
+            cam.setYaw(pc->yaw);
+            cam.setPitch(pc->pitch);
+        } else {
+            const glm::vec3 focus =
+                tc->position + glm::vec3(0.0f, 0.0f, 1.2f);
+            cam.setTarget(focus);
+            cam.setDistance(pc->camDistance);
+            cam.setYaw(pc->yaw);
+            // Camera 的 pitch 是"相机在目标上方"的俯视角，与我们的视线
+            // 仰角反号 —— 不取负的话"鼠标往上"会变成"相机升得更高、看得
+            // 更低"（这正是 2026-10-11 修掉的那个上下颠倒）。
+            cam.setPitch(-pc->pitch);
+        }
+    }
+
+    // 自动化探针：每 30 帧报一次玩家状态（pos / yaw / pitch），
+    // 验证脚本据此断言"按 D 玩家往右挪了 / 动鼠标视野转了"。
+    // 末尾带 miv = 鼠标是否落在视口矩形内：鼠标视角是它门控的，注入不生效
+    // 时第一眼就该看出是"鼠标不在视口里"还是"位移没收到"。
+    ++m_playerLogTick;
+    if (m_playerLogTick >= 30) {
+        m_playerLogTick = 0;
+        for (ecs::Entity e : players) {
+            const auto* pc = w.get<ecs::PlayerComponent>(e);
+            const auto* tc = w.get<ecs::TransformComponent>(e);
+            if (!pc || !tc) continue;
+            const std::string* nm = w.name(e);
+            VK_LOG_INFO("PLAYER-STATE '%s' mode=%s pos=(%.3f,%.3f,%.3f) "
+                        "yaw=%.3f pitch=%.3f miv=%d",
+                        nm ? nm->c_str() : "?",
+                        pc->mode == ecs::PlayerMode::ThirdPerson ? "third"
+                                                                 : "first",
+                        static_cast<double>(tc->position.x),
+                        static_cast<double>(tc->position.y),
+                        static_cast<double>(tc->position.z),
+                        static_cast<double>(pc->yaw),
+                        static_cast<double>(pc->pitch),
+                        mouseInViewport ? 1 : 0);
+        }
+    }
+}
+
 void EditorApp::runCollision(float dt) {
     (void)dt;
     scene::Scene& sc = m_ctx->runtimeScene();
@@ -528,9 +718,17 @@ void EditorApp::runCollision(float dt) {
     std::vector<physics::BodyContact> contacts;
     const int pairs = physics::resolveBodyOverlaps(sc, 4, &contacts);
 
+    // 相机求解要跳过玩家自己的胶囊（第一人称的"眼睛"就在里面）
+    std::vector<ecs::Entity> players;
+    const ecs::World& w = sc.world();
+    w.each<ecs::PlayerComponent>(
+        [&](ecs::Entity e, const ecs::PlayerComponent&) {
+            players.push_back(e);
+        });
+
     const glm::vec3 camBefore = sc.camera().position();
-    const bool camPushed =
-        physics::resolveCamera(sc, sc.camera(), kPlayCameraRadius);
+    const bool camPushed = physics::resolveCamera(sc, sc.camera(),
+                                                  kPlayCameraRadius, players);
     const glm::vec3 camAfter = sc.camera().position();
 
     ++m_collisionFrames;
@@ -670,11 +868,13 @@ void EditorApp::handleShortcuts() {
     }
 
     // 手柄模式（和主流编辑器一致）。
-    // **按住右键飞行时让位**：这时 W / E 是"前进 / 上升"（见
-    // ViewportPanel::handleNavigation），不该顺手把手柄切成平移 / 旋转模式。
-    // UE 也是这么分的 —— 字母键只在没在"驾驶"相机时才是工具快捷键。
+    // **只在编辑态**：Play 态 W/E/R 是玩家的移动键（runPlayers 里读），
+    // 不能顺手把手柄模式切了。**按住右键飞行时同样让位**：这时 W / E 是
+    // "前进 / 上升"（见 ViewportPanel::handleNavigation），不该顺手把
+    // 手柄切成平移 / 旋转模式。UE 也是这么分的 —— 字母键只在没在"驾驶"
+    // 相机时才是工具快捷键。
     const bool flying = ImGui::IsMouseDown(ImGuiMouseButton_Right);
-    if (!flying) {
+    if (m_ctx->isEditing() && !flying) {
         if (ImGui::IsKeyPressed(ImGuiKey_W, false))
             m_ctx->setGizmoMode(GizmoMode::Translate);
         if (ImGui::IsKeyPressed(ImGuiKey_E, false))
@@ -793,6 +993,7 @@ void EditorApp::onImGui() {
     if (m_ctx->panels().scripts) drawScriptPanel();
     if (m_ctx->panels().engine) drawEnginePanel();
     if (m_ctx->showSettings()) drawSettingsPanel();
+    drawCharacterWindow();
 
     drawStatusBar();
 
@@ -1050,6 +1251,160 @@ void EditorApp::drawStatsPanel() {
                 r.viewportActive() ? " (offscreen -> ImGui)" : " (swapchain)");
     ImGui::Text("MSAA: %ux", static_cast<unsigned>(r.sampleCount()));
     ImGui::Text("Depth prepass: %s", r.depthPrePassEnabled() ? "on" : "off");
+
+    // ---- 物体级视锥剔除的实际效果 ----
+    // "drawn / total"：实际提交的物体数 / 场景里可见的网格实体总数。
+    // culled 为两者之差；draw calls 与 triangles 是提交量（不是着色量），
+    // 正是视锥剔除要压下去的那部分 CPU 提交开销。
+    {
+        const render::Renderer::RenderStats& rs = r.renderStats();
+        const uint32_t drawn = rs.drawnOpaque + rs.drawnTransparent;
+        ImGui::Text("Objects: %u drawn / %u", drawn, rs.renderables);
+        if (!r.frustumCullingEnabled()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1.0f),
+                               "[frustum culling off]");
+        } else {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(culled %u, lights %u)", rs.culledFrustum,
+                                rs.gizmosCulled);
+        }
+        ImGui::Text("Draw calls: %u   Triangles: %u", rs.drawCalls,
+                    rs.triangles);
+
+        // ---- 空间索引（BVH）----
+        // visits = 本帧视锥查询**实际访过**的节点数。它远小于 nodes 才说明
+        // 子树真的被剪掉了；如果逼近 nodes，说明树建歪了（退化成了全遍历）。
+        const scene::Scene::SpatialStats bs =
+            m_ctx->activeScene().spatialStats();
+        ImGui::Text("BVH: %llu nodes / %llu objects / depth %llu, visits %u",
+                    static_cast<unsigned long long>(bs.nodes),
+                    static_cast<unsigned long long>(bs.entities),
+                    static_cast<unsigned long long>(bs.depth),
+                    rs.bvhNodeVisits);
+
+        // ---- LOD ----
+        // 直接给出"用 LOD / 不用 LOD"的三角形数对照 —— 这是这套系统唯一
+        // 值得看的数字。noLod 是假设所有物体都用 0 级时的提交量。
+        if (rs.lodEntities > 0) {
+            const float saved = rs.trianglesNoLod > 0
+                ? 100.0f * (1.0f - static_cast<float>(rs.triangles) /
+                                     static_cast<float>(rs.trianglesNoLod))
+                : 0.0f;
+            ImGui::Text("LOD: %u ents  L0 %u / L1 %u / L2 %u / L3 %u",
+                        rs.lodEntities, rs.lodLevelCounts[0],
+                        rs.lodLevelCounts[1], rs.lodLevelCounts[2],
+                        rs.lodLevelCounts[3]);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(tris %u vs %u, -%.0f%%)", rs.triangles,
+                                rs.trianglesNoLod,
+                                static_cast<double>(saved));
+        } else {
+            ImGui::TextDisabled("LOD: 没有带 LOD 链的可见物体");
+        }
+
+        // ---- 环境（天空盒 + IBL）----
+        if (const render::Environment* env = r.environment()) {
+            const render::Environment::Stats& es = env->stats();
+            ImGui::Text("Env: sky %u / irr %u / pref %u x%u mips / lut %u",
+                        es.skySize, es.irradianceSize, es.prefilterSize,
+                        es.prefilterMips, es.lutSize);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(sky %s, IBL %s)",
+                                r.skyEnabled() ? "on" : "off",
+                                r.iblEnabled() ? "split-sum" : "approx");
+        } else {
+            ImGui::TextDisabled("Env: 环境贴图未就绪");
+        }
+
+        // ---- 级联阴影（CSM）----
+        if (const render::ShadowPass* sp = r.shadowPass()) {
+            ImGui::Text("Shadow: %u casc %ux%u  dist %.0fm  %s",
+                        sp->cascadeCount(), sp->resolution(), sp->resolution(),
+                        static_cast<double>(sp->maxDistance()),
+                        r.shadowsEnabled() ? "on" : "off");
+            uint32_t sub = 0, con = 0;
+            for (uint32_t c = 0; c < sp->cascadeCount(); ++c) {
+                sub += sp->submitted(c);
+                con += sp->considered(c);
+            }
+            // "提交/考虑"就是每级裁剪空间剔除的效果：没有剔除时
+            // 提交量会正好等于 考虑数 × 级联数。
+            ImGui::TextDisabled(
+                "splits %.1f / %.1f / %.1f / %.1f | submitted %u of %u "
+                "(per-cascade cull)",
+                static_cast<double>(sp->split(0)),
+                static_cast<double>(sp->split(1)),
+                static_cast<double>(sp->split(2)),
+                static_cast<double>(sp->split(3)), sub, con);
+        }
+
+        // ---- 局部光源阴影（点光 / 聚光灯）----
+        if (const render::LocalShadowPass* lsp = r.localShadowPass()) {
+            ImGui::Text("Local shadow: %ux%u x %u layers, used %u  %s",
+                        lsp->resolution(), lsp->resolution(),
+                        lsp->layerCount(), r.localShadowLayersUsed(),
+                        r.localShadowsEnabled() ? "on" : "off");
+            uint32_t sub = 0, con = 0;
+            for (uint32_t l = 0; l < lsp->layerCount(); ++l) {
+                sub += lsp->submitted(l);
+                con += lsp->considered(l);
+            }
+            // 与级联同理：没有逐层剔除时，提交量会等于 考虑数 × 用掉的层数。
+            ImGui::TextDisabled(
+                "submitted %u of %u (per-layer cull) | max %u lamps",
+                sub, con, r.localShadowMaxLights());
+        }
+
+        // ---- Shader 变体 / 关键字（见 render/ShaderKeywords.h）----
+        // 第一行是"惰性创建有没有失控"的体温计：一个只用得到 3 种材质组合
+        // 的场景应当稳定停在 3；数字随帧数一直涨就说明缓存根本没命中。
+        // switches 是每帧真的发生了几次 vkCmdBindPipeline —— 同材质的相邻
+        // 物体只付一次，所以它通常远小于绘制数。
+        //
+        // ⚠ 面板只有 kFloatW(360) px 宽，而 ImGui 会把超宽的文字**裁掉**
+        //   （不换行、不报错）—— 第一版把关键字名字也摊在这一行上，实测
+        //   整行只剩开头几个字。所以这里只写最紧凑的 "k5:1"，名字进 tooltip。
+        if (r.forwardPipelines().initialized()) {
+            ImGui::Text("Shader vars: %u fwd + %u depth, %u switches",
+                        r.forwardPipelines().created(),
+                        r.depthPrePipelines().created(), rs.variantSwitches);
+
+            std::string vars, tip;
+            for (uint32_t m = 0; m <= render::kKeywordAll; ++m) {
+                if (rs.variantCounts[m] == 0) continue;
+                char buf[24];
+                std::snprintf(buf, sizeof(buf), "%sk%u:%u",
+                              vars.empty() ? "" : " ", m, rs.variantCounts[m]);
+                vars += buf;
+
+                char tbuf[96];
+                std::snprintf(tbuf, sizeof(tbuf), "k%u  %s  x%u\n", m,
+                              render::keywordNames(m).c_str(),
+                              rs.variantCounts[m]);
+                tip += tbuf;
+            }
+            ImGui::TextDisabled("%s", vars.empty() ? "(本帧无前向变体绘制)"
+                                                   : vars.c_str());
+            // 掩码是位集合，"k5" 这种编号不看名字是读不出来的 → 悬停给出映射。
+            if (!tip.empty() && ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("本帧各变体画了几个物体：\n%s"
+                                  "\nbit0 double-sided / bit1 alpha-blend / "
+                                  "bit2 normal-map", tip.c_str());
+            }
+
+            // 强制掩码：对照实验留下的印记。非 -1 时画面是被"篡改"过的，
+            // 必须显眼 —— 否则看到的人会以为材质开关失效了。
+            if (r.forcedKeywordMask() >= 0) {
+                const auto fm = static_cast<render::KeywordMask>(
+                    r.forcedKeywordMask());
+                ImGui::TextColored(
+                    ImVec4(0.95f, 0.72f, 0.35f, 1.0f),
+                    "FORCED mask %d: %s", r.forcedKeywordMask(),
+                    render::keywordNames(fm).c_str());
+            }
+        }
+    }
     ImGui::TextWrapped("GPU: %s", r.device().properties().deviceName);
 
     ImGui::Separator();
@@ -1196,17 +1551,130 @@ void EditorApp::drawEnginePanel() {
     ImGui::SliderFloat("Bloom knee", &post.bloomKnee, 0.01f, 2.0f, "%.2f");
     ImGui::SliderFloat("Bloom strength", &post.bloomStrength, 0.0f, 2.0f,
                        "%.2f");
+    // FXAA：MSAA 之后还剩贴图直接放大的锯齿（以及 MSAA=1 时的几何锯齿），
+    // 交给 tonemap 之后的 FXAA 补刀。资源常驻，这里实时切零成本。
+    ImGui::Checkbox("FXAA (post AA)", &post.fxaa);
 
     ImGui::SeparatorText("Clustered Forward");
     ImGui::Checkbox("Cluster culling", &r.clusterCullingEnabled());
     ImGui::SameLine();
     ImGui::Checkbox("Depth prepass", &r.depthPrePassEnabled());
+    ImGui::SameLine();
+    // 物体级视锥剔除：关掉即退回"全量提交"，是验证剔除是否漏画的手段
+    // （同一场景开关两次，画面必须完全一致）。
+    ImGui::Checkbox("Frustum culling", &r.frustumCullingEnabled());
     ImGui::Checkbox("Light gizmos", &r.lightGizmosEnabled());
+
+    // ---- 天空盒 + IBL ----
+    // 两个开关刻意分开：Sky 只管"背景画不画"，IBL 只管"环境光用哪条
+    // 路径算"。分开之后，"背景变了"和"物体着色变了"两件事可以各自
+    // 归因 —— 混成一个开关的话，画面一有变化就分不清是谁干的。
+    ImGui::Checkbox("Skybox", &r.skyEnabled());
+    ImGui::SameLine();
+    ImGui::Checkbox("IBL", &r.iblEnabled());
+    if (!r.environmentReady()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1.0f),
+                           "(env build failed)");
+    }
     if (r.lightGizmosEnabled()) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(100.0f);
         ImGui::DragFloat("##gizmo", &r.lightGizmoScale(), 0.002f, 0.01f, 0.25f,
                          "%.3f");
+    }
+
+    // ---- 级联阴影（CSM）----
+    // Cascades = 1 就是旧单张图的行为，所以这颗下拉框顺带是个开关：
+    // 切到 1 再切回 4，一眼能看出 CSM 改善的是哪一段（远处的地面
+    // 接触阴影、以及近处的分辨率）。
+    ImGui::Checkbox("Shadows", &r.shadowsEnabled());
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90.0f);
+    if (ImGui::BeginCombo("##cascades", 
+                          (std::to_string(r.shadowCascades()) + " casc").c_str())) {
+        for (int n = 1; n <= 4; ++n) {
+            const bool sel = (static_cast<uint32_t>(n) == r.shadowCascades());
+            if (ImGui::Selectable((std::to_string(n) + " cascade(s)").c_str(),
+                                  sel)) {
+                r.shadowCascades() = static_cast<uint32_t>(n);
+            }
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::DragFloat("Shadow dist", &r.shadowDistance(), 1.0f, 5.0f, 200.0f,
+                     "%.0f m");
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::DragFloat("Split lambda", &r.shadowLambda(), 0.01f, 0.0f, 1.0f,
+                     "%.2f");
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::DragFloat("Fade start", &r.shadowFadeStart(), 0.005f, 0.0f, 1.0f,
+                     "%.2f");
+    ImGui::SetNextItemWidth(150.0f);
+    // xy = 常数 / 斜率深度偏移；zw = PCF 核半径（纹素）与远级联的增长系数
+    ImGui::DragFloat2("Bias", &r.shadowBias().x, 0.0001f, 0.0f, 0.02f, "%.4f");
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::DragFloat2("PCF radius", &r.shadowBias().z, 0.05f, 0.0f, 4.0f,
+                      "%.2f");
+
+    // ---- 局部光源阴影（点光 / 聚光灯）----
+    // 与级联并列的第二套通道：所有投影的局部光共用一张 1024² × 12 层的
+    // 2D array 深度图 —— 聚光灯占 1 层、点光占 6 层（立方体 6 面），
+    // 所以"12 层"实际只够 2 盏点光或 12 盏聚光。
+    // 层还没用满时，界面上会显示"用掉的层数 / 总数"，一眼能看出预算。
+    ImGui::Checkbox("Local shadows", &r.localShadowsEnabled());
+    ImGui::SameLine();
+    {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%u / %u layers",
+                      r.localShadowLayersUsed(),
+                      render::kMaxLocalShadowLayers);
+        ImGui::TextDisabled("%s", buf);
+    }
+    ImGui::SetNextItemWidth(150.0f);
+    // 本帧最多几盏灯投影。灯按到相机的距离由近到远排，预算用完就轮不到
+    // 远处的 —— 所以这个值调小时，先失去阴影的一定是最远那盏。
+    {
+        // uint32 → int 走一次显式转换（SliderInt 只接受 int）
+        int maxLights = static_cast<int>(r.localShadowMaxLights());
+        if (ImGui::SliderInt("Max lit lamps", &maxLights, 0,
+                             static_cast<int>(render::kMaxLocalShadowLayers))) {
+            r.localShadowMaxLights() = static_cast<uint32_t>(maxLights);
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("每帧最多几盏灯投射阴影（近的优先）\n"
+                          "点灯要 6 层、射灯 1 层，总共只有 %u 层",
+                          render::kMaxLocalShadowLayers);
+    }
+    ImGui::SetNextItemWidth(150.0f);
+    // xy = 常数 / 斜率深度偏移；z = PCF 核半径（纹素）
+    ImGui::DragFloat2("Local bias", &r.localShadowBias().x, 0.0001f, 0.0f,
+                      0.02f, "%.4f");
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::DragFloat("Local PCF", &r.localShadowBias().z, 0.05f, 0.0f, 4.0f,
+                     "%.2f");
+
+    // ---- LOD ----
+    // 关掉 = 全部用 LOD0，用来对比验证"低模没把画面画坏"（同一场景开关
+    // 两次，远处物体的轮廓会有差异，但近处必须完全一致）。
+    ImGui::Checkbox("LOD", &r.lodEnabled());
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragFloat("Bias", &r.lodBias(), 0.01f, 0.1f, 10.0f, "%.2f");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("> 1 更早切低模（远处更省）\n< 1 更保画质");
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110.0f);
+    // -1 = 自动按距离选；0..3 = 全部锁在该级（看一眼某一级长什么样）
+    static const char* kLodForceLabels[] = {"Auto", "Force L0", "Force L1",
+                                            "Force L2", "Force L3"};
+    int forceIdx = r.forcedLodLevel() + 1;
+    if (ImGui::Combo("##lodforce", &forceIdx, kLodForceLabels, 5)) {
+        r.forcedLodLevel() = forceIdx - 1;
     }
 
     // MSAA：切换会重建 HdrTarget 与前向管线（视口离屏链会被保留下来，
@@ -1523,6 +1991,18 @@ void EditorApp::drawSettingsPanel() {
 
     ImGui::EndChild();
     ImGui::End();
+}
+
+// ---------------------------------------------------------------- 角色详情窗口
+
+void EditorApp::drawCharacterWindow() {
+    // 处理"创建角色后打开详情窗口"的请求
+    const ecs::Entity req = m_ctx->takeCharacterWindowRequest();
+    if (req.valid()) {
+        m_characterWindow->open(req);
+    }
+    // 每帧绘制（窗口内部自己判断是否打开）
+    m_characterWindow->draw();
 }
 
 } // namespace editor

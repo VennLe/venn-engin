@@ -132,6 +132,7 @@ int resolveBodyOverlaps(scene::Scene& scene, int iterations = 4,
 
 // 相机不穿墙：把相机当成半径 radius 的球，推出所有 solid 碰撞体。
 // 返回是否真的推过（调用方据此打日志）。
-bool resolveCamera(scene::Scene& scene, scene::Camera& cam, float radius);
+bool resolveCamera(scene::Scene& scene, scene::Camera& cam, float radius,
+                   const std::vector<ecs::Entity>& ignore = {});
 
 } // namespace physics

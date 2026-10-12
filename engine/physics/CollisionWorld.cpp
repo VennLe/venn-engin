@@ -418,7 +418,8 @@ int resolveBodyOverlaps(scene::Scene& scene, int iterations,
     return touched;
 }
 
-bool resolveCamera(scene::Scene& scene, scene::Camera& cam, float radius) {
+bool resolveCamera(scene::Scene& scene, scene::Camera& cam, float radius,
+                   const std::vector<ecs::Entity>& ignore) {
     std::vector<Collider> cols;
     collectColliders(scene, cols);
     if (cols.empty()) return false;
@@ -434,6 +435,12 @@ bool resolveCamera(scene::Scene& scene, scene::Camera& cam, float radius) {
         bool any = false;
         for (const Collider& c : cols) {
             if (!c.solid) continue;
+            // 第一人称的"眼睛"就在玩家自己的胶囊里 —— 跳过玩家，
+            // 否则相机每帧都被玩家自己推出去（画面抖个不停）。
+            bool isPlayer = false;
+            for (const ecs::Entity p : ignore)
+                if (p.valid() && p.id == c.entity.id) { isPlayer = true; break; }
+            if (isPlayer) continue;
             // 粗筛：相机球 AABB 与碰撞体 AABB
             bool skip = false;
             for (int k = 0; k < 3; ++k) {

@@ -7,7 +7,13 @@
 //     G 几何遮蔽      Smith + Schlick-GGX
 //     F 菲涅尔        Schlick 近似
 //   直接光 = (kD * albedo/π + specular) * radiance * NdotL
-//   环境光 = 简化 IBL（程序化天空梯度）
+//   环境光 = **真 IBL**（split-sum）：三条预计算通道
+//      漫反射 ← irradianceMap（余弦卷积）
+//      镜面   ← prefilterMap（GGX 预过滤，按粗糙度取 mip）
+//              × brdfLut（(N·V, roughness) → (A, B)）
+//    见 render/Environment.h 与 assets/shaders/common.glsl。
+//    关掉（ubo.envParams.x = 0）时回退到旧的程序化天空梯度近似 ——
+//    保留它是为了做"同一场景两条路径"的对照实验，不是备用方案。
 //
 //   法线贴图用屏幕空间导数构造 TBN（cotangent frame），
 //   因此顶点数据无需切线属性。
@@ -25,7 +31,42 @@
 //   "亮了不该亮的区域"这类极难定位的问题。
 // ============================================================
 
+// ------------------------------------------------------------
+// Shader 关键字（编译期开关，见 render/ShaderKeywords.h）
+//
+// 这份 .frag 会被**编译多份**：构建期按关键字组合各编一份
+// pbr.k<掩码>.frag.spv（掩码 = 位序拼出来的 0..7）。
+// 下面是每个宏的默认值 —— 直接 glslc 编（不带任何 -D）时得到"全关"，
+// 也就是 k0，行为与本文件引入关键字之前一致，便于对照。
+//
+//   VENN_DOUBLE_SIDED  双面材质：关背面剔除（管线状态，见
+//                      VariantPipelines::applyKeywordState）+ 按
+//                      gl_FrontFacing 翻转法线（下面"法线"那段）
+//   VENN_ALPHA_BLEND   半透明：alpha 参与输出（管线那边同时不写深度）
+//   VENN_NORMAL_MAP    材质挂了法线贴图：采样 + cotangent frame
+//
+// ⚠ 位序与 CMakeLists.txt 的 VARIANT_DEFINES_n 手工表、以及
+//   ShaderKeywords.cpp 的 kKeywords[] 必须逐字一致。
+// ------------------------------------------------------------
+#ifndef VENN_DOUBLE_SIDED
+#define VENN_DOUBLE_SIDED 0
+#endif
+#ifndef VENN_ALPHA_BLEND
+#define VENN_ALPHA_BLEND 0
+#endif
+#ifndef VENN_NORMAL_MAP
+#define VENN_NORMAL_MAP 0
+#endif
+
+#include "common.glsl"
+
 const float PI = 3.14159265359;
+
+// 旧路径（envParams.x == 0）用的天空常数。与 Environment 的默认
+// EnvSettings 一致 —— 两条路径用的是同一个天空模型，差别只在
+// "预计算卷积"与"单次方向采样近似"。
+const vec3 kFallbackZenith = vec3(0.55, 0.70, 0.95);
+const vec3 kFallbackGround = vec3(0.10, 0.09, 0.09);
 
 layout(set = 0, binding = 0) uniform FrameUBO {
     mat4 view;
@@ -33,7 +74,7 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     vec4 lightDir;
     vec4 lightColor;
     vec4 camPos;
-    mat4 lightSpace;
+    mat4 lightSpace[4]; // 4 级级联的光源空间矩阵，索引 = 级联号
     vec4 cameraParams;  // x=zNear y=zFar z=切片最近深度 w=深度切片数
     vec4 clusterDims;   // x=gridX y=gridY z=depthSlices w=tileSize
     vec4 screenSize;    // x=width y=height z=1/width w=1/height
@@ -41,18 +82,40 @@ layout(set = 0, binding = 0) uniform FrameUBO {
                         // w=每簇槽位数上限（与 ClusteredLighting 的
                         //   maxLightsPerCluster 同源）
     mat4 invViewProj;
+    vec4 envParams;     // x=IBL 开关 y=预过滤最大 mip
+    vec4 shadowParams;  // x=级联数 y=最大阴影距离 z=淡出起点 w=总开关
+    vec4 cascadeSplits; // x..w = 各级覆盖的远端世界距离
+    vec4 shadowBias;    // x=常数偏移 y=斜率偏移 z=PCF 半径 w=远级联增长
+    // ---- 局部光源阴影参数 ----
+    // x=常数偏移 y=斜率偏移 z=PCF 半径(纹素) w=总开关
+    // 与方向光分开一套：正交（级联）深度是线性的，透射（点光/聚光）
+    // 深度在近处极度非线性，同一套 bias 不可能两边都合适。
+    vec4 localShadowParams;
+    // ---- 高度雾 ----
+    // x=基础密度 y=高度衰减系数(1/米) z=雾总开关 w=保留
+    // 雾色不从这里来 —— 下面直接采样天空立方体，保证雾到天际线
+    // 的颜色与天空盒自动一致。
+    vec4 fogParams;
 } ubo;
 
-// 阴影贴图。用 sampler2DShadow：采样时硬件直接做深度比较，
-// texture() 返回 0/1（是否被遮挡），着色器里不需要手写 if
-layout(set = 0, binding = 1) uniform sampler2DShadow shadowMap;
+// 级联阴影贴图：一张 **2D array** 的深度图，第 i 层就是第 i 级级联。
+// 用 sampler2DArrayShadow：采样时硬件直接做深度比较，texture() 返回
+// 0/1（是否被遮挡），着色器里不需要手写 if。
+// 第 3 个分量是**层号**（级联号），第 4 个分量才是比较用的参考深度。
+layout(set = 0, binding = 1) uniform sampler2DArrayShadow shadowMap;
 
 // 与 scene::LightInstance 严格对应（std430，4×vec4 = 64 字节）
 struct Light {
     vec4 positionRange;      // xyz=世界坐标 w=影响半径
     vec4 colorIntensity;     // rgb=颜色  a=强度
     vec4 directionCosInner;  // xyz=传播方向 w=cos(内锥角)
-    vec4 cosOuterType;       // x=cos(外锥角) y=类型(0=点 1=射灯 2=方向光)
+    // x=cos(外锥角)
+    // y=类型(0=点 1=射灯 2=方向光)
+    // z=**阴影层基准号**（-1 = 不投影）。点光要 6 层，实际层号 =
+    //   基准号 + vennCubeFaceIndex(片元方向)；射灯 1 层，直接就是基准号。
+    // w=这盏灯是否投射阴影(0/1)。层基准号由 CPU 每帧分配（Renderer::
+    //   prepareLocalShadows），着色器只管用，不知道分配策略。
+    vec4 cosOuterType;
 };
 
 layout(std430, set = 0, binding = 2) readonly buffer LightBuffer {
@@ -79,6 +142,50 @@ layout(set = 5, binding = 0) uniform sampler2D metallicMap;
 // 自发光贴图：与因子**相加**，未绑定时绑内置纯黑 → 加法恒等。
 layout(set = 6, binding = 0) uniform sampler2D emissiveMap;
 
+// ---- IBL 三件套（见 render/Environment.h）----
+// 都挂在 set 0：Vulkan 只保证至少 4 个 set 可同时绑定，而 set 1..6
+// 已经被六张贴图占满，环境资源只能往 set 0 里塞 —— 语义上也正好，
+// 它们本来就是"每帧全局"的。
+//   · irradianceMap：32² 立方体，texture(irr, N) = 半球余弦积分 / π
+//   · prefilterMap ：128² 立方体、5 级 mip，mip ↔ 粗糙度
+//   · brdfLut      ：256² 二维表，(N·V, roughness) → (A, B)
+layout(set = 0, binding = 7) uniform samplerCube irradianceMap;
+layout(set = 0, binding = 8) uniform samplerCube prefilterMap;
+layout(set = 0, binding = 9) uniform sampler2D brdfLut;
+// 天空立方体（与 sky pass 同一张图）：高度雾用它取雾色 —— 远处物体
+// 淡入的终点与背景天空严格一致。只在 fogParams.z > 0.5 时才采样，
+// 关着时这条采样不发生，基线逐位不变。
+layout(set = 0, binding = 10) uniform samplerCube skyMap;
+
+// ---- 局部光源阴影（点光 / 聚光灯，见 render/LocalShadowPass.h）----
+// 逐层的"世界 → 光源裁剪矩阵"。**同一块 buffer 被两处读**：
+//   · shadow.vert —— 渲染对应层的深度图时用它变换顶点
+//   · 本文件      —— 采样时把片元世界坐标投回同一空间求参考深度
+// 只有一份数据源，所以不可能出现"渲染与采样用了不同矩阵"。
+struct LightShadow {
+    mat4 matrix;  // 世界 → 光源裁剪空间（*_RH_ZO，clip z ∈ [0,1]）
+    // x = near（米） y = far（米） z = 所属光源下标（调试用） w = 该层是否有效
+    // xy 是必需的：要把"世界单位的深度偏移"换算成 NDC（见
+    // ndcBiasFromWorld）。透视投影的 NDC 深度是双曲的，少了它们只能拍
+    // 一个拍不准的 NDC 常数，实测会把聚光灯的阴影整个推没。
+    vec4 params;
+};
+layout(std430, set = 0, binding = 11) readonly buffer LightShadows {
+    LightShadow records[];
+} lightShadow;
+
+// 局部光源阴影图：一张 2D array 深度图（采样器带硬件深度比较）。
+//   · 聚光灯占 1 层（沿锥轴一次透视投影）
+//   · 点光占 6 层（立方体 6 面，面号 = vennCubeFaceIndex）
+// 层号不是固定的，由 CPU 每帧分配 → 从灯表的 cosOuterType.z 读。
+layout(set = 0, binding = 12) uniform sampler2DArrayShadow localShadowMap;
+
+// ---- SSAO 结果（见 render/SSAOPass.h 与 assets/shaders/ssao.frag）----
+// R8 遮蔽图（1 = 无遮蔽），在深度预通道与前向之间算好。SSAO 关闭时
+// 绑的是缺省纯白图 → 采样恒为 1.0，乘上去逐位不变 —— "关闭 = 基线"
+// 的对照约定由此成立，不需要着色器里再开一个 if。
+layout(set = 0, binding = 14) uniform sampler2D ssaoTex;
+
 layout(push_constant) uniform Push {
     mat4 model;
     vec4 baseColorFactor;
@@ -89,7 +196,6 @@ layout(push_constant) uniform Push {
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
 layout(location = 2) in vec2 vUV;
-layout(location = 3) in vec4 vLightSpacePos;
 
 layout(location = 0) out vec4 outColor;
 
@@ -120,18 +226,15 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-// 程序化环境：用方向采样"天空梯度"代替常量环境色。
-// 这样金属反射会随法线朝向变化 —— 朝上的面反射天空、朝下的面反射地面，
-// 这是让金属"看起来像金属"的关键（常量环境色会把金属压成一块死色）。
+// 旧路径的近似环境色。天空模型本身在 common.glsl 的 vennSkyColor()，
+// 与烘焙环境贴图用的是**同一个函数** —— 这条路径的意义是"用单次
+// 方向采样代替卷积"，而不是"换一套天空"。
+//
+// 它为什么不够：方向采样只对"完全光滑的镜面"和对"完全均匀的环境"
+// 才正确。粗糙表面应该对波瓣范围做积分，这里却只取一个点；反射方向
+// 用 mix(R, N, rough²) 折中一下，粗糙度只让整体变暗，不会真的变糊。
 vec3 envColor(vec3 dir) {
-    // ⚠ 本引擎是 **Z-up**（地面 = z = 0，光源 up 轴 = +Z），所以"朝上"
-    // 对应的是 dir.z，不是 dir.y。用 dir.y 的话梯度方向会落到世界 +Y —
-    // 那是水平方向，地面上的环境光就变成沿 Y 轴的一条明暗带：近处暗、
-    // 远处亮，中间还有一条笔直的硬边，看起来就像地面上多了一块阴影。
-    float t = clamp(dir.z * 0.5 + 0.5, 0.0, 1.0);
-    vec3 ground = vec3(0.10, 0.09, 0.09);
-    vec3 sky = vec3(0.55, 0.70, 0.95);
-    return mix(ground, sky, t * t);
+    return vennSkyColor(dir, kFallbackZenith, kFallbackGround);
 }
 
 // 用位置/UV 的屏幕空间导数构造切线基（无需顶点切线属性）
@@ -152,33 +255,175 @@ mat3 cotangentFrame(vec3 N, vec3 p, vec2 uv) {
     return mat3(T * inv, B * inv, N);
 }
 
-// 3×3 PCF 软阴影。单点采样会得到锯齿状硬边，对邻域取平均后边缘自然柔和
-float shadowFactor(vec4 lightSpacePos, float NdotL) {
-    vec3 proj = lightSpacePos.xyz / lightSpacePos.w;
+// ================= 级联阴影（CSM）=================
+//
+// 三层"距离分级"：
+//   ① **级联划分**：近处一级小而密，远处一级大而疏。分割点由 CPU 按
+//      log/uniform 混合算好放进 ubo.cascadeSplits。
+//   ② **级联选择按视深度**（不是世界距离、也不是 gl_FragCoord.z）：用
+//      ubo.view 把世界点变到视图空间取 -z，与 CPU 侧算分割点是同一把尺子。
+//   ③ **最大阴影距离 + 淡出**：超出 ubo.shadowParams.y 彻底没有阴影，并在
+//      最后一段距离里 smoothstep 淡出，避免阴影在地平线处"一刀切"。
+//
+// 级联盒的构造见 ShadowPass::updateCascades —— 关键点是每级用**视锥切片的
+// 包围球**（与光方向无关 → 相机平移时半径稳定），并把球心在光空间里量化到
+// 纹素网格（消除相机移动时的阴影边缘抖动）。
+
+// 按视深度选级联，返回 [0, 级联数)
+int selectCascade(float viewDepth) {
+    int n = int(ubo.shadowParams.x);
+    int last = max(n - 1, 0);
+    int c = last;   // 视深度超过所有分割点时落到最后一级
+    for (int i = 0; i < 4; ++i) {
+        if (i >= n) break;
+        if (viewDepth <= ubo.cascadeSplits[i]) {
+            c = i;
+            break;
+        }
+    }
+    return c;
+}
+
+// 3×3 PCF。单点采样会得到锯齿状硬边，对邻域取平均后边缘自然柔和。
+// 核半径（纹素）随级联变远而变大：远级联一个纹素覆盖的世界尺寸更大，
+// 用同样的纹素半径会显得更硬、也更容易随相机移动而闪烁。
+float pcfCascade(vec3 proj, int cascade, float bias) {
+    ivec3 size = textureSize(shadowMap, 0);
+    vec2 texel = 1.0 / vec2(size.xy);
+    float radius = ubo.shadowBias.z * (1.0 + ubo.shadowBias.w * float(cascade));
+
+    float sum = 0.0;
+    for (int x = -1; x <= 1; ++x) {
+        for (int y = -1; y <= 1; ++y) {
+            sum += texture(shadowMap,
+                           vec4(proj.xy + vec2(x, y) * texel * radius,
+                                float(cascade), proj.z - bias));
+        }
+    }
+    return sum / 9.0;
+}
+
+// 返回 [0,1] 的**可见度**：1 = 完全受光，0 = 完全在阴影里。
+float shadowFactor(vec3 worldPos, float NdotL) {
+    if (ubo.shadowParams.w < 0.5) return 1.0;
+
+    // 视深度：与 CPU 侧算分割点用的是同一把尺子（沿相机视线的线性深度）
+    float viewDepth = -(ubo.view * vec4(worldPos, 1.0)).z;
+
+    // ---- 距离分级：超出最大阴影距离 → 完全没有阴影 ----
+    float maxDist = ubo.shadowParams.y;
+    if (viewDepth > maxDist) return 1.0;
+    // 最后一段距离线性淡出：1（完整阴影）→ 0（无阴影）。
+    // 两个端点都连续，所以不会出现一圈突兀的边界。
+    float fade = 1.0 - smoothstep(maxDist * ubo.shadowParams.z, maxDist,
+                                  viewDepth);
+
+    // ---- 选级联 ----
+    int cascade = selectCascade(viewDepth);
+
+    vec4 lsp = ubo.lightSpace[cascade] * vec4(worldPos, 1.0);
+    vec3 proj = lsp.xyz / lsp.w;
     // 只有 xy 需要从 NDC [-1,1] 映射到纹理坐标 [0,1]。
     // ⚠ z **不能**再 *0.5+0.5：光源投影是 Zero-to-One 约定（近=0 远=1，
-    // 见 ShadowPass::updateLightMatrix），深度已经是 Vulkan 的 [0,1]。
+    // 见 ShadowPass::updateCascades），深度已经是 Vulkan 的 [0,1]。
     // 再压一次会把参考深度变成实际深度的一半，整片覆盖区都会被误判成阴影。
     proj.xy = proj.xy * 0.5 + 0.5;
 
-    // 落在光源视野之外 → 视为无遮挡
+    // 落在本级的正交盒之外 → 视为无遮挡。**不能在这里淡出**：级联盒边缘
+    // 在屏幕上是任意形状的，做淡出会留下一圈假的暗带。真正的距离淡出
+    // 由上面的 fade 负责（它只依赖视深度，与级联盒无关）。
     if (proj.z > 1.0 || proj.z < 0.0 || proj.x < 0.0 || proj.x > 1.0 ||
         proj.y < 0.0 || proj.y > 1.0) {
         return 1.0;
     }
 
     // 斜率相关深度偏移：表面越趋近平行于光线，自阴影条纹越严重
-    float bias = max(0.0015 * (1.0 - NdotL), 0.0004);
+    float bias = max(ubo.shadowBias.y * (1.0 - NdotL), ubo.shadowBias.x);
 
-    vec2 texel = 1.0 / vec2(textureSize(shadowMap, 0));
+    float sh = pcfCascade(proj, cascade, bias);
+    return mix(1.0, sh, fade);
+}
+
+// ---------------- 局部光源阴影（点光 / 聚光灯）----------------
+
+// 3×3 PCF（局部光源版）。层号由调用方算好一起传进来。
+float pcfLocal(vec2 uv, float refZ, float layer, float bias) {
+    ivec3 size = textureSize(localShadowMap, 0);
+    vec2 texel = 1.0 / vec2(size.xy);
+    const float radius = ubo.localShadowParams.z;
+
     float sum = 0.0;
     for (int x = -1; x <= 1; ++x) {
         for (int y = -1; y <= 1; ++y) {
-            sum += texture(shadowMap,
-                           vec3(proj.xy + vec2(x, y) * texel, proj.z - bias));
+            sum += texture(localShadowMap,
+                           vec4(uv + vec2(x, y) * texel * radius, layer,
+                                refZ - bias));
         }
     }
     return sum / 9.0;
+}
+
+// 把"世界单位的深度偏移"换算成当前参考深度处的 NDC 偏移。
+//
+// 透视投影（*_RH_ZO）的 NDC 深度是双曲的：
+//     z(d) = (f / (f - n)) · (1 - n / d)
+// 对 d 求导得  dz/dd = (f - z·(f - n))² / (n·f·(f - n))。
+// 在远平面附近这个值极小（range=32、near=1.6 时约 1.6e-3 每米），
+// 意味着 **0.0016 的 NDC 偏移就等于 1 米** —— 上一版就是按 NDC 给的
+// 常数偏移，结果把聚光灯的阴影整个推没了。反过来在近平面附近同样的
+// NDC 偏移只有几毫米。所以偏移必须以米为单位给，在这里换算。
+float ndcBiasFromWorld(float refZ, float nearP, float farP, float worldBias) {
+    const float span = farP - nearP;
+    if (span <= 1e-6) return 0.0;
+    const float denom = farP - refZ * span;
+    return worldBias * (denom * denom) /
+           max(nearP * farP * span, 1e-9);
+}
+
+// 单盏局部光源对本像素的**可见度**：1 = 完全受光，0 = 完全在阴影里。
+//
+// 层号的推导是这里唯一容易错的地方，两步都从灯表读，不猜：
+//   1. 基准层号 = L.cosOuterType.z（CPU 分配的；-1 表示没分到层）
+//   2. 点光再按"从灯指向片元的方向"选立方体的面 → 基准号 + 面号
+// 面号必须与 common.glsl 的 vennCubeDir 表一致 —— LocalShadowPass 的
+// CPU 侧就是用那张表生成 6 个面的视图矩阵的。
+float localShadowFactor(Light L, vec3 worldPos, float NdotL) {
+    if (ubo.localShadowParams.w < 0.5) return 1.0;  // 总开关
+    if (L.cosOuterType.w < 0.5) return 1.0;         // 这盏灯不投影
+    const int base = int(L.cosOuterType.z + 0.5);
+    if (base < 0) return 1.0;                       // 层预算用完了
+
+    int layer = base;
+    if (L.cosOuterType.y < 0.5) {  // 点光：6 个面里选一个
+        vec3 d = worldPos - L.positionRange.xyz;
+        if (dot(d, d) < 1e-8) return 1.0;
+        layer = base + vennCubeFaceIndex(d);
+    }
+
+    const vec4 layerParams = lightShadow.records[layer].params;
+    vec4 lp = lightShadow.records[layer].matrix * vec4(worldPos, 1.0);
+    // 光源背后：透视除法会翻号，投影没有意义 → 视为无遮挡。
+    // （正交的级联那边 w 恒为 1，永远不会走到这个分支。）
+    if (lp.w <= 1e-5) return 1.0;
+
+    vec3 proj = lp.xyz / lp.w;
+    // 只有 xy 要映射到 [0,1]；z 已经是 Zero-to-One 的参考深度。
+    proj.xy = proj.xy * 0.5 + 0.5;
+
+    // 落在本层的光锥/光盒之外 → 无遮挡。刻意不做淡出：每一层的边界在
+    // 屏幕上是任意形状，淡出会留下一圈假暗带（与级联那边同一条教训）。
+    if (proj.z < 0.0 || proj.z > 1.0 || proj.x < 0.0 || proj.x > 1.0 ||
+        proj.y < 0.0 || proj.y > 1.0) {
+        return 1.0;
+    }
+
+    // 斜率相关的深度偏移：表面越趋近平行于光线，自阴影条纹越严重。
+    // 参数是**米**，按本层的 near/far 换算成该深度处的 NDC 偏移。
+    const float worldBias = max(ubo.localShadowParams.y * (1.0 - NdotL),
+                                ubo.localShadowParams.x);
+    const float bias =
+        ndcBiasFromWorld(proj.z, layerParams.x, layerParams.y, worldBias);
+    return pcfLocal(proj.xy, proj.z, float(layer), bias);
 }
 
 // ---------------- 分簇：定位本像素所属的簇 ----------------
@@ -272,6 +517,11 @@ vec3 shadeLocalLight(Light L, vec3 N, vec3 V, vec3 worldPos, vec3 albedo,
     if (NdotL <= 0.0) return vec3(0.0);
     if (att <= 0.0) return vec3(0.0);
 
+    // 阴影只衰减**直接光**（与方向光同一条约定）。方向光（type=2）的
+    // cosOuterType.w 恒为 0，这里会直接短路返回 1。
+    const float shadow = localShadowFactor(L, worldPos, NdotL);
+    if (shadow <= 0.0) return vec3(0.0);
+
     vec3 H = normalize(V + Ld);
     float NdotV = max(dot(N, V), 1e-4);
 
@@ -284,7 +534,7 @@ vec3 shadeLocalLight(Light L, vec3 N, vec3 V, vec3 worldPos, vec3 albedo,
     vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
 
     // 强度与颜色一起构成辐射亮度；HDR 下可以远大于 1
-    vec3 radiance = L.colorIntensity.rgb * L.colorIntensity.a * att;
+    vec3 radiance = L.colorIntensity.rgb * L.colorIntensity.a * att * shadow;
     return (kD * albedo / PI + specular) * radiance * NdotL;
 }
 
@@ -292,11 +542,25 @@ void main() {
     // ---------------- 材质采样 ----------------
     vec4 albedoSample = texture(albedoMap, vUV);
     vec3 albedo = albedoSample.rgb * push.baseColorFactor.rgb;
+#if VENN_ALPHA_BLEND
+    // 只有半透明材质才让 albedo 的 alpha 参与输出 —— 管线侧同时开了混合、
+    // 关了深度写（见 VariantPipelines::applyKeywordState），两边是一体的。
     float alpha = albedoSample.a * push.baseColorFactor.a;
+#else
+    // 不透明：直接输出 1。省掉这次乘法是小事，主要是别让 HDR 目标的
+    // alpha 通道带着一堆没人看的值一路传到后处理。
+    float alpha = 1.0;
+#endif
 
     float metallic = push.pbr.x;
     float roughness = push.pbr.y;
+#if VENN_NORMAL_MAP
     float normalScale = push.pbr.z;
+#else
+    // 没有法线贴图时 normalScale 用不到。留着会是未使用变量，
+    // 干脆跟着一起编掉。
+    const float normalScale = 0.0;
+#endif
     float ao = push.pbr.w;
 
     vec3 orm = texture(ormMap, vUV).rgb;
@@ -315,12 +579,34 @@ void main() {
 
     // ---------------- 法线 ----------------
     vec3 N = normalize(vNormal);
+
+#if VENN_DOUBLE_SIDED
+    // 双面材质：背面看到的其实是几何背侧，法线要翻过来才"朝向观察者"。
+    // 不翻的话背面 N·L < 0 → 直接光整片归零，看起来像一块纯黑的剪影。
+    //
+    // ⚠ 必须在采样法线贴图**之前**翻：下面 cotangent frame 是拿 N 当
+    //   基准轴建的，先翻再建 TBN，扰动后的法线才与"看得见的那一面"
+    //   一致。反过来（先建 TBN 再翻 N）会得到一个既不是 N 也不是 -N 的
+    //   斜法线，背面光照会歪。
+    if (!gl_FrontFacing) N = -N;
+#endif
+
+#if VENN_NORMAL_MAP
+    // 有法线贴图才做这一整段。没有法线图的材质（normalMap == nullptr）
+    // 在 C++ 侧就不会置这个位（见 keywordsOf），于是这次纹理采样与
+    // 下面的 cotangent frame（两次叉乘 + 归一化）**整段被编掉**。
+    //
+    // 编掉之后画面对不对？对的，而且是逐像素相同：没挂法线图时绑的是
+    // 内置平坦法线贴图 (0.5,0.5,1)，*2-1 得 (0,0,1)；xy 再乘 normalScale
+    // 仍是 0，于是 TBN * (0,0,1) 恰好等于 TBN 的第三列 = N 本身。
+    // 验证脚本 tools/verify_shader_variants.py 把这条当核心断言。
     vec3 nSample = texture(normalMap, vUV).xyz * 2.0 - 1.0;
     nSample.xy *= normalScale;
     if (dot(nSample.xy, nSample.xy) > 1e-8) {
         mat3 TBN = cotangentFrame(N, vWorldPos, vUV);
         N = normalize(TBN * normalize(nSample));
     }
+#endif
 
     vec3 V = normalize(ubo.camPos.xyz - vWorldPos);
     float NdotV = max(dot(N, V), 0.0);
@@ -344,7 +630,7 @@ void main() {
     vec3 radiance = ubo.lightColor.rgb * ubo.lightDir.w;
 
     // 阴影只衰减直接光；环境光不受遮挡影响（简化处理）
-    float shadow = shadowFactor(vLightSpacePos, NdotL);
+    float shadow = shadowFactor(vWorldPos, NdotL);
     vec3 direct = (kD * albedo / PI + specular) * radiance * NdotL * shadow;
 
     // ---------------- 分簇局部光源 ----------------
@@ -366,30 +652,89 @@ void main() {
                                        roughness, metallic);
     }
 
-    // ---------------- 环境光（程序化 IBL 近似）----------------
-    // lightParams.y 是环境光倍率：室内场景把它压小，局部光源才有存在感
+    // ---------------- 环境光 ----------------
+    // lightParams.y 是环境光倍率：室内场景把它压小，局部光源才有存在感。
+    // 两条路径共用它，否则"开关 IBL"会顺带改变整体亮度，对照实验就废了。
     const float ambientScale = ubo.lightParams.y;
 
-    // 漫反射：朝 N 方向取环境辐照度（半球积分用单次采样近似）
-    vec3 irradiance = envColor(N) * ao * ambientScale;
-    vec3 ambientDiffuse = albedo * irradiance;
+    // ---- 屏幕空间 AO ----
+    // 只压环境光（含 IBL），不碰直接光 —— 直接光的遮挡归阴影图管，
+    // 环境光的遮挡归 SSAO 管，两套系统各司其职。
+    const vec2 ssuv = gl_FragCoord.xy * ubo.screenSize.zw;
+    const float ssao = texture(ssaoTex, ssuv).r;
 
-    // 镜面：沿反射方向取环境色；粗糙度越高反射越模糊，
-    // 用 R 与 N 之间的插值模拟这个"模糊"，并让能量随粗糙度衰减。
-    vec3 R = reflect(-V, N);
-    vec3 specDir = normalize(mix(R, N, roughness * roughness));
-    vec3 envSpec = envColor(specDir) * ao * ambientScale;
-    // 用菲涅尔项调制：掠射角（边缘）反射更强 —— 金属边缘高光带由此而来
-    vec3 F_env = fresnelSchlick(NdotV, F0);
-    vec3 ambientSpecular = envSpec * F_env * (1.0 - roughness * 0.75);
+    vec3 ambient;
+    if (ubo.envParams.x > 0.5) {
+        // ---- 真 IBL（split-sum，Karis）----
+        // 三项的来龙去脉见 render/Environment.h；这里只讲用法。
 
-    vec3 ambient = ambientDiffuse + ambientSpecular;
+        // 漫反射：辐照度图存的已经是 E/π，直接乘 albedo 就是 Lambert 项
+        // （(albedo/π)·E == albedo·(E/π)，卷积时那个 π 就是为此乘的）。
+        const vec3 irradiance = texture(irradianceMap, N).rgb;
+
+        // 环境光的菲涅尔要先按粗糙度压一下：光滑表面掠射角几乎全反射，
+        // 粗糙表面则没那么极端。用 kS 同时把能量分给镜面与漫反射。
+        const vec3 kS_env = vennFresnelSchlickRoughness(NdotV, F0, roughness);
+        const vec3 kD_env = (vec3(1.0) - kS_env) * (1.0 - metallic);
+
+        // 镜面：按粗糙度取预过滤 mip。这一句就是"粗糙反射会变糊"的
+        // 全部实现 —— 上一版这里只做了一次方向采样，所以怎么调都不像。
+        const vec3 R = reflect(-V, N);
+        const float maxLod = ubo.envParams.y;
+        const vec3 prefiltered =
+            textureLod(prefilterMap, R, roughness * maxLod).rgb;
+
+        // split-sum 的第二项：把菲涅尔折成 F0·A + B，于是 F0 不必进表。
+        const vec2 ab = texture(brdfLut, vec2(max(NdotV, 1e-4), roughness)).rg;
+
+        const vec3 diffuseIbl = kD_env * albedo * irradiance;
+        const vec3 specularIbl = prefiltered * (kS_env * ab.x + ab.y);
+
+        ambient = (diffuseIbl + specularIbl) * ao * ambientScale * ssao;
+    } else {
+        // ---- 旧路径（近似，仅用于对照）----
+        // 漫反射：朝 N 方向单次采样
+        const vec3 irradiance = envColor(N) * ao * ambientScale;
+
+        // 镜面：沿反射方向取环境色；用 R 与 N 的插值假装"模糊"，
+        // 并让能量随粗糙度线性衰减
+        const vec3 R = reflect(-V, N);
+        const vec3 specDir = normalize(mix(R, N, roughness * roughness));
+        const vec3 envSpec = envColor(specDir) * ao * ambientScale;
+        const vec3 F_env = fresnelSchlick(NdotV, F0);
+        const vec3 ambientSpecular =
+            envSpec * F_env * (1.0 - roughness * 0.75);
+
+        ambient = albedo * irradiance + ambientSpecular;
+        ambient *= ssao;
+    }
 
     // 自发光 = 因子 + 贴图。贴图槽空着时绑的是内置纯黑，加法恒等；
     // 放一张图进去立刻发光（因子保留 0 也亮），不用两头调。
     vec3 emissive = push.emissive.rgb + texture(emissiveMap, vUV).rgb;
 
     vec3 color = ambient + direct + localLights + emissive;
+
+    // ---------------- 高度雾（指数雾 × 高度衰减，Z-up）----------------
+    // f = 1 - exp(-距离 × 密度 × exp(-高度 × 衰减))：
+    //   · 距离越远雾越厚（指数曲线，近处几乎透明 —— 场景主体不受影响）；
+    //   · 高度越高雾越稀（地面附近最浓），Z-up 所以高度就是世界 z。
+    // 雾色沿视线方向采**天空立方体**（binding 10，就是天空 pass 画的
+    // 那张图）—— 远处物体淡入雾色的终点与背景天空颜色严格一致，
+    // 地平线不会出现"雾色和天色对不上"的断层。IBL 关闭（走了近似
+    // 天空路径）时用同一套 vennSkyColor 公式现算，两条路径共用模型。
+    if (ubo.fogParams.z > 0.5) {
+        const float dist = distance(ubo.camPos.xyz, vWorldPos);
+        const float h = max(vWorldPos.z, 0.0);
+        const float fogAmount = dist * ubo.fogParams.x *
+                                exp(-ubo.fogParams.y * h);
+        const float fogFactor = clamp(1.0 - exp(-fogAmount), 0.0, 1.0);
+        const vec3 vdir = normalize(vWorldPos - ubo.camPos.xyz);
+        const vec3 fogColor = (ubo.envParams.x > 0.5)
+            ? texture(skyMap, vdir).rgb
+            : envColor(vdir);
+        color = mix(color, fogColor, fogFactor);
+    }
 
     // alpha 参与混合：透明材质走 baseline blend 管线
     outColor = vec4(color, alpha);

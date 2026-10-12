@@ -114,6 +114,40 @@ void ColliderView::draw(EditorContext& ctx, const glm::vec2& vpPos,
 
     w.each<ecs::CollisionComponent>(
         [&](ecs::Entity e, const ecs::CollisionComponent& cc) {
+            const bool isSel = (e == sel);
+            const bool wireHidden =
+                !cc.showWireframe && !(isSel && editing);
+
+            // 状态签名在任何情况下都要打（自动化断言"勾选框切到隐藏"
+            // 靠它 —— 线框被隐藏时恰恰最需要这行日志）。
+            if (std::getenv("MYVK_LOG_RECTS")) {
+                const std::string* nm = w.name(e);
+                static std::string lastSig;
+                const std::string sig =
+                    (nm ? *nm : std::string("?")) + "|" +
+                    (cc.shape == ecs::ColliderShape::ConvexHull ? "convex"
+                                                                : "capsule") +
+                    "|" + std::to_string(cc.hullPoints.size()) + "|" +
+                    std::to_string(cc.hullEdges.size()) + "|" +
+                    (cc.solid ? "1" : "0") + "|" +
+                    (cc.showWireframe ? "1" : "0");
+                if (sig != lastSig) {
+                    lastSig = sig;
+                    VK_LOG_INFO("COLLIDER-SIG '%s' shape=%s points=%zu edges=%zu "
+                                "solid=%d show=%d",
+                                nm ? nm->c_str() : "?",
+                                cc.shape == ecs::ColliderShape::ConvexHull
+                                    ? "convex"
+                                    : "capsule",
+                                cc.hullPoints.size(), cc.hullEdges.size(),
+                                cc.solid ? 1 : 0, cc.showWireframe ? 1 : 0);
+                }
+            }
+
+            // 用户关掉线框就不画；但正在编辑（W/E/R 调整）的选中碰撞体
+            // 强制显示 —— 否则调整时看不见自己在动什么。
+            if (wireHidden) return;
+
             const glm::mat4 xform = sc.worldMatrix(e) * cc.localMatrix();
             buildSegments(cc, xform, m_segments3);
             if (m_segments3.empty()) return;
@@ -139,7 +173,6 @@ void ColliderView::draw(EditorContext& ctx, const glm::vec2& vpPos,
             }
             if (visibleCount == 0) return;
 
-            const bool isSel = (e == sel);
             const ImU32 col = (isSel && editing) ? kColEditing
                               : isSel            ? kColSelected
                                                  : kColIdle;
@@ -152,31 +185,12 @@ void ColliderView::draw(EditorContext& ctx, const glm::vec2& vpPos,
                             thick);
             }
 
-            // 自动化：屏幕包围矩形 + 一行签名（形状 / 顶点数 / 边数）
+            // 自动化：屏幕包围矩形（隐藏时不打 —— 没画东西就没有矩形语义）
             if (std::getenv("MYVK_LOG_RECTS")) {
                 const std::string* nm = w.name(e);
                 const std::string tag =
                     std::string("COLLIDER ") + (nm ? *nm : std::string("?"));
                 logRect(tag.c_str(), ImVec2(minX, minY), ImVec2(maxX, maxY));
-
-                static std::string lastSig;
-                const std::string sig =
-                    (nm ? *nm : std::string("?")) + "|" +
-                    (cc.shape == ecs::ColliderShape::ConvexHull ? "convex"
-                                                                : "capsule") +
-                    "|" + std::to_string(cc.hullPoints.size()) + "|" +
-                    std::to_string(cc.hullEdges.size());
-                if (sig != lastSig) {
-                    lastSig = sig;
-                    VK_LOG_INFO("COLLIDER-SIG '%s' shape=%s points=%zu edges=%zu "
-                                "solid=%d",
-                                nm ? nm->c_str() : "?", 
-                                cc.shape == ecs::ColliderShape::ConvexHull
-                                    ? "convex"
-                                    : "capsule",
-                                cc.hullPoints.size(), cc.hullEdges.size(),
-                                cc.solid ? 1 : 0);
-                }
             }
         });
 
@@ -193,6 +207,8 @@ bool ColliderView::hitSelectedWireframe(EditorContext& ctx,
     if (!e.valid()) return false;
     const auto* cc = sc.world().get<ecs::CollisionComponent>(e);
     if (!cc) return false;
+    // 线框被隐藏（且不在编辑中）就不再响应点击 —— 看不见的东西不该点到
+    if (!cc->showWireframe && !ctx.colliderEdit()) return false;
 
     const glm::mat4 xform = sc.worldMatrix(e) * cc->localMatrix();
     buildSegments(*cc, xform, m_segments3);

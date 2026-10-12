@@ -315,7 +315,14 @@ def main():
                       ("g%d" % seg1) in r1.group(8), "key=%s" % r1.group(8))
 
                 # 再拖一次：证明"顶点数确实跟着参数走"（几何真的重建了）
-                drag_h(hwnd, segRect, +70, label="Segments#2")
+                #
+                # ⚠ 第二次必须**反向**拖。原来的写法是两次都 +70：
+                #   滑块步长 = 拖拽像素 / 滑块可用宽度 × 值域，而可用宽度会随
+                #   Inspector 面板宽度变化（实测同一台机器上 +70px 一次涨 35，
+                #   另一次直接顶到上限 256）。同方向时第一次一旦饱和，第二次
+                #   就纹丝不动，断言必挂（`seg 256->256` 就是这么来的）。
+                #   反向拖与面板宽度无关，值一定落在区间内部。
+                drag_h(hwnd, segRect, -40, label="Segments#2")
                 r2 = find_line(tap, REBUILD_RE.pattern, 6.0,
                                where=is_shape("sphere"))
                 if not r2:

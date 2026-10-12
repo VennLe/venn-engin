@@ -17,10 +17,21 @@ class Buffer;
 
 namespace assets {
 
+class LodChain;   // assets/Lod.h
+
 struct Vertex {
     glm::vec3 pos;
     glm::vec3 normal;
     glm::vec2 uv;
+    // ---- 蒙皮（glTF JOINTS_0 / WEIGHTS_0）----
+    // 非蒙皮网格保持全 0：着色器里按 weights 之和 > 0 分支走蒙皮路径，
+    // 这样静态网格与蒙皮网格共用同一条管线，不用双管线。
+    // joints 存的是"骨架内 joint 下标"（0..numJoints-1），渲染时加上
+    // PushConstants::skin.x 的 jointBase 定位到 SSBO 里的具体矩阵。
+    glm::uvec4 joints{0, 0, 0, 0};
+    glm::vec4 weights{0.0f, 0.0f, 0.0f, 0.0f};
+    // 32 → 64 字节。默认成员初始化保证所有旧代码（几何生成器逐字段
+    // 赋值 pos/normal/uv）不需要改。
 
     static VkVertexInputBindingDescription bindingDescription() {
         VkVertexInputBindingDescription b{};
@@ -31,7 +42,7 @@ struct Vertex {
     }
 
     static std::vector<VkVertexInputAttributeDescription> attributeDescriptions() {
-        std::vector<VkVertexInputAttributeDescription> attrs(3);
+        std::vector<VkVertexInputAttributeDescription> attrs(5);
         attrs[0].binding = 0;
         attrs[0].location = 0;
         attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
@@ -44,6 +55,15 @@ struct Vertex {
         attrs[2].location = 2;
         attrs[2].format = VK_FORMAT_R32G32_SFLOAT;
         attrs[2].offset = offsetof(Vertex, uv);
+        // 蒙皮：location 3 = 关节下标（uint），location 4 = 权重
+        attrs[3].binding = 0;
+        attrs[3].location = 3;
+        attrs[3].format = VK_FORMAT_R32G32B32A32_UINT;
+        attrs[3].offset = offsetof(Vertex, joints);
+        attrs[4].binding = 0;
+        attrs[4].location = 4;
+        attrs[4].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attrs[4].offset = offsetof(Vertex, weights);
         return attrs;
     }
 };
@@ -57,7 +77,7 @@ struct Vertex {
 // 也依赖同一套东西。
 // ============================================================
 struct MeshSource {
-    enum class Kind { Unknown, Builtin, OBJ, GLTF };
+    enum class Kind { Unknown, Builtin, OBJ, GLTF, FBX };
 
     Kind kind = Kind::Unknown;
     std::string shape;         // Builtin: "cube" / "plane" / "sphere"
@@ -94,6 +114,12 @@ public:
     // 录制绘制命令
     void draw(VkCommandBuffer cmd) const;
 
+    // 实例化绘制：instanceCount 个实例共享本次 VB/IB 绑定，VS 里用
+    // gl_InstanceIndex（含 firstInstance 偏移）索引每实例 SSBO 槽。
+    // draw() = drawInstanced(cmd, 1, 0) 的便捷写法。
+    void drawInstanced(VkCommandBuffer cmd, uint32_t instanceCount,
+                       uint32_t firstInstance) const;
+
     const std::vector<Vertex>& vertices() const { return m_vertices; }
     const std::vector<uint32_t>& indices() const { return m_indices; }
 
@@ -110,6 +136,15 @@ public:
     bool hasBounds() const { return m_hasBounds; }
     const glm::vec3& boundsMin() const { return m_boundsMin; }
     const glm::vec3& boundsMax() const { return m_boundsMax; }
+
+    // ---- LOD 链 ----
+    // 由 AssetManager 惰性生成后挂上（见 AssetManager::ensureLod）。**不是**
+    // 网格自身的几何数据，所以只是一根裸指针；链对象的所有权在
+    // AssetManager::m_lods 里，生命周期覆盖所有 Mesh。
+    //
+    // 渲染层拿它选层级；没有链（或链只有 1 级）就是"不做 LOD"。
+    const LodChain* lodChain() const { return m_lodChain; }
+    void setLodChain(const LodChain* c) { m_lodChain = c; }
 
     // 在一个轴向对齐面上生成 4 个顶点（u×v = n 保证从外侧看 CCW）
     // offsetAlongNormal：立方体的面需沿法线偏移 half；单个面（如地面）传 false
@@ -128,6 +163,9 @@ private:
     glm::vec3 m_boundsMin{0.0f};
     glm::vec3 m_boundsMax{0.0f};
     bool m_hasBounds = false;
+
+    // LOD 链（不拥有；所有权在 AssetManager）
+    const LodChain* m_lodChain = nullptr;
 
     rhi::Buffer* m_vertexBuffer = nullptr;
     rhi::Buffer* m_indexBuffer = nullptr;

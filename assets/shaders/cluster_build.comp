@@ -39,7 +39,9 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     vec4 lightDir;
     vec4 lightColor;
     vec4 camPos;
-    mat4 lightSpace;
+    mat4 lightSpace[4]; // 4 级级联（compute 用不到，但**偏移必须与
+                        // pbr.vert / pbr.frag 完全一致**，否则下面所有
+                        // 成员都会错位到别的数据上）
     vec4 cameraParams;  // x=zNear y=zFar z=切片最近深度 w=切片数
     vec4 clusterDims;   // x=gridX y=gridY z=depthSlices w=tileSize
     vec4 screenSize;    // x=width y=height z=1/width w=1/height

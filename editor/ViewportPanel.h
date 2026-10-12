@@ -81,6 +81,15 @@ public:
     // （见 EditorContext::selectionFromViewport）。
     void dropSelectionToGround();
 
+    // 关掉视口内所有 2D 叠加层（左上角统计文字、右上角导航 HUD、左下角
+    // 导航球、手柄）。给自动化截图用：这些叠加层里有 FPS / 帧时间这种
+    // **每次运行都不同**的数字，会污染"背景像素应当完全一致"这类断言。
+    // 只影响 ImGui 覆盖层，不影响 3D 场景本身的渲染。
+    void setHudVisible(bool visible) {
+        m_showOverlay = visible;
+        m_showGizmo = visible;
+    }
+
 private:
     void drawToolbar();
     // 工具栏第二行：平移 / 旋转 / 缩放各自的吸附开关 + 步长 + UE 预设

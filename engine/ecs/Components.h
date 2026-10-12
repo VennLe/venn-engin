@@ -17,6 +17,8 @@
 namespace assets {
 class Mesh;
 class Material;
+class Model;
+class Skeleton;
 }
 
 namespace ecs {
@@ -101,6 +103,27 @@ struct MaterialComponent {
     assets::Material* material = nullptr;
 };
 
+// ---------------- 蒙皮网格（骨骼网格体）----------------
+// 挂在**模型根实体**上（不是每个 SubMesh 实体）：一个骨骼网格体的所有
+// primitive 共享一份骨架与动画状态。渲染层遍历带此组件的实体，按
+// Skeleton::sample 采样出关节矩阵写进骨骼 SSBO，再给每个 SubMesh 的
+// push.skin 填上 jointBase（见 Renderer）。
+//
+// 与 MeshComponent 并存：骨骼网格体的每个 primitive 仍是普通
+// MeshComponent + MaterialComponent（静态路径），多一个本组件声明
+// "这棵子树是蒙皮的"。jointBase 是派生数据，渲染层每帧填。
+struct SkinnedMeshComponent {
+    assets::Model* model = nullptr;      // 含 Skeleton 的模型
+    // 当前播放的动画 clip 名（空 = 静止姿势 / rest pose）
+    std::string clipName;
+    float time = 0.0f;                    // 当前动画时刻（秒），由上层推进
+    float speed = 1.0f;                   // 播放速度倍率
+    bool playing = true;                  // 是否播放
+
+    // 派生数据：本模型在骨骼 SSBO 里的关节矩阵起始下标（渲染层填）
+    int jointBase = -1;
+};
+
 // ---------------- 碰撞体 ----------------
 //
 // 碰撞体是**独立于渲染网格**的一块凸几何：默认按网格生成（凸包紧紧包住
@@ -141,6 +164,10 @@ struct CollisionComponent {
     // 仍然能被相机挡住，但不会推开别的物体。
     bool solid = true;
 
+    // 画不画碰撞框线框（Inspector 里可切）。编辑中（W/E/R 调整）时
+    // 无论开关都强制显示，否则调整时看不见自己在动什么。
+    bool showWireframe = true;
+
     glm::mat4 localMatrix() const {
         glm::mat4 m(1.0f);
         m = glm::translate(m, position);
@@ -155,6 +182,51 @@ struct CollisionComponent {
 struct VisibilityComponent {
     bool visible = true;      // 参与主渲染
     bool castShadow = true;   // 参与阴影贴图渲染
+};
+
+// ---------------- 玩家（运行态由 WASD + 鼠标驱动）----------------
+//
+// Player 实体 = 玩家的"脚"。第一人称只是一个空节点（+ 胶囊碰撞体，
+// 编辑态能看见占位线框，运行态不穿墙）；第三人称在它下面挂一套程序化
+// 卡通小人（见 EditorScene::createPlayer 的 rig）。
+//
+// 相机语义（对齐市面游戏的手感差异）：
+//   第一人称 —— 鼠标 = 转动**视野**（yaw/pitch），WASD 沿视线走；
+//   第三人称 —— 鼠标 = **环绕角色**的轨道相机（camYaw/camPitch），
+//               WASD 沿相机朝向走、角色平滑转身朝移动方向。
+enum class PlayerMode : int { FirstPerson = 0, ThirdPerson = 1 };
+
+struct PlayerComponent {
+    PlayerMode mode = PlayerMode::FirstPerson;
+
+    float eyeHeight = 1.7f;     // 第一人称眼睛离"脚"的高度
+    float moveSpeed = 3.0f;     // m/s（按住 Shift ×2）
+    float lookSpeed = 0.0025f;  // 鼠标灵敏度：弧度/像素
+
+    // **视线仰角**：弧度，**正 = 抬头**（鼠标往上 → 抬头，两种模式一致）。
+    // yaw 与 Camera 同约定：yaw=0 朝 +X，yaw 增大向右转。
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+
+    // 第三人称轨道相机（轨道方位角复用上面的 yaw）。Camera 的 pitch 是
+    // "相机在目标上方的俯视角"，与视线仰角**反号**，所以驱动相机时传
+    // -pitch（见 EditorApp::runPlayers）。创建第三人称玩家时 pitch 初始
+    // 给 -0.35 → 视线略微向下 → 相机落在角色上方俯视。
+    float camDistance = 3.5f;   // 相机离角色（注视点）的距离
+    float turnSpeed = 12.0f;    // 角色朝移动方向转身的插值速度（1/s）
+
+    // ---- 运行态派生状态（不序列化）----
+    float walkPhase = 0.0f;     // 四肢摆动相位
+    float bodyYaw = 0.0f;       // 第三人称角色当前朝向（平滑转身用）
+    bool  started = false;      // 本轮 Play 的第一帧（初始化 bodyYaw 等）
+};
+
+// 第三人称小人的肢体标记：运行态 walk 动画按 kind 摆动对应的肢体。
+// 部件本体就是普通实体（网格 + 材质 + 父子变换），序列化天然支持。
+struct PlayerLimbComponent {
+    enum Kind : int { Body = 0, Head = 1, ArmL = 2, ArmR = 3,
+                      LegL = 4, LegR = 5 };
+    int kind = Body;
 };
 
 // ---------------- 编辑器锁定（纯标记）----------------
@@ -193,6 +265,10 @@ struct PointLightComponent {
     float intensity = 12.0f;
     float range = 5.0f;  // 影响半径（超过这个距离贡献为 0）
     bool enabled = true;
+    // 是否投射阴影。**默认关**：点光要走立方体贴图的 6 个面，
+    // 一层 1024² 的深度图 × 6，是聚光灯的 6 倍代价。想要影子
+    // 的室内点光手动打开即可（层预算见 render::kMaxLocalShadowLayers）。
+    bool castsShadow = false;
 };
 
 struct SpotLightComponent {
@@ -203,6 +279,8 @@ struct SpotLightComponent {
     float innerAngle = 0.28f;  // 内锥半角（弧度）：此角度内全亮
     float outerAngle = 0.52f;  // 外锥半角（弧度）：此角度外为 0
     bool enabled = true;
+    // 射灯只占 **1 层**（沿锥轴的透视投影），代价很低，所以默认开
+    bool castsShadow = true;
 };
 
 // ---------------- 脚本 ----------------

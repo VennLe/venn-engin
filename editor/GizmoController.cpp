@@ -215,6 +215,29 @@ void GizmoController::drawGizmo(EditorContext& ctx, ImDrawList* draw,
     // 轴的颜色/位置会随相机变，写死坐标必然踩坑（见 DebugRects.h 的说明）。
     logRect("GZ-ORIGIN", ImVec2(o.x - 5.0f, o.y - 5.0f),
             ImVec2(o.x + 5.0f, o.y + 5.0f));
+    if (std::getenv("MYVK_LOG_RECTS")) {
+        // 相机状态跟手柄一起打（一次）：脚本断言"相机对着哪"时用，
+        // 也让"投影跑到屏幕外"这类问题一眼看出是相机被谁动了。
+        static const scene::Camera* lastCam = nullptr;
+        static glm::vec3 lastPos(0.0f);
+        const scene::Camera& dbgCam = ctx.activeScene().camera();
+        if (lastCam != &dbgCam ||
+            glm::distance(lastPos, dbgCam.position()) > 0.01f) {
+            lastCam = &dbgCam;
+            lastPos = dbgCam.position();
+            VK_LOG_INFO("GZ-CAM pos=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f) "
+                        "yaw=%.3f pitch=%.3f dist=%.2f",
+                        static_cast<double>(dbgCam.position().x),
+                        static_cast<double>(dbgCam.position().y),
+                        static_cast<double>(dbgCam.position().z),
+                        static_cast<double>(dbgCam.target().x),
+                        static_cast<double>(dbgCam.target().y),
+                        static_cast<double>(dbgCam.target().z),
+                        static_cast<double>(dbgCam.yaw()),
+                        static_cast<double>(dbgCam.pitch()),
+                        static_cast<double>(dbgCam.distance()));
+        }
+    }
 
     const auto axisColor = [&](int i) {
         return (i == static_cast<int>(highlight)) ? colHot : colAxis[i];

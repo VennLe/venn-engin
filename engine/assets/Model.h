@@ -11,8 +11,10 @@
 // 节点树结构。
 // ============================================================
 
+#include "assets/Skeleton.h"
 #include "rhi/VulkanCommon.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -36,7 +38,14 @@ struct Model {
     glm::vec3 center{0.0f};
     float radius = 1.0f;
 
+    // ---- 蒙皮（glTF skin + animations）----
+    // 所有 primitive 共享一份骨架；为空 = 静态模型。
+    // 渲染时 Renderer::updateSkinning 按 skeletonOwner（本 Model 指针）
+    // 采样出关节矩阵写入 SSBO，再按 slot 槽位被各 primitive 的绘制用。
+    std::shared_ptr<Skeleton> skeleton;
+
     bool valid() const { return !subMeshes.empty(); }
+    bool skinned() const { return skeleton && skeleton->jointCount() > 0; }
 };
 
 } // namespace assets

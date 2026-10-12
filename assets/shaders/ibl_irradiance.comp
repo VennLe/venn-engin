@@ -1,0 +1,67 @@
+#version 450
+// ============================================================
+// ibl_irradiance.comp —— 漫反射辐照度卷积（IBL 第一条通道）
+//
+// 目标：对每个输出方向 N，求半球上入射辐亮度的**余弦加权积分**
+//
+//     E(N) = ∫  L(ω) · max(N·ω, 0) dω
+//
+// 这个量对**漫反射**才是对的：它已经是"半球上所有方向的平均"，
+// 所以片元里 texture(irr, N) 一次采样就够了 —— 不需要在片元里
+// 对 N 周围的天空再做任何积分。
+//
+// 为什么输出可以很小（32²）：E(N) 是低通量，随方向变化极慢
+// （相邻像素本来就只差一点点），高分辨率纯属浪费。
+//
+// 为什么用"均匀半球扫掠"而不是重要性采样：
+//   被积函数是 L(ω)·cosθ，余弦本身就平滑、方差很小，
+//   几千个均匀样本已经足够。省下的复杂度换来的是这段代码
+//   可以直接对着公式读。
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform samplerCube skyMap;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray irrOut;
+
+layout(push_constant) uniform Push {
+    vec4 params;   // x = 角度步长（弧度）
+} pc;
+
+#include "common.glsl"
+
+void main() {
+    const int face = int(gl_GlobalInvocationID.z);
+    if (face >= 6) return;
+
+    const ivec2 size = imageSize(irrOut).xy;
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    const vec3 N = vennCubeDir(face, vennCubeFaceUv(pixel, size));
+
+    // 围绕 N 建切线基，把半球参数化到 (phi, theta)
+    const vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    const vec3 T = normalize(cross(up, N));
+    const vec3 B = cross(N, T);
+
+    const float delta = max(pc.params.x, 1e-3);
+    vec3 sum = vec3(0.0);
+    float samples = 0.0;
+
+    for (float phi = 0.0; phi < 2.0 * VENN_PI; phi += delta) {
+        for (float theta = 0.0; theta < 0.5 * VENN_PI; theta += delta) {
+            const vec3 tangent =
+                vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+            const vec3 world = T * tangent.x + B * tangent.y + N * tangent.z;
+            // 半球面微元 dω = sinθ dθ dφ，再乘余弦项
+            sum += texture(skyMap, world).rgb * cos(theta) * sin(theta);
+            samples += 1.0;
+        }
+    }
+
+    // 乘 π：E(N) 的定义里已含 cos，而 Lambert BRDF = albedo/π，
+    // 两者相乘后 π 恰好抵消 —— 片元里就能直接写 albedo * E(N)。
+    const vec3 irradiance = VENN_PI * sum / max(samples, 1.0);
+    imageStore(irrOut, ivec3(pixel, face), vec4(irradiance, 1.0));
+}

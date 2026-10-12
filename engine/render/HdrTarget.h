@@ -32,6 +32,20 @@
 // 为什么每个 frame-in-flight 各持一份：
 //   两条命令缓冲可能同时在 GPU 上执行，共用附件会出现
 //   "A 帧在写、B 帧在采样"的跨命令缓冲竞争。
+//
+// ---- 共享深度（2026-10-12 屏幕空间效果引入）----
+// 深度图原本只有附件一种身份（预通道写、前向 LOAD、之后没人再读）。
+// SSAO / SSR / SSGI / god rays 都要"读深度"才能重建视图空间坐标，
+// 所以深度图多了一个身份：**可采样纹理**（sampler2DMS，MSAA 图像
+// 只能用 2DMS 取样本）。为此两处改动：
+//   · 深度图 usage 加 SAMPLED_BIT，每帧多一个 depthSampledView
+//     （与附件视图同图不同 view —— view 只是布局无关的引用，安全）；
+//   · 两个 renderpass 的深度附件进出布局改为 DEPTH_READ_ONLY：
+//     预通道 finalLayout = DEPTH_READ_ONLY（SSAO 在预通道与前向之间
+//     采样它）→ 前向 initialLayout = DEPTH_READ_ONLY、subpass 内自动
+//     升回 DEPTH_ATTACHMENT（renderpass 的附件引用布局自带迁移）、
+//     finalLayout = DEPTH_READ_ONLY（前向之后的链继续采样）。
+//     storeOp 相应从 DONT_CARE 改成 STORE（不然链读到的是未定义内容）。
 // ============================================================
 
 #include "rhi/VulkanCommon.h"
@@ -80,7 +94,14 @@ public:
         return m_frames[frameIndex % m_frames.size()].resolveView;
     }
 
+    // 深度图的**可采样**视图（屏幕空间效果用 sampler2DMS 取样本）。
+    // 与附件视图同图不同 view；布局由两个 renderpass 的附件描述统一管理。
+    VkImageView depthSampledView(uint32_t frameIndex) const {
+        return m_frames[frameIndex % m_frames.size()].depthSampledView;
+    }
+
     VkFormat colorFormat() const { return kColorFormat; }
+    VkFormat depthFormat() const { return m_depthFormat; }
     VkExtent2D extent() const { return m_extent; }
     uint32_t framesInFlight() const {
         return static_cast<uint32_t>(m_frames.size());
@@ -98,10 +119,13 @@ private:
         VkDeviceMemory resolveMemory = VK_NULL_HANDLE;
         VkImageView resolveView = VK_NULL_HANDLE;
 
-        // 多采样深度（预通道写、前向通道 LOAD）
+        // 多采样深度（预通道写、前向通道 LOAD、屏幕空间效果采样）
         VkImage depthImage = VK_NULL_HANDLE;
         VkDeviceMemory depthMemory = VK_NULL_HANDLE;
         VkImageView depthView = VK_NULL_HANDLE;
+        // 同一张深度图的"纹理身份"视图（usage 含 SAMPLED）。
+        // 与 depthView 指向同一 image —— 布局由 renderpass 统一管理。
+        VkImageView depthSampledView = VK_NULL_HANDLE;
 
         VkFramebuffer depthFb = VK_NULL_HANDLE;    // 深度预通道
         VkFramebuffer forwardFb = VK_NULL_HANDLE;  // 前向通道

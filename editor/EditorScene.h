@@ -16,6 +16,7 @@
 //   想要什么自己在编辑器里搭。
 // ============================================================
 
+#include "ecs/Components.h"
 #include "ecs/Entity.h"
 
 #include <glm/glm.hpp>
@@ -71,6 +72,16 @@ ecs::Entity createSunlight(scene::Scene& scene);
 // 可以往场景里摆任意多盏；与 Sunlight 的区别见 createSunlight。
 ecs::Entity createDirectionalLight(scene::Scene& scene,
                                    const glm::vec3& position = glm::vec3(0.0f));
+
+// ---- Player（Shift+A → Player → First-Person / Third-Person）----
+
+// 创建玩家。实体 position = 玩家的"脚"（贴在 groundSpot 上），带
+// PlayerComponent + 胶囊碰撞体（运行态不穿墙；编辑态线框就是占位提示）。
+// 第三人称会在下面挂一套程序化卡通小人（头/身体/四肢，PlayerLimbComponent
+// 标记肢体，运行态 walk 动画按它摆动）。
+ecs::Entity createPlayer(scene::Scene& scene, assets::AssetManager& assets,
+                         ecs::PlayerMode mode,
+                         const glm::vec3& groundSpot);
 
 // ------------------------------------------------------------ 模型实例化
 //

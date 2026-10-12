@@ -74,7 +74,8 @@ public:
                               const glm::vec3& world, glm::vec2& outScreen);
 
     // ---- 拾取 ----
-    // 遍历所有"可见 + 有网格"的实体，做射线 / 世界 AABB 求交，取最近命中
+    // 走场景的空间索引（scene::Bvh）做射线遍历，取最近命中的实体；
+    // 上锁的实体（自带地面）不参与点选。O(log N)。
     PickResult pick(scene::Scene& scene, const Ray& ray);
 
     // ---- 求交原语 ----

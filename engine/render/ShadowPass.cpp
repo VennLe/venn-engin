@@ -3,16 +3,29 @@
 #include "rhi/Device.h"
 #include "rhi/Pipeline.h"
 
-#include "render/RenderTypes.h"
+#include "render/ShadowCull.h"
 #include "render/ShaderPath.h"
 
 #include "scene/Scene.h"
 #include "ecs/Components.h"
 #include "assets/Mesh.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace render {
+
+namespace {
+
+// 线性视深度 → NDC z。glm::perspective 且**未**定义
+// GLM_FORCE_DEPTH_ZERO_TO_ONE，所以 NDC z ∈ [-1, 1]。
+// 与 pbr.frag / cluster_build.comp 的 ndcToDepth 互为逆运算：
+//   ndcToDepth(z, n, f) = 2nf / ((n+f) - z(f-n))
+float depthToNdc(float d, float n, float f) {
+    return (d * (f + n) - 2.0f * f * n) / (d * (f - n));
+}
+
+} // namespace
 
 ShadowPass::ShadowPass(rhi::Device& device,
                        VkDescriptorSetLayout frameSetLayout,
@@ -45,6 +58,18 @@ ShadowPass::~ShadowPass() {
     }
 }
 
+void ShadowPass::setCascadeCount(uint32_t n) {
+    m_cascadeCount = std::min(std::max(n, 1u), kMaxCascades);
+}
+
+uint32_t ShadowPass::submitted(uint32_t cascade) const {
+    return cascade < kMaxCascades ? m_submitted[cascade] : 0;
+}
+
+uint32_t ShadowPass::considered(uint32_t cascade) const {
+    return cascade < kMaxCascades ? m_considered[cascade] : 0;
+}
+
 void ShadowPass::createResource() {
     VkDevice dev = m_device.get();
 
@@ -56,7 +81,8 @@ void ShadowPass::createResource() {
 
     // ---- 比较采样器 ----
     // compareEnable=TRUE 时 texture() 在硬件里直接做深度比较，
-    // 返回 0/1（是否被遮挡），省去着色器中的手工判断
+    // 返回 0/1（是否被遮挡），省去着色器中的手工判断。
+    // 同一把采样器数组与非数组都适用。
     VkSamplerCreateInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     si.magFilter = VK_FILTER_LINEAR;
@@ -72,6 +98,7 @@ void ShadowPass::createResource() {
     VK_CHECK(vkCreateSampler(dev, &si, nullptr, &m_sampler));
 
     // ---- depth-only RenderPass（各帧共用，只描述格式）----
+    // 每一级级联都走一次这个小 render pass，只是 framebuffer 挂的层不同。
     VkAttachmentDescription depth{};
     depth.format = m_depthFormat;
     depth.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -126,7 +153,9 @@ void ShadowPass::createFrame(Frame& f) {
     ci.format = m_depthFormat;
     ci.extent = {m_resolution, m_resolution, 1};
     ci.mipLevels = 1;
-    ci.arrayLayers = 1;
+    // 一层 = 一级级联。固定按 kMaxCascades 分配，级联数改小时只是不用它们，
+    // 不必重建资源（改一次级联数就重分配几十 MB 实在太浪费）。
+    ci.arrayLayers = kMaxCascades;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
@@ -146,36 +175,54 @@ void ShadowPass::createFrame(Frame& f) {
     VK_CHECK(vkAllocateMemory(dev, &ai, nullptr, &f.memory));
     VK_CHECK(vkBindImageMemory(dev, f.image, f.memory, 0));
 
+    // 采样用视图：4 层一起（着色器按层号选级联）
     VkImageViewCreateInfo vi{};
     vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     vi.image = f.image;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     vi.format = m_depthFormat;
     vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     vi.subresourceRange.levelCount = 1;
-    vi.subresourceRange.layerCount = 1;
-    VK_CHECK(vkCreateImageView(dev, &vi, nullptr, &f.view));
+    vi.subresourceRange.layerCount = kMaxCascades;
+    VK_CHECK(vkCreateImageView(dev, &vi, nullptr, &f.arrayView));
 
-    VkFramebufferCreateInfo fbci{};
-    fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    fbci.renderPass = m_renderPass;
-    fbci.attachmentCount = 1;
-    fbci.pAttachments = &f.view;
-    fbci.width = m_resolution;
-    fbci.height = m_resolution;
-    fbci.layers = 1;
-    VK_CHECK(vkCreateFramebuffer(dev, &fbci, nullptr, &f.framebuffer));
+    // 渲染用视图：每层一个 2D 视图。
+    // ⚠ 不能直接把 arrayView 挂进 framebuffer 就完事 —— 那会变成
+    // "layered rendering"，需要 multiview / gl_Layer 把每个实例送到不同层。
+    for (uint32_t c = 0; c < kMaxCascades; ++c) {
+        VkImageViewCreateInfo lv = vi;
+        lv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        lv.subresourceRange.baseArrayLayer = c;
+        lv.subresourceRange.layerCount = 1;
+        VK_CHECK(vkCreateImageView(dev, &lv, nullptr, &f.layerView[c]));
+
+        VkFramebufferCreateInfo fbci{};
+        fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbci.renderPass = m_renderPass;
+        fbci.attachmentCount = 1;
+        fbci.pAttachments = &f.layerView[c];
+        fbci.width = m_resolution;
+        fbci.height = m_resolution;
+        fbci.layers = 1;
+        VK_CHECK(vkCreateFramebuffer(dev, &fbci, nullptr, &f.framebuffer[c]));
+    }
 }
 
 void ShadowPass::destroyFrame(Frame& f) {
     VkDevice dev = m_device.get();
-    if (f.framebuffer != VK_NULL_HANDLE) {
-        vkDestroyFramebuffer(dev, f.framebuffer, nullptr);
-        f.framebuffer = VK_NULL_HANDLE;
+    for (uint32_t c = 0; c < kMaxCascades; ++c) {
+        if (f.framebuffer[c] != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(dev, f.framebuffer[c], nullptr);
+            f.framebuffer[c] = VK_NULL_HANDLE;
+        }
+        if (f.layerView[c] != VK_NULL_HANDLE) {
+            vkDestroyImageView(dev, f.layerView[c], nullptr);
+            f.layerView[c] = VK_NULL_HANDLE;
+        }
     }
-    if (f.view != VK_NULL_HANDLE) {
-        vkDestroyImageView(dev, f.view, nullptr);
-        f.view = VK_NULL_HANDLE;
+    if (f.arrayView != VK_NULL_HANDLE) {
+        vkDestroyImageView(dev, f.arrayView, nullptr);
+        f.arrayView = VK_NULL_HANDLE;
     }
     if (f.image != VK_NULL_HANDLE) {
         vkDestroyImage(dev, f.image, nullptr);
@@ -196,7 +243,13 @@ void ShadowPass::createPipeline() {
     desc.setLayouts = {m_frameSetLayout};
     desc.pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     desc.pushConstant.offset = 0;
-    desc.pushConstant.size = sizeof(PushConstants);
+    // ⚠ 这里是 **ShadowPushConstants（96B）**，不是主前向的 128B
+    // PushConstants。两者不同是允许的：本 Pass 在**自己的 render pass 内
+    // 自行绑定 set 0**（不像前向 Pass 那样"绑一次 set 0 再切一堆管线"），
+    // 绑定时和绘制时用的是同一个管线布局对象，不可能不兼容。
+    // 反过来说：**不要**把这个 Pass 的绘制搬进前向 Pass 的 render pass 里，
+    // 那会立刻踩到 VUID-...-08600。
+    desc.pushConstant.size = sizeof(ShadowPushConstants);
     desc.renderPass = m_renderPass;
     desc.colorAttachmentCount = 0;  // depth-only
     desc.depthTest = true;
@@ -204,49 +257,115 @@ void ShadowPass::createPipeline() {
     // 只渲染正面：剔除背面能显著减少 shadow acne
     desc.cullMode = VK_CULL_MODE_FRONT_BIT;
     desc.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    // 深度偏移：把深度沿法线推开一点，抵消自阴影条纹
+    // 深度偏移：把深度沿法线推开一点，抵消自阴影条纹。
+    // 级联把正交深度范围拉长（远大于单张图时的 2r），所以这两个值比
+    // 单级联时代略大。
     desc.depthBiasEnable = true;
-    desc.depthBiasConstant = 1.25f;
-    desc.depthBiasSlope = 1.75f;
+    desc.depthBiasConstant = 1.6f;
+    desc.depthBiasSlope = 2.2f;
 
     m_pipeline = std::make_unique<rhi::Pipeline>(m_device, desc);
 }
 
-void ShadowPass::updateLightMatrix(const glm::vec3& direction,
-                                   const glm::vec3& center, float radius) {
-    const glm::vec3 d = glm::normalize(direction);  // 传播方向：光 → 场景
+void ShadowPass::updateCascades(const glm::mat4& camView,
+                                const glm::mat4& camProj,
+                                float camNear, float camFar,
+                                const glm::vec3& lightDir, float maxDistance,
+                                float lambda) {
+    // 相机远平面之外的级联毫无意义（那里根本没有可见像素），
+    // 直接夹住 —— 不夹的话远级联的半径会被白白撑大，近处的精度跟着掉。
+    m_maxDistance = std::min(std::max(maxDistance, 1.0f),
+                             camFar > 1.0f ? camFar : 1.0f);
+    const uint32_t n = m_cascadeCount;
 
-    // 光源放在场景中心逆着光方向的位置
-    const float distance = radius * 2.0f;
-    const glm::vec3 lightPos = center - d * distance;
-
-    glm::vec3 up(0.0f, 0.0f, 1.0f);  // Z-up
-    // 光方向接近垂直时 lookAt 会退化（up 与视线共线），换用另一个轴
-    if (std::abs(glm::dot(d, up)) > 0.99f) {
-        up = glm::vec3(0.0f, 1.0f, 0.0f);
+    // ---- 1) 分割点：log 与 uniform 的插值（PSSM 的 practical scheme）----
+    //   纯对数：近处极密、远处极疏，但第 0 级会小到几乎没有意义；
+    //   纯均匀：远处精度不够。lambda 默认 0.6 略偏均匀。
+    const float nf = camNear > 1e-4f ? camNear : 1e-4f;
+    float splits[kMaxCascades + 1];
+    splits[0] = nf;
+    for (uint32_t i = 1; i <= n; ++i) {
+        const float f = static_cast<float>(i) / static_cast<float>(n);
+        const float logS = nf * std::pow(m_maxDistance / nf, f);
+        const float uniS = nf + (m_maxDistance - nf) * f;
+        splits[i] = lambda * logS + (1.0f - lambda) * uniS;
     }
+    for (uint32_t i = 0; i < n; ++i) m_splits[i] = splits[i + 1];
+    // 级联数不足 4 时把多余分量填成最后一级的值：着色器会按级联数截断，
+    // 不会读到它们，但填满能避免调试时看到一堆 0 而误判。
+    for (uint32_t i = n; i < kMaxCascades; ++i) m_splits[i] = splits[n];
 
-    const glm::mat4 view = glm::lookAt(lightPos, center, up);
-    // 正交范围 = 场景包围球；近远平面紧贴包围球以提升深度精度。
-    //
-    // ⚠ 深度必须是 **0→1（Zero-to-One）** 约定，不能用 glm::ortho：
-    //   · Vulkan 的 clip/NDC 深度范围是 [0, 1]，glm::ortho 给的是
-    //     OpenGL 约定 [-1, 1]；
-    //   · 若用 GL 约定，阴影图**写入**的深度是 ndc_z∈[-1,1] 被裁剪后
-    //     的一半（z<0 的几何整段被裁掉），而 pbr.frag **采样**时算出的
-    //     参考深度又是另一套映射 —— 两侧不在同一深度空间，整个覆盖区
-    //     会被判成"被遮挡"，屏幕上就是一块边界笔直的暗色四边形。
-    //   · glm::orthoRH_ZO 把近平面映到 0、远平面映到 1，与 Vulkan 一致；
-    //     相应地 pbr.frag 里对 proj.z **不再**做 *0.5+0.5（只有 xy 需要）。
-    const glm::mat4 proj = glm::orthoRH_ZO(-radius, radius, -radius, radius,
-                                           distance - radius, distance + radius);
+    const glm::mat4 invViewProj = glm::inverse(camProj * camView);
+    const glm::vec3 d = glm::normalize(lightDir);
 
-    m_lightSpace = proj * view;
+    // 光方向接近垂直时 lookAt 会退化（up 与视线共线），换用另一个轴
+    glm::vec3 up(0.0f, 0.0f, 1.0f);  // Z-up
+    if (std::abs(glm::dot(d, up)) > 0.99f) up = glm::vec3(0.0f, 1.0f, 0.0f);
+
+    for (uint32_t c = 0; c < n; ++c) {
+        // ---- 2) 视锥切片的 8 个世界角点 ----
+        const float z0 = depthToNdc(splits[c], nf, camFar);
+        const float z1 = depthToNdc(splits[c + 1], nf, camFar);
+        glm::vec3 corners[8];
+        int k = 0;
+        for (int zi = 0; zi < 2; ++zi) {
+            const float zn = (zi == 0) ? z0 : z1;
+            for (int yi = 0; yi < 2; ++yi) {
+                for (int xi = 0; xi < 2; ++xi) {
+                    const glm::vec4 p =
+                        invViewProj * glm::vec4((xi == 0) ? -1.0f : 1.0f,
+                                                (yi == 0) ? -1.0f : 1.0f,
+                                                zn, 1.0f);
+                    corners[k++] = glm::vec3(p) / p.w;
+                }
+            }
+        }
+
+        // ---- 3) 包围球 ----
+        // 用球而不是盒：球的半径与光方向无关，光一转也不变 → 阴影边缘
+        // 不会随光照角度"呼吸"。盒的半径会随方向变，必然抖。
+        glm::vec3 mid(0.0f);
+        for (const glm::vec3& p : corners) mid += p;
+        mid /= 8.0f;
+        float radius = 0.0f;
+        for (const glm::vec3& p : corners) {
+            radius = glm::max(radius, glm::length(p - mid));
+        }
+        // 退化保护：切片极小或数值异常时，给一个下限免得 texel 归一化除零
+        radius = glm::max(radius, 0.05f);
+
+        // ---- 4) 光空间视图 + 纹素量化 ----
+        const float texel = 2.0f * radius / static_cast<float>(m_resolution);
+        const glm::vec3 eye = mid - d * (radius + kDepthPadding);
+        glm::mat4 view = glm::lookAt(eye, mid, up);
+        // 把球心在光空间里的位置量化到纹素网格，再把差量补回视图矩阵的
+        // 平移列。相机连续移动时，采样网格相对世界就是"整格跳"的而不是
+        // 连续滑的 —— 这是消除阴影边缘闪烁的关键一步。
+        {
+            const glm::vec4 cLS = view * glm::vec4(mid, 1.0f);
+            const float sx = std::floor(cLS.x / texel) * texel;
+            const float sy = std::floor(cLS.y / texel) * texel;
+            view[3][0] += sx - cLS.x;
+            view[3][1] += sy - cLS.y;
+        }
+        // 近平面取 0：正交投影的深度是线性的，牺牲的那点精度可以忽略，
+        // 换来的是"光源到切片之间的所有遮挡体都进深度图"。
+        const glm::mat4 proj = glm::orthoRH_ZO(
+            -radius, radius, -radius, radius, 0.0f,
+            2.0f * (radius + kDepthPadding));
+        m_lightSpace[c] = proj * view;
+    }
+    for (uint32_t c = n; c < kMaxCascades; ++c) {
+        m_lightSpace[c] = m_lightSpace[n - 1];
+    }
 }
 
 void ShadowPass::render(VkCommandBuffer cmd, scene::Scene& scene,
-                        VkDescriptorSet frameSet, uint32_t frameIndex) {
-    if (m_frames.empty()) return;
+                        VkDescriptorSet frameSet, uint32_t frameIndex,
+                        uint32_t cascade,
+                        const std::unordered_map<const assets::Mesh*, int>*
+                            jointBases) {
+    if (m_frames.empty() || cascade >= m_cascadeCount) return;
     Frame& f = m_frames[frameIndex % m_frames.size()];
 
     VkClearValue clear{};
@@ -255,7 +374,9 @@ void ShadowPass::render(VkCommandBuffer cmd, scene::Scene& scene,
     VkRenderPassBeginInfo rp{};
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rp.renderPass = m_renderPass;
-    rp.framebuffer = f.framebuffer;
+    // framebuffer 挂的是**这一层**的 2D 视图 → CLEAR 只清这一层，
+    // 各级之间互不干扰
+    rp.framebuffer = f.framebuffer[cascade];
     rp.renderArea.offset = {0, 0};
     rp.renderArea.extent = {m_resolution, m_resolution};
     rp.clearValueCount = 1;
@@ -282,17 +403,46 @@ void ShadowPass::render(VkCommandBuffer cmd, scene::Scene& scene,
                                 nullptr);
     }
 
+    const glm::mat4& clip = m_lightSpace[cascade];
+    uint32_t considered = 0;
+    uint32_t submitted = 0;
+
     // 只渲染投射阴影的物体（VisibilityComponent::castShadow）
     scene.forEachShadowCaster([&](ecs::Entity e, ecs::MeshComponent& mc) {
         if (!mc.mesh || !mc.mesh->valid()) return;
+        ++considered;
 
-        PushConstants push{};
-        push.model = scene.worldMatrix(e);
+        const glm::mat4 world = scene.worldMatrix(e);
+        // 每一级各剔除一次：级联的正交盒只覆盖一个视锥切片，绝大多数
+        // 投影体在每一级里都在盒外。不剔的话提交量就是全场景 × 级联数。
+        if (mc.mesh->hasBounds() &&
+            !visibleInLightClip(clip * world, mc.mesh->boundsMin(),
+                                mc.mesh->boundsMax())) {
+            return;
+        }
+        ++submitted;
+
+        ShadowPushConstants push{};
+        push.model = world;
+        // which.y = 0 → shadow.vert 从 FrameUBO.lightSpace[x] 取矩阵
+        push.which = glm::vec4(static_cast<float>(cascade), 0.0f, 0.0f, 0.0f);
+        // 蒙皮网格：jointBase 必须和主前向路径一致，否则阴影用的是
+        // 绑定姿势而不是当前姿势（角色一动影子就散架）
+        if (jointBases) {
+            const auto jt = jointBases->find(mc.mesh);
+            if (jt != jointBases->end() && jt->second >= 0) {
+                push.skin = glm::vec4(static_cast<float>(jt->second), 0.0f,
+                                      1.0f, 0.0f);
+            }
+        }
         vkCmdPushConstants(cmd, m_pipeline->layout(),
                            VK_SHADER_STAGE_VERTEX_BIT, 0,
-                           sizeof(PushConstants), &push);
+                           sizeof(ShadowPushConstants), &push);
         mc.mesh->draw(cmd);
     });
+
+    m_considered[cascade] = considered;
+    m_submitted[cascade] = submitted;
 
     vkCmdEndRenderPass(cmd);
 }

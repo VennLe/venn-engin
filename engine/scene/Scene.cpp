@@ -1,5 +1,7 @@
 #include "scene/Scene.h"
 
+#include "assets/Mesh.h"
+
 #include <algorithm>
 
 namespace scene {
@@ -153,6 +155,80 @@ void Scene::clear() {
     // 世界清空后旧句柄可能"碰巧"仍通过 alive 检查（generation 归零），
     // 必须显式重置，避免 light() 误把方向光挂到别的实体上
     m_lightEntity = ecs::Entity{};
+
+    // 空间索引一并作废
+    m_bvh.clear();
+    m_indexedEntities.clear();
+}
+
+// ---------------------------------------------------------------- 空间索引
+
+bool Scene::meshLocalBounds(const assets::Mesh& mesh, BvhAabb& out) const {
+    if (mesh.hasBounds()) {
+        // 快路径：Mesh 在上传顶点时就把局部 AABB 算好了
+        out.min = mesh.boundsMin();
+        out.max = mesh.boundsMax();
+        return true;
+    }
+    // 慢路径：还没上传 / 上传时没有顶点的网格，退回扫一遍 CPU 顶点。
+    // 拾取必须能选中"刚导入、还没上传"的物体，所以不能只认 hasBounds。
+    const auto& verts = mesh.vertices();
+    if (verts.empty()) return false;
+    out.min = out.max = verts[0].pos;
+    for (const auto& v : verts) out.expand(v.pos);
+    return true;
+}
+
+Bvh& Scene::spatialIndex() {
+    m_indexItems.clear();
+
+    forEachRenderable([&](ecs::Entity e, ecs::MeshComponent& mc,
+                          ecs::MaterialComponent&) {
+        if (!mc.mesh) return;
+        BvhAabb local;
+        if (!meshLocalBounds(*mc.mesh, local)) return;
+
+        Bvh::Item item;
+        item.entity = e;
+        item.bounds = transformAabb(worldMatrix(e), local);
+        m_indexItems.push_back(item);
+    });
+
+    // 实体集合（含顺序）没变 → 只重新拟合包围盒；变了 → 整棵重建。
+    // 顺序也要比：ECS 的存储重排会让"叶子 → items 下标"的对应关系失效，
+    // 这时 refit 会把包围盒填到错的实体上，必须重建。
+    bool sameSet = m_indexItems.size() == m_indexedEntities.size();
+    if (sameSet) {
+        for (size_t i = 0; i < m_indexItems.size(); ++i) {
+            if (m_indexItems[i].entity != m_indexedEntities[i]) {
+                sameSet = false;
+                break;
+            }
+        }
+    }
+
+    if (!sameSet) {
+        m_bvh.build(m_indexItems);
+        m_indexedEntities.clear();
+        m_indexedEntities.reserve(m_indexItems.size());
+        for (const Bvh::Item& it : m_indexItems)
+            m_indexedEntities.push_back(it.entity);
+    } else {
+        m_indexBounds.clear();
+        m_indexBounds.reserve(m_indexItems.size());
+        for (const Bvh::Item& it : m_indexItems)
+            m_indexBounds.push_back(it.bounds);
+        m_bvh.refit(m_indexBounds);
+    }
+    return m_bvh;
+}
+
+Scene::SpatialStats Scene::spatialStats() const {
+    SpatialStats st;
+    st.nodes = m_bvh.nodeCount();
+    st.entities = m_bvh.leafCount();
+    st.depth = m_bvh.depth();
+    return st;
 }
 
 } // namespace scene

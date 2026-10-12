@@ -4,12 +4,26 @@
 //
 // Pass 编排（Clustered Forward / 分簇前向）：
 //
-//   ShadowPass（方向光阴影图，depth-only 2048²）
-//     → DepthPrePass（不透明几何只写深度，MSAA 深度附件）
-//       → ClusterBuild（compute：按 tile × 深度层切簇，把灯分到簇里）
-//         → ForwardPass（不透明 →【地平面栅格】→ 透明，输出到 MSAA HDR，再 resolve）
-//           → PostProcess（Bloom 亮部提取 → 高斯 H/V → 合成 + Tonemap）
-//             → 交换链（SRGB，硬件做线性→sRGB 编码；ImGui 画在同一 Pass）
+//   ShadowPass（方向光**级联**阴影图，depth-only 2048² × 4 层 2D array；
+//               每一级一次 depth-only render pass，各级各自做裁剪空间剔除）
+//     → LocalShadowPass（点光 / 聚光灯阴影，depth-only 1024² × 12 层 2D array；
+//               每层一次 depth-only render pass，含"未使用层只清不画"）
+//       → DepthPrePass（不透明几何只写深度，MSAA 深度附件）
+//         → ClusterBuild（compute：按 tile × 深度层切簇，把灯分到簇里）
+//           → ForwardPass（【天空盒】→ 不透明 →【地平面栅格】→ 透明，
+//                        输出到 MSAA HDR，再 resolve）
+//             → PostProcess（Bloom 亮部提取 → 高斯 H/V → 合成 + Tonemap）
+//               → 交换链（SRGB，硬件做线性→sRGB 编码；ImGui 画在同一 Pass）
+//
+// 两套阴影为什么必须是**两张图**：级联是正交投影、覆盖相机视锥切片，
+// 分辨率要 2048² 才够；局部光是一盏灯一个锥体（点光 6 个 90° 面），
+// 12 层已经吃满预算，只能给 1024²。硬塞进同一张 array 两边都得将就。
+//
+// 天空盒为什么排在最前面：它是一张全屏背景，任何几何都该盖住它。
+// 它自己不写深度、也不过深度测试（depthTest/depthWrite 都关），所以
+// 深度预通道铺好的深度原封不动地留给不透明与透明几何。排到最后
+// 就不行了 —— 那时"背景"会盖掉地平面栅格（栅格同样不写深度，
+// 它的像素深度还停在 1.0，正好落进"天空该画"的判据里）。
 //
 // 地平面栅格为什么插在"不透明"与"透明"之间：它是个半透明的参考层，
 // 但**必须吃深度测试**（墙/箱子该挡住它），所以不能画在 ImGui 图层上；
@@ -30,11 +44,18 @@
 //
 // 描述符布局（与着色器一一对应）：
 //   set 0  binding 0 : FrameUBO（每帧一份）
-//          binding 1 : shadowMap（sampler2DShadow）
+//          binding 1 : shadowMap（sampler2DArrayShadow，第 i 层 = 第 i 级级联）
 //          binding 2 : lights SSBO（LightInstance[]）
 //          binding 3 : clusters SSBO（uvec2[]）
 //          binding 4 : lightIndices SSBO（uint[]）
 //          binding 5 : clusterStats SSBO（uint[4]，遥测）
+//          binding 6 : jointMatrices SSBO（蒙皮，VERTEX 阶段）
+//          binding 7 : irradianceMap（samplerCube，IBL 漫反射）
+//          binding 8 : prefilterMap（samplerCube，IBL 镜面预过滤）
+//          binding 9 : brdfLut（sampler2D，split-sum 第二项）
+//          binding 10: skyMap（samplerCube，天空盒背景）
+//          binding 11: lightShadows SSBO（LightShadowRecord[]，逐层的局部光矩阵）
+//          binding 12: localShadowMap（sampler2DArrayShadow，第 i 层 = 第 i 个局部阴影层）
 //   set 1            : albedo 贴图
 //   set 2            : normal 贴图
 //   set 3            : ORM 贴图（R=AO G=Roughness B=Metallic）
@@ -53,20 +74,29 @@
 #include "rhi/Pipeline.h"
 
 #include "render/FrameResources.h"
+#include "render/Frustum.h"
 #include "render/RenderTypes.h"
+#include "render/ScreenSpaceSettings.h"
 #include "render/ShadowPass.h"
+#include "render/LocalShadowPass.h"
+#include "render/ShaderKeywords.h"
+#include "render/ShaderHotReload.h"
+#include "render/VariantPipelines.h"
 #include "render/HdrTarget.h"
 #include "render/PostProcess.h"
 #include "render/ClusteredLighting.h"
+#include "render/Environment.h"
 
 #include "ui/ImGuiManager.h"
 #include "assets/Texture.h"
 #include "assets/Material.h"
+#include "assets/Lod.h"
 #include "ecs/Entity.h"
 #include "scene/Light.h"
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace core {
@@ -82,6 +112,10 @@ class Mesh;
 }
 
 namespace render {
+
+class SSAOPass;
+class FrameGraph;
+struct FrameGraphInput;
 
 // 地平面参考栅格（编辑器视口的坐标系参照物）。
 // 一个专门的 pass：在 y = 0 平面上画一个解析式抗锯齿栅格，
@@ -134,6 +168,22 @@ public:
     // 后处理参数（ImGui 面板直接改）
     PostSettings& postSettings() { return m_post->settings(); }
 
+    // ============================================================
+    // 屏幕空间效果（SSAO / 高度雾 / SSGI / SSR / God rays）
+    //
+    // 设置对象被三个消费者共享：
+    //   · SSAOPass（前向前，结果经 set0/binding14 进 pbr.frag）
+    //   · FrameGraph（前向后：SSGI → SSR → God rays，输出图接管
+    //     PostProcess 的输入）
+    //   · pbr.frag（高度雾参数走 FrameUBO.fogParams）
+    // 切开关**零资源重建**：ssao/链的激活状态变化在 drawFrame 开头
+    // 被检测，必要时重写一次描述符 / 重建一次 PostProcess 输入。
+    // ============================================================
+    ScreenSpaceSettings& screenSpaceSettings() { return m_screenSpace; }
+    const ScreenSpaceSettings& screenSpaceSettings() const {
+        return m_screenSpace;
+    }
+
     // 分簇光照（灯列表 / 簇 / 统计）
     ClusteredLighting& clusteredLighting() { return *m_lighting; }
 
@@ -141,11 +191,188 @@ public:
     VkSampleCountFlagBits sampleCount() const { return m_sampleCount; }
     void setSampleCount(VkSampleCountFlagBits samples);
 
+    // ---- shader 热重载（见 render/ShaderHotReload.h）----
+    // watchShaderFiles 注册要监听的 .spv（init 尾部调一次）；drawFrame
+    // 每帧调 pollShaderReload 轮询，发现变化就 waitIdle + 重跑
+    // createPipelines（变体族缓存清掉后下一帧按需从磁盘重读）。
+    // MYVK_SHADER_HOTRELOAD=0 可关（像素级回归需要绝对稳定时用）。
+    void watchShaderFiles();
+    void pollShaderReload();
+    // 热重载专用：重建主链 + 预览链的 PostProcess（管线随 shader 变）
+    void rebuildPostChains();
+
     // 深度预通道开关（关掉后主 Pass 的 early-Z 失效，仅用于对比验证）
     bool& depthPrePassEnabled() { return m_depthPrePassEnabled; }
 
     // 分簇剔除开关（关掉后每簇塞满灯表 —— 用于验证"剔除不漏光"）
     bool& clusterCullingEnabled() { return m_clusterCullingEnabled; }
+
+    // ============================================================
+    // 物体级视锥剔除
+    //
+    // 每帧用**主相机**的视锥（见 m_sceneFrustum）把场景里可见的网格实体
+    // 筛一遍：世界空间 AABB 完全落在视锥外的，不进入深度预通道 / 不透明 /
+    // 透明任何一条几何提交路径。
+    //
+    // 关掉它就退回"全量提交"，用于对比验证剔除是否漏画（开关本身就是
+    // 回归测试的手段：同一场景开关两次，画面必须一模一样）。
+    // ============================================================
+    bool& frustumCullingEnabled() { return m_frustumCullingEnabled; }
+    bool frustumCullingEnabled() const { return m_frustumCullingEnabled; }
+
+    // ============================================================
+    // LOD（细节层级）
+    //
+    // 有 LOD 链的网格（见 assets/Lod.h）每帧按"屏幕占高比"选一层画：
+    // 占得越小用越低的模。选择带迟滞（kLodHysteresis），物体正好骑在
+    // 阈值上时不会每帧来回跳。
+    //
+    // 这里是**全局**开关与偏差 —— 单物体的覆盖以后可以走 ECS 组件；
+    // 现在先把"能不能真的少画"这件事立起来。
+    //   * enabled 关掉 = 全部退回 LOD0，用于对比验证"低模没画坏画面"。
+    //   * bias > 1 = 更早切低模（数字越大越省、画质越低）。
+    //   * forcedLevel >= 0 = 无视距离，所有物体都锁在这一级（调试用：
+    //     一眼看出某一级长什么样）。
+    // ============================================================
+    bool& lodEnabled() { return m_lodEnabled; }
+    bool lodEnabled() const { return m_lodEnabled; }
+    float& lodBias() { return m_lodBias; }
+    int& forcedLodLevel() { return m_forcedLodLevel; }
+
+    // ============================================================
+    // 天空盒 + IBL（见 render/Environment.h）
+    //
+    // 环境贴图在 init 时烘焙一次，四张图（天空立方体 / 辐照度 /
+    // 预过滤 / BRDF 表）加起来不到 2 MB。这里的两个开关只决定
+    // **怎么用**它们：
+    //   * ibl：开 = pbr.frag 走真 IBL（split-sum）；关 = 回退到旧的
+    //     程序化天空梯度近似。两者画面必须**不同**（近似就是近似），
+    //     但都要在物理上说得通 —— 这是对照实验的判据。
+    //   * sky：开 = 画天空盒背景；关 = 露出 HDR 原先的清屏色。
+    //     用来隔离"新加的背景 pass"与"新的 IBL 数学"两件事。
+    // ============================================================
+    bool& iblEnabled() { return m_iblEnabled; }
+    bool iblEnabled() const { return m_iblEnabled; }
+    bool& skyEnabled() { return m_skyEnabled; }
+    bool skyEnabled() const { return m_skyEnabled; }
+    const render::Environment* environment() const { return m_environment.get(); }
+    bool environmentReady() const {
+        return m_environment != nullptr && m_environment->valid();
+    }
+
+    // ============================================================
+    // 级联方向光阴影（CSM，见 render/ShadowPass.h）
+    //
+    //   * cascades：1..4。**1 = 退回单张正交图**（和旧行为等价），
+    //     用来做"CSM 到底改善了哪一段"的对照实验。
+    //   * distance：最远阴影距离（米）。超出它的像素完全没有阴影，
+    //     并在最后 (1 - fadeStart) 比例的距离里平滑淡出 ——
+    //     这就是"阴影距离分级"的硬边界。会被自动夹到相机远平面以内。
+    //   * lambda：级联分割的 log / uniform 混合系数（0=全均匀 1=全对数）。
+    //   * fadeStart：淡出起点占最大距离的比例（0.85 = 最后 15% 淡出）。
+    //   * bias：（常数偏移, 斜率偏移, PCF 核半径(纹素), 远级联半径增长）
+    // ============================================================
+    bool& shadowsEnabled() { return m_shadowsEnabled; }
+    bool shadowsEnabled() const { return m_shadowsEnabled; }
+    uint32_t& shadowCascades() { return m_shadowCascades; }
+    uint32_t shadowCascades() const { return m_shadowCascades; }
+    float& shadowDistance() { return m_shadowDistance; }
+    float& shadowLambda() { return m_shadowLambda; }
+    float& shadowFadeStart() { return m_shadowFadeStart; }
+    glm::vec4& shadowBias() { return m_shadowBias; }
+    const glm::vec4& shadowBias() const { return m_shadowBias; }
+    const render::ShadowPass* shadowPass() const { return m_shadowPass.get(); }
+
+    // ============================================================
+    // 局部光源阴影（点光 / 聚光灯，见 render/LocalShadowPass.h）
+    //
+    // 与级联方向光**并列**的第二套阴影通道，共用同一张
+    // 1024² × 12 层的 2D array 深度图：
+    //   * 聚光灯占 1 层（沿锥轴一次透视投影）；
+    //   * 点光占 6 层（立方体 6 面各一次 90° 透视投影）。
+    //
+    //   * enabled：总开关。关掉后 depth-only Pass 仍在跑（保证那张图
+    //     始终处于可采样布局），只是片元不再采样 → localShadowParams.w = 0。
+    //   * maxLights：本帧最多几盏灯参与投影。层数硬上限是 12 层，这个
+    //     软上限用来做"少投几盏"的对照实验（灯按到相机的距离由近到远排，
+    //     预算用完就轮不到，宁可不投也不要抢掉近处的）。
+    //   * bias：（常数深度偏移, 斜率深度偏移, PCF 核半径(纹素)）
+    // 分配结果通过灯表的 cosOuterType.z（基准层号）告知片元侧。
+    // ============================================================
+    bool& localShadowsEnabled() { return m_localShadowsEnabled; }
+    bool localShadowsEnabled() const { return m_localShadowsEnabled; }
+    uint32_t& localShadowMaxLights() { return m_localShadowMaxLights; }
+    glm::vec4& localShadowBias() { return m_localShadowBias; }
+    const glm::vec4& localShadowBias() const { return m_localShadowBias; }
+    const render::LocalShadowPass* localShadowPass() const {
+        return m_localShadowPass.get();
+    }
+    // 本帧实际用掉的层数（0 = 没有任何局部光源投影）
+    uint32_t localShadowLayersUsed() const { return m_localShadowLayersUsed; }
+
+    // 本帧渲染统计（drawFrame 开头清零，供 Stats 面板显示剔除效果）。
+    // 计数口径是"提交"而非"像素"：triangles 是提交的三角形数（不是实际
+    // 着色数）——它衡量的是 CPU 提交开销，正是视锥剔除要压下去的东西。
+    struct RenderStats {
+        uint32_t renderables = 0;       // 索引里的网格实体总数（剔除前）
+        uint32_t culledFrustum = 0;     // 被视锥剔除的数量
+        uint32_t drawnOpaque = 0;       // 实际提交的不透明物体数
+        uint32_t drawnTransparent = 0;  // 实际提交的透明物体数
+        uint32_t gizmosCulled = 0;      // 被剔除的灯可视化小球数
+        uint32_t drawCalls = 0;         // 提交的绘制命令总数（含深度预通道）
+        uint32_t triangles = 0;         // 提交的三角形总数
+        // GPU instancing：不透明列表聚合出的批数（items - batches = 省下的
+        // draw call）。instancing 关闭时与 drawnOpaque 相等。
+        uint32_t opaqueBatches = 0;
+        // 本帧视锥查询实际访过的 BVH 节点数。渲染统计里最有用的一条：
+        // 它和 renderables 一比就知道树有没有建歪（退化成全遍历时
+        // 会逼近 nodeCount）。
+        uint32_t bvhNodeVisits = 0;
+
+        // ---- LOD（见 assets/Lod.h）----
+        // 可见物体里"有 LOD 链"的数量。没链的（立方体/平面这种已经最简的
+        // 网格）不计入，所以 lodEntities <= drawnOpaque + drawnTransparent。
+        uint32_t lodEntities = 0;
+        // 各层级各画了多少个（下标 = 层级，0 = 高模）
+        uint32_t lodLevelCounts[assets::kMaxLodLevels] = {0, 0, 0, 0};
+        // 如果**全部**用 LOD0 会提交多少三角形。和 triangles 一比就是
+        // 这套 LOD 到底省了多少 —— 验证脚本的核心断言之一。
+        uint32_t trianglesNoLod = 0;
+        // 层级切换次数（本帧 + 累计）。静止场景里累计值应当很快不再增长；
+        // 一直涨说明迟滞没生效、物体在阈值上抖动。
+        uint32_t lodSwitches = 0;
+
+        // ---- Shader 变体（关键字系统，见 render/ShaderKeywords.h）----
+        // 本帧各变体各画了多少个，下标 = 关键字掩码（0..7）。
+        // 全 0 的项不在日志里打印，否则一行 8 段全是 0 根本读不动。
+        uint32_t variantCounts[1u << kKeywordCount] = {};
+        // 因掩码变化而重绑管线的次数。和 drawCalls 一比就知道变体切换
+        // 带来的绑定开销有多大（同掩码相邻的物体不会重绑）。
+        uint32_t variantSwitches = 0;
+    };
+    const RenderStats& renderStats() const { return m_stats; }
+
+    // ============================================================
+    // Shader 变体 / 关键字（见 render/ShaderKeywords.h）
+    //
+    // 每个绘制项按下式得到一个关键字掩码，绘制时拿掩码去变体族里取管线：
+    //     掩码 = keywordsOf(material)      ← 材质特性（双面 / 透明 / 有法线图）
+    // 队列分类（不透明 / 透明）也由同一个掩码推导 —— "半透明"只有一处定义。
+    //
+    //   · forcedKeywordMask >= 0 时**无视材质**，所有绘制项都用这个掩码。
+    //     用来逐个变体做对照实验（例如强制关掉 NORMAL_MAP，看画面差在哪；
+    //     或强制打开 DOUBLE_SIDED，看背面是否真的画出来）。
+    //     -1 = 不强制（默认）。可用 MYVK_SHADER_FORCE_MASK 环境变量设初值。
+    //   · 变体族本身：已建了几个变体、命中率（验证脚本靠它证明缓存生效）。
+    // ============================================================
+    int& forcedKeywordMask() { return m_forcedKeywordMask; }
+    int forcedKeywordMask() const { return m_forcedKeywordMask; }
+    const VariantPipelines& forwardPipelines() const {
+        return m_forwardPipelines;
+    }
+    const VariantPipelines& depthPrePipelines() const {
+        return m_depthPrePipelines;
+    }
 
     // 灯光可视化小球
     bool& lightGizmosEnabled() { return m_showLightGizmos; }
@@ -184,14 +411,44 @@ public:
     // ImGui::Image() 用的纹理句柄（实体是 VkDescriptorSet 的整型化形式）
     uint64_t viewportTextureId() const;
 
+    // ============================================================
+    // 角色详情窗口的独立预览渲染目标（UE5 Persona 的预览视口）
+    //
+    // 主视口与预览视口要**同时**显示、尺寸不同、相机不同、场景不同，
+    // 所以不能复用上面那套单例离屏链 —— 这里给 Renderer 加第二套
+    // HdrTarget + PostProcess + 离屏输出图，专门渲染角色窗口的预览场景。
+    // drawPreview() 与 drawFrame() 在同一次 drawFrame 调用内先后执行，
+    // 共用同一份 FrameUBO / 骨骼 SSBO / 灯数据缓冲（这些是每帧一份的
+    // 全局资源，按场景内容各自上传后再录制对应 pass）。
+    // ============================================================
+    void setPreviewSize(uint32_t width, uint32_t height);
+    bool previewActive() const {
+        return m_previewWidth > 0 && m_previewHeight > 0;
+    }
+    uint64_t previewTextureId() const;
+    // 设置 / 清除"本帧要额外渲染的预览场景"（角色详情窗口持有）。
+    // 非空时，主场景录制完毕后、同一命令缓冲内继续把它渲染到预览离屏图。
+    void setPreviewScene(scene::Scene* scene) { m_previewScene = scene; }
+
 private:
     void createFrameResources();
     void createDescriptorLayouts();
     void createDefaultTextures();
     void createLightGizmoMesh();
     void createShadowPass();
+    void createEnvironment();
     void createHdrTarget();
     void createPostProcess();
+    // 屏幕空间效果模块的创建 / 重建（SSAOPass + FrameGraph）。
+    // recreate 版在"渲染分辨率或 MSAA 变了"的所有路径上调用
+    // （applyViewportSize / recreateSwapchain / setSampleCount）。
+    void createScreenSpace();
+    void recreateScreenSpace();
+    // PostProcess 应该采样的输入视图：链激活时 = FrameGraph 的输出
+    // 工作图，否则 = HDR resolve 视图（基线路径，逐像素不变）。
+    std::vector<VkImageView> postInputViews() const;
+    // 链激活状态翻转后重接 PostProcess 输入（内部含 waitIdle）
+    void rewirePostInput();
     void createClusteredLighting();
     void createPipelines();
     void writeGlobalDescriptors();
@@ -203,14 +460,116 @@ private:
     void applyViewportSize();
     void createViewportTextures();
     void destroyViewportTextures();
+    // 预览离屏链的尺寸应用（独立于主视口）
+    void applyPreviewSize();
+    void createPreviewTextures();
+    void destroyPreviewTextures();
+    // 把指定场景的相机 / 灯 / 蒙皮数据上传到本帧全局缓冲。
+    // extent 指定该场景的渲染分辨率（主视口用 renderExtent()，
+    // 预览视口用预览尺寸）。resetSkinning 为 true 时清空蒙皮映射与
+    // SSBO 偏移（主场景），false 时追加（预览场景紧接主场景之后）。
+    void uploadSceneState(scene::Scene& scene, VkExtent2D extent,
+                          bool resetSkinning);
+    // 把 scene 的几何录制进指定 HdrTarget（阴影 + 深度预通道 + 分簇 + 前向）。
+    // isPreview=true 时跳过阴影 pass 与分簇 compute（预览与主场景共享这些
+    // 全局缓冲，且主场景的采样命令已录制在先，避免无同步竞争）。
+    void recordSceneInto(VkCommandBuffer cmd, scene::Scene& scene,
+                         class HdrTarget& hdr, bool isPreview);
+    // 在同一个命令缓冲内录制预览场景（主场景之后调用）。
+    void recordPreview(VkCommandBuffer cmd);
     void recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
                      scene::Scene& scene);
     // 录制深度预通道（返回是否真的录了内容）
     void recordDepthPrePass(VkCommandBuffer cmd, scene::Scene& scene);
-    // 单个网格的绘制（含 doubleSided 管线切换的调用方负责）
+    // 单个网格的绘制（含 doubleSided 管线切换的调用方负责）。
+    // instanceCount/firstInstance 走 instancing 合批：VS 从实例 SSBO 读
+    // model，push 里的 model 字段闲置（仍照推，保持 push 布局恒定）。
     void drawMesh(VkCommandBuffer cmd, VkPipelineLayout layout,
                   const glm::mat4& model, const assets::Material& mat,
-                  const assets::Mesh& mesh);
+                  const assets::Mesh& mesh, uint32_t instanceCount = 1,
+                  uint32_t firstInstance = 0);
+    // 不透明合批：排序 + 聚合 + 写实例 SSBO（buildDrawLists 尾部调用）。
+    void buildOpaqueBatches();
+    // 蒙皮：遍历场景里的 SkinnedMeshComponent，采样关节矩阵写入骨骼 SSBO，
+    // 并建立 mesh→jointBase 映射供 drawMesh 查。每帧在 recordFrame 前调用。
+    // resetOffset=true 时清空映射与偏移（主场景每帧第一次调用）；false 时
+    // 追加写入（预览场景紧跟在主场景之后，共享同一 SSBO，互不覆盖）。
+    void updateSkinning(scene::Scene& scene, bool resetOffset);
+
+    // ------------------------------------------------------------
+    // 一帧内要提交给**某一个场景**的绘制项。
+    //
+    // 建表时一次性把两件事算完：
+    //   1) 视锥剔除（世界 AABB vs 视锥的六平面测试）
+    //   2) 世界矩阵缓存 —— Scene::worldMatrix(e) 要沿父链递归累乘，
+    //      而深度预通道 / 不透明 / 透明三条路径原本各算一次，同一个实体
+    //      一帧要算 3~4 遍。缓存下来是纯赚。
+    // 之后所有几何提交路径都遍历这两张表，不再碰 ECS。
+    // ------------------------------------------------------------
+    struct DrawItem {
+        const assets::Mesh* mesh = nullptr;
+        const assets::Material* material = nullptr;  // 可能为空（走缺省材质）
+        glm::mat4 model{1.0f};
+        float viewDepthSq = 0.0f;  // 到相机的距离平方（透明排序用）
+        // LOD 层级（0 = 高模）。仅用于统计/调试，绘制路径不读它。
+        int lodLevel = 0;
+        // 该实体**原始**网格（LOD0）的三角形数。统计"不用 LOD 会提交多少"
+        // 时要拿它做对照 —— 此时 mesh 指向的已经是低模了。
+        uint32_t baseTriangles = 0;
+        // 本项的 Shader 变体掩码，由 keywordsOf(*material) 一次性算好。
+        // 建表时算而不是绘制时算：同一个材质在一帧里会被深度预通道、
+        // 前向两条路径各取一次掩码，算两遍既费又可能不一致。
+        // 材质为空（只有深度预通道会画）时保持 kKeywordNone。
+        KeywordMask keywords = kKeywordNone;
+    };
+
+    // 构建本帧绘制列表。isMain 为 true 时累积 RenderStats（预览场景是
+    // 附带渲染，不该把它的大小算进主场景的剔除统计里）。
+    // 前提：m_sceneFrustum 已经按**本场景**的相机更新过（见 uploadSceneState）。
+    // 走 Scene::spatialIndex()（BVH）取视锥内的候选集，不再线性扫全场景。
+    void buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
+                        bool isMain);
+
+    // 深度预通道的几何提交（遍历本帧不透明绘制列表）。
+    // 调用方负责 RenderPass 的 begin/end 与 set 0 的绑定。
+    void recordOpaqueDepthGeometry(VkCommandBuffer cmd);
+
+    // ------------------------------------------------------------
+    // Shader 变体的绑定（前向 Pass 用）
+    // ------------------------------------------------------------
+    // 材质 → **生效**的关键字掩码：默认就是 keywordsOf(mat)，
+    // forcedKeywordMask >= 0 时无视材质直接用它（对照实验用）。
+    KeywordMask effectiveKeywords(const assets::Material& mat) const;
+    // 绑定 kw 对应的前向变体管线；与 bound 相同则跳过（同掩码相邻的
+    // 物体不该重绑）。每次真的重绑会把 switches 加一。
+    void bindForwardVariant(VkCommandBuffer cmd, KeywordMask kw,
+                            KeywordMask& bound, uint32_t& switches);
+
+    // 天空盒背景（全屏三角形）。前提：set 0 已绑定，且处于前向 Pass 内、
+    // 几何提交之前。调用后管线状态是"天空管线"，调用方接着自己绑下一个。
+    void recordSkyBackground(VkCommandBuffer cmd);
+
+    // 级联阴影的几何提交：**每一级一次** depth-only render pass。
+    // 前提：本帧的 FrameUBO 已经上传过（updateCascades 就在那里调的）。
+    // 预览场景不要调（阴影图是全局一张，主场景的采样命令已经录制在先）。
+    void recordShadowPasses(VkCommandBuffer cmd, scene::Scene& scene,
+                            VkDescriptorSet frameSet);
+
+    // 建 LocalShadowPass（init 时一次；分辨率改动要重建 → 一次 waitIdle）
+    void createLocalShadowPass();
+    // 建局部光源阴影矩阵缓冲区（每帧 in-flight 一份，常驻映射）
+    void createLocalShadowBuffers();
+    // 每帧给"要投影的局部光源"分配层号，并把世界→光源裁剪矩阵写进
+    // **本帧**的 lightShadows SSBO。
+    //
+    // ⚠ 必须在 m_lighting->uploadLights() **之前**调用：层号（写进
+    //   LightInstance::cosOuterType.z）要随灯表一起送到片元侧，晚了就
+    //   会出现"片上写的是上一帧的层号"。
+    void prepareLocalShadows(scene::Scene& scene, const glm::vec3& camPos);
+    // 逐层录制 depth-only pass：**所有层都要走一遍**（未使用的层只清深度），
+    // 否则那张 array 会有一层停在 UNDEFINED 而被采样 → 验证层直接报错。
+    void recordLocalShadowPasses(VkCommandBuffer cmd, scene::Scene& scene,
+                                 VkDescriptorSet frameSet);
 
     core::Window& m_window;
 
@@ -220,18 +579,37 @@ private:
     std::unique_ptr<rhi::Swapchain> m_swapchain;
     std::unique_ptr<rhi::CommandPool> m_commandPool;
 
-    // ---- 前向渲染管线（都绑在 HdrTarget 的 render pass 上）----
-    std::unique_ptr<rhi::Pipeline> m_pipeline;                     // 不透明
-    std::unique_ptr<rhi::Pipeline> m_pipelineDoubleSided;          // 不透明双面
-    std::unique_ptr<rhi::Pipeline> m_pipelineTransparent;          // 透明混合
-    std::unique_ptr<rhi::Pipeline> m_pipelineTransparentDouble;    // 透明双面
+    // ---- 前向渲染管线：按关键字掩码的**变体族**（都绑在 HdrTarget 的 render pass 上）----
+    // 这里原来是 4 条手写成员（不透明 / 双面 / 透明 / 透明双面）＋ 三处
+    // if 阶梯，再加一个材质特性就要变成 8 条。现在交给掩码自动派生：
+    //   · 掩码决定**编哪份 .spv**（NORMAL_MAP 少一次采样 + 一次 cotangent
+    //     frame；DOUBLE_SIDED 多一次 gl_FrontFacing 法线翻转）；
+    //   · 掩码同时决定**管线固定状态**（DOUBLE_SIDED → 关剔除；
+    //     ALPHA_BLEND → 开混合 + 不写深度）。两边由同一个掩码推导，
+    //     不可能出现"编译期是双面、栅格化还在剔背面"这种错位。
+    // 惰性创建、按掩码缓存，没用到过的组合不会白建。
+    render::VariantPipelines m_forwardPipelines;
 
     // ---- 深度预通道管线（绑在 HdrTarget 的 depthPrePass 上）----
-    std::unique_ptr<rhi::Pipeline> m_pipelineDepthPrePass;
-    std::unique_ptr<rhi::Pipeline> m_pipelineDepthPrePassDouble;
+    // 它只有 DOUBLE_SIDED 关不关剔除这一个差别，而且不输出颜色 ——
+    // ALPHA_BLEND / NORMAL_MAP 对它没有意义。所以走 SingleSpv：所有掩码
+    // 共用同一份 depth_only.frag.spv，只有固定状态随掩码变，不为它多编
+    // 8 份毫无区别的字节码。
+    render::VariantPipelines m_depthPrePipelines;
+
+    // ---- shader 热重载（见 watchShaderFiles / pollShaderReload）----
+    render::ShaderHotReload m_shaderReload;
+    // 帧计数节流：每 15 帧扫一次 mtime（60fps ≈ 0.25s，与脚本热重载
+    // 的 0.5s 定时器同数量级；std::filesystem 的 stat 很便宜，但没必要
+    // 每帧做）。
+    uint32_t m_shaderReloadTick = 0;
 
     // ---- 地平面栅格管线（前向 Pass 内，三角形带 4 顶点，无顶点缓冲）----
     std::unique_ptr<rhi::Pipeline> m_gridPipeline;
+
+    // ---- 天空盒背景管线（前向 Pass 内，全屏三角形 3 顶点，无顶点缓冲）----
+    // 推常量范围与主前向管线一致，理由同栅格管线（见 createPipelines）。
+    std::unique_ptr<rhi::Pipeline> m_pipelineSky;
 
     std::unique_ptr<rhi::DescriptorAllocator> m_descriptors;
     VkDescriptorSetLayout m_globalSetLayout = VK_NULL_HANDLE;
@@ -239,10 +617,42 @@ private:
     std::vector<FrameResources> m_frames;
     std::vector<VkSemaphore> m_renderFinished;  // 每交换链图像一个
     std::unique_ptr<render::ShadowPass> m_shadowPass;
+    std::unique_ptr<render::LocalShadowPass> m_localShadowPass;
     std::unique_ptr<render::HdrTarget> m_hdrTarget;
     std::unique_ptr<render::PostProcess> m_post;
     std::unique_ptr<render::ClusteredLighting> m_lighting;
+    std::unique_ptr<render::Environment> m_environment;
     std::unique_ptr<ui::ImGuiManager> m_imgui;
+
+    // ---- 屏幕空间效果（见 screenSpaceSettings() 的注释）----
+    std::unique_ptr<render::SSAOPass> m_ssao;
+    std::unique_ptr<render::FrameGraph> m_frameGraph;
+    render::ScreenSpaceSettings m_screenSpace;
+    // 接线状态缓存：与 m_screenSpace 的开关比对，变了才付重接的代价
+    bool m_chainWired = false;   // FrameGraph 链 → PostProcess 输入
+    bool m_ssaoWired = false;    // binding 14 = SSAO 结果图还是白图
+    // 推常量/UBO 用的相机推导缓存（uploadSceneState 每帧填）
+    glm::mat4 m_invProj{1.0f};        // inverse(proj)
+    glm::vec4 m_projCoefs{0, 0, 0, 0};// P00/P11/P22/P23（解析投影用）
+    glm::mat4 m_viewProj{1.0f};       // proj*view（太阳屏幕投影用）
+    float m_camNear = 0.1f;
+    float m_camFar = 200.0f;
+
+    // ---- 纹理能力（构造函数从环境变量读，textureContext() 下发）----
+    bool m_texMipmaps = false;      // MYVK_MIPMAP=1：RGBA8 纹理生成 mip 链
+    bool m_texStream = false;       // MYVK_TEXSTREAM=1：DDS mip 分帧补传
+    float m_anisoOverride = -1.0f;  // MYVK_ANISO 覆盖；<0 = 设备上限
+
+    // ---- 角色详情窗口的独立预览离屏链 ----
+    std::unique_ptr<render::HdrTarget> m_previewHdrTarget;
+    std::unique_ptr<render::PostProcess> m_previewPost;
+    uint32_t m_previewWidth = 0;
+    uint32_t m_previewHeight = 0;
+    bool m_previewDirty = false;
+    std::vector<VkDescriptorSet> m_previewTextureSets;
+    std::vector<VkImageView> m_previewTextureViews;
+    // 本帧要额外渲染的预览场景（角色详情窗口持有，非空才录制预览）。
+    scene::Scene* m_previewScene = nullptr;
 
     // 缺省贴图：材质未指定某张纹理时绑定它们，保证描述符始终有效
     std::unique_ptr<assets::Texture> m_defaultWhite;       // (1,1,1,1)
@@ -255,14 +665,121 @@ private:
 
     // 每帧复用的灯列表（避免每帧分配）
     std::vector<scene::LightInstance> m_lightScratch;
-    // 透明物体排序用的临时列表：(实体, 到相机的距离平方)
-    std::vector<std::pair<ecs::Entity, float>> m_transparentScratch;
+
+    // ---- 物体级视锥剔除 ----
+    // 本帧**当前场景**的相机视锥（uploadSceneState 里按该场景的相机重建；
+    // 主场景用完后预览场景会覆盖它，但主场景的绘制列表此时已经建好）。
+    Frustum m_sceneFrustum;
+    bool m_sceneFrustumValid = false;
+    bool m_frustumCullingEnabled = true;
+    RenderStats m_stats;
+    // 本帧的绘制列表（buildDrawLists 填充）。透明表已按到相机距离降序排好。
+    std::vector<DrawItem> m_opaqueDraws;
+    std::vector<DrawItem> m_transparentDraws;
+
+    // ============================================================
+    // GPU instancing / 合批（MYVK_INSTANCING=1，见 buildOpaqueBatches）
+    //
+    // 不透明列表按 (关键字掩码, 材质, 网格) 稳定排序后，相邻同键项聚合成
+    // 一批：每批只付一次 vkCmdBindPipeline + 材质 push + 纹理 set 绑定，
+    // 用 vkCmdDrawIndexedInstanced(count) 展开 —— 每实例的 model 矩阵放在
+    // set 0 binding 13 的 SSBO 里，pbr.inst.vert 用 gl_InstanceIndex 读
+    // （firstInstance 即全局槽基址，批与批之间天然不重叠）。
+    //
+    // 槽序 = 批展开的绘制序，**深度预通道与前向 Pass 共用同一份**
+    // （两个 pass 遍历同一个 m_opaqueBatches，SSBO 只写一次）。
+    // 主场景与预览场景的槽在 buffer 里连续排布：buildDrawLists 每场景
+    // 调一次，isMain 时把游标清零再累加（与骨骼 SSBO 的 jointOffset 同款）。
+    //
+    // 透明列表**不合批**：它必须按到相机的距离排序（混合语义），
+    // 排序与批序互斥 —— 透明物体逐个提交，走原路径。
+    // ============================================================
+    struct DrawBatch {
+        const assets::Mesh* mesh = nullptr;
+        const assets::Material* material = nullptr;  // 可空（只进深度预通道）
+        KeywordMask keywords = kKeywordNone;
+        uint32_t firstInstance = 0;  // 全局 SSBO 槽基址
+        uint32_t count = 0;          // 实例数
+    };
+    std::vector<DrawBatch> m_opaqueBatches;
+    bool m_instancingEnabled = false;
+    // 本帧已写入实例 SSBO 的槽总数（主场景 + 预览场景累加）。
+    uint32_t m_instanceOffset = 0;
+    // BVH 视锥查询的结果（避免每帧分配）。装的是候选实体的句柄，
+    // 建表时再按句柄回查 Mesh / Material 组件。
+    std::vector<ecs::Entity> m_visibleScratch;
+
+    // ---- LOD ----
+    bool m_lodEnabled = true;
+    float m_lodBias = 1.0f;
+    int m_forcedLodLevel = -1;
+    // 每个实体上一帧选的层级（迟滞要用）。用实体 id 做键；实体销毁后条目
+    // 会留到下次被同 id 复用时覆盖 —— 最坏情况是新物体第一帧少一次迟滞，
+    // 没有任何可见影响。切换次数单独累计，供验证脚本判断"稳不稳"。
+    std::unordered_map<uint32_t, uint8_t> m_lodSelected;
+    uint32_t m_lodSwitchTotal = 0;
+
+    // 蒙皮：mesh 指针 → 骨骼 SSBO 里的 jointBase（updateSkinning 每帧填）。
+    // drawMesh 用它把 push.skin.x 设为该 mesh 的关节矩阵起始下标。
+    std::unordered_map<const assets::Mesh*, int> m_skinJointBase;
+    // 当前帧已写入骨骼 SSBO 的关节矩阵总数（主场景 + 预览场景累加）。
+    uint32_t m_skinJointOffset = 0;
 
     VkSampleCountFlagBits m_sampleCount = VK_SAMPLE_COUNT_4_BIT;
     bool m_depthPrePassEnabled = true;
     bool m_clusterCullingEnabled = true;
+    // Shader 变体强制覆盖（-1 = 按材质推导）。见 forcedKeywordMask()。
+    int m_forcedKeywordMask = -1;
+    bool m_iblEnabled = true;
+    bool m_skyEnabled = true;
     bool m_showLightGizmos = true;
     float m_lightGizmoScale = 0.05f;
+
+    // ---- 级联阴影（CSM）----
+    bool m_shadowsEnabled = true;
+    // 每级的分辨率（4 级各一张，所以显存是它的 4 倍：2048² × 4 字节 × 4 层
+    // × 2 帧 ≈ 134 MB。`MYVK_SHADOW_RES` 可下调）
+    uint32_t m_shadowResolution = render::ShadowPass::kDefaultResolution;
+    uint32_t m_shadowCascades = render::ShadowPass::kMaxCascades;
+    float m_shadowDistance = 90.0f;
+    float m_shadowLambda = 0.6f;
+    float m_shadowFadeStart = 0.85f;
+    // (常数深度偏移, 斜率深度偏移, PCF 核半径(纹素), 远级联半径增长)
+    glm::vec4 m_shadowBias{0.0009f, 0.0032f, 1.0f, 0.55f};
+
+    // ---- 局部光源阴影（点光 / 聚光灯）----
+    bool m_localShadowsEnabled = true;
+    uint32_t m_localShadowResolution = render::LocalShadowPass::kDefaultResolution;
+    // 本帧最多几盏灯参与投影（层数硬上限由 kMaxLocalShadowLayers 决定）
+    uint32_t m_localShadowMaxLights = 4;
+    // (常数深度偏移, 斜率深度偏移, PCF 核半径(纹素), 开关 ← 每帧写)
+    // ⚠ 前两个是**世界单位（米）**，不是 NDC 偏移。透视投影的 NDC 深度是
+    //    双曲分布，同一个 NDC 偏移在远平面附近对应好几米、在近处只有几毫米，
+    //    所以只有按米给、再由片元按参考深度换算（用每层的 near/far），
+    //    这个参数才有可调性。0.03 / 0.15 对 1024² 的层大致等于"一个纹素
+    //    跨度的深度误差 + 一点余量"。
+    glm::vec4 m_localShadowBias{0.030f, 0.150f, 1.2f, 0.0f};
+    // 本帧实际用掉的层数（prepareLocalShadows 填）
+    uint32_t m_localShadowLayersUsed = 0;
+    // 逐层的工作区（避免每帧分配）：
+    //   m_localShadowMatrices[i]   = 第 i 层的世界 → 光源裁剪矩阵
+    //   m_localShadowLayerLight[i] = 第 i 层对应的 m_lightScratch 下标，-1 = 未用
+    //   m_localShadowNear/Far[i]   = 第 i 层投影的近 / 远平面（米）。
+    //     片元侧要靠它把"世界单位的深度偏移"换算成 NDC —— 透视投影的
+    //     深度是双曲的，没有这对数值就给不出正确的偏移（踩过）。
+    std::vector<glm::mat4> m_localShadowMatrices;
+    std::vector<int> m_localShadowLayerLight;
+    std::vector<float> m_localShadowNear;
+    std::vector<float> m_localShadowFar;
+    // 本帧的层分配候选（避免每帧分配）。按到相机距离由近到远排 ——
+    // 层预算用完时 "近的优先" 必须是一条硬规则，否则移动相机时
+    // 会看到"哪盏灯投影"在跳。
+    struct LocalShadowCandidate {
+        uint32_t lightIndex = 0;  // m_lightScratch 下标
+        float distSq = 0.0f;      // 到相机的距离平方（排序键）
+        uint32_t layers = 0;      // 该灯要占几层（点光 6 / 聚光 1）
+    };
+    std::vector<LocalShadowCandidate> m_localShadowCandidates;
 
     // 地平面栅格（编辑器每帧写 gridEnabled；默认关）
     bool m_gridEnabled = false;

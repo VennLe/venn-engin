@@ -65,6 +65,7 @@ struct PostSettings {
     float bloomStrength = 0.30f;  // bloom 叠加强度（0 = 关闭）
     int   tonemapMode = 0;        // 0=ACES 1=Reinhard 2=Clamp
     float vignette = 0.25f;       // 暗角强度
+    bool  fxaa = false;           // FXAA 后处理抗锯齿（MYVK_FXAA=1 默认开）
 };
 
 class PostProcess {
@@ -136,6 +137,19 @@ private:
         VkFramebuffer fb = VK_NULL_HANDLE;
     };
 
+    // FXAA 中间图：合成（tonemap）的输出、FXAA pass 的输入。
+    // 两种模式都常驻 —— 开关 FXAA 只是录制路径分支，不触发资源重建，
+    // ImGui 的 checkbox 才能做到实时切。
+    struct FxaaFrame {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        // 合成 pass 的目标 framebuffer（绑 m_offscreenRenderPass ——
+        // 无论哪种模式，这张图都要被 FXAA 采样，finalLayout 必须是
+        // SHADER_READ_ONLY）
+        VkFramebuffer fb = VK_NULL_HANDLE;
+    };
+
     void createSetLayoutAndSampler();
     void createRenderPasses();
     void createPipelines();
@@ -145,6 +159,8 @@ private:
     void destroySwapFramebuffers();
     void createSceneOutputFrames();
     void destroySceneOutputFrames();
+    void createFxaaFrames();
+    void destroyFxaaFrames();
     void buildDescriptorSets(const std::vector<VkImageView>& hdrColorViews);
     void destroyDescriptors();
 
@@ -152,11 +168,13 @@ private:
     std::unique_ptr<rhi::Pipeline> makeFullscreenPipeline(
         VkRenderPass renderPass, const char* fragSpv, uint32_t setCount);
 
-    // 在 bloom render pass 内画一个全屏三角形到指定 framebuffer
-    void drawFullscreen(VkCommandBuffer cmd, rhi::Pipeline& pipeline,
-                        VkFramebuffer fb, VkExtent2D extent,
-                        const VkDescriptorSet* sets, uint32_t setCount,
-                        const float push[4]);
+    // 在指定 render pass 内画一个全屏三角形到指定 framebuffer
+    // （bloom 三连传 m_bloomRenderPass；FXAA 按目标传 m_postRenderPass 或
+    // m_offscreenRenderPass —— 与合成 pass 的双管线结构完全对偶）
+    void drawFullscreen(VkCommandBuffer cmd, VkRenderPass renderPass,
+                        rhi::Pipeline& pipeline, VkFramebuffer fb,
+                        VkExtent2D extent, const VkDescriptorSet* sets,
+                        uint32_t setCount, const float push[4]);
 
     // 合成 + Tonemap。targetExtent/RP/pipeline 由调用方按模式选择。
     // overlay 非空时在其中绘制（必须落在同一个 RenderPass 实例内）。
@@ -164,6 +182,18 @@ private:
                          VkRenderPass rp, rhi::Pipeline& pipeline,
                          VkExtent2D targetExtent, uint32_t frameIndex,
                          const std::function<void(VkCommandBuffer)>* overlay);
+
+    // 全屏 Pass 的通用录制（recordComposite 的形状抽取，FXAA pass 也用它）：
+    // Begin(rp) → bind → viewport/scissor → 绑 sets → push → draw →
+    // [overlay] → End。overlay 非空时**必须**画在 End 之前 —— 管线绑在
+    // 本 RenderPass 上，重开一个 Pass 会把刚画好的内容清掉。
+    void recordFullscreenPass(VkCommandBuffer cmd, VkFramebuffer fb,
+                              VkRenderPass rp, rhi::Pipeline& pipeline,
+                              VkExtent2D targetExtent,
+                              const VkDescriptorSet* sets, uint32_t setCount,
+                              const float push[4],
+                              const std::function<void(VkCommandBuffer)>*
+                                  overlay);
 
     rhi::Device& m_device;
     VkFormat m_swapFormat = VK_FORMAT_UNDEFINED;
@@ -181,6 +211,9 @@ private:
     std::unique_ptr<rhi::Pipeline> m_blurPipeline;
     std::unique_ptr<rhi::Pipeline> m_postPipeline;           // 绑 m_postRenderPass
     std::unique_ptr<rhi::Pipeline> m_postOffscreenPipeline;  // 绑离屏 RenderPass
+    // FXAA 两条（与合成的双管线对偶）：
+    std::unique_ptr<rhi::Pipeline> m_fxaaPipeline;           // → 交换链（模式 A）
+    std::unique_ptr<rhi::Pipeline> m_fxaaOffscreenPipeline;  // → 离屏（模式 B）
 
     std::unique_ptr<rhi::DescriptorAllocator> m_descriptors;
 
@@ -192,11 +225,14 @@ private:
     std::vector<BloomFrame> m_bloom;
     std::vector<VkFramebuffer> m_swapFramebuffers;
     std::vector<SceneOutputFrame> m_sceneOutput;
+    std::vector<FxaaFrame> m_fxaa;
 
     // 每帧三个输入集，分别指向 HDR / bloomA / bloomB
     std::vector<VkDescriptorSet> m_hdrSets;
     std::vector<VkDescriptorSet> m_bloomASets;
     std::vector<VkDescriptorSet> m_bloomBSets;
+    // FXAA 的输入集（指向 fxaa 中间图）
+    std::vector<VkDescriptorSet> m_fxaaSets;
 
     PostSettings m_settings;
 };

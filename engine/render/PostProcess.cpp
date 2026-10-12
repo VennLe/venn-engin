@@ -34,8 +34,11 @@ PostProcess::~PostProcess() {
     destroyBloom();
     destroySwapFramebuffers();
     destroySceneOutputFrames();
+    destroyFxaaFrames();
 
     VkDevice dev = m_device.get();
+    m_fxaaOffscreenPipeline.reset();
+    m_fxaaPipeline.reset();
     m_postOffscreenPipeline.reset();
     m_postPipeline.reset();
     m_blurPipeline.reset();
@@ -218,6 +221,12 @@ void PostProcess::createPipelines() {
     // 离屏目标那条管线（编辑器视口模式才用得上）
     m_postOffscreenPipeline =
         makeFullscreenPipeline(m_offscreenRenderPass, "post.frag.spv", 2);
+    // FXAA 两条：与合成的双管线结构对偶 —— 输出目标决定绑哪条 RenderPass。
+    // fxaa.frag.spv 由 CMake 与其它 shader 一起编译（普通文件，无关键字）。
+    m_fxaaPipeline =
+        makeFullscreenPipeline(m_postRenderPass, "fxaa.frag.spv", 1);
+    m_fxaaOffscreenPipeline =
+        makeFullscreenPipeline(m_offscreenRenderPass, "fxaa.frag.spv", 1);
 }
 
 void PostProcess::destroyBloom() {
@@ -323,18 +332,54 @@ void PostProcess::createSceneOutputFrames() {
     }
 }
 
+void PostProcess::destroyFxaaFrames() {
+    for (auto& f : m_fxaa) {
+        if (f.fb != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(m_device.get(), f.fb, nullptr);
+            f.fb = VK_NULL_HANDLE;
+        }
+        destroyImage2D(m_device, f.image, f.memory, f.view);
+    }
+    m_fxaa.clear();
+}
+
+void PostProcess::createFxaaFrames() {
+    m_fxaa.resize(m_framesInFlight);
+
+    for (auto& f : m_fxaa) {
+        const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                        VK_IMAGE_USAGE_SAMPLED_BIT;
+        createImage2D(m_device, m_sceneExtent.width, m_sceneExtent.height,
+                      m_swapFormat, usage, VK_IMAGE_ASPECT_COLOR_BIT, f.image,
+                      f.memory, f.view);
+
+        // 合成的目标：无论模式 A/B，fxaa 中间图都要被 FXAA pass 采样，
+        // finalLayout 必须是 SHADER_READ_ONLY → 绑 m_offscreenRenderPass
+        VkFramebufferCreateInfo fbci{};
+        fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbci.renderPass = m_offscreenRenderPass;
+        fbci.attachmentCount = 1;
+        fbci.pAttachments = &f.view;
+        fbci.width = m_sceneExtent.width;
+        fbci.height = m_sceneExtent.height;
+        fbci.layers = 1;
+        VK_CHECK(vkCreateFramebuffer(m_device.get(), &fbci, nullptr, &f.fb));
+    }
+}
+
 void PostProcess::destroyDescriptors() { m_descriptors.reset(); }
 
 void PostProcess::buildDescriptorSets(
     const std::vector<VkImageView>& hdrColorViews) {
-    // 输入集数量 = 帧数 × 3（HDR / bloomA / bloomB），留足余量
-    const uint32_t count = static_cast<uint32_t>(m_bloom.size()) * 3 + 8;
+    // 输入集数量 = 帧数 × 4（HDR / bloomA / bloomB / fxaa），留足余量
+    const uint32_t count = static_cast<uint32_t>(m_bloom.size()) * 4 + 8;
     m_descriptors =
         std::make_unique<rhi::DescriptorAllocator>(m_device, count, 4, count);
 
     m_hdrSets.resize(m_bloom.size());
     m_bloomASets.resize(m_bloom.size());
     m_bloomBSets.resize(m_bloom.size());
+    m_fxaaSets.resize(m_bloom.size());
 
     for (size_t i = 0; i < m_bloom.size(); ++i) {
         m_hdrSets[i] = m_descriptors->allocate(m_setLayout);
@@ -348,6 +393,12 @@ void PostProcess::buildDescriptorSets(
         m_bloomBSets[i] = m_descriptors->allocate(m_setLayout);
         m_descriptors->writeTexture(m_bloomBSets[i], 0, m_sampler,
                                     m_bloom[i].bView);
+
+        if (!m_fxaa.empty()) {
+            m_fxaaSets[i] = m_descriptors->allocate(m_setLayout);
+            m_descriptors->writeTexture(m_fxaaSets[i], 0, m_sampler,
+                                        m_fxaa[i].view);
+        }
     }
 }
 
@@ -406,22 +457,29 @@ void PostProcess::recreate(const std::vector<VkImageView>& swapchainViews,
     }
 
     createBloomFrames();
+    // fxaa 中间图没有 ImGui 纹理引用（sceneOutput 才有，要保 ID 稳定），
+    // 可以直接整组换 —— 但必须先 destroy：recreate 会在 resize / 热重载 /
+    // MSAA 切换时反复执行，不销毁就重建会把旧 image/memory/view/fb
+    // 整组漏掉（实测 verify_collision_play 退出时报 24 个 leaked objects，
+    // 就是窗口 resize 两次 × 每帧一组）。
+    destroyFxaaFrames();
+    createFxaaFrames();
     createSwapFramebuffers(swapchainViews);
     buildDescriptorSets(hdrColorViews);
 }
 
 // ---------------------------------------------------------------- 录制
 
-void PostProcess::drawFullscreen(VkCommandBuffer cmd, rhi::Pipeline& pipeline,
-                                 VkFramebuffer fb, VkExtent2D extent,
-                                 const VkDescriptorSet* sets, uint32_t setCount,
-                                 const float push[4]) {
+void PostProcess::drawFullscreen(VkCommandBuffer cmd, VkRenderPass renderPass,
+                                 rhi::Pipeline& pipeline, VkFramebuffer fb,
+                                 VkExtent2D extent, const VkDescriptorSet* sets,
+                                 uint32_t setCount, const float push[4]) {
     VkClearValue clear{};
     clear.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
 
     VkRenderPassBeginInfo rp{};
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp.renderPass = m_bloomRenderPass;
+    rp.renderPass = renderPass;
     rp.framebuffer = fb;
     rp.renderArea.offset = {0, 0};
     rp.renderArea.extent = extent;
@@ -451,13 +509,11 @@ void PostProcess::drawFullscreen(VkCommandBuffer cmd, rhi::Pipeline& pipeline,
     vkCmdEndRenderPass(cmd);
 }
 
-void PostProcess::recordComposite(
+void PostProcess::recordFullscreenPass(
     VkCommandBuffer cmd, VkFramebuffer fb, VkRenderPass rp,
-    rhi::Pipeline& pipeline, VkExtent2D targetExtent, uint32_t frameIndex,
+    rhi::Pipeline& pipeline, VkExtent2D targetExtent,
+    const VkDescriptorSet* sets, uint32_t setCount, const float push[4],
     const std::function<void(VkCommandBuffer)>* overlay) {
-    const uint32_t fi =
-        frameIndex % static_cast<uint32_t>(m_bloom.size());
-
     VkClearValue clear{};
     clear.color = {{kUiClear[0], kUiClear[1], kUiClear[2], kUiClear[3]}};
 
@@ -484,15 +540,10 @@ void PostProcess::recordComposite(
     sc.extent = targetExtent;
     vkCmdSetScissor(cmd, 0, 1, &sc);
 
-    VkDescriptorSet sets[2] = {m_hdrSets[fi], m_bloomASets[fi]};
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            pipeline.layout(), 0, 2, sets, 0, nullptr);
-
-    const float post[4] = {m_settings.exposure, m_settings.bloomStrength,
-                           static_cast<float>(m_settings.tonemapMode),
-                           m_settings.vignette};
+                            pipeline.layout(), 0, setCount, sets, 0, nullptr);
     vkCmdPushConstants(cmd, pipeline.layout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       sizeof(float) * 4, post);
+                       sizeof(float) * 4, push);
     vkCmdDraw(cmd, 3, 1, 0, 0);
 
     // overlay（ImGui）**必须**在这个正在进行的 RenderPass 内绘制：
@@ -501,6 +552,21 @@ void PostProcess::recordComposite(
     if (overlay && *overlay) (*overlay)(cmd);
 
     vkCmdEndRenderPass(cmd);
+}
+
+void PostProcess::recordComposite(
+    VkCommandBuffer cmd, VkFramebuffer fb, VkRenderPass rp,
+    rhi::Pipeline& pipeline, VkExtent2D targetExtent, uint32_t frameIndex,
+    const std::function<void(VkCommandBuffer)>* overlay) {
+    const uint32_t fi =
+        frameIndex % static_cast<uint32_t>(m_bloom.size());
+
+    VkDescriptorSet sets[2] = {m_hdrSets[fi], m_bloomASets[fi]};
+    const float post[4] = {m_settings.exposure, m_settings.bloomStrength,
+                           static_cast<float>(m_settings.tonemapMode),
+                           m_settings.vignette};
+    recordFullscreenPass(cmd, fb, rp, pipeline, targetExtent, sets, 2, post,
+                         overlay);
 }
 
 void PostProcess::renderScene(
@@ -521,21 +587,76 @@ void PostProcess::renderScene(
         // 1) 亮部提取：HDR（全分辨率） → bloomA（半分辨率）
         const float bright[4] = {m_settings.bloomThreshold, m_settings.bloomKnee,
                                  m_settings.exposure, 0.0f};
-        drawFullscreen(cmd, *m_brightPipeline, bf.aFb, m_bloomExtent,
-                       &m_hdrSets[fi], 1, bright);
+        drawFullscreen(cmd, m_bloomRenderPass, *m_brightPipeline, bf.aFb,
+                       m_bloomExtent, &m_hdrSets[fi], 1, bright);
 
         // 2) 水平模糊：bloomA → bloomB
         const float blurH[4] = {texelX, texelY, 1.0f, 0.0f};
-        drawFullscreen(cmd, *m_blurPipeline, bf.bFb, m_bloomExtent,
-                       &m_bloomASets[fi], 1, blurH);
+        drawFullscreen(cmd, m_bloomRenderPass, *m_blurPipeline, bf.bFb,
+                       m_bloomExtent, &m_bloomASets[fi], 1, blurH);
 
         // 3) 垂直模糊：bloomB → bloomA（结果留在 bloomA）
         const float blurV[4] = {texelX, texelY, 0.0f, 1.0f};
-        drawFullscreen(cmd, *m_blurPipeline, bf.aFb, m_bloomExtent,
-                       &m_bloomBSets[fi], 1, blurV);
+        drawFullscreen(cmd, m_bloomRenderPass, *m_blurPipeline, bf.aFb,
+                       m_bloomExtent, &m_bloomBSets[fi], 1, blurV);
     }
 
     if (!bloomOk) return;
+
+    // ---- FXAA 开启：合成 → fxaa 中间图 → FXAA → 最终目标 ----
+    // 为什么插在 tonemap 之后：FXAA 的判定阈值定义在显示域（LDR），
+    // HDR 值域上对比度判断完全失效（fxaa.frag 头注释详述）。
+    // 为什么 UI 必须在 FXAA 之后：让 FXAA 模糊 ImGui 面板文字是不可
+    // 接受的 —— 两种模式下 overlay 都在 FXAA 写出的那个 Pass 里（模式 B
+    // 的 ImGui 本来就在下一个 Pass；模式 A 内嵌进 FXAA Pass）。
+    if (m_settings.fxaa && fi < m_fxaaSets.size() &&
+        fi < m_fxaa.size()) {
+        const float texelX2 =
+            1.0f / static_cast<float>(m_sceneExtent.width);
+        const float texelY2 =
+            1.0f / static_cast<float>(m_sceneExtent.height);
+        const float fxaaPush[4] = {texelX2, texelY2, 0.0f, 0.0f};
+
+        // 合成到 fxaa 中间图。统一走离屏管线 —— 两种模式下这张图的
+        // finalLayout 都是 SHADER_READ_ONLY（下一站是 FXAA 的输入）。
+        recordComposite(cmd, m_fxaa[fi].fb, m_offscreenRenderPass,
+                        *m_postOffscreenPipeline, m_sceneExtent, frameIndex,
+                        nullptr);
+
+        if (m_splitOutput && fi < m_sceneOutput.size()) {
+            // 模式 B：FXAA → 离屏图（ImGui 采样的那张），UI 照旧另跑
+            recordFullscreenPass(cmd, m_sceneOutput[fi].fb,
+                                 m_offscreenRenderPass,
+                                 *m_fxaaOffscreenPipeline, m_sceneExtent,
+                                 &m_fxaaSets[fi], 1, fxaaPush, nullptr);
+
+            // FXAA pass 的 finalLayout 只保证"布局正确"，写入对
+            // ImGui 片元采样可见还要靠这条显式屏障。
+            VkImageMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = m_sceneOutput[fi].image;
+            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                                 nullptr, 0, nullptr, 1, &barrier);
+            return;
+        }
+
+        // 模式 A：FXAA 直写交换链，UI overlay 内嵌在同一 Pass 内 ——
+        // ImGui 管线绑在 m_postRenderPass 上，此 Pass 附件描述一致，
+        // 管线可直接用；UI 因此落在抗锯齿之后的图层上。
+        recordFullscreenPass(cmd, m_swapFramebuffers[imageIndex],
+                             m_postRenderPass, *m_fxaaPipeline, m_sceneExtent,
+                             &m_fxaaSets[fi], 1, fxaaPush, &overlay);
+        return;
+    }
 
     if (m_splitOutput && fi < m_sceneOutput.size()) {
         // ---- 模式 B：合成到离屏图（不画 UI），UI 由 renderUiToSwapchain 负责 ----

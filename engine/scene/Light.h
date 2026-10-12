@@ -33,7 +33,17 @@ struct LightInstance {
     glm::vec4 positionRange{0.0f};       // xyz = 世界坐标, w = 影响半径
     glm::vec4 colorIntensity{1.0f};      // rgb = 颜色, a = 强度
     glm::vec4 directionCosInner{0, -1, 0, 1.0f};  // xyz = 传播方向, w = cos(内锥)
-    glm::vec4 cosOuterType{0.0f};        // x = cos(外锥), y = 类型(0=点 1=射灯)
+    // x = cos(外锥)
+    // y = 类型(0=点 1=射灯 2=方向光)
+    // z = **阴影层号**：本灯在这张局部阴影图（2D array）里的基准层。
+    //     -1 = 不投影。点灯要 6 层（立方体 6 个面），所以基准层 + 面号 = 实际层；
+    //     射灯 1 层，基准层就是它自己。由 Renderer 每帧分配（见 prepareLocalShadows）。
+    //     这个字段是"渲染侧算好、采样侧直接读"的 —— 着色器不需要知道分配策略。
+    // w = 是否投射阴影（0/1）。**必须由组件带过来**：Renderer 只看得见
+    //     LightInstance，看不到 ECS 组件。
+    // ⚠ 用 z/w 这两个原本空着的分量承载阴影信息，是为了让 LightInstance
+    //   **保持 64 字节**、与着色器 struct Light 的布局一字不改。
+    glm::vec4 cosOuterType{0.0f};
 
     // 类型编码，写进 cosOuterType.y 供着色器分支。
     // 注意：C++ 的 enum 底层类型必须是整型（不能是 float），
@@ -43,6 +53,13 @@ struct LightInstance {
     // 分簇前向的局部光通道）。场景级太阳走的是另一条通道
     // （ShadowPass + 着色器里的 sun UBO），不在这里。
     enum class Type : int { Point = 0, Spot = 1, Directional = 2 };
+
+    // 阴影层号（-1 = 不投影）
+    int shadowLayer() const {
+        return static_cast<int>(cosOuterType.z + 0.5f);
+    }
+    void setShadowLayer(int layer) { cosOuterType.z = static_cast<float>(layer); }
+    bool castsShadow() const { return cosOuterType.w > 0.5f; }
 };
 
 // 与着色器 Light 结构体（4×vec4 = 64 字节）必须严格一致
@@ -56,9 +73,10 @@ inline LightInstance makePointLight(const glm::vec3& pos,
     li.positionRange = glm::vec4(pos, pl.range);
     li.colorIntensity = glm::vec4(pl.color, pl.intensity);
     li.directionCosInner = glm::vec4(0.0f);
+    // z = -1：层号由 Renderer 每帧分配，这里只声明"要不要影子"
     li.cosOuterType =
-        glm::vec4(1.0f, static_cast<float>(LightInstance::Type::Point), 0.0f,
-                  0.0f);
+        glm::vec4(1.0f, static_cast<float>(LightInstance::Type::Point), -1.0f,
+                  pl.castsShadow ? 1.0f : 0.0f);
     return li;
 }
 
@@ -73,7 +91,7 @@ inline LightInstance makeSpotLight(const glm::vec3& pos,
     li.directionCosInner = glm::vec4(d, std::cos(sl.innerAngle));
     li.cosOuterType = glm::vec4(std::cos(sl.outerAngle),
                                 static_cast<float>(LightInstance::Type::Spot),
-                                0.0f, 0.0f);
+                                -1.0f, sl.castsShadow ? 1.0f : 0.0f);
     return li;
 }
 
@@ -89,8 +107,10 @@ inline LightInstance makeDirectionalLight(
                             ? glm::normalize(dl.direction)
                             : glm::vec3(0.0f, 0.0f, -1.0f);
     li.directionCosInner = glm::vec4(d, 0.0f);
+    // 实体级方向光不投影（场景级太阳才投，走 ShadowPass 那条路）
     li.cosOuterType = glm::vec4(
-        0.0f, static_cast<float>(LightInstance::Type::Directional), 0.0f, 0.0f);
+        0.0f, static_cast<float>(LightInstance::Type::Directional), -1.0f,
+        0.0f);
     return li;
 }
 

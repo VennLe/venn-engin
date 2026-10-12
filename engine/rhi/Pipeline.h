@@ -47,7 +47,19 @@ struct PipelineDesc {
     // 正面绕序：几何数据按"从外侧看 CCW"生成（见 assets/Mesh.cpp addFace），
     // 配合 Camera::projMatrix 的 Y 翻转，Vulkan 中正面即 COUNTER_CLOCKWISE
     VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+    // ---- 共用管线布局（可选）----
+    // 非空时 Pipeline 直接用它，且**不拥有、不销毁**（调用方负责生命周期）。
+    // 用途：着色器变体族（render/VariantPipelines）。变体之间只有片元逻辑
+    // 与固定状态不同，描述符集与 push constant 范围完全一致 —— 共用一份
+    // 布局既省对象，也让"取布局"这件事不再需要先建出一个管线来。
+    VkPipelineLayout sharedLayout = VK_NULL_HANDLE;
 };
+
+// 按 desc 里的 setLayouts / pushConstant 建一个管线布局。
+// 单独暴露出来是为了让变体族能在**还没建任何管线**的时候就拿到布局
+// （vkCmdBindDescriptorSets 在第一次绘制之前就要用它）。
+VkPipelineLayout createPipelineLayout(Device& device, const PipelineDesc& desc);
 
 class Pipeline {
 public:
@@ -67,6 +79,8 @@ private:
     Device& m_device;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
     VkPipelineLayout m_layout = VK_NULL_HANDLE;
+    // false = m_layout 是 desc.sharedLayout 借来的，析构时不销毁。
+    bool m_ownsLayout = true;
 };
 
 } // namespace rhi

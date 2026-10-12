@@ -105,12 +105,27 @@ void Device::createLogicalDevice() {
     queueCI.queueCount = 1;
     queueCI.pQueuePriorities = &priority;
 
-    // 各向异性过滤（可选特性：有就用）
-    VkPhysicalDeviceFeatures features{};
-    VkPhysicalDeviceFeatures supported{};
-    vkGetPhysicalDeviceFeatures(m_physical, &supported);
-    if (supported.samplerAnisotropy) {
-        features.samplerAnisotropy = VK_TRUE;
+    // 独立深度/模板布局（Vulkan 1.2 核心特性）：HdrTarget 的共享深度
+    // 方案把深度附件的 initial/finalLayout 设成 DEPTH_READ_ONLY_OPTIMAL
+    // （深度预通道 → SSAO/FrameGraph 采样同一条深度图）—— 不开这个
+    // 特性该布局直接非法（验证层 VUID 一串）。查询支持并显式启用。
+    VkPhysicalDeviceVulkan12Features vk12{};
+    vk12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    VkPhysicalDeviceFeatures2 feats2{};
+    feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    feats2.pNext = &vk12;
+    vkGetPhysicalDeviceFeatures2(m_physical, &feats2);
+    if (!vk12.separateDepthStencilLayouts) {
+        throw std::runtime_error(
+            "Device lacks separateDepthStencilLayouts (required by the "
+            "shared-depth screen-space pipeline)");
+    }
+    vk12.separateDepthStencilLayouts = VK_TRUE;
+
+    // 各向异性过滤（可选特性：有就用）。走 Features2 链声明 ——
+    // pNext 一旦挂了 12Features，pEnabledFeatures 必须为 NULL。
+    if (feats2.features.samplerAnisotropy) {
+        feats2.features.samplerAnisotropy = VK_TRUE;
         m_maxAnisotropy = m_props.limits.maxSamplerAnisotropy;
         if (m_maxAnisotropy > 8.0f) m_maxAnisotropy = 8.0f;
     } else {
@@ -121,9 +136,10 @@ void Device::createLogicalDevice() {
 
     VkDeviceCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    ci.pNext = &feats2;
     ci.queueCreateInfoCount = 1;
     ci.pQueueCreateInfos = &queueCI;
-    ci.pEnabledFeatures = &features;
+    ci.pEnabledFeatures = nullptr;
     ci.enabledExtensionCount = 1;
     ci.ppEnabledExtensionNames = extensions;
 

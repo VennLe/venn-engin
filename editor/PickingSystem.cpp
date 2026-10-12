@@ -1,12 +1,14 @@
 #include "PickingSystem.h"
 
 #include "assets/Mesh.h"
+#include "core/Logger.h"
 #include "ecs/Components.h"
 #include "scene/Camera.h"
 #include "scene/Scene.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
 namespace editor {
@@ -14,32 +16,6 @@ namespace editor {
 namespace {
 
 constexpr float kEps = 1e-6f;
-
-// 射线 / AABB（slab 法）。tmin 从 0 起算 → 起点在盒内也算命中。
-bool rayAabb(const Ray& r, const Aabb& b, float& tHit) {
-    if (!b.valid) return false;
-
-    float tmin = 0.0f;
-    float tmax = std::numeric_limits<float>::max();
-
-    for (int i = 0; i < 3; ++i) {
-        const float o = r.origin[i];
-        const float d = r.dir[i];
-        if (std::fabs(d) < kEps) {
-            if (o < b.min[i] || o > b.max[i]) return false;
-            continue;
-        }
-        float t1 = (b.min[i] - o) / d;
-        float t2 = (b.max[i] - o) / d;
-        if (t1 > t2) std::swap(t1, t2);
-        tmin = std::max(tmin, t1);
-        tmax = std::min(tmax, t2);
-        if (tmin > tmax) return false;
-    }
-
-    tHit = tmin;
-    return true;
-}
 
 } // namespace
 
@@ -206,29 +182,70 @@ Aabb PickingSystem::worldAabb(scene::Scene& scene, ecs::Entity e) const {
 
 PickResult PickingSystem::pick(scene::Scene& scene, const Ray& ray) {
     PickResult best;
-    float bestT = std::numeric_limits<float>::max();
 
-    scene.forEachRenderable([&](ecs::Entity e, ecs::MeshComponent&,
-                                ecs::MaterialComponent&) {
-        // 上锁的实体（自带地面）不参与点选：它是参照物，不该被选中 / 变换。
-        // 跳过而不是"排在最后"—— 否则点在空地上也会选中地面，右键视角
-        // 一转就发现选中变了，很烦躁。
-        if (scene.world().has<ecs::LockedComponent>(e)) return;
+    // 走场景的**空间索引（BVH）**做射线遍历。
+    //
+    // 老实现是线性扫描：每个实体先算世界 AABB（8 个角点过世界矩阵）再
+    // 做射线测试 —— 场景一上量，"点一下选中物体"就明显发涩。BVH 把它
+    // 变成 O(log N)：节点包围盒没被射线碰到，整棵子树直接跳过。
+    //
+    // 上锁的实体（自带地面）不参与点选：它是参照物，不该被选中 / 变换。
+    // 交给叶子过滤器跳过 —— 语义与老版"跳过而不是排在最后"完全一致。
+    const scene::Bvh& bvh = scene.spatialIndex();
+    const scene::BvhHit hit = bvh.raycastFiltered(
+        scene::BvhRay{ray.origin, ray.dir}, [&scene](ecs::Entity e) {
+            return !scene.world().has<ecs::LockedComponent>(e);
+        });
 
-        const Aabb b = worldAabb(scene, e);
-        if (!b.valid) return;
-
-        float t = 0.0f;
-        if (!rayAabb(ray, b, t)) return;
-        if (t >= bestT) return;
-
-        bestT = t;
+    // 先落结果，再自检：自检要比较的就是 best 与线性扫描 —— 顺序反了
+    // same 会恒为 0（best 还是空的）。
+    if (hit.hit) {
         best.hit = true;
-        best.entity = e;
-        best.distance = t;
-        best.point = ray.origin + ray.dir * t;
-    });
+        best.entity = hit.entity;
+        best.distance = hit.distance;
+        best.point = ray.origin + ray.dir * hit.distance;
+    }
 
+    // ---- 自检（MYVK_BVH_DBG=1）：BVH 的最近命中必须与"逐个实体线性扫描"
+    //      完全一致。拾取是"点一下选错人"类的 bug 最容易藏身的地方，
+    //      而它只在点击时触发、平时看不出来，所以留一条可验证的对照。
+    //
+    // ⚠ 位置必须在"没打中就直接 return"**之前**。放在后面的话，"点空地"
+    //   这一路完全不出日志，验证脚本就分不清两种情况：射线本来就没打中
+    //   （场景/机位问题），还是自检压根没跑到（回归失败最难查的一类）。
+    //   实测就是被这条坑过：verify_bvh 报 `PICK-DBG : None`，无从判断。
+    if (std::getenv("MYVK_BVH_DBG")) {
+        glm::vec3 d = ray.dir;
+        for (int i = 0; i < 3; ++i)
+            if (d[i] == 0.0f) d[i] = 1e-20f;
+        const glm::vec3 inv = 1.0f / d;
+        float linBest = std::numeric_limits<float>::max();
+        ecs::Entity linEntity{};
+        bool linHit = false;
+        scene.forEachRenderable([&](ecs::Entity e, ecs::MeshComponent&,
+                                    ecs::MaterialComponent&) {
+            if (scene.world().has<ecs::LockedComponent>(e)) return;
+            const Aabb b = worldAabb(scene, e);
+            if (!b.valid) return;
+            float t = 0.0f;
+            if (!scene::Bvh::intersectAabb(ray.origin, inv,
+                                           scene::BvhAabb{b.min, b.max}, t))
+                return;
+            if (t < linBest) {
+                linBest = t;
+                linEntity = e;
+                linHit = true;
+            }
+        });
+        const bool same = (linHit == best.hit) &&
+                          (!best.hit || linEntity.id == best.entity.id);
+        VK_LOG_INFO("PICK-DBG bvh=%u(d=%.3f) linear=%u(d=%.3f) same=%d "
+                    "rayNodes=%u rayLeafTests=%u hit=%d",
+                    best.entity.id, static_cast<double>(best.distance),
+                    linEntity.id, static_cast<double>(linBest),
+                    same ? 1 : 0, bvh.lastRayNodeVisits(),
+                    bvh.lastRayLeafTests(), best.hit ? 1 : 0);
+    }
     return best;
 }
 

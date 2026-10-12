@@ -73,6 +73,18 @@ int Application::run(uint64_t maxFrames) {
         // 场景逻辑更新（相机 + 对象动画）
         activeScene().update(m_time.deltaTime());
 
+        // LOD 层级惰性生成：只给"当前场景里实际用到、且还没建链"的网格
+        // 建一次。放在这里而不是网格创建时，是为了不给内容浏览器里预览
+        // 一下就丢掉的临时网格白造几份 GPU 缓冲；ensureLod 幂等，反复调
+        // 的代价只是一次哈希查找。
+        {
+            scene::Scene& s = activeScene();
+            s.forEachRenderable([this](ecs::Entity, ecs::MeshComponent& mc,
+                                       ecs::MaterialComponent&) {
+                if (mc.mesh) assets().ensureLod(mc.mesh);
+            });
+        }
+
         // 游戏逻辑更新
         onUpdate(m_time.deltaTime());
 
@@ -80,6 +92,10 @@ int Application::run(uint64_t maxFrames) {
         // MYVK_HIDE_UI=1：完全跳过 UI 绘制 —— 截图对比时任何随帧变化的
         // 文字（FPS 等）都会破坏"逐像素一致"的前提，UI 必须消失。
         if (!hideUi) onImGui();
+
+        // 纹理流驱动：流式中的 DDS 每帧补一个 mip 层（无流式纹理时
+        // 零开销）。放在渲染提交前 —— 补传的层同帧即可被采样。
+        if (m_assets) m_assets->tickTextureStreaming();
 
         // 渲染一帧
         m_renderer->drawFrame(activeScene());

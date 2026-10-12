@@ -10,10 +10,12 @@
 
 #include "ecs/Components.h"
 #include "ecs/World.h"
+#include "scene/Bvh.h"
 #include "scene/Camera.h"
 #include "scene/Light.h"
 
 #include <string>
+#include <vector>
 
 namespace scene {
 
@@ -60,6 +62,27 @@ public:
             });
     }
 
+    // ---- 空间加速结构（BVH）----
+    //
+    // 场景里所有"可见 + 有网格"实体的世界空间 AABB 索引。渲染的物体级
+    // 视锥剔除与编辑器的射线拾取**共用同一棵**，省掉两套线性扫描。
+    //
+    // 刷新策略（每次调用都会走一遍）：
+    //   * 实体集合没变 → Bvh::refit()：拓扑不动，只重算包围盒，O(N) 无分配；
+    //   * 集合变了     → 整棵重建。
+    //
+    // ⚠ 每次调用都要把全场景的世界矩阵 + 8 个角点算一遍，同一帧里请
+    //   **取一次往下传**，别在每个 pass 里各调一次。
+    Bvh& spatialIndex();
+
+    // 索引规模（ImGui 的 Stats 面板显示用）
+    struct SpatialStats {
+        size_t nodes = 0;     // 总节点数（含内部节点）
+        size_t entities = 0;  // 被索引的实体数
+        size_t depth = 0;     // 树高
+    };
+    SpatialStats spatialStats() const;
+
     // ---- 相机 ----
     Camera& camera() { return m_camera; }
     const Camera& camera() const { return m_camera; }
@@ -93,9 +116,24 @@ public:
     size_t objectCount() const { return m_world.entityCount(); }
 
 private:
+    // 重新收集"可见 + 有网格"实体并拟合 BVH（集合变了就重建拓扑）
+    void refreshSpatialIndex();
+    // 网格局部空间包围盒（扫一遍顶点）。返回 false = 没有顶点数据，
+    // 该实体不参与索引（也就不会被剔除 / 拾取）。
+    bool meshLocalBounds(const assets::Mesh& mesh, BvhAabb& out) const;
+
     ecs::World m_world;
     Camera m_camera;
     ecs::Entity m_lightEntity;
+
+    // ---- 空间索引 ----
+    Bvh m_bvh;
+    // 复用的中间数组：每帧都要填一遍，避免反复堆分配
+    std::vector<Bvh::Item> m_indexItems;
+    std::vector<BvhAabb> m_indexBounds;
+    // 上一轮索引到的实体序列（顺序也一起比 —— ECS 重新排列组件存储
+    // 会让遍历顺序变化，这时叶子与 items 的下标对应关系失效，必须重建）
+    std::vector<ecs::Entity> m_indexedEntities;
 };
 
 } // namespace scene

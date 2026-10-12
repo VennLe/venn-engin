@@ -225,6 +225,30 @@ public:
     bool colliderEdit() const { return m_colliderEdit; }
     void setColliderEdit(bool on) { m_colliderEdit = on; }
 
+    // ---- 视口矩形（ViewportPanel 每帧写）----
+    //
+    // 运行态 Player 的鼠标视角就用"鼠标是否落在视口矩形内"门控。
+    //
+    // ⚠ 为什么不用 ImGui 的 hover（IsItemHovered / IsWindowHovered）：
+    //   本编辑器开了 ImGuiConfigFlags_NavEnableKeyboard。用户一旦用过
+    //   键盘，ImGui 会进入 nav 高亮状态，而 ItemHoverable() 里有这么一句
+    //       if (g.NavHighlightItemUnderNav && ...) return false;
+    //   —— 于是 IsItemHovered() 会**一直**返回 false，直到鼠标重新动过
+    //   （NavHighlightItemUnderNav 只在 io.MouseDelta != 0 时才清除）。
+    //   结果就是：在运行态按过 Space / WASD 之后，鼠标视角直接失效。
+    //   游戏输入不该被 UI 的 nav 状态左右，所以这里改成自己判矩形。
+    void setViewportRect(const glm::vec2& pos, const glm::vec2& size) {
+        m_viewportPos = pos;
+        m_viewportSize = size;
+        m_viewportValid = true;
+    }
+    bool mouseInViewport(const glm::vec2& mouse) const {
+        return m_viewportValid && mouse.x >= m_viewportPos.x &&
+               mouse.y >= m_viewportPos.y &&
+               mouse.x < m_viewportPos.x + m_viewportSize.x &&
+               mouse.y < m_viewportPos.y + m_viewportSize.y;
+    }
+
     // 帧校验：句柄失效时按名字找回，找不回就清空。
     // （撤销删除、Play/Stop 之后都会依赖它把选择"接上"）
     void validateSelection();
@@ -359,6 +383,19 @@ public:
     // Settings 弹窗是否打开
     bool& showSettings() { return m_showSettings; }
 
+    // ---------------------------------------------------------- 角色详情窗口
+    // 创建第一/第三人称角色后，请求打开角色详情窗口（Persona 风格）。
+    // 由 ViewportPanel 在创建玩家后置位，EditorApp 每帧检查并打开窗口，
+    // 打开后即清空请求。实体句柄可能因撤销/重建失效，窗口打开时校验。
+    void requestCharacterWindow(ecs::Entity player) {
+        m_pendingCharacter = player;
+    }
+    ecs::Entity takeCharacterWindowRequest() {
+        ecs::Entity e = m_pendingCharacter;
+        m_pendingCharacter = ecs::Entity{};
+        return e;
+    }
+
 private:
     assets::AssetManager& m_assets;
 
@@ -385,6 +422,11 @@ private:
     bool m_selectionFromViewport = false;
     // W/E/R 手柄作用在碰撞体上？（见 colliderEdit()）
     bool m_colliderEdit = false;
+
+    // 视口矩形（ImGui 屏幕坐标；Player 运行态鼠标门控，见 setViewportRect）
+    glm::vec2 m_viewportPos{0.0f};
+    glm::vec2 m_viewportSize{0.0f};
+    bool m_viewportValid = false;
 
     CommandStack m_commands;
 
@@ -421,6 +463,9 @@ private:
     float m_fontScale = 1.0f;
     float m_toolbarH = 48.0f;
     bool m_showSettings = false;
+
+    // 待打开角色详情窗口的玩家实体（无效 = 无请求）
+    ecs::Entity m_pendingCharacter{};
 };
 
 } // namespace editor

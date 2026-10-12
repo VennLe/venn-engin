@@ -3,6 +3,19 @@
 
 namespace rhi {
 
+VkPipelineLayout createPipelineLayout(Device& device, const PipelineDesc& desc) {
+    VkPipelineLayoutCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    ci.setLayoutCount = static_cast<uint32_t>(desc.setLayouts.size());
+    ci.pSetLayouts = desc.setLayouts.empty() ? nullptr : desc.setLayouts.data();
+    ci.pushConstantRangeCount = desc.pushConstant.size > 0 ? 1 : 0;
+    ci.pPushConstantRanges =
+        desc.pushConstant.size > 0 ? &desc.pushConstant : nullptr;
+    VkPipelineLayout out = VK_NULL_HANDLE;
+    VK_CHECK(vkCreatePipelineLayout(device.get(), &ci, nullptr, &out));
+    return out;
+}
+
 Pipeline::Pipeline(Device& device, const PipelineDesc& desc) : m_device(device) {
     VkDevice dev = m_device.get();
 
@@ -96,16 +109,15 @@ Pipeline::Pipeline(Device& device, const PipelineDesc& desc) : m_device(device) 
     dynamic.dynamicStateCount = 2;
     dynamic.pDynamicStates = dynStates;
 
-    // 管线布局
-    VkPipelineLayoutCreateInfo layoutCI{};
-    layoutCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layoutCI.setLayoutCount = static_cast<uint32_t>(desc.setLayouts.size());
-    layoutCI.pSetLayouts =
-        desc.setLayouts.empty() ? nullptr : desc.setLayouts.data();
-    layoutCI.pushConstantRangeCount = desc.pushConstant.size > 0 ? 1 : 0;
-    layoutCI.pPushConstantRanges =
-        desc.pushConstant.size > 0 ? &desc.pushConstant : nullptr;
-    VK_CHECK(vkCreatePipelineLayout(dev, &layoutCI, nullptr, &m_layout));
+    // 管线布局：变体族会传 sharedLayout 进来共用一份（Pipeline 不拥有它，
+    // 析构时也不销毁）；没传就自己建一份并持有。
+    if (desc.sharedLayout != VK_NULL_HANDLE) {
+        m_layout = desc.sharedLayout;
+        m_ownsLayout = false;
+    } else {
+        m_layout = createPipelineLayout(device, desc);
+        m_ownsLayout = true;
+    }
 
     VkGraphicsPipelineCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -135,8 +147,11 @@ Pipeline::~Pipeline() {
         vkDestroyPipeline(m_device.get(), m_pipeline, nullptr);
         m_pipeline = VK_NULL_HANDLE;
     }
+    // sharedLayout 是借来的（调用方负责销毁）—— 只清句柄，不动资源。
     if (m_layout != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(m_device.get(), m_layout, nullptr);
+        if (m_ownsLayout) {
+            vkDestroyPipelineLayout(m_device.get(), m_layout, nullptr);
+        }
         m_layout = VK_NULL_HANDLE;
     }
 }

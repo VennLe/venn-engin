@@ -79,7 +79,10 @@ void HdrTarget::createRenderPasses() {
         depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        // finalLayout = DEPTH_READ_ONLY：预通道与前向之间可能插着
+        // SSAO pass，它要把这张深度图当**纹理**采样。渲染pass结束
+        // 时自动转到 READ_ONLY 布局，前向的 initialLayout 与之衔接。
+        depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
 
         VkAttachmentReference depthRef{
             0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
@@ -100,15 +103,20 @@ void HdrTarget::createRenderPasses() {
         deps[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
         deps[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        // 子过程 → 外部：把深度写"交出去"，供后面的前向通道读取
+        // 子过程 → 外部：深度写"交出去"。读者有两类：
+        //   · 前向通道继续当附件用（READ/WRITE，老语义）
+        //   · 屏幕空间效果把它当纹理采样（FRAGMENT + SHADER_READ，
+        //     2026-10-12 新增 —— 没有这条，SSAO 读到的是未同步内容）
         deps[1].srcSubpass = 0;
         deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
         deps[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
         deps[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         deps[1].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
         deps[1].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                VK_ACCESS_SHADER_READ_BIT;
 
         VkRenderPassCreateInfo ci{};
         ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -153,15 +161,18 @@ void HdrTarget::createRenderPasses() {
     }
 
     // 深度：LOAD —— 直接复用深度预通道的结果，不重新清。
-    // storeOp 用 DONT_CARE：这一帧之后没人再读深度
+    // 布局流：预通道停在 DEPTH_READ_ONLY（SSAO 可能已采样过）→ 本
+    // pass 开头自动升到 DEPTH_ATTACHMENT → 结束时转回 DEPTH_READ_ONLY
+    // （前向之后的屏幕空间效果继续采样它）。storeOp 因此必须是 STORE
+    // —— 过去"这一帧之后没人再读深度"的假设已被屏幕空间效果打破。
     attaches[1].format = m_depthFormat;
     attaches[1].samples = m_samples;
     attaches[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    attaches[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attaches[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     attaches[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     attaches[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attaches[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    attaches[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    attaches[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
+    attaches[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
 
     uint32_t attachmentCount = 2;
     if (msaa) {
@@ -200,11 +211,15 @@ void HdrTarget::createRenderPasses() {
     deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    // 子过程 → 外部：颜色（含 resolve）写完，后处理才能采样
+    // 子过程 → 外部：颜色（含 resolve）写完，后处理才能采样；
+    // 深度同理 —— 屏幕空间效果（SSR/SSGI/god rays）在前向之后把
+    // 深度图当纹理采样，深度写必须对片元阶段可见。
     deps[1].srcSubpass = 0;
     deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
@@ -237,10 +252,30 @@ void HdrTarget::createFrame(Frame& f) {
                   VK_IMAGE_ASPECT_COLOR_BIT, f.resolveImage, f.resolveMemory,
                   f.resolveView);
 
+    // 深度图：附件身份之外还要当**纹理**被屏幕空间效果采样
+    // （sampler2DMS）→ usage 加 SAMPLED_BIT。多采样图像按规范
+    // 只能以 2DMS 形式取样，不能当普通 sampler2D 过滤采样 ——
+    // OffscreenImage.h 顶部注释说的是后者，这里用的是前者。
     createImage2D(m_device, m_extent.width, m_extent.height, m_depthFormat,
-                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_SAMPLED_BIT,
                   VK_IMAGE_ASPECT_DEPTH_BIT, f.depthImage, f.depthMemory,
                   f.depthView, m_samples);
+
+    // 纹理身份视图：与附件视图同图不同 view（view 只是引用，
+    // 布局由 renderpass 的附件描述统一迁移）
+    {
+        VkImageViewCreateInfo vi{};
+        vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vi.image = f.depthImage;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = m_depthFormat;
+        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        vi.subresourceRange.levelCount = 1;
+        vi.subresourceRange.layerCount = 1;
+        VK_CHECK(vkCreateImageView(m_device.get(), &vi, nullptr,
+                                   &f.depthSampledView));
+    }
 
     // 深度预通道 framebuffer（只有深度）
     {
@@ -288,6 +323,10 @@ void HdrTarget::destroyFrame(Frame& f) {
         f.depthFb = VK_NULL_HANDLE;
     }
     destroyImage2D(m_device, f.depthImage, f.depthMemory, f.depthView);
+    if (f.depthSampledView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_device.get(), f.depthSampledView, nullptr);
+        f.depthSampledView = VK_NULL_HANDLE;
+    }
     destroyImage2D(m_device, f.resolveImage, f.resolveMemory, f.resolveView);
     destroyImage2D(m_device, f.msaaColorImage, f.msaaColorMemory,
                    f.msaaColorView);

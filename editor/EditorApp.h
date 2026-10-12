@@ -51,6 +51,7 @@ class InspectorPanel;
 class ContentBrowser;
 class ScriptEngine;
 class SplitLayout;
+class CharacterWindow;
 
 class EditorApp : public core::Application {
 public:
@@ -85,6 +86,12 @@ private:
                       const char* tag, uint64_t& summaryFrame);
     // 每帧在**运行态副本**上执行一遍脚本（只在 Run 态调用）
     void runRuntimeScripts(float dt);
+    // 每帧驱动**运行态副本**上的玩家（只在 Run 态、脚本之后 / 碰撞之前调用）：
+    // WASD 移动 + 鼠标转视角（第一人称）或环绕轨道相机（第三人称），
+    // 并把运行态相机摆到玩家视野 / 轨道位上。第三人称顺带驱动 walk 摆腿。
+    void runPlayers(float dt);
+    // 玩家状态探针的分帧计数（PLAYER-STATE 每 30 帧一条，防刷屏）
+    int m_playerLogTick = 0;
     // 每帧在**运行态副本**上做碰撞求解（只在 Run 态、脚本之后调用）：
     //   1) 带碰撞体的实体两两分离 —— "不能互相穿过"
     //   2) 相机当成一个球推出碰撞体 —— "相机视角也不允许穿过"
@@ -99,6 +106,8 @@ private:
     void drawEnginePanel();
     void drawStatusBar();
     void drawSettingsPanel();
+    // 角色详情窗口（创建第一/第三人称角色时弹出）
+    void drawCharacterWindow();
     // 视口正下方那一行播放条（Run = 运行游戏；Play/Pause/Stop = 动画）。
     // 按钮在这一行的水平正中。
     void drawTransportBar();
@@ -111,6 +120,7 @@ private:
     std::unique_ptr<ContentBrowser> m_content;
     std::unique_ptr<ScriptEngine> m_scripts;
     std::unique_ptr<SplitLayout> m_split;
+    std::unique_ptr<CharacterWindow> m_characterWindow;
 
     // 热重载扫描节流（每 0.5s 扫一次脚本文件时间戳）
     float m_hotReloadTimer = 0.0f;

@@ -1,0 +1,84 @@
+#version 450
+// ============================================================
+// ibl_brdf.comp —— split-sum 的 BRDF 积分表（IBL 第三条通道）
+//
+// ---- split-sum 在拆什么 ----
+//   环境镜面反射的完整积分是
+//       ∫ f_spec(V,L) · L(ω) · (N·L) dω
+//   它同时含"环境"与"BRDF"，没法预计算成一张与环境无关的表。
+//   Karis 的做法是拆成两项的乘积（近似，但效果好得离谱）：
+//
+//       ≈ [∫ L·D·(N·L) dω / ∫ D·(N·L) dω] × [∫ f_spec·(N·L) dω]
+//         └─ prefilter 通道（与环境有关）─┘  └─ 本文件（只与 BRDF 有关）─┘
+//
+//   第二项只依赖两个量：N·V 与 roughness —— 于是能烘成一张与场景
+//   无关的二维表。又因为 Fresnel 只以 (F0·A + B) 的形式线性进入，
+//   表里存的就是这一对 (A, B)，片元里一次三元运算即可。
+//
+// 横轴 = N·V，纵轴 = roughness。(N·V=1, rough=0) 即"正对观察、
+// 完全光滑"，那里**精确地** A=1、B=0（可以硬断言，见 verify_ibl.py）。
+//
+// 输出 RG32F 而不是 RG16F：C++ 侧要把它回读做数值自检，
+// 半精度得额外写转换、也容易在转换里藏 bug。512 KB 换代码简单值得。
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rg32f) uniform writeonly image2D lutOut;
+
+layout(push_constant) uniform Push {
+    vec4 params;   // x = 样本数
+} pc;
+
+#include "common.glsl"
+
+// Schlick-GGX 几何项（IBL 版：k = a²/2，不是直接光的 (r+1)²/8）
+float geometrySchlickGGX_IBL(float NdotV, float roughness) {
+    const float k = (roughness * roughness) / 2.0;
+    return NdotV / max(NdotV * (1.0 - k) + k, 1e-6);
+}
+
+float geometrySmith_IBL(float NdotV, float NdotL, float roughness) {
+    return geometrySchlickGGX_IBL(NdotV, roughness) *
+           geometrySchlickGGX_IBL(NdotL, roughness);
+}
+
+// 对固定的 (NdotV, roughness) 做蒙特卡洛积分，返回 (A, B)
+vec2 integrateBrdf(float NdotV, float roughness) {
+    const vec3 V = vec3(sqrt(max(1.0 - NdotV * NdotV, 0.0)), 0.0, NdotV);
+    const vec3 N = vec3(0.0, 0.0, 1.0);
+
+    float A = 0.0;
+    float B = 0.0;
+
+    const uint sampleCount = uint(max(pc.params.x, 1.0));
+    for (uint i = 0u; i < sampleCount; ++i) {
+        const vec2 xi = vennHammersley(i, sampleCount);
+        const vec3 H = vennImportanceSampleGGX(xi, N, roughness);
+        const vec3 L = normalize(2.0 * dot(V, H) * H - V);
+
+        const float NdotL = max(L.z, 0.0);
+        const float NdotH = max(H.z, 0.0);
+        const float VdotH = max(dot(V, H), 0.0);
+        if (NdotL <= 0.0) continue;
+
+        const float G = geometrySmith_IBL(NdotV, NdotL, roughness);
+        const float G_vis = (G * VdotH) / max(NdotH * NdotV, 1e-4);
+        // Fresnel 拆成 F0·A + B：A 收与 F0 成比例的部分，B 收余项
+        const float Fc = pow(1.0 - VdotH, 5.0);
+        A += (1.0 - Fc) * G_vis;
+        B += Fc * G_vis;
+    }
+    return vec2(A, B) / float(sampleCount);
+}
+
+void main() {
+    const ivec2 size = imageSize(lutOut);
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    // uv.x → N·V（左 = 正对 = 1、右 = 掠射 = 0）；uv.y → roughness
+    const vec2 ab = integrateBrdf(uv.x, uv.y);
+    imageStore(lutOut, pixel, vec4(ab, 0.0, 1.0));
+}

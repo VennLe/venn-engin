@@ -722,6 +722,50 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
         ImGui::EndMenu();
     }
 
+    // Player：两种相机视角的玩家（WASD + 鼠标，运行态驱动）
+    const bool playerOpen = ImGui::BeginMenu("Player");
+    menuRect("VP-ADD-Player", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (playerOpen) {
+        const bool fp = ImGui::MenuItem("First-Person Player");
+        menuRect("VP-ADD-FirstPerson", ImGui::GetItemRectMin(),
+                 ImGui::GetItemRectMax());
+        if (fp) {
+            ecs::Entity created{};
+            addEntity("First-Person Player", [&]() {
+                created = createPlayer(m_ctx.editorScene(), m_ctx.assets(),
+                                       ecs::PlayerMode::FirstPerson, m_addSpot);
+                return created;
+            });
+            // 创建后打开角色详情窗口（Persona 风格）
+            if (created.valid()) m_ctx.requestCharacterWindow(created);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "The camera IS the player.\n"
+                "Run (Play) then: WASD to move, mouse to look around.");
+
+        const bool tp = ImGui::MenuItem("Third-Person Player");
+        menuRect("VP-ADD-ThirdPerson", ImGui::GetItemRectMin(),
+                 ImGui::GetItemRectMax());
+        if (tp) {
+            ecs::Entity created{};
+            addEntity("Third-Person Player", [&]() {
+                created = createPlayer(m_ctx.editorScene(), m_ctx.assets(),
+                                       ecs::PlayerMode::ThirdPerson, m_addSpot);
+                return created;
+            });
+            // 创建后打开角色详情窗口（Persona 风格）
+            if (created.valid()) m_ctx.requestCharacterWindow(created);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "A little cartoon character with an orbit camera.\n"
+                "Run (Play) then: WASD moves the character (it turns with "
+                "you), mouse orbits the camera.");
+
+        ImGui::EndMenu();
+    }
+
     ImGui::EndPopup();
 }
 
@@ -1047,6 +1091,11 @@ void ViewportPanel::draw() {
     const ImVec2 imgMin = ImGui::GetItemRectMin();
     const ImVec2 imgSz = ImGui::GetItemRectSize();
     const bool hovered = ImGui::IsItemHovered();
+    // 上报给 EditorContext：运行态 Player 的鼠标视角控制按它门控。
+    // 注意这里写的是**矩形**而不是 hover —— 见 setViewportRect 的说明
+    // （编辑器的 nav 键盘模式会把 IsItemHovered 一直压成 false）。
+    m_ctx.setViewportRect(glm::vec2(imgMin.x, imgMin.y),
+                          glm::vec2(imgSz.x, imgSz.y));
 
     // 自动化用（MYVK_LOG_RECTS=1）：视口图像的屏幕矩形。
     // 拖拽落点 / 手柄命中都在这块矩形里，脚本靠它算坐标。

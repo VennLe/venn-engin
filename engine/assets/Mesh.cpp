@@ -54,13 +54,18 @@ void Mesh::upload(rhi::Device& device, rhi::CommandPool& cmdPool,
 }
 
 void Mesh::draw(VkCommandBuffer cmd) const {
+    drawInstanced(cmd, 1, 0);
+}
+
+void Mesh::drawInstanced(VkCommandBuffer cmd, uint32_t instanceCount,
+                         uint32_t firstInstance) const {
     if (!m_vertexBuffer || !m_indexBuffer) return;
 
     VkBuffer vbs[] = {m_vertexBuffer->get()};
     VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(cmd, 0, 1, vbs, offsets);
     vkCmdBindIndexBuffer(cmd, m_indexBuffer->get(), 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+    vkCmdDrawIndexed(cmd, m_indexCount, instanceCount, 0, 0, firstInstance);
 }
 
 // ---------------- 几何生成 ----------------

@@ -6,31 +6,83 @@
 // 若定义在 Renderer.h 里就会形成循环 include。
 //
 // 改这里的任何一个字段，都必须同步修改对应的着色器声明：
-//   FrameUBO      -> pbr.vert / pbr.frag / shadow.vert
-//   PushConstants -> pbr.vert / pbr.frag / shadow.vert
+//   FrameUBO            -> pbr.vert / pbr.frag / sky.vert / cluster_build.comp
+//                          / shadow.vert（后者只声明到 lightSpace[4] 前缀）
+//   PushConstants       -> pbr.vert / pbr.frag / grid.vert
+//   ShadowPushConstants -> shadow.vert
+//   LightShadowRecord   -> shadow.vert / pbr.frag（set 0 / binding 11 的 SSBO）
 // ============================================================
 
 #include "rhi/VulkanCommon.h"
 
 namespace render {
 
-// 每帧全局常量缓冲（std140 布局，共 368 字节）
+// 级联阴影（CSM）的级联数上限。
+// 4 是"够用"与"每帧要画 4 遍投影体"之间的折中：再往上单级覆盖范围
+// 改善得很慢，而阴影 Pass 的提交量是线性增长的。
+static constexpr uint32_t kShadowCascadeMax = 4;
+
+// ============================================================
+// 局部光源阴影（点光 / 聚光灯）的层预算
 //
-// 前半段（240 字节）是阴影 Pass 就在用的老字段；着色器只声明自己
-// 需要的前缀即可 —— GLSL 的 uniform block 允许比绑定的 buffer 短。
-// 后半段是分簇光照新增的。
+// 所有需要投影的局部光源**共用一张 2D array 深度图**（见 LocalShadowPass）：
+//   · 聚光灯占 **1 层** —— 沿锥轴的一次透视投影就够了；
+//   · 点光占 **6 层** —— 立方体 6 个面各一次 90° 透视投影。
+// 层号就是"这张图里的层下标"，由 Renderer 每帧分配（光源按到相机的
+// 距离由近到远排，预算用完就轮不到，宁可不投影也不要抢掉近处的）。
+//
+// 12 层 = 2 盏点光 + 0 盏聚光，或 12 盏聚光，或任意组合。
+// 1024² × 12 层 × 4 字节 × 2 帧 ≈ 100 MB —— 所以分辨率与环境变量
+// （MYVK_LOCAL_SHADOW_RES）都可调，默认值偏保守。
+// ============================================================
+static constexpr uint32_t kMaxLocalShadowLayers = 12;
+static constexpr uint32_t kPointLightFaces = 6;
+static constexpr uint32_t kSpotLightFaces = 1;
+
+// 单盏局部光源的阴影矩阵记录（std430，共 80 字节）。
+// 直接 memcpy 进 SSBO，被 2 个着色器读：
+//   · shadow.vert —— 渲染本层深度图时的世界 → 光源裁剪空间变换
+//   · pbr.frag    —— 采样时把片元世界坐标投回同一空间求参考深度
+// **只有一份数据源**，所以不可能出现"渲染与采样用了不同矩阵"
+// （这条约定与 CSM 的 FrameUBO.lightSpace[4] 完全一致）。
+struct LightShadowRecord {
+    glm::mat4 matrix;  //  0  世界 → 光源裁剪空间（请用 *_RH_ZO，z ∈ [0,1]）
+    // x = 该层投影的 near（米）
+    // y = 该层投影的 far（米，通常就是灯的 range）
+    // z = 该层所属光源在灯表里的下标（-1 = 该层未使用），只用于调试/dump
+    // w = 该层是否有效（0/1）
+    //
+    // xy 不是装饰：透视投影的 NDC 深度是**双曲**分布 —— 同样大小的 NDC
+    // 偏移，在远平面附近对应好几米、在近处只有几毫米。所以深度偏移参数
+    // 必须以**世界单位**给出，片元里再用 xy 把它换算回 NDC
+    // （见 pbr.frag::ndcBiasFromWorld）。少了 xy 就只能拍一个拍不准的
+    // 常数 —— 我们踩过：0.0016 的 NDC 常数把聚光灯的阴影整个推没了。
+    glm::vec4 params;  // 64
+};
+static_assert(sizeof(LightShadowRecord) == 80, "LightShadowRecord 布局变了");
+
+// 每帧全局常量缓冲（std140 布局，共 640 字节）
+//
+// 前半段是阴影 Pass 就在用的老字段；着色器只声明自己需要的前缀即可 ——
+// GLSL 的 uniform block 允许比绑定的 buffer 短。
 struct FrameUBO {
     glm::mat4 view;        // offset   0
     glm::mat4 proj;        // offset  64
     glm::vec4 lightDir;    // offset 128  xyz=传播方向（指向被照物），w=强度
     glm::vec4 lightColor;  // offset 144  rgb=颜色
     glm::vec4 camPos;      // offset 160  xyz=相机世界坐标
-    glm::mat4 lightSpace;  // offset 176  光源空间矩阵（阴影投影）
+
+    // ---- 级联阴影（CSM）----
+    // 每个级联一个光源空间矩阵（世界 → 光源裁剪空间）。**同一个数组同时
+    // 供两处使用**：ShadowPass 渲染各级深度图时用它，pbr.frag 采样时用
+    // 它反查——只有一份数据源，不可能出现"渲染与采样用了不同矩阵"。
+    //
+    // offset 176，共 256 字节（mat4 的 std140 步长就是 64，紧凑排列）
+    glm::mat4 lightSpace[kShadowCascadeMax];
 
     // ---- 分簇前向渲染（clustered forward）----
-
     // x = zNear, y = zFar
-    // z = 分簇切片的最近深度（**不是** zNear，见下）
+    // z = 分簇切片的最近深度（**不是** zNear）
     // w = 深度切片数（与 clusterDims.z 冗余，方便着色器少读一个分量）
     //
     // 为什么 z ≠ zNear：本引擎的投影由 glm::perspective 生成，且**没有**
@@ -40,32 +92,115 @@ struct FrameUBO {
     //     d_min = 2 * zNear * zFar / (zNear + zFar)
     // 深度切片必须从 d_min 起算，否则靠近相机的几层切片全落在裁剪区外，
     // 白白浪费掉（而且 AABB 也会算错）。
-    glm::vec4 cameraParams;  // offset 240
+    glm::vec4 cameraParams;  // offset 432
 
     // x = gridX, y = gridY, z = depthSlices, w = tileSize（像素）
-    glm::vec4 clusterDims;   // offset 256
+    glm::vec4 clusterDims;   // offset 448
 
     // x = 宽度, y = 高度, z = 1/宽度, w = 1/高度
-    glm::vec4 screenSize;    // offset 272
+    glm::vec4 screenSize;    // offset 464
 
     // x = 光源数量, y = 环境光强度倍率, z = 是否启用分簇剔除(0/1),
     // w = 每簇槽位数上限（须与 ClusteredLighting::maxLightsPerCluster 相同，
     //     片元着色器靠它做防御性截断）
-    glm::vec4 lightParams;   // offset 288
+    glm::vec4 lightParams;   // offset 480
 
     // NDC(齐次 w=1) → 世界 的反投影矩阵，= inverse(proj * view)
     // 分簇 compute 用它把每个簇的 8 个角点还原到世界空间求 AABB
-    glm::mat4 invViewProj;   // offset 304
-};
+    glm::mat4 invViewProj;   // offset 496
 
-// 每 draw call 的推送常量（std430 布局，共 112 字节）
-// Vulkan 规范至少保证 128 字节，此处留有余量
+    // ---- IBL（见 render/Environment.h）----
+    // x = IBL 开关（0/1）。关掉时 pbr.frag 回退到旧的程序化天空梯度，
+    //     用于"开关两次画面必须不同、但都要正确"的对照实验。
+    // y = 预过滤立方体的最大 mip（roughness × 它 = textureLod 的层级）
+    // z, w = 保留
+    glm::vec4 envParams;     // offset 560
+
+    // ---- 级联阴影参数 ----
+    // x = 实际级联数（1..kShadowCascadeMax）
+    // y = 最大阴影距离（世界单位）。超出它的像素不再有阴影 ——
+    //     这就是"阴影距离分级"的硬边界，配合 z 做平滑淡出。
+    // z = 淡出起点占最大距离的比例（0..1）；0.85 表示最后 15% 线性淡出
+    // w = 阴影总开关（1 开 / 0 关）
+    glm::vec4 shadowParams;  // offset 576
+
+    // x..w = 第 0..3 级级联覆盖的**远端世界距离**（沿相机视线方向的线性
+    // 深度）。级联数不足 4 时多余分量重复最后一级的值，着色器不必特判。
+    glm::vec4 cascadeSplits; // offset 592
+
+    // x = 常数深度偏移, y = 斜率深度偏移（都作用在归一化深度上）
+    // z = PCF 核半径（纹素）, w = 远级联的 PCF 半径增长系数
+    glm::vec4 shadowBias;    // offset 608
+
+    // ---- 局部光源阴影参数 ----
+    // x = 常数深度偏移（**米**，不是 NDC —— 透视投影下 NDC 偏移没有
+    //     固定的世界含义，见 LightShadowRecord::params）
+    // y = 斜率深度偏移（米，乘以 (1 - N·L)）
+    // z = PCF 核半径（纹素）
+    // w = 局部阴影总开关（1 开 / 0 关）
+    //
+    // 为什么与方向光分开：正交投影（级联）的深度是**线性**的，按 NDC 给
+    // 偏移就够了；透视投影（点/聚光）的深度是双曲的，两者不可能共用一套
+    // 单位，也不可能共用一组数值。
+    glm::vec4 localShadowParams;  // offset 624
+
+    // ---- 高度雾（屏幕空间效果第一弹，2026-10-12）----
+    // x = 基础密度（水平方向）；y = 高度衰减系数（1/米，Z-up：高度 =
+    //     世界 z，越高越稀）；z = 雾总开关（1 开 / 0 关）；w = 保留
+    // 雾色不在这里 —— pbr.frag 直接采样天空立方体（binding 10），
+    // 雾到地平线的颜色过渡与天空盒自动一致，用户改天顶色也不用同步。
+    glm::vec4 fogParams;          // offset 640
+};
+// 总 656 字节。std140 下 mat4 步长 16、vec4 对齐 16，与这里的自然布局一致。
+// ⚠ 追加字段只能放**末尾**：sky.vert / grid.vert / shadow.vert /
+//   cluster_build.comp 只声明前缀，尾部追加不影响它们的偏移。
+static_assert(sizeof(FrameUBO) == 656, "FrameUBO 布局变了，必须同步所有声明它的着色器");
+
+// 阴影 Pass 专用的推送常量（std430 布局，共 96 字节）。
+//
+// **级联阴影与局部光源阴影共用这一个结构**：两者的差别只是
+// `which.x` 指向哪张表、以及读哪张深度图。省掉第二套推常量是因为
+// shadow.vert 也要共用 —— 一个着色器只能有一个 push_constant 块。
+//
+// 为什么不复用 PushConstants：那个已经**恰好用满** Vulkan 保证的 128 字节
+// 下限（见下），塞不下级联/层索引。而 ShadowPass 拥有自己的管线布局、并且在
+// **自己的 render pass 内自行绑定 set 0**（不像前向 Pass 那样"绑一次 set 0
+// 然后切一堆管线"），所以它的 push 范围不必与主前向管线逐字段相同 ——
+// 绑定时用的布局和绘制时用的布局是同一个对象，不可能不兼容。
+struct ShadowPushConstants {
+    glm::mat4 model;   //  0  与主路径一致
+    glm::vec4 skin;    // 64  x=jointBase（y/z/w 未用）
+    // x = 索引（级联号，或局部阴影的**层号**）
+    // y = 0 → 从 FrameUBO.lightSpace[x] 取矩阵（CSM）
+    //     1 → 从 lightShadows[x].matrix 取矩阵（点光/聚光灯）
+    glm::vec4 which;   // 80
+};
+static_assert(sizeof(ShadowPushConstants) == 96, "ShadowPushConstants 布局变了");
+
+// 每 draw call 的推送常量（std430 布局，共 128 字节）
+// Vulkan 规范保证的 push constant 下限正好是 128 字节 —— 恰好用满。
+// （从 112 扩上来的原因：蒙皮需要 jointBase 定位骨骼矩阵 SSBO，
+//   见 pbr.vert 的 inJoints/inWeights 与 set0/binding6。）
 struct PushConstants {
     glm::mat4 model;           //   0
     glm::vec4 baseColorFactor; //  64
     glm::vec4 pbr;             //  80  x=metallic y=roughness z=normalScale w=ao
     glm::vec4 emissive;        //  96  rgb=自发光
+    glm::vec4 skin;            // 112  x=jointBase（SSBO 里首个关节矩阵的下标；
+                               //       y=关节总数；z=1 表示该网格蒙皮，
+                               //       0 = 静态网格，着色器直接走原路径）
 };
+
+// GPU instancing 的每实例数据（set 0 binding 13，std430）。
+// 合批 = 同 (关键字掩码, 材质, 网格) 的多个实体共享一次
+// vkCmdDrawIndexedInstanced —— 管线与纹理 set 每批付一次，只有
+// model 矩阵逐实例不同，放进这里让顶点着色器按 gl_InstanceIndex 取。
+// std430 的 mat4 数组 stride = 64（4 个 align-16 的列向量），与
+// glm::mat4 的内存布局逐字节一致，可以直接 memcpy。
+struct InstanceData {
+    glm::mat4 model;
+};
+static_assert(sizeof(InstanceData) == 64, "InstanceData 必须是一个裸 mat4");
 
 // 地平面栅格的推送常量（与 assets/shaders/grid.{vert,frag} 一一对应）。
 // 数据只有 48 字节 —— 它不需要额外描述符（相机矩阵从 FrameUBO 读），

@@ -66,6 +66,10 @@ bool isObjPath(const std::string& p) {
     return endsWith(p, ".obj") || endsWith(p, ".OBJ");
 }
 
+bool isFbxPath(const std::string& p) {
+    return endsWith(p, ".fbx") || endsWith(p, ".FBX");
+}
+
 // "assets/models/Cube/Cube.gltf" → "Cube"
 // ⚠ std::filesystem::path 不能直接赋给 std::string，必须显式 .string()
 std::string pathStem(const std::string& p) {
@@ -124,7 +128,7 @@ ecs::Entity createPrimitive(scene::Scene& scene, assets::AssetManager& assets,
         case PrimitiveKind::Plane:
             attachPrimitive(w, e, assets, ecs::MeshPrimitive::Plane,
                             paletteMaterial(assets, "editor_plane_default",
-                                            170, 172, 178, 0.85f, 0.0f));
+                                            200, 200, 205, 0.55f, 0.0f));
             break;
         case PrimitiveKind::PointLight: {
             ecs::PointLightComponent pl;
@@ -163,12 +167,60 @@ ecs::Entity createPrimitiveOnGround(scene::Scene& scene,
             break;
         default:
             pos.z += primitiveHalfHeight(kind);
+            // Plane 的几何面正好在 z=0，与自带 Ground 的顶面完全共面 →
+            // z-fighting：两块面逐像素抢深度，看起来"灰白半透明、若影若现"
+            // （透出来的就是 Ground 的灰色）。抬 1cm 视觉上仍然贴地。
+            if (kind == PrimitiveKind::Plane) pos.z += 0.01f;
             break;
     }
     return createPrimitive(scene, assets, kind, pos);
 }
 
 // ---------------------------------------------------------------- 特殊灯光
+
+// ------------------------------------------------------------
+// Player（第一人称 / 第三人称）
+//
+// 实体 position = 玩家的"脚"（永远贴地，运行态只在水平面移动）。
+// 第一人称：空节点 + 胶囊碰撞体 —— 编辑态碰撞线框就是"这里站着一个人"的
+// 占位提示（用户明确说第一人称不用管模型，视角本身就是玩家）。
+// 第三人称：只保留胶囊碰撞体占位（2026-10-11 起不再程序化拼小人）——
+// 角色模型（静态网格 / 骨骼网格 + 动画）由"角色详情窗口"绑定。
+// 胶囊：r=0.30、圆柱段半高 0.55 → 总高 1.70，中心抬 z=0.85 底部贴地。
+// ------------------------------------------------------------
+ecs::Entity createPlayer(scene::Scene& scene, assets::AssetManager& assets,
+                         ecs::PlayerMode mode,
+                         const glm::vec3& groundSpot) {
+    ecs::World& w = scene.world();
+
+    const char* rootName = mode == ecs::PlayerMode::ThirdPerson
+                               ? "Player (Third-Person)"
+                               : "Player (First-Person)";
+    ecs::Entity root = scene.createObject(rootName);
+    if (auto* t = w.get<ecs::TransformComponent>(root))
+        t->position = groundSpot;   // 脚踩在落点上
+
+    ecs::PlayerComponent pc;
+    pc.mode = mode;
+    // pitch = 视线仰角（正 = 抬头）：第三人称初始略微低头，
+    // 于是相机落在角色斜上方俯视（相机 pitch 取 -pc.pitch）。
+    if (mode == ecs::PlayerMode::ThirdPerson) pc.pitch = -0.35f;
+    pc.bodyYaw = pc.yaw;   // 出生时角色朝向 = 视线方向
+    w.add<ecs::PlayerComponent>(root, pc);
+
+    // 胶囊碰撞体：占位 + 运行态防穿墙。中心在 (0,0,0.85)。
+    ecs::CollisionComponent cc;
+    cc.shape = ecs::ColliderShape::Capsule;
+    cc.position = glm::vec3(0.0f, 0.0f, 0.85f);
+    cc.capsuleRadius = 0.30f;
+    cc.capsuleHalfHeight = 0.55f;
+    w.add<ecs::CollisionComponent>(root, cc);
+
+    // 第三人称不再程序化拼小人（2026-10-11 用户反馈"太粗糙"）—— 只保留
+    // 胶囊碰撞体作占位提示。真正的角色模型（静态网格 / 骨骼网格 + 动画）
+    // 通过"角色详情窗口"绑定，见 editor/CharacterWindow。
+    return root;
+}
 
 ecs::Entity createSunlight(scene::Scene& scene) {
     // 日照预设（与 resetToEmptyScene 的默认太阳一致：
@@ -227,8 +279,10 @@ ImportResult instantiateModel(scene::Scene& scene, assets::AssetManager& assets,
             return out;
         }
 
-        // ---- 其余按 glTF 处理 ----
-        assets::Model* model = assets.loadGLTF(resolved, modelRelativePath);
+        // ---- 其余按 FBX / glTF 分派（两者都产出 Model + SubMesh 列表）----
+        assets::Model* model = isFbxPath(modelRelativePath)
+                                   ? assets.loadFBX(resolved, modelRelativePath)
+                                   : assets.loadGLTF(resolved, modelRelativePath);
         if (!model || !model->valid()) return out;
 
         out.root = scene.createObject(pathStem(modelRelativePath));

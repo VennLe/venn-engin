@@ -402,6 +402,242 @@ Material* gltfMaterial(AssetManager& assets, const tinygltf::Model& gm,
     return mat;
 }
 
+// ---- 蒙皮 / 动画解析（2026-10-11 引入，见 assets/Skeleton.h）----
+
+// JOINTS_0 的分量读取（UNSIGNED_BYTE / SHORT / UINT 都合法）
+uint32_t readJoint(const AccessorView& v, size_t i) {
+    const uint8_t* p = v.data + i * v.stride;
+    switch (v.compType) {
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+            return *p;
+        case TINYGLTF_COMPONENT_TYPE_SHORT: {
+            int16_t x = 0;
+            std::memcpy(&x, p, 2);
+            return static_cast<uint32_t>(x);
+        }
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: {
+            uint16_t x = 0;
+            std::memcpy(&x, p, 2);
+            return x;
+        }
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT: {
+            uint32_t x = 0;
+            std::memcpy(&x, p, 4);
+            return x;
+        }
+        default:
+            return 0;
+    }
+}
+
+// 读 JOINTS_0 第 i 个元素的第 k 分量（k=0..3）
+uint32_t readJointAt(const AccessorView& v, size_t i, int k) {
+    const uint8_t* p = v.data + i * v.stride;
+    switch (v.compType) {
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+            return p[k];
+        case TINYGLTF_COMPONENT_TYPE_SHORT: {
+            int16_t x = 0;
+            std::memcpy(&x, p + k * 2, 2);
+            return static_cast<uint32_t>(x);
+        }
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: {
+            uint16_t x = 0;
+            std::memcpy(&x, p + k * 2, 2);
+            return x;
+        }
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT: {
+            uint32_t x = 0;
+            std::memcpy(&x, p + k * 4, 4);
+            return x;
+        }
+        default:
+            return 0;
+    }
+}
+
+glm::vec4 readVec4(const AccessorView& v, size_t i) {
+    const uint8_t* p = v.data + i * v.stride;
+    if (v.compType == TINYGLTF_COMPONENT_TYPE_FLOAT)
+        return {readFloat(p), readFloat(p + 4), readFloat(p + 8),
+                readFloat(p + 12)};
+    // 归一化小整型（规范化 accessor）极少见于 WEIGHTS_0，防御性支持
+    float c[4] = {0, 0, 0, 0};
+    for (int k = 0; k < v.comps && k < 4; ++k) {
+        switch (v.compType) {
+            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+                c[k] = p[k] / 255.0f;
+                break;
+            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: {
+                uint16_t x = 0;
+                std::memcpy(&x, p + k * 2, 2);
+                c[k] = x / 65535.0f;
+                break;
+            }
+        }
+    }
+    return {c[0], c[1], c[2], c[3]};
+}
+
+// glTF skin → 引擎 Skeleton（不含动画；动画单独 parseAnimations）。
+// meshNodeWorld：蒙皮 mesh 节点的世界矩阵 —— 蒙皮公式要把关节换到
+// mesh 节点空间（invMeshNode），这样 push.model 可以原样乘上去，
+// 渲染代码无需感知节点树。
+std::shared_ptr<Skeleton> parseSkeleton(const tinygltf::Model& gm,
+                                        int skinIdx,
+                                        const glm::mat4& meshNodeWorld) {
+    if (skinIdx < 0 || skinIdx >= static_cast<int>(gm.skins.size()))
+        return nullptr;
+    const auto& skin = gm.skins[skinIdx];
+
+    auto sk = std::make_shared<Skeleton>();
+    const int n = static_cast<int>(skin.joints.size());
+    sk->joints.resize(n);
+
+    // node 下标 → joint 下标
+    for (int j = 0; j < n; ++j)
+        sk->nodeMap[skin.joints[j]] = j;
+    auto isJoint = [&](int node) {
+        return sk->nodeMap.find(node) != sk->nodeMap.end();
+    };
+
+    // 父链查找表：node → 其在场景里的父 node（buildParentMap 一次）
+    std::unordered_map<int, int> parentOf;
+    std::function<void(int, int)> walkParents = [&](int node, int parent) {
+        parentOf[node] = parent;
+        if (node >= 0 && node < static_cast<int>(gm.nodes.size()))
+            for (int c : gm.nodes[node].children) walkParents(c, node);
+    };
+    if (gm.defaultScene >= 0 &&
+        gm.defaultScene < static_cast<int>(gm.scenes.size())) {
+        for (int r : gm.scenes[gm.defaultScene].nodes) walkParents(r, -1);
+    } else {
+        for (size_t r = 0; r < gm.nodes.size(); ++r) walkParents((int)r, -1);
+    }
+
+    // 场景根 → node 的静止世界矩阵（供 externalChain 用）
+    std::unordered_map<int, glm::mat4> nodeWorld;
+    std::function<glm::mat4(int)> worldOf = [&](int node) -> glm::mat4 {
+        auto it = nodeWorld.find(node);
+        if (it != nodeWorld.end()) return it->second;
+        const glm::mat4 local =
+            node < 0 || node >= static_cast<int>(gm.nodes.size())
+                ? glm::mat4(1.0f)
+                : nodeLocalMatrix(gm.nodes[node]);
+        const glm::mat4 w = parentOf.count(node) && parentOf[node] >= 0
+                                ? worldOf(parentOf[node]) * local
+                                : local;
+        nodeWorld[node] = w;
+        return w;
+    };
+
+    for (int j = 0; j < n; ++j) {
+        const int node = skin.joints[j];
+        auto& J = sk->joints[j];
+        if (node >= 0 && node < static_cast<int>(gm.nodes.size())) {
+            J.name = gm.nodes[node].name;
+            J.restLocal = nodeLocalMatrix(gm.nodes[node]);
+        }
+        const int p = parentOf.count(node) ? parentOf[node] : -1;
+        if (p >= 0 && isJoint(p)) {
+            J.parent = sk->nodeMap[p];
+        } else {
+            // 骨架外的祖先链（armature 节点等）整体作为 externalChain
+            J.parent = -1;
+            J.externalChain = p >= 0 ? worldOf(p) : glm::mat4(1.0f);
+        }
+    }
+
+    // inverseBindMatrices：MAT4 float accessor
+    if (skin.inverseBindMatrices >= 0) {
+        AccessorView v;
+        if (accessorView(gm, skin.inverseBindMatrices, v)) {
+            const size_t cnt = std::min(v.count, static_cast<size_t>(n));
+            for (size_t j = 0; j < cnt; ++j) {
+                const uint8_t* p = v.data + j * v.stride;
+                glm::mat4 m(1.0f);
+                // glTF 列主序 = glm 内存布局，直接拷
+                std::memcpy(&m, p, sizeof(glm::mat4));
+                sk->joints[j].invBind = m;
+            }
+        }
+    }
+
+    // 拓扑序：保证 sample 时 parent 先于 child 被处理
+    sk->topoOrder.clear();
+    sk->topoOrder.reserve(n);
+    std::vector<bool> done(n, false);
+    for (int pass = 0; pass < n; ++pass) {
+        bool progressed = false;
+        for (int j = 0; j < n; ++j) {
+            if (done[j]) continue;
+            if (sk->joints[j].parent < 0 || done[sk->joints[j].parent]) {
+                done[j] = true;
+                sk->topoOrder.push_back(j);
+                progressed = true;
+            }
+        }
+        if (!progressed) break;   // 环（异常数据），剩下的按原序兜底
+    }
+    for (int j = 0; j < n; ++j)
+        if (!done[j]) sk->topoOrder.push_back(j);
+
+    sk->invMeshNode = glm::inverse(meshNodeWorld);
+    return sk;
+}
+
+// glTF animations → Skeleton::clips（轨道按 node→joint 映射）
+void parseAnimations(const tinygltf::Model& gm, Skeleton& sk) {
+    for (const auto& ganim : gm.animations) {
+        AnimationClip clip;
+        clip.name = ganim.name.empty() ? ("clip" + std::to_string(sk.clips.size()))
+                                       : ganim.name;
+        for (const auto& ch : ganim.channels) {
+            const int joint = sk.nodeToJoint(ch.target_node);
+            if (joint < 0) continue;   // 非骨架节点（网格/object 层动画）
+            if (ch.sampler < 0 ||
+                ch.sampler >= static_cast<int>(ganim.samplers.size()))
+                continue;
+            const auto& gs = ganim.samplers[ch.sampler];
+
+            AnimTrack t;
+            t.joint = joint;
+            if (ch.target_path == "translation")
+                t.path = AnimTrack::Translation;
+            else if (ch.target_path == "rotation")
+                t.path = AnimTrack::Rotation;
+            else if (ch.target_path == "scale")
+                t.path = AnimTrack::Scale;
+            else
+                continue;   // weights（形变动画）暂不支持
+
+            AccessorView tin, tout;
+            if (!accessorView(gm, gs.input, tin)) continue;
+            if (!accessorView(gm, gs.output, tout)) continue;
+            t.times.resize(tin.count);
+            for (size_t i = 0; i < tin.count; ++i)
+                t.times[i] = readFloat(tin.data + i * tin.stride);
+            t.values.resize(tout.count);
+            for (size_t i = 0; i < tout.count; ++i)
+                t.values[i] = readVec4(tout, i);
+            t.step = (gs.interpolation == "STEP");
+            // CUBICSPLINE 的输出是 3 倍密度（in/out tangent），本引擎
+            // 的角色只出 LINEAR/STEP；遇到三次样条按线性近似。
+            if (gs.interpolation == "CUBICSPLINE" && tout.count == tin.count * 3) {
+                std::vector<glm::vec4> simplified(tin.count);
+                for (size_t i = 0; i < tin.count; ++i)
+                    simplified[i] = t.values[i * 3 + 1];   // 取节点值段
+                t.values = std::move(simplified);
+            }
+
+            if (!t.times.empty())
+                clip.duration = std::max(clip.duration, t.times.back());
+            clip.tracks.push_back(std::move(t));
+        }
+        if (!clip.tracks.empty()) sk.clips.push_back(std::move(clip));
+    }
+}
+
 } // namespace
 
 std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
@@ -445,6 +681,12 @@ std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
 
     glm::vec3 bmin(1e30f), bmax(-1e30f);
 
+    // 第一个带 skin 的 mesh 节点的世界矩阵（含 Y-up→Z-up 根旋转），
+    // 供 parseSkeleton 计算 invMeshNode 用。
+    glm::mat4 skinnedMeshWorld(1.0f);
+    int skinnedSkinIdx = -1;
+    bool foundSkin = false;
+
     std::function<void(int, const glm::mat4&, int)> walk =
         [&](int nodeIdx, const glm::mat4& parent, int depth) {
             if (nodeIdx < 0 || nodeIdx >= static_cast<int>(gm.nodes.size()))
@@ -459,6 +701,13 @@ std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
             if (node.mesh >= 0 &&
                 node.mesh < static_cast<int>(gm.meshes.size())) {
                 const auto& gmesh = gm.meshes[node.mesh];
+
+                // 记录蒙皮 mesh 节点（骨架挂在第一个带 skin 的节点上）
+                if (!foundSkin && node.skin >= 0) {
+                    foundSkin = true;
+                    skinnedMeshWorld = world;
+                    skinnedSkinIdx = node.skin;
+                }
 
                 for (size_t p = 0; p < gmesh.primitives.size(); ++p) {
                     const auto& prim = gmesh.primitives[p];
@@ -501,6 +750,31 @@ std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
                             verts[i].uv = readVec2(aUv, i);
                     }
                     // TANGENT 故意忽略：着色器用屏幕空间导数构造 TBN
+
+                    // ---- 蒙皮：JOINTS_0 / WEIGHTS_0 ----
+                    // 只有这个 primitive 属于带 skin 的 mesh 时才读。
+                    // JOINTS_0 存的是 glTF skin 里的 joint 下标（0..N-1），
+                    // 与 Skeleton::joints 对齐；渲染时加 PushConstants 的
+                    // jointBase 定位到 SSBO。权重和 > 0 才走蒙皮分支。
+                    if (node.skin >= 0) {
+                        auto itJ = prim.attributes.find("JOINTS_0");
+                        auto itW = prim.attributes.find("WEIGHTS_0");
+                        AccessorView aJ, aW;
+                        const bool hasJ = itJ != prim.attributes.end() &&
+                                          accessorView(gm, itJ->second, aJ);
+                        const bool hasW = itW != prim.attributes.end() &&
+                                          accessorView(gm, itW->second, aW);
+                        if (hasJ && hasW) {
+                            for (size_t i = 0; i < aPos.count; ++i) {
+                                verts[i].joints = glm::uvec4(
+                                    readJointAt(aJ, i, 0),
+                                    aJ.comps > 1 ? readJointAt(aJ, i, 1) : 0,
+                                    aJ.comps > 2 ? readJointAt(aJ, i, 2) : 0,
+                                    aJ.comps > 3 ? readJointAt(aJ, i, 3) : 0);
+                                verts[i].weights = readVec4(aW, i);
+                            }
+                        }
+                    }
 
                     for (const auto& v : verts) {
                         bmin = glm::min(bmin, v.pos);
@@ -584,6 +858,17 @@ std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
             walk(static_cast<int>(n), kYupToZup, 0);
     }
 
+    // ---- 蒙皮骨架 + 动画 ----
+    if (foundSkin) {
+        model->skeleton = parseSkeleton(gm, skinnedSkinIdx, skinnedMeshWorld);
+        if (model->skeleton) {
+            parseAnimations(gm, *model->skeleton);
+            VK_LOG_INFO("glTF: skinned model, %d joints, %d clips",
+                        model->skeleton->jointCount(),
+                        static_cast<int>(model->skeleton->clips.size()));
+        }
+    }
+
     if (bmin.x <= bmax.x) {
         model->center = (bmin + bmax) * 0.5f;
         model->radius = glm::length(bmax - bmin) * 0.5f;
@@ -603,6 +888,19 @@ Model* AssetManager::loadGLTF(const std::string& path,
 
     auto model = loadGLTFModel(*m_ctx.device, *m_ctx.cmdPool, m_ctx, *this,
                                path, key);
+    Model* raw = model.get();
+    m_models[key] = std::move(model);
+    return raw;
+}
+
+Model* AssetManager::loadFBX(const std::string& path,
+                             const std::string& name) {
+    const std::string key = name.empty() ? path : name;
+    auto it = m_models.find(key);
+    if (it != m_models.end()) return it->second.get();
+
+    auto model = loadFBXModel(*m_ctx.device, *m_ctx.cmdPool, m_ctx, *this,
+                              path, key);
     Model* raw = model.get();
     m_models[key] = std::move(model);
     return raw;

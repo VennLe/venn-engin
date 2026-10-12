@@ -327,6 +327,12 @@ json meshSourceToJson(const assets::Mesh* mesh) {
             j["modelKey"] = s.name;  // GLTF 下 MeshSource.name 存模型键
             j["subMeshIndex"] = s.subMeshIndex;
             return j;
+        case assets::MeshSource::Kind::FBX:
+            j["kind"] = "fbx";
+            j["path"] = s.path;
+            j["modelKey"] = s.name;  // FBX 下 MeshSource.name 存模型键
+            j["subMeshIndex"] = s.subMeshIndex;
+            return j;
         default:
             // Unknown：没有来源信息就无法重建，调用方会计入 skipped
             return nullptr;
@@ -388,6 +394,27 @@ assets::Mesh* resolveMesh(assets::AssetManager& am, const json& jm) {
         return nullptr;
     }
 
+    if (kind == "fbx") {
+        const std::string path = jm.value("path", std::string());
+        if (path.empty()) return nullptr;
+        const std::string modelKey = jm.value("modelKey", path);
+        const int sub = jm.value("subMeshIndex", -1);
+        try {
+            assets::Model* model =
+                am.loadFBX(assets::resolveAssetPath(path), modelKey);
+            if (model && sub >= 0 &&
+                sub < static_cast<int>(model->subMeshes.size())) {
+                return model->subMeshes[static_cast<size_t>(sub)].mesh;
+            }
+            VK_LOG_WARN("SceneSerializer: FBX submesh %d out of range (%s)", sub,
+                        path.c_str());
+        } catch (const std::exception& ex) {
+            VK_LOG_WARN("SceneSerializer: FBX load failed (%s): %s",
+                        path.c_str(), ex.what());
+        }
+        return nullptr;
+    }
+
     return nullptr;
 }
 
@@ -407,11 +434,16 @@ json cameraToJson(const Camera& cam) {
 
 void applyCamera(Camera& cam, const json& jc) {
     if (!jc.is_object()) return;
-    cam.setTarget(vec3FromJson(
-        jc.contains("target") ? jc["target"] : json(nullptr), cam.target()));
+    // ⚠ 顺序有讲究：编辑器相机是**飞行模式**（applyEditorCameraMode），
+    //   yaw/pitch/distance 的 setter 都会从"当前 target"反推相机位置；
+    //   如果先设 target，后面三个 setter 一同步 target 就被旧位置盖掉 ——
+    //   表现为"场景 JSON 里的相机没生效，画面看向莫名其妙的地方"。
+    //   target 必须**最后**设（把相机精确钉到 target + dir*distance）。
     cam.setYaw(jc.value("yaw", cam.yaw()));
     cam.setPitch(jc.value("pitch", cam.pitch()));
     cam.setDistance(jc.value("distance", cam.distance()));
+    cam.setTarget(vec3FromJson(
+        jc.contains("target") ? jc["target"] : json(nullptr), cam.target()));
     cam.setFov(jc.value("fov", cam.fov()));
 }
 
@@ -445,6 +477,7 @@ json pointLightToJson(const ecs::PointLightComponent& L) {
         {"intensity", L.intensity},
         {"range", L.range},
         {"enabled", L.enabled},
+        {"castsShadow", L.castsShadow},
     };
 }
 
@@ -454,6 +487,7 @@ json spotLightToJson(const ecs::SpotLightComponent& L) {
         {"range", L.range},               {"direction", vec3ToJson(L.direction)},
         {"innerAngle", L.innerAngle},     {"outerAngle", L.outerAngle},
         {"enabled", L.enabled},
+        {"castsShadow", L.castsShadow},
     };
 }
 
@@ -465,6 +499,7 @@ ecs::PointLightComponent pointLightFromJson(const json& j) {
     L.intensity = j.value("intensity", L.intensity);
     L.range = j.value("range", L.range);
     L.enabled = j.value("enabled", L.enabled);
+    L.castsShadow = j.value("castsShadow", L.castsShadow);
     return L;
 }
 
@@ -480,6 +515,7 @@ ecs::SpotLightComponent spotLightFromJson(const json& j) {
     L.innerAngle = j.value("innerAngle", L.innerAngle);
     L.outerAngle = j.value("outerAngle", L.outerAngle);
     L.enabled = j.value("enabled", L.enabled);
+    L.castsShadow = j.value("castsShadow", L.castsShadow);
     return L;
 }
 
@@ -524,6 +560,7 @@ json collisionToJson(const ecs::CollisionComponent& c) {
     j["capsuleRadius"] = c.capsuleRadius;
     j["capsuleHalfHeight"] = c.capsuleHalfHeight;
     j["solid"] = c.solid;
+    j["showWireframe"] = c.showWireframe;
     return j;
 }
 
@@ -544,6 +581,7 @@ ecs::CollisionComponent collisionFromJson(const json& j) {
     c.capsuleRadius = j.value("capsuleRadius", c.capsuleRadius);
     c.capsuleHalfHeight = j.value("capsuleHalfHeight", c.capsuleHalfHeight);
     c.solid = j.value("solid", true);
+    c.showWireframe = j.value("showWireframe", true);
     return c;
 }
 
@@ -637,6 +675,24 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
                 {"timeScale", sc->timeScale},
             };
         }
+
+        // 玩家（walkPhase/bodyYaw/started 是运行态派生值，不存）
+        if (const auto* pc = w.get<ecs::PlayerComponent>(it.entity)) {
+            je["player"] = json{
+                {"mode", pc->mode == ecs::PlayerMode::ThirdPerson
+                             ? "third"
+                             : "first"},
+                {"eyeHeight", pc->eyeHeight},
+                {"moveSpeed", pc->moveSpeed},
+                {"lookSpeed", pc->lookSpeed},
+                {"yaw", pc->yaw},
+                {"pitch", pc->pitch},
+                {"camDistance", pc->camDistance},
+                {"turnSpeed", pc->turnSpeed},
+            };
+        }
+        if (const auto* limb = w.get<ecs::PlayerLimbComponent>(it.entity))
+            je["playerLimb"] = limb->kind;
 
         if (je["mesh"].is_null()) ++r.skipped;  // 无网格不算失败，只是没内容
 
@@ -797,6 +853,34 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 else
                     w.add<ecs::ScriptComponent>(e, sc);
             }
+        }
+
+        // 玩家 / 肢体标记
+        if (je.contains("player") && je["player"].is_object()) {
+            const json& jp = je["player"];
+            ecs::PlayerComponent pc;
+            pc.mode = (jp.value("mode", std::string("first")) == "third")
+                          ? ecs::PlayerMode::ThirdPerson
+                          : ecs::PlayerMode::FirstPerson;
+            pc.eyeHeight = jp.value("eyeHeight", pc.eyeHeight);
+            pc.moveSpeed = jp.value("moveSpeed", pc.moveSpeed);
+            pc.lookSpeed = jp.value("lookSpeed", pc.lookSpeed);
+            pc.yaw = jp.value("yaw", pc.yaw);
+            pc.pitch = jp.value("pitch", pc.pitch);
+            pc.camDistance = jp.value("camDistance", pc.camDistance);
+            pc.turnSpeed = jp.value("turnSpeed", pc.turnSpeed);
+            if (auto* p = w.get<ecs::PlayerComponent>(e))
+                *p = pc;
+            else
+                w.add<ecs::PlayerComponent>(e, pc);
+        }
+        if (je.contains("playerLimb") && je["playerLimb"].is_number_integer()) {
+            ecs::PlayerLimbComponent limb;
+            limb.kind = je["playerLimb"].get<int>();
+            if (auto* p = w.get<ecs::PlayerLimbComponent>(e))
+                p->kind = limb.kind;
+            else
+                w.add<ecs::PlayerLimbComponent>(e, limb);
         }
 
         // 碰撞体。position/rotation/scale 从文件读；**凸包顶点按网格重建**

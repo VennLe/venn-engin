@@ -51,7 +51,24 @@ Sandbox 已删，游戏直接在编辑器视口里跑。
 `MYVK_GRID=0`(关视口地平面栅格；默认开) /
 `MYVK_CONTENT_DIR=assets/models`(Content 面板初次打开进哪个目录，默认 assets) /
 `MYVK_LOG_RECTS=1`(打印关键控件矩形，给自动化脚本定位用；见"工具") /
-`MYVK_SHADOW_DBG=1`(每帧打阴影 casters/center/radius/lightDir；排查地面暗区/阴影异常第一步) /
+`MYVK_SHADOW_DBG=1`(打 `SHADOW-DBG`：级联数/最大距离/λ/四级分割点/bias/开关，
+`SHADOW-STATS`：每级"提交/考虑"，以及局部光源的 `LOCAL-SHADOW-DBG`
+（候选数/分配数/用掉的层数/maxLights）与 `LOCAL-SHADOW-STATS`（层数/用掉/提交/考虑）
+——排查阴影异常第一步) /
+`MYVK_SHADOW=0`(关掉**方向光**阴影；深度图照常渲染，开关只在片元里) /
+`MYVK_SHADOW_CASCADES=1..4`(**1 = 退回旧单张正交图**，对照实验用) /
+`MYVK_SHADOW_DIST=米`(最远阴影距离 = 距离分级的硬边界，会自动夹到相机远平面以内) /
+`MYVK_SHADOW_LAMBDA=0..1`(级联分割 log/uniform 混合系数，默认 0.6) /
+`MYVK_SHADOW_RES=像素`(每级分辨率，默认 2048) /
+`MYVK_LOCAL_SHADOW=0`(关掉**点光/聚光灯**阴影；深度图照常渲染，开关只在片元里。
+与 `MYVK_LOCAL_SHADOW_LIGHTS=0` **逐像素等价** —— 两条独立路径，验证脚本会断言这一点) /
+`MYVK_LOCAL_SHADOW_LIGHTS=n`(本帧最多几盏灯投；**0 = 一盏都不分配**。灯按到相机的距离
+由近到远排，预算用完就轮不到远处的) /
+`MYVK_LOCAL_SHADOW_RES=像素`(每层分辨率，默认 1024；改它要重建资源，只在 init 读) /
+`MYVK_LOCAL_SHADOW_BIAS=a,b,c`(常数偏移**米** / 斜率偏移**米** / PCF 半径纹素，
+默认 `0.030,0.150,1.2`) /
+`MYVK_EDITOR_NO_HUD=1`(视口叠加层全关；**做视口像素断言前必开** ——
+里面的 FPS/帧时间每次运行都不同，会让"同配置两次逐像素相同"永远失败) /
 **编辑器自动化钩子（2026-10-09 新增，只在设了变量时生效）**：
 `MYVK_EDITOR_SCENE=<路径>`(启动即打开该场景而非空场景) /
 `MYVK_EDITOR_SELECT=<名字>`(启动后按名字选中实体，让手柄/检查器有内容) /
@@ -60,32 +77,92 @@ Sandbox 已删，游戏直接在编辑器视口里跑。
 `MYVK_EDITOR_CAM="x,y,z,yawDeg,pitchDeg"`(把视口相机摆到指定位姿 —— 截图/交互测试用。
 **必须排在 `MYVK_EDITOR_SCENE` 之后**，见坑点 #53) /
 `MYVK_MSAA / LIGHTS / CLUSTER_CULL=0 / DEPTH_PREPASS=0 / LIGHT_GIZMOS=0 / TILE_SIZE /
-CLUSTER_SLICES / MAX_LIGHTS_PER_CLUSTER / CLUSTER_STATS=1`。
+CLUSTER_SLICES / MAX_LIGHTS_PER_CLUSTER / CLUSTER_STATS=1` /
+`MYVK_EDITOR_NO_HUD=1`(2026-10-12：关掉视口里全部 2D 叠加层 → 纯 3D 出图。
+**做视口像素断言时必须设** —— 统计文字里的 FPS/帧时间每次都不同) /
+`MYVK_SKY / IBL / SKY_ZENITH / SKY_GROUND / ENV_DBG=1`(见"天空盒 + 真 IBL"节)。
 
 ## 渲染管线约定（改动前必读）
-Pass 顺序：`ShadowPass → DepthPrePass(独立 RP) → ClusterBuild(compute) → Forward(MSAA resolve，
-深度 LOAD) → PostProcess(Bloom+Tonemap) → 交换链`。**compute 不能在 RP 内部执行** → 深度预通道必须
+Pass 顺序：`ShadowPass(4 级级联，每级一次独立 depth-only RP) →
+LocalShadowPass(点光/聚光，12 层 2D array，每层一次独立 depth-only RP；未用的层也只清) →
+DepthPrePass(独立 RP) →
+ClusterBuild(compute) → Forward(天空盒 → MSAA resolve，深度 LOAD) →
+PostProcess(Bloom+Tonemap) → 交换链`。**compute 不能在 RP 内部执行** → 深度预通道必须
 独立成 RP；该 RP **无条件执行**（只把"画几何"包进开关），否则前向 RP 的 `LOAD` 深度未定义、画面废。
 - **Forward 内部子顺序**：`不透明 → 地平面栅格 → 透明`。栅格夹在中间是**刻意的**：吃深度测试
   （墙/柱子/箱子能正确挡住它）+ 不写深度（玻璃能叠在它上面）+ 排在透明之前。
   它**绝不能**做成 ImGui 叠加层 —— ImGui 永远压在 3D 之上，栅格会穿透一切。
-- **阴影（方向光，`ShadowPass`）三条硬约定**（2026-10-10 补齐，之前全是 bug）：
+- **阴影（方向光 CSM，`ShadowPass`）四条硬约定**（2026-10-12 改为级联后重写）：
   1. **投影矩阵必须是 Zero-to-One**：`glm::orthoRH_ZO`（不是 `glm::ortho`）。Vulkan 的 clip z 是
      [0,1]，GL 约定的 [-1,1] 会让"写入阴影图的深度"和 `pbr.frag` 采样时算的参考深度不在同一空间
      → 覆盖区内一切表面被判成阴影（屏幕上一块边界笔直的暗四边形）。
      对应地 `pbr.frag::shadowFactor` **只对 xy** 做 `*0.5+0.5`，z 直接用。
-  2. **正交范围用"投影物体的世界 AABB"**（`Mesh::boundsMin/Max` 8 角过世界矩阵，
-     `forEachShadowCaster` 遍历），**不能用实体原点**——原点会把包围盒退化成 1 个点（radius 只剩
-     2m），阴影贴图只覆盖原点周围一小块，屏幕上就是一块方形边界。无投影物体时以
-     `camera().target()` 为中心给 25m 兜底。
+  2. **每级正交范围 = "该级视锥切片的包围球"**（`invViewProj` 反投影 8 个角点求球），
+     **不再是"投影物体的世界 AABB"**（那条是单张图时代的写法，已作废）。
+     用**球**而不是**盒**：球半径与光方向无关（盒会随方向变 → 光一转阴影边缘就"呼吸"）。
+     球心还要在**光空间量化到纹素网格**（把差量补回 `view[3][0/1]`），否则相机平移时边缘整片闪。
+     正交的**近平面取 0**（深度线性），靠 `kDepthPadding = 25m` 的外扩保证
+     "光源到切片之间的遮挡体都进深度图"。退化时给 `radius` 一个 0.05 的下限（免得除零）。
   3. **"只接收不投射"的物体必须 `VisibilityComponent::castShadow=false`**（自带地面就是），
-     否则 120×120 地板会把正交范围撑到 ±85m（深度精度全浪费）+ 地板自投影 acne。
+     否则 300×300 地板会把自己投进每一级 + 自投影 acne。
+  4. **级联分割点用 PSSM practical scheme**：`λ·near·(D/near)^(i/N) + (1-λ)·(near+(D-near)·i/N)`，
+     `D = min(相机远平面, 距离上限)`、λ=0.6。**near/far 必须从 `camera().nearPlane()/farPlane()` 读**，
+     不能写死常量 —— 级联分割、切片角点 NDC 换算、分簇对数切片三处都假设同一组值。
+     D=90/near=0.1 → `9.36 / 19.82 / 36.87 / 90.00`（`tools/verify_csm.py` 会逐项对公式）。
+     级联盒**边缘不淡出**（只在"视深度 > 最大距离"处 `smoothstep` 淡出），否则交界处出现假暗带。
+- **阴影（局部光源：点光 / 聚光灯，`LocalShadowPass`）四条硬约定**（2026-10-12 新增）：
+  1. **近平面按 range 取 `clamp(range/20, 0.1, 2.0)`，不能拍一个小常数**。透视投影的 NDC 深度
+     是**双曲**的，`far/near` 越大，远平面附近两个只差几米的表面在 NDC 上几乎贴在一起。
+     实测 range=32 用 near=0.05 时，"离灯 15m 的遮挡体"与"20m 的地面" **NDC 只差 7.5e-4**
+     → 任何合理的深度偏移都会把阴影整个推没。改 range/20 后同一个场景涨到 **2.8e-2**。
+  2. **深度偏移参数以「米」为单位给，片元里按参考深度换算回 NDC**
+     （`LightShadowRecord.params = (near, far, 光源下标, 有效位)`；
+     `pbr.frag::ndcBiasFromWorld`：`dz/dd = (f − z·(f−n))² / (n·f·(f−n))`）。
+     这是最贵的一个坑：照抄 CSM 的 NDC 常数 `0.0016`，在 range=32/near=0.05 下等于
+     **10 米世界深度** → 聚光灯的阴影一片都不剩（实测 5956 像素差异直接归零）。
+     默认 `(0.030, 0.150, 1.2)` = 常数 3cm / 斜率 15cm / PCF 1.2 纹素。
+     **别给双曲分布的深度配 NDC 常数偏移** —— 那等于在不同距离上配了完全不同的世界偏移。
+  3. **未使用的层每帧也要走一次空的 depth-only pass（只清深度）**。整张 array 是被采样器
+     一起绑定的，留一层停在 UNDEFINED → 验证层直接报 IMAGE_LAYOUT。空清是"快清"，
+     比按需重建 image / 维护 per-frame 布局状态机便宜得多。
+  4. **层分配：按到相机的距离**平方**由近到远贪心，预算不够就整体停在那一盏之前**，
+     不跳过它去找下一盏（那样"哪盏灯有影子"会随相机移动乱跳）。点光 6 层、聚光 1 层，
+     `kMaxLocalShadowLayers = 12`；分配结果写回 `LightInstance::cosOuterType.z`（基准层号）。
+     点光的实际层号 = 基准层号 + `vennCubeFaceIndex(片元方向 − 灯位置)`。
+  光栅化阶段的 `depthBias` 对浮点深度几乎为 0（`r ≈ 2⁻²³`，常数 1.4 → 1.7e-7 NDC）；
+  真正的偏移在片元侧。CSM 那一路也一样。
+- **`ShadowPass` / `LocalShadowPass` 共用 `assets/shaders/shadow.vert`**：靠
+  `ShadowPushConstants.which.y` 选矩阵来源（0 → `FrameUBO.lightSpace[x]`，
+  1 → set0/binding11 的 `lightShadow.records[x].matrix`）。**矩阵只有一份副本**：
+  渲染深度图与 `pbr.frag` 采样读的是同一块 buffer，不可能不一致。
+- `engine/render/ShadowCull.h::visibleInLightClip` 是两套阴影共用的局部 AABB 剔除：
+  正交/透通用（对 `w ≤ 0` 直接放弃剔除），取代了 `ShadowPass.cpp` 里那份假设 w≡1 的旧版。
+- **`ShadowPass` 的推常量是 `ShadowPushConstants`（96B），不是主前向的 `PushConstants`（128B）**：
+  128B 恰好是 Vulkan 保证的下限，塞不下级联索引。两者不同是**合法**的，唯一理由是
+  该 Pass 在**自己的 render pass 内自行绑定 set 0**（绑定时与绘制时同一个管线布局对象）。
+  ⚠ **绝不要把这个 Pass 的绘制搬进前向 Pass 的 render pass**，否则立刻 VUID-08600。
+- **array 深度图的渲染**：framebuffer / `imageStore` **不能挂 array 视图做单层渲染**
+  （那就变成 layered rendering，需要 multiview / `gl_Layer`）。每层单独建一个
+  `VIEW_TYPE_2D` 视图 + framebuffer，采样侧才用 `sampler2DArrayShadow` 一次选层。
 - **缺省贴图的色彩空间**：`Renderer::createDefaultTextures()` 的白色（ORM）与平坦法线
   **必须 `makeSolid(..., srgb=false)`**（UNORM）。建成 SRGB 会被硬件 gamma 解码：平坦法线
   (128,128,255) → (0.216,0.216,1.0) → `nSample=(-0.568,-0.568,1.0)`，即"平坦法线"被整体扳了约 39°，
   大面片上 TBN 一退化就整块变色（又是一条硬边）。颜色贴图（albedo/emissive）才 SRGB。
-- 描述符 **set 0**：0 FrameUBO / 1 shadowMap / 2 lights / 3 clusters / 4 lightIndices / 5 clusterStats
-  （灯数据全挤进 set 0：Vulkan 只保证 4 个 set 同时绑定）。set 1/2/3 = albedo/normal/ORM。
+- 描述符 **set 0（共 13 个 binding）**：0 FrameUBO / 1 shadowMap
+  （2026-10-12 起是 **`sampler2DArrayShadow`**，第 i 层 = 第 i 级级联）/ 2 lights /
+  3 clusters / 4 lightIndices / 5 clusterStats / 6 jointMatrices / 7 irradianceMap /
+  8 prefilterMap / 9 brdfLut / 10 skyMap /
+  **11 lightShadows（`LightShadowRecord[]` SSBO，逐层的局部光源矩阵，
+  VERTEX|FRAGMENT 两阶段）/ 12 localShadowMap（`sampler2DArrayShadow`，
+  第 i 层 = 第 i 个局部阴影层）**
+  （灯与环境资源全挤进 set 0：Vulkan 只保证 4 个 set 同时绑定，set 1..6 已被六张贴图占满）。
+  `Renderer::kGlobalSetBindings = 13`；7..10、12 是 COMBINED_IMAGE_SAMPLER + FRAGMENT 阶段。
+- **`FrameUBO` 640 字节**（std140）。2026-10-12 加 IBL 的 `vec4 envParams`（384B），
+  再加 CSM 的 `mat4 lightSpace[4]` + `shadowParams`(576) / `cascadeSplits`(592) /
+  `shadowBias`(608)，最后加局部光源的 `localShadowParams`(624) → **640B**
+  （x=常数偏移**米** y=斜率偏移**米** z=PCF 半径 w=总开关）。
+  ⚠ 改 `FrameUBO` 必须同步**所有**声明它的着色器：`pbr.vert`、`pbr.frag`、`sky.vert`、
+  `cluster_build.comp`、`shadow.vert`（后两个只声明前缀，无害但必须一致）。
 - compute 管线复用 `m_globalSetLayout` → dispatch 必须绑 `frame.globalUBOSet`。
 - 推常量 **112B**：`mat4 model + vec4 baseColor + vec4 pbr(metal/rough/normalScale/ao) + vec4 emissive`
   （`render::PushConstants`；栅格另有 48B 的 `GridPushConstants`）；顶点 `pos3+normal3+uv2` stride 32。
@@ -109,6 +186,109 @@ Pass 顺序：`ShadowPass → DepthPrePass(独立 RP) → ClusterBuild(compute) 
 - 射灯只按 range 球剔除（锥角在片元算）；衰减用窗口化平方反比 `win²/d²`，range 处严格归零。
 - 透明（Blend）不写深度、按相机距离**降序**排序、**不参与深度预通道**。
 - 遥测 `stats` SSBO：0 单簇最大 / 1 溢出簇数 / 2 配对数 / 3 空簇数（`beginFrame` 回读并清零）。
+
+## 渲染性能三件套（物体级视锥剔除 / BVH / LOD，2026-10-11）
+- **视锥剔除**：`engine/render/Frustum.h/.cpp`（Gribb–Hartmann；本工程 NDC z∈[-1,1]，
+  近平面 `r3+r2`）。`uploadSceneState` 按**本场景**相机重建 `m_sceneFrustum`，
+  `buildDrawLists` 用它筛世界 AABB。开关 `frustumCullingEnabled()` / `MYVK_FRUSTUM_CULL=0`
+  （关掉=全量提交，是"开关两次画面逐像素一致"的对照组）。
+- **BVH**：`engine/scene/Bvh.h/.cpp`。`Scene::spatialIndex()` 每帧一次：实体集合（含**顺序**）
+  变了 → `build`，否则 `refit`。渲染剔除与编辑器射线拾取**共用同一棵**（拾取 O(log N)）。
+  ⚠ `query` 的叶子必须**逐元素复测**（叶子盒是成员的**并集**，并集相交 ≠ 每个成员相交）；
+  `refit` 倒序遍历依赖"父下标恒小于子下标"；`buildRange` **只能重排 order 下标表，不能动
+  items**（否则 refit 会把叶子拟合到别的实体上 → 第二帧起漏画）。自检 `MYVK_BVH_DBG=1`
+  打 `BVH-DBG brute= bvh= missing= extra=`，`missing>0` 就是会漏画的硬错误。
+- **LOD**：`engine/assets/Lod.h/.cpp` + `AssetManager::ensureLod`（`Application::run` 每帧对
+  当前场景的可见网格调一次，惰性幂等，不给内容浏览器里的临时网格白建层级）。
+  `switchRatio[i]` = **进入第 i 级**的比值上界（区间 `[switchRatio[i+1], switchRatio[i])`，
+  默认 {1.0, 0.25, 0.10, 0.04}，迟滞 1.15）。比值 = `AABB半对角线 / (距离 × tan(fovY/2))`。
+  `selectLevel(ratio, bias, current)` 里 **bias 是除**（bias>1 → 更快落低模）；`current<0`
+  时**从高模往下退**，不能写成"返回第一个满足 r<阈值的层"。
+  生成：程序化图元按细分逐级减半重生成；导入网格走顶点聚类（位置取格内**平均**），
+  格分辨率按"目标=上一级一半三角形"**二分搜索** [2,256]，不能写死。
+  **蒙皮网格不生成**（jointBase 按 `Mesh*` 记，换网格会对不上）。
+  开关 `lodEnabled()/lodBias()/forcedLodLevel()`、env `MYVK_LOD` / `MYVK_LOD_BIAS` /
+  `MYVK_LOD_FORCE`；`MYVK_LOD_DBG=1` → `LOD-BUILD` / `LOD-STATS` / `LOD-SWITCH`。
+
+## 天空盒 + 真 IBL（split-sum，2026-10-12）
+模块：`engine/render/Environment.h/.cpp`（自持 4 张图 + 采样器 + 描述符池 + 4 条 compute 管线）
+\+ 6 个新着色器 `common.glsl` / `sky_cube.comp` / `ibl_irradiance.comp` / `ibl_prefilter.comp` /
+`ibl_brdf.comp` / `sky.vert` / `sky.frag`。`Renderer::createEnvironment()` 在 init 第 9.5 步调用。
+- **天空模型唯一来源是 `vennSkyColor(dir, zenith, ground)`**（在 `common.glsl`，`venn` 前缀全局命名
+  空间的公共库）。梯度**必须用 `dir.z`**（Z-up）—— 用 `dir.y` 会让地面上出现一条笔直的明暗带。
+- **烘焙用 compute 而不是 6 次 render pass**：面号→方向是纯函数 `vennCubeDir(face, uv)`，
+  一趟 dispatch 的 z 维 = 6 就写满，不需要 6 个 framebuffer / render pass。
+- ⚠ **`imageStore` 不能指定 mip** → 预过滤每个 mip 各建一个 `VIEW_TYPE_2D_ARRAY` 视图
+  （`baseMipLevel = m`），逐级写入。
+- **天空立方体 `RGBA32F`、BRDF LUT `RG32F` 是为了 CPU 回读**（免掉半精度转换代码，数值自检
+  直接读 float）。irradiance / prefilter 只要 `RGBA16F`。
+- **天空 pass 排在前向 Pass 最前**（`depthTest/depthWrite` 全关）→ 排到最后会盖掉地平面栅格
+  （栅格也不写深度，像素深度停在 1.0，正好落进"天空该画"的判据里）。
+- **天空/栅格管线的 set 布局 + 推常量范围必须与主前向管线逐字段一致**（见上文 VUID-08600 那条）。
+- split-sum（Karis）：漫反射 = `albedo × irradiance(N)`（卷积时乘了 π，与 Lambert 的 1/π 抵消）；
+  镜面 = `prefilter(R, rough×maxLod) × (F0×A + B)`。
+- **BRDF LUT 有解析解**：`(N·V=1, roughness=0)` 处**精确** `A=1, B=0`
+  （V=N → H=N → G_vis=1、Fc=0）。是全链路唯一能硬断言的检查点。
+- 保留旧的程序化近似路径，用 `FrameUBO.envParams.x` 切换。**这不是备用方案**，是"两条路径
+  必须给出不同画面"的对照实验手段。
+- env：`MYVK_SKY` / `MYVK_IBL`（0/1）、`MYVK_SKY_ZENITH`/`MYVK_SKY_GROUND`（`"r,g,b"`）、
+  各尺寸与样本数（`MYVK_SKY_RES` 等）、`MYVK_ENV_DBG=1` → `ENV-DBG` / `ENV-READBACK`。
+
+## Shader 变体 / 关键字系统（2026-10-12）
+着色器是**离线 glslc 预编译的固定管线**。关键字 = 位集合（掩码 0..7），
+`render/ShaderKeywords.h` 是唯一事实来源；位序在**三处逐字对齐**：
+`ShaderKeywords.cpp` 的 `kKeywords[]` / `CMakeLists.txt` 的 `SHADER_KEYWORDS`
++ `VARIANT_DEFINES_0..7` / `assets/shaders/pbr.frag` 的 `#if`。
+- bit0 `VENN_DOUBLE_SIDED` `double-sided`：改代码（`gl_FrontFacing` 翻法线）+ 改状态（cullMode）
+- bit1 `VENN_ALPHA_BLEND`  `alpha-blend` ：改代码（真 alpha）        + 改状态（混合/不写深度）
+- bit2 `VENN_NORMAL_MAP`   `normal-map`  ：改代码（采样+TBN）        + **不改状态**
+- 变体文件名：`pbr.frag` + 掩码 n → **`pbr.k<n>.frag.spv`**（k0..k7 八份）。
+  实测八份字节数全不同（k0=39644 … k4=42856 … k7=43156，k4 多 3.2KB = 法线+TBN）。
+- **掩码同时推导"编哪份 .spv"与"管线固定状态"**（`VariantPipelines::get` +
+  `applyKeywordState`），结构上杜绝"编译期双面、栅格化还在剔背面"。
+  `stateMask` 过滤：深度预通道只按 `kKeywordDoubleSided` 分（`depth_created=2`）。
+- **队列分类也跟着掩码**（`hasKeyword(kw, kKeywordAlphaBlend)`），不再看 `mat->alphaMode`。
+
+**两条硬约定**
+1. 绑定缓存的"什么都没绑"哨兵**不能用 0**（0 是合法掩码，全关材质就是 0）→
+   `constexpr KeywordMask kBindsNothing = 0xFFFFFFFFu;`。栅格管线之后**必须重置**。
+2. `SHADER-VARIANTS` 自检日志**必须打在前向 Pass 之后**（`variantSwitches` 在
+   Pass 循环里累加；放 `buildDrawLists` 里读永远是刚清零的 0 —— 踩过）。
+
+**⚠ 真 bug（被新脚本揪出）**：`VariantPipelines::layout()` 曾写成
+`get(kKeywordNone).layout()`，"借基线那份用"→ **每次取布局都白建一个 k0 变体**，
+违背"只建用到的"。`FORCE_MASK=0` 时恰好蒙混过关，`=4/=1` 时报 `fwd_created=2`。
+修法：`rhi::PipelineDesc` 加 `sharedLayout`（非空则用、**不拥有不销毁**），
+抽出 `rhi::createPipelineLayout(device, desc)`；`init()` 只建**一份**布局供全体变体复用。
+**变体共用同一 VkPipelineLayout 是正确性要求**（set 0 一整个 Pass 绑一次，
+中途换 layout 不兼容的管线 → 后续 draw 报 `VUID-...-08600`），不是优化。
+
+**`NORMAL_MAP` 等价性**：内置平坦法线是 8 位 `(128,128,255)`，`*2-1` 得
+`(0.00392, 0.00392, 1.0)`（128/255 ≈ 0.50196，**不是**精确 0.5）→
+`FORCE_MASK=0 vs 4` 实测 **最大差 1 个 LSB、>18 的像素 0 个、均值 0.1012、bbox=None**。
+配对断言（防"两边都错"）：挂非平坦棋盘法线图时 **5808 像素 / 最大差 30**（卡 max>20）。
+
+**⚠ `fillForwardPipelineDesc` 里 `desc.fragSpv = readFile("pbr.frag.spv")` 必须删掉**
+—— 单体 `pbr.frag.spv` 已不再生成，留着启动即 `Fatal: Failed to open file`。
+
+## 视口像素断言的纪律（2026-10-12 血的教训）
+- ⚠ **`ViewportPanel::drawOverlay` 会在视口左上角画 FPS / 帧时间**（`1317 FPS 0.76 ms`、
+  `entities N` …），这些数字**每次运行都不同**。同配置跑两次，左上角区 `region_diff` = 2.72，
+  而右上 / 左下 / 中心精确为 0.00 —— 曾让我误判成"IBL 开关污染了背景"，白查一轮。
+  → 自动化跑视口像素断言**必须先 `MYVK_EDITOR_NO_HUD=1`**（`ViewportPanel::setHudVisible(false)`，
+  连统计文字 + 导航 HUD + 左下角导航球一起关掉；只影响 ImGui 覆盖层，不动 3D 场景）。
+- `region_diff` 按 `range(x0,x1,2)` **stride 抽样**：全区域均值 1.11 的区可能算出 4.48。
+  归因前先打印"全区域均值 + 差异像素清单"，别只看一个数。
+- 色调映射会把高光段压平：线性空间 2.1× 的比值差到画面上只剩 1.24×。
+  **别用固定倍数阈值**，改用"逐级落差 > ε"或"单调性"这类判据，对方向性 bug 反而更敏感。
+- **把日志行当"读数表"时，先打印一次 `m.groups()` 再写断言**：多分量日志（`SHADOW-DBG`
+  有 12 个捕获组）手数分组号必错一次 —— 曾把 `enabled` 写成 `group(11)`，拿到的是
+  `bias.w = 0.55`，40 条断言全绿只这一条假红。
+- **"全有 / 全无"的开关测不出"分级"**：要证明"距离分级"，得取一个**落在淡出区间内**的
+  中间阈值（`MYVK_SHADOW_DIST=70` → 差异被削弱但仍在），再配上两端（完整 / 逐像素相同），
+  三个点连起来才是**单调信号**。只测开关两端等于没测分级。
+- **"整体亮度偏移"这类伪信号要用"变化定位"排除**：断言差异**只**落在预期区域
+  （如地面窄带）、且**别的区域平均差 ≈ 0**。只看"画面变了"会把全局偏移也算通过。
 
 ## editor/ 编辑器层约定
 三条铁律：**① 编辑器模式不跑游戏逻辑 ② 渲染目标是 ImGui 子窗口而非全屏 ③ 编辑态与运行态分离**。
@@ -200,7 +380,49 @@ Pass 顺序：`ShadowPass → DepthPrePass(独立 RP) → ClusterBuild(compute) 
 - 脚本：`verify_collider_menu.py`（29 断言）/ `verify_collider_gizmo.py`（51 断言，**三模式各起
   一个进程**——W/E/R 在 flying 时让位，别靠按键切模式）/ `verify_collision_play.py`。
 
+### Player 系统（2026-10-11 新增：第一/第三人称 + 程序化卡通角色）
+- **Shift+A ▸ Player ▸ First/Third-Person Player**（`EditorScene::createPlayer`）。实体 = 玩家"脚"
+  （贴地 root）：`PlayerComponent{mode, eyeHeight=1.7, moveSpeed=3.0, lookSpeed=0.0025, yaw, pitch,
+  camDistance=3.5, turnSpeed=12, walkPhase, bodyYaw, started}`（后三个运行态派生不序列化）；
+  胶囊碰撞体 position=(0,0,0.85) r=0.30 halfHeight=0.55。第三人称 rig：root 下关节节点
+  （`PlayerLimbComponent{Body/Head/ArmL/ArmR/LegL/LegR}`）→ 肢体网格是**子实体**、向下偏移
+  -len/2 → 摆动绕肩/髋而非肢体中点。低面数 cylinder/sphere segments=12 rings=8；
+  配色：躯干蓝/头肤色/眼白/腿深蓝灰。
+- **两种鼠标语义**（对齐市面游戏）：第一人称 yaw/pitch 就是视线；第三人称 yaw/pitch 是
+  **轨道方位/俯仰**（初始 pitch=0.35），角色朝移动方向转身（目标 yaw=atan2 反解 + 最短角差
+  wrap 插值，`rotation.z = -bodyYaw`，Z-up）。walk：`walkPhase += speed*3.2*dt`，
+  `swing=sin*0.65`，ArmL/LegR=+swing 反相 ArmR/LegL，停止按 `1-min(1,10dt)` 衰减归位。
+- **相机驱动**（坑点 #22 不变式的应用）：第一人称 `setTarget(eye+dir); setDistance(1.0)`
+  相机精确落眼睛；第三人称 `setTarget(focus=z+1.2); setDistance(camDistance)` 轨道。
+  `resolveCamera` 加 `ignore` 参数——第一人称"眼睛"在玩家胶囊内，不自推。
+- **输入门控**：`io.MouseDelta` 只在 `viewportHovered()`（ViewportPanel 每帧上报）生效；
+  WASD 用 `ImGui::IsKeyDown` + Shift×2 加速。⚠ **Play 态 W/E/R 手柄快捷键必须
+  `isEditing() && !flying` 守卫**，否则按 W 移动会切手柄模式。
+- 序列化：`player{mode "first"/"third", 7 参数}` + `playerLimb{kind int}`；探针
+  `PLAYER-STATE`（每 30 帧，Play 态）。
+
+### FBX 导入（2026-10-11 新增，ufbx 双文件库）
+- **ufbx_matrix 是 3x4（12 float）**，memcpy 到 glm::mat4 会越界读 → 必须按列显式构造 toGlm。
+- **蒙皮空间约定（核心）**：ufbx 的 `cluster->geometry_to_bone` 是**文件原始空间**（cm/Y-up，
+  不带轴/单位换算），而 `node_to_world` 已换算到引擎空间 —— 两者不可组合。venn 的方案：
+  蒙皮顶点加载时**烘到静止世界空间**（`v' = G2W·v`），`invBind(j) = inv(W_rest(j))`、
+  `invMeshNode = I` → 静止时 jointMat=I，多 submesh 共享骨架严格正确；SubMesh::transform
+  蒙皮时取单位阵，归位 T(-center) 就是 push.model。诊断指标 `FBX skin dbg maxRestErr`。
+- restLocal 用 **node_to_world** 推导（node_to_parent 缺根级轴/单位调整）；动画采样时
+  `ufbx_evaluate_transform` 相对**直接父节点**，父非骨骼要左乘父链静止世界变换。
+- **模型归位**：世界 AABB 中心平移回原点（UE Import 惯例），静态=左乘 T(-center) 到 SubMesh::transform。
+- **资产端坑**：Blender 导出 FBX 声明 Z-up 但数据沿 +Y（为 glTF 设计）→ 模型躺着。
+  导出前把 armature 转 90°X；`bake_space_transform=True` 别用（第三方导入器的经典坑）。
+  改了 assets/models/*.fbx 后必须手动 cp 到 build/bin/assets/models（重链才触发拷贝）。
+- **CharacterWindow**（UE5 Persona 风格 MVP）：独立预览离屏链（`setPreviewScene/previewTextureId`），
+  recordPreview 必须在 **ImGui 之前**；左栏 280px 放三标签；`MYVK_CHARACTER_MODEL=<路径>`
+  打开窗口自动绑模型（自动化钩子）。
+- 验证：`tools/verify_character_window.py`（创建角色→窗口→绑模型→切 Animation 标签→
+  点 clip 播放全链路）。**click() 收客户区坐标**；未激活 ImGui tab 的 logRect 是 (0,0)，
+  要等非退化矩形；首次点击只聚焦 ImGui 窗口，第二次才切标签。
+
 ### Hierarchy 的"文件夹"节点（2026-10-09 新增）
+
 - **显式标记**：`HierarchyComponent::group`（**不要**靠"这个节点没有网格组件"去猜 —— 空节点会被误判）。
   序列化字段 `je["folder"]`；右键 `Mark as Folder` / `Unmark as Folder`；新建走 `uniqueName()`
   保证 `Folder` / `Folder 2` / … 唯一；`duplicateEntity` 要连 `group` 一起复制。
@@ -508,10 +730,24 @@ Mesh/Material/Texture 各带"来源描述"（`*Source`），序列化只写描�
 16. **"编译通过 + 日志无错" ≠ 画面正确**，一定要看截图。
 17. 相机视线要避开柱子（柱子在 (±4,±4)，正对角视线必穿 (4,4)）；默认 editor 相机 distance=12/pitch=0.28
     会从盒外看房间外墙 → 一片暗灰。
-18. `ImGui::BeginDragDropSource()` 默认要求上一个 item 有非零 ID → 无 ID 的 item 必须传
+18. ⚠ **验证脚本里"注入的第一次左键点击会被 Windows 拿去做窗口激活"**，ImGui 收不到
+    → `ImGui::IsMouseClicked(Left)` 那一帧不存在，拾取/拖拽**静默不执行**。
+    症状极具误导性：`verify_bvh` 报"视口正中点不中 Cube_0"、`PICK-DBG` 一行都没有
+    （看起来像 BVH 射线或机位错），其实第一次点击整下丢了；而第二次点击正常。
+    **修法**：注入鼠标操作的用例开头先做一次**预热点击**，并断言预热本身产生了日志。
+    ⚠ 预热用的"对照断言"要改成**计数增量**（如 `pick: nothing hit` 的条数前后对比），
+    否则预热那条日志会让"有没有日志"型判据**恒真**。
+19. `PickingSystem::pick` 的自检日志原本排在 `if (!hit.hit) return best;` **之后**
+    → 没打中时一条日志都不出，"射线没打中"与"自检没跑到"无法区分。自检必须在早退之前；
+    且要**先把 hit 写进 best 再自检**，否则 `same` 恒为 0。
+20. `ImGui::BeginDragDropSource()` 默认要求上一个 item 有非零 ID → 无 ID 的 item 必须传
     `ImGuiDragDropFlags_SourceAllowNullID`，否则 `IM_ASSERT(0)` → 退出码 `0xc0000409`。
-19. **ImGui 每帧把聚焦窗口提到最前** → 想让视口上的 HUD/覆盖层可见，**必须是 viewport 的 child window**
+21. **ImGui 每帧把聚焦窗口提到最前** → 想让视口上的 HUD/覆盖层可见，**必须是 viewport 的 child window**
     （`SetCursorScreenPos` 定位 + 在 `ImGui::End()` 之前画）；独立的顶层窗口会被 3D 图盖住。
+22. **`build/bin/imgui.ini` 会在下次启动覆盖默认面板布局** —— 存档里一个过期的
+    `Pos=1228,336` 能把 Stats 面板整个推出 1258 宽的客户区（截图上只剩行首几个字，
+    看起来像"文字被裁"其实是窗口在屏幕外）。目视确认 UI 时先删掉它让面板回默认位；
+    另外 Stats 面板内容天然宽于 360px，**横向滚动是既有状态**，不算新引入的 bug。
     （旧坑：CreateProcess 的 `bInheritHandles` / 环境块继承 —— 跨进程方案已删除，见 editor/ 一节。）
 20. MinGW 的 `os_defines.h` **已定义 `NOMINMAX`** → 自己再 `#define` 会告警重定义。
 30. **ImGui 的 popup 必须"每帧都被提交"，否则帧末会被直接关掉**：菜单一弹出来就正好
@@ -558,8 +794,15 @@ Mesh/Material/Texture 各带"来源描述"（`*Source`），序列化只写描�
     （`fontScale` 是用户可调的，实测写死 236px 时提示行被裁成半截。）
 22. **`Camera` 飞行模式的 setter 不变式**：`m_target` 与 `m_flyPos` 互为逆运算，任何只改一边的
     接口都会让另一种模式"拖了没反应"。新增接口务必按 `m_fly` 分支（详见"视口相机与导航"）。
-23. **视口工具栏已经很长**：往里加按钮会被挤出右边缘裁掉（实测 `Fullscreen (F)` 变成 `Fulls…`）。
-    再加控件前先想"能不能挪到浮层 / 主工具栏"。
+23. **视口工具栏已经很长**：往里加按钮会被挤出右边缘裁掉（实测 `Fullscreen (F)` 变成 `Fulls…`）。    再加控件前先想"能不能挪到浮层 / 主工具栏"。
+25. **PostProcess 里新增"每帧一组"的资源，recreate() 必须配对 destroy**：recreate 会在
+    resize / 热重载 / MSAA 切换时反复执行，只 create 不 destroy 每次漏一组
+    （实测 resize 两次 → 退出时报 24 个 leaked objects，验证层 rc=4 → 三个用例
+    连环 FAIL）。sceneOutput 图是例外（有 ImGui 纹理引用要保 ID，用 reusable 判断），
+    fxaa 中间图无引用可整组换。
+26. **验证脚本结尾必须打 `结果: PASS`/`结果: FAIL: ...` 汇总行**：run_regression.py
+    的判定是 `rc==0 AND OK_RE 命中`（OK_RE = `RESULT: PASS|全部断言 PASS|结果: PASS`），
+    只 return 0 不打汇总行 → 断言全绿也判 FAIL（rc=0 的 FAIL 就是这个）。
 24. **验证"输入驱动"的行为别只靠像素差分**：编辑器场景是大片平滑渐变，轻微视角变化就会让
     60%+ 像素变化 → 差分恒等于"全变了"，没有区分度。可靠读数是**界面上的数字**：
     Inspector 的 `Target/Yaw/Pitch` 与 HUD 的 `Sensitivity`（截图后直接读数比对最实在）。
@@ -672,8 +915,152 @@ Mesh/Material/Texture 各带"来源描述"（`*Source`），序列化只写描�
     `SameLine()` 不传参，宽度用 `GetWindowContentRegionMax().x - GetCursorPosX()` 算。
     **别把窄面板里的槽位钉成固定列**：Inspector 默认只有 ~315px，"定宽因子控件 + 标签 + 槽位"
     三样塞不下 → 标签被压扁、槽位叠到控件上。
+64. **`discreteEdit` 的契约是"*target 已持有新值，第 4 参 = 旧值"，它只压撤销栈、不赋值**。
+    `ImGui::Checkbox` 只会写局部变量 → 勾选框分支里**必须先 `cc->xxx = xxx;` 再调
+    discreteEdit**。忘写就是全空操作：memcmp(before, target) 相等直接 return，
+    连撤销记录都不压（现象：点了没反应、存盘还是旧值，看起来像"鼠标漂移"）。
+    2026-10-11 Show Wireframe / Collider Solid 两个勾选框同时栽在这。
+65. **sRGB 交换链吃 ImGui 颜色的精确机制**（坑点 #34 的定量化）：IM_COL32 字节被 shader
+    **当线性值**输出 → 硬件再做一次 sRGB 编码 → 屏幕字节 = `encode(c/255)*255`。
+    金 `IM_COL32(255,202,74)` 实测上屏 `(245,219,142)`（b: 74→142 = 0.29^0.4167≈0.575）。
+    像素判据必须用**编码后实测色**（直方图采），±40 容差。⚠ 别加"线混亮背景"的中间
+    混合色：会和背景本身撞色，线框隐藏时背景假阳性（实测 262px 假命中，|Δ|全 <40）。
+66. **探针语义分层**：状态签名（COLLIDER-SIG）**无论可见与否都打**（隐藏时恰恰最需要）；
+    矩形探针（logRect）没画东西就不打（无矩形语义）。**toggle 类勾选框必须有回执日志**
+    （`INS-COLLIDER-EDIT-SET 0/1`）——自动化闭环重试靠它，盲点 toggle 会把状态勾回去。
+67. **序列化 `applyCamera` 的 setter 顺序：target 必须**最后**设**。fly 模式下
+    yaw/pitch/distance 各自的 `syncFlyTarget()` 会从"当前 target"反推位置；先设 target
+    会被后续 setter 用旧 flyPos 覆盖（存量 bug：JSON 相机全废，被新脚本暴露）。
+68. **`vkGetPhysicalDeviceFeatures2` 在 apiVersion=1.0 的实例上是无效调用**
+    （验证层报 ERROR、返回值全 0）—— 查 1.1/1.2 特性前先把实例升到 1.2
+    （`vkEnumerateInstanceVersion` 查 loader，取 min(1.2, supported)）。
+    pNext 挂 Vulkan12Features 后 `pEnabledFeatures` 必须为 NULL，老字段
+    （samplerAnisotropy）改走 `VkPhysicalDeviceFeatures2.features`。
+    `separateDepthStencilLayouts` 是共享 MSAA 深度方案的硬依赖
+    （DEPTH_READ_ONLY_OPTIMAL 附件布局），不支持直接 throw。
+69. **着色器的 set/binding 划分必须对着 `buildDescriptorSets` 写**：源图+深度
+    双输入的正确姿势是 **set0=源图、set1=深度**（两个独立 set，各只有
+    binding0）—— 写成"同 set 两个 binding"会报 `binding was not declared in
+    VkPipelineLayout` 且运行期 vkCmdDraw 缺 binding。ssao_blur / fg_ssgi /
+    fg_ssr / fg_godrays 四个着色器都栽过。
+70. **DescriptorAllocator 的 0 计数类型不能进 poolSize**（VUID-00302：
+    descriptorCount 必须 >0）。`.inl` 里已改成只收 >0 的类型；新调用方传
+    maxUBOs=0 不会再炸。
+71. **ping-pong 屏障的 oldLayout 要用 UNDEFINED**：单 pass 链里 k=1 工作图
+    永远不被写（停 UNDEFINED），renderpass 的 initialLayout=UNDEFINED 还会把
+    验证层布局状态重置 —— oldLayout=SHADER_READ_ONLY 每帧撞 2 条 VUID-09600。
+    UNDEFINED 匹配任意布局，全屏覆盖写本来就不要旧内容，WAW/WAR 内存依赖不变。
+72. **SSAOPass（或任何"全局描述符引用的图"）重建后必须 writeGlobalDescriptors**：
+    resultView 句柄换了，set0/binding14 若不刷新就是悬空视图。
+    setSampleCount 路径已补，新增重建路径时记得跟。
+73. **场景 JSON 的 mesh `size` 只吃标量**：数组（`[2,2,12]`）会让场景加载直接
+    崩（Editor 闪退、run_once 截图空 `cannot write empty image`）。
+74. **MYVK_EDITOR_CAM 的 pitch 是俯角（正=向下）**，且 setTarget 轨道重摆后
+    真实朝向不完全受控 —— 别盲调机位，用 MYVK_FG_SUN_UV="u,v" 钩子直接指定
+    太阳屏幕坐标；godrays 信号在**暗色区域**最显著（叠亮天空上 8bit 差只有
+    5~30），验证时用 MYVK_GODRAYS_STRENGTH 拉强。
+75. **进程 stdout 是块缓冲**：验证脚本读日志只有前 24 行 ≠ 进程卡死，可能只是
+    缓冲没刷。判启动失败看三样：errs 里有 Fatal / 窗口是否存在 / 截图是否空。
+76. **blit 链生成 mip 时初始 barrier 必须全层 UNDEFINED→TRANSFER_DST**：只转
+    level0 会让 blit 目的层（1..N-1）停在 UNDEFINED → VUID-09600。经典写法：
+    全层转 DST → copy mip0 → 每级"源层 DST→SRC、blit、源层就地 SRC→SHADER_READ"
+    → 最后一层 DST→SHADER_READ。
+77. **流式纹理的未传层也要转 SHADER_READ**：验证层按描述符视图**全部 subresource**
+    检查布局（不做 maxLod 分析）——未传层停在 TRANSFER_DST 会撞 09600。布局合法
+    内容未定义即可（maxLod 挡住逻辑采样）；补传时 SHADER_READ→TRANSFER_DST→
+    copy→SHADER_READ 每层三个 barrier。
+78. **手写 DDS/二进制格式的 struct.pack 别用 `Ns` 装 N 字节结构体**：`8s` 会把
+    32 字节 ddspf 截断成 8 字节（fourCC 丢失 → 引擎报 Unsupported pixel format）。
+    用 `32s` 或展开 `8I`。
+79. **numpy 手写块压缩编码器的两个坑**：① 块级"端点进位修正"必须只作用于触发块
+    （全图共享数组无脑 +1 会把非触发块的调色板与已编码值撑错位 → PSNR 掉到 8dB）；
+    ② decode 侧 (Bh,Bw,16,3) 不能直接 reshape 成图像——块列维与 texel 维错位，
+    必须 reshape(Bh,Bw,4,4,3).transpose(0,2,1,3,4)（encode 的 transpose 的逆）。
+    自检用内置解码器回读算 PSNR（Pillow 只能读 BC 不能写，也不认自写头）。
 
 ## 工具
+- `tools/run_regression.py`（2026-10-11）：**串行**跑全套 GUI 验证脚本（GUI 必须独占窗口），
+  **以退出码为准**。这批脚本的结果行格式不统一（`RESULT: PASS` / `全部断言 PASS` /
+  `全部 PASS` / `结果: PASS`），只靠文本匹配会误判。两例之间默认等 2s。
+  ⚠ 单跑过、连跑偶发失败是已知的**焦点时序**问题（见 `force_foreground` 注释），
+  判失败前**先单独复现一次**再下结论。`--tail N` 打失败用例的日志尾部。
+- `tools/verify_frustum_cull.py`（2026-10-11）：137 立方体（4 在视锥内）→ culled=132 /
+  drawnOpaque=4；`MYVK_FRUSTUM_CULL=0` 对照组 drawnOpaque=136 且两次截图 diff≈0.07。
+- `tools/verify_bvh.py`（2026-10-11）：树健康 / 剪枝 / `BVH-DBG missing=0 extra=0` /
+  与线性基线逐值相同 / 射线拾取点中 Cube_0 且 `PICK-DBG same=1`。
+  ⚠ 视口**左下角**是导航小图标的隐形按钮，会吞掉点击；测"点空地"要点**右下角**。
+- `tools/verify_lod.py`（2026-10-11）：4 距离（3/12/30/80）摆同一颗高模球恰好落 4 级；
+  断言链生成、1/1/1/1 分布、tris 3060 vs noLod 9216、静止不抖、`MYVK_LOD=0` 对照组、
+  `MYVK_LOD_FORCE`、`MYVK_LOD_BIAS`、立方体不生成、OBJ 高模球聚类简化 3968/1840/920/384、
+  anime_girl.glb 蒙皮链停在 1 级。
+- `tools/verify_ibl.py`（2026-10-12）：天空盒 + 真 IBL，4 组 32 条断言。
+  ① 环境资源尺寸 + `ENV-READBACK` 数值自检（亮度严格递减 = Z-up 守门人；
+  **BRDF LUT 在 (1,0) 处精确 (1,0)**）。② 关天空：左右上角差对称的 139.3/139.4，
+  球体区差 **0.00**（把背景 pass 与物体着色分开归因）。③ 关 IBL：球体区差 40.8，
+  背景角区差 **0.00**。④ 因果实验：天顶=红 / 地面=蓝，无球场景三条天空带 `r/b`
+  0.942 > 0.831 > 0.761（单调，抓"梯度错落到 dir.y"），有球+关天空时球面上半偏红、
+  下半偏蓝（证明整条 IBL 链路的图正确接管了着色）。
+  ⚠ 全程 `MYVK_EDITOR_NO_HUD=1`（原因见"视口像素断言的纪律"）。
+- `tools/verify_csm.py`（2026-10-12）：级联方向光阴影 + 阴影距离分级，5 组 ~40 条断言。
+  场景 = 300 地面 + 沿 +X 五根 6³ 柱子，相机 `40,60,22,270,22`。① **分割点逐项等于解析
+  公式**（最大误差 0.0014）。② 每级剔除：`considered` = 投影体数 × 级联数 = 20、
+  实测提交 7（省 65%）、各级 `0/5 0/5 2/5 5/5` 单调不减、第 0 级提交 0。③ `CASCADES=1`
+  → 四个分割点全 = 90、`considered` 20→5、`c0=5/5`。④ **距离分级量成连续信号**：
+  与"关阴影"的差异像素 n(90)=1660 > n(70)=556 > n(25)=**0**（dist=25 时逐像素完全相同）。
+  ⑤ 变化只落在地面窄带（视口上方 1/4 平均差 0.000）。
+  ⚠ 两处场景性质（换场景时要重新推）：5 根柱子的**视线深度完全相同（≈62.7m）**，
+  所以 4 级与 1 级的截图差异**必然很小**（实测仅 19px）——级联数主要靠**数值**断言；
+  且相机高 22m / 俯角 22° ⇒ **可见地面的视深度是 [31.4m, ∞)**，c0/c1 覆盖的地面根本不在画面里。
+- `tools/verify_local_shadow.py`（2026-10-12）：局部光源阴影（点光 / 聚光灯），5 组 43 条断言。
+  场景 = 4 投影体 + 3 盏投影灯（2 聚光 + 1 点光，到相机距离平方 578 / 798 / 1172）+ 1 盏
+  `castsShadow=false` 的对照灯，相机 `0,-34,15,90,16`。① **层分配**：`candidates=3 assigned=3
+  layers=8/12`（1+1+6）；★ `MYVK_LOCAL_SHADOW_LIGHTS=1` → `layers=1`（留下的是距离 578 的
+  **聚光灯**，不是距离 1172 的**点光**）——一条断言同时钉住"近的优先"与"按层数算预算"。
+  硬预算溢出（4 盏点光 = 24 层 > 12）：`assigned=2 layers=12/12`，层号不越界。
+  ② 逐层剔除：`considered=32`（4 投影体 × 8 层）、`submitted=28`。③ **两条关断路径等价**：
+  `MYVK_LOCAL_SHADOW=0`（短路采样）与 `MYVK_LOCAL_SHADOW_LIGHTS=0`（不分配层）**逐像素最大差 = 0**；
+  开 / 关 = 5956 像素、最大差 193，视口上方 1/4 平均差 0.000。④ 层预算是连续信号：
+  mean `0.3139 < 0.3409 < 0.4919`；⚠ 差异**像素计数在相邻档位间非单调**（多一盏灯同时照亮地面，
+  一些勉强过阈值的像素会掉回去）→ 只对均值守恒，像素计数仅在 n(3) 上做方向断言。
+  ⑤ 点光 6 面：开 / 关 9388 像素、差异带横跨视口宽度 **61.2%**，目视确认是四边均匀的对称方环
+  （地面本影半宽 5.5 = `2.5 × 11/(11−6)` 的解析值），无立方体面接缝、无 acne、无漏光。
+  ⚠ 全程 `MYVK_EDITOR_NO_HUD=1`；改动 `LocalShadowPass` 的 `kCubeFaceDir/kCubeFaceUp` 必须与
+  `common.glsl` 的 `vennCubeDir/vennCubeFaceIndex/vennCubeFaceUvFromDir` 逐条重新对齐。
+- `tools/verify_shader_variants.py`（2026-10-12）：Shader 变体 / 关键字系统，5 组 31 条断言。
+  相机 `0,-34,15,90,16`；全程 `MYVK_SHADER_VARIANTS=1` + `MYVK_FRUSTUM_DBG=1` +
+  `MYVK_LIGHT_GIZMOS=0` + `MYVK_EDITOR_NO_HUD=1`，等**两条** `SHADER-VARIANTS `。
+  ① **路由**（场景 = 7 个体用上全部 5 种掩码）：`fwd_created=5 depth_created=2 forced=-1
+  draws=k0=2,k1=2,k2=1,k4=1,k5=1`，掩码集合恰好 `{0,1,2,4,5}`、逐个掩码计数与场景逐条对上、
+  `fwd_created` 跑多帧后**不增长**（缓存生效）、`BUILT fwd k5 = "double-sided|normal-map"`、
+  `BUILT depth = {0,1}`。② `FORCE_MASK=0 vs 4`（**场景里没有任何贴图文件**）：
+  最大差 ≤ **1 个 LSB**、`>18 的像素 0 个`、均值 0.1012、bbox=None —— 证明"编掉法线段"等价。
+  ③ `FORCE_MASK=0 vs 1`（地面 + 两块**朝向相反**的竖直板，不必赌 plane 图元法线朝向）：
+  **24792 像素、最大差 178**，差异带宽视口 29.3%。④ 配对断言（防"两边都错"）：挂非平坦
+  棋盘法线图时 `0 vs 4` = **5808 像素、最大差 30**（判读卡 `max > 20`，因为太阳压到 0.45 后
+  法线 ±0.7 只换 ~30/255 亮度）。⑤ 透明：`0 vs 2` = **116226 像素、最大差 126**，
+  且 `FORCE_MASK=0` 时 `drawnTransparent=0`（分类确实跟着掩码走）。
+  ⚠ 每组强制掩码运行都断言 `fwd_created == 1` —— 就是这条把 `layout()` 白建 k0 的 bug
+  揪出来的。所有像素比对**裁到视口矩形**（复用 `verify_local_shadow.diff_stats(vp=...)`）。
+- `tools/_probe_ui_variants.py`（2026-10-12）：UI 目视确认探针（非断言型）——启动编辑器
+  加载变体场景 → 预热点击 + 点地面选中 Ground（材质 = 双面+法线图 → 掩码 5）→ 截图
+  `_venn_verify/ui_variants.png`。看 Stats 面板变体矩阵与 Inspector `Shader Var` 行。
+  ⚠ 跑之前删 `build/bin/imgui.ini`（见坑点 22）；点击点选 0.70 倍视口高度处（正中是天空）。
+- `tools/verify_shader_hotreload.py`（2026-10-12）：shader 热重载，**同一进程内**
+  覆盖 `build/bin/shaders/pbr.k0.frag.spv`（glslc 编"强制绿色"临时源）→ 等
+  `SHADER-RELOAD ok` → 像素大变 → 还原 → **逐像素回基线**（n=0）。4 条附加断言：
+  重载后 `fwd_created` 回 1（缓存真被清）、SHADER-RELOAD 恰好 2 条、零 VUID。
+  glslc 探测 `$VULKAN_SDK/Bin` → `C:\VulkanSDK\*\Bin`（本机 `E:\code\vulkan\core\Bin`）。
+- `tools/verify_fxaa.py`（2026-10-12）：FXAA（`MYVK_FXAA`，插在 tonemap 后）。
+  MSAA=1 + 斜置亮板：开/关差异 14209 像素、占比 4.75%（early-out 让平坦区恒等，
+  只动边缘）；**自动找平坦窗**（32² 相邻差 ≤3、离差异 bbox ≥24px → 天空区）断言
+  n==0。⚠ 别把"平坦区"选在地面 —— 参考栅格的细线本身就是锯齿源，FXAA 动它是
+  正确行为（实测 497 像素假失败）。
+- `tools/verify_instancing.py`（2026-10-12）：GPU instancing / 合批（`MYVK_INSTANCING`）。
+  场景 = 地面 + 4 红 + 4 蓝 cube（**共享 mesh name "ins_cube" 与各自材质 name**）+ 球
+  → items=10、batches=4、saved=6；开/关**逐像素等价**（n=0，SSBO mat4 与 push 的
+  model 数值逐位相同）。⚠ 场景 JSON 里 mesh/material 的 **name 就是 AssetManager
+  的缓存键** —— 每实体用不同 name（如实体名小写）会得到 N 个独立对象，合批永远
+  10/10 不命中（实测踩过）。
 - `tools/capture_window.py`：启动 exe → 缩放压测 → `PrintWindow` 截图（不受遮挡；进程需 DPI 感知）。
   参数 `--no-resize / --size WxH / --out / --wait / --env K=V / --exe / --title / --args`。
   **默认目标已经是 `build/bin/Editor.exe` / 标题 "Venn Editor"**（Sandbox 已删）。
@@ -690,6 +1077,16 @@ Mesh/Material/Texture 各带"来源描述"（`*Source`），序列化只写描�
   `--asset / --out / --debug-shot / --size / --env`。**改任何拖拽交互都先跑它。**
 - `tools/verify_add_menu.py`：Shift+A 菜单 + 播放条端到端（断言 1a/1b/2 布局、3 Cube、
   4 Sunlight；混合注入见坑点 #42，日志正则见坑点 #40）。
+- `tools/verify_plane_display.py`（2026-10-11）：Shift+A 加 Plane → Ctrl+S 断言落点
+  `position.z ≈ 0.01`（z-fighting 抬升）+ 截图。
+- `tools/verify_collider_show.py`（2026-10-11）：**Show Wireframe 勾选框**端到端。
+  默认 show=1 → 点 Edit 勾选框关编辑（等回执 `INS-COLLIDER-EDIT-SET 0`）→ 取消 Show →
+  SIG show=0 + 像素消失 → Ctrl+S JSON `showWireframe=false` → 勾回 + 像素回来。
+  ⚠ 像素判据用 sRGB 编码后实测色（坑点 #65）；**窗口必须 1600x1200**（900 高时 Show
+  勾选框被压出屏外 y=917）。阈值：隐藏 <40 / 显示 >300（残留 ~15px = 红方块太阳高光）。
+- `tools/verify_player.py`（2026-10-11）：Player 两 case 两进程。菜单创建 → Space Run →
+  PLAYER-STATE → W hold 断言位移方向（first: x 增大 / third: x 减小）→ D 横移（y 减小）→
+  `mouse_event` 相对移动断言 yaw 变化 → 第三人称截 edit/walk 两张图。
 - `tools/verify_prefs.py`：Preferences 居中截图验证（`MYVK_EDITOR_PREFS=1` 钩子）。
 - `tools/verify_drop_to_floor.py`：**数字键 0 落地 + 地面锁定**端到端（真左键点选、真按键）。
   三个用例：A 守卫（`MYVK_EDITOR_SELECT` 非视口选中 → 按 0 必须 skipped）；
@@ -729,9 +1126,13 @@ Mesh/Material/Texture 各带"来源描述"（`*Source`），序列化只写描�
   拖 Size → Ctrl+S → 直接读临时 json 断言 `primitive{...}` → 重开并载入 → 断言
   `MESH-PARAMS ... key=builtin/cube/s1.9000` **还是**那个键（= 几何是用存档参数重建的）。
   临时场景放 `tempfile.mkdtemp()`，不往仓库写。
-- **`MYVK_SHADOW_DBG=1`**：`Renderer::drawFrame` 每帧打一行
-  `SHADOW-DBG casters=N center=(x,y,z) radius=R dir=(x,y,z)` —— 排查阴影问题第一步就看它
-  （"没有投影物体却有暗区" ⇒ 与阴影无关；"radius 只有 2" ⇒ 包围盒退化成原点）。
+- **`MYVK_SHADOW_DBG=1`**：打两种行。
+  `SHADOW-DBG cascades=N dist=D lambda=L splits=a/b/c/d bias=(...) enabled=0|1`
+  （分割点对不对、距离上限有没有生效、参数有没有被 env 覆盖，一条看全）；
+  `SHADOW-STATS cascades=N submitted=S considered=C c0=s/c c1=... c3=...`
+  （"每级各遍历一遍全部投影体"⇒ considered 应精确 = 投影体数 × 级联数；
+  不剔除的话 submitted 就等于它）。排查阴影第一步就看这两行。
+  ⚠ 两者都 30 帧一条，且 `SHADOW-DBG` 只在 `resetSkinning`（主场景）时打。
 - **着色器问题定位法**（2026-10-10 修"四边形阴影"时总结）：把中间量当 `outColor` 直接输出做二分
   （一次跑一张三通道探针图，如 `vec4(NdotV, specDir.z, N.z, 1)`）；再用**常量输出**
   `vec4(0.5,0.5,0.5,1)` 排除后处理/帧缓冲。图里看不出结论就**转数值**：逐行取中位数亮度
@@ -748,10 +1149,13 @@ Mesh/Material/Texture 各带"来源描述"（`*Source`），序列化只写描�
   `TR-BAR`（播放条）、`PREFS-WIN`（Preferences 窗口）、
   `VP-ADD-OPEN/WIN/Mesh/Light/Cube/Sphere/Cylinder/Plane/Sunlight/DirectionalLight/SpotLight/PointLight`（Shift+A 菜单，
   **一律带 `#<第几次打开>` 后缀**，见坑点 #56）、
+  `VP-ADD-Player/FirstPerson/ThirdPerson`（Player 子菜单）、
+  `INS-COLLIDER-EDIT` / `INS-COLLIDER-SHOW`（碰撞段两个勾选框）、
   `NAV-BALL+X/Y/Z`（导航球正轴小球中心）、
   `INS-MESH-HEADER`、`MESH-PARAM <控件名>`、`MAT-SLOT <槽名>`、
   `MAT-CHIP <槽名>`（**方块里当前显示的文件名**，空槽是 `(empty)` —— 让"界面文案"可被断言，
   不用截图认字；`MAT-CHIP` 不打矩形，只打内容）。
+  `COLLIDER <实体名>`（线框屏幕包围矩形）、`GZ-CAM`（相机状态签名，变化 >0.01 才打）。
   **加了新控件就给它加一个 tag** —— 这是让界面可被自动化验证的唯一途径。
 - **面板内容也要能被断言**：控件的**存在性**截图上很难证明（"少了一个控件"看不出来），
   所以 Mesh / Light 段各打一行**签名日志**（只在内容变化时打，不刷屏）：

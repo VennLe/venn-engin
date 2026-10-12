@@ -10,16 +10,22 @@ inline DescriptorAllocator::DescriptorAllocator(Device& device, uint32_t maxSets
                                                 uint32_t maxSamplers,
                                                 uint32_t maxStorageBuffers)
     : m_device(device) {
+    // 计数为 0 的类型不进池（VUID-VkDescriptorPoolSize-descriptorCount-00302：
+    // descriptorCount 必须大于 0 —— 传 0 的条目会直接触发验证层报错）
     VkDescriptorPoolSize sizes[3]{};
-    sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    sizes[0].descriptorCount = maxUBOs;
-    sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[1].descriptorCount = maxSamplers;
-    sizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[2].descriptorCount = maxStorageBuffers;
-
-    // descriptorCount 为 0 的 pool size 是合法的，但没必要带进去
-    const uint32_t poolSizeCount = maxStorageBuffers > 0 ? 3u : 2u;
+    uint32_t poolSizeCount = 0;
+    if (maxUBOs > 0) {
+        sizes[poolSizeCount].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        sizes[poolSizeCount++].descriptorCount = maxUBOs;
+    }
+    if (maxSamplers > 0) {
+        sizes[poolSizeCount].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        sizes[poolSizeCount++].descriptorCount = maxSamplers;
+    }
+    if (maxStorageBuffers > 0) {
+        sizes[poolSizeCount].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        sizes[poolSizeCount++].descriptorCount = maxStorageBuffers;
+    }
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;

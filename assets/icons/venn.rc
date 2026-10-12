@@ -5,13 +5,16 @@
  *   1. RT_GROUP_ICON #1 -> the icon Explorer shows for the .exe, AND the
  *      source core/Window::applyIconFromResource() pulls multi-size HICONs
  *      from at startup (SM_CXICON for ICON_BIG, SM_CXSMICON for ICON_SMALL).
- *      Keeping all 7 frames matters: the 16x16 title-bar icon comes straight
- *      from here instead of being a shrunk 512x512.
+ *      venn.ico now carries 17 frames (16/20/24/28/32/40/48/56/64/72/80/96/
+ *      112/128/160/192/256) so 100%..250% DPI each get a nearest-size hit
+ *      instead of a GDI stretch; the old 7-frame set left 125%/175% (40px,
+ *      56px) with no exact match, which is what read as "blurry".
  *
  *   2. VERSIONINFO -> Explorer's Details tab, and it gives the shell a
  *      version to compare against when deciding whether its icon cache is
  *      stale (a bare icon change with no version bump can keep showing the
- *      old icon until the cache is rebuilt).
+ *      old icon until the cache is rebuilt). Bump it whenever the icon
+ *      artwork changes -- last bumped to 0.3.0.0 with the 17-frame icon.
  *
  * Keep this file pure ASCII: windres is not told about any code page.
  */
@@ -19,8 +22,8 @@
 1 ICON "venn.ico"
 
 1 VERSIONINFO
-FILEVERSION    0,2,0,0
-PRODUCTVERSION 0,2,0,0
+FILEVERSION    0,3,0,0
+PRODUCTVERSION 0,3,0,0
 FILEFLAGSMASK  0x3fL
 FILEFLAGS      0x0L
 FILEOS         0x40004L
@@ -33,12 +36,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "venn"
             VALUE "FileDescription",  "venn engine editor"
-            VALUE "FileVersion",      "0.2.0.0"
+            VALUE "FileVersion",      "0.3.0.0"
             VALUE "InternalName",     "Editor"
             VALUE "LegalCopyright",   "MIT"
             VALUE "OriginalFilename", "Editor.exe"
             VALUE "ProductName",      "venn"
-            VALUE "ProductVersion",   "0.2.0.0"
+            VALUE "ProductVersion",   "0.3.0.0"
         END
     END
     BLOCK "VarFileInfo"
