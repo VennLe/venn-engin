@@ -11,6 +11,7 @@
 #include "assets/Skeleton.h"
 #include "render/ShaderPath.h"
 #include "render/SSAOPass.h"
+#include "render/VolumetricFog.h"
 #include "render/FrameGraph.h"
 
 // 编辑器视口要把它自己的离屏输出图注册成 ImGui 纹理
@@ -86,7 +87,7 @@ bool envFloat(const char* name, float& out) {
     return true;
 }
 
-constexpr uint32_t kGlobalSetBindings = 16;
+constexpr uint32_t kGlobalSetBindings = 17;
 
 // "当前没有绑定任何前向变体管线"的哨兵。
 // ⚠ 不能用 0：0 是**合法掩码**（三个关键字全关，也是最常见的材质）。
@@ -173,6 +174,21 @@ Renderer::Renderer(core::Window& window) : m_window(window) {
         const int v = std::atoi(s);
         if (v >= 256) m_shadowResolution = static_cast<uint32_t>(v);
     }
+    // ---- 阴影硬化三件套（R3-1）----
+    //   MYVK_SHADOW_SNAP=0     → 关掉纹素量化（默认 1 = 旧行为，验证用）
+    //   MYVK_SHADOW_BLEND=f    → 级联间混合带宽，占本级跨度的比例（0 = 关）
+    //   MYVK_SHADOW_HARDEN=f   → 接触硬化强度（0 = 关）
+    if (const char* s = std::getenv("MYVK_SHADOW_SNAP")) {
+        m_shadowTexelSnap = (std::atoi(s) != 0);
+    }
+    if (const char* s = std::getenv("MYVK_SHADOW_BLEND")) {
+        const float v = static_cast<float>(std::atof(s));
+        m_shadowBlend = std::min(std::max(v, 0.0f), 0.5f);
+    }
+    if (const char* s = std::getenv("MYVK_SHADOW_HARDEN")) {
+        const float v = static_cast<float>(std::atof(s));
+        m_shadowHarden = std::min(std::max(v, 0.0f), 1.0f);
+    }
 
     // ---- 局部光源阴影（点光 / 聚光灯）----
     //   MYVK_LOCAL_SHADOW=0      → 关掉（图仍渲染，片元不再采样）
@@ -229,6 +245,14 @@ Renderer::Renderer(core::Window& window) : m_window(window) {
     envFloat("MYVK_GODRAYS_STRENGTH", m_screenSpace.godraysStrength);
     envFloat("MYVK_TAA_BLEND", m_screenSpace.taaBlend);
     envFloat("MYVK_TAA_CLAMP", m_screenSpace.taaClamp);
+    // Froxel 体积雾（R3-2）。用 MYVK_VFOG* 前缀 —— MYVK_FOG* 已被
+    // 上面的**高度雾**占用，两者是独立路径。
+    m_screenSpace.vfog = envBool("MYVK_VFOG", false);
+    envFloat("MYVK_VFOG_DENSITY", m_screenSpace.vfogDensity);
+    envFloat("MYVK_VFOG_ALBEDO", m_screenSpace.vfogAlbedo);
+    envFloat("MYVK_VFOG_FALLOFF", m_screenSpace.vfogHeightFalloff);
+    envFloat("MYVK_VFOG_BLOB", m_screenSpace.vfogBlobStrength);
+    envFloat("MYVK_VFOG_PHASE_G", m_screenSpace.vfogPhaseG);
     // MYVK_TAA_PHASE：冻结抖动相位（验证钩子，见 m_taaForcePhase 注释）
     if (const char* s = std::getenv("MYVK_TAA_PHASE")) {
         const int v = std::atoi(s);
@@ -683,6 +707,15 @@ void Renderer::createDescriptorLayouts() {
     bindings[15].descriptorCount = 1;
     bindings[15].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
+    // 16：Froxel 体积雾的 3D 结果图（R3-2，见 render/VolumetricFog.h）。
+    // 前向 pbr.frag 采样它合成 (out = lit·T + inscatter)。关闭时绑
+    // 1×1×1 的"透明"图（T=1, inscatter=0）→ 合成退化成 out = lit，
+    // 与基线逐位一致（与 SSAO 的缺省白图同一套路）。
+    bindings[16].binding = 16;
+    bindings[16].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[16].descriptorCount = 1;
+    bindings[16].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
     m_globalSetLayout = rhi::makeSetLayout(
         *m_device, std::vector<VkDescriptorSetLayoutBinding>(bindings,
                                                              bindings + kGlobalSetBindings));
@@ -1017,6 +1050,11 @@ void Renderer::createScreenSpace() {
     if (!m_mdi)
         m_mdi = std::make_unique<render::MdiDraw>(
             *m_device, *m_commandPool, MAX_FRAMES_IN_FLIGHT);
+    // Froxel 体积雾（R3-2）。构造只建管线/采样器/缺省透明图；
+    // 3D froxel 图在 recreateScreenSpace 里按屏幕分辨率建。
+    if (!m_vfog)
+        m_vfog = std::make_unique<render::VolumetricFog>(
+            *m_device, *m_commandPool, m_globalSetLayout, MAX_FRAMES_IN_FLIGHT);
     recreateScreenSpace();
 }
 
@@ -1038,6 +1076,11 @@ void Renderer::recreateScreenSpace() {
     m_ssao->setDepthViews(depthViews);
     m_frameGraph->setDepthViews(depthViews);
     if (m_hiz) m_hiz->setDepthViews(depthViews);
+    // Froxel 体积雾：3D 图按屏幕分辨率建，深度视图同样跟着喂。
+    if (m_vfog) {
+        m_vfog->recreate(ext, samples);
+        m_vfog->setDepthViews(depthViews);
+    }
 
     // R2-2：MDI 的紧凑化着色器直接读 Hi-Z 金字塔与候选 AABB 缓冲 ——
     // 两者都属于 HiZOcclusion，重建后必须重新喂（顺序不能反）。
@@ -1248,6 +1291,7 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
     // 场景里一加个远处的大物体，近处那级的精度就跟着掉；以及"没有投影体"
     // 时要靠 camera.target() 兜底。
     m_shadowPass->setCascadeCount(m_shadowCascades);
+    m_shadowPass->setTexelSnapping(m_shadowTexelSnap);
     m_shadowPass->updateCascades(ubo.view, ubo.proj, kNear, kFar, ld,
                                  m_shadowDistance, m_shadowLambda);
 
@@ -1265,6 +1309,8 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
         m_shadowPass->split(0), m_shadowPass->split(1),
         m_shadowPass->split(2), m_shadowPass->split(3));
     ubo.shadowBias = m_shadowBias;
+    // 阴影硬化三件套：x=级联混合带宽 y=接触硬化强度（0 = 各自关闭）
+    ubo.shadowFilter = glm::vec4(m_shadowBlend, m_shadowHarden, 0.0f, 0.0f);
 
     // 诊断：把每级的分割点与级联数打出来。级联分割是这个功能里最容易
     // "看着没问题其实糊了"的部分（半径算大了 → 精度全浪费）。
@@ -1274,7 +1320,7 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
     if (resetSkinning && shadowDbg && (shadowDbgTick++ % 30) == 1) {
         VK_LOG_INFO("SHADOW-DBG cascades=%u dist=%.1f lambda=%.2f "
                     "splits=%.2f/%.2f/%.2f/%.2f bias=(%.4f,%.4f,%.1f,%.2f) "
-                    "enabled=%d",
+                    "enabled=%d blend=%.3f harden=%.3f snap=%d",
                     cascades, static_cast<double>(m_shadowPass->maxDistance()),
                     static_cast<double>(m_shadowLambda),
                     static_cast<double>(m_shadowPass->split(0)),
@@ -1285,7 +1331,45 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
                     static_cast<double>(m_shadowBias.y),
                     static_cast<double>(m_shadowBias.z),
                     static_cast<double>(m_shadowBias.w),
-                    m_shadowsEnabled ? 1 : 0);
+                    m_shadowsEnabled ? 1 : 0,
+                    static_cast<double>(m_shadowBlend),
+                    static_cast<double>(m_shadowHarden),
+                    m_shadowTexelSnap ? 1 : 0);
+    }
+
+    // R3-1 诊断：把第 0 级的**光空间视图矩阵平移列**（×1e6，取整）打出来。
+    // 目的：texel snapping 的保证是"相机在纹素内移动 → 该级光空间矩阵
+    // 逐位不变"。这是**画面之外**的可观测量，能在 2048² 分辨率下（纹素
+    // 远小于一个像素，截图差分测不出）仍然直接判定量化是否生效。
+    // 配合 verify_shadow_hardening.py 第 2 组：snap 开 → 矩阵平移列分段
+    // 常数（连续几步同值 + 一次整格跳）；snap 关 → 每步都均匀漂移。
+    static const bool shadowMatrixDbg =
+        std::getenv("MYVK_SHADOW_MATRIX_DBG") != nullptr;
+    if (resetSkinning && shadowMatrixDbg) {        // 只打第 0 级（近处、纹素最小、最能体现量化）。
+        // 精度取 1e6：纹素 ≈ 7.5e-3 m，×1e6 后步长 7500，既能看出"整格
+        // 跳"，又能看出"格内不动"。×1000 会把格内漂移整体量化掉。
+        const glm::mat4& ls = m_shadowPass->lightSpace(0);
+        const long long tx = llround(static_cast<double>(ls[3][0]) * 1e6);
+        const long long ty = llround(static_cast<double>(ls[3][1]) * 1e6);
+        const long long tz = llround(static_cast<double>(ls[3][2]) * 1e6);
+        VK_LOG_INFO("SHADOW-MATRIX c0 t=(%lld,%lld,%lld)", tx, ty, tz);
+    }
+
+    // R3-2 诊断：Froxel 体积雾的参数与网格。30 帧一条（与 SHADOW-DBG 同频）。
+    // 关掉时也打一行（enabled=0），便于验证脚本确认"关 = 不录 pass"。
+    static const bool vfogDbg = std::getenv("MYVK_VFOG_DBG") != nullptr;
+    static uint32_t vfogDbgTick = 0;
+    if (resetSkinning && vfogDbg && (vfogDbgTick++ % 30) == 1) {
+        glm::uvec3 g = m_vfog ? m_vfog->gridSize() : glm::uvec3(0u);
+        VK_LOG_INFO("VFOG-DBG enabled=%d grid=%ux%ux%u density=%.4f albedo=%.2f "
+                    "falloff=%.4f blob=%.2f g=%.2f ready=%d",
+                    m_screenSpace.vfog ? 1 : 0, g.x, g.y, g.z,
+                    static_cast<double>(m_screenSpace.vfogDensity),
+                    static_cast<double>(m_screenSpace.vfogAlbedo),
+                    static_cast<double>(m_screenSpace.vfogHeightFalloff),
+                    static_cast<double>(m_screenSpace.vfogBlobStrength),
+                    static_cast<double>(m_screenSpace.vfogPhaseG),
+                    (m_vfog && m_vfog->ready()) ? 1 : 0);
     }
 
     // ---- 局部光源 ----
@@ -1387,6 +1471,16 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
                                   m_screenSpace.fogHeightFalloff, 1.0f, 0.0f);
     } else {
         ubo.fogParams = glm::vec4(0.0f);
+    }
+    // Froxel 体积雾（R3-2）：网格尺寸 + 开关。关着时 w=0，pbr.frag 整块
+    // 短路，且 binding 16 绑的是 1×1×1 透明图 —— 两重保险回到基线。
+    if (resetSkinning && m_screenSpace.vfog && m_vfog && m_vfog->ready()) {
+        const glm::uvec3 g = m_vfog->gridSize();
+        ubo.vfogParams = glm::vec4(static_cast<float>(g.x),
+                                   static_cast<float>(g.y),
+                                   static_cast<float>(g.z), 1.0f);
+    } else {
+        ubo.vfogParams = glm::vec4(0.0f);
     }
     // 调试视图模式（R0-2）：前向片元的输出覆盖开关。所有场景（主视口
     // 与离屏目标）共用同一个全局值。
@@ -2662,6 +2756,17 @@ void Renderer::writeGlobalSet(VkDescriptorSet set, uint32_t frameIndex,
                                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         }
     }
+
+    // binding 16：Froxel 体积雾 3D 结果图（R3-2）。开启且就绪时绑本帧
+    // 的雾图；否则绑 1×1×1 透明图 → 采样恒 (0,0,0,1)，合成逐位回基线。
+    if (m_vfog && m_vfog->ready() && m_screenSpace.vfog) {
+        m_descriptors->writeTexture(set, 16, m_vfog->sampler(),
+                                    m_vfog->view(i),
+                                    m_vfog->imageLayout());
+    } else {
+        m_descriptors->writeTexture(set, 16, m_vfog->neutralSampler(),
+                                    m_vfog->neutralView());
+    }
 }
 
 // 懒建"某离屏目标本帧的相机 UBO 槽"。buffer 与 set 都只建一次，之后
@@ -3494,6 +3599,20 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
     m_lighting->record(cmd, m_currentFrame, m_clusterCullingEnabled,
                        frame.globalUBOSet);
     tsEnd(render::GpuTimer::kCluster);
+
+    // ========= Pass 3.5：Froxel 体积雾（compute ×2，R3-2）===========
+    // 位置：深度预通道 + 分簇之后、前向之前。
+    //   · 必须在深度预通道之后 —— 注入趟要采深度做积分截断；
+    //   · 必须在分簇之后 —— 注入趟读 lights[] SSBO（与簇同源）；
+    //   · 必须在前向之前 —— 前向的片元采样 3D 雾图合成。
+    // 关闭时一个 compute 都不录：binding 16 绑 1×1×1 透明图 →
+    // pbr.frag 的雾合成退化成 out = lit，基线逐位不变。
+    if (m_screenSpace.vfog && m_vfog && m_vfog->ready()) {
+        const float clusterNearVf =
+            2.0f * m_camNear * m_camFar / (m_camNear + m_camFar);
+        m_vfog->setCameraSlices(clusterNearVf, m_camNear, m_camFar);
+        m_vfog->render(cmd, m_currentFrame, m_screenSpace, frame.globalUBOSet);
+    }
 
     // ================= Pass 4：前向渲染 → MSAA HDR → resolve ========
     VkClearValue clears[2]{};

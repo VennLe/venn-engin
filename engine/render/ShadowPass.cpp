@@ -336,18 +336,33 @@ void ShadowPass::updateCascades(const glm::mat4& camView,
 
         // ---- 4) 光空间视图 + 纹素量化 ----
         const float texel = 2.0f * radius / static_cast<float>(m_resolution);
-        const glm::vec3 eye = mid - d * (radius + kDepthPadding);
-        glm::mat4 view = glm::lookAt(eye, mid, up);
-        // 把球心在光空间里的位置量化到纹素网格，再把差量补回视图矩阵的
-        // 平移列。相机连续移动时，采样网格相对世界就是"整格跳"的而不是
-        // 连续滑的 —— 这是消除阴影边缘闪烁的关键一步。
-        {
-            const glm::vec4 cLS = view * glm::vec4(mid, 1.0f);
-            const float sx = std::floor(cLS.x / texel) * texel;
-            const float sy = std::floor(cLS.y / texel) * texel;
-            view[3][0] += sx - cLS.x;
-            view[3][1] += sy - cLS.y;
+
+        // 量化必须在**光空间里对球心的世界位置**做，不能对 `view * mid`
+        // 做 —— `mid` 是 lookAt 的 target，lookAt 之后它必然落在视轴原点，
+        // `view*mid == (0,0,-dist)` 恒成立，量化一个常量等于什么都没做
+        // （这正是 2026-10-13 发现的 bug：开关看起来接线了、日志也在打，
+        // 但阴影边缘照样连续滑动）。
+        //
+        // 正确做法：先用"只含旋转"的光空间基把球心变换到光轴坐标系
+        // （Rx = 视矩阵的左上 3x3 的转置，即世界→光轴方向），对它的
+        // xy 量化到纹素网格，得到量化后的**世界位置** center，再用它重建
+        // lookAt。这样"相机在纹素内移动"时，center 逐位不变 → 整个
+        // lightSpace 矩阵逐位不变 → 阴影落点相对世界完全不动。
+        glm::vec3 center = mid;
+        if (m_texelSnapping) {
+            // 光轴基（与 lookAt 内部一致：z=视线方向，x=up×z，y=z×x）
+            const glm::vec3 lz = d;
+            const glm::vec3 lx = glm::normalize(glm::cross(up, lz));
+            const glm::vec3 ly = glm::cross(lz, lx);
+            // 世界 → 光轴坐标系（点乘即投影）
+            const float ax = glm::dot(mid, lx);
+            const float ay = glm::dot(mid, ly);
+            const float sx = std::floor(ax / texel) * texel;
+            const float sy = std::floor(ay / texel) * texel;
+            center = mid + lx * (sx - ax) + ly * (sy - ay);
         }
+        const glm::vec3 eye = center - d * (radius + kDepthPadding);
+        const glm::mat4 view = glm::lookAt(eye, center, up);
         // 近平面取 0：正交投影的深度是线性的，牺牲的那点精度可以忽略，
         // 换来的是"光源到切片之间的所有遮挡体都进深度图"。
         const glm::mat4 proj = glm::orthoRH_ZO(

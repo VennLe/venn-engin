@@ -48,7 +48,7 @@
 
 # ---------------------------------------------------------------- 工具
 CMAKE        ?= cmake
-MINGW_PREFIX ?= C:/msys64/ucrt64
+MINGW_PREFIX ?= C:/Program Files/CodeBlocks/MinGW
 CC_BIN       ?= $(MINGW_PREFIX)/bin/gcc.exe
 CXX_BIN      ?= $(MINGW_PREFIX)/bin/g++.exe
 GENERATOR    ?= Ninja
@@ -88,8 +88,8 @@ PKG_NAME ?= venn-$(VERSION)-$(BUILD_TYPE)-win64
 # -DXXX=3 加 .5，加引号才能原样传给 CMake。
 CMAKE_CONFIGURE := $(CMAKE) -S . -B $(BUILD_DIR) -G $(GENERATOR) \
 	-DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
-	-DCMAKE_C_COMPILER=$(CC_BIN) \
-	-DCMAKE_CXX_COMPILER=$(CXX_BIN) \
+	"-DCMAKE_C_COMPILER=$(CC_BIN)" \
+	"-DCMAKE_CXX_COMPILER=$(CXX_BIN)" \
 	"-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
 	$(CMAKE_ARGS)
 

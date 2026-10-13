@@ -1952,6 +1952,28 @@ void EditorApp::drawEnginePanel() {
         }
     }
 
+    // ---- Froxel 体积雾（R3-2）----
+    // 与解析式**高度雾**（MYVK_FOG）是两条独立路径：高度雾按世界坐标
+    // 解析求值、介质均匀；froxel 雾逐格积分内散射，有局部形状与光柱。
+    // 这里只放开关 + 密度（其余参数走 MYVK_VFOG_* 环境变量）。
+    {
+        render::ScreenSpaceSettings& ss = r.screenSpaceSettings();
+        if (ImGui::Checkbox("Froxel fog", &ss.vfog)) {
+            VK_LOG_INFO("VFOG-COMBO enabled=%d", ss.vfog ? 1 : 0);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Froxel 体积雾：逐格沿视线积分内散射/消光\n"
+                "聚光灯锥内出现光柱；关闭时逐像素回基线");
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::SliderFloat("Density", &ss.vfogDensity, 0.001f, 0.20f, "%.3f");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("基础密度（1/米，越大雾越浓）");
+        }
+    }
+
     // ---- 调试视图模式（R0-2，docs/render_roadmap.md）----
     // Lit = 默认渲染路径；其余是排查工具（法线/粗糙度/金属度/线框/
     // 过绘制/灯复杂度）。wireframe 在不支持 fillModeNonSolid 的设备上

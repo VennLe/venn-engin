@@ -292,60 +292,60 @@
 ### R2-2 Multi-draw indirect + GPU 剔除 ✅ 已完成（2026-10-13）
 
 - **交付**：
-  - `assets/shaders/hiz_test.glsl`（新）：`vennHizOccluded()` 公共判据 ——
-    R2-1 的 `occlusion_test.comp` 与 R2-2 的 `mdi_compact.comp` **共用同一份
-    数学**（两边判据一旦有逐字差异，"CPU 说可见、GPU 说被挡"会变成随机丢
+  - `assets/shaders/hiz_test.glsl`（新）：`vennHizOccluded()` 公共判据 ——      
+    R2-1 的 `occlusion_test.comp` 与 R2-2 的 `mdi_compact.comp` **共用同一份      
+    数学**（两边判据一旦有逐字差异，"CPU 说可见、GPU 说被挡"会变成随机丢      
     物体的疑难杂症）。
-  - `assets/shaders/mdi_compact.comp`（新）：`local_size 64`；binding 0 = Hi-Z
-    图、1 = AABB、2 = Catalog、3 = ObjBatch、4 = Instances（writeonly）、
-    5 = Indirect（裸 `uint cmds[]`）；push 112 B。核心是**一次 `atomicAdd`
-    兼做槽位分配与计数**：`slot = atomicAdd(cmds[base+1], 1u)` 的旧返回值 =
-    批内第几个可见实例 = 紧凑化槽位，[1] 的终值 = 本帧要画几个 —— 不需要
-    第二遍 finalize pass。`firstInstance`（[4]）= 该批候选数的前缀和，任何
+  - `assets/shaders/mdi_compact.comp`（新）：`local_size 64`；binding 0 = Hi-Z      
+    图、1 = AABB、2 = Catalog、3 = ObjBatch、4 = Instances（writeonly）、      
+    5 = Indirect（裸 `uint cmds[]`）；push 112 B。核心是**一次 `atomicAdd`      
+    兼做槽位分配与计数**：`slot = atomicAdd(cmds[base+1], 1u)` 的旧返回值 =      
+    批内第几个可见实例 = 紧凑化槽位，[1] 的终值 = 本帧要画几个 —— 不需要      
+    第二遍 finalize pass。`firstInstance`（[4]）= 该批候选数的前缀和，任何      
     槽位都落在预留区间内。
-  - `assets/shaders/pbr.vert`：新增 `VENN_MDI` 分支（从结构化的
-    `MdiInstance { mat4 model; ivec4 aux; }` 取 model + jointBase）；main()
-    重构成"先定 modelMat/jointBase 再做变换"，三条路径（MDI / 合批 / 基线）
+  - `assets/shaders/pbr.vert`：新增 `VENN_MDI` 分支（从结构化的      
+    `MdiInstance { mat4 model; ivec4 aux; }` 取 model + jointBase）；main()      
+    重构成"先定 modelMat/jointBase 再做变换"，三条路径（MDI / 合批 / 基线）      
     只换数据来路、**数学逐位不变**。
-  - `engine/render/MdiDraw.h/.cpp`（新）：4 条缓冲**构造时一次分到底**
-    （catalog / objBatch / instances / indirect，全 HOST_VISIBLE；indirect 额外
-    带 `INDIRECT_BUFFER` usage 兼当 SSBO 与间接命令）+ `mdi_compact` 管线
-    （`kMaxObjects=8192` / `kMaxBatches=4096`，约 1.5 MB/槽）。
-    `readBack` 只累加各命令的 `instanceCount` —— **回读量 O(批数)**，不是
+  - `engine/render/MdiDraw.h/.cpp`（新）：4 条缓冲**构造时一次分到底**      
+    （catalog / objBatch / instances / indirect，全 HOST_VISIBLE；indirect 额外      
+    带 `INDIRECT_BUFFER` usage 兼当 SSBO 与间接命令）+ `mdi_compact` 管线      
+    （`kMaxObjects=8192` / `kMaxBatches=4096`，约 1.5 MB/槽）。      
+    `readBack` 只累加各命令的 `instanceCount` —— **回读量 O(批数)**，不是      
     R2-1 的 O(物体数)。
-  - `engine/assets/Mesh.h/.cpp`：新增 `bindGeometry(cmd)`（只绑 VB/IB），
+  - `engine/assets/Mesh.h/.cpp`：新增 `bindGeometry(cmd)`（只绑 VB/IB），      
     `drawInstanced` 改为复用它。
-  - `Renderer`：set 0 binding 15 = 紧凑化实例表（`kGlobalSetBindings` 15→16）；
-    `buildMdiFrameData()` 生成 catalog/objBatch/命令/提交组，并把候选 AABB
-    重排成批序（Hi-Z 测试与紧凑化必须同一种编号）；`recordFrame` 深度预通道
-    之后插入 **Pass 2.5**（`recordPyramid` + `compact`）；前向不透明块四分支
-    （调试 / MDI / 合批 / 基线）；`recordOffscreenTarget` 在 MDI 打开时**整体
+  - `Renderer`：set 0 binding 15 = 紧凑化实例表（`kGlobalSetBindings` 15→16）；      
+    `buildMdiFrameData()` 生成 catalog/objBatch/命令/提交组，并把候选 AABB      
+    重排成批序（Hi-Z 测试与紧凑化必须同一种编号）；`recordFrame` 深度预通道      
+    之后插入 **Pass 2.5**（`recordPyramid` + `compact`）；前向不透明块四分支      
+    （调试 / MDI / 合批 / 基线）；`recordOffscreenTarget` 在 MDI 打开时**整体      
     跳过**；`drawFrame` 回读块 MDI 时只回读 draw 参数。
-  - env：`MYVK_MDI`（默认关）、`MYVK_MDI_DBG`（每 30 帧 `MDI-STATS`）；
-    打开时强制 occlusion=1 / instancing=1 / 深度预通道。面板：
-    `Multi-draw indirect` 勾选 + 统计。`CULL-STATS` 追加
+  - env：`MYVK_MDI`（默认关）、`MYVK_MDI_DBG`（每 30 帧 `MDI-STATS`）；      
+    打开时强制 occlusion=1 / instancing=1 / 深度预通道。面板：      
+    `Multi-draw indirect` 勾选 + 统计。`CULL-STATS` 追加      
     `mdi / mdiSub / mdiBatches / mdiInst`。
-- **实测参考**（`verify_mdi.py`，6 组断言）。场景：墙挡住墙后 8 个物体、墙前
+- **实测参考**（`verify_mdi.py`，6 组断言）。场景：墙挡住墙后 8 个物体、墙前    
   2 个做正对照，**共用网格与材质** → 候选 11 → 3 批 → 3 组：
   - 关闭：`mdi=0` / `mdiSub=0`、无 `MDI-STATS`、两次运行逐像素一致；
-  - 打开：`mdiSub=3`（11 → 3）、`drawCalls 12 → 4`、GPU 候选 11 / 画出 3 /
+  - 打开：`mdiSub=3`（11 → 3）、`drawCalls 12 → 4`、GPU 候选 11 / 画出 3 /      
     剔除 8；
   - **开 vs 关视口逐像素不变（>18 像素 = 0、平均差 0.0000）**，全程零 VUID。
-- **坑点**：见 MEMORY.md **#114~#118**（`vkCmdDrawIndexedIndirect` **不带**
-  VB/IB 必须自己绑 —— 漏了会拿"上一次绑定的残留缓冲"解释 `firstIndex`，
-  画面形状对、顶点数据错而**验证层一声不吭**；提交组键必须含网格；
-  Pass 2.5 要放 `recordFrame` 而不是 `recordSceneInto`；`beginFrame` 的长度
-  校验 catalog/objBatch 是"每物体"、commands 是"每批"；binding 15 必须在
+- **坑点**：见 MEMORY.md **#114~#118**（`vkCmdDrawIndexedIndirect` **不带**    
+  VB/IB 必须自己绑 —— 漏了会拿"上一次绑定的残留缓冲"解释 `firstIndex`，    
+  画面形状对、顶点数据错而**验证层一声不吭**；提交组键必须含网格；    
+  Pass 2.5 要放 `recordFrame` 而不是 `recordSceneInto`；`beginFrame` 的长度    
+  校验 catalog/objBatch 是"每物体"、commands 是"每批"；binding 15 必须在    
   set 0 layout 里声明）。
-- **回归**：**31/31 全通过**（`_venn_verify/_regression/_reg_mdi_full2.log`）。
-  首轮 30/31，唯一失败 `verify_character_window` 是已知的输入注入时序 flaky，
-  单跑立刻 PASS。顺带给 `run_regression.py` 加了**增量跑**（跳过"上次 PASS
+- **回归**：**31/31 全通过**（`_venn_verify/_regression/_reg_mdi_full2.log`）。    
+  首轮 30/31，唯一失败 `verify_character_window` 是已知的输入注入时序 flaky，    
+  单跑立刻 PASS。顺带给 `run_regression.py` 加了**增量跑**（跳过"上次 PASS    
   且产物指纹未变"的用例，30 例命中时 25 分钟 → 18.6 秒，见 MEMORY.md #119）。
-- **留给后续**：`mdiSub == mdiBatches`（组键含网格，而批键本来就是
-  "掩码+材质+网格"）—— 收益落在"**GPU 生成 draw 参数 + 零 CPU 回读 + 零帧
-  延迟**"，不是命令条数。要真落到那句 O(材质数)，前置是**全局几何 arena**
-  （所有网格共用一份顶点/索引大缓冲，靠命令里的 `firstIndex`/`vertexOffset`
-  寻址）；再往后是 `vkCmdDrawIndexedIndirectCount`（命令条数也由 GPU 写）
+- **留给后续**：`mdiSub == mdiBatches`（组键含网格，而批键本来就是    
+  "掩码+材质+网格"）—— 收益落在"**GPU 生成 draw 参数 + 零 CPU 回读 + 零帧    
+  延迟**"，不是命令条数。要真落到那句 O(材质数)，前置是**全局几何 arena**    
+  （所有网格共用一份顶点/索引大缓冲，靠命令里的 `firstIndex`/`vertexOffset`    
+  寻址）；再往后是 `vkCmdDrawIndexedIndirectCount`（命令条数也由 GPU 写）    
   与 `VK_DISPATCH_INDIRECT`。
 
 ### R2-2 原始计划（存档）
@@ -354,84 +354,84 @@
 - **改动点**：instance buffer 结构化（world matrix + material id per instance）、indirect buffer 由 R2-1 的 compute 写 draw 参数（VK_DISPATCH_INDIRECT 或 draw-count 读回）、`Renderer::recordSceneInto` 前向 pass 改 indirect 路径（保留旧路径做 A/B）。
 - **依赖**：`←! R2-1`（可见性 compaction 的输出就是 indirect 输入）
 - **规模**：L
-- **与实现的差异**：① "indirect buffer 由 R2-1 的 compute 写"落地成**新写一个
-  `mdi_compact.comp`**（R2-1 的 `occlusion_test.comp` 保持"只写 vis 标志"的
-  职责不变），两者共用 `hiz_test.glsl`；② 走的是"**CPU 预填其余字段 +
-  GPU 只写 instanceCount**"，不是 `VK_DISPATCH_INDIRECT` / draw-count 读回；
-  ③ 提交路径改在 `recordFrame`（主视口）而不是 `recordSceneInto` —— 后者只
-  服务离屏目标，且离屏在 MDI 打开时被整体跳过；④ 提交组键加了"网格"
+- **与实现的差异**：① "indirect buffer 由 R2-1 的 compute 写"落地成**新写一个    
+  `mdi_compact.comp`**（R2-1 的 `occlusion_test.comp` 保持"只写 vis 标志"的    
+  职责不变），两者共用 `hiz_test.glsl`；② 走的是"**CPU 预填其余字段 +    
+  GPU 只写 instanceCount**"，不是 `VK_DISPATCH_INDIRECT` / draw-count 读回；    
+  ③ 提交路径改在 `recordFrame`（主视口）而不是 `recordSceneInto` —— 后者只    
+  服务离屏目标，且离屏在 MDI 打开时被整体跳过；④ 提交组键加了"网格"    
   （见坑点 #114/#115）。
 
 ### R2-3 Bindless / descriptor indexing ✅ 已完成（2026-10-13）
 
 - **交付**：
-  - `engine/rhi/Device`：创建逻辑设备时启用**一整组** Vulkan 1.2 特性 ——
-    `descriptorIndexing` + `runtimeDescriptorArray` +
-    `shaderSampledImageArrayNonUniformIndexing` +
-    `descriptorBindingPartiallyBound` +
-    `descriptorBindingSampledImageUpdateAfterBind`（外加 1.0 核心的
-    `shaderSampledImageArrayDynamicIndexing`）。**要么全开要么全不开**：
-    缺任一项就整体不 set，`supportsBindless()` 返回 false（"半开"的症状是
+  - `engine/rhi/Device`：创建逻辑设备时启用**一整组** Vulkan 1.2 特性 ——      
+    `descriptorIndexing` + `runtimeDescriptorArray` +      
+    `shaderSampledImageArrayNonUniformIndexing` +      
+    `descriptorBindingPartiallyBound` +      
+    `descriptorBindingSampledImageUpdateAfterBind`（外加 1.0 核心的      
+    `shaderSampledImageArrayDynamicIndexing`）。**要么全开要么全不开**：      
+    缺任一项就整体不 set，`supportsBindless()` 返回 false（"半开"的症状是      
     管线建不出来，或者数组尾部未初始化的槽被采样而验证层不一定报）。
-  - `engine/rhi/DescriptorSet`：`DescriptorAllocator` 支持池级
-    `VkDescriptorPoolCreateFlags`；`makeSetLayout` 支持 per-binding flags
-    （`VkDescriptorSetLayoutBindingFlagsCreateInfo`）；新增
+  - `engine/rhi/DescriptorSet`：`DescriptorAllocator` 支持池级      
+    `VkDescriptorPoolCreateFlags`；`makeSetLayout` 支持 per-binding flags      
+    （`VkDescriptorSetLayoutBindingFlagsCreateInfo`）；新增      
     `writeTextureAt(set, binding, arrayElement, ...)` —— 按**数组下标**写单个元素。
-  - `engine/render/Bindless.h/.cpp`（新）：每帧槽一份 update-after-bind 描述符集
-    —— binding 0 = `sampler2D textures[]`（运行时大小数组，**PARTIALLY_BOUND**
-    所以未注册的槽合法；容量按设备 `maxPerStageDescriptorSamplers` 收窄，上限
-    4096）、binding 1 = `GpuMaterialPage pages[]`（每帧槽一份 HOST_VISIBLE 页表，
-    4096 页 × 32 B）。`textureIndex()` 惰性注册返**稳定**下标（sampler/view
-    变了就重写该槽 —— 纹理流收尾会重建 sampler）；`materialPage()` 每帧惰性
+  - `engine/render/Bindless.h/.cpp`（新）：每帧槽一份 update-after-bind 描述符集      
+    —— binding 0 = `sampler2D textures[]`（运行时大小数组，**PARTIALLY_BOUND**      
+    所以未注册的槽合法；容量按设备 `maxPerStageDescriptorSamplers` 收窄，上限      
+    4096）、binding 1 = `GpuMaterialPage pages[]`（每帧槽一份 HOST_VISIBLE 页表，      
+    4096 页 × 32 B）。`textureIndex()` 惰性注册返**稳定**下标（sampler/view      
+    变了就重写该槽 —— 纹理流收尾会重建 sampler）；`materialPage()` 每帧惰性      
     分配页并写表（同指针去重）；`bind()` 把 set 1 绑上。
-  - `assets/shaders/pbr.frag`：`#if VENN_BINDLESS` 分支把六个贴图槽从
-    "set 1..6 各一个 sampler2D" 换成
-    `#define albedoMap textures[gMat.tex0.x]` 等六条宏（`gMat` 在 main 开头
-    由 `pages[uint(push.emissive.w + 0.5)]` 查一次）—— **函数体里那 6 处
-    `texture(<槽>, uv)` 一个字没改**，与非 bindless 的那份逐字同源，不可能
-    因为手抄而分叉。页号借 push 常量最后 16 字节的空闲位（`emissive.w`，
-    非 bindless 时推 1.0、从无编译单元读取）—— push 被硬件卡在 128 字节，
+  - `assets/shaders/pbr.frag`：`#if VENN_BINDLESS` 分支把六个贴图槽从      
+    "set 1..6 各一个 sampler2D" 换成      
+    `#define albedoMap textures[gMat.tex0.x]` 等六条宏（`gMat` 在 main 开头      
+    由 `pages[uint(push.emissive.w + 0.5)]` 查一次）—— **函数体里那 6 处      
+    `texture(<槽>, uv)` 一个字没改**，与非 bindless 的那份逐字同源，不可能      
+    因为手抄而分叉。页号借 push 常量最后 16 字节的空闲位（`emissive.w`，      
+    非 bindless 时推 1.0、从无编译单元读取）—— push 被硬件卡在 128 字节，      
     另开字段会直接越过 `maxPushConstantsSize`。
-  - `CMakeLists.txt`：`-DVENN_BINDLESS=1` 再编 8 份
-    `pbr.bindless.k<N>.frag.spv`（bindless 是**全局开关**、与材质关键字正交，
+  - `CMakeLists.txt`：`-DVENN_BINDLESS=1` 再编 8 份      
+    `pbr.bindless.k<N>.frag.spv`（bindless 是**全局开关**、与材质关键字正交，      
     所以不占用掩码位，只多一族文件）。
-  - `Renderer`：set 1..6 的布局改走 `pipelineTexSetLayout()`（bindless 时是
-    那一份数组布局；grid/sky 同步，否则踩"set 0 被中途打断"那条 VUID）；
-    前向变体 `fragBaseName` 与调试管线片元按开关切换；`recordFrame` /
-    `recordSceneInto` 每个前向 pass 绑一次 set 1；`materialPageCode()` 逐 draw
-    把页号压进 push；`bindMaterialTextures()` 在 bindless 下**空转**（每 draw 的
-    描述符绑定从 6 次降到 0 次）；`beginFrame` 在 in-flight 栅栏后复位本槽页表；
-    `BINDLESS-STATS` 日志 + `CULL-STATS` 追加 `bl / blTex / blPages`；
-    热重载监听 bindless 那一族。**注意**：bindless 改的是描述符布局与 .spv，
-    所以面板勾选框走 `setBindlessEnabled()`（waitIdle + `createPipelines()`），
+  - `Renderer`：set 1..6 的布局改走 `pipelineTexSetLayout()`（bindless 时是      
+    那一份数组布局；grid/sky 同步，否则踩"set 0 被中途打断"那条 VUID）；      
+    前向变体 `fragBaseName` 与调试管线片元按开关切换；`recordFrame` /      
+    `recordSceneInto` 每个前向 pass 绑一次 set 1；`materialPageCode()` 逐 draw      
+    把页号压进 push；`bindMaterialTextures()` 在 bindless 下**空转**（每 draw 的      
+    描述符绑定从 6 次降到 0 次）；`beginFrame` 在 in-flight 栅栏后复位本槽页表；      
+    `BINDLESS-STATS` 日志 + `CULL-STATS` 追加 `bl / blTex / blPages`；      
+    热重载监听 bindless 那一族。**注意**：bindless 改的是描述符布局与 .spv，      
+    所以面板勾选框走 `setBindlessEnabled()`（waitIdle + `createPipelines()`），      
     不能像 MDI 那样只翻一个 bool。
   - env：`MYVK_BINDLESS`（默认**关**）、`MYVK_BINDLESS_DBG`（每 30 帧统计）。
-  - 顶点着色器**一份没改**：`pbr.vert` / `pbr.inst.vert` / `pbr.mdi.vert` 三份
+  - 顶点着色器**一份没改**：`pbr.vert` / `pbr.inst.vert` / `pbr.mdi.vert` 三份      
     原样复用（顶点阶段从不采样材质贴图，set 1 的声明与它无关）。
-- **实测参考**（`verify_bindless.py`，7 组断言）。场景：6 个物体 × 6 个材质、
-  每材质的 **6 个贴图槽全部非空**（任一条下标映射错位都会立刻改画面），
+- **实测参考**（`verify_bindless.py`，7 组断言）。场景：6 个物体 × 6 个材质、    
+  每材质的 **6 个贴图槽全部非空**（任一条下标映射错位都会立刻改画面），    
   贴图池只放 14 张（相邻材质**故意共享**）：
-  - 关闭：`bl=0` / `blTex=0` / `blPages=0`、无 `BINDLESS-STATS`、两次运行
+  - 关闭：`bl=0` / `blTex=0` / `blPages=0`、无 `BINDLESS-STATS`、两次运行      
     逐像素一致（平均差 0.0000）；
-  - 打开：`bl=1`、`blTex=17`（= 14 场景贴图 + 3 缺省图；**不去重会是 39**）、
+  - 打开：`bl=1`、`blTex=17`（= 14 场景贴图 + 3 缺省图；**不去重会是 39**）、      
     `blPages=6`（= 材质数）、`setsBound` ≈ 1/帧；
-  - **开 vs 关视口逐像素不变（>18 像素 = 0、平均差 0.0000）**，且
-    `drawnOpaque` / `drawCalls` 与基线**完全相同**（bindless 只减描述符绑定，
-    不动几何提交）；bindless + MDI 同时开着也逐像素不变（覆盖间接路径那条
+  - **开 vs 关视口逐像素不变（>18 像素 = 0、平均差 0.0000）**，且      
+    `drawnOpaque` / `drawCalls` 与基线**完全相同**（bindless 只减描述符绑定，      
+    不动几何提交）；bindless + MDI 同时开着也逐像素不变（覆盖间接路径那条      
     独立的 push 填充分支）。全程零 VUID。
-- **坑点**：见 MEMORY.md **#120~#123**（glslang 对采样器数组的非常量下标要求
-  `GL_EXT_nonuniform_qualifier`，且 `#extension` 必须在任何非预处理记号之前；
-  数组容量要按设备 `maxPerStageDescriptorSamplers` 收窄；页表必须**按帧槽
-  分离**否则会撕裂在途读取；`#ifdef` vs `#if` —— 默认定义成 0 的开关不能用
+- **坑点**：见 MEMORY.md **#120~#123**（glslang 对采样器数组的非常量下标要求    
+  `GL_EXT_nonuniform_qualifier`，且 `#extension` 必须在任何非预处理记号之前；    
+  数组容量要按设备 `maxPerStageDescriptorSamplers` 收窄；页表必须**按帧槽    
+  分离**否则会撕裂在途读取；`#ifdef` vs `#if` —— 默认定义成 0 的开关不能用    
   `#ifdef` 判断）。
-- **回归**：**32/32 全通过**（`_venn_verify/_regression/_reg_bindless_full.log`）。
-  因为 build/bin（新增 8 份 `pbr.bindless.k*.frag.spv` + 重链接的 Editor.exe）
-  与 `tools/*.py` 都变了，产物指纹失效 → 增量机制正确地判定为"全部重跑"
+- **回归**：**32/32 全通过**（`_venn_verify/_regression/_reg_bindless_full.log`）。    
+  因为 build/bin（新增 8 份 `pbr.bindless.k*.frag.spv` + 重链接的 Editor.exe）    
+  与 `tools/*.py` 都变了，产物指纹失效 → 增量机制正确地判定为"全部重跑"    
   （25m05s，零跳过）。
-- **留给后续**：`Material` 的 6 个 `Texture*` 槽仍然在 CPU 侧；真正"材质也在
-  GPU"（可见性缓冲 / 逐片元材质索引）是 R2-4；`VK_EXT_descriptor_buffer` 可以
-  把 set 1 的两条 binding 也省成裸地址；容量 4096 目前是固定数组，改成
-  运行时数组 + `VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT` 可省掉
+- **留给后续**：`Material` 的 6 个 `Texture*` 槽仍然在 CPU 侧；真正"材质也在    
+  GPU"（可见性缓冲 / 逐片元材质索引）是 R2-4；`VK_EXT_descriptor_buffer` 可以    
+  把 set 1 的两条 binding 也省成裸地址；容量 4096 目前是固定数组，改成    
+  运行时数组 + `VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT` 可省掉    
   一部分池预留。
 
 ### R2-3 原始计划（存档）
@@ -440,12 +440,12 @@
 - **改动点**：`Device` 开 `VK_EXT_descriptor_indexing`（或 1.2 feature），建全局大池（`maxPerStageDescriptorSamplers` 上限查询）、`Material` 注册返回 texture index、着色器全部 binding 改数组索引。
 - **依赖**：R2-2 的前置（软），可独立做。
 - **规模**：M~L（改动面广：所有 pbr 变体 shader）
-- **与实现的差异**：① 用 **Vulkan 1.2 feature**（`VkPhysicalDeviceVulkan12Features`）
-  而不是 `VK_EXT_descriptor_indexing` 扩展 —— 1.2 已把同一组特性核心化；
-  ② "所有 pbr 变体 shader"实际只改了 **片元**（顶点阶段不采样材质贴图，
-  三份 vert 原样复用），规模从 M~L 降到 M；③ `Material` 本身**不注册**任何
+- **与实现的差异**：① 用 **Vulkan 1.2 feature**（`VkPhysicalDeviceVulkan12Features`）    
+  而不是 `VK_EXT_descriptor_indexing` 扩展 —— 1.2 已把同一组特性核心化；    
+  ② "所有 pbr 变体 shader"实际只改了 **片元**（顶点阶段不采样材质贴图，    
+  三份 vert 原样复用），规模从 M~L 降到 M；③ `Material` 本身**不注册**任何    
   index（那会给每个材质对象加一层与渲染器绑定的状态），改成渲染时惰性注册
-  + 每帧页表 —— 材质对象保持"纯数据"。
+  - 每帧页表 —— 材质对象保持"纯数据"。
 
 ### R2-4 （远期）变体爆炸对策：visibility buffer / 前向+簇内材质分拣
 
@@ -457,12 +457,39 @@
 
 ## 阶段 3 · 光影质量
 
-### R3-1 阴影硬化三件套
+### R3-1 阴影硬化三件套 ✅ 已完成（2026-10-13）
 
 - **目标**：①级联间混合带（消除接缝）②texel snapping（相机移动阴影不"游动"）③接触硬化（近距离不再漏光）。
-- **改动点**：`ShadowPass`：每级光空间位置按 texel size 取整；混合带 = 采样相邻两级按 depth 混合；接触硬化 = 按 receiver 深度与最近 cascade 距离调 PCF 半径。
-- **验收**：接缝处截图无亮线；相机平移时阴影边缘像素时间序列方差下降；对焦区阴影与基线一致（开关默认关）。
+- **交付**：
+  - `FrameUBO` 尾部新增 `vec4 shadowFilter`（x=混合带宽 y=接触硬化强度）→ **688 B**；      
+    `pbr.frag` 同步声明（新字段只能加在末尾）。
+  - **① 级联间混合带**（`pbr.frag::shadowFactor`）：接收点落在"本级远端最后      
+    `band` 比例"内时，同时采样下一级并按视深度线性混合（`sampleCascade` 单级      
+    采样，box 外返回 1）。`MYVK_SHADOW_BLEND`（0..0.5，默认 0 = 关 = 基线）。
+  - **③ 接触硬化**（同处）：按接收点在级联内的**相对视深度**缩放 PCF 核半径      
+    （近端收、远端放，`radiusScale = mix(1, 1+4·harden, t)`）。`MYVK_SHADOW_HARDEN`      
+    （0..1，默认 0 = 关 = 基线）。
+  - **② texel snapping**（`ShadowPass::updateCascades`）：球心在光轴坐标系里      
+    量化到纹素网格后再重建 lookAt；`ShadowPass::setTexelSnapping(bool)` /      
+    `MYVK_SHADOW_SNAP`（默认 1 = 旧行为）。
+- **⚠ 途中修掉一个真 bug（重要）**：量化原先写成"对 `view * mid` 取整再补回    
+  `view[3][0/1]`" —— 但 `mid` 是 lookAt 的 target，`view*mid == (0,0,-dist)`    
+  **恒成立**，量化一个常量等于什么都没做（开关、日志都"正常"，阴影边缘却    
+  照样连续滑动）。正确做法：用光轴基 `(lx,ly)` 把球心的**世界位置**投影后    
+  量化，再 `center = mid + lx·(sx-ax) + ly·(sy-ay)` 重建 lookAt。
+- **验收手段（关键教训）**：texel snapping 的效果在 `MYVK_SHADOW_RES=2048` 下    
+  是**亚像素级**（一纹素 ≈ 1cm 世界 ≈ 0.05 屏幕像素），且相机一移动"整幅    
+  画面的视差位移"会把它彻底淹没 —— 靠截图像素差分**根本测不出来**（实测    
+  snap 开/关差分在小数点后 5 位完全相同；降到 256 也一样）。最终改为断言    
+  **画面之外的量**：`MYVK_SHADOW_MATRIX_DBG=1` 打第 0 级光空间矩阵的平移列    
+  （×1e6），断言"量化开 = 分段常数 + 一次整格跳、量化关 = 每步都漂移"。
+- **验证**：`tools/verify_shadow_hardening.py`（4 组断言，已进回归 DEFAULT）：    
+  · 组1 关闭态两次运行逐像素一致（max diff = 0）    
+  · 组2 量化：snap 段长 `[5,4]` + 整格跳 977 vs nosnap 每步 121（无重复）    
+  · 组3 混合带：接缝峰值台阶 36.0 → 18.3（−49%），变化局限在 27 行（视口 5.8%）    
+  · 组4 接触硬化：近 0.738 vs 远 0.568（1.30×），3397 像素被改
 - **规模**：M
+
 
 ### R3-2 Froxel 体积雾
 
@@ -586,7 +613,7 @@
 ## 推荐执行顺序（把"性价比/依赖"折算后的直线序）
 
 ```
-R0-1 GPU时戳 ──► R0-2 视图模式 ──► R1-1 TAA ──► R4-1 AlphaMask(小,穿插) ──► R3-1 阴影硬化
+R0-1 GPU时戳 ──► R0-2 视图模式 ──► R1-1 TAA ──► R4-1 AlphaMask(小,穿插) ──► R3-1 阴影硬化 ✅
       │                                  │
       ▼                                  ▼
   R2-1 Hi-Z ──► R1-2 自动曝光 ──► R1-3 LUT ──► R3-2 体积雾 ──► R4-2 SSS ──► R5-1 反射探针

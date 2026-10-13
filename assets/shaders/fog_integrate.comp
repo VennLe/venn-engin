@@ -1,0 +1,70 @@
+#version 450
+// ============================================================
+// fog_integrate.comp —— Froxel 体积雾第二趟：沿 z 前向积分
+//
+// 一个 invocation 负责一个 (x, y) 列（froxel 的整个深度栈）。
+//
+// 前向积分（front-to-back）：
+//   T = 1
+//   for k in [0, froxelZ):
+//     seg = exp(-ext[k] * segLen)          // 本格内的透射率
+//     out[k].rgb = inscatter + scatter[k] * (1 - seg) / max(ext[k], eps) * T
+//     T *= seg
+//     out[k].a   = T
+//
+// 存的是"**进入**该格时"的累积值 —— 这样片元采样像素所在格时，
+// 得到的就是"从相机到该像素表面"的整段积分。
+//
+// 为什么每个 (x,y) 列只能一个线程跑：积分沿 z 有数据依赖
+// （T 是前缀量），并行会读到未写完的邻居。所以这里 dispatch 成
+// (froxelX, froxelY) 个线程，每个线程串行跑 froxelZ 步。
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// 本趟只需要 push 常量里的网格 + 参数（相机在注入趟已消化）。
+layout(push_constant) uniform Push {
+    uvec4 grid;    // x=froxelX y=froxelY z=froxelZ w=flags
+    vec4 params;
+    vec4 params2;  // x=切片最近深度 y=zNear z=zFar w=相位 g
+} pc;
+
+layout(set = 1, binding = 1, rgba16f) uniform image3D fogScatter;
+
+void main() {
+    const uvec3 gid = gl_GlobalInvocationID;
+    if (gid.x >= pc.grid.x || gid.y >= pc.grid.y) return;
+
+    const float sliceNear = pc.params2.x;
+    const float zf = pc.params2.z;
+    const float slices = float(pc.grid.z);
+    const float ratio = zf / sliceNear;
+
+    float T = 1.0;
+    vec3 accum = vec3(0.0);
+
+    for (uint k = 0u; k < pc.grid.z; ++k) {
+        ivec3 c = ivec3(int(gid.x), int(gid.y), int(k));
+        vec4 s = imageLoad(fogScatter, c);  // rgb=单位长度散射 a=单位长度消光
+
+        // 本格厚度
+        float dNear = sliceNear * pow(ratio, float(k) / slices);
+        float dFar = sliceNear * pow(ratio, float(k + 1u) / slices);
+        float segLen = max(dFar - dNear, 1e-5);
+
+        float ext = max(s.a, 0.0);
+        // 段内透射率：exp(-消光 × 段长)。消光→0 时退化为 1（全透）。
+        float segT = exp(-ext * segLen);
+
+        // 段内积分近似：scatter 沿段近似常数。
+        // 段内积分 ≈ scatter / 消光 × (1 - segT)
+        // 消光极小用 segLen 兜底（避免 0/0）。
+        float intFactor = (ext > 1e-4) ? (1.0 - segT) / ext : segLen;
+        accum += s.rgb * intFactor * T;
+
+        T *= segT;
+
+        // 写回：进入第 k 格时的累积散射 + 透射率
+        imageStore(fogScatter, c, vec4(accum, T));
+    }
+}

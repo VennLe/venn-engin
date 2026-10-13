@@ -87,6 +87,14 @@ public:
     }
 
     uint32_t resolution() const { return m_resolution; }
+
+    // 纹素量化（texel snapping）开关。R3-1 之③。
+    //   true（默认）：球心在光空间量化到纹素网格 —— 相机平移时采样网格
+    //     相对世界"整格跳"，阴影边缘不再连续滑动 → 不闪。
+    //   false：球心直接取连续值 —— 供验证脚本做"量化到底有没有降低
+    //     边缘闪烁"的 A/B 对照（关掉后逐像素稳定性必然变差）。
+    void setTexelSnapping(bool on) { m_texelSnapping = on; }
+    bool texelSnapping() const { return m_texelSnapping; }
     // 供 Renderer 写入 set 0 / binding 1（2D array 视图，按帧取）
     VkImageView view(uint32_t frameIndex) const {
         return m_frames[frameIndex % m_frames.size()].arrayView;
@@ -129,6 +137,7 @@ private:
     uint32_t m_cascadeCount = kMaxCascades;
     float m_maxDistance = 0.0f;
     VkFormat m_depthFormat = VK_FORMAT_UNDEFINED;
+    bool m_texelSnapping = true;   // R3-1：阴影边缘稳定化（默认开 = 旧行为）
 
     VkSampler m_sampler = VK_NULL_HANDLE;  // compare sampler（各帧共用）
     VkRenderPass m_renderPass = VK_NULL_HANDLE;

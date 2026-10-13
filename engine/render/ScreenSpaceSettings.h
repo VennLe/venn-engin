@@ -16,6 +16,9 @@
 //   MYVK_SSAO / MYVK_FOG / MYVK_SSGI / MYVK_SSR / MYVK_GODRAYS = 1 开
 //   MYVK_TAA = 1 开；MYVK_TAA_BLEND / MYVK_TAA_CLAMP = 数值覆盖
 //   MYVK_FOG_DENSITY / MYVK_FOG_FALLOFF = 数值覆盖
+//   MYVK_VFOG = 1 开 Froxel 体积雾（R3-2）；MYVK_VFOG_DENSITY /
+//     MYVK_VFOG_ALBEDO / MYVK_VFOG_FALLOFF / MYVK_VFOG_BLOB /
+//     MYVK_VFOG_PHASE_G = 数值覆盖
 //   MYVK_SSAO_RADIUS / MYVK_SSAO_STRENGTH = 数值覆盖
 // 运行时由 Engine 面板实时改（Renderer::screenSpaceSettings()）。
 //
@@ -43,6 +46,26 @@ struct ScreenSpaceSettings {
     bool fog = false;
     float fogDensity = 0.012f;     // 水平方向的基础密度
     float fogHeightFalloff = 0.08f; // 越高越稀的衰减系数（1/米）
+
+    // ---- Froxel 体积雾（R3-2）----
+    // 位置：深度预通道 + 分簇之后、前向之前。逐 froxel 沿视线积分
+    // 内散射/消光，前向按像素采样合成（out = lit·T + inscatter）。
+    // 与上面的**高度晕**是两条独立路径：高度雾只在 pbr.frag 里按
+    // 世界坐标解析求值，没有体积散射、没有局部形状；froxel 雾有。
+    // 默认关 = 基线逐位不变（binding 16 绑 1×1×1 透明图）。
+    //
+    //   vfogDensity      基础密度（1/米，越大雾越浓）
+    //   vfogAlbedo       散射反照率（散射/消光比，0..1；1 = 纯散射）
+    //   vfogHeightFalloff 高度衰减（1/米；越大"越高越稀"越强）
+    //   vfogBlobStrength 局部雾团强度（0 = 均匀介质，>0 让雾有团块形状）
+    //   vfogPhaseG        HG 相位各向异性 g（0 = 各向同性，>0 前向散射
+    //                    → 灯/太阳附近出现光柱；0.6 是常见"雾"取值）
+    bool vfog = false;
+    float vfogDensity = 0.030f;
+    float vfogAlbedo = 0.90f;
+    float vfogHeightFalloff = 0.05f;
+    float vfogBlobStrength = 2.0f;
+    float vfogPhaseG = 0.60f;
 
     // ---- SSGI-lite（屏幕空间全局光，加色注入）----
     bool ssgi = false;

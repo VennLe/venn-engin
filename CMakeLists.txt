@@ -355,7 +355,7 @@ endforeach()
 #   hiz_build.comp.spv        VENN_MSAA_DEPTH=0 → sampler2D
 #   hiz_build.msaa.comp.spv   VENN_MSAA_DEPTH=1 → sampler2DMS
 # 运行期按 HdrTarget::samples() 选（见 HiZOcclusion::createPipelines）。
-set(SHADER_MSAA_DEPTH_COMPUTE hiz_build.comp)
+set(SHADER_MSAA_DEPTH_COMPUTE hiz_build.comp fog_inject.comp)
 
 foreach(SRC ${SHADER_MSAA_DEPTH_COMPUTE})
     set(SRC_PATH ${SHADER_SRC_DIR}/${SRC})

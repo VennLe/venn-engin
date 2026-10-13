@@ -1,1533 +1,498 @@
-# venn —— 项目长期笔记
+# venn —— 项目长期笔记（精编版）
 
-> 2026-10-09 起项目更名为 **venn**（原 MyVulkanEngine），**仓库目录 = `E:\code\cpp\venn-engin`**
-> （CMake 工程名是 `Venn`，两者不一致是刻意的）。工程里**只有一个可执行文件
-> `Editor.exe`**：内置 demo 与独立的 Sandbox 示例程序已按用户要求**全部删除**，
-> venn 启动不再加载任何样例（`resetToEmptyScene`）。
+> 本文是「改动前必读」的浓缩约定集，**只保留仍然有效的规则**。详细叙事见各日
+> `YYYY-MM-DD.md` 日志；本文每条都指向一个明确的代码位置或一个明确的判断。
 >
-> **2026-10-10 起世界坐标系 = 右手系 Z-up**（与 Blender/3ds Max 同向，用户要求）。
-> 相机 up、栅格地面（z=0）、贴地方向（min.z）、glTF 导入转换（绕 X+90°，
-> 见 MeshLoader `kYupToZup`；OBJ 不转）都基于此。详见 2026-10-10 日志。
->
-> **改目录名后必须删 `build/` 重新 configure** —— CMakeCache.txt / VerifyGlobs.cmake 里
-> 全是绝对路径，直接 `cmake --build` 会报 "CMakeCache.txt directory ... is different"。
+> **项目**：从零手写的 Vulkan 引擎（学习向，C++17），仓库 `E:\code\cpp\venn-engin`
+> （CMake 工程名 `Venn`，刻意不一致）。世界坐标系 = **右手系 Z-up**（2026-10-10 起）。
+> 只有一个可执行文件 `Editor.exe`；Sandbox/demo 已全部删除，启动 `resetToEmptyScene`。
+> **改目录名后必须删 `build/` 重新 configure**（CMakeCache 全是绝对路径）。
 
-## 项目定位与分层（新增代码必须放对层）
-从零手写的 Vulkan 引擎（学习向，C++17）。
-`engine/core`(Application 主循环/Window/Input/Logger/Time/WindowGeometry) → `engine/rhi`(Vulkan 封装) →
-`engine/render`(Renderer 组织一帧/HdrTarget/ShadowPass/PostProcess/FrameResources) →
-`engine/scene`(Scene/Camera/Light + SceneSerializer) → `engine/assets`(Mesh/Texture/Material/加载器) ；
-还有 `engine/ui`(ImGuiManager)、`engine/ecs`(World/Entity/Components)。
-应用层只剩 `editor`(EditorApp + 面板 + 自研脚本语言 + 编辑器态场景)。原来并行的
-`game`(SandboxGame) 已删除。依赖方向 `editor → render/ui → scene/assets → rhi → core`；
-**engine/ 不认识 editor/**，唯一接缝是 `Application::activeScene()` /
-`Renderer::setViewportSize` / `viewportTextureId`；一次性收尾走 `Application::onShutdown()`。
-**CMake 目标名**：静态库 `venn`（`project(Venn VERSION 0.2.0)`）+ 可执行 `Editor`。
+## 项目分层（新增代码必须放对层）
+`engine/core`(Application/Window/Input/Logger/Time/WindowGeometry) → `engine/rhi`(Vulkan 封装) →
+`engine/render`(Renderer/HdrTarget/ShadowPass/PostProcess/FrameResources/Environment) →
+`engine/scene`(Scene/Camera/Light/Bvh + SceneSerializer) → `engine/assets`(Mesh/Texture/Material/加载器/Lod)；
+另有 `engine/ui`(ImGuiManager)、`engine/ecs`(World/Entity/Components)、`engine/physics`(碰撞)。
+应用层只有 `editor`(EditorApp + 面板 + 自研脚本 `*.vks` + 编辑器态场景)。
+依赖 `editor → render/ui → scene/assets → rhi → core`；**engine/ 不认识 editor/**，
+唯一接缝 `Application::activeScene()` / `Renderer::setViewportSize` / `viewportTextureId()`；
+一次性收尾走 `Application::onShutdown()`。CMake 目标：静态库 `venn` + 可执行 `Editor`。
 
 ## 构建与运行（Windows + MinGW）
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_C_COMPILER=C:/msys64/ucrt64/bin/gcc.exe \
-  -DCMAKE_CXX_COMPILER=C:/msys64/ucrt64/bin/g++.exe \
+  -DCMAKE_C_COMPILER=C:/Program\ Files/CodeBlocks/MinGW/bin/gcc.exe \
+  -DCMAKE_CXX_COMPILER=C:/Program\ Files/CodeBlocks/MinGW/bin/g++.exe \
   "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"   # 必须（CMake4 拒绝 GLFW 的 3.4）
 cmake --build build -j 8
 ```
-Vulkan SDK 头文件在 `E:/code/vulkan/core/Include`。只有一个目标 `Editor`；资源拷贝
-（shaders/models/scenes/scripts/fonts/icons）由 CMake 函数 `myvk_copy_runtime_assets(target)` 统一负责。
+- **工具链路径含空格** → `-DCMAKE_CXX_COMPILER=` 这类参数**必须整体加引号**，否则按空格拆开。
+- 默认走 `./make build`（`Makefile` + `make.cmd`，驱动 `mingw32-make`）。
+  常用目标 `build / run / clean / rebuild / distclean / package / smoke / info`。
+  **`make run` = 打开编辑器**（唯一入口，无 sandbox/play 目标）。
+- Makefile 配方须**同时兼容 cmd.exe 与 sh** → 只用 `cmake -E`、正斜杠、`cmake -E env`；
+  `echo` 与 `.cmd/.bat` **整文件**必须纯 ASCII（cmd 用 GBK，乱码会被当命令 → 死循环）。
+- `build/bin/imgui.ini` **会在下次启动覆盖默认面板布局**（自动化跑必须 `io.IniFilename=nullptr`）。
+- 第三方库版本锁：**tinygltf 固定 v2.9.4**（master 是 v3 API，不兼容）；imgui 用 master；
+  glfw 3.4；glm 1.0.1；stb / tinyobjloader / VulkanMemoryAllocator 用 master。
 
-**Makefile**（`Makefile` + `make.cmd`，驱动 `mingw32-make`）：`build / run / clean / rebuild /
-distclean / package / smoke / info / help / install-make-alias`。
-**`make run` = 打开编辑器**（唯一入口）。**没有 `sandbox` / `play` 目标** ——
-Sandbox 已删，游戏直接在编辑器视口里跑。
-- 配方须**同时兼容 cmd.exe 与 sh** → 只用 `cmake -E`、正斜杠、`cmake -E env`
-- `echo` 与 `.cmd/.bat` **整文件**必须纯 ASCII（cmd 用 GBK，否则乱码被当命令 → 死循环）
-- 配置戳 `build/.configured-$(BUILD_TYPE)`；`:=` 立即展开变量必须定义在依赖者之前
-- `make run` 用 `cmake -E chdir build/bin`（ImGui 把 imgui.ini 写在 CWD）；`package` 用 `cmake -E tar`
-
-**环境变量**：`MYVK_FRAMES=N`(跑 N 帧退出；**同时抑制窗口几何存档**) /
-`MYVK_EDITOR_PLAY=1`(编辑器启动即 Play) / `MYVK_NO_WINDOW_SAVE=1`(禁止写窗口几何存档) /
-`MYVK_VALIDATION=0` / `MYVK_SHADER_DIR` / `MYVK_ASSET_DIR` /
-`MYVK_SCENE_TEST=1` / `MYVK_FREEZE_ANIM=1` / `MYVK_HIDE_UI=1`(关全部 UI，像素对比必备) /
-`MYVK_GRID=0`(关视口地平面栅格；默认开) /
-`MYVK_CONTENT_DIR=assets/models`(Content 面板初次打开进哪个目录，默认 assets) /
-`MYVK_LOG_RECTS=1`(打印关键控件矩形，给自动化脚本定位用；见"工具") /
-`MYVK_SHADOW_DBG=1`(打 `SHADOW-DBG`：级联数/最大距离/λ/四级分割点/bias/开关，
-`SHADOW-STATS`：每级"提交/考虑"，以及局部光源的 `LOCAL-SHADOW-DBG`
-（候选数/分配数/用掉的层数/maxLights）与 `LOCAL-SHADOW-STATS`（层数/用掉/提交/考虑）
-——排查阴影异常第一步) /
-`MYVK_SHADOW=0`(关掉**方向光**阴影；深度图照常渲染，开关只在片元里) /
-`MYVK_SHADOW_CASCADES=1..4`(**1 = 退回旧单张正交图**，对照实验用) /
-`MYVK_SHADOW_DIST=米`(最远阴影距离 = 距离分级的硬边界，会自动夹到相机远平面以内) /
-`MYVK_SHADOW_LAMBDA=0..1`(级联分割 log/uniform 混合系数，默认 0.6) /
-`MYVK_SHADOW_RES=像素`(每级分辨率，默认 2048) /
-`MYVK_LOCAL_SHADOW=0`(关掉**点光/聚光灯**阴影；深度图照常渲染，开关只在片元里。
-与 `MYVK_LOCAL_SHADOW_LIGHTS=0` **逐像素等价** —— 两条独立路径，验证脚本会断言这一点) /
-`MYVK_LOCAL_SHADOW_LIGHTS=n`(本帧最多几盏灯投；**0 = 一盏都不分配**。灯按到相机的距离
-由近到远排，预算用完就轮不到远处的) /
-`MYVK_LOCAL_SHADOW_RES=像素`(每层分辨率，默认 1024；改它要重建资源，只在 init 读) /
-`MYVK_LOCAL_SHADOW_BIAS=a,b,c`(常数偏移**米** / 斜率偏移**米** / PCF 半径纹素，
-默认 `0.030,0.150,1.2`) /
-`MYVK_EDITOR_NO_HUD=1`(视口叠加层全关；**做视口像素断言前必开** ——
-里面的 FPS/帧时间每次运行都不同，会让"同配置两次逐像素相同"永远失败) /
-**编辑器自动化钩子（2026-10-09 新增，只在设了变量时生效）**：
-`MYVK_EDITOR_SCENE=<路径>`(启动即打开该场景而非空场景) /
-`MYVK_EDITOR_SELECT=<名字>`(启动后按名字选中实体，让手柄/检查器有内容) /
-`MYVK_EDITOR_GIZMO=move|rotate|scale`(启动即切手柄模式) /
-`MYVK_EDITOR_PREFS=1`(启动即开 Preferences 大窗口，截图验证用) /
-`MYVK_EDITOR_CAM="x,y,z,yawDeg,pitchDeg"`(把视口相机摆到指定位姿 —— 截图/交互测试用。
-**必须排在 `MYVK_EDITOR_SCENE` 之后**，见坑点 #53) /
-`MYVK_MSAA / LIGHTS / CLUSTER_CULL=0 / DEPTH_PREPASS=0 / LIGHT_GIZMOS=0 / TILE_SIZE /
-CLUSTER_SLICES / MAX_LIGHTS_PER_CLUSTER / CLUSTER_STATS=1` /
-`MYVK_EDITOR_NO_HUD=1`(2026-10-12：关掉视口里全部 2D 叠加层 → 纯 3D 出图。
-**做视口像素断言时必须设** —— 统计文字里的 FPS/帧时间每次都不同) /
-`MYVK_SKY / IBL / SKY_ZENITH / SKY_GROUND / ENV_DBG=1`(见"天空盒 + 真 IBL"节)。
+## 环境变量（自动化钩子，只在设了时生效）
+- 基础：`MYVK_FRAMES=N`(跑 N 帧退出+抑制窗口存档) / `MYVK_VALIDATION=0` /
+  `MYVK_SHADER_DIR` / `MYVK_ASSET_DIR` / `MYVK_HIDE_UI=1` / `MYVK_NO_WINDOW_SAVE=1` /
+  `MYVK_CONTENT_DIR` / `MYVK_FREEZE_ANIM=1` / `MYVK_SCENE_TEST=1`。
+- **视口像素断言必备**：`MYVK_EDITOR_NO_HUD=1`(关掉视口全部 2D 叠加层)。
+  里面的 FPS/帧时间每次运行都不同，不关掉"同配置两次逐像素相同"永远失败。
+  另 `MYVK_GRID=0`(关地平面栅格，栅格是屏幕空间固定图案，给对比添噪声)。
+- 编辑器自动化：`MYVK_EDITOR_SCENE=<路径>` / `MYVK_EDITOR_SELECT=<名字>` /
+  `MYVK_EDITOR_GIZMO=move|rotate|scale` / `MYVK_EDITOR_PREFS=1` /
+  `MYVK_EDITOR_CAM="x,y,z,yawDeg,pitchDeg"`（**必须排在 MYVK_EDITOR_SCENE 之后**，见坑 #53）/
+  `MYVK_EDITOR_SPACE=world|local` / `MYVK_EDITOR_COLLIDER=hull|capsule` /
+  `MYVK_CHARACTER_MODEL=<路径>`。
+- 渲染开关：`MYVK_MSAA / LIGHTS / CLUSTER_CULL=0 / DEPTH_PREPASS=0 / LIGHT_GIZMOS=0 /
+  TILE_SIZE / CLUSTER_SLICES / MAX_LIGHTS_PER_CLUSTER / CLUSTER_STATS=1` / `MYVK_FRUSTUM_CULL=0` /
+  `MYVK_LOD / MYVK_LOD_BIAS / MYVK_LOD_FORCE / MYVK_LOD_DBG=1`。
+- 阴影（详见渲染管线节）：`MYVK_SHADOW_DBG=1`(打 `SHADOW-DBG`/`SHADOW-STATS`) /
+  `MYVK_SHADOW=0` / `MYVK_SHADOW_CASCADES=1..4` / `MYVK_SHADOW_DIST=米` / `MYVK_SHADOW_LAMBDA=0..1` /
+  `MYVK_SHADOW_RES=像素` / `MYVK_SHADOW_SNAP=0` / `MYVK_SHADOW_BLEND=0..0.5` / `MYVK_SHADOW_HARDEN=0..1` /
+  `MYVK_LOCAL_SHADOW=0`(与 `MYVK_LOCAL_SHADOW_LIGHTS=0` 逐像素等价) / `MYVK_LOCAL_SHADOW_LIGHTS=n` /
+  `MYVK_LOCAL_SHADOW_RES=像素` / `MYVK_LOCAL_SHADOW_BIAS=a,b,c`(米/米/纹素，默认 `0.030,0.150,1.2`)。
+- 环境/IBL：`MYVK_SKY / IBL / SKY_ZENITH / SKY_GROUND / SKY_RES / ENV_DBG=1`。
+- Froxel 体积雾（R3-2）：`MYVK_VFOG=1` / `MYVK_VFOG_DENSITY` / `MYVK_VFOG_ALBEDO` /
+  `MYVK_VFOG_FALLOFF` / `MYVK_VFOG_BLOB` / `MYVK_VFOG_PHASE_G` / `MYVK_VFOG_DBG=1`(打 `VFOG-DBG`)。
+  ⚠ **`MYVK_FOG*` 是另一条路径**（解析式**高度雾**，只在 pbr.frag 里按世界坐标求值）——
+  两条独立，别混。froxel 雾默认关，关时 set0/binding16 绑 1×1×1 透明图 = 基线逐位不变。
+- `MYVK_LOG_RECTS=1`：打印关键控件矩形（自动化定位）；各子系统落盘日志见"工具"节。
 
 ## 渲染管线约定（改动前必读）
-Pass 顺序：`ShadowPass(4 级级联，每级一次独立 depth-only RP) →
-LocalShadowPass(点光/聚光，12 层 2D array，每层一次独立 depth-only RP；未用的层也只清) →
-DepthPrePass(独立 RP) →
-ClusterBuild(compute) → Forward(天空盒 → MSAA resolve，深度 LOAD) →
-PostProcess(Bloom+Tonemap) → 交换链`。**compute 不能在 RP 内部执行** → 深度预通道必须
-独立成 RP；该 RP **无条件执行**（只把"画几何"包进开关），否则前向 RP 的 `LOAD` 深度未定义、画面废。
-- **Forward 内部子顺序**：`不透明 → 地平面栅格 → 透明`。栅格夹在中间是**刻意的**：吃深度测试
-  （墙/柱子/箱子能正确挡住它）+ 不写深度（玻璃能叠在它上面）+ 排在透明之前。
-  它**绝不能**做成 ImGui 叠加层 —— ImGui 永远压在 3D 之上，栅格会穿透一切。
-- **阴影（方向光 CSM，`ShadowPass`）四条硬约定**（2026-10-12 改为级联后重写）：
-  1. **投影矩阵必须是 Zero-to-One**：`glm::orthoRH_ZO`（不是 `glm::ortho`）。Vulkan 的 clip z 是
-     [0,1]，GL 约定的 [-1,1] 会让"写入阴影图的深度"和 `pbr.frag` 采样时算的参考深度不在同一空间
-     → 覆盖区内一切表面被判成阴影（屏幕上一块边界笔直的暗四边形）。
-     对应地 `pbr.frag::shadowFactor` **只对 xy** 做 `*0.5+0.5`，z 直接用。
-  2. **每级正交范围 = "该级视锥切片的包围球"**（`invViewProj` 反投影 8 个角点求球），
-     **不再是"投影物体的世界 AABB"**（那条是单张图时代的写法，已作废）。
-     用**球**而不是**盒**：球半径与光方向无关（盒会随方向变 → 光一转阴影边缘就"呼吸"）。
-     球心还要在**光空间量化到纹素网格**（把差量补回 `view[3][0/1]`），否则相机平移时边缘整片闪。
-     正交的**近平面取 0**（深度线性），靠 `kDepthPadding = 25m` 的外扩保证
-     "光源到切片之间的遮挡体都进深度图"。退化时给 `radius` 一个 0.05 的下限（免得除零）。
-  3. **"只接收不投射"的物体必须 `VisibilityComponent::castShadow=false`**（自带地面就是），
-     否则 300×300 地板会把自己投进每一级 + 自投影 acne。
-  4. **级联分割点用 PSSM practical scheme**：`λ·near·(D/near)^(i/N) + (1-λ)·(near+(D-near)·i/N)`，
-     `D = min(相机远平面, 距离上限)`、λ=0.6。**near/far 必须从 `camera().nearPlane()/farPlane()` 读**，
-     不能写死常量 —— 级联分割、切片角点 NDC 换算、分簇对数切片三处都假设同一组值。
-     D=90/near=0.1 → `9.36 / 19.82 / 36.87 / 90.00`（`tools/verify_csm.py` 会逐项对公式）。
-     级联盒**边缘不淡出**（只在"视深度 > 最大距离"处 `smoothstep` 淡出），否则交界处出现假暗带。
-- **阴影（局部光源：点光 / 聚光灯，`LocalShadowPass`）四条硬约定**（2026-10-12 新增）：
-  1. **近平面按 range 取 `clamp(range/20, 0.1, 2.0)`，不能拍一个小常数**。透视投影的 NDC 深度
-     是**双曲**的，`far/near` 越大，远平面附近两个只差几米的表面在 NDC 上几乎贴在一起。
-     实测 range=32 用 near=0.05 时，"离灯 15m 的遮挡体"与"20m 的地面" **NDC 只差 7.5e-4**
-     → 任何合理的深度偏移都会把阴影整个推没。改 range/20 后同一个场景涨到 **2.8e-2**。
-  2. **深度偏移参数以「米」为单位给，片元里按参考深度换算回 NDC**
-     （`LightShadowRecord.params = (near, far, 光源下标, 有效位)`；
-     `pbr.frag::ndcBiasFromWorld`：`dz/dd = (f − z·(f−n))² / (n·f·(f−n))`）。
-     这是最贵的一个坑：照抄 CSM 的 NDC 常数 `0.0016`，在 range=32/near=0.05 下等于
-     **10 米世界深度** → 聚光灯的阴影一片都不剩（实测 5956 像素差异直接归零）。
-     默认 `(0.030, 0.150, 1.2)` = 常数 3cm / 斜率 15cm / PCF 1.2 纹素。
-     **别给双曲分布的深度配 NDC 常数偏移** —— 那等于在不同距离上配了完全不同的世界偏移。
-  3. **未使用的层每帧也要走一次空的 depth-only pass（只清深度）**。整张 array 是被采样器
-     一起绑定的，留一层停在 UNDEFINED → 验证层直接报 IMAGE_LAYOUT。空清是"快清"，
-     比按需重建 image / 维护 per-frame 布局状态机便宜得多。
-  4. **层分配：按到相机的距离**平方**由近到远贪心，预算不够就整体停在那一盏之前**，
-     不跳过它去找下一盏（那样"哪盏灯有影子"会随相机移动乱跳）。点光 6 层、聚光 1 层，
-     `kMaxLocalShadowLayers = 12`；分配结果写回 `LightInstance::cosOuterType.z`（基准层号）。
-     点光的实际层号 = 基准层号 + `vennCubeFaceIndex(片元方向 − 灯位置)`。
-  光栅化阶段的 `depthBias` 对浮点深度几乎为 0（`r ≈ 2⁻²³`，常数 1.4 → 1.7e-7 NDC）；
-  真正的偏移在片元侧。CSM 那一路也一样。
-- **`ShadowPass` / `LocalShadowPass` 共用 `assets/shaders/shadow.vert`**：靠
-  `ShadowPushConstants.which.y` 选矩阵来源（0 → `FrameUBO.lightSpace[x]`，
-  1 → set0/binding11 的 `lightShadow.records[x].matrix`）。**矩阵只有一份副本**：
-  渲染深度图与 `pbr.frag` 采样读的是同一块 buffer，不可能不一致。
-- `engine/render/ShadowCull.h::visibleInLightClip` 是两套阴影共用的局部 AABB 剔除：
-  正交/透通用（对 `w ≤ 0` 直接放弃剔除），取代了 `ShadowPass.cpp` 里那份假设 w≡1 的旧版。
-- **`ShadowPass` 的推常量是 `ShadowPushConstants`（96B），不是主前向的 `PushConstants`（128B）**：
-  128B 恰好是 Vulkan 保证的下限，塞不下级联索引。两者不同是**合法**的，唯一理由是
-  该 Pass 在**自己的 render pass 内自行绑定 set 0**（绑定时与绘制时同一个管线布局对象）。
-  ⚠ **绝不要把这个 Pass 的绘制搬进前向 Pass 的 render pass**，否则立刻 VUID-08600。
-- **array 深度图的渲染**：framebuffer / `imageStore` **不能挂 array 视图做单层渲染**
-  （那就变成 layered rendering，需要 multiview / `gl_Layer`）。每层单独建一个
-  `VIEW_TYPE_2D` 视图 + framebuffer，采样侧才用 `sampler2DArrayShadow` 一次选层。
-- **缺省贴图的色彩空间**：`Renderer::createDefaultTextures()` 的白色（ORM）与平坦法线
-  **必须 `makeSolid(..., srgb=false)`**（UNORM）。建成 SRGB 会被硬件 gamma 解码：平坦法线
-  (128,128,255) → (0.216,0.216,1.0) → `nSample=(-0.568,-0.568,1.0)`，即"平坦法线"被整体扳了约 39°，
-  大面片上 TBN 一退化就整块变色（又是一条硬边）。颜色贴图（albedo/emissive）才 SRGB。
-- 描述符 **set 0（共 13 个 binding）**：0 FrameUBO / 1 shadowMap
-  （2026-10-12 起是 **`sampler2DArrayShadow`**，第 i 层 = 第 i 级级联）/ 2 lights /
-  3 clusters / 4 lightIndices / 5 clusterStats / 6 jointMatrices / 7 irradianceMap /
-  8 prefilterMap / 9 brdfLut / 10 skyMap /
-  **11 lightShadows（`LightShadowRecord[]` SSBO，逐层的局部光源矩阵，
-  VERTEX|FRAGMENT 两阶段）/ 12 localShadowMap（`sampler2DArrayShadow`，
-  第 i 层 = 第 i 个局部阴影层）**
-  （灯与环境资源全挤进 set 0：Vulkan 只保证 4 个 set 同时绑定，set 1..6 已被六张贴图占满）。
-  `Renderer::kGlobalSetBindings = 13`；7..10、12 是 COMBINED_IMAGE_SAMPLER + FRAGMENT 阶段。
-- **`FrameUBO` 640 字节**（std140）。2026-10-12 加 IBL 的 `vec4 envParams`（384B），
-  再加 CSM 的 `mat4 lightSpace[4]` + `shadowParams`(576) / `cascadeSplits`(592) /
-  `shadowBias`(608)，最后加局部光源的 `localShadowParams`(624) → **640B**
-  （x=常数偏移**米** y=斜率偏移**米** z=PCF 半径 w=总开关）。
-  ⚠ 改 `FrameUBO` 必须同步**所有**声明它的着色器：`pbr.vert`、`pbr.frag`、`sky.vert`、
-  `cluster_build.comp`、`shadow.vert`（后两个只声明前缀，无害但必须一致）。
-- compute 管线复用 `m_globalSetLayout` → dispatch 必须绑 `frame.globalUBOSet`。
-- 推常量 **112B**：`mat4 model + vec4 baseColor + vec4 pbr(metal/rough/normalScale/ao) + vec4 emissive`
-  （`render::PushConstants`；栅格另有 48B 的 `GridPushConstants`）；顶点 `pos3+normal3+uv2` stride 32。
-- ⚠️ **旁路管线必须让 push constant range 与主管线逐字段相同**：set 0 是整个 Pass 一次性绑定的，
-  而 Vulkan 判"管线布局兼容"时**把 push constant range 的范围与阶段也算进去**。若新管线只声明
-  自己的小 range（栅格本来想声 48B），立刻报 VUID-...-08600「set 0 被不兼容的
-  vkCmdBindDescriptorSets 打断」，**后续所有 draw（含透明）全报错**。→ 栅格管线**故意**声明与
-  主前向管线一样的 112B（实际只推 48B，合法）。别想着"换个 layout 重绑一次 set 0"——那会
-  打断 set 0 的既有绑定，反而更糟。
+Pass 顺序：`ShadowPass(4 级级联，每级独立 depth-only RP) → LocalShadowPass(点光/聚光，12 层 2D
+array，每层独立 RP；未用的层也只清) → DepthPrePass(独立 RP) → SSAO(compute) → ClusterBuild(compute) →
+VolumetricFog(compute×2，R3-2，关时不录) →
+Forward(天空盒 → 不透明 → 地平面栅格 → 透明，MSAA resolve，深度 LOAD) → PostProcess(Bloom+Tonemap)
+→ 交换链`。**compute 不能在 RP 内执行** → 深度预通道必须独立成 RP，且**无条件执行**（只把"画几何"
+包进开关），否则前向 RP 的 `LOAD` 深度未定义。
+- **Forward 内部子顺序刻意如此**：栅格夹在不透明与透明之间 —— 吃深度测试（墙能挡它）+
+  不写深度（玻璃能叠） + 排在透明前。它**绝不能**做成 ImGui 叠加层（ImGui 永远压 3D 之上）。
+
+### 阴影 · 方向光 CSM（`ShadowPass`）
+1. **投影矩阵必须是 Zero-to-One**：`glm::orthoRH_ZO`（不是 `glm::ortho`）。Vulkan clip z∈[0,1]，
+   GL 的 [-1,1] 会让深度图与 `pbr.frag` 参考深度不在同一空间 → 覆盖区一片黑。
+   `pbr.frag::shadowFactor` **只对 xy** 做 `*0.5+0.5`，z 直接用。
+2. **每级正交范围 = "该级视锥切片的包围球"**（`invViewProj` 反投影 8 角点求球），**不是物体 AABB**。
+   用球（半径与光方向无关，盒会让光一转阴影边缘"呼吸"）。球心在**光轴坐标系里量化到纹素网格**
+   （`MYVK_SHADOW_SNAP=0` 可关，默认开）。⚠ **量化必须作用在球心的世界位置**：用只含旋转的
+   光轴基 `(lx,ly,lz)` 把 `mid` 投影后取整，再 `center = mid + lx*(sx-ax) + ly*(sy-ay)` 重建
+   lookAt。**不能对 `view*mid` 量化**（`mid` 是 lookAt target，`view*mid≡(0,0,-dist)`，量化 = 空操作
+   —— 这个 bug 曾潜伏到 R3-1 才被 `SHADOW-MATRIX` 日志揪出）。
+   正交**近平面取 0**，靠 `kDepthPadding = 25m` 外扩。退化时 `radius` 下限 0.05。
+3. **只接收不投射的物体必须 `VisibilityComponent::castShadow=false`**（自带地面就是），
+   否则大地板会把自己投进每一级 + 自投影 acne。
+4. **级联分割 PSSM practical scheme**：`λ·near·(D/near)^(i/N) + (1-λ)·(near+(D-near)·i/N)`，
+   `D = min(相机远平面, 距离上限)`、λ=0.6。**near/far 必须从 `camera().nearPlane()/farPlane()` 读**，
+   不能写死（级联分割、切片角点 NDC 换算、分簇对数切片三处假设同一组值）。
+   D=90/near=0.1 → `9.36 / 19.82 / 36.87 / 90.00`（`tools/verify_csm.py` 逐项对公式）。
+   级联盒**边缘不淡出**（只在"视深度 > 最大距离"处 `smoothstep`），否则交界处假暗带。
+5. **R3-1 阴影硬化三件套**（`MYVK_SHADOW_BLEND` / `MYVK_SHADOW_HARDEN` / `MYVK_SHADOW_SNAP`）：
+   `FrameUBO.shadowFilter = (blendBand, harden, 0, 0)`。
+   - **级联间混合带**：接收点落在"本级远端最后 band 比例"内时，同时采样下一级并按深度插值
+     （`pbr.frag::shadowFactor` / `sampleCascade`）。0 = 关 = 基线。
+   - **接触硬化**：按接收点在级联内的相对视深度缩放 PCF 核半径（近端收、远端放）。0 = 关 = 基线。
+   - **texel snapping**：见上第 2 条，默认开（= 原行为）。
+   每件都遵循"默认关 = 逐像素等于基线"，每件都要 A/B 对照。
+   ⚠ **snap 的效果无法用截图验证**（亚像素级）→ 断言 `MYVK_SHADOW_MATRIX_DBG=1` 打的
+   `SHADOW-MATRIX c0 t=(..)`（第 0 级矩阵平移列 ×1e6）：量化开 = 分段常数 + 一次整格跳；
+   量化关 = 每步都漂移。见 `tools/verify_shadow_hardening.py`（4 组断言）。
+
+### 阴影 · 局部光源（点光/聚光，`LocalShadowPass`）
+1. **近平面按 range 取 `clamp(range/20, 0.1, 2.0)`**，不能拍小常数。透视 NDC 深度是**双曲**的：
+   range=32 用 near=0.05 时，"离灯 15m 遮挡体"与"20m 地面" NDC 只差 7.5e-4 → 阴影整个消失；
+   改 range/20 后涨到 2.8e-2。
+2. **深度偏移以「米」给，片元按参考深度换算回 NDC**（`LightShadowRecord.params=(near,far,灯下标,有效位)`；
+   `pbr.frag::ndcBiasFromWorld`：`dz/dd = (f − z·(f−n))² / (n·f·(f−n))`）。
+   照抄 CSM 的 NDC 常数 `0.0016` 在 range=32 下等于 10 米世界深度 → 阴影一片不剩。
+   **别给双曲深度配 NDC 常数偏移**。
+3. **未使用的层每帧也要走一次空 depth-only pass（只清深度）**：整张 array 被采样器一起绑定，
+   留一层停 UNDEFINED → 验证层报 IMAGE_LAYOUT。
+4. **层分配：按到相机的距离平方由近到远贪心，预算不够就整体停在那一盏之前**（不跳过它去找下一盏，
+   那样"哪盏灯有影子"会随相机乱跳）。点光 6 层/聚光 1 层，`kMaxLocalShadowLayers=12`；
+   结果写回 `LightInstance::cosOuterType.z`（基准层号），点光实际层号 = 基准 + `vennCubeFaceIndex(dir)`。
+   光栅化 `depthBias` 对浮点深度几乎为 0，真正偏移在片元侧。
+
+### 阴影 · 共用
+- `ShadowPass`/`LocalShadowPass` 共用 `shadow.vert`，靠 `ShadowPushConstants.which.y` 选矩阵来源
+  （0→`FrameUBO.lightSpace[x]`，1→set0/binding11 `lightShadow.records[x].matrix`）。**矩阵只有一份**。
+- `ShadowCull.h::visibleInLightClip` 是两套阴影共用的局部 AABB 剔除（正交/透通用，`w≤0` 放弃剔除）。
+- `ShadowPass` 推常量是 `ShadowPushConstants`（96B，非主前向 128B）—— 因为它在**自己的 RP 内自行绑
+  set 0**。**绝不要把该 Pass 绘制搬进前向 RP**，否则 VUID-08600。
+- **array 深度图渲染**：framebuffer/`imageStore` 不能挂 array 视图做单层渲染（那是 layered
+  rendering）。每层单独建 `VIEW_TYPE_2D` 视图 + framebuffer；采样侧才用 `sampler2DArrayShadow`。
+
+### 描述符 / FrameUBO / 推常量
+- **set 0（17 个 binding）**：0 FrameUBO / 1 shadowMap(`sampler2DArrayShadow`，第 i 层=第 i 级) /
+  2 lights / 3 clusters / 4 lightIndices / 5 clusterStats / 6 jointMatrices / 7 irradianceMap /
+  8 prefilterMap / 9 brdfLut / 10 skyMap / 11 lightShadows(`LightShadowRecord[]` SSBO，VERTEX|FRAGMENT) /
+  12 localShadowMap(`sampler2DArrayShadow`) / 13 instanceModels(vertex, instancing) /
+  14 ssaoTex(R8，关时绑白图) / 15 mdiInstances(vertex, MDI) /
+  16 vfogTex(`sampler3D`，R3-2，关时绑 1×1×1 透明图)。`kGlobalSetBindings = 17`。
+  （灯/环境/雾资源全挤 set 0：Vulkan 只保证 4 个 set 同时绑，set 1..6 已被六张材质贴图占满。）
+- **`FrameUBO` 704 字节**（std140，有 `static_assert`）。历史：IBL `envParams`(384) → CSM
+  `lightSpace[4]`+`shadowParams`(576)/`cascadeSplits`(592)/`shadowBias`(608) → `localShadowParams`(624)
+  → 高度雾 `fogParams`(640) → `viewModeParams`(656) → R3-1 `shadowFilter`(672) → R3-2 `vfogParams`(688)
+  → 704。
+  ⚠ 改它必须同步**所有**声明它的着色器：`pbr.vert`、`pbr.frag`、`sky.vert`、`cluster_build.comp`、
+  `shadow.vert`、`fog_inject.comp`（后几个只声明前缀，无害但必须一致）。新字段**只能加在末尾**。
+- 推常量 **112B**：`mat4 model + vec4 baseColor + vec4 pbr + vec4 emissive`（`render::PushConstants`）；
+  栅格另有 48B `GridPushConstants`；顶点 `pos3+normal3+uv2` stride 32。
+- ⚠️ **旁路管线的 push constant range 必须与主管线逐字段相同**：set 0 是整个 Pass 一次性绑定的，
+  Vulkan 判"管线布局兼容"时**把 push constant range 的范围与阶段也算进去**。栅格管线因此**故意**
+  声明与主前向一样的 112B（实际只推 48B）。否则立刻 VUID-08600，**后续所有 draw 全报错**。
+  也别想"换个 layout 重绑 set 0"——那会打断既有绑定，更糟。
 - 交换链/纹理均 SRGB，**着色器内不做手动 gamma**；视口/剪刀动态，resize 不必重建管线。
-- 绕序：`addFace(n,u,v,half)` 中 **u×v 必须等于 n**，正面 `COUNTER_CLOCKWISE`（配 `projMatrix` Y 翻转）；
-  `offsetAlongNormal`：立方体面 true，单个面（地面）必须 **false**。
+- 绕序：`addFace(n,u,v,half)` 中 **u×v 必须 = n**，正面 `COUNTER_CLOCKWISE`；
+  `offsetAlongNormal`：立方体面 true，单面（地面）必须 false。
 
 ## 分簇光照（Clustered Forward）
-- **簇编址三处必须一致**（C++ / `cluster_build.comp` / `pbr.frag`）：
-  `idx=(slice*gridY+tileY)*gridX+tileX`，切片 `d(k)=clusterNear·(zf/clusterNear)^(k/slices)`。
-- 切片起点用 `clusterNear` 而非 `zNear`（glm::perspective 未定 ZERO_TO_ONE，NDC z∈[-1,1]）。
+- **簇编址三处必须一致**（C++/`cluster_build.comp`/`pbr.frag`）：`idx=(slice*gridY+tileY)*gridX+tileX`，
+  切片 `d(k)=clusterNear·(zf/clusterNear)^(k/slices)`；切片起点用 `clusterNear` 而非 `zNear`。
 - **固定槽位** `lightIndices[ci*cap+i]`（非原子追加）→ 结果**可复现**，截图对比才有意义。
-- `maxLightsPerCluster` **唯一数据源是 C++**（经 `ubo.lightParams.w` 传给片元），**严禁在
-  pbr.frag 硬编码**。只花显存不花时间 → 默认 **128**。
-- 射灯只按 range 球剔除（锥角在片元算）；衰减用窗口化平方反比 `win²/d²`，range 处严格归零。
+- `maxLightsPerCluster` **唯一数据源是 C++**（经 `ubo.lightParams.w` 传片元），**禁在 pbr.frag 硬编码**。
+  只花显存不花时间 → 默认 128。
+- 射灯只按 range 球剔除；衰减用窗口化平方反比 `win²/d²`，range 处严格归零。
 - 透明（Blend）不写深度、按相机距离**降序**排序、**不参与深度预通道**。
-- 遥测 `stats` SSBO：0 单簇最大 / 1 溢出簇数 / 2 配对数 / 3 空簇数（`beginFrame` 回读并清零）。
+- 遥测 `stats` SSBO：0 单簇最大/1 溢出簇数/2 配对数/3 空簇数（`beginFrame` 回读并清零）。
 
-## 渲染性能三件套（物体级视锥剔除 / BVH / LOD，2026-10-11）
-- **视锥剔除**：`engine/render/Frustum.h/.cpp`（Gribb–Hartmann；本工程 NDC z∈[-1,1]，
-  近平面 `r3+r2`）。`uploadSceneState` 按**本场景**相机重建 `m_sceneFrustum`，
-  `buildDrawLists` 用它筛世界 AABB。开关 `frustumCullingEnabled()` / `MYVK_FRUSTUM_CULL=0`
-  （关掉=全量提交，是"开关两次画面逐像素一致"的对照组）。
-- **BVH**：`engine/scene/Bvh.h/.cpp`。`Scene::spatialIndex()` 每帧一次：实体集合（含**顺序**）
-  变了 → `build`，否则 `refit`。渲染剔除与编辑器射线拾取**共用同一棵**（拾取 O(log N)）。
-  ⚠ `query` 的叶子必须**逐元素复测**（叶子盒是成员的**并集**，并集相交 ≠ 每个成员相交）；
-  `refit` 倒序遍历依赖"父下标恒小于子下标"；`buildRange` **只能重排 order 下标表，不能动
-  items**（否则 refit 会把叶子拟合到别的实体上 → 第二帧起漏画）。自检 `MYVK_BVH_DBG=1`
-  打 `BVH-DBG brute= bvh= missing= extra=`，`missing>0` 就是会漏画的硬错误。
-- **LOD**：`engine/assets/Lod.h/.cpp` + `AssetManager::ensureLod`（`Application::run` 每帧对
-  当前场景的可见网格调一次，惰性幂等，不给内容浏览器里的临时网格白建层级）。
-  `switchRatio[i]` = **进入第 i 级**的比值上界（区间 `[switchRatio[i+1], switchRatio[i])`，
-  默认 {1.0, 0.25, 0.10, 0.04}，迟滞 1.15）。比值 = `AABB半对角线 / (距离 × tan(fovY/2))`。
-  `selectLevel(ratio, bias, current)` 里 **bias 是除**（bias>1 → 更快落低模）；`current<0`
-  时**从高模往下退**，不能写成"返回第一个满足 r<阈值的层"。
-  生成：程序化图元按细分逐级减半重生成；导入网格走顶点聚类（位置取格内**平均**），
-  格分辨率按"目标=上一级一半三角形"**二分搜索** [2,256]，不能写死。
-  **蒙皮网格不生成**（jointBase 按 `Mesh*` 记，换网格会对不上）。
-  开关 `lodEnabled()/lodBias()/forcedLodLevel()`、env `MYVK_LOD` / `MYVK_LOD_BIAS` /
-  `MYVK_LOD_FORCE`；`MYVK_LOD_DBG=1` → `LOD-BUILD` / `LOD-STATS` / `LOD-SWITCH`。
+## 渲染性能三件套
+- **视锥剔除**（`render/Frustum.h/.cpp`，Gribb–Hartmann；本工程 NDC z∈[-1,1]，近平面 `r3+r2`）：
+  `uploadSceneState` 按**本场景**相机重建 `m_sceneFrustum`。开关 `frustumCullingEnabled()`/
+  `MYVK_FRUSTUM_CULL=0`（关掉=全量提交，是"开关两次逐像素一致"的对照组）。
+- **BVH**（`scene/Bvh.h/.cpp`）：`spatialIndex()` 每帧一次，实体集合（含**顺序**）变了→`build`，
+  否则 `refit`。渲染剔除与编辑器射线拾取**共用同一棵**。
+  ⚠ `query` 叶子必须**逐元素复测**（叶子盒是成员并集，并集相交 ≠ 每个成员相交）；
+  `refit` 倒序遍历依赖"父下标恒小于子下标"；`buildRange` **只能重排 order 下标表，不能动 items**。
+  自检 `MYVK_BVH_DBG=1` 打 `BVH-DBG brute= bvh= missing= extra=`，`missing>0` = 会漏画的硬错误。
+- **LOD**（`assets/Lod.h/.cpp` + `AssetManager::ensureLod`）：`switchRatio[i]` = 进入第 i 级的上界
+  （默认 {1.0,0.25,0.10,0.04}，迟滞 1.15）；比值 = `AABB半对角线/(距离×tan(fovY/2))`。
+  `selectLevel(ratio,bias,current)` 里 **bias 是除**（>1 → 更快落低模）；`current<0` 时**从高模往下退**。
+  程序化图元按细分减半重生成；导入网格走顶点聚类（格分辨率二分搜索 [2,256]）。
+  **蒙皮网格不生成**（jointBase 按 `Mesh*` 记）。`MYVK_LOD_DBG=1` → `LOD-BUILD/STATS/SWITCH`。
+- **Hi-Z / 遮挡剔除**：候选 AABB 表必须收**所有**视锥内物体；两帧延迟回读有时序不变量。
+- **MDI（间接绘制）**：`vkCmdDrawIndexedIndirect` 不带 VB/IB → **必须自己绑**；
+  提交组键必须含"网格"；"Pass 2.5" 要放 `recordFrame` 不是 `recordSceneInto`；
+  `pbr.mdi.vert` 读的 binding 15 必须在 set 0 layout 里声明。
 
-## 天空盒 + 真 IBL（split-sum，2026-10-12）
-模块：`engine/render/Environment.h/.cpp`（自持 4 张图 + 采样器 + 描述符池 + 4 条 compute 管线）
-\+ 6 个新着色器 `common.glsl` / `sky_cube.comp` / `ibl_irradiance.comp` / `ibl_prefilter.comp` /
-`ibl_brdf.comp` / `sky.vert` / `sky.frag`。`Renderer::createEnvironment()` 在 init 第 9.5 步调用。
-- **天空模型唯一来源是 `vennSkyColor(dir, zenith, ground)`**（在 `common.glsl`，`venn` 前缀全局命名
-  空间的公共库）。梯度**必须用 `dir.z`**（Z-up）—— 用 `dir.y` 会让地面上出现一条笔直的明暗带。
-- **烘焙用 compute 而不是 6 次 render pass**：面号→方向是纯函数 `vennCubeDir(face, uv)`，
-  一趟 dispatch 的 z 维 = 6 就写满，不需要 6 个 framebuffer / render pass。
-- ⚠ **`imageStore` 不能指定 mip** → 预过滤每个 mip 各建一个 `VIEW_TYPE_2D_ARRAY` 视图
-  （`baseMipLevel = m`），逐级写入。
-- **天空立方体 `RGBA32F`、BRDF LUT `RG32F` 是为了 CPU 回读**（免掉半精度转换代码，数值自检
-  直接读 float）。irradiance / prefilter 只要 `RGBA16F`。
-- **天空 pass 排在前向 Pass 最前**（`depthTest/depthWrite` 全关）→ 排到最后会盖掉地平面栅格
-  （栅格也不写深度，像素深度停在 1.0，正好落进"天空该画"的判据里）。
-- **天空/栅格管线的 set 布局 + 推常量范围必须与主前向管线逐字段一致**（见上文 VUID-08600 那条）。
-- split-sum（Karis）：漫反射 = `albedo × irradiance(N)`（卷积时乘了 π，与 Lambert 的 1/π 抵消）；
+## 天空盒 + 真 IBL（split-sum）
+模块 `render/Environment.h/.cpp`（4 张图 + 采样器 + 描述符池 + 4 条 compute）+ `common.glsl` /
+`sky_cube.comp` / `ibl_irradiance.comp` / `ibl_prefilter.comp` / `ibl_brdf.comp` / `sky.vert` / `sky.frag`。
+- **天空模型唯一来源 `vennSkyColor(dir, zenith, ground)`**（`common.glsl`）。梯度**必须用 `dir.z`**
+  （Z-up）—— 用 `dir.y` 会出现一条笔直的明暗带。
+- **烘焙用 compute 而非 6 次 RP**：`vennCubeDir(face,uv)` 是纯函数，dispatch z 维=6 就写满。
+- ⚠ **`imageStore` 不能指定 mip** → 预过滤每 mip 各建一个 `VIEW_TYPE_2D_ARRAY`（`baseMipLevel=m`）。
+- 天空立方体 `RGBA32F`、BRDF LUT `RG32F`（为 CPU 回读免半精度转换）。irradiance/prefilter `RGBA16F`。
+- **天空 pass 排在前向 Pass 最前**（depthTest/Write 全关）→ 排最后会盖掉地平面栅格。
+- split-sum（Karis）：漫反射 = `albedo × irradiance(N)`（卷积乘 π，与 1/π 抵消）；
   镜面 = `prefilter(R, rough×maxLod) × (F0×A + B)`。
-- **BRDF LUT 有解析解**：`(N·V=1, roughness=0)` 处**精确** `A=1, B=0`
-  （V=N → H=N → G_vis=1、Fc=0）。是全链路唯一能硬断言的检查点。
-- 保留旧的程序化近似路径，用 `FrameUBO.envParams.x` 切换。**这不是备用方案**，是"两条路径
-  必须给出不同画面"的对照实验手段。
-- env：`MYVK_SKY` / `MYVK_IBL`（0/1）、`MYVK_SKY_ZENITH`/`MYVK_SKY_GROUND`（`"r,g,b"`）、
-  各尺寸与样本数（`MYVK_SKY_RES` 等）、`MYVK_ENV_DBG=1` → `ENV-DBG` / `ENV-READBACK`。
+- **BRDF LUT 有解析解**：`(N·V=1, roughness=0)` 处**精确 A=1, B=0** —— 唯一能硬断言的检查点。
+- 保留旧程序化近似路径，用 `FrameUBO.envParams.x` 切换（"两条路径给出不同画面"的对照实验手段）。
 
-## Shader 变体 / 关键字系统（2026-10-12）
+## Shader 变体 / 关键字系统
 着色器是**离线 glslc 预编译的固定管线**。关键字 = 位集合（掩码 0..7），
-`render/ShaderKeywords.h` 是唯一事实来源；位序在**三处逐字对齐**：
-`ShaderKeywords.cpp` 的 `kKeywords[]` / `CMakeLists.txt` 的 `SHADER_KEYWORDS`
-+ `VARIANT_DEFINES_0..7` / `assets/shaders/pbr.frag` 的 `#if`。
-- bit0 `VENN_DOUBLE_SIDED` `double-sided`：改代码（`gl_FrontFacing` 翻法线）+ 改状态（cullMode）
-- bit1 `VENN_ALPHA_BLEND`  `alpha-blend` ：改代码（真 alpha）        + 改状态（混合/不写深度）
-- bit2 `VENN_NORMAL_MAP`   `normal-map`  ：改代码（采样+TBN）        + **不改状态**
-- 变体文件名：`pbr.frag` + 掩码 n → **`pbr.k<n>.frag.spv`**（k0..k7 八份）。
-  实测八份字节数全不同（k0=39644 … k4=42856 … k7=43156，k4 多 3.2KB = 法线+TBN）。
-- **掩码同时推导"编哪份 .spv"与"管线固定状态"**（`VariantPipelines::get` +
-  `applyKeywordState`），结构上杜绝"编译期双面、栅格化还在剔背面"。
-  `stateMask` 过滤：深度预通道只按 `kKeywordDoubleSided` 分（`depth_created=2`）。
-- **队列分类也跟着掩码**（`hasKeyword(kw, kKeywordAlphaBlend)`），不再看 `mat->alphaMode`。
+`render/ShaderKeywords.h` 唯一事实来源；位序在三处逐字对齐：`ShaderKeywords.cpp::kKeywords[]` /
+`CMakeLists.txt` 的 `SHADER_KEYWORDS` + `VARIANT_DEFINES_0..7` / `pbr.frag` 的 `#if`。
+- bit0 `VENN_DOUBLE_SIDED`(改代码+改 cullMode) / bit1 `VENN_ALPHA_BLEND`(改代码+改混合/不写深度) /
+  bit2 `VENN_NORMAL_MAP`(只改代码,**不改状态**)。
+- 变体文件名 `pbr.k<n>.frag.spv`（k0..k7）。掩码同时推导"编哪份 .spv"与"管线固定状态"
+  （`VariantPipelines::get` + `applyKeywordState`）。队列分类也跟着掩码。
+- **两条硬约定**：① 绑定缓存的"什么都没绑"哨兵**不能用 0**（0 是合法掩码）→
+  `kBindsNothing = 0xFFFFFFFFu`，栅格管线之后必须重置。② `SHADER-VARIANTS` 自检日志
+  **必须打在前向 Pass 之后**（`variantSwitches` 在 Pass 循环里累加）。
+- 变体**共用同一 VkPipelineLayout**（正确性要求，防 VUID-08600）；`rhi::PipelineDesc.sharedLayout`
+  （非空则用、不拥有不销毁）。
+- `fillForwardPipelineDesc` 里 `desc.fragSpv = readFile("pbr.frag.spv")` 必须删（单体已不生成）。
+- **glslang：采样器数组非常量下标要显式声明扩展，且 `#extension` 必须在所有非预处理语句之前**。
+- **默认定义为 0 的编译开关不能用 `#ifdef` 判断**。
 
-**两条硬约定**
-1. 绑定缓存的"什么都没绑"哨兵**不能用 0**（0 是合法掩码，全关材质就是 0）→
-   `constexpr KeywordMask kBindsNothing = 0xFFFFFFFFu;`。栅格管线之后**必须重置**。
-2. `SHADER-VARIANTS` 自检日志**必须打在前向 Pass 之后**（`variantSwitches` 在
-   Pass 循环里累加；放 `buildDrawLists` 里读永远是刚清零的 0 —— 踩过）。
-
-**⚠ 真 bug（被新脚本揪出）**：`VariantPipelines::layout()` 曾写成
-`get(kKeywordNone).layout()`，"借基线那份用"→ **每次取布局都白建一个 k0 变体**，
-违背"只建用到的"。`FORCE_MASK=0` 时恰好蒙混过关，`=4/=1` 时报 `fwd_created=2`。
-修法：`rhi::PipelineDesc` 加 `sharedLayout`（非空则用、**不拥有不销毁**），
-抽出 `rhi::createPipelineLayout(device, desc)`；`init()` 只建**一份**布局供全体变体复用。
-**变体共用同一 VkPipelineLayout 是正确性要求**（set 0 一整个 Pass 绑一次，
-中途换 layout 不兼容的管线 → 后续 draw 报 `VUID-...-08600`），不是优化。
-
-**`NORMAL_MAP` 等价性**：内置平坦法线是 8 位 `(128,128,255)`，`*2-1` 得
-`(0.00392, 0.00392, 1.0)`（128/255 ≈ 0.50196，**不是**精确 0.5）→
-`FORCE_MASK=0 vs 4` 实测 **最大差 1 个 LSB、>18 的像素 0 个、均值 0.1012、bbox=None**。
-配对断言（防"两边都错"）：挂非平坦棋盘法线图时 **5808 像素 / 最大差 30**（卡 max>20）。
-
-**⚠ `fillForwardPipelineDesc` 里 `desc.fragSpv = readFile("pbr.frag.spv")` 必须删掉**
-—— 单体 `pbr.frag.spv` 已不再生成，留着启动即 `Fatal: Failed to open file`。
-
-## 视口像素断言的纪律（2026-10-12 血的教训）
-- ⚠ **`ViewportPanel::drawOverlay` 会在视口左上角画 FPS / 帧时间**（`1317 FPS 0.76 ms`、
-  `entities N` …），这些数字**每次运行都不同**。同配置跑两次，左上角区 `region_diff` = 2.72，
-  而右上 / 左下 / 中心精确为 0.00 —— 曾让我误判成"IBL 开关污染了背景"，白查一轮。
-  → 自动化跑视口像素断言**必须先 `MYVK_EDITOR_NO_HUD=1`**（`ViewportPanel::setHudVisible(false)`，
-  连统计文字 + 导航 HUD + 左下角导航球一起关掉；只影响 ImGui 覆盖层，不动 3D 场景）。
-- `region_diff` 按 `range(x0,x1,2)` **stride 抽样**：全区域均值 1.11 的区可能算出 4.48。
-  归因前先打印"全区域均值 + 差异像素清单"，别只看一个数。
-- 色调映射会把高光段压平：线性空间 2.1× 的比值差到画面上只剩 1.24×。
-  **别用固定倍数阈值**，改用"逐级落差 > ε"或"单调性"这类判据，对方向性 bug 反而更敏感。
-- **把日志行当"读数表"时，先打印一次 `m.groups()` 再写断言**：多分量日志（`SHADOW-DBG`
-  有 12 个捕获组）手数分组号必错一次 —— 曾把 `enabled` 写成 `group(11)`，拿到的是
-  `bias.w = 0.55`，40 条断言全绿只这一条假红。
-- **"全有 / 全无"的开关测不出"分级"**：要证明"距离分级"，得取一个**落在淡出区间内**的
-  中间阈值（`MYVK_SHADOW_DIST=70` → 差异被削弱但仍在），再配上两端（完整 / 逐像素相同），
-  三个点连起来才是**单调信号**。只测开关两端等于没测分级。
-- **"整体亮度偏移"这类伪信号要用"变化定位"排除**：断言差异**只**落在预期区域
-  （如地面窄带）、且**别的区域平均差 ≈ 0**。只看"画面变了"会把全局偏移也算通过。
+## 视口像素断言的纪律（血的教训）
+- ⚠ `ViewportPanel::drawOverlay` 会画 FPS/帧时间（每次运行都不同）→ 断言前**必须
+  `MYVK_EDITOR_NO_HUD=1`**。
+- `region_diff` 按 stride 2 抽样：全区域均值 1.11 的区可能算出 4.48。归因前先打印
+  "全区域均值 + 差异像素清单"，别只看一个数。
+- 色调映射会压平高光：线性 2.1× 的比值到画面只剩 1.24×。**别用固定倍数阈值**，
+  用"逐级落差 > ε"或"单调性"判据。
+- **把日志行当读数表时，先打印一次 `m.groups()` 再写断言** —— 多分量日志手数分组号必错一次。
+- **"全有/全无"的开关测不出"分级"**：要证明"距离分级"得取一个**落在淡出区间内**的中间阈值，
+  再配两端，三点连起来才是单调信号。
+- **"整体亮度偏移"这类伪信号要用"变化定位"排除**：断言差异**只**落在预期区域、别的区域 ≈ 0。
+- **验证"输入驱动"的行为别只靠像素差分**（编辑器场景是大片平滑渐变，轻微视角变化就差分很大）。
+- **验证脚本结尾必须打 `结果: PASS`/`结果: FAIL: ...` 汇总行**（run_regression.py 依赖它）。
+- **回归可增量跑**：`run_regression.py` 会跳过"上次 PASS 且产物未变"的。
 
 ## editor/ 编辑器层约定
 三条铁律：**① 编辑器模式不跑游戏逻辑 ② 渲染目标是 ImGui 子窗口而非全屏 ③ 编辑态与运行态分离**。
-- **运行态 = 同进程的内存副本**（`m_runtimeScene`，最核心）：`EditorContext::activeScene()` 是唯一
-  分派点 —— `usingRuntime() ? m_runtimeScene : m_editorScene`。点 Play 把编辑态
-  `sceneToJson` → `sceneFromJson(m_runtimeScene)`（**内存拷贝，不落盘、不起进程**），
-  于是**视口自己就变成了游戏画面**（复用同一条离屏渲染链，不需要第二个窗口）。
-  - **不做跨进程**：曾用 `Editor.exe --play <快照>` 另起进程弹独立游戏窗口（`GameProcess`/`PlayerApp`），
-    已**整体删除**。原因：用户要的是"就在原来视口里显示"；同进程零渲染器改动即可达成。
-  - 运行态相机：`play()` 里对**副本**调 `setUseGlobalInput(false)` + `setFlyMode(true)`；
-    **此后编辑器不再驱动它**（视口在 Play 期间不处理任何键鼠导航），怎么动由游戏逻辑决定。
-    编辑态相机不受影响（详见"视口相机与导航"一节）。
-  - `pause()` 只翻状态；`stop()` 丢弃 runtime scene、复位 `m_gameFullscreen`、`validateSelection()`。
-  - 脚本只在 Play 态跑，且只作用于 **runtime scene**；编辑态只 `preloadScripts()`（编译不执行）。
-- **Play 期间编辑器只读**（gizmo/Inspector/层级增删被 `!isEditing()` 挡住 —— 那边跑的是副本，
-  改了也同步不回去；想做"边跑边编辑"要另开一轮设计）。
+- **运行态 = 同进程的内存副本**（`m_runtimeScene`）：`EditorContext::activeScene()` 是唯一分派点
+  （`usingRuntime() ? m_runtimeScene : m_editorScene`）。Play = 编辑态 `sceneToJson` →
+  `sceneFromJson(m_runtimeScene)`（**内存拷贝，不落盘不起进程**）→ 视口自己变成游戏画面。
+  **不做跨进程**（`GameProcess`/`PlayerApp` 已整体删除）。运行态相机 `play()` 里对副本调
+  `setUseGlobalInput(false)`+`setFlyMode(true)`，此后编辑器不再驱动它。
+  `pause()` 只翻状态；`stop()` 丢弃 runtime scene、复位 `m_gameFullscreen`、`validateSelection()`。
+- **Play 期间编辑器只读**（gizmo/Inspector/层级增删被 `!isEditing()` 挡住）。
 - **命令模式**：值编辑 `RawBytesEditCommand`，结构编辑 `SceneSnapshotCommand`（整场景 JSON）；
-  统一入口 `structuralEdit(name,fn)`（捕 before → 执行 → 捕 after）。破坏性操作**两段式**
-  （ECS 遍历期间不能增删 → 攒 pending 队列，树画完再 `flushPending()`）。
+  统一入口 `structuralEdit(name,fn)`。破坏性操作**两段式**（ECS 遍历期间不能增删 → 攒 pending
+  队列，树画完 `flushPending()`）。
 - **视口解耦**：`setViewportSize` 让 3D 输出写离屏图，`viewportTextureId()` 给 `ImGui::Image`。
-  纹理稳定性：draw data 在 drawFrame 前已构建 → ① recreate 保留场景输出图 ② `createViewportTextures`
-  比较未变则不重注册 ③ ViewportPanel 尺寸刚变那帧不画图（`m_resizePending`）。
-- **布局**：SplitLayout 二叉分栏树（比例 0..1 → 自适应）；主体面板必须 **Always 落位 +
-  NoMove/NoResize**；分隔条用前景 DrawList 画线 + 手动命中。标题带状态须加稳定 ID（`###viewport`）。
-- **自研脚本 .vks**（`editor/script/ScriptEngine.{h,cpp}`）：`ScriptHost{scene,entity}` 是唯一接缝
-  （安全性是结构性的）；热重载 mtime 轮询 0.5s，**编译失败保留上一版**；数值用 double，
-  `rotate` 单位是**度**，步数上限防死循环。
-- **全局观感走 `ImGuiManager::applyVennStyle()`**（`init()` 里 `StyleColorsDark()` 之后调）：
-  尺寸 `FramePadding(9,5)/ItemSpacing(9,7)/WindowPadding(10,8)/圆角 4px`；配色 accent
-  `(0.16,0.53,0.94)`、`WindowBg(0.106,0.110,0.118)`、`MenuBarBg == TitleBg(0.113,0.117,0.125)`
-  —— 工具条刻意用同一个颜色，和菜单栏**连成一条顶栏**（UE 观感的关键）。
-- **面板宽度按窗口宽度自适应**：`kLeftFrac 0.175 / min 300 / max 520`、`kRightFrac 0.205 / min 330 / max 560`；
-  用户拖过分隔条后 `m_userAdjusted=true` 不再自动重算，仅"首帧或宽度变化 >1.25×/<0.8×"时重算。
-  （原因：最大化 3840 时固定 320px 侧栏只占 8%，挤成一坨。）
-- **快捷键**：`F2` 重命名（Hierarchy / Content 各自处理，Content 只在鼠标悬停本面板时生效）、
-  `Ctrl+D` 复制、`Ctrl+N` 新建场景、`Delete` 删除、`Backspace` 上一级。
-- **Content 面板的右键菜单是"显式单 popup"**：`DrawEntry` 只写 `m_ctxRequest/m_ctxEntry`，
-  `drawGrid()` 循环外 `OpenPopup(kEntryCtxPopup)` + `drawEntryContextMenu()`；`BeginPopup`
-  返回 false 就自动把 `m_ctxOpen` 清掉（状态自愈，不需要额外关闭逻辑）。见坑点 #30。
+  纹理稳定性：① recreate 保留场景输出图 ② `createViewportTextures` 比较未变则不重注册
+  ③ ViewportPanel 尺寸刚变那帧不画图（`m_resizePending`）。
+- **布局**：SplitLayout 二叉分栏树；主体面板必须 **Always 落位 + NoMove/NoResize**；
+  标题带状态须加稳定 ID（`###viewport`）。
+- **自研脚本 .vks**（`editor/script/ScriptEngine.{h,cpp}`）：`ScriptHost{scene,entity}` 是唯一接缝；
+  热重载 mtime 轮询 0.5s，**编译失败保留上一版**；数值用 double，`rotate` 单位是**度**，
+  步数上限防死循环。只在 Play 态跑且只作用于 runtime scene。
+- **全局观感走 `ImGuiManager::applyVennStyle()`**：accent `(0.16,0.53,0.94)`、
+  `WindowBg(0.106,0.110,0.118)`、`MenuBarBg == TitleBg(0.113,0.117,0.125)`（工具条与菜单栏
+  **连成一条顶栏**，UE 观感关键）。
+- **面板宽度自适应**：`kLeftFrac 0.175/min300/max520`、`kRightFrac 0.205/min330/max560`；
+  用户拖过分隔条后 `m_userAdjusted` 不再自动重算。
+- **快捷键**：`F2` 重命名 / `Ctrl+D` 复制 / `Ctrl+N` 新建场景 / `Delete` 删除 / `Backspace` 上一级。
+- **Content 右键菜单是"显式单 popup"**：只写 `m_ctxRequest/m_ctxEntry`，循环外 `OpenPopup` +
+  `drawEntryContextMenu`；`BeginPopup` 返回 false 就自动清状态。
 
-### Shift+A 添加菜单 / 播放条 / Preferences（2026-10-10 新增）
-- **Shift+A 菜单**（视口 hovered 才触发；按住右键驾驶相机时不抢键）：popup 每帧无条件提交；
-  落点 `m_addSpot` = 鼠标射线 ∩ z=0（朝天兜底视线前方 5 米）。Mesh 子项 = primitive 贴地
-  （`createPrimitiveOnGround` 抬半高）；Light 子项里 **Sunlight = 场景级太阳**（唯一、有阴影、
-  日照预设、`Scene::lightEntity()` 访问器，太阳不进实体序列化）；**Directional Light = 实体级
-  补光**（`LightInstance::Type::Directional=2`：`positionRange.w=1e5` 影响球 trick 让分簇剔除
-  全覆盖，`collectLights` 跳过太阳实体，pbr.frag `shadeLocalLight` 按 `cosOuterType.y>1.5`
-  分支取 `Ld=normalize(-direction)`、att=1）。
-- **播放条**：`LayoutRects.transport`，`computeLayout` 从视口底部扣 `kTransportH=34px`
-  （3D 渲染高度自然缩小），`EditorApp::drawTransportBar` 居中画 Run|Play|Pause|Stop；
-  Content 底行仍是统计文字（播放条曾在这里，已还原）。
-- **Preferences**：`drawSettingsPanel`，920x620 居中可缩放，左 168px 分类栏
-  （Interface/Viewport/Editing/Keymap/Scene）+ 右内容页，apply 不持久化。
-  窗口 ID 是 `###prefs`——**别沿用旧名**（imgui.ini 残留旧窗口位置会让它飞到角落，见坑点 #43）。
-
-### 编辑器锁定 + 数字键 0「落地」（2026-10-10 新增）
-- **`ecs::LockedComponent`（纯标记）**＝"看得见、动不了"。两处生效：
-  `PickingSystem::pick` **跳过**它（点空地 = 不选中任何东西，而不是选中地面）、
-  `GizmoController::update` 直接 return（挡住"从层级树选中"这条路径）。
-  序列化字段 `je["locked"]`（**读写都要补**，否则存档再打开地面就自动解锁了）。
-  出口只有一个：Inspector Transform 段的 `Locked` 勾（走 `structuralEdit` 可撤销），
-  锁定期间整段变换字段 `BeginDisabled`；Hierarchy 后缀 `[locked]`。
-  自带 `Ground` 默认带这个组件 —— 它是编辑器的参照系，**别让它参与点选/变换**。
-- **数字键 0 = 落地**（`ViewportPanel::dropSelectionToGround`）：把选中物体**竖直**挪到地面，
-  只改 z、让**世界包围盒底部**贴到 z = 0（用 `PickingSystem::worldAabb`）。
-  两条硬约束：① 只认"**在 3D 视口里左键点中**"的选中（`EditorContext::selectionFromViewport()`
-  —— `selectFromViewport()` 置真，`select()` / `clearSelection()` 置假），层级树选中时只提示不动手；
-  ② 只对有网格的实体生效（灯/相机没有包围盒）。位移是世界空间的，父节点下要换算回父空间
-  （`inverse(parentWorld) * vec4(0,0,dz,0)`），入栈走 `TransformEditCommand`。
-
-### 碰撞体系统（2026-10-10 新增，`engine/physics/` 四文件 + `editor/ColliderView`）
-- **QuickHull**（`ConvexHull`）三维凸包，必须配冲突表（UV 球级输入否则 15 亿次距离计算）；
-  退化输入（Plane 共面）兜底成 2cm 薄板。**GJK+EPA**（`ConvexCollision`）不依赖绕序：
-  面朝向用对顶点定向 / `n·v>0`。支撑函数 `support_{M·S}(d)=M·support_S(Mᵀ·d)` → 非均匀缩放精确。
-- **`CollisionComponent` 与 TransformComponent 字段名/类型/欧拉序完全一致** → 手柄只换指针
-  （`GizmoController::TrsPointers` + `m_onCollider`，世界矩阵 = 实体世界 × `cc.localMatrix()`）。
-  序列化只存 7 参数，凸包顶点读盘后按 mesh 重建（不落盘）。
-- **"刚好包裹" = 顶点按 AABB 中心居中**（否则缩放手柄往外拉而非绕自己放大）；胶囊半径取
-  另两维半长的**外接圆**半径（内切会露角）。入口：视口右键菜单（按下/松开 <6px 才算点击，
-  与右键转相机共存）；`MYVK_EDITOR_COLLIDER=hull|capsule` 自动化钩子。
-- **碰撞框线框走 ImGui draw list 不走 3D 管线**（免描述符同步 + 天然 X-ray）；
-  凸包"边"从面提取（顶点两两连会糊成一团）；只读遍历用 const `w.each<T>`。
-- **编辑态碰撞不阻止变换，只在运行态分离**（`runCollision`：`resolveBodyOverlaps` 4 轮双向推半、
-  推完立刻重建这俩 collider；`resolveCamera` 半径 0.25 球推出；在 runRuntimeScripts **之后**）。
-  日志预算 `m_collisionLogBudget`（前 240 帧逐条）—— 初值/复位为 0 会让 Play 全程静默。
-- **日志是自动化的"接口"：追加字段只能放行尾**。`gizmo begin/end` 的 `target=` 插在中间
-  打断了 verify_gizmo_scale.py 的正则（`space=` 必须紧跟 `axis=`）。新脚本用 `.*target=` 适配，
-  END 组编号 pos 3-5 / rot 6-8 / scale 9-11 / target 12。
-- 脚本：`verify_collider_menu.py`（29 断言）/ `verify_collider_gizmo.py`（51 断言，**三模式各起
-  一个进程**——W/E/R 在 flying 时让位，别靠按键切模式）/ `verify_collision_play.py`。
-
-### Player 系统（2026-10-11 新增：第一/第三人称 + 程序化卡通角色）
-- **Shift+A ▸ Player ▸ First/Third-Person Player**（`EditorScene::createPlayer`）。实体 = 玩家"脚"
-  （贴地 root）：`PlayerComponent{mode, eyeHeight=1.7, moveSpeed=3.0, lookSpeed=0.0025, yaw, pitch,
-  camDistance=3.5, turnSpeed=12, walkPhase, bodyYaw, started}`（后三个运行态派生不序列化）；
-  胶囊碰撞体 position=(0,0,0.85) r=0.30 halfHeight=0.55。第三人称 rig：root 下关节节点
-  （`PlayerLimbComponent{Body/Head/ArmL/ArmR/LegL/LegR}`）→ 肢体网格是**子实体**、向下偏移
-  -len/2 → 摆动绕肩/髋而非肢体中点。低面数 cylinder/sphere segments=12 rings=8；
-  配色：躯干蓝/头肤色/眼白/腿深蓝灰。
-- **两种鼠标语义**（对齐市面游戏）：第一人称 yaw/pitch 就是视线；第三人称 yaw/pitch 是
-  **轨道方位/俯仰**（初始 pitch=0.35），角色朝移动方向转身（目标 yaw=atan2 反解 + 最短角差
-  wrap 插值，`rotation.z = -bodyYaw`，Z-up）。walk：`walkPhase += speed*3.2*dt`，
-  `swing=sin*0.65`，ArmL/LegR=+swing 反相 ArmR/LegL，停止按 `1-min(1,10dt)` 衰减归位。
-- **相机驱动**（坑点 #22 不变式的应用）：第一人称 `setTarget(eye+dir); setDistance(1.0)`
-  相机精确落眼睛；第三人称 `setTarget(focus=z+1.2); setDistance(camDistance)` 轨道。
-  `resolveCamera` 加 `ignore` 参数——第一人称"眼睛"在玩家胶囊内，不自推。
-- **输入门控**：`io.MouseDelta` 只在 `viewportHovered()`（ViewportPanel 每帧上报）生效；
-  WASD 用 `ImGui::IsKeyDown` + Shift×2 加速。⚠ **Play 态 W/E/R 手柄快捷键必须
-  `isEditing() && !flying` 守卫**，否则按 W 移动会切手柄模式。
-- 序列化：`player{mode "first"/"third", 7 参数}` + `playerLimb{kind int}`；探针
-  `PLAYER-STATE`（每 30 帧，Play 态）。
-
-### FBX 导入（2026-10-11 新增，ufbx 双文件库）
-- **ufbx_matrix 是 3x4（12 float）**，memcpy 到 glm::mat4 会越界读 → 必须按列显式构造 toGlm。
-- **蒙皮空间约定（核心）**：ufbx 的 `cluster->geometry_to_bone` 是**文件原始空间**（cm/Y-up，
-  不带轴/单位换算），而 `node_to_world` 已换算到引擎空间 —— 两者不可组合。venn 的方案：
-  蒙皮顶点加载时**烘到静止世界空间**（`v' = G2W·v`），`invBind(j) = inv(W_rest(j))`、
-  `invMeshNode = I` → 静止时 jointMat=I，多 submesh 共享骨架严格正确；SubMesh::transform
-  蒙皮时取单位阵，归位 T(-center) 就是 push.model。诊断指标 `FBX skin dbg maxRestErr`。
-- restLocal 用 **node_to_world** 推导（node_to_parent 缺根级轴/单位调整）；动画采样时
-  `ufbx_evaluate_transform` 相对**直接父节点**，父非骨骼要左乘父链静止世界变换。
-- **模型归位**：世界 AABB 中心平移回原点（UE Import 惯例），静态=左乘 T(-center) 到 SubMesh::transform。
-- **资产端坑**：Blender 导出 FBX 声明 Z-up 但数据沿 +Y（为 glTF 设计）→ 模型躺着。
-  导出前把 armature 转 90°X；`bake_space_transform=True` 别用（第三方导入器的经典坑）。
-  改了 assets/models/*.fbx 后必须手动 cp 到 build/bin/assets/models（重链才触发拷贝）。
-- **CharacterWindow**（UE5 Persona 风格 MVP）：独立预览离屏链（`setPreviewScene/previewTextureId`），
-  recordPreview 必须在 **ImGui 之前**；左栏 280px 放三标签；`MYVK_CHARACTER_MODEL=<路径>`
-  打开窗口自动绑模型（自动化钩子）。
-- 验证：`tools/verify_character_window.py`（创建角色→窗口→绑模型→切 Animation 标签→
-  点 clip 播放全链路）。**click() 收客户区坐标**；未激活 ImGui tab 的 logRect 是 (0,0)，
-  要等非退化矩形；首次点击只聚焦 ImGui 窗口，第二次才切标签。
-
-### Hierarchy 的"文件夹"节点（2026-10-09 新增）
-
-- **显式标记**：`HierarchyComponent::group`（**不要**靠"这个节点没有网格组件"去猜 —— 空节点会被误判）。
-  序列化字段 `je["folder"]`；右键 `Mark as Folder` / `Unmark as Folder`；新建走 `uniqueName()`
-  保证 `Folder` / `Folder 2` / … 唯一；`duplicateEntity` 要连 `group` 一起复制。
-- **树行的图标不能塞进 `TreeNodeEx` 的 label**（label 是纯文本，字体里没有文件夹字形）→
-  label 传空串，图标 + 名字全部自己用 `DrawList` 画：
-  `行左边缘 = ImGui::GetCursorScreenPos().x`（**必须在 `TreeNodeEx` 之前取**）
-  `文本起点 = 行左边缘 + ImGui::GetTreeNodeToLabelSpacing()`
-  （后者实现 = `FontSize + FramePadding.x * 2`，**恰好等于** imgui_widgets.cpp 里的 `text_offset_x`）。
-  文件夹名字用暖色 `IM_COL32(238,202,132,255)`。图标在 `editor/EditorIcons.h`
-  （`drawFolderIcon` 52px 给 Content / `drawTreeFolderIcon` 小号给 Hierarchy）。
-
-### 模型导入 = "根节点 + 子网格"，落点贴地（2026-10-09 新增）
-- `EditorScene::instantiateModel()` 返回 `ImportResult{root, entities}`：**一定要建一个空根节点**
-  当把手 —— glTF 节点的 `transform` 是**世界变换**，直接分解成 TRS 塞进子节点之后，
-  它们彼此没有共同父级，没法"整体平移到落点"。
-- `EditorScene::alignImportToGround(scene, picking, imported, target)`：联合所有子网格的世界 AABB →
-  `shift = (target.x - c.x, target.y - box.min.y, target.z - c.z)`。
-  **拿不到 CPU 侧包围盒时只平移、不贴地**（宁可不贴也不要塞到地面以下）。
-  会打一行 `alignImportToGround: box.min.y=… bottom=… (target.y=…) root=(…)` 供自动化断言。
-- 两个入口共用这套逻辑：**拖进视口**（落点 = 鼠标射线 ∩ y=0 平面）与 **双击 Content 里的模型**
-  （落点固定为世界原点）。
-- Content 侧**只有模型能拖**（`.gltf/.glb/.obj`）：`BeginDragDropSource` 必须带
-  `ImGuiDragDropFlags_SourceAllowNullID` —— 缩略图条目是无 ID 的 item，不带会 `IM_ASSERT(0)`
-  直接崩（退程码 `0xc0000409`）。视口侧拖拽中画绿色高亮边框 + 落点说明文字。
+### 关键子系统
+- **Shift+A 添加菜单 / 播放条 / Preferences**：菜单视口 hovered 才触发，popup 每帧无条件提交；
+  落点 = 鼠标射线∩z=0。**Sunlight = 场景级太阳**（唯一、有阴影、不进实体序列化）；
+  **Directional Light = 实体级补光**（`Type::Directional=2`，`positionRange.w=1e5` 影响球 trick）。
+  播放条 `LayoutRects.transport`，视口底部扣 `kTransportH=34px`。Preferences 窗口 ID 是 `###prefs`
+  （**别沿用旧名**，imgui.ini 残留会让它飞角落）。
+- **编辑器锁定**：`ecs::LockedComponent`（纯标记，看得见动不了）。`PickingSystem::pick` 跳过它、
+  `GizmoController::update` 直接 return。序列化字段 `je["locked"]`（**读写都要补**）。
+  自带 `Ground` 默认带它（它是参照系）。数字键 0 = 落地（只改 z、世界包围盒底部贴 z=0，
+  只认"在 3D 视口里左键点中"的选中）。
+- **碰撞体系统**（`engine/physics/` 四文件 + `editor/ColliderView`）：QuickHull 必须配冲突表；
+  GJK+EPA 不依赖绕序。`CollisionComponent` 与 `TransformComponent` 字段名/类型/欧拉序完全一致 →
+  手柄只换指针。序列化只存 7 参数，凸包顶点读盘后按 mesh 重建。
+  线框走 ImGui draw list（免描述符同步 + 天然 X-ray）。**编辑态碰撞不阻止变换，只在运行态分离**。
+  `MYVK_EDITOR_COLLIDER=hull|capsule` 自动化钩子。
+- **Player 系统**（第一/第三人称 + 程序化卡通角色）：实体 = 玩家"脚"（贴地 root），
+  `PlayerComponent{mode, eyeHeight=1.7, moveSpeed=3.0, lookSpeed=0.0025, yaw, pitch, camDistance=3.5,
+  turnSpeed=12, walkPhase, bodyYaw, started}`。第一人称 yaw/pitch = 视线；第三人称 = 轨道方位/俯仰，
+  角色朝移动方向转身（最短角差 wrap 插值，`rotation.z = -bodyYaw`，Z-up）。
+  ⚠ **Play 态 W/E/R 手柄快捷键必须 `isEditing() && !flying` 守卫**。
+- **FBX 导入**（ufbx 双文件库）：`ufbx_matrix` 是 3x4（12 float），memcpy 到 mat4 会越界 → 按列构造。
+  **蒙皮核心约定**：蒙皮顶点加载时**烘到静止世界空间**，`invBind(j)=inv(W_rest(j))`、`invMeshNode=I`。
+  模型归位：世界 AABB 中心平移回原点（UE 惯例）。**资产端坑**：Blender 导 FBX 声明 Z-up 但数据沿
+  +Y → 导出前把 armature 转 90°X；`bake_space_transform` 别用。改 assets/models/*.fbx 后必须手动 cp
+  到 build/bin/assets/models（重链才触发拷贝）。CharacterWindow 的 `recordPreview` 必须在 **ImGui 之前**。
+- **Hierarchy 文件夹节点**：显式标记 `HierarchyComponent::group`（**不要**靠"没有网格组件"去猜）。
+  树的图标不能塞进 `TreeNodeEx` label → label 传空串，图标+名字用 DrawList 自己画
+  （`行左边缘 = GetCursorScreenPos().x` **必须在 TreeNodeEx 之前取**）。
 
 ## 视口相机与导航（先分清"谁的相机"）
-**两者的存储模型相同（`scene::Camera` 的自由飞行），但归属完全不同 —— 这是最容易做错的地方：**
-- **编辑态 = 编辑器视口的导航相机**，由编辑器**完全驱动**：视口悬停时按 UE 编辑器的习惯操作。
-- **Play 态 = 游戏自己的相机**，编辑器**不碰**：视口在 Play 期间**不响应任何键鼠导航**
-  （用户明确要求"运行前的视口要好用，运行后归游戏管"），只负责渲染 + 全屏切换。
-  ⚠️ 上一版把导航做进了 Play 态，方向是错的。
+两者的存储模型相同（`scene::Camera` 自由飞行），但归属完全不同：
+- **编辑态 = 编辑器视口导航相机**，编辑器完全驱动。
+- **Play 态 = 游戏相机**，编辑器**不碰**（视口在 Play 期间不响应任何键鼠导航）。
 
-### 编辑态导航（完全按 UE 编辑器）
-| 操作 | 行为 |
-|---|---|
-| 按住**右键**拖动 | 自由旋转（水平 + 俯仰） |
-| 按住**中键**拖动 | 平移 |
-| **单独滚轮** | 沿视线**推 / 拉相机**（`kNavDollyPerNotch=0.6f` 米/格 × sens） |
-| **右键 + 滚轮** | 调导航灵敏度（±`kSensitivityStep=0.1f`/格） |
-| **右键 + WASD** | 前后左右飞行（**只在按住右键时**） |
-| **右键 + Q / E** | 下降 / 上升；**Shift** 加速 ×3 |
-| **左键** | 点选物体 / 拖 gizmo 手柄 —— **不参与导航** |
-| **左下角导航球** | 拖拽 = 绕注视点转视角；点轴端小球 = 吸附正视图（见下） |
-| **数字键 1/3/7** | Front/Right/Top（Ctrl+ 反向 = Back/Left/Bottom）；2/4/6/8 = 15° 步进 |
+编辑态导航（按 UE）：右键拖=自由旋转 / 中键拖=平移 / 单独滚轮=推拉相机（`kNavDollyPerNotch=0.6`）/
+右键+滚轮=灵敏度 / 右键+WASD=飞行（**只在按住右键时**）/ 右键+Q/E=升降（Shift ×3）/
+左键=点选+gizmo / 左下导航球 / 数字键 1/3/7=Front/Right/Top（Ctrl 反向）。
+- **滚轮两条路靠"是否按住右键"分流**（复用 `lookDown`，无第三种语义）。
+- **"飞行只在按住右键时生效"是必须的**：`W/E/R` 同时是手柄快捷键，`handleShortcuts` 里用
+  `const bool flying = IsMouseDown(Right)` 门控。
+- `applyEditorCameraMode()` = `setUseGlobalInput(false)`+`setFlyMode(true)`。**每次场景重建必须重设**
+  （新建/打开/重建 demo → `onSceneReplaced()`；undo/redo → 各自入口显式调用）。
+  **飞行模式不在序列化范围内**，漏掉表现为"导航突然变回老式轨道相机"。
+- **导航球**（`ViewportPanel::drawNavGizmo`，Blender 风格）：整块方形是 `InvisibleButton`，
+  四角也吞鼠标。切视图/拖拽都**绕当前注视点**转（先存 target，改完 setTarget 钉回去）。
+  Z-up 映射：Front=-Y(yaw=+π/2)/Back=+Y/Right=+X(yaw=0)/Top=+Z(pitch=+kPitchLimit)。
+  数字键接入点必须在 `io.KeyCtrl` 分支**之前**。主键盘数字键是 `ImGuiKey_1`。
+  `Camera::kPitchLimit = 1.5533f`（89°）。
+- **Camera 飞行模式不变式**：`position()` 与 `m_target` 通过 `target = position - angleDir()*distance`
+  **互为逆运算**。**任何动 target/distance/yaw/pitch 的接口都必须同步另一侧**，否则"拖了没反应/
+  画面静止/绕空点打转"。相关入口：`syncFlyTarget()` / `setTarget` / `setDistance` / `setYaw` /
+  `setPitch` / `orbit` / `zoomBy` / `panWorld` / `dolly` / `update()`。新增接口先问
+  "飞行模式下这条还成立吗"。
+- **灵敏度浮层**（`m_navSensitivity`，默认 1，clamp 0.05..20）只作用于编辑态。浮层只保留
+  标题 + Sensitivity 输入 + `Ground grid` 勾选框。**浮层必须是 viewport 的 child window**；
+  **浮层尺寸必须按字体度量算**（写死像素放大字号后会被裁）。
 
-- **滚轮必须有两条路，靠"是否按住右键"分流**（用户明确要求）：单独滚轮 = 推拉相机，
-  右键 + 滚轮 = 灵敏度。判定复用 `lookDown`，和 WASD 门控同一个开关，所以不会有第三种语义。
-  HUD 上的滚轮入口（鼠标停在浮层里）**同样要求按住右键**，保持一致。
-- **"飞行只在按住右键时生效"是必须的**：`W/E/R` 同时是手柄模式快捷键，不门控就会
-  "按 W 往前飞的同时把手柄切成平移模式"。UE 就是这么分的；`EditorApp::handleShortcuts`
-  里用 `const bool flying = IsMouseDown(Right)` 门控那三个快捷键。
-- 常量在 `ViewportPanel.cpp`：`kNavLookPerPixel=0.0025f` / `kNavPanPerPixel=0.01f` /
-  `kNavMoveSpeed=5.0f` / `kNavDollyPerNotch=0.6f` / `kSensitivityStep=0.1f`。
-- `EditorContext::applyEditorCameraMode()` = `setUseGlobalInput(false)` + `setFlyMode(true)`。
-  **每次场景重建都必须重设**：新建/打开/重建 demo → `onSceneReplaced()`（内含调用），
-  undo/redo（整场景快照恢复）→ 各自入口里显式调用。**飞行模式不在序列化范围内**，
-  漏掉就表现为"导航突然变回老式轨道相机"。
-
-### 导航球（Navigation Gizmo，视口左下角，Blender 风格）
-- `ViewportPanel::drawNavGizmo`：六个轴端小球（正轴实心+白字母 / 负轴暗底+轴色字母）
-  按深度（`-d·f`）远→近排序绘制；整块方形区域是一个 `InvisibleButton`，
-  **四角也吞鼠标**（不穿透点选，和 Blender 一致）。Z-up 后**蓝 Z+ 球 = Top**。
-- **切视图/拖拽都"绕当前注视点"转**：`snapViewTo` / `orbitViewAroundPivot` 都是
-  先存 `target()`，改完 yaw/pitch 再 `setTarget(pivot)` 钉回去 —— 原地转头会让
-  被观察物飞出视野。顶/底视图 yaw 是退化量，**保留当前 yaw**。
-  Z-up 视图映射：Front=相机在 **-Y**（yaw=+π/2）/ Back=+Y / Right=+X（yaw=0）/
-  Top=+Z（pitch=+kPitchLimit）。
-- 点击 vs 拖拽：位移 ≤ `kGizmoClickSlop(5px)` 算点击（吸附），否则算拖拽。
-- 数字键接入点在 `EditorApp::handleShortcuts` 里 **`io.KeyCtrl` 分支之前**
-  —— 那个分支末尾 return，放后面会把 Ctrl+1/3/7 吞掉。
-- 主键盘数字键的 ImGui 枚举名是 `ImGuiKey_1`（不是 `ImGuiKey_Keypad1`，那是小键盘）。
-- **`Camera::kPitchLimit = 1.5533f`（89°）**：原三处硬编码 1.52f 会让顶视图偏斜；
-  89° 是 `forwardAxis()/rightAxis()` 兜底分支的安全上限，别再加大。
-- 调试：`MYVK_LOG_RECTS=1` 下打 `NAV-CAM yaw=... pitch=...`（变化 >0.02 rad 才打）；
-  交互验证脚本 `tools/verify_nav_gizmo.py`（Z-up 后点 **Z+** 球 / 按 1/3/7，四条断言）。
-
-### ⚠️ Camera 飞行模式的不变式（改任何 setter 前必读）
-`position()` 与 `m_target` 通过 `target = position - angleDir()*distance` **互为逆运算**。
-所以**任何动 target / distance / yaw / pitch 的接口都必须同步另一侧**，
-否则飞行模式下表现为"拖了没反应 / 画面静止 / 绕空点打转"：
-
-- `syncFlyTarget()`（位置→target，`moveLocal`/`look` 用）
-- `setTarget` / `setDistance` / `setYaw` / `setPitch`（target→位置方向，反推 `m_flyPos`）
-- `orbit` / `zoomBy` / `panWorld` / `dolly`（轨道风格入口，飞行模式下自动改写成等价动作）
-- `Camera::update()`（全局输入路径）也要按 `m_fly` 分支，否则与上面的入口脱节
-
-新增任何改相机姿态的接口，都要问一句"飞行模式下这条还成立吗"。
-
-### 灵敏度与浮层
-- **导航灵敏度**（`EditorContext::m_navSensitivity`）：默认 **1**，clamp `0.05..20`，
-  移动与旋转**共用**。视口右上角 HUD 可 `InputFloat` 直接填（≤0 忽略）、
-  **按住右键 + 滚轮**可调（上滑变大 / 下滑变小）。**只作用于编辑态**。
-  （单独滚轮是推拉相机，不碰这个值 —— 见上面的导航表。）
-  InputFloat **step 传 0** 就没有 +/- 按钮（用户明确不要按钮）；框宽
-  `kSensitivityFieldW=88` 够显示 "20.00"。
-  **2026-10-10 起浮层只保留**：标题 `Viewport navigation` + Sensitivity 输入 + `Ground grid` 勾选框；
-  操作提示文字（RMB/MMB/WASD…）与 Sensitivity 的 `Reset 1.00` 按钮**已按用户要求删除**，别再画回去。
-- **Play 态浮层**只有"全屏 / 恢复"按钮 + 播放状态，**刻意不含导航控件**。
-- **浮层必须是 viewport 的 child window**（`SetCursorScreenPos` + `BeginChild`，在
-  `ImGui::End()` **之前**画）：ImGui 每帧把聚焦窗口提到最前，独立顶层窗口会被 3D 图盖住。
-- **浮层尺寸必须按字体度量算**（`CalcTextSize` / `GetFrameHeightWithSpacing` /
-  `GetTextLineHeightWithSpacing` + `GetStyle().WindowPadding`）。写死像素的话，
-  用户在 Settings 里放大字号后文字就被裁掉半截。也**不要**在视口工具栏里再塞全屏按钮 ——
-  那条工具栏本来就很长，会被挤出右边缘（实测被裁成 "Fulls…"）。
-
-## Gizmo 拖拽与吸附（`editor/PickingSystem` + `editor/GizmoController`）
-**两个曾经的致命缺陷（用户报"拖拽方向反 + 速度越来越快"），已修，改这里前必读：**
+## Gizmo 拖拽与吸附
+**两个曾经的致命缺陷（用户报"拖拽方向反 + 越拖越快"），已修，改这里前必读：**
 - **① 轴线/射线最近点的参数符号**（`PickingSystem::closestOnAxis`，Ericson 5.1.9）：
-  `s = (b*e - c*d) / (a*c - b*b)`。曾把分母写成 `b*b - a*c`（差一个负号）→ 参数整体取反
-  → **往右拖物体往左跑**。现在分母保留 `b*b - a*c` 只用于判平行，参数用等价的
-  `(c*d - b*e) / (b*b - a*c)`。**改符号前先想清楚分子分母是不是同时翻了。**
-- **② 拖拽参考线必须"冻结"**（正反馈环）：`applyDrag` 若每帧都用物体**当前**位置当轴线原点，
-  则物体自己走过的位移会被重新算进参数 → `D_new = Δ + D_old` → **越拖越快**（指数发散）。
-  正确做法：`beginDrag` 里快照 `m_dragOrigin / m_dragAxis / m_dragWorldLen`，`applyDrag`
-  全程只用这份快照（`m_origin / m_axisDir / m_worldLen` 每帧都在变，不能碰）。
-- **三套独立的吸附**（`EditorContext`）：`snapMove/snapMoveStep`、`snapRotate/snapRotateStep`、
-  `snapScale/snapScaleStep`，各带 `...Ref()` + `snapForCurrentMode()/snapStepForCurrentMode()/
-  toggleSnapForCurrentMode()`。**量化语义各不相同，别统一**：
-  | 模式 | 量化对象 | 默认步长（对齐 UE5） |
-  |---|---|---|
-  | 平移 | **位移增量**（米） | 0.1 m（UE5 的 10 uu → 本引擎 1u=1m） |
-  | 旋转 | **角度增量**（度） | 10° |
-  | 缩放 | **倍率 factor**（不是缩放绝对值！） | 0.1 |
-  缩放量化倍率的原因：量化绝对值会让第一下拖拽从 0.37 直接跳到 0.4，像抽搐了一下。
-- **UI**：视口工具栏**第二行** `drawSnapRow()`（`snapField()` 勾选框 + DragFloat + Presets 弹窗 +
-  `current: … snap on/off`）；**G 键** = 切换当前工具的吸附（`!flying` 门控内）。
-  拖拽时右上角浮层显示实时读数 `Move X: +0.600 m  [snap]`（`GizmoController::readout()`，
-  只在 `dragging()` 期间有效，`endDrag`/非拖拽帧会被清空）。
-- 旋转**始终在"拖拽起始姿态"上叠加**（`R = D*R0` 或 `R0*D`），不做增量累乘。
+  参数用 `(c*d - b*e) / (b*b - a*c)`，分母 `b*b-a*c` 只用于判平行。**改符号前先想清楚分子分母
+  是不是同时翻了。**
+- **② 拖拽参考线必须"冻结"**（正反馈环）：`beginDrag` 快照 `m_dragOrigin/m_dragAxis/m_dragWorldLen`，
+  `applyDrag` 全程只用快照。用每帧当前位置会指数发散。
+- **三套独立吸附**（量化语义各不相同，别统一）：平移=**位移增量**（默认 0.1m）/ 旋转=**角度增量**
+  （10°）/ 缩放=**倍率 factor**（0.1，不是缩放绝对值）。UI：视口工具栏第二行 `drawSnapRow()`，
+  **G 键**切换（`!flying` 内）。旋转**始终在"拖拽起始姿态"上叠加**（`R=D*R0` 或 `R0*D`）。
+- **手柄 7 种 `Handle`**：`AxisX/Y/Z`、`PlaneYZ/XZ/XY`（**枚举名 = 该平面法线**，颜色按法线取）、
+  `Screen`。平移/缩放=单轴+平面双轴+中心 Screen；旋转=三轴环+外圈 arcball。
+  平面方片命中用 `pointInQuad()`；命中顺序旋转先判三轴环再判外圈。平面拖拽**必须兜底**
+  （`kMaxDragUnits=2000`）。
+- **本引擎欧拉序 `R = Rx·Ry·Rz`**，而 `glm::eulerAngles` 用 YXZ，**不能直接用** → 自己写
+  `eulerFromRotation()`（`y=asin(m[2][0])`、`x=atan2(-m[2][1],m[2][2])`、`z=atan2(-m[1][0],m[0][0])`，
+  `|sy|>0.99999` 走万向锁分支）。
+- **缩放：拖的那根轴 ≠ 改的那个分量**（`scale` 是局部的，手柄拖的是世界方向）。修法：把拖拽方向
+  **投影到局部轴**再分配 `sc[i] = m_startScale[i]*(1+(factor-1)*w[i])`，`w[i]=|dot(axis,localAxisWorld[i])|`。
+  **不变量**：不是"拖 Y 改 scale.y"，而是"物体在世界里长大的方向 ≈ 被拖手柄的世界方向"。
 
-### 手柄的三种粒度（2026-10-09 重写：从"只有单轴"扩到 7 种 `Handle`）
-`enum class Handle : int { None=-1, AxisX/Y/Z=0/1/2, PlaneYZ=3, PlaneXZ=4, PlaneXY=5, Screen=6 }`。
-- **平面枚举名 = 该平面的法线**（`PlaneYZ` 的法线是 X）。颜色按**法线**取 → 法线 X 的方片是红的，
-  和 UE / Blender 的"红方块 = 法线朝 X 的面板"一致，不用记额外规则。
-- 平移/缩放：单轴（沿线/单轴拉伸）+ 平面双轴（平面内自由移动 / 两轴一起缩放，取两腿平均）
-  + 中心 `Screen`（**视平面**内自由移动 / **等比**缩放）。旋转：三轴环 + 外圈 arcball 自由旋转。
-- 平面方片画在两根轴夹角处（`kPlaneT0 0.30 ~ kPlaneT1 0.62` 相对手柄长度），命中用
-  `pointInQuad()`（四角叉积同号），**不是**逐边求交。命中顺序：旋转先判三轴环再判外圈
-  （正交视图下"视轴环"会和某根轴环重合，应优先给具体轴）；平移/缩放的顺序是
-  中心 → 平面 → 单轴。
-- **arcball**：屏幕偏移映射到单位虚拟球（球外投到赤道），`angle = atan2(|p0×p1|, p0·p1)`，
-  轴从相机系（`right/up/-fwd`）转到世界系；自由旋转**固定按世界空间**施加。
-- **平面拖拽必须兜底**：射线几乎与平面平行时交点跑无穷远、位移瞬间爆炸 →
-  `kMaxDragUnits = 2000`，超了就丢弃该帧。
-- **本引擎欧拉序是 `R = Rx·Ry·Rz`**，而 `glm::eulerAngles` 用的是 **YXZ**，语义不同**不能直接用**
-  → 自己写 `eulerFromRotation()`。GLM 列主序下 `R_ij = m[j][i]`：
-  `y = asin(m[2][0])`、`x = atan2(-m[2][1], m[2][2])`、`z = atan2(-m[1][0], m[0][0])`，
-  `|sy| > 0.99999` 走万向锁分支（x/z 只有一个自由度，全归到 x）。
-- API：`hotHandle()/handleName()`（**旧的 `hotAxis()/axisName()` 已删**）。
-
-### 缩放：拖的那根轴 ≠ 改的那个分量（2026-10-10 修）
-**用户报的症状**："切到 Scale 拖 Y 轴却在 Z 方向拉伸、拖 Z 轴却在 Y 方向拉伸"。
-- **根因**：`TransformComponent::scale` 是**局部**的（`localMatrix = T·Rx·Ry·Rz·S`），缩放作用在
-  **物体自己的三根轴**上；而手柄拖的是**世界**里的方向。物体一转两套轴就不重合，而旧代码
-  `sc[axisIdx] = m_startScale[axisIdx] * factor;` 直接把世界倍率塞进局部分量 → 必然写错维度。
-- **修法**：把拖拽方向**投影到局部轴**再分配
-  ```cpp
-  for (i) w[i] = |dot(axis, localAxisWorld[i])|;      // 单轴手柄
-  for (i) w[i] = |dot(U, L[i])| + |dot(V, L[i])|;     // 平面手柄（两条腿）
-  sc[i] = m_startScale[i] * (1 + (factor - 1) * w[i]);
-  ```
-  轴对齐时 w 退化成 (1,0,0) 之类 → 与旧行为一致；整体等比与朝向无关，保持 `sc = start * factor`。
-- `GizmoController` 新增 `m_localAxisWorld[3]`（恒定局部轴）/ `m_dragLocalAxes[3]`（beginDrag 冻结）。
-- **该断言的不变量**：不是"拖 Y 改 scale.y"，而是
-  **"物体在世界里长大的方向 ≈ 被拖手柄的世界方向"** —— 长大方向 = `Σ(Δscale[i] · 局部轴 i 的世界方向)`。
-  见 `tools/verify_gizmo_scale.py`（含"绕 X 转 90° 后拖三根轴"的用例）。
-- 坐标系切换钩子：`MYVK_EDITOR_SPACE=world|local`。
-
-## 地平面参考栅格（`assets/shaders/grid.{vert,frag}` + `Renderer::GridSettings`）
-- **解析式、零顶点缓冲**：VS 用 `gl_VertexIndex` 拼 4 顶点铺在 **z = `planeOffset`（默认 0）** 的大四边形；
-  格线在 FS 里按 `fract(p/step + 0.5) - 0.5` 求"到最近线的距离"，除 `fwidth(p)` 转成**像素距离**
-  → 1px 抗锯齿线宽，**不依赖 MSAA**，远处靠 `smoothstep` 淡出避免摩尔纹。
-- **三种图层**：最小格（1 m，暗）× `minorStrength` → 主格（10 m，亮，线宽 ×1.4）→
-  世界轴（**X 轴红 / Y 轴绿**，与视口 gizmo 同配色；Z-up 迁移后即为此，早期文档写的"Z 轴蓝"已作废）。
-  默认 `extent 60 / minor 1 / major 10`。
-- **自带地面（2026-10-10 新增）**：`EditorScene::resetToEmptyScene` 会建一个 `Ground` 实体
-  （`plane(1.0)` × `scale(120,120,1)`，**castShadow=false**），顶面正好在 z=0 与栅格面重合；
-  不透明 Pass 先画地面、栅格 Pass 排在其后 → 栅格线画在地面上、互不遮挡。改地面尺寸/位置时
-  **必须同步 `GridSettings::extent`**，否则边缘会出现"线飘在没有地板的地方"。
-  **地面是"上锁"的**（`ecs::LockedComponent`）：视口点不到、选中也不给变换手柄 —— 它是参照系，
-  不该被平移/缩放/旋转。想调它得先在 Inspector 里取消 `Locked` 勾。详见"编辑器锁定"小节。
-- **淡化是"距栅格中心"而不是"距相机"**（2026-10-10 修）：`fade.xy` 与切比雪夫距离
-  `max(|p.x|,|p.y|)` 比较，栅格的样子**不随相机移动变化**。旧写法用 `length(vWorld - vCam)`
-  = 一圈"没有栅格的环"跟着相机跑，飞行时非常显眼（`grid.vert` 的 `vCam` 因此删掉了）。
-- **线宽必须按占空比封顶**（`kMaxLineDuty = 0.22`）：线宽是**像素**单位，格子小到亚像素时若不封顶，
-  1.4px 的线画在 0.3px 的格子上 → 覆盖率恒为 1 → 整片糊成一条亮带（实测远处整行亮度 +55）。
-  `gridCoverage()` 里 `w = min(baseWpx, kMaxLineDuty * cellPx)`，最小格/主格共用；
-  亚像素淡出阈值 `smoothstep(0.7, 1.6, cellPx)`（**旧值 2.5~8.0 太狠**：相机贴地 0.4m 平视时
-  1m 格在 13m 外就整族消失 —— 这就是"贴近地面看栅格会消失"的根因）。
-- **与地面共面必须压 z-fighting**：VS 里 `clip.z -= 1e-6 * clip.w`（等价于全距离恒定的 NDC 偏移）。
-- 管线：`TRIANGLE_STRIP` / 无顶点布局 / `depthTest=true` / `depthWrite=false` / `blendEnable=true` /
-  `cullMode=NONE`。推常量 48B（`params/color/fade`）。
-- **开关**：`Renderer::gridEnabled()`（`bool&`），由 `EditorApp::onUpdate` 每帧写
-  `= isEditing() && ctx.showGrid()` —— **Play 期间强制关**（视口是游戏画面）。
-  UI 三处等价入口：视口右上角 HUD 勾选框 `Ground grid (1 m)`（**默认开**）、View 菜单、`MYVK_GRID=0`。
-- 数值调参在 `drawEnginePanel()` 的 `Viewport grid (z = 0)` 段与 Preferences 的 `Ground grid (z = 0)`
-  段（两处等价；`Edge fade start/end (m)` = **距栅格中心**的距离，见上。开关**刻意不放**在那里）。
-- ⚠️ 栅格是**世界空间**的，与相机无关；相机在水面/地板上方才能看到它，且会被墙正确遮挡。
+## 地平面参考栅格（`grid.{vert,frag}` + `Renderer::GridSettings`）
+- **解析式、零顶点缓冲**：VS 用 `gl_VertexIndex` 拼 4 顶点铺在 z=`planeOffset`；FS 按
+  `fract(p/step+0.5)-0.5` 求到最近线的距离，除 `fwidth(p)` 转**像素距离** → 1px 抗锯齿，不依赖 MSAA。
+- **三种图层**：最小格(1m 暗) → 主格(10m 亮，线宽×1.4) → 世界轴（**X 红 / Y 绿**）。默认 extent60/1/10。
+- **自带地面**（`resetToEmptyScene` 建 `Ground`，`castShadow=false`，顶面 z=0 与栅格面重合）。
+  改地面尺寸/位置时**必须同步 `GridSettings::extent`**。地面是"上锁"的。
+- **淡化是"距栅格中心"不是"距相机"**（用切比雪夫距离 `max(|p.x|,|p.y|)`），样子不随相机移动变化。
+- **线宽必须按占空比封顶**（`kMaxLineDuty=0.22`）：`w = min(baseWpx, kMaxLineDuty*cellPx)`；
+  亚像素淡出阈值 `smoothstep(0.7,1.6,cellPx)`（旧值 2.5~8.0 太狠 → "贴近地面看栅格会消失"）。
+- 与地面共面压 z-fighting：VS 里 `clip.z -= 1e-6*clip.w`。
+- 管线：TRIANGLE_STRIP/无顶点布局/depthTest=true/depthWrite=false/blendEnable=true/cullMode=NONE。
+- **开关**：`gridEnabled()` 由 `EditorApp::onUpdate` 每帧写 `= isEditing() && ctx.showGrid()`
+  → **Play 期间强制关**。UI 三处等价：视口 HUD 勾选框 / View 菜单 / `MYVK_GRID=0`。
 
 ## 全屏与窗口几何
+- **Play 态全屏** = 窗口真全屏 + 视口独占整屏：`m_gameFullscreen` 只存逻辑状态，
+  `EditorApp::syncWindowFullscreen()` → `Window::setFullscreen(true)` → `glfwSetWindowMonitor`。
+  `F` 切换 / `Esc` 退出（都只在 Play 态）。**F11 = 只切窗口全屏**（任何模式可用）。
+  切换**必须做边沿检测**（`m_appliedWindowFullscreen`），否则每帧无条件 set 会立刻关掉 F11 全屏。
+- **窗口几何**（`core/WindowGeometry.{h,cpp}`）：无存档 → 工作区居中、宽高=工作区×0.70；
+  有存档 → 用存档（含 maximized），**必须先做可见性校验**（换显示器后存档可能落屏幕外）。
+  `onInit()` 第一件事落位、`onShutdown()` 保存。自动化跑不写存档
+  （`MYVK_FRAMES`/`MYVK_NO_WINDOW_SAVE` 存在时跳过）。
 
-### 全屏（两种，别再混）
-- **Play 态全屏 = 窗口真全屏 + 视口独占整屏**：`EditorContext::m_gameFullscreen` 只存**逻辑**
-  状态（本类不认识 Window），真正的窗口切换在 `EditorApp::syncWindowFullscreen()`
-  → `Window::setFullscreen(true)` → `glfwSetWindowMonitor(win, primaryMonitor, 0,0,
-  mode->width, mode->height, mode->refreshRate)`。退出时回到**进入全屏前记住的窗口几何**。
-  快捷键 **F 切换** / **Esc 退出**（都只在 Play 态生效）；按钮两处：主工具栏（`isEditing()` 时禁用）
-  + 视口右上角播放浮层（全屏时工具栏不画，浮层那个是唯一图形化退出口）。
-- **F11 = 只切窗口全屏**（面板照旧），任何模式都可用；View 菜单也有
-  （`EditorContext::windowFullscreenRequest()` 请求标志 → EditorApp 消费，和 `quitRequested` 同套路）。
-- **切换必须做边沿检测**：`EditorApp::m_appliedWindowFullscreen` 记住"上次告诉 GLFW 的值"，
-  只在变化时动窗口。若每帧无条件 `setFullscreen(want)`，编辑态下 `want=false` 会把 F11
-  打开的纯窗口全屏立刻关掉；F11 在"只看游戏"模式下也会看起来像按键失灵。
-- `Window::setFullscreen` 里除 `glfwSetWindowMonitor` 外**必须再置 `m_resized = true`**：
-  framebuffer 回调通常会置位，但漏掉时会拿着旧尺寸的交换链渲染一整帧（画面被拉伸）。
-
-### 窗口几何：首次居中 70%，之后记住上次关闭时的样子
-- `engine/core/WindowGeometry.{h,cpp}`（新）：`applyStartupGeometry(window, fraction, 存档文件, 兜底W,H)`
-  + `saveWindowGeometry(window, 存档文件)`。
-  - 无存档 → 主显示器**工作区**（`glfwGetMonitorWorkarea`，已排除任务栏）居中、宽高 = 工作区 × fraction。
-  - 有存档 → 用存档（含 `maximized`）；**必须先做可见性校验**（`visibleOnSomeMonitor`），
-    换显示器 / 拔外接屏后存档可能落在屏幕外 —— 那样窗口开了也看不到、拖不回来。
-- `EditorApp`：存档名 `editor_window.ini`（和 `imgui.ini` 一样放 CWD）、`fraction = 0.70f`；
-  `onInit()` **第一件事**就落位，`onShutdown()` 保存。
-  - `core::Application` 为此新增 `virtual void onShutdown()`（主循环退出前、窗口还活着时调用）。
-  - 落位走的是"置 resize 标志 → Renderer 下一帧重建交换链"，和用户手动拖窗口同一条路。
-  - **自动化跑不写存档**：`MYVK_FRAMES` 或 `MYVK_NO_WINDOW_SAVE` 存在时跳过
-    （`automationRun()`）；`tools/capture_window.py` 默认给子进程注入 `MYVK_NO_WINDOW_SAVE=1`
-    —— 它会故意缩放窗口压测，否则会把用户的存档改成压测尺寸。
-- `Window` 新增的几何 API：`windowPos/windowSize/setWindowPos/setWindowSize/maximized/maximize/
-  primaryMonitorWorkArea/windowedGeometry`。注意**几何是屏幕坐标**（glfwGetWindowSize），
-  与 `framebufferSize`（像素，高 DPI 下不同）不要混用。`windowedGeometry()` 在全屏时返回
-  "进入全屏前"那份 —— 否则下次启动会拿全屏尺寸当窗口尺寸。
-
-## venn 命名与图标（三层落地）
-引擎/编辑器统一叫 **venn**：窗口标题 `Venn Editor`（**Sandbox 已删，没有第二个窗口了**），
-日志头 `=== Venn Engine - Editor ===`。图标形象是**滑稽可爱豚鼠**（矢量卡通风：
-奶油色身体 + 焦糖色斑块、大眼、龅牙、抿嘴笑、炸毛），源图在 `design/venn_logo_source.png`。
-
-三层各自独立、缺一不可 —— **2026-10-10 晚重做了第 2 层**（原来的实现有 bug，见下）：
-1. **exe 资源**：`assets/icons/venn.rc`（`1 ICON "venn.ico"` + `VERSIONINFO`）+
-   CMake `enable_language(RC OPTIONAL)` → 资源管理器图标。`venn.ico` 含
-   16/24/32/48/64/128/256 七档（全 PNG 压缩）。
-2. **窗口图标**：`Window` 构造函数里 `GLFW_VISIBLE=FALSE` 建窗 →
-   `applyIconFromResource()` → 再 `glfwShowWindow`。`applyIconFromResource()`
-   从 exe 自己的 `RT_GROUP_ICON #1` 用 `LoadImageW(mode, 1, IMAGE_ICON,
-   SM_CXICON/SM_CXSMICON, ...)` 各取一张，然后**三处都设**：
-   `WM_SETICON`(ICON_BIG/ICON_SMALL/ICON_SMALL2) + `SetClassLongPtrW`
-   (GCLP_HICON/GCLP_HICONSM)。析构 `DestroyIcon`。
-   `setIconFromFile()` 退化为**兜底**：`m_iconFromResource` 为真时直接 early-return。
-3. **AUMID**：`SetCurrentProcessExplicitAppUserModelID(L"venn.engine.editor")`
-   —— 必须在**任何窗口创建之前**调。Editor 是**控制台子系统**程序，不显式设
-   AUMID 时 Windows 按 exe 路径猜，可能把窗口和控制台主机算成一组。
-4. **PNG 落盘**：`assets/icons/venn_icon.png`（512×512 透明）只作兜底，不再走它。
-
-> ⚠ **不要**退回"单张 512 PNG + `glfwSetWindowIcon`"的写法。GLFW 的
-> `_glfwSetWindowIconWin32` 按 `abs(w*h - targetW*targetH)` 选图，只喂一张
-> 512 时 `ICON_BIG`(48) 和 `ICON_SMALL`(24) 都拿到 512，再由 GDI 硬缩 → 小尺寸糊；
-> 而且它只发 `WM_SETICON`、**不设窗口类图标**，任务栏按钮是在窗口**第一次显示**
-> 时创建并记下当时的图标 —— 默认 `GLFW_VISIBLE=true` 会在 `glfwSetWindowIcon`
-> 之前就 `ShowWindow`，于是抢跑。详见坑点 #55。
-
-抠图要点：抹水印 → 抠中性浅灰背景（`sat<=10 && dist<=16`）→ 去地面阴影 →
-**洪泛填洞还原封闭内部**（否则眼白/牙齿会被一起打掉）→ 腐蚀 1px 去浅色镶边。
+## venn 命名与图标
+窗口标题 `Venn Editor`，日志头 `=== Venn Engine - Editor ===`。图标是**滑稽可爱豚鼠**。
+三层独立缺一不可：① exe 资源（`venn.rc` + `enable_language(RC OPTIONAL)`，`.ico` 七档）②
+窗口图标（`GLFW_VISIBLE=FALSE` 建窗 → `applyIconFromResource()` → 再 show；三处设
+`WM_SETICON` + `SetClassLongPtrW`）③ AUMID（`SetCurrentProcessExplicitAppUserModelID`，
+必须在任何窗口创建之前）。
+> ⚠ **不要**退回"单张 512 PNG + `glfwSetWindowIcon`"（GLFW 只发 `WM_SETICON`、不设窗口类图标，
+> 且默认 `GLFW_VISIBLE=true` 会在设图标前就 ShowWindow 抢跑）。
 
 ## 资产溯源与序列化
-Mesh/Material/Texture 各带"来源描述"（`*Source`），序列化只写描述、加载时由 AssetManager 重建
-（JSON 可读可手改可进版本库）；glTF 派生资源用"模型键 + primitive 下标"；路径入 JSON 前过
-`assets::makeAssetRelative()`；层级父子用**数组下标**；相机与方向光也在同一个 JSON 里。
+- Mesh/Material/Texture 各带"来源描述"，序列化只写描述、加载时由 AssetManager 重建；
+  路径入 JSON 前过 `makeAssetRelative()`；层级父子用**数组下标**；相机与方向光也在同一 JSON。
+- **`Mesh` 带局部 AABB 缓存**（`hasBounds()/boundsMin()/boundsMax()`，`upload()` 时算一次）：
+  阴影正交范围、编辑器拾取/贴地都要"物体实际尺寸"，别退回实体原点。
+- **`Texture` 色彩空间是契约**：`fromPixels(...,srgb)` / `makeSolid(...,srgb)` —— albedo/emissive
+  用 true，**normal/ORM 必须 false**。
+- **材质 6 个纹理槽**：albedo/normal/orm/**roughnessMap/metallicMap/emissiveMap**（后三个独立单因子，
+  刻意不复用 orm）。roughness/metallic **相乘**（默认纯白=恒等）；emissive **相加**（默认**纯黑**=恒等，
+  "加白"是错的）。描述符 `kTextureSetCount 3→6`，setLayouts 4→7。
+  落盘的 `name` 就是纹理**缓存键**，数据贴图的 `#linear` 后缀**不能剥**。
+- **场景 JSON 的 mesh `size` 只吃标量**（数组会让加载失败）。
 
-- **`Mesh` 带局部 AABB 缓存**（`hasBounds()` / `boundsMin()` / `boundsMax()`，`upload()` 时从顶点算一次）：
-  阴影正交范围、编辑器拾取/贴地都要"物体实际尺寸"，别再退回实体原点。
-- **`Texture` 的色彩空间是契约**：`fromPixels(..., bool srgb)` / `makeSolid(..., uint32_t size, bool srgb)`
-  —— albedo/emissive 用 true，**normal/ORM 必须 false**（见坑点 #47）。`m_source.srgb` 记录该选择。
-- **材质现在有 6 个纹理槽**（2026-10-10 加）：albedo / normal / orm / **roughnessMap / metallicMap /
-  emissiveMap**。后三个是**独立单因子槽**，刻意**不复用 orm**——UE5 语义是每个因子各挂一张图，而
-  ORM 是打包图，共用槽会让"只想换粗糙度"变成"必须提供打包图"。
-  - 合成方式：roughness/metallic **相乘**（默认绑**纯白** → 恒等）；emissive **相加**（默认绑**纯黑** →
-    恒等）。**"加白"是错的**：会让所有没绑自发光图的材质整片发白光。`Renderer::m_defaultBlack` 为此存在。
-  - 描述符集数量 `kTextureSetCount` 3 → **6**，主前向管线与栅格管线的 `setLayouts` 都从 4 扩到 **7**
-    （字段数不一致 → VUID-...-08600）。新增 set = 4/5/6，见 `assets/shaders/pbr.frag`。
-  - `SceneSerializer` 读写 `roughnessMap/metallicMap/emissiveMap`；读盘后必须**显式补写**
-    `mat->xxxMap`（`makeMaterialPBR` 按名字命中缓存时**不会**碰这几个新字段）。
-  - ⚠ 落盘的 `name` 就是纹理**缓存键**（`resolveTexture`：`key = name.empty() ? path : name`），
-    所以数据贴图的 `#linear` 后缀**不能剥**——剥了会让"同一张图当颜色/数据贴图"在重载时撞键。
+---
 
-## 已知坑点（血泪清单）
-1. PowerShell 里 `-DXXX=3.5` 会被拆开 → **必须加引号**。
-2. `Window.h` 里 **vulkan.h 必须在 glfw3.h 之前**（`glfwCreateWindowSurface` 被 `#if VK_VERSION_1_0` 包着）。
-3. 每张交换链图像需**独立**的 render-finished 信号量；析构时 Swapchain 必须先于 Surface 销毁。
-4. imgui master(≥1.93) InitInfo 变了（RenderPass 移到 `PipelineInfoMain.RenderPass`）；无 docking 分支
-   → `ImGuiWindowFlags_NoDocking` **未定义**。
-5. tinyobjloader 字段 `config.vertex_color`；tinygltf master 已重构 → 固定 v2.9.4。
-6. **深度图当纹理采样**必须用 `DEPTH_STENCIL_READ_ONLY_OPTIMAL`（非 SHADER_READ_ONLY）。
-7. **glTF ORM 陷阱**：`metallicRoughness` R 通道常写 0，本引擎 ORM 约定 R=AO → 必须 CPU 侧重打包。
-8. 全屏三角形用 `gl_VertexIndex`（Vulkan GLSL），不是 `gl_VertexID`。
-9. `World::clear()` 归零 generation → 旧句柄可能"碰巧" alive；`Scene::clear()` 必须重置 `m_lightEntity`。
-10. **本环境 PowerShell 输出不回显、bash coreutils 不可靠** → 结果写文件再 Read/Grep；日志用
-    `[System.IO.File]::WriteAllText(p,s,UTF8Encoding($false))`；长命令用后台任务（其输出可被捕获）。
-11. `enum class` 底层类型必须是整型；嵌套类型当类型名用要写全限定名（`Scene::LightStats`）。
-12. **头文件前向声明的类型，定义不能放进匿名命名空间**（否则是另外两个类型，`StmtPtr/ExprPtr` 对不上）。
-13. `std::filesystem::path` **不能**直接赋给 `std::string` → 用 `.generic_string()`。
-14. 引号 include 先查**当前文件所在目录** → `editor/script/*.cpp` 里写 `#include "ScriptEngine.h"`。
-15. **同一文件的多处修改必须串行下发**（并行 Edit 第二个会静默回滚第一个）。不同文件可并行。
-16. **"编译通过 + 日志无错" ≠ 画面正确**，一定要看截图。
-17. 相机视线要避开柱子（柱子在 (±4,±4)，正对角视线必穿 (4,4)）；默认 editor 相机 distance=12/pitch=0.28
-    会从盒外看房间外墙 → 一片暗灰。
-18. ⚠ **验证脚本里"注入的第一次左键点击会被 Windows 拿去做窗口激活"**，ImGui 收不到
-    → `ImGui::IsMouseClicked(Left)` 那一帧不存在，拾取/拖拽**静默不执行**。
-    症状极具误导性：`verify_bvh` 报"视口正中点不中 Cube_0"、`PICK-DBG` 一行都没有
-    （看起来像 BVH 射线或机位错），其实第一次点击整下丢了；而第二次点击正常。
-    **修法**：注入鼠标操作的用例开头先做一次**预热点击**，并断言预热本身产生了日志。
-    ⚠ 预热用的"对照断言"要改成**计数增量**（如 `pick: nothing hit` 的条数前后对比），
-    否则预热那条日志会让"有没有日志"型判据**恒真**。
-19. `PickingSystem::pick` 的自检日志原本排在 `if (!hit.hit) return best;` **之后**
-    → 没打中时一条日志都不出，"射线没打中"与"自检没跑到"无法区分。自检必须在早退之前；
-    且要**先把 hit 写进 best 再自检**，否则 `same` 恒为 0。
-20. `ImGui::BeginDragDropSource()` 默认要求上一个 item 有非零 ID → 无 ID 的 item 必须传
-    `ImGuiDragDropFlags_SourceAllowNullID`，否则 `IM_ASSERT(0)` → 退出码 `0xc0000409`。
-21. **ImGui 每帧把聚焦窗口提到最前** → 想让视口上的 HUD/覆盖层可见，**必须是 viewport 的 child window**
-    （`SetCursorScreenPos` 定位 + 在 `ImGui::End()` 之前画）；独立的顶层窗口会被 3D 图盖住。
-22. **`build/bin/imgui.ini` 会在下次启动覆盖默认面板布局** —— 存档里一个过期的
-    `Pos=1228,336` 能把 Stats 面板整个推出 1258 宽的客户区（截图上只剩行首几个字，
-    看起来像"文字被裁"其实是窗口在屏幕外）。目视确认 UI 时先删掉它让面板回默认位；
-    另外 Stats 面板内容天然宽于 360px，**横向滚动是既有状态**，不算新引入的 bug。
-    （旧坑：CreateProcess 的 `bInheritHandles` / 环境块继承 —— 跨进程方案已删除，见 editor/ 一节。）
-20. MinGW 的 `os_defines.h` **已定义 `NOMINMAX`** → 自己再 `#define` 会告警重定义。
-30. **ImGui 的 popup 必须"每帧都被提交"，否则帧末会被直接关掉**：菜单一弹出来就正好
-    盖在光标下，触发它的那个 item 立刻不再 hovered —— 若把 `BeginPopup*` 塞进
-    `if (hovered)` 里，下一帧不再执行、popup 没提交，菜单**只闪一帧**就消失。
-    正解：`drawEntry` 里只置"请求"（记下目标快照），`BeginPopup` 放到循环**之外**每帧
-    无条件调用；且 `OpenPopup` / `BeginPopup` 必须在**同一 ID 栈深度**（同一窗口、无 PushID），
-    否则 `GetID()` 哈希不同，永远打不开。
-31. **自动化输入：扩展键（Delete/方向键/Insert/Home/End）用 `keybd_event` 必须同时给扫描码**。
-    GLFW 从 `lParam` 的 `(KF_EXTENDED|0xff)` 取 scancode 再查 `keycodes[]`，Delete 的表项是
-    `keycodes[0x153]`。只传 `KEYEVENTF_EXTENDEDKEY` 而 `bScan=0` → 系统回退 `MapVirtualKey(VK)=0x53`，
-    扩展位丢了 → 查表得 0 → **键被整个丢弃**（现象：F2 有效、Delete 死活没反应）。
-    正解：`keybd_event(vk, MapVirtualKeyW(vk,0), extended?0x0001:0, 0)`。
-32. **这台机器上鼠标会被外部挪动**：`SetCursorPos` 之后 0.35s 内光标会平滑漂走
-    （实测采到 `(255,750)→(313,817)` 这种曲线），而空闲时又完全静止。
-    引擎里没有任何 warp 光标的代码。所以自动化点击不能"设一次就点"，
-    必须**闭环**（连续两次读回都在 ±2 内）+ 点击后校验画面再重试。
-33. **调试日志要限流**：把 `logRect(tag,...)` 放进递归的 `drawNode` 里，同一 tag 每帧被调
-    N 次、值一直变 → 两分钟写了 30MB，而且脚本取"最后一行"拿到的是随机某一行（坐标全错）。
-    必须"每帧只记一次"。
-34. **ImGui 颜色经 SRGB 交换链后会明显变亮**：`ImVec4(0.62,0.24,0.22)` 在屏幕上约是
-    `(206,140,133)` 的**浅鲑红**。按 `*255` 去写像素判据（找红色按钮）会一个像素都匹配不到。
-35. **自动化测试用的"红色确认按钮"定位**：用"新旧两张图里**新增**的红色区域"，能天然排除
-    3D 场景里本来就有的红盒子。
-36. **改 exe 图标要在 CMake 里 `enable_language(RC OPTIONAL)`**：MSYS2 ucrt64 自带
-    `windres`；`if(CMAKE_RC_COMPILER)` 判可用后再把 `.rc` 加进 `target_sources`。
-    新增后**必须重新 configure**（CMakeLists 变了会自动触发）。
-37. **`SetForegroundWindow` 会静默失败，而窗口不在前台时 ImGui 的拖拽完全收不到输入**。
-    Windows 的硬规则：只有**当前前台进程**（或被它启动的进程）才允许改前台窗口。
-    症状极具迷惑性 —— 坐标对所有、`SetCursorPos` 返回 1、`mouse_event` 也不报错，
-    但拖拽中间态截图里**连跟随提示都没有**，`BeginDragDropSource` 一次都没点火。
-    绕法：先按下再松开一次 ALT（`keybd_event(VK_MENU,…)`），系统就认为"用户在操作"，
-    随后的 `SetForegroundWindow` 才会被放行 —— 见 `tools/verify_asset_drag.py::force_foreground`。
-38. **解析自家日志的正则别用行首锚定**。日志行有 `[INFO ] ` 前缀，写 `^TAG=` 的
-    `re.match` 会一条都匹配不到，且**不报错**（脚本静默地"什么都找不到"）。
-    用 `re.search`，标签用 `[^=]+` 而不是 `.+`（`.+` 贪婪会把 `=(x,y)-(x,y)` 吞错位）。
-39. **改项目根目录名会被"以它为 cwd 的进程"挡住**。`mv` 报
-    "另一个进程正在使用此文件" / `System.IO.IOException`，而**子目录改名完全正常**
-    ⇒ 锁在根目录本身（VS Code 的扩展宿主以工作区根为 cwd 是最常见的一种）。
-    先让用户关掉那个窗口再改；改完必须删 `build/` 重新 configure（CMake/Ninja 缓存里
-    全是绝对路径），并同步所有硬编码绝对路径（`.workbuddy/skills/*`、文档）。
-21. **ImGui 固定像素尺寸的浮层会被字号缩放裁掉** → 宽度用 `CalcTextSize(...)` 取所有文本的最大值、
-    高度用 `GetFrameHeightWithSpacing()/GetTextLineHeightWithSpacing()/WindowPadding` 累加。
-    （`fontScale` 是用户可调的，实测写死 236px 时提示行被裁成半截。）
-22. **`Camera` 飞行模式的 setter 不变式**：`m_target` 与 `m_flyPos` 互为逆运算，任何只改一边的
-    接口都会让另一种模式"拖了没反应"。新增接口务必按 `m_fly` 分支（详见"视口相机与导航"）。
-23. **视口工具栏已经很长**：往里加按钮会被挤出右边缘裁掉（实测 `Fullscreen (F)` 变成 `Fulls…`）。    再加控件前先想"能不能挪到浮层 / 主工具栏"。
-25. **PostProcess 里新增"每帧一组"的资源，recreate() 必须配对 destroy**：recreate 会在
-    resize / 热重载 / MSAA 切换时反复执行，只 create 不 destroy 每次漏一组
-    （实测 resize 两次 → 退出时报 24 个 leaked objects，验证层 rc=4 → 三个用例
-    连环 FAIL）。sceneOutput 图是例外（有 ImGui 纹理引用要保 ID，用 reusable 判断），
-    fxaa 中间图无引用可整组换。
-26. **验证脚本结尾必须打 `结果: PASS`/`结果: FAIL: ...` 汇总行**：run_regression.py
-    的判定是 `rc==0 AND OK_RE 命中`（OK_RE = `RESULT: PASS|全部断言 PASS|结果: PASS`），
-    只 return 0 不打汇总行 → 断言全绿也判 FAIL（rc=0 的 FAIL 就是这个）。
-24. **验证"输入驱动"的行为别只靠像素差分**：编辑器场景是大片平滑渐变，轻微视角变化就会让
-    60%+ 像素变化 → 差分恒等于"全变了"，没有区分度。可靠读数是**界面上的数字**：
-    Inspector 的 `Target/Yaw/Pitch` 与 HUD 的 `Sensitivity`（截图后直接读数比对最实在）。
-    注入真实输入：`SetCursorPos` 让窗口收到**真**的 WM_MOUSEMOVE（只 PostMessage 会被真实鼠标
-    消息覆盖 → 视口不再 hovered），再 `PostMessage(WM_MOUSEWHEEL / WM_*BUTTONDOWN)`。
-    ⚠️ **WM_MOUSEWHEEL 的 wParam 高字是"这一次的 delta"（WHEEL_DELTA=120），不是累计格数**；
-    传累计值会让效果成倍（第一次就踩了：3 格变成 9 格）。
-25. **窗口几何存档 vs 自动化**：`tools/capture_window.py` 会故意缩放窗口压测 —— 让它给子进程
-    注入 `MYVK_NO_WINDOW_SAVE=1`，否则用户的"上次窗口大小"会被压测尺寸覆写。
-    另外该工具用 `terminate()` 强杀进程，`onShutdown()` 不会执行（这也是为什么它是安全的）。
-26. **"方向反 + 越拖越快"是两个独立缺陷叠加**（符号取反 × 自激正反馈），只修一个会得到
-    "方向对了但仍在加速"。数值可复现的 bug **先用小脚本把公式跑一遍**再动 C++，
-    比反复截图快得多。**验证用的环境变量钩子用完必须删干净**（`grep -rn "TEMP-"` 收尾）。
-27. **改某条管线的 push constant range = 有可能打断整个 Pass 的 set 0 绑定**
-    （VUID-...-08600，报错会出现在**后续无关的 draw 上**，极易误判）。想给旁路管线"缩 range"
-    之前先读"渲染管线约定"最后一条。
-28. `ContentBrowser` 面板会**扫描进程 CWD 的所有图片**做缩略图 → 在项目根目录随手丢验证截图
-    会被当成资源"加载"（日志刷 `Texture loaded:`）。验证产物请用固定前缀并及时清理。
-29. **"验证层静默"要当成一等验收项**：`grep -c "VUID\|ERROR"` 必须为 0。校验信息在
-    `capture_window.py` 的 stdout 里，很容易被"截图看着没问题"盖过去。
-40. **logRect 矩形日志的正则要允许小写**：tag 带 `Mesh`/`Cube` 这类小写时，
-    `[A-Z-]+` 会**静默失配**——"转储里明明有、脚本就是等不到"（子串转储看得见、
-    正则抓不到）。脚本侧用 `[A-Za-z-]+`。
-41. **`ImGui::BeginMenu` 只有子菜单展开才返回 true**：给它配的 logRect 必须写在
-    if **之外**无条件打（BeginMenu 无论返回值都提交 item，GetItemRectMin/Max 仍有效）。
-    写在 if 里 = 悬停前矩形永远不出来，自动化"等父项矩形才知道悬停哪"直接死锁。
-42. **自动化注入 Shift+A 的唯一稳法**：ALT-trick 前台确认（force_foreground）+
-    keybd_event **真实 Shift**（PostMessage 的 Shift 进不了 GetKeyState，GLFW
-    `getMods()` 读不到）+ **PostMessage 带扫描码的 A**。全真实 keybd_event(Shift+A)
-    反而不稳（脚本后台跑时前台策略会拒绝）。
-43. **自动化启动别读窗口几何存档**：存档可能是上次手动会话留下的全屏态，首帧
-    Appearing 窗口（Preferences）按全屏居中，脚本随后缩窗 → "飞到"客户区角落。
-    `automationRun()` 时**跳过 `applyStartupGeometry`（读和写都跳）**。
-    另：`Begin("X###id")` 的窗口 ID 是 ### 后面的部分——换 ID 才能甩掉
-    imgui.ini 里旧窗口的位置遗产。
-44. **`glm::ortho` ≠ Vulkan 深度**：GLM 默认（未定义 `GLM_FORCE_DEPTH_ZERO_TO_ONE`）输出
-    OpenGL 约定的 z∈[-1,1]，Vulkan 只保留 clip z∈[0,1]。主相机的 `glm::perspective` 因为
-    "写和读用同一套"所以看不出问题，但**任何把 z 存进贴图再手工换算的地方都会错**
-    （阴影图就是）。这类地方必须用 `glm::orthoRH_ZO` / `perspectiveRH_ZO`，且采样侧不要再
-    `*0.5+0.5`（那只对 xy 成立）。
-45. **包围盒别只用实体原点**：`worldMatrix(e)[3]` 丢掉尺寸/缩放，单个物体 → 半径 0。需要
-    "物体实际多大"就用 `Mesh::boundsMin/boundsMax`（上传时算好缓存，8 角过世界矩阵）。
-46. **本引擎是 Z-up**：着色器里凡是要"上/下"的都得用 `.z`（`envColor` 曾错用 `.y` → 环境光
-    梯度沿世界 +Y 走，地面出现一条明暗硬边）。同理任何 `dir.y * 0.5 + 0.5` 的天空梯度写法都要复核。
-47. **数据贴图必须 UNORM**：normal / ORM 用 `srgb=false`，颜色贴图才 `srgb=true`。
-    `Texture::makeSolid` / `fromPixels` 的 srgb 默认是 **true** —— 建数据贴图时必须显式传 false。
-48. **改了 GLSL 之后 `make build` 不一定把 .spv 拷到 `build/bin/shaders/`**：拷贝是 Editor 目标的
-    POST_BUILD 步骤，**只有 Editor 重新链接才会跑**。只改着色器时 ninja 只跑 `glslc`，
-    `build/bin/shaders/*.spv` 仍是旧的 → "改了没效果"。对策：`cp build/shaders/*.spv build/bin/shaders/`
-    （或顺手 touch 一个 .cpp 让它重链）。**验证着色器改动前先核对两边时间戳。**
-49. **mingw 的 `-Wformat` 不认 `%zu`**：会当成无此转换 → 报"参数过多/类型不符"。
-    size_t 打日志用 `%llu` + `static_cast<unsigned long long>(...)`。
-50. **"视角相关"的淡出阈值要按屏幕密度算，别用固定距离**：栅格最小格原本"一格剩 2.5px 就整族抹掉"，
-    而一格占几像素 = 格距 / `fwidth` 是**随视角**变的 —— 相机一贴近地面，1m 格在十几米外就全没了
-    （"贴近地面看栅格会消失"的根因）。阈值要放到真正的亚像素区（≈1.5px），并且**先把线宽按占空比
-    封顶**（否则亚像素时线宽占满整格，整片糊成亮带）。
-51. **像素单位的线宽一定要封顶**：`min(baseWpx, kMaxLineDuty * cellPx)`。只按像素给线宽、不设上限，
-    远处必然糊成一片亮色（覆盖率恒 1）。这条对任何"解析式图案/描边"都成立。
-52. **别用"到相机的距离"做固定物体的淡出**：栅格是固定的一块地，用相机距离淡出等于让一圈
-    "没有栅格的环"跟着相机跑。固定物体的可见范围要用**它自己的坐标**表达（这里是到栅格中心的
-    切比雪夫距离），这样外观与相机无关。
-53. **环境的钩子要注意初始化顺序**：`MYVK_EDITOR_CAM` 必须放在 `MYVK_EDITOR_SCENE` **之后** ——
-    加载场景会连相机一起覆盖，顺序反了钩子就白设（表现为"机位没生效"，且不报错）。
-54. **"可被选中/可被变换"要显式声明**：靠约定（"别去点地面"）守不住。用标记组件 + 在
-    **拾取和手柄两处**都挡（只挡一处，从层级树选中就绕过去了）。加新的"不可交互"实体时同理。
-55. **Windows 窗口图标要"多尺寸 + 显示前设好 + AUMID"三管齐下**：GLFW 的
-    `chooseImage` 按 `|w*h - target|` 挑图，单张 512 → ICON_BIG(48)/ICON_SMALL(24)
-    都拿到 512 再被 GDI 硬缩（小图标糊）；`glfwSetWindowIcon` 只发 `WM_SETICON`、
-    **不设窗口类图标**；任务栏按钮在窗口**第一次显示**时创建并记下当时图标，而
-    `GLFW_VISIBLE` 默认 true → `glfwCreateWindow` 内部先 `ShowWindow` 抢跑。
-    正解：`GLFW_VISIBLE=FALSE` → 从 exe 的 `RT_GROUP_ICON` 用 `LoadImageW` 按
-    SM_CXICON/SM_CXSMICON 各取一张 → `WM_SETICON`×3 + `SetClassLongPtrW`×2 →
-    `glfwShowWindow`；再在最前面 `SetCurrentProcessExplicitAppUserModelID`
-    （控制台子系统程序尤其要显式设）。详见"venn 命名与图标"一节。
-56. **`logRect` 是按矩形去抖的 → 弹出物的 tag 必须带"第几次打开"的序号**：
-    `VP-ADD-Mesh` 这种固定 tag，第二次在**同一位置**打开菜单时矩形没变、一行都不打，
-    自动化脚本于是拿到上一轮的陈旧坐标、在子菜单展开前就点下去。症状极具迷惑性：
-    **第一次加 Cube 成功、紧接着加 Sphere 必失败**（新 tag 的 PointLight 反而正常）。
-    修法：`ViewportPanel::drawAddMenu` 里 `++m_addMenuSeq`，tag 变 `VP-ADD-Mesh#3`；
-    脚本侧按 `tag(#\d+)?=` 取**最后一条** = 最新一次。
-57. **GLFW 的键值按 scancode 查表 + 修饰键走 GetKeyState**：注入按键必须带真实扫描码
-    （`PostMessage(hwnd, WM_KEYDOWN, vk, (sc<<16)|1)`），否则映射成 `GLFW_KEY_UNKNOWN`；
-    而 Shift/Ctrl 这类修饰键**必须用真实 `keybd_event`**（PostMessage 的修饰键
-    GLFW 看不见 —— 实测窗口已在前台也一样失败）。所以"Ctrl+S""Shift+A"只能
-    真实修饰键 + PostMessage 字母键混合注入。
-58. **自动化脚本里 `SetForegroundWindow` 要加 attach-thread-input 兜底**：只有当前前台
-    进程才允许改前台窗口，后台脚本直接调会**静默失败**；症状是"脚本单独跑全过、跟在别的
-    命令后面连着跑就偶发全挂"。最可靠的一条是把调用线程的输入队列临时挂到当前前台线程
-    （`AttachThreadInput(me, fg, TRUE)` → `SetForegroundWindow` → `AttachThreadInput(..., FALSE)`），
-    ALT 点一下只当兜底。这个 helper 统一放 `tools/verify_asset_drag.py::force_foreground`，
-    **别在别的脚本里复制一份**（复制的版本会落后于修复）。
-59. **`ImGui::EndGroup()` 会 `ItemAdd`**（带一个自动 ID），而 `BeginDragDropTarget()` 在
-    `LastItemData.ID==0` 时会用 `GetIDFromRectangle()` 兜底 —— 所以**一整组的包围盒可以直接
-    当 drop target**，不需要额外塞 `InvisibleButton`。`SetDragDropPayload` 的 type 上限 32 字节。
-60. **同一张图片在不同色彩空间下必须是两份 GPU 纹理 → 缓存键要编进 sRGB**：`AssetManager`
-    只按名字缓存，albedo(`_SRGB`) 和 normal(`_UNORM`) 共用一个键时第二次会拿回第一次那张，
-    法线被 gamma 过一次 → 光照方向全歪且极难查。本工程的约定是
-    `slotCacheKey(rel, srgb) = srgb ? rel : rel + "#linear"`（`#linear` 只是内部标记，
-    **显示前要剥掉**，见 `stripVariantSuffix()`）。⚠ 但**落盘的 `name` 字段不能剥** ——
-    它就是 `resolveTexture` 用的缓存键（`key = name.empty() ? path : name`），剥了重载时会撞键。
-61. **"因子 × 贴图"的默认值必须是数学中性值**：roughness/metallic 贴图与因子**相乘** → 未绑定时
-    要绑**纯白**；emissive 贴图与因子**相加** → 未绑定时要绑**纯黑**。用"加白"会让所有没绑
-    自发光图的材质整片发白光（而且看起来像"曝光坏了"，很难联想到贴图默认值）。
-62. **`ImGui::Dummy()` 天然就是拖放落点**：它给 `ItemAdd` 传的 ID 是 **0**，而
-    `BeginDragDropTarget()` 在 ID 为 0 时会退回 `GetIDFromRectangle()`，于是"这块矩形"就是热区，
-    **不需要额外的 `InvisibleButton`**。配合 `AddRectFilled/AddRect/AddImage/AddText` 就能手绘一个
-    "小方块 + 加号 → 绑图后长成缩略图 + 文件名"的槽位（见 `InspectorPanel::drawTextureChip`）。
-63. **`ImGui::SameLine(offset)` 的 offset 是"相对窗口内容起点"**，不是相对光标
-    （imgui.cpp 注释：`offset_from_start_x`）。想要"标签右边自然排一个控件"就直接
-    `SameLine()` 不传参，宽度用 `GetWindowContentRegionMax().x - GetCursorPosX()` 算。
-    **别把窄面板里的槽位钉成固定列**：Inspector 默认只有 ~315px，"定宽因子控件 + 标签 + 槽位"
-    三样塞不下 → 标签被压扁、槽位叠到控件上。
-64. **`discreteEdit` 的契约是"*target 已持有新值，第 4 参 = 旧值"，它只压撤销栈、不赋值**。
-    `ImGui::Checkbox` 只会写局部变量 → 勾选框分支里**必须先 `cc->xxx = xxx;` 再调
-    discreteEdit**。忘写就是全空操作：memcmp(before, target) 相等直接 return，
-    连撤销记录都不压（现象：点了没反应、存盘还是旧值，看起来像"鼠标漂移"）。
-    2026-10-11 Show Wireframe / Collider Solid 两个勾选框同时栽在这。
-65. **sRGB 交换链吃 ImGui 颜色的精确机制**（坑点 #34 的定量化）：IM_COL32 字节被 shader
-    **当线性值**输出 → 硬件再做一次 sRGB 编码 → 屏幕字节 = `encode(c/255)*255`。
-    金 `IM_COL32(255,202,74)` 实测上屏 `(245,219,142)`（b: 74→142 = 0.29^0.4167≈0.575）。
-    像素判据必须用**编码后实测色**（直方图采），±40 容差。⚠ 别加"线混亮背景"的中间
-    混合色：会和背景本身撞色，线框隐藏时背景假阳性（实测 262px 假命中，|Δ|全 <40）。
-66. **探针语义分层**：状态签名（COLLIDER-SIG）**无论可见与否都打**（隐藏时恰恰最需要）；
-    矩形探针（logRect）没画东西就不打（无矩形语义）。**toggle 类勾选框必须有回执日志**
-    （`INS-COLLIDER-EDIT-SET 0/1`）——自动化闭环重试靠它，盲点 toggle 会把状态勾回去。
-67. **序列化 `applyCamera` 的 setter 顺序：target 必须**最后**设**。fly 模式下
-    yaw/pitch/distance 各自的 `syncFlyTarget()` 会从"当前 target"反推位置；先设 target
-    会被后续 setter 用旧 flyPos 覆盖（存量 bug：JSON 相机全废，被新脚本暴露）。
-68. **`vkGetPhysicalDeviceFeatures2` 在 apiVersion=1.0 的实例上是无效调用**
-    （验证层报 ERROR、返回值全 0）—— 查 1.1/1.2 特性前先把实例升到 1.2
-    （`vkEnumerateInstanceVersion` 查 loader，取 min(1.2, supported)）。
-    pNext 挂 Vulkan12Features 后 `pEnabledFeatures` 必须为 NULL，老字段
-    （samplerAnisotropy）改走 `VkPhysicalDeviceFeatures2.features`。
-    `separateDepthStencilLayouts` 是共享 MSAA 深度方案的硬依赖
-    （DEPTH_READ_ONLY_OPTIMAL 附件布局），不支持直接 throw。
-69. **着色器的 set/binding 划分必须对着 `buildDescriptorSets` 写**：源图+深度
-    双输入的正确姿势是 **set0=源图、set1=深度**（两个独立 set，各只有
-    binding0）—— 写成"同 set 两个 binding"会报 `binding was not declared in
-    VkPipelineLayout` 且运行期 vkCmdDraw 缺 binding。ssao_blur / fg_ssgi /
-    fg_ssr / fg_godrays 四个着色器都栽过。
-70. **DescriptorAllocator 的 0 计数类型不能进 poolSize**（VUID-00302：
-    descriptorCount 必须 >0）。`.inl` 里已改成只收 >0 的类型；新调用方传
-    maxUBOs=0 不会再炸。
-71. **ping-pong 屏障的 oldLayout 要用 UNDEFINED**：单 pass 链里 k=1 工作图
-    永远不被写（停 UNDEFINED），renderpass 的 initialLayout=UNDEFINED 还会把
-    验证层布局状态重置 —— oldLayout=SHADER_READ_ONLY 每帧撞 2 条 VUID-09600。
-    UNDEFINED 匹配任意布局，全屏覆盖写本来就不要旧内容，WAW/WAR 内存依赖不变。
-72. **SSAOPass（或任何"全局描述符引用的图"）重建后必须 writeGlobalDescriptors**：
-    resultView 句柄换了，set0/binding14 若不刷新就是悬空视图。
-    setSampleCount 路径已补，新增重建路径时记得跟。
-73. **场景 JSON 的 mesh `size` 只吃标量**：数组（`[2,2,12]`）会让场景加载直接
-    崩（Editor 闪退、run_once 截图空 `cannot write empty image`）。
-74. **MYVK_EDITOR_CAM 的 pitch 是俯角（正=向下）**，且 setTarget 轨道重摆后
-    真实朝向不完全受控 —— 别盲调机位，用 MYVK_FG_SUN_UV="u,v" 钩子直接指定
-    太阳屏幕坐标；godrays 信号在**暗色区域**最显著（叠亮天空上 8bit 差只有
-    5~30），验证时用 MYVK_GODRAYS_STRENGTH 拉强。
-75. **进程 stdout 是块缓冲**：验证脚本读日志只有前 24 行 ≠ 进程卡死，可能只是
-    缓冲没刷。判启动失败看三样：errs 里有 Fatal / 窗口是否存在 / 截图是否空。
-76. **blit 链生成 mip 时初始 barrier 必须全层 UNDEFINED→TRANSFER_DST**：只转
-    level0 会让 blit 目的层（1..N-1）停在 UNDEFINED → VUID-09600。经典写法：
-    全层转 DST → copy mip0 → 每级"源层 DST→SRC、blit、源层就地 SRC→SHADER_READ"
-    → 最后一层 DST→SHADER_READ。
-77. **流式纹理的未传层也要转 SHADER_READ**：验证层按描述符视图**全部 subresource**
-    检查布局（不做 maxLod 分析）——未传层停在 TRANSFER_DST 会撞 09600。布局合法
-    内容未定义即可（maxLod 挡住逻辑采样）；补传时 SHADER_READ→TRANSFER_DST→
-    copy→SHADER_READ 每层三个 barrier。
-78. **手写 DDS/二进制格式的 struct.pack 别用 `Ns` 装 N 字节结构体**：`8s` 会把
-    32 字节 ddspf 截断成 8 字节（fourCC 丢失 → 引擎报 Unsupported pixel format）。
-    用 `32s` 或展开 `8I`。
-79. **numpy 手写块压缩编码器的两个坑**：① 块级"端点进位修正"必须只作用于触发块
-    （全图共享数组无脑 +1 会把非触发块的调色板与已编码值撑错位 → PSNR 掉到 8dB）；
-    ② decode 侧 (Bh,Bw,16,3) 不能直接 reshape 成图像——块列维与 texel 维错位，
-    必须 reshape(Bh,Bw,4,4,3).transpose(0,2,1,3,4)（encode 的 transpose 的逆）。
-    自检用内置解码器回读算 PSNR（Pillow 只能读 BC 不能写，也不认自写头）。
-80. **自动化跑必须把 ImGui 的 `imgui.ini` 一起关掉**（`io.IniFilename = nullptr`，见
-    `ImGuiManager::init`；`MYVK_NO_WINDOW_SAVE` / `MYVK_FRAMES` 时生效）。此前它只管
-    `editor_window.ini`，ImGui 的 ini **照样读照样写** —— 手动会话常是全屏（存档里
-    `editor_window.ini` 记着 3840x2054），而脚本把窗口缩到 1600x900，于是存档里
-    "在 3840 宽度下完全正常"的浮动窗口坐标（实测 `[character] Pos=1559,597
-    Size=1263,794`）一读回来就把角色窗口顶到客户区之外：ImGui 照画、`logRect` 照打
-    坐标，脚本按那段矩形点击**全部落在窗口外且不报错** → `verify_character_window`
-    的"拿到动画条目矩形（CHAR-CLIP）"恒挂，而且**一次踩脏就永久复现**（每轮都写回）。
-    识别特征：日志里 `Preview render size ->` 大于窗口客户区（934x701 > 1578x844 的一半），
-    或截图里浮动窗口只剩右/下边缘一条。主面板不受影响（`computeLayout()` 每帧显式定 Pos/Size）。
-    ⚠ 与坑点 #22 同一根源（那里是目视确认，这里是自动化点击）。
-81. **尺寸重建路径的顺序：`recreateScreenSpace()` 必须早于 `postInputViews()`**。链激活时
-    `postInputViews()` 返回 `FrameGraph::outputView()` —— 那是**即将随重建销毁**的旧工作图
-    句柄。`applyViewportSize` 里先 `m_mainTarget->apply(..., postInputViews())` 再重建
-    FrameGraph，写进描述符的就是已失效的 `VkImageView`（验证层报
-    `pDescriptorWrites[0].pImageInfo[0].imageView Invalid VkImageView Object 0xaa00...`）。
-    正解：`apply(...)` 第三参一律传**空 vector**（先接 HDR resolve，必定有效），收尾再调
-    `rewireMainTargetChainInput()` 用重建后的新句柄补接。
-82. **一个命令缓冲里录两个相机 → `FrameUBO` 必须"一相机一份"**。`FrameUBO` 是
-    HOST_VISIBLE + 常驻映射，`uploadSceneState` 在**录制期**就 memcpy 进去 —— 主视口与
-    预览/额外视角先后录制时只有最后一次能留在 buffer 里，GPU 执行时**先录的那个场景也读到
-    后一次的值**（主视口被渲染成预览相机的视角）。旧注释写的"主场景命令已录制完毕所以安全"
-    是错的：memcpy 发生在录制期而非执行期。正解：`FrameResources::OffscreenUbo`（vector，
-    下标 = `m_targets` 序号 - 1），离屏目标各持一份 UBO + 各自的 set 0，其余 binding 共享。
-83. **相机特效的验证钩子与度量**：① 静态相机下运动模糊速度物理恒为 0（无法端到端验证），
-    用 `MYVK_MB_SIM_YAW` 造一个确定的速度源，但**必须绕相机自身位置偏航**
-    （`T(camPos)·Rz·T(-camPos)`）—— 绕世界原点转对远离原点的相机速度极大，会被着色器里的
-    速度上限 `params.z=0.25` 饱和，于是 strength 怎么乘都被夹到同一值（断言"强度单调"假通过）。
-    ② "差异像素数"在阈值处会**饱和**，强度类断言要看**平均差**（线性量）。
-84. **`RT-TARGETS` 这类多目标日志的名字要按"指针身份"判断，不能按下标**：预览目标（1 号）是
-    角色窗口首次打开时懒建的，`MYVK_EXTRA_VIEW=1` 又可能让它先存在 —— 按下标取名会错位。
-85. **预览关闭时不能走 `setSize(0,0) + apply()`**：`RenderTarget` 里"非离屏"的语义是
-    "HDR 跟交换链尺寸"（游戏模式直写交换链用的），对预览来说那就是白白多建一张 1600x900 的
-    HDR。关闭时直接 `return` 冻住原资源（下次打开零重建）才是想要的。
-86. **GPU 时戳：被 reset 却没写入的 query 会永远 unavailable，拖累整批读回**（2026-10-13，R0-1）：
-    `vkCmdResetQueryPool` 每帧复位整 slot 的 18 个 query，但 SSAO/FrameGraph 这类条件 pass 的
-    begin/end 若包在 `if` 里，关闭时 query 被复位却无人写入 → `vkGetQueryPoolResults` 对整批
-    返回 VK_NOT_READY（驱动还会把 available 的部分填进 buffer，数据看着合理、返回值却不是
-    SUCCESS —— 极易误判）。**所有段无条件打 begin/end**，关闭段 = 相邻时戳 ≈0，正好当
-    "未激活"标记。
-87. **GPU 时戳：fence 初始是 signaled 的，头几帧读 query 违反 VUID-09401**（uninitialized）。
-    帧槽的命令缓冲还没提交过时该 slot 的 query 从未初始化。用 `markSubmitted(frameIndex)`
-    （vkQueueSubmit 之后打标）挡住，只有提交过的槽才允许 readFrame。
-88. **GPU 时戳的周期/位数是队列族属性不是设备属性**：`timestampPeriod` 在
-    `limits` 里，但 `timestampValidBits` 在 `vkGetPhysicalDeviceQueueFamilyProperties`
-    的**对应队列族**里（0 = 该队列不支持时戳）。validBits < 64 时要 mask 再做差。
+## 已知坑点（血泪清单 · 只留仍有效的规则）
+
+### 构建 / 环境
+1. PowerShell 里 `-DXXX=3.5` 会被拆开 → **必须加引号**（含空格的路径同理）。
+2. `Window.h` 里 **vulkan.h 必须在 glfw3.h 之前**（`glfwCreateWindowSurface` 被 `#if VK_VERSION_1_0` 包）。
+3. 本环境 PowerShell 输出不回显、bash coreutils 不可靠 → 结果写文件再 Read/Grep。
+4. mingw 的 `-Wformat` 不认 `%zu` → 报"参数过多/类型不符"。
+5. MinGW 的 `os_defines.h` **已定义 `NOMINMAX`** → 自己再 `#define` 会告警重定义。
+6. **改了 GLSL 后 `make build` 不一定把 .spv 拷到 `build/bin/shaders/`**（拷贝是 Editor 目标的
+   依赖，改动只有 .spv 时要触发拷贝）。
+7. **`GLOB mismatch!` 是 `CONFIGURE_DEPENDS` 的正常提示**，不是错误。
+
+### 视口像素断言（续）
+64. **texel snapping 不能对 `view * mid` 量化**：`mid` 是 lookAt 的 target，
+    lookAt 后必然落在视轴原点 → `view*mid == (0,0,-dist)` **恒成立**，量化它是
+    空操作（开关、日志都"正常"，阴影边缘却照样连续滑动）。必须用"只含旋转"的
+    光轴基把球心的**世界位置**投影后量化，再重建 lookAt。见 R3-1。
+65. **亚像素级的效果不能靠截图差分验证**：`MYVK_SHADOW_RES=2048` 时一纹素
+    ≈0.05 屏幕像素，snap 开/关的截图差分在小数点后 5 位完全相同（降到 256 也
+    一样）——因为相机一移动，"整幅画面的视差位移"就把它淹没了。**测理论亚像素
+    的现象要断言画面之外的量**（如光空间矩阵的平移列，见 `MYVK_SHADOW_MATRIX_DBG`）。
+    硬凑一个像素断言只会做出恒真的假 PASS。
+
+### C++ / 类型
+8. `enum class` 底层类型必须是整型；嵌套类型当类型名用要写全限定名。
+9. **头文件前向声明的类型，定义不能放匿名命名空间**（否则是另外两个类型）。
+10. `std::filesystem::path` **不能**直接赋 `std::string` → 用 `.generic_string()`。
+11. 引号 include 先查**当前文件所在目录**。
+12. **同一文件的多处修改必须串行下发**（并行 Edit 第二个会静默回滚第一个）。不同文件可并行。
+13. `World::clear()` 归零 generation → 旧句柄可能"碰巧" alive；`Scene::clear()` 必须重置 `m_lightEntity`。
+
+### Vulkan
+14. 每张交换链图像需**独立** render-finished 信号量；析构时 Swapchain 先于 Surface 销毁。
+15. **深度图当纹理采样**用 `DEPTH_STENCIL_READ_ONLY_OPTIMAL`（非 SHADER_READ_ONLY）。
+16. **改某条管线的 push constant range = 可能打断整个 Pass 的 set 0 绑定**（VUID-08600）。
+17. **DescriptorAllocator 的 0 计数类型不能进 poolSize**（VUID-00302）。
+18. **ping-pong 屏障的 oldLayout 要用 UNDEFINED**（单 pass 链里 k=1 工作图）。
+19. **全局描述符引用的图（如 SSAOPass）重建后必须 `writeGlobalDescriptors`**。
+20. `vkGetPhysicalDeviceFeatures2` 在 apiVersion=1.0 的实例上是无效调用。
+21. **blit 链生成 mip 时初始 barrier 必须全层 UNDEFINED→TRANSFER_DST**；流式纹理的未传层也要转
+    SHADER_READ（验证层按描述符视图**全部 subresource** 校验）。
+22. **`glm::ortho` ≠ Vulkan 深度**：用 `glm::orthoRH_ZO`（或定义 `GLM_FORCE_DEPTH_ZERO_TO_ONE`）。
+
+### GPU 时戳 / 查询
+23. **被 reset 却没写入的 query 会永远 unavailable，拖累整批读回**。
+24. **fence 初始是 signaled 的，头几帧读 query 违反 VUID-09401**。
+25. **`timestampPeriod`/位数是队列族属性不是设备属性**。
+
+### ImGui / 编辑器自动化
+26. `ImGui::BeginDragDropSource()` 默认要求上一个 item 有非零 ID → 无 ID 的 item 必须传
+    `SourceAllowNullID`（否则 `IM_ASSERT(0)` 崩，退程码 `0xc0000409`）。
+27. **`ImGui::Dummy()` 天然就是拖放落点**（ItemAdd 传的 ID 是 0）。
+28. **ImGui 每帧把聚焦窗口提到最前** → 视口上的 HUD/覆盖层**必须是 viewport 的 child window**。
+29. **ImGui 的 popup 必须"每帧都被提交"**，否则帧末会被直接关掉。
+30. **`ImGui::BeginMenu` 只有子菜单展开才返回 true** → 配的 logRect 必须写在子菜单内部。
+31. **`ImGui::EndGroup()` 会 `ItemAdd`**（带自动 ID），`BeginDragDropTarget()` 在其后仍可用。
+32. `ImGui::SameLine(offset)` 的 offset 是**相对窗口内容起点**，不是相对光标。
+33. **固定像素尺寸的浮层会被字号缩放裁掉** → 用 `CalcTextSize` 等字体度量算尺寸。
+34. **视口工具栏已经很长**：加按钮会被挤出右边缘裁掉 → 先想"能不能挪到浮层/主工具栏"。
+35. `discreteEdit` 的契约是"`*target` 已持有新值，第 4 参 = 旧值"，它只压撤销栈、不赋值。
+36. **序列化 `applyCamera` 的 setter 顺序：target 必须最后设**（fly 模式下）。
+37. **`logRect` 是按矩形去抖的 → 弹出物的 tag 必须带"第几次打开"的序号**；
+    正则要允许小写 tag。
+38. imgui master(≥1.93) InitInfo 变了；无 docking 分支 → `ImGuiWindowFlags_NoDocking` 未定义。
+39. **自动化跑必须把 ImGui 的 `imgui.ini` 一起关掉**（`io.IniFilename = nullptr`）。
+40. **自动化启动别读窗口几何存档**（存档可能是上次手动会话留下的全屏态）。
+41. **解析自家日志的正则别用行首锚定**（日志有 `[INFO ] ` 前缀）。
+42. **进程 stdout 是块缓冲**：日志只有前 24 行 ≠ 进程卡死。
+43. **自动化 `SetForegroundWindow` 会静默失败**（窗口不在前台时 ImGui 收不到输入）→
+    要加 attach-thread-input 兜底；`SetWindowPos` 后光标会被外部挪走。
+44. **自动化注入扩展键（Delete/方向键等）用 `keybd_event` 必须同时给扫描码**；
+    GLFW 键值按 scancode 查表 + 修饰键走 `GetKeyState`。
+45. **验证脚本里"注入的第一次左键点击会被 Windows 拿去做窗口激活"**，ImGui 收不到。
+46. **自动化注入 Shift+A 的唯一稳法**：ALT-trick 前台确认 + 真实扫描码。
+47. **验证层静默是一等验收项**：`grep -c "VUID\|ERROR"` 必须为 0。
+
+### 颜色 / 贴图
+48. **数据贴图必须 UNORM**：normal/ORM 用 `srgb=false`，颜色贴图才 `srgb=true`。
+49. **ImGui 颜色经 SRGB 交换链后会明显变亮**（`ImVec4(0.62,0.24,0.22)` 屏幕上约是 0.34 亮度）。
+50. **同一张图在不同色彩空间必须是两份 GPU 纹理 → 缓存键要编进 sRGB**。
+51. **"因子 × 贴图"的默认值必须是数学中性值**（roughness/metallic 未绑定时绑纯白；
+    emissive 绑纯黑）。**别用"加白"**。
+52. **缺省贴图**：`createDefaultTextures()` 的白色(ORM)与平坦法线**必须 `srgb=false`**，
+    否则平坦法线 (128,128,255) 被硬件 gamma 解码 → 被扳约 39° → 大面片整块变色。
+
+### 命名 / 图标 / 其它
+53. **环境的钩子要注意初始化顺序**：`MYVK_EDITOR_CAM` 必须放在 `MYVK_EDITOR_SCENE` **之后**。
+54. **"可被选中/可被变换"要显式声明**（用标记组件，别靠约定）。
+55. **`MYVK_EDITOR_CAM` 的 pitch 是俯角（正=向下）**，且 setTarget 轨道重摆后要重设。
+56. **脚本的 `readJoint` 等辅助函数未使用会有告警**；tinyobjloader 头里的 unused 函数告警无害。
+57. **改项目根目录名会被"以它为 cwd 的进程"挡住**（`mv` 报 busy）→ 先关进程。
+58. **`ContentBrowser` 面板会扫描进程 CWD 的所有图片做缩略图** → 别在项目根目录乱丢验证截图。
+59. **自动控制器不要给用户给的"目标值"做无理由的下限夹紧**。
+60. **动态分辨率必须把"输出分辨率"与"场景渲染分辨率"彻底分开，且两处一致**；
+    **离屏输出图（ImGui 采样那张）是全分辨率的，判"能否复用"要用它**。
+61. **"关闭 = 基线逐像素不变"在着色器里也要落实到位**（用 0 判断而不是宏）。
+62. **glslang：`#extension` 必须在所有非预处理语句之前**。
+63. **bindless 纹理数组的容量必须按设备收窄，不能硬写**；材质页表必须**按帧槽分离**，
+    否则会撕裂在途读取。
+64. **`#ifdef` 判不出"默认定义为 0 的编译开关"** → 用 `#if` 或 `constexpr`。
 
 ## 工具
-- `tools/run_regression.py`（2026-10-11）：**串行**跑全套 GUI 验证脚本（GUI 必须独占窗口），
-  **以退出码为准**。这批脚本的结果行格式不统一（`RESULT: PASS` / `全部断言 PASS` /
-  `全部 PASS` / `结果: PASS`），只靠文本匹配会误判。两例之间默认等 2s。
-  **完整回归跑一次即可**（2026-10-13 用户明确：从"跑两次"改为"一次"）。
-  ⚠ 单跑过、连跑偶发失败是已知的**焦点时序**问题（见 `force_foreground` 注释），
-  判失败前**先单独复现一次**再下结论。`--tail N` 打失败用例的日志尾部。
-- `tools/verify_frustum_cull.py`（2026-10-11）：137 立方体（4 在视锥内）→ culled=132 /
-  drawnOpaque=4；`MYVK_FRUSTUM_CULL=0` 对照组 drawnOpaque=136 且两次截图 diff≈0.07。
-- `tools/verify_bvh.py`（2026-10-11）：树健康 / 剪枝 / `BVH-DBG missing=0 extra=0` /
-  与线性基线逐值相同 / 射线拾取点中 Cube_0 且 `PICK-DBG same=1`。
-  ⚠ 视口**左下角**是导航小图标的隐形按钮，会吞掉点击；测"点空地"要点**右下角**。
-- `tools/verify_lod.py`（2026-10-11）：4 距离（3/12/30/80）摆同一颗高模球恰好落 4 级；
-  断言链生成、1/1/1/1 分布、tris 3060 vs noLod 9216、静止不抖、`MYVK_LOD=0` 对照组、
-  `MYVK_LOD_FORCE`、`MYVK_LOD_BIAS`、立方体不生成、OBJ 高模球聚类简化 3968/1840/920/384、
-  anime_girl.glb 蒙皮链停在 1 级。
-- `tools/verify_ibl.py`（2026-10-12）：天空盒 + 真 IBL，4 组 32 条断言。
-  ① 环境资源尺寸 + `ENV-READBACK` 数值自检（亮度严格递减 = Z-up 守门人；
-  **BRDF LUT 在 (1,0) 处精确 (1,0)**）。② 关天空：左右上角差对称的 139.3/139.4，
-  球体区差 **0.00**（把背景 pass 与物体着色分开归因）。③ 关 IBL：球体区差 40.8，
-  背景角区差 **0.00**。④ 因果实验：天顶=红 / 地面=蓝，无球场景三条天空带 `r/b`
-  0.942 > 0.831 > 0.761（单调，抓"梯度错落到 dir.y"），有球+关天空时球面上半偏红、
-  下半偏蓝（证明整条 IBL 链路的图正确接管了着色）。
-  ⚠ 全程 `MYVK_EDITOR_NO_HUD=1`（原因见"视口像素断言的纪律"）。
-- `tools/verify_csm.py`（2026-10-12）：级联方向光阴影 + 阴影距离分级，5 组 ~40 条断言。
-  场景 = 300 地面 + 沿 +X 五根 6³ 柱子，相机 `40,60,22,270,22`。① **分割点逐项等于解析
-  公式**（最大误差 0.0014）。② 每级剔除：`considered` = 投影体数 × 级联数 = 20、
-  实测提交 7（省 65%）、各级 `0/5 0/5 2/5 5/5` 单调不减、第 0 级提交 0。③ `CASCADES=1`
-  → 四个分割点全 = 90、`considered` 20→5、`c0=5/5`。④ **距离分级量成连续信号**：
-  与"关阴影"的差异像素 n(90)=1660 > n(70)=556 > n(25)=**0**（dist=25 时逐像素完全相同）。
-  ⑤ 变化只落在地面窄带（视口上方 1/4 平均差 0.000）。
-  ⚠ 两处场景性质（换场景时要重新推）：5 根柱子的**视线深度完全相同（≈62.7m）**，
-  所以 4 级与 1 级的截图差异**必然很小**（实测仅 19px）——级联数主要靠**数值**断言；
-  且相机高 22m / 俯角 22° ⇒ **可见地面的视深度是 [31.4m, ∞)**，c0/c1 覆盖的地面根本不在画面里。
-- `tools/verify_local_shadow.py`（2026-10-12）：局部光源阴影（点光 / 聚光灯），5 组 43 条断言。
-  场景 = 4 投影体 + 3 盏投影灯（2 聚光 + 1 点光，到相机距离平方 578 / 798 / 1172）+ 1 盏
-  `castsShadow=false` 的对照灯，相机 `0,-34,15,90,16`。① **层分配**：`candidates=3 assigned=3
-  layers=8/12`（1+1+6）；★ `MYVK_LOCAL_SHADOW_LIGHTS=1` → `layers=1`（留下的是距离 578 的
-  **聚光灯**，不是距离 1172 的**点光**）——一条断言同时钉住"近的优先"与"按层数算预算"。
-  硬预算溢出（4 盏点光 = 24 层 > 12）：`assigned=2 layers=12/12`，层号不越界。
-  ② 逐层剔除：`considered=32`（4 投影体 × 8 层）、`submitted=28`。③ **两条关断路径等价**：
-  `MYVK_LOCAL_SHADOW=0`（短路采样）与 `MYVK_LOCAL_SHADOW_LIGHTS=0`（不分配层）**逐像素最大差 = 0**；
-  开 / 关 = 5956 像素、最大差 193，视口上方 1/4 平均差 0.000。④ 层预算是连续信号：
-  mean `0.3139 < 0.3409 < 0.4919`；⚠ 差异**像素计数在相邻档位间非单调**（多一盏灯同时照亮地面，
-  一些勉强过阈值的像素会掉回去）→ 只对均值守恒，像素计数仅在 n(3) 上做方向断言。
-  ⑤ 点光 6 面：开 / 关 9388 像素、差异带横跨视口宽度 **61.2%**，目视确认是四边均匀的对称方环
-  （地面本影半宽 5.5 = `2.5 × 11/(11−6)` 的解析值），无立方体面接缝、无 acne、无漏光。
-  ⚠ 全程 `MYVK_EDITOR_NO_HUD=1`；改动 `LocalShadowPass` 的 `kCubeFaceDir/kCubeFaceUp` 必须与
-  `common.glsl` 的 `vennCubeDir/vennCubeFaceIndex/vennCubeFaceUvFromDir` 逐条重新对齐。
-- `tools/verify_shader_variants.py`（2026-10-12）：Shader 变体 / 关键字系统，5 组 31 条断言。
-  相机 `0,-34,15,90,16`；全程 `MYVK_SHADER_VARIANTS=1` + `MYVK_FRUSTUM_DBG=1` +
-  `MYVK_LIGHT_GIZMOS=0` + `MYVK_EDITOR_NO_HUD=1`，等**两条** `SHADER-VARIANTS `。
-  ① **路由**（场景 = 7 个体用上全部 5 种掩码）：`fwd_created=5 depth_created=2 forced=-1
-  draws=k0=2,k1=2,k2=1,k4=1,k5=1`，掩码集合恰好 `{0,1,2,4,5}`、逐个掩码计数与场景逐条对上、
-  `fwd_created` 跑多帧后**不增长**（缓存生效）、`BUILT fwd k5 = "double-sided|normal-map"`、
-  `BUILT depth = {0,1}`。② `FORCE_MASK=0 vs 4`（**场景里没有任何贴图文件**）：
-  最大差 ≤ **1 个 LSB**、`>18 的像素 0 个`、均值 0.1012、bbox=None —— 证明"编掉法线段"等价。
-  ③ `FORCE_MASK=0 vs 1`（地面 + 两块**朝向相反**的竖直板，不必赌 plane 图元法线朝向）：
-  **24792 像素、最大差 178**，差异带宽视口 29.3%。④ 配对断言（防"两边都错"）：挂非平坦
-  棋盘法线图时 `0 vs 4` = **5808 像素、最大差 30**（判读卡 `max > 20`，因为太阳压到 0.45 后
-  法线 ±0.7 只换 ~30/255 亮度）。⑤ 透明：`0 vs 2` = **116226 像素、最大差 126**，
-  且 `FORCE_MASK=0` 时 `drawnTransparent=0`（分类确实跟着掩码走）。
-  ⚠ 每组强制掩码运行都断言 `fwd_created == 1` —— 就是这条把 `layout()` 白建 k0 的 bug
-  揪出来的。所有像素比对**裁到视口矩形**（复用 `verify_local_shadow.diff_stats(vp=...)`）。
-- `tools/_probe_ui_variants.py`（2026-10-12）：UI 目视确认探针（非断言型）——启动编辑器
-  加载变体场景 → 预热点击 + 点地面选中 Ground（材质 = 双面+法线图 → 掩码 5）→ 截图
-  `_venn_verify/ui_variants.png`。看 Stats 面板变体矩阵与 Inspector `Shader Var` 行。
-  ⚠ 跑之前删 `build/bin/imgui.ini`（见坑点 22）；点击点选 0.70 倍视口高度处（正中是天空）。
-- `tools/verify_shader_hotreload.py`（2026-10-12）：shader 热重载，**同一进程内**
-  覆盖 `build/bin/shaders/pbr.k0.frag.spv`（glslc 编"强制绿色"临时源）→ 等
-  `SHADER-RELOAD ok` → 像素大变 → 还原 → **逐像素回基线**（n=0）。4 条附加断言：
-  重载后 `fwd_created` 回 1（缓存真被清）、SHADER-RELOAD 恰好 2 条、零 VUID。
-  glslc 探测 `$VULKAN_SDK/Bin` → `C:\VulkanSDK\*\Bin`（本机 `E:\code\vulkan\core\Bin`）。
-- `tools/verify_fxaa.py`（2026-10-12）：FXAA（`MYVK_FXAA`，插在 tonemap 后）。
-  MSAA=1 + 斜置亮板：开/关差异 14209 像素、占比 4.75%（early-out 让平坦区恒等，
-  只动边缘）；**自动找平坦窗**（32² 相邻差 ≤3、离差异 bbox ≥24px → 天空区）断言
-  n==0。⚠ 别把"平坦区"选在地面 —— 参考栅格的细线本身就是锯齿源，FXAA 动它是
-  正确行为（实测 497 像素假失败）。
-- `tools/verify_instancing.py`（2026-10-12）：GPU instancing / 合批（`MYVK_INSTANCING`）。
-  场景 = 地面 + 4 红 + 4 蓝 cube（**共享 mesh name "ins_cube" 与各自材质 name**）+ 球
-  → items=10、batches=4、saved=6；开/关**逐像素等价**（n=0，SSBO mat4 与 push 的
-  model 数值逐位相同）。⚠ 场景 JSON 里 mesh/material 的 **name 就是 AssetManager
-  的缓存键** —— 每实体用不同 name（如实体名小写）会得到 N 个独立对象，合批永远
-  10/10 不命中（实测踩过）。
-- `tools/capture_window.py`：启动 exe → 缩放压测 → `PrintWindow` 截图（不受遮挡；进程需 DPI 感知）。
-  参数 `--no-resize / --size WxH / --out / --wait / --env K=V / --exe / --title / --args`。
-  **默认目标已经是 `build/bin/Editor.exe` / 标题 "Venn Editor"**（Sandbox 已删）。
-  窗口查找用 `EnumWindows` + 标题**前缀**匹配。
-  **会给子进程注入 `MYVK_NO_WINDOW_SAVE=1`**（压测会缩放窗口，别污染窗口几何存档）。
-  抓 Play 态画面：`--env MYVK_EDITOR_PLAY=1`；**想抓全屏布局**得改 `EditorApp::onInit()` 里
-  `m_ctx->gameFullscreenRef() = true;` 临时置位（无命令行开关），抓完记得撤。Play 态 HUD 在视口右上角。
-  运行：`& "C:\Users\v_lweiili\.workbuddy\binaries\python\envs\default\Scripts\python.exe" tools\capture_window.py`
-  **注意**：改了面板默认落位要先删 `build/bin/imgui.ini`（`FirstUseEver` 只在无记录时生效）；
-  想回到"首次启动的 70% 居中"要删 `build/bin/editor_window.ini`。
-- `tools/verify_asset_drag.py`：**真鼠标**端到端拖拽验证（需求 3 就是靠它验的）。
-  带 `MYVK_LOG_RECTS=1` 启动 → 读 `CB-CELL <文件>` / `VP-RECT` 矩形 → 摆成固定尺寸 → 强制前台 →
-  `SetCursorPos` + `mouse_event` 拖拽 → 截图 + 断言 `alignImportToGround` 的 `bottom == 0`。
-  `--asset / --out / --debug-shot / --size / --env`。**改任何拖拽交互都先跑它。**
-- `tools/verify_add_menu.py`：Shift+A 菜单 + 播放条端到端（断言 1a/1b/2 布局、3 Cube、
-  4 Sunlight；混合注入见坑点 #42，日志正则见坑点 #40）。
-- `tools/verify_plane_display.py`（2026-10-11）：Shift+A 加 Plane → Ctrl+S 断言落点
-  `position.z ≈ 0.01`（z-fighting 抬升）+ 截图。
-- `tools/verify_collider_show.py`（2026-10-11）：**Show Wireframe 勾选框**端到端。
-  默认 show=1 → 点 Edit 勾选框关编辑（等回执 `INS-COLLIDER-EDIT-SET 0`）→ 取消 Show →
-  SIG show=0 + 像素消失 → Ctrl+S JSON `showWireframe=false` → 勾回 + 像素回来。
-  ⚠ 像素判据用 sRGB 编码后实测色（坑点 #65）；**窗口必须 1600x1200**（900 高时 Show
-  勾选框被压出屏外 y=917）。阈值：隐藏 <40 / 显示 >300（残留 ~15px = 红方块太阳高光）。
-- `tools/verify_player.py`（2026-10-11）：Player 两 case 两进程。菜单创建 → Space Run →
-  PLAYER-STATE → W hold 断言位移方向（first: x 增大 / third: x 减小）→ D 横移（y 减小）→
-  `mouse_event` 相对移动断言 yaw 变化 → 第三人称截 edit/walk 两张图。
-- `tools/verify_prefs.py`：Preferences 居中截图验证（`MYVK_EDITOR_PREFS=1` 钩子）。
-- `tools/verify_drop_to_floor.py`：**数字键 0 落地 + 地面锁定**端到端（真左键点选、真按键）。
-  三个用例：A 守卫（`MYVK_EDITOR_SELECT` 非视口选中 → 按 0 必须 skipped）；
-  B 正例（`MYVK_EDITOR_CAM` 把相机对准悬空立方体 → 点中 → 按 0 → 断言 dz=-2.5 / x·y 不变 /
-  bottom=0 / 落点 z=0.5）；C 锁定（选中 Ground 不给手柄、点空地无选中）。
-  断言全靠日志：`drop-to-floor:`、`pick:`、`gizmo: '...' is locked`。
-  **改拾取 / 手柄 / 键盘快捷键都先跑它。**
-- `tools/verify_nav_gizmo.py`：导航球 + 视图快捷键。⚠ 2026-10-10 修过两处**假失败**：
-  ① `keybd_event(vk, 0, ...)` 扫描码为 0 → 键根本发不出去（改成 `post_key` + 真扫描码，
-  见坑点 #57）；② 靠"扫截图里的蓝色像素"找导航球，误命中 Content 面板的蓝像素 → 改为读
-  编辑器新打的 `NAV-BALL+X/Y/Z` 矩形。
-- `tools/verify_material_drag.py`：**从 Content 拖纹理到材质槽**端到端（UE5 那种绑定）。
-  三条断言：① 拖到 albedo 且 `srgb=1`；② 同一张图拖到 normal 且 `srgb=0`；
-  ③ **同一张图在两个槽上是两份不同色彩空间的纹理**（若共用缓存键会出现两次 srgb=1，见坑点 #60）。
-  断言靠 `material slot '%s' <- %s (srgb=%d)` 日志 + `MAT-SLOT <槽名>` 矩形。
-- `tools/verify_material_chips.py`：**Material 面板六个"属性 + 小方块"纹理槽**端到端（2026-10-10）。
-  断言：六槽都在 / 空槽是 22px 小方块（不是一整行） / 空槽 `MAT-CHIP` 为 `(empty)` /
-  拖拽绑定且 srgb 正确 / **方块里显示的是文件名**（允许左侧 `...`）/ 绑定后宽度 > 60px /
-  不越出面板右缘 / **emissive 绑图后视口平均亮度上升**（证明 set 6 真进了着色器）。
-  ⚠ albedo 例外：空场景 Ground 的材质本来就带默认底色图（`_default_tex`，纯浅灰），
-  它上屏就是"已绑定"、宽 114px —— 别把它当假失败。
-- `tools/verify_material_roundtrip.py`：**新增三个槽的存盘/读盘闭环**（2026-10-10）。
-  拖三张图 → Ctrl+S → 读临时 json 断言 `*Map.kind=file` + 路径 + srgb(0/0/1) →
-  重开载入 → 三个槽又显示回文件名且宽度回到"已绑定"的样子。
-- `tools/verify_gizmo_scale.py`：**缩放轴正确性**端到端（2026-10-10）。四用例：
-  A 未旋转/世界（三轴分量对位）、B 绕 X 转 90°/世界（`|cos|=1.0000`，用户报的场景）、
-  C 绕 X 转 90°/局部、D 平面手柄（平面内两维变、法线维冻结）。
-  ⚠ 抓取点必须取**轴端**（`GRAB_T = 1.0`）：`hitTest` 判定顺序是 平面 → 单轴，而透视下
-  "62% 的世界长度"在屏幕上的占比会超过 62%，取 0.75 时实测抓 Y 轴抓到了 XZ 方片。
-- `tools/verify_mesh_params.py`：**Mesh / Light 差异化参数 + 拖拽调值**端到端。
-  靠面板里的**签名日志**做结构性断言（截图证不了"Sphere 比 Cube 多两个控件"）：
-  `MESH-PARAMS kind=Sphere labels=Radius,Segments,Rings key=<缓存键>`、
-  `LIGHT-PARAMS type=Spot labels=...`。再按 `MESH-PARAM <控件名>` 矩形真拖，
-  断言 `primitive rebuild: ... -> N verts (key ...)` 的**值变了 + 缓存键变了**。
-  `INS-MESH-HEADER` 是 Mesh 标题栏（Mesh 段默认**折叠**，脚本得先点开）。
-- `tools/verify_primitive_roundtrip.py`：**图元参数存盘/读盘闭环**。空场景加 Cube →
-  拖 Size → Ctrl+S → 直接读临时 json 断言 `primitive{...}` → 重开并载入 → 断言
-  `MESH-PARAMS ... key=builtin/cube/s1.9000` **还是**那个键（= 几何是用存档参数重建的）。
-  临时场景放 `tempfile.mkdtemp()`，不往仓库写。
-- **`MYVK_SHADOW_DBG=1`**：打两种行。
-  `SHADOW-DBG cascades=N dist=D lambda=L splits=a/b/c/d bias=(...) enabled=0|1`
-  （分割点对不对、距离上限有没有生效、参数有没有被 env 覆盖，一条看全）；
-  `SHADOW-STATS cascades=N submitted=S considered=C c0=s/c c1=... c3=...`
-  （"每级各遍历一遍全部投影体"⇒ considered 应精确 = 投影体数 × 级联数；
-  不剔除的话 submitted 就等于它）。排查阴影第一步就看这两行。
-  ⚠ 两者都 30 帧一条，且 `SHADOW-DBG` 只在 `resetSkinning`（主场景）时打。
-- **着色器问题定位法**（2026-10-10 修"四边形阴影"时总结）：把中间量当 `outColor` 直接输出做二分
-  （一次跑一张三通道探针图，如 `vec4(NdotV, specDir.z, N.z, 1)`）；再用**常量输出**
-  `vec4(0.5,0.5,0.5,1)` 排除后处理/帧缓冲。图里看不出结论就**转数值**：逐行取中位数亮度
-  （避开栅格线），找"最大单步跳变"的位置与幅度 —— 比肉眼判断可靠得多。
-  ⚠ 用这个方法前先确认 `build/bin/shaders/*.spv` 是新的（见坑点 #48）。
-- `tools/compare_png.py a.png b.png`：逐像素对比。回归时配 `MYVK_FREEZE_ANIM=1 MYVK_HIDE_UI=1`，
-  同配置连跑两次应 0 差异。对照实验：`maxLightsPerCluster` 必须 ≥ 灯数（否则参考图自己被截断 = 假差异）。
-- **`editor/DebugRects.h` + `MYVK_LOG_RECTS=1`**：把控件真实矩形打一行日志
-  （`CB-RECT up=(10,480)-(38,508) center=(24,494)`）。**ImGui 坐标 == 客户区像素，和 PrintWindow
-  截图 1:1**，所以自动化脚本可以直接拿这些坐标点控件，不用在截图里"猜"按钮位置（猜坐标踩过坑：
-  DPI 缩放 / 窗口被 ini 恢复成最大化 / 用户拖过分隔条，写死的坐标会整体偏掉而且**不报错**，只是点不中）。
-  矩形变化超过 4px 才重打一行；同一个 tag 每帧只允许记一次（见坑点 #33）。
-  现有 tag：`CB-CELL <文件名>`、`CB-RECT up|reload|cell0`、`VP-RECT`、`HIER-RECT row0`、
-  `TR-BAR`（播放条）、`PREFS-WIN`（Preferences 窗口）、
-  `VP-ADD-OPEN/WIN/Mesh/Light/Cube/Sphere/Cylinder/Plane/Sunlight/DirectionalLight/SpotLight/PointLight`（Shift+A 菜单，
-  **一律带 `#<第几次打开>` 后缀**，见坑点 #56）、
-  `VP-ADD-Player/FirstPerson/ThirdPerson`（Player 子菜单）、
-  `INS-COLLIDER-EDIT` / `INS-COLLIDER-SHOW`（碰撞段两个勾选框）、
-  `NAV-BALL+X/Y/Z`（导航球正轴小球中心）、
-  `INS-MESH-HEADER`、`MESH-PARAM <控件名>`、`MAT-SLOT <槽名>`、
-  `MAT-CHIP <槽名>`（**方块里当前显示的文件名**，空槽是 `(empty)` —— 让"界面文案"可被断言，
-  不用截图认字；`MAT-CHIP` 不打矩形，只打内容）。
-  `COLLIDER <实体名>`（线框屏幕包围矩形）、`GZ-CAM`（相机状态签名，变化 >0.01 才打）。
-  **加了新控件就给它加一个 tag** —— 这是让界面可被自动化验证的唯一途径。
-- **面板内容也要能被断言**：控件的**存在性**截图上很难证明（"少了一个控件"看不出来），
-  所以 Mesh / Light 段各打一行**签名日志**（只在内容变化时打，不刷屏）：
-  `MESH-PARAMS kind=... labels=... key=...` / `LIGHT-PARAMS type=... labels=...`。
-  新增/删除一个属性时**顺手更新 labels**，脚本的断言才有意义。
-- 启动方式：双击 exe 即可（着色器按 exe 绝对路径找）。查找顺序：`MYVK_SHADER_DIR` → `exe目录/shaders`
-  → `cwd/shaders` → `cwd/assets/shaders`。
-- **验证产物放项目外**：`/e/code/cpp/_venn_verify/`（截图 / 日志 / 场景 json）。
-  删掉的内置 demo / Sandbox 备份在 `/e/code/cpp/_venn_removed_demo/`。
-  ⚠️ ContentBrowser 会扫进程 CWD 的图片当资源（见坑点 #28），别往项目里丢截图。
-
-## VS Code（IntelliSense，与 CMake 编译解耦）
-手写 `includePath` 必须与 CMakeLists 的 `target_include_directories` 同步；SDK 的 `Include` 根目录
-（**不要**加 `Include/glm`，会与 third_party/glm 冲突）；报 "无法打开 vulkan.h" 先怀疑 `.vscode` 配置缺失。
-89. **带动态数字的面板会毁掉逐像素对照轮**（2026-10-13，R0-2）：Engine 面板的
-    "Lights/cluster: avg %.2f" 每帧微变 —— 为了让验证脚本看到某个控件（VM-COMBO 标签）
-    而打开整个面板，代价是面板区域逐轮不同。**控件存在性验证与像素对照必须分开轮次**：
-    用独立 env（MYVK_ENGINE_PANEL=1）按需打开，不要绑在 automationRun() 上。
-90. **"灰度图"断言的阈值不能设 3**：bloom 半分辨率采样 + tonemap 会在灰度图上留下
-    4~9 的通道间舍入噪声（实测 (153,157,162) 这种）。灰度判定阈值用 **<=12**，
-    真彩色内容（法线/热度色/轴线）通道差 >=60 —— 中间地带不存在，两边都安全。
-91. **调试热度色 ramp 的通道分配**：LightComplexity 1..4 灯必须是**绿**（g = min(n,4)*0.22），
-    红留给 >4 灯 —— 把 r 通道给低灯数会让"1 灯场景"全屏红，看起来像坏了。
-    Overdraw 的 additive 基色选 **R 主导的品红**（0.040,0.010,0.024）：蓝色是天空的
-    固有属性，R>B 才能在直方图断言里与天空区分。
-92. **TAA 的抖动相位必须按帧槽（frame-in-flight）各持一个**（2026-10-13，R1-1）：
-    历史图是按帧槽分开累积的（帧 f 读的是 f-2 留在同槽里的结果），所以"槽 0 的帧号"
-    永远是偶数、槽 1 永远是奇数。若相位用**全局**计数器按帧号递增，槽 0 就只见过偶数
-    相位、槽 1 只见过奇数相位 —— 两个槽收敛到两张**不同**的 4 相位平均图，屏幕上以
-    半帧率来回切，而且抓哪一张取决于抓拍瞬间的奇偶，**跨运行不可复现**。
-    症状：verify 的"两次独立运行逐像素一致"断言挂（实测 max 77 / 611 px）。
-    修法：`m_taaPhase[2]` 各槽 +1。修完 max 8 / **0 px**。
-93. **TAA 历史图的"视图必须恒定"是硬约束**：PostProcess 的输入描述符只在
-    `recreate` 时写一次（`PostProcess::buildDescriptorSets`），输入视图一变就指向
-    已销毁对象。所以 TAA **不能** ping-pong 输出图 —— 只能"固定 out 图 + 每帧
-    `vkCmdCopyImage` 把 out 拷进 hist"。那张 copy 约一张全分辨率 RGBA16F 的带宽
-    （约 1% 显存带宽），换的是这条硬约束。
-94. **描述符写入的布局 = 验证层认定的布局（VUID 09600 不看分支）**：TAA 首帧
-    / 尺寸变化后历史无效，我最初**跳过**了所有 barrier —— 于是 history 图停在
-    `UNDEFINED`，而它会报错：验证层对"这个描述符会不会被采样"做的是 **SPIR-V 静态
-    判定**，片元里 `if (historyValid < 0.5) return;` 拦不住它。修法：即使不采样，
-    也要显式把图迁到描述符声明的布局（`UNDEFINED → SHADER_READ_ONLY_OPTIMAL`）。
-    同理，描述符写的布局必须与该图在该帧的**实际最终布局**一致（链源头每帧重写就是
-    为了这个）。
-95. **抗锯齿的判据不能用一阶梯度**：一阶梯度（总变差）在"理想阶跃被摊成斜坡"后
-    **总量不变**（TV 守恒），所以 `|dI/dx| > thr` 的计数几乎不动（实测只有 1.3%）。
-    用**二阶差分**（Laplacian）—— 它直接度量"局部曲率"，锯齿正是少数像素上的极大
-    曲率：实测 10361 → 4877（−53%）。另外必须配一条"变化集中在边缘"的断言
-    （边缘平均变化 / 非边缘平均变化 ≥ 5×，实测 14.8×）来排除"其实就是全局模糊"。
-96. **收敛类断言的容差要按现象的成因定，不要硬写"逐像素全等"**：TAA 权重是 0.1 的
-    指数滑动平均，收敛后进入 **8 相位极限环**，抓拍落在环上哪个位置由帧号决定 ——
-    两次运行必然差 α×边缘对比度量级（实测 max 9，全部 ≤18）。可断言的是
-    "**没有可见差异**（>18 的像素数 = 0）" + "平均差 ≤ 0.35"。真正该被排除的是
-    "没收敛"：那种情况会差出成百上千个显著像素。
-97. **回归"开头三例"的焦点时序 flaky（面板抢前台 / 截图与拾取过早）**（2026-10-13，R1-1）：
-    完整回归（26 例串行）里 `verify_frustum_cull` / `verify_bvh` / `verify_ibl` 三例
-    偶发失败，且**总在最开头**（前 4 个里占 3 个）。两种症状：
-    ① `capture_client` 返回空图 → `ValueError: cannot write empty image`（窗口还没
-    真正抢到前台 / 截图发生在前台切换之前）；
-    ② BVH 拾取"没等到 pick 日志"，`PICK-DBG bvh=4294967295(d=0) ... same=1`
-    （注入的点击被窗口激活吃掉，脚本其实已带"预热点击"兜底，但仍偶发）。
-    **三者单独跑 100% PASS** —— 是环境时序，不是代码回归。判据：单跑能过 + 失败
-    集中在开头 + `same==1` 等分支断言仍 PASS。遇到时**先单跑复现**再下结论。
-98. **HDR 的"颜色写"只对 FRAGMENT 有可见性依赖 → compute 直接采样它是错的**（2026-10-13，R1-2）：
-    `HdrTarget` 前向 renderpass 的 `deps[1].dstStageMask = FRAGMENT_SHADER_BIT`
-    —— 后处理（bloom / 合成）在片元里采样 HDR 之所以能跑，就是靠这条。
-    自动曝光如果直接写个 compute 去读 HDR，等于踩在**没有依赖声明**的读上
-    （要么补一条需要 `VkImage` 的显式屏障，而 `PostProcess::recreate` 只拿得到
-    `VkImageView`，拿不到 image）。绕法：先做一个**片元**降采样 pass 把场景色
-    变成自己的小图，再让 compute 读**自己的**图。
-99. **"自己的图 + 独立 RenderPass"可以把跨阶段同步全写进 subpass 依赖**（2026-10-13，R1-2）：
-    给自动曝光的亮度图建一个专用 RenderPass，把
-    `deps[0]: COMPUTE_SHADER/SHADER_READ → COLOR_ATTACHMENT_OUTPUT/WRITE`（上一帧
-    compute 读的 WAR）与 `deps[1]: COLOR_ATTACHMENT_OUTPUT/WRITE → COMPUTE_SHADER/
-    SHADER_READ`（本帧 compute 读的 RAW）都声明进去 —— 整条链**一行显式
-    `vkCmdPipelineBarrier` 都不用**。附件 `initialLayout` 取 UNDEFINED（每次全量
-    覆盖），顺带绕开"图刚创建还是 UNDEFINED"的初始化难题。同一张图的
-    `oldLayout` 每次都不一样时，这种"把语义交给 renderpass"的写法比手写屏障稳。
-100. **GPU→CPU 回读的时序要挂在 in-flight 栅栏之后，并且按帧槽分开**（2026-10-13，R1-2）：
-    与 `ClusteredLighting::beginFrame` 同一条规矩 —— `Renderer::drawFrame` 里
-    `vkWaitForFences(frame.inFlightFence)` 之后才发现"这个 slot 上一轮的命令
-    一定跑完了"，此时读该 slot 的 HOST_VISIBLE 缓冲才是安全的（HOST_COHERENT
-    则不必手动 invalidate）。所以测量链每帧 ×N 个帧槽各一份 bins/result，
-    读的是**两帧前**的结果 —— 代价是曝光有 2 帧延迟，对"指数平滑的适应"完全
-    无所谓，换来的是零停顿。写入侧别忘 `COMPUTE → HOST` 的那条 barrier。
-101. **⚠ 同一时刻只能有一个 GUI 验证脚本在跑 —— 它们会互相残杀**（2026-10-13，R1-3）：
-    每个验证脚本开头都调 `kill_stale_editors()`，而那是
-    `taskkill /F /IM Editor.exe` —— **无差别**杀掉机器上所有 `Editor.exe`，
-    包括**另一个正在跑的回归**手里的编辑器。症状极具误导性：
-    ① 截图变成空图 → `ValueError: cannot write empty image`；
-    ② 编辑器"莫名提前自行退出"（进程还在等日志，进程已经没了）；
-    ③ `subprocess.Popen` 报 `FileNotFoundError [WinError 2]`。
-    2026-10-13 就因此废掉了一整轮 27 例回归（21/27，且失败项**全部**是上面
-    三种症状）。**纪律**：跑回归前先确认没有别的验证在跑；回归运行期间
-    **不要构建**（会把 `bin/Editor.exe` 换掉，后续用例直接 `FileNotFoundError`）、
-    **不要跑任何 GUI 测试**。判据：失败项是否全是"空图 / 文件找不到 / 提前退出"
-    这几种**非断言类**症状；若是，先怀疑并发，而不是代码回归。
-102. **"空图"这类脆性要一次性从共享抓图入口根治**（2026-10-13，R1-3）：
-    `capture_client` 在窗口刚 `ShowWindow` 后可能拿到 0×0，`img.save()` 直接抛
-    异常把脚本崩掉（不是断言失败，是 traceback）。修法统一到
-    `capture_window.capture_nonempty(hwnd, tries=12, delay=0.4)`：循环重试到
-    `size > 16` 为止，拿不到返回 `None`（让断言优雅失败）并给出一条 `[dbg]`
-    行说明 client 尺寸与进程存活状态。`verify_shader_variants.run_once` /
-    `verify_auto_exposure` / `verify_color_lut` 已全部改走它。
-103. **3D LUT 是"固定尺寸资源"：视图恒定 + 构造时立即烘一次**（2026-10-13，R1-3）：
-    ① LUT 图不参与 `recreate`（尺寸恒定），但**描述符集要跟着描述符池重建**
-    —— 每次 `buildDescriptorSets` 里重写；
-    ② **构造时就 `bakeLut()` 一次**（哪怕参数是默认恒等）。原因：每个
-    `RenderTarget` 各持一个 `PostProcess`，而只有**主目标**会被驱动
-    `beginFrame`；若把首次烘焙延迟到 `beginFrame`，副目标的 LUT 图会一直停在
-    `UNDEFINED`，而描述符声明的是 `SHADER_READ_ONLY` → 验证层报错（与 TAA
-    那条 VUID 09600 同一个坑）。烘焙后图**永久**停在 `SHADER_READ_ONLY`。
-104. **恒等 LUT 是仿射映射 → 硬件三线性可精确重建**（2026-10-13，R1-3）：
-    32³ LUT 的格点存的就是"输入本身"时，三线性插值在**仿射函数**上是精确的
-    —— 所以"开着但参数全默认"实测与基线**最大差 1 / 平均差 0.06**（16F 存储
-    + 8-bit 插值权重带来的量级）。这才让"恒等 ≈ 逐像素不变"成为可断言的性质
-    （若换成 8-bit UNORM，暗部会被 sRGB 编码放大出可见台阶）。采样坐标必须
-    落在纹素中心：`uvw = c·(N-1)/N + 1/(2N)`；映射写错（比如用 `c` 直接采样）
-    会整体偏色 —— B 组那两条"恒等"断言正是在钉死这个坐标映射。
-105. **动态分辨率必须把"输出分辨率"与"场景渲染分辨率"彻底分开，且两处
-    尺寸必须共用同一个计算函数**（2026-10-13，R1-4）：`PostProcess` 过去只有
-    一个 `m_sceneExtent`（既是 HDR 尺寸也是合成目标尺寸）。DRS 一来这两者
-    就分家了：`m_outExtent`（视口/交换链，全分辨率：合成 viewport/scissor、
-    FXAA 中间图、离屏输出图）与 `m_sceneExtent = 输出 × renderScale`（HdrTarget
-    / 深度 / SSAO / 链 / TAA / bloom / 分簇）。**两个尺寸在两个地方各算一次**
-    —— `RenderTarget::apply`（建 HdrTarget）与 `PostProcess::recreate`
-    （m_sceneExtent）—— 必须走**同一个** `scaledRenderExtent()`，否则
-    HdrTarget 与后处理各用各的尺寸，画面/验证层立刻炸。
-106. **离屏输出图（ImGui 采样的那张）是"全分辨率"的，判"能否复用"要用
-    **输出**分辨率而不是渲染分辨率**（2026-10-13，R1-4）：`PostProcess::recreate`
-    里 sceneOutput 的复用判据原本比的是 `m_sceneExtent`。改成 DRS 后
-    `m_sceneExtent` 会随缩放比变，于是每调一次 DRS 就把离屏输出图整组
-    重建 → **ImTextureID 白换一次**（而那一帧的 ImGui 绘制数据早就构建完了）。
-    判据改成 `m_outExtent`（DRS 不动它）后，纹理 ID 稳定。
-107. **"关闭 = 基线逐像素不变"在着色器里也要落实到位**（2026-10-13，R1-4）：
-    升采样不能只是"参数为 0 时数值接近" —— `post.frag` 的 `upsampleScene()`
-    在 `pc.ups.z <= 0.5` 时**第一件事就是 `return texture(hdrTex, uv).rgb`**，
-    与引入前**逐字相同**（不是"近似相同"）。比例判据放在 **CPU 侧**：
-    `renderScale < 0.999` 才算开（避免浮点误差把 1.0 判成"开"）。
-108. **自动控制器不要给用户给的"目标值"做无理由的下限夹紧**（2026-10-13，
-    R1-4）：`target = max(drsTargetMs, 0.5f)` 这种"防御性"夹紧在空场景上是
-    **反效果** —— 实测 GPU 整帧才 0.22ms，目标被抬到 0.5ms 后反而高于实测，
-    于是 `scale' = scale·√(target/measured) > scale`，缩放比**永远不动**（回归
-    D1 组实测 12265 帧卡在 1.0）。改回 `max(目标, 1e-3)` 后正常下降到 min。
-    教训：控制环里任何"截断/夹紧"都要能说出它防的是什么。
-109. **回归脚本读"渲染分辨率"日志要取最后一条**（2026-10-13，R1-4）：编辑器
-    启动早期会**先按交换链尺寸建一次离屏目标**（游戏模式的 950×648），面板
-    布局稳定后才切到视口尺寸（608×492）。`render_sizes()[0]` 拿到的是前者，
-    与 `VP-RECT` 对不上 → 误判失败。取 `[-1]`。
-110. **焦点时序 flaky 的第二种症状：输入注入整体失效**（2026-10-13，R1-4）：
-    除已知的"空图 / 拾取没等到日志"外，`verify_nav_gizmo` 在完整回归里
-    会挂，且**只挂"走系统输入队列"的鼠标点击断言**（`SetCursorPos` +
-    `mouse_event`；键盘走 `PostMessageW` 一律正常）。两轮完整回归均
-    28/29 卡在此例，但**单跑 4/4 全 PASS**（含连着跑 3 次）、短序列也 PASS，
-    只有完整 29 例"连着跑"才偶发 —— 与 `verify_asset_drag.py::force_foreground`
-    注释里写的"单独跑通过、连着跑偶发全挂"完全吻合。判据：单跑能过 +
-    只挂鼠标那条 + 失败形态逐轮变化 → 环境时序，非代码回归。
-    同类：`verify_fxaa` 也偶发挂"平坦区小窗"断言（同样两轮完整回归里 PASS）。
-    教训：**视口 + 前台时序类用例天生有 flaky，别一挂就怀疑功能坏了。**
-
-111. **Hi-Z 的两个同步/约定坑**（2026-10-13，R2-1）：
-    ① **深度附件的写只对片元阶段可见** —— `HdrTarget` 的 subpass 依赖
-    （`deps[1]`）只把 `DEPTH_STENCIL_ATTACHMENT_WRITE` 同步到
-    `FRAGMENT_SHADER_BIT`（屏幕空间效果都是片元 pass）。Hi-Z 用 **compute**
-    读深度，必须自己补一条 image barrier：`LATE|EARLY_FRAGMENT_TESTS →
-    COMPUTE_SHADER`，`srcAccess=DEPTH_STENCIL_ATTACHMENT_WRITE`，
-    `dstAccess=SHADER_READ`，**布局不变**（前向 pass 的 finalLayout 已经是
-    `DEPTH_STENCIL_READ_ONLY_OPTIMAL`，与 `setDepthViews` 声明的一致）。
-    所以 `record()` 要接 `VkImage`（不是 view）—— 附件屏障要的是 image。
-    ② **深度值 → NDC 用 `d*2-1`**：本引擎没定义
-    `GLM_FORCE_DEPTH_ZERO_TO_ONE`，NDC z ∈ [-1,1]（见 Frustum.h /
-    RenderTypes.h），`space.glsl` 也是这条约定。`occlusion_test.comp` 里
-    `zNear`（角点 `clip.z/clip.w`）与 `hizNdc = hiz*2-1` 因此在同一空间 ——
-    实测 3 个被挡球全剔、且开/关画面逐像素相同（平均差 0.0000），这条
-    映射**被实验钉死**。
-
-112. **遮挡剔除的"自我封闭"陷阱：候选 AABB 表必须收所有视锥内物体，
-    包含本帧已被剔的**（2026-10-13，R2-1）：`buildDrawLists` 里对每个
-    `mesh->hasBounds()` 的候选**先无条件 push 进 `m_hizAabbScratch` +
-    `m_hizSlotEntities`，再按 `m_occludedSet` 决定 `continue`**。若"被剔的
-    物体不再进候选表"，它就永远不会被重新测试 —— 相机一转，被挡物体本该
-    露出来却因为不再参与测试而**永久消失**。这条不变量比"少剔几个"重要
-    得多：宁可多测（CPU 便宜）、不可漏测。
-
-113. **两帧延迟回读的时序不变量**（2026-10-13，R2-1）：
-    ① **回读必须在 `buildDrawLists` 之前**：`m_hizSlotEntities[slot]` 会在
-    同一 slot 的 `buildDrawLists` 开头被 `clear()` 重填，而 vis 缓冲里存的
-    是**两帧前**那次上传的结果 —— 顺序反了就会拿"本帧的实体表"去解释
-    "两帧前的 vis"。正确位置是 `drawFrame` 开头、in-flight 栅栏之后
-    （`MAX_FRAMES_IN_FLIGHT=2` → 天然延迟两帧、且读到的一定是写完了的）。
-    ② 两张表必须**严格同长**：AABB 与实体都在同一个 `if (size < kMaxObjects)`
-    里成对 push，`uploadAabbs` 也按同一个上限截断；回读用
-    `n = min(flags.size(), ents.size())` 兜底。
-    ③ **vis 缓冲首帧必须填"全可见"**（`memset(...,1,...)`）：HOST_VISIBLE
-    缓冲默认是 0，不初始化会被当成"全被遮挡"→ 第一次打开 Hi-Z 就把整个
-    场景剔光。
-    ④ **关闭期间也要清本槽实体表**：否则重新打开时本槽 vis 里还留着"上次
-    打开时"的旧数据，可能拿旧 vis 去剔对不上的实体（清表后 `n=min=0`，
-    先不剔、两帧后自然恢复）。
-
-
-114. **间接绘制（`vkCmdDrawIndexedIndirect`）不带 VB/IB —— 必须自己绑**
-    （2026-10-13，R2-2）：`VkDrawIndexedIndirectCommand` 里的 `firstIndex` /
-    `vertexOffset` 只能在**已绑定**的顶点/索引缓冲里寻址，而
-    `vkCmdDrawIndexedIndirect` **不会**帮你绑任何东西。漏了这一句的症状
-    极具迷惑性：拿到的是"上一次绑定的残留缓冲"（前向 pass 里就是天空盒 /
-    深度预通道的最后一个网格），于是**画面形状看着对、颜色/顶点数据错**
-    （实测：墙整体亮了 ~45%，红球少了 2900 像素），而
-    **Vulkan 验证层一个字都不报**。修法：`assets::Mesh` 新增
-    `bindGeometry(cmd)`（只绑 VB/IB，`drawInstanced` 复用它），MDI 组循环里
-    在每次间接绘制前调一次。
-
-115. **MDI 的提交组键必须含"网格"**（2026-10-13，R2-2）：一次
-    `vkCmdDrawIndexedIndirect` 只带**一套**已绑定的 VB/IB，组内混网格 →
-    后一条命令会拿前一条的缓冲去解释自己的 `firstIndex`（就是 #114 的
-    "顶点数据错位"）。本引擎每个 `Mesh` 各有自己的 VB/IB，所以组键 =
-    **(掩码, 材质, 网格)**。副作用：组数因此恒等于批数，`mdiSub == mdiBatches`
-    —— 收益落在"GPU 生成 draw 参数 + 零回读"，而不是命令条数。真要做到
-    路线图里那句 O(材质数)，前置条件是**全局几何 arena**（所有网格共用
-    一份顶点/索引大缓冲，靠命令里的 `firstIndex`/`vertexOffset` 寻址）。
-
-116. **MDI 的"Pass 2.5"要放在 `recordFrame`，不是 `recordSceneInto`**
-    （2026-10-13，R2-2）：`recordSceneInto` 只服务**离屏/预览目标**
-    （`isPreview` 恒 true），主视口不走它。一开始把"Hi-Z 金字塔 +
-    compact + MDI 绘制路径"加在那个函数里，症状是 `mdiSub=0`、
-    `MDI-STATS` 全 0 —— **机制完全没跑，但一帧日志都不报错**。正确位置：
-    `recordFrame` 的**深度预通道之后、前向 render pass 之前**（紧凑化要在
-    前向之前拿到本帧深度 = 零帧延迟的全部要点）。
-
-117. **`MdiDraw::beginFrame` 的长度校验：catalog/objBatch 是"每物体"、
-    commands 是"每批"**（2026-10-13，R2-2）：写成
-    `n == commands.size()` 会让 11 个物体 / 3 条命令直接判"不合法"并
-    静默退回旧路径（症状同样是 `mdiSub=0`）。正确的是
-    `n == objBatch.size() && !commands.empty()`，再各自对
-    `kMaxObjects` / `kMaxBatches` 做上限检查。
-
-118. **pbr.mdi.vert 读的 binding 15 必须在 set 0 的 layout 里声明**
-    （2026-10-13，R2-2）：着色器里 `layout(std430, set=0, binding=15)`
-    只要声明了，`VkGraphicsPipelineCreateInfo` 的 layout 就必须有它 ——
-    否则创建管线时报 `VUID-VkGraphicsPipelineCreateInfo-layout-07988`。
-    所以 `kGlobalSetBindings` 从 15 加到 **16**，并给
-    `bindings[15]` 一个"无 MDI 时的退化绑定"（绑 `instanceModels`），
-    这样开着合批/基线路径的管线创建也不受影响。
-    配套约束：**紧凑化实例表缓冲永不换对象**（构造时按 `kMaxObjects`
-    一次分到底，约 1.5 MB/槽）—— 一扩容就得回头重写 set 0 的 binding 15，
-    那是这条路径最容易出错的地方。
-
-119. **回归可以增量跑：`run_regression.py` 会跳过"上次 PASS 且产物未变"的
-     用例**（2026-10-13）：全套 31 例 = **25 分钟**，而绝大多数是几十~两百秒
-     的 GUI 用例；只改了某一块渲染功能却把其余 30 例重跑一遍纯属浪费。
-     机制：
-     * 缓存 `_venn_verify/_regression/_cache.json` 里存一个**产物指纹** +
-       一份 PASS 名单。指纹 = `build/bin` **下所有文件**（含 Editor.exe 与被
-       拷过去的 .spv / 材质 / 模型 / 场景）+ `tools/*.py` 的
-       `(相对路径, 大小, mtime_ns)` 的 SHA1。
-     * **必须覆盖整个 `build/bin`，不能只看 exe 的 mtime** —— 改一个
-       `.comp`/`.vert` 只触发"拷贝到 bin"、exe 本身不重链接，只看 exe 就会
-       错误地跳过已失效的用例。
-     * **`run_regression.py` 自己不算在指纹里**：它是"跑法"（跳过策略、
-       输出格式），不影响任何用例的判定；算进去的话动一次本文件就让整份
-       缓存作废、白等 25 分钟。
-     * 指纹对不上 → 缓存**整体作废**、全跑（并打印一行说明）。
-     * **只有 PASS 进缓存**：FAIL 的用例会被丢弃 → 下次一定重跑。这正是
-       我们要的"失败必复现"。
-     * **明确写出的用例名永远跑**（`python tools/run_regression.py bvh`
-       是"我就要看这个"，不是"顺手带上"）；`--all` 无视缓存全跑；
-       `--no-cache` 不读也不写。
-     * 实测收益：30 例命中缓存时 **25 分钟 → 18.6 秒**。
-
-120. **glslang：采样器数组的"非常量下标"要显式声明扩展，且 `#extension`
-     必须排在所有非预处理记号之前**（2026-10-13，R2-3）：
-     ```glsl
-     #version 450
-     #if VENN_BINDLESS
-     #extension GL_EXT_nonuniform_qualifier : require
-     #endif
-     ```
-     不声明就编不过：`error: 'variable index' : required extension not
-     requested: GL_EXT_nonuniform_qualifier`。有点反直觉 —— 下标来自 push
-     常量（**动态 uniform**，严格说不需要 `nonuniformEXT()`，也不会生成
-     `NonUniform` 装饰），但 glslang 只要看到"非常量下标访问不透明类型数组"
-     就要求这个扩展。声明之后生成的 SPIR-V 会带
-     `OpCapability RuntimeDescriptorArray` + `OpExtension
-     "SPV_EXT_descriptor_indexing"` —— 所以设备侧必须开
-     `runtimeDescriptorArray` 与 `descriptorIndexing`（本引擎已在
-     `Device::createLogicalDevice` 里开）。
-     第二半条同样要命：`#extension` 只能出现在**任何非预处理记号之前**
-     （只有 `#version` 能排在它前面）。把它写在"用到它的那段声明旁边"
-     （比如文件中部 `layout(set=1...)` 之前）会直接报 "extension directive
-     must occur before any non-preprocessor tokens"。
-
-121. **bindless 纹理数组的容量必须按设备收窄，不能硬写**
-     （2026-10-13，R2-3）：`vkCreateDescriptorSetLayout` 的
-     `descriptorCount` 受 `maxPerStageDescriptorSamplers`（原文
-     `maxPerStageDescriptorSampledImages`）约束 —— 独显上这个值是 1048576，
-     但**集显可能只有 128**，硬写 4096 会在别的机器上直接建不出 layout。
-     做法：`capacity = min(kMaxTextures, limits.maxPerStageDescriptorSamplers)`，
-     低于 64 就当设备不支持（返回 false → 调用方降级成关闭）。
-     注意 update-after-bind 那几个上限（`maxPerStageDescriptorUpdateAfterBind*`）
-     在 **`VkPhysicalDeviceVulkan12Properties`** 里，不在
-     `VkPhysicalDeviceLimits` 里（写 `lim.maxPerStageDescriptorUpdateAfterBindSamplers`
-     会直接编译不过）—— 要查就得再挂一条 pNext，本引擎刻意只查核心 limits
-     （更保守的那个）。另外 `descriptorBindingPartiallyBound` 之后这个上限
-     严格说不再被强制（我们只访问写过的槽），收窄只是省内存 + 避开驱动差异。
-
-122. **bindless 的材质页表必须"按帧槽分离"，否则会撕裂在途读取**
-     （2026-10-13，R2-3）：页号是**每帧惰性分配**的（`beginFrame` 把该槽的
-     页计数清零、整表重写）。如果只有一份页表，重写它的时候上一帧的 GPU
-     还在读 —— 典型的 host-write vs GPU-read 竞争。做法：页表缓冲与描述符集
-     都按 `MAX_FRAMES_IN_FLIGHT` 各一份，`beginFrame` 只在**拿到 in-flight
-     栅栏之后**调（和 `ClusteredLighting::beginFrame`、自动曝光回读同一个
-     位置、同一条理由）。这也是"页号只在帧内稳定、跨帧可能变"的根源 ——
-     所以页号必须逐 draw push，**不能缓存在材质对象上**。
-     纹理数组那一侧相反：下标是**跨帧稳定**的（惰性注册、永不回收），
-     所以只需要在注册/句柄变化时写一次描述符（池是 UPDATE_AFTER_BIND 的，
-     在途帧安全）。
-
-123. **默认定义为 0 的编译开关不能用 `#ifdef` 判断**
-     （2026-10-13，R2-3）：pbr.frag 的惯例是"每个关键字都给一个默认定义"
-     （`#ifndef VENN_NORMAL_MAP / #define VENN_NORMAL_MAP 0`），这样直接
-     `glslc` 不带 `-D` 编出来就是全关。加 `VENN_BINDLESS` 时如果写成
-     `#ifdef VENN_BINDLESS`，那么文件中部那条 `#define VENN_BINDLESS 0`
-     之后所有 `#ifdef` 都恒为真 —— 症状是"基线的 .spv 里也走了 bindless
-     分支"，编译不报错、画面全错。正确写法是 `#if VENN_BINDLESS`
-     （未定义时 `#if` 按 0 处理，所以文件最顶部那条 `#extension` 守卫
-     也能用同一个写法）。区分方式：**关键字位**才用 `#if VENN_XXX`
-     + 默认定义；**全局开关**（instancing / mdi / bindless）用
-     `#ifdef` + 只在 CMake 里 `-D`（沿用 pbr.vert 的既有写法）。
+- `tools/run_regression.py`：总回归，逐脚本跑、读末尾 `结果: PASS`；**增量**（跳过"上次 PASS
+  且产物未变"的）。新增验证脚本必须加进它的 `DEFAULT` 列表。
+- 各类 `tools/verify_*.py`：CSM / local shadow / shadow(hardening) / nav_gizmo / gizmo_scale /
+  collider_menu / collider_gizmo / collision_play / character_window / add_menu / csm / lod /
+  occlusion / mdi … 每个都以 `结果: PASS` 结尾。
+- 共用设施：`capture_window.py`（`capture_client`/`find_window`/`user32`，默认注入
+  `MYVK_NO_WINDOW_SAVE=1`）、`verify_add_menu.py`（`LogTap`/`kill_stale_editors`/`wait_rect`）。
+- 截图输出目录：`<repo>/../_venn_verify`（本机 `G:\GameEngine\_venn_verify`）。
+- Python 解释器：`D:\env\python\python.exe`（3.12），已装 Pillow（走 `-i https://pypi.org/simple`）。
+- `make smoke` = 跑 `MYVK_FRAMES=N` 冒烟；`make package` = `cmake -E tar` 打包。
+- 子系统日志：`SHADOW-DBG`/`SHADOW-STATS`/`LOCAL-SHADOW-*` / `ENV-DBG`/`ENV-READBACK` /
+  `BVH-DBG` / `LOD-BUILD`/`LOD-STATS`/`LOD-SWITCH` / `CLUSTER-*` / `SHADER-VARIANTS` /
+  `RT-TARGETS` / `PLAYER-STATE` / `COLLIDER-SIG` / `VP-RECT` / `NAV-CAM`。
+- `MYVK_LOG_RECTS=1`：打印关键控件矩形（给自动化定位）。

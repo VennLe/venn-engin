@@ -158,11 +158,31 @@ struct FrameUBO {
     // 走运行时 uniform 而不是关键字变体：视图模式是**全局单值**且
     // 随时切换 —— 为它编 8x 份 .spv 会让缓存命中率雪崩（UE 同款取舍）。
     glm::vec4 viewModeParams;     // offset 656
+
+    // ---- 阴影硬化三件套（R3-1）----
+    // x = 级联间混合带宽（占本级覆盖跨度的比例，0 = 关闭）。
+    //     接收点落在"本级远端最后 band 比例"的距离内时，与**下一级**按
+    //     深度线性混合 —— 级联交界处两级分辨率突变导致的亮线/硬边就消失。
+    //     必须为 0 时整个分支跳过（关闭 = 基线逐像素不变）。
+    // y = 接触硬化强度（0 = 关闭）。按接收点在级联内的相对视深度缩放
+    //     PCF 核半径：越靠近本级近端（接触区）半径越收，阴影越锐利、
+    //     越不漏光；越远则越软。0 时半径不额外缩放。
+    // z, w = 保留
+    glm::vec4 shadowFilter;       // offset 672
+
+    // ---- Froxel 体积雾（R3-2，见 render/VolumetricFog.h）----
+    // x = froxel 网格 X 维（屏幕横向上 froxel 数）
+    // y = froxel 网格 Y 维
+    // z = froxel 网格 Z 维（深度分层数）
+    // w = 总开关（1 开 / 0 关）。关着时 pbr.frag 整块短路 → 基线逐位不变。
+    // 片元用 (gl_FragCoord.xy → 瓦片号, 视图深度 → 层号) 定位自己所在的
+    // froxel，采样 binding 16 的 3D 图拿 (inscatter.rgb, transmittance)。
+    glm::vec4 vfogParams;         // offset 688
 };
-// 总 656 字节。std140 下 mat4 步长 16、vec4 对齐 16，与这里的自然布局一致。
+// 总 704 字节。std140 下 mat4 步长 16、vec4 对齐 16，与这里的自然布局一致。
 // ⚠ 追加字段只能放**末尾**：sky.vert / grid.vert / shadow.vert /
 //   cluster_build.comp 只声明前缀，尾部追加不影响它们的偏移。
-static_assert(sizeof(FrameUBO) == 672, "FrameUBO 布局变了，必须同步所有声明它的着色器");
+static_assert(sizeof(FrameUBO) == 704, "FrameUBO 布局变了，必须同步所有声明它的着色器");
 
 // 阴影 Pass 专用的推送常量（std430 布局，共 96 字节）。
 //

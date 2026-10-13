@@ -116,6 +116,16 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     // 运行时 uniform 分支是刻意的：全局单值 + 随时切换，不值得为它
     // 翻倍 .spv 变体（UE 同款取舍）。
     vec4 viewModeParams;
+
+    // ---- 阴影硬化三件套（R3-1）----
+    // x = 级联间混合带宽（占本级覆盖跨度的比例，0 = 关闭）
+    // y = 接触硬化强度（0 = 关闭）
+    // z / w = 保留
+    vec4 shadowFilter;
+
+    // ---- Froxel 体积雾（R3-2）----
+    // xyz = froxel 网格尺寸；w = 总开关
+    vec4 vfogParams;
 } ubo;
 
 // 级联阴影贴图：一张 **2D array** 的深度图，第 i 层就是第 i 级级联。
@@ -242,6 +252,12 @@ layout(set = 0, binding = 12) uniform sampler2DArrayShadow localShadowMap;
 // 的对照约定由此成立，不需要着色器里再开一个 if。
 layout(set = 0, binding = 14) uniform sampler2D ssaoTex;
 
+// ---- Froxel 体积雾 3D 结果图（R3-2，见 render/VolumetricFog.h）----
+// 每 texel = (inscatter.rgb, transmittance)："进入该 froxel 时"从相机
+// 累积的散射与透射率。关闭时绑 1×1×1 的透明图（rgb=0, a=1）→ 合成
+// 退化成 out = lit，与基线逐位一致（与 ssaoTex 的缺省白图同理）。
+layout(set = 0, binding = 16) uniform sampler3D vfogTex;
+
 layout(push_constant) uniform Push {
     mat4 model;
     vec4 baseColorFactor;
@@ -349,10 +365,13 @@ int selectCascade(float viewDepth) {
 // 3×3 PCF。单点采样会得到锯齿状硬边，对邻域取平均后边缘自然柔和。
 // 核半径（纹素）随级联变远而变大：远级联一个纹素覆盖的世界尺寸更大，
 // 用同样的纹素半径会显得更硬、也更容易随相机移动而闪烁。
-float pcfCascade(vec3 proj, int cascade, float bias) {
+//
+// radiusScale 是 R3-1 接触硬化引入的额外乘子（1.0 = 不缩放，即旧行为）。
+float pcfCascade(vec3 proj, int cascade, float bias, float radiusScale) {
     ivec3 size = textureSize(shadowMap, 0);
     vec2 texel = 1.0 / vec2(size.xy);
-    float radius = ubo.shadowBias.z * (1.0 + ubo.shadowBias.w * float(cascade));
+    float radius = ubo.shadowBias.z * (1.0 + ubo.shadowBias.w * float(cascade))
+                   * radiusScale;
 
     float sum = 0.0;
     for (int x = -1; x <= 1; ++x) {
@@ -363,6 +382,35 @@ float pcfCascade(vec3 proj, int cascade, float bias) {
         }
     }
     return sum / 9.0;
+}
+
+// 采样**单一级联**的可见度（不含距离淡出）。落在本级正交盒之外 → 1.0。
+// radiusScale 透传给 PCF（接触硬化用）。
+//
+// 之所以把"选级联 + 距离淡出"留在 shadowFactor 里、把单级采样拆出来：
+// R3-1 的混合带需要**同时**采样相邻两级再按 depth 混合，只有单级版本
+// 才能被复用两次而不重复那段盒外判断。
+float sampleCascade(vec3 worldPos, int cascade, float NdotL,
+                    float radiusScale) {
+    vec4 lsp = ubo.lightSpace[cascade] * vec4(worldPos, 1.0);
+    vec3 proj = lsp.xyz / lsp.w;
+    // 只有 xy 需要从 NDC [-1,1] 映射到纹理坐标 [0,1]。
+    // ⚠ z **不能**再 *0.5+0.5：光源投影是 Zero-to-One 约定（近=0 远=1，
+    // 见 ShadowPass::updateCascades），深度已经是 Vulkan 的 [0,1]。
+    // 再压一次会把参考深度变成实际深度的一半，整片覆盖区都会被误判成阴影。
+    proj.xy = proj.xy * 0.5 + 0.5;
+
+    // 落在本级的正交盒之外 → 视为无遮挡。**不能在这里淡出**：级联盒边缘
+    // 在屏幕上是任意形状的，做淡出会留下一圈假的暗带。真正的距离淡出
+    // 由 shadowFactor 负责（它只依赖视深度，与级联盒无关）。
+    if (proj.z > 1.0 || proj.z < 0.0 || proj.x < 0.0 || proj.x > 1.0 ||
+        proj.y < 0.0 || proj.y > 1.0) {
+        return 1.0;
+    }
+
+    // 斜率相关深度偏移：表面越趋近平行于光线，自阴影条纹越严重
+    float bias = max(ubo.shadowBias.y * (1.0 - NdotL), ubo.shadowBias.x);
+    return pcfCascade(proj, cascade, bias, radiusScale);
 }
 
 // 返回 [0,1] 的**可见度**：1 = 完全受光，0 = 完全在阴影里。
@@ -382,27 +430,48 @@ float shadowFactor(vec3 worldPos, float NdotL) {
 
     // ---- 选级联 ----
     int cascade = selectCascade(viewDepth);
+    const int n = int(ubo.shadowParams.x);
 
-    vec4 lsp = ubo.lightSpace[cascade] * vec4(worldPos, 1.0);
-    vec3 proj = lsp.xyz / lsp.w;
-    // 只有 xy 需要从 NDC [-1,1] 映射到纹理坐标 [0,1]。
-    // ⚠ z **不能**再 *0.5+0.5：光源投影是 Zero-to-One 约定（近=0 远=1，
-    // 见 ShadowPass::updateCascades），深度已经是 Vulkan 的 [0,1]。
-    // 再压一次会把参考深度变成实际深度的一半，整片覆盖区都会被误判成阴影。
-    proj.xy = proj.xy * 0.5 + 0.5;
-
-    // 落在本级的正交盒之外 → 视为无遮挡。**不能在这里淡出**：级联盒边缘
-    // 在屏幕上是任意形状的，做淡出会留下一圈假的暗带。真正的距离淡出
-    // 由上面的 fade 负责（它只依赖视深度，与级联盒无关）。
-    if (proj.z > 1.0 || proj.z < 0.0 || proj.x < 0.0 || proj.x > 1.0 ||
-        proj.y < 0.0 || proj.y > 1.0) {
-        return 1.0;
+    // ---- 接触硬化（R3-1 之②）----
+    // 用接收点在**本级覆盖跨度内的相对位置**当作"离接触区多远"的代理：
+    //   近端（t→0，物体与地面接触的地方）→ radiusScale 收到 1（最锐利，
+    //     不会因 PCF 模糊而在地面接缝处漏出亮边）；
+    //   远端（t→1）→ radiusScale 放大到 1 + strength·k，阴影自然变软。
+    // hardenK 取 4 是经验值：配合默认 PCF 半径 1.0 纹素，最多到 5 纹素，
+    // 恰好是 3×3 核在纹素被放大后仍不至于跨过整个核的程度。
+    // strength = 0 时 radiusScale 恒为 1 → 逐位回到旧路径。
+    float radiusScale = 1.0;
+    if (ubo.shadowFilter.y > 0.001) {
+        float splitEnd = cascade < 3 ? ubo.cascadeSplits[cascade]
+                                     : maxDist;
+        float t = clamp(viewDepth / max(splitEnd, 1e-3), 0.0, 1.0);
+        radiusScale = mix(1.0, 1.0 + ubo.shadowFilter.y * 4.0, t);
     }
 
-    // 斜率相关深度偏移：表面越趋近平行于光线，自阴影条纹越严重
-    float bias = max(ubo.shadowBias.y * (1.0 - NdotL), ubo.shadowBias.x);
+    float sh = sampleCascade(worldPos, cascade, NdotL, radiusScale);
 
-    float sh = pcfCascade(proj, cascade, bias);
+    // ---- 级联间混合带（R3-1 之①）----
+    // 级联交界处"本级的最后几个纹素"与"下一级的头几个纹素"分辨率不同，
+    // 直接切换会在屏幕上留下一条亮线（本级分辨率更细 → 交界处阴影突然
+    // 变锐/变糊）。做法：接收点落在"本级远端最后 band 比例"内时，同时
+    // 采样下一级并按深度线性混合 —— 交界处两级各占一半，亮线被抹平。
+    //
+    // band 用**本级覆盖跨度**的比例表示（不是世界距离常量）：近级的
+    // 跨度只有几米、远级有几十米，写死米数会让近级几乎全被混合带吃掉。
+    float band = ubo.shadowFilter.x;
+    if (band > 0.001 && cascade + 1 < n) {
+        float splitEnd = ubo.cascadeSplits[cascade];
+        float splitPrev = cascade > 0 ? ubo.cascadeSplits[cascade - 1] : 0.0;
+        float span = max(splitEnd - splitPrev, 1e-3);
+        float bandLo = splitEnd - span * band;
+        if (viewDepth > bandLo) {
+            float t = clamp((viewDepth - bandLo) / (span * band), 0.0, 1.0);
+            float shNext = sampleCascade(worldPos, cascade + 1, NdotL,
+                                         radiusScale);
+            sh = mix(sh, shNext, t);
+        }
+    }
+
     return mix(1.0, sh, fade);
 }
 
@@ -801,6 +870,33 @@ void main() {
             ? texture(skyMap, vdir).rgb
             : envColor(vdir);
         color = mix(color, fogColor, fogFactor);
+    }
+
+    // ---------------- Froxel 体积雾（R3-2）----------------
+    // 与上面的**高度雾**是独立路径（两条可以同时开，各自叠一次）。
+    // 采样：像素所在的 froxel = (屏幕瓦片, 视图深度层)，直接取该格存好的
+    // (inscatter, T)，做 out = color * T + inscatter。
+    //
+    // 视图深度 → 层号：与 fog_inject.comp 的指数分层公式完全一致
+    // （d(k) = sliceNear ·(zf/sliceNear)^(k/slices)），反解 k。
+    // 关（w<0.5）时整块跳过 —— 基线逐位不变。
+    if (ubo.vfogParams.w > 0.5) {
+        const float zf = ubo.cameraParams.y;
+        const float sliceNear = ubo.cameraParams.z;
+        const float slices = ubo.vfogParams.z;
+
+        // 视图空间深度：从世界距离近似（沿视线），足够定位层号。
+        const float viewDist = max(distance(ubo.camPos.xyz, vWorldPos),
+                                   sliceNear * 1.0001);
+        // d(k) = sliceNear · ratio^(k/slices) → k = slices · log(d/sliceNear)/log(ratio)
+        const float logRatio = log(zf / sliceNear);
+        float kf = slices * log(viewDist / sliceNear) / max(logRatio, 1e-4);
+        // 归一化到 [0,1] 的纹理 z 坐标（3D 图是 CLAMP，越界自动夹边）
+        const float tz = (kf + 0.5) / slices;
+
+        const vec2 tile = gl_FragCoord.xy / ubo.vfogParams.xy;
+        vec4 fog = texture(vfogTex, vec3(tile, tz));
+        color = color * fog.a + fog.rgb;
     }
 
     // ---------------- 调试视图模式（R0-2）----------------

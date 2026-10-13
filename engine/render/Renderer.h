@@ -121,6 +121,7 @@ class Mesh;
 namespace render {
 
 class SSAOPass;
+class VolumetricFog;
 class FrameGraph;
 struct FrameGraphInput;
 
@@ -382,6 +383,10 @@ public:
     float& shadowFadeStart() { return m_shadowFadeStart; }
     glm::vec4& shadowBias() { return m_shadowBias; }
     const glm::vec4& shadowBias() const { return m_shadowBias; }
+    // ---- 阴影硬化三件套（R3-1）----
+    bool& shadowTexelSnap() { return m_shadowTexelSnap; }
+    float& shadowBlend() { return m_shadowBlend; }
+    float& shadowHarden() { return m_shadowHarden; }
     const render::ShadowPass* shadowPass() const { return m_shadowPass.get(); }
 
     // ============================================================
@@ -854,6 +859,7 @@ private:
 
     // ---- 屏幕空间效果（见 screenSpaceSettings() 的注释）----
     std::unique_ptr<render::SSAOPass> m_ssao;
+    std::unique_ptr<render::VolumetricFog> m_vfog;
     std::unique_ptr<render::FrameGraph> m_frameGraph;
 
     // ---- Hi-Z 遮挡剔除（R2-1，见 occlusionCullingEnabled() 的注释）----
@@ -1102,6 +1108,13 @@ private:
     float m_shadowFadeStart = 0.85f;
     // (常数深度偏移, 斜率深度偏移, PCF 核半径(纹素), 远级联半径增长)
     glm::vec4 m_shadowBias{0.0009f, 0.0032f, 1.0f, 0.55f};
+
+    // ---- 阴影硬化三件套（R3-1）----
+    // 三个都默认取"不改变基线"的一侧：snap=开（既有行为）、blend/harden=0
+    // （分支完全跳过）。验证脚本逐一打开做对照。
+    bool m_shadowTexelSnap = true;    // ③ 球心光空间纹素量化
+    float m_shadowBlend = 0.0f;       // ① 级联间混合带宽（占本级跨度比例）
+    float m_shadowHarden = 0.0f;      // ② 接触硬化强度
 
     // ---- 局部光源阴影（点光 / 聚光灯）----
     bool m_localShadowsEnabled = true;
