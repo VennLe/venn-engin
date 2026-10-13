@@ -114,6 +114,12 @@ public:
     // 录制绘制命令
     void draw(VkCommandBuffer cmd) const;
 
+    // 只绑顶点/索引缓冲，不发绘制命令。给**间接绘制**用：
+    // vkCmdDrawIndexedIndirect 自己不带 VB/IB，调用方必须先绑好 ——
+    // 否则会拿上一次绑定的残留缓冲去解释 firstIndex/vertexOffset，
+    // 画出"形状对但顶点数据错"的几何（这条路径最难发现的一类 bug）。
+    void bindGeometry(VkCommandBuffer cmd) const;
+
     // 实例化绘制：instanceCount 个实例共享本次 VB/IB 绑定，VS 里用
     // gl_InstanceIndex（含 firstInstance 偏移）索引每实例 SSBO 槽。
     // draw() = drawInstanced(cmd, 1, 0) 的便捷写法。

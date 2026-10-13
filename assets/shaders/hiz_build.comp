@@ -1,0 +1,64 @@
+#version 450
+// ============================================================
+// hiz_build.comp —— Hi-Z 深度金字塔的 **mip0**（R2-1 遮挡剔除）
+//
+// 把 HdrTarget 的深度图（可 MSAA）降成单采样 float 图，作为金字塔第 0 级。
+// 后续 mip1..N 由 hiz_downsample.comp 逐级 2×2 取 max。
+//
+// ---- 为什么取 max（最远）而不是 min ----
+// Hi-Z 里存的是"这一块**最远**的遮挡体深度"。判定"被遮挡"的条件是
+// **物体的最近点仍比这里最远的遮挡体还远** —— 只要有一处遮挡体够近、
+// 或者物体有一点露出来，条件都不成立 → 不会误剔。这是**保守**方向：
+// 宁可少剔一个，也不能把看得见的东西剔掉（漏画是肉眼可见的 bug）。
+//
+// ---- 为什么 MSAA 取样本最大值 ----
+// 多采样深度在边缘处样本深度不连续（跨两个深度面）。取 max 相当于
+// "把这块的背景深度当遮挡体" —— 同样是保守方向（更容易判定可见）。
+//
+// ---- 编两份 ----
+//   hiz_build.comp.spv        VENN_MSAA_DEPTH=0 → sampler2D
+//   hiz_build.msaa.comp.spv   VENN_MSAA_DEPTH=1 → sampler2DMS
+// 由 CMakeLists.txt 的 SHADER_MSAA_DEPTH_COMPUTE 生成，运行期按
+// HdrTarget::samples() 选（与 ssao.frag 那套完全一致）。
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#ifndef VENN_MSAA_DEPTH
+#define VENN_MSAA_DEPTH 0
+#endif
+
+#if VENN_MSAA_DEPTH
+layout(set = 0, binding = 0) uniform sampler2DMS srcDepth;
+#else
+layout(set = 0, binding = 0) uniform sampler2D srcDepth;
+#endif
+
+// R32_SFLOAT 存储图像（逐 mip 一个视图，这里绑的是 mip0）
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dstMip;
+
+layout(push_constant) uniform PC {
+    ivec2 srcSize;   // 源深度图的像素尺寸
+    int samples;     // 深度图每纹素的样本数（非 MSAA = 1）
+    int _pad;
+} pc;
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 ds = imageSize(dstMip);
+    if (p.x >= ds.x || p.y >= ds.y) return;
+
+    // mip0 与深度图同尺寸（1:1）；clamp 只是防御源更小的情况
+    const ivec2 sp = clamp(p, ivec2(0), pc.srcSize - ivec2(1));
+
+    float d = 0.0;
+#if VENN_MSAA_DEPTH
+    // 取所有样本的**最大**（最远）深度 —— 保守
+    for (int s = 0; s < pc.samples; ++s) {
+        d = max(d, texelFetch(srcDepth, sp, s).r);
+    }
+#else
+    d = texelFetch(srcDepth, sp, 0).r;
+#endif
+    imageStore(dstMip, p, vec4(d));
+}

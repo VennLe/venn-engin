@@ -100,6 +100,12 @@ public:
         return m_frames[frameIndex % m_frames.size()].depthSampledView;
     }
 
+    // 深度图的 image 本体（Hi-Z 的 compute 屏障需要 image，不是 view）。
+    // 与 depthSampledView 是同一张图。
+    VkImage depthImage(uint32_t frameIndex) const {
+        return m_frames[frameIndex % m_frames.size()].depthImage;
+    }
+
     VkFormat colorFormat() const { return kColorFormat; }
     VkFormat depthFormat() const { return m_depthFormat; }
     VkExtent2D extent() const { return m_extent; }

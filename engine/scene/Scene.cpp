@@ -62,7 +62,8 @@ glm::mat4 Scene::worldMatrix(ecs::Entity e) const {
 }
 
 void Scene::update(float dt) {
-    m_camera.update(dt);
+    // 多相机：每台都要推进（各自的平滑/惯性状态互不影响）
+    for (Camera& c : m_cameras) c.update(dt);
 }
 
 Light& Scene::light() {
@@ -159,6 +160,17 @@ void Scene::clear() {
     // 空间索引一并作废
     m_bvh.clear();
     m_indexedEntities.clear();
+
+    // 相机与后处理体积也是场景内容：清场后只留 0 号默认相机（保留它
+    // 的朝向/位置，它是"观察者"而不是物体），多余的相机与全部体积丢掉。
+    if (m_cameras.size() > 1) m_cameras.resize(1);
+    m_postVolumes.clear();
+}
+
+// 追加一台相机：从 0 号相机复制（新视角的合理起点），返回它的下标。
+size_t Scene::addCamera() {
+    m_cameras.push_back(m_cameras[0]);
+    return m_cameras.size() - 1;
 }
 
 // ---------------------------------------------------------------- 空间索引

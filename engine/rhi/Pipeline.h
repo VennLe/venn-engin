@@ -43,6 +43,10 @@ struct PipelineDesc {
     bool depthBiasEnable = false;
     float depthBiasConstant = 0.0f;
     float depthBiasSlope = 0.0f;
+    // 多边形模式：FILL（默认）/ LINE（线框，需 fillModeNonSolid 特性）。
+    // Wireframe 视图模式（R0-2）用它 —— LINE 模式下片元照样跑 pbr.frag
+    // （输出固定色），深度测试关闭以透视全部边线。
+    VkPolygonMode polygonMode = VK_POLYGON_MODE_FILL;
     VkCullModeFlags cullMode = VK_CULL_MODE_BACK_BIT;
     // 正面绕序：几何数据按"从外侧看 CCW"生成（见 assets/Mesh.cpp addFace），
     // 配合 Camera::projMatrix 的 Y 翻转，Vulkan 中正面即 COUNTER_CLOCKWISE

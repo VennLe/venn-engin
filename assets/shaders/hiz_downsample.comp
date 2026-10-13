@@ -1,0 +1,39 @@
+#version 450
+// ============================================================
+// hiz_downsample.comp —— Hi-Z 金字塔逐级降采样（mip k-1 → mip k）
+//
+// 每个输出纹素 = 对应 2×2 源纹素的**最大**深度（最远）。
+// 取 max 的理由见 hiz_build.comp 顶部（保守方向）。
+//
+// 源 mip 以"只有 1 个 mip 的 sampler2D 视图"绑定（baseMip=k-1、levelCount=1），
+// 所以 texelFetch(..., 0) 取到的就是 mip k-1 本身；目标写进 mip k 的
+// 存储图像视图。两者共用 hiz_build 那套 set 布局（sampler + storage image）。
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcMip;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dstMip;
+
+layout(push_constant) uniform PC {
+    ivec2 srcSize;   // 源 mip 的像素尺寸
+    int _pad0;
+    int _pad1;
+} pc;
+
+void main() {
+    const ivec2 dp = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 ds = imageSize(dstMip);
+    if (dp.x >= ds.x || dp.y >= ds.y) return;
+
+    const ivec2 s0 = dp * 2;
+    float m = 0.0;
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            const ivec2 s = clamp(s0 + ivec2(x, y), ivec2(0),
+                                  pc.srcSize - ivec2(1));
+            m = max(m, texelFetch(srcMip, s, 0).r);
+        }
+    }
+    imageStore(dstMip, dp, vec4(m));
+}

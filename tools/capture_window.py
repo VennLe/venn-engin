@@ -116,6 +116,27 @@ def capture_client(hwnd):
     return img.convert("RGB"), bool(ok)
 
 
+def capture_nonempty(hwnd, tries=12, delay=0.4):
+    """抓一张**非空**截图（所有 GUI 验证脚本共用的健壮入口）。
+
+    已知的窗口前台时序 flaky：刚 ShowWindow 后 PrintWindow / GetClientRect
+    可能拿到 0×0（窗口尚未真正显示 / 尺寸未生效），此时 `Image.save` 会抛
+    `ValueError: cannot write empty image`，把整个验证脚本崩掉。这里重试到
+    拿到真实尺寸为止；拿不到就返回 None（让调用方优雅失败或跳过像素断言）。
+
+    ⚠ 另一个已被踩过的坑（本函数之外的纪律）：**同一时间只能有一个 GUI
+    测试在跑**。每个脚本开跑前都调 `kill_stale_editors()`，那是
+    `taskkill /F /IM Editor.exe` —— 会**无差别**杀掉别的脚本正在用的编辑器，
+    症状正是"截图是空图 / 编辑器莫名提前退出"。跑前务必确认没有别的回归在跑。
+    """
+    for _ in range(tries):
+        img, _ok = capture_client(hwnd)
+        if img is not None and img.size[0] > 16 and img.size[1] > 16:
+            return img
+        time.sleep(delay)
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-resize", action="store_true",

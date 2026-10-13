@@ -253,6 +253,34 @@ foreach(SRC ${SHADER_GLSL_SOURCES})
 endforeach()
 
 # ------------------------------------------------------------
+# pbr.bindless.frag —— Bindless 版片元着色器（R2-3）
+# ------------------------------------------------------------
+# 同一份 pbr.frag 再编 8 份，额外加 -DVENN_BINDLESS=1：六张贴图槽从
+# "set 1..6 各一个 sampler2D" 改成 "set 1 binding 0 的运行时数组 + 材质页表"。
+#
+# 为什么仍然要 ×8 份而不是"把 bindless 做成第 4 个关键字位"：
+#   关键字位是**材质属性**（双面/透明/法线图），bindless 是**全局开关**
+#   （Renderer 按它选 set 布局），两者正交。混进同一个位掩码会让
+#   "全局开关 = 材质组合"这种错配有机会发生，也会让掩码空间翻倍到 16。
+#   所以沿用 instancing / mdi 顶点着色器的处理方式：全局开关 → 独立的
+#   .spv 文件族，名字是 pbr.bindless.k<N>.frag.spv。
+#   VariantPipelines 只要把 fragBaseName 换成 "pbr.bindless.frag" 即可命中
+#   （variantShaderFile 的拼法是 <stem>.k<N>.<ext>.spv）。
+foreach(MASK RANGE 7)
+    set(DEFS ${VARIANT_DEFINES_${MASK}})
+    set(OUT ${SHADER_OUT_DIR}/pbr.bindless.k${MASK}.frag.spv)
+    add_custom_command(
+        OUTPUT ${OUT}
+        COMMAND ${GLSLC} -I${SHADER_SRC_DIR} -DVENN_BINDLESS=1 ${DEFS}
+                ${SHADER_SRC_DIR}/pbr.frag -o ${OUT}
+        DEPENDS ${SHADER_SRC_DIR}/pbr.frag ${SHADER_INCLUDES}
+        COMMENT "glslc: pbr.frag (VENN_BINDLESS) k${MASK} -> pbr.bindless.k${MASK}.frag.spv"
+        VERBATIM
+    )
+    list(APPEND SHADER_TARGETS ${OUT})
+endforeach()
+
+# ------------------------------------------------------------
 # pbr.inst.vert —— GPU instancing 版顶点着色器
 # ------------------------------------------------------------
 # 同一份 pbr.vert 加 -DVENN_INSTANCING=1：顶点变换从实例 SSBO
@@ -272,6 +300,24 @@ add_custom_command(
 list(APPEND SHADER_TARGETS ${PBR_INST_OUT})
 
 # ------------------------------------------------------------
+# pbr.mdi.vert —— Multi-draw indirect 版顶点着色器（R2-2）
+# ------------------------------------------------------------
+# 同一份 pbr.vert 加 -DVENN_MDI=1：model 矩阵与蒙皮定位都从
+# **结构化实例记录**（set 0 binding 15，由 mdi_compact.comp 紧凑化）
+# 里取。材质仍走 push 常量 —— 一次 vkCmdDrawIndexedIndirect 覆盖的是
+# "同管线 + 同材质"的一组批。
+set(PBR_MDI_OUT ${SHADER_OUT_DIR}/pbr.mdi.vert.spv)
+add_custom_command(
+    OUTPUT ${PBR_MDI_OUT}
+    COMMAND ${GLSLC} -I${SHADER_SRC_DIR} -DVENN_MDI=1
+            ${SHADER_SRC_DIR}/pbr.vert -o ${PBR_MDI_OUT}
+    DEPENDS ${SHADER_SRC_DIR}/pbr.vert ${SHADER_INCLUDES}
+    COMMENT "glslc: pbr.vert (VENN_MDI) -> pbr.mdi.vert.spv"
+    VERBATIM
+)
+list(APPEND SHADER_TARGETS ${PBR_MDI_OUT})
+
+# ------------------------------------------------------------
 # 屏幕空间效果的 MSAA 深度变体（SSAO / SSR / SSGI / god rays）
 # ------------------------------------------------------------
 # 这些全屏 pass 都要读 HdrTarget 的**深度图**。深度图是 MSAA 的：
@@ -282,7 +328,8 @@ list(APPEND SHADER_TARGETS ${PBR_INST_OUT})
 # 运行期按 HdrTarget::samples() 选哪份 —— MYVK_MSAA=1 时用前者，
 # 4x（默认）时用后者。给空间.glsl 的函数族提供两种重载签名。
 set(SHADER_MSAA_DEPTH_SHADERS
-    ssao.frag ssao_blur.frag fg_ssr.frag fg_ssgi.frag fg_godrays.frag)
+    ssao.frag ssao_blur.frag fg_ssr.frag fg_ssgi.frag fg_godrays.frag
+    fg_dof.frag fg_motionblur.frag fg_taa.frag)
 
 foreach(SRC ${SHADER_MSAA_DEPTH_SHADERS})
     set(SRC_PATH ${SHADER_SRC_DIR}/${SRC})
@@ -294,6 +341,32 @@ foreach(SRC ${SHADER_MSAA_DEPTH_SHADERS})
                 ${SRC_PATH} -o ${MSAA_OUT}
         DEPENDS ${SRC_PATH} ${SHADER_INCLUDES}
         COMMENT "glslc: ${SRC} (VENN_MSAA_DEPTH) -> ${STEM}.msaa.frag.spv"
+        VERBATIM
+    )
+    list(APPEND SHADER_TARGETS ${MSAA_OUT})
+endforeach()
+
+# ------------------------------------------------------------
+# MSAA 深度变体的 **compute** 版（Hi-Z 金字塔，R2-1）
+# ------------------------------------------------------------
+# hiz_build.comp 要从 HdrTarget 的深度图建金字塔 mip0。深度是 MSAA 的，
+# 只能用 sampler2DMS + texelFetch 读（与上面那批 frag 同一条理由）。
+# 编两份：
+#   hiz_build.comp.spv        VENN_MSAA_DEPTH=0 → sampler2D
+#   hiz_build.msaa.comp.spv   VENN_MSAA_DEPTH=1 → sampler2DMS
+# 运行期按 HdrTarget::samples() 选（见 HiZOcclusion::createPipelines）。
+set(SHADER_MSAA_DEPTH_COMPUTE hiz_build.comp)
+
+foreach(SRC ${SHADER_MSAA_DEPTH_COMPUTE})
+    set(SRC_PATH ${SHADER_SRC_DIR}/${SRC})
+    string(REGEX REPLACE "\\.[^.]*$" "" STEM ${SRC})
+    set(MSAA_OUT ${SHADER_OUT_DIR}/${STEM}.msaa.comp.spv)
+    add_custom_command(
+        OUTPUT ${MSAA_OUT}
+        COMMAND ${GLSLC} -I${SHADER_SRC_DIR} -DVENN_MSAA_DEPTH=1
+                ${SRC_PATH} -o ${MSAA_OUT}
+        DEPENDS ${SRC_PATH} ${SHADER_INCLUDES}
+        COMMENT "glslc: ${SRC} (VENN_MSAA_DEPTH) -> ${STEM}.msaa.comp.spv"
         VERBATIM
     )
     list(APPEND SHADER_TARGETS ${MSAA_OUT})

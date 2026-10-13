@@ -35,6 +35,22 @@ public:
     const VkPhysicalDeviceProperties& properties() const { return m_props; }
     float maxSamplerAnisotropy() const { return m_maxAnisotropy; }
 
+    // ============================================================
+    // Bindless（R2-3，见 render/Bindless.h）
+    //
+    // true = 下列特性组合**全部**已在创建逻辑设备时启用：
+    //   descriptorIndexing                     —— 总开关
+    //   runtimeDescriptorArray                 —— 着色器里能写 sampler2D tex[]
+    //   shaderSampledImageArrayNonUniformIndexing —— 允许非常量索引
+    //   descriptorBindingPartiallyBound        —— 数组尾部未写的槽合法
+    //   descriptorBindingSampledImageUpdateAfterBind —— 运行时补注册纹理
+    //
+    // 少任何一个都不上报支持（调用方据此把 MYVK_BINDLESS 降级成"关闭"
+    // 并打一行日志，绝不半开）。实测下限：Vulkan 1.2 起这是可选特性，
+    // 但桌面三家的现代驱动都全支持。
+    // ============================================================
+    bool supportsBindless() const { return m_descriptorIndexing; }
+
 private:
     bool pickPhysicalDevice();
     void createLogicalDevice();
@@ -47,6 +63,7 @@ private:
     VkQueue m_queue = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties m_props{};
     float m_maxAnisotropy = 1.0f;
+    bool m_descriptorIndexing = false;
 };
 
 } // namespace rhi

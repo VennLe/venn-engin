@@ -977,11 +977,58 @@ Mesh/Material/Texture 各带"来源描述"（`*Source`），序列化只写描�
     ② decode 侧 (Bh,Bw,16,3) 不能直接 reshape 成图像——块列维与 texel 维错位，
     必须 reshape(Bh,Bw,4,4,3).transpose(0,2,1,3,4)（encode 的 transpose 的逆）。
     自检用内置解码器回读算 PSNR（Pillow 只能读 BC 不能写，也不认自写头）。
+80. **自动化跑必须把 ImGui 的 `imgui.ini` 一起关掉**（`io.IniFilename = nullptr`，见
+    `ImGuiManager::init`；`MYVK_NO_WINDOW_SAVE` / `MYVK_FRAMES` 时生效）。此前它只管
+    `editor_window.ini`，ImGui 的 ini **照样读照样写** —— 手动会话常是全屏（存档里
+    `editor_window.ini` 记着 3840x2054），而脚本把窗口缩到 1600x900，于是存档里
+    "在 3840 宽度下完全正常"的浮动窗口坐标（实测 `[character] Pos=1559,597
+    Size=1263,794`）一读回来就把角色窗口顶到客户区之外：ImGui 照画、`logRect` 照打
+    坐标，脚本按那段矩形点击**全部落在窗口外且不报错** → `verify_character_window`
+    的"拿到动画条目矩形（CHAR-CLIP）"恒挂，而且**一次踩脏就永久复现**（每轮都写回）。
+    识别特征：日志里 `Preview render size ->` 大于窗口客户区（934x701 > 1578x844 的一半），
+    或截图里浮动窗口只剩右/下边缘一条。主面板不受影响（`computeLayout()` 每帧显式定 Pos/Size）。
+    ⚠ 与坑点 #22 同一根源（那里是目视确认，这里是自动化点击）。
+81. **尺寸重建路径的顺序：`recreateScreenSpace()` 必须早于 `postInputViews()`**。链激活时
+    `postInputViews()` 返回 `FrameGraph::outputView()` —— 那是**即将随重建销毁**的旧工作图
+    句柄。`applyViewportSize` 里先 `m_mainTarget->apply(..., postInputViews())` 再重建
+    FrameGraph，写进描述符的就是已失效的 `VkImageView`（验证层报
+    `pDescriptorWrites[0].pImageInfo[0].imageView Invalid VkImageView Object 0xaa00...`）。
+    正解：`apply(...)` 第三参一律传**空 vector**（先接 HDR resolve，必定有效），收尾再调
+    `rewireMainTargetChainInput()` 用重建后的新句柄补接。
+82. **一个命令缓冲里录两个相机 → `FrameUBO` 必须"一相机一份"**。`FrameUBO` 是
+    HOST_VISIBLE + 常驻映射，`uploadSceneState` 在**录制期**就 memcpy 进去 —— 主视口与
+    预览/额外视角先后录制时只有最后一次能留在 buffer 里，GPU 执行时**先录的那个场景也读到
+    后一次的值**（主视口被渲染成预览相机的视角）。旧注释写的"主场景命令已录制完毕所以安全"
+    是错的：memcpy 发生在录制期而非执行期。正解：`FrameResources::OffscreenUbo`（vector，
+    下标 = `m_targets` 序号 - 1），离屏目标各持一份 UBO + 各自的 set 0，其余 binding 共享。
+83. **相机特效的验证钩子与度量**：① 静态相机下运动模糊速度物理恒为 0（无法端到端验证），
+    用 `MYVK_MB_SIM_YAW` 造一个确定的速度源，但**必须绕相机自身位置偏航**
+    （`T(camPos)·Rz·T(-camPos)`）—— 绕世界原点转对远离原点的相机速度极大，会被着色器里的
+    速度上限 `params.z=0.25` 饱和，于是 strength 怎么乘都被夹到同一值（断言"强度单调"假通过）。
+    ② "差异像素数"在阈值处会**饱和**，强度类断言要看**平均差**（线性量）。
+84. **`RT-TARGETS` 这类多目标日志的名字要按"指针身份"判断，不能按下标**：预览目标（1 号）是
+    角色窗口首次打开时懒建的，`MYVK_EXTRA_VIEW=1` 又可能让它先存在 —— 按下标取名会错位。
+85. **预览关闭时不能走 `setSize(0,0) + apply()`**：`RenderTarget` 里"非离屏"的语义是
+    "HDR 跟交换链尺寸"（游戏模式直写交换链用的），对预览来说那就是白白多建一张 1600x900 的
+    HDR。关闭时直接 `return` 冻住原资源（下次打开零重建）才是想要的。
+86. **GPU 时戳：被 reset 却没写入的 query 会永远 unavailable，拖累整批读回**（2026-10-13，R0-1）：
+    `vkCmdResetQueryPool` 每帧复位整 slot 的 18 个 query，但 SSAO/FrameGraph 这类条件 pass 的
+    begin/end 若包在 `if` 里，关闭时 query 被复位却无人写入 → `vkGetQueryPoolResults` 对整批
+    返回 VK_NOT_READY（驱动还会把 available 的部分填进 buffer，数据看着合理、返回值却不是
+    SUCCESS —— 极易误判）。**所有段无条件打 begin/end**，关闭段 = 相邻时戳 ≈0，正好当
+    "未激活"标记。
+87. **GPU 时戳：fence 初始是 signaled 的，头几帧读 query 违反 VUID-09401**（uninitialized）。
+    帧槽的命令缓冲还没提交过时该 slot 的 query 从未初始化。用 `markSubmitted(frameIndex)`
+    （vkQueueSubmit 之后打标）挡住，只有提交过的槽才允许 readFrame。
+88. **GPU 时戳的周期/位数是队列族属性不是设备属性**：`timestampPeriod` 在
+    `limits` 里，但 `timestampValidBits` 在 `vkGetPhysicalDeviceQueueFamilyProperties`
+    的**对应队列族**里（0 = 该队列不支持时戳）。validBits < 64 时要 mask 再做差。
 
 ## 工具
 - `tools/run_regression.py`（2026-10-11）：**串行**跑全套 GUI 验证脚本（GUI 必须独占窗口），
   **以退出码为准**。这批脚本的结果行格式不统一（`RESULT: PASS` / `全部断言 PASS` /
   `全部 PASS` / `结果: PASS`），只靠文本匹配会误判。两例之间默认等 2s。
+  **完整回归跑一次即可**（2026-10-13 用户明确：从"跑两次"改为"一次"）。
   ⚠ 单跑过、连跑偶发失败是已知的**焦点时序**问题（见 `force_foreground` 注释），
   判失败前**先单独复现一次**再下结论。`--tail N` 打失败用例的日志尾部。
 - `tools/verify_frustum_cull.py`（2026-10-11）：137 立方体（4 在视锥内）→ culled=132 /
@@ -1170,3 +1217,317 @@ Mesh/Material/Texture 各带"来源描述"（`*Source`），序列化只写描�
 ## VS Code（IntelliSense，与 CMake 编译解耦）
 手写 `includePath` 必须与 CMakeLists 的 `target_include_directories` 同步；SDK 的 `Include` 根目录
 （**不要**加 `Include/glm`，会与 third_party/glm 冲突）；报 "无法打开 vulkan.h" 先怀疑 `.vscode` 配置缺失。
+89. **带动态数字的面板会毁掉逐像素对照轮**（2026-10-13，R0-2）：Engine 面板的
+    "Lights/cluster: avg %.2f" 每帧微变 —— 为了让验证脚本看到某个控件（VM-COMBO 标签）
+    而打开整个面板，代价是面板区域逐轮不同。**控件存在性验证与像素对照必须分开轮次**：
+    用独立 env（MYVK_ENGINE_PANEL=1）按需打开，不要绑在 automationRun() 上。
+90. **"灰度图"断言的阈值不能设 3**：bloom 半分辨率采样 + tonemap 会在灰度图上留下
+    4~9 的通道间舍入噪声（实测 (153,157,162) 这种）。灰度判定阈值用 **<=12**，
+    真彩色内容（法线/热度色/轴线）通道差 >=60 —— 中间地带不存在，两边都安全。
+91. **调试热度色 ramp 的通道分配**：LightComplexity 1..4 灯必须是**绿**（g = min(n,4)*0.22），
+    红留给 >4 灯 —— 把 r 通道给低灯数会让"1 灯场景"全屏红，看起来像坏了。
+    Overdraw 的 additive 基色选 **R 主导的品红**（0.040,0.010,0.024）：蓝色是天空的
+    固有属性，R>B 才能在直方图断言里与天空区分。
+92. **TAA 的抖动相位必须按帧槽（frame-in-flight）各持一个**（2026-10-13，R1-1）：
+    历史图是按帧槽分开累积的（帧 f 读的是 f-2 留在同槽里的结果），所以"槽 0 的帧号"
+    永远是偶数、槽 1 永远是奇数。若相位用**全局**计数器按帧号递增，槽 0 就只见过偶数
+    相位、槽 1 只见过奇数相位 —— 两个槽收敛到两张**不同**的 4 相位平均图，屏幕上以
+    半帧率来回切，而且抓哪一张取决于抓拍瞬间的奇偶，**跨运行不可复现**。
+    症状：verify 的"两次独立运行逐像素一致"断言挂（实测 max 77 / 611 px）。
+    修法：`m_taaPhase[2]` 各槽 +1。修完 max 8 / **0 px**。
+93. **TAA 历史图的"视图必须恒定"是硬约束**：PostProcess 的输入描述符只在
+    `recreate` 时写一次（`PostProcess::buildDescriptorSets`），输入视图一变就指向
+    已销毁对象。所以 TAA **不能** ping-pong 输出图 —— 只能"固定 out 图 + 每帧
+    `vkCmdCopyImage` 把 out 拷进 hist"。那张 copy 约一张全分辨率 RGBA16F 的带宽
+    （约 1% 显存带宽），换的是这条硬约束。
+94. **描述符写入的布局 = 验证层认定的布局（VUID 09600 不看分支）**：TAA 首帧
+    / 尺寸变化后历史无效，我最初**跳过**了所有 barrier —— 于是 history 图停在
+    `UNDEFINED`，而它会报错：验证层对"这个描述符会不会被采样"做的是 **SPIR-V 静态
+    判定**，片元里 `if (historyValid < 0.5) return;` 拦不住它。修法：即使不采样，
+    也要显式把图迁到描述符声明的布局（`UNDEFINED → SHADER_READ_ONLY_OPTIMAL`）。
+    同理，描述符写的布局必须与该图在该帧的**实际最终布局**一致（链源头每帧重写就是
+    为了这个）。
+95. **抗锯齿的判据不能用一阶梯度**：一阶梯度（总变差）在"理想阶跃被摊成斜坡"后
+    **总量不变**（TV 守恒），所以 `|dI/dx| > thr` 的计数几乎不动（实测只有 1.3%）。
+    用**二阶差分**（Laplacian）—— 它直接度量"局部曲率"，锯齿正是少数像素上的极大
+    曲率：实测 10361 → 4877（−53%）。另外必须配一条"变化集中在边缘"的断言
+    （边缘平均变化 / 非边缘平均变化 ≥ 5×，实测 14.8×）来排除"其实就是全局模糊"。
+96. **收敛类断言的容差要按现象的成因定，不要硬写"逐像素全等"**：TAA 权重是 0.1 的
+    指数滑动平均，收敛后进入 **8 相位极限环**，抓拍落在环上哪个位置由帧号决定 ——
+    两次运行必然差 α×边缘对比度量级（实测 max 9，全部 ≤18）。可断言的是
+    "**没有可见差异**（>18 的像素数 = 0）" + "平均差 ≤ 0.35"。真正该被排除的是
+    "没收敛"：那种情况会差出成百上千个显著像素。
+97. **回归"开头三例"的焦点时序 flaky（面板抢前台 / 截图与拾取过早）**（2026-10-13，R1-1）：
+    完整回归（26 例串行）里 `verify_frustum_cull` / `verify_bvh` / `verify_ibl` 三例
+    偶发失败，且**总在最开头**（前 4 个里占 3 个）。两种症状：
+    ① `capture_client` 返回空图 → `ValueError: cannot write empty image`（窗口还没
+    真正抢到前台 / 截图发生在前台切换之前）；
+    ② BVH 拾取"没等到 pick 日志"，`PICK-DBG bvh=4294967295(d=0) ... same=1`
+    （注入的点击被窗口激活吃掉，脚本其实已带"预热点击"兜底，但仍偶发）。
+    **三者单独跑 100% PASS** —— 是环境时序，不是代码回归。判据：单跑能过 + 失败
+    集中在开头 + `same==1` 等分支断言仍 PASS。遇到时**先单跑复现**再下结论。
+98. **HDR 的"颜色写"只对 FRAGMENT 有可见性依赖 → compute 直接采样它是错的**（2026-10-13，R1-2）：
+    `HdrTarget` 前向 renderpass 的 `deps[1].dstStageMask = FRAGMENT_SHADER_BIT`
+    —— 后处理（bloom / 合成）在片元里采样 HDR 之所以能跑，就是靠这条。
+    自动曝光如果直接写个 compute 去读 HDR，等于踩在**没有依赖声明**的读上
+    （要么补一条需要 `VkImage` 的显式屏障，而 `PostProcess::recreate` 只拿得到
+    `VkImageView`，拿不到 image）。绕法：先做一个**片元**降采样 pass 把场景色
+    变成自己的小图，再让 compute 读**自己的**图。
+99. **"自己的图 + 独立 RenderPass"可以把跨阶段同步全写进 subpass 依赖**（2026-10-13，R1-2）：
+    给自动曝光的亮度图建一个专用 RenderPass，把
+    `deps[0]: COMPUTE_SHADER/SHADER_READ → COLOR_ATTACHMENT_OUTPUT/WRITE`（上一帧
+    compute 读的 WAR）与 `deps[1]: COLOR_ATTACHMENT_OUTPUT/WRITE → COMPUTE_SHADER/
+    SHADER_READ`（本帧 compute 读的 RAW）都声明进去 —— 整条链**一行显式
+    `vkCmdPipelineBarrier` 都不用**。附件 `initialLayout` 取 UNDEFINED（每次全量
+    覆盖），顺带绕开"图刚创建还是 UNDEFINED"的初始化难题。同一张图的
+    `oldLayout` 每次都不一样时，这种"把语义交给 renderpass"的写法比手写屏障稳。
+100. **GPU→CPU 回读的时序要挂在 in-flight 栅栏之后，并且按帧槽分开**（2026-10-13，R1-2）：
+    与 `ClusteredLighting::beginFrame` 同一条规矩 —— `Renderer::drawFrame` 里
+    `vkWaitForFences(frame.inFlightFence)` 之后才发现"这个 slot 上一轮的命令
+    一定跑完了"，此时读该 slot 的 HOST_VISIBLE 缓冲才是安全的（HOST_COHERENT
+    则不必手动 invalidate）。所以测量链每帧 ×N 个帧槽各一份 bins/result，
+    读的是**两帧前**的结果 —— 代价是曝光有 2 帧延迟，对"指数平滑的适应"完全
+    无所谓，换来的是零停顿。写入侧别忘 `COMPUTE → HOST` 的那条 barrier。
+101. **⚠ 同一时刻只能有一个 GUI 验证脚本在跑 —— 它们会互相残杀**（2026-10-13，R1-3）：
+    每个验证脚本开头都调 `kill_stale_editors()`，而那是
+    `taskkill /F /IM Editor.exe` —— **无差别**杀掉机器上所有 `Editor.exe`，
+    包括**另一个正在跑的回归**手里的编辑器。症状极具误导性：
+    ① 截图变成空图 → `ValueError: cannot write empty image`；
+    ② 编辑器"莫名提前自行退出"（进程还在等日志，进程已经没了）；
+    ③ `subprocess.Popen` 报 `FileNotFoundError [WinError 2]`。
+    2026-10-13 就因此废掉了一整轮 27 例回归（21/27，且失败项**全部**是上面
+    三种症状）。**纪律**：跑回归前先确认没有别的验证在跑；回归运行期间
+    **不要构建**（会把 `bin/Editor.exe` 换掉，后续用例直接 `FileNotFoundError`）、
+    **不要跑任何 GUI 测试**。判据：失败项是否全是"空图 / 文件找不到 / 提前退出"
+    这几种**非断言类**症状；若是，先怀疑并发，而不是代码回归。
+102. **"空图"这类脆性要一次性从共享抓图入口根治**（2026-10-13，R1-3）：
+    `capture_client` 在窗口刚 `ShowWindow` 后可能拿到 0×0，`img.save()` 直接抛
+    异常把脚本崩掉（不是断言失败，是 traceback）。修法统一到
+    `capture_window.capture_nonempty(hwnd, tries=12, delay=0.4)`：循环重试到
+    `size > 16` 为止，拿不到返回 `None`（让断言优雅失败）并给出一条 `[dbg]`
+    行说明 client 尺寸与进程存活状态。`verify_shader_variants.run_once` /
+    `verify_auto_exposure` / `verify_color_lut` 已全部改走它。
+103. **3D LUT 是"固定尺寸资源"：视图恒定 + 构造时立即烘一次**（2026-10-13，R1-3）：
+    ① LUT 图不参与 `recreate`（尺寸恒定），但**描述符集要跟着描述符池重建**
+    —— 每次 `buildDescriptorSets` 里重写；
+    ② **构造时就 `bakeLut()` 一次**（哪怕参数是默认恒等）。原因：每个
+    `RenderTarget` 各持一个 `PostProcess`，而只有**主目标**会被驱动
+    `beginFrame`；若把首次烘焙延迟到 `beginFrame`，副目标的 LUT 图会一直停在
+    `UNDEFINED`，而描述符声明的是 `SHADER_READ_ONLY` → 验证层报错（与 TAA
+    那条 VUID 09600 同一个坑）。烘焙后图**永久**停在 `SHADER_READ_ONLY`。
+104. **恒等 LUT 是仿射映射 → 硬件三线性可精确重建**（2026-10-13，R1-3）：
+    32³ LUT 的格点存的就是"输入本身"时，三线性插值在**仿射函数**上是精确的
+    —— 所以"开着但参数全默认"实测与基线**最大差 1 / 平均差 0.06**（16F 存储
+    + 8-bit 插值权重带来的量级）。这才让"恒等 ≈ 逐像素不变"成为可断言的性质
+    （若换成 8-bit UNORM，暗部会被 sRGB 编码放大出可见台阶）。采样坐标必须
+    落在纹素中心：`uvw = c·(N-1)/N + 1/(2N)`；映射写错（比如用 `c` 直接采样）
+    会整体偏色 —— B 组那两条"恒等"断言正是在钉死这个坐标映射。
+105. **动态分辨率必须把"输出分辨率"与"场景渲染分辨率"彻底分开，且两处
+    尺寸必须共用同一个计算函数**（2026-10-13，R1-4）：`PostProcess` 过去只有
+    一个 `m_sceneExtent`（既是 HDR 尺寸也是合成目标尺寸）。DRS 一来这两者
+    就分家了：`m_outExtent`（视口/交换链，全分辨率：合成 viewport/scissor、
+    FXAA 中间图、离屏输出图）与 `m_sceneExtent = 输出 × renderScale`（HdrTarget
+    / 深度 / SSAO / 链 / TAA / bloom / 分簇）。**两个尺寸在两个地方各算一次**
+    —— `RenderTarget::apply`（建 HdrTarget）与 `PostProcess::recreate`
+    （m_sceneExtent）—— 必须走**同一个** `scaledRenderExtent()`，否则
+    HdrTarget 与后处理各用各的尺寸，画面/验证层立刻炸。
+106. **离屏输出图（ImGui 采样的那张）是"全分辨率"的，判"能否复用"要用
+    **输出**分辨率而不是渲染分辨率**（2026-10-13，R1-4）：`PostProcess::recreate`
+    里 sceneOutput 的复用判据原本比的是 `m_sceneExtent`。改成 DRS 后
+    `m_sceneExtent` 会随缩放比变，于是每调一次 DRS 就把离屏输出图整组
+    重建 → **ImTextureID 白换一次**（而那一帧的 ImGui 绘制数据早就构建完了）。
+    判据改成 `m_outExtent`（DRS 不动它）后，纹理 ID 稳定。
+107. **"关闭 = 基线逐像素不变"在着色器里也要落实到位**（2026-10-13，R1-4）：
+    升采样不能只是"参数为 0 时数值接近" —— `post.frag` 的 `upsampleScene()`
+    在 `pc.ups.z <= 0.5` 时**第一件事就是 `return texture(hdrTex, uv).rgb`**，
+    与引入前**逐字相同**（不是"近似相同"）。比例判据放在 **CPU 侧**：
+    `renderScale < 0.999` 才算开（避免浮点误差把 1.0 判成"开"）。
+108. **自动控制器不要给用户给的"目标值"做无理由的下限夹紧**（2026-10-13，
+    R1-4）：`target = max(drsTargetMs, 0.5f)` 这种"防御性"夹紧在空场景上是
+    **反效果** —— 实测 GPU 整帧才 0.22ms，目标被抬到 0.5ms 后反而高于实测，
+    于是 `scale' = scale·√(target/measured) > scale`，缩放比**永远不动**（回归
+    D1 组实测 12265 帧卡在 1.0）。改回 `max(目标, 1e-3)` 后正常下降到 min。
+    教训：控制环里任何"截断/夹紧"都要能说出它防的是什么。
+109. **回归脚本读"渲染分辨率"日志要取最后一条**（2026-10-13，R1-4）：编辑器
+    启动早期会**先按交换链尺寸建一次离屏目标**（游戏模式的 950×648），面板
+    布局稳定后才切到视口尺寸（608×492）。`render_sizes()[0]` 拿到的是前者，
+    与 `VP-RECT` 对不上 → 误判失败。取 `[-1]`。
+110. **焦点时序 flaky 的第二种症状：输入注入整体失效**（2026-10-13，R1-4）：
+    除已知的"空图 / 拾取没等到日志"外，`verify_nav_gizmo` 在完整回归里
+    会挂，且**只挂"走系统输入队列"的鼠标点击断言**（`SetCursorPos` +
+    `mouse_event`；键盘走 `PostMessageW` 一律正常）。两轮完整回归均
+    28/29 卡在此例，但**单跑 4/4 全 PASS**（含连着跑 3 次）、短序列也 PASS，
+    只有完整 29 例"连着跑"才偶发 —— 与 `verify_asset_drag.py::force_foreground`
+    注释里写的"单独跑通过、连着跑偶发全挂"完全吻合。判据：单跑能过 +
+    只挂鼠标那条 + 失败形态逐轮变化 → 环境时序，非代码回归。
+    同类：`verify_fxaa` 也偶发挂"平坦区小窗"断言（同样两轮完整回归里 PASS）。
+    教训：**视口 + 前台时序类用例天生有 flaky，别一挂就怀疑功能坏了。**
+
+111. **Hi-Z 的两个同步/约定坑**（2026-10-13，R2-1）：
+    ① **深度附件的写只对片元阶段可见** —— `HdrTarget` 的 subpass 依赖
+    （`deps[1]`）只把 `DEPTH_STENCIL_ATTACHMENT_WRITE` 同步到
+    `FRAGMENT_SHADER_BIT`（屏幕空间效果都是片元 pass）。Hi-Z 用 **compute**
+    读深度，必须自己补一条 image barrier：`LATE|EARLY_FRAGMENT_TESTS →
+    COMPUTE_SHADER`，`srcAccess=DEPTH_STENCIL_ATTACHMENT_WRITE`，
+    `dstAccess=SHADER_READ`，**布局不变**（前向 pass 的 finalLayout 已经是
+    `DEPTH_STENCIL_READ_ONLY_OPTIMAL`，与 `setDepthViews` 声明的一致）。
+    所以 `record()` 要接 `VkImage`（不是 view）—— 附件屏障要的是 image。
+    ② **深度值 → NDC 用 `d*2-1`**：本引擎没定义
+    `GLM_FORCE_DEPTH_ZERO_TO_ONE`，NDC z ∈ [-1,1]（见 Frustum.h /
+    RenderTypes.h），`space.glsl` 也是这条约定。`occlusion_test.comp` 里
+    `zNear`（角点 `clip.z/clip.w`）与 `hizNdc = hiz*2-1` 因此在同一空间 ——
+    实测 3 个被挡球全剔、且开/关画面逐像素相同（平均差 0.0000），这条
+    映射**被实验钉死**。
+
+112. **遮挡剔除的"自我封闭"陷阱：候选 AABB 表必须收所有视锥内物体，
+    包含本帧已被剔的**（2026-10-13，R2-1）：`buildDrawLists` 里对每个
+    `mesh->hasBounds()` 的候选**先无条件 push 进 `m_hizAabbScratch` +
+    `m_hizSlotEntities`，再按 `m_occludedSet` 决定 `continue`**。若"被剔的
+    物体不再进候选表"，它就永远不会被重新测试 —— 相机一转，被挡物体本该
+    露出来却因为不再参与测试而**永久消失**。这条不变量比"少剔几个"重要
+    得多：宁可多测（CPU 便宜）、不可漏测。
+
+113. **两帧延迟回读的时序不变量**（2026-10-13，R2-1）：
+    ① **回读必须在 `buildDrawLists` 之前**：`m_hizSlotEntities[slot]` 会在
+    同一 slot 的 `buildDrawLists` 开头被 `clear()` 重填，而 vis 缓冲里存的
+    是**两帧前**那次上传的结果 —— 顺序反了就会拿"本帧的实体表"去解释
+    "两帧前的 vis"。正确位置是 `drawFrame` 开头、in-flight 栅栏之后
+    （`MAX_FRAMES_IN_FLIGHT=2` → 天然延迟两帧、且读到的一定是写完了的）。
+    ② 两张表必须**严格同长**：AABB 与实体都在同一个 `if (size < kMaxObjects)`
+    里成对 push，`uploadAabbs` 也按同一个上限截断；回读用
+    `n = min(flags.size(), ents.size())` 兜底。
+    ③ **vis 缓冲首帧必须填"全可见"**（`memset(...,1,...)`）：HOST_VISIBLE
+    缓冲默认是 0，不初始化会被当成"全被遮挡"→ 第一次打开 Hi-Z 就把整个
+    场景剔光。
+    ④ **关闭期间也要清本槽实体表**：否则重新打开时本槽 vis 里还留着"上次
+    打开时"的旧数据，可能拿旧 vis 去剔对不上的实体（清表后 `n=min=0`，
+    先不剔、两帧后自然恢复）。
+
+
+114. **间接绘制（`vkCmdDrawIndexedIndirect`）不带 VB/IB —— 必须自己绑**
+    （2026-10-13，R2-2）：`VkDrawIndexedIndirectCommand` 里的 `firstIndex` /
+    `vertexOffset` 只能在**已绑定**的顶点/索引缓冲里寻址，而
+    `vkCmdDrawIndexedIndirect` **不会**帮你绑任何东西。漏了这一句的症状
+    极具迷惑性：拿到的是"上一次绑定的残留缓冲"（前向 pass 里就是天空盒 /
+    深度预通道的最后一个网格），于是**画面形状看着对、颜色/顶点数据错**
+    （实测：墙整体亮了 ~45%，红球少了 2900 像素），而
+    **Vulkan 验证层一个字都不报**。修法：`assets::Mesh` 新增
+    `bindGeometry(cmd)`（只绑 VB/IB，`drawInstanced` 复用它），MDI 组循环里
+    在每次间接绘制前调一次。
+
+115. **MDI 的提交组键必须含"网格"**（2026-10-13，R2-2）：一次
+    `vkCmdDrawIndexedIndirect` 只带**一套**已绑定的 VB/IB，组内混网格 →
+    后一条命令会拿前一条的缓冲去解释自己的 `firstIndex`（就是 #114 的
+    "顶点数据错位"）。本引擎每个 `Mesh` 各有自己的 VB/IB，所以组键 =
+    **(掩码, 材质, 网格)**。副作用：组数因此恒等于批数，`mdiSub == mdiBatches`
+    —— 收益落在"GPU 生成 draw 参数 + 零回读"，而不是命令条数。真要做到
+    路线图里那句 O(材质数)，前置条件是**全局几何 arena**（所有网格共用
+    一份顶点/索引大缓冲，靠命令里的 `firstIndex`/`vertexOffset` 寻址）。
+
+116. **MDI 的"Pass 2.5"要放在 `recordFrame`，不是 `recordSceneInto`**
+    （2026-10-13，R2-2）：`recordSceneInto` 只服务**离屏/预览目标**
+    （`isPreview` 恒 true），主视口不走它。一开始把"Hi-Z 金字塔 +
+    compact + MDI 绘制路径"加在那个函数里，症状是 `mdiSub=0`、
+    `MDI-STATS` 全 0 —— **机制完全没跑，但一帧日志都不报错**。正确位置：
+    `recordFrame` 的**深度预通道之后、前向 render pass 之前**（紧凑化要在
+    前向之前拿到本帧深度 = 零帧延迟的全部要点）。
+
+117. **`MdiDraw::beginFrame` 的长度校验：catalog/objBatch 是"每物体"、
+    commands 是"每批"**（2026-10-13，R2-2）：写成
+    `n == commands.size()` 会让 11 个物体 / 3 条命令直接判"不合法"并
+    静默退回旧路径（症状同样是 `mdiSub=0`）。正确的是
+    `n == objBatch.size() && !commands.empty()`，再各自对
+    `kMaxObjects` / `kMaxBatches` 做上限检查。
+
+118. **pbr.mdi.vert 读的 binding 15 必须在 set 0 的 layout 里声明**
+    （2026-10-13，R2-2）：着色器里 `layout(std430, set=0, binding=15)`
+    只要声明了，`VkGraphicsPipelineCreateInfo` 的 layout 就必须有它 ——
+    否则创建管线时报 `VUID-VkGraphicsPipelineCreateInfo-layout-07988`。
+    所以 `kGlobalSetBindings` 从 15 加到 **16**，并给
+    `bindings[15]` 一个"无 MDI 时的退化绑定"（绑 `instanceModels`），
+    这样开着合批/基线路径的管线创建也不受影响。
+    配套约束：**紧凑化实例表缓冲永不换对象**（构造时按 `kMaxObjects`
+    一次分到底，约 1.5 MB/槽）—— 一扩容就得回头重写 set 0 的 binding 15，
+    那是这条路径最容易出错的地方。
+
+119. **回归可以增量跑：`run_regression.py` 会跳过"上次 PASS 且产物未变"的
+     用例**（2026-10-13）：全套 31 例 = **25 分钟**，而绝大多数是几十~两百秒
+     的 GUI 用例；只改了某一块渲染功能却把其余 30 例重跑一遍纯属浪费。
+     机制：
+     * 缓存 `_venn_verify/_regression/_cache.json` 里存一个**产物指纹** +
+       一份 PASS 名单。指纹 = `build/bin` **下所有文件**（含 Editor.exe 与被
+       拷过去的 .spv / 材质 / 模型 / 场景）+ `tools/*.py` 的
+       `(相对路径, 大小, mtime_ns)` 的 SHA1。
+     * **必须覆盖整个 `build/bin`，不能只看 exe 的 mtime** —— 改一个
+       `.comp`/`.vert` 只触发"拷贝到 bin"、exe 本身不重链接，只看 exe 就会
+       错误地跳过已失效的用例。
+     * **`run_regression.py` 自己不算在指纹里**：它是"跑法"（跳过策略、
+       输出格式），不影响任何用例的判定；算进去的话动一次本文件就让整份
+       缓存作废、白等 25 分钟。
+     * 指纹对不上 → 缓存**整体作废**、全跑（并打印一行说明）。
+     * **只有 PASS 进缓存**：FAIL 的用例会被丢弃 → 下次一定重跑。这正是
+       我们要的"失败必复现"。
+     * **明确写出的用例名永远跑**（`python tools/run_regression.py bvh`
+       是"我就要看这个"，不是"顺手带上"）；`--all` 无视缓存全跑；
+       `--no-cache` 不读也不写。
+     * 实测收益：30 例命中缓存时 **25 分钟 → 18.6 秒**。
+
+120. **glslang：采样器数组的"非常量下标"要显式声明扩展，且 `#extension`
+     必须排在所有非预处理记号之前**（2026-10-13，R2-3）：
+     ```glsl
+     #version 450
+     #if VENN_BINDLESS
+     #extension GL_EXT_nonuniform_qualifier : require
+     #endif
+     ```
+     不声明就编不过：`error: 'variable index' : required extension not
+     requested: GL_EXT_nonuniform_qualifier`。有点反直觉 —— 下标来自 push
+     常量（**动态 uniform**，严格说不需要 `nonuniformEXT()`，也不会生成
+     `NonUniform` 装饰），但 glslang 只要看到"非常量下标访问不透明类型数组"
+     就要求这个扩展。声明之后生成的 SPIR-V 会带
+     `OpCapability RuntimeDescriptorArray` + `OpExtension
+     "SPV_EXT_descriptor_indexing"` —— 所以设备侧必须开
+     `runtimeDescriptorArray` 与 `descriptorIndexing`（本引擎已在
+     `Device::createLogicalDevice` 里开）。
+     第二半条同样要命：`#extension` 只能出现在**任何非预处理记号之前**
+     （只有 `#version` 能排在它前面）。把它写在"用到它的那段声明旁边"
+     （比如文件中部 `layout(set=1...)` 之前）会直接报 "extension directive
+     must occur before any non-preprocessor tokens"。
+
+121. **bindless 纹理数组的容量必须按设备收窄，不能硬写**
+     （2026-10-13，R2-3）：`vkCreateDescriptorSetLayout` 的
+     `descriptorCount` 受 `maxPerStageDescriptorSamplers`（原文
+     `maxPerStageDescriptorSampledImages`）约束 —— 独显上这个值是 1048576，
+     但**集显可能只有 128**，硬写 4096 会在别的机器上直接建不出 layout。
+     做法：`capacity = min(kMaxTextures, limits.maxPerStageDescriptorSamplers)`，
+     低于 64 就当设备不支持（返回 false → 调用方降级成关闭）。
+     注意 update-after-bind 那几个上限（`maxPerStageDescriptorUpdateAfterBind*`）
+     在 **`VkPhysicalDeviceVulkan12Properties`** 里，不在
+     `VkPhysicalDeviceLimits` 里（写 `lim.maxPerStageDescriptorUpdateAfterBindSamplers`
+     会直接编译不过）—— 要查就得再挂一条 pNext，本引擎刻意只查核心 limits
+     （更保守的那个）。另外 `descriptorBindingPartiallyBound` 之后这个上限
+     严格说不再被强制（我们只访问写过的槽），收窄只是省内存 + 避开驱动差异。
+
+122. **bindless 的材质页表必须"按帧槽分离"，否则会撕裂在途读取**
+     （2026-10-13，R2-3）：页号是**每帧惰性分配**的（`beginFrame` 把该槽的
+     页计数清零、整表重写）。如果只有一份页表，重写它的时候上一帧的 GPU
+     还在读 —— 典型的 host-write vs GPU-read 竞争。做法：页表缓冲与描述符集
+     都按 `MAX_FRAMES_IN_FLIGHT` 各一份，`beginFrame` 只在**拿到 in-flight
+     栅栏之后**调（和 `ClusteredLighting::beginFrame`、自动曝光回读同一个
+     位置、同一条理由）。这也是"页号只在帧内稳定、跨帧可能变"的根源 ——
+     所以页号必须逐 draw push，**不能缓存在材质对象上**。
+     纹理数组那一侧相反：下标是**跨帧稳定**的（惰性注册、永不回收），
+     所以只需要在注册/句柄变化时写一次描述符（池是 UPDATE_AFTER_BIND 的，
+     在途帧安全）。
+
+123. **默认定义为 0 的编译开关不能用 `#ifdef` 判断**
+     （2026-10-13，R2-3）：pbr.frag 的惯例是"每个关键字都给一个默认定义"
+     （`#ifndef VENN_NORMAL_MAP / #define VENN_NORMAL_MAP 0`），这样直接
+     `glslc` 不带 `-D` 编出来就是全关。加 `VENN_BINDLESS` 时如果写成
+     `#ifdef VENN_BINDLESS`，那么文件中部那条 `#define VENN_BINDLESS 0`
+     之后所有 `#ifdef` 都恒为真 —— 症状是"基线的 .spv 里也走了 bindless
+     分支"，编译不报错、画面全错。正确写法是 `#if VENN_BINDLESS`
+     （未定义时 `#if` 按 0 处理，所以文件最顶部那条 `#extension` 守卫
+     也能用同一个写法）。区分方式：**关键字位**才用 `#if VENN_XXX`
+     + 默认定义；**全局开关**（instancing / mdi / bindless）用
+     `#ifdef` + 只在 CMake 里 `-D`（沿用 pbr.vert 的既有写法）。

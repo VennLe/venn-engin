@@ -447,6 +447,58 @@ void applyCamera(Camera& cam, const json& jc) {
     cam.setFov(jc.value("fov", cam.fov()));
 }
 
+// ============================================================
+// 后处理体积（scene/PostVolume.h）
+// ============================================================
+
+json postVolumeToJson(const PostVolume& v) {
+    return json{
+        {"name", v.name},
+        {"boundsMin", vec3ToJson(v.boundsMin)},
+        {"boundsMax", vec3ToJson(v.boundsMax)},
+        {"priority", v.priority},
+        {"blendDistance", v.blendDistance},
+        {"dofFocus", v.dofFocus},
+        {"dofAperture", v.dofAperture},
+        {"dofMaxRadius", v.dofMaxRadius},
+        {"motionBlurStrength", v.motionBlurStrength},
+        {"chromaStrength", v.chromaStrength},
+        {"vignetteStrength", v.vignetteStrength},
+        {"dof", v.dof},
+        {"motionBlur", v.motionBlur},
+        {"chromatic", v.chromatic},
+        {"vignette", v.vignette},
+    };
+}
+
+PostVolume postVolumeFromJson(const json& j) {
+    PostVolume v;
+    if (!j.is_object()) return v;
+    v.name = j.value("name", std::string());
+    v.boundsMin = vec3FromJson(j.contains("boundsMin") ? j["boundsMin"]
+                                                      : json(nullptr),
+                               v.boundsMin);
+    v.boundsMax = vec3FromJson(j.contains("boundsMax") ? j["boundsMax"]
+                                                      : json(nullptr),
+                               v.boundsMax);
+    v.priority = j.value("priority", v.priority);
+    v.blendDistance = j.value("blendDistance", v.blendDistance);
+    // ⚠ 缺省值必须是 kNoOverride 而不是结构体默认 —— 用 j.value("x", v.x)
+    //   写法时，JSON 里没写的项本来就是 v.x（= -1 = 不覆盖），语义正合；
+    //   这里显式写出来是为了让"没写 = 不覆盖"这条约定在源码里看得见。
+    v.dofFocus = j.value("dofFocus", v.dofFocus);
+    v.dofAperture = j.value("dofAperture", v.dofAperture);
+    v.dofMaxRadius = j.value("dofMaxRadius", v.dofMaxRadius);
+    v.motionBlurStrength = j.value("motionBlurStrength", v.motionBlurStrength);
+    v.chromaStrength = j.value("chromaStrength", v.chromaStrength);
+    v.vignetteStrength = j.value("vignetteStrength", v.vignetteStrength);
+    v.dof = j.value("dof", v.dof);
+    v.motionBlur = j.value("motionBlur", v.motionBlur);
+    v.chromatic = j.value("chromatic", v.chromatic);
+    v.vignette = j.value("vignette", v.vignette);
+    return v;
+}
+
 json lightToJson(const Light& L) {
     return json{
         {"direction", vec3ToJson(L.direction)},
@@ -611,7 +663,23 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
     root["version"] = kFormatVersion;
     root["generator"] = "Venn/SceneSerializer";
     root["camera"] = cameraToJson(scene.camera());
+    // 多相机：0 号相机同时也写在顶层 "camera"（旧场景 / 旧读取器仍认它），
+    // 额外相机列在这里。读的时候以 "camera" 为准覆盖 0 号，再从 "cameras"
+    // 补齐 1..n —— 两个字段都能单独改而不会互相打架。
+    if (scene.cameraCount() > 1) {
+        json cams = json::array();
+        for (size_t i = 1; i < scene.cameraCount(); ++i)
+            cams.push_back(cameraToJson(scene.camera(i)));
+        root["cameras"] = std::move(cams);
+    }
     root["light"] = lightToJson(scene.light());
+    // 后处理体积（相机级效果的场景化覆盖）：为空时不写，旧场景文件不含它。
+    if (!scene.postVolumes().empty()) {
+        json vols = json::array();
+        for (const PostVolume& v : scene.postVolumes().volumes())
+            vols.push_back(postVolumeToJson(v));
+        root["postVolumes"] = std::move(vols);
+    }
 
     root["entities"] = json::array();
     for (const Item& it : items) {
@@ -721,8 +789,24 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
 
     applyCamera(scene.camera(), root.contains("camera") ? root["camera"]
                                                         : json(nullptr));
+    // 额外相机（多相机）。顶层 "camera" 已经钉好 0 号，这里从 1 号起补。
+    if (root.contains("cameras") && root["cameras"].is_array()) {
+        const json& cams = root["cameras"];
+        for (size_t i = 0; i < cams.size(); ++i) {
+            Camera& cam = (scene.cameraCount() > i + 1)
+                              ? scene.camera(i + 1)
+                              : scene.camera(scene.addCamera());
+            applyCamera(cam, cams[i]);
+        }
+    }
     applyLight(scene.light(), root.contains("light") ? root["light"]
                                                      : json(nullptr));
+
+    // 后处理体积
+    if (root.contains("postVolumes") && root["postVolumes"].is_array()) {
+        for (const json& jv : root["postVolumes"])
+            scene.postVolumes().add(postVolumeFromJson(jv));
+    }
 
     if (!root.contains("entities") || !root["entities"].is_array()) {
         r.ok = true;  // 只有相机/光照的空场景也算成功

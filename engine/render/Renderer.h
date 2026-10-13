@@ -75,8 +75,11 @@
 
 #include "render/FrameResources.h"
 #include "render/Frustum.h"
+#include "render/GpuTimer.h"
 #include "render/RenderTypes.h"
 #include "render/ScreenSpaceSettings.h"
+#include "render/CameraEffects.h"
+#include "render/RenderTarget.h"
 #include "render/ShadowPass.h"
 #include "render/LocalShadowPass.h"
 #include "render/ShaderKeywords.h"
@@ -86,6 +89,9 @@
 #include "render/PostProcess.h"
 #include "render/ClusteredLighting.h"
 #include "render/Environment.h"
+#include "render/HiZOcclusion.h"
+#include "render/MdiDraw.h"
+#include "render/Bindless.h"
 
 #include "ui/ImGuiManager.h"
 #include "assets/Texture.h"
@@ -94,6 +100,7 @@
 #include "ecs/Entity.h"
 #include "scene/Light.h"
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -168,6 +175,31 @@ public:
     // 后处理参数（ImGui 面板直接改）
     PostSettings& postSettings() { return m_post->settings(); }
 
+    // 自动曝光（R1-2）的当前值 / 开关（面板显示用）
+    float autoExposureValue() const {
+        return m_post ? m_post->autoExposureValue() : 1.0f;
+    }
+    bool autoExposureEnabled() const {
+        return m_post && m_post->settings().autoExposure;
+    }
+
+    // ============================================================
+    // 相机级后处理效果（景深 / 运动模糊 / 色差 / 暗角）
+    //
+    // 这是**基础值**（ImGui 面板改的就是它）。每帧会叠加"后处理体积"
+    // （scene.postVolumes()）在相机位置处的覆盖值，得到生效值
+    // （effectiveCameraEffects()）再下发：
+    //   · dof / motionBlur → FrameGraph 链（前向后，读深度与相机矩阵）
+    //   · chromatic / vignette → PostProcess 合成（tonemap 后，显示域）
+    // 全部默认关（暗角默认 0.25 是引入本模块前的既有值）。
+    // ============================================================
+    CameraEffectSettings& cameraEffects() { return m_cameraFx; }
+    const CameraEffectSettings& cameraEffects() const { return m_cameraFx; }
+    // 本帧叠加体积覆盖后的生效值
+    const CameraEffectSettings& effectiveCameraEffects() const {
+        return m_effectiveCameraFx;
+    }
+
     // ============================================================
     // 屏幕空间效果（SSAO / 高度雾 / SSGI / SSR / God rays）
     //
@@ -182,6 +214,75 @@ public:
     ScreenSpaceSettings& screenSpaceSettings() { return m_screenSpace; }
     const ScreenSpaceSettings& screenSpaceSettings() const {
         return m_screenSpace;
+    }
+
+    // ============================================================
+    // Hi-Z 遮挡剔除（R2-1）
+    //
+    // 视锥剔除只问"在不在画面里"；这一项补上"在画面里但被更近的几何
+    // 盖住了"。开启后每帧在**前向 pass 之后**建一张 Hi-Z 深度金字塔、
+    // 把本帧的候选 AABB 逐个与它比较，结果回读到 CPU，**延迟两帧**
+    // 作用到绘制列表（被判定完全遮挡的实体不进不透明/透明列表）。
+    //
+    // 默认**关**：关闭时不录任何 compute、不剔任何东西 → 逐像素回到基线。
+    // 打开时也只剔"整块都躲在更近几何后面"的物体（判据见
+    // occlusion_test.comp 顶部的一串保守条件）→ 画面不该有可见变化。
+    //
+    // 环境变量：MYVK_HIZ=1 开、MYVK_HIZ_BIAS 覆盖深度偏置(NDC)、
+    //           MYVK_HIZ_DBG=1 打诊断日志。
+    // ============================================================
+    bool& occlusionCullingEnabled() { return m_occlusionCullingEnabled; }
+    bool occlusionCullingEnabled() const { return m_occlusionCullingEnabled; }
+    const render::HiZStats& hizStats() const {
+        static const render::HiZStats kEmpty{};
+        return m_hiz ? m_hiz->stats() : kEmpty;
+    }
+    float& hizDepthBias() { return m_hizBiasNdc; }
+
+    // ============================================================
+    // Multi-draw indirect + GPU 紧凑化（R2-2，见 render/MdiDraw.h）
+    //
+    // 依赖 R2-1：打开 MDI 会自动带上遮挡剔除（Hi-Z）、合批与深度预通道
+    // —— 前两个是它的数据来源与前提，第三个是"本帧深度"的来源。
+    // 打开后前向 pass 的不透明几何改走**每组一次** vkCmdDrawIndexedIndirect
+    // （组 = 同管线 + 同材质），提交量从 O(物体数) 降到 O(材质数)。
+    //
+    // 默认**关**：关闭时零 compute、零间接命令 → 逐像素回到基线。
+    // 环境变量：MYVK_MDI=1 开、MYVK_MDI_DBG=1 打每帧 MDI-STATS。
+    // ============================================================
+    bool& mdiEnabled() { return m_mdiEnabled; }
+    bool mdiEnabled() const { return m_mdiEnabled; }
+    const render::MdiStats& mdiStats() const {
+        static const render::MdiStats kEmpty{};
+        return m_mdi ? m_mdi->stats() : kEmpty;
+    }
+
+    // ============================================================
+    // Bindless / descriptor indexing（R2-3，见 render/Bindless.h）
+    //
+    // 打开后材质不再各占 set 1..6：所有贴图进 set 1 binding 0 的运行时
+    // 数组，材质页号 per-draw push 进 push 常量 —— 一个 draw 只绑 2 个
+    // 描述符集（set 0 / set 1），且**纹理数量完全不影响绑定次数**。
+    //
+    // 默认**关**：关闭时 set 布局、.spv、push 内容全部走旧路径 →
+    // 逐像素回到基线（这是所有新效果的对照约定）。
+    //
+    // 硬前提：设备支持 descriptor indexing 的整套特性（Device::supportsBindless）。
+    // 设备不支持时即使 MYVK_BINDLESS=1 也不会打开，只打一行日志。
+    // 环境变量：MYVK_BINDLESS=1 开、MYVK_BINDLESS_DBG=1 打每帧统计。
+    // ============================================================
+    bool bindlessEnabled() const { return m_bindlessEnabled; }
+    // 运行时切换（编辑器勾选框）。代价 = 一次 waitIdle + 整组前向管线重建：
+    // set 1 的布局与片元 .spv 都变了，而这两者绑在管线对象上，改不了。
+    // 关闭时会把 m_bindless 整个放掉（回到"每材质 6 个 set"的旧路径）。
+    void setBindlessEnabled(bool on);
+    // 设备是否**有能力**开（与 bindlessEnabled() 不同：后者是"当前开着"）
+    bool bindlessSupported() const {
+        return m_device && m_device->supportsBindless();
+    }
+    const render::BindlessStats& bindlessStats() const {
+        static const render::BindlessStats kEmpty{};
+        return m_bindless ? m_bindless->stats() : kEmpty;
     }
 
     // 分簇光照（灯列表 / 簇 / 统计）
@@ -316,6 +417,9 @@ public:
     struct RenderStats {
         uint32_t renderables = 0;       // 索引里的网格实体总数（剔除前）
         uint32_t culledFrustum = 0;     // 被视锥剔除的数量
+        // Hi-Z 遮挡剔除（R2-1）：在视锥**内**、但被更近几何完全挡住的
+        // 数量（延迟两帧回读的结果）。开启遮挡剔除时 <= 视锥候选数。
+        uint32_t culledOcclusion = 0;
         uint32_t drawnOpaque = 0;       // 实际提交的不透明物体数
         uint32_t drawnTransparent = 0;  // 实际提交的透明物体数
         uint32_t gizmosCulled = 0;      // 被剔除的灯可视化小球数
@@ -324,6 +428,16 @@ public:
         // GPU instancing：不透明列表聚合出的批数（items - batches = 省下的
         // draw call）。instancing 关闭时与 drawnOpaque 相等。
         uint32_t opaqueBatches = 0;
+        // Multi-draw indirect（R2-2）：本帧真正发出的 vkCmdDrawIndexedIndirect
+        // 次数（= 同管线同材质的组数）与 GPU 紧凑化后画出的实例数。
+        // 组数 vs drawnOpaque 就是"CPU 提交量从 O(物体数) 降到 O(材质数)"。
+        uint32_t mdiSubmissions = 0;
+        uint32_t mdiBatches = 0;
+        uint32_t mdiInstances = 0;
+        // Bindless（R2-3）：已注册进纹理数组的张数、本帧用掉的材质页数。
+        // 关着时全 0（旧路径一张纹理一个 set，没有"数组下标"这个概念）。
+        uint32_t bindlessTextures = 0;
+        uint32_t bindlessPages = 0;
         // 本帧视锥查询实际访过的 BVH 节点数。渲染统计里最有用的一条：
         // 它和 renderables 一比就知道树有没有建歪（退化成全遍历时
         // 会逼近 nodeCount）。
@@ -351,6 +465,43 @@ public:
         uint32_t variantSwitches = 0;
     };
     const RenderStats& renderStats() const { return m_stats; }
+
+    // GPU 时戳剖析（R0-1）：各 pass 耗时（毫秒）。nullptr / !valid() =
+    // 设备不支持时戳；lastTotalMs() < 0 = 本帧还没有读回数据。
+    const GpuTimer* gpuTimer() const { return m_gpuTimer.get(); }
+
+    // ============================================================
+    // 调试视图模式（R0-2，docs/render_roadmap.md）
+    //
+    //   Lit             默认，原渲染路径（逐像素不变）
+    //   Unlit           纯反照率（无光照/阴影）
+    //   Normal          世界空间法线可视化
+    //   Roughness / Metallic  材质参数灰度图
+    //   Wireframe       LINE 光栅（需 fillModeNonSolid 特性），固定绿色
+    //   Overdraw        additive 累加（重叠越多越亮），depth 不测试
+    //   LightComplexity 簇内灯数热度图
+    //
+    // 前 5 种与 LightComplexity 走 pbr.frag 的 viewModeParams.x 分支
+    // （运行时 uniform，UE 同款取舍）；Wireframe/Overdraw 额外换管线。
+    // 阴影 pass / 深度预通道 / 分簇 compute 不受影响 —— 只覆盖前向
+    // 片元输出。初始值可用 MYVK_VIEW_MODE=<0..7> 设置。
+    // ============================================================
+    enum class ViewMode : uint32_t {
+        Lit = 0,
+        Unlit,
+        Normal,
+        Roughness,
+        Metallic,
+        Wireframe,
+        Overdraw,
+        LightComplexity,
+    };
+    static const char* viewModeName(ViewMode m);
+    ViewMode viewMode() const { return m_viewMode; }
+    void setViewMode(ViewMode m);
+    // Wireframe 依赖 fillModeNonSolid 特性；不支持的设备上返回 false，
+    // setViewMode(Wireframe) 会回退 Lit。
+    bool wireframeAvailable() const { return m_fillModeNonSolid; }
 
     // ============================================================
     // Shader 变体 / 关键字（见 render/ShaderKeywords.h）
@@ -412,14 +563,34 @@ public:
     uint64_t viewportTextureId() const;
 
     // ============================================================
+    // 通用 RenderTarget API（见 render/RenderTarget.h）
+    //
+    // 每个 RenderTarget = 一套 HdrTarget + PostProcess + ImGui 输出纹理，
+    // 自管尺寸与生命周期。主视口与角色预览都是它的实例（0 号 / 1 号）。
+    // 新增离屏视角（小地图 / 反射探针 / 画中画）= createRenderTarget()
+    // + 绑场景与相机，不再改动主链代码。
+    // ============================================================
+    size_t renderTargetCount() const { return m_targets.size(); }
+    render::RenderTarget* renderTarget(size_t index) {
+        return index < m_targets.size() ? m_targets[index].get() : nullptr;
+    }
+    render::RenderTarget* mainRenderTarget() { return m_mainTarget; }
+    render::RenderTarget* previewRenderTarget() { return m_previewTarget; }
+    // 追加一个离屏目标（初始尺寸 0 = 未激活），返回其下标
+    size_t createRenderTarget();
+    uint64_t renderTargetTextureId(size_t index) const;
+
+    // 多相机：主视口用 scene.camera(index) 渲染（0 = 默认相机）。
+    // 相机由场景持有（Scene::camera(i) / addCamera，见 scene/Scene.h）。
+    void setViewCameraIndex(size_t index) { m_viewCameraIndex = index; }
+    size_t viewCameraIndex() const { return m_viewCameraIndex; }
+
+    // ============================================================
     // 角色详情窗口的独立预览渲染目标（UE5 Persona 的预览视口）
     //
-    // 主视口与预览视口要**同时**显示、尺寸不同、相机不同、场景不同，
-    // 所以不能复用上面那套单例离屏链 —— 这里给 Renderer 加第二套
-    // HdrTarget + PostProcess + 离屏输出图，专门渲染角色窗口的预览场景。
-    // drawPreview() 与 drawFrame() 在同一次 drawFrame 调用内先后执行，
-    // 共用同一份 FrameUBO / 骨骼 SSBO / 灯数据缓冲（这些是每帧一份的
-    // 全局资源，按场景内容各自上传后再录制对应 pass）。
+    // 主视口与预览视口要**同时**显示、尺寸不同、相机不同、场景不同 ——
+    // 预览就是一个绑定了"预览场景 + 其相机"的 RenderTarget（1 号）。
+    // drawFrame() 内主场景录制完毕后，继续把预览场景渲染到它。
     // ============================================================
     void setPreviewSize(uint32_t width, uint32_t height);
     bool previewActive() const {
@@ -427,8 +598,10 @@ public:
     }
     uint64_t previewTextureId() const;
     // 设置 / 清除"本帧要额外渲染的预览场景"（角色详情窗口持有）。
-    // 非空时，主场景录制完毕后、同一命令缓冲内继续把它渲染到预览离屏图。
     void setPreviewScene(scene::Scene* scene) { m_previewScene = scene; }
+    // 额外视角（验证 / 演示用）：MYVK_EXTRA_VIEW=1 时建一个 2 号目标，
+    // 用主场景的 camera(1) 渲染，证明"通用 RT + 多相机"确实开箱可用。
+    bool extraViewEnabled() const { return m_extraTarget != nullptr; }
 
 private:
     void createFrameResources();
@@ -437,13 +610,30 @@ private:
     void createLightGizmoMesh();
     void createShadowPass();
     void createEnvironment();
-    void createHdrTarget();
-    void createPostProcess();
+    // 主视口离屏目标（0 号）：建 HdrTarget + PostProcess + 离屏纹理。
+    // 取代过去分开的 createHdrTarget / createPostProcess —— 两者本就是
+    // "一个离屏目标"的两半，现在合到 RenderTarget 里一起建。
+    void createMainTarget();
+    // 每帧把"后处理体积覆盖"叠加到基础相机效果上，得到生效值并下发到
+    // PostProcess（色差 / 暗角）。FrameGraph 的 DoF / 运动模糊直接读
+    // effectiveCameraEffects()。
+    void updateCameraEffects(scene::Scene& scene);
+    // 录制一个"非主"离屏目标（预览 / 额外视角）：上传它绑定的场景状态 →
+    // 录几何 → 跑后处理。与主视口的差别只有"跳过阴影与分簇 compute"。
+    void recordOffscreenTarget(VkCommandBuffer cmd,
+                               render::RenderTarget& target);
     // 屏幕空间效果模块的创建 / 重建（SSAOPass + FrameGraph）。
     // recreate 版在"渲染分辨率或 MSAA 变了"的所有路径上调用
     // （applyViewportSize / recreateSwapchain / setSampleCount）。
     void createScreenSpace();
     void recreateScreenSpace();
+    // 0 号目标重建后，把 PostProcess 的输入重接到"当前应有的源"：
+    // 链激活 → FrameGraph 的输出工作图；否则 → HDR resolve 视图。
+    // ⚠ 必须在 recreateScreenSpace() **之后**调用 —— 链激活时
+    //   postInputViews() 返回的是 FrameGraph 的工作图，而那批图的句柄
+    //   要等 FrameGraph 按新尺寸重建后才更新；先取就会把**即将销毁**的
+    //   旧视图写进描述符（验证层报 invalid VkImageView）。
+    void rewireMainTargetChainInput();
     // PostProcess 应该采样的输入视图：链激活时 = FrameGraph 的输出
     // 工作图，否则 = HDR resolve 视图（基线路径，逐像素不变）。
     std::vector<VkImageView> postInputViews() const;
@@ -452,29 +642,48 @@ private:
     void createClusteredLighting();
     void createPipelines();
     void writeGlobalDescriptors();
+    // 给**指定** set 0 写全部 15 个 binding。frameIndex 决定阴影图 / SSBO /
+    // SSAO 图用哪一份（每帧在途各一套，必须对应）；ubo 是该 set 的 binding 0。
+    // writeGlobalDescriptors 用它对"主链 set"与"各离屏目标的 set"各写一遍 ——
+    // 两者只差 binding 0（各目标自己的相机 UBO），其余完全共享。
+    void writeGlobalSet(VkDescriptorSet set, uint32_t frameIndex, VkBuffer ubo);
+    // 懒建"某离屏目标本帧的相机 UBO 槽"（建 buffer + set 0 + 写全部 binding）。
+    // slot = 离屏目标序号（0 起）。返回槽结构。
+    FrameResources::OffscreenUbo& ensureOffscreenUbo(uint32_t slot);
     // 每张交换链图像一个"渲染完成"信号量（避免与呈现操作复用冲突）
     void createRenderFinishedSemaphores();
     void destroyRenderFinishedSemaphores();
     void recreateSwapchain();
     // 应用新的视口尺寸：重建 HdrTarget / 分簇 / 后处理 / ImGui 纹理
     void applyViewportSize();
-    void createViewportTextures();
-    void destroyViewportTextures();
+    // DRS 的缩放比变化后重建一整套随分辨率走的资源（HdrTarget / 屏幕空间
+    // 链 / 分簇 / PostProcess）。与 applyViewportSize 同一套序列，只是
+    // 尺寸没变、变的是 PostSettings::renderScale。
+    void applyRenderScale();
+    // 懒创建 1 号目标（角色预览，第一次打开角色窗口时才建）
+    render::RenderTarget* ensurePreviewTarget();
     // 预览离屏链的尺寸应用（独立于主视口）
     void applyPreviewSize();
-    void createPreviewTextures();
-    void destroyPreviewTextures();
     // 把指定场景的相机 / 灯 / 蒙皮数据上传到本帧全局缓冲。
     // extent 指定该场景的渲染分辨率（主视口用 renderExtent()，
     // 预览视口用预览尺寸）。resetSkinning 为 true 时清空蒙皮映射与
     // SSBO 偏移（主场景），false 时追加（预览场景紧接主场景之后）。
+    // camOverride 非空时用它代替 scene.camera()（多相机：主视口可选
+    // camera(i)，离屏目标用自己的相机）。
+    // offscreenSlot >= 0 时把相机 UBO 写进"该离屏目标的本帧槽"而不是
+    // 主链 UBO（见 FrameResources::OffscreenUbo 的注释），并把本场景要用的
+    // set 0 记进 m_sceneGlobalSet 供紧随其后的 recordSceneInto 使用。
     void uploadSceneState(scene::Scene& scene, VkExtent2D extent,
-                          bool resetSkinning);
+                          bool resetSkinning,
+                          const scene::Camera* camOverride = nullptr,
+                          int offscreenSlot = -1);
     // 把 scene 的几何录制进指定 HdrTarget（阴影 + 深度预通道 + 分簇 + 前向）。
     // isPreview=true 时跳过阴影 pass 与分簇 compute（预览与主场景共享这些
     // 全局缓冲，且主场景的采样命令已录制在先，避免无同步竞争）。
+    // globalSet = 该场景要绑的 set 0（主链或某个离屏目标的）。
     void recordSceneInto(VkCommandBuffer cmd, scene::Scene& scene,
-                         class HdrTarget& hdr, bool isPreview);
+                         class HdrTarget& hdr, bool isPreview,
+                         VkDescriptorSet globalSet);
     // 在同一个命令缓冲内录制预览场景（主场景之后调用）。
     void recordPreview(VkCommandBuffer cmd);
     void recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
@@ -488,6 +697,11 @@ private:
                   const glm::mat4& model, const assets::Material& mat,
                   const assets::Mesh& mesh, uint32_t instanceCount = 1,
                   uint32_t firstInstance = 0);
+    // set 1..6（albedo / normal / orm / roughness / metallic / emissive）的
+    // 绑定，缺省时用中性贴图。drawMesh 与 MDI 路径共用 —— 两处的贴图
+    // 顺序/缺省规则必须完全一致，否则同一材质会在两条路径下长得不一样。
+    void bindMaterialTextures(VkCommandBuffer cmd, VkPipelineLayout layout,
+                              const assets::Material& mat);
     // 不透明合批：排序 + 聚合 + 写实例 SSBO（buildDrawLists 尾部调用）。
     void buildOpaqueBatches();
     // 蒙皮：遍历场景里的 SkinnedMeshComponent，采样关节矩阵写入骨骼 SSBO，
@@ -521,6 +735,10 @@ private:
         // 前向两条路径各取一次掩码，算两遍既费又可能不一致。
         // 材质为空（只有深度预通道会画）时保持 kKeywordNone。
         KeywordMask keywords = kKeywordNone;
+        // 该项在 Hi-Z 候选表（m_hizAabbScratch）里的下标；-1 = 没进候选表
+        // （网格没有包围盒）。R2-2 要按**批序**重排候选 AABB，所以必须
+        // 能从这里找回它，不能只靠"两个表的顺序恰好一样"。
+        int32_t hizSlot = -1;
     };
 
     // 构建本帧绘制列表。isMain 为 true 时累积 RenderStats（预览场景是
@@ -618,8 +836,18 @@ private:
     std::vector<VkSemaphore> m_renderFinished;  // 每交换链图像一个
     std::unique_ptr<render::ShadowPass> m_shadowPass;
     std::unique_ptr<render::LocalShadowPass> m_localShadowPass;
-    std::unique_ptr<render::HdrTarget> m_hdrTarget;
-    std::unique_ptr<render::PostProcess> m_post;
+    // ---- 通用离屏目标（见 render/RenderTarget.h）----
+    // m_targets 拥有全部目标；下面三个是**非拥有**的便捷句柄：
+    //   [0] 主视口（常驻）  [1] 角色预览（懒建）  [2] 额外视角（env）
+    // 主链的 m_hdrTarget / m_post 也指向 m_targets[0] 内部 —— 保留成裸
+    // 指针是**故意的**：Renderer 全文有近 60 处 m_hdrTarget->/m_post->
+    // 调用，改成裸指针后这些调用点一行都不用动。
+    std::vector<std::unique_ptr<render::RenderTarget>> m_targets;
+    render::RenderTarget* m_mainTarget = nullptr;
+    render::RenderTarget* m_previewTarget = nullptr;
+    render::RenderTarget* m_extraTarget = nullptr;
+    render::HdrTarget* m_hdrTarget = nullptr;
+    render::PostProcess* m_post = nullptr;
     std::unique_ptr<render::ClusteredLighting> m_lighting;
     std::unique_ptr<render::Environment> m_environment;
     std::unique_ptr<ui::ImGuiManager> m_imgui;
@@ -627,6 +855,53 @@ private:
     // ---- 屏幕空间效果（见 screenSpaceSettings() 的注释）----
     std::unique_ptr<render::SSAOPass> m_ssao;
     std::unique_ptr<render::FrameGraph> m_frameGraph;
+
+    // ---- Hi-Z 遮挡剔除（R2-1，见 occlusionCullingEnabled() 的注释）----
+    std::unique_ptr<render::HiZOcclusion> m_hiz;
+    bool m_occlusionCullingEnabled = false;
+    float m_hizBiasNdc = 1.0e-3f;   // 遮挡判定的 NDC 深度偏置（保守）
+
+    // ---- Multi-draw indirect（R2-2）----
+    std::unique_ptr<render::MdiDraw> m_mdi;
+    bool m_mdiEnabled = false;
+    bool m_mdiDbg = false;
+    // 每帧重建的草稿（避免每帧分配）：源目录 / 物体→批号 / 命令 / 提交组，
+    // 以及按**批序**重排过的候选 AABB（与目录同下标）。
+    std::vector<render::MdiInstance> m_mdiCatalogScratch;
+    std::vector<uint32_t> m_mdiObjBatchScratch;
+    std::vector<render::MdiDrawCommand> m_mdiCmdScratch;
+    std::vector<render::MdiSubmitGroup> m_mdiGroupScratch;
+    std::vector<render::HiZAabb> m_mdiAabbScratch;
+    // 把本帧的绘制列表 + 批表翻译成 MDI 的四个缓冲（buildDrawLists 尾部调）。
+    bool buildMdiFrameData();
+    // 本帧 MDI 数据是否已就绪（buildDrawLists 里置位，recordFrame 里读）。
+    // 之所以要存一份：buildDrawLists 跑在录制**之前**，到 recordFrame 里
+    // 再判一次"目录/命令是否齐"就得重算，且两处的判据容易走偏。
+    bool m_mdiStaged = false;
+    bool m_hizDbg = false;
+
+    // ---- Bindless / descriptor indexing（R2-3）----
+    // m_bindless 非空 = 设备支持且当前开着（两者必须同时成立，别只看
+    // m_bindlessEnabled()：设备不支持时后者会被 init 打回 false）。
+    std::unique_ptr<render::BindlessTextures> m_bindless;
+    bool m_bindlessEnabled = false;
+    bool m_bindlessDbg = false;
+    // 逐 draw 把材质页号压进 push.emissive.w（关闭时恒 1.0 = 旧值）。
+    // 放在这里是为了让 drawMesh / MDI 两条提交路径共用同一个口径。
+    float materialPageCode(const assets::Material& mat);
+    // set 1..6 用的布局：bindless 时是那一份"纹理数组 + 页表"的布局，
+    // 否则是老的"单纹理"布局。管线描述的 setLayouts 与 grid/sky 的
+    // 对齐都必须走它 —— 两处用了不同的对象就会踩"set 0 被中途打断"
+    // 那条 VUID（见 createPipelines 里栅格那段说明）。
+    VkDescriptorSetLayout pipelineTexSetLayout() const {
+        return m_bindless ? m_bindless->setLayout() : m_textureSetLayout;
+    }
+    // 本帧候选 AABB（与上传给 GPU 的顺序一一对应）。回读时用它把 vis 的
+    // 下标映射回实体 —— 顺序错了就会剔错物体，是这一块最容易踩的坑。
+    std::vector<render::HiZAabb> m_hizAabbScratch;
+    std::vector<ecs::Entity> m_hizSlotEntities[MAX_FRAMES_IN_FLIGHT];
+    // 两帧前判定"被遮挡"的实体集合（buildDrawLists 按它过滤候选）。
+    std::unordered_map<uint32_t, uint8_t> m_occludedSet;
     render::ScreenSpaceSettings m_screenSpace;
     // 接线状态缓存：与 m_screenSpace 的开关比对，变了才付重接的代价
     bool m_chainWired = false;   // FrameGraph 链 → PostProcess 输入
@@ -637,20 +912,85 @@ private:
     glm::mat4 m_viewProj{1.0f};       // proj*view（太阳屏幕投影用）
     float m_camNear = 0.1f;
     float m_camFar = 200.0f;
+    // uploadSceneState 算出的"本场景要绑的 set 0"：
+    //   主视口 = 本帧的 globalUBOSet；
+    //   离屏目标 = 它自己的相机 UBO 槽（见 FrameResources::OffscreenUbo）。
+    // recordSceneInto 紧接着用它，避免两处各自重算一遍。
+    VkDescriptorSet m_sceneGlobalSet = VK_NULL_HANDLE;
 
     // ---- 纹理能力（构造函数从环境变量读，textureContext() 下发）----
     bool m_texMipmaps = false;      // MYVK_MIPMAP=1：RGBA8 纹理生成 mip 链
     bool m_texStream = false;       // MYVK_TEXSTREAM=1：DDS mip 分帧补传
     float m_anisoOverride = -1.0f;  // MYVK_ANISO 覆盖；<0 = 设备上限
 
-    // ---- 角色详情窗口的独立预览离屏链 ----
-    std::unique_ptr<render::HdrTarget> m_previewHdrTarget;
-    std::unique_ptr<render::PostProcess> m_previewPost;
+    // ---- 相机效果（景深 / 运动模糊 / 色差 / 暗角）+ 后处理体积 ----
+    // 基础值（UI 改） / 生效值（每帧叠加体积覆盖后下发）
+    render::CameraEffectSettings m_cameraFx;
+    render::CameraEffectSettings m_effectiveCameraFx;
+    // 主视口用哪台相机（scene.camera(index)）
+    size_t m_viewCameraIndex = 0;
+    // 重投影矩阵（运动模糊 + TAA 共用）：clipFromView =
+    // prevViewProj × inverse(view)。把"视图空间点 → 上一帧屏幕 uv"整条链
+    // 压成一个矩阵。**两侧都用未抖动的投影**（TAA 的抖动只进光栅化），
+    // 于是相机静止时严格推出"速度 0"。
+    //
+    // ⚠ 这里修掉了引入 TAA 时发现的一个既有错误：以前算的是
+    //   viewProj × inverse(view) —— 两者相乘恰好等于 proj 本身，
+    //   于是运动模糊只对"投影变化"有反应，相机真正平移/旋转时反而不动
+    //   （verify_camfx 的 B2/B3 之所以能过，是因为它们走 MYVK_MB_SIM_YAW
+    //   钩子直接覆盖了这个矩阵）。正确形式必须把**上一帧的 viewProj**
+    //   带进来。
+    glm::mat4 m_clipFromView{1.0f};  // 本帧用（每帧在 uploadSceneState 里算）
+    glm::mat4 m_prevViewProj{1.0f};  // 上一帧未抖动 viewProj
+    glm::mat4 m_curViewProj{1.0f};   // 本帧未抖动 viewProj（帧末滚进 m_prev）
+    bool m_hasPrevFrame = false;
+
+    // ---- 自动曝光（R1-2）----
+    // 每帧 dt 从 steady_clock 量（指数的适应速度用它换算 alpha）。
+    // 首帧用一个 60fps 的估计值，避免 dt 巨大把曝光一次拉到底。
+    std::chrono::steady_clock::time_point m_lastFrameTime{};
+    float m_frameDt = 1.0f / 60.0f;
+    // MYVK_AUTOEXP_DBG=1：每帧一行 AUTOEXP 日志（回归脚本读它画收敛曲线）
+    bool m_autoExposureDbg = false;
+    // MYVK_CG_DBG=1：每帧一行 LUT-INFO 日志（色彩分级回归读它）
+    bool m_colorGradingDbg = false;
+    // MYVK_DRS_DBG=1：每帧一行 DRS 日志（动态分辨率回归读它画缩放曲线）
+    bool m_drsDbg = false;
+    // 自动曝光的 EV 偏置：面板改的是"基础值"（存在 PostSettings 里），
+    // 后处理体积可以按相机位置覆盖它。这两个成员做"回声检测" ——
+    // 值 != 上一次写下去的值就说明面板动过 → 更新基础值。
+    float m_aeBiasBase = 0.0f;
+    float m_aeBiasApplied = 0.0f;
+    // 色彩分级 LUT 混合权重同理：面板值 = 基础值，后处理体积可按位置覆盖。
+    float m_cgBlendBase = 1.0f;
+    float m_cgBlendApplied = 1.0f;
+    // MYVK_MB_SIM_YAW=<度>：验证钩子 —— 静态相机下人为制造偏航角速度，
+    // 让运动模糊的重投影路径可被端到端验证（正常使用不设 = 0）。
+    float m_mbSimYaw = 0.0f;
+    // ---- TAA 的抖动相位 ----
+    // Halton(2,3) 序列的下标 —— **按帧槽（frame-in-flight）各持一个**！
+    //
+    // 为什么不能用一个全局计数器：历史图是按帧槽分开累积的（TAA 在
+    // 帧 f 读的是 f-2 留在同槽里的结果），所以"槽 0 的帧号"永远是偶数、
+    // "槽 1 的帧号"永远是奇数。若相位按帧号递增，槽 0 就只见过偶数相位、
+    // 槽 1 只见过奇数相位 —— 两个槽收敛到**不同的** 4 相位平均，
+    // 屏幕上以半帧率来回切这两张图，而且抓哪一张取决于抓拍瞬间的奇偶，
+    // 跨运行不可复现（verify_taa 的"两次运行逐像素一致"就是这么挂的）。
+    // 每槽各自 +1 之后，两个槽都遍历全部 8 个相位、收敛到同一张图。
+    uint32_t m_taaPhase[2] = {0u, 0u};
+    // MYVK_TAA_PHASE=<0..7>：验证钩子 —— **冻结**抖动相位（不随帧推进），
+    // 且即使 TAA 关着也照加抖动。配合 8 次运行（相位 0..7，TAA=0，MSAA=1）
+    // 可在 Python 侧离线平均出"8 次亚像素重采样"的参考图，再与 TAA 的
+    // 收敛结果对照。正常使用不设 = -1（不冻结、TAA 关则无抖动）。
+    int m_taaForcePhase = -1;
+    // MYVK_EXTRA_VIEW=1：建一个额外离屏目标（2 号）做通用 RT 演示 / 验证
+    bool m_extraViewWanted = false;
+
+    // ---- 角色详情窗口的预览（1 号 RenderTarget）----
     uint32_t m_previewWidth = 0;
     uint32_t m_previewHeight = 0;
+    // 面板拖动了尺寸 → 下一帧录制前应用（不能在 ImGui 构建期重建资源）
     bool m_previewDirty = false;
-    std::vector<VkDescriptorSet> m_previewTextureSets;
-    std::vector<VkImageView> m_previewTextureViews;
     // 本帧要额外渲染的预览场景（角色详情窗口持有，非空才录制预览）。
     scene::Scene* m_previewScene = nullptr;
 
@@ -673,6 +1013,22 @@ private:
     bool m_sceneFrustumValid = false;
     bool m_frustumCullingEnabled = true;
     RenderStats m_stats;
+    // ---- GPU 时戳剖析（R0-1）----
+    // 每帧在命令缓冲里对各 pass 打 begin/end 时戳，fence 之后读回。
+    // 默认开（开销 = 每帧 18 个 query 写，微秒级）；MYVK_GPU_TIMER=0 关。
+    // 只写 query pool，不触碰渲染资源 —— 开关与画面无关。
+    std::unique_ptr<GpuTimer> m_gpuTimer;
+    bool m_gpuTiming = true;
+
+    // ---- 调试视图模式（R0-2）----
+    ViewMode m_viewMode = ViewMode::Lit;
+    bool m_fillModeNonSolid = false;  // 物理设备特性（wireframe 前提）
+    // Wireframe / Overdraw 的独立管线（与变体族共用 layout，frag 都是
+    // pbr.k0 —— 输出固定色，材质差异只剩顶点变换）。
+    std::unique_ptr<rhi::Pipeline> m_wireframePipeline;
+    std::unique_ptr<rhi::Pipeline> m_overdrawPipeline;
+    // 这两种模式的几何绘制改走它；其余返回 null（着色器分支即可）
+    rhi::Pipeline* viewModeDebugPipeline();
     // 本帧的绘制列表（buildDrawLists 填充）。透明表已按到相机距离降序排好。
     std::vector<DrawItem> m_opaqueDraws;
     std::vector<DrawItem> m_transparentDraws;
@@ -785,16 +1141,10 @@ private:
     bool m_gridEnabled = false;
     GridSettings m_grid;
 
-    // ---- 编辑器视口（0,0 = 关闭）----
+    // ---- 编辑器视口（0,0 = 关闭；尺寸/纹理都在 m_targets[0] 里）----
     uint32_t m_viewportWidth = 0;
     uint32_t m_viewportHeight = 0;
     bool m_viewportDirty = false;
-    // 每帧一张 ImGui 纹理（引用该帧的离屏输出图）
-    std::vector<VkDescriptorSet> m_viewportTextureSets;
-    // 注册这些纹理时引用的离屏 image view。
-    // 重建时先比对：视图没变就**不**注销重注册 —— 否则本帧已经构建好的
-    // ImGui 绘制数据会指向刚被释放的描述符集（编辑器 resize 时的经典坑）。
-    std::vector<VkImageView> m_viewportTextureViews;
 
     uint32_t m_currentFrame = 0;
     bool m_framebufferResized = false;

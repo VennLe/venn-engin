@@ -132,6 +132,38 @@ void Device::createLogicalDevice() {
         m_maxAnisotropy = 1.0f;
     }
 
+    // 采样器数组的动态索引（Vulkan 1.0 核心特性，桌面驱动基本全有）。
+    // bindless 的 `textures[材质页.tex0.x]` 需要它 —— 不过请求它并不会
+    // 影响任何既有路径：没有着色器索引采样器数组时它等于没开。
+    if (feats2.features.shaderSampledImageArrayDynamicIndexing) {
+        feats2.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    }
+
+    // ---- Bindless / descriptor indexing（R2-3）----
+    // 一整组特性，**要么全开要么全不开**：只开一半会让"运行时补注册纹理"
+    // 或"数组尾部留空"变成未定义行为，而且往往要等到跑到某个场景才崩。
+    // 缺任何一个就整体不去 set，supportsBindless() 返回 false。
+    const bool bindlessOK =
+        vk12.descriptorIndexing &&
+        vk12.runtimeDescriptorArray &&
+        vk12.shaderSampledImageArrayNonUniformIndexing &&
+        vk12.descriptorBindingPartiallyBound &&
+        vk12.descriptorBindingSampledImageUpdateAfterBind;
+    if (bindlessOK) {
+        vk12.descriptorIndexing = VK_TRUE;
+        vk12.runtimeDescriptorArray = VK_TRUE;
+        // 索引来自 push 常量（逐 draw 一次 = 动态 uniform），严格说
+        // nonUniform 用不上；照样开是为了让"以后把材质页塞进 SSBO 逐
+        // 片元查"（R2-4 visibility buffer）不用回头改设备特性。
+        vk12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+        vk12.descriptorBindingPartiallyBound = VK_TRUE;
+        vk12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+        m_descriptorIndexing = true;
+    }
+    VK_LOG_INFO("Device: descriptor indexing %s",
+                m_descriptorIndexing ? "available (bindless usable)"
+                                     : "UNAVAILABLE (bindless disabled)");
+
     const char* extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
     VkDeviceCreateInfo ci{};

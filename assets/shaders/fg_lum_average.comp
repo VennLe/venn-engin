@@ -1,0 +1,68 @@
+#version 450
+// ============================================================
+// fg_lum_average.comp —— 自动曝光（R1-2）第三步：直方图 → 平均亮度
+//
+// 单 invocation（箱数只有 128，串行扫一遍比并行归约更简单也更快）。
+//
+// 做法（UE histogram eye adaptation 的经典形式）：
+//   1. 数出总样本数 total；
+//   2. 按**百分位裁剪**：丢掉最暗 2% 与最亮 2%（离群：纯黑背景、
+//      太阳/自发光高光），只让中间 96% 参与平均；
+//   3. 在 log2 轴上求加权平均 → 几何平均亮度（单位：档）。
+//
+// 输出写进一张 HOST_VISIBLE 缓冲，CPU 在**两帧之后**回读它
+// （那时该帧的 in-flight 栅栏已过，读到的一定是完整结果）。
+// ============================================================
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 1) buffer Bins { uint bins[]; };
+layout(set = 0, binding = 2) buffer Result { float result[]; };
+
+layout(push_constant) uniform PC {
+    vec4 params;  // x = 箱数 y = log2 下限 z = log2 上限 w = 保留
+} pc;
+
+// 百分位裁剪比例（两端各丢这么多）
+const float kClip = 0.02;
+
+void main() {
+    const uint binCount = uint(pc.params.x + 0.5);
+    const float logLo = pc.params.y;
+    const float logHi = pc.params.z;
+    const float step = (logHi - logLo) / float(binCount);
+
+    uint total = 0u;
+    for (uint i = 0u; i < binCount; ++i) total += bins[i];
+
+    if (total == 0u) {
+        result[0] = 0.0;  // 平均 log2 亮度
+        result[1] = 0.0;  // 参与统计的样本数
+        result[2] = 0.0;  // 总样本数
+        return;
+    }
+
+    const uint skipLow = uint(float(total) * kClip);
+    const uint skipHigh = uint(float(total) * (1.0 - kClip));
+
+    uint acc = 0u;
+    float sum = 0.0;
+    uint used = 0u;
+    for (uint i = 0u; i < binCount; ++i) {
+        const uint c = bins[i];
+        if (c == 0u) continue;
+        const uint start = acc;
+        acc += c;
+        const uint end = acc;
+        // 整箱落在裁剪窗口之外 → 丢
+        if (end <= skipLow || start >= skipHigh) continue;
+        // 跨窗的箱先按整箱计入（128 箱的粒度下这点误差可忽略）
+        const float binLog2 = logLo + (float(i) + 0.5) * step;
+        sum += binLog2 * float(c);
+        used += c;
+    }
+
+    result[0] = used > 0u ? sum / float(used) : 0.0;
+    result[1] = float(used);
+    result[2] = float(total);
+}

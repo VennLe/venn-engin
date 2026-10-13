@@ -1,0 +1,57 @@
+#version 450
+// ============================================================
+// occlusion_test.comp —— AABB vs Hi-Z 的遮挡测试（R2-1）
+//
+// 一个 invocation 负责一个物体的世界空间 AABB：投影 → 选 mip → 在该 mip
+// 上采样 Hi-Z 取 max → 判定"物体最近点是否仍比区域最远遮挡体更远"。
+// 判据的**全部数学**都在 hiz_test.glsl::vennHizOccluded 里，与 R2-2 的
+// mdi_compact.comp 共用同一份实现（两边判据必须逐字相同，否则会出现
+// "CPU 说可见、GPU 说被挡"这类随机丢物体的分歧）。
+//
+// 本 pass 只负责把判据的结果写成 vis 标志位，供 CPU 两帧后回读。
+//
+// ---- 为什么延迟两帧才生效 ----
+// 结果写进 vis SSBO，由 CPU 在**两帧后**（该帧 in-flight 栅栏过后）读回，
+// 再作用到绘制列表。所以本帧采样的 Hi-Z 是"两帧前的视角"—— 相机快速
+// 运动时可能剔多，但因为有那一串保守判据 + 深度偏置，实际只会在
+// 物体彻底被挡时命中，不会出现明显的 pop。
+//
+// （R2-2 的 GPU-driven 路径不走这里 —— 它在同一个命令缓冲里
+//   建金字塔 → 测 → 紧凑化 → 间接绘制，零帧延迟。见 mdi_compact.comp。）
+// ============================================================
+
+#include "hiz_test.glsl"
+
+layout(local_size_x = 64) in;
+
+// Hi-Z 金字塔（全 mip 链）—— 用 textureLod 显式指定层，采样器用 NEAREST
+layout(set = 0, binding = 0) uniform sampler2D hizTex;
+
+// 物体的世界 AABB：每 2 个 vec4 一个盒子（lo.xyz / hi.xyz）
+layout(std430, set = 0, binding = 1) readonly buffer AabbBuffer {
+    vec4 aabbs[];
+};
+
+// 可见性：1 = 可见（要画），0 = 被遮挡（可剔）
+layout(std430, set = 0, binding = 2) writeonly buffer VisBuffer {
+    uint vis[];
+};
+
+layout(push_constant) uniform PC {
+    mat4 viewProj;   // 未抖动的 proj * view（与深度渲染只差亚像素抖动）
+    // x = 物体数 y = 深度偏置(NDC) z = 最大 mip w = 保留
+    vec4 params;
+    // x = 宽 y = 高 z = 1/宽 w = 1/高（屏幕像素换算）
+    vec4 screen;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.params.x)) return;
+
+    const bool occluded =
+        vennHizOccluded(aabbs[i * 2u + 0u].xyz, aabbs[i * 2u + 1u].xyz,
+                        pc.viewProj, hizTex, pc.params.z, pc.params.y,
+                        pc.screen.xy);
+    vis[i] = occluded ? 0u : 1u;
+}

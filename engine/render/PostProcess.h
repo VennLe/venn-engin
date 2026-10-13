@@ -52,6 +52,9 @@
 namespace rhi {
 class Device;
 class Pipeline;
+class ComputePipeline;
+class Buffer;
+class CommandPool;
 class DescriptorAllocator;
 }
 
@@ -64,8 +67,75 @@ struct PostSettings {
     float bloomKnee = 0.4f;       // 软过渡带宽
     float bloomStrength = 0.30f;  // bloom 叠加强度（0 = 关闭）
     int   tonemapMode = 0;        // 0=ACES 1=Reinhard 2=Clamp
-    float vignette = 0.25f;       // 暗角强度
     bool  fxaa = false;           // FXAA 后处理抗锯齿（MYVK_FXAA=1 默认开）
+
+    // ---- 自动曝光（直方图 eye adaptation，R1-2）----
+    // 与 exposure **二选一**：
+    //   · autoExposure = false → 用 exposure（手动滑条），与引入本模块
+    //     之前逐像素一致（回归基线）；
+    //   · autoExposure = true  → 用后台测出的自适应值；exposure 滑条
+    //     保留原值（当"起始值"与"关掉后的回退值"，不会被覆盖）。
+    //
+    //   exposureKey   = 目标中间灰：让"平均亮度 × 曝光"落在这里。
+    //                   0.18 是摄影上的中灰（UE 默认量级）。
+    //   exposureSpeed = 适应速度（1/秒）：越大收敛越快、越容易"呼吸"。
+    //   exposureMin/Max = 曝光夹紧（防止对着纯黑/纯亮场景发散）。
+    //   exposureBias  = EV 偏置（+1 亮一档）。后处理体积可覆盖。
+    bool  autoExposure = false;
+    float exposureKey = 0.18f;
+    float exposureSpeed = 3.0f;
+    float exposureMin = 0.02f;
+    float exposureMax = 8.0f;
+    float exposureBias = 0.0f;
+
+    // ---- 色彩分级 LUT（32³，R1-3）----
+    // lift / gamma / gain 各三通道 + 对比度 + 饱和度 → 在 CPU 侧烘成
+    // 32³ 3D LUT → 合成 pass 里一次三线性采样（tonemap 之后、暗角之前）。
+    //
+    // 关闭（默认）→ 合成走与引入前**逐像素相同**的路径（回归基线）。
+    // 开启且参数全默认 → 烘出恒等 LUT，画面几乎不变（见着色器注释：
+    // 恒等是仿射映射，硬件三线性可精确重建）。
+    bool  colorGrading = false;
+    float cgLutBlend = 1.0f;                              // LUT 混合权重
+    float cgLift[3]  = {0.0f, 0.0f, 0.0f};                // 阴影抬升
+    float cgGamma[3] = {1.0f, 1.0f, 1.0f};                // 中间调 gamma
+    float cgGain[3]  = {1.0f, 1.0f, 1.0f};                // 高光增益
+    float cgContrast = 1.0f;                              // 对比度（绕 0.5）
+    float cgSaturation = 1.0f;                            // 饱和度（绕亮度）
+
+    // ---- 动态分辨率（DRS，R1-4）----
+    // 场景按 renderScale 缩小渲染（HdrTarget / 深度 / 屏幕空间链 / TAA /
+    // bloom 全部跟着缩），合成 pass 再升采样回全分辨率的输出。
+    // 关闭（默认）→ renderScale = 1.0 → **逐像素回到基线**。
+    //
+    //   dynamicRes   = 总开关。关着时 renderScale 强制 1.0。
+    //   drsAuto      = true 按 GPU 帧耗时自动调；false 用 renderScale 手动值。
+    //   renderScale  = 当前生效的缩放比（自动模式下由控制器更新）。
+    //   drsTargetMs  = 目标 GPU 帧时间（ms）—— 自动模式的调节目标。
+    //   drsMin/MaxScale = 缩放夹紧。
+    //   drsSharpness = 升采样的边缘锐度（0 = 纯双线性）。
+    bool  dynamicRes = false;
+    bool  drsAuto = true;
+    float renderScale = 1.0f;
+    float drsTargetMs = 16.6f;
+    float drsMinScale = 0.5f;
+    float drsMaxScale = 1.0f;
+    float drsSharpness = 0.6f;
+};
+
+// 由"输出分辨率"与缩放比算出"场景渲染分辨率"。
+// 规则：四舍五入、下限 16（避免极小图）、上限不超过输出（不放大渲染）。
+// RenderTarget（HdrTarget 尺寸）与 PostProcess（内部 extent）共用同一个
+// 函数 —— 两处必须逐位一致，否则 HdrTarget 与 PostProcess 对不上。
+VkExtent2D scaledRenderExtent(VkExtent2D out, float scale);
+
+// 相机级"显示域"效果（色差 + 暗角）—— 走合成的第二个推常量 vec4。
+// 由 Renderer 每帧从 CameraEffectSettings（含后处理体积覆盖）同步进来。
+// 景深 / 运动模糊不在这里（它们在 FrameGraph 链上，需要深度与相机矩阵）。
+struct PostCameraFx {
+    float chroma = 0.0f;          // 径向色差强度（0 = 关）
+    float vignette = 0.25f;       // 暗角强度（引入本模块前就在合成里，默认 0.25）
+    float vignettePower = 1.0f;   // 暗角的径向幂（>1 更压向边缘）
 };
 
 class PostProcess {
@@ -91,8 +161,11 @@ public:
 
     // 是否处于"场景 → 离屏图"模式（编辑器视口）
     bool offscreen() const { return m_splitOutput; }
-    // 场景渲染分辨率（模式 A = 交换链尺寸；模式 B = 视口尺寸）
+    // 场景渲染分辨率（**缩放后**；模式 A = 交换链尺寸 × renderScale，
+    // 模式 B = 视口尺寸 × renderScale）。HdrTarget / 链 / bloom 都用它。
     VkExtent2D sceneExtent() const { return m_sceneExtent; }
+    // 全分辨率输出尺寸（交换链 / 视口本身）—— 合成 / FXAA / 离屏输出图用它。
+    VkExtent2D outputExtent() const { return m_outExtent; }
     VkExtent2D swapchainExtent() const { return m_swapExtent; }
     // 离屏输出视图（供 ImGui_ImplVulkan_AddTexture 注册成纹理）
     VkImageView sceneOutputView(uint32_t frameIndex) const;
@@ -115,6 +188,67 @@ public:
 
     PostSettings& settings() { return m_settings; }
     const PostSettings& settings() const { return m_settings; }
+
+    // 相机级显示域效果（色差 / 暗角）。Renderer 每帧写 —— 含后处理体积
+    // 的覆盖结果。默认 = 只在合成里应用 0.25 的暗角（既有基线）。
+    void setCameraFx(const PostCameraFx& fx) { m_cameraFx = fx; }
+    const PostCameraFx& cameraFx() const { return m_cameraFx; }
+
+    // ============================================================
+    // 自动曝光（R1-2）
+    // ============================================================
+    // 每帧在 **in-flight 栅栏之后、录制命令之前** 调用：
+    //   · 回读"两帧前"写好的直方图结果（那时该帧的栅栏已过，读到的一定
+    //     是完整数据 —— 与 ClusteredLighting::beginFrame 同一套时序）；
+    //   · 求目标曝光、按 dt 做指数平滑。
+    // 录制命令时用的就是这个平滑后的值（recordComposite / 亮部提取）。
+    void beginFrame(uint32_t frameIndex, float dt);
+
+    // 回归钩子：跳过回读，把"测量到的平均亮度"直接钉死成给定值
+    // （>0 生效）。让收敛曲线与场景内容解耦，断言才是确定性的。
+    void setAutoExposureSimLum(float lum) { m_aeSimLum = lum; }
+
+    // 本帧生效的曝光：autoExposure 关 ⇒ **精确等于** settings().exposure
+    float effectiveExposure() const {
+        return m_settings.autoExposure ? m_aeValue : m_settings.exposure;
+    }
+    // 诊断读数（日志 / 验证脚本用）
+    float autoExposureAvgLog2() const { return m_aeAvgLog2; }
+    float autoExposureAvgLum() const;  // exp2(avgLog2)
+    float autoExposureSamples() const { return m_aeSamples; }
+    float autoExposureTarget() const { return m_aeTarget; }
+    float autoExposureTargetRaw() const { return m_aeTargetRaw; }
+    float autoExposureValue() const { return m_aeValue; }
+
+    // ============================================================
+    // 色彩分级 LUT（32³，R1-3）
+    // ============================================================
+    // LUT 每轴的纹素数。
+    static constexpr uint32_t kLutSize = 32;
+    // LUT 资源是否就绪（构造时一次建好，与场景分辨率无关）。
+    bool lutReady() const { return m_lutView != VK_NULL_HANDLE; }
+    // 诊断：最近一次烘焙出来的 LUT 是否等价于恒等映射（参数全默认时）。
+    bool lutIdentity() const { return m_lutIdentity; }
+    // 强制下一帧重烘（参数改了但没走 beginFrame 的差异检测时用；面板
+    // 改动无需调用 —— beginFrame 会自动比对烘焙快照）。
+    void markLutDirty() { m_lutDirty = true; }
+
+    // ============================================================
+    // 动态分辨率（DRS，R1-4）
+    // ============================================================
+    // 当前生效的缩放比（= settings().renderScale）。RenderTarget 建
+    // HdrTarget 时读它，必须与 PostProcess 内部的 m_sceneExtent 一致。
+    float renderScale() const { return m_settings.renderScale; }
+
+    // 每帧在 **in-flight 栅栏之后** 调用，喂入平滑后的 GPU 帧时间（ms，
+    // <=0 表示时戳不可用）。内部按 drsTargetMs 调整 renderScale（指数
+    // 趋近 + 死区 + 量化 + 冷却，避免每帧重建资源）。
+    // 返回 true 表示"量化后的缩放比变了" → 调用方必须走重建路径
+    // （HdrTarget / 屏幕空间链 / 分簇 / PostProcess 全都要重新分配）。
+    bool updateDynamicResolution(float gpuFrameMs);
+    // 诊断读数（日志 / 验证脚本）
+    float drsSmoothedMs() const { return m_drsSmoothedMs; }
+    float drsLastFrameMs() const { return m_drsLastMs; }
 
 private:
     struct BloomFrame {
@@ -164,9 +298,103 @@ private:
     void buildDescriptorSets(const std::vector<VkImageView>& hdrColorViews);
     void destroyDescriptors();
 
+    // ---- 自动曝光的亮度测量链（R1-2）----
+    // 资源尺寸**固定**（与场景分辨率无关）→ 只在构造/析构里建销，
+    // 不参与 resize / MSAA 变化的 recreate（少一大块状态）。
+    //   场景色 --(片元降采样)--> 64×64 块平均 log2 亮度图
+    //        --(compute 直方图)--> 128 箱 bins
+    //        --(compute 归约+百分位裁剪)--> 平均 log2 亮度（HOST_VISIBLE）
+    void createAeResources();
+    void destroyAeResources();
+    void buildAeDescriptorSets();
+    // 录制三步测量链（只在 autoExposure 开时被调用）
+    void recordAutoExposure(VkCommandBuffer cmd, uint32_t fi);
+
+    // ---- 色彩分级 LUT（R1-3）----
+    // 资源尺寸固定（32³）→ 构造/析构里建销，不参与 resize。
+    void createLutResources();
+    void destroyLutResources();
+    // 把 settings 里的 lift/gamma/gain/contrast/saturation 烘成 32³ 格点，
+    // 上传到 m_lutImage。waitIdle 后走一次性命令缓冲（staging 拷贝 + 布局
+    // 迁移）。只在参数变化时调用（beginFrame 里比对快照）。
+    void bakeLut();
+    // 参数快照与当前 settings 不一致 → 重烘
+    bool gradingChanged() const;
+    void snapshotGrading();
+    // beginFrame 里调用：脏了就重烘
+    void rebakeLutIfDirty();
+
+    // 亮度图尺寸 / 直方图箱数 / 每纹素分层采样数（log2 轴范围）
+    static constexpr uint32_t kLumWidth = 64;
+    static constexpr uint32_t kLumHeight = 64;
+    static constexpr uint32_t kAeBins = 128;
+    static constexpr uint32_t kLumSamplesPerTexel = 4;
+    static constexpr float kAeLogLo = -10.0f;  // 2^-10 ≈ 0.001
+    static constexpr float kAeLogHi = 10.0f;   // 2^+10 = 1024
+
+    struct LumFrame {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkFramebuffer fb = VK_NULL_HANDLE;  // 挂在 m_lumRenderPass 上
+    };
+
+    // 亮度图专用 RenderPass：附件与 bloom 图同格式（省一个格式支持性风险），
+    // 但同步语义是**为 compute 写的** —— 见 PostProcess.cpp 的注释。
+    VkRenderPass m_lumRenderPass = VK_NULL_HANDLE;
+    std::unique_ptr<rhi::Pipeline> m_lumPipeline;           // 片元降采样
+    std::unique_ptr<rhi::ComputePipeline> m_histPipeline;   // 直方图
+    std::unique_ptr<rhi::ComputePipeline> m_avgPipeline;    // 归约
+    VkDescriptorSetLayout m_aeSetLayout = VK_NULL_HANDLE;
+    std::vector<LumFrame> m_lum;
+    std::vector<std::unique_ptr<rhi::Buffer>> m_aeBins;
+    std::vector<std::unique_ptr<rhi::Buffer>> m_aeResult;
+    std::vector<float*> m_aeResultMapped;
+    std::vector<VkDescriptorSet> m_aeSets;
+
+    // CPU 侧的自适应状态
+    float m_aeValue = 1.0f;       // 平滑后的当前曝光
+    float m_aeTarget = 1.0f;      // 本帧目标（夹紧后）
+    float m_aeTargetRaw = 1.0f;   // 本帧目标（夹紧前）
+    float m_aeAvgLog2 = 0.0f;
+    float m_aeSamples = 0.0f;
+    float m_aeSimLum = 0.0f;      // >0 → 跳过回读（回归钩子）
+    bool  m_aeWasOn = false;      // 上升沿检测：关→开时以手动值为起点
+
+    // ---- 色彩分级 LUT（R1-3）----
+    // 32³ 3D 纹理 + 一个独立描述符集（set 2，单 binding）。
+    // 为什么不用 rhi::Image：那是 2D-only 的封装，不支持 VK_IMAGE_TYPE_3D。
+    // 为什么格式是 16F：8-bit 会在暗部量化出可见台阶（恒等 LUT 的采样
+    // 误差被 sRGB 编码在近黑处放大）；16F 又能被绝大多数设备三线性过滤。
+    // 为什么单张（不分帧）：LUT 在帧间恒定，读出是只读 → 全帧槽共用一个集。
+    VkImage m_lutImage = VK_NULL_HANDLE;
+    VkDeviceMemory m_lutMemory = VK_NULL_HANDLE;
+    VkImageView m_lutView = VK_NULL_HANDLE;
+    VkFormat m_lutFormat = VK_FORMAT_UNDEFINED;
+    VkDescriptorSet m_lutSet = VK_NULL_HANDLE;
+    std::unique_ptr<rhi::CommandPool> m_uploadPool;   // 仅烘焙时用（一次）
+    bool m_lutDirty = true;       // 构造后第一次 beginFrame 必烘
+    bool m_lutIdentity = true;    // 最近一次烘焙是否恒等（诊断）
+    // 上一次烘焙用的参数快照（beginFrame 比对，变了才重烘）
+    float m_cgLift[3] = {0.0f, 0.0f, 0.0f};
+    float m_cgGamma[3] = {1.0f, 1.0f, 1.0f};
+    float m_cgGain[3] = {1.0f, 1.0f, 1.0f};
+    float m_cgContrast = 1.0f;
+    float m_cgSaturation = 1.0f;
+
+    // ---- 动态分辨率（DRS，R1-4）的 CPU 侧状态 ----
+    // 平滑后的 GPU 帧时间（指数滑动平均）+ 最近一次原始读数 + 冷却计数。
+    // 冷却的意义：缩放比一变就要 waitIdle + 重建一整批图（HDR / 深度 /
+    // bloom / 链），太频繁会明显卡顿 —— 因此量化到 1/16 步进 + 至少隔
+    // 若干帧才允许再变。
+    float m_drsSmoothedMs = 0.0f;
+    float m_drsLastMs = 0.0f;
+    int   m_drsCooldown = 0;
+
     // 全屏三角形 Pass 的通用管线构造（无顶点缓冲 / 无深度）
     std::unique_ptr<rhi::Pipeline> makeFullscreenPipeline(
-        VkRenderPass renderPass, const char* fragSpv, uint32_t setCount);
+        VkRenderPass renderPass, const char* fragSpv, uint32_t setCount,
+        uint32_t pushSize);
 
     // 在指定 render pass 内画一个全屏三角形到指定 framebuffer
     // （bloom 三连传 m_bloomRenderPass；FXAA 按目标传 m_postRenderPass 或
@@ -174,7 +402,7 @@ private:
     void drawFullscreen(VkCommandBuffer cmd, VkRenderPass renderPass,
                         rhi::Pipeline& pipeline, VkFramebuffer fb,
                         VkExtent2D extent, const VkDescriptorSet* sets,
-                        uint32_t setCount, const float push[4]);
+                        uint32_t setCount, const void* push, uint32_t pushSize);
 
     // 合成 + Tonemap。targetExtent/RP/pipeline 由调用方按模式选择。
     // overlay 非空时在其中绘制（必须落在同一个 RenderPass 实例内）。
@@ -191,7 +419,7 @@ private:
                               VkRenderPass rp, rhi::Pipeline& pipeline,
                               VkExtent2D targetExtent,
                               const VkDescriptorSet* sets, uint32_t setCount,
-                              const float push[4],
+                              const void* push, uint32_t pushSize,
                               const std::function<void(VkCommandBuffer)>*
                                   overlay);
 
@@ -219,7 +447,8 @@ private:
 
     bool m_splitOutput = false;         // 模式 B
     VkExtent2D m_swapExtent{0, 0};      // 交换链尺寸
-    VkExtent2D m_sceneExtent{0, 0};     // 场景渲染尺寸
+    VkExtent2D m_outExtent{0, 0};       // 全分辨率输出（视口 / 交换链）
+    VkExtent2D m_sceneExtent{0, 0};     // 场景渲染尺寸 = m_outExtent × renderScale
     VkExtent2D m_bloomExtent{0, 0};     // = m_sceneExtent / kBloomDownscale
 
     std::vector<BloomFrame> m_bloom;
@@ -235,6 +464,7 @@ private:
     std::vector<VkDescriptorSet> m_fxaaSets;
 
     PostSettings m_settings;
+    PostCameraFx m_cameraFx;
 };
 
 } // namespace render

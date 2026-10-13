@@ -1,0 +1,58 @@
+#version 450
+// ============================================================
+// fg_lum_histogram.comp —— 自动曝光（R1-2）第二步：亮度直方图
+//
+// 读上一步的"块平均对数亮度图"（64×64 = 4096 个样本），在 log2
+// 亮度轴上分 128 箱做直方图。
+//
+// 为什么用直方图而不是直接求平均：
+//   自动曝光最怕**离群值** —— 画面里一个小太阳就足以把平均值拉高
+//   十倍，曝光会整帧压暗。直方图让下一步可以按**百分位裁剪**
+//   （丢掉最暗 2% 与最亮 2%），只统计主体亮度，这正是 UE 的
+//   "histogram eye adaptation" 的做法。
+//
+// 为什么每个 workgroup 先在 shared memory 里累加：
+//   4096 个样本直接对全局 bins 做 atomicAdd，热门箱（比如大面积
+//   天空落在一两个箱里）会串行化。先在 shared 里攒、最后每箱只
+//   对全局发一次原子，冲突降一个数量级。
+//
+// 本 pass 由 average pass 收尾：bins → 平均对数亮度 → 回读缓冲。
+// ============================================================
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D lumTex;   // 块平均 log2 亮度
+layout(set = 0, binding = 1) buffer Bins { uint bins[]; };
+layout(set = 0, binding = 2) buffer Result { float result[]; };
+
+layout(push_constant) uniform PC {
+    vec4 params;  // x = 图宽 y = 图高 z = 箱数（<= 128） w = 保留
+    vec4 range;   // x = log2 下限 y = log2 上限 z/w 保留
+} pc;
+
+// 每 workgroup 的私有直方图（箱数上限 128）
+shared uint sHist[128];
+
+void main() {
+    const uint binCount = uint(pc.params.z);
+    const uint lane = gl_LocalInvocationIndex;
+    const uint lanes = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+
+    for (uint i = lane; i < 128u; i += lanes) sHist[i] = 0u;
+    barrier();
+
+    const ivec2 size = ivec2(int(pc.params.x + 0.5), int(pc.params.y + 0.5));
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < size.x && p.y < size.y) {
+        const float avgLog2 = texelFetch(lumTex, p, 0).r;
+        const float t = (avgLog2 - pc.range.x) / (pc.range.y - pc.range.x);
+        const uint b = uint(clamp(t, 0.0, 0.999999) * float(binCount));
+        atomicAdd(sHist[b], 1u);
+    }
+    barrier();
+
+    // 每箱只对全局发一次原子
+    for (uint i = lane; i < binCount; i += lanes) {
+        if (sHist[i] > 0u) atomicAdd(bins[i], sHist[i]);
+    }
+}

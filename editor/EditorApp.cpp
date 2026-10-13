@@ -118,6 +118,13 @@ void EditorApp::onInit() {
     assets::AssetManager& am = assets();
 
     m_ctx = std::make_unique<EditorContext>(am);
+    // Engine 面板默认收起；自动化按需打开（MYVK_ENGINE_PANEL=1）：
+    // 面板里的 View mode（R0-2）/ MSAA 下拉是"控件存在性"验证的对象
+    // （VM-COMBO 标签）。不能用 automationRun() 一刀切 —— 面板里的
+    // "Lights/cluster: avg %.2f" 每帧微变，会毁掉逐像素对照轮。
+    if (std::getenv("MYVK_ENGINE_PANEL")) {
+        m_ctx->panels().engine = true;
+    }
     m_scripts = std::make_unique<ScriptEngine>();
     m_split = std::make_unique<SplitLayout>();
     m_toolbar = std::make_unique<Toolbar>(*m_ctx);
@@ -1269,8 +1276,48 @@ void EditorApp::drawStatsPanel() {
             ImGui::TextDisabled("(culled %u, lights %u)", rs.culledFrustum,
                                 rs.gizmosCulled);
         }
+        // Hi-Z 遮挡剔除：occl = 本帧因"被挡住"没进绘制列表的物体数；
+        // tested = 两帧前那次 GPU 实际测过的候选数（上限 kMaxObjects）。
+        if (r.occlusionCullingEnabled()) {
+            const render::HiZStats& hs = r.hizStats();
+            ImGui::SameLine();
+            ImGui::TextDisabled("| Hi-Z tested %u, occluded %u (%u mips)",
+                                hs.objects, rs.culledOcclusion, hs.mipCount);
+        }
         ImGui::Text("Draw calls: %u   Triangles: %u", rs.drawCalls,
                     rs.triangles);
+
+        // ---- GPU 耗时瀑布（R0-1）----
+        // 时戳来自 query pool（上一帧读回），单位毫秒。≈0 的段（效果
+        // 关闭 / 没有离屏窗口）灰显 —— 看一眼就知道 GPU 时间花在哪。
+        if (const render::GpuTimer* gt = r.gpuTimer()) {
+            if (gt->valid() && gt->lastTotalMs() >= 0.0f) {
+                ImGui::Separator();
+                float maxSeg = 0.0f;
+                for (uint32_t s = 0; s < render::GpuTimer::kSectionCount;
+                     ++s)
+                    maxSeg = std::max(maxSeg, gt->lastMs(s));
+                ImGui::Text("GPU: %.2f ms/frame", gt->lastTotalMs());
+                const ImVec4 hot(0.45f, 0.80f, 0.95f, 1.0f);
+                const ImVec4 idle(0.55f, 0.55f, 0.58f, 1.0f);
+                for (uint32_t row = 0; row < 3; ++row) {
+                    for (uint32_t col = 0; col < 3; ++col) {
+                        const uint32_t s = row * 3 + col;
+                        const float ms = gt->lastMs(s);
+                        if (col > 0) ImGui::SameLine();
+                        if (ms > maxSeg * 0.05f && ms > 0.005f)
+                            ImGui::TextColored(hot, "%s %.2f",
+                                               gt->sectionName(s),
+                                               static_cast<double>(ms));
+                        else
+                            ImGui::TextColored(idle, "%s -",
+                                               gt->sectionName(s));
+                    }
+                }
+            } else {
+                ImGui::TextDisabled("GPU: 时戳数据未就绪");
+            }
+        }
 
         // ---- 空间索引（BVH）----
         // visits = 本帧视锥查询**实际访过**的节点数。它远小于 nodes 才说明
@@ -1545,7 +1592,6 @@ void EditorApp::drawEnginePanel() {
     ImGui::SliderFloat("Exposure", &post.exposure, 0.05f, 4.0f, "%.2f");
     const char* tonemaps[] = {"ACES", "Reinhard", "Clamp (raw HDR)"};
     ImGui::Combo("Tonemap", &post.tonemapMode, tonemaps, 3);
-    ImGui::SliderFloat("Vignette", &post.vignette, 0.0f, 1.0f, "%.2f");
     ImGui::SliderFloat("Bloom threshold", &post.bloomThreshold, 0.0f, 4.0f,
                        "%.2f");
     ImGui::SliderFloat("Bloom knee", &post.bloomKnee, 0.01f, 2.0f, "%.2f");
@@ -1555,6 +1601,129 @@ void EditorApp::drawEnginePanel() {
     // 交给 tonemap 之后的 FXAA 补刀。资源常驻，这里实时切零成本。
     ImGui::Checkbox("FXAA (post AA)", &post.fxaa);
 
+    // ---- 自动曝光（直方图 eye adaptation，R1-2）----
+    // 勾上后用后台测出的自适应曝光替代 Exposure 滑条（滑条值保留为
+    // 起始值 / 关掉后的回退值，不会被覆盖）。测量链的资源常驻，切换
+    // 只是"录不录那三个 pass"，零重建 —— 与 FXAA / TAA 同一套约定。
+    if (ImGui::Checkbox("Auto exposure (histogram)", &post.autoExposure)) {
+        VK_LOG_INFO("AUTOEXP-COMBO enabled=%d", post.autoExposure ? 1 : 0);
+    }
+    if (post.autoExposure) {
+        ImGui::SliderFloat("  key (middle grey)", &post.exposureKey, 0.01f, 1.0f,
+                           "%.3f");
+        ImGui::SliderFloat("  adapt speed", &post.exposureSpeed, 0.1f, 12.0f,
+                           "%.2f");
+        ImGui::SliderFloat("  EV bias", &post.exposureBias, -4.0f, 4.0f, "%.2f");
+        ImGui::SliderFloat("  exposure min", &post.exposureMin, 0.005f, 1.0f,
+                           "%.3f");
+        ImGui::SliderFloat("  exposure max", &post.exposureMax, 1.0f, 16.0f,
+                           "%.2f");
+        ImGui::Text("  current: %.4f", r.autoExposureValue());
+    }
+
+    // ---- 色彩分级 LUT（32³，R1-3）----
+    // 勾上后：lift/gamma/gain/contrast/saturation 在 CPU 侧烘成 32³ 3D LUT，
+    // 合成 pass 里一次三线性采样（tonemap 之后、暗角之前）。参数一变就重烘
+    // （尺寸小，代价可忽略）。关着时合成走基线路径 → 逐像素不变。
+    if (ImGui::Checkbox("Color grading (3D LUT)", &post.colorGrading)) {
+        VK_LOG_INFO("LUT-COMBO enabled=%d", post.colorGrading ? 1 : 0);
+    }
+    if (post.colorGrading) {
+        ImGui::SliderFloat("  LUT blend", &post.cgLutBlend, 0.0f, 1.0f, "%.3f");
+        ImGui::SliderFloat3("  lift", post.cgLift, -0.5f, 0.5f, "%.3f");
+        ImGui::SliderFloat3("  gamma", post.cgGamma, 0.2f, 3.0f, "%.3f");
+        ImGui::SliderFloat3("  gain", post.cgGain, 0.0f, 3.0f, "%.3f");
+        ImGui::SliderFloat("  contrast", &post.cgContrast, 0.2f, 3.0f, "%.3f");
+        ImGui::SliderFloat("  saturation", &post.cgSaturation, 0.0f, 3.0f,
+                           "%.3f");
+        if (ImGui::Button("  reset grading")) {
+            for (int i = 0; i < 3; ++i) {
+                post.cgLift[i] = 0.0f;
+                post.cgGamma[i] = 1.0f;
+                post.cgGain[i] = 1.0f;
+            }
+            post.cgContrast = 1.0f;
+            post.cgSaturation = 1.0f;
+            post.cgLutBlend = 1.0f;
+        }
+    }
+
+    // ---- 动态分辨率（DRS，R1-4）----
+    // 勾上后场景按 renderScale 缩小渲染，合成 pass 用对比度自适应的
+    // 边缘感知升采样写回全分辨率输出。自动模式按 GPU 帧耗时调缩放比。
+    // 关着时 renderScale 恒为 1.0 → 逐像素回到基线。
+    if (ImGui::Checkbox("Dynamic resolution", &post.dynamicRes)) {
+        VK_LOG_INFO("DRS-COMBO enabled=%d", post.dynamicRes ? 1 : 0);
+    }
+    if (post.dynamicRes) {
+        ImGui::Checkbox("  auto (by GPU time)", &post.drsAuto);
+        if (post.drsAuto) {
+            ImGui::SliderFloat("  target ms", &post.drsTargetMs, 4.0f, 33.0f,
+                               "%.1f");
+            const render::GpuTimer* gt = r.gpuTimer();
+            ImGui::Text("  current scale: %.3f  (gpu %.2f ms)",
+                        r.postSettings().renderScale,
+                        static_cast<double>(gt ? gt->lastTotalMs() : -1.0f));
+        } else {
+            ImGui::SliderFloat("  render scale", &post.renderScale, 0.3f, 1.0f,
+                               "%.2f");
+        }
+        ImGui::SliderFloat("  min scale", &post.drsMinScale, 0.25f, 1.0f,
+                           "%.2f");
+        ImGui::SliderFloat("  max scale", &post.drsMaxScale, 0.25f, 1.0f,
+                           "%.2f");
+        ImGui::SliderFloat("  sharpen", &post.drsSharpness, 0.0f, 1.5f, "%.2f");
+    }
+
+    // ---- 相机级后处理效果（见 render/CameraEffects.h）----
+    // 暗角从 Post 面板搬到这里：它和色差一样都是"相机效果"，现在四个
+    // 效果共用一处面板；下面的后处理体积可以按位置覆盖这里的值。
+    auto& cfx = r.cameraEffects();
+    ImGui::SeparatorText("Camera Effects");
+    ImGui::Checkbox("DoF (depth of field)", &cfx.dof);
+    if (cfx.dof) {
+        ImGui::SliderFloat("  focus (m)", &cfx.dofFocus, 0.1f, 60.0f, "%.2f");
+        ImGui::SliderFloat("  aperture", &cfx.dofAperture, 0.0f, 8.0f, "%.2f");
+        ImGui::SliderFloat("  max radius (px)", &cfx.dofMaxRadius, 1.0f, 40.0f,
+                           "%.1f");
+    }
+    ImGui::Checkbox("Motion blur", &cfx.motionBlur);
+    if (cfx.motionBlur) {
+        ImGui::SliderFloat("  strength", &cfx.motionBlurStrength, 0.0f, 4.0f,
+                           "%.2f");
+        ImGui::SliderInt("  samples", &cfx.motionBlurSamples, 2, 16);
+    }
+    ImGui::Checkbox("Chromatic aberration", &cfx.chromatic);
+    if (cfx.chromatic) {
+        ImGui::SliderFloat("  chroma", &cfx.chromaStrength, 0.0f, 3.0f, "%.2f");
+    }
+    ImGui::Checkbox("Vignette", &cfx.vignette);
+    if (cfx.vignette) {
+        ImGui::SliderFloat("  vignette", &cfx.vignetteStrength, 0.0f, 1.0f,
+                           "%.2f");
+        ImGui::SliderFloat("  falloff power", &cfx.vignettePower, 0.25f, 4.0f,
+                           "%.2f");
+    }
+    // 多相机：主视口用场景里的哪台相机（0 = 默认）。相机数量由场景决定，
+    // 编辑器可以在这里追加（新相机从 0 号复制，改它的位置/朝向即可）。
+    {
+        scene::Scene& sc = activeScene();
+        int camIdx = static_cast<int>(r.viewCameraIndex());
+        const int camCount = std::max(1, static_cast<int>(sc.cameraCount()));
+        ImGui::Text("Cameras: %d", camCount);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Add")) sc.addCamera();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy 1st -> current")) {
+            if (sc.cameraCount() > 1) {
+                sc.camera(static_cast<size_t>(camIdx)) = sc.camera(0);
+            }
+        }
+        if (ImGui::SliderInt("View camera", &camIdx, 0, camCount - 1)) {
+            r.setViewCameraIndex(static_cast<size_t>(std::max(camIdx, 0)));
+        }
+    }
+
     ImGui::SeparatorText("Clustered Forward");
     ImGui::Checkbox("Cluster culling", &r.clusterCullingEnabled());
     ImGui::SameLine();
@@ -1563,6 +1732,59 @@ void EditorApp::drawEnginePanel() {
     // 物体级视锥剔除：关掉即退回"全量提交"，是验证剔除是否漏画的手段
     // （同一场景开关两次，画面必须完全一致）。
     ImGui::Checkbox("Frustum culling", &r.frustumCullingEnabled());
+    // Hi-Z 遮挡剔除（R2-1）：在视锥剔除之上再剔掉"在画面里但被挡住"的物体。
+    // 依赖深度图 → 只对主场景生效；关掉即回到"只看视锥"，用于验证没漏画。
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Occlusion (Hi-Z)", &r.occlusionCullingEnabled())) {
+        VK_LOG_INFO("HIZ-COMBO occlusionCull=%d",
+                    r.occlusionCullingEnabled() ? 1 : 0);
+    }
+    if (r.occlusionCullingEnabled()) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::DragFloat("##hizbias", &r.hizDepthBias(), 1.0e-4f, 0.0f, 5.0e-2f,
+                         "bias %.4f");
+    }
+    // Multi-draw indirect + GPU 紧凑化（R2-2）：把"一物一 draw / 一批一 draw"
+    // 压成"每组一次 vkCmdDrawIndexedIndirect"（组 = 同管线 + 同材质），
+    // 可见性由 GPU 在 mdi_compact.comp 里紧凑化。依赖遮挡剔除 + 合批 +
+    // 深度预通道（打开时自动带上）。
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Multi-draw indirect", &r.mdiEnabled())) {
+        VK_LOG_INFO("MDI-COMBO mdi=%d", r.mdiEnabled() ? 1 : 0);
+    }
+    if (r.mdiEnabled()) {
+        ImGui::SameLine();
+        const render::MdiStats& ms = r.mdiStats();
+        ImGui::TextDisabled("(sub %u, batches %u, inst %u)",
+                            ms.submissions, ms.batches, ms.instancesDrawn);
+    }
+    // Bindless / descriptor indexing（R2-3）：材质不再各占 set 1..6，
+    // 所有贴图进 set 1 的运行时数组，逐 draw 只 push 材质页号。
+    // ⚠ 打开/关闭会重建整组前向管线（一次 waitIdle）—— 布局与 .spv 都变了。
+    //   设备不支持时勾选框置灰（descriptor indexing 是 Vulkan 1.2 可选特性）。
+    {
+        bool on = r.bindlessEnabled();
+        const bool supported = r.bindlessSupported();
+        if (!supported) ImGui::BeginDisabled();
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Bindless", &on)) {
+            r.setBindlessEnabled(on);
+        }
+        if (!supported) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                supported ? "set1 = textures[] + material pages[]; "
+                            "per-draw 只 push 材质页号（切换会重建前向管线）"
+                          : "设备不支持 descriptor indexing");
+        }
+        if (r.bindlessEnabled()) {
+            ImGui::SameLine();
+            const render::BindlessStats& bs = r.bindlessStats();
+            ImGui::TextDisabled("(tex %u/%u, pages %u)",
+                                bs.textures, bs.maxTextures, bs.framePages);
+        }
+    }
     ImGui::Checkbox("Light gizmos", &r.lightGizmosEnabled());
 
     // ---- 天空盒 + IBL ----
@@ -1698,6 +1920,65 @@ void EditorApp::drawEnginePanel() {
             default: bits = VK_SAMPLE_COUNT_4_BIT; break;
         }
         r.setSampleCount(bits);
+    }
+
+    // ---- TAA（时域抗锯齿，R1-1，docs/render_roadmap.md）----
+    // 勾上后会做两件事：FrameGraph 链头多一个 resolve pass（读历史 +
+    // 深度重投影 + YCoCg 方差钳制混合），以及帧首给投影矩阵加
+    // Halton(2,3) 子像素抖动。所以它和 FXAA 是**可以叠加**的（FXAA 在
+    // 显示域，TAA 在 HDR 域），但一般二选一即可。
+    {
+        render::ScreenSpaceSettings& ss = r.screenSpaceSettings();
+        if (ImGui::Checkbox("TAA", &ss.taa)) {
+            VK_LOG_INFO("TAA-COMBO enabled=%d", ss.taa ? 1 : 0);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "时域抗锯齿：帧首子像素抖动 + 历史重投影混合\n"
+                "关闭时与本模块引入前逐像素一致（回归基线）");
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SliderFloat("Blend", &ss.taaBlend, 0.02f, 0.5f, "%.2f");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("当前帧权重（越小越稳、越容易拖影）");
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SliderFloat("Clamp", &ss.taaClamp, 0.25f, 4.0f, "%.2f");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "邻域方差钳制系数（sigma）\n>2 更保历史但易鬼影，<0.5 杀鬼影但会闪");
+        }
+    }
+
+    // ---- 调试视图模式（R0-2，docs/render_roadmap.md）----
+    // Lit = 默认渲染路径；其余是排查工具（法线/粗糙度/金属度/线框/
+    // 过绘制/灯复杂度）。wireframe 在不支持 fillModeNonSolid 的设备上
+    // 会静默回退 Lit（渲染器侧处理，见 Renderer::setViewMode）。
+    {
+        static const char* kViewModeLabels[] = {
+            "Lit", "Unlit", "Normal", "Roughness", "Metallic",
+            "Wireframe", "Overdraw", "Light Complexity"};
+        int vmIdx = static_cast<int>(r.viewMode());
+        ImGui::SetNextItemWidth(140.0f);
+        if (ImGui::Combo("View mode", &vmIdx, kViewModeLabels, 8)) {
+            r.setViewMode(static_cast<render::Renderer::ViewMode>(vmIdx));
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Lit = 默认渲染（基线）\n"
+                "Wireframe 需设备支持 fillModeNonSolid");
+        }
+        // 界面存在性标签（自动化验证用，与 VP-ADD-* 同惯例）：只打一次。
+        static bool vmTagged = false;
+        if (!vmTagged) {
+            vmTagged = true;
+            if (std::getenv("MYVK_LOG_RECTS")) {
+                VK_LOG_INFO("VM-COMBO labels=8 current=%s",
+                            render::Renderer::viewModeName(r.viewMode()));
+            }
+        }
     }
 
     // ---- 地平面栅格（参数）----

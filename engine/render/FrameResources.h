@@ -9,6 +9,7 @@
 #include "rhi/Buffer.h"
 
 #include <memory>
+#include <vector>
 
 namespace render {
 
@@ -45,6 +46,25 @@ struct FrameResources {
     std::unique_ptr<rhi::Buffer> instanceModels;
     void* instanceMapped = nullptr;
     uint32_t instanceCapacity = 0;  // 当前能容纳的 InstanceData 个数
+
+    // ============================================================
+    // 离屏目标各自的相机 UBO（每个离屏目标一份）
+    //
+    // FrameUBO 是 HOST_VISIBLE + 常驻映射、在**录制期** memcpy 的：
+    // 一个命令缓冲里若先后录制"主视口"与"预览/额外视角"两个场景，
+    // 两者需要的相机矩阵不同，而 memcpy 只有最后一次能留在 buffer 里，
+    // GPU 执行时**先录制的那个场景也会读到后一次的值** —— 主视口会被
+    // 渲染成预览相机的视角。所以离屏目标必须各持一份 UBO + 各自的
+    // set 0（其余 14 个 binding 与主链共享同一批每帧资源）。
+    //
+    // 下标 = 离屏目标序号（Renderer::m_targets 里的序号 - 1），懒建。
+    // ============================================================
+    struct OffscreenUbo {
+        std::unique_ptr<rhi::Buffer> ubo;
+        void* mapped = nullptr;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+    };
+    std::vector<OffscreenUbo> offscreenUbos;
 };
 
 } // namespace render

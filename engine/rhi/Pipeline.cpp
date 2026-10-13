@@ -58,7 +58,7 @@ Pipeline::Pipeline(Device& device, const PipelineDesc& desc) : m_device(device) 
     raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     raster.depthClampEnable = VK_FALSE;
     raster.rasterizerDiscardEnable = VK_FALSE;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.polygonMode = desc.polygonMode;
     raster.cullMode = desc.cullMode;
     raster.frontFace = desc.frontFace;
     raster.depthBiasEnable = desc.depthBiasEnable ? VK_TRUE : VK_FALSE;

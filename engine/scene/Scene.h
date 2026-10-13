@@ -13,6 +13,7 @@
 #include "scene/Bvh.h"
 #include "scene/Camera.h"
 #include "scene/Light.h"
+#include "scene/PostVolume.h"
 
 #include <string>
 #include <vector>
@@ -83,9 +84,36 @@ public:
     };
     SpatialStats spatialStats() const;
 
-    // ---- 相机 ----
-    Camera& camera() { return m_camera; }
-    const Camera& camera() const { return m_camera; }
+    // ---- 相机（多相机）----
+    // 相机是"观察者"而不是场景内容，所以不由 ECS 持有，而是 Scene 直接
+    // 维护一个数组：下标 0 是**默认相机**（编辑器轨道相机 / 游戏主相机），
+    // camera() 等价于 camera(0) —— 所有既有调用点语义不变。
+    //
+    // 其余相机供"多视口"使用：Renderer 的通用 RenderTarget 可以各自绑定
+    // 一台（小地图 / 驾驶舱 / 反射探针 / 画中画），一台相机一个观察角度。
+    // 相机之间没有任何隐含耦合，改一台不影响另一台。
+    Camera& camera() { return m_cameras[0]; }
+    const Camera& camera() const { return m_cameras[0]; }
+    Camera& camera(size_t index) {
+        return m_cameras[index < m_cameras.size() ? index : 0];
+    }
+    const Camera& camera(size_t index) const {
+        return m_cameras[index < m_cameras.size() ? index : 0];
+    }
+    size_t cameraCount() const { return m_cameras.size(); }
+    // 追加一台相机（默认从 0 号相机复制一份 —— 新视角的起点通常是
+    // 当前视角，这比从单位矩阵开始好调得多）。返回新相机的下标。
+    size_t addCamera();
+
+    // ---- 后处理体积（见 scene/PostVolume.h）----
+    // 体积是**场景内容**：一个 AABB 里覆盖一组相机后处理参数（景深对焦
+    // 距离 / 运动模糊强度 / 色差 / 暗角）。Renderer 每帧按相机位置求值，
+    // 叠加到基础设置上得到生效值。
+    //
+    // 相机与体积都在 Scene 上，好处是"多相机 + 体积"天然可用：换一台
+    // 相机就是换一个求值位置。
+    PostVolumeSet& postVolumes() { return m_postVolumes; }
+    const PostVolumeSet& postVolumes() const { return m_postVolumes; }
 
     // ---- 方向光（懒创建：首次调用时自动建实体）----
     Light& light();
@@ -123,7 +151,11 @@ private:
     bool meshLocalBounds(const assets::Mesh& mesh, BvhAabb& out) const;
 
     ecs::World m_world;
-    Camera m_camera;
+    // 相机数组：0 号恒存在（默认相机），camera() = m_cameras[0]。
+    // 用 vector 而不是"一个相机 + 几个额外相机"，是为了让"下标即相机 id"
+    // 这件事只有一处定义（Renderer::setViewCameraIndex 直接用下标）。
+    std::vector<Camera> m_cameras{1};
+    PostVolumeSet m_postVolumes;
     ecs::Entity m_lightEntity;
 
     // ---- 空间索引 ----

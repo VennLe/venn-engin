@@ -1,4 +1,12 @@
 #version 450
+// bindless 路径（-DVENN_BINDLESS=1，见下面 set 1 的说明）要用**运行时
+// 大小数组 + 动态下标**访问采样器数组。glslang 对"非常量下标访问不透明
+// 类型数组"一律要求先声明这个扩展，即便下标来自 push 常量（动态 uniform，
+// 严格说是合法且不需要 nonuniformEXT 的）。
+// 必须放在任何非预处理记号之前 —— 只有 #version 能排在它前面。
+#if VENN_BINDLESS
+#extension GL_EXT_nonuniform_qualifier : require
+#endif
 // ============================================================
 // pbr.frag —— Cook-Torrance PBR 片元着色器（分簇前向 / clustered forward）
 //
@@ -57,6 +65,12 @@
 #ifndef VENN_NORMAL_MAP
 #define VENN_NORMAL_MAP 0
 #endif
+// VENN_BINDLESS 是**全局开关**（Renderer 按它选 set 布局与 .spv），
+// 不是材质关键字位 —— 所以不参与掩码，只多编一族
+// pbr.bindless.k<掩码>.frag.spv（见 CMakeLists.txt）。
+#ifndef VENN_BINDLESS
+#define VENN_BINDLESS 0
+#endif
 
 #include "common.glsl"
 
@@ -96,6 +110,12 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     // 雾色不从这里来 —— 下面直接采样天空立方体，保证雾到天际线
     // 的颜色与天空盒自动一致。
     vec4 fogParams;
+
+    // ---- 调试视图模式（R0-2）----
+    // x = 模式（0=Lit 原路径，见 Renderer::ViewMode）。y/z/w 保留。
+    // 运行时 uniform 分支是刻意的：全局单值 + 随时切换，不值得为它
+    // 翻倍 .spv 变体（UE 同款取舍）。
+    vec4 viewModeParams;
 } ubo;
 
 // 级联阴影贴图：一张 **2D array** 的深度图，第 i 层就是第 i 级级联。
@@ -130,6 +150,41 @@ layout(std430, set = 0, binding = 4) readonly buffer LightIndexBuffer {
     uint lightIndices[];
 };
 
+#if VENN_BINDLESS
+// ============================================================
+// Bindless 路径（R2-3，-DVENN_BINDLESS=1 编出 pbr.bindless.k<N>.frag.spv）
+//
+// 六张贴图槽不再是六个 set，而是**同一个运行时大小数组**的元素。
+// 下标来自材质"页表"（set 1 binding 1），页号由 CPU 逐 draw push 在
+// push.emissive.w 里（见 render/Bindless.h 与 RenderTypes.h）。
+//
+// 下面这六条 #define 是整段改造的全部 —— 函数体里那 6 处
+// `texture(albedoMap, vUV)` 一个字都不用改，宏展开后就是
+//   texture(textures[gMat.tex0.x], vUV)
+// 之所以用宏而不是改调用点：让**非 bindless 的那份 .spv 与这份逐字
+// 同源**，两边不可能因为"手抄时改错一次采样"而分叉。
+//
+// gMat 是文件级变量，在 main() 开头填一次（材质在一个 draw 内恒定，
+// 不值得每个采样点都查一次页表）。
+// ============================================================
+struct GpuMaterialPage {
+    uvec4 tex0;  // x=albedo y=normal z=ORM w=roughness
+    uvec4 tex1;  // x=metallic y=emissive
+};
+layout(set = 1, binding = 0) uniform sampler2D textures[];
+layout(std430, set = 1, binding = 1) readonly buffer MaterialPages {
+    GpuMaterialPage pages[];
+};
+
+GpuMaterialPage gMat;
+
+#define albedoMap    textures[gMat.tex0.x]
+#define normalMap    textures[gMat.tex0.y]
+#define ormMap       textures[gMat.tex0.z]
+#define roughnessMap textures[gMat.tex0.w]
+#define metallicMap  textures[gMat.tex1.x]
+#define emissiveMap  textures[gMat.tex1.y]
+#else
 layout(set = 1, binding = 0) uniform sampler2D albedoMap;
 layout(set = 2, binding = 0) uniform sampler2D normalMap;
 layout(set = 3, binding = 0) uniform sampler2D ormMap;  // R=AO G=Rough B=Metal
@@ -141,6 +196,7 @@ layout(set = 4, binding = 0) uniform sampler2D roughnessMap;
 layout(set = 5, binding = 0) uniform sampler2D metallicMap;
 // 自发光贴图：与因子**相加**，未绑定时绑内置纯黑 → 加法恒等。
 layout(set = 6, binding = 0) uniform sampler2D emissiveMap;
+#endif
 
 // ---- IBL 三件套（见 render/Environment.h）----
 // 都挂在 set 0：Vulkan 只保证至少 4 个 set 可同时绑定，而 set 1..6
@@ -190,6 +246,12 @@ layout(push_constant) uniform Push {
     mat4 model;
     vec4 baseColorFactor;
     vec4 pbr;
+    // rgb = 自发光。**w 在 bindless 路径里是材质页号**（R2-3）：
+    // 非 bindless 时 CPU 一律推 1.0，本文件的非 bindless 编译单元从不读
+    // 这个 w —— 所以"借一个空闲分量"不会改变任何既有像素。
+    // push 常量被硬件卡在 128 字节，而 pbr.frag 只声明到偏移 112，
+    // 最后 16 字节（也就是这里的 w）是现成的空位；另开一个字段会直接
+    // 越过 maxPushConstantsSize。见 render/Bindless.h 的说明。
     vec4 emissive;
 } push;
 
@@ -539,6 +601,11 @@ vec3 shadeLocalLight(Light L, vec3 N, vec3 V, vec3 worldPos, vec3 albedo,
 }
 
 void main() {
+#if VENN_BINDLESS
+    // 材质页查一次：页号在 push.emissive.w 里（+0.5 是为了把 float 稳妥地
+    // 截回整数 —— 页号 ≤ 4096，float 能精确表示，不存在舍入问题）。
+    gMat = pages[uint(push.emissive.w + 0.5)];
+#endif
     // ---------------- 材质采样 ----------------
     vec4 albedoSample = texture(albedoMap, vUV);
     vec3 albedo = albedoSample.rgb * push.baseColorFactor.rgb;
@@ -734,6 +801,44 @@ void main() {
             ? texture(skyMap, vdir).rgb
             : envColor(vdir);
         color = mix(color, fogColor, fogFactor);
+    }
+
+    // ---------------- 调试视图模式（R0-2）----------------
+    // Lit（0）是原路径，下面一个字都不执行 —— 基线逐像素不变。
+    // 其余模式覆盖输出：
+    //   1 Unlit          纯反照率（无光照/阴影 —— 排查材质用）
+    //   2 Normal         世界空间法线 * 0.5 + 0.5（蓝紫为主，法线朝向错一眼可见）
+    //   3 Roughness      粗糙度灰度图
+    //   4 Metallic       金属度灰度图
+    //   5 Wireframe      固定绿（管线侧 polygonMode=LINE，全边线透视）
+    //   6 Overdraw       固定低强度紫红（管线侧 additive 混合，重叠累加）
+    //   7 LightComplexity 簇内灯数热度（蓝=0，绿=1..4，加红=>4）
+    const int vmode = int(ubo.viewModeParams.x + 0.5);
+    if (vmode != 0) {
+        vec3 debug = color;
+        if (vmode == 1) {
+            debug = albedo;
+        } else if (vmode == 2) {
+            debug = N * 0.5 + 0.5;
+        } else if (vmode == 3) {
+            debug = vec3(roughness);
+        } else if (vmode == 4) {
+            debug = vec3(metallic);
+        } else if (vmode == 5) {
+            debug = vec3(0.20, 1.00, 0.45);
+        } else if (vmode == 6) {
+            // 品红（R>B）：additive 累加，重叠越多越亮；选 R 主导是为了
+            // 与"天空的蓝"在直方图上区分开。
+            debug = vec3(0.040, 0.010, 0.024);
+        } else if (vmode == 7) {
+            const float n = float(lightCount);
+            // 0 灯 = 深蓝底；1..4 灯 = 绿随数增强；>4 再叠红
+            debug = vec3(min(max(n - 4.0, 0.0), 8.0) * 0.12,
+                         min(n, 4.0) * 0.22,
+                         0.06);
+        }
+        outColor = vec4(debug, 1.0);
+        return;
     }
 
     // alpha 参与混合：透明材质走 baseline blend 管线

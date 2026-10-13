@@ -8,11 +8,13 @@ namespace rhi {
 inline DescriptorAllocator::DescriptorAllocator(Device& device, uint32_t maxSets,
                                                 uint32_t maxUBOs,
                                                 uint32_t maxSamplers,
-                                                uint32_t maxStorageBuffers)
+                                                uint32_t maxStorageBuffers,
+                                                uint32_t maxStorageImages,
+                                                VkDescriptorPoolCreateFlags flags)
     : m_device(device) {
     // 计数为 0 的类型不进池（VUID-VkDescriptorPoolSize-descriptorCount-00302：
     // descriptorCount 必须大于 0 —— 传 0 的条目会直接触发验证层报错）
-    VkDescriptorPoolSize sizes[3]{};
+    VkDescriptorPoolSize sizes[4]{};
     uint32_t poolSizeCount = 0;
     if (maxUBOs > 0) {
         sizes[poolSizeCount].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -26,12 +28,17 @@ inline DescriptorAllocator::DescriptorAllocator(Device& device, uint32_t maxSets
         sizes[poolSizeCount].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         sizes[poolSizeCount++].descriptorCount = maxStorageBuffers;
     }
+    if (maxStorageImages > 0) {
+        sizes[poolSizeCount].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        sizes[poolSizeCount++].descriptorCount = maxStorageImages;
+    }
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     ci.poolSizeCount = poolSizeCount;
     ci.pPoolSizes = sizes;
     ci.maxSets = maxSets;
+    ci.flags = flags;
 
     VK_CHECK(vkCreateDescriptorPool(m_device.get(), &ci, nullptr, &m_pool));
 }
@@ -93,13 +100,66 @@ inline void DescriptorAllocator::writeTexture(VkDescriptorSet set,
     vkUpdateDescriptorSets(m_device.get(), 1, &write, 0, nullptr);
 }
 
+inline void DescriptorAllocator::writeTextureAt(VkDescriptorSet set,
+                                                uint32_t binding,
+                                                uint32_t arrayElement,
+                                                VkSampler sampler,
+                                                VkImageView view,
+                                                VkImageLayout layout) {
+    VkDescriptorImageInfo info{};
+    info.sampler = sampler;
+    info.imageView = view;
+    info.imageLayout = layout;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = binding;
+    write.dstArrayElement = arrayElement;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &info;
+    vkUpdateDescriptorSets(m_device.get(), 1, &write, 0, nullptr);
+}
+
+inline void DescriptorAllocator::writeStorageImage(VkDescriptorSet set,
+                                                   uint32_t binding,
+                                                   VkImageView view,
+                                                   VkImageLayout layout) {
+    VkDescriptorImageInfo info{};
+    info.sampler = VK_NULL_HANDLE;   // 存储图像不配采样器
+    info.imageView = view;
+    info.imageLayout = layout;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = binding;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &info;
+    vkUpdateDescriptorSets(m_device.get(), 1, &write, 0, nullptr);
+}
+
 inline VkDescriptorSetLayout makeSetLayout(
     Device& device,
-    const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
+    const std::vector<VkDescriptorSetLayoutBinding>& bindings,
+    const std::vector<VkDescriptorBindingFlags>& bindingFlags,
+    VkDescriptorSetLayoutCreateFlags flags) {
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flagInfo{};
+    flagInfo.sType =
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+
     VkDescriptorSetLayoutCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     ci.bindingCount = static_cast<uint32_t>(bindings.size());
     ci.pBindings = bindings.data();
+    ci.flags = flags;
+    if (bindingFlags.size() == bindings.size() && !bindingFlags.empty()) {
+        flagInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
+        flagInfo.pBindingFlags = bindingFlags.data();
+        ci.pNext = &flagInfo;
+    }
 
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
     VK_CHECK(vkCreateDescriptorSetLayout(device.get(), &ci, nullptr, &layout));

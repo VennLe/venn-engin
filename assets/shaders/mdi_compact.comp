@@ -1,0 +1,90 @@
+#version 450
+// ============================================================
+// mdi_compact.comp —— GPU 驱动的可见性紧凑化 + 间接绘制参数生成（R2-2）
+//
+// 一个 invocation 负责一个候选物体，三件事：
+//   1. 用 hiz_test.glsl::vennHizOccluded 判它是否被遮挡（**与 R2-1 同一份
+//      数学**）—— 被挡的直接退出；
+//   2. 通过 atomicAdd 抢一个"本批内的槽位"，把它的结构化实例记录
+//      （world matrix + aux）写进紧凑化后的实例缓冲；
+//   3. 那次 atomicAdd 本身就是**在写间接绘制命令的 instanceCount 字段** ——
+//      因此 pass 结束后，indirect[] 里的每条命令已经是"本帧真正要画的
+//      实例数"，CPU 一个 draw 参数都不用算。
+//
+// ---- 为什么槽位就是 instanceCount ----
+//   cmd 的字段布局（VkDrawIndexedIndirectCommand，5 个 uint32）：
+//       [0] indexCount  [1] instanceCount  [2] firstIndex
+//       [3] vertexOffset[4] firstInstance
+//   CPU 事先把 [0][2][3][4] 填好、[1] 清 0。atomicAdd([1], 1) 返回旧值 =
+//   本批内第几个可见实例 → 既是槽位偏移，又让 [1] 最终累加成总数。
+//   一次原子操作同时解决"紧凑化"与"计数"，不需要第二遍 finalize pass。
+//
+// ---- 上界保证 ----
+//   每个批的 firstInstance 基址 = 该批**候选**数的前缀和 → 无论
+//   atomicAdd 拿到哪个槽位，都落在该批预留的区间内，不会越界。
+//
+// ---- 零帧延迟 ----
+//   本 pass 排在"深度预通道之后、前向之前"，因此 Hi-Z 用的就是**本帧**
+//   的深度与相机，没有 R2-1 那条两帧延迟（也没有随之而来的 pop）。
+// ============================================================
+
+#include "hiz_test.glsl"
+
+layout(local_size_x = 64) in;
+
+// Hi-Z 金字塔（全 mip 链，NEAREST 采样）
+layout(set = 0, binding = 0) uniform sampler2D hizTex;
+// 候选物体的世界 AABB（每 2 个 vec4 一个盒子）
+layout(std430, set = 0, binding = 1) readonly buffer AabbBuffer {
+    vec4 aabbs[];
+};
+
+// 每实例的结构化记录（std430，80 字节）—— 必须与 pbr.vert 的 MdiInstance、
+// 以及 C++ 的 render::MdiInstance 逐字段一致。
+struct MdiInstance {
+    mat4 model;   //  0
+    ivec4 aux;    // 64  x = jointBase（<0 → 静态网格）
+};
+
+// 源目录：CPU 每帧按**候选顺序**写一遍（下标 = 物体号，与 aabbs 对齐）
+layout(std430, set = 0, binding = 2) readonly buffer Catalog {
+    MdiInstance items[];
+} catalog;
+// 物体号 → 它所属的批号（= 间接命令下标）
+layout(std430, set = 0, binding = 3) readonly buffer ObjBatch {
+    uint objBatch[];
+} objToBatch;
+// 紧凑化后的实例记录：下标 = 间接命令的 firstInstance + 批内槽位
+layout(std430, set = 0, binding = 4) writeonly buffer Instances {
+    MdiInstance items[];
+} outInst;
+// 间接命令的裸 uint 视图（每批 5 个 uint，见顶部注释）
+layout(std430, set = 0, binding = 5) buffer Indirect {
+    uint cmds[];
+};
+
+layout(push_constant) uniform PC {
+    mat4 viewProj;   // 未抖动的 proj * view
+    // x = 物体数 y = 深度偏置(NDC) z = 最大 mip w = 保留
+    vec4 params;
+    // x = 宽 y = 高 z = 1/宽 w = 1/高
+    vec4 screen;
+    // x = 每批命令占的 uint 数（= 5）；y/z/w 保留
+    uvec4 meta;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.params.x)) return;
+
+    const bool occluded =
+        vennHizOccluded(aabbs[i * 2u + 0u].xyz, aabbs[i * 2u + 1u].xyz,
+                        pc.viewProj, hizTex, pc.params.z, pc.params.y,
+                        pc.screen.xy);
+    if (occluded) return;   // 被挡住 → 不进实例列表，也不计入 instanceCount
+
+    const uint base = objToBatch.objBatch[i] * pc.meta.x;
+    const uint slot = atomicAdd(cmds[base + 1u], 1u);   // instanceCount
+    const uint firstInst = cmds[base + 4u];             // firstInstance
+    outInst.items[firstInst + slot] = catalog.items[i];
+}

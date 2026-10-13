@@ -14,6 +14,7 @@
 //
 // 环境变量初值（Renderer 构造函数读）：
 //   MYVK_SSAO / MYVK_FOG / MYVK_SSGI / MYVK_SSR / MYVK_GODRAYS = 1 开
+//   MYVK_TAA = 1 开；MYVK_TAA_BLEND / MYVK_TAA_CLAMP = 数值覆盖
 //   MYVK_FOG_DENSITY / MYVK_FOG_FALLOFF = 数值覆盖
 //   MYVK_SSAO_RADIUS / MYVK_SSAO_STRENGTH = 数值覆盖
 // 运行时由 Engine 面板实时改（Renderer::screenSpaceSettings()）。
@@ -55,6 +56,20 @@ struct ScreenSpaceSettings {
     // ---- God rays（屏幕空间径向体积光）----
     bool godrays = false;
     float godraysStrength = 0.45f; // 光柱强度
+
+    // ---- TAA（时域抗锯齿，R1-1）----
+    // 链的**头**：前向之后先跑 TAA，再把解析结果喂给后面的屏幕空间效果。
+    // 默认为**关**（与 FXAA / MSAA 的既有默认一致 —— 像素级回归要求
+    // "不设任何 env 时与引入本模块之前逐像素不变"）。
+    // 关着时：不抖动投影、一个 pass 都不录、PostProcess 直接采 HDR。
+    //
+    //   taaBlend  = 当前帧权重（越小越稳、越容易留下拖影）。0.1 是
+    //               UE 默认量级（约 10 帧收敛）。
+    //   taaClamp  = 邻域方差钳制的 sigma 系数（1.0 标准；>2 更保历史、
+    //               更容易鬼影；<0.5 更激进地杀鬼影但会闪）。
+    bool taa = false;
+    float taaBlend = 0.1f;
+    float taaClamp = 1.0f;
 };
 
 } // namespace render

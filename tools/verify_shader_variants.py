@@ -74,7 +74,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from capture_window import capture_client, find_window, user32      # noqa: E402
+from capture_window import capture_client, capture_nonempty, find_window, user32  # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors, wait_rect   # noqa: E402
 # diff_stats / to_np 复用局部阴影脚本里的那份：它带"裁到视口"的逻辑，
 # 那份注释把"为什么要裁"讲清楚了，不适合在第二个脚本里再抄一遍。
@@ -296,8 +296,9 @@ def run_once(exe, scene, extra_env, shot_path, cam=CAM, wait=20.0):
 
         img = None
         if shot_path:
-            img, _ = capture_client(hwnd)
-            img.save(shot_path)
+            img = capture_nonempty(hwnd)
+            if img is not None:
+                img.save(shot_path)
 
         with tap.lock:
             lines = list(tap.lines)

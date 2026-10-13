@@ -150,11 +150,19 @@ struct FrameUBO {
     // 雾色不在这里 —— pbr.frag 直接采样天空立方体（binding 10），
     // 雾到地平线的颜色过渡与天空盒自动一致，用户改天顶色也不用同步。
     glm::vec4 fogParams;          // offset 640
+
+    // ---- 调试视图模式（R0-2，见 Renderer::ViewMode）----
+    // x = 模式（0=Lit 原路径、1=Unlit、2=Normal、3=Roughness、4=Metallic、
+    //     5=Wireframe、6=Overdraw、7=LightComplexity）
+    // y/z/w = 保留
+    // 走运行时 uniform 而不是关键字变体：视图模式是**全局单值**且
+    // 随时切换 —— 为它编 8x 份 .spv 会让缓存命中率雪崩（UE 同款取舍）。
+    glm::vec4 viewModeParams;     // offset 656
 };
 // 总 656 字节。std140 下 mat4 步长 16、vec4 对齐 16，与这里的自然布局一致。
 // ⚠ 追加字段只能放**末尾**：sky.vert / grid.vert / shadow.vert /
 //   cluster_build.comp 只声明前缀，尾部追加不影响它们的偏移。
-static_assert(sizeof(FrameUBO) == 656, "FrameUBO 布局变了，必须同步所有声明它的着色器");
+static_assert(sizeof(FrameUBO) == 672, "FrameUBO 布局变了，必须同步所有声明它的着色器");
 
 // 阴影 Pass 专用的推送常量（std430 布局，共 96 字节）。
 //

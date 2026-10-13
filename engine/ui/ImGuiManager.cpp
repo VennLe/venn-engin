@@ -13,6 +13,7 @@
 #include <GLFW/glfw3.h>
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace ui {
 
@@ -130,6 +131,28 @@ void ImGuiManager::init(GLFWwindow* window, rhi::Instance& instance,
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    // ---- 自动化跑：imgui.ini 一并不读也不写 ----
+    // 编辑器把**浮动面板**（角色窗口 / Preferences / Stats…）的 Pos/Size 交给
+    // ImGui 自己持久化，落在 cwd 的 imgui.ini 里。这东西在手动会话里是功能
+    // （下次打开还在原处），但对脚本是**毒药**：
+    //   手动会话常常是全屏（3840x2054），脚本却把窗口缩到 1600x900 ——
+    //   存档里那个在 3840 宽度下完全正常的坐标（实测 [character] 存成
+    //   Pos=1559,597 Size=1263,794）一读回来，角色窗口就被顶到客户区右/下
+    //   之外：ImGui 照画不误、logRect 照打坐标，可脚本按那段矩形去点击全部
+    //   落在窗口外 —— 实测症状正是 verify_character_window 的
+    //   "拿到动画条目矩形（CHAR-CLIP）"失败（标签根本切不过去），
+    //   而且是**持久化**的：一次踩脏，此后每次都挂。
+    // 主面板（Hierarchy/Inspector/viewport/Content…）不受影响：它们的
+    // Pos/Size 由 computeLayout() 每帧显式设定，本来就不靠 ini。
+    // 这样 MYVK_NO_WINDOW_SAVE 才名副其实（它此前只管 editor_window.ini）——
+    // InspectorPanel 里"ini 被 MYVK_NO_WINDOW_SAVE 关掉了"那段注释写的
+    // 就是这个约定，只是实现一直缺着。
+    if (std::getenv("MYVK_NO_WINDOW_SAVE") || std::getenv("MYVK_FRAMES")) {
+        io.IniFilename = nullptr;
+        VK_LOG_INFO("ImGui settings persistence disabled (automation run)");
+    }
+
     ImGui::StyleColorsDark();
     applyVennStyle();
 
