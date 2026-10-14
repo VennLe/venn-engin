@@ -12,6 +12,7 @@
 #include "render/ShaderPath.h"
 #include "render/SSAOPass.h"
 #include "render/VolumetricFog.h"
+#include "render/LightTextureLibrary.h"
 #include "render/FrameGraph.h"
 
 // 编辑器视口要把它自己的离屏输出图注册成 ImGui 纹理
@@ -87,7 +88,7 @@ bool envFloat(const char* name, float& out) {
     return true;
 }
 
-constexpr uint32_t kGlobalSetBindings = 17;
+constexpr uint32_t kGlobalSetBindings = 19;
 
 // "当前没有绑定任何前向变体管线"的哨兵。
 // ⚠ 不能用 0：0 是**合法掩码**（三个关键字全关，也是最常见的材质）。
@@ -253,6 +254,14 @@ Renderer::Renderer(core::Window& window) : m_window(window) {
     envFloat("MYVK_VFOG_FALLOFF", m_screenSpace.vfogHeightFalloff);
     envFloat("MYVK_VFOG_BLOB", m_screenSpace.vfogBlobStrength);
     envFloat("MYVK_VFOG_PHASE_G", m_screenSpace.vfogPhaseG);
+    // 光源修饰（R3-3）。三个都默认**关**：关时逐灯修饰记录全零，着色器
+    // 走原始光照路径，与基线逐位一致。
+    m_iesEnabled = envBool("MYVK_IES", false);
+    m_cookieEnabled = envBool("MYVK_COOKIE", false);
+    m_areaLightEnabled = envBool("MYVK_AREA_LIGHT", false);
+    // MYVK_IES_FILE="name1:path1;name2:path2" —— 运行时把 .ies 文件
+    // 加载进纹理库。解析推迟到库建好之后（见构造函数后段）。
+    if (const char* s = std::getenv("MYVK_IES_FILE")) m_iesFileSpec = s;
     // MYVK_TAA_PHASE：冻结抖动相位（验证钩子，见 m_taaForcePhase 注释）
     if (const char* s = std::getenv("MYVK_TAA_PHASE")) {
         const int v = std::atoi(s);
@@ -716,6 +725,21 @@ void Renderer::createDescriptorLayouts() {
     bindings[16].descriptorCount = 1;
     bindings[16].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+    // 17：逐灯修饰记录（R3-3，LightExtInstance[]）。与 binding 2 的灯表
+    // 下标严格对齐；关闭时内容全零 → 着色器走原始光照路径。
+    bindings[17].binding = 17;
+    bindings[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[17].descriptorCount = 1;
+    bindings[17].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    // 18：光源修饰纹理库（cookie + IES 的 sampler2DArray）。第 0 层恒为
+    // 全白 → 任何"没配贴图"的灯都退化成乘 1。库总是存在（程序化生成），
+    // 所以这个 binding 永远绑得到有效数组视图。
+    bindings[18].binding = 18;
+    bindings[18].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[18].descriptorCount = 1;
+    bindings[18].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
     m_globalSetLayout = rhi::makeSetLayout(
         *m_device, std::vector<VkDescriptorSetLayoutBinding>(bindings,
                                                              bindings + kGlobalSetBindings));
@@ -1055,6 +1079,32 @@ void Renderer::createScreenSpace() {
     if (!m_vfog)
         m_vfog = std::make_unique<render::VolumetricFog>(
             *m_device, *m_commandPool, m_globalSetLayout, MAX_FRAMES_IN_FLIGHT);
+    // 光源修饰纹理库（R3-3）：cookie + IES 的 sampler2DArray。与分辨率
+    // 无关，一次性建好；内建图案程序化生成，永远有效。
+    if (!m_lightTextures) {
+        m_lightTextures = std::make_unique<render::LightTextureLibrary>(
+            *m_device, *m_commandPool);
+        m_lightTextures->create();
+        // MYVK_IES_FILE="name1:path1;name2:path2" → 逐个加载
+        if (!m_iesFileSpec.empty()) {
+            size_t p = 0;
+            while (p < m_iesFileSpec.size()) {
+                size_t semi = m_iesFileSpec.find(';', p);
+                std::string item = m_iesFileSpec.substr(
+                    p, semi == std::string::npos ? std::string::npos
+                                                 : semi - p);
+                const size_t colon = item.find(':');
+                if (colon != std::string::npos) {
+                    const std::string name = item.substr(0, colon);
+                    const std::string path = item.substr(colon + 1);
+                    if (!name.empty() && !path.empty())
+                        m_lightTextures->loadIesFile(path, name);
+                }
+                if (semi == std::string::npos) break;
+                p = semi + 1;
+            }
+        }
+    }
     recreateScreenSpace();
 }
 
@@ -1373,7 +1423,8 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
     }
 
     // ---- 局部光源 ----
-    scene.collectLights(m_lightScratch);
+    // 同时收集逐灯修饰描述（R3-3）：下标与 m_lightScratch 严格对齐。
+    scene.collectLights(m_lightScratch, &m_lightModScratch);
     // 层分配必须夹在"收集"与"上传"之间：分配结果（层号）写回
     // m_lightScratch 的 cosOuterType.z，随灯表一起送到片元侧。
     //
@@ -1385,6 +1436,29 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
         prepareLocalShadows(scene, glm::vec3(ubo.camPos));
     }
     m_lighting->uploadLights(m_currentFrame, m_lightScratch);
+
+    // R3-3：把修饰描述里的"名字"解析成纹理层号，展平成 GPU 记录后上传。
+    // （名字 → 层号必须走 LightTextureLibrary，所以解析放在这里而不是 scene 层。）
+    resolveLightExt();
+    m_lighting->uploadLightExt(m_currentFrame, m_lightExtScratch);
+
+    // LIGHTX-DBG：光源修饰自检
+    static const bool lightxDbg = std::getenv("MYVK_LIGHTX_DBG") != nullptr;
+    static uint32_t lightxTick = 0;
+    if (resetSkinning && lightxDbg && (lightxTick++ % 30) == 1) {
+        uint32_t nIes = 0, nCookie = 0, nArea = 0;
+        for (const auto& e : m_lightExtScratch) {
+            if (e.tex.y > 0.5f) ++nIes;
+            if (e.tex.w > 0.5f) ++nCookie;
+            if (e.area.z > 0.5f) ++nArea;
+        }
+        VK_LOG_INFO("LIGHTX-DBG lights=%u ies=%u cookie=%u area=%u "
+                    "nodes=%u iesOn=%d cookieOn=%d areaOn=%d",
+                    static_cast<unsigned>(m_lightExtScratch.size()), nIes, nCookie,
+                    nArea, m_lightTextures ? m_lightTextures->layerCount() : 0u,
+                    m_iesEnabled ? 1 : 0, m_cookieEnabled ? 1 : 0,
+                    m_areaLightEnabled ? 1 : 0);
+    }
 
     const float clusterNear = 2.0f * kNear * kFar / (kNear + kFar);
     ubo.cameraParams =
@@ -2767,6 +2841,18 @@ void Renderer::writeGlobalSet(VkDescriptorSet set, uint32_t frameIndex,
         m_descriptors->writeTexture(set, 16, m_vfog->neutralSampler(),
                                     m_vfog->neutralView());
     }
+
+    // binding 17：逐灯修饰记录（R3-3）。每帧 in-flight 一块。
+    m_descriptors->writeBuffer(set, 17, m_lighting->lightExtBuffer(i),
+                               m_lighting->lightExtBufferSize(),
+                               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+
+    // binding 18：光源修饰纹理库（cookie + IES）。库是程序化生成的、
+    // 生命周期与 Renderer 相同，永远有效；关闭时着色器按 enable 位跳过。
+    if (m_lightTextures && m_lightTextures->valid()) {
+        m_descriptors->writeTexture(set, 18, m_lightTextures->sampler(),
+                                    m_lightTextures->view());
+    }
 }
 
 // 懒建"某离屏目标本帧的相机 UBO 槽"。buffer 与 set 都只建一次，之后
@@ -3227,6 +3313,43 @@ void Renderer::prepareLocalShadows(scene::Scene& scene,
                     static_cast<unsigned>(m_localShadowCandidates.size()),
                     assigned, m_localShadowLayersUsed, total,
                     m_localShadowMaxLights, m_localShadowsEnabled ? 1 : 0);
+    }
+}
+
+// R3-3：把 collectLights 填好的"名字描述"解析成 GPU 的 LightExtInstance。
+// 三个总开关任何一个关掉时，对应字段保持 0 → 着色器走原始路径。
+// 名字找不到（拼错 / 没加载）时也退化成"无修饰"，不会让整盏灯失效。
+void Renderer::resolveLightExt() {
+    m_lightExtScratch.clear();
+    m_lightExtScratch.reserve(m_lightModScratch.size());
+    for (const auto& m : m_lightModScratch) {
+        scene::LightExtInstance e;  // 默认全零 = 无修饰
+
+        // 区域光：两半轴都 > 0 才算面光源
+        if (m_areaLightEnabled && m.areaHalfWidth > 0.0f &&
+            m.areaHalfHeight > 0.0f) {
+            e.area = glm::vec4(m.areaHalfWidth, m.areaHalfHeight, 1.0f, 0.0f);
+        }
+
+        // IES 光域网
+        if (m_iesEnabled && !m.iesProfile.empty() && m_lightTextures) {
+            const int layer = m_lightTextures->layerOf(m.iesProfile);
+            if (layer >= 0) {
+                e.tex.x = static_cast<float>(layer);
+                e.tex.y = 1.0f;
+            }
+        }
+
+        // light function（投影贴图）
+        if (m_cookieEnabled && !m.lightFunction.empty() && m_lightTextures) {
+            const int layer = m_lightTextures->layerOf(m.lightFunction);
+            if (layer >= 0) {
+                e.tex.z = static_cast<float>(layer);
+                e.tex.w = 1.0f;
+            }
+        }
+
+        m_lightExtScratch.push_back(e);
     }
 }
 

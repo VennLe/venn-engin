@@ -540,6 +540,11 @@ json spotLightToJson(const ecs::SpotLightComponent& L) {
         {"innerAngle", L.innerAngle},     {"outerAngle", L.outerAngle},
         {"enabled", L.enabled},
         {"castsShadow", L.castsShadow},
+        // R3-3 光源修饰（空串 / 0 = 不用，与旧场景二进制兼容）
+        {"areaWidth", L.areaWidth},
+        {"areaHeight", L.areaHeight},
+        {"iesProfile", L.iesProfile},
+        {"lightFunction", L.lightFunction},
     };
 }
 
@@ -568,6 +573,11 @@ ecs::SpotLightComponent spotLightFromJson(const json& j) {
     L.outerAngle = j.value("outerAngle", L.outerAngle);
     L.enabled = j.value("enabled", L.enabled);
     L.castsShadow = j.value("castsShadow", L.castsShadow);
+    // R3-3 光源修饰
+    L.areaWidth = j.value("areaWidth", L.areaWidth);
+    L.areaHeight = j.value("areaHeight", L.areaHeight);
+    L.iesProfile = j.value("iesProfile", L.iesProfile);
+    L.lightFunction = j.value("lightFunction", L.lightFunction);
     return L;
 }
 

@@ -348,9 +348,10 @@ def main():
              {"Color", "Intensity", "Range", "Enabled"}),
             ("Directional Light", "DirectionalLight", "Directional",
              {"Direction", "Color", "Intensity", "Ambient", "CastsShadow"}),
+            # R3-3 起射灯多了一组"光源修饰"字段（区域光尺寸 / IES / cookie）
             ("Spot Light", "SpotLight", "Spot",
              {"Color", "Intensity", "Range", "Direction",
-              "InnerCone", "OuterCone", "Enabled"}),
+              "InnerCone", "OuterCone", "Area", "IES", "Cookie", "Enabled"}),
         ]
         light_sets = {}
         for name, tag, typename, expect in want:

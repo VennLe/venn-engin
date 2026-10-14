@@ -125,7 +125,10 @@ public:
     // ---- 局部光源收集（分簇前向渲染）----
     // 把所有 enabled 的点光/射灯展平成 LightInstance（位置取世界矩阵平移）。
     // 传入 out 由调用方复用，避免每帧分配。
-    void collectLights(std::vector<LightInstance>& out) const;
+    // mods 非空时同步填一份逐灯修饰描述（R3-3：区域光 / IES / light function），
+    // **下标与 out 严格一一对应**（同一盏灯在同一位置 push）。
+    void collectLights(std::vector<LightInstance>& out,
+                       std::vector<LightModifierDesc>* mods = nullptr) const;
 
     // 统计信息（ImGui 显示用）
     struct LightStats {

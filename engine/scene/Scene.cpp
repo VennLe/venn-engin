@@ -91,8 +91,12 @@ const Light& Scene::light() const {
 
 // ---------------------------------------------------------------- 局部光源
 
-void Scene::collectLights(std::vector<LightInstance>& out) const {
+void Scene::collectLights(std::vector<LightInstance>& out,
+                          std::vector<LightModifierDesc>* mods) const {
     out.clear();
+    if (mods) mods->clear();
+    // 每 push 一盏灯就 push 一条修饰描述 —— 两者下标必须严格对齐。
+    // 没有修饰的灯（点光 / 方向光）push 一条空的占位。
 
     // 点光
     m_world.each<ecs::PointLightComponent>(
@@ -100,6 +104,7 @@ void Scene::collectLights(std::vector<LightInstance>& out) const {
             if (!pl.enabled) return;
             const glm::vec3 pos = glm::vec3(worldMatrix(e)[3]);
             out.push_back(makePointLight(pos, pl));
+            if (mods) mods->push_back(LightModifierDesc{});
         });
 
     // 射灯（放在后面：着色器按顺序遍历，点光通常更多、
@@ -109,6 +114,14 @@ void Scene::collectLights(std::vector<LightInstance>& out) const {
             if (!sl.enabled) return;
             const glm::vec3 pos = glm::vec3(worldMatrix(e)[3]);
             out.push_back(makeSpotLight(pos, sl));
+            if (mods) {
+                LightModifierDesc d;
+                d.areaHalfWidth = sl.areaWidth * 0.5f;
+                d.areaHalfHeight = sl.areaHeight * 0.5f;
+                d.iesProfile = sl.iesProfile;
+                d.lightFunction = sl.lightFunction;
+                mods->push_back(std::move(d));
+            }
         });
 
     // 实体级方向光（编辑器可以摆多盏，作为"补光"用 —— 无阴影、无衰减）。
@@ -120,6 +133,7 @@ void Scene::collectLights(std::vector<LightInstance>& out) const {
             if (dl.intensity <= 0.0f) return;
             const glm::vec3 pos = glm::vec3(worldMatrix(e)[3]);
             out.push_back(makeDirectionalLight(pos, dl));
+            if (mods) mods->push_back(LightModifierDesc{});
         });
 }
 

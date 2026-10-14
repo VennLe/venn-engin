@@ -106,6 +106,11 @@ public:
     void uploadLights(uint32_t frameIndex,
                       const std::vector<scene::LightInstance>& lights);
 
+    // 每帧把逐灯修饰记录（R3-3：区域光 / IES / light function）写进
+    // 并行 SSBO。下标必须与 uploadLights 的灯表严格对齐。
+    void uploadLightExt(uint32_t frameIndex,
+                        const std::vector<scene::LightExtInstance>& ext);
+
     // 在帧开始（等待栅栏之后）调用，把上一帧的遥测读回 CPU，并清零统计缓冲
     void beginFrame(uint32_t frameIndex);
 
@@ -118,6 +123,9 @@ public:
     // ---- 资源句柄（Renderer 负责写进 set 0 的 binding 2/3/4/5）----
     VkBuffer lightsBuffer(uint32_t frameIndex) const;
     VkDeviceSize lightsBufferSize() const;
+    // 逐灯修饰记录（binding 17）—— 容量与 lights 相同（kMaxLights）
+    VkBuffer lightExtBuffer(uint32_t frameIndex) const;
+    VkDeviceSize lightExtBufferSize() const;
     VkBuffer clustersBuffer(uint32_t frameIndex) const;
     VkDeviceSize clustersBufferSize() const;
     VkBuffer lightIndicesBuffer(uint32_t frameIndex) const;
@@ -147,11 +155,13 @@ public:
 private:
     struct FrameData {
         std::unique_ptr<rhi::Buffer> lights;
+        std::unique_ptr<rhi::Buffer> lightExt;  // R3-3 修饰记录（binding 17）
         std::unique_ptr<rhi::Buffer> clusters;
         std::unique_ptr<rhi::Buffer> lightIndices;
         std::unique_ptr<rhi::Buffer> stats;
         void* statsMapped = nullptr;  // 4 个 uint：见 cluster_build.comp
         void* lightsMapped = nullptr;
+        void* lightExtMapped = nullptr;
     };
 
     void destroyFrames();

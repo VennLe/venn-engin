@@ -160,6 +160,21 @@ layout(std430, set = 0, binding = 4) readonly buffer LightIndexBuffer {
     uint lightIndices[];
 };
 
+// ---- R3-3：逐灯修饰记录（下标与 lights[] 严格对齐）----
+// area: x=半宽(米) y=半高(米) z=是否面光源 w=保留
+// tex : x=IES层号(-1=无) y=IES开关 z=cookie层号(-1=无) w=cookie开关
+struct LightExt {
+    vec4 area;
+    vec4 tex;
+};
+layout(std430, set = 0, binding = 17) readonly buffer LightExtBuffer {
+    LightExt lightExt[];
+};
+
+// 光源修饰纹理库（cookie + IES 共用一张数组）。第 0 层恒为全白：
+// 任何"没配贴图"的灯都退化成乘 1。
+layout(set = 0, binding = 18) uniform sampler2DArray lightTex;
+
 #if VENN_BINDLESS
 // ============================================================
 // Bindless 路径（R2-3，-DVENN_BINDLESS=1 编出 pbr.bindless.k<N>.frag.spv）
@@ -669,6 +684,110 @@ vec3 shadeLocalLight(Light L, vec3 N, vec3 V, vec3 worldPos, vec3 albedo,
     return (kD * albedo / PI + specular) * radiance * NdotL;
 }
 
+// ============================================================
+// R3-3：带光源修饰的局部光照求值
+//
+//   ① IES：按"灯→片元"方向的角度采样柱面展开的光域网剖面（角度→强度）
+//   ② light function：把片元方向投影到灯锥截面，采样投影贴图（cookie）
+//   ③ 区域光：矩形发射体按"球光代表点"近似 —— 漫反射取最近点（软化
+//      接触处过曝），高光沿反射光取球面最近点（把高光摊开变柔）
+//
+// 只有三个开关里至少一个为真时才走到这里；否则走原始 shadeLocalLight，
+// 保证"修饰全关 = 基线逐位一致"。三个开关都是每灯常量，所以关了的时候
+// 这个分支在 entire warp 上一致，没有发散代价。
+// ============================================================
+vec3 shadeLocalLightMod(Light L, LightExt E, vec3 N, vec3 V, vec3 worldPos,
+                        vec3 albedo, vec3 F0, float roughness,
+                        float metallic) {
+    vec3 toLight = L.positionRange.xyz - worldPos;
+    float dist = length(toLight);
+    float range = L.positionRange.w;
+    if (dist >= range) return vec3(0.0);
+
+    vec3 Lc = toLight / max(dist, 1e-5);
+    vec3 Ld = Lc;   // 漫反射方向
+    vec3 Ls = Lc;   // 高光方向（区域光时才与 Ld 不同）
+    float attD = distanceAttenuation(dist, range);
+    float attS = attD;
+    float mod = 1.0;  // IES × cookie 的乘性调制
+
+    // 灯的局部正交基（由传播方向定义；与 CPU 侧的投影基同源约定）
+    const vec3 D = normalize(L.directionCosInner.xyz);
+    const vec3 upv = abs(D.z) > 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+    const vec3 T1 = normalize(cross(upv, D));
+    const vec3 T2 = cross(D, T1);
+
+    if (L.cosOuterType.y > 0.5) {  // 射灯：先算锥形衰减
+        const float cosAngle = dot(-Lc, D);
+        const float s = spotAttenuation(cosAngle, L.directionCosInner.w,
+                                        L.cosOuterType.x);
+        attD *= s * s;
+        attS *= s * s;
+
+        // ---- ② light function（投影贴图 / cookie）----
+        if (E.tex.w > 0.5) {
+            const vec3 rel = worldPos - L.positionRange.xyz;
+            const float z = dot(rel, D);
+            const float tanOuter =
+                tan(acos(clamp(L.cosOuterType.x, -1.0, 1.0)));
+            const vec2 uvc = vec2(dot(rel, T1), dot(rel, T2)) /
+                                 max(z * tanOuter, 1e-5) * 0.5 + 0.5;
+            const bool inside = (z > 0.0) &&
+                                all(greaterThanEqual(uvc, vec2(0.0))) &&
+                                all(lessThanEqual(uvc, vec2(1.0)));
+            mod *= inside ? texture(lightTex, vec3(uvc, E.tex.z)).r : 0.0;
+        }
+    }
+
+    // ---- ① IES 光域网（点光 / 射灯通用）----
+    if (E.tex.y > 0.5) {
+        const vec3 dir = -Lc;  // 灯 → 片元
+        const float theta = acos(clamp(dot(dir, D), -1.0, 1.0));  // 0..π
+        const float phi = atan(dot(dir, T2), dot(dir, T1)) / (2.0 * PI) + 0.5;
+        mod *= texture(lightTex, vec3(phi, theta / PI, E.tex.x)).r;
+    }
+
+    // ---- ③ 区域光（矩形 → 球光代表点）----
+    if (E.area.z > 0.5) {
+        const float r = sqrt(max(E.area.x * E.area.y, 0.0));  // 等面积球半径
+        if (r > 1e-4) {
+            // 漫反射：用"离片元最近的球面"作代表点（软化接触过曝）
+            attD = distanceAttenuation(max(dist - r, 1e-4), range);
+            // 高光：UE4 式球光代表点 —— 反射光线上离球面最近的点
+            const vec3 Rr = reflect(-V, N);
+            const vec3 centerToRay = dot(toLight, Rr) * Rr - toLight;
+            const float c2r = length(centerToRay);
+            const vec3 closest =
+                toLight + centerToRay * clamp(r / max(c2r, 1e-4), 0.0, 1.0);
+            const float dS = max(length(closest), 1e-4);
+            Ls = closest / dS;
+            attS = distanceAttenuation(dS, range);
+        }
+    }
+
+    const float NdotLd = max(dot(N, Ld), 0.0);
+    const float NdotLs = max(dot(N, Ls), 0.0);
+    if (NdotLd <= 0.0 && NdotLs <= 0.0) return vec3(0.0);
+
+    const float shadow = localShadowFactor(L, worldPos, max(NdotLd, 1e-4));
+    if (shadow <= 0.0) return vec3(0.0);
+
+    const float NdotV = max(dot(N, V), 1e-4);
+    const vec3 H = normalize(V + Ls);
+    const float NDF = distributionGGX(N, H, roughness);
+    const float G = geometrySmith(N, V, Ls, roughness);
+    const vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+    const vec3 specular = (NDF * G * F) / max(4.0 * NdotV * NdotLs, 1e-4);
+    const vec3 kS = F;
+    const vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
+
+    const vec3 radiance =
+        L.colorIntensity.rgb * L.colorIntensity.a * mod * shadow;
+    const vec3 diffuse = kD * albedo / PI * attD * NdotLd;
+    const vec3 spec = specular * attS * NdotLs;
+    return (diffuse + spec) * radiance;
+}
+
 void main() {
 #if VENN_BINDLESS
     // 材质页查一次：页号在 push.emissive.w 里（+0.5 是为了把 float 稳妥地
@@ -784,8 +903,15 @@ void main() {
 
     for (uint i = 0u; i < lightCount; ++i) {
         const uint li = lightIndices[cluster.x + i];
-        localLights += shadeLocalLight(lights[li], N, V, vWorldPos, albedo, F0,
-                                       roughness, metallic);
+        const LightExt ex = lightExt[li];
+        // 三个修饰开关全关 → 走**原样**的 shadeLocalLight，与基线逐位一致。
+        if (ex.tex.y > 0.5 || ex.tex.w > 0.5 || ex.area.z > 0.5) {
+            localLights += shadeLocalLightMod(lights[li], ex, N, V, vWorldPos,
+                                              albedo, F0, roughness, metallic);
+        } else {
+            localLights += shadeLocalLight(lights[li], N, V, vWorldPos, albedo,
+                                           F0, roughness, metallic);
+        }
     }
 
     // ---------------- 环境光 ----------------

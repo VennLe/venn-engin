@@ -122,6 +122,7 @@ namespace render {
 
 class SSAOPass;
 class VolumetricFog;
+class LightTextureLibrary;
 class FrameGraph;
 struct FrameGraphInput;
 
@@ -789,6 +790,9 @@ private:
     //   LightInstance::cosOuterType.z）要随灯表一起送到片元侧，晚了就
     //   会出现"片上写的是上一帧的层号"。
     void prepareLocalShadows(scene::Scene& scene, const glm::vec3& camPos);
+
+    // R3-3：把 m_lightModScratch（名字）解析成 m_lightExtScratch（层号）
+    void resolveLightExt();
     // 逐层录制 depth-only pass：**所有层都要走一遍**（未使用的层只清深度），
     // 否则那张 array 会有一层停在 UNDEFINED 而被采样 → 验证层直接报错。
     void recordLocalShadowPasses(VkCommandBuffer cmd, scene::Scene& scene,
@@ -860,6 +864,8 @@ private:
     // ---- 屏幕空间效果（见 screenSpaceSettings() 的注释）----
     std::unique_ptr<render::SSAOPass> m_ssao;
     std::unique_ptr<render::VolumetricFog> m_vfog;
+    // R3-3：光源修饰纹理库（cookie + IES 的 sampler2DArray）
+    std::unique_ptr<render::LightTextureLibrary> m_lightTextures;
     std::unique_ptr<render::FrameGraph> m_frameGraph;
 
     // ---- Hi-Z 遮挡剔除（R2-1，见 occlusionCullingEnabled() 的注释）----
@@ -1011,6 +1017,9 @@ private:
 
     // 每帧复用的灯列表（避免每帧分配）
     std::vector<scene::LightInstance> m_lightScratch;
+    // R3-3：逐灯修饰（CPU 名字描述 → 解析成 GPU LightExtInstance）
+    std::vector<scene::LightModifierDesc> m_lightModScratch;
+    std::vector<scene::LightExtInstance> m_lightExtScratch;
 
     // ---- 物体级视锥剔除 ----
     // 本帧**当前场景**的相机视锥（uploadSceneState 里按该场景的相机重建；
@@ -1115,6 +1124,15 @@ private:
     bool m_shadowTexelSnap = true;    // ③ 球心光空间纹素量化
     float m_shadowBlend = 0.0f;       // ① 级联间混合带宽（占本级跨度比例）
     float m_shadowHarden = 0.0f;      // ② 接触硬化强度
+
+    // ---- 光源修饰（R3-3）----
+    // 三个总开关默认**关**：关时逐灯修饰记录全为零 → 着色器走原始路径，
+    // 与基线逐位一致。组件上的名字只是"想用什么"，真正的开关在这里。
+    bool m_iesEnabled = false;         // IES 光域网
+    bool m_cookieEnabled = false;      // light function 投影贴图
+    bool m_areaLightEnabled = false;   // 矩形区域光
+    // MYVK_IES_FILE 的原始串（库建好后解析加载）
+    std::string m_iesFileSpec;
 
     // ---- 局部光源阴影（点光 / 聚光灯）----
     bool m_localShadowsEnabled = true;

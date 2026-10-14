@@ -66,6 +66,36 @@ struct LightInstance {
 static_assert(sizeof(LightInstance) == 64,
               "LightInstance 必须与着色器 struct Light 的 std430 布局一致");
 
+// ============================================================
+// LightModifierDesc —— CPU 侧的光源修饰描述（R3-3）
+//
+// LightInstance 刻意保持 64 字节、一字不改（阴影/分簇都按它算偏移），
+// 所以"区域光 / IES / light function"这三样修饰单独走一条并行数组。
+// 名字（不是层号）放在这里 —— 层号要由 Renderer 用 LightTextureLibrary
+// 解析（scene 层不认识 GPU 纹理）。
+// ============================================================
+struct LightModifierDesc {
+    float areaHalfWidth = 0.0f;    // 矩形面光源半宽（米）；0 = 不是面光源
+    float areaHalfHeight = 0.0f;   // 半高
+    std::string iesProfile;        // IES 名字（空 = 不用）
+    std::string lightFunction;     // 投影贴图名字（空 = 不用）
+};
+
+// ============================================================
+// LightExtInstance —— 展平后送 GPU 的逐灯修饰记录（32 字节）
+//
+// 与着色器 struct LightExt 的 std430 布局严格对应（2×vec4）。
+// ============================================================
+struct LightExtInstance {
+    // x = 半宽(米) y = 半高(米) z = 是否面光源(0/1) w = 保留
+    glm::vec4 area{0.0f};
+    // x = IES 层号(-1=无) y = IES 开关(0/1)
+    // z = light function 层号(-1=无) w = light function 开关(0/1)
+    glm::vec4 tex{-1.0f, 0.0f, -1.0f, 0.0f};
+};
+static_assert(sizeof(LightExtInstance) == 32,
+              "LightExtInstance 必须与着色器 struct LightExt 的 std430 布局一致");
+
 // 把一盏灯加成 LightInstance（位置由调用方给出，通常取实体世界矩阵平移）
 inline LightInstance makePointLight(const glm::vec3& pos,
                                     const ecs::PointLightComponent& pl) {

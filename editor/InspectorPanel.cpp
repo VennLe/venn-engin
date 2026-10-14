@@ -1314,7 +1314,50 @@ void InspectorPanel::drawLights(ecs::Entity e) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("penumbra = outer - inner\nnarrow the gap for a harder edge");
 
-        labels = "Color,Intensity,Range,Direction,InnerCone,OuterCone,Enabled";
+        // ---- 光源修饰（R3-3）：区域光尺寸 / IES / light function ----
+        // 三者都共享灯的局部正交基，所以只有射灯有这几项。真正的总开关
+        // 在渲染器（MYVK_AREA_LIGHT / MYVK_IES / MYVK_COOKIE）—— 这里只
+        // 写"这盏灯想用什么"。
+        ImGui::SeparatorText("Modifiers");
+        {
+            const float aw0 = sl->areaWidth;
+            ImGui::DragFloat("Area Width", &sl->areaWidth, 0.05f, 0.0f, 40.0f,
+                             "%.2f");
+            probe("AreaWidth");
+            fieldEdit(m_ctx, "Spot Area Width", &sl->areaWidth, aw0);
+            const float ah0 = sl->areaHeight;
+            ImGui::DragFloat("Area Height", &sl->areaHeight, 0.05f, 0.0f, 40.0f,
+                             "%.2f");
+            probe("AreaHeight");
+            fieldEdit(m_ctx, "Spot Area Height", &sl->areaHeight, ah0);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "rect area light size in metres (0 = point-like)\n"
+                    "softens the highlight; needs MYVK_AREA_LIGHT=1");
+
+            static const char* kIesItems[] = {"(none)", "ies:narrow",
+                                              "ies:wide", "ies:batwing"};
+            static const char* kCookieItems[] = {"(none)", "cookie:grid",
+                                                 "cookie:rings",
+                                                 "cookie:bars"};
+            auto nameCombo = [](const char* label, std::string& value,
+                                const char* const* items, int n) {
+                int cur = 0;
+                for (int i = 1; i < n; ++i)
+                    if (value == items[i]) cur = i;
+                if (ImGui::Combo(label, &cur, items, n))
+                    value = (cur == 0) ? std::string() : std::string(items[cur]);
+            };
+            nameCombo("IES", sl->iesProfile, kIesItems, 4);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("IES photometric web\nneeds MYVK_IES=1");
+            nameCombo("Light Function", sl->lightFunction, kCookieItems, 4);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("projected cookie texture\nneeds MYVK_COOKIE=1");
+        }
+
+        labels = "Color,Intensity,Range,Direction,InnerCone,OuterCone,"
+                 "Area,IES,Cookie,Enabled";
 
         bool en = sl->enabled;
         if (ImGui::Checkbox("Enabled", &en)) {

@@ -491,17 +491,73 @@
 - **规模**：M
 
 
-### R3-2 Froxel 体积雾
+### R3-2 Froxel 体积雾 ✅ 已完成（2026-10-13）
 
 - **目标**：局部雾团、灯光散射（点/聚光在雾里的光柱）、被物体遮挡——替换现在解析式高度雾的"均匀介质"假设。
-- **改动点**：froxel 网格（如 160x90x64）→ 从深度图 reconstruct 世界坐标 → 沿视线积分散射（每 froxel 内对簇内灯求 inscattering，复用分簇光照的簇数据！）→ 前向 pass 里按像素 froxel 采样雾。God rays pass 可被它取代（保留开关）。
-- **坑点预警**：MSAA 深度图 resolve 后是中心样本，froxel 深度重建要用 per-pixel 深度（MSAA 下用 resolve 深度或降采样深度——先走 resolve 接受误差）。
-- **验收**：关=基线逐像素不变；开时聚光灯锥内出现光柱；雾团有局部形状；`MYVK_FOG_*` 密度参数单调。
+- **交付**：
+  - **`render/VolumetricFog.{h,cpp}`**：`RGBA16F` 3D froxel 图（每 texel =
+    `(inscatter.rgb, transmittance)`）+ 两条 compute 管线 + 1×1×1 缺省"透明"图
+    （关闭时 set0/binding16 绑它）。网格 = 屏幕 / 16 × 64 层。
+  - **`assets/shaders/fog_inject.comp`**：每 froxel 反投影视锥小块 → 世界 AABB →
+    密度（高度衰减 + 雾团）→ 采 HdrTarget 深度做积分截断 → 遍历相交灯 + 太阳求
+    单位长度内散射（HG 相位）。**MSAA 双形态**（`-DVENN_MSAA_DEPTH=1` →
+    `sampler2DMS`）。
+  - **`assets/shaders/fog_integrate.comp`**：每 (x,y) 列沿 z 前向积分
+    （`T *= exp(-ext·len)`）写回 (inscatter, T)。
+  - **`pbr.frag`**：`binding 16 sampler3D vfogTex` + `ubo.vfogParams`（网格 + 开关）；
+    合成 `color = color·T + inscatter`。
+  - **`FrameUBO`** 末尾追加 `vec4 vfogParams` → **总 704 字节**（原 688）。
+    `kGlobalSetBindings` 16 → 17。
+  - 环境变量 `MYVK_VFOG` / `_DENSITY` / `_ALBEDO` / `_FALLOFF` / `_BLOB` /
+    `_PHASE_G`；`MYVK_VFOG_DBG=1` 打 `VFOG-DBG`。
+  - ⚠ **命名冲突**：`MYVK_FOG*` 已被**解析式高度雾**占用 → 全程用 `MYVK_VFOG*`。
+    两条雾是独立路径（高度雾解析、froxel 逐格积分），可同时开。
+- **验收**：`tools/verify_volumetric_fog.py`（4 组，已进回归 DEFAULT）：
+  · 关闭态两次运行差 **0.000000**；开启全屏均值差 0.88；
+  · 射灯锥区 3.61 vs 左上角 0.00（**ratio 3609×**，证局部形状）；
+  · 密度 0.01→0.05→0.12 差异 **0.31→1.37→2.66** 单调；
+  · 高度衰减 0.0→0.5 差异 **1.63→0.005**（雾变淡）。
 - **规模**：L
 
-### R3-3 （选做）区域光 / IES / light function
+### R3-3 区域光 / IES / light function ✅ 已完成（2026-10-14）
 
-- **目标**：面光源柔高光（解析 LTG 现成公式）、IES 光域网贴图（IES parser → 灯附加纹理）、light function 投影贴图。
+- **目标**：面光源柔高光、IES 光域网贴图（IES parser → 灯附加纹理）、light function 投影贴图。
+- **交付**：
+  - **数据层**：`scene::LightExtInstance`（32B）走**并行 SSBO**（set0/binding17），
+    下标与 `lights[]` 严格对齐 —— `LightInstance` 刻意保持 64 字节不动。
+    `Scene::collectLights(out, mods*)` 同步填 CPU 侧 `LightModifierDesc`（名字）。
+  - **`render/LightTextureLibrary.{h,cpp}`**：把 cookie 与 IES 剖面烘进**同一张**
+    `sampler2DArray`（256²，16 层，`R8G8B8A8_UNORM`，binding18）。第 0 层恒为
+    全白（恒等）。内建 7 层：`white` / `cookie:grid|rings|bars` /
+    `ies:narrow|wide|batwing`。支持运行时加载 `.ies`（**LM-63 Type C parser**：
+    跳关键字行 → 头行 10 数 → 竖/横角数组 → candela 网格 → 双线性重采样到
+    `(u=水平角, v=竖直角)`）。
+  - **着色器**（`pbr.frag::shadeLocalLightMod`）：
+    ① IES = 按"灯→片元"方向的角度采样柱面展开剖面；
+    ② light function = 把片元投影到灯锥截面 → `uvc` → 采样 cookie；
+    ③ 区域光 = **球光代表点近似**（漫反射取最近球面软化接触；高光沿反射光取
+       球面最近点 → 柔高光），等效半径 `r = sqrt(hw·hh)`。
+  - **组件**：`SpotLightComponent` 加 `areaWidth/areaHeight/iesProfile/
+    lightFunction`（名字）；`SceneSerializer` 存取；Inspector 加 "Modifiers"
+    段（Area W/H 滑条 + IES / Light Function 下拉）。
+  - 环境变量 `MYVK_IES` / `MYVK_COOKIE` / `MYVK_AREA_LIGHT`（默认全 **关**）；
+    `MYVK_IES_FILE="name:path;…"` 运行时加载 IES；`MYVK_LIGHTX_DBG=1` 打
+    `LIGHTX-DBG`。`kGlobalSetBindings` 17 → 19。
+- **⚠ 关键设计**：三个开关全关时逐灯记录全零 → 着色器走**原样的**
+  `shadeLocalLight`（不是"新函数里 mod=1"）→ **基线逐位一致**（避免浮点
+  重结合导致最后一位不同）。开关是每灯常量，分支在 warp 上一致，无发散代价。
+- **⚠ 教训（测试场景必须先确认信号可见）**：首版测试场景把射灯摆在相机
+  正下方（光池在 FOV 之外），结果 cookie/IES 的差分**全是 0**，一度以为
+  着色器没生效。实际上是"信号不在画面里"。→ 写验证脚本前先用光池包围盒
+  确认光池可见（脚本里 `bright_bbox` 直接做了这个自检）。
+- **验收**：`tools/verify_light_modifiers.py`（6 组，已进回归 DEFAULT）：
+  · 组1 默认三修饰全关 + 两次运行差 **0.000000**；
+  · 组2 cookie：均值差 5.63，光池中线差值**振荡穿越 10 次**（周期性网格，
+    不是均匀调暗），光池内 17.65 vs 左上角 0.00；
+  · 组3 IES：亮像素 **52756 → 6144**（收窄到 12%）；
+  · 组4 区域光：面积 4 / 10 / 22 → 差异 **90.99 < 97.23 < 107.31** 单调；
+  · 组5 名字拼错 → ies=0、差异 0.000000（安全回退）；
+  · 组6 `.ies` 文件加载：nodes 7 → 8 且新层被用上（差异 7.97）。
 - **规模**：M
 
 ---
@@ -616,7 +672,8 @@
 R0-1 GPU时戳 ──► R0-2 视图模式 ──► R1-1 TAA ──► R4-1 AlphaMask(小,穿插) ──► R3-1 阴影硬化 ✅
       │                                  │
       ▼                                  ▼
-  R2-1 Hi-Z ──► R1-2 自动曝光 ──► R1-3 LUT ──► R3-2 体积雾 ──► R4-2 SSS ──► R5-1 反射探针
+  R2-1 Hi-Z ──► R1-2 自动曝光 ──► R1-3 LUT ──► R3-2 体积雾 ✅ ──► R4-2 SSS ──► R5-1 反射探针
+                                                  R3-3 光源修饰 ✅（区域光/IES/light function）
       │
       ▼
   R2-2 indirect ──► R2-3 bindless ──► (R7-x 架构层)

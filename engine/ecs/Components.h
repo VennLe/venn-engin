@@ -281,6 +281,21 @@ struct SpotLightComponent {
     bool enabled = true;
     // 射灯只占 **1 层**（沿锥轴的透视投影），代价很低，所以默认开
     bool castsShadow = true;
+
+    // ---------------- R3-3 光源修饰 ----------------
+    // 三者共享灯的局部正交基（由 direction 定义），所以只有射灯支持。
+    //
+    // 矩形面光源尺寸（米）。任一为 0 = 点状（默认，= 原行为）。
+    // 非 0 时按"矩形发射体"求值：漫反射用最近点、高光用 UE4 式球光
+    // 代表点 → 高光变柔、接触处不再过曝。
+    float areaWidth = 0.0f;
+    float areaHeight = 0.0f;
+    // IES 光域网：内建 "ies:narrow" / "ies:wide" / "ies:batwing"，
+    // 或运行时加载的 .ies 文件名。空 = 不用。
+    std::string iesProfile;
+    // light function（投影贴图 / cookie）：内建 "cookie:grid" /
+    // "cookie:rings" / "cookie:bars"。空 = 不用。
+    std::string lightFunction;
 };
 
 // ---------------- 脚本 ----------------

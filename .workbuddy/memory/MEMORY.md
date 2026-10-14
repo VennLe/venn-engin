@@ -59,6 +59,11 @@ cmake --build build -j 8
 - 环境/IBL：`MYVK_SKY / IBL / SKY_ZENITH / SKY_GROUND / SKY_RES / ENV_DBG=1`。
 - Froxel 体积雾（R3-2）：`MYVK_VFOG=1` / `MYVK_VFOG_DENSITY` / `MYVK_VFOG_ALBEDO` /
   `MYVK_VFOG_FALLOFF` / `MYVK_VFOG_BLOB` / `MYVK_VFOG_PHASE_G` / `MYVK_VFOG_DBG=1`(打 `VFOG-DBG`)。
+- 光源修饰（R3-3，**只对射灯生效**，默认全关）：`MYVK_IES=1` / `MYVK_COOKIE=1` /
+  `MYVK_AREA_LIGHT=1`；`MYVK_IES_FILE="name:path;name2:path2"` 加载 `.ies`(LM-63)；
+  `MYVK_LIGHTX_DBG=1` 打 `LIGHTX-DBG`。内建纹理名：`cookie:grid|rings|bars`、
+  `ies:narrow|wide|batwing`。真正的开关在组件字段（`SpotLightComponent::iesProfile/
+  lightFunction/areaWidth/areaHeight`）里写"想用什么"，总开关在渲染器。
   ⚠ **`MYVK_FOG*` 是另一条路径**（解析式**高度雾**，只在 pbr.frag 里按世界坐标求值）——
   两条独立，别混。froxel 雾默认关，关时 set0/binding16 绑 1×1×1 透明图 = 基线逐位不变。
 - `MYVK_LOG_RECTS=1`：打印关键控件矩形（自动化定位）；各子系统落盘日志见"工具"节。
@@ -127,13 +132,16 @@ Forward(天空盒 → 不透明 → 地平面栅格 → 透明，MSAA resolve，
   rendering）。每层单独建 `VIEW_TYPE_2D` 视图 + framebuffer；采样侧才用 `sampler2DArrayShadow`。
 
 ### 描述符 / FrameUBO / 推常量
-- **set 0（17 个 binding）**：0 FrameUBO / 1 shadowMap(`sampler2DArrayShadow`，第 i 层=第 i 级) /
+- **set 0（19 个 binding）**：0 FrameUBO / 1 shadowMap(`sampler2DArrayShadow`，第 i 层=第 i 级) /
   2 lights / 3 clusters / 4 lightIndices / 5 clusterStats / 6 jointMatrices / 7 irradianceMap /
   8 prefilterMap / 9 brdfLut / 10 skyMap / 11 lightShadows(`LightShadowRecord[]` SSBO，VERTEX|FRAGMENT) /
   12 localShadowMap(`sampler2DArrayShadow`) / 13 instanceModels(vertex, instancing) /
   14 ssaoTex(R8，关时绑白图) / 15 mdiInstances(vertex, MDI) /
-  16 vfogTex(`sampler3D`，R3-2，关时绑 1×1×1 透明图)。`kGlobalSetBindings = 17`。
-  （灯/环境/雾资源全挤 set 0：Vulkan 只保证 4 个 set 同时绑，set 1..6 已被六张材质贴图占满。）
+  16 vfogTex(`sampler3D`，R3-2，关时绑 1×1×1 透明图) /
+  17 lightExt(`LightExtInstance[]`，R3-3，与 binding2 下标对齐) /
+  18 lightTex(`sampler2DArray`，R3-3，cookie+IES 共用，第 0 层恒全白，永有效)。
+  `kGlobalSetBindings = 19`。
+  （灯/环境/雾/光源修饰资源全挤 set 0：Vulkan 只保证 4 个 set 同时绑，set 1..6 已被六张材质贴图占满。）
 - **`FrameUBO` 704 字节**（std140，有 `static_assert`）。历史：IBL `envParams`(384) → CSM
   `lightSpace[4]`+`shadowParams`(576)/`cascadeSplits`(592)/`shadowBias`(608) → `localShadowParams`(624)
   → 高度雾 `fogParams`(640) → `viewModeParams`(656) → R3-1 `shadowFilter`(672) → R3-2 `vfogParams`(688)
@@ -157,6 +165,12 @@ Forward(天空盒 → 不透明 → 地平面栅格 → 透明，MSAA resolve，
 - `maxLightsPerCluster` **唯一数据源是 C++**（经 `ubo.lightParams.w` 传片元），**禁在 pbr.frag 硬编码**。
   只花显存不花时间 → 默认 128。
 - 射灯只按 range 球剔除；衰减用窗口化平方反比 `win²/d²`，range 处严格归零。
+- **光源修饰（R3-3）**：`LightInstance` 保持 64B 不动，修饰走**并行 SSBO**
+  `LightExtInstance`(32B, binding17)，**下标与 `lights[]` 严格对齐**
+  （`Scene::collectLights(out, mods*)` 同一循环 push）。三修饰 = IES（角度剖面）/
+  cookie（锥内投影）/ 区域光（球光代表点 `r=√(hw·hh)`）。
+  ⚠ **基线纪律**：三开关全关 → 记录全零 → 着色器走**原样的** `shadeLocalLight`
+  分支（不是"新函数里 mod=1"）—— 浮点重结合会让最后一位不同，破坏"关=基线逐位一致"。
 - 透明（Blend）不写深度、按相机距离**降序**排序、**不参与深度预通道**。
 - 遥测 `stats` SSBO：0 单簇最大/1 溢出簇数/2 配对数/3 空簇数（`beginFrame` 回读并清零）。
 

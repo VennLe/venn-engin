@@ -47,7 +47,7 @@ TOOLS_DIR = os.path.join(ROOT, "tools")
 DEFAULT = [
     "verify_frustum_cull", "verify_bvh", "verify_lod", "verify_ibl",
     "verify_csm", "verify_local_shadow", "verify_shadow_hardening",
-    "verify_volumetric_fog",
+    "verify_volumetric_fog", "verify_light_modifiers",
     "verify_shader_variants",
     "verify_shader_hotreload", "verify_fxaa", "verify_instancing",
     "verify_nav_gizmo",

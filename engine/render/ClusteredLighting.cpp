@@ -99,6 +99,17 @@ void ClusteredLighting::buildBuffers() {
         f.lightsMapped = f.lights->map();
         std::memset(f.lightsMapped, 0, static_cast<size_t>(lightsBytes));
 
+        // ---- lightExt：逐灯修饰（R3-3），同样每帧上传 → HOST_VISIBLE ----
+        const VkDeviceSize extBytes =
+            static_cast<VkDeviceSize>(kMaxLights) *
+            sizeof(scene::LightExtInstance);
+        f.lightExt = std::make_unique<rhi::Buffer>(
+            m_device, extBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        f.lightExtMapped = f.lightExt->map();
+        std::memset(f.lightExtMapped, 0, static_cast<size_t>(extBytes));
+
         // ---- clusters：纯 GPU 随机访问 → DEVICE_LOCAL ----
         // 用 vkCmdFillBuffer 清零：初始内容必须是"0 盏灯"，否则首帧
         // 描述符还没被 compute 写过时会读到垃圾。
@@ -133,9 +144,11 @@ void ClusteredLighting::destroyFrames() {
     for (auto& f : m_frames) {
         f.statsMapped = nullptr;
         f.lightsMapped = nullptr;
+        f.lightExtMapped = nullptr;
         f.stats.reset();
         f.lightIndices.reset();
         f.clusters.reset();
+        f.lightExt.reset();
         f.lights.reset();
     }
     // 缓冲区由 unique_ptr 释放，但槽位保留 —— recreate() 之后立刻重新填充
@@ -165,6 +178,21 @@ void ClusteredLighting::uploadLights(
 
     // 清零遥测：本帧的 compute 会重新累加
     if (f.statsMapped) std::memset(f.statsMapped, 0, 4 * sizeof(uint32_t));
+}
+
+void ClusteredLighting::uploadLightExt(
+    uint32_t frameIndex, const std::vector<scene::LightExtInstance>& ext) {
+    if (m_frames.empty()) return;
+    auto& f = m_frames[frameIndex % m_frames.size()];
+    if (!f.lightExt || !f.lightExtMapped) return;
+
+    uint32_t n = static_cast<uint32_t>(ext.size());
+    if (n > kMaxLights) n = kMaxLights;
+    // 未提供的尾部显式清零：灯数减少时不能读到上一帧残留的修饰。
+    auto* dst = static_cast<scene::LightExtInstance*>(f.lightExtMapped);
+    for (uint32_t i = 0; i < kMaxLights; ++i) {
+        dst[i] = (i < n) ? ext[i] : scene::LightExtInstance{};
+    }
 }
 
 void ClusteredLighting::beginFrame(uint32_t frameIndex) {
@@ -236,6 +264,12 @@ VkBuffer ClusteredLighting::lightsBuffer(uint32_t frameIndex) const {
 }
 VkDeviceSize ClusteredLighting::lightsBufferSize() const {
     return static_cast<VkDeviceSize>(kMaxLights) * sizeof(scene::LightInstance);
+}
+VkBuffer ClusteredLighting::lightExtBuffer(uint32_t frameIndex) const {
+    return m_frames[frameIndex % m_frames.size()].lightExt->get();
+}
+VkDeviceSize ClusteredLighting::lightExtBufferSize() const {
+    return static_cast<VkDeviceSize>(kMaxLights) * sizeof(scene::LightExtInstance);
 }
 VkBuffer ClusteredLighting::clustersBuffer(uint32_t frameIndex) const {
     return m_frames[frameIndex % m_frames.size()].clusters->get();
