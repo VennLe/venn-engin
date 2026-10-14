@@ -46,12 +46,78 @@
 #  [3] 每个配方行必须以 TAB 开头，不能是空格。
 # ============================================================================
 
-# ---------------------------------------------------------------- 工具
+# ---------------------------------------------------------------- 工具链
+# 本工程支持两套工具链，用 TOOLCHAIN 选（默认 auto：有 MinGW 就用 MinGW，
+# 否则退到 MSVC）：
+#
+#   TOOLCHAIN=mingw  MinGW(ucrt64) + Ninja            —— 项目原来的路线
+#   TOOLCHAIN=msvc   Visual Studio 2022 + MSBuild     —— 本机实际可用的路线
+#   TOOLCHAIN=auto   自动探测（默认）
+#
+# 为什么会有 msvc 这条路：本机的 MinGW 工具链整条缺失（gcc/g++/
+# mingw32-make 都不在，C:/Program Files/CodeBlocks 与 C:/msys64 都不存在），
+# 但装了完整的 VS2022 Professional。详见 vcvars.cmd 顶部注释。
+#
+# MSVC 侧有两个必须知道的约束（都写进 vcvars.cmd 了）：
+#   * MSBuild 内部用 .NET Hashtable 存环境变量，这张表**大小写不敏感**。
+#     环境里同时存在 https_proxy 与 HTTPS_PROXY 会让它抛 ArgumentException，
+#     报成 "MSB6001: CL.exe 的命令行开关无效"。vcvars.cmd 会先清掉小写版。
+#   * 源文件是 UTF-8 无 BOM + 大量中文注释，必须给 cl 传 /utf-8，
+#     否则按 GBK 代码页解析会报 C2001「常量中有换行符」。
+#     （已在 CMakeLists.txt 里为所有 target 钉死。）
 CMAKE        ?= cmake
-MINGW_PREFIX ?= C:/Program Files/CodeBlocks/MinGW
+TOOLCHAIN    ?= auto
+
+# 一个空格（给路径转义用）。空 = 空 = 一个空格，这是 GNU Make 里
+# 表达"字面空格"的标准写法（空变量与只含空格的变量展开后都是那个空格）。
+empty :=
+space := $(empty) $(empty)
+
+# ---- MinGW 侧（TOOLCHAIN=mingw / auto 探测命中时使用）----
+MINGW_PREFIX ?= C:/msys64/ucrt64
 CC_BIN       ?= $(MINGW_PREFIX)/bin/gcc.exe
 CXX_BIN      ?= $(MINGW_PREFIX)/bin/g++.exe
 GENERATOR    ?= Ninja
+
+# ---- MSVC 侧（TOOLCHAIN=msvc 时使用）----
+# VS 安装根目录。vcvars.cmd 用同一个默认值；换机器只需覆盖这一个变量。
+VENN_VS_DIR  ?= D:/Microsoft Visual Studio/2022/Professional
+# MSVC 用 Ninja 生成器同样可以（cl.exe 由 vcvars.cmd 带进 PATH），
+# 这样 build/ 的目录布局与 MinGW 侧完全一致，构建后处理命令不用改。
+MSVC_GENERATOR ?= Ninja
+
+# ---- 自动探测 ----
+# 探测依据：本机是否存在可用的编译器。
+#
+# ⚠ 必须用 $(wildcard) 而**不能**用 $(exists)：GNU Make 没有 exists 函数。
+# ⚠ 路径里的**空格必须用反斜杠转义**，否则 wildcard 直接返回空 ——
+#   "D:/Microsoft Visual Studio/..." 这种路径不转义会让探测永远失败，
+#   然后静默地退回 mingw（= 本机没有的编译器）。这个坑实测过：
+#     $(wildcard D:/Microsoft Visual Studio/.../vcvars64.bat)      -> 空
+#     $(wildcard D:/Microsoft\ Visual\ Studio/.../vcvars64.bat)    -> 命中
+#   （没空格的路径转不转义都行。）
+# ⚠ 也不能用 $(shell if exist ...)：Make 在 Windows 上若 PATH 里有 sh.exe
+#   就会用 sh 跑 $(shell)，cmd 的 if exist 语法在那里直接语法错误。
+VENN_VS_DIR_MK := $(subst $(space),\$(space),$(VENN_VS_DIR))
+ifeq ($(TOOLCHAIN),auto)
+  ifneq ($(wildcard $(subst $(space),\$(space),$(MINGW_PREFIX))/bin/g++.exe),)
+    TOOLCHAIN := mingw
+  else ifneq ($(wildcard $(subst $(space),\$(space),$(VENN_VS_DIR))/VC/Auxiliary/Build/vcvars64.bat),)
+    TOOLCHAIN := msvc
+  else
+    TOOLCHAIN := mingw
+  endif
+endif
+
+ifeq ($(TOOLCHAIN),msvc)
+  # MSVC：configure / build 都交给 msvc-build.cmd —— 它内部先 call vcvars.cmd
+  # 搭好环境（含清掉大小写重复的代理变量），再调 cmake。
+  # Makefile 这边只负责把参数用环境变量递过去，保持配方是"一条干净命令"。
+  GENERATOR  := $(MSVC_GENERATOR)
+  MSVC_BUILD  = cmd /c msvc-build.cmd
+else
+  MSVC_BUILD  =
+endif
 
 # ---------------------------------------------------------------- 构建配置
 # 注意：这几个变量必须在 CONFIG_STAMP / CMAKE_CONFIGURE 之前定义。
@@ -86,12 +152,32 @@ PKG_NAME ?= venn-$(VERSION)-$(BUILD_TYPE)-win64
 # 那一行长命令只写一次，$(CONFIG_STAMP) 与 configure 共用。
 # 注意 "..." 这对引号是必须的：cmd/PowerShell 会把 -DXXX=3.5 拆成
 # -DXXX=3 加 .5，加引号才能原样传给 CMake。
-CMAKE_CONFIGURE := $(CMAKE) -S . -B $(BUILD_DIR) -G $(GENERATOR) \
+#
+# 两套工具链的 configure 参数不同：
+#   mingw  —— 显式指定 gcc/g++（Ninja 不会自动找）
+#   msvc   —— 完全交给 msvc-build.cmd（内部不指定编译器，让 Ninja 从 PATH
+#             里找到 vcvars.cmd 带进来的 cl.exe）
+ifeq ($(TOOLCHAIN),msvc)
+CMAKE_CONFIGURE =
+else
+CMAKE_CONFIGURE = $(CMAKE) -S . -B $(BUILD_DIR) -G $(GENERATOR) \
 	-DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
 	"-DCMAKE_C_COMPILER=$(CC_BIN)" \
 	"-DCMAKE_CXX_COMPILER=$(CXX_BIN)" \
 	"-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
 	$(CMAKE_ARGS)
+endif
+
+# 编译命令：两条路都归一到"能跑 cmake --build"这一条。
+# MSVC 侧不能直接用 cmake --build（那样没有 vcvars 环境，cl.exe 找不到），
+# 必须过 msvc-build.cmd —— 并行度由脚本自己从 NUMBER_OF_PROCESSORS 取，
+# **不要**在这里再拼 $(PARALLEL)：那会被脚本当成 target 名，
+# 报 "CMake Error: Invalid value used with --target"。
+ifeq ($(TOOLCHAIN),msvc)
+CMAKE_BUILD = $(MSVC_BUILD) build
+else
+CMAKE_BUILD = $(CMAKE) --build $(BUILD_DIR) $(PARALLEL)
+endif
 
 # ---------------------------------------------------------------- 运行参数
 FRAMES        ?=
@@ -120,7 +206,7 @@ RUN_EDITOR  = $(CMAKE) -E chdir $(BIN_DIR) $(CMAKE) -E env $(RUN_ENV) Editor.exe
 
 .DEFAULT_GOAL := all
 
-.PHONY: all build configure editor shaders run run-editor \
+.PHONY: all build configure editor shaders run run-editor toolchain \
         smoke clean distclean rebuild package info help install-make-alias
 
 # ============================================================================
@@ -131,30 +217,46 @@ all: build
 
 ## 配置 + 编译全部目标
 build: $(CONFIG_STAMP)
-	@echo [build] type=$(BUILD_TYPE) out=$(BIN_DIR)
-	$(CMAKE) --build $(BUILD_DIR) $(PARALLEL)
+	@echo [build] tools=$(TOOLCHAIN) type=$(BUILD_TYPE) out=$(BIN_DIR)
+	$(CMAKE_BUILD)
 
 # 只在配置戳缺失时跑 configure
 $(CONFIG_STAMP):
-	@echo [configure] type=$(BUILD_TYPE) gen=$(GENERATOR)
+	@echo [configure] tools=$(TOOLCHAIN) type=$(BUILD_TYPE) gen=$(GENERATOR)
+ifeq ($(TOOLCHAIN),msvc)
+	$(MSVC_BUILD) configure
+else
 	$(CMAKE_CONFIGURE)
 	@$(CMAKE) -E touch $(CONFIG_STAMP)
+endif
 
 ## 强制重新跑一次 CMake 配置（改了 CMAKE_ARGS / 编译器时用）
 configure:
-	@echo [configure] forced
+	@echo [configure] forced  tools=$(TOOLCHAIN)
+ifeq ($(TOOLCHAIN),msvc)
+	$(MSVC_BUILD) configure
+else
 	$(CMAKE_CONFIGURE)
 	@$(CMAKE) -E touch $(CONFIG_STAMP)
+endif
 
 ## 只编译编辑器（本工程唯一的可执行文件）
 editor: $(CONFIG_STAMP)
 	@echo [build] target=Editor
+ifeq ($(TOOLCHAIN),msvc)
+	$(MSVC_BUILD) build Editor
+else
 	$(CMAKE) --build $(BUILD_DIR) --target Editor $(PARALLEL)
+endif
 
 ## 只重新编译 GLSL 到 SPIR-V
 shaders: $(CONFIG_STAMP)
 	@echo [build] target=Shaders
+ifeq ($(TOOLCHAIN),msvc)
+	$(MSVC_BUILD) build Shaders
+else
 	$(CMAKE) --build $(BUILD_DIR) --target Shaders $(PARALLEL)
+endif
 
 # ============================================================================
 #  运行
@@ -186,7 +288,12 @@ else
 ## 清掉编译产物，保留配置缓存（下次 make build 直接重编，很快）
 clean:
 	@echo [clean] removing build outputs, keeping $(BUILD_DIR) cache
+ifeq ($(TOOLCHAIN),msvc)
+	@echo [clean] note: msvc+ninja 没有 clean 目标，改删 bin/ 与中间产物
+	$(CMAKE) -E remove_directory $(BUILD_DIR)/bin
+else
 	$(CMAKE) --build $(BUILD_DIR) --target clean
+endif
 endif
 
 ## 彻底删除 build/ 与 dist/（回到"干净检出"状态）
@@ -225,22 +332,49 @@ package: build
 
 ## 打印当前生效的构建参数
 info:
+	@echo   toolchain    : $(TOOLCHAIN)
 	@echo   build type   : $(BUILD_TYPE)
 	@echo   generator    : $(GENERATOR)
+ifeq ($(TOOLCHAIN),msvc)
+	@echo   C compiler   : MSVC cl.exe via vcvars.cmd
+	@echo   C++ compiler : MSVC cl.exe via vcvars.cmd
+	@echo   VS root      : $(VENN_VS_DIR)
+else
 	@echo   C compiler   : $(CC_BIN)
 	@echo   C++ compiler : $(CXX_BIN)
+endif
 	@echo   parallel     : $(if $(strip $(JOBS)),$(JOBS),auto)
 	@echo   build dir    : $(BUILD_DIR)
 	@echo   binaries     : $(BIN_DIR)/Editor.exe
 	@echo   package name : $(PKG_NAME)
 	@echo   smoke frames : $(SMOKE_FRAMES)
 
-## 把 mingw32-make 暴露成 make，之后就能直接敲 make build
+## 把 make 暴露成 PATH 上的裸命令（仅 MinGW 侧有意义）
+## MSVC 侧请改用根目录的 make.cmd（它会自动找一份可用的 GNU Make）。
 install-make-alias:
+ifeq ($(TOOLCHAIN),msvc)
+	@echo [alias] toolchain=msvc - nothing to do here.
+	@echo [alias] use .\make.cmd ^(or add this dir to PATH^) to run make.
+else
 	@echo [alias] copy mingw32-make.exe to make.exe in $(MINGW_PREFIX)/bin
 	@echo [alias] note: this creates a new file inside your MinGW install
 	$(CMAKE) -E copy $(MINGW_PREFIX)/bin/mingw32-make.exe $(MINGW_PREFIX)/bin/make.exe
 	@echo [alias] done - open a new terminal to use plain "make"
+endif
+
+## 诊断：报告本机可用的构建工具链
+toolchain:
+	@echo   detected     : $(TOOLCHAIN)
+	@echo   make         : this GNU Make process
+	@echo   cmake        : $(CMAKE)
+ifeq ($(TOOLCHAIN),msvc)
+	@echo   VS root      : $(VENN_VS_DIR)
+	@echo   vcvars       : $(VENN_VS_DIR)/VC/Auxiliary/Build/vcvars64.bat
+else
+	@echo   mingw prefix : $(MINGW_PREFIX)
+	@echo   g++          : $(CXX_BIN)
+endif
+	@echo   override     : make TOOLCHAIN=msvc  or  make TOOLCHAIN=mingw
 
 ## 列出全部目标
 help:
@@ -260,8 +394,11 @@ help:
 	@echo   ---
 	@echo   make package          build + zip into dist/
 	@echo   make info             print current build settings
+	@echo   make toolchain        report the detected toolchain
 	@echo   make install-make-alias  install a plain "make" command
 	@echo   ---
-	@echo   variables: BUILD_TYPE JOBS FRAMES VALIDATION PKG_NAME
+	@echo   variables: TOOLCHAIN BUILD_TYPE JOBS FRAMES VALIDATION PKG_NAME
+	@echo   example  : make TOOLCHAIN=msvc build
+	@echo   example  : make TOOLCHAIN=mingw build
 	@echo   example  : make BUILD_TYPE=Release package
 	@echo   example  : make run FRAMES=300 VALIDATION=0

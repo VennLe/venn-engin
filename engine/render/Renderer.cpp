@@ -7,6 +7,7 @@
 #include "assets/Mesh.h"
 #include "assets/Material.h"
 #include "assets/Texture.h"
+#include "assets/AssetPath.h"
 #include "assets/Model.h"
 #include "assets/Skeleton.h"
 #include "render/ShaderPath.h"
@@ -88,7 +89,7 @@ bool envFloat(const char* name, float& out) {
     return true;
 }
 
-constexpr uint32_t kGlobalSetBindings = 19;
+constexpr uint32_t kGlobalSetBindings = 20;
 
 // "当前没有绑定任何前向变体管线"的哨兵。
 // ⚠ 不能用 0：0 是**合法掩码**（三个关键字全关，也是最常见的材质）。
@@ -151,6 +152,17 @@ Renderer::Renderer(core::Window& window) : m_window(window) {
     // 分开是为了让验证脚本能分别隔离"新背景 pass"与"新 IBL 数学"。
     m_iblEnabled = envBool("MYVK_IBL", true);
     m_skyEnabled = envBool("MYVK_SKY", true);
+
+    // ---- 预积分皮肤散射（R4-2）----
+    //   MYVK_SSS=f → 曲率缩放（默认 kSssDefaultCurvatureScale = 8）。
+    //                f = 0 时曲率恒 0 → LUT 退化成 Lambert，正好当"关掉
+    //                SSS"的对照组；f > 1 更夸张、f < 1 更含蓄。
+    //   只影响 ShadingModel=Skin 的材质 —— Default 材质不引用这段数据，
+    //   所以本变量的任何取值都不可能改变 Default 的像素。
+    {
+        float sss = 0.0f;
+        if (envFloat("MYVK_SSS", sss)) m_sssCurvatureScale = sss;
+    }
 
     // ---- 级联阴影（CSM）----
     //   MYVK_SHADOW=0          → 完全关掉阴影（shader 里 shadowParams.w = 0）
@@ -740,6 +752,16 @@ void Renderer::createDescriptorLayouts() {
     bindings[18].descriptorCount = 1;
     bindings[18].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+    // 19：预积分皮肤散射 LUT（R4-2，256²，UNORM）。只有
+    // VENN_SHADING_SKIN 编译单元读它；Default 材质不读。布局上永远存在
+    // 这个 binding（与 7..10 / 14 / 16 同一待遇），缺省也绑一张有效表 ——
+    // 否则建 Default 变体管线时验证层会报"layout 里缺 shader 声明的资源"
+    // （VUID-VkGraphicsPipelineCreateInfo-layout-07988）。
+    bindings[19].binding = 19;
+    bindings[19].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[19].descriptorCount = 1;
+    bindings[19].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
     m_globalSetLayout = rhi::makeSetLayout(
         *m_device, std::vector<VkDescriptorSetLayoutBinding>(bindings,
                                                              bindings + kGlobalSetBindings));
@@ -780,6 +802,42 @@ void Renderer::createDefaultTextures() {
     uint8_t black[4] = {0, 0, 0, 255};
     m_defaultBlack = std::make_unique<assets::Texture>();
     m_defaultBlack->makeSolid(ctx, black, 4, /*srgb=*/false);
+
+    // ---- R4-2：预积分皮肤散射 LUT ----
+    // 优先加载离线烘焙的 assets/textures/sss_lut.dds（tools/make_sss_lut.py
+    // 生成，BC1）。**UNORM**（srgb=false）：表里存的是"漫反射响应"这个
+    // 物理量，不是颜色 —— 做 sRGB 解码会把整张响应曲线抬亮。
+    // 加载失败就程序化生成一张"Lambert 表"兜底：Skin 会退化成与 Default
+    // 一样（功能不生效），但绝不崩、不黑 —— 与 IBL 烘不出来时的态度一致。
+    auto makeFallbackLut = [&]() {
+        m_sssLut = std::make_unique<assets::Texture>();
+        constexpr uint32_t kSize = 256;
+        std::vector<uint8_t> px(static_cast<size_t>(kSize) * kSize * 4);
+        for (uint32_t y = 0; y < kSize; ++y) {
+            for (uint32_t x = 0; x < kSize; ++x) {
+                const float ndotl =
+                    static_cast<float>(x) / static_cast<float>(kSize - 1) * 2.0f -
+                    1.0f;
+                const uint8_t v = static_cast<uint8_t>(
+                    glm::clamp(ndotl, 0.0f, 1.0f) * 255.0f + 0.5f);
+                uint8_t* p = &px[(static_cast<size_t>(y) * kSize + x) * 4];
+                p[0] = p[1] = p[2] = v;
+                p[3] = 255;
+            }
+        }
+        m_sssLut->fromPixels(ctx, px.data(), kSize, kSize, /*srgb=*/false);
+    };
+    m_sssLut = std::make_unique<assets::Texture>();
+    try {
+        const std::string p =
+            assets::resolveAssetPath("textures/sss_lut.dds");
+        m_sssLut->fromDDS(ctx, p, /*srgb=*/false);
+        VK_LOG_INFO("SSS: LUT loaded (%s)", p.c_str());
+    } catch (const std::exception& e) {
+        VK_LOG_WARN("SSS: LUT load failed (%s) -> Lambert fallback", e.what());
+        m_sssLut.reset();          // 半成品先销毁（析构会回收已建的图）
+        makeFallbackLut();
+    }
 }
 
 void Renderer::createLightGizmoMesh() {
@@ -1561,6 +1619,10 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
     ubo.viewModeParams = glm::vec4(static_cast<float>(
                                       static_cast<uint32_t>(m_viewMode)),
                                   0.0f, 0.0f, 0.0f);
+    // 预积分皮肤散射（R4-2）：曲率缩放。只有 VENN_SHADING_SKIN 编译单元
+    // 读它 —— Default 材质根本不引用这段数据，所以这个值的任何变化都
+    // 不可能影响 Default 的像素（"Default 逐像素不变"由构造保证）。
+    ubo.sssParams = glm::vec4(m_sssCurvatureScale, 0.0f, 0.0f, 0.0f);
 
     // ---- 相机视锥：必须用**未抖动**的投影 ----
     // 抖动会让视锥在亚像素尺度上逐帧摆动 → 恰好压在视锥边界上的物体
@@ -1777,6 +1839,11 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
         // 空材质（只有深度预通道会画）保持"全关"。
         const assets::Material* mat = it.material;
         it.keywords = mat ? effectiveKeywords(*mat) : kKeywordNone;
+
+        // ---- R4-1：Mask 不参与深度预通道 ----
+        // 预通道的 depth_only.frag 不采样材质，无法知道哪里该镂空；让 Mask
+        // 进去会把"该透光"的深度写死。掩码是唯一判据（与队列分类同一规则）。
+        it.skipDepthPrepass = hasKeyword(it.keywords, kKeywordAlphaMask);
 
         // ---- 队列分类也由掩码推导 ----
         // 原来是再判一次 mat->alphaMode —— 那样"什么算半透明"就有两处
@@ -2853,6 +2920,20 @@ void Renderer::writeGlobalSet(VkDescriptorSet set, uint32_t frameIndex,
         m_descriptors->writeTexture(set, 18, m_lightTextures->sampler(),
                                     m_lightTextures->view());
     }
+
+    // binding 19：预积分皮肤散射 LUT（R4-2）。图在 init 时建好（加载
+    // sss_lut.dds 或程序化兜底），生命周期与 Renderer 相同 → 永远有效。
+    // **所有帧共用同一张图**（与 7..10 的 IBL 图同理），所以写的是同一个
+    // 视图；描述符集按帧分开只是因为 set 0 里还有每帧不同的 UBO/阴影图。
+    if (m_sssLut && m_sssLut->view() != VK_NULL_HANDLE) {
+        m_descriptors->writeTexture(set, 19, m_sssLut->sampler(),
+                                    m_sssLut->view());
+    } else if (m_defaultWhite) {
+        // 理论上到不了这里（createDefaultTextures 必建）；真到了也绝不
+        // 留一个未写的 binding —— 未定义内容的内存会让验证层报错。
+        m_descriptors->writeTexture(set, 19, m_defaultWhite->sampler(),
+                                    m_defaultWhite->view());
+    }
 }
 
 // 懒建"某离屏目标本帧的相机 UBO 槽"。buffer 与 set 都只建一次，之后
@@ -3403,6 +3484,32 @@ void Renderer::bindForwardVariant(VkCommandBuffer cmd, render::KeywordMask kw,
                       m_forwardPipelines.get(kw).get());
 }
 
+// Mask 材质的 alpha 裁切阈值 → push.skin.w（R4-1）。
+//
+// 约定：**符号位是抖动开关**（负 = 抖动，绝对值仍是阈值）。之所以要借
+// 符号位而不是再加一个字段：push 常量被硬件卡死在 128 字节，skin.w 是
+// 最后一个空位（见 pbr.frag 的 Push 块说明）。
+//
+// 非 Mask 材质推 **+0.5**（旧的"什么都没写"的默认值），它们的着色器编译
+// 单元里那段代码整段被编掉，读不到这个值 —— 保证 Opaque/Blend 路径逐像素
+// 不变。
+//
+// `MYVK_CUTOFF_DBG=1` 时打印每材质一行的真值（节流 —— 只每 60 次打一行）。
+float Renderer::alphaCutoffLane(const assets::Material& mat) {
+    if (mat.alphaMode != assets::Material::AlphaMode::Mask) return 0.5f;
+    const float c = glm::clamp(mat.alphaCutoff, 0.0f, 1.0f);
+    const float lane = mat.ditherAlpha ? -glm::max(c, 1.0f / 256.0f) : c;
+    if (std::getenv("MYVK_CUTOFF_DBG")) {
+        static int dbgTick = 0;
+        if ((dbgTick++ % 60) == 1) {
+            VK_LOG_INFO("CUTOFF-DBG mat=%s cutoff=%.4f dither=%d lane=%.4f",
+                        mat.name.c_str(), mat.alphaCutoff,
+                        mat.ditherAlpha ? 1 : 0, lane);
+        }
+    }
+    return lane;
+}
+
 void Renderer::drawMesh(VkCommandBuffer cmd, VkPipelineLayout layout,
                         const glm::mat4& model, const assets::Material& mat,
                         const assets::Mesh& mesh, uint32_t instanceCount,
@@ -3417,11 +3524,14 @@ void Renderer::drawMesh(VkCommandBuffer cmd, VkPipelineLayout layout,
     push.emissive = glm::vec4(mat.emissive, materialPageCode(mat));
     // 蒙皮定位：查 mesh 是否属于某个蒙皮模型。jointBase<0 = 静态网格，
     // 着色器按 weights 和 == 0 走原路径（skin.z 只是防御性冗余）。
+    // skin.w = alpha 裁切阈值（R4-1）。
     const auto it = m_skinJointBase.find(&mesh);
     if (it != m_skinJointBase.end() && it->second >= 0) {
-        push.skin = glm::vec4(static_cast<float>(it->second), 0.0f, 1.0f, 0.0f);
+        push.skin =
+            glm::vec4(static_cast<float>(it->second), 0.0f, 1.0f,
+                      alphaCutoffLane(mat));
     } else {
-        push.skin = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+        push.skin = glm::vec4(0.0f, 0.0f, 0.0f, alphaCutoffLane(mat));
     }
     vkCmdPushConstants(cmd, layout,
                        VK_SHADER_STAGE_VERTEX_BIT |
@@ -3535,14 +3645,22 @@ void Renderer::updateSkinning(scene::Scene& scene, bool resetOffset) {
 void Renderer::recordOpaqueDepthGeometry(VkCommandBuffer cmd) {
     // 深度预通道只有 DOUBLE_SIDED 一个关键字有意义（占位：ALPHA_BLEND /
     // NORMAL_MAP 对只写深度的管线没有影响，见 createPipelines 里的说明）。
-    // 掩码不变就不重绑；kBindsNothing 是无效哨兵（掩码只有 0..7）。
+    // 掩码不变就不重绑；kBindsNothing 是无效哨兵。
     KeywordMask boundMask = kBindsNothing;
+
+    // R4-1：Mask 项**整体跳过预通道**（见 DrawItem::skipDepthPrepass 的说明）。
+    // 判据直接用掩码里的 ALPHA_MASK 位 —— 批是按掩码切的，所以"批级"
+    // 与"项级"判据必然一致，不需要在 DrawBatch 上再存一个冗余标志。
+    const auto skipped = [](KeywordMask kw) {
+        return hasKeyword(kw, kKeywordAlphaMask);
+    };
 
     if (m_instancingEnabled) {
         // 合批路径：与前向 Pass 遍历**同一个** m_opaqueBatches ——
         // 槽序一致，实例 SSBO 只需写一份。空材质的批也要画（预通道
         // 允许空材质，前向才跳过它们）。
         for (const DrawBatch& b : m_opaqueBatches) {
+            if (skipped(b.keywords)) continue;
             const KeywordMask kw = b.keywords;
             if (kw != boundMask) {
                 boundMask = kw;
@@ -3566,6 +3684,7 @@ void Renderer::recordOpaqueDepthGeometry(VkCommandBuffer cmd) {
     }
 
     for (const DrawItem& it : m_opaqueDraws) {
+        if (it.skipDepthPrepass) continue;
         const KeywordMask kw = it.keywords;
         if (kw != boundMask) {
             boundMask = kw;
@@ -3817,6 +3936,9 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
                                  g.material->normalScale, g.material->ao);
             push.emissive =
                 glm::vec4(g.material->emissive, materialPageCode(*g.material));
+            // R4-1：Mask 的裁切阈值随材质走 push.skin.w（MDI 的 model/skin
+            // 都不从 push 取，但 skin.w 是**片元**读的，必须每材质推对）。
+            push.skin.w = alphaCutoffLane(*g.material);
             vkCmdPushConstants(cmd, m_forwardPipelines.layout(),
                                VK_SHADER_STAGE_VERTEX_BIT |
                                    VK_SHADER_STAGE_FRAGMENT_BIT,

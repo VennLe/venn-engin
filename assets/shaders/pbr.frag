@@ -43,7 +43,7 @@
 // Shader 关键字（编译期开关，见 render/ShaderKeywords.h）
 //
 // 这份 .frag 会被**编译多份**：构建期按关键字组合各编一份
-// pbr.k<掩码>.frag.spv（掩码 = 位序拼出来的 0..7）。
+// pbr.k<掩码>.frag.spv（掩码 = 位序拼出来的 0..31）。
 // 下面是每个宏的默认值 —— 直接 glslc 编（不带任何 -D）时得到"全关"，
 // 也就是 k0，行为与本文件引入关键字之前一致，便于对照。
 //
@@ -52,8 +52,16 @@
 //                      gl_FrontFacing 翻转法线（下面"法线"那段）
 //   VENN_ALPHA_BLEND   半透明：alpha 参与输出（管线那边同时不写深度）
 //   VENN_NORMAL_MAP    材质挂了法线贴图：采样 + cotangent frame
+//   VENN_ALPHA_MASK    alpha 裁切：alpha < push.skin.w 时丢弃片元，
+//                      否则按不透明输出（管线侧写深度、不混合）。
+//                      MSAA 下借用 alpha-to-coverage 得到边缘抗锯齿。
+//                      R4-1；与 ALPHA_BLEND **互斥**（掩码由枚举保证）。
+//   VENN_SHADING_SKIN  预积分皮肤散射（R4-2）：漫反射不再用 max(N·L,0)，
+//                      而是按 (N·L, 曲率) 查一张预烘焙的散射 LUT —— 光按
+//                      扩散核绕过明暗交界线，红通道散射最远 → 耳缘/鼻梁
+//                      泛红透光。默认（未置位）代码整段编掉 → 逐像素不变。
 //
-// ⚠ 位序与 CMakeLists.txt 的 VARIANT_DEFINES_n 手工表、以及
+// ⚠ 位序与 CMakeLists.txt 的 SHADER_KEYWORDS 列表、以及
 //   ShaderKeywords.cpp 的 kKeywords[] 必须逐字一致。
 // ------------------------------------------------------------
 #ifndef VENN_DOUBLE_SIDED
@@ -64,6 +72,12 @@
 #endif
 #ifndef VENN_NORMAL_MAP
 #define VENN_NORMAL_MAP 0
+#endif
+#ifndef VENN_ALPHA_MASK
+#define VENN_ALPHA_MASK 0
+#endif
+#ifndef VENN_SHADING_SKIN
+#define VENN_SHADING_SKIN 0
 #endif
 // VENN_BINDLESS 是**全局开关**（Renderer 按它选 set 布局与 .spv），
 // 不是材质关键字位 —— 所以不参与掩码，只多编一族
@@ -126,6 +140,12 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     // ---- Froxel 体积雾（R3-2）----
     // xyz = froxel 网格尺寸；w = 总开关
     vec4 vfogParams;
+
+    // ---- 预积分皮肤散射（R4-2）----
+    // x = 曲率缩放（把"屏幕空间法线导数"映射到 LUT 的 0..1 曲率轴；
+    //     MYVK_SSS=0 时为 0 → 曲率恒 0 → LUT 退化成 Lambert，用作对照组）
+    // y/z/w = 保留
+    vec4 sssParams;
 } ubo;
 
 // 级联阴影贴图：一张 **2D array** 的深度图，第 i 层就是第 i 级级联。
@@ -174,6 +194,15 @@ layout(std430, set = 0, binding = 17) readonly buffer LightExtBuffer {
 // 光源修饰纹理库（cookie + IES 共用一张数组）。第 0 层恒为全白：
 // 任何"没配贴图"的灯都退化成乘 1。
 layout(set = 0, binding = 18) uniform sampler2DArray lightTex;
+
+// ---- 预积分皮肤散射 LUT（R4-2）----
+// 256×256 二维表：u = N·L（-1..1 映射到 0..1），v = 曲率（0..1）。
+// 表里存的是"已经按扩散核积分过"的漫反射响应（RGB 逐通道，红散射最远）。
+// 只在 VENN_SHADING_SKIN 编译单元里被引用；不置位时这个 binding 在
+// layout 里仍然存在（关时绑一张退化的缺省表），只是着色器不去读它。
+#if VENN_SHADING_SKIN
+layout(set = 0, binding = 19) uniform sampler2D sssLut;
+#endif
 
 #if VENN_BINDLESS
 // ============================================================
@@ -284,6 +313,10 @@ layout(push_constant) uniform Push {
     // 最后 16 字节（也就是这里的 w）是现成的空位；另开一个字段会直接
     // 越过 maxPushConstantsSize。见 render/Bindless.h 的说明。
     vec4 emissive;
+    // 蒙皮定位（见 pbr.vert）。**w = alpha 裁切阈值**（R4-1）：
+    // 只有 VENN_ALPHA_MASK 编译单元才读它，其它材质推什么值都无所谓。
+    // 借 skin.w 是因为 push 已经被硬件卡死在 128 字节，这是最后一个空位。
+    vec4 skin;
 } push;
 
 layout(location = 0) in vec3 vWorldPos;
@@ -626,6 +659,52 @@ float spotAttenuation(float cosAngle, float cosInner, float cosOuter) {
                  0.0, 1.0);
 }
 
+// ============================================================
+// 预积分皮肤散射辅助（R4-2）
+//
+// ⚠ 必须定义在 shadeLocalLight / shadeLocalLightMod **之前** —— 那两个
+//   函数体里在 VENN_SHADING_SKIN 分支下会调用 skinDiffuse。
+//
+// 曲率与光源无关，所以 main() 只算一次塞进 gSkinCurvature，之后方向光与
+// 局部光的着色函数直接读它 —— 免去顺着调用链改函数签名（那两个函数被
+// 两处调用，改动面会扩散到本来与皮肤无关的代码）。
+// ============================================================
+#if VENN_SHADING_SKIN
+float gSkinCurvature = 0.0;
+
+// 屏幕空间法线导数 → LUT 的曲率轴（0..1）。
+// **用几何法线**（插值后的顶点法线）而不是扰动后的 N：法线贴图的高频
+// 细节会让 fwidth 爆表，整张脸变成噪点。
+// ubo.sssParams.x 是尺度旋钮（MYVK_SSS 可覆盖），0 时曲率恒 0 → LUT 退化
+// 成 Lambert，正好当"关掉 SSS"的对照组。
+float skinCurvatureFrom(vec3 geomN) {
+    return clamp(length(fwidth(geomN)) * ubo.sssParams.x, 0.0, 1.0);
+}
+
+// 漫反射乘子。Default 是 vec3(NdotL)；Skin 换成查表结果 —— 表里已经
+// 含"散射核积分"与"逐通道泛红"（R 散射最远）。返回值恒 ≥ 0，所以在
+// 明暗交界线外侧也会给出一点光（背阴面渗光）。
+//
+// 传**未截断**的 N·L：截断会把 LUT 左半轴（背面）整段压成 0，泛红
+// 透光正是靠那一段。u = N·L*0.5+0.5 把 [-1,1] 映射到 [0,1]。
+vec3 skinDiffuse(vec3 N, vec3 L) {
+    float ndotl = dot(N, L);
+    float u = ndotl * 0.5 + 0.5;
+    // ⚠ 坐标必须落到**纹素中心**（(i+0.5)/N）而不是 0..1 直给。
+    // 纹理采样器是 REPEAT 地址模式，而这两条轴的端点恰好会取到 u=1
+    // （正对光）与 v=0（平面：fwidth(几何法线)=0 → 曲率恒 0）—— 边界上
+    // 双线性会跟"绕到另一侧"的纹素各取一半：曲率 0 的行会掺进曲率 1 的
+    // 红边（实测 v=0 读出 0.18，而表里其实是 0.098），皮肤上所有平坦
+    // 区域都会无端泛红。(curv*255+0.5)/256 正好是第 curv*255 号纹素的
+    // 中心，与 make_sss_lut.py 的 linspace 布点逐格对齐、永不跨界。
+    const float kLutSize = 256.0;
+    vec2 uv = (vec2(u, gSkinCurvature) * (kLutSize - 1.0) + 0.5) / kLutSize;
+    // **必须 textureLod(...,0)**：隐式 LOD 会按导数选 mip，而这张表两条轴
+    // 都是连续量，一混相邻 mip 整张响应就糊了。
+    return textureLod(sssLut, uv, 0.0).rgb;
+}
+#endif
+
 // 单盏局部光源的完整 BRDF 贡献。
 // 类型：0 = 点光，1 = 射灯，2 = 方向光（实体级补光：无衰减、无阴影，
 //       L 直接取 -direction；分簇剔除靠它 10⁵ 米的"影响球"保证全覆盖）。
@@ -681,7 +760,14 @@ vec3 shadeLocalLight(Light L, vec3 N, vec3 V, vec3 worldPos, vec3 albedo,
 
     // 强度与颜色一起构成辐射亮度；HDR 下可以远大于 1
     vec3 radiance = L.colorIntensity.rgb * L.colorIntensity.a * att * shadow;
+#if VENN_SHADING_SKIN
+    // 局部光也吃曲率响应（交界线更柔、带一点泛红）。**不做背阴面渗光**：
+    // 上面已按 NdotL<=0 提前退出，这里 N·L 必为正 —— 改动面最小，也不
+    // 碰 GGX 分母（镜面仍用 NdotL）。
+    return (kD * albedo / PI * skinDiffuse(N, Ld) + specular * NdotL) * radiance;
+#else
     return (kD * albedo / PI + specular) * radiance * NdotL;
+#endif
 }
 
 // ============================================================
@@ -783,7 +869,13 @@ vec3 shadeLocalLightMod(Light L, LightExt E, vec3 N, vec3 V, vec3 worldPos,
 
     const vec3 radiance =
         L.colorIntensity.rgb * L.colorIntensity.a * mod * shadow;
+#if VENN_SHADING_SKIN
+    // 面积光/IES/cookie 路径：漫反射同样换成曲率响应（含背阴面渗光，
+    // 因为这里的提前退出是 "NdotLd<=0 且 NdotLs<=0"，单侧背阴仍会走到）。
+    const vec3 diffuse = kD * albedo / PI * attD * skinDiffuse(N, Ld);
+#else
     const vec3 diffuse = kD * albedo / PI * attD * NdotLd;
+#endif
     const vec3 spec = specular * attS * NdotLs;
     return (diffuse + spec) * radiance;
 }
@@ -801,6 +893,47 @@ void main() {
     // 只有半透明材质才让 albedo 的 alpha 参与输出 —— 管线侧同时开了混合、
     // 关了深度写（见 VariantPipelines::applyKeywordState），两边是一体的。
     float alpha = albedoSample.a * push.baseColorFactor.a;
+#elif VENN_ALPHA_MASK
+    // alpha 裁切（R4-1）：alpha 低于阈值直接丢弃片元 —— 既不写颜色也不写
+    // 深度，于是镂空处从背面能透光。
+    //
+    // 与 **alpha-to-coverage** 共存（管线在 MSAA 下开了 a2c，见
+    // applyKeywordState）：把 alpha 预映射成
+    //     alpha' = clamp((alpha - cutoff) * 2 + 0.5)
+    // 让"alpha == cutoff"正好落在 a2c 硬编码的 0.5 阈值上，于是 cutoff
+    // 滑条在 MSAA 下也生效（a2c 阈值本身 Vulkan 不允许配）。
+    //
+    // ⚠ 两种采样数**共用这一段**，不引入 VENN_MSAA 宏（否则变体数翻倍）：
+    //   · samples > 1：alpha' 写进 outColor.a，硬件按覆盖掩码裁决；
+    //     "discard 掉 alpha'<=0 的片元"与 a2c 的结果恰好相同（alpha'<=0
+    //     ⟺ 覆盖掩码全 0），所以这次 discard 不改变画面，只省一个片元。
+    //   · samples == 1：a2c 是空操作，outColor.a 被忽略 —— 这次 discard
+    //     就是唯一的裁决手段，两者行为一致。
+    float rawAlpha = albedoSample.a * push.baseColorFactor.a;
+    // **抖动模式**（ditherAlpha，R4-1）：push.skin.w 的**符号**是开关
+    // （负 → 抖动，绝对值仍是 cutoff）。借符号位是因为 push 已满 128 字节。
+    // 抖动 = 用一个屏幕空间有序抖动阈值代替固定 cutoff —— 一个片元要么
+    // 完全不透明、要么完全透明，只是"谁被留下"随位置变化，配合 TAA 多帧
+    // 累积就得到柔和的半透明边缘（且**照样写深度**，不像 Blend 会排序崩）。
+    // ⚠ 抖动模式刻意**不要**软边（alpha' 恒为 keep 的 0/1），否则 a2c 的
+    //   软边会与时间抖动叠加成两重模糊。
+    float cutoff = abs(push.skin.w);
+    float keep, alpha;
+    if (push.skin.w < 0.0) {
+        // 4×4 Bayer 有序抖动（16 级）。有序抖动比哈希噪声在 MSAA 下更稳定
+        // （格子与覆盖掩码对齐），也比 8×8 少一半分支代价。
+        const float kBayer[16] = float[16](
+            0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0,
+            3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+        ivec2 p = ivec2(mod(gl_FragCoord.xy, 4.0));
+        float threshold = (kBayer[p.y * 4 + p.x] + 0.5) / 16.0;
+        keep = step(threshold, rawAlpha);
+        alpha = keep;
+    } else {
+        keep = step(cutoff, rawAlpha);
+        alpha = clamp((rawAlpha - cutoff) * 2.0 + 0.5, 0.0, 1.0);
+    }
+    if (keep < 0.5) discard;
 #else
     // 不透明：直接输出 1。省掉这次乘法是小事，主要是别让 HDR 目标的
     // alpha 通道带着一堆没人看的值一路传到后处理。
@@ -834,6 +967,11 @@ void main() {
 
     // ---------------- 法线 ----------------
     vec3 N = normalize(vNormal);
+#if VENN_SHADING_SKIN
+    // 曲率趁**法线贴图扰动之前**取：这一刻的 N 就是几何法线。用扰动后的
+    // 法线算 fwidth 会让贴图的高频细节整片爆掉（满脸噪点）。
+    gSkinCurvature = skinCurvatureFrom(N);
+#endif
 
 #if VENN_DOUBLE_SIDED
     // 双面材质：背面看到的其实是几何背侧，法线要翻过来才"朝向观察者"。
@@ -886,7 +1024,14 @@ void main() {
 
     // 阴影只衰减直接光；环境光不受遮挡影响（简化处理）
     float shadow = shadowFactor(vWorldPos, NdotL);
+#if VENN_SHADING_SKIN
+    // R4-2：漫反射乘子换成预积分散射响应（明暗交界线外也渗光 + 泛红），
+    // 镜面项仍用真实 NdotL —— 高光不该被次表面散射糊掉。
+    vec3 direct = (kD * albedo / PI * skinDiffuse(N, Ld) + specular * NdotL) *
+                  radiance * shadow;
+#else
     vec3 direct = (kD * albedo / PI + specular) * radiance * NdotL * shadow;
+#endif
 
     // ---------------- 分簇局部光源 ----------------
     // 只遍历"本簇灯列表"里的灯，数量由场景布置决定（室内小范围灯通常

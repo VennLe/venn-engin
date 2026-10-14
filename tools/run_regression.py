@@ -50,6 +50,10 @@ DEFAULT = [
     "verify_volumetric_fog", "verify_light_modifiers",
     "verify_shader_variants",
     "verify_shader_hotreload", "verify_fxaa", "verify_instancing",
+    # R4-1：AlphaMode::Mask（alpha 裁切）+ 抖动裁切
+    "verify_alpha_mask",
+    # R4-2：预积分 SSS（ShadingModel::Skin，bit4 VENN_SHADING_SKIN）
+    "verify_sss",
     "verify_nav_gizmo",
     "verify_character_window", "verify_add_menu", "verify_mesh_params",
     "verify_collider_gizmo", "verify_player", "verify_collision_play",

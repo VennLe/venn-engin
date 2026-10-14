@@ -246,10 +246,30 @@ def main():
         #
         # 所以先右下角空地上点一次把窗口"激活"掉；顺便它自己就是一次
         # 有意义的对照（该处应当什么都打不中）。后面的断言才做数。
-        click_client(hwnd, vx0 + (vx1 - vx0) * 0.94, vy0 + (vy1 - vy0) * 0.94)
-        warm = last_match(tap, "pick: nothing hit", MISS_RE, timeout=6.0)
-        check("预热点击能到达视口（第一次注入点击会被窗口激活吃掉）",
-              warm is not None)
+        #
+        # ⚠ **预热只作准备动作，不作断言**。`click_client` 是真实输入注入
+        # （SetCursorPos + mouse_event），能否被 ImGui 收到取决于窗口是不是
+        # **真的**前台 + 首帧有没有初始化完 —— 空闲时 2s 就收到，机器忙时
+        # 实测 26s 都收不到（12 次尝试全落空）。把"预热收到了"写成硬断言，
+        # 就是在断言一个不可控的时序，必然 flaky。
+        # 而它要保护的东西——"注入点击能到达视口"——已经由下面 (b)(c) 覆盖：
+        # (b) 要拿到 `pick: selected`，(c) 要看到 miss 计数**新增**，
+        # 而且 (c) 用的就是**这里同一个坐标**。所以预热收不到时下面必然红，
+        # 这里只留一条响亮的提示。
+        t_warm = time.time()
+        warm, tries = None, 0
+        while warm is None and time.time() - t_warm < 20.0:
+            tries += 1
+            click_client(hwnd, vx0 + (vx1 - vx0) * 0.94,
+                         vy0 + (vy1 - vy0) * 0.94)
+            warm = last_match(tap, "pick: nothing hit", MISS_RE, timeout=1.2)
+        if warm is None:
+            print("  ⚠ 预热点击 %d 次 / %.1fs 内都没被窗口收到（准备动作失败，"
+                  "非断言；真正的前台检查在下面两次点击）"
+                  % (tries, time.time() - t_warm))
+        else:
+            print("  预热点击：%d 次尝试 / %.1fs 后被窗口收到"
+                  % (tries, time.time() - t_warm))
 
         # (b) 点视口正中：射线沿 +X，最近的是 (5,0,3) 的 Cube_0
         click_client(hwnd, (vx0 + vx1) / 2, (vy0 + vy1) / 2)

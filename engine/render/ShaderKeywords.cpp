@@ -23,6 +23,8 @@ const KeywordInfo kKeywords[kKeywordCount] = {
     {kKeywordDoubleSided, "VENN_DOUBLE_SIDED", "double-sided"},
     {kKeywordAlphaBlend, "VENN_ALPHA_BLEND", "alpha-blend"},
     {kKeywordNormalMap, "VENN_NORMAL_MAP", "normal-map"},
+    {kKeywordAlphaMask, "VENN_ALPHA_MASK", "alpha-mask"},
+    {kKeywordShadingSkin, "VENN_SHADING_SKIN", "shading-skin"},
 };
 
 // 位序 → 表下标的换算。表按位序排，所以下标就是"这是第几个被置的位"。
@@ -79,10 +81,16 @@ KeywordMask keywordsOf(const assets::Material& mat) {
     if (mat.alphaMode == assets::Material::AlphaMode::Blend) {
         m |= kKeywordAlphaBlend;
     }
+    if (mat.alphaMode == assets::Material::AlphaMode::Mask) {
+        m |= kKeywordAlphaMask;
+    }
     // 只看"有没有挂图"。normalScale == 0 时不置位也说得过去（缩放成 0
     // 等于不起作用），但那样同一个材质在拖动 normalScale 经过 0 时会
     // 反复切换变体、还要多编一份。少一份变体、多一次无害采样更划算。
     if (mat.normalMap) m |= kKeywordNormalMap;
+    if (mat.shadingModel == assets::Material::ShadingModel::Skin) {
+        m |= kKeywordShadingSkin;
+    }
     return m;
 }
 

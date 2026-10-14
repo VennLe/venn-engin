@@ -364,18 +364,23 @@ def crop_pair(a, b, vp):
     return pa[y0:h, x0:w], pb[y0:h, x0:w], x0, y0
 
 
-def diff_stats(a, b, vp=None):
-    """逐像素最大通道差的统计：>18 的像素数、最大差、均值、包围盒。
+def diff_stats(a, b, vp=None, thr=18):
+    """逐像素最大通道差的统计：`> thr` 的像素数、最大差、均值、包围盒。
 
     vp 非空时**只统计视口矩形内**的像素（理由见 crop_pair）。
     返回的 bbox 仍是**窗口绝对坐标**，方便直接和截图对照。
+
+    ⚠ `thr` 只影响**计数**（`n` 与 `box`），不影响 `max` 与 `mean`。
+    调用方若用 `n` 做断言，必须让 `thr` 与它的"显著"口径一致 —— 默认值 18
+    与"`max > 8` 就算显著"这类断言是不自洽的（差在 9..18 之间的画面会
+    出现 `max` 达标而 `n` 恒为 0）。
     """
     import numpy as np
     pa, pb, x0, y0 = crop_pair(a, b, vp)
     if pa is None:
         return 0, 0, 0.0, None
     d = np.abs(pa - pb).max(axis=2)
-    ys, xs = np.nonzero(d > 18)
+    ys, xs = np.nonzero(d > thr)
     box = None
     if len(ys):
         box = [int(xs.min()) + x0, int(ys.min()) + y0,

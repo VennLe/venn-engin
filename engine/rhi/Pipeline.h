@@ -43,6 +43,10 @@ struct PipelineDesc {
     bool depthBiasEnable = false;
     float depthBiasConstant = 0.0f;
     float depthBiasSlope = 0.0f;
+    // Alpha-to-coverage（R4-1）：把片元 alpha 转成逐采样覆盖掩码，让
+    // alpha 裁切/透贴的边缘在 MSAA 下得到硬件抗锯齿。**只能在 samples > 1
+    // 时开**（Vulkan 硬性规定，1x 下开会让 vkCreateGraphicsPipelines 报错）。
+    bool alphaToCoverage = false;
     // 多边形模式：FILL（默认）/ LINE（线框，需 fillModeNonSolid 特性）。
     // Wireframe 视图模式（R0-2）用它 —— LINE 模式下片元照样跑 pbr.frag
     // （输出固定色），深度测试关闭以透视全部边线。

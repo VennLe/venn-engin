@@ -1035,10 +1035,10 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
     // ---- 杂项（同样两列：名字 + 值，没有槽位）----
     const int modeBefore = static_cast<int>(mat->alphaMode);
     int mode = modeBefore;
-    const char* kAlpha[] = {"Opaque", "Blend"};
+    const char* kAlpha[] = {"Opaque", "Blend", "Mask"};
     rowBegin("Alpha Mode");
     ImGui::SetNextItemWidth(kValueWidth);
-    if (ImGui::Combo("##alpha-mode", &mode, kAlpha, 2)) {
+    if (ImGui::Combo("##alpha-mode", &mode, kAlpha, 3)) {
         const auto newMode = static_cast<assets::Material::AlphaMode>(mode);
         const auto oldMode = mat->alphaMode;
         if (newMode != oldMode) {
@@ -1052,6 +1052,65 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
         }
     }
 
+    // ---- Mask（alpha 裁切）专属：阈值 + 抖动模式（R4-1）----
+    // 只在 Mask 模式下出现 —— 其它模式这两个字段不参与着色器编译，显示
+    // 出来只会让人以为"调了没反应"。
+    if (mat->alphaMode == assets::Material::AlphaMode::Mask) {
+        const float c0 = mat->alphaCutoff;
+        rowBegin("Alpha Cutoff");
+        ImGui::SetNextItemWidth(kValueWidth);
+        ImGui::SliderFloat("##alpha-cutoff", &mat->alphaCutoff, 0.0f, 1.0f,
+                           "%.2f");
+        fieldEdit(m_ctx, "Material Alpha Cutoff", &mat->alphaCutoff, c0);
+
+        bool dither = mat->ditherAlpha;
+        rowBegin("Dither Alpha");
+        if (ImGui::Checkbox("##dither-alpha", &dither)) {
+            const bool ob = mat->ditherAlpha;
+            mat->ditherAlpha = dither;
+            discreteEdit(m_ctx, "Material Dither Alpha", &mat->ditherAlpha, ob);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Stochastic alpha test: keep the fragment with a Bayer-dither\n"
+                "threshold instead of a fixed cutoff. Still writes depth (unlike\n"
+                "Blend), and TAA turns the dithered edge into a soft one.");
+        }
+    }
+
+    // ---- 着色模型（R4-2）----
+    // Default = 标准金属-粗糙度 BRDF；Skin = 预积分次表面散射（漫反射改查
+    // (N·L, 曲率) LUT，鼻梁/耳缘泛红透光）。它是**关键字位**（bit4），所以
+    // 切一下就能从下面 "Shader Var" 那行看到 k 值跟着变 —— 生效与否可自证。
+    {
+        int sm = static_cast<int>(mat->shadingModel);
+        const char* kShading[] = {"Default", "Skin"};
+        rowBegin("Shading Model");
+        ImGui::SetNextItemWidth(kValueWidth);
+        if (ImGui::Combo("##shading-model", &sm, kShading, 2)) {
+            const auto newSm = static_cast<assets::Material::ShadingModel>(sm);
+            const auto oldSm = mat->shadingModel;
+            if (newSm != oldSm) {
+                mat->shadingModel = newSm;
+                m_ctx.commands().pushAlreadyApplied(
+                    std::make_unique<LambdaCommand>(
+                        "Material Shading Model",
+                        [mat, oldSm]() { mat->shadingModel = oldSm; },
+                        [mat, newSm]() { mat->shadingModel = newSm; }));
+                m_ctx.dirty() = true;
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Default = metallic-roughness BRDF.\n\n"
+                "Skin = pre-integrated subsurface scattering: the diffuse term\n"
+                "looks up a baked (N.L, curvature) LUT instead of max(N.L,0),\n"
+                "so light wraps around the terminator and the red channel bleeds\n"
+                "furthest -> nose bridge / ear rims glow red. Default materials\n"
+                "are compiled without this code path entirely (pixel-identical).");
+        }
+    }
+
     bool ds = mat->doubleSided;
     rowBegin("Double Sided");
     if (ImGui::Checkbox("##double-sided", &ds)) {
@@ -1061,7 +1120,8 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
     }
 
     // ---- 这个材质会被编成哪个着色器变体（见 render/ShaderKeywords.h）----
-    // 只读。上面三个控件（Double Sided / Alpha Mode / Normal 槽位）的组合
+    // 只读。上面那些控件（Double Sided / Alpha Mode / Shading Model /
+    // Normal 槽位）的组合
     // 结果直接写出来，省得去猜"双面 + 挂了法线图"到底是哪一份 .spv ——
     // 也省得在改了开关后看不出"到底有没有生效"。
     //
@@ -1085,6 +1145,8 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
                 "  bit0  double-sided  VENN_DOUBLE_SIDED  关背面剔除\n"
                 "  bit1  alpha-blend   VENN_ALPHA_BLEND   走混合、不写深度\n"
                 "  bit2  normal-map    VENN_NORMAL_MAP    采样法线贴图 + TBN\n"
+                "  bit3  alpha-mask    VENN_ALPHA_MASK    alpha 裁切（discard）\n"
+                "  bit4  shading-skin  VENN_SHADING_SKIN 预积分皮肤散射 LUT\n"
                 "\n没挂法线图时 bit2 为 0：那段采样与 TBN 会被整段编掉，"
                 "改为绑一张内置平坦法线，两者像素等价。\n"
                 "\n若设了 MYVK_SHADER_FORCE_MASK，实际用的变体会被强制覆盖，"

@@ -43,7 +43,10 @@ from verify_asset_drag import force_foreground, move_to           # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
-OUT_DIR = r"E:\code\cpp\_venn_verify"
+# ⚠ 不能写死盘符：仓库 2026-10-14 从 `E:\code\cpp` 迁到 `D:\A-VENN\code\cpp`，
+# 写死会让 `os.makedirs` 抛 FileNotFoundError: 'E:\'。与其它 verify_* 一致，
+# 取**仓库上一级**下的 `_venn_verify`。
+OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify")
 
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004

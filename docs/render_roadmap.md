@@ -564,19 +564,66 @@
 
 ## 阶段 4 · 材质表现力
 
-### R4-1 AlphaMode 加 `Mask`（alpha test）+ 抖动裁切
+### R4-1 AlphaMode 加 `Mask`（alpha test）+ 抖动裁切 ✅ 已完成（2026-10-13）
 
 - **目标**：植被叶子、栅栏、铁丝网必须；`Mask` + cutoff 滑条 + 可选抖动模式（配合 TAA 随机化）。
 - **改动点**：`Material::AlphaMode` 枚举加 `Mask`、材质面板 cutoff 滑条、`pbr.frag` 加 `discard` 分支（或 `alphaToCoverage` 借 MSAA，两条都做）。
 - **验收**：`Mask` 材质的镂空格网从背面能看到透光；Opaque/Blend 路径逐像素不变。
 - **规模**：S（**性价比极高，建议提前**）
+- **交付**：`AlphaMode::Mask` + `alphaCutoff` + `ditherAlpha`（Bayer 抖动裁切）；
+  关键字 **bit3 `VENN_ALPHA_MASK`**（裁切阈值走现有 push 常量的 `skin.w`）；
+  材质面板加 "Alpha Mode" 下拉 + Mask 专属的 Cutoff 滑条 / Dither 开关；
+  `SceneSerializer` 写 `alphaMode` 字符串（并保留旧 `alphaBlend` 布尔做兼容）。
+  验收脚本 `tools/verify_alpha_mask.py`（已进回归 DEFAULT）。
 
-### R4-2 预积分 SSS（皮肤）
+### R4-2 预积分 SSS（皮肤）✅ 已完成（2026-10-14）
 
 - **目标**：最便宜的次表面散射入门——预烘焙散射 profile LUT（曲率→颜色偏移），前向里按曲率采样。
 - **改动点**：`Material` 加 `ShadingModel` 枚举（Default/Skin）→ `pbr.frag` 分支：diffuse 乘预积分 LUT（LUT 用脚本生成 256×256 PNG 烘成 BC）+ 可选 2 pass 模糊（先不做）。
 - **验收**：anime_girl 皮肤在强侧光下鼻梁/耳缘泛红透光；ShadingModel=Default 逐像素不变。
 - **规模**：M
+- **交付**：
+  - **LUT 生成**：`tools/make_sss_lut.py` → `assets/textures/sss_lut.dds`
+    （BC1 + 完整 mip，`srgb=false`）。模型：`D(cosθ,curv) = Σ_φ P(s)·max(0,cos(θ−φ)) / Σ_φ P(s)`，
+    `P(s)=exp(−s²/2σ²)`、`s = r·φ`、`r = 1/curv`，σ 逐通道 `(500,300,150) mm`（R 渗得最远）。
+    逐行逐通道归一化（N·L=1 处归一到 1）→ **曲率=0 行逐点等于 `max(N·L,0)`**。
+  - **着色器**：关键字 **bit4 `VENN_SHADING_SKIN`**（变体 16 → **32**）；
+    `pbr.frag::skinDiffuse` 用 `textureLod` 采样 LUT，方向光与
+    `shadeLocalLight`/`shadeLocalLightMod` 的漫反射乘子从 `NdotL` 换成查表值；
+    曲率 `curv = clamp(length(fwidth(几何法线)) * ubo.sssParams.x, 0, 1)` ——
+    **取法线贴图扰动之前**的几何法线（否则贴图高频细节让整张脸变噪点）。
+  - **接线**：`FrameUBO` 704 → **720** 字节（末尾 `sssParams`）；set0 从 19 →
+    **20** 个 binding（binding19 = `sampler2D sssLut`，纹理解析失败时用程序化
+    Lambert 表兜底，绝不黑屏）。开关在**材质字段**上（`Material::shadingModel`），
+    尺度在 `MYVK_SSS`（默认 8；`=0` → 曲率恒 0 → 退化成 Lambert 对照组）。
+  - **编辑器**：材质面板加 "Shading Model" 下拉（带撤销）；`SceneSerializer`
+    写 `shadingModel`（`"skin"` / 缺省即 default）。
+- **⚠ 关键坑（采样坐标必须钉到纹素中心）**：LUT 采样器是 **REPEAT** 地址模式，
+  而两条轴的端点恰好会取到 `u=1`（正对光）与 `v=0`（平面：`fwidth(几何法线)=0`
+  → 曲率恒 0）。边界上的双线性会与"绕到另一侧"的纹素各取一半 —— 曲率 0 的行
+  掺进曲率 1 的红边（实测 v=0 读出 0.179，而表里是 0.098），**皮肤所有平坦
+  区域无端泛红**。修法：`uv = (x*(N−1)+0.5)/N` 把坐标钉到纹素中心，与
+  `make_sss_lut.py` 的 `linspace` 布点逐格对齐。修复后 "Skin(尺度0) vs Default"
+  的差从 **5.614 → 0.204**（27 倍）。
+- **验收**：`tools/verify_sss.py`（A 组 4 项数值 + B 组 5 项渲染，已进回归 DEFAULT）：
+  · A1 曲率0 行 vs `max(N·L,0)` 误差 **0.00000**；A2 曲率1/N·L=0 → RGB=(0.206,0.120,0.058)；
+  · A3 曲率1/N·L=1 → (1,1,1)；A4 固定 N·L 下 R 随曲率**单调** 0.294→0.385；
+  · B1 Default 球 `MYVK_SSS` 0 vs 16 → **0.000000**（Default 逐像素不变，满足验收）；
+  · B2 Skin 0 vs 16 → **6.41**；B3 ΔRGB=(+13.46,+4.79,+0.95)，**ΔR/ΔB = 14.1×**（泛红方向）；
+  · B4 Skin(=0) vs Default → **0.2041**（只剩 LUT 量化噪声，同时是采样边界不变量的守卫）；
+  · B5 `MYVK_SSS=4` → 0.514 < 6.41/3（曲率轴单调、未饱和）。
+  · **否定测试**：故意把采样坐标退化回边界坐标 → B4 读到 **5.6143**，证明该断言非空。
+- **已知边界（留给后续）**：① **只作用于"直接光"的漫反射** —— 环境/IBL 的漫反射
+  （`irradianceMap` 余弦卷积那一路）没有过 LUT，因为那张表需要"光的来向"，而 IBL 是
+  半球积分、没有单一方向。所以背光面的泛红只来自直接光，逆光时偏冷。真想补，得改用
+  **球谐/辐照度探针 + 逐方向查表**，或上 R5-1 反射探针时一起做。
+  ② 路线图原文里"可选 2 pass 模糊"没做 —— 预积分 LUT 已把交界线柔化，屏幕空间再糊一遍
+  的收益低于成本（且会破坏"Default 逐像素不变"的对齐口径）。
+  ③ **默认刻度 8 对细几何是"已饱和"的**：`curv = fwidth(几何法线) × 8`，一个 ~200px 的球
+  其 `fwidth` 只有 ~0.013（curv≈0.10），而鼻梁那种十几像素宽的特征 `fwidth` 可到 ~0.2
+  → curv 被 clamp 到 1（= 最强散射行）。也就是说默认值在脸上基本是"拉满"的，
+  想让皮肤含蓄一点就把 `MYVK_SSS` 调到 3~5；想让它成为可调的艺术参数，应该把刻度
+  从"全局常量"升级成**材质字段**（`Material::sssCurvatureScale`）。
 
 ### R4-3 POM 视差遮挡贴图
 
@@ -669,10 +716,10 @@
 ## 推荐执行顺序（把"性价比/依赖"折算后的直线序）
 
 ```
-R0-1 GPU时戳 ──► R0-2 视图模式 ──► R1-1 TAA ──► R4-1 AlphaMask(小,穿插) ──► R3-1 阴影硬化 ✅
+R0-1 GPU时戳 ──► R0-2 视图模式 ──► R1-1 TAA ──► R4-1 AlphaMask ✅(小,穿插) ──► R3-1 阴影硬化 ✅
       │                                  │
       ▼                                  ▼
-  R2-1 Hi-Z ──► R1-2 自动曝光 ──► R1-3 LUT ──► R3-2 体积雾 ✅ ──► R4-2 SSS ──► R5-1 反射探针
+  R2-1 Hi-Z ──► R1-2 自动曝光 ──► R1-3 LUT ──► R3-2 体积雾 ✅ ──► R4-2 SSS ✅ ──► R5-1 反射探针
                                                   R3-3 光源修饰 ✅（区域光/IES/light function）
       │
       ▼

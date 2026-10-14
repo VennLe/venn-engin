@@ -157,6 +157,12 @@ struct GridSettings {
     float fadeEnd = 60.0f;
 };
 
+// R4-2：皮肤预积分散射的曲率缩放默认值。
+// 把"屏幕空间法线导数（无量纲）"映射到 SSS LUT 的曲率轴 0..1。
+// 8.0 是实测值：脸颊这种大平面几乎为 0，轮廓/鼻梁/耳缘落到 0.4~1.0。
+// 环境变量 MYVK_SSS 可以覆盖它（=0 时关掉 SSS，作对照组）。
+static constexpr float kSssDefaultCurvatureScale = 8.0f;
+
 class Renderer {
 public:
     explicit Renderer(core::Window& window);
@@ -745,6 +751,15 @@ private:
         // （网格没有包围盒）。R2-2 要按**批序**重排候选 AABB，所以必须
         // 能从这里找回它，不能只靠"两个表的顺序恰好一样"。
         int32_t hizSlot = -1;
+        // 该项是否**不参与深度预通道**（R4-1）。
+        //
+        // Mask 材质的前向片元会 discard，但深度预通道用的是 depth_only.frag
+        // （不采样材质 → 无从判断该不该丢）。若让 Mask 项进预通道，镂空处
+        // 会先被写进深度，前向的 mask 片元再被 early-Z 挡掉 → 镂空"透光"
+        // 直接失效，而且 alpha-to-coverage 的软边也被已经写死的深度覆盖。
+        // 所以 Mask 项**跳过预通道**，靠前向自己写深度（代价是丢掉这一批的
+        // early-Z，可接受；等做"带材质采样的 depth prepass 变体"再补回来）。
+        bool skipDepthPrepass = false;
     };
 
     // 构建本帧绘制列表。isMain 为 true 时累积 RenderStats（预览场景是
@@ -901,6 +916,10 @@ private:
     // 逐 draw 把材质页号压进 push.emissive.w（关闭时恒 1.0 = 旧值）。
     // 放在这里是为了让 drawMesh / MDI 两条提交路径共用同一个口径。
     float materialPageCode(const assets::Material& mat);
+    // Mask 材质的 alpha 裁切阈值 → push.skin.w（R4-1）。非 Mask 材质恒
+    // 返回 +0.5（旧的空值）；负号 = 抖动模式（见 pbr.frag 的说明）。
+    // 同样放在这里让 drawMesh / MDI 共用。
+    static float alphaCutoffLane(const assets::Material& mat);
     // set 1..6 用的布局：bindless 时是那一份"纹理数组 + 页表"的布局，
     // 否则是老的"单纹理"布局。管线描述的 setLayouts 与 grid/sky 的
     // 对齐都必须走它 —— 两处用了不同的对象就会踩"set 0 被中途打断"
@@ -1010,6 +1029,13 @@ private:
     std::unique_ptr<assets::Texture> m_defaultWhite;       // (1,1,1,1)
     std::unique_ptr<assets::Texture> m_defaultFlatNormal;  // (0.5,0.5,1)
     std::unique_ptr<assets::Texture> m_defaultBlack;       // (0,0,0,1)
+
+    // R4-2：预积分皮肤散射 LUT（256²，set0/binding19）。
+    // init 时从 assets/textures/sss_lut.dds 加载；缺失/损坏则程序化生成
+    // 一张"Lambert 表"兜底（Skin 材质退化成 Default，绝不崩）。
+    std::unique_ptr<assets::Texture> m_sssLut;
+    // 曲率缩放（→ FrameUBO.sssParams.x）。MYVK_SSS=0 时置 0 = 关 SSS 对照组。
+    float m_sssCurvatureScale = kSssDefaultCurvatureScale;
 
     // 灯光可视化：每盏灯画一个小自发光球（由 Renderer 自己建网格，
     // 不经过 AssetManager —— 它是渲染器的调试设施，不是场景资产）

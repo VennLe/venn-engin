@@ -36,7 +36,7 @@ from verify_asset_drag import force_foreground, move_to          # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
-OUT_DIR = r"E:\code\cpp\_venn_verify"
+OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify")
 
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004

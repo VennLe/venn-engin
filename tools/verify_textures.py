@@ -142,14 +142,20 @@ def main():
         return run_once(exe, scene, env, os.path.join(OUT_DIR, "tex_%s.png"
                                                       % tag), cam=CAM)
 
-    def diff_n(imgA, imgB, vpA, vpB):
-        """公共视口内的差异像素数 / 最大差"""
+    def diff_n(imgA, imgB, vpA, vpB, thr=18):
+        """公共视口内的差异像素数 / 最大差。
+
+        ⚠ `thr` 必须显式传：`verify_local_shadow.diff_stats` 内部硬编码了
+        `d > 18` 的计数阈值，而本文件的断言有的只要求 `max 差 > 8`——
+        同一行里两个阈值不自洽（差在 9..18 之间的画面：`mx` 达标而 `n`
+        恒为 0）。凡是要用 `n` 的断言，就让 `thr` 与它的"显著"口径一致。
+        """
         if imgA is None or imgB is None or vpA is None or vpB is None:
             return -1, -1
         a, b = vp_box(vpA), vp_box(vpB)
         box = (max(a[0], b[0]), max(a[1], b[1]),
                min(a[2], b[2]), min(a[3], b[3]))
-        n, mx, _, _ = diff_stats(imgA, imgB, box)
+        n, mx, _, _ = diff_stats(imgA, imgB, box, thr=thr)
         return n, mx
 
     # ---- 组 1：基线确定性（默认跑两次逐像素一致）----
@@ -162,10 +168,14 @@ def main():
     # ---- 组 2：mipmap（远景高频棋盘差异显著）----
     _, vpC, imgC, eC = run("mip_base")
     lm, vpD, imgD, eD = run("mip_on", on={"MYVK_MIPMAP": "1"})
-    n, mx = diff_n(imgC, imgD, vpC, vpD)
-    print("     mipmap：差异像素=%d 最大差=%d" % (n, mx))
+    n18, mx = diff_n(imgC, imgD, vpC, vpD)
+    # 断言里说的是"差异显著"，口径就该和 `mx > 8` 对齐（用 >8 计数），
+    # 而不是复用 `n` 的 >18 —— 否则 mx=17 时会自相矛盾地判 FAIL。
+    n8, _ = diff_n(imgC, imgD, vpC, vpD, thr=8)
+    print("     mipmap：差异像素(>8)=%d 差异像素(>18)=%d 最大差=%d"
+          % (n8, n18, mx))
     check("mipmap 开/关差异显著（远景摩尔纹被压掉）",
-          n > 800 and mx > 8, "n=%d max=%d" % (n, mx))
+          n8 > 800 and mx > 8, "n(>8)=%d max=%d" % (n8, mx))
     mip_lines = [l for l in lm if "Texture mip chain" in l]
     check("日志确认 mip 链生成（levels>1）",
           any("levels=" in l and not l.endswith("levels=1") for l in mip_lines),

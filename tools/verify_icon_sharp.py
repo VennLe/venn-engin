@@ -28,7 +28,7 @@ import time
 from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = "E:/code/cpp/_venn_verify"
+OUT = os.path.join(os.path.dirname(ROOT), "_venn_verify")
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)

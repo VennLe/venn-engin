@@ -14,6 +14,26 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
+# ------------------------------------------------------------
+# MSVC 全局开关
+# ------------------------------------------------------------
+# /utf-8：本工程的源文件是 UTF-8 无 BOM，注释与日志字符串里有大量中文。
+#   不指定的话 MSVC 按系统 ANSI 代码页（本机是 936=GBK）解析源文件，
+#   某些中文字符的 UTF-8 字节序列会在 GBK 下被切成"半个字符"，让编译器
+#   以为字符串没有闭合 —— 报 C2001「常量中有换行符」、C2143/C2059 一串
+#   语法错误。MinGW 默认按 UTF-8 处理，所以这个坑只有在 MSVC 下才炸。
+#   /utf-8 等价于 /source-charset:utf-8 /execution-charset:utf-8。
+# NOMINMAX：Windows.h 的 min/max 宏会咬 std::min/std::max（GLFW 会拉进
+#   Windows.h）。MinGW 侧我们也一直假定没有这两个宏。
+# WIN32_LEAN_AND_MEAN：少拉一堆用不上的 Windows 头（含 winsock1）。
+if(MSVC)
+    add_compile_options(/utf-8 /W3 /permissive- /Zc:__cplusplus)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    # C4819（源文件代码页无法表示）已被 /utf-8 解决；这里再显式静音，
+    # 免得第三方头文件里的既有字节仍刷屏。
+    add_compile_options(/wd4819)
+endif()
+
 # 输出目录：build/bin
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -49,6 +69,13 @@ set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/glfw EXCLUDE_FROM_ALL)
 
+# glfw 是独立项目（add_subdirectory），顶层 add_compile_options 虽会沿目录继承，
+# 但它自带的 target 可能自行覆盖编译选项 —— 显式再钉一次 /utf-8，避免
+# glfw 源码里（有非 ASCII 注释）在 MSVC 下报 C4819/C2001。
+if(MSVC)
+    target_compile_options(glfw PRIVATE /utf-8 /wd4819)
+endif()
+
 # ---- ImGui（核心 + GLFW/Vulkan 后端）----
 set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
 add_library(imgui STATIC
@@ -64,6 +91,9 @@ target_include_directories(imgui PUBLIC
     ${IMGUI_DIR}/backends
 )
 target_link_libraries(imgui PUBLIC glfw Vulkan::Vulkan)
+if(MSVC)
+    target_compile_options(imgui PRIVATE /utf-8 /wd4819)
+endif()
 
 # ---- header-only 库（interface target）----
 add_library(glm INTERFACE)
@@ -83,6 +113,11 @@ target_include_directories(tinygltf INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_
 add_library(ufbx STATIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ufbx/ufbx.c)
 target_include_directories(ufbx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ufbx)
 set_target_properties(ufbx PROPERTIES LINKER_LANGUAGE CXX)
+if(MSVC)
+    # ufbx.c 是纯 C，但它被当作 C++ 编译（LINKER_LANGUAGE CXX）；
+    # 源码里同样有非 ASCII 字符，一并钉 /utf-8。
+    target_compile_options(ufbx PRIVATE /utf-8 /wd4819)
+endif()
 
 # ---- nlohmann/json（单头文件；场景序列化用）----
 # 头文件放在 third_party/nlohmann/json.hpp，include 目录指到 third_party，
@@ -113,11 +148,10 @@ target_link_libraries(venn PUBLIC
     nlohmann_json
     vma
 )
-if(MSVC)
-    target_compile_options(venn PRIVATE /W3)
-else()
+if(NOT MSVC)
     target_compile_options(venn PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
+# MSVC 侧：/utf-8 /W3 /permissive- 已在文件顶部的全局 add_compile_options 给出。
 
 # ============================================================
 # 编辑器（唯一的可执行文件）
@@ -197,28 +231,52 @@ set(SHADER_TARGETS "")
 # Shader 变体 / 关键字系统（与 engine/render/ShaderKeywords.h 配套）
 # ------------------------------------------------------------
 # 关键字**位序**必须与 ShaderKeywords.h 里的 ShaderKeyword 逐位一致：
-#   bit0 → VENN_DOUBLE_SIDED   bit1 → VENN_ALPHA_BLEND   bit2 → VENN_NORMAL_MAP
+#   bit0 → VENN_DOUBLE_SIDED   bit1 → VENN_ALPHA_BLEND
+#   bit2 → VENN_NORMAL_MAP     bit3 → VENN_ALPHA_MASK
 #
 # 凡是源码里出现 #if VENN_* 的着色器，都必须列进 SHADER_VARIANT_SHADERS ——
-# 它会为 2^3 = 8 种组合各编一份 <名字>.k<掩码>.<阶段>.spv。
+# 它会为 2^5 = 32 种组合各编一份 <名字>.k<掩码>.<阶段>.spv。
 # 文件名里的 k 数字就是掩码本身，由 render::variantShaderFile() 用同一条
 # 规则拼出来。位序改了而这里没改，运行时会读不到文件并在 stderr 报
 # "找不到变体着色器"（VariantPipelines.cpp），不会静默画错。
-set(SHADER_KEYWORDS VENN_DOUBLE_SIDED VENN_ALPHA_BLEND VENN_NORMAL_MAP)
+set(SHADER_KEYWORDS VENN_DOUBLE_SIDED VENN_ALPHA_BLEND
+                    VENN_NORMAL_MAP VENN_ALPHA_MASK VENN_SHADING_SKIN)
 set(SHADER_VARIANT_SHADERS pbr.frag)
 
-# 掩码 0..7 对应的 -D 参数表。
-# 手写展开而不用 math(EXPR) 的位运算：这份表肉眼就能逐个核对，也不依赖
-# CMake 版本对 & | << 的支持。加第 4 个关键字时这里会变成 16 行 —— 那时
-# 再换生成式也不迟。
-set(VARIANT_DEFINES_0)
-set(VARIANT_DEFINES_1 -DVENN_DOUBLE_SIDED=1)
-set(VARIANT_DEFINES_2 -DVENN_ALPHA_BLEND=1)
-set(VARIANT_DEFINES_3 -DVENN_DOUBLE_SIDED=1 -DVENN_ALPHA_BLEND=1)
-set(VARIANT_DEFINES_4 -DVENN_NORMAL_MAP=1)
-set(VARIANT_DEFINES_5 -DVENN_DOUBLE_SIDED=1 -DVENN_NORMAL_MAP=1)
-set(VARIANT_DEFINES_6 -DVENN_ALPHA_BLEND=1 -DVENN_NORMAL_MAP=1)
-set(VARIANT_DEFINES_7 -DVENN_DOUBLE_SIDED=1 -DVENN_ALPHA_BLEND=1 -DVENN_NORMAL_MAP=1)
+# 掩码 0..31 对应的 -D 参数表 —— **生成式**（R4-1 起从手写 8 行换成循环）。
+# 位序来自 SHADER_KEYWORDS 的列表顺序：第 i 个关键字对应 bit i。
+# 于是"关键字表改了、-D 表忘了改"这类错位从根上不可能发生。
+#
+# ⚠ 两个 CMake 陷阱（都踩过，写在这里免得后人重踩）：
+#   1. `list(APPEND tbl "${EMPTY}")` 会**丢掉空串** —— 展开后所有下标往前
+#      挪一位，k0/k2/k4… 全部错位。所以空项存一个哨兵串 "_"，取用时再
+#      换回空。
+#   2. `${DEFS}` 本身是**列表**，直接 append 会被展平成多个表项。所以
+#      先用 list(JOIN) 拍成一个以空格分隔的单串，表项与掩码才一一对应。
+list(LENGTH SHADER_KEYWORDS KEYWORD_COUNT)
+math(EXPR VARIANT_COUNT "1 << ${KEYWORD_COUNT}")
+math(EXPR VARIANT_MAX "${VARIANT_COUNT} - 1")
+set(VARIANT_DEFINES_ALL "")
+foreach(MASK RANGE ${VARIANT_MAX})
+    set(DEFS "")
+    set(BIT 0)
+    foreach(KW ${SHADER_KEYWORDS})
+        math(EXPR BITVAL "1 << ${BIT}")
+        math(EXPR HIT "${MASK} & ${BITVAL}")
+        if(HIT)
+            list(APPEND DEFS -D${KW}=1)
+        endif()
+        math(EXPR BIT "${BIT} + 1")
+    endforeach()
+    if(DEFS)
+        list(JOIN DEFS " " DEFS_STR)   # 拍平成单串，避免上面的陷阱 2
+    else()
+        set(DEFS_STR "_")              # 哨兵，避免陷阱 1
+    endif()
+    list(APPEND VARIANT_DEFINES_ALL "${DEFS_STR}")
+endforeach()
+# 把哨兵换回空串（-D 位置留空 = 不定义任何关键字）。
+list(TRANSFORM VARIANT_DEFINES_ALL REPLACE "^_$" "")
 
 foreach(SRC ${SHADER_GLSL_SOURCES})
     get_filename_component(FNAME ${SRC} NAME)       # 例：bloom_bright.frag
@@ -227,8 +285,11 @@ foreach(SRC ${SHADER_GLSL_SOURCES})
 
     if(FNAME IN_LIST SHADER_VARIANT_SHADERS)
         # 带关键字的着色器：每种组合一份 .spv
-        foreach(MASK RANGE 7)
-            set(DEFS ${VARIANT_DEFINES_${MASK}})
+        foreach(MASK RANGE ${VARIANT_MAX})
+            list(GET VARIANT_DEFINES_ALL ${MASK} DEFS_STR)
+            # 与下面 bindless 那一族同理：DEFS_STR 是空格分隔的单串，
+            # 必须拆回多个参数（否则多关键字组合会拼成一个畸形 -D）。
+            separate_arguments(DEFS NATIVE_COMMAND "${DEFS_STR}")
             set(OUT ${SHADER_OUT_DIR}/${STEM}.k${MASK}.${EXT}.spv)
             add_custom_command(
                 OUTPUT ${OUT}
@@ -255,19 +316,24 @@ endforeach()
 # ------------------------------------------------------------
 # pbr.bindless.frag —— Bindless 版片元着色器（R2-3）
 # ------------------------------------------------------------
-# 同一份 pbr.frag 再编 8 份，额外加 -DVENN_BINDLESS=1：六张贴图槽从
+# 同一份 pbr.frag 再编 ${VARIANT_COUNT} 份，额外加 -DVENN_BINDLESS=1：六张贴图槽从
 # "set 1..6 各一个 sampler2D" 改成 "set 1 binding 0 的运行时数组 + 材质页表"。
 #
-# 为什么仍然要 ×8 份而不是"把 bindless 做成第 4 个关键字位"：
-#   关键字位是**材质属性**（双面/透明/法线图），bindless 是**全局开关**
+# 为什么仍然要 ×N 份而不是"把 bindless 做成一个关键字位"：
+#   关键字位是**材质属性**（双面/透明/法线图/裁切），bindless 是**全局开关**
 #   （Renderer 按它选 set 布局），两者正交。混进同一个位掩码会让
-#   "全局开关 = 材质组合"这种错配有机会发生，也会让掩码空间翻倍到 16。
+#   "全局开关 = 材质组合"这种错配有机会发生，也会让掩码空间白白翻倍。
 #   所以沿用 instancing / mdi 顶点着色器的处理方式：全局开关 → 独立的
 #   .spv 文件族，名字是 pbr.bindless.k<N>.frag.spv。
 #   VariantPipelines 只要把 fragBaseName 换成 "pbr.bindless.frag" 即可命中
 #   （variantShaderFile 的拼法是 <stem>.k<N>.<ext>.spv）。
-foreach(MASK RANGE 7)
-    set(DEFS ${VARIANT_DEFINES_${MASK}})
+foreach(MASK RANGE ${VARIANT_MAX})
+    list(GET VARIANT_DEFINES_ALL ${MASK} DEFS_STR)
+    # DEFS_STR 是"以空格分隔的单串"（见上面的生成式说明），必须用
+    # separate_arguments 拆回多个参数 —— 否则 k3 会变成**一个**带空格的
+    # 参数 `"-DVENN_DOUBLE_SIDED=1 -DVENN_ALPHA_BLEND=1"`，glslc 把它当成
+    # 一个畸形 -D 而报 "'#if' : unexpected tokens following directive"。
+    separate_arguments(DEFS NATIVE_COMMAND "${DEFS_STR}")
     set(OUT ${SHADER_OUT_DIR}/pbr.bindless.k${MASK}.frag.spv)
     add_custom_command(
         OUTPUT ${OUT}
@@ -382,33 +448,72 @@ add_dependencies(Editor Shaders)
 # （见 assets/AssetPath.cpp 的解析顺序）。
 # ============================================================
 function(myvk_copy_runtime_assets target)
-    # 拷贝 .spv 与 GLSL 源码到可执行目录
-    add_custom_command(TARGET ${target} POST_BUILD
+    # 拷贝 .spv 与 GLSL 源码到可执行目录。
+    #
+    # ⚠ **不能**用 `add_custom_command(TARGET ... POST_BUILD)`：POST_BUILD 只在
+    #   **目标自身被重建（重新链接）**时执行。于是"只改了一个 .frag、没动任何
+    #   C++"→ `Shaders` 目标重新生成 .spv，但 Editor 被认为是最新的、不重链接
+    #   → 拷贝步骤整段跳过 → 运行时加载的还是**上一次**的 .spv。现象极具迷惑性：
+    #   改了着色器却"看不到任何变化"，或者看到的是上一版的行为。
+    #   （`add_dependencies(Editor Shaders)` 只保证**构建顺序**，不触发重链接。）
+    #
+    # 正确做法：把拷贝挂在一个**没有输出文件的 custom target** 上 —— 这种目标的
+    # COMMAND 每次构建都会执行；再让它 DEPENDS 全部 .spv，于是顺序变成
+    # "先把着色器编出来 → 再拷过去"，改一处着色器也能立刻生效。
+    add_custom_target(${target}_shaders ALL
         COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${SHADER_OUT_DIR} $<TARGET_FILE_DIR:${target}>/shaders
+            ${SHADER_OUT_DIR} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders
         COMMAND ${CMAKE_COMMAND} -E copy
-            ${SHADER_GLSL_SOURCES} $<TARGET_FILE_DIR:${target}>/shaders
+            ${SHADER_GLSL_SOURCES} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders
+        DEPENDS ${SHADER_TARGETS}
         COMMENT "Copying shaders to ${target} binary dir"
     )
+    add_dependencies(${target} ${target}_shaders)
 
-    # 模型等资源也拷到可执行目录
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets/models)
-        add_custom_command(TARGET ${target} POST_BUILD
+    # ---- 只读资源（纹理/模型/字体/图标）：同样必须**每次构建**都拷 ----
+    #
+    # ⚠ 与上面的 .spv 完全同一个坑：这些是**构建输入**（由 tools/ 下的脚本离线
+    #   产出），改了源文件却不重新链接 C++ 时，POST_BUILD 不会跑 → 运行时读到的
+    #   还是旧资产。调试时表现为"我明明重新生成了贴图，画面却一点没变"，
+    #   极难定位。所以一并挂到"每次都跑"的 custom target 上。
+    #
+    # ⚠ assets/scenes 与 assets/scripts **不在此列**：它们是编辑器运行时**会写**
+    #   的目录（存档场景 / 自研脚本），每次构建都从仓库覆盖过去会把用户的存档
+    #   冲掉 —— 那两个目录保持 POST_BUILD（只在重新链接时同步一次）。
+    set(VENN_ALWAYS_ASSET_DIRS
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/models|assets/models"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/textures|assets/textures"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons|assets/icons"
+    )
+    set(always_asset_cmds "")
+    foreach(item IN LISTS VENN_ALWAYS_ASSET_DIRS)
+        string(REPLACE "|" ";" pair "${item}")
+        list(GET pair 0 src)
+        list(GET pair 1 rel)
+        if(EXISTS "${src}")
+            list(APPEND always_asset_cmds
+                COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${rel}
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${src}" ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${rel}
+            )
+        endif()
+    endforeach()
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/misc/fonts)
+        list(APPEND always_asset_cmds
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/fonts
             COMMAND ${CMAKE_COMMAND} -E copy_directory
-                ${CMAKE_CURRENT_SOURCE_DIR}/assets/models
-                $<TARGET_FILE_DIR:${target}>/assets/models
-            COMMENT "Copying models to ${target} binary dir"
+                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/misc/fonts
+                ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/fonts
         )
     endif()
-
-    # 纹理资源（DDS 压缩纹理测试资产等）
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets/textures)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                ${CMAKE_CURRENT_SOURCE_DIR}/assets/textures
-                $<TARGET_FILE_DIR:${target}>/assets/textures
-            COMMENT "Copying textures to ${target} binary dir"
+    if(always_asset_cmds)
+        add_custom_target(${target}_assets ALL
+            ${always_asset_cmds}
+            COMMENT "Copying readonly assets to ${target} binary dir"
         )
+        add_dependencies(${target} ${target}_assets)
     endif()
 
     # 场景 / 脚本目录（编辑器会读写 assets/scenes 与 assets/scripts）
@@ -426,30 +531,6 @@ function(myvk_copy_runtime_assets target)
                 ${CMAKE_CURRENT_SOURCE_DIR}/assets/scripts
                 $<TARGET_FILE_DIR:${target}>/assets/scripts
             COMMENT "Copying scripts to ${target} binary dir"
-        )
-    endif()
-
-    # 编辑器 UI 字体（ImGui 用 TTF，运行时按 assets/fonts 查找）
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/misc/fonts)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory
-                $<TARGET_FILE_DIR:${target}>/assets/fonts
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/misc/fonts
-                $<TARGET_FILE_DIR:${target}>/assets/fonts
-            COMMENT "Copying UI fonts to ${target} binary dir"
-        )
-    endif()
-
-    # venn 的图标（PNG：运行时 glfwSetWindowIcon 用；ICO/RES 只用于 exe 资源）
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets/icons)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory
-                $<TARGET_FILE_DIR:${target}>/assets/icons
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                ${CMAKE_CURRENT_SOURCE_DIR}/assets/icons
-                $<TARGET_FILE_DIR:${target}>/assets/icons
-            COMMENT "Copying venn icons to ${target} binary dir"
         )
     endif()
 endfunction()

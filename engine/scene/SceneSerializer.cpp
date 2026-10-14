@@ -168,7 +168,21 @@ json materialToJson(const assets::Material* mat) {
     j["ao"] = mat->ao;
     j["emissive"] = vec3ToJson(mat->emissive);
     j["doubleSided"] = mat->doubleSided;
+    // 透明模式：写字符串（Opaque / Blend / Mask）。**同时保留旧的 alphaBlend
+    // 布尔**——老场景文件只有它，读的时候要能兼容（见 resolveMaterial）。
+    j["alphaMode"] = (mat->alphaMode == assets::Material::AlphaMode::Blend)
+                         ? "blend"
+                         : (mat->alphaMode == assets::Material::AlphaMode::Mask)
+                               ? "mask"
+                               : "opaque";
     j["alphaBlend"] = (mat->alphaMode == assets::Material::AlphaMode::Blend);
+    j["alphaCutoff"] = mat->alphaCutoff;
+    j["ditherAlpha"] = mat->ditherAlpha;
+    // 着色模型（R4-2）：写字符串。"default" 不写也能读（见 resolveMaterial），
+    // 但显式写出让人一眼看得出这个材质走哪条漫反射路径。
+    j["shadingModel"] =
+        (mat->shadingModel == assets::Material::ShadingModel::Skin) ? "skin"
+                                                                   : "default";
     j["albedo"] = textureSourceToJson(mat->albedoMap);
     j["normal"] = textureSourceToJson(mat->normalMap);
     j["orm"] = textureSourceToJson(mat->ormMap);
@@ -242,6 +256,23 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
         mat->alphaMode = jm.value("alphaBlend", false)
                              ? assets::Material::AlphaMode::Blend
                              : assets::Material::AlphaMode::Opaque;
+        // alphaMode 字符串优先（新格式）。缺席时退回上面的 alphaBlend 布尔
+        // —— 老场景文件没有这个字段，不能因此把 Mask/Blend 读丢。
+        const std::string am = jm.value("alphaMode", std::string());
+        if (am == "blend") {
+            mat->alphaMode = assets::Material::AlphaMode::Blend;
+        } else if (am == "mask") {
+            mat->alphaMode = assets::Material::AlphaMode::Mask;
+        } else if (am == "opaque") {
+            mat->alphaMode = assets::Material::AlphaMode::Opaque;
+        }
+        mat->alphaCutoff = jm.value("alphaCutoff", 0.5f);
+        mat->ditherAlpha = jm.value("ditherAlpha", false);
+        // 着色模型（R4-2）。缺席 = 老场景 = Default（逐像素不变）。
+        mat->shadingModel =
+            (jm.value("shadingModel", std::string()) == "skin")
+                ? assets::Material::ShadingModel::Skin
+                : assets::Material::ShadingModel::Default;
     }
     return mat;
 }

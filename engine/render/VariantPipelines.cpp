@@ -46,6 +46,18 @@ void applyKeywordState(KeywordMask m, KeywordMask stateMask,
         desc.blendEnable = false;
         desc.depthWrite = true;
     }
+    // ALPHA_MASK 不参与固定状态：它**不改变**管线状态（写深度、不混合，
+    // 与 Opaque 一模一样），只在片元里按 cutoff 丢弃片元。
+    // 这正是它相对 Blend 的核心优势 —— 镂空物体照样写深度、照样能被
+    // 不透明物体正确遮挡，且不需要排序。
+    //
+    // alphaToCoverage：只有当采样数 > 1 时才启用。它把片元的 alpha 转成
+    // 逐采样覆盖掩码，于是 MSAA 下 Mask 的筛孔边缘会得到**硬件级的抗锯齿**
+    // （比 discard 的硬边好看，且不需要 TAA）。采样数为 1 时 MUST 关 ——
+    // Vulkan 规定 alphaToCoverageEnable 只在 rasterizationSamples != 1 时可用，
+    // 否则 vkCreateGraphicsPipelines 直接报错。
+    desc.alphaToCoverage = hasKeyword(bits, kKeywordAlphaMask) &&
+                           desc.samples != VK_SAMPLE_COUNT_1_BIT;
     // NORMAL_MAP 不参与固定状态：它只改代码（少一次采样与 TBN）。
 }
 

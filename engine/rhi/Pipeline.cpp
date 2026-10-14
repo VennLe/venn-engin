@@ -71,6 +71,12 @@ Pipeline::Pipeline(Device& device, const PipelineDesc& desc) : m_device(device) 
         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisample.rasterizationSamples = desc.samples;
     multisample.sampleShadingEnable = VK_FALSE;
+    // Alpha-to-coverage：只在 MSAA 下有效（enableAlphaToCoverage 还要看
+    // 设备特性，Intel Iris Xe 支持；不支持时这里为 false 即"没说"）。
+    // 未开 MSAA 时 desc.alphaToCoverage 由调用方保证为 false（见
+    // VariantPipelines::applyKeywordState 的说明）。
+    multisample.alphaToCoverageEnable =
+        desc.alphaToCoverage ? VK_TRUE : VK_FALSE;
 
     VkPipelineDepthStencilStateCreateInfo depthStencil{};
     depthStencil.sType =

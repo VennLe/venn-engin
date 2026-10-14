@@ -45,9 +45,43 @@ struct Material {
     // ---- 透明模式 ----
     // Opaque：参与深度预通道，不透明管线绘制
     // Blend ：不参与深度预通道，混合管线绘制（不写深度、按到相机距离降序排序）
+    // Mask  ：alpha 裁切（alpha test）。参与深度预通道、走不透明管线（写深度），
+    //         但片元在 alpha < alphaCutoff 时直接 discard —— 于是"镂空"的
+    //         部分既不写颜色也不写深度，从背面能直接看到透光。植被叶子、
+    //         栅栏、铁丝网靠它，代价只有一次比较。**筛孔边缘是硬的**
+    //         （没有半透明过渡），要高频道效果再叠抖动模式（见 ditherEnabled）。
     // 最终 alpha = baseColorFactor.a × albedo 贴图的 alpha 通道
-    enum class AlphaMode { Opaque, Blend };
+    enum class AlphaMode { Opaque, Blend, Mask };
     AlphaMode alphaMode = AlphaMode::Opaque;
+
+    // Mask 模式的裁切阈值：alpha < cutoff 的片元被丢掉。
+    // 默认 0.5 是业界惯例（也正好是"sRGB 贴图里 0.5 线性亮度"这种直觉值）。
+    // 只在 alphaMode == Mask 时参与着色器编译（其它模式这段代码整段编掉）。
+    float alphaCutoff = 0.5f;
+
+    // 抖动裁切（stochastic alpha test）：Mask 模式下不 discard，而是把
+    // alpha 与一个屏幕空间蓝噪声阈值比较后写成 0/1 —— 得到"筛网边缘有
+    // 概率穿透"的效果。配合 TAA（R1-1）多帧累积，边缘会被时间滤波成
+    // 柔和的半透明观感，同时**保留写深度**（不像 Blend 那样排序崩坏）。
+    // 关闭时（默认）Mask 走原样的硬 discard 路径 → 逐像素不变。
+    bool ditherAlpha = false;
+
+    // ---- 着色模型（R4-2）----
+    // Default：标准金属-粗糙度 BRDF（漫反射 = max(N·L,0)）。
+    // Skin   ：在此之上叠一层**预积分次表面散射** —— 用 (N·L, 曲率) 查一张
+    //          预烘焙的散射 LUT 代替朴素的 max(N·L,0)，光按扩散核"绕过"
+    //          明暗交界线，且红通道散射最远 → 鼻梁/耳缘/指尖泛红透光。
+    //
+    // "曲率"由片元处**几何法线**的屏幕空间导数（fwidth）近似，所以这个
+    // 效果**不需要任何额外顶点数据或贴图**：同一张网格换成 Skin 就有反应，
+    // 平坦的地方（脸颊正面）几乎与 Default 一致，只有法线变化快的地方
+    // （轮廓边缘、鼻梁、耳缘）才明显。
+    //
+    // 语义上等价于"给这个材质换一个漫反射响应函数"，所以走**关键字变体**
+    // （bit4 VENN_SHADING_SKIN）而不是运行时 uniform：Default 材质那段代码
+    // 整段编掉 → 逐像素不变。
+    enum class ShadingModel { Default, Skin };
+    ShadingModel shadingModel = ShadingModel::Default;
 
     // ---- 因子（线性空间）----
     glm::vec4 baseColorFactor{1.0f};

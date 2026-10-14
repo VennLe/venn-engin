@@ -30,6 +30,8 @@
 //   bit 0  DOUBLE_SIDED  双面：关背面剔除 + 背面翻转法线
 //   bit 1  ALPHA_BLEND   透明混合：走混合管线、不写深度、alpha 参与输出
 //   bit 2  NORMAL_MAP    材质挂了法线贴图：采样 + TBN 变换
+//   bit 3  ALPHA_MASK    alpha 裁切：按 cutoff discard（或不 discard 时抖动）
+//   bit 4  SHADING_SKIN  预积分皮肤散射：漫反射项改查 (N·L, 曲率) LUT
 //
 // ⚠ 位序就是"规范化顺序"：变体 ID、.spv 文件名、GLSL 宏名全部按它排。
 //   调换位序等于换掉所有变体的身份，改之前先搜一遍 CMakeLists.txt。
@@ -55,8 +57,12 @@ enum ShaderKeyword : uint32_t {
     kKeywordAlphaBlend = 1u << 1,
     // 材质挂了法线贴图：采样 + cotangent frame
     kKeywordNormalMap = 1u << 2,
+    // alphaMode == Mask：片元按 alphaCutoff 裁切（可选抖动）
+    kKeywordAlphaMask = 1u << 3,
+    // shadingModel == Skin：漫反射按预积分 SSS LUT 采样（R4-2）
+    kKeywordShadingSkin = 1u << 4,
 
-    kKeywordCount = 3,
+    kKeywordCount = 5,
     kKeywordAll = (1u << kKeywordCount) - 1u,
 };
 
@@ -106,9 +112,13 @@ std::string keywordNames(KeywordMask m);
 // 材质 → 关键字。**这是"材质特性开关变体"的唯一一条规则**，
 // 绘制路径与验证脚本都必须走它，不要各自再写一遍 if。
 //
-//   doubleSided        -> kKeywordDoubleSided
-//   alphaMode == Blend -> kKeywordAlphaBlend
-//   normalMap != null  -> kKeywordNormalMap
+//   doubleSided         -> kKeywordDoubleSided
+//   alphaMode == Blend  -> kKeywordAlphaBlend
+//   normalMap != null   -> kKeywordNormalMap
+//   alphaMode == Mask   -> kKeywordAlphaMask
+//   shadingModel == Skin -> kKeywordShadingSkin
+//
+// ⚠ Blend 与 Mask 互斥（一次只能一个），枚举本身就保证了这点。
 //
 // ⚠ normalMap 为 null 时**不是**"采样一张白图"，而是把整段采样与 TBN
 //   变换编译掉。两者的画面必须逐像素相同（默认平坦法线贴图算出来的

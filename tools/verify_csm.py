@@ -436,6 +436,7 @@ def main():
     check("零 Vulkan 验证层报错", not errs_off, errs_off[:2])
 
     res = {}
+    dist_imgs = {}
     for tag, dist in (("near", 70), ("far", 25)):
         shot = os.path.join(OUT_DIR, "csm_dist%d.png" % dist)
         lines_d, _, img_d, errs_d = run_once(
@@ -457,6 +458,7 @@ def main():
               abs(spd[3] - dist) < 0.02, "%.2f" % spd[3])
         if img_d is not None:
             res[dist] = diff_stats(img_off, img_d)
+            dist_imgs[dist] = img_d
 
     if img_on is not None and img_off is not None:
         n90, mx90, mean90, box90 = diff_stats(img_off, img_on)
@@ -473,9 +475,20 @@ def main():
             # 这让"距离分级"和"全有全无的开关"彻底区分开。
             check("dist=70 阴影被削弱但仍在（50 < 差异像素 < 1200）",
                   50 < n70 < 1200, n70)
-            check("dist=70 的阴影强度明显低于 dist=90（均值 < 0.7 × dist=90）",
-                  mean70 < 0.7 * mean90,
-                  "%.4f vs %.4f" % (mean70, mean90))
+            # ⚠ 强度比较必须**限定在差异带内**。`diff_stats` 的均值是
+            # `total/(W*H)`（整幅图），会把全图的零星噪声（上一用例残留、
+            # 窗口状态）一起算进来 —— 实测套件里连跑时它会从 0.047 跳到
+            # 0.149（而差异像素数与最大差**完全不变**），把这条断言变成
+            # flaky。改用 `dist=90` 那条阴影带（box90）内的平均差。
+            if dist_imgs.get(70) is not None and box90:
+                band90 = region_diff(img_on, img_off, box90)
+                band70 = region_diff(dist_imgs[70], img_off, box90)
+                print("  差异带 %s 内平均差: dist=90 → %.3f, dist=70 → %.3f"
+                      % (box90, band90, band70))
+                check("dist=70 的阴影强度明显低于 dist=90"
+                      "（差异带内均值 < 0.7 × dist=90）",
+                      band70 < 0.7 * band90,
+                      "%.4f vs %.4f" % (band70, band90))
             check("dist=70 的阴影变化量小于 dist=90（最大差 < dist=90）",
                   mx70 < mx90, "%d vs %d" % (mx70, mx90))
 

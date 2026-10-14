@@ -61,7 +61,7 @@ struct LightShadowRecord {
 };
 static_assert(sizeof(LightShadowRecord) == 80, "LightShadowRecord 布局变了");
 
-// 每帧全局常量缓冲（std140 布局，共 640 字节）
+// 每帧全局常量缓冲（std140 布局，共 720 字节）
 //
 // 前半段是阴影 Pass 就在用的老字段；着色器只声明自己需要的前缀即可 ——
 // GLSL 的 uniform block 允许比绑定的 buffer 短。
@@ -178,11 +178,18 @@ struct FrameUBO {
     // 片元用 (gl_FragCoord.xy → 瓦片号, 视图深度 → 层号) 定位自己所在的
     // froxel，采样 binding 16 的 3D 图拿 (inscatter.rgb, transmittance)。
     glm::vec4 vfogParams;         // offset 688
+
+    // ---- 预积分皮肤散射（R4-2）----
+    // x = 曲率缩放：把"屏幕空间法线导数"映射到 SSS LUT 的曲率轴(0..1)。
+    //     0 时曲率恒 0 → LUT 退化成 Lambert，正好是"关掉 SSS"的对照组。
+    //     只被 VENN_SHADING_SKIN 编译单元读取，Default 材质完全不受影响。
+    // y/z/w = 保留
+    glm::vec4 sssParams;          // offset 704
 };
-// 总 704 字节。std140 下 mat4 步长 16、vec4 对齐 16，与这里的自然布局一致。
+// 总 720 字节。std140 下 mat4 步长 16、vec4 对齐 16，与这里的自然布局一致。
 // ⚠ 追加字段只能放**末尾**：sky.vert / grid.vert / shadow.vert /
 //   cluster_build.comp 只声明前缀，尾部追加不影响它们的偏移。
-static_assert(sizeof(FrameUBO) == 704, "FrameUBO 布局变了，必须同步所有声明它的着色器");
+static_assert(sizeof(FrameUBO) == 720, "FrameUBO 布局变了，必须同步所有声明它的着色器");
 
 // 阴影 Pass 专用的推送常量（std430 布局，共 96 字节）。
 //
@@ -217,6 +224,9 @@ struct PushConstants {
     glm::vec4 skin;            // 112  x=jointBase（SSBO 里首个关节矩阵的下标；
                                //       y=关节总数；z=1 表示该网格蒙皮，
                                //       0 = 静态网格，着色器直接走原路径）
+                               //      w = alpha 裁切阈值（R4-1，只给 Mask 材质用；
+                               //          其它材质推 0.5 的默认值，但着色器只有在
+                               //          VENN_ALPHA_MASK 编译单元里才读它）
 };
 
 // GPU instancing 的每实例数据（set 0 binding 13，std430）。
