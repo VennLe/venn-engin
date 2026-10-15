@@ -20,6 +20,7 @@
 //     MYVK_VFOG_ALBEDO / MYVK_VFOG_FALLOFF / MYVK_VFOG_BLOB /
 //     MYVK_VFOG_PHASE_G = 数值覆盖
 //   MYVK_SSAO_RADIUS / MYVK_SSAO_STRENGTH = 数值覆盖
+//   MYVK_DECALS = 1 开延迟贴花（R4-4）
 // 运行时由 Engine 面板实时改（Renderer::screenSpaceSettings()）。
 //
 // UI 切开关不需要任何资源重建：
@@ -93,6 +94,19 @@ struct ScreenSpaceSettings {
     bool taa = false;
     float taaBlend = 0.1f;
     float taaClamp = 1.0f;
+
+    // ---- 延迟贴花（DBuffer，R4-4）----
+    // 位置：深度预通道之后、前向 Pass 之前。先把所有贴花体积的
+    // 反照率/法线/粗糙度-金属度写进三张屏幕空间图（DBuffer），
+    // 前向的片元再按 coverage 混进材质。
+    //
+    // 默认为**关**（本项目所有屏幕空间效果的既有约定）：关着时
+    // decal pass 一个都不录，前向的 set0/binding 20..22 指向一张
+    // 1×1 全透明图 → coverage 恒 0 → 那段整块跳过，逐像素回到基线。
+    //
+    // 开着但场景里没有贴花时也一样（pass 把 DBuffer 清成 coverage=0）——
+    // 这是"关=基线"之外的第二条对照断言。
+    bool decals = false;
 };
 
 } // namespace render

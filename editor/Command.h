@@ -93,6 +93,13 @@ public:
     // 历史（全部命令名，按时间顺序；cursor 之前的是"已执行"）
     std::vector<std::string> historyNames() const;
 
+    // 栈顶（= 最近一条已执行的命令）。空栈 / 游标为 0 时返回 nullptr。
+    // E19 的"合并连续编辑"要用它判断"上一条是不是同一个参数的编辑"。
+    Command* topCommand() {
+        if (m_cursor == 0) return nullptr;
+        return m_stack[m_cursor - 1].get();
+    }
+
 private:
     std::vector<std::unique_ptr<Command>> m_stack;
     size_t m_cursor = 0;  // 已执行的命令条数
@@ -161,6 +168,46 @@ private:
     std::size_t m_size = 0;
     std::vector<std::uint8_t> m_before;
     std::vector<std::uint8_t> m_after;
+};
+
+// ============================================================
+// ParamEditCommand —— 注册表参数（渲染设置）的可撤销编辑（E19）
+//
+// 与 RawBytesEditCommand 的区别在于**能合并**：
+//   拖一次滑条 = `IsItemActivated` 记 before、`IsItemDeactivatedAfterEdit`
+//   落一条命令 —— 本来就是一次。但"连拖两下"（松手又马上按下去）在用户
+//   心里仍是一次调整，本命令支持把第二段的 after 并进同一条记录，
+//   于是历史里只留一行 "Set SSR Strength: 0.50 → 0.80"。
+//
+// 名字预拼好（"Set <参数 label>: <旧值> → <新值>"）：Command::name() 返回
+// const char*，若在 name() 里现拼就得持有静态缓冲，多实例会互相覆盖。
+// ============================================================
+class ParamEditCommand : public Command {
+public:
+    // label 形如 "Set SSR Strength"；beforeStr/afterStr 已是格式化好的值
+    ParamEditCommand(std::string label, std::string paramId, void* target,
+                     std::vector<std::uint8_t> before, std::string beforeStr,
+                     std::vector<std::uint8_t> after, std::string afterStr);
+
+    void undo() override;
+    void redo() override;
+    const char* name() const override { return m_full.c_str(); }
+
+    const std::string& paramId() const { return m_paramId; }
+    // 合并：只换 after（before 保持不变）——语义是"还是同一次操作"
+    void mergeAfter(std::vector<std::uint8_t> after, std::string afterStr);
+
+private:
+    void rebuildName();
+
+    std::string m_label;      // "Set SSR Strength"
+    std::string m_paramId;    // "ssr.strength"
+    void* m_target = nullptr;
+    std::vector<std::uint8_t> m_before;
+    std::vector<std::uint8_t> m_after;
+    std::string m_beforeStr;
+    std::string m_afterStr;
+    std::string m_full;       // 预拼好的完整名字
 };
 
 // 实体的 TRS 快照

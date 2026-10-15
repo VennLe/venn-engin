@@ -20,6 +20,21 @@ EditorContext::EditorContext(assets::AssetManager& assets) : m_assets(assets) {
     }
 }
 
+// ---------------------------------------------------------------- 最近打开
+
+void EditorContext::pushRecentScene(const std::string& relPath) {
+    if (relPath.empty()) return;
+    // 去重（同一条挪到最前），再截到上限
+    for (size_t i = 0; i < m_recent.size(); ++i) {
+        if (m_recent[i] == relPath) {
+            m_recent.erase(m_recent.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
+    m_recent.insert(m_recent.begin(), relPath);
+    if (m_recent.size() > kMaxRecent) m_recent.resize(kMaxRecent);
+}
+
 // ---------------------------------------------------------------- 吸附
 
 bool EditorContext::snapForCurrentMode() const {

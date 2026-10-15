@@ -89,9 +89,12 @@
 #include "render/PostProcess.h"
 #include "render/ClusteredLighting.h"
 #include "render/Environment.h"
+#include "render/ReflectionProbe.h"
+#include "fx/ParticleSystem.h"
 #include "render/HiZOcclusion.h"
 #include "render/MdiDraw.h"
 #include "render/Bindless.h"
+#include "render/DecalBuffer.h"
 
 #include "ui/ImGuiManager.h"
 #include "assets/Texture.h"
@@ -112,6 +115,7 @@ class Window;
 
 namespace scene {
 class Scene;
+class Camera;
 }
 
 namespace assets {
@@ -162,6 +166,21 @@ struct GridSettings {
 // 8.0 是实测值：脸颊这种大平面几乎为 0，轮廓/鼻梁/耳缘落到 0.4~1.0。
 // 环境变量 MYVK_SSS 可以覆盖它（=0 时关掉 SSS，作对照组）。
 static constexpr float kSssDefaultCurvatureScale = 8.0f;
+
+// R5-1：探针捕获用的“面相机”参数。
+//
+// 为什么不用 scene::Camera：立方体的 ±Z 面（正上 / 正下）视线与 Camera
+// 固定的世界 up = (0,0,1) **平行**，glm::lookAt 的基会退化（画面翻转或
+// NaN）。所以面相机绕过 Camera，直接给 view 矩阵 + 90° 投影。
+//
+// 投影的 Y 翻转（proj[1][1] *= -1）在 uploadSceneState 里补上 —— 必须与
+// Camera::projMatrix 一致，否则捕获图的上下会翻，盒投影算出的方向全错。
+struct ProbeFaceView {
+    glm::mat4 view{1.0f};
+    glm::vec3 position{0.0f};   // 探针世界坐标（= 该面的视点）
+    float nearZ = 0.1f;
+    float farZ = 200.0f;
+};
 
 class Renderer {
 public:
@@ -307,6 +326,11 @@ public:
     // MYVK_SHADER_HOTRELOAD=0 可关（像素级回归需要绝对稳定时用）。
     void watchShaderFiles();
     void pollShaderReload();
+    // 编辑器 Build ▸ Reload Shaders：把"每 15 帧一轮"的节流推到阈值以上，
+    // 让**下一帧**立刻扫一遍 .spv 的 mtime（有变化就走既有的重编译路径）。
+    // 不直接在这里 poll：那样会把结果消费掉，drawFrame 里那轮就看不到
+    // "变了"，于是管线永远不重建。
+    void forceShaderReloadScan();
     // 热重载专用：重建主链 + 预览链的 PostProcess（管线随 shader 变）
     void rebuildPostChains();
 
@@ -368,6 +392,37 @@ public:
     bool environmentReady() const {
         return m_environment != nullptr && m_environment->valid();
     }
+
+    // ============================================================
+    // 反射探针（R5-1，见 render/ReflectionProbe.h）
+    //
+    // 探针本体（盒体 / 强度 / 是否盒投影）是 ECS 组件，由编辑器创建；
+    // 这里只暴露全局设置与统计。总开关默认**关** —— 关着时一次捕获都
+    // 不录、资源也不分配，"基线逐像素不变"由构造保证。
+    // ============================================================
+    render::ProbeSettings& probeSettings() { return m_probeSettings; }
+    const render::ProbeSettings& probeSettings() const {
+        return m_probeSettings;
+    }
+    const render::ReflectionProbeSystem* probes() const { return m_probes.get(); }
+    // 立刻重捕全部探针（Inspector 的 Capture 按钮 / console 的 probe.capture）
+    void requestProbeCapture() { m_probeCaptureRequested = true; }
+
+    // ============================================================
+    // GPU 粒子（R6-1，见 fx/ParticleSystem.h）
+    //
+    // 粒子本体（发射器）是 ECS 组件，由编辑器创建；这里只暴露**全局**
+    // 设置与统计。全局设置与组件参数是正交的：全局倍率 × 组件参数。
+    // 总开关默认**关** —— 关着时一个 pass 都不录、显存也不分配，
+    // "无粒子组件的场景 = 基线逐像素不变"由构造保证。
+    // ============================================================
+    fx::ParticleSettings& particleSettings() { return m_particleSettings; }
+    const fx::ParticleSettings& particleSettings() const {
+        return m_particleSettings;
+    }
+    const fx::ParticleSystem* particles() const { return m_particles.get(); }
+    // 本帧实际模拟的发射器数（> 0 才真的有粒子 pass 在跑）
+    uint32_t particleEmitterCount() const { return m_particleEmitterCount; }
 
     // ============================================================
     // 级联方向光阴影（CSM，见 render/ShadowPass.h）
@@ -450,6 +505,12 @@ public:
         // 关着时全 0（旧路径一张纹理一个 set，没有"数组下标"这个概念）。
         uint32_t bindlessTextures = 0;
         uint32_t bindlessPages = 0;
+        // POM（R4-3）：本帧有多少个不透明物体走了 VENN_PARALLAX 变体
+        // （即材质挂了高度图）。0 = 场景里没有任何视差材质。
+        uint32_t parallaxDraws = 0;
+        // 延迟贴花（R4-4）：本帧确实提交了几张贴花到 DBuffer。
+        // 关着 / 场景里没有贴花时都是 0（两者画面也完全相同）。
+        uint32_t decalDraws = 0;
         // 本帧视锥查询实际访过的 BVH 节点数。渲染统计里最有用的一条：
         // 它和 renderables 一比就知道树有没有建歪（退化成全遍历时
         // 会逼近 nodeCount）。
@@ -507,7 +568,12 @@ public:
         Wireframe,
         Overdraw,
         LightComplexity,
+        // 哨兵：**不是**一个可切换的模式，只用来数"一共有几种"，
+        // 于是 E14 的视图模式条可以写成数据驱动（枚举加一种，UI 自动多一格）。
+        // 任何"取值范围"检查都应当用 Count 而不是写死 7。
+        Count,
     };
+    static constexpr int kViewModeCount = static_cast<int>(ViewMode::Count);
     static const char* viewModeName(ViewMode m);
     ViewMode viewMode() const { return m_viewMode; }
     void setViewMode(ViewMode m);
@@ -615,13 +681,105 @@ public:
     // 用主场景的 camera(1) 渲染，证明"通用 RT + 多相机"确实开箱可用。
     bool extraViewEnabled() const { return m_extraTarget != nullptr; }
 
+    // ============================================================
+    // 多视口（E07）
+    //
+    // 主视口（0 号目标）之外，再要几个"同一场景、不同相机"的离屏视角。
+    // 实现上**完全复用既有离屏通道** —— 每个子视口就是一个 RenderTarget，
+    // 绑同一个场景 + 自己的相机，由 recordOffscreenTarget() 录一遍。
+    // 主链一行没改（这正是 RenderTarget 被抽出来的目的）。
+    //
+    // 与 MYVK_EXTRA_VIEW（2 号目标）的分工：那个是**验证钩子**（固定
+    // camera(1)、固定 320×180）；这个是编辑器真要用的东西 —— 数量、尺寸、
+    // 相机全由编辑器给。
+    //
+    // ⚠ 多视口默认**不启用**（count = 0）。只有编辑器切到
+    //   TwoVertical / TwoHorizontal / Quad 才会非零，所以单视口布局下
+    //   渲染路径与引入本功能之前**逐像素一致**。
+    // ⚠ MDI 开着时离屏目标整体被跳过（见 recordOffscreenTarget 开头），
+    //   子视口会一起跳过并只打一行日志 —— 不是错误，是已知取舍。
+    // ============================================================
+    void setSubviewCount(size_t n);   // 0..4（不含主视口）
+    size_t subviewCount() const { return m_subviews.size(); }
+    void setSubviewSize(size_t i, uint32_t w, uint32_t h);
+    bool subviewReady(size_t i) const;
+    uint64_t subviewTextureId(size_t i) const;
+    // 相机**拷贝**进 Renderer 内部（调用方不必保证生命周期）
+    void setSubviewCamera(size_t i, const scene::Camera& cam);
+
 private:
+    // 子视口目标的懒创建 / 尺寸应用。必须在录制命令缓冲**之前**调用
+    // （内部会 waitIdle + 重建 framebuffer/描述符）。
+    void applySubviewTargets();
+
+    // 子视口：目标 + 相机 + 请求尺寸（dirty 时下一帧应用）
+    //
+    // ⚠ target 是**非拥有**的裸指针，所有权在 m_targets —— 因为槽位下标
+    //   （m_targets 下标）决定相机 UBO 用哪一格，所以目标必须统一由
+    //   m_targets 持有。这里若写成 unique_ptr 就是**双拥有**：编译期可能
+    //   侥幸过关，运行期一定双重释放。m_targets 用 unique_ptr 存元素，
+    //   对象地址不会随 vector 扩容而变，所以裸观察指针在"该条目没被
+    //   erase"期间始终有效（缩容时两边同时收，见 setSubviewCount）。
+    struct SubviewSlot {
+        render::RenderTarget* target = nullptr;   // 非拥有，见上方说明
+        std::unique_ptr<scene::Camera> camera;
+        uint32_t reqW = 0;
+        uint32_t reqH = 0;
+        uint32_t curW = 0;
+        uint32_t curH = 0;
+        bool dirty = true;
+    };
+    std::vector<SubviewSlot> m_subviews;
+
+    // ---- E01：特性注册表接线 ----
+    // 把 FeatureRegistry 的参数 id 绑到真实成员地址（见
+    // render/FeatureRegistry.h）。必须在成员默认初始化之后、init() 之前
+    // 调用 —— 绑定时捕获的当前值会成为 resetToDefaults() 的默认值。
+    void bindFeatureParams();
+    // PostSettings 要等 createMainTarget() 里 m_post 建好才能绑，单独一个。
+    void bindPostFeatureParams();
+
     void createFrameResources();
     void createDescriptorLayouts();
     void createDefaultTextures();
     void createLightGizmoMesh();
     void createShadowPass();
     void createEnvironment();
+
+    // ---- R5-1 反射探针 ----
+    // 建探针系统（懒建 GPU 资源：只有真的启用时才分配）。
+    void createReflectionProbes();
+    // 把场景里的 ReflectionProbeComponent 收集成 GPU 表。
+    // 返回 true = 需要（重新）捕获（数据变了 / 被显式请求 / 还没烘过）。
+    bool collectProbes(scene::Scene& scene);
+    // 若需要捕获：录 6 个面的场景渲染 → 拷进捕获立方体 → 跑 GGX 预过滤。
+    // 捕获走**独立的一次性命令缓冲**（提交后 vkQueueWaitIdle），所以它
+    // 不占主帧的命令缓冲，也不会改主帧的相机 UBO / 绘制列表 —— 但它会
+    // 改 CPU 侧的绘制列表与灯缓存，所以仍必须排在主场景
+    // uploadSceneState **之前**（后者会把那些状态全部重建一遍）。
+    void recordProbeCapture(scene::Scene& scene);
+    // 6 个面的相机基（Vulkan 立方体面序 +X -X +Y -Y +Z -Z）。
+    // 见 .cpp 里的推导：up 与经典 lookAt 表**反号**，因为本引擎的投影
+    // 自带 Vulkan 的 Y 翻转。
+    static void probeFaceBasis(uint32_t face, glm::vec3& forward,
+                               glm::vec3& right, glm::vec3& up);
+
+    // ---- R6-1 GPU 粒子 ----
+    // 建粒子系统（懒建：构造只建 RPass / 管线 / 采样器，显存要等到
+    // 真的启用才分配 —— 与 ReflectionProbeSystem 同一条约定）。
+    void createParticles();
+    // 把场景里的 ParticleEmitterComponent 收集成 GPU 表。
+    // 返回本帧有效的发射器数（0 = 一个粒子都不用画）。
+    uint32_t collectParticleEmitters(scene::Scene& scene);
+    // 本帧的模拟帧号是否已经冻住（fx.freezeFrame）。
+    bool particleFrozen() const {
+        return m_particleSettings.freezeFrame > 0 &&
+               m_particleSimFrame >=
+                   static_cast<uint32_t>(m_particleSettings.freezeFrame);
+    }
+    // 与 HdrTarget 的重建同步：重挂 framebuffer 与深度视图。
+    void recreateParticles();
+
     // 主视口离屏目标（0 号）：建 HdrTarget + PostProcess + 离屏纹理。
     // 取代过去分开的 createHdrTarget / createPostProcess —— 两者本就是
     // "一个离屏目标"的两半，现在合到 RenderTarget 里一起建。
@@ -654,11 +812,16 @@ private:
     void createClusteredLighting();
     void createPipelines();
     void writeGlobalDescriptors();
-    // 给**指定** set 0 写全部 15 个 binding。frameIndex 决定阴影图 / SSBO /
+    // 给**指定** set 0 写全部 23 个 binding。frameIndex 决定阴影图 / SSBO /
     // SSAO 图用哪一份（每帧在途各一套，必须对应）；ubo 是该 set 的 binding 0。
     // writeGlobalDescriptors 用它对"主链 set"与"各离屏目标的 set"各写一遍 ——
     // 两者只差 binding 0（各目标自己的相机 UBO），其余完全共享。
-    void writeGlobalSet(VkDescriptorSet set, uint32_t frameIndex, VkBuffer ubo);
+    //
+    // mainViewport=false 时 binding 20..22（R4-4 的 DBuffer）绑缺省透明图：
+    // DBuffer 只有主视口那一份，离屏目标的相机与分辨率都不同，采样它等于
+    // 把主视口的贴花按错误的 uv 糊上去。离屏目标直接"不渲染贴花"更诚实。
+    void writeGlobalSet(VkDescriptorSet set, uint32_t frameIndex, VkBuffer ubo,
+                        bool mainViewport = true);
     // 懒建"某离屏目标本帧的相机 UBO 槽"（建 buffer + set 0 + 写全部 binding）。
     // slot = 离屏目标序号（0 起）。返回槽结构。
     FrameResources::OffscreenUbo& ensureOffscreenUbo(uint32_t slot);
@@ -688,7 +851,8 @@ private:
     void uploadSceneState(scene::Scene& scene, VkExtent2D extent,
                           bool resetSkinning,
                           const scene::Camera* camOverride = nullptr,
-                          int offscreenSlot = -1);
+                          int offscreenSlot = -1,
+                          const ProbeFaceView* faceView = nullptr);
     // 把 scene 的几何录制进指定 HdrTarget（阴影 + 深度预通道 + 分簇 + 前向）。
     // isPreview=true 时跳过阴影 pass 与分簇 compute（预览与主场景共享这些
     // 全局缓冲，且主场景的采样命令已录制在先，避免无同步竞争）。
@@ -874,11 +1038,128 @@ private:
     render::PostProcess* m_post = nullptr;
     std::unique_ptr<render::ClusteredLighting> m_lighting;
     std::unique_ptr<render::Environment> m_environment;
+    // ---- R5-1 反射探针（见 render/ReflectionProbe.h）----
+    // 懒建：只有 m_probeSettings.enabled 为真时才分配 GPU 资源。
+    // m_probeCaptureRequested 是"这一帧重捕一次"的一次性请求（Inspector
+    // 的 Capture 按钮 / console 命令），消费后立刻清掉。
+    std::unique_ptr<render::ReflectionProbeSystem> m_probes;
+    render::ProbeSettings m_probeSettings;
+    bool m_probeCaptureRequested = false;
+    // 上一帧下发给 shader 的探针数（用来判断"数量变了 → 需要重捕"）。
+    uint32_t m_probeCountUploaded = 0;
+    // 探针数据的 hash（位置 / 盒体 / 强度任一变了就重捕）。0 = 还没烘过。
+    uint64_t m_probeDataHash = 0;
+    // 自动捕获节流：距上次捕获过了多少帧（0 = 还没捕获过）。
+    uint32_t m_probeFramesSinceCapture = 0;
+    // MYVK_PROBE_DBG 的转储节流。
+    uint32_t m_probeDbgFrame = 0;
+    bool m_probeDbg = false;
+    // 本帧收集到的探针（CPU 侧镜像：GPU 表 + 世界坐标 + 盒体尺寸）。
+    // 捕获需要世界坐标，而 ProbeGpu 里的 worldPos 只是转发给 shader 的
+    // 同一份数据 —— 保留一份 CPU 数组避免反解矩阵。
+    std::vector<render::ProbeGpu> m_probeScratch;
+    std::vector<glm::vec3> m_probePositions;
+    // 探针捕获用的相机 UBO 槽：**每个面一个**（base .. base+5）。
+    //
+    // ⚠ 为什么不是"一个槽复用 6 次"：UBO 是**记录期写、执行期读**的内存。
+    //   一次提交里 6 个面若共用一份 UBO，GPU 执行第 0 面时那份内存里已经
+    //   是第 5 面写进去的矩阵了 —— 于是 6 个面全部按第 5 面的相机渲染。
+    //   而绘制列表是**记录期**按各面相机剔除的：第 0 面的列表里只有 +X 的
+    //   那个物体，用"朝 -Z 的相机"去看它，它落在 90° 视野之外 → 该面只剩
+    //   背景。表现出来就是"只有最后一个面有内容"，极易被误诊成拷贝或
+    //   面序出错。离屏目标早就踩过同一个坑，见 FrameResources::OffscreenUbo。
+    //   配套约束：**一个探针 = 一次独立提交**（见 recordProbeCapture），
+    //   所以槽数恒为 6，与 maxProbes 无关。
+    //
+    // 基址取 64 而不是紧邻 0：离屏目标的槽 = m_targets 下标（主视口 +
+    // 子视口 + 预览窗口），留出余量才不会撞上。
+    static constexpr int kProbeFaceUboSlotBase = 64;
+
+    // ---- R6-1 GPU 粒子（见 fx/ParticleSystem.h）----
+    // 懒建：只有 m_particleSettings.enabled 为真时才分配显存（与探针同）。
+    std::unique_ptr<fx::ParticleSystem> m_particles;
+    fx::ParticleSettings m_particleSettings;
+    // 本帧收集到的发射器（CPU 侧镜像 —— 每帧上传后即无效）。
+    std::vector<fx::ParticleEmitterGpu> m_particleScratch;
+    // 本帧有效的发射器数（0 = 不录粒子 pass）
+    uint32_t m_particleEmitterCount = 0;
+    // 模拟帧号。**从 1 开始数**（第 1 帧 = 首次模拟），因为 burst 的
+    // 判据是"第一次模拟那一帧"。冻结帧（fx.freezeFrame）就是停在这个
+    // 计数上不再 ++ —— 画面随之完全确定，验证脚本才有可比性。
+    uint32_t m_particleSimFrame = 0;
+    // 固定步长累加器（秒）。**这是"粒子速度与渲染帧率无关"的关键**：
+    // 每帧把真实 dt 攒进来，攒够 1/simHz 才走一步。以前是"每渲染帧
+    // 一步"，于是 500+ fps 的编辑器里粒子快 8 倍。
+    float m_particleSimAccum = 0.0f;
+    // 单个渲染帧最多补几步。攒过头（拖窗口 / 断点）时宁可丢掉也不
+    // 追平 —— 否则会陷入"补步 → 更慢 → 补更多步"的死亡螺旋。
+    // 8 步 @60Hz = 133 ms，已经覆盖了 10 fps 的极端情况。
+    static constexpr uint32_t kMaxSimStepsPerFrame = 8;
+    // 每个 frame-in-flight 槽**上一次模拟到第几帧**。粒子池是按槽分开的
+    //（两帧可能同时在 GPU 上执行，共用一份池会互相写坏），所以每个槽
+    // 每 framesInFlight 帧才被派发一次 —— 传单帧 dt 会让每个槽的模拟
+    // 以 1/framesInFlight 的速度爬行（粒子只是"慢慢地飘"，画面看着正常，
+    // 所以这个 bug 只能靠计数器抓出来）。用差值补上漏掉的时间步。
+    // 0 = 这个槽还没模拟过（于是它的第一次模拟 elapsed 就是当时的帧号）。
+    uint32_t m_particleSlotFrame[8] = {};
+    // 上一次打 FX-FREEZE 的帧号（只打一次，别每帧刷屏）
+    uint32_t m_particleFreezeLogged = 0;
+    // MYVK_FX_DBG 的转储节流
+    uint32_t m_particleDbgFrame = 0;
+    // FX-EMITTER（MYVK_FX_DBG=2）自己的节流计数器。它与 m_particleDbgFrame
+    // 分开：那条打在 drawFrame 里，这条打在 recordFrame 里，两者谁先谁后
+    // 不该被诊断消息的节流依赖。
+    uint32_t m_particleEmitterDumpFrame = 0;
+    bool m_particleDbg = false;
+    // MYVK_FX_DBG=2 才为真：额外打 FX-EMITTER（发射器参数逐值）。
+    bool m_particleDbgParams = false;
+    // 池耗尽的 WARN 只打一次（rate × lifetime > capacity 的静态条件，
+    // 一旦成立就一直成立 —— 每帧打会把日志刷没）。
+    bool m_particlePoolWarned = false;
+
+    // ---- Rate over Distance 的累积状态（按发射器序号）----
+    //
+    // 距离发射的判据是"发射器累积走过多少米"，所以需要跨帧记住三样东西。
+    // ⚠ 距离只在**真的推进了模拟**的帧上提交（pending → committed）：
+    //   渲染帧率高于 simHz 时大部分帧一步都不走，如果那些帧也把位移算进去，
+    //   发射量就又和帧率挂上钩了（正是刚修掉的那个问题的另一个化身）。
+    std::vector<glm::vec3> m_particleEmitterPrevPos;  // 上一帧的世界位置
+    std::vector<float> m_particleDistPending;        // 尚未提交的位移
+    std::vector<float> m_particleDistCommitted;      // 已提交的累积距离
+    // ---- Prewarm：每个发射器是否已经"开场预热"过 ----
+    // PreWarm 是一次性事件（发射器一登场就是稳态），不是持续状态。
+    std::vector<bool> m_particlePrewarmApplied;
+    // 本帧需要把模拟时钟**向前拨**的步数（0 = 不拨）。见
+    // collectParticleEmitters 末尾的推导 —— 固定步长下"先跑一整轮"与
+    // "把时钟拨过去"完全等价，但后者只要一条赋值。
+    uint32_t m_particlePrewarmSteps = 0;
+
+    // ---- 排序（Renderer > Sort Mode）----
+    //
+    // ⚠ 排序是**整张紧凑表**的属性，不是逐发射器的：一个混合模式只有一张
+    //   alive 表，而顶点着色器是用同一个 push 常量去读它的。所以多个发射器
+    //   要求不同的排序时只能取一个 —— 这里取"第一个非 None 的"，
+    //   和 Unity 里"排序属于 Particle System 而非 Emitter"是一致的
+    //   （Unity 也只有一个 Sort Mode）。
+    int m_particleSortMode = 0;         // ecs::ParticleSortMode 的整数值
+    glm::vec3 m_particleSortCamPos{0.0f};  // 判距离用的相机位置
+
     std::unique_ptr<ui::ImGuiManager> m_imgui;
 
     // ---- 屏幕空间效果（见 screenSpaceSettings() 的注释）----
     std::unique_ptr<render::SSAOPass> m_ssao;
     std::unique_ptr<render::VolumetricFog> m_vfog;
+    // R4-4：延迟贴花的三张 DBuffer + 贴花 pass（见 render/DecalBuffer.h）。
+    // 只在主视口录 —— 它是"屏幕空间"效果，离屏目标的相机/分辨率都不同，
+    // 复用同一张 DBuffer 会贴错位置（离屏目标的 set0 因此绑缺省透明图）。
+    std::unique_ptr<render::DecalBuffer> m_decals;
+    // 本帧从 ECS 收集到的贴花（避免每帧分配）。buildDrawLists 的
+    // isMain 分支里填，recordFrame 里上传。
+    std::vector<render::DecalDrawItem> m_decalScratch;
+    // 接线状态缓存：贴花开/关翻转时要重写 set0 的 binding 20..22
+    bool m_decalsWired = false;
+    // 收集贴花（世界矩阵 = 实体世界矩阵 × size 缩放）。
+    void collectDecals(scene::Scene& scene);
     // R3-3：光源修饰纹理库（cookie + IES 的 sampler2DArray）
     std::unique_ptr<render::LightTextureLibrary> m_lightTextures;
     std::unique_ptr<render::FrameGraph> m_frameGraph;
@@ -900,8 +1181,7 @@ private:
     std::vector<render::MdiSubmitGroup> m_mdiGroupScratch;
     std::vector<render::HiZAabb> m_mdiAabbScratch;
     // 把本帧的绘制列表 + 批表翻译成 MDI 的四个缓冲（buildDrawLists 尾部调）。
-    bool buildMdiFrameData();
-    // 本帧 MDI 数据是否已就绪（buildDrawLists 里置位，recordFrame 里读）。
+    bool buildMdiFrameData();    // 本帧 MDI 数据是否已就绪（buildDrawLists 里置位，recordFrame 里读）。
     // 之所以要存一份：buildDrawLists 跑在录制**之前**，到 recordFrame 里
     // 再判一次"目录/命令是否齐"就得重算，且两处的判据容易走偏。
     bool m_mdiStaged = false;
@@ -920,6 +1200,9 @@ private:
     // 返回 +0.5（旧的空值）；负号 = 抖动模式（见 pbr.frag 的说明）。
     // 同样放在这里让 drawMesh / MDI 共用。
     static float alphaCutoffLane(const assets::Material& mat);
+    // POM 的逐材质视差深度 → push.skin.y（R4-3）。没挂高度图时返回 0
+    // （那只影响 VENN_PARALLAX 编译单元，其它变体压根不读）。
+    static float pomHeightLane(const assets::Material& mat);
     // set 1..6 用的布局：bindless 时是那一份"纹理数组 + 页表"的布局，
     // 否则是老的"单纹理"布局。管线描述的 setLayouts 与 grid/sky 的
     // 对齐都必须走它 —— 两处用了不同的对象就会踩"set 0 被中途打断"
@@ -1029,6 +1312,10 @@ private:
     std::unique_ptr<assets::Texture> m_defaultWhite;       // (1,1,1,1)
     std::unique_ptr<assets::Texture> m_defaultFlatNormal;  // (0.5,0.5,1)
     std::unique_ptr<assets::Texture> m_defaultBlack;       // (0,0,0,1)
+    // R4-4：(0,0,0,0) —— DBuffer 的"这里没有贴花"。前向 Pass 只看
+    // coverage（alpha），所以透明黑就是"贴花分支整段跳过"的中性值。
+    // 不能用 m_defaultBlack：它的 alpha 是 1，会把整个画面染成黑色贴花。
+    std::unique_ptr<assets::Texture> m_defaultTransparent;
 
     // R4-2：预积分皮肤散射 LUT（256²，set0/binding19）。
     // init 时从 assets/textures/sss_lut.dds 加载；缺失/损坏则程序化生成
@@ -1036,6 +1323,17 @@ private:
     std::unique_ptr<assets::Texture> m_sssLut;
     // 曲率缩放（→ FrameUBO.sssParams.x）。MYVK_SSS=0 时置 0 = 关 SSS 对照组。
     float m_sssCurvatureScale = kSssDefaultCurvatureScale;
+
+    // R4-3：视差遮挡贴图（POM）。
+    //   逐材质的视差深度走 push.skin.y（push 已满 128 字节，复用一个空闲
+    //   分量 —— 与 R4-1 借 skin.w、R2-3 借 emissive.w 同一条路子）。
+    //   下面是**全局**参数（→ FrameUBO.pomParams），MYVK_POM* 可覆盖：
+    //     x = 淡出起点(米)  y = 淡出终点(米)  z = 层数上限  w = 全局倍率/开关
+    float m_pomFadeStart = 10.0f;
+    float m_pomFadeEnd = 26.0f;
+    float m_pomMaxLayers = 32.0f;
+    // 全局倍率兼开关。= 0 → 整段 ray-march 短路（"关掉 POM"的对照组）。
+    float m_pomCoverageScale = 1.0f;
 
     // 灯光可视化：每盏灯画一个小自发光球（由 Renderer 自己建网格，
     // 不经过 AssetManager —— 它是渲染器的调试设施，不是场景资产）

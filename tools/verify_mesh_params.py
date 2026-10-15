@@ -242,11 +242,21 @@ def main():
             return 4
         check("添加 Cube", True)
 
-        # Mesh 段默认折叠 —— 展开它才有参数可读
+        # Mesh 段默认折叠 —— 展开它才有参数可读。
+        # ⚠ 注入的点击**偶尔被吞**（第一次左键可能被 Windows 拿去激活窗口 /
+        # 此刻面板布局还在变），实测会读到"没有 MESH-PARAMS 日志"的假失败。
+        # 这里做成"幂等 + 重试"：已经是展开态（日志里已有签名）就不点；否则
+        # 点到签名出现为止。
         hdr = wait_rect(tap, "INS-MESH-HEADER", 6.0)
         if hdr:
-            click(hwnd, (hdr[0] + hdr[2]) * 0.5, (hdr[1] + hdr[3]) * 0.5)
-            time.sleep(0.6)
+            sig_re = r"MESH-PARAMS kind=(\S+) labels="
+            if not find_line(tap, sig_re, 0.2):
+                for _try in range(3):
+                    click(hwnd, (hdr[0] + hdr[2]) * 0.5,
+                          (hdr[1] + hdr[3]) * 0.5)
+                    time.sleep(0.6)
+                    if find_line(tap, sig_re, 1.0):
+                        break
         else:
             check("找到 Mesh 标题栏", False, "INS-MESH-HEADER 没出现")
 

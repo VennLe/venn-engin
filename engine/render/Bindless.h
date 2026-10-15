@@ -70,7 +70,7 @@ namespace render {
 // ============================================================
 struct GpuMaterialPage {
     glm::uvec4 tex0{0}; // x=albedo y=normal z=ORM w=roughness
-    glm::uvec4 tex1{0}; // x=metallic y=emissive
+    glm::uvec4 tex1{0}; // x=metallic y=emissive z=height(R4-3 POM)
 };
 static_assert(sizeof(GpuMaterialPage) == 32,
               "GpuMaterialPage 必须与着色器里的 std430 布局一致（两个 uvec4）");

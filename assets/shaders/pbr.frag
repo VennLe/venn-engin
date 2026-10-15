@@ -60,6 +60,11 @@
 //                      而是按 (N·L, 曲率) 查一张预烘焙的散射 LUT —— 光按
 //                      扩散核绕过明暗交界线，红通道散射最远 → 耳缘/鼻梁
 //                      泛红透光。默认（未置位）代码整段编掉 → 逐像素不变。
+//   VENN_PARALLAX      POM 视差遮挡贴图（R4-3）：采样 albedo/normal/orm/…
+//                      之前先沿切线空间视向把 UV 推开（层步进 ray-march），
+//                      平面上的凹陷会随视角"错位"。深度尺度走 push.skin.y
+//                      （复用一个空闲分量），全局开关/层数/淡出距离走
+//                      ubo.pomParams。默认（未置位）整段编掉 → 逐像素不变。
 //
 // ⚠ 位序与 CMakeLists.txt 的 SHADER_KEYWORDS 列表、以及
 //   ShaderKeywords.cpp 的 kKeywords[] 必须逐字一致。
@@ -78,6 +83,15 @@
 #endif
 #ifndef VENN_SHADING_SKIN
 #define VENN_SHADING_SKIN 0
+#endif
+// VENN_PARALLAX  POM 视差遮挡贴图（R4-3）：材质挂了高度图时，先沿切线空间
+//                 视向把 UV 推开再采样其余贴图 —— 平面上的砖缝/凹槽会随视角
+//                 错位，看起来真的有凹凸。没挂高度图时整段编掉 → 逐像素不变。
+// ⚠ 与 VENN_NORMAL_MAP 是**互补**关系而不是替代：视差改的是"采到哪里"
+//   （几何错觉），法线图改的是"那里的法线朝哪"（光照细节）。远处的
+//   渐出会退回纯法线贴图 —— 那时这段 offset 已被距离淡出到 0。
+#ifndef VENN_PARALLAX
+#define VENN_PARALLAX 0
 #endif
 // VENN_BINDLESS 是**全局开关**（Renderer 按它选 set 布局与 .spv），
 // 不是材质关键字位 —— 所以不参与掩码，只多编一族
@@ -146,6 +160,28 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     //     MYVK_SSS=0 时为 0 → 曲率恒 0 → LUT 退化成 Lambert，用作对照组）
     // y/z/w = 保留
     vec4 sssParams;
+
+    // ---- 视差遮挡贴图（R4-3）----
+    // x = 淡出起点（米） y = 淡出终点（米，超出即完全退回法线贴图）
+    // z = 层数上限（步进的最大层数）
+    // w = 全局倍率兼开关（乘在材质的 heightScale 上；= 0 → offset 恒 0）
+    // 只被 VENN_PARALLAX 编译单元读取（见 render/RenderTypes.h 的说明）。
+    vec4 pomParams;
+
+    // ---- 延迟贴花（R4-4）----
+    // x = 总开关（1 开 / 0 关）。0 时下面那一段贴花采样**整块跳过** ——
+    //     此时 binding 20..22 绑的是 1×1 全透明图，采了也是 coverage 0，
+    //     但跳过省掉三次纹理采样。这是"关 = 基线逐像素不变"的实现依据。
+    // y/z/w = 保留。
+    vec4 decalParams;
+
+    // ---- 反射探针（R5-1）----
+    // x = 总开关（1 开 / 0 关）。0 时下面 vennProbeReflection() 立刻返回，
+    //     连 cubearray 采样都不发生 —— 与 binding 23 绑的缺省黑图一起
+    //     构成"关 = 基线逐像素不变"的双保险。
+    // y = 本帧探针数；z = 预过滤 cube array 的最大 mip；
+    // w = 全局强度倍率。
+    vec4 probeParams;
 } ubo;
 
 // 级联阴影贴图：一张 **2D array** 的深度图，第 i 层就是第 i 级级联。
@@ -208,13 +244,13 @@ layout(set = 0, binding = 19) uniform sampler2D sssLut;
 // ============================================================
 // Bindless 路径（R2-3，-DVENN_BINDLESS=1 编出 pbr.bindless.k<N>.frag.spv）
 //
-// 六张贴图槽不再是六个 set，而是**同一个运行时大小数组**的元素。
+// 七张贴图槽不再是七个 set，而是**同一个运行时大小数组**的元素。
 // 下标来自材质"页表"（set 1 binding 1），页号由 CPU 逐 draw push 在
 // push.emissive.w 里（见 render/Bindless.h 与 RenderTypes.h）。
 //
-// 下面这六条 #define 是整段改造的全部 —— 函数体里那 6 处
-// `texture(albedoMap, vUV)` 一个字都不用改，宏展开后就是
-//   texture(textures[gMat.tex0.x], vUV)
+// 下面这几条 #define 是整段改造的全部 —— 函数体里那些
+// `texture(albedoMap, uv)` 一个字都不用改，宏展开后就是
+//   texture(textures[gMat.tex0.x], uv)
 // 之所以用宏而不是改调用点：让**非 bindless 的那份 .spv 与这份逐字
 // 同源**，两边不可能因为"手抄时改错一次采样"而分叉。
 //
@@ -223,7 +259,7 @@ layout(set = 0, binding = 19) uniform sampler2D sssLut;
 // ============================================================
 struct GpuMaterialPage {
     uvec4 tex0;  // x=albedo y=normal z=ORM w=roughness
-    uvec4 tex1;  // x=metallic y=emissive
+    uvec4 tex1;  // x=metallic y=emissive z=height(R4-3)
 };
 layout(set = 1, binding = 0) uniform sampler2D textures[];
 layout(std430, set = 1, binding = 1) readonly buffer MaterialPages {
@@ -238,6 +274,7 @@ GpuMaterialPage gMat;
 #define roughnessMap textures[gMat.tex0.w]
 #define metallicMap  textures[gMat.tex1.x]
 #define emissiveMap  textures[gMat.tex1.y]
+#define heightMap    textures[gMat.tex1.z]
 #else
 layout(set = 1, binding = 0) uniform sampler2D albedoMap;
 layout(set = 2, binding = 0) uniform sampler2D normalMap;
@@ -250,6 +287,9 @@ layout(set = 4, binding = 0) uniform sampler2D roughnessMap;
 layout(set = 5, binding = 0) uniform sampler2D metallicMap;
 // 自发光贴图：与因子**相加**，未绑定时绑内置纯黑 → 加法恒等。
 layout(set = 6, binding = 0) uniform sampler2D emissiveMap;
+// 高度图（R4-3 POM）。只在 VENN_PARALLAX 编译单元里被采样；未置位时
+// 这个 set 仍然会被绑（绑内置纯黑），只是着色器不去读它。
+layout(set = 7, binding = 0) uniform sampler2D heightMap;
 #endif
 
 // ---- IBL 三件套（见 render/Environment.h）----
@@ -301,6 +341,42 @@ layout(set = 0, binding = 14) uniform sampler2D ssaoTex;
 // 累积的散射与透射率。关闭时绑 1×1×1 的透明图（rgb=0, a=1）→ 合成
 // 退化成 out = lit，与基线逐位一致（与 ssaoTex 的缺省白图同理）。
 layout(set = 0, binding = 16) uniform sampler3D vfogTex;
+
+// ---- 延迟贴花的三张 DBuffer（R4-4，见 render/DecalBuffer.h）----
+// 每张的 alpha 都是 **coverage**（0 = 这里没有贴花）。值由贴花 pass 在
+// 深度预通道之后写进来，本文件只负责按 coverage 把它们混进材质。
+//
+// 关闭贴花时（ubo.decalParams.x = 0）绑的是 1×1 的 (0,0,0,0)，
+// 同时下面整段被 uniform 分支跳过 —— 两条一起保证"关 = 基线逐像素不变"。
+//   binding 20：反照率（**绝对色**，不是乘数）
+//   binding 21：**世界空间**法线（编码到 0..1）
+//   binding 22：x=粗糙度 y=金属度
+layout(set = 0, binding = 20) uniform sampler2D decalAlbedoTex;
+layout(set = 0, binding = 21) uniform sampler2D decalNormalTex;
+layout(set = 0, binding = 22) uniform sampler2D decalRoughMetalTex;
+
+// ---- 反射探针（R5-1，见 render/ReflectionProbe.h）----
+//   binding 23：预过滤后的 cube **array** —— 第 i 个探针占第 6i..6i+5 层
+//               （Vulkan 面序 +X -X +Y -Y +Z -Z），mip ↔ 粗糙度。
+//               用 array 而不是"每探针一个 binding"：探针数是运行时变量，
+//               而 binding 数一变就要重建管线布局 → 全管线重建。
+//               一个 array 让描述符写一次就永远不用动。
+//   binding 24：探针数据（盒体 / 世界矩阵 / 强度）。
+// 关着时 x=0 让下面整段短路，23 也绑着一张 1×1 的黑 cube array
+// —— 与 SSAO 的缺省白图 / 贴花的全透明图是同一条既有约定。
+layout(set = 0, binding = 23) uniform samplerCubeArray probeMap;
+
+// ⚠ 与 C++ 侧 render::ProbeGpu **逐字对齐**（std430）。
+//   结构体必须声明在**块外**：GLSL 不允许在 interface block 里定义结构体。
+struct Probe {
+    mat4 worldToLocal;  // 世界 → 探针局部（旋转 + 平移）
+    vec4 extents;       // xyz = 盒体半轴（探针局部，米）；w = 边界混合距离
+    vec4 params;        // x = 强度 y = 启用 z = 盒投影 w = 保留
+    vec4 worldPos;      // xyz = 探针世界坐标
+};
+layout(std430, set = 0, binding = 24) readonly buffer ProbeBuffer {
+    Probe probes[];
+};
 
 layout(push_constant) uniform Push {
     mat4 model;
@@ -380,6 +456,94 @@ mat3 cotangentFrame(vec3 N, vec3 p, vec2 uv) {
     float inv = inversesqrt(m);
     return mat3(T * inv, B * inv, N);
 }
+
+#if VENN_PARALLAX
+// ============================================================
+// POM 视差遮挡贴图（R4-3）—— 层步进 ray-march（steep parallax + 两点细化）
+//
+// 思路：把表面看成一张高度场 h(u,v)。片元真正"看见"的不是 (u,v)，而是
+// 从眼睛沿视线反向走、第一次撞到高度面的那个点。于是：
+//
+//   ① 在**切线空间**里表示视线方向 Vt（TBN 的转置把世界向量转进去）；
+//   ② 从 h=1 的平面开始，沿 -Vt.xy 方向一层一层往下走（每层 Δdepth=1/N，
+//      同时 Δuv = -Vt.xy/Vt.z · scale · Δdepth）；
+//   ③ 走到"层深 >= 该处高度"就说明穿过去了，在最后两点之间线性插值
+//      得到交点 → 这就是要采样的 UV。
+//
+// 三个必须讲清楚的取舍：
+//
+// · **层数随视角倾斜度变化**：正对（|Vt.z|≈1）时用最少层（8），掠射
+//   （|Vt.z|→0）时用参数上限（ubo.pomParams.z）。掠射时 UV 位移最大、
+//   最容易看出层状台阶，所以那里才值得多步几层。
+// · **淡出（LOD）**：距离超过 pomParams.y 直接返回原 UV —— 此时纹理在
+//   屏幕上已被缩小到"一个像素跨好几个纹素"，层间 UV 步长小于一个纹素，
+//   继续 march 只会放大走样而看不出视差。另外用 fwidth(uv)（每像素跨了
+//   多少 UV）做一道与距离无关的兜底：掠射远处同样会被淡出。
+// · **早退**：scale ≤ 0 或淡出到 0 时立刻返回原 UV，一枪不发。这就是
+//   "heightScale = 0 → 与没挂高度图逐像素相同"的实现依据。
+//
+// ⚠ TBN 用的是 **vUV**（未经视差位移的插值 UV）的屏幕空间导数 ——
+//   位移后的 UV 在分支处不连续，拿它求导会得到错误的切线基。
+// ⚠ 高度图的地址模式必须是 REPEAT：视差一旦生效，UV 必然被推出 [0,1]；
+//   用 CLAMP 会在贴图边界拉出一条硬缝。
+vec2 parallaxUv(vec3 N, vec3 worldPos, vec2 uv) {
+    // 全局倍率兼开关（MYVK_POM，0 = 关闭）乘上材质的视差深度。
+    float scale = push.skin.y * ubo.pomParams.w;
+    if (scale <= 0.0) return uv;
+
+    // ---- 距离淡出：远处退回普通法线贴图 ----
+    const vec3 toEye = ubo.camPos.xyz - worldPos;
+    const float dist = length(toEye);
+    float fade = 1.0 - smoothstep(ubo.pomParams.x, ubo.pomParams.y, dist);
+    if (fade <= 0.0) return uv;
+
+    // ---- 纹素密度淡出：一个像素跨的 UV 太大时同样放弃 ----
+    // 与距离无关的那道保险：正对时很远也还能看清，但掠射时近处就已经
+    // 每像素跨好几个纹素了。0.02/0.08 是"每像素约 1/50 ~ 1/12 个 UV 单位"
+    // 的量级（对 512² 的图即每像素 10~40 纹素）。
+    const float texelStep = length(fwidth(uv));
+    fade *= 1.0 - smoothstep(0.02, 0.08, texelStep);
+    if (fade <= 0.0) return uv;
+    scale *= fade;
+
+    // ---- 切线空间视向 ----
+    // TBN 的三列是 (T, B, N)（见 cotangentFrame），所以转置即"世界 → 切线"。
+    const mat3 TBN = cotangentFrame(N, worldPos, uv);
+    const vec3 Vt = normalize(transpose(TBN) * normalize(toEye));
+
+    // ---- 层步进 ----
+    // 层数随倾斜度插值；layerDepth 是每层的高度增量（h ∈ [0,1] 从底面起算，
+    // 所以"从 h=1 的平面往下走"等价于层深从 0 往上累加）。
+    const float maxLayers = float(max(int(ubo.pomParams.z), 4));
+    const float numLayers = mix(maxLayers, 8.0, abs(Vt.z));
+    const float layerDepth = 1.0 / numLayers;
+    // |Vt.z| 在掠射时趋近 0，除它会爆掉 → 夹一个下限（此时位移本来就该很大，
+    // 但让 stepUv 有限至少保证循环还能收敛）。
+    const vec2 stepUv = (Vt.xy / max(abs(Vt.z), 0.08)) * scale * layerDepth;
+
+    vec2 cur = uv;
+    float depth = 0.0;                       // 已下探的层深
+    float h = texture(heightMap, cur).r;     // 当前采样点的高度
+    const int n = int(numLayers + 0.5);
+    for (int i = 0; i < n; ++i) {
+        if (depth >= h) break;               // 已经穿到高度面之下
+        cur -= stepUv;                       // 沿视线投影方向后退
+        depth += layerDepth;
+        h = texture(heightMap, cur).r;
+    }
+
+    // ---- 两点线性细化 ----
+    // 此刻 cur 在"层深 >= 高度"的一侧，cur+stepUv 是上一侧。用一个线性
+    // 交点把量化台阶抹掉（不做这一步，掠射时能看到明显的分层条纹）。
+    const vec2 prevUv = cur + stepUv;
+    const float afterDepth = h - depth;                       // ≤ 0
+    const float beforeDepth =
+        texture(heightMap, prevUv).r - (depth - layerDepth);  // ≥ 0
+    const float denom = afterDepth - beforeDepth;
+    const float w = (abs(denom) > 1e-6) ? (afterDepth / denom) : 0.0;
+    return mix(cur, prevUv, clamp(w, 0.0, 1.0));
+}
+#endif
 
 // ================= 级联阴影（CSM）=================
 //
@@ -880,14 +1044,101 @@ vec3 shadeLocalLightMod(Light L, LightExt E, vec3 N, vec3 V, vec3 worldPos,
     return (diffuse + spec) * radiance;
 }
 
+// ============================================================
+// 反射探针（R5-1）
+//
+// 目的：SSR 只能在屏幕里真的照得到东西时才有反射，室内背对窗口的
+// 那面墙 / 地板 / 金属球就是"屏幕里什么都没有"。探针填这个空 ——
+// 它从盒体中心把周围烘成一张立方体贴图，与相机看哪儿无关。
+//
+// 三个细节决定了它像不像"真的在照这间屋子"：
+//   ① 盒体归属：片元落在哪个探针的 AABB 里就用哪个（这里取**第一个**
+//      命中的，多探针重叠时不做混合 —— v1 的取舍，见 ReflectionProbe.h）。
+//   ② box projection：把反射方向修正成"从盒体内部朝那面墙看"的方向。
+//      没有它，贴在墙上的探针会把整个房间的反射压成一个固定方向的
+//      天空色 —— 这是"探针看起来只是换了个环境球"的根因。
+//   ③ 边界淡出：靠近盒体边界时权重渐变到 0，避免相邻两个探针的
+//      交界处出现硬边。
+//
+// 返回 rgb = 反射色（未乘菲涅尔），w = 覆盖权重（0 = 不在任何探针里）。
+// 关着（probeParams.x = 0）时立即返回 0 —— 这一次 uniform 判断就是
+// "关 = 基线逐像素不变"的实现。
+// ============================================================
+vec4 vennProbeReflection(vec3 P, vec3 R, float roughness) {
+    if (ubo.probeParams.x < 0.5) return vec4(0.0);
+
+    const int count = int(ubo.probeParams.y + 0.5);
+    const float maxLod = ubo.probeParams.z;
+    const float globalK = ubo.probeParams.w;
+
+    for (int i = 0; i < count; ++i) {
+        const Probe pr = probes[i];
+        if (pr.params.y < 0.5) continue;  // 该探针被停用
+
+        const vec3 lp = (pr.worldToLocal * vec4(P, 1.0)).xyz;
+        const vec3 e = max(pr.extents.xyz, vec3(1e-4));
+        // 盒体内测试：a 的三个分量都 <= 0 时在盒内。
+        // -max(a) 就是"到最近那个面的距离"，正好当边界淡出的分子。
+        const vec3 a = abs(lp) - e;
+        const float inside = -max(max(a.x, a.y), a.z);
+        if (inside < 0.0) continue;
+
+        const float blend = max(pr.extents.w, 1e-4);
+        const float w = clamp(inside / blend, 0.0, 1.0);
+
+        // ---- 盒投影 ----
+        // 把反射方向转到探针局部，求它与盒体表面的交点，再用"探针中心 →
+        // 交点"当采样方向。这就是 UE 的 box projection：
+        //   没有它 → 采样方向恒为 R，盒体各处的反射内容相同（贴图感）；
+        //   有它   → 靠近某面墙的片元朝那个方向看，看到的是那面墙的内容。
+        vec3 dir = R;
+        if (pr.params.z > 0.5) {
+            const vec3 rl = mat3(pr.worldToLocal) * R;
+            const vec3 invR = 1.0 / max(abs(rl), vec3(1e-6));
+            // 到三个方向上面板的最小 t（slab 法）
+            const vec3 t = e * invR;
+            const float tExit = min(min(t.x, t.y), t.z);
+            const vec3 hitLocal = lp + rl * max(tExit, 1e-4);
+            const vec3 hitDirLocal = normalize(hitLocal);
+            // 局部方向 → 世界方向：worldToLocal 只含旋转 + 平移，
+            // 所以逆的旋转部分是它的 3×3 转置。
+            dir = normalize(transpose(mat3(pr.worldToLocal)) * hitDirLocal);
+        }
+
+        const vec3 c = textureLod(probeMap, vec4(dir, float(i)),
+                                  roughness * maxLod).rgb;
+        return vec4(c * pr.params.x * globalK, w);
+    }
+    return vec4(0.0);
+}
+
 void main() {
 #if VENN_BINDLESS
     // 材质页查一次：页号在 push.emissive.w 里（+0.5 是为了把 float 稳妥地
     // 截回整数 —— 页号 ≤ 4096，float 能精确表示，不存在舍入问题）。
     gMat = pages[uint(push.emissive.w + 0.5)];
 #endif
+    // ---------------- 视差遮挡贴图（R4-3，可选）----------------
+    // 必须在**所有材质采样之前**算出最终 UV：位移是"看到表面哪个点"，
+    // albedo / normal / orm / 粗糙 / 金属 / 自发光必须看到**同一个点**，
+    // 否则砖缝的凹槽里会出现"颜色对不上法线"的鬼影。
+    // 没挂高度图时 matUV 就是 vUV —— 与引入 POM 之前逐像素相同。
+    vec2 matUV = vUV;
+#if VENN_PARALLAX
+    {
+        // 切线基要用**几何法线**（法线贴图扰动之前），所以这里重算一份
+        // 与下面"法线"那段完全相同的 N（含双面翻转），而不是借用后面
+        // 扰动过的 N —— 那会让视差方向随贴图高频细节抖动。
+        vec3 geomN = normalize(vNormal);
+#if VENN_DOUBLE_SIDED
+        if (!gl_FrontFacing) geomN = -geomN;
+#endif
+        matUV = parallaxUv(geomN, vWorldPos, vUV);
+    }
+#endif
+
     // ---------------- 材质采样 ----------------
-    vec4 albedoSample = texture(albedoMap, vUV);
+    vec4 albedoSample = texture(albedoMap, matUV);
     vec3 albedo = albedoSample.rgb * push.baseColorFactor.rgb;
 #if VENN_ALPHA_BLEND
     // 只有半透明材质才让 albedo 的 alpha 参与输出 —— 管线侧同时开了混合、
@@ -951,7 +1202,7 @@ void main() {
 #endif
     float ao = push.pbr.w;
 
-    vec3 orm = texture(ormMap, vUV).rgb;
+    vec3 orm = texture(ormMap, matUV).rgb;
     ao *= orm.r;
     roughness *= orm.g;
     metallic *= orm.b;
@@ -959,8 +1210,8 @@ void main() {
     // 单因子贴图再乘一层（未绑定时是纯白，等于没乘）。
     // 于是 glTF 那种打包 ORM 与"一张一张单独指定"两种用法可以共存：
     // 想单独换粗糙度，只需要在粗糙度槽里放一张图，不用去动 ORM。
-    roughness *= texture(roughnessMap, vUV).r;
-    metallic *= texture(metallicMap, vUV).r;
+    roughness *= texture(roughnessMap, matUV).r;
+    metallic *= texture(metallicMap, matUV).r;
 
     roughness = clamp(roughness, 0.04, 1.0);
     metallic = clamp(metallic, 0.0, 1.0);
@@ -993,13 +1244,52 @@ void main() {
     // 内置平坦法线贴图 (0.5,0.5,1)，*2-1 得 (0,0,1)；xy 再乘 normalScale
     // 仍是 0，于是 TBN * (0,0,1) 恰好等于 TBN 的第三列 = N 本身。
     // 验证脚本 tools/verify_shader_variants.py 把这条当核心断言。
-    vec3 nSample = texture(normalMap, vUV).xyz * 2.0 - 1.0;
+    // 采样坐标用**视差位移后**的 matUV（凹槽里的法线细节要跟着颜色一起
+    // 挪），但切线基仍用未位移的 vUV —— 位移后的 UV 在淡出/早退的分支
+    // 边界上不连续，拿它求 dFdx 会得到错的切线（法线整片歪掉）。
+    vec3 nSample = texture(normalMap, matUV).xyz * 2.0 - 1.0;
     nSample.xy *= normalScale;
     if (dot(nSample.xy, nSample.xy) > 1e-8) {
         mat3 TBN = cotangentFrame(N, vWorldPos, vUV);
         N = normalize(TBN * normalize(nSample));
     }
 #endif
+
+    // ---------------- 延迟贴花（R4-4）----------------
+    // 位置是关键：必须在 albedo / roughness / metallic / N **都算完之后、
+    // F0 与 V 之前**。贴花要改的正是这四个量，而它们之后的每一段
+    // （F0、直接光、IBL、阴影、雾）都该看到**贴过之后**的值 ——
+    // 这正是"延迟贴花"相对"把贴花画成一块半透明几何"的优势：
+    // 它真的参与了 BRDF，而不是在最终画面上蒙一层。
+    //
+    // uv 由 gl_FragCoord 换算（DBuffer 与场景同分辨率，见 DecalBuffer::
+    // recreate 用的是 renderExtent()）。三张图共用同一个 uv。
+    //
+    // 用 textureLod(…, 0) 而不是 texture()：这两次采样在
+    // "coverage > 0"的分支里（非一致控制流），隐式导数在 quad 内会
+    // 因部分像素不进分支而变成垃圾 —— DBuffer 没有 mip，锁死 level 0
+    // 就让这点彻底无关紧要。
+    if (ubo.decalParams.x > 0.5) {
+        const vec2 dbUv = gl_FragCoord.xy * ubo.screenSize.zw;
+        const vec4 dbA = textureLod(decalAlbedoTex, dbUv, 0.0);
+        // coverage = 0 → 这个像素上没有贴花（清屏值 / 贴花范围之外）。
+        // 一次纹理采样就判掉，这是"开着但没有贴花 = 基线逐像素不变"
+        // 的实现依据。
+        if (dbA.a > 0.0) {
+            const float dcov = dbA.a;
+            // 反照率是**替换**语义（贴花 = 覆盖在表面上的另一层材质），
+            // 按 coverage 插值而不是相乘。
+            albedo = mix(albedo, dbA.rgb, dcov);
+            // 法线存的是世界空间方向 → 直接方向插值再归一化。
+            const vec3 dbN =
+                normalize(textureLod(decalNormalTex, dbUv, 0.0).xyz * 2.0 - 1.0);
+            N = normalize(mix(N, dbN, dcov));
+            // 粗糙度 / 金属度：弹孔比墙面粗糙、油渍更"金属"，都走这里。
+            const vec4 dbRM = textureLod(decalRoughMetalTex, dbUv, 0.0);
+            roughness = mix(roughness, clamp(dbRM.r, 0.04, 1.0), dcov);
+            metallic = mix(metallic, clamp(dbRM.g, 0.0, 1.0), dcov);
+        }
+    }
 
     vec3 V = normalize(ubo.camPos.xyz - vWorldPos);
     float NdotV = max(dot(N, V), 0.0);
@@ -1088,8 +1378,24 @@ void main() {
         // 全部实现 —— 上一版这里只做了一次方向采样，所以怎么调都不像。
         const vec3 R = reflect(-V, N);
         const float maxLod = ubo.envParams.y;
-        const vec3 prefiltered =
+        vec3 prefiltered =
             textureLod(prefilterMap, R, roughness * maxLod).rgb;
+
+        // ---- R5-1：反射探针 ----
+        // 片元落在某个探针盒体内时，用探针烘出来的立方体贴图**替换**
+        // 这一路的环境镜面。替换（而不是相加）的理由：IBL 的预过滤图是
+        // "无限远的天空"，探针图是"这间屋子"——两件事描述的是同一个物理量
+        // （该方向的入射辐射），相加就是双倍计。
+        //
+        // 与 SSR 的关系（v1 的取舍，写在这里免得下次"顺手改成混合"）：
+        // SSR 在 FrameGraph 里是**加色**的，它只在自己命中时加东西；探针
+        // 提供的是"屏幕里没有的那部分"。两者在"SSR 也命中了"的像素上会
+        // 叠加 —— 想做"按 roughness 权重混合"需要全屏 pass 拿到材质粗糙度，
+        // 而现在的 SSR v1 本来就没有这个输入（见 fg_ssr.frag 文件头）。
+        // 升级路径：把 roughness 写进场景色 alpha，或等 R7-1 的
+        // 声明式 RenderGraph 把 SSR 改成延迟反射 pass。
+        const vec4 probe = vennProbeReflection(vWorldPos, R, roughness);
+        if (probe.w > 0.0) prefiltered = mix(prefiltered, probe.rgb, probe.w);
 
         // split-sum 的第二项：把菲涅尔折成 F0·A + B，于是 F0 不必进表。
         const vec2 ab = texture(brdfLut, vec2(max(NdotV, 1e-4), roughness)).rg;
@@ -1118,7 +1424,7 @@ void main() {
 
     // 自发光 = 因子 + 贴图。贴图槽空着时绑的是内置纯黑，加法恒等；
     // 放一张图进去立刻发光（因子保留 0 也亮），不用两头调。
-    vec3 emissive = push.emissive.rgb + texture(emissiveMap, vUV).rgb;
+    vec3 emissive = push.emissive.rgb + texture(emissiveMap, matUV).rgb;
 
     vec3 color = ambient + direct + localLights + emissive;
 

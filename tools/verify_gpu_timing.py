@@ -43,13 +43,14 @@ from verify_shader_variants import run_once                          # noqa: E40
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(ROOT, "..", "_venn_verify")
 
-SECTIONS = ["shadows", "local_sh", "depth", "ssao", "cluster",
-            "forward", "framegraph", "offscreen", "post"]
+SECTIONS = ["shadows", "local_sh", "depth", "decals", "ssao", "cluster",
+            "forward", "particles", "framegraph", "offscreen", "post"]
 # 常开段（默认场景里这些 pass 一定在录命令）
 ALWAYS_ON = ["shadows", "depth", "cluster", "forward", "post"]
 # 默认场景里关闭/不存在的段（run_once 设了 MYVK_EDITOR_NO_HUD=1，
-# 预览窗口不开 → offscreen 也是空的）
-INACTIVE = ["ssao", "framegraph", "offscreen"]
+# 预览窗口不开 → offscreen 也是空的；默认场景没有粒子发射器 →
+# particles 只打相邻两个时戳，读数 ≈0）
+INACTIVE = ["ssao", "framegraph", "offscreen", "particles"]
 
 TIMING_RE = re.compile(r"GPU-TIMING\s+(.*)")
 
@@ -155,8 +156,8 @@ def main():
                   "frame=" + ",".join(f"{f:.2f}" for f in frames[:6]))
 
             missing = [k for t in timings for k in SECTIONS if k not in t]
-            check("T1d 每条日志 9 段齐全", not missing,
-                  f"缺失 {sorted(set(missing))}" if missing else "9/9")
+            check("T1d 每条日志 11 段齐全", not missing,
+                  f"缺失 {sorted(set(missing))}" if missing else "11/11")
 
             bad = []
             for t in timings:
@@ -180,9 +181,10 @@ def main():
         # ============ T2 条件段归零 ============
         if timings:
             worst = max(max(t.get(k, 99) for t in timings) for k in INACTIVE)
-            check("T2 关闭的段 ≈ 0（ssao/framegraph/offscreen < 0.05ms）",
+            check("T2 关闭的段 ≈ 0（ssao/framegraph/offscreen/particles < "
+                  "0.05ms）",
                   worst < 0.05,
-                  f"三段最大值 {worst:.4f}ms")
+                  f"{len(INACTIVE)} 段最大值 {worst:.4f}ms")
         else:
             check("T2 关闭的段 ≈ 0", False, "没有可解析的日志")
 

@@ -245,10 +245,14 @@ void HdrTarget::createFrame(Frame& f) {
                       f.msaaColorMemory, f.msaaColorView, m_samples);
     }
 
-    // resolve 图：既是颜色附件（MSAA 关时），也是被采样的那张
+    // resolve 图：既是颜色附件（MSAA 关时），也是被采样的那张。
+    // TRANSFER_SRC 是给反射探针捕获（R5-1）用的：捕获要把这一面
+    // vkCmdCopyImage 进立方体贴图的某一层。usage 只是"允许"，不改变
+    // 布局与带宽 —— 不开探针的运行一个字节的差异都没有。
     createImage2D(m_device, m_extent.width, m_extent.height, kColorFormat,
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                      VK_IMAGE_USAGE_SAMPLED_BIT,
+                      VK_IMAGE_USAGE_SAMPLED_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT, f.resolveImage, f.resolveMemory,
                   f.resolveView);
 

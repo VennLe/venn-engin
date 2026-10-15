@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "generator": "Venn/SceneSerializer",
+  "entities": [
+    {
+      "name": "Props",
+      "folder": true,
+      "parent": -1,
+      "transform": {"position": [0, 0, 0], "rotation": [0, 0, 0], "scale": [1, 1, 1]}
+    },
+    {
+      "name": "Crate",
+      "parent": 0,
+      "transform": {"position": [0, 0.5, 0], "rotation": [0, 0, 0], "scale": [1, 1, 1]},
+      "mesh": {"kind": "builtin", "shape": "cube", "size": 1.0, "name": "cube"}
+    },
+    {
+      "name": "PointLight",
+      "parent": 0,
+      "transform": {"position": [2, 1.5, 2], "rotation": [0, 0, 0], "scale": [1, 1, 1]},
+      "pointLight": {"color": [1, 0.9, 0.8], "intensity": 8, "range": 12, "enabled": true, "castsShadow": true}
+    },
+    {
+      "name": "Ball",
+      "parent": 1,
+      "transform": {"position": [0, 1.5, 0], "rotation": [0, 0, 0], "scale": [0.5, 0.5, 0.5]},
+      "mesh": {"kind": "builtin", "shape": "sphere", "size": 1.0, "name": "sphere"}
+    },
+    {
+      "name": "SoloLight",
+      "parent": -1,
+      "transform": {"position": [-3, 2, -1], "rotation": [0, 0, 0], "scale": [1, 1, 1]},
+      "pointLight": {"color": [0.7, 0.8, 1], "intensity": 5, "range": 10, "enabled": true, "castsShadow": false}
+    },
+    {
+      "name": "Ground",
+      "parent": -1,
+      "locked": true,
+      "transform": {"position": [0, 0, 0], "rotation": [0, 0, 0], "scale": [1, 1, 1]},
+      "mesh": {"kind": "builtin", "shape": "plane", "size": 10.0, "name": "plane"}
+    }
+  ]
+}

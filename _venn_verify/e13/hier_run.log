@@ -1,0 +1,7 @@
+launched pid 47336
+source(client)=58,747  target(client)=103,343  drop=(10, 210, 285, 390)  vp=(305, 184, 1241, 776)
+foreground ok=True
+cursor now = (487, 1210)  want(client) = (58, 747)
+PrintWindow ok=True size=(1578, 844) -> E:\code\cpp\_venn_verify\asset_drag.png
+alignImportToGround: box.min.z=-0.7780 bottom=0.0000
+贴地断言: PASS (|bottom| < 1e-3)

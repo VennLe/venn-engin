@@ -61,7 +61,7 @@ struct TextureSource {
     uint32_t cell = 32;                        // Checker 格子边长（像素）
     uint32_t size = 512;                       // Checker / Solid 边长
     std::string path;                          // File
-    bool srgb = true;                          // File / Solid：色彩空间
+    bool srgb = true;                          // File / Solid / Checker：色彩空间
 };
 
 class Texture {
@@ -88,9 +88,12 @@ public:
                  bool srgb = true);
 
     // 程序化棋盘格（两种颜色，格子大小 cell）
+    // srgb 语义与 makeSolid 一致：数据贴图（法线 / 粗糙度 / **高度图**）
+    // 必须传 false，否则硬件采样时会做 sRGB→线性解码，灰度被整体压暗
+    // 且非线性（0.5 → 0.216）—— 对高度场来说就是"起伏形状被扭过"。
     void makeCheckerboard(const TextureContext& ctx, uint32_t width,
                           uint32_t height, uint32_t cell, uint8_t a[4],
-                          uint8_t b[4]);
+                          uint8_t b[4], bool srgb = true);
 
     // 程序化纯色
     // srgb=true  → R8G8B8A8_SRGB  （albedo / emissive 等"颜色"贴图）

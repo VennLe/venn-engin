@@ -35,6 +35,12 @@ public:
     const VkPhysicalDeviceProperties& properties() const { return m_props; }
     float maxSamplerAnisotropy() const { return m_maxAnisotropy; }
 
+    // 设备本地（DEVICE_LOCAL）显存**总量**，字节。
+    // 视口统计 HUD 的 "VRAM" 一行用它 —— 本引擎没有自己的分配器记账
+    // （没有 VMA，各类 Target 各自 new），所以拿不到"已用"，只能报容量。
+    // 首次调用时查一次并缓存（vkGetPhysicalDeviceMemoryProperties 不快）。
+    uint64_t deviceLocalHeapBytes() const;
+
     // ============================================================
     // Bindless（R2-3，见 render/Bindless.h）
     //

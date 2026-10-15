@@ -185,11 +185,49 @@ struct FrameUBO {
     //     只被 VENN_SHADING_SKIN 编译单元读取，Default 材质完全不受影响。
     // y/z/w = 保留
     glm::vec4 sssParams;          // offset 704
+
+    // ---- 视差遮挡贴图（POM，R4-3）----
+    // x = 淡出起点（米）：相机到片元的距离超过它就线性削弱视差 offset；
+    // y = 淡出终点（米）：超过它 offset 恒 0 —— **远处退回普通法线贴图**，
+    //     既省掉整段 ray-march 的采样，也避开远处纹素被缩小时必然出现的
+    //     抖动（层间 UV 步长已经小于一个纹素，继续步进只是在放大走样）。
+    // z = 层数上限（步进的最大层数；越大越精确也越贵，典型 16~64）
+    // w = 全局倍率兼开关：乘在材质的 heightScale 上。= 0 → offset 恒 0
+    //     （整段短路）→ 与没开 POM 逐像素相同，是 A/B 对照的开关。
+    //     MYVK_POM 可覆盖，默认 1.0。
+    // 只被 VENN_PARALLAX 编译单元读取。
+    glm::vec4 pomParams;          // offset 720
+
+    // ---- 延迟贴花（DBuffer，R4-4）----
+    // x = 总开关（1 开 / 0 关）。0 时 pbr.frag 整段跳过贴花采样 ——
+    //     此时 set0/binding 20..22 绑的是全透明贴图（coverage 恒 0），
+    //     两者效果相同，但跳过省掉三次纹理采样。这就是"关 = 基线
+    //     逐像素不变"的实现依据。
+    // y/z/w = 保留（留给将来的逐贴花强度 / 屏幕空间模糊半径）。
+    //
+    // ⚠ 用它而不是新开一个着色器关键字位：贴花的开关是**全局**的、
+    //   可以随时切（与 vfogParams.w / viewModeParams 同一条取舍），
+    //   而关键字位是材质属性 —— 混进去会让变体数平白翻倍。
+    glm::vec4 decalParams;        // offset 736
+
+    // ---- 反射探针（R5-1，见 render/ReflectionProbe.h）----
+    // x = 总开关（1 开 / 0 关）。0 时 pbr.frag 里整段探针采样短路 ——
+    //     此时 binding 23 绑的是 1×1 缺省 cube array，采了也是黑的，
+    //     但跳过省掉一次 cube array 采样与一圈探针循环。这就是
+    //     "关 = 基线逐像素不变"的实现依据。
+    // y = 本帧有效探针数（上限 = ReflectionProbeSystem 的 maxProbes）
+    // z = 预过滤 cube array 的最大 mip（roughness × 它 = textureLod 层级）
+    // w = 全局强度倍率（探针各自的强度乘在它之上）
+    glm::vec4 probeParams;        // offset 752
 };
-// 总 720 字节。std140 下 mat4 步长 16、vec4 对齐 16，与这里的自然布局一致。
+// 总 768 字节。std140 下 mat4 步长 16、vec4 对齐 16，与这里的自然布局一致。
 // ⚠ 追加字段只能放**末尾**：sky.vert / grid.vert / shadow.vert /
 //   cluster_build.comp 只声明前缀，尾部追加不影响它们的偏移。
-static_assert(sizeof(FrameUBO) == 720, "FrameUBO 布局变了，必须同步所有声明它的着色器");
+//
+// 关于 R6-1 粒子：它**不需要**在这里加字段 —— 全局倍率（尺寸 / 亮度 /
+// 软化距离）走粒子自己的 push 常量，发射器参数走 SSBO，存活数由间接
+// 命令的 instanceCount 承载（CPU 根本不需要知道）。
+static_assert(sizeof(FrameUBO) == 768, "FrameUBO 布局变了，必须同步所有声明它的着色器");
 
 // 阴影 Pass 专用的推送常量（std430 布局，共 96 字节）。
 //
@@ -261,6 +299,12 @@ static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
 // Texture::descriptorSet()）：把多张图塞进同一个 set 就变成"组合"才拥有
 // 描述符，缓存与生命周期都要重做。多绑几个 set 的代价远小于那笔复杂度。
 //   1 albedo  2 normal  3 orm  4 roughness  5 metallic  6 emissive
-static constexpr uint32_t kTextureSetCount = 6;
+//   7 height（R4-3 POM 用；只有挂了高度图的材质才真的采样它）
+//
+// ⚠ 第 7 个既超出"Vulkan 只保证 4 个 set"的规范下限，也超出过去 6 个的
+//   用量 —— 所以这是本引擎对 `maxBoundDescriptorSets` 的实际要求（≥ 8）。
+//   RTX 3060 报 32；AMD/Intel/Adreno/Mali 普遍报 8，正好够。真遇到更小的
+//   设备，前向变体管线会创建失败（不是静默画错）。
+static constexpr uint32_t kTextureSetCount = 7;
 
 } // namespace render

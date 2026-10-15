@@ -1,6 +1,8 @@
 #include "rhi/Pipeline.h"
 #include "rhi/Device.h"
 
+#include <algorithm>
+
 namespace rhi {
 
 VkPipelineLayout createPipelineLayout(Device& device, const PipelineDesc& desc) {
@@ -87,26 +89,36 @@ Pipeline::Pipeline(Device& device, const PipelineDesc& desc) : m_device(device) 
     depthStencil.depthBoundsTestEnable = VK_FALSE;
     depthStencil.stencilTestEnable = VK_FALSE;
 
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    // 不透明默认关闭混合；透明材质打开标准 alpha 混合
-    blendAttachment.blendEnable = desc.blendEnable ? VK_TRUE : VK_FALSE;
-    blendAttachment.srcColorBlendFactor = desc.srcColorBlendFactor;
-    blendAttachment.dstColorBlendFactor = desc.dstColorBlendFactor;
-    blendAttachment.colorBlendOp = desc.colorBlendOp;
-    blendAttachment.srcAlphaBlendFactor = desc.srcAlphaBlendFactor;
-    blendAttachment.dstAlphaBlendFactor = desc.dstAlphaBlendFactor;
-    blendAttachment.alphaBlendOp = desc.alphaBlendOp;
-    blendAttachment.colorWriteMask =
-        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    // ⚠ 这里必须是一个**数组**，不能是"一个对象 + attachmentCount=N"。
+    // 多颜色附件（MRT，R4-4 的 DBuffer 就是 3 个）时，驱动会按
+    // attachmentCount 去读 pAttachments 的后续元素 —— 只给一个元素就是
+    // 越界读栈（轻则混合状态错乱，重则验证层直接报错）。
+    // 我们的用法里所有附件共用同一套混合规则，所以照抄 desc 填满即可。
+    // 上限 8：本引擎最多用到 3 个（DBuffer），留一倍余量。
+    constexpr uint32_t kMaxBlendAttachments = 8;
+    VkPipelineColorBlendAttachmentState blendAttachments[kMaxBlendAttachments]{};
+    for (uint32_t i = 0; i < kMaxBlendAttachments; ++i) {
+        auto& a = blendAttachments[i];
+        // 不透明默认关闭混合；透明材质 / DBuffer 打开混合
+        a.blendEnable = desc.blendEnable ? VK_TRUE : VK_FALSE;
+        a.srcColorBlendFactor = desc.srcColorBlendFactor;
+        a.dstColorBlendFactor = desc.dstColorBlendFactor;
+        a.colorBlendOp = desc.colorBlendOp;
+        a.srcAlphaBlendFactor = desc.srcAlphaBlendFactor;
+        a.dstAlphaBlendFactor = desc.dstAlphaBlendFactor;
+        a.alphaBlendOp = desc.alphaBlendOp;
+        a.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    }
 
     VkPipelineColorBlendStateCreateInfo blend{};
     blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     blend.logicOpEnable = VK_FALSE;
     // colorAttachmentCount == 0 → depth-only 管线，颜色混合状态必须为空
+    const uint32_t nBlend = std::min(desc.colorAttachmentCount,
+                                     kMaxBlendAttachments);
     blend.attachmentCount = desc.colorAttachmentCount;
-    blend.pAttachments =
-        desc.colorAttachmentCount > 0 ? &blendAttachment : nullptr;
+    blend.pAttachments = nBlend > 0 ? blendAttachments : nullptr;
 
     VkDynamicState dynStates[] = {VK_DYNAMIC_STATE_VIEWPORT,
                                   VK_DYNAMIC_STATE_SCISSOR};

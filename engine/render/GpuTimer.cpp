@@ -14,8 +14,8 @@ constexpr float kSanityMaxMs = 500.0f;
 
 const char* GpuTimer::sectionName(uint32_t section) {
     static const char* kNames[kSectionCount] = {
-        "shadows", "local_sh", "depth", "ssao",    "cluster",
-        "forward", "framegraph", "offscreen", "post",
+        "shadows", "local_sh",   "depth",  "decals",  "ssao", "cluster",
+        "forward", "particles",  "framegraph", "offscreen", "post",
     };
     return section < kSectionCount ? kNames[section] : "?";
 }

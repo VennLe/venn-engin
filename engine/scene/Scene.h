@@ -63,6 +63,41 @@ public:
             });
     }
 
+    // 所有**启用**的延迟贴花（R4-4，见 ecs::DecalComponent）。
+    //
+    // 贴花没有网格 —— 盒体几何是渲染器自己建的单位立方体，场景侧只提供
+    // 世界矩阵与参数。所以这里不像 forEachRenderable 那样要求 MeshComponent。
+    template <typename Fn>
+    void forEachDecal(Fn&& fn) {
+        m_world.each<ecs::DecalComponent>(
+            [&](ecs::Entity e, ecs::DecalComponent& dc) {
+                if (!dc.enabled) return;
+                fn(e, dc);
+            });
+    }
+
+    // 所有**启用**的反射探针（R5-1，见 ecs::ReflectionProbeComponent）。
+    template <typename Fn>
+    void forEachReflectionProbe(Fn&& fn) {
+        m_world.each<ecs::ReflectionProbeComponent>(
+            [&](ecs::Entity e, ecs::ReflectionProbeComponent& pc) {
+                if (!pc.enabled) return;
+                fn(e, pc);
+            });
+    }
+
+    // 所有**启用**的粒子发射器（R6-1，见 ecs::ParticleEmitterComponent）。
+    // 与贴花 / 探针同一条约定：粒子也没有网格 —— 几何是顶点着色器现拼的
+    // billboard，场景侧只提供世界矩阵（位置 + 朝向）与发射参数。
+    template <typename Fn>
+    void forEachParticleEmitter(Fn&& fn) {
+        m_world.each<ecs::ParticleEmitterComponent>(
+            [&](ecs::Entity e, ecs::ParticleEmitterComponent& pc) {
+                if (!pc.enabled) return;
+                fn(e, pc);
+            });
+    }
+
     // ---- 空间加速结构（BVH）----
     //
     // 场景里所有"可见 + 有网格"实体的世界空间 AABB 索引。渲染的物体级

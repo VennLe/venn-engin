@@ -1,0 +1,245 @@
+#include "EditorLayoutIO.h"
+
+#include "core/Logger.h"
+
+#include <nlohmann/json.hpp>
+
+#include <cstdlib>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+
+namespace editor {
+
+namespace {
+using json = nlohmann::json;
+
+constexpr const char* kDefaultPath = "config/editor_layout.json";
+constexpr int kFormatVersion = 1;
+} // namespace
+
+bool editorLayoutAutomationRun() {
+    return std::getenv("MYVK_FRAMES") != nullptr ||
+           std::getenv("MYVK_NO_WINDOW_SAVE") != nullptr;
+}
+
+// MYVK_EDITOR_LAYOUT 是否被**显式**指定（非空）。
+bool editorLayoutPathExplicit() {
+    const char* p = std::getenv("MYVK_EDITOR_LAYOUT");
+    return p != nullptr && p[0] != '\0';
+}
+
+std::string editorLayoutPath() {
+    if (const char* p = std::getenv("MYVK_EDITOR_LAYOUT")) {
+        if (p[0] != '\0') return p;
+    }
+    return kDefaultPath;
+}
+
+bool loadEditorLayout(LayoutState& out) {
+    // 规则 1：自动化运行不读**默认路径**。
+    //   理由：上一次手动会话留下的布局会把自动化跑出的画面改掉，像素级
+    //   对照（回归）就不再成立。
+    //   但 MYVK_EDITOR_LAYOUT 是**显式**指定的路径 —— 那是自动化脚本自己
+    //   要求读的（比如验"落盘往返"），不是残留状态，所以放行。没有这一条
+    //   落盘功能在自动化里就没法验证，只能靠人开窗口手点。
+    if (editorLayoutAutomationRun() && !editorLayoutPathExplicit()) return false;
+
+    const std::string path = editorLayoutPath();
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec) return false;
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+
+    json j;
+    try {
+        in >> j;
+    } catch (const std::exception& e) {
+        VK_LOG_WARN("Editor layout: '%s' 解析失败（%s），改用出厂布局", path.c_str(),
+                    e.what());
+        return false;
+    }
+    if (!j.is_object()) return false;
+
+    LayoutState s;
+
+    // ---- panels ----
+    if (j.contains("panels") && j["panels"].is_array()) {
+        for (const auto& it : j["panels"]) {
+            if (!it.is_object()) continue;
+            const auto idIt = it.find("id");
+            if (idIt == it.end() || !idIt->is_string()) continue;
+            s.panels.emplace_back(idIt->get<std::string>(),
+                                  it.value("open", true));
+        }
+    }
+
+    // ---- workspace ----
+    s.workspace = j.value("workspace", std::string("level"));
+
+    // ---- split ----
+    if (j.contains("split") && j["split"].is_array()) {
+        const auto& arr = j["split"];
+        const int n = static_cast<int>(arr.size());
+        for (int i = 0; i < kLayoutSplitNodes && i < n; ++i) {
+            const json& n0 = arr[static_cast<size_t>(i)];
+            if (!n0.is_object()) continue;
+            s.splitRatio[i] = n0.value("ratio", 0.0f);
+            s.splitCollapsed[i] = n0.value("collapsed", false);
+            s.splitSaved[i] = n0.value("saved", 0.30f);
+        }
+    }
+
+    s.viewportLayout = j.value("viewportLayout", 0);
+    s.viewMode = j.value("viewMode", 0);
+    s.maximized = j.value("maximized", std::string(""));
+
+    if (j.contains("recent") && j["recent"].is_array()) {
+        for (const auto& it : j["recent"]) {
+            if (it.is_string()) s.recent.push_back(it.get<std::string>());
+        }
+    }
+
+    // 防御：比例非法（NaN / 负 / >1）时退回默认，不让坏文件把布局搞成 0 宽
+    for (int i = 0; i < kLayoutSplitNodes; ++i) {
+        const float r = s.splitRatio[i];
+        if (!(r >= 0.0f && r <= 1.0f)) s.splitRatio[i] = 0.0f;
+        const float v = s.splitSaved[i];
+        if (!(v > 0.0f && v <= 1.0f)) s.splitSaved[i] = 0.30f;
+    }
+
+    s.valid = true;
+    out = std::move(s);
+    VK_LOG_INFO("Editor layout: loaded '%s' (workspace=%s, panels=%zu)",
+                path.c_str(), out.workspace.c_str(), out.panels.size());
+    return true;
+}
+
+bool saveEditorLayout(const LayoutState& s) {
+    // 规则 1：自动化运行不写（免得把测试跑出来的布局存成"用户的"）。
+    // 与读不同，这里**显式路径也不放行** —— 脚本没有任何正当理由借自动化
+    // 会话去覆写一个布局文件；要生成存档就用正常窗口跑一次。
+    if (editorLayoutAutomationRun()) return false;
+
+    json j;
+    j["version"] = kFormatVersion;
+
+    json panels = json::array();
+    for (const auto& kv : s.panels) {
+        panels.push_back(json{{"id", kv.first}, {"open", kv.second}});
+    }
+    j["panels"] = std::move(panels);
+
+    j["workspace"] = s.workspace;
+
+    json split = json::array();
+    for (int i = 0; i < kLayoutSplitNodes; ++i) {
+        split.push_back(json{{"ratio", s.splitRatio[i]},
+                             {"collapsed", s.splitCollapsed[i]},
+                             {"saved", s.splitSaved[i]}});
+    }
+    j["split"] = std::move(split);
+
+    j["viewportLayout"] = s.viewportLayout;
+    j["viewMode"] = s.viewMode;
+    j["maximized"] = s.maximized;
+    j["recent"] = s.recent;
+
+    const std::string path = editorLayoutPath();
+    std::error_code ec;
+
+    const std::filesystem::path p(path);
+    if (p.has_parent_path()) {
+        std::filesystem::create_directories(p.parent_path(), ec);
+        if (ec) {
+            VK_LOG_WARN("Editor layout: 建目录失败 '%s': %s",
+                        p.parent_path().string().c_str(), ec.message().c_str());
+            return false;
+        }
+    }
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        VK_LOG_WARN("Editor layout: 打不开写入目标 '%s'", path.c_str());
+        return false;
+    }
+    out << j.dump(2) << "\n";
+    if (!out) {
+        VK_LOG_WARN("Editor layout: 写入失败 '%s'", path.c_str());
+        return false;
+    }
+    VK_LOG_INFO("Editor layout: saved '%s' (workspace=%s)", path.c_str(),
+                s.workspace.c_str());
+    return true;
+}
+
+// ============================================================
+// E17：偏好落盘
+// ============================================================
+
+std::string editorPrefsPath() {
+    if (const char* p = std::getenv("MYVK_EDITOR_PREFS_PATH")) {
+        if (p[0] != '\0') return p;
+    }
+    return "config/editor_prefs.json";
+}
+
+bool saveEditorPrefs(
+    const std::vector<std::pair<std::string, double>>& kv) {
+    if (editorLayoutAutomationRun()) return false;   // 写全程禁止
+    json j;
+    j["version"] = kFormatVersion;
+    json prefs = json::object();
+    for (const auto& it : kv) prefs[it.first] = it.second;
+    j["prefs"] = prefs;
+
+    const std::string path = editorPrefsPath();
+    std::error_code ec;
+    std::filesystem::create_directories(
+        std::filesystem::path(path).parent_path(), ec);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        VK_LOG_WARN("Editor prefs: 打不开写入目标 '%s'", path.c_str());
+        return false;
+    }
+    out << j.dump(2) << "\n";
+    if (!out) {
+        VK_LOG_WARN("Editor prefs: 写入失败 '%s'", path.c_str());
+        return false;
+    }
+    VK_LOG_INFO("Editor prefs: saved '%s' (%zu keys)", path.c_str(),
+                kv.size());
+    return true;
+}
+
+bool loadEditorPrefs(std::vector<std::pair<std::string, double>>& out) {
+    // 显式路径 → 读放行（与布局同一条规则）
+    const bool explicitPath = std::getenv("MYVK_EDITOR_PREFS_PATH") != nullptr;
+    if (editorLayoutAutomationRun() && !explicitPath) return false;
+
+    const std::string path = editorPrefsPath();
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;   // 没有存档 = 第一次启动，保持出厂值
+
+    try {
+        json j = json::parse(in);
+        if (!j.is_object() || !j.contains("prefs") ||
+            !j["prefs"].is_object())
+            return false;
+        out.clear();
+        for (auto it = j["prefs"].begin(); it != j["prefs"].end(); ++it) {
+            if (it.value().is_number())
+                out.emplace_back(it.key(), it.value().get<double>());
+        }
+        VK_LOG_INFO("Editor prefs: loaded '%s' (%zu keys)", path.c_str(),
+                    out.size());
+        return true;
+    } catch (const std::exception& e) {
+        VK_LOG_WARN("Editor prefs: '%s' 解析失败（%s），改用出厂偏好",
+                    path.c_str(), e.what());
+        return false;
+    }
+}
+
+} // namespace editor

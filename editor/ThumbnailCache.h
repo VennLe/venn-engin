@@ -18,6 +18,17 @@
 //
 // 取不到图的行会记进 m_failed 并**不再重试** —— 否则一个坏文件会让
 // 日志每帧刷一行 WARN。
+//
+// E13 追加：LRU 上限。浏览大目录时，缓存会按"看过的每一张图"线性增长，
+// 而每张都占一个 ImGui 描述符 + 一份 GPU 纹理引用。这里给缓存设一个条目
+// 上限，超出后按**最近使用**淘汰最久未用的那张（淘汰时立刻注销句柄，
+// 与 erase 同一条路径）。
+//
+// 关于"后台线程解码"：真正的异步解码需要把"读文件 + 解码像素"从
+// AssetManager::loadTexture（它把解码与 GPU 上传绑在一次调用里）里拆出来，
+// 中间加一个"待上传队列"，由渲染线程每帧取走上传 —— Vulkan 的纹理创建
+// 不能在工作线程调用。这是独立的一块工作（记账在 editor_roadmap E13），
+// 本缓存先把 LRU 与内存上限做掉。
 // ============================================================
 
 #include <cstdint>
@@ -61,9 +72,24 @@ public:
     void eraseTree(const std::string& prefix);
     void clear();
 
+    // E13 缓存统计（供日志/验收断言）
+    std::size_t size() const { return m_items.size(); }
+    std::size_t capacity() const { return m_cap; }
+    void setCapacity(std::size_t cap) { m_cap = cap ? cap : 1; }
+
 private:
-    std::unordered_map<std::string, Entry> m_items;
+    // LRU 淘汰最久未使用的一项（不淘汰 keep 指定项）
+    void evictIfNeeded(const std::string& keep);
+
+    struct Slot {
+        Entry entry;
+        std::uint64_t lastUse = 0;
+    };
+
+    std::unordered_map<std::string, Slot> m_items;
     std::unordered_map<std::string, bool> m_failed;
+    std::uint64_t m_tick = 0;
+    std::size_t m_cap = 256;   // 上限：大目录滚动时的内存/描述符兜底
 };
 
 } // namespace editor

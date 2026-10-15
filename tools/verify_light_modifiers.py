@@ -44,7 +44,8 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from capture_window import capture_client, find_window, user32      # noqa: E402
+from capture_window import (capture_client, capture_nonempty, find_window,
+                            user32)                                # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors, wait_rect   # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -184,9 +185,20 @@ def run_once(exe, scene, extra_env, shot_path):
 
         img = None
         if shot_path:
-            shot, _ = capture_client(hwnd)
-            shot.save(shot_path)
-            img = np.asarray(shot.convert("RGB")).astype("float32")
+            # 窗口偶尔还没铺开（client 0×0）→ 直接 save 会抛
+            # "cannot write empty image"。capture_nonempty 内部重试 12×0.4s，
+            # 外层再包 3 轮兜底（回归连跑时机器负载高，一次 4.8s 可能不够）。
+            shot = None
+            for _try in range(3):
+                shot = capture_nonempty(hwnd)
+                if shot is not None:
+                    break
+                time.sleep(0.8)
+            if shot is None:
+                print("  [warn] 抓图为空（已重试 3 轮）—— 本步像素断言不可用")
+            else:
+                shot.save(shot_path)
+                img = np.asarray(shot.convert("RGB")).astype("float32")
 
         with tap.lock:
             lines = list(tap.lines)

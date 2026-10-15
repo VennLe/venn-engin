@@ -53,13 +53,27 @@ private:
         std::uintmax_t size = 0;
     };
 
+    // ---- E13 视图 / 尺寸 / 类型过滤 ----
+    enum class ViewMode { Grid, List };
+    enum class ThumbSize { Small, Medium, Large, Huge };
+    // 类型过滤：按扩展名映射（Material 认 .mat.json / .vmat；Scene 认 .json）
+    enum class TypeFilter {
+        All, Model, Texture, Material, Scene, Script, Shader, Folder
+    };
+
     void refresh();
 
-    // ---- 三段式 UI：导航行 / 搜索行 / 网格 ----
+    // ---- 三段式 UI：导航行 / 工具行 / 内容区 ----
     void drawNavRow();
-    void drawSearchRow();
+    void drawCrumbRow();     // 面包屑独占一整行（可点击跳转，窄面板下左裁）
+    void drawToolbarRow();   // 搜索 + 类型过滤 + 尺寸档 + 网格/列表切换
     void drawGrid();
+    void drawList();
     void drawEntry(const DirEntry& ent, float cellW, float cellH);
+    void drawListRow(const DirEntry& ent, float rowH);
+
+    // 当前类型过滤是否命中该条目
+    bool entryMatchesType(const DirEntry& ent) const;
 
     // 取缩略图（缓存命中/失败都在内部处理，返回 nullptr = 画不了）
     const ThumbnailCache::Entry* thumbnail(const std::string& absPath);
@@ -67,6 +81,13 @@ private:
     // ---- 文件系统操作（都做完整错误处理 + 刷新 + 提示）----
     void navigateTo(const std::string& rel);
     void goUp();
+    // E13 历史栈：←/→ 在访问过的目录间往返
+    void back();
+    void forward();
+    void pushHistory(const std::string& rel);
+    bool canBack() const;
+    bool canForward() const;
+
     void openEntry(const DirEntry& ent);          // 等同双击
     void beginRename(const std::string& absPath, const std::string& name);
     void commitRename();
@@ -74,6 +95,11 @@ private:
     void requestDelete(const DirEntry& ent);
     void doDelete();
     void createFolder();
+    // E13 New ▸ Material / Scene / Script
+    void createScene();
+    void createScript();
+    // E13 Show References：扫描资产根下引用该文件名的文本资产（简版）
+    void showReferences(const DirEntry& ent);
     void revealInExplorer(const std::string& absPath);
 
     void invalidateThumb(const std::string& absPath);
@@ -95,6 +121,19 @@ private:
     std::string m_root;    // 浏览根（一般是进程工作目录）
     std::string m_rel;     // 相对根的当前目录
     std::string m_filter;  // 名字过滤（大小写不敏感）
+
+    // ---- E13 视图状态 ----
+    ViewMode m_view = ViewMode::Grid;
+    ThumbSize m_thumb = ThumbSize::Medium;
+    TypeFilter m_typeFilter = TypeFilter::All;
+    int m_typeFilterIdx = 0;   // Combo 索引（与 TypeFilter 一一对应）
+    int m_thumbIdx = 1;        // 尺寸档索引（0=Small .. 3=Huge）
+    float m_cellW = 96.0f;     // 当前网格格子尺寸（drawGrid 每帧填，drawEntry 用）
+    float m_cellH = 104.0f;
+    // 历史栈：m_histPos 指向当前目录；back/forward 只移动游标，不截断
+    std::vector<std::string> m_history;
+    int m_histPos = -1;
+    bool m_histInit = false;
 
     std::vector<DirEntry> m_entries;
     bool m_dirty = true;

@@ -1,9 +1,13 @@
 #include "Toolbar.h"
 
 #include "EditorScene.h"
+#include "PanelRegistry.h"
+#include "Workspace.h"
+#include "script/ScriptEngine.h"
 
 #include "assets/AssetPath.h"
 #include "core/Logger.h"
+#include "render/Renderer.h"
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
 
@@ -17,9 +21,23 @@ namespace editor {
 
 namespace {
 
-// 播放控制按钮的配色（绿=播放、黄=暂停、红=停止）
 // 播放条配色（Run / Play / Pause / Stop）现在由 ContentBrowser 底部的
 // 播放行使用 —— 颜色常量跟着搬过去了，这里不再需要。
+
+// 视图模式枚举的合法范围（菜单生成用）
+constexpr int kViewModeCount = 8;   // Renderer::ViewMode 的条目数
+
+const char* groupName(editor::PanelGroup g) {
+    switch (g) {
+        case PanelGroup::General: return "General";
+        case PanelGroup::Debug: return "Debug";
+        case PanelGroup::Authoring: return "Authoring";
+    }
+    return "General";
+}
+
+constexpr PanelGroup kGroups[3] = {PanelGroup::General, PanelGroup::Debug,
+                                   PanelGroup::Authoring};
 
 } // namespace
 
@@ -36,48 +54,168 @@ void Toolbar::newScene() {
 
 void Toolbar::openScene(const std::string& relPath) {
     const scene::SceneIoResult r = scene::loadScene(
-        m_ctx.editorScene(), m_ctx.assets(),
-        assets::resolveAssetPath(relPath));
+        m_ctx.editorScene(), m_ctx.assets(), assets::resolveAssetPath(relPath));
     if (r.ok) {
         // 相机是刚从 JSON 读回来的（轨道模式）—— onSceneReplaced() 会重设
         m_ctx.onSceneReplaced();
         m_ctx.scenePath() = relPath;
+        m_ctx.pushRecentScene(relPath);
         m_ctx.notify("Opened " + relPath);
+        VK_LOG_INFO("Scene opened: '%s' (%zu entities)", relPath.c_str(),
+                    m_ctx.editorScene().objectCount());
     } else {
         m_ctx.notify("Open failed: " + r.error);
+        VK_LOG_WARN("Scene open failed for '%s': %s", relPath.c_str(),
+                    r.error.c_str());
     }
 }
 
-void Toolbar::saveScene(const std::string& relPath) {
+void Toolbar::saveSceneAs(const std::string& relPath) {
     const std::string abs = assets::resolveAssetPath(relPath);
     const scene::SceneIoResult r = scene::saveScene(m_ctx.editorScene(), abs);
     if (r.ok) {
         m_ctx.scenePath() = relPath;
         m_ctx.dirty() = false;
+        m_ctx.pushRecentScene(relPath);
         m_ctx.notify("Saved " + relPath + " (" + std::to_string(r.entities) +
                      " entities)");
+        VK_LOG_INFO("Scene saved: '%s'", abs.c_str());
     } else {
         m_ctx.notify("Save failed: " + r.error);
+        VK_LOG_WARN("Scene save failed for '%s': %s", abs.c_str(),
+                    r.error.c_str());
     }
 }
 
-// ---------------------------------------------------------------- 菜单
+void Toolbar::saveSceneToCurrentPath() { saveSceneAs(m_ctx.scenePath()); }
+
+// ---------------------------------------------------------------- 菜单子项
+
+void Toolbar::drawPanelMenu() {
+    const PanelDesc* t = panelTable();
+    const int n = panelCount();
+
+    for (PanelGroup g : kGroups) {
+        bool any = false;
+        for (int i = 0; i < n; ++i) {
+            if (t[i].group == g) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) continue;
+
+        if (!ImGui::BeginMenu(groupName(g))) continue;
+        for (int i = 0; i < n; ++i) {
+            if (t[i].group != g) continue;
+            bool open = panelOpen(i);
+            const char* sc = (t[i].shortcut && t[i].shortcut[0]) ? t[i].shortcut
+                                                                 : nullptr;
+            if (ImGui::MenuItem(t[i].title, sc, &open)) {
+                setPanelOpen(i, open);
+                m_ctx.notify(std::string(t[i].title) +
+                             (open ? " shown" : " hidden"));
+            }
+        }
+        ImGui::EndMenu();
+    }
+}
+
+void Toolbar::drawWorkspaceMenu() {
+    const int cur = m_ctx.workspace().current();
+    for (int i = 0; i < kWorkspaceCount; ++i) {
+        char label[192];
+        std::snprintf(label, sizeof(label), "%s##ws_%s", kWorkspaces[i].title,
+                      kWorkspaces[i].id);
+        const bool selected = (i == cur);
+        if (ImGui::MenuItem(label, nullptr, selected)) {
+            m_host.applyWorkspace(i);
+            m_ctx.notify(std::string("Workspace: ") + kWorkspaces[i].title);
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kWorkspaces[i].hint);
+    }
+    ImGui::Separator();
+    char saveLabel[96];
+    std::snprintf(saveLabel, sizeof(saveLabel), "Save Workspace%s",
+                  m_ctx.workspaceModified() ? "  *" : "");
+    if (ImGui::MenuItem(saveLabel)) m_host.saveWorkspace();
+    if (ImGui::MenuItem("Reset Workspace")) m_host.resetWorkspace();
+    ImGui::Separator();
+    ImGui::MenuItem("Ctrl+Alt+1..6 switches workspaces", nullptr, false, false);
+    if (m_ctx.workspaceModified()) {
+        ImGui::TextDisabled("current layout differs from the preset (*)");
+    }
+}
+
+void Toolbar::drawViewModeMenu() {
+    using VM = render::Renderer::ViewMode;
+    const int cur = m_host.currentViewMode();
+    for (int m = 0; m < kViewModeCount; ++m) {
+        const char* name = render::Renderer::viewModeName(static_cast<VM>(m));
+        char label[64];
+        std::snprintf(label, sizeof(label), "%s", name);
+        if (ImGui::MenuItem(label, nullptr, m == cur)) m_host.applyViewMode(m);
+    }
+}
+
+// ---------------------------------------------------------------- 菜单栏
 
 void Toolbar::drawMenuBar() {
     if (!ImGui::BeginMainMenuBar()) return;
 
+    // ================================================================
+    // File
+    // ================================================================
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("New Scene", "Ctrl+N")) newScene();
 
         ImGui::Separator();
-        if (ImGui::MenuItem("Open (current path)")) {
+        if (ImGui::MenuItem("Open (current path)", "Ctrl+O")) {
             openScene(m_ctx.scenePath());
         }
-        if (ImGui::MenuItem("Save", "Ctrl+S")) {
-            saveScene(m_ctx.scenePath());
+
+        // ---- Open Recent ▸（最近 10 个，最新在前）----
+        if (ImGui::BeginMenu("Open Recent", !m_ctx.recentScenes().empty())) {
+            // 拷贝一份再遍历：菜单项点下去会改 recent（pushRecentScene），
+            // 直接在原容器上迭代就是"边遍历边改"。
+            const std::vector<std::string> items = m_ctx.recentScenes();
+            for (size_t i = 0; i < items.size(); ++i) {
+                char label[320];
+                std::snprintf(label, sizeof(label), "%s##recent%zu",
+                              items[i].c_str(), i);
+                if (ImGui::MenuItem(label)) openScene(items[i]);
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Clear Recent")) {
+                m_ctx.recentScenesRef().clear();
+            }
+            ImGui::EndMenu();
         }
+
+        ImGui::Separator();
+        if (ImGui::MenuItem("Save", "Ctrl+S")) saveSceneToCurrentPath();
         if (ImGui::MenuItem("Save As (assets/scenes/scene.json)")) {
-            saveScene("assets/scenes/scene.json");
+            saveSceneAs("assets/scenes/scene.json");
+        }
+
+        ImGui::Separator();
+        // ---- Import / Export ----
+        // Import 走的是**拖拽进视口**那条既有路径（见 ViewportPanel 的
+        // AcceptDragDropPayload）—— 这里给的是同一个动作的菜单入口：
+        // 打开内容浏览器看一眼能拖什么。真正的"文件选择对话框"要等
+        // 平台层有原生对话框（E28 打包 UI 会同批做）。
+        if (ImGui::BeginMenu("Import")) {
+            if (ImGui::MenuItem("Reveal assets/ in Content Browser")) {
+                m_ctx.notify("Drag a .gltf/.obj/.fbx from the Content "
+                             "browser into the viewport to place it");
+            }
+            ImGui::MenuItem("Native file dialog (E28)", nullptr, false, false);
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Export")) {
+            ImGui::MenuItem("Export scene as glTF (E28)", nullptr, false,
+                            false);
+            ImGui::EndMenu();
         }
 
         ImGui::Separator();
@@ -89,6 +227,9 @@ void Toolbar::drawMenuBar() {
         ImGui::EndMenu();
     }
 
+    // ================================================================
+    // Edit
+    // ================================================================
     if (ImGui::BeginMenu("Edit")) {
         ImGui::BeginDisabled(!m_ctx.commands().canUndo());
         std::string undoLabel = "Undo";
@@ -104,36 +245,59 @@ void Toolbar::drawMenuBar() {
         if (ImGui::MenuItem(redoLabel.c_str(), "Ctrl+Y")) m_ctx.redo();
         ImGui::EndDisabled();
 
-        ImGui::Separator();
-        if (ImGui::MenuItem("Clear History")) {
-            m_ctx.commands().clear();
-            m_ctx.notify("History cleared");
+        // ---- History ▸：撤销栈可视化（原来是一段平铺的列表，改成子菜单）----
+        const auto names = m_ctx.commands().historyNames();
+        if (ImGui::BeginMenu("History", !names.empty())) {
+            const size_t cursor = m_ctx.commands().cursor();
+            for (size_t i = names.size(); i-- > 0;) {
+                const bool applied = i < cursor;
+                char label[256];
+                std::snprintf(label, sizeof(label), "%s %s##hist%zu",
+                              applied ? "[x]" : "[ ]", names[i].c_str(), i);
+                ImGui::MenuItem(label, nullptr, false, false);
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Clear History")) {
+                m_ctx.commands().clear();
+                m_ctx.notify("History cleared");
+            }
+            ImGui::EndMenu();
         }
 
         ImGui::Separator();
         ImGui::BeginDisabled(!m_ctx.hasSelection());
-        if (ImGui::MenuItem("Deselect")) m_ctx.clearSelection();
+        if (ImGui::MenuItem("Duplicate", "Ctrl+D")) {
+            m_ctx.notify("Use Ctrl+D / the Hierarchy context menu");
+        }
         ImGui::EndDisabled();
 
         ImGui::Separator();
-        if (ImGui::MenuItem("Preferences...", nullptr, false, true))
-            m_ctx.showSettings() = true;
-
-        // 历史列表（最近 12 条，倒序）
-        const auto names = m_ctx.commands().historyNames();
-        if (!names.empty()) {
-            ImGui::SeparatorText("History");
-            const size_t cursor = m_ctx.commands().cursor();
-            const size_t begin = names.size() > 12 ? names.size() - 12 : 0;
-            for (size_t i = names.size(); i-- > begin;) {
-                const bool applied = i < cursor;
-                ImGui::TextDisabled("%s %s", applied ? "[x]" : "[ ]",
-                                    names[i].c_str());
-            }
+        // ---- 选择 ----
+        // ⚠ Select All / Invert 需要**多选**，而当前的选择模型是单个
+        //   Entity（EditorContext::m_selection）。这两项故意禁用而不是
+        //   假装能用 —— 多选随 E11（Inspector 升级）/ E22（选择增强）落地。
+        ImGui::MenuItem("Select None", "Esc", false, false);
+        if (ImGui::MenuItem("Deselect")) m_ctx.clearSelection();
+        ImGui::BeginDisabled(true);
+        ImGui::MenuItem("Select All", "Ctrl+A", false, false);
+        ImGui::MenuItem("Invert Selection", nullptr, false, false);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("multi-selection lands with E11 / E22");
         }
+
+        ImGui::Separator();
+        if (ImGui::MenuItem("Project Settings...")) {
+            m_ctx.notify("Project settings panel lands with E26 "
+                         "(quality tiers)");
+        }
+        if (ImGui::MenuItem("Editor Preferences...")) m_ctx.showSettings() = true;
         ImGui::EndMenu();
     }
 
+    // ================================================================
+    // GameObject（保持既有内容不动）
+    // ================================================================
     if (ImGui::BeginMenu("GameObject")) {
         static const PrimitiveKind kinds[] = {
             PrimitiveKind::Cube,      PrimitiveKind::Sphere,
@@ -171,18 +335,47 @@ void Toolbar::drawMenuBar() {
         ImGui::EndMenu();
     }
 
+    // ================================================================
+    // View
+    // ================================================================
     if (ImGui::BeginMenu("View")) {
-        EditorContext::PanelVisibility& p = m_ctx.panels();
-        ImGui::MenuItem("Hierarchy", nullptr, &p.hierarchy);
-        ImGui::MenuItem("Inspector", nullptr, &p.inspector);
-        ImGui::MenuItem("Content", nullptr, &p.content);
-        ImGui::MenuItem("Scripts", nullptr, &p.scripts);
-        ImGui::MenuItem("Stats", nullptr, &p.stats);
-        ImGui::MenuItem("Engine (render settings)", nullptr, &p.engine);
+        if (ImGui::BeginMenu("View Mode")) {
+            drawViewModeMenu();
+            ImGui::EndMenu();
+        }
+
+        // 视口布局（E07）
+        if (ImGui::BeginMenu("Viewport Layout")) {
+            const int cur = m_host.currentViewportLayout();
+            for (int i = 0; i < viewportLayoutCount(); ++i) {
+                const auto l = static_cast<ViewportLayout>(i);
+                char label[96];
+                std::snprintf(label, sizeof(label), "%s##vpl%d",
+                              viewportLayoutName(l), i);
+                if (ImGui::MenuItem(label, nullptr, i == cur)) {
+                    m_host.applyViewportLayout(i);
+                    m_ctx.notify(std::string("Viewport layout: ") +
+                                 viewportLayoutName(l));
+                }
+            }
+            ImGui::EndMenu();
+        }
+
+        if (ImGui::BeginMenu("Panel")) {
+            drawPanelMenu();
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Workspace")) {
+            drawWorkspaceMenu();
+            ImGui::EndMenu();
+        }
+
         ImGui::Separator();
-        ImGui::MenuItem("Viewport", nullptr, &p.viewport);
         // 地平面栅格（和视口右上角浮层里那个勾选框是同一份状态）
         ImGui::MenuItem("Ground grid (1 m)", nullptr, &m_ctx.showGridRef());
+        if (ImGui::MenuItem("Maximize focused panel", "Shift+Space")) {
+            m_ctx.notify("Shift+Space over a panel toggles maximize");
+        }
         if (ImGui::MenuItem("Reset Layout")) {
             m_ctx.relayout() = true;
             m_ctx.notify("Layout reset");
@@ -195,7 +388,53 @@ void Toolbar::drawMenuBar() {
         ImGui::EndMenu();
     }
 
+    // ================================================================
+    // Build（新）
+    // ================================================================
+    if (ImGui::BeginMenu("Build")) {
+        if (ImGui::MenuItem("Reload Shaders", "Ctrl+Shift+R")) {
+            m_host.reloadShaders();
+        }
+        if (ImGui::MenuItem("Reload Assets")) m_host.reloadAssets();
+        ImGui::Separator();
+        ImGui::BeginDisabled(true);
+        ImGui::MenuItem("Package... (E28)", nullptr, false, false);
+        ImGui::MenuItem("Bake Lighting... (E29)", nullptr, false, false);
+        ImGui::EndDisabled();
+        ImGui::EndMenu();
+    }
+
+    // ================================================================
+    // Window（面板显隐 + 工作区，和 View 里那两个子菜单同源）
+    // ================================================================
+    if (ImGui::BeginMenu("Window")) {
+        if (ImGui::BeginMenu("Panels")) {
+            drawPanelMenu();
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Workspaces")) {
+            drawWorkspaceMenu();
+            ImGui::EndMenu();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Reset Layout")) {
+            m_ctx.relayout() = true;
+            m_ctx.notify("Layout reset");
+        }
+        ImGui::EndMenu();
+    }
+
+    // ================================================================
+    // Help
+    // ================================================================
     if (ImGui::BeginMenu("Help")) {
+        // E18：命令面板（可发现性的总入口）
+        if (ImGui::MenuItem("Command Palette...", "Ctrl+Shift+P"))
+            m_host.showCommandPalette();
+        // E21：错过的 WARN/ERROR 都在这里（Toast 只活 4 秒）
+        if (ImGui::MenuItem("Show Notification History"))
+            m_host.showNotificationHistory();
+        if (ImGui::MenuItem("Shortcut Reference")) m_showShortcuts = true;
         ImGui::SeparatorText("Viewport navigation (edit mode)");
         ImGui::MenuItem("Hold RMB + drag: look around", nullptr, false, false);
         ImGui::MenuItem("Hold RMB + WASD: fly   Q / E: down / up", nullptr,
@@ -203,66 +442,70 @@ void Toolbar::drawMenuBar() {
         ImGui::MenuItem("Hold MMB + drag: pan   Shift: fly faster", nullptr,
                         false, false);
         ImGui::MenuItem("Wheel: dolly in / out", nullptr, false, false);
-        ImGui::MenuItem("Hold RMB + wheel: navigation sensitivity (1.00)",
-                        nullptr, false, false);
+        ImGui::MenuItem("Hold RMB + wheel: navigation sensitivity", nullptr,
+                        false, false);
         ImGui::SeparatorText("Editing");
-        ImGui::MenuItem("LMB: select object / drag gizmo handle", nullptr, false,
-                        false);
         ImGui::MenuItem(
             "W / E / R: gizmo mode   X: world / local   (not while RMB)",
             nullptr, false, false);
-        ImGui::MenuItem("LMB drag handle: move / rotate / scale", nullptr, false,
-                        false);
         ImGui::MenuItem("G: snapping on/off for the current tool", nullptr,
                         false, false);
-        ImGui::MenuItem(
-            "Snap steps: move 0.1 m / rotate 10 deg / scale 0.1 (= UE5)",
-            nullptr, false, false);
         ImGui::MenuItem("F: focus selection   Del: delete", nullptr, false,
                         false);
         ImGui::MenuItem("Shift+A (in viewport): add menu (Mesh / Light)",
                         nullptr, false, false);
         ImGui::MenuItem("F2: rename (Hierarchy)   Ctrl+D: duplicate", nullptr,
                         false, false);
-        ImGui::MenuItem("Ctrl+Z / Ctrl+Y: undo / redo", nullptr, false, false);
-        ImGui::MenuItem("Ctrl+S: save scene   Ctrl+N: new scene", nullptr,
+        ImGui::SeparatorText("Panels & workspaces");
+        ImGui::MenuItem("Alt+1..8: toggle a panel", nullptr, false, false);
+        ImGui::MenuItem("Ctrl+Alt+1..6: switch workspace", nullptr, false,
+                        false);
+        ImGui::MenuItem("Shift+Space: maximize the panel under the mouse",
+                        nullptr, false, false);
+        ImGui::MenuItem("Double-click a splitter: collapse / expand", nullptr,
                         false, false);
-        ImGui::SeparatorText("Panels");
-        ImGui::MenuItem("Right-click a Hierarchy node: rename / duplicate /\n"
-                        "delete / create child / new folder",
-                        nullptr, false, false);
-        ImGui::MenuItem("Right-click a Content item: open / rename /\n"
-                        "duplicate / delete / reveal in Explorer",
-                        nullptr, false, false);
-        ImGui::MenuItem("Double-click folders to enter, '..' or the arrow\n"
-                        "button to go back up",
-                        nullptr, false, false);
+        ImGui::MenuItem("Right-click a splitter: ratio presets", nullptr, false,
+                        false);
         ImGui::SeparatorText("Playing (game runs in the viewport)");
         ImGui::MenuItem("Space: play / pause", nullptr, false, false);
         ImGui::MenuItem("F: fullscreen, game only (Esc to leave)", nullptr,
                         false, false);
         ImGui::MenuItem("F11: window fullscreen (works in any mode)", nullptr,
                         false, false);
-        ImGui::MenuItem("The game owns the camera - viewport takes no input",
-                        nullptr, false, false);
+        ImGui::Separator();
+        ImGui::MenuItem("API docs: docs/editor_architecture.md", nullptr, false,
+                        false);
+        if (ImGui::MenuItem("About Venn...")) m_showAbout = true;
         ImGui::EndMenu();
     }
 
-    // 右侧显示当前场景路径与"未保存"标记
-    const float rightWidth = 320.0f;
+    // 右侧显示当前场景路径 + 工作区 + "未保存"标记
+    const float rightWidth = 460.0f;
     ImGui::SameLine(ImGui::GetWindowWidth() - rightWidth);
     ImGui::TextColored(m_ctx.dirty() ? ImVec4(1.0f, 0.82f, 0.4f, 1.0f)
                                      : ImVec4(0.6f, 0.65f, 0.7f, 1.0f),
                        "%s%s", m_ctx.scenePath().c_str(),
                        m_ctx.dirty() ? " *" : "");
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.45f, 0.68f, 0.92f, 1.0f), "|  %s%s",
+                       m_ctx.workspace().currentTitle(),
+                       m_ctx.workspaceModified() ? " *" : "");
 
     ImGui::EndMainMenuBar();
 }
 
 // ---------------------------------------------------------------- 工具条
 //
-// 只剩右对齐的 Undo / Redo（Save/New/手柄模式/全屏/播放控制都已移走，
-// 见 Toolbar.h 顶部的去向说明）。
+// 从"一排按钮"变成**可折叠的工具组**。组的划分按"这个动作属于哪件事"，
+// 而不是"看起来排一排行不行"：
+//   View  —— 视口布局 + 视图模式（E07 的布局切换按钮就在这里）
+//   Build —— 重载着色器（编译期动作）
+//   Edit  —— 撤销 / 重做
+// 右键工具条切换组的显隐。
+//
+// ⚠ 刻意**不**把 Move/Rotate/Scale 和 Play 按钮搬回来：它们已经在视口
+//   工具条与视口下方的播放条上，工具栏再放一遍就是两个入口写同一份状态
+//   （本项目历史上正是因为"重复入口"把它们移走的，见 Toolbar.h 顶部）。
 
 void Toolbar::drawBar() {
     const LayoutRects& L = m_ctx.layout();
@@ -299,58 +542,214 @@ void Toolbar::drawBar() {
         return ImGui::CalcTextSize(label).x + st.FramePadding.x * 2.0f + 12.0f;
     };
 
-    // 把窗口内容宽度扣掉左右内边距，下面按它做右对齐
     const float barW = ImGui::GetWindowWidth() - pad.x * 2.0f;
     const float rowY = ImGui::GetCursorPosY();
+    const float textY = rowY + (btnH - ImGui::GetTextLineHeight()) * 0.5f;
 
-    // 左侧：当前手柄模式提示（轻量文字，不占按钮 —— 模式切换在视口工具条）
+    // ---- 左侧：当前手柄模式提示（轻量文字，不占按钮）----
     const char* modeName = "Move";
     switch (m_ctx.gizmoMode()) {
         case GizmoMode::Translate: modeName = "Move"; break;
         case GizmoMode::Rotate:    modeName = "Rotate"; break;
         case GizmoMode::Scale:     modeName = "Scale"; break;
     }
-    ImGui::SetCursorPos(ImVec2(pad.x, rowY + (btnH - ImGui::GetTextLineHeight()) * 0.5f));
+    ImGui::SetCursorPos(ImVec2(pad.x, textY));
     ImGui::TextDisabled("%s   (W / E / R)", modeName);
 
-    // ================================================================
-    // 右组：撤销 / 重做（右对齐）
-    // ================================================================
-    const float rightW = btnW("Undo") + btnW("Redo") + st.ItemSpacing.x;
-    ImGui::SetCursorPos(ImVec2(pad.x + barW - rightW, rowY));
+    // ---- 右侧：工具组（从右往左摆：Edit | Build | View）----
+    float cursorRight = pad.x + barW;
 
-    ImGui::BeginDisabled(!m_ctx.commands().canUndo());
-    if (ImGui::Button("Undo", ImVec2(btnW("Undo"), btnH))) m_ctx.undo();
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered() && m_ctx.commands().canUndo())
-        ImGui::SetTooltip("Undo: %s  (Ctrl+Z)", m_ctx.commands().undoName());
+    // 单个工具组的绘制辅助：从 cursorRight 往左排 n 个按钮
+    auto groupStart = [&](float width) {
+        cursorRight -= width;
+        ImGui::SetCursorPos(ImVec2(cursorRight, rowY));
+    };
 
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!m_ctx.commands().canRedo());
-    if (ImGui::Button("Redo", ImVec2(btnW("Redo"), btnH))) m_ctx.redo();
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered() && m_ctx.commands().canRedo())
-        ImGui::SetTooltip("Redo: %s  (Ctrl+Y)", m_ctx.commands().redoName());
+    // ---------- Edit 组 ----------
+    if (m_groups.transform) {
+        const float w = btnW("Undo") + btnW("Redo") + st.ItemSpacing.x;
+        groupStart(w);
+        ImGui::BeginDisabled(!m_ctx.commands().canUndo());
+        if (ImGui::Button("Undo", ImVec2(btnW("Undo"), btnH))) m_ctx.undo();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(m_ctx.commands().canUndo()
+                                  ? "Undo: %s  (Ctrl+Z)"
+                                  : "Nothing to undo  (Ctrl+Z)",
+                              m_ctx.commands().undoName());
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!m_ctx.commands().canRedo());
+        if (ImGui::Button("Redo", ImVec2(btnW("Redo"), btnH))) m_ctx.redo();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(m_ctx.commands().canRedo()
+                                  ? "Redo: %s  (Ctrl+Y)"
+                                  : "Nothing to redo  (Ctrl+Y)",
+                              m_ctx.commands().redoName());
+        }
+        cursorRight -= st.ItemSpacing.x;   // 组间留白
+    }
+
+    // ---------- Build 组 ----------
+    if (m_groups.build) {
+        const float w = btnW("Reload Shaders");
+        groupStart(w);
+        if (ImGui::Button("Reload Shaders", ImVec2(w, btnH))) {
+            m_host.reloadShaders();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Re-scan .spv mtime now (Ctrl+Shift+R)");
+        }
+        cursorRight -= st.ItemSpacing.x;
+    }
+
+    // ---------- View 组：视口布局 + 视图模式 ----------
+    if (m_groups.view) {
+        const char* layoutNames[4] = {"1", "2V", "2H", "4"};
+        const int curLayout = m_host.currentViewportLayout();
+        float w = 0.0f;
+        for (int i = 0; i < viewportLayoutCount() && i < 4; ++i) {
+            w += btnW(layoutNames[i]) + st.ItemSpacing.x;
+        }
+        w += btnW("View: Lit") + st.ItemSpacing.x;
+        groupStart(w);
+
+        // 视图模式下拉
+        {
+            char label[64];
+            std::snprintf(label, sizeof(label), "View: %s",
+                          render::Renderer::viewModeName(
+                              static_cast<render::Renderer::ViewMode>(
+                                  m_host.currentViewMode())));
+            if (ImGui::Button(label, ImVec2(btnW(label), btnH))) {
+                ImGui::OpenPopup("##viewmode_popup");
+            }
+            if (ImGui::BeginPopup("##viewmode_popup")) {
+                drawViewModeMenu();
+                ImGui::EndPopup();
+            }
+        }
+
+        ImGui::SameLine();
+        for (int i = 0; i < viewportLayoutCount() && i < 4; ++i) {
+            const auto l = static_cast<ViewportLayout>(i);
+            const bool on = (i == curLayout);
+            if (on) {
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                                      ImVec4(0.24f, 0.42f, 0.62f, 1.0f));
+            }
+            if (ImGui::Button(layoutNames[i], ImVec2(btnW(layoutNames[i]), btnH))) {
+                m_host.applyViewportLayout(i);
+            }
+            if (on) ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Viewport layout: %s", viewportLayoutName(l));
+            }
+            ImGui::SameLine();
+        }
+        cursorRight -= st.ItemSpacing.x;
+    }
+
+    // ---- 右键：切换工具组显隐 ----
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        ImGui::OpenPopup("##toolbar_groups");
+    }
+    if (ImGui::BeginPopup("##toolbar_groups")) {
+        ImGui::SeparatorText("Toolbar groups");
+        ImGui::MenuItem("Edit (Undo/Redo)", nullptr, &m_groups.transform);
+        ImGui::MenuItem("Build", nullptr, &m_groups.build);
+        ImGui::MenuItem("View (layout / view mode)", nullptr, &m_groups.view);
+        ImGui::EndPopup();
+    }
 
     ImGui::End();
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor();
 }
 
-// 工具栏里的一条竖分隔（比 TextUnformatted("|") 更像 UE5 的分组线）
-void Toolbar::toolbarSeparator() {
-    const float h = 22.0f;
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const float y0 = p.y + (ImGui::GetFrameHeight() - h) * 0.5f;
-    ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x + 4.0f, y0),
-                                        ImVec2(p.x + 4.0f, y0 + h),
-                                        IM_COL32(84, 88, 96, 200), 1.0f);
-    ImGui::Dummy(ImVec2(9.0f, 0.0f));
+// ---------------------------------------------------------------- 帮助窗口
+
+void Toolbar::drawAboutWindow() {
+    if (m_showAbout) {
+        ImGui::OpenPopup("About Venn");
+        m_showAbout = false;
+    }
+    if (ImGui::BeginPopupModal("About Venn", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Venn Engine  %s", m_host.engineVersion());
+        ImGui::Separator();
+        ImGui::Text("GPU: %s", m_host.gpuName());
+        ImGui::Text("Backend: Vulkan 1.2");
+        ImGui::Text("Renderer: clustered forward+ / MSAA / Hi-Z / cascaded "
+                    "shadows");
+        ImGui::Text("Editor build: %s %s", __DATE__, __TIME__);
+        ImGui::Separator();
+        ImGui::TextDisabled("docs/editor_roadmap.md is the live task list.");
+        if (ImGui::Button("Close", ImVec2(120.0f, 0.0f))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 }
+
+void Toolbar::drawShortcutReference() {
+    if (!m_showShortcuts) return;
+
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 520.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(220.0f, 120.0f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Shortcut Reference", &m_showShortcuts)) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::TextWrapped("Roughly what a 3A editor needs; the panel list below "
+                       "is generated from the panel registry, so it can never "
+                       "go stale.");
+    ImGui::SeparatorText("Panels (from the registry)");
+    {
+        const PanelDesc* t = panelTable();
+        const int n = panelCount();
+        for (int i = 0; i < n; ++i) {
+            ImGui::Text("%-10s %s",
+                        (t[i].shortcut && t[i].shortcut[0]) ? t[i].shortcut : "-",
+                        t[i].title);
+        }
+    }
+
+    ImGui::SeparatorText("Workspaces");
+    for (int i = 0; i < kWorkspaceCount; ++i) {
+        char chord[32];
+        std::snprintf(chord, sizeof(chord), "Ctrl+Alt+%d", i + 1);
+        ImGui::Text("%-12s %-10s %s", chord, kWorkspaces[i].title,
+                    kWorkspaces[i].hint);
+    }
+
+    ImGui::SeparatorText("Layout");
+    ImGui::Text("%-12s %s", "Shift+Space", "maximize the panel under the mouse");
+    ImGui::Text("%-12s %s", "dbl-click", "collapse / expand a splitter");
+    ImGui::Text("%-12s %s", "right-click", "splitter ratio presets");
+
+    ImGui::SeparatorText("Edit / File");
+    ImGui::Text("%-12s %s", "Ctrl+Z/Y", "undo / redo");
+    ImGui::Text("%-12s %s", "Ctrl+D", "duplicate selection");
+    ImGui::Text("%-12s %s", "Ctrl+S", "save scene");
+    ImGui::Text("%-12s %s", "Ctrl+N", "new scene");
+    ImGui::Text("%-12s %s", "Del", "delete selection");
+    ImGui::Text("%-12s %s", "F2", "rename (Hierarchy)");
+    ImGui::Text("%-12s %s", "F11", "window fullscreen");
+
+    ImGui::End();
+}
+
+// ---------------------------------------------------------------- 入口
 
 void Toolbar::draw() {
     drawMenuBar();
     drawBar();
+    drawAboutWindow();
+    drawShortcutReference();
 }
 
 } // namespace editor

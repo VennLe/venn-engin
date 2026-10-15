@@ -1,0 +1,552 @@
+#version 450
+// ============================================================
+// particle_sim.comp —— GPU 粒子模拟（R6-1）
+//
+// 一个 dispatch 干四件事，**每个槽位一个线程**：
+//
+//   ① 推进：age += dt；活着就积分（重力 + 解析阻尼 + 力 + 湍流噪声 +
+//      速度曲线 + 轨道/径向 + 限速）并更新位置、旋转。
+//   ② 判死：age >= 寿命 → velLife.w = -1（用"负年龄"当死亡标记，
+//      判定与读取是同一份数据，不可能出现"标记说活着、年龄是垃圾"）。
+//   ③ 出生：**槽位自己的相位**决定本帧该不该发（见下面的推导）；
+//      burst 由 (t-dt, t] 区间里有没有命中爆发时刻决定。
+//   ④ 曲线求值：尺寸 / 透明度 / 颜色（渐变带）。
+//   ⑤ 紧凑化：活着的粒子用 atomicAdd 挤进两类 alive[] 表
+//      （加色 / Alpha 各一张，因为混合模式是管线的固定状态，
+//        一次 draw 只能有一种）。
+//
+// ---- 为什么"每槽位一个相位"（本文件里最值得看的一段）----
+//
+// 常见的写法是"本帧该发 n 颗，就往前 n 个空位写"。那要求先算出 n
+// （CPU 算，或者一个串行 dispatch），再分配下标；而且槽位的复用顺序与
+// rate 强耦合，改 rate 会让画面整体跳变。
+//
+// 这里换个角度：**把每个槽位看成一个独立的周期性发射点**。
+//
+//     period = capacity / rate                     ← 一个槽位的完整周期
+//     槽位 j 的发射时刻 = (k + (j + 0.5) / capacity) * period , k = 0,1,2,…
+//
+// 于是"本帧该不该发"就是"区间 (t-dt, t] 里有没有整数 k" ——
+// 两次 floor 就能判定，不需要任何跨线程通信：
+//
+//     k     = floor((t        - offset) / period)
+//     kPrev = floor((t - dt   - offset) / period)
+//     该发  ⟺  k > kPrev 且 k >= 0
+//
+// 这个式子带来三个性质，都是本任务想要的：
+//   · **与帧率无关**：dt 变化只是改变了"本帧命中几个槽位"，总发射率不变；
+//   · **完全确定**：给定步号与容量，任一槽位的状态可复现 —— 验证脚本的
+//     "两次运行逐像素一致"（配 MYVK_FX_FREEZE 冻结帧）就靠它；
+//   · **时间上均匀**：相邻槽位差 period/capacity，所以任意时刻的发射
+//     都是均匀的，不会出现"一帧发一大批"的脉冲。
+//
+// 代价：每个槽位的**首次**发射时刻不同 → 前 lifetime 秒是"渐入"的
+// （容量 512、rate 120 时大约 1.8 秒填满）。这恰好与真实喷泉的起势一致，
+// 所以不视为缺陷。
+//
+// Rate over Distance 用**完全同构**的推导，只是把参数从"时间"换成
+// "累积距离"：periodDist = capacity / rateOverDistance，判据里的 t 换成
+// s（CPU 每帧把发射器累积走过的距离写进 Emitter.dist）。
+//
+// ---- 时间轴：duration / looping / startDelay / prewarm ----
+//   tLocal = t - startDelay
+//   duration = 0        → 一条无限长的直线（默认，与 v1 逐位一致）
+//   duration > 0 & loop → 折回 tCycle = mod(tLocal, duration)
+//   duration > 0 & !loop→ tLocal >= duration 之后不再发射
+// 连续发射的相位用 tCycle 计算（每一轮重新"渐入"），跨轮的那一步把
+// tCyclePrev 当作 0（本轮刚开始，谁都没发过）。burst 用同样的区间判据。
+//
+// ---- ⚠ 默认路径必须逐位不变 ----
+// 本文件里每一个新模块都挂在一个"默认关"的条件上，而且新分支**不改变
+// 原有表达式的求值**（比如 arc = 360 时直接用 v1 的 `hash * 2π`，不做
+// 任何角度重映射）—— 否则"默认值 = 老行为"就只是口号，冻结帧验证会
+// 在肉眼看不出的地方失败。
+//
+// ---- 池耗尽 ----
+// rate × lifetime > capacity 时槽位会被**提前**复用（还没死就被重新发射）
+// → 画面上的表现是粒子中途"跳"到新的出生点。CPU 侧检测到这个条件会打
+// 一行 WARN（见 Renderer::collectParticleEmitters）。
+// ============================================================
+
+#include "particle_common.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer EmitterBuf {
+    Emitter emitters[];
+};
+
+layout(std430, set = 0, binding = 1) buffer ParticleBuf {
+    Particle particles[];
+};
+
+// 紧凑表：[0] 加色 [1] Alpha。两段各 capacity() 个槽位。
+layout(std430, set = 0, binding = 2) buffer AliveBuf {
+    uint alive[];
+};
+
+// [0] = 加色存活数  [1] = Alpha 存活数  [2] = 本帧发射数  [3] = 保留
+// ⚠ 必须由 CPU 在录制前清零（见 ParticleSystem::upload）。
+layout(std430, set = 0, binding = 3) buffer CounterBuf {
+    uint counters[];
+};
+
+layout(push_constant) uniform SimPC {
+    // x = dt（秒）—— **本槽自上次模拟以来经过的时间**，不是单帧 dt。
+    //     池按 frame-in-flight 槽分开（两帧可能同时在 GPU 上），所以每个
+    //     槽每 framesInFlight 帧才被派发一次；x 就是用来补上那些漏掉的
+    //     时间步的。传单帧 dt 会让模拟以 1/framesInFlight 的速度爬行，
+    //     而且**看不出来**（粒子只是慢慢地飘）。0 = 本帧一步都没推进
+    //     （渲染帧率高于 simHz 时的常态），此时只重建紧凑表。
+    // y = 模拟时刻（秒）z = 模拟步号 w = 发射器数
+    vec4 timing;
+    // x = 每发射器容量 y = 总槽数 z, w = 保留
+    vec4 pool;
+} pc;
+
+layout(local_size_x = 64) in;
+
+// ---------------------------------------------------------------- 角度
+//
+// arc / shapeRotation 的统一入口。
+//
+// ⚠ arc >= 360（默认）时**必须**退化成 v1 的 `hash * 2π` —— 而不是
+//   "先算 hash*arcRad 再减 arcRad/2"。后者在 arc=360 时等价于把整圈
+//   旋转 π，分布一样但每颗粒子拿到的角度不同 → 位置全变 → 冻结帧
+//   验证逐像素比较会失败。所以这里显式分两条路。
+float fxAngle(const Emitter em, const uint seed, const uint salt) {
+    const float arc = em.emit2.z;
+    if (arc >= 360.0) {
+        return fxHash01(seed ^ salt) * 6.28318530718;
+    }
+    const float arcRad = radians(clamp(arc, 1.0, 360.0));
+    const float a0 = radians(em.emit2.x) - arcRad * 0.5;
+    return a0 + fxHash01(seed ^ salt) * arcRad;
+}
+
+// 把 (x,y) 的方向换到 arc 扇区里（只给 Box 用 —— 其它形状本来就在
+// 极坐标下采样，直接用 fxAngle 即可）。返回旋转后的 xy。
+vec2 fxArcRemapXY(const Emitter em, const vec2 xy) {
+    const float arc = em.emit2.z;
+    if (arc >= 360.0) return xy;
+    const float r = length(xy);
+    if (r < 1e-6) return xy;
+    const float arcRad = radians(clamp(arc, 1.0, 360.0));
+    const float a0 = radians(em.emit2.x) - arcRad * 0.5;
+    const float a = a0 + mod(atan(xy.y, xy.x) + 6.28318530718, arcRad);
+    return vec2(cos(a), sin(a)) * r;
+}
+
+// ---------------------------------------------------------------- 出生
+//
+// 形状采样（发射器局部空间）。返回局部偏移。
+//
+// emitFrom 决定"在体积里 / 只在棱上 / 只在面上"：
+//   Volume → v1 的行为（Box 直接用均匀体采样；Cone/Circle 用 sqrt 取面积均匀）
+//   Shell  → 只在表面（球壳 / 盒面）
+//   Edge   → 只在"棱"上（盒的棱 / 锥的底圈 / 线段的两端）
+// radiusThickness 只对 Volume 有意义（1 = 实心，0 = 贴着表面/边缘）。
+vec3 fxSampleShape(const Emitter em, const uint seed) {
+    const int kind = int(em.emit.z + 0.5);
+    const int from = int(em.emit.w + 0.5);
+    const float R = em.origin.w;
+    const float thick = clamp(em.emit2.y, 0.0, 1.0);
+
+    if (kind == FX_SHAPE_BOX) {
+        vec3 u = fxHash31(seed) * 2.0 - 1.0;
+        if (from == FX_EMIT_SHELL) {
+            // 面上：随机挑一个轴推到 ±1
+            const int face = int(fxHash01(seed ^ 43u) * 3.0);
+            u[face] = (fxHash01(seed ^ 47u) < 0.5) ? -1.0 : 1.0;
+        } else if (from == FX_EMIT_EDGE) {
+            const int a1 = int(fxHash01(seed ^ 43u) * 3.0);
+            const int a2 = (a1 + 1 + int(fxHash01(seed ^ 53u) * 2.0)) % 3;
+            u[a1] = (fxHash01(seed ^ 47u) < 0.5) ? -1.0 : 1.0;
+            u[a2] = (fxHash01(seed ^ 59u) < 0.5) ? -1.0 : 1.0;
+        } else if (thick < 1.0) {
+            // 体积但收薄：把点朝中心拉（thick = 1 时不动 → 与 v1 逐位一致）
+            u *= thick;
+        }
+        u.xy = fxArcRemapXY(em, u.xy);
+        return u * em.shapeExtents.xyz;
+    }
+
+    if (kind == FX_SHAPE_SPHERE || kind == FX_SHAPE_HEMISPHERE) {
+        // 球内**均匀**：方向取单位球面，半径取 u^(1/3)
+        // （直接用 u 会让点全挤在球心附近，这是经典的取样错误）
+        vec3 d = normalize(fxHash31(seed) * 2.0 - 1.0 + vec3(1e-5));
+        if (kind == FX_SHAPE_HEMISPHERE && d.z < 0.0) d.z = -d.z;
+        float rr = R;
+        if (from == FX_EMIT_VOLUME) {
+            rr = R * pow(fxHash01(seed ^ 7u), 1.0 / 3.0);
+            if (thick < 1.0) {
+                rr = mix(R * (1.0 - thick), R, rr / max(R, 1e-6));
+            }
+        }
+        // 扇区限制：只动 xy 的方向（球面上"绕 +Z 的扇区"）
+        if (em.emit2.z < 360.0) {
+            const float len = length(d.xy);
+            if (len > 1e-5) {
+                const float a = fxAngle(em, seed, 11u);
+                d.xy = vec2(cos(a), sin(a)) * len;
+            }
+        }
+        return d * rr;
+    }
+
+    if (kind == FX_SHAPE_CONE || kind == FX_SHAPE_CIRCLE) {
+        // 底面圆盘上均匀取点（半径取 sqrt(u) 才是面积均匀）
+        const float ang = fxAngle(em, seed, 11u);
+        float rr = R * sqrt(fxHash01(seed ^ 13u));
+        if (from != FX_EMIT_VOLUME) {
+            rr = R;                       // Edge / Shell 都落在底圈的边上
+        } else if (thick < 1.0) {
+            rr *= thick;
+        }
+        return vec3(cos(ang) * rr, sin(ang) * rr, 0.0);
+    }
+
+    if (kind == FX_SHAPE_EDGE) {
+        // 一条线段：沿局部 X，长度 = 2R
+        const float u = (from == FX_EMIT_VOLUME)
+                            ? (fxHash01(seed ^ 17u) * 2.0 - 1.0) * thick
+                            : (fxHash01(seed ^ 17u) < 0.5 ? -1.0 : 1.0);
+        return vec3(u * R, 0.0, 0.0);
+    }
+
+    return vec3(0.0);  // FX_SHAPE_POINT
+}
+
+// 方向采样（发射器局部空间）：沿 +Z 的锥，半角由 shapeExtents.w
+// （= cos(spread)）给出。
+//
+// 用 cos 而不是角度：均匀取 cos θ 才能在球面上**面积均匀**，
+// 取 θ 均匀会让粒子聚在锥轴附近。
+vec3 fxSampleDir(const Emitter em, const uint seed) {
+    const float cosMax = em.shapeExtents.w;
+    const float ct = mix(cosMax, 1.0, fxHash01(seed ^ 17u));
+    const float st = sqrt(max(0.0, 1.0 - ct * ct));
+    const float phi = fxHash01(seed ^ 19u) * 6.28318530718;
+    return vec3(st * cos(phi), st * sin(phi), ct);
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint total = uint(pc.pool.y);
+    if (gid >= total) return;
+
+    const uint cap = uint(pc.pool.x);
+    const uint e = gid / cap;             // 所属发射器
+    const uint j = gid % cap;             // 该发射器内的槽位号
+    const float dt = pc.timing.x;
+    const float t = pc.timing.y;
+
+    // 发射器数之外的槽位：直接标死。这样"删掉一个发射器"不会留下
+    // 一批永远停在最后状态的粒子（它们会立刻从紧凑表里消失）。
+    if (float(e) >= pc.timing.w) {
+        Particle dead;
+        dead.posSize = vec4(0.0);
+        dead.velLife = vec4(0.0, 0.0, 0.0, -1.0);
+        dead.color = vec4(0.0);
+        dead.misc = vec4(0.0);
+        dead.extra = vec4(0.0);
+        particles[gid] = dead;
+        return;
+    }
+
+    // ⚠ 池子的初值必须是**全零**（见 ParticleSystem::createFrame 的
+    //   vkCmdFillBuffer）：零 → velLife.w = 0 且 misc.x = 0 →
+    //   "age = dt >= 寿命 0" 立刻判死。若初值是未定义的垃圾，第一帧
+    //   就会冒出一批位置/颜色全是垃圾的粒子（DEVICE_LOCAL 内存不清零）。
+
+    const Emitter em = emitters[e];
+    const uint blend = uint(em.miscParams.y + 0.5);   // 0 = 加色 1 = Alpha
+    // ⚠ 段长按**总槽数**算，不是按每发射器容量：maxEmitters 个发射器的
+    //   加色粒子全挤进同一张表，用 cap 会让第 2 个发射器的粒子被
+    //   `slot < cap` 挡掉（表现为"只有第一个发射器画得出来"）。
+    //   总槽数是个天然的上界：一共就 total 个线程，每个最多加 1 次。
+    const uint listBase = blend * total;
+
+    const bool localSpace = (int(em.emit2.w + 0.5) == FX_SPACE_LOCAL);
+    const int shapeKind = int(em.emit.z + 0.5);
+
+    // ---------------------------------------------------------- 时间轴
+    const float startDelay = max(em.play.w, 0.0);
+    const float duration = max(em.play.x, 0.0);
+    const bool looping = em.play.y > 0.5;
+
+    const float tLocal = t - startDelay;
+    const float tPrevLocal = tLocal - dt;
+
+    bool emitWindow = (tLocal >= 0.0);
+    float tCycle = tLocal;
+    float tCyclePrev = tPrevLocal;
+    bool cycleRestart = false;   // 本步跨了一轮的边界
+    if (duration > 0.0) {
+        if (looping) {
+            const float cNow = mod(tLocal, duration);
+            const float cPrev =
+                (tPrevLocal < 0.0) ? -1.0 : mod(tPrevLocal, duration);
+            cycleRestart = (cNow < cPrev) || (tPrevLocal < 0.0);
+            tCycle = max(cNow, 0.0);
+            // 跨轮 → 上一刻当作"本轮第 0 秒"（谁都没发过）
+            tCyclePrev = cycleRestart ? 0.0 : cNow - dt;
+        } else {
+            emitWindow = emitWindow && (tLocal <= duration);
+        }
+    }
+
+    // ---------------------------------------------------------- 逐粒子状态
+    Particle p = particles[gid];
+
+    bool doSpawn = false;
+    float spawnSlot = 0.0;
+
+    // ---------------------------------------------------------- ① 推进
+    if (p.velLife.w >= 0.0) {
+        const float agePrev = p.velLife.w;
+        const float age = agePrev + dt;
+        if (age >= p.misc.x) {
+            p.velLife.w = -1.0;          // 超过寿命 → 死
+        } else {
+            const float uPrev = clamp(agePrev / max(p.misc.x, 1e-4), 0.0, 1.0);
+            vec3 v = p.velLife.xyz;
+            vec3 r = p.posSize.xyz;
+            // 「相对发射器中心」的位置 —— 轨道与径向速度都绕它转。
+            // Local 空间下位置本来就是相对的，World 空间下要减掉原点。
+            const vec3 rel = localSpace ? r : (r - em.origin.xyz);
+
+            // 阻尼用**解析积分**而不是 v *= (1 - drag*dt)：后者在
+            // drag*dt 接近 1 时会翻转速度符号（低帧率下能看见）。
+            // exp(-drag*dt) 恒正，任何 dt 都稳。
+            const float damp = exp(-em.gravityDrag.w * dt);
+
+            // ---- 加速度：重力（+ 力）----
+            vec3 g = localSpace ? em.shapeAux.xyz : em.gravityDrag.xyz;
+            if (em.force.w != 0.0) {
+                // 逐粒子随机化用 extra.w（出生时定的 [-1,1] 值）
+                g += em.force.xyz * (1.0 + em.force.w * p.extra.w);
+            }
+            v = v * damp + g * dt;
+
+            // ---- Velocity over Lifetime：轴向曲线 ----
+            const vec3 add = vec3(fxCurve4(em.velX, uPrev),
+                                  fxCurve4(em.velY, uPrev),
+                                  fxCurve4(em.velZ, uPrev));
+            // 非零才做后面的变换 —— 默认（全 0 曲线）时一行都不多做。
+            if (dot(add, add) > 0.0) {
+                if (em.noiseB.z > 0.5 && localSpace) {
+                    // 世界空间的曲线要换到局部空间再加
+                    v += inverse(mat3(em.world)) * add;
+                } else {
+                    v += add;
+                }
+            }
+
+            // ---- 轨道：绕三轴的角速度 ω，作用在相对位置上 ----
+            // v += ω × r 是"小角度旋转"的等价速度，积分一步后
+            // 位置正好转过 ω·dt。用 atan2 的自由旋转会让"相对位置"跟着
+            // 一起转，所以这里只在速度上加，位置由 ① 统一积分。
+            const vec3 omega = radians(em.orbital.xyz);
+            if (dot(omega, omega) > 0.0) {
+                vec3 rr = rel;
+                if (em.orbital.w > 0.0) {
+                    const float len = length(rel);
+                    rr = (len > 1e-4 ? rel / len : vec3(1.0, 0.0, 0.0)) *
+                         em.orbital.w;
+                }
+                v += cross(omega, rr);
+            }
+
+            // ---- 径向速度：正 = 从中心向外 ----
+            if (em.limitVel.w != 0.0) {
+                const float len = length(rel);
+                if (len > 1e-4) v += (rel / len) * em.limitVel.w;
+            }
+
+            // ---- 速度倍率曲线 ----
+            if (em.shapeAux.w > 0.5) {
+                v *= max(fxCurve4(em.speedMod, uPrev), 0.0);
+            }
+
+            // ---- 湍流噪声 ----
+            if (em.noiseB.x > 0.5) {
+                const vec3 sp = r * max(em.noiseA.y, 1e-4) +
+                                vec3(t * em.noiseA.z) +
+                                vec3(p.extra.w * 13.7);
+                v += fxTurbulence(sp, int(em.noiseB.y + 0.5)) * em.noiseA.x * dt;
+                if (em.noiseA.w > 0.0) v *= exp(-em.noiseA.w * dt);
+            }
+
+            // ---- Limit Velocity over Lifetime ----
+            if (em.limitVel.z > 0.5) {
+                const float sp = length(v);
+                const float lim = max(em.limitVel.x, 0.0);
+                if (sp > lim) {
+                    const float k = max(em.limitVel.y, 0.0);
+                    // dampen = 0 → 直接夹到上限；> 0 → 逐帧逼近上限
+                    const float target = (k > 0.0)
+                        ? mix(sp, lim, clamp(k * dt, 0.0, 1.0))
+                        : lim;
+                    v *= target / max(sp, 1e-6);
+                }
+            }
+
+            p.velLife.xyz = v;
+            p.posSize.xyz = r + v * dt;
+            p.velLife.w = age;
+
+            // ---- Rotation over Lifetime ----
+            if (em.rot.z != 0.0) {
+                p.extra.x += em.rot.z * (1.0 + em.rot.w * p.extra.w) * dt;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- ② 出生判定
+    if (emitWindow) {
+        // ---- 连续发射（时间）----
+        if (em.emit.x > 0.0 && dt > 0.0) {
+            const float period = float(cap) / em.emit.x;
+            const float phase = (float(j) + 0.5) / float(cap) * period;
+            const float k = floor((tCycle - phase) / period);
+            const float kPrev = floor((tCyclePrev - phase) / period);
+            if (k > kPrev && k >= 0.0) {
+                doSpawn = true;
+                spawnSlot = k;
+            }
+        }
+        // ---- 连续发射（距离）----
+        // 与时间版完全同构：把 t 换成"发射器累积走过的距离 s"。
+        // dist.x / dist.y 是 CPU 每帧算好的累积距离（本帧 / 上一帧）。
+        if (em.emit.y > 0.0) {
+            const float sNow = em.dist.x;
+            const float sPrev = em.dist.y;
+            if (sNow > sPrev) {
+                const float periodD = float(cap) / em.emit.y;
+                const float phase = (float(j) + 0.5) / float(cap) * periodD;
+                const float k = floor((sNow - phase) / periodD);
+                const float kPrev = floor((sPrev - phase) / periodD);
+                if (k > kPrev && k >= 0.0) {
+                    if (!doSpawn) {
+                        doSpawn = true;
+                        // +0.5 的偏移让"距离版第 k 代"与"时间版第 k 代"
+                        // 拿到不同的随机种子（见下面的种子编码）。
+                        spawnSlot = k + 0.5;
+                    }
+                }
+            }
+        }
+        // ---- Bursts ----
+        // 每条 burst 在 tCycle 轴上有一个（或 cycles 个）触发时刻，
+        // 判据同连续发射：时刻落在 (tCyclePrev, tCycle] 里就发。
+        // ⚠ 多个 burst 在同一步同时命中时**只有第一条生效**（一个槽位
+        //   一步最多生一颗）—— 这是刻意的：真正的"一次发 N 颗"由每条
+        //   burst 自己的 count 负责（那是按槽位号 j 分摊的）。
+        const int nBurst = int(em.renderMisc.w + 0.5);
+        for (int b = 0; b < 4; ++b) {
+            if (b >= nBurst) break;
+            const vec4 bd = em.bursts[b];
+            if (bd.y <= 0.0) continue;
+            const int cycles = max(1, int(bd.z + 0.5));
+            for (int c = 0; c < 4; ++c) {
+                if (c >= cycles) break;
+                const float ev = max(bd.x, 0.0) + float(c) * bd.w;
+                const bool hit = (ev > tCyclePrev && ev <= tCycle) ||
+                                 (cycleRestart && ev <= tCycle);
+                if (hit && float(j) < bd.y && !doSpawn) {
+                    doSpawn = true;
+                    // 代号落在 [0.5, 1.0) 这一段（见种子编码），
+                    // 与连续发射的 [2, ∞) 完全分开。
+                    spawnSlot = -1.0 - (float(b * 4 + c) + 1.0) / 32.0;
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- ③ 出生
+    if (doSpawn) {
+        // 种子 = (槽位, 第几次出生)。**不用步号** —— 步号会让同一个槽位
+        // 的连续两次出生拿到完全不同的随机量，看起来像"每颗都不一样"，
+        // 但其实"同一 slot 的同一代"在两次运行里必须逐位一致，
+        // 用 (slot, generation) 是最小且充分的键。
+        //
+        // spawnSlot 的编码（乘 1024 抹掉小数，取整后必须是**互不相同**的
+        // 整数，且不能为负 —— 负数 float 转 uint 在 GLSL 里是未定义行为）：
+        //   时间版第 k 代 → k + 2        → 2048, 3072, …
+        //   距离版第 k 代 → k + 2.5      → 2560, 3584, …（与上面错开）
+        //   burst 第 n 条 → 1 - (n+1)/32 → 992, 960, …（n = 0..15）
+        // 三者两两不重叠，且全都 ≥ 0.5。
+        const float gen = spawnSlot + 2.0;
+        const uint seed = fxHash(gid * 9781u +
+                                 uint(max(gen, 0.0) * 1024.0) *
+                                     2654435761u +
+                                 1u);
+        const vec3 lp = fxSampleShape(em, seed);
+        const vec3 dirLocal = fxSampleDir(em, seed);
+
+        const float spd =
+            max(0.0, em.lifeSpeed.z *
+                         (1.0 + (fxHash01(seed ^ 23u) * 2.0 - 1.0) *
+                                    em.lifeSpeed.w));
+        const float life =
+            max(0.05, em.lifeSpeed.x *
+                          (1.0 + (fxHash01(seed ^ 29u) * 2.0 - 1.0) *
+                                     em.lifeSpeed.y));
+
+        if (localSpace) {
+            // Local：位置与速度都留在发射器局部空间，顶点着色器再用
+            // Emitter.world 变到世界。好处是"发射器移动 / 旋转"自动带着
+            // 粒子走（火把、车尾灯的拖尾），不需要 CPU 去动每个粒子。
+            p.posSize = vec4(lp, 0.0);
+            p.velLife = vec4(dirLocal * spd, 0.0);
+        } else {
+            p.posSize = vec4((em.world * vec4(lp, 1.0)).xyz, 0.0);
+            // mat3(world) 含缩放 → 必须归一化，否则"缩放发射器"会顺带改速度
+            const vec3 dir =
+                normalize(mat3(em.world) * dirLocal + vec3(1e-6));
+            p.velLife = vec4(dir * spd, 0.0);
+        }
+        p.misc = vec4(life, float(seed & 0xFFFFu) / 65535.0, 0.0, float(e));
+
+        // 初始旋转（度）—— Rotation over Lifetime 的起点
+        p.extra = vec4(em.rot.x + (fxHash01(seed ^ 31u) * 2.0 - 1.0) * em.rot.y,
+                       localSpace ? 1.0 : 0.0,
+                       0.0,
+                       fxHash01(seed ^ 37u) * 2.0 - 1.0);
+
+        // 计数：本帧发射数（GPU 侧的观测量，验证脚本读它）
+        atomicAdd(counters[2], 1u);
+    }
+
+    // ---------------------------------------------------------- ④ 曲线求值
+    // 出生和推进都在这里统一算 —— **一份实现**，不可能出现"刚出生的
+    // 粒子用了上一帧的颜色"这类分歧。
+    if (p.velLife.w >= 0.0) {
+        const float u = clamp(p.velLife.w / max(p.misc.x, 1e-4), 0.0, 1.0);
+        const vec3 rgb =
+            fxRampEval(em.ramp, int(em.renderMisc.z + 0.5), u);
+        p.color =
+            vec4(rgb * em.miscParams.w, max(fxCurve4(em.alphaCurve, u), 0.0));
+        p.posSize.w = max(fxCurve4(em.sizeCurve, u) * em.miscParams.x, 0.0);
+        // 拉伸长度（米）：0 = 纯 billboard
+        p.misc.z = length(p.velLife.xyz) * em.miscParams.z;
+    } else {
+        p.color = vec4(0.0);
+        p.posSize.w = 0.0;
+        p.misc.z = 0.0;
+    }
+
+    particles[gid] = p;
+
+    // ---------------------------------------------------------- ⑤ 紧凑化
+    // 活着的粒子挤进它那一类 alive 表。**顺序无关**（加色与顺序无关；
+    // Alpha 用槽位顺序近似），所以一次 atomicAdd 就够，不需要前缀和。
+    // 需要真正排序时由 particle_histo / particle_scatter 两趟再做一次
+    // 桶排序 —— 那两趟只在 Sort Mode != None 时录。
+    if (p.velLife.w >= 0.0) {
+        const uint slot = atomicAdd(counters[blend], 1u);
+        // 防御：理论上前者不会超过 total（每个线程至多加 1，共 total 个
+        // 线程），但越界写是"验证层不报错、画面随机崩"的那类 bug，
+        // 宁可多一个判断。
+        if (slot < total) alive[listBase + slot] = gid;
+    }
+}

@@ -26,7 +26,8 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from capture_window import capture_client, find_window, user32   # noqa: E402
+from capture_window import (capture_client, capture_nonempty, find_window,
+                            user32)                                # noqa: E402
 from verify_asset_drag import client_to_screen, force_foreground, move_to  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -238,9 +239,14 @@ def main():
         if vp:
             move_to(hwnd, (vp[0] + vp[2]) // 2, vp[1] + 40)   # 挪开，别挡 tooltip
         time.sleep(0.6)
-        img, ok = capture_client(hwnd)
-        img.save(args.out)
-        print("截图 ok=%s -> %s" % (ok, args.out))
+        # 存档截图（不参与断言）—— 用非空抓图，窗口偶尔还没铺开（0×0），
+        # 直接 save 会抛 "cannot write empty image" 把整个脚本崩掉。
+        img = capture_nonempty(hwnd)
+        if img is None:
+            print("截图失败（窗口未铺开）—— 跳过存档")
+        else:
+            img.save(args.out)
+            print("截图 -> %s" % args.out)
 
         print()
         if fails:

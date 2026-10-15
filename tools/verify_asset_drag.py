@@ -42,10 +42,11 @@ MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 
 RECT_RE = re.compile(
-    r"(CB-CELL [^=]+|VP-RECT|HIER-RECT row0)"
+    r"(CB-CELL [^=]+|VP-RECT|HIER-RECT row0|HIER-RECT drop)"
     r"=\((-?\d+),(-?\d+)\)-\((-?\d+),(-?\d+)\)"
 )
 ALIGN_RE = re.compile(r"alignImportToGround: box.min.z=(-?[\d.]+) -> bottom=(-?[\d.]+)")
+HIER_IMPORT_RE = re.compile(r"HIER-IMPORT rel=(.+?) count=(\d+)")
 
 
 class LogTap:
@@ -56,6 +57,7 @@ class LogTap:
         self.rects = {}          # tag -> (x0, y0, x1, y1)
         self.lines = []
         self.align = None        # (min_z, bottom_z)
+        self.hier_import = None       # Hierarchy 落点："(rel, count)"
         self.lock = threading.Lock()
         self.t = threading.Thread(target=self._pump, daemon=True)
         self.t.start()
@@ -72,6 +74,9 @@ class LogTap:
                 a = ALIGN_RE.search(line)
                 if a:
                     self.align = (float(a.group(1)), float(a.group(2)))
+                h = HIER_IMPORT_RE.search(line)
+                if h:
+                    self.hier_import = (h.group(1), int(h.group(2)))
 
     def rect(self, tag):
         with self.lock:
@@ -175,6 +180,9 @@ def main():
     ap.add_argument("--debug-shot", default="",
                     help="额外存一张拖到一半的截图，用来判断拖拽有没有点火")
     ap.add_argument("--size", default="1600x900")
+    ap.add_argument("--target", default="vp", choices=["vp", "hier"],
+                    help="落点面板：vp=视口（生成实体并贴地），"
+                         "hier=Hierarchy 树下方空白区")
     ap.add_argument("--env", action="append", default=[])
     args = ap.parse_args()
 
@@ -221,14 +229,23 @@ def main():
                   [t[len("CB-CELL "):] for t in list(tap.rects) if t.startswith("CB-CELL")])
             return 3
 
+        # 落点面板：视口 / Hierarchy 下方空白区（都能接住 assets 拖放）
+        drop = vp
+        if args.target == "hier":
+            drop = tap.wait_rect("HIER-RECT drop", 10.0)
+            if not drop:
+                print("拿不到 HIER-RECT drop（Hierarchy 的拖放落点）")
+                return 3
+
         sx = (cell[0] + cell[2]) // 2
         sy = (cell[1] + cell[3]) // 2
         # 落点选视口下半部、偏左一点 —— 既不压在手柄/浮层上，也和原点明显不同，
         # 这样"拖到哪儿就落在哪儿"也能一并看出来
-        tx = int(vp[0] + (vp[2] - vp[0]) * 0.34)
-        ty = int(vp[1] + (vp[3] - vp[1]) * 0.74)
+        tx = int(drop[0] + (drop[2] - drop[0]) * 0.34)
+        ty = int(drop[1] + (drop[3] - drop[1]) * 0.74)
 
-        print("source(client)=%d,%d  target(client)=%d,%d  vp=%s" % (sx, sy, tx, ty, vp))
+        print("source(client)=%d,%d  target(client)=%d,%d  drop=%s  vp=%s"
+              % (sx, sy, tx, ty, drop, vp))
 
         print("foreground ok=%s" % force_foreground(hwnd))
         user32.SetForegroundWindow(hwnd)
@@ -266,13 +283,27 @@ def main():
         img.save(args.out)
         print("PrintWindow ok=%s size=%s -> %s" % (ok, img.size, args.out))
 
-        if tap.align:
+        ok = False
+        if args.target == "hier":
+            # Hierarchy 落点：断言走的是 HIER-IMPORT（在原点生成、贴地并选中）
+            if tap.hier_import:
+                rel, cnt = tap.hier_import
+                print("HIER-IMPORT rel=%s count=%d" % (rel, cnt))
+                print("Hierarchy 落点断言: %s (生成了 %d 个 mesh)"
+                      % ("PASS" if cnt > 0 else "FAIL", cnt))
+                ok = cnt > 0
+            else:
+                print("没有出现 HIER-IMPORT 日志 —— 拖到 Hierarchy 没生效")
+        elif tap.align:
             miny, bottom = tap.align
             print("alignImportToGround: box.min.z=%.4f bottom=%.4f" % (miny, bottom))
             print("贴地断言: %s (|bottom| < 1e-3)"
                   % ("PASS" if abs(bottom) < 1e-3 else "FAIL"))
+            ok = abs(bottom) < 1e-3
         else:
             print("没有出现 alignImportToGround 日志 —— 拖拽大概率没生效")
+
+        if not ok:
             print("最近 25 行日志：")
             for line in tap.lines[-25:]:
                 print("   ", line)

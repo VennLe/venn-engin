@@ -216,8 +216,12 @@ uint32_t BindlessTextures::materialPage(const assets::Material& mat) {
                           tex(mat.normalMap, m_defaultFlatNormal),
                           tex(mat.ormMap, m_defaultWhite),
                           tex(mat.roughnessMap, m_defaultWhite));
+    // z = 高度图（R4-3 POM）。缺省槽位用**纯黑**而不是白：白 = 处处等高
+    // → 视差射线会一路走到层数上限（退化成一个大偏移）；黑 = 处处最低
+    // → 循环立刻停下 → offset 0（"没挂高度图"的中性行为）。
     rec.tex1 = glm::uvec4(tex(mat.metallicMap, m_defaultWhite),
-                          tex(mat.emissiveMap, m_defaultBlack), 0u, 0u);
+                          tex(mat.emissiveMap, m_defaultBlack),
+                          tex(mat.heightMap, m_defaultBlack), 0u);
     m_pageMapped[m_frame][page] = rec;
 
     m_pageOf.emplace(&mat, page);

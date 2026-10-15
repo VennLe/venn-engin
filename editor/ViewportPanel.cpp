@@ -5,6 +5,7 @@
 #include "EditorScene.h"  // instantiateModel
 
 #include "render/Renderer.h"
+#include "render/FeatureRegistry.h"   // E14：视口设置直接写 grid.* 参数
 
 #include "ecs/Components.h"
 #include "physics/CollisionWorld.h"
@@ -17,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace editor {
 
@@ -473,69 +475,6 @@ void ViewportPanel::handleNavigation(bool hovered) const {
     cam.moveLocal(glm::vec3(r * speed, u * speed, f * speed));
 }
 
-// ---------------------------------------------------------------- 叠加层
-
-void ViewportPanel::drawOverlay(ImDrawList* dl, const glm::vec2& vpPos,
-                                const glm::vec2& vpSize) const {
-    (void)vpSize;
-    const ImU32 col = IM_COL32(216, 228, 240, 230);
-    const ImU32 warn = IM_COL32(255, 196, 92, 235);
-
-    const float x = vpPos.x + 10.0f;
-    float y = vpPos.y + 8.0f;
-    char buf[256];
-
-    const ImGuiIO& io = ImGui::GetIO();
-    std::snprintf(buf, sizeof(buf), "%.0f FPS   %.2f ms", io.Framerate,
-                  io.Framerate > 0.0f ? 1000.0f / io.Framerate : 0.0f);
-    dl->AddText(ImVec2(x, y), col, buf);
-    y += 17.0f;
-
-    const scene::Scene& sc = m_ctx.activeScene();
-    const scene::Scene::LightStats ls = sc.lightStats();
-    std::snprintf(buf, sizeof(buf), "entities %zu   lights %zu   %ux%u",
-                  sc.objectCount(), ls.pointLights + ls.spotLights,
-                  m_requestedW, m_requestedH);
-    dl->AddText(ImVec2(x, y), col, buf);
-    y += 17.0f;
-
-    const ecs::World& w = sc.world();
-    const std::string* nm =
-        m_ctx.hasSelection() ? w.name(m_ctx.selection()) : nullptr;
-    std::snprintf(buf, sizeof(buf), "selected: %s",
-                  nm ? nm->c_str() : "(none)");
-    dl->AddText(ImVec2(x, y),
-                nm ? col : IM_COL32(150, 158, 168, 200), buf);
-    y += 17.0f;
-
-    if (!m_ctx.isEditing()) {
-        // 视口渲染的就是**运行态副本**本身 —— 游戏画面与编辑画面共用同一条
-        // 离屏渲染链，只是相机换成了自由飞行视角。
-        // 灵敏度与操作提示在右上角的浮层里（见 drawNavHud）。
-        const char* state = m_ctx.isPaused() ? "PAUSED" : "PLAYING";
-        std::snprintf(buf, sizeof(buf), "%s  t=%.2fs%s", state,
-                      static_cast<double>(m_ctx.playTime()),
-                      m_ctx.gameFullscreen() ? "  [fullscreen]" : "");
-        dl->AddText(ImVec2(x, y), warn, buf);
-    } else {
-        std::snprintf(buf, sizeof(buf), "EDIT   gizmo: %s / %s",
-                      m_ctx.gizmoMode() == GizmoMode::Translate ? "move"
-                      : m_ctx.gizmoMode() == GizmoMode::Rotate ? "rotate"
-                                                              : "scale",
-                      m_ctx.gizmoSpace() == GizmoSpace::World ? "world"
-                                                             : "local");
-        dl->AddText(ImVec2(x, y), col, buf);
-        y += 17.0f;
-
-        // 拖动隐藏着一半的信息：拖的时候手柄会被鼠标挡住，人也未必看得清
-        // 屏幕上那点位置变化。这里直接报"沿哪个轴走了多少"（吸附打开时
-        // 末尾带 [snap]），是最直观的反馈。
-        if (m_gizmo.dragging() && !m_gizmo.readout().empty()) {
-            dl->AddText(ImVec2(x, y), IM_COL32(255, 214, 102, 240),
-                        m_gizmo.readout().c_str());
-        }
-    }
-}
 
 // ---------------------------------------------------------------- Shift+A 添加菜单
 //
@@ -905,15 +844,23 @@ void ViewportPanel::drawObjectMenu(const glm::vec2& vpPos,
     // ---- 松开右键：**几乎没动**才算点击（动了就是右键拖拽转视角）----
     if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
         const bool clicked = glm::length(mouse - m_ctxPressPos) < 6.0f;
-        if (m_ctxPressOnSelected && clicked) {
-            ++m_ctxMenuSeq;
-            m_ctxMenuPos = mouse;
-            if (std::getenv("MYVK_LOG_RECTS")) {
-                VK_LOG_INFO("VP-OBJ-OPEN seq=%d at=(%.0f,%.0f)", m_ctxMenuSeq,
-                            static_cast<double>(mouse.x),
-                            static_cast<double>(mouse.y));
+        if (clicked) {
+            if (m_ctxPressOnSelected) {
+                ++m_ctxMenuSeq;
+                m_ctxMenuPos = mouse;
+                if (std::getenv("MYVK_LOG_RECTS")) {
+                    VK_LOG_INFO("VP-OBJ-OPEN seq=%d at=(%.0f,%.0f)", m_ctxMenuSeq,
+                                static_cast<double>(mouse.x),
+                                static_cast<double>(mouse.y));
+                }
+                ImGui::OpenPopup("##vp_object");
+            } else {
+                // 空白处 → "Viewport Display"（浮层显隐 / 统计 HUD 逐项）。
+                // 判定与物体菜单共用一套"按下 → 松开位移 < 6px"的逻辑，
+                // 所以右键拖拽转视角永远不会误弹菜单。
+                m_ctxMenuPos = mouse;
+                ImGui::OpenPopup("##vp_display");
             }
-            ImGui::OpenPopup("##vp_object");
         }
         m_ctxPressOnSelected = false;
     }
@@ -1169,8 +1116,9 @@ void ViewportPanel::draw() {
     // 3.6) 选中物体上的右键菜单：添加 / 移除碰撞体、切换手柄目标
     drawObjectMenu(vpPos, vpSize, hovered);
 
-    // 4) 叠加信息
-    if (m_showOverlay) drawOverlay(dl, vpPos, vpSize);
+    // 4) 叠加信息：E14 起全部走四角浮层（drawStatsHud 等，见下面第 6 步）。
+    //    原来这里的 drawOverlay（左上角统计文字）已经并进统计 HUD ——
+    //    左上角让给了视图模式条。
 
     // 5) 内容浏览器拖进来的**网格** → 就地实例化。
     //    落点 = 鼠标射线与 z = 0 栅格面的交点（拖到哪儿就落在哪儿，不是
@@ -1233,14 +1181,45 @@ void ViewportPanel::draw() {
         ImGui::EndDragDropTarget();
     }
 
-    // 视口右上角浮层。两者都放在所有交互之后、End() 之前 —— 它们是
-    // **子窗口**，见下面各自的说明。
-    //   编辑态 → 导航 HUD（灵敏度 + 操作提示）+ 左下角导航球，跟随 "HUD" 勾选框
-    //   运行态 → 极简播放浮层（全屏按钮 + 状态），不含任何导航控件
+    // 6) E14 四角浮层。全部放在所有交互之后、ImGui::End() 之前 —— 它们是
+    //    **子窗口**（见上面 E14 浮层那一段的说明）。
+    //      编辑态 → 左上模式条 / 右上统计 HUD / 左下相机信息 / 右下导航球，
+    //               每块各自一个开关（右键空白处的 Viewport Display 菜单）
+    //      运行态 → 极简播放浮层（全屏按钮 + 状态），不含任何导航控件
+    //
+    //    Viewport Display 菜单必须在编辑态**每帧无条件提交**（不提交的帧
+    //    ImGui 会直接把 popup 关掉），所以它的调用点在这里、不在 if 里。
     if (m_ctx.isEditing()) {
+        drawDisplayMenu(vpPos, vpSize, hovered);
+        // 自动化（MYVK_LOG_RECTS=1）：浮层开关状态**只在变化时**打一行。
+        // 脚本不能靠"矩形日志还在不在打"判断显隐 —— `logRect` 对同一个矩形
+        // 只打一条（按 tag + 4px 去抖），不是逐帧刷的。有了这一行，
+        // "点一下菜单 → 状态真翻了" 和 "读盘后生效了" 都是可断言的。
+        if (std::getenv("MYVK_LOG_RECTS")) {
+            const EditorContext::ViewportOverlay& ov = m_ctx.vpOverlay();
+            const int sig = (m_showOverlay ? 1 : 0) | (ov.modeBar ? 2 : 0) |
+                            (ov.stats ? 4 : 0) | (ov.camera ? 8 : 0) |
+                            (ov.navGizmo ? 16 : 0);
+            static int lastSig = -1;
+            if (sig != lastSig) {
+                lastSig = sig;
+                VK_LOG_INFO("VP-OVERLAY master=%d modeBar=%d stats=%d "
+                            "camera=%d navGizmo=%d",
+                            m_showOverlay ? 1 : 0, ov.modeBar ? 1 : 0,
+                            ov.stats ? 1 : 0, ov.camera ? 1 : 0,
+                            ov.navGizmo ? 1 : 0);
+            }
+        }
         if (m_showOverlay) {
-            drawNavHud(vpPos, vpSize);
-            drawNavGizmo(vpPos, vpSize);
+            const EditorContext::ViewportOverlay& ov = m_ctx.vpOverlay();
+            // 先清掉上一帧的模式条边界：模式条被关掉时统计 HUD 要回到顶边，
+            // 不能还按上一帧的位置往下躲。
+            m_modeBarRight = 0.0f;
+            m_modeBarBottom = 0.0f;
+            if (ov.modeBar) drawViewModeBar(vpPos, vpSize);
+            if (ov.stats) drawStatsHud(vpPos, vpSize);
+            if (ov.camera) drawCameraInfo(vpPos, vpSize);
+            if (ov.navGizmo) drawNavGizmo(vpPos, vpSize);
         }
     } else {
         drawPlayHud(vpPos, vpSize);
@@ -1250,50 +1229,276 @@ void ViewportPanel::draw() {
     if (gameFullscreen) ImGui::PopStyleVar();
 }
 
-// ---------------------------------------------------------------- 右上角浮层
+// ---------------------------------------------------------------- E14 浮层
 //
-// 为什么必须是**子窗口**而不是独立顶层窗口：
-// 视口窗口本身是焦点窗口，ImGui 每帧都会把焦点窗口 BringWindowToDisplayFront，
-// 于是独立窗口会被推到列表前面、**被视口盖住**（第一版就是这么翻车的）。
-// 子窗口的绘制永远在父窗口之后，天然压在 3D 画面之上。
+// 四角分工（E14 起）：
+//   左上 = 视图模式条        右上 = 统计 HUD
+//   左下 = 相机信息 + 书签    右下 = 导航 gizmo
 //
-// 位置跟着 Image 的矩形走，全屏时 Image 就是整屏，于是它就落在屏幕右上角。
+// 为什么必须是**子窗口**而不是独立顶层窗口：视口窗口本身是焦点窗口，ImGui
+// 每帧都会把焦点窗口 BringWindowToDisplayFront，于是独立窗口会被推到列表
+// 前面、**被视口盖住**（第一版就是这么翻车的）。子窗口的绘制永远在父窗口
+// 之后，天然压在 3D 画面之上。
+//
+// 位置全部跟着 Image 的矩形（vpPos / vpSize）走，全屏时 Image 就是整屏。
+//
+// 显隐分两层：`m_showOverlay`（工具栏 "HUD" 勾选框，也是 MYVK_EDITOR_NO_HUD
+// 的落点）是**总闸**；总闸之上，四块各自还有一个开关存在 EditorContext 里，
+// 右键视口空白处的 "Viewport Display" 菜单切换、经 Settings 落盘。
+// 总闸关掉时四块全灭 —— 这就是 NO_HUD 逐像素回归能成立的前提。
 
-// 编辑态导航 HUD。灵敏度是"移动与旋转共用"的系数：默认 1、必须 > 0。
-// 滚轮在视口图像上"按住右键"滑也能调（那条路径在 handleNavigation 里），
-// 这里再补一条"鼠标停在 HUD 上时同理" —— 否则用户会觉得滚轮时灵时不灵。
-// 顺带放一个**地平面栅格的显示开关**（用户要的"视图右上角的单选框"，
-// 默认开；View 菜单里有一个等价入口）。
-void ViewportPanel::drawNavHud(const glm::vec2& vpPos, const glm::vec2& vpSize) {
-    // 浮层只有三行：标题 + 两个控件行（灵敏度、栅格开关）。
-    // 操作提示文字（"RMB drag look" 那三行）和「Reset 1.00」按钮按用户要求
-    // 去掉了 —— 视口里只留真正需要拨一下的东西；操作说明在 Help 菜单里。
-    //
-    // 尺寸跟着当前字号算。字体缩放是用户可调的（Settings 面板），
-    // 写死像素的话一放大文字就会被裁掉半截 —— 这个坑第一版就踩过。
+// 模式条的短标签：8 个按钮挤一行，长名字（light_complexity）放不下。
+// 完整名字在 hover 提示和右侧的 "view: xxx" 里（Renderer::viewModeName）。
+// 统一 3 个字母宽：8 格 × 50px ≈ 400px，加上右边的模式名一共约 610px ——
+// 既不会盖住右上角的统计 HUD，也能在 950px 宽的视口里一行放下。
+const char* kViewModeShort[] = {"Lit", "Unl", "Nrm", "Rgh",
+                                "Mtl", "Wir", "Odr", "Lgt"};
+static_assert(render::Renderer::kViewModeCount == 8,
+              "视图模式条短标签表要跟着 Renderer::ViewMode 一起扩");
+
+// ---- 视图模式条（左上）----
+void ViewportPanel::drawViewModeBar(const glm::vec2& vpPos,
+                                    const glm::vec2& vpSize) {
+    (void)vpSize;
+    render::Renderer& r = m_renderer;
+    const int cur = static_cast<int>(r.viewMode());
+    const int n = render::Renderer::kViewModeCount;
     const ImGuiStyle& st = ImGui::GetStyle();
-    const float frameH = ImGui::GetFrameHeightWithSpacing();
 
-    float textW = ImGui::CalcTextSize("Viewport navigation").x;
-    // 灵敏度那一行 = 数值框 + "Sensitivity" 标签（Reset 按钮已移除）
-    textW = std::max(textW, kSensitivityFieldW + st.ItemInnerSpacing.x +
-                                 ImGui::CalcTextSize("Sensitivity").x);
-    // 栅格那一行是 "勾选框 + 标签 + 副标题"
-    textW = std::max(textW, ImGui::CalcTextSize("Ground grid (1 m)").x +
-                                 ImGui::CalcTextSize("(z = 0 plane)").x + 44.0f);
+    const float btnH = ImGui::GetFrameHeight();
+    float btnW = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        btnW = std::max(btnW, ImGui::CalcTextSize(kViewModeShort[i]).x);
+    }
+    btnW += st.FramePadding.x * 2.0f + 6.0f;
 
-    const float cw = textW + st.WindowPadding.x * 2.0f + 8.0f;
-    // 1 行文字（标题）+ 2 个控件行（灵敏度、栅格勾选框）
-    const float ch = ImGui::GetTextLineHeightWithSpacing() + frameH * 2.0f +
-                     st.WindowPadding.y * 2.0f + st.ItemSpacing.y * 2.0f;
+    char nameBuf[64];
+    std::snprintf(nameBuf, sizeof(nameBuf), "view: %s",
+                  render::Renderer::viewModeName(r.viewMode()));
+    const float nameW =
+        std::max(ImGui::CalcTextSize(nameBuf).x,
+                 ImGui::CalcTextSize("view: light_complexity").x);
+
+    const float cw = st.WindowPadding.x * 2.0f + btnW * static_cast<float>(n) +
+                     st.ItemSpacing.x * (static_cast<float>(n) + 1.0f) + nameW;
+    const float ch = btnH + st.WindowPadding.y * 2.0f;
+
+    ImGui::SetCursorScreenPos(ImVec2(vpPos.x + 10.0f, vpPos.y + 10.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.10f, 0.80f));
+    ImGui::BeginChild("##vp_modebar", ImVec2(cw, ch), 0,
+                      ImGuiWindowFlags_NoScrollbar |
+                          ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleColor();
+
+    logRect("VP-RECT modebar", ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
+                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
+    // 记下这块的右边界 / 下边界：统计 HUD（右上）据此避让 —— 窄视口下
+    // 两块本来会在顶边撞上，撞上时统计 HUD 自动下移到模式条之下。
+    m_modeBarRight = ImGui::GetWindowPos().x + ImGui::GetWindowWidth();
+    m_modeBarBottom = ImGui::GetWindowPos().y + ImGui::GetWindowHeight();
+
+    const ImVec4 active(0.26f, 0.52f, 0.85f, 1.0f);
+    const ImVec4 idle(0.20f, 0.20f, 0.23f, 1.0f);
+    for (int i = 0; i < n; ++i) {
+        if (i) ImGui::SameLine(0.0f, st.ItemSpacing.x);
+        ImGui::PushID(i);
+        ImGui::PushStyleColor(ImGuiCol_Button, i == cur ? active : idle);
+        char tag[48];
+        std::snprintf(tag, sizeof(tag), "%s##vm", kViewModeShort[i]);
+        if (ImGui::Button(tag, ImVec2(btnW, 0.0f))) {
+            r.setViewMode(static_cast<render::Renderer::ViewMode>(i));
+        }
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "%s view\nShortcut: Shift+%d\n"
+                "(Lit is the baseline path; the others are debug views)",
+                render::Renderer::viewModeName(
+                    static_cast<render::Renderer::ViewMode>(i)),
+                i + 1);
+        }
+        ImGui::PopID();
+    }
+    ImGui::SameLine(0.0f, st.ItemSpacing.x);
+    ImGui::TextDisabled("%s", nameBuf);
+
+    ImGui::EndChild();
+
+    // 自动化：模式条存在 + 一共几格（只打一次，和 VM-COMBO 同理）
+    static bool tagged = false;
+    if (!tagged) {
+        tagged = true;
+        if (std::getenv("MYVK_LOG_RECTS")) {
+            VK_LOG_INFO("VP-MODEBAR modes=%d current=%s", n,
+                        render::Renderer::viewModeName(r.viewMode()));
+        }
+    }
+}
+
+// ---- 统计 HUD（右上）----
+//
+// 每一行都由 EditorContext::StatsHudItems 里的一个开关控制：调性能时全开，
+// 盯画面时只留 FPS。宽度按**当前启用的行**里最长的一条算，关掉几行浮层就
+// 真的变窄，而不是留一片空白。
+void ViewportPanel::drawStatsHud(const glm::vec2& vpPos,
+                                 const glm::vec2& vpSize) {
+    const EditorContext::StatsHudItems& it = m_ctx.statsHud();
+    const scene::Scene& sc = m_ctx.activeScene();
+    const render::Renderer::RenderStats& rs = m_renderer.renderStats();
+    const ImGuiIO& io = ImGui::GetIO();
+
+    std::vector<std::string> lines;
+    char b[192];
+    if (it.fps) {
+        std::snprintf(b, sizeof(b), "%.0f FPS",
+                      static_cast<double>(io.Framerate));
+        lines.emplace_back(b);
+    }
+    if (it.frameMs) {
+        std::snprintf(b, sizeof(b), "%.2f ms",
+                      io.Framerate > 0.0f ? 1000.0 / io.Framerate : 0.0);
+        lines.emplace_back(b);
+    }
+    if (it.drawCalls) {
+        std::snprintf(b, sizeof(b), "draw calls  %u", rs.drawCalls);
+        lines.emplace_back(b);
+    }
+    if (it.triangles) {
+        std::snprintf(b, sizeof(b), "triangles   %u", rs.triangles);
+        lines.emplace_back(b);
+    }
+    if (it.vram) {
+        // 引擎没有自己的分配器（无 VMA），拿不到"已用"，这里报的是
+        // **设备本地堆容量** —— 调资源预算时看的是同一个数。
+        const double gb = static_cast<double>(
+                              m_renderer.device().deviceLocalHeapBytes()) /
+                          (1024.0 * 1024.0 * 1024.0);
+        std::snprintf(b, sizeof(b), "VRAM        %.1f GB", gb);
+        lines.emplace_back(b);
+    }
+    if (it.resolution) {
+        std::snprintf(b, sizeof(b), "viewport    %ux%u", m_requestedW,
+                      m_requestedH);
+        lines.emplace_back(b);
+    }
+    if (it.viewMode) {
+        std::snprintf(b, sizeof(b), "view mode   %s",
+                      render::Renderer::viewModeName(m_renderer.viewMode()));
+        lines.emplace_back(b);
+    }
+    if (it.entities) {
+        const scene::Scene::LightStats ls = sc.lightStats();
+        std::snprintf(b, sizeof(b), "entities %zu   lights %zu",
+                      sc.objectCount(), ls.pointLights + ls.spotLights);
+        lines.emplace_back(b);
+    }
+    if (it.selection) {
+        const std::string* nm = m_ctx.hasSelection()
+                                    ? sc.world().name(m_ctx.selection())
+                                    : nullptr;
+        std::snprintf(b, sizeof(b), "selected: %s", nm ? nm->c_str() : "(none)");
+        lines.emplace_back(b);
+    }
+    if (it.gizmo) {
+        if (!m_ctx.isEditing()) {
+            // 视口渲染的就是**运行态副本**本身 —— 游戏画面与编辑画面共用
+            // 同一条离屏渲染链，只是相机换成了自由飞行视角。
+            std::snprintf(b, sizeof(b), "%s  t=%.2fs%s",
+                          m_ctx.isPaused() ? "PAUSED" : "PLAYING",
+                          static_cast<double>(m_ctx.playTime()),
+                          m_ctx.gameFullscreen() ? "  [fullscreen]" : "");
+            lines.emplace_back(b);
+        } else {
+            std::snprintf(b, sizeof(b), "EDIT   gizmo: %s / %s",
+                          m_ctx.gizmoMode() == GizmoMode::Translate ? "move"
+                          : m_ctx.gizmoMode() == GizmoMode::Rotate ? "rotate"
+                                                                  : "scale",
+                          m_ctx.gizmoSpace() == GizmoSpace::World ? "world"
+                                                                 : "local");
+            lines.emplace_back(b);
+            // 拖动手柄时鼠标会挡住画面，这里报"沿哪个轴走了多少"
+            // （吸附打开时末尾带 [snap]）是最直观的反馈。
+            if (m_gizmo.dragging() && !m_gizmo.readout().empty()) {
+                lines.push_back(m_gizmo.readout());
+            }
+        }
+    }
+
+    const ImGuiStyle& st = ImGui::GetStyle();
+    float w = ImGui::CalcTextSize("(all stats hidden)").x;
+    for (const std::string& s : lines) {
+        w = std::max(w, ImGui::CalcTextSize(s.c_str()).x);
+    }
+    const float cw = w + st.WindowPadding.x * 2.0f + 6.0f;
+    // 行距要用 GetTextLineHeightWithSpacing：TextUnformatted 每行前进的是
+    // "行高 + ItemSpacing.y"。按 GetTextLineHeight 算会少几像素，10 行时
+    // 刚好溢出 → 子窗口冒出滚动条，最后两行直接被滚出可视区（踩过）。
+    const float lineH = ImGui::GetTextLineHeightWithSpacing();
+    const float rows = std::max(1.0f, static_cast<float>(lines.size()));
+    const float ch = lineH * rows + st.WindowPadding.y * 2.0f + 2.0f;
+
+    const float statsX = vpPos.x + vpSize.x - cw - 10.0f;
+    // 窄视口避让：模式条铺得宽时，统计 HUD 下移到它下方而不是叠上去。
+    float statsY = vpPos.y + 10.0f;
+    if (m_modeBarRight > statsX - 8.0f && m_modeBarBottom > statsY) {
+        statsY = m_modeBarBottom + 6.0f;
+    }
+    ImGui::SetCursorScreenPos(ImVec2(statsX, statsY));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.10f, 0.78f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.89f, 0.94f, 0.92f));
+    ImGui::BeginChild("##vp_stats", ImVec2(cw, ch), 0,
+                      ImGuiWindowFlags_NoScrollbar |
+                          ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleColor(2);
+
+    logRect("VP-RECT stats", ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
+                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
+
+    if (lines.empty()) {
+        ImGui::TextDisabled("(all stats hidden)");
+    } else {
+        for (const std::string& s : lines) ImGui::TextUnformatted(s.c_str());
+    }
+
+    // 编辑态才提示"右键空白处可以改这里" —— Play 态没有这块菜单
+    ImGui::EndChild();
+}
+
+// ---- 相机信息 + 书签（左下）----
+//
+// 这里是原来的"右上角导航 HUD"搬家后的样子：灵敏度、栅格开关原样保留，
+// 另外补上真正需要在摆机位时盯着看的四个数（位置 / 注视点 / FOV / 距离），
+// 以及一排相机书签。
+void ViewportPanel::drawCameraInfo(const glm::vec2& vpPos,
+                                   const glm::vec2& vpSize) {
+    scene::Camera& cam = m_ctx.activeScene().camera();
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float fieldW = kSensitivityFieldW;
+
+    const glm::vec3 p = cam.position();
+    const glm::vec3 t = cam.target();
+
+    const float cw = 250.0f;
+    // 内容 = 4 行文字（Camera / pos / look / Bookmarks）+ 3 行控件
+    // （FOV / Sensitivity+Grid / 书签按钮）。用 *WithSpacing 的版本量，
+    // 否则要么溢出冒滚动条、要么底部留一大块空白。
+    const float ch = ImGui::GetTextLineHeightWithSpacing() * 4.0f +
+                     ImGui::GetFrameHeightWithSpacing() * 3.0f +
+                     st.WindowPadding.y * 2.0f + 2.0f;
 
     ImGui::SetCursorScreenPos(
-        ImVec2(vpPos.x + vpSize.x - cw - 10.0f, vpPos.y + 10.0f));
-
+        ImVec2(vpPos.x + 10.0f, vpPos.y + vpSize.y - ch - 10.0f));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.10f, 0.80f));
-    // 注意：1.90+ 的 BeginChild 第三个参数是 child_flags（不再是 border 布尔），
-    // 这里传 0 最保险；要不要边框无所谓，背景已经有区分度了。
-    ImGui::BeginChild("##nav_hud", ImVec2(cw, ch), 0);
+    ImGui::BeginChild("##vp_cam", ImVec2(cw, ch), 0,
+                      ImGuiWindowFlags_NoScrollbar |
+                          ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleColor();
+
+    logRect("VP-RECT cam", ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
+                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
 
     // 鼠标停在浮层上时：**按住右键**滚轮同样调灵敏度（此时鼠标不在视口
     // 图像上，handleNavigation 那条路径不会触发）。单独滚轮在浮层上不做
@@ -1304,15 +1509,25 @@ void ViewportPanel::drawNavHud(const glm::vec2& vpPos, const glm::vec2& vpSize) 
         m_ctx.addNavSensitivity(io.MouseWheel * kSensitivityStep);
     }
 
-    ImGui::TextDisabled("Viewport navigation");
+    ImGui::TextDisabled("Camera");
+    ImGui::Text("pos    %.2f %.2f %.2f", static_cast<double>(p.x),
+                static_cast<double>(p.y), static_cast<double>(p.z));
+    ImGui::Text("look   %.2f %.2f %.2f", static_cast<double>(t.x),
+                static_cast<double>(t.y), static_cast<double>(t.z));
 
-    // ---- 灵敏度 ----
-    // InputFloat 让用户直接填浮点（点/拖都能改）。
-    // **step 传 0 就不会画那两个 +/- 方块按钮** —— 它们又占地方又把文本区
-    // 挤窄，导致 "20.00" 这种上限值显示不全（用户反馈的正是这个）。
-    // 约束必须 > 0：非正数（或输入过程中的乱值）一律忽略，下一帧会回显上一个合法值。
+    // FOV：摆机位时最常拨的一个数，直接给可拖的控件（和 Inspector 同一个
+    // 相机对象，两边改的是同一份状态）。
+    float fov = cam.fov();
+    ImGui::SetNextItemWidth(fieldW);
+    if (ImGui::SliderFloat("FOV", &fov, 15.0f, 110.0f, "%.0f deg")) {
+        cam.setFov(fov);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("dist %.1f m", static_cast<double>(cam.distance()));
+
+    // 灵敏度（原导航 HUD 的内容）
     float sens = m_ctx.navSensitivity();
-    ImGui::SetNextItemWidth(kSensitivityFieldW);
+    ImGui::SetNextItemWidth(fieldW);
     if (ImGui::InputFloat("Sensitivity", &sens, 0.0f, 0.0f, "%.2f")) {
         if (sens > 0.0f) {
             m_ctx.navSensitivityRef() =
@@ -1326,24 +1541,196 @@ void ViewportPanel::drawNavHud(const glm::vec2& vpPos, const glm::vec2& vpSize) 
                           static_cast<double>(EditorContext::kMinSensitivity),
                           static_cast<double>(EditorContext::kMaxSensitivity));
     }
-
-    // ---- 地平面栅格 ----
-    // 用户要的"视图右上角的单选框"。默认开；真正的绘制在 render/Renderer
-    // 的 grid pass（最小格 1 m、主格 10 m），这里只管开关。
-    // Play 期间栅格不画（视口里是游戏画面），所以这个勾选框只在编辑态出现。
-    ImGui::Checkbox("Ground grid (1 m)", &m_ctx.showGridRef());
+    ImGui::SameLine();
+    ImGui::Checkbox("Grid", &m_ctx.showGridRef());
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
-            "Reference grid on the z = 0 plane.\n"
-            "Minor lines every 1 m, major lines every 10 m.\n"
-            "Hidden while playing (the viewport shows the game then).\n"
-            "Start with MYVK_GRID=0 to force it off.");
+            "Reference grid on the z = 0 plane (minor 1 m / major 10 m).\n"
+            "Hidden while playing. MYVK_GRID=0 forces it off.");
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("(z = 0 plane)");
+    if (ImGui::SmallButton("View...")) ImGui::OpenPopup("##vp_settings");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Viewport settings: grid step, background, units");
+    }
+
+    // ---- 相机书签 ----
+    // 左键 = 跳过去；右键 = 存当前位置。空槽画成暗色，有书的画成蓝色。
+    // 键盘等价物：Ctrl+Shift+数字存、Alt+Shift+数字跳（见 handleOverlayShortcuts）。
+    ImGui::TextDisabled("Bookmarks  (LMB recall / RMB save)");
+    EditorContext::CameraBookmark* bm = m_ctx.bookmarksRef();
+    const ImVec4 used(0.26f, 0.52f, 0.85f, 1.0f);
+    const ImVec4 empty(0.20f, 0.20f, 0.23f, 1.0f);
+    // 9 个按钮要在一行里塞下：把 FramePadding 收窄（默认 8 太宽，
+    // 9 个加起来正好超出容器内宽，第 9 格会被裁掉）。
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 2.0f));
+    for (int i = 0; i < EditorContext::kBookmarkCount; ++i) {
+        if (i) ImGui::SameLine(0.0f, 2.0f);
+        ImGui::PushID(1000 + i);
+        ImGui::PushStyleColor(ImGuiCol_Button, bm[i].set ? used : empty);
+        char lb[8];
+        std::snprintf(lb, sizeof(lb), "%d", i + 1);
+        if (ImGui::SmallButton(lb)) {
+            if (bm[i].set) {
+                const glm::vec3 keep = cam.target();
+                cam.setYaw(bm[i].yaw);
+                cam.setPitch(bm[i].pitch);
+                cam.setTarget(keep);
+                m_ctx.setStatus("Camera bookmark " + std::to_string(i + 1));
+                VK_LOG_INFO("VP-BOOK recall slot=%d", i + 1);
+            } else {
+                VK_LOG_INFO("VP-BOOK recall slot=%d (empty)", i + 1);
+            }
+        }
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            bm[i].set = true;
+            bm[i].pos = cam.position();
+            bm[i].yaw = cam.yaw();
+            bm[i].pitch = cam.pitch();
+            m_ctx.setStatus("Saved camera bookmark " + std::to_string(i + 1));
+            VK_LOG_INFO("VP-BOOK save slot=%d pos=%.3f,%.3f,%.3f yaw=%.4f "
+                        "pitch=%.4f",
+                        i + 1, static_cast<double>(bm[i].pos.x),
+                        static_cast<double>(bm[i].pos.y),
+                        static_cast<double>(bm[i].pos.z),
+                        static_cast<double>(bm[i].yaw),
+                        static_cast<double>(bm[i].pitch));
+        }
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s\nCtrl+Shift+%d = save, Alt+Shift+%d = recall",
+                              bm[i].set ? "occupied" : "empty", i + 1, i + 1);
+        }
+        ImGui::PopID();
+    }
+    ImGui::PopStyleVar();
+
+    // ---- 视口设置 ----
+    if (ImGui::BeginPopup("##vp_settings")) {
+        ImGui::SeparatorText("Grid step");
+
+        // 网格步长直接写到注册表参数上（E02 起 grid.* 是纯 UI 参数，
+        // 没有副作用钩子，写值即生效）。
+        auto setGrid = [](float minor, float major) {
+            if (void* p = render::paramPtr("grid.minorStep")) {
+                *static_cast<float*>(p) = minor;
+            }
+            if (void* p = render::paramPtr("grid.majorStep")) {
+                *static_cast<float*>(p) = major;
+            }
+        };
+        float curMinor = 1.0f;
+        if (void* p = render::paramPtr("grid.minorStep")) {
+            curMinor = *static_cast<float*>(p);
+        }
+        const float steps[3] = {1.0f, 0.5f, 0.1f};
+        for (int i = 0; i < 3; ++i) {
+            if (i) ImGui::SameLine();
+            char lb[24];
+            std::snprintf(lb, sizeof(lb), "%g m", static_cast<double>(steps[i]));
+            if (ImGui::RadioButton(lb, std::fabs(curMinor - steps[i]) < 1e-4f)) {
+                setGrid(steps[i], steps[i] * 10.0f);
+            }
+        }
+
+        ImGui::SeparatorText("Background");
+        bool sky = m_renderer.skyEnabled();
+        if (ImGui::RadioButton("Sky / environment", sky)) {
+            m_renderer.skyEnabled() = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Solid", !sky)) m_renderer.skyEnabled() = false;
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Solid = the sky pass is skipped and the scene clears to the\n"
+                "flat background colour (useful for silhouette checks).");
+        }
+
+        ImGui::SeparatorText("Units");
+        ImGui::TextDisabled("Readouts above use meters.");
+
+        ImGui::SeparatorText("View mode");
+        ImGui::TextDisabled("Use the bar in the top-left corner (Shift+1..%d).",
+                            render::Renderer::kViewModeCount);
+
+        ImGui::EndPopup();
+    }
 
     ImGui::EndChild();
-    ImGui::PopStyleColor();
+}
+
+// ---- "Viewport Display" 菜单（右键视口空白处）----
+//
+// 只负责**画**这个 popup：按下 / 松开的判定在 drawObjectMenu 里（那里已经
+// 记好了"右键按在哪儿、是不是按在选中物体上"，两半共用一套逻辑就不会出现
+// "拖拽转视角顺手弹出菜单"）。本函数必须每帧无条件调用 —— 不提交的帧
+// ImGui 会直接把它关掉。
+void ViewportPanel::drawDisplayMenu(const glm::vec2& vpPos,
+                                    const glm::vec2& vpSize, bool hovered) {
+    (void)vpPos;
+    (void)vpSize;
+    (void)hovered;
+    if (!m_ctx.isEditing()) return;
+
+    ImGui::SetNextWindowPos(ImVec2(m_ctxMenuPos.x, m_ctxMenuPos.y),
+                            ImGuiCond_Appearing);
+    if (!ImGui::BeginPopup("##vp_display")) return;
+
+    logRect("VP-DISPLAY-WIN", ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
+                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
+
+    EditorContext::ViewportOverlay& ov = m_ctx.vpOverlayRef();
+    EditorContext::StatsHudItems& st = m_ctx.statsHudRef();
+
+    // 自动化（MYVK_LOG_RECTS=1）：每个开关的真实矩形都打出来 —— 脚本按
+    // 日志矩形点击，不猜字体行高（和 VP-ADD-* 那套同一套路）。
+    const auto itemRect = [](const char* tag) {
+        if (!std::getenv("MYVK_LOG_RECTS")) return;
+        logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    };
+
+    ImGui::SeparatorText("Overlay panels");
+    ImGui::Checkbox("View mode bar (top-left)", &ov.modeBar);
+    itemRect("VP-DISPLAY-ITEM modeBar");
+    ImGui::Checkbox("Stats HUD (top-right)", &ov.stats);
+    itemRect("VP-DISPLAY-ITEM stats");
+    ImGui::Checkbox("Camera info (bottom-left)", &ov.camera);
+    itemRect("VP-DISPLAY-ITEM camera");
+    ImGui::Checkbox("Navigation gizmo (bottom-right)", &ov.navGizmo);
+    itemRect("VP-DISPLAY-ITEM navGizmo");
+
+    ImGui::SeparatorText("Stats HUD lines");
+    ImGui::BeginDisabled(!ov.stats);
+    ImGui::Checkbox("FPS", &st.fps);
+    ImGui::SameLine();
+    ImGui::Checkbox("Frame time", &st.frameMs);
+    ImGui::Checkbox("Draw calls", &st.drawCalls);
+    ImGui::SameLine();
+    ImGui::Checkbox("Triangles", &st.triangles);
+    ImGui::Checkbox("VRAM", &st.vram);
+    ImGui::SameLine();
+    ImGui::Checkbox("Resolution", &st.resolution);
+    ImGui::Checkbox("View mode", &st.viewMode);
+    ImGui::SameLine();
+    ImGui::Checkbox("Entities", &st.entities);
+    ImGui::Checkbox("Selection", &st.selection);
+    ImGui::SameLine();
+    ImGui::Checkbox("Gizmo state", &st.gizmo);
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    if (ImGui::MenuItem("Show all overlays")) {
+        ov.modeBar = ov.stats = ov.camera = ov.navGizmo = true;
+        st = EditorContext::StatsHudItems{};
+    }
+    itemRect("VP-DISPLAY-ITEM all");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Turn all four corner panels and every stats line "
+                          "back on.");
+    }
+
+    ImGui::EndPopup();
 }
 
 // ---------------------------------------------------------------- 左下角导航球
@@ -1367,8 +1754,9 @@ void ViewportPanel::drawNavHud(const glm::vec2& vpPos, const glm::vec2& vpSize) 
 void ViewportPanel::drawNavGizmo(const glm::vec2& vpPos, const glm::vec2& vpSize) {
     const float half = kGizmoRingR + kGizmoBallR + 5.0f;
     const float box = half * 2.0f;
-    // 贴着视口图像左下角
-    const glm::vec2 c(vpPos.x + kGizmoMargin + half,
+    // E14 起贴**右下角**：左下角让给相机信息块（位置 / FOV / 书签）。
+    // Blender 是左下、UE 是右下，两种都常见 —— 这里按 E14 的四角分工走。
+    const glm::vec2 c(vpPos.x + vpSize.x - kGizmoMargin - half,
                       vpPos.y + vpSize.y - kGizmoMargin - half);
 
     ImGui::SetCursorScreenPos(ImVec2(c.x - half, c.y - half));
@@ -1578,6 +1966,9 @@ void ViewportPanel::handleViewShortcuts() {
     if (!m_ctx.isEditing()) return;
 
     const ImGuiIO& io = ImGui::GetIO();
+    // Shift 层被 E14 的浮层快捷键占了（Shift+数字 = 视图模式，
+    // Ctrl/Alt+Shift+数字 = 相机书签），所以这里直接让路。
+    if (io.KeyShift) return;
     const bool ctrl = io.KeyCtrl;
     scene::Camera& cam = m_ctx.activeScene().camera();
 
@@ -1612,6 +2003,79 @@ void ViewportPanel::handleViewShortcuts() {
     if (ImGui::IsKeyPressed(ImGuiKey_Keypad8, true)) dpitch -= kStep;
     if (ImGui::IsKeyPressed(ImGuiKey_Keypad2, true)) dpitch += kStep;
     if (dyaw != 0.0f || dpitch != 0.0f) orbitViewAroundPivot(cam, dyaw, dpitch);
+}
+
+// ---------------------------------------------------------------- E14 快捷键
+//
+// 数字键已经被两套既有快捷键占满（1/3/7(+Ctrl) 视图方向、Alt+数字 面板显隐），
+// 所以 E14 的三件事全挂在 **Shift 层**：
+//   Shift+1..8          切视图模式（等价于点左上角的模式条）
+//   Ctrl+Shift+1..9     存相机书签到该槽
+//   Alt+Shift+1..9      跳回该槽
+// 相机书签不带位置：跳转只恢复 yaw / pitch（**保留当前注视点**）——
+// 这样"看一眼侧面再回来"不会把镜头甩到别的地方去，比连位置一起还原好用。
+void ViewportPanel::handleOverlayShortcuts() {
+    if (!m_ctx.isEditing()) return;
+
+    const ImGuiIO& io = ImGui::GetIO();
+    if (!io.KeyShift) return;
+
+    static const ImGuiKey kDigits[9] = {
+        ImGuiKey_1, ImGuiKey_2, ImGuiKey_3, ImGuiKey_4, ImGuiKey_5,
+        ImGuiKey_6, ImGuiKey_7, ImGuiKey_8, ImGuiKey_9};
+
+    if (io.KeyCtrl) {
+        // ---- 存书签 ----
+        scene::Camera& cam = m_ctx.activeScene().camera();
+        for (int i = 0; i < EditorContext::kBookmarkCount; ++i) {
+            if (!ImGui::IsKeyPressed(kDigits[i], false)) continue;
+            EditorContext::CameraBookmark& b = m_ctx.bookmarksRef()[i];
+            b.set = true;
+            b.pos = cam.position();
+            b.yaw = cam.yaw();
+            b.pitch = cam.pitch();
+            m_ctx.setStatus("Saved camera bookmark " + std::to_string(i + 1));
+            VK_LOG_INFO("VP-BOOK save slot=%d pos=%.3f,%.3f,%.3f yaw=%.4f "
+                        "pitch=%.4f",
+                        i + 1, static_cast<double>(b.pos.x),
+                        static_cast<double>(b.pos.y),
+                        static_cast<double>(b.pos.z),
+                        static_cast<double>(b.yaw),
+                        static_cast<double>(b.pitch));
+        }
+        return;
+    }
+
+    if (io.KeyAlt) {
+        // ---- 跳书签 ----
+        scene::Camera& cam = m_ctx.activeScene().camera();
+        for (int i = 0; i < EditorContext::kBookmarkCount; ++i) {
+            if (!ImGui::IsKeyPressed(kDigits[i], false)) continue;
+            const EditorContext::CameraBookmark& b = m_ctx.bookmarksRef()[i];
+            if (!b.set) {
+                VK_LOG_INFO("VP-BOOK recall slot=%d (empty)", i + 1);
+                continue;
+            }
+            const glm::vec3 keep = cam.target();
+            cam.setYaw(b.yaw);
+            cam.setPitch(b.pitch);
+            cam.setTarget(keep);
+            m_ctx.setStatus("Camera bookmark " + std::to_string(i + 1));
+            VK_LOG_INFO("VP-BOOK recall slot=%d yaw=%.4f pitch=%.4f", i + 1,
+                        static_cast<double>(b.yaw),
+                        static_cast<double>(b.pitch));
+        }
+        return;
+    }
+
+    // ---- 切视图模式 ----
+    const int n = render::Renderer::kViewModeCount;
+    for (int i = 0; i < n && i < 9; ++i) {
+        if (!ImGui::IsKeyPressed(kDigits[i], false)) continue;
+        m_renderer.setViewMode(static_cast<render::Renderer::ViewMode>(i));
+        VK_LOG_INFO("VP-MODEBAR key=%d mode=%s", i + 1,
+                    render::Renderer::viewModeName(m_renderer.viewMode()));
+    }
 }
 
 // 运行态极简浮层：只留"退出全屏"的入口 + 播放状态。

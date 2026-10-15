@@ -25,6 +25,7 @@ const KeywordInfo kKeywords[kKeywordCount] = {
     {kKeywordNormalMap, "VENN_NORMAL_MAP", "normal-map"},
     {kKeywordAlphaMask, "VENN_ALPHA_MASK", "alpha-mask"},
     {kKeywordShadingSkin, "VENN_SHADING_SKIN", "shading-skin"},
+    {kKeywordParallax, "VENN_PARALLAX", "parallax"},
 };
 
 // 位序 → 表下标的换算。表按位序排，所以下标就是"这是第几个被置的位"。
@@ -91,6 +92,11 @@ KeywordMask keywordsOf(const assets::Material& mat) {
     if (mat.shadingModel == assets::Material::ShadingModel::Skin) {
         m |= kKeywordShadingSkin;
     }
+    // POM：只看"有没有挂高度图"。heightScale == 0 时不置位也说得过去
+    // （offset 恒 0 = 不起作用），但那样在编辑器里把滑条从 0 往上推的
+    // 一瞬间才切变体、而且要多编一份"挂了图但不生效"的变体 ——
+    // 与 normalScale 同一条取舍：少一份变体、多一次无害的采样。
+    if (mat.heightMap) m |= kKeywordParallax;
     return m;
 }
 

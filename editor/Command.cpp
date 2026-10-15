@@ -142,6 +142,41 @@ void PrimitiveEditCommand::apply(const ecs::MeshComponent& snap) {
 void PrimitiveEditCommand::undo() { apply(m_before); }
 void PrimitiveEditCommand::redo() { apply(m_after); }
 
+// ---------------------------------------------------------------- 参数编辑（E19）
+
+ParamEditCommand::ParamEditCommand(std::string label, std::string paramId,
+                                   void* target, std::vector<std::uint8_t> before,
+                                   std::string beforeStr,
+                                   std::vector<std::uint8_t> after,
+                                   std::string afterStr)
+    : m_label(std::move(label)), m_paramId(std::move(paramId)),
+      m_target(target), m_before(std::move(before)),
+      m_after(std::move(after)), m_beforeStr(std::move(beforeStr)),
+      m_afterStr(std::move(afterStr)) {
+    rebuildName();
+}
+
+void ParamEditCommand::rebuildName() {
+    m_full = m_label + ": " + m_beforeStr + " -> " + m_afterStr;
+}
+
+void ParamEditCommand::mergeAfter(std::vector<std::uint8_t> after,
+                                  std::string afterStr) {
+    m_after = std::move(after);
+    m_afterStr = std::move(afterStr);
+    rebuildName();
+}
+
+void ParamEditCommand::undo() {
+    if (!m_target || m_before.empty()) return;
+    std::memcpy(m_target, m_before.data(), m_before.size());
+}
+
+void ParamEditCommand::redo() {
+    if (!m_target || m_after.empty()) return;
+    std::memcpy(m_target, m_after.data(), m_after.size());
+}
+
 // ---------------------------------------------------------------- 场景快照
 
 void SceneSnapshotCommand::restore(const std::string& json) {

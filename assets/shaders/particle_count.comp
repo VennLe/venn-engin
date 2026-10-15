@@ -1,0 +1,196 @@
+#version 450
+// ============================================================
+// particle_count.comp —— 把 GPU 数出来的存活数写成间接绘制命令（R6-1）
+//
+// 顺便（Sort Mode != None 时）做一次**桶排序**，把紧凑表重排成
+// "由远及近 / 由老到新" 的顺序，写进 aliveSorted[]。
+//
+// ---- 为什么要单独一个 dispatch ----
+// 模拟那一趟里，每个线程各自 atomicAdd 出自己占的紧凑表下标 —— 但没有
+// 哪个线程知道**所有**线程加完之后的总数（那正是"总数"的定义）。
+// 想在一个 dispatch 里把总数写进间接命令，就得让"最后一个完成的工作组"
+// 去写（block-completion 计数 + 内存可见性假设）。那个模式能跑，但它的
+// 正确性依赖 memoryBarrierBuffer 的可见性语义与"所有块的 atomicAdd 都
+// 已完成"这一推断 —— 是那种"九成九对、偶尔在某个驱动上画错一帧"的写法。
+//
+// 而另开一趟的代价是**一次 1 线程的 dispatch**（微秒级），换来的是
+// 一次显式的、被验证层认可的内存屏障。这笔交易非常划算。
+//
+// ---- 为什么是**两条**命令 ----
+// 混合模式是图形管线的固定状态，一次 draw 只能有一种。所以紧凑表分两张
+// （加色 / Alpha，见 particle_sim.comp），间接命令也写两条 ——
+// 各自 instanceCount = 自己那张表的数量。空的那条是 0，驱动直接跳过。
+//
+// ---- 为什么是**非索引**的 VkDrawIndirectCommand ----
+// 顶点着色器用 gl_VertexIndex 现拼四边形（0..5），没有任何顶点/索引缓冲。
+// **索引绘制下 gl_VertexIndex 来自索引缓冲** —— 没绑就是垃圾索引，三角形
+// 会被切成"月牙"残片。所以这里写的是 4 个 uint 的非索引命令。
+//
+// ---- vertexCount = 6 的含义 ----
+// 管线是 **TRIANGLE_LIST**（rhi::PipelineDesc::topology 的默认值），所以
+// 6 个顶点 = 三角形 (0,1,2) + (3,4,5)，**不是** strip 的 (0,1,2)+(2,1,3)。
+// 顶点着色器里的角点表就是按 list 的配对列的（那里有详细说明）。
+//
+// ---- 排序：为什么用桶排序，而且敢放在"1 个线程"里做完 ----
+//
+// 精确排序（基数排序）要直方图 + 多趟前缀和 + 散射，还要额外的临时缓冲；
+// 回读到 CPU 排序则是本模块存在的意义所在（那条路已经堵死）。
+// 半透明粒子的排序需求本来就是"视觉上大致从远到近"，64 档深度桶
+// **完全够用**，而且桶内顺序无关紧要 —— 于是整件事塌缩成：
+//
+//     ① 扫描求键的范围（距离模式的 min/max）
+//     ② 直方图（数每个桶有几个）
+//     ③ 前缀和（每个桶的起始下标）
+//     ④ 散射（把粒子按桶序写进 aliveSorted）
+//
+// 四步都是"读一遍 / 写一遍"的线性操作，放进这一个线程里全做完：
+// 最多 2 × total 次读 + 2 × total 次写（容量 4096 × 2 时约 16 K 次），
+// 单线程也就几十微秒 —— 而它**默认关**，加色粒子（火焰）根本不需要它。
+//
+// ⚠ 排序键**不存数组**，每趟现算：单线程的私有数组放 4096 个 float 会
+//   直接溢到本地内存（那比重新算一遍慢得多）。键的计算就是几次乘法，
+//   多算两遍完全划算。
+//
+// 与 C++ 侧的对应：
+//   fx::kBlendModeCount = 2
+//   fx::kIndirectCmdStride = 16（VkDrawIndirectCommand 的字节大小）
+//   fx::kSortBuckets = 64
+// ============================================================
+
+#include "particle_common.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer CounterBuf {
+    // [0] = 加色存活数  [1] = Alpha 存活数  [2] = 本帧发射数  [3] = 保留
+    uint counters[];
+};
+
+// VkDrawIndirectCommand = {vertexCount, instanceCount, firstVertex,
+//                          firstInstance}，4 个 uint32。
+layout(std430, set = 0, binding = 1) writeonly buffer IndirectBuf {
+    uint cmd[];
+};
+
+// 排序时要判深度 / 判 Local 空间的位置，所以要能读发射器表。
+layout(std430, set = 0, binding = 2) readonly buffer EmitterBuf {
+    Emitter emitters[];
+};
+
+// 粒子本体（读年龄、位置、寿命）。
+layout(std430, set = 0, binding = 3) readonly buffer ParticleBuf {
+    Particle particles[];
+};
+
+// 模拟那一趟填好的紧凑表（顺序 = atomicAdd 的完成顺序）。
+layout(std430, set = 0, binding = 4) readonly buffer AliveBuf {
+    uint alive[];
+};
+
+// 排序结果。Sort Mode = None 时不写，顶点着色器也不读它。
+layout(std430, set = 0, binding = 5) writeonly buffer AliveSortedBuf {
+    uint aliveSorted[];
+};
+
+layout(push_constant) uniform SortPC {
+    // xyz = 相机世界坐标（判距离用）w = 排序模式（FX_SORT_*）
+    vec4 cam;
+    // x = 排序开关(0/1) y = 总槽数 z = 档数（= kSortBuckets）
+    // w = 最大发射器数（把 p.misc.w 夹进合法范围用 —— 读 SSBO 越界
+    //     不报错，只会拿到垃圾，表现是"某颗粒子排到了莫名其妙的位置"）
+    vec4 cfg;
+} pc;
+
+layout(local_size_x = 1) in;
+
+const uint kBlends = 2u;
+
+// 排序键：**越小越先画**。
+//   ByDistance   → 距离（远的先画）
+//   OldestFirst  → 1 - 归一化年龄（老的先画）
+//   YoungestFirst→ 归一化年龄（新的先画）
+float sortKey(const uint gid) {
+    const Particle p = particles[gid];
+    const int mode = int(pc.cam.w + 0.5);
+    if (mode == FX_SORT_BY_DISTANCE) {
+        vec3 wp = p.posSize.xyz;
+        if (p.extra.y > 0.5) {
+            // Local 空间：位置是发射器局部的，先变到世界
+            const uint e = min(uint(max(p.misc.w, 0.0)),
+                               max(uint(pc.cfg.w) - 1u, 0u));
+            wp = (emitters[e].world * vec4(wp, 1.0)).xyz;
+        }
+        return distance(wp, pc.cam.xyz);
+    }
+    const float u = clamp(p.velLife.w / max(p.misc.x, 1e-4), 0.0, 1.0);
+    return (mode == FX_SORT_OLDEST_FIRST) ? (1.0 - u) : u;
+}
+
+void main() {
+    const uint total = uint(pc.cfg.y);
+    const uint nb = max(uint(pc.cfg.z), 1u);
+    const bool doSort = pc.cfg.x > 0.5 && pc.cam.w != 0.0;
+
+    // 单线程 → 私有数组即可（64 个 uint）。用 shared 反而要走 barrier。
+    uint histo[64];
+    uint base[64];
+
+    for (uint m = 0u; m < kBlends; ++m) {
+        const uint count = min(counters[m], total);
+        const uint listBase = m * total;
+
+        // ---- 写间接绘制命令（与排序无关，先写）----
+        const uint cbase = m * 4u;
+        cmd[cbase + 0u] = 6u;     // vertexCount：TRIANGLE_LIST 下两个三角形
+        cmd[cbase + 1u] = count;  // instanceCount：本类的存活粒子数
+        cmd[cbase + 2u] = 0u;     // firstVertex
+        cmd[cbase + 3u] = 0u;     // firstInstance
+
+        if (!doSort || count == 0u) continue;
+
+        for (uint b = 0u; b < 64u; ++b) {
+            histo[b] = 0u;
+            base[b] = 0u;
+        }
+
+        // ---- ① 求键的范围 ----
+        // ByDistance 用真实范围（而不是 near/far）归一化：粒子往往只占
+        // 视野里很小的一段深度，按 near/far 归一化会把它们全挤进两三个
+        // 桶里，排序等于没做。
+        float kmin = 1e30;
+        float kmax = -1e30;
+        for (uint i = 0u; i < count; ++i) {
+            const float k = sortKey(alive[listBase + i]);
+            kmin = min(kmin, k);
+            kmax = max(kmax, k);
+        }
+        const float span = max(kmax - kmin, 1e-6);
+
+        // ---- ② 直方图 ----
+        for (uint i = 0u; i < count; ++i) {
+            const float k = sortKey(alive[listBase + i]);
+            const uint b = min(uint((k - kmin) / span * float(nb - 1u) + 0.5),
+                               nb - 1u);
+            histo[b] += 1u;
+        }
+
+        // ---- ③ 前缀和（独占扫描）----
+        uint acc = 0u;
+        for (uint b = 0u; b < nb; ++b) {
+            base[b] = acc;
+            acc += histo[b];
+        }
+
+        // ---- ④ 散射 ----
+        // 用 base[] 当游标：写完一个就 +1，于是同一个桶里的粒子按
+        // 紧凑表原顺序落位（稳定排序）。桶内顺序无关紧要，但"稳定"
+        // 让两次运行的结果可复现 —— 验证脚本要的正是这个。
+        for (uint i = 0u; i < count; ++i) {
+            const uint gid = alive[listBase + i];
+            const float k = sortKey(gid);
+            const uint b = min(uint((k - kmin) / span * float(nb - 1u) + 0.5),
+                               nb - 1u);
+            const uint slot = base[b];
+            base[b] = slot + 1u;
+            if (slot < total) aliveSorted[listBase + slot] = gid;
+        }
+    }
+}

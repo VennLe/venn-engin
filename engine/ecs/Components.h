@@ -19,6 +19,7 @@ class Mesh;
 class Material;
 class Model;
 class Skeleton;
+class Texture;
 }
 
 namespace ecs {
@@ -184,6 +185,60 @@ struct VisibilityComponent {
     bool castShadow = true;   // 参与阴影贴图渲染
 };
 
+// ---------------- 延迟贴花（DBuffer，R4-4）----------------
+//
+// 贴花 = 一个**盒体体积** + 两张贴图。渲染时画的是盒体几何（单位立方体 ×
+// 世界矩阵），但片元不采盒体自己的表面，而是：
+//   ① 从深度图 texelFetch 重建该像素的**场景表面世界坐标**；
+//   ② 乘 worldToLocal 投到贴花局部空间；
+//   ③ 落在单位立方体内 → 采样贴花贴图，结果写进 DBuffer（三张：反照率 /
+//      世界法线 / 粗糙度-金属度），再由前向 Pass 按 coverage 混合进去。
+//
+// 为什么绕这一圈而不干脆把贴图画在盒体表面上：贴花要"贴着"任意形状的
+// 表面（地面标记 / 弹孔 / 墙上的涂鸦），贴着盒体面只能得到一个悬空的方盒。
+// 这个 pass 也没有深度附件 —— 遮挡关系完全由"重建出的场景点是否在盒内"
+// 决定（见 DecalBuffer 的说明）。
+//
+// 位置 / 朝向 / 尺寸都取自实体的 TransformComponent：
+//   · position / rotation → 盒体中心与朝向
+//   · scale × size         → 盒体的三个半轴长度
+// 于是"移动贴花"与"移动物体"共用同一套机制（含父链累乘、撤销、序列化）。
+struct DecalComponent {
+    // 盒体尺寸（米，沿**实体局部轴**）。默认 1 m 立方体。
+    glm::vec3 size{1.0f, 1.0f, 1.0f};
+    // 不透明度：乘在贴花 albedo 的 alpha 上，也就是 DBuffer 里 coverage
+    // 的上限。0 = 完全看不见（但 pass 照跑，用于对照实验）。
+    float opacity = 1.0f;
+
+    // 贴花颜色 = albedo.rgb × tint。让同一张贴图能当多种标记用。
+    glm::vec3 tint{1.0f};
+
+    // 贴花自己的 PBR 参数。**覆盖**被贴表面的对应量（按 coverage 加权）：
+    // 弹孔该比周围墙面更粗糙、油渍该更有金属感，都靠它。
+    float roughness = 0.7f;
+    float metallic = 0.0f;
+    // 法线强度：0 = 贴花不影响法线（只用场景几何法线），1 = 贴图原样。
+    float normalScale = 1.0f;
+
+    // 距离淡出（米，相机到**贴花中心**的距离）。
+    // fadeEnd <= fadeStart 时这一路关闭（默认关闭 = 不做距离淡出）。
+    float fadeStart = 0.0f;
+    float fadeEnd = 0.0f;
+
+    // 边缘软淡出（占半轴的比例：0 = 硬边，0.15 = 最后 15% 逐渐透明）。
+    // 硬边会在盒体边界上留下一条可见的直线接缝。
+    float edgeFade = 0.15f;
+
+    bool enabled = true;
+
+    // 贴图。为空时用缺省值（albedo → 白、normal → 平坦法线），
+    // 也就是"只有一个纯色方块"，仍然是个能用的贴花。
+    //   albedo —— 颜色贴图（srgb=true）
+    //   normal —— 切线空间法线（srgb=false）
+    assets::Texture* albedo = nullptr;
+    assets::Texture* normal = nullptr;
+};
+
 // ---------------- 玩家（运行态由 WASD + 鼠标驱动）----------------
 //
 // Player 实体 = 玩家的"脚"。第一人称只是一个空节点（+ 胶囊碰撞体，
@@ -309,6 +364,334 @@ struct ScriptComponent {
     std::string path;          // 脚本路径（相对资产根，或绝对路径）
     bool enabled = true;
     float timeScale = 1.0f;    // 脚本内部 time / dt 的缩放
+};
+
+// ---------------- 反射探针（R5-1）----------------
+//
+// 一个探针 = 场景里的一个**盒体**（沿实体局部轴）。渲染器从盒体中心把
+// 周围环境烘成一张立方体贴图，之后任何落在这个盒体内的表面，其镜面
+// 反射都从这张图里取 —— 于是背对窗口的墙/地板/金属球也能反射出屋子
+// 里的东西（那是 SSR 按定义做不到的：屏幕里没有的东西它反射不了）。
+//
+// 盒体尺寸直接复用实体的 Transform（位置 / 旋转 / 缩放）：
+//   extents 是**半轴长度**，实体的 scale 会再乘上去（所以把一个探针
+//   整体放大就是把它的作用范围放大，与直觉一致）。
+struct ReflectionProbeComponent {
+    // 盒体半轴（米，沿实体局部轴）。默认 10×10×5 —— 一个房间的尺度。
+    // 探针的**作用范围**就是这个盒子：只有盒体内部的表面才会采样它。
+    glm::vec3 extents{10.0f, 10.0f, 5.0f};
+
+    // 反射强度倍率。1 = 与 IBL 同强度；0 = 关了（但捕获照做，用于对照）。
+    float intensity = 1.0f;
+
+    // 盒投影修正。开（默认）= 把反射方向先打到盒体壁上再采样 ——
+    // 贴近单面墙时会得到正确的透视（关掉的话整个房间的反射会被压成
+    // 一个方向的天空，贴到平面上像一张贴纸）。
+    bool boxProjection = true;
+
+    // 边界混合距离（米）：从盒体边界往里 blend 这么宽的区域里，
+    // 探针的权重线性淡出到 0。硬边会在两个相邻探针之间留下可见接缝。
+    float blendDistance = 1.0f;
+
+    bool enabled = true;
+};
+
+// ---------------- GPU 粒子发射器（R6-1）----------------
+//
+// 一个发射器 = 场景里的一个**点 / 盒体 / 球 / 锥**，它按 rate 持续
+// 往外喷粒子；粒子在 GPU 上模拟（年龄 / 速度 / 重力 / 阻尼 / 曲线），
+// 由一个 instanced billboard pass 画出来。
+//
+// ---- 为什么粒子数据不在组件里 ----
+// 组件是"发射器的配置"，不是"粒子"。粒子（位置/速度/年龄）活在
+// render::ParticleSystem 的 GPU 池子里，每帧被 compute 推进一步 ——
+// 上万颗粒子不可能每帧从 CPU 塞回去（那正是本任务要消掉的瓶颈）。
+// 所以这里只有**参数**，没有运行时状态；序列化也只需要存参数。
+//
+// ---- 位置 / 朝向 ----
+// 与贴花 / 探针同一条约定：发射器的位置与朝向直接吃实体的 Transform
+// （含父链累乘），所以移动发射器 = 用同一套 gizmo / 撤销 / 层级。
+//
+// ---- 为什么曲线是 4 个滑条而不是曲线编辑器 ----
+// 路线图明确"曲线编辑先用滑条组"。4 个控制点在 t = 0、1/3、2/3、1 处
+// 线性插值 —— 足够表达"先大后小""先亮后灭"这两类最常见的形状，
+// 而它的存储就是一个 vec4，序列化 / 撤销 / GPU 上传全都是现成的。
+// 真正的曲线编辑器（贝塞尔 + 关键帧）留给后续的粒子编辑器任务。
+//
+// ---- 模块划分照抄 Unity Shuriken ----
+// 本组件与 Inspector 面板都按 Unity 的模块切分（Main / Emission / Shape /
+// Velocity over Lifetime / Limit Velocity / Force over Lifetime / Color over
+// Lifetime / Size over Lifetime / Rotation over Lifetime / Noise / Renderer），
+// 这样"在 Unity 里会调粒子的人"打开面板就能直接上手 —— 参数名、单位、
+// 分组顺序都刻意对齐。Blender 那边（Emitter / Physics / Render 三大块）
+// 的差别主要是曲线编辑体验，本引擎用 4 点滑条曲线 + 渐变色带表达。
+//
+// ---- 每个模块都有 enabled 开关，默认 = 老行为 ----
+// 新增模块全部默认**关**（或默认值等价于"不产生影响"），所以：
+//   · 老场景加载进来逐位一致（验收"无粒子组件 = 基线不变"的延伸）；
+//   · 冻结帧验证的旧断言全部继续成立。
+enum class ParticleShape : int {
+    Point = 0,       // 从一个点发射
+    Box,             // 在盒体体积内均匀分布
+    Sphere,          // 在球体内均匀分布（半径 = shapeRadius）
+    Hemisphere,      // 上半球
+    Cone,            // 沿实体局部 +Z 的锥体（半径 = shapeRadius，角 = spread）
+    Circle,          // 底面圆盘（等价于厚度 = 0 的 Cone 底面）
+    Edge,            // 沿一条线段（长度 = 2 × shapeRadius，沿局部 X）
+};
+
+// Unity 的 "Emit From"：形状的体积 / 边缘 / 壳。
+enum class ParticleEmitFrom : int {
+    Volume = 0,  // 实心体积内均匀（半径按 radiusThickness 加权）
+    Edge,        // 只在边缘（Box 的棱 / Cone 的底圈）
+    Shell,       // 只在表面上（球壳 / 盒面）
+};
+
+enum class ParticleBlend : int {
+    Additive = 0,  // 加色（火 / 火花 / 魔法）—— 默认
+    Alpha,         // 普通 alpha 混合（烟 / 水花）
+};
+
+// Unity 的 Renderer > Render Mode。
+enum class ParticleRenderMode : int {
+    Billboard = 0,           // 永远正对相机（默认）
+    StretchedBillboard,      // 长轴沿速度方向拉伸
+    HorizontalBillboard,     // 躺平（正对世界 Z 轴）—— 地面环形冲击波
+    VerticalBillboard,       // 竖立但绕世界 Z 轴锁定 —— 火柱、瀑布
+};
+
+// Unity 的 Renderer > Sort Mode。加色混合与顺序无关，只有 Alpha 需要它。
+enum class ParticleSortMode : int {
+    None = 0,          // 槽位顺序（最快，加色用这个）
+    ByDistance,        // 远的先画（Alpha 的正确顺序）
+    OldestFirst,       // 老的先画
+    YoungestFirst,     // 新的先画
+};
+
+// Unity 的 Main > Simulation Space。
+enum class ParticleSimulationSpace : int {
+    Local = 0,  // 发射器移动时粒子跟着走（火把、车尾灯）
+    World,      // 发射出去的粒子留在世界里（烟雾、篝火）
+};
+
+// 颜色渐变的停靠点上限。8 个足够表达火焰（暗红→橙→黄→白→烟）与
+// 爆炸（白→黄→橙→红→黑）这类典型色带，而 GPU 侧就是 8 个 vec4。
+static constexpr int kMaxColorStops = 8;
+
+// 一次性爆发的上限（Unity 的 Bursts 是个可增删的数组，这里固定 4 条）。
+static constexpr int kMaxBursts = 4;
+
+// 颜色渐变的第 i 个停靠点：xyz = 线性 HDR 颜色，w = 位置 t ∈ [0,1]。
+// 存成 vec4 而不是 (float t, vec3 rgb) 是为了让 std430 的数组步长
+// 恰好是 16 字节 —— 与 GPU 那边的 `vec4 ramp[8]` 逐字对齐。
+struct ParticleColorRamp {
+    int count = 3;
+    glm::vec4 stops[kMaxColorStops] = {
+        glm::vec4(1.00f, 0.75f, 0.25f, 0.0f),   // t = 0：橙
+        glm::vec4(1.00f, 0.35f, 0.05f, 0.5f),   // t = 0.5：红
+        glm::vec4(0.25f, 0.04f, 0.02f, 1.0f),   // t = 1：暗红
+        glm::vec4(0.0f), glm::vec4(0.0f), glm::vec4(0.0f), glm::vec4(0.0f),
+        glm::vec4(0.0f),
+    };
+    // 停靠点必须按 t 递增（求值时只做一次线性扫描，不做排序）。
+    // 面板在拖动停靠点时调用；插入排序，最多 8 个元素。
+    void sort() {
+        if (count < 2) return;
+        if (count > kMaxColorStops) count = kMaxColorStops;
+        for (int i = 1; i < count; ++i) {
+            const glm::vec4 key = stops[i];
+            int j = i - 1;
+            while (j >= 0 && stops[j].w > key.w) {
+                stops[j + 1] = stops[j];
+                --j;
+            }
+            stops[j + 1] = key;
+        }
+    }
+    // 求值：t 落在哪一段，段内线性插值。
+    // t 在第一个停靠点之前 → 取第一个；在最后一个之后 → 取最后一个。
+    glm::vec3 eval(float t) const {
+        if (count <= 0) return glm::vec3(1.0f);
+        if (count == 1) return glm::vec3(stops[0]);
+        const float u = glm::clamp(t, 0.0f, 1.0f);
+        if (u <= stops[0].w) return glm::vec3(stops[0]);
+        for (int i = 1; i < count; ++i) {
+            if (u <= stops[i].w) {
+                const float span = stops[i].w - stops[i - 1].w;
+                const float f =
+                    span > 1e-6f ? (u - stops[i - 1].w) / span : 0.0f;
+                return glm::mix(glm::vec3(stops[i - 1]), glm::vec3(stops[i]), f);
+            }
+        }
+        return glm::vec3(stops[count - 1]);
+    }
+};
+
+// Unity 的 Bursts 数组的一项。
+struct ParticleBurst {
+    // 相对发射器开始的时刻（秒）。0 = 立刻。
+    float time = 0.0f;
+    // 这一波发多少颗。
+    int count = 0;
+    // 重复几次（1 = 只发一次）。0 或 1 都表示一次。
+    int cycles = 1;
+    // 两次之间的间隔（秒）。cycles > 1 时才有意义。
+    float interval = 0.0f;
+};
+
+struct ParticleEmitterComponent {
+    // ======================================================================
+    //  Main / Playback（Unity 的 "Particle System" 主模块）
+    // ======================================================================
+    // 每秒发射数。真实发射数是**累积**的：rate=120 在 60fps 下
+    // 每帧发 2 颗，rate=90 则是"发 1 颗、停 1 颗、发 1 颗……"。
+    // 累积器在 GPU 侧按"每个槽位自己的相位"实现（见 particle_sim.comp），
+    // 所以任何帧率下发射都是均匀的、且完全确定（给定帧号就能算出状态）。
+    float rate = 120.0f;
+    // 每移动 1 米额外发射多少颗（Unity: Rate over Distance）。
+    // 与 rate 叠加：静止时只有 rate 起作用，快速移动时轨迹会"拉丝"。
+    // 0 = 关（默认，等价于老行为）。
+    float rateOverDistance = 0.0f;
+
+    // ---- 播放控制 ----
+    // 发射时长（秒）。**0 = 无限**（默认）。
+    // > 0 且 looping 时，每 duration 秒重新开始一轮（含 burst）；
+    // > 0 且非 looping 时，duration 之后停止发射（已有粒子继续活完）。
+    float duration = 0.0f;
+    bool looping = true;
+    // 预热：模拟在"第 0 秒"之前先跑一整轮，所以第一帧看到的就是
+    // 稳态（Unity 的 Prewarm）。**冻结帧验证不要开** —— 它会让
+    // "第一次模拟"不再是第 1 步。默认关。
+    bool prewarm = false;
+    // 启动延迟（秒）：这时刻之前不发射。默认 0。
+    float startDelay = 0.0f;
+
+    // ---- 生命周期 ----
+    float lifetime = 1.8f;           // 基础寿命（秒）
+    float lifetimeVariance = 0.2f;   // 寿命随机比例（0..1，± 这个比例）
+    float startSpeed = 2.5f;         // 初速（米/秒）
+    float speedVariance = 0.3f;      // 速度随机比例（0..1）
+    float spread = 25.0f;            // 方向扩散半角（度），Cone 也用它
+
+    // ======================================================================
+    //  Emission（一次性爆发）
+    // ======================================================================
+    ParticleBurst bursts[kMaxBursts];
+    // 兼容字段：等价于 bursts[0]（time = 0，cycles = 1）。
+    // 序列化时若只有 "burst" 就填进 bursts[0]。
+    // ⚠ 不直接用它驱动 GPU（统一走 bursts 数组），只是老的读写入口。
+    // 面板显示的是 bursts 数组。
+
+    // ======================================================================
+    //  Shape
+    // ======================================================================
+    ParticleShape shape = ParticleShape::Point;
+    glm::vec3 shapeExtents{0.5f, 0.5f, 0.5f};  // Box 的**半轴**（米）
+    float shapeRadius = 0.5f;                  // Sphere / Cone / Circle / Edge
+    // 体积厚度：1 = 实心（老行为），0 = 只有壳/边缘。
+    // Unity 面板上叫 "Radius Thickness"。
+    float radiusThickness = 1.0f;
+    // 绕局部 +Z 的角度范围（度）。360 = 整圈（默认），180 = 只在半边。
+    float arc = 360.0f;
+    // 形状自身绕局部 +Z 的旋转（度）。把"半边锥"转到想要的方向。
+    float shapeRotation = 0.0f;
+    ParticleEmitFrom emitFrom = ParticleEmitFrom::Volume;
+
+    // ======================================================================
+    //  Velocity over Lifetime（Unity 的模块之一，默认关）
+    // ======================================================================
+    bool velOverLifeEnabled = false;
+    // 三个轴向的 4 点曲线（加在速度上，米/秒）
+    glm::vec4 velOverLifeX{0.0f};
+    glm::vec4 velOverLifeY{0.0f};
+    glm::vec4 velOverLifeZ{0.0f};
+    // 曲线的坐标系：false = 发射器局部（默认），true = 世界。
+    bool velOverLifeWorldSpace = false;
+    // 绕三轴的轨道角速度（度/秒）—— 火旋、龙卷风的基础。
+    glm::vec3 orbital{0.0f};
+    float orbitalOffset = 0.0f;   // 轨道半径偏移（米）
+    // 径向速度（米/秒）：正 = 从中心向外，负 = 向内聚拢。
+    float radial = 0.0f;
+    // 速度倍率曲线（Unity 的 Speed Modifier）：乘在 |v| 上。
+    // 0,0,0,0 = 关（默认）。
+    glm::vec4 speedModifier{0.0f};
+
+    // ======================================================================
+    //  Limit Velocity over Lifetime
+    // ======================================================================
+    bool limitVelEnabled = false;
+    float limitSpeed = 1.0f;      // 速度上限（米/秒）
+    float limitDampen = 0.0f;     // 超过上限时每秒损失多少比例（0..1）
+
+    // ======================================================================
+    //  Force over Lifetime
+    // ======================================================================
+    bool forceEnabled = false;
+    glm::vec3 force{0.0f};        // 恒定加速度（米/秒²），与重力叠加
+    float forceRandomize = 0.0f;  // 逐粒子随机化比例（0..1）
+
+    // ======================================================================
+    //  Rotation over Lifetime
+    // ======================================================================
+    float startRotation = 0.0f;            // 初始旋转（度）
+    float startRotationVariance = 180.0f;  // 初始旋转随机半幅（度）
+    float angularVelocity = 0.0f;          // 角速度（度/秒）
+    float angularVelocityVariance = 0.0f;  // 角速度随机比例（0..1）
+
+    // ======================================================================
+    //  Noise
+    // ======================================================================
+    bool noiseEnabled = false;
+    float noiseStrength = 1.0f;    // 扰动强度（米/秒²）
+    float noiseFrequency = 0.5f;   // 空间频率（越小越"大团"）
+    float noiseScrollSpeed = 0.0f; // 噪声场自身的滚动（0 = 冻结）
+    float noiseDamping = 0.0f;     // 阻尼（Unity: Damping）
+    int noiseOctaves = 1;          // 倍频层数（1..4）
+
+    // ======================================================================
+    //  Physics（老字段，保留）
+    // ======================================================================
+    // 重力（米/秒²）。Z-up 坐标系 → 默认 (0,0,-9.8)。
+    glm::vec3 gravity{0.0f, 0.0f, -9.8f};
+    // 每秒阻尼系数（>0 = 速度按 exp(-drag*t) 衰减）。
+    // 0 = 真空（粒子只会被重力/初速支配）。
+    float drag = 0.15f;
+    // 模拟空间：Local = 粒子跟着发射器走；World = 留在世界里。
+    ParticleSimulationSpace simulationSpace = ParticleSimulationSpace::World;
+
+    // ======================================================================
+    //  Size over Lifetime / Color over Lifetime
+    // ======================================================================
+    // 尺寸倍率：乘在 startSize 上。默认"先大后小"是火焰的典型形状。
+    glm::vec4 sizeOverLife{0.35f, 1.0f, 0.75f, 0.0f};
+    // 不透明度：默认"快速涨到 1、末段归零"。
+    glm::vec4 alphaOverLife{0.25f, 1.0f, 0.7f, 0.0f};
+    // 颜色渐变（默认就是老的"橙→红→暗红"三段）。
+    ParticleColorRamp colorRamp;
+
+    // ======================================================================
+    //  Renderer
+    // ======================================================================
+    float startSize = 0.18f;                  // 基础尺寸（米，billboard 边长）
+    ParticleBlend blend = ParticleBlend::Additive;
+    ParticleRenderMode renderMode = ParticleRenderMode::Billboard;
+    ParticleSortMode sortMode = ParticleSortMode::None;
+    // 拉伸系数：0 = 纯 billboard（永远正对相机）；>0 = 沿速度方向拉伸
+    // （拉伸长度 = 速度 × 这个系数，雨 / 火星 / 快速移动的碎屑）。
+    // ⚠ renderMode = StretchedBillboard 时才生效。
+    float stretchScale = 0.0f;
+    // 自发光强度：粒子不参与场景光照（它是自发光贴片），亮度靠它。
+    float emissive = 2.5f;
+
+    // ======================================================================
+    //  Soft particles（本引擎特有，Unity 里是粒子着色器的软混合选项）
+    // ======================================================================
+    // 开 = 粒子靠近不透明表面时按深度差淡出（消除"硬切在墙里"的接缝）。
+    // 关 = 只做硬深度遮挡。两者都不需要深度写入（见 particle.frag）。
+    bool softParticles = true;
+    float softDistance = 0.5f;  // 淡化距离（米）
+
+    bool enabled = true;
 };
 
 } // namespace ecs

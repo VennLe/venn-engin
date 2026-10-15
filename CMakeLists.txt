@@ -233,14 +233,16 @@ set(SHADER_TARGETS "")
 # 关键字**位序**必须与 ShaderKeywords.h 里的 ShaderKeyword 逐位一致：
 #   bit0 → VENN_DOUBLE_SIDED   bit1 → VENN_ALPHA_BLEND
 #   bit2 → VENN_NORMAL_MAP     bit3 → VENN_ALPHA_MASK
+#   bit4 → VENN_SHADING_SKIN   bit5 → VENN_PARALLAX
 #
 # 凡是源码里出现 #if VENN_* 的着色器，都必须列进 SHADER_VARIANT_SHADERS ——
-# 它会为 2^5 = 32 种组合各编一份 <名字>.k<掩码>.<阶段>.spv。
+# 它会为 2^6 = 64 种组合各编一份 <名字>.k<掩码>.<阶段>.spv。
 # 文件名里的 k 数字就是掩码本身，由 render::variantShaderFile() 用同一条
 # 规则拼出来。位序改了而这里没改，运行时会读不到文件并在 stderr 报
 # "找不到变体着色器"（VariantPipelines.cpp），不会静默画错。
 set(SHADER_KEYWORDS VENN_DOUBLE_SIDED VENN_ALPHA_BLEND
-                    VENN_NORMAL_MAP VENN_ALPHA_MASK VENN_SHADING_SKIN)
+                    VENN_NORMAL_MAP VENN_ALPHA_MASK VENN_SHADING_SKIN
+                    VENN_PARALLAX)
 set(SHADER_VARIANT_SHADERS pbr.frag)
 
 # 掩码 0..31 对应的 -D 参数表 —— **生成式**（R4-1 起从手写 8 行换成循环）。
@@ -395,7 +397,7 @@ list(APPEND SHADER_TARGETS ${PBR_MDI_OUT})
 # 4x（默认）时用后者。给空间.glsl 的函数族提供两种重载签名。
 set(SHADER_MSAA_DEPTH_SHADERS
     ssao.frag ssao_blur.frag fg_ssr.frag fg_ssgi.frag fg_godrays.frag
-    fg_dof.frag fg_motionblur.frag fg_taa.frag)
+    fg_dof.frag fg_motionblur.frag fg_taa.frag decal.frag particle.frag)
 
 foreach(SRC ${SHADER_MSAA_DEPTH_SHADERS})
     set(SRC_PATH ${SHADER_SRC_DIR}/${SRC})

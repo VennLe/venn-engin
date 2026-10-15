@@ -15,6 +15,7 @@
 #include "render/VolumetricFog.h"
 #include "render/LightTextureLibrary.h"
 #include "render/FrameGraph.h"
+#include "render/FeatureRegistry.h"
 
 // 编辑器视口要把它自己的离屏输出图注册成 ImGui 纹理
 #include <imgui.h>
@@ -55,6 +56,15 @@ bool envBool(const char* name, bool defaultValue) {
     return true;
 }
 
+// 从环境变量读一个整数 —— 用于有**级别**的诊断开关（MYVK_FX_DBG=1 打
+// 逐帧计数，=2 再打一份发射器参数）。没设置 / 空串 / 解析不出 → 默认值。
+// 与 envBool 同样的态度：宁可退回默认值，也不要让错别字悄悄改行为。
+int envInt(const char* name, int defaultValue) {
+    const char* s = std::getenv(name);
+    if (!s || s[0] == '\0') return defaultValue;
+    return std::atoi(s);
+}
+
 // set 0 的 binding 数：0=FrameUBO 1=阴影图 2..5=灯/簇/索引/遥测
 // 6=骨骼矩阵 7=辐照度 8=预过滤 9=BRDF表 10=天空立方体
 // 从环境变量读 "r,g,b"（三个 float）。解析失败就当没设置 ——
@@ -89,7 +99,7 @@ bool envFloat(const char* name, float& out) {
     return true;
 }
 
-constexpr uint32_t kGlobalSetBindings = 20;
+constexpr uint32_t kGlobalSetBindings = 25;
 
 // "当前没有绑定任何前向变体管线"的哨兵。
 // ⚠ 不能用 0：0 是**合法掩码**（三个关键字全关，也是最常见的材质）。
@@ -118,211 +128,325 @@ void transformAabb(const glm::mat4& m, const glm::vec3& lo, const glm::vec3& hi,
 
 } // namespace
 
+// ============================================================
+// E01 · 特性注册表接线
+//
+// 把 FeatureRegistry 里的参数 id 接到真实成员地址上。写法刻意保持
+// "一行一个参数"，因为这张表就是"引擎里到底有哪些可调项"的**清单** ——
+// 和 FeatureRegistry.cpp 里的元数据表一一对应，缺一边都会被
+// logRegistrySelfCheck() 点名。
+//
+// ⚠ 绑定必须发生在**成员默认初始化之后**（NSDMI 都在这里之前跑完），
+//   因为 bindParam 会把"此刻的值"记成默认值；随后 loadEnvOverrides()
+//   才把 env 覆盖写进去。顺序反了会让默认值变成 env 值 → reset 失效。
+// ============================================================
+void Renderer::bindFeatureParams() {
+    using render::ParamKind;
+
+    // ---- 剔除 / LOD ----
+    render::bindParam("cull.frustum", &m_frustumCullingEnabled, ParamKind::Bool);
+    render::bindParam("hiz.enabled", &m_occlusionCullingEnabled, ParamKind::Bool);
+    render::bindParam("hiz.bias", &m_hizBiasNdc, ParamKind::Float);
+    render::bindParam("lod.enabled", &m_lodEnabled, ParamKind::Bool);
+    render::bindParam("lod.bias", &m_lodBias, ParamKind::Float);
+    render::bindParam("lod.force", &m_forcedLodLevel, ParamKind::Int);
+
+    // ---- 天空 / 表面 ----
+    render::bindParam("sky.enabled", &m_skyEnabled, ParamKind::Bool);
+    render::bindParam("sky.ibl", &m_iblEnabled, ParamKind::Bool);
+    render::bindParam("sss.curvature", &m_sssCurvatureScale, ParamKind::Float);
+    render::bindParam("pom.coverage", &m_pomCoverageScale, ParamKind::Float);
+    // 一个 env（MYVK_POM_FADE="起点,终点"）写两个字段 → 用 aux
+    render::bindParamAux("pom.fade", &m_pomFadeStart, &m_pomFadeEnd,
+                         ParamKind::Float);
+    render::bindParam("pom.maxLayers", &m_pomMaxLayers, ParamKind::Float);
+
+    // ---- 级联阴影 ----
+    render::bindParam("shadow.enabled", &m_shadowsEnabled, ParamKind::Bool);
+    render::bindParam("shadow.cascades", &m_shadowCascades, ParamKind::Int);
+    render::bindParam("shadow.distance", &m_shadowDistance, ParamKind::Float);
+    render::bindParam("shadow.lambda", &m_shadowLambda, ParamKind::Float);
+    render::bindParam("shadow.resolution", &m_shadowResolution, ParamKind::Int);
+    render::bindParam("shadow.fadeStart", &m_shadowFadeStart, ParamKind::Float);
+    render::bindParam("shadow.texelSnap", &m_shadowTexelSnap, ParamKind::Bool);
+    render::bindParam("shadow.blend", &m_shadowBlend, ParamKind::Float);
+    render::bindParam("shadow.harden", &m_shadowHarden, ParamKind::Float);
+
+    // ---- 局部光源阴影 ----
+    render::bindParam("lshadow.enabled", &m_localShadowsEnabled,
+                      ParamKind::Bool);
+    render::bindParam("lshadow.maxLights", &m_localShadowMaxLights,
+                      ParamKind::Int);
+    render::bindParam("lshadow.resolution", &m_localShadowResolution,
+                      ParamKind::Int);
+    // 只前三个分量有 env（w 是每帧写的开关位）
+    render::bindParam("lshadow.bias", &m_localShadowBias.x, ParamKind::Vec3);
+
+    // ---- 光源修饰 ----
+    render::bindParam("lm.ies", &m_iesEnabled, ParamKind::Bool);
+    render::bindParam("lm.cookie", &m_cookieEnabled, ParamKind::Bool);
+    render::bindParam("lm.areaLight", &m_areaLightEnabled, ParamKind::Bool);
+
+    // ---- 屏幕空间 ----
+    render::bindParam("ssao.enabled", &m_screenSpace.ssao, ParamKind::Bool);
+    render::bindParam("ssao.radius", &m_screenSpace.ssaoRadius,
+                      ParamKind::Float);
+    render::bindParam("ssao.strength", &m_screenSpace.ssaoStrength,
+                      ParamKind::Float);
+    render::bindParam("ssao.bias", &m_screenSpace.ssaoBias, ParamKind::Float);
+
+    render::bindParam("hfog.enabled", &m_screenSpace.fog, ParamKind::Bool);
+    render::bindParam("hfog.density", &m_screenSpace.fogDensity,
+                      ParamKind::Float);
+    render::bindParam("hfog.falloff", &m_screenSpace.fogHeightFalloff,
+                      ParamKind::Float);
+
+    render::bindParam("vfog.enabled", &m_screenSpace.vfog, ParamKind::Bool);
+    render::bindParam("vfog.density", &m_screenSpace.vfogDensity,
+                      ParamKind::Float);
+    render::bindParam("vfog.albedo", &m_screenSpace.vfogAlbedo,
+                      ParamKind::Float);
+    render::bindParam("vfog.falloff", &m_screenSpace.vfogHeightFalloff,
+                      ParamKind::Float);
+    render::bindParam("vfog.blob", &m_screenSpace.vfogBlobStrength,
+                      ParamKind::Float);
+    render::bindParam("vfog.phaseG", &m_screenSpace.vfogPhaseG,
+                      ParamKind::Float);
+
+    render::bindParam("ssgi.enabled", &m_screenSpace.ssgi, ParamKind::Bool);
+    render::bindParam("ssgi.strength", &m_screenSpace.ssgiStrength,
+                      ParamKind::Float);
+    render::bindParam("ssgi.radius", &m_screenSpace.ssgiRadius,
+                      ParamKind::Float);
+
+    render::bindParam("ssr.enabled", &m_screenSpace.ssr, ParamKind::Bool);
+    render::bindParam("ssr.strength", &m_screenSpace.ssrStrength,
+                      ParamKind::Float);
+
+    render::bindParam("godrays.enabled", &m_screenSpace.godrays, ParamKind::Bool);
+    render::bindParam("godrays.strength", &m_screenSpace.godraysStrength,
+                      ParamKind::Float);
+
+    render::bindParam("decals.enabled", &m_screenSpace.decals, ParamKind::Bool);
+
+    // ---- 反射探针（R5-1）----
+    // 探针本体是 ECS 组件（编辑器创建）；这里绑的是全局设置。
+    // captureSize / autoFrames 用 ParamKind::Int（字段本身就是 int）。
+    render::bindParam("probe.enabled", &m_probeSettings.enabled,
+                      ParamKind::Bool);
+    render::bindParam("probe.intensity", &m_probeSettings.intensity,
+                      ParamKind::Float);
+    render::bindParam("probe.captureSize", &m_probeSettings.captureSize,
+                      ParamKind::Int);
+    render::bindParam("probe.autoFrames", &m_probeSettings.autoCaptureFrames,
+                      ParamKind::Int);
+
+    // ---- GPU 粒子（R6-1）----
+    // 粒子本体是 ECS 组件（发射器，编辑器里创建）；这里绑的是**全局**
+    // 设置 —— 全局倍率 × 组件参数，两者正交。容量 / 发射器上限 /
+    // 模拟频率**故意不接 UI**（装机参数，改一次要重建整套显存），
+    // 只走 MYVK_FX_CAPACITY / _EMITTERS / _HZ。
+    render::bindParam("fx.enabled", &m_particleSettings.enabled,
+                      ParamKind::Bool);
+    render::bindParam("fx.sizeScale", &m_particleSettings.sizeScale,
+                      ParamKind::Float);
+    render::bindParam("fx.softness", &m_particleSettings.softness,
+                      ParamKind::Float);
+    render::bindParam("fx.intensity", &m_particleSettings.intensity,
+                      ParamKind::Float);
+    render::bindParam("fx.freezeFrame", &m_particleSettings.freezeFrame,
+                      ParamKind::Int);
+
+    render::bindParam("taa.enabled", &m_screenSpace.taa, ParamKind::Bool);
+    render::bindParam("taa.blend", &m_screenSpace.taaBlend, ParamKind::Float);
+    render::bindParam("taa.clamp", &m_screenSpace.taaClamp, ParamKind::Float);
+
+    // ---- 相机效果 ----
+    render::bindParam("dof.enabled", &m_cameraFx.dof, ParamKind::Bool);
+    render::bindParam("dof.focus", &m_cameraFx.dofFocus, ParamKind::Float);
+    render::bindParam("dof.aperture", &m_cameraFx.dofAperture,
+                      ParamKind::Float);
+    render::bindParam("dof.maxRadius", &m_cameraFx.dofMaxRadius,
+                      ParamKind::Float);
+
+    render::bindParam("mb.enabled", &m_cameraFx.motionBlur, ParamKind::Bool);
+    render::bindParam("mb.strength", &m_cameraFx.motionBlurStrength,
+                      ParamKind::Float);
+    render::bindParam("mb.samples", &m_cameraFx.motionBlurSamples,
+                      ParamKind::Int);
+    render::bindParam("mb.simYaw", &m_mbSimYaw, ParamKind::Float);
+
+    render::bindParam("chroma.enabled", &m_cameraFx.chromatic, ParamKind::Bool);
+    render::bindParam("chroma.strength", &m_cameraFx.chromaStrength,
+                      ParamKind::Float);
+
+    render::bindParam("vig.enabled", &m_cameraFx.vignette, ParamKind::Bool);
+    render::bindParam("vig.strength", &m_cameraFx.vignetteStrength,
+                      ParamKind::Float);
+    render::bindParam("vig.power", &m_cameraFx.vignettePower, ParamKind::Float);
+
+    // ---- 渲染路径 / 纹理 / 变体 ----
+    render::bindParam("rp.depthPrepass", &m_depthPrePassEnabled,
+                      ParamKind::Bool);
+    render::bindParam("rp.clusterCull", &m_clusterCullingEnabled,
+                      ParamKind::Bool);
+    render::bindParam("rp.instancing", &m_instancingEnabled, ParamKind::Bool);
+    render::bindParam("rp.mdi", &m_mdiEnabled, ParamKind::Bool);
+    render::bindParam("rp.bindless", &m_bindlessEnabled, ParamKind::Bool);
+    render::bindParam("rp.gizmos", &m_showLightGizmos, ParamKind::Bool);
+    render::bindParam("rp.extraView", &m_extraViewWanted, ParamKind::Bool);
+
+    render::bindParam("tex.mipmaps", &m_texMipmaps, ParamKind::Bool);
+    render::bindParam("tex.stream", &m_texStream, ParamKind::Bool);
+    render::bindParam("tex.aniso", &m_anisoOverride, ParamKind::Float);
+
+    render::bindParam("var.forceMask", &m_forcedKeywordMask, ParamKind::Int);
+    render::bindParam("var.taaPhase", &m_taaForcePhase, ParamKind::Int);
+
+    // ---- 视口栅格参数（E02/E09：纯 UI，无 env；开关不在这组里）----
+    render::bindParam("grid.minorStep", &m_grid.minorStep, ParamKind::Float);
+    render::bindParam("grid.majorStep", &m_grid.majorStep, ParamKind::Float);
+    render::bindParam("grid.extent", &m_grid.extent, ParamKind::Float);
+    render::bindParam("grid.alpha", &m_grid.alpha, ParamKind::Float);
+    render::bindParam("grid.lineWidthPx", &m_grid.lineWidthPx,
+                      ParamKind::Float);
+    render::bindParam("grid.fadeStart", &m_grid.fadeStart, ParamKind::Float);
+    render::bindParam("grid.fadeEnd", &m_grid.fadeEnd, ParamKind::Float);
+}
+
+// PostSettings 住在 PostProcess 里，要等 createMainTarget() 建好 m_post
+// 才能拿到地址 —— 所以单独一次绑定 + 一次 loadEnvOverrides()。
+// loadEnvOverrides() 只处理"尚未应用过"的绑定，所以第二次调用不会把
+// 上面那批已经应用过的参数再打一遍（这一点很关键：init() 里有些开关
+// 会被设备能力修正，重打会把它覆盖回去）。
+void Renderer::bindPostFeatureParams() {
+    using render::ParamKind;
+    render::PostSettings& ps = m_post->settings();
+
+    render::bindParam("post.exposure", &ps.exposure, ParamKind::Float);
+    render::bindParam("post.tonemap", &ps.tonemapMode, ParamKind::Int);
+    render::bindParam("post.bloomThreshold", &ps.bloomThreshold,
+                      ParamKind::Float);
+    render::bindParam("post.bloomKnee", &ps.bloomKnee, ParamKind::Float);
+    render::bindParam("post.bloomStrength", &ps.bloomStrength,
+                      ParamKind::Float);
+    render::bindParam("post.fxaa", &ps.fxaa, ParamKind::Bool);
+
+    render::bindParam("ae.enabled", &ps.autoExposure, ParamKind::Bool);
+    render::bindParam("ae.key", &ps.exposureKey, ParamKind::Float);
+    render::bindParam("ae.speed", &ps.exposureSpeed, ParamKind::Float);
+    render::bindParam("ae.bias", &ps.exposureBias, ParamKind::Float);
+    render::bindParam("ae.min", &ps.exposureMin, ParamKind::Float);
+    render::bindParam("ae.max", &ps.exposureMax, ParamKind::Float);
+
+    render::bindParam("cg.enabled", &ps.colorGrading, ParamKind::Bool);
+    render::bindParam("cg.blend", &ps.cgLutBlend, ParamKind::Float);
+    render::bindParam("cg.lift", &ps.cgLift[0], ParamKind::Color3);
+    render::bindParam("cg.gamma", &ps.cgGamma[0], ParamKind::Color3);
+    render::bindParam("cg.gain", &ps.cgGain[0], ParamKind::Color3);
+    render::bindParam("cg.contrast", &ps.cgContrast, ParamKind::Float);
+    render::bindParam("cg.saturation", &ps.cgSaturation, ParamKind::Float);
+
+    render::bindParam("drs.enabled", &ps.dynamicRes, ParamKind::Bool);
+    render::bindParam("drs.auto", &ps.drsAuto, ParamKind::Bool);
+    render::bindParam("drs.scale", &ps.renderScale, ParamKind::Float);
+    render::bindParam("drs.targetMs", &ps.drsTargetMs, ParamKind::Float);
+    render::bindParam("drs.minScale", &ps.drsMinScale, ParamKind::Float);
+    render::bindParam("drs.maxScale", &ps.drsMaxScale, ParamKind::Float);
+    render::bindParam("drs.sharpness", &ps.drsSharpness, ParamKind::Float);
+}
+
 Renderer::Renderer(core::Window& window) : m_window(window) {
     // 物体级视锥剔除开关。默认开；MYVK_FRUSTUM_CULL=0 可关闭 ——
     // 自动化验证靠它做"开关两次画面必须一致"的对照。
-    m_frustumCullingEnabled = envBool("MYVK_FRUSTUM_CULL", true);
+    // ============================================================
+    // 环境变量初值 —— 已全部迁进 FeatureRegistry（E01 阶段 A）
+    //
+    // 原来这里散着 100 多行「成员 = envBool(环境变量名, 默认值)」；现在
+    // 每个可调项只在 render/FeatureRegistry.cpp 的 kFeatures[] 里登记
+    // 一次，env 名/默认值/取值域/tooltip/UI 档位都在那一处。
+    //
+    // ⚠ 搬迁是**纯等价变换**：解析语义（envBool 的 "0/f/F/off"、
+    //   envFloat 拒绝负数与 NaN、atoi 直取、sscanf 部分解析…）逐条对应
+    //   到 EnvMode 上的一个分支；默认值在 bindParam 那一刻从成员捕获，
+    //   所以不设任何 env 时行为与搬迁前**逐位一致**（39 例回归基线）。
+    //
+    // 注册表还额外派生出：Engine/Features 面板的控件、工具提示、
+    // 分级折叠、单项复位 —— 这些原来都得手写。
+    // ============================================================
+    bindFeatureParams();
+    render::loadEnvOverrides();
 
-    // Hi-Z 遮挡剔除（R2-1）。默认**关** —— 与所有新效果同一条约定：
-    // "关闭 = 与引入前逐像素相同"。MYVK_HIZ=1 打开；
-    // MYVK_HIZ_BIAS 覆盖遮挡判定的 NDC 深度偏置（越大越保守、越少剔）。
-    m_occlusionCullingEnabled = envBool("MYVK_HIZ", false);
+    // 诊断开关不进注册表（它们不是"特性参数"，只是打日志的闸门）。
     m_hizDbg = envBool("MYVK_HIZ_DBG", false);
-    if (const char* s = std::getenv("MYVK_HIZ_BIAS")) {
-        const float v = static_cast<float>(std::atof(s));
-        if (v >= 0.0f) m_hizBiasNdc = v;
-    }
 
-
-    // LOD 开关。默认开；MYVK_LOD=0 退回"全部 LOD0"，同样是对照组。
-    m_lodEnabled = envBool("MYVK_LOD", true);
-    // 全局偏差与强制层级：验证脚本靠它们做"偏差真的把分界推过去了"
-    // 和"某一级长什么样"的断言。
-    if (const char* s = std::getenv("MYVK_LOD_BIAS")) {
-        const float v = static_cast<float>(std::atof(s));
-        if (v > 0.0f) m_lodBias = v;
-    }
-    if (const char* s = std::getenv("MYVK_LOD_FORCE")) {
-        m_forcedLodLevel = std::atoi(s);
-    }
-
-    // IBL / 天空盒开关。两个都默认开。
-    //   MYVK_IBL=0 → pbr.frag 回退到旧的程序化天空梯度近似
-    //   MYVK_SKY=0 → 不画天空盒背景（露出 HDR 清屏色）
-    // 分开是为了让验证脚本能分别隔离"新背景 pass"与"新 IBL 数学"。
-    m_iblEnabled = envBool("MYVK_IBL", true);
-    m_skyEnabled = envBool("MYVK_SKY", true);
-
-    // ---- 预积分皮肤散射（R4-2）----
+    // ---- 预积分皮肤散射（R4-2） ----
     //   MYVK_SSS=f → 曲率缩放（默认 kSssDefaultCurvatureScale = 8）。
     //                f = 0 时曲率恒 0 → LUT 退化成 Lambert，正好当"关掉
     //                SSS"的对照组；f > 1 更夸张、f < 1 更含蓄。
     //   只影响 ShadingModel=Skin 的材质 —— Default 材质不引用这段数据，
     //   所以本变量的任何取值都不可能改变 Default 的像素。
-    {
-        float sss = 0.0f;
-        if (envFloat("MYVK_SSS", sss)) m_sssCurvatureScale = sss;
-    }
-
-    // ---- 级联阴影（CSM）----
-    //   MYVK_SHADOW=0          → 完全关掉阴影（shader 里 shadowParams.w = 0）
-    //   MYVK_SHADOW_CASCADES=n → 1..4。**1 就是旧单张图的行为**，
-    //                            验证脚本靠它做"CSM 改善的是哪一段"的对照
-    //   MYVK_SHADOW_DIST=米    → 最远阴影距离（距离分级的硬边界）
-    //   MYVK_SHADOW_LAMBDA=f   → 级联分割的 log/uniform 混合系数
-    //   MYVK_SHADOW_RES=像素   → 每级的分辨率
-    m_shadowsEnabled = envBool("MYVK_SHADOW", true);
-    if (const char* s = std::getenv("MYVK_SHADOW_CASCADES")) {
-        m_shadowCascades = std::min(std::max(std::atoi(s), 1), 4);
-    }
-    if (const char* s = std::getenv("MYVK_SHADOW_DIST")) {
-        const float v = static_cast<float>(std::atof(s));
-        if (v > 0.0f) m_shadowDistance = v;
-    }
-    if (const char* s = std::getenv("MYVK_SHADOW_LAMBDA")) {
-        const float v = static_cast<float>(std::atof(s));
-        m_shadowLambda = std::min(std::max(v, 0.0f), 1.0f);
-    }
-    if (const char* s = std::getenv("MYVK_SHADOW_RES")) {
-        const int v = std::atoi(s);
-        if (v >= 256) m_shadowResolution = static_cast<uint32_t>(v);
-    }
-    // ---- 阴影硬化三件套（R3-1）----
-    //   MYVK_SHADOW_SNAP=0     → 关掉纹素量化（默认 1 = 旧行为，验证用）
-    //   MYVK_SHADOW_BLEND=f    → 级联间混合带宽，占本级跨度的比例（0 = 关）
-    //   MYVK_SHADOW_HARDEN=f   → 接触硬化强度（0 = 关）
-    if (const char* s = std::getenv("MYVK_SHADOW_SNAP")) {
-        m_shadowTexelSnap = (std::atoi(s) != 0);
-    }
-    if (const char* s = std::getenv("MYVK_SHADOW_BLEND")) {
-        const float v = static_cast<float>(std::atof(s));
-        m_shadowBlend = std::min(std::max(v, 0.0f), 0.5f);
-    }
-    if (const char* s = std::getenv("MYVK_SHADOW_HARDEN")) {
-        const float v = static_cast<float>(std::atof(s));
-        m_shadowHarden = std::min(std::max(v, 0.0f), 1.0f);
-    }
-
+    //
+    // ---- 视差遮挡贴图（R4-3，POM）----
+    //   MYVK_POM=f          → 全局倍率兼开关，乘在材质的 heightScale 上。
+    //   MYVK_POM_FADE=a,b   → 距离淡出区间（米）。超出 b 完全退回法线贴图。
+    //   MYVK_POM_LAYERS=n   → 层数上限（步进的最大层数，典型 16~64）。
+    // 只影响挂了高度图（VENN_PARALLAX）的材质 —— 没挂的整段编掉。
+    //
+    // ---- 级联阴影（CSM）+ 阴影硬化三件套（R3-1）----
+    //   MYVK_SHADOW / _CASCADES / _DIST / _LAMBDA / _RES
+    //   MYVK_SHADOW_SNAP=0 关纹素量化；_BLEND 级联混合带宽；_HARDEN 接触硬化
+    //
     // ---- 局部光源阴影（点光 / 聚光灯）----
-    //   MYVK_LOCAL_SHADOW=0      → 关掉（图仍渲染，片元不再采样）
-    //   MYVK_LOCAL_SHADOW_LIGHTS=n → 本帧最多几盏灯投（按到相机距离由近到远取）
-    //   MYVK_LOCAL_SHADOW_RES=px  → 每层分辨率（改它要重建资源，init 时）
-    //   MYVK_LOCAL_SHADOW_BIAS=a,b,c → 常数(米) / 斜率(米) / PCF 半径(纹素)
-    m_localShadowsEnabled = envBool("MYVK_LOCAL_SHADOW", true);
-    if (const char* s = std::getenv("MYVK_LOCAL_SHADOW_LIGHTS")) {
-        m_localShadowMaxLights = static_cast<uint32_t>(std::max(std::atoi(s), 0));
-    }
-    if (const char* s = std::getenv("MYVK_LOCAL_SHADOW_BIAS")) {
-        float a = m_localShadowBias.x, b = m_localShadowBias.y,
-              c = m_localShadowBias.z;
-        if (std::sscanf(s, "%f,%f,%f", &a, &b, &c) >= 1) {
-            m_localShadowBias.x = a;
-            m_localShadowBias.y = b;
-            m_localShadowBias.z = c;
-        }
-    }
-
+    //   MYVK_LOCAL_SHADOW / _LIGHTS / _RES / _BIAS(三个分量)
+    //
     // ---- Shader 变体 / 关键字（见 render/ShaderKeywords.h）----
-    //   MYVK_SHADER_FORCE_MASK=n → 无视材质，所有绘制项都用掩码 n（0..7）。
-    //     逐个变体做对照实验用：比如 =4（只开 NORMAL_MAP）能看出法线贴图
-    //     到底改了多少像素，=1 能看出双面是否真的画出了背面。
-    //     默认 -1 = 不强制，按材质推导。
-    //   MYVK_SHADER_VARIANTS=1 在 recordFrame 里读，决定打不打每 30 帧
-    //     那条 SHADER-VARIANTS 自检日志（必须在前向 Pass 之后打，
-    //     否则管线切换次数还没累加出来）。
-    if (const char* s = std::getenv("MYVK_SHADER_FORCE_MASK")) {
-        const int v = std::atoi(s);
-        if (v >= 0 && v <= static_cast<int>(kKeywordAll)) {
-            m_forcedKeywordMask = v;
-        }
-    }
-
-    // ---- 屏幕空间效果（SSAO / 雾 / SSGI / SSR / God rays）----
+    //   MYVK_SHADER_FORCE_MASK=n → 无视材质，所有绘制项都用掩码 n。
+    //   MYVK_SHADER_VARIANTS=1 在 recordFrame 里读（日志开关，不在这里）。
+    //
+    // ---- 屏幕空间效果（SSAO / 雾 / SSGI / SSR / God rays / TAA / 贴花）----
     // 全部默认关：像素级回归依赖"什么都不开 = 基线逐位不变"。
-    // 环境变量只做初值，运行时由 Engine 面板实时切（零重建）。
-    m_screenSpace.ssao = envBool("MYVK_SSAO", false);
-    m_screenSpace.fog = envBool("MYVK_FOG", false);
-    m_screenSpace.ssgi = envBool("MYVK_SSGI", false);
-    m_screenSpace.ssr = envBool("MYVK_SSR", false);
-    m_screenSpace.godrays = envBool("MYVK_GODRAYS", false);
-    // TAA（R1-1）：链的**头**。开着时会额外做两件事 —— 帧首给投影矩阵
-    // 加 Halton(2,3) 子像素抖动、FrameGraph 里多跑一个 resolve pass。
-    m_screenSpace.taa = envBool("MYVK_TAA", false);
-    envFloat("MYVK_SSAO_RADIUS", m_screenSpace.ssaoRadius);
-    envFloat("MYVK_SSAO_STRENGTH", m_screenSpace.ssaoStrength);
-    envFloat("MYVK_FOG_DENSITY", m_screenSpace.fogDensity);
-    envFloat("MYVK_FOG_FALLOFF", m_screenSpace.fogHeightFalloff);
-    envFloat("MYVK_SSGI_STRENGTH", m_screenSpace.ssgiStrength);
-    envFloat("MYVK_SSGI_RADIUS", m_screenSpace.ssgiRadius);
-    envFloat("MYVK_SSR_STRENGTH", m_screenSpace.ssrStrength);
-    envFloat("MYVK_GODRAYS_STRENGTH", m_screenSpace.godraysStrength);
-    envFloat("MYVK_TAA_BLEND", m_screenSpace.taaBlend);
-    envFloat("MYVK_TAA_CLAMP", m_screenSpace.taaClamp);
-    // Froxel 体积雾（R3-2）。用 MYVK_VFOG* 前缀 —— MYVK_FOG* 已被
-    // 上面的**高度雾**占用，两者是独立路径。
-    m_screenSpace.vfog = envBool("MYVK_VFOG", false);
-    envFloat("MYVK_VFOG_DENSITY", m_screenSpace.vfogDensity);
-    envFloat("MYVK_VFOG_ALBEDO", m_screenSpace.vfogAlbedo);
-    envFloat("MYVK_VFOG_FALLOFF", m_screenSpace.vfogHeightFalloff);
-    envFloat("MYVK_VFOG_BLOB", m_screenSpace.vfogBlobStrength);
-    envFloat("MYVK_VFOG_PHASE_G", m_screenSpace.vfogPhaseG);
-    // 光源修饰（R3-3）。三个都默认**关**：关时逐灯修饰记录全零，着色器
-    // 走原始光照路径，与基线逐位一致。
-    m_iesEnabled = envBool("MYVK_IES", false);
-    m_cookieEnabled = envBool("MYVK_COOKIE", false);
-    m_areaLightEnabled = envBool("MYVK_AREA_LIGHT", false);
+    // 环境变量只做初值，运行时由 Engine/Features 面板实时切（零重建）。
+    //
+    // ---- 光源修饰（R3-3）----
+    //   三个都默认**关**：关时逐灯修饰记录全零，着色器走原始光照路径。
+    //
+    // 以上全部（含各自的 env 名、默认值、取值域、校验规则）已登记在
+    // render/FeatureRegistry.cpp 的 kFeatures[]；本函数体顶部那次
+    // bindFeatureParams() + loadEnvOverrides() 就是它们的唯一读取点。
+    // 详见 FeatureRegistry.h 顶部对迁徙语义的说明。
+
     // MYVK_IES_FILE="name1:path1;name2:path2" —— 运行时把 .ies 文件
     // 加载进纹理库。解析推迟到库建好之后（见构造函数后段）。
+    // 它是**字符串清单**而不是标量参数，所以不进注册表。
     if (const char* s = std::getenv("MYVK_IES_FILE")) m_iesFileSpec = s;
-    // MYVK_TAA_PHASE：冻结抖动相位（验证钩子，见 m_taaForcePhase 注释）
-    if (const char* s = std::getenv("MYVK_TAA_PHASE")) {
-        const int v = std::atoi(s);
-        if (v >= 0 && v < 8) m_taaForcePhase = v;
-    }
 
     // ---- 纹理能力钩子（默认全维持旧行为：无 mip、设备默认各向异性）----
-    m_texMipmaps = envBool("MYVK_MIPMAP", false);
-    m_texStream = envBool("MYVK_TEXSTREAM", false);
-    // <0 = 不覆盖（用设备上限）；0-8 覆盖（1 = 强制各向同性）
-    m_anisoOverride = -1.0f;
-    float aniso = 0.0f;
-    if (envFloat("MYVK_ANISO", aniso) && aniso > 0.0f)
-        m_anisoOverride = aniso;
+    // MYVK_MIPMAP / MYVK_TEXSTREAM / MYVK_ANISO 已登记进注册表（tex.*）。
+    // ⚠ m_anisoOverride 的默认值 -1 由成员初始化给出，注册表在绑定时
+    //   捕获它；env 只在"能解析成 > 0"时才写入（EnvMode::FloatPositive），
+    //   与原代码 `if (envFloat(...) && aniso > 0.0f)` 完全一致。
 
     // ---- 相机级后处理效果（见 render/CameraEffects.h）----
     // 默认全关（暗角例外：它在引入本模块前就在合成 push 里，默认 0.25）。
     // 关着时对应 pass 不录 / push 参数为 0 → 画面逐像素回基线。
-    m_cameraFx.dof = envBool("MYVK_DOF", false);
-    envFloat("MYVK_DOF_FOCUS", m_cameraFx.dofFocus);
-    envFloat("MYVK_DOF_APERTURE", m_cameraFx.dofAperture);
-    envFloat("MYVK_DOF_RADIUS", m_cameraFx.dofMaxRadius);
-    m_cameraFx.motionBlur = envBool("MYVK_MOTIONBLUR", false);
-    envFloat("MYVK_MB_STRENGTH", m_cameraFx.motionBlurStrength);
-    {
-        float v = 0.0f;
-        if (envFloat("MYVK_MB_SAMPLES", v))
-            m_cameraFx.motionBlurSamples = static_cast<int>(v);
-    }
-    m_cameraFx.chromatic = envBool("MYVK_CHROMA", false);
-    envFloat("MYVK_CHROMA_STRENGTH", m_cameraFx.chromaStrength);
+    //
+    // MYVK_DOF* / MYVK_MOTIONBLUR / MYVK_MB_* / MYVK_CHROMA* /
+    // MYVK_VIGNETTE_* 已登记进注册表（dof.* / mb.* / chroma.* / vig.*）。
+    //
+    // ⚠ MYVK_VIGNETTE_OFF 是**反向**开关（设了就关暗角），与注册表的
+    //   "env 写初值"模型相反，所以留在原地不进注册表。
     if (envBool("MYVK_VIGNETTE_OFF", false)) m_cameraFx.vignette = false;
-    envFloat("MYVK_VIGNETTE_STRENGTH", m_cameraFx.vignetteStrength);
-    {
-        float v = 0.0f;
-        if (envFloat("MYVK_VIGNETTE_POWER", v) && v > 0.0f)
-            m_cameraFx.vignettePower = v;
-    }
-    // 运动模糊的可复现性钩子（静态相机下人为制造角速度，见 uploadSceneState）
-    envFloat("MYVK_MB_SIM_YAW", m_mbSimYaw);
 
     // ---- 多相机 / 通用 RenderTarget ----
     //   MYVK_VIEW_CAM=n   → 主视口用 scene.camera(n) 渲染（多相机对照）
     //   MYVK_EXTRA_VIEW=1 → 额外建一个离屏目标（2 号）做通用 RT 演示
+    // （extraView 已登记为 rp.extraView；VIEW_CAM 不是"特性参数"而是
+    //  "用哪台相机"，留在这里。）
     if (const char* s = std::getenv("MYVK_VIEW_CAM")) {
         const int v = std::atoi(s);
         if (v >= 0) m_viewCameraIndex = static_cast<size_t>(v);
     }
-    m_extraViewWanted = envBool("MYVK_EXTRA_VIEW", false);
 }
 
 Renderer::~Renderer() {
@@ -454,7 +578,9 @@ void Renderer::init() {
     //      必须在 createPipelines **之前**建好 —— 前向变体的 setLayouts
     //      里 set 1 就是这里的布局。缺省贴图也要一并注册（材质槽为空时
     //      材质页要指向它们）。
-    m_bindlessEnabled = envBool("MYVK_BINDLESS", false);
+    // MYVK_BINDLESS 已登记为 rp.bindless（构造函数里读好），此处只保留
+    // 诊断闸门 + 设备能力降级 —— 降级是"能力修正"而不是"env 读取"，
+    // 所以不受注册表约束。
     m_bindlessDbg = envBool("MYVK_BINDLESS_DBG", false);
     if (m_bindlessEnabled && !m_device->supportsBindless()) {
         // 设备不支持就整体降级，绝不半开：半开的症状是"管线建不出来"
@@ -499,14 +625,11 @@ void Renderer::init() {
     m_sampleCount = sampleCountFromEnv();
     createMainTarget();
 
-    // 自动化测试钩子：让验证脚本能固定住会改变画面的开关，
-    // 从而做"剔除前/后""MSAA 开/关"的像素级对比。
-    m_depthPrePassEnabled = envBool("MYVK_DEPTH_PREPASS", true);
-    m_clusterCullingEnabled = envBool("MYVK_CLUSTER_CULL", true);
-    m_showLightGizmos = envBool("MYVK_LIGHT_GIZMOS", true);
-    // GPU instancing / 合批：默认关（像素级回归的基线路径）。开着时
-    // 渲染结果必须与关着逐像素一致 —— 验证脚本的核心断言。
-    m_instancingEnabled = envBool("MYVK_INSTANCING", false);
+    // 渲染路径开关（深度预通道 / 簇剔除 / 灯 gizmo / 合批）由
+    // FeatureRegistry 的 rp.* 在构造函数里统一读 env 并写入成员
+    // —— 验证脚本仍走同一批环境变量（MYVK_DEPTH_PREPASS /
+    // _CLUSTER_CULL / _LIGHT_GIZMOS / _INSTANCING），语义不变。
+    // 这里不再重复读，避免出现"第二个写入口"。
 
     // Multi-draw indirect + GPU 紧凑化（R2-2，见 render/MdiDraw.h）。默认**关**。
     // 它有三个硬前提，打开时一并带上（并打日志说清楚，免得日后排查
@@ -514,9 +637,10 @@ void Renderer::init() {
     //   · 遮挡剔除   —— 紧凑化的输入就是 Hi-Z 的测试结果；
     //   · 合批       —— 间接命令按**批**组织（批 = 同掩码+同材质+同网格）；
     //   · 深度预通道 —— 紧凑化要在前向之前拿到**本帧**深度。
-    // ⚠ 必须排在上面三行**之后**：这里会把它们改掉，反过来就被覆盖了。
-    m_mdiEnabled = envBool("MYVK_MDI", false);
-    m_mdiDbg = envBool("MYVK_MDI_DBG", false);
+    // ⚠ 前提开关（遮挡剔除 / 合批 / 深度预通道）已由注册表的 rp.* 在
+    //   构造函数里读好，所以这里的 "改成 true" 不会被后续 env 覆盖。
+    //   m_mdiEnabled 本身也是 rp.mdi（MYVK_MDI），此处不再重复读。
+    m_mdiDbg = envBool("MYVK_MDI_DBG", false);   // 诊断闸门，不进注册表
     if (m_mdiEnabled) {
         const bool forced = !m_occlusionCullingEnabled || !m_instancingEnabled;
         m_occlusionCullingEnabled = true;
@@ -525,6 +649,21 @@ void Renderer::init() {
         VK_LOG_INFO("MDI: enabled (occlusion=1 instancing=1%s)",
                     forced ? " depth-prepass=1 (forced)" : "");
     }
+
+    // 视差遮挡贴图（R4-3）：全局参数确认（逐材质的深度在 push.skin.y）。
+    // 默认倍率 1.0；= 0 时整段短路 → 与没开 POM 逐像素相同。
+    VK_LOG_INFO("POM: scale=%.3f fade=%.1f..%.1f m layers=%.0f", 
+                static_cast<double>(m_pomCoverageScale),
+                static_cast<double>(m_pomFadeStart),
+                static_cast<double>(m_pomFadeEnd),
+                static_cast<double>(m_pomMaxLayers));
+
+    // 延迟贴花（R4-4）：默认**关**（MYVK_DECALS 已登记为 decals.enabled，
+    // 构造函数里读好）。关着时一个 pass 都不录、set0/binding 20..22 绑
+    // 全透明图 → pbr.frag 的贴花分支整段跳过（"关 = 基线逐像素不变"）。
+    VK_LOG_INFO("DECALS: %s (dbuffer x3 RGBA8, max %u decals/slot)",
+                m_screenSpace.decals ? "on" : "off",
+                render::DecalBuffer::kMaxDecals);
 
     // 调试视图模式（R0-2）：MYVK_VIEW_MODE=<0..7> 固定初始模式（自动化
     // 验证用；wireframe 在不支持 fillModeNonSolid 的设备上会被
@@ -549,6 +688,18 @@ void Renderer::init() {
     //      的 render pass。但它必须在 writeGlobalDescriptors 之前，
     //      因为 set 0 的 binding 7..10 要绑到这些图上。
     createEnvironment();
+
+    // 9.6) 反射探针（R5-1）。只建 CPU 侧对象 + 走一遍 env 读装机参数；
+    //      GPU 资源**懒建**（默认关 → 一个字节都不分配）。必须早于
+    //      writeGlobalDescriptors —— 它要往 set 0 的 binding 23/24 写
+    //      （未就绪时写的是系统自带的缺省 cube array）。
+    createReflectionProbes();
+
+    // 9.7) GPU 粒子（R6-1）。与探针同一条约定：只建 CPU 侧对象 + 读装机
+    //      参数（容量 / 发射器上限 / 模拟频率），GPU 资源懒建（默认关 →
+    //      一个字节都不分配）。它不改 set 0（粒子自己的描述符集内部持有），
+    //      所以放在 writeGlobalDescriptors **之后**也安全。
+    createParticles();
 
     // 10) 渲染管线（必须晚于 HdrTarget —— 它要 HDR 的 render pass）
     createPipelines();
@@ -624,6 +775,11 @@ void Renderer::init() {
     // 调试视图模式的启动确认（放在 createPipelines 之后 —— wireframe
     // 可能已因 fillModeNonSolid 缺席被回退，这里打的是最终生效值）。
     VK_LOG_INFO("VIEW-MODE init mode=%s", viewModeName(m_viewMode));
+
+    // E01 自检：把"注册表登记了多少参数 / 实际绑定了多少"打一行，
+    // 有登记但没接线的一并点名。放在这里是因为绑定分两处完成
+    // （构造函数 + createMainTarget 之后的后处理），此处两者都已就绪。
+    render::logRegistrySelfCheck();
     VK_LOG_INFO(
         "Renderer initialized (GPU: %s, MSAA %ux, shadow %u, HDR %ux%u, "
         "clusters %ux%ux%u = %u)",
@@ -762,6 +918,40 @@ void Renderer::createDescriptorLayouts() {
     bindings[19].descriptorCount = 1;
     bindings[19].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+    // 20/21/22：延迟贴花的三张 DBuffer（R4-4，见 render/DecalBuffer.h）——
+    // 反照率 / 世界法线 / 粗糙度-金属度，每张的 alpha 都是 **coverage**。
+    // 关着（或场景里没有贴花）时绑一张 1×1 的 (0,0,0,0)：
+    // pbr.frag 只看 alpha，恒 0 → 贴花那段整块跳过 → 逐像素回到基线。
+    //
+    // 与 7..10 / 14 / 16 / 19 同一待遇：布局上永远存在这些 binding，
+    // 否则建管线时验证层会报"layout 里缺着色器声明的资源"。
+    for (uint32_t b = 20; b <= 22; ++b) {
+        bindings[b].binding = b;
+        bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[b].descriptorCount = 1;
+        bindings[b].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+
+    // 23：反射探针的预过滤 cube **array**（R5-1，见 render/ReflectionProbe.h）。
+    // 为什么是 array 而不是"每探针一个 binding"：探针数量是运行时变量，
+    // binding 数一变就要重建 set layout → 全管线跟着重建。用一个 array，
+    // 描述符写一次就再也不用动（与 bindless textures[] 同思路）。
+    // 关着 / 还没烘时绑 1×1 的**全黑** cube array —— pbr.frag 里
+    // probeParams.x == 0 会直接跳过整段，但 layout 上必须存在这个 binding
+    // （否则建任何用 pbr.frag 的管线时验证层报 layout-07988）。
+    bindings[23].binding = 23;
+    bindings[23].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[23].descriptorCount = 1;
+    bindings[23].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    // 24：反射探针的逐探针数据（ProbeGpu[]，std430）。
+    // 与灯表一样是可变长度 SSBO；空表时绑一块 1 元素的零缓冲，
+    // 让 shader 里的 probes[i] 永远不越界（count 由 probeParams.y 给）。
+    bindings[24].binding = 24;
+    bindings[24].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[24].descriptorCount = 1;
+    bindings[24].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
     m_globalSetLayout = rhi::makeSetLayout(
         *m_device, std::vector<VkDescriptorSetLayoutBinding>(bindings,
                                                              bindings + kGlobalSetBindings));
@@ -802,6 +992,14 @@ void Renderer::createDefaultTextures() {
     uint8_t black[4] = {0, 0, 0, 255};
     m_defaultBlack = std::make_unique<assets::Texture>();
     m_defaultBlack->makeSolid(ctx, black, 4, /*srgb=*/false);
+
+    // 全透明：延迟贴花 DBuffer 的"没有贴花"（R4-4）。
+    // 前向 Pass 只看 coverage（= alpha），所以中性值必须是 alpha=0。
+    // ⚠ 不能用 m_defaultBlack（alpha=255）：那会让整屏都被当成
+    //   coverage=1 的黑色贴花，画面直接变黑。
+    uint8_t clear[4] = {0, 0, 0, 0};
+    m_defaultTransparent = std::make_unique<assets::Texture>();
+    m_defaultTransparent->makeSolid(ctx, clear, 4, /*srgb=*/false);
 
     // ---- R4-2：预积分皮肤散射 LUT ----
     // 优先加载离线烘焙的 assets/textures/sss_lut.dds（tools/make_sss_lut.py
@@ -946,6 +1144,734 @@ uint64_t Renderer::renderTargetTextureId(size_t index) const {
     return m_targets[index]->textureId(m_currentFrame);
 }
 
+// ---------------------------------------------------------------- 反射探针（R5-1）
+//
+// 三段：① 从探针位置用 6 个面相机把**场景本身**渲进一张立方体贴图；
+//       ② 逐 mip 跑 GGX 预过滤（与 Environment 同一个 ibl_prefilter.comp）；
+//       ③ pbr.frag 按所在盒体采样。
+//
+// 这里只负责①的录制与调度，②在 ReflectionProbeSystem::finishCapture 里。
+
+void Renderer::createReflectionProbes() {
+    // ⚠ 这里**只填"装机参数"**（容量 / 预过滤质量 / 诊断闸门）。
+    //    enabled / intensity / captureSize / autoCaptureFrames 属于
+    //    FeatureRegistry 的参数（probe.*），已经在 bindFeatureParams 里
+    //    读过 env 并绑好 —— 在这里重读会造出"第二个写入口"，
+    //    那正是这个项目一直在避免的东西。这里只做防御性夹紧。
+    m_probeSettings.captureSize =
+        std::clamp(m_probeSettings.captureSize, 8, 1024);
+
+    envUint("MYVK_PROBE_MAX", 1, m_probeSettings.maxProbes);
+    m_probeSettings.maxProbes = std::min(m_probeSettings.maxProbes, 16u);
+
+    envUint("MYVK_PROBE_PREFILTER_RES", 8, m_probeSettings.prefilterSize);
+    envUint("MYVK_PROBE_PREFILTER_MIPS", 1, m_probeSettings.prefilterMips);
+    envUint("MYVK_PROBE_SAMPLES", 16, m_probeSettings.prefilterSamples);
+    m_probeSettings.prefilterSize =
+        std::min(m_probeSettings.prefilterSize, 512u);
+    m_probeSettings.prefilterMips =
+        std::min(m_probeSettings.prefilterMips, 8u);
+    // ⚠ mip 链长必须与分辨率自洽：N×N 的图最多只有 1+log2(N) 级。
+    //   例如 PREFILTER_RES=8 只支持 4 级，再要 5 级就是**规范违规**
+    //   （VUID 直接报 "mipLevels must be less than or equal to the number
+    //   of levels in the complete mipmap chain"），图像创建失败、整条
+    //   捕获链作废。环境变量是给人手敲的，不能让一个不合理的组合把
+    //   渲染器打成一个非法状态 —— 这里夹紧到合法上界。
+    {
+        uint32_t maxChain = 1;
+        for (uint32_t s = m_probeSettings.prefilterSize; s > 1; s >>= 1) ++maxChain;
+        m_probeSettings.prefilterMips =
+            std::clamp(m_probeSettings.prefilterMips, 1u, maxChain);
+    }
+
+    // 诊断闸门：只要日志（PROBE-DUMP），不改渲染行为。读回缓冲由
+    // ReflectionProbeSystem 自己按同一个变量开（见其构造函数）。
+    m_probeDbg = envBool("MYVK_PROBE_DBG", false);
+
+    m_probes = std::make_unique<render::ReflectionProbeSystem>(
+        *m_device, *m_commandPool, m_probeSettings, MAX_FRAMES_IN_FLIGHT);
+    // 捕获用的离屏目标必须与主视口同样的采样数 —— 前向管线是照主
+    // HdrTarget 的 render pass 建的，采样数不同就打不开那个 framebuffer。
+    m_probes->setCaptureSamples(m_sampleCount);
+
+    // ⚠ 这里**不**调 ensureResources()：探针默认关，关着时一个字节的
+    //    显存都不该分配（"从没用过探针的运行，显存占用与引入本模块
+    //    之前相同"）。真正的分配推迟到第一次真的启用 / 请求捕获时。
+
+    VK_LOG_INFO("PROBE: created (enabled=%d capture=%d prefilter=%u mips=%u "
+                "max=%u ssp=%u)",
+                m_probeSettings.enabled ? 1 : 0, m_probeSettings.captureSize,
+                m_probeSettings.prefilterSize, m_probeSettings.prefilterMips,
+                m_probeSettings.maxProbes, m_probeSettings.prefilterSamples);
+}
+
+// ============================================================
+// R6-1 GPU 粒子（见 fx/ParticleSystem.h）
+// ============================================================
+
+void Renderer::createParticles() {
+    if (m_particles) return;
+
+    // ---- 装机参数走 env ----
+    // 容量 / 发射器上限 / 模拟频率决定**显存布局**，改一次要 waitIdle 并
+    // 重建整套资源 —— 属于"装机参数"而不是"面板参数"（与探针的
+    // MYVK_PROBE_MAX / PREFILTER_* 同一个取舍，见 check_feature_surface.py
+    // 里那一段注释）。上限夹一下：容量是"每发射器的槽位数"，两个数相乘
+    // 才是总显存，放开了能被环境变量写成几 GB。
+    uint32_t cap = 512;
+    envUint("MYVK_FX_CAPACITY", 32, cap);
+    cap = std::min(cap, 8192u);
+    uint32_t maxEmitters = 8;
+    envUint("MYVK_FX_EMITTERS", 1, maxEmitters);
+    maxEmitters = std::min(maxEmitters, 64u);
+    uint32_t hz = 60;
+    envUint("MYVK_FX_HZ", 1, hz);
+    hz = std::min(hz, 480u);
+
+    m_particleSettings.perEmitterCapacity = cap;
+    m_particleSettings.maxEmitters = maxEmitters;
+    m_particleSettings.simHz = hz;
+
+    // 诊断闸门：只要日志（FX-DUMP / FX-EMITTER），不改渲染行为。
+    //   1 = 每 30 帧一条 FX-DUMP（GPU 侧计数）；
+    //   2 = 再打一份 FX-EMITTER（把交给 GPU 的发射器数据逐值打出来）。
+    //       ⚠ 这一级不是"更啰嗦的日志"，它是**唯一**能精确验证
+    //       "旧格式与新格式等价"的手段 —— 像素比较做不到（见冻结分支里
+    //       关于两条固有不确实性的说明）。
+    m_particleDbg = envInt("MYVK_FX_DBG", 0) >= 1;
+    m_particleDbgParams = envInt("MYVK_FX_DBG", 0) >= 2;
+
+    m_particles = std::make_unique<fx::ParticleSystem>(
+        *m_device, *m_commandPool, m_particleSettings, MAX_FRAMES_IN_FLIGHT);
+
+    // ⚠ 这里**不**调 ensureResources()：粒子默认关，关着时一个字节的显存
+    //    都不该分配（"从没用过粒子的运行，显存占用与引入本模块之前相同"）。
+    //    真正的分配推迟到第一次真的启用时。
+    VK_LOG_INFO("FX: created (enabled=%d cap=%u emitters=%u simHz=%u "
+                "poolMB=%.2f)",
+                m_particleSettings.enabled ? 1 : 0, cap, maxEmitters, hz,
+                static_cast<double>(cap) * static_cast<double>(maxEmitters) *
+                    static_cast<double>(sizeof(fx::ParticleGpu)) / 1048576.0);
+}
+
+uint32_t Renderer::collectParticleEmitters(scene::Scene& scene) {
+    m_particleScratch.clear();
+    m_particleEmitterCount = 0;
+    if (!m_particleSettings.enabled || !m_particles) return 0;
+
+    // 本帧各发射器的软化距离取**最大值**传给系统（逐粒子携带要多花
+    // 4 B × 上万粒子，而粒子之间的软化差异远小于"有 / 无软化"）。
+    float softMax = 0.0f;
+    uint32_t idx = 0;
+
+    scene.forEachParticleEmitter([&](ecs::Entity e,
+                                     ecs::ParticleEmitterComponent& pc) {
+        if (m_particleScratch.size() >= m_particleSettings.maxEmitters) return;
+        const glm::mat4 world = scene.worldMatrix(e);
+        const glm::vec3 wpos(world[3]);
+
+        fx::ParticleEmitterGpu g{};
+        // 形状采样与方向都在**发射器局部空间**做，所以整份 world 要传过去
+        //（sim 里用 mat3(world) 转方向，用 world * vec4(lp,1) 转位置）。
+        g.world = world;
+        g.origin = glm::vec4(wpos, pc.shapeRadius);
+        g.gravityDrag = glm::vec4(pc.gravity, pc.drag);
+        g.lifeSpeed = glm::vec4(pc.lifetime, pc.lifetimeVariance,
+                                pc.startSpeed, pc.speedVariance);
+        // 扩散半角存 cos 阈值：shader 里对 cos 均匀取样才是**球面上**面积
+        // 均匀（对角度均匀取样会让粒子聚在锥轴附近）。夹到 [0,90°] ——
+        // 超过 90° 就不是"沿 +Z 的锥"而是全向，那是 Sphere 形状的活。
+        g.shapeExtents = glm::vec4(
+            pc.shapeExtents,
+            std::cos(glm::radians(glm::clamp(pc.spread, 0.0f, 90.0f))));
+        g.sizeCurve = pc.sizeOverLife;
+        g.alphaCurve = pc.alphaOverLife;
+
+        // ---- Main / Playback ----
+        g.play = glm::vec4(std::max(pc.duration, 0.0f),
+                           pc.looping ? 1.0f : 0.0f,
+                           pc.prewarm ? 1.0f : 0.0f,
+                           std::max(pc.startDelay, 0.0f));
+
+        // ---- Emission ----
+        g.emit = glm::vec4(
+            std::max(pc.rate, 0.0f), std::max(pc.rateOverDistance, 0.0f),
+            static_cast<float>(static_cast<int>(pc.shape)),
+            static_cast<float>(static_cast<int>(pc.emitFrom)));
+        g.emit2 = glm::vec4(pc.shapeRotation, pc.radiusThickness, pc.arc,
+                            static_cast<float>(
+                                static_cast<int>(pc.simulationSpace)));
+
+        // ---- Shape 附加：Local 空间要用的局部重力 ----
+        // 粒子在局部空间积分，重力必须换到同一空间。
+        // inverse(mat3) 只对 3x3 旋转/缩放的线性部分求逆：
+        //   localG = inverse(mat3(world)) * worldG
+        glm::vec3 gravityLocal = pc.gravity;
+        {
+            const glm::mat3 lin(world);
+            const float det = glm::determinant(lin);
+            if (std::abs(det) > 1e-8f) {
+                gravityLocal = glm::inverse(lin) * pc.gravity;
+            }
+        }
+        const bool speedModOn =
+            glm::dot(pc.speedModifier, pc.speedModifier) > 0.0f;
+        g.shapeAux = glm::vec4(gravityLocal, speedModOn ? 1.0f : 0.0f);
+
+        // ---- Velocity over Lifetime ----
+        g.velX = pc.velOverLifeX;
+        g.velY = pc.velOverLifeY;
+        g.velZ = pc.velOverLifeZ;
+        g.speedMod = pc.speedModifier;
+        g.orbital = glm::vec4(pc.orbital, pc.orbitalOffset);
+
+        // ---- Force / Limit Velocity ----
+        g.force = glm::vec4(pc.force, pc.forceRandomize);
+        g.limitVel = glm::vec4(pc.limitSpeed, pc.limitDampen,
+                               pc.limitVelEnabled ? 1.0f : 0.0f, pc.radial);
+
+        // ---- Rotation over Lifetime ----
+        g.rot = glm::vec4(pc.startRotation, pc.startRotationVariance,
+                          pc.angularVelocity, pc.angularVelocityVariance);
+
+        // ---- Noise ----
+        g.noiseA = glm::vec4(pc.noiseStrength, pc.noiseFrequency,
+                             pc.noiseScrollSpeed, pc.noiseDamping);
+        g.noiseB = glm::vec4(pc.noiseEnabled ? 1.0f : 0.0f,
+                             static_cast<float>(glm::clamp(pc.noiseOctaves, 1, 4)),
+                             pc.velOverLifeWorldSpace ? 1.0f : 0.0f, 0.0f);
+
+        // ---- Renderer ----
+        g.miscParams = glm::vec4(pc.startSize,
+                                 static_cast<float>(static_cast<int>(pc.blend)),
+                                 pc.stretchScale, pc.emissive);
+        int rampCount = glm::clamp(pc.colorRamp.count, 0, ecs::kMaxColorStops);
+        int burstCount = 0;
+        for (int b = 0; b < ecs::kMaxBursts; ++b) {
+            if (pc.bursts[b].count > 0) ++burstCount;
+        }
+        g.renderMisc = glm::vec4(
+            static_cast<float>(static_cast<int>(pc.renderMode)),
+            static_cast<float>(static_cast<int>(pc.sortMode)),
+            static_cast<float>(rampCount), static_cast<float>(burstCount));
+
+        // ---- Color over Lifetime（渐变带）----
+        for (int s = 0; s < ecs::kMaxColorStops; ++s) {
+            g.ramp[s] = pc.colorRamp.stops[s];
+        }
+        // ---- Bursts ----
+        for (int b = 0; b < ecs::kMaxBursts; ++b) {
+            const ecs::ParticleBurst& src = pc.bursts[b];
+            g.bursts[b] = glm::vec4(src.time, static_cast<float>(src.count),
+                                    static_cast<float>(src.cycles),
+                                    src.interval);
+        }
+
+        // ---- Rate over Distance：累积距离 ----
+        // 只有**真的推进了模拟**的那些帧才算距离（见 m_particleDistPending
+        // 的说明），否则"渲染帧多走几步"会让发射量与帧率挂上钩。
+        while (m_particleEmitterPrevPos.size() <= idx) {
+            m_particleEmitterPrevPos.push_back(wpos);
+            m_particleDistPending.push_back(0.0f);
+            m_particleDistCommitted.push_back(0.0f);
+            m_particlePrewarmApplied.push_back(false);
+        }
+        const float moved = glm::distance(wpos, m_particleEmitterPrevPos[idx]);
+        m_particleEmitterPrevPos[idx] = wpos;
+        if (pc.rateOverDistance > 0.0f && moved > 0.0f) {
+            m_particleDistPending[idx] += moved;
+        }
+        g.dist = glm::vec4(m_particleDistCommitted[idx] +
+                               m_particleDistPending[idx],
+                           m_particleDistCommitted[idx], 0.0f, 0.0f);
+
+        // ---- 诊断（MYVK_FX_DBG=2）：把**交给 GPU 的这份数据**逐值打出来 ----
+        //
+        // 为什么需要这一条：验证"旧格式（burst / colorStart|Mid|End）与新格式
+        // （bursts[] / colorRamp[]）读进来等价"**不能**靠像素比较。冻结帧下
+        // 两次运行的像素差本来就有非零下界（池分槽 + atomicAdd 顺序，见冻结
+        // 分支里的长注释），1.4 的差既可能是兼容层坏了、也可能只是噪声 ——
+        // 这样的断言要么假 PASS 要么随机 FAIL。
+        //
+        // 这里把**解析之后**的结果直接打出来，"等价"就退化成一次字符串
+        // 比较：精确、零噪声。顺带让粒子配置可以脱离编辑器审计（"我设的
+        // 那 4 条 burst 到底进没进去"不用再靠截图猜）。
+        //
+        // ⚠ 必须用 %.9g：float32 的十进制往返精度。用 %g（默认 6 位）会把
+        //   "不同"的两个值打成一样，"相等"的结论就没有意义了。
+        // 单独一个计数器：本人跑在 recordFrame 里，而 FX-DUMP 在 drawFrame 里，
+        // 两者谁先谁后不该被这条诊断依赖。`%30==1` → 第 2/32/62… 次收集各一条，
+        // 45 帧的短跑就能拿到。
+        if (m_particleDbgParams && (m_particleEmitterDumpFrame++ % 30) == 1) {
+            auto v3 = [](const glm::vec3& v) {
+                char b[96];
+                std::snprintf(b, sizeof(b), "(%.9g,%.9g,%.9g)",
+                              static_cast<double>(v.x),
+                              static_cast<double>(v.y),
+                              static_cast<double>(v.z));
+                return std::string(b);
+            };
+            auto v4 = [](const glm::vec4& v) {
+                char b[128];
+                std::snprintf(b, sizeof(b), "(%.9g,%.9g,%.9g,%.9g)",
+                              static_cast<double>(v.x),
+                              static_cast<double>(v.y),
+                              static_cast<double>(v.z),
+                              static_cast<double>(v.w));
+                return std::string(b);
+            };
+            char head[1024];
+            std::snprintf(
+                head, sizeof(head),
+                "FX-EMITTER idx=%u rate=%.9g rateDist=%.9g duration=%.9g "
+                "loop=%d prewarm=%d startDelay=%.9g lifetime=%.9g "
+                "lifeVar=%.9g speed=%.9g speedVar=%.9g gravity=%s drag=%.9g "
+                "shape=%d emitFrom=%d radius=%.9g radiusThickness=%.9g "
+                "arc=%.9g spread=%.9g gravityLocal=%s gravityLocalOn=%d "
+                "size=%s alpha=%s startSize=%.9g emissive=%.9g blend=%d "
+                "mode=%d sort=%d stretch=%.9g soft=%d softDist=%.9g "
+                "rampCount=%d renderMisc=%s bursts=%d",
+                idx, static_cast<double>(pc.rate),
+                static_cast<double>(pc.rateOverDistance),
+                static_cast<double>(pc.duration), pc.looping ? 1 : 0,
+                pc.prewarm ? 1 : 0, static_cast<double>(pc.startDelay),
+                static_cast<double>(pc.lifetime),
+                static_cast<double>(pc.lifetimeVariance),
+                static_cast<double>(pc.startSpeed),
+                static_cast<double>(pc.speedVariance),
+                v3(pc.gravity).c_str(), static_cast<double>(pc.drag),
+                static_cast<int>(pc.shape), static_cast<int>(pc.emitFrom),
+                static_cast<double>(pc.shapeRadius),
+                static_cast<double>(pc.radiusThickness),
+                static_cast<double>(pc.arc), static_cast<double>(pc.spread),
+                v3(g.shapeAux).c_str(),
+                g.shapeAux.w > 0.5f ? 1 : 0,
+                v4(pc.sizeOverLife).c_str(), v4(pc.alphaOverLife).c_str(),
+                static_cast<double>(pc.startSize),
+                static_cast<double>(pc.emissive),
+                static_cast<int>(pc.blend), static_cast<int>(pc.renderMode),
+                static_cast<int>(pc.sortMode),
+                static_cast<double>(pc.stretchScale),
+                pc.softParticles ? 1 : 0,
+                static_cast<double>(pc.softDistance),
+                glm::clamp(pc.colorRamp.count, 0, ecs::kMaxColorStops),
+                v4(g.renderMisc).c_str(), burstCount);
+            std::string line(head);
+            // 色带停靠点（只打前 rampCount 个 —— 后面的槽位是脏数据，
+            // 打出来只会让"等价"比较被无意义的字节干扰）。
+            line += " rampStops=[";
+            for (int s = 0; s < rampCount; ++s) {
+                line += v4(g.ramp[s]);
+            }
+            line += "] burstList=[";
+            for (int b = 0; b < ecs::kMaxBursts; ++b) {
+                line += v4(g.bursts[b]);
+            }
+            line += "]";
+            VK_LOG_INFO("%s", line.c_str());
+        }
+
+        m_particleScratch.push_back(g);
+        ++idx;
+
+        if (pc.softParticles) softMax = std::max(softMax, pc.softDistance);
+
+        // 池耗尽：rate × lifetime > 每发射器容量 → 槽位会在粒子还没死时
+        // 被重新发射（画面表现：粒子中途"跳"到新的出生点）。这是**静态**
+        // 条件（一旦成立就一直成立），所以只打一次。
+        if (!m_particlePoolWarned && pc.rate > 0.0f &&
+            pc.rate * pc.lifetime >
+                static_cast<float>(m_particleSettings.perEmitterCapacity)) {
+            m_particlePoolWarned = true;
+            VK_LOG_WARN("FX-POOL: emitter pool exhausted (rate=%.1f x "
+                        "lifetime=%.2f = %.0f > capacity %u) -- slots are "
+                        "reused before the particles die; raise "
+                        "MYVK_FX_CAPACITY",
+                        static_cast<double>(pc.rate),
+                        static_cast<double>(pc.lifetime),
+                        static_cast<double>(pc.rate * pc.lifetime),
+                        m_particleSettings.perEmitterCapacity);
+        }
+    });
+
+    m_particleEmitterCount = static_cast<uint32_t>(m_particleScratch.size());
+
+    // ---- 排序模式与相机位置（整张紧凑表共用一个）----
+    m_particleSortMode = 0;
+    {
+        uint32_t i = 0;
+        for (const fx::ParticleEmitterGpu& g : m_particleScratch) {
+            const int m = static_cast<int>(g.renderMisc.y + 0.5f);
+            if (m != 0) {
+                m_particleSortMode = m;
+                break;
+            }
+            ++i;
+        }
+        (void)i;
+    }
+    {
+        const scene::Camera& cam =
+            m_viewCameraIndex < scene.cameraCount() ? scene.camera(m_viewCameraIndex)
+                                                    : scene.camera();
+        m_particleSortCamPos = cam.position();
+    }
+
+    // ---- Prewarm：把模拟时钟先拨到"一整轮之后" --------------------
+    // Unity 的 Prewarm 是"发射器一登场就是稳态"，实现上等价于在 t = 0
+    // 之前先跑完一整轮。这里不重跑 GPU（那要几百个 dispatch），而是把
+    // 模拟时钟**直接拨过去** —— 固定步长下这两者完全等价。
+    //
+    // 只在"这个发射器集合还没预热过"时做一次（PreWarm 是开场事件，
+    // 不是持续状态）。
+    m_particlePrewarmSteps = 0;
+    if (!m_particleSettings.enabled) {
+        /* 关着的时候不改任何东西 */
+    } else {
+        uint32_t i = 0;
+        for (const fx::ParticleEmitterGpu& g : m_particleScratch) {
+            if (i < m_particlePrewarmApplied.size() && !m_particlePrewarmApplied[i] &&
+                g.play.z > 0.5f) {
+                // duration = 0 时用 lifetime 当一整轮的长度（"让粒子填满
+                // 池子"是预热最直观的含义）。
+                const float span = (g.play.x > 0.0f) ? g.play.x : g.lifeSpeed.x;
+                const uint32_t steps = static_cast<uint32_t>(
+                    std::ceil(std::max(span, 0.0f) *
+                              static_cast<float>(m_particleSettings.simHz)));
+                m_particlePrewarmSteps = std::max(m_particlePrewarmSteps, steps);
+                m_particlePrewarmApplied[i] = true;
+            }
+            ++i;
+        }
+    }
+
+    m_particles->setSoftDistance(softMax > 0.0f ? softMax : 0.5f);
+    return m_particleEmitterCount;
+}
+
+// 与 HdrTarget 的重建同步。抽成一个函数是因为有**两个**调用点：
+// recreateScreenSpace()（分辨率 / MSAA 变了），以及"首次启用时的懒建"
+//（那时资源刚分配，framebuffer 与深度视图都还没接上）。
+void Renderer::recreateParticles() {
+    if (!m_particles) return;
+    const uint32_t n = m_hdrTarget->framesInFlight();
+    std::vector<VkImageView> colorViews, depthViews;
+    colorViews.reserve(n);
+    depthViews.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        // 目标是 HDR 的 **resolve 图**（单采样）—— 前向 pass 的
+        // finalLayout 把它留在 SHADER_READ_ONLY，粒子的 pass 接在
+        // 那里 continue。不能挂 MSAA 颜色附件：那个 pass 的
+        // depthTest/depthWrite 都是关的，挂上去只会白付采样数。
+        colorViews.push_back(m_hdrTarget->colorView(i));
+        depthViews.push_back(m_hdrTarget->depthSampledView(i));
+    }
+    m_particles->recreate(renderExtent(), m_hdrTarget->samples(), colorViews,
+                          depthViews);
+}
+
+// 收集场景里的探针 → GPU 表。同时**判定是否需要重捕**：
+//   · 被显式请求（Inspector 的 Capture 按钮 / console 命令）；
+//   · 数据哈希变了（探针增删 / 位置 / 盒体 / 开关任一变化）；
+//   · 从来没烘过（m_probeDataHash == 0）；
+//   · 自动频率到了（autoCaptureFrames > 0 且距上次捕获够久）。
+// 返回 true = 本帧要跑 recordProbeCapture。
+bool Renderer::collectProbes(scene::Scene& scene) {
+    m_probeScratch.clear();
+    m_probePositions.clear();
+    if (!m_probeSettings.enabled || !m_probes) return false;
+
+    // ---- 收集 ----
+    // 哈希用"逐探针的 4 个标量 + 世界矩阵平移列"，不用浮点逐位相等 ——
+    // 目标只是"用户动了探针 → 重捕"，不是密码学哈希。
+    uint64_t hash = 1469598103934665603ull;   // FNV-1a 64 偏移基
+    auto mix = [&hash](uint64_t v) {
+        hash ^= v;
+        hash *= 1099511628211ull;
+    };
+    auto mixF = [&mix](float f) {
+        // 量化到 1e-4：编辑器的拖拽会有无意义的尾数抖动，量化后
+        // "停手 = 不再重捕"，自动频率那一档才不会被无谓地触发。
+        mix(static_cast<uint64_t>(
+            static_cast<int64_t>(std::llround(static_cast<double>(f) * 1e4))));
+    };
+
+    scene.forEachReflectionProbe([&](ecs::Entity e,
+                                     ecs::ReflectionProbeComponent& pc) {
+        if (m_probeScratch.size() >= m_probeSettings.maxProbes) return;
+        const glm::mat4 world = scene.worldMatrix(e);
+        const glm::vec3 pos(world[3]);
+
+        // 实体 scale 折进盒体半轴：放大探针实体 = 放大作用范围。
+        // 取**绝对值**：负缩放（镜像）不该把盒子翻成空的（半轴必须是
+        // 正数，否则盒内测试恒不成立，探针看起来"完全没生效"）。
+        const glm::vec3 sx(std::abs(world[0][0]), std::abs(world[1][1]),
+                           std::abs(world[2][2]));
+        glm::vec3 ext = pc.extents * sx;
+        ext = glm::max(ext, glm::vec3(1e-3f));
+
+        // worldToLocal 只保留**旋转 + 平移**（丢掉缩放）：extents 已经
+        // 把 scale 吸收进半轴长度了，再除一次就重复了。
+        glm::mat4 rotOnly = world;
+        rotOnly[0] = glm::vec4(glm::normalize(glm::vec3(world[0])), 0.0f);
+        rotOnly[1] = glm::vec4(glm::normalize(glm::vec3(world[1])), 0.0f);
+        rotOnly[2] = glm::vec4(glm::normalize(glm::vec3(world[2])), 0.0f);
+        rotOnly[3] = glm::vec4(pos, 1.0f);
+
+        render::ProbeGpu g{};
+        g.worldToLocal = glm::inverse(rotOnly);
+        g.extents = glm::vec4(ext, glm::max(pc.blendDistance, 1e-3f));
+        g.params = glm::vec4(
+            pc.intensity, 1.0f, pc.boxProjection ? 1.0f : 0.0f, 0.0f);
+        g.worldPos = glm::vec4(pos, 0.0f);
+        m_probeScratch.push_back(g);
+        m_probePositions.push_back(pos);
+
+        mixF(pos.x); mixF(pos.y); mixF(pos.z);
+        mixF(ext.x); mixF(ext.y); mixF(ext.z);
+        mixF(pc.intensity);
+        mixF(pc.blendDistance);
+        mix(static_cast<uint64_t>(pc.boxProjection ? 1 : 0));
+    });
+
+    if (m_probeScratch.empty()) {
+        // 一个探针都没有 → 不需要捕获，且把 shader 侧也清空。
+        m_probes->upload(m_probeScratch, m_currentFrame);
+        m_probeDataHash = 0;
+        return false;
+    }
+
+    const bool dataChanged = (hash != m_probeDataHash);
+    m_probeDataHash = hash;
+
+    // ---- 判定 ----
+    // 三条**或**的关系（任意一条成立就重捕）：
+    //   ① 被显式请求（Inspector 的 Capture 按钮 / 新增探针）；
+    //   ② 数据变了，或从来没烘过（hash == 0 且还没捕获过）；
+    //   ③ 定期刷新（autoCaptureFrames > 0 时每 N 帧一次；0 = 关）。
+    //
+    // ⚠ ③ 默认就是 0。理由：捕获一次要渲 6 个面 + 跑满预过滤链，
+    //   而**静态场景里重捕的产物与上一份逐位相同** —— 定期重捕在白烧
+    //   显存带宽。动态场景（移动的光源 / 物体）才需要它，那时候由用户
+    //   在 Engine 面板里给它一个非零值。
+    bool need = false;
+    if (m_probeCaptureRequested) {
+        need = true;
+        m_probeCaptureRequested = false;
+    } else if (dataChanged || m_probes->stats().captures == 0) {
+        need = true;
+    } else if (m_probeSettings.autoCaptureFrames > 0 &&
+               m_probeFramesSinceCapture >=
+                   static_cast<uint32_t>(m_probeSettings.autoCaptureFrames)) {
+        need = true;
+    }
+    if (std::getenv("MYVK_PROBE_DBG")) {
+        VK_LOG_INFO("PROBE-DECIDE changed=%d frames=%u auto=%d captures=%u "
+                    "need=%d hash=%llu",
+                    dataChanged ? 1 : 0, m_probeFramesSinceCapture,
+                    m_probeSettings.autoCaptureFrames,
+                    m_probes->stats().captures, need ? 1 : 0,
+                    static_cast<unsigned long long>(hash));
+    }
+    return need;
+}
+
+// 6 个面的相机基。Vulkan 立方体贴图的面序：0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z。
+//
+// ⚠ up 的符号：本引擎的 Camera::projMatrix 自带 Vulkan 的 Y 翻转
+//   （proj[1][1] *= -1），所以立方体面的 lookAt 表在这里必须**把 up 取反**
+//   —— 即用经典表里的 -up。这不是笔误：Y 翻转后再用经典 up，图像会上下
+//   颠倒，盒投影算出来的方向全错（而且错得"看着像模像样"，很难发现）。
+void Renderer::probeFaceBasis(uint32_t face, glm::vec3& forward,
+                              glm::vec3& right, glm::vec3& up) {
+    switch (face) {
+        case 0: forward = { 1.0f, 0.0f, 0.0f}; right = {0.0f, 0.0f, -1.0f}; up = {0.0f, -1.0f, 0.0f}; break;
+        case 1: forward = {-1.0f, 0.0f, 0.0f}; right = {0.0f, 0.0f,  1.0f}; up = {0.0f, -1.0f, 0.0f}; break;
+        case 2: forward = { 0.0f, 1.0f, 0.0f}; right = {1.0f, 0.0f,  0.0f}; up = {0.0f,  0.0f, 1.0f}; break;
+        case 3: forward = { 0.0f,-1.0f, 0.0f}; right = {1.0f, 0.0f,  0.0f}; up = {0.0f,  0.0f,-1.0f}; break;
+        case 4: forward = { 0.0f, 0.0f, 1.0f}; right = {1.0f, 0.0f,  0.0f}; up = {0.0f, -1.0f, 0.0f}; break;
+        default: forward = {0.0f, 0.0f,-1.0f}; right = {-1.0f, 0.0f, 0.0f}; up = {0.0f, -1.0f, 0.0f}; break;
+    }
+}
+
+void Renderer::recordProbeCapture(scene::Scene& scene) {
+    if (!m_probes || !m_probes->ready()) return;
+    render::HdrTarget* target = m_probes->captureTarget();
+    if (!target || target->extent().width == 0) return;
+    if (m_probeScratch.empty()) return;
+
+    const VkExtent2D ext = target->extent();
+    const scene::Camera& main = scene.camera();
+    const float nearZ = main.nearPlane();
+    const float farZ = main.farPlane();
+
+    // ---- 独立的一次性命令缓冲 ----
+    // 为什么不在主命令缓冲里录：捕获要改**全局唯一**的 CPU 状态
+    // （绘制列表 / 相机 UBO / 灯表缓存），而主帧的录制紧随其后。
+    // 单独提交 + vkQueueWaitIdle 让"捕获"成为主帧之前**已完成**的独立
+    // 工作单元 —— 于是主帧的现场完全不受影响，捕获本身也不与主帧共享
+    // 任何在途资源（确定性优先，见文件头的取舍说明）。
+    const uint32_t count = static_cast<uint32_t>(m_probeScratch.size());
+    for (uint32_t p = 0; p < count; ++p) {
+        // **一个探针一次独立提交**。不是"图省事"：6 个面的相机 UBO 必须
+        // 在同一个提交里同时有效（UBO 记录期写、执行期读，共用一份就会
+        // 让 6 个面全读到最后写的那个 —— 详见 kProbeFaceUboSlotBase 的
+        // 注释）。一次提交一个探针 + 6 个固定槽，槽数就与 maxProbes 无关，
+        // 也不必为每个探针各留 6 个槽。捕获本来就只在"请求 / 数据变了"时
+        // 发生，多出的几次提交完全可以忽略。
+        VkCommandBuffer cmd = m_commandPool->beginOneTime();
+        m_probes->beginCapture(cmd, p);
+        for (uint32_t face = 0; face < 6; ++face) {
+            glm::vec3 fwd, right, up;
+            probeFaceBasis(face, fwd, right, up);
+            const glm::vec3 pos = m_probePositions[p];
+
+            render::ProbeFaceView fv{};
+            fv.view = glm::lookAt(pos, pos + fwd, up);
+            fv.position = pos;
+            fv.nearZ = nearZ;
+            fv.farZ = farZ;
+
+            // 每个面**独占**一个 UBO 槽：主链 UBO 留给主相机。
+            uploadSceneState(scene, ext, /*resetSkinning=*/false, nullptr,
+                             kProbeFaceUboSlotBase + static_cast<int>(face),
+                             &fv);
+            recordSceneInto(cmd, scene, *target, /*isPreview=*/true,
+                            m_sceneGlobalSet);
+            if (m_probeDbg) {
+                VK_LOG_INFO("PROBE-FACE f=%u fwd=(%.2f,%.2f,%.2f) right=(%.2f,"
+                            "%.2f,%.2f) up=(%.2f,%.2f,%.2f) opaque=%zu",
+                            face, static_cast<double>(fwd.x),
+                            static_cast<double>(fwd.y),
+                            static_cast<double>(fwd.z),
+                            static_cast<double>(right.x),
+                            static_cast<double>(right.y),
+                            static_cast<double>(right.z),
+                            static_cast<double>(up.x),
+                            static_cast<double>(up.y),
+                            static_cast<double>(up.z),
+                            m_opaqueDraws.size());
+            }
+            m_probes->copyFace(cmd, face);
+        }
+        m_probes->finishCapture(cmd, p);
+        m_probes->noteCaptureCounted();
+        m_commandPool->endAndSubmit(cmd);
+    }
+
+    m_device->waitIdle();
+
+    m_probeFramesSinceCapture = 0;
+    VK_LOG_INFO("PROBE-CAPTURE probes=%u size=%ux%u prefilter=%u mips=%u "
+                "total=%u",
+                count, ext.width, ext.height,
+                m_probeSettings.prefilterSize, m_probeSettings.prefilterMips,
+                m_probes->stats().captures);
+}
+
+//
+// 每个子视口 = 一个挂在 m_targets 尾部的 RenderTarget。
+// 之所以一定要放进 m_targets 而不是自己单独持有：离屏目标的**相机 UBO
+// 槽**是按 m_targets 下标分配的（见 FrameResources::OffscreenUbo）——
+// 同一命令缓冲里录多台相机，每台必须有自己的槽，否则后录的会把先录的
+// 相机矩阵盖掉。下标唯一 = 槽唯一，这条约束由"统一持有"来保证。
+
+// 任何增删 m_targets 之后都必须重排槽位（预览目标是懒建的，可能在子视口
+// 之后才出现，那时"子视口恒在尾部"的假设就不成立了）。
+static void reindexTargets(std::vector<std::unique_ptr<render::RenderTarget>>& v) {
+    for (size_t i = 0; i < v.size(); ++i) {
+        v[i]->setSlotIndex(static_cast<uint32_t>(i));
+    }
+}
+
+void Renderer::setSubviewCount(size_t n) {
+    if (n > 4) n = 4;
+    if (n == m_subviews.size()) return;
+
+    if (n < m_subviews.size()) {
+        // 缩容：先释放 ImGui 纹理（ImGui 后端还活着时必须先摘），
+        // 再从 m_targets 里把自己摘掉，最后重排槽位。
+        for (size_t i = n; i < m_subviews.size(); ++i) {
+            render::RenderTarget* t = m_subviews[i].target;
+            if (!t) continue;
+            t->releaseImGuiTextures();
+            for (size_t k = 0; k < m_targets.size(); ++k) {
+                if (m_targets[k].get() == t) {
+                    m_targets.erase(m_targets.begin() +
+                                    static_cast<std::ptrdiff_t>(k));
+                    break;
+                }
+            }
+        }
+        m_subviews.resize(n);
+        reindexTargets(m_targets);
+        VK_LOG_INFO("SUBVIEW: count -> %zu (targets=%zu)", m_subviews.size(),
+                    m_targets.size());
+        return;
+    }
+
+    m_subviews.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        SubviewSlot& s = m_subviews[i];
+        if (s.target) continue;
+        createRenderTarget();
+        s.target = m_targets.back().get();
+        s.target->setImGui(m_imgui ? m_imgui.get() : nullptr);
+        s.camera = std::make_unique<scene::Camera>();
+        s.dirty = true;
+    }
+    reindexTargets(m_targets);
+    VK_LOG_INFO("SUBVIEW: count -> %zu (targets=%zu)", m_subviews.size(),
+                m_targets.size());
+}
+
+void Renderer::setSubviewSize(size_t i, uint32_t w, uint32_t h) {
+    if (i >= m_subviews.size()) return;
+    if (w > 0 && w < 16) w = 16;
+    if (h > 0 && h < 16) h = 16;
+    SubviewSlot& s = m_subviews[i];
+    if (s.reqW == w && s.reqH == h) return;
+    s.reqW = w;
+    s.reqH = h;
+    s.dirty = true;
+}
+
+bool Renderer::subviewReady(size_t i) const {
+    if (i >= m_subviews.size()) return false;
+    const SubviewSlot& s = m_subviews[i];
+    return s.target != nullptr && s.target->ready() && s.target->offscreen();
+}
+
+uint64_t Renderer::subviewTextureId(size_t i) const {
+    if (!subviewReady(i)) return 0;
+    return m_subviews[i].target->textureId(m_currentFrame);
+}
+
+void Renderer::setSubviewCamera(size_t i, const scene::Camera& cam) {
+    if (i >= m_subviews.size()) return;
+    SubviewSlot& s = m_subviews[i];
+    if (!s.camera) s.camera = std::make_unique<scene::Camera>();
+    *s.camera = cam;
+}
+
+void Renderer::applySubviewTargets() {
+    for (SubviewSlot& s : m_subviews) {
+        if (!s.target) continue;
+        if (s.reqW == 0 || s.reqH == 0) continue;
+        if (!s.dirty && s.curW == s.reqW && s.curH == s.reqH) continue;
+
+        // RenderTarget::apply 内部会 waitIdle —— 所以本函数必须在
+        // 录制命令缓冲**之前**调用（drawFrame 开头，与 applyViewportSize 同处）。
+        s.target->setImGui(m_imgui ? m_imgui.get() : nullptr);
+        s.target->setSize(s.reqW, s.reqH);
+        s.target->apply(m_swapchain->views(), m_swapchain->extent(), {});
+        s.target->refreshTextures();
+        s.curW = s.reqW;
+        s.curH = s.reqH;
+        s.dirty = false;
+    }
+}
+
 // 0 号目标 = 主视口。取代过去分开的 createHdrTarget / createPostProcess。
 void Renderer::createMainTarget() {
     // 初始尺寸：编辑态用视口尺寸（非零 → 离屏模式），否则 0
@@ -962,37 +1888,38 @@ void Renderer::createMainTarget() {
     m_post = m_mainTarget->post();
     m_sampleCount = m_hdrTarget->samples();  // 设备可能不支持请求 → 降档
 
+    // ============================================================
+    // E01 · 后处理参数的绑定点
+    //
+    // PostSettings 住在 PostProcess 里（m_post），而它要等本函数把主目标
+    // 建出来才有地址 —— 所以构造函数里那次 bindFeatureParams() 够不到它，
+    // 必须在这里补一次绑定 + 一次 loadEnvOverrides()。
+    //
+    // loadEnvOverrides() **只处理尚未应用过的绑定**，所以构造期那批已经
+    // 应用过的参数不会被重打一遍。这一点很关键：init() 里有些开关会被
+    // 设备能力修正（m_bindlessEnabled 就会在不支持 bindless 的设备上被
+    // 强制关掉），重打会把它覆盖回去。
+    // ============================================================
+    bindPostFeatureParams();
+    render::loadEnvOverrides();
+
     // FXAA 默认关（保持既有画面基线；像素级回归依赖它关着）。
     // Render 面板的 checkbox 运行时可切（资源常驻，切换零重建）。
-    m_post->settings().fxaa = envBool("MYVK_FXAA", false);
+    // MYVK_FXAA 已登记为 post.fxaa（上一步已应用）。
 
-    // ---- 曝光（R1-2）----
-    // 手动曝光：MYVK_EXPOSURE=<f>。默认 1.0 —— 与本模块引入前一致，
-    // 所以不设任何 env 时画面逐像素不变。
-    envFloat("MYVK_EXPOSURE", m_post->settings().exposure);
-
-    // 自动曝光（直方图 eye adaptation）：
-    //   MYVK_AUTOEXP=1        开（默认关 —— 关着时一个 pass 都不录）
-    //   MYVK_AE_KEY=<f>       目标中间灰（默认 0.18）
-    //   MYVK_AE_SPEED=<f>     适应速度 1/秒（默认 3.0）
-    //   MYVK_AE_MIN/MAX=<f>   曝光夹紧
-    //   MYVK_AE_BIAS=<f>      EV 偏置（可为负）
-    //   MYVK_AE_SIM_LUM=<f>   验证钩子：把测量亮度钉死（跳过回读）
-    //   MYVK_AUTOEXP_DBG=1    每帧一行 AUTOEXP 日志（回归脚本读曲线）
+    // 自动曝光（R1-2）：
+    // MYVK_AUTOEXP / _AE_KEY / _AE_SPEED / _AE_MIN / _AE_MAX / _AE_BIAS
+    // 已登记为 ae.*（上一步已应用）。这里剩的两个**不是特性参数**：
     {
-        render::PostSettings& ps = m_post->settings();
-        ps.autoExposure = envBool("MYVK_AUTOEXP", false);
-        envFloat("MYVK_AE_KEY", ps.exposureKey);
-        envFloat("MYVK_AE_SPEED", ps.exposureSpeed);
-        envFloat("MYVK_AE_MIN", ps.exposureMin);
-        envFloat("MYVK_AE_MAX", ps.exposureMax);
-        if (const char* s = std::getenv("MYVK_AE_BIAS")) {
-            ps.exposureBias = static_cast<float>(std::atof(s));
-        }
+        // MYVK_AE_SIM_LUM=<f>：把测量亮度钉死，让验证脚本跳过 GPU 回读
+        // → 曝光曲线完全确定。它调的是 setter 而不是写字段，所以不进
+        // 注册表（注册表只存"字段地址"）。
         float simLum = 0.0f;
         if (envFloat("MYVK_AE_SIM_LUM", simLum) && simLum > 0.0f) {
             m_post->setAutoExposureSimLum(simLum);
         }
+        // MYVK_AUTOEXP_DBG=1：每帧一行 AUTOEXP 日志（回归脚本读曲线）。
+        // 诊断闸门，不是用户旋钮。
         m_autoExposureDbg = envBool("MYVK_AUTOEXP_DBG", false);
     }
 
@@ -1005,26 +1932,12 @@ void Renderer::createMainTarget() {
     //   MYVK_CG_CONTRAST=<f>   对比度（默认 1）
     //   MYVK_CG_SATURATION=<f> 饱和度（默认 1）
     //   MYVK_CG_DBG=1          每帧一行 LUT-INFO
-    {
-        render::PostSettings& ps = m_post->settings();
-        ps.colorGrading = envBool("MYVK_CG", false);
-        envFloat("MYVK_CG_BLEND", ps.cgLutBlend);
-        envFloat("MYVK_CG_CONTRAST", ps.cgContrast);
-        envFloat("MYVK_CG_SATURATION", ps.cgSaturation);
-        glm::vec3 v3;
-        if (envVec3("MYVK_CG_LIFT", v3)) {
-            ps.cgLift[0] = v3.x; ps.cgLift[1] = v3.y; ps.cgLift[2] = v3.z;
-        }
-        if (envVec3("MYVK_CG_GAMMA", v3)) {
-            ps.cgGamma[0] = v3.x; ps.cgGamma[1] = v3.y; ps.cgGamma[2] = v3.z;
-        }
-        if (envVec3("MYVK_CG_GAIN", v3)) {
-            ps.cgGain[0] = v3.x; ps.cgGain[1] = v3.y; ps.cgGain[2] = v3.z;
-        }
-        m_colorGradingDbg = envBool("MYVK_CG_DBG", false);
-        // 参数可能被 env 改了 → 强制重烘（构造时已 snapshot，这里再打一次脏）
-        m_post->markLutDirty();
-    }
+    // MYVK_CG / _CG_BLEND / _CG_CONTRAST / _CG_SATURATION / _CG_LIFT /
+    // _CG_GAMMA / _CG_GAIN 已登记为 cg.*（上一步已应用）。
+    // 这里只剩诊断闸门 + 一次脏标记：
+    m_colorGradingDbg = envBool("MYVK_CG_DBG", false);
+    // 参数可能被 env 改了 → 强制重烘（构造时已 snapshot，这里再打一次脏）
+    m_post->markLutDirty();
 
     // ---- 动态分辨率（DRS，R1-4）----
     //   MYVK_DRS=1             开（默认关 —— 关着时 renderScale 恒为 1.0，
@@ -1035,19 +1948,11 @@ void Renderer::createMainTarget() {
     //   MYVK_DRS_MIN/MAX=<f>   缩放夹紧（默认 0.5 / 1.0）
     //   MYVK_DRS_SHARP=<f>     升采样锐度（默认 0.6；0 = 纯双线性）
     //   MYVK_DRS_DBG=1         每帧一行 DRS 日志（回归脚本读曲线）
-    {
-        render::PostSettings& ps = m_post->settings();
-        ps.dynamicRes = envBool("MYVK_DRS", false);
-        ps.drsAuto = envBool("MYVK_DRS_AUTO", true);
-        envFloat("MYVK_RENDER_SCALE", ps.renderScale);
-        envFloat("MYVK_DRS_TARGET_MS", ps.drsTargetMs);
-        envFloat("MYVK_DRS_MIN", ps.drsMinScale);
-        envFloat("MYVK_DRS_MAX", ps.drsMaxScale);
-        envFloat("MYVK_DRS_SHARP", ps.drsSharpness);
-        if (ps.renderScale > 1.0f) ps.renderScale = 1.0f;
-        if (ps.renderScale < 0.25f) ps.renderScale = 0.25f;
-        m_drsDbg = envBool("MYVK_DRS_DBG", false);
-    }
+    // 全部已登记为 drs.*（上一步已应用）。renderScale 的 [0.25, 1.0] 夹紧
+    // 写在 drs.scale 的 clampLo/clampHi 里（EnvMode::FloatNonNeg 先拒绝
+    // 负数/NaN，再夹紧 —— 与原代码 envFloat + 两次 if 完全一致）。
+    // 这里只剩诊断闸门：
+    m_drsDbg = envBool("MYVK_DRS_DBG", false);
 }
 
 // 每帧：把后处理体积在相机位置处的覆盖值叠加到基础相机效果上。
@@ -1137,13 +2042,17 @@ void Renderer::createScreenSpace() {
     if (!m_vfog)
         m_vfog = std::make_unique<render::VolumetricFog>(
             *m_device, *m_commandPool, m_globalSetLayout, MAX_FRAMES_IN_FLIGHT);
+    // 延迟贴花（R4-4）。构造建 RPass / 管线 / 盒体网格 / 记录 SSBO；
+    // 三张 DBuffer 在 recreateScreenSpace 里按渲染分辨率建。
+    if (!m_decals)
+        m_decals = std::make_unique<render::DecalBuffer>(
+            *m_device, *m_commandPool, MAX_FRAMES_IN_FLIGHT);
     // 光源修饰纹理库（R3-3）：cookie + IES 的 sampler2DArray。与分辨率
     // 无关，一次性建好；内建图案程序化生成，永远有效。
     if (!m_lightTextures) {
         m_lightTextures = std::make_unique<render::LightTextureLibrary>(
             *m_device, *m_commandPool);
-        m_lightTextures->create();
-        // MYVK_IES_FILE="name1:path1;name2:path2" → 逐个加载
+        m_lightTextures->create();        // MYVK_IES_FILE="name1:path1;name2:path2" → 逐个加载
         if (!m_iesFileSpec.empty()) {
             size_t p = 0;
             while (p < m_iesFileSpec.size()) {
@@ -1189,6 +2098,23 @@ void Renderer::recreateScreenSpace() {
         m_vfog->recreate(ext, samples);
         m_vfog->setDepthViews(depthViews);
     }
+
+    // R4-4：DBuffer 三张图跟渲染分辨率走，深度视图与缺省贴图一并喂。
+    // 缺省贴图（白 / 平坦法线）是 DecalBuffer 内部"贴花没配图"时的兜底，
+    // 传的是 Renderer 自己那两张 —— 全引擎只有一份缺省，口径一致。
+    if (m_decals && m_defaultWhite && m_defaultFlatNormal) {
+        m_decals->recreate(ext, samples, depthFormat);
+        m_decals->setDepthViews(depthViews);
+        m_decals->setDefaultTextures(m_defaultWhite->view(),
+                                     m_defaultWhite->sampler(),
+                                     m_defaultFlatNormal->view(),
+                                     m_defaultFlatNormal->sampler());
+    }
+
+    // R6-1：粒子的 framebuffer 挂在 HDR 的 resolve 图上（每帧一张），
+    // 深度视图喂给片元做遮挡 + 软化 —— 两者都随 HdrTarget 重建而换。
+    // 片元 .spv 按 MSAA 选哪一份也在 recreate 里处理。
+    recreateParticles();
 
     // R2-2：MDI 的紧凑化着色器直接读 Hi-Z 金字塔与候选 AABB 缓冲 ——
     // 两者都属于 HiZOcclusion，重建后必须重新喂（顺序不能反）。
@@ -1355,11 +2281,12 @@ glm::vec2 taaJitterNdc(uint32_t phase, VkExtent2D extent) {
 void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
                                 bool resetSkinning,
                                 const scene::Camera* camOverride,
-                                int offscreenSlot) {
+                                int offscreenSlot,
+                                const ProbeFaceView* faceView) {
     auto& frame = m_frames[m_currentFrame];
 
     // 本场景（相机 + 投影）—— 主视口可以是 scene.camera(i)（多相机），
-    // 离屏目标可以带自己的相机。
+    // 离屏目标可以带自己的相机，反射探针（R5-1）带的是自己的面相机。
     const scene::Camera& cam = camOverride ? *camOverride : scene.camera();
 
     // ---- 选择本场景的 set 0 与 UBO 目标内存 ----
@@ -1377,20 +2304,38 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
 
     // ---- FrameUBO 的前半段（相机 / 光）----
     FrameUBO ubo{};
-    ubo.view = cam.viewMatrix();
-    ubo.proj = cam.projMatrix(
-        static_cast<float>(extent.width) / static_cast<float>(extent.height));
+    // 面相机（R5-1 探针捕获）：view 与 position 由调用方直接给，
+    // 投影是固定的 90°（立方体每个面都是正方锥角）。
+    // 其余字段（光照 / 阴影 / 雾 / 调试）仍走下面共同的一段 —— 捕获
+    // 用的是"真正的场景渲染"，不是另起一套简化光照。
+    const bool isFaceView = (faceView != nullptr);
+    glm::vec3 camPosW;
+    if (isFaceView) {
+        ubo.view = faceView->view;
+        camPosW = faceView->position;
+        // 90° 竖直 FOV、1:1 宽高比 → 每个面都是 90°×90° 的正方锥。
+        // Y 翻转与 Camera::projMatrix 一致（见 ProbeFaceView 的注释）。
+        glm::mat4 proj = glm::perspective(glm::radians(90.0f), 1.0f,
+                                          faceView->nearZ, faceView->farZ);
+        proj[1][1] *= -1.0f;
+        ubo.proj = proj;
+    } else {
+        ubo.view = cam.viewMatrix();
+        camPosW = cam.position();
+        ubo.proj = cam.projMatrix(static_cast<float>(extent.width) /
+                                  static_cast<float>(extent.height));
+    }
     glm::vec3 ld = glm::normalize(scene.light().direction);
     ubo.lightDir = glm::vec4(ld, scene.light().intensity);
     ubo.lightColor = glm::vec4(scene.light().color, 1.0f);
-    ubo.camPos = glm::vec4(cam.position(), 1.0f);
+    ubo.camPos = glm::vec4(camPosW, 1.0f);
 
     // 近远平面**必须从相机读**，不能写死常量：级联分割点、切片角点的
     // NDC 换算、以及分簇的对数切片都假设"这里的 near/far"与
     // `camera().projMatrix()` 用的是同一组值。默认都是 0.1 / 200，
     // 但场景可以改，写死就会悄悄错位。
-    const float kNear = cam.nearPlane();
-    const float kFar = cam.farPlane();
+    const float kNear = isFaceView ? faceView->nearZ : cam.nearPlane();
+    const float kFar = isFaceView ? faceView->farZ : cam.farPlane();
 
     // ---- 级联阴影：由**相机视锥切片**算 N 级光源空间矩阵 ----
     // 注意这里不再需要"场景投影体包围球"了 —— 那是单张图时代的做法
@@ -1400,8 +2345,14 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
     // 时要靠 camera.target() 兜底。
     m_shadowPass->setCascadeCount(m_shadowCascades);
     m_shadowPass->setTexelSnapping(m_shadowTexelSnap);
-    m_shadowPass->updateCascades(ubo.view, ubo.proj, kNear, kFar, ld,
-                                 m_shadowDistance, m_shadowLambda);
+    // 面相机（R5-1 探针捕获）**不重算级联**：捕获不录阴影 pass（见
+    // recordSceneInto(isPreview=true)），它采样的是**上一次主场景**渲染
+    // 出来的那张阴影图。若这里按面相机重算矩阵，矩阵与图的内容就对不上
+    // → 捕获里会出现"阴影贴错位置"。保持上一帧主相机的矩阵才是自洽的。
+    if (!isFaceView) {
+        m_shadowPass->updateCascades(ubo.view, ubo.proj, kNear, kFar, ld,
+                                     m_shadowDistance, m_shadowLambda);
+    }
 
     const uint32_t cascades = m_shadowPass->cascadeCount();
     for (uint32_t c = 0; c < render::kShadowCascadeMax; ++c) {
@@ -1537,6 +2488,13 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
                   scene.light().ambientScale,
                   m_clusterCullingEnabled ? 1.0f : 0.0f,
                   static_cast<float>(m_lighting->config().maxLightsPerCluster));
+    // 面相机（R5-1 探针捕获）**关掉局部光源**：簇表是按主相机视锥建的，
+    // 探针的 6 个面朝向各不相同，拿主相机的簇去查会取到不相干的灯
+    // （画面里表现为"漏灯 / 错灯"，且随主相机朝向而变 —— 不可复现）。
+    // 把每簇灯数上限设为 0，片元侧的循环直接空转 = 捕获里只有
+    // 方向光 + IBL + 自发光 + 天空。这与 ReflectionProbe.h 文件头写的
+    // 取舍一致；升级路径是给捕获单独一套簇缓冲。
+    if (isFaceView) ubo.lightParams.w = 0.0f;
     ubo.invViewProj = glm::inverse(ubo.proj * ubo.view);
     // IBL 开关与预过滤 mip 上限。环境烘不出来时强制走旧路径 ——
     // 否则着色器会去采一张还没写过的图（全黑），金属会突然变死色。
@@ -1624,6 +2582,45 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
     // 不可能影响 Default 的像素（"Default 逐像素不变"由构造保证）。
     ubo.sssParams = glm::vec4(m_sssCurvatureScale, 0.0f, 0.0f, 0.0f);
 
+    // 视差遮挡贴图（R4-3）：
+    //   x/y = 距离淡出区间（米），z = 层数上限，w = 全局倍率兼开关。
+    // 只被 VENN_PARALLAX 编译单元读；w = 0 时整段 ray-march 短路 →
+    // 与没开 POM 逐像素相同（"关闭 = 基线"的可断言形式）。
+    // 层数按**本帧相机远平面**兜底收窄：太远的层数纯属浪费采样。
+    ubo.pomParams = glm::vec4(m_pomFadeStart, m_pomFadeEnd, m_pomMaxLayers,
+                              m_pomCoverageScale);
+
+    // R4-4 延迟贴花：x = 总开关（1 开 / 0 关）。
+    // 0 时 pbr.frag 整段跳过贴花采样 —— 此时 set0/binding 20..22 绑的是
+    // 全透明图（coverage 恒 0），采了也是 0，但跳过省掉三次纹理采样。
+    ubo.decalParams = glm::vec4(m_screenSpace.decals ? 1.0f : 0.0f, 0.0f, 0.0f,
+                                0.0f);
+
+    // R5-1 反射探针：
+    //   x = 总开关（1 开 / 0 关）。0 时 pbr.frag 的整段探针采样短路 ——
+    //       此时 binding 23 绑的是缺省全黑 cube array，采了也没用。
+    //   y = 本帧有效探针数。0 时着色器即使开了也不进循环。
+    //   z = 预过滤 cube array 的最大 mip（粗糙度 → mip 的换算上限）。
+    //   w = 全局强度倍率。
+    //
+    // 离屏目标（预览 / 额外视角）**不开探针**：它们的探针表与主视口
+    // 用的是同一块 SSBO（每帧只上传一份），绑同一张 cube array —— 但
+    // 一台不同相机的离屏视图仍然可以正确从同一张世界空间反射图里取
+    // 反射（探针是**世界空间**的，与观察相机无关）。所以这里不按
+    // mainViewport 区分，x 只由开关与就绪状态决定。
+    {
+        const bool probeOk = m_probes && m_probes->ready();
+        const uint32_t nProbes = probeOk ? m_probes->probeCount() : 0u;
+        const bool on = m_probeSettings.enabled && probeOk && nProbes > 0;
+        ubo.probeParams = glm::vec4(
+            on ? 1.0f : 0.0f, static_cast<float>(nProbes),
+            probeOk ? m_probes->maxLod() : 0.0f, m_probeSettings.intensity);
+        // 捕获本身**不许采探针图**：那既是对上一次烘焙结果的自我引用
+        // （反馈回路，会让多次捕获逐次变亮），也会让"探针关/开"的对照
+        // 实验互相污染。捕获里一律按 envParams.x 走 IBL，与首次烘焙一致。
+        if (isFaceView) ubo.probeParams = glm::vec4(0.0f);
+    }
+
     // ---- 相机视锥：必须用**未抖动**的投影 ----
     // 抖动会让视锥在亚像素尺度上逐帧摆动 → 恰好压在视锥边界上的物体
     // 会闪烁（剔除结果帧间不稳定）。所以这一步排在抖动之前。
@@ -1655,10 +2652,69 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
 
     // 重置蒙皮的调用方就是"主场景"（离屏目标传 false 追加骨骼矩阵），
     // 借用它来区分统计口径：离屏目标的物体数不该算进主场景的剔除统计。
-    buildDrawLists(scene, cam.position(), resetSkinning);
+    buildDrawLists(scene, camPosW, resetSkinning);
 
     // ---- 蒙皮 ----
     updateSkinning(scene, resetSkinning);
+}
+
+// ============================================================
+// 延迟贴花（R4-4）的收集
+//
+// 贴花没有网格组件 —— 盒体几何是 DecalBuffer 自建的单位立方体，
+// 所以这里只产出"世界矩阵 + 材质参数 + 两张贴图的 view/sampler"。
+//
+// 世界矩阵 = 实体世界矩阵 × scale(size)：于是盒体在实体局部轴上的
+// 三个半轴长度正好是 size/2，位置/朝向复用实体的 Transform（含父链
+// 累乘，与"移动物体"共用同一套机制）。
+// ============================================================
+void Renderer::collectDecals(scene::Scene& scene) {
+    m_decalScratch.clear();
+    // 关着时一张都不收：这样 decalDraws 统计恒 0，与"没录 pass"口径一致。
+    if (!m_screenSpace.decals) return;
+
+    scene.forEachDecal([&](ecs::Entity e, ecs::DecalComponent& dc) {
+        render::DecalDrawItem it;
+        // 尺寸给一个下限：0 尺寸的盒体没有体积，反投影到局部空间后
+        // 除法会炸（NaN 一路传到 coverage）。
+        const glm::vec3 size = glm::max(dc.size, glm::vec3(1e-4f));
+        // base = 实体的 TRS（平移 + 旋转），**不含**贴花尺寸缩放。
+        // worldToLocal 从 base 求逆 —— 于是片元里的 local 就是**米**，
+        // 盒内测试（|local| vs size/2）与 uv 投影（local.xy/size.xy）
+        // 才自洽。若改成 inverse(base * scale(size))，local 会变成
+        // 单位立方体坐标，盒体判定会大出整整一个 size 倍。
+        const glm::mat4 base = scene.worldMatrix(e);
+        it.world = base * glm::scale(glm::mat4(1.0f), size);
+        it.worldToLocal = glm::inverse(base);
+        it.size = size;
+        it.opacity = dc.opacity;
+        it.tint = dc.tint;
+        it.roughness = dc.roughness;
+        it.metallic = dc.metallic;
+        it.normalScale = dc.normalScale;
+        it.edgeFade = dc.edgeFade;
+        it.fadeStart = dc.fadeStart;
+        it.fadeEnd = dc.fadeEnd;
+        if (dc.albedo) {
+            it.albedoView = dc.albedo->view();
+            it.albedoSampler = dc.albedo->sampler();
+        }
+        if (dc.normal) {
+            it.normalView = dc.normal->view();
+            it.normalSampler = dc.normal->sampler();
+        }
+        m_decalScratch.push_back(it);
+    });
+
+    // 超出预算的贴花会被 DecalBuffer 丢弃 —— 打一行日志说明，免得
+    // "加了贴花却没出现"被当成渲染 bug 查半天。
+    static const bool decalDbg = std::getenv("MYVK_DECAL_DBG") != nullptr;
+    if (decalDbg && m_decalScratch.size() > render::DecalBuffer::kMaxDecals) {
+        // ⚠ 用 %u + 显式转 unsigned：MinGW 的 printf 不认 %zu。
+        VK_LOG_WARN("DECALS: %u requested, only %u slots -> extras dropped",
+                    static_cast<unsigned>(m_decalScratch.size()),
+                    render::DecalBuffer::kMaxDecals);
+    }
 }
 
 // 构建本帧绘制列表：视锥剔除 + 世界矩阵缓存 + 透明排序，一次做完。
@@ -1674,6 +2730,9 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
     if (isMain) {
         m_hizAabbScratch.clear();
         m_hizSlotEntities[m_currentFrame].clear();
+        // 延迟贴花（R4-4）：只有主视口收集 —— DBuffer 只有一份，
+        // 离屏目标不渲染贴花（见 writeGlobalSet 的说明）。
+        collectDecals(scene);
     }
     // 实例 SSBO 槽游标：主场景从头排（照骨骼 SSBO 的 resetOffset 模式），
     // 预览场景紧跟在主场景的槽后面继续累加 —— 同一块 buffer 互不覆盖。
@@ -1935,6 +2994,15 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
         }
         for (const DrawItem& it : m_transparentDraws) {
             ++m_stats.variantCounts[it.keywords & kKeywordAll];
+        }
+        // POM（R4-3）：本帧有多少个不透明物体走了视差变体。用它做"POM
+        // 真的进了管线"的正向证据（不依赖画面差异 —— 视差很小时画面差异
+        // 可能落在噪声地板附近，但变体计数是硬的）。
+        m_stats.parallaxDraws = 0;
+        for (const DrawItem& it : m_opaqueDraws) {
+            if (it.material && hasKeyword(it.keywords, kKeywordParallax)) {
+                ++m_stats.parallaxDraws;
+            }
         }
         // ⚠ SHADER-VARIANTS 自检日志**不在这里**打。buildDrawLists 跑在前向
         //   Pass **之前**，而 variantSwitches 是前向 Pass 里累加的 ——
@@ -2514,9 +3582,9 @@ static void fillForwardPipelineDesc(rhi::PipelineDesc& desc,
     desc.vertexBindings.push_back(assets::Vertex::bindingDescription());
     desc.vertexAttributes = assets::Vertex::attributeDescriptions();
     // set 0 = FrameUBO + 阴影图 + 灯数据，
-    // set 1..6 = albedo / normal / orm / roughness / metallic / emissive
-    desc.setLayouts = {globalSet, texSet, texSet, texSet,
-                       texSet,   texSet, texSet};
+    // set 1..7 = albedo / normal / orm / roughness / metallic / emissive / height
+    desc.setLayouts = {globalSet, texSet, texSet, texSet, texSet,
+                       texSet,    texSet, texSet};
     desc.pushConstant.stageFlags =
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     desc.pushConstant.offset = 0;
@@ -2673,7 +3741,7 @@ void Renderer::createPipelines() {
         rhi::PipelineDesc desc;
         desc.vertSpv = vkutil::readFile(resolveShaderPath("grid.vert.spv"));
         desc.fragSpv = vkutil::readFile(resolveShaderPath("grid.frag.spv"));
-        desc.setLayouts = {m_globalSetLayout, ts, ts, ts, ts, ts, ts};
+        desc.setLayouts = {m_globalSetLayout, ts, ts, ts, ts, ts, ts, ts};
         desc.pushConstant.stageFlags =
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         desc.pushConstant.offset = 0;
@@ -2703,7 +3771,7 @@ void Renderer::createPipelines() {
         rhi::PipelineDesc desc;
         desc.vertSpv = vkutil::readFile(resolveShaderPath("sky.vert.spv"));
         desc.fragSpv = vkutil::readFile(resolveShaderPath("sky.frag.spv"));
-        desc.setLayouts = {m_globalSetLayout, ts, ts, ts, ts, ts, ts};
+        desc.setLayouts = {m_globalSetLayout, ts, ts, ts, ts, ts, ts, ts};
         desc.pushConstant.stageFlags =
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         desc.pushConstant.offset = 0;
@@ -2795,7 +3863,7 @@ void Renderer::writeGlobalDescriptors() {
 // 用哪一份（阴影图 / 灯与簇 SSBO / 骨骼 / 局部阴影 / 实例 / SSAO 图）。
 // ubo 只影响 binding 0 —— 这正是主链与离屏目标唯一的差别。
 void Renderer::writeGlobalSet(VkDescriptorSet set, uint32_t frameIndex,
-                              VkBuffer ubo) {
+                              VkBuffer ubo, bool mainViewport) {
     if (set == VK_NULL_HANDLE) return;
     auto& f = m_frames[frameIndex];
     const uint32_t i = frameIndex;
@@ -2934,6 +4002,50 @@ void Renderer::writeGlobalSet(VkDescriptorSet set, uint32_t frameIndex,
         m_descriptors->writeTexture(set, 19, m_defaultWhite->sampler(),
                                     m_defaultWhite->view());
     }
+
+    // binding 20/21/22：延迟贴花的三张 DBuffer（R4-4）。
+    // 只有**主视口**才接真图：DBuffer 是屏幕空间的、只有主视口那一份，
+    // 离屏目标（预览 / 额外视角）的相机与分辨率都不同，采样它会把主视口
+    // 的贴花按错误的 uv 糊上去 —— 干脆绑全透明图，即"离屏目标不渲染贴花"。
+    const bool decalsOn = mainViewport && m_screenSpace.decals && m_decals &&
+                          m_decals->ready();
+    for (uint32_t k = 0; k < 3; ++k) {
+        const uint32_t binding = 20 + k;
+        if (decalsOn) {
+            m_descriptors->writeTexture(set, binding, m_decals->sampler(),
+                                        m_decals->view(i, static_cast<int>(k)));
+        } else {
+            m_descriptors->writeTexture(
+                set, binding, m_defaultTransparent->sampler(),
+                m_defaultTransparent->view());
+        }
+    }
+
+    // binding 23/24：反射探针（R5-1）。
+    //   23 = 预过滤 cube array。未启用 / 未就绪时绑 1×1 的缺省全黑
+    //        cube array —— probeParams.x == 0 时 pbr.frag 整段短路，内容
+    //        根本读不到；但 binding 必须写，未写过的描述符是未定义行为。
+    //   24 = 逐探针数据 SSBO。系统不存在时退而绑**实例表缓冲**
+    //        （binding 13 的同款），与 binding 15 的兜底同一套路：
+    //        layout 要求存在，实际访问由 shader 的 count 短路保证不发生。
+    if (m_probes && m_probes->ready()) {
+        m_descriptors->writeTexture(set, 23, m_probes->sampler(),
+                                    m_probes->cubeArrayView());
+        m_descriptors->writeBuffer(set, 24, m_probes->dataBuffer(i),
+                                   m_probes->dataBufferSize(),
+                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    } else {
+        if (m_probes) {
+            m_descriptors->writeTexture(set, 23, m_probes->fallbackSampler(),
+                                        m_probes->fallbackView());
+        } else if (m_defaultBlack) {
+            m_descriptors->writeTexture(set, 23, m_defaultBlack->sampler(),
+                                        m_defaultBlack->view());
+        }
+        m_descriptors->writeBuffer(set, 24, f.instanceModels->get(),
+                                   f.instanceModels->size(),
+                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    }
 }
 
 // 懒建"某离屏目标本帧的相机 UBO 槽"。buffer 与 set 都只建一次，之后
@@ -2955,7 +4067,9 @@ FrameResources::OffscreenUbo& Renderer::ensureOffscreenUbo(uint32_t slot) {
     }
     if (s.set == VK_NULL_HANDLE) {
         s.set = m_descriptors->allocate(m_globalSetLayout);
-        writeGlobalSet(s.set, m_currentFrame, s.ubo->get());
+        // mainViewport=false：离屏目标不接 DBuffer（绑全透明图），
+        // 理由见 writeGlobalSet 的说明。
+        writeGlobalSet(s.set, m_currentFrame, s.ubo->get(), /*mainViewport=*/false);
     }
     return s;
 }
@@ -3129,6 +4243,13 @@ void Renderer::watchShaderFiles() {
     m_shaderReload.watch("fg_dof.msaa.frag.spv");
     m_shaderReload.watch("fg_motionblur.frag.spv");
     m_shaderReload.watch("fg_motionblur.msaa.frag.spv");
+}
+
+void Renderer::forceShaderReloadScan() {
+    // pollShaderReload 的节流是 `if (++tick < 15) return;` —— 把 tick 顶到
+    // 阈值上，下一帧那次 ++ 就会越过它、立刻扫一轮。见头文件里的说明。
+    m_shaderReloadTick = 15;
+    VK_LOG_INFO("SHADER-RELOAD forced by editor (Build menu)");
 }
 
 void Renderer::pollShaderReload() {
@@ -3510,6 +4631,16 @@ float Renderer::alphaCutoffLane(const assets::Material& mat) {
     return lane;
 }
 
+// 逐材质的视差深度 → push.skin.y（R4-3）。
+//
+// skin.y 是 push 常量里**最后一个没人读**的分量（x=jointBase、z=蒙皮标志
+// 由顶点着色器用，w=R4-1 借去放 alpha 阈值，y 一直是 0）。push 被硬件卡在
+// 128 字节，没挂高度图时返回 0（着色器也压根不读）。
+float Renderer::pomHeightLane(const assets::Material& mat) {
+    if (!mat.heightMap) return 0.0f;
+    return glm::max(mat.heightScale, 0.0f);
+}
+
 void Renderer::drawMesh(VkCommandBuffer cmd, VkPipelineLayout layout,
                         const glm::mat4& model, const assets::Material& mat,
                         const assets::Mesh& mesh, uint32_t instanceCount,
@@ -3524,14 +4655,15 @@ void Renderer::drawMesh(VkCommandBuffer cmd, VkPipelineLayout layout,
     push.emissive = glm::vec4(mat.emissive, materialPageCode(mat));
     // 蒙皮定位：查 mesh 是否属于某个蒙皮模型。jointBase<0 = 静态网格，
     // 着色器按 weights 和 == 0 走原路径（skin.z 只是防御性冗余）。
-    // skin.w = alpha 裁切阈值（R4-1）。
+    //   skin.w = alpha 裁切阈值（R4-1）
+    //   skin.y = POM 视差深度（R4-3，只被 VENN_PARALLAX 编译单元读）
+    const float pomLane = pomHeightLane(mat);
     const auto it = m_skinJointBase.find(&mesh);
     if (it != m_skinJointBase.end() && it->second >= 0) {
-        push.skin =
-            glm::vec4(static_cast<float>(it->second), 0.0f, 1.0f,
-                      alphaCutoffLane(mat));
+        push.skin = glm::vec4(static_cast<float>(it->second), pomLane, 1.0f,
+                              alphaCutoffLane(mat));
     } else {
-        push.skin = glm::vec4(0.0f, 0.0f, 0.0f, alphaCutoffLane(mat));
+        push.skin = glm::vec4(0.0f, pomLane, 0.0f, alphaCutoffLane(mat));
     }
     vkCmdPushConstants(cmd, layout,
                        VK_SHADER_STAGE_VERTEX_BIT |
@@ -3554,8 +4686,11 @@ void Renderer::bindMaterialTextures(VkCommandBuffer cmd,
     //   哪来"这件事只应该有一个出口。）
     if (m_bindless) return;
 
-    // set 1..6：albedo / normal / orm / roughness / metallic / emissive
-    // （缺省时绑定中性贴图：白 / 平坦法线 / 白 / 白 / 白 / 黑）
+    // set 1..7：albedo / normal / orm / roughness / metallic / emissive /
+    // height（缺省时绑定中性贴图：白 / 平坦法线 / 白 / 白 / 白 / 黑 / 黑）。
+    // set 7（高度图）也在这里绑，即便当前材质没挂高度图 —— 命令缓冲里
+    // **不能留着一个没绑的 set**：PARALLAX 变体的着色器声明了它。没挂时
+    // 绑纯黑（0）→ 视差循环立即停下 → offset 0，行为与"没开 POM"一致。
     VkDescriptorSet texSets[kTextureSetCount] = {
         (mat.albedoMap ? mat.albedoMap : m_defaultWhite.get())->descriptorSet(),
         (mat.normalMap ? mat.normalMap : m_defaultFlatNormal.get())
@@ -3567,6 +4702,7 @@ void Renderer::bindMaterialTextures(VkCommandBuffer cmd,
             ->descriptorSet(),
         (mat.emissiveMap ? mat.emissiveMap : m_defaultBlack.get())
             ->descriptorSet(),
+        (mat.heightMap ? mat.heightMap : m_defaultBlack.get())->descriptorSet(),
     };
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1,
                             kTextureSetCount, texSets, 0, nullptr);
@@ -3769,7 +4905,7 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
     VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
 
     // ---- GPU 时戳剖析（R0-1）----
-    // 每帧先复位本 slot 的 18 个 query，再由下面各段打 begin/end。
+    // 每帧先复位本 slot 的 20 个 query，再由下面各段打 begin/end。
     // resetFrame 录在命令缓冲里：GPU 按序执行，此刻同 slot 的上一轮
     // 命令早已被 drawFrame 开头的 fence 等待过，安全。
     if (m_gpuTiming && m_gpuTimer) {
@@ -3804,6 +4940,26 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
     tsBegin(render::GpuTimer::kDepthPre);
     recordDepthPrePass(cmd, scene);
     tsEnd(render::GpuTimer::kDepthPre);
+
+    // ========= Pass 2.6：延迟贴花 DBuffer（R4-4）===================
+    // 位置：深度预通道之后、前向之前。三个理由，缺一不可：
+    //   · 必须在深度预通道之后 —— 片元要靠深度图重建场景表面世界坐标；
+    //   · 必须在分簇 compute 之前 —— 它是本命令缓冲里最后一段几何；
+    //     （其实先于/后于 compute 都行，放在这里是为了让"几何 → compute
+    //       → 前向"的顺序保持单一）
+    //   · 必须在前向之前 —— 前向的片元采样 DBuffer 的 coverage 混合材质。
+    // 关闭时一个 pass 都不录，且 set0/binding 20..22 绑全透明图 →
+    // 前向的贴花分支整段跳过，逐像素回到基线。
+    // 开着但场景里没有贴花时**照样录**（只清屏）—— 画面上与关着完全一致，
+    // 这是"效果真的只在有内容时才生效"的对照断言。
+    tsBegin(render::GpuTimer::kDecals);
+    if (m_decals && m_decals->ready() && m_screenSpace.decals) {
+        m_decals->upload(frame.globalUBO->get(), m_currentFrame,
+                         m_decalScratch);
+        m_decals->render(cmd, m_currentFrame);
+        m_stats.decalDraws = m_decals->count();
+    }
+    tsEnd(render::GpuTimer::kDecals);
 
     // ================= Pass 2.5：Hi-Z 金字塔 + MDI 紧凑化（R2-2）=====
     // 夹在深度预通道与前向之间是本模块的**全部要点**：
@@ -3939,6 +5095,8 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
             // R4-1：Mask 的裁切阈值随材质走 push.skin.w（MDI 的 model/skin
             // 都不从 push 取，但 skin.w 是**片元**读的，必须每材质推对）。
             push.skin.w = alphaCutoffLane(*g.material);
+            // R4-3：POM 的视差深度同理 —— skin.y 也是片元读的。
+            push.skin.y = pomHeightLane(*g.material);
             vkCmdPushConstants(cmd, m_forwardPipelines.layout(),
                                VK_SHADER_STAGE_VERTEX_BIT |
                                    VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -4132,6 +5290,172 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
                       m_hizBiasNdc);
     }
 
+    // ================= Pass 4.2：GPU 粒子（R6-1）=====================
+    // 位置：前向之后、FrameGraph 之前。三条理由：
+    //   · 前向**之后** —— 粒子是叠在场景上的（loadOp = LOAD），而且它
+    //     要采场景深度做遮挡 + 软化，深度必须已经写完全；
+    //   · FrameGraph **之前** —— 屏幕空间链（SSGI/SSR/DoF/运动模糊）与
+    //     后处理（泛光/色调映射）都该作用在"含粒子"的画面上。放到链
+    //     之后，火花的泛光就没了，而且色调映射会把粒子当背景处理；
+    //   · 与前向共享**同一条命令缓冲** —— 模拟 compute 与绘制之间只隔
+    //     显式屏障，不需要第二次 submit 与额外的帧延迟。
+    //
+    // 关闭 / 没有发射器 / 已冻结到停止模拟时**零 compute**；时戳
+    // begin/end 无条件打（紧挨 → 读数 ≈0，正好标记"未激活"，与 SSAO /
+    // FrameGraph 段同一条约定：被复位却不写的 query 会永远 unavailable，
+    // 拖累整批 vkGetQueryPoolResults 返回 NOT_READY）。
+    tsBegin(render::GpuTimer::kParticles);
+    {
+        const bool fxLive = m_particles && m_particles->ready() &&
+                            m_particleSettings.enabled &&
+                            m_particleEmitterCount > 0;
+        if (fxLive) {
+            const bool frozen = particleFrozen();
+            if (!frozen) {
+                const uint32_t hz = m_particleSettings.simHz > 0
+                                        ? m_particleSettings.simHz
+                                        : 60u;
+                // 单帧步长只由 simHz 决定（见下），所以"给定步号"就能完全
+                // 复现粒子状态。
+                const float dt = 1.0f / static_cast<float>(hz);
+
+                // ---- 用**真实经过的时间**去凑固定步长 ------------------
+                //
+                // 以前是"每渲染帧 = 一步 dt"，于是模拟速度直接乘上了渲染
+                // 帧率：编辑器空场景能跑到 500+ fps，粒子就快 8 倍
+                //（`FX-DUMP` 里 dispatches 和渲染帧号一样大，一眼能看出来 ——
+                //  一个 lifetime=30s 的粒子在 9 秒内就被推进了 80 秒）。
+                //
+                // Unity / Blender 的粒子都是按**墙钟时间**走的，所以这里
+                // 补上标准的固定步长累加器：
+                //
+                //     累积真实 dt → 攒够一个 dt 就走一步，余数留给下一帧
+                //
+                // 两边的好处都保住：
+                //   · 速度与帧率无关（高帧率不再"快放"、低帧率不再"慢放"）；
+                //   · 仍是**固定步长**，所以 MYVK_FX_FREEZE=N 依然表示
+                //     "第 N 步之后"，跨机器可复现 —— 只是它现在等价于
+                //     N/hz 秒的模拟时间，而不是 N 个渲染帧。
+                m_particleSimAccum += m_frameDt;
+                uint32_t steps = 0;
+                while (m_particleSimAccum >= dt &&
+                       steps < kMaxSimStepsPerFrame) {
+                    m_particleSimAccum -= dt;
+                    ++m_particleSimFrame;
+                    ++steps;
+                }
+                // 攒了太多（拖窗口 / 断点后回来）就**放弃**追平，不要想着
+                // 一次补几百步把帧率拖死 —— 粒子跳一下就过去了。
+                if (steps >= kMaxSimStepsPerFrame) {
+                    m_particleSimAccum = 0.0f;
+                }
+
+                // ---- Prewarm：把模拟时钟向前拨（只在开场做一次）----
+                // 见 collectParticleEmitters 末尾：固定步长下"先跑一整轮"
+                // 与"把时钟拨过去"完全等价，而后者只要一条赋值。
+                if (m_particlePrewarmSteps > 0) {
+                    m_particleSimFrame += m_particlePrewarmSteps;
+                    for (uint32_t s = 0; s < 8; ++s) {
+                        m_particleSlotFrame[s] = m_particleSimFrame;
+                    }
+                    VK_LOG_INFO("FX-PREWARM: simulation clock advanced by %u "
+                                "steps (%.2fs) -- the emitter starts in "
+                                "steady state",
+                                m_particlePrewarmSteps,
+                                static_cast<double>(
+                                    static_cast<float>(
+                                        m_particlePrewarmSteps) /
+                                    static_cast<float>(hz)));
+                    m_particlePrewarmSteps = 0;
+                }
+
+                // ⚠ **即使一步都没凑出来也要派发**。upload() 每帧会把
+                //   计数器清零（resetCounters），而计数器是由这一趟 compute
+                //   重新累加出来的 —— 跳过派发就会留下"计数器全是 0、间接
+                //   命令还是上一帧的值"的不一致状态（FX-DUMP 里表现为
+                //   alive=0 而 inst=(1,0)，看着像渲染坏了，其实是诊断在说谎）。
+                //   步数为 0 时 dtSlot = 0，着色器里 age/速度/位置都不动，
+                //   只把紧凑表重建一遍 —— 代价可以忽略（整段 0.02 ms）。
+                {
+                    const float t = static_cast<float>(m_particleSimFrame) * dt;
+
+                    // ⚠ 本槽自上次模拟以来经过的**步数**。池按 frame-in-flight
+                    //   槽分开，所以每个槽每 framesInFlight 帧才被派发一次；
+                    //   这里一次补上漏掉的那些步，否则每个池的模拟时间只以
+                    //   1/framesInFlight 的速度前进（画面看着"正常"，只是所有
+                    //   粒子都慢了一倍 —— 只有计数器能看出来）。上面那个
+                    //   累加器让"漏步"成为常态，这条补偿不能省。
+                    const uint32_t slot = m_currentFrame;
+                    const uint32_t elapsedFrames =
+                        m_particleSimFrame - m_particleSlotFrame[slot];
+                    const float dtSlot =
+                        static_cast<float>(elapsedFrames) * dt;
+
+                    fx::ParticleSystem::SimPush push{};
+                    push.timing = glm::vec4(
+                        dtSlot, t, static_cast<float>(m_particleSimFrame),
+                        static_cast<float>(m_particleEmitterCount));
+                    push.pool = glm::vec4(
+                        static_cast<float>(
+                            m_particleSettings.perEmitterCapacity),
+                        static_cast<float>(m_particles->capacity()), 0.0f, 0.0f);
+                    // 本趟真正推进的步数 = elapsedFrames（0 = 只重建紧凑表）
+                    m_particles->recordSimulation(
+                        cmd, m_currentFrame, push, m_particleSortCamPos,
+                        m_particleSortMode);
+                    m_particleSlotFrame[slot] = m_particleSimFrame;
+                }
+
+                // ---- Rate over Distance：提交本帧的位移 ------------------
+                // 只有**真的走了一步**的帧才提交 —— 否则"渲染帧多跑几帧"
+                // 会让距离发射量与帧率挂上钩（就是刚修掉的那个问题的
+                // 另一个化身）。提交之后 pending 归零，下一次推进时
+                // dist.y（= 已提交值）正好等于上一次推进的时刻。
+                for (size_t i = 0; i < m_particleDistPending.size(); ++i) {
+                    m_particleDistCommitted[i] += m_particleDistPending[i];
+                    m_particleDistPending[i] = 0.0f;
+                }
+            } else if (m_particleFreezeLogged != m_particleSimFrame) {
+                // 冻结是一次性事件，只打一行 —— 验证脚本等的是它。
+                m_particleFreezeLogged = m_particleSimFrame;
+                VK_LOG_INFO("FX-FREEZE frame=%u alive=%u (simulation stopped; "
+                            "state is now reproduced bit-for-bit across runs)",
+                            m_particleSimFrame, m_particles->stats().alive);
+            }
+            // 冻结时**仍然画**：模拟停了，池子里的状态就停在那里，
+            // 每帧画出来的都是同一张图（这正是冻结帧的用途）。
+            //
+            // ⚠ 但"同一张图"要打一点折扣 —— 冻结帧能保证的是**状态**
+            //   可复现，不是**像素**可复现。实测（364 颗，FREEZE=120）
+            //   两次运行的像素平均差是 1.6~2.1 / 255，来源有两条，都不是
+            //   bug、也都关不掉：
+            //     ① 池按 frames-in-flight 分槽（本函数上面的 m_frames），
+            //        每槽只在自己被派发的那一刻推进（`dtSlot = elapsed*dt`）。
+            //        冻结之后各槽就停**各自的最后一步**上，彼此差 1~2 步，
+            //        于是粒子位置差 ≈ v·dt。截到哪一槽由墙钟帧号
+            //        （m_currentFrame）决定 —— 所以"同一场景跑两次"拍到的
+            //        可能不是同一槽。实测这条是主因：**一颗粒子**（速率
+            //        2/s、寿命 0.4s）都有 0.0082 的差，而软粒子开关对它的
+            //        读数毫无影响（0.008244 vs 0.008244）。
+            //     ② 紧凑表（alive list）的顺序来自 compute 里 `atomicAdd`
+            //        的完成顺序，本来就**不确定**。加色混合数学上与顺序无关，
+            //        但帧缓冲是 8 位 UNORM：每个片元的 `+=` 都要量化一次，
+            //        顺序不同 → 舍入路径不同 → 差值随**重叠粒子数**增长。
+            //        364 颗 + 软粒子 → 1.59；同一批粒子把软粒子关掉
+            //        （fade 变成 0/1，不再有部分覆盖率）→ 0.058。
+            //   所以 verify_particles.py 对稠密羽流只断言"差有界 + 状态
+            //   逐位一致"，不主张逐像素一致。
+            //   （FX-DUMP 的状态字段两次运行**完全一致**：alive/draws/
+            //    maxAlive/simFrame/inst 全同 —— 那才是这一条真正的验收面。）
+            m_particles->draw(
+                cmd, m_currentFrame, frame.globalUBO->get(),
+                glm::vec2(static_cast<float>(hdrExtent.width),
+                          static_cast<float>(hdrExtent.height)),
+                m_camNear, m_camFar);
+        }
+    }
+    tsEnd(render::GpuTimer::kParticles);
+
     // ========= Pass 4.5：FrameGraph 链（SSGI → SSR → God rays → DoF → 运动模糊）==
     // 全关时零 pass —— PostProcess 直接采样 HDR，逐位回到基线。
     // 相机效果（景深 / 运动模糊）排在这条链的**末尾**：它们作用于"最终
@@ -4244,6 +5568,14 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
             m_extraTarget->setCamera(&scene.camera(1));
         recordOffscreenTarget(cmd, *m_extraTarget);
     }
+    // 多视口（E07）：同一场景、各自相机。与额外视角走**同一条通道**
+    // （recordOffscreenTarget），所以阴影/分簇那些全局缓冲天然共享。
+    for (SubviewSlot& s : m_subviews) {
+        if (!s.target || !s.target->ready() || !s.camera) continue;
+        s.target->setScene(&scene);
+        s.target->setCamera(s.camera.get());
+        recordOffscreenTarget(cmd, *s.target);
+    }
     tsEnd(render::GpuTimer::kOffscreen);
 
     // ============ Pass 5..N：Bloom + Tonemap → 输出 ==============
@@ -4289,6 +5621,9 @@ void Renderer::drawFrame(scene::Scene& scene) {
     if (m_viewportDirty) {
         applyViewportSize();
     }
+    // 多视口（E07）：子视口尺寸变了就重建它们那几个离屏链。
+    // 必须在这里（waitIdle 只能在录制之前）—— 与 applyViewportSize 同理。
+    applySubviewTargets();
     // ImGui 面板可能改了分簇参数 → 重建簇缓冲
     if (m_lighting->needsRebuild()) {
         const VkExtent2D e = renderExtent();
@@ -4312,6 +5647,17 @@ void Renderer::drawFrame(scene::Scene& scene) {
         m_ssaoWired = m_screenSpace.ssao;
         writeGlobalDescriptors();
     }
+    // 延迟贴花（R4-4）开关翻转 → binding 20..22 从全透明图换到 DBuffer
+    // （或反之）。与 SSAO 同一套路：只重写 set 0，没有任何资源重建。
+    // 判据带上 ready()：分辨率重建那一帧 m_decals 还没准备好接深度图，
+    // 此时不能把 DBuffer 接上去（会采到未初始化的图）。
+    {
+        const bool on = m_screenSpace.decals && m_decals && m_decals->ready();
+        if (on != m_decalsWired) {
+            m_decalsWired = on;
+            writeGlobalDescriptors();
+        }
+    }
 
     // ---- shader 热重载：外部构建器更新了 .spv → 帧边界重建管线 ----
     // 放在 fence 等待之前：waitIdle 保证重建时 GPU 上没有任何命令在跑。
@@ -4323,7 +5669,7 @@ void Renderer::drawFrame(scene::Scene& scene) {
     vkWaitForFences(dev, 1, &frame.inFlightFence, VK_TRUE, UINT64_MAX);
 
     // ---- GPU 时戳读回（R0-1）----
-    // fence 已过 → 本 slot 上一轮的 18 个 query 一定已写入。结果留在
+    // fence 已过 → 本 slot 上一轮的 20 个 query 一定已写入。结果留在
     // GpuTimer 自身（m_stats 稍后会被整块清零，放不住）。首帧 query
     // 还没提交过，readFrame 返回 false 直接跳过。
     // 诊断（MYVK_GPU_TIMING=1）：每 30 帧一行，与 CULL-STATS /
@@ -4335,8 +5681,8 @@ void Renderer::drawFrame(scene::Scene& scene) {
         if (timingDbg && (timingTick++ % 30) == 1) {
             VK_LOG_INFO(
                 "GPU-TIMING frame=%.2f shadows=%.2f local_sh=%.2f "
-                "depth=%.2f ssao=%.2f cluster=%.2f forward=%.2f "
-                "framegraph=%.2f offscreen=%.2f post=%.2f",
+                "depth=%.2f decals=%.2f ssao=%.2f cluster=%.2f forward=%.2f "
+                "particles=%.2f framegraph=%.2f offscreen=%.2f post=%.2f",
                 static_cast<double>(m_gpuTimer->lastTotalMs()),
                 static_cast<double>(m_gpuTimer->lastMs(0)),
                 static_cast<double>(m_gpuTimer->lastMs(1)),
@@ -4346,7 +5692,9 @@ void Renderer::drawFrame(scene::Scene& scene) {
                 static_cast<double>(m_gpuTimer->lastMs(5)),
                 static_cast<double>(m_gpuTimer->lastMs(6)),
                 static_cast<double>(m_gpuTimer->lastMs(7)),
-                static_cast<double>(m_gpuTimer->lastMs(8)));
+                static_cast<double>(m_gpuTimer->lastMs(8)),
+                static_cast<double>(m_gpuTimer->lastMs(9)),
+                static_cast<double>(m_gpuTimer->lastMs(10)));
         }
     }
 
@@ -4481,6 +5829,129 @@ void Renderer::drawFrame(scene::Scene& scene) {
     // ---- 本帧渲染统计清零（buildDrawLists 会重新累积）----
     m_stats = RenderStats{};
 
+    // ---- 反射探针（R5-1，见 render/ReflectionProbe.h）----
+    // 位置：in-flight 栅栏之后、主场景 uploadSceneState 之前。
+    //   · 栅栏之后 —— 回读缓冲（MYVK_PROBE_DBG）本轮已被 GPU 写完；
+    //   · 主上传之前 —— 捕获会改 CPU 侧的绘制列表 / 灯缓存 / 相机 UBO，
+    //     而紧随其后的主 uploadSceneState 会把它们全部按主相机重建。
+    // 捕获本身在**独立的一次性命令缓冲**里提交并等待完成（见
+    // recordProbeCapture），所以它与主帧不共享任何在途资源。
+    if (m_probes) {
+        m_probes->pollReadback();
+        if (m_probeSettings.enabled) {
+            // 面板 / env 改了参数 → 同步进系统（会改布局的字段自动标记重建）。
+            m_probes->setSettings(m_probeSettings);
+            // MSAA 变了也要重建捕获目标：前向管线是照主 HdrTarget 的
+            // render pass 建的，采样数不同就打不开捕获目标的 framebuffer。
+            m_probes->setCaptureSamples(m_sampleCount);
+            // 懒建：第一次真的启用时才分配显存。
+            if (!m_probes->ready()) {
+                if (m_probes->ensureResources()) {
+                    // 资源从"缺省 cube array"换成真的那张 → set 0 的
+                    // binding 23/24 必须重写（与 SSAO / 贴花开关翻转同一套路）。
+                    writeGlobalDescriptors();
+                    m_probeDataHash = 0;   // 首次必须烘一次
+                } else {
+                    VK_LOG_ERROR("PROBE: ensureResources failed; "
+                                 "reflection probes stay disabled");
+                }
+            }
+            if (m_probes->ready()) {
+                const bool need = collectProbes(scene);
+                // 探针数据**每帧都传**：盒体位置 / 强度随时可能在编辑器里
+                // 被拖动，而采样端读的就是这份表。重捕与否只决定 cube map
+                // 的内容是否刷新。
+                m_probes->upload(m_probeScratch, m_currentFrame);
+                if (need) {
+                    recordProbeCapture(scene);
+                } else {
+                    ++m_probeFramesSinceCapture;
+                }
+            }
+        } else if (m_probes->ready()) {
+            // 关着但资源还在：把探针数清零，让 shader 的循环立刻空转。
+            // （probeParams.x 也会是 0 —— 两重保险。）
+            m_probeScratch.clear();
+            m_probes->upload(m_probeScratch, m_currentFrame);
+        }
+    }
+
+    // ---- GPU 粒子（R6-1，见 fx/ParticleSystem.h）----
+    // 位置与探针同一处：in-flight 栅栏之后（回读缓冲本轮已被 GPU 写完）、
+    // 主场景 uploadSceneState 之前。
+    //
+    // 这里做的是**CPU 侧的上传**（发射器表 + 计数器清零 + 上一轮回读）；
+    // 真正的 compute / 绘制在 recordFrame 里与主帧共享同一条命令缓冲 ——
+    // 所以粒子不占第二次 submit，也不引入额外的帧延迟。
+    //
+    // 回读的时序约定（与探针的 pollReadback 同）：本帧读的是**上一轮同
+    // 槽**的数据。fence 刚等过，GPU 对那块内存的写已经可见。
+    if (m_particles) {
+        m_particles->pollStats(m_currentFrame);
+        if (m_particleSettings.enabled) {
+            // 面板 / env 改了参数 → 同步进系统（会改显存布局的字段自动
+            // 标记重建）。
+            m_particles->setSettings(m_particleSettings);
+            // 懒建：第一次真的启用时才分配显存。
+            if (!m_particles->ready()) {
+                if (m_particles->ensureResources()) {
+                    // 刚分配出来的 framebuffer / 深度视图还没接上 ——
+                    // 补一次 recreate。ensureResources 内部已经 waitIdle，
+                    // 所以此刻重建是安全的。
+                    recreateParticles();
+                    // 模拟帧号从 0 起：冻结帧（fx.freezeFrame）要能复现
+                    // "第 N 次模拟之后"的画面，起点必须确定。
+                    m_particleSimFrame = 0;
+                    // 累加器一起清零：这里是"全套资源刚建好"的时刻，
+                    // 从 0 开始攒时间，第一步不会因为之前攒下的余数提前到来。
+                    m_particleSimAccum = 0.0f;
+                    // 每个槽的"上次模拟帧号"一起清零 —— 否则重建之后
+                    // 第一次模拟会拿到一个巨大的 elapsed（把整段时间一次
+                    // 补进去 = 一帧之内喷出几百颗粒子）。
+                    for (uint32_t i = 0; i < 8; ++i) m_particleSlotFrame[i] = 0;
+                    m_particleFreezeLogged = 0;
+                    m_particlePoolWarned = false;
+                    // 池是新建的 → 预热标记与距离累积一起作废（否则
+                    // "开场预热"这一辈子只会发生在那块已经被丢掉的池子上）。
+                    for (size_t i = 0; i < m_particlePrewarmApplied.size(); ++i) {
+                        m_particlePrewarmApplied[i] = false;
+                    }
+                } else {
+                    VK_LOG_ERROR("FX: ensureResources failed; particles stay "
+                                 "disabled");
+                }
+            }
+            if (m_particles->ready()) {
+                // 冻结帧：模拟停了 ⇒ 不重传发射器、也不清计数器。
+                // 前者会让"冻住的那一帧"被后来的编辑改掉（冻结的意义就是
+                // 画面完全确定），后者会让回读永远是 0（看不出还剩多少粒子）。
+                const bool frozen = particleFrozen();
+                if (!frozen) {
+                    collectParticleEmitters(scene);
+                    m_particles->upload(m_particleScratch, m_currentFrame);
+                    if (m_particles->stats().dropped > 0) {
+                        // 超出 maxEmitters 的发射器被丢掉了 —— 这是"用户加了
+                        // 第 9 个发射器但看不到效果"的根因，必须说出来。
+                        static bool droppedLogged = false;
+                        if (!droppedLogged) {
+                            droppedLogged = true;
+                            VK_LOG_WARN("FX: %u emitters dropped (max=%u) -- "
+                                        "raise MYVK_FX_EMITTERS",
+                                        m_particles->stats().dropped,
+                                        m_particleSettings.maxEmitters);
+                        }
+                    }
+                }
+            }
+        } else if (m_particles->ready()) {
+            // 关着但资源还在：把发射器表清空 —— 模拟会把全部槽位标死，
+            // 紧凑表随之清空，间接命令的 instanceCount 变成 0。
+            // （这样"运行中开关粒子"不会留下上一帧的一批粒子停在画面上。）
+            m_particleScratch.clear();
+            m_particleEmitterCount = 0;
+            m_particles->upload(m_particleScratch, m_currentFrame, false);        }
+    }
+
     // ---- 场景状态上传 ----
     // 阴影正交范围 / 局部灯 / FrameUBO（相机与光照）/ **相机视锥 + 本帧
     // 绘制列表**（物体级视锥剔除就在这里发生）/ 蒙皮。
@@ -4531,7 +6002,7 @@ void Renderer::drawFrame(scene::Scene& scene) {
                 "lod=%u/%u/%u/%u lodEnts=%u noLod=%u lodSw=%u "
                 "occl=%u occlOn=%d hizMips=%u "
                 "mdi=%d mdiSub=%u mdiBatches=%u mdiInst=%u "
-                "bl=%d blTex=%u blPages=%u",
+                "bl=%d blTex=%u blPages=%u pom=%u decal=%u",
                 m_stats.renderables, m_stats.culledFrustum,
                 m_stats.drawnOpaque, m_stats.drawnTransparent,
                 m_stats.gizmosCulled, m_stats.drawCalls, m_stats.triangles,
@@ -4552,8 +6023,89 @@ void Renderer::drawFrame(scene::Scene& scene) {
                 m_stats.mdiSubmissions, m_stats.mdiBatches,
                 m_stats.mdiInstances,
                 (m_bindless && m_bindlessEnabled) ? 1 : 0,
-                m_stats.bindlessTextures, m_stats.bindlessPages);
+                m_stats.bindlessTextures, m_stats.bindlessPages,
+                m_stats.parallaxDraws, m_stats.decalDraws);
         }
+    }
+
+    // ---- 反射探针自检（R5-1；MYVK_PROBE_DBG=1 打开）----
+    // 每 30 帧一条，与 CULL-STATS / LOD-STATS 同频。打的是"捕获真的发生了、
+    // 6 个面真的各有内容"——6 面平均亮度来自回读（HOST_COHERENT），
+    // 它是**画面之外**的可观测量：即使截图上分辨不出反射，6 个亮度值
+    // 也能直接证明捕获管线（6 面相机 → 拷贝 → 回读）整链在跑。
+    if (m_probeDbg && m_probes && m_probes->ready() &&
+        (m_probeDbgFrame++ % 30) == 1) {
+        const render::ReflectionProbeSystem::Stats& ps = m_probes->stats();
+        VK_LOG_INFO(
+            "PROBE-DUMP enabled=%d count=%u captures=%u size=%u pref=%u "
+            "mips=%u readback=%d lum=(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f)",
+            m_probeSettings.enabled ? 1 : 0, ps.probeCount, ps.captures,
+            ps.captureSize, ps.prefilterSize, ps.mips,
+            ps.readbackValid ? 1 : 0, static_cast<double>(ps.faceLum[0]),
+            static_cast<double>(ps.faceLum[1]), static_cast<double>(ps.faceLum[2]),
+            static_cast<double>(ps.faceLum[3]), static_cast<double>(ps.faceLum[4]),
+            static_cast<double>(ps.faceLum[5]));
+        // 非黑纹素计数：`lum` 会被"大面积暗 + 一小块亮"压扁到看不出，
+        // 这一项直接回答"这一面有没有内容"。
+        VK_LOG_INFO("PROBE-NZ +X=%u -X=%u +Y=%u -Y=%u +Z=%u -Z=%u (of %u)",
+                    ps.faceNonZero[0], ps.faceNonZero[1], ps.faceNonZero[2],
+                    ps.faceNonZero[3], ps.faceNonZero[4], ps.faceNonZero[5],
+                    ps.captureSize * ps.captureSize);
+        // 每面中心纹素。面序 = +X -X +Y -Y +Z -Z；中心看的是视轴方向。
+        VK_LOG_INFO(
+            "PROBE-MID +X=(%.3f,%.3f,%.3f) -X=(%.3f,%.3f,%.3f) "
+            "+Y=(%.3f,%.3f,%.3f) -Y=(%.3f,%.3f,%.3f) +Z=(%.3f,%.3f,%.3f) "
+            "-Z=(%.3f,%.3f,%.3f)",
+            static_cast<double>(ps.faceMid[0].x),
+            static_cast<double>(ps.faceMid[0].y),
+            static_cast<double>(ps.faceMid[0].z),
+            static_cast<double>(ps.faceMid[1].x),
+            static_cast<double>(ps.faceMid[1].y),
+            static_cast<double>(ps.faceMid[1].z),
+            static_cast<double>(ps.faceMid[2].x),
+            static_cast<double>(ps.faceMid[2].y),
+            static_cast<double>(ps.faceMid[2].z),
+            static_cast<double>(ps.faceMid[3].x),
+            static_cast<double>(ps.faceMid[3].y),
+            static_cast<double>(ps.faceMid[3].z),
+            static_cast<double>(ps.faceMid[4].x),
+            static_cast<double>(ps.faceMid[4].y),
+            static_cast<double>(ps.faceMid[4].z),
+            static_cast<double>(ps.faceMid[5].x),
+            static_cast<double>(ps.faceMid[5].y),
+            static_cast<double>(ps.faceMid[5].z));
+    }
+
+    // ---- 诊断（MYVK_FX_DBG=1）：GPU 粒子的逐帧观测 ----
+    // 与 PROBE-DUMP 同一条约定：每 30 帧一条，只打日志不改渲染行为。
+    //
+    // alive / spawned 是**GPU 侧**的观测量（compute 用 atomicAdd 数的，
+    // 上一轮回读），CPU 完全不知道有几颗粒子在画 —— 所以它是"粒子真的
+    // 在跑"的唯一硬证据：即使截图上分辨不出，计数也能证明整链
+    //（发射 → 紧凑化 → 计数 → 间接绘制）在动。
+    // 冻结帧后 alive 会稳定在同一个值（模拟停住），验证脚本据此断言
+    // "同一配置两次运行**状态**逐位一致"。
+    // ⚠ 不是"逐像素一致" —— 两条固有不确实性（池分槽 / atomicAdd 顺序）
+    //   让像素差有个非零下界，详见本函数上面冻结分支里的长注释。
+    //
+    // ⚠ `dispatches` 与 `simFrame` 是**两个不同的量**，别混：
+    //   dispatches = 模拟 compute 派发了几次（≈ 渲染帧率，每帧一次）；
+    //   simFrame   = 模拟推进了几个固定步（= 模拟时刻 × simHz）。
+    //   粒子按墙钟时间走之后，两者在高帧率下会差一个数量级
+    //   ——"dispatches 远大于 simFrame"就是"速度与帧率解耦"的直接证据。
+    //   （以前两者相等，代价是 500 fps 的编辑器里火焰快 8 倍。）
+    if (m_particleDbg && m_particles && m_particles->ready() &&
+        (m_particleDbgFrame++ % 30) == 1) {
+        const fx::ParticleSystem::Stats& fs = m_particles->stats();
+        VK_LOG_INFO("FX-DUMP enabled=%d slot=%u emitters=%u alive=%u spawned=%u "
+                    "cap=%u draws=%u maxAlive=%u dispatches=%llu readback=%d "
+                    "frozen=%d simFrame=%u inst=(%u,%u)",
+                    m_particleSettings.enabled ? 1 : 0, m_currentFrame,
+                    fs.emitters, fs.alive,
+                    fs.spawned, fs.capacity, fs.draws, fs.maxAlive,
+                    static_cast<unsigned long long>(fs.simDispatches),
+                    fs.readbackValid ? 1 : 0, particleFrozen() ? 1 : 0,
+                    m_particleSimFrame, fs.instAdditive, fs.instAlpha);
     }
 
     // 提交

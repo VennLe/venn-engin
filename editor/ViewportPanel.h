@@ -76,6 +76,14 @@ public:
     // 由 EditorApp::handleShortcuts 每帧调一次；内部自带"仅编辑态"判断。
     void handleViewShortcuts();
 
+    // E14：浮层快捷键。Shift+1..N 切视图模式；Ctrl+Shift+数字 存相机书签，
+    // Alt+Shift+数字 跳回书签。同样由 EditorApp::handleShortcuts 调用。
+    //
+    // 为什么全挂在 Shift 层：数字键本身被两套既有快捷键占满了 ——
+    // 1/3/7(+Ctrl) 是 Blender 视图方向、Alt+数字 是面板显隐（E04）。
+    // Shift 层是当时唯一还空着、又和"第二功能"直觉一致的位置。
+    void handleOverlayShortcuts();
+
     // 数字键 0：把选中的物体**竖直**落地（x / y 不动，只让世界包围盒底部
     // 贴到 z = 0 的地面）。只对"在 3D 视口里左键点中"的选中生效
     // （见 EditorContext::selectionFromViewport）。
@@ -94,12 +102,21 @@ private:
     void drawToolbar();
     // 工具栏第二行：平移 / 旋转 / 缩放各自的吸附开关 + 步长 + UE 预设
     void drawSnapRow();
-    void drawOverlay(ImDrawList* dl, const glm::vec2& vpPos,
-                     const glm::vec2& vpSize) const;
     // 编辑态导航（UE 视口手感：飞行相机 + 滚轮推拉 / 右键滚轮调灵敏度）
     void handleNavigation(bool hovered) const;
-    // 编辑态右上角浮层：灵敏度 + 栅格开关 + 操作提示
-    void drawNavHud(const glm::vec2& vpPos, const glm::vec2& vpSize);
+    // E14 · 四角浮层（各自独立显隐，见 EditorContext::ViewportOverlay）
+    //   左上 = 视图模式条
+    void drawViewModeBar(const glm::vec2& vpPos, const glm::vec2& vpSize);
+    //   右上 = 统计 HUD（FPS / 帧时间 / draw calls / 三角形 / VRAM / 分辨率 /
+    //          视图模式 / 实体 / 选中，逐行可关）
+    void drawStatsHud(const glm::vec2& vpPos, const glm::vec2& vpSize);
+    //   左下 = 相机信息（位置 / 注视点 / FOV / 距离 / 灵敏度 + 书签条 + 设置）
+    void drawCameraInfo(const glm::vec2& vpPos, const glm::vec2& vpSize);
+    // 右键视口空白处 → "Viewport Display" 菜单：四块浮层的开关 +
+    // 统计 HUD 的逐项开关（右键点中选中物体时仍然是物体菜单，见
+    // drawObjectMenu 的按下/松开判定）。
+    void drawDisplayMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
+                         bool hovered);
     // 编辑态左下角导航球：拖拽转视角 / 点轴端小球吸附到正视图
     void drawNavGizmo(const glm::vec2& vpPos, const glm::vec2& vpSize);
     // 运行态右上角浮层：全屏 / 恢复按钮 + 播放状态（不提供任何导航）
@@ -137,6 +154,11 @@ private:
 
     bool m_showOverlay = true;
     bool m_showGizmo = true;
+
+    // E14：模式条（左上）的右 / 下边界（屏幕坐标，每帧由 drawViewModeBar
+    // 填）。统计 HUD 用它判断顶边会不会撞上，撞上就下移一行。
+    float m_modeBarRight = 0.0f;
+    float m_modeBarBottom = 0.0f;
 
     // ---- 导航球（Navigation Gizmo）的拖拽状态 ----
     // m_navPressDir：按下时命中的轴端（ViewDir 枚举，-1 = 没点在小球上）。

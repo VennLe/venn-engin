@@ -36,6 +36,12 @@
 
 #include "core/Application.h"
 
+#include "ConsolePanel.h"    // E16：m_console 成员需要完整类型（unique_ptr 析构）
+#include "NotificationCenter.h"  // E21：m_notifications（同上，unique_ptr 析构）
+#include "GpuTimelinePanel.h"    // E25：m_gpuTimeline（同上）
+#include "PanelRegistry.h"   // PanelDesc（面板表是 EditorApp 的静态成员）
+#include "Toolbar.h"         // EditorHost（菜单里那些"要动引擎"的动作走它）
+
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -52,11 +58,45 @@ class ContentBrowser;
 class ScriptEngine;
 class SplitLayout;
 class CharacterWindow;
+class ParamEditCommand;
 
-class EditorApp : public core::Application {
+// EditorApp 同时实现 EditorHost —— 菜单里那些"要动引擎"的动作
+// （切工作区 / 换视图模式 / 读 GPU 型号）都在这里落地。Toolbar 只知道
+// "我要切工作区"，不知道它是怎么实现的（见 Toolbar.h 的说明）。
+class EditorApp : public core::Application, public EditorHost {
 public:
     EditorApp();
     ~EditorApp() override;
+
+    // ---------------------------------------------------------- EditorHost
+    void applyWorkspace(int index) override;
+    void saveWorkspace() override;
+    void resetWorkspace() override;
+    void applyViewportLayout(int layout) override;
+    int currentViewportLayout() override;
+    void applyViewMode(int mode) override;
+    int currentViewMode() override;
+    void reloadShaders() override;
+    void reloadAssets() override;
+    const char* gpuName() override;
+    const char* engineVersion() override;
+
+    // ---- E18 命令面板 ----
+    // Help ▸ Command Palette… 与 Ctrl+Shift+P 都落到这里（Toolbar 拿不到
+    // 面板状态，所以走 EditorHost 这条窄接口，与 applyWorkspace 一个套路）。
+    void showCommandPalette() override;
+
+    // ---- E21 通知历史（Help 菜单入口）----
+    // 与 showCommandPalette 同一个理由：Toolbar 拿不到窗口状态位。
+    void showNotificationHistory() override;
+
+    // ---------------------------------------------------------- E04 面板表
+    // 表本体在 EditorApp.cpp（表项里的 draw 指针要指向本类的私有绘制函数）。
+    // 为什么是**静态成员**而不是"自由函数 + friend"：自由函数要拿私有成员
+    // 就得 friend，而 friend 声明必须和 PanelRegistry.h 里的声明逐字一致 ——
+    // 那种"两处同步"是编译期查不出来的坑。静态成员天然有访问权。
+    static const std::vector<PanelDesc>& panelTableVec();
+    static std::vector<PanelDesc> buildPanelTable();
 
 protected:
     void onInit() override;
@@ -71,6 +111,40 @@ protected:
 private:
     void computeLayout();
     void handleShortcuts();
+
+    // ---------------------------------------------------------- E04 面板表
+    // 表项里的 draw 入口（静态薄壳 → 转调到成员函数；表的定义见
+    // EditorApp.cpp 的 buildPanelTable）
+    static void panelDrawHierarchy(EditorApp& a);
+    static void panelDrawContent(EditorApp& a);
+    static void panelDrawInspector(EditorApp& a);
+    static void panelDrawViewport(EditorApp& a);
+    static void panelDrawStats(EditorApp& a);
+    static void panelDrawScripts(EditorApp& a);
+    static void panelDrawEngine(EditorApp& a);
+    static void panelDrawConsole(EditorApp& a);
+    static void panelDrawGpuTimeline(EditorApp& a);
+
+    // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
+    void drawPanels();
+    // 画一块"待建设"的占位（表里 draw == nullptr 的非视口面板）
+    void drawPlaceholderPanel(int panelIndex);
+
+    // ---------------------------------------------------------- E05 工作区
+    // 施加某套工作区：面板显隐 + 分栏比例 + 视口布局 + 视图模式。
+    // 只有本类同时拿得到 SplitLayout / Renderer / 面板状态，所以放在这儿。
+    // （applyWorkspace / saveWorkspace / resetWorkspace 是 EditorHost 的
+    //   实现，声明在上面。）
+    // 当前实际布局是否偏离了该工作区的出厂预设（标题栏的 * 号）
+    bool workspaceModified();
+    // 视图模式名（菜单用）
+    static const char* viewModeLabel(int mode);
+
+    // ---------------------------------------------------------- 布局持久化
+    void loadEditorLayoutFromDisk();   // onInit
+    void saveEditorLayoutToDisk();     // onShutdown
+    // 把"视口布局"同步给渲染器（子视口数量）+ 记录日志
+    void syncViewportLayout();
     // 让 GLFW 顶层窗口的全屏状态跟上"游戏全屏"逻辑状态。
     // **只在状态发生变化的那一帧动窗口** —— 每帧无条件同步会把 F11
     // （纯窗口全屏）立刻覆盖掉。
@@ -104,6 +178,52 @@ private:
     void drawStatsPanel();
     void drawScriptPanel();
     void drawEnginePanel();
+    // E09 特殊块：生成器表达不了的四小块（动作型控件 / 只读信息），
+    // 各自独立成函数，保持 drawEnginePanel 本体是个薄驱动。
+    void drawEngineCameras();
+    void drawEngineViewMode();
+    void drawEngineMsaa();
+    void drawEngineClusterStats();
+    // E16：Console 面板（日志汇入 + 表驱动命令）。
+    void drawConsolePanel();
+    void registerConsoleCommands();
+    // E25：GPU 时戳时间轴（甘特图 + 60 帧历史 + 点段联动 Console）。
+    void drawGpuTimelinePanel();
+    // E21：通知 / 进度 —— 状态栏计数与 toast 的接线（见 NotificationCenter.h）。
+    //   ① 打开 Console 并滚到某条日志（点 toast / 历史项的落地）
+    void serviceNotificationFocus();
+    //   ② 自动化钩子：MYVK_EDITOR_TOAST / MYVK_EDITOR_ASYNC_TASK（第 40 帧起）
+    void driveNotificationHooks();
+    //   ②b MYVK_EDITOR_TOAST_CLICK=<idx>：第 60 帧"点"那条 toast
+    void driveToastClickHook();
+    //   ③ 进度条打开时把任务数喂给状态栏锚点
+    void logNotificationStatus();
+    // E18：把"动作"登记进命令注册表（命令面板 / 快捷键表 / 总览共用一张表）。
+    void registerEditorCommands();
+    bool& commandPaletteRef() { return m_showCommandPalette; }
+    // E17：偏好表驱动（单项重置 / 搜索 / Reset All / 落盘）。
+    // ⚠ PrefItem::ptr 返回 void*（指向 float 或 bool，看 isBool）——
+    //   设置项的存储分散在 EditorContext / Renderer，地址走访问器拿。
+    struct PrefItem {
+        const char* id;        // 稳定键（落盘 + ImGui ID + 搜索文本）
+        const char* label;
+        const char* category;  // 页名 / 搜索结果分组
+        bool isBool;
+        float def;             // 出厂默认（重置用）
+        float lo, hi;          // Float 档的 UI 范围
+        std::function<void*(EditorApp&)> ptr;
+    };
+    static const std::vector<PrefItem>& prefsTable();
+    void drawPrefRow(const PrefItem& it);
+    void applyPrefsFromDisk();
+    void savePrefsToDisk();
+    bool m_confirmResetAll = false;   // Reset All 的二次确认状态
+    // FeatureUIGen 的参数变更钩子（FTR-UI 日志 + 个别参数的副作用）。
+    void onFeatureParamChanged(const char* paramId);
+    // E19：参数编辑结束 → 推一条可撤销的 ParamEditCommand（500ms 内同一
+    // 参数连续编辑合并成一条）。是 FeatureUIGen 的 undo 钩子的落地实现。
+    void onFeatureParamUndo(const char* paramId, const void* before,
+                            const void* after, std::size_t size);
     void drawStatusBar();
     void drawSettingsPanel();
     // 角色详情窗口（创建第一/第三人称角色时弹出）
@@ -121,6 +241,36 @@ private:
     std::unique_ptr<ScriptEngine> m_scripts;
     std::unique_ptr<SplitLayout> m_split;
     std::unique_ptr<CharacterWindow> m_characterWindow;
+    std::unique_ptr<ConsolePanel> m_console;
+    // E16：MYVK_EDITOR_CONSOLE_CMD 注入命令只执行一次的哨兵。
+    bool m_consoleCmdDone = false;
+    // E18：命令面板开合位（Ctrl+Shift+P / Help 菜单）
+    bool m_showCommandPalette = false;
+
+    // ---- E21：通知 / 进度 ----
+    std::unique_ptr<NotificationCenter> m_notifications;
+    bool m_showNotificationHistory = false;
+    // 自动化钩子（MYVK_EDITOR_TOAST / MYVK_EDITOR_ASYNC_TASK）的一次性哨兵
+    bool m_notifHookDone = false;
+    bool m_toastClickDone = false;
+    bool m_taskDemoActive = false;
+    bool m_taskDemoCancelled = false;
+
+    // ---- E25：GPU 时戳时间轴 ----
+    // 面板自己按帧采样 60 帧历史（GpuTimer 只存最近一帧）。
+    std::unique_ptr<GpuTimelinePanel> m_gpuTimeline;
+    // MYVK_EDITOR_GPUTIMELINE=1 开面板只做一次
+    bool m_gpuTimelineOpenDone = false;
+
+    // ---- E19：设置类改动的撤销（合并窗口）----
+    // 同一个参数、500ms 内的连续编辑合并成一条历史。
+    // ⚠ m_lastParamCmd 是指向**命令栈持有的对象**的裸指针，用来判断"栈顶
+    //   是不是我刚记的那一条"。栈自己负责它的生命周期；这里只在
+    //   `topCommand() == m_lastParamCmd` 时才 deref，且还要 id 与时间窗
+    //   都对得上 —— 三重条件同时误判的概率可以忽略。
+    ParamEditCommand* m_lastParamCmd = nullptr;
+    std::string m_lastParamId;
+    double m_lastParamTime = 0.0;
 
     // 热重载扫描节流（每 0.5s 扫一次脚本文件时间戳）
     float m_hotReloadTimer = 0.0f;
@@ -148,6 +298,28 @@ private:
     // 每次新 Play 开始也会重新灌满（见 EditorApp::onUpdate）。
     int m_collisionLogBudget = 240;
     uint64_t m_collisionFrames = 0;
+
+    // ---- E08：播放倍速（Transport 的 0.25x / 1x / 2x）----
+    // 乘在 dt 上（等价于 Unity 的 Time.timeScale / UE 的 Global Time
+    // Dilation）。默认 1.0 —— 不碰它时逐帧行为与本功能引入前完全一致。
+    float m_timeScale = 1.0f;
+
+    // ---- E05：自动化用"按帧切工作区"序列 ----
+    // MYVK_EDITOR_WORKSPACE 只能定"启动时是哪一套"；而 E05 的验收要求
+    // "切过去 → 断言 → 切回来 → 复原"，那就得在**同一个会话内**切两次。
+    // 所以另有一个序列钩子：
+    //     MYVK_EDITOR_WORKSPACE_SEQ="30:debug 60:level"
+    // = 第 30 帧切到 debug、第 60 帧切回 level（帧号从 1 起，空格/逗号都能分隔）。
+    // 这条钩子只在自动化里用；界面上切工作区走菜单 / Ctrl+Alt+数字。
+    struct WsSwitch {
+        uint64_t frame = 0;
+        int index = 0;
+    };
+    std::vector<WsSwitch> m_wsSwitch;
+    uint64_t m_editorFrames = 0;
+    // 解析上面那个序列（坏格式 / 未知工作区 → WARN 后跳过该条，不整体失败：
+    // 一个笔误不该让整轮自动化跑不起来）。
+    void parseWorkspaceSequence(const char* spec);
 
     // 已经同步给 GLFW 窗口的全屏状态（边沿检测用，见 syncWindowFullscreen）
     bool m_appliedWindowFullscreen = false;

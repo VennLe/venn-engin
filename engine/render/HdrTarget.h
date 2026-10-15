@@ -106,6 +106,14 @@ public:
         return m_frames[frameIndex % m_frames.size()].depthImage;
     }
 
+    // 单采样 HDR 颜色图的 **image** 本体（不只是 view）。
+    // 给"把这张图拷到别处"的用途 —— 反射探针捕获（R5-1）要把每个面的
+    // 解析结果 vkCmdCopyImage 进立方体贴图的一层。renderpass 的
+    // finalLayout = SHADER_READ_ONLY，所以调用方从它迁到 TRANSFER_SRC。
+    VkImage resolveImage(uint32_t frameIndex) const {
+        return m_frames[frameIndex % m_frames.size()].resolveImage;
+    }
+
     VkFormat colorFormat() const { return kColorFormat; }
     VkFormat depthFormat() const { return m_depthFormat; }
     VkExtent2D extent() const { return m_extent; }

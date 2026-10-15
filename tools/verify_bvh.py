@@ -49,6 +49,12 @@ def launch(exe, scene):
     env["MYVK_NO_WINDOW_SAVE"] = "1"
     env["MYVK_FRUSTUM_DBG"] = "1"
     env["MYVK_BVH_DBG"] = "1"
+    # 关掉视口四角浮层（E14 之后：左上模式条 / 右上统计 / 左下相机信息 /
+    # 右下导航球）。都是**子窗口**，会吃掉落在自己身上的点击 —— 本用例靠
+    # "点右下角空地应打不中任何物体"来验证射线拾取，而右下角现在正好是
+    # 导航球。E14 之前导航小图标在左下角（所以那时的注释写"别点左下角"），
+    # 四角布局之后四个角全被浮层占了，只能整体关掉这才有真正的"空地"。
+    env["MYVK_EDITOR_NO_HUD"] = "1"
     env["MYVK_EDITOR_SCENE"] = scene
     env["MYVK_EDITOR_CAM"] = CAM
 
@@ -260,6 +266,11 @@ def main():
         warm, tries = None, 0
         while warm is None and time.time() - t_warm < 20.0:
             tries += 1
+            # 每轮重抢一次前台：全量回归里前面用例的编辑器可能在异步退出，
+            # 期间焦点会被抢走 —— 窗口一旦不在前台，mouse_event 静默失效
+            # （不报错、只表现为"点了没反应"）。force_foreground 已经在
+            # 前台时立即返回，无副作用。
+            force_foreground(hwnd)
             click_client(hwnd, vx0 + (vx1 - vx0) * 0.94,
                          vy0 + (vy1 - vy0) * 0.94)
             warm = last_match(tap, "pick: nothing hit", MISS_RE, timeout=1.2)
@@ -300,8 +311,10 @@ def main():
                   "rayLeafTests=%d total=%d" % (rayLeaf, total))
 
         # (c) 点视口右下角：射线朝右下方，打不到任何立方体。
-        #     注意**不能点左下角** —— 那里是导航小图标（轴指示器）的隐形
-        #     按钮，它会先把这一下吃掉（NAV-GIZMO press），点选根本不会执行。
+        #     E14 之后视口四角都摆了浮层（子窗口会吃掉落在自己身上的点击），
+        #     所以本用例统一以 MYVK_EDITOR_NO_HUD=1 启动（见 launch()），
+        #     右下角才是真正的空地。（E14 之前导航小图标在左下角，
+        #     那时的禁忌是"别点左下角"。）
         #
         # ⚠ 判据是"这次点击**新增**了一条 pick 日志"，不能只看"日志里有
         #   `pick: nothing hit`" —— 上面那次预热点击本身就会打一条一样的，

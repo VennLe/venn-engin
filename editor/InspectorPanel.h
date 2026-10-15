@@ -32,8 +32,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace assets {
@@ -54,6 +56,12 @@ public:
 
     void draw();
 
+    // ---- E11 自动化自检（由 Console `insp.selftest` 调用）----
+    // 覆盖三件事：剪贴板 Copy→改值→Paste 往返一致；Reset to Default 回到
+    // 构造默认；折叠状态按名持久化（面板级 map，与当前实体无关）。
+    // 成功返回 true，out 填一行可断言的详情。
+    bool selfTest(std::string& out);
+
 private:
     void drawSceneryFallback();  // 没选中时显示相机 / 主光 / 场景信息
     void drawTransform(ecs::Entity e);
@@ -65,12 +73,59 @@ private:
     // 不显示"Add"按钮是有意的 —— 碰撞体的默认形状要按网格算（凸包 / 胶囊），
     // 那需要有 mesh，视口菜单能顺手把 mesh 检查掉。
     void drawCollisionSection(ecs::Entity e);
+    // 延迟贴花段落（R4-4）：只在实体**已经有** DecalComponent 时出现。
+    // 加组件走下面的 "Add Component → Decal"，或者场景 JSON 里直接写。
+    void drawDecalSection(ecs::Entity e);
+    // 反射探针段落（R5-1）：只在实体**已经有** ReflectionProbeComponent
+    // 时出现。加组件走下面的 "Add Component → Reflection Probe"。
+    void drawReflectionProbeSection(ecs::Entity e);
+    // GPU 粒子发射器段落（R6-1）：只在实体**已经有**
+    // ParticleEmitterComponent 时出现。曲线编辑用的是"四根滑条 = 四个
+    // 控制点"（路线图明确："曲线编辑先用滑条组"）。
+    void drawParticleEmitterSection(ecs::Entity e);
+
+    // 颜色渐变带编辑器（Color over Lifetime）。Unity 里是一条带停靠点的
+    // 色带，Blender 里是 Color Ramp —— 这里做成两者的共同子集：
+    //   · 顶部一条**预览带**（按停靠点分段线性铺开，直接看出颜色走向）
+    //   · 每行一个停靠点：颜色方块 + 位置滑条 + 删除；停靠点按 t 自动排序
+    //   · 底部 "Add stop"（上限 kMaxColorStops）
+    // 返回 true = 本帧改过（调用方据此打签名日志 / INS-FX-RAMP-EDIT）。
+    //
+    // ⚠ 撤销记的是**整条带子**（target = &ramp，sizeof(ParticleColorRamp)
+    //   字节），不是单个停靠点。
+    //   理由：拖完一个停靠点会 `ramp.sort()` 重排，`&stops[i]` 下次就指向
+    //   另一个点了 —— 按单个点记的话，"撤销"会把**别的**点改回旧值。
+    //   整条带子只有 8×(4+16)+8 ≈ 168 字节，一次快照的代价可以忽略。
+    //   增删停靠点走 m_ctx.structuralEdit（那会改变停靠点个数）。
+    bool drawColorRampEditor(const char* id, ecs::ParticleColorRamp& ramp);
     void drawLights(ecs::Entity e);
     void drawScript(ecs::Entity e);
     void drawAddRemove(ecs::Entity e);
 
     // 内置图元的生成参数拖完了：重建几何 + 入撤销栈
     void commitPrimitiveEdit(ecs::Entity e, const ecs::MeshComponent& before);
+
+    // ---- E11 分区折叠 / 搜索 / 右键菜单 ----
+    //
+    // sectionHeader() 统一替代裸 CollapsingHeader：
+    //   · 折叠状态按**分区名**记忆（m_sectionOpen），换实体不重置；
+    //   · 顶部搜索词命中分区名或字段关键词才画该分区（否则整段跳过）；
+    //   · 传入有效实体时，标题上挂右键菜单（Copy / Paste / Reset）。
+    //   key 为折叠记忆与搜索用的稳定名（默认同 name；如 "Script (.vks)" 用 "Script"）。
+    bool sectionHeader(const char* name, bool defaultOpen = false,
+                       ecs::Entity e = ecs::Entity{}, const char* key = nullptr);
+
+    // 分区标题的右键菜单（绑定 CollapsingHeader 这一项）
+    void drawSectionContextMenu(const char* name, ecs::Entity e);
+
+    // 搜索无命中提示 / INSP-SECTIONS 状态日志（去抖）
+    void drawNoMatchHint();
+    void logSectionState();
+
+    // 组件剪贴板操作（POD 字节快照）。返回 true = 该分区支持此操作。
+    bool copySection(const char* name, ecs::Entity e);
+    bool pasteSection(const char* name, ecs::Entity e);
+    bool resetSection(const char* name, ecs::Entity e);
 
     // 一个材质纹理槽（"小方块 + 加号"）。挨着对应的因子控件放一行，
     // 从 Content 面板把图片拖进来即可绑定；绑定后方块里放缩略图、右边
@@ -79,8 +134,12 @@ private:
     //   srgb     —— 颜色贴图传 true（albedo / emissive），数据贴图传 false。
     //               这个参数同时决定缓存键的后缀，见 .cpp 里的 slotCacheKey
     //   maxWidth —— 这一行剩下的水平空间：文件名按它裁剪，避免把窗口撑出去
+    //   logTag   —— 矩形日志的 tag 前缀。默认 "MAT-SLOT"（材质区），
+    //               贴花区传 "DECAL-SLOT" —— 两个区的槽位名会重名
+    //               （都有 albedo / normal），日志里必须能分开。
     bool drawTextureChip(const char* slotId, const char* hintText,
-                         assets::Texture** slot, bool srgb, float maxWidth);
+                         assets::Texture** slot, bool srgb, float maxWidth,
+                         const char* logTag = "MAT-SLOT");
 
     // ---- 撤销辅助（定义在头里，模板需要可见）----
     //
@@ -151,6 +210,35 @@ private:
     // 只在签名变化时打一行，不会刷屏 —— 和 logRect 的去抖是同一个思路。
     std::string m_lastMeshParamSig;
     std::string m_lastLightParamSig;
+    // 贴花段同理：DECAL-PARAMS labels=... 只在签名变化时打一行。
+    std::string m_lastDecalParamSig;
+    // 探针段同理（PROBE-PARAMS）。
+    std::string m_lastProbeParamSig;
+    // 粒子发射器段同理（FX-PARAMS）—— 验证脚本靠它断言"这个分段真的有
+    // 这些控件"（比去截图里认控件靠谱）。
+    std::string m_lastFxParamSig;
+    // 粒子面板的一键"全展开 / 全折叠"。
+    //   -1 = 不强制（常态）；0 = 本帧强制全折叠；1 = 本帧强制全展开。
+    // 为什么需要这个瞬态标志：ImGui 的 SetNextItemOpen(cond = Appearing)
+    // 只在节点**第一次出现**时生效，之后状态归 ImGui 自己的 storage 管，
+    // 所以"一键全展开"必须用 cond = Always 强推一帧 —— 而 Always 每帧都
+    // 推就会让用户点不动那些折叠标题。测完这一帧立刻复位。
+    int m_fxForceModules = -1;
+
+    // ---- E11 分区折叠 / 搜索 / 剪贴板 ----
+    // 折叠状态**按分区名**持久化：面板级成员，切实体、切场景都保留。
+    // 值的权威来源仍是 ImGui 自己的 window storage（用户点击时同步回来），
+    // 这里存一份是为了"第一帧施加初始值"与日志可断言。
+    std::unordered_map<std::string, bool> m_sectionOpen;
+    // 组件搜索词：非空时只画命中的分区（分区名或字段关键词）
+    char m_search[64] = {0};
+    // 组件剪贴板：分区名 + 组件字节快照（Copy/Paste Properties）
+    std::string m_clipSection;
+    std::vector<std::uint8_t> m_clipBytes;
+    int m_clipKind = 0;               // 快照对应的组件类型（见 PodKind）
+    int m_sectionsDrawn = 0;          // 本帧画出的分区数（搜索"无命中"提示用）
+    // INSP-SECTIONS 日志去抖签名
+    std::string m_lastSectionSig;
 };
 
 } // namespace editor

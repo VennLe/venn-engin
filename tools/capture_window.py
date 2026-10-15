@@ -116,25 +116,50 @@ def capture_client(hwnd):
     return img.convert("RGB"), bool(ok)
 
 
-def capture_nonempty(hwnd, tries=12, delay=0.4):
-    """抓一张**非空**截图（所有 GUI 验证脚本共用的健壮入口）。
+def _looks_blank(img, tol=3.0):
+    """整窗近乎单色 → 这一帧根本没抓到画面。
 
-    已知的窗口前台时序 flaky：刚 ShowWindow 后 PrintWindow / GetClientRect
-    可能拿到 0×0（窗口尚未真正显示 / 尺寸未生效），此时 `Image.save` 会抛
-    `ValueError: cannot write empty image`，把整个验证脚本崩掉。这里重试到
-    拿到真实尺寸为止；拿不到就返回 None（让调用方优雅失败或跳过像素断言）。
+    `PrintWindow(PW_RENDERFULLCONTENT)` 在 Vulkan 交换链窗口上偶发返回
+    **尺寸正常但整幅纯白**的未合成帧（实测 1280×800 只压出 4460 字节）。
+    编辑器整窗恒含左侧 Hierarchy / Content 与右侧 Inspector 面板文字，
+    所以"整窗单色"永远不是真实画面 —— 可据此可靠地判定空帧。
+
+    症状非常隐蔽：空图 vs 正常图做像素比对 → "差异铺满整窗 / 采样区全 255"，
+    看起来像渲染回归，其实是抓图失败。CSM / IBL 两例就是这么被坑的。
+    """
+    if img is None:
+        return True
+    g = img.convert("L").resize((32, 20))
+    px = g.tobytes()
+    return (max(px) - min(px)) < tol
+
+
+def capture_stable(hwnd, tries=10, delay=0.35):
+    """抓一张**真的画面**：尺寸正确（> 16px）且内容非单色。
+
+    比 `capture_client` 多两层重试，专治两种已知 flaky：
+      1. 刚 ShowWindow / SetWindowPos 后 `GetClientRect` 拿到 0×0（尺寸未生效）；
+      2. PrintWindow 拿到尺寸正常但整窗纯白的空帧（Vulkan 交换链合成时序）。
+    拿不到就返回 None，让调用方优雅失败 / 跳过像素断言，而不是静默写出空图。
+    """
+    for _ in range(tries):
+        img, _ok = capture_client(hwnd)
+        if (img is not None and img.size[0] > 16 and img.size[1] > 16
+                and not _looks_blank(img)):
+            return img
+        time.sleep(delay)
+    return None
+
+
+def capture_nonempty(hwnd, tries=12, delay=0.4):
+    """（历史名，保留兼容）抓一张非空截图 —— 现在同时排除"整窗纯白"的空帧。
 
     ⚠ 另一个已被踩过的坑（本函数之外的纪律）：**同一时间只能有一个 GUI
     测试在跑**。每个脚本开跑前都调 `kill_stale_editors()`，那是
     `taskkill /F /IM Editor.exe` —— 会**无差别**杀掉别的脚本正在用的编辑器，
     症状正是"截图是空图 / 编辑器莫名提前退出"。跑前务必确认没有别的回归在跑。
     """
-    for _ in range(tries):
-        img, _ok = capture_client(hwnd)
-        if img is not None and img.size[0] > 16 and img.size[1] > 16:
-            return img
-        time.sleep(delay)
-    return None
+    return capture_stable(hwnd, tries=tries, delay=delay)
 
 
 def main():

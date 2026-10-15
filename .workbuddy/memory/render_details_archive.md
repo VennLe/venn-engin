@@ -350,10 +350,10 @@ SSGI / SSR / GodRays / DoF / MotionBlur 走统一 FrameGraph 资源调度；新�
 
 # 全局 set0 描述符表 / 构建路径表（查阅用 · 2026-10-14 从 MEMORY.md 搬入）
 
-## `set 0` 的 20 个 binding（`kGlobalSetBindings = 20`）
+## `set 0` 的 25 个 binding（`kGlobalSetBindings = 25`）
 | # | 内容 | 备注 |
 |---|---|---|
-| 0 | FrameUBO（720B） | 唯一来源 `RenderTypes.h` |
+| 0 | FrameUBO（**768B**） | 唯一来源 `RenderTypes.h`；`static_assert(sizeof(FrameUBO)==768)`，末尾 `probeParams` @752 |
 | 1 | shadowMap | `sampler2DArrayShadow`，第 i 层 = 第 i 级级联 |
 | 2 | lights | `LightInstance[]` |
 | 3 | clusters | 簇网格 |
@@ -373,9 +373,23 @@ SSGI / SSR / GodRays / DoF / MotionBlur 走统一 FrameGraph 资源调度；新�
 | 17 | lightExt | `LightExtInstance[]`，**下标与 binding2 严格对齐** |
 | 18 | lightTex | `sampler2DArray`（cookie + IES 共用），第 0 层恒全白 |
 | 19 | sssLut | `sampler2D`，R4-2 皮肤预积分 LUT（BC1 + mip，UNORM） |
+| 20 | decalAlbedo | R4-4 DBuffer 反照率（`R8G8B8A8_UNORM`），**关/无贴花时绑 `m_defaultTransparent`** |
+| 21 | decalNormal | R4-4 DBuffer 世界法线（同格式 / 同缺省） |
+| 22 | decalRoughMetal | R4-4 DBuffer 粗糙度-金属度（同格式 / 同缺省） |
+| 23 | probeMap | R5-1 反射探针立方体数组 `samplerCubeArray`，**关/无探针时绑 1×1 全黑 cube array（6 层）兜底图** |
+| 24 | ProbeBuffer | R5-1 探针参数 SSBO（`ProbeGpu`，std430 **112B** = mat4 + 3×vec4，无尾填充） |
 
-灯 / 环境 / 雾 / 光源修饰 / SSS 全挤在 set 0：Vulkan 只保证 4 个 set 同时绑定，而 set 1..6 已被
-六张材质贴图占满。新增 binding 必须同步 `kGlobalSetBindings` + `writeGlobalSet` + 着色器 layout 三处。
+⚠ **DBuffer 的缺省图必须是 `m_defaultTransparent`（RGBA 0,0,0,0）**，**不能**用
+`m_defaultBlack`：DBuffer 第四通道是 coverage，alpha=255 会让整屏被当成"coverage=1 的黑色贴花"。
+
+⚠ **探针 binding 23 的兜底图不能省**（不是"关着就不绑"）：`pbr.frag` 声明了该 binding，
+只要 layout 里有这个资源，创建**任何**用 `pbr.frag` 的管线时都必须有有效描述符，
+否则 `VUID-VkGraphicsPipelineCreateInfo-layout-07988`（与 SSAO 缺省白图 / 贴花全透明图同一条约定）。
+⚠ GLSL 侧 `struct Probe` 必须定义在 interface block **之外**（结构体不能定义在块里）。
+
+灯 / 环境 / 雾 / 光源修饰 / SSS / **贴花 DBuffer** / **反射探针** 全挤在 set 0：Vulkan 只保证 4 个 set 同时绑定，
+而 set 1..6 已被六张材质贴图占满（set7 被 POM 的 heightMap 占了）。新增 binding 必须同步
+`kGlobalSetBindings` + `writeGlobalSet` + 着色器 layout 三处。
 
 ## 本机构建路径
 | 项 | 值 |
@@ -434,7 +448,47 @@ SSGI / SSR / GodRays / DoF / MotionBlur 走统一 FrameGraph 资源调度；新�
 - **R4-2（皮肤 SSS）**：`MYVK_SSS=f` 覆盖曲率缩放（默认 8）。**`=0` → 曲率恒 0 → LUT 退化成 Lambert**，
   这是"关掉 SSS"的对照组。真实开关是材质的 `shadingModel` 字段（Default/Skin）。
   ⚠ **`f ≥ 24` 后曲率被 clamp 到 1 而饱和**（24/32/48/64 逐位相同）→ 做 A/B 对照要选敏感区间内的刻度。
+- **R4-3（POM）**：`MYVK_POM=0` 全局关（等价"所有材质 `heightScale=0`"，一步 `return uv` 短路）。
+  真实开关是材质的 `heightMap` 槽 + `heightScale`（关键字 bit5 `PARALLAX`）；`heightScale=0` 是
+  逐材质的对照组。全局刻度走 `ubo.pomParams`（x/y 淡出区间、z 层数上限、w 倍率兼开关），
+  逐材质深度走 `push.skin.y`。
+- **R4-4（延迟贴花 DBuffer）**：`MYVK_DECALS=1` 打开（**默认关**；关着时一个 pass 都不录、
+  binding 20/21/22 指向 1×1 全透明图）。真实开关是组件的 `enabled` 字段 + `opacity`；
+  全局开关在 `ubo.decalParams.x`。诊断：`MYVK_DECAL_DBG=1`（贴花数超 `kMaxDecals=64` 时打 WARN）。
+  逐帧打 `DECALS: on/off (dbuffer x3 RGBA8, max 64 decals/slot)`；`CULL-STATS` 尾部 ` decal=%u`；
+  `GPU-TIMING` 中部有 `decals=%.2f` 段。
+- **R5-1（反射探针）**：`MYVK_PROBES=1` 打开（**默认关**）；`MYVK_PROBE_INTENSITY=f` /
+  `PROBE_SIZE=N`（捕获分辨率，默认 **128**，夹 8..1024）/ `PROBE_AF=N`（`autoCaptureFrames`，**0 = 关**，默认关）/
+  `PROBE_MAX=N`（默认 4）/ `PROBE_PREFILTER_RES=N`（默认 64，上夹 512）/
+  `PROBE_PREFILTER_MIPS=N`（默认 5，**夹紧到 `1+log2(res)`**，见坑点）/
+  `PROBE_SAMPLES=N`（预过滤采样数，默认 256）。真实开关是组件的 `enabled` 字段；
+  全局开关在 `ubo.probeParams`（offset 752）。
+  诊断：`MYVK_PROBE_DBG=1` 打 `PROBE` / `PROBE-RES` / `PROBE-CAPTURE` / `PROBE-FACE` /
+  `PROBE-DECIDE` / **`PROBE-DUMP`（逐面加权平均亮度）/ `PROBE-NZ`（逐面非黑纹素计数）/
+  `PROBE-MID`（逐面中心纹素实测色）** —— **三个指标交叉验证才可信**。
+  ⚠ **探针依赖 IBL 总开关**：`MYVK_PROBES=1` 但 `MYVK_IBL=0` → 静默失效（见坑点表）。
+- **R6-1（GPU 粒子）**：`MYVK_FX=1` 打开（**默认关**；关着时**一个字节显存都不分配**
+  —— `ensureResources()` 推迟到第一次真的启用）。真实开关是组件的 `enabled` 字段。
+  `MYVK_FX_CAPACITY=N`（**每发射器**槽数，默认 4096）/ `MYVK_FX_EMITTERS=N`（最多几个发射器）/
+  `MYVK_FX_HZ=N`（模拟固定步长频率，默认 60，上夹 480）/ `MYVK_FX_SIZE=f`（尺寸倍率）/
+  `MYVK_FX_SOFTNESS=f`（软化距离倍率；**0 = 关软化，只留硬遮挡**）/
+  `MYVK_FX_INTENSITY=f`（亮度倍率）/ `MYVK_FX_FREEZE=N`（模拟钉在第 N 步之后）/
+  `MYVK_FX_DBG=N`（**1 = 每 30 帧一条 `FX-DUMP`；2 = 再打一份 `FX-EMITTER`**）。
+  前五个之一（`enabled`）接进 `FeatureRegistry`：`fx.enabled` / `fx.sizeScale` /
+  `fx.softness` / `fx.intensity` / `fx.freezeFrame`（Engine 面板 + env + 序列化四路派生）。
+  诊断家族：`FX: created (enabled=…)` / `FX-DUMP` / **`FX-EMITTER`** / `FX-FREEZE` /
+  `FX-PREWARM` / `FX-POOL`（池耗尽警告）/ `FX: … emitters dropped`；
+  `GPU-TIMING` 有 `particles=%.2f` 段。
+  ⚠ `MYVK_FX_DBG` 没设 → **`FX-DUMP` 一行都不打**（挂在 `m_particleDbg` 闸门后面）。
+  ⚠ **`FX-EMITTER` 是唯一能精确验证"旧格式与新格式等价"的手段**（像素做不到，见坑点表）；
+  它用 `%.9g`（float32 十进制往返精度）打印，**不能用 `%g`**。
 - **UI 自动化**：`MYVK_LOG_RECTS=1`（打印关键控件矩形）。
+  粒子面板额外的矩形锚点：`INS-FX-HEADER` / `INS-FX-BURSTS` / `INS-FX-VEL-X` /
+  `INS-FX-SPEED-MOD` / `INS-FX-COLOR` / `INS-FX-ALPHA-CURVE` / `INS-FX-SIZE-CURVE` /
+  `INS-FX-BLEND` / `INS-FX-SOFT` / `INS-FX-EXPAND-ALL` / `INS-FX-COLLAPSE-ALL` /
+  `INS-FX-RAMP-EDIT`。
+  ⚠ 折叠/展开的注入变量有**两种解析**：`MYVK_EDITOR_INSP_COLLAPSE`（按空白切分）与
+  `MYVK_EDITOR_INSP_EXPAND`（**保留空格**，因为要传 `"Particle Emitter"` 这种带空格的键）。
 
 ---
 
@@ -517,3 +571,133 @@ SSGI / SSR / GodRays / DoF / MotionBlur 走统一 FrameGraph 资源调度；新�
     很可能是空的 —— R4-2 正是靠它把"5.6143"从谜团变成有意的回归守卫。
 58. **新增资源目录必须先确认它是不是"编辑器运行时也会写"的目录**：是 → 保持 POST_BUILD（别每次构建
     覆盖用户的编辑）；否 → 挂 `ALL` 自定义目标保证每次构建同步。
+59. **高度场的空间尺度必须 ≫ 视差位移**（R4-3）：高度图格宽若与位移同量级，射线走一两步就撞到
+    相邻凹格（`h=0`）而提前 `break`，位移被"格宽"截断、**不再随入射角增长** —— 实测 8 格密棋盘
+    （格宽 0.125 UV）只测出 1.2× 的角度差异。换成 **2 格**大棋盘（格宽 0.5 UV）才恢复 ∝ tanθ。
+60. **淡出 / LOD 类效果的验证机位，必须让"整个可见表面"都越过阈值**（R4-3 D1）：掠射机位
+    `y=-1.7` 看似"距墙 10 m"，其实**正前方 1.7 m 就撞墙** → 全屏根本淡不掉，被误读成"淡出没接"。
+    换成正视机位（法向距离 9.4 m > 淡出终点 8 m）后逐像素一致。**判失败前先核算几何。**
+61. **测"位移/视差方向"的镜像机位，入射角要 ≤ 45°**（R4-3 C2）：位移沿表面的 u 轴，投影到屏幕
+    水平的比例是 `r·u = cosθ`。θ=70° 时左右镜像机位的水平分量**同号（都是 +0.34）** → 方向
+    完全正确的实现被 `best_hshift` 误判成"方向反了"。θ=45° 时两侧位移才真正反号（实测 ±21 px）。
+62. **直接在整张截图上算互相关 = 假阴性**（R4-3 C2）：截图左右两侧是 ImGui 面板（实测 1258 px 宽
+    里只有 ~625 px 是视口，x<300 与 x>925 逐列差异恒为 0）。一大片"零位移"会把互相关**硬拉回 0 点**
+    → 位移恒测成 0 px。**先把图按 `VP-RECT` 裁到视口再算**（`diff_stats` 内部一直是这么干的，
+    但手写的互相关别忘）。
+63. **测"均匀位移"要用"处处等高"的高度图**（R4-3 C2）：棋盘高度图下只有凸台有位移、凹槽位移
+    恒 0（起点 `h=0` 立即 `break`），列剖面的互相关被两半**平均掉** → 同样测不出。全白高度图
+    （1 格）让每像素位移一致，才测得出方向。
+64. **推常量 128B 的最后一个空闲位**：`push.skin` 的 `x=jointBase`（VS）/`z=蒙皮标志`（VS）/
+    `w=alpha 阈值`（R4-1）/ **`y` 一直没人读** → R4-3 的逐材质视差深度走 `skin.y`。
+    硬件把 push constant 卡在 **128 字节**，**这是最后一个能塞逐材质标量的地方**；再要就只能
+    进 SSBO / bindless 页表（R4-3 的 heightMap 索引就是复用 `GpuMaterialPage.tex1.z` 的空闲位）。
+65. **抓图空图（`GetClientRect` = 0×0）必须走 `capture_nonempty`**：窗口刚 `ShowWindow` /
+    被别的进程抢前台时，`capture_client()` 会返回 0×0，`Image.save()` 直接抛
+    `ValueError: cannot write empty image` —— 这**不是判 FAIL，是把整个验证脚本崩掉**
+    （rc 非 0 且没有任何断言输出）。R4-3 那一轮同时打中 `verify_nav_gizmo` 与
+    `verify_light_modifiers`，两者的日志尾部都是同一个 traceback。
+66. **"展开折叠段再读日志"的断言必须做成幂等 + 重试**：面板段默认折叠（如 Inspector 的
+    `Mesh`），脚本先点标题栏展开、再读里面打的调试日志。**注入的点击偶尔被吞**（第一次左键
+    被 Windows 拿去激活窗口 / 此刻布局还在变），于是读到"没有 MESH-PARAMS 日志"的**假失败**
+    —— 而且失败项每次还略有不同（典型的 flaky 指纹）。修法：先查日志判断"当前是不是已经
+    展开"，未展开才点；点完校验 1 秒，没出现就再点（≤3 次）。
+67. ⚠⚠ **深度附件里存的是 NDC z 本身，不是 `(ndc+1)/2`**（R4-4，本轮最贵的坑）。
+    本引擎投影由 `glm::perspective` 生成且**没有** `GLM_FORCE_DEPTH_ZERO_TO_ONE`
+    → GLM 的 NDC z ∈ [-1, 1]；而 Vulkan 的深度范围**恒为 [0, 1]**
+    （`VkViewport::minDepth=0 / maxDepth=1` → `z_f = ndc_z`）。两者叠加 → 深度附件里存的就是
+    `ndc_z`。后果：**照抄 `space.glsl::vennViewPosFromDepth` 的 `depth*2-1` 是二次映射** ——
+    重建点被拉近 ~1.7 倍（地面点飞到场地上空 2~3 m），盒内测试全数失败 → 一张贴花都看不见
+    （`diff on vs base: >18=0`，而日志一切正常：`DECALS: on`、`CULL-STATS decal=1`）。
+    **跨 pass 复用几何重建代码之前，先实测确认深度附件的数值约定。**
+68. **"窄带身份测试"是核实数值约定的最快手段**（R4-4，一击定位 67）：不做"把调试量编码成颜色
+    再读数"（那条路被色调映射堵死了，见 69），而是拿**已知几何**算出"候选约定下各自唯一可能的
+    区间"，再看实测落在哪一个。本次：地面 9..16.5 m、`near=0.1 far=200` → 若存 `(ndc+1)/2`
+    应落在 `[0.9908, 0.9942]`，若存 `ndc_z` 应落在 `[0.9817, 0.9883]`；探针读三档
+    `d≈0.9817 / 0.9850 / 0.9883` → 定案。
+69. **把调试量编码成颜色再读数，在带色调映射的管线里是无效方法**（R4-4）：调试值写 `coverage=1`
+    后，前向用 albedo × ~2.3 曝光再 `x/(x+1)` → 输出**饱和**，任何编码都被压平（读数恒贴上界）。
+    正确做法二选一：① 用**饱和原色做分类编码**（黑/蓝/黄/品红/绿），只回答"走了哪条分支"；
+    ② **直接看截图**。想读数值 → 走 68 的窄带身份测试。
+70. **顶点属性的 numeric type 必须与 `VkVertexInputAttributeDescription::format` 一致**（R4-4）：
+    `assets::Vertex` 的 joints 是 `R8G8B8A8_UINT` → GLSL 必须写
+    `layout(location = 3) in uvec4 inJoints;`（**写 `ivec4` 触发
+    `VUID-VkGraphicsPipelineCreateInfo-Input-08733`**，管线创建失败、画面**完全没有任何效果**，
+    但 `CULL-STATS` 照样报"提交了 1 个" → 排查方向被彻底带偏）。
+71. **`re.Match.group(-1)` 抛 `IndexError`**（R4-4）：Python ≥3.6 负数下标**不再**表示"最后一组"。
+    共用工具 `last_match(pat, lines, group=...)` 的默认值若写 `-1`，会在**第一次调用**就崩掉
+    —— 而且是在前面几组断言都过了之后（R4-4 崩在 B1，A 组 6 项全绿），白烧一轮排查。
+72. ⚠⚠ **UBO 是"记录期写、执行期读"的内存 —— 同一份 UBO 在同一个提交里给多个视角/目标复用，
+    必然全部用最后一份的值**（R5-1，本轮 head-line bug）。一次 `vkQueueSubmit` 录 6 个立方体面、
+    共用同一个相机 UBO 槽 → GPU 执行第 0 面时那块内存里已经是**第 5 面**的矩阵 → 6 面全按第 5 面
+    渲染；而绘制列表是**记录期**按各面相机剔除的 → 只有最后一面自洽。
+    表现 = **"只有最后一个面有内容"**，极易误诊成"逐面拷贝没生效"或"面序反了"。
+    修法 = **每面独占一个 UBO 槽**（`kProbeFaceUboSlotBase = 64`）**+ 一个目标/探针一次独立提交**
+    （`rhi::CommandPool` 的 cmd 缓冲不能录两次/提交两次）。离屏目标（`FrameResources::OffscreenUbo`）
+    踩过同一个坑 —— **这是第二次，以后写"多视角/多目标"的 pass 先想这一条**。
+73. **排查"拷贝 vs 渲染"要用切分实验**（R5-1，两条错误假设都被它一刀切掉）：让 6 面**全用同一个面
+    的相机**（临时 `MYVK_PROBE_SAMEFACE=1`）—— 若"六面都有内容"就证明**拷贝链路没问题、问题在渲染**。
+    同时排除掉的两条：① "cube-compatible 图像拷贝必须 6 层一组"（**WebSearch 证伪**，逐层 region
+    是标准做法）；② "缺内存屏障"（加全量 `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT` 屏障**结果零变化**）。
+    **临时诊断钩子用完必须清**（`grep -c "TEMP-DEBUG\|SAMEFACE"` = 0）。
+74. ⚠ **mip 链长必须与分辨率自洽**（R5-1）：N×N 的图最多 `1+log2(N)` 级（8×8 只支持 4 级）。
+    超了是**规范违规**（`VUID-VkImageCreateInfo-mipLevels`），图像创建失败、**整条捕获链作废**
+    —— 表现是"开了效果但什么都没发生"，**不崩**。入口已把 `prefilterMips` 夹紧到 `1+log2(size)`。
+75. ⚠ **探针（及一切"替换 IBL 镜面项"的效果）的混合在 IBL 总开关内部**（R5-1）：
+    `pbr.frag` 的 `if (ubo.envParams.x > 0.5)` 是总闸 —— **`MYVK_PROBES=1, MYVK_IBL=0` 会静默失效**。
+    语义上说得通（"关掉环境光"就包含探针），但对使用者是坑 → **必须写进 UI hint**。
+    另：**`ambientScale` 会把探针一起乘没** → 验收场地必须 `ambientScale = 1.0`。
+76. ⚠ **回读自检要看三个互相不能替代的指标**（R5-1）：逐面**加权平均亮度**（"大面积暗 + 一小块亮"
+    会被压扁，亮块占 1/64 时均值只剩 0.3）/ 逐面**中心纹素**（单点说不清整面）/
+    逐面**非黑纹素计数**（最不容易自欺，直接回答"这面到底有没有内容"）。
+    "均值 0 但中心有颜色"这类自相矛盾的数据，靠三者交叉才能立刻定型。
+77. ⚠ **`verify_*.py` 的结果行写法不是自由格式**（R6-1 **第三次**踩）：`run_regression.py` 的 `OK_RE`
+    只认 `RESULT: PASS` / `全部断言 PASS` / `^全部 PASS\b` / `结果: PASS`（**ASCII 冒号**），
+    取**最后一条**匹配。写成 `PASS —— ...` 或 `PASS: 全部通过` 会**进程 rc=0 但 runner 判 FAIL**
+    （日志里连一个 "FAIL" 字样都没有，极易误判成 runner 的锅）。
+    **规则写在文档里显然不够** → 新脚本第一件事是**照抄一个已通过脚本的结尾块**。
+78. ⚠⚠ **push constant 的「范围」必须在 `VkPipelineLayoutCreateInfo` 里逐字节声明**（R6-1 头号 bug）：
+    粒子的**计数**管线只用来写间接命令，看起来"不需要 push 常量"，于是没声明 ——
+    后果不是报个错：① 验证层每帧刷 `VUID-VkComputePipelineCreateInfo-layout-07987`；
+    ② `vkCmdPushConstants` 的落点**未定义**；③ 最要命的是 `cfg.y`（总槽数）取到 **0**
+    → `count = min(counters, 0) = 0` → 间接命令 `instanceCount` **恒为 0** →
+    **一颗粒子都不画**，而日志里除了那几行 VUID 什么都没说。
+    **范围 = 着色器里 `layout(push_constant)` 那个块，逐字节一致；每个 compute 管线都要检查。**
+79. ⚠⚠ **返回类型推导的 lambda：任何一个 `return 值;` 都会把返回类型定死**（R6-1 §14.2）：
+    要"提前退出"必须用**裸 `return;`**（或显式写 `-> void`）。把 `return false;` 落在
+    末尾无 return 的路径上是 **UB**，MSVC 在 **Debug** 下会在函数末尾塞一条 **trap 指令**
+    → 整进程 `0xC000001D`（Illegal instruction）、**一行日志都不给**、瞬间死。
+    定位手法：**二分**（逐个模块开关 → 收窄到"只要展开组件就崩"）→ **读回生成的代码**。
+    另一个化身：`return false;` 与 `ImGui::PopID()` 的**顺序被写反**（重写时把签名里的
+    `-> bool` 去掉、却漏了那个 `return false;`）。
+80. ⚠ **冻结帧（`MYVK_FX_FREEZE=N`）不是"逐像素一致"**（R6-1 实测，口径改了两次才写对）：
+    它保证的是**状态**逐位可复现（`alive/draws/cap/maxAlive/simFrame/inst` 在所有配置的所有次
+    运行里**完全相同**），**像素**做不到。两条固有不确实性：
+    ① **池按 frames-in-flight 分槽**，每槽只在自己被派发时推进（`dtSlot = elapsed * dt`），
+       冻结后各槽停在**各自的最后一步**（差 1~2 步）→ 恰好落在边界上的那颗粒子生/死不同
+       → 一整块粒子面积（≈250 px）变。**所以差异不随速度放大**（10 倍初速反而更小）——
+       **差的是"集合"不是"位移"**；**一颗粒子也有 0.0082 的差**、且软粒子开关对它读数**完全相同**。
+    ② **紧凑表顺序来自 `atomicAdd` 的完成顺序**，加色混合数学上无序，但帧缓冲是 **8 位 UNORM**：
+       每个片元的 `+=` 都要量化一次 → 差值随**重叠的部分覆盖率像素**增长
+       （364 颗羽流：软粒子开 1.59~2.13、关 0.058，**27 倍**）。
+    ⇒ **凡有"原子顺序 / 多槽分帧 / 8 位量化"的地方，"逐像素一致"这条断言就不要提**；
+    **先实测再定阈值**，不要猜。
+81. ⚠ **验证"序列化新旧格式等价"不要用像素**（R6-1）：改用 `MYVK_FX_DBG=2` 的 `FX-EMITTER`
+    （把交给 GPU 的发射器数据逐值打出）→ 等价性退化成**一次字符串比较**，精确、零噪声，
+    且顺手让配置可以脱离编辑器审计。**必须 `%.9g`**（float32 十进制往返精度）；
+    `%g` 默认 6 位**会把不同的值打成一样**，"相等"的结论就没意义了。
+82. ⚠ **搜索/过滤的「兜底条件」必须与「逐项放行条件」同源**（R6-1 的真实现 bug）：
+    粒子面板逐模块放行按"模块名 **+** 模块关键词"，兜底却只按"模块名"
+    → 搜只在关键词表里的词（`billboard`）得 **12 个模块全显示**，过滤等于没生效。
+    测试期望值同样栽在这上面：拿 `"particle"` 当"组件级关键词"来测兜底，
+    可它是 "Soft **Particle**s" 这个**模块名**的子串 ⇒ 过滤到只剩 soft 才是对的。
+83. ⚠ **`FX-PARAMS` 的 `modules=` 只登记「画出来的、且展开的」模块**（R6-1）：
+    一个都没有时写的是**字面量 `(none)`** 而不是空串（解析必须归一化）。
+    ⇒ 测"搜索过滤"必须**先把 12 个模块全展开**再搜，否则被命中的模块默认折叠 → 永远是 `(none)`
+    （"实现是对的、期望是错的"的典型）。
+84. ⚠ **注入"展开某个分区"可能是空操作**（R6-1）：`MYVK_EDITOR_INSP_EXPAND="Particle
+    Emitter,fx/playback"` 里 `fx/playback` 本来就默认展开 → 注入等于没注，
+    而 `fx/*` 的**模块**展开状态由 ImGui 自己存，`SetNextItemOpen(cond=Appearing)` 对
+    **已存在**的节点不再生效 → **"一键全展开"必须用 `ImGuiCond_Always` 强推一帧**。
+85. ⚠ **抓图偶发偏一点不要靠放宽阈值解决**（R6-1）：同一场景连续抓 9 次全 `0.000000`，
+    整套脚本跑十几次里出现过一次 `0.261`（窗口抢占 / 捕获落在尺寸未落定的一帧）。
+    处置 = **失败时重抓 N 次取最小差**，**判据一个字不放宽**。放宽门槛 = 把断言变成永远绿。

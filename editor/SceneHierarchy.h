@@ -15,8 +15,11 @@
 
 #include "EditorContext.h"
 #include "EditorScene.h"  // PrimitiveKind
+#include "PickingSystem.h"  // E13：拖放导入模型后按包围盒贴地
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace editor {
 
@@ -32,8 +35,15 @@ public:
 
 private:
     void drawNode(ecs::Entity e, int depth);
-    bool passesFilter(const std::string& name) const;
     void drawNodeContextMenu(ecs::Entity e);
+    // E12 顶部面包屑：选中实体的祖先链，可点击跳转
+    void drawBreadcrumb();
+
+    // ---- E12 过滤升级：type: 前缀语法 + 保留祖先链 ----
+    // nodeMatches = 本节点是否命中（文本或 type: 语法）；
+    // subtreeMatches = 本节点或任一后代命中（祖先因此保持可见）。
+    bool nodeMatches(ecs::Entity e, const std::string& name) const;
+    bool subtreeMatches(ecs::Entity e) const;
 
     // 画完之后统一执行（避免在遍历中动 World）
     void flushPending();
@@ -68,6 +78,19 @@ private:
     bool m_hasRename = false;
     ecs::Entity m_renameCommit{};
     std::string m_renameValue;
+
+    // ---- E12 状态列的 pending（👁 可见 / 🔒 锁定，树画完再执行）----
+    struct VisToggle {
+        ecs::Entity e;
+        bool value;
+    };
+    std::vector<VisToggle> m_pendingVisToggles;
+    std::vector<std::pair<ecs::Entity, bool>> m_pendingLockToggles;
+
+    // ---- E13 拖放导入：把 Content 里的模型拖到树上 → 生成实体 ----
+    // 记成 pending：拖放回调发生在遍历 ECS 的过程中，不能当场创建实体。
+    std::string m_pendingImportRel;
+    PickingSystem m_picking;
 };
 
 } // namespace editor

@@ -32,6 +32,7 @@
 //   bit 2  NORMAL_MAP    材质挂了法线贴图：采样 + TBN 变换
 //   bit 3  ALPHA_MASK    alpha 裁切：按 cutoff discard（或不 discard 时抖动）
 //   bit 4  SHADING_SKIN  预积分皮肤散射：漫反射项改查 (N·L, 曲率) LUT
+//   bit 5  PARALLAX      POM 视差遮挡贴图：UV 沿切线空间视向推开（R4-3）
 //
 // ⚠ 位序就是"规范化顺序"：变体 ID、.spv 文件名、GLSL 宏名全部按它排。
 //   调换位序等于换掉所有变体的身份，改之前先搜一遍 CMakeLists.txt。
@@ -61,8 +62,10 @@ enum ShaderKeyword : uint32_t {
     kKeywordAlphaMask = 1u << 3,
     // shadingModel == Skin：漫反射按预积分 SSS LUT 采样（R4-2）
     kKeywordShadingSkin = 1u << 4,
+    // 材质挂了高度图：UV 先做视差遮挡贴图（POM）再采样其余贴图（R4-3）
+    kKeywordParallax = 1u << 5,
 
-    kKeywordCount = 5,
+    kKeywordCount = 6,
     kKeywordAll = (1u << kKeywordCount) - 1u,
 };
 

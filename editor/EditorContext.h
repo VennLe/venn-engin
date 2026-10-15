@@ -73,6 +73,8 @@
 // ============================================================
 
 #include "Command.h"
+#include "PanelRegistry.h"  // 面板显隐的权威存储 + panelOpenRef
+#include "Workspace.h"      // WorkspaceManager / ViewportLayout
 
 #include "ecs/Entity.h"
 // Scene 是本类的**按值成员**，前向声明不够，必须拿到完整定义
@@ -161,6 +163,9 @@ public:
     void animStop();    // 任意 → Stopped（用快照恢复编辑场景）
     float animTime() const { return m_animTime; }
     void advanceAnimTime(float dt) { m_animTime += dt; }
+    // 时间轴拖拽（scrub）：直接改写时钟读数。脚本读的就是这个值，
+    // 所以往回拖 = 让下一帧的脚本看到更小的 time。
+    void setAnimTime(float t) { m_animTime = t; }
 
     // 整个场景被替换（新建 / 打开文件）后调用：清选择、清历史
     void onSceneReplaced();
@@ -168,6 +173,7 @@ public:
     // 运行态已经跑了多久（脚本的 time，也用于 HUD 显示）
     float playTime() const { return m_playTime; }
     void advancePlayTime(float dt) { m_playTime += dt; }
+    void setPlayTime(float t) { m_playTime = t; }
 
     // ---------------------------------------------------------- 游戏全屏
     // 只在 Play 期间有效：让视口独占整个编辑器窗口（F 键 / 右上角按钮切换），
@@ -324,6 +330,54 @@ public:
     bool showGrid() const { return m_showGrid; }
     bool& showGridRef() { return m_showGrid; }
 
+    // ---------------------------------------------------------- 视口浮层（E14）
+    // 视口里四角各一块浮层，**各自独立显隐**（右键视口空白处的 "Viewport
+    // Display" 菜单切换），状态经 Settings 落盘（config/editor_prefs.json）。
+    //
+    // 这样分的理由：四块信息的使用频率完全不同 —— 模式条常开、统计 HUD
+    // 只在调性能时看、相机信息在摆机位时看、导航球有个性偏好。绑成一个
+    // "HUD" 总开关时，用户被迫"要么全看要么全不看"。
+    struct ViewportOverlay {
+        bool modeBar = true;    // 左上：视图模式条
+        bool stats = true;      // 右上：统计 HUD
+        bool camera = true;     // 左下：相机信息 + 书签
+        bool navGizmo = true;   // 右下：导航 gizmo
+    };
+    // 统计 HUD 的**逐项**开关。默认全开；关掉自己不看的那几行就能让
+    // 一块 6 行的浮层缩成 2 行，盯画面时干扰小很多。
+    struct StatsHudItems {
+        bool fps = true;
+        bool frameMs = true;
+        bool drawCalls = true;
+        bool triangles = true;
+        bool vram = true;
+        bool resolution = true;
+        bool viewMode = true;
+        bool entities = true;
+        bool selection = true;
+        // 手柄状态行（"EDIT gizmo: move / world"）与拖拽实时读数。
+        // 它原来画在左上角的 drawOverlay 里，E14 左上角让给了视图模式条，
+        // 于是并进统计 HUD —— 拖拽时"沿哪个轴走了多少"是最需要盯的一行。
+        bool gizmo = true;
+    };
+    // 相机书签：Ctrl+Shift+数字 存当前视角，Alt+Shift+数字 跳回去。
+    // （数字键本身被 Blender 那套视图方向键与 Alt 面板显隐占满了，见
+    //   EditorApp::handleShortcuts 的说明，所以这里只能挂到 Shift 层。）
+    struct CameraBookmark {
+        bool set = false;
+        glm::vec3 pos{0.0f};
+        float yaw = 0.0f;
+        float pitch = 0.0f;
+    };
+    static constexpr int kBookmarkCount = 9;
+
+    ViewportOverlay& vpOverlayRef() { return m_vpOverlay; }
+    const ViewportOverlay& vpOverlay() const { return m_vpOverlay; }
+    StatsHudItems& statsHudRef() { return m_statsHud; }
+    const StatsHudItems& statsHud() const { return m_statsHud; }
+    CameraBookmark* bookmarksRef() { return m_bookmarks; }
+    const CameraBookmark* bookmarks() const { return m_bookmarks; }
+
     // ---------------------------------------------------------- 状态 / 提示
     void setStatus(std::string s) { m_status = std::move(s); }
     const std::string& status() const { return m_status; }
@@ -339,16 +393,65 @@ public:
     // Hierarchy / Content，看起来像坏了。需要时从 View 菜单打开。
     // 视口左上角的 HUD 叠加层已经提供了 FPS / 实体数 / 灯光数，
     // 所以默认收起 Stats 并不损失常用信息。
+    //
+    // ⚠ E04 起这里**不再是存储**。权威存储是 PanelRegistry 里那份按表下标
+    //   索引的持久 bool 数组（加一个面板只加一行表项）。本结构体只是一层
+    //   **命名引用视图** —— 几个引用绑到那份数组上，于是所有既有调用点
+    //   （`panels().viewport = true`、`&p.hierarchy`、`if (panels.stats)`）
+    //   一行都不用改。默认值（defaultOpen）也搬到了表里。
+    //
+    //   为什么不做成"每帧从表拷一份 bool 回来"：`MenuItem(..., &p.stats)`
+    //   是**直接写指针**的，拷贝出去的副本改了不会回写。引用才是对的。
     struct PanelVisibility {
-        bool hierarchy = true;
-        bool inspector = true;
-        bool content = true;
-        bool viewport = true;
-        bool scripts = false;  // 浮动，View 菜单打开
-        bool stats = false;    // 浮动，View 菜单打开
-        bool engine = false;   // 引擎/光照调参面板（默认收起）
+        bool& hierarchy;
+        bool& inspector;
+        bool& content;
+        bool& viewport;
+        bool& stats;
+        bool& scripts;
+        bool& engine;
+        bool& console;
+
+        PanelVisibility()
+            : hierarchy(panelOpenRef("hierarchy")),
+              inspector(panelOpenRef("inspector")),
+              content(panelOpenRef("content")),
+              viewport(panelOpenRef("viewport")),
+              stats(panelOpenRef("stats")),
+              scripts(panelOpenRef("scripts")),
+              engine(panelOpenRef("engine")),
+              console(panelOpenRef("console")) {}
     };
+    // 引用成员 → 本对象不可赋值，但可以整体拷贝构造（调用点只读它）
     PanelVisibility& panels() { return m_panels; }
+
+    // ---------------------------------------------------------- 工作区（E05）
+    // "当前是哪一套工作区"。真正的施加在 EditorApp::applyWorkspace ——
+    // 它才拿得到 SplitLayout / Renderer。
+    WorkspaceManager& workspace() { return m_workspace; }
+    const WorkspaceManager& workspace() const { return m_workspace; }
+
+    // 当前布局是否偏离了该工作区的出厂预设（标题栏 / 菜单上的 * 号）。
+    // 由 EditorApp 逐帧比对后写进来 —— 比对要同时看 SplitLayout 与
+    // Renderer，那两个本类都拿不到，所以只能"外面算、这里存"。
+    bool workspaceModified() const { return m_wsModified; }
+    void setWorkspaceModified(bool v) { m_wsModified = v; }
+
+    // ---------------------------------------------------------- 多视口（E07）
+    // 视口布局 + 哪个子视口是"活动的"（唯一接受键鼠输入的那个）。
+    ViewportLayout viewportLayout() const { return m_viewportLayout; }
+    void setViewportLayout(ViewportLayout l) { m_viewportLayout = l; }
+    int activeSubview() const { return m_activeSubview; }
+    void setActiveSubview(int i) {
+        if (i >= 0 && i < 4) m_activeSubview = i;
+    }
+
+    // ---------------------------------------------------------- 最大化（E06）
+    // Shift+Space 让鼠标所在的分栏面板临时占满工作区。
+    // ⚠ 权威状态**只有一份**，在 SplitLayout（m_maximized）—— EditorContext
+    //   不存第二份，因为两份状态必然会漂。Shift+Space 直接在
+    //   EditorApp::handleShortcuts 里落到 SplitLayout 上（那里拿得到鼠标
+    //   位置和各个面板矩形）。落盘时再由 EditorApp 把槽位翻译成面板 id。
 
     // ---------------------------------------------------------- 布局
     // 由 EditorApp 每帧填充；面板用 FirstUseEver 落位（用户拖动后不再覆盖）
@@ -361,6 +464,15 @@ public:
     // 当前场景文件路径（供标题栏 / 保存使用）
     std::string& scenePath() { return m_scenePath; }
     bool& dirty() { return m_dirty; }
+
+    // ---------------------------------------------------------- 最近打开（E08）
+    // File ▸ Open Recent。**最新在前**，去重，最多 kMaxRecent 条。
+    // 落盘进 config/editor_layout.json（见 EditorLayoutIO）——
+    // 不然每次重启都清空，这个菜单就永远只有一行 "no recent scenes"。
+    static constexpr size_t kMaxRecent = 10;
+    const std::vector<std::string>& recentScenes() const { return m_recent; }
+    std::vector<std::string>& recentScenesRef() { return m_recent; }
+    void pushRecentScene(const std::string& relPath);
 
     // 菜单里的 "Quit"：置位后由 EditorApp 在下一帧关闭窗口
     bool& quitRequested() { return m_quit; }
@@ -394,6 +506,17 @@ public:
         ecs::Entity e = m_pendingCharacter;
         m_pendingCharacter = ecs::Entity{};
         return e;
+    }
+
+    // ---------------------------------------------------------- 反射探针（R5-1）
+    // Inspector 的 "Capture" 按钮请求**立刻重捕一次**全部探针。
+    // 与角色窗口同一个套路：本类不认识 Renderer（那要拖进整条渲染头
+    // 依赖），所以只放一个请求标志，EditorApp 每帧取走并转给渲染器。
+    void requestProbeCapture() { m_probeCaptureRequest = true; }
+    bool takeProbeCaptureRequest() {
+        const bool v = m_probeCaptureRequest;
+        m_probeCaptureRequest = false;
+        return v;
     }
 
 private:
@@ -444,13 +567,24 @@ private:
     // 地平面栅格（编辑态视口）
     bool m_showGrid = true;
 
+    // 视口浮层 / 统计 HUD 逐项 / 相机书签（E14）
+    ViewportOverlay m_vpOverlay;
+    StatsHudItems m_statsHud;
+    CameraBookmark m_bookmarks[kBookmarkCount];
+
     std::string m_status = "Ready";
     std::string m_notification;
     float m_notificationTimer = 0.0f;
 
-    PanelVisibility m_panels;
+    PanelVisibility m_panels;   // 命名引用视图（不持有存储）
     LayoutRects m_layout;
     bool m_relayout = false;
+
+    // ---- 工作区 / 多视口 / 最大化（E04~E07）----
+    WorkspaceManager m_workspace;
+    ViewportLayout m_viewportLayout = ViewportLayout::Single;
+    int m_activeSubview = 0;
+    bool m_wsModified = false;
 
     // 当前场景文件路径（供标题栏 / 保存使用）。
     // 启动是空场景（不加载任何样例），所以这只是"Ctrl+S 会写到哪儿"。
@@ -466,6 +600,12 @@ private:
 
     // 待打开角色详情窗口的玩家实体（无效 = 无请求）
     ecs::Entity m_pendingCharacter{};
+
+    // R5-1：待处理的"立刻重捕反射探针"请求（Inspector 的 Capture 按钮）
+    bool m_probeCaptureRequest = false;
+
+    // 最近打开的场景（最新在前，见 pushRecentScene）
+    std::vector<std::string> m_recent;
 };
 
 } // namespace editor

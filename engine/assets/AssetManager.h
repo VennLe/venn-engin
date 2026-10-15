@@ -51,8 +51,10 @@ public:
     Model* loadFBX(const std::string& path, const std::string& name = "model");
 
     // ---- 纹理 ----
+    // srgb 语义见 Texture::makeCheckerboard / makeSolid：数据贴图传 false。
     Texture* checker(const std::string& name, uint8_t a[4], uint8_t b[4],
-                     uint32_t cell = 32, uint32_t size = 512);
+                     uint32_t cell = 32, uint32_t size = 512,
+                     bool srgb = true);
     Texture* solid(const std::string& name, uint8_t color[4]);
     Texture* loadTexture(const std::string& path, const std::string& name = "",
                          bool srgb = true);
@@ -383,11 +385,11 @@ inline void tagTextureName(Texture* tex, const std::string& name) {
 
 inline Texture* AssetManager::checker(const std::string& name, uint8_t a[4],
                                       uint8_t b[4], uint32_t cell,
-                                      uint32_t size) {
+                                      uint32_t size, bool srgb) {
     auto it = m_textures.find(name);
     if (it != m_textures.end()) return it->second.get();
     auto tex = std::make_unique<Texture>();
-    tex->makeCheckerboard(m_ctx, size, size, cell, a, b);
+    tex->makeCheckerboard(m_ctx, size, size, cell, a, b, srgb);
     Texture* raw = tex.get();
     tagTextureName(raw, name);
     m_textures[name] = std::move(tex);

@@ -213,4 +213,21 @@ VkFormat Device::findDepthFormat() const {
         VK_IMAGE_TILING_OPTIMAL, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
 }
 
+uint64_t Device::deviceLocalHeapBytes() const {
+    // 缓存：这是启动期常量，查询本身要过一遍驱动，不该每帧做。
+    static uint64_t cached = 0;
+    if (cached != 0) return cached;
+
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(m_physical, &mp);
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; ++i) {
+        if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            total += mp.memoryHeaps[i].size;
+        }
+    }
+    cached = total;
+    return cached;
+}
+
 } // namespace rhi

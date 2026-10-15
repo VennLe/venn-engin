@@ -65,7 +65,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from capture_window import capture_client, find_window, user32      # noqa: E402
+from capture_window import capture_stable, find_window, user32      # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors, wait_rect   # noqa: E402
 from verify_frustum_cull import region_diff                         # noqa: E402
 
@@ -188,8 +188,13 @@ def run_once(exe, scene, extra_env, shot_path=None, wait=14.0):
 
         img = None
         if shot_path:
-            img, _ = capture_client(hwnd)
-            img.save(shot_path)
+            # capture_stable：重试到拿到"真的画面"（尺寸正确且非整窗单色）
+            # —— PrintWindow 偶发返回尺寸正常但整幅纯白的未合成帧
+            img = capture_stable(hwnd)
+            if img is None:
+                print("  WARN: 抓图失败（连续空帧），本轮像素比对不可信")
+            else:
+                img.save(shot_path)
 
         with tap.lock:
             lines = list(tap.lines)

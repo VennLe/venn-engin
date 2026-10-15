@@ -13,6 +13,7 @@
 //   ssao         SSAO（关闭时 begin/end 紧挨 → ≈0，正好标记"未激活"）
 //   cluster      分簇剔除 compute
 //   forward      前向（天空/不透明/灯球/栅格/透明）
+//   particles    GPU 粒子（R6-1：模拟 compute ×2 + 间接绘制）
 //   framegraph   屏幕空间链（全关时 ≈0）
 //   offscreen    预览 + 额外视角的离屏目标（无窗口时 ≈0）
 //   post         Bloom / 合成 / FXAA + UI
@@ -37,15 +38,26 @@ namespace render {
 
 class GpuTimer {
 public:
-    static constexpr uint32_t kSectionCount = 9;
+    static constexpr uint32_t kSectionCount = 11;
 
     enum Section : uint32_t {
         kShadows = 0,
         kLocalShadows,
         kDepthPre,
+        // 延迟贴花（R4-4）：深度预通道之后、前向之前的那一段。
+        kDecals,
         kSsao,
         kCluster,
         kForward,
+        // GPU 粒子（R6-1）：前向之后、FrameGraph 之前的那一段
+        //（模拟 compute ×2 + 间接绘制）。
+        //
+        // ⚠ 段在**枚举里的顺序必须与录制的先后顺序一致**：
+        //   readFrame 用「第 0 段的 begin」到「最后一段的 end」算整帧
+        //   耗时（stamps[kSectionCount*2-1]）。把这一段放到末尾会让
+        //   "整帧"缩到粒子 pass 结束 —— 后面还有 framegraph/offscreen/
+        //   post，读数就少算了。
+        kParticles,
         kFrameGraph,
         kOffscreen,
         kPost,

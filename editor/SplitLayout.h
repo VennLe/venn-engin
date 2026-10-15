@@ -14,11 +14,23 @@
 //   · 不引入 ImGui docking 分支，纯手工算矩形 + 一条 InvisibleButton 拖拽
 //   · 产出仍然是 EditorContext::LayoutRects，所有面板代码**零改动**
 //   · 比例用 0..1 的 float 存，落在窗口内再用像素换算，天然自适应
+//
+// ------------------------------------------------------------
+// E06：从"能用"到"好用"的五件事
+// ------------------------------------------------------------
+//   1. **分隔线可视化** —— 悬停变亮变粗、拖动时跟一条"比例 xx%"的 tooltip
+//   2. **双击折叠/展开** —— 双击哪条线就折哪一侧（原来只能折 A 区）
+//   3. **面板最大化** —— Shift+Space 让鼠标所在面板临时占满工作区，再按还原
+//   4. **比例预设** —— 右键分隔线弹 50/50、70/30、30/70 快选
+//   5. **最小尺寸 / 隐藏折叠** —— 每栏 minW 独立设置；面板被关掉时那一侧
+//      **自动收成 0**，邻居吃掉空间（关掉 Hierarchy 后 Content 应该长高，
+//      而不是留一块空白）
 // ============================================================
 
 #include <algorithm>
 
 #include "EditorContext.h"  // 复用 Rect / LayoutRects
+#include "PanelRegistry.h"  // LayoutSlot（槽位定义只有一份）
 
 namespace editor {
 
@@ -35,12 +47,23 @@ struct SplitNode {
 
     int a = -1;           // 子节点下标（-1 = 叶子，用 panelA）
     int b = -1;
-    int panelA = -1;      // 叶子面板（a 为 -1 时有效）
+    int panelA = -1;      // 叶子面板（a 为 -1 时有效；LayoutSlot 值）
     int panelB = -1;      // 叶子面板（b 为 -1 时有效）
 
     // 当前是否折叠（双击分隔条切换；折叠时 A 区宽度为 0）
     bool collapsed = false;
     float savedRatio = 0.3f;  // 折叠前的比例，展开时恢复
+
+    // true = 这条比例是"按窗口尺寸自适应"的（首帧 / 窗口大幅缩放时重算）；
+    // false = 用户拖过、或工作区明确指定了数字 → 尊重它，不再自动覆盖。
+    // （取代了原来一个全局的 m_userAdjusted 标志：那时拖过根节点就会把
+    //   右区节点的自适应一起冻住，是错的。）
+    bool autoRatio = true;
+
+    // 当前两侧是否"有面板要显示"（面板被关掉时那侧收成 0，见 E06-5）。
+    // 由 beginFrame 每帧写入，resolve/processSplitters 读。
+    bool liveA = true;
+    bool liveB = true;
 };
 
 // ---------------------------------------------------------------- 布局器
@@ -51,6 +74,9 @@ struct SplitNode {
 class SplitLayout {
 public:
     SplitLayout() { buildDefault(); }
+
+    // 分栏树节点数：0=根（左右）1=左栏（上下）2=右区（视口|检查器）
+    static constexpr int kNodeCount = 3;
 
     // 每帧第一件事：记录窗口尺寸；首帧按尺寸把初始像素宽度换算成比例
     void beginFrame(float displayW, float displayH);
@@ -66,7 +92,38 @@ public:
     void setToolbarHeight(float h) { m_toolbarH = h; }
 
     // 重置为默认分栏（"Reset Layout" 用）
-    void reset() { buildDefault(); }
+    void reset();
+
+    // ---- 面板显隐（E06-5）----
+    // 被关掉的面板那一侧收成 0 宽/高，邻居吃掉空间。
+    // EditorApp 每帧调一次（面板状态是 PanelRegistry 的全局数组）。
+    void syncPanelVisibility();
+
+    // 某个槽位当前是否真的占着地方（最大化时只有那一个为 true）
+    bool showsInLayout(int slot) const;
+
+    // ---- 节点参数（工作区切换 / 落盘用）----
+    float ratio(int node) const;
+    void setRatio(int node, float r);
+    bool collapsed(int node) const;
+    void setCollapsed(int node, bool c);
+    float savedRatio(int node) const;
+    void setSavedRatio(int node, float r);
+    // 把某个节点交回"按窗口自适应"（工作区预设里 ratio 写 0 的那些节点）
+    void setAutoRatio(int node, bool autoRatio);
+    bool autoRatio(int node) const;
+    // 让下一次 beginFrame 重算全部自动节点（切换工作区 / Reset Layout 用）
+    void markNeedsAutoRecalc() { m_initialized = false; }
+
+    // ---- 最大化（E06-3）----
+    // slot 传 LayoutSlot 值；-1 = 清除。
+    void toggleMaximize(int slot);
+    void setMaximized(int slot);
+    int maximizedSlot() const { return m_maximized; }
+
+    // ---- 比例预设（E06-4）----
+    // aFrac = A 区占的比例（0.5 / 0.7 / 0.3）。同时清掉折叠态。
+    void applyPreset(int node, float aFrac);
 
 private:
     void buildDefault();
@@ -82,14 +139,23 @@ private:
     // 递归：为每个内部节点的分栏处画/处理一条可拖分隔条
     void processSplitters(int nodeIdx, float x, float y, float w, float h);
 
+    // 主体区域（菜单栏之下、状态栏之上的那块）
+    void bodyRect(float displayW, float displayH, float& x, float& y,
+                  float& w, float& h) const;
+
     // 拖动状态
-    int m_dragNode = -1;     // 正在拖的分栏节点下标
-    float m_dragStart = 0.0f; // 拖动起始的像素位置（该分栏当前分隔线位置）
+    int m_dragNode = -1;      // 正在拖的分栏节点下标
+    float m_dragStart = 0.0f; // 拖动起始的像素位置
+    // 双击判定：ImGui 的 IsMouseDoubleClicked 已经处理了间隔，这里只用来
+    // 记住"双击时要折哪一侧"（离鼠标更近的那一侧）
+    float m_hoverFrac = 0.0f; // 悬停/拖动时的比例，供 tooltip 显示
+    // 本次 handleSplitters 里已有节点吃掉了悬停。两条分隔条叠在同一点时
+    // （某节点被折到 0/1，位置正好压在父节点的线上），只让先处理的那个
+    // 响应 —— 否则一次双击会同时折一条、展一条。
+    bool m_splitHoverTaken = false;
 
     // 首帧尚未按窗口尺寸初始化比例
     bool m_initialized = false;
-    // 用户手动拖过分隔条 —— 之后不再自动按窗口宽度重算比例
-    bool m_userAdjusted = false;
     // 上次算比例时的窗口宽度（用来判断"尺寸变化很大"）
     float m_lastInitW = 0.0f;
 
@@ -100,6 +166,9 @@ private:
 
     std::vector<SplitNode> m_nodes;
     int m_root = -1;
+
+    // 被最大化的槽位（kSlotNone = 没有）
+    int m_maximized = kSlotNone;
 };
 
 } // namespace editor

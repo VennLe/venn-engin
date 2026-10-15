@@ -88,6 +88,9 @@ json textureSourceToJson(const assets::Texture* tex) {
             j["colorB"] = colorToJson(s.colorB);
             j["cell"] = s.cell;
             j["size"] = s.size;
+            // 色彩空间（数据贴图 = false）。历史文件没有这个字段，
+            // 读的时候默认 true（= 旧行为）。
+            j["srgb"] = s.srgb;
             return j;
         case assets::TextureSource::Kind::File:
             j["kind"] = "file";
@@ -125,7 +128,9 @@ assets::Texture* resolveTexture(assets::AssetManager& am, const json& jt) {
             static_cast<uint32_t>(jt.value("cell", 32));
         const uint32_t size =
             static_cast<uint32_t>(jt.value("size", 512));
-        return am.checker(name.empty() ? "checker" : name, a, b, cell, size);
+        const bool srgb = jt.value("srgb", true);
+        return am.checker(name.empty() ? "checker" : name, a, b, cell, size,
+                          srgb);
     }
     if (kind == "file") {
         const std::string path = jt.value("path", std::string());
@@ -190,6 +195,10 @@ json materialToJson(const assets::Material* mat) {
     j["roughnessMap"] = textureSourceToJson(mat->roughnessMap);
     j["metallicMap"] = textureSourceToJson(mat->metallicMap);
     j["emissiveMap"] = textureSourceToJson(mat->emissiveMap);
+    // 视差遮挡贴图（R4-3）：高度图 + 深度尺度。高度图缺席 = 这个材质
+    // 走非 PARALLAX 变体（逐像素与引入前相同），heightScale 也就不参与。
+    j["heightMap"] = textureSourceToJson(mat->heightMap);
+    j["heightScale"] = mat->heightScale;
     return j;
 }
 
@@ -242,6 +251,10 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
         am, jm.contains("metallicMap") ? jm["metallicMap"] : json(nullptr));
     assets::Texture* emissiveMap = resolveTexture(
         am, jm.contains("emissiveMap") ? jm["emissiveMap"] : json(nullptr));
+    // 高度图（R4-3 POM）。readTexture 用同一个 resolveTexture，
+    // 所以 checker/solid/file 三种来源都能往返。
+    assets::Texture* heightMap = resolveTexture(
+        am, jm.contains("heightMap") ? jm["heightMap"] : json(nullptr));
 
     assets::Material* mat = am.makeMaterialPBR(
         name, albedo, normal, orm, baseColor, roughness, metallic, emissive,
@@ -251,6 +264,8 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
         mat->roughnessMap = roughnessMap;
         mat->metallicMap = metallicMap;
         mat->emissiveMap = emissiveMap;
+        mat->heightMap = heightMap;
+        mat->heightScale = jm.value("heightScale", 0.05f);
         mat->normalScale = normalScale;
         mat->ao = ao;
         mat->alphaMode = jm.value("alphaBlend", false)
@@ -678,6 +693,341 @@ ecs::CollisionComponent collisionFromJson(const json& j) {
     return c;
 }
 
+// ---- 延迟贴花（DBuffer，R4-4）----
+// 存"盒体尺寸 + 参数 + 两张贴图的来源"。位置 / 朝向走实体的 transform，
+// 所以这里不重复存 position/rotation —— 与"移动灯"是同一条约定。
+//
+// 贴图走 textureSourceToJson：与材质槽完全同一套（file / solid / checker），
+// 于是**程序化来源也能往返**（验证脚本就是这么构造贴花的：不依赖磁盘上
+// 有没有 PNG）。
+json decalToJson(const ecs::DecalComponent& d) {
+    json j;
+    j["size"] = vec3ToJson(d.size);
+    j["opacity"] = d.opacity;
+    j["tint"] = vec3ToJson(d.tint);
+    j["roughness"] = d.roughness;
+    j["metallic"] = d.metallic;
+    j["normalScale"] = d.normalScale;
+    j["fadeStart"] = d.fadeStart;
+    j["fadeEnd"] = d.fadeEnd;
+    j["edgeFade"] = d.edgeFade;
+    j["enabled"] = d.enabled;
+    j["albedo"] = textureSourceToJson(d.albedo);
+    j["normal"] = textureSourceToJson(d.normal);
+    return j;
+}
+
+ecs::DecalComponent decalFromJson(assets::AssetManager& am, const json& j) {
+    ecs::DecalComponent d;
+    if (!j.is_object()) return d;
+    d.size = vec3FromJson(j.contains("size") ? j["size"] : json(nullptr), d.size);
+    d.opacity = j.value("opacity", d.opacity);
+    d.tint = vec3FromJson(j.contains("tint") ? j["tint"] : json(nullptr), d.tint);
+    d.roughness = j.value("roughness", d.roughness);
+    d.metallic = j.value("metallic", d.metallic);
+    d.normalScale = j.value("normalScale", d.normalScale);
+    d.fadeStart = j.value("fadeStart", d.fadeStart);
+    d.fadeEnd = j.value("fadeEnd", d.fadeEnd);
+    d.edgeFade = j.value("edgeFade", d.edgeFade);
+    d.enabled = j.value("enabled", true);
+    d.albedo = resolveTexture(
+        am, j.contains("albedo") ? j["albedo"] : json(nullptr));
+    d.normal = resolveTexture(
+        am, j.contains("normal") ? j["normal"] : json(nullptr));
+    return d;
+}
+
+// ---- 反射探针（R5-1）----
+// 存"盒体半轴 + 强度 + 盒投影开关 + 边界混合"。位置 / 朝向走实体的
+// transform（与贴花 / 灯同一条约定），所以这里不重复存 position/rotation。
+// 捕获本身**不进文件**：它是烘焙产物，下次打开时由渲染器重新烘
+// （探针数据一变就自动重捕，见 Renderer::collectProbes）。
+json reflectionProbeToJson(const ecs::ReflectionProbeComponent& p) {
+    json j;
+    j["extents"] = vec3ToJson(p.extents);
+    j["intensity"] = p.intensity;
+    j["boxProjection"] = p.boxProjection;
+    j["blendDistance"] = p.blendDistance;
+    j["enabled"] = p.enabled;
+    return j;
+}
+
+ecs::ReflectionProbeComponent reflectionProbeFromJson(const json& j) {
+    ecs::ReflectionProbeComponent p;
+    if (!j.is_object()) return p;
+    const json null;
+    p.extents = vec3FromJson(j.contains("extents") ? j["extents"] : null,
+                             p.extents);
+    p.intensity = j.value("intensity", p.intensity);
+    p.boxProjection = j.value("boxProjection", p.boxProjection);
+    p.blendDistance = j.value("blendDistance", p.blendDistance);
+    p.enabled = j.value("enabled", true);
+    return p;
+}
+
+// ---- GPU 粒子发射器（R6-1）----
+// 位置 / 朝向 / 缩放走实体的 transform（与贴花 / 探针同一条约定），
+// 所以这里不存 position/rotation —— 发射器的局部 +Z 就是锥体轴、
+// 就是形状采样的坐标系。
+//
+// **粒子本身不进文件**：它们是 GPU 池里的一堆瞬时状态，打开场景时从
+// 零开始重新发射（帧号从 1 起，见 Renderer::m_particleSimFrame）。
+// 存"某一刻有哪些粒子"既不必要（下一帧就不一样了）也无法复现。
+json particleEmitterToJson(const ecs::ParticleEmitterComponent& p) {
+    json j;
+    // ---- Main / Playback ----
+    j["rate"] = p.rate;
+    j["rateOverDistance"] = p.rateOverDistance;
+    j["duration"] = p.duration;
+    j["looping"] = p.looping;
+    j["prewarm"] = p.prewarm;
+    j["startDelay"] = p.startDelay;
+    j["lifetime"] = p.lifetime;
+    j["lifetimeVariance"] = p.lifetimeVariance;
+    j["startSpeed"] = p.startSpeed;
+    j["speedVariance"] = p.speedVariance;
+    j["spread"] = p.spread;
+    // ---- Emission（bursts 是数组；burns[0] 同时也写成 "burst" 作为
+    //      老读法 / 老写法的兼容入口）----
+    {
+        json arr = json::array();
+        for (int b = 0; b < ecs::kMaxBursts; ++b) {
+            const ecs::ParticleBurst& s = p.bursts[b];
+            json e;
+            e["time"] = s.time;
+            e["count"] = s.count;
+            e["cycles"] = s.cycles;
+            e["interval"] = s.interval;
+            arr.push_back(e);
+        }
+        j["bursts"] = arr;
+        j["burst"] = p.bursts[0].count;
+    }
+    // ---- Shape ----
+    j["shape"] = static_cast<int>(p.shape);
+    j["shapeExtents"] = vec3ToJson(p.shapeExtents);
+    j["shapeRadius"] = p.shapeRadius;
+    j["radiusThickness"] = p.radiusThickness;
+    j["arc"] = p.arc;
+    j["shapeRotation"] = p.shapeRotation;
+    j["emitFrom"] = static_cast<int>(p.emitFrom);
+    // ---- Velocity over Lifetime ----
+    j["velOverLifeEnabled"] = p.velOverLifeEnabled;
+    j["velOverLifeX"] = vec4ToJson(p.velOverLifeX);
+    j["velOverLifeY"] = vec4ToJson(p.velOverLifeY);
+    j["velOverLifeZ"] = vec4ToJson(p.velOverLifeZ);
+    j["velOverLifeWorldSpace"] = p.velOverLifeWorldSpace;
+    j["orbital"] = vec3ToJson(p.orbital);
+    j["orbitalOffset"] = p.orbitalOffset;
+    j["radial"] = p.radial;
+    j["speedModifier"] = vec4ToJson(p.speedModifier);
+    // ---- Limit Velocity ----
+    j["limitVelEnabled"] = p.limitVelEnabled;
+    j["limitSpeed"] = p.limitSpeed;
+    j["limitDampen"] = p.limitDampen;
+    // ---- Force ----
+    j["forceEnabled"] = p.forceEnabled;
+    j["force"] = vec3ToJson(p.force);
+    j["forceRandomize"] = p.forceRandomize;
+    // ---- Rotation over Lifetime ----
+    j["startRotation"] = p.startRotation;
+    j["startRotationVariance"] = p.startRotationVariance;
+    j["angularVelocity"] = p.angularVelocity;
+    j["angularVelocityVariance"] = p.angularVelocityVariance;
+    // ---- Noise ----
+    j["noiseEnabled"] = p.noiseEnabled;
+    j["noiseStrength"] = p.noiseStrength;
+    j["noiseFrequency"] = p.noiseFrequency;
+    j["noiseScrollSpeed"] = p.noiseScrollSpeed;
+    j["noiseDamping"] = p.noiseDamping;
+    j["noiseOctaves"] = p.noiseOctaves;
+    // ---- Physics ----
+    j["gravity"] = vec3ToJson(p.gravity);
+    j["drag"] = p.drag;
+    j["simulationSpace"] = static_cast<int>(p.simulationSpace);
+    // ---- Size / Color over Lifetime ----
+    j["sizeOverLife"] = vec4ToJson(p.sizeOverLife);
+    j["alphaOverLife"] = vec4ToJson(p.alphaOverLife);
+    {
+        json ramp = json::array();
+        for (int s = 0; s < p.colorRamp.count && s < ecs::kMaxColorStops; ++s) {
+            json e;
+            e["t"] = p.colorRamp.stops[s].w;
+            e["color"] = vec3ToJson(glm::vec3(p.colorRamp.stops[s]));
+            ramp.push_back(e);
+        }
+        j["colorRamp"] = ramp;
+        j["colorRampCount"] = p.colorRamp.count;
+        // 老的三个字段继续写（外部工具 / 老版本的读取路径），
+        // 取渐变带上 t = 0 / 0.5 / 1 的采样值。
+        j["colorStart"] = vec3ToJson(p.colorRamp.eval(0.0f));
+        j["colorMid"] = vec3ToJson(p.colorRamp.eval(0.5f));
+        j["colorEnd"] = vec3ToJson(p.colorRamp.eval(1.0f));
+    }
+    // ---- Renderer ----
+    j["startSize"] = p.startSize;
+    j["blend"] = static_cast<int>(p.blend);
+    j["renderMode"] = static_cast<int>(p.renderMode);
+    j["sortMode"] = static_cast<int>(p.sortMode);
+    j["stretchScale"] = p.stretchScale;
+    j["emissive"] = p.emissive;
+    j["softParticles"] = p.softParticles;
+    j["softDistance"] = p.softDistance;
+    j["enabled"] = p.enabled;
+    return j;
+}
+
+ecs::ParticleEmitterComponent particleEmitterFromJson(const json& j) {
+    ecs::ParticleEmitterComponent p;
+    if (!j.is_object()) return p;
+    const json null;
+    // ---- Main / Playback ----
+    p.rate = j.value("rate", p.rate);
+    p.rateOverDistance = j.value("rateOverDistance", p.rateOverDistance);
+    p.duration = j.value("duration", p.duration);
+    p.looping = j.value("looping", p.looping);
+    p.prewarm = j.value("prewarm", p.prewarm);
+    p.startDelay = j.value("startDelay", p.startDelay);
+    p.lifetime = j.value("lifetime", p.lifetime);
+    p.lifetimeVariance = j.value("lifetimeVariance", p.lifetimeVariance);
+    p.startSpeed = j.value("startSpeed", p.startSpeed);
+    p.speedVariance = j.value("speedVariance", p.speedVariance);
+    p.spread = j.value("spread", p.spread);
+    // ---- Emission ----
+    // 新格式：bursts 数组。老格式：单个 "burst"（= 时刻 0 的一次爆发）。
+    // 两条都认，这样老场景能原样打开。
+    if (j.contains("bursts") && j["bursts"].is_array()) {
+        const json& arr = j["bursts"];
+        for (int b = 0; b < ecs::kMaxBursts && b < static_cast<int>(arr.size());
+             ++b) {
+            const json& e = arr[static_cast<size_t>(b)];
+            if (!e.is_object()) continue;
+            p.bursts[b].time = e.value("time", p.bursts[b].time);
+            p.bursts[b].count = e.value("count", p.bursts[b].count);
+            p.bursts[b].cycles = e.value("cycles", p.bursts[b].cycles);
+            p.bursts[b].interval = e.value("interval", p.bursts[b].interval);
+        }
+    } else if (j.contains("burst")) {
+        p.bursts[0].time = 0.0f;
+        p.bursts[0].count = j.value("burst", 0);
+        p.bursts[0].cycles = 1;
+        p.bursts[0].interval = 0.0f;
+    }
+    // ---- Shape ----
+    p.shape = static_cast<ecs::ParticleShape>(
+        j.value("shape", static_cast<int>(p.shape)));
+    p.shapeExtents = vec3FromJson(j.contains("shapeExtents")
+                                      ? j["shapeExtents"] : null,
+                                  p.shapeExtents);
+    p.shapeRadius = j.value("shapeRadius", p.shapeRadius);
+    p.radiusThickness = j.value("radiusThickness", p.radiusThickness);
+    p.arc = j.value("arc", p.arc);
+    p.shapeRotation = j.value("shapeRotation", p.shapeRotation);
+    p.emitFrom = static_cast<ecs::ParticleEmitFrom>(
+        j.value("emitFrom", static_cast<int>(p.emitFrom)));
+    // ---- Velocity over Lifetime ----
+    p.velOverLifeEnabled = j.value("velOverLifeEnabled", p.velOverLifeEnabled);
+    p.velOverLifeX = vec4FromJson(
+        j.contains("velOverLifeX") ? j["velOverLifeX"] : null, p.velOverLifeX);
+    p.velOverLifeY = vec4FromJson(
+        j.contains("velOverLifeY") ? j["velOverLifeY"] : null, p.velOverLifeY);
+    p.velOverLifeZ = vec4FromJson(
+        j.contains("velOverLifeZ") ? j["velOverLifeZ"] : null, p.velOverLifeZ);
+    p.velOverLifeWorldSpace =
+        j.value("velOverLifeWorldSpace", p.velOverLifeWorldSpace);
+    p.orbital = vec3FromJson(j.contains("orbital") ? j["orbital"] : null,
+                             p.orbital);
+    p.orbitalOffset = j.value("orbitalOffset", p.orbitalOffset);
+    p.radial = j.value("radial", p.radial);
+    p.speedModifier = vec4FromJson(
+        j.contains("speedModifier") ? j["speedModifier"] : null,
+        p.speedModifier);
+    // ---- Limit Velocity ----
+    p.limitVelEnabled = j.value("limitVelEnabled", p.limitVelEnabled);
+    p.limitSpeed = j.value("limitSpeed", p.limitSpeed);
+    p.limitDampen = j.value("limitDampen", p.limitDampen);
+    // ---- Force ----
+    p.forceEnabled = j.value("forceEnabled", p.forceEnabled);
+    p.force = vec3FromJson(j.contains("force") ? j["force"] : null, p.force);
+    p.forceRandomize = j.value("forceRandomize", p.forceRandomize);
+    // ---- Rotation over Lifetime ----
+    p.startRotation = j.value("startRotation", p.startRotation);
+    p.startRotationVariance =
+        j.value("startRotationVariance", p.startRotationVariance);
+    p.angularVelocity = j.value("angularVelocity", p.angularVelocity);
+    p.angularVelocityVariance =
+        j.value("angularVelocityVariance", p.angularVelocityVariance);
+    // ---- Noise ----
+    p.noiseEnabled = j.value("noiseEnabled", p.noiseEnabled);
+    p.noiseStrength = j.value("noiseStrength", p.noiseStrength);
+    p.noiseFrequency = j.value("noiseFrequency", p.noiseFrequency);
+    p.noiseScrollSpeed = j.value("noiseScrollSpeed", p.noiseScrollSpeed);
+    p.noiseDamping = j.value("noiseDamping", p.noiseDamping);
+    p.noiseOctaves = j.value("noiseOctaves", p.noiseOctaves);
+    // ---- Physics ----
+    p.gravity = vec3FromJson(j.contains("gravity") ? j["gravity"] : null,
+                             p.gravity);
+    p.drag = j.value("drag", p.drag);
+    p.simulationSpace = static_cast<ecs::ParticleSimulationSpace>(
+        j.value("simulationSpace", static_cast<int>(p.simulationSpace)));
+    // ---- Size / Color over Lifetime ----
+    p.sizeOverLife = vec4FromJson(
+        j.contains("sizeOverLife") ? j["sizeOverLife"] : null, p.sizeOverLife);
+    p.alphaOverLife = vec4FromJson(
+        j.contains("alphaOverLife") ? j["alphaOverLife"] : null,
+        p.alphaOverLife);
+    if (j.contains("colorRamp") && j["colorRamp"].is_array() &&
+        !j["colorRamp"].empty()) {
+        const json& ramp = j["colorRamp"];
+        const int n = glm::clamp(
+            j.value("colorRampCount", static_cast<int>(ramp.size())), 1,
+            ecs::kMaxColorStops);
+        for (int s = 0; s < n; ++s) {
+            const size_t idx = static_cast<size_t>(
+                s < static_cast<int>(ramp.size()) ? s : ramp.size() - 1);
+            const json& e = ramp[idx];
+            glm::vec3 c(1.0f);
+            if (e.is_object()) {
+                c = vec3FromJson(e.contains("color") ? e["color"] : null, c);
+                p.colorRamp.stops[s].w =
+                    e.value("t", p.colorRamp.stops[s].w);
+            }
+            p.colorRamp.stops[s] = glm::vec4(c, p.colorRamp.stops[s].w);
+        }
+        p.colorRamp.count = n;
+    } else {
+        // 老格式：三段固定颜色 → 塞进渐变带（t = 0 / 0.5 / 1）
+        const glm::vec3 c0 = vec3FromJson(
+            j.contains("colorStart") ? j["colorStart"] : null,
+            glm::vec3(1.0f, 0.75f, 0.25f));
+        const glm::vec3 c1 = vec3FromJson(
+            j.contains("colorMid") ? j["colorMid"] : null,
+            glm::vec3(1.0f, 0.35f, 0.05f));
+        const glm::vec3 c2 = vec3FromJson(
+            j.contains("colorEnd") ? j["colorEnd"] : null,
+            glm::vec3(0.25f, 0.04f, 0.02f));
+        p.colorRamp.count = 3;
+        p.colorRamp.stops[0] = glm::vec4(c0, 0.0f);
+        p.colorRamp.stops[1] = glm::vec4(c1, 0.5f);
+        p.colorRamp.stops[2] = glm::vec4(c2, 1.0f);
+    }
+    p.colorRamp.sort();
+    // ---- Renderer ----
+    p.startSize = j.value("startSize", p.startSize);
+    p.blend = static_cast<ecs::ParticleBlend>(
+        j.value("blend", static_cast<int>(p.blend)));
+    p.renderMode = static_cast<ecs::ParticleRenderMode>(
+        j.value("renderMode", static_cast<int>(p.renderMode)));
+    p.sortMode = static_cast<ecs::ParticleSortMode>(
+        j.value("sortMode", static_cast<int>(p.sortMode)));
+    p.stretchScale = j.value("stretchScale", p.stretchScale);
+    p.emissive = j.value("emissive", p.emissive);
+    p.softParticles = j.value("softParticles", p.softParticles);
+    p.softDistance = j.value("softDistance", p.softDistance);
+    p.enabled = j.value("enabled", true);
+    return p;
+}
+
 // ============================================================
 // 场景 → JSON（文件版与内存版共用的核心）
 // ============================================================
@@ -776,6 +1126,21 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         if (const auto* cc = w.get<ecs::CollisionComponent>(it.entity))
             je["collision"] = collisionToJson(*cc);
 
+        // 延迟贴花（R4-4）。注意：贴花**没有网格**，所以下面那句
+        // "mesh 为空 → skipped++" 对它不适用 —— 只有贴花的实体是合法的。
+        if (const auto* dc = w.get<ecs::DecalComponent>(it.entity))
+            je["decal"] = decalToJson(*dc);
+
+        // 反射探针（R5-1）。与贴花同理：探针**没有网格**，
+        // 下面那句 "mesh 为空 → skipped++" 对它也不适用。
+        if (const auto* rp = w.get<ecs::ReflectionProbeComponent>(it.entity))
+            je["probe"] = reflectionProbeToJson(*rp);
+
+        // GPU 粒子发射器（R6-1）。与贴花 / 探针同理：发射器**没有网格**
+        //（几何是顶点着色器现拼的 billboard），同样不适用 skipped++ 那句。
+        if (const auto* fx = w.get<ecs::ParticleEmitterComponent>(it.entity))
+            je["particleEmitter"] = particleEmitterToJson(*fx);
+
         // 脚本（只有路径与开关，脚本源码本身是独立文件）
         if (const auto* sc = w.get<ecs::ScriptComponent>(it.entity)) {
             je["script"] = json{
@@ -803,7 +1168,9 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         if (const auto* limb = w.get<ecs::PlayerLimbComponent>(it.entity))
             je["playerLimb"] = limb->kind;
 
-        if (je["mesh"].is_null()) ++r.skipped;  // 无网格不算失败，只是没内容
+        if (je["mesh"].is_null() && !je.contains("decal") &&
+            !je.contains("probe") && !je.contains("particleEmitter"))
+            ++r.skipped;  // 无网格无贴花无探针无发射器才算"没内容"
 
         root["entities"].push_back(std::move(je));
     }
@@ -1022,7 +1389,42 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 w.add<ecs::CollisionComponent>(e, cc);
         }
 
-        if (!mesh && !mat) ++r.skipped;
+        // 延迟贴花（R4-4）。组件只描述"盒体 + 参数 + 贴图"—— 盒体几何
+        // 由渲染器自建，所以这里不碰 MeshComponent（贴花实体通常没有网格）。
+        if (je.contains("decal") && je["decal"].is_object()) {
+            const ecs::DecalComponent dc = decalFromJson(assets, je["decal"]);
+            if (auto* p = w.get<ecs::DecalComponent>(e))
+                *p = dc;
+            else
+                w.add<ecs::DecalComponent>(e, dc);
+        }
+
+        // 反射探针（R5-1）。与贴花同一形态：实体只提供变换 + 参数，
+        // 立方体贴图由渲染器烘（不落盘）。
+        if (je.contains("probe") && je["probe"].is_object()) {
+            const ecs::ReflectionProbeComponent rp =
+                reflectionProbeFromJson(je["probe"]);
+            if (auto* p = w.get<ecs::ReflectionProbeComponent>(e))
+                *p = rp;
+            else
+                w.add<ecs::ReflectionProbeComponent>(e, rp);
+        }
+
+        // GPU 粒子发射器（R6-1）。粒子本身**不落盘**（瞬时状态），
+        // 存的是发射器的配置；打开场景时从帧号 1 重新发射。
+        if (je.contains("particleEmitter") &&
+            je["particleEmitter"].is_object()) {
+            const ecs::ParticleEmitterComponent fx =
+                particleEmitterFromJson(je["particleEmitter"]);
+            if (auto* p = w.get<ecs::ParticleEmitterComponent>(e))
+                *p = fx;
+            else
+                w.add<ecs::ParticleEmitterComponent>(e, fx);
+        }
+
+        if (!mesh && !mat && !je.contains("decal") && !je.contains("probe") &&
+            !je.contains("particleEmitter"))
+            ++r.skipped;
     }
 
     r.ok = true;

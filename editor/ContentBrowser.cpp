@@ -58,6 +58,31 @@ bool isScript(const std::string& name) { return lowerExt(name) == ".vks"; }
 
 bool isScene(const std::string& name) { return lowerExt(name) == ".json"; }
 
+// E13 着色器源码（类型过滤用）
+bool isShader(const std::string& name) {
+    const std::string e = lowerExt(name);
+    return e == ".vert" || e == ".frag" || e == ".comp" || e == ".glsl" ||
+           e == ".geom" || e == ".tesc" || e == ".tese" || e == ".spv";
+}
+
+std::string lowerCopy(const std::string& s) {
+    std::string r = s;
+    std::transform(r.begin(), r.end(), r.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return r;
+}
+
+// E13 材质资产：引擎目前把材质内嵌在场景 JSON 里，独立材质文件用
+// .mat.json / .vmat 约定（过滤器先认它，等独立材质落地即可直接用）。
+bool isMaterial(const std::string& name) {
+    if (lowerExt(name) == ".vmat") return true;
+    const std::string lower = lowerCopy(name);
+    const std::string suffix = ".mat.json";
+    return lower.size() > suffix.size() &&
+           lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 bool containsFold(const std::string& hay, const std::string& needle) {
     if (needle.empty()) return true;
     auto it = std::search(hay.begin(), hay.end(), needle.begin(), needle.end(),
@@ -268,6 +293,53 @@ void paintPlus(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
     dl->AddLine(ImVec2(cx, cy - k), ImVec2(cx, cy + k), c, 2.0f);
 }
 
+// E13 历史前进/后退箭头
+void paintLeftArrow(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
+    const float cx = (a.x + b.x) * 0.5f;
+    const float cy = (a.y + b.y) * 0.5f;
+    const float k = 5.5f;
+    dl->AddTriangleFilled(ImVec2(cx - k, cy), ImVec2(cx + k * 0.55f, cy - k),
+                          ImVec2(cx + k * 0.55f, cy + k), c);
+    dl->AddRectFilled(ImVec2(cx + k * 0.2f, cy - 1.8f),
+                      ImVec2(cx + k, cy + 1.8f), c, 1.0f);
+}
+
+void paintRightArrow(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
+    const float cx = (a.x + b.x) * 0.5f;
+    const float cy = (a.y + b.y) * 0.5f;
+    const float k = 5.5f;
+    dl->AddTriangleFilled(ImVec2(cx + k, cy), ImVec2(cx - k * 0.55f, cy - k),
+                          ImVec2(cx - k * 0.55f, cy + k), c);
+    dl->AddRectFilled(ImVec2(cx - k * 0.2f, cy - 1.8f),
+                      ImVec2(cx - k, cy + 1.8f), c, 1.0f);
+}
+
+// E13 网格 / 列表视图切换图标
+void paintGridMode(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
+    const float cx = (a.x + b.x) * 0.5f;
+    const float cy = (a.y + b.y) * 0.5f;
+    const float s = 3.2f, gap = 1.4f;
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j)
+            dl->AddRectFilled(
+                ImVec2(cx - s - gap + i * (s + gap) * 1.0f,
+                       cy - s - gap + j * (s + gap) * 1.0f),
+                ImVec2(cx - gap + i * (s + gap) * 1.0f,
+                       cy - gap + j * (s + gap) * 1.0f), c, 1.0f);
+}
+
+void paintListMode(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
+    const float cx = (a.x + b.x) * 0.5f;
+    const float cy = (a.y + b.y) * 0.5f;
+    const float w = 6.5f;
+    for (int i = -1; i <= 1; ++i) {
+        dl->AddRectFilled(ImVec2(cx - w, cy + i * 4.2f - 1.4f),
+                          ImVec2(cx - w + 2.6f, cy + i * 4.2f + 1.4f), c, 0.5f);
+        dl->AddLine(ImVec2(cx - w + 4.2f, cy + i * 4.2f),
+                    ImVec2(cx + w, cy + i * 4.2f), c, 1.6f);
+    }
+}
+
 } // namespace
 
 // 缩略图纹理的注销交给 ThumbnailCache 的析构（原来这里有一份手写的循环，
@@ -320,9 +392,12 @@ void ContentBrowser::refresh() {
 
         // 只关心"有意义的"文件：目录 + 引擎认识的几类资源
         if (!e.isDir && !isImage(e.name) && !isModel(e.name) &&
-            !isScript(e.name) && !isScene(e.name)) {
+            !isScript(e.name) && !isScene(e.name) && !isShader(e.name) &&
+            !isMaterial(e.name)) {
             continue;
         }
+        // E13 类型过滤
+        if (!entryMatchesType(e)) continue;
         e.absPath = de.path().string();
         m_entries.push_back(std::move(e));
     }
@@ -333,6 +408,14 @@ void ContentBrowser::refresh() {
                   if (a.isDir != b.isDir) return a.isDir > b.isDir;
                   return a.name < b.name;
               });
+
+    // 自动化可断言的一行：当前目录 + 过滤条件 + 可见条目数。
+    // tools/verify_content_browser.py 靠它验证"类型过滤切换后数量变化正确"。
+    VK_LOG_INFO("CB-ENTRIES dir=%s filter=%s type=%d view=%d count=%zu",
+                m_rel.empty() ? "(root)" : m_rel.c_str(),
+                m_filter.empty() ? "-" : m_filter.c_str(),
+                static_cast<int>(m_typeFilter), static_cast<int>(m_view),
+                m_entries.size());
 }
 
 // ---------------------------------------------------------------- 缩略图
@@ -360,9 +443,75 @@ void ContentBrowser::invalidateThumbTree(const std::string& absPath) {
 
 // ---------------------------------------------------------------- 导航
 
+// E13 历史栈：第一次导航时把初始目录压进去；向后导航（push=true）会
+// 截断"前进"分支 —— 与浏览器一致。
+void ContentBrowser::pushHistory(const std::string& rel) {
+    if (!m_histInit) {
+        m_histInit = true;
+        m_history.push_back(rel);
+        m_histPos = 0;
+        return;
+    }
+    // 与当前位置相同的重复项不入栈（反复点同一个面包屑不该堆历史）
+    if (m_histPos >= 0 && static_cast<std::size_t>(m_histPos) < m_history.size() &&
+        m_history[static_cast<std::size_t>(m_histPos)] == rel) {
+        return;
+    }
+    m_history.resize(static_cast<std::size_t>(m_histPos) + 1);
+    m_history.push_back(rel);
+    m_histPos = static_cast<int>(m_history.size()) - 1;
+}
+
+bool ContentBrowser::canBack() const { return m_histPos > 0; }
+bool ContentBrowser::canForward() const {
+    return m_histPos >= 0 &&
+           static_cast<std::size_t>(m_histPos) + 1 < m_history.size();
+}
+
+void ContentBrowser::back() {
+    if (!canBack()) return;
+    --m_histPos;
+    const std::string rel = m_history[static_cast<std::size_t>(m_histPos)];
+    if (rel == m_rel) return;
+    m_rel = rel;
+    m_selected.clear();
+    m_dirty = true;
+    m_ctxOpen = false;
+    m_ctxRequest = false;
+}
+
+void ContentBrowser::forward() {
+    if (!canForward()) return;
+    ++m_histPos;
+    const std::string rel = m_history[static_cast<std::size_t>(m_histPos)];
+    if (rel == m_rel) return;
+    m_rel = rel;
+    m_selected.clear();
+    m_dirty = true;
+    m_ctxOpen = false;
+    m_ctxRequest = false;
+}
+
+// E13 类型过滤：按扩展名/是否为目录判定
+bool ContentBrowser::entryMatchesType(const DirEntry& ent) const {
+    switch (m_typeFilter) {
+        case TypeFilter::All:     return true;
+        case TypeFilter::Folder:  return ent.isDir;
+        case TypeFilter::Model:   return !ent.isDir && isModel(ent.name);
+        case TypeFilter::Texture: return !ent.isDir && isImage(ent.name);
+        case TypeFilter::Material:return !ent.isDir && isMaterial(ent.name);
+        case TypeFilter::Script:  return !ent.isDir && isScript(ent.name);
+        case TypeFilter::Shader:  return !ent.isDir && isShader(ent.name);
+        case TypeFilter::Scene:
+            return !ent.isDir && isScene(ent.name) && !isMaterial(ent.name);
+    }
+    return true;
+}
+
 void ContentBrowser::navigateTo(const std::string& rel) {
     if (rel == m_rel) return;
     m_rel = rel;
+    pushHistory(rel);
     m_selected.clear();
     m_dirty = true;
     // 换目录了，右键菜单的目标已经不在视野里 —— 直接作废
@@ -381,6 +530,21 @@ void ContentBrowser::goUp() {
 void ContentBrowser::drawNavRow() {
     const float h = ImGui::GetFrameHeight();
     const ImVec2 bs(h, h);
+
+    // ---- E13 历史前进 / 后退 ----
+    if (iconButton("back", bs, paintLeftArrow,
+                   canBack() ? "Back  (Alt+Left)" : "No previous folder",
+                   canBack())) {
+        back();
+    }
+    logRect("CB-RECT back", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine(0.0f, 4.0f);
+    if (iconButton("fwd", bs, paintRightArrow,
+                   canForward() ? "Forward  (Alt+Right)" : "No next folder",
+                   canForward())) {
+        forward();
+    }
+    ImGui::SameLine(0.0f, 8.0f);
 
     // ---- 返回上一级（有正常图标，而不是一个 ".." 文字按钮）----
     const bool canUp = !m_rel.empty();
@@ -401,64 +565,203 @@ void ContentBrowser::drawNavRow() {
     }
     logRect("CB-RECT reload", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
 
-    ImGui::SameLine(0.0f, 8.0f);
+    // ---- 右端：New ▸ 菜单 ----
+    // 与 4 个导航按钮同行（Content 面板约 290px 宽：导航 168 + New 84 = 252，
+    // 放得下），面包屑另起一整行，见 drawCrumbRow()。
+    const float newBtnW = ImGui::CalcTextSize("New").x +
+                          ImGui::GetStyle().FramePadding.x * 2.0f + 34.0f;
+    const float nx = ImGui::GetWindowContentRegionMax().x - newBtnW;
+    if (nx > ImGui::GetCursorPosX()) {
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(nx);
+        if (ImGui::Button("New", ImVec2(newBtnW, 0.0f))) {
+            ImGui::OpenPopup("##cb_new");
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Create a new asset in this folder");
+        }
+        if (ImGui::BeginPopup("##cb_new")) {
+            if (ImGui::MenuItem("Folder")) m_newFolderRequest = true;
+            if (ImGui::MenuItem("Scene (.json)")) createScene();
+            if (ImGui::MenuItem("Script (.vks)")) createScript();
+            ImGui::Separator();
+            ImGui::MenuItem("Material (inline in scene)", nullptr, false, false);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Materials are stored inside the scene JSON today -\n"
+                    "edit them in the Inspector's Material section.");
+            }
+            ImGui::EndPopup();
+        }
+    }
+}
 
-    // ---- 面包屑：每一段都能点 ----
+// 面包屑独占一整行：Content 面板默认只有约 290px 宽，和导航按钮挤一行时
+// 连当前目录名都显示不出来。三级降级：全部显示 → "…" + 末尾若干段 →
+// 只显示当前目录名。（完整路径在底部状态行里始终可见，这里可以放心裁。）
+void ContentBrowser::drawCrumbRow() {
     const std::string rootName =
         fs::path(m_root.empty() ? "." : m_root).filename().string();
+
+    std::vector<std::pair<std::string, std::string>> crumbs;   // label, rel
+    crumbs.emplace_back(rootName.empty() ? "/" : rootName, std::string());
+    if (!m_rel.empty()) {
+        fs::path acc;
+        for (const auto& part : fs::path(m_rel)) {
+            acc /= part;
+            crumbs.emplace_back(part.string(), acc.generic_string());
+        }
+    }
+
+    // 面包屑按钮用 FramePadding(6)，宽度估算按 6 算，否则末尾会被裁半个字。
+    const float pad = 6.0f * 2.0f + 2.0f;
+    const float sepW = ImGui::CalcTextSize("/").x + 4.0f;
+    const float dotsW = ImGui::CalcTextSize("...").x + sepW + 2.0f;
+    auto crumbW = [&](std::size_t i) {
+        return ImGui::CalcTextSize(crumbs[i].first.c_str()).x + pad;
+    };
+
+    const float availW =
+        std::max(ImGui::GetContentRegionAvail().x - 2.0f, 40.0f);
+
+    float total = 0.0f;
+    for (std::size_t i = 0; i < crumbs.size(); ++i)
+        total += crumbW(i) + (i ? sepW : 0.0f);
+
+    bool clippedLeft = false;
+    bool onlyLast = false;
+    std::size_t firstShown = 0;
+    if (total > availW) {
+        clippedLeft = true;
+        const float a = availW - dotsW;
+        float used = 0.0f;
+        firstShown = crumbs.size();
+        for (std::size_t i = crumbs.size(); i-- > 0;) {
+            const float w = crumbW(i) + sepW;
+            if (used + w > a && firstShown != crumbs.size()) break;
+            used += w;
+            firstShown = i;
+        }
+        if (firstShown == crumbs.size()) {
+            // 连"… + 末段"都放不下：只画当前目录名
+            clippedLeft = false;
+            onlyLast = true;
+        }
+    }
+
+    const ImVec2 clipA = ImGui::GetCursorScreenPos();
+    const float rowH = ImGui::GetTextLineHeightWithSpacing() + 2.0f;
+    ImGui::PushClipRect(clipA, ImVec2(clipA.x + availW, clipA.y + rowH), true);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 2.0f));
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
                           ImVec4(0.23f, 0.36f, 0.57f, 1.0f));
 
-    if (ImGui::SmallButton(rootName.empty() ? "/" : rootName.c_str())) {
-        navigateTo(std::string());
-    }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m_root.c_str());
+    auto drawCrumb = [&](std::size_t i) {
+        ImGui::PushID(static_cast<int>(i));
+        if (ImGui::SmallButton(crumbs[i].first.c_str()))
+            navigateTo(crumbs[i].second);
+        ImGui::PopID();
+        if (i == 0 && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", m_root.c_str());
+    };
 
-    if (!m_rel.empty()) {
-        const fs::path relPath(m_rel);
-        fs::path acc;
-        for (const auto& part : relPath) {
-            acc /= part;
-            ImGui::SameLine(0.0f, 2.0f);
-            ImGui::TextDisabled("/");
-            ImGui::SameLine(0.0f, 2.0f);
-            const std::string s = part.string();
-            if (ImGui::SmallButton(s.c_str()))
-                navigateTo(acc.generic_string());
+    if (onlyLast) {
+        drawCrumb(crumbs.size() - 1);
+    } else {
+        bool firstItem = true;
+        if (clippedLeft) {
+            ImGui::TextDisabled("...");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m_root.c_str());
+            firstItem = false;
+        }
+        for (std::size_t i = firstShown; i < crumbs.size(); ++i) {
+            if (!firstItem) {
+                ImGui::SameLine(0.0f, 2.0f);
+                ImGui::TextDisabled("/");
+                ImGui::SameLine(0.0f, 2.0f);
+            }
+            firstItem = false;
+            drawCrumb(i);
         }
     }
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar();
+    ImGui::PopClipRect();
 
-    // ---- 右端：新建文件夹 ----
-    const float btnW = ImGui::CalcTextSize("New Folder").x +
-                       ImGui::GetStyle().FramePadding.x * 2.0f + 26.0f;
-    const float x = ImGui::GetWindowContentRegionMax().x - btnW;
-    if (x > ImGui::GetCursorPosX()) {
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(x);
-        if (ImGui::Button("New Folder", ImVec2(btnW, 0.0f))) {
-            m_newFolderRequest = true;
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Create a folder here, then type its name");
+    // 面包屑的宽度决策只在矩形调试开关下打印，且**只在决策变化时打**
+    // （否则每帧一行会刷爆日志，自动化脚本读不到真正有用的行）。
+    if (std::getenv("MYVK_LOG_RECTS")) {
+        static int lastKey = -1;
+        const int key = int(firstShown) * 4 + (clippedLeft ? 2 : 0) +
+                        (onlyLast ? 1 : 0);
+        if (key != lastKey) {
+            lastKey = key;
+            VK_LOG_INFO("CB-CRUMB avail=%.1f total=%.1f first=%zu dots=%d only=%d",
+                        availW, total, firstShown, clippedLeft ? 1 : 0,
+                        onlyLast ? 1 : 0);
         }
     }
 }
 
-void ContentBrowser::drawSearchRow() {
-    const float clearW = ImGui::CalcTextSize("Clear").x +
-                         ImGui::GetStyle().FramePadding.x * 2.0f + 12.0f;
-    ImGui::SetNextItemWidth(-(clearW + 6.0f));
-    if (ImGui::InputTextWithHint("##filter", "filter by name...", m_pathBuf,
+void ContentBrowser::drawToolbarRow() {
+    // 单行工具栏：类型过滤 + 视图切换 + 缩略图尺寸 + 名字过滤。
+    // Content 面板默认只有约 290px 宽。原先"工具栏 + 过滤"拆两行，会把网格挤
+    // 到只剩一行可见（拖放用例的目标资产会掉进裁剪区外）；全部并成一行后网格
+    // 能稳定显示近两行。既然横向只有 278px，就放弃独立的 Clear 按钮（改按
+    // Esc 清除，输入框也有右键菜单），把宽度让给名字过滤（约 100px）。
+    static const char* kTypeNames[] = {"All",     "Models",  "Textures",
+                                      "Materials", "Scenes", "Scripts",
+                                      "Shaders", "Folders"};
+    ImGui::SetNextItemWidth(78.0f);
+    if (ImGui::Combo("##cb_type", &m_typeFilterIdx, kTypeNames,
+                     IM_ARRAYSIZE(kTypeNames))) {
+        m_typeFilter = static_cast<TypeFilter>(m_typeFilterIdx);
+        m_dirty = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Filter by asset type (extension-based)");
+    }
+    ImGui::SameLine(0.0f, 4.0f);
+
+    const float h = ImGui::GetFrameHeight();
+    const ImVec2 bs(h, h);
+    if (iconButton("view_grid", bs, paintGridMode, "Grid view",
+                   m_view == ViewMode::Grid)) {
+        m_view = ViewMode::Grid;
+    }
+    ImGui::SameLine(0.0f, 2.0f);
+    if (iconButton("view_list", bs, paintListMode, "List view",
+                   m_view == ViewMode::List)) {
+        m_view = ViewMode::List;
+    }
+    ImGui::SameLine(0.0f, 4.0f);
+
+    static const char* kSizeNames[] = {"S", "M", "L", "XL"};
+    ImGui::SetNextItemWidth(46.0f);
+    ImGui::BeginDisabled(m_view == ViewMode::List);
+    if (ImGui::Combo("##cb_size", &m_thumbIdx, kSizeNames,
+                     IM_ARRAYSIZE(kSizeNames))) {
+        m_thumb = static_cast<ThumbSize>(m_thumbIdx);
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Thumbnail size (grid view)");
+    }
+    ImGui::SameLine(0.0f, 4.0f);
+
+    // ---- 名字过滤（吃掉本行剩余宽度）----
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint("##filter", "filter...", m_pathBuf,
                                  sizeof(m_pathBuf))) {
         m_filter = m_pathBuf;
         m_dirty = true;
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Clear", ImVec2(clearW, 0.0f))) {
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Filter by name (case-insensitive)\nEsc to clear");
+    }
+    // Esc 清除过滤（键盘在框里时消费掉，免得传给别处）
+    if (ImGui::IsItemHovered() && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
         m_pathBuf[0] = '\0';
         m_filter.clear();
         m_dirty = true;
@@ -491,8 +794,9 @@ void ContentBrowser::drawEntry(const DirEntry& ent, float cellW, float cellH) {
         }
     }
 
-    const float iconBox = 52.0f;
-    const float iconTop = 10.0f;
+    // E13 图标框跟着格子尺寸缩放（缩略图四档联动）
+    const float iconBox = std::max(24.0f, m_cellW - 44.0f);
+    const float iconTop = std::max(4.0f, (m_cellH - 22.0f - iconBox) * 0.35f);
 
     // ---- 图标 ----
     ImGui::Dummy(ImVec2(cellW, iconBox + iconTop));
@@ -858,6 +1162,109 @@ void ContentBrowser::createFolder() {
     m_ctx.notify("Created folder");
 }
 
+// ---------------------------------------------------------------- 新建资产
+
+// E13 New ▸ Scene：写一份最小可用场景（只有相机/光照字段，entities 为空），
+// 落盘后立刻进入重命名 —— 与 New Folder 一致。
+void ContentBrowser::createScene() {
+    const fs::path dir = fs::path(m_root) / m_rel;
+    const std::string path = uniqueChildPath(dir.string(), "NewScene", ".json");
+    std::error_code ec;
+    {
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) {
+            m_ctx.notify("New scene failed: cannot open file");
+            return;
+        }
+        const char* body =
+            "{\n"
+            "  \"version\": 1,\n"
+            "  \"generator\": \"Venn/SceneSerializer\",\n"
+            "  \"entities\": []\n"
+            "}\n";
+        std::fwrite(body, 1, std::strlen(body), f);
+        std::fclose(f);
+    }
+    (void)ec;
+    m_dirty = true;
+    m_selected = path;
+    beginRename(path, fs::path(path).filename().string());
+    m_ctx.notify("Created scene");
+}
+
+// E13 New ▸ Script：写一个带 update() 骨架的 .vks
+void ContentBrowser::createScript() {
+    const fs::path dir = fs::path(m_root) / m_rel;
+    const std::string path = uniqueChildPath(dir.string(), "NewScript", ".vks");
+    {
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) {
+            m_ctx.notify("New script failed: cannot open file");
+            return;
+        }
+        const char* body =
+            "// Venn script (.vks) - attached from the Inspector's Script\n"
+            "// section, or by double-clicking this file with an entity selected.\n"
+            "//\n"
+            "// Scripts only run in Play mode; the editor scene is untouched.\n"
+            "\n"
+            "fn update(dt) {\n"
+            "    // rotate 90 deg/sec around Y\n"
+            "    self.rotation.y = self.rotation.y + dt * 1.5708\n"
+            "}\n";
+        std::fwrite(body, 1, std::strlen(body), f);
+        std::fclose(f);
+    }
+    m_dirty = true;
+    m_selected = path;
+    beginRename(path, fs::path(path).filename().string());
+    m_ctx.notify("Created script");
+}
+
+// ---------------------------------------------------------------- 引用查询
+
+// E13 Show References（简版）：在资产根下扫描文本型资产（场景 JSON / 脚本）
+// 里是否出现该文件名。完整版需要资产数据库，这里先用"文本搜索"顶上 ——
+// 覆盖了最常见的用法（"这个贴图/模型还有谁在用"）。
+void ContentBrowser::showReferences(const DirEntry& ent) {
+    if (ent.isDir) return;
+    const std::string needle = ent.name;
+    std::error_code ec;
+    const fs::path root = m_root;
+    std::vector<std::string> hits;
+
+    for (fs::recursive_directory_iterator it(
+             root, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        const std::string name = it->path().filename().string();
+        if (name == needle) continue;   // 不算"引用自己"
+        if (!(isScene(name) || isScript(name))) continue;
+        std::FILE* f = std::fopen(it->path().string().c_str(), "rb");
+        if (!f) continue;
+        std::string text;
+        char buf[4096];
+        size_t n = 0;
+        while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+        std::fclose(f);
+        if (text.find(needle) != std::string::npos) {
+            hits.push_back(assets::makeAssetRelative(it->path().string()));
+        }
+        if (hits.size() >= 12) break;
+    }
+
+    if (hits.empty()) {
+        m_ctx.notify("No references to " + needle);
+        return;
+    }
+    std::string msg = std::to_string(hits.size()) + " reference(s): ";
+    for (size_t i = 0; i < hits.size(); ++i) {
+        if (i) msg += ", ";
+        msg += hits[i];
+    }
+    m_ctx.notify(msg);
+}
+
 // ---------------------------------------------------------------- 资源管理器
 
 void ContentBrowser::revealInExplorer(const std::string& absPath) {
@@ -899,6 +1306,10 @@ void ContentBrowser::drawEntryContextMenu() {
         m_ctx.notify("Path copied to clipboard");
     }
     if (ImGui::MenuItem("Show in Explorer")) revealInExplorer(ent.absPath);
+    if (ImGui::MenuItem("Show References")) showReferences(ent);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Scan scene / script assets that mention this file");
+    }
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.5f, 1.0f));
     if (ImGui::MenuItem("Delete", "Del")) requestDelete(ent);
@@ -914,6 +1325,8 @@ void ContentBrowser::drawEmptyContextMenu() {
         return;
     }
     if (ImGui::MenuItem("New Folder")) m_newFolderRequest = true;
+    if (ImGui::MenuItem("New Scene")) createScene();
+    if (ImGui::MenuItem("New Script")) createScript();
     ImGui::Separator();
     if (ImGui::MenuItem("Refresh")) m_dirty = true;
     if (ImGui::MenuItem("Show in Explorer")) revealInExplorer(
@@ -961,12 +1374,164 @@ void ContentBrowser::drawDeleteConfirm() {
     ImGui::EndPopup();
 }
 
+// ---------------------------------------------------------------- 列表视图
+
+// E13 列表行：小图标 + 名字 + （右对齐）类型/大小。
+// 与网格共用同一套交互（选中 / 双击 / 右键 / 拖拽），只是排成一行。
+void ContentBrowser::drawListRow(const DirEntry& ent, float rowH) {
+    ImGui::PushID(ent.absPath.c_str());
+
+    const bool selected = (m_selected == ent.absPath);
+    const bool renaming = (m_renameTarget == ent.absPath);
+
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    const bool hovered = ImGui::IsMouseHoveringRect(
+        p, ImVec2(p.x + w, p.y + rowH));
+    if (selected || hovered) {
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + rowH),
+                          selected ? IM_COL32(36, 66, 112, 200)
+                                   : IM_COL32(48, 52, 60, 150), 4.0f);
+        if (selected) {
+            dl->AddRect(p, ImVec2(p.x + w, p.y + rowH),
+                        IM_COL32(64, 132, 226, 230), 4.0f, 0, 1.5f);
+        }
+    }
+
+    // 图标（16px 见方，垂直居中）
+    const float ic = 16.0f;
+    const ImVec2 ip(p.x + 6.0f, p.y + (rowH - ic) * 0.5f);
+    if (ent.isDir) {
+        drawFolderIcon(dl, ip, ic);
+    } else if (isImage(ent.name)) {
+        const ThumbnailCache::Entry* t = thumbnail(ent.absPath);
+        if (t && t->ds != VK_NULL_HANDLE) {
+            dl->AddImage(static_cast<ImTextureID>(
+                             reinterpret_cast<std::uintptr_t>(t->ds)),
+                         ip, ImVec2(ip.x + ic, ip.y + ic));
+        } else {
+            drawPageIcon(dl, ip, ic, accentColor(ent.name), glyphFor(ent.name));
+        }
+    } else {
+        drawPageIcon(dl, ip, ic, accentColor(ent.name), glyphFor(ent.name));
+    }
+
+    const float textX = ip.x + ic + 8.0f;
+    const float textY = p.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f;
+
+    if (renaming) {
+        ImGui::SetCursorScreenPos(ImVec2(textX, p.y + 2.0f));
+        ImGui::SetNextItemWidth(w - (textX - p.x) - 8.0f);
+        if (m_renameFocus) {
+            ImGui::SetKeyboardFocusHere();
+            m_renameFocus = false;
+        }
+        if (ImGui::InputText("##rename_list", m_renameBuf, sizeof(m_renameBuf),
+                             ImGuiInputTextFlags_EnterReturnsTrue)) {
+            m_renameCommit = true;
+        }
+        if (ImGui::IsItemDeactivated() && !m_renameCommit) m_renameCancel = true;
+    } else {
+        dl->AddText(ImVec2(textX, textY),
+                    selected ? IM_COL32(236, 242, 250, 255)
+                             : IM_COL32(206, 212, 220, 255),
+                    ent.name.c_str());
+
+        // 右端：类型 + 大小
+        const std::string right =
+            std::string(ent.isDir ? "folder" : lowerExt(ent.name)) +
+            (ent.isDir ? "" : "   " + humanSize(ent.size));
+        const float rw = ImGui::CalcTextSize(right.c_str()).x;
+        if (w - rw - 10.0f > textX - p.x) {
+            dl->AddText(ImVec2(p.x + w - rw - 8.0f, textY),
+                        IM_COL32(140, 146, 156, 255), right.c_str());
+        }
+    }
+
+    // 撑满整行（交互区）
+    ImGui::SetCursorScreenPos(p);
+    ImGui::Dummy(ImVec2(w, rowH));
+
+    {
+        const std::string tag = "CB-CELL " + ent.name;
+        logRect(tag.c_str(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    }
+
+    const bool hov = ImGui::IsItemHovered();
+    if (hov && !renaming) {
+        ImGui::BeginTooltip();
+        ImGui::Text("%s", ent.name.c_str());
+        if (!ent.isDir) ImGui::TextDisabled("%s", humanSize(ent.size).c_str());
+        ImGui::TextDisabled("%s", ent.absPath.c_str());
+        ImGui::EndTooltip();
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) m_selected = ent.absPath;
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) openEntry(ent);
+    }
+
+    if (!renaming) {
+        const bool itemHovered =
+            ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup);
+        if (itemHovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
+            m_selected = ent.absPath;
+            m_ctxEntry = ent;
+            m_ctxRequest = true;
+        }
+    }
+
+    // 拖拽（与网格一致）
+    const bool draggable = !ent.isDir && (isModel(ent.name) || isImage(ent.name));
+    if (draggable &&
+        ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+        const std::string rel = assets::makeAssetRelative(ent.absPath);
+        ImGui::SetDragDropPayload(drag::kAsset, rel.c_str(), rel.size() + 1);
+        ImGui::Text("%s", ent.name.c_str());
+        ImGui::EndDragDropSource();
+    }
+
+    ImGui::PopID();
+}
+
+void ContentBrowser::drawList() {
+    const float rowH = ImGui::GetFrameHeight() + 6.0f;
+    const float footerH = ImGui::GetFrameHeightWithSpacing();
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 2.0f));
+    ImGui::BeginChild("##list", ImVec2(0, -footerH), ImGuiChildFlags_None);
+
+    drawEmptyContextMenu();
+
+    if (m_entries.empty()) {
+        ImGui::TextDisabled(m_filter.empty() ? "(empty folder)" : "(no match)");
+    } else {
+        for (const DirEntry& e : m_entries) drawListRow(e, rowH);
+    }
+
+    if (m_ctxRequest) {
+        m_ctxRequest = false;
+        m_ctxOpen = true;
+        ImGui::OpenPopup(kEntryCtxPopup);
+    }
+    if (m_ctxOpen) drawEntryContextMenu();
+
+    ImGui::PopStyleVar();
+    ImGui::EndChild();
+}
+
 // ---------------------------------------------------------------- 网格
 
 void ContentBrowser::drawGrid() {
-    // 格子稍微放大一点：图标 52px + 名字，88×118 会挤
-    const float cellW = 96.0f;
-    const float cellH = 104.0f;
+    // E13 缩略图四档尺寸：格子边长与图标框一起缩放
+    float cellW = 96.0f;
+    float cellH = 104.0f;
+    switch (m_thumb) {
+        case ThumbSize::Small:  cellW = 72.0f;  cellH = 74.0f;  break;
+        case ThumbSize::Medium: cellW = 96.0f;  cellH = 104.0f; break;
+        case ThumbSize::Large:  cellW = 132.0f; cellH = 146.0f; break;
+        case ThumbSize::Huge:   cellW = 176.0f; cellH = 196.0f; break;
+    }
+    m_cellW = cellW;
+    m_cellH = cellH;
 
     const float availW = ImGui::GetContentRegionAvail().x;
     int columns = static_cast<int>((availW + 8.0f) / (cellW + 8.0f));
@@ -1039,12 +1604,46 @@ void ContentBrowser::draw() {
         ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows |
                                ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
 
+    // E13 自动化钩子（一次性）：注入类型过滤 / 视图 / 尺寸，便于脚本
+    // 断言"类型过滤切换后可见项数量变化正确"。正常使用不设即无影响。
+    static bool s_envViewDone = false;
+    if (!s_envViewDone) {
+        s_envViewDone = true;
+        if (const char* t = std::getenv("MYVK_EDITOR_CB_TYPE")) {
+            static const char* kNames[] = {"all",    "model", "texture",
+                                           "material", "scene", "script",
+                                           "shader", "folder"};
+            for (int i = 0; i < 8; ++i) {
+                if (lowerCopy(t) == kNames[i]) {
+                    m_typeFilterIdx = i;
+                    m_typeFilter = static_cast<TypeFilter>(i);
+                    m_dirty = true;
+                    VK_LOG_INFO("CB-FILTER type=%s", kNames[i]);
+                    break;
+                }
+            }
+        }
+        if (const char* v = std::getenv("MYVK_EDITOR_CB_VIEW")) {
+            m_view = (lowerCopy(v) == "list") ? ViewMode::List : ViewMode::Grid;
+            m_dirty = true;
+        }
+        if (const char* s = std::getenv("MYVK_EDITOR_CB_SIZE")) {
+            const int idx = std::atoi(s);
+            if (idx >= 0 && idx <= 3) {
+                m_thumbIdx = idx;
+                m_thumb = static_cast<ThumbSize>(idx);
+            }
+        }
+    }
+
     if (m_dirty) refresh();
 
     drawNavRow();
-    drawSearchRow();
+    drawCrumbRow();
+    drawToolbarRow();
     ImGui::Separator();
-    drawGrid();
+    if (m_view == ViewMode::Grid) drawGrid();
+    else drawList();
     ImGui::Separator();
 
     // 统计文字（原来的底行：播放条已移到视口正下方，这里保持原状）
@@ -1053,10 +1652,12 @@ void ContentBrowser::draw() {
                   m_rel.empty() ? "(root)" : m_rel.c_str());
     ImGui::TextDisabled("%s", stat);
 
-    // 键盘：Backspace 上一级；F2 重命名；Delete 删除（都对选中项）
+    // 键盘：Backspace 上一级；Alt+← / Alt+→ 历史；F2 重命名；Delete 删除
     const ImGuiIO& io = ImGui::GetIO();
     if (!io.WantTextInput && m_renameTarget.empty() && hoveredPanel) {
         if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) goUp();
+        if (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false)) back();
+        if (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) forward();
         auto selEntry = [&]() -> const DirEntry* {
             for (const DirEntry& e : m_entries)
                 if (e.absPath == m_selected) return &e;

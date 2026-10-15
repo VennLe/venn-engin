@@ -691,7 +691,7 @@ void Texture::fromPixels(const TextureContext& ctx, const uint8_t* pixels,
 
 void Texture::makeCheckerboard(const TextureContext& ctx, uint32_t width,
                                uint32_t height, uint32_t cell, uint8_t a[4],
-                               uint8_t b[4]) {
+                               uint8_t b[4], bool srgb) {
     std::vector<uint8_t> pixels(
         static_cast<size_t>(width) * height * 4);
     for (uint32_t y = 0; y < height; ++y) {
@@ -705,7 +705,7 @@ void Texture::makeCheckerboard(const TextureContext& ctx, uint32_t width,
             pixels[idx + 3] = c[3];
         }
     }
-    fromPixels(ctx, pixels.data(), width, height);
+    fromPixels(ctx, pixels.data(), width, height, srgb);
 
     // 记录来源（注意要在 fromPixels 之后设，它不覆盖 m_source）
     m_source = TextureSource{};
@@ -716,6 +716,7 @@ void Texture::makeCheckerboard(const TextureContext& ctx, uint32_t width,
     }
     m_source.cell = cell;
     m_source.size = width;
+    m_source.srgb = srgb;
 }
 
 void Texture::makeSolid(const TextureContext& ctx, uint8_t color[4],
