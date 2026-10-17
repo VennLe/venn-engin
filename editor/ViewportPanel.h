@@ -99,15 +99,31 @@ public:
     }
 
 private:
+    // 视口工具条（2026-10-17 晚重做：一条紧凑图标行 + 若干下拉，
+    // 结构对齐 UE5 视口工具条 —— 见 ViewportPanel.cpp 顶部那段说明）
     void drawToolbar();
-    // 工具栏第二行：平移 / 旋转 / 缩放各自的吸附开关 + 步长 + UE 预设
-    void drawSnapRow();
+    // 工具条上的下拉内容。每个函数**只画 popup 内部**，由 drawToolbar
+    // 每帧无条件提交（不提交的那一帧 ImGui 会把弹层关掉）。
+    // 打开下拉 / 给下拉定位。**为什么需要这一对**：ImGui 的 OpenPopup 不带
+    // 定位时会把弹层摆在**鼠标位置**（正好压在工具条那一行上），而 UE 的
+    // 下拉是从按钮左下角往下展开的。openDropdown 记住刚提交的那个按钮矩形，
+    // placeDropdown 在 BeginPopup 之前把它设成弹层左上角。
+    void openDropdown(const char* popupId);
+    void placeDropdown();
+    void drawToolMenu();            // 变换工具（带搜索框 + 快捷键）
+    void drawSpaceMenu();           // 世界 / 局部坐标
+    void drawSnapMenu(int which);   // 0=move 1=grid 2=rotate 3=scale
+    void drawViewMenu();            // 透视 / 视图方向 / 相机
+    void drawLayoutMenu();          // 视口分屏布局（1 / 2V / 2H / 4）
+    void drawSpeedMenu();           // 相机速度
+    void drawLightMenu();           // 光照模式（= 视图模式）
+    void drawShowMenu();            // 显示标志
+    void drawVpSettingsMenu();      // 栅格 / 背景 / 参数
     // 编辑态导航（UE 视口手感：飞行相机 + 滚轮推拉 / 右键滚轮调灵敏度）
     void handleNavigation(bool hovered) const;
     // E14 · 视口浮层（各自独立显隐，见 EditorContext::ViewportOverlay）
     //   （左下角的相机信息块已并入 Inspector → World → Camera）
     //   左上 = 视图模式条
-    void drawViewModeBar(const glm::vec2& vpPos, const glm::vec2& vpSize);
     //   右上 = 统计 HUD（FPS / 帧时间 / draw calls / 三角形 / VRAM / 分辨率 /
     //          视图模式 / 实体 / 选中，逐行可关）
     void drawStatsHud(const glm::vec2& vpPos, const glm::vec2& vpSize);
@@ -160,10 +176,21 @@ private:
     //   本字段 = 存在的情况下收不收起来（临时）
     bool m_statsCollapsed = false;
 
-    // E14：模式条（左上）的右 / 下边界（屏幕坐标，每帧由 drawViewModeBar
-    // 填）。统计 HUD 用它判断顶边会不会撞上，撞上就下移一行。
-    float m_modeBarRight = 0.0f;
-    float m_modeBarBottom = 0.0f;
+    // 工具下拉里的搜索框（"开始输入以搜索"）。会话内有效 —— 这是
+    // "找工具"的临时输入，不该跟着布局落盘。
+    char m_toolSearch[64] = {0};
+    // 上一次**打过日志**的搜索词。只在内容变化时打一行 —— 每帧打会刷爆日志。
+    char m_toolSearchLogged[64] = {0};
+
+    // 下拉弹层的锚点（屏幕坐标 = 刚点开的那个按钮的左下角）。
+    // 用两个 float 而不是 ImVec2：这个头文件不 include imgui.h。
+    float m_popupX = 0.0f;
+    float m_popupY = 0.0f;
+
+    // 上一次**打过日志**的工具模式（GizmoMode 的整数值；-1 = 还没打过）。
+    // 用在 drawToolbar 末尾做差分：三条入口（工具按钮 / 快捷键 / 顶栏下拉）
+    // 只在这一处留日志，见 .cpp 里的说明。
+    int m_lastToolMode = -1;
 
     // ---- 导航球（Navigation Gizmo）的拖拽状态 ----
     // m_navPressDir：按下时命中的轴端（ViewDir 枚举，-1 = 没点在小球上）。

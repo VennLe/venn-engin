@@ -1,5 +1,6 @@
 #include "ConsolePanel.h"
 
+#include "DebugRects.h"
 #include "Localization.h"
 #include <imgui.h>
 
@@ -140,10 +141,32 @@ void ConsolePanel::setSearchFilter(const std::string& text) {
 }
 
 void ConsolePanel::draw(bool* open) {
+    // 首次出现的几何：**贴着底栏上面、横向居中偏左**的一块宽面板。
+    //
+    // 原来这里什么都没有 → ImGui 用默认的 (60,60) + 自动尺寸，于是一个
+    // 440×169 的小窗凭空出现在左上角、正好压在 Hierarchy 标题栏上。用户
+    // 报的"点 Output Log 没打开面板"就是这个：窗其实开了，只是那副样子
+    // 怎么看都不像"输出日志开着"。给一个像样的默认位置和尺寸。
+    {
+        const ImGuiIO& io = ImGui::GetIO();
+        const float w = std::min(860.0f, io.DisplaySize.x * 0.62f);
+        const float h = std::min(330.0f, io.DisplaySize.y * 0.40f);
+        ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_FirstUseEver);
+        // 底边离窗口底 48px（= 状态栏 + 底栏那一条），左边对齐视口左缘一帶
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f,
+                                       io.DisplaySize.y - 48.0f),
+                                ImGuiCond_FirstUseEver, ImVec2(0.5f, 1.0f));
+    }
     if (!ImGui::Begin(trId("Console", "panel_console"), open)) {
         ImGui::End();
         return;
     }
+
+    // 自动化锚点：底栏 "输出日志" 按钮的端到端断言要能证明"面板真的开出来了"
+    // （只查 OUTPUT-LOG open=1 那条日志，证明不了绘制）。
+    logRect("CONSOLE-PANEL", ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
+                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
 
     // ---- 工具行：级别过滤 + 搜索 + 操作 ----
     ImGui::Checkbox(TR("Info"), &m_showInfo);

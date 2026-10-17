@@ -181,8 +181,10 @@ const char* GizmoController::modeName() const {
     switch (m_mode) {
         case GizmoMode::Translate: return "Move";
         case GizmoMode::Rotate: return "Rotate";
-        default: return "Scale";
+        case GizmoMode::Scale: return "Scale";
+        case GizmoMode::Select: return "Select";
     }
+    return "?";
 }
 
 void GizmoController::planeBasisForHandles(int normalIdx, glm::vec3& u,
@@ -883,6 +885,18 @@ bool GizmoController::update(EditorContext& ctx, const scene::Camera& camera,
     // 在这儿改既不会进历史也不会写回编辑态 —— 与其让人以为"改了没反应"，
     // 不如直接挡住。
     if (!ctx.isEditing()) {
+        m_dragging = false;
+        m_dragHandles = Handle::None;
+        m_hover = Handle::None;
+        return false;
+    }
+
+    // 选择模式（Q）：这一帧**根本没有手柄** —— 不画、不做命中、不吞左键。
+    //
+    // 放在几何计算之前返回，是为了不留下任何"上一次的姿态"：m_hover /
+    // m_dragging 一并清掉，否则从"移动"切到"选择"的那一帧，指针还停在
+    // 旧手柄上会继续显示抓手光标（看起来像手柄没消失）。
+    if (ctx.gizmoMode() == GizmoMode::Select) {
         m_dragging = false;
         m_dragHandles = Handle::None;
         m_hover = Handle::None;

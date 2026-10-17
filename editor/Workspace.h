@@ -33,7 +33,17 @@
 #include <cstdint>
 #include <string>
 
+// render::Renderer 在**全局**命名空间（不是 editor::render）。
+// 这条前向声明必须写在 namespace editor 外面 —— 写进去就成了
+// editor::render::Renderer，与真类型不是同一个东西（编译器只会说
+// "参数类型不匹配"，很难看出是命名空间错位）。
+namespace render {
+class Renderer;
+}
+
 namespace editor {
+
+class EditorContext;  // 只给 applyViewportLayout 用（前向声明，别把大头顶进来）
 
 // 视口布局（E07 用；定义在这里因为它是工作区的一部分）
 enum class ViewportLayout : std::uint8_t {
@@ -45,6 +55,24 @@ enum class ViewportLayout : std::uint8_t {
 
 const char* viewportLayoutName(ViewportLayout l);
 int viewportLayoutCount();
+
+// 布局 → 还要几个**子视口**（主视口之外，即 Renderer::setSubviewCount 的参数）。
+//   Single = 0 / TwoVertical = 1 / TwoHorizontal = 1 / Quad = 3
+//
+// ⚠ 只此一份。以前这条映射写在 EditorApp::syncViewportLayout 里，视口工具条
+//   的下拉要用同一张表 —— 抄第二份意味着"从菜单切"和"从工作区切"迟早不一样。
+int viewportSubviewCount(ViewportLayout l);
+
+// 施加视口布局：写 EditorContext + 设渲染器子视口数 + 打一行 VIEWPORT-LAYOUT。
+//
+// 为什么要一个共用函数：切布局有**两条**入口 ——
+//   ① EditorApp（切工作区 / 读布局存档）
+//   ② 视口工具条那个 "1 / 2V / 2H / 4" 下拉
+// 上一版只有 ① 会同步子视口并留日志，从下拉切就只改了"数字"、离屏目标没跟上，
+// 4 屏也拿不到证据。共用一份实现之后两种入口行为与日志必然一致。
+// （Renderer / EditorContext 都只前向声明，避免这个头把两个大模块拖进来。）
+void applyViewportLayout(EditorContext& ctx, render::Renderer& renderer,
+                         ViewportLayout l);
 
 struct WorkspacePreset {
     const char* id;

@@ -135,6 +135,23 @@ DEFAULT = [
     # E13 ContentBrowser：类型过滤矩阵 / 列表与四档缩略图尺寸 / 拖资产到
     # 视口（贴地）与 Hierarchy（实例化）两条落点
     "verify_content_browser",
+    # 2026-10-17 布局改造：Content 从常驻分栏改成"底栏抽屉"。
+    # 看守对象：底栏（通栏/32px/三个带 Logo 的按钮/右侧资源统计）、
+    # 抽屉开合（点按钮 / 再点关 / 点外部关）、Dock in layout（停靠后
+    # 视口变矮 ≈ 抽屉高、点外部不关）、上边缘拖拽改高度。
+    "verify_bottom_bar",
+    # 2026-10-17 晚：Content 三栏改造（树 | 类型单选 | 内容+搜索+排序）。
+    # 跟着 bottom_bar 一起跑：两者都在同一个抽屉里，改一边很容易碰另一边。
+    "verify_content_three_pane",
+    # 2026-10-17 晚（第二条需求）：Content 右栏顶部的动作条 ——
+    # Add（图标+文字，菜单**向上**弹，13 种资源类型 + 导入）/ Save All /
+    # 上一层·下一层 / 路径框（相对项目根）。与三栏同处一个抽屉，一起跑。
+    "verify_content_action_row",
+    # 2026-10-17 晚（用户两条需求）：①3D 视口工具条重做（单行图标 + 九个
+    # 下拉：工具/坐标/四个吸附/视口看法），②底栏 CMD 右侧的 + 面板托盘
+    # （向上弹的勾选列表、带 logo 的面板按钮、按钮可收起、× 移除按钮、
+    # 右键最小化）。顺带覆盖两张新面板（Physics / Particles）。
+    "verify_viewport_bar",
     # E14 Viewport：四角浮层（模式条 / 统计 HUD / 相机信息 + 9 书签 / 导航球）、
     # NO_HUD 两次逐像素一致 + 与改造前参考图一致、四浮层全关 == NO_HUD、
     # Shift+数字 快捷键、Viewport Display 右键菜单显隐、偏好落盘跨进程往返
@@ -379,7 +396,9 @@ TRIGGERS = {
                               "engine/render/ShadowCull.h",
                               "assets/shaders/shadow.vert",
                               "assets/shaders/shadow.frag"],
-    "verify_local_shadow":   ["engine/render/LocalShadowPass.*"],
+    "verify_local_shadow":   ["engine/render/LocalShadowPass.*",
+                              "assets/shaders/grid.frag",
+                              "assets/shaders/grid.vert"],
     "verify_shadow_hardening": ["engine/render/ShadowPass.*",
                                 "assets/shaders/shadow.vert"],
     # ---- 环境 / IBL / 雾 ----
@@ -408,7 +427,13 @@ TRIGGERS = {
                               "assets/shaders/fg_godrays.frag"],
     "verify_taa":            ["assets/shaders/fg_taa.frag",
                               "engine/render/PostProcess.*"],
-    "verify_fxaa":           ["assets/shaders/fxaa.frag"],
+    # ⚠ 2026-10-17 晚补：fxaa / local_shadow 的视口截图里**有地平面栅格**
+    #   （编辑器默认开栅格）。栅格着色器一改，视口像素就变 → 这两个用例
+    #   必须跟着跑（栅格修好之前它在地板上经常被深度冲突吃掉，所以这个
+    #   依赖关系一直是隐形的）。
+    "verify_fxaa":           ["assets/shaders/fxaa.frag",
+                              "assets/shaders/grid.frag",
+                              "assets/shaders/grid.vert"],
     "verify_auto_exposure":  ["engine/render/PostProcess.*",
                               "assets/shaders/fg_lum_average.comp",
                               "assets/shaders/fg_lum_downsample.frag",
@@ -488,6 +513,12 @@ TRIGGERS = {
                               # 是**从面板表生成**的，工作区子菜单也从预设生成 ——
                               # 表或预设改一个字，这一例的菜单断言就可能变。
                               "editor/PanelRegistry.*", "editor/Workspace.*"],
+    # 底栏 + Content 抽屉：底栏与抽屉的外框都在 EditorApp；主体的让位高度
+    # 走 SplitLayout 的 bottomInset；抽屉里画的是 ContentBrowser::drawBody；
+    # 默认开关来自面板表与工作区预设（Workspace.*）。
+    "verify_bottom_bar":     ["editor/EditorApp.*", "editor/SplitLayout.*",
+                              "editor/ContentBrowser.*", "editor/ConsolePanel.*",
+                              "editor/PanelRegistry.*", "editor/Workspace.*"],
     "verify_mesh_params":    ["editor/InspectorPanel.*"],
     "verify_character_window": ["editor/CharacterWindow.*", "assets/models/**"],
     "verify_material_roundtrip": ["engine/scene/SceneSerializer.*"],
@@ -534,10 +565,35 @@ TRIGGERS = {
     "verify_content_browser": ["editor/ContentBrowser.*",
                                "editor/ThumbnailCache.*",
                                "editor/EditorDragDrop.h"],
+    # 2026-10-17 晚：Content 三栏改造（目录树 / 类型单选列 / 内容+搜索+排序）。
+    # 看守对象：三栏从左往右且都落在抽屉里、点树节点切目录、类型单选生效、
+    # 排序图标紧贴搜索框右边、排序菜单四个勾选框、最近搜索、以及
+    # "抽屉重开后不被视口盖住 / 分割线不画进抽屉"这两个层级回归。
+    "verify_content_three_pane": ["editor/ContentBrowser.*",
+                                  "editor/EditorApp.*",
+                                  "editor/SplitLayout.*"],
+    # 2026-10-17 晚：右栏顶部动作条（Add ▸ 13 类型 + 导入 / Save All /
+    # 上一层·下一层 / 路径框）。Save All 走 EditorContext 的请求位，
+    # 真正落盘在 EditorApp；导入对话框的 Win32 调用在 ContentBrowser。
+    "verify_content_action_row": ["editor/ContentBrowser.*",
+                                  "editor/EditorApp.*",
+                                  "editor/EditorContext.h",
+                                  "editor/Localization.cpp"],
     # E14：四角浮层 / 书签 / 显隐全在 ViewportPanel；相机 yaw/pitch 存取走
     #      引擎的 scene::Camera（书签存的就是它）
     "verify_viewport":       ["editor/ViewportPanel.*",
                               "engine/scene/Camera.*"],
+    # 2026-10-17 晚：视口工具条（图标/下拉/吸附/视图菜单）+ 底栏面板托盘
+    #   + 两张新面板。改动面横跨这几处，任何一个动了这一组都要重跑。
+    "verify_viewport_bar":   ["editor/ViewportPanel.*",
+                              "editor/EditorApp.*",
+                              "editor/EditorContext.h",
+                              "editor/EditorContext.cpp",
+                              "editor/GizmoController.cpp",
+                              "editor/PanelRegistry.*",
+                              "editor/PhysicsPanel.*",
+                              "editor/ParticlesPanel.*",
+                              "editor/Localization.cpp"],
     # ---- 阶段 D：交互理念 ----
     # E18：注册表本体 + 模糊匹配 + 命令面板 UI 全在新文件 CommandRegistry；
     #      命令的**登记**（从特性/面板/视图模式/工作区/控制台五路派生）在

@@ -76,6 +76,8 @@ class InspectorPanel;
 class ContentBrowser;
 class SplitLayout;
 class CharacterWindow;
+class PhysicsPanel;
+class ParticlesPanel;
 class ParamEditCommand;
 
 // EditorApp 同时实现 EditorHost —— 菜单里那些"要动引擎"的动作
@@ -98,6 +100,11 @@ public:
     void reloadAssets() override;
     const char* gpuName() override;
     const char* engineVersion() override;
+
+    // ---- 顶栏播放条：前进一帧 ----
+    // 语义是"进入暂停（有运行态）后推进一个固定步长"。真正的一帧要走
+    // 脚本 → 玩家 → 物理 → 碰撞这条链，全在本类手里，Toolbar 只发意图。
+    void stepOneFrame() override;
 
     // ---- E18 命令面板 ----
     // Help ▸ Command Palette… 与 Ctrl+Shift+P 都落到这里（Toolbar 拿不到
@@ -142,6 +149,10 @@ private:
     static void panelDrawEngine(EditorApp& a);
     static void panelDrawConsole(EditorApp& a);
     static void panelDrawGpuTimeline(EditorApp& a);
+    // 2026-10-17 晚新增的三张（底栏托盘可勾选）
+    static void panelDrawCharacter(EditorApp& a);
+    static void panelDrawPhysics(EditorApp& a);
+    static void panelDrawParticles(EditorApp& a);
 
     // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
     void drawPanels();
@@ -169,6 +180,9 @@ private:
     void syncWindowFullscreen();
     // F11：只切窗口全屏（面板照旧），编辑态也能用
     void toggleWindowFullscreen();
+    // 把编辑场景立刻落盘到当前场景路径（Ctrl+S 与 Content 工具栏的
+    // "Save All" 共用这一条路径 —— 两处各写一遍必然漂移）
+    void saveSceneNow();
     // 把编辑态场景引用到的脚本全部加载 + 编译一遍（只为在面板上暴露错误；
     // 真正执行它们的地方在下面的 runScriptsOn）
     void preloadScripts();
@@ -272,8 +286,74 @@ private:
     // 角色详情窗口（创建第一/第三人称角色时弹出）
     void drawCharacterWindow();
     // 视口正下方那一行播放条（Run = 运行游戏；Play/Pause/Stop = 动画）。
-    // 按钮在这一行的水平正中。
+    //
+    // ⚠ 2026-10-17：UI 被用户要求移除，**这个函数不再被调用**（保留实现
+    //   是为了将来恢复时不用从 git 里翻）。computeLayout 里 transport 矩形
+    //   恒为 0×0，即使误调也画不出来。
     void drawTransportBar();
+
+    // ---- 底部通栏 + Content 抽屉（2026-10-17 布局改造）----
+    // 底栏：左侧三个带图标的按钮（内容 / 输出日志 / CMD），右侧资源统计。
+    void drawBottomBar();
+    // 一个"Logo + 文字"的底栏按钮。active = 对应面板当前是否打开（高亮）。
+    bool barButton(const char* id, const char* label, int icon,
+                   bool active, const char* tip);
+
+    // ---- 底栏面板托盘（2026-10-17 晚）----
+    // "CMD 右边一个 +，点开往上弹一列勾选；勾上的面板在 + 右侧出现一个
+    //  带 Logo 的按钮，点按开关，按钮右上角的 × 把它移掉"。
+    //
+    // 托盘按钮的三种结果。用一个枚举而不是三个 bool：调用点的 switch
+    // 逼着把"点了按钮"和"点了叉号"分开处理，漏一个编译器就报。
+    enum class TrayHit { None = 0, Toggle, Remove };
+    TrayHit trayButton(const char* id, const char* label, int icon, bool active,
+                       const char* tip);
+    // "+" 弹出的勾选列表（向上弹）。每帧无条件提交。
+    void drawPanelPicker();
+    // 托盘面板的"最小化"状态上报：ImGui 的折叠箭头 / 双击标题栏都会改这个
+    // 状态，而它**不产生任何 ImGui 调用**可以挂钩。所以每帧读一次窗口对象，
+    // 变了就打一行 PANEL-STATE（自动化据此断言"最小化真的生效了"）。
+    void servicePanelTrayState();
+
+    // 浮动面板标题栏右上角的"最小化"按钮（2026-10-17 第四轮）。
+    //
+    // 用户原话："在 Content 面板这里通过点击 + 打开的所有面板，右上角都要有
+    // 可以最小化的按钮，点击最小化即把面板窗口最小化放到 + 按钮右侧原来的
+    // 位置上。" —— 也就是收回成底栏那个托盘按钮。
+    //
+    // 为什么是手工命中 + 手工绘制，而不是塞一个 ImGui 控件：标题栏是 ImGui
+    // 在 `Begin()` 内部画完的，面板各自的 `Begin/End` 之外**没有**官方入口
+    // 往标题栏里加控件（想加只能整窗换成 NoTitleBar + 自绘标题栏，那会连带
+    // 丢掉拖拽 / 折叠 / 双击最大化）。所以这里在**所有面板画完之后**，按窗口
+    // 对象算出"关闭 X 左边那一格"，用该窗口自己的 DrawList 画、再手动判命中。
+    // 命中前要求 `HoveredWindow == 该窗口`，所以被别的窗口盖住时点不到。
+    void drawPanelMinimizeButtons();
+    // 把某个面板弄到"真的看得见"：清掉托盘的临时收起 + 打开 + 请求焦点。
+    // 底栏的 Output Log / CMD 按钮走这条路 —— 上一版直接 `open = !open`，
+    // 一旦面板处于"勾着但被收起"的状态，点一下只是把勾取了，屏幕上什么都
+    // 不会变，用户看到的就是"点了没反应"。
+    void focusPanel(const char* id);
+    // 下一帧要 `SetWindowFocus` 的面板 id（空 = 不请求）。窗口还没建起来的
+    // 那一帧调 SetWindowFocus 是无效的，所以延后一帧。
+    const char* m_focusPanelWant = nullptr;
+    // Character 窗口"上一帧是不是开着"。它自己管 `m_open`，点 × 时只改自己
+    // 的成员，面板注册表那边还是勾着的 —— 于是下一帧同步逻辑又把它打开，
+    // 表现就是"叉号关不掉"。靠这个字段把"用户关的"和"刚被勾上"区分开。
+    bool m_characterWasOpen = false;
+    // "+" 按钮的屏幕位置（列表要开在它正上方 —— 底栏贴着屏幕底边，
+    // 往下弹会直接出屏）。每次画 + 时更新。
+    // ⚠ 用 4 个 float 而不是 ImVec2：这个头文件不 include imgui.h（和
+    //   SplitLayout::setOccluder 同一条理由）。
+    float m_trayPlusX = 0.0f;
+    float m_trayPlusY = 0.0f;
+    float m_trayBtnH = 24.0f;
+    // 上一次上报的（开 / 折叠）状态，按面板表下标。只用来"变化时才打日志"。
+    bool m_trayStateOpen[kMaxPanels] = {};
+    int m_trayStateMin[kMaxPanels] = {};
+    // 抽屉（浮层或停靠，取决于 m_contentDock）。
+    void drawContentDrawer();
+    // 未停靠时点外部关闭（在所有窗口画完之后调用）。
+    void serviceContentDrawerDismiss();
 
     std::unique_ptr<EditorContext> m_ctx;
     std::unique_ptr<Toolbar> m_toolbar;
@@ -284,11 +364,34 @@ private:
     std::unique_ptr<vks::ScriptEngine> m_scripts;
     std::unique_ptr<SplitLayout> m_split;
     std::unique_ptr<CharacterWindow> m_characterWindow;
+    // 2026-10-17 晚：底栏"+"托盘里的两张功能面板（Physics / Particles）
+    std::unique_ptr<PhysicsPanel> m_physicsPanel;
+    std::unique_ptr<ParticlesPanel> m_particlesPanel;
     std::unique_ptr<ConsolePanel> m_console;
     // E16：MYVK_EDITOR_CONSOLE_CMD 注入命令只执行一次的哨兵。
     bool m_consoleCmdDone = false;
     // E18：命令面板开合位（Ctrl+Shift+P / Help 菜单）
     bool m_showCommandPalette = false;
+
+    // ---- 底栏 / Content 抽屉状态（2026-10-17）----
+    // 抽屉高度（像素）。浮层与停靠共用同一个值 —— 勾上 "Dock in layout"
+    // 时不该跳一下高度。
+    float m_contentDrawerH = 320.0f;
+    // "Dock in layout"：勾上 = 抽屉占布局（视口变矮）、点外部不关；
+    // 不勾 = 浮层、点外部即关。默认不勾（用户要求）。
+    bool m_contentDock = false;
+    // 拖拽抽屉上边缘用的活动标志（ImGui 的 InvisibleButton 已经帮我们
+    // 处理"按下/拖出/松开"，这里只记起始高度，避免累加漂移）。
+    bool m_contentDragging = false;
+    float m_contentDragStartH = 0.0f;
+    float m_contentDragStartY = 0.0f;
+    // 本帧鼠标是否落在抽屉 / 底栏上（点外部关闭要用）。
+    bool m_contentDrawerHovered = false;
+    bool m_bottomBarHovered = false;
+    // 上一帧抽屉里有没有弹层（右键菜单 / 排序菜单）。
+    // 用来把"关弹层的那一下点击"和"点面板外部"区分开 —— ImGui 在
+    // NewFrame 里就把弹层关掉了，帧末只能靠这个"上帧快照"判断。
+    bool m_contentPopupWasOpen = false;
 
     // ---- E21：通知 / 进度 ----
     std::unique_ptr<NotificationCenter> m_notifications;

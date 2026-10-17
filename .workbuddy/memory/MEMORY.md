@@ -92,6 +92,42 @@
   （imgui.cpp:5121）因**节点先提交**锁死 `HoveredId` → **图标收不到 hover/点击**。
 - ⚠ **偏好 `kPrefsVersion` ≠ 布局 `kFormatVersion`**：偏好**逐键覆盖** → **老存档会把新默认顶回** → 升版本
   让老档作废。
+- ⚠⚠ **布局范式（2026-10-17 改）**：**Content 不再是常驻分栏**，改成"从底栏往上弹的抽屉"。
+  左栏下半收成 0 → **Hierarchy 吃满整条左栏**；`syncPanelVisibility()` 里 **`kSlotContent` 恒 `false`**
+  （**保留 case 保持类型显式**，别删——删了会掉进 `default: return true`）。
+  底栏 `LayoutRects.bottom` = 状态栏上方 32px 通栏：`[📁]Content [📄]Output Log [⌨]CMD` + 右侧
+  `N entries | assets`；**播放条 UI 已整体移除**（`transport` 字段保留但恒 0×0，旧脚本还在读）。
+  抽屉默认**不 dock**（浮层，点外部即关）；`Dock in layout` 勾上后**真的占布局**（`bottomInset` 加高）。
+  **抽屉内容 = 三栏**：左目录树（根 `assets/`，点节点切目录）/ 中资源类型单选列 / 右"搜索+排序+网格"
+  （排序菜单是**勾选框语义但二选一**；目录永远排文件前；搜索历史只在回车时记）。
+  四个坑：① **`SplitLayout::setBottomInset(h)` 是"底栏 + 停靠抽屉"的总让位高度，≠ 底栏高度**
+  （拿它当底栏高度 → 底栏被撑成 352px）；`apply()` 不写 `out.bottom`，由 `computeLayout()` 显式写。
+  ② **`IsWindowHovered()` 默认不把"有 active item"算悬停** → 点按钮的松开帧返回 false →
+  判定成"点外部"、同帧把刚开的抽屉关掉（表现：按钮闪一下抽屉永远不出来）→ 必须加
+  `ImGuiHoveredFlags_AllowWhenBlockedByActiveItem`。③ **工作区预设会强制覆盖面板开关**
+  （`Workspace.cpp` 的 `kLevelOpen`/`kCharOpen`）→ 只改 `defaultOpen` 不够，**预设里也要删**。
+  ④⚠ **ImGui 绘制顺序 = `g.Windows` 顺序，且点中某窗口会把它挪到末尾** → "后画的在上层"
+  只在同帧成立（点视口 / 重开抽屉时抽屉会被盖）→ 每帧 `BringWindowToDisplayFront(抽屉)`
+  （imgui_internal，**有 popup 时不能提**）。**分隔条画在 ForegroundDrawList** → 必须用
+  `SplitLayout::setOccluder(抽屉矩形)` 把线切成 0~2 段，否则竖线直接画进抽屉里。
+  ⑤⚠ **popup 开着时 `IsWindowHovered(抽屉)` 是 false** → "点抽屉里别处"会连带把抽屉关掉；
+  判定要用**上一帧快照**（`m_contentPopupWasOpen`）—— ImGui 在 NewFrame 就关了弹层，
+  帧末查 `IsPopupOpen` 已经 false，抓不到。
+- ⚠⚠ **面板里"随选中状态出现/消失的一行"会让整棵树上下跳一行**（点行 → 选中 → 那行出现 →
+  树往下跳 → 鼠标已不在该行 → 再点变取消 → 又跳回），表面症状是"行尾图标点了没反应"
+  （`verify_hierarchy_status` A2/A3 的 `hover=0 active=0`）。`Path: (no selection)` 面包屑
+  整行删掉就是为这个 —— **别用 `Dummy` 占位糊过去**，那只是把抖动换成一条空白。
+- ⚠ **Hierarchy 列头必须手画，不能用 `Table`/`Columns`**：`Columns` 会在列结束前固定
+  `GetContentRegionAvail().x`，而这宽度还要给搜索框 `SetNextItemWidth(-1)` →
+  `m_typeColX` 每帧算一次存成员，给树内所有行共用（行在 `BeginChild` 内、列头在外，
+  各算各的**必差 8px 内边距、有滚动条差 14px**）。名字**宽度不够先丢 `[hidden]/[locked]`
+  后缀保名字**；截断走 `drawClippedText` 在 **UTF-8 字符边界**二分（`(b & 0xC0) != 0x80`
+  才是字符起点），按字节截会给中文留半个字形。
+- ⚠ **视口左上角模式条已删（2026-10-17 用户要求）**：Lit/Unl/Nrm… 与右上 Lighting 下拉
+  完全重复。视图模式只剩两个入口（Lighting 下拉 + `Shift+1..8`，日志 `VP-MODEBAR key=N`
+  仍在）。`VP-OVERLAY` 从此 **3 字段** `master/stats/navGizmo`；左上角为空 → 统计 HUD 的
+  `statsY` 不再需要往下避让。偏好键 `vp.overlay.modeBar` 一并删除（老存档残留无害：
+  `applyPrefs` 逐项按**本表**查键，表里没有的键根本不读）。
 
 ## 断言纪律（全文 → 归档）
 - ⚠ **必须 `MYVK_EDITOR_NO_HUD=1`** + `MYVK_GRID=0`；**采样区必须落在被测物体上**（俯角 8° 时"视口正中"
@@ -107,6 +143,12 @@
 - ⚠⚠ **GUI harness 两类抖动**：① **首帧布局竞态**（分栏根 `ratio=0`）→ 连起重试到 `VP-RECT` 收敛；
   ② **Win32 窗口级联**（不给位置每次右移 38px）→ **显式摆 (0,0) + 光标挪屏幕右下**。
 - ⚠ **sRGB 交换链二次编码** → 面板底**上屏实测**亮度 深色 85~132 / 浅色 225~245 → **像素判据阈值按实测定**。
+- ⚠⚠ **删功能 = 同时删掉它的锚点和"等它的等待"**，否则留下两类隐性垃圾：
+  ① **永真的空断言**（"某矩形不出现"在矩形永远不出现之后白送 PASS）→ 改成查**还活着**的
+  同义锚点（如总闸自己的 `VP-OVERLAY master=0`），并把"这东西不存在"归到一个**独占的**
+  反向用例里；② **永不到来的 `ready_needle` / `wait_count`** → 每个会话**白等满 timeout**
+  （`VP-RECT modebar=` 删模式条后让 `verify_viewport` 每次空转 25 秒）。删断言时**项数会变**
+  （本轮 `verify_viewport` 42 → 41），是正常的，不是漏跑。
 
 ## 工具（细节 → 归档「编辑器验证工具链」）
 - **`run_regression.py`**：读末尾 `结果: PASS`；**增量**。⚠ **新增 `verify_*.py` 必须进 `DEFAULT` + 补
@@ -122,7 +164,17 @@
 —— 后 5 项是**游戏运行时 G21~G25 的硬前置**。**基准 = "以 unity 或 blender 为准"。**
 
 **编辑器 ✅**：B（E04~E08）· **C 全部（E09~E17）** · E11.1 图标条 · D（E18/E19/E21）· E25 · 五点需求 +
-Inspector Render/Particles/Physics 页（10-16）· **打磨七连（10-17，见路线图 §13）**。
+Inspector Render/Particles/Physics 页（10-16）· **打磨七连（10-17，见路线图 §13）** +
+**底栏/Content 抽屉改造（10-17，`editor_roadmap.md` E06 段）**。
+⚠ **栅格俯视抖动已修（10-17，`grid.frag`，记在 `editor_roadmap.md` E14 段）**：根因不是采样相位，
+是 **1 m 格在 120 m 高空只占 ~4.3 px、线宽 1.4 px = 周期 4px 的高频图案**（量级：机位移 0.3m →
+`mean=24.49`、`n>18=221k`）；**TAA 无效**（平均成灰噪点）。修法 = LOD 阈值 `0.9/2.0 → 5.0/12.0`
++ 补 **100 m 超级格**（否则高空整族被收掉 → 地面全白）。复测 24.49 → **7.14**。
+⚠ 定抖动/噪声的**唯一可靠对照是"同机位两次启动"**（= 0.000000 才能排除确定性因素）。
+⚠⚠ **栅格"虚化/一片看不见"（10-17 晚）= 共面深度冲突，不是 LOD**：判据是"**地板盖住的像素没线、
+出了地板边界立刻有线**"。根因：只在**顶点**里做 `clip.z -= 1e-6*clip.w`，而四边形横跨 ±2000 m，
+4 km 跨度上的插值误差与 1e-6 同量级。修法：`grid.frag` 里用 `vWorld` 重算 `gl_FragDepth` 再减 **1e-5**，
+`grid.vert` 的偏移删掉。⚠ 别用"放大到 1e-3"敷衍（20 m 处等于抬高 4 m，物体穿模）。
 **E03 设置层级 ✅（10-17）**：`engine/render/RenderSettingsIO.*` = 5 层覆盖链
 （prefs→project→scene→object→camera，读时从最具体回退）+ `config/render.json` 落盘 + 无窗口自检
 （`MYVK_RENDER_SETTINGS_TEST=1`）。⚠ 两个坑：① **文件层与 env 层各要一个 applied 标记**，每阶段顺序
@@ -151,7 +203,18 @@ jointMatrices SSBO）—— **别再规划"转 GPU 蒙皮"**。
 岛级休眠）+ `RigidBodyComponent`/`PhysicsSettings` + 序列化；**仅 Play 态**；UI 在 Inspector→Physics；
 自检 `MYVK_PHYS_TEST=1`；回归 `verify_physics.py`。
 
-**自检现状**：特性 **34/34 有 UI 面**、裸 env 漏网 **0**；映射表 **54/62**、`DEFAULT` **62 例**。
+**编辑器 UI 收官（10-17 晚）**：视口工具条重做成**一行 18 控件 + 9 个下拉**
+（工具/坐标/四个吸附/视口看法，`ViewportPanel::drawToolbar`），新增 `GizmoMode::Select`；
+底栏 CMD 右侧 `+` **面板托盘**（`EditorApp::drawPanelPicker/trayButton`，直接遍历
+`panelTable()`，勾选→生带 logo 的按钮、叉号移除、右键最小化）。⚠ 三个容易再踩的：
+① `panelOpen`=勾选（落盘）与 `panelTrayHiddenRef`=窗口临时收起（`PanelRegistry`）**必须分开**，
+否则"点按钮"会把按钮自己弄没；② 浮动面板要每帧 `BringWindowToDisplayFront`，**否则被视口盖住**
+（视口一旦被点中就被 ImGui 提到 `g.Windows` 末尾）；③ ImGui 的 `OpenPopup` 无定位时弹层开在
+**鼠标位置**，会被 `SetNextWindowPos(..., Appearing)` 修正。新面板 `PhysicsPanel` / `ParticlesPanel`。
+回归 `verify_viewport_bar.py`（57 项）。⚠ **自动化里键盘输入必须 `PostMessage(WM_CHAR)`**，
+`keybd_event` 编辑器收不到（扫描码 0 → KEY_UNKNOWN）。
+
+**自检现状**：特性 **34/34 有 UI 面**、裸 env 漏网 **0**；映射表 **58/66**、`DEFAULT` **66 例**。
 ⚠ 裸 env 白名单：`MYVK_PHYS`/`MYVK_PHYS_TEST`/`MYVK_STARTUP_DELAY`/`MYVK_RENDER_SETTINGS(_TEST)`/
 `MYVK_RENDER_PREFS`（同 `MYVK_FRAMES`）、`ALLOW_SUFFIX` 加 `_DUMP`（同 `_DBG`）；
 `MYVK_RUNTIME`、`MYVK_FIXED_DT` 在 `ALLOW_EXACT`，`MYVK_RUNTIME_*` 按前缀放行。

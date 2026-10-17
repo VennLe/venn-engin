@@ -167,11 +167,15 @@ class Session:
         return mean_luma(img, r), path
 
     def bar_lumas(self):
-        """(顶栏 TB-BAR, 传输条 TR-BAR) 的平均亮度 —— 这两条原来都是硬编码
-        深灰，浅色主题下会留成"深色孤岛"，所以单独量一把当回归门。"""
+        """(顶栏 TB-BAR, 底栏 BAR-BOTTOM) 的平均亮度 —— 这两条原来都是硬编码
+        深灰，浅色主题下会留成"深色孤岛"，所以单独量一把当回归门。
+
+        2026-10-17：视口下方那条播放条（TR-BAR）已移除，换成状态栏上方的
+        通栏底栏（BAR-BOTTOM，同样是 tokens().barBg）—— 校验对象跟着换，
+        语义不变：**横贯全宽的一条 bar 必须跟着主题变**。"""
         img, _ = capture_client(self.hwnd)
         out = []
-        for tag in ("TB-BAR", "TR-BAR"):
+        for tag in ("TB-BAR", "BAR-BOTTOM"):
             r = self.tap.last_rect(tag)
             out.append(mean_luma(img, r) if r else -1.0)
         return out[0], out[1]

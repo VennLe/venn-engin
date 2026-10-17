@@ -152,7 +152,15 @@ void SplitLayout::syncPanelVisibility() {
         if (slot == kSlotNone) return false;
         switch (slot) {
             case kSlotHierarchy: return panelOpen(panelIndexOf("hierarchy"));
-            case kSlotContent:   return panelOpen(panelIndexOf("content"));
+            // ⚠ 2026-10-17：Content 不再是常驻分栏面板，改成了"从底栏往上
+            //   弹出的抽屉"（见 EditorApp::drawContentDrawer）。所以这里恒
+            //   false —— 左栏下半收成 0、Hierarchy 吃满整条左栏。抽屉打开
+            //   时的矩形由 EditorApp 直接写进 L.content，不经过分栏树。
+            //   保留 kSlotContent 这个分支（而不是删掉 case）是为了让
+            //   "content 确实还在分栏槽位体系里"这件事在类型上是显式的：
+            //   一条 case 恒 false 比"少一个 case 掉进 default: return true"
+            //   安全得多 —— 后者会让左栏下半留一块空。 
+            case kSlotContent:   return false;
             case kSlotViewport:  return panelOpen(panelIndexOf("viewport"));
             case kSlotInspector: return panelOpen(panelIndexOf("inspector"));
             default:             return true;
@@ -201,7 +209,7 @@ void SplitLayout::bodyRect(float displayW, float displayH, float& x, float& y,
     x = 0.0f;
     y = kMenuH + m_toolbarH;
     w = W;
-    h = std::max(H - y - kStatusH, 120.0f);
+    h = std::max(H - y - kStatusH - m_bottomInset, 120.0f);
 }
 
 void SplitLayout::apply(LayoutRects& out) {
@@ -211,7 +219,8 @@ void SplitLayout::apply(LayoutRects& out) {
     const float H = std::max(m_dispH, 240.0f);
     const float bodyY = kMenuH + m_toolbarH;
     const float statusH = kStatusH;
-    const float bodyH = std::max(H - bodyY - statusH, 120.0f);
+    const float bodyH =
+        std::max(H - bodyY - statusH - m_bottomInset, 120.0f);
 
     if (m_maximized != kSlotNone) {
         // 最大化：目标面板占满主体，其余三个收成 0。
@@ -230,6 +239,11 @@ void SplitLayout::apply(LayoutRects& out) {
     out.menu = {0.0f, 0.0f, W, kMenuH};
     out.toolbar = {0.0f, kMenuH, W, m_toolbarH};
     out.status = {0.0f, H - statusH, W, statusH};
+    // ⚠ out.bottom **不在这里写**：m_bottomInset 是"主体底部让出的总高度"
+    //   （底栏 + 停靠的抽屉），而底栏自己的矩形只是其中最下面 32px。
+    //   SplitLayout 不知道这个拆分比例 —— 由 EditorApp::computeLayout 写。
+    //   写错过一次：直接拿 m_bottomInset 当底栏高度，底栏被撑成 352px 高，
+    //   内容画在顶部 32px、下面 320px 全是空白。
 }
 
 void SplitLayout::resolve(int nodeIdx, float x, float y, float w, float h,
@@ -320,14 +334,112 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
         segB = ImVec2(x + w, by);
     }
 
-    // ---- 命中 / 拖拽：手动判断鼠标是否落在热区内 ----
+    // ------------------------------------------------------------
+    // 遮挡矩形裁切（浮层式 Content 抽屉，2026-10-17）
+    // ------------------------------------------------------------
+    // 这条线画在 ForegroundDrawList 上（压在所有面板之上），而抽屉是浮层、
+    // 不在分栏树里 —— 不裁的话，Hierarchy | Viewport 那条竖线会**穿过
+    // 抽屉内部**，看起来像"分割线渗透进了 Content 面板"。
+    // 裁切只对轴对齐线段做（分隔条本来就是横/竖），结果是 0~2 段：
+    //   · 整条落在遮挡矩形里 → 这一帧既不画也不接受命中
+    //   · 部分相交 → 只画露出来的那几段（抽屉贴底，通常就是上面那一段）
+    ImVec2 pieces[2][2];
+    int nPieces = 0;
+    {
+        const float x0 = std::min(segA.x, segB.x), x1 = std::max(segA.x, segB.x);
+        const float y0 = std::min(segA.y, segB.y), y1 = std::max(segA.y, segB.y);
+        if (!m_occlOn) {
+            pieces[0][0] = ImVec2(x0, y0);
+            pieces[0][1] = ImVec2(x1, y1);
+            nPieces = 1;
+        } else if (n.dir == SplitNode::Dir::Vertical) {
+            // 横线（上下分栏的界）：遮挡矩形在这一行上挖掉 x 区间
+            if (segA.y >= m_occlY0 && segA.y <= m_occlY1) {
+                const float gx0 = std::max(x0, m_occlX0);
+                const float gx1 = std::min(x1, m_occlX1);
+                if (gx0 < gx1) {
+                    if (gx0 - x0 > 0.5f) {
+                        pieces[nPieces][0] = ImVec2(x0, y0);
+                        pieces[nPieces][1] = ImVec2(gx0, y1);
+                        ++nPieces;
+                    }
+                    if (x1 - gx1 > 0.5f) {
+                        pieces[nPieces][0] = ImVec2(gx1, y0);
+                        pieces[nPieces][1] = ImVec2(x1, y1);
+                        ++nPieces;
+                    }
+                } else {
+                    pieces[0][0] = ImVec2(x0, y0);
+                    pieces[0][1] = ImVec2(x1, y1);
+                    nPieces = 1;
+                }
+            } else {
+                pieces[0][0] = ImVec2(x0, y0);
+                pieces[0][1] = ImVec2(x1, y1);
+                nPieces = 1;
+            }
+        } else {
+            // 竖线（左右分栏的界）：遮挡矩形在这一列上挖掉 y 区间
+            if (segA.x >= m_occlX0 && segA.x <= m_occlX1) {
+                const float gy0 = std::max(y0, m_occlY0);
+                const float gy1 = std::min(y1, m_occlY1);
+                if (gy0 < gy1) {
+                    if (gy0 - y0 > 0.5f) {
+                        pieces[nPieces][0] = ImVec2(x0, y0);
+                        pieces[nPieces][1] = ImVec2(x1, gy0);
+                        ++nPieces;
+                    }
+                    if (y1 - gy1 > 0.5f) {
+                        pieces[nPieces][0] = ImVec2(x0, gy1);
+                        pieces[nPieces][1] = ImVec2(x1, y1);
+                        ++nPieces;
+                    }
+                } else {
+                    pieces[0][0] = ImVec2(x0, y0);
+                    pieces[0][1] = ImVec2(x1, y1);
+                    nPieces = 1;
+                }
+            } else {
+                pieces[0][0] = ImVec2(x0, y0);
+                pieces[0][1] = ImVec2(x1, y1);
+                nPieces = 1;
+            }
+        }
+    }
+    if (nPieces == 0) {
+        // 整条都被抽屉盖住：不画、不记锚点、不参与命中。
+        // ⚠ 若这一条正好在被拖着，得顺手结束拖拽 —— 否则 m_dragNode 卡在
+        //   这里，鼠标松开也清不掉，之后再一点就会"线跟着鼠标跑"。
+        if (m_dragNode == nodeIdx) {
+            m_dragNode = -1;
+            m_hoverFrac = 0.0f;
+        }
+        return;
+    }
+    // ⚠ 锚点记**第一段**（露出来的那段）：拖拽脚本点的是锚点矩形的中心，
+    //   被裁之后中心仍然落在"这条线真实可见的位置"上，不用改脚本。
+    segA = pieces[0][0];
+    segB = pieces[0][1];
+
+    // ---- 命中 / 拖拽：手动判断鼠标是否落在**可见段**的热区内 ----
     const ImVec2 mouse = ImGui::GetIO().MousePos;
     const bool horizontal = (n.dir == SplitNode::Dir::Horizontal);
-    const float dist = horizontal ? std::abs(mouse.x - segA.x)
-                                  : std::abs(mouse.y - segA.y);
-    const float inRange =
-        horizontal ? (mouse.y >= y && mouse.y <= y + h)
-                   : (mouse.x >= x && mouse.x <= x + w);
+    const float lineCoord = horizontal ? bx : by;
+    const float dist = horizontal ? std::abs(mouse.x - lineCoord)
+                                  : std::abs(mouse.y - lineCoord);
+    // ⚠ 范围判定从"整个 body 跨度"改成"鼠标落在某一段可见段里"：
+    //   原来用 inRange = 整条跨度，抽屉盖上来的那截照样能拖分栏
+    //   （线和抽屉的把手只差几像素时最容易误触）。
+    bool inRange = false;
+    for (int i = 0; i < nPieces; ++i) {
+        const ImVec2 a = pieces[i][0];
+        const ImVec2 b = pieces[i][1];
+        if (horizontal) {
+            if (mouse.y >= a.y && mouse.y <= b.y) { inRange = true; break; }
+        } else {
+            if (mouse.x >= a.x && mouse.x <= b.x) { inRange = true; break; }
+        }
+    }
     const bool hovered = (dist <= kSplitterHit * 0.5f) && inRange &&
                          !ImGui::IsAnyItemHovered() && !m_splitHoverTaken;
     // 同一像素上可能**叠着两条**分隔条：某个节点被完全折到 0 / 1 时，它的
@@ -342,10 +454,13 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
     const bool dragging = (m_dragNode == nodeIdx);
 
     // ---- 绘制：画在最顶层，确保不被面板盖住（E06-1 三态配色）----
+    // 逐段画：被抽屉裁开后可能是两段（抽屉横跨整宽时一般只剩上面那段）。
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     const ImU32 col = dragging ? kSplitDrag : (hovered ? kSplitHover : kSplitIdle);
     const float thick = (dragging || hovered) ? 2.0f : 1.0f;
-    dl->AddLine(segA, segB, col, thick);
+    for (int i = 0; i < nPieces; ++i) {
+        dl->AddLine(pieces[i][0], pieces[i][1], col, thick);
+    }
 
     // 悬停时在两端各补一小段"抓手"，让"这里能拖"一眼可见
     if (hovered || dragging) {

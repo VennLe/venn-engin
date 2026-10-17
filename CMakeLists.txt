@@ -188,6 +188,12 @@ if(DEFINED VENN_ICON_RC)
         OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/venn.ico")
 endif()
 target_link_libraries(VennEditor PRIVATE VennEngine)
+if(WIN32)
+    # 导入资源用的系统"打开文件"对话框（GetOpenFileNameW）在 comdlg32 里。
+    # glfw/shell32 那几条是它隐式带进来的，comdlg32 没有 —— 不显式链接会
+    # 在链接期报 LNK2019: __imp_GetOpenFileNameW。
+    target_link_libraries(VennEditor PRIVATE comdlg32)
+endif()
 
 # ============================================================
 # 运行时（runtime/ → Game.exe）

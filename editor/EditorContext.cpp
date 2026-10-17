@@ -45,16 +45,22 @@ bool EditorContext::snapForCurrentMode() const {
     switch (m_gizmoMode) {
         case GizmoMode::Translate: return m_snapMove;
         case GizmoMode::Rotate: return m_snapRotate;
-        default: return m_snapScale;
+        case GizmoMode::Scale: return m_snapScale;
+        // 选择模式没有变换，吸附自然谈不上。返回 false 而不是"随便挑一套"：
+        // 工具条上那颗吸附指示器读的就是这里。
+        case GizmoMode::Select: return false;
     }
+    return false;
 }
 
 float EditorContext::snapStepForCurrentMode() const {
     switch (m_gizmoMode) {
         case GizmoMode::Translate: return m_snapMoveStep;
         case GizmoMode::Rotate: return m_snapRotateStep;
-        default: return m_snapScaleStep;
+        case GizmoMode::Scale: return m_snapScaleStep;
+        case GizmoMode::Select: return 0.0f;
     }
+    return 0.0f;
 }
 
 // 只翻转"当前模式"那一套 —— 工具栏上的快捷开关按 X 用的就是它
@@ -63,7 +69,9 @@ void EditorContext::toggleSnapForCurrentMode() {
     switch (m_gizmoMode) {
         case GizmoMode::Translate: m_snapMove = !m_snapMove; break;
         case GizmoMode::Rotate: m_snapRotate = !m_snapRotate; break;
-        default: m_snapScale = !m_snapScale; break;
+        case GizmoMode::Scale: m_snapScale = !m_snapScale; break;
+        // 选择模式下 X 什么也不做（没有可吸附的变换）
+        case GizmoMode::Select: break;
     }
 }
 

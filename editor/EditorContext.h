@@ -93,7 +93,23 @@ class AssetManager;
 namespace editor {
 
 // 手柄模式（W / E / R 切换，与主流编辑器一致）
-enum class GizmoMode : int { Translate = 0, Rotate = 1, Scale = 2 };
+//
+// 2026-10-17 晚：新增 Select（Q）。用户要求视口工具条按 UE5 的样子给
+// "选择 / 平移 / 旋转 / 缩放"四个工具，而"选择"不是一个手柄 —— 它
+// 恰好是**没有手柄**的状态：鼠标左键只做点选，选中物体上不出现三轴。
+// 把它做成枚举值而不是另一个 bool，是因为工具条是"四选一"的单选组：
+// 两个平行状态（"哪个手柄" + "要不要手柄"）会立刻出现"选择模式下手柄
+// 还亮着"这种自相矛盾的组合。
+//
+// ⚠ 所有 `switch (gizmoMode())` 都必须显式写上 Select —— 原来的
+//   `default:` 分支是当 Scale 用的，放任 Select 落进去会让"选择模式"
+//   画出一把缩放手柄（比没有更糟）。
+enum class GizmoMode : int {
+    Translate = 0,
+    Rotate = 1,
+    Scale = 2,
+    Select = 3,
+};
 // 手柄坐标系
 enum class GizmoSpace : int { World = 0, Local = 1 };
 // 播放状态机
@@ -119,8 +135,15 @@ struct Rect {
 struct LayoutRects {
     // transport = 视口正下方那一行播放条（Run / Play / Pause / Stop），
     // 高度从 viewport 里扣出来 —— 视口的 3D 画面在这行上方结束。
+    //
+    // ⚠ 2026-10-17 起 transport **不再绘制**（播放条的 UI 被移除，动画相关
+    //   入口暂时只留快捷键 / 菜单）。字段保留，值恒为 0×0：EditorLayoutIO
+    //   与几个回归脚本还在读它，删字段会让它们编译 / 解析失败。
+    //
+    // bottom = 状态栏正上方那条通栏（Content / 输出日志 / CMD 三个带图标的
+    // 按钮 + 资源条目统计）。高度恒为 kBottomBarH（见 EditorApp）。
     Rect menu, toolbar, hierarchy, content, inspector, viewport, status,
-         transport;
+         transport, bottom;
 };
 
 // 物理世界的**运行态只读快照**（R7-1）。
@@ -226,6 +249,21 @@ public:
     void addNavSensitivity(float delta) {
         m_navSensitivity = glm::clamp(m_navSensitivity + delta,
                                       kMinSensitivity, kMaxSensitivity);
+    }
+
+    // "基于距离的相机速度"（UE 的 Camera Speed scaled by distance）。
+    // 打开后 WASD 的飞行速度随"相机到注视点的距离"线性放大 —— 远景下
+    // 拖同样的鼠标不该只挪一厘米。
+    //
+    // **默认关**：打开它会改变同样一段按键走多远，这是行为变化，必须由
+    // 用户显式选。关着时算子恒为 1，飞行速度与改动前逐位一致。
+    bool navSpeedScalesWithDistance() const { return m_navSpeedByDistance; }
+    bool& navSpeedScaleRef() { return m_navSpeedByDistance; }
+    // 当前应乘的距离系数（1 = 不缩放）。夹在 [0.25, 8]，否则贴脸时飞不动、
+    // 远景时一按就冲出场景。
+    float navDistanceSpeedFactor(float distance) const {
+        if (!m_navSpeedByDistance) return 1.0f;
+        return glm::clamp(distance / 10.0f, 0.25f, 8.0f);
     }
 
     // 编辑态相机 = 显式输入（视口用 ImGui 驱动）+ 自由飞行（UE 视口手感）。
@@ -408,14 +446,16 @@ public:
     bool& showGridRef() { return m_showGrid; }
 
     // ---------------------------------------------------------- 视口浮层（E14）
-    // 视口里四角各一块浮层，**各自独立显隐**（右键视口空白处的 "Viewport
+    // 视口里两块浮层，**各自独立显隐**（右键视口空白处的 "Viewport
     // Display" 菜单切换），状态经 Settings 落盘（config/editor_prefs.json）。
     //
-    // 这样分的理由：四块信息的使用频率完全不同 —— 模式条常开、统计 HUD
-    // 只在调性能时看、相机信息在摆机位时看、导航球有个性偏好。绑成一个
-    // "HUD" 总开关时，用户被迫"要么全看要么全不看"。
+    // 这样分的理由：两块信息的使用频率完全不同 —— 统计 HUD 只在调性能时看、
+    // 导航球有个性偏好。绑成一个 "HUD" 总开关时，用户被迫"要么全看要么全不看"。
+    //
+    // ⚠ **左上角的"视图模式条"已删（2026-10-17 用户要求）**：Lit/Unl/Nrm/...
+    //   八个按钮和右上角 Lighting 下拉里的视图模式是同一组东西，摆两遍纯属
+    //   重复。视图模式现在只有两个入口：Lighting 下拉 + Shift+1..8。
     struct ViewportOverlay {
-        bool modeBar = true;    // 左上：视图模式条
         // 右上：统计 HUD。**默认关** —— 它每帧都在变（FPS / 帧时间），
         // 是视口里最"吵"的一块；要调性能时从右键 Viewport Display 打开即可，
         // 打开后还能用标题行折叠成一颗小胶囊（见 ViewportPanel::m_statsCollapsed）。
@@ -568,6 +608,12 @@ public:
     // 属于 EditorApp 的职责（和 quitRequested / relayout 一个套路）。
     bool& windowFullscreenRequest() { return m_windowFsRequest; }
 
+    // Content 工具栏里的 "Save All"：置位后由 EditorApp 处理。
+    // 为什么不让 ContentBrowser 自己存：场景路径、InputMap、以及"存完要清
+    // dirty"这三件事都在 EditorApp 手里；面板只认识文件名，复制一份保存
+    // 逻辑过去必然两边漂移。
+    bool& saveAllRequest() { return m_saveAllRequest; }
+
     // ---------------------------------------------------------- 界面设置
     // 字体缩放（全局，1.0 = 默认字号）。放在 EditorContext 里是为了让
     // Settings 弹窗、工具栏高度、分栏布局共用同一份状态。
@@ -623,6 +669,8 @@ private:
 
     bool m_gameFullscreen = false;
     float m_navSensitivity = 1.0f;
+    // 见 navSpeedScalesWithDistance()。默认关 = 行为与改动前完全一致。
+    bool m_navSpeedByDistance = false;
 
     // 选中项的两个参数版本（select / selectFromViewport 都转发到它）——
     // 只有它能改 m_selectionFromViewport，所以放在私有区。
@@ -719,6 +767,7 @@ private:
     bool m_dirty = false;
     bool m_quit = false;
     bool m_windowFsRequest = false;
+    bool m_saveAllRequest = false;
 
     // 界面设置（默认值：字体 1.0、工具栏高 48 —— 比旧的 40 更宽松）
     float m_fontScale = 1.0f;

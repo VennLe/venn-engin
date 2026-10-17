@@ -15,6 +15,12 @@ namespace {
 //   · 上限 24 个面板对编辑器来说绰绰有余，超了有 assert 兜底。
 bool g_open[kMaxPanels] = {};
 
+// "勾着但窗口被底栏按钮收起来了"（见 EditorApp::drawBottomBar 注释）。
+// 放在这里而不是 EditorApp 的成员里，是为了让**所有**打开面板的入口
+// （Window 菜单 / Alt+N / 命令面板 / 工作区切换）都能在 setPanelOpen 里
+// 顺手把它清掉 —— 否则会出现"面板勾着、按了 Alt+0 却没反应"。
+bool g_trayHidden[kMaxPanels] = {};
+
 // 状态是否已经按 defaultOpen 初始化过（首次访问时做一次）
 bool g_initialized = false;
 
@@ -70,6 +76,21 @@ bool panelOpen(int index) {
 void setPanelOpen(int index, bool open) {
     ensureInit();
     if (bool* p = panelOpenSlot(index)) *p = open;
+    // 任何"打开"动作都以可见为准：底栏按钮的收起状态在这里统一作废。
+    if (open) {
+        if (bool* h = panelTrayHiddenSlot(index)) *h = false;
+    }
+}
+
+bool* panelTrayHiddenSlot(int index) {
+    if (index < 0 || index >= panelCountImpl()) return nullptr;
+    return &g_trayHidden[index];
+}
+
+bool& panelTrayHiddenRef(int index) {
+    ensureInit();
+    if (bool* p = panelTrayHiddenSlot(index)) return *p;
+    return g_dummy;
 }
 
 void togglePanel(int index) {
@@ -126,6 +147,9 @@ void resetPanelStateToDefaults() {
     const PanelDesc* t = panelTable();
     const int n = panelCountImpl();
     for (int i = 0; i < n; ++i) g_open[i] = t[i].defaultOpen;
+    // 托盘"被按钮临时收起"也一并清掉：切换工作区 / 重置布局之后，
+    // 默认开着的面板必须真的看得见，不能还停在上一套布局的收起态里。
+    for (int i = 0; i < kMaxPanels; ++i) g_trayHidden[i] = false;
     g_initialized = true;
 }
 

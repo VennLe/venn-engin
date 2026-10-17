@@ -36,8 +36,6 @@ public:
 private:
     void drawNode(ecs::Entity e, int depth);
     void drawNodeContextMenu(ecs::Entity e);
-    // E12 顶部面包屑：选中实体的祖先链，可点击跳转
-    void drawBreadcrumb();
 
     // ---- E12 过滤升级：type: 前缀语法 + 保留祖先链 ----
     // nodeMatches = 本节点是否命中（文本或 type: 语法）；
@@ -51,6 +49,13 @@ private:
     EditorContext& m_ctx;
 
     char m_filter[64] = {0};
+
+    // ---- 列头（项目标签 / 类型）----------
+    // 类型列左边界与右边界（屏幕坐标）。每帧在 draw() 里算一次，所有行共用
+    // —— 行在树 child 之内、列头在 child 之外，两边各算各的必然差 8px 内边距
+    // （有滚动条时还差 14px）。见 .cpp 里列头那一段。
+    float m_typeColX = 0.0f;
+    float m_typeColRight = 0.0f;
 
     // 重命名
     ecs::Entity m_renameTarget{};

@@ -97,6 +97,20 @@ def wait_rect_of(tap, tag, timeout=8.0):
     return None
 
 
+# 列头锚点（2026-10-17 新增的两列表头）：`HIER-COLHDR=(x0,y0)-(x1,y1) typeX=<x>`
+COLHDR_RE = re.compile(r"HIER-COLHDR=" + RECT_ANY_RE[1:] +
+                       r" typeX=(-?[\d.]+)")
+
+
+def colhdr_of(lines):
+    """最近一条列头日志 → (x0, y0, x1, y1, typeX)。"""
+    for line in reversed(lines):
+        m = COLHDR_RE.search(line)
+        if m:
+            return tuple(float(m.group(i)) for i in range(1, 6))
+    return None
+
+
 def warm_pixels(img, box):
     """box=(x0,y0,x1,y1) 内"暖色"像素个数（橙/红图标线的证据）。"""
     x0, y0, x1, y1 = [int(round(v)) for v in box]
@@ -252,6 +266,18 @@ def main():
               eye is not None and inside(lock, row) and inside(eye, row) and
               eye[2] <= lock[0] + 1,
               "lock=%s eye=%s row=%s" % (lock, eye, row))
+
+        # ---- A0：列头（项目标签 / 类型）2026-10-17 新增 ----
+        with tap.lock:
+            hdr = colhdr_of(list(tap.lines))
+        check("A0 列头画在第一行上方（不覆盖列表）",
+              hdr is not None and hdr[3] <= row[1] + 1,
+              "hdr=%s row0=%s" % (hdr, row))
+        check("A0b 类型列左边界落在行内、且在行尾 👁 左边（不压图标）",
+              hdr is not None and eye is not None and
+              row[0] < hdr[4] < eye[0],
+              "typeX=%s eye.x=%s" % (hdr[4] if hdr else None,
+                                     eye[0] if eye else None))
 
         toggle_probe(hwnd, tap, lock, "A2", "lock",
                      ("hier_lock_before.png", "hier_lock_after.png",

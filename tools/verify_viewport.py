@@ -2,8 +2,10 @@
 
 交付物（见 editor/ViewportPanel.cpp 的 "E14 浮层" 一段）：
 
-  · 浮层分工：左上 = 视图模式条 / 右上 = 统计 HUD（**默认折叠隐藏**，
-              可点开）/ 右下 = 导航 gizmo。
+  · 浮层分工：右上 = 统计 HUD（**默认折叠隐藏**，可点开）/ 右下 = 导航 gizmo。
+              左上角的"视图模式条"（Lit/Unl/Nrm/... 八个按钮）**已删**
+              （2026-10-17 用户要求：和右上角 Lighting 下拉里的模式是同一组
+              东西，重复占地方）。视图模式切换只剩 Lighting 下拉 + Shift+1..8。
               左下角**曾经**是相机浮层（pos·look·FOV·Sens·Grid + 9 个书签）；
               2026-10-16 按用户要求**并入 Inspector → World → Camera**
               （两处编辑同一个相机对象本来就是重复），所以视口里不再有它。
@@ -18,12 +20,12 @@
 
 断言分组：
 
-  V0 UI 存在性    VP-MODEBAR modes=8 current=lit；modebar 矩形日志在；
-                  NAV-BALL+X 出现（导航 gizmo 在画）；
-                  **默认状态** VP-OVERLAY master=1 modeBar=1 stats=0 navGizmo=1
+  V0 UI 存在性    **左上角没有模式条**（VP-RECT modebar / VP-MODEBAR modes=
+                  都不该出现）；NAV-BALL+X 出现（导航 gizmo 在画）；
+                  **默认状态** VP-OVERLAY master=1 stats=0 navGizmo=1
                   （stats 默认关是 2026-10-16 的既定行为，不是回归）。
   V1 NO_HUD 确定性 同参数两次抓图，**整窗**（15 个面板 + 视口）逐像素一致。
-  V2 全关 == NO_HUD 三个浮层开关全关（走偏好文件）→ 视口内部与 NO_HUD
+  V2 全关 == NO_HUD 两个浮层开关全关（走偏好文件）→ 视口内部与 NO_HUD
                   逐像素一致。**这条是 E14 的核心不变量**：总闸之外的三块
                   开关必须把各自的绘制完全关掉，一块都不许漏。
                   （只比视口内部：总闸关 vs 开会让工具栏的 HUD 勾选框
@@ -51,19 +53,21 @@
                   "参考"，从此只能验"它还是它自己"。结构断言不需要重采 ——
                   "面板边界在哪"是人能一眼判断对错的东西，±8px 也足够严。
   V3b 天空/色调   参考图与本轮在**天空区域**（视口上方一块固定矩形，
-                  `SKY_BOX`）的三通道均值差 < 1.0 —— 曝光 / tonemap / IBL
+                  `SKY_DY` / `SKY_X`）的三通道均值差 < 1.0 —— 曝光 / tonemap / IBL
                   没有被误改。（实测 0.12~0.19，阈值留了约 5 倍余量。）
   V4 模式条快捷键 Shift+2 → unlit、Shift+5 → wireframe、Shift+1 → 回 lit。
   V5 书签往返     Ctrl+Shift+1 存槽 1 → 按 3（右视图，改朝角）→ Ctrl+Shift+2
                   存槽 2 → 断言两槽不同（证明按下 3 真的改了相机）→
                   Alt+Shift+1 跳槽 1 → 断言 yaw/pitch 与槽 1 存时一致。
   V6 Display 菜单 右键视口空白处 → VP-DISPLAY-WIN（菜单开了）→ 点
-                  "View mode bar" → VP-OVERLAY modeBar=0 且 navGizmo 仍是 1、
-                  stats 仍是它本来的默认 0 → 点 "Show all overlays" → 三块全 1。
-  V7 偏好落盘往返 正常窗口里把 modeBar 关掉、stats 打开，优雅关窗（onShutdown
-                  落盘）→ 偏好 JSON 里 vp.overlay.modeBar==0 / stats==1 且
+                  "Navigation gizmo" → VP-OVERLAY navGizmo=0 且 stats 仍是它
+                  本来的默认 0 → 点 "Show all overlays" → 两块全 1。
+  V7 偏好落盘往返 正常窗口里把 navGizmo 关掉、stats 打开，优雅关窗（onShutdown
+                  落盘）→ 偏好 JSON 里 vp.overlay.navGizmo==0 / stats==1 且
                   vp.stat.* 齐全 → 第二程带着这份偏好启动 → VP-OVERLAY 生效、
                   两块各自按存下来的值画或不画。
+                  ⚠ 另断言 `vp.overlay.modeBar` **不再落盘**（模式条删掉之后
+                    这个键就不该再写出来，否则是"删了一半"）。
                   （特意做成一关一开：落盘的是**值**而不是"关过"这件事，
                     a 一个方向往返证明不了这一点。）
   V8 零验证层错误 全部会话无 VUID / VALIDATION / ERROR。
@@ -153,9 +157,18 @@ VP_INNER = (330, 200, 1200, 750)
 # V3：面板垂直分隔线的位置容差。实测同一份二进制在不同分栏比例下会差 3~5px
 # （面板最小宽度随内容变），8px 既容得下这个，又能抓住"真的动过布局"。
 SKEL_TOL = 8
-# V3b：取视口**上方**一块固定矩形（一定落在天空里，见文件头）；坐标系同样是
-# 窗口客户区。
-SKY_BOX = (195, 240, 600, 900)
+# V3b：天空采样框 —— **相对视口上沿**，不是绝对屏幕坐标。
+#
+# 为什么改（2026-10-17 晚）：视口工具条从"两行按钮"并成"一行图标 + 下拉"，
+# 3D 图像的上沿从 y=184 抬到 y=145。原来写死的绝对框 (195,240) 换算成"距
+# 视口上沿的深度"就从 11px 变成了 50px —— 落进天空竖直渐变更亮的一段，
+# 三通道均值差了 1.1（阈值 1.0），看着像"曝光被改了"，其实渲染一个像素都
+# 没动。改成"距上沿 11~56px"之后，同一段天空重新对上：实测差 0.10。
+#
+# 基线（tools/vp_nohud_baseline.png）是 E14 时期抓的，那时视口上沿 = 184。
+BASE_VP_TOP = 184
+SKY_DY = (11, 56)      # 相对视口上沿的深度区间
+SKY_X = (600, 900)     # 横向也避开左右两栏，纯天空
 SKY_TOL = 1.0
 
 WM_KEYDOWN = 0x0100
@@ -217,15 +230,16 @@ def last_match(lines, rx):
 
 
 OVERLAY_RE = re.compile(
-    r"VP-OVERLAY master=(\d) modeBar=(\d) stats=(\d) navGizmo=(\d)")
+    r"VP-OVERLAY master=(\d) stats=(\d) navGizmo=(\d)")
 
 # 日志里 VP-OVERLAY 的键顺序（与 ViewportPanel::draw 第 6 步的格式串一致）。
-# ⚠ 2026-10-16 起**没有 camera** 这一项了：相机浮层已并入 Inspector。
-OVERLAY_KEYS = ["master", "modeBar", "stats", "navGizmo"]
+# ⚠ 2026-10-16 起**没有 camera**（相机浮层并入 Inspector）；
+#   2026-10-17 起**没有 modeBar**（左上视图模式条删掉，功能并入 Lighting 菜单）。
+OVERLAY_KEYS = ["master", "stats", "navGizmo"]
 
 
 def overlay_state(tap):
-    """最近一条 VP-OVERLAY 的状态（总闸 + 三个浮层开关）。
+    """最近一条 VP-OVERLAY 的状态（总闸 + 两个浮层开关）。
 
     这一行**只在状态变化时**打（ViewportPanel::draw 第 6 步）—— 显隐不能靠
     "矩形日志还在不在打"来判断：`logRect` 对同一矩形只打一条，不是逐帧刷的。
@@ -361,7 +375,7 @@ def park_cursor():
 
 
 def launch(exe, env_extra, actions=None, shot=None, window=(WIN_W, WIN_H),
-           settle=3.0, ready_needle="VP-RECT modebar=", ready_n=1):
+           settle=3.0, ready_needle="VP-OVERLAY master=", ready_n=1):
     """起一轮编辑器 → 摆窗口 → 等就绪 → （可选）跑动作 → 抓图 → 收尾。
 
     ⚠ 窗口在 onInit **之前**就建好了（GLFW create window 是初始化第一步），
@@ -458,7 +472,10 @@ def launch(exe, env_extra, actions=None, shot=None, window=(WIN_W, WIN_H),
 #   反而被淹掉。V2c 就是因此从 PASS 翻成 130564px 差异的（**不是浮层的问题**）。
 #
 #   对策：要逐像素比的会话一律用 `launch_converged`，等到几何收敛再抓图。
-CONVERGED_VP = (310, 184, 1238, 776)
+# 2026-10-17 晚更新：视口工具条并成一行 → 3D 图像上沿 184 → 145。
+# 连起 3 次实测稳定在 (305,145,1241,778)（骨架 [6,294,1250,1571]），
+# 旧的 (310,184,1238,776) 是两行工具条时代的几何。
+CONVERGED_VP = (305, 145, 1241, 778)
 LAYOUT_TRIES = 4
 
 
@@ -507,7 +524,11 @@ def launch_and_close_gracefully(exe, env_extra, actions=None, timeout=25.0):
         time.sleep(1.0)
         user32.SetWindowPos(hwnd, 0, 0, 0, WIN_W, WIN_H, 0x0002 | 0x0004)
         time.sleep(3.0)
-        wait_count(tap, "VP-RECT modebar=", 2, timeout=25.0)
+        # 冷启动等到视口矩形第一次上报（= 视口画完第一帧、尺寸已定）。
+        # 原来这里等的是 "VP-RECT modebar=" —— 左上角模式条删掉（2026-10-17）
+        # 之后那条日志**永不再出现**，于是每个会话都白等满 25 秒才往下走。
+        # 换成视口自身的 `VP-RECT=`（注意：`VP-RECT stats=` 不含这个子串）。
+        wait_count(tap, "VP-RECT=", 1, timeout=25.0)
         time.sleep(0.8)
         if actions:
             actions(tap, hwnd)
@@ -559,7 +580,9 @@ def panel_skeleton(img, y0=100, y1=780):
     colstd = lum.std(axis=0)
     colmean = lum.mean(axis=0)
     cand = []
-    for x in range(2, len(colstd) - 2):
+    # 从 10 开始：x≈0 是窗口边框（一整列 130 vs 面板内 93），在阈值边缘反复
+    # 横跳（实测 6.1 判否 / 6.2 判是），它不是"面板分隔线"，一律不看。
+    for x in range(10, len(colstd) - 2):
         if colstd[x] >= 2.0:
             continue
         left = colmean[max(0, x - 6):x - 1].mean()
@@ -674,21 +697,25 @@ def main():
     errs_all["快捷键/书签"] = s.errs
     lines = s.lines
 
-    check("V0a 模式条 8 格（VP-MODEBAR modes=8 current=lit）",
-          s.tap.has_line("VP-MODEBAR modes=8 current=lit"),
-          "缺 VP-MODEBAR modes=8 current=lit")
-    check("V0b VP-RECT modebar 矩形日志在（浮层在画）",
-          s.tap.last_rect("VP-RECT modebar") is not None)
+    # 视图模式条（左上 Lit/Unl/Nrm/... 八个按钮）2026-10-17 按用户要求删掉 ——
+    # 判据**反过来**：它不该再留下任何痕迹。查两条：矩形日志（只要画过就会有）
+    # 与那条一次性的 "modes=8 current=..." 统计日志。
+    check("V0a 左上角没有视图模式条（VP-RECT modebar / modes=8 都不出现）",
+          s.tap.last_rect("VP-RECT modebar") is None and
+          not s.tap.has_line("VP-MODEBAR modes="),
+          "模式条已删，不该再有矩形/统计日志")
+    check("V0b 键盘切视图模式仍可用（Shift+2 的日志在）",
+          s.tap.has_line("VP-MODEBAR key=2 mode=unlit"))
     check("V0c 导航 gizmo 在画（NAV-BALL+X）",
           s.tap.last_rect("NAV-BALL+X") is not None)
     # 默认状态：stats **默认关**（2026-10-16 用户要求"右上角数据面板默认可折叠
     # 隐藏"，折叠态默认就是看不到）。所以这里断言的是"默认长什么样"，而不是
     # "四块都在" —— 后者现在是**错的期望**。
     ov_default = overlay_state(s.tap)
-    check("V0d 默认 VP-OVERLAY：master/modeBar/navGizmo 开、stats 关",
+    check("V0d 默认 VP-OVERLAY：master/navGizmo 开、stats 关",
           ov_default is not None and ov_default["master"] == 1 and
-          ov_default["modeBar"] == 1 and ov_default["stats"] == 0 and
-          ov_default["navGizmo"] == 1, f"{ov_default}")
+          ov_default["stats"] == 0 and ov_default["navGizmo"] == 1,
+          f"{ov_default}")
     check("V0e stats 默认关 → VP-RECT stats 不该出现",
           not s.tap.has_line("VP-RECT stats="))
 
@@ -701,8 +728,8 @@ def main():
     check("V4d Shift+1 → 回 lit",
           s.tap.has_line("VP-MODEBAR key=1 mode=lit"))
     ov0 = overlay_state(s.tap)
-    check("V4e 启动时浮层状态 = 默认（modeBar/navGizmo 开、stats 关）",
-          ov0 is not None and ov0["master"] == 1 and ov0["modeBar"] == 1 and
+    check("V4e 启动时浮层状态 = 默认（navGizmo 开、stats 关）",
+          ov0 is not None and ov0["master"] == 1 and
           ov0["navGizmo"] == 1 and ov0["stats"] == 0,
           f"{ov0}")
 
@@ -741,8 +768,10 @@ def main():
                           ready_needle=None, settle=4.0)
     errs_all["NO_HUD A"] = s1.errs
     errs_all["NO_HUD B"] = s2.errs
-    check("V1a NO_HUD 会话确实没画浮层（无 VP-RECT modebar）",
-          not s1.tap.has_line("VP-RECT modebar="))
+    # NO_HUD = 总闸关。判据用总闸自己那条日志（VP-OVERLAY master=0）——
+    # 原来靠"没有 modebar 矩形"，模式条删掉之后那条就成了**永远成立的空断言**。
+    check("V1a NO_HUD 会话总闸是关的（VP-OVERLAY master=0）",
+          s1.tap.has_line("VP-OVERLAY master=0"))
 
     if s1.img is not None and s2.img is not None:
         # 整窗比对：15 个面板 + 视口一起比，比"只裁视口"更强，而且**不依赖
@@ -770,10 +799,19 @@ def main():
               f"参考 {sk_ref} / 本轮 {sk_cur}"
               + (f" / 最大差 {worst}px" if ok_len else " / 条数不同"))
         # ---- V3b：天空 / 色调没被误改（曝光与 tonemap 的守卫）----
-        if (base.size == s1.img.size and SKY_BOX[1] <= H
-                and SKY_BOX[3] <= W):
-            m_ref = region_mean(base, SKY_BOX)
-            m_cur = region_mean(s1.img, SKY_BOX)
+        #
+        # 两边各用**自己**视口的相对深度：基线那张的视口上沿是 BASE_VP_TOP，
+        # 本轮用日志里的 VP-RECT（拿不到就退回 CONVERGED_VP）。这样"工具条
+        # 变高变矮"不会把采样点挪到天空渐变别的段落上（见 SKY_DY 处注释）。
+        vp_top = s1.vp_rect[1] if s1.vp_rect else CONVERGED_VP[1]
+        box_ref = (BASE_VP_TOP + SKY_DY[0], BASE_VP_TOP + SKY_DY[1],
+                   SKY_X[0], SKY_X[1])
+        box_cur = (vp_top + SKY_DY[0], vp_top + SKY_DY[1],
+                   SKY_X[0], SKY_X[1])
+        if (base.size == s1.img.size and box_cur[1] <= H
+                and box_cur[3] <= W):
+            m_ref = region_mean(base, box_ref)
+            m_cur = region_mean(s1.img, box_cur)
             dmax = float(abs(m_ref - m_cur).max())
             check("V3b 天空/色调逐位不变（三通道均值差 < %.1f）" % SKY_TOL,
                   dmax < SKY_TOL,
@@ -800,8 +838,7 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         p_all_off = os.path.join(td, "all_off.json")
         write_prefs(p_all_off, {
-            "vp.overlay.modeBar": 0, "vp.overlay.stats": 0,
-            "vp.overlay.navGizmo": 0})
+            "vp.overlay.stats": 0, "vp.overlay.navGizmo": 0})
         # 只覆盖偏好（那份"三开关全关"），布局仍钉在不存在处（= 出厂默认），
         # 否则这一程的面板边界会和 s1（NO_HUD）不一样 → 视口内部裁的就不是
         # 同一块像素了。
@@ -811,23 +848,25 @@ def main():
                               ready_needle=None, settle=4.0)
         errs_all["全浮层关"] = s3.errs
         st3 = overlay_state(s3.tap)
-        check("V2a 三个开关都是 0（VP-OVERLAY），总闸仍开",
+        check("V2a 两个开关都是 0（VP-OVERLAY），总闸仍开",
               st3 is not None and st3["master"] == 1 and
-              all(st3[k] == 0 for k in ("modeBar", "stats", "navGizmo")),
+              all(st3[k] == 0 for k in ("stats", "navGizmo")),
               f"{st3}")
-        for tag in ("VP-RECT modebar", "VP-RECT stats"):
-            check(f"V2b 关掉后 {tag} 不再出现",
-                  not s3.tap.has_line(tag + "="))
+        # 只断言**还活着**的那一个。`VP-RECT modebar` 原来也在这一列里，
+        # 模式条删掉之后它成了"永远成立"的空断言 —— 与其留着凑数，不如删掉：
+        # 真正证明"模式条不存在"的是 V0a（它同时查矩形和 VP-MODEBAR modes=）。
+        check("V2b 关掉后 VP-RECT stats 不再出现",
+              not s3.tap.has_line("VP-RECT stats="))
         check("V2b 关掉后 NAV-BALL 不再出现",
               not s3.tap.has_line("NAV-BALL+X"))
         if s3.img is not None and s1.img is not None:
             # 只比视口内部：整窗比对会带上工具栏那个 HUD 勾选框的高亮差
             # （总闸关 vs 总闸开，1560 像素，与浮层无关）。
             d = diff_stats(crop(s3.img, VP_INNER), crop(s1.img, VP_INNER))
-            check("V2c 三浮层全关 == NO_HUD（视口内部逐像素）",
+            check("V2c 两浮层全关 == NO_HUD（视口内部逐像素）",
                   d is not None and d["pixels"] == 0, f"{d}")
         else:
-            check("V2c 三浮层全关 == NO_HUD（视口内部逐像素）", False,
+            check("V2c 两浮层全关 == NO_HUD（视口内部逐像素）", False,
                   "截图缺失")
 
     # ============================================================ V6
@@ -851,37 +890,40 @@ def main():
         r_all = tap.last_rect("VP-DISPLAY-ITEM all")
         # ⚠ 相机浮层的复选项已随浮层一起删掉（见文件头），菜单里没有
         #   "VP-DISPLAY-ITEM camera" 了 —— 不要再断言它。
-        v6["items"] = all(r is not None for r in (r_mb, r_st, r_gz, r_all))
+        # ⚠ 视图模式条的复选项 2026-10-17 也删掉了（模式条本身不存在了）：
+        #   菜单里必须**没有** modeBar 这一项，所以这里断言它 == None。
+        v6["modebar_item"] = r_mb is None
+        v6["items"] = all(r is not None for r in (r_st, r_gz, r_all))
         if not (v6["menu"] and v6["items"]):
             return
 
-        click_rect(hwnd, r_mb)               # 关掉 View mode bar
+        click_rect(hwnd, r_gz)               # 关掉导航 gizmo（默认是开的）
         v6["after_off"] = wait_overlay(
-            tap, lambda st: st["modeBar"] == 0, timeout=4.0)
+            tap, lambda st: st["navGizmo"] == 0, timeout=4.0)
         click_rect(hwnd, r_all)              # Show all overlays
         v6["after_all"] = wait_overlay(
-            tap, lambda st: all(st[k] == 1
-                                for k in ("modeBar", "stats", "navGizmo")),
+            tap, lambda st: all(st[k] == 1 for k in ("stats", "navGizmo")),
             timeout=4.0)
 
     s4 = launch(exe, pinned_env(pin_dir), actions=act_display_menu,
                 shot=os.path.join(OUT_DIR, "vp_display_menu.png"),
-                ready_needle="VP-RECT modebar=")
+                ready_needle="VP-OVERLAY master=")
     errs_all["Display 菜单"] = s4.errs
 
     check("V6a 右键视口空白处弹出 Viewport Display 菜单", v6.get("menu"))
-    check("V6b 菜单里三块浮层开关 + Show all 的矩形都打出来了",
+    check("V6b 菜单里两块浮层开关 + Show all 的矩形都打出来了",
           v6.get("items"))
+    check("V6b2 菜单里已经没有 View mode bar 这一项（随模式条一起删）",
+          v6.get("modebar_item") is True)
     off_st = v6.get("after_off")
-    check("V6c 点掉 View mode bar → VP-OVERLAY modeBar=0",
-          off_st is not None and off_st["modeBar"] == 0, f"{off_st}")
-    check("V6d 只关了这一块：navGizmo 仍是 1、stats 保持它的默认 0",
-          off_st is not None and off_st["navGizmo"] == 1 and
-          off_st["stats"] == 0, f"{off_st}")
+    check("V6c 点掉 Navigation gizmo → VP-OVERLAY navGizmo=0",
+          off_st is not None and off_st["navGizmo"] == 0, f"{off_st}")
+    check("V6d 只关了这一块：stats 保持它的默认 0",
+          off_st is not None and off_st["stats"] == 0, f"{off_st}")
     all_st = v6.get("after_all")
-    check("V6e Show all overlays → 三块全回来（stats 也被打开）",
+    check("V6e Show all overlays → 两块全回来（stats 也被打开）",
           all_st is not None and
-          all(all_st[k] == 1 for k in ("modeBar", "stats", "navGizmo")),
+          all(all_st[k] == 1 for k in ("stats", "navGizmo")),
           f"{all_st}")
 
     # ============================================================ V7
@@ -907,10 +949,10 @@ def main():
             right_click_client(hwnd, cx, cy)
             if not tap.last_rect("VP-DISPLAY-WIN"):
                 return
-            # 一关一开：modeBar 1→0、stats 0→1（stats 的默认值就是 0，
-            # 见 V0d）。这样落盘的两个值都**不等于默认**，第二程才能证明
-            # "存下来的是值本身"，而不是"瞎猫碰上默认值"。
-            for item in ("VP-DISPLAY-ITEM modeBar", "VP-DISPLAY-ITEM stats"):
+            # 一关一开：navGizmo 1→0、stats 0→1（两者的默认值见 V0d）。
+            # 这样落盘的两个值都**不等于默认**，第二程才能证明"存下来的是
+            # 值本身"，而不是"瞎猫碰上默认值"。
+            for item in ("VP-DISPLAY-ITEM navGizmo", "VP-DISPLAY-ITEM stats"):
                 r = tap.last_rect(item)
                 if r:
                     click_rect(hwnd, r)
@@ -931,14 +973,21 @@ def main():
             prefs = {}
             if os.path.exists(prefs_path):
                 prefs = read_prefs(prefs_path)
-            check("V7d vp.overlay.modeBar 落盘为 0（点了一下关掉）",
-                  prefs.get("vp.overlay.modeBar") == 0,
+            # 模式条删掉之后，这个键**不该再被写出来**（写了就是"删了一半"：
+            # 界面上没有开关，盘里还留着一条永远改不动的值）。
+            check("V7d vp.overlay.modeBar 不再落盘（模式条已删）",
+                  "vp.overlay.modeBar" not in prefs,
                   f"modeBar={prefs.get('vp.overlay.modeBar')}")
+            check("V7d2 vp.overlay.navGizmo 落盘为 0（点了一下关掉）",
+                  prefs.get("vp.overlay.navGizmo") == 0,
+                  f"navGizmo={prefs.get('vp.overlay.navGizmo')}")
             check("V7e vp.overlay.stats 落盘为 1（点了一下打开）",
                   prefs.get("vp.overlay.stats") == 1,
                   f"stats={prefs.get('vp.overlay.stats')}")
-            check("V7f vp.overlay.navGizmo 保持 1（没被误关）",
-                  prefs.get("vp.overlay.navGizmo") == 1,
+            check("V7f vp.overlay.stats / navGizmo 互不影响（值各自独立）",
+                  prefs.get("vp.overlay.stats") == 1 and
+                  prefs.get("vp.overlay.navGizmo") == 0,
+                  f"stats={prefs.get('vp.overlay.stats')} "
                   f"navGizmo={prefs.get('vp.overlay.navGizmo')}")
             stats_keys = [k for k in prefs if k.startswith("vp.stat.")]
             check("V7g 10 条 vp.stat.* 行开关都在盘里",
@@ -950,19 +999,17 @@ def main():
                 s5 = launch(exe, pinned_env(td, {
                                   "MYVK_EDITOR_PREFS_PATH": prefs_path}),
                             shot=os.path.join(OUT_DIR, "vp_prefs_reload.png"),
-                            ready_needle="VP-RECT modebar=")
+                            ready_needle="VP-OVERLAY master=")
                 errs_all["偏好读回"] = s5.errs
                 check("V7h 第二程读回了偏好（日志有 'Editor prefs: loaded'）",
                       s5.tap.has_line("Editor prefs: loaded"))
                 st5 = overlay_state(s5.tap)
-                check("V7i 第二程 VP-OVERLAY：modeBar 关、stats/navGizmo 开",
+                check("V7i 第二程 VP-OVERLAY：navGizmo 关、stats 开",
                       st5 is not None and st5["master"] == 1 and
-                      st5["modeBar"] == 0 and st5["stats"] == 1 and
-                      st5["navGizmo"] == 1, f"{st5}")
+                      st5["stats"] == 1 and st5["navGizmo"] == 0, f"{st5}")
                 check("V7j 第二程：关掉的不画、打开的画",
-                      not s5.tap.has_line("VP-RECT modebar=") and
                       s5.tap.has_line("VP-RECT stats=") and
-                      s5.tap.last_rect("NAV-BALL+X") is not None)
+                      s5.tap.last_rect("NAV-BALL+X") is None)
             else:
                 check("V7h/i 第二程读回", False, "偏好文件没写出来")
         finally:

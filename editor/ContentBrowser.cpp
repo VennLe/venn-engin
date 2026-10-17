@@ -25,6 +25,18 @@
 #include <functional>
 #include <string>
 #include <system_error>
+#include <vector>
+
+// 导入资源要用系统的"打开文件"对话框。
+// ⚠ 为什么要 `win32` 这一层而不是自己写一个 ImGui 文件浏览器：用户明确
+//   要的是"本地资源管理器"—— 那意味着要能用窗口左侧的快速访问、网络位置、
+//   搜索框、预览。自己做的简易浏览器一条都比不了，而且没有"最近的文件夹"。
+// ⚠ NOMINMAX 已经在 CMake 里全局定义（windows.h 的 min/max 宏会和
+//   std::max 打架），这里不用重复。
+#ifdef _WIN32
+#include <windows.h>
+#include <commdlg.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -323,6 +335,116 @@ void paintListMode(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
     }
 }
 
+// 排序图标：三根递减的横条 + 右侧一个向下箭头（"排序"的通用图形）。
+// 三条横线从左到右变短 = "按长度排"，箭头 = 方向。
+void paintSortIcon(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
+    const float cx = (a.x + b.x) * 0.5f;
+    const float cy = (a.y + b.y) * 0.5f;
+    const float left = cx - 7.0f;
+    const float lens[3] = {9.0f, 6.5f, 4.0f};
+    for (int i = 0; i < 3; ++i) {
+        const float y = cy - 4.6f + i * 4.0f;
+        dl->AddLine(ImVec2(left, y), ImVec2(left + lens[i], y), c, 1.6f);
+    }
+    const float ax = cx + 3.6f;
+    dl->AddLine(ImVec2(ax, cy - 5.2f), ImVec2(ax, cy + 4.0f), c, 1.6f);
+    dl->AddTriangleFilled(ImVec2(ax - 2.6f, cy + 3.2f),
+                          ImVec2(ax + 2.6f, cy + 3.2f),
+                          ImVec2(ax, cy + 6.6f), c);
+}
+
+// ------------------------------------------------- 动作条（Add / Save All）
+//
+// 2026-10-17 晚 用户需求：右侧内容区的搜索栏**上面**再加一行按钮。
+// 这一行有两个"图标 + 文字"的按钮（Add / Save All）—— 而 ImGui::Button
+// 画不了图标（字体里没有那些字形），所以只能自绘：InvisibleButton 拿命中，
+// DrawList 画框 + 图标 + 文字。
+//
+// ⚠ 宽度必须**先算再画**：这一行里路径框吃剩余宽度，按钮宽度算错了
+//   路径框就会压到按钮身上。所以宽度计算抽成 iconTextWidth 让两边共用。
+float iconTextWidth(const char* text, float h, bool caret) {
+    constexpr float kPad = 7.0f;    // 左右内边距
+    constexpr float kIcon = 14.0f;  // 图标方块边长
+    constexpr float kGap = 6.0f;    // 图标与文字之间
+    float w = kPad + kIcon + kPad;
+    if (text && text[0]) w += kGap + ImGui::CalcTextSize(text).x;
+    if (caret) w += 12.0f;          // 菜单指示三角占位
+    return std::max(w, h + 8.0f);
+}
+
+bool iconTextButton(const char* id, const char* text, float h,
+                    const IconPainter& paint, const char* tip, bool caret) {
+    ImGui::PushID(id);
+    const float w = iconTextWidth(text, h, caret);
+    ImGui::InvisibleButton("##itb", ImVec2(w, h));
+    const bool clicked = ImGui::IsItemClicked();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+
+    const ImVec2 a = ImGui::GetItemRectMin();
+    const ImVec2 b = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 bg = held      ? IM_COL32(52, 96, 168, 255)
+                     : hovered ? IM_COL32(46, 62, 92, 255)
+                               : IM_COL32(44, 47, 53, 255);
+    dl->AddRectFilled(a, b, bg, 4.0f);
+    dl->AddRect(a, b, IM_COL32(74, 79, 88, 200), 4.0f, 0, 1.0f);
+
+    const ImU32 fg = IM_COL32(222, 228, 236, 255);
+    const ImVec2 ia(a.x + 7.0f, a.y + (h - 14.0f) * 0.5f);
+    const ImVec2 ib(ia.x + 14.0f, ia.y + 14.0f);
+    paint(dl, ia, ib, fg);
+
+    if (text && text[0]) {
+        dl->AddText(ImVec2(ib.x + 6.0f, a.y + (h - ImGui::GetTextLineHeight()) * 0.5f),
+                    fg, text);
+    }
+    if (caret) {
+        const float cx = b.x - 11.0f;
+        const float cy = a.y + h * 0.5f;
+        dl->AddTriangleFilled(ImVec2(cx - 3.5f, cy - 2.0f),
+                              ImVec2(cx + 3.5f, cy - 2.0f),
+                              ImVec2(cx, cy + 2.6f), fg);
+    }
+    if (hovered && tip) ImGui::SetTooltip(TR("%s"), tip);
+    ImGui::PopID();
+    return clicked;
+}
+
+// 保存图标：软盘（外壳 + 上方金属滑片 + 下方标签块）。
+// 这是"保存"最没有歧义的图形，比一个向下箭头强 —— 后者会被读成"下载"。
+void paintSaveIcon(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
+    const float cx = (a.x + b.x) * 0.5f;
+    const float cy = (a.y + b.y) * 0.5f;
+    const float w = 5.8f, h = 6.2f;
+    // 外壳
+    dl->AddRect(ImVec2(cx - w, cy - h), ImVec2(cx + w, cy + h), c, 1.4f, 0, 1.6f);
+    // 上方滑片（金属挡片）
+    dl->AddRectFilled(ImVec2(cx - 2.2f, cy - h + 1.2f),
+                      ImVec2(cx + 2.2f, cy - h + 3.8f), c, 0.4f);
+    // 下方标签块
+    dl->AddRectFilled(ImVec2(cx - w + 1.5f, cy + 0.8f),
+                      ImVec2(cx + w - 1.5f, cy + h - 1.0f), c, 0.8f);
+}
+
+// 历史导航：左 / 右人字形（"上一层 / 下一层"）。
+// 画成 ◀ ▶ 而不是 ↑ ↓：它们紧挨着路径框，横向的箭头天然对应
+// "往路径的上一段 / 下一段走"，而且不会和左栏那个 ↑（真正的上一级）
+// 撞脸 —— 两个同样的箭头做不同的事是最糟的设计。
+void paintChevronLeft(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
+    const float cx = (a.x + b.x) * 0.5f;
+    const float cy = (a.y + b.y) * 0.5f;
+    dl->AddLine(ImVec2(cx + 2.4f, cy - 5.2f), ImVec2(cx - 2.6f, cy), c, 1.9f);
+    dl->AddLine(ImVec2(cx - 2.6f, cy), ImVec2(cx + 2.4f, cy + 5.2f), c, 1.9f);
+}
+
+void paintChevronRight(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
+    const float cx = (a.x + b.x) * 0.5f;
+    const float cy = (a.y + b.y) * 0.5f;
+    dl->AddLine(ImVec2(cx - 2.4f, cy - 5.2f), ImVec2(cx + 2.6f, cy), c, 1.9f);
+    dl->AddLine(ImVec2(cx + 2.6f, cy), ImVec2(cx - 2.4f, cy + 5.2f), c, 1.9f);
+}
+
 } // namespace
 
 // 缩略图纹理的注销交给 ThumbnailCache 的析构（原来这里有一份手写的循环，
@@ -333,11 +455,22 @@ void paintListMode(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
 void ContentBrowser::refresh() {
     m_entries.clear();
     m_dirty = false;
+    // 目录树缓存与新的一次扫描同寿命：文件系统可能刚被新建/改名/删除过。
+    m_dirCache.clear();
 
     if (m_root.empty()) {
         std::error_code ec;
         m_root = fs::current_path(ec).string();
         if (ec) m_root = ".";
+    }
+
+    // 目录树的根 = "当前游戏项目的内容目录"。有 assets/ 就用它，否则退化成
+    // 进程工作目录（引擎/示例项目之外也能用）。
+    if (m_contentRootRel.empty()) {
+        std::error_code rec;
+        m_contentRootRel = fs::is_directory(fs::path(m_root) / "assets", rec)
+                               ? "assets"
+                               : std::string();
     }
 
     // 第一次进来直接落在 assets/ 上 —— 引擎的"内容根"。
@@ -386,19 +519,33 @@ void ContentBrowser::refresh() {
     }
 
     // 目录在前，同类按名字排（找东西比"按修改时间"更好预测）
+    // 2026-10-17：排序字段/方向改成用户可选（右栏排序图标），但
+    // **"目录永远在文件前面"不受影响** —— 和资源管理器一致。
     std::sort(m_entries.begin(), m_entries.end(),
-              [](const DirEntry& a, const DirEntry& b) {
+              [this](const DirEntry& a, const DirEntry& b) {
                   if (a.isDir != b.isDir) return a.isDir > b.isDir;
-                  return a.name < b.name;
+                  int c = 0;
+                  if (m_sortBy == SortBy::Size && a.size != b.size) {
+                      c = (a.size < b.size) ? -1 : 1;
+                  } else {
+                      const std::string la = lowerCopy(a.name);
+                      const std::string lb = lowerCopy(b.name);
+                      if (la != lb) c = (la < lb) ? -1 : 1;
+                  }
+                  return m_sortAsc ? c < 0 : c > 0;
               });
 
     // 自动化可断言的一行：当前目录 + 过滤条件 + 可见条目数。
     // tools/verify_content_browser.py 靠它验证"类型过滤切换后数量变化正确"。
-    VK_LOG_INFO("CB-ENTRIES dir=%s filter=%s type=%d view=%d count=%zu",
+    // ⚠ 前 5 个字段的**顺序与格式不能动**（脚本的正则按位置取），
+    //   新字段一律往后加。
+    VK_LOG_INFO("CB-ENTRIES dir=%s filter=%s type=%d view=%d count=%zu "
+                "sort=%d asc=%d",
                 m_rel.empty() ? "(root)" : m_rel.c_str(),
                 m_filter.empty() ? "-" : m_filter.c_str(),
                 static_cast<int>(m_typeFilter), static_cast<int>(m_view),
-                m_entries.size());
+                m_entries.size(), static_cast<int>(m_sortBy),
+                static_cast<int>(m_sortAsc));
 }
 
 // ---------------------------------------------------------------- 缩略图
@@ -461,6 +608,7 @@ void ContentBrowser::back() {
     m_dirty = true;
     m_ctxOpen = false;
     m_ctxRequest = false;
+    VK_LOG_INFO("CB-HIST back rel=%s pos=%d", m_rel.c_str(), m_histPos);
 }
 
 void ContentBrowser::forward() {
@@ -473,6 +621,7 @@ void ContentBrowser::forward() {
     m_dirty = true;
     m_ctxOpen = false;
     m_ctxRequest = false;
+    VK_LOG_INFO("CB-HIST fwd rel=%s pos=%d", m_rel.c_str(), m_histPos);
 }
 
 // E13 类型过滤：按扩展名/是否为目录判定
@@ -493,8 +642,14 @@ bool ContentBrowser::entryMatchesType(const DirEntry& ent) const {
 
 void ContentBrowser::navigateTo(const std::string& rel) {
     if (rel == m_rel) return;
-    m_rel = rel;
+    // ⚠ 顺序很重要：先记"现在在哪"，再切到新目录。
+    //   反过来写（先赋值 m_rel 再 pushHistory）的话，**第一次**导航时历史
+    //   里只有新目录本身（pushHistory 的首次调用会用它初始化栈），于是
+    //   ‹"上一层目录" 从一启动就是灰的，要切两次才亮 —— 2026-10-17 把
+    //   这两个按钮摆到界面之前一直没人发现，因为入口只有 Alt+←。
+    pushHistory(m_rel);
     pushHistory(rel);
+    m_rel = rel;
     m_selected.clear();
     m_dirty = true;
     // 换目录了，右键菜单的目标已经不在视野里 —— 直接作废
@@ -514,14 +669,14 @@ void ContentBrowser::drawNavRow() {
     const float h = ImGui::GetFrameHeight();
     const ImVec2 bs(h, h);
 
-    // ---- 返回上一级（有正常图标，而不是一个 ".." 文字按钮）----
+    // 左栏头部的四个图标按钮。三栏改造后这一行只剩图标 —— 宽度要留给
+    // 目录树（左栏最窄时只有 132 px）。
     //
     // ⚠ 这里**故意没有**"前进 / 后退"两个箭头按钮（2026-10-17 按用户要求
-    //   去掉）：Content 面板默认只有约 290 px 宽，那两个按钮占了最宝贵的
-    //   起手位置，而它们能做的事（回到刚才浏览过的目录）在编辑器里用处很小
-    //   —— 真正常用的是"上一级"。快捷键 Alt+← / Alt+→ 仍然可用（见
-    //   draw() 末尾的键盘处理），back()/forward() 的历史栈也没拆，
-    //   所以只是**去掉了入口**，没有删能力。
+    //   去掉）：那两个按钮占了最宝贵的起手位置，而它们能做的事（回到刚才
+    //   浏览过的目录）在编辑器里用处很小 —— 真正常用的是"上一级"。
+    //   快捷键 Alt+← / Alt+→ 仍然可用（见 drawBody 末尾的键盘处理），
+    //   back()/forward() 的历史栈也没拆，所以只是**去掉了入口**。
     const bool canUp = !m_rel.empty();
     if (iconButton("up", bs, paintUpArrow,
                    canUp ? "Go up one level  (Backspace)" : "Already at the root",
@@ -531,176 +686,192 @@ void ContentBrowser::drawNavRow() {
     // 调试开关 MYVK_LOG_RECTS=1：记下 ↑ 按钮矩形（自动化脚本要按它）
     logRect("CB-RECT up", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     ImGui::SameLine(0.0f, 4.0f);
-    if (iconButton("home", bs, paintHome, "Jump to the browsing root")) {
-        navigateTo(std::string());
+    if (iconButton("home", bs, paintHome, "Jump to the project root")) {
+        navigateTo(m_contentRootRel);
     }
     ImGui::SameLine(0.0f, 4.0f);
     if (iconButton("reload", bs, paintRefresh, "Re-scan this folder")) {
         m_dirty = true;
     }
     logRect("CB-RECT reload", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-
-    // ---- 右端：New ▸ 菜单 ----
-    // 与 4 个导航按钮同行（Content 面板约 290px 宽：导航 168 + New 84 = 252，
-    // 放得下），面包屑另起一整行，见 drawCrumbRow()。
-    const float newBtnW = ImGui::CalcTextSize("New").x +
-                          ImGui::GetStyle().FramePadding.x * 2.0f + 34.0f;
-    const float nx = ImGui::GetWindowContentRegionMax().x - newBtnW;
-    if (nx > ImGui::GetCursorPosX()) {
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(nx);
-        if (ImGui::Button(TR("New"), ImVec2(newBtnW, 0.0f))) {
-            ImGui::OpenPopup("##cb_new");
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(TR("Create a new asset in this folder"));
-        }
-        if (ImGui::BeginPopup("##cb_new")) {
-            if (ImGui::MenuItem(TR("Folder"))) m_newFolderRequest = true;
-            if (ImGui::MenuItem(TR("Scene (.json)"))) createScene();
-            if (ImGui::MenuItem(TR("Script (.vks)"))) createScript();
-            ImGui::Separator();
-            ImGui::MenuItem(TR("Material (inline in scene)"), nullptr, false, false);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    TR("Materials are stored inside the scene JSON today -\n"
-                    "edit them in the Inspector's Material section."));
-            }
-            ImGui::EndPopup();
-        }
-    }
-}
-
-// 面包屑独占一整行：Content 面板默认只有约 290px 宽，和导航按钮挤一行时
-// 连当前目录名都显示不出来。三级降级：全部显示 → "…" + 末尾若干段 →
-// 只显示当前目录名。（完整路径在底部状态行里始终可见，这里可以放心裁。）
-void ContentBrowser::drawCrumbRow() {
-    const std::string rootName =
-        fs::path(m_root.empty() ? "." : m_root).filename().string();
-
-    std::vector<std::pair<std::string, std::string>> crumbs;   // label, rel
-    crumbs.emplace_back(rootName.empty() ? "/" : rootName, std::string());
-    if (!m_rel.empty()) {
-        fs::path acc;
-        for (const auto& part : fs::path(m_rel)) {
-            acc /= part;
-            crumbs.emplace_back(part.string(), acc.generic_string());
-        }
-    }
-
-    // 面包屑按钮用 FramePadding(6)，宽度估算按 6 算，否则末尾会被裁半个字。
-    const float pad = 6.0f * 2.0f + 2.0f;
-    const float sepW = ImGui::CalcTextSize("/").x + 4.0f;
-    const float dotsW = ImGui::CalcTextSize("...").x + sepW + 2.0f;
-    auto crumbW = [&](std::size_t i) {
-        return ImGui::CalcTextSize(crumbs[i].first.c_str()).x + pad;
-    };
-
-    const float availW =
-        std::max(ImGui::GetContentRegionAvail().x - 2.0f, 40.0f);
-
-    float total = 0.0f;
-    for (std::size_t i = 0; i < crumbs.size(); ++i)
-        total += crumbW(i) + (i ? sepW : 0.0f);
-
-    bool clippedLeft = false;
-    bool onlyLast = false;
-    std::size_t firstShown = 0;
-    if (total > availW) {
-        clippedLeft = true;
-        const float a = availW - dotsW;
-        float used = 0.0f;
-        firstShown = crumbs.size();
-        for (std::size_t i = crumbs.size(); i-- > 0;) {
-            const float w = crumbW(i) + sepW;
-            if (used + w > a && firstShown != crumbs.size()) break;
-            used += w;
-            firstShown = i;
-        }
-        if (firstShown == crumbs.size()) {
-            // 连"… + 末段"都放不下：只画当前目录名
-            clippedLeft = false;
-            onlyLast = true;
-        }
-    }
-
-    const ImVec2 clipA = ImGui::GetCursorScreenPos();
-    const float rowH = ImGui::GetTextLineHeightWithSpacing() + 2.0f;
-    ImGui::PushClipRect(clipA, ImVec2(clipA.x + availW, clipA.y + rowH), true);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 2.0f));
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                          ImVec4(0.23f, 0.36f, 0.57f, 1.0f));
-
-    auto drawCrumb = [&](std::size_t i) {
-        ImGui::PushID(static_cast<int>(i));
-        if (ImGui::SmallButton(crumbs[i].first.c_str()))
-            navigateTo(crumbs[i].second);
-        ImGui::PopID();
-        if (i == 0 && ImGui::IsItemHovered())
-            ImGui::SetTooltip(TR("%s"), m_root.c_str());
-    };
-
-    if (onlyLast) {
-        drawCrumb(crumbs.size() - 1);
-    } else {
-        bool firstItem = true;
-        if (clippedLeft) {
-            ImGui::TextDisabled(TR("..."));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip(TR("%s"), m_root.c_str());
-            firstItem = false;
-        }
-        for (std::size_t i = firstShown; i < crumbs.size(); ++i) {
-            if (!firstItem) {
-                ImGui::SameLine(0.0f, 2.0f);
-                ImGui::TextDisabled(TR("/"));
-                ImGui::SameLine(0.0f, 2.0f);
-            }
-            firstItem = false;
-            drawCrumb(i);
-        }
-    }
-    ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar();
-    ImGui::PopClipRect();
-
-    // 面包屑的宽度决策只在矩形调试开关下打印，且**只在决策变化时打**
-    // （否则每帧一行会刷爆日志，自动化脚本读不到真正有用的行）。
-    if (std::getenv("MYVK_LOG_RECTS")) {
-        static int lastKey = -1;
-        const int key = int(firstShown) * 4 + (clippedLeft ? 2 : 0) +
-                        (onlyLast ? 1 : 0);
-        if (key != lastKey) {
-            lastKey = key;
-            VK_LOG_INFO("CB-CRUMB avail=%.1f total=%.1f first=%zu dots=%d only=%d",
-                        availW, total, firstShown, clippedLeft ? 1 : 0,
-                        onlyLast ? 1 : 0);
-        }
-    }
-}
-
-void ContentBrowser::drawToolbarRow() {
-    // 单行工具栏：类型过滤 + 视图切换 + 缩略图尺寸 + 名字过滤。
-    // Content 面板默认只有约 290px 宽。原先"工具栏 + 过滤"拆两行，会把网格挤
-    // 到只剩一行可见（拖放用例的目标资产会掉进裁剪区外）；全部并成一行后网格
-    // 能稳定显示近两行。既然横向只有 278px，就放弃独立的 Clear 按钮（改按
-    // Esc 清除，输入框也有右键菜单），把宽度让给名字过滤（约 100px）。
-    static const char* kTypeNames[] = {"All",     "Models",  "Textures",
-                                      "Materials", "Scenes", "Scripts",
-                                      "Shaders", "Folders"};
-    ImGui::SetNextItemWidth(78.0f);
-    if (ImGui::Combo("##cb_type", &m_typeFilterIdx, kTypeNames,
-                     IM_ARRAYSIZE(kTypeNames))) {
-        m_typeFilter = static_cast<TypeFilter>(m_typeFilterIdx);
-        m_dirty = true;
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(TR("Filter by asset type (extension-based)"));
-    }
     ImGui::SameLine(0.0f, 4.0f);
 
+    // New ▸（原来是一个 84 px 的文字按钮，三栏下放不下 → 换成 + 图标）
+    if (iconButton("new", bs, paintPlus, "Create a new asset in this folder")) {
+        ImGui::OpenPopup("##cb_new");
+    }
+    if (ImGui::BeginPopup("##cb_new")) {
+        if (ImGui::MenuItem(TR("Folder"))) m_newFolderRequest = true;
+        if (ImGui::MenuItem(TR("Scene (.json)"))) createScene();
+        if (ImGui::MenuItem(TR("Script (.vks)"))) createScript();
+        ImGui::Separator();
+        ImGui::MenuItem(TR("Material (inline in scene)"), nullptr, false, false);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("Materials are stored inside the scene JSON today -\n"
+                   "edit them in the Inspector's Material section."));
+        }
+        ImGui::EndPopup();
+    }
+}
+
+// ---------------------------------------------------------------- 三栏
+//
+// 2026-10-17（用户需求）：Content 拆成"左中右"三栏。
+//   左：**项目目录树** —— 根 = 当前游戏项目的内容目录（assets/）。
+//       点任意一层，右栏立刻切到那一层。树自己就把路径显示出来了，
+//       所以原来的面包屑整行删掉（它在窄面板下还要三级降级裁字）。
+//   中：**资源类型单选竖列** —— All / Models / Textures / ... 一列
+//       RadioButton（原来是工具栏里一个 78px 宽的下拉框：要展开才知道
+//       有哪些类型，也不方便一眼看到"当前在筛什么"）。
+//   右：**当前目录的内容** —— 顶行 = 搜索框（带最近搜索）+ 排序图标 +
+//       视图切换，下面是网格 / 列表。
+void ContentBrowser::drawTreePane(float w) {
+    ImGui::BeginChild("##cb_tree", ImVec2(w, 0.0f), ImGuiChildFlags_Borders);
+    const ImVec2 c0 = ImGui::GetWindowPos();
+    const ImVec2 c1(c0.x + ImGui::GetWindowSize().x,
+                    c0.y + ImGui::GetWindowSize().y);
+
+    drawNavRow();
+    ImGui::Separator();
+
+    // 根节点：项目内容目录。label 只放目录名（"assets"），全路径走 tooltip。
+    const std::string rootLabel =
+        fs::path(m_contentRootRel.empty() ? m_root : m_contentRootRel)
+            .filename()
+            .string();
+    drawDirNode(m_contentRootRel, rootLabel.empty() ? "/" : rootLabel, 0);
+
+    ImGui::EndChild();
+    logRect("CB-TREE", c0, c1);
+}
+
+void ContentBrowser::drawTypePane(float w) {
+    ImGui::BeginChild("##cb_types", ImVec2(w, 0.0f), ImGuiChildFlags_Borders);
+    const ImVec2 c0 = ImGui::GetWindowPos();
+    const ImVec2 c1(c0.x + ImGui::GetWindowSize().x,
+                    c0.y + ImGui::GetWindowSize().y);
+
+    ImGui::TextDisabled("%s", TR("Asset type"));
+    ImGui::Separator();
+
+    // 行距压到 2：抽屉默认高度只有 320 px，8 个单选按默认间距排下来正好
+    // 把最后一项（Folders）挤到边界上（虽然能滚，但看起来像被裁了）。
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 2.0f));
+
+    // ⚠ 顺序 = TypeFilter 的枚举值（MYVK_EDITOR_CB_TYPE 的环境钩子、
+    //   CB-ENTRIES 日志里的 type=N、verify_content_browser 的下标全部
+    //   依赖这个顺序，只能往后加、不能重排）。
+    static const char* kTypeNames[] = {"All",     "Models",    "Textures",
+                                       "Materials", "Scenes",  "Scripts",
+                                       "Shaders", "Folders"};
+    for (int i = 0; i < 8; ++i) {
+        if (ImGui::RadioButton(TR(kTypeNames[i]), m_typeFilterIdx == i)) {
+            m_typeFilterIdx = i;
+            m_typeFilter = static_cast<TypeFilter>(i);
+            m_dirty = true;   // 类型过滤在 refresh() 里做 → 立刻重列一次
+            VK_LOG_INFO("CB-FILTER type=%s", kTypeNames[i]);
+        }
+        char tag[48];
+        std::snprintf(tag, sizeof(tag), "CB-TYPE %s", kTypeNames[i]);
+        logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    }
+    ImGui::PopStyleVar();
+
+    ImGui::EndChild();
+    logRect("CB-TYPES", c0, c1);
+}
+
+void ContentBrowser::drawItemsPane(float w) {
+    ImGui::BeginChild("##cb_items", ImVec2(w, 0.0f), ImGuiChildFlags_Borders);
+    const ImVec2 c0 = ImGui::GetWindowPos();
+    const ImVec2 c1(c0.x + ImGui::GetWindowSize().x,
+                    c0.y + ImGui::GetWindowSize().y);
+
+    drawActionRow();   // 最上面一行：Add / Save All / 上一层·下一层 / 路径框
+    drawSearchRow();
+    ImGui::Separator();
+    if (m_view == ViewMode::Grid) drawGrid();
+    else drawList();
+
+    ImGui::EndChild();
+    logRect("CB-ITEMS", c0, c1);
+}
+
+// 右栏顶行：搜索框 + 最近搜索 + 排序图标 + 视图切换 + 缩略图尺寸。
+void ContentBrowser::drawSearchRow() {
     const float h = ImGui::GetFrameHeight();
     const ImVec2 bs(h, h);
+    const ImGuiStyle& st = ImGui::GetStyle();
+
+    // 右侧固定要占的宽度（排序 + 网格 + 列表 + 尺寸档），搜索框吃掉剩下的。
+    const float sizeW = 52.0f;
+    const float rightW = bs.x * 3.0f + sizeW + st.ItemSpacing.x * 5.0f;
+    const float searchW =
+        std::max(ImGui::GetContentRegionAvail().x - rightW, 90.0f);
+
+    ImGui::SetNextItemWidth(searchW);
+    // 平时**边打边过滤**（沿用原来的手感）；只有回车才算一次"搜索"，
+    // 记进最近搜索 —— 每敲一个字存一条只会把历史刷满无用前缀。
+    const bool entered = ImGui::InputTextWithHint(
+        "##cb_search", TR("Search this folder..."), m_pathBuf,
+        sizeof(m_pathBuf), ImGuiInputTextFlags_EnterReturnsTrue);
+    if (ImGui::IsItemEdited()) {
+        m_filter = m_pathBuf;
+        m_dirty = true;
+    }
+    if (entered && m_pathBuf[0]) pushRecentSearch(std::string(m_pathBuf));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Search the current folder by name\n"
+                             "Esc: clear   Enter: remember this search"));
+    }
+    // 空着点进来 = 想重新搜 → 直接把最近搜索摊开（IDE 的搜索框都这么做）
+    if (ImGui::IsItemActivated() && m_filter.empty() &&
+        !m_recentSearches.empty()) {
+        ImGui::OpenPopup("##cb_hist");
+    }
+    logRect("CB-SEARCH", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    // Esc 清空（键盘在框里时消费掉，免得传给别处）
+    if (ImGui::IsItemHovered() && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        m_pathBuf[0] = '\0';
+        m_filter.clear();
+        m_dirty = true;
+    }
+
+    // ---- 最近搜索 ----
+    // ⚠ popup 必须**每帧无条件提交**（不能只在"刚打开那一帧"调 BeginPopup），
+    //   否则 ImGui 下一帧没看到它就把自己关掉 —— 只闪一帧。
+    if (ImGui::BeginPopup("##cb_hist")) {
+        if (ImGui::IsWindowAppearing()) {
+            VK_LOG_INFO("CB-HISTORY n=%zu", m_recentSearches.size());
+        }
+        ImGui::TextDisabled("%s", TR("Recent searches"));
+        ImGui::Separator();
+        for (std::size_t i = 0; i < m_recentSearches.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::Selectable(m_recentSearches[i].c_str())) {
+                std::snprintf(m_pathBuf, sizeof(m_pathBuf), "%s",
+                              m_recentSearches[i].c_str());
+                m_filter = m_recentSearches[i];
+                m_dirty = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndPopup();
+    }
+
+    // ---- 排序图标（紧挨在搜索框右边）----
+    ImGui::SameLine(0.0f, 4.0f);
+    if (iconButton("sort", bs, paintSortIcon, "Sort options")) {
+        ImGui::OpenPopup("##cb_sort");
+    }
+    logRect("CB-SORT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    drawSortMenu();   // 同上：每帧无条件提交
+
+    // ---- 视图切换 + 缩略图尺寸 ----
+    ImGui::SameLine(0.0f, 4.0f);
     if (iconButton("view_grid", bs, paintGridMode, "Grid view",
                    m_view == ViewMode::Grid)) {
         m_view = ViewMode::Grid;
@@ -713,7 +884,7 @@ void ContentBrowser::drawToolbarRow() {
     ImGui::SameLine(0.0f, 4.0f);
 
     static const char* kSizeNames[] = {"S", "M", "L", "XL"};
-    ImGui::SetNextItemWidth(46.0f);
+    ImGui::SetNextItemWidth(sizeW);
     ImGui::BeginDisabled(m_view == ViewMode::List);
     if (ImGui::Combo("##cb_size", &m_thumbIdx, kSizeNames,
                      IM_ARRAYSIZE(kSizeNames))) {
@@ -723,24 +894,468 @@ void ContentBrowser::drawToolbarRow() {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(TR("Thumbnail size (grid view)"));
     }
-    ImGui::SameLine(0.0f, 4.0f);
+}
 
-    // ---- 名字过滤（吃掉本行剩余宽度）----
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::InputTextWithHint("##filter", "filter...", m_pathBuf,
-                                 sizeof(m_pathBuf))) {
-        m_filter = m_pathBuf;
-        m_dirty = true;
+// 排序菜单（排序图标点开的那个小子菜单）。
+//
+// 用户要求是"排序类型两个勾选框（名称 / 大小）+ 排序方式两个勾选框
+// （升序 / 降序）"。这里就是**复选框**，但语义是二选一：点已勾上的那一项
+// 不会把它取消（否则会出现"既不按名称也不按大小"这种无意义状态）。
+// 视觉上仍然是勾选框，符合"勾选框"的说法。
+void ContentBrowser::drawSortMenu() {
+    if (!ImGui::BeginPopup("##cb_sort")) return;
+
+    ImGui::TextDisabled("%s", TR("Sort by"));
+    bool byName = (m_sortBy == SortBy::Name);
+    bool bySize = (m_sortBy == SortBy::Size);
+    if (ImGui::Checkbox(TR("Name"), &byName) && byName) {
+        m_sortBy = SortBy::Name;
+        m_dirty = true;           // 重新排序发生在 refresh() 里
+        VK_LOG_INFO("CB-SORT by=name");
     }
+    logRect("CB-SORT-NAME", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::Checkbox(TR("Size"), &bySize) && bySize) {
+        m_sortBy = SortBy::Size;
+        m_dirty = true;
+        VK_LOG_INFO("CB-SORT by=size");
+    }
+    logRect("CB-SORT-SIZE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    ImGui::Separator();
+    ImGui::TextDisabled("%s", TR("Order"));
+    bool asc = m_sortAsc;
+    bool desc = !m_sortAsc;
+    if (ImGui::Checkbox(TR("Ascending"), &asc) && asc) {
+        m_sortAsc = true;
+        m_dirty = true;
+        VK_LOG_INFO("CB-SORT order=asc");
+    }
+    logRect("CB-SORT-ASC", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::Checkbox(TR("Descending"), &desc) && desc) {
+        m_sortAsc = false;
+        m_dirty = true;
+        VK_LOG_INFO("CB-SORT order=desc");
+    }
+    logRect("CB-SORT-DESC", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    ImGui::EndPopup();
+}
+
+// ================================================================ 动作条
+//
+// 2026-10-17 晚（用户需求 4）：右侧内容区"搜索栏的上边"再加一行。
+// 布局（严格按用户说的顺序）：
+//
+//     [ + Add ▾ ]   [ ▣ Save All ]  [ ‹ ] [ › ]   [ /assets/models ...... ]
+//
+//   · Add      —— 图标 + 文字，点开一个**向上**弹的子菜单
+//   · Save All —— 图标 + 文字
+//   · ‹ ›      —— "上一层目录 / 下一层目录"：沿**浏览历史**往返
+//                 （和左栏那个 ↑"上一级"不是一回事：↑ 走的是父子层级，
+//                   ‹ › 走的是你刚才看过什么。Alt+← / Alt+→ 同款）
+//   · 路径框   —— 相对项目根目录的相对路径，只读、可选中复制
+
+// Add ▸ 的 13 种资源类型。
+// ⚠ 顺序 = 菜单里的顺序 = 验证脚本按 `CB-ADDITEM <key>` 取矩形时的依据，
+//   只能往后加、不能重排。
+// ⚠ key 一律 ASCII 小写（进日志 / 进文件头），label 是**英文原文**（过 TR()），
+//   ext 不带点。
+const ContentBrowser::AddKind* ContentBrowser::addKinds(int& count) {
+    static const AddKind kKinds[] = {
+        {"material",  "Material",       "vmat"},
+        {"model",     "Model",          "vmodel"},
+        {"scene",     "Scene",          "json"},
+        {"animation", "Animation",      "vanim"},
+        {"cinematic", "Cinematic Sequence", "vseq"},
+        {"media",     "Media",          "vmedia"},
+        {"water",     "Water",          "vwater"},
+        {"texture",   "Texture",        "vtex"},
+        {"physics",   "Physics",        "vphys"},
+        {"audio",     "Audio",          "vaudio"},
+        {"foliage",   "Foliage",        "vveg"},
+        {"ui",        "User Interface", "vui"},
+        {"worldmap",  "World Map",      "vmap"},
+    };
+    count = static_cast<int>(sizeof(kKinds) / sizeof(kKinds[0]));
+    return kKinds;
+}
+
+void ContentBrowser::drawActionRow() {
+    const float h = ImGui::GetFrameHeight();
+    const ImVec2 bs(h, h);
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float availW = ImGui::GetContentRegionAvail().x;
+
+    // ---- 窄面板三级降级 ----
+    // 抽屉拉到很窄时，一行塞不下"Add + Save All + 两个箭头 + 路径框"。
+    // 路径框是这一行里信息量最大的东西（它是"我在哪"的唯一指示），
+    // 所以先牺牲 Save All 的文字、再整个牺牲 Save All。
+    bool saveText = true;
+    bool showSave = true;
+    const float addW = iconTextWidth(TR("Add"), h, true);
+    const float navW = bs.x * 2.0f + st.ItemSpacing.x;
+    const float gaps = 6.0f + 8.0f + 6.0f;
+    constexpr float kMinPathW = 96.0f;
+    if (addW + iconTextWidth(TR("Save All"), h, false) + navW + gaps + kMinPathW >
+        availW) {
+        saveText = false;
+    }
+    if (addW + iconTextWidth("", h, false) + navW + gaps + kMinPathW > availW) {
+        showSave = false;
+    }
+
+    // ---------------- Add ----------------
+    if (iconTextButton("cb_add", TR("Add"), h, paintPlus,
+                       "Create a new asset  (the menu opens above)", true)) {
+        ImGui::OpenPopup("##cb_add");
+    }
+    m_addBtnX0 = ImGui::GetItemRectMin().x;
+    m_addBtnY0 = ImGui::GetItemRectMin().y;
+    m_addBtnX1 = ImGui::GetItemRectMax().x;
+    m_addBtnY1 = ImGui::GetItemRectMax().y;
+    logRect("CB-ADD-BTN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    // 同上：popup 必须**每帧无条件提交**，只在"刚点开那一帧"调会只闪一帧。
+    drawAddMenu();
+
+    // ---------------- Save All ----------------
+    ImGui::SameLine(0.0f, 6.0f);
+    if (showSave) {
+        if (iconTextButton("cb_saveall", saveText ? TR("Save All") : "", h,
+                           paintSaveIcon,
+                           "Save every modified asset (scene + input map)",
+                           false)) {
+            saveAll();
+        }
+        logRect("CB-SAVEALL", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        ImGui::SameLine(0.0f, 8.0f);
+    }
+
+    // ---------------- 上一层 / 下一层 ----------------
+    if (iconButton("cb_prev", bs, paintChevronLeft,
+                   "Previous folder  (Alt+Left)", canBack())) {
+        back();
+    }
+    logRect("CB-PREV", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine(0.0f, 2.0f);
+    if (iconButton("cb_next", bs, paintChevronRight,
+                   "Next folder  (Alt+Right)", canForward())) {
+        forward();
+    }
+    logRect("CB-NEXT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    // ---------------- 路径框 ----------------
+    ImGui::SameLine(0.0f, 6.0f);
+    const float pathW = std::max(ImGui::GetContentRegionAvail().x, 40.0f);
+    // "相对当前游戏项目的根目录的相对路径" —— m_rel 就是（它本来就相对
+    // 进程工作目录，也就是项目根）。前面补一个 '/' 让它读起来像路径。
+    const std::string shown = m_rel.empty() ? std::string("/") : ("/" + m_rel);
+    std::snprintf(m_pathDisplay, sizeof(m_pathDisplay), "%s", shown.c_str());
+    ImGui::SetNextItemWidth(pathW);
+    // 只读 InputText 而不是 Text：这样路径能**选中 / Ctrl+C 复制**，
+    // 但改不动 —— 用户要的是"显示"，不是"编辑"。
+    ImGui::InputText("##cb_path", m_pathDisplay, sizeof(m_pathDisplay),
+                     ImGuiInputTextFlags_ReadOnly);
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(TR("Filter by name (case-insensitive)\nEsc to clear"));
+        ImGui::SetTooltip(TR("Path relative to the project root (read-only)"));
     }
-    // Esc 清除过滤（键盘在框里时消费掉，免得传给别处）
-    if (ImGui::IsItemHovered() && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        m_pathBuf[0] = '\0';
-        m_filter.clear();
-        m_dirty = true;
+    logRect("CB-PATH", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (m_lastPathLogged != m_rel) {
+        m_lastPathLogged = m_rel;
+        VK_LOG_INFO("CB-PATH rel=%s", shown.c_str());
     }
+}
+
+// Add 按钮上方弹出的子菜单。
+void ContentBrowser::drawAddMenu() {
+    int n = 0;
+    const AddKind* kinds = addKinds(n);
+
+    // ---- 往上弹 ----
+    // ImGui 默认把 popup 放在锚点**下方**。抽屉贴着屏幕底边，往下弹直接
+    // 出屏幕；用户也明确要求"在按钮的上侧打开"。所以自己算位置：底边贴
+    // 按钮顶边。
+    //
+    // 高度只能**估**：BeginPopup 之前窗口还没排版，拿不到真实尺寸。
+    // MenuItem 的高度 = 文本行高（见 imgui_widgets.cpp 的 MenuItemEx：
+    // Selectable 的 size.y 传的就是 label_size.y），项之间再加 ItemSpacing。
+    // 估出来的误差在几像素级，而菜单周围没有任何东西跟它对齐，看不出来。
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const int rows = n + 1;   // 13 类型 + Import
+    const float rowH = ImGui::GetTextLineHeight() + st.ItemSpacing.y;
+    const float sepY = st.ItemSpacing.y + 1.0f;
+    const float estH =
+        rows * rowH + sepY + st.WindowPadding.y * 2.0f - st.ItemSpacing.y;
+
+    const ImVec2 vpPos = ImGui::GetMainViewport()->Pos;
+    const ImVec2 vpSize = ImGui::GetMainViewport()->Size;
+    float px = m_addBtnX0;
+    float py = m_addBtnY0 - estH - 4.0f;
+    if (py < vpPos.y + 4.0f) {
+        // 窗口特别矮（或按钮本来就在屏幕上方）→ 退回往下弹，至少不越界
+        py = m_addBtnY1 + 4.0f;
+    }
+    px = std::min(px, vpPos.x + vpSize.x - 220.0f);
+    ImGui::SetNextWindowPos(ImVec2(px, py), ImGuiCond_Always);
+
+    if (!ImGui::BeginPopup("##cb_add")) return;
+
+    for (int i = 0; i < n; ++i) {
+        if (ImGui::MenuItem(TR(kinds[i].label))) {
+            createAsset(kinds[i].key, kinds[i].label, kinds[i].ext);
+        }
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "CB-ADDITEM %s", kinds[i].key);
+        logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    }
+
+    ImGui::Separator();
+    if (ImGui::MenuItem(TR("Import..."))) importFiles();
+    logRect("CB-ADDITEM import", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    ImGui::EndPopup();
+}
+
+// Add ▸ <类型>：在当前目录落一个最小资产文件，然后进重命名。
+//
+// 2026-10-17 的边界：除了 Scene（.json 走 SceneSerializer 那套）和
+// Material（.vmat 已经是约定好的扩展名），其余类型**还没有加载器**。
+// 这里仍然把文件落下去 —— "新建了但打不开"是诚实的中间态，而"菜单点了
+// 什么都不发生"是坏掉的。文件体就是 {"type":...,"version":1}，
+// 将来的资产工厂按 type 分派即可。
+void ContentBrowser::createAsset(const char* kindKey, const char* kindLabel,
+                                 const char* ext) {
+    const fs::path dir = fs::path(m_root) / m_rel;
+    const std::string stem = std::string("New ") + kindLabel;
+    const std::string path =
+        uniqueChildPath(dir.string(), stem, std::string(".") + ext);
+
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        m_ctx.notify(TR("Create failed: cannot open file"));
+        VK_LOG_WARN("CB-ADD kind=%s failed: cannot open %s", kindKey,
+                    path.c_str());
+        return;
+    }
+    char body[192];
+    const int n = std::snprintf(body, sizeof(body),
+                                "{\n  \"type\": \"%s\",\n  \"version\": 1\n}\n",
+                                kindKey);
+    if (n > 0) std::fwrite(body, 1, static_cast<size_t>(n), f);
+    std::fclose(f);
+
+    m_dirty = true;
+    m_selected = path;
+    beginRename(path, fs::path(path).filename().string());
+    VK_LOG_INFO("CB-ADD kind=%s ext=%s path=%s", kindKey, ext, path.c_str());
+    m_ctx.notify(std::string(TR("Created ")) + TR(kindLabel));
+}
+
+// "保存所有"：面板只置位，真正落盘由 EditorApp 做 —— 它才认识场景路径、
+// 也才拿得到 InputMap。和 quitRequested / windowFullscreenRequest 一个套路。
+void ContentBrowser::saveAll() {
+    m_ctx.saveAllRequest() = true;
+    VK_LOG_INFO("CB-SAVEALL dir=%s", m_rel.c_str());
+}
+
+// "导入"：只置位。模态对话框必须等这一帧的 ImGui 数据全部提交完再开 ——
+// 在遍历控件的途中卡进一个阻塞的 Win32 消息循环，本帧的顶点缓冲会对不上。
+void ContentBrowser::importFiles() {
+    m_importRequest = true;
+    VK_LOG_INFO("CB-IMPORT request dir=%s", m_rel.c_str());
+}
+
+void ContentBrowser::openImportDialog() {
+#ifdef _WIN32
+    // 自动化脚本点不了系统对话框 —— 给它一个"只走流程、不开窗"的开关。
+    if (std::getenv("MYVK_EDITOR_CB_NO_DIALOG")) {
+        VK_LOG_INFO("CB-IMPORT dialog=suppressed");
+        return;
+    }
+
+    std::vector<wchar_t> buf(64 * 1024, L'\0');
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = GetActiveWindow();
+    if (!ofn.hwndOwner) ofn.hwndOwner = GetForegroundWindow();
+    // 过滤器两段之间和最后都要有 '\0'（字面量本身已经带一个收尾的）
+    ofn.lpstrFilter =
+        L"Game assets\0"
+        L"*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.gltf;*.glb;*.obj;*.fbx;*.wav;"
+        L"*.mp3;*.ogg;*.json;*.vks\0"
+        L"All files\0*.*\0";
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = static_cast<DWORD>(buf.size());
+    ofn.lpstrTitle = L"Import assets into the current folder";
+    // ⚠ OFN_NOCHANGEDIR 不能省：不带它，对话框会把**进程当前目录**改成
+    //   用户最后浏览的那个文件夹。而这套引擎的资源查找、m_root、m_rel
+    //   全建立在"工作目录 = 项目根"上 —— 一导入就全盘错位，且下次启动
+    //   还开在那个目录。
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER |
+                OFN_NOCHANGEDIR | OFN_ALLOWMULTISELECT;
+
+    if (!GetOpenFileNameW(&ofn)) {
+        VK_LOG_INFO("CB-IMPORT cancelled");
+        return;
+    }
+
+    // 多选的返回格式："<目录>\0<文件1>\0<文件2>\0\0"；
+    // 单选时就是 "<完整路径>\0\0"（没有额外的文件段）。
+    std::vector<std::wstring> picked;
+    {
+        const wchar_t* p = buf.data();
+        const std::wstring first = p;
+        p += first.size() + 1;
+        if (*p == L'\0') {
+            picked.push_back(first);   // 单选：first 就是完整路径
+        } else {
+            while (*p) {
+                const std::wstring name = p;
+                picked.push_back(first + L"\\" + name);
+                p += name.size() + 1;
+            }
+        }
+    }
+
+    const fs::path dir = fs::path(m_root) / m_rel;
+    int done = 0;
+    std::string last;
+    for (const std::wstring& wp : picked) {
+        const fs::path src(wp);
+        std::error_code ec;
+        if (!fs::is_regular_file(src, ec)) continue;
+        // 同名冲突自动加编号，绝不覆盖用户已有的资产
+        const std::string dst = uniqueChildPath(
+            dir.string(), src.stem().string(), src.extension().string());
+        fs::copy_file(src, dst, ec);
+        if (ec) {
+            VK_LOG_WARN("CB-IMPORT copy failed %s: %s", dst.c_str(),
+                        ec.message().c_str());
+            continue;
+        }
+        last = dst;
+        ++done;
+    }
+
+    VK_LOG_INFO("CB-IMPORT done n=%d dir=%s last=%s", done, m_rel.c_str(),
+                last.c_str());
+    if (done == 0) {
+        m_ctx.notify(TR("Nothing imported"));
+        return;
+    }
+    m_dirty = true;
+    m_selected = last;
+    m_ctx.notify(std::string(TR("Imported ")) + std::to_string(done) +
+                 TR(" file(s)"));
+#else
+    m_ctx.notify(TR("Import is Windows-only for now"));
+    VK_LOG_WARN("CB-IMPORT unsupported on this platform");
+#endif
+}
+
+// 一个目录节点（递归）。用 SceneHierarchy 同一套做法：
+// TreeNodeEx 的 label 传空串，图标和名字都用 DrawList 自己画 —— 字体里
+// 没有文件夹字形，而 label 是纯文本，没法在名字前面插矢量图标。
+void ContentBrowser::drawDirNode(const std::string& rel,
+                                 const std::string& label, int depth) {
+    const std::vector<std::string> kids = subDirs(rel);
+
+    ImGui::PushID(rel.empty() ? "##root" : rel.c_str());
+    ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_OpenOnArrow |
+                           ImGuiTreeNodeFlags_SpanAvailWidth |
+                           ImGuiTreeNodeFlags_NoTreePushOnOpen;
+    if (m_rel == rel) f |= ImGuiTreeNodeFlags_Selected;
+    if (kids.empty()) f |= ImGuiTreeNodeFlags_Leaf;
+    // 根节点默认展开一层：一进来就能看到 assets/ 下有什么
+    if (depth == 0) f |= ImGuiTreeNodeFlags_DefaultOpen;
+
+    const float rowX = ImGui::GetCursorScreenPos().x;
+    const bool open = ImGui::TreeNodeEx("##node", f, "%s", "");
+
+    // 点击（不是点三角展开）→ 把右栏切到这个目录
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+        navigateTo(rel);
+    }
+
+    const ImVec2 rmin = ImGui::GetItemRectMin();
+    const ImVec2 rmax = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float fs = ImGui::GetFontSize();
+    const float textY = (rmin.y + rmax.y) * 0.5f - fs * 0.5f;
+    float textX = rowX + ImGui::GetTreeNodeToLabelSpacing();
+    drawTreeFolderIcon(dl, ImVec2(textX, textY), fs);
+    textX += fs + 5.0f;
+    dl->AddText(ImVec2(textX, textY), ImGui::GetColorU32(ImGuiCol_Text),
+                label.c_str());
+    if (ImGui::IsItemHovered()) {
+        const fs::path full =
+            rel.empty() ? fs::path(m_root) : fs::path(m_root) / rel;
+        ImGui::SetTooltip("%s", full.string().c_str());
+    }
+    if (depth == 0) {
+        logRect("CB-TREE-ROOT", rmin, rmax);
+    }
+    // 自动化锚点：每个节点一行（脚本点它来切目录）。
+    // logRect 自带去抖（矩形不变不重复打），节点数也就十几个，不刷屏。
+    {
+        char tag[128];
+        std::snprintf(tag, sizeof(tag), "CB-TREE-NODE %s", label.c_str());
+        logRect(tag, rmin, rmax);
+    }
+
+    if (open && !kids.empty()) {
+        for (const std::string& k : kids) {
+            const std::string childRel =
+                rel.empty() ? k : (fs::path(rel) / k).generic_string();
+            drawDirNode(childRel, k, depth + 1);
+        }
+    }
+    ImGui::PopID();
+}
+
+// 子目录列表（按名字排）。缓存放在 m_dirCache，refresh() 时清空。
+// 返回**拷贝**：递归时 drawDirNode 会继续往缓存里插条目，返回引用虽然
+// （unordered_map 是节点式容器）不会失效，但改容器时还持着引用容易出事。
+std::vector<std::string> ContentBrowser::subDirs(const std::string& rel) {
+    auto it = m_dirCache.find(rel);
+    if (it != m_dirCache.end()) return it->second;
+
+    std::vector<std::string> out;
+    std::error_code ec;
+    const fs::path dir =
+        rel.empty() ? fs::path(m_root) : (fs::path(m_root) / rel);
+    for (fs::directory_iterator it2(
+             dir, fs::directory_options::skip_permission_denied, ec);
+         !ec && it2 != fs::directory_iterator(); it2.increment(ec)) {
+        std::error_code dec;
+        if (!it2->is_directory(dec)) continue;
+        const std::string n = it2->path().filename().string();
+        // 跳过隐藏目录（.git / .vs / .cache …）—— 对做项目的人没有意义
+        if (n.empty() || n[0] == '.') continue;
+        out.push_back(n);
+    }
+    std::sort(out.begin(), out.end());
+    m_dirCache[rel] = out;
+    return out;
+}
+
+void ContentBrowser::pushRecentSearch(std::string q) {
+    if (q.empty()) return;
+    // 去重（同一条挪到最前），再截到上限 —— 和"最近打开的场景"一个做法
+    for (std::size_t i = 0; i < m_recentSearches.size(); ++i) {
+        if (m_recentSearches[i] == q) {
+            m_recentSearches.erase(m_recentSearches.begin() +
+                                   static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
+    m_recentSearches.insert(m_recentSearches.begin(), std::move(q));
+    constexpr std::size_t kMaxRecentSearch = 8;
+    if (m_recentSearches.size() > kMaxRecentSearch) {
+        m_recentSearches.resize(kMaxRecentSearch);
+    }
+    VK_LOG_INFO("CB-SEARCH q=%s n=%zu", m_recentSearches.front().c_str(),
+                m_recentSearches.size());
 }
 
 // ---------------------------------------------------------------- 单个条目
@@ -1472,9 +2087,10 @@ void ContentBrowser::drawListRow(const DirEntry& ent, float rowH) {
 
 void ContentBrowser::drawList() {
     const float rowH = ImGui::GetFrameHeight() + 6.0f;
-    const float footerH = ImGui::GetFrameHeightWithSpacing();
+    // 2026-10-17：原来这里给底部的 "N entries" 统计留一行（-footerH），
+    // 那行文字早已挪到底栏 → 现在铺满整个可用高度。
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 2.0f));
-    ImGui::BeginChild("##list", ImVec2(0, -footerH), ImGuiChildFlags_None);
+    ImGui::BeginChild("##list", ImVec2(0, 0), ImGuiChildFlags_None);
 
     drawEmptyContextMenu();
 
@@ -1516,10 +2132,9 @@ void ContentBrowser::drawGrid() {
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 8.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f, 6.0f));
-    // 高度留出底部那一行统计文字 —— 否则网格会把剩余空间全吃掉，
-    // 统计行被挤到窗口外面（原来的写法就是这样，一直看不到）。
-    const float footerH = ImGui::GetFrameHeightWithSpacing();
-    ImGui::BeginChild("##grid", ImVec2(0, -footerH), ImGuiChildFlags_None);
+    // 2026-10-17：这里的 -footerH 同样随"统计行搬家"一起改成铺满
+    // （多出来的这一行高度正好让 assets/models 的第三行也露出来）。
+    ImGui::BeginChild("##grid", ImVec2(0, 0), ImGuiChildFlags_None);
 
     drawEmptyContextMenu();
 
@@ -1574,7 +2189,17 @@ void ContentBrowser::draw() {
         ImGui::End();
         return;
     }
+    drawBody();
+    ImGui::End();
+}
 
+// 抽屉形态下的内容区：调用方已经 Begin 了一个无标题栏窗口（并且已经画完
+// 自己的头部行 —— 右侧那个 "Dock in layout" 复选框在 EditorApp 里）。
+//
+// 为什么不把头部也放这里：头部要改的是 **EditorApp 的**抽屉状态
+// （高度 / 停靠），而 ContentBrowser 不该反过来持有编辑器的布局状态。
+// 拆成"外框归 EditorApp、内容归 ContentBrowser"之后，两边各管各的。
+void ContentBrowser::drawBody() {
     // 键盘快捷键只在鼠标悬停在本面板时生效 —— 否则会和 Hierarchy 的
     // 同名快捷键（F2 改名 / Del 删除）打架。
     const bool hoveredPanel =
@@ -1611,23 +2236,57 @@ void ContentBrowser::draw() {
                 m_thumb = static_cast<ThumbSize>(idx);
             }
         }
+        // MYVK_EDITOR_CB_HIST="foo,bar"：预置"最近搜索"。
+        // 之所以要这个钩子：搜索历史是**用户输入**产生的，脚本要么真的
+        // 注入键盘（跨进程不稳），要么就得先有点历史才能验证"点空搜索框
+        // 会摊开最近搜索"。给它一个可复现的起点。
+        if (const char* s = std::getenv("MYVK_EDITOR_CB_HIST")) {
+            std::string all(s);
+            std::size_t pos = 0;
+            while (pos <= all.size()) {
+                const std::size_t comma = all.find(',', pos);
+                const std::string one = all.substr(
+                    pos, comma == std::string::npos ? std::string::npos
+                                                    : comma - pos);
+                if (!one.empty()) m_recentSearches.push_back(one);
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            VK_LOG_INFO("CB-HISTORY seeded=%zu", m_recentSearches.size());
+        }
     }
 
     if (m_dirty) refresh();
 
-    drawNavRow();
-    drawCrumbRow();
-    drawToolbarRow();
-    ImGui::Separator();
-    if (m_view == ViewMode::Grid) drawGrid();
-    else drawList();
-    ImGui::Separator();
+    // ---- 三栏：目录树 | 类型过滤 | 内容 ----
+    // 宽度按比例分，但两侧都有上下限：抽屉很窄时优先保右栏（内容才是
+    // 用户真正要看的东西），把左栏压到下限。
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float totalW = std::max(avail.x, 200.0f);
+    constexpr float kGap = 6.0f;
+    float treeW = std::clamp(totalW * 0.18f, 132.0f, 250.0f);
+    float typeW = std::clamp(totalW * 0.11f, 96.0f, 140.0f);
+    float itemsW = totalW - treeW - typeW - kGap * 2.0f;
+    if (itemsW < 160.0f) {
+        // 极窄：先收类型栏，再收树
+        typeW = std::max(typeW * 0.75f, 80.0f);
+        itemsW = totalW - treeW - typeW - kGap * 2.0f;
+        if (itemsW < 160.0f) {
+            treeW = std::max(treeW * 0.7f, 90.0f);
+            itemsW = std::max(totalW - treeW - typeW - kGap * 2.0f, 80.0f);
+        }
+    }
 
-    // 统计文字（原来的底行：播放条已移到视口正下方，这里保持原状）
-    char stat[512];
-    std::snprintf(stat, sizeof(stat), "%zu entries  |  %s", m_entries.size(),
-                  m_rel.empty() ? "(root)" : m_rel.c_str());
-    ImGui::TextDisabled(TR("%s"), stat);
+    drawTreePane(treeW);
+    ImGui::SameLine(0.0f, kGap);
+    drawTypePane(typeW);
+    ImGui::SameLine(0.0f, kGap);
+    drawItemsPane(itemsW);
+
+    // ⚠ 原来这里有一行 "N entries | assets" 统计。2026-10-17 起它挪到了
+    //   编辑器底栏（EditorApp::drawBottomBar 调 entryCount()/currentRel()）——
+    //   抽屉是"从底栏往上弹"的，统计留在抽屉里会跟着抽屉一起消失，
+    //   而它本来就该是"常驻的全局信息"。
 
     // 键盘：Backspace 上一级；Alt+← / Alt+→ 历史；F2 重命名；Delete 删除
     const ImGuiIO& io = ImGui::GetIO();
@@ -1648,7 +2307,6 @@ void ContentBrowser::draw() {
     }
 
     drawDeleteConfirm();
-    ImGui::End();
 
     // ---- 帧末统一处理（不在遍历格子的过程中改文件系统）----
     if (m_renameCommit) commitRename();
@@ -1660,6 +2318,19 @@ void ContentBrowser::draw() {
         m_newFolderRequest = false;
         createFolder();
     }
+    // 导入对话框放在**最后**：此时本帧所有 ImGui 控件都已提交，
+    // 阻塞进 Win32 消息循环也不会破坏这一帧的数据。
+    if (m_importRequest) {
+        m_importRequest = false;
+        openImportDialog();
+    }
+}
+
+// 底栏的 "N entries | assets" 用。抽屉关着时也要能显示 —— 所以这里
+// 顺手做一次 refresh（只在 dirty 时列目录，不每帧扫盘）。
+std::size_t ContentBrowser::entryCount() {
+    if (m_dirty) refresh();
+    return m_entries.size();
 }
 
 } // namespace editor

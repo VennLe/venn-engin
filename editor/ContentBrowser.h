@@ -32,6 +32,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -44,6 +45,15 @@ public:
     ~ContentBrowser() = default;
 
     void draw();
+
+    // 抽屉形态：调用方已经 Begin 了一个无标题栏窗口（头部行由 EditorApp 画），
+    // 这里只画导航 + 工具行 + 内容区。见 ContentBrowser.cpp 的注释。
+    void drawBody();
+
+    // 底栏统计用（"7 entries | assets"）。抽屉关着时也能取到 —— 内部按需
+    // 刷新（dirty 才列目录）。
+    std::size_t entryCount();
+    const std::string& currentRel() const { return m_rel; }
 
 private:
     struct DirEntry {
@@ -60,13 +70,52 @@ private:
     enum class TypeFilter {
         All, Model, Texture, Material, Scene, Script, Shader, Folder
     };
+    // 排序字段 / 方向（2026-10-17：抽屉三栏改造时加的，见 drawSortMenu）
+    enum class SortBy { Name, Size };
+
+    // Add ▸ 子菜单的一项（13 种资源类型，顺序即菜单顺序、也是脚本按下标
+    // 取矩形时依赖的顺序 —— 只能往后加）。
+    struct AddKind {
+        const char* key;    // 日志 / 文件名里用的 ASCII 键（不进译文表）
+        const char* label;  // 英文原文（过 TR()）
+        const char* ext;    // 落盘扩展名（不含点）
+    };
+    static const AddKind* addKinds(int& count);
 
     void refresh();
 
-    // ---- 三段式 UI：导航行 / 工具行 / 内容区 ----
-    void drawNavRow();
-    void drawCrumbRow();     // 面包屑独占一整行（可点击跳转，窄面板下左裁）
-    void drawToolbarRow();   // 搜索 + 类型过滤 + 尺寸档 + 网格/列表切换
+    // ---- 三栏（目录树 | 类型过滤 | 内容）----
+    // 2026-10-17 用户需求：把 Content 拆成左中右三栏。
+    void drawTreePane(float w);    // 左：项目目录树（根 = 项目内容目录）
+    void drawTypePane(float w);    // 中：资源类型单选竖列
+    void drawItemsPane(float w);   // 右：当前目录内容 + 搜索/排序
+    void drawNavRow();             // 左栏头部四个图标按钮（↑ ⌂ ⟳ +）
+    void drawSearchRow();          // 右栏顶部：搜索框 + 历史 + 排序图标 + 视图
+    void drawSortMenu();           // 排序图标弹出的菜单内容（在 popup 里调）
+
+    // ---- 右栏最上面那一行动作条（2026-10-17 晚 用户需求 4）----
+    //   左端："Add"（图标+文字，点开一个**向上**弹的子菜单）
+    //   中间："Save All" + 上一层 / 下一层（历史导航）
+    //   右端：路径框（相对项目根目录的相对路径，只读、可选中复制）
+    void drawActionRow();
+    void drawAddMenu();            // Add 按钮上方弹出的子菜单（popup 里调）
+    // Add ▸ 各类资源。2026-10-17 阶段：**落一个最小的资产文件**
+    // （{"type":...,"version":1} 骨架）并立刻进入重命名 —— 和 New Folder
+    // 的手感一致。真正的加载器还没写，所以文件暂时只是"占位声明"。
+    void createAsset(const char* kindKey, const char* kindLabel,
+                     const char* ext);
+    void saveAll();                // 置位 EditorContext 的"保存所有"请求
+    // 导入：把系统文件对话框选中的文件**拷贝**进当前目录。
+    // ⚠ 对话框是模态阻塞的，必须在**帧末**调（见 drawBody 的收尾块）——
+    //   在 ImGui 遍历途中卡住会让本帧的顶点缓冲对不上。
+    void importFiles();
+    void openImportDialog();       // Win32 GetOpenFileNameW（非 Windows 走提示）
+    void drawDirNode(const std::string& rel, const std::string& label,
+                     int depth);
+    // 某个相对目录下的子目录名（带缓存 —— 每帧递归扫盘会拖慢 UI）
+    std::vector<std::string> subDirs(const std::string& rel);
+    void pushRecentSearch(std::string q);
+
     void drawGrid();
     void drawList();
     void drawEntry(const DirEntry& ent, float cellW, float cellH);
@@ -126,10 +175,26 @@ private:
     ViewMode m_view = ViewMode::Grid;
     ThumbSize m_thumb = ThumbSize::Medium;
     TypeFilter m_typeFilter = TypeFilter::All;
-    int m_typeFilterIdx = 0;   // Combo 索引（与 TypeFilter 一一对应）
+    int m_typeFilterIdx = 0;   // 单选列 / Combo 索引（与 TypeFilter 一一对应）
     int m_thumbIdx = 1;        // 尺寸档索引（0=Small .. 3=Huge）
     float m_cellW = 96.0f;     // 当前网格格子尺寸（drawGrid 每帧填，drawEntry 用）
     float m_cellH = 104.0f;
+
+    // ---- 排序（右栏排序图标的菜单）----
+    // 目录永远排在文件前面 —— 这一条与排序字段无关（和资源管理器一致）。
+    SortBy m_sortBy = SortBy::Name;
+    bool m_sortAsc = true;
+
+    // ---- 最近搜索（搜索框历史）----
+    // 只在**回车**或从历史里选时记录：边打边过滤很常见，但每敲一个字就
+    // 存一条历史会把列表刷满没用的前缀。
+    std::vector<std::string> m_recentSearches;
+    // 左栏目录树的子目录缓存：相对目录 → 子目录名（按名字排好）。
+    // refresh() 时整个清空（文件系统可能已经变了）。
+    std::unordered_map<std::string, std::vector<std::string>> m_dirCache;
+    // 目录树的根（相对 m_root）。有 assets/ 就是 "assets" —— "当前游戏项目
+    // 的内容目录"；没有则退化成 m_root 本身。
+    std::string m_contentRootRel;
     // 历史栈：m_histPos 指向当前目录；back/forward 只移动游标，不截断
     std::vector<std::string> m_history;
     int m_histPos = -1;
@@ -167,6 +232,22 @@ private:
 
     // 新建文件夹：建完立刻进入重命名
     bool m_newFolderRequest = false;
+
+    // ---- 动作条（Add / Save All / 上一层·下一层 / 路径框）----
+    // Add 按钮的矩形：子菜单要**贴着它往上**弹，所以每帧记一份
+    // （不使用 ImGui 的默认"鼠标下方"定位 —— 抽屉在屏幕最底下，往下弹
+    //  会直接出屏幕）。
+    float m_addBtnX0 = 0.0f;
+    float m_addBtnY0 = 0.0f;
+    float m_addBtnX1 = 0.0f;
+    float m_addBtnY1 = 0.0f;
+    // 导入对话框：点击只置位，真正的阻塞调用在 drawBody 帧末执行
+    bool m_importRequest = false;
+    // 路径框的显示缓冲（只读 InputText 需要一个可写缓冲；**不能**复用
+    // m_pathBuf —— 那是搜索框的，混用会让搜索内容被路径覆盖）
+    char m_pathDisplay[512] = {0};
+    // 路径变化才打 CB-PATH 日志（每帧打会把日志刷爆）
+    std::string m_lastPathLogged;
 
     // 缩略图缓存：绝对路径 → ImGui 纹理句柄（共享实现，见 ThumbnailCache.h）
     ThumbnailCache m_thumbs;

@@ -177,6 +177,87 @@ static void drawTypeIcon(ImDrawList* dl, ImVec2 p, float fs, NodeType t) {
     }
 }
 
+// 搜索框左侧的小放大镜：一个圆圈 + 一根斜柄。ImGui 自带字体里没有这个字形，
+// 和文件夹 / 类型图标一样用 DrawList 现画（清晰、不依赖资源文件）。
+static void drawMagnifierIcon(ImDrawList* dl, ImVec2 p, float s, ImU32 col) {
+    const float r = s * 0.32f;
+    const ImVec2 c(p.x + s * 0.42f, p.y + s * 0.42f);
+    dl->AddCircle(c, r, col, 0, 1.4f);
+    dl->AddLine(ImVec2(c.x + r * 0.74f, c.y + r * 0.74f),
+                ImVec2(p.x + s * 0.96f, p.y + s * 0.96f), col, 1.6f);
+}
+
+// 把一行文字塞进 [p.x, p.x + width)：放不下就在**字符边界**上截断并补 ".."。
+//
+// 为什么不直接让子窗口裁：名字画到类型列上会跟类型文字叠在一起（右侧那一列
+// 是独立绘制的，不是 ImGui 的列系统，没有自动裁切）。为什么不用 ImGui 内部的
+// RenderTextEllipsis：那是 imgui_internal.h 的东西，本项目没有暴露。
+// UTF-8 边界：只要 (byte & 0xC0) != 0x80 就是一个字符的起点 —— 中文名字被从
+// 中间截断会出现半个字形的乱码。
+static void drawClippedText(ImDrawList* dl, ImVec2 p, float width, ImU32 col,
+                            const char* text) {
+    if (!text || !text[0] || width <= 4.0f) return;
+    if (ImGui::CalcTextSize(text).x <= width) {
+        dl->AddText(p, col, text);
+        return;
+    }
+    static const char* kDots = "..";
+    const float dotsW = ImGui::CalcTextSize(kDots).x;
+    std::vector<int> cut;    // 合法的截断位置（字节下标）
+    const int n = static_cast<int>(std::strlen(text));
+    for (int i = 1; i <= n; ++i) {
+        if (i == n || (static_cast<unsigned char>(text[i]) & 0xC0) != 0x80) {
+            cut.push_back(i);
+        }
+    }
+    if (cut.empty()) return;
+    int lo = 0;
+    int hi = static_cast<int>(cut.size()) - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        const std::string part(text, static_cast<size_t>(cut[mid]));
+        if (ImGui::CalcTextSize(part.c_str()).x + dotsW <= width) lo = mid;
+        else hi = mid - 1;
+    }
+    std::string out(text, static_cast<size_t>(cut[lo]));
+    out += kDots;
+    dl->AddText(p, col, out.c_str());
+}
+
+// 类型列的显示名（UE Outliner 的 "Type" 列那一套：文件夹显示成"文件夹"，
+// 其余按组件给一个类名）。留在英文是刻意的 —— 这些是类名，和 Inspector /
+// 日志里的叫法一致，翻成中文反而对不上。
+//
+// `brief` = 短名。Hierarchy 默认宽 285px，其中类型列只分到 ~77px，
+// "DirectionalLight" / "StaticMeshActor" 放不下，截断成 "Directio.." /
+// "StaticM.." 反而认不出是什么。所以**先试全名、放不下退短名、再放不下才截断**
+// （见 drawNode 里那段）。短名只做"去掉后缀/取首词"，不改叫法体系。
+static const char* hierTypeLabel(const ecs::World& w, ecs::Entity e,
+                                bool brief = false) {
+    if (const auto* h = w.get<ecs::HierarchyComponent>(e)) {
+        if (h->group) return TR("Folder");
+    }
+    if (w.has<ecs::DirectionalLightComponent>(e))
+        return brief ? "DirLight" : "DirectionalLight";
+    if (w.has<ecs::PointLightComponent>(e))
+        return brief ? "PointLight" : "PointLight";     // 本来就够短
+    if (w.has<ecs::SpotLightComponent>(e))
+        return brief ? "SpotLight" : "SpotLight";
+    if (w.has<ecs::ParticleEmitterComponent>(e))
+        return brief ? "Particles" : "ParticleEmitter";
+    if (w.has<ecs::MeshComponent>(e))
+        return brief ? "Mesh" : "StaticMeshActor";
+    if (w.has<ecs::ScriptComponent>(e))
+        return brief ? "Script" : "ScriptActor";
+    if (w.has<ecs::CollisionComponent>(e))
+        return brief ? "Collider" : "ColliderActor";
+    if (w.has<ecs::DecalComponent>(e))
+        return brief ? "Decal" : "DecalActor";
+    if (w.has<ecs::PlayerComponent>(e))
+        return brief ? "Player" : "PlayerStart";
+    return "Empty";
+}
+
 // 状态列：眼睛（可见性）。visible=false 时画成"闭眼"（轮廓 + 斜杠）。
 static void drawEyeIcon(ImDrawList* dl, ImVec2 mn, ImVec2 mx, bool visible,
                         ImU32 col) {
@@ -296,19 +377,15 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
     if (m_ctx.selection() == e) flags |= ImGuiTreeNodeFlags_Selected;
 
-    // 用后缀标出组件构成，一眼看出这节点是干什么的
+    // 名字后缀只留**状态**（隐藏 / 不投影 / 锁定）。
+    // "这个节点是什么"已经由右侧的类型列回答（mesh / DirectionalLight / ...），
+    // 原来那几个 "  [mesh]" "  [sun]" 和类型列完全重复，占的还正是名字最缺的
+    // 那点宽度（Hierarchy 默认只有 280px 宽）。
     char label[256];
-    const auto* mc = w.get<ecs::MeshComponent>(e);
-    const auto* pl = w.get<ecs::PointLightComponent>(e);
-    const auto* sl = w.get<ecs::SpotLightComponent>(e);
-    const auto* scp = w.get<ecs::ScriptComponent>(e);
     const auto* vis = w.get<ecs::VisibilityComponent>(e);
-    const auto* dl = w.get<ecs::DirectionalLightComponent>(e);
     const bool locked = w.has<ecs::LockedComponent>(e);
 
-    std::snprintf(label, sizeof(label), "%s%s%s%s%s%s%s%s", name.c_str(),
-                  mc ? "  [mesh]" : "", dl ? "  [sun]" : "",
-                  (pl || sl) ? "  [light]" : "", scp ? "  [script]" : "",
+    std::snprintf(label, sizeof(label), "%s%s%s%s", name.c_str(),
                   (vis && !vis->visible) ? "  [hidden]" : "",
                   (vis && !vis->castShadow) ? "  [noshadow]" : "",
                   locked ? "  [locked]" : "");
@@ -359,7 +436,35 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
             col = IM_COL32(238, 202, 132, 255);
         else
             col = ImGui::GetColorU32(ImGuiCol_Text);
-        draw->AddText(ImVec2(textX, textY), col, label);
+        // 名字画到类型列左边界为止（超长就 ".." 截断，否则会压到类型文字上）
+        const float nameW = m_typeColX - textX - 6.0f;
+        // 名字后面还跟着状态后缀（[hidden] / [noshadow] / [locked]）。宽度不够
+        // 时**先丢后缀、保名字** —— 后缀是补充信息，把名字挤成 "Grou.." 属于
+        // 本末倒置（Hierarchy 默认宽度下每条长名字都会踩到）。
+        const char* shown = label;
+        if (ImGui::CalcTextSize(label).x > nameW &&
+            ImGui::CalcTextSize(name.c_str()).x <= nameW) {
+            shown = name.c_str();
+        }
+        drawClippedText(draw, ImVec2(textX, textY), nameW, col, shown);
+
+        // ---- 类型列：每一行都画（列头固定在上面） ----
+        // 右边界用**本行**自己的右沿而不是列头算出来的那个值：出现竖向滚动条
+        // 时行会窄 14px，用列头的值会让类型文字压进行尾的 👁/🔒。
+        const float typeLimit =
+            std::min(m_typeColRight, rmax.x - (ImGui::GetFontSize() + 6.0f) * 2.0f - 6.0f);
+        if (typeLimit > m_typeColX + 8.0f) {
+            const float typeW = typeLimit - m_typeColX;
+            // 全名放不下 → 退短名（"DirectionalLight" 77px 的列里只能留成
+            // "DirLight"；硬截成 "Directio.." 等于没说）。短名也放不下才截断。
+            const char* tl = hierTypeLabel(w, e);
+            if (ImGui::CalcTextSize(tl).x > typeW) {
+                const char* tb = hierTypeLabel(w, e, /*brief=*/true);
+                if (ImGui::CalcTextSize(tb).x <= typeW) tl = tb;
+            }
+            drawClippedText(draw, ImVec2(m_typeColX, textY), typeW,
+                            IM_COL32(150, 156, 166, dimmed ? 110 : 200), tl);
+        }
 
         // 记下行矩形给状态列用（见下面"状态列"——必须在右键菜单
         // 之后画，否则 InvisibleButton 会抢走 BeginPopupContextItem
@@ -632,9 +737,29 @@ void SceneHierarchy::draw() {
                           "Drag other entities onto it to nest them."));
     }
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##filter", "search... (type:mesh / type:light)",
-                             m_filter, sizeof(m_filter));
+    {
+        // 搜索框左侧塞一个小放大镜。做法：把 FramePadding.x 临时撑大 →
+        // 输入框的**文字起点右移**（提示语也跟着右移，不会压在图标上），
+        // 图标本身画在框内左侧、垂直居中。
+        const ImGuiStyle& st = ImGui::GetStyle();
+        const float fs = ImGui::GetFontSize();
+        const float iconS = fs * 0.82f;
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(st.FramePadding.x + iconS + 6.0f,
+                                   st.FramePadding.y));
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint(
+            "##filter", "search... (type:mesh / type:light)",
+            m_filter, sizeof(m_filter));
+        ImGui::PopStyleVar();
+        const ImVec2 mn = ImGui::GetItemRectMin();
+        const ImVec2 mx = ImGui::GetItemRectMax();
+        drawMagnifierIcon(ImGui::GetWindowDrawList(),
+                          ImVec2(mn.x + st.FramePadding.x + 3.0f,
+                                 (mn.y + mx.y) * 0.5f - iconS * 0.5f),
+                          iconS, ImGui::GetColorU32(ImGuiCol_TextDisabled));
+        logRect("HIER-SEARCH", mn, mx);
+    }
 
     // 自动化钩子（截图 / 回归测试）：启动时注入一次过滤词，
     // 验证 type: 语法与"过滤保留祖先链"行为。正常使用不设即无影响。
@@ -650,12 +775,71 @@ void SceneHierarchy::draw() {
         }
     }
 
-    // ---- E12 面包屑：选中实体的祖先链，可点击跳转 ----
-    drawBreadcrumb();
+    // ---- E12 面包屑整行已删（2026-10-17 用户要求）----
+    //
+    // 原来这里是"Path: (no selection)"或可点击的祖先链。用户要求去掉那行字；
+    // 顺着这条线整行删掉更符合参照的 UE Outliner（它没有路径行），也解决了
+    // 一个真实的坑：这一行**有/没有**会让下面整棵树上下跳一行 —— 点行尾
+    // 👁/🔒 时点击落在旧坐标上、松手时那一行已经挪走，表现为"图标点了没反应"
+    // （verify_hierarchy_status 的 A2/A3 抓到过）。整行不存在，就不存在
+    // "要不要给它留高度"的两难。
+    //
+    // 顺带一提：ContentBrowser 的目录面包屑也早就因为同样的理由整行删了。
 
-    ImGui::Separator();
+    // ---- 列头：项目标签 | 类型 ----
+    //
+    // 类型列的 x 用**绝对屏幕坐标**在这里算一次存进成员，树里的每一行都用
+    // 同一个值。不能两边各按"自己的左边缘 + 比例"算：列头在树 child 之外、
+    // 行在 child 之内，两者的内容起点差了一个 WindowPadding（8px），而且
+    // 出现滚动条时行的右边界还会再缩 14px —— 各算各的必然对不齐。
+    {
+        const float fs = ImGui::GetFontSize();
+        const ImVec2 mn = ImGui::GetCursorScreenPos();
+        const float w = ImGui::GetContentRegionAvail().x;
+        const float hdrH = fs + 8.0f;
+        const ImVec2 mx(mn.x + w, mn.y + hdrH);
+        // 行尾状态列占的宽度（👁 + 🔒 两格 + 右边距），类型文字不许压上去
+        const float iconsW = (fs + 6.0f) * 2.0f + 10.0f;
+        // 宽度分配：**名字列优先**。Hierarchy 默认只有 ~270px 内容宽，三列
+        // （名字 / 类型 / 两个状态图标）本来就挤，所以先按"至少 148px 给名字"
+        // 划一刀，剩下的才归类型列；面板再窄也要给类型列留 46px，不能被挤没
+        // （挤没的后果是两列文字直接叠在一起）。面板拉宽时类型列自动长大。
+        // 146 这个数是量出来的：默认宽度下 "DirectionalLight" 需要约 100px，
+        // 而名字文字起点在行左缘 +46（缩进 + 折行箭头 + 类型图标）→ 146 刚好
+        // 放得下；再小就会截成 "Direction.."。
+        float typeX = std::max(mn.x + 146.0f, mx.x - iconsW - 92.0f);
+        typeX = std::min(typeX, mx.x - iconsW - 46.0f);
+        m_typeColX = typeX;
+        m_typeColRight = mx.x - iconsW - 4.0f;
 
-    // ---- 树（底部预留 footer + 面包屑两行）----
+        ImGui::Dummy(ImVec2(w, hdrH));
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(mn, mx, ImGui::GetColorU32(ImGuiCol_TableHeaderBg));
+        dl->AddLine(ImVec2(typeX, mn.y + 2.0f), ImVec2(typeX, mx.y - 2.0f),
+                    ImGui::GetColorU32(ImGuiCol_Separator));
+        dl->AddLine(ImVec2(mn.x, mx.y - 0.5f), ImVec2(mx.x, mx.y - 0.5f),
+                    ImGui::GetColorU32(ImGuiCol_Separator));
+
+        const ImU32 txt = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+        const float eyeS = fs * 0.8f;
+        const float eyeY = mn.y + (hdrH - eyeS) * 0.5f;
+        // 左边那颗 👁 只是"这一列是可见性"的表意（真正的开关在每一行行尾），
+        // 所以画成禁用色、不做命中。
+        drawEyeIcon(dl, ImVec2(mn.x + 3.0f, eyeY),
+                    ImVec2(mn.x + 3.0f + eyeS, eyeY + eyeS), true, txt);
+        const float ty = mn.y + (hdrH - fs) * 0.5f;
+        dl->AddText(ImVec2(mn.x + 3.0f + eyeS + 6.0f, ty), txt,
+                    TR("Item Label"));
+        dl->AddText(ImVec2(typeX + 6.0f, ty), txt, TR("Type"));
+        // 自动化锚点：列头矩形 + 类型列左边界（脚本据此断言"两列都在、
+        // 类型列没压到行尾图标上"，也顺带证明它画在列表上方）。
+        if (std::getenv("MYVK_LOG_RECTS")) {
+            VK_LOG_INFO("HIER-COLHDR=(%.0f,%.0f)-(%.0f,%.0f) typeX=%.0f",
+                        mn.x, mn.y, mx.x, mx.y, typeX);
+        }
+    }
+
+    // ---- 树（底部预留 footer 一行）----
     ImGui::BeginChild("##tree", ImVec2(0, -46.0f), ImGuiChildFlags_None);
 
     // 右键空白处也能新建
@@ -719,10 +903,9 @@ void SceneHierarchy::draw() {
                             avail.y > 6.0f ? avail.y : 6.0f));
         const ImVec2 a = ImGui::GetItemRectMin();
         const ImVec2 b = ImGui::GetItemRectMax();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImU32 hintCol = IM_COL32(120, 126, 136, 140);
-        dl->AddText(ImVec2(a.x + 6.0f, a.y + 4.0f), hintCol,
-                    "drop a model here to create an entity");
+        // 这里原来还画了一行灰色提示 "drop a model here to create an entity"。
+        // 2026-10-17 用户要求去掉（树下方那块空白就是落点，文字纯属噪音）。
+        // 落点矩形照旧上报 —— verify_asset_drag 靠它算拖放坐标。
         logRect("HIER-RECT drop", a, b);
         if (ImGui::BeginDragDropTarget()) {
             if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(drag::kAsset)) {
@@ -742,41 +925,6 @@ void SceneHierarchy::draw() {
     ImGui::End();
 
     flushPending();
-}
-
-// ---------------------------------------------------------------- E12 面包屑
-
-void SceneHierarchy::drawBreadcrumb() {
-    const ecs::Entity sel = m_ctx.selection();
-    ecs::World& w = m_ctx.editorScene().world();
-    if (!sel.valid()) {
-        ImGui::TextDisabled(TR("Path: (no selection)"));
-        return;
-    }
-    // 从选中节点向上收祖先链（画出来是 Root / ... / 选中项）
-    std::vector<ecs::Entity> chain{sel};
-    ecs::Entity cur = sel;
-    for (int d = 0; d < 64; ++d) {
-        const auto* h = w.get<ecs::HierarchyComponent>(cur);
-        if (!h || h->parent == ecs::kInvalidEntity) break;
-        cur = w.handle(h->parent);
-        if (!cur.valid()) break;
-        chain.push_back(cur);
-    }
-    std::reverse(chain.begin(), chain.end());
-
-    ImGui::TextDisabled(TR("Path:"));
-    for (size_t i = 0; i < chain.size(); ++i) {
-        ImGui::SameLine();
-        if (i) {
-            ImGui::TextDisabled(TR("/"));
-            ImGui::SameLine();
-        }
-        const std::string* np = w.name(chain[i]);
-        ImGui::PushID(static_cast<int>(chain[i].id));
-        if (ImGui::SmallButton(np ? np->c_str() : "?")) m_ctx.select(chain[i]);
-        ImGui::PopID();
-    }
 }
 
 // ---------------------------------------------------------------- pending

@@ -1,10 +1,12 @@
-"""端到端验证：视口 Shift+A 添加菜单 + 视口正下方播放条。
+"""端到端验证：视口 Shift+A 添加菜单 + 底部通栏。
 
 覆盖：
   1. 布局断言（日志矩形，确定性）：
-     - TR-BAR 紧贴 VP-RECT 底边（播放条在视口正下方）
-     - TR-BAR 高度 ≈ 34px（"刚刚好一行"）
-     - 彩色按钮组（Run/Play/Pause/Stop）水平居中于 TR-BAR
+     - BAR-BOTTOM 是通栏（x 从 0 到客户区宽）、高度 ≈ 32px
+     - 三个图标按钮（Content / Output Log / CMD）都在底栏内、从左往右排
+     - 每个按钮左侧都画出彩色 Logo（不是只剩灰文字）
+     （2026-10-17：原来的"视口下方播放条 TR-BAR"已按用户要求移除，
+       这一组断言换成校验新底栏 —— 见 docs/editor_roadmap.md。）
   2. Shift+A 菜单：
      - 打开菜单（VP-ADD-OPEN 日志 = 打开成功）
      - 键盘导航激活 Mesh > Cube（ImGui 已启用 NavEnableKeyboard：
@@ -284,11 +286,11 @@ def main():
         time.sleep(1.0)
 
         vp = tap.last_rect("VP-RECT")
-        tr = tap.last_rect("TR-BAR")
-        print("VP-RECT:", vp)
-        print("TR-BAR :", tr)
-        if not vp or not tr:
-            print("缺 VP-RECT / TR-BAR 日志")
+        bar = tap.last_rect("BAR-BOTTOM")
+        print("VP-RECT  :", vp)
+        print("BAR-BOTTOM:", bar)
+        if not vp or not bar:
+            print("缺 VP-RECT / BAR-BOTTOM 日志")
             return 3
 
         # 窗口尺寸 sanity check：偶尔 Window Manager 不吃 resize，
@@ -303,22 +305,29 @@ def main():
             user32.SetWindowPos(hwnd, 0, 100, 100, tw, th, 0x0004)
             time.sleep(2.0)
             vp = tap.last_rect("VP-RECT")
-            tr = tap.last_rect("TR-BAR")
-            print("retry VP-RECT:", vp, " TR-BAR:", tr)
+            bar = tap.last_rect("BAR-BOTTOM")
+            print("retry VP-RECT:", vp, " BAR-BOTTOM:", bar)
 
-        # ---- 断言 1：播放条紧贴视口底边、高度 ≈ 34 ----
-        # （VP-RECT 是视口窗口内的 3D 图像矩形；图像下方还有 ~8px 的
-        #   窗口内边距，所以允许 10px 容差）
-        if abs(tr[1] - vp[3]) <= 10.0:
-            print("断言 1a (TR-BAR 紧贴视口底边): PASS")
+        # ---- 断言 1：底栏紧贴状态栏上方、高度 ≈ 32 ----
+        #
+        # 2026-10-17 布局改造后，原"视口正下方播放条（TR-BAR）"已被移除，
+        # 换成状态栏上方这条通栏（BAR-BOTTOM = Content / 输出日志 / CMD）。
+        # 这里保留"固定条的形状"这一层校验，只是换成新对象：
+        #   · 底栏必须**通栏**（x 从 0 到客户区宽）；
+        #   · 高度 32px；
+        #   · 下边缘正好压在状态栏上（客户区高 - 26）。
+        if abs((bar[3] - bar[1]) - 32.0) <= 4.0:
+            print("断言 1a (底栏高度≈32): PASS")
         else:
-            print("断言 1a: FAIL")
-            fails.append("1a tr.y0=%.0f vs vp.y1=%.0f" % (tr[1], vp[3]))
-        if abs((tr[3] - tr[1]) - 34.0) <= 5.0:
-            print("断言 1b (TR-BAR 高度≈34): PASS")
+            print("断言 1a: FAIL h=%.0f" % (bar[3] - bar[1]))
+            fails.append("1a bar h=%.0f" % (bar[3] - bar[1]))
+        if bar[0] <= 2.0 and abs(bar[2] - crect.right) <= 3.0:
+            print("断言 1b (底栏通栏 x∈[%.0f,%.0f], 客户区宽 %d): PASS"
+                  % (bar[0], bar[2], crect.right))
         else:
-            print("断言 1b: FAIL")
-            fails.append("1b h=%.0f" % (tr[3] - tr[1]))
+            print("断言 1b: FAIL bar x∈[%.0f,%.0f] vs W=%d"
+                  % (bar[0], bar[2], crect.right))
+            fails.append("1b bar not full width")
 
         # ---- 断言 2：整组彩色按钮在播放条内且水平居中 ----
         #
@@ -330,27 +339,42 @@ def main():
         #   组中心被拽到 1020 而条中心只有 774 → 误报 FAIL（按钮一动没动）。
         #   2026-10-16 全量回归就是这么挂的：拿 addmenu_00_full.png 复算，
         #   TR-BAR 之内彩色像素只有 x∈[630,853]（中心 742，与 774 差 33 < 40）。
+        #
+        # 2026-10-17：播放条移除后，这一条改成校验**底栏的三个图标按钮**：
+        #   · 三个矩形都落在底栏内；
+        #   · 从左往右 content < log < cmd（用户要求的顺序）；
+        #   · 每个按钮左侧 22px 内**有彩色像素**（= Logo 真的画出来了，
+        #     不是只剩灰文字）。
         img, _ = capture_client(hwnd)
         px = img.load()
         W, H = img.size
-        bx0 = max(int(tr[0]), 0)
-        bx1 = min(int(tr[2]), W)
-        colored = [(x, y) for y in range(int(tr[1]) + 2, min(int(tr[3]) - 2, H))
-                   for x in range(bx0, bx1)
-                   if max(px[x, y][:3]) - min(px[x, y][:3]) > 45]
-        if colored:
-            xs = [p[0] for p in colored]
-            row_cx = (min(xs) + max(xs)) * 0.5
-            tr_cx = (tr[0] + tr[2]) * 0.5
-            ok = abs(row_cx - tr_cx) < 40.0
-            print("断言 2 (按钮组居中, 组中心 x=%.0f, 条中心 x=%.0f, "
-                  "彩色 x∈[%d,%d]): %s"
-                  % (row_cx, tr_cx, min(xs), max(xs), "PASS" if ok else "FAIL"))
-            if not ok:
-                fails.append("2 row-center x=%.0f vs %.0f" % (row_cx, tr_cx))
+        btns = [("content", tap.last_rect("BAR-BTN-content")),
+                ("log", tap.last_rect("BAR-BTN-log")),
+                ("cmd", tap.last_rect("BAR-BTN-cmd"))]
+        miss = [n for n, r in btns if not r]
+        if miss:
+            print("断言 2: FAIL（缺按钮矩形 %s）" % miss)
+            fails.append("2 missing rects %s" % miss)
         else:
-            print("断言 2: FAIL（没找到彩色按钮）")
-            fails.append("2 no colored buttons")
+            inside = all(r[1] >= bar[1] - 1.0 and r[3] <= bar[3] + 1.0
+                         for _, r in btns)
+            ordered = btns[0][1][0] < btns[1][1][0] < btns[2][1][0]
+            icons = 0
+            for _, r in btns:
+                for y in range(int(r[1]), min(int(r[3]), H)):
+                    for x in range(int(r[0]), min(int(r[0]) + 22, W)):
+                        q = px[x, y][:3]
+                        if max(q) - min(q) > 40:
+                            icons += 1
+            print("断言 2 (三按钮在底栏内=%s / 从左往右=%s / Logo 彩色像素=%d, "
+                  "x=(%.0f,%.0f,%.0f)): %s"
+                  % (inside, ordered, icons, btns[0][1][0], btns[1][1][0],
+                     btns[2][1][0],
+                     "PASS" if (inside and ordered and icons > 60) else "FAIL"))
+            if not (inside and ordered):
+                fails.append("2 layout inside=%s ordered=%s" % (inside, ordered))
+            elif icons <= 60:
+                fails.append("2 icons too few colored px (%d)" % icons)
 
         img, _ = capture_client(hwnd)
         img.save(os.path.join(out, "addmenu_00_full.png"))

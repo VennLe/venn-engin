@@ -1798,6 +1798,16 @@ void Renderer::setSubviewCount(size_t n) {
     if (n < m_subviews.size()) {
         // 缩容：先释放 ImGui 纹理（ImGui 后端还活着时必须先摘），
         // 再从 m_targets 里把自己摘掉，最后重排槽位。
+        //
+        // ⚠ 必须先 device.waitIdle()。这一句是 2026-10-17 第四轮补的：
+        //   setSubviewCount 是**在渲染中途**被调用的（视口工具条的下拉，
+        //   或者切工作区），而上一次提交的命令缓冲可能还在跑、里面的
+        //   descriptor set 正指着这些目标 —— 直接析构就会撞上
+        //   `vkFreeDescriptorSets(): can't be called on a VkDescriptorSet
+        //   that is currently in use`（真机验证层实测报出来的）。
+        //   代价是这一次切换卡一下，切布局本来就是低频操作，可以接受。
+        //   （扩容方向不需要：新建的资源没有历史引用。）
+        m_device->waitIdle();
         for (size_t i = n; i < m_subviews.size(); ++i) {
             render::RenderTarget* t = m_subviews[i].target;
             if (!t) continue;

@@ -1,5 +1,10 @@
 #include "Workspace.h"
 
+#include "EditorContext.h"
+
+#include "core/Logger.h"
+#include "render/Renderer.h"
+
 #include <cstring>
 
 namespace editor {
@@ -10,9 +15,8 @@ namespace {
 // 用 id 字符串而不是下标 —— 见头文件里的说明（下标错位是静默的）。
 // 这些字符串必须与 PanelRegistry 表里的 id 完全一致。
 
-// Level：默认。四个主面板齐全，调参面板收起。
-const char* const kLevelOpen[] = {"hierarchy", "content", "viewport",
-                                  "inspector", nullptr};
+// Level：默认。三个主面板（Content 已改成底栏抽屉，默认关着）。
+const char* const kLevelOpen[] = {"hierarchy", "viewport", "inspector", nullptr};
 const char* const kLevelClose[] = {"stats", "scripts", "engine", "console",
                                    nullptr};
 
@@ -23,9 +27,8 @@ const char* const kRenderOpen[] = {"viewport", "inspector", "engine", "stats",
 const char* const kRenderClose[] = {"hierarchy", "scripts", "console",
                                     nullptr};
 
-// Character：搭角色 / 摆位。层级 + 内容 + 检查器 + 视口。
-const char* const kCharOpen[] = {"hierarchy", "content", "viewport",
-                                 "inspector", nullptr};
+// Character：搭角色 / 摆位。层级 + 检查器 + 视口（Content 走底栏抽屉）。
+const char* const kCharOpen[] = {"hierarchy", "viewport", "inspector", nullptr};
 const char* const kCharClose[] = {"stats", "scripts", "engine", "console",
                                   nullptr};
 
@@ -80,6 +83,26 @@ const char* viewportLayoutName(ViewportLayout l) {
 }
 
 int viewportLayoutCount() { return 4; }
+
+int viewportSubviewCount(ViewportLayout l) {
+    switch (l) {
+        case ViewportLayout::Single: return 0;
+        case ViewportLayout::TwoVertical:
+        case ViewportLayout::TwoHorizontal: return 1;
+        case ViewportLayout::Quad: return 3;
+    }
+    return 0;
+}
+
+void applyViewportLayout(EditorContext& ctx, render::Renderer& renderer,
+                         ViewportLayout l) {
+    ctx.setViewportLayout(l);
+    const int sub = viewportSubviewCount(l);
+    // Single = 只有主视口；其余布局每个格子各一个离屏目标，
+    // 主视口用 0 号，剩下的都是"子视口"。
+    renderer.setSubviewCount(static_cast<size_t>(sub));
+    VK_LOG_INFO("VIEWPORT-LAYOUT %s (subviews=%d)", viewportLayoutName(l), sub);
+}
 
 int workspaceIndexOf(const char* id) {
     if (!id) return -1;

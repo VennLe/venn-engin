@@ -37,6 +37,8 @@
 
 #include "EditorContext.h"
 
+#include <glm/glm.hpp>
+
 #include <string>
 
 namespace editor {
@@ -67,6 +69,11 @@ public:
     virtual const char* gpuName() = 0;
     virtual const char* engineVersion() = 0;
 
+    // ---- 顶栏播放条：前进一帧 ----
+    // "先进入暂停（有运行态）再推进一个固定步长"这件事要动物理世界和
+    // 脚本引擎，Toolbar 两样都拿不到 —— 所以只发一个意图出去。
+    virtual void stepOneFrame() = 0;
+
     // ---- E18 命令面板（Help 菜单的入口；Ctrl+Shift+P 由 EditorApp 直接处理）----
     virtual void showCommandPalette() = 0;
     // ---- E21 通知历史（Help 菜单的入口）----
@@ -96,6 +103,13 @@ private:
     void drawWorkspaceMenu();
     void drawViewModeMenu();
 
+    // 顶栏 "+ Add" 按钮弹出的添加菜单（Mesh / Light / Player）。
+    // 与视口里的 Shift+A 菜单是同一批工厂函数，区别只有**落点**：
+    // 视口菜单落在鼠标射线的地面交点上，顶栏没有鼠标上下文，按环形排队摆。
+    void drawAddBarMenu();
+    // 顶栏添加菜单的下一个落点（2m 间距的环，环满了往外扩一圈）
+    glm::vec3 nextAddSpot();
+
     void saveSceneAs(const std::string& relPath);
 
     // 工具栏分组之间的竖线（比 TextUnformatted("|") 更像 UE5 的分组线）
@@ -113,6 +127,9 @@ private:
         bool build = true;
     };
     BarGroups m_groups;
+
+    // 顶栏添加菜单的摆位计数（见 nextAddSpot）
+    int m_addCounter = 0;
 
     // 两个帮助窗口
     bool m_showAbout = false;

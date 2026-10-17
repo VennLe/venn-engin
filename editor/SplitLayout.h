@@ -91,8 +91,35 @@ public:
     // 设置面板里拖高度滑块时实时生效。
     void setToolbarHeight(float h) { m_toolbarH = h; }
 
+    // 主体区底部要**额外**留出的高度（状态栏之上）。
+    //
+    // 2026-10-17：底栏（Content / 输出日志 / CMD 那一行）从这里扣。
+    // 之所以做成"inset"而不是在 EditorApp 里事后压缩各面板矩形：
+    // 分隔条的命中检测、最大化判定都复用了同一套 bodyH 计算
+    // （见 bodyRect / apply / handleSplitters），事后压缩会让
+    // "分隔条画在 A 处、命中在 B 处"。扣在源头只有一处。
+    void setBottomInset(float h) { m_bottomInset = h > 0.0f ? h : 0.0f; }
+
     // 重置为默认分栏（"Reset Layout" 用）
     void reset();
+
+    // ------------------------------------------------------------
+    // 遮挡矩形（浮层式 Content 抽屉）
+    // ------------------------------------------------------------
+    // 抽屉是**浮层**（默认不 dock）：它横跨整宽盖在视口下半部，但它不属于
+    // 分栏树 —— 分栏树算出来的 separator 仍然穿过它。所以把这个矩形交给
+    // 分栏器，让它把分隔条**切成可见的几段**：
+    //   · 画只画可见段（原来整条画在 ForegroundDrawList 上，会直接压在
+    //     抽屉里，用户看到的是"Hierarchy | Viewport 那条线渗进 Content"）
+    //   · 命中判定也只用可见段（否则在抽屉里拖高度会误拖分栏）
+    // off = true 时完全忽略（抽屉关着 → 行为与没有这个功能时逐像素一致）。
+    void setOccluder(bool on, float x0, float y0, float x1, float y1) {
+        m_occlOn = on;
+        m_occlX0 = x0;
+        m_occlY0 = y0;
+        m_occlX1 = x1;
+        m_occlY1 = y1;
+    }
 
     // ---- 面板显隐（E06-5）----
     // 被关掉的面板那一侧收成 0 宽/高，邻居吃掉空间。
@@ -163,6 +190,16 @@ private:
     float m_dispH = 0.0f;
 
     float m_toolbarH = 48.0f;   // 工具栏高度（可被 setToolbarHeight 覆盖）
+    float m_bottomInset = 0.0f; // 底栏（+ 停靠的 Content 抽屉）占掉的高度
+
+    // 遮挡矩形（浮层抽屉）。见 setOccluder。
+    // 刻意用 4 个 float 而不是 ImVec2：这个头文件不 include imgui.h
+    // （EditorContext 也不 include），为两个点引一整包头文件不划算。
+    bool m_occlOn = false;
+    float m_occlX0 = 0.0f;
+    float m_occlY0 = 0.0f;
+    float m_occlX1 = 0.0f;
+    float m_occlY1 = 0.0f;
 
     std::vector<SplitNode> m_nodes;
     int m_root = -1;

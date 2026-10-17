@@ -85,6 +85,13 @@ bool* panelOpenSlotById(const char* id);
 // 供 EditorContext::PanelVisibility 的引用成员初始化，那里不能接 nullptr。
 bool& panelOpenRef(const char* id);
 
+// "勾着，但窗口被底栏托盘按钮临时收起来了"（按钮仍在，再点一下回来）。
+// 和 panelOpen 分开存，是因为它们是两个概念：panelOpen = 这个面板的按钮
+// 在不在（落盘），trayHidden = 窗口现在是不是被藏了（会话内）。
+// setPanelOpen(i, true) 会自动清掉它 —— 任何"打开"动作都以可见为准。
+bool* panelTrayHiddenSlot(int index);
+bool& panelTrayHiddenRef(int index);
+
 int  panelIndexOf(const char* id);
 bool panelOpen(int index);
 void setPanelOpen(int index, bool open);

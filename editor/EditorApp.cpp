@@ -6,6 +6,8 @@
 #include "ContentBrowser.h"
 #include "DebugRects.h"
 #include "EditorContext.h"
+#include "EditorIcons.h"
+#include "ui/ImGuiTheme.h"
 #include "EditorLayoutIO.h"
 #include "ConsolePanel.h"
 #include "FeatureUIGen.h"
@@ -20,6 +22,8 @@
 #include "InspectorPanel.h"
 #include "KeyBindingsPage.h"
 #include "PanelRegistry.h"
+#include "ParticlesPanel.h"
+#include "PhysicsPanel.h"
 #include "SceneHierarchy.h"
 #include "SplitLayout.h"
 #include "Toolbar.h"
@@ -43,6 +47,10 @@
 #include "ui/ImGuiTheme.h"
 
 #include <imgui.h>
+// ⚠ 只有一处用到内部 API：抽屉每帧 BringWindowToDisplayFront（见
+//   drawContentDrawer 末尾）。公开 API 没有"只改绘制顺序、不动焦点"
+//   的入口，而 SetNextWindowFocus 会抢键盘焦点。
+#include <imgui_internal.h>
 
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
@@ -61,13 +69,27 @@ namespace editor {
 
 namespace {
 
+// 早期声明：drawPanels（本文件前部）要给浮动面板抢层级，需要按 id 拿到
+// 它的 ImGui 窗口名；真正的定义在文件后半段（托盘那一节）。
+std::string trayWindowName(const char* id);
+
 // 布局常量（像素）。主体四个面板（Hierarchy/Content/Viewport/Inspector）
 // 已交给 SplitLayout 分栏树按比例自适应；这里只保留横贯全宽的固定条
 // 与浮动调试面板的尺寸常量。
 constexpr float kStatusH = 26.0f;
 // 视口正下方播放条（Run / Play / Pause / Stop）的高度。
 // "刚刚好一行"：一行按钮（28px）+ 上下各 3px 内边距。
+//
+// ⚠ 2026-10-17：这一条**不再绘制**（用户要求"动画部分的操作 UI 先全部
+//   移除"）。常量保留给 LayoutRects::transport 的注释与历史脚本对照，
+//   但 computeLayout 不再从视口里扣它。
 constexpr float kTransportH = 34.0f;
+// 底部通栏（Content / 输出日志 / CMD 三个带图标的按钮）的高度。
+// 比状态栏高一点：里面有 22px 的图标，上下各留 4px 呼吸。
+constexpr float kBottomBarH = 32.0f;
+// Content 抽屉的高度范围与默认值（未停靠时是浮层，停靠时占布局）。
+constexpr float kContentDrawerMin = 120.0f;
+constexpr float kContentDrawerDefault = 320.0f;
 // 视口最小渲染尺寸（与 ViewportPanel 的同名常量保持一致）
 constexpr float kMinViewport = 64.0f;
 
@@ -274,8 +296,11 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
          true, false, kSlotHierarchy, &EditorApp::panelDrawHierarchy},
         {"inspector", "Inspector", PanelGroup::General, "Alt+2", "sliders",
          true, false, kSlotInspector, &EditorApp::panelDrawInspector},
+        // ⚠ content 的 defaultOpen = false：2026-10-17 起它是"底栏抽屉"，
+        //   默认关着（用户要求）。仍然留在表里 → View/Window 菜单、Alt+3、
+        //   布局持久化照旧可用；只是它不再占分栏（见 SplitLayout 的注释）。
         {"content", "Content Browser", PanelGroup::General, "Alt+3", "folder",
-         true, false, kSlotContent, &EditorApp::panelDrawContent},
+         false, false, kSlotContent, &EditorApp::panelDrawContent},
         {"viewport", "Viewport", PanelGroup::General, "Alt+4", "camera",
          true, false, kSlotViewport, &EditorApp::panelDrawViewport},
         {"stats", "Stats", PanelGroup::Debug, "Alt+5", "chart",
@@ -292,6 +317,17 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         // Rendering 工作区默认打开 —— 见 Workspace.cpp 的 kRenderOpen。
         {"gputimeline", "GPU Timeline", PanelGroup::Authoring, "Alt+9",
          "timer", false, true, kSlotNone, &EditorApp::panelDrawGpuTimeline},
+        // ---- 2026-10-17 晚：底栏"+"托盘里勾出来的功能面板 ----
+        // 这三张都画在自己的文件里（CharacterWindow / PhysicsPanel /
+        // ParticlesPanel），表项只负责"显隐 + 快捷键 + 落盘"，与其余浮动
+        // 面板完全一致 —— 于是托盘、View 菜单、快捷键、布局持久化四路
+        // 自动跟上，不需要在托盘里另开一套注册表。
+        {"character", "Character", PanelGroup::Authoring, "Alt+0", "user",
+         false, true, kSlotNone, &EditorApp::panelDrawCharacter},
+        {"physics", "Physics", PanelGroup::Authoring, "", "atom",
+         false, true, kSlotNone, &EditorApp::panelDrawPhysics},
+        {"particles", "Particles", PanelGroup::Authoring, "", "spark",
+         false, true, kSlotNone, &EditorApp::panelDrawParticles},
     };
 }
 
@@ -315,6 +351,32 @@ void EditorApp::panelDrawEngine(EditorApp& a) { a.drawEnginePanel(); }
 void EditorApp::panelDrawConsole(EditorApp& a) { a.drawConsolePanel(); }
 void EditorApp::panelDrawGpuTimeline(EditorApp& a) {
     a.drawGpuTimelinePanel();
+}
+// Character 是唯一"窗口对象活得比面板状态久"的一张：CharacterWindow 自己
+// 有 open/close，还要绑定一个玩家实体。所以这里只做**双向同步** ——
+//   · 面板勾上（open=true）而窗口没开 → 用当前选中项（没有就空实体）打开
+//   · 关窗口的 × 被点 → 把面板勾选也去掉
+//
+// ⚠ 同步**不能**放在这个 draw 钩子里：`drawPanels` 只在 `panelOpen()`
+//   为真时才派发，于是"从菜单/命令面板把勾去掉"这条路走不到这里，窗口
+//   会留在屏幕上（表里以为关了、屏幕上还开着）。真正的同步在
+//   `drawCharacterWindow()` 里 —— 它每帧无条件被调用。这里保持空壳只是
+//   为了让面板表有一项 draw 入口（表项没有 draw 且 slot==kSlotNone 时会
+//   画一个占位窗口）。
+//
+// ⚠ 2026-10-17 第四轮修的 bug（用户原话："点击 character 面板右上角的叉号
+//   关闭按钮无法关闭 character 面板"）：上一版写的是 `panelOpen && !isOpen
+//   → open()`。点 × 时 CharacterWindow 把自己的 `m_open` 关掉，但注册表那
+//   一格**还是勾着的** → 下一个同步周期看到"勾着却没开"，于是又给它打开，
+//   表现就是叉号按了没反应。现在用 m_characterWasOpen 记住"上一帧它开过"，
+//   由此区分两种"勾着但没开"：**用户刚关的**（上帧开过）与**刚被勾上的**
+//   （上帧没开）。前者把注册表也关掉，后者才打开。
+void EditorApp::panelDrawCharacter(EditorApp& a) { (void)a; }
+void EditorApp::panelDrawPhysics(EditorApp& a) {
+    if (a.m_physicsPanel) a.m_physicsPanel->draw();
+}
+void EditorApp::panelDrawParticles(EditorApp& a) {
+    if (a.m_particlesPanel) a.m_particlesPanel->draw();
 }
 
 void EditorApp::drawPlaceholderPanel(int panelIndex) {
@@ -353,7 +415,13 @@ void EditorApp::drawPanels() {
     const std::vector<PanelDesc>& t = panelTableVec();
     for (int i = 0; i < static_cast<int>(t.size()); ++i) {
         if (!panelOpen(i)) continue;
+        // 底栏按钮把窗口收起来了：不提交 = ImGui 认为它关着。勾选状态留着，
+        // 所以按钮还在，再点一下就回来。
+        if (panelTrayHiddenRef(i)) continue;
         const PanelDesc& p = t[i];
+        // Content 是"底栏抽屉"，不走表驱动绘制（它要盖在所有面板之上，
+        // 而这里的顺序是表顺序 → 会被后画的视口盖住）。见 drawContentDrawer。
+        if (p.layoutSlot == kSlotContent) continue;
         // 分栏树里的面板：被"最大化"顶掉的那三个不画
         if (p.layoutSlot != kSlotNone && !m_split->showsInLayout(p.layoutSlot)) {
             continue;
@@ -362,6 +430,23 @@ void EditorApp::drawPanels() {
             p.draw(*this);
         } else if (p.layoutSlot == kSlotNone) {
             drawPlaceholderPanel(i);
+        }
+
+        // 浮动面板抢层级 —— 和 Content 抽屉完全同一个理由（那边有长注释）：
+        // 一旦点中视口，ImGui 就把视口挪到 g.Windows 末尾，于是"后画的在
+        // 上层"只在那一帧成立；此后新建的面板会被视口**盖住**。表现是
+        // "在底栏勾上 Physics，面板却看不见" —— 用户会以为按钮坏了。
+        // 有弹出层时不提（右键菜单 / 下拉都在 g.Windows 里，硬提会把它们
+        // 压在面板下面）；折叠的不提（它只剩一条标题栏，没必要往前挤）。
+        if (p.layoutSlot == kSlotNone && p.draw) {
+            ImGuiWindow* w = ImGui::FindWindowByName(p.id ? trayWindowName(p.id).c_str()
+                                                         : "");
+            const bool anyPopup =
+                ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                                ImGuiPopupFlags_AnyPopupLevel);
+            if (w && !w->Collapsed && !anyPopup) {
+                ImGui::BringWindowToDisplayFront(w);
+            }
         }
     }
 }
@@ -416,6 +501,20 @@ void EditorApp::onInit() {
     if (std::getenv("MYVK_ENGINE_PANEL")) {
         m_ctx->panels().engine = true;
     }
+    // Content 抽屉（2026-10-17 起默认关着）的自动化钩子：
+    //   MYVK_EDITOR_CONTENT_DRAWER=1 → 启动就打开抽屉；
+    //   MYVK_EDITOR_CONTENT_DOCK=1   → 顺带勾上 "Dock in layout"。
+    // MYVK_CONTENT_DIR 也算"要打开" —— 那一族脚本（CB-ENTRIES / 材质拖拽）
+    // 本来就假定内容面板看得见；面板不 draw 的话连 CB-ENTRIES 都不会打，
+    // 它们会以"找不到日志"的形态失败，而不是报真正的原因。
+    if (std::getenv("MYVK_EDITOR_CONTENT_DRAWER") ||
+        std::getenv("MYVK_CONTENT_DIR")) {
+        m_ctx->panels().content = true;
+    }
+    if (std::getenv("MYVK_EDITOR_CONTENT_DOCK")) {
+        m_ctx->panels().content = true;
+        m_contentDock = true;
+    }
     m_scripts = std::make_unique<vks::ScriptEngine>();
     m_split = std::make_unique<SplitLayout>();
     m_toolbar = std::make_unique<Toolbar>(*m_ctx, *this);
@@ -436,6 +535,11 @@ void EditorApp::onInit() {
     // 与 Console 的顺序无关，唯一的前提是"点段联动 Console"要有 Console
     // 可写（由 draw 时的入参保证，不在构造期绑定）。
     m_gpuTimeline = std::make_unique<editor::GpuTimelinePanel>();
+    // 2026-10-17 晚：底栏"+"托盘里的两张新面板。都只借用 EditorContext /
+    // Renderer 的引用，构造无副作用。
+    m_physicsPanel = std::make_unique<editor::PhysicsPanel>(*m_ctx);
+    m_particlesPanel =
+        std::make_unique<editor::ParticlesPanel>(*m_ctx, renderer());
     // E21：通知中心 —— 接管 Logger 的**第二条**通道（hook）。
     // ⚠ 顺序：必须先有 Console 再建通知中心。两条通道本身互不依赖，但
     //   "点 Error 的 toast → 打开 Console 滚到那条"这个动作要有 Console 可开。
@@ -621,6 +725,8 @@ void EditorApp::onInit() {
             m_ctx->setGizmoMode(GizmoMode::Rotate);
         else if (g == "scale")
             m_ctx->setGizmoMode(GizmoMode::Scale);
+        else if (g == "select")
+            m_ctx->setGizmoMode(GizmoMode::Select);
     }
 
     // MYVK_EDITOR_SPACE=world|local：启动就把手柄坐标系切过去。
@@ -997,6 +1103,23 @@ void EditorApp::toggleWindowFullscreen() {
     }
     window().setFullscreen(true);
     m_appliedWindowFullscreen = true;
+}
+
+// 场景落盘。抽成函数是因为它现在有**两个**入口：Ctrl+S 和 Content 工具栏
+// 的 "Save All"。两处各写一遍必然漂移（改了一处忘了另一处）。
+void EditorApp::saveSceneNow() {
+    const std::string abs = assets::resolveAssetPath(m_ctx->scenePath());
+    const scene::SceneIoResult r = scene::saveScene(m_ctx->editorScene(), abs);
+    if (r.ok) {
+        m_ctx->dirty() = false;
+        m_ctx->notify(TR("Saved ") + m_ctx->scenePath());
+        // 落到日志里：自动化脚本靠它确认"真的存了、存到哪了"
+        VK_LOG_INFO("Scene saved: '%s'", abs.c_str());
+    } else {
+        m_ctx->notify(TR("Save failed: ") + r.error);
+        VK_LOG_WARN("Scene save failed for '%s': %s", abs.c_str(),
+                    r.error.c_str());
+    }
 }
 
 // ---------------------------------------------------------------- 脚本执行
@@ -1524,20 +1647,69 @@ void EditorApp::computeLayout() {
 
     m_split->apply(m_ctx->layout());
 
-    // 视口正下方腾出"刚刚好一行"播放条：从视口矩形底部扣掉一行，
-    // 扣出来的就是 transport 条。3D 画面的渲染高度随之自然缩小。
+    // ============================================================
+    // 底部：底栏（Content / 输出日志 / CMD）+ 可停靠的 Content 抽屉
+    // ============================================================
     //
-    // ⚠ 只有视口真的占着地方时才扣：面板被关掉 / 被别的面板最大化顶掉时
-    //   它的矩形是 0×0，硬扣会把 0 抬到 kMinViewport，于是"最大化 Hierarchy"
-    //   之后屏幕底部会冒出一条属于视口的播放条。
+    // 2026-10-17 布局改造（用户要求）：
+    //   · Content 不再是常驻分栏面板（SplitLayout 里它恒不 live）；
+    //   · 底栏是常驻的一行通栏，左下三个带图标的按钮，右侧是资源统计；
+    //   · 点"内容"→ Content 抽屉从底栏往上弹；
+    //   · 抽屉右上角 "Dock in layout" 勾上 = 真的占布局（视口/层级随之变矮），
+    //     不勾 = 浮层（盖在视口上，点面板外任意处就关）。
+    //
+    // 两次 apply 的原因：抽屉高度要按"扣掉底栏之后还剩多少主体"来夹
+    // （不能超过 bodyH - kMinViewport，否则视口会被压没）。第一次 apply
+    // 只为拿到这个 bodyH；夹完再 apply 一次把停靠高度真正扣进去。
     LayoutRects& L = m_ctx->layout();
-    if (L.viewport.w > 1.0f && L.viewport.h > 1.0f) {
-        L.transport = {L.viewport.x, L.viewport.y + L.viewport.h - kTransportH,
-                       L.viewport.w, kTransportH};
-        L.viewport.h = std::max(L.viewport.h - kTransportH, kMinViewport);
-    } else {
-        L.transport = {0.0f, 0.0f, 0.0f, 0.0f};
+    const bool drawerOpen = m_ctx->panels().content;
+
+    m_split->setBottomInset(kBottomBarH);
+    m_split->apply(L);
+    const float bodyTop = L.toolbar.y + L.toolbar.h;
+    // 主体可用的高度 = 到"底栏上沿"为止（不要再减 statusH：底栏自己就在
+    // 状态栏上方，apply 已经把它让出来了）。
+    const float barTop = io.DisplaySize.y - kStatusH - kBottomBarH;
+    const float bodyH = std::max(barTop - bodyTop, 120.0f);
+    const float maxDrawerH = std::max(bodyH - kMinViewport, kContentDrawerMin);
+    m_contentDrawerH =
+        std::clamp(m_contentDrawerH, kContentDrawerMin, maxDrawerH);
+
+    const float dockH = (drawerOpen && m_contentDock) ? m_contentDrawerH : 0.0f;
+    if (dockH > 0.0f) {
+        m_split->setBottomInset(kBottomBarH + dockH);
+        m_split->apply(L);
     }
+
+    // 底栏矩形：**永远**贴着状态栏上方、高度恒为 kBottomBarH。
+    // （停靠抽屉长在它上面，所以主体底边 = L.bottom.y - dockH，这个由
+    //   SplitLayout 的 bottomInset 负责 —— 两边算的必须是同一件事。）
+    L.bottom = {0.0f, io.DisplaySize.y - kStatusH - kBottomBarH,
+                io.DisplaySize.x, kBottomBarH};
+
+    // 抽屉矩形：横跨整窗、贴着底栏上沿往上长（停靠/浮层用同一个矩形，
+    // 区别只在"有没有从布局里扣掉"）。
+    if (drawerOpen) {
+        L.content = {0.0f, L.bottom.y - m_contentDrawerH, io.DisplaySize.x,
+                     m_contentDrawerH};
+    } else {
+        L.content = {0.0f, 0.0f, 0.0f, 0.0f};
+    }
+
+    // 浮层抽屉要"挖掉"分栏分隔线：分隔条画在 ForegroundDrawList 上（压在
+    // 所有面板之上），而抽屉不在分栏树里 —— 不告诉布局器的话，
+    // Hierarchy | Viewport 那条竖线会一路画进抽屉内部。
+    // 停靠形态不用管：bottomInset 已经把分隔条的下端收到抽屉上沿了。
+    if (drawerOpen && !m_contentDock) {
+        m_split->setOccluder(true, L.content.x, L.content.y,
+                             L.content.x + L.content.w,
+                             L.content.y + L.content.h);
+    } else {
+        m_split->setOccluder(false, 0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    // transport（视口下方播放条）已停用：UI 被移除，矩形恒为 0×0。
+    L.transport = {0.0f, 0.0f, 0.0f, 0.0f};
 }
 
 // ============================================================
@@ -1573,18 +1745,14 @@ const char* EditorApp::viewModeLabel(int mode) {
 }
 
 void EditorApp::syncViewportLayout() {
-    const ViewportLayout l = m_ctx->viewportLayout();
-    // Single = 只有主视口；其余布局每个格子各一个离屏目标，
-    // 主视口用 0 号，剩下的都是"子视口"。
-    size_t sub = 0;
-    switch (l) {
-        case ViewportLayout::Single: sub = 0; break;
-        case ViewportLayout::TwoVertical:
-        case ViewportLayout::TwoHorizontal: sub = 1; break;
-        case ViewportLayout::Quad: sub = 3; break;
-    }
-    renderer().setSubviewCount(sub);
-    VK_LOG_INFO("VIEWPORT-LAYOUT %s (subviews=%zu)", viewportLayoutName(l), sub);
+    // 写 EditorContext + 设子视口数 + 打 VIEWPORT-LAYOUT 三件事都在
+    // Workspace.cpp 里（视口工具条的"1 / 2V / 2H / 4"下拉走同一个函数），
+    // 这样两条入口的行为与日志不会分叉。
+    //
+    // ⚠ 必须写全 `editor::`：本类有一个同名的虚函数
+    //   `applyViewportLayout(int)`（EditorHost 那条窄接口），不加限定会被
+    //   它挡住，报的是"参数个数不对"，看着像调用写错了。
+    editor::applyViewportLayout(*m_ctx, renderer(), m_ctx->viewportLayout());
 }
 
 void EditorApp::applyWorkspace(int index) {
@@ -1701,6 +1869,35 @@ void EditorApp::applyViewMode(int mode) {
 
 int EditorApp::currentViewMode() {
     return static_cast<int>(renderer().viewMode());
+}
+
+// 顶栏那颗"前进一帧"(▶|)。
+//
+// 语义与 UE 的 Step 一致：**必须有运行态**才能步进（没有运行态时先 Play 出
+// 一份副本，立刻暂停），然后手动推进**一个固定步长**。为什么不复用
+// onUpdate 里那条链：那边的 dt 是墙钟时间，一次点击推进多少完全看机器快慢，
+// 步进就失去了"逐帧调试"的意义。这里写死 1/60，与项目的固定物理步长对齐。
+//
+// 顺序照抄 onUpdate：脚本 → 玩家 → 物理 → 碰撞。少一环都会让"步进出来的
+// 状态"和"跑起来的状态"不一致 —— 那种不一致最难查。
+void EditorApp::stepOneFrame() {
+    if (!m_ctx->usingRuntime()) {
+        m_ctx->play();     // 复制运行态（失败时 play() 内部已经报错并回退）
+        if (!m_ctx->usingRuntime()) return;
+    }
+    if (m_ctx->isPlaying()) m_ctx->pause();  // 步进总是停在暂停态
+
+    constexpr float kStepDt = 1.0f / 60.0f;
+    m_ctx->advancePlayTime(kStepDt);
+    runRuntimeScripts(kStepDt);
+    runPlayers(kStepDt);
+    if (!m_physics) buildPhysicsWorld();
+    stepPhysics(kStepDt);
+    runCollision(kStepDt);
+
+    VK_LOG_INFO("Editor: STEP one frame (playTime=%.3f run=%d)",
+                static_cast<double>(m_ctx->playTime()),
+                static_cast<int>(m_ctx->usingRuntime()));
 }
 
 void EditorApp::reloadShaders() {
@@ -1965,22 +2162,7 @@ void EditorApp::handleShortcuts() {
         if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
             reloadShaders();
         }
-        if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-            const std::string abs =
-                assets::resolveAssetPath(m_ctx->scenePath());
-            const scene::SceneIoResult r =
-                scene::saveScene(m_ctx->editorScene(), abs);
-            if (r.ok) {
-                m_ctx->dirty() = false;
-                m_ctx->notify(TR("Saved ") + m_ctx->scenePath());
-                // 落到日志里：自动化脚本靠它确认"真的存了、存到哪了"
-                VK_LOG_INFO("Scene saved: '%s'", abs.c_str());
-            } else {
-                m_ctx->notify(TR("Save failed: ") + r.error);
-                VK_LOG_WARN("Scene save failed for '%s': %s", abs.c_str(),
-                            r.error.c_str());
-            }
-        }
+        if (ImGui::IsKeyPressed(ImGuiKey_S, false)) saveSceneNow();
         return;  // 带 Ctrl 的组合键到此为止
     }
 
@@ -1992,6 +2174,11 @@ void EditorApp::handleShortcuts() {
     // 相机时才是工具快捷键。
     const bool flying = ImGui::IsMouseDown(ImGuiMouseButton_Right);
     if (m_ctx->isEditing() && !flying) {
+        // Q = 选择模式（2026-10-17 晚加的第四个工具，见 GizmoMode::Select）。
+        // ⚠ Q 同时也是"按住右键下降"（handleNavigation 里的飞行键）—— 上面
+        //   的 `!flying` 已经把它们分开了，别删这个条件。
+        if (ImGui::IsKeyPressed(ImGuiKey_Q, false))
+            m_ctx->setGizmoMode(GizmoMode::Select);
         if (ImGui::IsKeyPressed(ImGuiKey_W, false))
             m_ctx->setGizmoMode(GizmoMode::Translate);
         if (ImGui::IsKeyPressed(ImGuiKey_E, false))
@@ -2124,6 +2311,16 @@ void EditorApp::onImGui() {
         toggleWindowFullscreen();
     }
 
+    // Content 工具栏的 "Save All"：场景 + 输入映射一起落盘。
+    // 面板只置位（见 ContentBrowser::saveAll），存盘路径留在这边 ——
+    // 它才知道 scenePath，也才拿得到 InputMap 的落盘入口。
+    if (m_ctx->saveAllRequest()) {
+        m_ctx->saveAllRequest() = false;
+        saveSceneNow();
+        m_ctx->saveInputMap();
+        VK_LOG_INFO("CB-SAVEALL done scene=%s", m_ctx->scenePath().c_str());
+    }
+
     // R5-1：Inspector 的 Capture 按钮 → 立刻重捕反射探针。
     // 与上面 Fullscreen 同一套路：面板只置位，拿得到 Renderer 的这里取走
     // 并转交。渲染器在**下一帧开头**执行捕获（记录在独立命令缓冲里，
@@ -2160,18 +2357,39 @@ void EditorApp::onImGui() {
 
     // E04：所有面板**表驱动**绘制。顺序 = 表里的顺序（主面板在前、
     // 浮动调试面板在后），与改造前逐条一致。
+    // Content 已改成抽屉（见 drawContentDrawer），这里跳过它。
     drawPanels();
 
-    // 播放条只在视口真的占着地方时画（视口被关掉、或被别的面板最大化
-    // 顶掉时，它的矩形是 0×0，再画就会浮在别的面板上）
-    if (m_ctx->panels().viewport && m_split->showsInLayout(kSlotViewport)) {
-        drawTransportBar();
-    }
+    // 托盘面板的最小化状态上报（每帧读窗口对象，变化时打一行日志）
+    servicePanelTrayState();
+
+    // Content 抽屉：必须排在 drawPanels 之后 —— ImGui 里后画的窗口在上层，
+    // 浮层形态（未停靠）要盖住视口。
+    drawContentDrawer();
+
+    // 底栏（内容 / 输出日志 / CMD + 资源统计）。画在抽屉之后、状态栏之前：
+    // 它是一条常驻通栏，Z 序上要压住任何从它上面弹出来的东西的底边。
+    drawBottomBar();
 
     if (m_ctx->showSettings()) drawSettingsPanel();
     drawCharacterWindow();
 
+    // 浮动面板标题栏的"最小化"按钮。必须排在**所有窗口画完之后**：它要读
+    // 每个窗口这一帧的 Pos/Size 才能把那一格摆到关闭 X 的左边（见函数注释）。
+    drawPanelMinimizeButtons();
+
+    // 上一帧请求的焦点（窗口那时可能还没建起来，所以延后一帧）
+    if (m_focusPanelWant) {
+        const std::string n = trayWindowName(m_focusPanelWant);
+        if (ImGui::FindWindowByName(n.c_str())) ImGui::SetWindowFocus(n.c_str());
+        m_focusPanelWant = nullptr;
+    }
+
     drawStatusBar();
+
+    // 未停靠的抽屉：点面板外任意位置即关。判定放在**所有窗口都画完之后**
+    // —— 否则"这一帧谁被点到"还没确定（ImGui 的 hovered 是按窗口累积的）。
+    serviceContentDrawerDismiss();
 
     // 分栏分隔条：在**所有面板之后**处理 —— 分隔线画在前景层（盖在面板上），
     // 拖拽用鼠标位置手动判断（不依赖面板窗口层级）
@@ -2457,6 +2675,907 @@ void EditorApp::drawStatusBar() {
 
     ImGui::End();
     ImGui::PopStyleVar();
+}
+
+// ============================================================
+// 底栏 + Content 抽屉（2026-10-17）
+// ============================================================
+//
+// 布局动机（用户原话）："原本的 Content 面板移除掉，把 '7 entries | assets'
+// 那部分位置和底部栏的动画设置部分合并成一行；在这一栏的左侧放一个内容
+// 侧滑菜单（前面有 Logo），紧接着是输出日志（同样带 Logo），再往右是 CMD"。
+//
+// 落地方式：
+//   · Content 不再占分栏（SplitLayout 里它恒不 live，左栏只剩 Hierarchy）；
+//   · 状态栏上方多一条通栏 `L.bottom`：左起「内容 / 输出日志 / CMD」三个
+//     带矢量图标的按钮，右侧是资源统计（原来 Content 面板底行那一条）；
+//   · 点「内容」→ 抽屉从底栏往上弹（浮层），可拖上边缘改高度；
+//     抽屉右上角 "Dock in layout" 勾上 = 真正占布局（视口变矮、不自动关闭）。
+//   · 播放条（Run/Play/Pause/Stop + 时间轴）的 UI 整条移除。
+//
+// 图标全部 ImDrawList 现画（与 EditorIcons.h 同一套约定：不塞图标字体，
+// 任意 DPI 都清晰）。颜色写死 —— 图标是"内容"，不该跟着主题漂移。
+namespace {
+
+// 底栏图标表。2026-10-17 晚加了一整组：托盘里那些面板按钮各要一个
+// Logo —— 一列长得一样的按钮没法用。
+enum BarIcon {
+    kBarIconContent = 0,
+    kBarIconLog,
+    kBarIconCmd,
+    kBarIconPlus,
+    kBarIconCharacter,
+    kBarIconPhysics,
+    kBarIconParticles,
+    kBarIconStats,
+    kBarIconScripts,
+    kBarIconEngine,
+    kBarIconConsole,
+    kBarIconTimeline,
+};
+
+void drawBarIcon(ImDrawList* dl, ImVec2 p, float s, int icon) {
+    if (icon == kBarIconContent) {
+        // 文件夹图标直接复用资源浏览器那个大号版本（尺寸参数化，18px 也清晰）
+        drawFolderIcon(dl, p, s);
+        return;
+    }
+    if (icon == kBarIconLog) {
+        // 输出日志：一页日志纸 —— 深蓝底 + 三行亮横线 + 左侧状态点。
+        // 用"纸 + 行"而不是"终端 >_"，是为了和右边的 CMD 一眼区分开。
+        const ImU32 bg = IM_COL32(34, 50, 70, 255);
+        const ImU32 edge = IM_COL32(96, 150, 198, 255);
+        const ImU32 line = IM_COL32(152, 208, 248, 255);
+        dl->AddRectFilled(p, ImVec2(p.x + s, p.y + s), bg, s * 0.16f);
+        dl->AddRect(p, ImVec2(p.x + s, p.y + s), edge, s * 0.16f, 0, 1.3f);
+        for (int i = 0; i < 3; ++i) {
+            const float y = p.y + s * (0.29f + 0.21f * static_cast<float>(i));
+            dl->AddCircleFilled(ImVec2(p.x + s * 0.24f, y), s * 0.055f, line, 8);
+            dl->AddRectFilled(ImVec2(p.x + s * 0.40f, y - s * 0.042f),
+                              ImVec2(p.x + s * 0.82f, y + s * 0.042f), line,
+                              s * 0.03f);
+        }
+        return;
+    }
+    if (icon == kBarIconPlus) {
+        // 加号：两条粗线。底框用强调色的淡底，一眼看出"这是个入口"。
+        const ImU32 bg = IM_COL32(38, 62, 92, 255);
+        const ImU32 fg = IM_COL32(148, 206, 255, 255);
+        dl->AddRectFilled(p, ImVec2(p.x + s, p.y + s), bg, s * 0.22f);
+        const float th = std::max(1.6f, s * 0.11f);
+        dl->AddLine(ImVec2(p.x + s * 0.26f, p.y + s * 0.5f),
+                    ImVec2(p.x + s * 0.74f, p.y + s * 0.5f), fg, th);
+        dl->AddLine(ImVec2(p.x + s * 0.5f, p.y + s * 0.26f),
+                    ImVec2(p.x + s * 0.5f, p.y + s * 0.74f), fg, th);
+        return;
+    }
+    const float cx = p.x + s * 0.5f;
+    const float cy = p.y + s * 0.5f;
+    switch (icon) {
+        case kBarIconCmd: {
+            // CMD：终端窗口 —— 近黑底 + 绿色 ">" + 光标方块
+            const ImU32 bg = IM_COL32(16, 22, 18, 255);
+            const ImU32 edge = IM_COL32(88, 204, 134, 255);
+            const ImU32 fg = IM_COL32(124, 242, 162, 255);
+            dl->AddRectFilled(p, ImVec2(p.x + s, p.y + s), bg, s * 0.16f);
+            dl->AddRect(p, ImVec2(p.x + s, p.y + s), edge, s * 0.16f, 0, 1.3f);
+            const ImVec2 a(p.x + s * 0.22f, p.y + s * 0.30f);
+            const ImVec2 b(p.x + s * 0.44f, p.y + s * 0.50f);
+            const ImVec2 c(p.x + s * 0.22f, p.y + s * 0.70f);
+            dl->AddLine(a, b, fg, 1.7f);
+            dl->AddLine(b, c, fg, 1.7f);
+            dl->AddRectFilled(ImVec2(p.x + s * 0.52f, p.y + s * 0.58f),
+                              ImVec2(p.x + s * 0.80f, p.y + s * 0.72f), fg,
+                              s * 0.04f);
+            break;
+        }
+        case kBarIconCharacter: {
+            // 人形：头 + 肩。角色面板最没有歧义的图标。
+            const ImU32 fg = IM_COL32(214, 186, 140, 255);
+            dl->AddCircleFilled(ImVec2(cx, p.y + s * 0.30f), s * 0.16f, fg, 12);
+            dl->PathClear();
+            dl->PathArcTo(ImVec2(cx, p.y + s * 0.92f), s * 0.30f, 3.30f, 6.12f, 16);
+            dl->PathStroke(fg, 0, std::max(1.6f, s * 0.13f));
+            break;
+        }
+        case kBarIconPhysics: {
+            // 原子：一个核 + 两个斜椭圆 = "物理"
+            const ImU32 fg = IM_COL32(150, 208, 214, 255);
+            dl->AddCircleFilled(ImVec2(cx, cy), s * 0.10f, fg, 10);
+            dl->PathClear();
+            dl->PathEllipticalArcTo(ImVec2(cx, cy), ImVec2(s * 0.42f, s * 0.18f),
+                                    0.6f, 0.0f, 6.2832f, 20);
+            dl->PathStroke(fg, 0, 1.4f);
+            dl->PathClear();
+            dl->PathEllipticalArcTo(ImVec2(cx, cy), ImVec2(s * 0.42f, s * 0.18f),
+                                    2.5f, 0.0f, 6.2832f, 20);
+            dl->PathStroke(fg, 0, 1.4f);
+            break;
+        }
+        case kBarIconParticles: {
+            // 火花团：中心一点 + 四向短线
+            const ImU32 fg = IM_COL32(246, 176, 108, 255);
+            dl->AddCircleFilled(ImVec2(cx, cy), s * 0.13f, fg, 10);
+            const float r0 = s * 0.22f, r1 = s * 0.42f;
+            for (int i = 0; i < 4; ++i) {
+                const float a = 0.7854f + 1.5708f * static_cast<float>(i);
+                dl->AddLine(ImVec2(cx + std::cos(a) * r0, cy + std::sin(a) * r0),
+                            ImVec2(cx + std::cos(a) * r1, cy + std::sin(a) * r1),
+                            fg, 1.5f);
+            }
+            break;
+        }
+        case kBarIconStats: {
+            // 柱状图
+            const ImU32 fg = IM_COL32(138, 196, 246, 255);
+            const float bw = s * 0.16f;
+            const float hs[3] = {0.34f, 0.62f, 0.46f};
+            for (int i = 0; i < 3; ++i) {
+                const float x = p.x + s * (0.16f + 0.28f * static_cast<float>(i));
+                dl->AddRectFilled(ImVec2(x, p.y + s * (0.86f - hs[i])),
+                                  ImVec2(x + bw, p.y + s * 0.86f), fg, 1.0f);
+            }
+            break;
+        }
+        case kBarIconScripts: {
+            // 尖括号 </>
+            const ImU32 fg = IM_COL32(196, 168, 246, 255);
+            dl->AddLine(ImVec2(p.x + s * 0.40f, p.y + s * 0.24f),
+                        ImVec2(p.x + s * 0.20f, cy), fg, 1.8f);
+            dl->AddLine(ImVec2(p.x + s * 0.20f, cy),
+                        ImVec2(p.x + s * 0.40f, p.y + s * 0.76f), fg, 1.8f);
+            dl->AddLine(ImVec2(p.x + s * 0.60f, p.y + s * 0.24f),
+                        ImVec2(p.x + s * 0.80f, cy), fg, 1.8f);
+            dl->AddLine(ImVec2(p.x + s * 0.80f, cy),
+                        ImVec2(p.x + s * 0.60f, p.y + s * 0.76f), fg, 1.8f);
+            break;
+        }
+        case kBarIconEngine: {
+            // 齿轮
+            const ImU32 fg = IM_COL32(198, 202, 210, 255);
+            dl->AddCircle(ImVec2(cx, cy), s * 0.18f, fg, 14, 1.6f);
+            for (int i = 0; i < 8; ++i) {
+                const float a = 6.2832f * static_cast<float>(i) / 8.0f;
+                dl->AddLine(ImVec2(cx + std::cos(a) * s * 0.22f,
+                                   cy + std::sin(a) * s * 0.22f),
+                            ImVec2(cx + std::cos(a) * s * 0.40f,
+                                   cy + std::sin(a) * s * 0.40f),
+                            fg, 1.6f);
+            }
+            break;
+        }
+        case kBarIconConsole: {
+            // 终端提示符（和 CMD 同形，但底色偏灰 —— 一个是"命令输入"，
+            // 一个是"日志输出"）
+            const ImU32 bg = IM_COL32(30, 32, 38, 255);
+            const ImU32 fg = IM_COL32(196, 204, 216, 255);
+            dl->AddRectFilled(p, ImVec2(p.x + s, p.y + s), bg, s * 0.16f);
+            dl->AddLine(ImVec2(p.x + s * 0.22f, p.y + s * 0.32f),
+                        ImVec2(p.x + s * 0.42f, p.y + s * 0.5f), fg, 1.5f);
+            dl->AddLine(ImVec2(p.x + s * 0.42f, p.y + s * 0.5f),
+                        ImVec2(p.x + s * 0.22f, p.y + s * 0.68f), fg, 1.5f);
+            dl->AddRectFilled(ImVec2(p.x + s * 0.52f, p.y + s * 0.58f),
+                              ImVec2(p.x + s * 0.78f, p.y + s * 0.70f), fg,
+                              s * 0.04f);
+            break;
+        }
+        case kBarIconTimeline: {
+            // 时间轴：一条基线 + 几个刻度 + 一个游标
+            const ImU32 fg = IM_COL32(228, 196, 120, 255);
+            dl->AddLine(ImVec2(p.x + s * 0.14f, p.y + s * 0.70f),
+                        ImVec2(p.x + s * 0.86f, p.y + s * 0.70f), fg, 1.5f);
+            for (int i = 0; i < 4; ++i) {
+                const float x = p.x + s * (0.20f + 0.20f * static_cast<float>(i));
+                dl->AddLine(ImVec2(x, p.y + s * 0.70f),
+                            ImVec2(x, p.y + s * 0.56f), fg, 1.2f);
+            }
+            dl->AddRectFilled(ImVec2(p.x + s * 0.56f, p.y + s * 0.24f),
+                              ImVec2(p.x + s * 0.62f, p.y + s * 0.72f), fg, 0.5f);
+            break;
+        }
+        default: break;
+    }
+}
+
+// 面板 id → 底栏图标。托盘按钮和勾选列表共用这一份映射。
+int barIconForPanel(const char* id) {
+    const std::string s = id ? id : "";
+    if (s == "character") return kBarIconCharacter;
+    if (s == "physics") return kBarIconPhysics;
+    if (s == "particles") return kBarIconParticles;
+    if (s == "stats") return kBarIconStats;
+    if (s == "scripts") return kBarIconScripts;
+    if (s == "engine") return kBarIconEngine;
+    if (s == "console") return kBarIconConsole;
+    if (s == "gputimeline") return kBarIconTimeline;
+    return kBarIconEngine;   // 兜底：将来新加的面板至少有个像样的图标
+}
+
+// 哪些面板"可以变成底栏按钮"。判据只有一条：**它能不能离开布局**。
+//   · 分栏里的四个面板（Hierarchy / Inspector / Content / Viewport）由
+//     SplitLayout 定位，给它们底栏按钮只会和分栏打架 —— 它们仍然出现在
+//     勾选列表里（属于"布局面板"那一段），只是不生成按钮。
+//   · Content 与 Output Log 在底栏已经各有一个按钮（这是用户上一轮的设计），
+//     再生成一个就是同一个开关两个入口，只会让人怀疑哪个才是真的。
+bool panelTrayEligible(const PanelDesc& p) {
+    if (p.layoutSlot != kSlotNone) return false;
+    const std::string id = p.id ? p.id : "";
+    if (id == "console" || id == "content") return false;
+    return true;
+}
+
+// "浮动面板" = 有自己的 ImGui 标题栏、位置自己管的那种。
+// ⚠ 和 panelTrayEligible **不是**同一个条件：Console 在底栏已经有专属按钮
+//   （不该再生成一个托盘按钮），但它确实是浮动窗口，标题栏上那个最小化
+//   按钮必须有。2026-10-17 第四轮拆出这一条，就是别再让"按钮资格"顺手
+//   决定了"有没有最小化"。
+bool panelFloating(const PanelDesc& p) {
+    return p.layoutSlot == kSlotNone && p.draw != nullptr;
+}
+
+// 面板的 ImGui 窗口名（只要 "###" 之后那一段 —— ImGui 按它算窗口 ID，
+// 所以带不带译文都指同一个窗口）。Character 是历史遗留的 "character_v2"。
+std::string trayWindowName(const char* id) {
+    const std::string s = id ? id : "";
+    if (s == "character") return "###character_v2";
+    return "###panel_" + s;
+}
+
+// 托盘按钮右侧"叉号带"的宽度。命中区、绘制、日志矩形三处共用这一个数 ——
+// 分开写就会重演"点叉号却点到了按钮"那个 bug。
+constexpr float kTrayRemoveW = 14.0f;
+
+} // namespace
+
+bool EditorApp::barButton(const char* id, const char* label, int icon,
+                          bool active, const char* tip) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float iconS = 18.0f;
+    const ImVec2 txt = ImGui::CalcTextSize(label);
+    const float h = ImGui::GetTextLineHeight() + 7.0f;
+    const float w = st.FramePadding.x * 2.0f + iconS + 8.0f + txt.x;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+
+    ImGui::PushID(id);
+    const bool clicked = ImGui::InvisibleButton("##hit", ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    ImGui::PopID();
+
+    char tag[64];
+    std::snprintf(tag, sizeof(tag), "BAR-BTN-%s", id);
+    logRect(tag, p, ImVec2(p.x + w, p.y + h));
+
+    // 背景：选中 = 强调色淡底 + 描边；悬停 = 亮一档；按住 = 再亮一点。
+    // 全部用 token，浅色主题下不会变成一块深色孤岛。
+    const ImVec4 bg = held      ? ui::tokens().accentSoft
+                      : hovered ? ImVec4(1.0f, 1.0f, 1.0f, 0.10f)
+                      : active  ? ui::tokens().accentSoft
+                                : ImVec4(1.0f, 1.0f, 1.0f, 0.045f);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(bg), 4.0f);
+    if (active) {
+        dl->AddRect(p, ImVec2(p.x + w, p.y + h),
+                    ImGui::GetColorU32(ui::tokens().accent), 4.0f, 0, 1.2f);
+    }
+
+    drawBarIcon(dl, ImVec2(p.x + st.FramePadding.x, p.y + (h - iconS) * 0.5f),
+                iconS, icon);
+    // 文字：选中 = 正常正文色；未选中 = 正常色降到 78% —— 不用 TextDisabled，
+    // 那个太暗（0.48 灰），在底栏这种"常驻入口"上会显得像禁用项。
+    ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    if (!active) tc.w *= 0.78f;
+    dl->AddText(ImVec2(p.x + st.FramePadding.x + iconS + 8.0f,
+                       p.y + (h - txt.y) * 0.5f),
+                ImGui::GetColorU32(tc), label);
+
+    if (hovered && tip) ImGui::SetTooltip("%s", tip);
+    return clicked;
+}
+
+// 托盘按钮：和 barButton 同款，但右上角多一个 ×，右键还有小菜单。
+//
+// 命中分成两块：主体（宽 w-14）和叉号（右上 14×14）。**绝对不能用一个
+// 大按钮把叉号区也吃掉** —— 那样"点叉号"和"点按钮"就没法区分了
+// （用户明确要的是"点右上角的叉号移除"）。
+EditorApp::TrayHit EditorApp::trayButton(const char* id, const char* label,
+                                         int icon, bool active,
+                                         const char* tip) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float iconS = 18.0f;
+    const ImVec2 txt = ImGui::CalcTextSize(label);
+    const float h = ImGui::GetTextLineHeight() + 7.0f;
+    const float bodyW = st.FramePadding.x * 2.0f + iconS + 8.0f + txt.x;
+    const float w = bodyW + kTrayRemoveW;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    m_trayBtnH = h;
+
+    TrayHit hit = TrayHit::None;
+
+    ImGui::PushID(id);
+    // 主体：点它 = 开关面板
+    if (ImGui::InvisibleButton("##body", ImVec2(bodyW, h))) hit = TrayHit::Toggle;
+    const bool bodyHovered = ImGui::IsItemHovered();
+    // 叉号：紧贴主体右侧的**整块**命中区。
+    //
+    // 这里踩过一次：一开始只放了 12x12 的小方块（视觉上 × 就这么大），
+    // 但它和日志里报出去的矩形（整条右侧竖带）对不上 —— 自动化按矩形
+    // 中心点下去，落在小方块外面 → 点"叉号"变成点"按钮"，表现为
+    // "叉号只会关面板、不会移除按钮"。现在命中区 = 日志矩形 = 绘制区域。
+    ImGui::SetCursorScreenPos(ImVec2(p.x + bodyW, p.y));
+    if (ImGui::InvisibleButton("##x", ImVec2(kTrayRemoveW, h))) hit = TrayHit::Remove;
+    const bool xHovered = ImGui::IsItemHovered();
+
+    // 右键菜单：最小化 / 关闭（最小化的主入口是窗口标题栏那颗折叠箭头，
+    // 这里给一个"不用瞄准"的第二入口）
+    if (bodyHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        ImGui::OpenPopup("##tray_ctx");
+    }
+    if (ImGui::BeginPopup("##tray_ctx")) {
+        const std::string wname = trayWindowName(id + 5);   // 去掉 "tray_" 前缀
+        ImGuiWindow* win = ImGui::FindWindowByName(wname.c_str());
+        const bool collapsed = win ? (win->Collapsed != 0) : false;
+        if (ImGui::MenuItem(TR(collapsed ? "Expand" : "Minimize"))) {
+            ImGui::SetWindowCollapsed(wname.c_str(), !collapsed);
+            VK_LOG_INFO("PANEL-TRAY %s minimized=%d", id + 5,
+                        collapsed ? 0 : 1);
+        }
+        logRect("BAR-TRAY-CTX-min", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        if (ImGui::MenuItem(TR("Close panel"))) {
+            hit = TrayHit::Remove;
+        }
+        logRect("BAR-TRAY-CTX-close", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+
+    const ImVec2 q(p.x + w, p.y + h);
+    const ImVec4 bg = active ? ui::tokens().accentSoft : ImVec4(1.0f, 1.0f, 1.0f, 0.045f);
+    dl->AddRectFilled(p, ImVec2(p.x + bodyW, q.y), ImGui::GetColorU32(bg), 4.0f);
+    if (active) {
+        dl->AddRect(p, ImVec2(p.x + bodyW, q.y),
+                    ImGui::GetColorU32(ui::tokens().accent), 4.0f, 0, 1.2f);
+    } else if (bodyHovered) {
+        dl->AddRectFilled(p, ImVec2(p.x + bodyW, q.y), IM_COL32(255, 255, 255, 26),
+                          4.0f);
+    }
+
+    drawBarIcon(dl, ImVec2(p.x + st.FramePadding.x, p.y + (h - iconS) * 0.5f),
+                iconS, icon);
+    ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    if (!active) tc.w *= 0.78f;
+    dl->AddText(ImVec2(p.x + st.FramePadding.x + iconS + 8.0f,
+                       p.y + (h - txt.y) * 0.5f),
+                ImGui::GetColorU32(tc), label);
+
+    // 叉号：常态淡（不抢视线），悬停变红 —— 它是"删除"，该警示一下
+    const ImVec2 xc(p.x + bodyW + kTrayRemoveW * 0.5f, p.y + h * 0.5f);
+    const ImU32 xCol = xHovered ? IM_COL32(248, 122, 122, 255)
+                                : IM_COL32(168, 176, 188, 150);
+    dl->AddLine(ImVec2(xc.x - 3.0f, xc.y - 3.0f), ImVec2(xc.x + 3.0f, xc.y + 3.0f),
+                xCol, 1.4f);
+    dl->AddLine(ImVec2(xc.x - 3.0f, xc.y + 3.0f), ImVec2(xc.x + 3.0f, xc.y - 3.0f),
+                xCol, 1.4f);
+
+    char tag[64];
+    std::snprintf(tag, sizeof(tag), "BAR-TRAY-%s", id);
+    logRect(tag, p, ImVec2(p.x + bodyW, q.y));
+    std::snprintf(tag, sizeof(tag), "BAR-TRAY-X-%s", id);
+    logRect(tag, ImVec2(p.x + bodyW, p.y), q);
+
+    if ((bodyHovered || xHovered) && tip) ImGui::SetTooltip("%s", tip);
+    return hit;
+}
+
+// 托盘面板的"最小化"（= ImGui 的折叠）状态上报。
+//
+// 为什么需要它：折叠状态是 ImGui 窗口自己的，改动发生在**标题栏那颗折叠
+// 箭头**上（或者双击标题栏），我们没有任何控件回调可以挂。而"面板可以
+// 最小化"是用户明确要的能力 —— 没有可断言的痕迹，就没法证明它没坏。
+// 每帧读一次窗口对象，只有变化才打一行，成本可以忽略。
+void EditorApp::servicePanelTrayState() {
+    for (int i = 0; i < panelCount(); ++i) {
+        const PanelDesc& pd = panelTable()[i];
+        // 用 panelFloating 而不是 panelTrayEligible：Console 没有托盘按钮，
+        // 但它有最小化按钮，收起状态同样要上报（自动化断言要用）。
+        if (!panelFloating(pd)) continue;
+        const bool isOpen = panelOpen(i) && !panelTrayHiddenRef(i);
+        const std::string wname = trayWindowName(pd.id);
+        ImGuiWindow* win = isOpen ? ImGui::FindWindowByName(wname.c_str()) : nullptr;
+        const int min = (win && win->Collapsed) ? 1 : 0;
+        if (isOpen != m_trayStateOpen[i] || min != m_trayStateMin[i]) {
+            m_trayStateOpen[i] = isOpen;
+            m_trayStateMin[i] = min;
+            VK_LOG_INFO("PANEL-STATE %s open=%d min=%d", pd.id,
+                        isOpen ? 1 : 0, min);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 面板最小化
+//
+// 2026-10-17 第四轮（用户原话）："在 Content 面板这里通过点击 + 打开的所有
+// 面板，右上角都要有可以最小化的按钮，点击最小化即把面板窗口最小化放到
+// Content 面板上 + 按钮右侧原来的位置上。"
+//
+// 落地：托盘按钮不消失（那等于"取消勾选"），只是把窗口收起来 —— 于是
+// "最小化"= `panelTrayHiddenRef(i) = true`，底栏那个按钮变暗、再点一下就回来。
+// 这和右键托盘按钮里的"最小化"完全是同一条路径，两处入口、一份状态。
+
+void EditorApp::focusPanel(const char* id) {
+    const int idx = panelIndexOf(id);
+    if (idx < 0) return;
+    // setPanelOpen 里带了"打开就把托盘收起态作废"，所以这里不用再清一次
+    setPanelOpen(idx, true);
+    m_focusPanelWant = panelId(idx);
+    VK_LOG_INFO("PANEL-FOCUS %s", id);
+}
+
+void EditorApp::drawPanelMinimizeButtons() {
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float fs = g.FontSize;
+    const ImVec2 mp = ImGui::GetIO().MousePos;
+
+    // 上一帧上报过的矩形（只为"变化时才打日志"，不打的话每帧刷屏）
+    static float lastX[kMaxPanels] = {};
+    static float lastY[kMaxPanels] = {};
+    static bool lastHov[kMaxPanels] = {};
+
+    for (int i = 0; i < panelCount(); ++i) {
+        const PanelDesc& pd = panelTable()[i];
+        // 浮动面板才有标题栏；分栏面板与抽屉（Content）不在此列
+        if (!panelFloating(pd)) continue;
+        if (!panelOpen(i) || panelTrayHiddenRef(i)) continue;
+
+        const std::string wname = trayWindowName(pd.id);
+        ImGuiWindow* w = ImGui::FindWindowByName(wname.c_str());
+        if (!w || w->Collapsed || w->Hidden || !w->Active) continue;
+
+        // 关闭 X 的几何来自 imgui.cpp:RenderWindowTitleBarContents ——
+        //   close_pos = (titleMax.x - FramePadding.x - FontSize, titleMin.y + FramePadding.y)
+        // 我们占它左边一格（再让 2px，别和 X 的命中区粘在一起）。
+        const float x = w->Pos.x + w->Size.x - st.FramePadding.x - fs * 2.0f - 2.0f;
+        const float y = w->Pos.y + st.FramePadding.y;
+        const ImVec2 mn(x, y), mx(x + fs, y + fs);
+
+        // 命中：鼠标在格子里 **且** 这一帧悬停的就是这个窗口（被别的窗口
+        // 盖住时 g.HoveredWindow 是上面那个，于是点不到 —— 正是想要的）。
+        const bool inRect = mp.x >= mn.x && mp.x < mx.x && mp.y >= mn.y && mp.y < mx.y;
+        const bool hovered = inRect && g.HoveredWindow == w;
+
+        if (hovered) {
+            w->DrawList->AddRectFilled(mn, mx, IM_COL32(255, 255, 255, 46), 3.0f);
+        }
+        // 一条横线 = 最小化（比画一个 "–" 字形更不依赖字体里有没有这个字符）
+        const float cy = (mn.y + mx.y) * 0.5f;
+        w->DrawList->AddLine(ImVec2(mn.x + fs * 0.22f, cy),
+                             ImVec2(mx.x - fs * 0.22f, cy),
+                             ImGui::GetColorU32(ImGuiCol_Text), 1.6f);
+
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            panelTrayHiddenRef(i) = true;
+            VK_LOG_INFO("PANEL-MIN %s hidden=1", pd.id);
+        }
+
+        if (lastX[i] != mn.x || lastY[i] != mn.y || lastHov[i] != hovered) {
+            lastX[i] = mn.x;
+            lastY[i] = mn.y;
+            lastHov[i] = hovered;
+            // 自动化锚点：`PANEL-MIN <id>=(x0,y0)-(x1,y1)`
+            // （tag 里带空格，脚本侧要用自己的正则取，别指望 last_rect）
+            VK_LOG_INFO("PANEL-MIN %s=(%.0f,%.0f)-(%.0f,%.0f) hov=%d", pd.id,
+                        mn.x, mn.y, mx.x, mx.y, hovered ? 1 : 0);
+        }
+    }
+}
+
+// "+" 的勾选列表。分三段：
+//   ① 浮动功能面板（勾上 → 底栏出现按钮）
+//   ② 底栏已有按钮的（Content / Output Log，只显示状态，不能重复勾）
+//   ③ 布局面板（Hierarchy / Inspector / Viewport，勾选直接开关，但没有按钮）
+void EditorApp::drawPanelPicker() {    // 位置：**底边**贴住 + 按钮的上沿，高度随内容往上长。
+    //
+    // 上一版是"估算总高，再用 顶=+y-估计高 摆"—— 估小了弹层就往下溢出，
+    // 压住底栏（实测底部溢出 52px）。改成 SetNextWindowPos 的 pivot=(0,1)
+    // 之后，不管里面有几行、翻译成多长，底边永远贴在那儿。
+    ImGui::SetNextWindowPos(ImVec2(m_trayPlusX, m_trayPlusY - 6.0f),
+                            ImGuiCond_Appearing, ImVec2(0.0f, 1.0f));
+
+    if (!ImGui::BeginPopup("##panel_picker")) return;
+
+    logRect("BAR-PICKER-WIN", ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
+                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
+
+    // ---- ① 浮动功能面板 ----
+    ImGui::SeparatorText(TR("Panels"));
+    int nTray = 0;
+    for (int i = 0; i < panelCount(); ++i) {
+        const PanelDesc& pd = panelTable()[i];
+        if (!panelTrayEligible(pd)) continue;
+        ++nTray;
+        bool* open = panelOpenSlot(i);
+        if (!open) continue;
+        ImGui::PushID(i);
+        const bool was = *open;
+        if (ImGui::Checkbox(TR(pd.title), open)) {
+            VK_LOG_INFO("PANEL-PICK %s open=%d", pd.id, *open ? 1 : 0);
+        }
+        // 勾上=按钮出现且面板直接打开（"勾选显示出来"就是这个意思；
+        // 只加按钮不开面板会让人以为没生效）
+        if (was != *open) {
+            // 勾选状态和"窗口被按钮收起"是两回事，重新勾上必须回到可见态
+            panelTrayHiddenRef(i) = false;
+            if (*open) {
+                m_ctx->notify(std::string(TR("Added ")) + TR(pd.title) +
+                              TR(" button"));
+            }
+        }
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "BAR-PICK-%s", pd.id);
+        logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        ImGui::PopID();
+    }
+    if (nTray == 0) ImGui::TextDisabled("%s", TR("(none)"));
+
+    // ---- ② 底栏常驻的两个 ----
+    ImGui::SeparatorText(TR("Always in this bar"));
+    ImGui::BeginDisabled(true);
+    ImGui::Checkbox(TR("Content Browser"), &m_ctx->panels().content);
+    ImGui::Checkbox(TR("Console"), &m_ctx->panels().console);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Content and Output Log already have their own\n"
+                          "buttons on this bar - they are not duplicated here."));
+    }
+
+    // ---- ③ 布局面板 ----
+    ImGui::SeparatorText(TR("Docked in the layout"));
+    const char* docked[3] = {"hierarchy", "inspector", "viewport"};
+    for (const char* id : docked) {
+        const int idx = panelIndexOf(id);
+        if (idx < 0) continue;
+        bool* open = panelOpenSlot(idx);
+        if (!open) continue;
+        ImGui::PushID(1000 + idx);
+        if (ImGui::Checkbox(TR(panelTitle(idx)), open)) {
+            VK_LOG_INFO("PANEL-PICK %s open=%d", id, *open ? 1 : 0);
+        }
+        ImGui::PopID();
+    }
+
+    ImGui::EndPopup();
+}
+
+void EditorApp::drawBottomBar() {
+    const LayoutRects& L = m_ctx->layout();
+    m_bottomBarHovered = false;
+    if (L.bottom.w < 160.0f || L.bottom.h < 8.0f) return;
+
+    logRect("BAR-BOTTOM", ImVec2(L.bottom.x, L.bottom.y),
+            ImVec2(L.bottom.x + L.bottom.w, L.bottom.y + L.bottom.h));
+
+    ImGui::SetNextWindowPos(ImVec2(L.bottom.x, L.bottom.y), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(L.bottom.w, L.bottom.h), ImGuiCond_Always);
+
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+    // 与工具栏/状态栏同色（走 token）：这条通栏和它们是一套"框"
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::tokens().barBg);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 3.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 4.0f));
+    if (!ImGui::Begin("##bottombar", nullptr, flags)) {
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor();
+        return;
+    }
+    // ⚠ 必须带 AllowWhenBlockedByActiveItem：点击底栏按钮的**松开那一帧**，
+    //   InvisibleButton 还是 active item，默认标志下 IsWindowHovered 返回
+    //   false → serviceContentDrawerDismiss 会把它当成"点了外部"，
+    //   于是"点 Content 打开抽屉"在同帧内被立刻关掉（表现：按钮闪一下、
+    //   抽屉永远出不来）。
+    m_bottomBarHovered = ImGui::IsWindowHovered(
+        ImGuiHoveredFlags_ChildWindows |
+        ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+
+    const bool drawerOpen = m_ctx->panels().content;
+
+    if (barButton("content", TR("Content"), kBarIconContent, drawerOpen,
+                  TR("Show / hide the Content drawer above this bar.\n"
+                     "Drag its top edge to resize; tick “Dock in layout”\n"
+                     "to keep it docked instead of a click-away overlay."))) {
+        m_ctx->panels().content = !drawerOpen;
+        VK_LOG_INFO("CONTENT-DRAWER open=%d dock=%d h=%.0f",
+                    static_cast<int>(!drawerOpen),
+                    static_cast<int>(m_contentDock), m_contentDrawerH);
+    }
+
+    ImGui::SameLine();
+    if (barButton("log", TR("Output Log"), kBarIconLog,
+                  m_ctx->panels().console,
+                  TR("Show / hide the Output Log (same panel as Alt+8)."))) {
+        // ⚠ 2026-10-17 第四轮：用户报"点 Output Log 没打开面板"。原代码是
+        //   `console = !console` —— 它**只翻注册表那一格**，而 Console 这个
+        //   窗口的开合还受"托盘临时收起"和 ImGui 自己的窗口位置影响。改成：
+        //   看不见 → 弄到**真的看得见**（清收起态 + 请求焦点）；看得见 → 关。
+        //   "看得见"= 勾着 && 没被托盘收起。
+        const int idx = panelIndexOf("console");
+        const bool visible = panelOpen(idx) && !panelTrayHiddenRef(idx);
+        if (visible) {
+            setPanelOpen(idx, false);
+        } else {
+            focusPanel("console");
+        }
+        VK_LOG_INFO("OUTPUT-LOG open=%d visible_before=%d",
+                    static_cast<int>(m_ctx->panels().console),
+                    static_cast<int>(visible));
+    }
+
+    ImGui::SameLine();
+    if (barButton("cmd", TR("CMD"), kBarIconCmd, m_showCommandPalette,
+                  TR("Open the command console (Ctrl+Shift+P)."))) {
+        // 命令面板是个"开着就占焦"的弹层：再点一次收掉，否则永远是"再点无效"
+        m_showCommandPalette = !m_showCommandPalette;
+        VK_LOG_INFO("CMD-PALETTE open=%d", static_cast<int>(m_showCommandPalette));
+    }
+
+    // ---------------------------------------------------------- 面板托盘
+    //
+    // 2026-10-17 晚（用户原话）："CMD 按钮的右侧加一个 + 的 logo 按钮，
+    // 点击后上方打开一个子菜单，内容有一列勾选列表……勾选好 Character
+    // 面板后，CMD 右侧就会出现 Character 对应的按钮（都是带 logo 一起的），
+    // 点击按钮就会打开对应的功能面板……按钮也是可以点击右上角的叉号给
+    // 移除掉的"。
+    //
+    // 落地：+ 按钮 → 向上的勾选列表（drawPanelPicker）；勾上的浮动面板
+    // 在 + 右边各生成一个按钮（trayButton），按钮右上角画一个小 ×。
+    ImGui::SameLine();
+    {
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float sz = ImGui::GetTextLineHeight() + 7.0f;
+        m_trayPlusX = p.x;
+        m_trayPlusY = p.y;
+        m_trayBtnH = sz;
+        if (ImGui::InvisibleButton("##panel_tray_plus", ImVec2(sz + 6.0f, sz))) {
+            ImGui::OpenPopup("##panel_picker");
+        }
+        const bool hovered = ImGui::IsItemHovered();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        if (hovered) {
+            dl->AddRectFilled(p, ImVec2(p.x + sz + 6.0f, p.y + sz),
+                              IM_COL32(255, 255, 255, 26), 4.0f);
+        }
+        drawBarIcon(dl, ImVec2(p.x + 3.0f, p.y + (sz - 18.0f) * 0.5f), 18.0f,
+                    kBarIconPlus);
+        logRect("BAR-TRAY-PLUS", p, ImVec2(p.x + sz + 6.0f, p.y + sz));
+        if (hovered) {
+            ImGui::SetTooltip(TR("Add a panel button to this bar.\n"
+                              "Tick a panel, and a button with its logo appears\n"
+                              "to the right of +."));
+        }
+    }
+
+    // 勾上的浮动面板 → 底栏按钮（顺序 = 面板表顺序，稳定不跳）
+    for (int i = 0; i < panelCount(); ++i) {
+        const PanelDesc& pd = panelTable()[i];
+        if (!panelTrayEligible(pd)) continue;
+        if (!panelOpen(i)) continue;
+        ImGui::SameLine();
+        char id[48];
+        std::snprintf(id, sizeof(id), "tray_%s", pd.id);
+        const TrayHit hit = trayButton(id, TR(pd.title), barIconForPanel(pd.id),
+                                       !panelTrayHiddenRef(i),
+                                       TR("Show / hide this panel.\n"
+                                          "The × in the corner removes the button.\n"
+                                          "Right-click for minimize / close."));
+        switch (hit) {
+            case TrayHit::Toggle:
+                // 只收窗口，不动勾选 —— 按钮必须留着，否则"再点一下打开"
+                // 就没有入口了（用户要的是按钮可点、叉号才移除按钮）。
+                panelTrayHiddenRef(i) = !panelTrayHiddenRef(i);
+                VK_LOG_INFO("PANEL-TRAY %s open=%d", pd.id,
+                            panelTrayHiddenRef(i) ? 0 : 1);
+                break;
+            case TrayHit::Remove:
+                // 叉号 = 不仅关掉，还把按钮一起撤掉（等价于取消勾选）
+                setPanelOpen(i, false);
+                panelTrayHiddenRef(i) = false;
+                VK_LOG_INFO("PANEL-TRAY %s removed=1", pd.id);
+                break;
+            case TrayHit::None:
+                break;
+        }
+    }
+
+    // 勾选列表必须每帧提交（不提交的那一帧 ImGui 会把弹层关掉）
+    drawPanelPicker();
+
+    // 右侧：资源统计（原来 Content 面板底行那一句，现在常驻）
+    char stat[512];
+    const std::string& rel = m_content->currentRel();
+    std::snprintf(stat, sizeof(stat), "%zu entries  |  %s",
+                  m_content->entryCount(),
+                  rel.empty() ? "(root)" : rel.c_str());
+    const float tw = ImGui::CalcTextSize(stat).x;
+    const float x = std::max(ImGui::GetWindowWidth() - tw - 12.0f,
+                             ImGui::GetCursorPosX());
+    ImGui::SameLine(x);
+    ImGui::TextDisabled("%s", stat);
+    logRect("BAR-STATS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+}
+
+void EditorApp::drawContentDrawer() {
+    m_contentDrawerHovered = false;
+    if (!m_ctx->panels().content) return;
+
+    LayoutRects& L = m_ctx->layout();
+    if (L.content.w < 120.0f || L.content.h < 32.0f) return;
+
+    logRect("CONTENT-DRAWER", ImVec2(L.content.x, L.content.y),
+            ImVec2(L.content.x + L.content.w, L.content.y + L.content.h));
+
+    ImGui::SetNextWindowPos(ImVec2(L.content.x, L.content.y), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(L.content.w, L.content.h), ImGuiCond_Always);
+
+    // 无标题栏：标题行自己画（要能在右上角摆 "Dock in layout"）。
+    // 没有 NoMove/NoResize 之外的拖拽需求 —— 位置由布局每帧钉死，
+    // 大小只由"上边缘拖拽"决定（见下面的 grip）。
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 3.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 4.0f));
+    if (!ImGui::Begin("##contentdrawer", nullptr, flags)) {
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        return;
+    }
+    m_contentDrawerHovered =
+        ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows |
+                               ImGuiHoveredFlags_AllowWhenBlockedByPopup |
+                               ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+
+    // ---- 上边缘：拖拽改高度 ----
+    // 用 InvisibleButton 让 ImGui 帮我们管"按下 / 拖出 / 松开"；
+    // 高度按**起始高度 + 累计位移**算（而不是 += delta.y）—— 后者在
+    // 触摸板那种高频小步长下会累积误差，松手后与预期差几个像素。
+    const float gripH = 6.0f;
+    ImGui::SetCursorPos(ImVec2(0.0f, 0.0f));
+    ImGui::InvisibleButton("##drawer_grip",
+                           ImVec2(ImGui::GetContentRegionAvail().x, gripH));
+    if (ImGui::IsItemActive()) {
+        const ImGuiIO& io = ImGui::GetIO();
+        if (!m_contentDragging) {
+            m_contentDragging = true;
+            m_contentDragStartH = m_contentDrawerH;
+            m_contentDragStartY = io.MousePos.y;
+        }
+        const float dy = m_contentDragStartY - io.MousePos.y;
+        m_contentDrawerH = std::clamp(m_contentDragStartH + dy,
+                                      kContentDrawerMin,
+                                      io.DisplaySize.y * 0.72f);
+    } else {
+        m_contentDragging = false;
+    }
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    }
+    // 把手可见化：一条贴着窗口顶边的细线，悬停/拖拽时变强调色。
+    // 没有它的话"上边缘能拖改高度"是完全隐形的（用户只能靠猜）。
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 g0 = ImGui::GetItemRectMin();
+        const ImVec2 g1 = ImGui::GetItemRectMax();
+        const bool hot = ImGui::IsItemHovered() || ImGui::IsItemActive();
+        const ImU32 lineCol =
+            hot ? ImGui::GetColorU32(ui::tokens().accent)
+                : ImGui::GetColorU32(ImGuiCol_Separator);
+        dl->AddLine(ImVec2(g0.x, g1.y - 1.0f), ImVec2(g1.x, g1.y - 1.0f),
+                    lineCol, 1.0f);
+    }
+    logRect("CONTENT-DRAWER-GRIP", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    // ---- 头部行 ----
+    ImGui::TextUnformatted(TR("Content"));
+
+    // 右上角："Dock in layout" + 关闭。
+    // 勾上 = 抽屉变成布局的一部分（视口/层级随之变矮、点外部不关）；
+    // 不勾 = 浮层（默认）。用户明确要求"默认不勾选"。
+    const char* dockLbl = TR("Dock in layout");
+    const float cbW =
+        ImGui::CalcTextSize(dockLbl).x + ImGui::GetFrameHeight() + 10.0f;
+    ImGui::SameLine(std::max(ImGui::GetWindowWidth() - cbW - 34.0f, 120.0f));
+    if (ImGui::Checkbox(dockLbl, &m_contentDock)) {
+        VK_LOG_INFO("CONTENT-DRAWER dock=%d", static_cast<int>(m_contentDock));
+        if (m_contentDock) m_contentDragging = false;
+    }
+    logRect("CONTENT-DRAWER-DOCK", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::SmallButton(TR("x"))) {
+        m_ctx->panels().content = false;
+        VK_LOG_INFO("CONTENT-DRAWER open=0 (close button)");
+    }
+
+    ImGui::Separator();
+    m_content->drawBody();
+
+    // ------------------------------------------------------------
+    // 层级：抽屉必须稳定压在所有布局面板之上
+    // ------------------------------------------------------------
+    // ImGui 的绘制顺序 = g.Windows 的顺序，而**点中某个窗口会把它挪到
+    // 顺序末尾**（FocusWindow → BringWindowToDisplayFront）。所以"后画的
+    // 在上层"只在同一帧内成立：点一下视口，视口就跑到抽屉后面去了 ——
+    // 表现是"抽屉上半截被视口盖住"（浮层抽屉正好压在视口下半部）。
+    //
+    // 这里每帧把抽屉重新提到最前。两条保护：
+    //   ① **有弹出层时不动**（右键菜单 / 排序菜单 / 组合框下拉都在
+    //      g.Windows 里，硬提前会把它们压在抽屉下面 —— 菜单直接看不见）；
+    //   ② 停靠形态不提（它已经是布局的一部分，提上去会盖住底栏）。
+    //
+    // ⚠ 用的是 imgui_internal 的 BringWindowToDisplayFront：ImGui 公开 API
+    //   里没有"只改绘制顺序、不动焦点"的入口（SetNextWindowFocus 会抢
+    //   键盘焦点，紧跟着的输入框就会失焦）。
+    if (!m_contentDock) {
+        ImGuiWindow* self = ImGui::GetCurrentWindow();
+        const bool anyPopup =
+            ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                            ImGuiPopupFlags_AnyPopupLevel);
+        if (!anyPopup) {
+            ImGui::BringWindowToDisplayFront(self);
+        }
+    }
+
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+}
+
+void EditorApp::serviceContentDrawerDismiss() {
+    if (!m_ctx->panels().content) return;
+    // 停靠形态是布局的一部分 —— 点别处当然不关。
+    if (m_contentDock) return;
+
+    // ------------------------------------------------------------
+    // 弹层（右键菜单 / 排序菜单 / 组合框下拉）开着时的点击不算"点外部"
+    // ------------------------------------------------------------
+    // 抽屉里弹出的菜单盖在抽屉上方，此时 g.HoveredWindow 是那个 popup、
+    // 不是抽屉 —— IsWindowHovered 于是返回 false。所以"菜单开着时点抽屉
+    // 里别的地方"会同时发生两件事：关菜单 + 把整个抽屉一起关掉。
+    //
+    // 判定用**上一帧是否还有弹层**：ImGui 在 NewFrame 里就把"点了外部"
+    // 的弹层关掉了，等到这里（帧末）IsPopupOpen 已经是 false —— 只看当前
+    // 帧状态抓不到。IDE 的抽屉/浮层都是"第一下只关菜单"，这里照抄。
+    const bool popupNow =
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                        ImGuiPopupFlags_AnyPopupLevel);
+    if (m_contentPopupWasOpen && !popupNow) {
+        m_contentPopupWasOpen = false;
+        return;   // 这一下点击的用途是"关菜单"
+    }
+    m_contentPopupWasOpen = popupNow;
+
+    if (!ImGui::IsMouseClicked(ImGuiMouseButton_Left)) return;
+    // 点在抽屉自己身上、或点在底栏的按钮上（那一帧正是它把抽屉开出来的）
+    // 都不算"外部"。后者不加的话：点「内容」→ 同帧末尾判定为外部 → 立刻关掉。
+    if (m_contentDrawerHovered || m_bottomBarHovered) return;
+
+    m_ctx->panels().content = false;
+    VK_LOG_INFO("CONTENT-DRAWER closed=outside");
 }
 
 // ---------------------------------------------------------------- 播放条
@@ -4393,14 +5512,12 @@ const std::vector<EditorApp::PrefItem>& EditorApp::prefsTable() {
         {"snap.scaleStep", "Scale step", "Snapping", false, 0.1f, 0.01f, 1.0f,
          [](EditorApp& a) -> void* { return &a.m_ctx->snapScaleStepRef(); }},
         // ---- Viewport overlays（E14）----
-        // 四角浮层各自的显隐。右键视口空白处的 "Viewport Display" 菜单是
-        // 主入口，这里是同一份存储的第二个视图（顺带解决了落盘 —— E17 的
-        // prefs 表就是持久化的唯一来源）。
-        {"vp.overlay.modeBar", "View mode bar", "Viewport overlays", true, 1.0f,
-         0.0f, 0.0f,
-         [](EditorApp& a) -> void* {
-             return &a.m_ctx->vpOverlayRef().modeBar;
-         }},
+        // 浮层各自的显隐。右键视口空白处的 "Viewport Display" 菜单是主入口，
+        // 这里是同一份存储的第二个视图（顺带解决了落盘 —— E17 的 prefs 表
+        // 就是持久化的唯一来源）。
+        // ⚠ `vp.overlay.modeBar` 已随左上角模式条一起删掉（2026-10-17）。
+        //   旧存档里残留这个键是无害的：装载时按**本表**逐项查 JSON，表里
+        //   没有的键根本不会被读（见 EditorLayoutIO::applyPrefs）。
         {"vp.overlay.stats", "Stats HUD", "Viewport overlays", true, 0.0f, 0.0f,
          0.0f,
          [](EditorApp& a) -> void* {
@@ -4588,11 +5705,36 @@ void EditorApp::savePrefsToDisk() {
 // ---------------------------------------------------------------- 角色详情窗口
 
 void EditorApp::drawCharacterWindow() {
+    if (!m_characterWindow) return;
     // 处理"创建角色后打开详情窗口"的请求
     const ecs::Entity req = m_ctx->takeCharacterWindowRequest();
     if (req.valid()) {
         m_characterWindow->open(req);
+        // 注册表也要跟上 —— 否则托盘/View 菜单里那一格是空的，而窗口已经开着
+        setPanelOpen(panelIndexOf("character"), true);
+        VK_LOG_INFO("PANEL character open=1 reason=create-request");
     }
+
+    // ---- 注册表 ⇄ 窗口 双向同步（每帧无条件跑，理由见 panelDrawCharacter）----
+    const int idx = panelIndexOf("character");
+    if (idx >= 0) {
+        const bool wantOpen = panelOpen(idx);
+        const bool isOpen = m_characterWindow->isOpen();
+        if (wantOpen && !isOpen && m_characterWasOpen) {
+            // 用户点的标题栏 ×：注册表跟着关，否则下一帧又会把它打开
+            setPanelOpen(idx, false);
+            VK_LOG_INFO("PANEL character open=0 reason=user-close");
+        } else if (wantOpen && !isOpen) {
+            m_characterWindow->open(m_ctx->hasSelection() ? m_ctx->selection()
+                                                          : ecs::Entity{});
+            VK_LOG_INFO("PANEL character open=1");
+        } else if (!wantOpen && isOpen) {
+            m_characterWindow->close();
+            VK_LOG_INFO("PANEL character open=0");
+        }
+        m_characterWasOpen = m_characterWindow->isOpen();
+    }
+
     // 每帧绘制（窗口内部自己判断是否打开）
     m_characterWindow->draw();
 }

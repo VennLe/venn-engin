@@ -3,6 +3,7 @@
 #include "Localization.h"
 #include "DebugRects.h"    // MYVK_LOG_RECTS：把视口矩形打给自动化脚本
 #include "EditorDragDrop.h"
+#include "FeatureUIGen.h"   // emitParamChange：改 grid.* 后要标脏 + 记撤销
 #include "EditorScene.h"  // instantiateModel
 
 #include "render/Renderer.h"
@@ -18,6 +19,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -59,6 +61,31 @@ constexpr float kSensitivityStep = 0.1f;
 // 所以要能放下 "20.00"（上限）再加一点余量 —— 带按钮的版本会被两个
 // 方块挤掉一半宽度，数字直接显示不全（这是本次要修的问题）。
 constexpr float kSensitivityFieldW = 88.0f;
+
+// 工具下拉弹层的**目标宽度**。搜索框、行宽都以它为基准 —— 见 drawToolMenu
+// 里"不能从 GetWindowWidth 反推"那段说明。
+constexpr float kToolMenuW = 268.0f;
+
+// ---- 下拉按钮的"最近一次矩形"中转站 ----
+//
+// vpIconButton / vpValueButton / vpTextButton 是匿名命名空间里的自由函数，
+// 拿不到 ViewportPanel 的成员，而 openDropdown 又必须在**按钮刚返回**时
+// 知道它的矩形。不能读 GetItemRect*：这几个函数内部在 hover 时会 SetTooltip
+// （StartTooltip 会开一个新窗口），LastItemData 就不一定还是那颗按钮了。
+// 所以让按钮自己把矩形记到这儿 —— 一行、确定、没有隐式依赖。
+ImVec2 g_lastBtnMin(0.0f, 0.0f);
+ImVec2 g_lastBtnMax(0.0f, 0.0f);
+void noteButtonRect(const ImVec2& p, const ImVec2& q) {
+    g_lastBtnMin = p;
+    g_lastBtnMax = q;
+}
+
+// 给**刚刚提交的那个控件**打一条矩形日志。
+// logRect 的 tag 参数签名要求 (tag, a, b)，这里只是省掉重复的
+// GetItemRectMin/Max 两行 —— 弹层里要打十几次，写全太吵。
+void tagItem(const char* tag) {
+    logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+}
 
 // ---- 视图方向（导航球 + 数字键共用）----
 // 下标 = 轴 * 2 + (0 正 / 1 负)，顺序必须和 drawNavGizmo 里生成小球的
@@ -144,42 +171,319 @@ constexpr float kGizmoClickSlop = 5.0f; // 位移小于它就当成"点击"（�
 // UE 的平移预设是 1 / 10 / 100 / 1000 uu，本引擎 1 单位 = 1 米、1 uu = 1 cm，
 // 所以换算过来正好是同一组数字 0.01 / 0.1 / 1 / 10（米）。
 // 旋转与缩放是无量纲 / 角度，直接照抄 UE 的预设。
-const float kSnapMovePresets[] = {0.01f, 0.1f, 1.0f, 10.0f};
-const float kSnapRotPresets[] = {5.0f, 10.0f, 15.0f, 30.0f, 45.0f};
-const float kSnapScalePresets[] = {0.01f, 0.1f, 1.0f, 10.0f};
+//
+// 2026-10-17 晚：数值从"三个预设表"扩成工具条上四个下拉的列表。
+// 四个下拉各管一件事，而且**都绑定到真实存储**：
+//   move  → EditorContext::snapMoveStep（米）
+//   grid  → render 的 grid.minorStep（米，粗格自动 ×10）
+//   rotate→ EditorContext::snapRotateStep（度）
+//   scale → EditorContext::snapScaleStep（倍率）
+const float kSnapMovePresets[] = {0.01f, 0.1f, 0.5f, 1.0f, 5.0f, 10.0f, 100.0f};
+const float kSnapGridPresets[] = {0.1f, 0.25f, 0.5f, 1.0f, 5.0f, 10.0f};
+const float kSnapRotPresets[] = {1.0f, 5.0f, 10.0f, 15.0f, 30.0f, 45.0f, 90.0f};
+const float kSnapScalePresets[] = {0.01f, 0.05f, 0.1f, 0.25f, 0.5f, 1.0f};
 
-struct SnapPresetSet {
-    const char* label;
-    const float* values;
-    int count;
-    const char* fmt;
-    float* target;
+// 工具条上的一格图标（矢量绘制，不依赖图标字体）。
+enum VpIcon {
+    kVpIconSelect = 0,
+    kVpIconMove,
+    kVpIconRotate,
+    kVpIconScale,
+    kVpIconGlobe,
+    kVpIconReset,
+    kVpIconSnapMove,
+    kVpIconSnapGrid,
+    kVpIconSnapRot,
+    kVpIconSnapScale,
+    kVpIconEye,
+    kVpIconGear,
+    kVpIconGrid,
+    kVpIconCaret,
+    kVpIconAxis,
 };
 
-// 一个"吸附"控件组：[x] 名称 [数值] —— 勾选框控制开关，数值可直接拖 / 输入。
-// 步长范围故意给得宽：平移能到 100 m（搭大场景），也能到 1 mm。
-bool snapField(const char* label, bool& enabled, float& value,
-               const char* fmt, float vmin, float vmax, float speed,
-               const char* tooltip) {
-    bool changed = false;
-    ImGui::PushID(label);
+// 把图标画进 [p, p+s] 这个方块里。坐标系是"单位正方形缩放到 s"，
+// 所以同一份代码在 16px 和 24px 下都成立。
+void paintVpIcon(ImDrawList* dl, ImVec2 p, float s, int kind, ImU32 c) {
+    const auto X = [&](float u) { return p.x + u * s; };
+    const auto Y = [&](float v) { return p.y + v * s; };
+    const ImVec2 ctr(X(0.5f), Y(0.5f));
+    const float th = std::max(1.2f, s * 0.075f);   // 线宽跟着尺寸走
 
-    if (ImGui::Checkbox("##on", &enabled)) changed = true;
-    ImGui::SameLine(0.0f, 4.0f);
+    switch (kind) {
+        case kVpIconSelect: {
+            // 鼠标指针：主三角 + 下面的尾巴（两段都是凸的，可以分别填充）
+            const ImVec2 a(X(0.30f), Y(0.13f));
+            const ImVec2 b(X(0.30f), Y(0.80f));
+            const ImVec2 cc(X(0.53f), Y(0.60f));
+            dl->AddTriangleFilled(a, b, cc, c);
+            const ImVec2 t0(X(0.47f), Y(0.62f));
+            const ImVec2 t1(X(0.58f), Y(0.88f));
+            const ImVec2 t2(X(0.69f), Y(0.82f));
+            const ImVec2 t3(X(0.58f), Y(0.57f));
+            dl->AddQuadFilled(t0, t1, t2, t3, c);
+            break;
+        }
+        case kVpIconMove: {
+            // 四向箭头
+            dl->AddLine(ImVec2(X(0.5f), Y(0.18f)), ImVec2(X(0.5f), Y(0.82f)), c, th);
+            dl->AddLine(ImVec2(X(0.18f), Y(0.5f)), ImVec2(X(0.82f), Y(0.5f)), c, th);
+            dl->AddTriangleFilled(ImVec2(X(0.5f), Y(0.08f)), ImVec2(X(0.40f), Y(0.24f)),
+                                  ImVec2(X(0.60f), Y(0.24f)), c);
+            dl->AddTriangleFilled(ImVec2(X(0.5f), Y(0.92f)), ImVec2(X(0.40f), Y(0.76f)),
+                                  ImVec2(X(0.60f), Y(0.76f)), c);
+            dl->AddTriangleFilled(ImVec2(X(0.08f), Y(0.5f)), ImVec2(X(0.24f), Y(0.40f)),
+                                  ImVec2(X(0.24f), Y(0.60f)), c);
+            dl->AddTriangleFilled(ImVec2(X(0.92f), Y(0.5f)), ImVec2(X(0.76f), Y(0.40f)),
+                                  ImVec2(X(0.76f), Y(0.60f)), c);
+            break;
+        }
+        case kVpIconRotate:
+        case kVpIconSnapRot: {
+            // 圆弧 + 箭头（顺时针）
+            dl->PathClear();
+            dl->PathArcTo(ctr, s * 0.33f, 0.55f, 5.10f, 24);
+            dl->PathStroke(c, 0, th);
+            const ImVec2 tip(X(0.72f), Y(0.20f));
+            dl->AddTriangleFilled(tip, ImVec2(X(0.52f), Y(0.18f)),
+                                  ImVec2(X(0.66f), Y(0.34f)), c);
+            break;
+        }
+        case kVpIconScale:
+        case kVpIconSnapScale: {
+            // 外框 + 一道斜向箭头 = 缩放
+            dl->AddRect(ImVec2(X(0.16f), Y(0.30f)), ImVec2(X(0.70f), Y(0.84f)), c,
+                        0.0f, 0, th);
+            dl->AddLine(ImVec2(X(0.34f), Y(0.66f)), ImVec2(X(0.78f), Y(0.22f)), c, th);
+            dl->AddTriangleFilled(ImVec2(X(0.86f), Y(0.14f)),
+                                  ImVec2(X(0.62f), Y(0.20f)),
+                                  ImVec2(X(0.80f), Y(0.38f)), c);
+            break;
+        }
+        case kVpIconGlobe: {
+            // 球 + 一条经线（竖直椭圆）+ 一条纬线（水平椭圆）= 坐标系
+            dl->AddCircle(ctr, s * 0.34f, c, 20, th);
+            dl->PathClear();
+            dl->PathEllipticalArcTo(ctr, ImVec2(s * 0.15f, s * 0.34f), 0.0f, 0.0f,
+                                    6.2832f, 20);
+            dl->PathStroke(c, 0, th * 0.8f);
+            dl->PathClear();
+            dl->PathEllipticalArcTo(ctr, ImVec2(s * 0.34f, s * 0.12f), 0.0f, 0.0f,
+                                    6.2832f, 20);
+            dl->PathStroke(c, 0, th * 0.8f);
+            break;
+        }
+        case kVpIconReset: {
+            // 逆时针回转箭头 + 中心点 = "恢复"
+            dl->PathClear();
+            dl->PathArcTo(ctr, s * 0.30f, 2.60f, 6.0f, 20);
+            dl->PathStroke(c, 0, th);
+            dl->AddTriangleFilled(ImVec2(X(0.22f), Y(0.46f)),
+                                  ImVec2(X(0.44f), Y(0.36f)),
+                                  ImVec2(X(0.24f), Y(0.66f)), c);
+            dl->AddCircleFilled(ctr, s * 0.06f, c, 8);
+            break;
+        }
+        case kVpIconSnapMove: {
+            // 两个对齐点 + 中间的连线 = 吸附
+            dl->AddLine(ImVec2(X(0.28f), Y(0.72f)), ImVec2(X(0.72f), Y(0.28f)), c, th);
+            dl->AddCircleFilled(ImVec2(X(0.24f), Y(0.76f)), s * 0.12f, c, 10);
+            dl->AddCircle(ImVec2(X(0.76f), Y(0.24f)), s * 0.12f, c, 10, th);
+            break;
+        }
+        case kVpIconGrid:
+        case kVpIconSnapGrid: {
+            dl->AddRect(ImVec2(X(0.16f), Y(0.16f)), ImVec2(X(0.84f), Y(0.84f)), c,
+                        0.0f, 0, th);
+            dl->AddLine(ImVec2(X(0.39f), Y(0.16f)), ImVec2(X(0.39f), Y(0.84f)), c, th);
+            dl->AddLine(ImVec2(X(0.61f), Y(0.16f)), ImVec2(X(0.61f), Y(0.84f)), c, th);
+            dl->AddLine(ImVec2(X(0.16f), Y(0.39f)), ImVec2(X(0.84f), Y(0.39f)), c, th);
+            dl->AddLine(ImVec2(X(0.16f), Y(0.61f)), ImVec2(X(0.84f), Y(0.61f)), c, th);
+            break;
+        }
+        case kVpIconEye: {
+            // 眼睛：两条三次贝塞尔拼成杏仁形 + 瞳孔
+            dl->AddCircleFilled(ctr, s * 0.13f, c, 10);
+            dl->PathClear();
+            dl->PathLineTo(ImVec2(X(0.10f), Y(0.5f)));
+            dl->PathBezierCubicCurveTo(ImVec2(X(0.30f), Y(0.18f)),
+                                       ImVec2(X(0.70f), Y(0.18f)),
+                                       ImVec2(X(0.90f), Y(0.5f)), 16);
+            dl->PathBezierCubicCurveTo(ImVec2(X(0.70f), Y(0.82f)),
+                                       ImVec2(X(0.30f), Y(0.82f)),
+                                       ImVec2(X(0.10f), Y(0.5f)), 16);
+            dl->PathStroke(c, 0, th);
+            break;
+        }
+        case kVpIconGear: {
+            dl->AddCircle(ctr, s * 0.20f, c, 14, th);
+            for (int i = 0; i < 8; ++i) {
+                const float a = 6.2832f * static_cast<float>(i) / 8.0f;
+                dl->AddLine(ImVec2(ctr.x + std::cos(a) * s * 0.24f,
+                                   ctr.y + std::sin(a) * s * 0.24f),
+                            ImVec2(ctr.x + std::cos(a) * s * 0.38f,
+                                   ctr.y + std::sin(a) * s * 0.38f),
+                            c, th);
+            }
+            break;
+        }
+        case kVpIconCaret: {
+            dl->AddTriangleFilled(ImVec2(X(0.26f), Y(0.40f)),
+                                  ImVec2(X(0.74f), Y(0.40f)),
+                                  ImVec2(X(0.50f), Y(0.66f)), c);
+            break;
+        }
+        case kVpIconAxis:
+        default: {
+            // 三轴小图标（X 红 / Y 绿 / Z 蓝由调用方决定单色版本）
+            dl->AddLine(ImVec2(X(0.22f), Y(0.78f)), ImVec2(X(0.78f), Y(0.78f)), c, th);
+            dl->AddLine(ImVec2(X(0.22f), Y(0.78f)), ImVec2(X(0.22f), Y(0.22f)), c, th);
+            dl->AddLine(ImVec2(X(0.22f), Y(0.78f)), ImVec2(X(0.60f), Y(0.40f)), c, th);
+            break;
+        }
+    }
+}
 
-    ImGui::BeginDisabled(!enabled);
-    ImGui::SetNextItemWidth(ImGui::CalcTextSize("0.0000").x +
-                            ImGui::GetStyle().FramePadding.x * 2.0f + 8.0f);
-    if (ImGui::DragFloat("##v", &value, speed, vmin, vmax, fmt)) changed = true;
-    ImGui::EndDisabled();
+// 工具条上的一格方形图标按钮。active = 当前选中（工具 / 视图模式）。
+// 背景用 token 的强调色，浅色主题下不会变成一块深色孤岛。
+bool vpIconButton(const char* id, int icon, bool active, const char* tip,
+                  float sz = 24.0f, const char* rectTag = nullptr) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
 
-    ImGui::SameLine(0.0f, 4.0f);
-    ImGui::TextUnformatted(label);
-
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(TR("%s"), tooltip);
-
+    ImGui::PushID(id);
+    const bool clicked = ImGui::InvisibleButton("##hit", ImVec2(sz, sz));
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
     ImGui::PopID();
-    return changed;
+
+    const ImVec2 q(p.x + sz, p.y + sz);
+    if (active) {
+        dl->AddRectFilled(p, q, ImGui::GetColorU32(ui::tokens().accentSoft), 3.0f);
+        dl->AddRect(p, q, ImGui::GetColorU32(ui::tokens().accent), 3.0f, 0, 1.2f);
+    } else if (held) {
+        dl->AddRectFilled(p, q, ImGui::GetColorU32(ui::tokens().accentSoft), 3.0f);
+    } else if (hovered) {
+        dl->AddRectFilled(p, q, IM_COL32(255, 255, 255, 26), 3.0f);
+    }
+
+    ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    if (!active) tc.w *= 0.84f;   // 未选中降一档，但不用 TextDisabled（太暗）
+    paintVpIcon(dl, ImVec2(p.x + (sz - sz * 0.66f) * 0.5f,
+                           p.y + (sz - sz * 0.66f) * 0.5f),
+                sz * 0.66f, icon, ImGui::GetColorU32(tc));
+
+    noteButtonRect(p, q);
+    if (rectTag) logRect(rectTag, p, q);
+    if (hovered && tip) ImGui::SetTooltip("%s", tip);
+    return clicked;
+}
+
+// "图标 + 数值 + ▾" 的下拉按钮（吸附四件套 / 相机速度都是这个样子）。
+// 返回 true 时调用方负责 OpenPopup。
+
+// 先算宽度再画：右侧那一组要"先知道总宽才能右对齐"，所以宽度的算法
+// 必须和绘制共用同一份（各写一遍迟早会漂）。
+float vpValueButtonWidth(const char* value) {
+    return 4.0f + 16.0f + 4.0f + ImGui::CalcTextSize(value).x + 4.0f + 10.0f + 4.0f;
+}
+float vpTextButtonWidth(const char* label) {
+    return 8.0f + ImGui::CalcTextSize(label).x + 4.0f + 11.0f + 6.0f;
+}
+
+bool vpValueButton(const char* id, int icon, const char* value, const char* tip,
+                   const char* rectTag) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float h = 24.0f;
+    const ImVec2 txt = ImGui::CalcTextSize(value);
+    const float w = vpValueButtonWidth(value);
+
+    ImGui::PushID(id);
+    const bool clicked = ImGui::InvisibleButton("##hit", ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    ImGui::PopID();
+
+    const ImVec2 q(p.x + w, p.y + h);
+    if (held) {
+        dl->AddRectFilled(p, q, ImGui::GetColorU32(ui::tokens().accentSoft), 3.0f);
+    } else if (hovered) {
+        dl->AddRectFilled(p, q, IM_COL32(255, 255, 255, 26), 3.0f);
+    }
+
+    ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    if (!hovered) tc.w *= 0.88f;
+    const ImU32 col = ImGui::GetColorU32(tc);
+    paintVpIcon(dl, ImVec2(p.x + 4.0f, p.y + (h - 16.0f) * 0.5f), 16.0f, icon, col);
+    dl->AddText(ImVec2(p.x + 24.0f, p.y + (h - txt.y) * 0.5f), col, value);
+    paintVpIcon(dl, ImVec2(p.x + w - 15.0f, p.y + (h - 12.0f) * 0.5f), 12.0f,
+                kVpIconCaret,
+                ImGui::GetColorU32(ImGuiCol_TextDisabled));
+
+    noteButtonRect(p, q);
+    if (rectTag) logRect(rectTag, p, q);
+    if (hovered && tip) ImGui::SetTooltip("%s", tip);
+    return clicked;
+}
+
+// "文字 + ▾" 的下拉按钮（透视 / 光照模式）。
+bool vpTextButton(const char* id, const char* label, const char* tip,
+                  const char* rectTag, float h = 24.0f) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const ImVec2 txt = ImGui::CalcTextSize(label);
+    const float w = vpTextButtonWidth(label);
+
+    ImGui::PushID(id);
+    const bool clicked = ImGui::InvisibleButton("##hit", ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    ImGui::PopID();
+
+    const ImVec2 q(p.x + w, p.y + h);
+    if (held) {
+        dl->AddRectFilled(p, q, ImGui::GetColorU32(ui::tokens().accentSoft), 3.0f);
+    } else if (hovered) {
+        dl->AddRectFilled(p, q, IM_COL32(255, 255, 255, 26), 3.0f);
+    }
+
+    ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    if (!hovered) tc.w *= 0.88f;
+    const ImU32 col = ImGui::GetColorU32(tc);
+    dl->AddText(ImVec2(p.x + 8.0f, p.y + (h - txt.y) * 0.5f), col, label);
+    paintVpIcon(dl, ImVec2(p.x + w - 17.0f, p.y + (h - 12.0f) * 0.5f), 12.0f,
+                kVpIconCaret, ImGui::GetColorU32(ImGuiCol_TextDisabled));
+
+    noteButtonRect(p, q);
+    if (rectTag) logRect(rectTag, p, q);
+    if (hovered && tip) ImGui::SetTooltip("%s", tip);
+    return clicked;
+}
+
+// 分屏布局在按钮上显示的短标签 —— 就是用户给的那四个字样：1 / 2V / 2H / 4。
+//
+// 为什么按钮上不用 viewportLayoutName()（single / two_vertical ...）：那是
+// **落盘用的 id**，二十多个字符根本塞不进工具条；而且用户认的就是这四个。
+// 完整说明落在下拉里（每行都有），按钮上只需要"我现在是几屏"。
+const char* viewportLayoutShortName(ViewportLayout l) {
+    switch (l) {
+        case ViewportLayout::Single: return "1";
+        case ViewportLayout::TwoVertical: return "2V";
+        case ViewportLayout::TwoHorizontal: return "2H";
+        case ViewportLayout::Quad: return "4";
+    }
+    return "1";
+}
+
+// 工具条的分组竖线（比 TextUnformatted("|") 更像 UE 的分组分隔）
+void vpBarSeparator() {    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float h = 24.0f;
+    ImGui::Dummy(ImVec2(9.0f, h));
+    const float x = p.x + 4.5f;
+    const ImU32 col = ImGui::GetColorU32(ImGuiCol_Separator);
+    dl->AddLine(ImVec2(x, p.y + 3.0f), ImVec2(x, p.y + h - 3.0f), col, 1.0f);
 }
 
 } // namespace
@@ -187,146 +491,811 @@ bool snapField(const char* label, bool& enabled, float& value,
 ViewportPanel::ViewportPanel(EditorContext& ctx, render::Renderer& renderer)
     : m_ctx(ctx), m_renderer(renderer) {}
 
-// ---------------------------------------------------------------- 工具栏
-
-void ViewportPanel::drawToolbar() {
-    // 手柄模式：三个互斥按钮，快捷键 W/E/R
-    const GizmoMode mode = m_ctx.gizmoMode();
-    const ImVec4 active(0.26f, 0.52f, 0.85f, 1.0f);
-    const ImVec4 idle(0.20f, 0.20f, 0.23f, 1.0f);
-
-    ImGui::PushStyleColor(ImGuiCol_Button, mode == GizmoMode::Translate ? active : idle);
-    if (ImGui::Button(TR("Move (W)"))) m_ctx.setGizmoMode(GizmoMode::Translate);
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, mode == GizmoMode::Rotate ? active : idle);
-    if (ImGui::Button(TR("Rotate (E)"))) m_ctx.setGizmoMode(GizmoMode::Rotate);
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, mode == GizmoMode::Scale ? active : idle);
-    if (ImGui::Button(TR("Scale (R)"))) m_ctx.setGizmoMode(GizmoMode::Scale);
-    ImGui::PopStyleColor();
-
-    ImGui::SameLine();
-    ImGui::TextUnformatted(TR("|"));
-    ImGui::SameLine();
-
-    // 坐标系
-    const GizmoSpace space = m_ctx.gizmoSpace();
-    if (ImGui::RadioButton(TR("World"), space == GizmoSpace::World))
-        m_ctx.setGizmoSpace(GizmoSpace::World);
-    ImGui::SameLine();
-    if (ImGui::RadioButton(TR("Local"), space == GizmoSpace::Local))
-        m_ctx.setGizmoSpace(GizmoSpace::Local);
-
-    ImGui::SameLine();
-    ImGui::TextUnformatted(TR("|"));
-    ImGui::SameLine();
-
-    ImGui::Checkbox(TR("Gizmo"), &m_showGizmo);
-    ImGui::SameLine();
-    ImGui::Checkbox(TR("HUD"), &m_showOverlay);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(TR("Viewport overlay (stats / selection), the navigation\n"
-                          "HUD in the top-right and the navigation gizmo\n"
-                          "in the bottom-left corner."));
-    }
-
-    ImGui::SameLine();
-    ImGui::TextUnformatted(TR("|"));
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!m_ctx.hasSelection());
-    if (ImGui::Button(TR("Focus (F)"))) focusSelection();
-    ImGui::EndDisabled();
-
-    // 注：全屏切换按钮**不在这里**。它已经在主工具栏和视口右上角浮层里
-    // 各有一个（全屏时工具栏不画，浮层那个是必备的退出口）。视口工具栏本
-    // 来就长，再加一个会被挤出右边缘裁掉 —— 上一版就是这么翻车的。
-
-    // 吸附单独占一行：三种变换各有开关 + 步长，塞进上面那行必定溢出。
-    drawSnapRow();
+// 打开下拉并把"弹层该出现在哪"记下来。
+//
+// 必须在按钮**刚提交完**的那一行调用（读的是 GetItemRect*）。ImGui 自己的
+// OpenPopup 会把弹层摆在鼠标位置 —— 落在工具条那一行上，既挡按钮又不
+// 像 UE；这里统一改成"从按钮左下角往下展开"。
+void ViewportPanel::openDropdown(const char* popupId) {
+    m_popupX = g_lastBtnMin.x;
+    m_popupY = g_lastBtnMax.y + 1.0f;
+    ImGui::OpenPopup(popupId);
 }
 
-// ---------------------------------------------------------------- 吸附
+// 每个 drawXxxMenu 的第一行（BeginPopup 之前）调用。
+// ImGuiCond_Appearing：只在弹层出现的那一帧定位，之后用户/滚动条都能接管。
+void ViewportPanel::placeDropdown() {
+    if (m_popupY <= 0.0f) return;
+    ImGui::SetNextWindowPos(ImVec2(m_popupX, m_popupY), ImGuiCond_Appearing);
+}
+
+// ---------------------------------------------------------------- 视口工具条
 //
-// UE5 的模型是"每种变换一套吸附开关 + 步长"，这里照做（默认值与预设值
-// 见文件头常量）。三个勾选框默认关闭 —— 吸附是"想对齐时开一下"的手段，
-// 默认开着会让自由摆放变成一格一格地跳。
+// 2026-10-17 晚重做。用户给了 6 张 UE5 视口工具条的截图，要求"按这些图片
+// 的 ui 结构和功能重新设计"。落地成**一条紧凑的图标行 + 九个下拉**：
 //
-// 为什么单独起一行：工具栏第一行已经是 Move/Rotate/Scale + World/Local +
-// Gizmo/HUD + Focus，再塞三个勾选框 + 三个数字框会被挤出右边缘裁掉
-// （这个坑上一版踩过一次）。
-void ViewportPanel::drawSnapRow() {
+//   ┌─────────────────────────────────────────────────────────────────────┐
+//   │ [▼工具] │ ↖ ✥ ⟳ ⤢ │ 🌐▾ ↺ │ ✛0▾ ▦5▾ ⟳10°▾ ⤢0.25▾ │  透视▾ 0.51▾ 光照▾ 👁 ⚙ ▦ │
+//   └─────────────────────────────────────────────────────────────────────┘
+//     ①工具下拉  ②四个工具  ③坐标/复位  ④吸附四件套           ⑤视口看法的右侧组
+//
+// 为什么把原来的两行（工具 + 吸附）并成一行：原来第二行是"三个勾选框 +
+// 三个数字框 + Presets"，一共要 900+ px，窄视口里必被裁掉。改成"图标 +
+// 数值 + 下拉"之后每组只占 ~70px，四个吸附加左组全部塞进 520px ——
+// 这正是 UE5 的做法（值不是常驻的滑条，而是点开才有的列表）。
+//
+// 三处刻意的取舍（都是"不许骗人"这条纪律的延伸）：
+//   · **正交投影不给**：scene::Camera 只有透视投影，摆一个点了没反应的
+//     "正交"单选比没有更糟。菜单里它以禁用态出现，提示写明"引擎暂不支持"。
+//   · **视图方向写的是本引擎真实的快捷键**（Num1/3/7 + Ctrl 反向），
+//     不是截图里的 Alt+G/J/K/H —— 照抄别人的按钮却挂着另一套键位，
+//     是"文档骗人"。
+//   · **吸附的四个值各自绑定真实存储**：move/rotate/scale 写 EditorContext，
+//     grid 写 render 的 grid.minorStep（粗格自动 ×10），不是四个摆设。
+void ViewportPanel::drawToolbar() {
     EditorContext& c = m_ctx;
+    const GizmoMode mode = c.gizmoMode();
+    const bool spaceLocal = (c.gizmoSpace() == GizmoSpace::Local);
 
-    ImGui::TextDisabled(TR("Snap"));
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(
-            TR("Grid snapping - one set per transform, same model as UE5's\n"
-            "viewport toolbar. Defaults: move 0.1 m / rotate 10 deg /\n"
-            "scale 0.1 (= UE's 10 uu / 10 deg / 0.1, with 1 uu = 1 cm)."));
-    }
-    ImGui::SameLine();
-
-    snapField("Move (m)", c.snapMoveRef(), c.snapMoveStepRef(), "%.3f", 0.001f,
-              100.0f, 0.005f,
-              "Translate: the drag delta is quantised to this many meters.\n"
-              "UE default = 10 uu = 0.1 m.");
-    ImGui::SameLine();
-    ImGui::TextUnformatted(TR("|"));
-    ImGui::SameLine();
-    snapField("Rotate (deg)", c.snapRotateRef(), c.snapRotateStepRef(), "%.1f",
-              0.5f, 90.0f, 0.1f,
-              "Rotate: the drag delta is quantised to this many degrees.\n"
-              "UE default = 10 deg.");
-    ImGui::SameLine();
-    ImGui::TextUnformatted(TR("|"));
-    ImGui::SameLine();
-    snapField("Scale (x)", c.snapScaleRef(), c.snapScaleStepRef(), "%.3f",
-              0.001f, 10.0f, 0.005f,
-              "Scale: the scale FACTOR is quantised (not the absolute value,\n"
-              "so the first drag never jumps). UE default = 0.1.");
-
-    // ---- 预设（对齐 UE5 下拉里那一串值）----
-    ImGui::SameLine();
-    ImGui::TextUnformatted(TR("|"));
-    ImGui::SameLine();
-    if (ImGui::Button(TR("Presets"))) ImGui::OpenPopup("##snap_presets");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(TR("Pick a step from UE5's preset lists."));
-    }
-
-    SnapPresetSet sets[3] = {
-        {"Move (m)", kSnapMovePresets, 4, "%.2f", &c.snapMoveStepRef()},
-        {"Rotate (deg)", kSnapRotPresets, 5, "%.0f", &c.snapRotateStepRef()},
-        {"Scale (x)", kSnapScalePresets, 4, "%.2f", &c.snapScaleStepRef()},
+    // 切换工具时打一行日志：自动化据此断言"点这个按钮真的换了模式"。
+    // ⚠ 这里**不**打日志（只落状态）。日志挪到 drawToolbar 末尾按帧差分，
+    //   因为换模式的入口有三处：这里的四个工具按钮、快捷键 Q/W/E/R、
+    //   以及顶栏那颗"选择模式"下拉。只在按钮里打日志的话，后两条路径
+    //   一行痕迹都没有 —— 自动化没法证明它们改的是同一份状态。
+    const auto setMode = [&](GizmoMode m) {
+        if (c.gizmoMode() == m) return;
+        c.setGizmoMode(m);
     };
+    const auto same = [&]() { ImGui::SameLine(0.0f, 2.0f); };
 
-    if (ImGui::BeginPopup("##snap_presets")) {
-        for (SnapPresetSet& s : sets) {
-            ImGui::TextDisabled(TR("%s"), s.label);
-            for (int i = 0; i < s.count; ++i) {
-                char item[48];
-                std::snprintf(item, sizeof(item), s.fmt,
-                              static_cast<double>(s.values[i]));
-                if (i > 0) ImGui::SameLine();
-                ImGui::PushID(i);
-                if (ImGui::SmallButton(item)) *s.target = s.values[i];
-                ImGui::PopID();
-            }
-            ImGui::Separator();
+    // ---------------- ① 工具下拉（当前工具图标 + ▾）----------------
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float h = 24.0f, w = 42.0f;
+        const ImVec2 q(p.x + w, p.y + h);
+        // 先记账再点：openDropdown 靠 g_lastBtnMin/Max 定位，不能读到上一颗按钮
+        noteButtonRect(p, q);
+        if (ImGui::InvisibleButton("##vp_tool_dd", ImVec2(w, h)))
+            openDropdown("##vp_tool_menu");
+        const bool hovered = ImGui::IsItemHovered();
+        if (hovered) {
+            dl->AddRectFilled(p, q, IM_COL32(255, 255, 255, 30), 3.0f);
         }
-        ImGui::TextDisabled(TR("Values follow UE5's viewport presets."));
-        ImGui::EndPopup();
+        const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+        const int curIcon = mode == GizmoMode::Select      ? kVpIconSelect
+                            : mode == GizmoMode::Translate ? kVpIconMove
+                            : mode == GizmoMode::Rotate    ? kVpIconRotate
+                                                           : kVpIconScale;
+        paintVpIcon(dl, ImVec2(p.x + 5.0f, p.y + 4.0f), 16.0f, curIcon, col);
+        paintVpIcon(dl, ImVec2(p.x + 26.0f, p.y + 7.0f), 11.0f, kVpIconCaret,
+                    ImGui::GetColorU32(ImGuiCol_TextDisabled));
+        logRect("VP-TOOLBTN", p, q);
+        if (hovered) {
+            ImGui::SetTooltip(TR("Transform tool  (Q / W / E / R)\n"
+                              "Opens the tool list with a search box."));
+        }
     }
 
-    // 当前模式的吸附状态（手柄拖拽时的实时读数在左上角叠加层里）
-    ImGui::SameLine();
-    const char* modeLabel = c.gizmoMode() == GizmoMode::Translate ? "move"
-                            : c.gizmoMode() == GizmoMode::Rotate ? "rotate"
-                                                                 : "scale";
-    ImGui::TextDisabled(TR("current: %s snap %s"), modeLabel,
-                        c.snapForCurrentMode() ? "ON" : "off");
+    // ---------------- ② 四个工具（单选）----------------
+    same();
+    if (vpIconButton("vpt_sel", kVpIconSelect, mode == GizmoMode::Select,
+                     TR("Select  (Q)\nPick objects. No transform handle is shown."),
+                     24.0f, "VP-TOOL select"))
+        setMode(GizmoMode::Select);
+    same();
+    if (vpIconButton("vpt_move", kVpIconMove, mode == GizmoMode::Translate,
+                     TR("Move  (W)"), 24.0f, "VP-TOOL move"))
+        setMode(GizmoMode::Translate);
+    same();
+    if (vpIconButton("vpt_rot", kVpIconRotate, mode == GizmoMode::Rotate,
+                     TR("Rotate  (E)"), 24.0f, "VP-TOOL rotate"))
+        setMode(GizmoMode::Rotate);
+    same();
+    if (vpIconButton("vpt_scale", kVpIconScale, mode == GizmoMode::Scale,
+                     TR("Scale  (R)"), 24.0f, "VP-TOOL scale"))
+        setMode(GizmoMode::Scale);
+
+    // ---------------- ③ 坐标系 + 复位 ----------------
+    same();
+    vpBarSeparator();
+    same();
+    if (vpIconButton("vpt_space", kVpIconGlobe, spaceLocal,
+                     TR("Transform space  (X toggles)\nWorld = gizmo axes follow the world grid\n"
+                        "Local = they follow the object's rotation"),
+                     24.0f, "VP-SPACE"))
+        openDropdown("##vp_space_menu");
+    same();
+    {
+        ImGui::BeginDisabled(!c.hasSelection());
+        if (vpIconButton("vpt_reset", kVpIconReset, false,
+                         TR("Reset the selected object's rotation and scale\n"
+                            "(position is kept). Undoable with Ctrl+Z."),
+                         24.0f, "VP-XFORM-RESET")) {
+            const ecs::Entity e = c.selection();
+            bool did = false;
+            c.structuralEdit("Reset Transform", [&]() {
+                if (auto* t = c.editorScene().world().get<ecs::TransformComponent>(e)) {
+                    t->rotation = glm::vec3(0.0f);
+                    t->scale = glm::vec3(1.0f);
+                    did = true;
+                }
+            });
+            if (did) {
+                c.dirty() = true;
+                c.setStatus(TR("Reset rotation + scale"));
+                VK_LOG_INFO("VP-XFORM-RESET entity=%u", e.id);
+            }
+        }
+        ImGui::EndDisabled();
+    }
+
+    // ---------------- ④ 吸附四件套 ----------------
+    same();
+    vpBarSeparator();
+    same();
+    {
+        char buf[32];
+        // 平移吸附：0 = 关（UE 的 0 也是这个意思）
+        const bool on = c.snapMove();
+        std::snprintf(buf, sizeof(buf), on ? "%g m" : "0", static_cast<double>(
+                          on ? c.snapMoveStep() : 0.0f));
+        if (vpValueButton("vpt_snap_move", kVpIconSnapMove, buf,
+                          TR("Move snapping step\nClick for the preset list."),
+                          "VP-SNAP move"))
+            openDropdown("##vp_snap_move");
+    }
+    same();
+    {
+        char buf[32];
+        float g = 1.0f;
+        if (void* p = render::paramPtr("grid.minorStep")) {
+            g = *static_cast<float*>(p);
+        }
+        std::snprintf(buf, sizeof(buf), "%g m", static_cast<double>(g));
+        if (vpValueButton("vpt_snap_grid", kVpIconSnapGrid, buf,
+                          TR("Reference grid cell size"), "VP-SNAP grid"))
+            openDropdown("##vp_snap_grid");
+    }
+    same();
+    {
+        char buf[32];
+        const bool on = c.snapRotate();
+        std::snprintf(buf, sizeof(buf), on ? "%.0f°" : "0°",
+                      static_cast<double>(on ? c.snapRotateStep() : 0.0f));
+        if (vpValueButton("vpt_snap_rot", kVpIconSnapRot, buf,
+                          TR("Rotation snapping step"), "VP-SNAP rotate"))
+            openDropdown("##vp_snap_rot");
+    }
+    same();
+    {
+        char buf[32];
+        const bool on = c.snapScale();
+        std::snprintf(buf, sizeof(buf), on ? "%g" : "0",
+                      static_cast<double>(on ? c.snapScaleStep() : 0.0f));
+        if (vpValueButton("vpt_snap_scale", kVpIconSnapScale, buf,
+                          TR("Scale snapping step"), "VP-SNAP scale"))
+            openDropdown("##vp_snap_scale");
+    }
+
+    // ---------------- ⑤ 右侧组：视口怎么看 ----------------
+    //
+    // 右对齐。宽度先算再画：算出来放不下就**整组不画** —— 挤在边缘被裁掉
+    // 一半的按钮，比没有更让人困惑（而且会盖住左边那排的命中区）。
+    {
+        char speedBuf[32];
+        std::snprintf(speedBuf, sizeof(speedBuf), "%.2f",
+                      static_cast<double>(c.navSensitivity()));
+        const char* lightName = TR(render::Renderer::viewModeName(m_renderer.viewMode()));
+        const char* persp = TR("Perspective");
+        const char* layoutName = viewportLayoutShortName(c.viewportLayout());
+
+        const float rightW =
+            vpTextButtonWidth(persp) + 2.0f +
+            vpTextButtonWidth(layoutName) + 2.0f +
+            vpValueButtonWidth(speedBuf) +
+            2.0f + vpTextButtonWidth(lightName) + 2.0f + 24.0f + 2.0f + 24.0f +
+            2.0f + 24.0f + 8.0f;
+
+        const float targetX =
+            ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rightW;
+        if (targetX > ImGui::GetCursorPosX() + 6.0f) {
+            ImGui::SameLine(targetX);
+            logRect("VP-BAR-RIGHT", ImGui::GetCursorScreenPos(),
+                    ImVec2(ImGui::GetCursorScreenPos().x + rightW,
+                           ImGui::GetCursorScreenPos().y + 24.0f));
+
+            if (vpTextButton("vpt_view", persp,
+                             TR("Projection, view directions and camera"),
+                             "VP-VIEW-BTN"))
+                openDropdown("##vp_view_menu");
+            same();
+            // 分屏布局（1 / 2V / 2H / 4）。**紧挨着"透视"**是用户明确要求的：
+            // "把这些参数也一样放到和 Perspective 这些属性一起并排放置，
+            //  点击后也是展开下拉勾选框列表去设置"。
+            if (vpTextButton("vpt_layout", layoutName,
+                             TR("Viewport split layout\n"
+                                "1 = single   2V = side by side\n"
+                                "2H = stacked   4 = quad"),
+                             "VP-LAYOUT-BTN"))
+                openDropdown("##vp_layout_menu");
+            same();
+            if (vpValueButton("vpt_speed", kVpIconMove, speedBuf,
+                              TR("Camera speed\nHold RMB + wheel to change it "
+                                 "without opening this menu."),
+                              "VP-SPEED"))
+                openDropdown("##vp_speed_menu");
+            same();
+            if (vpTextButton("vpt_light", lightName,
+                             TR("Lighting mode (how the scene is drawn)"),
+                             "VP-LIGHT"))
+                openDropdown("##vp_light_menu");
+            same();
+            if (vpIconButton("vpt_show", kVpIconEye, false,
+                             TR("Show flags"), 24.0f, "VP-SHOW"))
+                openDropdown("##vp_show_menu");
+            same();
+            if (vpIconButton("vpt_settings", kVpIconGear, false,
+                             TR("Viewport settings (grid / background)"), 24.0f,
+                             "VP-SET"))
+                openDropdown("##vp_settings_menu");
+            same();
+            if (vpIconButton("vpt_grid", kVpIconGrid, c.showGridRef(),
+                             TR("Reference grid on / off"), 24.0f, "VP-GRID"))
+                c.showGridRef() = !c.showGridRef();
+        }
+    }
+
+    // ---------------- 工具模式变化留痕（单一出口）----------------
+    // 放在这一帧所有入口**之后**：不论模式是点工具按钮、按 Q/W/E/R，还是从
+    // 顶栏那颗"选择模式"下拉改的，只要和上一帧不同就打一行。这样
+    //   · 自动化能证明"三条入口改的是同一份状态"（同一行日志）
+    //   · 不会因为同一帧多次赋值而刷出多行
+    if (static_cast<int>(mode) != m_lastToolMode) {
+        m_lastToolMode = static_cast<int>(mode);
+        VK_LOG_INFO("VP-TOOLMODE %s",
+                    mode == GizmoMode::Select      ? "select"
+                    : mode == GizmoMode::Translate ? "move"
+                    : mode == GizmoMode::Rotate    ? "rotate"
+                                                   : "scale");
+    }
+
+    // ---------------- 下拉内容（每帧无条件提交）----------------
+    // ⚠ 这些 BeginPopup 必须**每帧都执行**：ImGui 在没提交的那一帧会把
+    //   弹层直接关掉（和 ContentBrowser 右键菜单同一个坑）。所以它们
+    //   不在任何 if 里。
+    drawToolMenu();
+    drawSpaceMenu();
+    drawSnapMenu(0);
+    drawSnapMenu(1);
+    drawSnapMenu(2);
+    drawSnapMenu(3);
+    drawViewMenu();
+    drawLayoutMenu();
+    drawSpeedMenu();
+    drawLightMenu();
+    drawShowMenu();
+    drawVpSettingsMenu();
+}
+
+// ---------------------------------------------------------------- 下拉内容
+//
+// 每个函数只画 popup 内部，由 drawToolbar 每帧无条件调用。
+
+// 搜索框的过滤规则（大小写不敏感的子串）。单独提出来是因为**两处**要用：
+// vpToolRow 用它决定这一行画不画，drawToolMenu 用它算"剩几行"打日志。
+// 两处各写一遍，迟早在大小写/空串上分叉。
+static bool vpToolMatch(const char* label, const char* filter) {
+    if (!filter || !filter[0]) return true;
+    std::string hay(label), needle(filter);
+    auto lower = [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); };
+    std::transform(hay.begin(), hay.end(), hay.begin(), lower);
+    std::transform(needle.begin(), needle.end(), needle.begin(), lower);
+    return hay.find(needle) != std::string::npos;
+}
+
+// 一行工具项：左侧圆点（选中实心）+ 图标 + 名字 + 右对齐的快捷键。
+// 这是截图里"变换工具"那一段的排版 —— 圆点而不是对勾，因为它是**单选**。
+static bool vpToolRow(const char* id, int icon, const char* label, const char* key,
+                      bool active, const char* filter, const char* rectTag) {
+    if (!vpToolMatch(label, filter)) return false;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float h = 26.0f;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+
+    ImGui::PushID(id);
+    const bool clicked = ImGui::Selectable("##row", false,
+                                           ImGuiSelectableFlags_None,
+                                           ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+    ImGui::PopID();
+
+    const float cy = p.y + h * 0.5f;
+    // 单选圆点
+    if (active) {
+        dl->AddCircleFilled(ImVec2(p.x + 10.0f, cy), 4.2f,
+                            ImGui::GetColorU32(ui::tokens().accent), 12);
+    } else {
+        dl->AddCircle(ImVec2(p.x + 10.0f, cy), 4.2f,
+                      ImGui::GetColorU32(ImGuiCol_TextDisabled), 12, 1.2f);
+    }
+    // 图标 + 名字
+    ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    if (!active && !hovered) tc.w *= 0.86f;
+    const ImU32 col = ImGui::GetColorU32(tc);
+    paintVpIcon(dl, ImVec2(p.x + 22.0f, cy - 8.0f), 16.0f, icon, col);
+    dl->AddText(ImVec2(p.x + 46.0f, cy - ImGui::GetTextLineHeight() * 0.5f), col,
+                label);
+    // 快捷键（右对齐）
+    const ImVec2 kw = ImGui::CalcTextSize(key);
+    dl->AddText(ImVec2(p.x + w - kw.x - 10.0f, cy - kw.y * 0.5f),
+                ImGui::GetColorU32(ImGuiCol_TextDisabled), key);
+
+    if (rectTag) logRect(rectTag, p, ImVec2(p.x + w, p.y + h));
+    return clicked;
+}
+
+void ViewportPanel::drawToolMenu() {
+    placeDropdown();
+    if (!ImGui::BeginPopup("##vp_tool_menu")) return;
+
+    logRect("VP-TOOLMENU-WIN", ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
+                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
+
+    // 搜索框宽度**固定**，不要用 GetWindowWidth() 推。
+    //
+    // 踩过的坑：`SetNextItemWidth(max(230, GetWindowWidth()-16))` 在弹层
+    // 第一帧拿到的是父窗口宽度（≈1570），于是搜索框被撑到 1554px、把
+    // 整个弹层拉成一条横贯屏幕的带子。弹层是 auto-resize 的 —— 内容的
+    // 宽度**决定**窗口宽度，从窗口宽度反推内容宽度是个死循环。
+    ImGui::SetNextItemWidth(kToolMenuW - 16.0f);
+    ImGui::InputTextWithHint("##vp_tool_search", TR("Start typing to search"),
+                             m_toolSearch, sizeof(m_toolSearch));
+    logRect("VP-TOOLSEARCH", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    ImGui::SeparatorText(TR("Transform tools"));
+
+    struct Row { GizmoMode m; int icon; const char* label; const char* key;
+                 const char* id; };
+    const Row rows[4] = {
+        {GizmoMode::Select, kVpIconSelect, "Select", "Q", "select"},
+        {GizmoMode::Translate, kVpIconMove, "Move", "W", "move"},
+        {GizmoMode::Rotate, kVpIconRotate, "Rotate", "E", "rotate"},
+        {GizmoMode::Scale, kVpIconScale, "Scale", "R", "scale"},
+    };
+    const GizmoMode cur = m_ctx.gizmoMode();
+    int shown = 0;
+    for (const Row& r : rows) {
+        char tag[48];
+        std::snprintf(tag, sizeof(tag), "VP-TOOLITEM %s", r.label);
+        if (vpToolRow(r.label, r.icon, TR(r.label), r.key, cur == r.m,
+                      m_toolSearch, tag)) {
+            m_ctx.setGizmoMode(r.m);
+            // 日志用**小写 id**，和工具条上那四个按钮（setMode）保持同一套
+            // 词表 —— 同一个动作打两种写法，自动化脚本就得猜是哪一种。
+            VK_LOG_INFO("VP-TOOLMODE %s", r.id);
+            ImGui::CloseCurrentPopup();
+        }
+        if (vpToolMatch(r.label, m_toolSearch)) ++shown;
+    }
+    // 搜索词变化时打一行"过滤结果剩几行"。搜索是"按行不再提交"来过滤的，
+    // 没有可断言的痕迹就没法证明它真的在过滤（而非键没进去）。
+    if (std::strcmp(m_toolSearch, m_toolSearchLogged) != 0) {
+        std::snprintf(m_toolSearchLogged, sizeof(m_toolSearchLogged), "%s",
+                      m_toolSearch);
+        VK_LOG_INFO("VP-TOOLSEARCH q=%s rows=%d", m_toolSearch, shown);
+    }
+
+    ImGui::Separator();
+    // 焦点 / 全屏这种"动作"也放这里 —— 截图里的下拉在工具列表下面还有
+    // 若干动作项。只列真的接了线的两个。
+    ImGui::BeginDisabled(!m_ctx.hasSelection());
+    if (ImGui::MenuItem(TR("Focus selection"), "F")) focusSelection();
+    ImGui::EndDisabled();
+
+    ImGui::EndPopup();
+}
+
+void ViewportPanel::drawSpaceMenu() {
+    placeDropdown();
+    if (!ImGui::BeginPopup("##vp_space_menu")) return;
+    const GizmoSpace sp = m_ctx.gizmoSpace();
+    bool world = (sp == GizmoSpace::World);
+    if (ImGui::RadioButton(TR("World"), world)) {
+        m_ctx.setGizmoSpace(GizmoSpace::World);
+        VK_LOG_INFO("VP-SPACE world");
+        // 单选 = 选完就结束。不关的话弹层会一直挂着，下一次点击会被它吃掉
+        // （表现为"点了别的按钮没反应"）。
+        ImGui::CloseCurrentPopup();
+    }
+    logRect("VP-SPACEITEM world", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::RadioButton(TR("Local"), !world)) {
+        m_ctx.setGizmoSpace(GizmoSpace::Local);
+        VK_LOG_INFO("VP-SPACE local");
+        ImGui::CloseCurrentPopup();
+    }
+    logRect("VP-SPACEITEM local", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::Separator();
+    ImGui::TextDisabled(TR("X toggles"));
+    ImGui::EndPopup();
+}
+
+// 一个"对齐数值"下拉：标题 + 单选列表（截图里那一列圆点 + 数字）。
+void ViewportPanel::drawSnapMenu(int which) {
+    const char* popup = which == 0   ? "##vp_snap_move"
+                        : which == 1 ? "##vp_snap_grid"
+                        : which == 2 ? "##vp_snap_rot"
+                                     : "##vp_snap_scale";
+    placeDropdown();
+    if (!ImGui::BeginPopup(popup)) return;
+
+    EditorContext& c = m_ctx;
+    const char* id = which == 0   ? "move"
+                     : which == 1 ? "grid"
+                     : which == 2 ? "rotate"
+                                  : "scale";
+    const float* values = which == 0   ? kSnapMovePresets
+                          : which == 1 ? kSnapGridPresets
+                          : which == 2 ? kSnapRotPresets
+                                       : kSnapScalePresets;
+    const int count = which == 0   ? static_cast<int>(sizeof(kSnapMovePresets) / sizeof(float))
+                      : which == 1 ? static_cast<int>(sizeof(kSnapGridPresets) / sizeof(float))
+                      : which == 2 ? static_cast<int>(sizeof(kSnapRotPresets) / sizeof(float))
+                                   : static_cast<int>(sizeof(kSnapScalePresets) / sizeof(float));
+
+    ImGui::SeparatorText(TR("Align size"));
+    logRect("VP-SNAPMENU-WIN", ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
+                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
+
+    // 当前值（grid 读渲染参数，其余读 EditorContext）
+    float cur = 0.0f;
+    bool on = true;
+    if (which == 0) {
+        on = c.snapMove();
+        cur = c.snapMoveStep();
+    } else if (which == 1) {
+        if (void* p = render::paramPtr("grid.minorStep")) {
+            cur = *static_cast<float*>(p);
+        }
+    } else if (which == 2) {
+        on = c.snapRotate();
+        cur = c.snapRotateStep();
+    } else {
+        on = c.snapScale();
+        cur = c.snapScaleStep();
+    }
+
+    // 第 0 项：Off（只有三个变换吸附有"关"，栅格尺寸没有"关"这种说法）
+    if (which != 1) {
+        if (ImGui::RadioButton(TR("Off"), !on)) {
+            if (which == 0) c.snapMoveRef() = false;
+            else if (which == 2) c.snapRotateRef() = false;
+            else c.snapScaleRef() = false;
+            VK_LOG_INFO("VP-SNAP %s on=0", id);
+            ImGui::CloseCurrentPopup();
+        }
+    }
+
+    for (int i = 0; i < count; ++i) {
+        char label[32];
+        const float v = values[i];
+        if (which == 1) {
+            std::snprintf(label, sizeof(label), "%g m", static_cast<double>(v));
+        } else if (which == 2) {
+            std::snprintf(label, sizeof(label), "%.0f°", static_cast<double>(v));
+        } else {
+            std::snprintf(label, sizeof(label), "%g", static_cast<double>(v));
+        }
+        const bool selected = on && std::fabs(cur - v) < 1e-4f;
+        if (ImGui::RadioButton(label, selected)) {
+            if (which == 0) {
+                c.snapMoveStepRef() = v;
+                c.snapMoveRef() = true;
+            } else if (which == 1) {
+                if (void* gp = render::paramPtr("grid.minorStep")) {
+                    *static_cast<float*>(gp) = v;
+                }
+                if (void* gp = render::paramPtr("grid.majorStep")) {
+                    *static_cast<float*>(gp) = v * 10.0f;
+                }
+                // 走统一变更钩子：标脏（下一帧落盘）+ 推一条可撤销的 ParamEdit
+                editor::emitParamChange("grid.minorStep");
+                editor::emitParamChange("grid.majorStep");
+            } else if (which == 2) {
+                c.snapRotateStepRef() = v;
+                c.snapRotateRef() = true;
+            } else {
+                c.snapScaleStepRef() = v;
+                c.snapScaleRef() = true;
+            }
+            VK_LOG_INFO("VP-SNAP %s=%.4f on=1", id, static_cast<double>(v));
+            ImGui::CloseCurrentPopup();
+        }
+        char tag[48];
+        std::snprintf(tag, sizeof(tag), "VP-SNAPITEM %s-%d", id, i);
+        logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    }
+
+    ImGui::EndPopup();
+}
+
+void ViewportPanel::drawViewMenu() {
+    placeDropdown();
+    if (!ImGui::BeginPopup("##vp_view_menu")) return;
+
+    scene::Camera& cam = m_ctx.activeScene().camera();
+
+    ImGui::SeparatorText(TR("Projection"));
+    // 正交：引擎还没有（Camera 只有透视）。**以禁用态出现**并说明原因 ——
+    // 藏起来会让人以为"少了东西"，做成能点却没反应则是骗人。
+    ImGui::RadioButton(TR("Perspective"), true);
+    logRect("VP-VIEWITEM persp", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::BeginDisabled(true);
+    ImGui::RadioButton(TR("Orthographic"), false);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Not implemented: scene::Camera only does a\n"
+                          "perspective projection in this engine."));
+    }
+
+    ImGui::SeparatorText(TR("View directions"));
+    struct Dir { int dir; const char* label; const char* key; };
+    const Dir dirs[6] = {
+        {kViewPosZ, "Top", "Num7"},    {kViewNegZ, "Bottom", "Ctrl+Num7"},
+        {kViewPosX, "Right", "Num3"},  {kViewNegX, "Left", "Ctrl+Num3"},
+        {kViewNegY, "Front", "Num1"},  {kViewPosY, "Back", "Ctrl+Num1"},
+    };
+    for (const Dir& d : dirs) {
+        if (ImGui::MenuItem(TR(d.label), d.key)) {
+            snapViewTo(cam, d.dir);
+            m_ctx.setStatus(std::string("View: ") + viewDirName(d.dir));
+            VK_LOG_INFO("VP-VIEWDIR %s", d.label);
+        }
+        // 逐项打矩形：MenuItem 的位置随翻译长度/主题行高变化，脚本按
+        // "第几行"估算点击必错（实测：V2 顶视图一直点不中）。
+        char tag[48];
+        std::snprintf(tag, sizeof(tag), "VP-VIEWDIRITEM %s", d.label);
+        logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    }
+
+    ImGui::SeparatorText(TR("Camera"));
+    float fov = cam.fov();
+    ImGui::SetNextItemWidth(160.0f);
+    if (ImGui::SliderFloat(TR("Field of view"), &fov, 20.0f, 120.0f, "%.0f°")) {
+        cam.setFov(fov);
+        VK_LOG_INFO("VP-VIEWERP fov=%.1f", static_cast<double>(cam.fov()));
+    }
+    float nearZ = cam.nearPlane();
+    ImGui::SetNextItemWidth(160.0f);
+    if (ImGui::DragFloat(TR("Near plane"), &nearZ, 0.01f, 0.001f, 10.0f, "%.3f")) {
+        cam.setClipPlanes(nearZ, cam.farPlane());
+        VK_LOG_INFO("VP-VIEWERP near=%.3f", static_cast<double>(cam.nearPlane()));
+    }
+    ImGui::TextDisabled(TR("Far plane  %.0f m"), static_cast<double>(cam.farPlane()));
+
+    ImGui::Separator();
+    ImGui::BeginDisabled(!m_ctx.hasSelection());
+    if (ImGui::MenuItem(TR("Focus selection"), "F")) focusSelection();
+    ImGui::EndDisabled();
+
+    ImGui::EndPopup();
+}
+
+// 分屏布局下拉（1 / 2V / 2H / 4）。
+//
+// 用户原话："编辑器右上方的 1，2V，2H，4，这些代表的是……分辨率，无论是不是
+// 请把这个参数也一样放到和 Perspective 这些属性一起并排放置，点击后也是
+// 展开下拉勾选框列表去设置。"
+//
+// ⚠ 它其实**不是分辨率**，是视口分屏布局（1 屏 / 左右 2 屏 / 上下 2 屏 /
+//   四宫格）。所以下拉里每一项都写明"哪种分屏"，按钮上仍用用户认得的
+//   1/2V/2H/4 —— 既不误解也不改口。真正的渲染分辨率在右边的统计 HUD 里。
+void ViewportPanel::drawLayoutMenu() {
+    placeDropdown();
+    if (!ImGui::BeginPopup("##vp_layout_menu")) return;
+
+    ImGui::SeparatorText(TR("Viewport layout"));
+    struct Item { ViewportLayout l; const char* label; const char* hint; };
+    const Item items[4] = {
+        {ViewportLayout::Single, "1", "Single viewport"},
+        {ViewportLayout::TwoVertical, "2V", "Two side by side"},
+        {ViewportLayout::TwoHorizontal, "2H", "Two stacked"},
+        {ViewportLayout::Quad, "4", "Quad (four views)"},
+    };
+    const ViewportLayout cur = m_ctx.viewportLayout();
+    for (const Item& it : items) {
+        char label[96];
+        std::snprintf(label, sizeof(label), "%s\t%s", it.label, TR(it.hint));
+        // 勾选式（MenuItem 的 selected 就是那个对勾）—— 单选，不是多选
+        if (ImGui::MenuItem(label, nullptr, cur == it.l)) {
+            if (cur != it.l) {
+                // 走共用实现：写 EditorContext + 设子视口数 + VIEWPORT-LAYOUT
+                // 日志（与切工作区 / 读存档那条路径完全一致）。
+                applyViewportLayout(m_ctx, m_renderer, it.l);
+            }
+        }
+        char tag[48];
+        std::snprintf(tag, sizeof(tag), "VP-LAYOUTITEM %s", it.label);
+        logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled(TR("Split views share one camera for now."));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Each split renders the same camera; per-view cameras\n"
+                          "are not implemented yet. Sub-views do get their own\n"
+                          "offscreen target."));
+    }
+    ImGui::EndPopup();
+}
+
+void ViewportPanel::drawSpeedMenu() {    placeDropdown();
+    if (!ImGui::BeginPopup("##vp_speed_menu")) return;
+
+    ImGui::SeparatorText(TR("Camera speed"));
+    float s = m_ctx.navSensitivity();
+    ImGui::SetNextItemWidth(180.0f);
+    if (ImGui::SliderFloat("##vp_speed", &s, 0.1f, 20.0f, "%.2f")) {
+        m_ctx.navSensitivityRef() = s;
+        VK_LOG_INFO("VP-SPEED %.2f", static_cast<double>(s));
+    }
+    logRect("VP-SPEEDITEM", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::TextDisabled(TR("Hold RMB and use the wheel to change it\n"
+                           "on the fly, without opening this menu."));
+
+    // 基于距离的相机速度：离注视点越远飞得越快（UE 的 "Camera Speed
+    // scaled by distance"）。默认关 —— 打开后同样一段 WASD 会走得更远，
+    // 这是**行为改变**，必须是用户显式选的。
+    bool scaled = m_ctx.navSpeedScalesWithDistance();
+    if (ImGui::Checkbox(TR("Scale with distance"), &scaled)) {
+        m_ctx.navSpeedScaleRef() = scaled;
+        VK_LOG_INFO("VP-SPEED distance=%.0f", scaled ? 1.0 : 0.0);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("The further the camera is from its pivot, the faster\n"
+                          "it flies - so the same drag feels the same at any zoom."));
+    }
+
+    ImGui::EndPopup();
+}
+
+void ViewportPanel::drawLightMenu() {
+    placeDropdown();
+    if (!ImGui::BeginPopup("##vp_light_menu")) return;
+    const int n = render::Renderer::kViewModeCount;
+    const int cur = static_cast<int>(m_renderer.viewMode());
+    ImGui::SeparatorText(TR("Lighting mode"));
+    for (int i = 0; i < n; ++i) {
+        const auto vm = static_cast<render::Renderer::ViewMode>(i);
+        if (ImGui::RadioButton(TR(render::Renderer::viewModeName(vm)), i == cur)) {
+            m_renderer.setViewMode(vm);
+            VK_LOG_INFO("VP-LIGHT %s", render::Renderer::viewModeName(vm));
+            // 单选，选完关掉（否则弹层挂着吃掉下一次点击 —— 见 drawSpaceMenu）
+            ImGui::CloseCurrentPopup();
+        }
+        char tag[40];
+        std::snprintf(tag, sizeof(tag), "VP-LIGHTITEM %d", i);
+        logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    }
+    ImGui::Separator();
+    ImGui::TextDisabled(TR("Shift+1..%d does the same"), n);
+    ImGui::EndPopup();
+}
+
+void ViewportPanel::drawShowMenu() {
+    placeDropdown();
+    if (!ImGui::BeginPopup("##vp_show_menu")) return;
+    EditorContext::ViewportOverlay& ov = m_ctx.vpOverlayRef();
+
+    ImGui::SeparatorText(TR("Show flags"));
+
+    // 每个勾选框都打矩形（VP-SHOWITEM <flag>）：脚本点的是**真实的框**，
+    // 不是"第几行 + 固定像素"。
+    bool grid = m_ctx.showGridRef();
+    if (ImGui::Checkbox(TR("Reference grid"), &grid)) {
+        m_ctx.showGridRef() = grid;
+        VK_LOG_INFO("VP-SHOW grid=%d", grid ? 1 : 0);
+    }
+    tagItem("VP-SHOWITEM grid");
+    bool giz = m_showGizmo;
+    if (ImGui::Checkbox(TR("Transform gizmo"), &giz)) {
+        m_showGizmo = giz;
+        VK_LOG_INFO("VP-SHOW gizmo=%d", giz ? 1 : 0);
+    }
+    tagItem("VP-SHOWITEM gizmo");
+    bool hud = m_showOverlay;
+    if (ImGui::Checkbox(TR("Viewport HUD"), &hud)) {
+        m_showOverlay = hud;
+        VK_LOG_INFO("VP-SHOW hud=%d", hud ? 1 : 0);
+    }
+    tagItem("VP-SHOWITEM hud");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Master switch for the corner overlays below."));
+    }
+    bool sky = m_renderer.skyEnabled();
+    if (ImGui::Checkbox(TR("Sky"), &sky)) {
+        m_renderer.skyEnabled() = sky;
+        VK_LOG_INFO("VP-SHOW sky=%d", sky ? 1 : 0);
+    }
+    tagItem("VP-SHOWITEM sky");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Off = the scene clears to the flat background colour."));
+    }
+
+    ImGui::SeparatorText(TR("Overlay panels"));
+    ImGui::BeginDisabled(!m_showOverlay);
+    ImGui::Checkbox(TR("Stats HUD"), &ov.stats);
+    ImGui::Checkbox(TR("Navigation gizmo"), &ov.navGizmo);
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    if (ImGui::MenuItem(TR("Show all"))) {
+        m_showGizmo = true;
+        m_showOverlay = true;
+        m_ctx.showGridRef() = true;
+        ov.stats = ov.navGizmo = true;
+        VK_LOG_INFO("VP-SHOW all=1");
+    }
+
+    ImGui::EndPopup();
+}
+
+void ViewportPanel::drawVpSettingsMenu() {
+    placeDropdown();
+    if (!ImGui::BeginPopup("##vp_settings_menu")) return;
+
+    ImGui::SeparatorText(TR("Reference grid"));
+    struct G { const char* id; const char* label; float lo, hi; float speed; };
+    const G gs[4] = {
+        {"grid.minorStep", "Minor step (m)", 0.1f, 10.0f, 0.01f},
+        {"grid.majorStep", "Major step (m)", 1.0f, 100.0f, 0.1f},
+        {"grid.extent", "Extent (m)", 5.0f, 500.0f, 1.0f},
+        {"grid.alpha", "Opacity", 0.0f, 1.0f, 0.005f},
+    };
+    for (const G& g : gs) {
+        void* p = render::paramPtr(g.id);
+        if (!p) continue;
+        float v = *static_cast<float*>(p);
+        ImGui::PushID(g.id);
+        ImGui::SetNextItemWidth(150.0f);
+        if (ImGui::DragFloat(TR(g.label), &v, g.speed, g.lo, g.hi, "%.3f")) {
+            *static_cast<float*>(p) = v;
+            editor::emitParamChange(g.id);
+            VK_LOG_INFO("VP-SET %s=%.3f", g.id, static_cast<double>(v));
+        }
+        char tag[48];
+        std::snprintf(tag, sizeof(tag), "VP-SETITEM %s", g.id);
+        tagItem(tag);
+        ImGui::PopID();
+    }
+
+    ImGui::SeparatorText(TR("Background"));
+    const bool sky = m_renderer.skyEnabled();
+    if (ImGui::RadioButton(TR("Sky / environment"), sky)) {
+        m_renderer.skyEnabled() = true;
+        VK_LOG_INFO("VP-SET sky=1");
+    }
+    if (ImGui::RadioButton(TR("Solid"), !sky)) {
+        m_renderer.skyEnabled() = false;
+        VK_LOG_INFO("VP-SET sky=0");
+    }
+
+    ImGui::Separator();
+    if (ImGui::MenuItem(TR("Reset grid settings"))) {
+        const char* ids[4] = {"grid.minorStep", "grid.majorStep", "grid.extent",
+                              "grid.alpha"};
+        for (const char* id : ids) {
+            render::resetParam(id);
+            editor::emitParamChange(id);
+        }
+        VK_LOG_INFO("VP-SET reset=1");
+    }
+
+    ImGui::EndPopup();
 }
 
 void ViewportPanel::focusSelection() const {
@@ -484,6 +1453,8 @@ void ViewportPanel::handleNavigation(bool hovered) const {
     if (f == 0.0f && r == 0.0f && u == 0.0f) return;
 
     float speed = kNavMoveSpeed * sens * io.DeltaTime;
+    // "基于距离的相机速度"（默认关 → 系数恒 1，行为与改动前一致）
+    speed *= m_ctx.navDistanceSpeedFactor(glm::length(cam.target() - cam.position()));
     if (io.KeyShift) speed *= 3.0f;
     cam.moveLocal(glm::vec3(r * speed, u * speed, f * speed));
 }
@@ -1015,11 +1986,45 @@ void ViewportPanel::draw() {
         ImGui::Separator();
     }
 
+    // ============================================================
+    // 分屏布局（2026-10-17 第四轮）
+    // ------------------------------------------------------------
+    // 用户以为工具条右上那四个 1/2V/2H/4 是"渲染分辨率"，其实是**视口分屏**。
+    // 挪到"透视"右边的同时把这件功能真正接通 —— 一个点了看不见任何变化的
+    // 下拉，和没做没有区别（本项目的一条硬纪律：开关必须真的接到渲染器）。
+    //
+    // 落地方式：
+    //   · **主渲染目标只渲染"一格"**（尺寸 = 单格尺寸），四屏不会摊薄分辨率；
+    //   · 其余格用渲染器已有的子视口目标（Renderer::setSubviewSize /
+    //     setSubviewCamera / subviewTextureId），每格各一个相机：
+    //       格 0 = 用户的透视相机（**唯一可交互的一格**）
+    //       格 1..3 = 前 / 顶 / 右三个正交方向（同一位置、同一 FOV）
+    //   · 格与格之间留 2px 缝，缝里露出深底色当分隔线。
+    //
+    // ⚠ 单屏（默认）时这几个表达式全都退化成恒等（cols=rows=1）——
+    //   既有视口的交互、拾取、浮层行为一个像素都不变。
+    // ============================================================
+    const ViewportLayout vlayout = m_ctx.viewportLayout();
+    int gCols = 1, gRows = 1;
+    switch (vlayout) {
+        case ViewportLayout::Single: break;
+        case ViewportLayout::TwoVertical: gCols = 2; break;
+        case ViewportLayout::TwoHorizontal: gRows = 2; break;
+        case ViewportLayout::Quad: gCols = 2; gRows = 2; break;
+    }
+    constexpr float kPaneGap = 2.0f;
+    const int paneCount = gCols * gRows;
+
     const ImVec2 avail = ImGui::GetContentRegionAvail();
-    const std::uint32_t wantW = static_cast<std::uint32_t>(
-        std::max(avail.x, kMinViewport));
-    const std::uint32_t wantH = static_cast<std::uint32_t>(
-        std::max(avail.y, kMinViewport));
+    // 整块区域的尺寸（= 各格 + 缝），保证格宽乘出来正好铺满
+    const float fullW = std::max(avail.x, kMinViewport * gCols);
+    const float fullH = std::max(avail.y, kMinViewport * gRows);
+    const float paneW = (fullW - kPaneGap * (gCols - 1)) / gCols;
+    const float paneH = (fullH - kPaneGap * (gRows - 1)) / gRows;
+
+    // 主渲染目标 / 子视口目标都用**单格**尺寸
+    const std::uint32_t wantW = static_cast<std::uint32_t>(paneW);
+    const std::uint32_t wantH = static_cast<std::uint32_t>(paneH);
 
     if (wantW != m_requestedW || wantH != m_requestedH) {
         m_requestedW = wantW;
@@ -1027,15 +2032,54 @@ void ViewportPanel::draw() {
         m_resizePending = true;
         m_renderer.setViewportSize(wantW, wantH);
     }
+    for (int i = 0; i < paneCount - 1; ++i) {
+        m_renderer.setSubviewSize(static_cast<size_t>(i), wantW, wantH);
+    }
+    // 子视口相机：与主相机**同一位置**，朝向换成三个正交方向。
+    // 为什么不是"四格同一个相机"：那样四格画面一模一样，看不出分屏有什么用；
+    // 为什么要换子格而不是主格：主格是用户正在飞的相机，不能被动。
+    if (paneCount > 1) {
+        const scene::Camera& cam0 = m_ctx.activeScene().camera();
+        const int dirs[3] = {kViewNegY, kViewPosZ, kViewPosX};  // 前 / 顶 / 右
+        for (int i = 0; i < paneCount - 1; ++i) {
+            scene::Camera c = cam0;
+            snapViewTo(c, dirs[i % 3]);
+            m_renderer.setSubviewCamera(static_cast<size_t>(i), c);
+        }
+    }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const std::uint64_t texId = m_renderer.viewportTextureId();
-    const ImVec2 imageSize(static_cast<float>(m_requestedW),
-                           static_cast<float>(m_requestedH));
+    // 占位/图像的**控件矩形**永远是整块区域（拾取落点、脚本锚点都以它为准）
+    const ImVec2 imageSize(fullW, fullH);
 
     if (!m_resizePending && texId != 0) {
-        ImGui::Image(static_cast<ImTextureID>(texId), imageSize, ImVec2(0, 0),
-                     ImVec2(1, 1));
+        // 用 Dummy 占位、用 draw list 画各格：
+        // 这样"一个控件覆盖整块区域"的交互模型不变（hover 一直有效），
+        // 而内部可以任意切分。
+        ImGui::Dummy(imageSize);
+        const ImVec2 origin = ImGui::GetItemRectMin();
+        dl->AddRectFilled(origin,
+                          ImVec2(origin.x + fullW, origin.y + fullH),
+                          IM_COL32(10, 11, 14, 255));
+        for (int r = 0; r < gRows; ++r) {
+            for (int c = 0; c < gCols; ++c) {
+                const int idx = r * gCols + c;
+                const ImVec2 a(origin.x + c * (paneW + kPaneGap),
+                               origin.y + r * (paneH + kPaneGap));
+                const ImVec2 b(a.x + paneW, a.y + paneH);
+                const std::uint64_t t =
+                    idx == 0 ? texId
+                             : m_renderer.subviewTextureId(
+                                   static_cast<size_t>(idx - 1));
+                if (t != 0) {
+                    dl->AddImage(static_cast<ImTextureID>(t), a, b);
+                } else {
+                    // 子视口目标还在建（apply 要等一次 waitIdle）→ 先留空
+                    dl->AddRectFilled(a, b, IM_COL32(24, 26, 30, 255));
+                }
+            }
+        }
     } else {
         // 尺寸刚变（或首帧还没拿到纹理）：本帧不碰纹理，等下一帧
         ImGui::Dummy(imageSize);
@@ -1050,20 +2094,33 @@ void ViewportPanel::draw() {
 
     const ImVec2 imgMin = ImGui::GetItemRectMin();
     const ImVec2 imgSz = ImGui::GetItemRectSize();
-    const bool hovered = ImGui::IsItemHovered();
+    // 分屏时**只有左上那一格接受键鼠交互**（它是用户的透视视图，其余格是
+    // 前/顶/右的只读预览）。所以交互矩形取"第一格"的尺寸，而且鼠标必须真的
+    // 落在第一格里 —— 否则在别的格子上也能拖手柄 / 点选，手感会非常错乱。
+    // （单屏时 paneW/paneH 就等于整块尺寸，这一整段退化成恒等。）
+    const ImVec2 pane0Min = imgMin;
+    const ImVec2 pane0Size(paneW, paneH);
+    const ImVec2 mousePos = ImGui::GetIO().MousePos;
+    const bool inPane0 = mousePos.x >= pane0Min.x &&
+                         mousePos.x < pane0Min.x + pane0Size.x &&
+                         mousePos.y >= pane0Min.y &&
+                         mousePos.y < pane0Min.y + pane0Size.y;
+    const bool hovered = ImGui::IsItemHovered() && inPane0;
     // 上报给 EditorContext：运行态 Player 的鼠标视角控制按它门控。
     // 注意这里写的是**矩形**而不是 hover —— 见 setViewportRect 的说明
     // （编辑器的 nav 键盘模式会把 IsItemHovered 一直压成 false）。
-    m_ctx.setViewportRect(glm::vec2(imgMin.x, imgMin.y),
-                          glm::vec2(imgSz.x, imgSz.y));
+    m_ctx.setViewportRect(glm::vec2(pane0Min.x, pane0Min.y),
+                          glm::vec2(pane0Size.x, pane0Size.y));
 
     // 自动化用（MYVK_LOG_RECTS=1）：视口图像的屏幕矩形。
     // 拖拽落点 / 手柄命中都在这块矩形里，脚本靠它算坐标。
+    // ⚠ 这里报的是**整块区域**（不是第一格）：脚本按它算中心点，单屏时两者
+    //   完全一致；分屏时"整块"才是这块控件的真实范围。
     logRect("VP-RECT", imgMin,
             ImVec2(imgMin.x + imgSz.x, imgMin.y + imgSz.y));
 
-    const glm::vec2 vpPos(imgMin.x, imgMin.y);
-    const glm::vec2 vpSize(imgSz.x, imgSz.y);
+    const glm::vec2 vpPos(pane0Min.x, pane0Min.y);
+    const glm::vec2 vpSize(pane0Size.x, pane0Size.y);
 
     // 1) 相机导航：**只在编辑态**。
     //    Play 期间相机是运行态场景自己的东西，编辑器视口一个键鼠事件都不抢
@@ -1210,24 +2267,18 @@ void ViewportPanel::draw() {
         // "点一下菜单 → 状态真翻了" 和 "读盘后生效了" 都是可断言的。
         if (std::getenv("MYVK_LOG_RECTS")) {
             const EditorContext::ViewportOverlay& ov = m_ctx.vpOverlay();
-            const int sig = (m_showOverlay ? 1 : 0) | (ov.modeBar ? 2 : 0) |
-                            (ov.stats ? 4 : 0) | (ov.navGizmo ? 8 : 0);
+            const int sig = (m_showOverlay ? 1 : 0) | (ov.stats ? 2 : 0) |
+                            (ov.navGizmo ? 4 : 0);
             static int lastSig = -1;
             if (sig != lastSig) {
                 lastSig = sig;
-                VK_LOG_INFO("VP-OVERLAY master=%d modeBar=%d stats=%d "
-                            "navGizmo=%d",
-                            m_showOverlay ? 1 : 0, ov.modeBar ? 1 : 0,
-                            ov.stats ? 1 : 0, ov.navGizmo ? 1 : 0);
+                VK_LOG_INFO("VP-OVERLAY master=%d stats=%d navGizmo=%d",
+                            m_showOverlay ? 1 : 0, ov.stats ? 1 : 0,
+                            ov.navGizmo ? 1 : 0);
             }
         }
         if (m_showOverlay) {
             const EditorContext::ViewportOverlay& ov = m_ctx.vpOverlay();
-            // 先清掉上一帧的模式条边界：模式条被关掉时统计 HUD 要回到顶边，
-            // 不能还按上一帧的位置往下躲。
-            m_modeBarRight = 0.0f;
-            m_modeBarBottom = 0.0f;
-            if (ov.modeBar) drawViewModeBar(vpPos, vpSize);
             if (ov.stats) drawStatsHud(vpPos, vpSize);
             // 左下角曾经是相机浮层；已并入 Inspector → World → Camera（见
             // EditorContext::ViewportOverlay 的说明），这里不再画任何东西。
@@ -1243,9 +2294,14 @@ void ViewportPanel::draw() {
 
 // ---------------------------------------------------------------- E14 浮层
 //
-// 四角分工（E14 起）：
-//   左上 = 视图模式条        右上 = 统计 HUD
+// 四角分工：
+//   左上 = （空）            右上 = 统计 HUD
 //   左下 = 相机信息 + 书签    右下 = 导航 gizmo
+//
+// 左上原来是"视图模式条"（Lit/Unl/Nrm/... 八个按钮 + 当前模式名）。2026-10-17
+// 用户指出：同一组视图模式在右上角的 Lighting 下拉里已经有了，左上这一条纯属
+// 重复占地方，删掉。视图模式切换只剩两个入口：Lighting 下拉（ViewportPanel::
+// drawLightMenu）与 Shift+1..8 快捷键（EditorApp::handleNavigation）。
 //
 // 为什么必须是**子窗口**而不是独立顶层窗口：视口窗口本身是焦点窗口，ImGui
 // 每帧都会把焦点窗口 BringWindowToDisplayFront，于是独立窗口会被推到列表
@@ -1258,102 +2314,6 @@ void ViewportPanel::draw() {
 // 的落点）是**总闸**；总闸之上，四块各自还有一个开关存在 EditorContext 里，
 // 右键视口空白处的 "Viewport Display" 菜单切换、经 Settings 落盘。
 // 总闸关掉时四块全灭 —— 这就是 NO_HUD 逐像素回归能成立的前提。
-
-// 模式条的短标签：8 个按钮挤一行，长名字（light_complexity）放不下。
-// 完整名字在 hover 提示和右侧的 "view: xxx" 里（Renderer::viewModeName）。
-// 统一 3 个字母宽：8 格 × 50px ≈ 400px，加上右边的模式名一共约 610px ——
-// 既不会盖住右上角的统计 HUD，也能在 950px 宽的视口里一行放下。
-const char* kViewModeShort[] = {"Lit", "Unl", "Nrm", "Rgh",
-                                "Mtl", "Wir", "Odr", "Lgt"};
-static_assert(render::Renderer::kViewModeCount == 8,
-              "the view-mode bar short-label table must grow with Renderer::ViewMode");
-
-// ---- 视图模式条（左上）----
-void ViewportPanel::drawViewModeBar(const glm::vec2& vpPos,
-                                    const glm::vec2& vpSize) {
-    (void)vpSize;
-    render::Renderer& r = m_renderer;
-    const int cur = static_cast<int>(r.viewMode());
-    const int n = render::Renderer::kViewModeCount;
-    const ImGuiStyle& st = ImGui::GetStyle();
-
-    const float btnH = ImGui::GetFrameHeight();
-    float btnW = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        btnW = std::max(btnW, ImGui::CalcTextSize(kViewModeShort[i]).x);
-    }
-    btnW += st.FramePadding.x * 2.0f + 6.0f;
-
-    char nameBuf[64];
-    std::snprintf(nameBuf, sizeof(nameBuf), "view: %s",
-                  render::Renderer::viewModeName(r.viewMode()));
-    const float nameW =
-        std::max(ImGui::CalcTextSize(nameBuf).x,
-                 ImGui::CalcTextSize("view: light_complexity").x);
-
-    const float cw = st.WindowPadding.x * 2.0f + btnW * static_cast<float>(n) +
-                     st.ItemSpacing.x * (static_cast<float>(n) + 1.0f) + nameW;
-    const float ch = btnH + st.WindowPadding.y * 2.0f;
-
-    ImGui::SetCursorScreenPos(ImVec2(vpPos.x + 10.0f, vpPos.y + 10.0f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.10f, 0.80f));
-    ImGui::BeginChild("##vp_modebar", ImVec2(cw, ch), 0,
-                      ImGuiWindowFlags_NoScrollbar |
-                          ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::PopStyleColor();
-    // 浅色主题：深底要配浅字（见 kOverlayText 的注释）。深色主题不推。
-    const int ovPush = ui::tokens().isLight ? 2 : 0;
-    if (ovPush) {
-        ImGui::PushStyleColor(ImGuiCol_Text, kOverlayText);
-        ImGui::PushStyleColor(ImGuiCol_TextDisabled, kOverlayTextDim);
-    }
-
-    logRect("VP-RECT modebar", ImGui::GetWindowPos(),
-            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
-                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
-    // 记下这块的右边界 / 下边界：统计 HUD（右上）据此避让 —— 窄视口下
-    // 两块本来会在顶边撞上，撞上时统计 HUD 自动下移到模式条之下。
-    m_modeBarRight = ImGui::GetWindowPos().x + ImGui::GetWindowWidth();
-    m_modeBarBottom = ImGui::GetWindowPos().y + ImGui::GetWindowHeight();
-
-    const ImVec4 active(0.26f, 0.52f, 0.85f, 1.0f);
-    const ImVec4 idle(0.20f, 0.20f, 0.23f, 1.0f);
-    for (int i = 0; i < n; ++i) {
-        if (i) ImGui::SameLine(0.0f, st.ItemSpacing.x);
-        ImGui::PushID(i);
-        ImGui::PushStyleColor(ImGuiCol_Button, i == cur ? active : idle);
-        char tag[48];
-        std::snprintf(tag, sizeof(tag), "%s##vm", kViewModeShort[i]);
-        if (ImGui::Button(tag, ImVec2(btnW, 0.0f))) {
-            r.setViewMode(static_cast<render::Renderer::ViewMode>(i));
-        }
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(
-                TR("%s view\nShortcut: Shift+%d\n"
-                "(Lit is the baseline path; the others are debug views)"),
-                render::Renderer::viewModeName(
-                    static_cast<render::Renderer::ViewMode>(i)),
-                i + 1);
-        }
-        ImGui::PopID();
-    }
-    ImGui::SameLine(0.0f, st.ItemSpacing.x);
-    ImGui::TextDisabled(TR("%s"), nameBuf);
-
-    if (ovPush) ImGui::PopStyleColor(ovPush);
-    ImGui::EndChild();
-
-    // 自动化：模式条存在 + 一共几格（只打一次，和 VM-COMBO 同理）
-    static bool tagged = false;
-    if (!tagged) {
-        tagged = true;
-        if (std::getenv("MYVK_LOG_RECTS")) {
-            VK_LOG_INFO("VP-MODEBAR modes=%d current=%s", n,
-                        render::Renderer::viewModeName(r.viewMode()));
-        }
-    }
-}
 
 // ---- 统计 HUD（右上）----
 //
@@ -1489,11 +2449,9 @@ void ViewportPanel::drawStatsHud(const glm::vec2& vpPos,
     const float ch = lineH * rows + st.WindowPadding.y * 2.0f + 2.0f;
 
     const float statsX = vpPos.x + vpSize.x - cw - 10.0f;
-    // 窄视口避让：模式条铺得宽时，统计 HUD 下移到它下方而不是叠上去。
-    float statsY = vpPos.y + 10.0f;
-    if (m_modeBarRight > statsX - 8.0f && m_modeBarBottom > statsY) {
-        statsY = m_modeBarBottom + 6.0f;
-    }
+    // 左上角的模式条删掉之后，这里不再需要"往下躲"的避让计算 —— 统计 HUD
+    // 永远是右上角第一个浮层。
+    const float statsY = vpPos.y + 10.0f;
     ImGui::SetCursorScreenPos(ImVec2(statsX, statsY));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.10f, 0.78f));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.89f, 0.94f, 0.92f));
@@ -1569,8 +2527,6 @@ void ViewportPanel::drawDisplayMenu(const glm::vec2& vpPos,
     };
 
     ImGui::SeparatorText(TR("Overlay panels"));
-    ImGui::Checkbox(TR("View mode bar (top-left)"), &ov.modeBar);
-    itemRect("VP-DISPLAY-ITEM modeBar");
     ImGui::Checkbox(TR("Stats HUD (top-right)"), &ov.stats);
     itemRect("VP-DISPLAY-ITEM stats");
     ImGui::Checkbox(TR("Navigation gizmo (bottom-right)"), &ov.navGizmo);
@@ -1644,12 +2600,12 @@ void ViewportPanel::drawDisplayMenu(const glm::vec2& vpPos,
 
     ImGui::Separator();
     if (ImGui::MenuItem(TR("Show all overlays"))) {
-        ov.modeBar = ov.stats = ov.navGizmo = true;
+        ov.stats = ov.navGizmo = true;
         st = EditorContext::StatsHudItems{};
     }
     itemRect("VP-DISPLAY-ITEM all");
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(TR("Turn all three corner panels and every stats line "
+        ImGui::SetTooltip(TR("Turn both corner panels and every stats line "
                           "back on."));
     }
 
