@@ -1,5 +1,6 @@
 #include "CommandRegistry.h"
 
+#include "Localization.h"
 #include "core/Logger.h"
 
 #include <imgui.h>
@@ -295,12 +296,12 @@ void drawRow(const CommandDesc& c, bool selected) {
     if (avail > rightW) {
         ImGui::SameLine(ImGui::GetCursorPosX() + avail - rightW);
         if (!c.shortcut.empty())
-            ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.70f, 1.0f), "%s",
+            ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.70f, 1.0f), TR("%s"),
                                c.shortcut.c_str());
         else
-            ImGui::TextUnformatted("  ");
+            ImGui::TextUnformatted(TR("  "));
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.45f, 0.50f, 0.60f, 1.0f), "%s",
+        ImGui::TextColored(ImVec4(0.45f, 0.50f, 0.60f, 1.0f), TR("%s"),
                            c.category.c_str());
     }
     if (!ok) ImGui::EndDisabled();
@@ -350,7 +351,7 @@ bool drawCommandPalette(CommandRegistry& reg, bool* open) {
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse;
 
     bool executed = false;
-    if (ImGui::Begin("Command Palette###cmdpal", nullptr, flags)) {
+    if (ImGui::Begin(trId("Command Palette", "cmdpal"), nullptr, flags)) {
         // 窗口真的建起来了才算"打开了"（日志放这里 —— 自动化据此确认
         // 面板确实进了绘制路径，而不是只置了个 bool）
         if (!g_p.loggedOpen) {
@@ -358,8 +359,8 @@ bool drawCommandPalette(CommandRegistry& reg, bool* open) {
             core::logMessage(core::LogLevel::Info, "CMD-PALETTE open");
         }
         ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f),
-                           "Command Palette    (type to search, Enter to run, "
-                           "Esc to close)");
+                           TR("Command Palette    (type to search, Enter to run, "
+                           "Esc to close)"));
         if (g_p.focusReq) {
             ImGui::SetKeyboardFocusHere();
             g_p.focusReq = false;
@@ -382,7 +383,7 @@ bool drawCommandPalette(CommandRegistry& reg, bool* open) {
         if (hits.empty()) {
             const auto near = reg.closest(g_p.query, 5);
             ImGui::TextColored(ImVec4(0.85f, 0.70f, 0.35f, 1.0f),
-                               "no command matches '%s'%s", g_p.query,
+                               TR("no command matches '%s'%s"), g_p.query,
                                near.empty() ? "" : "   — closest:");
             for (const CommandDesc* c : near) drawRow(*c, false);
         } else {
@@ -395,7 +396,7 @@ bool drawCommandPalette(CommandRegistry& reg, bool* open) {
             ImGui::EndChild();
             if (static_cast<int>(hits.size()) > kMaxShown)
                 ImGui::TextColored(ImVec4(0.55f, 0.55f, 0.60f, 1.0f),
-                                   "... %d more",
+                                   TR("... %d more"),
                                    static_cast<int>(hits.size()) - kMaxShown);
         }
 

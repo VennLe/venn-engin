@@ -266,6 +266,14 @@ def main():
         "MYVK_EDITOR_SCENE": scene_path,
         "MYVK_EDITOR_SELECT": "ColliderCube",
         "MYVK_EDITOR_COLLIDER": "hull",
+        # ⚠ 必须关栅格（本文件是**逐像素**判据）。地面栅格的线色
+        #   `GridSettings.color = (0.72,0.76,0.82)` 上屏后落在浅青一带，
+        #   在 ±40 容差里和 WIREFRAME_COLORS 的青色**撞色**；而判据用的
+        #   矩形是 `COLLIDER <名字>` 外扩 8px 的，正好把那圈地面线框进来。
+        #   实测：栅格开着时"线框已隐藏"仍剩 176 个假阳性像素（阈值 <40）
+        #   → 红；关掉后 0。这**不是**线框没藏住 —— 用改动前的旧栅格参数
+        #   （extent 60 / fade 45→60）复跑，数字一模一样是 176，属既有缺陷。
+        "MYVK_GRID": "0",
     }, args.size)
     if not hwnd:
         print("编辑器没起来")

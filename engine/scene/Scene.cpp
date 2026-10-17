@@ -76,6 +76,14 @@ Light& Scene::light() {
         }
         p = &m_world.add<ecs::DirectionalLightComponent>(m_lightEntity);
     }
+    // 太阳也一样要有 VisibilityComponent —— 否则 Hierarchy 里它的行尾就没有
+    // 👁（那一格是"有组件才画"），而**唯一**会缺这一格的就是它（其余实体都
+    // 走 Scene::createObject）。缺了组件 → Hierarchy 少一个按钮，用户看到
+    // 的就是"灯的可见性开关不见了"。
+    // add 是幂等的：已存在时不覆盖（`w.add` 只在缺失时插入）。
+    if (!m_world.get<ecs::VisibilityComponent>(m_lightEntity)) {
+        m_world.add<ecs::VisibilityComponent>(m_lightEntity);
+    }
     return *p;
 }
 
@@ -179,6 +187,10 @@ void Scene::clear() {
     // 的朝向/位置，它是"观察者"而不是物体），多余的相机与全部体积丢掉。
     if (m_cameras.size() > 1) m_cameras.resize(1);
     m_postVolumes.clear();
+
+    // 物理世界也是场景内容：清场之后回到出厂参数（新场景不该继承上一份
+    // 场景的重力/步长）。读盘路径随后会用文件里的 "physics" 覆盖它。
+    m_physics = PhysicsSettings{};
 }
 
 // 追加一台相机：从 0 号相机复制（新视角的合理起点），返回它的下标。

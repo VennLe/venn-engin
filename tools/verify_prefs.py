@@ -61,12 +61,20 @@ def main():
               "尺寸", img.size)
         if not win:
             print("未拿到 PREFS-WIN 日志")
+            # ⚠ 结尾必须有 `结果:` 行（ASCII 冒号）：本文件是**截图工具**，
+            #   本来只打 `: PASS` / `: FAIL`，一旦被塞进 run_regression 就
+            #   会因为"没有结果行"被判 FAIL（rc=0 却红）—— 踩过。
+            print("结果: FAIL: 没拿到 PREFS-WIN")
             return 3
         cx = (win[0] + win[2]) * 0.5
         cy = (win[1] + win[3]) * 0.5
         ok = abs(cx - W * 0.5) < 30.0 and abs(cy - H * 0.5) < 30.0
         print("窗口中心 (%.0f,%.0f) vs 客户区中心 (%.0f,%.0f): %s"
               % (cx, cy, W * 0.5, H * 0.5, "PASS" if ok else "FAIL"))
+        if ok:
+            print("结果: PASS")
+        else:
+            print("结果: FAIL: 偏好窗口没有居中")
         return 0 if ok else 4
     finally:
         proc.terminate()

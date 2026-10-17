@@ -16,11 +16,19 @@
 //   MYVK_EDITOR_PLAY=1   启动即进入 Play（配合 MYVK_FRAMES 验证播放链路）
 //   MYVK_VALIDATION=0    关闭 Vulkan 验证层
 //   MYVK_SHADER_DIR      覆盖着色器目录
+//   MYVK_PHYS_TEST=1     **只跑物理自检然后退出**（不初始化 Vulkan、不开窗）
+//                        —— 见 physics/PhysicsSelfTest.h 与 tools/verify_physics.py
+//   MYVK_RENDER_SETTINGS_TEST=1
+//                        **只跑渲染设置层级自检然后退出**（不初始化 Vulkan、不开窗）
+//                        —— 见 render/RenderSettingsIO.h 与
+//                        tools/verify_settings_layers.py
 // ============================================================
 
 #include "EditorApp.h"
 
 #include "core/Logger.h"
+#include "physics/PhysicsSelfTest.h"
+#include "render/RenderSettingsIO.h"
 
 #include <cstdlib>
 #include <exception>
@@ -47,6 +55,22 @@ int main(int argc, char** argv) {
     try {
         const uint64_t maxFrames = envFrames("MYVK_FRAMES");
         VK_LOG_INFO("=== Venn Engine - Editor ===");
+
+        // 物理自检：**在 Vulkan / 窗口之前**返回。物理模块不依赖渲染，
+        // 所以这条路径能在没有 GPU、没有显示器、跑得飞快的情况下验证
+        // 数值正确性（见 physics/PhysicsSelfTest.h 的说明）。
+        if (std::getenv("MYVK_PHYS_TEST") != nullptr) {
+            const int failures = physics::runPhysicsSelfTest();
+            return failures == 0 ? 0 : 1;
+        }
+
+        // E03 渲染设置层级自检：同一条"在 Vulkan / 窗口之前返回"的路径。
+        // 覆盖链 / 解析 / 落盘都是纯数据逻辑，不需要设备 —— 也正因为如此
+        // 它能在 CI 里秒级跑完（见 render/RenderSettingsIO.h）。
+        if (std::getenv("MYVK_RENDER_SETTINGS_TEST") != nullptr) {
+            const int failures = render::runSettingsSelfTest();
+            return failures == 0 ? 0 : 1;
+        }
 
         editor::EditorApp app;
         return app.run(maxFrames);

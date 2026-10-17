@@ -72,11 +72,17 @@ float coverage(float distPx, float wpx) {
 
 // 一整族格线的覆盖率，把"亚像素怎么办"包在里面：
 //   · 线宽 = min(期望像素线宽, kMaxLineDuty × 一格像素数) → 格子越小线越细；
-//   · 一格不足 ~1.6 px 时才真正淡出（那时细节已经解析不出来了）。
+//   · 一格不足 ~2 px 时就真正淡出（那时细节已经解析不出来了）。
+//
+// ⚠ 2026-10-17 把阈值从 (0.7, 1.6) 提到 (0.9, 2.0)：远平面放开到 5 km 之后
+//   相机可以飞到很高，1 m 小格在 300 m 高空只剩 ~1.5 px —— 旧阈值刚好卡在
+//   "还能解析"的边缘，整片小格变成摩尔纹（截图里就是一片灰噪点）。UE 的
+//   视口栅格在这时会把小格整族收掉、只留 10 m 主格，这里对上它的行为。
+//   贴地平视时一格有几十像素，完全不受影响。
 float gridCoverage(vec2 p, float step, vec2 fw, float baseWpx) {
     const float cellPx = cellPixels(step, fw);
     const float w = min(baseWpx, kMaxLineDuty * cellPx);
-    return coverage(lineDistPx(p, step, fw), w) * smoothstep(0.7, 1.6, cellPx);
+    return coverage(lineDistPx(p, step, fw), w) * smoothstep(0.9, 2.0, cellPx);
 }
 
 void main() {

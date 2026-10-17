@@ -1,5 +1,6 @@
 #include "SplitLayout.h"
 
+#include "Localization.h"
 #include "DebugRects.h"
 
 #include <imgui.h>
@@ -405,7 +406,7 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
     // ---- 拖动中跟一条比例 tooltip（E06-1）----
     if (dragging && mouseDown) {
         m_hoverFrac = n.ratio;
-        ImGui::SetTooltip("%s %.0f%%  |  %s %.0f%%", slotName(n.panelA),
+        ImGui::SetTooltip(TR("%s %.0f%%  |  %s %.0f%%"), slotName(n.panelA),
                           n.ratio * 100.0f, slotName(n.panelB),
                           (1.0f - n.ratio) * 100.0f);
     }
@@ -443,9 +444,9 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
     }
     if (ImGui::BeginPopup(popupId)) {
         ImGui::SeparatorText(horizontal ? "Horizontal split" : "Vertical split");
-        if (ImGui::MenuItem("50 / 50")) applyPreset(nodeIdx, 0.5f);
-        if (ImGui::MenuItem("70 / 30")) applyPreset(nodeIdx, 0.7f);
-        if (ImGui::MenuItem("30 / 70")) applyPreset(nodeIdx, 0.3f);
+        if (ImGui::MenuItem(TR("50 / 50"))) applyPreset(nodeIdx, 0.5f);
+        if (ImGui::MenuItem(TR("70 / 30"))) applyPreset(nodeIdx, 0.7f);
+        if (ImGui::MenuItem(TR("30 / 70"))) applyPreset(nodeIdx, 0.3f);
         ImGui::Separator();
         if (ImGui::MenuItem(n.collapsed ? "Expand" : "Collapse")) {
             if (n.collapsed) {
@@ -458,10 +459,10 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
             }
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Maximize side A")) {
+        if (ImGui::MenuItem(TR("Maximize side A"))) {
             setMaximized(n.panelA);
         }
-        if (ImGui::MenuItem("Maximize side B")) {
+        if (ImGui::MenuItem(TR("Maximize side B"))) {
             setMaximized(n.panelB);
         }
         ImGui::EndPopup();

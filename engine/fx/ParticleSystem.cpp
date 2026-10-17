@@ -234,10 +234,24 @@ void ParticleSystem::createDescriptors() {
     // 池的容量按类型给：
     //   UBO   —— 只有绘制的 binding 2（FrameUBO），每帧 1 个
     //   采样器 —— 只有绘制的 binding 3（场景深度），每帧 1 个
-    //   SSBO  —— 模拟 4 + 计数 2 + 绘制 2 = 8 个/帧
+    //   SSBO  —— **每帧 14 个**（见下）
+    //
+    // ⚠⚠ SSBO 的数法（2026-10-16 修）：池是按 **set layout 的全部 binding**
+    //  计费的，`vkAllocateDescriptorSets` 那一刻就把整个 layout 的每种描述符
+    //  从池里扣掉 —— 不是"实际写了几条"。
+    //   实际 layout：模拟 4（emitters/particles/alive/counters）
+    //              + 计数 6（bindings 0..5，含 aliveSorted）
+    //              + 绘制 4（bindings 0/1/4/5）
+    //              = **14 个/帧**。
+    //   这里原先是 `* 8`，注释还把计数/绘制各算成 2 个（只数了"主要的"那几条）
+    //   → 预算 8/帧 < 需求 14/帧 → **第二帧一开始就 `VK_ERROR_OUT_OF_POOL_MEMORY`**
+    //   （-1000069000，落在 rhi/DescriptorSet.inl 的 vkAllocateDescriptorSets），
+    //   表现是 `MYVK_FX=1` 一开就 `Fatal: Vulkan call failed` —— 空场景也一样，
+    //   与场景/UI 无关。留 16 而不是刚好 14：多 2 个余量，以后给某个 set 加
+    //   一个 binding 不会再炸。
     m_descriptors = std::make_unique<rhi::DescriptorAllocator>(
         m_device, m_framesInFlight * 3, m_framesInFlight, m_framesInFlight,
-        m_framesInFlight * 8, 0);
+        m_framesInFlight * 16, 0);
 }
 
 void ParticleSystem::createFrame(uint32_t i) {

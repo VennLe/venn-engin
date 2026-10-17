@@ -321,19 +321,31 @@ def main():
             fails.append("1b h=%.0f" % (tr[3] - tr[1]))
 
         # ---- 断言 2：整组彩色按钮在播放条内且水平居中 ----
+        #
+        # ⚠⚠ 扫的范围**必须夹在 TR-BAR 自己的 x 区间里**。
+        #   这一行（y 落在 TR-BAR 内）在**整窗**上横跨到右侧 Inspector，而
+        #   Inspector 里 Directional Light 段是**故意**用 R/G/B 画 XYZ 轴标签的
+        #   （x≈1321 红 / 1365 绿 / 1409 蓝，等距 44px）。它们落在 TR-BAR 右缘
+        #   （1253）之外，却会被"整窗横扫"算进去 → min=630 / max=1409 →
+        #   组中心被拽到 1020 而条中心只有 774 → 误报 FAIL（按钮一动没动）。
+        #   2026-10-16 全量回归就是这么挂的：拿 addmenu_00_full.png 复算，
+        #   TR-BAR 之内彩色像素只有 x∈[630,853]（中心 742，与 774 差 33 < 40）。
         img, _ = capture_client(hwnd)
         px = img.load()
         W, H = img.size
+        bx0 = max(int(tr[0]), 0)
+        bx1 = min(int(tr[2]), W)
         colored = [(x, y) for y in range(int(tr[1]) + 2, min(int(tr[3]) - 2, H))
-                   for x in range(0, W)
+                   for x in range(bx0, bx1)
                    if max(px[x, y][:3]) - min(px[x, y][:3]) > 45]
         if colored:
             xs = [p[0] for p in colored]
             row_cx = (min(xs) + max(xs)) * 0.5
             tr_cx = (tr[0] + tr[2]) * 0.5
             ok = abs(row_cx - tr_cx) < 40.0
-            print("断言 2 (按钮组居中, 组中心 x=%.0f, 条中心 x=%.0f): %s"
-                  % (row_cx, tr_cx, "PASS" if ok else "FAIL"))
+            print("断言 2 (按钮组居中, 组中心 x=%.0f, 条中心 x=%.0f, "
+                  "彩色 x∈[%d,%d]): %s"
+                  % (row_cx, tr_cx, min(xs), max(xs), "PASS" if ok else "FAIL"))
             if not ok:
                 fails.append("2 row-center x=%.0f vs %.0f" % (row_cx, tr_cx))
         else:

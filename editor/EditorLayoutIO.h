@@ -47,6 +47,12 @@ struct LayoutState {
     int viewMode = 0;         // Renderer::ViewMode 的整数值
     std::string maximized;    // 被最大化的面板 id（"" = 无）
 
+    // Inspector 当前选中的页签。**存的是 id 字符串**（"object" / "material" …），
+    // 不是下标 —— 下标会随着"往中间插一个页签"整体漂移，那样老配置读回来
+    // 会静默跳到另一个页签上。id 由 InspectorPanel::tabId / tabIndexById 提供，
+    // 本文件因此**不需要**认识 InspectorPanel（两边只共享字符串）。
+    std::string inspTab = "object";
+
     // File ▸ Open Recent（最新在前）。落在这里而不是场景文件里，因为它是
     // **编辑器状态**：换台机器打开同一个工程，看见的应该是各自的最近列表。
     std::vector<std::string> recent;

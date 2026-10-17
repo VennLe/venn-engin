@@ -1,5 +1,6 @@
 #include "EditorApp.h"
 
+#include "Localization.h"
 #include "CharacterWindow.h"
 #include "CommandRegistry.h"
 #include "ContentBrowser.h"
@@ -13,8 +14,11 @@
 #include "GpuTimelinePanel.h"
 // E09：生成区直接遍历 kFeatures / paramPtr（FeatureUIGen.h 只前向声明）
 #include "render/FeatureRegistry.h"
+#include "render/RenderSettingsIO.h"
 #include "EditorScene.h"
+#include "InputMapIO.h"
 #include "InspectorPanel.h"
+#include "KeyBindingsPage.h"
 #include "PanelRegistry.h"
 #include "SceneHierarchy.h"
 #include "SplitLayout.h"
@@ -28,13 +32,20 @@
 #include "core/WindowGeometry.h"
 #include "ecs/Components.h"
 #include "physics/CollisionWorld.h"
+#include "physics/PhysicsWorld.h"
+// 场景 ⇄ 物理的绑定层（G01 从本文件提到引擎层，与 Game.exe 共用）
+#include "physics/ScenePhysics.h"
 #include "render/Renderer.h"
 #include "scene/Camera.h"
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
 #include "ui/ImGuiManager.h"
+#include "ui/ImGuiTheme.h"
 
 #include <imgui.h>
+
+#include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtx/matrix_decompose.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -105,6 +116,143 @@ const ImGuiKey kDigitKeys[9] = {
     ImGuiKey_1, ImGuiKey_2, ImGuiKey_3, ImGuiKey_4, ImGuiKey_5,
     ImGuiKey_6, ImGuiKey_7, ImGuiKey_8, ImGuiKey_9};
 
+// ---------------------------------------------------------------- 偏好页
+// **顺序即下标**（`page == N` 的分支都写数字，改顺序等于改语义）。
+// 名字是逻辑名：显示时过 TR，落盘/自动化按名字查 —— 换语言不会选中别的页。
+constexpr const char* kPrefsPages[] = {"Interface", "Appearance", "Viewport",
+                                       "Editing",   "Keymap",     "Scene",
+                                       "Bindings"};
+constexpr int kPrefsPageCount =
+    static_cast<int>(sizeof(kPrefsPages) / sizeof(kPrefsPages[0]));
+// G06：游戏动作键位重绑定（见 KeyBindingsPage.h 的说明）
+constexpr int kPrefsPageBindings = 6;
+
+// MYVK_EDITOR_PREFS_PAGE=<页名|下标>：打开 Preferences 时直接落到这一页。
+// 没有它，"改键位"这条链只能靠人手点两下才能进入被测状态。
+int prefsPageFromEnv() {
+    const char* p = std::getenv("MYVK_EDITOR_PREFS_PAGE");
+    if (!p || p[0] == '\0') return 0;
+    for (int i = 0; i < kPrefsPageCount; ++i)
+        if (std::strcmp(p, kPrefsPages[i]) == 0) return i;
+    char* end = nullptr;
+    const long v = std::strtol(p, &end, 10);
+    if (end && *end == '\0' && v >= 0 && v < kPrefsPageCount)
+        return static_cast<int>(v);
+    VK_LOG_WARN("PREFS unknown MYVK_EDITOR_PREFS_PAGE='%s' (valid: %s..%s or "
+                "an index) — falling back to Interface",
+                p, kPrefsPages[0], kPrefsPages[kPrefsPageCount - 1]);
+    return 0;
+}
+
+// ============================================================
+// G06 · 键位注入脚本（MYVK_EDITOR_REBIND）
+// ============================================================
+// 语法：分号分隔的一串命令，按顺序执行 ——
+//
+//   <context>/<action>=<glfw键码>   绑一条键盘绑定（走 UI 的同一条路径）
+//   <context>/<action>=clear        只解掉键盘绑定（手柄保留）
+//   <context>/<action>=reset        这个动作恢复出厂（键盘 + 手柄）
+//   resetall                        整表恢复出厂
+//   undo                            走**同一条**撤销栈（验证可撤销性）
+//   save                            写盘到 editorInputMapPath()
+//
+// 例：`Gameplay/Jump=70;save`（70 = GLFW_KEY_F）
+//
+// ⚠ 为什么不直接点 UI：捕获必须"按下真实按键"，自动化里没有可靠的合成
+//   按键（PostMessage 到 GLFW 那条路只在窗口有焦点时成立）。所以给
+//   **唯一的写路径**（EditorContext::rebindAction / saveInputMap）开一个
+//   脚本口子 —— UI 与脚本走同一段代码，脚本能测的就等于 UI 能做的。
+//
+// ⚠ 键码用数字而不是 "F"：GLFW 的键码本来就是数字，再造一套名字表等于
+//   多一个会漂移的映射（"F" 到底是不是 GLFW_KEY_F）。
+void applyRebindScript(EditorContext& ctx, const char* script) {
+    std::string s(script);
+    int applied = 0;
+    int failed = 0;
+
+    std::size_t begin = 0;
+    while (begin <= s.size()) {
+        const std::size_t semi = s.find(';', begin);
+        std::string tok = (semi == std::string::npos)
+                              ? s.substr(begin)
+                              : s.substr(begin, semi - begin);
+        begin = (semi == std::string::npos) ? s.size() + 1 : semi + 1;
+
+        // 去掉两端空白（允许写成 "a; b" 这种好读的形式）
+        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+            tok.erase(tok.begin());
+        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+            tok.pop_back();
+        if (tok.empty()) continue;
+
+        if (tok == "save") {
+            ++applied;
+            if (!ctx.saveInputMap()) ++failed;
+            continue;
+        }
+        if (tok == "undo") {
+            ++applied;
+            ctx.undo();
+            continue;
+        }
+        if (tok == "resetall") {
+            ++applied;
+            if (!ctx.resetAllBindings()) ++failed;
+            continue;
+        }
+        if (tok == "dump") {
+            // 什么都不改，只为了让末尾那次**全表输出**跑起来（只读断言用）。
+            ++applied;
+            continue;
+        }
+
+        const std::size_t eq = tok.find('=');
+        const std::size_t slash = tok.find('/');
+        if (eq == std::string::npos || slash == std::string::npos ||
+            slash > eq) {
+            VK_LOG_WARN("INS-BIND-SCRIPT bad command '%s'", tok.c_str());
+            ++failed;
+            continue;
+        }
+        const std::string c = tok.substr(0, slash);
+        const std::string a = tok.substr(slash + 1, eq - slash - 1);
+        const std::string v = tok.substr(eq + 1);
+
+        bool ok = false;
+        if (v == "clear")
+            ok = ctx.clearActionBinding(c, a);
+        else if (v == "reset")
+            ok = ctx.resetActionBinding(c, a);
+        else {
+            const int code = std::atoi(v.c_str());
+            if (code <= 0) {
+                VK_LOG_WARN("INS-BIND-SCRIPT bad key code '%s'", v.c_str());
+                ++failed;
+                continue;
+            }
+            core::InputBinding b;
+            b.source = core::InputSource::Key;
+            b.code = code;
+            ok = ctx.rebindAction(c, a, b);
+        }
+        VK_LOG_INFO("INS-BIND-INJECT %s ok=%d", tok.c_str(), ok ? 1 : 0);
+        if (ok) ++applied;
+        else ++failed;
+    }
+
+    // 脚本跑完把**生效后的**整张表逐条打出来。
+    //
+    // ⚠ 这是自动化唯一稳定的"改完到底长什么样"口径：手写 JSON 断言只能看到
+    //   落盘格式，而这里看到的是**内存里真正生效的**绑定（`PadBtn0 / F` 这种
+    //   多来源描述也在）。只在注入时打，不污染正常运行的日志。
+    for (const std::string& cn : ctx.inputMap().contextNames())
+        for (const std::string& an : ctx.inputMap().actionNames(cn))
+            VK_LOG_INFO("INS-BIND-AFTER %s/%s=%s", cn.c_str(), an.c_str(),
+                        ctx.inputMap().describeBinding(cn, an).c_str());
+
+    VK_LOG_INFO("INS-BIND-SCRIPT applied=%d failed=%d", applied, failed);
+}
+
 } // namespace
 
 // ============================================================
@@ -174,7 +322,7 @@ void EditorApp::drawPlaceholderPanel(int panelIndex) {
     const char* id = panelId(panelIndex);
 
     char win[160];
-    std::snprintf(win, sizeof(win), "%s###panel_%s", title, id);
+    std::snprintf(win, sizeof(win), "%s###panel_%s", TR(title), id);
 
     ImGui::SetNextWindowSize(ImVec2(kFloatW, 150.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(kFloatMargin, kFloatMargin + kStatsH + kScriptsH +
@@ -188,12 +336,14 @@ void EditorApp::drawPlaceholderPanel(int panelIndex) {
         if (!open) setPanelOpen(panelIndex, false);
         return;
     }
-    ImGui::TextDisabled("%s", title);
+    ImGui::TextDisabled(TR("%s"), TR(title));
     ImGui::Separator();
     ImGui::TextWrapped(
-        "这块面板已经在注册表里登记了（id = \"%s\"）：\n"
-        "View/Window 菜单、快捷键、显隐持久化三路都已生效。\n"
-        "内容由后续任务填充（见 docs/editor_roadmap.md）。",
+        TR("This panel is registered in the panel table (id = \"%s\"):\n"
+           "the View/Window menus, its shortcut and its visibility "
+           "persistence are all live.\n"
+           "Its content is filled in by later tasks "
+           "(see docs/editor_roadmap.md)."),
         id);
     ImGui::End();
     if (!open) setPanelOpen(panelIndex, false);
@@ -266,7 +416,7 @@ void EditorApp::onInit() {
     if (std::getenv("MYVK_ENGINE_PANEL")) {
         m_ctx->panels().engine = true;
     }
-    m_scripts = std::make_unique<ScriptEngine>();
+    m_scripts = std::make_unique<vks::ScriptEngine>();
     m_split = std::make_unique<SplitLayout>();
     m_toolbar = std::make_unique<Toolbar>(*m_ctx, *this);
     // E02：生成器写完参数值后回调这里（FTR-UI 日志 + 副作用）。
@@ -296,6 +446,9 @@ void EditorApp::onInit() {
     registerConsoleCommands();
     // E17：偏好读盘（无存档 / 自动化 → 出厂值；见 EditorLayoutIO 的守卫）
     applyPrefsFromDisk();
+    // 主题 / 语言读回来之后要**真应用一次** —— 窗口已经建好了，样式是
+    // ImGuiManager::init 用出厂主题画的，不改这一步存档就形同虚设。
+    applyAppearance();
     m_viewport = std::make_unique<ViewportPanel>(*m_ctx, renderer());
     m_hierarchy = std::make_unique<SceneHierarchy>(*m_ctx);
     m_inspector = std::make_unique<InspectorPanel>(*m_ctx);
@@ -367,6 +520,7 @@ void EditorApp::onInit() {
     //   MYVK_EDITOR_SCENE=路径   启动即打开指定场景，而不是空场景
     //   MYVK_EDITOR_SELECT=名字  启动后按名字选中一个实体
     //   MYVK_EDITOR_CAM="x,y,z,yawDeg,pitchDeg"   把视口相机摆到指定位姿
+    //   MYVK_EDITOR_CLIP="near,far"               钉死视口相机裁剪面（默认 0.1/5000）
     //   MYVK_EDITOR_GIZMO=move|rotate|scale   启动即切手柄模式
     //   MYVK_EDITOR_COLLIDER=hull|capsule     给选中项加碰撞体并进入碰撞体编辑
     //   MYVK_EDITOR_PREFS=1      启动即打开 Preferences 窗口（截图验证用）
@@ -433,6 +587,30 @@ void EditorApp::onInit() {
         }
     }
 
+    // ---- MYVK_EDITOR_CLIP="near,far"：把视口相机的裁剪面钉死 ----
+    // 自动化专用，和 MYVK_EDITOR_CAM 同一类钩子（同样必须排在
+    // MYVK_EDITOR_SCENE 之后：加载场景会连相机一起覆盖）。
+    //
+    // 为什么需要它：编辑器视口默认 0.1 / **5000** m（见
+    // applyEditorCameraMode 的注释），而视锥剔除 / BVH 那两个用例是**按
+    // 200 m 远的"看不见"来设计场景**的（39 个立方体摆在 x=250..4050）。
+    // 远平面一放开到 5 km，那 39 个就名正言顺地进了视锥 → culled 从 132
+    // 掉到 94。它们的基线（132 / 4）本身没错，错在**依赖了编辑器的默认
+    // 值**；把默认钉回它们设计时的那一档，用例就重新只测"剔除算得对不对"，
+    // 而不是顺带测"编辑器的远平面是多少"。
+    if (const char* envClip = std::getenv("MYVK_EDITOR_CLIP")) {
+        float nz = 0.0f, fz = 0.0f;
+        if (std::sscanf(envClip, "%f,%f", &nz, &fz) == 2 && fz > nz) {
+            m_ctx->editorScene().camera().setClipPlanes(nz, fz);
+            VK_LOG_INFO("Editor: clip planes near=%.3f far=%.1f (MYVK_EDITOR_CLIP)",
+                        (double)m_ctx->editorScene().camera().nearPlane(),
+                        (double)m_ctx->editorScene().camera().farPlane());
+        } else {
+            VK_LOG_WARN("MYVK_EDITOR_CLIP 解析失败: '%s'（期望 near,far）",
+                        envClip);
+        }
+    }
+
     // MYVK_EDITOR_GIZMO=move|rotate|scale：启动就把手柄切到某个模式，
     // 这样三种粒度的界面（轴向 / 平面 / 整体）都能被截图覆盖到。
     if (const char* envGizmo = std::getenv("MYVK_EDITOR_GIZMO")) {
@@ -454,6 +632,65 @@ void EditorApp::onInit() {
             m_ctx->setGizmoSpace(GizmoSpace::Local);
         else if (s == "world")
             m_ctx->setGizmoSpace(GizmoSpace::World);
+    }
+
+    // MYVK_EDITOR_SNAP=0|1：吸附默认值自 2026-10-17 起改成**全开**了。
+    // 但"拖一段像素 → 期望一个连续的数值"这类断言在吸附下是不确定的
+    // （落点被量化到 0.1 m / 10 度 / 0.1 倍，拖得不够远还会直接量化成 0），
+    // 所以给需要**原始拖拽**的脚本留一个关掉的口子。
+    // 不设这个变量 = 用用户默认值（全开）。
+    if (const char* envSnap = std::getenv("MYVK_EDITOR_SNAP")) {
+        const bool on = (envSnap[0] != '0');
+        m_ctx->snapMoveRef() = on;
+        m_ctx->snapRotateRef() = on;
+        m_ctx->snapScaleRef() = on;
+    }
+
+    // ---- G06：键位绑定表 ----
+    // 读盘（自动化下默认路径不读，见 InputMapIO 的规则说明）→ 再跑注入脚本。
+    // 顺序不能反：脚本是在**读出来的表**上改。
+    m_ctx->loadInputMap();
+    if (const char* rebind = std::getenv("MYVK_EDITOR_REBIND"))
+        applyRebindScript(*m_ctx, rebind);
+
+    // MYVK_EDITOR_BIND_CAPTURE=<context>/<action>：开机就进"等待按键"态。
+    //
+    // 存在的意义只有一条：**捕获态那块 UI 要能被截图和断言**。真正的捕获
+    // 必须按真实按键，自动化里没有可靠手段（合成按键只在窗口有焦点时成立），
+    // 所以"进入捕获态"这件事单独开个口子，剩下的交给 G/H 组去验面板。
+    if (const char* cap = std::getenv("MYVK_EDITOR_BIND_CAPTURE")) {
+        const std::string s = cap;
+        const std::size_t slash = s.find('/');
+        if (slash != std::string::npos && slash > 0 && slash + 1 < s.size()) {
+            m_ctx->beginInputCapture(s.substr(0, slash), s.substr(slash + 1));
+            VK_LOG_INFO("INS-BIND-CAPTURE-ARMED %s", cap);
+        } else {
+            VK_LOG_WARN("MYVK_EDITOR_BIND_CAPTURE='%s' 需要 <context>/<action>",
+                        cap);
+        }
+    }
+
+    // 自动化可观测：开机**生效后**的吸附 / 栅格 / 主题 / 语言一把打出来。
+    // 为什么需要：这四项都是"用户默认值"，改完只有界面上几个勾选框能看出来，
+    // 脚本没法断言（也不该去数像素里的对勾）。打一行结构化状态最省事。
+    // 只在 MYVK_LOG_RECTS 下打 —— 那是本项目统一的"自动化观测开关"。
+    if (std::getenv("MYVK_LOG_RECTS")) {
+        const render::GridSettings& g = renderer().gridSettings();
+        VK_LOG_INFO(
+            "EDITOR-STATE snap.move=%d snap.rotate=%d snap.scale=%d "
+            "step.move=%.3f step.rotate=%.1f step.scale=%.3f "
+            "grid.extent=%.1f grid.minor=%.3f grid.major=%.3f "
+            "grid.fadeStart=%.1f grid.fadeEnd=%.1f theme=%d language=%d",
+            m_ctx->snapMove() ? 1 : 0, m_ctx->snapRotate() ? 1 : 0,
+            m_ctx->snapScale() ? 1 : 0,
+            static_cast<double>(m_ctx->snapMoveStep()),
+            static_cast<double>(m_ctx->snapRotateStep()),
+            static_cast<double>(m_ctx->snapScaleStep()),
+            static_cast<double>(g.extent), static_cast<double>(g.minorStep),
+            static_cast<double>(g.majorStep),
+            static_cast<double>(g.fadeStart),
+            static_cast<double>(g.fadeEnd), ui::currentThemeIndex(),
+            language());
     }
     if (std::getenv("MYVK_EDITOR_PREFS")) m_ctx->showSettings() = true;
 
@@ -563,7 +800,7 @@ void EditorApp::onUpdate(float dt) {
         const int idx = m_wsSwitch.front().index;
         m_wsSwitch.erase(m_wsSwitch.begin());
         applyWorkspace(idx);
-        m_ctx->notify(std::string("Workspace: ") + kWorkspaces[idx].title);
+        m_ctx->notify(std::string(TR("Workspace: ")) + TR(kWorkspaces[idx].title));
     }
 
     // ---- E16：Console 命令注入（自动化验收用）----
@@ -616,8 +853,8 @@ void EditorApp::onUpdate(float dt) {
         const int reloaded = m_scripts->pollHotReload();
         preloadScripts();  // 场景里新增/删除了脚本也要跟上
         if (reloaded > 0) {
-            m_ctx->notify("Hot-reloaded " + std::to_string(reloaded) +
-                          " script file(s)");
+            m_ctx->notify(std::string(TR("Hot-reloaded ")) +
+                          std::to_string(reloaded) + TR(" script file(s)"));
         }
     }
 
@@ -639,6 +876,17 @@ void EditorApp::onUpdate(float dt) {
         // 玩家在脚本之后 / 碰撞之前：脚本可能挪物体，玩家再动自己，
         // 碰撞最后保证谁都不穿谁（玩家也被墙挡）。
         runPlayers(simDt);
+        // ---- R7-1 物理 ----
+        // 世界在进入 Play 的第一帧建一次（`!m_physics` 就是"还没建"），
+        // 之后每帧推进 + 把解算结果写回运行态 TransformComponent。
+        //
+        // 顺序：脚本 → 玩家 → **物理** → 碰撞。
+        //   · 物理在脚本/玩家之后：脚本可能移动**运动学**物体（平台/门），
+        //     物理要读到它这一帧的最终位置才能算出正确的撞击速度。
+        //   · 物理在碰撞之前：碰撞里的相机推出必须基于**本帧最终**的物体
+        //     位置，否则相机会卡在"已经移走了的箱子"里。
+        if (!m_physics) buildPhysicsWorld();
+        stepPhysics(simDt);
         // 碰撞必须在脚本**之后**：脚本负责让物体动，碰撞负责不让它们穿过去。
         // 反过来（先碰撞后脚本）等于每一帧结束时都留一次穿透。
         runCollision(simDt);
@@ -649,6 +897,18 @@ void EditorApp::onUpdate(float dt) {
         m_scriptErrors.clear();
         m_collisionFrames = 0;
         m_collisionLogBudget = 240;
+        // 物理世界随运行态一起丢弃（Stop 之后编辑场景从没被动过，所以
+        // 不需要任何回滚 —— 这条是"Stop 即还原"能成立的关键一环）。
+        //
+        // ⚠ 只在**真正 Stop** 时丢。Pause 走的是同一个 else 分支（isPlaying()
+        //   为假），但暂停后恢复必须接着跑，所以判据是 usingRuntime()：
+        //   Stopped=false / Playing|Paused=true。
+        if (!m_ctx->usingRuntime()) {
+            destroyPhysicsWorld();
+            m_physicsFrames = 0;
+            // 编辑态：物理没在跑（面板据此显示原因而不是一片 0）
+            m_ctx->setPhysicsRuntime(PhysicsRuntimeInfo{});
+        }
     }
 
     // ---- 动画（编辑态脚本）：Play 走、Pause 冻结、Stop 恢复快照 ----
@@ -669,6 +929,8 @@ void EditorApp::onShutdown() {
     // E04 / E05 / E17：布局 + 工作区 + 偏好落盘（自动化时各自跳过）
     saveEditorLayoutToDisk();
     if (m_console) savePrefsToDisk();
+    // E03：渲染设置落盘（只在用户真的改过参数时；自动化一律跳过）
+    if (m_renderSettingsDirty > 0) saveRenderSettings(false);
     // E21：通知历史落盘（自动化跳过 —— 与上面同一条规则）
     if (m_notifications) m_notifications->saveToDisk();
 
@@ -756,10 +1018,10 @@ void EditorApp::runScriptsOn(scene::Scene& sc, double t, float dt,
         [&](ecs::Entity e, ecs::ScriptComponent& scomp) {
             if (!scomp.enabled || scomp.path.empty()) return;
 
-            ScriptAsset* asset = m_scripts->get(scomp.path);
+            vks::ScriptAsset* asset = m_scripts->get(scomp.path);
             if (!asset) return;
 
-            ScriptProgram* prog = asset->program();
+            vks::ScriptProgram* prog = asset->program();
             if (!prog || !prog->valid()) {
                 // 编译就没过：只在错误内容变化时报一次，别刷屏
                 const std::string msg = asset->lastError().toString();
@@ -774,11 +1036,11 @@ void EditorApp::runScriptsOn(scene::Scene& sc, double t, float dt,
                 return;
             }
 
-            ScriptHost host;
+            vks::ScriptHost host;
             host.scene = &sc;
             host.entity = e;
 
-            ScriptError err;
+            vks::ScriptError err;
             const double ts = static_cast<double>(scomp.timeScale);
             const bool ok = prog->run(host, t * ts, dtd * ts, frame, err);
 
@@ -1073,6 +1335,141 @@ void EditorApp::runCollision(float dt) {
     if (verbose) --m_collisionLogBudget;
 }
 
+// ---------------------------------------------------------------- R7-1 物理
+//
+// 与碰撞求解（runCollision）的分工：
+//   · runCollision —— **没有动力学**的位置分离。只处理"有碰撞体、但没有
+//     刚体"的实体（Collider::physicsDriven 把刚体摘出去了），外加相机推出。
+//   · 本节的物理世界 —— 有 RigidBodyComponent 的实体，走完整的刚体动力学。
+// 两者同时开着也不会互相打架，因为管辖范围不重叠。
+
+// 把运行态场景里的 RigidBodyComponent 变成 physics::PhysicsWorld 里的刚体。
+//
+// 只在进入 Play 的第一帧调用一次。之后每帧只步进 + 写回变换 —— 参数是
+// "初始条件"，运行中改它不会追溯生效（要重开 Play）。这与"编辑态改不了
+// 运行态"的整体设计一致：Play 中途改 Inspector 只影响下次 Play。
+void EditorApp::buildPhysicsWorld() {
+    destroyPhysicsWorld();
+
+    // 翻译逻辑本身在 engine/physics/ScenePhysics.cpp —— 与 Game.exe **共用
+    // 同一份**（G01/G03 把它从编辑器提出去，就是为了不让"编辑器里调好的手感
+    // 出包后不一样"，见 ship_roadmap §15 风险 #10）。
+    physics::SceneBuildOptions opts;
+    if (const char* e = std::getenv("MYVK_PHYS")) {
+        opts.enabledOverride = (std::atoi(e) != 0) ? 1 : 0;
+    }
+
+    physics::SceneBinding binding =
+        physics::buildSceneWorld(m_ctx->runtimeScene(), opts);
+    if (!binding.enabled) return;
+
+    m_physics = std::move(binding.world);
+    m_physicsEntityToBody = std::move(binding.entityToBody);
+
+    m_physicsFrames = 0;
+    m_physicsLogBudget = 60;
+    // MYVK_PHYS_DUMP=N → 每 N 帧一行/每体（N=1 就是逐帧，配 MYVK_FRAMES
+    // 截断用）；不设 / 非法值 → 关。
+    m_physicsDumpEvery = 0;
+    if (const char* dump = std::getenv("MYVK_PHYS_DUMP")) {
+        const int n = std::atoi(dump);
+        if (n > 0) m_physicsDumpEvery = n;
+    }
+
+    const scene::PhysicsSettings& ps = m_ctx->runtimeScene().physicsSettings();
+    VK_LOG_INFO("physics: world built — %d body(ies) (ground=%d triggers=%d "
+                "materials=%d) from %d "
+                "rigid entities, gravity=(%.2f,%.2f,%.2f) dt=%.5f",
+                binding.bodies, binding.ground ? 1 : 0, binding.triggers,
+                binding.materials,
+                binding.rigidEntities,
+                static_cast<double>(ps.gravity.x),
+                static_cast<double>(ps.gravity.y),
+                static_cast<double>(ps.gravity.z),
+                static_cast<double>(ps.fixedTimeStep));
+}
+
+void EditorApp::stepPhysics(float dt) {
+    if (!m_physics) return;
+    scene::Scene& sc = m_ctx->runtimeScene();
+    ecs::World& w = sc.world();
+
+    ++m_physicsFrames;
+
+    // ---- 1) 运动学体：实体 → 刚体（步进前）----
+    physics::syncKinematicFromScene(sc, *m_physics, m_physicsEntityToBody, dt);
+
+    // ---- 2) 步进 ----
+    m_physics->step(dt);
+
+    // ---- 3) 写回实体变换（只写动态体）----
+    physics::writeBackToScene(sc, *m_physics, m_physicsEntityToBody);
+
+    // ---- 4) 统计日志（前几十帧给全，之后只报一次心跳）----
+    const physics::PhysicsStats& st = m_physics->stats();
+    // 面板的只读快照（Inspector 的 Physics 页读它，见 PhysicsRuntimeInfo）
+    editor::PhysicsRuntimeInfo info;
+    info.active = true;
+    info.bodies = st.bodies;
+    info.dynamic = st.dynamic;
+    info.sleeping = st.asleep;
+    info.manifolds = st.manifolds;
+    info.contactPoints = st.contactPoints;
+    info.broadphasePairs = st.broadphasePairs;
+    info.joints = st.joints;
+    info.maxPenetration = st.maxPenetration;
+    info.maxSpeed = st.maxSpeed;
+    info.steps = static_cast<unsigned long long>(st.steps);
+    info.simTime = st.simTime;
+    m_ctx->setPhysicsRuntime(info);
+
+    // 前 60 帧逐帧给全（自动化断言用），之后每 120 帧一条心跳 ——
+    // 长时间 Play 不该把日志刷爆，但"物理还在走"这件事要能看见。
+    const bool verbose = m_physicsLogBudget > 0;
+    if (verbose) --m_physicsLogBudget;
+    if (verbose || (m_physicsFrames % 120u) == 0u) {
+        VK_LOG_INFO("physics: step=%llu bodies=%d dyn=%d asleep=%d "
+                    "manifolds=%d contacts=%d pairs=%d maxPen=%.4f",
+                    static_cast<unsigned long long>(st.steps), st.bodies,
+                    st.dynamic, st.asleep, st.manifolds, st.contactPoints,
+                    st.broadphasePairs,
+                    static_cast<double>(st.maxPenetration));
+    }
+
+    // ---- 5) 调试转储（MYVK_PHYS_DUMP=<N>）----
+    // 每 N 帧一行/每体。**位置从实体读**（而不是从刚体读）——这样断言的是
+    // "写回链路也对了"，而不仅是"求解器算对了"。这两件事会各自坏掉：
+    // 求解器对了但写回用错坐标系，画面照样是错的。
+    if (m_physicsDumpEvery > 0 &&
+        (m_physicsFrames % static_cast<uint64_t>(m_physicsDumpEvery)) == 0u) {
+        for (auto& kv : m_physicsEntityToBody) {
+            const physics::RigidBody* b = m_physics->body(kv.second);
+            if (!b || !b->isDynamic()) continue;
+            const ecs::Entity e = w.handle(kv.first);
+            const std::string* nm = e.valid() ? w.name(e) : nullptr;
+            const auto* tc = e.valid() ? w.get<ecs::TransformComponent>(e) : nullptr;
+            const glm::vec3 p = tc ? tc->position : b->position;
+            VK_LOG_INFO("PHYS-BODY f=%llu name='%s' pos=(%.5f,%.5f,%.5f) "
+                        "vel=(%.5f,%.5f,%.5f) awake=%d",
+                        static_cast<unsigned long long>(m_physicsFrames),
+                        nm ? nm->c_str() : "?", static_cast<double>(p.x),
+                        static_cast<double>(p.y), static_cast<double>(p.z),
+                        static_cast<double>(b->linearVelocity.x),
+                        static_cast<double>(b->linearVelocity.y),
+                        static_cast<double>(b->linearVelocity.z),
+                        b->awake ? 1 : 0);
+        }
+    }
+}
+
+void EditorApp::destroyPhysicsWorld() {
+    if (!m_physics) return;
+    m_physics.reset();
+    m_physicsEntityToBody.clear();
+    // 面板不该在"世界已经没了"之后继续显示上一帧的步数
+    m_ctx->setPhysicsRuntime(editor::PhysicsRuntimeInfo{});
+}
+
 // 动画：直接在**编辑场景**上跑脚本（Play 走 / Pause 冻结 / Stop 恢复快照）
 void EditorApp::runAnimScripts(float dt) {
     runScriptsOn(m_ctx->editorScene(), static_cast<double>(m_ctx->animTime()),
@@ -1099,7 +1496,7 @@ void EditorApp::preloadScripts() {
     m_scripts->clear();
     int failed = 0;
     for (const std::string& p : m_scriptPaths) {
-        ScriptAsset* a = m_scripts->get(p);
+        vks::ScriptAsset* a = m_scripts->get(p);
         if (a && !a->lastError().ok()) {
             ++failed;
             m_scripts->logLine("[compile] " + p + " > " +
@@ -1280,7 +1677,7 @@ void EditorApp::saveWorkspace() {
 
 void EditorApp::resetWorkspace() {
     applyWorkspace(m_ctx->workspace().current());
-    m_ctx->notify("Workspace reset to factory preset");
+    m_ctx->notify(TR("Workspace reset to factory preset"));
 }
 
 // ---------------------------------------------------------------- EditorHost
@@ -1310,7 +1707,7 @@ void EditorApp::reloadShaders() {
     // 热重载平时是"每 15 帧扫一轮 .spv 的 mtime"；这里把节流推到阈值以上
     // → 下一帧立刻扫一遍（等价于手动催一次）。
     renderer().forceShaderReloadScan();
-    m_ctx->notify("Shader reload requested (see the log)");
+    m_ctx->notify(TR("Shader reload requested (see the log)"));
 }
 
 void EditorApp::reloadAssets() {
@@ -1318,7 +1715,7 @@ void EditorApp::reloadAssets() {
     // AssetManager.h）：没有"整表重扫"这件事可做。真正需要的是**脚本**
     // 重编译，那由 EditorApp::preloadScripts 每帧节流做。
     preloadScripts();
-    m_ctx->notify("Assets reloaded (scripts recompiled)");
+    m_ctx->notify(TR("Assets reloaded (scripts recompiled)"));
     VK_LOG_INFO("ASSETS-RELOAD requested (scripts recompiled)");
 }
 
@@ -1429,6 +1826,13 @@ void EditorApp::loadEditorLayoutFromDisk() {
     const int vm = (s.viewMode >= 0 && s.viewMode <= vmLimit) ? s.viewMode : 0;
     renderer().setViewMode(static_cast<VM>(vm));
 
+    // Inspector 的当前页签。存的是 **id 字符串**，所以"往中间插一个页签"
+    // 不会让老配置读回来跳到别的页上；认不出来的 id 保持默认（不报错）。
+    if (m_inspector) {
+        const int tab = InspectorPanel::tabIndexById(s.inspTab.c_str());
+        if (tab >= 0) m_inspector->setActiveTab(tab);
+    }
+
     const int ws = workspaceIndexOf(s.workspace.c_str());
     m_ctx->workspace().setCurrent(ws >= 0 ? ws : 0);
     m_ctx->recentScenesRef() = s.recent;
@@ -1437,12 +1841,12 @@ void EditorApp::loadEditorLayoutFromDisk() {
     syncViewportLayout();
     // 读盘摘要打一行：验收脚本靠它区分"读到了存档"和"退回了出厂值"。
     VK_LOG_INFO("LAYOUT-LOAD workspace=%s viewportLayout=%s viewMode=%s "
-                "maximized=%s recent=%zu panels=%zu",
+                "maximized=%s recent=%zu panels=%zu inspTab=%s",
                 m_ctx->workspace().currentId(),
                 viewportLayoutName(m_ctx->viewportLayout()),
                 viewModeLabel(static_cast<int>(renderer().viewMode())),
                 s.maximized.empty() ? "(none)" : s.maximized.c_str(),
-                s.recent.size(), s.panels.size());
+                s.recent.size(), s.panels.size(), s.inspTab.c_str());
     logPanelStates();
 }
 
@@ -1466,6 +1870,7 @@ void EditorApp::saveEditorLayoutToDisk() {
     s.viewportLayout = static_cast<int>(m_ctx->viewportLayout());
     s.viewMode = static_cast<int>(renderer().viewMode());
     s.maximized = slotPanelId(m_split->maximizedSlot());
+    if (m_inspector) s.inspTab = InspectorPanel::tabId(m_inspector->activeTab());
     s.recent = m_ctx->recentScenes();
     const bool ok = saveEditorLayout(s);
     VK_LOG_INFO("LAYOUT-SAVE %s path=%s workspace=%s maximized=%s recent=%zu",
@@ -1480,6 +1885,13 @@ void EditorApp::handleShortcuts() {
     const ImGuiIO& io = ImGui::GetIO();
     // 正在文本输入（重命名 / 脚本路径）时不要抢键
     if (io.WantTextInput) return;
+
+    // ---- G06 键位捕获：模态，收下**全部**按键 ----
+    // 必须排在所有快捷键之前（包括 F11 与命令面板）。玩家按下 Rebind 之后
+    // 要把 Jump 绑到 Space，而 Space 是"运行/暂停"、F 是全屏 —— 不收手的话
+    // "点一下 Rebind" 会顺带把场景跑起来。捕获本身在 KeyBindingsPage 里读
+    // GLFW 原始状态（那一层不受 ImGui 的键盘门控影响）。
+    if (m_ctx->inputCaptureActive()) return;
 
     // ---- F11：窗口全屏（任何模式都可用，面板照旧显示）----
     // 与 Play 态的 F 分工：F = "全屏 + 只看游戏"，F11 = 只是把窗口铺满显示器。
@@ -1501,8 +1913,8 @@ void EditorApp::handleShortcuts() {
         for (int i = 0; i < kWorkspaceCount && i < 9; ++i) {
             if (ImGui::IsKeyPressed(kDigitKeys[i], false)) {
                 applyWorkspace(i);
-                m_ctx->notify(std::string("Workspace: ") +
-                              kWorkspaces[i].title);
+                m_ctx->notify(std::string(TR("Workspace: ")) +
+                              TR(kWorkspaces[i].title));
                 return;
             }
         }
@@ -1560,11 +1972,11 @@ void EditorApp::handleShortcuts() {
                 scene::saveScene(m_ctx->editorScene(), abs);
             if (r.ok) {
                 m_ctx->dirty() = false;
-                m_ctx->notify("Saved " + m_ctx->scenePath());
+                m_ctx->notify(TR("Saved ") + m_ctx->scenePath());
                 // 落到日志里：自动化脚本靠它确认"真的存了、存到哪了"
                 VK_LOG_INFO("Scene saved: '%s'", abs.c_str());
             } else {
-                m_ctx->notify("Save failed: " + r.error);
+                m_ctx->notify(TR("Save failed: ") + r.error);
                 VK_LOG_WARN("Scene save failed for '%s': %s", abs.c_str(),
                             r.error.c_str());
             }
@@ -1624,7 +2036,7 @@ void EditorApp::handleShortcuts() {
                                  : "Panel maximized  (Shift+Space to restore)");
         } else if (m_split->maximizedSlot() != kSlotNone) {
             m_split->setMaximized(kSlotNone);
-            m_ctx->notify("Layout restored");
+            m_ctx->notify(TR("Layout restored"));
         }
     }
 
@@ -1695,6 +2107,12 @@ void EditorApp::handleShortcuts() {
 // ---------------------------------------------------------------- UI 编排
 
 void EditorApp::onImGui() {
+    // ⚠ 第一件事：把上一帧记下的"离屏目标尺寸变了"真正落地。
+    // 必须抢在**任何 UI 被构建之前** —— 重建会重新注册 ImGui 纹理，
+    // 而 UI 里 ImGui::Image 抓到的必须是重建**之后**的句柄（详见
+    // Renderer::applyPendingResizes 的注释：放晚一步就是拖窗口边框崩溃）。
+    renderer().applyPendingResizes();
+
     // E18：命令面板开着时**不让快捷键穿透** —— 那时面板的输入框在收字，
     // 若照跑 handleShortcuts，敲 "s" 会顺手触发吸附、敲数字会切视角。
     if (!m_showCommandPalette) handleShortcuts();
@@ -1923,7 +2341,7 @@ void EditorApp::drawStatusBar() {
 
     ImGui::TextUnformatted(m_ctx->status().c_str());
     ImGui::SameLine();
-    ImGui::TextDisabled("| history %zu/%zu",
+    ImGui::TextDisabled(TR("| history %zu/%zu"),
                         m_ctx->commands().cursor(),
                         m_ctx->commands().depth());
 
@@ -1934,10 +2352,10 @@ void EditorApp::drawStatusBar() {
     if (selCount == 1) {
         const std::string* np = m_ctx->activeScene().world().name(
             m_ctx->selection());
-        ImGui::TextDisabled("| selected: %d (%s)", selCount,
+        ImGui::TextDisabled(TR("| selected: %d (%s)"), selCount,
                             np ? np->c_str() : "unnamed");
     } else {
-        ImGui::TextDisabled("| selected: %d", selCount);
+        ImGui::TextDisabled(TR("| selected: %d"), selCount);
     }
 
     // 播放状态 + 实体计数：以前挤在工具条最右端（那条工具栏本来就很长，
@@ -1953,11 +2371,11 @@ void EditorApp::drawStatusBar() {
     const ImVec4 stateCol = playing ? ImVec4(0.55f, 0.85f, 0.55f, 1.0f)
                                     : (paused ? ImVec4(0.95f, 0.8f, 0.4f, 1.0f)
                                               : ImVec4(0.62f, 0.67f, 0.74f, 1.0f));
-    ImGui::TextDisabled("|");
+    ImGui::TextDisabled(TR("|"));
     ImGui::SameLine();
-    ImGui::TextColored(stateCol, "%s", stateText);
+    ImGui::TextColored(stateCol, TR("%s"), stateText);
     ImGui::SameLine();
-    ImGui::TextDisabled("| %zu entities (editor %zu / runtime %zu)",
+    ImGui::TextDisabled(TR("| %zu entities (editor %zu / runtime %zu)"),
                         m_ctx->activeScene().objectCount(),
                         m_ctx->editorScene().objectCount(),
                         m_ctx->runtimeScene().objectCount());
@@ -1965,49 +2383,49 @@ void EditorApp::drawStatusBar() {
     // ---- E21：保存状态 / 后台任务 / WARN-ERROR 计数（状态栏常驻四项）----
     // 保存状态：`*` 未保存（`dirty` 开关由 EditorContext 维护，保存即清）。
     ImGui::SameLine();
-    ImGui::TextDisabled("|");
+    ImGui::TextDisabled(TR("|"));
     ImGui::SameLine();
     if (m_ctx->dirty())
-        ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.40f, 1.0f), "* unsaved");
+        ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.40f, 1.0f), TR("* unsaved"));
     else
-        ImGui::TextDisabled("saved");
+        ImGui::TextDisabled(TR("saved"));
 
     // 后台任务数：>0 时点一下把进度条恢复出来（最小化后的归处）。
     const int nTasks = m_notifications->taskCount();
     ImGui::SameLine();
-    ImGui::TextDisabled("|");
+    ImGui::TextDisabled(TR("|"));
     ImGui::SameLine();
     if (nTasks > 0) {
         char label[48];
         std::snprintf(label, sizeof(label), "tasks %d", nTasks);
-        ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.95f, 1.0f), "%s", label);
+        ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.95f, 1.0f), TR("%s"), label);
         if (m_notifications->tasksMinimized() && ImGui::IsItemClicked())
             m_notifications->setTasksMinimized(false);
     } else {
-        ImGui::TextDisabled("tasks 0");
+        ImGui::TextDisabled(TR("tasks 0"));
     }
 
     // WARN / ERROR 计数：点一下打开 Console（"我刚错过了什么"的最短路径）。
     const int nErr = m_notifications->errorCount();
     const int nWarn = m_notifications->warnCount();
     ImGui::SameLine();
-    ImGui::TextDisabled("|");
+    ImGui::TextDisabled(TR("|"));
     ImGui::SameLine();
     if (nErr > 0) {
         const auto c = NotificationCenter::levelColor(core::LogLevel::Error);
-        ImGui::TextColored(ImVec4(c.r, c.g, c.b, 1.0f), "errors %d", nErr);
+        ImGui::TextColored(ImVec4(c.r, c.g, c.b, 1.0f), TR("errors %d"), nErr);
     } else {
-        ImGui::TextDisabled("errors 0");
+        ImGui::TextDisabled(TR("errors 0"));
     }
     const bool errClicked = ImGui::IsItemClicked();
     ImGui::SameLine();
-    ImGui::TextDisabled("|");
+    ImGui::TextDisabled(TR("|"));
     ImGui::SameLine();
     if (nWarn > 0) {
         const auto c = NotificationCenter::levelColor(core::LogLevel::Warn);
-        ImGui::TextColored(ImVec4(c.r, c.g, c.b, 1.0f), "warns %d", nWarn);
+        ImGui::TextColored(ImVec4(c.r, c.g, c.b, 1.0f), TR("warns %d"), nWarn);
     } else {
-        ImGui::TextDisabled("warns 0");
+        ImGui::TextDisabled(TR("warns 0"));
     }
     const bool warnClicked = ImGui::IsItemClicked();
     if ((errClicked || warnClicked) && m_notifications->historyCount() > 0) {
@@ -2018,11 +2436,11 @@ void EditorApp::drawStatusBar() {
     const int nUnread = m_notifications->unread();
     if (nUnread > 0) {
         ImGui::SameLine();
-        ImGui::TextDisabled("|");
+        ImGui::TextDisabled(TR("|"));
         ImGui::SameLine();
-        if (ImGui::SmallButton("notifications")) m_showNotificationHistory = true;
+        if (ImGui::SmallButton(TR("notifications"))) m_showNotificationHistory = true;
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.95f, 1.0f), "%d", nUnread);
+        ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.95f, 1.0f), TR("%d"), nUnread);
     }
 
     // 自动化锚点：上面四个数值任一变化就打一条 NOTIF-STATUSBAR（边沿触发）。
@@ -2033,7 +2451,7 @@ void EditorApp::drawStatusBar() {
         const float w = ImGui::CalcTextSize(m_ctx->notification().c_str()).x;
         ImGui::SameLine(std::max(ImGui::GetWindowWidth() - w - 20.0f, 300.0f));
         const float a = std::min(m_ctx->notificationTimer() / 0.6f, 1.0f);
-        ImGui::TextColored(ImVec4(0.55f, 0.9f, 0.6f, a), "%s",
+        ImGui::TextColored(ImVec4(0.55f, 0.9f, 0.6f, a), TR("%s"),
                            m_ctx->notification().c_str());
     }
 
@@ -2068,8 +2486,8 @@ void EditorApp::drawTransportBar() {
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
 
     // 与工具栏同色，看起来是视口下方一体的"控制条"
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,
-                          ImVec4(0.113f, 0.117f, 0.125f, 1.0f));
+    // ⚠ 走 token（同 Toolbar.cpp 的理由）：浅色主题下硬编码会留一条深色孤岛。
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::tokens().barBg);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 3.0f));
     if (!ImGui::Begin("##transport", nullptr, flags)) {
         ImGui::End();
@@ -2120,39 +2538,39 @@ void EditorApp::drawTransportBar() {
 
     // ---- 动画 Play / Pause / Stop ----
     ImGui::SameLine();
-    ImGui::TextDisabled("|");
+    ImGui::TextDisabled(TR("|"));
 
     ImGui::SameLine();
     ImGui::BeginDisabled(runActive || m_ctx->animPlaying());
     ImGui::PushStyleColor(ImGuiCol_Button, kPlayCol);
-    if (ImGui::Button("Play", ImVec2(btnW("Play"), 28.0f))) m_ctx->animPlay();
+    if (ImGui::Button(TR("Play"), ImVec2(btnW("Play"), 28.0f))) m_ctx->animPlay();
     ImGui::PopStyleColor();
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered() && !runActive) {
-        ImGui::SetTooltip("Run scripts as an animation **on the editing "
-                          "scene**.\nStop restores the scene from a snapshot.");
+        ImGui::SetTooltip(TR("Run scripts as an animation **on the editing "
+                          "scene**.\nStop restores the scene from a snapshot."));
     }
 
     ImGui::SameLine();
     ImGui::BeginDisabled(!m_ctx->animPlaying());
     ImGui::PushStyleColor(ImGuiCol_Button, kPauseCol);
-    if (ImGui::Button("Pause", ImVec2(btnW("Pause"), 28.0f)))
+    if (ImGui::Button(TR("Pause"), ImVec2(btnW("Pause"), 28.0f)))
         m_ctx->animPause();
     ImGui::PopStyleColor();
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Freeze the animation (state is kept).");
+        ImGui::SetTooltip(TR("Freeze the animation (state is kept)."));
     }
 
     ImGui::SameLine();
     ImGui::BeginDisabled(!m_ctx->animActive());
     ImGui::PushStyleColor(ImGuiCol_Button, kStopCol);
-    if (ImGui::Button("Stop", ImVec2(btnW("Stop"), 28.0f))) m_ctx->animStop();
+    if (ImGui::Button(TR("Stop"), ImVec2(btnW("Stop"), 28.0f))) m_ctx->animStop();
     ImGui::PopStyleColor();
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Stop the animation and restore the scene to\n"
-                          "how it looked when Play was pressed.");
+        ImGui::SetTooltip(TR("Stop the animation and restore the scene to\n"
+                          "how it looked when Play was pressed."));
     }
 
     // ================================================================
@@ -2160,11 +2578,16 @@ void EditorApp::drawTransportBar() {
     // ================================================================
     //
     // ⚠⚠ 这一整块**必须是灰阶配色**。
-    //   tools/verify_add_menu.py 的断言 2 是这样做的：扫这一行的所有像素，
-    //   取"高饱和"（max-min > 45）像素的质心，断言它落在 TR-BAR 水平正中
-    //   —— 也就是那四个彩色按钮组的中心。任何**彩色**控件出现在这一行都会
-    //   把质心拽偏，于是那条断言误报 FAIL（而按钮其实一动没动）。
-    //   所以下面所有 PushStyleColor 都刻意只给灰阶（max-min ≈ 6）。
+    //   tools/verify_add_menu.py 的断言 2 是这样做的：在 TR-BAR 的 x 区间内
+    //   扫这一行的高饱和（max-min > 45）像素，取它们的 [min,max] 中点，断言
+    //   它落在 TR-BAR 水平正中 —— 也就是那四个彩色按钮组的中心。任何**彩色**
+    //   控件出现在这一行**且落在 TR-BAR 里**都会把中点拽偏，于是那条断言
+    //   误报 FAIL（而按钮其实一动没动）。所以下面所有 PushStyleColor 都刻意
+    //   只给灰阶（max-min ≈ 6）。
+    //
+    //   （2026-10-16 修：该断言原先扫**整窗宽度**，于是右侧 Inspector 的
+    //     R/G/B 轴标签也能把它拽偏 —— 实测组中心被拽到 x=1020、条中心 774，
+    //     而 TR-BAR 之内其实只有 x∈[630,853]。现在扫描区间已夹进 TR-BAR。）
     //
     // 布局：这一块只吃**左侧**剩余空间（到彩色按钮组左边缘为止），
     // 右侧什么都不放 —— 对称留白，按钮的居中位置与改造前逐像素一致。
@@ -2175,20 +2598,35 @@ void EditorApp::drawTransportBar() {
     // 至少 24px。窗口更窄时整块**不画** —— 宁可少一排读数，也不让控件
     // 压到中间那四个彩色按钮上（那会同时破坏观感和像素断言）。
     if (leftBudget > 300.0f) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.21f, 0.23f, 1.0f));
+        // ⚠ 灰阶**不变**，但明度必须跟主题走：浅色主题下那片 0.20 的深灰片
+        //   配上深色正文 = 看不清。两条分支都是 max-min ≤ 6 的灰，所以上面
+        //   那条"高饱和像素中点居中"的断言在两种主题下都成立。
+        //   VennDark 走 else 分支 = 逐字段等于改动前的字面量。
+        const bool lt = ui::tokens().isLight;
+        ImGui::PushStyleColor(ImGuiCol_Button,
+                              lt ? ImVec4(0.80f, 0.81f, 0.83f, 1.0f)
+                                 : ImVec4(0.20f, 0.21f, 0.23f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                              ImVec4(0.26f, 0.27f, 0.30f, 1.0f));
+                              lt ? ImVec4(0.74f, 0.75f, 0.78f, 1.0f)
+                                 : ImVec4(0.26f, 0.27f, 0.30f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                              ImVec4(0.30f, 0.31f, 0.34f, 1.0f));
+                              lt ? ImVec4(0.70f, 0.71f, 0.74f, 1.0f)
+                                 : ImVec4(0.30f, 0.31f, 0.34f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_SliderGrab,
-                              ImVec4(0.42f, 0.43f, 0.46f, 1.0f));
+                              lt ? ImVec4(0.60f, 0.61f, 0.64f, 1.0f)
+                                 : ImVec4(0.42f, 0.43f, 0.46f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_SliderGrabActive,
-                              ImVec4(0.52f, 0.53f, 0.56f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.17f, 0.18f, 0.20f, 1.0f));
+                              lt ? ImVec4(0.50f, 0.51f, 0.54f, 1.0f)
+                                 : ImVec4(0.52f, 0.53f, 0.56f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,
+                              lt ? ImVec4(0.84f, 0.85f, 0.87f, 1.0f)
+                                 : ImVec4(0.17f, 0.18f, 0.20f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
-                              ImVec4(0.23f, 0.24f, 0.26f, 1.0f));
+                              lt ? ImVec4(0.78f, 0.79f, 0.82f, 1.0f)
+                                 : ImVec4(0.23f, 0.24f, 0.26f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
-                              ImVec4(0.27f, 0.28f, 0.31f, 1.0f));
+                              lt ? ImVec4(0.74f, 0.75f, 0.78f, 1.0f)
+                                 : ImVec4(0.27f, 0.28f, 0.31f, 1.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
                             ImVec2(st.FramePadding.x, 7.0f));
 
@@ -2200,7 +2638,7 @@ void EditorApp::drawTransportBar() {
             std::snprintf(buf, sizeof(buf), "f%-6d %.2fs",
                           static_cast<int>(clockT * 60.0f + 0.5f), clockT);
             ImGui::SetCursorPos(ImVec2(x, rowY + 4.0f));
-            ImGui::TextDisabled("%s", buf);
+            ImGui::TextDisabled(TR("%s"), buf);
             x += ImGui::CalcTextSize("f000000 00.00s").x + 10.0f;
         }
 
@@ -2227,8 +2665,8 @@ void EditorApp::drawTransportBar() {
                 ImGui::EndCombo();
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Playback speed (applies to scripts, "
-                                  "players and collision)");
+                ImGui::SetTooltip(TR("Playback speed (applies to scripts, "
+                                  "players and collision)"));
             }
             x += 74.0f + 8.0f;
         }
@@ -2241,7 +2679,7 @@ void EditorApp::drawTransportBar() {
             const bool canStep = m_ctx->animState() == AnimState::Paused;
             ImGui::SetCursorPos(ImVec2(x, rowY));
             ImGui::BeginDisabled(!canStep);
-            if (ImGui::Button("Step", ImVec2(56.0f, 28.0f))) {
+            if (ImGui::Button(TR("Step"), ImVec2(56.0f, 28.0f))) {
                 const float oneFrame = 1.0f / 60.0f;
                 m_ctx->advanceAnimTime(oneFrame);
                 runAnimScripts(oneFrame);
@@ -2267,9 +2705,9 @@ void EditorApp::drawTransportBar() {
                 else m_ctx->setAnimTime(scrub);
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Timeline: drag to scrub the script clock.\n"
+                ImGui::SetTooltip(TR("Timeline: drag to scrub the script clock.\n"
                                   "A real sequencer (keyframes / tracks) "
-                                  "lands with E24.");
+                                  "lands with E24."));
             }
         }
 
@@ -2297,7 +2735,7 @@ void EditorApp::drawStatsPanel() {
     ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(w660, 0.0f), ImGuiCond_FirstUseEver);
 
-    if (!ImGui::Begin("Stats", &m_ctx->panels().stats)) {
+    if (!ImGui::Begin(trId("Stats", "panel_stats"), &m_ctx->panels().stats)) {
         ImGui::End();
         return;
     }
@@ -2311,7 +2749,7 @@ void EditorApp::drawStatsPanel() {
     ftHist[119] = ftMs;
     std::memmove(fpsHist, fpsHist + 1, sizeof(float) * 119);
     fpsHist[119] = io.Framerate;
-    ImGui::Text("FPS: %.1f  (%.2f ms)", io.Framerate, ftMs);
+    ImGui::Text(TR("FPS: %.1f  (%.2f ms)"), io.Framerate, ftMs);
     ImGui::PlotLines("##ft-hist", ftHist, 120, 0, "frame time (ms) / 120f",
                      0.0f, 50.0f, ImVec2(-1.0f, 40.0f));
     ImGui::PlotLines("##fps-hist", fpsHist, 120, 0, "fps / 120f", 0.0f, 240.0f,
@@ -2323,20 +2761,20 @@ void EditorApp::drawStatsPanel() {
 
     // ================= 左栏：CPU 侧 =================
     const scene::Scene& sc = m_ctx->activeScene();
-    ImGui::Text("Viewport scene: %s",
+    ImGui::Text(TR("Viewport scene: %s"),
                 m_ctx->isEditing() ? "EDITOR" : "RUNTIME (playing)");
-    ImGui::Text("Entities: %zu", sc.objectCount());
+    ImGui::Text(TR("Entities: %zu"), sc.objectCount());
 
     const scene::Scene::LightStats ls = sc.lightStats();
-    ImGui::Text("Local lights: %zu (%zu point / %zu spot)",
+    ImGui::Text(TR("Local lights: %zu (%zu point / %zu spot)"),
                 ls.pointLights + ls.spotLights, ls.pointLights, ls.spotLights);
 
     ImGui::Separator();
     const VkExtent2D re = r.renderExtent();
-    ImGui::Text("Render target: %ux%u%s", re.width, re.height,
+    ImGui::Text(TR("Render target: %ux%u%s"), re.width, re.height,
                 r.viewportActive() ? " (offscreen -> ImGui)" : " (swapchain)");
-    ImGui::Text("MSAA: %ux", static_cast<unsigned>(r.sampleCount()));
-    ImGui::Text("Depth prepass: %s", r.depthPrePassEnabled() ? "on" : "off");
+    ImGui::Text(TR("MSAA: %ux"), static_cast<unsigned>(r.sampleCount()));
+    ImGui::Text(TR("Depth prepass: %s"), r.depthPrePassEnabled() ? "on" : "off");
 
     // ---- 物体级视锥剔除的实际效果 ----
     // "drawn / total"：实际提交的物体数 / 场景里可见的网格实体总数。
@@ -2345,14 +2783,14 @@ void EditorApp::drawStatsPanel() {
     {
         const render::Renderer::RenderStats& rs = r.renderStats();
         const uint32_t drawn = rs.drawnOpaque + rs.drawnTransparent;
-        ImGui::Text("Objects: %u drawn / %u", drawn, rs.renderables);
+        ImGui::Text(TR("Objects: %u drawn / %u"), drawn, rs.renderables);
         if (!r.frustumCullingEnabled()) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1.0f),
-                               "[frustum culling off]");
+                               TR("[frustum culling off]"));
         } else {
             ImGui::SameLine();
-            ImGui::TextDisabled("(culled %u, lights %u)", rs.culledFrustum,
+            ImGui::TextDisabled(TR("(culled %u, lights %u)"), rs.culledFrustum,
                                 rs.gizmosCulled);
         }
         // Hi-Z 遮挡剔除：occl = 本帧因"被挡住"没进绘制列表的物体数；
@@ -2360,10 +2798,10 @@ void EditorApp::drawStatsPanel() {
         if (r.occlusionCullingEnabled()) {
             const render::HiZStats& hs = r.hizStats();
             ImGui::SameLine();
-            ImGui::TextDisabled("| Hi-Z tested %u, occluded %u (%u mips)",
+            ImGui::TextDisabled(TR("| Hi-Z tested %u, occluded %u (%u mips)"),
                                 hs.objects, rs.culledOcclusion, hs.mipCount);
         }
-        ImGui::Text("Draw calls: %u   Triangles: %u", rs.drawCalls,
+        ImGui::Text(TR("Draw calls: %u   Triangles: %u"), rs.drawCalls,
                     rs.triangles);
 
         // ---- 空间索引（BVH）----
@@ -2371,7 +2809,7 @@ void EditorApp::drawStatsPanel() {
         // 子树真的被剪掉了；如果逼近 nodes，说明树建歪了（退化成了全遍历）。
         const scene::Scene::SpatialStats bs =
             m_ctx->activeScene().spatialStats();
-        ImGui::Text("BVH: %llu nodes / %llu objects / depth %llu, visits %u",
+        ImGui::Text(TR("BVH: %llu nodes / %llu objects / depth %llu, visits %u"),
                     static_cast<unsigned long long>(bs.nodes),
                     static_cast<unsigned long long>(bs.entities),
                     static_cast<unsigned long long>(bs.depth),
@@ -2385,35 +2823,35 @@ void EditorApp::drawStatsPanel() {
                 ? 100.0f * (1.0f - static_cast<float>(rs.triangles) /
                                      static_cast<float>(rs.trianglesNoLod))
                 : 0.0f;
-            ImGui::Text("LOD: %u ents  L0 %u / L1 %u / L2 %u / L3 %u",
+            ImGui::Text(TR("LOD: %u ents  L0 %u / L1 %u / L2 %u / L3 %u"),
                         rs.lodEntities, rs.lodLevelCounts[0],
                         rs.lodLevelCounts[1], rs.lodLevelCounts[2],
                         rs.lodLevelCounts[3]);
             ImGui::SameLine();
-            ImGui::TextDisabled("(tris %u vs %u, -%.0f%%)", rs.triangles,
+            ImGui::TextDisabled(TR("(tris %u vs %u, -%.0f%%)"), rs.triangles,
                                 rs.trianglesNoLod,
                                 static_cast<double>(saved));
         } else {
-            ImGui::TextDisabled("LOD: 没有带 LOD 链的可见物体");
+            ImGui::TextDisabled(TR("LOD: no visible objects with an LOD chain"));
         }
 
         // ---- 环境（天空盒 + IBL）----
         if (const render::Environment* env = r.environment()) {
             const render::Environment::Stats& es = env->stats();
-            ImGui::Text("Env: sky %u / irr %u / pref %u x%u mips / lut %u",
+            ImGui::Text(TR("Env: sky %u / irr %u / pref %u x%u mips / lut %u"),
                         es.skySize, es.irradianceSize, es.prefilterSize,
                         es.prefilterMips, es.lutSize);
             ImGui::SameLine();
-            ImGui::TextDisabled("(sky %s, IBL %s)",
+            ImGui::TextDisabled(TR("(sky %s, IBL %s)"),
                                 r.skyEnabled() ? "on" : "off",
                                 r.iblEnabled() ? "split-sum" : "approx");
         } else {
-            ImGui::TextDisabled("Env: 环境贴图未就绪");
+            ImGui::TextDisabled(TR("Env: environment maps not ready"));
         }
 
         // ---- 级联阴影（CSM）----
         if (const render::ShadowPass* sp = r.shadowPass()) {
-            ImGui::Text("Shadow: %u casc %ux%u  dist %.0fm  %s",
+            ImGui::Text(TR("Shadow: %u casc %ux%u  dist %.0fm  %s"),
                         sp->cascadeCount(), sp->resolution(), sp->resolution(),
                         static_cast<double>(sp->maxDistance()),
                         r.shadowsEnabled() ? "on" : "off");
@@ -2425,8 +2863,8 @@ void EditorApp::drawStatsPanel() {
             // "提交/考虑"就是每级裁剪空间剔除的效果：没有剔除时
             // 提交量会正好等于 考虑数 × 级联数。
             ImGui::TextDisabled(
-                "splits %.1f / %.1f / %.1f / %.1f | submitted %u of %u "
-                "(per-cascade cull)",
+                TR("splits %.1f / %.1f / %.1f / %.1f | submitted %u of %u "
+                "(per-cascade cull)"),
                 static_cast<double>(sp->split(0)),
                 static_cast<double>(sp->split(1)),
                 static_cast<double>(sp->split(2)),
@@ -2435,7 +2873,7 @@ void EditorApp::drawStatsPanel() {
 
         // ---- 局部光源阴影（点光 / 聚光灯）----
         if (const render::LocalShadowPass* lsp = r.localShadowPass()) {
-            ImGui::Text("Local shadow: %ux%u x %u layers, used %u  %s",
+            ImGui::Text(TR("Local shadow: %ux%u x %u layers, used %u  %s"),
                         lsp->resolution(), lsp->resolution(),
                         lsp->layerCount(), r.localShadowLayersUsed(),
                         r.localShadowsEnabled() ? "on" : "off");
@@ -2446,7 +2884,7 @@ void EditorApp::drawStatsPanel() {
             }
             // 与级联同理：没有逐层剔除时，提交量会等于 考虑数 × 用掉的层数。
             ImGui::TextDisabled(
-                "submitted %u of %u (per-layer cull) | max %u lamps",
+                TR("submitted %u of %u (per-layer cull) | max %u lamps"),
                 sub, con, r.localShadowMaxLights());
         }
 
@@ -2456,7 +2894,7 @@ void EditorApp::drawStatsPanel() {
         // switches 是每帧真的发生了几次 vkCmdBindPipeline —— 同材质的相邻
         // 物体只付一次，所以它通常远小于绘制数。
         if (r.forwardPipelines().initialized()) {
-            ImGui::Text("Shader vars: %u fwd + %u depth, %u switches",
+            ImGui::Text(TR("Shader vars: %u fwd + %u depth, %u switches"),
                         r.forwardPipelines().created(),
                         r.depthPrePipelines().created(), rs.variantSwitches);
 
@@ -2474,13 +2912,13 @@ void EditorApp::drawStatsPanel() {
                               rs.variantCounts[m]);
                 tip += tbuf;
             }
-            ImGui::TextDisabled("%s", vars.empty() ? "(本帧无前向变体绘制)"
+            ImGui::TextDisabled(TR("%s"), vars.empty() ? TR("(no forward variant draws this frame)")
                                                    : vars.c_str());
             // 掩码是位集合，"k5" 这种编号不看名字是读不出来的 → 悬停给出映射。
             if (!tip.empty() && ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("本帧各变体画了几个物体：\n%s"
+                ImGui::SetTooltip(TR("Objects drawn per forward variant this frame:\n%s"
                                   "\nbit0 double-sided / bit1 alpha-blend / "
-                                  "bit2 normal-map", tip.c_str());
+                                  "bit2 normal-map"), tip.c_str());
             }
 
             // 强制掩码：对照实验留下的印记。非 -1 时画面是被"篡改"过的，
@@ -2490,12 +2928,12 @@ void EditorApp::drawStatsPanel() {
                     r.forcedKeywordMask());
                 ImGui::TextColored(
                     ImVec4(0.95f, 0.72f, 0.35f, 1.0f),
-                    "FORCED mask %d: %s", r.forcedKeywordMask(),
+                    TR("FORCED mask %d: %s"), r.forcedKeywordMask(),
                     render::keywordNames(fm).c_str());
             }
         }
     }
-    ImGui::TextWrapped("GPU: %s", r.device().properties().deviceName);
+    ImGui::TextWrapped(TR("GPU: %s"), r.device().properties().deviceName);
 
     ImGui::Separator();
     // 播放状态（现在游戏就跑在视口里，没有第二个进程/窗口）
@@ -2507,29 +2945,29 @@ void EditorApp::drawStatsPanel() {
                          : m_ctx->isPaused()
                              ? ImVec4(0.95f, 0.8f, 0.4f, 1.0f)
                              : ImVec4(0.55f, 0.85f, 0.55f, 1.0f);
-    ImGui::TextColored(pbCol, "Playback: %s (in viewport)%s", pbState,
+    ImGui::TextColored(pbCol, TR("Playback: %s (in viewport)%s"), pbState,
                        (m_ctx->gameFullscreen() && !m_ctx->isEditing())
                            ? "  [fullscreen]"
                            : "");
     if (!m_ctx->isEditing()) {
-        ImGui::Text("Game time: %.2fs",
+        ImGui::Text(TR("Game time: %.2fs"),
                     static_cast<double>(m_ctx->playTime()));
-        ImGui::TextDisabled("Camera owned by the game (viewport takes no input)");
+        ImGui::TextDisabled(TR("Camera owned by the game (viewport takes no input)"));
     }
     // 视口导航灵敏度：编辑态相机的移动 / 旋转系数（右上角 HUD 可改）
-    ImGui::Text("View sensitivity: x%.2f",
+    ImGui::Text(TR("View sensitivity: x%.2f"),
                 static_cast<double>(m_ctx->navSensitivity()));
-    ImGui::Text("Editor %zu / runtime %zu entities",
+    ImGui::Text(TR("Editor %zu / runtime %zu entities"),
                 m_ctx->editorScene().objectCount(),
                 m_ctx->runtimeScene().objectCount());
-    ImGui::Text("Scripts loaded: %zu", m_scripts->scriptCount());
+    ImGui::Text(TR("Scripts loaded: %zu"), m_scripts->scriptCount());
 
     // ================= 右栏：GPU 侧（时戳剖析）=================
     ImGui::NextColumn();
     if (const render::GpuTimer* gt = r.gpuTimer()) {
         if (gt->valid() && gt->lastTotalMs() >= 0.0f) {
             const float total = gt->lastTotalMs();
-            ImGui::Text("GPU: %.2f ms/frame", total);
+            ImGui::Text(TR("GPU: %.2f ms/frame"), total);
 
             // ---- E15 时戳堆叠条形图：10 段按占比横向铺满一条 ----
             // 一眼看出哪个 pass 最贵；悬停读精确毫秒（R0-1 的数据早就
@@ -2574,7 +3012,7 @@ void EditorApp::drawStatsPanel() {
                 for (uint32_t s = 0; s < render::GpuTimer::kSectionCount; ++s) {
                     a += (total > 0.0f) ? gt->lastMs(s) / total : 0.0f;
                     if (rel <= a) {
-                        ImGui::SetTooltip("%s  %.3f ms  (%.1f%%)",
+                        ImGui::SetTooltip(TR("%s  %.3f ms  (%.1f%%)"),
                                           gt->sectionName(s),
                                           static_cast<double>(gt->lastMs(s)),
                                           static_cast<double>(
@@ -2596,18 +3034,18 @@ void EditorApp::drawStatsPanel() {
                                        ImGuiColorEditFlags_NoTooltip,
                                        ImVec2(10.0f, 10.0f));
                     ImGui::SameLine();
-                    ImGui::Text("%s %.2f", gt->sectionName(s),
+                    ImGui::Text(TR("%s %.2f"), gt->sectionName(s),
                                 static_cast<double>(ms));
                 } else {
                     ImGui::ColorButton("##chip", ImVec4(0.3f, 0.3f, 0.33f, 1.0f),
                                        ImGuiColorEditFlags_NoTooltip,
                                        ImVec2(10.0f, 10.0f));
                     ImGui::SameLine();
-                    ImGui::TextDisabled("%s -", gt->sectionName(s));
+                    ImGui::TextDisabled(TR("%s -"), gt->sectionName(s));
                 }
             }
         } else {
-            ImGui::TextDisabled("GPU: 时戳数据未就绪");
+            ImGui::TextDisabled(TR("GPU: timestamp data not ready"));
         }
     }
 
@@ -2625,71 +3063,71 @@ void EditorApp::drawScriptPanel() {
     ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(kFloatW, kScriptsH), ImGuiCond_FirstUseEver);
 
-    if (!ImGui::Begin("Scripts", &m_ctx->panels().scripts)) {
+    if (!ImGui::Begin(trId("Scripts", "panel_scripts"), &m_ctx->panels().scripts)) {
         ImGui::End();
         return;
     }
 
-    ImGui::TextDisabled("Language: .vks (see editor/script/ScriptEngine.h)");
-    if (ImGui::Button("Reload all")) {
+    ImGui::TextDisabled(TR("Language: .vks (see engine/script/ScriptEngine.h)"));
+    if (ImGui::Button(TR("Reload all"))) {
         const int n = m_scripts->pollHotReload();
         for (const std::string& p : m_scripts->loadedPaths()) {
             m_scripts->reloadNow(p);
         }
-        m_ctx->notify("Reloaded " + std::to_string(n) +
-                      " changed script(s) + forced all");
+        m_ctx->notify(std::string(TR("Reloaded ")) + std::to_string(n) +
+                      TR(" changed script(s), forced all"));
     }
     ImGui::SameLine();
-    ImGui::Text("hot-reload scan: 0.5s");
+    ImGui::Text(TR("hot-reload scan: 0.5s"));
 
     ImGui::Separator();
     if (ImGui::BeginTabBar("##scripttabs")) {
         if (ImGui::BeginTabItem("Loaded")) {
             for (const std::string& p : m_scripts->loadedPaths()) {
-                ScriptAsset* a = m_scripts->get(p);
+                vks::ScriptAsset* a = m_scripts->get(p);
                 if (!a) continue;
                 const bool bad = !a->lastError().ok();
                 ImGui::TextColored(bad ? ImVec4(1.0f, 0.5f, 0.45f, 1.0f)
                                        : ImVec4(0.6f, 0.9f, 0.6f, 1.0f),
-                                   "%s  (#%llu)", p.c_str(),
+                                   TR("%s  (#%llu)"), p.c_str(),
                                    static_cast<unsigned long long>(
                                        a->reloadCount()));
                 if (bad) {
                     ImGui::SameLine();
-                    ImGui::TextDisabled("<- %s",
+                    ImGui::TextDisabled(TR("<- %s"),
                                         a->lastError().toString().c_str());
                 }
                 ImGui::SameLine();
                 ImGui::PushID(p.c_str());
-                if (ImGui::SmallButton("reload")) m_scripts->reloadNow(p);
+                if (ImGui::SmallButton(TR("reload"))) m_scripts->reloadNow(p);
                 ImGui::PopID();
             }
             if (m_scripts->scriptCount() == 0)
-                ImGui::TextDisabled("(the scene references no scripts)");
+                ImGui::TextDisabled(TR("(the scene references no scripts)"));
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Log")) {
             ImGui::BeginChild("##log");
             const auto& log = m_scripts->log();
-            for (const std::string& s : log) ImGui::TextWrapped("%s", s.c_str());
+            for (const std::string& s : log) ImGui::TextWrapped(TR("%s"), s.c_str());
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("How it works")) {
             ImGui::BeginChild("##howto");
             ImGui::TextWrapped(
-                "In edit mode scripts are only PRE-COMPILED: syntax errors "
-                "show up immediately, but nothing runs and nothing animates.");
+                TR("In edit mode scripts are only PRE-COMPILED: syntax errors "
+                "show up immediately, but nothing runs and nothing animates."));
             ImGui::Spacing();
             ImGui::TextWrapped(
-                "Press Play and they execute every frame on the runtime copy "
+                TR("Press Play and they execute every frame on the runtime copy "
                 "of the scene - which is exactly what the viewport renders. "
                 "Stop discards that copy, so the scene you edited is never "
-                "touched.");
+                "touched."));
             ImGui::Spacing();
             ImGui::TextWrapped(
-                "Hot reload: save the .vks file and it is picked up within "
-                "0.5s, even while playing.");
+                TR("Hot reload: save the .vks file and it is picked up within "
+                "0.5s, even while playing."));
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
@@ -2714,7 +3152,7 @@ void EditorApp::drawEnginePanel() {
         ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(kFloatW, kScriptsH), ImGuiCond_FirstUseEver);
 
-    if (!ImGui::Begin("Engine", &m_ctx->panels().engine)) {
+    if (!ImGui::Begin(trId("Engine", "panel_engine"), &m_ctx->panels().engine)) {
         ImGui::End();
         return;
     }
@@ -2722,13 +3160,13 @@ void EditorApp::drawEnginePanel() {
     // ---- 顶栏：档位（100+ 旋钮平铺没人能用，默认只给 Basic）+ 搜索 ----
     static int tier = 0;               // 0=Basic 1=Advanced 2=Debug
     static char search[64] = "";
-    ImGui::TextUnformatted("Show");
+    ImGui::TextUnformatted(TR("Show"));
     ImGui::SameLine();
-    ImGui::RadioButton("Basic", &tier, 0);
+    ImGui::RadioButton(TR("Basic"), &tier, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Adv", &tier, 1);
+    ImGui::RadioButton(TR("Adv"), &tier, 1);
     ImGui::SameLine();
-    ImGui::RadioButton("Debug", &tier, 2);
+    ImGui::RadioButton(TR("Debug"), &tier, 2);
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputTextWithHint("##ftrsearch", "Search features / params...",
                              search, sizeof(search));
@@ -2746,6 +3184,10 @@ void EditorApp::drawEnginePanel() {
         }
         ImGui::EndCombo();
     }
+
+    // ---- E03：设置文件（覆盖链概览 + Export/Reload）----
+    // 放在生成区**之前**：它管的是整份文件，不该沉到三十多个特性块后面。
+    drawEngineSettingsIO();
 
     // ---- 生成区：全部特性按 registry 的 group 分节，逐块生成 ----
     const char* lastGroup = nullptr;
@@ -2767,6 +3209,71 @@ void EditorApp::drawEnginePanel() {
     ImGui::End();
 }
 
+// ------------------------------------------------ E03 设置层级（覆盖链）
+
+void EditorApp::drawEngineSettingsIO() {
+    render::SettingsChain& chain = render::activeChain();
+    const std::string path = render::projectSettingsPath();
+    const render::SettingsLayer* proj =
+        chain.layer(render::SettingScope::Project);
+
+    // 刻意做得**很矮**（一行按钮 + 一行状态）：它放在面板**顶部**是有理由的
+    // —— 放到三十多个特性块后面就得靠滚动条才找得到，而它管的是"整份文件"。
+    ImGui::SeparatorText(TR("Settings file"));
+    if (ImGui::Button(TR("Export current"))) saveRenderSettings(true);
+    logRect("SET-EXPORT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Write every non-default parameter to:\n%s"),
+                          path.c_str());
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Reload from disk"))) render::reloadFromDisk();
+    logRect("SET-RELOAD", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Re-read the file and apply it now (unsaved "
+                             "edits are lost)."));
+    }
+    ImGui::SameLine();
+    if (proj && proj->present) {
+        ImGui::Text(TR("%zu override(s)"), proj->values.size());
+        if (proj->rejected > 0) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.62f, 0.2f, 1.0f),
+                               TR("(%d rejected — see Console)"),
+                               proj->rejected);
+        }
+    } else {
+        ImGui::TextDisabled(TR("no file — all defaults"));
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Chain: %s"), chain.describe().c_str());
+    }
+}
+
+// E03：落盘。
+// `explicitExport == false` 是"用户改过参数"的自动保存（关闭时一次），
+// true 是面板上的 Export 按钮。两者都受同一条守卫约束：
+// **自动化运行一律不写** —— 否则一次测试跑就会在仓库里留下一个 json，
+// 把所有像素基线悄悄换掉。
+void EditorApp::saveRenderSettings(bool explicitExport) {
+    if (render::renderSettingsAutomationRun()) {
+        VK_LOG_INFO("RENDER-SET not saved (automation run)");
+        return;
+    }
+    render::SettingsLayer layer =
+        render::captureFromRegistry(render::SettingScope::Project);
+    if (layer.empty() && !explicitExport) {
+        m_renderSettingsDirty = 0;
+        return;   // 全默认 → 不生成文件（"无文件 = 无覆盖"的语义）
+    }
+    layer.source = render::projectSettingsPath();
+    if (render::saveLayerFile(layer, layer.source)) {
+        m_renderSettingsDirty = 0;
+        // 让面板上的"覆盖数"立刻反映刚写下去的内容
+        render::activeChain().setLayer(layer);
+    }
+}
+
 // ---------------------------------------- E09 特殊块（生成器表达不了的）
 
 void EditorApp::drawEngineCameras() {
@@ -2776,12 +3283,12 @@ void EditorApp::drawEngineCameras() {
     scene::Scene& sc = activeScene();
     int camIdx = static_cast<int>(r.viewCameraIndex());
     const int camCount = std::max(1, static_cast<int>(sc.cameraCount()));
-    ImGui::SeparatorText("Cameras");
-    ImGui::Text("Cameras: %d", camCount);
+    ImGui::SeparatorText(TR("Cameras"));
+    ImGui::Text(TR("Cameras: %d"), camCount);
     ImGui::SameLine();
-    if (ImGui::SmallButton("Add")) sc.addCamera();
+    if (ImGui::SmallButton(TR("Add"))) sc.addCamera();
     ImGui::SameLine();
-    if (ImGui::SmallButton("Copy 1st -> current")) {
+    if (ImGui::SmallButton(TR("Copy 1st -> current"))) {
         if (sc.cameraCount() > 1) {
             sc.camera(static_cast<size_t>(camIdx)) = sc.camera(0);
         }
@@ -2801,13 +3308,13 @@ void EditorApp::drawEngineViewMode() {
         "Wireframe", "Overdraw", "Light Complexity"};
     int vmIdx = static_cast<int>(r.viewMode());
     ImGui::SetNextItemWidth(140.0f);
-    if (ImGui::Combo("View mode", &vmIdx, kViewModeLabels, 8)) {
+    if (ImGui::Combo(TR("View mode"), &vmIdx, kViewModeLabels, 8)) {
         r.setViewMode(static_cast<render::Renderer::ViewMode>(vmIdx));
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
-            "Lit = 默认渲染（基线）\n"
-            "Wireframe 需设备支持 fillModeNonSolid");
+            TR("Lit = default rendering (baseline)\n"
+            "Wireframe requires device support for fillModeNonSolid"));
     }
     static bool vmTagged = false;
     if (!vmTagged) {
@@ -2834,7 +3341,7 @@ void EditorApp::drawEngineMsaa() {
     }
     const char* kMsaaLabels[4] = {"1x (off)", "2x", "4x", "8x"};
     ImGui::SetNextItemWidth(120.0f);
-    if (ImGui::Combo("MSAA##samples", &msaaIdx, kMsaaLabels, 4)) {
+    if (ImGui::Combo(TR("MSAA##samples"), &msaaIdx, kMsaaLabels, 4)) {
         VkSampleCountFlagBits bits = VK_SAMPLE_COUNT_4_BIT;
         switch (kMsaaItems[msaaIdx]) {
             case 1: bits = VK_SAMPLE_COUNT_1_BIT; break;
@@ -2848,18 +3355,18 @@ void EditorApp::drawEngineMsaa() {
 
 void EditorApp::drawEngineClusterStats() {
     render::Renderer& r = renderer();
-    ImGui::SeparatorText("Cluster stats");
+    ImGui::SeparatorText(TR("Cluster stats"));
     const render::ClusterStats& cs = r.clusteredLighting().stats();
     const render::ClusterConfig& cfg = r.clusteredLighting().config();
-    ImGui::Text("Grid: %u x %u x %u (tile %u px)", cs.clusterX, cs.clusterY,
+    ImGui::Text(TR("Grid: %u x %u x %u (tile %u px)"), cs.clusterX, cs.clusterY,
                 cs.clusterZ, cfg.tileSize);
-    ImGui::Text("Lights/cluster: avg %.2f  max %u / %u",
+    ImGui::Text(TR("Lights/cluster: avg %.2f  max %u / %u"),
                 cs.avgLightsPerCluster(), cs.maxLightsInCluster,
                 cfg.maxLightsPerCluster);
-    ImGui::Text("Empty clusters: %u", cs.emptyClusters);
+    ImGui::Text(TR("Empty clusters: %u"), cs.emptyClusters);
     if (cs.overflowed())
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.2f, 1.0f),
-                           "Overflow: %u clusters truncated!",
+                           TR("Overflow: %u clusters truncated!"),
                            cs.overflowClusters);
 }
 
@@ -2867,6 +3374,8 @@ void EditorApp::drawEngineClusterStats() {
 
 void EditorApp::onFeatureParamChanged(const char* paramId) {
     VK_LOG_INFO("FTR-UI %s", paramId);
+    // E03：用户真的动过参数 → 关闭时要落盘（"首次改参数时才写文件"）。
+    ++m_renderSettingsDirty;
     // 生成器只会写"值"；个别参数还伴随"动作"，集中在这里处理：
     if (std::strcmp(paramId, "rp.bindless") == 0) {
         // bindless 切换要重建前向管线。生成器已把成员写成新值，而
@@ -3008,19 +3517,19 @@ void EditorApp::registerConsoleCommands() {
 
     auto* con = m_console.get();
 
-    con->addCommand("help", "列出全部命令", [con](const std::vector<std::string>&) {
+    con->addCommand("help", "List all commands", [con](const std::vector<std::string>&) {
         return std::string(
             "help / clear / set <id> <v> / get <id> / reset <id|feature> / "
             "params <feature> / preset <Low|Medium|High|Epic|Cinematic> / "
             "stat gpu / insp.selftest / undo.selftest / notif.push|dump|click|"
             "task|progress|cancel|done");
     });
-    con->addCommand("clear", "清空日志缓冲",
+    con->addCommand("clear", "Clear the log buffer",
                     [con](const std::vector<std::string>&) {
                         con->clear();
                         return std::string();
                     });
-    con->addCommand("set", "set <paramId> <value>  写注册表参数（特性 id 等价于 <id>.enabled）",
+    con->addCommand("set", "set <paramId> <value>  write a registry param (a feature id means <id>.enabled)",
         [resolveParam](const std::vector<std::string>& args) -> std::string {
             if (args.size() < 3) return "usage: set <paramId> <value>";
             const ParamDesc* p = resolveParam(args[1]);
@@ -3046,7 +3555,7 @@ void EditorApp::registerConsoleCommands() {
             editor::emitParamChange(p->id);   // 与 UI 路径同一套副作用
             return p->id + std::string(" = ") + v;
         });
-    con->addCommand("get", "get <paramId>  读注册表参数当前值",
+    con->addCommand("get", "get <paramId>  read the current value of a registry param",
         [resolveParam](const std::vector<std::string>& args) -> std::string {
             if (args.size() < 2) return "usage: get <paramId>";
             const ParamDesc* p = resolveParam(args[1]);
@@ -3079,7 +3588,7 @@ void EditorApp::registerConsoleCommands() {
             }
             return buf;
         });
-    con->addCommand("reset", "reset <paramId|featureId>  恢复默认",
+    con->addCommand("reset", "reset <paramId|featureId>  restore defaults",
         [](const std::vector<std::string>& args) -> std::string {
             if (args.size() < 2) return "usage: reset <paramId|featureId>";
             if (const render::FeatureDesc* f = render::findFeature(args[1].c_str())) {
@@ -3096,7 +3605,7 @@ void EditorApp::registerConsoleCommands() {
             }
             return "unknown param or feature '" + args[1] + "'";
         });
-    con->addCommand("params", "params <featureId>  列出某特性的全部参数",
+    con->addCommand("params", "params <featureId>  list every param of a feature",
         [](const std::vector<std::string>& args) -> std::string {
             if (args.size() < 2) return "usage: params <featureId>";
             const render::FeatureDesc* f =
@@ -3121,7 +3630,7 @@ void EditorApp::registerConsoleCommands() {
                 }
             return "unknown preset '" + args[1] + "'";
         });
-    con->addCommand("stat", "stat gpu  往控制台打一份 GPU 时戳",
+    con->addCommand("stat", "stat gpu  print a GPU timestamp report to the console",
         [this](const std::vector<std::string>& args) -> std::string {
             if (args.size() < 2 || args[1] != "gpu") return "usage: stat gpu";
             const render::GpuTimer* gt = renderer().gpuTimer();
@@ -3139,7 +3648,7 @@ void EditorApp::registerConsoleCommands() {
     // E11：Inspector 自检（剪贴板往返 / Reset / 折叠持久化）。
     // 日志形如 INSP-SELFTEST copy-paste=OK reset=OK collapse-persist=OK，
     // 供 tools/verify_inspector.py 断言。
-    con->addCommand("insp.selftest", "insp.selftest  Inspector 剪贴板/重置自检",
+    con->addCommand("insp.selftest", "insp.selftest  Inspector clipboard/reset self-test",
         [this](const std::vector<std::string>&) -> std::string {
             std::string out;
             const bool ok = m_inspector->selfTest(out);
@@ -3155,7 +3664,7 @@ void EditorApp::registerConsoleCommands() {
     // 日志形如 UNDO-SELFTEST param=ssr.strength kind=4 merged=1 undoOk=1
     // redoOk=1 restored=1 depthDelta=0，供 tools/verify_undo_settings.py 断言。
     con->addCommand("undo.selftest",
-                    "undo.selftest [paramId]  设置类改动撤销自检",
+                    "undo.selftest [paramId]  self-test for undoing setting changes",
         [this](const std::vector<std::string>& args) -> std::string {
             const std::string pid = args.size() > 1 ? args[1] : "ssr.strength";
             const render::ParamDesc* p = render::findParam(pid.c_str());
@@ -3237,7 +3746,7 @@ void EditorApp::registerConsoleCommands() {
     //   notif.click <idx>              模拟点第 idx 条 toast（UI 与脚本同一条路）
     //   notif.task / notif.cancel / notif.progress   进度任务的手动驱动
     con->addCommand("notif.push",
-                    "notif.push <info|warn|error> <text>  弹一条通知",
+                    "notif.push <info|warn|error> <text>  raise a notification",
         [this](const std::vector<std::string>& args) -> std::string {
             if (args.size() < 3)
                 return "usage: notif.push <info|warn|error> <text>";
@@ -3257,7 +3766,7 @@ void EditorApp::registerConsoleCommands() {
                 return "unknown level '" + lv + "' (info|warn|error)";
             return "pushed " + lv;
         });
-    con->addCommand("notif.dump", "notif.dump  通知 / 进度计数快照",
+    con->addCommand("notif.dump", "notif.dump  snapshot of notification / progress counts",
         [this](const std::vector<std::string>&) -> std::string {
             char buf[256];
             std::snprintf(buf, sizeof(buf),
@@ -3274,14 +3783,14 @@ void EditorApp::registerConsoleCommands() {
             return buf;
         });
     con->addCommand("notif.click",
-                    "notif.click <idx>  模拟点第 idx 条 toast（0 = 最上面那条）",
+                    "notif.click <idx>  simulate clicking toast #idx (0 = topmost)",
         [this](const std::vector<std::string>& args) -> std::string {
             const int idx = args.size() > 1 ? std::atoi(args[1].c_str()) : 0;
             if (m_notifications->toastCount() == 0) return "no toasts";
             m_notifications->clickToast(idx);
             return "clicked toast " + std::to_string(idx);
         });
-    con->addCommand("notif.task", "notif.task <id> <title...>  起一个进度任务",
+    con->addCommand("notif.task", "notif.task <id> <title...>  start a progress task",
         [this](const std::vector<std::string>& args) -> std::string {
             if (args.size() < 3) return "usage: notif.task <id> <title...>";
             std::string title;
@@ -3293,7 +3802,7 @@ void EditorApp::registerConsoleCommands() {
             return "task started: " + args[1];
         });
     con->addCommand("notif.progress",
-                    "notif.progress <id> <0..1>  推进任务进度",
+                    "notif.progress <id> <0..1>  advance task progress",
         [this](const std::vector<std::string>& args) -> std::string {
             if (args.size() < 3) return "usage: notif.progress <id> <0..1>";
             const float p = std::strtof(args[2].c_str(), nullptr);
@@ -3301,13 +3810,13 @@ void EditorApp::registerConsoleCommands() {
                 return "task '" + args[1] + "' cancelled or gone";
             return "progress " + args[1] + " = " + args[2];
         });
-    con->addCommand("notif.cancel", "notif.cancel <id>  请求取消任务",
+    con->addCommand("notif.cancel", "notif.cancel <id>  request task cancellation",
         [this](const std::vector<std::string>& args) -> std::string {
             if (args.size() < 2) return "usage: notif.cancel <id>";
             m_notifications->requestCancel(args[1]);
             return "cancel requested: " + args[1];
         });
-    con->addCommand("notif.done", "notif.done <id>  结束任务",
+    con->addCommand("notif.done", "notif.done <id>  finish a task",
         [this](const std::vector<std::string>& args) -> std::string {
             if (args.size() < 2) return "usage: notif.done <id>";
             m_notifications->endTask(args[1]);
@@ -3366,8 +3875,8 @@ void EditorApp::registerEditorCommands() {
     for (int i = 0; i < static_cast<int>(pt.size()); ++i) {
         CommandDesc c;
         c.id = std::string("panel.toggle.") + pt[i].id;
-        c.label = std::string("Toggle Panel: ") + pt[i].title;
-        c.category = "View";
+        c.label = std::string(TR("Toggle Panel: ")) + TR(pt[i].title);
+        c.category = TR("View");
         c.shortcut = pt[i].shortcut ? pt[i].shortcut : "";
         c.keywords = std::string("panel window ") + pt[i].id;
         c.run = [this, i]() {
@@ -3393,7 +3902,7 @@ void EditorApp::registerEditorCommands() {
     for (int i = 0; i < kWorkspaceCount; ++i) {
         CommandDesc c;
         c.id = "workspace." + std::to_string(i);
-        c.label = std::string("Workspace: ") + workspaceTitle(i);
+        c.label = std::string(TR("Workspace: ")) + TR(workspaceTitle(i));
         c.category = "View";
         if (i < 9) c.shortcut = "Ctrl+Alt+" + std::to_string(i + 1);
         c.keywords = std::string("workspace layout ") + workspaceId(i);
@@ -3514,7 +4023,7 @@ void EditorApp::registerEditorCommands() {
         c.run = [this]() {
             m_ctx->relayout() = true;
             resetPanelStateToDefaults();
-            m_ctx->notify("Layout reset");
+            m_ctx->notify(TR("Layout reset"));
         };
         reg.add(std::move(c));
     }
@@ -3569,8 +4078,11 @@ void EditorApp::drawSettingsPanel() {
     //   面板也叫 "settings"，imgui.ini 里残留它的 Pos/Size —— 沿用旧 ID
     //   会让新大窗口继承一个陈旧位置（甚至被 clamp 到屏幕角落，实测踩过）。
     //   换新 ID 与旧记录切割，首帧 Appearing 居中才生效。
-    if (!ImGui::Begin("Preferences###prefs", &m_ctx->showSettings(),
+    if (!ImGui::Begin(trId("Preferences", "prefs"), &m_ctx->showSettings(),
                       ImGuiWindowFlags_NoCollapse)) {
+        // 窗口被关掉（或折叠）时这一帧谁也画不到 —— 捕获必须收掉，
+        // 否则全局快捷键会一直被挡着。
+        m_ctx->endInputCapture();
         ImGui::End();
         return;
     }
@@ -3594,55 +4106,70 @@ void EditorApp::drawSettingsPanel() {
     ImGui::InputTextWithHint("##prefs_search", "Search settings...", search,
                              sizeof(search));
     ImGui::SameLine();
-    if (ImGui::Button("Save")) savePrefsToDisk();
+    if (ImGui::Button(TR("Save"))) savePrefsToDisk();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("把当前偏好写进 %s（退出时也会自动保存）",
+        ImGui::SetTooltip(TR("Write current preferences to %s (also saved automatically on exit)"),
                           editorPrefsPath().c_str());
     ImGui::SameLine();
-    if (ImGui::Button("Reload")) {
+    if (ImGui::Button(TR("Reload"))) {
         applyPrefsFromDisk();
-        m_ctx->notify("Preferences reloaded from disk");
+        applyAppearance();
+        m_ctx->notify(TR("Preferences reloaded from disk"));
     }
     ImGui::SameLine();
     if (!m_confirmResetAll) {
-        if (ImGui::Button("Reset All")) m_confirmResetAll = true;
+        if (ImGui::Button(TR("Reset All"))) m_confirmResetAll = true;
     } else {
         // 二次确认：第一次点击只进入"确认态"（按钮变红），再点才真清
         ImGui::PushStyleColor(ImGuiCol_Button,
                               ImVec4(0.65f, 0.22f, 0.18f, 1.0f));
-        if (ImGui::Button("Confirm reset all?")) {
+        if (ImGui::Button(TR("Confirm reset all?"))) {
             for (const PrefItem& it : prefsTable()) {
+                if (!it.options.empty()) {
+                    const int n = static_cast<int>(it.options.size());
+                    const int d = std::clamp(static_cast<int>(it.def), 0, n - 1);
+                    if (it.setChoice) it.setChoice(d);
+                    continue;
+                }
                 void* p = it.ptr(*this);
                 if (it.isBool)
                     *static_cast<bool*>(p) = (it.def > 0.5f);
                 else
                     *static_cast<float*>(p) = it.def;
             }
+            applyAppearance();
             m_confirmResetAll = false;
             savePrefsToDisk();
-            m_ctx->notify("All preferences reset to defaults");
+            m_ctx->notify(TR("All preferences reset to defaults"));
         }
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        if (ImGui::SmallButton("cancel")) m_confirmResetAll = false;
+        if (ImGui::SmallButton(TR("cancel"))) m_confirmResetAll = false;
     }
 
     // ---- 左侧分类标签 ----
-    static int page = 0;
-    static const char* kPages[] = {"Interface", "Viewport", "Editing",
-                                   "Keymap",    "Scene"};
+    //
+    // 页表提到了**文件作用域**（kPrefsPages）：页签要能被自动化按名字选中
+    // （MYVK_EDITOR_PREFS_PAGE=Bindings），而那个初值在函数一开始就要用，
+    // 局部 static 数组在这一行还没声明。
+    static int page = prefsPageFromEnv();
+    constexpr int kPageCount = kPrefsPageCount;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                          ImVec4(0.09f, 0.095f, 0.105f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::tokens().panelBg);
     ImGui::BeginChild("##prefs_nav", ImVec2(168.0f, 0.0f),
                       ImGuiChildFlags_Borders);
     ImGui::PopStyleColor();
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 3.0f));
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
-    for (int i = 0; i < 5; ++i) {
-        if (ImGui::Selectable(kPages[i], page == i)) {
+    for (int i = 0; i < kPageCount; ++i) {
+        if (ImGui::Selectable(TR(kPrefsPages[i]), page == i)) {
             page = i;
         }
+        // 自动化锚点：分类页签矩形（tag 只能含字母/连字符 → 用英文页名，
+        // 不能用下标数字，见 tools/verify_add_menu.py 的 RECT_RE）。
+        // 语言切换不影响它（页名是**逻辑**名，不随界面语言变）。
+        logRect((std::string("PREFS-TAB-") + kPrefsPages[i]).c_str(),
+                ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     }
     ImGui::PopStyleVar();
     ImGui::EndChild();
@@ -3653,86 +4180,110 @@ void EditorApp::drawSettingsPanel() {
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
 
     const std::vector<PrefItem>& table = prefsTable();
-    auto drawCategory = [this, &table](const char* cat) {
-        ImGui::SeparatorText(cat);
+    auto drawCategory = [this, &table](const char* cat, const char* note = nullptr) {
+        // ⚠ SeparatorText 只吃显示文本；分类**键**保持英文（表里的
+        //   category 字段就是键，翻译只发生在画出来的这一层）。
+        ImGui::SeparatorText(TR(cat));
+        // 分类级的说明**不上屏**：标题右边挂一个 "(?)"，悬浮才展开
+        //（2026-10-17 用户要求：面板上只留控件，解释走 tooltip）。
+        if (note && note[0]) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(?)");
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                ImGui::SetTooltip("%s", note);
+        }
         for (const PrefItem& it : table)
             if (std::strcmp(it.category, cat) == 0) drawPrefRow(it);
     };
 
     if (search[0]) {
-        // ---- E17 搜索模式：跨分类平铺命中项（label / id / 分类名）----
+        // ---- E17 搜索模式：跨分类平铺命中项（label / id / 分类名 / 选项名）----
         const char* lastCat = nullptr;
         int hits = 0;
         for (const PrefItem& it : table) {
-            const bool hit = prefMatch(it.label, search) ||
-                             prefMatch(it.id, search) ||
-                             prefMatch(it.category, search);
+            bool hit = prefMatch(it.label, search) ||
+                       prefMatch(it.id, search) ||
+                       prefMatch(it.category, search);
+            for (const char* o : it.options) {
+                if (hit) break;
+                hit = prefMatch(o, search) || prefMatch(TR(o), search);
+            }
             if (!hit) continue;
             if (!lastCat || std::strcmp(lastCat, it.category) != 0) {
-                ImGui::SeparatorText(it.category);
+                ImGui::SeparatorText(TR(it.category));
                 lastCat = it.category;
             }
             drawPrefRow(it);
             ++hits;
         }
         if (hits == 0)
-            ImGui::TextDisabled("(no settings match '%s')", search);
+            ImGui::TextDisabled(TR("(no settings match '%s')"), search);
     } else if (page == 0) {
         drawCategory("Interface");
     } else if (page == 1) {
-        drawCategory("Navigation");
-        ImGui::TextDisabled("(also editable in the viewport HUD; "
-                            "hold RMB + wheel to adjust)");
+        drawCategory("Appearance",
+                     "A theme only swaps colours and rounding - the panel "
+                     "layout stays identical.\n\nSwitching the language "
+                     "replaces display text only; every id, key and command "
+                     "stays English.");
+    } else if (page == 2) {
+        drawCategory("Navigation",
+                     "Also editable in the viewport HUD: hold RMB + wheel "
+                     "to adjust the sensitivity.");
         drawCategory("Ground grid");
         drawCategory("Light gizmos");
-    } else if (page == 2) {
-        drawCategory("Snapping");
     } else if (page == 3) {
-        // ---- Keymap（只读速查）----
-        ImGui::SeparatorText("Viewport navigation (edit mode)");
-        ImGui::BulletText("Hold RMB + drag: look around");
-        ImGui::BulletText("Hold RMB + WASD: fly   Q / E: down / up");
-        ImGui::BulletText("Hold MMB + drag: pan   Shift: fly faster");
-        ImGui::BulletText("Wheel: dolly in / out   RMB + wheel: sensitivity");
-        ImGui::SeparatorText("Editing");
-        ImGui::BulletText("LMB: select / drag gizmo handle");
-        ImGui::BulletText("W / E / R: gizmo mode   X: world / local");
-        ImGui::BulletText("G: snapping on/off for the current tool");
-        ImGui::BulletText("Shift+A (in viewport): add menu (Mesh / Light)");
-        ImGui::BulletText("1 / 3 / 7: Front / Right / Top (+Ctrl = opposite)");
-        ImGui::BulletText("2 / 4 / 6 / 8: orbit step (Blender numpad)");
-        ImGui::BulletText("F: focus selection   Del: delete   F2: rename");
-        ImGui::BulletText("Ctrl+Z / Ctrl+Y: undo / redo");
-        ImGui::SeparatorText("Scene & playback");
-        ImGui::BulletText("Ctrl+S: save   Ctrl+N: new scene");
-        ImGui::BulletText("Space: run / pause   F: game fullscreen (in run)");
-        ImGui::BulletText("F11: window fullscreen (any mode)");
+        drawCategory("Snapping");
     } else if (page == 4) {
+        // ---- Keymap（只读速查）----
+        ImGui::SeparatorText(TR("Viewport navigation (edit mode)"));
+        ImGui::BulletText(TR("Hold RMB + drag: look around"));
+        ImGui::BulletText(TR("Hold RMB + WASD: fly   Q / E: down / up"));
+        ImGui::BulletText(TR("Hold MMB + drag: pan   Shift: fly faster"));
+        ImGui::BulletText(TR("Wheel: dolly in / out   RMB + wheel: sensitivity"));
+        ImGui::SeparatorText(TR("Editing"));
+        ImGui::BulletText(TR("LMB: select / drag gizmo handle"));
+        ImGui::BulletText(TR("W / E / R: gizmo mode   X: world / local"));
+        ImGui::BulletText(TR("G: snapping on/off for the current tool"));
+        ImGui::BulletText(TR("Shift+A (in viewport): add menu (Mesh / Light)"));
+        ImGui::BulletText(TR("1 / 3 / 7: Front / Right / Top (+Ctrl = opposite)"));
+        ImGui::BulletText(TR("2 / 4 / 6 / 8: orbit step (Blender numpad)"));
+        ImGui::BulletText(TR("F: focus selection   Del: delete   F2: rename"));
+        ImGui::BulletText(TR("Ctrl+Z / Ctrl+Y: undo / redo"));
+        ImGui::SeparatorText(TR("Scene & playback"));
+        ImGui::BulletText(TR("Ctrl+S: save   Ctrl+N: new scene"));
+        ImGui::BulletText(TR("Space: run / pause   F: game fullscreen (in run)"));
+        ImGui::BulletText(TR("F11: window fullscreen (any mode)"));
+    } else if (page == kPrefsPageBindings) {
+        // ---- G06：游戏动作键位重绑定 ----
+        drawKeyBindingsPage(*m_ctx, window().handle());
+    } else if (page == 5) {
         // ---- Scene（信息页）----
-        ImGui::SeparatorText("Scene");
-        ImGui::Text("Path: %s%s", m_ctx->scenePath().c_str(),
-                    m_ctx->dirty() ? "  (unsaved changes)" : "");
+        ImGui::SeparatorText(TR("Scene"));
+        ImGui::Text(TR("Path: %s%s"), m_ctx->scenePath().c_str(),
+                    m_ctx->dirty() ? TR("  (unsaved changes)") : "");
         if (m_ctx->dirty())
             ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.4f, 1.0f),
-                               "There are unsaved changes - Ctrl+S to save.");
-        ImGui::Text("Entities: %zu (editor %zu / runtime %zu)",
+                               TR("There are unsaved changes - Ctrl+S to save."));
+        ImGui::Text(TR("Entities: %zu (editor %zu / runtime %zu)"),
                     m_ctx->activeScene().objectCount(),
                     m_ctx->editorScene().objectCount(),
                     m_ctx->runtimeScene().objectCount());
         const scene::Scene::LightStats ls = m_ctx->editorScene().lightStats();
-        ImGui::Text("Local lights: %zu (%zu point / %zu spot)",
+        ImGui::Text(TR("Local lights: %zu (%zu point / %zu spot)"),
                     ls.pointLights + ls.spotLights, ls.pointLights,
                     ls.spotLights);
-        ImGui::Spacing();
-        ImGui::TextWrapped("Save / open with the File menu (Ctrl+S / Ctrl+N). "
-                           "The transport row below the viewport holds Run "
-                           "(game) and Play / Pause / Stop (animation).");
     }
 
     ImGui::Spacing();
     ImGui::Separator();
-    ImGui::TextDisabled("Preferences apply immediately. Saved to %s.",
+    ImGui::TextDisabled(TR("Preferences apply immediately. Saved to %s."),
                         editorPrefsPath().c_str());
+
+    // G06：捕获是模态的 —— 离开这一页 / 关掉 Preferences 必须收掉，否则
+    // 全局快捷键会一直被挡着（症状是"整个编辑器按什么都没反应"）。
+    if (page != kPrefsPageBindings && m_ctx->inputCaptureActive())
+        m_ctx->endInputCapture();
 
     ImGui::EndChild();
     ImGui::End();
@@ -3751,6 +4302,26 @@ const std::vector<EditorApp::PrefItem>& EditorApp::prefsTable() {
         // ---- Interface ----
         {"fontScale", "Font scale", "Interface", false, 1.0f, 0.75f, 2.0f,
          [](EditorApp& a) -> void* { return &a.m_ctx->fontScale(); }},
+        // ---- Appearance（主题 / 语言）----
+        // 这两项是"选项型"：落盘存下标，取值走 getChoice/setChoice。
+        // options 从各自的模块派生，不写死 —— 以后往 ui::ThemeId 里加一套
+        // 主题，这里自动多一个下拉项，不需要同步维护两份名单。
+        {"theme", "Theme", "Appearance", false, 0.0f, 0.0f, 0.0f, nullptr,
+         []() -> int { return ui::currentThemeIndex(); },
+         [](int v) { ui::applyTheme(v); }, nullptr,
+         [] {
+             std::vector<const char*> o;
+             for (int i = 0; i < ui::themeCount(); ++i) o.push_back(ui::themeName(i));
+             return o;
+         }()},
+        {"language", "Language", "Appearance", false, 0.0f, 0.0f, 0.0f, nullptr,
+         []() -> int { return language(); },
+         [](int v) { setLanguage(v); }, nullptr,
+         [] {
+             std::vector<const char*> o;
+             for (int i = 0; i < languageCount(); ++i) o.push_back(languageName(i));
+             return o;
+         }()},
         {"toolbarHeight", "Toolbar height", "Interface", false, 46.0f, 42.0f,
          84.0f,
          [](EditorApp& a) -> void* { return &a.m_ctx->toolbarHeight(); }},
@@ -3771,8 +4342,8 @@ const std::vector<EditorApp::PrefItem>& EditorApp::prefsTable() {
          [](EditorApp& a) -> void* {
              return &a.renderer().gridSettings().majorStep;
          }},
-        {"grid.extent", "Extent (m)", "Ground grid", false, 60.0f, 5.0f,
-         500.0f,
+        {"grid.extent", "Extent (m)", "Ground grid", false, 250.0f, 5.0f,
+         1000.0f,
          [](EditorApp& a) -> void* {
              return &a.renderer().gridSettings().extent;
          }},
@@ -3785,13 +4356,13 @@ const std::vector<EditorApp::PrefItem>& EditorApp::prefsTable() {
          [](EditorApp& a) -> void* {
              return &a.renderer().gridSettings().lineWidthPx;
          }},
-        {"grid.fadeStart", "Edge fade start (m)", "Ground grid", false, 45.0f,
-         0.0f, 300.0f,
+        {"grid.fadeStart", "Edge fade start (m)", "Ground grid", false, 200.0f,
+         0.0f, 600.0f,
          [](EditorApp& a) -> void* {
              return &a.renderer().gridSettings().fadeStart;
          }},
-        {"grid.fadeEnd", "Edge fade end (m)", "Ground grid", false, 60.0f,
-         5.0f, 300.0f,
+        {"grid.fadeEnd", "Edge fade end (m)", "Ground grid", false, 250.0f,
+         5.0f, 600.0f,
          [](EditorApp& a) -> void* {
              return &a.renderer().gridSettings().fadeEnd;
          }},
@@ -3806,18 +4377,18 @@ const std::vector<EditorApp::PrefItem>& EditorApp::prefsTable() {
          [](EditorApp& a) -> void* {
              return &a.renderer().lightGizmoScale();
          }},
-        // ---- Snapping（UE5 默认：关 + 0.1m / 10deg / 0.1）----
-        {"snap.move", "Move snapping", "Snapping", true, 0.0f, 0.0f, 0.0f,
+        // ---- Snapping（用户要求：默认全开；步长仍是 UE5 那套 0.1 / 10 / 0.1）----
+        {"snap.move", "Move snapping", "Snapping", true, 1.0f, 0.0f, 0.0f,
          [](EditorApp& a) -> void* { return &a.m_ctx->snapMoveRef(); }},
         {"snap.moveStep", "Move step (m)", "Snapping", false, 0.1f, 0.01f,
          5.0f,
          [](EditorApp& a) -> void* { return &a.m_ctx->snapMoveStepRef(); }},
-        {"snap.rotate", "Rotate snapping", "Snapping", true, 0.0f, 0.0f, 0.0f,
+        {"snap.rotate", "Rotate snapping", "Snapping", true, 1.0f, 0.0f, 0.0f,
          [](EditorApp& a) -> void* { return &a.m_ctx->snapRotateRef(); }},
         {"snap.rotateStep", "Rotate step (deg)", "Snapping", false, 10.0f,
          1.0f, 90.0f,
          [](EditorApp& a) -> void* { return &a.m_ctx->snapRotateStepRef(); }},
-        {"snap.scale", "Scale snapping", "Snapping", true, 0.0f, 0.0f, 0.0f,
+        {"snap.scale", "Scale snapping", "Snapping", true, 1.0f, 0.0f, 0.0f,
          [](EditorApp& a) -> void* { return &a.m_ctx->snapScaleRef(); }},
         {"snap.scaleStep", "Scale step", "Snapping", false, 0.1f, 0.01f, 1.0f,
          [](EditorApp& a) -> void* { return &a.m_ctx->snapScaleStepRef(); }},
@@ -3830,15 +4401,10 @@ const std::vector<EditorApp::PrefItem>& EditorApp::prefsTable() {
          [](EditorApp& a) -> void* {
              return &a.m_ctx->vpOverlayRef().modeBar;
          }},
-        {"vp.overlay.stats", "Stats HUD", "Viewport overlays", true, 1.0f, 0.0f,
+        {"vp.overlay.stats", "Stats HUD", "Viewport overlays", true, 0.0f, 0.0f,
          0.0f,
          [](EditorApp& a) -> void* {
              return &a.m_ctx->vpOverlayRef().stats;
-         }},
-        {"vp.overlay.camera", "Camera info", "Viewport overlays", true, 1.0f,
-         0.0f, 0.0f,
-         [](EditorApp& a) -> void* {
-             return &a.m_ctx->vpOverlayRef().camera;
          }},
         {"vp.overlay.navGizmo", "Navigation gizmo", "Viewport overlays", true,
          1.0f, 0.0f, 0.0f,
@@ -3901,20 +4467,50 @@ const std::vector<EditorApp::PrefItem>& EditorApp::prefsTable() {
 
 void EditorApp::drawPrefRow(const PrefItem& it) {
     ImGui::PushID(it.id);
+
+    // ---- 选项型（下拉）：改完立刻生效，没有"确定"按钮 ----
+    if (!it.options.empty()) {
+        const int n = static_cast<int>(it.options.size());
+        int cur = it.getChoice ? it.getChoice() : 0;
+        if (cur < 0 || cur >= n) cur = 0;
+        // ImGui 的下拉要 `const char* const*`；顺便在这里过一遍 TR ——
+        // 选项名只在**显示**时翻译，落盘的永远是下标。
+        std::vector<const char*> disp(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) disp[i] = TR(it.options[i]);
+        ImGui::SetNextItemWidth(220.0f);
+        if (ImGui::Combo(it.label, &cur, disp.data(), n)) {
+            if (it.setChoice) it.setChoice(cur);
+            if (it.onChoiceChanged) it.onChoiceChanged(cur);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(TR("R"))) {
+            const int d = std::clamp(static_cast<int>(it.def), 0, n - 1);
+            if (it.setChoice) it.setChoice(d);
+            if (it.onChoiceChanged) it.onChoiceChanged(d);
+        }
+        if (ImGui::IsItemHovered()) {
+            const int d = std::clamp(static_cast<int>(it.def), 0, n - 1);
+            ImGui::SetTooltip(TR("Reset '%s' to default (%s)"), TR(it.label),
+                              TR(it.options[d]));
+        }
+        ImGui::PopID();
+        return;
+    }
+
     void* p = it.ptr(*this);
     if (it.isBool) {
-        ImGui::Checkbox(it.label, static_cast<bool*>(p));
+        ImGui::Checkbox(TR(it.label), static_cast<bool*>(p));
     } else {
         float* f = static_cast<float*>(p);
         ImGui::SetNextItemWidth(220.0f);
         // 用 DragFloat 而不是 SliderFloat：像 extent=500 这种"超出常用
         // 区间"的值还能往回拖，不会被滑条夹死。
-        ImGui::DragFloat(it.label, f, (it.hi - it.lo) * 0.005f, it.lo, it.hi,
-                         "%.2f");
+        ImGui::DragFloat(TR(it.label), f, (it.hi - it.lo) * 0.005f, it.lo,
+                         it.hi, "%.2f");
     }
     // 单项重置：悬停显示默认值是什么
     ImGui::SameLine();
-    if (ImGui::SmallButton("R")) {
+    if (ImGui::SmallButton(TR("R"))) {
         if (it.isBool)
             *static_cast<bool*>(p) = (it.def > 0.5f);
         else
@@ -3922,13 +4518,25 @@ void EditorApp::drawPrefRow(const PrefItem& it) {
     }
     if (ImGui::IsItemHovered()) {
         if (it.isBool)
-            ImGui::SetTooltip("Reset '%s' to default (%s)", it.label,
-                              it.def > 0.5f ? "on" : "off");
+            ImGui::SetTooltip(TR("Reset '%s' to default (%s)"), TR(it.label),
+                              it.def > 0.5f ? TR("on") : TR("off"));
         else
-            ImGui::SetTooltip("Reset '%s' to default (%.2f)", it.label,
+            ImGui::SetTooltip(TR("Reset '%s' to default (%.2f)"), TR(it.label),
                               static_cast<double>(it.def));
     }
     ImGui::PopID();
+}
+
+// 主题 / 语言是**立即生效的全局状态**：读盘之后必须真应用一次，否则只是
+// 改了"存储"没改"表现"（窗口已经建好，样式是启动时那一套）。
+// 放在这里而不是读盘循环里，是因为两个设置项都要经过同一条路。
+void EditorApp::applyAppearance() {
+    for (const PrefItem& it : prefsTable()) {
+        if (it.options.empty() || !it.getChoice) continue;
+        const int v = it.getChoice();
+        if (it.setChoice) it.setChoice(v);          // 夹范围 + 应用
+        if (it.onChoiceChanged) it.onChoiceChanged(v);
+    }
 }
 
 void EditorApp::applyPrefsFromDisk() {
@@ -3937,6 +4545,14 @@ void EditorApp::applyPrefsFromDisk() {
     for (const auto& [key, val] : kv) {
         for (const PrefItem& it : prefsTable()) {
             if (key != it.id) continue;
+            if (!it.options.empty()) {
+                // 选项型：存的是下标，夹进合法范围再写回
+                const int n = static_cast<int>(it.options.size());
+                const int idx = std::clamp(
+                    static_cast<int>(std::lround(val)), 0, n - 1);
+                if (it.setChoice) it.setChoice(idx);
+                break;
+            }
             void* p = it.ptr(*this);
             if (it.isBool) {
                 *static_cast<bool*>(p) = (val > 0.5);
@@ -3954,6 +4570,12 @@ void EditorApp::applyPrefsFromDisk() {
 void EditorApp::savePrefsToDisk() {
     std::vector<std::pair<std::string, double>> kv;
     for (const PrefItem& it : prefsTable()) {
+        if (!it.options.empty()) {
+            kv.emplace_back(it.id,
+                            it.getChoice ? static_cast<double>(it.getChoice())
+                                         : 0.0);
+            continue;
+        }
         void* p = it.ptr(*this);
         const double v = it.isBool
                              ? (*static_cast<bool*>(p) ? 1.0 : 0.0)

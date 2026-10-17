@@ -576,6 +576,9 @@ struct Binding {
     void* aux = nullptr;     // FloatPair 的第二个字段
     ParamKind kind = ParamKind::Float;
     bool applied = false;    // env 是否已经应用过（分阶段调用用）
+    // 文件层（RenderSettingsIO）是否已经处理过这条绑定。**必须与 applied
+    // 分开**：两者都分阶段调用，而 env 永远要后写（测试钩子优先级最高）。
+    bool settingsApplied = false;
     // 绑定那一刻捕获的"默认值"（此时成员刚默认初始化完、env 还没读）
     bool dBool = false;
     int dInt = 0;
@@ -777,6 +780,49 @@ void* paramPtr(const char* id) {
         if (b.id == id) return b.ptr;
     }
     return nullptr;
+}
+
+// ============================================================
+// ③-b 文件层覆盖用到的绑定视图（E03）
+// ============================================================
+
+namespace {
+
+BindingView viewOf(const Binding& b) {
+    BindingView v;
+    v.id = b.id;
+    v.kind = b.kind;
+    v.ptr = b.ptr;
+    v.aux = b.aux;
+    v.dBool = b.dBool;
+    v.dInt = b.dInt;
+    v.dFloat = b.dFloat;
+    v.dColor[0] = b.dColor[0];
+    v.dColor[1] = b.dColor[1];
+    v.dColor[2] = b.dColor[2];
+    return v;
+}
+
+} // namespace
+
+int takeUnappliedBindings(std::vector<BindingView>& out) {
+    int n = 0;
+    for (Binding& b : g_bindings) {
+        if (b.settingsApplied) continue;
+        b.settingsApplied = true;
+        out.push_back(viewOf(b));
+        ++n;
+    }
+    return n;
+}
+
+int collectBindings(std::vector<BindingView>& out) {
+    for (const Binding& b : g_bindings) out.push_back(viewOf(b));
+    return static_cast<int>(g_bindings.size());
+}
+
+void resetSettingsApplied() {
+    for (Binding& b : g_bindings) b.settingsApplied = false;
 }
 
 // ============================================================

@@ -7,14 +7,33 @@
 // ============================================================
 
 #include <chrono>
+#include <cstdlib>
 
 namespace core {
 
 class Time {
 public:
+    Time() {
+        // MYVK_FIXED_DT=<秒>：把每帧的 deltaTime 钉成常量。
+        //
+        // 为什么需要它：**确定性验证**。物理是固定步长 + 累加器的，只要
+        // 喂进去的 dt 序列一样，结果就逐位一样。而真实墙钟的 dt 每帧都在
+        // 抖 —— 于是"编辑器 Play 与 Game.exe 跑完同一段之后位置相同"这件
+        // 事，用真实 dt 根本无法比较。钉成常量之后两边步进序列完全一致，
+        // 逐位比较才有意义（见 tools/verify_runtime_determinism.py）。
+        //
+        // ⚠ 正常使用**不设**即为真实墙钟；它不是给玩家用的旋钮。
+        if (const char* s = std::getenv("MYVK_FIXED_DT")) {
+            const float v = static_cast<float>(std::atof(s));
+            if (v > 0.0f) m_fixedDelta = v;
+        }
+    }
+
     void update() {
         auto now = std::chrono::high_resolution_clock::now();
-        if (m_hasLast) {
+        if (m_fixedDelta > 0.0f) {
+            m_deltaTime = m_fixedDelta;
+        } else if (m_hasLast) {
             m_deltaTime = std::chrono::duration<float>(now - m_last).count();
         }
         m_last = now;
@@ -40,6 +59,8 @@ private:
     std::chrono::high_resolution_clock::time_point m_last{};
     bool m_hasLast = false;
     float m_deltaTime = 0.0f;
+    // > 0 → 每帧 deltaTime 固定为它（MYVK_FIXED_DT，见构造函数注释）
+    float m_fixedDelta = -1.0f;
     float m_elapsed = 0.0f;
     uint64_t m_frameCount = 0;
     float m_fps = 0.0f;

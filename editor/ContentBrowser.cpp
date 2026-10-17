@@ -1,5 +1,6 @@
 #include "ContentBrowser.h"
 
+#include "Localization.h"
 #include "DebugRects.h"
 #include "EditorDragDrop.h"
 #include "EditorIcons.h"
@@ -243,7 +244,7 @@ bool iconButton(const char* id, ImVec2 size, const IconPainter& paint,
     }
     paint(dl, a, b, enabled ? IM_COL32(222, 228, 236, 255)
                             : IM_COL32(120, 124, 132, 255));
-    if (hovered && tip) ImGui::SetTooltip("%s", tip);
+    if (hovered && tip) ImGui::SetTooltip(TR("%s"), tip);
     ImGui::EndDisabled();
     ImGui::PopID();
     return clicked;
@@ -293,26 +294,8 @@ void paintPlus(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
     dl->AddLine(ImVec2(cx, cy - k), ImVec2(cx, cy + k), c, 2.0f);
 }
 
-// E13 历史前进/后退箭头
-void paintLeftArrow(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
-    const float cx = (a.x + b.x) * 0.5f;
-    const float cy = (a.y + b.y) * 0.5f;
-    const float k = 5.5f;
-    dl->AddTriangleFilled(ImVec2(cx - k, cy), ImVec2(cx + k * 0.55f, cy - k),
-                          ImVec2(cx + k * 0.55f, cy + k), c);
-    dl->AddRectFilled(ImVec2(cx + k * 0.2f, cy - 1.8f),
-                      ImVec2(cx + k, cy + 1.8f), c, 1.0f);
-}
-
-void paintRightArrow(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
-    const float cx = (a.x + b.x) * 0.5f;
-    const float cy = (a.y + b.y) * 0.5f;
-    const float k = 5.5f;
-    dl->AddTriangleFilled(ImVec2(cx + k, cy), ImVec2(cx - k * 0.55f, cy - k),
-                          ImVec2(cx - k * 0.55f, cy + k), c);
-    dl->AddRectFilled(ImVec2(cx - k * 0.2f, cy - 1.8f),
-                      ImVec2(cx - k, cy + 1.8f), c, 1.0f);
-}
+// E13 历史前进/后退箭头：**已随按钮一起删除**（2026-10-17）。
+// 留个记号，免得以后有人照着旧截图又把它加回来 —— 见 drawNavRow 的注释。
 
 // E13 网格 / 列表视图切换图标
 void paintGridMode(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
@@ -531,22 +514,14 @@ void ContentBrowser::drawNavRow() {
     const float h = ImGui::GetFrameHeight();
     const ImVec2 bs(h, h);
 
-    // ---- E13 历史前进 / 后退 ----
-    if (iconButton("back", bs, paintLeftArrow,
-                   canBack() ? "Back  (Alt+Left)" : "No previous folder",
-                   canBack())) {
-        back();
-    }
-    logRect("CB-RECT back", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-    ImGui::SameLine(0.0f, 4.0f);
-    if (iconButton("fwd", bs, paintRightArrow,
-                   canForward() ? "Forward  (Alt+Right)" : "No next folder",
-                   canForward())) {
-        forward();
-    }
-    ImGui::SameLine(0.0f, 8.0f);
-
     // ---- 返回上一级（有正常图标，而不是一个 ".." 文字按钮）----
+    //
+    // ⚠ 这里**故意没有**"前进 / 后退"两个箭头按钮（2026-10-17 按用户要求
+    //   去掉）：Content 面板默认只有约 290 px 宽，那两个按钮占了最宝贵的
+    //   起手位置，而它们能做的事（回到刚才浏览过的目录）在编辑器里用处很小
+    //   —— 真正常用的是"上一级"。快捷键 Alt+← / Alt+→ 仍然可用（见
+    //   draw() 末尾的键盘处理），back()/forward() 的历史栈也没拆，
+    //   所以只是**去掉了入口**，没有删能力。
     const bool canUp = !m_rel.empty();
     if (iconButton("up", bs, paintUpArrow,
                    canUp ? "Go up one level  (Backspace)" : "Already at the root",
@@ -574,22 +549,22 @@ void ContentBrowser::drawNavRow() {
     if (nx > ImGui::GetCursorPosX()) {
         ImGui::SameLine();
         ImGui::SetCursorPosX(nx);
-        if (ImGui::Button("New", ImVec2(newBtnW, 0.0f))) {
+        if (ImGui::Button(TR("New"), ImVec2(newBtnW, 0.0f))) {
             ImGui::OpenPopup("##cb_new");
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Create a new asset in this folder");
+            ImGui::SetTooltip(TR("Create a new asset in this folder"));
         }
         if (ImGui::BeginPopup("##cb_new")) {
-            if (ImGui::MenuItem("Folder")) m_newFolderRequest = true;
-            if (ImGui::MenuItem("Scene (.json)")) createScene();
-            if (ImGui::MenuItem("Script (.vks)")) createScript();
+            if (ImGui::MenuItem(TR("Folder"))) m_newFolderRequest = true;
+            if (ImGui::MenuItem(TR("Scene (.json)"))) createScene();
+            if (ImGui::MenuItem(TR("Script (.vks)"))) createScript();
             ImGui::Separator();
-            ImGui::MenuItem("Material (inline in scene)", nullptr, false, false);
+            ImGui::MenuItem(TR("Material (inline in scene)"), nullptr, false, false);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip(
-                    "Materials are stored inside the scene JSON today -\n"
-                    "edit them in the Inspector's Material section.");
+                    TR("Materials are stored inside the scene JSON today -\n"
+                    "edit them in the Inspector's Material section."));
             }
             ImGui::EndPopup();
         }
@@ -663,7 +638,7 @@ void ContentBrowser::drawCrumbRow() {
             navigateTo(crumbs[i].second);
         ImGui::PopID();
         if (i == 0 && ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", m_root.c_str());
+            ImGui::SetTooltip(TR("%s"), m_root.c_str());
     };
 
     if (onlyLast) {
@@ -671,14 +646,14 @@ void ContentBrowser::drawCrumbRow() {
     } else {
         bool firstItem = true;
         if (clippedLeft) {
-            ImGui::TextDisabled("...");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m_root.c_str());
+            ImGui::TextDisabled(TR("..."));
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(TR("%s"), m_root.c_str());
             firstItem = false;
         }
         for (std::size_t i = firstShown; i < crumbs.size(); ++i) {
             if (!firstItem) {
                 ImGui::SameLine(0.0f, 2.0f);
-                ImGui::TextDisabled("/");
+                ImGui::TextDisabled(TR("/"));
                 ImGui::SameLine(0.0f, 2.0f);
             }
             firstItem = false;
@@ -720,7 +695,7 @@ void ContentBrowser::drawToolbarRow() {
         m_dirty = true;
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Filter by asset type (extension-based)");
+        ImGui::SetTooltip(TR("Filter by asset type (extension-based)"));
     }
     ImGui::SameLine(0.0f, 4.0f);
 
@@ -746,7 +721,7 @@ void ContentBrowser::drawToolbarRow() {
     }
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Thumbnail size (grid view)");
+        ImGui::SetTooltip(TR("Thumbnail size (grid view)"));
     }
     ImGui::SameLine(0.0f, 4.0f);
 
@@ -758,7 +733,7 @@ void ContentBrowser::drawToolbarRow() {
         m_dirty = true;
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Filter by name (case-insensitive)\nEsc to clear");
+        ImGui::SetTooltip(TR("Filter by name (case-insensitive)\nEsc to clear"));
     }
     // Esc 清除过滤（键盘在框里时消费掉，免得传给别处）
     if (ImGui::IsItemHovered() && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -882,22 +857,22 @@ void ContentBrowser::drawEntry(const DirEntry& ent, float cellW, float cellH) {
 
     if (hovered && !renaming) {
         ImGui::BeginTooltip();
-        ImGui::Text("%s", ent.name.c_str());
-        if (!ent.isDir) ImGui::TextDisabled("%s", humanSize(ent.size).c_str());
-        ImGui::TextDisabled("%s", ent.absPath.c_str());
+        ImGui::Text(TR("%s"), ent.name.c_str());
+        if (!ent.isDir) ImGui::TextDisabled(TR("%s"), humanSize(ent.size).c_str());
+        ImGui::TextDisabled(TR("%s"), ent.absPath.c_str());
         if (isModel(ent.name))
             ImGui::TextColored(ImVec4(0.6f, 0.9f, 0.6f, 1.0f),
-                               "drag into the viewport to instantiate");
+                               TR("drag into the viewport to instantiate"));
         if (isScript(ent.name))
             ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.95f, 1.0f),
-                               "double-click: attach to selected entity");
+                               TR("double-click: attach to selected entity"));
         if (isScene(ent.name))
             ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.6f, 1.0f),
-                               "double-click: open this scene");
+                               TR("double-click: open this scene"));
         if (isImage(ent.name))
-            ImGui::TextDisabled("texture (albedo / normal / ORM source)");
+            ImGui::TextDisabled(TR("texture (albedo / normal / ORM source)"));
         ImGui::Separator();
-        ImGui::TextDisabled("right-click: rename / duplicate / delete");
+        ImGui::TextDisabled(TR("right-click: rename / duplicate / delete"));
         ImGui::EndTooltip();
     }
 
@@ -947,11 +922,11 @@ void ContentBrowser::drawEntry(const DirEntry& ent, float cellW, float cellH) {
         ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
         const std::string rel = assets::makeAssetRelative(ent.absPath);
         ImGui::SetDragDropPayload(drag::kAsset, rel.c_str(), rel.size() + 1);
-        ImGui::Text("%s", ent.name.c_str());
+        ImGui::Text(TR("%s"), ent.name.c_str());
         if (isImage(ent.name)) {
-            ImGui::TextDisabled("drop on a Material texture slot to bind");
+            ImGui::TextDisabled(TR("drop on a Material texture slot to bind"));
         } else {
-            ImGui::TextDisabled("drop in the viewport -> bottom sits on the grid");
+            ImGui::TextDisabled(TR("drop in the viewport -> bottom sits on the grid"));
         }
         ImGui::EndDragDropSource();
     }
@@ -974,10 +949,10 @@ void ContentBrowser::openEntry(const DirEntry& ent) {
         if (r.ok) {
             m_ctx.onSceneReplaced();
             m_ctx.scenePath() = rel;
-            m_ctx.notify("Opened " + ent.name + " (" +
-                         std::to_string(r.entities) + " entities)");
+            m_ctx.notify(std::string(TR("Opened ")) + ent.name + " (" +
+                         std::to_string(r.entities) + TR(" entities)"));
         } else {
-            m_ctx.notify("Open failed: " + r.error);
+            m_ctx.notify(TR("Open failed: ") + r.error);
         }
     } else if (isModel(ent.name)) {
         // 双击模型 = 放到原点上并且**底部贴住栅格面**（和拖进视口同一套逻辑，
@@ -994,14 +969,14 @@ void ContentBrowser::openEntry(const DirEntry& ent) {
         });
         if (imported.ok()) {
             m_ctx.select(imported.root);
-            m_ctx.notify("Imported " + ent.name + " (" +
-                         std::to_string(imported.count()) + " mesh)");
+            m_ctx.notify(std::string(TR("Imported ")) + ent.name + " (" +
+                         std::to_string(imported.count()) + TR(" mesh)"));
         } else {
-            m_ctx.notify("Failed: " + ent.name);
+            m_ctx.notify(TR("Failed: ") + ent.name);
         }
     } else if (isScript(ent.name)) {
         if (!m_ctx.hasSelection()) {
-            m_ctx.notify("Select an entity first, then double-click the script");
+            m_ctx.notify(TR("Select an entity first, then double-click the script"));
         } else {
             const std::string rel = assets::makeAssetRelative(ent.absPath);
             const ecs::Entity sel = m_ctx.selection();
@@ -1015,7 +990,8 @@ void ContentBrowser::openEntry(const DirEntry& ent) {
                     w.add<ecs::ScriptComponent>(sel, sc);
                 }
             });
-            m_ctx.notify("Assigned " + ent.name + " to selection");
+            m_ctx.notify(std::string(TR("Assigned ")) + ent.name +
+                      TR(" to selection"));
         }
     }
 }
@@ -1046,12 +1022,13 @@ void ContentBrowser::commitRename() {
     const fs::path dst = src.parent_path() / newName;
     std::error_code ec;
     if (fs::exists(dst, ec)) {
-        m_ctx.notify("Rename failed: '" + newName + "' already exists");
+        m_ctx.notify(std::string(TR("Rename failed: '")) + newName +
+                      TR("' already exists"));
         return;
     }
     fs::rename(src, dst, ec);
     if (ec) {
-        m_ctx.notify("Rename failed: " + ec.message());
+        m_ctx.notify(TR("Rename failed: ") + ec.message());
         VK_LOG_WARN("ContentBrowser: rename %s -> %s failed: %s", target.c_str(),
                     dst.string().c_str(), ec.message().c_str());
         return;
@@ -1059,7 +1036,7 @@ void ContentBrowser::commitRename() {
     invalidateThumbTree(target);
     m_selected = dst.string();
     m_dirty = true;
-    m_ctx.notify("Renamed to " + newName);
+    m_ctx.notify(TR("Renamed to ") + newName);
 }
 
 // ---------------------------------------------------------------- 复制
@@ -1095,14 +1072,14 @@ void ContentBrowser::duplicateEntry(const DirEntry& ent) {
     }
 
     if (ec) {
-        m_ctx.notify("Duplicate failed: " + ec.message());
+        m_ctx.notify(TR("Duplicate failed: ") + ec.message());
         VK_LOG_WARN("ContentBrowser: duplicate %s failed: %s", ent.absPath.c_str(),
                     ec.message().c_str());
         return;
     }
     m_selected = newName;
     m_dirty = true;
-    m_ctx.notify("Duplicated " + ent.name);
+    m_ctx.notify(TR("Duplicated ") + ent.name);
 }
 
 // ---------------------------------------------------------------- 删除
@@ -1132,7 +1109,7 @@ void ContentBrowser::doDelete() {
         fs::remove(target, ec);
     }
     if (ec) {
-        m_ctx.notify("Delete failed: " + ec.message());
+        m_ctx.notify(TR("Delete failed: ") + ec.message());
         VK_LOG_WARN("ContentBrowser: delete %s failed: %s", target.c_str(),
                     ec.message().c_str());
         return;
@@ -1140,7 +1117,7 @@ void ContentBrowser::doDelete() {
     invalidateThumbTree(target);
     if (m_selected == target) m_selected.clear();
     m_dirty = true;
-    m_ctx.notify("Deleted " + name);
+    m_ctx.notify(TR("Deleted ") + name);
     VK_LOG_INFO("ContentBrowser: deleted %s", target.c_str());
 }
 
@@ -1152,14 +1129,14 @@ void ContentBrowser::createFolder() {
     std::error_code ec;
     fs::create_directories(path, ec);
     if (ec) {
-        m_ctx.notify("New folder failed: " + ec.message());
+        m_ctx.notify(TR("New folder failed: ") + ec.message());
         return;
     }
     m_dirty = true;
     m_selected = path;
     // 建完立刻进入重命名 —— 和资源管理器的行为一致
     beginRename(path, fs::path(path).filename().string());
-    m_ctx.notify("Created folder");
+    m_ctx.notify(TR("Created folder"));
 }
 
 // ---------------------------------------------------------------- 新建资产
@@ -1173,7 +1150,7 @@ void ContentBrowser::createScene() {
     {
         std::FILE* f = std::fopen(path.c_str(), "wb");
         if (!f) {
-            m_ctx.notify("New scene failed: cannot open file");
+            m_ctx.notify(TR("New scene failed: cannot open file"));
             return;
         }
         const char* body =
@@ -1189,7 +1166,7 @@ void ContentBrowser::createScene() {
     m_dirty = true;
     m_selected = path;
     beginRename(path, fs::path(path).filename().string());
-    m_ctx.notify("Created scene");
+    m_ctx.notify(TR("Created scene"));
 }
 
 // E13 New ▸ Script：写一个带 update() 骨架的 .vks
@@ -1199,7 +1176,7 @@ void ContentBrowser::createScript() {
     {
         std::FILE* f = std::fopen(path.c_str(), "wb");
         if (!f) {
-            m_ctx.notify("New script failed: cannot open file");
+            m_ctx.notify(TR("New script failed: cannot open file"));
             return;
         }
         const char* body =
@@ -1218,7 +1195,7 @@ void ContentBrowser::createScript() {
     m_dirty = true;
     m_selected = path;
     beginRename(path, fs::path(path).filename().string());
-    m_ctx.notify("Created script");
+    m_ctx.notify(TR("Created script"));
 }
 
 // ---------------------------------------------------------------- 引用查询
@@ -1254,7 +1231,7 @@ void ContentBrowser::showReferences(const DirEntry& ent) {
     }
 
     if (hits.empty()) {
-        m_ctx.notify("No references to " + needle);
+        m_ctx.notify(TR("No references to ") + needle);
         return;
     }
     std::string msg = std::to_string(hits.size()) + " reference(s): ";
@@ -1275,7 +1252,7 @@ void ContentBrowser::revealInExplorer(const std::string& absPath) {
     (void)rc;
 #else
     (void)absPath;
-    m_ctx.notify("Reveal in file manager is Windows-only for now");
+    m_ctx.notify(TR("Reveal in file manager is Windows-only for now"));
 #endif
 }
 
@@ -1293,26 +1270,26 @@ void ContentBrowser::drawEntryContextMenu() {
 
     if (ImGui::MenuItem(ent.isDir ? "Open" : "Open / Run")) openEntry(ent);
     ImGui::Separator();
-    if (ImGui::MenuItem("Rename", "F2")) beginRename(ent.absPath, ent.name);
-    if (ImGui::MenuItem("Duplicate", "Ctrl+D")) duplicateEntry(ent);
+    if (ImGui::MenuItem(TR("Rename"), "F2")) beginRename(ent.absPath, ent.name);
+    if (ImGui::MenuItem(TR("Duplicate"), "Ctrl+D")) duplicateEntry(ent);
     // 只有在文件夹上才有意义 —— 建到文件里一定会失败
-    if (ent.isDir && ImGui::MenuItem("New Folder Here")) {
+    if (ent.isDir && ImGui::MenuItem(TR("New Folder Here"))) {
         navigateTo((fs::path(m_rel) / ent.name).generic_string());
         m_newFolderRequest = true;
     }
     ImGui::Separator();
-    if (ImGui::MenuItem("Copy Path")) {
+    if (ImGui::MenuItem(TR("Copy Path"))) {
         ImGui::SetClipboardText(ent.absPath.c_str());
-        m_ctx.notify("Path copied to clipboard");
+        m_ctx.notify(TR("Path copied to clipboard"));
     }
-    if (ImGui::MenuItem("Show in Explorer")) revealInExplorer(ent.absPath);
-    if (ImGui::MenuItem("Show References")) showReferences(ent);
+    if (ImGui::MenuItem(TR("Show in Explorer"))) revealInExplorer(ent.absPath);
+    if (ImGui::MenuItem(TR("Show References"))) showReferences(ent);
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Scan scene / script assets that mention this file");
+        ImGui::SetTooltip(TR("Scan scene / script assets that mention this file"));
     }
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.5f, 1.0f));
-    if (ImGui::MenuItem("Delete", "Del")) requestDelete(ent);
+    if (ImGui::MenuItem(TR("Delete"), "Del")) requestDelete(ent);
     ImGui::PopStyleColor();
 
     ImGui::EndPopup();
@@ -1324,16 +1301,16 @@ void ContentBrowser::drawEmptyContextMenu() {
                                             ImGuiPopupFlags_NoOpenOverItems)) {
         return;
     }
-    if (ImGui::MenuItem("New Folder")) m_newFolderRequest = true;
-    if (ImGui::MenuItem("New Scene")) createScene();
-    if (ImGui::MenuItem("New Script")) createScript();
+    if (ImGui::MenuItem(TR("New Folder"))) m_newFolderRequest = true;
+    if (ImGui::MenuItem(TR("New Scene"))) createScene();
+    if (ImGui::MenuItem(TR("New Script"))) createScript();
     ImGui::Separator();
-    if (ImGui::MenuItem("Refresh")) m_dirty = true;
-    if (ImGui::MenuItem("Show in Explorer")) revealInExplorer(
+    if (ImGui::MenuItem(TR("Refresh"))) m_dirty = true;
+    if (ImGui::MenuItem(TR("Show in Explorer"))) revealInExplorer(
         (fs::path(m_root) / m_rel).string());
-    if (ImGui::MenuItem("Copy Path")) {
+    if (ImGui::MenuItem(TR("Copy Path"))) {
         ImGui::SetClipboardText((fs::path(m_root) / m_rel).string().c_str());
-        m_ctx.notify("Path copied to clipboard");
+        m_ctx.notify(TR("Path copied to clipboard"));
     }
     ImGui::EndPopup();
 }
@@ -1349,24 +1326,24 @@ void ContentBrowser::drawDeleteConfirm() {
         return;
     }
 
-    ImGui::TextColored(ImVec4(1.0f, 0.66f, 0.55f, 1.0f), "Delete this %s?",
+    ImGui::TextColored(ImVec4(1.0f, 0.66f, 0.55f, 1.0f), TR("Delete this %s?"),
                        m_deleteIsDir ? "folder and everything inside it"
                                      : "file");
     ImGui::Spacing();
-    ImGui::TextWrapped("%s", m_deleteTarget.c_str());
+    ImGui::TextWrapped(TR("%s"), m_deleteTarget.c_str());
     ImGui::Spacing();
-    ImGui::TextDisabled("This cannot be undone.");
+    ImGui::TextDisabled(TR("This cannot be undone."));
     ImGui::Separator();
     ImGui::Spacing();
 
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.62f, 0.24f, 0.22f, 1.0f));
-    if (ImGui::Button("Delete", ImVec2(120.0f, 0.0f))) {
+    if (ImGui::Button(TR("Delete"), ImVec2(120.0f, 0.0f))) {
         doDelete();
         ImGui::CloseCurrentPopup();
     }
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)) ||
+    if (ImGui::Button(TR("Cancel"), ImVec2(120.0f, 0.0f)) ||
         ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
         m_deleteTarget.clear();
         ImGui::CloseCurrentPopup();
@@ -1462,9 +1439,9 @@ void ContentBrowser::drawListRow(const DirEntry& ent, float rowH) {
     const bool hov = ImGui::IsItemHovered();
     if (hov && !renaming) {
         ImGui::BeginTooltip();
-        ImGui::Text("%s", ent.name.c_str());
-        if (!ent.isDir) ImGui::TextDisabled("%s", humanSize(ent.size).c_str());
-        ImGui::TextDisabled("%s", ent.absPath.c_str());
+        ImGui::Text(TR("%s"), ent.name.c_str());
+        if (!ent.isDir) ImGui::TextDisabled(TR("%s"), humanSize(ent.size).c_str());
+        ImGui::TextDisabled(TR("%s"), ent.absPath.c_str());
         ImGui::EndTooltip();
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) m_selected = ent.absPath;
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) openEntry(ent);
@@ -1486,7 +1463,7 @@ void ContentBrowser::drawListRow(const DirEntry& ent, float rowH) {
         ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
         const std::string rel = assets::makeAssetRelative(ent.absPath);
         ImGui::SetDragDropPayload(drag::kAsset, rel.c_str(), rel.size() + 1);
-        ImGui::Text("%s", ent.name.c_str());
+        ImGui::Text(TR("%s"), ent.name.c_str());
         ImGui::EndDragDropSource();
     }
 
@@ -1593,7 +1570,7 @@ void ContentBrowser::draw() {
     const ImGuiWindowFlags wf = ImGuiWindowFlags_NoMove |
                                 ImGuiWindowFlags_NoResize |
                                 ImGuiWindowFlags_NoCollapse;
-    if (!ImGui::Begin("Content", &panels.content, wf)) {
+    if (!ImGui::Begin(trId("Content", "panel_content"), &panels.content, wf)) {
         ImGui::End();
         return;
     }
@@ -1650,7 +1627,7 @@ void ContentBrowser::draw() {
     char stat[512];
     std::snprintf(stat, sizeof(stat), "%zu entries  |  %s", m_entries.size(),
                   m_rel.empty() ? "(root)" : m_rel.c_str());
-    ImGui::TextDisabled("%s", stat);
+    ImGui::TextDisabled(TR("%s"), stat);
 
     // 键盘：Backspace 上一级；Alt+← / Alt+→ 历史；F2 重命名；Delete 删除
     const ImGuiIO& io = ImGui::GetIO();

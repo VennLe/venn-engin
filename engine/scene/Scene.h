@@ -13,6 +13,7 @@
 #include "scene/Bvh.h"
 #include "scene/Camera.h"
 #include "scene/Light.h"
+#include "scene/PhysicsSettings.h"
 #include "scene/PostVolume.h"
 
 #include <string>
@@ -150,12 +151,28 @@ public:
     PostVolumeSet& postVolumes() { return m_postVolumes; }
     const PostVolumeSet& postVolumes() const { return m_postVolumes; }
 
+    // 物理世界参数（重力 / 步长 / 迭代 / 休眠）。是**场景数据** ——
+    // 随场景一起序列化，换场景就换物理手感。见 scene/PhysicsSettings.h。
+    PhysicsSettings& physicsSettings() { return m_physics; }
+    const PhysicsSettings& physicsSettings() const { return m_physics; }
+
     // ---- 方向光（懒创建：首次调用时自动建实体）----
     Light& light();
     const Light& light() const;
     // 太阳实体的句柄（编辑器选中它时 Inspector 就能显示太阳参数）。
     // 注意：light() 尚未被调用过时句柄可能无效 —— 先调一次 light()。
     ecs::Entity lightEntity() const { return m_lightEntity; }
+
+    // 场景级太阳是否**可见**（Hierarchy 行尾 👁 的落点）。
+    //
+    // 为什么单独给一个口子：太阳不是"可渲染物"（没有 MeshComponent），
+    // `forEachRenderable` 的 `visible` 闸门拦不到它 —— 它的光是从
+    // `light()` 直接喂进 FrameUBO 的。所以渲染器得自己问一句。
+    // **缺组件 = 可见**（老场景 / 程序化建的太阳都按可见处理）。
+    bool sunVisible() const {
+        const auto* vis = m_world.get<ecs::VisibilityComponent>(m_lightEntity);
+        return !vis || vis->visible;
+    }
 
     // ---- 局部光源收集（分簇前向渲染）----
     // 把所有 enabled 的点光/射灯展平成 LightInstance（位置取世界矩阵平移）。
@@ -194,6 +211,7 @@ private:
     // 这件事只有一处定义（Renderer::setViewCameraIndex 直接用下标）。
     std::vector<Camera> m_cameras{1};
     PostVolumeSet m_postVolumes;
+    PhysicsSettings m_physics;
     ecs::Entity m_lightEntity;
 
     // ---- 空间索引 ----

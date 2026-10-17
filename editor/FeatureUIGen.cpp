@@ -1,5 +1,6 @@
 #include "FeatureUIGen.h"
 
+#include "Localization.h"
 #include "core/Logger.h"
 #include "render/FeatureRegistry.h"
 #include "render/GpuTimer.h"
@@ -120,7 +121,7 @@ bool drawControl(const render::ParamDesc& p, const char* labelOverride) {
     }
 
     if (p.tooltip && p.tooltip[0] && ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", p.tooltip);
+        ImGui::SetTooltip(TR("%s"), p.tooltip);
     if (changed && g_changeHook) g_changeHook(p.id);
     return changed;
 }
@@ -232,7 +233,7 @@ bool drawFeatureBlock(const render::FeatureDesc& f, int tierLevel,
     }
     if (f.roadmap && f.roadmap[0] && ImGui::GetItemRectMax().y > 0.0f) {
         ImGui::SameLine();
-        ImGui::TextDisabled("[%s]", f.roadmap);
+        ImGui::TextDisabled(TR("[%s]"), f.roadmap);
     }
     // GPU 成本：注册表给了段名 + 计时器可用时显示（性能意识从面板可见）。
     if (gt && gt->valid()) {
@@ -241,7 +242,7 @@ bool drawFeatureBlock(const render::FeatureDesc& f, int tierLevel,
             const float ms = gt->lastMs(static_cast<uint32_t>(sec));
             if (ms > 0.0f) {
                 ImGui::SameLine();
-                ImGui::TextDisabled("%.2f ms", static_cast<double>(ms));
+                ImGui::TextDisabled(TR("%.2f ms"), static_cast<double>(ms));
             }
         }
     }
@@ -252,13 +253,13 @@ bool drawFeatureBlock(const render::FeatureDesc& f, int tierLevel,
         const float avail = ImGui::GetContentRegionAvail().x;
         if (avail > btnW + 8.0f)
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - btnW);
-        if (ImGui::SmallButton("Reset")) {
+        if (ImGui::SmallButton(TR("Reset"))) {
             for (int i = 0; i < f.paramCount; ++i)
                 render::resetParam(f.params[i].id);
             VK_LOG_INFO("FTR-RESET %s", f.id);
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("把 %s 的全部参数恢复默认", f.name);
+            ImGui::SetTooltip(TR("Reset all parameters of %s to defaults"), f.name);
     }
 
     // ---- 参数区：启用开关关着 → 收起；档位与搜索过滤 ----

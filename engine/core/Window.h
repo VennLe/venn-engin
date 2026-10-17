@@ -88,6 +88,19 @@ public:
     // Vulkan 表面（由 Renderer 在初始化时创建/销毁）
     VkSurfaceKHR createSurface(VkInstance instance) const;
 
+    // ---------------------------------------------------------- 显示时机
+    //
+    // 窗口是**隐藏创建**的（见构造函数注释：一是为了任务栏图标，二是为了
+    // 消掉"启动闪白"）。什么时候让它露面由 Application 决定：
+    //
+    //   show()  = 第一帧已经呈现到交换链上了，现在显示 = 用户看到的第一帧
+    //             就是渲染结果，不会先看到一块系统白。
+    //
+    // 幂等：重复调用无害。自动化（MYVK_FRAMES 等）下 Application 会在首帧
+    // 后立刻调它，保证脚本能截到图。
+    void show();
+    bool isShown() const { return m_shown; }
+
 private:
     static void framebufferResizeCallback(GLFWwindow* w, int width, int height);
     static void windowIconifyCallback(GLFWwindow* w, int iconified);
@@ -96,6 +109,9 @@ private:
     // 用可执行文件内嵌的 .ico 资源设图标。Windows 专用；其它平台直接
     // 返回 false（交给 setIconFromFile 的 PNG 路径）。
     bool applyIconFromResource();
+
+    // 把窗口类的背景刷换成深灰（消除"显示前的白色客户区"）。Windows 专用。
+    bool applyDarkBackgroundBrush();
 
     // 进程级的任务栏身份（AppUserModelID）。必须在**任何窗口创建之前**
     // 调用；Windows 专用。
@@ -108,6 +124,7 @@ private:
     bool m_resized = false;
     bool m_shouldClose = false;
     bool m_iconFromResource = false;
+    bool m_shown = false;
 
     // 从资源里 LoadImageW 出来的 HICON：不带 LR_SHARED 的话由调用方负责
     // 销毁，而窗口活着的全过程都要用它们，所以留到析构再 DestroyIcon。

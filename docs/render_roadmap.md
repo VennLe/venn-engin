@@ -6,6 +6,12 @@
 > FrameGraph(SSGI/SSR/GodRays/DoF/MotionBlur)、色差/暗角/后处理体积、shader 变体+热重载、  
 > GPU instancing、视锥剔除/BVH/LOD、蒙皮(SSBO 关节矩阵)、纹理四件套(mipmap/各向异性/BC/流式)、  
 > 多相机/通用 RenderTarget、AlphaMode{Opaque,Blend}、RenderStats。
+>
+> **配套文档**：`docs/editor_roadmap.md`（E 系列，人的入口）+ `docs/ship_roadmap.md`
+> （**G 系列**，游戏运行时与出货，2026-10-17 新建）。三者分工 **R = 画得对 / E = 用得顺 / G = 出得去**。  
+> ⚠ **R 系列里有 5 项（R5-2 / R5-3 / R6-2 ~ R6-5）是 G 系列的硬前置** ——
+> 它们的"运行时消费端"在 `ship_roadmap.md` 的 G21~G25，**R 侧落地时 G 侧的消费路径才第一次真正被用到**。
+> 换言之：这几项**不是"可选的美化"**，而是"开放世界能不能做出来"的分水岭。
 
 ## 使用约定
 

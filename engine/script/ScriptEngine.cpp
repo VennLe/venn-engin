@@ -16,21 +16,21 @@
 #include <unordered_map>
 #include <utility>
 
-namespace editor {
+namespace vks {
 
 // ============================================================
 // AST —— 头文件只做前向声明（struct Expr; struct Stmt;），
 // 完整定义留在本 .cpp 里：语法细节不对外暴露，但类型身份必须是
-// editor::Expr / editor::Stmt —— 也就是头文件里 StmtPtr / ExprPtr
+// vks::Expr / vks::Stmt —— 也就是头文件里 StmtPtr / ExprPtr
 // 指向的那两个类型。
 //
 // 注意：**绝不能**把这两个结构体放进下面的匿名命名空间。
-// 匿名命名空间里的 Expr/Stmt 是**另外两个类型**，和 editor::Expr /
-// editor::Stmt 毫无关系，于是 StmtPtr 与 parse* 的返回值对不上，
+// 匿名命名空间里的 Expr/Stmt 是**另外两个类型**，和 vks::Expr /
+// vks::Stmt 毫无关系，于是 StmtPtr 与 parse* 的返回值对不上，
 // 编译器会报一堆 "could not convert unique_ptr<anonymous::Stmt> to
-// unique_ptr<editor::Stmt>"。
+// unique_ptr<vks::Stmt>"。
 //
-// 放在 namespace editor 里同样对外不可见：别的编译单元只看到前向
+// 放在 namespace vks 里同样对外不可见：别的编译单元只看到前向
 // 声明，拿不到布局，更无法构造。
 // ============================================================
 
@@ -1163,4 +1163,4 @@ std::vector<std::string> ScriptEngine::loadedPaths() const {
     return out;
 }
 
-} // namespace editor
+} // namespace vks

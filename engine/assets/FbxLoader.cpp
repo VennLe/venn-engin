@@ -212,10 +212,21 @@ Material* fbxMaterial(AssetManager& assets, const ufbx_material& mat,
         roughness = (float)mat.pbr.roughness.value_real;
     if (mat.pbr.metalness.has_value)
         metallic = (float)mat.pbr.metalness.value_real;
+    // ⚠ 自发光必须乘 `EmissiveFactor`（2026-10-17 修）：
+    //   FBX 里 `EmissiveColor` **恒写成 (1,1,1)**，"到底发不发光"由
+    //   `EmissiveFactor` 决定。绝大多数导出器（含 Maya/Blender 的 FBX
+    //   导出）都会写 (1,1,1) + Factor 0，表示"不自发光"。
+    //   旧代码只看 `pbr.emission_color.value_vec3`、把 Factor 丢掉 → 每一具
+    //   FBX 模型都变成**纯白自发光**：光照怎么调都没反应，预览里永远是一张
+    //   白色剪影（实测 assets/models/anime_girl.fbx 的 7 个材质全是
+    //   color=(1,1,1) + factor=0.00）。同一模型的 .glb 版本没有这个问题 ——
+    //   这就是当初"为什么 glb 正常、fbx 发白"的全部原因。
     if (mat.pbr.emission_color.has_value)
         emissive = {(float)mat.pbr.emission_color.value_vec3.x,
                     (float)mat.pbr.emission_color.value_vec3.y,
                     (float)mat.pbr.emission_color.value_vec3.z};
+    if (mat.fbx.emission_factor.has_value)
+        emissive *= (float)mat.fbx.emission_factor.value_real;
 
     // albedo 贴图：pbr.base_color.texture 优先，回退 fbx.diffuse_color.texture
     Texture* albedo = nullptr;

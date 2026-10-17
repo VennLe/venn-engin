@@ -39,6 +39,33 @@ def center(rect):
     return (int((rect[0] + rect[2]) * 0.5), int((rect[1] + rect[3]) * 0.5))
 
 
+# 鼠标左键按下 / 抬起（drag 用）
+_MOUSEEVENTF_LEFTDOWN = 0x0002
+_MOUSEEVENTF_LEFTUP = 0x0004
+
+
+def drag_client(hwnd, x0, y0, x1, y1, steps=10, hold=0.05):
+    """在**客户区坐标**上按住左键从 (x0,y0) 拖到 (x1,y1)。
+
+    用真鼠标事件（SetCursorPos + mouse_event）而不是直投 WM_MOUSEMOVE：
+    ImGui 的窗口 resize 抓的是光标位置，只发消息不给光标移动会被当成
+    "没动"。坐标一律走 client_to_screen 换算，避免标题栏高度差。
+    """
+    sx, sy = client_to_screen(hwnd, int(x0), int(y0))
+    user32.SetCursorPos(sx, sy)
+    time.sleep(0.25)
+    user32.mouse_event(_MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    time.sleep(0.15)
+    for i in range(1, steps + 1):
+        px = x0 + (x1 - x0) * i / steps
+        py = y0 + (y1 - y0) * i / steps
+        cx, cy = client_to_screen(hwnd, int(px), int(py))
+        user32.SetCursorPos(cx, cy)
+        time.sleep(hold)
+    user32.mouse_event(_MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    time.sleep(0.35)
+
+
 def wait_line(tap, needle, timeout=8.0):
     end = time.time() + timeout
     while time.time() < end:
@@ -201,19 +228,79 @@ def main():
                       grep_lines(tap, "play clip")[-1] if grep_lines(
                           tap, "play clip") else "没等到")
 
-        # ---- 8) 截图（人工核对预览视口 + 左侧属性栏布局）----
+        # ---- 8) 默认尺寸够大（2026-10-17 用户报"窗口太小"）----
+        #
+        # ⚠ 只看截图是靠不住的：第 9 步的拖动会把窗口改小，所以**截图必须
+        #   拍在拖动之前**，否则"窗口太小"其实是测试自己拖出来的假象。
+        #   真正的判据是 ImGui 自己报的 CHAR-WIN 矩形。
+        #
+        # 目标值（代码里 defW/defH，客户区 1578×844 时）：
+        #   0.78 * 1578 = 1231，0.82 * 844 = 692，下限 980×620。
+        # 这里只断言"明显大于旧的 760×560"，不去咬具体数值 —— 脚本会在
+        # 不同显示器上跑，咬死 1231 就是给自己埋一个换机器才红的坑。
+        win_rect = wait_valid_rect(tap, "CHAR-WIN", 5.0)
+        check("拿到角色窗口矩形（CHAR-WIN）", win_rect is not None)
+        if win_rect:
+            ww = win_rect[2] - win_rect[0]
+            wh = win_rect[3] - win_rect[1]
+            check("角色窗口默认尺寸够大（>旧版 760×560）",
+                  ww > 800 and wh > 560,
+                  "%.0fx%.0f" % (ww, wh))
+
+        # ---- 9) 截图（拖动之前，人工核对预览视口 + 三栏布局）----
         time.sleep(1.2)
         img = capture_client(hwnd)[0]
         png = os.path.join(OUT_DIR, "character_window.png")
         img.save(png)
         check("角色窗口截图已保存", os.path.exists(png), png)
 
-        # ---- 9) 无验证层报错 ----
+        # ---- 10) 拖住窗口右下角改大小（2026-10-17 用户报的崩溃）----
+        #
+        # 症状：用鼠标拖角色窗口的边框改大小 → 程序直接退出。
+        # 根因：预览离屏链在**命令录制过程中**重建，RemoveTexture 把旧的
+        # VkDescriptorSet 释放掉，而本帧的 ImGui 绘制数据早就把那个句柄记进
+        # draw list 了 → vkCmdBindDescriptorSets 绑一个已释放的 set
+        # （VUID-vkCmdBindDescriptorSets-pDescriptorSets）。
+        # 修法见 Renderer::applyPendingResizes：重建推迟到 UI 构建之前。
+        #
+        # 断言分三层：① 拖完进程还活着；② 日志里没有那条 VUID；
+        #   ③ 尺寸下限（SetNextWindowSizeConstraints 880×560）真的兜住了 ——
+        #   这一条顺带证明"用户把窗口拖到很小也不会把预览视口挤没"。
+        # ⚠ 只断言①不够 —— 关掉验证层时同样的 UAF 可能"侥幸不崩"。
+        resized = False
+        if win_rect:
+            # 每次拖动都从**当前**右下角出发：用同一个旧坐标连拖三次，
+            # 光标会先跳回原处再走，ImGui 的 resize 抓取会中途丢失。
+            for (fx, fy) in [(-380, -260), (60, 40), (-120, -60), (-300, -200)]:
+                time.sleep(0.25)   # 等上一轮的尺寸落进日志（logRect 有去抖）
+                cur = wait_valid_rect(tap, "CHAR-WIN", 1.5) or win_rect
+                x0 = cur[2] - 3
+                y0 = cur[3] - 3
+                drag_client(hwnd, x0, y0, x0 + fx, y0 + fy)
+                if proc.poll() is not None:
+                    break
+            resized = proc.poll() is None
+            check("拖动窗口边框改大小后进程仍存活", resized,
+                  "崩溃时预览链正在重建" if not resized else "ok")
+
+            time.sleep(0.5)
+            final_rect = wait_valid_rect(tap, "CHAR-WIN", 2.0)
+            if resized and final_rect:
+                fw = final_rect[2] - final_rect[0]
+                fh = final_rect[3] - final_rect[1]
+                check("拖到很小也被下限兜住（>=880×560）",
+                      fw >= 878 and fh >= 558, "%.0fx%.0f" % (fw, fh))
+            time.sleep(0.6)
+            img = capture_client(hwnd)[0]
+            png2 = os.path.join(OUT_DIR, "character_window_resized.png")
+            img.save(png2)
+
+        # ---- 11) 无验证层报错 ----
         errors = grep_lines(tap, r"(ERROR|VALIDATION|VUID)")
         check("无 Vulkan 验证层报错", len(errors) == 0,
               "; ".join(errors[:3]) if errors else "clean")
 
-        # ---- 10) 再跑几秒确认稳定 ----
+        # ---- 12) 再跑几秒确认稳定 ----
         time.sleep(2.0)
         alive = proc.poll() is None
         check("编辑器持续运行无崩溃", alive)

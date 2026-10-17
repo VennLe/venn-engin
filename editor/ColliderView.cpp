@@ -19,8 +19,10 @@
 namespace editor {
 namespace {
 
-constexpr int kCapsuleRingSegments = 20;   // 两端圆的边数
-constexpr int kCapsuleArcSegments = 10;    // 端部半圆的边数
+constexpr int kCapsuleRingSegments = 24;   // 纬线环的边数
+constexpr int kCapsuleArcSegments = 6;     // 每条经线在**单个球冠**上的弧段数
+constexpr int kCapsuleMeridians = 12;      // 经线条数（每 30° 一条）
+constexpr float kPi = 3.14159265358979323846f;
 
 const ImU32 kColIdle = IM_COL32(96, 208, 196, 165);      // 普通碰撞框：青
 const ImU32 kColSelected = IM_COL32(255, 202, 74, 225);  // 选中：金黄
@@ -50,6 +52,20 @@ void ColliderView::buildSegments(const ecs::CollisionComponent& cc,
     }
 
     // ---- 胶囊：轴 = 局部 +Z ----
+    //
+    // 尺寸约定（与 ecs::CollisionComponent / 物理侧一致）：
+    //   r = 半径；h = **圆柱段**的半高（不含两端半球）
+    //   ⇒ 整根胶囊从 z = -(h+r) 到 z = +(h+r)。
+    //
+    // 2026-10-17 重写：原来的画法只在 XZ / YZ 两个平面画端部半圆，四个
+    // 45° 方向上球冠是**空的**，看起来"少了一块"，两端像两片薄薄的镜头
+    // 而不是半球。现在的画法和 UE / Unity 的调试胶囊一致：
+    //
+    //   (1) **经线**：每 30° 一条，从北极沿上半球下来 → 沿圆柱直下 →
+    //       沿下半球到南极。一条线贯通整根胶囊，所以球冠与圆柱天然接上。
+    //   (2) **纬线环**：圆柱两端 z = ±h 各一圈（半径 r，这就是"赤道"），
+    //       两端球冠各再补一圈 45° 环（半径 r/√2）—— 有了它球冠看起来
+    //       才是个球面，而不是一顶光秃秃的伞。
     const float r = cc.capsuleRadius;
     const float h = cc.capsuleHalfHeight;
 
@@ -57,41 +73,53 @@ void ColliderView::buildSegments(const ecs::CollisionComponent& cc,
         return glm::vec3(xform * glm::vec4(p, 1.0f));
     };
 
-    // 两端圆
-    for (int end = 0; end < 2; ++end) {
-        const float z = end == 0 ? h : -h;
-        glm::vec3 prev;
-        for (int i = 0; i <= kCapsuleRingSegments; ++i) {
-            const float a = 2.0f * 3.14159265f * static_cast<float>(i) /
-                            static_cast<float>(kCapsuleRingSegments);
-            const glm::vec3 p(r * std::cos(a), r * std::sin(a), z);
-            if (i > 0) pushSeg(out, toWorld(prev), toWorld(p));
+    // ---- (1) 经线 ----
+    for (int m = 0; m < kCapsuleMeridians; ++m) {
+        const float a = 2.0f * kPi * static_cast<float>(m) /
+                        static_cast<float>(kCapsuleMeridians);
+        const float ca = std::cos(a);
+        const float sa = std::sin(a);
+
+        glm::vec3 prev(0.0f, 0.0f, h + r);            // 北极
+        // 上半球：theta 0 → 90°，半径 r*sin、高度 h + r*cos
+        for (int i = 1; i <= kCapsuleArcSegments; ++i) {
+            const float t = 0.5f * kPi * static_cast<float>(i) /
+                            static_cast<float>(kCapsuleArcSegments);
+            const glm::vec3 p(r * std::sin(t) * ca, r * std::sin(t) * sa,
+                              h + r * std::cos(t));
+            pushSeg(out, toWorld(prev), toWorld(p));
+            prev = p;
+        }
+        // 母线（圆柱段）
+        const glm::vec3 low(r * ca, r * sa, -h);
+        pushSeg(out, toWorld(prev), toWorld(low));
+        prev = low;
+        // 下半球：theta 0 → 90°，半径 r*cos、高度 -h - r*sin
+        for (int i = 1; i <= kCapsuleArcSegments; ++i) {
+            const float t = 0.5f * kPi * static_cast<float>(i) /
+                            static_cast<float>(kCapsuleArcSegments);
+            const glm::vec3 p(r * std::cos(t) * ca, r * std::cos(t) * sa,
+                              -h - r * std::sin(t));
+            pushSeg(out, toWorld(prev), toWorld(p));
             prev = p;
         }
     }
 
-    // 四条母线（圆的 0/90/180/270 度处）
-    for (int k = 0; k < 4; ++k) {
-        const float a = 0.5f * 3.14159265f * static_cast<float>(k);
-        const glm::vec3 dir(r * std::cos(a), r * std::sin(a), 0.0f);
-        pushSeg(out, toWorld(dir + glm::vec3(0, 0, h)),
-                toWorld(dir + glm::vec3(0, 0, -h)));
-    }
-
-    // 端部半圆：XZ 与 YZ 两个平面各画一道，合起来就是个"球冠"的轮廓
-    for (int end = 0; end < 2; ++end) {
-        const float sign = end == 0 ? 1.0f : -1.0f;
-        for (int plane = 0; plane < 2; ++plane) {
-            glm::vec3 prev;
-            for (int i = 0; i <= kCapsuleArcSegments; ++i) {
-                const float a = 3.14159265f * static_cast<float>(i) /
-                                static_cast<float>(kCapsuleArcSegments);
-                const float s = std::sin(a) * r;
-                const float c = std::cos(a) * r;
-                const glm::vec3 p = (plane == 0)
-                                        ? glm::vec3(s, 0.0f, sign * (h + c))
-                                        : glm::vec3(0.0f, s, sign * (h + c));
-                if (i > 0) pushSeg(out, toWorld(prev), toWorld(p));
+    // ---- (2) 纬线环 ----
+    // 顺序：圆柱下端赤道 → 圆柱上端赤道 → 下端 45° 环 → 上端 45° 环
+    {
+        const float rc = r * 0.70710678f;    // r/√2：45° 处的半径
+        const float zc = r * 0.70710678f;    // 球冠中心到 45° 环的高度差
+        const float ringZ[4] = {h, -h, h + zc, -h - zc};
+        const float ringR[4] = {r, r, rc, rc};
+        for (int k = 0; k < 4; ++k) {
+            glm::vec3 prev(ringR[k], 0.0f, ringZ[k]);
+            for (int i = 1; i <= kCapsuleRingSegments; ++i) {
+                const float a = 2.0f * kPi * static_cast<float>(i) /
+                                static_cast<float>(kCapsuleRingSegments);
+                const glm::vec3 p(ringR[k] * std::cos(a),
+                                  ringR[k] * std::sin(a), ringZ[k]);
+                pushSeg(out, toWorld(prev), toWorld(p));
                 prev = p;
             }
         }

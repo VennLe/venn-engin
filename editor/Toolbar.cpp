@@ -1,9 +1,13 @@
 #include "Toolbar.h"
 
+#include "Localization.h"
+#include "DebugRects.h"    // logRect：MYVK_LOG_RECTS 下把顶栏矩形打给脚本
 #include "EditorScene.h"
 #include "PanelRegistry.h"
 #include "Workspace.h"
 #include "script/ScriptEngine.h"
+
+#include "ui/ImGuiTheme.h"
 
 #include "assets/AssetPath.h"
 #include "core/Logger.h"
@@ -48,7 +52,7 @@ void Toolbar::newScene() {
     resetToEmptyScene(m_ctx.editorScene(), m_ctx.assets());
     // onSceneReplaced() 里会把相机重设成编辑态模式（显式输入 + 自由飞行）
     m_ctx.onSceneReplaced();
-    m_ctx.notify("New empty scene");
+    m_ctx.notify(TR("New empty scene"));
     VK_LOG_INFO("Editor: new empty scene");
 }
 
@@ -60,11 +64,11 @@ void Toolbar::openScene(const std::string& relPath) {
         m_ctx.onSceneReplaced();
         m_ctx.scenePath() = relPath;
         m_ctx.pushRecentScene(relPath);
-        m_ctx.notify("Opened " + relPath);
+        m_ctx.notify(TR("Opened ") + relPath);
         VK_LOG_INFO("Scene opened: '%s' (%zu entities)", relPath.c_str(),
                     m_ctx.editorScene().objectCount());
     } else {
-        m_ctx.notify("Open failed: " + r.error);
+        m_ctx.notify(TR("Open failed: ") + r.error);
         VK_LOG_WARN("Scene open failed for '%s': %s", relPath.c_str(),
                     r.error.c_str());
     }
@@ -77,11 +81,11 @@ void Toolbar::saveSceneAs(const std::string& relPath) {
         m_ctx.scenePath() = relPath;
         m_ctx.dirty() = false;
         m_ctx.pushRecentScene(relPath);
-        m_ctx.notify("Saved " + relPath + " (" + std::to_string(r.entities) +
-                     " entities)");
+        m_ctx.notify(std::string(TR("Saved ")) + relPath + " (" +
+                     std::to_string(r.entities) + TR(" entities)"));
         VK_LOG_INFO("Scene saved: '%s'", abs.c_str());
     } else {
-        m_ctx.notify("Save failed: " + r.error);
+        m_ctx.notify(TR("Save failed: ") + r.error);
         VK_LOG_WARN("Scene save failed for '%s': %s", abs.c_str(),
                     r.error.c_str());
     }
@@ -111,7 +115,7 @@ void Toolbar::drawPanelMenu() {
             bool open = panelOpen(i);
             const char* sc = (t[i].shortcut && t[i].shortcut[0]) ? t[i].shortcut
                                                                  : nullptr;
-            if (ImGui::MenuItem(t[i].title, sc, &open)) {
+            if (ImGui::MenuItem(TR(t[i].title), sc, &open)) {
                 setPanelOpen(i, open);
                 m_ctx.notify(std::string(t[i].title) +
                              (open ? " shown" : " hidden"));
@@ -125,25 +129,25 @@ void Toolbar::drawWorkspaceMenu() {
     const int cur = m_ctx.workspace().current();
     for (int i = 0; i < kWorkspaceCount; ++i) {
         char label[192];
-        std::snprintf(label, sizeof(label), "%s##ws_%s", kWorkspaces[i].title,
+        std::snprintf(label, sizeof(label), "%s##ws_%s", TR(kWorkspaces[i].title),
                       kWorkspaces[i].id);
         const bool selected = (i == cur);
         if (ImGui::MenuItem(label, nullptr, selected)) {
             m_host.applyWorkspace(i);
-            m_ctx.notify(std::string("Workspace: ") + kWorkspaces[i].title);
+            m_ctx.notify(std::string(TR("Workspace: ")) + TR(kWorkspaces[i].title));
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kWorkspaces[i].hint);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(TR(kWorkspaces[i].hint));
     }
     ImGui::Separator();
     char saveLabel[96];
     std::snprintf(saveLabel, sizeof(saveLabel), "Save Workspace%s",
                   m_ctx.workspaceModified() ? "  *" : "");
     if (ImGui::MenuItem(saveLabel)) m_host.saveWorkspace();
-    if (ImGui::MenuItem("Reset Workspace")) m_host.resetWorkspace();
+    if (ImGui::MenuItem(TR("Reset Workspace"))) m_host.resetWorkspace();
     ImGui::Separator();
-    ImGui::MenuItem("Ctrl+Alt+1..6 switches workspaces", nullptr, false, false);
+    ImGui::MenuItem(TR("Ctrl+Alt+1..6 switches workspaces"), nullptr, false, false);
     if (m_ctx.workspaceModified()) {
-        ImGui::TextDisabled("current layout differs from the preset (*)");
+        ImGui::TextDisabled(TR("current layout differs from the preset (*)"));
     }
 }
 
@@ -166,16 +170,16 @@ void Toolbar::drawMenuBar() {
     // ================================================================
     // File
     // ================================================================
-    if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("New Scene", "Ctrl+N")) newScene();
+    if (ImGui::BeginMenu(TR("File"))) {
+        if (ImGui::MenuItem(TR("New Scene"), "Ctrl+N")) newScene();
 
         ImGui::Separator();
-        if (ImGui::MenuItem("Open (current path)", "Ctrl+O")) {
+        if (ImGui::MenuItem(TR("Open (current path)"), "Ctrl+O")) {
             openScene(m_ctx.scenePath());
         }
 
         // ---- Open Recent ▸（最近 10 个，最新在前）----
-        if (ImGui::BeginMenu("Open Recent", !m_ctx.recentScenes().empty())) {
+        if (ImGui::BeginMenu(TR("Open Recent"), !m_ctx.recentScenes().empty())) {
             // 拷贝一份再遍历：菜单项点下去会改 recent（pushRecentScene），
             // 直接在原容器上迭代就是"边遍历边改"。
             const std::vector<std::string> items = m_ctx.recentScenes();
@@ -186,15 +190,15 @@ void Toolbar::drawMenuBar() {
                 if (ImGui::MenuItem(label)) openScene(items[i]);
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Clear Recent")) {
+            if (ImGui::MenuItem(TR("Clear Recent"))) {
                 m_ctx.recentScenesRef().clear();
             }
             ImGui::EndMenu();
         }
 
         ImGui::Separator();
-        if (ImGui::MenuItem("Save", "Ctrl+S")) saveSceneToCurrentPath();
-        if (ImGui::MenuItem("Save As (assets/scenes/scene.json)")) {
+        if (ImGui::MenuItem(TR("Save"), "Ctrl+S")) saveSceneToCurrentPath();
+        if (ImGui::MenuItem(TR("Save As (assets/scenes/scene.json)"))) {
             saveSceneAs("assets/scenes/scene.json");
         }
 
@@ -204,33 +208,33 @@ void Toolbar::drawMenuBar() {
         // AcceptDragDropPayload）—— 这里给的是同一个动作的菜单入口：
         // 打开内容浏览器看一眼能拖什么。真正的"文件选择对话框"要等
         // 平台层有原生对话框（E28 打包 UI 会同批做）。
-        if (ImGui::BeginMenu("Import")) {
-            if (ImGui::MenuItem("Reveal assets/ in Content Browser")) {
-                m_ctx.notify("Drag a .gltf/.obj/.fbx from the Content "
-                             "browser into the viewport to place it");
+        if (ImGui::BeginMenu(TR("Import"))) {
+            if (ImGui::MenuItem(TR("Reveal assets/ in Content Browser"))) {
+                m_ctx.notify(TR("Drag a .gltf/.obj/.fbx from the Content "
+                             "browser into the viewport to place it"));
             }
-            ImGui::MenuItem("Native file dialog (E28)", nullptr, false, false);
+            ImGui::MenuItem(TR("Native file dialog (E28)"), nullptr, false, false);
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Export")) {
-            ImGui::MenuItem("Export scene as glTF (E28)", nullptr, false,
+        if (ImGui::BeginMenu(TR("Export"))) {
+            ImGui::MenuItem(TR("Export scene as glTF (E28)"), nullptr, false,
                             false);
             ImGui::EndMenu();
         }
 
         ImGui::Separator();
-        if (ImGui::MenuItem("Reload Scripts")) {
-            m_ctx.notify("(scripts hot-reload automatically)");
+        if (ImGui::MenuItem(TR("Reload Scripts"))) {
+            m_ctx.notify(TR("(scripts hot-reload automatically)"));
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Quit", "Alt+F4")) m_ctx.quitRequested() = true;
+        if (ImGui::MenuItem(TR("Quit"), "Alt+F4")) m_ctx.quitRequested() = true;
         ImGui::EndMenu();
     }
 
     // ================================================================
     // Edit
     // ================================================================
-    if (ImGui::BeginMenu("Edit")) {
+    if (ImGui::BeginMenu(TR("Edit"))) {
         ImGui::BeginDisabled(!m_ctx.commands().canUndo());
         std::string undoLabel = "Undo";
         if (m_ctx.commands().canUndo())
@@ -247,7 +251,7 @@ void Toolbar::drawMenuBar() {
 
         // ---- History ▸：撤销栈可视化（原来是一段平铺的列表，改成子菜单）----
         const auto names = m_ctx.commands().historyNames();
-        if (ImGui::BeginMenu("History", !names.empty())) {
+        if (ImGui::BeginMenu(TR("History"), !names.empty())) {
             const size_t cursor = m_ctx.commands().cursor();
             for (size_t i = names.size(); i-- > 0;) {
                 const bool applied = i < cursor;
@@ -257,17 +261,17 @@ void Toolbar::drawMenuBar() {
                 ImGui::MenuItem(label, nullptr, false, false);
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Clear History")) {
+            if (ImGui::MenuItem(TR("Clear History"))) {
                 m_ctx.commands().clear();
-                m_ctx.notify("History cleared");
+                m_ctx.notify(TR("History cleared"));
             }
             ImGui::EndMenu();
         }
 
         ImGui::Separator();
         ImGui::BeginDisabled(!m_ctx.hasSelection());
-        if (ImGui::MenuItem("Duplicate", "Ctrl+D")) {
-            m_ctx.notify("Use Ctrl+D / the Hierarchy context menu");
+        if (ImGui::MenuItem(TR("Duplicate"), "Ctrl+D")) {
+            m_ctx.notify(TR("Use Ctrl+D / the Hierarchy context menu"));
         }
         ImGui::EndDisabled();
 
@@ -276,29 +280,29 @@ void Toolbar::drawMenuBar() {
         // ⚠ Select All / Invert 需要**多选**，而当前的选择模型是单个
         //   Entity（EditorContext::m_selection）。这两项故意禁用而不是
         //   假装能用 —— 多选随 E11（Inspector 升级）/ E22（选择增强）落地。
-        ImGui::MenuItem("Select None", "Esc", false, false);
-        if (ImGui::MenuItem("Deselect")) m_ctx.clearSelection();
+        ImGui::MenuItem(TR("Select None"), "Esc", false, false);
+        if (ImGui::MenuItem(TR("Deselect"))) m_ctx.clearSelection();
         ImGui::BeginDisabled(true);
-        ImGui::MenuItem("Select All", "Ctrl+A", false, false);
-        ImGui::MenuItem("Invert Selection", nullptr, false, false);
+        ImGui::MenuItem(TR("Select All"), "Ctrl+A", false, false);
+        ImGui::MenuItem(TR("Invert Selection"), nullptr, false, false);
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("multi-selection lands with E11 / E22");
+            ImGui::SetTooltip(TR("multi-selection lands with E11 / E22"));
         }
 
         ImGui::Separator();
-        if (ImGui::MenuItem("Project Settings...")) {
-            m_ctx.notify("Project settings panel lands with E26 "
-                         "(quality tiers)");
+        if (ImGui::MenuItem(TR("Project Settings..."))) {
+            m_ctx.notify(TR("Project settings panel lands with E26 "
+                         "(quality tiers)"));
         }
-        if (ImGui::MenuItem("Editor Preferences...")) m_ctx.showSettings() = true;
+        if (ImGui::MenuItem(TR("Editor Preferences..."))) m_ctx.showSettings() = true;
         ImGui::EndMenu();
     }
 
     // ================================================================
     // GameObject（保持既有内容不动）
     // ================================================================
-    if (ImGui::BeginMenu("GameObject")) {
+    if (ImGui::BeginMenu(TR("GameObject"))) {
         static const PrimitiveKind kinds[] = {
             PrimitiveKind::Cube,      PrimitiveKind::Sphere,
             PrimitiveKind::Cylinder,  PrimitiveKind::Plane,
@@ -318,14 +322,14 @@ void Toolbar::drawMenuBar() {
         }
         // 特殊灯光条目（语义不在 PrimitiveKind 里，见 EditorScene.h）
         ImGui::Separator();
-        if (ImGui::MenuItem("Sunlight")) {
+        if (ImGui::MenuItem(TR("Sunlight"))) {
             ecs::Entity sun{};
             m_ctx.structuralEdit("Add Sunlight", [&]() {
                 sun = createSunlight(m_ctx.editorScene());
             });
             if (sun.valid()) m_ctx.select(sun);
         }
-        if (ImGui::MenuItem("Directional Light")) {
+        if (ImGui::MenuItem(TR("Directional Light"))) {
             ecs::Entity created{};
             m_ctx.structuralEdit("Add Directional Light", [&]() {
                 created = createDirectionalLight(m_ctx.editorScene());
@@ -338,14 +342,14 @@ void Toolbar::drawMenuBar() {
     // ================================================================
     // View
     // ================================================================
-    if (ImGui::BeginMenu("View")) {
-        if (ImGui::BeginMenu("View Mode")) {
+    if (ImGui::BeginMenu(TR("View"))) {
+        if (ImGui::BeginMenu(TR("View Mode"))) {
             drawViewModeMenu();
             ImGui::EndMenu();
         }
 
         // 视口布局（E07）
-        if (ImGui::BeginMenu("Viewport Layout")) {
+        if (ImGui::BeginMenu(TR("Viewport Layout"))) {
             const int cur = m_host.currentViewportLayout();
             for (int i = 0; i < viewportLayoutCount(); ++i) {
                 const auto l = static_cast<ViewportLayout>(i);
@@ -361,28 +365,28 @@ void Toolbar::drawMenuBar() {
             ImGui::EndMenu();
         }
 
-        if (ImGui::BeginMenu("Panel")) {
+        if (ImGui::BeginMenu(TR("Panel"))) {
             drawPanelMenu();
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Workspace")) {
+        if (ImGui::BeginMenu(TR("Workspace"))) {
             drawWorkspaceMenu();
             ImGui::EndMenu();
         }
 
         ImGui::Separator();
         // 地平面栅格（和视口右上角浮层里那个勾选框是同一份状态）
-        ImGui::MenuItem("Ground grid (1 m)", nullptr, &m_ctx.showGridRef());
-        if (ImGui::MenuItem("Maximize focused panel", "Shift+Space")) {
-            m_ctx.notify("Shift+Space over a panel toggles maximize");
+        ImGui::MenuItem(TR("Ground grid (1 m)"), nullptr, &m_ctx.showGridRef());
+        if (ImGui::MenuItem(TR("Maximize focused panel"), "Shift+Space")) {
+            m_ctx.notify(TR("Shift+Space over a panel toggles maximize"));
         }
-        if (ImGui::MenuItem("Reset Layout")) {
+        if (ImGui::MenuItem(TR("Reset Layout"))) {
             m_ctx.relayout() = true;
-            m_ctx.notify("Layout reset");
+            m_ctx.notify(TR("Layout reset"));
         }
         ImGui::Separator();
         // 窗口真全屏（面板照旧显示）。Play 态的 F 是"全屏 + 只看游戏"。
-        if (ImGui::MenuItem("Toggle Fullscreen", "F11")) {
+        if (ImGui::MenuItem(TR("Toggle Fullscreen"), "F11")) {
             m_ctx.windowFullscreenRequest() = true;
         }
         ImGui::EndMenu();
@@ -391,15 +395,15 @@ void Toolbar::drawMenuBar() {
     // ================================================================
     // Build（新）
     // ================================================================
-    if (ImGui::BeginMenu("Build")) {
-        if (ImGui::MenuItem("Reload Shaders", "Ctrl+Shift+R")) {
+    if (ImGui::BeginMenu(TR("Build"))) {
+        if (ImGui::MenuItem(TR("Reload Shaders"), "Ctrl+Shift+R")) {
             m_host.reloadShaders();
         }
-        if (ImGui::MenuItem("Reload Assets")) m_host.reloadAssets();
+        if (ImGui::MenuItem(TR("Reload Assets"))) m_host.reloadAssets();
         ImGui::Separator();
         ImGui::BeginDisabled(true);
-        ImGui::MenuItem("Package... (E28)", nullptr, false, false);
-        ImGui::MenuItem("Bake Lighting... (E29)", nullptr, false, false);
+        ImGui::MenuItem(TR("Package... (E28)"), nullptr, false, false);
+        ImGui::MenuItem(TR("Bake Lighting... (E29)"), nullptr, false, false);
         ImGui::EndDisabled();
         ImGui::EndMenu();
     }
@@ -407,19 +411,19 @@ void Toolbar::drawMenuBar() {
     // ================================================================
     // Window（面板显隐 + 工作区，和 View 里那两个子菜单同源）
     // ================================================================
-    if (ImGui::BeginMenu("Window")) {
-        if (ImGui::BeginMenu("Panels")) {
+    if (ImGui::BeginMenu(TR("Window"))) {
+        if (ImGui::BeginMenu(TR("Panels"))) {
             drawPanelMenu();
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Workspaces")) {
+        if (ImGui::BeginMenu(TR("Workspaces"))) {
             drawWorkspaceMenu();
             ImGui::EndMenu();
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Reset Layout")) {
+        if (ImGui::MenuItem(TR("Reset Layout"))) {
             m_ctx.relayout() = true;
-            m_ctx.notify("Layout reset");
+            m_ctx.notify(TR("Layout reset"));
         }
         ImGui::EndMenu();
     }
@@ -427,55 +431,55 @@ void Toolbar::drawMenuBar() {
     // ================================================================
     // Help
     // ================================================================
-    if (ImGui::BeginMenu("Help")) {
+    if (ImGui::BeginMenu(TR("Help"))) {
         // E18：命令面板（可发现性的总入口）
-        if (ImGui::MenuItem("Command Palette...", "Ctrl+Shift+P"))
+        if (ImGui::MenuItem(TR("Command Palette..."), "Ctrl+Shift+P"))
             m_host.showCommandPalette();
         // E21：错过的 WARN/ERROR 都在这里（Toast 只活 4 秒）
-        if (ImGui::MenuItem("Show Notification History"))
+        if (ImGui::MenuItem(TR("Show Notification History")))
             m_host.showNotificationHistory();
-        if (ImGui::MenuItem("Shortcut Reference")) m_showShortcuts = true;
-        ImGui::SeparatorText("Viewport navigation (edit mode)");
-        ImGui::MenuItem("Hold RMB + drag: look around", nullptr, false, false);
-        ImGui::MenuItem("Hold RMB + WASD: fly   Q / E: down / up", nullptr,
+        if (ImGui::MenuItem(TR("Shortcut Reference"))) m_showShortcuts = true;
+        ImGui::SeparatorText(TR("Viewport navigation (edit mode)"));
+        ImGui::MenuItem(TR("Hold RMB + drag: look around"), nullptr, false, false);
+        ImGui::MenuItem(TR("Hold RMB + WASD: fly   Q / E: down / up"), nullptr,
                         false, false);
-        ImGui::MenuItem("Hold MMB + drag: pan   Shift: fly faster", nullptr,
+        ImGui::MenuItem(TR("Hold MMB + drag: pan   Shift: fly faster"), nullptr,
                         false, false);
-        ImGui::MenuItem("Wheel: dolly in / out", nullptr, false, false);
-        ImGui::MenuItem("Hold RMB + wheel: navigation sensitivity", nullptr,
+        ImGui::MenuItem(TR("Wheel: dolly in / out"), nullptr, false, false);
+        ImGui::MenuItem(TR("Hold RMB + wheel: navigation sensitivity"), nullptr,
                         false, false);
-        ImGui::SeparatorText("Editing");
+        ImGui::SeparatorText(TR("Editing"));
         ImGui::MenuItem(
-            "W / E / R: gizmo mode   X: world / local   (not while RMB)",
+            TR("W / E / R: gizmo mode   X: world / local   (not while RMB)"),
             nullptr, false, false);
-        ImGui::MenuItem("G: snapping on/off for the current tool", nullptr,
+        ImGui::MenuItem(TR("G: snapping on/off for the current tool"), nullptr,
                         false, false);
-        ImGui::MenuItem("F: focus selection   Del: delete", nullptr, false,
+        ImGui::MenuItem(TR("F: focus selection   Del: delete"), nullptr, false,
                         false);
-        ImGui::MenuItem("Shift+A (in viewport): add menu (Mesh / Light)",
+        ImGui::MenuItem(TR("Shift+A (in viewport): add menu (Mesh / Light)"),
                         nullptr, false, false);
-        ImGui::MenuItem("F2: rename (Hierarchy)   Ctrl+D: duplicate", nullptr,
+        ImGui::MenuItem(TR("F2: rename (Hierarchy)   Ctrl+D: duplicate"), nullptr,
                         false, false);
-        ImGui::SeparatorText("Panels & workspaces");
-        ImGui::MenuItem("Alt+1..8: toggle a panel", nullptr, false, false);
-        ImGui::MenuItem("Ctrl+Alt+1..6: switch workspace", nullptr, false,
+        ImGui::SeparatorText(TR("Panels & workspaces"));
+        ImGui::MenuItem(TR("Alt+1..8: toggle a panel"), nullptr, false, false);
+        ImGui::MenuItem(TR("Ctrl+Alt+1..6: switch workspace"), nullptr, false,
                         false);
-        ImGui::MenuItem("Shift+Space: maximize the panel under the mouse",
+        ImGui::MenuItem(TR("Shift+Space: maximize the panel under the mouse"),
                         nullptr, false, false);
-        ImGui::MenuItem("Double-click a splitter: collapse / expand", nullptr,
+        ImGui::MenuItem(TR("Double-click a splitter: collapse / expand"), nullptr,
                         false, false);
-        ImGui::MenuItem("Right-click a splitter: ratio presets", nullptr, false,
+        ImGui::MenuItem(TR("Right-click a splitter: ratio presets"), nullptr, false,
                         false);
-        ImGui::SeparatorText("Playing (game runs in the viewport)");
-        ImGui::MenuItem("Space: play / pause", nullptr, false, false);
-        ImGui::MenuItem("F: fullscreen, game only (Esc to leave)", nullptr,
+        ImGui::SeparatorText(TR("Playing (game runs in the viewport)"));
+        ImGui::MenuItem(TR("Space: play / pause"), nullptr, false, false);
+        ImGui::MenuItem(TR("F: fullscreen, game only (Esc to leave)"), nullptr,
                         false, false);
-        ImGui::MenuItem("F11: window fullscreen (works in any mode)", nullptr,
+        ImGui::MenuItem(TR("F11: window fullscreen (works in any mode)"), nullptr,
                         false, false);
         ImGui::Separator();
-        ImGui::MenuItem("API docs: docs/editor_architecture.md", nullptr, false,
+        ImGui::MenuItem(TR("API docs: docs/editor_architecture.md"), nullptr, false,
                         false);
-        if (ImGui::MenuItem("About Venn...")) m_showAbout = true;
+        if (ImGui::MenuItem(TR("About Venn..."))) m_showAbout = true;
         ImGui::EndMenu();
     }
 
@@ -484,10 +488,10 @@ void Toolbar::drawMenuBar() {
     ImGui::SameLine(ImGui::GetWindowWidth() - rightWidth);
     ImGui::TextColored(m_ctx.dirty() ? ImVec4(1.0f, 0.82f, 0.4f, 1.0f)
                                      : ImVec4(0.6f, 0.65f, 0.7f, 1.0f),
-                       "%s%s", m_ctx.scenePath().c_str(),
+                       TR("%s%s"), m_ctx.scenePath().c_str(),
                        m_ctx.dirty() ? " *" : "");
     ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.45f, 0.68f, 0.92f, 1.0f), "|  %s%s",
+    ImGui::TextColored(ImVec4(0.45f, 0.68f, 0.92f, 1.0f), TR("|  %s%s"),
                        m_ctx.workspace().currentTitle(),
                        m_ctx.workspaceModified() ? " *" : "");
 
@@ -522,7 +526,9 @@ void Toolbar::drawBar() {
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBringToFrontOnFocus;
 
     // 与菜单栏同色 → 视觉上和菜单栏连成一条"顶栏"（UE5 就是这么做的）
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.113f, 0.117f, 0.125f, 1.0f));
+    // ⚠ 走 token（不是硬编码）：浅色主题下硬编码会留成一条深色孤岛。
+    //   VennDark 的 tok.barBg 就等于改动前那个字面量 → 默认主题逐像素不变。
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::tokens().barBg);
     const ImVec2 pad(12.0f, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, pad);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(9.0f, 7.0f));
@@ -533,6 +539,11 @@ void Toolbar::drawBar() {
         ImGui::PopStyleColor();
         return;
     }
+    // 自动化锚点：顶栏矩形（脚本据此断言"顶栏底色跟主题走"—— 这一处原来
+    // 是硬编码深灰，浅色主题下会留成一条深色孤岛）。
+    logRect("TB-BAR", ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
+                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
 
     const ImGuiStyle& st = ImGui::GetStyle();
     // 按钮统一高度（比文字框略高，整条看起来是"一整块"而不是一行小控件）
@@ -554,7 +565,7 @@ void Toolbar::drawBar() {
         case GizmoMode::Scale:     modeName = "Scale"; break;
     }
     ImGui::SetCursorPos(ImVec2(pad.x, textY));
-    ImGui::TextDisabled("%s   (W / E / R)", modeName);
+    ImGui::TextDisabled(TR("%s   (W / E / R)"), modeName);
 
     // ---- 右侧：工具组（从右往左摆：Edit | Build | View）----
     float cursorRight = pad.x + barW;
@@ -570,7 +581,7 @@ void Toolbar::drawBar() {
         const float w = btnW("Undo") + btnW("Redo") + st.ItemSpacing.x;
         groupStart(w);
         ImGui::BeginDisabled(!m_ctx.commands().canUndo());
-        if (ImGui::Button("Undo", ImVec2(btnW("Undo"), btnH))) m_ctx.undo();
+        if (ImGui::Button(TR("Undo"), ImVec2(btnW("Undo"), btnH))) m_ctx.undo();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(m_ctx.commands().canUndo()
@@ -580,7 +591,7 @@ void Toolbar::drawBar() {
         }
         ImGui::SameLine();
         ImGui::BeginDisabled(!m_ctx.commands().canRedo());
-        if (ImGui::Button("Redo", ImVec2(btnW("Redo"), btnH))) m_ctx.redo();
+        if (ImGui::Button(TR("Redo"), ImVec2(btnW("Redo"), btnH))) m_ctx.redo();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(m_ctx.commands().canRedo()
@@ -595,11 +606,11 @@ void Toolbar::drawBar() {
     if (m_groups.build) {
         const float w = btnW("Reload Shaders");
         groupStart(w);
-        if (ImGui::Button("Reload Shaders", ImVec2(w, btnH))) {
+        if (ImGui::Button(TR("Reload Shaders"), ImVec2(w, btnH))) {
             m_host.reloadShaders();
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Re-scan .spv mtime now (Ctrl+Shift+R)");
+            ImGui::SetTooltip(TR("Re-scan .spv mtime now (Ctrl+Shift+R)"));
         }
         cursorRight -= st.ItemSpacing.x;
     }
@@ -644,7 +655,7 @@ void Toolbar::drawBar() {
             }
             if (on) ImGui::PopStyleColor();
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Viewport layout: %s", viewportLayoutName(l));
+                ImGui::SetTooltip(TR("Viewport layout: %s"), viewportLayoutName(l));
             }
             ImGui::SameLine();
         }
@@ -657,10 +668,10 @@ void Toolbar::drawBar() {
         ImGui::OpenPopup("##toolbar_groups");
     }
     if (ImGui::BeginPopup("##toolbar_groups")) {
-        ImGui::SeparatorText("Toolbar groups");
-        ImGui::MenuItem("Edit (Undo/Redo)", nullptr, &m_groups.transform);
-        ImGui::MenuItem("Build", nullptr, &m_groups.build);
-        ImGui::MenuItem("View (layout / view mode)", nullptr, &m_groups.view);
+        ImGui::SeparatorText(TR("Toolbar groups"));
+        ImGui::MenuItem(TR("Edit (Undo/Redo)"), nullptr, &m_groups.transform);
+        ImGui::MenuItem(TR("Build"), nullptr, &m_groups.build);
+        ImGui::MenuItem(TR("View (layout / view mode)"), nullptr, &m_groups.view);
         ImGui::EndPopup();
     }
 
@@ -678,16 +689,16 @@ void Toolbar::drawAboutWindow() {
     }
     if (ImGui::BeginPopupModal("About Venn", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Venn Engine  %s", m_host.engineVersion());
+        ImGui::Text(TR("Venn Engine  %s"), m_host.engineVersion());
         ImGui::Separator();
-        ImGui::Text("GPU: %s", m_host.gpuName());
-        ImGui::Text("Backend: Vulkan 1.2");
-        ImGui::Text("Renderer: clustered forward+ / MSAA / Hi-Z / cascaded "
-                    "shadows");
-        ImGui::Text("Editor build: %s %s", __DATE__, __TIME__);
+        ImGui::Text(TR("GPU: %s"), m_host.gpuName());
+        ImGui::Text(TR("Backend: Vulkan 1.2"));
+        ImGui::Text(TR("Renderer: clustered forward+ / MSAA / Hi-Z / cascaded "
+                    "shadows"));
+        ImGui::Text(TR("Editor build: %s %s"), __DATE__, __TIME__);
         ImGui::Separator();
-        ImGui::TextDisabled("docs/editor_roadmap.md is the live task list.");
-        if (ImGui::Button("Close", ImVec2(120.0f, 0.0f))) {
+        ImGui::TextDisabled(TR("docs/editor_roadmap.md is the live task list."));
+        if (ImGui::Button(TR("Close"), ImVec2(120.0f, 0.0f))) {
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -699,46 +710,52 @@ void Toolbar::drawShortcutReference() {
 
     ImGui::SetNextWindowSize(ImVec2(560.0f, 520.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(220.0f, 120.0f), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Shortcut Reference", &m_showShortcuts)) {
+    if (!ImGui::Begin(trId("Shortcut Reference", "shortcutref"), &m_showShortcuts)) {
         ImGui::End();
         return;
     }
 
-    ImGui::TextWrapped("Roughly what a 3A editor needs; the panel list below "
-                       "is generated from the panel registry, so it can never "
-                       "go stale.");
-    ImGui::SeparatorText("Panels (from the registry)");
+    // 说明不上屏：挂在标题行右边的小 "(?)" 上，悬浮才展开。
+    ImGui::SeparatorText(TR("Panels (from the registry)"));
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip("%s",
+                          TR("Roughly what a 3A editor needs; the panel list "
+                             "below is generated from the panel registry, so "
+                             "it can never go stale."));
+    }
     {
         const PanelDesc* t = panelTable();
         const int n = panelCount();
         for (int i = 0; i < n; ++i) {
-            ImGui::Text("%-10s %s",
+            ImGui::Text(TR("%-10s %s"),
                         (t[i].shortcut && t[i].shortcut[0]) ? t[i].shortcut : "-",
-                        t[i].title);
+                        TR(t[i].title));
         }
     }
 
-    ImGui::SeparatorText("Workspaces");
+    ImGui::SeparatorText(TR("Workspaces"));
     for (int i = 0; i < kWorkspaceCount; ++i) {
         char chord[32];
         std::snprintf(chord, sizeof(chord), "Ctrl+Alt+%d", i + 1);
-        ImGui::Text("%-12s %-10s %s", chord, kWorkspaces[i].title,
-                    kWorkspaces[i].hint);
+        ImGui::Text(TR("%-12s %-10s %s"), chord, TR(kWorkspaces[i].title),
+                    TR(kWorkspaces[i].hint));
     }
 
-    ImGui::SeparatorText("Layout");
-    ImGui::Text("%-12s %s", "Shift+Space", "maximize the panel under the mouse");
-    ImGui::Text("%-12s %s", "dbl-click", "collapse / expand a splitter");
-    ImGui::Text("%-12s %s", "right-click", "splitter ratio presets");
+    ImGui::SeparatorText(TR("Layout"));
+    ImGui::Text(TR("%-12s %s"), "Shift+Space", "maximize the panel under the mouse");
+    ImGui::Text(TR("%-12s %s"), "dbl-click", "collapse / expand a splitter");
+    ImGui::Text(TR("%-12s %s"), "right-click", "splitter ratio presets");
 
-    ImGui::SeparatorText("Edit / File");
-    ImGui::Text("%-12s %s", "Ctrl+Z/Y", "undo / redo");
-    ImGui::Text("%-12s %s", "Ctrl+D", "duplicate selection");
-    ImGui::Text("%-12s %s", "Ctrl+S", "save scene");
-    ImGui::Text("%-12s %s", "Ctrl+N", "new scene");
-    ImGui::Text("%-12s %s", "Del", "delete selection");
-    ImGui::Text("%-12s %s", "F2", "rename (Hierarchy)");
-    ImGui::Text("%-12s %s", "F11", "window fullscreen");
+    ImGui::SeparatorText(TR("Edit / File"));
+    ImGui::Text(TR("%-12s %s"), "Ctrl+Z/Y", "undo / redo");
+    ImGui::Text(TR("%-12s %s"), "Ctrl+D", "duplicate selection");
+    ImGui::Text(TR("%-12s %s"), "Ctrl+S", "save scene");
+    ImGui::Text(TR("%-12s %s"), "Ctrl+N", "new scene");
+    ImGui::Text(TR("%-12s %s"), "Del", "delete selection");
+    ImGui::Text(TR("%-12s %s"), "F2", "rename (Hierarchy)");
+    ImGui::Text(TR("%-12s %s"), "F11", "window fullscreen");
 
     ImGui::End();
 }

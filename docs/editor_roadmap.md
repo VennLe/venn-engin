@@ -10,6 +10,14 @@
 > 与渲染路线图（`docs/render_roadmap.md`，R 系列）的关系：  
 > **R 系列做"引擎能力"，E 系列做"人的入口"。** 二者**成对交付**——  
 > 任何 R 项完成时，它在 E 系列里的对应 UI 面必须同时落地（见 §8 准入契约）。
+>
+> 与游戏运行时路线图（`docs/ship_roadmap.md`，**G 系列**，2026-10-17 新建）的关系：  
+> **G 系列做"成品"**（能跑、能玩、能发）。三者的分工是 **R = 画得对 / E = 用得顺 / G = 出得去**。  
+> ⚠ **G 系列反过来会要求 E 系列的配套**（如 G11~G13 动画运行时需要 Animator 面板、
+> G18 Prefab 需要 ContentBrowser 拖拽与 Hierarchy 右键）—— 对照表见 `ship_roadmap.md` §12.1。  
+> ⚠ 另：`G02` 会把 `ScriptEngine` 从 `editor/script/` 搬到 `engine/script/`、
+> `G20` 会把 `Localization` 迁到 `engine/ui/`（分层要求，见其 §12.3）；这两次搬家**都会动到
+> `engine/**`（= `GLOBAL_GLOBS`）→ 各自那一轮必然全量回归**。
 
 ---
 
@@ -159,7 +167,7 @@ E01 ──► E02 ──► E09 ──► E10 ──► E04 ──► E05 ──
 - **规模**：**M**
 - **依赖**：E01
 
-### E03 · 设置层级与持久化
+### E03 · 设置层级与持久化 ✅ 已完成（2026-10-17）
 
 - **目标**：渲染设置在 **5 个作用域**里可覆盖、可继承、可落盘。
 - **改动点**
@@ -176,6 +184,54 @@ E01 ──► E02 ──► E09 ──► E10 ──► E04 ──► E05 ──
   - 写入合法 json → 重启后参数保持；写入非法 json → 报 WARN 并回落默认（不崩溃）。
 - **规模**：**M**
 - **依赖**：E01
+
+#### 交付记录（2026-10-17）与计划的三处偏差
+
+1. **`FeatureRegistry` 多暴露了一层"绑定视图"**（`BindingView` /
+   `takeUnappliedBindings` / `collectBindings` / `resetSettingsApplied`）。
+   **为什么非加不可**：同一个参数可能既被 `config/render.json` 覆盖、又被
+   `MYVK_*` 覆盖，而 **env 是测试钩子，必须永远赢**。所以每个绑定阶段
+   的顺序被钉死成 `applyToRegistry() → loadEnvOverrides()`，两边各记各的
+   "处理过没有"（`settingsApplied` / `applied` 两个独立标记）。
+   只加一个标记会让第二个绑定阶段（`createMainTarget` 之后那批 post 参数）
+   把第一批的 env 值盖回去。
+2. **校验与 env 完全一致，不额外按 UI 范围夹紧**。已经踩过：`lshadow.bias`
+   的 UI 范围是 `0~1`，而默认 z 分量是 `1.2` —— 按 UI 夹会让"导出→重载"
+   一次就把默认值改坏。所以文件层只做 env 那一套（非有限值拒绝 /
+   `minAccept,maxAccept` / `clampLo,clampHi`）。
+3. **UI 入口放在 Engine 面板的顶部**（`drawEngineSettingsIO`：
+   `Export current` / `Reload from disk` + 覆盖计数）。原本写在生成区
+   **之后**（三十多个特性块后面），实测按钮被挤到 `y=3079`（窗口只有 900 高）
+   —— **点不到 = 不算交付**。`verify_settings_layers` 的 I2 就是这条断言
+   （否定测试：挪回底部立刻变红）。
+
+另外两件计划里没写但必须做的事：
+
+- **`engine/render/RenderSettingsIO.*` 进了 `RENDER_MODULES`**（否则
+  `check_regression_map.py` 的 F 组会报"没被覆盖的 render 文件"）。
+- **`config/README.md` + `config/render.example.json`**：示例文件被
+  `verify_settings_layers` 的 J 组当作**输入**校验（每个键都必须真生效）——
+  文档里的例子不能是假的。
+
+**Scene / Object / Camera 三层只提供了数据通路，没有磁盘入口**：
+`SettingsChain::setLayer` / `parseLayerText` 已经能接收它们（五层优先级
+由自检 B1 逐层验证），但"场景文件内嵌块"与"实体/相机组件"的 schema
+改动属于 E20（覆盖指示器）那一轮的事 —— 动 `SceneSerializer` 会牵到
+所有场景夹具。
+
+**验收对照**：
+
+| 条款 | 证据 |
+| --- | --- |
+| 无 `render.json` → 零行为变化 | `verify_settings_layers` B1（**一条 `RENDER-SET` 日志都没有**）+ B2（`SHADOW-DBG cascades=4`） |
+| 合法 json → 重启后保持 | C1/C2/C3（`applied=shadow.cascades value=2 from=project` → `cascades=2`）+ 自检 E1/E2/E3（落盘往返**逐位相同**） |
+| 非法 json → WARN + 回落默认 + 不崩 | D1/D2/D3/D4 |
+| 文件层不是影子结构体 | C4：同一份 json 与 `MYVK_SHADOW_CASCADES=2` 的 `splits=` **逐字符相同** |
+
+⚠ **"改参数 → 自动落盘"这一段没有端到端用例**，因为自动化运行**禁止写**
+（与 E07 布局/偏好同一条规则：`MYVK_FRAMES` / `MYVK_NO_WINDOW_SAVE` 存在
+即为自动化）。覆盖方式是拆开验：写的一半靠自检的 `saveLayerFile` 往返，
+读的一半靠 C 组。这是**已知的覆盖缺口**，不是"测过了"。
 
 ---
 
@@ -351,6 +407,53 @@ E01 ──► E02 ──► E09 ──► E10 ──► E04 ──► E05 ──
   多选编辑同步到 N 个实体、Copy/Paste Properties 往返一致。
 - **规模**：**L**
 - **依赖**：E20（覆盖指示器）、E03（层级）
+
+#### E11.1 · Inspector 加"左侧图标导航条"（页签化） ✅ 已完成（2026-10-16）
+
+- **动机**：E11 把分区做成了可折叠，但**仍然是一条滚动条堆到底** —— 选中一个
+  球之后要滚过 Transform / Visibility / Mesh / Material / Collision / Decal /
+  Reflection Probe / Particle Emitter / Light / Script 才找得到要调的那一项。
+  用户提出照 Blender 属性编辑器的组织方式改造：**左列一竖排图标 + 右侧只显示
+  当前页的内容**。
+- **改动点**
+  1. `editor/InspectorIcons.h`（新建）：`IconPen`（归一化坐标 → 屏幕坐标的
+     小笔）+ 11 个矢量图标（cube / wrench / camera / export / photo / globe /
+     sparkle / ball+gravity / sphere / curve / list）。颜色**由调用方给**
+     （常态 TextDisabled、悬停/选中 Text）—— 与 `EditorIcons.h` 的"资产图标
+     颜色写死"是两套契约，头注释里写清了分工。
+  2. `InspectorPanel::InspTab` 枚举 + `kTabs[]` 表（**顺序必须一致**，有
+     `static_assert` 兜项数、`All` 必须在末尾）+ `drawNavBar()`（
+     `InvisibleButton` + 自绘圆角高亮 + 左侧指示条 + tooltip + 每项
+     `logRect("INS-NAV <id>")`）。
+  3. 页签 → 分区映射：Object=Transform/Visibility/Mesh；Tool=Script/Add
+     Component；Render=Light/Decal/Probe；Output=只读信息（引擎暂无输出设置，
+     不编假控件）；Scene=统计；World=相机/主光；Particles；Physics；Material；
+     Animation=Skinned Mesh；**All**=旧的堆叠视图。
+  4. **没选中物体时不再整页退出**：World / Scene / Output 与"选中谁"无关，
+     仍然可用；其余页签画一行"先选个物体"（并发 `INS-TAB-EMPTY` 日志锚点）。
+  5. 搜索词非空时**忽略页签选择、跨全部页签摊平命中项**（与 Preferences 窗口
+     的搜索行为对齐）。
+  6. 选中页签落盘（`LayoutState::inspTab`，**存 id 字符串不存下标** ——
+     往中间插一个页签不会让老配置跳到别的页上）。
+  7. 新增环境变量 `MYVK_EDITOR_INSP_TAB=<名字|下标>`。
+- **⚠ 兼容性决定**：**自动化运行（`MYVK_FRAMES` / `MYVK_NO_WINDOW_SAVE`）下
+  默认页签 = `all`**。项目里已有 9 个验证脚本靠 `INS-MESH-HEADER` /
+  `INS-COLLISION-HEADER` / `INS-PROBE-HEADER` / `INS-FX-EXPAND-ALL` 这些矩形
+  锚点断言"那个分区画出来了"；分区一旦按页签分散，不指定页签就只看得到
+  Object 页 → 那 9 个脚本会**整批误报**。默认"全部"一次性保住它们，
+  想单测某一页再用环境变量指定。交互时默认仍是 Object 页。
+- **涉及文件**：`editor/InspectorIcons.h`（新建）、`editor/InspectorPanel.{h,cpp}`、
+  `editor/EditorLayoutIO.{h,cpp}`、`editor/EditorApp.cpp`
+- **验收**：`tools/verify_inspector_tabs.py`（25 项断言，5 组：导航条结构 /
+  页签隔离正负对照 / 无选中行为 / 搜索跨页签 / 像素）。**否定测试**：把页签
+  派发改成"永远画全部"重生后，10 条隔离断言**全部变红**并报出"多了/缺了
+  哪些锚点" → 证明它们不是空断言。
+- **规模**：M
+- **坑（写给后来人）**：`INS-MESH/COLLISION/PROBE-HEADER` 记在
+  `sectionHeader()` 之后、`if (!open) return;` **之前** —— 它们必须"折叠着
+  也在"，否则脚本点不到展开。代价是**被搜索词过滤掉时那几行日志照样会打**
+  （"函数被调用了" ≠ "分区可见"）。想判断"某分区可见"只能用记在提前返回
+  **之后**的锚点（`INS-MATERIAL-HEADER` / `INS-OUTPUT-HEADER`）。
 
 ### E12 · Hierarchy 升级 ✅ 已完成（2026-10-14）
 
@@ -846,7 +949,7 @@ E25 全部依赖（E05 工作区 / E15 统计面板 / R0-1 的 `GpuTimer`）都�
 | 任务 | 状态 | 阻塞原因 |
 | --- | --- | --- |
 | E24 资产编辑器框架 | 待做 | 依赖 E13 / E05（**均已就绪**）—— L 级，可立刻开工 |
-| E26 画质档位 | 待做 | ⚠ 依赖 **E03（设置层级与持久化，尚未落地）**：`engine/render/RenderSettingsIO.*` 不存在 |
+| E26 画质档位 | 待做 | ✅ 依赖的 **E03（设置层级与持久化）已于 2026-10-17 落地**（`engine/render/RenderSettingsIO.*` + `config/render.json`）—— 准入契约已满足 |
 | E27 RenderGraph 可视化 | 待做 | ⚠ **准入契约未满足**：依赖渲染侧 **R7-1「声明式 RenderGraph」**，`docs/render_roadmap.md` 里它还在阶段 7（未做）。现有 `render/FrameGraph` 只覆盖"前向之后"的 5 个 pass，不是全管线 |
 | E28 打包 / 发布 UI | 待做 | 依赖 E21 / E13（**均已就绪**）—— L 级，需动 `CMakeLists.txt` 加 `VENN_SHIPPING` 宏 |
 | E29 烘焙流水线 UI | 待做 | 🟡 **准入契约部分满足（2026-10-15）**：**R5-1 反射探针已落地** ✅（`engine/render/ReflectionProbe.*` + `Inspector ▸ Reflection Probe` 属性面板 + `Capture` 按钮），但 **R5-2 lightmap 仍未落地** ✗ —— 面板的"光照贴图缩略图"那一半还是空的。可先做反射探针那一路（设置档 + 进度条 + 探针预览球），光照贴图那一路等 R5-2 |
@@ -921,7 +1024,7 @@ E25 全部依赖（E05 工作区 / E15 统计面板 / R0-1 的 `GpuTimer`）都�
 | **M1 · 特性面补全** ✅ | E01 / E02 / E09 / E10                   | `check_feature_surface.py` **退出码 0**（实测 **32 个特性全部有 UI 面**、裸 env 漏网 0） |
 | **M2 · 布局成熟** ✅ | E04 / E05 / E06                         | 工作区可切换、布局可落盘、分割线可视化（**2026-10-14 达成**） |
 | **M3 · 核心面板达标** ✅ | E11 / E12 / E13 / E14 / E15 / E16 / E17 | 每个面板有独立 `verify_*.py` 且 PASS（**2026-10-15 达成**；E11/E13/E14 三支脚本为本轮新增） |
-| **M4 · 交互成熟**   | E18 / E19 / E20 / E21 / E23             | 命令面板可搜、设置可撤销、快捷键可重绑定（**E18/E19/E21 于 2026-10-15 达成**；E20 待 E03、E23 待做） |
+| **M4 · 交互成熟**   | E18 / E19 / E20 / E21 / E23             | 命令面板可搜、设置可撤销、快捷键可重绑定（**E18/E19/E21 于 2026-10-15 达成；E03 于 2026-10-17 达成**；E20 待做、E23 待做） |
 | **M5 · 生产力工具**  | E07 / E22 / E24 / ✅E25 / E26             | 多视口、资产编辑器、时间轴、画质档位可用                                 |
 | **M6 · 3A 收口**  | E08 / E27 / E28 / E29                   | 出包可用、Shipping 剔除生效、烘焙有 UI                            |
 
@@ -943,10 +1046,158 @@ E25 全部依赖（E05 工作区 / E15 统计面板 / R0-1 的 `GpuTimer`）都�
 | 命令系统     | **统一注册表（71 条）+ 模糊搜索 + `Ctrl+Shift+P` 命令面板** | 统一注册表 + 模糊搜索                        | ✅ E16 / E18                               |
 | 快捷键      | 硬编码、不可改         | 表驱动 + 可重绑定 + 总览                                                           | E23                               |
 | 撤销覆盖     | 变换/碰撞/图元/场景 + Inspector 字段 + **渲染设置参数（500ms 合并）** | + 渲染设置                                        | ✅ E11 / E19                               |
-| 设置层级     | 单层内存结构体（+ 扁平偏好落盘）         | 5 层覆盖链 + 落盘                                                               | E03 / E20                         |
+| 设置层级     | **5 层覆盖链 + `config/render.json` 落盘**（prefs → project 接磁盘；scene/object/camera 已通数据通路，等 E20） | 5 层覆盖链 + 落盘                                                               | ✅ E03 / E20                         |
 | 通知/进度    | **Toast + 进度条 + 历史 + 状态栏常驻计数 + 落盘** | Toast + 进度条 + 历史                                                          | ✅ E21                               |
 | GPU 时戳可视化 | **本帧甘特图 + 60 帧历史堆叠 + 点段联动 Console**（另有 Stats 的单帧瀑布条） | 甘特图 + 多帧历史 + 联动                                    | ✅ E25                               |
 | 日志可见性    | **Console 面板（级别过滤 + 搜索 + 命令行）**     | 级别过滤+搜索                                                       | ✅ E16                               |
 | 编辑器代码量   | **23,614 行**（.cpp 19,391 + .h 4,223） | 结构化增长（生成器替代手写）                                          | 全部                                |
 
 阶段 C 的逐项实现与取证见 §4 末尾的「阶段 C 落地记录」。
+
+---
+
+## 11 · 物理引擎（PHYS-1）✅ v1 已完成（2026-10-16）
+
+> 由用户需求引入的**引擎级新子系统**（此前引擎没有物理）。不属于原 E/R 系列，
+> 单独记为 PHYS。范围经用户拍板：**完整刚体核心** + **仅 Play 态仿真**。
+
+### 11.1 交付范围（v1）
+
+| 层            | 内容                                                                                     |
+| ------------ | -------------------------------------------------------------------------------------- |
+| 数学 / 形状    | 凸体（球 / 盒 / 胶囊 / 凸包）、AABB、`Shape` 与质量属性（质量或密度二选一）                                |
+| 广相           | **SAP**（扫描剪枝，主轴 x）                                                                     |
+| 窄相           | **GJK / EPA**（凸-凸）+ **SAT 盒盒裁剪**（生成 4 点流形）                                            |
+| 求解器         | 顺序冲量 **PGS** + **热启动** + **Baumgarte** 位置修正 + **split impulse**（位置误差不污染速度）                 |
+| 积分           | 半隐式欧拉 + **定步长累加器**（`fixedTimeStep` / `maxSubSteps`）                                      |
+| 关节           | Fixed / Ball / Hinge / Slider / Distance                                                |
+| 休眠           | **岛级休眠**（并查集把连成一串的刚体当一个岛，整岛一起睡）                                                   |
+| ECS 组件       | `ecs::RigidBodyComponent`（`bodyType` / `shape` / 形状尺寸 / 质量 / 摩擦 / 弹性 / 阻尼 / 初速度 / `useGravity` / `allowSleep`） |
+| 场景级设置      | `scene::PhysicsSettings`（重力 / 无限地面 / 定步长 / substeps / 迭代次数 / Baumgarte / slop / 休眠阈值）        |
+| 序列化         | 已接 `SceneSerializer`：顶层 `physics` 段（**仅在与默认值不同时写**）+ 每实体 `rigidbody` 段                    |
+| UI            | **Inspector ▸ Physics**：`Physics World`（世界参数，可 Reset）+ `Rigid Body`（选中物体）+ 复用 `Collision` 段        |
+
+### 11.2 关键接线（`editor/EditorApp.cpp`）
+
+- `buildPhysicsWorld()`：Play 时按场景建世界。**刚体形状取世界米**（显式形状不乘实体缩放；
+  `Auto` 依次尝试 Collision 的 hull/capsule → 网格 AABB → 0.5m 球），并**把世界缩放烘进形状尺寸**。
+- `stepPhysics(dt)`：运动学体**先**读实体位置反算速度 → `step()` → **只对动态体**写回
+  `TransformComponent`（位置 + 由旋转矩阵反解的欧拉角；**刻意不写 scale**）。
+- 每帧顺序：**脚本 → 玩家 → 物理 → 碰撞**。`CollisionWorld` 里 `physicsDriven` 的实体
+  **不再参与碰撞解算**（位置归物理引擎管），但**仍然挡住相机**。
+- ⚠ **只有真正 `Stop` 才销毁物理世界**——`Pause` 走的是同一分支，不能顺手 `reset()`。
+
+### 11.3 验证入口
+
+| 入口                                  | 用途                                                            |
+| ----------------------------------- | ------------------------------------------------------------- |
+| `MYVK_PHYS_TEST=1`                  | **无窗口、无 Vulkan** 的物理自检（`editor/main.cpp` 在 `app.run()` 前返回）；输出 `PHYS-TEST <name> result=PASS\|FAIL` + `PHYS-TOTAL pass=n fail=m`。**29/29 PASS** |
+| `MYVK_PHYS_DUMP=<N>`                | Play 态每 N 帧打一行 `PHYS-BODY`（位置**从实体读**，用来证明写回链路真的生效）             |
+| `MYVK_EDITOR_PLAY=1`                | 启动即进 Play 态（配合 `MYVK_EDITOR_SCENE` 观察仿真）                        |
+| `tools/verify_physics.py`           | 回归用例，已进 `run_regression.py` 的 `DEFAULT`                       |
+
+### 11.4 v1 明确不做（后续 PHYS-2 候选）
+
+连续碰撞检测（CCD）/ 软体 / 布料 / 破碎 / 车辆轮胎模型 / 多层场景（高度场地形）/
+物理调试可视化（接触点、AABB、岛着色）/ 与动画系统的双向耦合（布娃娃）。
+另有：**碰撞事件回调**（进入/离开/持续）与**触发体（trigger）**尚未开放给脚本。
+
+## 12 · 全量回归（2026-10-16）✅ 首轮 46/50 → 4 项全部定案
+
+`python tools/run_regression.py --all`，**50 例 / 49m39s**。首轮 46/50；逐项定位后修掉 3 项
+**测试度量缺陷** → 复跑 PASS；剩下 1 项**真产品缺陷**已按用户裁定修掉（见 12.1）。
+收尾又清掉 E 组送达与粒子 3 项"差 1"口径（见 12.2）。
+
+| 用例 | 首轮 | 处理 |
+| --- | --- | --- |
+| `verify_add_menu` | FAIL 断言 2 | ✅ 修：扫描区间夹进 `TR-BAR` 矩形（原先扫整窗，被右侧 Inspector 的 R/G/B 轴标签污染） |
+| `verify_gpu_timeline` | FAIL T2e | ✅ 修：丢掉 `frames<30` 的启动样本（把两侧采样窗口对齐；**阈值仍 5%**） |
+| `verify_particles` | FAIL B1/E1b/F2（另一轮 +G1b） | ✅ 全部修 —— **产品代码一行未动**，全是口径/注入路径问题，见 12.2 |
+| `verify_material_roundtrip` | FAIL 3 项 | ✅ 修：材质行自适应列宽，见 12.1 |
+
+### 12.1 ✅ 已修：材质槽方块被图标条挤没（2026-10-16）
+
+- **现象**：已绑定的 `metallic / roughness / emissive` 槽方块只有 **48px**，`MAT-CHIP` 打出来是
+  `shows=".png"` —— **文件名读不出来**（三个槽看起来一个样）。
+- **根因**：面板 330px 本身没错（符合 `kRightMin`），但 **E11.1 的图标导航条占掉 48px**，内容列只剩
+  ~251px；而材质行是固定 3 列 `88 + 10 + 88 + 10 = 196`，行首还缩进 ~73px →
+  槽位只剩 `251 − 196 − 4 ≈ 48`。
+- **修法（用户裁定：自适应列宽）**：**标签列固定 88**（标签必须读得全），让**值列**按可用宽收缩
+  （下限 44px），**槽位保底 96px**。宽面板（`inner ≥ 292`）值列照样顶回 88 →
+  **与改造前逐像素一致**。另给槽位 tooltip 补上**完整文件名**
+  （330px 面板装不下 18 字符的名字，画面里 `fitText` 只能留 ~8 个字形）。
+- **结果**：槽位 **48px → 89px**；`verify_material_roundtrip` / `verify_material_chips` 均 PASS。
+- **防复发**：`verify_material_chips.py`（断言"面板拖窄时方块不越界 / 绑定后显示文件名"）
+  **已补进 `DEFAULT` + `TRIGGERS`** —— 它原先不在清单里，所以这个缺陷一直没被拦住；
+  `check_regression_map.py` 里"改 `InspectorPanel.cpp` 影响哪几例"的 fixture 同步成 **5 例**。
+- **未选的备选**：① 提高 `SplitLayout::kRightMin`（330 → ~400）—— 会牵动 `verify_viewport` 的
+  `CONVERGED_VP` 及一批截图基线；② 窄面板时槽位换行到第二行 —— 材质段高度近翻倍、纵向版式大改。
+
+### 12.2 ✅ 收尾：E 组点击送达 + 粒子 3 项"差 1"口径（2026-10-16）
+
+**全部是测试侧改动，产品代码一行未动**（详细叙事 → `.workbuddy/memory/2026-10-16.md` §18）。
+
+- **E1b 复挂的真因 = `force_foreground` 的返回值被忽略**。上一轮记成"事件被系统丢掉"，加的
+  "重抢前台 + 重试"在下一轮单跑里**又挂了**（点 3 次全未送达）。实际是它返回 False 时窗口还被
+  终端压着，`mouse_event` 那几发**真实**点击全落到**压在上面的窗口**上了 —— 重试多少次都一样。
+  新加一条与前台/遮挡无关的注入路径 **`click_client_post`**（`PostMessage(WM_LBUTTONDOWN/UP)`，
+  位移仍由 `mouse_set_client` 的 `PostMessage(WM_MOUSEMOVE)` 提供），`click_for` 两路轮换。
+  - 证据：**真实路径**与**强制直投路径**（把 `force_foreground` 打成永远 False）**各自**跑 E 组，
+    均 1 次点击到位。
+  - `verify_bvh` 的"预热点击"是同一根因（注释里早记下"机器忙时 12 次尝试全落空"），已换成
+    `click_vp`：**10 次尝试/21.8s 全落空 → 1 次/2.0s**，用例 45s → 24s。
+- **粒子 B1/B3/F2/G1b 改口径**（`§15.3` 早写明"应当先改断言口径"，这次先**量出分布**再定）：
+  冻结帧跨运行**只有界**（实测 5 次：`alive` 极差 4、`maxAlive` 1、`simFrame` 120..121）——
+  两条机制都关不掉：池按 frames-in-flight 分槽（各槽停在自己最后一步）+ 累加器允许一帧补多步。
+  - `B1` 拆成"确定字段精确比 + 跨槽字段有界比"；`B3` 改 `[120, 127]`；**新增 `B3b`**：
+    "冻结后真的停住"用**同一趟内多个样本互等**来精确验（更严）。
+  - `F2` 的 `dispatches > simFrame` 在这台机器上**恒不成立**（vsync 60fps 与 simHz 60 相等 →
+    实测 182 vs 183）→ F 组加 `MYVK_FX_HZ=8`，判据改 `dispatches >= 2*simFrame`（旧行为下必红，
+    这才真的在验"速度与帧率解耦"）。
+  - `G1b`（两次独立运行的瞬时计数）改有界。
+  - ⚠ 引擎 `FX-FREEZE` 日志那句 "state is now reproduced bit-for-bit" 是**过度承诺**，
+    `B1` 原来的期望正是照它写的 —— 改它要动 `engine/**`（欠一次全量），**暂留**，下次顺手改。
+- **复跑**：`verify_particles` **35 项全 PASS**、`verify_bvh` PASS、两个自检脚本 PASS。
+
+## 13 · 编辑器打磨七连（2026-10-17）✅ 全部落地
+
+用户一次性下达 7 点体验清单，**全部完成 + 建验证**。5 个新脚本全 PASS，受影响既有用例复跑全 PASS。
+（详细叙事 → `.workbuddy/memory/2026-10-17.md`）
+
+| # | 需求 | 定论 |
+| --- | --- | --- |
+| 1 | 主题美化 + 多风格可选 | `engine/ui/ImGuiTheme.{h,cpp}` 新建；`ThemeId` 5 套；**VennDark 逐字段照抄 → 默认逐像素不变**；修掉浅色主题下的"深色孤岛"（新增 `Token.barBg` + 视口叠加片浅字） |
+| 2 | 启动闪白 → 缓冲 2s | 隐藏创建 + `applyDarkBackgroundBrush()` 深灰底 + 首帧后 `show()`；新增 `MYVK_STARTUP_DELAY=1` 让缓冲可测又不写盘 |
+| 3 | 胶囊线框规范 | `ColliderView.cpp` 重写：**12 贯通经线 + 4 纬线环**，球冠完整闭合；几何量测 H/W=3.571 全符合解析 |
+| 4 | 吸附默认全开 | 构造默认 `false→true` + 同步 prefs `def`（否则老存档顶回）；新增 `MYVK_EDITOR_SNAP` |
+| 5 | 栅格 1m×1m + 扩大 | 确认 `minor=1.0/major=10.0`；`extent 60→250`（500m 见方）、fade 同步 |
+| 6 | 中英切换（**硬约束**） | `editor/Localization.{h,cpp}` 新建；`tr()`/`trId()`；**代码零中文字面量**（机械包装 792 处 `TR(...)`）；词典 ~609 条 |
+| 7 | Hierarchy 锁/眼失效 | **真因 = `ItemHoverable` overlap 语义**（见 13.1）；修法 = 节点加 `ImGuiTreeNodeFlags_AllowOverlap`；另补太阳缺 `VisibilityComponent` |
+
+### 13.1 ✅ 关键真因与坑（值得记牢）
+
+- **`ItemHoverable` overlap**（`imgui.cpp:5121`）：叠在 `TreeNodeEx` 行矩形上的 `InvisibleButton`
+  因节点**先提交**而被 `HoveredId != id` 挡掉 → **永远收不到 hover/click**。
+  **修法 = 节点加 `ImGuiTreeNodeFlags_AllowOverlap`**（命中改 front-to-back）。**已做否定测试**
+  （去掉它 → 断言必红），确认 load-bearing。
+- **偏好存档 schema 门**：偏好是**逐键覆盖** → **老存档会把新默认顶回**（改默认必踩）。
+  修法 = 新增 **`kPrefsVersion=2`**（与布局的 `kFormatVersion` **两套独立门**）；老版本整份作废回出厂默认。
+- **ImGui 窗口名兼作 ID** → 翻译文案会改 ID 丢布局 → 必用 `trId(name, id)`。
+- **太阳懒创建的可见性缺口**：`Scene::light()` 只加 `NameComponent`+`DirectionalLightComponent`，
+  **没有 `VisibilityComponent`**（对比 `Scene::createObject`）→ 补齐 + `sunVisible()` 语义。
+- **胶囊拟合立方体必然得球**：`r=√2/2·half`、`halfHeight=0` —— **不是 bug**，已钉成用例期望。
+- **sRGB 二次编码对像素判据的影响**：上屏实测亮度 **深色 85~132 / 浅色 225~245** →
+  阈值必须按实测定，不能按理论 sRGB 亮度。
+
+### 13.2 ✅ 定性为**既有缺陷**：`verify_collider_show` 栅格撞色
+
+断言"关线框后像素消失"报 `pixels=176>40` FAIL。用**改动前**旧栅格参数复跑**数字一样 176** →
+与本轮无关。真因 = 判据矩形外扩 8px 框进了**地面栅格线**，其色在 ±40 容差内**与线框青色撞色** →
+给该用例 env 加 **`MYVK_GRID=0`**（附注释）→ 复跑 PASS（3774→0→3062）。
+
+### 13.3 回归注册（原子同步完成）
+
+`run_regression.py` 的 `DEFAULT` **+5 例**、`TRIGGERS` **+4 条**（`verify_startup_show` **故意不打**
+映射 —— 它全依赖 `engine/core/**` = `GLOBAL_GLOBS`，按"全量+点名"铁律处理）；
+`check_regression_map.py` → **PASS（48/56 已登记）**。
+

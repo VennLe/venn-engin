@@ -128,6 +128,16 @@ def run_once(exe, scene, extra_env, shot_path, wait_stats=12.0):
     env["MYVK_BVH_DBG"] = "1"
     env["MYVK_EDITOR_SCENE"] = scene
     env["MYVK_EDITOR_CAM"] = CAM
+    # 钉死裁剪面（2026-10-17）。本场景是按"远平面 200 m"设计的：39 个立方体
+    # 摆在 x=250..4050，注释原文就是"远在远平面之外"。而编辑器视口默认已经
+    # 放开到 5000 m（修"飞高俯视视野越来越窄"那一项时改的，见
+    # EditorContext::applyEditorCameraMode）→ 那 39 个全部进入视锥，
+    # culled 从 132 掉到 94、drawn 从 4 涨到 42。
+    #
+    # ⚠ 别改成"把基线从 132 改成 94"：那样这条用例就变成在测"编辑器视口的
+    #   远平面是多少"，视口默认再动一次它还会红。剔除算得对不对与远平面无关，
+    #   所以要钉的是**输入**，不是**期望**。
+    env["MYVK_EDITOR_CLIP"] = "0.1,200"
     env.update(extra_env)
 
     proc = subprocess.Popen([exe], cwd=os.path.dirname(exe), env=env,

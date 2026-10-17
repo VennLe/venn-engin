@@ -138,6 +138,7 @@ BUILD_DIR ?= build
 DIST_DIR  ?= dist
 BIN_DIR    = $(BUILD_DIR)/bin
 EDITOR     = $(BIN_DIR)/Editor.exe
+GAME       = $(BIN_DIR)/Game.exe
 SHADER_DIR = $(BIN_DIR)/shaders
 ASSET_DIR  = $(BIN_DIR)/assets
 
@@ -203,10 +204,12 @@ endif
 # <当前工作目录>/imgui.ini，从项目根目录直接跑会把 imgui.ini 甩到仓库根，
 # 所以这里显式 chdir 到 build/bin。
 RUN_EDITOR  = $(CMAKE) -E chdir $(BIN_DIR) $(CMAKE) -E env $(RUN_ENV) Editor.exe  $(ARGS)
+# G01：运行时（Game.exe）。与编辑器完全平行 —— 同一个引擎库，另一个 main。
+RUN_GAME    = $(CMAKE) -E chdir $(BIN_DIR) $(CMAKE) -E env $(RUN_ENV) Game.exe    $(ARGS)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all build configure editor shaders run run-editor toolchain \
+.PHONY: all build configure editor game shaders run run-editor run-game toolchain \
         smoke clean distclean rebuild package info help install-make-alias
 
 # ============================================================================
@@ -240,13 +243,22 @@ else
 	@$(CMAKE) -E touch $(CONFIG_STAMP)
 endif
 
-## 只编译编辑器（本工程唯一的可执行文件）
+## 只编译编辑器（editor/ → Editor.exe）
 editor: $(CONFIG_STAMP)
-	@echo [build] target=Editor
+	@echo [build] target=VennEditor
 ifeq ($(TOOLCHAIN),msvc)
-	$(MSVC_BUILD) build Editor
+	$(MSVC_BUILD) build VennEditor
 else
-	$(CMAKE) --build $(BUILD_DIR) --target Editor $(PARALLEL)
+	$(CMAKE) --build $(BUILD_DIR) --target VennEditor $(PARALLEL)
+endif
+
+## 只编译运行时（runtime/ → Game.exe）
+game: $(CONFIG_STAMP)
+	@echo [build] target=VennRuntime
+ifeq ($(TOOLCHAIN),msvc)
+	$(MSVC_BUILD) build VennRuntime
+else
+	$(CMAKE) --build $(BUILD_DIR) --target VennRuntime $(PARALLEL)
 endif
 
 ## 只重新编译 GLSL 到 SPIR-V
@@ -269,6 +281,11 @@ run: build
 
 ## run 的别名（旧脚本兼容）
 run-editor: run
+
+## 编译并运行**运行时**（Game.exe）—— 出货的那个程序
+run-game: build
+	@echo [run] Game     env: $(RUN_ENV)
+	$(RUN_GAME)
 
 ## 无人值守冒烟测试：编辑器跑 SMOKE_FRAMES 帧后自动退出。
 ## 默认自动进入 Play —— 于是"复制运行态 + 每帧执行脚本 + 渲染到视口"
@@ -319,6 +336,7 @@ package: build
 	$(CMAKE) -E remove_directory $(DIST_DIR)/$(PKG_NAME)
 	$(CMAKE) -E make_directory $(DIST_DIR)/$(PKG_NAME)
 	$(CMAKE) -E copy $(EDITOR) $(DIST_DIR)/$(PKG_NAME)
+	$(CMAKE) -E copy $(GAME) $(DIST_DIR)/$(PKG_NAME)
 	$(CMAKE) -E copy_directory $(SHADER_DIR) $(DIST_DIR)/$(PKG_NAME)/shaders
 	$(CMAKE) -E copy_directory $(ASSET_DIR) $(DIST_DIR)/$(PKG_NAME)/assets
 	@echo [package] compressing
@@ -345,7 +363,7 @@ else
 endif
 	@echo   parallel     : $(if $(strip $(JOBS)),$(JOBS),auto)
 	@echo   build dir    : $(BUILD_DIR)
-	@echo   binaries     : $(BIN_DIR)/Editor.exe
+	@echo   binaries     : $(BIN_DIR)/Editor.exe  $(BIN_DIR)/Game.exe
 	@echo   package name : $(PKG_NAME)
 	@echo   smoke frames : $(SMOKE_FRAMES)
 
@@ -383,9 +401,11 @@ help:
 	@echo   make build            configure + build all targets
 	@echo   make configure        force re-run CMake configure
 	@echo   make editor           build the editor only
+	@echo   make game             build the runtime (Game.exe) only
 	@echo   make shaders          rebuild GLSL to SPIR-V only
 	@echo   ---
 	@echo   make run              build + run the editor (main entry)
+	@echo   make run-game         build + run the runtime (Game.exe)
 	@echo   make smoke            headless smoke test
 	@echo   ---
 	@echo   make clean            remove build outputs, keep CMake cache

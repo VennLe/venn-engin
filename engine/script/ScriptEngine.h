@@ -1,6 +1,15 @@
 #pragma once
 // ============================================================
-// editor/script/ScriptEngine —— 极简脚本语言 + 引擎属性绑定 + 热重载
+// engine/script/ScriptEngine —— 极简脚本语言 + 引擎属性绑定 + 热重载
+//
+// ⚠ **住在这里而不是 editor/ 里**（2026-10-17，G02 搬家）：
+//   分层的铁律是 `runtime → engine ← editor`，而**运行时必须能用脚本**
+//   —— 脚本引擎只要还留在 editor/ 里，Game.exe 就永远用不上 .vks。
+//   搬家时只改了 namespace（editor:: → vks::），接口与语义一字未动：
+//   ScriptHost 仍然是"脚本能碰到什么"的唯一接缝。
+//   （命名空间叫 `vks` 而不是 `script`：.vks 就是这个语言的名字，
+//    也不会和任何目录级的通用名撞车。engine/ 下其余模块用的是
+//    core / render / scene / ecs / assets / physics 这一级名字。）
 //
 // ------------------------------------------------------------
 // 一、为什么自己写一个脚本语言，而不是嵌 Lua / Wren
@@ -59,7 +68,7 @@ namespace scene {
 class Scene;
 }
 
-namespace editor {
+namespace vks {
 
 // 编译期 / 运行期错误
 struct ScriptError {
@@ -189,4 +198,4 @@ private:
     std::vector<std::string> m_log;
 };
 
-} // namespace editor
+} // namespace vks

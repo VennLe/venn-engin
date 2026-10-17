@@ -1,0 +1,171 @@
+{
+  "version": 1,
+  "generator": "venn sandbox (G05 sample level)",
+  "camera": {
+    "target": [0.0, 0.0, 2.0],
+    "yaw": 35.0,
+    "pitch": -18.0,
+    "distance": 14.0
+  },
+  "physics": {
+    "enabled": true,
+    "groundPlane": true,
+    "fixedTimeStep": 0.0166666675,
+    "maxSubSteps": 4
+  },
+  "entities": [
+    {
+      "name": "Ground",
+      "transform": {
+        "position": [0.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "locked": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "plane",
+        "size": 40.0,
+        "name": "sandbox_ground"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "sandbox_ground_mat",
+        "baseColor": [0.42, 0.44, 0.47, 1.0],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [0.0, 0.0, 0.0],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "BoxA",
+      "transform": {
+        "position": [-2.5, 0.0, 3.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "sandbox_box_a"
+      },
+      "primitive": {
+        "kind": "box",
+        "size": 1.0
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "sandbox_box_a_mat",
+        "baseColor": [0.82, 0.36, 0.26, 1.0],
+        "metallic": 0.0,
+        "roughness": 0.55,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [0.0, 0.0, 0.0],
+        "doubleSided": false,
+        "alphaBlend": false
+      },
+      "rigidbody": {
+        "bodyType": 2,
+        "shape": 2,
+        "halfExtents": [0.5, 0.5, 0.5],
+        "density": 500.0,
+        "useGravity": true,
+        "allowSleep": true
+      }
+    },
+    {
+      "name": "BoxB",
+      "transform": {
+        "position": [0.0, 0.0, 6.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "sandbox_box_b"
+      },
+      "primitive": {
+        "kind": "box",
+        "size": 1.0
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "sandbox_box_b_mat",
+        "baseColor": [0.30, 0.62, 0.40, 1.0],
+        "metallic": 0.0,
+        "roughness": 0.55,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [0.0, 0.0, 0.0],
+        "doubleSided": false,
+        "alphaBlend": false
+      },
+      "rigidbody": {
+        "bodyType": 2,
+        "shape": 2,
+        "halfExtents": [0.5, 0.5, 0.5],
+        "density": 500.0,
+        "useGravity": true,
+        "allowSleep": true
+      }
+    },
+    {
+      "name": "BoxC",
+      "transform": {
+        "position": [2.5, 0.0, 9.5],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "sandbox_box_c"
+      },
+      "primitive": {
+        "kind": "box",
+        "size": 1.0
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "sandbox_box_c_mat",
+        "baseColor": [0.32, 0.48, 0.78, 1.0],
+        "metallic": 0.0,
+        "roughness": 0.55,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [0.0, 0.0, 0.0],
+        "doubleSided": false,
+        "alphaBlend": false
+      },
+      "rigidbody": {
+        "bodyType": 2,
+        "shape": 2,
+        "halfExtents": [0.5, 0.5, 0.5],
+        "density": 500.0,
+        "useGravity": true,
+        "allowSleep": true
+      }
+    }
+  ]
+}

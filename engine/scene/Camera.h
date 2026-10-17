@@ -116,6 +116,21 @@ public:
     float nearPlane() const { return m_zNear; }
     float farPlane() const { return m_zFar; }
 
+    // 近 / 远裁剪面。默认 0.1 / 200 是**游戏**用的（够近看清手指、够远盖住
+    // 一个关卡）；编辑器视口要另一套，见 EditorContext::applyEditorCameraMode。
+    //
+    // ⚠ 远平面不是"无所谓的上限"：它会把远处几何**直接裁掉**。相机升到
+    //   150 m 俯视地面时，画面里最远的地砖已经在 250 m 外 —— 远平面留在
+    //   200 m 就会出现"越飞越高、可见地面越来越窄、最后整屏空白"。
+    //   UE5 的视口不存在这个现象，因为它的远平面在数值上是"无穷远"
+    //   （reversed-Z + infinite far）。本引擎还是普通 Z，所以用一个足够大的
+    //   有限值（5000 m）来近似：depth 精度在 1 km 处仍有 ~0.6 m，远小于
+    //   一个像素，肉眼无差。
+    void setClipPlanes(float nearZ, float farZ) {
+        m_zNear = glm::clamp(nearZ, 1.0e-3f, 10.0f);
+        m_zFar = glm::max(farZ, m_zNear * 10.0f);
+    }
+
 private:
     // 由 yaw/pitch 得到的单位方向（指向相机**背后**，见文件头的公式推导）
     glm::vec3 angleDir() const;

@@ -16,6 +16,7 @@
 #include "render/LightTextureLibrary.h"
 #include "render/FrameGraph.h"
 #include "render/FeatureRegistry.h"
+#include "render/RenderSettingsIO.h"
 
 // 编辑器视口要把它自己的离屏输出图注册成 ImGui 纹理
 #include <imgui.h>
@@ -375,6 +376,12 @@ Renderer::Renderer(core::Window& window) : m_window(window) {
     // 分级折叠、单项复位 —— 这些原来都得手写。
     // ============================================================
     bindFeatureParams();
+    // E03 · 设置层级：先把 prefs / project 两层覆盖落下来，**再**读 env。
+    // 顺序不能反 —— env 是测试钩子，必须能压过任何存档（两者各记各的
+    // applied 标记，见 FeatureRegistry.h 的 BindingView 说明）。
+    // 无 config/render.json 时这里零动作、零日志 → 与 E03 之前逐像素一致。
+    render::loadStartupLayers();
+    render::applyToRegistry();
     render::loadEnvOverrides();
 
     // 诊断开关不进注册表（它们不是"特性参数"，只是打日志的闸门）。
@@ -1901,6 +1908,9 @@ void Renderer::createMainTarget() {
     // 强制关掉），重打会把它覆盖回去。
     // ============================================================
     bindPostFeatureParams();
+    // E03：后处理参数在上一阶段还不存在（m_post 刚建出来），所以这里
+    // 补一次文件层应用。loadStartupLayers() 是幂等的，不重复读盘。
+    render::applyToRegistry();
     render::loadEnvOverrides();
 
     // FXAA 默认关（保持既有画面基线；像素级回归依赖它关着）。
@@ -2326,7 +2336,15 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
                                   static_cast<float>(extent.height));
     }
     glm::vec3 ld = glm::normalize(scene.light().direction);
-    ubo.lightDir = glm::vec4(ld, scene.light().intensity);
+    // 太阳的 👁（VisibilityComponent::visible=false）由**渲染器**兜：
+    // 它不是可渲染物（没有 MeshComponent），forEachRenderable 拦不到。
+    // 把强度归零就够了 —— 直射项是 `sunColor * NdotL * shadow`，强度 0
+    // 时连阴影也看不见（没有光可遮）。ambientScale 不动：那是环境项，
+    // 不属于"这盏灯发不发亮"。
+    // ⚠ 默认（可见）时与改动前逐字节相同 —— 这是"关闭 = 基线不变"的落点。
+    const float sunIntensity =
+        scene.sunVisible() ? scene.light().intensity : 0.0f;
+    ubo.lightDir = glm::vec4(ld, sunIntensity);
     ubo.lightColor = glm::vec4(scene.light().color, 1.0f);
     ubo.camPos = glm::vec4(camPosW, 1.0f);
 
@@ -3462,12 +3480,20 @@ void Renderer::recordOffscreenTarget(VkCommandBuffer cmd,
     target.post()->renderScene(cmd, m_currentFrame, m_currentFrame, overlay);
 }
 
+void Renderer::applyPendingResizes() {
+    // ⚠ 只允许在"上一帧已经提交完、本帧 UI 还没构建"的时刻调用
+    //   （EditorApp::onImGui 的第一行）。apply() 内部会 device.waitIdle()，
+    //   而 refreshTextures() 会 RemoveTexture(旧 descriptor set) ——
+    //   这两件事都必须发生在**没有任何 ImGui 绘制数据引用旧句柄**的时候。
+    if (m_viewportDirty) applyViewportSize();
+    if (m_previewDirty) applyPreviewSize();
+}
+
 void Renderer::recordPreview(VkCommandBuffer cmd) {
     if (!m_previewScene) return;
     if (!previewActive()) return;
-    // applyPreviewSize 会**懒创建** 1 号目标（第一次打开角色窗口时才建），
-    // 所以"目标还不存在"不能作为提前 return 的条件 —— 否则永远建不起来。
-    if (m_previewDirty || !m_previewTarget) applyPreviewSize();
+    // 尺寸变更在这里**不再处理**（见 applyPendingResizes 的注释）。
+    // 目标还没建好 = 这一帧没有可画的东西，等下一次 flush 建出来即可。
     if (!m_previewTarget || !m_previewTarget->ready()) return;
 
     // 绑场景与相机：预览有自己的场景与相机（与主视口互不影响）。
@@ -5418,8 +5444,15 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
             } else if (m_particleFreezeLogged != m_particleSimFrame) {
                 // 冻结是一次性事件，只打一行 —— 验证脚本等的是它。
                 m_particleFreezeLogged = m_particleSimFrame;
+                // ⚠ 措辞别再写 "bit-for-bit"（2026-10-17 改）：池按
+                //   frames-in-flight 分槽、每槽停在自己的最后一步，而且
+                //   一帧可能补多步 —— 跨运行能保证的是"**同一个 simFrame
+                //   上的状态是确定的**"，但"停在第 N 步"这件事本身只到
+                //   ±几步。说成逐位一致会让验证脚本写出随机红的断言
+                //   （tools/verify_particles.py 的 B1 就被这句话坑过）。
                 VK_LOG_INFO("FX-FREEZE frame=%u alive=%u (simulation stopped; "
-                            "state is now reproduced bit-for-bit across runs)",
+                            "state at this step is reproducible, the exact "
+                            "step reached may differ by a few across runs)",
                             m_particleSimFrame, m_particles->stats().alive);
             }
             // 冻结时**仍然画**：模拟停了，池子里的状态就停在那里，
@@ -5486,7 +5519,9 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
         // （不模糊 / TAA 拿到的历史位置就是自己）。
         in.clipFromView = m_clipFromView;
         in.sunColor = glm::vec4(glm::vec3(scene.light().color) *
-                                    scene.light().intensity,
+                                    (scene.sunVisible()
+                                         ? scene.light().intensity
+                                         : 0.0f),
                                 1.0f);
         if (clip.w > 0.0f) {
             const glm::vec2 uv = glm::vec2(clip.x, clip.y) / clip.w * 0.5f +

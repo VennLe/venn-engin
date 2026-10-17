@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "_comment": "示例文件（不会自动加载）。复制成 config/render.json，或改名为 MYVK_RENDER_SETTINGS 指向的路径后生效。键 = '<featureId>.<paramId>'，参数清单见 engine/render/FeatureRegistry.cpp。以 _ 开头的键会被忽略。",
+  "_note_bool": "Bool：true/false（也接受 0/1/\"on\"/\"off\"）",
+  "shadow.enabled": true,
+  "_note_int": "Int / Enum：整数；Enum 也可以写选项名",
+  "shadow.cascades": 2,
+  "post.tonemap": "ACES",
+  "_note_float": "Float：数字",
+  "post.exposure": 1.2,
+  "_note_color": "Color3 / Vec3：[x, y, z]",
+  "cg.lift": [0.02, 0.0, 0.01],
+  "_note_pair": "Float + aux（一个键写两个字段）：[a, b]，要求 a >= 0 且 b > a",
+  "pom.fade": [12, 30]
+}

@@ -96,6 +96,17 @@ struct Collider {
     glm::vec3 aabbMin{0.0f};
     glm::vec3 aabbMax{0.0f};
     bool solid = true;
+
+    // 这个实体的位置由 **physics::PhysicsWorld** 驱动（它有 RigidBodyComponent）。
+    //
+    // 为什么要有这个标记：resolveBodyOverlaps 是"没有动力学时代的"位置分离
+    // ——它不管质量、不管速度，见到重叠就各推一半。刚体要是也被它推，就会
+    // 和求解器的结果每帧互相打架（求解器推回去、分离再推出去），表现为
+    // 抖动甚至穿透。所以刚体的实体只归物理引擎管。
+    //
+    // 但它**仍然**挡住相机（resolveCamera 不看这个标记）——"这面墙是刚体"
+    // 和"相机不许穿过去"是两件事。
+    bool physicsDriven = false;
 };
 
 // 收集场景里所有有碰撞组件的实体。hullPoints 为空的（刚读盘 / 还没生成）

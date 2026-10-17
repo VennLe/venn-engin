@@ -56,6 +56,39 @@ public:
 
     void draw();
 
+    // ---- 左侧页签（Inspector 的一级导航）----
+    //
+    // 为什么要加这一层：以前所有分区竖直堆在一条滚动条里 —— 选中一个球之后,
+    // 要滚过 Transform / Visibility / Mesh / Material / Collision / Decal /
+    // Reflection Probe / Particle Emitter / Light / Script 才找得到要调的那一项。
+    // 改成"左边一列图标 + 右边一页内容"之后，视线只需要在一个方向上移动。
+    //
+    // **枚举顺序 = 图标栏自上而下的顺序 = 整数值**。下面 .cpp 里的
+    // kTabs[] 表与它逐项对应，改一处必须同步改另一处（编译期不会报错，
+    // 错了只会表现为"点了 A 出来 B"）。
+    enum class InspTab : int {
+        Object = 0,  // 物体属性：变换 / 可见性
+        Tool,        // 工具：网格生成参数 / 脚本 / 增删组件
+        Render,      // 渲染：灯光 / 贴花 / 反射探针
+        Output,      // 输出：视口与画面的输出信息
+        Scene,       // 场景：统计信息
+        World,       // 世界属性：相机 / 主光
+        Particles,   // 粒子系统
+        Physics,     // 物理系统：碰撞体
+        Material,    // 材质
+        Animation,   // 动画：蒙皮与片段播放
+        All,         // 全部：旧的"一长条堆叠"视图
+        Count,
+    };
+
+    // 当前 / 指定页签的读写。落盘走 EditorApp 的 LayoutState（见
+    // EditorLayoutIO.h 的 inspTab），所以这里是**纯状态访问**，不碰文件。
+    int activeTab() const { return m_tab; }
+    void setActiveTab(int t);
+    static int tabCount();
+    static const char* tabId(int t);          // 持久化 & env 用的稳定名
+    static int tabIndexById(const char* id);  // 找不到返回 -1
+
     // ---- E11 自动化自检（由 Console `insp.selftest` 调用）----
     // 覆盖三件事：剪贴板 Copy→改值→Paste 往返一致；Reset to Default 回到
     // 构造默认；折叠状态按名持久化（面板级 map，与当前实体无关）。
@@ -64,6 +97,57 @@ public:
 
 private:
     void drawSceneryFallback();  // 没选中时显示相机 / 主光 / 场景信息
+
+    // ---- 页签导航与内容派发 ----
+    // drawNavBar() 自己开一个**很窄的子窗口**（宽度 = 一个方形按钮），
+    // 调用方紧接着 SameLine() + BeginChild 开内容区。
+    void drawNavBar();
+    void drawTabContent(ecs::Entity e);
+    void drawTabObject(ecs::Entity e);
+    void drawTabTool(ecs::Entity e);
+    void drawTabRender(ecs::Entity e);
+    void drawTabOutput();
+    void drawTabScene();
+    void drawTabWorld(ecs::Entity e);
+    void drawTabParticles(ecs::Entity e);
+    void drawTabPhysics(ecs::Entity e);
+    void drawTabMaterial(ecs::Entity e);
+    void drawTabAnimation(ecs::Entity e);
+    void drawTabAll(ecs::Entity e);
+
+    // 该页签需要的组件在这个实体上没有 → 画一行"这里为什么是空的"。
+    // 比直接留白好：留白会让人以为面板坏了。
+    void tabEmptyHint(const char* what);
+
+    // 相机 / 主光 / 场景统计三段，从 drawSceneryFallback 里拆出来 ——
+    // 这样"没选中物体"时 World / Scene 页签仍然有内容。
+    void drawCameraSection();
+    void drawSunSection();
+    // 渲染细节（全局）：从 render::FeatureRegistry 生成控件 —— 与 Engine
+    // 面板是**同一份存储、同一套控件**（都写 paramPtr），这里只是把
+    // "渲染"相关的分组挑出来放到渲染页签里，省得为了调 SSR/阴影就得开
+    // 另一块面板。与选中哪个物体无关。
+    void drawRenderSettingsSection();
+    // 物体级渲染属性（可见性 / 投射阴影 / 逐物体 LOD 偏置）。
+    void drawObjectRenderSection(ecs::Entity e);
+    // ---- R7-1 物理页签的两段 ----
+    // ① 世界级：整份场景的物理参数（重力/步长/求解器/休眠）+ 运行态只读统计。
+    //    与"选中哪个物体"无关，所以没选中任何东西时页签也不空。
+    void drawPhysicsWorldSection();
+    // ② 物体级：选中实体的 RigidBodyComponent（没有就提供"添加"按钮）。
+    void drawRigidBodySection(ecs::Entity e);
+    // ---- M2（G07~G09）：四个玩法组件 ----
+    // 四段都是"**只有组件存在时才出现**"（添加统一走 Tool 页签的
+    // Add Component，与贴花 / 探针 / 粒子发射器同一条链路）——
+    // 添加入口分散到每段里，迟早会出现两套默认值。
+    void drawCharacterSection(ecs::Entity e);        // G07 角色控制器
+    void drawTriggerSection(ecs::Entity e);          // G08 触发体
+    void drawPhysicsMaterialSection(ecs::Entity e);  // G08 材质覆盖层
+    void drawCameraComponentSection(ecs::Entity e);  // G09 相机组件 + 相机列表
+    // 给选中实体挂/摘刚体（走 structuralEdit 进撤销栈）。
+    void addRigidBodyTo(ecs::Entity e);
+    void removeRigidBodyFrom(ecs::Entity e);
+    void drawSceneStatsSection();
     void drawTransform(ecs::Entity e);
     void drawVisibility(ecs::Entity e);
     void drawMeshAndMaterial(ecs::Entity e);
@@ -83,6 +167,15 @@ private:
     // ParticleEmitterComponent 时出现。曲线编辑用的是"四根滑条 = 四个
     // 控制点"（路线图明确："曲线编辑先用滑条组"）。
     void drawParticleEmitterSection(ecs::Entity e);
+    // 粒子页签的两段"外壳"：
+    //   · Preview —— 全局总开关 + 预览倍率（不需要选中物体）
+    //   · Add —— "在世界原点生成一个粒子特效" 的按钮
+    void drawParticlePreviewSection();
+    void drawParticleAddSection(ecs::Entity e);
+    // 在**世界原点**建一个带 Transform + ParticleEmitterComponent 的实体，
+    // 选中它并打开粒子总开关（否则"加了却什么都看不见"）。
+    // 返回值给自动化断言用。
+    ecs::Entity addParticleEffectAtOrigin();
 
     // 颜色渐变带编辑器（Color over Lifetime）。Unity 里是一条带停靠点的
     // 色带，Blender 里是 Color Ramp —— 这里做成两者的共同子集：
@@ -202,6 +295,11 @@ private:
     ecs::Entity m_scriptBufFor{};
     char m_scriptBuf[256] = {0};
 
+    // 动画片段名的输入缓冲（同上：换实体就重灌）。
+    // clipName 是 std::string，InputText 不能直接绑它，必须有个 char 缓冲。
+    ecs::Entity m_skinnedBufFor{};
+    char m_skinnedBuf[128] = {0};
+
     // Mesh / Light 面板"这一帧到底画了哪些参数"的签名。
     //
     // 用途有两个：一是**验证**（tools/verify_mesh_params.py 靠这行日志断言
@@ -225,6 +323,16 @@ private:
     // 推就会让用户点不动那些折叠标题。测完这一帧立刻复位。
     int m_fxForceModules = -1;
 
+    // ---- 左侧页签状态 ----
+    // 当前页签（`InspTab` 的整数值）。切页签**不动** m_sectionOpen ——
+    // 折叠状态是按分区名记的，所以来回翻页签既不会丢折叠，也不需要重建。
+    int m_tab = static_cast<int>(InspTab::Object);
+    // INSP-TAB 日志的去抖签名（页签名 + 选中的实体）。只在变化时打一行，
+    // 供 tools/verify_inspector_tabs.py 断言"点了哪个页签"。
+    std::string m_lastTabSig;
+    // INS-TAB-EMPTY 的去抖签名（"<页签>/<缺什么组件>"），见 tabEmptyHint。
+    std::string m_lastEmptySig;
+
     // ---- E11 分区折叠 / 搜索 / 剪贴板 ----
     // 折叠状态**按分区名**持久化：面板级成员，切实体、切场景都保留。
     // 值的权威来源仍是 ImGui 自己的 window storage（用户点击时同步回来），
@@ -232,6 +340,10 @@ private:
     std::unordered_map<std::string, bool> m_sectionOpen;
     // 组件搜索词：非空时只画命中的分区（分区名或字段关键词）
     char m_search[64] = {0};
+    // Render 页签里渲染特性块的过滤词。**和 m_search 分开**：m_search 过滤
+    // 的是"有哪些分区"，这里是"分区里有哪些参数"，两件事混在一起会让
+    // "搜 subsurf 结果把整个 Rendering 分区藏了"。
+    char m_renderFilter[64] = {0};
     // 组件剪贴板：分区名 + 组件字节快照（Copy/Paste Properties）
     std::string m_clipSection;
     std::vector<std::uint8_t> m_clipBytes;

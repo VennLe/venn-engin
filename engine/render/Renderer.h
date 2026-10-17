@@ -139,7 +139,18 @@ struct FrameGraphInput;
 //   放进 3D pass 才能吃到深度测试 —— 墙挡住的那些格线就不该出现。
 struct GridSettings {
     // 半边长（米）：栅格覆盖 [-extent, extent]²
-    float extent = 60.0f;
+    //
+    // 2026-10-17 按用户要求"按 UE5 的标准规模弄大些"：60 → **250**
+    // （原来只有 120 m 见方，走两步就出块；现在 500 m 见方）。
+    // 2026-10-17 晚再扩到 **2000**：250 太小时，相机飞到 150 m 以上俯视，
+    // 可见地面被栅格自己的边界切出一个方块 —— 与"远平面裁掉远处地面"是
+    // 同一个观感问题。UE5 的视口栅格实际是无限大的（按 LOD 换格距），
+    // 这里退一步做成"足够大的一块 + 亚像素淡出"，几何代价仍然是 2 个三角形
+    // （顶点由 gl_VertexIndex 现算，格线全部在片元里解析求值）。
+    // ⚠ 实际能看到的范围还会被**远平面**夹一次 —— 见 Renderer::recordFrame
+    //   里 `fadeEnd = min(fadeEnd, extent, far*0.95)`。编辑器视口的 far 是
+    //   5000 m（见 EditorContext::applyEditorCameraMode），不再卡在 200 m。
+    float extent = 2000.0f;
     // 最小格 / 主格（米）。用户要求"最小基本单位 1 m"，主格取 10 m
     float minorStep = 1.0f;
     float majorStep = 10.0f;
@@ -157,8 +168,8 @@ struct GridSettings {
     // 淡出等于让一圈"没有栅格的环"跟着相机跑，飞行时非常显眼）。
     // 实际用的终点还会被 extent 与远平面夹一次，见 Renderer::recordFrame。
     float lineWidthPx = 1.4f;
-    float fadeStart = 45.0f;
-    float fadeEnd = 60.0f;
+    float fadeStart = 1500.0f;
+    float fadeEnd = 2000.0f;
 };
 
 // R4-2：皮肤预积分散射的曲率缩放默认值。
@@ -675,6 +686,17 @@ public:
         return m_previewWidth > 0 && m_previewHeight > 0;
     }
     uint64_t previewTextureId() const;
+
+    // 把"尺寸变了"这件事真正落地（重建离屏链 + 重注册 ImGui 纹理）。
+    //
+    // ⚠ **必须在 UI 构建之前调用**，也就是 Application 的 onImGui 开头 ——
+    //   不能像原来那样放在 drawFrame 的录制过程里。原因是一次重建会把旧
+    //   的 ImGui 纹理（VkDescriptorSet）RemoveTexture 掉再注册新的；而
+    //   本帧的 ImGui 绘制数据**早就**把旧句柄记进 draw list 了，等到
+    //   ImGui 真正提交时就绑了一个已释放的 descriptor set。
+    //   症状正是"用鼠标拖角色窗口的边框改大小 → 直接崩"。主视口与预览
+    //   两条离屏链都有这个问题，所以统一从这一个入口走。
+    void applyPendingResizes();
     // 设置 / 清除"本帧要额外渲染的预览场景"（角色详情窗口持有）。
     void setPreviewScene(scene::Scene* scene) { m_previewScene = scene; }
     // 额外视角（验证 / 演示用）：MYVK_EXTRA_VIEW=1 时建一个 2 号目标，

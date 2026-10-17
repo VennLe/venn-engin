@@ -1028,6 +1028,225 @@ ecs::ParticleEmitterComponent particleEmitterFromJson(const json& j) {
     return p;
 }
 
+// ---------------------------------------------------------------- 物理（R7-1）
+//
+// 两层数据，各自挂在它该在的地方：
+//   · **场景级**（重力 / 步长 / 求解器 / 休眠）→ 顶层 "physics"
+//     （跟相机、太阳一样是"一份场景一套参数"）
+//   · **实体级**（刚体：类型 / 形状 / 质量 / 材质 / 初速度）→ 每实体的
+//     "rigidbody"
+//
+// ⚠ 这里**不存**任何解算结果（速度、位置、休眠标记）。位置本来就在
+//   transform 里，而速度/休眠是运行态派生量 —— Play 每次都从编辑态摆好的
+//   位置重新开始，这正是"Stop 即回滚"能成立的前提。存了反而会让同一份
+//   场景文件读两次得到不同的初始条件。
+
+json physicsToJson(const PhysicsSettings& p) {
+    return json{
+        {"enabled", p.enabled},
+        {"gravity", vec3ToJson(p.gravity)},
+        {"groundPlane", p.groundPlane},
+        {"fixedTimeStep", p.fixedTimeStep},
+        {"maxSubSteps", p.maxSubSteps},
+        {"velocityIterations", p.velocityIterations},
+        {"positionIterations", p.positionIterations},
+        {"baumgarte", p.baumgarte},
+        {"slop", p.slop},
+        {"allowSleep", p.allowSleep},
+        {"sleepLinearThreshold", p.sleepLinearThreshold},
+        {"sleepAngularThreshold", p.sleepAngularThreshold},
+        {"sleepTime", p.sleepTime},
+    };
+}
+
+void physicsFromJson(PhysicsSettings& p, const json& j) {
+    if (!j.is_object()) return;   // 老场景 / 空 → 保留 clear() 后的默认值
+    p.enabled = j.value("enabled", p.enabled);
+    if (j.contains("gravity")) p.gravity = vec3FromJson(j["gravity"], p.gravity);
+    p.groundPlane = j.value("groundPlane", p.groundPlane);
+    p.fixedTimeStep = j.value("fixedTimeStep", p.fixedTimeStep);
+    p.maxSubSteps = j.value("maxSubSteps", p.maxSubSteps);
+    p.velocityIterations = j.value("velocityIterations", p.velocityIterations);
+    p.positionIterations = j.value("positionIterations", p.positionIterations);
+    p.baumgarte = j.value("baumgarte", p.baumgarte);
+    p.slop = j.value("slop", p.slop);
+    p.allowSleep = j.value("allowSleep", p.allowSleep);
+    p.sleepLinearThreshold =
+        j.value("sleepLinearThreshold", p.sleepLinearThreshold);
+    p.sleepAngularThreshold =
+        j.value("sleepAngularThreshold", p.sleepAngularThreshold);
+    p.sleepTime = j.value("sleepTime", p.sleepTime);
+}
+
+json rigidBodyToJson(const ecs::RigidBodyComponent& b) {
+    return json{
+        {"bodyType", static_cast<int>(b.bodyType)},
+        {"shape", static_cast<int>(b.shape)},
+        {"radius", b.radius},
+        {"halfHeight", b.halfHeight},
+        {"halfExtents", vec3ToJson(b.halfExtents)},
+        {"mass", b.mass},
+        {"density", b.density},
+        {"staticFriction", b.staticFriction},
+        {"dynamicFriction", b.dynamicFriction},
+        {"restitution", b.restitution},
+        {"linearDamping", b.linearDamping},
+        {"angularDamping", b.angularDamping},
+        {"useGravity", b.useGravity},
+        {"allowSleep", b.allowSleep},
+        {"initialVelocity", vec3ToJson(b.initialVelocity)},
+        {"initialAngularVelocity", vec3ToJson(b.initialAngularVelocity)},
+    };
+}
+
+ecs::RigidBodyComponent rigidBodyFromJson(const json& j) {
+    ecs::RigidBodyComponent b;   // 从默认值出发：缺字段 = 该字段保持默认
+    if (!j.is_object()) return b;
+
+    b.bodyType = static_cast<ecs::PhysicsBodyType>(
+        j.value("bodyType", static_cast<int>(b.bodyType)));
+    b.shape = static_cast<ecs::PhysicsShapeType>(
+        j.value("shape", static_cast<int>(b.shape)));
+    b.radius = j.value("radius", b.radius);
+    b.halfHeight = j.value("halfHeight", b.halfHeight);
+    if (j.contains("halfExtents"))
+        b.halfExtents = vec3FromJson(j["halfExtents"], b.halfExtents);
+    b.mass = j.value("mass", b.mass);
+    b.density = j.value("density", b.density);
+    b.staticFriction = j.value("staticFriction", b.staticFriction);
+    b.dynamicFriction = j.value("dynamicFriction", b.dynamicFriction);
+    b.restitution = j.value("restitution", b.restitution);
+    b.linearDamping = j.value("linearDamping", b.linearDamping);
+    b.angularDamping = j.value("angularDamping", b.angularDamping);
+    b.useGravity = j.value("useGravity", b.useGravity);
+    b.allowSleep = j.value("allowSleep", b.allowSleep);
+    if (j.contains("initialVelocity"))
+        b.initialVelocity = vec3FromJson(j["initialVelocity"], b.initialVelocity);
+    if (j.contains("initialAngularVelocity"))
+        b.initialAngularVelocity =
+            vec3FromJson(j["initialAngularVelocity"], b.initialAngularVelocity);
+    return b;
+}
+
+// ---------------- 角色控制器（G07）----------------
+//
+// ⚠ `velocity / position / bodyYaw / onGround / groundNormalZ / started`
+//   是**运行态**：每帧由 stepCharacter 写回，存下来既没意义（下一帧就被
+//   覆盖）也会把"上一轮的悬崖边状态"带进新会话。只存决定手感的那一组。
+json characterToJson(const ecs::CharacterControllerComponent& c) {
+    return json{
+        {"radius", c.radius},
+        {"halfHeight", c.halfHeight},
+        {"stepHeight", c.stepHeight},
+        {"slopeLimitDeg", c.slopeLimitDeg},
+        {"groundSnap", c.groundSnap},
+        {"groundSnapDistance", c.groundSnapDistance},
+        {"gravityScale", c.gravityScale},
+        {"maxSpeed", c.maxSpeed},
+        {"sprintMultiplier", c.sprintMultiplier},
+        {"jumpSpeed", c.jumpSpeed},
+        {"acceleration", c.acceleration},
+        {"airControl", c.airControl},
+        {"turnSpeed", c.turnSpeed},
+        {"pushStrength", c.pushStrength},
+        {"enabled", c.enabled},
+    };
+}
+
+ecs::CharacterControllerComponent characterFromJson(const json& j) {
+    ecs::CharacterControllerComponent c;
+    if (!j.is_object()) return c;
+    c.radius = j.value("radius", c.radius);
+    c.halfHeight = j.value("halfHeight", c.halfHeight);
+    c.stepHeight = j.value("stepHeight", c.stepHeight);
+    c.slopeLimitDeg = j.value("slopeLimitDeg", c.slopeLimitDeg);
+    c.groundSnap = j.value("groundSnap", c.groundSnap);
+    c.groundSnapDistance =
+        j.value("groundSnapDistance", c.groundSnapDistance);
+    c.gravityScale = j.value("gravityScale", c.gravityScale);
+    c.maxSpeed = j.value("maxSpeed", c.maxSpeed);
+    c.sprintMultiplier = j.value("sprintMultiplier", c.sprintMultiplier);
+    c.jumpSpeed = j.value("jumpSpeed", c.jumpSpeed);
+    c.acceleration = j.value("acceleration", c.acceleration);
+    c.airControl = j.value("airControl", c.airControl);
+    c.turnSpeed = j.value("turnSpeed", c.turnSpeed);
+    c.pushStrength = j.value("pushStrength", c.pushStrength);
+    c.enabled = j.value("enabled", c.enabled);
+    return c;
+}
+
+// ---------------- 触发体（G08）----------------
+json triggerToJson(const ecs::TriggerComponent& t) {
+    return json{
+        {"enabled", t.enabled},
+        {"mask", t.mask},
+        {"reportStay", t.reportStay},
+    };
+}
+
+ecs::TriggerComponent triggerFromJson(const json& j) {
+    ecs::TriggerComponent t;
+    if (!j.is_object()) return t;
+    t.enabled = j.value("enabled", t.enabled);
+    t.mask = j.value("mask", t.mask);
+    t.reportStay = j.value("reportStay", t.reportStay);
+    return t;
+}
+
+// ---------------- 物理材质（G08）----------------
+// 覆盖层：没有本组件时物理行为与加它之前**逐字段相同**，所以"缺文件"和
+// "有文件但缺字段"都必须落回 RigidBody 的默认值，不能凭空造一个覆盖层。
+json physicsMaterialToJson(const ecs::PhysicsMaterialComponent& m) {
+    return json{
+        {"staticFriction", m.staticFriction},
+        {"dynamicFriction", m.dynamicFriction},
+        {"restitution", m.restitution},
+        {"density", m.density},
+    };
+}
+
+ecs::PhysicsMaterialComponent physicsMaterialFromJson(const json& j) {
+    ecs::PhysicsMaterialComponent m;
+    if (!j.is_object()) return m;
+    m.staticFriction = j.value("staticFriction", m.staticFriction);
+    m.dynamicFriction = j.value("dynamicFriction", m.dynamicFriction);
+    m.restitution = j.value("restitution", m.restitution);
+    m.density = j.value("density", m.density);
+    return m;
+}
+
+// ---------------- 相机组件（G09）----------------
+// `trauma` 是运行态（外部 addShake 累加、随时间衰减），不落盘。
+json cameraComponentToJson(const ecs::CameraComponent& c) {
+    return json{
+        {"fov", c.fov},
+        {"priority", c.priority},
+        {"enabled", c.enabled},
+        {"targetOffset", vec3ToJson(c.targetOffset)},
+        {"distance", c.distance},
+        {"minDistance", c.minDistance},
+        {"collideWithWorld", c.collideWithWorld},
+        {"shakeAmplitude", c.shakeAmplitude},
+        {"shakeFrequency", c.shakeFrequency},
+    };
+}
+
+ecs::CameraComponent cameraComponentFromJson(const json& j) {
+    ecs::CameraComponent c;
+    if (!j.is_object()) return c;
+    c.fov = j.value("fov", c.fov);
+    c.priority = j.value("priority", c.priority);
+    c.enabled = j.value("enabled", c.enabled);
+    if (j.contains("targetOffset"))
+        c.targetOffset = vec3FromJson(j["targetOffset"], c.targetOffset);
+    c.distance = j.value("distance", c.distance);
+    c.minDistance = j.value("minDistance", c.minDistance);
+    c.collideWithWorld = j.value("collideWithWorld", c.collideWithWorld);
+    c.shakeAmplitude = j.value("shakeAmplitude", c.shakeAmplitude);
+    c.shakeFrequency = j.value("shakeFrequency", c.shakeFrequency);
+    return c;
+}
+
 // ============================================================
 // 场景 → JSON（文件版与内存版共用的核心）
 // ============================================================
@@ -1064,6 +1283,26 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         root["cameras"] = std::move(cams);
     }
     root["light"] = lightToJson(scene.light());
+    // 物理世界（R7-1）。只有**非默认**才写 —— 老场景文件里没有这段，
+    // 读的时候也就自然落到默认值上，两份文件的 diff 不会被"一整套默认
+    // 物理参数"撑爆。判据用一个显式函数而不是逐字段比较，是为了让"新增
+    // 一个字段忘了同步"变成编译期 / 一看就懂的错误。
+    {
+        const PhysicsSettings& ps = scene.physicsSettings();
+        const PhysicsSettings def;
+        if (ps.enabled != def.enabled || ps.gravity != def.gravity ||
+            ps.groundPlane != def.groundPlane ||
+            ps.fixedTimeStep != def.fixedTimeStep ||
+            ps.maxSubSteps != def.maxSubSteps ||
+            ps.velocityIterations != def.velocityIterations ||
+            ps.positionIterations != def.positionIterations ||
+            ps.baumgarte != def.baumgarte || ps.slop != def.slop ||
+            ps.allowSleep != def.allowSleep ||
+            ps.sleepLinearThreshold != def.sleepLinearThreshold ||
+            ps.sleepAngularThreshold != def.sleepAngularThreshold ||
+            ps.sleepTime != def.sleepTime)
+            root["physics"] = physicsToJson(ps);
+    }
     // 后处理体积（相机级效果的场景化覆盖）：为空时不写，旧场景文件不含它。
     if (!scene.postVolumes().empty()) {
         json vols = json::array();
@@ -1141,6 +1380,28 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         if (const auto* fx = w.get<ecs::ParticleEmitterComponent>(it.entity))
             je["particleEmitter"] = particleEmitterToJson(*fx);
 
+        // 刚体（R7-1）。与贴花 / 探针 / 发射器同理：它也不带网格 ——
+        // "隐形的墙"就是一个只有刚体的实体，所以下面那句 skipped++ 同样
+        // 要为它开一个口子。位置/朝向已经在 transform 里，这里只存参数。
+        if (const auto* rb = w.get<ecs::RigidBodyComponent>(it.entity))
+            je["rigidbody"] = rigidBodyToJson(*rb);
+
+        // 角色控制器（G07）。与刚体**互斥**：角色是运动学的，由
+        // stepCharacter 驱动，不交给物理求解器（互斥关系在 Inspector 里
+        // 会给出提示，见 InspectorPanel 的 "角色控制器" 段）。
+        if (const auto* chc =
+                w.get<ecs::CharacterControllerComponent>(it.entity))
+            je["character"] = characterToJson(*chc);
+
+        // 触发体（G08）/ 物理材质（G08）/ 相机（G09）
+        if (const auto* trg = w.get<ecs::TriggerComponent>(it.entity))
+            je["trigger"] = triggerToJson(*trg);
+        if (const auto* pmat =
+                w.get<ecs::PhysicsMaterialComponent>(it.entity))
+            je["physicsMaterial"] = physicsMaterialToJson(*pmat);
+        if (const auto* cam = w.get<ecs::CameraComponent>(it.entity))
+            je["camera"] = cameraComponentToJson(*cam);
+
         // 脚本（只有路径与开关，脚本源码本身是独立文件）
         if (const auto* sc = w.get<ecs::ScriptComponent>(it.entity)) {
             je["script"] = json{
@@ -1168,9 +1429,16 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         if (const auto* limb = w.get<ecs::PlayerLimbComponent>(it.entity))
             je["playerLimb"] = limb->kind;
 
-        if (je["mesh"].is_null() && !je.contains("decal") &&
-            !je.contains("probe") && !je.contains("particleEmitter"))
-            ++r.skipped;  // 无网格无贴花无探针无发射器才算"没内容"
+        // "有没有内容"：没有网格时，贴花 / 探针 / 发射器 / 刚体 / 角色 /
+        // 触发体 / 物理材质 / 相机 任意一个存在就不算空 —— 它们都是
+        // "没有网格但有意义"的实体（隐形的墙、触发区域、相机机位）。
+        const bool hasNonMeshContent =
+            je.contains("decal") || je.contains("probe") ||
+            je.contains("particleEmitter") || je.contains("rigidbody") ||
+            je.contains("character") || je.contains("trigger") ||
+            je.contains("physicsMaterial") || je.contains("camera");
+        if (je["mesh"].is_null() && !hasNonMeshContent)
+            ++r.skipped;
 
         root["entities"].push_back(std::move(je));
     }
@@ -1209,6 +1477,11 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
     }
     applyLight(scene.light(), root.contains("light") ? root["light"]
                                                      : json(nullptr));
+
+    // 物理世界（R7-1）。scene.clear() 已经把 m_physics 复位成默认值，
+    // 所以"老场景没有 physics 字段"这条路径**什么都不用做**就是对的。
+    physicsFromJson(scene.physicsSettings(),
+                    root.contains("physics") ? root["physics"] : json(nullptr));
 
     // 后处理体积
     if (root.contains("postVolumes") && root["postVolumes"].is_array()) {
@@ -1422,9 +1695,57 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 w.add<ecs::ParticleEmitterComponent>(e, fx);
         }
 
-        if (!mesh && !mat && !je.contains("decal") && !je.contains("probe") &&
-            !je.contains("particleEmitter"))
-            ++r.skipped;
+        // 刚体（R7-1）。只是**数据**：真正的 physics::RigidBody 由编辑器在
+        // 进入 Play 时按它建（见 EditorApp::buildPhysicsWorld）。编辑态读盘
+        // 之后场景里就多了一个"待仿真的物体"，仅此而已。
+        if (je.contains("rigidbody") && je["rigidbody"].is_object()) {
+            const ecs::RigidBodyComponent rb = rigidBodyFromJson(je["rigidbody"]);
+            if (auto* p = w.get<ecs::RigidBodyComponent>(e))
+                *p = rb;
+            else
+                w.add<ecs::RigidBodyComponent>(e, rb);
+        }
+
+        // 角色控制器（G07）/ 触发体 / 物理材质（G08）/ 相机（G09）。
+        // 全是纯数据：真正的行为由运行时或编辑器在 Play 时消费。
+        if (je.contains("character") && je["character"].is_object()) {
+            const ecs::CharacterControllerComponent ch =
+                characterFromJson(je["character"]);
+            if (auto* p = w.get<ecs::CharacterControllerComponent>(e))
+                *p = ch;
+            else
+                w.add<ecs::CharacterControllerComponent>(e, ch);
+        }
+        if (je.contains("trigger") && je["trigger"].is_object()) {
+            const ecs::TriggerComponent tr = triggerFromJson(je["trigger"]);
+            if (auto* p = w.get<ecs::TriggerComponent>(e))
+                *p = tr;
+            else
+                w.add<ecs::TriggerComponent>(e, tr);
+        }
+        if (je.contains("physicsMaterial") && je["physicsMaterial"].is_object()) {
+            const ecs::PhysicsMaterialComponent pm =
+                physicsMaterialFromJson(je["physicsMaterial"]);
+            if (auto* p = w.get<ecs::PhysicsMaterialComponent>(e))
+                *p = pm;
+            else
+                w.add<ecs::PhysicsMaterialComponent>(e, pm);
+        }
+        if (je.contains("camera") && je["camera"].is_object()) {
+            const ecs::CameraComponent cm =
+                cameraComponentFromJson(je["camera"]);
+            if (auto* p = w.get<ecs::CameraComponent>(e))
+                *p = cm;
+            else
+                w.add<ecs::CameraComponent>(e, cm);
+        }
+
+        const bool hasNonMeshContent =
+            je.contains("decal") || je.contains("probe") ||
+            je.contains("particleEmitter") || je.contains("rigidbody") ||
+            je.contains("character") || je.contains("trigger") ||
+            je.contains("physicsMaterial") || je.contains("camera");
+        if (!mesh && !mat && !hasNonMeshContent) ++r.skipped;
     }
 
     r.ok = true;

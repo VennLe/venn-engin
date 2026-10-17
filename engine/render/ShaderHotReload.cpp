@@ -8,7 +8,7 @@ namespace render {
 
 namespace {
 
-// 与 editor/script/ScriptEngine.cpp 的 fileWriteTime 同款实现：
+// 与 engine/script/ScriptEngine.cpp 的 fileWriteTime 同款实现：
 // last_write_time 失败（文件不存在/被锁）一律返回 0，绝不上抛 ——
 // 外部构建器写文件的瞬间可能读不到，下一轮 poll 自然追上。
 int64_t fileWriteTime(const std::string& path) {

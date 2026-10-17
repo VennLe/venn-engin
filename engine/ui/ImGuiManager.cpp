@@ -1,4 +1,5 @@
 #include "ui/ImGuiManager.h"
+#include "ui/ImGuiTheme.h"
 #include "rhi/Instance.h"
 #include "rhi/Device.h"
 
@@ -22,106 +23,6 @@ namespace {
 // 大、且是矢量字体，缩放后更清晰。
 constexpr float kBaseFontSize = 18.0f;
 
-// ---------------------------------------------------------------- 视觉风格
-// 对齐 UE5 编辑器的观感：
-//   · 间距比 ImGui 默认舒展一档（默认 FramePadding 是 4,3、ItemSpacing 8,4）
-//     —— 这是"面板看起来拥挤"最直接的原因：控件彼此贴太近、文字顶到边框。
-//   · 深灰阶 + 单一蓝色强调色；面板用方角（4px 圆角），不用发光/描边。
-//   · 主菜单栏与工具栏同色，视觉上连成一条"顶栏"。
-void applyVennStyle() {
-    ImGuiStyle& s = ImGui::GetStyle();
-    ImVec4* c = s.Colors;
-
-    // ---- 尺寸 ----
-    s.WindowPadding = ImVec2(10.0f, 8.0f);
-    s.FramePadding = ImVec2(9.0f, 5.0f);       // 默认 3 → 控件更"厚"，不挤
-    s.ItemSpacing = ImVec2(9.0f, 7.0f);        // 默认 8,4 → 行间透气
-    s.ItemInnerSpacing = ImVec2(7.0f, 5.0f);
-    s.CellPadding = ImVec2(7.0f, 5.0f);
-    s.IndentSpacing = 20.0f;
-    s.ScrollbarSize = 13.0f;
-    s.GrabMinSize = 11.0f;
-
-    s.WindowBorderSize = 1.0f;
-    s.ChildBorderSize = 1.0f;
-    s.PopupBorderSize = 1.0f;
-    s.FrameBorderSize = 0.0f;
-    s.TabBorderSize = 0.0f;
-
-    s.WindowRounding = 4.0f;
-    s.ChildRounding = 4.0f;
-    s.FrameRounding = 4.0f;
-    s.PopupRounding = 4.0f;
-    s.ScrollbarRounding = 6.0f;
-    s.GrabRounding = 4.0f;
-    s.TabRounding = 4.0f;
-
-    s.WindowTitleAlign = ImVec2(0.02f, 0.5f);
-    s.WindowMenuButtonPosition = ImGuiDir_None;   // 面板标题左边不留折叠三角
-    s.SeparatorTextBorderSize = 1.0f;
-    s.SeparatorTextPadding = ImVec2(14.0f, 4.0f);
-
-    // ---- 配色（UE5 深色一套的近似值）----
-    const ImVec4 accent(0.16f, 0.53f, 0.94f, 1.00f);
-
-    c[ImGuiCol_Text] = ImVec4(0.86f, 0.87f, 0.89f, 1.00f);
-    c[ImGuiCol_TextDisabled] = ImVec4(0.48f, 0.50f, 0.53f, 1.00f);
-
-    c[ImGuiCol_WindowBg] = ImVec4(0.106f, 0.110f, 0.118f, 1.00f);
-    c[ImGuiCol_ChildBg] = ImVec4(0.129f, 0.133f, 0.141f, 1.00f);
-    c[ImGuiCol_PopupBg] = ImVec4(0.118f, 0.122f, 0.129f, 0.98f);
-    c[ImGuiCol_Border] = ImVec4(0.235f, 0.245f, 0.263f, 0.85f);
-    c[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-
-    c[ImGuiCol_FrameBg] = ImVec4(0.176f, 0.184f, 0.196f, 1.00f);
-    c[ImGuiCol_FrameBgHovered] = ImVec4(0.227f, 0.239f, 0.259f, 1.00f);
-    c[ImGuiCol_FrameBgActive] = ImVec4(0.263f, 0.280f, 0.310f, 1.00f);
-
-    c[ImGuiCol_TitleBg] = ImVec4(0.113f, 0.117f, 0.125f, 1.00f);
-    c[ImGuiCol_TitleBgActive] = ImVec4(0.149f, 0.157f, 0.169f, 1.00f);
-    c[ImGuiCol_TitleBgCollapsed] = ImVec4(0.113f, 0.117f, 0.125f, 1.00f);
-
-    c[ImGuiCol_MenuBarBg] = ImVec4(0.113f, 0.117f, 0.125f, 1.00f);
-    c[ImGuiCol_ScrollbarBg] = ImVec4(0.086f, 0.090f, 0.098f, 1.00f);
-    c[ImGuiCol_ScrollbarGrab] = ImVec4(0.286f, 0.298f, 0.318f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.353f, 0.365f, 0.388f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.420f, 0.435f, 0.459f, 1.00f);
-
-    c[ImGuiCol_CheckMark] = accent;
-    c[ImGuiCol_SliderGrab] = ImVec4(0.29f, 0.42f, 0.63f, 1.00f);
-    c[ImGuiCol_SliderGrabActive] = accent;
-
-    c[ImGuiCol_Button] = ImVec4(0.200f, 0.211f, 0.231f, 1.00f);
-    c[ImGuiCol_ButtonHovered] = ImVec4(0.247f, 0.310f, 0.427f, 1.00f);
-    c[ImGuiCol_ButtonActive] = ImVec4(0.216f, 0.400f, 0.706f, 1.00f);
-
-    c[ImGuiCol_Header] = ImVec4(0.188f, 0.267f, 0.400f, 1.00f);
-    c[ImGuiCol_HeaderHovered] = ImVec4(0.231f, 0.365f, 0.573f, 1.00f);
-    c[ImGuiCol_HeaderActive] = ImVec4(0.243f, 0.451f, 0.780f, 1.00f);
-
-    c[ImGuiCol_Separator] = ImVec4(0.235f, 0.245f, 0.263f, 1.00f);
-    c[ImGuiCol_SeparatorHovered] = ImVec4(0.310f, 0.400f, 0.560f, 1.00f);
-    c[ImGuiCol_SeparatorActive] = accent;
-
-    c[ImGuiCol_ResizeGrip] = ImVec4(0.235f, 0.245f, 0.263f, 0.60f);
-    c[ImGuiCol_ResizeGripHovered] = ImVec4(0.310f, 0.400f, 0.560f, 0.80f);
-    c[ImGuiCol_ResizeGripActive] = accent;
-
-    c[ImGuiCol_Tab] = ImVec4(0.145f, 0.153f, 0.165f, 1.00f);
-    c[ImGuiCol_TabHovered] = ImVec4(0.231f, 0.365f, 0.573f, 1.00f);
-    c[ImGuiCol_TabSelected] = ImVec4(0.188f, 0.267f, 0.400f, 1.00f);
-
-    c[ImGuiCol_PlotLines] = ImVec4(0.60f, 0.66f, 0.74f, 1.00f);
-    c[ImGuiCol_PlotHistogram] = accent;
-
-    c[ImGuiCol_TextSelectedBg] = ImVec4(0.16f, 0.53f, 0.94f, 0.35f);
-    c[ImGuiCol_NavHighlight] = accent;
-    c[ImGuiCol_DragDropTarget] = ImVec4(1.00f, 0.78f, 0.20f, 0.90f);
-    c[ImGuiCol_TableHeaderBg] = ImVec4(0.145f, 0.153f, 0.165f, 1.00f);
-    c[ImGuiCol_TableBorderStrong] = ImVec4(0.235f, 0.245f, 0.263f, 1.00f);
-    c[ImGuiCol_TableBorderLight] = ImVec4(0.180f, 0.188f, 0.200f, 1.00f);
-    c[ImGuiCol_TableRowBgAlt] = ImVec4(1.00f, 1.00f, 1.00f, 0.02f);
-}
 } // namespace
 
 void ImGuiManager::init(GLFWwindow* window, rhi::Instance& instance,
@@ -153,8 +54,10 @@ void ImGuiManager::init(GLFWwindow* window, rhi::Instance& instance,
         VK_LOG_INFO("ImGui settings persistence disabled (automation run)");
     }
 
-    ImGui::StyleColorsDark();
-    applyVennStyle();
+    // 主题（含尺寸度量）—— 具体调色板在 ui/ImGuiTheme.cpp，这里只负责
+    // 在启动时应用"当前主题"（默认 VennDark = 改动前那套配色）。
+    // 运行中换主题走 ui::applyTheme()，见 Edit ▸ Preferences ▸ Interface。
+    applyTheme(currentThemeIndex());
 
     // ---- 加载矢量字体（DroidSans，随 imgui 一起拷贝到 assets/fonts）----
     // 用矢量 TTF 替代内置位图字体：基础字号更大，且运行时 FontGlobalScale
@@ -177,6 +80,55 @@ void ImGuiManager::init(GLFWwindow* window, rhi::Instance& instance,
     } else {
         VK_LOG_WARN("ImGui font not found: %s (fallback to builtin)",
                     fontPath.c_str());
+    }
+
+    // ---- 合并一个中文字体（编辑器要支持中文界面）----
+    //
+    // 为什么是"合并"而不是"换成中文字体"：
+    //   · 英文字形仍由 DroidSans 提供 —— 这保证了**英文界面逐像素不变**
+    //     （回归里那批像素断言全部按英文界面标定）。
+    //   · 中文字形从系统字体补进来（MergeMode）。ImGui 的字符查找是
+    //     "先注册的字体优先"，所以两边各取所长，不会串味。
+    //
+    // ⚠ 中文字体不随仓库分发（微软雅黑 19MB），改用**系统字体**：Windows
+    //   自带，路径固定。找不到就只打一条 WARN —— 中文界面的汉字会显示成
+    //   '?'，但程序照常跑，英文界面完全不受影响。
+    {
+        static const char* kCjkCandidates[] = {
+            "C:/Windows/Fonts/msyh.ttc",    // 微软雅黑（Win7+ 标配）
+            "C:/Windows/Fonts/msyhl.ttc",   // 微软雅黑 Light
+            "C:/Windows/Fonts/Deng.ttf",    // 等线
+            "C:/Windows/Fonts/simhei.ttf",  // 黑体
+            "C:/Windows/Fonts/simsun.ttc",  // 宋体
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+        };
+        const char* picked = nullptr;
+        for (const char* p : kCjkCandidates) {
+            if (FILE* f = std::fopen(p, "rb")) {
+                std::fclose(f);
+                picked = p;
+                break;
+            }
+        }
+        if (picked) {
+            ImFontConfig cfg;
+            cfg.MergeMode = true;
+            // 只取常用简体字（约 2500 个）：全 CJK 区有 2 万个码位，图集会
+            // 撑到 8192x8192，启动慢且吃显存 —— 编辑器界面用不到那些生僻字。
+            cfg.GlyphRanges = io.Fonts->GetGlyphRangesChineseSimplifiedCommon();
+            // .ttc 是多字体集合，取第 0 个面（微软雅黑常规体）
+            cfg.FontNo = 0;
+            ImFont* cjk = io.Fonts->AddFontFromFileTTF(
+                picked, kBaseFontSize, &cfg);
+            if (cjk)
+                VK_LOG_INFO("ImGui CJK font merged: %s (%.0fpx)", picked,
+                            kBaseFontSize);
+            else
+                VK_LOG_WARN("ImGui CJK font merge failed: %s", picked);
+        } else {
+            VK_LOG_WARN("No CJK font found - Chinese UI text will not render");
+        }
     }
 
     ImGui_ImplGlfw_InitForVulkan(window, true);

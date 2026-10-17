@@ -38,6 +38,8 @@
 // ============================================================
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace render {
 
@@ -293,6 +295,42 @@ void resetToDefaults();
 
 // 把某一个参数恢复默认（UI 的"复位"小按钮用）。返回是否成功。
 bool resetParam(const char* id);
+
+// ---------------------------------------------------------------- 文件层覆盖（E03）
+// RenderSettingsIO 的覆盖链要往"同一个存储"里写值，所以它需要的**只是**
+// 绑定表，而不是第二个影子结构体。这里把绑定暴露成一份只读视图。
+//
+// ⚠ 为什么"文件层"和"env 层"要用**两个独立**的 applied 标记：
+//   同一个参数完全可能既被 `config/render.json` 覆盖、又被 `MYVK_*` 覆盖。
+//   env 是测试钩子，必须**永远赢**。于是每个阶段的顺序被钉死成：
+//       applySettingsOnce() → loadEnvOverrides()
+//   两边各记各的"处理过没有"，才能在**分阶段绑定**（构造期 /
+//   createMainTarget 之后）的两次调用里都保持这个顺序。
+
+struct BindingView {
+    // 用 std::string 而不是 const char*：绑定表的 vector 会随 bindParam
+    // 扩容，裸指针会在下一次绑定后悬垂。
+    std::string id;
+    ParamKind kind = ParamKind::Float;
+    void* ptr = nullptr;
+    void* aux = nullptr;
+    // 绑定那一刻捕获的默认值（与 resetToDefaults() 用的是同一份）
+    bool dBool = false;
+    int dInt = 0;
+    float dFloat = 0.0f;
+    float dColor[3] = {0.0f, 0.0f, 0.0f};
+};
+
+// 取走"尚未被文件层处理过"的绑定（**取即标记**，语义与 loadEnvOverrides
+// 的"只处理一次"完全一致）。返回本次新取到的条数。
+int takeUnappliedBindings(std::vector<BindingView>& out);
+
+// 全部已绑定参数（"导出当前设置"用）。不改变任何标记。
+int collectBindings(std::vector<BindingView>& out);
+
+// 把文件层的 applied 标记全部清掉 —— 只给 UI 的"重新载入设置"用
+// （用户手改 json 后要求当场生效）。env 的标记**不动**。
+void resetSettingsApplied();
 
 // ---------------------------------------------------------------- 自检
 

@@ -180,6 +180,186 @@ struct CollisionComponent {
     }
 };
 
+// ---------------- 刚体（R7-1）----------------
+//
+// CollisionComponent 只描述"有个碰撞体"（给编辑器的碰撞预览 + 位置分离用，
+// 没有动力学）。本组件才是"这东西**受物理支配**"：Play 时编辑器会按它给
+// 每个实体在 physics::PhysicsWorld 里建一个刚体，每帧把解算出来的变换写回
+// TransformComponent；Stop 时整个运行态被丢弃，于是天然回滚。
+//
+// ⚠ 只有 Play 态参与仿真（与相机/脚本/玩家的处理方式一致）。编辑态摆好的
+//   位置永远是"初始条件"，不会被物理改掉 —— 这是 ECS 存档、撤销、序列化
+//   全都依赖的前提。
+
+// 刚体的运动类型。名字对应 physics::BodyType。
+enum class PhysicsBodyType : int {
+    Static = 0,     // 永不动（墙 / 地板），逆质量 = 0
+    Kinematic = 1,  // 由速度驱动（平台 / 门），不受重力与冲量影响
+    Dynamic = 2,    // 完整动力学
+};
+
+// 碰撞形状。Auto = 按实体的 CollisionComponent / 网格包围盒推断，
+// 这样"先加网格再加刚体"不用手填尺寸。
+enum class PhysicsShapeType : int {
+    Auto = 0,
+    Sphere = 1,
+    Box = 2,
+    Capsule = 3,
+    ConvexHull = 4,
+};
+
+struct RigidBodyComponent {
+    PhysicsBodyType bodyType = PhysicsBodyType::Dynamic;
+    PhysicsShapeType shape = PhysicsShapeType::Auto;
+
+    // ---- 显式形状尺寸（shape != Auto 时生效）----
+    float radius = 0.5f;             // Sphere / Capsule
+    float halfHeight = 0.5f;         // Capsule 的圆柱段半高
+    glm::vec3 halfExtents{0.5f};     // Box
+
+    // ---- 质量 ----
+    // mass <= 0 → 按 density × 体积算（默认路径：改尺寸时质量自动跟着变）。
+    float mass = 0.0f;
+    float density = 500.0f;
+
+    // ---- 材质 ----
+    float staticFriction = 0.6f;
+    float dynamicFriction = 0.4f;
+    float restitution = 0.0f;        // 弹性：0 = 完全非弹性
+    float linearDamping = 0.05f;
+    float angularDamping = 0.05f;
+
+    // ---- 行为开关 ----
+    bool useGravity = true;
+    bool allowSleep = true;
+
+    // ---- 初速度（Play 开始的那一刻施加，随后就交给求解器）----
+    glm::vec3 initialVelocity{0.0f};
+    glm::vec3 initialAngularVelocity{0.0f};
+};
+
+// ---------------- 角色控制器（G07）----------------
+//
+// 与 RigidBodyComponent 的 Dynamic 体是**两种东西**：
+//   · 刚体：被力/冲量驱动，台阶会卡、斜坡会滑 —— 适合箱子、碎块
+//   · 角色：位置由 physics::stepCharacter 直接决定（运动学），能迈台阶、
+//     能贴地、不会反弹 —— 适合玩家 / NPC
+//
+// ⚠ 与 PlayerComponent 的关系：PlayerComponent 是编辑器 Play 态那套"便携
+//   移动"（它有自己的 WASD 代码路径）。两者**互斥**；同时挂时角色控制器
+//   优先（Inspector 里会提示）。
+struct CharacterControllerComponent {
+    // 尺寸：position 是胶囊**中心**，总高 = 2 × (halfHeight + radius)
+    float radius = 0.35f;
+    float halfHeight = 0.55f;
+
+    // 行走
+    float stepHeight = 0.35f;
+    float slopeLimitDeg = 46.0f;
+    bool groundSnap = true;
+    float groundSnapDistance = 0.30f;
+
+    // 运动
+    float gravityScale = 1.0f;
+    float maxSpeed = 4.5f;
+    float sprintMultiplier = 2.0f;
+    float jumpSpeed = 5.0f;
+    float acceleration = 40.0f;
+    float airControl = 0.25f;
+    float turnSpeed = 12.0f;      // 转身插值速度（1/s）
+    float pushStrength = 1.0f;
+
+    bool enabled = true;
+
+    // ---- 运行态（不序列化）----
+    glm::vec3 velocity{0.0f};
+    glm::vec3 position{0.0f};     // 胶囊中心（每帧由控制器写回）
+    float bodyYaw = 0.0f;         // 当前朝向（平滑转身用）
+    bool onGround = false;
+    float groundNormalZ = 1.0f;
+    bool started = false;         // 本轮 Play 的第一帧（初始化 bodyYaw）
+};
+
+// ---------------- 触发体（G08）----------------
+//
+// 挂在**已经有 CollisionComponent** 的实体上：那个碰撞体的几何就是触发
+// 体积。语义与 `CollisionComponent::solid=false` 的区别是**有没有事件**：
+//   · solid=false       —— 只可视化、不推开、不报事件
+//   · TriggerComponent  —— 不推开，但每帧产出 Enter / Stay / Exit
+//
+// 为什么要一个独立组件而不是复用 solid 标志：事件是有成本的（每帧对每个
+// 触发体做一次重叠测试），必须能"只为真的需要事件的体积付这笔钱"。
+struct TriggerComponent {
+    bool enabled = true;
+    // 只报告带这些层的实体（位掩码，0xFFFFFFFF = 全收）。
+    unsigned mask = 0xFFFFFFFFu;
+    // Stay 事件每帧都派发是有意义的（"站在火里持续掉血"），但它也是
+    // 事件量的主要来源 —— 不需要时可以关掉，只留 Enter / Exit。
+    bool reportStay = true;
+};
+
+// ---------------- 物理材质（G08）----------------
+//
+// 与 RigidBodyComponent 里那四个字段的关系：本组件是**覆盖层**。
+// 没有它 → 行为与 G08 之前逐字段相同（这是硬约束：既有物理用例的轨迹
+// 一位都不许变）；有它 → 用这里的值。
+//
+// 为什么拆出来而不是从 RigidBody 里删字段：摩擦/弹性属于"表面属性"，
+// 一个箱子换材质不该动它的质量与初速度；而 RigidBody 的生命周期更长
+//（Play 开始时就烘成 physics::RigidBody 了）。覆盖层的写法让两者解耦，
+// 又不用改任何既有场景。
+struct PhysicsMaterialComponent {
+    float staticFriction = 0.6f;
+    float dynamicFriction = 0.4f;
+    float restitution = 0.0f;
+    float density = 500.0f;
+    // ⚠ 这里**没有** restitutionThreshold：弹性速度阈值是
+    //   physics::Settings 上的**世界级**参数（Solver 用它统一判断"这一下
+    //   算不算撞"），按物体分开需要改求解器契约。别在这儿放一个吃不到的
+    //   字段 —— "界面上能调、实际没接线"比没有更糟。
+};
+
+// ---------------- 相机组件（G09）----------------
+//
+// 一台相机 = 一个实体 + 本组件。`scene::Camera` 仍是**渲染用的那一台**；
+// 本组件决定"谁来当它、怎么摆"。
+//
+// 优先级：每帧挑 priority 最大的启用相机。同分时取**实体 id 较小**的
+//（确定性：不能因为遍历顺序变了就换镜头）。
+//
+// ⚠ 两种用法，别混：
+//   · **跟随相机（第三人称）** → 挂在**角色实体**上（与
+//     CharacterControllerComponent 同一个实体）。姿态由 PlayerController
+//     算好交给 CameraSystem；本组件的 fov / 跟随参数就是给它的。
+//   · **固定机位（过场 / 备用镜头）** → 独立实体，位置与朝向取它的世界
+//     矩阵，fov 取本组件（见 CameraSystem::poseFromEntity）。
+//
+// ⚠ 这里**故意没有** nearClip / farClip / orthographic / orthoHeight /
+//   damping：渲染端目前用的是全局近远平面（改它要动投影矩阵与深度精度，
+//   near 一变所有像素断言都得重定），正交相机则整条渲染路径都还没写。
+//   "界面上能调、实际没接线"比没有更糟 —— 等真接线时再加回来。
+struct CameraComponent {
+    float fov = 45.0f;
+
+    int priority = 0;
+    bool enabled = true;
+
+    // ---- 跟随（运行态 PlayerController 也用它）----
+    // 注视点相对**胶囊中心**。0.76 ≈ 头顶往下 0.14（1.8 m 高的胶囊）。
+    // ⚠ 是相对胶囊中心、不是相对实体原点（原点在脚底）：跟随相机每帧
+    //   拿的是物理状态里的胶囊中心，少一次换算是少一处错。
+    glm::vec3 targetOffset{0.0f, 0.0f, 0.76f};
+    float distance = 4.0f;                      // 第三人称臂长
+    float minDistance = 0.6f;
+    bool collideWithWorld = true;                // 臂长遇墙缩短
+
+    // ---- 震动（**默认 0 = 关**：关掉时相机状态逐位不变）----
+    float shakeAmplitude = 0.0f;   // 米
+    float shakeFrequency = 24.0f;  // Hz
+    // 运行态：外部通过 CameraSystem::addShake() 累加，随时间衰减
+    float trauma = 0.0f;
+};
+
 struct VisibilityComponent {
     bool visible = true;      // 参与主渲染
     bool castShadow = true;   // 参与阴影贴图渲染

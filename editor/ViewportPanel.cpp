@@ -1,11 +1,14 @@
 #include "ViewportPanel.h"
 
+#include "Localization.h"
 #include "DebugRects.h"    // MYVK_LOG_RECTS：把视口矩形打给自动化脚本
 #include "EditorDragDrop.h"
 #include "EditorScene.h"  // instantiateModel
 
 #include "render/Renderer.h"
 #include "render/FeatureRegistry.h"   // E14：视口设置直接写 grid.* 参数
+
+#include "ui/ImGuiTheme.h"
 
 #include "ecs/Components.h"
 #include "physics/CollisionWorld.h"
@@ -26,6 +29,16 @@ namespace {
 
 // 面板最小渲染尺寸：再小就退化成 1×1 的图，重建开销反而不划算
 constexpr float kMinViewport = 64.0f;
+
+// ---- 视口叠加片（模式条 / 统计 HUD / 播放 HUD）的文字色 ----
+// 这些贴片的底**故意是深色且与主题无关** —— 它们压在任意 3D 画面上（可能
+// 是纯白天空），只有"深底 + 浅字"才在每套主题下都保证对比度；UE / Unity /
+// Blender 的视口叠加层都是这么做的。
+// 于是**浅色主题**下必须反过来把文字强制成浅色：主题的 ImGuiCol_Text 在
+// 浅色主题里是深色，"深底 + 深字"直接看不见。
+// ⚠ 深色主题下**一个都不推** → 与改动前逐像素一致（默认主题基线不动）。
+constexpr ImVec4 kOverlayText = ImVec4(0.88f, 0.91f, 0.95f, 1.0f);
+constexpr ImVec4 kOverlayTextDim = ImVec4(0.64f, 0.68f, 0.74f, 1.0f);
 
 // ---- 视口导航（编辑态）参数 ----
 // 鼠标每移动 1 像素转多少弧度（再乘灵敏度）。0.0025 rad ≈ 0.14°/px ——
@@ -163,7 +176,7 @@ bool snapField(const char* label, bool& enabled, float& value,
     ImGui::SameLine(0.0f, 4.0f);
     ImGui::TextUnformatted(label);
 
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(TR("%s"), tooltip);
 
     ImGui::PopID();
     return changed;
@@ -183,47 +196,47 @@ void ViewportPanel::drawToolbar() {
     const ImVec4 idle(0.20f, 0.20f, 0.23f, 1.0f);
 
     ImGui::PushStyleColor(ImGuiCol_Button, mode == GizmoMode::Translate ? active : idle);
-    if (ImGui::Button("Move (W)")) m_ctx.setGizmoMode(GizmoMode::Translate);
+    if (ImGui::Button(TR("Move (W)"))) m_ctx.setGizmoMode(GizmoMode::Translate);
     ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Button, mode == GizmoMode::Rotate ? active : idle);
-    if (ImGui::Button("Rotate (E)")) m_ctx.setGizmoMode(GizmoMode::Rotate);
+    if (ImGui::Button(TR("Rotate (E)"))) m_ctx.setGizmoMode(GizmoMode::Rotate);
     ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Button, mode == GizmoMode::Scale ? active : idle);
-    if (ImGui::Button("Scale (R)")) m_ctx.setGizmoMode(GizmoMode::Scale);
+    if (ImGui::Button(TR("Scale (R)"))) m_ctx.setGizmoMode(GizmoMode::Scale);
     ImGui::PopStyleColor();
 
     ImGui::SameLine();
-    ImGui::TextUnformatted("|");
+    ImGui::TextUnformatted(TR("|"));
     ImGui::SameLine();
 
     // 坐标系
     const GizmoSpace space = m_ctx.gizmoSpace();
-    if (ImGui::RadioButton("World", space == GizmoSpace::World))
+    if (ImGui::RadioButton(TR("World"), space == GizmoSpace::World))
         m_ctx.setGizmoSpace(GizmoSpace::World);
     ImGui::SameLine();
-    if (ImGui::RadioButton("Local", space == GizmoSpace::Local))
+    if (ImGui::RadioButton(TR("Local"), space == GizmoSpace::Local))
         m_ctx.setGizmoSpace(GizmoSpace::Local);
 
     ImGui::SameLine();
-    ImGui::TextUnformatted("|");
+    ImGui::TextUnformatted(TR("|"));
     ImGui::SameLine();
 
-    ImGui::Checkbox("Gizmo", &m_showGizmo);
+    ImGui::Checkbox(TR("Gizmo"), &m_showGizmo);
     ImGui::SameLine();
-    ImGui::Checkbox("HUD", &m_showOverlay);
+    ImGui::Checkbox(TR("HUD"), &m_showOverlay);
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Viewport overlay (stats / selection), the navigation\n"
+        ImGui::SetTooltip(TR("Viewport overlay (stats / selection), the navigation\n"
                           "HUD in the top-right and the navigation gizmo\n"
-                          "in the bottom-left corner.");
+                          "in the bottom-left corner."));
     }
 
     ImGui::SameLine();
-    ImGui::TextUnformatted("|");
+    ImGui::TextUnformatted(TR("|"));
     ImGui::SameLine();
     ImGui::BeginDisabled(!m_ctx.hasSelection());
-    if (ImGui::Button("Focus (F)")) focusSelection();
+    if (ImGui::Button(TR("Focus (F)"))) focusSelection();
     ImGui::EndDisabled();
 
     // 注：全屏切换按钮**不在这里**。它已经在主工具栏和视口右上角浮层里
@@ -246,12 +259,12 @@ void ViewportPanel::drawToolbar() {
 void ViewportPanel::drawSnapRow() {
     EditorContext& c = m_ctx;
 
-    ImGui::TextDisabled("Snap");
+    ImGui::TextDisabled(TR("Snap"));
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
-            "Grid snapping - one set per transform, same model as UE5's\n"
+            TR("Grid snapping - one set per transform, same model as UE5's\n"
             "viewport toolbar. Defaults: move 0.1 m / rotate 10 deg /\n"
-            "scale 0.1 (= UE's 10 uu / 10 deg / 0.1, with 1 uu = 1 cm).");
+            "scale 0.1 (= UE's 10 uu / 10 deg / 0.1, with 1 uu = 1 cm)."));
     }
     ImGui::SameLine();
 
@@ -260,14 +273,14 @@ void ViewportPanel::drawSnapRow() {
               "Translate: the drag delta is quantised to this many meters.\n"
               "UE default = 10 uu = 0.1 m.");
     ImGui::SameLine();
-    ImGui::TextUnformatted("|");
+    ImGui::TextUnformatted(TR("|"));
     ImGui::SameLine();
     snapField("Rotate (deg)", c.snapRotateRef(), c.snapRotateStepRef(), "%.1f",
               0.5f, 90.0f, 0.1f,
               "Rotate: the drag delta is quantised to this many degrees.\n"
               "UE default = 10 deg.");
     ImGui::SameLine();
-    ImGui::TextUnformatted("|");
+    ImGui::TextUnformatted(TR("|"));
     ImGui::SameLine();
     snapField("Scale (x)", c.snapScaleRef(), c.snapScaleStepRef(), "%.3f",
               0.001f, 10.0f, 0.005f,
@@ -276,11 +289,11 @@ void ViewportPanel::drawSnapRow() {
 
     // ---- 预设（对齐 UE5 下拉里那一串值）----
     ImGui::SameLine();
-    ImGui::TextUnformatted("|");
+    ImGui::TextUnformatted(TR("|"));
     ImGui::SameLine();
-    if (ImGui::Button("Presets")) ImGui::OpenPopup("##snap_presets");
+    if (ImGui::Button(TR("Presets"))) ImGui::OpenPopup("##snap_presets");
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Pick a step from UE5's preset lists.");
+        ImGui::SetTooltip(TR("Pick a step from UE5's preset lists."));
     }
 
     SnapPresetSet sets[3] = {
@@ -291,7 +304,7 @@ void ViewportPanel::drawSnapRow() {
 
     if (ImGui::BeginPopup("##snap_presets")) {
         for (SnapPresetSet& s : sets) {
-            ImGui::TextDisabled("%s", s.label);
+            ImGui::TextDisabled(TR("%s"), s.label);
             for (int i = 0; i < s.count; ++i) {
                 char item[48];
                 std::snprintf(item, sizeof(item), s.fmt,
@@ -303,7 +316,7 @@ void ViewportPanel::drawSnapRow() {
             }
             ImGui::Separator();
         }
-        ImGui::TextDisabled("Values follow UE5's viewport presets.");
+        ImGui::TextDisabled(TR("Values follow UE5's viewport presets."));
         ImGui::EndPopup();
     }
 
@@ -312,7 +325,7 @@ void ViewportPanel::drawSnapRow() {
     const char* modeLabel = c.gizmoMode() == GizmoMode::Translate ? "move"
                             : c.gizmoMode() == GizmoMode::Rotate ? "rotate"
                                                                  : "scale";
-    ImGui::TextDisabled("current: %s snap %s", modeLabel,
+    ImGui::TextDisabled(TR("current: %s snap %s"), modeLabel,
                         c.snapForCurrentMode() ? "ON" : "off");
 }
 
@@ -352,7 +365,7 @@ void ViewportPanel::dropSelectionToGround() {
     const std::string* nmp = m_ctx.editorScene().world().name(e);
     const char* nm = nmp ? nmp->c_str() : "?";
     if (!m_ctx.selectionFromViewport()) {
-        m_ctx.setStatus("Drop to floor: 先在 3D 视图里左键点选物体");
+        m_ctx.setStatus(TR("Drop to floor: click-select an object in the 3D viewport first"));
         VK_LOG_INFO("drop-to-floor: skipped ('%s' was not picked in the "
                     "viewport)", nm);
         return;
@@ -370,7 +383,7 @@ void ViewportPanel::dropSelectionToGround() {
 
     const float dz = -box.min.z;   // 世界空间里要把"底部"抬多高
     if (std::fabs(dz) < 1e-4f) {
-        m_ctx.setStatus("Already on the ground");
+        m_ctx.setStatus(TR("Already on the ground"));
         VK_LOG_INFO("drop-to-floor: '%s' already on the ground", nm);
         return;
     }
@@ -554,13 +567,13 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
              ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
                     ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
 
-    ImGui::SeparatorText("Add");
+    ImGui::SeparatorText(TR("Add"));
 
     // ⚠ logRect 必须在 BeginMenu 之外无条件调用：BeginMenu 只有在子菜单
     //   展开时才返回 true，写在 if 里会导致"悬停前永远拿不到父项矩形"，
     //   自动化脚本就死锁在"等矩形 → 才知道悬停哪"上（实测踩过）。
     //   BeginMenu 无论返回值如何都会提交 item，GetItemRectMin/Max 始终有效。
-    const bool meshOpen = ImGui::BeginMenu("Mesh");
+    const bool meshOpen = ImGui::BeginMenu(TR("Mesh"));
     menuRect("VP-ADD-Mesh", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     if (meshOpen) {
         const std::function<ecs::Entity()> makers[] = {
@@ -599,12 +612,12 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
     }
 
     // 同上：父项矩形无条件打（子菜单展开与否都要有，脚本靠它定位悬停点）
-    const bool lightOpen = ImGui::BeginMenu("Light");
+    const bool lightOpen = ImGui::BeginMenu(TR("Light"));
     menuRect("VP-ADD-Light", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     if (lightOpen) {
         // Sunlight：配置场景级太阳（有阴影、全局唯一），选中太阳实体
         {
-            const bool clicked = ImGui::MenuItem("Sunlight");
+            const bool clicked = ImGui::MenuItem(TR("Sunlight"));
             menuRect("VP-ADD-Sunlight", ImGui::GetItemRectMin(),
                      ImGui::GetItemRectMax());
             if (clicked) {
@@ -614,12 +627,12 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
             }
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("The scene's key light - simulates the sun.\n"
-                              "Casts shadows, lights the whole world.");
+            ImGui::SetTooltip(TR("The scene's key light - simulates the sun.\n"
+                              "Casts shadows, lights the whole world."));
         }
         // 实体级方向光：补光，可摆多盏，无阴影
         {
-            const bool clicked = ImGui::MenuItem("Directional Light");
+            const bool clicked = ImGui::MenuItem(TR("Directional Light"));
             menuRect("VP-ADD-DirectionalLight", ImGui::GetItemRectMin(),
                      ImGui::GetItemRectMax());
             if (clicked) {
@@ -629,11 +642,11 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
             }
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("A secondary directional fill light\n"
-                              "(no shadows, add as many as you like).");
+            ImGui::SetTooltip(TR("A secondary directional fill light\n"
+                              "(no shadows, add as many as you like)."));
         }
         {
-            const bool clicked = ImGui::MenuItem("Spot Light");
+            const bool clicked = ImGui::MenuItem(TR("Spot Light"));
             menuRect("VP-ADD-SpotLight", ImGui::GetItemRectMin(),
                      ImGui::GetItemRectMax());
             if (clicked) {
@@ -646,7 +659,7 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
             }
         }
         {
-            const bool clicked = ImGui::MenuItem("Point Light");
+            const bool clicked = ImGui::MenuItem(TR("Point Light"));
             menuRect("VP-ADD-PointLight", ImGui::GetItemRectMin(),
                      ImGui::GetItemRectMax());
             if (clicked) {
@@ -662,10 +675,10 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
     }
 
     // Player：两种相机视角的玩家（WASD + 鼠标，运行态驱动）
-    const bool playerOpen = ImGui::BeginMenu("Player");
+    const bool playerOpen = ImGui::BeginMenu(TR("Player"));
     menuRect("VP-ADD-Player", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     if (playerOpen) {
-        const bool fp = ImGui::MenuItem("First-Person Player");
+        const bool fp = ImGui::MenuItem(TR("First-Person Player"));
         menuRect("VP-ADD-FirstPerson", ImGui::GetItemRectMin(),
                  ImGui::GetItemRectMax());
         if (fp) {
@@ -680,10 +693,10 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                "The camera IS the player.\n"
-                "Run (Play) then: WASD to move, mouse to look around.");
+                TR("The camera IS the player.\n"
+                "Run (Play) then: WASD to move, mouse to look around."));
 
-        const bool tp = ImGui::MenuItem("Third-Person Player");
+        const bool tp = ImGui::MenuItem(TR("Third-Person Player"));
         menuRect("VP-ADD-ThirdPerson", ImGui::GetItemRectMin(),
                  ImGui::GetItemRectMax());
         if (tp) {
@@ -698,9 +711,9 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                "A little cartoon character with an orbit camera.\n"
+                TR("A little cartoon character with an orbit camera.\n"
                 "Run (Play) then: WASD moves the character (it turns with "
-                "you), mouse orbits the camera.");
+                "you), mouse orbits the camera."));
 
         ImGui::EndMenu();
     }
@@ -723,7 +736,7 @@ void ViewportPanel::addCollisionBody(ecs::Entity e,
     if (!e.valid()) return;
     auto* mc = m_ctx.editorScene().world().get<ecs::MeshComponent>(e);
     if (!mc || !mc->mesh) {
-        m_ctx.notify("No mesh to build a collider from");
+        m_ctx.notify(TR("No mesh to build a collider from"));
         VK_LOG_WARN("addCollisionBody: entity has no mesh");
         return;
     }
@@ -749,7 +762,7 @@ void ViewportPanel::addCollisionBody(ecs::Entity e,
                          });
 
     if (!ok) {
-        m_ctx.notify("Collider build failed (empty mesh?)");
+        m_ctx.notify(TR("Collider build failed (empty mesh?)"));
         return;
     }
     // 加完直接进入"编辑碰撞体"状态：手柄立刻作用在刚做出来的框上，
@@ -810,7 +823,7 @@ void ViewportPanel::removeCollisionBody(ecs::Entity e) {
     });
     m_ctx.setColliderEdit(false);
     VK_LOG_INFO("collision: removed collider from '%s'", nm ? nm->c_str() : "?");
-    m_ctx.notify("Removed collision body");
+    m_ctx.notify(TR("Removed collision body"));
 }
 
 void ViewportPanel::drawObjectMenu(const glm::vec2& vpPos,
@@ -887,33 +900,33 @@ void ViewportPanel::drawObjectMenu(const glm::vec2& vpPos,
 
     // 父项矩形必须**无条件**打点（BeginMenu 只在子菜单展开时才返回 true，
     // 写在 if 里脚本会永远等不到它）—— 见 drawAddMenu 里的同一条注释。
-    const bool addOpen = ImGui::BeginMenu("Add Collision Body");
+    const bool addOpen = ImGui::BeginMenu(TR("Add Collision Body"));
     menuRect("VP-OBJ-Add", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     if (addOpen) {
-        const bool c1 = ImGui::MenuItem("Convex Hull (QuickHull)");
+        const bool c1 = ImGui::MenuItem(TR("Convex Hull (QuickHull)"));
         menuRect("VP-OBJ-AddConvex", ImGui::GetItemRectMin(),
                  ImGui::GetItemRectMax());
         if (c1) addCollisionBody(e, ecs::ColliderShape::ConvexHull);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                "Fits a convex hull around the mesh (QuickHull).\n"
-                "Tightest fit - the industry-standard collision shape.");
+                TR("Fits a convex hull around the mesh (QuickHull).\n"
+                "Tightest fit - the industry-standard collision shape."));
         }
 
-        const bool c2 = ImGui::MenuItem("Capsule");
+        const bool c2 = ImGui::MenuItem(TR("Capsule"));
         menuRect("VP-OBJ-AddCapsule", ImGui::GetItemRectMin(),
                  ImGui::GetItemRectMax());
         if (c2) addCollisionBody(e, ecs::ColliderShape::Capsule);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                "A capsule wrapping the object's bounds.\n"
-                "Cheap and smooth - good for characters.");
+                TR("A capsule wrapping the object's bounds.\n"
+                "Cheap and smooth - good for characters."));
         }
         ImGui::EndMenu();
     }
 
     const bool hasCollider = (cc != nullptr);
-    if (ImGui::MenuItem("Remove Collision Body", nullptr, false, hasCollider)) {
+    if (ImGui::MenuItem(TR("Remove Collision Body"), nullptr, false, hasCollider)) {
         removeCollisionBody(e);
     }
     menuRect("VP-OBJ-Remove", ImGui::GetItemRectMin(),
@@ -922,7 +935,7 @@ void ViewportPanel::drawObjectMenu(const glm::vec2& vpPos,
     ImGui::Separator();
 
     bool editingColl = m_ctx.colliderEdit();
-    if (ImGui::MenuItem("Edit Collider with W/E/R", nullptr, &editingColl,
+    if (ImGui::MenuItem(TR("Edit Collider with W/E/R"), nullptr, &editingColl,
                         hasCollider)) {
         m_ctx.setColliderEdit(editingColl);
         VK_LOG_INFO("collision: gizmo target -> %s",
@@ -931,12 +944,12 @@ void ViewportPanel::drawObjectMenu(const glm::vec2& vpPos,
     menuRect("VP-OBJ-EditCollider", ImGui::GetItemRectMin(),
              ImGui::GetItemRectMax());
     if (ImGui::IsItemHovered() && !hasCollider) {
-        ImGui::SetTooltip("Add a collision body first");
+        ImGui::SetTooltip(TR("Add a collision body first"));
     }
 
     if (hasCollider) {
         bool solid = cc->solid;
-        if (ImGui::MenuItem("Solid (blocks other colliders)", nullptr, &solid)) {
+        if (ImGui::MenuItem(TR("Solid (blocks other colliders)"), nullptr, &solid)) {
             m_ctx.structuralEdit("Toggle Collider Solid", [&]() {
                 if (auto* p = w.get<ecs::CollisionComponent>(e))
                     p->solid = solid;
@@ -1086,7 +1099,7 @@ void ViewportPanel::draw() {
                 m_ctx.setColliderEdit(true);
                 VK_LOG_INFO("pick: collider wireframe hit -> gizmo target = "
                             "collider");
-                m_ctx.setStatus("Editing collision body (W/E/R)");
+                m_ctx.setStatus(TR("Editing collision body (W/E/R)"));
             }
         } else {
             const Ray ray =
@@ -1097,7 +1110,7 @@ void ViewportPanel::draw() {
                 m_ctx.selectFromViewport(hit.entity);
                 const std::string* n =
                     m_ctx.activeScene().world().name(hit.entity);
-                m_ctx.setStatus("Selected " +
+                m_ctx.setStatus(TR("Selected ") +
                                 (n ? *n : std::string("Object")));
                 // 打一行日志：自动化脚本靠它断言"这一下点中了谁 / 有没有点中"
                 // （比如点在地面上应当什么都不选中 —— 地面是 LockedComponent）。
@@ -1171,11 +1184,11 @@ void ViewportPanel::draw() {
             });
             if (imported.ok()) {
                 m_ctx.select(imported.root);
-                m_ctx.notify("Imported " + rel + " (" +
-                             std::to_string(imported.count()) + " mesh)");
+                m_ctx.notify(std::string(TR("Imported ")) + rel + " (" +
+                             std::to_string(imported.count()) + TR(" mesh)"));
                 m_ctx.dirty() = true;
             } else {
-                m_ctx.notify("Failed to import " + rel);
+                m_ctx.notify(TR("Failed to import ") + rel);
             }
         }
         ImGui::EndDragDropTarget();
@@ -1198,16 +1211,14 @@ void ViewportPanel::draw() {
         if (std::getenv("MYVK_LOG_RECTS")) {
             const EditorContext::ViewportOverlay& ov = m_ctx.vpOverlay();
             const int sig = (m_showOverlay ? 1 : 0) | (ov.modeBar ? 2 : 0) |
-                            (ov.stats ? 4 : 0) | (ov.camera ? 8 : 0) |
-                            (ov.navGizmo ? 16 : 0);
+                            (ov.stats ? 4 : 0) | (ov.navGizmo ? 8 : 0);
             static int lastSig = -1;
             if (sig != lastSig) {
                 lastSig = sig;
                 VK_LOG_INFO("VP-OVERLAY master=%d modeBar=%d stats=%d "
-                            "camera=%d navGizmo=%d",
+                            "navGizmo=%d",
                             m_showOverlay ? 1 : 0, ov.modeBar ? 1 : 0,
-                            ov.stats ? 1 : 0, ov.camera ? 1 : 0,
-                            ov.navGizmo ? 1 : 0);
+                            ov.stats ? 1 : 0, ov.navGizmo ? 1 : 0);
             }
         }
         if (m_showOverlay) {
@@ -1218,7 +1229,8 @@ void ViewportPanel::draw() {
             m_modeBarBottom = 0.0f;
             if (ov.modeBar) drawViewModeBar(vpPos, vpSize);
             if (ov.stats) drawStatsHud(vpPos, vpSize);
-            if (ov.camera) drawCameraInfo(vpPos, vpSize);
+            // 左下角曾经是相机浮层；已并入 Inspector → World → Camera（见
+            // EditorContext::ViewportOverlay 的说明），这里不再画任何东西。
             if (ov.navGizmo) drawNavGizmo(vpPos, vpSize);
         }
     } else {
@@ -1254,7 +1266,7 @@ void ViewportPanel::draw() {
 const char* kViewModeShort[] = {"Lit", "Unl", "Nrm", "Rgh",
                                 "Mtl", "Wir", "Odr", "Lgt"};
 static_assert(render::Renderer::kViewModeCount == 8,
-              "视图模式条短标签表要跟着 Renderer::ViewMode 一起扩");
+              "the view-mode bar short-label table must grow with Renderer::ViewMode");
 
 // ---- 视图模式条（左上）----
 void ViewportPanel::drawViewModeBar(const glm::vec2& vpPos,
@@ -1289,6 +1301,12 @@ void ViewportPanel::drawViewModeBar(const glm::vec2& vpPos,
                       ImGuiWindowFlags_NoScrollbar |
                           ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleColor();
+    // 浅色主题：深底要配浅字（见 kOverlayText 的注释）。深色主题不推。
+    const int ovPush = ui::tokens().isLight ? 2 : 0;
+    if (ovPush) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kOverlayText);
+        ImGui::PushStyleColor(ImGuiCol_TextDisabled, kOverlayTextDim);
+    }
 
     logRect("VP-RECT modebar", ImGui::GetWindowPos(),
             ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
@@ -1312,8 +1330,8 @@ void ViewportPanel::drawViewModeBar(const glm::vec2& vpPos,
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                "%s view\nShortcut: Shift+%d\n"
-                "(Lit is the baseline path; the others are debug views)",
+                TR("%s view\nShortcut: Shift+%d\n"
+                "(Lit is the baseline path; the others are debug views)"),
                 render::Renderer::viewModeName(
                     static_cast<render::Renderer::ViewMode>(i)),
                 i + 1);
@@ -1321,8 +1339,9 @@ void ViewportPanel::drawViewModeBar(const glm::vec2& vpPos,
         ImGui::PopID();
     }
     ImGui::SameLine(0.0f, st.ItemSpacing.x);
-    ImGui::TextDisabled("%s", nameBuf);
+    ImGui::TextDisabled(TR("%s"), nameBuf);
 
+    if (ovPush) ImGui::PopStyleColor(ovPush);
     ImGui::EndChild();
 
     // 自动化：模式条存在 + 一共几格（只打一次，和 VM-COMBO 同理）
@@ -1343,6 +1362,36 @@ void ViewportPanel::drawViewModeBar(const glm::vec2& vpPos,
 // 真的变窄，而不是留一片空白。
 void ViewportPanel::drawStatsHud(const glm::vec2& vpPos,
                                  const glm::vec2& vpSize) {
+    const ImGuiStyle& st0 = ImGui::GetStyle();
+
+    // ---- 折叠态：只留一颗小胶囊，点一下就展开 ----
+    //
+    // 折叠状态是**会话内**的（不落盘，也不进偏好表）：它回答的是"这一屏要
+    // 不要看数字"，属于临时动作；而"这块 HUD 存不存在"属于偏好
+    // （vp.overlay.stats）。两者分开，才不会出现"我折了一次，下次开编辑器
+    // 它自己变成关的"。
+    if (m_statsCollapsed) {
+        const float cw = ImGui::CalcTextSize("Stats").x +
+                         st0.FramePadding.x * 2.0f + 8.0f;
+        const float chh = ImGui::GetTextLineHeightWithSpacing();
+        ImGui::SetCursorScreenPos(
+            ImVec2(vpPos.x + vpSize.x - cw - 10.0f, vpPos.y + 10.0f));
+        ImGui::PushStyleColor(ImGuiCol_Button,
+                              ImVec4(0.10f, 0.12f, 0.15f, 0.80f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.80f, 0.87f, 0.95f));
+        const bool expand =
+            ImGui::Button(TR("Stats##vp_stats_expand"), ImVec2(cw, chh));
+        ImGui::PopStyleColor(2);
+        logRect("VP-RECT stats", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        if (expand) {
+            m_statsCollapsed = false;
+            if (std::getenv("MYVK_LOG_RECTS"))
+                VK_LOG_INFO("VP-STATS-COLLAPSE 0");
+        }
+        return;
+    }
+
     const EditorContext::StatsHudItems& it = m_ctx.statsHud();
     const scene::Scene& sc = m_ctx.activeScene();
     const render::Renderer::RenderStats& rs = m_renderer.renderStats();
@@ -1435,7 +1484,8 @@ void ViewportPanel::drawStatsHud(const glm::vec2& vpPos,
     // "行高 + ItemSpacing.y"。按 GetTextLineHeight 算会少几像素，10 行时
     // 刚好溢出 → 子窗口冒出滚动条，最后两行直接被滚出可视区（踩过）。
     const float lineH = ImGui::GetTextLineHeightWithSpacing();
-    const float rows = std::max(1.0f, static_cast<float>(lines.size()));
+    // +1 行给标题（"Stats  −"，点它折叠）
+    const float rows = std::max(1.0f, static_cast<float>(lines.size())) + 1.0f;
     const float ch = lineH * rows + st.WindowPadding.y * 2.0f + 2.0f;
 
     const float statsX = vpPos.x + vpSize.x - cw - 10.0f;
@@ -1447,17 +1497,33 @@ void ViewportPanel::drawStatsHud(const glm::vec2& vpPos,
     ImGui::SetCursorScreenPos(ImVec2(statsX, statsY));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.10f, 0.78f));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.89f, 0.94f, 0.92f));
+    // 浅色主题再补一个 TextDisabled（深底上的深灰字看不见）。深色主题维持
+    // 原来的 2 个 push → 与改动前逐像素一致。
+    const int stPush = ui::tokens().isLight ? 3 : 2;
+    if (stPush == 3)
+        ImGui::PushStyleColor(ImGuiCol_TextDisabled, kOverlayTextDim);
     ImGui::BeginChild("##vp_stats", ImVec2(cw, ch), 0,
                       ImGuiWindowFlags_NoScrollbar |
                           ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::PopStyleColor(2);
+    ImGui::PopStyleColor(stPush);
 
     logRect("VP-RECT stats", ImGui::GetWindowPos(),
             ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
                    ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
 
+    // 标题行 = 折叠按钮。整块 HUD 的"隐藏"与"收起"是两件事：隐藏归偏好
+    // （右键菜单），收起归这颗按钮。
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.13f, 0.15f, 0.19f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                          ImVec4(0.20f, 0.24f, 0.30f, 1.0f));
+    if (ImGui::SmallButton(TR("Stats  -##vp_stats_collapse"))) {
+        m_statsCollapsed = true;
+        if (std::getenv("MYVK_LOG_RECTS")) VK_LOG_INFO("VP-STATS-COLLAPSE 1");
+    }
+    ImGui::PopStyleColor(2);
+
     if (lines.empty()) {
-        ImGui::TextDisabled("(all stats hidden)");
+        ImGui::TextDisabled(TR("(all stats hidden)"));
     } else {
         for (const std::string& s : lines) ImGui::TextUnformatted(s.c_str());
     }
@@ -1471,194 +1537,6 @@ void ViewportPanel::drawStatsHud(const glm::vec2& vpPos,
 // 这里是原来的"右上角导航 HUD"搬家后的样子：灵敏度、栅格开关原样保留，
 // 另外补上真正需要在摆机位时盯着看的四个数（位置 / 注视点 / FOV / 距离），
 // 以及一排相机书签。
-void ViewportPanel::drawCameraInfo(const glm::vec2& vpPos,
-                                   const glm::vec2& vpSize) {
-    scene::Camera& cam = m_ctx.activeScene().camera();
-    const ImGuiStyle& st = ImGui::GetStyle();
-    const float fieldW = kSensitivityFieldW;
-
-    const glm::vec3 p = cam.position();
-    const glm::vec3 t = cam.target();
-
-    const float cw = 250.0f;
-    // 内容 = 4 行文字（Camera / pos / look / Bookmarks）+ 3 行控件
-    // （FOV / Sensitivity+Grid / 书签按钮）。用 *WithSpacing 的版本量，
-    // 否则要么溢出冒滚动条、要么底部留一大块空白。
-    const float ch = ImGui::GetTextLineHeightWithSpacing() * 4.0f +
-                     ImGui::GetFrameHeightWithSpacing() * 3.0f +
-                     st.WindowPadding.y * 2.0f + 2.0f;
-
-    ImGui::SetCursorScreenPos(
-        ImVec2(vpPos.x + 10.0f, vpPos.y + vpSize.y - ch - 10.0f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.10f, 0.80f));
-    ImGui::BeginChild("##vp_cam", ImVec2(cw, ch), 0,
-                      ImGuiWindowFlags_NoScrollbar |
-                          ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::PopStyleColor();
-
-    logRect("VP-RECT cam", ImGui::GetWindowPos(),
-            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
-                   ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
-
-    // 鼠标停在浮层上时：**按住右键**滚轮同样调灵敏度（此时鼠标不在视口
-    // 图像上，handleNavigation 那条路径不会触发）。单独滚轮在浮层上不做
-    // 任何事 —— 免得想把鼠标滚过输入框时意外把相机推走了。
-    const ImGuiIO& io = ImGui::GetIO();
-    if (ImGui::IsWindowHovered() &&
-        ImGui::IsMouseDown(ImGuiMouseButton_Right) && io.MouseWheel != 0.0f) {
-        m_ctx.addNavSensitivity(io.MouseWheel * kSensitivityStep);
-    }
-
-    ImGui::TextDisabled("Camera");
-    ImGui::Text("pos    %.2f %.2f %.2f", static_cast<double>(p.x),
-                static_cast<double>(p.y), static_cast<double>(p.z));
-    ImGui::Text("look   %.2f %.2f %.2f", static_cast<double>(t.x),
-                static_cast<double>(t.y), static_cast<double>(t.z));
-
-    // FOV：摆机位时最常拨的一个数，直接给可拖的控件（和 Inspector 同一个
-    // 相机对象，两边改的是同一份状态）。
-    float fov = cam.fov();
-    ImGui::SetNextItemWidth(fieldW);
-    if (ImGui::SliderFloat("FOV", &fov, 15.0f, 110.0f, "%.0f deg")) {
-        cam.setFov(fov);
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("dist %.1f m", static_cast<double>(cam.distance()));
-
-    // 灵敏度（原导航 HUD 的内容）
-    float sens = m_ctx.navSensitivity();
-    ImGui::SetNextItemWidth(fieldW);
-    if (ImGui::InputFloat("Sensitivity", &sens, 0.0f, 0.0f, "%.2f")) {
-        if (sens > 0.0f) {
-            m_ctx.navSensitivityRef() =
-                glm::clamp(sens, EditorContext::kMinSensitivity,
-                           EditorContext::kMaxSensitivity);
-        }
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Must be > 0 (%.2f .. %.2f).\n"
-                          "Hold RMB + mouse wheel to nudge it.",
-                          static_cast<double>(EditorContext::kMinSensitivity),
-                          static_cast<double>(EditorContext::kMaxSensitivity));
-    }
-    ImGui::SameLine();
-    ImGui::Checkbox("Grid", &m_ctx.showGridRef());
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(
-            "Reference grid on the z = 0 plane (minor 1 m / major 10 m).\n"
-            "Hidden while playing. MYVK_GRID=0 forces it off.");
-    }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("View...")) ImGui::OpenPopup("##vp_settings");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Viewport settings: grid step, background, units");
-    }
-
-    // ---- 相机书签 ----
-    // 左键 = 跳过去；右键 = 存当前位置。空槽画成暗色，有书的画成蓝色。
-    // 键盘等价物：Ctrl+Shift+数字存、Alt+Shift+数字跳（见 handleOverlayShortcuts）。
-    ImGui::TextDisabled("Bookmarks  (LMB recall / RMB save)");
-    EditorContext::CameraBookmark* bm = m_ctx.bookmarksRef();
-    const ImVec4 used(0.26f, 0.52f, 0.85f, 1.0f);
-    const ImVec4 empty(0.20f, 0.20f, 0.23f, 1.0f);
-    // 9 个按钮要在一行里塞下：把 FramePadding 收窄（默认 8 太宽，
-    // 9 个加起来正好超出容器内宽，第 9 格会被裁掉）。
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 2.0f));
-    for (int i = 0; i < EditorContext::kBookmarkCount; ++i) {
-        if (i) ImGui::SameLine(0.0f, 2.0f);
-        ImGui::PushID(1000 + i);
-        ImGui::PushStyleColor(ImGuiCol_Button, bm[i].set ? used : empty);
-        char lb[8];
-        std::snprintf(lb, sizeof(lb), "%d", i + 1);
-        if (ImGui::SmallButton(lb)) {
-            if (bm[i].set) {
-                const glm::vec3 keep = cam.target();
-                cam.setYaw(bm[i].yaw);
-                cam.setPitch(bm[i].pitch);
-                cam.setTarget(keep);
-                m_ctx.setStatus("Camera bookmark " + std::to_string(i + 1));
-                VK_LOG_INFO("VP-BOOK recall slot=%d", i + 1);
-            } else {
-                VK_LOG_INFO("VP-BOOK recall slot=%d (empty)", i + 1);
-            }
-        }
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-            bm[i].set = true;
-            bm[i].pos = cam.position();
-            bm[i].yaw = cam.yaw();
-            bm[i].pitch = cam.pitch();
-            m_ctx.setStatus("Saved camera bookmark " + std::to_string(i + 1));
-            VK_LOG_INFO("VP-BOOK save slot=%d pos=%.3f,%.3f,%.3f yaw=%.4f "
-                        "pitch=%.4f",
-                        i + 1, static_cast<double>(bm[i].pos.x),
-                        static_cast<double>(bm[i].pos.y),
-                        static_cast<double>(bm[i].pos.z),
-                        static_cast<double>(bm[i].yaw),
-                        static_cast<double>(bm[i].pitch));
-        }
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s\nCtrl+Shift+%d = save, Alt+Shift+%d = recall",
-                              bm[i].set ? "occupied" : "empty", i + 1, i + 1);
-        }
-        ImGui::PopID();
-    }
-    ImGui::PopStyleVar();
-
-    // ---- 视口设置 ----
-    if (ImGui::BeginPopup("##vp_settings")) {
-        ImGui::SeparatorText("Grid step");
-
-        // 网格步长直接写到注册表参数上（E02 起 grid.* 是纯 UI 参数，
-        // 没有副作用钩子，写值即生效）。
-        auto setGrid = [](float minor, float major) {
-            if (void* p = render::paramPtr("grid.minorStep")) {
-                *static_cast<float*>(p) = minor;
-            }
-            if (void* p = render::paramPtr("grid.majorStep")) {
-                *static_cast<float*>(p) = major;
-            }
-        };
-        float curMinor = 1.0f;
-        if (void* p = render::paramPtr("grid.minorStep")) {
-            curMinor = *static_cast<float*>(p);
-        }
-        const float steps[3] = {1.0f, 0.5f, 0.1f};
-        for (int i = 0; i < 3; ++i) {
-            if (i) ImGui::SameLine();
-            char lb[24];
-            std::snprintf(lb, sizeof(lb), "%g m", static_cast<double>(steps[i]));
-            if (ImGui::RadioButton(lb, std::fabs(curMinor - steps[i]) < 1e-4f)) {
-                setGrid(steps[i], steps[i] * 10.0f);
-            }
-        }
-
-        ImGui::SeparatorText("Background");
-        bool sky = m_renderer.skyEnabled();
-        if (ImGui::RadioButton("Sky / environment", sky)) {
-            m_renderer.skyEnabled() = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Solid", !sky)) m_renderer.skyEnabled() = false;
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(
-                "Solid = the sky pass is skipped and the scene clears to the\n"
-                "flat background colour (useful for silhouette checks).");
-        }
-
-        ImGui::SeparatorText("Units");
-        ImGui::TextDisabled("Readouts above use meters.");
-
-        ImGui::SeparatorText("View mode");
-        ImGui::TextDisabled("Use the bar in the top-left corner (Shift+1..%d).",
-                            render::Renderer::kViewModeCount);
-
-        ImGui::EndPopup();
-    }
-
-    ImGui::EndChild();
-}
-
 // ---- "Viewport Display" 菜单（右键视口空白处）----
 //
 // 只负责**画**这个 popup：按下 / 松开的判定在 drawObjectMenu 里（那里已经
@@ -1690,44 +1568,89 @@ void ViewportPanel::drawDisplayMenu(const glm::vec2& vpPos,
         logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     };
 
-    ImGui::SeparatorText("Overlay panels");
-    ImGui::Checkbox("View mode bar (top-left)", &ov.modeBar);
+    ImGui::SeparatorText(TR("Overlay panels"));
+    ImGui::Checkbox(TR("View mode bar (top-left)"), &ov.modeBar);
     itemRect("VP-DISPLAY-ITEM modeBar");
-    ImGui::Checkbox("Stats HUD (top-right)", &ov.stats);
+    ImGui::Checkbox(TR("Stats HUD (top-right)"), &ov.stats);
     itemRect("VP-DISPLAY-ITEM stats");
-    ImGui::Checkbox("Camera info (bottom-left)", &ov.camera);
-    itemRect("VP-DISPLAY-ITEM camera");
-    ImGui::Checkbox("Navigation gizmo (bottom-right)", &ov.navGizmo);
+    ImGui::Checkbox(TR("Navigation gizmo (bottom-right)"), &ov.navGizmo);
     itemRect("VP-DISPLAY-ITEM navGizmo");
 
-    ImGui::SeparatorText("Stats HUD lines");
+    ImGui::SeparatorText(TR("Stats HUD lines"));
     ImGui::BeginDisabled(!ov.stats);
-    ImGui::Checkbox("FPS", &st.fps);
+    ImGui::Checkbox(TR("FPS"), &st.fps);
     ImGui::SameLine();
-    ImGui::Checkbox("Frame time", &st.frameMs);
-    ImGui::Checkbox("Draw calls", &st.drawCalls);
+    ImGui::Checkbox(TR("Frame time"), &st.frameMs);
+    ImGui::Checkbox(TR("Draw calls"), &st.drawCalls);
     ImGui::SameLine();
-    ImGui::Checkbox("Triangles", &st.triangles);
-    ImGui::Checkbox("VRAM", &st.vram);
+    ImGui::Checkbox(TR("Triangles"), &st.triangles);
+    ImGui::Checkbox(TR("VRAM"), &st.vram);
     ImGui::SameLine();
-    ImGui::Checkbox("Resolution", &st.resolution);
-    ImGui::Checkbox("View mode", &st.viewMode);
+    ImGui::Checkbox(TR("Resolution"), &st.resolution);
+    ImGui::Checkbox(TR("View mode"), &st.viewMode);
     ImGui::SameLine();
-    ImGui::Checkbox("Entities", &st.entities);
-    ImGui::Checkbox("Selection", &st.selection);
+    ImGui::Checkbox(TR("Entities"), &st.entities);
+    ImGui::Checkbox(TR("Selection"), &st.selection);
     ImGui::SameLine();
-    ImGui::Checkbox("Gizmo state", &st.gizmo);
+    ImGui::Checkbox(TR("Gizmo state"), &st.gizmo);
     ImGui::EndDisabled();
 
+    // ---- 视口设置 ----
+    // 原来这组控件在左下角相机浮层的 "View..." 弹出菜单里。相机浮层并入
+    // Inspector 之后，这里才是它们的自然归宿（都是"视口怎么看"，不是
+    // "相机在哪"）。
+    ImGui::SeparatorText(TR("Grid"));
+    auto setGrid = [](float minor, float major) {
+        if (void* p = render::paramPtr("grid.minorStep")) {
+            *static_cast<float*>(p) = minor;
+        }
+        if (void* p = render::paramPtr("grid.majorStep")) {
+            *static_cast<float*>(p) = major;
+        }
+    };
+    float curMinor = 1.0f;
+    if (void* p = render::paramPtr("grid.minorStep")) {
+        curMinor = *static_cast<float*>(p);
+    }
+    const float steps[3] = {1.0f, 0.5f, 0.1f};
+    for (int i = 0; i < 3; ++i) {
+        ImGui::PushID(5000 + i);
+        char lb[24];
+        std::snprintf(lb, sizeof(lb), "%g m", static_cast<double>(steps[i]));
+        if (ImGui::RadioButton(lb, std::fabs(curMinor - steps[i]) < 1e-4f)) {
+            setGrid(steps[i], steps[i] * 10.0f);
+        }
+        ImGui::PopID();
+        if (i < 2) ImGui::SameLine();
+    }
+    itemRect("VP-DISPLAY-ITEM gridstep");
+    ImGui::Checkbox(TR("Reference grid"), &m_ctx.showGridRef());
+    itemRect("VP-DISPLAY-ITEM grid");
+
+    ImGui::SeparatorText(TR("Background"));
+    {
+        const bool sky = m_renderer.skyEnabled();
+        if (ImGui::RadioButton(TR("Sky / environment"), sky)) {
+            m_renderer.skyEnabled() = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton(TR("Solid"), !sky)) m_renderer.skyEnabled() = false;
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("Solid = the sky pass is skipped and the scene clears to the\n"
+                "flat background colour (useful for silhouette checks)."));
+        }
+    }
+
     ImGui::Separator();
-    if (ImGui::MenuItem("Show all overlays")) {
-        ov.modeBar = ov.stats = ov.camera = ov.navGizmo = true;
+    if (ImGui::MenuItem(TR("Show all overlays"))) {
+        ov.modeBar = ov.stats = ov.navGizmo = true;
         st = EditorContext::StatsHudItems{};
     }
     itemRect("VP-DISPLAY-ITEM all");
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Turn all four corner panels and every stats line "
-                          "back on.");
+        ImGui::SetTooltip(TR("Turn all three corner panels and every stats line "
+                          "back on."));
     }
 
     ImGui::EndPopup();
@@ -1925,7 +1848,7 @@ void ViewportPanel::drawNavGizmo(const glm::vec2& vpPos, const glm::vec2& vpSize
     dl->AddCircleFilled(cc, 3.0f, IM_COL32(210, 216, 226, 220));
 
     if (hot >= 0) {
-        ImGui::SetTooltip("%s\nClick: snap to this view\nDrag: orbit view",
+        ImGui::SetTooltip(TR("%s\nClick: snap to this view\nDrag: orbit view"),
                           viewDirName(balls[hot].dir));
     }
 
@@ -2034,7 +1957,7 @@ void ViewportPanel::handleOverlayShortcuts() {
             b.pos = cam.position();
             b.yaw = cam.yaw();
             b.pitch = cam.pitch();
-            m_ctx.setStatus("Saved camera bookmark " + std::to_string(i + 1));
+            m_ctx.setStatus(TR("Saved camera bookmark ") + std::to_string(i + 1));
             VK_LOG_INFO("VP-BOOK save slot=%d pos=%.3f,%.3f,%.3f yaw=%.4f "
                         "pitch=%.4f",
                         i + 1, static_cast<double>(b.pos.x),
@@ -2060,7 +1983,7 @@ void ViewportPanel::handleOverlayShortcuts() {
             cam.setYaw(b.yaw);
             cam.setPitch(b.pitch);
             cam.setTarget(keep);
-            m_ctx.setStatus("Camera bookmark " + std::to_string(i + 1));
+            m_ctx.setStatus(TR("Camera bookmark ") + std::to_string(i + 1));
             VK_LOG_INFO("VP-BOOK recall slot=%d yaw=%.4f pitch=%.4f", i + 1,
                         static_cast<double>(b.yaw),
                         static_cast<double>(b.pitch));
@@ -2095,6 +2018,10 @@ void ViewportPanel::drawPlayHud(const glm::vec2& vpPos, const glm::vec2& vpSize)
         ImVec2(vpPos.x + vpSize.x - cw - 10.0f, vpPos.y + 10.0f));
 
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.10f, 0.80f));
+    // 浅色主题：深底配浅字（否则那颗 Fullscreen 按钮的标签看不见）。
+    // 深色主题不推 → 逐像素不变。
+    const int phPush = ui::tokens().isLight ? 1 : 0;
+    if (phPush) ImGui::PushStyleColor(ImGuiCol_Text, kOverlayText);
     ImGui::BeginChild("##play_hud", ImVec2(cw, ch), 0);
 
     if (ImGui::Button(m_ctx.gameFullscreen() ? "Restore view  (F)"
@@ -2105,12 +2032,12 @@ void ViewportPanel::drawPlayHud(const glm::vec2& vpPos, const glm::vec2& vpSize)
 
     ImGui::TextColored(m_ctx.isPlaying() ? ImVec4(0.55f, 0.9f, 0.58f, 1.0f)
                                          : ImVec4(0.95f, 0.8f, 0.4f, 1.0f),
-                       "%s   t = %.2fs",
+                       TR("%s   t = %.2fs"),
                        m_ctx.isPlaying() ? "PLAYING" : "PAUSED",
                        static_cast<double>(m_ctx.playTime()));
 
     ImGui::EndChild();
-    ImGui::PopStyleColor();
+    ImGui::PopStyleColor(1 + phPush);
 }
 
 } // namespace editor

@@ -1,5 +1,6 @@
 #include "GpuTimelinePanel.h"
 
+#include "Localization.h"
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -200,13 +201,13 @@ void GpuTimelinePanel::draw(bool* open, ConsolePanel* console) {
     ImGui::SetNextWindowSizeConstraints(ImVec2(420.0f, 240.0f),
                                         ImVec2(FLT_MAX, FLT_MAX));
 
-    if (!ImGui::Begin("GPU Timeline", open)) {
+    if (!ImGui::Begin(trId("GPU Timeline", "panel_gputimeline"), open)) {
         ImGui::End();
         return;
     }
 
     if (m_count <= 0) {
-        ImGui::TextDisabled("等待 GPU 时戳数据…（R0-1 的查询池尚未读回）");
+        ImGui::TextDisabled(TR("Waiting for GPU timestamp data... (R0-1 query pool not read back yet)"));
         ImGui::End();
         return;
     }
@@ -217,14 +218,14 @@ void GpuTimelinePanel::draw(bool* open, ConsolePanel* console) {
     const float gap = cur->total - cur->segSum;
 
     // ---- 概览一行 ----
-    ImGui::Text("GPU frame: %.2f ms", static_cast<double>(cur->total));
+    ImGui::Text(TR("GPU frame: %.2f ms"), static_cast<double>(cur->total));
     ImGui::SameLine();
-    ImGui::TextDisabled("| avg %.2f | max %.2f | %d frames",
+    ImGui::TextDisabled(TR("| avg %.2f | max %.2f | %d frames"),
                         static_cast<double>(avg), static_cast<double>(mx),
                         m_count);
     if (gap > 0.0005f) {
         ImGui::SameLine();
-        ImGui::TextDisabled("| gap %.3f ms", static_cast<double>(gap));
+        ImGui::TextDisabled(TR("| gap %.3f ms"), static_cast<double>(gap));
     }
 
     const ImGuiIO& io = ImGui::GetIO();
@@ -232,7 +233,7 @@ void GpuTimelinePanel::draw(bool* open, ConsolePanel* console) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
     // ================= 本帧甘特图 =================
-    ImGui::SeparatorText("Frame timeline (hover to read, click to filter)");
+    ImGui::SeparatorText(TR("Frame timeline (hover to read, click to filter)"));
     {
         const float barH = 26.0f;
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -278,7 +279,7 @@ void GpuTimelinePanel::draw(bool* open, ConsolePanel* console) {
 
         if (hov && hoverSeg >= 0) {
             ImGui::SetTooltip(
-                "%s\n%.3f ms  (%.1f%%)\navg over %d frames: %.3f ms",
+                TR("%s\n%.3f ms  (%.1f%%)\navg over %d frames: %.3f ms"),
                 render::GpuTimer::sectionName(
                     static_cast<uint32_t>(hoverSeg)),
                 static_cast<double>(cur->ms[hoverSeg]),
@@ -291,7 +292,7 @@ void GpuTimelinePanel::draw(bool* open, ConsolePanel* console) {
                     return static_cast<double>(a / std::max(m_count, 1));
                 }());
         } else if (hov) {
-            ImGui::SetTooltip("gap（段与时戳未覆盖的帧间时间）\n%.3f ms",
+            ImGui::SetTooltip(TR("gap (frame time not covered by segments or timestamps)\n%.3f ms"),
                               static_cast<double>(gap));
         }
         if (clicked) {
@@ -305,7 +306,7 @@ void GpuTimelinePanel::draw(bool* open, ConsolePanel* console) {
     }
 
     // ================= 最近 60 帧堆叠 =================
-    ImGui::SeparatorText("History (oldest top -> newest bottom)");
+    ImGui::SeparatorText(TR("History (oldest top -> newest bottom)"));
     {
         const float rowH = 4.0f;
         const float rowsH = rowH * static_cast<float>(m_count);
@@ -345,14 +346,14 @@ void GpuTimelinePanel::draw(bool* open, ConsolePanel* console) {
             dl->AddRect(ImVec2(p0.x, p0.y + rowH * hoverRow),
                         ImVec2(p0.x + barW, p0.y + rowH * (hoverRow + 1)),
                         IM_COL32(255, 255, 255, 200), 0.0f, 0, 1.0f);
-            ImGui::SetTooltip("frame -%d\n%.3f ms%s", m_count - 1 - hoverRow,
+            ImGui::SetTooltip(TR("frame -%d\n%.3f ms%s"), m_count - 1 - hoverRow,
                               static_cast<double>(s->total),
                               (s == cur) ? "\n(newest)" : "");
         }
     }
 
     // ================= 段明细 =================
-    ImGui::SeparatorText("Sections");
+    ImGui::SeparatorText(TR("Sections"));
     if (ImGui::BeginTable("##segs", 4,
                           ImGuiTableFlags_SizingStretchProp |
                               ImGuiTableFlags_RowBg |
@@ -395,29 +396,29 @@ void GpuTimelinePanel::draw(bool* open, ConsolePanel* console) {
                 if (console) console->setSearchFilter(sname);
             }
             ImGui::TableSetColumnIndex(1);
-            if (active) ImGui::Text("%.3f", static_cast<double>(ms));
-            else ImGui::TextDisabled("0");
+            if (active) ImGui::Text(TR("%.3f"), static_cast<double>(ms));
+            else ImGui::TextDisabled(TR("0"));
             ImGui::TableSetColumnIndex(2);
             if (active && cur->total > 0.0f)
-                ImGui::Text("%.1f%%",
+                ImGui::Text(TR("%.1f%%"),
                             static_cast<double>(100.0f * ms / cur->total));
-            else ImGui::TextDisabled("-");
+            else ImGui::TextDisabled(TR("-"));
             ImGui::TableSetColumnIndex(3);
-            ImGui::TextDisabled("%.3f", static_cast<double>(a));
+            ImGui::TextDisabled(TR("%.3f"), static_cast<double>(a));
         }
         ImGui::EndTable();
     }
 
     // ================= 底部动作 =================
-    if (ImGui::Button("Clear history")) {
+    if (ImGui::Button(TR("Clear history"))) {
         m_count = 0;
         m_head = 0;
         m_selected = -1;
     }
     ImGui::SameLine();
-    if (ImGui::Button("Reset selection")) m_selected = -1;
+    if (ImGui::Button(TR("Reset selection"))) m_selected = -1;
     ImGui::SameLine();
-    ImGui::TextDisabled("| Click a section to filter Console by its name");
+    ImGui::TextDisabled(TR("| Click a section to filter Console by its name"));
 
     // 待联动的过滤词：宿主（EditorApp）在 Console 就绪时取走。
     // 这里不直接调 console->setSearchFilter —— 保持"面板之间不互相引用"，

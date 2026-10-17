@@ -1,5 +1,6 @@
 #include "ConsolePanel.h"
 
+#include "Localization.h"
 #include <imgui.h>
 
 #include <algorithm>
@@ -139,25 +140,25 @@ void ConsolePanel::setSearchFilter(const std::string& text) {
 }
 
 void ConsolePanel::draw(bool* open) {
-    if (!ImGui::Begin("Console", open)) {
+    if (!ImGui::Begin(trId("Console", "panel_console"), open)) {
         ImGui::End();
         return;
     }
 
     // ---- 工具行：级别过滤 + 搜索 + 操作 ----
-    ImGui::Checkbox("Info", &m_showInfo);
+    ImGui::Checkbox(TR("Info"), &m_showInfo);
     ImGui::SameLine();
-    ImGui::Checkbox("Warn", &m_showWarn);
+    ImGui::Checkbox(TR("Warn"), &m_showWarn);
     ImGui::SameLine();
-    ImGui::Checkbox("Error", &m_showError);
+    ImGui::Checkbox(TR("Error"), &m_showError);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-190.0f);
     ImGui::InputTextWithHint("##consearch", "filter...", m_search,
                              sizeof(m_search));
     ImGui::SameLine();
-    if (ImGui::Button("Clear")) clearLocked();
+    if (ImGui::Button(TR("Clear"))) clearLocked();
     ImGui::SameLine();
-    if (ImGui::Button("Copy")) {
+    if (ImGui::Button(TR("Copy"))) {
         // 复制**过滤后**的行 —— 用户看到什么就复制什么
         std::string out;
         for (const Line& l : m_lines) {
@@ -173,7 +174,7 @@ void ConsolePanel::draw(bool* open) {
         ImGui::SetClipboardText(out.c_str());
     }
     ImGui::SameLine();
-    if (ImGui::Button("Save")) {
+    if (ImGui::Button(TR("Save"))) {
         std::ofstream f("editor_console.log", std::ios::app);
         for (const Line& l : m_lines)
             f << "[" << core::logLevelTag(l.level) << "] " << l.text << "\n";
@@ -199,11 +200,11 @@ void ConsolePanel::draw(bool* open) {
             scrollHitY = ImGui::GetCursorPosY();
         switch (l.level) {
             case core::LogLevel::Warn:
-                ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.40f, 1.0f), "%s",
+                ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.40f, 1.0f), TR("%s"),
                                    l.text.c_str());
                 break;
             case core::LogLevel::Error:
-                ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.40f, 1.0f), "%s",
+                ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.40f, 1.0f), TR("%s"),
                                    l.text.c_str());
                 break;
             default:
@@ -222,7 +223,7 @@ void ConsolePanel::draw(bool* open) {
         ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f)
         ImGui::SetScrollHereY(1.0f);
     ImGui::EndChild();
-    ImGui::Checkbox("autoscroll", &m_autoscroll);
+    ImGui::Checkbox(TR("autoscroll"), &m_autoscroll);
 
     // ---- 命令输入 + 自动补全 ----
     ImGui::Separator();
@@ -239,7 +240,7 @@ void ConsolePanel::draw(bool* open) {
                 std::snprintf(m_input, sizeof(m_input), "%s", c->name.c_str());
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", c->help.c_str());
+                ImGui::SetTooltip(TR("%s"), c->help.c_str());
         }
     }
     const bool submit = ImGui::InputText(
@@ -274,13 +275,13 @@ void ConsolePanel::draw(bool* open) {
                       candidates.front()->name.c_str());
     }
     ImGui::SameLine();
-    if (ImGui::Button("Run") || submit) {
+    if (ImGui::Button(TR("Run")) || submit) {
         const std::string cmd(m_input);
         m_input[0] = '\0';
         execute(cmd);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Tab 补全 · ↑/↓ 历史 · 'help' 列出全部命令");
+        ImGui::SetTooltip(TR("Tab to complete - Up/Down history - 'help' lists all commands"));
     }
 
     ImGui::End();

@@ -7,7 +7,7 @@
 // 任何 Vk 对象，重建失败也碰不到它。
 //
 // 为什么轮询 mtime 而不是 ReadDirectoryChangesW：
-//   · 与脚本热重载（editor/script/ScriptEngine.cpp 的 fileWriteTime/
+//   · 与脚本热重载（engine/script/ScriptEngine.cpp 的 fileWriteTime/
 //     poll）同一套模式，行为可预期、跨平台、无窗口消息依赖；
 //   · 轮询间隔 0.25s（15 帧 @60fps）对"改 shader → 存盘 → 看效果"
 //     完全够用，一秒的 fs event 也省不出可感知的延迟。

@@ -48,21 +48,21 @@ const char* const kDebugClose[] = {"scripts", nullptr};
 
 const WorkspacePreset kWorkspaces[] = {
     // id          title         hint                                     ratio{根,左栏,右区}      布局                     viewMode  open          close
-    {"level", "Level", "关卡编辑：层级 + 内容 + 视口 + 检查器",
+    {"level", "Level", "Level editing: hierarchy + content + viewport + inspector",
      {0.0f, 0.50f, 0.0f}, ViewportLayout::Single, 0, kLevelOpen, kLevelClose},
-    {"rendering", "Rendering", "渲染调参：大视口 + Engine 面板 + 统计",
+    {"rendering", "Rendering", "Render tuning: large viewport + Engine panel + stats",
      {0.0f, 0.50f, 0.0f}, ViewportLayout::Single, 0, kRenderOpen, kRenderClose},
-    {"character", "Character", "角色：层级 + 内容浏览器 + 检查器",
+    {"character", "Character", "Character: hierarchy + content browser + inspector",
      {0.0f, 0.50f, 0.0f}, ViewportLayout::TwoVertical, 0, kCharOpen,
      kCharClose},
-    {"animation", "Animation", "动画：脚本 + 层级 + 检查器",
+    {"animation", "Animation", "Animation: scripts + hierarchy + inspector",
      {0.0f, 0.55f, 0.0f}, ViewportLayout::TwoHorizontal, 0, kAnimOpen,
      kAnimClose},
-    {"cinematic", "Cinematic", "镜头：视口占主体，其余全部收起",
+    {"cinematic", "Cinematic", "Cinematic: the viewport dominates, everything else collapsed",
      {0.10f, 0.50f, 1.0f}, ViewportLayout::Single, 0, kCineOpen, kCineClose},
     // Debug 的视图模式 = LightComplexity(7)：这是"调试视角"该有的样子，
     // 也顺带验证"工作区能记住视图模式"这条语义确实生效。
-    {"debug", "Debug", "调试：全开 + 簇内灯数热度图",
+    {"debug", "Debug", "Debug: everything open + per-cluster light-count heatmap",
      {0.0f, 0.45f, 0.0f}, ViewportLayout::Quad, 7, kDebugOpen, kDebugClose},
 };
 

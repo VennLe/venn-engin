@@ -16,6 +16,14 @@ using json = nlohmann::json;
 
 constexpr const char* kDefaultPath = "config/editor_layout.json";
 constexpr int kFormatVersion = 1;
+
+// 偏好存档**单独**的 schema 版本（布局继续用 kFormatVersion，互不牵连）。
+// 为什么要它：`editor_prefs.json` 里的键会**逐键覆盖**出厂默认值，所以只要
+// 出厂默认变过一次，老存档就会把新默认"顶掉" —— 用户看到的就是"你改了个
+// 寂寞"（2026-10-17 实况：存档里 snap.move=0 / grid.extent=60 把"吸附默认
+// 全开"和"栅格放大到 500m"两条改动全盖没了）。加一版 → 老存档不再认，
+// 出厂默认生效一次；用户随后改的任何值照常落盘。
+constexpr int kPrefsVersion = 2;
 } // namespace
 
 bool editorLayoutAutomationRun() {
@@ -94,6 +102,7 @@ bool loadEditorLayout(LayoutState& out) {
     s.viewportLayout = j.value("viewportLayout", 0);
     s.viewMode = j.value("viewMode", 0);
     s.maximized = j.value("maximized", std::string(""));
+    s.inspTab = j.value("inspTab", std::string("object"));
 
     if (j.contains("recent") && j["recent"].is_array()) {
         for (const auto& it : j["recent"]) {
@@ -144,6 +153,7 @@ bool saveEditorLayout(const LayoutState& s) {
     j["viewportLayout"] = s.viewportLayout;
     j["viewMode"] = s.viewMode;
     j["maximized"] = s.maximized;
+    j["inspTab"] = s.inspTab;
     j["recent"] = s.recent;
 
     const std::string path = editorLayoutPath();
@@ -189,7 +199,7 @@ bool saveEditorPrefs(
     const std::vector<std::pair<std::string, double>>& kv) {
     if (editorLayoutAutomationRun()) return false;   // 写全程禁止
     json j;
-    j["version"] = kFormatVersion;
+    j["version"] = kPrefsVersion;
     json prefs = json::object();
     for (const auto& it : kv) prefs[it.first] = it.second;
     j["prefs"] = prefs;
@@ -227,6 +237,17 @@ bool loadEditorPrefs(std::vector<std::pair<std::string, double>>& out) {
         if (!j.is_object() || !j.contains("prefs") ||
             !j["prefs"].is_object())
             return false;
+        // 老 schema（或无版本号）→ 整份作废，回到出厂默认（见 kPrefsVersion
+        // 的注释）。**不能只删几个键** —— 出厂默认一变，旧值的语义就不可信了。
+        if (!j.contains("version") || !j["version"].is_number() ||
+            j["version"].get<int>() < kPrefsVersion) {
+            const std::string seen =
+                j.contains("version") ? j["version"].dump() : std::string("none");
+            VK_LOG_INFO("Editor prefs: '%s' 是旧 schema（version=%s，需要 %d）"
+                        "→ 作废，改用出厂偏好",
+                        path.c_str(), seen.c_str(), kPrefsVersion);
+            return false;
+        }
         out.clear();
         for (auto it = j["prefs"].begin(); it != j["prefs"].end(); ++it) {
             if (it.value().is_number())

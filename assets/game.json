@@ -1,0 +1,15 @@
+{
+  "_comment": "Game.exe 的出厂配置。优先级: 命令行 > 环境变量(MYVK_RUNTIME_*) > 本文件 > 内置默认。本文件是**只读**的, 运行时不写它 (运行时写的是 %LOCALAPPDATA%/Venn/venn)。",
+  "scene": "scenes/sandbox.json",
+  "title": "Venn Game",
+  "width": 1280,
+  "height": 720,
+  "fullscreen": false,
+  "maxFps": 60,
+  "unfocusedFps": 15,
+  "timeScale": 1.0,
+  "language": "en",
+  "quality": "high",
+  "audioDevice": "default",
+  "startState": "playing"
+}

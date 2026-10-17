@@ -1,5 +1,6 @@
 #include "SceneHierarchy.h"
 
+#include "Localization.h"
 #include "DebugRects.h"
 #include "EditorDragDrop.h"
 #include "EditorIcons.h"
@@ -21,6 +22,10 @@ namespace {
 
 // 让 logRect 每帧最多记一次（drawNode 递归调用，见下面用法）
 int g_logRectFrame = -1;
+// 上一句"第一个被记的行"是哪个实体 —— 行尾状态列（👁/🔒）的锚点只给它记。
+// 自动化脚本（tools/verify_hierarchy_status.py）靠 HIER-LOCK/HIER-EYE 的
+// 矩形去点图标，所以锚点必须真的落在"画出来的那个按钮"上，不能猜坐标。
+ecs::Entity g_logRectRow{};
 
 // base、base 2、base 3 …… 里第一个没被占用的名字。
 // "文件夹"这种节点天生会重名（就叫 Folder），直接建一堆同名节点会让人
@@ -276,7 +281,17 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
 
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
                                ImGuiTreeNodeFlags_SpanAvailWidth |
-                               ImGuiTreeNodeFlags_DefaultOpen;
+                               ImGuiTreeNodeFlags_DefaultOpen |
+                               // ⚠ 必须开 AllowOverlap：行尾那一列 👁/🔒 图标是
+                               //    **叠在节点矩形上**的 InvisibleButton，而
+                               //    ImGui 的命中测试是"提交顺序靠前的先占"——
+                               //    节点先提交就把 g.HoveredId 占了，后面的图标
+                               //    在 ItemHoverable() 里直接被 `g.HoveredId != 0
+                               //    && !g.HoveredIdAllowOverlap` 挡掉 → **永远收不到
+                               //    hover / click**（图标画得出来、点了没反应）。
+                               //    开这个标志 = 节点主动让位，命中测试变成
+                               //    "后提交的（图标）优先"。见 imgui.cpp::ItemHoverable。
+                               ImGuiTreeNodeFlags_AllowOverlap;
     if (!hasChildren)
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
     if (m_ctx.selection() == e) flags |= ImGuiTreeNodeFlags_Selected;
@@ -359,6 +374,7 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
     //   （真踩过：两分钟写了 30MB，而且取"最后一行"拿到的是随机某一行）。
     if (g_logRectFrame != ImGui::GetFrameCount()) {
         g_logRectFrame = ImGui::GetFrameCount();
+        g_logRectRow = e;   // 行尾状态列（HIER-LOCK/HIER-EYE）只记这一行
         logRect("HIER-RECT row0", ImGui::GetItemRectMin(),
                 ImGui::GetItemRectMax());
     }
@@ -409,7 +425,13 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
         const float rowH = rowRectMax.y - rowRectMin.y;
         const float colW = fs + 6.0f;
         float ix = rowRectMax.x - colW - 4.0f;
-        const bool hoveredRow = ImGui::IsItemHovered();
+        // 行悬停：用**矩形**判，而不是 IsItemHovered()。
+        // 节点开了 AllowOverlap 之后，指针落在行尾图标上时节点会主动让出
+        // hover（后提交者优先）→ IsItemHovered() 变 false → 图标会"一亮一暗"
+        // 地闪。矩形判只问"指针在不在这一行里"，与命中测试无关，稳定。
+        const bool hoveredRow =
+            ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+            ImGui::IsMouseHoveringRect(rowRectMin, rowRectMax);
         // 常态半透明，悬停该行才点亮 —— 不与名字抢注意力
         const ImU32 hot = ImGui::GetColorU32(ImGuiCol_Text);
         const ImU32 idle = IM_COL32(150, 152, 158, 90);
@@ -427,16 +449,23 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
                 m_pendingLockToggles.push_back({e, !locked});
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(locked ? "Unlock (viewport can pick)"
-                                         : "Lock (viewport cannot pick)");
+                ImGui::SetTooltip(TR(locked ? "Unlock (viewport can pick)"
+                                           : "Lock (viewport cannot pick)"));
             ImGui::PopID();
+            if (g_logRectRow.id == e.id)
+                logRect("HIER-LOCK row0", mn, ImVec2(mn.x + colW, mn.y + rowH));
             ix -= colW;
         }
-        // 👁 可见（只有带 VisibilityComponent 的实体才有这一格）
-        if (vis) {
+        // 👁 可见（**每一行都有**这一格）。
+        // 组件缺失 = 可见（`forEachRenderable` 的闸门也是这个语义：没组件
+        // 就不过滤）。缺失时点它 → 由 flushPending 补一个组件再写值。
+        // ⚠ 别退回 `if (vis)`：太阳（m_lightEntity）曾是**唯一**缺这个组件的
+        //   实体（它不走 Scene::createObject），于是它那一行少一个按钮 ——
+        //   用户看到的就是"灯的可见性开关不见了"。
+        {
             const ImVec2 mn(ix, rowRectMin.y + (rowH - fs) * 0.5f);
             const ImVec2 mx(ix + fs, mn.y + fs);
-            const bool shown = vis->visible;
+            const bool shown = vis ? vis->visible : true;
             const ImU32 col = shown ? (hoveredRow ? hot : idle)
                                     : IM_COL32(200, 90, 80, 230);
             drawEyeIcon(draw, mn, mx, shown, col);
@@ -446,9 +475,11 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
                 m_pendingVisToggles.push_back({e, !shown});
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(shown ? "Hide (visible = false)"
-                                        : "Show (visible = true)");
+                ImGui::SetTooltip(TR(shown ? "Hide (visible = false)"
+                                           : "Show (visible = true)"));
             ImGui::PopID();
+            if (g_logRectRow.id == e.id)
+                logRect("HIER-EYE row0", mn, ImVec2(mn.x + colW, mn.y + rowH));
         }
         ImGui::SetCursorScreenPos(ImVec2(rowRectMin.x, rowRectMax.y));
     }
@@ -470,7 +501,7 @@ void SceneHierarchy::drawNodeContextMenu(ecs::Entity e) {
     if (!ImGui::BeginPopupContextItem("##ctx")) return;
 
     // ---- 建子物体（UE5 的 Outliner 也是这么放的）----
-    if (ImGui::BeginMenu("Create Child")) {
+    if (ImGui::BeginMenu(TR("Create Child"))) {
         static const PrimitiveKind kinds[] = {
             PrimitiveKind::Empty,     PrimitiveKind::Cube,
             PrimitiveKind::Sphere,    PrimitiveKind::Plane,
@@ -484,7 +515,7 @@ void SceneHierarchy::drawNodeContextMenu(ecs::Entity e) {
             }
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Folder (group)")) {
+        if (ImGui::MenuItem(TR("Folder (group)"))) {
             m_pendingCreate = true;
             m_pendingCreateKind = PrimitiveKind::Empty;
             m_createParent = e;
@@ -494,14 +525,14 @@ void SceneHierarchy::drawNodeContextMenu(ecs::Entity e) {
     }
     ImGui::Separator();
 
-    if (ImGui::MenuItem("Rename", "F2")) {
+    if (ImGui::MenuItem(TR("Rename"), "F2")) {
         m_renameTarget = e;
         m_renameFocus = true;
         const std::string* n = m_ctx.editorScene().world().name(e);
         std::snprintf(m_renameBuf, sizeof(m_renameBuf), "%s",
                       n ? n->c_str() : "");
     }
-    if (ImGui::MenuItem("Duplicate", "Ctrl+D")) m_pendingDuplicate = e;
+    if (ImGui::MenuItem(TR("Duplicate"), "Ctrl+D")) m_pendingDuplicate = e;
 
     // ---- 文件夹标记 ----
     // "文件夹"= 纯分组节点（没有网格/灯光/脚本），树里显示成目录图标。
@@ -517,23 +548,24 @@ void SceneHierarchy::drawNodeContextMenu(ecs::Entity e) {
 
     // ---- E12：状态快捷开关（与行内 👁/🔒 图标同一 pending 通道）----
     if (const auto* vc = m_ctx.editorScene().world().get<ecs::VisibilityComponent>(e)) {
-        if (ImGui::MenuItem(vc->visible ? "Hide" : "Show")) {
+        if (ImGui::MenuItem(TR(vc->visible ? "Hide" : "Show"))) {
             m_pendingVisToggles.push_back({e, !vc->visible});
         }
     }
     const bool nowLocked =
         m_ctx.editorScene().world().has<ecs::LockedComponent>(e);
-    if (ImGui::MenuItem(nowLocked ? "Unlock (pickable)" : "Lock (not pickable)")) {
+    if (ImGui::MenuItem(
+            TR(nowLocked ? "Unlock (pickable)" : "Lock (not pickable)"))) {
         m_pendingLockToggles.push_back({e, !nowLocked});
     }
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.5f, 1.0f));
-    if (ImGui::MenuItem("Delete", "Del")) m_pendingDelete = e;
+    if (ImGui::MenuItem(TR("Delete"), "Del")) m_pendingDelete = e;
     ImGui::PopStyleColor();
 
     ImGui::Separator();
-    if (ImGui::MenuItem("Focus", "F")) m_pendingFocus = e;
-    if (ImGui::MenuItem("Unparent")) {
+    if (ImGui::MenuItem(TR("Focus"), "F")) m_pendingFocus = e;
+    if (ImGui::MenuItem(TR("Unparent"))) {
         m_unparentTarget = e;
         m_hasUnparent = true;
     }
@@ -557,7 +589,7 @@ void SceneHierarchy::draw() {
     const ImGuiWindowFlags wf = ImGuiWindowFlags_NoMove |
                                 ImGuiWindowFlags_NoResize |
                                 ImGuiWindowFlags_NoCollapse;
-    if (!ImGui::Begin("Hierarchy", &panels.hierarchy, wf)) {
+    if (!ImGui::Begin(trId("Hierarchy", "panel_hierarchy"), &panels.hierarchy, wf)) {
         ImGui::End();
         return;
     }
@@ -565,7 +597,7 @@ void SceneHierarchy::draw() {
     scene::Scene& sc = m_ctx.editorScene();
 
     // ---- 顶部：新建 + 过滤 ----
-    if (ImGui::Button("+ Create")) ImGui::OpenPopup("create_menu");
+    if (ImGui::Button(TR("+ Create"))) ImGui::OpenPopup("create_menu");
     if (ImGui::BeginPopup("create_menu")) {
         static const PrimitiveKind kinds[] = {
             PrimitiveKind::Cube,     PrimitiveKind::Sphere,
@@ -580,7 +612,7 @@ void SceneHierarchy::draw() {
             }
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Folder (group)")) {
+        if (ImGui::MenuItem(TR("Folder (group)"))) {
             m_pendingCreate = true;
             m_pendingCreateKind = PrimitiveKind::Empty;
             m_createParent = ecs::Entity{};
@@ -589,15 +621,15 @@ void SceneHierarchy::draw() {
         ImGui::EndPopup();
     }
     ImGui::SameLine();
-    if (ImGui::Button("New Folder")) {
+    if (ImGui::Button(TR("New Folder"))) {
         m_pendingCreate = true;
         m_pendingCreateKind = PrimitiveKind::Empty;
         m_createParent = ecs::Entity{};
         m_createAsFolder = true;
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Create an empty grouping node named 'Folder'.\n"
-                          "Drag other entities onto it to nest them.");
+        ImGui::SetTooltip(TR("Create an empty grouping node named 'Folder'.\n"
+                          "Drag other entities onto it to nest them."));
     }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-1.0f);
@@ -630,40 +662,40 @@ void SceneHierarchy::draw() {
     if (ImGui::BeginPopupContextWindow("##empty_ctx",
                                        ImGuiPopupFlags_MouseButtonRight |
                                            ImGuiPopupFlags_NoOpenOverItems)) {
-        if (ImGui::MenuItem("New Folder (group)")) {
+        if (ImGui::MenuItem(TR("New Folder (group)"))) {
             m_pendingCreate = true;
             m_pendingCreateKind = PrimitiveKind::Empty;
             m_createParent = ecs::Entity{};
             m_createAsFolder = true;
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("New Cube")) {
+        if (ImGui::MenuItem(TR("New Cube"))) {
             m_pendingCreate = true;
             m_pendingCreateKind = PrimitiveKind::Cube;
             m_createParent = ecs::Entity{};
             m_createAsFolder = false;
         }
-        if (ImGui::MenuItem("New Sphere")) {
+        if (ImGui::MenuItem(TR("New Sphere"))) {
             m_pendingCreate = true;
             m_pendingCreateKind = PrimitiveKind::Sphere;
             m_createParent = ecs::Entity{};
             m_createAsFolder = false;
         }
-        if (ImGui::MenuItem("New Point Light")) {
+        if (ImGui::MenuItem(TR("New Point Light"))) {
             m_pendingCreate = true;
             m_pendingCreateKind = PrimitiveKind::PointLight;
             m_createParent = ecs::Entity{};
             m_createAsFolder = false;
         }
-        if (ImGui::MenuItem("New Empty")) {
+        if (ImGui::MenuItem(TR("New Empty"))) {
             m_pendingCreate = true;
             m_pendingCreateKind = PrimitiveKind::Empty;
             m_createParent = ecs::Entity{};
             m_createAsFolder = false;
         }
         ImGui::Separator();
-        ImGui::TextDisabled("Tip: right-click a node for rename /");
-        ImGui::TextDisabled("duplicate / delete / create child");
+        ImGui::TextDisabled(TR("Tip: right-click a node for rename /"));
+        ImGui::TextDisabled(TR("duplicate / delete / create child"));
         ImGui::EndPopup();
     }
 
@@ -704,7 +736,7 @@ void SceneHierarchy::draw() {
     ImGui::EndChild();
 
     ImGui::Separator();
-    ImGui::TextDisabled("%zu entities   |   %zu roots", sc.objectCount(),
+    ImGui::TextDisabled(TR("%zu entities   |   %zu roots"), sc.objectCount(),
                         roots.size());
 
     ImGui::End();
@@ -718,7 +750,7 @@ void SceneHierarchy::drawBreadcrumb() {
     const ecs::Entity sel = m_ctx.selection();
     ecs::World& w = m_ctx.editorScene().world();
     if (!sel.valid()) {
-        ImGui::TextDisabled("Path: (no selection)");
+        ImGui::TextDisabled(TR("Path: (no selection)"));
         return;
     }
     // 从选中节点向上收祖先链（画出来是 Root / ... / 选中项）
@@ -733,11 +765,11 @@ void SceneHierarchy::drawBreadcrumb() {
     }
     std::reverse(chain.begin(), chain.end());
 
-    ImGui::TextDisabled("Path:");
+    ImGui::TextDisabled(TR("Path:"));
     for (size_t i = 0; i < chain.size(); ++i) {
         ImGui::SameLine();
         if (i) {
-            ImGui::TextDisabled("/");
+            ImGui::TextDisabled(TR("/"));
             ImGui::SameLine();
         }
         const std::string* np = w.name(chain[i]);
@@ -788,12 +820,12 @@ void SceneHierarchy::flushPending() {
         });
         if (imported.ok()) {
             m_pendingFocus = imported.root;
-            m_ctx.notify("Imported " + rel + " (" +
-                         std::to_string(imported.count()) + " mesh)");
+            m_ctx.notify(std::string(TR("Imported ")) + rel + " (" +
+                         std::to_string(imported.count()) + TR(" mesh)"));
             VK_LOG_INFO("HIER-IMPORT rel=%s count=%zu", rel.c_str(),
                         imported.count());
         } else {
-            m_ctx.notify("Import failed: " + rel);
+            m_ctx.notify(TR("Import failed: ") + rel);
             VK_LOG_INFO("HIER-IMPORT rel=%s FAILED", rel.c_str());
         }
     }
@@ -890,8 +922,15 @@ void SceneHierarchy::flushPending() {
     for (const VisToggle& vt : m_pendingVisToggles) {
         if (!vt.e.valid()) continue;
         m_ctx.structuralEdit(vt.value ? "Show entity" : "Hide entity", [&]() {
-            if (auto* v = w.get<ecs::VisibilityComponent>(vt.e))
+            if (auto* v = w.get<ecs::VisibilityComponent>(vt.e)) {
                 v->visible = vt.value;
+            } else {
+                // 行内 👁 对"没有这个组件"的行也画得出来（缺失 = 可见），
+                // 所以这里要把组件补上再写值，否则点了等于没点。
+                ecs::VisibilityComponent nv{};
+                nv.visible = vt.value;
+                w.add<ecs::VisibilityComponent>(vt.e, nv);
+            }
         });
         m_ctx.dirty() = true;
     }
@@ -979,7 +1018,7 @@ void SceneHierarchy::flushPending() {
         m_pendingFocus = ecs::Entity{};
         sc.camera().setTarget(
             glm::vec3(sc.worldMatrix(target)[3]));
-        m_ctx.notify("Focused selection");
+        m_ctx.notify(TR("Focused selection"));
     }
 }
 
@@ -1017,7 +1056,7 @@ void SceneHierarchy::duplicateSelection() {
     if (dup.valid()) {
         m_ctx.select(dup);
         m_ctx.dirty() = true;
-        m_ctx.notify("Duplicated " + newName);
+        m_ctx.notify(TR("Duplicated ") + newName);
     }
 }
 

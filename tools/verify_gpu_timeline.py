@@ -233,13 +233,25 @@ def main():
 
     gf = gpu_frames(a["lines"])
     if A and gf:
-        panel_med = statistics.median(t["last"] for t in A)
+        # ⚠⚠ 只比**同源窗口**的样本。
+        #   GPU-TIMING 每 30 帧才写一条；而面板的第一条快照在 `frames=7` 就
+        #   写了 —— 那一格正是启动期（管线/着色器首次编译），实测 11.3~11.6ms，
+        #   而稳态只有 ~8.5ms。样本只有 4 条时，这个离群点能把中位拽高 ~10%
+        #   （2026-10-16 全量回归实测：面板中位 9.503 vs GPU-TIMING 中位 8.535
+        #   = 10.19% FAIL，而两侧报的其实是同一个量）。
+        #   修法：丢掉 frames < 30 的启动样本（GPU-TIMING 压根不采这一段），
+        #   阈值**仍是 5%** —— 这是把两侧的采样窗口对齐，不是放宽标准。
+        #   三轮实测（2026-10-16，剔除启动样本后）：0.40% / 0.22% / 0.33%。
+        steady = [t for t in A if t["frames"] >= 30]
+        if len(steady) < 2:
+            steady = A
+        panel_med = statistics.median(t["last"] for t in steady)
         timing_med = statistics.median(gf)
         d = rel_diff(panel_med, timing_med)
-        check("T2e 面板报的总长与 GPU-TIMING 的 frame 同量级（< 5%）",
+        check("T2e 面板报的总长与 GPU-TIMING 的 frame 同量级（< 5%，同源窗口）",
               d < 0.05,
-              "面板中位 %.3f ms vs GPU-TIMING 中位 %.3f ms，差 %.2f%%" % (
-                  panel_med, timing_med, d * 100.0))
+              "面板中位 %.3f ms（%d 条稳态样本）vs GPU-TIMING 中位 %.3f ms，"
+              "差 %.2f%%" % (panel_med, len(steady), timing_med, d * 100.0))
     else:
         check("T2e 面板报的总长与 GPU-TIMING 的 frame 同量级", False,
               "缺一侧数据")

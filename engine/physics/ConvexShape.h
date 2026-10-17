@@ -34,6 +34,12 @@ struct ConvexShape {
         Hull = 0,     // 由网格顶点求出的凸包
         Capsule = 1,  // 胶囊体（轴 = 局部 +Z，本引擎世界是 Z-up）
         Sphere = 2,   // 球（相机碰撞体用）
+        // Box 是**物理模块加的**（见 PhysicsShape.h）：编辑器从网格生成
+        // 碰撞体只产生 Hull / Capsule，而手搓的刚体（尤其是给关节当
+        // "地面 / 壁面"用的板）需要一个解析长方体。
+        // 加在这里而不是另开一套形状体系，是为了让 GJK / EPA 只有一条路：
+        // 支撑函数认得的形状，碰撞代码就不用认识第二种。
+        Box = 3,      // 轴对齐长方体（halfExtents，见下）
     };
 
     Kind kind = Kind::Capsule;
@@ -50,6 +56,11 @@ struct ConvexShape {
     // ---- Capsule / Sphere ----
     float radius = 0.5f;
     float halfHeight = 0.5f;  // Capsule 圆柱段的半高（不含两端半球）
+
+    // ---- Box（Kind::Box）----
+    // 半边长。用"半边"而不是"整边"，和 Capsule 的 halfHeight 一致 ——
+    // 混用两种约定迟早会有一个地方写错。
+    glm::vec3 halfExtents{0.5f, 0.5f, 0.5f};
 
     // 沿 dir 最远的点（局部空间）。dir 不必归一化，允许零向量。
     glm::vec3 supportLocal(const glm::vec3& dir) const;

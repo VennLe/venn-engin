@@ -76,6 +76,7 @@
 #include "PanelRegistry.h"  // 面板显隐的权威存储 + panelOpenRef
 #include "Workspace.h"      // WorkspaceManager / ViewportLayout
 
+#include "core/InputMap.h"  // G06：键位绑定表（按值持有，见 inputMap()）
 #include "ecs/Entity.h"
 // Scene 是本类的**按值成员**，前向声明不够，必须拿到完整定义
 #include "scene/Scene.h"
@@ -122,6 +123,29 @@ struct LayoutRects {
          transport;
 };
 
+// 物理世界的**运行态只读快照**（R7-1）。
+//
+// 为什么不让 Inspector 直接摸 physics::PhysicsWorld：
+//   · 那个对象归 EditorApp 所有，生命周期与 Play 严格绑定（Play 建 / Stop 丢）；
+//   · 面板只需要"看一眼现在跑成什么样"，不需要改它 —— 拿一个指针反而
+//     会诱导面板去写运行态（那会破坏"Play 期间编辑态零改动"的前提）。
+// 所以 EditorApp 每帧把统计数灌进来，面板只读。world 为 false 时面板知道
+// "物理没在跑"，可以显示原因而不是一片 0。
+struct PhysicsRuntimeInfo {
+    bool active = false;          // 物理世界当前存在（Play 中且总开关开着）
+    int bodies = 0;
+    int dynamic = 0;
+    int sleeping = 0;
+    int manifolds = 0;
+    int contactPoints = 0;
+    int broadphasePairs = 0;
+    int joints = 0;
+    float maxPenetration = 0.0f;
+    float maxSpeed = 0.0f;
+    unsigned long long steps = 0;
+    float simTime = 0.0f;
+};
+
 class EditorContext {
 public:
     // assets 由 Application 持有，编辑器只借用（与 Scene 共享同一份资源缓存）
@@ -151,6 +175,12 @@ public:
     void pause();   // Playing → Paused
     void stop();    // 任意 → Stopped（丢弃运行态）
     void togglePlayPause();
+
+    // ---- R7-1 物理：运行态只读快照（见 PhysicsRuntimeInfo 的说明）----
+    const PhysicsRuntimeInfo& physicsRuntime() const { return m_physicsRuntime; }
+    void setPhysicsRuntime(const PhysicsRuntimeInfo& info) {
+        m_physicsRuntime = info;
+    }
 
     // ---- 动画（编辑态脚本，见 AnimState 的说明）----
     AnimState animState() const { return m_anim; }
@@ -261,6 +291,51 @@ public:
 
     const std::string& selectionName() const { return m_selectionName; }
 
+    // ---------------------------------------------------------- 键位绑定（G06）
+    // 编辑器**按值持有**一份 `core::InputMap`。
+    //
+    // 为什么不是"引擎全局单例"：绑定表是**这份工程的数据**（存成
+    // `assets/input_map.json`，Game.exe 读同一份）。放进 EditorContext 让
+    // 面板只依赖一个入口，也让"改 → 撤销 → 再改"有地方挂。
+    //
+    // ⚠ 编辑器**从不 poll() 它**。编辑器的键鼠归 core::Input 与各面板自己
+    //   （视口导航、快捷键）；这里的实例只是"可编辑的表"，一旦让它开始
+    //   采集，两套输入会在同一个窗口上互相抢。
+    core::InputMap& inputMap() { return m_inputMap; }
+    const core::InputMap& inputMap() const { return m_inputMap; }
+    // 改过但还没落盘（面板顶部的 * 号）
+    bool inputMapDirty() const { return m_inputMapDirty; }
+    void setInputMapDirty(bool v) { m_inputMapDirty = v; }
+
+    // 启动时读一次。**读不到 = 保持出厂绑定**（文件不存在是正常状态，
+    // 第一次启动/从没改过键位就是这样），不是错误。
+    void loadInputMap();
+    bool saveInputMap();   // 落盘 + 清 dirty；失败只打 WARN
+
+    // 改动的**唯一**入口：应用 + 入撤销栈（整表 JSON 文本的前后快照）。
+    // 面板不许直接调 inputMap().setActionBinding(...) —— 那样改了撤不回。
+    //
+    // ⚠ 为什么整表快照而不是"精确改一条"：绑定表只有几十条、几百字节，
+    //   操作频率是"人按一下键"。精确回滚要处理"这条是新加的/被替换的/
+    //   多来源里哪一条"，而快照一行搞定且绝不出错 —— 与 SceneSnapshotCommand
+    //   同一个取舍理由。
+    bool rebindAction(const std::string& context, const std::string& action,
+                      const core::InputBinding& binding);
+    bool resetActionBinding(const std::string& context,
+                            const std::string& action);
+    bool clearActionBinding(const std::string& context,
+                            const std::string& action);
+    bool resetAllBindings();
+
+    // ---- 键位捕获态（面板写、全局快捷键读）----
+    // 捕获期间 `handleShortcuts` 必须整体闭嘴：玩家想把 Jump 绑到 Space，
+    // 而 Space 是"运行/暂停" —— 不收手的话点一下 Rebind 就把场景跑起来了。
+    bool inputCaptureActive() const { return !m_captureAction.empty(); }
+    void beginInputCapture(std::string context, std::string action);
+    void endInputCapture();
+    const std::string& captureContext() const { return m_captureContext; }
+    const std::string& captureAction() const { return m_captureAction; }
+
     // ---------------------------------------------------------- 撤销栈
     CommandStack& commands() { return m_commands; }
     void undo();
@@ -300,8 +375,10 @@ public:
     //     平移 10 uu = 10 cm → **0.1 m**
     //     旋转 → **10 度**
     //     缩放 → **0.1**（倍率）
-    // 三个开关默认都是**关**：吸附是"想对齐时按一下"的手段，默认开着会让
-    // 自由摆放变得一格一格的，反而别扭。
+    // 三个开关**默认全开**（2026-10-17 按用户要求改；UE5 原本是默认关）。
+    // 步长仍是 UE5 那套：0.1 m / 10 度 / 0.1 倍 —— 所以默认状态下拖动
+    // 手柄会稳定地落在 10 cm / 10 度 / 10% 的整数倍上。
+    // 临时关掉：按 G（只影响当前手柄模式），或 Preferences ▸ Snapping。
     bool snapMove() const { return m_snapMove; }
     bool& snapMoveRef() { return m_snapMove; }
     float snapMoveStep() const { return m_snapMoveStep; }
@@ -339,10 +416,19 @@ public:
     // "HUD" 总开关时，用户被迫"要么全看要么全不看"。
     struct ViewportOverlay {
         bool modeBar = true;    // 左上：视图模式条
-        bool stats = true;      // 右上：统计 HUD
-        bool camera = true;     // 左下：相机信息 + 书签
+        // 右上：统计 HUD。**默认关** —— 它每帧都在变（FPS / 帧时间），
+        // 是视口里最"吵"的一块；要调性能时从右键 Viewport Display 打开即可，
+        // 打开后还能用标题行折叠成一颗小胶囊（见 ViewportPanel::m_statsCollapsed）。
+        bool stats = false;
         bool navGizmo = true;   // 右下：导航 gizmo
     };
+    // ⚠ **左下角的相机浮层已经删掉了**（原来叫 ov.camera）。
+    //   原因：它和 Inspector → World → Camera 是**同一个相机对象的两个编辑
+    //   入口**（FOV / 距离 / 朝向两边都能改），既重复又容易让人以为"两处
+    //   数值不一致"。现在相机只有一个面板：Inspector 的 World 页。
+    //   浮层里那些**只在那里才有**的功能（9 个相机书签、导航灵敏度、网格
+    //   开关）已经搬进 Inspector，键鼠快捷键（Ctrl+Shift+N / Alt+Shift+N）
+    //   完全没动。
     // 统计 HUD 的**逐项**开关。默认全开；关掉自己不看的那几行就能让
     // 一块 6 行的浮层缩成 2 行，盯画面时干扰小很多。
     struct StatsHudItems {
@@ -527,6 +613,9 @@ private:
     PlayState m_play = PlayState::Stopped;
     float m_playTime = 0.0f;
 
+    // R7-1：物理世界的运行态统计（由 EditorApp 每帧灌入，面板只读）
+    PhysicsRuntimeInfo m_physicsRuntime;
+
     // ---- 动画状态 ----
     AnimState m_anim = AnimState::Stopped;
     float m_animTime = 0.0f;
@@ -553,15 +642,53 @@ private:
 
     CommandStack m_commands;
 
+    // ---- 键位绑定（G06，见上方的说明）----
+    core::InputMap m_inputMap;
+    bool m_inputMapDirty = false;
+    std::string m_captureContext;
+    std::string m_captureAction;
+
+    // "改一处绑定"的公共外壳：抓 before → 执行 → 抓 after → 入栈。
+    // 返回 false = 操作本身失败，或结果与改之前逐字节相同（绑了同一个键）。
+    template <typename Fn>
+    bool inputMapEdit(const std::string& name, Fn&& fn) {
+        const std::string before = m_inputMap.toText();
+        if (!fn()) return false;
+        const std::string after = m_inputMap.toText();
+        if (before == after) return false;
+        // ⚠ 捕获 this 而不是 &m_inputMap：撤销之后**也要**把 dirty 立起来
+        //   （文件此刻与内存不一致了）。只捕获指针就只能改数据、改不了脏标记。
+        m_commands.pushAlreadyApplied(std::make_unique<LambdaCommand>(
+            name,
+            [this, before]() {
+                m_inputMap.loadFromText(before);
+                m_inputMapDirty = true;
+            },
+            [this, after]() {
+                m_inputMap.loadFromText(after);
+                m_inputMapDirty = true;
+            }));
+        m_inputMapDirty = true;
+        setStatus(name);
+        return true;
+    }
+
     GizmoMode m_gizmoMode = GizmoMode::Translate;
     GizmoSpace m_gizmoSpace = GizmoSpace::World;
 
-    // 吸附：三套独立（默认值见上面 snapMove 一节的说明，对齐 UE5）
-    bool m_snapMove = false;
+    // 吸附：三套独立（平移 / 旋转 / 缩放）。
+    //
+    // ⚠ 2026-10-17 按用户要求改成**默认全开**（原来是跟 UE5 一样默认关）。
+    //   步长仍是 UE5 那套：0.1 m / 10 度 / 0.1 倍。想临时关掉按 G，
+    //   或者去 Preferences ▸ Snapping 取消勾选。
+    //   ⚠ 若要再改这里，**必须同步** prefsTable() 里 snap.* 的 `def`——
+    //     那个 def 是"Reset All / 单项 R"的落点，两边不一致会让重置把
+    //     默认值改回去（已踩过一次）。
+    bool m_snapMove = true;
     float m_snapMoveStep = 0.1f;    // 米
-    bool m_snapRotate = false;
+    bool m_snapRotate = true;
     float m_snapRotateStep = 10.0f;  // 度
-    bool m_snapScale = false;
+    bool m_snapScale = true;
     float m_snapScaleStep = 0.1f;    // 倍率
 
     // 地平面栅格（编辑态视口）

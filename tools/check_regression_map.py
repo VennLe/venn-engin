@@ -46,7 +46,11 @@ OLD = mk("assets/shaders/decal.frag",
          "docs/render_roadmap.md",
          "editor/InspectorPanel.cpp",
          "assets/scenes/demo.json",
-         "engine/render/Foo.cpp")
+         "engine/render/Foo.cpp",
+         # M1（G01/G05）：运行时目标与出厂配置 —— 让下面对它们的两条 fixture
+         # 是"改了"而不是"新增"（新增会顺带触发"未登记点名"，那是另一回事）。
+         "runtime/GameLoop.cpp",
+         "assets/game.json")
 
 
 def with_change(*paths, drop=()):
@@ -97,9 +101,16 @@ run("新增**未登记**的 render 文件 → 全量 + 点名", OLD,
 run("改一个已登记的 render 模块（ShadowPass）", OLD,
     with_change("engine/render/ShadowPass.cpp"),
     want={"verify_csm", "verify_shadow_hardening", "verify_collision_play"})
-run("editor/InspectorPanel.cpp → mesh_params", OLD,
+run("editor/InspectorPanel.cpp → 五个面板块", OLD,
     with_change("editor/InspectorPanel.cpp"),
-    want={"verify_mesh_params", "verify_inspector"})
+    # ⚠ 这里**必须**跟着 run_regression.py 的 TRIGGERS 同步长：
+    #   网格参数（mesh_params）/ 分区折叠与搜索（inspector）/
+    #   左侧页签导航条（inspector_tabs）/ 粒子面板 12 模块（particles）/
+    #   材质槽小方块（material_chips —— 2026-10-16 补进 DEFAULT 时登记的）。
+    #   2026-10-16 加 E11.1 页签时，这条 fixture 先红了 —— 那是它在正常工作。
+    want={"verify_mesh_params", "verify_inspector",
+          "verify_inspector_tabs", "verify_particles",
+          "verify_material_chips"})
 run("assets/shaders/fg_taa.frag → taa", OLD,
     with_change("assets/shaders/fg_taa.frag"), want={"verify_taa"})
 run("删除 decal.frag → 也算变更", OLD,
@@ -111,6 +122,14 @@ run("多特性并发 → 并集", OLD,
     want={"verify_decals", "verify_fxaa", "verify_gpu_timing",
           "verify_collision_play"})
 run("无基准快照 → 全量", None, OLD, want=None)
+# M1：改 runtime 的任意一行 → 三条运行时用例**一起**跑。
+# 只挑出一条 = 假跳过（另外两条会跑在坏掉的运行时上而"通过"）。
+run("runtime/GameLoop.cpp → 三条运行时用例", OLD,
+    with_change("runtime/GameLoop.cpp"),
+    want={"verify_runtime_build", "verify_runtime_loop", "verify_runtime_states"})
+# G05 的出厂配置只被 states 的冷启动断言读，所以只有它。
+run("assets/game.json → 只跑 verify_runtime_states", OLD,
+    with_change("assets/game.json"), want={"verify_runtime_states"})
 
 print("\n[B] 快照覆盖范围（真实扫描仓库）")
 s = rr.source_snapshot()

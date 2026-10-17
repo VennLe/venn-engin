@@ -47,6 +47,25 @@
 #include <unordered_map>
 #include <vector>
 
+// 物理世界（R7-1）。只前向声明 —— 完整类型只在本类的 .cpp 里需要，头文件
+// 不必把整个 physics 模块拖给每一个 include 它的翻译单元。
+//
+// ⚠ 必须声明在 `namespace editor` **外面**。写在里面的话就成了嵌套的
+//   `editor::physics`，它会把名字查找里外层的 `::physics` 遮住 —— 后果是
+//   .cpp 里所有 `physics::xxx` 全部找不到（编译器报的是
+//   `"resolveBodyOverlaps" 不是 "editor::physics" 的成员`，看起来像少
+//   include，其实是这里多了一层命名空间）。
+namespace physics {
+class PhysicsWorld;
+}
+
+// 脚本引擎（G02 之后住在 engine/script/，namespace 也从 editor 改成 vks）。
+// ⚠ 与上面 physics 完全同一条理由：必须声明在 `namespace editor` **外面**，
+//   否则会变成嵌套的 `editor::vks`，把外层的 `::vks` 遮住。
+namespace vks {
+class ScriptEngine;
+}
+
 namespace editor {
 
 class EditorContext;
@@ -55,7 +74,6 @@ class ViewportPanel;
 class SceneHierarchy;
 class InspectorPanel;
 class ContentBrowser;
-class ScriptEngine;
 class SplitLayout;
 class CharacterWindow;
 class ParamEditCommand;
@@ -184,6 +202,13 @@ private:
     void drawEngineViewMode();
     void drawEngineMsaa();
     void drawEngineClusterStats();
+    // E03：设置层级 —— 覆盖链概览 + Export / Reload。
+    // 这里只画"层"这一级；每个参数自己的控件仍在各特性块里。
+    void drawEngineSettingsIO();
+    // E03：把"当前非默认值"写成 config/render.json。
+    // `explicitExport=false` = 用户改过参数后的自动保存；true = 面板上的
+    // Export 按钮（全默认时也照写，因为那是用户明确要求的）。
+    void saveRenderSettings(bool explicitExport);
     // E16：Console 面板（日志汇入 + 表驱动命令）。
     void drawConsolePanel();
     void registerConsoleCommands();
@@ -204,22 +229,40 @@ private:
     // E17：偏好表驱动（单项重置 / 搜索 / Reset All / 落盘）。
     // ⚠ PrefItem::ptr 返回 void*（指向 float 或 bool，看 isBool）——
     //   设置项的存储分散在 EditorContext / Renderer，地址走访问器拿。
+    //
+    // 另有一条"选项型"支路（Theme / Language 这类枚举）：`isChoice` 为真时
+    // ptr 不再使用，改走 getChoice / setChoice，落盘存的是**下标**。
     struct PrefItem {
         const char* id;        // 稳定键（落盘 + ImGui ID + 搜索文本）
         const char* label;
         const char* category;  // 页名 / 搜索结果分组
         bool isBool;
-        float def;             // 出厂默认（重置用）
+        float def;             // 出厂默认（重置用；选项型是默认下标）
         float lo, hi;          // Float 档的 UI 范围
         std::function<void*(EditorApp&)> ptr;
+
+        // ---- 选项型（下拉框）----
+        // optionCount > 0 时这一项画成下拉：显示 options[i]（过 TR），
+        // 取值是下标。两个 lambda 直接操作真正的存储。
+        std::function<int()> getChoice;
+        std::function<void(int)> setChoice;
+        // 改完之后的副作用（换主题要立刻 applyTheme）。可空。
+        std::function<void(int)> onChoiceChanged;
+        std::vector<const char*> options;   // 英文选项名（语言层负责翻译）
     };
     static const std::vector<PrefItem>& prefsTable();
     void drawPrefRow(const PrefItem& it);
     void applyPrefsFromDisk();
     void savePrefsToDisk();
+    // 把当前主题 / 语言真正应用下去（启动读盘后、以及下拉框改动后都要调）
+    void applyAppearance();
     bool m_confirmResetAll = false;   // Reset All 的二次确认状态
     // FeatureUIGen 的参数变更钩子（FTR-UI 日志 + 个别参数的副作用）。
     void onFeatureParamChanged(const char* paramId);
+    // E03：用户改过渲染参数 → 需要落盘（"首次改参数时才写文件"）。
+    // 用**计数**而不是 bool：拖动滑条时每帧都会回调，用计数才能在
+    // 落盘后清干净（bool 会被"落盘那一刻又来一次改动"吃掉）。
+    int m_renderSettingsDirty = 0;
     // E19：参数编辑结束 → 推一条可撤销的 ParamEditCommand（500ms 内同一
     // 参数连续编辑合并成一条）。是 FeatureUIGen 的 undo 钩子的落地实现。
     void onFeatureParamUndo(const char* paramId, const void* before,
@@ -238,7 +281,7 @@ private:
     std::unique_ptr<SceneHierarchy> m_hierarchy;
     std::unique_ptr<InspectorPanel> m_inspector;
     std::unique_ptr<ContentBrowser> m_content;
-    std::unique_ptr<ScriptEngine> m_scripts;
+    std::unique_ptr<vks::ScriptEngine> m_scripts;
     std::unique_ptr<SplitLayout> m_split;
     std::unique_ptr<CharacterWindow> m_characterWindow;
     std::unique_ptr<ConsolePanel> m_console;
@@ -298,6 +341,30 @@ private:
     // 每次新 Play 开始也会重新灌满（见 EditorApp::onUpdate）。
     int m_collisionLogBudget = 240;
     uint64_t m_collisionFrames = 0;
+
+    // ---- R7-1 物理世界 ----
+    // Play 开始时按运行态场景里的 RigidBodyComponent 建一次，之后每帧步进；
+    // Stop 时直接丢掉（运行态本来就会被 clear，物理世界跟它同生共死）。
+    //
+    // 为什么是"Play 才建"而不是常驻：物理世界持有的是**运行态**实体的
+    // entity id，编辑态的 id 在每次 Play 时会全部换掉（运行态是重新读一遍
+    // 内存 JSON 建出来的）。常驻就得每帧对 id，反而更容易出错。
+    std::unique_ptr<physics::PhysicsWorld> m_physics;
+    // entity.id → BodyId。写回变换时按它找体；同时保证同帧内不会重复建。
+    std::unordered_map<unsigned, unsigned> m_physicsEntityToBody;
+    // 一帧最多打几条物理日志（与碰撞日志同一套节流思路）
+    int m_physicsLogBudget = 60;
+    uint64_t m_physicsFrames = 0;
+    // MYVK_PHYS_DUMP=<N>：每 N 帧把每个刚体的名字/位置/速度打一行
+    // （`PHYS-BODY ...`）。0 = 关。物理是"结果不对但看不出哪不对"的典型，
+    // 有这行才能把数值期望写成断言（见 tools/verify_physics_editor.py）。
+    int m_physicsDumpEvery = 0;
+    // 按 PhysicsSettings 建世界并把场景里的刚体塞进去（只在 Play 首帧调用）。
+    void buildPhysicsWorld();
+    // 推进物理并把解算结果写回运行态 TransformComponent。
+    void stepPhysics(float dt);
+    // 丢掉物理世界（Stop / 退出 Play 时）。
+    void destroyPhysicsWorld();
 
     // ---- E08：播放倍速（Transport 的 0.25x / 1x / 2x）----
     // 乘在 dt 上（等价于 Unity 的 Time.timeScale / UE 的 Global Time

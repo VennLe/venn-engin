@@ -288,19 +288,59 @@ FEATURES = [
 # ============================================================
 ALLOW_PREFIXES = (
     "MYVK_EDITOR_",     # ① 编辑器自动化注入（CAM/SCENE/SELECT/PLAY/SPACE…）
+    # ① 运行时（G 系列）的开关。设计上与 `MYVK_EDITOR_` 完全对称：
+    #    它们只在 **Game.exe** 里存在，而 Game.exe **没有界面**（M1 阶段
+    #    连窗口 UI 都还没有，G15 才有游戏内 UI），所以"界面上摸不到"是
+    #    它的本质而不是欠账。带前缀放行 = 新增一个运行时开关不必每次来
+    #    白名单补一行，同时"裸 env 漏网"仍然会被抓住（例如有人写了个
+    #    `MYVK_SCENE` 就没前缀了）。
+    "MYVK_RUNTIME_",
 )
 ALLOW_EXACT = {
     # ① 测试 / CI 基础
     "MYVK_FRAMES", "MYVK_HIDE_UI", "MYVK_NO_WINDOW_SAVE", "MYVK_LOG_RECTS",
     "MYVK_VALIDATION", "MYVK_ENGINE_PANEL", "MYVK_EXTRA_VIEW",
+    # ① `MYVK_RUNTIME=1`：运行时的 verbose 开关（每 60 帧一行 GAME-LOOP）。
+    #    刻意**不**带下划线后缀（ship_roadmap 的验收条款就是按这个名字写的），
+    #    所以它不能被上面的前缀规则吃掉，必须在这里显式登记。
+    "MYVK_RUNTIME",
+    # ① `MYVK_FIXED_DT=<秒>`：把每帧 dt 钉成常量，用于**确定性对照**
+    #    （编辑器 Play 与 Game.exe 跑同一段固定步长序列，位置才能逐位比较，
+    #    见 tools/verify_runtime_determinism.py）。纯测试钩子，同 `MYVK_FRAMES`。
+    "MYVK_FIXED_DT",
+    # `MYVK_STARTUP_DELAY=1` 强制保留启动缓冲（正常启动本来就有 2s 缓冲，
+    #  界面无开关；它只用来抵消 `MYVK_NO_WINDOW_SAVE` 顺带跳过缓冲的副作用，
+    #  让 `verify_startup_show` 可测且不写 imgui.ini）→ 纯测试钩子，同 `MYVK_FRAMES`。
+    "MYVK_STARTUP_DELAY",
     # ① 测试钩子：为了构造确定性对照而存在的"注入点"，
     #    源码里明确写着"正常使用不设即无影响" → 不需要 UI。
     "MYVK_FG_SUN_UV",
+    # ① 物理（PHYS-1，2026-10-16）：
+    #    · `MYVK_PHYS`      只是覆盖**场景里的开关**做 A/B（源码原话：
+    #      "场景里的开关是权威；MYVK_PHYS=0/1 只是给自动化做 A/B 的强制覆盖"）
+    #      —— 用户要碰的那个开关在 Inspector ▸ Physics ▸ `Simulate Physics`，
+    #      有 UI，所以这里放行的是"覆盖手段"，不是"唯一入口"。
+    #    · `MYVK_PHYS_TEST` 是**无窗口无 Vulkan** 的自检入口（editor/main.cpp
+    #      在 app.run() 前就 return）—— 纯 CI/测试用，界面上不存在也不该存在。
+    #      与 `MYVK_FRAMES` 同类。
+    "MYVK_PHYS", "MYVK_PHYS_TEST",
+    # ② E03 设置层级（2026-10-17）：
+    #    · `MYVK_RENDER_SETTINGS` / `MYVK_RENDER_PREFS` 是**路径覆盖**，
+    #      不是功能开关 —— 用户改设置靠的是 Engine 面板的
+    #      `Export current` / `Reload from disk`（editor/EditorApp.cpp
+    #      的 drawEngineSettingsIO），文件默认落在 `config/render.json`。
+    #      这两个变量只给"自动化把文件指到临时目录"用（同 `MYVK_EDITOR_LAYOUT`）。
+    #    · `MYVK_RENDER_SETTINGS_TEST` 是无窗口无 Vulkan 的自检入口
+    #      （editor/main.cpp 在 app.run() 前就 return），与 `MYVK_PHYS_TEST`
+    #      同类：CI 专用，界面上不存在也不该存在。
+    "MYVK_RENDER_SETTINGS", "MYVK_RENDER_PREFS", "MYVK_RENDER_SETTINGS_TEST",
     # ② 路径 / 构建期
     "MYVK_ASSET_DIR", "MYVK_CONTENT_DIR", "MYVK_SHADER_DIR",
     "MYVK_CHARACTER_MODEL",
 }
-ALLOW_SUFFIX = ("_DBG",)   # ③ 诊断 dump
+# ③ 诊断 dump（`*_DBG`）。`*_DUMP` 同义：只打日志、不改行为，
+#    与 `MYVK_PHYS_DUMP=<N>`（每 N 帧一行 `PHYS-BODY`）是同一类。
+ALLOW_SUFFIX = ("_DBG", "_DUMP")
 
 # C 组：这几种 scope 的"没有 UI"算 **FAIL**（用户直接面对的）
 # 其余（Editor 内部工具类）算 **WARN**，不阻塞。

@@ -57,6 +57,11 @@ def launch(exe, scene):
     env["MYVK_EDITOR_NO_HUD"] = "1"
     env["MYVK_EDITOR_SCENE"] = scene
     env["MYVK_EDITOR_CAM"] = CAM
+    # 和 verify_frustum_cull 同源（这里也读它写的 cull_test_scene.json）：
+    # 场景里的"远处" 39 个立方体是按 200 m 远平面摆的，而编辑器视口默认已经
+    # 是 5000 m → 不钉死的话 GROUND_TRUTH_DRAWN=4 / CULLED=132 这组基线会
+    # 整体漂到 42 / 94（那**不是**回归，是场景假设过期）。
+    env["MYVK_EDITOR_CLIP"] = "0.1,200"
 
     proc = subprocess.Popen([exe], cwd=os.path.dirname(exe), env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -106,6 +111,38 @@ def click_client(hwnd, cx, cy):
     user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
     time.sleep(0.12)
     user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    time.sleep(0.5)
+
+
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+
+
+def click_client_post(hwnd, cx, cy):
+    """点一下 (cx, cy)，**与前台/窗口遮挡无关**。
+
+    `click_client` 走的是真实注入（`SetCursorPos` 挪真实光标 +
+    `mouse_event`），它的前提是"我们的窗口此刻真的在那个屏幕位置上、且在
+    最上层" —— 一旦 `force_foreground` 没抢到前台（比如编辑器窗口被终端
+    压着），这发点击就落到了**别的窗口**上，症状是"点了完全没反应"，看起来
+    像功能坏了。
+
+    本函数改走 `PostMessage` 直投窗口消息队列：消息直接进目标窗口的队列，
+    跟谁在最上层、谁是前台都无关。位移部分仍要 `mouse_set_client`
+    （`PostMessage(WM_MOUSEMOVE)` + `SetCursorPos`）—— ImGui 的 GLFW 后端
+    在光标已进入窗口后只吃光标位置回调，不自己轮询；不先送位移就到不了
+    目标控件。GLFW 的 win32 窗口过程对 WM_LBUTTONDOWN/UP 会用 lParam 里的
+    坐标再走一次 `_glfwInputCursorPos`，所以 lParam 必须带上真实客户端坐标。
+
+    ⚠ 这是"抢不到前台时的退路"，不是首选：真实事件更接近用户操作。两者
+    都失败才说明是产品问题。
+    """
+    P.mouse_set_client(hwnd, cx, cy)
+    time.sleep(0.35)
+    lp = P._mouse_lparam(cx, cy)
+    user32.PostMessageW(hwnd, WM_LBUTTONDOWN, 1, lp)   # wParam=MK_LBUTTON
+    time.sleep(0.12)
+    user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lp)
     time.sleep(0.5)
 
 
@@ -237,6 +274,24 @@ def main():
             return 5
         vx0, vy0, vx1, vy1 = vp
 
+        def click_vp(x, y):
+            """点视口 (x, y)：先真实注入，抢不到前台就直投窗口消息。
+
+            ⚠ 2026-10-16 补：本用例的"点了没反应"与 `verify_particles` 的
+            E 组是**同一个根因** —— `mouse_event` 属于真实输入，只有窗口真的
+            在最上层 + 前台时才落到它身上；`force_foreground` 失败（脚本跟在
+            别的命令后面跑、编辑器还在异步退出时很常见）那几发点击就全落到
+            压在上面的窗口上。下面预热那段的注释早就记过这个现象
+            （"机器忙时实测 26s 都收不到（12 次尝试全落空）"），当时没有退路，
+            只能"降级成提示"。
+            `click_client_post` 走 `PostMessage` 直投窗口队列，与前台/遮挡
+            无关，也不会被"激活那一击"吞掉（它不经 DefWindowProc 的激活路径）。
+            """
+            if force_foreground(hwnd):
+                click_client(hwnd, x, y)       # 首选：真实鼠标事件
+            else:
+                click_client_post(hwnd, x, y)  # 抢不到前台 → 与前台无关的那条路
+
         # (a) **预热点击**（关键，别删）。
         #
         # 注入的**第一次**左键点击会被 Windows 拿去"激活窗口"，ImGui 收不到
@@ -269,10 +324,8 @@ def main():
             # 每轮重抢一次前台：全量回归里前面用例的编辑器可能在异步退出，
             # 期间焦点会被抢走 —— 窗口一旦不在前台，mouse_event 静默失效
             # （不报错、只表现为"点了没反应"）。force_foreground 已经在
-            # 前台时立即返回，无副作用。
-            force_foreground(hwnd)
-            click_client(hwnd, vx0 + (vx1 - vx0) * 0.94,
-                         vy0 + (vy1 - vy0) * 0.94)
+            # 前台时立即返回，无副作用；抢不到时 click_vp 自动改走直投。
+            click_vp(vx0 + (vx1 - vx0) * 0.94, vy0 + (vy1 - vy0) * 0.94)
             warm = last_match(tap, "pick: nothing hit", MISS_RE, timeout=1.2)
         if warm is None:
             print("  ⚠ 预热点击 %d 次 / %.1fs 内都没被窗口收到（准备动作失败，"
@@ -283,7 +336,7 @@ def main():
                   % (tries, time.time() - t_warm))
 
         # (b) 点视口正中：射线沿 +X，最近的是 (5,0,3) 的 Cube_0
-        click_client(hwnd, (vx0 + vx1) / 2, (vy0 + vy1) / 2)
+        click_vp((vx0 + vx1) / 2, (vy0 + vy1) / 2)
         sel = last_match(tap, "pick: selected", SEL_RE, timeout=6.0)
         pk = last_match(tap, "PICK-DBG", PICK_RE, timeout=6.0)
         print("  正中点击 ->", sel.group(1) if sel else None)
@@ -324,7 +377,7 @@ def main():
                 return sum(1 for l in tap.lines if MISS_RE.search(l))
 
         before = miss_count()
-        click_client(hwnd, vx0 + (vx1 - vx0) * 0.94, vy0 + (vy1 - vy0) * 0.94)
+        click_vp(vx0 + (vx1 - vx0) * 0.94, vy0 + (vy1 - vy0) * 0.94)
         miss = last_match(tap, "pick: nothing hit", MISS_RE, timeout=6.0)
         check("点空地 -> 什么都没选中（这一下真的产生了 pick）",
               miss is not None and miss_count() > before,

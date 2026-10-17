@@ -104,16 +104,15 @@ private:
     void drawSnapRow();
     // 编辑态导航（UE 视口手感：飞行相机 + 滚轮推拉 / 右键滚轮调灵敏度）
     void handleNavigation(bool hovered) const;
-    // E14 · 四角浮层（各自独立显隐，见 EditorContext::ViewportOverlay）
+    // E14 · 视口浮层（各自独立显隐，见 EditorContext::ViewportOverlay）
+    //   （左下角的相机信息块已并入 Inspector → World → Camera）
     //   左上 = 视图模式条
     void drawViewModeBar(const glm::vec2& vpPos, const glm::vec2& vpSize);
     //   右上 = 统计 HUD（FPS / 帧时间 / draw calls / 三角形 / VRAM / 分辨率 /
     //          视图模式 / 实体 / 选中，逐行可关）
     void drawStatsHud(const glm::vec2& vpPos, const glm::vec2& vpSize);
-    //   左下 = 相机信息（位置 / 注视点 / FOV / 距离 / 灵敏度 + 书签条 + 设置）
-    void drawCameraInfo(const glm::vec2& vpPos, const glm::vec2& vpSize);
-    // 右键视口空白处 → "Viewport Display" 菜单：四块浮层的开关 +
-    // 统计 HUD 的逐项开关（右键点中选中物体时仍然是物体菜单，见
+    // 右键视口空白处 → "Viewport Display" 菜单：浮层开关 + 统计 HUD 的
+    // 逐项开关 + 网格步长/背景（右键点中选中物体时仍然是物体菜单，见
     // drawObjectMenu 的按下/松开判定）。
     void drawDisplayMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
                          bool hovered);
@@ -154,6 +153,12 @@ private:
 
     bool m_showOverlay = true;
     bool m_showGizmo = true;
+
+    // 统计 HUD 的"收起"状态（会话内，不落盘）。收起后只画一颗 "Stats" 胶囊。
+    // 与 EditorContext::ViewportOverlay::stats 的区别：
+    //   stats  = 这块 HUD 要不要存在（偏好，落盘）
+    //   本字段 = 存在的情况下收不收起来（临时）
+    bool m_statsCollapsed = false;
 
     // E14：模式条（左上）的右 / 下边界（屏幕坐标，每帧由 drawViewModeBar
     // 填）。统计 HUD 用它判断顶边会不会撞上，撞上就下移一行。

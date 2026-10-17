@@ -1,5 +1,6 @@
 #include "NotificationCenter.h"
 
+#include "Localization.h"
 #include "EditorLayoutIO.h"   // editorLayoutAutomationRun()（落盘守卫，与其他持久化同一条规则）
 
 #include <imgui.h>
@@ -181,12 +182,12 @@ void NotificationCenter::drawToasts() {
             ImGui::PopStyleColor();
             if (t.repeat > 1) {
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.62f, 0.64f, 0.68f, a), "x%d",
+                ImGui::TextColored(ImVec4(0.62f, 0.64f, 0.68f, a), TR("x%d"),
                                    t.repeat);
             }
             ImGui::PushStyleColor(ImGuiCol_Text,
                                   ImVec4(0.88f, 0.90f, 0.93f, a));
-            ImGui::TextWrapped("%s", t.text.c_str());
+            ImGui::TextWrapped(TR("%s"), t.text.c_str());
             ImGui::PopStyleColor();
             if (t.fromLog) {
                 ImGui::TextColored(ImVec4(0.58f, 0.62f, 0.70f, 0.9f * a),
@@ -228,11 +229,11 @@ void NotificationCenter::drawTaskBar() {
         ImGuiWindowFlags_NoFocusOnAppearing;
 
     if (ImGui::Begin("##taskbar", nullptr, flags)) {
-        ImGui::TextUnformatted("Tasks");
+        ImGui::TextUnformatted(TR("Tasks"));
         ImGui::SameLine(ImGui::GetWindowWidth() - 28.0f);
-        if (ImGui::SmallButton("v")) m_tasksMinimized = true;   // 最小化到状态栏
+        if (ImGui::SmallButton(TR("v"))) m_tasksMinimized = true;   // 最小化到状态栏
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Minimize (the count stays in the status bar)");
+            ImGui::SetTooltip(TR("Minimize (the count stays in the status bar)"));
         ImGui::Separator();
 
         for (size_t i = 0; i < m_tasks.size(); ++i) {
@@ -245,7 +246,7 @@ void NotificationCenter::drawTaskBar() {
                               static_cast<int>(t.progress * 100.0f + 0.5f));
                 const float w = ImGui::CalcTextSize(pct).x;
                 ImGui::SameLine(ImGui::GetWindowWidth() - w - 12.0f);
-                ImGui::TextDisabled("%s", pct);
+                ImGui::TextDisabled(TR("%s"), pct);
                 ImGui::ProgressBar(std::clamp(t.progress, 0.0f, 1.0f),
                                    ImVec2(-1.0f, 6.0f), "");
             } else {
@@ -254,7 +255,7 @@ void NotificationCenter::drawTaskBar() {
                                    ImVec2(-1.0f, 6.0f), "working...");
             }
             ImGui::SameLine(ImGui::GetWindowWidth() - 62.0f);
-            if (ImGui::SmallButton("Cancel")) requestCancel(t.id);
+            if (ImGui::SmallButton(TR("Cancel"))) requestCancel(t.id);
             ImGui::PopID();
         }
     }
@@ -265,35 +266,35 @@ void NotificationCenter::drawTaskBar() {
 void NotificationCenter::drawHistoryWindow(bool* open) {
     if (!open || !*open) return;
     ImGui::SetNextWindowSize(ImVec2(620.0f, 420.0f), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Notification History###notifhist", open)) {
+    if (!ImGui::Begin(trId("Notification History", "notifhist"), open)) {
         ImGui::End();
         return;
     }
 
     static char search[64] = {};
-    ImGui::Text("total %d", historyCount());
+    ImGui::Text(TR("total %d"), historyCount());
     ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.40f, 1.0f), "| warns %d",
+    ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.40f, 1.0f), TR("| warns %d"),
                        warnCount());
     ImGui::SameLine();
-    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.40f, 1.0f), "| errors %d",
+    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.40f, 1.0f), TR("| errors %d"),
                        errorCount());
     ImGui::SameLine();
-    ImGui::TextDisabled("| unread %d", unread());
+    ImGui::TextDisabled(TR("| unread %d"), unread());
     ImGui::SameLine(ImGui::GetWindowWidth() - 210.0f);
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputTextWithHint("##notifsearch", "filter...", search,
                              sizeof(search));
 
-    if (ImGui::Button("Mark all read")) markAllRead();
+    if (ImGui::Button(TR("Mark all read"))) markAllRead();
     ImGui::SameLine();
-    if (ImGui::Button("Clear")) clear();
+    if (ImGui::Button(TR("Clear"))) clear();
 
     // 最小化的任务条要能从历史窗口恢复（否则用户点了 v 就再也找不回来）
     if (!m_tasks.empty()) {
         ImGui::SameLine();
         bool minimized = m_tasksMinimized;
-        if (ImGui::Checkbox("minimize task bar", &minimized))
+        if (ImGui::Checkbox(TR("minimize task bar"), &minimized))
             m_tasksMinimized = minimized;
     }
 
@@ -307,21 +308,21 @@ void NotificationCenter::drawHistoryWindow(bool* open) {
             if (search[0] && n.text.find(search) == std::string::npos) continue;
             const Color c = levelColor(n.level);
             ImGui::PushID(i);
-            ImGui::TextColored(ImVec4(c.r, c.g, c.b, 1.0f), "%-5s",
+            ImGui::TextColored(ImVec4(c.r, c.g, c.b, 1.0f), TR("%-5s"),
                                levelName(n.level));
             ImGui::SameLine();
             if (!n.read)
-                ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.95f, 1.0f), "*");
+                ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.95f, 1.0f), TR("*"));
             else
-                ImGui::TextDisabled(" ");
+                ImGui::TextDisabled(TR(" "));
             ImGui::SameLine();
-            ImGui::TextWrapped("%s", n.text.c_str());
+            ImGui::TextWrapped(TR("%s"), n.text.c_str());
             if (n.repeat > 1) {
                 ImGui::SameLine();
-                ImGui::TextDisabled("x%d", n.repeat);
+                ImGui::TextDisabled(TR("x%d"), n.repeat);
             }
             if (n.fromLog && ImGui::IsItemHovered())
-                ImGui::SetTooltip("Open in Console");
+                ImGui::SetTooltip(TR("Open in Console"));
             if (n.fromLog && ImGui::IsItemClicked()) {
                 // 与点 toast 完全同一条路：立刻打开 Console 并滚到那一行
                 m_focusText = n.text;

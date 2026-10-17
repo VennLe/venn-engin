@@ -1,12 +1,16 @@
 #include "EditorContext.h"
 
+#include "InputMapIO.h"
+#include "Localization.h"
 #include "assets/AssetManager.h"
 #include "core/Logger.h"
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
 
 #include <cstdlib>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace editor {
 
@@ -83,6 +87,16 @@ void EditorContext::applyEditorCameraMode() {
     scene::Camera& cam = m_editorScene.camera();
     cam.setUseGlobalInput(false);  // 输入由 ViewportPanel 显式喂（ImGui 捕获了鼠标）
     cam.setFlyMode(true);          // UE 视口手感：转自己 + WASD 飞行
+
+    // ---- 远平面：编辑器视口用 5 km，而不是游戏的 200 m ----
+    // 这是"飞到高处俯视地面时视野越来越窄"的根因：远平面 200 m 会把
+    // 远侧的地面整片裁掉。相机在 150 m 高、俯角 60° 时，画面里最远的地面
+    // 已经在 ~250 m 外 —— 于是可见地面被切成画面下方的一条窄带，升得越高
+    // 带子越窄，到 300 m 时整屏空白。
+    //
+    // 近平面保持 0.1（贴地看细节要用），far/near = 5e4 对 24 位深度来说
+    // 在 100 m 处仍有 ~6 mm 精度，够用；1 km 处 ~0.6 m，远小于一像素。
+    cam.setClipPlanes(0.1f, 5000.0f);
 }
 
 void EditorContext::play() {
@@ -91,7 +105,7 @@ void EditorContext::play() {
     if (m_play == PlayState::Paused) {
         // 从暂停恢复：运行态的实体与状态原封不动，直接继续
         m_play = PlayState::Playing;
-        setStatus("Resumed");
+        setStatus(TR("Resumed"));
         return;
     }
 
@@ -101,7 +115,7 @@ void EditorContext::play() {
     if (!saved.ok) {
         VK_LOG_ERROR("Play failed: cannot snapshot scene: %s",
                      saved.error.c_str());
-        setStatus("Play failed: " + saved.error);
+        setStatus(TR("Play failed: ") + saved.error);
         return;
     }
 
@@ -110,7 +124,7 @@ void EditorContext::play() {
     if (!loaded.ok) {
         VK_LOG_ERROR("Play failed: cannot restore snapshot: %s",
                      loaded.error.c_str());
-        setStatus("Play failed: " + loaded.error);
+        setStatus(TR("Play failed: ") + loaded.error);
         return;
     }
 
@@ -138,14 +152,14 @@ void EditorContext::play() {
     VK_LOG_INFO("Editor: PLAY in viewport (runtime scene = %zu entities, "
                 "editor untouched)",
                 m_runtimeScene.objectCount());
-    setStatus("Playing in viewport (F = fullscreen)");
-    notify("Playing in viewport (F = fullscreen)");
+    setStatus(TR("Playing in viewport (F = fullscreen)"));
+    notify(TR("Playing in viewport (F = fullscreen)"));
 }
 
 void EditorContext::pause() {
     if (m_play != PlayState::Playing) return;
     m_play = PlayState::Paused;
-    setStatus("Paused");
+    setStatus(TR("Paused"));
 }
 
 void EditorContext::stop() {
@@ -160,7 +174,7 @@ void EditorContext::stop() {
 
     validateSelection();  // 把选择按名字接回编辑态
     VK_LOG_INFO("Editor: STOP (runtime discarded, editor scene restored)");
-    setStatus("Stopped");
+    setStatus(TR("Stopped"));
 }
 
 void EditorContext::togglePlayPause() {
@@ -179,14 +193,14 @@ void EditorContext::togglePlayPause() {
 
 void EditorContext::animPlay() {
     if (!isEditing()) {
-        setStatus("Animation unavailable while Run is active");
+        setStatus(TR("Animation unavailable while Run is active"));
         return;
     }
     if (m_anim == AnimState::Playing) return;
 
     if (m_anim == AnimState::Paused) {
         m_anim = AnimState::Playing;
-        setStatus("Animation resumed");
+        setStatus(TR("Animation resumed"));
         return;
     }
 
@@ -195,7 +209,7 @@ void EditorContext::animPlay() {
     if (!saved.ok) {
         VK_LOG_ERROR("Anim play failed: cannot snapshot scene: %s",
                      saved.error.c_str());
-        setStatus("Anim failed: " + saved.error);
+        setStatus(TR("Anim failed: ") + saved.error);
         return;
     }
 
@@ -203,13 +217,13 @@ void EditorContext::animPlay() {
     m_anim = AnimState::Playing;
     VK_LOG_INFO("Editor: ANIM play (editing the live scene; Stop restores "
                 "the snapshot)");
-    setStatus("Animation playing");
+    setStatus(TR("Animation playing"));
 }
 
 void EditorContext::animPause() {
     if (m_anim != AnimState::Playing) return;
     m_anim = AnimState::Paused;
-    setStatus("Animation paused");
+    setStatus(TR("Animation paused"));
 }
 
 void EditorContext::animStop() {
@@ -237,7 +251,7 @@ void EditorContext::animStop() {
     m_dirty = true;
 
     VK_LOG_INFO("Editor: ANIM stop (scene restored from snapshot)");
-    setStatus("Animation stopped");
+    setStatus(TR("Animation stopped"));
 }
 
 void EditorContext::onSceneReplaced() {
@@ -316,7 +330,7 @@ void EditorContext::validateSelection() {
 
 void EditorContext::undo() {
     if (!m_commands.undo()) {
-        setStatus("Nothing to undo");
+        setStatus(TR("Nothing to undo"));
         return;
     }
     setStatus(std::string("Undo: ") + m_commands.redoName());
@@ -328,7 +342,7 @@ void EditorContext::undo() {
 
 void EditorContext::redo() {
     if (!m_commands.redo()) {
-        setStatus("Nothing to redo");
+        setStatus(TR("Nothing to redo"));
         return;
     }
     setStatus(std::string("Redo: ") + m_commands.undoName());
@@ -341,6 +355,101 @@ std::string EditorContext::snapshot() const {
     // 结构编辑永远只发生在编辑态，快照也只抓编辑态
     scene::sceneToJson(m_editorScene, out);
     return out;
+}
+
+// ============================================================
+// G06 · 键位绑定
+// ============================================================
+
+void EditorContext::loadInputMap() {
+    // 出厂绑定是**唯一事实源**（core::InputMap::makeDefault）。文件只是
+    // 覆盖 —— 读不到就保持出厂，这条路径不该有任何错误处理分支。
+    m_inputMap = core::InputMap::makeDefault();
+    const bool fromFile = loadEditorInputMap(m_inputMap);
+    // 这一行是回归脚本的锚点：`source=factory` / `source=file` 一眼可判，
+    // 且**两条分支都会打**（"以为读了文件其实没读"是最难查的一类）。
+    VK_LOG_INFO("INS-BIND source=%s path=%s actions=%s",
+                fromFile ? "file" : "factory", editorInputMapPath().c_str(),
+                m_inputMap.describe().c_str());
+    m_inputMapDirty = false;
+}
+
+bool EditorContext::saveInputMap() {
+    if (!saveEditorInputMap(m_inputMap)) {
+        setStatus(TR("Key bindings NOT saved (see log)"));
+        return false;
+    }
+    m_inputMapDirty = false;
+    setStatus(TR("Key bindings saved"));
+    return true;
+}
+
+bool EditorContext::rebindAction(const std::string& context,
+                                 const std::string& action,
+                                 const core::InputBinding& binding) {
+    // ⚠ 两条日志打在**这里**而不是面板里：面板的"捕获"和自动化的
+    //   `MYVK_EDITOR_REBIND` 注入走的是同一条写路径，日志跟着路径走才能
+    //   保证"界面能做的 = 脚本能测的"。放在面板里的话，脚本改绑不会打
+    //   CLASH，冲突检测就少了一半覆盖。
+    const std::string key = m_inputMap.describeBindingOne(binding);
+    const std::vector<std::string> clash =
+        m_inputMap.conflictingActions(context, binding, action);
+
+    const std::string label = "Rebind " + action + " -> " + key;
+    const bool changed = inputMapEdit(label, [&]() {
+        return m_inputMap.setActionBinding(context, action, binding);
+    });
+    VK_LOG_INFO("INS-BIND-SET context=%s action=%s key=%s changed=%d "
+                "conflicts=%zu",
+                context.c_str(), action.c_str(), key.c_str(),
+                changed ? 1 : 0, clash.size());
+    if (!clash.empty()) {
+        std::string names;
+        for (std::size_t i = 0; i < clash.size(); ++i) {
+            if (i) names += ", ";
+            names += clash[i];
+        }
+        // 冲突**不阻止**绑定：同键多动作在游戏里是合法配置（玩家自己的
+        // 选择），面板只负责让他知道。
+        VK_LOG_WARN("INS-BIND-CLASH action=%s key=%s also=%s", action.c_str(),
+                    key.c_str(), names.c_str());
+    }
+    return changed;
+}
+
+bool EditorContext::resetActionBinding(const std::string& context,
+                                      const std::string& action) {
+    return inputMapEdit("Reset binding: " + action, [&]() {
+        return m_inputMap.resetActionBinding(context, action);
+    });
+}
+
+bool EditorContext::clearActionBinding(const std::string& context,
+                                      const std::string& action) {
+    // 只解键盘：手柄绑定留着（见 core::InputMap::setActionBinding 的说明，
+    // 面板在 v1 里只捕获键盘）。
+    return inputMapEdit("Clear binding: " + action, [&]() {
+        m_inputMap.clearActionBinding(context, action, core::InputSource::Key);
+        return true;
+    });
+}
+
+bool EditorContext::resetAllBindings() {
+    return inputMapEdit("Reset all key bindings", [&]() {
+        m_inputMap.resetToDefault();
+        return true;
+    });
+}
+
+void EditorContext::beginInputCapture(std::string context, std::string action) {
+    m_captureContext = std::move(context);
+    m_captureAction = std::move(action);
+    setStatus("Press a key for " + m_captureAction + "  (Esc = cancel)");
+}
+
+void EditorContext::endInputCapture() {
+    m_captureContext.clear();
+    m_captureAction.clear();
 }
 
 // ---------------------------------------------------------------- 提示

@@ -72,7 +72,8 @@ Window::Window(const std::string& title, int width, int height, bool resizable)
     // 任务栏先按通用图标建了按钮，等 Application::run() 里再调
     // glfwSetWindowIcon 只是"事后补救"，补不补得上看 shell 心情。
     //
-    // 改成：隐藏创建 → 设图标 → 再显示。第一帧起就是对的。
+    // 改成：隐藏创建 → 设图标 → **等第一帧画完再显示**（见 show() 的注释：
+    // 这一步同时解决了"启动闪白一下"）。
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
     m_window = glfwCreateWindow(width, height, title.c_str(), nullptr, nullptr);
@@ -85,7 +86,9 @@ Window::Window(const std::string& title, int width, int height, bool resizable)
 
     // 图标必须在 ShowWindow 之前设好（原因见上）
     applyIconFromResource();
-    glfwShowWindow(m_window);
+    // ⚠ 这里**不再** glfwShowWindow —— 窗口交给 Application::run() 在首帧
+    //   呈现之后显示。原因见 Window::show() 的注释（启动闪白）。
+    applyDarkBackgroundBrush();
 
     // 绑定回调
     glfwSetFramebufferSizeCallback(m_window, Window::framebufferResizeCallback);
@@ -212,6 +215,46 @@ bool Window::applyIconFromResource() {
 #else
     return false;
 #endif
+}
+
+bool Window::applyDarkBackgroundBrush() {
+#if defined(_WIN32)
+    if (!m_window) return false;
+    HWND hwnd = glfwGetWin32Window(m_window);
+    if (!hwnd) return false;
+
+    // 窗口类默认的背景刷是 COLOR_WINDOW = **纯白**。GLFW 注册窗口类时就是
+    // 这么干的。后果：窗口第一次 ShowWindow 时，客户区会先被系统用白刷
+    // 擦一遍 —— 在 Vulkan 把第一帧呈现上去之前，屏幕上是"一块白的"。
+    // 这就是用户看到的"启动闪白一下"。
+    //
+    // 两条路一起用（这是第二条）：
+    //   1) 主路：窗口根本不显示，等第一帧呈现完再 show（见 Window::show）。
+    //   2) 兜底：把窗口类背景刷换成和编辑器底色一致的深灰。这样即使因为
+    //      任何原因窗口提前可见（切全屏、DPI 变化触发的重新布局…），看到的
+    //      也是一块"编辑器底色"而不是刺眼的白。
+    //
+    // ⚠ 画刷由**进程**持有并负责释放：类一旦引用它，就不能在窗口还活着时
+    //   删掉（删了下次擦背景会用野指针）。这里故意不释放 —— 一个 8 字节的
+    //   画刷，进程级别的一次性开销，换取"绝不悬垂"。
+    static HBRUSH s_darkBrush =
+        CreateSolidBrush(RGB(27, 28, 30));   // ≈ ImGui WindowBg 的 sRGB
+    SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND,
+                     reinterpret_cast<LONG_PTR>(s_darkBrush));
+    return true;
+#else
+    return false;
+#endif
+}
+
+void Window::show() {
+    if (!m_window || m_shown) return;
+    m_shown = true;
+    glfwShowWindow(m_window);
+    // 显示之后请求一次窗口拿到焦点：隐藏创建时 GLFW 不会去激活窗口，
+    // 不显示出来就直接用会"窗口在但键盘没反应"。
+    glfwFocusWindow(m_window);
+    VK_LOG_INFO("Window shown (first frame is on screen)");
 }
 
 void Window::setIconFromFile(const std::string& pngPath) {

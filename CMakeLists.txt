@@ -129,14 +129,26 @@ add_library(vma INTERFACE)
 target_include_directories(vma INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/VulkanMemoryAllocator/include)
 
 # ============================================================
-# 引擎静态库（target 名 = venn）
+# 引擎静态库（target 名 = VennEngine）
+# ------------------------------------------------------------
+# G01（2026-10-17）：从"一个 Editor.exe"拆成"一个引擎库 + 两个可执行文件"。
+# 依赖方向是硬约束（见 docs/ship_roadmap.md §13）：
+#
+#     runtime/  ──►  engine/  ◄──  editor/
+#
+# VennEngine **只**收 engine/**，两个消费者都链它。
+# 它不认识 editor/、也不认识 runtime/ —— 这是下面那条 GLOB
+# 唯一的作用域，也是"引擎库的源文件列表里不含编辑器文件"这条验收的实现。
 # ============================================================
 file(GLOB_RECURSE ENGINE_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/engine/*.cpp)
-add_library(venn STATIC ${ENGINE_SOURCES})
-target_include_directories(venn PUBLIC
+add_library(VennEngine STATIC ${ENGINE_SOURCES})
+# 旧名别名：工程里还有若干处按 `venn` 指代引擎库（历史遗留），
+# 用 ALIAS 保住它们，避免"改名"变成一次大面积机械替换。
+add_library(venn ALIAS VennEngine)
+target_include_directories(VennEngine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/engine
 )
-target_link_libraries(venn PUBLIC
+target_link_libraries(VennEngine PUBLIC
     Vulkan::Vulkan
     glfw
     imgui
@@ -149,12 +161,12 @@ target_link_libraries(venn PUBLIC
     vma
 )
 if(NOT MSVC)
-    target_compile_options(venn PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_compile_options(VennEngine PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 # MSVC 侧：/utf-8 /W3 /permissive- 已在文件顶部的全局 add_compile_options 给出。
 
 # ============================================================
-# 编辑器（唯一的可执行文件）
+# 编辑器（editor/ → Editor.exe）
 # ------------------------------------------------------------
 # editor/ 里是只读依赖 engine/，反过来 engine/ 不认识 editor/。
 # （曾经还有一个 Sandbox 独立示例程序，2026-10-09 按用户要求整体删除。）
@@ -162,9 +174,10 @@ endif()
 file(GLOB_RECURSE EDITOR_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/editor/*.cpp
 )
-add_executable(Editor ${EDITOR_SOURCES})
+add_executable(VennEditor ${EDITOR_SOURCES})
+set_target_properties(VennEditor PROPERTIES OUTPUT_NAME Editor)
 if(DEFINED VENN_ICON_RC)
-    target_sources(Editor PRIVATE ${VENN_ICON_RC})
+    target_sources(VennEditor PRIVATE ${VENN_ICON_RC})
     # venn.rc 里是 `1 ICON "venn.ico"`，windres 在编译 rc 时才去读那个 ico。
     # 但 ninja 只把 rc 本身当作输入，不看 rc 里 `ICON` 语句引用的文件——
     # 于是单独重做 venn.ico（tools/make_icon.py 生成的 17 档高清图标）时，
@@ -174,12 +187,32 @@ if(DEFINED VENN_ICON_RC)
     set_source_files_properties(${VENN_ICON_RC} PROPERTIES
         OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/venn.ico")
 endif()
-target_link_libraries(Editor PRIVATE venn)
+target_link_libraries(VennEditor PRIVATE VennEngine)
+
+# ============================================================
+# 运行时（runtime/ → Game.exe）
+# ------------------------------------------------------------
+# 出货用的那个可执行文件。与编辑器**完全平行**：同一个 VennEngine，
+# 两个 main()，互相之间没有依赖，也不共享任何应用层代码。
+# ============================================================
+file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/*.cpp
+)
+add_executable(VennRuntime ${RUNTIME_SOURCES})
+set_target_properties(VennRuntime PROPERTIES OUTPUT_NAME Game)
+if(DEFINED VENN_ICON_RC)
+    target_sources(VennRuntime PRIVATE ${VENN_ICON_RC})
+    set_source_files_properties(${VENN_ICON_RC} PROPERTIES
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/venn.ico")
+endif()
+target_link_libraries(VennRuntime PRIVATE VennEngine)
 
 if(NOT MSVC)
-    target_link_options(Editor PRIVATE -static-libgcc -static-libstdc++)
+    target_link_options(VennEditor PRIVATE -static-libgcc -static-libstdc++)
+    target_link_options(VennRuntime PRIVATE -static-libgcc -static-libstdc++)
     if(WIN32)
-        target_link_options(Editor PRIVATE -static)
+        target_link_options(VennEditor PRIVATE -static)
+        target_link_options(VennRuntime PRIVATE -static)
     endif()
 endif()
 
@@ -441,7 +474,10 @@ foreach(SRC ${SHADER_MSAA_DEPTH_COMPUTE})
 endforeach()
 
 add_custom_target(Shaders ALL DEPENDS ${SHADER_TARGETS})
-add_dependencies(Editor Shaders)
+# 两个可执行文件都要按构建顺序排在着色器之后（真正"每次都拷"在下面的
+# VennShadersCopy 里，这里管的是"编译顺序"）。
+add_dependencies(VennEditor Shaders)
+add_dependencies(VennRuntime Shaders)
 
 # ============================================================
 # 运行期资源拷贝（Editor 用）
@@ -450,29 +486,34 @@ add_dependencies(Editor Shaders)
 # （见 assets/AssetPath.cpp 的解析顺序）。
 # ============================================================
 function(myvk_copy_runtime_assets target)
+    # ⚠ G01 起，这里不再"按 target 各拷一份" —— Editor.exe 与 Game.exe 需要
+    #   完全相同的 shaders/ 与 assets/，各拷一遍等于把拷贝量翻倍。
+    #   两个 exe 都 add_dependencies 到下面这两个**全局** target 上。
+    #
     # 拷贝 .spv 与 GLSL 源码到可执行目录。
     #
     # ⚠ **不能**用 `add_custom_command(TARGET ... POST_BUILD)`：POST_BUILD 只在
     #   **目标自身被重建（重新链接）**时执行。于是"只改了一个 .frag、没动任何
-    #   C++"→ `Shaders` 目标重新生成 .spv，但 Editor 被认为是最新的、不重链接
+    #   C++"→ `Shaders` 目标重新生成 .spv，但可执行文件被认为是最新的、不重链接
     #   → 拷贝步骤整段跳过 → 运行时加载的还是**上一次**的 .spv。现象极具迷惑性：
     #   改了着色器却"看不到任何变化"，或者看到的是上一版的行为。
-    #   （`add_dependencies(Editor Shaders)` 只保证**构建顺序**，不触发重链接。）
+    #   （`add_dependencies(... Shaders)` 只保证**构建顺序**，不触发重链接。）
     #
     # 正确做法：把拷贝挂在一个**没有输出文件的 custom target** 上 —— 这种目标的
     # COMMAND 每次构建都会执行；再让它 DEPENDS 全部 .spv，于是顺序变成
     # "先把着色器编出来 → 再拷过去"，改一处着色器也能立刻生效。
-    add_custom_target(${target}_shaders ALL
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${SHADER_OUT_DIR} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders
-        COMMAND ${CMAKE_COMMAND} -E copy
-            ${SHADER_GLSL_SOURCES} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders
-        DEPENDS ${SHADER_TARGETS}
-        COMMENT "Copying shaders to ${target} binary dir"
-    )
-    add_dependencies(${target} ${target}_shaders)
+    if(NOT TARGET VennShadersCopy)
+        add_custom_target(VennShadersCopy ALL
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                ${SHADER_OUT_DIR} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders
+            COMMAND ${CMAKE_COMMAND} -E copy
+                ${SHADER_GLSL_SOURCES} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders
+            DEPENDS ${SHADER_TARGETS}
+            COMMENT "Copying shaders to binary dir"
+        )
+    endif()
 
-    # ---- 只读资源（纹理/模型/字体/图标）：同样必须**每次构建**都拷 ----
+    # ---- 只读资源（纹理/模型/字体/图标 + game.json）：同样必须**每次构建**都拷 ----
     #
     # ⚠ 与上面的 .spv 完全同一个坑：这些是**构建输入**（由 tools/ 下的脚本离线
     #   产出），改了源文件却不重新链接 C++ 时，POST_BUILD 不会跑 → 运行时读到的
@@ -482,43 +523,61 @@ function(myvk_copy_runtime_assets target)
     # ⚠ assets/scenes 与 assets/scripts **不在此列**：它们是编辑器运行时**会写**
     #   的目录（存档场景 / 自研脚本），每次构建都从仓库覆盖过去会把用户的存档
     #   冲掉 —— 那两个目录保持 POST_BUILD（只在重新链接时同步一次）。
-    set(VENN_ALWAYS_ASSET_DIRS
-        "${CMAKE_CURRENT_SOURCE_DIR}/assets/models|assets/models"
-        "${CMAKE_CURRENT_SOURCE_DIR}/assets/textures|assets/textures"
-        "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons|assets/icons"
-    )
-    set(always_asset_cmds "")
-    foreach(item IN LISTS VENN_ALWAYS_ASSET_DIRS)
-        string(REPLACE "|" ";" pair "${item}")
-        list(GET pair 0 src)
-        list(GET pair 1 rel)
-        if(EXISTS "${src}")
+    #
+    # ⚠ `assets/game.json` 是 **G05 的运行时启动配置**：它是只读的出厂默认，
+    #   运行时**不写**它（写的是用户目录），所以走"每次拷贝"这一档。
+    if(NOT TARGET VennAssetsCopy)
+        set(VENN_ALWAYS_ASSET_DIRS
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/models|assets/models"
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/textures|assets/textures"
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons|assets/icons"
+        )
+        set(always_asset_cmds "")
+        foreach(item IN LISTS VENN_ALWAYS_ASSET_DIRS)
+            string(REPLACE "|" ";" pair "${item}")
+            list(GET pair 0 src)
+            list(GET pair 1 rel)
+            if(EXISTS "${src}")
+                list(APPEND always_asset_cmds
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${rel}
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        "${src}" ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${rel}
+                )
+            endif()
+        endforeach()
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/misc/fonts)
             list(APPEND always_asset_cmds
                 COMMAND ${CMAKE_COMMAND} -E make_directory
-                    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${rel}
+                    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/fonts
                 COMMAND ${CMAKE_COMMAND} -E copy_directory
-                    "${src}" ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${rel}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/misc/fonts
+                    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/fonts
             )
         endif()
-    endforeach()
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/misc/fonts)
-        list(APPEND always_asset_cmds
-            COMMAND ${CMAKE_COMMAND} -E make_directory
-                ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/fonts
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/misc/fonts
-                ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/fonts
-        )
-    endif()
-    if(always_asset_cmds)
-        add_custom_target(${target}_assets ALL
-            ${always_asset_cmds}
-            COMMENT "Copying readonly assets to ${target} binary dir"
-        )
-        add_dependencies(${target} ${target}_assets)
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets/game.json)
+            list(APPEND always_asset_cmds
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${CMAKE_CURRENT_SOURCE_DIR}/assets/game.json
+                    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/game.json
+            )
+        endif()
+        if(always_asset_cmds)
+            add_custom_target(VennAssetsCopy ALL
+                ${always_asset_cmds}
+                COMMENT "Copying readonly assets to binary dir"
+            )
+        else()
+            add_custom_target(VennAssetsCopy ALL
+                COMMAND ${CMAKE_COMMAND} -E echo "no readonly assets"
+                COMMENT "no readonly assets"
+            )
+        endif()
     endif()
 
-    # 场景 / 脚本目录（编辑器会读写 assets/scenes 与 assets/scripts）
+    add_dependencies(${target} VennShadersCopy VennAssetsCopy)
+
+    # 场景 / 脚本目录（编辑器与运行时都会读写 assets/scenes 与 assets/scripts）
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes)
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -537,5 +596,6 @@ function(myvk_copy_runtime_assets target)
     endif()
 endfunction()
 
-myvk_copy_runtime_assets(Editor)
+myvk_copy_runtime_assets(VennEditor)
+myvk_copy_runtime_assets(VennRuntime)
 

@@ -32,6 +32,15 @@ compile_commands.json
 # 运行时写出的界面状态（ImGui 窗口布局，路径跟着进程的工作目录走）
 imgui.ini
 
+# 运行期配置（E03 设置层级）。仓库里只留 config/README.md 与
+# render.example.json ——**用户自己的覆盖**不该进版本控制。
+# 正常跑起来这些文件落在 build/bin/config/（已被上面的 build/ 忽略），
+# 这两条是防"从仓库根目录启动编辑器"时把个人设置提上去。
+/config/render.json
+/config/render_prefs.json
+/config/editor_layout.json
+/config/editor_prefs.json
+
 # 截图工具（tools/capture_window.py）的默认输出落在仓库根目录。
 # 只忽略根目录的 png，assets/ 下的贴图不受影响。
 /*.png

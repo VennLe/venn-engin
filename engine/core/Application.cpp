@@ -46,6 +46,41 @@ int Application::run(uint64_t maxFrames) {
 
     uint64_t frameCounter = 0;
 
+    // ================= 窗口什么时候露面 =================
+    //
+    // 用户报的现象：编辑器启动时"闪白一下"。根因是窗口一创建就 ShowWindow，
+    // 而 Vulkan 的第一帧还没呈现上去 —— 系统拿窗口类的**白刷**把客户区擦了
+    // 一遍，于是先看到一块纯白，下一帧才被渲染结果盖掉。
+    //
+    // 现在窗口是**隐藏创建**的（见 core/Window 构造函数的注释，那里同时还
+    // 解决任务栏图标），这里负责在"第一帧已经呈现之后"再显示它。
+    //
+    // 再叠加 2 秒缓冲（用户明确要求"缓冲两秒再直接打开完整的窗口"）：
+    // 这两秒不是干等 —— 主循环照跑，着色器预编译 / 场景构建 / 纹理流式
+    // 上传都在这两秒里一帧一帧做完。所以窗口出现时已经是**能用的完整界面**，
+    // 而不是边加载边闪的半个界面。
+    //
+    // ⚠ 自动化跑**不缓冲**：脚本要尽早拿到窗口去送键鼠 / 截图，白等 2 秒
+    //   既浪费又可能踩到脚本自己的超时。判定见 automationRun 那一串
+    //   （工程里所有 verify 脚本至少会设其中一个）。
+    //
+    // MYVK_STARTUP_DELAY=1：**强制**保留这两秒，即使上面那串自动化变量已经
+    //   设了。为什么需要这个口子：验证"启动不闪白 + 确实是缓冲 2 秒才出现"
+    //   必须在**不设** MYVK_NO_WINDOW_SAVE 的情况下跑（那个变量同时关掉了
+    //   imgui.ini 存档），可它一设就把这个延迟也跳过了。于是加一个显式开关，
+    //   让测试既能拿到"延迟生效"，又能靠 MYVK_NO_WINDOW_SAVE 不写盘。
+    const bool startupAutomation =
+        std::getenv("MYVK_FRAMES") || std::getenv("MYVK_NO_WINDOW_SAVE") ||
+        std::getenv("MYVK_LOG_RECTS") || std::getenv("MYVK_HIDE_UI") ||
+        std::getenv("MYVK_EDITOR_NO_HUD");
+    const bool forceStartupDelay = [] {
+        const char* s = std::getenv("MYVK_STARTUP_DELAY");
+        return s && s[0] != '0';
+    }();
+    constexpr double kStartupShowDelay = 2.0;
+    double elapsedSec = 0.0;
+    bool windowShown = false;
+
     // 截图对比用：隐藏全部 UI。任何逐帧变化的东西（FPS 数字）都会让
     // "剔除开 vs 关"的像素对比永远失败，所以必须能把它关掉。
     const bool hideUi = [] {
@@ -98,7 +133,23 @@ int Application::run(uint64_t maxFrames) {
         if (m_assets) m_assets->tickTextureStreaming();
 
         // 渲染一帧
-        m_renderer->drawFrame(activeScene());
+        // ⚠ 默认由这里画；运行时（ownsFrameRendering()==true）自己在
+        //   GameLoop 的 render 相位里画（见 Application.h 的说明）。
+        //   两种情况都是**每帧恰好一次**。
+        if (!ownsFrameRendering()) m_renderer->drawFrame(activeScene());
+
+        // ---- 首帧已呈现 → 决定要不要让窗口露面（见上面那段注释）----
+        // 顺序：要缓冲就**必须**等满 kStartupShowDelay（哪怕在自动化跑里，
+        // 只要 MYVK_STARTUP_DELAY 显式要求）；否则自动化跑立刻露面、正常
+        // 跑等满两秒。
+        if (!windowShown) {
+            elapsedSec += m_time.deltaTime();
+            const bool buffering = forceStartupDelay || !startupAutomation;
+            if (buffering ? (elapsedSec >= kStartupShowDelay) : true) {
+                m_window->show();
+                windowShown = true;
+            }
+        }
 
         // 帧末：按键边沿状态推移
         Input::endFrame();

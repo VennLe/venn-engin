@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "generator": "Venn/SceneSerializer",
+  "physics": {
+    "enabled": true,
+    "gravity": [0, 0, -9.81],
+    "groundPlane": true,
+    "fixedTimeStep": 0.0166666675,
+    "maxSubSteps": 4,
+    "velocityIterations": 8,
+    "positionIterations": 3,
+    "baumgarte": 0.2,
+    "slop": 0.005,
+    "allowSleep": true,
+    "sleepLinearThreshold": 0.05,
+    "sleepAngularThreshold": 0.15,
+    "sleepTime": 0.5
+  },
+  "entities": [
+    {
+      "name": "DropA",
+      "parent": -1,
+      "transform": {"position": [0, 0, 6], "rotation": [0, 0, 0], "scale": [1, 1, 1]},
+      "mesh": {"kind": "builtin", "shape": "cube", "size": 1.0, "name": "cube"},
+      "rigidbody": {
+        "bodyType": 2, "shape": 2,
+        "radius": 0.5, "halfHeight": 0.5, "halfExtents": [0.5, 0.5, 0.5],
+        "mass": 0.0, "density": 500.0,
+        "staticFriction": 0.6, "dynamicFriction": 0.4, "restitution": 0.0,
+        "linearDamping": 0.05, "angularDamping": 0.05,
+        "useGravity": true, "allowSleep": true,
+        "initialVelocity": [0, 0, 0], "initialAngularVelocity": [0, 0, 0]
+      }
+    },
+    {
+      "name": "DropB",
+      "parent": -1,
+      "transform": {"position": [0.2, 0, 9], "rotation": [0, 0, 0], "scale": [1, 1, 1]},
+      "mesh": {"kind": "builtin", "shape": "cube", "size": 1.0, "name": "cube"},
+      "rigidbody": {
+        "bodyType": 2, "shape": 2,
+        "radius": 0.5, "halfHeight": 0.5, "halfExtents": [0.5, 0.5, 0.5],
+        "mass": 0.0, "density": 500.0,
+        "staticFriction": 0.6, "dynamicFriction": 0.4, "restitution": 0.0,
+        "linearDamping": 0.05, "angularDamping": 0.05,
+        "useGravity": true, "allowSleep": true,
+        "initialVelocity": [0, 0, 0], "initialAngularVelocity": [0, 0, 0]
+      }
+    },
+    {
+      "name": "Bounce",
+      "parent": -1,
+      "transform": {"position": [2.5, 0, 5], "rotation": [0, 0, 0], "scale": [1, 1, 1]},
+      "mesh": {"kind": "builtin", "shape": "sphere", "size": 1.0, "name": "sphere"},
+      "rigidbody": {
+        "bodyType": 2, "shape": 1,
+        "radius": 0.5, "halfHeight": 0.5, "halfExtents": [0.5, 0.5, 0.5],
+        "mass": 5.0, "density": 500.0,
+        "staticFriction": 0.4, "dynamicFriction": 0.3, "restitution": 0.6,
+        "linearDamping": 0.0, "angularDamping": 0.05,
+        "useGravity": true, "allowSleep": false,
+        "initialVelocity": [0, 0, 0], "initialAngularVelocity": [0, 0, 0]
+      }
+    },
+    {
+      "name": "Wall",
+      "parent": -1,
+      "transform": {"position": [-4, 0, 1.5], "rotation": [0, 0, 0], "scale": [1, 1, 1]},
+      "mesh": {"kind": "builtin", "shape": "cube", "size": 1.0, "name": "cube"},
+      "rigidbody": {
+        "bodyType": 0, "shape": 2,
+        "radius": 0.5, "halfHeight": 0.5, "halfExtents": [0.25, 4.0, 1.5],
+        "mass": 0.0, "density": 500.0,
+        "staticFriction": 0.6, "dynamicFriction": 0.4, "restitution": 0.0,
+        "linearDamping": 0.05, "angularDamping": 0.05,
+        "useGravity": false, "allowSleep": false,
+        "initialVelocity": [0, 0, 0], "initialAngularVelocity": [0, 0, 0]
+      }
+    }
+  ]
+}

@@ -350,7 +350,13 @@ void collectColliders(scene::Scene& scene, std::vector<Collider>& out) {
     out.reserve(ents.size());
     for (ecs::Entity e : ents) {
         Collider c;
-        if (buildCollider(scene, e, c)) out.push_back(std::move(c));
+        if (buildCollider(scene, e, c)) {
+            // 刚体实体由 PhysicsWorld 驱动位置，不参与这里的"各推一半"分离
+            // （见 Collider::physicsDriven 的说明）。
+            c.physicsDriven =
+                scene.world().has<ecs::RigidBodyComponent>(e);
+            out.push_back(std::move(c));
+        }
     }
 }
 
@@ -375,16 +381,16 @@ int resolveBodyOverlaps(scene::Scene& scene, int iterations,
 
     std::size_t solidCount = 0;
     for (const Collider& c : cols)
-        if (c.solid) ++solidCount;
+        if (c.solid && !c.physicsDriven) ++solidCount;
     if (solidCount < 2) return 0;
 
     int touched = 0;
     for (int it = 0; it < iterations; ++it) {
         bool any = false;
         for (std::size_t i = 0; i < cols.size(); ++i) {
-            if (!cols[i].solid) continue;
+            if (!cols[i].solid || cols[i].physicsDriven) continue;
             for (std::size_t j = i + 1; j < cols.size(); ++j) {
-                if (!cols[j].solid) continue;
+                if (!cols[j].solid || cols[j].physicsDriven) continue;
                 if (!aabbOverlap(cols[i], cols[j])) continue;
 
                 TransformedShape sa{&cols[i].shape, cols[i].world};

@@ -418,7 +418,7 @@ struct PanelDesc {
 | 面板 | 状态 | 归属工作区 | 备注 |
 |---|---|---|---|
 | Hierarchy | ✅ 已有 | Level | 场景树 |
-| Inspector | ✅ 已有 | 全部 | 对象属性（含 材质/贴花/灯/碰撞） |
+| Inspector | ✅ 已有 | 全部 | 对象属性。**左列 11 个图标页签 + 右侧一页内容**（Object / Tool / Render / Output / Scene / World / Particles / Physics / Material / Animation / All），见 `E11.1` |
 | ContentBrowser | ✅ 已有 | 全部 | 资产 |
 | Viewport | ✅ 已有 | 全部 | 视口 + 浮层 |
 | Stats | ✅ 已有 | Debug/Rendering | 帧统计 + GPU 时戳 |
@@ -650,7 +650,7 @@ CI / 回归前跑一次。**这是"以后新功能也会想着 UI"的机器保�
 | L4 交互 | `editor/ConsolePanel.*`（E16，命令行 `set/get/reset/params/preset/stat`）；命令面板 / 设置撤销 / 通知进度仍未做 | 🟡 部分 |
 | L5 自动化 | `LogTap` + `MYVK_LOG_RECTS` + `MYVK_EDITOR_NO_HUD` + **`VP-OVERLAY` 一类"只在状态变化时打"的状态日志**；每个面板一支 `verify_*.py` | ✅ |
 
-**两条后来才确立的实现约定**（写代码前先读）：
+**三条后来才确立的实现约定**（写代码前先读）：
 
 1. **编辑器侧的注入 env 一律带 `MYVK_EDITOR_` 前缀**（`MYVK_EDITOR_CB_TYPE` /
    `_INSP_SEARCH` / `_HIER_FILTER` / `_VP_LAYOUT` …）。`tools/check_feature_surface.py`
@@ -659,6 +659,14 @@ CI / 回归前跑一次。**这是"以后新功能也会想着 UI"的机器保�
 2. **视图浮层是视口窗口的 ImGui 子窗口**（不是独立顶层窗口）——
    视口窗口每帧都被 `BringWindowToDisplayFront`，独立窗口会被它盖住。
    显隐分两层：总闸 `m_showOverlay` × 四块各自的开关（`EditorContext::ViewportOverlay`）。
+3. **主题与语言是"横切展示层"，不进业务逻辑**（2026-10-17 确立）：
+   - **主题**（`engine/ui/ImGuiTheme.*`）：尺寸度量与颜色**解耦**，颜色收敛到 `ThemeTokens`
+     的语义槽；调色板集中在 `themeVennDark()` / `deriveDark()` / `deriveLight()`。
+     **调用点只认 `ui::tokens()` 的槽名，不写字面色值**（否则浅色主题下必留"深色孤岛"）。
+   - **语言**（`editor/Localization.*`）：**源码里只写英文**，中文是 `tr()` 的**运行时映射**；
+     窗口标题一律走 `trId(en,id)` 保住 `###id`。任何"把中文写回业务逻辑"的做法都算违反契约
+     （会污染字符串比较 / 序列化 key / ImGui ID）。
+   - 两者都通过**偏好表**持久化（`theme` / `language` 两个 int 键），与其它偏好同一套落盘路径。
 
 ## 附录 B · 设计取舍（诚实记录）
 
@@ -678,3 +686,150 @@ CI / 回归前跑一次。**这是"以后新功能也会想着 UI"的机器保�
 `TAA_`/`SKY_`/`SHADER_`/`LOD_`/`LOCAL_`/`DOF_`(各 4) · `VIGNETTE_`/`SSGI_`/`SSAO_`/
 `POM_`/`MB_`/`HIZ_`/`FOG_`(各 3) · 其余 2 个以内。
 **其中约 60% 目前编辑器里没有任何入口** —— 这就是 E1 阶段要清零的欠账。
+
+---
+
+## 附录 D · 运行时（`Game.exe`）进场后的分层（2026-10-17 起）
+
+M1（`docs/ship_roadmap.md` §4）把"只有一个 `Editor.exe`"这个结构性缺陷抹掉了。
+本附录记下**从那天起**必须遵守的三件事 —— 它们是"编辑器能编译"再也不能证明的东西。
+
+### D.1 三个 CMake 目标 / 两个产物
+
+| target | 源 | 产物 | 说明 |
+| --- | --- | --- | --- |
+| `VennEngine`（STATIC） | `engine/**` | `VennEngine.lib` | 只依赖第三方（Vulkan/GLFW/ImGui/tinygltf/stb）。**不认识 `editor/`、不认识 `runtime/`** |
+| `VennEditor` | `editor/**` | `Editor.exe`（`OUTPUT_NAME`） | 链 `VennEngine` |
+| `VennRuntime` | `runtime/**` | `Game.exe`（`OUTPUT_NAME`） | 链 `VennEngine` |
+
+**依赖方向单向**：`runtime → engine ← editor`。
+
+> ⚠ 改名陷阱：`add_executable(Editor ...)` 改成 `VennEditor` 之后，所有
+> `add_dependencies(Editor ...)` / `target_link_options(Editor ...)` /
+> `myvk_copy_runtime_assets(Editor)` 都要同步改，否则 CMake 配置阶段就报
+> target 不存在。产物名靠 `set_target_properties(... OUTPUT_NAME Editor)` 保住。
+> `add_library(venn ALIAS VennEngine)` 保住旧引用。
+
+> ⚠ 资产拷贝：**必须**是"无输出文件的 custom target + `ALL`"（现在叫
+> `VennShadersCopy` / `VennAssetsCopy`，`if(NOT TARGET)` 守卫全局只建一次）。
+> **禁用 `add_custom_command(TARGET ... POST_BUILD)`** —— 它只在**重新链接**
+> 时跑，改了 shader/贴图不会生效（老坑，见 MEMORY）。
+
+### D.2 编辑器那边**不许**再自己实现的三件事
+
+它们已经搬到引擎层，编辑器与运行时**共用同一份**（`engine/physics/ScenePhysics.{h,cpp}`）：
+
+1. 场景 → 物理世界的构建（显式形状 / Auto 网格 AABB / 兜底 0.5m 球 / 地面半空间 / 密度→质量 / 休眠开关）
+2. 运动学体同步（实体 → 刚体，步进前）
+3. 写回实体变换（只写动态体，步进后）
+
+以及两个数学工具：`eulerXYZFromMatrix()`（站内约定 **R = Rx·Ry·Rz**）、`scaleShapeForWorld()`（缩放烘进尺寸）。
+
+**为什么这是硬约束**：`ship_roadmap.md` §15 风险 #10 是"编辑器里调好的手感出包后不一样"。
+靠"两边都记得同步改"是防不住的 —— 只有**同一份二进制**才防得住。
+`tools/verify_runtime_loop.py` 的 D 组就是把这件事钉成断言：同一场景、同一 `MYVK_FIXED_DT`，
+编辑器 Play 与 `Game.exe` 的 `PHYS-BODY` 行**逐字符相同**。
+
+### D.3 两个新接缝
+
+1. **`core::Application::ownsFrameRendering()`**（默认 `false`）
+   运行时重写成 `true`：`GameLoop` 把"渲染"当作一个**可计数的相位**，所以不让基类在
+   `onUpdate` 之后补画一次。⚠ 重写成 `true` 之后**必须**在 `onUpdate` 里真的画一次。
+2. **`core::setLogSink()` 换消费者**
+   编辑器挂 Console 面板的环形缓冲，运行时挂文件 sink（`runtime/RuntimeLog.cpp`）。
+   sink 是**单消费者**，这是它的设计前提 —— 别再挂第二个。
+
+### D.4 `engine/script/` 与 namespace `vks`
+
+`.vks` 脚本引擎从 `editor/script/` 搬到 `engine/script/`（`git mv`，历史可 `--follow`），
+namespace 从 `editor` 改成 **`vks`**（选它而不是 `engine::script`：`.vks` 就是语言名，
+也不与目录级通用名撞车）。
+
+> ⚠ 在 `editor/EditorApp.h` 里前置声明它时，`namespace vks { class ScriptEngine; }`
+> 必须写在 `namespace editor` **外面** —— 写进去会变成嵌套的 `editor::vks`，
+> 把外层的 `::vks` 遮住（症状看起来像"少 include"）。这与 `physics` 的处理完全同源。
+
+### D.5 运行时侧的五件套同样成立
+
+`runtime/**` 已进 `run_regression.py` 的 `WATCH_ROOTS`（之前不在 → 改运行时一个字节
+都不会被影响分析看见）。三条用例全部登记在 `TRIGGERS` 的 `runtime/**` 名下，
+**三条一起跑**是故意的：只挂一条会让 `--narrow` 把另外两条判成"不受影响"。
+
+---
+
+## 附录 E · 设置层级（E03，2026-10-17 起）
+
+E01 把"每个旋钮"收敛成了**一处存储**，但存储只有一层（默认值 + env）。
+E03 在它外面套了**五层覆盖链**：
+
+```
+Editor Preferences   跨项目（config/render_prefs.json）
+  └─ Project         config/render.json      ← 唯一有磁盘写入口的一层
+      └─ Scene       场景文件内嵌块          （schema 改动属 E20）
+          └─ Object  实体组件
+              └─ Camera  相机组件
+```
+
+读的时候从**最具体往最泛**回退，一路没有就用出厂默认。实现全在
+`engine/render/RenderSettingsIO.{h,cpp}`，引擎层持有唯一一份
+（`render::activeChain()`），编辑器与运行时**共用** —— 与
+`engine/physics/ScenePhysics.*` 同一个理由：同一个参数不该因为"谁来跑"
+而有两套值。
+
+### E.1 两个独立的应用标记（这条最容易写错）
+
+`FeatureRegistry` 的每条绑定有 **两个**"处理过没有"：
+
+| 标记 | 谁置位 | 数据源 |
+| --- | --- | --- |
+| `applied` | `loadEnvOverrides()` | `MYVK_*` |
+| `settingsApplied` | `takeUnappliedBindings()` | 覆盖链 |
+
+**为什么不能合成一个**：绑定是**分阶段**发生的（构造期一批，
+`createMainTarget` 之后又来一批 post 参数）。如果共用一个标记，第二个阶段
+调用 `loadEnvOverrides()` 时会认为"这批已经处理过"，env 就写不进去了；
+反过来先应用文件层再应用 env，env 又能把文件值盖掉 —— 所以每个阶段的
+顺序被钉死成：
+
+```cpp
+bindXxxFeatureParams();
+render::loadStartupLayers();   // 只读一次，幂等
+render::applyToRegistry();     // 文件层（只处理未处理过的绑定）
+render::loadEnvOverrides();    // env 永远最后写 = 永远赢
+```
+
+### E.2 校验规则必须与 env 完全一致
+
+文件层的值只走 env 那一套（拒绝非有限值 / `minAccept,maxAccept` /
+`clampLo,clampHi`），**不**额外按 ParamDesc 的 UI 范围 `lo,hi` 夹紧。
+
+> ⚠ 已经踩过：`lshadow.bias` 的 UI 范围是 `0~1`，而它的默认 z 分量是
+> `1.2`。按 UI 夹紧的话，一次"导出 → 重载"就会把默认值本身改坏，
+> 而且**不报错**（只是画面悄悄变了）。
+
+### E.3 三条硬约束（等价于 E03 之前的"逐像素不变"）
+
+1. **无 `config/render.json` = 零动作**：不读、不写、**一条日志都不打**。
+   `verify_settings_layers` 的 B1 就是数 `RENDER-SET` 的出现次数（必须是 0）。
+2. **首次运行不自动生成文件**：只有"用户真的改过参数"（关闭编辑器时落盘）
+   或点了 Engine 面板的 **Export current** 才写。否则一次手动会话就会在
+   仓库里留下一个 json，把所有像素基线悄悄换掉。
+3. **自动化运行不读默认路径、写一律拒绝**（`MYVK_FRAMES` /
+   `MYVK_NO_WINDOW_SAVE` 即为自动化）。显式 `MYVK_RENDER_SETTINGS=<path>`
+   照读 —— 那是脚本自己要的路径。
+
+### E.4 落盘的形状是"最小覆盖集"
+
+`captureFromRegistry()` 只抓**与默认值不同**的键，所以：
+
+- 导出 → 重载是**逐位往返**（自检 `E3_roundtrip_bitwise`）；
+- 文件里读不到"和默认一样"的噪音；
+- 用户改回默认值后，那一项会**从文件里消失**（而不是留一个等于默认的键）。
+
+### E.5 校验入口
+
+- 无窗口：`Editor.exe` + `MYVK_RENDER_SETTINGS_TEST=1`（`SET-TEST` /
+  `SET-TOTAL`，与 `MYVK_PHYS_TEST` 同一条"在 Vulkan 之前 return"的路）
+- 端到端：`tools/verify_settings_layers.py`（已进 `DEFAULT` + `TRIGGERS`）
+- 格式说明与示例：`config/README.md`、`config/render.example.json`
+  （示例文件本身被 J 组当输入校验 —— **文档里的例子不能是假的**）

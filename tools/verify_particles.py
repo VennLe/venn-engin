@@ -15,10 +15,14 @@ R6-1 是一条**和主链解耦**的 GPU 链路：
 
   ② **确定性**（这是整个模块的设计前提，不是附加要求）
      · 随机数是 (槽位, 出生时刻) 的纯哈希，没有 CPU/GPU 状态；
-     · 所以 MYVK_FX_FREEZE=N 把模拟钉在第 N 步之后，同配置两次运行
-       **状态逐位一致**（alive / draws / maxAlive / simFrame / inst 全同）
-       —— 这一条同时也是"模拟真的按固定步长推进"的证据。
-     · ⚠ 但**像素**做不到逐像素一致：池分槽 + atomicAdd 顺序让它有一个
+     · 所以 MYVK_FX_FREEZE=N 把模拟钉在第 N 步**附近**：**真确定**的字段
+       （cap / emitters / frozen / instAlpha）跨运行精确相同；**"冻结那一刻
+       截到哪一槽"**决定的字段（alive / draws / instAdd / maxAlive /
+       simFrame）只有**有界**的差（实测极差 4 / 4 / 4 / 1 / 1）。根因是
+       池按 frames-in-flight 分槽 + 一帧可补多步，见 B1 的注释。
+     · 而"冻结之后真的停住"是**精确**可验的：同一趟里冻结后的所有 FX-DUMP
+       样本逐字段相同（B3b）。
+     · ⚠ **像素**更做不到逐像素一致：池分槽 + atomicAdd 顺序让它有一个
        1.4~2.1 / 255 的非零下界。本组因此只断言"差有界"，不主张一致 ——
        完整实测表与两条根因见 FX_PIXEL_BOUND 的注释。
 
@@ -70,15 +74,19 @@ R6-1 是一条**和主链解耦**的 GPU 链路：
          不再生效。）
   F. 速度与帧率解耦
      · F1 不冻结：simFrame > 0（模拟真的在推进）；
-     · F2 dispatches > simFrame（每渲染帧派发一次，而一帧只推进 0..8 个
-          固定步 —— 高帧率下派发数远大于步数，这就是"速度与帧率解耦"的
-          直接证据；两者相等则说明模拟还被帧率牵着走）。
+     · F2 dispatches >= 2 × simFrame（每渲染帧派发一次，而模拟按**墙钟**
+          推进固定步 —— 派发数远大于步数就是"速度与帧率解耦"的直接证据；
+          两者相等则说明模拟还被帧率牵着走）。
         ⚠ 本组必须带 MYVK_FX_DBG=1 —— FX-DUMP 挂在 Renderer 的诊断闸门
           后面，不设这个变量一行都不打（第一版漏了，F1 报"没拿到 FX-DUMP"，
           看起来像"模拟没跑"，其实只是诊断没开）。
+        ⚠⚠ 还必须 **MYVK_FX_HZ=8**（把模拟频率压到远低于帧率）：编辑器
+          vsync 锁 60fps、simHz 默认也是 60，两者本来就 1:1，F2 恒不成立
+          （实测 dispatches=182 / simFrame=183）。理由与判别力详见 F 段注释。
   G. 排序模式
-     · G1 sortMode=ByDistance 不崩、零 VUID，且**存活数与 None 相同**
-          （排序只改顺序，不改数量）。
+     · G1 sortMode=ByDistance 不崩、零 VUID，且**存活数与 None 有界一致**
+          （排序只改顺序、不改数量；两次独立运行的瞬时计数本来就有界差
+           1~4，所以比"有界"而不是 `==`，理由见 B1 注释）。
 
 用法：
     python tools/verify_particles.py
@@ -290,16 +298,30 @@ def image_run(exe, scene, out_png, env_extra):
     return lines, vp, img, errs
 
 
-def last_fxdump(lines):
-    """最后一条 FX-DUMP 的字段字典。"""
-    for ln in reversed(lines):
+FXDUMP_KEYS = ["enabled", "slot", "emitters", "alive", "spawned", "cap",
+               "draws", "maxAlive", "dispatches", "readback", "frozen",
+               "simFrame", "instAdd", "instAlpha"]
+
+
+def all_fxdumps(lines):
+    """日志里**所有** FX-DUMP → 字段字典列表（按时间序）。
+
+    B3b 要用它 —— "冻结之后真的不动了"只能靠**同一趟里的多个样本互相相等**
+    来证明（跨趟比较只能有界，见 B1 的注释）。
+    """
+    out = []
+    for ln in lines:
         m = FXDUMP_RE.search(ln)
         if m:
-            k = ["enabled", "slot", "emitters", "alive", "spawned", "cap",
-                 "draws", "maxAlive", "dispatches", "readback", "frozen",
-                 "simFrame", "instAdd", "instAlpha"]
-            return dict(zip(k, (int(m.group(i + 1)) for i in range(14))))
-    return None
+            out.append(dict(zip(FXDUMP_KEYS,
+                                (int(m.group(i + 1)) for i in range(14)))))
+    return out
+
+
+def last_fxdump(lines):
+    """最后一条 FX-DUMP 的字段字典。"""
+    ds = all_fxdumps(lines)
+    return ds[-1] if ds else None
 
 
 def last_fxparams(lines):
@@ -438,6 +460,14 @@ def main():
 
     a2 = capture_pair(s_none, [{"MYVK_FX": "0"}, {"MYVK_FX": "1"}],
                       ["fx_a_fxoff.png", "fx_a_fxon_noent.png"])
+    # ⚠ `err_a2` / `err_a3` 必须**先初始化**：抓图失败时下面的 else 分支不会执行，
+    #   而 A4 无条件拼 `err_a2 + err_a3 + err_on` → 曾经直接抛
+    #   `UnboundLocalError: cannot access local variable 'err_a2'`，
+    #   脚本带着 traceback 死掉、**永远走不到结尾的 `结果:` 行** →
+    #   回归里只看到 rc=1 和一个 Python 堆栈，看不出是哪条断言红了。
+    #   抓图失败是**已知会发生**的情形（窗口被抢占 / 进程提前退出），
+    #   所以这条路径必须是"判 FAIL + 报清楚"，不能是崩溃。
+    err_a2, err_a3 = [], []
     if a2 is None:
         check(False, "A2 抓图失败（视口图缺失）")
     else:
@@ -489,30 +519,71 @@ def main():
     d1 = last_fxdump(l_on)
     d2 = last_fxdump(l_b1b)
 
-    # ---- B1：**状态**逐位一致（这一条才是"确定性"的验收面）----
+    # ---- B1：**状态**一致 —— 真确定的字段精确比，机制允许的字段比**有界** ----
     #
     # 固定步长 + 纯哈希随机数（(槽位, 出生时刻) → 没有 CPU/GPU 状态）⇒
-    # 给定"第 N 步"的状态是完全确定的。这条断言**精确**，不设阈值。
+    # 给定"第 N 步"的状态是完全确定的。但 **"停在第 N 步"这件事本身**做不到
+    # 逐位确定，两条来源都关不掉（归档「固有不确实性①」+ Renderer 冻结分支）：
+    #   ① 池按 frames-in-flight 分槽，每槽只在自己被派发时推进
+    #      （dtSlot = elapsedFrames × dt）。冻结时各槽停在**各自的最后一步**
+    #      （彼此差 1~2 步），而"哪一槽是最后被派发的"由**墙钟帧号**
+    #      （m_currentFrame）决定 ⇒ 两次运行截到的槽不同 ⇒ 边界处那几颗粒子
+    #      生/死不同。本场景 rate=260/s、simHz=60 ⇒ 一步 ≈ 4.3 颗。
+    #   ② 累加器允许**一帧补多步**（kMaxSimStepsPerFrame = 8）⇒ 越过 FREEZE
+    #      的那一帧可能从 119 直接跳到 12x ⇒ simFrame 落在 [120, 127]。
     #
-    # ⚠ 只比这些字段，`dispatches` / `spawned` 不比：它们与**墙钟**有关 ——
+    # 2026-10-16 实测（FREEZE=120，同配置连跑 5 次，`_probe_b1.py`）：
+    #     alive 365..369（极差 4）· draws 同 · instAdd 同
+    #     maxAlive 371..372（极差 1）· simFrame 120..121（极差 1）
+    #     cap / emitters / frozen / instAlpha **全部相同**（这几个是真确定的）
+    # ⇒ 口径：`EXACT_KEYS` 精确比；`BOUND_KEYS` 给机制 2 倍余量（不是"随便差"）。
+    #   确定性真坏了（哈希改了、步长失控）差值会是几十上百，照样抓得住。
+    #
+    # ⚠ 为什么原来那句"逐位一致"会随机红：它照抄了引擎 `FX-FREEZE` 日志里
+    #   的一句**过度承诺**（"state is now reproduced bit-for-bit across runs"，
+    #   Renderer.cpp 的冻结分支）。那句话本身不成立 —— 见上面 ① ②。
+    #
+    # ⚠ `dispatches` / `spawned` 不比：它们与**墙钟**有关 ——
     #   dispatches = 渲染帧数（每帧派发一次），spawned = 上一轮回读的每帧
     #   发射计数。同一台机器两次跑的帧数天然不同（实测 773 vs 1548）。
-    STATE_KEYS = ["frozen", "alive", "draws", "cap", "maxAlive", "simFrame",
-                  "instAdd", "instAlpha", "emitters"]
+    EXACT_KEYS = ["frozen", "cap", "emitters", "instAlpha"]
+    # simFrame 的容差 = kMaxSimStepsPerFrame - 1（见上面 ②）
+    BOUND_KEYS = {"alive": 8, "draws": 8, "instAdd": 8, "maxAlive": 2,
+                  "simFrame": 7}
     if d1 is None or d2 is None:
         check(False, "B1 没拿到 FX-DUMP")
     else:
-        diffk = [k for k in STATE_KEYS if d1[k] != d2[k]]
-        check(not diffk,
-              "B1 冻结帧两次运行 → 状态逐位一致 (%s) [alive=%d simFrame=%d]"
-              % (",".join("%s:%d!=%d" % (k, d1[k], d2[k]) for k in diffk)
-                 if diffk else "全部相同", d1["alive"], d1["simFrame"]))
+        ex_k = [k for k in EXACT_KEYS if d1[k] != d2[k]]
+        bd_k = [k for k, tol in BOUND_KEYS.items()
+                if abs(d1[k] - d2[k]) > tol]
+        detail = ", ".join(
+            ["%s:%d!=%d" % (k, d1[k], d2[k]) for k in ex_k]
+            + ["%s:差%d>%d" % (k, abs(d1[k] - d2[k]), BOUND_KEYS[k])
+               for k in bd_k]) or "确定字段全同、跨槽字段均在界内"
+        check(not ex_k and not bd_k,
+              "B1 冻结帧两次运行 → 状态一致（%s）[alive=%d simFrame=%d]"
+              % (detail, d1["alive"], d1["simFrame"]))
         check(d1["frozen"] == 1, "B2 FX-DUMP frozen=1（模拟真的停住了）")
-        # "第 N 步之后"这条语义：推到的步号必须**正好**是 FREEZE 值，
-        # 且两次运行相同 —— 否则"给定步号就能复现"这句话不成立。
-        check(d1["simFrame"] == 120,
-              "B3 simFrame 正好停在 FREEZE=120 上 (simFrame=%d)"
+        # "第 N 步之后"这条语义：**至少**推到 FREEZE，且不越过"一帧最多补
+        # kMaxSimStepsPerFrame 步"的上限 —— 越上限就说明累加器失控。
+        # ⚠ 原来写的是 `== 120`（正好），实测 5 次里有 1 次是 121。
+        check(120 <= d1["simFrame"] <= 120 + 7,
+              "B3 simFrame 停在 FREEZE=120 附近 (simFrame=%d ∈ [120,127])"
               % d1["simFrame"])
+        # B3b：**冻结之后真的不动了**。跨趟比较只能有界，但"停住"本身是**精确**
+        #      可验的：同一趟里冻结后的所有 FX-DUMP 样本，**状态字段**必须
+        #      逐个相同。（每 30 帧一条；freeze 在第 120 步 ≈ 2s 时发生，
+        #      一趟 ~20s → 冻结后还有几十条样本。）
+        #      ⚠ 不能拿整条字典比 —— `slot`（帧号）冻结后**仍在涨**，
+        #        那是"这一帧是第几帧"，不是粒子状态。
+        st = ["frozen", "alive", "draws", "cap", "maxAlive", "simFrame",
+              "instAdd", "instAlpha", "emitters"]
+        froz = [tuple(d[k] for k in st)
+                for d in all_fxdumps(l_on) if d["frozen"] == 1]
+        same = len(set(froz)) == 1 if froz else False
+        check(len(froz) >= 2 and same,
+              "B3b 冻结后 %d 条样本状态逐字段相同（模拟真的停住了）"
+              % len(froz))
         check(d1["alive"] > 0,
               "B4 冻结时还有粒子活着 (alive=%d)" % d1["alive"])
         check(d1["instAdd"] + d1["instAlpha"] == d1["alive"],
@@ -681,18 +752,33 @@ def main():
     #   `m_particleDbg` 闸门后面（Renderer.cpp 的 `if (m_particleDbg && ...)`），
     #   不设这个变量就一行都不打 —— 第一版这里漏了，F1 报的是"没拿到
     #   FX-DUMP"，看起来像"模拟没跑"，其实只是诊断没开。
-    # 另外 FX-DUMP 是 `%30==1`（第 1/31/61/… 帧），200 帧里有 7 条。
+    # 另外 FX-DUMP 是 `%30==1`（第 2/32/62… 帧），200 帧里有 ~7 条。
+    #
+    # ⚠⚠ **必须把 simHz 压到远低于帧率**，否则 F2 恒不成立。
+    #   两个量（Renderer.cpp 的 FX-DUMP 注释）：
+    #     dispatches = 模拟 compute **派发**了几次 ≈ 渲染帧数（每帧一次）；
+    #     simFrame   = 模拟推进了几个**固定步** = 模拟时刻 × simHz。
+    #   编辑器 vsync 锁 60fps，而 simHz 默认**也是 60** ⇒ 两者本来就是 1:1，
+    #   实测 `dispatches=182 / simFrame=183`（§15.3 记的是 182 vs 182）。
+    #   这不是"功能坏了"，是**这台机器上这个配置根本不区分**。
+    #   特性存在的场景恰恰是"帧率远高于模拟频率"（高帧率不再快放），所以
+    #   把 simHz 降到 8：期望 simFrame ≈ 经过秒数 × 8，而 dispatches ≈ 帧数
+    #   → 两者差**一个数量级**，正是注释里承诺的那种证据。
+    #   判别力：旧行为（每帧一步、不看墙钟）下 simFrame == dispatches，
+    #   `dispatches >= 2*simFrame` 必然红 ⇒ 这条断言能区分新旧。
+    #   （阈值取 2× 而不是"一个数量级"是留余量：帧率掉到 16fps 也还成立。）
     l_f = run_frames(exe, {"MYVK_EDITOR_SCENE": s_new, "MYVK_FX": "1",
-                           "MYVK_FX_DBG": "1"}, frames=200)
+                           "MYVK_FX_DBG": "1", "MYVK_FX_HZ": "8"}, frames=200)
     df = last_fxdump(l_f)
     if df is None:
         check(False, "F1 没拿到 FX-DUMP")
     else:
         check(df["simFrame"] > 0,
               "F1 simFrame=%d > 0（模拟真的在推进）" % df["simFrame"])
-        check(df["dispatches"] > df["simFrame"],
-              "F2 dispatches=%d > simFrame=%d（速度与帧率解耦）"
-              % (df["dispatches"], df["simFrame"]))
+        check(df["simFrame"] * 2 <= df["dispatches"],
+              "F2 dispatches=%d >= 2*simFrame=%d（派发远多于步数 = "
+              "模拟按墙钟走，与帧率解耦）"
+              % (df["dispatches"], df["simFrame"] * 2))
 
     # =============================================================== G
     print("\n[G] 排序模式")
@@ -705,9 +791,15 @@ def main():
           "G1a sortMode=ByDistance 正常运行 (alive=%s)"
           % (dg["alive"] if dg else None))
     if dg is not None and d1 is not None:
-        check(dg["alive"] == d1["alive"],
-              "G1b 排序只改顺序不改数量 (alive %d == %d)"
-              % (dg["alive"], d1["alive"]))
+        # ⚠ 原来是 `==`（严格相等）。但 dg 与 d1 来自**两次独立运行**，
+        #   各取一条瞬时计数 —— 冻结帧跨运行本来就有界差 1~4（见 B1 注释），
+        #   所以 `==` 会随机红（§15、§17 都记到过 G1b 红）。
+        #   排序只该改**顺序**，不该改**数量** ⇒ 口径：差值落在同一条
+        #   有界带里（这里直接用 B1 的 alive 容差），且两者都 > 0。
+        check(abs(dg["alive"] - d1["alive"]) <= BOUND_KEYS["alive"],
+              "G1b 排序只改顺序不改数量 (alive %d ≈ %d，差 %d ≤ %d)"
+              % (dg["alive"], d1["alive"], abs(dg["alive"] - d1["alive"]),
+                 BOUND_KEYS["alive"]))
     check(not [l for l in err_g1 if ERR_RE.search(l)],
           "G1c 排序路径零 VUID / 零 [ERROR]")
 
@@ -726,8 +818,8 @@ def main():
         return 1
     print("结果: PASS（R6-1 GPU 粒子整链：开关/基线不变 → 状态确定性 → "
           "序列化新旧兼容 → 面板结构 → 一键展开折叠 → 速度与帧率解耦 → "
-          "排序，A 组 7 项 + B 组 7 项 + C 组 3 项 + D 组 9 项 + E 组 3 项 + "
-          "F 组 2 项 + G 组 3 项共 34 项，全部通过）")
+          "排序，A 组 7 项 + B 组 8 项 + C 组 3 项 + D 组 9 项 + E 组 3 项 + "
+          "F 组 2 项 + G 组 3 项共 35 项，全部通过）")
     print("=" * 72)
     return 0
 
@@ -737,9 +829,72 @@ def panel_click_test(exe, scene):
 
     单独起一个进程（run_frames 没法点），所以不复用上面的辅助。
     返回 [(消息, 是否通过)]。
+
+    ⚠⚠ 点击送达是这套注入里最脆的一环，**两条路并用**（详见 click_for）：
+    先试真实鼠标事件（需要抢到前台），失败就换成 PostMessage 直投（与前台
+    和窗口遮挡无关）。
+
+    2026-10-16 全量回归里 E1b 连挂两次（点 Expand all 后 modules 仍是默认的
+    4 个），而同排的 Collapse all 却生效；单独复现时**同一坐标连点三次全部
+    生效**（Expand → 12、Collapse → []、再 Expand → 12）。所以按钮本身没
+    问题。第一版把原因记成"force_foreground 没抢到前台时真实鼠标事件被系统
+    丢掉"，并加了"重抢前台 + 重试" —— 结果最后一轮单跑 E1b 又挂（点 3 次
+    全未送达）。真正的漏洞是**`force_foreground` 的返回值被忽略了**：它返
+    False 时窗口还被别的窗口压着，`mouse_event` 那几发点击全落到了压在上面
+    的窗口上。所以现在 k==0 才走真实事件（且必须先抢到前台），之后一律直投。
     """
     from verify_player import launch, close
-    from verify_bvh import click_client
+    from verify_bvh import click_client, click_client_post
+    from verify_asset_drag import force_foreground
+
+    def fx_modules():
+        with tap.lock:
+            lines = list(tap.lines)
+        p = last_fxparams(lines)
+        return p[0] if p else None
+
+    def click_for(x, y, want, tries=4, tag=None):
+        """点 (x, y) 直到 modules == want；返回 (实得值, 实际点了几次, 路径)。
+
+        两条注入路径轮着来：
+
+          第 1 次 —— **真实事件**（`click_client`），最接近用户操作。前提是
+             `force_foreground` 抢到前台；抢不到就跳过（发出去也只会点到压在
+             上面的窗口上）。
+          之后   —— **直投消息**（`click_client_post`），与前台和窗口遮挡无关。
+
+        ⚠ 2026-10-16 的教训：第一版只做"重抢前台 + 真实点击"，最后一轮单跑
+        E1b 仍挂了（点 3 次全未送达）。根因是**返回值被忽略** —— `force_foreground`
+        失败时窗口还被终端压着，`mouse_event` 把那几发点击全送到了终端上。
+        "抢前台"本身在这台机器上就会偶发失败（实测：脚本单独跑 3/3 通过，
+        跟在别的命令后面连着跑就偶发全挂），所以必须有一条不依赖它的退路。
+
+        ⚠ 2026-10-17 第二处：`tag` 给了就**每次点击前重读矩形**。
+        实测同一个按钮在一次运行里会打出**两份**矩形（窗口建好时的布局，
+        和 `launch()` 改完尺寸之后的布局，x 相差 145 px）。拿旧值去点，
+        点的是改尺寸前它所在的位置 —— 现在那里是隔壁控件甚至面板外。
+        症状与"没送达"一模一样（点 4 次、每次 path=post、modules 不变），
+        但根因是**量测窗口没对齐**（见 MEMORY「量测三坑」②）。
+        真实事件与直投**都**吃客户端坐标，所以两边一起修。
+        """
+        got = None
+        path = "none"
+        for k in range(tries):
+            if tag:
+                r = tap.last_rect(tag)
+                if r:
+                    x, y = (r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0
+            if k == 0 and force_foreground(hwnd):
+                click_client(hwnd, x, y)          # 首选：真实鼠标事件
+                path = "real"
+            else:
+                click_client_post(hwnd, x, y)     # 退路：直投窗口消息
+                path = "post"
+            time.sleep(1.2)
+            got = fx_modules()
+            if got == want:
+                return got, k + 1, path
+        return got, tries, path
 
     res = []
     # 只注入"展开组件"这一件事（模块的展开状态就此**全是默认值**）。
@@ -759,36 +914,28 @@ def panel_click_test(exe, scene):
         if r is None:
             return [("E0 没拿到 INS-FX-EXPAND-ALL 矩形", False)]
         cx, cy = (r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0
-        with tap.lock:
-            lines0 = list(tap.lines)
-        p0 = last_fxparams(lines0)
+
+        p0 = fx_modules()
         res.append(("E1a 初始 = 4 个默认展开的模块（modules=%s）"
-                    % (p0[0] if p0 else None),
-                    p0 is not None and p0[0] == MODULES_DEFAULT_OPEN))
+                    % (p0,),
+                    p0 == MODULES_DEFAULT_OPEN))
 
         # Expand all
-        click_client(hwnd, cx, cy)
-        time.sleep(1.2)
+        got1, n1, path1 = click_for(cx, cy, MODULES, tag="INS-FX-EXPAND-ALL")
         r2 = tap.last_rect("INS-FX-COLLAPSE-ALL")
-        with tap.lock:
-            lines1 = list(tap.lines)
-        p1 = last_fxparams(lines1)
-        res.append(("E1b 点 Expand all → modules 变 12 个（modules=%s）"
-                    % (len(p1[0]) if p1 else None),
-                    p1 is not None and p1[0] == MODULES))
+        res.append(("E1b 点 Expand all → modules 变 12 个（modules=%s，点了 %d 次/%s）"
+                    % (len(got1) if got1 is not None else None, n1, path1),
+                    got1 == MODULES))
 
         # Collapse all
         if r2 is None:
             res.append(("E2a 没拿到 INS-FX-COLLAPSE-ALL 矩形", False))
         else:
-            click_client(hwnd, (r2[0] + r2[2]) / 2.0, (r2[1] + r2[3]) / 2.0)
-            time.sleep(1.2)
-            with tap.lock:
-                lines2 = list(tap.lines)
-            p2 = last_fxparams(lines2)
-            res.append(("E2b 点 Collapse all → modules 变空（modules=%s）"
-                        % (p2[0] if p2 else None),
-                        p2 is not None and p2[0] == []))
+            got2, n2, path2 = click_for((r2[0] + r2[2]) / 2.0, (r2[1] + r2[3]) / 2.0,
+                                        [], tag="INS-FX-COLLAPSE-ALL")
+            res.append(("E2b 点 Collapse all → modules 变空（modules=%s，点了 %d 次/%s）"
+                        % (got2, n2, path2),
+                        got2 == []))
     finally:
         close(proc, hwnd)
     return res

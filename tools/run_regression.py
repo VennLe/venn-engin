@@ -78,10 +78,19 @@ DEFAULT = [
     "verify_alpha_mask",
     # R4-2：预积分 SSS（ShadingModel::Skin，bit4 VENN_SHADING_SKIN）
     "verify_sss",
+    # Inspector 左侧图标导航条 + 按页签分区（2026-10-16 的 UI 重构）。
+    # 放在这里跑是有讲究的：它逐个页签启动 16 次编辑器，是本套件里最慢的
+    # 一个；而它同时**看守着其它脚本的默认页签**（自动化默认 = all），
+    # 所以失败信息应该尽量早出现。
+    "verify_inspector_tabs",
     "verify_nav_gizmo",
     "verify_character_window", "verify_add_menu", "verify_mesh_params",
     "verify_collider_gizmo", "verify_player", "verify_collision_play",
     "verify_drop_to_floor", "verify_material_roundtrip",
+    # 材质槽小方块（空态是小方框 / 绑定后变宽并显示文件名 / 拖拽真的生效）。
+    # ⚠ 它此前**不在** DEFAULT 里 → 2026-10-16 那种"槽位被图标条挤到 48px、
+    #   文件名被裁成 .png"就没人拦（verify_material_roundtrip 是顺手抓到的）。
+    "verify_material_chips",
     "verify_primitive_roundtrip", "verify_screenspace", "verify_textures",
     # 多相机 / 通用 RenderTarget + 相机特效（DoF / 运动模糊 / 色差 / 暗角 /
     # 后处理体积）
@@ -145,6 +154,76 @@ DEFAULT = [
     # E25 GPU 时戳时间轴：时间轴总长 == GPU-TIMING 帧总耗时（< 5%）/ 60 帧
     # 历史封顶 / 点段联动 Console 过滤 / 归入 Rendering 工作区 / 采样纯读
     "verify_gpu_timeline",
+    # ---- 物理（R7-1）：完整刚体核心 ----
+    # 不需要窗口、不需要 Vulkan：MYVK_PHYS_TEST=1 让 Editor 在 app.run() 前
+    # 直接跑物理自检。**本套件里唯一能做逐位可复现断言**的用例（跨进程比对
+    # PHYS-TEST 行），也是物理唯一"机器可判定"的正确性证据 —— 一叠箱子塌掉
+    # 有一百种原因，浮点逐位一致只有一种解释。
+    "verify_physics",
+    # ---- 2026-10-17：主题 / 语言 / 默认值 / 胶囊线框 / 启动露面 ----
+    # 五套主题 + 中英映射替换 + 偏好存档 schema 门。判据只取 Preferences
+    # 窗口内部的平均亮度（整窗均值会被 3D 视口拽平，第一版就栽在这）。
+    "verify_theme_language",
+    # 出厂默认值：吸附全开 / 栅格 1m 且放大 / 存档仍能覆盖默认。
+    # 判据 = onInit 末尾那行 EDITOR-STATE（结构化，不数像素里的对勾）。
+    "verify_editor_defaults",
+    # 胶囊线框的**形状规范性**：正对投影下量轮廓的宽高比 / 对称 / 桶身直段 /
+    # 球冠收窄；副用例把"对 1m 立方体拟合出来的其实是球（halfHeight=0）"
+    # 钉成事实。
+    "verify_capsule_shape",
+    # 启动不闪白 + 缓冲两秒才露面：断言"首次可见时刻"落在 1.6~4.5s、露面后
+    # 连拍无白帧。它需要 MYVK_STARTUP_DELAY=1 才跑得出缓冲（MYVK_NO_WINDOW_SAVE
+    # 会顺带跳过缓冲，而那个变量又必须设 —— 否则退出时会覆盖用户的 imgui.ini）。
+    # ⚠ 这一例**故意不登记 TRIGGERS**：它依赖的全是 engine/core/**（= GLOBAL），
+    #   登记了反而命中"全横切登记"检查（--narrow 下会假跳过）。
+    "verify_startup_show",
+    # Hierarchy 行尾 🔒/👁 两个图标按钮（E12 的修补）。
+    "verify_hierarchy_status",
+    # ---- 阶段 M1：运行时骨架（G01~G05，2026-10-17）----
+    # G01+G02 结构验证：两个 exe 并存 / VennEngine 里零 editor+runtime 源文件 /
+    # 两个 exe 都链接同一个 VennEngine.lib / 脚本引擎已在 engine/script 且
+    # 重命名历史可追。**不起窗口**，读 build.ninja 与文件树，毫秒级 ——
+    # 它看守的那些病（引擎里 include 了 editor、另编一份源码冒充共享）不会让
+    # 任何一条 GUI 用例变红，所以必须有这么一条"只看结构"的用例。
+    "verify_runtime_build",
+    # G03 定步长调度：自检三条（300 帧恰好 300 步 / 累加器与 stepFixed 逐位
+    # 相同 / timeScale=0 零漂移）+ 真实主循环的 GAME-LOOP 字段语义 +
+    # **编辑器 Play 与 Game.exe 的 PHYS-BODY 逐字符相同**（后者是"出包手感
+    # 不漂移"的唯一机器证据）。
+    "verify_runtime_loop",
+    # G04+G05 状态栈与启动配置：迁移序列逐字（含 Paused 的阻断语义）/
+    # 清空全部 MYVK_* 仍按 assets/game.json 起 / CLI>env>json 优先级 /
+    # 日志落在 %LOCALAPPDATA% 且 --help 不建日志。
+    "verify_runtime_states",
+    # ---- 阶段 M2：手感地基（G06~G10，2026-10-17）----
+    # 四组互相独立的面（缺一条就有洞）：
+    #   A 五项无窗口自检（输入 / 角色 / 接触 / 相机 / 玩家）—— A 组证明算法对；
+    #   B 场景读盘锚点（triggers=1 materials=1 / PLAYER attached / CAM-ACTIVE
+    #     优先级 / fov 取自组件）—— 证明**字段真的从 JSON 读进来了**；
+    #   C 读→写→再读往返（`--dump-scene`）—— `saveScene` 与 `loadScene` 是
+    #     两套代码，只测读的话"存档丢字段"永远暴露不出来；
+    #   D 老场景 sandbox 基线不变（PLAYER none / 零 CAM-ACTIVE / triggers=0）。
+    # 全部无窗口，整条跑完约 3 秒。
+    "verify_runtime_m2",
+    # ---- 阶段 A · E03：设置层级与持久化（2026-10-17）----
+    # 三条硬约束一起看守：①无 config/render.json 时**一条 RENDER-SET 日志
+    # 都没有**（= 与 E03 之前逐像素一致）；②合法 json 真的落到渲染
+    # （SHADOW-DBG cascades=2），且与 env 路径的 splits 逐字符相同
+    # （= 文件层不是影子结构体）；③非法 json 只 WARN + 回落默认 + 不崩。
+    # A 组是无窗口自检（毫秒级），B~G 组跑 7 次编辑器（约 35s）。
+    "verify_settings_layers",
+    # ---- G06 键位重绑定（M2 的最后一件，2026-10-17）----
+    # 守的是"改了能存、存了能被游戏读到、读到了能撤销"这一整条链 ——
+    # 它坏了不会花屏，只会让玩家下次进游戏键位又变回老样子：
+    #   A 引擎自检（无窗口，H 组点名断言改绑/冲突/重置/清空）；
+    #   B 运行时无文件 → 出厂绑定；C 编辑器改绑+存盘 → JSON 逐字段；
+    #   D 运行时读**同一份**文件 → Jump 真的变成 F（且别的动作没丢）；
+    #   E 编辑器再读回来；F 改绑 → undo → 存盘，文件退回出厂值；
+    #   G Preferences ▸ Bindings 页的矩形锚点（UI 面真的存在）；
+    #   H 冲突检测（把 Jump 改到被 W 占用的键）；
+    #   I 自动化纪律（MYVK_FRAMES 下默认路径既不读也不写）。
+    # 9 次启动、每次几帧，整条约 25 秒。
+    "verify_input_bindings",
 ]
 
 # 结果行：兼容四种写法。取**最后一条**，因为有的脚本会先打一堆中间断言。
@@ -163,9 +242,16 @@ LEAK_RE = re.compile(r"leaked objects that have not been destroyed")
 WATCH_ROOTS = [
     "engine",
     "editor",
+    # 运行时（G01 起是**独立目标** VennRuntime → Game.exe）。之前不在这里，
+    # 于是"只改了 runtime/ 一个字节"在影响分析里**完全不可见** —— 这是
+    # 新增运行时那一轮必须补上的一个洞（不补就等于 runtime 没有回归）。
+    "runtime",
     "assets/shaders",
     "assets/models",
     "assets/textures",
+    # 出厂配置（G05）：只读、由人写，运行时不改它 → 可以进快照。
+    # ⚠ `assets/scenes/**` 仍然**不能**进来（编辑器会写它们，见下）。
+    "assets/game.json",
     "CMakeLists.txt",
     "Makefile",
     "make.cmd",
@@ -250,6 +336,7 @@ RENDER_MODULES = [
     "engine/render/OffscreenImage.h",
     "engine/render/PostProcess.*",
     "engine/render/ReflectionProbe.*",
+    "engine/render/RenderSettingsIO.*",
     "engine/render/RenderTarget.*",
     "engine/render/SSAOPass.*",
     "engine/render/ScreenSpaceSettings.h",
@@ -350,15 +437,47 @@ TRIGGERS = {
     "verify_reflection_probe": ["engine/render/ReflectionProbe.*"],
     # R6-1 粒子系统：模拟/计数/绘制三条着色器 + 资源与描述符池全在
     # ParticleSystem.*；组件与序列化落在 Components.h / SceneSerializer.cpp
-    # （本身就是横切，不登记）；面板在 InspectorPanel.* —— 那是横切文件，
-    # 所以面板那一组（D/E）实际上是无条件重跑，这是安全的退化。
+    # （本身就是横切，不登记）；面板（12 个 Shuriken 模块 / 色带 / 一键展开）
+    # 在 InspectorPanel.* —— 所以它必须显式登记，否则改面板不会重跑本例的
+    # D/E 两组断言。
+    # ⚠ 这里原本写的是"InspectorPanel.* 是横切文件，所以面板那一组实际上无条件
+    #   重跑" —— **这句是错的**：`GLOBAL_GLOBS` 里根本没有 `editor/**`，
+    #   InspectorPanel.* 只是被 verify_inspector / verify_mesh_params 登记过，
+    #   改它**不会**触发全量，于是本例的面板断言在"改面板"时被静默跳过。
+    #   教训：判断"某文件是不是横切"只能去 `GLOBAL_GLOBS` 里查，别凭印象。
     "verify_particles":      ["engine/fx/ParticleSystem.*",
                               "assets/shaders/particle_sim.comp",
                               "assets/shaders/particle_count.comp",
                               "assets/shaders/particle_common.glsl",
                               "assets/shaders/particle.vert",
-                              "assets/shaders/particle.frag"],
+                              "assets/shaders/particle.frag",
+                              "editor/InspectorPanel.*"],
     # ---- 编辑器 / UI ----
+    # 主题表 / applyTheme 本体在 engine/ui/ImGuiTheme.*（新文件）——
+    # ⚠ 但 `engine/ui/**` 是 GLOBAL_GLOBS，所以这条**不能只写它**，否则会被
+    #   "全横切登记"检查判成"等于没登记"（--narrow 下假跳过）。下面挂的是
+    #   主题/语言**真正会改到的编辑器侧文件**：
+    #     · Localization.*     —— 英→中映射表（唯一的中文来源）
+    #     · EditorLayoutIO.*   —— 偏好存档的 schema 版本门（kPrefsVersion）
+    #     · Toolbar.*          —— 顶栏/传输条底色改走 ui::tokens().barBg
+    #     · ViewportPanel.*    —— 视口叠加片在浅色主题下强制浅字
+    #   （EditorApp.cpp 同理未登记 → 改它全量，保守正确。）
+    "verify_theme_language": ["editor/Localization.*",
+                              "editor/EditorLayoutIO.*",
+                              "editor/Toolbar.*",
+                              "editor/ViewportPanel.*"],
+    # 出厂默认值（吸附全开 / 栅格 1m 与放大）。吸附默认值与步长在
+    # EditorContext.h；栅格默认值在 engine/render/Renderer.h（= GLOBAL，
+    # 所以这里必须另有非全横切的登记）；存档覆盖走 EditorLayoutIO.*。
+    "verify_editor_defaults": ["editor/EditorContext.h",
+                               "editor/EditorLayoutIO.*"],
+    # 胶囊线框的顶点/边数组全部由 ColliderView.* 自己生成（点与边都在这里
+    # 算完直接喂 AddLine）；拟合半径那一路在 engine/physics/**（= GLOBAL）。
+    "verify_capsule_shape":  ["editor/ColliderView.*"],
+    # E12 行尾状态列：图标绘制 / 命中矩形 / pending 队列全在 SceneHierarchy；
+    # 可见性组件的语义在 engine/scene/Scene.cpp（= GLOBAL）。
+    "verify_hierarchy_status": ["editor/SceneHierarchy.*",
+                                "editor/InspectorIcons.h"],
     "verify_nav_gizmo":      ["editor/ViewportPanel.*",
                               "editor/GizmoController.*",
                               "engine/scene/Camera.*"],
@@ -372,6 +491,16 @@ TRIGGERS = {
     "verify_mesh_params":    ["editor/InspectorPanel.*"],
     "verify_character_window": ["editor/CharacterWindow.*", "assets/models/**"],
     "verify_material_roundtrip": ["engine/scene/SceneSerializer.*"],
+    # 材质槽小方块：控件与"三列布局"都在 InspectorPanel.*；而**槽位拿到的可用宽度
+    # 由 SplitLayout 给的面板宽度决定** —— 2026-10-16 的"文件名被裁成 .png"正是
+    # "图标条 48px + 值列写死 88 + 槽位列 88"把槽位挤到 48px 造成的，所以布局那个
+    # 文件必须登记（改 `kRightMin` / 拖分栏都会改到它）。
+    # 拖放载荷类型在 EditorDragDrop.*。
+    # ⚠ `engine/assets/**` 与 `assets/shaders/pbr.frag` 都在 `GLOBAL_GLOBS` ——
+    #   **别再写进这里**（`--narrow` 下会变成假跳过）。
+    "verify_material_chips": ["editor/InspectorPanel.*",
+                              "editor/SplitLayout.*",
+                              "editor/EditorDragDrop.*"],
     "verify_primitive_roundtrip": ["engine/scene/SceneSerializer.*"],
     "verify_player":         ["editor/EditorScene.*"],
     # ⚠ 这一例同时是**资源泄漏门**：全套里只有它会让编辑器**优雅退出**，
@@ -387,6 +516,19 @@ TRIGGERS = {
     # ---- 阶段 C：核心面板 ----
     # E11：分区折叠表 / 关键词表 / POD 快照全在 InspectorPanel 里
     "verify_inspector":      ["editor/InspectorPanel.*"],
+    # E11.1：左侧图标导航条 + 按页签分区。页签表、页签派发、空页签提示全在
+    #        InspectorPanel.*；11 个矢量图标在 InspectorIcons.h（新文件，
+    #        只有这里会用到）。
+    #        ⚠ **两条故意不登记**（登记了反而制造"假跳过"，见文件顶部铁律 2）：
+    #          · `editor/EditorLayoutIO.*` —— 页签选择落盘确实在这里，但这个
+    #            文件是**全编辑器共用的落盘守卫**（布局 / 偏好 / 通知历史都走它），
+    #            只挂在本例名下会让 verify_viewport / verify_notifications
+    #            在它变更时被判成"不受影响"；
+    #          · `editor/EditorApp.cpp` —— 宿主接线（应用落盘的 inspTab、面板表），
+    #            同一文件里还有几十处别的面板接线（项目既有约定：未登记 → 全量）。
+    #        两者保持"未登记"= 变更时全量重跑，保守且与 E18/E19/E21 的写法一致。
+    "verify_inspector_tabs": ["editor/InspectorPanel.*",
+                              "editor/InspectorIcons.h"],
     # E13：过滤 / 面包屑 / 视图模式 / 缩略图档位在 ContentBrowser，
     #      缓存淘汰在 ThumbnailCache，拖放载荷定义在 EditorDragDrop.h
     "verify_content_browser": ["editor/ContentBrowser.*",
@@ -420,6 +562,72 @@ TRIGGERS = {
     #       Workspace.cpp —— 两者都未登记（改它们 → 全量），保守正确。
     "verify_gpu_timeline": ["editor/GpuTimelinePanel.*",
                             "editor/ConsolePanel.*"],
+    # ---- 物理（R7-1）----
+    # ⚠ **故意不登记**，与 verify_lod / verify_textures 等同一处理方式。
+    #   理由：`engine/physics/**` 早就是 GLOBAL_GLOBS（player / collision /
+    #   drop_to_floor 都吃它），所以改任何物理文件本来就会全量重跑 →
+    #   verify_physics 必然被执行，功能上不需要 TRIGGERS 这一行。
+    #   反过来，若把 `engine/physics/**` 登记到本用例名下，`--narrow` 模式下
+    #   一次 CollisionWorld 的改动就只会跑 verify_physics，把
+    #   verify_collision_play / verify_player / verify_drop_to_floor 判成
+    #   "不受影响" —— 那才是真正的假跳过。宁可多跑。
+    # ---- 阶段 M1：运行时骨架（G01~G05）----
+    # 三条用例的实现主体全在 `runtime/**`（G01 拆出来的那个独立目标）。
+    # 同一个 glob 挂到三条名下是**故意**的：改 runtime 的任何一行，
+    # 三条都该重跑；只挂一条会让 `--narrow` 把另外两条判成"不受影响"
+    # （那就是假跳过）。G05 的出厂配置 `assets/game.json` 只被
+    # verify_runtime_states 的冷启动断言读，单独挂给它。
+    # ⚠ 刻意**不登记**的：
+    #     · `CMakeLists.txt` / `engine/core/**` / `engine/physics/**` —— 横切
+    #     · `engine/script/**` —— 新目录；改它属"未登记" → 全量 + 点名，安全
+    #     · `assets/scenes/sandbox.json` —— 夹具，但 `assets/scenes/**` 按
+    #       约定不进快照（编辑器会写它们），故想改夹具时请手动点名这三条
+    "verify_runtime_build":  ["runtime/**"],
+    "verify_runtime_loop":   ["runtime/**"],
+    "verify_runtime_states": ["runtime/**", "assets/game.json"],
+    # ---- 阶段 M2 手感地基（G06~G10，2026-10-17）----
+    # 只登记**非横切**的实现主体：
+    #   runtime/PlayerController.* / runtime/SpringArm.* —— G10 总装，新文件
+    #   engine/scene/CameraSystem.*                 —— G09，新文件（不是横切）
+    #   engine/scene/SceneSerializer.*              —— 四个新组件的读写在这里
+    #     （同一个 glob 也挂在 verify_material_roundtrip / verify_primitive_
+    #      roundtrip 名下是**故意**的：序列化一改，三条都该重跑）
+    # ⚠ 刻意**不**登记（横切，登记了在 --narrow 下会变假跳过）：
+    #     engine/core/InputMap.*（G06）· engine/physics/CharacterController.*
+    #     与 ContactEvents.*（G07/G08）· engine/ecs/Components.h（组件）
+    #   —— 它们本来就在 GLOBAL_GLOBS 里，改它们必然全量。
+    # ⚠ 场景夹具 `assets/scenes/runtime_test/**` 也**不**登记：按约定
+    #   `assets/scenes/**` 不进快照（运行时会写它），改夹具请手动点名。
+    "verify_runtime_m2": ["runtime/PlayerController.*",
+                          "runtime/SpringArm.*",
+                          "engine/scene/CameraSystem.*",
+                          "engine/scene/SceneSerializer.*"],
+    # ---- 阶段 A · E03 设置层级与持久化（2026-10-17）----
+    # 覆盖链 / 解析 / 落盘全在 `engine/render/RenderSettingsIO.*`（**不**在
+    # GLOBAL_GLOBS 里，所以可以登记）；编辑器侧的 Settings 块与"改过参数
+    # 才落盘"在 EditorApp.*（`editor/**` 同样不是横切）。
+    # ⚠ 刻意不登记：`engine/render/Renderer.cpp`（横切）、
+    #   `engine/render/FeatureRegistry.*`（横切）—— 它们是本用例的接线点，
+    #   但登记横切文件会被 check_regression_map 判成"全横切登记 = 假跳过"。
+    #   `config/render.json` 是运行期产物、不进版本控制，也无从触发。
+    "verify_settings_layers": ["engine/render/RenderSettingsIO.*",
+                               "editor/EditorApp.cpp",
+                               "editor/EditorApp.h",
+                               "editor/main.cpp"],
+    # ---- G06 键位重绑定（2026-10-17）----
+    # 两个**新文件**（其它用例都不碰 → 登记安全）：落盘规则在 InputMapIO，
+    # 面板在 KeyBindingsPage。`EditorApp.cpp` 已由 verify_settings_layers
+    # 登记，这里再挂一份（多 owner）：改宿主接线这两条都该跑。
+    # ⚠ 刻意**不**登记（否则别的用例会假跳过）：
+    #     engine/core/InputMap.*        —— 横切（GLOBAL_GLOBS）
+    #     editor/EditorContext.*        —— 十几个用例共用的中枢
+    #     runtime/RuntimeApp.cpp / RuntimeConfig.*
+    #                                   —— 运行时用例的公共接线
+    #   这些走"没登记 = 全量 + 点名"，保守正确。
+    "verify_input_bindings": ["editor/InputMapIO.*",
+                              "editor/KeyBindingsPage.*",
+                              "editor/EditorApp.cpp",
+                              "editor/EditorApp.h"],
 }
 
 

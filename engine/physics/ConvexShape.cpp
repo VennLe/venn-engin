@@ -26,6 +26,13 @@ glm::vec3 ConvexShape::supportLocal(const glm::vec3& dir) const {
             if (len < 1e-8f) return glm::vec3(radius, 0.0f, 0.0f);
             return dir * (radius / len);
         }
+        case Kind::Box:
+            // 长方体：每一维各取自变量的符号 × 半边长。
+            // 这是**精确**支撑点（不像球要归一化）—— 支撑函数取的是
+            // "沿 dir 最远的顶点"，而顶点就是符号组合出来的那 8 个之一。
+            return glm::vec3(dir.x >= 0.0f ? halfExtents.x : -halfExtents.x,
+                             dir.y >= 0.0f ? halfExtents.y : -halfExtents.y,
+                             dir.z >= 0.0f ? halfExtents.z : -halfExtents.z);
         case Kind::Capsule:
         default: {
             const float len = glm::length(dir);
@@ -57,6 +64,10 @@ void ConvexShape::localAabb(glm::vec3& mn, glm::vec3& mx) const {
         case Kind::Sphere:
             mn = glm::vec3(-radius);
             mx = glm::vec3(radius);
+            return;
+        case Kind::Box:
+            mn = -halfExtents;
+            mx = halfExtents;
             return;
         case Kind::Capsule:
         default:

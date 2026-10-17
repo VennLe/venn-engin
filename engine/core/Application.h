@@ -41,6 +41,18 @@ protected:
     // 这就是编辑器能把 3D 渲染接到自己场景上的接缝。
     virtual scene::Scene& activeScene() { return m_scene; }
 
+    // ----------------------------------------------------------
+    // 谁负责"每帧提交一帧"
+    // ----------------------------------------------------------
+    // 默认 false → Application::run 在 onUpdate 之后调 drawFrame。
+    // 运行时（runtime/RuntimeApp）重写成 true：它的 GameLoop 把"渲染"
+    // 当作一个**可计数的相位**（要证明"Paused 时画面仍在出帧"、
+    // "每帧恰好画一次"），所以画由它自己发起。
+    //
+    // ⚠ 重写成 true 之后**必须**在 onUpdate 里真的画一次，否则这一帧
+    //   不会呈现 —— 交换链不推进、ImGui 的帧也不闭环。
+    virtual bool ownsFrameRendering() const { return false; }
+
     // ---- 引擎服务 ----
     Window& window() { return *m_window; }
     render::Renderer& renderer() { return *m_renderer; }
