@@ -132,6 +132,12 @@ public:
     const MeshSource& source() const { return m_source; }
     void setSource(const MeshSource& s) { m_source = s; }
 
+    // W2-2：`.vmeta` 的 `import.generateLods=false` → 这条网格不建 LOD 链。
+    // ⚠ 挂在 Mesh 上而不是 Model 上：LOD 链是按**网格**建的
+    //   （`AssetManager::ensureLod(Mesh*)`），按 Model 挂会漏掉共享网格。
+    bool noLod() const { return m_noLod; }
+    void setNoLod(bool v) { m_noLod = v; }
+
     bool valid() const { return m_vertexBuffer != nullptr; }
 
     // ---- 局部空间 AABB（上传时从顶点算一次，之后只读）----
@@ -164,6 +170,7 @@ private:
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     MeshSource m_source;
+    bool m_noLod = false;   // W2-2：禁用 LOD 链
 
     // 局部 AABB（upload 时算一次）。空网格 → m_hasBounds = false
     glm::vec3 m_boundsMin{0.0f};

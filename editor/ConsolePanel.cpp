@@ -64,9 +64,34 @@ void ConsolePanel::print(core::LogLevel level, const std::string& text) {
         if (nl == std::string::npos) nl = text.size();
         if (nl > start || start == 0)
             m_lines.push_back(Line{level, text.substr(start, nl - start)});
-        if (m_lines.size() > kMaxLines) m_lines.pop_front();
+        evictOverflow();
         if (nl == text.size()) break;
         start = nl + 1;
+    }
+}
+
+void ConsolePanel::evictOverflow() {
+    // 满了以后**先丢最老的 INFO**，WARN/ERROR 留到最后才丢。
+    //
+    // 为什么不是简单 pop_front（2026-10-19 实测）：一次普通启动会打
+    // 2000+ 条 INFO（着色器变体 / 资产加载），启动期的一条 ERROR 会在
+    // 用户打开 Console 之前就被顶掉 —— `verify_notifications` 抓到的是
+    // `CONSOLE-DUMP lines=2048 info=2048 warn=0 err=0`，而通知历史里
+    // 明明有 error=1。也就是说：**用户永远看不到那条错误**，而这正是
+    // Console 面板存在的理由（头注释 ①）。
+    //
+    // 丢的时候仍然是 FIFO 语义（丢最老的那条 Info），所以"最近发生了什么"
+    // 的观感不变；只有当整个缓冲里一条 Info 都没有（极端：全是 ERROR）时
+    // 才真正从头部丢。
+    while (m_lines.size() > kMaxLines) {
+        auto it = std::find_if(m_lines.begin(), m_lines.end(),
+                               [](const Line& l) {
+                                   return l.level == core::LogLevel::Info;
+                               });
+        if (it != m_lines.end())
+            m_lines.erase(it);
+        else
+            m_lines.pop_front();
     }
 }
 

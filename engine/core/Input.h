@@ -38,6 +38,14 @@ public:
     // ---- 按键状态清零（窗口失焦时） ----
     static void clear();
 
+    // 丢弃**下一次**鼠标位移。
+    //
+    // 场景：切光标模式（NORMAL ⇄ DISABLED）时 GLFW 会把光标 warp 到窗口
+    // 中心，那次位移是**系统产生的**，不是玩家挥手。不吞掉的话，玩家按
+    // ESC 暂停/恢复的那一帧视角会猛转一下 —— 而且它只在"恰好有过鼠标
+    // 位移"时出现，是最难复现的那类。
+    static void discardNextMouseDelta();
+
 private:
     // GLFW 回调（由 Window 绑定）
     friend class Window;

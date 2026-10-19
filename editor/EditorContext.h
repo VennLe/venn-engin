@@ -76,7 +76,8 @@
 #include "PanelRegistry.h"  // 面板显隐的权威存储 + panelOpenRef
 #include "Workspace.h"      // WorkspaceManager / ViewportLayout
 
-#include "core/InputMap.h"  // G06：键位绑定表（按值持有，见 inputMap()）
+#include "core/InputMap.h"
+#include "script/ScriptRuntime.h"  // S5：实例表（只借不拥有）
 #include "ecs/Entity.h"
 // Scene 是本类的**按值成员**，前向声明不够，必须拿到完整定义
 #include "scene/Scene.h"
@@ -341,6 +342,12 @@ public:
     //   采集，两套输入会在同一个窗口上互相抢。
     core::InputMap& inputMap() { return m_inputMap; }
     const core::InputMap& inputMap() const { return m_inputMap; }
+
+    // 脚本实例表（S5）。只借不拥有 —— 真正的对象在 EditorApp 里。
+    // ⚠ 允许为空（headless / 自检）：所有读它的地方都要判空。
+    vks::ScriptRuntime* scriptRuntime() { return m_scriptRuntime; }
+    const vks::ScriptRuntime* scriptRuntime() const { return m_scriptRuntime; }
+    void setScriptRuntime(vks::ScriptRuntime* rt) { m_scriptRuntime = rt; }
     // 改过但还没落盘（面板顶部的 * 号）
     bool inputMapDirty() const { return m_inputMapDirty; }
     void setInputMapDirty(bool v) { m_inputMapDirty = v; }
@@ -651,6 +658,35 @@ public:
         return v;
     }
 
+    // ---------------------------------------------------------- 音频（G14-7）
+    // 面板请求"放一声"（Inspector 的 ▶ / Content 双击 / 脚本预览）。
+    // 与 `requestProbeCapture` 同一个套路：本类不认识 `audio::AudioSystem`
+    //（那要拖进整条音频依赖），只放一个请求，EditorApp 每帧取走。
+    //
+    // ⚠ 只存**路径 + 音量**，不存"要播哪个 voice" —— 试听是一次性的，
+    //   没有"停止试听"这种操作（再点一次就是再放一声）。
+    void requestAudioPreview(const std::string& clip, float volume = 1.0f) {
+        m_audioPreviewClip = clip;
+        m_audioPreviewVolume = volume;
+        m_audioPreviewRequest = true;
+    }
+    bool takeAudioPreview(std::string& clip, float& volume) {
+        if (!m_audioPreviewRequest) return false;
+        m_audioPreviewRequest = false;
+        clip = m_audioPreviewClip;
+        volume = m_audioPreviewVolume;
+        return true;
+    }
+    // 停掉所有一次性试听（Content 面板"再双击一次同一个文件"走这里）。
+    // ⚠ 与 requestAudioPreview 分开而不是"传空路径表示停止"：空路径是
+    //   合法的坏输入，用一个魔法值当命令会让"路径为空"变成不可诊断。
+    void requestAudioStop() { m_audioStopRequest = true; }
+    bool takeAudioStop() {
+        const bool v = m_audioStopRequest;
+        m_audioStopRequest = false;
+        return v;
+    }
+
 private:
     assets::AssetManager& m_assets;
 
@@ -692,6 +728,7 @@ private:
 
     // ---- 键位绑定（G06，见上方的说明）----
     core::InputMap m_inputMap;
+    vks::ScriptRuntime* m_scriptRuntime = nullptr;
     bool m_inputMapDirty = false;
     std::string m_captureContext;
     std::string m_captureAction;
@@ -779,6 +816,12 @@ private:
 
     // R5-1：待处理的"立刻重捕反射探针"请求（Inspector 的 Capture 按钮）
     bool m_probeCaptureRequest = false;
+
+    // G14-7：待处理的试听请求（一次性，EditorApp 取走就清）
+    bool m_audioPreviewRequest = false;
+    std::string m_audioPreviewClip;
+    float m_audioPreviewVolume = 1.0f;
+    bool m_audioStopRequest = false;
 
     // 最近打开的场景（最新在前，见 pushRecentScene）
     std::vector<std::string> m_recent;

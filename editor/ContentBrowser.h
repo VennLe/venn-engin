@@ -67,8 +67,10 @@ private:
     enum class ViewMode { Grid, List };
     enum class ThumbSize { Small, Medium, Large, Huge };
     // 类型过滤：按扩展名映射（Material 认 .mat.json / .vmat；Scene 认 .json）
+    // ⚠ 只能**往后加**（枚举值 = 单选列下标 = MYVK_EDITOR_CB_TYPE /
+    //   CB-FILTER 日志里那个数字，脚本按下标取值）。W4-4 追加了 Terrain。
     enum class TypeFilter {
-        All, Model, Texture, Material, Scene, Script, Shader, Folder
+        All, Model, Texture, Material, Scene, Script, Shader, Folder, Terrain
     };
     // 排序字段 / 方向（2026-10-17：抽屉三栏改造时加的，见 drawSortMenu）
     enum class SortBy { Name, Size };
@@ -147,6 +149,11 @@ private:
     // E13 New ▸ Material / Scene / Script
     void createScene();
     void createScript();
+    // W4-4：Add ▸ Terrain —— 在 dir 下落一份**能直接打开**的平地三件套
+    // （`<dir>/New Terrain/{terrain.vterrain,height.r32,splat.rgba8}`）。
+    // 与其它 Add 项不同，它建的是**目录**而不是单文件：地形资产天生三件套，
+    // 拆开放就没有意义（`.vterrain` 里的 height/splat 是相对它自己解析的）。
+    void createTerrainAsset(const std::string& dir);
     // E13 Show References：扫描资产根下引用该文件名的文本资产（简版）
     void showReferences(const DirEntry& ent);
     void revealInExplorer(const std::string& absPath);
@@ -207,6 +214,12 @@ private:
 
     // 选中项（绝对路径）。单击选中，右键菜单默认作用于它。
     std::string m_selected;
+    // G14-8：正在试听的素材（**绝对路径**；空 = 没在试听）。
+    // ⚠ 这是 Content 面板自己的界面状态，**不是**音频系统的状态 ——
+    //   设备打不开时这里照样会进"播放态"，因为面板拿不到播放结果。
+    //   真实失败由 AudioSystem 打 `AUDIO-CLIP-FAIL`；本面板在发请求前也会
+    //   先做一次存在性检查（不存在就当场通知，不进播放态）。
+    std::string m_previewPath;
 
     // ---- 条目右键菜单 ----
     // 请求由 drawEntry()（格子）置位，真正的 OpenPopup + 绘制在 drawGrid()

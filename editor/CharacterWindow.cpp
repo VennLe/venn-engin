@@ -10,6 +10,7 @@
 #include "assets/Skeleton.h"
 #include "core/Logger.h"
 #include "render/Renderer.h"
+#include "scene/ModelInstance.h"
 
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
@@ -111,53 +112,28 @@ void CharacterWindow::close() {
 
 // ---------------------------------------------------------------- 预览场景
 
-// 把 Model 实例化进目标场景的父节点下。蒙皮模型（skeleton 非空）会在父节点
-// 挂 SkinnedMeshComponent；静态模型只建普通 MeshComponent 实体。
+// 把 Model 实例化进目标场景的父节点下。
+//
+// 实现已搬到 `engine/scene/ModelInstance`（A0-1）：主场景的导入路径
+// （Content 拖拽）以前走的是另一份实现、不判 skinned，导致带骨骼的 FBX
+// 拖进来只是一堆静态网格。现在两条入口共用同一份，这里只剩一层转发。
+//
+// autoPlay 的语义：
+//   * 预览场景（m_previewScene）→ false：姿势由底部时间轴滑条驱动，
+//     抢过来推进会和滑条打架。
+//   * **主场景的玩家实体**（bindModelToPlayer / generateSkeletonBinding）
+//     → true：绑上去就该动。以前这里一律 false，于是"绑定了角色但站在原地
+//     不动"——那不是 bug 的错觉，是真的没人在推进 time。
 std::vector<ecs::Entity> CharacterWindow::instanceModelInto(scene::Scene& scene,
                                                             assets::Model* model,
-                                                            ecs::Entity parent) {
-    std::vector<ecs::Entity> out;
-    if (!model || !model->valid()) return out;
-
-    ecs::World& w = scene.world();
-
-    for (const auto& sub : model->subMeshes) {
-        if (!sub.mesh) continue;
-        ecs::Entity e = scene.createObject(sub.name.empty() ? "mesh" : sub.name);
-
-        ecs::MeshComponent mc;
-        mc.mesh = sub.mesh;
-        w.add<ecs::MeshComponent>(e, mc);
-        w.add<ecs::MaterialComponent>(e, ecs::MaterialComponent{sub.material});
-
-        glm::vec3 scale(1.0f), translation(0.0f), skew(0.0f);
-        glm::quat orient(1.0f, 0.0f, 0.0f, 0.0f);
-        glm::vec4 perspective(0.0f);
-        glm::decompose(sub.transform, scale, orient, translation, skew,
-                       perspective);
-        if (auto* t = w.get<ecs::TransformComponent>(e)) {
-            t->position = translation;
-            t->rotation = glm::eulerAngles(orient);
-            t->scale = scale;
-        }
-        if (parent.valid()) scene.setParent(e, parent);
-        out.push_back(e);
-    }
-
-    // 蒙皮：在父节点（模型根）挂 SkinnedMeshComponent
-    if (model->skinned() && parent.valid()) {
-        ecs::SkinnedMeshComponent sk;
-        sk.model = model;
-        sk.clipName.clear();
-        sk.time = 0.0f;
-        sk.speed = 1.0f;
-        sk.playing = false;
-        if (auto* p = w.get<ecs::SkinnedMeshComponent>(parent))
-            *p = sk;
-        else
-            w.add<ecs::SkinnedMeshComponent>(parent, sk);
-    }
-    return out;
+                                                            ecs::Entity parent,
+                                                            bool autoPlay) {
+    scene::ModelInstanceOptions opt;
+    opt.parent = parent;
+    opt.subNameSuffix = "";        // 预览树里保持与改动前一致的名字
+    opt.autoPlay = autoPlay;
+    scene::ModelInstanceResult r = scene::instantiateModel(scene, model, opt);
+    return std::move(r.entities);
 }
 
 void CharacterWindow::computeModelBounds() {
@@ -220,7 +196,8 @@ void CharacterWindow::rebuildPreviewScene() {
 
     m_previewRoot = m_previewScene.createObject("PreviewRoot");
     // 根放在原点；模型自己的 submesh 变换会相对它摆
-    instanceModelInto(m_previewScene, m_model, m_previewRoot);
+    instanceModelInto(m_previewScene, m_model, m_previewRoot,
+                      /*autoPlay=*/false);
 
     // 诊断：模型的包围球与每个 submesh 的世界包围 —— 排查"预览视口看不到
     // 模型"这类取景/尺度问题（FBX 的单位常是 cm，转成米后模型可能极小或
@@ -697,7 +674,7 @@ void CharacterWindow::drawTransportBar() {
     // 时间轴：占满剩余宽度（拖动即定格，方便看姿势）
     ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - 130.0f));
     if (ImGui::SliderFloat("##timeline", &m_animTime, 0.0f, dur > 0.0f ? dur : 1.0f,
-                           "%.2fs")) {
+                           TR("%.2fs"))) {
         m_animPlaying = false;
     }
     tip(TR("Scrub the clip. Dragging pauses playback so you can inspect a pose."));
@@ -760,7 +737,7 @@ void CharacterWindow::drawDetailsPanel() {
     ImGui::SameLine(90.0f);
     if (m_boundsValid) {
         const glm::vec3 sz = m_boundsMax - m_boundsMin;
-        ImGui::TextDisabled("%.2f x %.2f x %.2f", static_cast<double>(sz.x),
+        ImGui::TextDisabled(TRL("%.2f x %.2f x %.2f"), static_cast<double>(sz.x),
                             static_cast<double>(sz.y), static_cast<double>(sz.z));
         tip(TR("Measured bounding box of the model in the preview scene "
                "(width x depth x height, metres). Capsule size and camera "
@@ -843,7 +820,7 @@ void CharacterWindow::drawDetailsPanel() {
             ImGui::TextDisabled("%.3fs", static_cast<double>(clip->duration));
             ImGui::Text(TR("Tracks"));
             ImGui::SameLine(90.0f);
-            ImGui::TextDisabled("%zu  (%zu keys)", trackCount, keyCount);
+            ImGui::TextDisabled(TRL("%zu  (%zu keys)"), trackCount, keyCount);
             tip(TR("A track is one animated channel of one bone "
                    "(translation / rotation / scale)."));
 
@@ -949,7 +926,7 @@ void CharacterWindow::bindModelToPlayer() {
                 if (w.has<ecs::MeshComponent>(kid)) w.destroy(kid);
             }
         }
-        instanceModelInto(sc, m_model, m_player);
+        instanceModelInto(sc, m_model, m_player, /*autoPlay=*/true);
     });
     m_ctx.dirty() = true;
     m_ctx.notify(TR("Bound model to player"));
@@ -993,7 +970,7 @@ void CharacterWindow::generateSkeletonBinding() {
             }
         }
         // ② 实例化模型（蒙皮模型会在玩家实体上挂 SkinnedMeshComponent）
-        instanceModelInto(sc, m_model, m_player);
+        instanceModelInto(sc, m_model, m_player, /*autoPlay=*/true);
 
         // ③ 胶囊：没有就建，有就按模型尺寸改写
         ecs::CharacterControllerComponent* cc =

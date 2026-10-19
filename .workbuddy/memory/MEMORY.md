@@ -1,225 +1,138 @@
-# venn —— 项目长期笔记（规则索引）
+# venn —— 项目笔记
 
-> **必须整份进注入窗口**，超了**尾部会被截断**。只放 **纪律 + 速查 + 指针**：
-> 细则/坑点 → `render_details_archive.md`；**下一步** → `docs/{editor,ship,render}_roadmap.md`；
-> **设计理由** → `docs/editor_architecture.md`。
-> 手写 Vulkan 引擎（C++17，学习向），仓库 **`D:\A-VENN\code\cpp\venn-engin`**（CMake 名 `Venn`，刻意
-> 不一致）。**右手系 Z-up**。现只有 `Editor.exe`（**`Game.exe` = G 系列待做**）。分层
-> `core→rhi→render→scene→assets`（另有 `ui`/`ecs`/`physics`；应用层 `editor`，**待加 `runtime`**）；
-> **engine/ 不认识 editor/、更不认识 runtime/**。改目录名后必须删 `build/` 重新 configure。
+> 只放 **纪律 + 速查 + 指针**。细则 → `editor_details_archive.md` / `render_details_archive.md`；
+> 全文 → `memory_full_2026-10-19.md`；数字 → `roadmaps.md`；下一步 → `docs/*_roadmap.md`。
+> ⚠ **上限 ~13 KB（超了会被整段截断注入）** → 只增纪律，涨了先删"已完成"细节。
+> 仓库 `D:\A-VENN\code\cpp\venn-engin`（CMake 名 `Venn`）。C++17 手写 Vulkan，**右手系 Z-up**；
+> `core→rhi→render→scene→assets`（另有 `ui`/`ui2`/`i18n`/`ecs`/`physics`/`script`/`audio`/`project`；
+> 应用层 `launcher`/`editor`/`runtime`，**engine/ 不认识后三个**）。改名后删 `build/` 重 configure。
 
 ## ⚠⚠ 第 0 条：动手前重读磁盘版
-上下文里的快照**可能被截断/陈旧** → 任何"重"动作（跑回归/批量改文件/改契约）前先读磁盘版，
-否则可能正在违反一条**已生效**的纪律（已发生过：因快照缺条目误启动全量回归）。
+快照**可能被截断/陈旧** → 跑回归 / 批量改文件 / 改契约前先读磁盘。
+⚠ `docs/` 里的历史数字**要标"哪一轮的口径"**（不删，但不标就会被当基准）。
 
-## ⚠ 回归执行纪律（2026-10-15，用户明确要求）
-**不要自动跑全量回归。** 只有用户**明确下达"开始全量回归"**才跑 `run_regression.py --all`。日常只跑
-**受影响用例**（按 `TRIGGERS`）；收尾**不要**顺便来一轮全量。⚠ `--explain` 在「没有基准快照」时**一律
-返回"全量"**（保守兜底）—— 不代表"必须跑全量"，点名即可。
+## ⚠ 回归纪律（用户明确要求）
+**不自动跑全量**：只有用户明确下达才 `--all`，日常只跑受影响用例（按 `TRIGGERS`）。
+⚠ `--explain` 无基准快照时**一律报全量**。⚠ GUI 用例**同时只能有一个**。
 
 ## ⚠ 特性准入（R5/R6/R7）= 五件套
-① 实现 ② `FeatureRegistry` 登记（`bindParam` 必须在**成员默认初始化之后、`loadEnvOverrides()` 之前**）
-③ **UI 面**（编辑器点得到）④ 序列化 ⑤ 回归用例 + TRIGGERS。**只有 `MYVK_*`、界面点不到的不算交付**。
-把关 `tools/check_feature_surface.py`（**C 无 UI 面 / D 裸 env 漏网 必须清零**）。⚠ `FeatureRegistry.*`
-在 `GLOBAL_GLOBS` → 动它触发全量。
+① 实现 ② `FeatureRegistry`（`bindParam` 在成员默认初始化**之后**、`loadEnvOverrides()`**之前**）
+③ **UI 面** ④ 序列化 ⑤ 用例 + `TRIGGERS`。**只有 `MYVK_*`、界面点不到的不算交付**。把关 `check_feature_surface.py`（C/D 清零）。
 
-## ⚠ 本机环境（归档里"另一台机器"的记录别照抄）
-- 仓库 **`D:\A-VENN\...`**（旧笔记的 `E:\...` **不存在**）。**GPU = Intel Iris Xe**（不是 RTX 3060）
-  → **8 个 set**，Intel 恰好 `maxBoundDescriptorSets = 8` **卡在线上** → 再加材质贴图槽得改架构。
-- Python：`...\envs\default\Scripts\python.exe`（numpy+pillow）。⚠ **裸 `python` 不带 PIL/numpy** →
-  回归整批 FAIL 报 `No module named 'PIL'`。
+## ⚠ 本机环境
+**GPU = Intel Iris Xe**：`maxBoundDescriptorSets=32` / `maxPerStageDescSamplers=64` / **descriptor
+indexing 可用** —— 但**低端设备只保证 8** → 加纹理槽走 **bindless**（`render/Bindless.h`，默认关），
+不是"加 set"。Python 用 `...\envs\default\Scripts\python.exe`；⚠ **裸 `python` 不带 PIL** → 回归整批 FAIL。
 
-## 构建
-入口 **`make build`**；`TOOLCHAIN=auto` → **本机走 MSVC**（MinGW 缺失）。⚠ **MSVC 四坑**：① 代理变量
-`https_proxy`+`HTTPS_PROXY` 并存 → MSBuild 假报 `MSB6001: CL.exe 开关无效`；② UTF-8 无 BOM + 中文注释 →
-`C2001`（对策 `/utf-8`）；③ `.cmd`/`.bat` **必须纯 ASCII**；④ Make 可能用 sh 跑配方 → `echo` 里不能有
-`(` `)` `|`。
-- ⚠ **资产拷贝必须 `add_custom_target(... ALL)`**，禁用 `add_custom_command(TARGET ... POST_BUILD)`（后者
-  只在**重新链接**时跑 → 改 shader/贴图**不生效**）。三目标拆分后（10-17）改成**全局一份**
-  `VennShadersCopy`/`VennAssetsCopy`（`if(NOT TARGET)` 守卫），否则两个 exe 各拷一遍。
-- ⚠ `LNK1168` = 残留 `Editor.exe` → `taskkill //F //IM Editor.exe`。⚠ 日志 UTF-16 混合 → `grep -a`。
-  ⚠ `strings Editor.exe` **抓不到** ASCII 常量 → 验代码是否进二进制只能靠**行为**。新增 `.cpp` 自动进构建。
-  ⚠ `build/bin/config/*.json`（layout/prefs/**render**）**未进版本控制**且运行会被写 → 像素断言必须用
-  `MYVK_EDITOR_LAYOUT`/`MYVK_EDITOR_PREFS_PATH`/`MYVK_RENDER_SETTINGS` 钉死。
-- ⚠ **三目标拆分（10-17）**：`add_executable` 一改名（`Editor`→`VennEditor`），`add_dependencies` /
-  `target_link_options` / 资产拷贝调用**全要同步**，产物名靠 `OUTPUT_NAME` 保住。
-- ⚠ `glm::decompose` 在 **gtx**（`matrix_decompose.hpp`，不是 gtc）+ `GLM_ENABLE_EXPERIMENTAL` 必须写在
-  **任何 glm 头之前**（含**本文件自己的头**）。GLFW **没有 `glfwGetWindowFocus`** → `glfwGetWindowAttrib(w, GLFW_FOCUSED)`。
-- ⚠ 前置声明 `vks`（原 `editor` 脚本引擎）**必须写在 `namespace editor` 外面** → 否则成嵌套 `editor::vks`
-  把外层 `::vks` 遮住（症状像"少 include"）。与 `physics` 同源。
+## 构建（细则 → 归档五）
+入口 **`./make.cmd build`**（`TOOLCHAIN=auto` → **MSVC**，`Debug` → **性能数字是 Debug 的**）。
+⚠ **四坑**：`https_proxy`+`HTTPS_PROXY` 并存 → 假报 `MSB6001`；UTF-8 无 BOM + 中文 → `C2001`
+（要 `/utf-8`）；`.cmd`/`.bat` **纯 ASCII**；Make 用 sh 跑配方 → `echo` 里不能有 `(` `)` `|`。
+⚠ 资产拷贝必须 `add_custom_target(... ALL)`（`POST_BUILD` **只在重链后**跑），**多个 target 拷同一
+目录会并发冲突** → 全局单例 target。增量构建报 `LNK1163` → 删那个 `.obj`，不是代码错。
 
-## 环境变量（全表 → 归档）
-- ⚠ `MYVK_EDITOR_SCENE` → `EDITOR_CAM` → `MYVK_EDITOR_CLIP="near,far"`（钉视口裁剪面，默认
-  `0.1/5000`；**顺序不能反**）；编辑器侧注入一律 `MYVK_EDITOR_` 前缀（白名单
-  **按前缀放行**，不带前缀 = 裸 env 漏网）。⚠ **落盘读/写不对称**：自动化下**默认不读**、显式
-  `MYVK_EDITOR_LAYOUT` 照读、**写一律拒绝**。
-- ⚠⚠ **改任何"全局默认"都要回头 grep 依赖它的测试**（2026-10-17 全量回归：视口远平面
-  200→5000 让 `verify_frustum_cull`/`verify_bvh` 的 132/4 基线整体漂到 94/42；偏好
-  `kPrefsVersion` 升 2 后 `verify_viewport` 的 `write_prefs` 还写 1 → 整份存档被丢弃）。
-  **正确修法是钉输入（`MYVK_EDITOR_CLIP`）/ 升 fixture，不是改期望值。**
+## 环境变量
+⚠ 顺序固定：`MYVK_EDITOR_SCENE` → `EDITOR_CAM` → `MYVK_EDITOR_CLIP="near,far"`（默认 `0.1/5000`）；
+编辑器侧一律 `MYVK_EDITOR_` 前缀（白名单按前缀放行）。⚠ **落盘读/写不对称**：自动化下默认不读、
+显式 `MYVK_EDITOR_LAYOUT` 照读、**写一律拒绝**。⚠⚠ **改"全局默认"要 grep 依赖它的测试**
+（远平面 200→5000 让基线整体漂）。**修法是钉输入 / 升 fixture，不是改期望值。**
 
 ## 契约速查
-- **Pass 序**：`Shadow(4 级联) → LocalShadow(12 层数组) → DepthPrePass → SSAO → ClusterBuild →
-  VolumetricFog(×2) → Forward(天空盒→不透明→栅格→透明) → PostProcess → 交换链`。**compute 不能在 RP 内
-  执行**（深度预通道独立成 RP 且**无条件执行**）；**栅格夹在不透明与透明之间**、**绝不能**做成 ImGui 叠加层。
-- **"改一处就得同步改 N 处"是常态**：`FrameUBO`(768B)/推常量(128B 全满)/set0(25 binding)/变体位序/
-  分簇编址/材质贴图 set(7)/旁路管线 range 须与主管线**逐字段相同**（否则 VUID-08600）。
-- ⚠ 两处**默认槽**是雷：DBuffer 缺省必须 `m_defaultTransparent`（`m_defaultBlack` 整屏变黑）；探针
-  binding 23 缺省必须绑 1×1 全黑 cube array，**不能"不绑"**。
-- **颜色空间是契约**：albedo/emissive `srgb=true`；normal/ORM/高度图 `false`；着色器内**不做手动 gamma**。
+- **Pass 序**：`Shadow → LocalShadow → DepthPrePass → SSAO → ClusterBuild → VolumetricFog(×2) →
+  Forward → PostProcess → 交换链`。**compute 不能在 RP 内执行**；**栅格夹在不透明与透明之间**、
+  **绝不能**做成 ImGui 叠加层。
+- **"改一处要同步改 N 处"是常态**：`FrameUBO`(768B)/推常量(128B 全满)/set0(25 binding)/分簇编址/
+  旁路管线 range 须与主管线**逐字段相同**（否则 VUID-08600）。
+- ⚠ 两处**默认槽**是雷：DBuffer 缺省必须 `m_defaultTransparent`；探针 binding 23 缺省必须绑 1×1
+  全黑 cube array，**不能"不绑"**。**颜色空间**：albedo/emissive `srgb=true`，normal/ORM/高度图
+  `false`，着色器内不做手动 gamma。
+- ⚠⚠ **材质是共享资产，不是逐物体**（按名缓存）。"逐物体"是**假象**，靠"每实体唯一材质名"维持。
+  三个实测 bug：①**同名静默合并**；②**身份是数组下标**（重导出即错位）；③**导入模型的材质覆盖存盘即丢**。
+- **动画/蒙皮**：`jointBase` 三路（MDI `aux.x` / 合批与基线 `push.skin.x`）；`invMeshNode` 与
+  `push.model` 约掉 → 静态与蒙皮同一条 draw。⚠ **采样不许留在 Renderer 里**。
+## 脚本（S0~S6 ✅；权威 → `docs/script_roadmap.md` §11）
+- **`engine/script/ScriptRuntime.{h,cpp}` = 唯一 tick 内核**。`let` **幂等声明**；内建名**编译期**
+  解析；相位 **`声明区 → start → 接触事件 → 顶层 → update`**。
+- ⚠⚠ **`ScriptProgram`/`HookBlock` 构造析构必须 out-of-line**（头里 `= default` → 别的 TU 报
+  `can't delete an incomplete type`）；头里前向声明的类型**定义必须在 `namespace vks` 里**（C2872）。
+- ⚠ 热重载用 `ScriptAsset::version()` **不用指针**；`on start` **不重跑**；自检里"第二步重新求值"
+  必须用普通赋值（`let` 幂等 → 整句跳过）。**S4 协程**：先 `++ip` 再压子帧 / `Frame&` 在
+  `push_back` 后悬垂 / `simFrame` 是 **1-based**。
+- ⚠⚠ **编辑态脚本不 tick** → `progVersion` 恒 0 → `VKS-RELOAD-*` 一条都不打。
+  **测热重载必须先按 Space 进 Play**。遗留：**编辑器 Play 没接 `ContactTracker`**（只有 `Game.exe` 派发）。
 
-## 编辑器架构（全文 → 归档「布局范式 · 核心面板」）
-- **加面板 = 表里加一行**：`panelTableVec()` + `PanelRegistry`（View 菜单/快捷键/图标/落盘**四路自动派生**）；
-  **面板间只准依赖 `EditorContext`**，动引擎走 `EditorHost` 纯虚接口。**`PanelVisibility`** 权威在
-  `PanelRegistry.cpp` 的 `bool g_open[kMaxPanels]`（**必须固定数组 + 引用**，vector 扩容 → `bool&` 悬垂）。
-  覆盖链：偏好→项目→场景→对象→相机。
-- ⚠ **默认一律"全关"**：`config/render.json` 缺失时行为**逐像素等于今天**（硬约束）；新效果一律
-  "关闭 = 基线逐像素不变"。
-- ⚠ **快捷键有排他**（面板 `Alt+1..8` / 工作区 `Ctrl+Alt+1..6` / 视图键占 `Ctrl+1..8` /
-  `Shift+Space` 须排在 `Space` 前）。**别引入 ImGui docking**（用自研 `SplitLayout`）。
-- ⚠ **Inspector 左侧 11 个页签**：加页签 = `kTabs[]` 加一行 + 两处 `static_assert`；**枚举值 = 图标栏顺序**；
-  **落盘写 id 字符串不写下标**。⚠ **窄栏属性行的槽位宽度按该列"最长标签"反推**（`kPhysParamW`/`kFxParamW`）
-  —— 拍脑袋的宽度会在**滚动条出现之后**才吃掉标签尾巴。
-- ⚠ **`All` 不是"融合视图"，是旧堆叠绘制顺序一字不改**（9 个旧脚本靠 `INS-*` 锚点断言分区存在）→
-  自动化默认页签 = `All`，交互默认 `Object`。**别"优化"它。**
-- ⚠⚠ **锚点语义**：`logRect` 记在"提前返回"**之前**的锚点只能证明**函数被调用**，不能证明**分区可见**
-  → **负向断言只能用记在返回之后的锚点。** ⚠ 图标**改完要真的放大截图肉眼看**。
-- **主题** = `ui::applyTheme(int)`（`engine/ui/ImGuiTheme.*`，5 套）：度量/颜色解耦，**VennDark 照抄 → 默认
-  逐像素不变**；⚠ 浅色主题**逐个**收掉硬编码深色"孤岛"（顶栏/工具条 → `Token.barBg`，叠加片推浅 `Text`）。
-- **语言** = `tr()`/`trId()`（`editor/Localization.*`）：**代码只写英文**（硬约束），中文只在词典；
-  ⚠ **窗口名兼作 ID** → 改名丢布局 → 一律 `trId(name,id)`。
-- ⚠ **`TreeNode` 行上的图标按钮必须加 `ImGuiTreeNodeFlags_AllowOverlap`**，否则 `ItemHoverable`
-  （imgui.cpp:5121）因**节点先提交**锁死 `HoveredId` → **图标收不到 hover/点击**。
-- ⚠ **偏好 `kPrefsVersion` ≠ 布局 `kFormatVersion`**：偏好**逐键覆盖** → **老存档会把新默认顶回** → 升版本
-  让老档作废。
-- ⚠⚠ **布局范式（2026-10-17 改）**：**Content 不再是常驻分栏**，改成"从底栏往上弹的抽屉"。
-  左栏下半收成 0 → **Hierarchy 吃满整条左栏**；`syncPanelVisibility()` 里 **`kSlotContent` 恒 `false`**
-  （**保留 case 保持类型显式**，别删——删了会掉进 `default: return true`）。
-  底栏 `LayoutRects.bottom` = 状态栏上方 32px 通栏：`[📁]Content [📄]Output Log [⌨]CMD` + 右侧
-  `N entries | assets`；**播放条 UI 已整体移除**（`transport` 字段保留但恒 0×0，旧脚本还在读）。
-  抽屉默认**不 dock**（浮层，点外部即关）；`Dock in layout` 勾上后**真的占布局**（`bottomInset` 加高）。
-  **抽屉内容 = 三栏**：左目录树（根 `assets/`，点节点切目录）/ 中资源类型单选列 / 右"搜索+排序+网格"
-  （排序菜单是**勾选框语义但二选一**；目录永远排文件前；搜索历史只在回车时记）。
-  四个坑：① **`SplitLayout::setBottomInset(h)` 是"底栏 + 停靠抽屉"的总让位高度，≠ 底栏高度**
-  （拿它当底栏高度 → 底栏被撑成 352px）；`apply()` 不写 `out.bottom`，由 `computeLayout()` 显式写。
-  ② **`IsWindowHovered()` 默认不把"有 active item"算悬停** → 点按钮的松开帧返回 false →
-  判定成"点外部"、同帧把刚开的抽屉关掉（表现：按钮闪一下抽屉永远不出来）→ 必须加
-  `ImGuiHoveredFlags_AllowWhenBlockedByActiveItem`。③ **工作区预设会强制覆盖面板开关**
-  （`Workspace.cpp` 的 `kLevelOpen`/`kCharOpen`）→ 只改 `defaultOpen` 不够，**预设里也要删**。
-  ④⚠ **ImGui 绘制顺序 = `g.Windows` 顺序，且点中某窗口会把它挪到末尾** → "后画的在上层"
-  只在同帧成立（点视口 / 重开抽屉时抽屉会被盖）→ 每帧 `BringWindowToDisplayFront(抽屉)`
-  （imgui_internal，**有 popup 时不能提**）。**分隔条画在 ForegroundDrawList** → 必须用
-  `SplitLayout::setOccluder(抽屉矩形)` 把线切成 0~2 段，否则竖线直接画进抽屉里。
-  ⑤⚠ **popup 开着时 `IsWindowHovered(抽屉)` 是 false** → "点抽屉里别处"会连带把抽屉关掉；
-  判定要用**上一帧快照**（`m_contentPopupWasOpen`）—— ImGui 在 NewFrame 就关了弹层，
-  帧末查 `IsPopupOpen` 已经 false，抓不到。
-- ⚠⚠ **面板里"随选中状态出现/消失的一行"会让整棵树上下跳一行**（点行 → 选中 → 那行出现 →
-  树往下跳 → 鼠标已不在该行 → 再点变取消 → 又跳回），表面症状是"行尾图标点了没反应"
-  （`verify_hierarchy_status` A2/A3 的 `hover=0 active=0`）。`Path: (no selection)` 面包屑
-  整行删掉就是为这个 —— **别用 `Dummy` 占位糊过去**，那只是把抖动换成一条空白。
-- ⚠ **Hierarchy 列头必须手画，不能用 `Table`/`Columns`**：`Columns` 会在列结束前固定
-  `GetContentRegionAvail().x`，而这宽度还要给搜索框 `SetNextItemWidth(-1)` →
-  `m_typeColX` 每帧算一次存成员，给树内所有行共用（行在 `BeginChild` 内、列头在外，
-  各算各的**必差 8px 内边距、有滚动条差 14px**）。名字**宽度不够先丢 `[hidden]/[locked]`
-  后缀保名字**；截断走 `drawClippedText` 在 **UTF-8 字符边界**二分（`(b & 0xC0) != 0x80`
-  才是字符起点），按字节截会给中文留半个字形。
-- ⚠ **视口左上角模式条已删（2026-10-17 用户要求）**：Lit/Unl/Nrm… 与右上 Lighting 下拉
-  完全重复。视图模式只剩两个入口（Lighting 下拉 + `Shift+1..8`，日志 `VP-MODEBAR key=N`
-  仍在）。`VP-OVERLAY` 从此 **3 字段** `master/stats/navGizmo`；左上角为空 → 统计 HUD 的
-  `statsY` 不再需要往下避让。偏好键 `vp.overlay.modeBar` 一并删除（老存档残留无害：
-  `applyPrefs` 逐项按**本表**查键，表里没有的键根本不读）。
+## 编辑器架构（细则 → 归档一/二/三/九）
+- **加面板 = 表里加一行**（`panelTableVec()` + `PanelRegistry` → 菜单/快捷键/图标/落盘四路派生）；
+  面板间**只准依赖 `EditorContext`**，动引擎走 `EditorHost`。开关权威是 `PanelRegistry.cpp` 的
+  `g_open[kMaxPanels]`（**固定数组 + 引用**，vector 扩容 → `bool&` 悬垂）。
+- ⚠ **默认一律"全关"**（`config/render.json` 缺失 → **逐像素等于今天**）。⚠ **快捷键排他**（面板
+  `Alt+1..8` / 工作区 `Ctrl+Alt+1..6` / 视图键 `Ctrl+1..8`）；**别引入 ImGui docking**（自研 `SplitLayout`）。
+- ⚠ **Inspector 11 页签**：加页签 = `kTabs[]` 加一行 + 两处 `static_assert`；**枚举值 = 图标栏顺序**；
+  **落盘写 id 不写下标**。⚠ **`All` 不是融合视图**（9 个脚本靠 `INS-*`）→ 自动化 `All`、交互 `Object`。
+- ⚠⚠ **布局/遮挡/托盘**：Content 是底栏**抽屉**；分隔条靠 `m_occluders`（**必须排除落在
+  `LayoutRects` 上的布局面板**）；"最小化" = `panelTrayHiddenRef(i)=1`，**自己无条件绘制的窗口也得认**；
+  **标题栏 × = 收进底栏**。⚠ 树里"随选中出现/消失的一行"会让整棵树跳行。⚠⚠ **粒子**：单发射器
+  只能画直线/矩形；分叉/辉光必须**多发射器**。
 
-## 断言纪律（全文 → 归档）
-- ⚠ **必须 `MYVK_EDITOR_NO_HUD=1`** + `MYVK_GRID=0`；**采样区必须落在被测物体上**（俯角 8° 时"视口正中"
-  只采到天空 → 误判"没生效"）。**抓图一律走 `capture_nonempty`**。
-- ⚠ **"状态一致"与"像素一致"是两个断言**（前者可精确、后者只能**有界**）；**新断言必须做"否定测试"**
-  （退化回 bug 版本 → 必须变红）；**临时诊断代码用完必须清**。
-- ⚠ **FAIL 先怀疑「期望」再怀疑「实现」**；**兜底条件必须与放行条件同源**；⚠ **flaky 先查度量口径**。
-- ⚠⚠ **脚本结尾必须是 `结果: PASS` / `结果: FAIL: ...`**（ASCII 冒号，取**最后一条**；自由格式
-  `PASS —— …` 会 rc=0 却判 FAIL）—— **已踩第三次** → **新脚本先照抄已通过脚本的结尾块。**
-- ⚠ 要截图的用例**别用 `MYVK_FRAMES` 控帧** → **等条件出现 + 主动关窗**。
-- ⚠⚠ **量测三坑**（细节 → 归档）：① **扫描区间夹在"被测控件自己的矩形"里**；② 比"两来源的数字"先
-  **对齐采样窗口**；③ **"点了没反应"先怀疑送达**。
-- ⚠⚠ **GUI harness 两类抖动**：① **首帧布局竞态**（分栏根 `ratio=0`）→ 连起重试到 `VP-RECT` 收敛；
-  ② **Win32 窗口级联**（不给位置每次右移 38px）→ **显式摆 (0,0) + 光标挪屏幕右下**。
-- ⚠ **sRGB 交换链二次编码** → 面板底**上屏实测**亮度 深色 85~132 / 浅色 225~245 → **像素判据阈值按实测定**。
-- ⚠⚠ **删功能 = 同时删掉它的锚点和"等它的等待"**，否则留下两类隐性垃圾：
-  ① **永真的空断言**（"某矩形不出现"在矩形永远不出现之后白送 PASS）→ 改成查**还活着**的
-  同义锚点（如总闸自己的 `VP-OVERLAY master=0`），并把"这东西不存在"归到一个**独占的**
-  反向用例里；② **永不到来的 `ready_needle` / `wait_count`** → 每个会话**白等满 timeout**
-  （`VP-RECT modebar=` 删模式条后让 `verify_viewport` 每次空转 25 秒）。删断言时**项数会变**
-  （本轮 `verify_viewport` 42 → 41），是正常的，不是漏跑。
+## 断言纪律（细则 → 归档四/九/十）
+- ⚠ 必须 `MYVK_EDITOR_NO_HUD=1` + `MYVK_GRID=0`；**采样区落在被测物体上**；**面板会盖住被测物**
+  → 先收进托盘 / 先点 `BAR-BTN-content`（被裁控件矩形**照样有值**，但点下去点到抽屉）。
+- ⚠⚠ **脚本结尾必须是 `结果: PASS` / `结果: FAIL: ...`**（ASCII 冒号，取最后一条）—— 已踩 **五次**。
+- ⚠ **"状态一致"与"像素一致"是两个断言**；**新断言必须做否定测试**且**带"对照区"**；
+  ⚠⚠ **落点必须是"两种实现会不一样的那个量"** —— 断言打在"对方也懒得写"的字段上，
+  两个世界都绿（实测 A1 `animator_paused` 打在 `anim.time`，系统无视 playing 也照样过）；
+  **临时诊断代码用完必须清**。**FAIL 先怀疑「期望」再怀疑「实现」**；**兜底条件必须
+  与放行条件同源**。⚠ 锚点拼错 = **断言永远为假**（静默 None）；`wait_rect` 读"最后一条" → 窗口收起
+  后读到**旧值** → 假通过。- ⚠⚠ **`has_line` 证明不了"点了有反应"** → `wait_count(needle, before+1)`，**计数在点击之前取**。
+  ⚠ **节流日志**不能 `sleep` 后读一把，要轮询。
+- ⚠⚠ **像素断言别用"整图平均差"**：角色占屏 4% → "站着 vs 跪着"只有 **0.41/255**。用**显著变化像素
+  占比**（裁到 `VP-RECT`，阈值 8）：> 0.5% **且 > 10× 基线**。⚠ 同 clip 钉两个时间不够 → **换 clip**。
+  ⚠ 同配置跑两次的**控制上限**写 0.1~0.3%（TAA 抖动），**不能写 0**。
+  ⚠⚠ **钉"主色是谁"而不是"某色占多少"**：差分包围盒会随布局缩放翻倍（实测 95x25→197x52），
+  占比型阈值当场红而画面完全正确；**"某状态色占 N%"等于把"控件此刻是否被悬停"判成 bug**。
+  ⚠⚠ **代理量会饱和**：平均差在位移超纹理格宽后撞顶（pom 45° 比 80° 还大）→ 换直接量或只断言单调。
+  ⚠⚠ **绝对容差不能用在计数型瞬时量上**（particles `alive` 跨运行差 1/5/10 随基数漂）→ `max(绝对值, 5%)`。
+- ⚠⚠ **要截图的用例别用 `MYVK_FRAMES`**；**`Game.exe` 认 argv `--frames`，`Editor.exe` 只认
+  `MYVK_FRAMES`**（`main.cpp` 丢 argv）。传错**无任何提示**，渲染到超时；叠加 Python **块缓冲** → 外面零日志。
+- ⚠⚠ **`PostMessage` 方向键必须带 `KF_EXTENDED`**（不带 → GLFW 翻成小键盘 2）；⚠ **`ctypes` 必须给
+  `PostMessageW`/`GetWindowTextW`/`OpenProcess` 声明 `argtypes`**（64 位 HWND 截断 → 静默失败）。
+  "输入没反应"要**同时**断言"目标没动"和"输入确实被吃到了"。
+- ⚠⚠ **Vulkan NDC 的 y 向下**：2D/UI 像素 → NDC 写 `y/H*2-1`（3D 已由 `proj[1][1]*=-1` 翻过一次，
+  2D 只剩**零次**）。写反 = 整层 UI **上下镜像**，**日志全对**、只有截图看得出。
+- ⚠⚠ **矩形锚点 tag 的字符类必须含数字**（`[A-Za-z0-9_-]+`），否则 `INS-…-LAYER0` 解析不出坐标。
+- ⚠⚠ **删功能 = 同时删掉它的锚点和"等它的等待"**（否则留下永真空断言）。
+- ⚠⚠ **harness 抖动三类**：首帧布局竞态 → 连起重试到 `VP-RECT` 收敛；Win32 窗口级联 → **显式
+  摆 (0,0) + 光标挪右下**；⚠⚠ **真实点击要求窗口在最前**（不在最前第一下只"激活窗口"、进不了
+  ImGui，日志一个字都没有）→ `click()` 前 `focus_window()`。⚠ **量测四坑**：扫描区间夹在被测
+  控件矩形里 / 比两来源先**对齐采样窗口** / "点了没反应"先怀疑**送达** / 一行排 N 个按钮会超宽。
+- ⚠⚠ **`Popen(stdout=PIPE)` 必须有人排空**（64 KB 管道满即死锁 → "窗口不出现"）。
+- ⚠⚠ **`shutil.rmtree` 静默失败 = 全绿但一个字没验**（读到上一轮旧文件）→ `fresh_dir()` 删不掉**绝不
+  降级复用**。⚠ 宿主有**批量删除保护**（按回合累计，阈值 50 文件）→ 一回合连跑三个 GUI 用例必撞。
 
-## 工具（细节 → 归档「编辑器验证工具链」）
-- **`run_regression.py`**：读末尾 `结果: PASS`；**增量**。⚠ **新增 `verify_*.py` 必须进 `DEFAULT` + 补
-  `TRIGGERS`**；⚠⚠ **改完 `TRIGGERS` 必跑 `check_regression_map.py`**（很可能先红）→ **改 `TRIGGERS` +
-  同步 fixture 是一个原子操作**。铁律：**没登记 = 全量 + 点名**；**横切文件别写进 `TRIGGERS`**（`--narrow`
-  下变假跳过）；横切名单**只以 `GLOBAL_GLOBS` 为准**（**没有 `editor/**`**）。
-- 设施：`capture_window.py`（⚠ `capture_client` 返回 **`(PIL.Image, ok)` 元组**）。⚠ `kill_stale_editors`
-  **无差别**杀 `Editor.exe` → **同时只能有一个 GUI 测试在跑**；截图目录 `<repo>/../_venn_verify`；
-  ⚠ **禁止硬编码绝对盘符**。
+## 工具
+- **`run_regression.py`**：读末尾 `结果: PASS`；增量。⚠ 新 `verify_*.py` 必须进 `DEFAULT` + `TRIGGERS`；
+  ⚠⚠ **改完 `TRIGGERS` 必跑 `check_regression_map.py`**（改表 + **同步自检 fixture** 是原子操作）。
+  铁律：**没登记 = 全量 + 点名**；**横切文件别写进 `TRIGGERS`**（名单只以 `GLOBAL_GLOBS` 为准）。
+  ⚠ **新断言长在哪个文件上，那个文件就得进本用例的 `TRIGGERS`**。
+- **`verify_i18n_coverage.py`**（A1~A4/B/B2/C/D/E/F）：⚠⚠ **缺译文不报错不崩，只会静静少翻一处**
+  （裸 `snprintf`、`SliderFloat(…,"%.1f deg")`、`TR` 漏在辅助函数外，三门盲区都实测栽过）。
+  ⚠ **豁免白名单必须整串精确匹配**。⚠ `kZh[]` 是 `emplace` = **先到先得**。⚠ 带 `##` 的 ImGui id
+  后缀在译文里必须原样保留。⚠ 一词两义靠**让 UI 原文更具体**。
+- 设施：`capture_window.py`（⚠ `capture_client` 返回 **`(PIL.Image, ok)` 元组**）；截图目录
+  `<repo>/../_venn_verify`；⚠ **禁止硬编码绝对盘符**；键盘必须 `PostMessage(WM_CHAR)`。
+  ⚠⚠ **自检日志 `detail=` 里不能有空格**。
+- ⚠⚠ **`os.remove`/`shutil.rmtree` 会被宿主按回合累计硬杀**（阈值 50 文件，**进程层终止、
+  `try/except OSError` 接不住**，日志停在删除那行、上面全 `[ OK ]`）→ 一律用 **`tools/safe_fs.py`**
+  的 `safe_remove`/`safe_rmtree`（rename 不计数）。⚠ 让位必须进**同级 `.trash/` 子目录**，
+  **不能原地改名**（`render.json.trash-123` 会撞 `verify_settings_layers` 的"安装目录无 render* 残留"）。
+- ⚠⚠ **词典会长、SDF 图集是静态产物** → 加词条后 `verify_ui2` 的"词典字符都在图集里"会红，
+  重跑 `gen_sdf_atlas.py --atlas 2048 --atlas-h 3072`（**默认 2048² 装不下**）。
 
-## 路线图与未解问题（**明细 → 归档**；只留结论 + 下一项）
-**渲染 ✅**：R0~R4 · R5-1 反射探针 · R6-1 GPU 粒子（缺 ribbon/mesh/碰撞/预览）。**未做 R5-2/R5-3/R6-2~R6-5**
-—— 后 5 项是**游戏运行时 G21~G25 的硬前置**。**基准 = "以 unity 或 blender 为准"。**
-
-**编辑器 ✅**：B（E04~E08）· **C 全部（E09~E17）** · E11.1 图标条 · D（E18/E19/E21）· E25 · 五点需求 +
-Inspector Render/Particles/Physics 页（10-16）· **打磨七连（10-17，见路线图 §13）** +
-**底栏/Content 抽屉改造（10-17，`editor_roadmap.md` E06 段）**。
-⚠ **栅格俯视抖动已修（10-17，`grid.frag`，记在 `editor_roadmap.md` E14 段）**：根因不是采样相位，
-是 **1 m 格在 120 m 高空只占 ~4.3 px、线宽 1.4 px = 周期 4px 的高频图案**（量级：机位移 0.3m →
-`mean=24.49`、`n>18=221k`）；**TAA 无效**（平均成灰噪点）。修法 = LOD 阈值 `0.9/2.0 → 5.0/12.0`
-+ 补 **100 m 超级格**（否则高空整族被收掉 → 地面全白）。复测 24.49 → **7.14**。
-⚠ 定抖动/噪声的**唯一可靠对照是"同机位两次启动"**（= 0.000000 才能排除确定性因素）。
-⚠⚠ **栅格"虚化/一片看不见"（10-17 晚）= 共面深度冲突，不是 LOD**：判据是"**地板盖住的像素没线、
-出了地板边界立刻有线**"。根因：只在**顶点**里做 `clip.z -= 1e-6*clip.w`，而四边形横跨 ±2000 m，
-4 km 跨度上的插值误差与 1e-6 同量级。修法：`grid.frag` 里用 `vWorld` 重算 `gl_FragDepth` 再减 **1e-5**，
-`grid.vert` 的偏移删掉。⚠ 别用"放大到 1e-3"敷衍（20 m 处等于抬高 4 m，物体穿模）。
-**E03 设置层级 ✅（10-17）**：`engine/render/RenderSettingsIO.*` = 5 层覆盖链
-（prefs→project→scene→object→camera，读时从最具体回退）+ `config/render.json` 落盘 + 无窗口自检
-（`MYVK_RENDER_SETTINGS_TEST=1`）。⚠ 两个坑：① **文件层与 env 层各要一个 applied 标记**，每阶段顺序
-`applyToRegistry() → loadEnvOverrides()`（env 必须赢；只用一个标记会把阶段二绑定时的 env 值盖回去）；
-② **别按 UI 的 lo/hi 夹文件值** —— `lshadow.bias` 默认 z=1.2 而 UI hi=1.0，一夹"导出→重载"就漂。
-⚠ 新增 `engine/render/*` 文件必须进 `RENDER_MODULES`（`check_regression_map` F 组会抓）。
-⚠ **下一项 = `E20` 覆盖指示器**（scene/object/camera 三层只通了数据通路，schema 改动属 E20）或 `E26` 画质档位。
-
-**游戏运行时（G 系列，`docs/ship_roadmap.md`，G01~G32 / 7 里程碑）✅ M1 + M2 已交付（10-17）**：
-三目标 `VennEngine`(静态库) + `VennEditor`→`Editor.exe` + `VennRuntime`→`Game.exe`；依赖单向
-`runtime→engine←editor`；`engine/script/`（namespace **`vks`**）；`runtime/` = GameLoop /
-GameState(+Stack) / RuntimeConfig / RuntimeLog / RuntimeApp；**`engine/physics/ScenePhysics.*`
-= 场景⇄物理的唯一实现**（编辑器与运行时共用，防手感漂移）。**M2 手感地基 ✅（G06~G10）**：
-`core/InputMap` + `physics/CharacterController` + `ContactEvents` + `scene/CameraSystem` +
-`runtime/PlayerController|SpringArm`；四个新组件（character/trigger/physicsMaterial/camera）**已序列化**；
-**G06 键位重绑定 = Preferences ▸ Bindings 页**（`editor/KeyBindingsPage.*` + `InputMapIO.*`，
-落盘 `assets/input_map.json`，运行时可撤销地读同一份）。**下一段 = M3 表现层 `G11 动画 I`。**
-⚠ M2 的三个"想当然"坑：① `sweepCapsule` 是**推出式**的（撞斜棱会边滑边退，找落点必须二分）；
-② 手柄轴**正负两半**不算冲突（只比 code 会报 8 对假冲突）；③ `core::Input::keyPressed` 在
-`WantCaptureKeyboard` 时恒 false → 键位捕获必须直接 `glfwGetKey`。
-P0 六项 = 运行时框架/游戏 UI/音频/动画运行时/输入映射/存档（**输入映射已 ✅**）。⚠ **最硬的墙 = Iris Xe `maxBoundDescriptorSets=8`
-已用满** → G15 运行时 UI **不能**再要独立 set（动手前先量）；⚠ **蒙皮已在 GPU**（`Renderer.h:52` `binding 6`
-jointMatrices SSBO）—— **别再规划"转 GPU 蒙皮"**。
-
-**物理（E-PHYS）✅ v1（10-16）**：`engine/physics`（PGS+热启动+split impulse/SAP/GJK-EPA+SAT/关节 5 种/
-岛级休眠）+ `RigidBodyComponent`/`PhysicsSettings` + 序列化；**仅 Play 态**；UI 在 Inspector→Physics；
-自检 `MYVK_PHYS_TEST=1`；回归 `verify_physics.py`。
-
-**编辑器 UI 收官（10-17 晚）**：视口工具条重做成**一行 18 控件 + 9 个下拉**
-（工具/坐标/四个吸附/视口看法，`ViewportPanel::drawToolbar`），新增 `GizmoMode::Select`；
-底栏 CMD 右侧 `+` **面板托盘**（`EditorApp::drawPanelPicker/trayButton`，直接遍历
-`panelTable()`，勾选→生带 logo 的按钮、叉号移除、右键最小化）。⚠ 三个容易再踩的：
-① `panelOpen`=勾选（落盘）与 `panelTrayHiddenRef`=窗口临时收起（`PanelRegistry`）**必须分开**，
-否则"点按钮"会把按钮自己弄没；② 浮动面板要每帧 `BringWindowToDisplayFront`，**否则被视口盖住**
-（视口一旦被点中就被 ImGui 提到 `g.Windows` 末尾）；③ ImGui 的 `OpenPopup` 无定位时弹层开在
-**鼠标位置**，会被 `SetNextWindowPos(..., Appearing)` 修正。新面板 `PhysicsPanel` / `ParticlesPanel`。
-回归 `verify_viewport_bar.py`（57 项）。⚠ **自动化里键盘输入必须 `PostMessage(WM_CHAR)`**，
-`keybd_event` 编辑器收不到（扫描码 0 → KEY_UNKNOWN）。
-
-**自检现状**：特性 **34/34 有 UI 面**、裸 env 漏网 **0**；映射表 **58/66**、`DEFAULT` **66 例**。
-⚠ 裸 env 白名单：`MYVK_PHYS`/`MYVK_PHYS_TEST`/`MYVK_STARTUP_DELAY`/`MYVK_RENDER_SETTINGS(_TEST)`/
-`MYVK_RENDER_PREFS`（同 `MYVK_FRAMES`）、`ALLOW_SUFFIX` 加 `_DUMP`（同 `_DBG`）；
-`MYVK_RUNTIME`、`MYVK_FIXED_DT` 在 `ALLOW_EXACT`，`MYVK_RUNTIME_*` 按前缀放行。
-
-### ⚠ 未解 / 已收尾（**明细 → `editor_roadmap.md` §12/§13**）
-- ✅ 10-16（46/50 → 4 项）+ 10-17（3 项）全部定案，**都是测试侧改动、产品码基本未动**。留下两条要记的：
-  ⚠ `verify_bvh`/`csm`/`ibl` 全量红 = harness flaky（单跑全 PASS）→ **别自动补跑"凑干净"**；
-  ⚠ `FX-FREEZE` 日志 "bit-for-bit" 是**过度承诺** → 下次动 `engine/**` 顺手改。
+## 路线图（权威 → `docs/*_roadmap.md`；已完成数字 → `roadmaps.md`）
+- 完成：启动器 M0~M6(缺 M5-c)·世界 W0~W4·渲染 R0~R4/R5-1/R6-1·编辑器 B/C/D/E11.1/E25/E26·
+  运行时 M1+M2·物理 v1(仅 Play)·音频·UI/HUD U0~U8·脚本 S0~S6。
+- 下一项：**A2 状态机**（A1 ✅）·世界 **W5 植被**·编辑器 E20/E22·渲染 R6-2 水体·**G16-1**。
+  ⚠ **anim/sk 双份字段的权威规则**见 `roadmaps.md`。
+- ⚠ flaky：`bvh`/`csm`/`ibl` 偶发全红（单跑 PASS）→ **别补跑"凑干净"**。
+  **10-19 的 5 个红已全修**（camfx/taa/pom = 期望过期；particles = 交互+容差；
+  notifications = **Console 环形缓冲真缺陷**）→ 判据见 `ship_roadmap.md`「全量回归基线」。

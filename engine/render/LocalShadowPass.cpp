@@ -344,9 +344,7 @@ void LocalShadowPass::createPipeline() {
 
 void LocalShadowPass::render(VkCommandBuffer cmd, scene::Scene& scene,
                              VkDescriptorSet frameSet, uint32_t frameIndex,
-                             uint32_t layer, const glm::mat4* clip,
-                             const std::unordered_map<const assets::Mesh*, int>*
-                                 jointBases) {
+                             uint32_t layer, const glm::mat4* clip) {
     if (m_frames.empty() || layer >= kMaxLayers) return;
     Frame& f = m_frames[frameIndex % m_frames.size()];
 
@@ -413,11 +411,13 @@ void LocalShadowPass::render(VkCommandBuffer cmd, scene::Scene& scene,
         push.model = world;
         // which.y = 1 → shadow.vert 从 binding11 的 records[layer] 取矩阵
         push.which = glm::vec4(static_cast<float>(layer), 1.0f, 0.0f, 0.0f);
-        // 蒙皮网格：jointBase 必须与主前向路径一致，否则阴影是绑定姿势
-        if (jointBases) {
-            const auto jt = jointBases->find(mc.mesh);
-            if (jt != jointBases->end() && jt->second >= 0) {
-                push.skin = glm::vec4(static_cast<float>(jt->second), 0.0f,
+        // 蒙皮网格：jointBase 必须与主前向路径一致，否则阴影是绑定姿势。
+        // 沿父链取本实体的组件值（不能按 const Mesh* 查表 —— 同 FBX 的
+        // 多个实例 Mesh 指针相同，会互相覆盖）。
+        if (const auto* skc =
+                scene.findInAncestors<ecs::SkinnedMeshComponent>(e)) {
+            if (skc->jointBase >= 0) {
+                push.skin = glm::vec4(static_cast<float>(skc->jointBase), 0.0f,
                                       1.0f, 0.0f);
             }
         }

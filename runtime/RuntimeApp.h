@@ -21,6 +21,7 @@
 // ============================================================
 
 #include "core/Application.h"
+#include "animation/AnimatorSystem.h"
 
 #include "GameLoop.h"
 #include "GameState.h"
@@ -29,6 +30,11 @@
 #include "RuntimeConfig.h"
 
 #include "core/InputMap.h"
+#include "ui/Hud.h"
+#include "ui/HudModel.h"
+#include "ui/PauseMenu.h"
+#include "ui2/UiFocus.h"
+#include "audio/AudioSystem.h"        // G14-5：整条音频链的门面
 #include "physics/ContactEvents.h"
 #include "physics/ScenePhysics.h"   // SceneBinding（按值持有，需要完整类型）
 
@@ -44,6 +50,7 @@ class Scene;
 
 namespace vks {
 class ScriptEngine;
+class ScriptRuntime;
 }
 
 namespace runtime {
@@ -73,14 +80,35 @@ private:
     int runScripts(float dt);
     void pumpContactEvents();
     void dumpPhysicsBodies(const char* tag);
+    // UI tick（U6）：**每帧都跑，在状态栈之外**。采样导航键 → 推进焦点栈
+    // → 产出 `m_svc.uiAction`（暂停菜单选了哪一项）。
+    void tickUi(float dt);
+    // 音频每帧（G14-5）：listener = 相机；把场景里的 AudioSourceComponent
+    // 收集成 SourceUpdate 喂给 AudioSystem。⚠ **只读世界**（§3.6）：
+    // 这里一个 `world().get<T>()` 的非 const 引用都不许拿去写。
+    void syncAudio(float dt, bool focused);
+
+    // 把宿主能力（HUD / 音频 / print / 错误）接到 ScriptRuntime 上。
+    // 只在初始化时调用一次 —— S0 之前这些 std::function 是每帧每实体重建的。
+    void installScriptServices();
 
     RuntimeConfig m_cfg;
     GameLoop m_loop;
     GameStateStack m_stateStack;
     GameServices m_svc;
 
-    std::unique_ptr<vks::ScriptEngine> m_scripts;
+    // ---- 脚本（S0）----
+    // 唯一的 tick 内核：与编辑器共用 `vks::ScriptRuntime`。S0 之前这里和
+    // EditorApp 各有一份复制粘贴的循环，能力已经分叉（编辑器那份没接
+    // HUD/音频）—— P2 的根治就是把循环搬进 engine。
+    std::unique_ptr<vks::ScriptRuntime> m_scriptRuntime;
+    vks::ScriptEngine* m_scripts = nullptr;  // = &m_scriptRuntime->engine()
     physics::SceneBinding m_binding;
+
+    // 骨骼动画（A0-3）：推进 SkinnedMeshComponent::time 并重算关节矩阵。
+    // 在 simulate() 里排在物理**之前**（A4 的根运动是物理的输入），
+    // 与编辑器 Play 的顺序一致。
+    animation::AnimatorSystem m_animator;
 
     // ---- M2：输入 / 角色 / 相机 / 接触事件 ----
     core::InputMap m_input;
@@ -90,12 +118,37 @@ private:
     bool m_contactTrace = false;
     int m_playerDumpEvery = 0;
 
+    // ---- M3：UI（U6 焦点 / U8 暂停菜单）----
+    //
+    // ⚠ 暂停的**权威在状态栈**（topName()=="Paused"），`m_lastUiState`
+    //   只是"上一帧是什么"的缓存，用来只在变化时改光标/输入上下文 ——
+    //   每帧都 pushContext 会让上下文栈无限增长。
+    PauseMenu m_pause;
+    // HUD：数据（HudModel）每帧由 simulate 推进，绘制由 Hud 在输出 pass 里做。
+    // ⚠ 两者分开是为了"数据能无窗口断言"（见 HudModel.h 的头注释）。
+    Hud m_hud;
+    HudModel m_hudModel;
+    ui2::UiFocusStack m_focus;
+    int m_lastUiState = -1;   // -1 未知 / 0 游戏中 / 1 暂停；首次必应用
+    // 请求压 Paused（tickUi 只置意图，迁移在 onUpdate 末尾统一做）
+    bool m_pauseRequested = false;
+    bool pausedNow() const;
+
+    // ---- 音频（G14-5）----
+    // ⚠ 门面是**栈上成员**，不做单例（§4.2：单例会让"两份音频系统"没法共存，
+    //   而且退出顺序变得不可控）。设备打不开时所有 API 变空操作。
+    audio::AudioSystem m_audio;
+    // 每帧复用的声源缓冲（避免每次 applySources 都堆分配）
+    std::vector<audio::SourceUpdate> m_audioSrcs;
+    // AUDIO-LISTENER 只打一次（每帧打会把日志淹掉，R15）。
+    // ⚠ 用成员而不是函数内 `static`：static 会被所有实例共享，
+    //   将来一份进程里开两个 App 就只有一个能打。
+    bool m_audioListenerLogged = false;
+
     // 不透明状态在栈顶时（MainMenu）世界不画，但仍要提交一帧
     // （否则 ImGui 的帧不闭环、交换链也不推进）。用一份空场景当背景。
     std::unique_ptr<scene::Scene> m_menuScene;
 
-    // 脚本运行期错误去重（同一实体同一条错误只报一次）
-    std::unordered_map<unsigned, std::string> m_scriptErrors;
     // 从进入 Playing 起算的仿真帧数（确定性对照用；与编辑器的
     // m_physicsFrames 同语义、同起点）
     std::uint64_t m_simFrames = 0;

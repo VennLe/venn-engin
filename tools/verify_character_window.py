@@ -27,7 +27,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from capture_window import capture_client, find_window, user32        # noqa: E402
 from verify_add_menu import (LogTap, click, kill_stale_editors,
-                             open_menu_and_click, wait_rect)   # noqa: E402
+                             open_menu_and_click, region_diff,
+                             wait_rect)   # noqa: E402
 from verify_asset_drag import client_to_screen, force_foreground      # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -254,6 +255,62 @@ def main():
         img.save(png)
         check("角色窗口截图已保存", os.path.exists(png), png)
 
+        # ---- 9b) 标题栏三个按钮：最小化 / 托盘恢复 / 叉号（2026-10-18 用户报的 bug）----
+        #
+        # 用户原话："角色窗口的最小化按钮点击会消失且无法正常最小化窗口，
+        # 此时继续点叉号也无法正常退出角色窗口。"
+        #
+        # 根因（两件事叠在一起，只有一条是产品 bug）：
+        #   ① `drawPanelMinimizeButtons` 的"最小化"= 把 `panelTrayHiddenRef`
+        #      置 1（收进底栏托盘）。其它浮动面板靠 `drawPanels` 里的
+        #      `if (panelTrayHiddenRef(i)) continue;` 生效，但 Character 的
+        #      窗口是 `drawCharacterWindow()` **无条件绘制**的 —— 位被置了、
+        #      按钮因为 hidden 被跳过而消失、窗口却照画。
+        #   ② 于是"叉号也退不出去"其实只是①的错觉：窗口一直在，用户点的
+        #      那颗叉号根本没有落在标题栏该在的位置（窗口没最小化，但按钮
+        #      栏的布局已经按"最小化"跳过了）。
+        #
+        # 断言必须**逐条**压住：只看"点完窗口还在不在"会把两种失败混成一种。
+        #   N1 最小化 → 窗口真的从屏幕上消失（整块矩形像素差明显 > 0）
+        #   N2 底栏托盘按钮 → 窗口原样回来（像素差 ≈ 0，不能是"重开了一个新的"）
+        #   N3 叉号 → 窗口消失，且日志给出 user-close（而不是被同步逻辑又开回来）
+        if win_rect:
+            min_rect = wait_valid_rect(tap, "PANEL-MIN character", 4.0)
+            check("拿到角色窗口的最小化按钮（PANEL-MIN character）",
+                  min_rect is not None)
+            if min_rect:
+                # ⚠ 采样区只用**标题栏左侧那一条**（静态文字，没有动画）。
+                #   不能拿整块窗口比 N1/N2：第七步点过动画条目，预览视口里
+                #   的人物**正在播放** —— 两次截图的人形必然不同，那个差异
+                #   会把"最小化/恢复"的真实信号淹掉（MEMORY「量测三坑」②：
+                #   比两个来源的数字前先把采样窗口对齐）。
+                band = (int(win_rect[0]) + 8, int(win_rect[1]) + 2,
+                        int(win_rect[0]) + 280, int(win_rect[1]) + 24)
+
+                before = capture_client(hwnd)[0]
+                click(hwnd, (min_rect[0] + min_rect[2]) * 0.5,
+                      (min_rect[1] + min_rect[3]) * 0.5)
+                time.sleep(1.2)
+                after_min = capture_client(hwnd)[0]
+                d_min = region_diff(before, after_min, band)
+                st_hidden = any("PANEL-STATE character open=0" in l
+                                for l in grep_lines(tap, "PANEL-STATE character"))
+                check("N1 点最小化 → 窗口真的收起来了（标题栏让位）",
+                      d_min > 3.0 and st_hidden,
+                      "diff=%.2f open0=%s" % (d_min, st_hidden))
+
+                # N2：底栏托盘按钮把它原样叫回来
+                tray = wait_valid_rect(tap, "BAR-TRAY-character", 3.0)
+                check("拿到底栏托盘按钮（BAR-TRAY-character）", tray is not None)
+                if tray:
+                    click(hwnd, (tray[0] + tray[2]) * 0.5,
+                          (tray[1] + tray[3]) * 0.5)
+                    time.sleep(1.2)
+                    after_back = capture_client(hwnd)[0]
+                    d_back = region_diff(before, after_back, band)
+                    check("N2 点托盘按钮 → 窗口原样回来（标题栏逐像素）",
+                          d_back < 2.0, "diff=%.2f" % d_back)
+
         # ---- 10) 拖住窗口右下角改大小（2026-10-17 用户报的崩溃）----
         #
         # 症状：用鼠标拖角色窗口的边框改大小 → 程序直接退出。
@@ -294,6 +351,34 @@ def main():
             img = capture_client(hwnd)[0]
             png2 = os.path.join(OUT_DIR, "character_window_resized.png")
             img.save(png2)
+
+        # ---- 10b) 叉号：点完必须真的退出去（2026-10-18 用户报的 bug）----
+        #
+        # 放在**拖动改尺寸之后**做：一是窗口此时已经是最终几何（不用为
+        # "关掉再重开"再造一个角色），二是顺带证明"改过大小之后叉号一样好使"。
+        #
+        # ⚠ 坐标用**相对窗口右边缘的偏移**推：叉号在最小化按钮右边一格
+        #   （见 imgui.cpp:RenderWindowTitleBarContents 的 close_pos）。
+        #   拿拖动前的绝对坐标去点会点到别处 —— 那正是"点了没反应"的经典误判
+        #   （见 MEMORY「量测三坑」②：比两个来源的数字先对齐采样窗口）。
+        if win_rect and min_rect:
+            fs = min_rect[2] - min_rect[0]
+            dx_right = win_rect[2] - (min_rect[2] + 2.0 + fs * 0.5)
+            dy_top = (min_rect[1] + fs * 0.5) - win_rect[1]
+            cur = wait_valid_rect(tap, "CHAR-WIN", 2.0) or win_rect
+            band_x = (int(cur[0]) + 8, int(cur[1]) + 2,
+                      int(cur[0]) + 280, int(cur[1]) + 24)
+            before_x = capture_client(hwnd)[0]
+            n0 = len(grep_lines(tap, "reason=user-close"))
+            click(hwnd, cur[2] - dx_right, cur[1] + dy_top)
+            time.sleep(1.3)
+            after_x = capture_client(hwnd)[0]
+            d_x = region_diff(before_x, after_x, band_x)
+            n1 = len(grep_lines(tap, "reason=user-close"))
+            check("N3 点叉号 → 窗口退出（user-close + 像素差 > 3）",
+                  d_x > 3.0 and n1 > n0,
+                  "diff=%.2f user-close %d→%d" % (d_x, n0, n1))
+            check("N3b 退出后进程仍存活", proc.poll() is None)
 
         # ---- 11) 无验证层报错 ----
         errors = grep_lines(tap, r"(ERROR|VALIDATION|VUID)")

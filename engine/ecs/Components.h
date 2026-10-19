@@ -12,6 +12,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace assets {
@@ -120,9 +121,100 @@ struct SkinnedMeshComponent {
     float time = 0.0f;                    // 当前动画时刻（秒），由上层推进
     float speed = 1.0f;                   // 播放速度倍率
     bool playing = true;                  // 是否播放
+    // 播到末尾怎么办：true → 绕回开头；false → 停在最后一帧。
+    // 加它之前 time 无人推进（全仓库唯一写入点是预览窗口的滑条），
+    // 所以这个语义是在 A0-3 接上时间推进时一起定下来的：
+    // **默认 true**（一段 Walk 播完应该接着走，而不是定格）。
+    bool loop = true;
 
-    // 派生数据：本模型在骨骼 SSBO 里的关节矩阵起始下标（渲染层填）
+    // 派生数据：本模型在骨骼 SSBO 里的关节矩阵起始下标（渲染层填）。
+    // ⚠ 这个值是**逐实体**的。以前渲染层按 `Mesh*` 建映射
+    //   （`Renderer::m_skinJointBase`），同一 FBX 实例化两次时第二个会
+    //   覆盖第一个 → 多个角色串成同一个姿势。现在权威在这里。
     int jointBase = -1;
+
+    // 派生数据：本实体的关节矩阵输出缓冲（每帧由 AnimatorSystem 重算，
+    // 渲染层只负责 memcpy 进 SSBO）。长度 = 骨架关节数。
+    // ⚠ 不要对它做按字节的撤销快照（它是 vector，memcpy 一个 std::vector
+    //   是未定义行为）——Inspector 改动画字段走的是逐字段命令。
+    std::vector<glm::mat4> jointMatrices;
+};
+
+// ---------------- 动画器（角色链 A1）----------------
+//
+// 与 SkinnedMeshComponent 的分工：
+//   · SkinnedMeshComponent = "这个实体是骨骼网格体" + 渲染侧派生数据
+//     （jointBase / jointMatrices）+ **老场景**的播放状态
+//   · AnimatorComponent   = "谁来驱动它、播什么"（本组件）
+//
+// 为什么不直接往 SkinnedMeshComponent 里加字段：
+//   A2 状态机 / A3 层与遮罩 / A4 根运动都只对"配了控制器的角色"有意义，而
+//   场景里大多数蒙皮实体（角色预览窗口的私有预览场景、只播一段待机动作的
+//   道具）只需要"单 clip 直放"。塞进一个组件就得给每个新字段写"空值 =
+//   老行为"的分支，Inspector 也只好显示一堆用不上的控件。
+//   所以：**只有真要控制器的人**才挂本组件。
+//
+// ⚠⚠ 权威关系（两个组件各有一份 time/speed/playing/loop，必须写清楚）：
+//   · **没有** AnimatorComponent → SkinnedMeshComponent 那四项是权威，
+//     行为与 A0 逐位相同（老场景 / 预览场景走的就是这条）
+//   · **有** AnimatorComponent → **本组件的四项是权威**。AnimatorSystem 每帧
+//     把 `time` 镜像回 `SkinnedMeshComponent::time`（那是派生量：Renderer 的
+//     ANIM-SKIN 日志、控制台 `anim.time`、截图断言都读它）。镜像的写入点
+//     **只有 AnimatorSystem 一处**；Inspector 在有本组件时直接绑本组件的
+//     字段，不再写 sk 的那一份 —— 否则两个写入点每帧打架，症状是
+//     "拖了时间轴又弹回去"，而且日志看着还挺正常。
+struct AnimatorComponent {
+    // 根运动的位移契约（A4 用，这里先占位 —— 字段一次加全，别分批，
+    // 每批都要重跑一遍全量）。
+    enum class RootMotionMode : int {
+        Off = 0,        // 动画不驱动位移（"原地跑 + 代码移动"）
+        FromClip = 1,   // 位移完全由动画给（过场 / 精确对齐）
+        DeltaOnly = 2,  // 位移进物理、pose 保原位（脚不打滑但不离地）
+    };
+
+    // 骨架来源。空 → 回退用 SkinnedMeshComponent::model（同一个实体的那
+    // 一份）—— 这样"只有一个模型"的常见情况不用填两遍。
+    assets::Model* model = nullptr;
+
+    // 控制器资产（A2 起是 `assets/animators/*.anim.json`）。
+    // **空 = 单 clip 直放模式**（A1 就是这一种），此时只用 defaultClip。
+    std::string controllerPath;
+
+    // 单 clip 直放模式播哪一段。**只在 clipName 还空着时补一次**
+    // （见下面的 appliedDefaultClip）。
+    std::string defaultClip;
+
+    // ---- 权威播放状态（有本组件时以这四个为准）----
+    float time = 0.0f;      // 当前时刻（秒）
+    float speed = 1.0f;     // 播放速度倍率
+    bool playing = true;
+    bool loop = true;
+
+    RootMotionMode rootMotion = RootMotionMode::Off;
+
+    // ==================================================================
+    // 运行时（**不序列化**）
+    // ==================================================================
+
+    // A2 的状态机游标：当前状态下标 + 在该状态里待了多久。
+    // -1 = 还没初始化（A1 的单 clip 模式一直是 -1）。
+    int stateIndex = -1;
+    float stateTime = 0.0f;
+
+    // defaultClip 只补一次：补过之后把 clipName 清空 = 真的看静止姿势。
+    // 没有这个标记的话，系统会每帧把 clipName 重新填成 defaultClip ——
+    // Inspector 上那句 "empty = rest pose" 就成了谎话（点不掉的控件比
+    // 没有更糟）。
+    bool appliedDefaultClip = false;
+
+    // ---- 参数黑板（A2 的状态机从这里读）----
+    // 三张表分开存而不是一个 variant：脚本侧 setFloat / setBool / setTrigger
+    // 本来也是三个内建函数，分开就不必在每次读的时候做类型判断。
+    // trigger 的语义是**一次性待消费事件**（true = 还没被转移吃掉）。
+    // A2 会按控制器资产里的参数声明初始化它们，所以这三张表不落盘。
+    std::unordered_map<std::string, float> floatParams;
+    std::unordered_map<std::string, bool> boolParams;
+    std::unordered_map<std::string, bool> triggerParams;
 };
 
 // ---------------- 碰撞体 ----------------
@@ -546,6 +638,39 @@ struct ScriptComponent {
     float timeScale = 1.0f;    // 脚本内部 time / dt 的缩放
 };
 
+// ---------------- 音频（G14）----------------
+//
+// ⚠ 组件是**配置**，不是"一个正在播放的声音"（docs/audio_roadmap.md §3.10）。
+//   真正的声部活在 `audio::Mixer` 的 64 个槽里，由 `playOnAwake` 申请、
+//   播完释放。200 个实体各挂一个 AudioSource 也不会变成 200 路混音。
+//
+// ⚠ `bus` 用 int 而不是 `audio::BusId`：`ecs` 是叶子层，不应该认识
+//   `engine/audio`（反过来更不行）。数值对应 1=Music / 2=SFX / 3=Voice。
+struct AudioSourceComponent {
+    // 相对资产根的路径（"audio/click.wav"）。空 = 不播。
+    std::string clip;
+
+    bool playOnAwake = true;
+    bool loop = false;
+    // 3D 空间化。关掉 = 增益恒为 volume，与距离无关（2D 音效 / UI 音）。
+    bool spatial = true;
+    float volume = 1.0f;
+    float pitch = 1.0f;
+    // 距离衰减参数（公式见 audio/Mixer.h 的 spatialGain）
+    float minDist = 1.0f;
+    float maxDist = 50.0f;
+    float rolloff = 1.0f;
+    int bus = 2;           // 1=Music 2=SFX 3=Voice
+    // 长音乐用流式（3 s 环形缓冲）；音效一律 false
+    bool streaming = false;
+};
+
+// 听者标记。挂在相机实体上；**没有就用 `activeScene().camera()`**
+// （运行时与编辑器 Play 都成立 —— 那里一定有相机）。
+struct AudioListenerComponent {
+    bool enabled = true;
+};
+
 // ---------------- 反射探针（R5-1）----------------
 //
 // 一个探针 = 场景里的一个**盒体**（沿实体局部轴）。渲染器从盒体中心把
@@ -660,6 +785,27 @@ static constexpr int kMaxColorStops = 8;
 
 // 一次性爆发的上限（Unity 的 Bursts 是个可增删的数组，这里固定 4 条）。
 static constexpr int kMaxBursts = 4;
+
+// 粒子的**贴图形状**（2026-10-18）。
+//
+// 为什么是"程序化形状"而不是贴图资产：本引擎的粒子 pass 是**一次间接绘制
+// 画完所有发射器**（紧凑表 + 顶点拉取），描述符集里也没有贴图槽 —— 想要
+// "每个发射器一张 PNG"就得加一个 sampler2DArray（8 层）+ 图像数组上传，
+// 那是另一摊工程。这里先用片元里的距离场做出 8 种轮廓：默认的 0 号与
+// 改动前**逐像素相同**（同样是 (1-r²)² 的圆盘羽化），其余几种给
+// 烟 / 火花 / 光环 / 雨丝 / 雪花 / 光晕各自的边缘，视觉差异一眼可见。
+//
+// ⚠ 枚举值是**序列化契约**：只能在末尾追加，不能插入/重排。
+enum class ParticleSprite : int {
+    Disc = 0,      // 默认：软边圆盘（改动前的外观）
+    Glow = 1,      // 更软的外晕 + 亮芯（魔法、闪电辉光）
+    Spark = 2,     // 四角星芒（火花 / 闪光）
+    Smoke = 3,     // 带噪声的团（烟、尘土）
+    Ring = 4,      // 空心环（冲击波、涟漪）
+    Streak = 5,    // 竖长条（雨丝、拖尾）
+    Flake = 6,     // 六角雪花
+    Count = 7,
+};
 
 // 颜色渐变的第 i 个停靠点：xyz = 线性 HDR 颜色，w = 位置 t ∈ [0,1]。
 // 存成 vec4 而不是 (float t, vec3 rgb) 是为了让 std430 的数组步长
@@ -853,6 +999,8 @@ struct ParticleEmitterComponent {
     //  Renderer
     // ======================================================================
     float startSize = 0.18f;                  // 基础尺寸（米，billboard 边长）
+    // 贴图形状（见 ParticleSprite）。默认 Disc = 与改动前逐像素相同。
+    ParticleSprite sprite = ParticleSprite::Disc;
     ParticleBlend blend = ParticleBlend::Additive;
     ParticleRenderMode renderMode = ParticleRenderMode::Billboard;
     ParticleSortMode sortMode = ParticleSortMode::None;
@@ -872,6 +1020,53 @@ struct ParticleEmitterComponent {
     float softDistance = 0.5f;  // 淡化距离（米）
 
     bool enabled = true;
+};
+
+// ============================================================
+// ScriptVarsComponent —— 脚本的**逐实体黑板**（S2）
+//
+// `setAttr(e, "hp", 80)` 写的地方。为什么是组件而不是"脚本实例里的一个
+// map"：
+//   · 黑板按**实体**索引，而脚本实例按"实体 + 脚本路径"索引。一个实体上
+//     可以挂两个脚本，它们必须看到同一份 hp；反过来实体没挂脚本时
+//     Inspector 也该能读出 hp（S5）。
+//   · 实体被删掉时组件随之消失 —— 不会像实例表那样留下悬垂条目。
+//
+// ⚠ 这个组件**不进存档**（运行期状态）。要"跨存档保住的东西"用
+//   `worldAttr` → `Scene::scriptVars`，两者刻意分开：逐实体黑板是
+//   "这一局的血量"，世界黑板是"这关的进度"。
+// ⚠ 只存 double。vec3 请拆成 x/y/z 三键 —— 黑板是玩法用的，不是通用
+//   数据容器，类型越少越不容易在脚本里搞错。
+// ============================================================
+struct ScriptVarsComponent {
+    std::unordered_map<std::string, double> values;
+};
+
+// ============================================================
+// TerrainComponent —— 地形（W4）
+//
+// 一个地形实体 = 一份 `.vterrain` 资产 + 一个变换。**没有网格组件**：
+// 几何完全由资产里的高度图与分块 LOD 生成，渲染器自己管顶点缓冲
+// （见 render/TerrainPass.h），物理层拿同一份高度当高度场
+// （见 physics/Heightfield.h）。
+//
+// 为什么 heightScale 放在组件上而不是只放资产里：
+//   同一个 `hills.vterrain` 可以摆两座"同一形状、不同起伏"的山。
+//   ⚠ 渲染与物理**必须都读这一个值**：物理侧用 heightAt 得到的高度与
+//     渲染侧顶点位移的高度一旦不同，角色就会悬空或陷进地里 —— 而画面
+//     完全正常（只是"贴地不准"），极难定位。
+// ============================================================
+struct TerrainComponent {
+    // 相对 assets/ 的 `.vterrain` 路径，例如 "terrain/hills/terrain.vterrain"
+    std::string source;
+    bool visible = true;
+    // 高度倍率：乘在 `.vterrain` 的 maxHeight 上。1.0 = 原样。
+    float heightScale = 1.0f;
+    // 4 层材质 id 覆盖（空串 = 用 `.vterrain` 里写的）。
+    // 改它需要重建地形实例（贴图与层参数 UBO 都在实例里），
+    // 所以把 dirty 置位即可 —— 渲染层下一帧会重建。
+    std::string layerOverrides[4];
+    bool dirty = false;
 };
 
 } // namespace ecs

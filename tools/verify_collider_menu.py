@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from capture_window import capture_client, find_window, user32        # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors               # noqa: E402
 from verify_asset_drag import client_to_screen, force_foreground     # noqa: E402
+from safe_fs import safe_remove
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
@@ -500,7 +501,7 @@ def main():
             print("note:", n)
         if not args.keep_scene:
             try:
-                os.remove(scene_path)
+                safe_remove(scene_path)
                 os.rmdir(tmpdir)
             except OSError:
                 pass

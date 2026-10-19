@@ -45,6 +45,12 @@ private:
     void addPreset(int preset);
     // 清单一行。返回 true = 这一行被点了（选中）。
     bool emitterRow(ecs::Entity e, const char* name, int index);
+    // 「选中发射器」那一整段（模块化属性编辑）。
+    // 只在选中的实体**真的带 ParticleEmitterComponent** 时才画；否则给一行
+    // "先在清单里点一行"的提示。**参数一律直接读写该实体的组件** ——
+    // 这是"Smoke 1 显示 Smoke 1 的配置"的唯一实现方式（2026-10-18 用户
+    // 明确要求：不同类型/不同实例的参数必须各自独立，不能共用一份）。
+    void drawSelectedEmitter(ecs::Entity e, ecs::ParticleEmitterComponent* fx);
     // 右键菜单里那三项（重命名开始 / 复制 / 删除）
     void beginRename(ecs::Entity e);
     void commitRename(ecs::Entity e);
@@ -55,6 +61,10 @@ private:
     render::Renderer& m_renderer;
     // 清单里选中行的"上一次日志签名"，只在变化时打一行（不刷爆日志）
     unsigned m_lastListSig = 0;
+    // 「选中发射器」那一段的日志签名：id + 关键参数。只在变化时打一行
+    // `FX-SEL id=.. rate=.. life=.. sprite=..`，自动化据此断言"面板显示的
+    // 确实是这一个发射器的值"（比截图像素比对稳定得多）。
+    unsigned m_selSig = 0;
 
     // ---- 重命名（行内编辑）----
     // 只允许一行处于编辑态：记 id 而不是下标（清单每帧重排，下标会指向别人）

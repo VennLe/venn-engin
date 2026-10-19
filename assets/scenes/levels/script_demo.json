@@ -1,0 +1,649 @@
+{
+  "version": 1,
+  "generator": "gen_script_demo.py (S6): 1 ground + player + 3 patrols + 2 doors + 5 pickups + 1 director, all logic in .vks",
+  "camera": {
+    "target": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "yaw": 0.0,
+    "pitch": -18.0,
+    "distance": 18.0,
+    "fov": 55.0
+  },
+  "light": {
+    "direction": [
+      0.42,
+      0.66,
+      -0.62
+    ],
+    "color": [
+      1.0,
+      0.96,
+      0.9
+    ],
+    "intensity": 3.2,
+    "castsShadow": true,
+    "ambientScale": 1.0
+  },
+  "physics": {
+    "enabled": true,
+    "groundPlane": true,
+    "fixedTimeStep": 0.0166666675,
+    "maxSubSteps": 4,
+    "allowSleep": true
+  },
+  "entities": [
+    {
+      "name": "Ground",
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": false,
+      "locked": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "plane",
+        "size": 60.0,
+        "name": "demo_ground"
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/ground.vmat",
+        "name": "materials/ground",
+        "id": "materials/ground"
+      }
+    },
+    {
+      "name": "Player",
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cylinder",
+        "size": 1.0,
+        "name": "demo_player"
+      },
+      "primitive": {
+        "kind": "cylinder",
+        "size": 0.9,
+        "radius": 0.35,
+        "segments": 16,
+        "rings": 1
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/skin.vmat",
+        "name": "materials/skin",
+        "id": "materials/skin"
+      },
+      "character": {
+        "radius": 0.35,
+        "halfHeight": 0.55,
+        "stepHeight": 0.35,
+        "slopeLimitDeg": 46.0,
+        "groundSnap": true,
+        "groundSnapDistance": 0.3,
+        "gravityScale": 1.0,
+        "maxSpeed": 4.5,
+        "sprintMultiplier": 2.0,
+        "jumpSpeed": 5.0,
+        "acceleration": 40.0,
+        "airControl": 0.25,
+        "turnSpeed": 12.0,
+        "pushStrength": 1.0,
+        "enabled": true
+      },
+      "camera": {
+        "fov": 55.0,
+        "priority": 10,
+        "enabled": true,
+        "targetOffset": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "distance": 18.0,
+        "minDistance": 1.0,
+        "collideWithWorld": false,
+        "shakeAmplitude": 0.0,
+        "shakeFrequency": 24.0
+      }
+    },
+    {
+      "name": "Patrol_A",
+      "transform": {
+        "position": [
+          4.0,
+          0.0,
+          0.6
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          0.8,
+          0.8,
+          1.2
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "demo_patrol"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/crate.vmat",
+        "name": "materials/crate",
+        "id": "materials/crate"
+      },
+      "script": {
+        "path": "scripts/enemy_patrol.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    },
+    {
+      "name": "Patrol_B",
+      "transform": {
+        "position": [
+          6.0,
+          5.0,
+          0.6
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          0.8,
+          0.8,
+          1.2
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "demo_patrol"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/crate.vmat",
+        "name": "materials/crate",
+        "id": "materials/crate"
+      },
+      "script": {
+        "path": "scripts/enemy_patrol.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    },
+    {
+      "name": "Patrol_C",
+      "transform": {
+        "position": [
+          6.0,
+          -5.0,
+          0.6
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          0.8,
+          0.8,
+          1.2
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "demo_patrol"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/crate.vmat",
+        "name": "materials/crate",
+        "id": "materials/crate"
+      },
+      "script": {
+        "path": "scripts/enemy_patrol.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    },
+    {
+      "name": "Door_A",
+      "transform": {
+        "position": [
+          2.0,
+          0.0,
+          1.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          0.2,
+          1.6,
+          2.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "demo_door"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/metal.vmat",
+        "name": "materials/metal",
+        "id": "materials/metal"
+      },
+      "script": {
+        "path": "scripts/door_timer.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    },
+    {
+      "name": "Door_B",
+      "transform": {
+        "position": [
+          0.0,
+          2.5,
+          1.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          90.0
+        ],
+        "scale": [
+          0.2,
+          1.6,
+          2.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "demo_door"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/metal.vmat",
+        "name": "materials/metal",
+        "id": "materials/metal"
+      },
+      "script": {
+        "path": "scripts/door_timer.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    },
+    {
+      "name": "Pickup_0",
+      "transform": {
+        "position": [
+          0.0,
+          -1.2,
+          0.4
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          0.4,
+          0.4,
+          0.4
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "sphere",
+        "size": 0.4,
+        "name": "demo_pickup"
+      },
+      "primitive": {
+        "kind": "sphere",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/cloth.vmat",
+        "name": "materials/cloth",
+        "id": "materials/cloth"
+      },
+      "script": {
+        "path": "scripts/pickup.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    },
+    {
+      "name": "Pickup_1",
+      "transform": {
+        "position": [
+          1.1413,
+          -0.3708,
+          0.4
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          0.4,
+          0.4,
+          0.4
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "sphere",
+        "size": 0.4,
+        "name": "demo_pickup"
+      },
+      "primitive": {
+        "kind": "sphere",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/cloth.vmat",
+        "name": "materials/cloth",
+        "id": "materials/cloth"
+      },
+      "script": {
+        "path": "scripts/pickup.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    },
+    {
+      "name": "Pickup_2",
+      "transform": {
+        "position": [
+          0.7053,
+          0.9708,
+          0.4
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          0.4,
+          0.4,
+          0.4
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "sphere",
+        "size": 0.4,
+        "name": "demo_pickup"
+      },
+      "primitive": {
+        "kind": "sphere",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/cloth.vmat",
+        "name": "materials/cloth",
+        "id": "materials/cloth"
+      },
+      "script": {
+        "path": "scripts/pickup.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    },
+    {
+      "name": "Pickup_3",
+      "transform": {
+        "position": [
+          -0.7053,
+          0.9708,
+          0.4
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          0.4,
+          0.4,
+          0.4
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "sphere",
+        "size": 0.4,
+        "name": "demo_pickup"
+      },
+      "primitive": {
+        "kind": "sphere",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/cloth.vmat",
+        "name": "materials/cloth",
+        "id": "materials/cloth"
+      },
+      "script": {
+        "path": "scripts/pickup.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    },
+    {
+      "name": "Pickup_4",
+      "transform": {
+        "position": [
+          -1.1413,
+          -0.3708,
+          0.4
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          0.4,
+          0.4,
+          0.4
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "sphere",
+        "size": 0.4,
+        "name": "demo_pickup"
+      },
+      "primitive": {
+        "kind": "sphere",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/cloth.vmat",
+        "name": "materials/cloth",
+        "id": "materials/cloth"
+      },
+      "script": {
+        "path": "scripts/pickup.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    },
+    {
+      "name": "Director",
+      "transform": {
+        "position": [
+          0.0,
+          -3.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": null,
+      "material": null,
+      "script": {
+        "path": "scripts/hud_counter.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    }
+  ]
+}

@@ -27,8 +27,11 @@
 #include "EditorApp.h"
 
 #include "core/Logger.h"
+#include "animation/AnimationSelfTest.h"
 #include "physics/PhysicsSelfTest.h"
+#include "project/ProjectFile.h"
 #include "render/RenderSettingsIO.h"
+#include "ui2/Ui2SelfTest.h"
 
 #include <cstdlib>
 #include <exception>
@@ -72,9 +75,33 @@ int main(int argc, char** argv) {
             return failures == 0 ? 0 : 1;
         }
 
+        // 骨骼动画自检（角色链 A0-3/A0-5）：同样在 Vulkan 之前返回。
+        // 覆盖"时间推进 / 循环回绕 / 逐位重构不变性 / 混合端点 / 层次顺序"，
+        // 全部是纯数值 —— 这条链过去一个用例都没有，正是因为采样埋在
+        // Renderer 里、必须开 GUI 才能验证。见 animation/AnimationSelfTest.h。
+        if (std::getenv("MYVK_ANIM_TEST") != nullptr) {
+            const int failures = animation::runAnimationSelfTest();
+            return failures == 0 ? 0 : 1;
+        }
+
+        // 游戏 UI 自检（U0~U6）：同样在 Vulkan 之前返回。覆盖缩放公式 /
+        // 默认值 / 字体度量 / 文本换行 / 布局比例 / 焦点导航 —— 全是纯 CPU
+        // 数值，不需要设备。见 ui2/Ui2SelfTest.h。
+        if (std::getenv("MYVK_UI2_TEST") != nullptr) {
+            const int failures = ui2::runUi2SelfTest();
+            return failures == 0 ? 0 : 1;
+        }
+
+        // 工程数据模型自检（启动器 M0/M2）：与上面四条同一条"Vulkan 之前
+        // 返回"的路。⚠ 走 **env** 而不是 argv —— `Editor.exe` 丢弃命令行
+        // （见文件头 P1：`Editor.exe --frames` 会照常渲染到超时且零提示）。
+        if (std::getenv("MYVK_PROJECT_TEST") != nullptr) {
+            const int failures = project::runProjectSelfTest();
+            return failures == 0 ? 0 : 1;
+        }
+
         editor::EditorApp app;
-        return app.run(maxFrames);
-    } catch (const std::exception& e) {
+        return app.run(maxFrames);    } catch (const std::exception& e) {
         VK_LOG_ERROR("Fatal: %s", e.what());
         return 1;
     }

@@ -1,0 +1,16 @@
+# G14-8 验收夹具：脚本内置音频函数。
+#
+#   期望（`Game.exe --scene scenes/runtime_test/audio_scene.json`）：
+#     · `AUDIO-PLAY ... clip=audio/tone_1k_mono.wav bus=2`   ← playSound
+#     · `music` 那条 setBusVolume **不**留下 "unknown bus" 警告
+#     · `musik` 那条**必须**留下警告（认不出要留痕，不许静默忽略）
+#
+# ⚠ 用区间 `frame >= 20 && frame < 21` 而不是 `frame == 20`：内置的 `frame`
+#   是渲染循环帧号，而脚本每个**定步**求值一次 —— 一个渲染帧里跑两个定步时
+#   两条求值拿到同一个 frame，条件会命中两次以上（U8 的 hud_damage.vks
+#   踩过 `==` 的坑）。所以这里**不假设"只播一次"**，断言只要求 "at least 1"。
+if (frame >= 20 && frame < 21) playSound("audio/tone_1k_mono.wav")
+if (frame >= 22 && frame < 23) setBusVolume("music", 0.3)
+if (frame >= 24 && frame < 25) setBusVolume("musik", 0.3)
+# 停掉全部一次性音效：链路能跑到就够了（声音早放完了，没有"听得出来"的断言）。
+if (frame >= 30 && frame < 31) stopAllSounds()

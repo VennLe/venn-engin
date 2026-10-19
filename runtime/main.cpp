@@ -49,6 +49,18 @@
 #include "scene/CameraSystem.h"
 
 #include "PlayerController.h"
+#include "ui/HudSelfTest.h"
+
+#include "audio/AudioSelfTest.h"
+#include "assets/LodSelfTest.h"
+#include "assets/MaterialSelfTest.h"
+#include "render/QualityPresets.h"
+#include "project/ProjectCreate.h"
+#include "project/ProjectDisplay.h"
+#include "project/ProjectFile.h"
+#include "project/RecentList.h"
+#include "script/ScriptSelfTest.h"
+#include "terrain/TerrainSelfTest.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -365,10 +377,64 @@ int main(int argc, char** argv) {
             return scene::runCameraSelfTest() == 0 ? 0 : 1;
         if (cfg.selftest == "player")
             return runtime::runPlayerSelfTest() == 0 ? 0 : 1;
+        // U8：HUD 的血量追随 / 伤害数字寿命 / 血条几何 / config/ui.json 往返。
+        // 全是纯数值与文件 IO，不需要窗口也不需要 GPU。
+        if (cfg.selftest == "hud") return runtime::runHudSelfTest();
+        // E26：画质档位表（档数 / enable 清单单调 / 数值项在 UI 范围内 /
+        // 平台映射 / 落盘键数）。纯数据 —— 没有绑定参数时也能跑，
+        // 真实链路（apply -> 参数真的变了）由 GUI 用例覆盖。
+        if (cfg.selftest == "quality")
+            return render::runQualitySelfTest() == 0 ? 0 : 1;
+        // G14：解码 / 混音 / 3D / 总线 / ducking / 池 / 流式 / 确定性。
+        // ⚠ 全部**不需要声卡也不需要窗口** —— 这是整条音频路线图的地基
+        //   （docs/audio_roadmap.md §3.1：混音必须在我们自己的 POD 里，
+        //    否则"衰减对不对""ducking 降了几 dB"只能靠耳朵）。
+        if (cfg.selftest == "audio")
+            return audio::runAudioSelfTest() == 0 ? 0 : 1;
+        // G14-5：只把**解析后**的音频配置打出来就退出（不开设备、不开窗口）。
+        // 存在的理由：`AUDIO-CONFIG` 那行是 env / game.json 是否真的生效的
+        // 唯一证据，而它必须在 `parseRuntimeConfig` 之后才有值。
+        // 断言只读这一行 —— 因此这个自检是**纯文本**的，不需要声卡。
+        if (cfg.selftest == "audio-config") return 0;
+        // W1-5：材质实例语义（跟随 / 不跟随 / 位序 / 只存覆盖项）。
+        // 纯数据断言 —— 没有 AssetManager（那要真设备），测的是
+        // `Material::syncInstanceParams` 与位掩码工具。
+        if (cfg.selftest == "material")
+            return assets::runMaterialSelfTest() == 0 ? 0 : 1;
+        // W2-3：蒙皮减面（按主 joint 分组 / 权重归一化 / joint 不被平均）。
+        // 纯数据 —— `decimateClustered` 不碰 GPU，所以这个自检也不需要设备。
+        if (cfg.selftest == "lod")
+            return assets::runLodSelfTest() == 0 ? 0 : 1;
+        // W4：地形资产格式 / 高度场双线性与射线 / 分块 LOD 与裙边 /
+        // 角色在 30° 坡上不下滑。纯数值 + 文件 IO，不开窗口也不要 GPU。
+        if (cfg.selftest == "terrain")
+            return terrain::runTerrainSelfTest() == 0 ? 0 : 1;
+        // S0：脚本内核。变量跨帧存活 / 两实例独立 / 熔断 / 本地时间 /
+        // 固定步号 / 两个现成夹具逐位不变 / reset / 换脚本 / 回收。
+        // 纯数值 + 临时文件 IO，不开窗口也不要 GPU。
+        if (cfg.selftest == "script")
+            return vks::runScriptSelfTest() == 0 ? 0 : 1;
+        // S6 基准：200 实例 × 100 语句/帧的**帧时间**。与 script 分开是因为
+        // 它是性能判据（比整套 A~E 组慢一个量级），混进去会让人不想跑自检。
+        if (cfg.selftest == "scriptbench")
+            return vks::runScriptBench() == 0 ? 0 : 1;
+        // 启动器 M2：工程数据模型（路径规则 / 逃逸拒绝 / 序列化往返 /
+        // 版本拒绝 / 名称消毒 / 目标目录冲突）。纯数值 + 临时目录 IO，
+        // 不开窗口也不要 GPU —— 与上面全部同一条"Vulkan 之前返回"的路。
+        //
+        // ⚠ 四组一起跑（工程数据 / 最近列表 / 画面设置 / 模板创建）。
+        //   **聚合写在 `project::runAllProjectSelfTests()` 里**，不在这个文件里：
+        //   启动器（`Launcher.exe`）也要跑同一套，两处各写一份"四项相加"
+        //   的话，将来加第五组必然漏掉一边 —— 而漏掉的表现是"某个 exe
+        //   全绿、其实那一组从没跑过"。
+        if (cfg.selftest == "project")
+            return project::runAllProjectSelfTests() == 0 ? 0 : 1;
 
         if (!cfg.selftest.empty()) {
             VK_LOG_WARN("未知自检项 '%s'（可用：states | determinism | input | "
-                        "character | contact | camera | player）",
+                        "character | contact | camera | player | hud | audio |\n"
+                        "                        audio-config | material | lod | "
+                        "terrain | script | scriptbench | project）",
                         cfg.selftest.c_str());
         }
 

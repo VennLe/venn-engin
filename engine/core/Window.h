@@ -41,6 +41,9 @@ public:
     void setWindowPos(int x, int y);
     void windowSize(int* w, int* h) const;
     void setWindowSize(int w, int h);
+    // 改标题栏文字。启动器拉起编辑器时用 `MYVK_EDITOR_PROJECT` 传工程根，
+    // 编辑器在 onInit 里读到工程名后调这个把名字挂上去。
+    void setTitle(const std::string& title);
     bool maximized() const;
     void maximize();
     // 主显示器工作区（已排除任务栏）。拿不到显示器时返回 false。
@@ -56,6 +59,19 @@ public:
     // 期间 framebuffer 变化会走 resize 回调 → Renderer 自动重建交换链。
     void setFullscreen(bool on);
     bool isFullscreen() const { return m_fullscreen; }
+
+    // ---------------------------------------------------------- 鼠标光标
+    //
+    // `visible=false` 走 `GLFW_CURSOR_DISABLED`：隐藏 + **锁在窗口内**并
+    // 持续上报相对位移 —— 这正是视角控制要的，也正是路线图里说的
+    // "clipCursor"。GLFW 没有单独的 clip 模式，DISABLED 就是它的等价物
+    // （且跨平台，不用 Win32 ClipCursor + HWND 那一套）。
+    //
+    // ⚠ 切换模式时 GLFW 会把光标 warp 到中心 → 下一次鼠标位移是系统产生
+    //   的巨值。这里顺带调 `Input::discardNextMouseDelta()` 吞掉它，
+    //   否则按 ESC 暂停/恢复的那一帧镜头会猛转。
+    void setCursorVisible(bool visible);
+    bool cursorVisible() const { return m_cursorVisible; }
 
     // 标记为需要重建交换链（resize 后由 Renderer 查询并清除）
     bool takeResizeFlag();
@@ -124,6 +140,7 @@ private:
     bool m_resized = false;
     bool m_shouldClose = false;
     bool m_iconFromResource = false;
+    bool m_cursorVisible = true;
     bool m_shown = false;
 
     // 从资源里 LoadImageW 出来的 HICON：不带 LR_SHARED 的话由调用方负责

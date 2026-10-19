@@ -11,6 +11,7 @@
 #include "core/Logger.h"
 #include "ecs/Components.h"
 #include "scene/Camera.h"
+#include "scene/ModelInstance.h"
 #include "scene/Scene.h"
 
 #include <glm/gtc/quaternion.hpp>
@@ -252,6 +253,23 @@ ecs::Entity createDirectionalLight(scene::Scene& scene,
 
 // ---------------------------------------------------------------- 模型导入
 
+namespace {
+
+// 同名对象已存在时加 `_1` / `_2` … 后缀（UE 里重复拖同一个资产的 `anime_girl1`）。
+// ⚠ 不是为了好看：多实例场景（A0-4 的否定测试）要求三个同名 FBX 能被**分别**
+//   指名，否则 `Scene::find` 只命中第一个，`anim.time <t> <name>` 永远改不到
+//   第二、第三个 —— 于是"三个 jointBase 两两不等"就退化成一个实例的假绿。
+std::string uniqueRootName(scene::Scene& scene, const std::string& base) {
+    if (!scene.find(base).valid()) return base;
+    for (int i = 1; i < 1000; ++i) {
+        const std::string cand = base + "_" + std::to_string(i);
+        if (!scene.find(cand).valid()) return cand;
+    }
+    return base;
+}
+
+} // namespace
+
 ImportResult instantiateModel(scene::Scene& scene, assets::AssetManager& assets,
                               const std::string& modelRelativePath,
                               const glm::vec3& position) {
@@ -285,32 +303,22 @@ ImportResult instantiateModel(scene::Scene& scene, assets::AssetManager& assets,
                                    : assets.loadGLTF(resolved, modelRelativePath);
         if (!model || !model->valid()) return out;
 
-        out.root = scene.createObject(pathStem(modelRelativePath));
-        if (auto* t = w.get<ecs::TransformComponent>(out.root))
-            t->position = position;
+        // 装配交给 engine/scene/ModelInstance —— 它同时也是**唯一**
+        // 会建 SkinnedMeshComponent 的地方。以前这段代码在这里手写，
+        // 从不判 model->skinned()，于是带骨骼的 FBX 拖进来只是一堆
+        // 静态网格（T-pose），而 Game.exe 走同一条路径 → 运行时永远
+        // 看不到蒙皮角色。现在两条入口共用一份实现。
+        scene::ModelInstanceOptions opt;
+        opt.subNameSuffix = "_inst";
+        opt.position = position;
+        opt.rootName = uniqueRootName(scene, pathStem(modelRelativePath));
+        opt.autoPlay = true;    // 拖进主场景就该动起来
+        opt.sourcePath = modelRelativePath;
 
-        for (const auto& sub : model->subMeshes) {
-            ecs::Entity e = scene.createObject(sub.name + "_inst");
-            attachRenderable(w, e, sub.mesh, sub.material);
-
-            // glTF 节点的世界变换分解成 TRS。
-            // 这是**相对根节点**的局部变换 —— 根节点在原点、姿态为单位阵，
-            // 所以直接把 glTF 的 TRS 塞进去即可，位置部分不含 position
-            // （position 由根节点负责）。
-            glm::vec3 scale(1.0f), translation(0.0f), skew(0.0f);
-            glm::quat orient(1.0f, 0.0f, 0.0f, 0.0f);
-            glm::vec4 perspective(0.0f);
-            glm::decompose(sub.transform, scale, orient, translation, skew,
-                           perspective);
-
-            if (auto* t = w.get<ecs::TransformComponent>(e)) {
-                t->position = translation;
-                t->rotation = glm::eulerAngles(orient);
-                t->scale = scale;
-            }
-            scene.setParent(e, out.root);
-            out.entities.push_back(e);
-        }
+        scene::ModelInstanceResult inst =
+            scene::instantiateModel(scene, model, opt);
+        out.root = inst.root;
+        out.entities = std::move(inst.entities);
     } catch (const std::exception& ex) {
         VK_LOG_WARN("instantiateModel failed (%s): %s", modelRelativePath.c_str(),
                     ex.what());

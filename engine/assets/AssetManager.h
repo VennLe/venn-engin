@@ -11,6 +11,10 @@
 #include "assets/Material.h"
 #include "assets/Model.h"
 
+// 同名材质冲突要打 WARN（W0-1）。以前这里没有日志依赖 ——
+// 冲突静默合并正是"三个 bug 里最难发现的那个"的根本原因。
+#include "core/Logger.h"
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -85,6 +89,31 @@ public:
     Texture* findTexture(const std::string& key) const;
     Material* findMaterial(const std::string& key) const;
 
+    // ---- 材质稳定身份（W0-2）----
+    // 按 `Material::id`（`models/xxx.glb#Skin`）查。线性扫描 —— 材质数量在
+    // 几百级，且只发生在读场景时，不做二级索引。
+    Material* findMaterialById(const std::string& id) const;
+    // 把 id 写进材质；若该 id 已被**另一个**材质占用则追加 `#2`/`#3` 并打
+    // `ASSET-MAT-COLLIDE`（id 撞车同样不能静默）。
+    void assignMaterialId(Material* m, const std::string& id);
+
+    // ---- 材质实例（W1）----
+    // 从母材质派生一个实例：值语义浅拷贝（参数 + 纹理指针），`parent` 指向母材质，
+    // `overridden = 0`（一开始全跟随）。
+    // ⚠ **只支持两级**：`parent` 本身是实例时拒绝并打 WARN —— 深度嵌套会让
+    //   "改了母材质谁该变"变成需要拓扑排序的问题，收益远小于复杂度。
+    // 同名的已存在实例会**复用**（同一份场景读两次不该每次多长一个材质）。
+    Material* makeInstanceOf(const Material* parent, const std::string& name);
+
+    // ---- 母材质变更的传播（W1-2）----
+    // 把母材质里**未被实例覆盖**的字段刷到所有子实例上。返回被更新的实例数。
+    //
+    // ⚠ 为什么不做自动脏检测：`Material` 是裸结构体（没有 setter）。
+    //   加 setter 要改 40+ 处写入点，漏一个就静默不同步。
+    // ⚠ 已知代价：O(材质数)，每次拖动滑条调用一次。材质数在几百级，
+    //   遍历成本可忽略 —— 不做"脏集合"优化。
+    int materialChanged(const Material* parent);
+
     // ---- 纹理流：每帧驱动流式中的纹理补传一个 mip 层 ----
     // 由 Application 主循环每帧调用（渲染提交之前）。没有流式中的
     // 纹理时是零开销空转。
@@ -115,6 +144,10 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Material>> m_materials;
     std::unordered_map<std::string, std::unique_ptr<Model>> m_models;
     std::unordered_map<const Mesh*, std::unique_ptr<LodChain>> m_lods;
+
+    // 同名材质冲突的编号源（W0-1）。只增不减 —— 编号进了存档，
+    // 复用会让"同一个名字"在两次加载里指到不同的材质。
+    std::uint32_t m_matConflictSeq = 0;
 
     // 按来源生成各级；只负责往 chain 里 add，不动别的状态
     void buildBuiltinLods(const Mesh& base, const MeshSource& src,
@@ -264,8 +297,9 @@ inline const LodChain* AssetManager::ensureLod(Mesh* base) {
     chain->add(base, kLodThresholds[0]);
 
     const MeshSource& src = base->source();
-    if (meshLooksSkinned(*base)) {
-        // 蒙皮网格不生成（见 Lod.h 文件头）
+    if (base->noLod()) {
+        // W2-2：`.vmeta` 里 generateLods=false —— 用户明确要求别建链
+        // （小道具、UI 图标这类东西减面反而更丑，省一次 CPU 减面）。
     } else if (src.kind == MeshSource::Kind::Builtin) {
         buildBuiltinLods(*base, src, *chain);
     } else {
@@ -469,15 +503,73 @@ inline Material* AssetManager::makeMaterial(const std::string& name,
                            metallic, glm::vec3(0.0f));
 }
 
+// detail 字段里不能有空格（项目铁律）。材质名/模型路径里带空格是常见的
+// （"Stone Wall"、"anime girl.glb"），所以日志里统一换下划线。
+inline std::string assetLogSafe(const std::string& s) {
+    std::string o = s;
+    for (char& c : o) {
+        if (c == ' ' || c == '\t') c = '_';
+    }
+    return o;
+}
+
+// "参数完全相同"的判据（W0-1）。//
+// ⚠ 浮点用精确相等：两边的来源都是同一份文件的 `json.value(...)`，读两次
+//   逐位相同。用 eps 反而会让"真的想改一点点"被吞掉（比如 0.5 → 0.5000001）。
+inline bool sameMaterialParams(const Material* m, Texture* albedo,
+                               Texture* normal, Texture* orm,
+                               const glm::vec4& baseColor, float roughness,
+                               float metallic, const glm::vec3& emissive,
+                               bool doubleSided) {
+    if (!m) return false;
+    return m->albedoMap == albedo && m->normalMap == normal && m->ormMap == orm &&
+           Material::sameVec4(m->baseColorFactor, baseColor) &&
+           m->roughness == roughness && m->metallic == metallic &&
+           Material::sameVec3(m->emissive, emissive) &&
+           m->doubleSided == doubleSided;
+}
+
 inline Material* AssetManager::makeMaterialPBR(
     const std::string& name, Texture* albedo, Texture* normal, Texture* orm,
     const glm::vec4& baseColor, float roughness, float metallic,
     const glm::vec3& emissive, bool doubleSided) {
-    auto it = m_materials.find(name);
-    if (it != m_materials.end()) return it->second.get();
+    std::string key = name;
+    auto it = m_materials.find(key);
+    if (it != m_materials.end()) {
+        // 参数一致 → 真共享（500 个物体用同一组参数是常见情形，共享合理）
+        if (sameMaterialParams(it->second.get(), albedo, normal, orm, baseColor,
+                               roughness, metallic, emissive, doubleSided))
+            return it->second.get();
+        // ⚠ 同名但参数不同 —— 以前这里直接 `return it->second.get()`，
+        //   后者的参数被**静默丢弃**：Ctrl+D 复制实体后两个物体共用第一份
+        //   材质，"我改了 B，A 也变了"，一个 WARN 都没有。
+        //
+        //   现在两种做法都不对，所以走第三条路：不覆盖、不报错返回 null
+        //   （那会让物体变无材质），而是**给唯一后缀另建一个**。
+        //
+        //   先在同一基名的后缀里找参数相同的 —— 保证幂等：同一份场景文件
+        //   读两次得到同一组材质，不会每次加载都多长一个 `#7`。
+        const std::string base = key;
+        for (const auto& kv : m_materials) {
+            const Material* cand = kv.second.get();
+            if (cand == it->second.get()) continue;
+            if (kv.first.size() <= base.size()) continue;
+            if (kv.first.compare(0, base.size(), base) != 0) continue;
+            if (kv.first[base.size()] != '#') continue;
+            if (sameMaterialParams(cand, albedo, normal, orm, baseColor,
+                                   roughness, metallic, emissive, doubleSided))
+                return kv.second.get();
+        }
+        key = base + "#" + std::to_string(++m_matConflictSeq);
+        VK_LOG_WARN("ASSET-MAT-COLLIDE name=%s renamed=%s",
+                    assetLogSafe(base).c_str(), assetLogSafe(key).c_str());
+    }
 
     auto mat = std::make_unique<Material>();
-    mat->name = name;
+    mat->name = key;
+    // 程序化材质的稳定身份就是它的缓存键（`Material::id` 对所有 kind 都有效，
+    // 序列化写出去以后，读端"先按 id 找"这条路对老场景也是通的）。
+    mat->id = key;
     mat->albedoMap = albedo;
     mat->normalMap = normal;
     mat->ormMap = orm;
@@ -488,8 +580,101 @@ inline Material* AssetManager::makeMaterialPBR(
     mat->doubleSided = doubleSided;
 
     Material* raw = mat.get();
-    m_materials[name] = std::move(mat);
+    m_materials[key] = std::move(mat);
     return raw;
+}
+
+inline Material* AssetManager::findMaterialById(const std::string& id) const {
+    if (id.empty()) return nullptr;
+    for (const auto& kv : m_materials) {
+        if (kv.second && kv.second->id == id) return kv.second.get();
+    }
+    return nullptr;
+}
+
+inline void AssetManager::assignMaterialId(Material* m, const std::string& id) {
+    if (!m) return;
+    std::string want = id.empty() ? m->name : id;
+
+    // id 撞车：同一个 `#Skin` 落在两个材质上 → 后到的追加编号。
+    // 与同名材质冲突是同一类问题，所以共用同一个计数器和同一句 WARN 的格式。
+    const Material* clash = findMaterialById(want);
+    if (clash && clash != m) {
+        const std::string base = want;
+        want = base + "#" + std::to_string(++m_matConflictSeq);
+        VK_LOG_WARN("ASSET-MAT-COLLIDE id=%s renamed=%s",
+                    assetLogSafe(base).c_str(), assetLogSafe(want).c_str());
+    }
+    m->id = want;
+}
+
+inline Material* AssetManager::makeInstanceOf(const Material* parent,
+                                              const std::string& name) {
+    if (!parent) return nullptr;
+    if (parent->isInstance()) {
+        // 两级限制：实例的实例 → 拒绝，退化成"直接用母材质"
+        VK_LOG_WARN("MATERIAL-INSTANCE parent=%s name=%s rejected=two-level",
+                    assetLogSafe(parent->id.empty() ? parent->name : parent->id)
+                        .c_str(),
+                    assetLogSafe(name).c_str());
+        return const_cast<Material*>(parent);
+    }
+
+    auto it = m_materials.find(name);
+    if (it != m_materials.end()) {
+        Material* m = it->second.get();
+        if (m != parent) {
+            m->parent = parent;
+            m->source.kind = MaterialSource::Kind::Instance;
+        }
+        return m;
+    }
+
+    auto mat = std::make_unique<Material>();
+    *mat = *parent;  // 值语义：参数与纹理指针一起拷过来
+    mat->name = name;
+    mat->id.clear();
+    mat->parent = parent;
+    mat->overridden = 0;
+    mat->source.kind = MaterialSource::Kind::Instance;
+
+    Material* raw = mat.get();
+    m_materials[name] = std::move(mat);
+    assignMaterialId(raw, name);
+    VK_LOG_INFO("MATERIAL-INSTANCE parent=%s name=%s overrides=0",
+                assetLogSafe(parent->id.empty() ? parent->name : parent->id)
+                    .c_str(),
+                assetLogSafe(name).c_str());
+    return raw;
+}
+
+inline int AssetManager::materialChanged(const Material* parent) {
+    if (!parent) return 0;
+    const Material::Params src = parent->captureParams();
+    int updated = 0;
+    int skipped = 0;
+    for (auto& kv : m_materials) {
+        Material* inst = kv.second.get();
+        if (!inst || inst->parent != parent) continue;
+        // 只刷"未覆盖"的那几位：覆盖位是用户明确要求"这一件不一样"
+        const std::uint32_t follow =
+            Material::kOvScalarMask & ~inst->overridden;
+        if (!follow) {
+            ++skipped;
+            continue;
+        }
+        Material::Params p = inst->captureParams();
+        Material::mergeParams(p, src, follow);
+        inst->applyParams(p);
+        ++updated;
+    }
+    if (updated || skipped) {
+        VK_LOG_INFO("MATERIAL-SYNC parent=%s updated=%d skipped=%d",
+                    assetLogSafe(parent->id.empty() ? parent->name : parent->id)
+                        .c_str(),
+                    updated, skipped);
+    }
+    return updated;
 }
 
 } // namespace assets

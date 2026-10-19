@@ -1,5 +1,6 @@
 {
   "_comment": "Game.exe 的出厂配置。优先级: 命令行 > 环境变量(MYVK_RUNTIME_*) > 本文件 > 内置默认。本文件是**只读**的, 运行时不写它 (运行时写的是 %LOCALAPPDATA%/Venn/venn)。",
+  "_comment_audio": "audio 块见 docs/audio_roadmap.md G14-5。顶层的 audioDevice 是**已废弃**的老字段, 仅作兼容别名; 新配置请写 audio.device。duckDepth: Voice 总线有声时 Music 往下压多少 (0=关, 0.75 约 -12dB)。",
   "scene": "scenes/sandbox.json",
   "title": "Venn Game",
   "width": 1280,
@@ -10,6 +11,17 @@
   "timeScale": 1.0,
   "language": "en",
   "quality": "high",
-  "audioDevice": "default",
-  "startState": "playing"
+  "startState": "playing",
+  "audio": {
+    "enabled": true,
+    "device": "default",
+    "master": 1.0,
+    "music": 0.7,
+    "sfx": 1.0,
+    "voice": 1.0,
+    "mute": false,
+    "muteOnFocusLost": false,
+    "duckDepth": 0.75,
+    "maxVoices": 64
+  }
 }

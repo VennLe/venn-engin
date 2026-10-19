@@ -167,8 +167,8 @@ void Toolbar::drawPanelMenu() {
                                                                  : nullptr;
             if (ImGui::MenuItem(TR(t[i].title), sc, &open)) {
                 setPanelOpen(i, open);
-                m_ctx.notify(std::string(t[i].title) +
-                             (open ? " shown" : " hidden"));
+                m_ctx.notify(std::string(TR(t[i].title)) +
+                             TR(open ? " shown" : " hidden"));
             }
         }
         ImGui::EndMenu();
@@ -190,7 +190,7 @@ void Toolbar::drawWorkspaceMenu() {
     }
     ImGui::Separator();
     char saveLabel[96];
-    std::snprintf(saveLabel, sizeof(saveLabel), "Save Workspace%s",
+    std::snprintf(saveLabel, sizeof(saveLabel), TR("Save Workspace%s"),
                   m_ctx.workspaceModified() ? "  *" : "");
     if (ImGui::MenuItem(saveLabel)) m_host.saveWorkspace();
     if (ImGui::MenuItem(TR("Reset Workspace"))) m_host.resetWorkspace();
@@ -706,7 +706,7 @@ void Toolbar::drawMenuBar() {
                        m_ctx.dirty() ? " *" : "");
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(0.45f, 0.68f, 0.92f, 1.0f), TR("|  %s%s"),
-                       m_ctx.workspace().currentTitle(),
+                       TR(m_ctx.workspace().currentTitle()),
                        m_ctx.workspaceModified() ? " *" : "");
 
     ImGui::EndMainMenuBar();
@@ -1011,10 +1011,10 @@ void Toolbar::drawBar() {
 
 void Toolbar::drawAboutWindow() {
     if (m_showAbout) {
-        ImGui::OpenPopup("About Venn");
+        ImGui::OpenPopup(TRL("About Venn"));
         m_showAbout = false;
     }
-    if (ImGui::BeginPopupModal("About Venn", nullptr,
+    if (ImGui::BeginPopupModal(TRL("About Venn"), nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Text(TR("Venn Engine  %s"), m_host.engineVersion());
         ImGui::Separator();

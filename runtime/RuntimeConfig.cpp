@@ -102,6 +102,40 @@ void applyGameJson(RuntimeConfig& cfg) {
     getStr("audioDevice", cfg.audioDevice);
     getStr("startState", cfg.startState);
 
+    // ---- 音频块（G14-5）----
+    if (j.contains("audio") && j["audio"].is_object()) {
+        const json& a = j["audio"];
+        auto aBool = [&](const char* k, bool& dst) {
+            if (a.contains(k) && a[k].is_boolean()) dst = a[k].get<bool>();
+        };
+        auto aNum = [&](const char* k, float& dst) {
+            if (a.contains(k) && a[k].is_number()) dst = a[k].get<float>();
+        };
+        aBool("enabled", cfg.audio.enabled);
+        if (a.contains("device") && a["device"].is_string())
+            cfg.audio.device = a["device"].get<std::string>();
+        aNum("master", cfg.audio.master);
+        aNum("music", cfg.audio.music);
+        aNum("sfx", cfg.audio.sfx);
+        aNum("voice", cfg.audio.voice);
+        aBool("mute", cfg.audio.mute);
+        aBool("muteOnFocusLost", cfg.audio.muteOnFocusLost);
+        aNum("duckDepth", cfg.audio.duckDepth);
+        if (a.contains("maxVoices") && a["maxVoices"].is_number_integer())
+            cfg.audio.maxVoices = a["maxVoices"].get<int>();
+    } else if (j.contains("audio")) {
+        VK_LOG_WARN("GAME-CONFIG game.json 的 audio 不是对象，忽略（%s）",
+                    path.c_str());
+    }
+
+    // ---- 老字段兼容（只读一次，别静默丢掉用户的选择）----
+    if (cfg.audioDevice != "default" && cfg.audioDevice != cfg.audio.device) {
+        VK_LOG_WARN("GAME-CONFIG-DEPRECATED audioDevice='%s' 已废弃，"
+                    "请改用 audio.device（本次仍按 audioDevice 生效）",
+                    cfg.audioDevice.c_str());
+        cfg.audio.device = cfg.audioDevice;
+    }
+
     VK_LOG_INFO("GAME-CONFIG loaded %s", path.c_str());
 }
 
@@ -116,6 +150,33 @@ void applyEnv(RuntimeConfig& cfg) {
     cfg.timeScale = envFloat("MYVK_RUNTIME_TIMESCALE", cfg.timeScale);
     cfg.language = envStr("MYVK_RUNTIME_LANGUAGE", cfg.language);
     cfg.quality = envStr("MYVK_RUNTIME_QUALITY", cfg.quality);
+
+    // ---- 音频（G14-5）----
+    // ⚠ 全套带 `MYVK_RUNTIME_AUDIO` 前缀（`check_feature_surface.py` 按前缀
+    //   放行，新增一个开关不用去白名单补一行）。
+    cfg.audio.enabled =
+        envFlag("MYVK_RUNTIME_AUDIO", cfg.audio.enabled);
+    cfg.audio.device =
+        envStr("MYVK_RUNTIME_AUDIO_DEVICE", cfg.audio.device);
+    cfg.audio.master = envFloat("MYVK_RUNTIME_AUDIO_MASTER", cfg.audio.master);
+    cfg.audio.music = envFloat("MYVK_RUNTIME_AUDIO_MUSIC", cfg.audio.music);
+    cfg.audio.sfx = envFloat("MYVK_RUNTIME_AUDIO_SFX", cfg.audio.sfx);
+    cfg.audio.voice = envFloat("MYVK_RUNTIME_AUDIO_VOICE", cfg.audio.voice);
+    cfg.audio.mute = envFlag("MYVK_RUNTIME_AUDIO_MUTE", cfg.audio.mute);
+    cfg.audio.duckDepth =
+        envFloat("MYVK_RUNTIME_AUDIO_DUCK", cfg.audio.duckDepth);
+    cfg.audio.maxVoices =
+        envInt("MYVK_RUNTIME_AUDIO_MAXVOICES", cfg.audio.maxVoices);
+    // `=1` 强制 NullBackend：无声卡机器 / 想验证"链路通但不发声"
+    cfg.audio.forceNull = envFlag("MYVK_RUNTIME_AUDIO_NULL", cfg.audio.forceNull);
+    // ⚠ `_NULL=1` 隐含"我要音频"：明确点了 NullBackend 却说"没开音频"、
+    //   于是什么也不做，是最容易让人以为开关坏了的一种组合。
+    //   但在自动化默认关的前提下，没有这一条 `_NULL=1` 单独用是**静默无效**的
+    //   （`_NULL` 只管后端，不管 enabled）。显式 `MYVK_RUNTIME_AUDIO=0` 仍然优先。
+    if (cfg.audio.forceNull && !std::getenv("MYVK_RUNTIME_AUDIO"))
+        cfg.audio.enabled = true;
+    cfg.audio.retryOnFailure =
+        envFlag("MYVK_RUNTIME_AUDIO_RETRY", cfg.audio.retryOnFailure);
     cfg.selftest = envStr("MYVK_RUNTIME_SELFTEST", cfg.selftest);
     cfg.dumpScenePath = envStr("MYVK_RUNTIME_DUMP_SCENE", cfg.dumpScenePath);
     cfg.inputMapPath = envStr("MYVK_RUNTIME_INPUT_MAP", cfg.inputMapPath);
@@ -198,6 +259,20 @@ void applyCli(RuntimeConfig& cfg, const std::vector<std::string>& args) {
             takeValue("--language", cfg.language);
         } else if (matchKey(a, "--start-state", val, inlineSet)) {
             takeValue("--start-state", cfg.startState);
+        } else if (matchKey(a, "--audio", val, inlineSet)) {
+            std::string v;
+            takeValue("--audio", v);
+            // on/off/1/0 都认（快捷方式里怎么写都有可能）
+            if (!v.empty())
+                cfg.audio.enabled = !(v == "0" || v == "off" || v == "false");
+        } else if (matchKey(a, "--audio-device", val, inlineSet)) {
+            takeValue("--audio-device", cfg.audio.device);
+        } else if (matchKey(a, "--audio-null", val, inlineSet)) {
+            (void)val;
+            (void)inlineSet;
+            cfg.audio.forceNull = true;
+        } else if (a == "--mute") {
+            cfg.audio.mute = true;
         } else if (a == "--fullscreen") {
             cfg.fullscreen = true;
         } else if (a == "--windowed") {
@@ -226,6 +301,52 @@ RuntimeConfig parseRuntimeConfig(const std::vector<std::string>& args) {
     cfg.width = std::max(160, cfg.width);
     cfg.height = std::max(120, cfg.height);
     cfg.timeScale = std::max(0.0f, cfg.timeScale);
+
+    // ---- 音频：自动化默认关（§3.2）----
+    //
+    // ⚠ 判断"是不是自动化"只看 `selftest` / `maxFrames` —— 这两个都是
+    //   **脚本注入的**，人手玩不会带。env 里显式给了 `MYVK_RUNTIME_AUDIO`
+    //   就完全听用户的（包括 `=1`）。
+    //
+    //   为什么必须有这一条：回归一轮要起几十次 Game.exe，如果每次都去开
+    //   共享模式的 WASAPI，既有用例会被"设备偶尔被占用"这种无关噪声搞出
+    //   时红时绿，而且日志里凭空多出 AUDIO-INIT 行。
+    if (!std::getenv("MYVK_RUNTIME_AUDIO") &&
+        !std::getenv("MYVK_RUNTIME_AUDIO_NULL")) {
+        const bool automation = !cfg.selftest.empty() || cfg.maxFrames > 0;
+        if (automation) cfg.audio.enabled = false;
+    }
+
+    // 音量底数夹一下：负数会让相位反相（听起来像"声音从背后出来"）
+    auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
+    cfg.audio.master = clamp01(cfg.audio.master);
+    cfg.audio.music = clamp01(cfg.audio.music);
+    cfg.audio.sfx = clamp01(cfg.audio.sfx);
+    cfg.audio.voice = clamp01(cfg.audio.voice);
+    cfg.audio.duckDepth = clamp01(cfg.audio.duckDepth);
+    if (cfg.audio.maxVoices < 1) cfg.audio.maxVoices = 1;
+    if (cfg.audio.maxVoices > 64) cfg.audio.maxVoices = 64;
+
+    // 解析结果必须能被自动化**只读地**核对（G14-5 的验收就靠它）：
+    // 一行、无空格、字段固定 —— `verify_audio.py` 拿它比对 env / game.json
+    // 有没有真的生效。
+    {
+        std::string dev = cfg.audio.device;
+        for (char& c : dev)
+            if (c == ' ' || c == '\t') c = '_';
+        VK_LOG_INFO("AUDIO-CONFIG enabled=%d device=%s null=%d master=%.2f "
+                    "music=%.2f sfx=%.2f voice=%.2f mute=%d duck=%.2f "
+                    "maxvoices=%d retry=%d",
+                    cfg.audio.enabled ? 1 : 0, dev.c_str(),
+                    cfg.audio.forceNull ? 1 : 0,
+                    static_cast<double>(cfg.audio.master),
+                    static_cast<double>(cfg.audio.music),
+                    static_cast<double>(cfg.audio.sfx),
+                    static_cast<double>(cfg.audio.voice),
+                    cfg.audio.mute ? 1 : 0,
+                    static_cast<double>(cfg.audio.duckDepth),
+                    cfg.audio.maxVoices, cfg.audio.retryOnFailure ? 1 : 0);
+    }
 
     VK_LOG_INFO("GAME-CONFIG scene='%s' window=%dx%d fullscreen=%d "
                 "maxFps=%d unfocusedFps=%d timeScale=%.2f language=%s "
@@ -260,7 +381,13 @@ const char* runtimeHelpText() {
         "  --verbose             每 60 帧打一行 GAME-LOOP\n"
         "  --trace-states        每次状态迁移打一行 GAME-STATE\n"
         "  --selftest <name>     无窗口自检后退出: states | determinism | input |\n"
-        "                        character | contact | camera | player\n"
+        "                        character | contact | camera | player | hud | audio |\n"
+        "                        material | lod | terrain | script | scriptbench |\n"
+        "                        project（工程数据模型）| audio-config（只打印音频配置）\n"
+        "  --audio <on|off>      开 / 关声音（= MYVK_RUNTIME_AUDIO）\n"
+        "  --audio-device <name> 设备名子串；__none__ = 显式无设备（不回落）\n"
+        "  --audio-null          强制 NullBackend（链路通但不发声）\n"
+        "  --mute                输出静音（声部照常跑，不是停播）\n"
         "  --dump-scene <path>   把读进来的场景再写一份（读→写往返自检）\n"
         "  --input-map <path>    键位绑定表（默认 assets/input_map.json）\n"
         "  --help                显示这段文字\n"

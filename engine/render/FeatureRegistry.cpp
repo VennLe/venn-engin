@@ -463,6 +463,32 @@ static const ParamDesc kParamsGrid[] = {
             ParamTier::Advanced, "完全淡出的距离（被 extent 与远平面夹住）。"),
 };
 
+// ---- 游戏 UI / HUD（U0，见 docs/ui_hud_roadmap.md）----
+// 这是**玩家看的** UI（血条 / 准星 / 伤害数字 / 暂停菜单），与
+// engine/ui/（编辑器的 ImGui）是两条通道，互不共享资源，所以参数
+// 也单独一组：关掉 HUD 不该动到任何后处理参数。
+//
+// ⚠ 默认值的设计约束（每次加参数都要过一遍）：
+//   · ui.enabled=true 但**没有 UI 数据** → 零绘制、不进任何 pass；
+//   · ui.hudInEditor=false → 编辑器截图逐位不变（几十条基线）。
+//   所以"打开这个特性"与"改变现有画面"是两件事。
+static const ParamDesc kParamsUi2[] = {
+    PBool("ui.enabled", "Game UI", "MYVK_UI", ParamTier::Basic,
+          "运行时 UI/HUD 总开关。关掉 = 一个像素都不画（与没有这条通道时逐位相同）。"),
+    PBool("ui.hudInEditor", "HUD in editor", "MYVK_UI_HUD_IN_EDITOR",
+          ParamTier::Advanced,
+          "在编辑器视口里也画 HUD（预览用）。默认关：打开会让编辑器截图像素整体漂。"),
+    PFloat("ui.scale", "UI scale", "MYVK_UI_SCALE", 0.5f, 3.0f,
+           ParamTier::Basic,
+           "逻辑像素 → 输出像素的额外倍率。生效值 = min(W/1920,H/1080) × 本值。"),
+    PBool("ui.debugBounds", "Show UI bounds", "MYVK_UI_DEBUG_BOUNDS",
+          ParamTier::Debug,
+          "把每个控件的最终矩形画成描边并打 UI2-BOUNDS 锚点（自动化读布局用）。"),
+    PFloat("ui.fontSize", "Font size", "MYVK_UI_FONT_SIZE", 8.0f, 64.0f,
+           ParamTier::Basic,
+           "默认字号（逻辑像素）。SDF 字体任意字号锐利，不需要重新烘焙。"),
+};
+
 // ============================================================
 #define ARRAY(a) a, static_cast<int>(sizeof(a) / sizeof((a)[0]))
 
@@ -557,6 +583,12 @@ const FeatureDesc kFeatures[] = {
     // ---- 视口 ----
     {"grid", "Viewport Grid", "Viewport", nullptr, nullptr, nullptr,
      ARRAY(kParamsGrid)},
+
+    // ---- 游戏 UI / HUD（U0）----
+    // test 指向 verify_ui2（tools/verify_ui2.py）：E 组会检查它确实在
+    // run_regression.py 的 DEFAULT 里 —— 登记了特性却没回归是会报红的。
+    {"ui2", "Game UI / HUD", "UI", "U0", nullptr, "verify_ui2",
+     ARRAY(kParamsUi2)},
 };
 
 const int kFeatureCount =

@@ -17,7 +17,7 @@
      CB-ADD-BTN < CB-SAVEALL < CB-PREV < CB-NEXT < CB-PATH（从左往右），
      五个控件在**同一行**，整行在搜索框（CB-SEARCH）**上方**，
      路径框是这一行最宽的一块。初始 CB-PATH rel=/assets。
-  B. Add 菜单：点开后有 13 个资源类型项（CB-ADDITEM <key>）+ import 项，
+  B. Add 菜单：点开后有 6 个资源类型项（CB-ADDITEM <key>）+ import 项，
      全部排在按钮**上侧**（每个 item 的 y1 ≤ 按钮 y0），且竖直一列。
   C. Add ▸ Material：CB-ADD kind=material ext=vmat path=...，
      并且文件**真的落到磁盘上**（脚本检查后删掉，不留垃圾）。
@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from capture_window import capture_stable, find_window                # noqa: E402
 from verify_add_menu import LogTap, click, force_foreground           # noqa: E402
+from safe_fs import safe_remove
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(ROOT, "..", "_venn_verify")
@@ -52,9 +53,15 @@ EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
 
 BAD_RE = r"VUID-|\[ERROR\]|Validation Error|leaked|SEGV"
 
-# Add ▸ 的 13 种资源类型（顺序 = 菜单顺序 = 用户口述顺序）
-KINDS = ["material", "model", "scene", "animation", "cinematic", "media",
-         "water", "texture", "physics", "audio", "foliage", "ui", "worldmap"]
+# Add ▸ 的资源类型（顺序 = 菜单顺序）。
+# ⚠ 2026-10-19（W2-4）：13 项 → **5 项** —— 下架了 8 个没有加载器的空壳
+#   （animation / cinematic / media / water / physics / foliage / ui /
+#   worldmap）。这条断言当时**没同步改**，脚本就一直红着（而它又在 DEFAULT
+#   里）—— 属于"改了功能没改期望值"，问题不在实现。
+# ⚠ 2026-10-19（W4-4）：加回 `terrain` —— 它现在有加载器
+#   （`engine/terrain/Terrain.cpp`），落的是能直接双击的平地三件套。
+#   以后 W5/W8 加回 foliage / water 时，**这张表要跟着加**。
+KINDS = ["material", "model", "scene", "texture", "audio", "terrain"]
 
 fails = []
 
@@ -198,7 +205,7 @@ def main():
             time.sleep(1.0)
             items = {k: rect_of(tap, "CB-ADDITEM " + k) for k in KINDS}
             check(all(v is not None for v in items.values()),
-                  "B1 13 种资源类型项都在菜单里")
+                  "B1 6 种资源类型项都在菜单里")
             imp = rect_of(tap, "CB-ADDITEM import")
             check(imp is not None, "B2 菜单里有「导入」项")
             if all(v is not None for v in items.values()) and imp:
@@ -209,7 +216,7 @@ def main():
                 check(max(xs) - min(xs) <= 2.0,
                       "B4 菜单项竖直一列（x 差 %.1f px）" % (max(xs) - min(xs)))
                 seq = [items[k][1] for k in KINDS]
-                check(seq == sorted(seq) and imp[1] > items["worldmap"][1],
+                check(seq == sorted(seq) and imp[1] > items[KINDS[-1]][1],
                       "B5 顺序与用户口述一致，导入在最后")
             check(count(tap, "CB-ADDITEM") > n_menu,
                   "B6 打开菜单后 CB-ADDITEM 日志确实新增了")
@@ -308,7 +315,7 @@ def main():
         # 清掉 C 组造出来的资产文件 —— 别在仓库里留垃圾
         if created and os.path.exists(created):
             try:
-                os.remove(created)
+                safe_remove(created)
                 print("    (清理测试资产: %s)" % os.path.basename(created))
             except OSError as e:
                 print("    (清理失败 %s: %s)" % (created, e))

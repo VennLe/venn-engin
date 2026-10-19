@@ -13,6 +13,14 @@
 
 ## 0 · 现状诊断（实测，2026-10-14）
 
+> ⚠⚠ **本节是"动手前"的问题快照，不是现状**。写它的时候 E01 还没做，所以下面那些
+> "完全无 UI ❌ 缺失"是**当时的结论**，用来回答"为什么要做 E01/E02/E03"。
+> **当前真实状态**（2026-10-19 复跑 `tools/check_feature_surface.py`）：
+> **35 / 35 个特性全部有 UI 面，无 UI 面 = 0**；`MYVK_*` 263 个（141 已登记 /
+> 123 白名单 / **裸 env 漏网 0**）；注册表已接管 109 / 141（77%）。
+> 剩余缺口是**参数级**（32 个仍只有 env → E10/E17），不是"点不到"。
+> 逐项进度看 `docs/editor_roadmap.md` §6 状态表。
+
 设计不能凭空来。先把"现在到底缺什么"量化清楚。
 
 ### 0.1 硬数据
@@ -426,11 +434,11 @@ struct PanelDesc {
 | Preferences | ✅ 已有 | — | 编辑器偏好 |
 | CharacterWindow | ✅ 已有 | Character | 角色预览 |
 | Scripts | ✅ 已有 | Debug | 脚本日志 |
-| **Console** | ❌ **待建** | Debug | 命令 + 日志（`VK_LOG_*` 汇入） |
-| **Command Palette** | ❌ **待建** | — | Ctrl+Shift+P，模糊搜索所有命令 |
-| **Renderer Graph** | ❌ 待建 | Rendering | RenderGraph 可视化（R7-1 时） |
-| **GPU Profile 时间轴** | ❌ 待建 | Rendering | 时戳分段条形图（R0-1 的数据已就绪） |
-| **Quality Settings** | ❌ 待建 | — | 画质档位 + 平台预设 |
+| **Console** | ✅ 已有（E16，2026-10-14） | Debug | 命令 + 日志（`VK_LOG_*` 汇入） |
+| **Command Palette** | ✅ 已有（E18，2026-10-15） | — | Ctrl+Shift+P，模糊搜索所有命令 |
+| **Renderer Graph** | ❌ 待建（阻塞于 R7-1） | Rendering | RenderGraph 可视化 |
+| **GPU Profile 时间轴** | ✅ 已有（E25，2026-10-15） | Rendering | 时戳甘特图 + 60 帧历史 |
+| **Quality Settings** | ✅ 已有（E26，2026-10-19） | Authoring | 画质档位 + 平台预设 + 差异预览 + 一致性检查 |
 | **Asset Preview** | ⚠ 部分 | — | 材质/网格预览（`CharacterWindow` 是雏形） |
 
 ---

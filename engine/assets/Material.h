@@ -13,6 +13,7 @@
 
 #include <glm/glm.hpp>
 
+#include <cstdint>
 #include <string>
 
 namespace assets {
@@ -26,12 +27,18 @@ class Texture;
 //                 （纹理槽自身也有 TextureSource，见 Texture.h）
 //   Model      —— 由 glTF 解析而来，重建方式是重新加载该模型，
 //                 所以这里只记模型缓存键即可（贴图一并回来）
+//   Instance   —— 母材质的实例（W1）。参数值语义拷贝自母材质，
+//                 但只有 `overridden` 位标出的字段才随本地修改。
+//   VMAT       —— 来自一个独立的材质资产文件（`assets/materials/*.vmat`，W2-1）。
+//                 与 Model 的区别：Model 的身份由模型文件里的材质名决定，
+//                 VMAT 的身份由文件自己写（`"id"` 字段），所以**跨关卡可共享**。
 // ============================================================
 struct MaterialSource {
-    enum class Kind { Procedural, Model };
+    enum class Kind { Procedural, Model, Instance, VMAT };
 
     Kind kind = Kind::Procedural;
     std::string modelKey;  // Model：AssetManager 里的模型缓存键
+    std::string vmatPath;  // VMAT：相对 assets/ 的 .vmat 路径
 
     void setModel(const std::string& key) {
         kind = Kind::Model;
@@ -146,6 +153,178 @@ struct Material {
 
     // ---- 来源溯源（序列化用）----
     MaterialSource source;
+
+    // ============================================================
+    // 稳定身份（W0-2）
+    //
+    // 以前材质的"身份"是 `m_materials` 的缓存键，而模型材质那个键是
+    // `models/xxx.glb/mat0` —— **数组下标**。模型重导出时材质顺序一变，
+    // 所有引用静默错位（mat0 从 Skin 变成 Hair，没有任何报错）。
+    //
+    // `id` 是给人看、给存档用的语义身份：`models/xxx.glb#Skin`。
+    // ⚠ 缓存键（`name`）**保持不变** —— `resolveMaterial` / `findMaterial` /
+    //   `Model::subMeshes[i].material` 多处依赖它，改名会动 5 处以上。
+    //   加一个并列字段、只让序列化用它，是成本最低且不破坏任何现有路径的做法。
+    // ============================================================
+    std::string id;
+
+    // ============================================================
+    // 可覆盖字段的参数集（W1 的位掩码就是这个字段序）
+    //
+    // 把「12 个可被实例覆盖 / 被存档记录的标量字段」收成一个可拷贝的
+    // 结构，是为了三件事共用一份定义：
+    //   · W0-3：导入模型的材质，靠它算出"用户到底改过哪几个字段"
+    //   · W1-1：实例的 `overridden` 位掩码（位序写死在下面）
+    //   · W1-2：母材质变更时按位刷新未覆盖字段
+    //
+    // ⚠ 纹理槽（7 个）**不进参数集**：换纹理是"结构变化"，
+    //   一律视为覆盖（见 kOvAllTextures），不进位掩码。
+    // ============================================================
+    struct Params {
+        glm::vec4 baseColorFactor{1.0f};
+        float metallic = 0.0f;
+        float roughness = 0.5f;
+        float normalScale = 1.0f;
+        float ao = 1.0f;
+        glm::vec3 emissive{0.0f};
+        AlphaMode alphaMode = AlphaMode::Opaque;
+        float alphaCutoff = 0.5f;
+        bool ditherAlpha = false;
+        ShadingModel shadingModel = ShadingModel::Default;
+        bool doubleSided = false;
+        float heightScale = 0.05f;
+    };
+
+    // 位序（W1-1）—— ⚠ 一旦发布就不能改：存档里是裸数字。
+    // 升位序必须同时升 `kMaterialVersion` 并写迁移。
+    enum OverrideBits : std::uint32_t {
+        kOvBaseColor   = 1u << 0,
+        kOvMetallic    = 1u << 1,
+        kOvRoughness   = 1u << 2,
+        kOvNormalScale = 1u << 3,
+        kOvAo          = 1u << 4,
+        kOvEmissive    = 1u << 5,
+        kOvAlphaMode   = 1u << 6,
+        kOvAlphaCutoff = 1u << 7,
+        kOvDitherAlpha = 1u << 8,
+        kOvShadingModel = 1u << 9,
+        kOvDoubleSided = 1u << 10,
+        kOvHeightScale = 1u << 11,
+        kOvScalarMask  = (1u << 12) - 1u,
+    };
+
+    // 取当前参数 / 写回参数
+    Params captureParams() const {
+        Params p;
+        p.baseColorFactor = baseColorFactor;
+        p.metallic = metallic;
+        p.roughness = roughness;
+        p.normalScale = normalScale;
+        p.ao = ao;
+        p.emissive = emissive;
+        p.alphaMode = alphaMode;
+        p.alphaCutoff = alphaCutoff;
+        p.ditherAlpha = ditherAlpha;
+        p.shadingModel = shadingModel;
+        p.doubleSided = doubleSided;
+        p.heightScale = heightScale;
+        return p;
+    }
+    void applyParams(const Params& p) {
+        baseColorFactor = p.baseColorFactor;
+        metallic = p.metallic;
+        roughness = p.roughness;
+        normalScale = p.normalScale;
+        ao = p.ao;
+        emissive = p.emissive;
+        alphaMode = p.alphaMode;
+        alphaCutoff = p.alphaCutoff;
+        ditherAlpha = p.ditherAlpha;
+        shadingModel = p.shadingModel;
+        doubleSided = p.doubleSided;
+        heightScale = p.heightScale;
+    }
+
+    // 逐字段比较，返回"不同的那几位"（0 = 完全一致）。
+    // ⚠ 浮点用精确相等而不是 eps：来源同为 `json.value(...)`，
+    //   同一份文件读两次逐位相同，不需要容差（见 W0-1 的判据说明）。
+    static bool sameVec4(const glm::vec4& a, const glm::vec4& b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
+    }
+    static bool sameVec3(const glm::vec3& a, const glm::vec3& b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    }
+    static std::uint32_t diffParams(const Params& a, const Params& b) {
+        std::uint32_t d = 0;
+        if (!sameVec4(a.baseColorFactor, b.baseColorFactor)) d |= kOvBaseColor;
+        if (a.metallic != b.metallic) d |= kOvMetallic;
+        if (a.roughness != b.roughness) d |= kOvRoughness;
+        if (a.normalScale != b.normalScale) d |= kOvNormalScale;
+        if (a.ao != b.ao) d |= kOvAo;
+        if (!sameVec3(a.emissive, b.emissive)) d |= kOvEmissive;
+        if (a.alphaMode != b.alphaMode) d |= kOvAlphaMode;
+        if (a.alphaCutoff != b.alphaCutoff) d |= kOvAlphaCutoff;
+        if (a.ditherAlpha != b.ditherAlpha) d |= kOvDitherAlpha;
+        if (a.shadingModel != b.shadingModel) d |= kOvShadingModel;
+        if (a.doubleSided != b.doubleSided) d |= kOvDoubleSided;
+        if (a.heightScale != b.heightScale) d |= kOvHeightScale;
+        return d;
+    }
+    // 按位把 b 的字段刷进 a（用于母材质变更传播 / 读档应用 overrides）
+    static void mergeParams(Params& a, const Params& b, std::uint32_t bits) {
+        if (bits & kOvBaseColor) a.baseColorFactor = b.baseColorFactor;
+        if (bits & kOvMetallic) a.metallic = b.metallic;
+        if (bits & kOvRoughness) a.roughness = b.roughness;
+        if (bits & kOvNormalScale) a.normalScale = b.normalScale;
+        if (bits & kOvAo) a.ao = b.ao;
+        if (bits & kOvEmissive) a.emissive = b.emissive;
+        if (bits & kOvAlphaMode) a.alphaMode = b.alphaMode;
+        if (bits & kOvAlphaCutoff) a.alphaCutoff = b.alphaCutoff;
+        if (bits & kOvDitherAlpha) a.ditherAlpha = b.ditherAlpha;
+        if (bits & kOvShadingModel) a.shadingModel = b.shadingModel;
+        if (bits & kOvDoubleSided) a.doubleSided = b.doubleSided;
+        if (bits & kOvHeightScale) a.heightScale = b.heightScale;
+    }
+
+    // ---- 导入快照（W0-3）----
+    // 只有 `Kind::Model` 的材质会填：记录"模型刚加载出来时"的参数。
+    // 有了它才能回答"用户到底改过哪几个字段"，进而只把差的那些写进存档
+    // （只写覆盖项，见 world_scale_roadmap D2）。
+    Params importDefaults;
+    bool hasImportDefaults = false;
+
+    void captureImportDefaults() {
+        importDefaults = captureParams();
+        hasImportDefaults = true;
+    }
+
+    // ---- 实例语义（W1-1）----
+    // 母材质（nullptr = 自己是母材质）。值语义：实例的参数字段就是真值，
+    // `overridden` 只决定"母材质变了要不要跟进"。
+    // ⚠ 永远指向 AssetManager 里由 unique_ptr 持有的对象 —— 材质在本进程内
+    //   不销毁，所以裸指针安全（`m_materials` 只增不删）。
+    const Material* parent = nullptr;
+    std::uint32_t overridden = 0;
+
+    bool isInstance() const { return parent != nullptr; }
+
+    // 两级限制：实例不能再当母材质（见 AssetManager::makeInstanceOf）
+    bool canBeParent() const { return parent == nullptr; }
+
+    // 把 child 里**未被覆盖**的字段刷成 parent 的值（W1-2 的核心算法）。
+    // 返回 1 = 真的刷了，0 = 全被覆盖（跳过）。
+    //
+    // 抽成静态自由函数而不是留在 AssetManager 里，是为了让自检能在
+    // **没有 AssetManager、没有 GPU、没有窗口** 的机器上直接测这段逻辑
+    // （AssetManager 的构造需要一个 TextureContext = 真设备）。
+    static int syncInstanceParams(Material& child, const Material& parent) {
+        const std::uint32_t follow = kOvScalarMask & ~child.overridden;
+        if (!follow) return 0;
+        Params p = child.captureParams();
+        mergeParams(p, parent.captureParams(), follow);
+        child.applyParams(p);
+        return 1;
+    }
 };
 
 } // namespace assets

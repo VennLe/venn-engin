@@ -38,10 +38,15 @@ DEFAULT_EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
 
 # tag 字符类必须含小写：VP-ADD-Mesh / VP-ADD-Cube 这些 tag 带小写字母，
 # 只写 [A-Z-] 会静默失配（转储看得见、正则抓不到，排查半天）。
+# ⚠ 还**必须含数字**：`INS-TERRAIN-LAYER0` 这类"带下标"的锚点用旧的
+#   `[A-Za-z-]+` 解析不出坐标 —— 而 `last_rect()` 会老老实实返回 None，
+#   断言就这么静默地永假（W4-4 实测踩了一次：4 个层槽明明画出来了，
+#   C3 报"[None, None, None, None]"）。数字是 tag 里最自然的后缀，
+#   没有理由把它排除在外。
 # `#\d+` 是"第几次打开弹出菜单"的序号 —— 菜单弹出物的矩形都带它，见
 # ViewportPanel::drawAddMenu 里那段注释。
 RECT_RE = re.compile(
-    r"([A-Za-z-]+(?:#\d+)?)"
+    r"([A-Za-z0-9_-]+(?:#\d+)?)"
     r"=\((-?[\d.]+),(-?[\d.]+)\)-\((-?[\d.]+),(-?[\d.]+)\)")
 
 WM_KEYDOWN = 0x0100

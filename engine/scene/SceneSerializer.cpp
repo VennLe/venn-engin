@@ -152,16 +152,174 @@ assets::Texture* resolveTexture(assets::AssetManager& am, const json& jt) {
 // 材质来源
 // ============================================================
 
+// ---- 覆盖项（W0-3 / W1-4）----
+//
+// 只写"与基准不同的字段"。基准有两种：
+//   · Model 材质  → 导入时的原始参数（`Material::importDefaults`）
+//   · Instance 材质 → 母材质（W1）
+// 存全量会有一个隐蔽后果：母材质/模型改了以后，所有实例的对应字段都
+// "值 ≠ 基准"，于是**全部被当成覆盖** → 改母材质不生效。这就是
+// `world_scale_roadmap` D2 与 `persistence_roadmap` D3 的同一条道理。
+const char* alphaModeToStr(assets::Material::AlphaMode m) {
+    switch (m) {
+        case assets::Material::AlphaMode::Blend: return "blend";
+        case assets::Material::AlphaMode::Mask: return "mask";
+        case assets::Material::AlphaMode::Opaque: break;
+    }
+    return "opaque";
+}
+
+json overridesToJson(const assets::Material::Params& p, std::uint32_t bits) {
+    json j = json::object();
+    using M = assets::Material;
+    if (bits & M::kOvBaseColor) j["baseColor"] = vec4ToJson(p.baseColorFactor);
+    if (bits & M::kOvMetallic) j["metallic"] = p.metallic;
+    if (bits & M::kOvRoughness) j["roughness"] = p.roughness;
+    if (bits & M::kOvNormalScale) j["normalScale"] = p.normalScale;
+    if (bits & M::kOvAo) j["ao"] = p.ao;
+    if (bits & M::kOvEmissive) j["emissive"] = vec3ToJson(p.emissive);
+    if (bits & M::kOvAlphaMode) j["alphaMode"] = alphaModeToStr(p.alphaMode);
+    if (bits & M::kOvAlphaCutoff) j["alphaCutoff"] = p.alphaCutoff;
+    if (bits & M::kOvDitherAlpha) j["ditherAlpha"] = p.ditherAlpha;
+    if (bits & M::kOvShadingModel)
+        j["shadingModel"] =
+            (p.shadingModel == M::ShadingModel::Skin) ? "skin" : "default";
+    if (bits & M::kOvDoubleSided) j["doubleSided"] = p.doubleSided;
+    if (bits & M::kOvHeightScale) j["heightScale"] = p.heightScale;
+    return j;
+}
+
+std::uint32_t overridesFromJson(const json& jo, assets::Material::Params& p) {
+    std::uint32_t bits = 0;
+    if (!jo.is_object()) return bits;
+    using M = assets::Material;
+    if (jo.contains("baseColor")) {
+        p.baseColorFactor = vec4FromJson(jo["baseColor"], p.baseColorFactor);
+        bits |= M::kOvBaseColor;
+    }
+    if (jo.contains("metallic")) {
+        p.metallic = jo.value("metallic", p.metallic);
+        bits |= M::kOvMetallic;
+    }
+    if (jo.contains("roughness")) {
+        p.roughness = jo.value("roughness", p.roughness);
+        bits |= M::kOvRoughness;
+    }
+    if (jo.contains("normalScale")) {
+        p.normalScale = jo.value("normalScale", p.normalScale);
+        bits |= M::kOvNormalScale;
+    }
+    if (jo.contains("ao")) {
+        p.ao = jo.value("ao", p.ao);
+        bits |= M::kOvAo;
+    }
+    if (jo.contains("emissive")) {
+        p.emissive = vec3FromJson(jo["emissive"], p.emissive);
+        bits |= M::kOvEmissive;
+    }
+    if (jo.contains("alphaMode")) {
+        const std::string s = jo.value("alphaMode", std::string("opaque"));
+        p.alphaMode = (s == "blend")   ? M::AlphaMode::Blend
+                      : (s == "mask")  ? M::AlphaMode::Mask
+                                       : M::AlphaMode::Opaque;
+        bits |= M::kOvAlphaMode;
+    }
+    if (jo.contains("alphaCutoff")) {
+        p.alphaCutoff = jo.value("alphaCutoff", p.alphaCutoff);
+        bits |= M::kOvAlphaCutoff;
+    }
+    if (jo.contains("ditherAlpha")) {
+        p.ditherAlpha = jo.value("ditherAlpha", p.ditherAlpha);
+        bits |= M::kOvDitherAlpha;
+    }
+    if (jo.contains("shadingModel")) {
+        p.shadingModel = (jo.value("shadingModel", std::string()) == "skin")
+                             ? M::ShadingModel::Skin
+                             : M::ShadingModel::Default;
+        bits |= M::kOvShadingModel;
+    }
+    if (jo.contains("doubleSided")) {
+        p.doubleSided = jo.value("doubleSided", p.doubleSided);
+        bits |= M::kOvDoubleSided;
+    }
+    if (jo.contains("heightScale")) {
+        p.heightScale = jo.value("heightScale", p.heightScale);
+        bits |= M::kOvHeightScale;
+    }
+    return bits;
+}
+
+// 只写"用户手工换上"的纹理槽（带 TextureSource 的那些）。
+// 模型/贴图资产自带的那几张没有 source，写出来是 null，读回来不该覆盖它们。
+json materialTextureOverrides(const assets::Material* mat) {
+    if (!mat) return json::object();
+    json tex = json::object();
+    auto put = [&tex](const char* key, assets::Texture* t) {
+        json s = textureSourceToJson(t);
+        if (!s.is_null()) tex[key] = s;
+    };
+    put("albedo", mat->albedoMap);
+    put("normal", mat->normalMap);
+    put("orm", mat->ormMap);
+    put("roughnessMap", mat->roughnessMap);
+    put("metallicMap", mat->metallicMap);
+    put("emissiveMap", mat->emissiveMap);
+    put("heightMap", mat->heightMap);
+    return tex;
+}
+
 json materialToJson(const assets::Material* mat) {
     if (!mat) return nullptr;
 
     json j;
     j["name"] = mat->name;
+    // W0-2：稳定身份。**所有 kind 都写** —— 读端先按 id 找，
+    // 找不到再按 name 回落，这样"模型重导出改了材质顺序"不会静默错位。
+    if (!mat->id.empty()) j["id"] = mat->id;
 
-    // glTF 派生的材质：只记"来自哪个模型"，重建 = 重新加载该模型
+    // 实例（W1-4）：只写母材质 id + 覆盖项，不写全量参数
+    if (mat->source.kind == assets::MaterialSource::Kind::Instance) {
+        j["kind"] = "instance";
+        j["parent"] = mat->parent ? (mat->parent->id.empty() ? mat->parent->name
+                                                             : mat->parent->id)
+                                  : std::string();
+        j["overrides"] =
+            overridesToJson(mat->captureParams(), mat->overridden);
+        j["alphaBlend"] = (mat->alphaMode == assets::Material::AlphaMode::Blend);
+        return j;
+    }
+
+    // 材质资产（W2-1）：只写"引用哪个 .vmat" + 用户改过的字段。
+    // 参数本身住在 .vmat 里 —— 这就是"改一次 .vmat，两个关卡都变"的机制。
+    if (mat->source.kind == assets::MaterialSource::Kind::VMAT) {
+        j["kind"] = "vmat";
+        j["path"] = mat->source.vmatPath;
+        assets::Material::Params cur = mat->captureParams();
+        const std::uint32_t bits =
+            mat->hasImportDefaults
+                ? assets::Material::diffParams(mat->importDefaults, cur)
+                : 0u;
+        if (bits) j["overrides"] = overridesToJson(cur, bits);
+        json tex = materialTextureOverrides(mat);
+        if (!tex.empty()) j["overridesTex"] = tex;
+        return j;
+    }
+
+    // glTF/FBX 派生的材质：记"来自哪个模型" + 用户改过的那几个字段
     if (mat->source.kind == assets::MaterialSource::Kind::Model) {
         j["kind"] = "model";
         j["modelKey"] = mat->source.modelKey;
+        // ⚠ 以前这里直接 `return j`，于是编辑器里对导入模型材质做的任何
+        //   修改**存盘即丢**，重开还会因为找不到而变成 null（物体变无材质）。
+        std::uint32_t bits = 0;
+        assets::Material::Params cur = mat->captureParams();
+        if (mat->hasImportDefaults)
+            bits = assets::Material::diffParams(mat->importDefaults, cur);
+        if (bits) j["overrides"] = overridesToJson(cur, bits);
+        // 纹理槽：只有"用户手工换上的"（带 TextureSource 的）才写 ——
+        // 模型自带的那几张没有 source，写出来是 null，读回来不该覆盖。
+        json tex = materialTextureOverrides(mat);
+        if (!tex.empty()) j["overridesTex"] = tex;
         return j;
     }
 
@@ -207,24 +365,210 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
 
     const std::string kind = jm.value("kind", std::string("procedural"));
     const std::string name = jm.value("name", std::string("material"));
+    const std::string id = jm.value("id", std::string());
+
+    // ---- 手工换上的纹理（W0-3 / W1-4）----
+    auto applyTexOverrides = [&am](assets::Material* m, const json& jo) {
+        if (!m || !jo.is_object()) return;
+        auto get = [&](const char* k) -> assets::Texture* {
+            return jo.contains(k) ? resolveTexture(am, jo[k]) : nullptr;
+        };
+        if (auto* t = get("albedo")) m->albedoMap = t;
+        if (auto* t = get("normal")) m->normalMap = t;
+        if (auto* t = get("orm")) m->ormMap = t;
+        if (auto* t = get("roughnessMap")) m->roughnessMap = t;
+        if (auto* t = get("metallicMap")) m->metallicMap = t;
+        if (auto* t = get("emissiveMap")) m->emissiveMap = t;
+        if (auto* t = get("heightMap")) m->heightMap = t;
+    };
+
+    // ---- 实例（W1-4）----
+    if (kind == "instance") {
+        const std::string parentId = jm.value("parent", std::string());
+        assets::Material* p = am.findMaterialById(parentId);
+        if (!p && !parentId.empty()) p = am.findMaterial(parentId);
+        assets::Material* m = nullptr;
+        if (p) {
+            m = am.makeInstanceOf(p, name);
+        } else {
+            // ⚠ 母材质找不到（模型文件删了 / .vmat 改名了）**不能变 null**：
+            //   退化成独立材质，overrides 照样应用 —— 关卡里的东西还在，
+            //   只是没了共享关系。
+            VK_LOG_WARN("ASSET-MAT-MISS parent=%s name=%s reason=parent-not-found",
+                        assets::assetLogSafe(parentId).c_str(),
+                        assets::assetLogSafe(name).c_str());
+            m = am.makeMaterialPBR(name, nullptr, nullptr, nullptr,
+                                   glm::vec4(1.0f), 0.5f, 0.0f, glm::vec3(0.0f),
+                                   false);
+        }
+        if (!m) return nullptr;
+        assets::Material::Params pp = m->captureParams();
+        const std::uint32_t bits = overridesFromJson(
+            jm.contains("overrides") ? jm["overrides"] : json::object(), pp);
+        m->applyParams(pp);
+        m->overridden = bits;
+        applyTexOverrides(m, jm.contains("overridesTex") ? jm["overridesTex"]
+                                                         : json::object());
+        // 老字段兼容：alphaBlend 布尔
+        if (jm.value("alphaBlend", false))
+            m->alphaMode = assets::Material::AlphaMode::Blend;
+        return m;
+    }
+
+    // ---- 材质资产文件（W2-1）----
+    // `assets/materials/*.vmat` 的字段与场景里的 `procedural` 块**完全相同**，
+    // 所以这里直接递归回自己：读文件 → 把 doc 当成 procedural 块解析。
+    // 一套解析器两处用，是这条最省的地方（多一套就会有两套 bug）。
+    if (kind == "vmat") {
+        const std::string relPath = jm.value("path", std::string());
+        // 先按 id 找已解析过的（300 个物体引用同一个 .vmat 不该解析 300 次）
+        if (!id.empty()) {
+            if (assets::Material* cached = am.findMaterialById(id)) {
+                if (jm.contains("overrides")) {
+                    assets::Material::Params pp = cached->captureParams();
+                    const std::uint32_t bits =
+                        overridesFromJson(jm["overrides"], pp);
+                    cached->applyParams(pp);
+                    cached->overridden |= bits;
+                }
+                if (jm.contains("overridesTex"))
+                    applyTexOverrides(cached, jm["overridesTex"]);
+                return cached;
+            }
+        }
+        json doc;
+        bool loaded = false;
+        if (!relPath.empty()) {
+            std::ifstream in(assets::resolveAssetPath(relPath),
+                             std::ios::binary);
+            if (in) {
+                try {
+                    in >> doc;
+                    loaded = doc.is_object();
+                } catch (const std::exception& ex) {
+                    VK_LOG_WARN("SceneSerializer: .vmat parse failed (%s): %s",
+                                relPath.c_str(), ex.what());
+                }
+            }
+        }
+        if (!loaded) {
+            VK_LOG_WARN("ASSET-MAT-MISS id=%s path=%s reason=vmat-not-found",
+                        assets::assetLogSafe(id).c_str(),
+                        assets::assetLogSafe(relPath).c_str());
+            const std::string missName =
+                (relPath.empty() ? std::string("vmat") : relPath) + "#missing";
+            assets::Material* m = am.findMaterial(missName);
+            if (!m)
+                m = am.makeMaterialPBR(missName, nullptr, nullptr, nullptr,
+                                       glm::vec4(1.0f), 0.5f, 0.0f,
+                                       glm::vec3(0.0f), false);
+            if (m) am.assignMaterialId(m, missName);
+            return m;
+        }
+
+        // .vmat 自己的 id 优先（这就是"材质资产可以被多个关卡共享"的锚点）
+        const std::string fileId = doc.value("id", std::string());
+        const std::string wantId =
+            !fileId.empty() ? fileId : (!id.empty() ? id : relPath);
+        if (!doc.contains("name")) doc["name"] = wantId;
+        doc["kind"] = "procedural";
+
+        assets::Material* m = resolveMaterial(am, doc);
+        if (m) {
+            m->source.kind = assets::MaterialSource::Kind::VMAT;
+            m->source.vmatPath = relPath;
+            am.assignMaterialId(m, wantId);
+            m->captureImportDefaults();
+            VK_LOG_INFO("ASSET-VMAT path=%s id=%s name=%s",
+                        assets::assetLogSafe(relPath).c_str(),
+                        assets::assetLogSafe(wantId).c_str(),
+                        assets::assetLogSafe(m->name).c_str());
+            if (jm.contains("overrides")) {
+                assets::Material::Params pp = m->captureParams();
+                const std::uint32_t bits =
+                    overridesFromJson(jm["overrides"], pp);
+                m->applyParams(pp);
+                m->overridden |= bits;
+            }
+            if (jm.contains("overridesTex"))
+                applyTexOverrides(m, jm["overridesTex"]);
+        }
+        return m;
+    }
 
     if (kind == "model") {
-        // 网格解析时通常已经重新加载过模型，材质随之登记完毕
-        assets::Material* m = am.findMaterial(name);
-        if (m) return m;
+        assets::Material* m = nullptr;
+        // 1) 先按**稳定 id** 找（W0-2：模型重导出改了材质顺序也能对上）
+        if (!id.empty()) m = am.findMaterialById(id);
+        // 2) 再按缓存键 name 回落（兼容没有 id 的老场景文件）
+        if (!m) m = am.findMaterial(name);
 
-        // 兜底：万一实体只有材质没有网格，这里补一次模型加载
-        const std::string modelKey = jm.value("modelKey", std::string());
-        if (!modelKey.empty()) {
-            try {
-                am.loadGLTF(assets::resolveAssetPath(modelKey), modelKey);
-            } catch (const std::exception& ex) {
-                VK_LOG_WARN(
-                    "SceneSerializer: model reload for material failed (%s): %s",
-                    modelKey.c_str(), ex.what());
+        if (!m) {
+            // 3) 兜底：实体只有材质没有网格时，这里补一次模型加载
+            const std::string modelKey = jm.value("modelKey", std::string());
+            if (!modelKey.empty()) {
+                try {
+                    const std::string abs = assets::resolveAssetPath(modelKey);
+                    // 按扩展名分派 —— FBX 走 loadGLTF 会抛异常，
+                    // 然后被静默当成"没有材质"（这正是 F3 的第二层）
+                    const bool fbx =
+                        abs.size() > 4 &&
+                        (abs.compare(abs.size() - 4, 4, ".fbx") == 0 ||
+                         abs.compare(abs.size() - 4, 4, ".FBX") == 0);
+                    if (fbx)
+                        am.loadFBX(abs, modelKey);
+                    else
+                        am.loadGLTF(abs, modelKey);
+                } catch (const std::exception& ex) {
+                    VK_LOG_WARN(
+                        "SceneSerializer: model reload for material failed (%s): %s",
+                        modelKey.c_str(), ex.what());
+                }
+                if (!id.empty()) m = am.findMaterialById(id);
+                if (!m) m = am.findMaterial(name);
             }
-            m = am.findMaterial(name);
         }
+
+        if (!m) {
+            // ⚠ 以前这里 `return m`（= nullptr），后果是**物体直接消失**：
+            //   下方 skip 判定 `!mesh && !mat && !hasNonMeshContent` 会把它
+            //   排除出渲染列表，一个日志都没有。现在退化成占位材质（默认白），
+            //   并且**打日志**。
+            VK_LOG_WARN("ASSET-MAT-MISS id=%s name=%s reason=not-found",
+                        assets::assetLogSafe(id).c_str(),
+                        assets::assetLogSafe(name).c_str());
+            // 占位用 `#missing` 后缀：既不污染模型真正的缓存键
+            // （否则以后模型加载成功会被冲突改名），又保证同一份文件读两次
+            // 落到同一个占位材质上。
+            const std::string missName = name + "#missing";
+            m = am.findMaterial(missName);
+            if (!m) {
+                m = am.makeMaterialPBR(missName, nullptr, nullptr, nullptr,
+                                       glm::vec4(1.0f), 0.5f, 0.0f,
+                                       glm::vec3(0.0f), false);
+                if (m) {
+                    const std::string modelKey =
+                        jm.value("modelKey", std::string());
+                    if (!modelKey.empty()) m->source.setModel(modelKey);
+                    am.assignMaterialId(m, missName);
+                    // 基准 = 占位材质的默认参数。有了它，overrides 才能
+                    // 被算成"差值"再写回去（否则本次读进来的覆盖会在
+                    // 下一次存盘时丢掉）。
+                    m->captureImportDefaults();
+                }
+            }
+        }
+
+        // 4) 应用用户改过的字段（W0-3 的核心）
+        if (m && jm.contains("overrides")) {
+            assets::Material::Params pp = m->captureParams();
+            const std::uint32_t bits =
+                overridesFromJson(jm["overrides"], pp);
+            m->applyParams(pp);
+            m->overridden |= bits;
+        }
+        if (m && jm.contains("overridesTex"))
+            applyTexOverrides(m, jm["overridesTex"]);
         return m;
     }
 
@@ -742,6 +1086,40 @@ ecs::DecalComponent decalFromJson(assets::AssetManager& am, const json& j) {
 // transform（与贴花 / 灯同一条约定），所以这里不重复存 position/rotation。
 // 捕获本身**不进文件**：它是烘焙产物，下次打开时由渲染器重新烘
 // （探针数据一变就自动重捕，见 Renderer::collectProbes）。
+// ------------------------------------------------------------
+// 地形（W4）
+//
+// 只存"哪份资产 + 变换 + 倍率 + 4 层覆盖"。高度图 / 权重图 / 分块网格
+// 全部由 `.vterrain`（及其兄弟文件）决定，不落进场景 —— 否则一个场景里
+// 就有 66049 个浮点数，diff 与合并都会变成灾难。
+// ------------------------------------------------------------
+json terrainToJson(const ecs::TerrainComponent& t) {
+    json j;
+    j["source"] = t.source;
+    j["visible"] = t.visible;
+    j["heightScale"] = t.heightScale;
+    json layers = json::array();
+    for (int i = 0; i < 4; ++i) layers.push_back(t.layerOverrides[i]);
+    j["layers"] = layers;
+    return j;
+}
+
+ecs::TerrainComponent terrainFromJson(const json& j) {
+    ecs::TerrainComponent t;
+    t.source = j.value("source", std::string());
+    t.visible = j.value("visible", true);
+    t.heightScale = j.value("heightScale", 1.0f);
+    if (j.contains("layers") && j["layers"].is_array()) {
+        const auto& arr = j["layers"];
+        for (int i = 0; i < 4 && static_cast<std::size_t>(i) < arr.size(); ++i) {
+            if (arr[static_cast<std::size_t>(i)].is_string()) {
+                t.layerOverrides[i] = arr[static_cast<std::size_t>(i)].get<std::string>();
+            }
+        }
+    }
+    return t;
+}
+
 json reflectionProbeToJson(const ecs::ReflectionProbeComponent& p) {
     json j;
     j["extents"] = vec3ToJson(p.extents);
@@ -773,6 +1151,167 @@ ecs::ReflectionProbeComponent reflectionProbeFromJson(const json& j) {
 // **粒子本身不进文件**：它们是 GPU 池里的一堆瞬时状态，打开场景时从
 // 零开始重新发射（帧号从 1 起，见 Renderer::m_particleSimFrame）。
 // 存"某一刻有哪些粒子"既不必要（下一帧就不一样了）也无法复现。
+// ------------------------------------------------------------
+// 蒙皮 / 骨骼动画（角色链 A0-2）
+// ------------------------------------------------------------
+//
+// 骨架来源从 `model->subMeshes[0].mesh->source()` 反推：组件里存的是
+// 加载后的 `Model*`，而 `MeshSource` 才是"怎么重建"的唯一权威 ——
+// `path` 是资产相对路径、`name` 是 AssetManager 的缓存键，与 `mesh`
+// 块里的 `modelKey` 是同一套约定，所以读档时能命中同一份缓存。
+//
+// ⚠ **老场景没有 `skinned` 键 → 不建组件** → 渲染结果逐像素等于今天。
+//   这是硬约束（"特性默认关 = 逐像素一致"），别改成默认建。
+// `Model*` → {"kind","path","modelKey"}。拿不到可靠的来源就返回 null
+// （程序化 / 未知来源的骨架没有重建信息 —— 只丢动画字段，网格本身走它
+// 自己的 `mesh` 块）。
+//
+// A1 起被 skinned 与 animator 两个块共用：两处各写一份 kind 判断，
+// 早晚会有一处漏掉 glTF（那是"存下来读不回来"的经典症状）。
+json modelSourceToJson(const assets::Model* model) {
+    if (!model || model->subMeshes.empty()) return nullptr;
+    const assets::Mesh* m0 = model->subMeshes.front().mesh;
+    if (!m0) return nullptr;
+    const assets::MeshSource& s = m0->source();
+    const char* kind = nullptr;
+    if (s.kind == assets::MeshSource::Kind::FBX) {
+        kind = "fbx";
+    } else if (s.kind == assets::MeshSource::Kind::GLTF) {
+        kind = "gltf";
+    }
+    if (!kind) return nullptr;
+    json j;
+    j["kind"] = kind;
+    j["path"] = s.path;
+    j["modelKey"] = s.name;
+    return j;
+}
+
+json skinnedToJson(const ecs::SkinnedMeshComponent& sk) {
+    json src = modelSourceToJson(sk.model);
+    if (src.is_null()) return nullptr;
+    json j = std::move(src);
+    j["clipName"] = sk.clipName;
+    j["time"] = sk.time;
+    j["speed"] = sk.speed;
+    j["playing"] = sk.playing;
+    j["loop"] = sk.loop;
+    return j;
+}
+
+// 按 {"kind","path","modelKey"} 重建模型。返回 nullptr = 失败（已打日志）。
+// `what` 只用于日志前缀（"skinned" / "animator"），方便定位是哪一块坏了。
+assets::Model* modelFromSource(assets::AssetManager& am, const json& j,
+                               const char* what) {
+    if (!j.is_object()) return nullptr;
+    const std::string kind = j.value("kind", std::string());
+    const std::string path = j.value("path", std::string());
+    if (path.empty()) return nullptr;
+    const std::string modelKey = j.value("modelKey", path);
+
+    assets::Model* model = nullptr;
+    try {
+        if (kind == "fbx") {
+            model = am.loadFBX(assets::resolveAssetPath(path), modelKey);
+        } else if (kind == "gltf") {
+            model = am.loadGLTF(assets::resolveAssetPath(path), modelKey);
+        } else {
+            VK_LOG_WARN("SceneSerializer: unknown %s kind '%s' (%s)", what,
+                        kind.c_str(), path.c_str());
+            return nullptr;
+        }
+    } catch (const std::exception& ex) {
+        VK_LOG_WARN("SceneSerializer: %s model load failed (%s): %s", what,
+                    path.c_str(), ex.what());
+        return nullptr;
+    }
+    if (!model || !model->skinned()) {
+        VK_LOG_WARN("SceneSerializer: '%s' block but model has no "
+                    "skeleton (%s)", what, path.c_str());
+        return nullptr;
+    }
+    return model;
+}
+
+// 返回 false = 重建失败（资产缺失 / 不是骨架模型）→ 调用方不建组件，
+// 并保留 `SCENE-SKINNED ... ok=0` 一行日志（断言靠它区分"没存"与"存了但读失败"）。
+bool skinnedFromJson(assets::AssetManager& am, const json& j,
+                     ecs::SkinnedMeshComponent& out) {
+    if (!j.is_object()) return false;
+    assets::Model* model = modelFromSource(am, j, "skinned");
+    if (!model) return false;
+
+    out.model = model;
+    out.clipName = j.value("clipName", std::string());
+    out.time = j.value("time", 0.0f);
+    out.speed = j.value("speed", 1.0f);
+    out.playing = j.value("playing", true);
+    out.loop = j.value("loop", true);
+    // 派生数据：由 AnimatorSystem / Renderer 每帧重算，绝不落盘
+    out.jointBase = -1;
+    out.jointMatrices.clear();
+    return true;
+}
+
+// ------------------------------------------------------------
+// 动画器（角色链 A1，2026-10-19）
+// ------------------------------------------------------------
+//
+// 只存"配置"：可选骨架来源 + controller/defaultClip + 四个播放字段 +
+// rootMotion。**运行时字段一律不落盘**（stateIndex / stateTime /
+// appliedDefaultClip / 三张参数黑板）—— 它们要么每帧重算，要么由控制器
+// 资产的 default 决定（A2）。
+//
+// ⚠ 老场景没有 `animator` 键 → 不建组件 → 走 A0 老路径，逐像素不变。
+//   这与 `skinned` 同一条硬约束，别改成默认建。
+json animatorToJson(const ecs::AnimatorComponent& an) {
+    json j;
+    j["defaultClip"] = an.defaultClip;
+    j["controllerPath"] = an.controllerPath;
+    j["time"] = an.time;
+    j["speed"] = an.speed;
+    j["playing"] = an.playing;
+    j["loop"] = an.loop;
+    j["rootMotion"] = static_cast<int>(an.rootMotion);
+    // 骨架来源只在**显式给过**的时候才写：空 = 用 skinned 那一份。
+    // 写一个空对象会让读档的人以为"这里本来有东西被清掉了"。
+    json src = modelSourceToJson(an.model);
+    if (!src.is_null()) j["model"] = std::move(src);
+    return j;
+}
+
+// 返回 false = 读不回来。**与 skinnedFromJson 的关键区别**：骨架来源读
+// 失败 / 没写都**不算失败** —— 组件仍然建起来，只是把 model 留空，让
+// AnimatorSystem 回退到 skinned 那一份。理由是"动画器的配置（clip /
+// time / speed）比骨架来源重要"，为了一个可回退的字段丢掉整块配置，
+// 用户下次打开会看到时间被重置。
+bool animatorFromJson(assets::AssetManager& am, const json& j,
+                      ecs::AnimatorComponent& out) {
+    if (!j.is_object()) return false;
+    if (j.contains("model")) {
+        out.model = modelFromSource(am, j["model"], "animator");
+    }
+    out.defaultClip = j.value("defaultClip", std::string());
+    out.controllerPath = j.value("controllerPath", std::string());
+    out.time = j.value("time", 0.0f);
+    out.speed = j.value("speed", 1.0f);
+    out.playing = j.value("playing", true);
+    out.loop = j.value("loop", true);
+    const int rm = j.value("rootMotion", 0);
+    out.rootMotion = (rm >= 0 && rm <= 2)
+                         ? static_cast<ecs::AnimatorComponent::RootMotionMode>(rm)
+                         : ecs::AnimatorComponent::RootMotionMode::Off;
+    // 运行时：一律重置（绝不能从文件里读回来，那会让"这一局"的状态
+    // 跟着存档走）
+    out.stateIndex = -1;
+    out.stateTime = 0.0f;
+    out.appliedDefaultClip = false;
+    out.floatParams.clear();
+    out.boolParams.clear();
+    out.triggerParams.clear();
+    return true;
+}
+
 json particleEmitterToJson(const ecs::ParticleEmitterComponent& p) {
     json j;
     // ---- Main / Playback ----
@@ -866,6 +1405,7 @@ json particleEmitterToJson(const ecs::ParticleEmitterComponent& p) {
     }
     // ---- Renderer ----
     j["startSize"] = p.startSize;
+    j["sprite"] = static_cast<int>(p.sprite);
     j["blend"] = static_cast<int>(p.blend);
     j["renderMode"] = static_cast<int>(p.renderMode);
     j["sortMode"] = static_cast<int>(p.sortMode);
@@ -1014,6 +1554,11 @@ ecs::ParticleEmitterComponent particleEmitterFromJson(const json& j) {
     p.colorRamp.sort();
     // ---- Renderer ----
     p.startSize = j.value("startSize", p.startSize);
+    // 贴图形状（ParticleSprite）。老场景没有这个键 → 保持默认 Disc，
+    // 也就是**逐像素不变**。
+    p.sprite = static_cast<ecs::ParticleSprite>(
+        glm::clamp(j.value("sprite", 0), 0,
+                   static_cast<int>(ecs::ParticleSprite::Count) - 1));
     p.blend = static_cast<ecs::ParticleBlend>(
         j.value("blend", static_cast<int>(p.blend)));
     p.renderMode = static_cast<ecs::ParticleRenderMode>(
@@ -1303,6 +1848,15 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
             ps.sleepTime != def.sleepTime)
             root["physics"] = physicsToJson(ps);
     }
+    // 脚本世界黑板（S2）。只有存在时才写 —— 与 physics 同款：老场景文件
+    // 里没有这段，读的时候自然落到空表。
+    // ⚠ 与 `ecs::ScriptVarsComponent`（逐实体、不存盘）**刻意分开**：
+    //   这里存的是"这关的进度"，组件存的是"这一局的血量"。
+    if (!scene.scriptVars().empty()) {
+        json sv = json::object();
+        for (const auto& kv : scene.scriptVars()) sv[kv.first] = kv.second;
+        root["scriptVars"] = std::move(sv);
+    }
     // 后处理体积（相机级效果的场景化覆盖）：为空时不写，旧场景文件不含它。
     if (!scene.postVolumes().empty()) {
         json vols = json::array();
@@ -1370,10 +1924,28 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         if (const auto* dc = w.get<ecs::DecalComponent>(it.entity))
             je["decal"] = decalToJson(*dc);
 
+        // 地形（W4）。它**没有网格组件** —— 几何由高度图在渲染层生成，
+        // 所以同样不适用下面那句 "mesh 为空 → skipped++"。
+        if (const auto* tc = w.get<ecs::TerrainComponent>(it.entity))
+            je["terrain"] = terrainToJson(*tc);
+
         // 反射探针（R5-1）。与贴花同理：探针**没有网格**，
         // 下面那句 "mesh 为空 → skipped++" 对它也不适用。
         if (const auto* rp = w.get<ecs::ReflectionProbeComponent>(it.entity))
             je["probe"] = reflectionProbeToJson(*rp);
+
+        // 蒙皮 / 骨骼动画（角色链 A0-2）。模型根实体**没有网格**，
+        // 所以它同样不适用下面那句 "mesh 为空 → skipped++"。
+        if (const auto* sk = w.get<ecs::SkinnedMeshComponent>(it.entity)) {
+            json js = skinnedToJson(*sk);
+            if (!js.is_null()) je["skinned"] = js;
+            VK_LOG_INFO("SCENE-SKINNED entity=%u clip=%s speed=%.2f "
+                        "playing=%d loop=%d stored=%d",
+                        static_cast<unsigned>(it.entity.id),
+                        sk->clipName.c_str(), static_cast<double>(sk->speed),
+                        sk->playing ? 1 : 0, sk->loop ? 1 : 0,
+                        js.is_null() ? 0 : 1);
+        }
 
         // GPU 粒子发射器（R6-1）。与贴花 / 探针同理：发射器**没有网格**
         //（几何是顶点着色器现拼的 billboard），同样不适用 skipped++ 那句。
@@ -1385,6 +1957,21 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         // 要为它开一个口子。位置/朝向已经在 transform 里，这里只存参数。
         if (const auto* rb = w.get<ecs::RigidBodyComponent>(it.entity))
             je["rigidbody"] = rigidBodyToJson(*rb);
+
+        // 动画器（角色链 A1）。挂在同一个模型根实体上，紧跟 skinned 之后。
+        // 存盘顺序 = 读档顺序，所以 animatorFromJson 里的 modelFromSource
+        // 一定能命中 AssetManager 缓存（键 = modelKey）。
+        if (const auto* an = w.get<ecs::AnimatorComponent>(it.entity)) {
+            je["animator"] = animatorToJson(*an);
+            VK_LOG_INFO("SCENE-ANIMATOR entity=%u clip=%s time=%.3f "
+                        "speed=%.2f playing=%d loop=%d ctrl=%d",
+                        static_cast<unsigned>(it.entity.id),
+                        an->defaultClip.c_str(),
+                        static_cast<double>(an->time),
+                        static_cast<double>(an->speed), an->playing ? 1 : 0,
+                        an->loop ? 1 : 0,
+                        an->controllerPath.empty() ? 0 : 1);
+        }
 
         // 角色控制器（G07）。与刚体**互斥**：角色是运动学的，由
         // stepCharacter 驱动，不交给物理求解器（互斥关系在 Inspector 里
@@ -1411,6 +1998,28 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
             };
         }
 
+        // 音频源（G14-7）。字段少 → **全写**（读端每个字段都有默认，
+        // 所以旧场景不受影响；而"只写非默认值"会让"我把 volume 调回 1.0
+        // 之后存档里为什么没这个键"变成一个要解释的问题）。
+        if (const auto* asc = w.get<ecs::AudioSourceComponent>(it.entity)) {
+            je["audio"] = json{
+                {"clip", asc->clip},
+                {"playOnAwake", asc->playOnAwake},
+                {"loop", asc->loop},
+                {"spatial", asc->spatial},
+                {"volume", asc->volume},
+                {"pitch", asc->pitch},
+                {"minDist", asc->minDist},
+                {"maxDist", asc->maxDist},
+                {"rolloff", asc->rolloff},
+                {"bus", asc->bus},
+                {"streaming", asc->streaming},
+            };
+        }
+        // 听者标记：只有一个 bool，直接用裸 bool（对象形式没有第二个字段可放）
+        if (const auto* al = w.get<ecs::AudioListenerComponent>(it.entity))
+            je["audioListener"] = al->enabled;
+
         // 玩家（walkPhase/bodyYaw/started 是运行态派生值，不存）
         if (const auto* pc = w.get<ecs::PlayerComponent>(it.entity)) {
             je["player"] = json{
@@ -1430,13 +2039,16 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
             je["playerLimb"] = limb->kind;
 
         // "有没有内容"：没有网格时，贴花 / 探针 / 发射器 / 刚体 / 角色 /
-        // 触发体 / 物理材质 / 相机 任意一个存在就不算空 —— 它们都是
-        // "没有网格但有意义"的实体（隐形的墙、触发区域、相机机位）。
+        // 触发体 / 物理材质 / 相机 / **蒙皮** 任意一个存在就不算空 —— 它们
+        // 都是"没有网格但有意义"的实体（隐形的墙、触发区域、相机机位、
+        // 模型根节点）。
         const bool hasNonMeshContent =
-            je.contains("decal") || je.contains("probe") ||
+            je.contains("terrain") || je.contains("decal") ||
+            je.contains("probe") ||
             je.contains("particleEmitter") || je.contains("rigidbody") ||
             je.contains("character") || je.contains("trigger") ||
-            je.contains("physicsMaterial") || je.contains("camera");
+            je.contains("physicsMaterial") || je.contains("camera") ||
+            je.contains("skinned") || je.contains("animator");
         if (je["mesh"].is_null() && !hasNonMeshContent)
             ++r.skipped;
 
@@ -1484,6 +2096,15 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                     root.contains("physics") ? root["physics"] : json(nullptr));
 
     // 后处理体积
+    // 脚本世界黑板（S2）
+    scene.scriptVars().clear();
+    if (root.contains("scriptVars") && root["scriptVars"].is_object()) {
+        for (auto it = root["scriptVars"].begin();
+             it != root["scriptVars"].end(); ++it) {
+            if (it.value().is_number())
+                scene.scriptVars()[it.key()] = it.value().get<double>();
+        }
+    }
     if (root.contains("postVolumes") && root["postVolumes"].is_array()) {
         for (const json& jv : root["postVolumes"])
             scene.postVolumes().add(postVolumeFromJson(jv));
@@ -1578,6 +2199,54 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 w.add<ecs::MaterialComponent>(e, ecs::MaterialComponent{mat});
         }
 
+        // ---- 蒙皮 / 骨骼动画（A0-2）----
+        // ⚠ 放在网格重建**之后**：那时 AssetManager 里模型已经热了，
+        //   `loadFBX/loadGLTF` 直接命中缓存（键 = `modelKey`）。
+        // ⚠ 老场景没有这个键 → 不建组件 → 逐像素等于今天。
+        if (je.contains("skinned")) {
+            ecs::SkinnedMeshComponent sk;
+            if (skinnedFromJson(assets, je["skinned"], sk)) {
+                if (auto* p = w.get<ecs::SkinnedMeshComponent>(e))
+                    *p = sk;
+                else
+                    w.add<ecs::SkinnedMeshComponent>(e, sk);
+                VK_LOG_INFO("SCENE-SKINNED entity=%u clip=%s speed=%.2f "
+                            "playing=%d loop=%d time=%.3f joints=%d ok=1",
+                            static_cast<unsigned>(e.id), sk.clipName.c_str(),
+                            static_cast<double>(sk.speed), sk.playing ? 1 : 0,
+                            sk.loop ? 1 : 0, static_cast<double>(sk.time),
+                            sk.model ? sk.model->skeleton->jointCount() : 0);
+            } else {
+                VK_LOG_INFO("SCENE-SKINNED entity=%u ok=0",
+                            static_cast<unsigned>(e.id));
+            }
+        }
+
+        // ---- 动画器（角色链 A1）----
+        // 必须在 skinned **之后**：它的 model 可以为空，靠 AnimatorSystem
+        // 回退到刚建好的 SkinnedMeshComponent::model。
+        // ⚠ 老场景没有这个键 → 不建组件 → 走 A0 老路径，逐像素不变。
+        if (je.contains("animator")) {
+            ecs::AnimatorComponent an;
+            if (animatorFromJson(assets, je["animator"], an)) {
+                if (auto* p = w.get<ecs::AnimatorComponent>(e))
+                    *p = an;
+                else
+                    w.add<ecs::AnimatorComponent>(e, an);
+                VK_LOG_INFO("SCENE-ANIMATOR entity=%u clip=%s time=%.3f "
+                            "speed=%.2f playing=%d loop=%d model=%d ok=1",
+                            static_cast<unsigned>(e.id),
+                            an.defaultClip.c_str(),
+                            static_cast<double>(an.time),
+                            static_cast<double>(an.speed),
+                            an.playing ? 1 : 0, an.loop ? 1 : 0,
+                            an.model ? 1 : 0);
+            } else {
+                VK_LOG_INFO("SCENE-ANIMATOR entity=%u ok=0",
+                            static_cast<unsigned>(e.id));
+            }
+        }
+
         // 局部光源组件
         if (je.contains("pointLight")) {
             const ecs::PointLightComponent pl =
@@ -1618,6 +2287,39 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 else
                     w.add<ecs::ScriptComponent>(e, sc);
             }
+        }
+
+        // 音频源（G14-7）
+        //
+        // ⚠ `clip` 为空也照样把组件加上：那是编辑器里"刚点击 Add Audio
+        //   Source、还没选素材"的正常中间态。跳过它会让"加完组件存盘再
+        //   打开就没了"，而用户完全看不出原因。
+        if (je.contains("audio") && je["audio"].is_object()) {
+            const json& ja = je["audio"];
+            ecs::AudioSourceComponent as;
+            as.clip = ja.value("clip", std::string());
+            as.playOnAwake = ja.value("playOnAwake", as.playOnAwake);
+            as.loop = ja.value("loop", as.loop);
+            as.spatial = ja.value("spatial", as.spatial);
+            as.volume = ja.value("volume", as.volume);
+            as.pitch = ja.value("pitch", as.pitch);
+            as.minDist = ja.value("minDist", as.minDist);
+            as.maxDist = ja.value("maxDist", as.maxDist);
+            as.rolloff = ja.value("rolloff", as.rolloff);
+            as.bus = ja.value("bus", as.bus);
+            as.streaming = ja.value("streaming", as.streaming);
+            if (auto* p = w.get<ecs::AudioSourceComponent>(e))
+                *p = as;
+            else
+                w.add<ecs::AudioSourceComponent>(e, as);
+        }
+        if (je.contains("audioListener") && je["audioListener"].is_boolean()) {
+            ecs::AudioListenerComponent al;
+            al.enabled = je["audioListener"].get<bool>();
+            if (auto* p = w.get<ecs::AudioListenerComponent>(e))
+                *p = al;
+            else
+                w.add<ecs::AudioListenerComponent>(e, al);
         }
 
         // 玩家 / 肢体标记
@@ -1670,6 +2372,16 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 *p = dc;
             else
                 w.add<ecs::DecalComponent>(e, dc);
+        }
+
+        // 地形（W4）。读盘只恢复组件；GPU 资源由渲染器在
+        // syncTerrains 里按需建（见 render/Renderer.cpp）。
+        if (je.contains("terrain") && je["terrain"].is_object()) {
+            const ecs::TerrainComponent tc = terrainFromJson(je["terrain"]);
+            if (auto* p = w.get<ecs::TerrainComponent>(e))
+                *p = tc;
+            else
+                w.add<ecs::TerrainComponent>(e, tc);
         }
 
         // 反射探针（R5-1）。与贴花同一形态：实体只提供变换 + 参数，
@@ -1741,10 +2453,12 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
         }
 
         const bool hasNonMeshContent =
-            je.contains("decal") || je.contains("probe") ||
+            je.contains("terrain") || je.contains("decal") ||
+            je.contains("probe") ||
             je.contains("particleEmitter") || je.contains("rigidbody") ||
             je.contains("character") || je.contains("trigger") ||
-            je.contains("physicsMaterial") || je.contains("camera");
+            je.contains("physicsMaterial") || je.contains("camera") ||
+            je.contains("skinned") || je.contains("animator");
         if (!mesh && !mat && !hasNonMeshContent) ++r.skipped;
     }
 

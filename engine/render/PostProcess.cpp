@@ -827,8 +827,36 @@ void PostProcess::recordComposite(
 
 void PostProcess::renderScene(
     VkCommandBuffer cmd, uint32_t imageIndex, uint32_t frameIndex,
-    const std::function<void(VkCommandBuffer)>& overlay) {
+    const std::function<void(VkCommandBuffer)>& overlay,
+    const GameUiDrawFn& gameUi) {
     if (m_bloom.empty() || m_swapFramebuffers.empty()) return;
+
+    // ---- 游戏 UI 的两个包装（顺序是契约：gameUi 先画，ImGui 后画）----
+    //
+    // ⚠ 为什么 gameUi 要拿到 **VkRenderPass**：游戏 UI 的管线按 render pass
+    //   懒建/缓存 —— 两个输出 pass 的 subpass dependency 不同，管线**不兼容**
+    //   （见 ui2/UiRenderer.h 文件头）。所以调用方必须把"当前在哪个 pass 里"
+    //   传下去，否则会在模式 B 里用错管线（VUID-vkCmdDraw-renderPass-02684）。
+    //
+    // · bothA 给**模式 A**（交换链）：gameUi + ImGui 都画在这个 Pass 里；
+    // · gameB 给**模式 B**（离屏图）：只画 gameUi，**绝不**画 ImGui ——
+    //   那张图会被 ImGui 自己当纹理贴进视口，把面板画进去就是无限套娃。
+    // · 没有 gameUi 时 bothPtr 就是原始 overlay 引用 → 与引入前逐位相同。
+    std::function<void(VkCommandBuffer)> bothA;
+    std::function<void(VkCommandBuffer)> gameB;
+    if (gameUi) {
+        bothA = [this, &gameUi, &overlay](VkCommandBuffer c) {
+            gameUi(c, m_postRenderPass);
+            if (overlay) overlay(c);
+        };
+        gameB = [this, &gameUi](VkCommandBuffer c) {
+            gameUi(c, m_offscreenRenderPass);
+        };
+    }
+    const std::function<void(VkCommandBuffer)>* bothPtr =
+        gameUi ? &bothA : &overlay;
+    const std::function<void(VkCommandBuffer)>* gameBPtr =
+        gameUi ? &gameB : nullptr;
 
     const uint32_t fi = frameIndex % static_cast<uint32_t>(m_bloom.size());
     BloomFrame& bf = m_bloom[fi];
@@ -886,12 +914,14 @@ void PostProcess::renderScene(
                         nullptr);
 
         if (m_splitOutput && fi < m_sceneOutput.size()) {
-            // 模式 B：FXAA → 离屏图（ImGui 采样的那张），UI 照旧另跑
+            // 模式 B：FXAA → 离屏图（ImGui 采样的那张），ImGui 照旧另跑。
+            // 游戏 UI 画在**这个** Pass 里 —— 它写出的就是视口看到的那张图，
+            // 而且排在 FXAA 之后（HUD 不该被抗锯齿糊掉）。
             recordFullscreenPass(cmd, m_sceneOutput[fi].fb,
                                  m_offscreenRenderPass,
                                  *m_fxaaOffscreenPipeline, m_outExtent,
                                  &m_fxaaSets[fi], 1, fxaaPush, sizeof(fxaaPush),
-                                 nullptr);
+                                 gameBPtr);
 
             // FXAA pass 的 finalLayout 只保证"布局正确"，写入对
             // ImGui 片元采样可见还要靠这条显式屏障。
@@ -918,15 +948,17 @@ void PostProcess::renderScene(
         recordFullscreenPass(cmd, m_swapFramebuffers[imageIndex],
                              m_postRenderPass, *m_fxaaPipeline, m_outExtent,
                              &m_fxaaSets[fi], 1, fxaaPush, sizeof(fxaaPush),
-                             &overlay);
+                             bothPtr);
         return;
     }
 
     if (m_splitOutput && fi < m_sceneOutput.size()) {
-        // ---- 模式 B：合成到离屏图（不画 UI），UI 由 renderUiToSwapchain 负责 ----
+        // ---- 模式 B：合成到离屏图（不画 ImGui），ImGui 由 renderUiToSwapchain 负责 ----
+        // 游戏 UI 例外：它画进离屏图本身（= 编辑器视口里能看到血条）。
+        // 这就是 `ui.hudInEditor` 那个开关的落点。
         recordComposite(cmd, m_sceneOutput[fi].fb, m_offscreenRenderPass,
                         *m_postOffscreenPipeline, m_outExtent, frameIndex,
-                        nullptr);
+                        gameBPtr);
 
         // RenderPass 的 finalLayout 已把图转到 SHADER_READ_ONLY，但那只
         // 保证"布局正确"，不保证"写入对后续读取可见"。这里补一条显式内存
@@ -950,7 +982,7 @@ void PostProcess::renderScene(
 
     // ---- 模式 A：合成到交换链，UI 画在同一个 Pass 内 ----
     recordComposite(cmd, m_swapFramebuffers[imageIndex], m_postRenderPass,
-                    *m_postPipeline, m_outExtent, frameIndex, &overlay);
+                    *m_postPipeline, m_outExtent, frameIndex, bothPtr);
 }
 
 void PostProcess::renderUiToSwapchain(

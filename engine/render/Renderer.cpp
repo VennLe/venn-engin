@@ -1,5 +1,6 @@
 #include "render/Renderer.h"
 
+#include "animation/Pose.h"
 #include "core/Window.h"
 #include "core/Logger.h"
 #include "scene/Scene.h"
@@ -17,6 +18,8 @@
 #include "render/FrameGraph.h"
 #include "render/FeatureRegistry.h"
 #include "render/RenderSettingsIO.h"
+#include "render/TerrainPass.h"
+#include "ui2/Ui2Settings.h"
 
 // 编辑器视口要把它自己的离屏输出图注册成 ImGui 纹理
 #include <imgui.h>
@@ -313,6 +316,12 @@ void Renderer::bindFeatureParams() {
                       ParamKind::Float);
     render::bindParam("grid.fadeStart", &m_grid.fadeStart, ParamKind::Float);
     render::bindParam("grid.fadeEnd", &m_grid.fadeEnd, ParamKind::Float);
+
+    // ---- 游戏 UI / HUD（U0）----
+    // 存储是 ui2::settings() 的普通成员（不是 Renderer 的成员）：游戏 UI
+    // 的消费者是 RuntimeApp 与 UiRenderer，Renderer 只是"顺路把它绑上"
+    // —— 这样 env / 面板 / config 三条写入口写的是同一份内存。
+    ui2::bindFeatureParams();
 }
 
 // PostSettings 住在 PostProcess 里，要等 createMainTarget() 建好 m_post
@@ -459,6 +468,14 @@ Renderer::Renderer(core::Window& window) : m_window(window) {
 Renderer::~Renderer() {
     if (m_device) {
         m_device->waitIdle();
+
+        // 地形：VkImage / VkBuffer / 采样器 / 描述符集全是它自己的，
+        // 必须在 Device 与描述符池之前拆掉（否则验证层在退出时报
+        // "object leaked"）。
+        if (m_terrain) {
+            m_terrain->shutdown();
+            m_terrain.reset();
+        }
 
         // 析构顺序要点：
         //   ImGui 的管线绑定在 Post 的 render pass 上 → ImGui 先走
@@ -711,6 +728,15 @@ void Renderer::init() {
     // 10) 渲染管线（必须晚于 HdrTarget —— 它要 HDR 的 render pass）
     createPipelines();
 
+    // 10.2) 游戏 UI 通道（U2）。位置有讲究：
+    //   · 必须在 createMainTarget **之后** —— 管线要绑在 Post 的输出 pass 上；
+    //   · 必须在第一次 drawFrame **之前** —— 否则第一帧没有 UI（无所谓，
+    //     但"UI2-STATS 要等 60 帧"会让自动化多等一秒）。
+    // ui.enabled=false 时**不建**：少一条管线、少几 MB 顶点缓冲，也保证
+    // "关掉这条通道"是真的关掉，而不是"建了但没画"。
+    // ⚠ 运行中 `set ui.enabled 1` 也要能生效 → drawFrame 里有同一段懒建。
+    if (ui2::settings().enabled) ensureUiRenderer();
+
     // 10.5) shader 热重载：注册监听名单（要在管线创建之后 —— 记录初始
     //       mtime，保证启动后第一轮 poll 不把"本来就在的文件"当变化）
     watchShaderFiles();
@@ -787,6 +813,29 @@ void Renderer::init() {
     // 有登记但没接线的一并点名。放在这里是因为绑定分两处完成
     // （构造函数 + createMainTarget 之后的后处理），此处两者都已就绪。
     render::logRegistrySelfCheck();
+
+    // ---- U0：游戏 UI 通道的能力量测（docs/ui_hud_roadmap.md §3.1）----
+    //
+    // 为什么先量再动手：`maxBoundDescriptorSets` 是**单次绘制同时绑定**的
+    // set 数上限，不是全局总数。3D 主通道恰好用满 8 个，但 UI 是独立
+    // 管线、只绑 1 个 set —— 所以"8 个用满 → UI 不能要 set"是错的。
+    // 这条日志就是把这个判断钉在**实测值**上，而不是钉在记忆里。
+    //
+    // 顺带把输出分辨率与交换链格式打出来：UI 的 sRGB 反编码、以及
+    // "除的是输出分辨率不是 DRS 分辨率"两条契约都依赖它们。
+    {
+        const VkPhysicalDeviceLimits& lim = m_device->properties().limits;
+        const VkExtent2D outExt = m_post ? m_post->outputExtent() : VkExtent2D{0, 0};
+        VK_LOG_INFO("UI2-CAPS maxBoundDescriptorSets=%u maxPerStageDescSamplers=%u "
+                    "swapFormat=%d outExtent=%ux%u enabled=%d",
+                    static_cast<unsigned>(lim.maxBoundDescriptorSets),
+                    static_cast<unsigned>(lim.maxPerStageDescriptorSamplers),
+                    static_cast<int>(m_swapchain->format()),
+                    static_cast<unsigned>(outExt.width),
+                    static_cast<unsigned>(outExt.height),
+                    ui2::settings().enabled ? 1 : 0);
+    }
+
     VK_LOG_INFO(
         "Renderer initialized (GPU: %s, MSAA %ux, shadow %u, HDR %ux%u, "
         "clusters %ux%ux%u = %u)",
@@ -796,8 +845,28 @@ void Renderer::init() {
         cs.clusterY, cs.clusterZ, cs.clusterCount);
 }
 
-void Renderer::createDescriptorLayouts() {
-    // set 0：binding 0 = FrameUBO，binding 1 = 级联阴影图，
+// 游戏 UI 通道（U2）的懒建。
+//
+// 为什么单独一个函数而不是在 init() 里内联：运行中也能 `set ui.enabled 1`
+// （面板上勾一下），那条路径必须在 drawFrame 里补建。两处共用同一个入口，
+// 不然"面板打开了却没反应"这种 bug 一定会出现。
+//
+// ⚠ 建不出来（shader 缺失 / 设备拒绝）只降级，不抛：UI 坏了不该让游戏起不来。
+void Renderer::ensureUiRenderer() {
+    if (m_uiRenderer || !m_post || !m_device || !m_commandPool) return;
+    auto r = std::make_unique<ui2::UiRenderer>();
+    if (!r->init(*m_device, *m_commandPool, m_post->renderPass(),
+                 MAX_FRAMES_IN_FLIGHT)) {
+        VK_LOG_WARN("UI2: init failed -> game UI stays disabled");
+        return;
+    }
+    m_uiRenderer = std::move(r);
+    // 图集还没就绪（U1 才加载 SDF 字体）→ 内建 1×1 白兜底，字形会是一块
+    // 实心方块。这不是"画错了"，是"图集没加载"的可见信号。
+    VK_LOG_INFO("UI2: renderer ready (independent 1-set pipeline)");
+}
+
+void Renderer::createDescriptorLayouts() {    // set 0：binding 0 = FrameUBO，binding 1 = 级联阴影图，
     //        binding 2/3/4 = 灯/簇/灯索引 SSBO，binding 5 = 遥测，
     //        binding 6 = 骨骼矩阵 SSBO（蒙皮网格，VERTEX 阶段），
     //        7..10 = IBL 三件套 + 天空立方体，
@@ -1388,9 +1457,12 @@ uint32_t Renderer::collectParticleEmitters(scene::Scene& scene) {
         if (pc.rateOverDistance > 0.0f && moved > 0.0f) {
             m_particleDistPending[idx] += moved;
         }
+        // w = 贴图形状（ParticleSprite）。这个位置原来写死 0（保留位），
+        // 顶点着色器读它、片元用距离场画出对应轮廓 —— 见 particle.frag。
         g.dist = glm::vec4(m_particleDistCommitted[idx] +
                                m_particleDistPending[idx],
-                           m_particleDistCommitted[idx], 0.0f, 0.0f);
+                           m_particleDistCommitted[idx], 0.0f,
+                           static_cast<float>(static_cast<int>(pc.sprite)));
 
         // ---- 诊断（MYVK_FX_DBG=2）：把**交给 GPU 的这份数据**逐值打出来 ----
         //
@@ -2038,6 +2110,13 @@ VkExtent2D Renderer::renderExtent() const {
     return m_swapchain ? m_swapchain->extent() : VkExtent2D{1, 1};
 }
 
+VkExtent2D Renderer::uiOutputExtent() const {
+    // ⚠ 用 outputExtent（不是 sceneExtent）：UI 不跟 DRS / 视口尺寸缩放。
+    if (m_post) return m_post->outputExtent();
+    if (m_swapchain) return m_swapchain->extent();
+    return VkExtent2D{1, 1};
+}
+
 // ---------------------------------------------------------------- 屏幕空间效果（SSAO + FrameGraph 链）
 
 void Renderer::createScreenSpace() {
@@ -2678,12 +2757,100 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
 
     std::memcpy(uboDst, &ubo, sizeof(FrameUBO));
 
+    // ⚠ 顺序必须**先蒙皮再建表**：DrawItem::jointBase 直接从
+    //   `SkinnedMeshComponent::jointBase` 拷过来，而那个值由 updateSkinning
+    //   分配。以前是 buildDrawLists 在前 —— 老实现靠"按 Mesh* 查表"，
+    //   表在上一帧就已经填好，所以看不出问题；改成逐项之后，第一帧会拿到
+    //   -1（角色第一帧不蒙皮，第二帧才对）。
+    updateSkinning(scene, resetSkinning);
+
     // 重置蒙皮的调用方就是"主场景"（离屏目标传 false 追加骨骼矩阵），
     // 借用它来区分统计口径：离屏目标的物体数不该算进主场景的剔除统计。
     buildDrawLists(scene, camPosW, resetSkinning);
 
-    // ---- 蒙皮 ----
-    updateSkinning(scene, resetSkinning);
+    // 地形实例与场景实体对齐（必须在录制命令之前，见 syncTerrains 的注释）
+    syncTerrains(scene);
+}
+
+// ============================================================
+// 地形（W4-2）
+//
+// 每帧对齐"场景里的地形实体"与"渲染层的 GPU 实例"：
+//   · 集合变了（新增/删除/换资产/层材质被改）→ 整批重建
+//   · 只是移动 / 改 heightScale → 只更新实例的 model 与倍率（零上传）
+//
+// 为什么不在 recordFrame 里做：重建要走一次性 command buffer 上传
+// 3 MB 顶点数据（`vkQueueWaitIdle`），而 recordFrame 正在录制命令 ——
+// 在同一队列上提交会撞车。这里在**录制之前**的 CPU 阶段做。
+// ============================================================
+namespace {
+struct TerrainItem {
+    std::uint32_t entity = 0;
+    std::string source;
+    glm::mat4 model{1.0f};
+    float heightScale = 1.0f;
+    std::array<std::string, 4> overrides;
+};
+} // namespace
+
+uint32_t Renderer::terrainCount() const {
+    return m_terrain ? m_terrain->instanceCount() : 0u;
+}
+
+void Renderer::syncTerrains(scene::Scene& scene) {
+    if (!m_terrain || !m_terrain->ready()) return;
+
+    std::vector<TerrainItem> items;
+    scene.forEachTerrain([&](ecs::Entity e, ecs::TerrainComponent& tc) {
+        TerrainItem it;
+        it.entity = e.id;
+        it.source = tc.source;
+        it.model = scene.worldMatrix(e);
+        it.heightScale = tc.heightScale;
+        for (int i = 0; i < 4; ++i) it.overrides[i] = tc.layerOverrides[i];
+        if (tc.dirty) {
+            tc.dirty = false;
+            // 层材质改了 → 位掩码/贴图/UBO 都在实例里，只能重建
+            m_terrainEntities.clear();
+        }
+        items.push_back(std::move(it));
+    });
+
+    // 集合（实体 id + 资产路径 + 层覆盖）没变 → 只刷 model / heightScale
+    bool same = (items.size() == m_terrainEntities.size());
+    if (same) {
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            if (items[i].entity != m_terrainEntities[i]) { same = false; break; }
+            const auto* inst = m_terrain->instanceAt(static_cast<uint32_t>(i));
+            if (!inst || inst->asset.path != items[i].source) { same = false; break; }
+        }
+    }
+
+    if (!same) {
+        m_terrain->clearInstances();
+        m_terrainEntities.clear();
+        // 贴图上下文里有 textureSetLayout，它在 Renderer::init 的
+        // "建完管线之后"才存在 —— 所以每次建实例前刷一次。
+        m_terrain->setTextureContext(textureContext());
+        for (const auto& it : items) {
+            if (m_terrain->createTerrain(it.source, it.model, it.heightScale,
+                                         &it.overrides)) {
+                m_terrainEntities.push_back(it.entity);
+            } else {
+                VK_LOG_ERROR("TERRAIN-CREATE-FAIL entity=%u path=%s", it.entity,
+                             it.source.c_str());
+            }
+        }
+    } else {
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            auto* inst = m_terrain->instanceAt(static_cast<uint32_t>(i));
+            if (!inst) continue;
+            inst->model = items[i].model;
+            inst->heightScale = (items[i].heightScale > 1.0e-4f)
+                                    ? items[i].heightScale
+                                    : 1.0f;
+        }
+    }
 }
 
 // ============================================================
@@ -2920,6 +3087,13 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
         // 无 LOD 的物体也要参与"如果全用 0 级会提交多少"的对照
         it.baseTriangles = static_cast<uint32_t>(
             mc->mesh->indices().size() / 3);
+        // ---- 蒙皮归属（逐绘制项，A0-4）----
+        // SkinnedMeshComponent 挂在**模型根**上，网格实体是它的子级 →
+        // 沿父链往上找。不能按 `const Mesh*` 查表：同一 FBX 的多个实例
+        // 拿到的 `Mesh*` 完全相同，第二个会覆盖第一个（多个角色串姿势）。
+        if (const auto* skc =
+                scene.findInAncestors<ecs::SkinnedMeshComponent>(e))
+            it.jointBase = skc->jointBase;
 
         // ---- Shader 变体：材质特性 → 关键字掩码 ----
         // 掩码在这里算一次，深度预通道与前向两条路径共用（见 DrawItem::keywords）。
@@ -3102,17 +3276,23 @@ void Renderer::buildOpaqueBatches() {
     m_opaqueBatches.clear();
     if (!m_instancingEnabled) return;  // 基线路径：逐项提交，不动 SSBO
 
-    // ---- 排序：同 (掩码, 材质, 网格) 挨在一起 ----
+    // ---- 排序：同 (掩码, 材质, 网格, jointBase) 挨在一起 ----
     // stable_sort 保住视锥查询的原顺序：同一场景逐帧的批划分一致，
     // 调试时"第 N 批是谁"不会跳。不透明的绘制顺序本来就不影响最终
     // 像素（深度测试裁决），排序只改变提交分组，不改画面。
+    //
+    // ⚠ jointBase 必须进排序键：批内只推一次 push.skin.x，同一网格的
+    //   两个蒙皮实例（同一 FBX 的两个敌人）jointBase 不同，混在一批里
+    //   → 全批共用第一个实例的关节矩阵（"三个敌人一个姿势"的直接原因）。
+    //   静态网格的 jointBase 全是 -1，排序结果与改动前**完全相同**。
     std::stable_sort(m_opaqueDraws.begin(), m_opaqueDraws.end(),
                      [](const DrawItem& a, const DrawItem& b) {
                          if (a.keywords != b.keywords)
                              return a.keywords < b.keywords;
                          if (a.material != b.material)
                              return a.material < b.material;
-                         return a.mesh < b.mesh;
+                         if (a.mesh != b.mesh) return a.mesh < b.mesh;
+                         return a.jointBase < b.jointBase;
                      });
 
     auto& frame = m_frames[m_currentFrame];
@@ -3137,21 +3317,24 @@ void Renderer::buildOpaqueBatches() {
                 m_instanceOffset;
 
     // ---- 相邻同键聚合：一批 = 一次管线/材质状态 + N 个实例 ----
-    // 蒙皮：jointBase 挂在 **mesh** 上（m_skinJointBase），同 mesh 的
-    // 实体共享同一份关节矩阵 —— 同 mesh 同材质的批内自然一致，不破坏。
+    // 蒙皮：jointBase 已进排序键与聚合键（见上面的说明）—— 同 mesh 的两个
+    // 蒙皮实例不会混进同一批，因为批内只能推一次 push.skin.x。
     size_t i = 0;
     while (i < m_opaqueDraws.size()) {
         size_t j = i;
         while (j + 1 < m_opaqueDraws.size() &&
                m_opaqueDraws[j + 1].keywords == m_opaqueDraws[i].keywords &&
                m_opaqueDraws[j + 1].material == m_opaqueDraws[i].material &&
-               m_opaqueDraws[j + 1].mesh == m_opaqueDraws[i].mesh) {
+               m_opaqueDraws[j + 1].mesh == m_opaqueDraws[i].mesh &&
+               m_opaqueDraws[j + 1].jointBase ==
+                   m_opaqueDraws[i].jointBase) {
             ++j;
         }
         DrawBatch batch;
         batch.mesh = m_opaqueDraws[i].mesh;
         batch.material = m_opaqueDraws[i].material;
         batch.keywords = m_opaqueDraws[i].keywords;
+        batch.jointBase = m_opaqueDraws[i].jointBase;
         batch.firstInstance = m_instanceOffset;
         batch.count = static_cast<uint32_t>(j - i + 1);
         for (size_t k = i; k <= j; ++k)
@@ -3206,13 +3389,9 @@ bool Renderer::buildMdiFrameData() {
         const DrawItem& it = m_opaqueDraws[i];
         render::MdiInstance rec;
         rec.model = it.model;
-        // jointBase 挂在 mesh 上（updateSkinning 填的 m_skinJointBase）。
-        // 合批路径把它放进 push.skin.x；MDI 的 push 是"每材质组一次"，
-        // 承载不了每网格的值 → 必须走实例记录。
-        const auto jt = m_skinJointBase.find(it.mesh);
-        rec.aux = glm::ivec4(
-            (jt != m_skinJointBase.end() && jt->second >= 0) ? jt->second : -1,
-            0, 0, 0);
+        // jointBase 逐绘制项（A0-4）。合批路径把它放进 push.skin.x；
+        // MDI 的 push 是"每组一次"，承载不了每网格的值 → 必须走实例记录。
+        rec.aux = glm::ivec4(it.jointBase, 0, 0, 0);
         m_mdiCatalogScratch[i] = rec;
 
         m_mdiAabbScratch[i] =
@@ -3391,7 +3570,7 @@ void Renderer::recordSceneInto(VkCommandBuffer cmd, scene::Scene& scene,
         for (const DrawItem& it : m_opaqueDraws) {
             if (!it.material) continue;  // 空材质只有深度预通道会画
             drawMesh(cmd, m_forwardPipelines.layout(), it.model, *it.material,
-                     *it.mesh);
+                     *it.mesh, 1, 0, it.jointBase);
         }
     } else {
         for (const DrawItem& it : m_opaqueDraws) {
@@ -3399,7 +3578,7 @@ void Renderer::recordSceneInto(VkCommandBuffer cmd, scene::Scene& scene,
             bindForwardVariant(cmd, it.keywords, boundMask,
                                m_stats.variantSwitches);
             drawMesh(cmd, m_forwardPipelines.layout(), it.model, *it.material,
-                     *it.mesh);
+                     *it.mesh, 1, 0, it.jointBase);
         }
     }
 
@@ -3438,14 +3617,14 @@ void Renderer::recordSceneInto(VkCommandBuffer cmd, scene::Scene& scene,
                           dbgPipe->get());
         for (const DrawItem& it : m_transparentDraws) {
             drawMesh(cmd, m_forwardPipelines.layout(), it.model, *it.material,
-                     *it.mesh);
+                     *it.mesh, 1, 0, it.jointBase);
         }
     } else {
         for (const DrawItem& it : m_transparentDraws) {
             bindForwardVariant(cmd, it.keywords, boundMask,
                                m_stats.variantSwitches);
             drawMesh(cmd, m_forwardPipelines.layout(), it.model, *it.material,
-                     *it.mesh);
+                     *it.mesh, 1, 0, it.jointBase);
         }
     }
     vkCmdEndRenderPass(cmd);
@@ -3694,6 +3873,25 @@ void Renderer::createPipelines() {
             m_bindlessEnabled ? "pbr.bindless.frag" : "pbr.frag",
             render::ShaderPermutation::PerMask,
             render::kKeywordDoubleSided | render::kKeywordAlphaBlend);
+    }
+
+    // ---- 地形（W4-2）：独立管线 + 自己的 set 1 ----
+    // 与主前向**共用 set 0 与 push 范围**（见 TerrainPass.h 的文件头）：
+    // 这样它能在前向 Pass 内直接录制，不需要重绑 set 0，也不会把
+    // 描述符状态打断（VUID-...-08600）。
+    // 采样数/RenderPass 变了只重建管线，地形实例的缓冲与纹理不动。
+    if (!m_terrain) {
+        m_terrain = std::make_unique<render::TerrainPass>();
+        render::TerrainPass::InitInfo ti;
+        ti.device = m_device.get();
+        ti.cmdPool = m_commandPool.get();
+        ti.globalSetLayout = m_globalSetLayout;
+        ti.renderPass = m_hdrTarget->renderPass();
+        ti.samples = m_hdrTarget->samples();
+        m_terrain->init(ti);
+    } else {
+        m_terrain->recreatePipeline(m_hdrTarget->renderPass(),
+                                    m_hdrTarget->samples());
     }
 
     // ---- 调试视图模式管线（R0-2）：Wireframe / Overdraw ----
@@ -4430,8 +4628,9 @@ void Renderer::recordShadowPasses(VkCommandBuffer cmd, scene::Scene& scene,
     // UNDEFINED 布局而被采样（验证层会报）。
     const uint32_t n = m_shadowPass->cascadeCount();
     for (uint32_t c = 0; c < n; ++c) {
-        m_shadowPass->render(cmd, scene, frameSet, m_currentFrame, c,
-                             &m_skinJointBase);
+        // jointBase 不再以"mesh → 下标"的映射传进去：pass 自己按实体沿
+        // 父链取 `SkinnedMeshComponent::jointBase`（逐实体，多实例正确）。
+        m_shadowPass->render(cmd, scene, frameSet, m_currentFrame, c);
     }
 
     // 自检（MYVK_SHADOW_DBG=1）：每级"考虑了多少 / 实际提交了多少"。
@@ -4602,8 +4801,7 @@ void Renderer::recordLocalShadowPasses(VkCommandBuffer cmd,
         // used == false 时传 nullptr：pass 内部只清深度（保证整张 array
         // 始终处于可采样的 READ_ONLY 布局）。**不能跳过这一步**。
         m_localShadowPass->render(cmd, scene, frameSet, m_currentFrame, layer,
-                                  used ? &m_localShadowMatrices[layer] : nullptr,
-                                  &m_skinJointBase);
+                                  used ? &m_localShadowMatrices[layer] : nullptr);
     }
 
     static const bool dbg = std::getenv("MYVK_SHADOW_DBG") != nullptr;
@@ -4680,7 +4878,7 @@ float Renderer::pomHeightLane(const assets::Material& mat) {
 void Renderer::drawMesh(VkCommandBuffer cmd, VkPipelineLayout layout,
                         const glm::mat4& model, const assets::Material& mat,
                         const assets::Mesh& mesh, uint32_t instanceCount,
-                        uint32_t firstInstance) {
+                        uint32_t firstInstance, int jointBase) {
     PushConstants push{};
     // instancing 合批时 VS 从实例 SSBO 按 gl_InstanceIndex 取 model，
     // 这里的 push.model 闲置（仍照推 —— push 布局必须恒定，见
@@ -4689,14 +4887,14 @@ void Renderer::drawMesh(VkCommandBuffer cmd, VkPipelineLayout layout,
     push.baseColorFactor = mat.baseColorFactor;
     push.pbr = glm::vec4(mat.metallic, mat.roughness, mat.normalScale, mat.ao);
     push.emissive = glm::vec4(mat.emissive, materialPageCode(mat));
-    // 蒙皮定位：查 mesh 是否属于某个蒙皮模型。jointBase<0 = 静态网格，
-    // 着色器按 weights 和 == 0 走原路径（skin.z 只是防御性冗余）。
+    // 蒙皮定位：jointBase < 0 = 静态网格，着色器按 weights 和 == 0 走原路径
+    // （skin.z 只是防御性冗余）。**由调用方从 DrawItem 传进来** —— 不再按
+    // `const Mesh*` 查表，那样同一 FBX 的多个实例会共用一份关节矩阵。
     //   skin.w = alpha 裁切阈值（R4-1）
     //   skin.y = POM 视差深度（R4-3，只被 VENN_PARALLAX 编译单元读）
     const float pomLane = pomHeightLane(mat);
-    const auto it = m_skinJointBase.find(&mesh);
-    if (it != m_skinJointBase.end() && it->second >= 0) {
-        push.skin = glm::vec4(static_cast<float>(it->second), pomLane, 1.0f,
+    if (jointBase >= 0) {
+        push.skin = glm::vec4(static_cast<float>(jointBase), pomLane, 1.0f,
                               alphaCutoffLane(mat));
     } else {
         push.skin = glm::vec4(0.0f, pomLane, 0.0f, alphaCutoffLane(mat));
@@ -4760,14 +4958,21 @@ float Renderer::materialPageCode(const assets::Material& mat) {
 void Renderer::updateSkinning(scene::Scene& scene, bool resetOffset) {
     auto& frame = m_frames[m_currentFrame];
     if (resetOffset) {
-        m_skinJointBase.clear();
         m_skinJointOffset = 0;
     }
 
-    // 收集所有骨骼网格体，算关节矩阵，写入 SSBO。
-    // jointBase 顺序累加；每个模型的 mesh 都映射到它的 jointBase。
+    // 本函数只做三件事：分配 jointBase、把**已经算好的** jointMatrices 拷进
+    // SSBO、必要时扩容 buffer。
+    //
+    // 采样已经搬到 `animation::AnimatorSystem`（A0-5）—— 以前这里直接调
+    // `skel.sample()`，于是任何动画逻辑都必须开 GUI 才能验证，这也正是
+    // 这条链过去没有任何自动化用例的原因。
+    //
+    // jointBase 也不再按 `Mesh*` 建映射（`m_skinJointBase`）：同一个 FBX
+    // 实例化两次时 `AssetManager` 返回同一个 `Model*`、同一批 `Mesh*`，
+    // 第二个实体就会覆盖第一个 → 多个角色共享一份关节矩阵、全部显示同
+    // 一个姿势。现在权威是 `SkinnedMeshComponent::jointBase`（逐实体）。
     uint32_t offset = m_skinJointOffset;
-    std::vector<glm::mat4> scratch;
 
     scene.world().each<ecs::SkinnedMeshComponent>(
         [&](ecs::Entity e, ecs::SkinnedMeshComponent& sk) {
@@ -4776,10 +4981,16 @@ void Renderer::updateSkinning(scene::Scene& scene, bool resetOffset) {
             const int n = skel.jointCount();
             if (n <= 0) return;
 
-            // 采样：clipName 空 → 静止姿势；否则找 clip 采样
-            const assets::AnimationClip* clip =
-                sk.clipName.empty() ? nullptr : skel.findClip(sk.clipName);
-            skel.sample(clip, sk.time, scratch);
+            // 兜底：不走 AnimatorSystem 的场景（角色预览窗口的私有预览
+            // 场景就是这种）没有别人填 jointMatrices，这里现场采一次。
+            // 与拆分前的"每帧采样"等价，所以预览画面逐像素不变。
+            if (sk.jointMatrices.size() != static_cast<size_t>(n)) {
+                const assets::AnimationClip* clip =
+                    sk.clipName.empty() ? nullptr : skel.findClip(sk.clipName);
+                animation::Pose pose;
+                animation::samplePose(skel, clip, sk.time, pose);
+                animation::poseToJoints(skel, pose, sk.jointMatrices);
+            }
 
             // 容量不足则重建 buffer（稀有路径）
             if (offset + static_cast<uint32_t>(n) > frame.jointCapacity) {
@@ -4798,12 +5009,18 @@ void Renderer::updateSkinning(scene::Scene& scene, bool resetOffset) {
             }
 
             std::memcpy(static_cast<glm::mat4*>(frame.jointMapped) + offset,
-                        scratch.data(), n * sizeof(glm::mat4));
+                        sk.jointMatrices.data(), n * sizeof(glm::mat4));
 
-            // 记录 jointBase + 把该模型所有 mesh 映射过去
+            // 逐实体记录 jointBase。只在**变化时**打日志：time 每帧都变，
+            // 每帧刷会把别的锚点淹掉；而"多实例两两不等"这件事只需要看到
+            // 每个实体各报一次自己的值。
+            const int prevBase = sk.jointBase;
             sk.jointBase = static_cast<int>(offset);
-            for (const auto& sub : sk.model->subMeshes)
-                if (sub.mesh) m_skinJointBase[sub.mesh] = sk.jointBase;
+            if (prevBase != sk.jointBase) {
+                VK_LOG_INFO("ANIM-SKIN entity=%u jointBase=%d time=%.3f",
+                            static_cast<unsigned>(e.id), sk.jointBase,
+                            static_cast<double>(sk.time));
+            }
 
             offset += static_cast<uint32_t>(n);
         });
@@ -4841,10 +5058,9 @@ void Renderer::recordOpaqueDepthGeometry(VkCommandBuffer cmd) {
             }
             PushConstants push{};
             // model 由实例 SSBO 提供（pbr.inst.vert 不读 push.model）；
-            // skin 照旧 —— jointBase 挂在 mesh 上，批内自然一致。
-            const auto jt = m_skinJointBase.find(b.mesh);
-            if (jt != m_skinJointBase.end() && jt->second >= 0) {
-                push.skin = glm::vec4(static_cast<float>(jt->second), 0.0f,
+            // skin 照旧 —— jointBase 已经进了聚合键，批内必然一致。
+            if (b.jointBase >= 0) {
+                push.skin = glm::vec4(static_cast<float>(b.jointBase), 0.0f,
                                       1.0f, 0.0f);
             }
             vkCmdPushConstants(cmd, m_depthPrePipelines.layout(),
@@ -4869,9 +5085,8 @@ void Renderer::recordOpaqueDepthGeometry(VkCommandBuffer cmd) {
         // 的 weights 之和判分支的，push.skin.x 只负责把该网格的关节矩阵
         // 起点（jointBase）告诉着色器。这里不填的话，多个骨骼网格体同场
         // 时预通道会用错关节 → 深度与前向对不上。
-        const auto jt = m_skinJointBase.find(it.mesh);
-        if (jt != m_skinJointBase.end() && jt->second >= 0) {
-            push.skin = glm::vec4(static_cast<float>(jt->second), 0.0f, 1.0f,
+        if (it.jointBase >= 0) {
+            push.skin = glm::vec4(static_cast<float>(it.jointBase), 0.0f, 1.0f,
                                   0.0f);
         }
         vkCmdPushConstants(cmd, m_depthPrePipelines.layout(),
@@ -5166,13 +5381,14 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
             for (const DrawBatch& b : m_opaqueBatches) {
                 if (!b.material) continue;
                 drawMesh(cmd, m_forwardPipelines.layout(), glm::mat4{1.0f},
-                         *b.material, *b.mesh, b.count, b.firstInstance);
+                         *b.material, *b.mesh, b.count, b.firstInstance,
+                     b.jointBase);
             }
         } else {
             for (const DrawItem& it : m_opaqueDraws) {
                 if (!it.material) continue;
                 drawMesh(cmd, m_forwardPipelines.layout(), it.model,
-                         *it.material, *it.mesh);
+                         *it.material, *it.mesh, 1, 0, it.jointBase);
             }
         }
     } else if (useMdi) {
@@ -5185,7 +5401,8 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
             bindForwardVariant(cmd, b.keywords, boundMask,
                                m_stats.variantSwitches);
             drawMesh(cmd, m_forwardPipelines.layout(), glm::mat4{1.0f},
-                     *b.material, *b.mesh, b.count, b.firstInstance);
+                     *b.material, *b.mesh, b.count, b.firstInstance,
+                     b.jointBase);
         }
     } else {
         for (const DrawItem& it : m_opaqueDraws) {
@@ -5193,7 +5410,7 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
             bindForwardVariant(cmd, it.keywords, boundMask,
                                m_stats.variantSwitches);
             drawMesh(cmd, m_forwardPipelines.layout(), it.model, *it.material,
-                     *it.mesh);
+                     *it.mesh, 1, 0, it.jointBase);
         }
     }
 
@@ -5280,6 +5497,20 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
         vkCmdDraw(cmd, 4, 1, 0, 0);
     }
 
+    // ---------------- 地形（W4-2）：独立管线，前向 Pass 内 ----------------
+    // 位置：不透明几何之后、透明之前。
+    //   · 放在不透明之后：深度预通道已经写过木箱/角色的深度，地形被它们
+    //     正确遮挡（地形的片元吃 early-Z，山后面的箱子不会被地面盖住）；
+    //   · 放在透明之前：玻璃之类的混合物体仍然叠在地形之上，顺序不变。
+    // ⚠ 它换过管线 → 变体绑定缓存作废（下面那行 boundMask 一起处理）。
+    if (m_terrain && m_terrain->ready() && m_terrain->instanceCount() > 0) {
+        const glm::vec3 terrainCam = scene.camera(m_viewCameraIndex).position();
+        m_terrainTriangles = m_terrain->record(cmd, terrainCam);
+        boundMask = kBindsNothing;
+    } else {
+        m_terrainTriangles = 0;
+    }
+
     // ⚠ 栅格管线刚把管线绑定改掉了 → 变体绑定的缓存作废。
     // 不重置的话，第一个透明物体若掩码恰好与"栅格之前绑的那个"相同，
     // 就会跳过重绑，直接拿栅格管线去画几何（栅格没有顶点缓冲，
@@ -5298,14 +5529,14 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
                               dbgPipe->get());
             for (const DrawItem& it : m_transparentDraws) {
                 drawMesh(cmd, m_forwardPipelines.layout(), it.model,
-                         *it.material, *it.mesh);
+                         *it.material, *it.mesh, 1, 0, it.jointBase);
             }
         } else {
             for (const DrawItem& it : m_transparentDraws) {
                 bindForwardVariant(cmd, it.keywords, boundMask,
                                    m_stats.variantSwitches);
                 drawMesh(cmd, m_forwardPipelines.layout(), it.model,
-                         *it.material, *it.mesh);
+                         *it.material, *it.mesh, 1, 0, it.jointBase);
             }
         }
     }
@@ -5628,8 +5859,28 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
     // 模式 B（编辑器视口）：合成写离屏图；再单独一个 Pass 清交换链并画
     //   ImGui —— Viewport 面板用 ImGui::Image 把那张离屏图贴进子窗口。
     const auto overlay = [this](VkCommandBuffer c) { m_imgui->render(c); };
+
+    // ---- 游戏 UI / HUD（U2）：Post 输出 pass 内、ImGui overlay **之前** ----
+    //
+    // 三条闸门，缺一不可：
+    //   ① 通道建好了（ui.enabled 且 init 成功）；
+    //   ② 这一帧**真的有东西要画**（`hasUiContent()`）—— 没有的话我们连
+    //      回调都不建，于是行为与"没有这条通道"逐位相同（默认关的守卫）；
+    //   ③ 编辑器视口（模式 B）要额外过 `ui.hudInEditor`：默认 false，
+    //      否则几十条编辑器像素基线会整体漂。
+    // pass 由 PostProcess 在包装里给定（模式 A = 交换链 pass、模式 B = 离屏
+    // pass）—— 这里**不许**自己按 m_post->offscreen() 猜，猜错了就是管线不兼容。
+    PostProcess::GameUiDrawFn gameUi;
+    if (m_uiRenderer && m_uiRenderer->ready() && ui2::hasUiContent() &&
+        (!m_post->offscreen() || ui2::settings().hudInEditor)) {
+        gameUi = [this](VkCommandBuffer c, VkRenderPass pass) {
+            m_uiRenderer->recordFrameUi(c, m_currentFrame,
+                                        m_post->outputExtent(), pass);
+        };
+    }
+
     tsBegin(render::GpuTimer::kPost);
-    m_post->renderScene(cmd, imageIndex, m_currentFrame, overlay);
+    m_post->renderScene(cmd, imageIndex, m_currentFrame, overlay, gameUi);
     if (m_post->offscreen()) {
         m_post->renderUiToSwapchain(cmd, imageIndex, overlay);
     }
@@ -6007,6 +6258,11 @@ void Renderer::drawFrame(scene::Scene& scene) {
             ? &scene.camera(m_viewCameraIndex)
             : nullptr;
     uploadSceneState(scene, renderExtent(), true, viewCam);
+
+    // ---- UI 通道的懒建（`set ui.enabled 1` 之后第一次生效的点）----
+    // 位置必须在**录制命令之前**：创建要 waitIdle + 传图元，不能夹在
+    // 一条正在录制的命令缓冲中间。（此时本帧的 in-flight 栅栏已等过。）
+    if (ui2::settings().enabled && !m_uiRenderer) ensureUiRenderer();
 
     // 录制命令
     recordFrame(frame.commandBuffer, imageIndex, scene);

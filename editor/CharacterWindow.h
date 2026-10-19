@@ -74,10 +74,13 @@ private:
     // 懒构建：第一次打开时把当前绑定的模型实例化进预览场景。
     void rebuildPreviewScene();
     // 把模型（SubMesh 列表）实例化进目标场景的指定父节点下，返回实体列表。
-    // 蒙皮模型会在根实体挂 SkinnedMeshComponent。
+    // 实际实现转发给 `engine/scene/ModelInstance`（全仓库唯一的装配入口）。
+    // autoPlay：预览场景传 false（姿势由底部时间轴滑条驱动），
+    //           绑到主场景的玩家实体上传 true（绑上去就该动）。
     std::vector<ecs::Entity> instanceModelInto(scene::Scene& scene,
                                                assets::Model* model,
-                                               ecs::Entity parent);
+                                               ecs::Entity parent,
+                                               bool autoPlay);
     // 把"当前模型 + 当前 clip"绑到预览场景的根上
     void syncPreviewSkinning();
 

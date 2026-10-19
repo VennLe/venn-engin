@@ -168,17 +168,31 @@ InputMap InputMap::makeDefault() {
     // ---- 菜单（压栈后 Gameplay 整组失效）----
     m.defineAction("Menu", "MenuUp");
     m.defineAction("Menu", "MenuDown");
+    // 左右也要有：U6 的焦点导航是**几何**的（两列布局里 ↓ 不该跳到旁边
+    // 那一列，玩家会用 → 过去），只给上下等于把一半导航关掉。
+    m.defineAction("Menu", "MenuLeft");
+    m.defineAction("Menu", "MenuRight");
     m.defineAction("Menu", "MenuConfirm");
     m.defineAction("Menu", "MenuBack");
     m.bindKey("Menu", "MenuUp", GLFW_KEY_UP);
     m.bindKey("Menu", "MenuUp", GLFW_KEY_W);
     m.bindKey("Menu", "MenuDown", GLFW_KEY_DOWN);
     m.bindKey("Menu", "MenuDown", GLFW_KEY_S);
+    m.bindKey("Menu", "MenuLeft", GLFW_KEY_LEFT);
+    m.bindKey("Menu", "MenuLeft", GLFW_KEY_A);
+    m.bindKey("Menu", "MenuRight", GLFW_KEY_RIGHT);
+    m.bindKey("Menu", "MenuRight", GLFW_KEY_D);
+    // Tab 在菜单里循环切换焦点（Shift+Tab 反向）。它绑在菜单上下文里
+    // 而不是全局：游戏中按 Tab 不该有任何反应。
+    m.defineAction("Menu", "MenuTab");
+    m.bindKey("Menu", "MenuTab", GLFW_KEY_TAB);
     m.bindKey("Menu", "MenuConfirm", GLFW_KEY_ENTER);
     m.bindKey("Menu", "MenuConfirm", GLFW_KEY_SPACE);
     m.bindKey("Menu", "MenuBack", GLFW_KEY_ESCAPE);
     m.bindGamepadButton("Menu", "MenuUp", GLFW_GAMEPAD_BUTTON_DPAD_UP);
     m.bindGamepadButton("Menu", "MenuDown", GLFW_GAMEPAD_BUTTON_DPAD_DOWN);
+    m.bindGamepadButton("Menu", "MenuLeft", GLFW_GAMEPAD_BUTTON_DPAD_LEFT);
+    m.bindGamepadButton("Menu", "MenuRight", GLFW_GAMEPAD_BUTTON_DPAD_RIGHT);
     m.bindGamepadButton("Menu", "MenuConfirm", GLFW_GAMEPAD_BUTTON_A);
     m.bindGamepadButton("Menu", "MenuBack", GLFW_GAMEPAD_BUTTON_B);
 

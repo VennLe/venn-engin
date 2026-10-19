@@ -94,9 +94,14 @@ MOUSEEVENTF_RIGHTUP = 0x0010
 WM_CHAR, WM_KEYDOWN, WM_KEYUP = 0x0102, 0x0100, 0x0101
 
 fails = []
+total = 0
 
 
 def check(ok, msg):
+    # ⚠ 计数必须显式累加：旧版尾部打的是 `len(fails) + sum(1 for _ in [])`
+    #   （恒等于失败数），于是汇总行永远显示"0 项断言"。
+    global total
+    total += 1
     print("    %-72s %s" % (msg, "PASS" if ok else "FAIL"))
     if not ok:
         fails.append(msg)
@@ -661,14 +666,16 @@ def main():
     finally:
         stop(proc, hwnd)
 
-    print("\n==== %d 项断言，%d 项失败 ====" % (
-        len(fails) + sum(1 for _ in []) + 0, len(fails)))
+    print("\n==== %d 项断言，%d 项失败 ====" % (total, len(fails)))
     if fails:
         for f in fails:
             print("  FAIL:", f)
-        return 1
-    print("ALL PASS")
-    return 0
+    # ⚠⚠ 收官行必须是 run_regression.py 的 OK_RE / BAD_RE 认得的写法。
+    #   旧版这里只打 `ALL PASS`，而 OK_RE 只匹配 `RESULT: PASS` /
+    #   `全部断言 PASS` / `全部 PASS`（中文）/ `结果: PASS` —— 于是**60 多项
+    #   断言全 PASS 也会被判 FAIL**（rc=0、日志里一条 FAIL 都没有，特别难查）。
+    print("\n结果: %s" % ("PASS" if not fails else "FAIL: " + ", ".join(fails)))
+    return 0 if not fails else 1
 
 
 if __name__ == "__main__":

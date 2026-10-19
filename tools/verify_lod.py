@@ -449,8 +449,13 @@ def main():
               st8 and st8["ents"] == 1, st8 and st8["ents"])
     check("零 Vulkan 验证层报错", not errs8, errs8[:3])
 
-    # ============ 第 8 组：蒙皮网格不该被简化 ============
-    print("\n== 第 8 组：蒙皮网格（anime_girl.glb）不生成 LOD ==")
+    # ============ 第 8 组：蒙皮网格也要被简化（W2-3）============
+    # ⚠ 2026-10-19 之前这里断言的是"停在 1 级"：`decimateClustered` 只合并
+    #   位置/法线/UV，会把 joints/weights 丢掉，减出来的网格顶点被吸到原点。
+    #   W2-3 让减面**按主影响 joint 分组**之后，蒙皮网格也能安全减面了，
+    #   于是这条断言整个反过来。纯数据部分（不跨骨合并 / 权重归一化）在
+    #   `Game.exe --selftest lod` 里，这里验的是"接上去以后还活着"。
+    print("\n== 第 8 组：蒙皮网格（anime_girl.glb）也生成 LOD（W2-3）==")
     girl = os.path.abspath(os.path.join(
         ROOT, "assets", "models", "anime_girl.glb"))
     if not os.path.exists(girl):
@@ -462,12 +467,20 @@ def main():
             "subMeshIndex": 0, "name": "lod_skinned"})
         b9, s9, _, _, errs9 = run_once(exe, skin_scene, {}, cam=cam3)
         print("  LOD-BUILD:", b9.group(0) if b9 else None)
-        check("蒙皮网格的链停在 1 级（不简化）",
-              b9 is not None and int(b9.group(3)) == 1,
+        check("蒙皮网格生成了 >= 2 级（W2-3 之前是 1 级）",
+              b9 is not None and int(b9.group(3)) >= 2,
               b9.group(0) if b9 else None)
+        # 三角形必须真的递减：只有 1 级 == 没简化；级数够但三角形不变也一样
+        if b9 is not None:
+            tris9 = [int(t) for t in b9.group(4).split("/")]
+            check("各级三角形严格递减",
+                  all(tris9[i + 1] < tris9[i] for i in range(len(tris9) - 1)),
+                  str(tris9))
+            check("末级至少比原网格少 2 倍",
+                  tris9[-1] * 2 <= tris9[0], "%d vs %d" % (tris9[-1], tris9[0]))
         st9 = parse_stats(s9)
-        check("渲染层因此没接管它（ents == 0）",
-              st9 and st9["ents"] == 0, st9 and st9["ents"])
+        check("渲染层接管了它（ents >= 1）",
+              st9 and st9["ents"] >= 1, st9 and st9["ents"])
         check("零 Vulkan 验证层报错", not errs9, errs9[:3])
 
     print("\n结果: %s" % ("PASS" if not fails else "FAIL: " + ", ".join(fails)))

@@ -49,6 +49,16 @@ struct GameServices {
     float timeScale = 1.0f;
     bool quitRequested = false;
     std::uint64_t frame = 0;
+
+    // ---- UI 交互（U6/U8）----
+    //
+    // 本帧玩家在 UI 上**激活**了哪个动作（暂停菜单：`resume` / `settings` /
+    // `quit`），空 = 没有。由宿主每帧填 —— 因为 UI tick 跑在状态栈**之外**
+    // （见 RuntimeApp::onUpdate），所以 Paused 读到的永远是这一帧的最新值。
+    std::string uiAction;
+    // 状态请求出栈。状态**不直接 pop 自己**：迁移不在回调里改栈
+    // （GameStateStack.h 的第 2 条约定），只置这个位，宿主在 tick 之后执行。
+    bool popRequested = false;
 };
 
 struct GameState {

@@ -45,6 +45,13 @@ imgui.ini
 # 只忽略根目录的 png，assets/ 下的贴图不受影响。
 /*.png
 
+# G14-6 流式对照用的 10 分钟 wav（105 MB）。
+# 正常情况下它只生成到 build/bin/assets/audio/（已被 build/ 忽略），
+# 这条是兜底：谁不小心用 --long 指到 assets/audio/ 也不会提交进去。
+# 缺了它 `verify_audio.py` 会自动重新生成（见 gen_long_audio），
+# 只是那一次的 A5 组对照会被跳过。
+assets/audio/_long_*.wav
+
 # 系统杂项
 .DS_Store
 Thumbs.db

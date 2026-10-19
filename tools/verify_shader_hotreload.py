@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from capture_window import capture_client, find_window, user32      # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors, wait_rect   # noqa: E402
 from verify_local_shadow import diff_stats, to_np, vp_box           # noqa: E402
+from safe_fs import safe_remove
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
@@ -307,9 +308,9 @@ def main():
         # 无论成败：还原原 .spv（防测试残留下一份绿色 shader）
         if os.path.exists(backup):
             shutil.copy2(backup, TARGET_SPV)
-            os.remove(backup)
+            safe_remove(backup)
         if os.path.exists(TMP_SRC):
-            os.remove(TMP_SRC)
+            safe_remove(TMP_SRC)
         if hwnd:
             user32.PostMessageW(hwnd, 0x0010, 0, 0)
         time.sleep(0.5)

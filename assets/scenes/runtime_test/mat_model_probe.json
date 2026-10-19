@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "generator": "mat model probe (W0-2/W0-3): one entity using anime_girl.glb submesh 0 (Skin), with two user overrides. Before W0 the overrides were dropped (dump gave material:null); after W0 they must round-trip. The ASSET-MAT-ID log lines must show 7 ids matching the 7 glTF material names (Skin/Hair/Cloth/EyeWhite/Iris/Shoe/Lash).",
+  "entities": [
+    {
+      "name": "Girl",
+      "transform": {
+        "position": [0.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "gltf",
+        "path": "models/anime_girl.glb",
+        "modelKey": "models/anime_girl.glb",
+        "subMeshIndex": 0
+      },
+      "material": {
+        "kind": "model",
+        "name": "models/anime_girl.glb/mat0",
+        "modelKey": "models/anime_girl.glb",
+        "id": "models/anime_girl.glb#Skin",
+        "overrides": {
+          "roughness": 0.05,
+          "baseColor": [1.0, 0.0, 0.0, 1.0]
+        }
+      }
+    }
+  ]
+}

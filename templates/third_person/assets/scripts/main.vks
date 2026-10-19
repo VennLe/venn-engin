@@ -1,0 +1,14 @@
+# main.vks —— __PROJECT_NAME__ · 第三人称模板（__TEMPLATE_ID__）
+#
+# 改这个文件，保存，编辑器里立刻热重载（不用重编译引擎）。
+# 这一行 print 是"脚本真的跑起来了"的观测点。
+let t = 0
+
+on start {
+    print("HELLO", "__PROJECT_NAME__")
+    print("MODE", "third_person")
+}
+
+on update {
+    t = t + dt
+}

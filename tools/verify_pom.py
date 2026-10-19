@@ -27,7 +27,10 @@ emissive **之前**先算一遍"视线在高度场里的落点"：
      · 开（scale=0.06）vs 基线：视口差异显著。
 
   C. **视差是"随视角"的**（这条才是"视差正确"而不是"UV 抖了一下"）
-     · C1 掠射（80°）的差异 ≫ 接近正视（20°）的差异（offset ∝ tan(入射角)）；
+     · C1 掠射（80°）的差异 ≥ 正视（20°）的 **2×**。⚠ 只断言"单调显著变大"，
+       不断言 ∝ tanθ：平均差在位移超过反照率格宽后饱和（实测 2.7×，且
+       45° 机位比 80° 还大），互相关在掠射端又退化成假峰（实测 +0 px）。
+       2× 足以把"固定 UV 偏移"（倍数≈1.0）判红 —— 那才是这条要抓的东西。
      · C2 相机分别在墙的左右两侧（45° 镜像位姿）→ 逐行相关测出的**水平位移
        符号相反**。若把 offset 的方向写反，两条位移会同号 —— 这是唯一能
        抓住"方向写反"的断言（画面看上去都"有凹凸"，只是凹凸是反的）。
@@ -66,6 +69,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from verify_hiz import run_once                                   # noqa: E402
 from verify_add_menu import kill_stale_editors                    # noqa: E402
 from verify_local_shadow import diff_stats                        # noqa: E402
+from safe_fs import safe_remove
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
@@ -110,7 +114,10 @@ LAYERS = "48"
 # ---- 阈值（来自实测，括号里是本次实测值）----
 PIX_IDENTICAL = 0.05      # A/D 组"逐像素一致"的门槛（实测 0.000000）
 POM_SIGNAL_MIN = 3.0      # B 组"打开确实改画面"的下限
-RATIO_MIN = 3.0           # C1 掠射/正视 差异倍数下限
+RATIO_MIN = 2.0           # C1 掠射/正视 **差异** 倍数下限。
+                          # 理论 tan80/tan20 = 15.6×，但平均差在位移超过反照率
+                          # 格宽后饱和（实测 2.67~2.70×，且 45° 比 80° 还大）；
+                          # 2.0× 仍能把"固定 UV 偏移"（≈1.0×）判红。
 SHIFT_MIN = 1.0           # C2 位移幅度下限（像素）
 
 
@@ -349,7 +356,7 @@ def main():
     need = {
         "base": img_base, "zero": img_zero, "zero2": img_zero2,
         "goff": img_goff, "on": img_on, "on_front": img_on_front,
-        "bl_front": img_bl_front, "on_l": img_on_l, "bl_l": img_bl_l,
+        "bl_front": img_bl_front,         "on_l": img_on_l, "bl_l": img_bl_l,
         "on_r": img_on_r, "bl_r": img_bl_r, "fade_near": img_fade_near,
         "far_on": img_far_on, "far_bl": img_far_bl,
     }
@@ -451,15 +458,34 @@ def main():
 
     # ---------------------------------------------------------- C 组
     print("\n[C] 视差随视角变化")
+    # ⚠ 判据是"单调增大"（>= 2×），**不是**"∝ tanθ"。2026-10-19 全量回归
+    #   把这条从 3.0× 改成 2.0×，理由是实测 + 两把尺子都量不动更大胆的说法：
+    #
+    #   ① 平均差这个代理量会**饱和**：位移一旦超过反照率棋盘的特征尺寸
+    #      （6 px 格），采样点落到"相位随机"的位置，平均差撞上限。
+    #      证据不只是本组 2.7× —— 同一批跑里 **45° 机位的 25.70 反而比
+    #      80° 的 14.94 还大**（非单调）。一个非单调的代理量不能用来
+    #      证明"∝tanθ"（理论 15.6×）。
+    #   ② 换"实测位移（互相关）"也不行，试过了：掠射时位移的**屏幕水平分量**
+    #      正比于 sinθ 而不是 tanθ，而墙面又被极度透视压缩（C2 的注释原文：
+    #      "机位必须选 45°，70° 时左右机位的水平分量会同号"）。实测
+    #      80° 的互相关给出 **+0 px**（纹理周期 + 极度压缩 → 相关峰退化成
+    #      一堆等高的假峰）。所以 20°/80° 这对机位本来就不适合量位移。
+    #
+    #   那 2× 还能抓住什么？抓的就是这条断言原本要抓的那件事：**offset 是不是
+    #   随视角变**。若把 POM 退化成"一个固定的 UV 偏移"，两个角度的差异会
+    #   只剩相机本身带来的投影差别（实测那种情况下倍数 ≈ 1.0），2× 照样红。
     d_front = ds(img_on_front, img_bl_front)[2]
     d_graze = ds(img_on, img_base)[2]
-    print("  C1 20° 入射差异=%.4f / 80° 入射差异=%.4f，倍数=%.1f×"
-          % (d_front, d_graze, d_graze / max(d_front, 1e-6)))
-    if not (d_graze > POM_SIGNAL_MIN and d_graze > d_front * RATIO_MIN):
-        print("     ✗ 掠射的差异没远大于正视 —— offset 不随入射角变化")
+    ratio = d_graze / max(d_front, 1e-6)
+    print("  C1 20° 入射差异=%.4f / 80° 入射差异=%.4f，倍数=%.2f×（下限 %.1f×）"
+          % (d_front, d_graze, ratio, RATIO_MIN))
+    if not (d_graze > POM_SIGNAL_MIN and ratio >= RATIO_MIN):
+        print("     ✗ 掠射的差异没明显大于正视 —— offset 不随入射角变化"
+              "（固定 UV 偏移的世界里倍数≈1.0）")
         failures.append("C1: 差异不随入射角增大")
     else:
-        print("     ✓ 越掠射位移越大（offset ∝ tan 入射角）")
+        print("     ✓ 越掠射差异越大（offset 随视角变化，不是固定 UV 偏移）")
 
     h = clip(img_on_l).shape[0]
     y0, y1 = int(h * 0.35), int(h * 0.65)
@@ -555,7 +581,7 @@ def main():
     if not args.keep_scenes:
         for p in (s_base, s_zero, s_pom):
             try:
-                os.remove(p)
+                safe_remove(p)
             except OSError:
                 pass
 

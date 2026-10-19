@@ -1,0 +1,447 @@
+{
+  "version": 1,
+  "generator": "gen_terrain_probe.py (W4): terrain/hills 512m, 6 crates + 3 rocks on the heightfield",
+  "camera": {
+    "target": [
+      0.0,
+      0.0,
+      20.1
+    ],
+    "yaw": 0.62,
+    "pitch": 0.3,
+    "distance": 52.0,
+    "fov": 55.0
+  },
+  "light": {
+    "direction": [
+      0.45,
+      0.7,
+      -0.62
+    ],
+    "color": [
+      1.0,
+      0.96,
+      0.9
+    ],
+    "intensity": 3.2,
+    "castsShadow": true,
+    "ambientScale": 1.0
+  },
+  "entities": [
+    {
+      "name": "Terrain",
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": false,
+      "locked": true,
+      "mesh": null,
+      "material": null,
+      "terrain": {
+        "source": "terrain/hills/terrain.vterrain",
+        "visible": true,
+        "heightScale": 1.0,
+        "layers": [
+          "",
+          "",
+          "",
+          ""
+        ]
+      }
+    },
+    {
+      "name": "TerrainCrate_0",
+      "transform": {
+        "position": [
+          -2.0,
+          -2.0,
+          17.5841
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "cube"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/crate.vmat",
+        "name": "materials/crate",
+        "id": "materials/crate"
+      }
+    },
+    {
+      "name": "TerrainCrate_1",
+      "transform": {
+        "position": [
+          2.2,
+          -1.6,
+          17.5725
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "cube"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/crate.vmat",
+        "name": "materials/crate",
+        "id": "materials/crate"
+      }
+    },
+    {
+      "name": "TerrainCrate_2",
+      "transform": {
+        "position": [
+          -1.4,
+          2.4,
+          17.6087
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "cube"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/crate.vmat",
+        "name": "materials/crate",
+        "id": "materials/crate"
+      }
+    },
+    {
+      "name": "TerrainCrate_3",
+      "transform": {
+        "position": [
+          2.6,
+          2.8,
+          17.5847
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "cube"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/crate.vmat",
+        "name": "materials/crate",
+        "id": "materials/crate"
+      }
+    },
+    {
+      "name": "TerrainCrate_4",
+      "transform": {
+        "position": [
+          0.4,
+          5.2,
+          17.6161
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "cube"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/crate.vmat",
+        "name": "materials/crate",
+        "id": "materials/crate"
+      }
+    },
+    {
+      "name": "TerrainCrate_5",
+      "transform": {
+        "position": [
+          -0.6,
+          -5.4,
+          17.6571
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "cube"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/crate.vmat",
+        "name": "materials/crate",
+        "id": "materials/crate"
+      }
+    },
+    {
+      "name": "TerrainRock_0",
+      "transform": {
+        "position": [
+          -34.0,
+          -26.0,
+          22.5926
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.6,
+          1.6,
+          2.2
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "cube"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/wall.vmat",
+        "name": "materials/wall",
+        "id": "materials/wall"
+      }
+    },
+    {
+      "name": "TerrainRock_1",
+      "transform": {
+        "position": [
+          38.0,
+          20.0,
+          22.6513
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.6,
+          1.6,
+          2.2
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "cube"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/wall.vmat",
+        "name": "materials/wall",
+        "id": "materials/wall"
+      }
+    },
+    {
+      "name": "TerrainRock_2",
+      "transform": {
+        "position": [
+          12.0,
+          46.0,
+          24.9813
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.6,
+          1.6,
+          2.2
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "cube"
+      },
+      "primitive": {
+        "kind": "cube",
+        "size": 1.0,
+        "radius": 0.5,
+        "segments": 48,
+        "rings": 24
+      },
+      "material": {
+        "kind": "vmat",
+        "path": "materials/wall.vmat",
+        "name": "materials/wall",
+        "id": "materials/wall"
+      }
+    }
+  ]
+}

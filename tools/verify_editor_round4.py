@@ -427,6 +427,7 @@ def main():
         #   "tray_" 前缀的 id 又拼了一遍），不是 BAR-TRAY-<id>。
         cw = None
         tray = rect_of(tap, "BAR-TRAY-tray_character", 3.0)
+        picked = False
         if tray is None:
             if plus:
                 click(hwnd, *center(plus))
@@ -436,13 +437,22 @@ def main():
                 if chk:
                     click(hwnd, *center(chk))
                     time.sleep(1.2)
+                    picked = True
             tray = rect_of(tap, "BAR-TRAY-tray_character", 5.0)
         check(tray is not None, "G3b 勾上之后底栏出现 Character 按钮")
-        if tray:
+
+        # ⚠⚠ 勾上**本身就把面板打开了**（drawPanelPicker 的语义：勾上 = 按钮
+        #   出现 + 面板直接打开）。所以刚勾完**不能再点一次托盘按钮** —— 它的
+        #   语义是"显示/隐藏切换"，再点一次正好把窗口收进底栏。而 G3c 用的是
+        #   `wait_rect`（读**最后一条**矩形），窗口收起来之后日志不再刷新，
+        #   读到的是**旧值** → G3c 假通过，G4 却点在一个已经不在的窗口上，
+        #   于是"点叉号关不掉"（2026-10-18 全量里就是这么红的）。
+        #   只有"按钮本来就在、窗口却没开"时才需要点它把窗口叫出来。
+        if tray and not picked:
             click(hwnd, *center(tray))
             time.sleep(1.3)
-            cw = wait_rect(tap, "CHAR-WIN", 4.0)
-            check(cw is not None, "G3c 点开 Character 面板")
+        cw = wait_rect(tap, "CHAR-WIN", 4.0)
+        check(cw is not None, "G3c Character 面板开着（勾上即打开）")
 
         # 点 × 关闭（× 在标题栏右端，往里收一点）
         closed = count(tap, "PANEL character open=0 reason=user-close")
@@ -475,12 +485,21 @@ def main():
             proc.terminate()
         if proc.poll() is None:
             proc.kill()
+        # ⚠ 结尾必须是 `结果: PASS` / `结果: FAIL` —— `run_regression.py` 的
+        #   `OK_RE` 只认 `RESULT: PASS` / `全部断言 PASS` / `^全部 PASS` /
+        #   `结果: PASS` 这四种（ASCII 冒号），且取**最后一条**匹配。
+        #   这里原来只打「全部通过。」→ rc=0 也被判 FAIL（报 `0/1 通过`）。
+        #   这条坑 MEMORY.md 已写过三次，第四次。新脚本先照抄这段。
+        print("\n" + "=" * 72)
         if fails:
-            print("\n失败 %d 项：" % len(fails))
+            print("失败 %d 项：" % len(fails))
             for f in fails:
-                print("  -", f)
+                print("  - %s" % f)
+            print("结果: FAIL（%d 项未通过）" % len(fails))
         else:
-            print("\n全部通过。")
+            print("结果: PASS（顶栏 / 选择模式 / +Add / 播放控制 / 视口分屏 / "
+                  "粒子命名与右键 / 底栏 ×与最小化，全部通过）")
+        print("=" * 72)
 
 
 if __name__ == "__main__":

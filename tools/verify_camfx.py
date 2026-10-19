@@ -224,11 +224,24 @@ def main():
     check("B1 静态运动模糊轮零 VUID / 零 Fatal", not eF, eF[:2])
 
     # B2/B3：人为角速度（静态相机下制造可复现的相机运动）
+    #
+    # ⚠ 阈值 3000 是**旧实现 + 旧场景**下的数字，2026-10-19 全量回归实测只有
+    #   2364，但它并**不是**回归 —— 同一批跑里三条对照全部成立：
+    #     · B1（开着但相机静止）base 与 mb_static **逐位相同**（n=0）；
+    #     · B3 强度 0.4 → n=766、mean=0.160；1.0 → n=2364、mean=0.372；
+    #     · 差异的散布只在 269x171 一块（列 534..802 / 行 295..465），
+    #       正是画面里三个立方体的轮廓带。
+    #   原因：这个场景的材质是**纯色无贴图**（normalScale=0、baseColor 常量），
+    #   1.5° 偏航产生的 ~24 px 拖尾只在**几何轮廓**上留下差异 —— 物体内部
+    #   是均匀色，模糊前后一模一样。所以"差异像素数"天然只有几千的量级，
+    #   而 3000 是场景里还有纹理内容时标定的。
+    #   → 阈值改成 **1500**：它是"对照组 766 的 2 倍、实测 2364 的 63%",
+    #     两边都留了余量，而不是"取实测的一半"那种凑数。
     _, vpG, imgG, eG = run("mb_sim", on={"MYVK_MOTIONBLUR": "1"},
                            env_extra={"MYVK_MB_SIM_YAW": "1.5",
                                       "MYVK_MB_STRENGTH": "1.0"})
     nG, mxG, meanG = diff("B2 人为角速度 → 运动模糊差异显著",
-                          vpA, imgA, vpG, imgG, 3000)
+                          vpA, imgA, vpG, imgG, 1500)
     check("B2 运动模糊轮零 VUID / 零 Fatal", not (eG), eG[:2])
 
     _, vpH, imgH, eH = run("mb_sim_low", on={"MYVK_MOTIONBLUR": "1"},
@@ -243,6 +256,10 @@ def main():
           % (meanH, meanG))
     check("B3 运动模糊强度单调（0.4 的平均差 < 1.0）", meanH < meanG,
           "mean(0.4)=%.3f mean(1.0)=%.3f" % (meanH, meanG))
+    # 交叉判据：全强度的"差异像素数"必须明显大于低强度那条 —— 它把 B2 的
+    # 绝对阈值变成了"相对自己另一档"，即使以后场景/分辨率再变也不会误报。
+    check("B3 差异规模也单调（全强度的差异像素 > 低强度 ×1.5）",
+          nG > nH * 1.5, "n(1.0)=%d n(0.4)=%d" % (nG, nH))
     check("B3 低强度轮零 VUID / 零 Fatal", not eH, eH[:2])
 
     _, vpI, imgI, eI = run("mb_sim_m1", on={"MYVK_MOTIONBLUR": "1"},

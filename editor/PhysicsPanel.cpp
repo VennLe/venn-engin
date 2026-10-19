@@ -70,14 +70,14 @@ void PhysicsPanel::draw() {
                               ImGuiTableFlags_SizingStretchProp |
                                   ImGuiTableFlags_RowBg)) {
             char buf[8][48];
-            std::snprintf(buf[0], sizeof(buf[0]), "%d (%d dyn)", rt.bodies, rt.dynamic);
+            std::snprintf(buf[0], sizeof(buf[0]), TR("%d (%d dyn)"), rt.bodies, rt.dynamic);
             std::snprintf(buf[1], sizeof(buf[1]), "%d", rt.sleeping);
             std::snprintf(buf[2], sizeof(buf[2]), "%d", rt.manifolds);
             std::snprintf(buf[3], sizeof(buf[3]), "%d", rt.contactPoints);
             std::snprintf(buf[4], sizeof(buf[4]), "%d", rt.broadphasePairs);
             std::snprintf(buf[5], sizeof(buf[5]), "%d", rt.joints);
-            std::snprintf(buf[6], sizeof(buf[6]), "%.4f m", rt.maxPenetration);
-            std::snprintf(buf[7], sizeof(buf[7]), "%.2f m/s", rt.maxSpeed);
+            std::snprintf(buf[6], sizeof(buf[6]), TR("%.4f m"), rt.maxPenetration);
+            std::snprintf(buf[7], sizeof(buf[7]), TR("%.2f m/s"), rt.maxSpeed);
             const char* keys[8] = {"Bodies", "Sleeping", "Manifolds", "Contacts",
                                    "Broadphase pairs", "Joints",
                                    "Max penetration", "Max speed"};
@@ -139,7 +139,7 @@ void PhysicsPanel::draw() {
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
         labelValue("Fixed step", "Simulated seconds per physics step (1/60 = 60 Hz)");
         float hz = ps.fixedTimeStep > 1e-6f ? 1.0f / ps.fixedTimeStep : 60.0f;
-        if (ImGui::DragFloat("##phys_hz", &hz, 1.0f, 20.0f, 240.0f, "%.0f Hz")) {
+        if (ImGui::DragFloat("##phys_hz", &hz, 1.0f, 20.0f, 240.0f, TR("%.0f Hz"))) {
             ps.fixedTimeStep = 1.0f / hz;
             dirty = true;
             VK_LOG_INFO("PHYS-SET hz=%.0f", static_cast<double>(hz));
@@ -203,7 +203,7 @@ void PhysicsPanel::draw() {
         }
         labelValue("Sleep time", "Seconds of stillness before sleeping");
         if (ImGui::DragFloat("##phys_st", &ps.sleepTime, 0.01f, 0.0f, 5.0f,
-                             "%.2f s")) {
+                             TR("%.2f s"))) {
             dirty = true;
         }
         ImGui::EndDisabled();

@@ -100,17 +100,39 @@ run("新增**未登记**的 render 文件 → 全量 + 点名", OLD,
     want_unmapped=("engine/render/BrandNew.cpp",))
 run("改一个已登记的 render 模块（ShadowPass）", OLD,
     with_change("engine/render/ShadowPass.cpp"),
-    want={"verify_csm", "verify_shadow_hardening", "verify_collision_play"})
-run("editor/InspectorPanel.cpp → 五个面板块", OLD,
+    # ⚠ 2026-10-18 起 ShadowPass 也被 verify_character_import 登记（它要读
+    #   `skc->jointBase` 往 push constant 里填蒙皮槽）→ 跟着同步 fixture。
+    want={"verify_csm", "verify_shadow_hardening", "verify_collision_play",
+          "verify_character_import"})
+run("editor/InspectorPanel.cpp → 面板块全家族", OLD,
     with_change("editor/InspectorPanel.cpp"),
     # ⚠ 这里**必须**跟着 run_regression.py 的 TRIGGERS 同步长：
     #   网格参数（mesh_params）/ 分区折叠与搜索（inspector）/
     #   左侧页签导航条（inspector_tabs）/ 粒子面板 12 模块（particles）/
-    #   材质槽小方块（material_chips —— 2026-10-16 补进 DEFAULT 时登记的）。
+    #   材质槽小方块（material_chips —— 2026-10-16 补进 DEFAULT 时登记的）/
+    #   Animation 页签的 INS-ANIM-* 锚点（character_import —— 2026-10-18）。
+    #   UI 分区（ui2 —— 2026-10-18：Inspector 的 Render 页新增 "UI" 分组，
+    #   `ui.*` 五个参数的控件就长在这里）。
+    #   中文化体检（verify_i18n_coverage —— 2026-10-18：它的取值域是 editor/**，
+    #   Inspector 是字面量最密的一个文件，所以必然会命中）。
+    #   Tool 页签的 Audio Source 段（verify_audio —— G14-7：`INS-AUDIO-HEADER`
+    #   与 `INS-AUDIO-PREVIEW` 两个锚点就画在这个文件里）。
     #   2026-10-16 加 E11.1 页签时，这条 fixture 先红了 —— 那是它在正常工作。
+    #   材质实例（W1-3 —— 2026-10-18：`INS-MAT-INSTANCE` / `INS-MAT-MAKEUNIQUE`
+    #   就长在 `drawMaterialSection` 里）。
     want={"verify_mesh_params", "verify_inspector",
           "verify_inspector_tabs", "verify_particles",
-          "verify_material_chips"})
+          "verify_material_chips", "verify_character_import",
+          "verify_ui2", "verify_i18n_coverage", "verify_audio",
+          "verify_material_instances",
+          # W4-4（2026-10-19）：Terrain 段（`INS-TERRAIN-*` 十个锚点）
+          # 就长在 `drawTerrainSection` 里。
+          "verify_terrain_editor",
+          # S5（2026-10-19）：Inspector 的 Script 段
+          # （`INS-SCRIPT-STATE` / `INS-SCRIPT-RESET`）就长在这个文件的
+          # `drawScript()` 里 —— 脚本的"实例状态"那一行是 S5 才加的，
+          # 所以这条 fixture 必须跟着长一项。
+          "verify_script_editor"})
 run("assets/shaders/fg_taa.frag → taa", OLD,
     with_change("assets/shaders/fg_taa.frag"), want={"verify_taa"})
 run("删除 decal.frag → 也算变更", OLD,
@@ -127,9 +149,12 @@ run("无基准快照 → 全量", None, OLD, want=None)
 run("runtime/GameLoop.cpp → 三条运行时用例", OLD,
     with_change("runtime/GameLoop.cpp"),
     want={"verify_runtime_build", "verify_runtime_loop", "verify_runtime_states"})
-# G05 的出厂配置只被 states 的冷启动断言读，所以只有它。
-run("assets/game.json → 只跑 verify_runtime_states", OLD,
-    with_change("assets/game.json"), want={"verify_runtime_states"})
+# G05 的出厂配置被 states 的冷启动断言读；G14 起它的 `audio` 块也被
+# `verify_audio` 的 B 组读（`AUDIO-CONFIG ... music=0.70` 就是
+# "game.json 真的生效"的唯一证据）→ 两个 owner。
+run("assets/game.json → 只跑 verify_runtime_states + verify_audio", OLD,
+    with_change("assets/game.json"),
+    want={"verify_runtime_states", "verify_audio"})
 
 print("\n[B] 快照覆盖范围（真实扫描仓库）")
 s = rr.source_snapshot()

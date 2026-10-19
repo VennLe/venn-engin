@@ -1,4 +1,6 @@
 #include "assets/MeshLoader.h"
+
+#include "assets/Vmeta.h"
 #include "assets/AssetManager.h"
 #include "assets/AssetPath.h"
 #include "rhi/Device.h"
@@ -364,11 +366,48 @@ Texture* buildOrmTexture(AssetManager& assets, const tinygltf::Model& gm,
                                   static_cast<uint32_t>(h), false);
 }
 
+// 材质的稳定身份（W0-2）：`<模型路径>#<glTF 材质名>`。
+//
+// 以前材质"身份"就是缓存键 `models/xxx.glb/mat0` —— **数组下标**。模型重导出
+// 时材质顺序一变，所有引用静默错位（mat0 从 Skin 变成 Hair，没有任何报错）。
+//
+// 两条回落：
+//   · 材质名为空 → `#mat<idx>`：匿名材质至少稳定在"位置"上，且一眼看得出
+//   · 同名 → 追加 `#2`/`#3`（按**前面出现过几个同名**算，确定性且幂等 ——
+//     同一份文件读两次得到同一串 id）
+std::string gltfMaterialName(const tinygltf::Model& gm, int matIdx,
+                             const std::string& base) {
+    if (matIdx < 0 || matIdx >= static_cast<int>(gm.materials.size()))
+        return std::string();
+
+    std::string n = gm.materials[static_cast<size_t>(matIdx)].name;
+    if (n.empty()) return std::string();
+
+    int dup = 0;
+    for (int i = 0; i < matIdx; ++i) {
+        if (gm.materials[static_cast<size_t>(i)].name == n) ++dup;
+    }
+    if (dup > 0) {
+        const std::string orig = n;
+        n += "#" + std::to_string(dup + 1);
+        VK_LOG_WARN("ASSET-MAT-DUPNAME model=%s name=%s id=%s",
+                    assetLogSafe(base).c_str(),
+                    assetLogSafe(orig).c_str(),
+                    assetLogSafe(n).c_str());
+    }
+    return n;
+}
+
 // glTF material → 引擎 Material
 Material* gltfMaterial(AssetManager& assets, const tinygltf::Model& gm,
-                       int matIdx, const std::string& base) {
+                       int matIdx, const std::string& base, Vmeta* vm) {
     const auto& gmat = gm.materials[matIdx];
     const std::string key = base + "/mat" + std::to_string(matIdx);
+
+    // ⚠ 已经导入过就**原样返回**，不按参数重新推导：
+    //   用户在编辑器里改过的材质参数（W0-3 的覆盖）不能被一次重导入静默刷掉。
+    //   "源文件变了要不要重导"是 W2-2 的策略（sourceHash），不在这里决定。
+    if (Material* cached = assets.findMaterial(key)) return cached;
 
     const auto& pbr = gmat.pbrMetallicRoughness;
 
@@ -398,7 +437,26 @@ Material* gltfMaterial(AssetManager& assets, const tinygltf::Model& gm,
         static_cast<float>(pbr.roughnessFactor),
         static_cast<float>(pbr.metallicFactor), emissive, gmat.doubleSided);
     // 标记来源：这个材质来自模型，重建方式是重新加载该模型
-    if (mat) mat->source.setModel(base);
+    if (mat) {
+        mat->source.setModel(base);
+        // W0-2：稳定身份；W0-3：记下导入时的原始参数（算 overrides 用）
+        // W2-2：id 走 .vmeta 的映射（重导出换了顺序也不串味）；
+        // 没有 sidecar 时 resolveMaterialId 自己生成并记进映射。
+        const std::string nm = gltfMaterialName(gm, matIdx, base);
+        const std::string mid =
+            vm ? resolveMaterialId(*vm, base, nm, matIdx)
+               : (base + "#" + (nm.empty() ? ("mat" + std::to_string(matIdx))
+                                           : nm));
+        assets.assignMaterialId(mat, mid);
+        mat->captureImportDefaults();
+        // 锚点：用来断言"7 个 id 与 7 个 glTF 材质名一一对应"。
+        // ⚠ 这里刻意打 `key=` 与 `id=` 两列 —— 只打 id 的话，
+        //   "id 改回数组下标"这条否定测试仍然会过（下标也是唯一字符串）。
+        VK_LOG_INFO("ASSET-MAT-ID model=%s key=%s id=%s",
+                    assetLogSafe(base).c_str(),
+                    assetLogSafe(key).c_str(),
+                    assetLogSafe(mat->id).c_str());
+    }
     return mat;
 }
 
@@ -671,13 +729,24 @@ std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
     auto model = std::make_unique<Model>();
     model->name = name;
 
+    // W2-2：导入设置 sidecar。读它 → 判定"源变没变 / 参数被改没被改" →
+    // 材质 id 从它的映射里取（重导出换序不串味），最后按需写回。
+    Vmeta vmeta = beginModelImport(name);
+
     // glTF 规范是 **Y-up**；引擎世界是 **Z-up** 右手系。
     // 在节点树根部预乘一个"绕 X +90°"的旋转：(x,y,z) → (x,-z,y)，
     // glTF 的 +Y(up)/+Z(forward) 就变成引擎的 +Z(up)/-Y(forward)。
     // 旋转保持手性，法线与绕序无需特殊处理；子节点的局部 TRS 也随之
     // 一并转换（decompose 出来的还是正确的 Z-up 姿态）。
-    const glm::mat4 kYupToZup =
+    glm::mat4 rootXform =
         glm::rotate(glm::mat4(1.0f), 1.57079637f, glm::vec3(1, 0, 0));
+    // W2-2：导入缩放乘在**根**上 —— 位移、骨骼、包围盒一起缩放，不会出现
+    // "模型缩小了但骨架没缩"这种错位。默认 1.0 是单位阵，逐位等于原行为。
+    if (vmeta.import.scale > 0.0f && vmeta.import.scale != 1.0f) {
+        rootXform = glm::scale(glm::mat4(1.0f),
+                               glm::vec3(vmeta.import.scale)) * rootXform;
+    }
+    const glm::mat4& kYupToZup = rootXform;
 
     glm::vec3 bmin(1e30f), bmax(-1e30f);
 
@@ -836,11 +905,14 @@ std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
                         msrc.name = name;  // GLTF 下 name 存"模型键"
                         msrc.subMeshIndex = static_cast<int>(p);
                         sm.mesh->setSource(msrc);
+                        // W2-2：generateLods=false → 这条网格不建 LOD 链
+                        sm.mesh->setNoLod(!vmeta.import.generateLods);
                     }
                     if (prim.material >= 0 &&
                         prim.material < static_cast<int>(gm.materials.size())) {
                         sm.material =
-                            gltfMaterial(assets, gm, prim.material, name);
+                            gltfMaterial(assets, gm, prim.material, name,
+                                         &vmeta);
                     }
                     model->subMeshes.push_back(std::move(sm));
                 }
@@ -873,6 +945,9 @@ std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
         model->center = (bmin + bmax) * 0.5f;
         model->radius = glm::length(bmax - bmin) * 0.5f;
     }
+
+    // W2-2：把本次见到的材质名补进映射并写回 sidecar（内容没变就不写）
+    finishModelImport(name, vmeta);
 
     VK_LOG_INFO("glTF loaded: %s (%u submeshes, %u materials)", path.c_str(),
                 static_cast<uint32_t>(model->subMeshes.size()),

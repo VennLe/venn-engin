@@ -1100,7 +1100,7 @@ V3 就退化成"自己跟自己比"。修后 `verify_viewport.py` **40 项断言
 - **规模**：**M**
 - **依赖**：E05、E15
 
-### E26 · 画质档位（Quality Settings 面板）
+### E26 · 画质档位（Quality Settings 面板）✅ 已完成（2026-10-19）
 
 - **目标**：一次切到"低/中/高/极高/电影级"，含**平台预设**。
 - **改动点**
@@ -1214,7 +1214,7 @@ E25 全部依赖（E05 工作区 / E15 统计面板 / R0-1 的 `GpuTimer`）都�
 | 任务 | 状态 | 阻塞原因 |
 | --- | --- | --- |
 | E24 资产编辑器框架 | 待做 | 依赖 E13 / E05（**均已就绪**）—— L 级，可立刻开工 |
-| E26 画质档位 | 待做 | ✅ 依赖的 **E03（设置层级与持久化）已于 2026-10-17 落地**（`engine/render/RenderSettingsIO.*` + `config/render.json`）—— 准入契约已满足 |
+| E26 画质档位 | **✅ 已完成（2026-10-19）** | 见本文件 §17 的落地记录 |
 | E27 RenderGraph 可视化 | 待做 | ⚠ **准入契约未满足**：依赖渲染侧 **R7-1「声明式 RenderGraph」**，`docs/render_roadmap.md` 里它还在阶段 7（未做）。现有 `render/FrameGraph` 只覆盖"前向之后"的 5 个 pass，不是全管线 |
 | E28 打包 / 发布 UI | 待做 | 依赖 E21 / E13（**均已就绪**）—— L 级，需动 `CMakeLists.txt` 加 `VENN_SHIPPING` 宏 |
 | E29 烘焙流水线 UI | 待做 | 🟡 **准入契约部分满足（2026-10-15）**：**R5-1 反射探针已落地** ✅（`engine/render/ReflectionProbe.*` + `Inspector ▸ Reflection Probe` 属性面板 + `Capture` 按钮），但 **R5-2 lightmap 仍未落地** ✗ —— 面板的"光照贴图缩略图"那一半还是空的。可先做反射探针那一路（设置档 + 进度条 + 探针预览球），光照贴图那一路等 R5-2 |
@@ -1223,6 +1223,9 @@ E25 全部依赖（E05 工作区 / E15 统计面板 / R0-1 的 `GpuTimer`）都�
 `DEFAULT` + `TRIGGERS`（`DEFAULT` 现 **46 例**；`check_regression_map.py`
 **PASS**：40 例已登记 / 46 例，6 例按设计无条件重跑；无死映射、无全横切登记）。
 `check_feature_surface.py` **PASS**（32/32 特性有 UI 面、裸 env 漏网 0）。
+
+> 上面这组数字是 **E25 当轮**的口径；2026-10-19 复跑为 **79 例已登记 / 86 例**、
+> **35/35 有 UI 面 / 裸 env 0**（新增 `verify_quality_presets` 等）。
 
 ---
 
@@ -1290,7 +1293,7 @@ E25 全部依赖（E05 工作区 / E15 统计面板 / R0-1 的 `GpuTimer`）都�
 | **M2 · 布局成熟** ✅ | E04 / E05 / E06                         | 工作区可切换、布局可落盘、分割线可视化（**2026-10-14 达成**） |
 | **M3 · 核心面板达标** ✅ | E11 / E12 / E13 / E14 / E15 / E16 / E17 | 每个面板有独立 `verify_*.py` 且 PASS（**2026-10-15 达成**；E11/E13/E14 三支脚本为本轮新增） |
 | **M4 · 交互成熟**   | E18 / E19 / E20 / E21 / E23             | 命令面板可搜、设置可撤销、快捷键可重绑定（**E18/E19/E21 于 2026-10-15 达成；E03 于 2026-10-17 达成**；E20 待做、E23 待做） |
-| **M5 · 生产力工具**  | E07 / E22 / E24 / ✅E25 / E26             | 多视口、资产编辑器、时间轴、画质档位可用                                 |
+| **M5 · 生产力工具**  | E07 / E22 / E24 / ✅E25 / ✅E26            | 多视口、资产编辑器、时间轴、画质档位可用                                 |
 | **M6 · 3A 收口**  | E08 / E27 / E28 / E29                   | 出包可用、Shipping 剔除生效、烘焙有 UI                            |
 
 **M1 是投入产出比最高的里程碑**——它把"功能有了但人用不了"这个结构性缺陷一次性抹掉。
@@ -1303,7 +1306,7 @@ E25 全部依赖（E05 工作区 / E15 统计面板 / R0-1 的 `GpuTimer`）都�
 
 | 维度       | 现状（2026-10-15）              | 目标                                                                        | 相关任务                              |
 | -------- | --------------- | ------------------------------------------------------------------------- | --------------------------------- |
-| 面板数      | **11 + 3 条带**（E18 命令面板 / E21 通知历史 / **E25 GPU 时间轴** 陆续进来） | +3（Quality / RenderGraph / Bake） | ✅ E18 / ✅ E21 / ✅ E25 / E26 / E27 / E29 |
+| 面板数      | **12 + 3 条带**（+ **E26 画质档位**；E18 命令面板 / E21 通知历史 / E25 GPU 时间轴 陆续进来） | +2（RenderGraph / Bake） | ✅ E18 / ✅ E21 / ✅ E25 / ✅ E26 / E27 / E29 |
 | 特性↔UI 覆盖 | **32/32（100%）**   | 100%                                                                      | ✅ E09 / E10 |
 | 工作区      | **6 套 + 落盘**     | 6 套 + 落盘                                                                  | ✅ E05                               |
 | 布局持久化    | **`config/editor_layout.json` + `editor_prefs.json`** | 全量                                             | ✅ E04 / E05 / E17                         |
@@ -1734,3 +1737,127 @@ E25 全部依赖（E05 工作区 / E15 统计面板 / R0-1 的 `GpuTimer`）都�
 - ⚠ 首跑 `verify_editor_round4` 有一次 B1~G3 **全挂**（矩形都拿到、点击全无反应），重跑即全 PASS ——
   鼠标注入在窗口没拿到前台时的老 flake，与本轮改动无关
 - 按纪律**没跑全量回归**（用户要求：等他发指令）
+
+---
+
+## 17 · E26 画质档位（2026-10-19）✅
+
+> 依赖 E01 / E03 / E09，三条全部就绪之后开工。**这一节是 E26 的落地记录**，
+> 与 §6 的原文（需求）对照着看。
+
+### 17.1 交付物
+
+| 文件 | 改动 |
+| --- | --- |
+| `engine/render/QualityPresets.{h,cpp}` | **扩展**：数值档位表（3 项）+ 平台预设（5 个）+ `presetDiff`（差异预览与一致性检查**共用**）+ `fillLayerForPreset`（落盘唯一入口）+ `runQualitySelfTest`（15 条） |
+| `editor/QualitySettingsPanel.{h,cpp}` | **新建**：档位单选 / 平台下拉 / 差异预览 / Apply / Check / Save / 需重启提示 |
+| `editor/EditorApp.{h,cpp}` | 面板表加一行（`quality`，Authoring 组，无快捷键）+ draw 薄壳 + onInit 建实例 |
+| `engine/project/ProjectDisplay.cpp` | `writeQuality` 与 `describeWrites` 改走 `fillLayerForPreset` —— **启动器与编辑器写的是同一份数据** |
+| `runtime/main.cpp` | `--selftest quality` 入口 |
+| `engine/i18n/ZhTable.cpp` | +26 条（其中 5 条是格式串） |
+| `tools/verify_quality_presets.py` | **新建**，20 条断言（A 4 + B 14 + C 2）+ A 组内部 15 条自检 —— 见 §17.4 |
+
+### 17.2 三个刻意的设计（都写进了代码注释）
+
+1. **选择与应用分开**。点档位只改"预览目标"，不立刻改参数 —— 否则差异预览
+   恒为 0，用户永远看不到"切到 Low 会关掉什么"。
+2. **差异与一致性检查共用 `presetDiff`**。两处各写一套比较逻辑必然漂移，
+   而漂移的表现是"两边都说通过、只有画面不对"。
+3. **落盘只写值，档位名只是标签**。`config/render.json` 里没有 `quality`
+   键 —— 面板重开时用 `presetDiff` **从实际值反推**是哪一档（差 0 项即命中），
+   反推不出来就显示 Custom。这与启动器 M4 解掉 `game.json.quality` 空挂
+   时的判断完全一致：**值才是权威**，标签是显示。
+
+### 17.3 数值档位表（只挑"当帧生效 + 明确的质量/性能权衡"）
+
+| 参数 | Low | Medium | High | Epic | Cinematic |
+| --- | --- | --- | --- | --- | --- |
+| `shadow.cascades` | 1 | 2 | 3 | 4 | 4 |
+| `shadow.distance` | 60 | 80 | **90** | 120 | 150 |
+| `lshadow.maxLights` | 1 | 2 | 4 | 8 | 12 |
+
+- **High 的 `shadow.distance` 必须是 90**（引擎默认值）—— 否则"默认工程点一下
+  High，画面就变了"。这条有自检（Q11）盯着。
+- **刻意不做**的两类：① 改了要重建资源的（`shadow.resolution` /
+  `lshadow.resolution`）—— 切档后必须重启，放进表里等于在面板上撒谎；
+  面板底部如实列出它们。② 美术意图参数（`ssao.radius` / `vfog.albedo`）——
+  那是"风格"不是"质量"。
+- 平台预设 = 档位别名（PC High→High / PC Low→Low / Game Console→Epic /
+  Mobile→Low / VR→High），**不引入第二套数值表**。
+
+### 17.4 验收（`tools/verify_quality_presets.py`，20 条全 PASS）
+
+```
+A 组（--selftest quality）
+  A1 退出码 0 · A2 15 条全过 · A3 failures=0
+  A4 表规模 presets=5 values=3 platforms=5 enable=22
+B 组（GUI，第一次启动）
+  B1 面板 rect=(448,108)-(1008,628)
+  B2 5 个档位锚点都在面板内（inside=[T,T,T,T,T]）
+  B3 点 Low → QUALITY-UI select preset=Low
+  B4 差异预览出现（QUAL-DIFF-0）
+  B5 选档没有立刻改参数（snapshot=0）
+  B6 Apply 生效
+  B7 preset=Low ssao=0 ssr=0 taa=0        ← **验收原文：SSR 生效值为 0**
+  B8 cascades=1 dist=60 lights=1
+  B9 应用后自检 mismatches=0
+  B10 preset=Epic ssao=1 ssr=1 taa=1 cascades=4
+  B11 Save 生效
+  B12 落盘 25 个键（22 开关 + 3 数值）
+  B13 数值项与 Epic 定义一致（4 / 120 / 8）
+  B14 Epic 开关（ssao/decals 开、dof 关）
+C 组（GUI，重开工程）
+  C2 RENDER-SET chain=project=25 total=25
+  C3 读回后自检 preset=Epic mismatches=0
+结果: PASS
+```
+
+### 17.5 这一轮踩到的两个坑（都是"锚点有值但点不到"那一族）
+
+| 现象 | 根因 | 修法 |
+| --- | --- | --- |
+| **B2 红**：第 5 个档位锚点（`QUAL-PRESET-4`）在面板右缘之外 | 5 个单选按钮一行放不下（英文 "Low quality"+"Medium quality"+… ≈ 550 px > 内容区 544 px）。**被 ImGui 裁掉的控件 `GetItemRectMin/Max` 照样返回真实坐标** → 锚点有值、点下去点到别处 | 档位按钮**每 3 个换一行**（3+2）。断言里加"锚点必须落在 `QUAL-RECT` 内"，把这类问题变成显式判据 |
+| **C3 红**：重开工程后自检 `preset=High mismatches=7` | 面板默认 `m_selected = High`，而落盘的是 Epic —— 面板拿"预览目标"当"当前档位" | 首帧用 `presetDiff` **反推**当前档位（5 档各比一次，差 0 项即命中），并且必须在**画单选按钮之前**做。有未绑定参数时一律报 Custom（diff 会跳过未绑定的项，"差 0"可能只是"没比到"） |
+
+### 17.6 "改一处要同步改 N 处"清单（这次的真实账）
+
+1. `ProjectDisplay::writeQuality` 改成调 `fillLayerForPreset` → **键数 22 → 25**
+2. → `verify_launcher_create.py` 的 `want = 22` 改 25（注释写清 22+3）
+3. → `verify_launcher_display.py` 的 R4 只打印行，未断言数字，**不用改**
+4. → `--selftest project` 的 **J11 挂了**（`keys=25 want=22`）—— 它断言的是
+   `render::enableParamCount()`，而写盘现在多了 3 个数值项。改成
+   `enableParamCount() + qualityValueCount()`。
+   ⚠ 这条一开始被我判成"不用改"，实跑才发现 —— **"改一处要同步改 N 处"里的 N
+   永远比你以为的多一个**，别靠推理，靠跑。
+5. `check_regression_map.py`：`QualityPresets.*` 已在 `RENDER_MODULES`（启动器那轮加的），
+   但 `verify_launcher_create` 的 `TRIGGERS` 缺 `ProjectDisplay.*` / `QualityPresets.*` —— 已补
+6. i18n：面板里 5 条状态行是裸 `snprintf`（D 组抓 8 条，其中 3 条是锚点 tag）→
+   状态行包 `TR`、tag 拼装改成 `std::string`（不经过 `snprintf`）
+
+### 17.7 明确没做（写下来免得下次重启讨论）
+
+- **不改 `editor/FeatureUIGen.cpp` 的顶栏 `Preset ▾`**：它已经调
+  `render::applyPreset`，E26 的数值项是**加在 `applyPreset` 里**的，所以顶栏
+  切档与面板切档行为逐位相同，不需要第二份 UI。
+- **不写 `"quality"` 标签键**（见 §17.2 第 3 条）。
+- **不做"自定义档另存为"**：E26 原文提到"可另存为自定义档"，但当前没有
+  "命名档位集合"的资产格式（那需要一个新的资产类型）。面板的 Save 已经把
+  当前档完整写进 `render.json`，改几个参数后仍然是 Custom —— 语义上等价，
+  少一个需要维护的资产格式。
+
+### 17.8 收口复跑（2026-10-19 最后一次全门复核）
+
+| 门 | 结果 |
+| --- | --- |
+| `Game.exe --selftest quality` | `presets=5 values=3 platforms=5 enable=22` → **15/15 OK，failures=0** |
+| `verify_quality_presets.py` | **20/20 PASS**（含 B7 `ssr=0`、B8 `cascades=1 dist=60`、B12 `keys=25`、C3 `preset=Epic mismatches=0`） |
+| `Launcher.exe --selftest project` | **112 条 failures=0**（J11 修好后） |
+| `verify_launcher_create` / `verify_launcher_project` / `verify_quality_presets` | **3/3 PASS**（34.3s / 9.6s / 49.8s） |
+| `verify_launcher_display` | PASS 83.8s |
+| `verify_settings_layers` | PASS 53.6s |
+| `check_regression_map.py` | PASS（**79 例已登记 / 86 例**，无死映射、无全横切、`RENDER_MODULES` 无缺口） |
+| `check_feature_surface.py` | PASS（**35/35 有 UI 面**，`MYVK_*` 263 个，裸 env 漏网 **0**，21 条 `*_DBG` 软警告留 E17） |
+| `verify_i18n_coverage.py` | PASS（A1~F 全 0，词典 **1708** 条，重复键 0） |
+
+⚠ 未跑全量：`engine/**` / `editor/**` / `runtime/**` / `launcher/**` / `CMakeLists.txt`
+都在 `GLOBAL_GLOBS`（横切），按纪律**等明确下令**再 `--all`。

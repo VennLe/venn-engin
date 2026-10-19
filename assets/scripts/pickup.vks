@@ -1,0 +1,20 @@
+# pickup.vks —— 拾取物：玩家走进 1.5 m 就收走，并给**世界黑板**加一。
+#
+# 三个要点：
+#   1. `taken` 是实例变量 → 每个拾取物各自只生效一次（同一份脚本、5 个实例）。
+#   2. `setWorldAttr("picked", …)` 写的是**世界**黑板（`Scene::scriptVars`），
+#      它**进存档**；而 `taken` 是逐实体变量（`ecs::ScriptVarsComponent`），
+#      **不存盘**。G5 就是靠这一对差值立论的。
+#   3. `setVisible(self(), false)` 之后实例还在跑（只是看不见），
+#      所以 `taken` 这个守卫是必须的 —— 去掉它会在原地每帧 +1。
+
+let taken = 0
+
+on update {
+    if (taken == 0 && dist(pos(self()), pos(player())) < 1.5) {
+        taken = 1
+        setWorldAttr("picked", worldAttr("picked", 0) + 1)
+        setVisible(self(), false)
+        print("PICKUP", name(self()), worldAttr("picked", 0))
+    }
+}

@@ -119,6 +119,22 @@ if(MSVC)
     target_compile_options(ufbx PRIVATE /utf-8 /wd4819)
 endif()
 
+# ---- stb_vorbis（OGG 解码：stb_vorbis.c 既是声明也是实现）----
+#
+# ⚠ 与 ufbx 完全同款：`third_party/stb/stb_vorbis.c` 从 2026-10-14 起就在
+#   仓库里，但 `stb` 是 **INTERFACE**（纯头文件）→ 那个 .c **没有任何
+#   target 编译它** → 想解 OGG 就是"文件在、符号没有"。
+#   G14-1 补上这个 target；C++ 侧只 `#define STB_VORBIS_HEADER_ONLY` 后
+#   include 同一个文件拿声明（stb 自带 extern "C" 保护）。
+add_library(stb_vorbis STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb/stb_vorbis.c)
+target_include_directories(stb_vorbis PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+if(MSVC)
+    # 纯 C 源，但会刷几百条 /W3 警告（未使用变量 / 有符号无符号比较）。
+    target_compile_options(stb_vorbis PRIVATE /utf-8 /wd4819 /W0)
+endif()
+
 # ---- nlohmann/json（单头文件；场景序列化用）----
 # 头文件放在 third_party/nlohmann/json.hpp，include 目录指到 third_party，
 # 这样代码里统一写 #include <nlohmann/json.hpp>
@@ -159,7 +175,14 @@ target_link_libraries(VennEngine PUBLIC
     ufbx
     nlohmann_json
     vma
+    stb_vorbis
 )
+# G14-3：WASAPI 后端要 COM（ole32）+ 多媒体线程提升（avrt）+ 内核流（ksuser）
+# 与 waveOut 兜底的 winmm。全部只在 Windows 上存在；engine/audio/WasapiBackend.cpp
+# 整个文件被 `#if defined(_WIN32)` 包住，非 Windows 上是一个空 TU。
+if(WIN32)
+    target_link_libraries(VennEngine PUBLIC ole32 avrt ksuser winmm)
+endif()
 if(NOT MSVC)
     target_compile_options(VennEngine PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
@@ -213,12 +236,45 @@ if(DEFINED VENN_ICON_RC)
 endif()
 target_link_libraries(VennRuntime PRIVATE VennEngine)
 
+# ============================================================
+# 启动器（launcher/ → Launcher.exe）
+# ------------------------------------------------------------
+# 路线图 D1/D2：**独立进程**，不是编辑器的一个模式。三个应用层平行：
+#
+#     launcher/ ─┐
+#     editor/   ─┼─►  VennEngine
+#     runtime/  ─┘
+#
+# ⚠ 它**不**链接 editor/ 的任何东西（连 `editor::tr` 都不用 ——
+#   直接 `i18n::tr`）。这是"启动器能独立发出去"的前提，也让
+#   `engine/` 之外的三份应用层互不影响。
+# ============================================================
+file(GLOB_RECURSE LAUNCHER_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/*.cpp
+)
+add_executable(VennLauncher ${LAUNCHER_SOURCES})
+set_target_properties(VennLauncher PROPERTIES OUTPUT_NAME Launcher)
+if(DEFINED VENN_ICON_RC)
+    target_sources(VennLauncher PRIVATE ${VENN_ICON_RC})
+    set_source_files_properties(${VENN_ICON_RC} PROPERTIES
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/venn.ico")
+endif()
+target_link_libraries(VennLauncher PRIVATE VennEngine)
+if(WIN32)
+    # `SHCreateItemFromParsingName` / `IFileOpenDialog` 的 COM 侧符号在
+    # ole32 + shell32 + uuid 里。ole32 已由 VennEngine PUBLIC 带过来
+    # （WASAPI 需要），这里补另外两个。
+    target_link_libraries(VennLauncher PRIVATE shell32 uuid)
+endif()
+
 if(NOT MSVC)
     target_link_options(VennEditor PRIVATE -static-libgcc -static-libstdc++)
     target_link_options(VennRuntime PRIVATE -static-libgcc -static-libstdc++)
+    target_link_options(VennLauncher PRIVATE -static-libgcc -static-libstdc++)
     if(WIN32)
         target_link_options(VennEditor PRIVATE -static)
         target_link_options(VennRuntime PRIVATE -static)
+        target_link_options(VennLauncher PRIVATE -static)
     endif()
 endif()
 
@@ -537,6 +593,21 @@ function(myvk_copy_runtime_assets target)
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/models|assets/models"
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/textures|assets/textures"
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons|assets/icons"
+            # U1（游戏 UI）：SDF 字体图集（PNG + JSON）由 tools/gen_sdf_atlas.py
+            # **构建期离线生成**并提交进仓库。运行时不读系统字体 —— 否则
+            # 打包到玩家机器上中文全是方块，且系统字体不可再分发。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/ui|assets/ui"
+            # G14：音频素材。⚠ 必须进"每次都拷"这一档 —— `POST_BUILD` 只在
+            # 重新链接时跑，改了 wav 却不重新链接时，运行时读到的还是旧素材
+            # （表现是"我明明换了音效，听起来没变"）。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/audio|assets/audio"
+            # W2-1：材质资产（`.vmat`）。母材质要能"被多个关卡共享"，
+            # 所以它必须有自己的文件；而且改一次要立刻生效 → 进"每次都拷"。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/materials|assets/materials"
+            # W4：地形资产（`.vterrain` + `.r32` + `.rgba8`）。与材质同一条
+            # 理由 —— 改一次高度图要立刻生效，否则"我明明加高了山"只能
+            # 在重新链接之后才看得到。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/terrain|assets/terrain"
         )
         set(always_asset_cmds "")
         foreach(item IN LISTS VENN_ALWAYS_ASSET_DIRS)
@@ -584,24 +655,77 @@ function(myvk_copy_runtime_assets target)
     add_dependencies(${target} VennShadersCopy VennAssetsCopy)
 
     # 场景 / 脚本目录（编辑器与运行时都会读写 assets/scenes 与 assets/scripts）
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes)
-        add_custom_command(TARGET ${target} POST_BUILD
+    # ⚠ S6 起 `assets/scripts/` 里是**随仓库提交**的示例玩法脚本
+    #   （enemy_patrol / door_timer / pickup / hud_counter），
+    #   `assets/scenes/levels/script_demo.json` 用相对资产根的路径引用它们。
+    #
+    # ⚠⚠ 这里是 `add_custom_target(... ALL)` 而不是 `add_custom_command(TARGET
+    #   POST_BUILD)`：POST_BUILD **只在重链之后**才跑，而这两个目录是"改了
+    #   资产但没改 C++"时唯一变化的东西 —— 用 POST_BUILD 的话，改完
+    #   `script_demo.json` 直接跑测试会拿到**上一份**场景，而且没有任何提示。
+    #   （以前它们在 POST_BUILD 里，W3/W4 都靠"反正会重链"侥幸躲过去了。）
+    #
+    # ⚠⚠ 2026-10-19（启动器 M0）：原来这里是 `${target}_copy_scenes`，**按
+    #   target 各建一份**。两个 exe 的输出目录是同一个 `${CMAKE_RUNTIME_OUTPUT_DIRECTORY}`
+    #   → ninja 并行执行两条 `copy_directory` 到同一个目标目录 → 实测直接
+    #   `Error copying directory ... No such file or directory`（一边正在建目录、
+    #   另一边已经在往它里面拷）。与 VennShadersCopy / VennAssetsCopy 统一成
+    #   **全局单例 + 两个 exe 都 add_dependencies**，从根上消掉这条竞态。
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes AND NOT TARGET VennScenesCopy)
+        add_custom_target(VennScenesCopy ALL
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 ${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes
-                $<TARGET_FILE_DIR:${target}>/assets/scenes
-            COMMENT "Copying scenes to ${target} binary dir"
+                ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/scenes
+            COMMENT "Copying scenes to binary dir"
+            VERBATIM
         )
     endif()
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets/scripts)
-        add_custom_command(TARGET ${target} POST_BUILD
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets/scripts AND NOT TARGET VennScriptsCopy)
+        add_custom_target(VennScriptsCopy ALL
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 ${CMAKE_CURRENT_SOURCE_DIR}/assets/scripts
-                $<TARGET_FILE_DIR:${target}>/assets/scripts
-            COMMENT "Copying scripts to ${target} binary dir"
+                ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/scripts
+            COMMENT "Copying scripts to binary dir"
+            VERBATIM
         )
+    endif()
+    if(TARGET VennScenesCopy)
+        add_dependencies(${target} VennScenesCopy)
+    endif()
+    if(TARGET VennScriptsCopy)
+        add_dependencies(${target} VennScriptsCopy)
+    endif()
+
+    # ------------------------------------------------------------
+    # 模板（启动器 M0）：`templates/` → `<exe>/templates`
+    # ------------------------------------------------------------
+    # `project::templatesRoot()` 的候选链是
+    #   MYVK_TEMPLATE_DIR > <exe>/templates > <cwd>/templates
+    # 所以不拷的话，从 `build/bin` 跑 `Game.exe --selftest project` 会
+    # 找不到模板（`templatesRoot()` 会退化成 `<exe>/templates` 这个
+    # **不存在**的路径，`templateDir()` 返回空串，创建自检全红）。
+    #
+    # 与 scenes/scripts 同样用 `ALL` 而不是 POST_BUILD：改一个模板 json
+    # 不重链接 C++，POST_BUILD 不会跑，于是"改了模板没生效"。
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/templates AND NOT TARGET VennTemplatesCopy)
+        add_custom_target(VennTemplatesCopy ALL
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                ${CMAKE_CURRENT_SOURCE_DIR}/templates
+                ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/templates
+            COMMENT "Copying templates to binary dir"
+            VERBATIM
+        )
+    endif()
+    if(TARGET VennTemplatesCopy)
+        add_dependencies(${target} VennTemplatesCopy)
     endif()
 endfunction()
 
 myvk_copy_runtime_assets(VennEditor)
 myvk_copy_runtime_assets(VennRuntime)
+# 启动器也要 `templates/`（新建工程时复制它）与 `assets/icons/`（窗口图标）。
+# 不需要着色器 —— 启动器一个 3D 也不画；但那个函数会一并拷进来，
+# 代价只是磁盘上多一份 shader，换来"三个 exe 的目录布局完全一致"，
+# 少一类"某个 exe 跑起来找不到 X"的差异。
+myvk_copy_runtime_assets(VennLauncher)
 

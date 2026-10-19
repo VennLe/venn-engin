@@ -102,12 +102,12 @@ public:
     VkSampler sampler() const { return m_sampler; }
 
     // 在独立的 depth-only render pass 内渲染**第 cascade 级**。
-    // jointBases：蒙皮网格的关节矩阵起始下标（与主前向路径同源）。
-    // 传 nullptr 表示场景里没有蒙皮网格。
+    // 蒙皮网格的 jointBase 由 pass 自己按实体沿父链取
+    // （`SkinnedMeshComponent::jointBase`，逐实体）—— 以前是由调用方传
+    // 一份"mesh → 下标"的映射，同一 FBX 的多个实例会互相覆盖。
     void render(VkCommandBuffer cmd, scene::Scene& scene,
                 VkDescriptorSet frameSet, uint32_t frameIndex,
-                uint32_t cascade,
-                const std::unordered_map<const assets::Mesh*, int>* jointBases);
+                uint32_t cascade);
 
     // 本帧第 cascade 级的提交统计（验证脚本用：证明剔除真的在省）
     uint32_t submitted(uint32_t cascade) const;

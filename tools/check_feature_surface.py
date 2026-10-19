@@ -273,6 +273,17 @@ FEATURES = [
          env=["MYVK_SHADER_HOTRELOAD", "MYVK_SHADER_VARIANTS",
               "MYVK_SHADER_FORCE_MASK"],
          test="verify_shader_hotreload", gpu=None),
+
+    # ---------------- 游戏 UI / HUD（U0，docs/ui_hud_roadmap.md）----------------
+    # C 组的 ui token 用的是**参数 id**：FeatureRegistry.cpp 也在
+    # _collect_editor_sources() 的输入里（registry 是"面板长什么样"的
+    # 元数据源），所以参数 id 本身就是"界面上点得到"的机器证据。
+    dict(id="ui2", name="游戏 UI / HUD", roadmap="U0", scope="Engine",
+         panel="Engine/Inspector ▸ UI",
+         ui=["ui.hudInEditor", "ui.debugBounds"],
+         env=["MYVK_UI", "MYVK_UI_HUD_IN_EDITOR", "MYVK_UI_SCALE",
+              "MYVK_UI_DEBUG_BOUNDS", "MYVK_UI_FONT_SIZE"],
+         test="verify_ui2", gpu=None),
 ]
 
 # ============================================================
@@ -295,6 +306,14 @@ ALLOW_PREFIXES = (
     #    白名单补一行，同时"裸 env 漏网"仍然会被抓住（例如有人写了个
     #    `MYVK_SCENE` 就没前缀了）。
     "MYVK_RUNTIME_",
+    # 启动器的**测试初值**钩子（`MYVK_LAUNCHER_TEST_ROOT/NAME/RES/QUALITY/
+    # CODE_EXTERNAL`）：四步向导仍然要一步不少地真点，它们只填初值。
+    # 与 `MYVK_EDITOR_` 同一条理由 —— 被测对象是启动器窗口，不是这些变量。
+    "MYVK_LAUNCHER_TEST_",
+    # 脚本引擎的诊断/配额（`MYVK_VKS_TRACE` 追踪、`MYVK_VKS_QUOTA` 指令数
+    # 上限）。用户面对的是 Scripts 面板（S5）与控制台 `script.*` 命令，
+    # 这两条是"排查脚本死循环"时的 CI 钩子。
+    "MYVK_VKS_",
 )
 ALLOW_EXACT = {
     # ① 测试 / CI 基础
@@ -308,6 +327,14 @@ ALLOW_EXACT = {
     #    （编辑器 Play 与 Game.exe 跑同一段固定步长序列，位置才能逐位比较，
     #    见 tools/verify_runtime_determinism.py）。纯测试钩子，同 `MYVK_FRAMES`。
     "MYVK_FIXED_DT",
+    # `MYVK_UI_ASSET_DIR`：ui2 资产目录覆盖（开发期用）。正式包走 exeDir，
+    # 这条只是"从别处跑二进制也能找到图集"的兜底 —— 纯测试/开发钩子。
+    "MYVK_UI_ASSET_DIR",
+    # `MYVK_LANG=zh|en`：运行时界面语言的**测试覆盖**（U7 验收条款点名的名字）。
+    # 正规入口是 `--language` / game.json 的 `language`（RuntimeConfig 已解析），
+    # 这条只是"不改配置文件也能 A/B 截图"的注入点 —— 与 `MYVK_FRAMES` 同类，
+    # 所以刻意**不**改成 `MYVK_RUNTIME_*`（改了路线图的验收命令就跑不通）。
+    "MYVK_LANG",
     # `MYVK_STARTUP_DELAY=1` 强制保留启动缓冲（正常启动本来就有 2s 缓冲，
     #  界面无开关；它只用来抵消 `MYVK_NO_WINDOW_SAVE` 顺带跳过缓冲的副作用，
     #  让 `verify_startup_show` 可测且不写 imgui.ini）→ 纯测试钩子，同 `MYVK_FRAMES`。
@@ -334,9 +361,33 @@ ALLOW_EXACT = {
     #      （editor/main.cpp 在 app.run() 前就 return），与 `MYVK_PHYS_TEST`
     #      同类：CI 专用，界面上不存在也不该存在。
     "MYVK_RENDER_SETTINGS", "MYVK_RENDER_PREFS", "MYVK_RENDER_SETTINGS_TEST",
+    # ① 骨骼动画自检（角色链 A0-3/A0-5，2026-10-18）：
+    #    `MYVK_ANIM_TEST` 是**无窗口无 Vulkan** 的自检入口（editor/main.cpp
+    #    在 app.run() 前就 return），与 `MYVK_PHYS_TEST` 同类：CI 专用，
+    #    界面上不存在也不该存在。用户面对的动画开关在
+    #    Inspector ▸ Animation（clip / 时间轴 / Loop / Playing），有 UI。
+    "MYVK_ANIM_TEST",
+    # ① 游戏 UI 自检（U0，2026-10-18）：`MYVK_UI2_TEST` 是无窗口无 Vulkan
+    #    的自检入口（editor/main.cpp 在 app.run() 前就 return），与
+    #    `MYVK_ANIM_TEST` / `MYVK_PHYS_TEST` 同类：CI 专用，界面上不存在
+    #    也不该存在。用户面对的 UI 开关是 Engine/Inspector ▸ UI 的
+    #    `ui.enabled` / `ui.hudInEditor`（有 UI 面）。
+    "MYVK_UI2_TEST",
     # ② 路径 / 构建期
     "MYVK_ASSET_DIR", "MYVK_CONTENT_DIR", "MYVK_SHADER_DIR",
     "MYVK_CHARACTER_MODEL",
+    # ③ 启动器（2026-10-19）：
+    #    · `MYVK_LAUNCHER_PAGE` —— 自动化从哪一页开始（向导第几步 / 主界面）。
+    #      纯测试钩子：正常使用总是从 Idle 页开始。
+    #    · `MYVK_LAUNCHER_RECENT` —— 最近列表文件的**路径覆盖**（同
+    #      `MYVK_RENDER_SETTINGS`）：用户改不了"最近工程存哪"，那是
+    #      `%LOCALAPPDATA%/Venn/launcher/recent.json`，不需要界面开关。
+    #    · `MYVK_TEMPLATE_DIR` —— 模板目录覆盖（开发期从别处跑二进制）。
+    "MYVK_LAUNCHER_PAGE", "MYVK_LAUNCHER_RECENT", "MYVK_TEMPLATE_DIR",
+    # ③ 无窗口自检入口（与 `MYVK_PHYS_TEST` / `MYVK_ANIM_TEST` 同类）：
+    #    `MYVK_PROJECT_TEST` = 工程层 112 条；`MYVK_QUALITY_TEST` = E26 的
+    #    15 条档位表断言。都在 app.run() 之前 return，界面上不存在。
+    "MYVK_PROJECT_TEST", "MYVK_QUALITY_TEST",
 }
 # ③ 诊断 dump（`*_DBG`）。`*_DUMP` 同义：只打日志、不改行为，
 #    与 `MYVK_PHYS_DUMP=<N>`（每 N 帧一行 `PHYS-BODY`）是同一类。

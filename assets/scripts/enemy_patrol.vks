@@ -1,0 +1,40 @@
+# enemy_patrol.vks —— 巡逻兵：沿 X 来回走，玩家靠太近就扣血。
+#
+# ⚠ 为什么是「距离判定」而不是 `on collide`（这是个刻意的设计，不是偷懒）：
+#   ① 编辑器的 Play 态**没有** ContactTracker —— 那套差分只在运行时的
+#      `RuntimeApp::pumpContactEvents` 里（S3 台账第 4 条）。用 `on collide`
+#      写玩法，同一份脚本在编辑器里就一动不动，"在编辑器里玩"这条验收直接没了。
+#   ② 玩家的角色代理是**运动学**体，而 `PhysicsWorld::collectContacts` 会把
+#      "两边都不会动"的接触对整对跳过 —— 运动学 vs 运动学撞不出事件。
+#   距离判定在 Game.exe 与编辑器里**行为逐位相同**，正是路线图 §8 要的
+#   "不改一行 C++ 就能做玩法"。
+#
+# 台账：`hp` 是**实例变量**（不存盘），`PATROL-HIT` 那行是 G2/G5 的判据。
+
+let hp = 100
+let dir = 1
+let home = vec3(0, 0, 0)
+let cool = 0
+
+on start {
+    # 记下出生点（跨帧状态，S0 之前做不到 —— 那时变量每帧归零）
+    home = pos(self())
+}
+
+on update {
+    p = pos(self())
+    if (p.x > home.x + 6.0) { dir = -1 }
+    if (p.x < home.x - 6.0) { dir = 1 }
+    setPos(self(), vec3(p.x + dir * 2.5 * dt, p.y, p.z))
+
+    if (cool > 0.0) { cool = cool - dt }
+    if (cool <= 0.0 && hp > 0 && dist(pos(self()), pos(player())) < 1.6) {
+        hp = hp - 10
+        cool = 0.5
+        damage(10)
+        popup(10)
+        # 给 Inspector / Instances 面板看（黑板可读）
+        setAttr(self(), "hp", hp)
+        print("PATROL-HIT", name(self()), hp)
+    }
+}

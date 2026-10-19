@@ -87,6 +87,9 @@ layout(location = 1) out vec4 vColor;
 // 该顶点的**视图空间深度**（正数，米）。片元用它和场景深度比较做软粒子；
 // 这个 pass 没有深度附件，所以 gl_FragCoord.z 是没有意义的。
 layout(location = 2) out float vViewZ;
+// 该粒子的贴图形状（ParticleSprite）。flat：整个四边形用同一个值，
+// 不做插值 —— 它是个枚举，插出来 0.37 这种数字毫无意义。
+layout(location = 3) out flat int vSprite;
 
 void main() {
     const uint inst = gl_InstanceIndex;
@@ -102,6 +105,7 @@ void main() {
         vUv = vec2(0.0);
         vColor = vec4(0.0);
         vViewZ = 1.0;
+        vSprite = 0;
         return;
     }
 
@@ -186,4 +190,6 @@ void main() {
     vColor = p.color;
     // RH 视图空间里相机看 -Z → 正深度 = -z
     vViewZ = -viewPos.z;
+    // 贴图形状来自发射器表（见 Renderer.cpp 里 g.dist.w 的填充）
+    vSprite = int(em.dist.w + 0.5);
 }

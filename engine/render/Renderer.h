@@ -97,6 +97,9 @@
 #include "render/DecalBuffer.h"
 
 #include "ui/ImGuiManager.h"
+// 游戏 UI 通道（U2）。用前向声明 + 头文件里的 unique_ptr 也行，但 Renderer
+// 的析构在 .cpp 里，这里直接用完整类型更省事（它只有 100 行）。
+#include "ui2/UiRenderer.h"
 #include "assets/Texture.h"
 #include "assets/Material.h"
 #include "assets/Lod.h"
@@ -193,6 +196,8 @@ struct ProbeFaceView {
     float farZ = 200.0f;
 };
 
+class TerrainPass;  // render/TerrainPass.h（W4-2）：地形独立管线
+
 class Renderer {
 public:
     explicit Renderer(core::Window& window);
@@ -206,6 +211,12 @@ public:
 
     // 资源上下文（供 AssetManager 创建 GPU 资源）
     assets::TextureContext textureContext();
+
+    // ---- 地形（W4-2）----
+    // 已经建好 GPU 资源的地形实例数 / 上一帧提交的地形三角形数。
+    // 验证脚本靠这两个数与日志里的 TERRAIN-LOD 判断"地形真的画了"。
+    uint32_t terrainCount() const;
+    uint64_t terrainTriangles() const { return m_terrainTriangles; }
 
     rhi::Device& device() { return *m_device; }
     ui::ImGuiManager& ui() { return *m_imgui; }
@@ -648,6 +659,14 @@ public:
     }
     // 3D 场景的渲染分辨率（视口模式 = 视口尺寸；否则 = 交换链尺寸）
     VkExtent2D renderExtent() const;
+
+    // **游戏 UI** 的输出分辨率（PostProcess 的 outputExtent）。
+    //
+    // 与 renderExtent() 的区别是刻意保留的：UI 不跟 DRS / 视口尺寸缩放
+    // （0.7x 渲染时血条不该变小）。宿主做命中测试时必须用**这一个** ——
+    // 它和 PostProcess 里真正画 UI 时拿到的尺寸同源，用别的值算出来的
+    // 命中框会整体偏一段比例，而且偏得不多，最难看出来。
+    VkExtent2D uiOutputExtent() const;
     // ImGui::Image() 用的纹理句柄（实体是 VkDescriptorSet 的整型化形式）
     uint64_t viewportTextureId() const;
 
@@ -760,6 +779,10 @@ private:
     void bindFeatureParams();
     // PostSettings 要等 createMainTarget() 里 m_post 建好才能绑，单独一个。
     void bindPostFeatureParams();
+
+    // 游戏 UI 通道（U2）：懒建。init() 里建一次；运行中 `set ui.enabled 1`
+    // 之后由 drawFrame 的同一段逻辑补建（建不出来只是降级，不影响 3D）。
+    void ensureUiRenderer();
 
     void createFrameResources();
     void createDescriptorLayouts();
@@ -891,10 +914,14 @@ private:
     // 单个网格的绘制（含 doubleSided 管线切换的调用方负责）。
     // instanceCount/firstInstance 走 instancing 合批：VS 从实例 SSBO 读
     // model，push 里的 model 字段闲置（仍照推，保持 push 布局恒定）。
+    // jointBase：本网格在骨骼 SSBO 里的关节矩阵起始下标。
+    //   -1 = 静态网格（着色器按顶点权重和 == 0 走原路径）。
+    //   以前是从 `m_skinJointBase` 按 `const Mesh*` 查出来的 —— 同一 FBX
+    //   多实例会互相覆盖，现在由调用方从 `DrawItem::jointBase` 直接传。
     void drawMesh(VkCommandBuffer cmd, VkPipelineLayout layout,
                   const glm::mat4& model, const assets::Material& mat,
                   const assets::Mesh& mesh, uint32_t instanceCount = 1,
-                  uint32_t firstInstance = 0);
+                  uint32_t firstInstance = 0, int jointBase = -1);
     // set 1..6（albedo / normal / orm / roughness / metallic / emissive）的
     // 绑定，缺省时用中性贴图。drawMesh 与 MDI 路径共用 —— 两处的贴图
     // 顺序/缺省规则必须完全一致，否则同一材质会在两条路径下长得不一样。
@@ -946,6 +973,16 @@ private:
         // 所以 Mask 项**跳过预通道**，靠前向自己写深度（代价是丢掉这一批的
         // early-Z，可接受；等做"带材质采样的 depth prepass 变体"再补回来）。
         bool skipDepthPrepass = false;
+        // 本项在骨骼 SSBO 里的关节矩阵起始下标。-1 = 静态网格。
+        //
+        // ⚠ 这是**逐绘制项**的，不是"按 Mesh* 查表"得到的。以前渲染层维护
+        //   `unordered_map<const assets::Mesh*, int> m_skinJointBase`：同一个
+        //   FBX 实例化两次时 `AssetManager` 返回同一个 `Model*`、同一批
+        //   `Mesh*`，第二个实体就会覆盖第一个的条目 → 多个角色共享同一个
+        //   jointBase、全部显示同一个姿势。权威现在在
+        //   `SkinnedMeshComponent::jointBase`（每个实体一份），建表时沿
+        //   父链取一次填到这里。
+        int32_t jointBase = -1;
     };
 
     // 构建本帧绘制列表。isMain 为 true 时累积 RenderStats（预览场景是
@@ -1007,6 +1044,17 @@ private:
     std::unique_ptr<rhi::Swapchain> m_swapchain;
     std::unique_ptr<rhi::CommandPool> m_commandPool;
 
+    // ---- 地形（W4-2）----
+    // 独立管线 + 自己的一套 set（见 render/TerrainPass.h 的文件头）。
+    // 每帧在前向 Pass 内、不透明几何之后录制。
+    std::unique_ptr<TerrainPass> m_terrain;
+    // 本帧有地形组件的实体（按遍历顺序），实例与它一一对应。
+    // 集合变化时整批重建（地形是"关卡级"资源，不是每帧变动的东西）。
+    std::vector<std::uint32_t> m_terrainEntities;
+    uint64_t m_terrainTriangles = 0;
+    // 这些私有方法在 private 区，公开的 terrainCount 要用它们的结果
+    void syncTerrains(scene::Scene& scene);
+
     // ---- 前向渲染管线：按关键字掩码的**变体族**（都绑在 HdrTarget 的 render pass 上）----
     // 这里原来是 4 条手写成员（不透明 / 双面 / 透明 / 透明双面）＋ 三处
     // if 阶梯，再加一个材质特性就要变成 8 条。现在交给掩码自动派生：
@@ -1058,6 +1106,10 @@ private:
     render::RenderTarget* m_extraTarget = nullptr;
     render::HdrTarget* m_hdrTarget = nullptr;
     render::PostProcess* m_post = nullptr;
+    // ---- 游戏 UI / HUD 通道（U2，见 docs/ui_hud_roadmap.md）----
+    // 只在 `ui.enabled` 为真时建（默认真）。它是**独立管线 + 独立描述符集**，
+    // 全局那 8 个 set 一个都不碰 —— 见 ui2/UiRenderer.h 顶部那段说明。
+    std::unique_ptr<ui2::UiRenderer> m_uiRenderer;
     std::unique_ptr<render::ClusteredLighting> m_lighting;
     std::unique_ptr<render::Environment> m_environment;
     // ---- R5-1 反射探针（见 render/ReflectionProbe.h）----
@@ -1415,6 +1467,10 @@ private:
         const assets::Mesh* mesh = nullptr;
         const assets::Material* material = nullptr;  // 可空（只进深度预通道）
         KeywordMask keywords = kKeywordNone;
+        // 批内所有项的 jointBase（聚合键的一部分 → 批内必然一致）。
+        // -1 = 静态网格。批内只能推一次 push.skin.x，所以它必须进聚合键：
+        // 同一 FBX 的两个敌人用同一个 mesh、但 jointBase 不同。
+        int32_t jointBase = -1;
         uint32_t firstInstance = 0;  // 全局 SSBO 槽基址
         uint32_t count = 0;          // 实例数
     };
@@ -1436,10 +1492,9 @@ private:
     std::unordered_map<uint32_t, uint8_t> m_lodSelected;
     uint32_t m_lodSwitchTotal = 0;
 
-    // 蒙皮：mesh 指针 → 骨骼 SSBO 里的 jointBase（updateSkinning 每帧填）。
-    // drawMesh 用它把 push.skin.x 设为该 mesh 的关节矩阵起始下标。
-    std::unordered_map<const assets::Mesh*, int> m_skinJointBase;
-    // 当前帧已写入骨骼 SSBO 的关节矩阵总数（主场景 + 预览场景累加）。
+    // 蒙皮：jointBase 已改为**逐绘制项**（见 DrawItem::jointBase）与
+    // 逐组件（`SkinnedMeshComponent::jointBase`）。这里只剩"本帧已写入
+    // 骨骼 SSBO 的关节矩阵总数"（主场景 + 预览场景累加），用于算下标。
     uint32_t m_skinJointOffset = 0;
 
     VkSampleCountFlagBits m_sampleCount = VK_SAMPLE_COUNT_4_BIT;

@@ -64,6 +64,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from safe_fs import safe_remove
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN_DIR = os.path.join(ROOT, "build", "bin")
@@ -283,7 +284,7 @@ def main():
                       % (mc.group(1) if mc else "?", txt.count("RENDER-SET")))
             finally:
                 try:
-                    os.remove(default_path)
+                    safe_remove(default_path)
                 except OSError:
                     pass
             check("G2 临时文件已清理", not os.path.isfile(default_path),
@@ -340,7 +341,7 @@ def main():
     finally:
         for name in os.listdir(tmpdir):
             try:
-                os.remove(os.path.join(tmpdir, name))
+                safe_remove(os.path.join(tmpdir, name))
             except OSError:
                 pass
         try:

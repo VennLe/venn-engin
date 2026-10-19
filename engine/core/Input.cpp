@@ -24,6 +24,7 @@ double g_deltaX = 0.0, g_deltaY = 0.0;
 double g_scrollDelta = 0.0;
 bool   g_uiMouse = false, g_uiKeyboard = false;
 bool   g_firstMouse = true;
+bool   g_discardDelta = false;
 } // namespace
 
 void Input::init(GLFWwindow* window) {
@@ -98,6 +99,8 @@ void Input::clear() {
     g_mouseDown.fill(false);
 }
 
+void Input::discardNextMouseDelta() { g_discardDelta = true; }
+
 // ---------------- GLFW 回调 ----------------
 
 void Input::keyCallback(GLFWwindow*, int key, int, int action, int) {
@@ -127,8 +130,13 @@ void Input::cursorPosCallback(GLFWwindow*, double xpos, double ypos) {
         g_cursorLastY = ypos;
         g_firstMouse = false;
     }
-    g_deltaX += xpos - g_cursorLastX;
-    g_deltaY += ypos - g_cursorLastY;
+    if (g_discardDelta) {
+        // 切光标模式后的第一次回调：只更新基准位置，不累积位移。
+        g_discardDelta = false;
+    } else {
+        g_deltaX += xpos - g_cursorLastX;
+        g_deltaY += ypos - g_cursorLastY;
+    }
     g_cursorLastX = xpos;
     g_cursorLastY = ypos;
     g_cursorX = xpos;

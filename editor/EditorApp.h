@@ -35,6 +35,9 @@
 // ============================================================
 
 #include "core/Application.h"
+#include "animation/AnimatorSystem.h"
+#include "audio/AudioSystem.h"
+#include "script/ScriptRuntime.h"
 
 #include "ConsolePanel.h"    // E16：m_console 成员需要完整类型（unique_ptr 析构）
 #include "NotificationCenter.h"  // E21：m_notifications（同上，unique_ptr 析构）
@@ -78,6 +81,7 @@ class SplitLayout;
 class CharacterWindow;
 class PhysicsPanel;
 class ParticlesPanel;
+class QualitySettingsPanel;   // E26
 class ParamEditCommand;
 
 // EditorApp 同时实现 EditorHost —— 菜单里那些"要动引擎"的动作
@@ -137,6 +141,10 @@ private:
     void computeLayout();
     void handleShortcuts();
 
+    // 每帧把所有"浮在分栏之上"的窗口矩形喂给分栏器（见 SplitLayout::addOccluder）。
+    // 必须排在**所有窗口都画完**之后、handleSplitters 之前调用。
+    void collectSplitOccluders();
+
     // ---------------------------------------------------------- E04 面板表
     // 表项里的 draw 入口（静态薄壳 → 转调到成员函数；表的定义见
     // EditorApp.cpp 的 buildPanelTable）
@@ -153,6 +161,8 @@ private:
     static void panelDrawCharacter(EditorApp& a);
     static void panelDrawPhysics(EditorApp& a);
     static void panelDrawParticles(EditorApp& a);
+    // E26：画质档位面板
+    static void panelDrawQuality(EditorApp& a);
 
     // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
     void drawPanels();
@@ -178,6 +188,8 @@ private:
     // **只在状态发生变化的那一帧动窗口** —— 每帧无条件同步会把 F11
     // （纯窗口全屏）立刻覆盖掉。
     void syncWindowFullscreen();
+    // G14-7/8：每帧喂音频 —— 取走试听请求、同步 Play 态声源、推进设备侧。
+    void syncEditorAudio(float dt);
     // F11：只切窗口全屏（面板照旧），编辑态也能用
     void toggleWindowFullscreen();
     // 把编辑场景立刻落盘到当前场景路径（Ctrl+S 与 Content 工具栏的
@@ -186,10 +198,11 @@ private:
     // 把编辑态场景引用到的脚本全部加载 + 编译一遍（只为在面板上暴露错误；
     // 真正执行它们的地方在下面的 runScriptsOn）
     void preloadScripts();
-    // 脚本执行内核：Run（运行态副本）与动画（编辑场景）共用
-    void runScriptsOn(scene::Scene& sc, double t, float dt,
-                      std::unordered_map<unsigned, std::string>& errors,
-                      const char* tag, uint64_t& summaryFrame);
+    // 脚本 tick 内核：Run（运行态副本）与动画（编辑场景）共用。
+    // `simTime < 0` → 实例自己累加本地时间（仿真态）；否则跟随外部时间轴
+    // （动画预览要能拖、能回放）。语义见 `ScriptRuntime.h` 的文件头。
+    void tickScripts(scene::Scene& sc, double simTime, float dt, const char* tag,
+                     uint64_t& summaryFrame);
     // 每帧在**运行态副本**上执行一遍脚本（只在 Run 态调用）
     void runRuntimeScripts(float dt);
     // 每帧驱动**运行态副本**上的玩家（只在 Run 态、脚本之后 / 碰撞之前调用）：
@@ -361,15 +374,37 @@ private:
     std::unique_ptr<SceneHierarchy> m_hierarchy;
     std::unique_ptr<InspectorPanel> m_inspector;
     std::unique_ptr<ContentBrowser> m_content;
-    std::unique_ptr<vks::ScriptEngine> m_scripts;
+    // ---- 脚本（S0）----
+    // ⚠ **只留一个 tick 内核**：Play（运行态副本）与动画预览（编辑场景）走
+    //   同一条 `ScriptRuntime::tick`，区别只在场景与时间源。S0 之前这里是
+    //   两份复制粘贴后各自演化的循环 —— 编辑器那份漏接了 HUD/音频，
+    //   于是"同一个脚本在编辑器 Play 和 Game.exe 里能力不一样"（P2）。
+    std::unique_ptr<vks::ScriptRuntime> m_scriptRuntime;
+    // 面板与 preloadScripts 要的资产列表/热重载（按路径共享的那一半）。
+    // 裸指针指向 m_scriptRuntime 内部的引擎：生命周期由 runtime 保证。
+    vks::ScriptEngine* m_scripts = nullptr;
+
+    // 编辑器里没有 runtime 的 HudModel。但 S0 的"能力一致"要求脚本调
+    // setHealth 时**不能静默不响** —— 记一份数值镜像，Scripts 面板显示它。
+    // ⚠ 这不是"编辑器也要画血条"：血条是 runtime 的 UI，编辑器只需要
+    //   能看见"脚本确实调到了 HUD"。
+    struct HudMirror {
+        float health = 100.0f;
+        int popups = 0;
+        float lastPopup = 0.0f;
+    };
+    HudMirror m_hudMirror;
     std::unique_ptr<SplitLayout> m_split;
     std::unique_ptr<CharacterWindow> m_characterWindow;
     // 2026-10-17 晚：底栏"+"托盘里的两张功能面板（Physics / Particles）
     std::unique_ptr<PhysicsPanel> m_physicsPanel;
     std::unique_ptr<ParticlesPanel> m_particlesPanel;
+    std::unique_ptr<QualitySettingsPanel> m_qualityPanel;   // E26
     std::unique_ptr<ConsolePanel> m_console;
     // E16：MYVK_EDITOR_CONSOLE_CMD 注入命令只执行一次的哨兵。
     bool m_consoleCmdDone = false;
+    bool m_panelsOpenedOnce = false;
+    bool m_scriptTabForced = false;
     // E18：命令面板开合位（Ctrl+Shift+P / Help 菜单）
     bool m_showCommandPalette = false;
 
@@ -425,11 +460,24 @@ private:
 
     // 运行态已经跑了多少帧（第一帧打一条脚本执行汇总日志，供冒烟测试确认链路）
     uint64_t m_runtimeFrames = 0;
-    // 脚本运行期错误去重：同一个实体同一条错误只打一次日志
-    std::unordered_map<unsigned, std::string> m_scriptErrors;
-    // 动画（编辑场景脚本）的帧计数与错误表 —— 与运行态分开，互不干扰
+    // 脚本实例表是否已经在"非运行态"里丢过了。
+    //
+    // 以前这里是"只要不在 Play 就每帧 reset()"，后果有两个，都很隐蔽：
+    //   ① **暂停**也会 reset → 恢复时所有脚本从头再来（`wait` 挂在哪全丢）；
+    //   ② 编辑态实例表永远是空的 → Instances 面板一帧都画不出行（S5 F1 红）。
+    // 现在改成"进非运行态丢一次，然后按**编辑场景**同步一张 Idle 表"：
+    // 面板在编辑态就有东西可看，按下 Play 才真正执行（S-D10）。
+    bool m_scriptTableDropped = false;
+    // 工程的起始场景（`venn.project.json` 的 `startScene`，资产相对路径）。
+    //
+    // 启动器 M1/D7：`MYVK_EDITOR_PROJECT` 只告诉我们"打开哪个工程"，工程里
+    // 声明了它该打开哪份文档。真正加载仍走既有的 `MYVK_EDITOR_SCENE` 钩子，
+    // 这里只是给它一个**默认值**（显式 env 优先）。
+    std::string m_projectScene;
+    // 动画（编辑场景脚本）的帧计数 —— 与运行态分开，互不干扰。
+    // ⚠ 错误去重**不在这里**了：S0 把它搬进了 `ScriptRuntime`
+    //   （一份实现，编辑器与 Game.exe 共用），这里只留帧计数打汇总日志。
     uint64_t m_animFrames = 0;
-    std::unordered_map<unsigned, std::string> m_animErrors;
     // 脚本 print() 的滚动日志
     std::vector<std::string> m_printLog;
 
@@ -468,6 +516,25 @@ private:
     void stepPhysics(float dt);
     // 丢掉物理世界（Stop / 退出 Play 时）。
     void destroyPhysicsWorld();
+
+    // ---- 骨骼动画（角色链 A0-3）----
+    // 推进 `SkinnedMeshComponent::time` 并重算关节矩阵。
+    // 在 Play 分支里排在 physics **之前**（A4 的根运动要成为物理的输入）；
+    // 非 Play 态传 dt=0 调一次 —— 只刷新姿势、不推进时间，这样拖时间轴
+    // 或改 clip 时视口立刻跟着变。
+    animation::AnimatorSystem m_animator;
+
+    // ---- 音频（G14-7/8）----
+    // 编辑器自己也要一份：Inspector 的 ▶ 试听、Content 面板双击试听、
+    // Play 态的场景音源 —— 三者都走这里。
+    //
+    // ⚠ 与运行时**不是同一个实例**（没做成单例，见 audio_roadmap §4.2）：
+    //   编辑器里"Play 的那份音频"和"编辑器自己的试听"本来就该互不影响
+    //   （试听不该被暂停菜单 duck 掉）。
+    // ⚠ 设备打不开是正常工况：进 Failed，所有 API 变空操作，按钮点了没声
+    //   不是崩溃。
+    audio::AudioSystem m_audio;
+    std::vector<audio::SourceUpdate> m_audioSrcs;
 
     // ---- E08：播放倍速（Transport 的 0.25x / 1x / 2x）----
     // 乘在 dt 上（等价于 Unity 的 Time.timeScale / UE 的 Global Time

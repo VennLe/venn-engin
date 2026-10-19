@@ -4,6 +4,11 @@
 #include "core/Logger.h"
 #include "render/FeatureRegistry.h"
 #include "render/GpuTimer.h"
+// 2026-10-19（启动器 M4）：画质预设表**下沉**到 engine/render，这里只转发。
+// 为什么：启动器要往工程的 `config/render.json` 写"这一档打开了哪些开关"，
+// 而 `launcher → engine`（不能反过来依赖 editor 应用层）。表留在两份
+// 必然漂移 —— 那会让"启动器选 High、编辑器显示 Epic"这种情况没有任何报错。
+#include "render/QualityPresets.h"
 
 #include <imgui.h>
 
@@ -15,6 +20,8 @@
 namespace editor {
 
 namespace {
+
+using render::isEnableParam;
 
 std::function<void(const char*)> g_changeHook;
 std::function<void(const char*, const void*, const void*, std::size_t)>
@@ -59,7 +66,16 @@ bool containsCI(const char* hay, const char* needle) {
 bool drawControl(const render::ParamDesc& p, const char* labelOverride) {
     void* ptr = render::paramPtr(p.id);
     if (!ptr) return false;   // 未绑定：启动自检会点名，这里静默
-    const char* label = labelOverride ? labelOverride : p.label;
+    // ⚠ 三件事挤在一行，都不是可选的：
+    //   ① TRL 而不是 TR —— 这些 label 有的带 `##fx` 之类的稳定 ID 后缀；
+    //   ② PushID(p.id) —— 中文译名可能重名（"Strength" 与 "Intensity" 都
+    //      可能译成"强度"），而 ImGui 的控件 ID 就是 label 哈希 → 重名会
+    //      撞 ID（症状：拖一个滑条另一个跟着动，或值显示串台）。用参数 id
+    //      当 ID 之后，译名怎么改都不会撞；
+    //   ③ Push/Pop 必须夹住整个 switch —— 下面 `IsItemActivated` 等
+    //      "上一个 item"的查询都发生在同一个 ID 栈层级上。
+    ImGui::PushID(p.id);
+    const char* label = TRL(labelOverride ? labelOverride : p.label);
 
     bool changed = false;
     switch (p.kind) {
@@ -123,16 +139,9 @@ bool drawControl(const render::ParamDesc& p, const char* labelOverride) {
     if (p.tooltip && p.tooltip[0] && ImGui::IsItemHovered())
         ImGui::SetTooltip(TR("%s"), p.tooltip);
     if (changed && g_changeHook) g_changeHook(p.id);
+    ImGui::PopID();       // 对应函数开头的 PushID(p.id)
     return changed;
 }
-// 这个参数是不是特性的"启用开关"（约定：id == "<featureId>.enabled"）。
-bool isEnableParam(const render::ParamDesc& p, const char* featureId) {
-    if (p.kind != render::ParamKind::Bool) return false;
-    const size_t fl = std::strlen(featureId);
-    return std::strncmp(p.id, featureId, fl) == 0 &&
-           std::strcmp(p.id + fl, ".enabled") == 0;
-}
-
 // GpuTimer 段名 → 段下标；找不到 -1。
 int gpuSectionByName(const char* name) {
     if (!name) return -1;
@@ -142,42 +151,9 @@ int gpuSectionByName(const char* name) {
     return -1;
 }
 
-// ---- 画质预设（E09 顶栏 Preset ▾）----
-// 只拨"开/关"：质量参数的档位化（半径/级联数/分辨率随档位变）是 E26
-// 的数据活。每档是"明确打开的启用参数清单"，没列到的一律关 ——
-// 这样预设是确定性的（从任何当前状态切过去结果都一样）。
-struct QualityPreset {
-    const char* name;
-    const char* const* on;
-};
-
-const char* const kPresetLow[] = {"cull.frustum", "lod.enabled", "sky.enabled",
-                                  nullptr};
-const char* const kPresetMedium[] = {"cull.frustum", "lod.enabled",
-                                     "sky.enabled", "sky.ibl",
-                                     "shadow.enabled", "ssao.enabled",
-                                     nullptr};
-const char* const kPresetHigh[] = {"cull.frustum", "lod.enabled", "sky.enabled",
-                                   "sky.ibl", "shadow.enabled", "ssao.enabled",
-                                   "taa.enabled", "hfog.enabled", "ssr.enabled",
-                                   nullptr};
-const char* const kPresetEpic[] = {
-    "cull.frustum", "lod.enabled", "sky.enabled", "sky.ibl",
-    "shadow.enabled", "lshadow.enabled", "ssao.enabled", "taa.enabled",
-    "hfog.enabled", "ssr.enabled", "ssgi.enabled", "godrays.enabled",
-    "decals.enabled", nullptr};
-// Cinematic = Epic + 相机景深（叙事镜头的标配）。
-const char* const kPresetCinematic[] = {
-    "cull.frustum", "lod.enabled", "sky.enabled", "sky.ibl",
-    "shadow.enabled", "lshadow.enabled", "ssao.enabled", "taa.enabled",
-    "hfog.enabled", "ssr.enabled", "ssgi.enabled", "godrays.enabled",
-    "decals.enabled", "dof.enabled", nullptr};
-
-const QualityPreset kPresets[] = {
-    {"Low", kPresetLow},           {"Medium", kPresetMedium},
-    {"High", kPresetHigh},         {"Epic", kPresetEpic},
-    {"Cinematic", kPresetCinematic},
-};
+// ---- 画质预设表（E09 顶栏 Preset ▾）已搬到 engine/render/QualityPresets.cpp ----
+// 2026-10-19：表下沉见那里的文件头。这里**一个字都不留** —— 两份表必然
+// 漂移，而"启动器写 High / 编辑器显示 Epic"这种漂移两边都不报错。
 
 }  // namespace
 
@@ -196,22 +172,26 @@ void emitParamChange(const char* paramId) {
 }
 
 bool drawParamControl(const render::ParamDesc& p) {
-    ImGui::PushID(p.id);
-    const bool changed = drawControl(p, nullptr);
-    ImGui::PopID();
-    return changed;
+    // ID 隔离已经由 drawControl 内部的 PushID(p.id) 办了，这里不再套一层
+    // （两层同 id 不报错，但会让以后"ID 到底哪来的"多一个假线索）。
+    return drawControl(p, nullptr);
 }
 
 bool drawFeatureBlock(const render::FeatureDesc& f, int tierLevel,
                       const char* filter, const render::GpuTimer* gt) {
     // ---- 过滤：特性名命中 → 整块可见；否则只留 label 命中的参数 ----
+    // ⚠ 中文模式下必须**同时匹配英文原文与中文译名**：用户看到的只有中文，
+    //   只匹配英文等于"这个搜索框在中文界面里搜不到东西"。
     const bool filtering = filter && filter[0];
     bool nameMatch = false;
     if (filtering) {
-        nameMatch = containsCI(f.name, filter) || containsCI(f.id, filter);
+        nameMatch = containsCI(f.name, filter) || containsCI(f.id, filter) ||
+                    containsCI(TR(f.name), filter);
         bool anyParam = false;
         for (int i = 0; i < f.paramCount; ++i)
-            if (containsCI(f.params[i].label, filter)) anyParam = true;
+            if (containsCI(f.params[i].label, filter) ||
+                containsCI(TR(f.params[i].label), filter))
+                anyParam = true;
         if (!nameMatch && !anyParam) return false;
     }
 
@@ -229,7 +209,7 @@ bool drawFeatureBlock(const render::FeatureDesc& f, int tierLevel,
     if (en) {
         drawControl(*en, f.name);
     } else {
-        ImGui::TextUnformatted(f.name);
+        ImGui::TextUnformatted(TR(f.name));
     }
     if (f.roadmap && f.roadmap[0] && ImGui::GetItemRectMax().y > 0.0f) {
         ImGui::SameLine();
@@ -259,7 +239,8 @@ bool drawFeatureBlock(const render::FeatureDesc& f, int tierLevel,
             VK_LOG_INFO("FTR-RESET %s", f.id);
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(TR("Reset all parameters of %s to defaults"), f.name);
+            ImGui::SetTooltip(TR("Reset all parameters of %s to defaults"),
+                              TR(f.name));
     }
 
     // ---- 参数区：启用开关关着 → 收起；档位与搜索过滤 ----
@@ -271,7 +252,8 @@ bool drawFeatureBlock(const render::FeatureDesc& f, int tierLevel,
             const render::ParamDesc& p = f.params[i];
             if (en && &p == en) continue;
             if (static_cast<int>(p.tier) > tierLevel) continue;
-            if (filtering && !nameMatch && !containsCI(p.label, filter))
+            if (filtering && !nameMatch && !containsCI(p.label, filter) &&
+                !containsCI(TR(p.label), filter))
                 continue;
             drawControl(p, nullptr);
         }
@@ -283,40 +265,19 @@ bool drawFeatureBlock(const render::FeatureDesc& f, int tierLevel,
 }
 
 void applyQualityPreset(int preset) {
-    if (preset < 0 || preset >= qualityPresetCount()) return;
-    const char* const* on = kPresets[preset].on;
-    int flipped = 0;
-    for (int i = 0; i < render::kFeatureCount; ++i) {
-        const render::FeatureDesc& f = render::kFeatures[i];
-        const render::ParamDesc* en = nullptr;
-        for (int j = 0; j < f.paramCount; ++j)
-            if (isEnableParam(f.params[j], f.id)) {
-                en = &f.params[j];
-                break;
-            }
-        if (!en) continue;
-        bool* v = static_cast<bool*>(render::paramPtr(en->id));
-        if (!v) continue;
-        bool want = false;
-        for (const char* const* s = on; *s; ++s)
-            if (std::strcmp(*s, en->id) == 0) want = true;
-        if (*v != want) {
-            *v = want;
-            if (g_changeHook) g_changeHook(en->id);   // 走同一套副作用钩子
-            ++flipped;
-        }
-    }
-    VK_LOG_INFO("PRESET-APPLY %s flipped=%d", kPresets[preset].name, flipped);
+    // 表与拨动逻辑都在 engine/render —— 这里只把"改了参数"的通知接上，
+    // 保证编辑器侧的 FTR-UI 日志 / 副作用钩子照旧触发。
+    render::applyPreset(preset, [](const char* id) {
+        if (g_changeHook) g_changeHook(id);
+    });
 }
 
 const char* qualityPresetName(int preset) {
-    return (preset >= 0 && preset < qualityPresetCount())
-               ? kPresets[preset].name
-               : "Custom";
+    return render::qualityPresetName(preset);
 }
 
 int qualityPresetCount() {
-    return static_cast<int>(sizeof(kPresets) / sizeof(kPresets[0]));
+    return render::qualityPresetCount();
 }
 
 }  // namespace editor

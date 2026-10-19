@@ -47,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from safe_fs import safe_remove
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_EXE = os.path.join(ROOT, "build", "bin", "Game.exe")
@@ -327,7 +328,7 @@ def main():
                   any("triggers=1 materials=1" in l for l in lines2),
                   "没有 'triggers=1 materials=1'")
             try:
-                os.remove(dst_out)
+                safe_remove(dst_out)
             except OSError:
                 pass
 
@@ -382,7 +383,7 @@ def main():
     # ================= 收尾 =================
     try:
         for f in os.listdir(tmpdir):
-            os.remove(os.path.join(tmpdir, f))
+            safe_remove(os.path.join(tmpdir, f))
         os.rmdir(tmpdir)
     except OSError:
         pass

@@ -51,6 +51,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 from verify_add_menu import kill_stale_editors                   # noqa: E402
 from verify_player import find_window                            # noqa: E402
+from safe_fs import safe_remove
 
 BIN = os.path.join(ROOT, "build", "bin")
 EXE_EDITOR = os.path.join(BIN, "Editor.exe")
@@ -191,7 +192,7 @@ def group_b_runtime_factory() -> None:
 def group_c_editor_write(path: str) -> bool:
     print("\n[C] 编辑器改绑 + 存盘（写路径）")
     if os.path.exists(path):
-        os.remove(path)
+        safe_remove(path)
     out = run(EXE_EDITOR, {
         "MYVK_EDITOR_SCENE": SCENE,
         "MYVK_EDITOR_INPUT_MAP": path,
@@ -416,7 +417,7 @@ def group_i_discipline() -> None:
     if os.path.exists(default):
         with open(default, "rb") as f:
             backup = f.read()
-        os.remove(default)
+        safe_remove(default)
     try:
         # 不给 MYVK_EDITOR_INPUT_MAP → 默认路径。自动化下既不读也不写。
         out = run(EXE_EDITOR, {

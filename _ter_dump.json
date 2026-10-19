@@ -1,0 +1,447 @@
+{
+  "camera": {
+    "distance": 52.0,
+    "fov": 55.0,
+    "pitch": 0.30000001192092896,
+    "target": [
+      0.0,
+      0.0,
+      20.100000381469727
+    ],
+    "yaw": 0.6200000047683716
+  },
+  "entities": [
+    {
+      "castShadow": false,
+      "locked": true,
+      "material": null,
+      "mesh": null,
+      "name": "Terrain",
+      "parent": -1,
+      "terrain": {
+        "heightScale": 1.0,
+        "layers": [
+          "",
+          "",
+          "",
+          ""
+        ],
+        "source": "terrain/hills/terrain.vterrain",
+        "visible": true
+      },
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "visible": true
+    },
+    {
+      "castShadow": true,
+      "material": {
+        "id": "materials/crate",
+        "kind": "vmat",
+        "name": "materials/crate",
+        "path": "materials/crate.vmat"
+      },
+      "mesh": {
+        "kind": "builtin",
+        "name": "cube",
+        "shape": "cube",
+        "size": 1.0
+      },
+      "name": "TerrainCrate_0",
+      "parent": -1,
+      "primitive": {
+        "kind": "cube",
+        "radius": 0.5,
+        "rings": 24,
+        "segments": 48,
+        "size": 1.0
+      },
+      "transform": {
+        "position": [
+          -2.0,
+          -2.0,
+          17.5841007232666
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "visible": true
+    },
+    {
+      "castShadow": true,
+      "material": {
+        "id": "materials/crate",
+        "kind": "vmat",
+        "name": "materials/crate",
+        "path": "materials/crate.vmat"
+      },
+      "mesh": {
+        "kind": "builtin",
+        "name": "cube",
+        "shape": "cube",
+        "size": 1.0
+      },
+      "name": "TerrainCrate_1",
+      "parent": -1,
+      "primitive": {
+        "kind": "cube",
+        "radius": 0.5,
+        "rings": 24,
+        "segments": 48,
+        "size": 1.0
+      },
+      "transform": {
+        "position": [
+          2.200000047683716,
+          -1.600000023841858,
+          17.572500228881836
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "visible": true
+    },
+    {
+      "castShadow": true,
+      "material": {
+        "id": "materials/crate",
+        "kind": "vmat",
+        "name": "materials/crate",
+        "path": "materials/crate.vmat"
+      },
+      "mesh": {
+        "kind": "builtin",
+        "name": "cube",
+        "shape": "cube",
+        "size": 1.0
+      },
+      "name": "TerrainCrate_2",
+      "parent": -1,
+      "primitive": {
+        "kind": "cube",
+        "radius": 0.5,
+        "rings": 24,
+        "segments": 48,
+        "size": 1.0
+      },
+      "transform": {
+        "position": [
+          -1.399999976158142,
+          2.4000000953674316,
+          17.608699798583984
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "visible": true
+    },
+    {
+      "castShadow": true,
+      "material": {
+        "id": "materials/crate",
+        "kind": "vmat",
+        "name": "materials/crate",
+        "path": "materials/crate.vmat"
+      },
+      "mesh": {
+        "kind": "builtin",
+        "name": "cube",
+        "shape": "cube",
+        "size": 1.0
+      },
+      "name": "TerrainCrate_3",
+      "parent": -1,
+      "primitive": {
+        "kind": "cube",
+        "radius": 0.5,
+        "rings": 24,
+        "segments": 48,
+        "size": 1.0
+      },
+      "transform": {
+        "position": [
+          2.5999999046325684,
+          2.799999952316284,
+          17.584699630737305
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "visible": true
+    },
+    {
+      "castShadow": true,
+      "material": {
+        "id": "materials/crate",
+        "kind": "vmat",
+        "name": "materials/crate",
+        "path": "materials/crate.vmat"
+      },
+      "mesh": {
+        "kind": "builtin",
+        "name": "cube",
+        "shape": "cube",
+        "size": 1.0
+      },
+      "name": "TerrainCrate_4",
+      "parent": -1,
+      "primitive": {
+        "kind": "cube",
+        "radius": 0.5,
+        "rings": 24,
+        "segments": 48,
+        "size": 1.0
+      },
+      "transform": {
+        "position": [
+          0.4000000059604645,
+          5.199999809265137,
+          17.616100311279297
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "visible": true
+    },
+    {
+      "castShadow": true,
+      "material": {
+        "id": "materials/crate",
+        "kind": "vmat",
+        "name": "materials/crate",
+        "path": "materials/crate.vmat"
+      },
+      "mesh": {
+        "kind": "builtin",
+        "name": "cube",
+        "shape": "cube",
+        "size": 1.0
+      },
+      "name": "TerrainCrate_5",
+      "parent": -1,
+      "primitive": {
+        "kind": "cube",
+        "radius": 0.5,
+        "rings": 24,
+        "segments": 48,
+        "size": 1.0
+      },
+      "transform": {
+        "position": [
+          -0.6000000238418579,
+          -5.400000095367432,
+          17.657100677490234
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "visible": true
+    },
+    {
+      "castShadow": true,
+      "material": {
+        "id": "materials/wall",
+        "kind": "vmat",
+        "name": "materials/wall",
+        "path": "materials/wall.vmat"
+      },
+      "mesh": {
+        "kind": "builtin",
+        "name": "cube",
+        "shape": "cube",
+        "size": 1.0
+      },
+      "name": "TerrainRock_0",
+      "parent": -1,
+      "primitive": {
+        "kind": "cube",
+        "radius": 0.5,
+        "rings": 24,
+        "segments": 48,
+        "size": 1.0
+      },
+      "transform": {
+        "position": [
+          -34.0,
+          -26.0,
+          22.592599868774414
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.600000023841858,
+          1.600000023841858,
+          2.200000047683716
+        ]
+      },
+      "visible": true
+    },
+    {
+      "castShadow": true,
+      "material": {
+        "id": "materials/wall",
+        "kind": "vmat",
+        "name": "materials/wall",
+        "path": "materials/wall.vmat"
+      },
+      "mesh": {
+        "kind": "builtin",
+        "name": "cube",
+        "shape": "cube",
+        "size": 1.0
+      },
+      "name": "TerrainRock_1",
+      "parent": -1,
+      "primitive": {
+        "kind": "cube",
+        "radius": 0.5,
+        "rings": 24,
+        "segments": 48,
+        "size": 1.0
+      },
+      "transform": {
+        "position": [
+          38.0,
+          20.0,
+          22.65130043029785
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.600000023841858,
+          1.600000023841858,
+          2.200000047683716
+        ]
+      },
+      "visible": true
+    },
+    {
+      "castShadow": true,
+      "material": {
+        "id": "materials/wall",
+        "kind": "vmat",
+        "name": "materials/wall",
+        "path": "materials/wall.vmat"
+      },
+      "mesh": {
+        "kind": "builtin",
+        "name": "cube",
+        "shape": "cube",
+        "size": 1.0
+      },
+      "name": "TerrainRock_2",
+      "parent": -1,
+      "primitive": {
+        "kind": "cube",
+        "radius": 0.5,
+        "rings": 24,
+        "segments": 48,
+        "size": 1.0
+      },
+      "transform": {
+        "position": [
+          12.0,
+          46.0,
+          24.981300354003906
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.600000023841858,
+          1.600000023841858,
+          2.200000047683716
+        ]
+      },
+      "visible": true
+    }
+  ],
+  "generator": "Venn/SceneSerializer",
+  "light": {
+    "ambientScale": 1.0,
+    "castsShadow": true,
+    "color": [
+      1.0,
+      0.9599999785423279,
+      0.8999999761581421
+    ],
+    "direction": [
+      0.44999998807907104,
+      0.699999988079071,
+      -0.6200000047683716
+    ],
+    "intensity": 3.200000047683716
+  },
+  "version": 1
+}

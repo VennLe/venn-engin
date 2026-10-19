@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "generator": "vmat_ref_probe (W2-1): two entities reference the SAME material asset materials/crate.vmat. Both must resolve to the same material (one ASSET-VMAT line, not two), and the dump must say kind:\"vmat\" with the shared id. Editing the .vmat must change both.",
+  "entities": [
+    {
+      "name": "CrateA",
+      "transform": {"position": [-2.0, 0.0, 0.5], "rotation": [0.0, 0.0, 0.0],
+                    "scale": [1.0, 1.0, 1.0]},
+      "parent": -1, "visible": true, "castShadow": true,
+      "mesh": {"kind": "builtin", "shape": "cube", "size": 1.0, "name": "cube"},
+      "primitive": {"kind": "cube", "size": 1.0},
+      "material": {"kind": "vmat", "path": "materials/crate.vmat",
+                   "name": "materials/crate", "id": "materials/crate"}
+    },
+    {
+      "name": "CrateB",
+      "transform": {"position": [2.0, 0.0, 0.5], "rotation": [0.0, 0.0, 0.0],
+                    "scale": [1.0, 1.0, 1.0]},
+      "parent": -1, "visible": true, "castShadow": true,
+      "mesh": {"kind": "builtin", "shape": "cube", "size": 1.0, "name": "cube"},
+      "primitive": {"kind": "cube", "size": 1.0},
+      "material": {"kind": "vmat", "path": "materials/crate.vmat",
+                   "name": "materials/crate", "id": "materials/crate"}
+    }
+  ]
+}

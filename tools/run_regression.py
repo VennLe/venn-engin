@@ -171,8 +171,18 @@ DEFAULT = [
     # E25 GPU 时戳时间轴：时间轴总长 == GPU-TIMING 帧总耗时（< 5%）/ 60 帧
     # 历史封顶 / 点段联动 Console 过滤 / 归入 Rendering 工作区 / 采样纯读
     "verify_gpu_timeline",
-    # ---- 物理（R7-1）：完整刚体核心 ----
-    # 不需要窗口、不需要 Vulkan：MYVK_PHYS_TEST=1 让 Editor 在 app.run() 前
+    # ---- 角色表现链 A0（2026-10-18）----
+    # 骨骼动画的无窗口数值自检：时间推进 / 循环回绕 / 采样拆分后的**逐位
+    # 不变性**（对照一份拆分前的参考实现）/ 混合端点短路 / 拓扑序。
+    # 不开 Vulkan、不开窗口，整条几百毫秒 —— 放在这里是为了让"动画算错了"
+    # 在套件前排就红，而不是等到半小时后那条 GUI 用例。
+    "verify_anim_runtime",
+    # 端到端一条因果链（六组）：导入建组件 → 面板有东西 → 存盘/读档往返
+    # → Play 态时间推进 → 像素上真的在动 → **多实例 jointBase 两两不等**。
+    # 最后一组是 A0-4 的否定测试：退回"按 Mesh* 共享 base"的旧实现时必红。
+    # ⚠ 它是 GUI 用例（约 60 秒，7 次启动），不能与其它 GUI 用例并行。
+    "verify_character_import",
+    # ---- 物理（R7-1）：完整刚体核心 ----    # 不需要窗口、不需要 Vulkan：MYVK_PHYS_TEST=1 让 Editor 在 app.run() 前
     # 直接跑物理自检。**本套件里唯一能做逐位可复现断言**的用例（跨进程比对
     # PHYS-TEST 行），也是物理唯一"机器可判定"的正确性证据 —— 一叠箱子塌掉
     # 有一百种原因，浮点逐位一致只有一种解释。
@@ -241,6 +251,131 @@ DEFAULT = [
     #   I 自动化纪律（MYVK_FRAMES 下默认路径既不读也不写）。
     # 9 次启动、每次几帧，整条约 25 秒。
     "verify_input_bindings",
+    # ---- 游戏 UI / HUD（U0~U8，2026-10-18）----
+    # 三层：① 无窗口数值自检（`MYVK_UI2_TEST=1`，毫秒级）；② `UI2-CAPS`
+    # 能力量测（把"maxBoundDescriptorSets 是同时绑定数不是总数"钉在实测值上）；
+    # ③ 像素守卫（`ui.enabled=1` 但没有 UI 数据 → 与关掉整条通道逐位相同）。
+    # ⚠ 它是 GUI 用例（2 次启动 + 1 次自检），不能与其它 GUI 用例并行。
+    "verify_ui2",
+    # ---- 中文化覆盖率（2026-10-18）----
+    # 纯静态扫描，不开窗口、不开 Vulkan、几百毫秒。八组体检：
+    #   A1/A2/A3 参数 label·tooltip·特性名、A4 Combo 选项、
+    #   B 未包 TR 的界面字面量、B2 包了 TR 但词典缺、C 词典孤儿与重复键、
+    #   D snprintf 格式串、E 控件显示格式串。
+    # ⚠ 为什么必须进回归：缺译文**不会报错、不会崩**，只会静静地少翻一处。
+    #   本项目已经栽过三次盲区（裸 snprintf 的 "tasks %d"、SliderFloat 的
+    #   "%.1f deg"、辅助函数内部的 label），全都是"肉眼不看就永远发现不了"。
+    #   放进套件前排没意义（它跟其它用例无依赖），放尾部是为了不打乱既有顺序。
+    "verify_i18n_coverage",
+    # ---- HUD / 暂停菜单 / 焦点栈（U6 + U8，2026-10-18）----
+    # 四层：A 无窗口数值自检（`--selftest hud`：血量追随/残影/伤害数字寿命/
+    # 对象池/血条几何/世界→屏幕 Y 方向/`config/ui.json` 往返）；
+    # B 上屏几何与准星否定测试（含对照区，防"两张图整体不一样"的假绿）；
+    # C 暂停菜单 + 焦点环 + **暂停时按 W 位置逐位不变**（U6 的验收条款）；
+    # D 夹具脚本 `damage(30)` → 血条 70% + 伤害数字出现后消失。
+    # ⚠ GUI 用例（2 次启动），不能与其它 GUI 用例并行。
+    "verify_hud",
+    # ---- G14 音频（G14-0~G14-9，2026-10-18）----
+    # 六组互相独立的面，缺一组就有洞：
+    #   A 无窗口自检（`Game.exe --selftest audio`，118 条断言）—— 解码 /
+    #     声部池 / 总线 / ducking / 3D 空间化 / 流式全在离线渲染里判，
+    #     **不需要声卡也不需要窗口**（§3.1 的前提，也是整条路线图能被验证
+    #     的根本原因）；
+    #   B `AUDIO-CONFIG` 那一行 —— 音频的失败模式几乎全在"配了但没生效"上；
+    #   C 设备后端四态（null / wasapi / 假名回落 / `__none__` 干净失败）；
+    #   D `saveScene`→`loadScene` 往返（只测读的话"存档丢字段"永远暴露不出来）
+    #     + 老场景对照；
+    #   E 编辑器 UI 面（`INS-AUDIO-HEADER` / `INS-AUDIO-PREVIEW` 矩形）+ 试听链
+    #     + **Play 副本里的组件真的被消费**；
+    #   F 脚本内置 `playSound` / `setBusVolume` / `stopAllSounds`。
+    # ⚠ GUI 用例（3 次启动编辑器），不能与其它 GUI 用例并行。
+    # ⚠ 它同时会给 build/bin/assets/audio 造一个 105 MB 的 10 分钟夹具
+    #   （不提交仓库，见 .gitignore）；`--skip-long` 可跳过那组对照。
+    "verify_audio",
+
+    # W0 + W1（docs/world_scale_roadmap.md）：材质身份 / 实例 / 覆盖项。
+    #   A `--selftest material`（无窗口无设备，15 条纯数据断言）；
+    #   B 场景往返：同名材质不再静默合并 / 材质 id 是 `模型#材质名` /
+    #     导入模型的覆盖能存能读 / 找不到 id 时**不能变 null** /
+    #     实例只写被覆盖的字段；
+    #   C 编辑器 UI：`INS-MAT-INSTANCE` / `INS-MAT-MAKEUNIQUE` + 真的点一下。
+    # ⚠ 它也是 GUI 用例（1 次启动编辑器），不能与其它 GUI 用例并行。
+    "verify_material_instances",
+
+    # W2-2（docs/world_scale_roadmap.md §7）：导入设置 sidecar `.vmeta`。
+    #   A 首次导入写出映射（7 条 = 模型路径#材质名）
+    #   B 源没变 → changed=0 且**不写盘**（mtime 逐位不变）
+    #   C 手改映射 → 材质 id 跟着改（这条是 W2-2 的目的）
+    #   D 源变了 → changed=1 + ASSET-MAT-REMAP-FAIL + 陈旧映射被清掉
+    #   E 改 import 参数 → forced=1
+    #   F import.scale 真的缩了模型（读 FBX 的归一化半径，不开窗口）
+    "verify_import_vmeta",
+
+    # W3（docs/world_scale_roadmap.md §8）：第一个真实关卡。
+    #   373 个实体、全部引用 8 个 `.vmat`。
+    #   A 加载 / B 往返逐字段相等 / C 性能（GPU + 增量）/ D 改母材质全变
+    #   E 关太阳后室内靠点光可见 / F 单件覆盖往返。
+    # ⚠ 它也是 GUI 用例（3 次开窗口截图），不能与其它 GUI 用例并行。
+    "verify_first_level",
+
+    # W4（docs/world_scale_roadmap.md §9）：地形。
+    #   A 组装（资产/4 层/cull=none/64 块）/ B 场景往返 / C LOD 按距离选
+    #   D 改层材质像素断言 / E 关掉地形 / E' 渲染层整条跳过 / F GPU 帧时
+    #   G `--selftest terrain` 27 条。
+    # ⚠ GUI 用例（4 次开窗口抓图），不能与其它 GUI 用例并行。
+    "verify_terrain",
+    # W4-4：地形编辑器面 —— ContentBrowser 双击 `.vterrain` + Inspector
+    #   Terrain 段。A 添加 / B 不叠第二份 / C 段内控件 / D 关可见像素
+    #   E Ctrl+S 往返 / F 重开自动恢复。
+    # ⚠ 也是 GUI 用例（真鼠标双击 + 前台 Ctrl+S）。
+    "verify_terrain_editor",
+
+    # S5（docs/script_roadmap.md §7）：脚本的**编辑器面**。
+    #   脚本从"只能翻日志"变成"面板里看得见、点得到"：
+    #   F1 Instances 页签 + 3 个实例锚点 / F2 Idle→Running（**文本 + 像素**
+    #   双证，四种状态四种颜色就是为这条存在的）/ F3 只改一个数字的热重载
+    #   保住变量（`VKS-RELOAD-KEEP`）/ F4 面板 Reset → `vars_after=0`
+    #   F5 死循环 → `Failed` 红字 → Reset 解除再熔断 / F6 控制台
+    #   `script.vars Boss` 打印 8 行键值。
+    # ⚠ GUI 用例（2 次启动编辑器），不能与其它 GUI 用例并行。
+    "verify_script_editor",
+
+    # S6（docs/script_roadmap.md §7）：**示例关卡的端到端玩法**，
+    # 也是 §8 那条总验收的机器化版本 —— 拿一个关卡、玩法全写在 `.vks` 里、
+    # 一行 C++ 都不改就能玩。
+    #   G1 三个巡逻兵在动（像素 + 天空对照区）/ G2 撞人扣血（HUD-STATS）
+    #   G3 门按**时刻**开合（Δt=2.0000s）/ G4 5 个拾取物 → worldAttr=5
+    #   G5 存盘往返（世界黑板保住、逐实体实例变量清零）
+    #   G6 改一个数字热重载（不重启、位置连续）/ G7 scriptbench 帧时间预算
+    # ⚠ 五次启动 Game.exe（含一次 12 秒长跑），不能与其它 GUI 用例并行。
+    "verify_script",
+
+    # ---- 引擎启动器（docs/launcher_roadmap.md，2026-10-19）----
+    # 六个用例各管一层，缺一层就有一整类"静默坏掉"没人看：
+    #   project  M0：工程能被**手动**打开（cwd=工程根 / 布局落在工程里）
+    #   ui       M1：启动器窗口的排版（header / 两栏 / 最近列表 / 底栏）
+    #   create   M2：四步向导 → 真建一个工程（16 条断言 + 截图复核）
+    #   open     M3：拉起编辑器（`CreateProcessW` + 自建 env 块 + 启动器自退）
+    #   display  M4：分辨率 / 画质预设真的落到 `render.json`（像素双证）
+    #   code     M5：外置代码根 = **目录联接**（改外部文件 → 工程里跟着变）
+    # ⚠ 除 `project` 全是 GUI 用例（各开 1~2 次窗口），**不能并行**。
+    # ⚠ `project` 是唯一一个"必须让编辑器真的写布局存档"的用例 ——
+    #   任何自动化帧控（`MYVK_FRAMES`）都会让它永远假绿，它自己刻意不设。
+    "verify_launcher_project",
+    "verify_launcher_ui",
+    "verify_launcher_create",
+    "verify_launcher_open",
+    "verify_launcher_display",
+    "verify_launcher_code",
+
+    # E26（docs/editor_roadmap.md §6）：画质档位。
+    #   19 条断言：A 组 `--selftest quality` 15 条纯数据；B 组真点
+    #   Low/Epic → `QUALITY-SNAPSHOT` 断言 ssao/ssr/taa/cascades 的具体值、
+    #   应用后自检 mismatches=0、落盘 25 个键；C 组重开工程读回同一档。
+    #   **验收原文**："切到 Low 后断言 SSR 生效值为 0；切回 Cinematic 为 1"
+    #   —— 这里用 Low↔Epic 达到同一条判据（Cinematic 只多一个 dof）。
+    # ⚠ GUI 用例（2 次启动编辑器），不能与其它 GUI 用例并行。
+    "verify_quality_presets",
 ]
 
 # 结果行：兼容四种写法。取**最后一条**，因为有的脚本会先打一堆中间断言。
@@ -263,6 +398,14 @@ WATCH_ROOTS = [
     # 于是"只改了 runtime/ 一个字节"在影响分析里**完全不可见** —— 这是
     # 新增运行时那一轮必须补上的一个洞（不补就等于 runtime 没有回归）。
     "runtime",
+    # 启动器（2026-10-19）：第三个应用层目标 VennLauncher → Launcher.exe。
+    # ⚠ 和 runtime 一样的道理 —— 不进快照就等于"启动器没有回归"，
+    #   改坏了 `LauncherApp.cpp` 也不会有人被叫醒。
+    "launcher",
+    # 工程模板（`templates/<type>/`）：启动器建工程时**原样拷走**它就是
+    # 产品本身（第一人称/第三人称的初值差异全在这里）。它不是运行时数据
+    # ——只有 `tools/gen_templates.py` 会写它，所以可以进快照。
+    "templates",
     "assets/shaders",
     "assets/models",
     "assets/textures",
@@ -352,6 +495,10 @@ RENDER_MODULES = [
     "engine/render/MdiDraw.*",
     "engine/render/OffscreenImage.h",
     "engine/render/PostProcess.*",
+    # 画质预设表（2026-10-19，从 `editor/FeatureUIGen.cpp` 下沉到引擎层）：
+    # 它决定的 22 个 `*.enabled` 会改变**走哪些 pass** → 场景里有没有泄漏、
+    # 帧时间预算对不对都跟着它变，所以照 RENDER_MODULES 的规矩进泄漏门。
+    "engine/render/QualityPresets.*",
     "engine/render/ReflectionProbe.*",
     "engine/render/RenderSettingsIO.*",
     "engine/render/RenderTarget.*",
@@ -360,6 +507,7 @@ RENDER_MODULES = [
     "engine/render/ShaderHotReload.*",
     "engine/render/ShadowCull.h",
     "engine/render/ShadowPass.*",
+    "engine/render/TerrainPass.*",
     "engine/render/VolumetricFog.*",
 ]
 
@@ -476,7 +624,16 @@ TRIGGERS = {
                               "assets/shaders/particle_common.glsl",
                               "assets/shaders/particle.vert",
                               "assets/shaders/particle.frag",
-                              "editor/InspectorPanel.*"],
+                              "editor/InspectorPanel.*",
+                              # 2026-10-18：H 组（逐发射器编辑 / 标题栏 ×）长在
+                              # ParticlesPanel 上；I 组（层级右键 → 打开粒子
+                              # 面板）的入口在 SceneHierarchy。这两个文件原来
+                              # 只被 verify_viewport_bar / verify_hierarchy_status
+                              # 登记 —— 改它们时本用例会**静默跳过**，H/I 两组
+                              # 断言就白写了。（判断"横切"只看 GLOBAL_GLOBS，
+                              # 这里两个都不是，所以可以登记。）
+                              "editor/ParticlesPanel.*",
+                              "editor/SceneHierarchy.*"],
     # ---- 编辑器 / UI ----
     # 主题表 / applyTheme 本体在 engine/ui/ImGuiTheme.*（新文件）——
     # ⚠ 但 `engine/ui/**` 是 GLOBAL_GLOBS，所以这条**不能只写它**，否则会被
@@ -487,7 +644,10 @@ TRIGGERS = {
     #     · Toolbar.*          —— 顶栏/传输条底色改走 ui::tokens().barBg
     #     · ViewportPanel.*    —— 视口叠加片在浅色主题下强制浅字
     #   （EditorApp.cpp 同理未登记 → 改它全量，保守正确。）
-    "verify_theme_language": ["editor/Localization.*",
+    # ⚠ U7 起词典本体在 `engine/i18n/**`：改那里同样会改编辑器的中/英显示，
+    #   只登记 `editor/Localization.*`（已退化成 101 行转发壳）会漏掉这类改动。
+    "verify_theme_language": ["engine/i18n/**",
+                              "editor/Localization.*",
                               "editor/EditorLayoutIO.*",
                               "editor/Toolbar.*",
                               "editor/ViewportPanel.*"],
@@ -521,8 +681,71 @@ TRIGGERS = {
                               "editor/PanelRegistry.*", "editor/Workspace.*"],
     "verify_mesh_params":    ["editor/InspectorPanel.*"],
     "verify_character_window": ["editor/CharacterWindow.*", "assets/models/**"],
-    "verify_material_roundtrip": ["engine/scene/SceneSerializer.*"],
-    # 材质槽小方块：控件与"三列布局"都在 InspectorPanel.*；而**槽位拿到的可用宽度
+    # 角色表现链 A0（2026-10-18）。这些文件**都不在** `GLOBAL_GLOBS` ——
+    # `engine/animation/**`（新目录：Pose / AnimatorSystem / 自检）和
+    # `engine/scene/ModelInstance.*`（新文件）如果没人登记，就是"未登记 →
+    # 全量"：能跑，但等于这两个模块没有增量回归（改一行全量跑两小时）。
+    # `engine/ecs/**`、`engine/assets/**`、`engine/render/Renderer.*` 是横切，
+    # 按铁律**不写**；`editor/EditorApp.cpp`（命令注册 / Play 挂载点 /
+    # IMPORT 钩子）沿用项目惯例不登记（同文件里还有几十处别的接线）。
+    "verify_anim_runtime":   ["engine/animation/**"],
+    "verify_character_import": ["engine/animation/**",
+                                "engine/scene/ModelInstance.*",
+                                # SCENE-SKINNED / SCENE-ANIMATOR 四条锚点（存 + 读）
+                                "engine/scene/SceneSerializer.*",
+                                # MODEL-INSTANCE / 唯一化名字 / IMPORT 落点
+                                "editor/EditorScene.*",
+                                "editor/CharacterWindow.*",
+                                # INS-ANIM-* 矩形 + Add Animator（A1）
+                                "editor/InspectorPanel.*",
+                                # anim.time / anim.clip 控制台命令（A1 起写 anim 那一份）
+                                "editor/EditorApp.*",
+                                # 逐 item jointBase 透传（阴影两条路径）
+                                "engine/render/ShadowPass.*",
+                                "engine/render/LocalShadowPass.*"],
+    # 游戏 UI / HUD（U0 起，docs/ui_hud_roadmap.md）。
+    # ⚠ `engine/ui2/**` **故意不进** `GLOBAL_GLOBS`：它只被 UI 通道引用，
+    #   不像 `Renderer.*` / `engine/ecs/**` 那样横切。放进去会让全量永远
+    #   点名，增量回归就失去意义了（这是路线图 §8.3 的明确决定）。
+    "verify_ui2":            ["engine/ui2/**",
+                              # UI 的插入点 / 两个输出 pass 的 hook
+                              "engine/render/PostProcess.*",
+                              # 着色器（UI 顶点/片元，sRGB 反编码在这里）
+                              "assets/shaders/ui2.*",
+                              # 词典搬家（U7）：单一权威在 engine/i18n
+                              "engine/i18n/**",
+                              # 离线生成的 SDF 图集（变了 → 所有文本断言重跑）
+                              "assets/ui/**",
+                              # 面板上的 UI 分区（ui.* 参数的控件长在这里）
+                              "editor/InspectorPanel.*"],
+    # HUD / 暂停菜单 / 焦点栈（U6+U8，docs/ui_hud_roadmap.md）。
+    # ⚠ 这里**只列非横切文件**：`engine/core/**`（Input / InputMap / Window）
+    #   与 `engine/render/**` 的几张契约表都在 `GLOBAL_GLOBS` 里，一改就全量，
+    #   写进 TRIGGERS 会在 `--narrow` 下假跳过。
+    # ⚠ `assets/scenes/**` 不进快照（那是运行时会写的目录），所以夹具场景
+    #   改动**不会**自动点名本用例 —— 改夹具时手动 `run_regression.py hud`。
+    "verify_hud":            ["runtime/ui/**",              # HUD / 菜单 / config
+                              "runtime/RuntimeApp.*",       # tickUi / 暂停迁移
+                              "runtime/GameState.*",        # Paused 的 resume/quit
+                              "runtime/main.cpp",           # --selftest hud 注册
+                              "engine/ui2/UiFocus.*",       # 焦点栈本体
+                              "engine/ui2/UiCanvas.*",      # 游戏 UI 的注入点
+                              "engine/script/ScriptEngine.*",  # 脚本 damage/popup
+                              "engine/render/PostProcess.*",   # uiOutputExtent 同源
+                              "assets/shaders/ui2.*"],         # 同样是像素依赖
+    # 中文化覆盖率：**取值域是整个 editor/**。
+    # 判据是"屏幕上还有没有英文"，而任何一处新加的 UI 字面量都可能破坏它 ——
+    # 没法收敛到几个文件。所以这里用 `editor/**` 而不是列举。
+    # ⚠ 它是静态扫描（几百毫秒），全量触发也不心疼；`editor/**` 不在
+    #   `GLOBAL_GLOBS` 里（那是横切渲染链的定义），所以这里不算"登记横切文件"。
+    "verify_i18n_coverage":   ["editor/**",
+                              # 词典本体：改词条自己也要重跑
+                              # ⚠ 别把 engine/render/FeatureRegistry.* 写进来 ——
+                              #   它在 GLOBAL_GLOBS 里，一改就全量重跑，列在这里
+                              #   只会被 check_regression_map 判成"冗余横切"
+                              #   （而且 --narrow 下会造成假跳过）。
+                              "tools/verify_i18n_coverage.py"],
+    "verify_material_roundtrip": ["engine/scene/SceneSerializer.*"],    # 材质槽小方块：控件与"三列布局"都在 InspectorPanel.*；而**槽位拿到的可用宽度
     # 由 SplitLayout 给的面板宽度决定** —— 2026-10-16 的"文件名被裁成 .png"正是
     # "图标条 48px + 值列写死 88 + 槽位列 88"把槽位挤到 48px 造成的，所以布局那个
     # 文件必须登记（改 `kRightMin` / 拖分栏都会改到它）。
@@ -684,6 +907,167 @@ TRIGGERS = {
                               "editor/KeyBindingsPage.*",
                               "editor/EditorApp.cpp",
                               "editor/EditorApp.h"],
+    # ---- G14 音频（G14-0~G14-9，2026-10-18）----
+    # `engine/audio/**` 是**整块新子系统**（不在 GLOBAL_GLOBS 里，也没有别的
+    # 用例碰它）→ 整目录登记是安全的，而且改任何一个音频文件都该重跑。
+    # 其余是各层的接线点，多数**已经是多 owner**（改一次多处重跑是对的）：
+    #   runtime/RuntimeConfig.*      —— audio 块 / `MYVK_RUNTIME_AUDIO_*` 解析
+    #   runtime/RuntimeApp.*         —— syncAudio / 暂停时 SFX 静音
+    #   runtime/main.cpp             —— `--selftest audio` / `audio-config` 注册
+    #   engine/scene/SceneSerializer.* —— audio / audioListener 块的读写
+    #   engine/script/ScriptEngine.* —— playSound / stopAllSounds / setBusVolume
+    #   editor/InspectorPanel.*      —— Tool 页签的 Audio Source 段
+    #   editor/EditorApp.*           —— 编辑器音频门面 + `audio.*` 控制台命令
+    #   editor/EditorContext.*       —— requestAudioPreview / takeAudioPreview
+    #   editor/ContentBrowser.*      —— 双击试听四态
+    #   assets/game.json             —— B2 组读它的 music=0.70（出厂配置）
+    # ⚠ 刻意**不**登记 `engine/ecs/Components.h`：`engine/ecs/**` 在
+    #   GLOBAL_GLOBS 里，写进来会在 `--narrow` 下变成假跳过。
+    # ⚠ `assets/scenes/runtime_test/audio_scene.json` + `audio_play.vks` 也
+    #   不登记（`assets/scenes/**` 不进快照），改夹具请手动点名本用例。
+    "verify_audio": ["engine/audio/**",
+                     "runtime/RuntimeConfig.*",
+                     "runtime/RuntimeApp.*",
+                     "runtime/main.cpp",
+                     "engine/scene/SceneSerializer.*",
+                     "engine/script/ScriptEngine.*",
+                     "editor/InspectorPanel.*",
+                     "editor/EditorApp.*",
+                     "editor/EditorContext.*",
+                     "editor/ContentBrowser.*",
+                     "assets/game.json"],
+
+    # ⚠⚠ `engine/assets/**` **在 GLOBAL_GLOBS 里** —— 材质相关的改动本来就
+    #   会点名全量，所以这里**不要**写 Material.h / AssetManager.h（写了在
+    #   `--narrow` 下会假跳过）。真正能落在这里的只有下面这几个"不会被
+    #   横切清单覆盖、但确实决定本用例成败"的文件。
+    "verify_material_instances": ["engine/scene/SceneSerializer.*",
+                                  "editor/InspectorPanel.*",
+                                  "runtime/main.cpp",
+                                  # 夹具本身就是判据（两个 Box 同名不同参数）
+                                  "assets/scenes/runtime_test/mat_conflict_probe.json",
+                                  "assets/scenes/runtime_test/mat_model_probe.json"],
+    # W2-2：sidecar 的判据全在**模型源文件**上（hash / 材质名 / 单位），
+    # 换一个模型就得重跑；`.vmeta` 本身是运行时产物（build/bin 下），不进快照。
+    # LOD（W2-3 顺带登记）：判据全在**蒙皮模型**上（第 8 组用它验"蒙皮也能
+    # 减面"），换模型就得重跑。`engine/assets/Lod.cpp` 是横切，不写进来。
+    "verify_lod": ["assets/models/anime_girl.glb"],
+    # W3：关卡的判据一半在生成器上（布局改了期望就得跟着改），一半在
+    # 母材质上（改 .vmat 会直接改画面）。场景文件本身不进 WATCH_ROOTS
+    # （编辑器会写它），所以这里显式点名。
+    "verify_first_level": ["tools/gen_first_level.py",
+                           "assets/scenes/levels/first_level.json",
+                           "assets/materials/*.vmat",
+                           "assets/scenes/sandbox.json"],
+    "verify_import_vmeta": ["assets/models/anime_girl.glb",
+                            "assets/models/anime_girl.fbx",
+                            "assets/scenes/runtime_test/mat_model_probe.json"],
+
+    # W4：地形。判据同时落在资产（生成器）、着色器、渲染 pass 与场景夹具上。
+    # ⚠ **不登记** `engine/physics/**`、`engine/ecs/**`、
+    #   `engine/scene/SceneSerializer.*`、`engine/render/Renderer.*` ——
+    #   它们都在 GLOBAL_GLOBS 里（写了在 `--narrow` 下就是假跳过）。
+    #   能落在这里的只有"不被横切覆盖、但确实决定本用例成败"的那几个。
+    "verify_terrain": ["engine/terrain/**",
+                       "engine/render/TerrainPass.*",
+                       "assets/shaders/terrain.vert",
+                       "assets/shaders/terrain.frag",
+                       "assets/terrain/**",
+                       "assets/materials/terrain_grass.vmat",
+                       "assets/scenes/levels/terrain_probe.json",
+                       "tools/gen_terrain.py",
+                       "tools/gen_terrain_probe.py"],
+    # W4-4：编辑器面。断言的锚点在 ContentBrowser / InspectorPanel 里，
+    #   资产那头在 engine/terrain/Terrain.cpp（`loadTerrainDesc` 与加载器
+    #   共用同一份校验）。`editor/**` **不在** GLOBAL_GLOBS，所以这里必须
+    #   点名 —— 否则改面板时这条用例会被静默跳过。
+    "verify_terrain_editor": ["engine/terrain/**",
+                              "editor/ContentBrowser.*",
+                              "editor/InspectorPanel.*",
+                              "assets/terrain/**"],
+
+    # S5：脚本的编辑器面。断言的锚点全在 `editor/EditorApp.cpp` 的
+    # Instances 页签与 `engine/script/ScriptRuntime.cpp` 的状态串上。
+    # ⚠ 三处**不能**写进来：
+    #   · `engine/scene/**` / `engine/ecs/**` —— GLOBAL_GLOBS 里（写了在
+    #     `--narrow` 下就是假跳过）；
+    #   · `editor/InspectorPanel.*` 已经登记给 terrain_editor 了，但同一个
+    #     文件出现在两条 TRIGGERS 里是**允许**的（这表是"文件→用例"，不是
+    #     反过来），所以这里照样点名；
+    #   · `editor/PanelRegistry.*` 也照点名 —— `MYVK_EDITOR_PANELS` 的 id 表
+    #     在那儿，改一个 id 这条用例的 F1 就会全红，而 `editor/**` 不在横切
+    #     名单里，不点名就会被静默跳过。
+    "verify_script_editor": ["engine/script/**",
+                             "editor/EditorApp.*",
+                             "editor/EditorContext.*",
+                             "editor/InspectorPanel.*",
+                             "editor/PanelRegistry.*",
+                             "editor/DebugRects.h"],
+
+    # S6：示例关卡的端到端玩法 + 基准。
+    # ⚠ `assets/scripts/**` 与 `assets/scenes/**` **不写**进来：它们不在
+    #   `WATCH_ROOTS` 里（编辑器运行时会写这两个目录，进了快照就每轮都判成
+    #   "变了"）。真正能触发的只有代码：脚本内核、运行时的存盘钩子、
+    #   以及把关卡生出来的那个生成器。
+    #   顺带一提：改了 `.vks` 之后手动跑这一例即可 —— 增量分析看不到它们，
+    #   这是"运行时数据不进快照"的代价，记在这里免得下次当成 bug 查。
+    "verify_script": ["engine/script/**",
+                      "runtime/RuntimeApp.*",
+                      "tools/gen_script_demo.py"],
+
+    # ---- 引擎启动器（docs/launcher_roadmap.md）----
+    # 六个用例共用一个新目录 `engine/project/**`（工程文件 / 最近列表 /
+    # 显示与画质 / 创建与联接）。**它不是横切文件** —— 只有启动器和编辑器
+    # 的 `MYVK_EDITOR_PROJECT` 分支读它，所以必须逐个点名（不点名就是
+    # "改完没人跑"）。
+    # ⚠ `launcher/**` 只列到文件，不写 `launcher/**`：五个用例对启动器的
+    #   依赖面完全不同（ui 看排版、open 看 spawn、code 看联接），写通配等于
+    #   把"改一个按钮"放大成"五个 GUI 用例全跑"。
+    # ⚠ `engine/core/**`、`editor/EditorContext.*` 之类**故意不写** ——
+    #   `engine/core/**` 在 GLOBAL_GLOBS 里（写了在 `--narrow` 下是假跳过）。
+    "verify_launcher_project": ["templates/**",
+                                "editor/EditorApp.*"],
+    "verify_launcher_ui": ["launcher/LauncherApp.*",
+                           "launcher/main.cpp",
+                           "engine/project/RecentList.*"],
+    "verify_launcher_create": ["launcher/LauncherApp.*",
+                               "engine/project/ProjectCreate.*",
+                               "engine/project/ProjectFile.*",
+                               # C9/C10 断言的落点是 `render.json` 的**键数**与
+                               # 开关值 —— 所以写盘那一层与预设表都要点名
+                               # （E26 之后键数 = 22 enable + 3 数值）。
+                               "engine/project/ProjectDisplay.*",
+                               "engine/render/QualityPresets.*",
+                               "templates/**"],
+    "verify_launcher_open": ["launcher/LauncherSpawn.*",
+                             "launcher/LauncherApp.*",
+                             "engine/project/RecentList.*"],
+    # M4：断言的落点在 `render.json` 与 `game.json` 的**回写**上，所以
+    # 除了显示层自己，还要点名画质预设表与编辑器的场景钩子。
+    "verify_launcher_display": ["launcher/LauncherApp.*",
+                                "engine/project/ProjectDisplay.*",
+                                "engine/render/QualityPresets.*",
+                                "editor/EditorApp.*"],
+    # M5：`createDirectoryJunction` 在 ProjectCreate 里，`PROJ-CODE-LINK`
+    # 校验在 EditorApp 的 `MYVK_EDITOR_PROJECT` 分支里，热重载在
+    # engine/script（已由 verify_script_editor 覆盖，这里也点名）。
+    "verify_launcher_code": ["launcher/LauncherApp.*",
+                             "engine/project/ProjectCreate.*",
+                             "engine/project/ProjectFile.*",
+                             "editor/EditorApp.*",
+                             "templates/**"],
+    # E26：断言的落点在 `QualityPresets`（档位定义）、`RenderSettingsIO`
+    # （落盘/读回）、面板本身、编辑器的档位钩子（FeatureUIGen），以及
+    # 启动器写画质那一层（ProjectDisplay —— 两个入口必须是同一份数据）。
+    # ⚠ `engine/render/QualityPresets.*` 同时登记了 RENDER_MODULES，所以
+    #   它还会被"泄漏门"扫一遍（改了它至少有一个优雅退出的用例跑过）。
+    "verify_quality_presets": ["engine/render/QualityPresets.*",
+                               "engine/render/RenderSettingsIO.*",
+                               "editor/QualitySettingsPanel.*",
+                               "editor/FeatureUIGen.*",
+                               "editor/EditorApp.*",
+                               "engine/project/ProjectDisplay.*",
+                               "runtime/main.cpp"],
 }
 
 

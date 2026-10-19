@@ -377,9 +377,7 @@ void ShadowPass::updateCascades(const glm::mat4& camView,
 
 void ShadowPass::render(VkCommandBuffer cmd, scene::Scene& scene,
                         VkDescriptorSet frameSet, uint32_t frameIndex,
-                        uint32_t cascade,
-                        const std::unordered_map<const assets::Mesh*, int>*
-                            jointBases) {
+                        uint32_t cascade) {
     if (m_frames.empty() || cascade >= m_cascadeCount) return;
     Frame& f = m_frames[frameIndex % m_frames.size()];
 
@@ -442,11 +440,15 @@ void ShadowPass::render(VkCommandBuffer cmd, scene::Scene& scene,
         // which.y = 0 → shadow.vert 从 FrameUBO.lightSpace[x] 取矩阵
         push.which = glm::vec4(static_cast<float>(cascade), 0.0f, 0.0f, 0.0f);
         // 蒙皮网格：jointBase 必须和主前向路径一致，否则阴影用的是
-        // 绑定姿势而不是当前姿势（角色一动影子就散架）
-        if (jointBases) {
-            const auto jt = jointBases->find(mc.mesh);
-            if (jt != jointBases->end() && jt->second >= 0) {
-                push.skin = glm::vec4(static_cast<float>(jt->second), 0.0f,
+        // 绑定姿势而不是当前姿势（角色一动影子就散架）。
+        //
+        // 沿父链取**本实体**的 SkinnedMeshComponent：不能按 `const Mesh*`
+        // 查表 —— 同一 FBX 实例化两次时 Mesh 指针完全相同，第二个实例会
+        // 覆盖第一个（阴影也跟着串姿势）。
+        if (const auto* skc =
+                scene.findInAncestors<ecs::SkinnedMeshComponent>(e)) {
+            if (skc->jointBase >= 0) {
+                push.skin = glm::vec4(static_cast<float>(skc->jointBase), 0.0f,
                                       1.0f, 0.0f);
             }
         }

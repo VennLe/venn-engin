@@ -34,6 +34,7 @@
 // 50 m/s 时一步约 0.83 m → 17 步，每步都有机会发现墙面。
 // ============================================================
 
+#include "physics/Heightfield.h"
 #include "physics/RigidBody.h"
 
 #include <glm/glm.hpp>
@@ -62,6 +63,18 @@ struct CharacterDesc {
     float acceleration = 40.0f;       // m/s²（地面）
     float airControl = 0.25f;         // 空中加速度打折
     float pushStrength = 1.0f;        // 推箱子的力度倍率（运动学代理的"质量感"）
+
+    // ---- 地形高度场（W4-3）----
+    // 非 nullptr 时，⑥ 贴地**先问高度场**再问物理世界的射线。
+    //
+    // ⚠ 必须能"完全不接"：nullptr（默认）时 ⑥ 的代码路径与引入高度场之前
+    //   逐位相同 —— 现有全部用例（A/B/C/D/E 五组）都只有 groundPlane，
+    //   它们断言的是"贴地贴得准不准"，任何为了地形而改动的默认行为都会
+    //   让那 5 组一起漂。
+    // ⚠ 只用于**贴地**。水平方向撞进山坡**不做**胶囊扫掠（第一版非目标，
+    //   见 docs/world_scale_roadmap.md §9 W4-3）：角色会直接走上陡坡，
+    //   坡度超过 slopeLimit 时因为"贴不住 → 重力接管"而滑下来。
+    const Heightfield* ground = nullptr;
 };
 
 // 角色的持久状态（跨帧）。运行态数据，**不进场景 JSON**。

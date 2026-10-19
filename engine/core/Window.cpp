@@ -328,6 +328,13 @@ void Window::setWindowSize(int w, int h) {
     glfwSetWindowSize(m_window, w, h);
 }
 
+void Window::setTitle(const std::string& title) {
+    // 启动器 M1：`Editor.exe` 的标题栏要显示**工程名**（"Venn Editor - MyGame"），
+    // 而构造 Application 时还不知道打开哪个工程（工程信息是 onInit 里读的）。
+    // 只改 GLFW 的标题，不动任何内部状态 —— 幂等，对标题没变化时零副作用。
+    glfwSetWindowTitle(m_window, title.c_str());
+}
+
 bool Window::maximized() const {
     return glfwGetWindowAttrib(m_window, GLFW_MAXIMIZED) == GLFW_TRUE;
 }
@@ -430,6 +437,19 @@ void Window::windowIconifyCallback(GLFWwindow* w, int iconified) {
     (void)w;
     (void)iconified;
     // 最小化时主循环自动切换到 glfwWaitEvents 省资源
+}
+
+// ---------------------------------------------------------------- 光标
+
+void Window::setCursorVisible(bool visible) {
+    if (!m_window) return;
+    if (visible == m_cursorVisible) return;
+    m_cursorVisible = visible;
+    glfwSetInputMode(m_window, GLFW_CURSOR,
+                     visible ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_DISABLED);
+    // 切换模式必然伴随一次 GLFW 的 warp（DISABLED 会把光标移回中心）。
+    // 吞掉那一次位移：否则玩家按 ESC 暂停/恢复的那一帧镜头会猛转一下。
+    Input::discardNextMouseDelta();
 }
 
 void Window::windowCloseCallback(GLFWwindow* w) {

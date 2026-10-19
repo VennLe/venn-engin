@@ -163,6 +163,8 @@ private:
     // 反射探针段落（R5-1）：只在实体**已经有** ReflectionProbeComponent
     // 时出现。加组件走下面的 "Add Component → Reflection Probe"。
     void drawReflectionProbeSection(ecs::Entity e);
+    // W4-4：地形段（尺寸 / maxHeight / 4 层材质槽 / Height scale；不做笔刷）
+    void drawTerrainSection(ecs::Entity e);
     // GPU 粒子发射器段落（R6-1）：只在实体**已经有**
     // ParticleEmitterComponent 时出现。曲线编辑用的是"四根滑条 = 四个
     // 控制点"（路线图明确："曲线编辑先用滑条组"）。
@@ -193,6 +195,7 @@ private:
     bool drawColorRampEditor(const char* id, ecs::ParticleColorRamp& ramp);
     void drawLights(ecs::Entity e);
     void drawScript(ecs::Entity e);
+    void drawAudioSource(ecs::Entity e);   // G14-7 音频源（Tool 页签）
     void drawAddRemove(ecs::Entity e);
 
     // 内置图元的生成参数拖完了：重建几何 + 入撤销栈
@@ -295,10 +298,24 @@ private:
     ecs::Entity m_scriptBufFor{};
     char m_scriptBuf[256] = {0};
 
+    // 音频素材路径的输入缓冲（同上：换实体就重灌）。
+    // `AudioSourceComponent::clip` 是 std::string，InputText 绑不了它。
+    ecs::Entity m_audioBufFor{};
+    char m_audioBuf[256] = {0};
+
     // 动画片段名的输入缓冲（同上：换实体就重灌）。
     // clipName 是 std::string，InputText 不能直接绑它，必须有个 char 缓冲。
     ecs::Entity m_skinnedBufFor{};
     char m_skinnedBuf[128] = {0};
+
+    // Animator 的两个路径输入缓冲（A1）：`controllerPath` / `defaultClip`
+    // 同样是 std::string。分两个 For 而不是共用一个 —— 同一个实体上两个
+    // 框各自的"换实体重灌"时机是独立的，共用一个槽会让先填的那个每帧
+    // 被另一个覆盖（症状：打着字突然跳回原值）。
+    ecs::Entity m_animCtrlBufFor{};
+    char m_animCtrlBuf[256] = {0};
+    ecs::Entity m_animDefBufFor{};
+    char m_animDefBuf[128] = {0};
 
     // Mesh / Light 面板"这一帧到底画了哪些参数"的签名。
     //

@@ -12,8 +12,34 @@
 >
 > **R 系列做能力，E 系列做入口，G 系列做成品。** 三者成对交付（见 §12 准入契约）。
 >
-> ⚠ **进度（2026-10-17）：M1 已交付**（G01~G05 全部完成，见 §4 开头的「交付记录」）。
-> M2 ~ M7 仍全部未开工。本文档是可执行版：
+> ⚠ **进度（2026-10-19 复核）**：M1（G01~G05）与 M2（G06~G10）已交付。
+> M3 ~ M7 里的大部分任务**已经被各自的专门路线图接管**（动画 → 角色链、
+> 音频 → `audio_roadmap`、HUD → `ui_hud_roadmap`、存档 → `persistence_roadmap`、
+> 地形 → `world_scale_roadmap`、脚本 → `script_roadmap`）。
+> **开工前先看下面这张对照表**，别按 §6~§10 里"未开工"的旧口径重复劳动。
+>
+> | 任务 | 实测状态（对着代码核过，不是对着文档猜） | 权威路线图 |
+> | --- | --- | --- |
+> | G11~G13 动画运行时 I/II/III | ❌ 未做。**A0 ✅（采样/推进）+ A1 ✅（`AnimatorComponent` 接管 time、单 clip 直放、`animator` 存档块）**，但**仍没有**状态机 / 层与遮罩 / 根运动 / 动画事件 / IK | `character_pipeline_roadmap.md` A2~A6 |
+> | G14 音频 | ✅ 已完成（自研 WASAPI，`audio_roadmap.md` G14-0~G14-9 全绿） | `audio_roadmap.md` |
+> | G15 游戏 UI / HUD | ✅ 已完成（`runtime/ui/`：UiRenderer / SDF 字体 / 布局 / 控件 / HUD / 暂停菜单） | `ui_hud_roadmap.md` U0~U8 |
+> | G16 稳定 GUID | ❌ 未开工。`engine/scene/` 里没有 `guid` 字段 | `persistence_roadmap.md` §3 |
+> | G17 存档系统 | ❌ 未开工。没有 `engine/scene/SaveGame.*` | 同上 §5 |
+> | G18 Prefab | ❌ 未开工 | 同上 §6 |
+> | G19 关卡流送 | ❌ 未开工 | 同上 §7 |
+> | G20 运行时设置与暂停菜单 | 🟡 **部分**：暂停菜单有（`runtime/ui/PauseMenu`，三项），但"设置"页**没有内容** —— 语言 / 画质 / 音量还没接 | 本文 §7 |
+> | G21 地形 | ✅ 已完成（`world_scale_roadmap.md` W4：`TerrainPass` + `physics::Heightfield` + Inspector 段） | `world_scale_roadmap.md` W4 |
+> | G22 水体 | ❌ 未做（阻塞于 R6-2） | `render_roadmap.md` R6-2 |
+> | G23 植被与风 | ❌ 未做（W5 是下一项） | `world_scale_roadmap.md` W5 |
+> | G24 动态天空与大气 | ❌ 未做（阻塞于 R6-5） | `render_roadmap.md` R6-5 |
+> | G25 光照烘焙的运行时消费端 | ❌ 未做（阻塞于 R5-2） | `render_roadmap.md` R5-2 |
+> | G26~G28 `.vks` 实体/事件/协程 | ✅ 已完成（`script_roadmap.md` S2~S4） | `script_roadmap.md` |
+> | G29 资产打包 `.pak` | ❌ 未做（仓库里没有 pak 相关代码） | 本文 §10 |
+> | G30 Shipping 剔除 | ❌ 未做（`CMakeLists.txt` 里没有 `VENN_SHIPPING`） | 本文 §10 |
+> | G31 崩溃回收（minidump） | ❌ 未做（没有 `MiniDumpWriteDump` 相关代码） | 本文 §10 |
+> | G32 运行时性能 HUD / 控制台 | ❌ 未做 | 本文 §10 |
+>
+> 本文档是可执行版：
 > 每个任务给到**可直接开工的改动点** + **机器可验证的验收条款**，能直接并进
 > `tools/run_regression.py` 与项目五件套纪律。
 >
@@ -91,14 +117,15 @@
 | **物理玩法接口** | 有接触对但**无回调**；无触发体；`friction/restitution` 混在 `CollisionComponent` 里 | G08 |
 | **相机系统** | 只有单个 `Camera` 类；无 `CameraComponent`、无混合栈、无震动/跟随 | G09 / G10 |
 | **动画运行时** | 只有 `sample()`；**无状态机、无混合、无层、无根运动、无事件、无 IK** | **G11~G13** |
-| **音频** | **零** | **G14** |
+| **音频** | ~~**零**~~ → **已有**（2026-10-18 完成，见 G14 段） | **G14 ✅** |
 | **游戏 UI/HUD** | 只有编辑器 ImGui（不能给玩家用） | **G15** |
-| **持久标识** | `Entity.id` 是运行时序号，重启就变 → 存档对不上号 | G16 |
-| **存档** | `SceneSerializer` 只能存整份关卡，无增量进度存档 | G17 |
-| **预制体** | 无 | G18 |
-| **关卡流送** | 无异步加载 / 无分块 | G19 |
+| **持久标识** | `Entity.id` 是运行时序号，重启就变 → 存档对不上号 | **G16**（设计已定 → `persistence_roadmap.md`） |
+| **存档** | `SceneSerializer` 只能存整份关卡，无增量进度存档 | **G17**（同上） |
+| **预制体** | 无 | **G18**（同上） |
+| **关卡流送** | 无异步加载 / 无分块 | **G19**（同上） |
 | **运行时设置** | 无（设置只活在编辑器偏好里） | G20 |
-| **世界规模** | 无地形 / 水 / 植被 / 动态天空 / 烘焙（对应 R6-2~R6-5、R5-2~R5-3） | G21~G25 |
+| **世界规模** | 无地形 / 水 / 植被 / 动态天空 / 烘焙（对应 R6-2~R6-5、R5-2~R5-3） | G21~G25（**主序已改** → `world_scale_roadmap.md`） |
+| **材质实例** | **无**。材质是共享资产（`Material*` 指向 `AssetManager` 缓存），靠"每个实体起唯一名字"伪装成逐物体；<br>实测 3 个 bug：同名静默合并 / 身份是数组下标 / 导入模型的覆盖不能持久化 | **W0~W1**（本表原本**没有这一项**） |
 | **脚本能力** | `.vks` 只能做属性动画；无实体查询、无事件、无跨帧状态 | **G26~G28** |
 | **出货** | 无资产打包、无 Shipping 剔除、无崩溃回收、无运行时性能 HUD | **G29~G32** |
 
@@ -196,9 +223,29 @@
 python tools/verify_runtime_build.py     # 结构：两 exe / 引擎库零 editor+runtime / 重命名历史
 python tools/verify_runtime_loop.py      # 定步长：自检 3 条 + GAME-LOOP 字段 + 编辑器 vs Game 逐字符
 python tools/verify_runtime_states.py    # 状态栈 + 配置优先级 + 日志落点
-python tools/check_regression_map.py     # 映射表自检（51/59 已登记，59 例在 DEFAULT）
-python tools/check_feature_surface.py    # 34/34 有 UI 面、裸 env 漏网 0
+python tools/check_regression_map.py     # 映射表自检（79/86 已登记，86 例在 DEFAULT —— 2026-10-19 复跑）
+python tools/check_feature_surface.py    # 35/35 有 UI 面、裸 env 漏网 0（2026-10-19 复跑）
 ```
+
+### 全量回归基线（2026-10-19）
+
+第一轮 `--all` **76/86** → 修掉 SDF 图集与删除保护后 **79/86** → 再修 `verify_ui2` 的按钮断言 **81/86**。
+剩下的 5 个**已逐条修完**（同日，连跑 5/5 PASS）。它们**都不是"实现坏了"**——四条是过期的期望，
+一条是真产品缺陷，改法记在这里免得下一轮又从头查：
+
+| 用例 | 当时的现象 | 定性 | 改法 |
+|---|---|---|---|
+| `verify_camfx` B2 | n=2364 < 3000 | **阈值过期**：3000 是"场景里有贴图"时标定的；本场景材质纯色，1.5° 偏航的 ~24px 拖尾只在**几何轮廓**上留差异（差分只在 269×171 一块） | 阈值 → **1500**（对照 B3=766、静止=0），并新增"全强度差异像素 > 低强度 ×1.5" |
+| `verify_taa` C1 | n=68 < 200 | **期望过脆**：MSAA=4 已抗好锯齿，TAA 只做亚像素修边；"显著变化"该由 MSAA=1 的 D3（715 px）去证 | C1 改成**双向**：视口内最大差 ≥16（噪声地板 4）**且** n < 视口 0.1% **且** Laplacian 不升（实测 3071→2249） |
+| `verify_pom` C1 | 2.7× < 3.0× | **代理量饱和**：平均差在位移超过反照率格宽（6px）后撞顶 —— 实测 45° 的 25.70 反而比 80° 的 14.94 大（非单调）；换互相关量也不行，掠射端退化成假峰（实测 **+0 px**） | 阈值 → **2.0×**，断言措辞改成"单调显著变大"，并把"为什么不能断言 ∝tanθ"写进注释；2× 足以判红"固定 UV 偏移"（≈1.0×） |
+| `verify_particles` | 有时 E1b、有时 H0b、有时 G1b | **GUI 交互不稳 + 计数型瞬时量的绝对容差**：`fx_click` 原来"既不等也不验"；`alive` 跨运行实测差 1 / 5 / 10，固定 8 扛不住 | ① 新增 `fx_ensure_picker`（**先验证弹层开着**再点条目，两步各自重试）；② `fx_click` 支持 `confirm` + 重读矩形；③ `alive` 容差 → `max(8, 5%)` |
+| `verify_notifications` | `CONSOLE-DUMP info=2048 err=0`，而 `NOTIF-DUMP error=1` | **真产品缺陷**：一次普通启动打 2000+ 条 INFO，把启动期那条 ERROR 顶出 2048 的环形缓冲 —— **用户也看不见**，正好违背 Console 面板存在的理由 | `ConsolePanel::evictOverflow()`：溢出时**优先丢最老的 INFO**，WARN/ERROR 留到最后。现打 `info=2047 err=1` |
+
+**否定测试（5 条改过的判据，全部实测）**：camfx 用"MB 没生效/静态不模糊"两种坏输入 → n=0 变红；
+taa 用"TAA 没跑（max=0）"与"TAA 把画面重画了（n=623、Laplacian 上升）"→ 都变红；
+pom 用"固定 UV 偏移（角度无关）"→ 倍数 1.00 变红；正例 3/3 绿。
+
+本条之外，`frustum_cull` / `bvh` / `ibl` / `csm` 偶发全红（单跑全 PASS）——**别补跑"凑干净"**。
 
 **M1 明确*不*做的事**（避免后面误判"已经有了"）：没有菜单 UI（G15）、没有输入映射（G06）、
 没有玩家（G10）、运行时没有任何 ImGui 界面（硬约束：不复用编辑器的 `io`）。
@@ -206,7 +253,9 @@ python tools/check_feature_surface.py    # 34/34 有 UI 面、裸 env 漏网 0
 （等价于"菜单上自动按了继续"）。
 
 **下一项**：`M2 · G06 输入映射` —— 在此之前先做 §13 提到的 `E03 设置层级`
-（`RenderSettingsIO.*` 目前不存在，`config/render.json` 还在 `MYVK_*` 手里）。
+（**该前置已于 2026-10-17 完成**：`engine/render/RenderSettingsIO.*` 已存在，逐 `ParamDesc`
+落盘到项目 `config/render.json`，`MYVK_*` 退为覆盖层；E26 画质档位 2026-10-19 又在其上
+补了 `render::fillLayerForPreset` 单一落盘入口。原记录"目前不存在"是 M1 当时的口径。）
 
 ### ✅ G01 · CMake 三目标拆分（引擎库 / 编辑器 / 运行时）
 
@@ -585,6 +634,28 @@ Jump 绑到 Space 的那一刻会先把场景跑起来。
 
 ### G14 · 音频（miniaudio：3D 衰减 + 总线 + 流式音乐）
 
+> **2026-10-18 更新：本项已独立成篇 → `docs/audio_roadmap.md`**
+> （现状盘点 + 七个断点 D0~D6 + `G14-0 ~ G14-9` 的完整拆分 + 锚点表 + 否定测试清单）。
+> 下面这段保留为**简版存档**，但其中四处已被修正，**冲突时以 `audio_roadmap.md` 为准**：
+> ① ⚠ **不要用高层 `ma_engine` / `ma_sound`** —— 它们把混音状态关在库里，无法离线渲染
+> → `--selftest` 测不了；只取"设备层"，混音自己写（与"采样不许留在 Renderer 里"同一条纪律）。
+> ② "默认关 = 基线不变" → 改为 **产品默认开 + 自动化默认关**（回归脚本注入 `MYVK_RUNTIME_AUDIO=0`）。
+> ③ 音频**不进** `engine/assets/AssetManager`（那是 GPU 资源管理器，且会把无窗口自检拖死）；
+> 用 `engine/audio/AudioClipCache`。
+> ④ `MYVK_AUDIO_TEST` / `MYVK_AUDIO` 不合 `MYVK_RUNTIME_*` 前缀（`check_feature_surface` D 组会报
+> 裸 env）→ 改为 `--selftest audio` / `MYVK_RUNTIME_AUDIO`。
+>
+> ⚠ 另：本机实测取不到外网（两个代理端口都不通），miniaudio 的 4.2 MB 头文件**下不下来**；
+> `audio_roadmap.md` §3.4 给了"自研 WASAPI 后端（零依赖）"的对照决策，推荐后者 + 设备层接口隔离。
+
+> ✅ **2026-10-18：G14-0 ~ G14-9 全部完成**（自研 WASAPI 后端，零第三方依赖）。
+> 判定信号：`Game.exe --selftest audio` → `AUDIO-TOTAL pass=118 fail=0`（**无声卡、无窗口**
+> 机器上同样全绿）；`tools/verify_audio.py` 六组 33 条 check → `结果: PASS`（33 秒）；
+> 真机 `AUDIO-INIT backend=wasapi device=扬声器_(...) sr=48000 ch=2 fallback=0`。
+> 实测数字与**九个落地坑**（含"`Editor.exe` 只认 `MYVK_FRAMES`、不认 argv `--frames`"）
+> 记在 `audio_roadmap.md` §13 / §13.1。下面这段"简版存档"**已作废**（它描述的是
+> miniaudio + `ma_sound` 的方案），只看 §5 的 G14-0~G14-9。
+
 - **目标**：**从零到有**。这是"没有它就不叫游戏"的六项之一。
 - **改动点**
   1. 选 **miniaudio**（**单头文件**、MIT、Windows 走 WASAPI、无额外依赖 → 与离线构建偏好一致）；
@@ -643,6 +714,14 @@ Jump 绑到 Space 的那一刻会先把场景跑起来。
 ---
 
 ## 7 · 阶段 M4 · 内容与存档（G16 ~ G20）
+
+> ⚠⚠ **G16~G19 的权威设计已独立成文 → `docs/persistence_roadmap.md`**（10-18）。
+> 下面四段保留为"目标 / 改动点 / 验收"的原始摘要，**但与新文档冲突时以新文档为准**。
+> 新文档实测出三件本节没写的事：①组件里唯一的实体引用只有 `HierarchyComponent::parent`；
+> ②场景 `version` **只写不读**（迁移表没有挂载点）；③`sceneFromJson` 是"解析 + GPU 上传"
+> 的混合体 → 所以多了一个前置任务 **G16-5 序列化器三段拆分**，否则 G19 的异步铁律无解。
+> ⚠ 另一处纠正：G16 验收 2 的"补发的 GUID 在同一次会话内稳定"**做不到**（随机补发）——
+> 能做到的是"同一个 World 内稳定 + 首次保存即固化"。
 
 ### G16 · 稳定 GUID（实体持久标识）
 
@@ -745,6 +824,23 @@ Jump 绑到 Space 的那一刻会先把场景跑起来。
 ---
 
 ## 8 · 阶段 M5 · 世界规模（G21 ~ G25，多为 R 系列对接）
+
+> ⚠⚠ **2026-10-18 起，本阶段的执行主序由 `docs/world_scale_roadmap.md` 接管。**
+> 那份文档在磁盘上量了 12 件事，其中三条**否掉了本阶段的排法**：
+>
+> 1. **G21~G25 全是"渲染特性"，但真正的断点在最前面 —— 材质没有"实例"这一层。**
+>    实测三个 bug：同名材质静默合并（后者参数全丢）/ 材质身份是数组下标
+>    （`models/anime_girl.glb/mat0`）/ 导入模型的材质覆盖**存盘即丢**（dump 出 `null`）。
+>    → 新增 **W0（止血）+ W1（实例）+ W2（导入）+ W3（第一个真实关卡）**，
+>    排在 G21 之前。**"世界规模"的起点是"一个能存能开、能统一调参的关卡"，不是地形。**
+> 2. **"世界规模"不是性能问题**：实测 50 / 200 / 500 个盒子，60 帧总耗时
+>    2.55 / 2.62 / 2.60 s，GPU `frame=` 4.39 / 4.74 / 4.55 ms —— **物体数 ×10，耗时不变**。
+>    所以本阶段的目标是"**有没有**"与"**调得动**"，不是"扛不扛得住"。
+> 3. **本阶段原判的两处"缺失"不成立**：Z-up 转换已解决（`MeshLoader.cpp:674`、
+>    `FbxLoader.cpp:503`）；LOD 已有完整实现（`assets/Lod.{h,cpp}`），**只缺蒙皮 LOD**。
+>
+> 下面 G21~G25 的**技术内容仍然有效**（`world_scale_roadmap.md` 逐条引用了），
+> 但顺序、以及新增的材质实例整块，按新文档走。
 
 > ⚠ **本阶段每一项都有 R 系列的硬前置**（`!`）。**渲染侧没落地时不要提前做**——
 > 做出来的只会是空壳 UI。**线性关卡的游戏可以整段后置**。
@@ -970,7 +1066,7 @@ Jump 绑到 Space 的那一刻会先把场景跑起来。
 | ✅ G08 物理接口 | Inspector ▸ Physics 加"触发体"勾选 + `PhysicsMaterial` 段 | 材质从 `Collision` 段里**拆出** |
 | ✅ G09 相机系统 | Inspector ▸ Camera 段 + 相机列表（优先级可调） | |
 | G11~G13 动画 | **Animator 面板**（状态机图 + 转移条件编辑 + 层/遮罩 + 事件时间轴） | 这是 E24 资产编辑器框架的一个具体用户 |
-| G14 音频 | Inspector ▸ Audio 段 + ContentBrowser 音频预览播放 | |
+| G14 音频 | Inspector ▸ Audio 段 + ContentBrowser 音频预览播放 | 完整拆分 → `docs/audio_roadmap.md` |
 | G16 GUID | 可选：Hierarchy 显示 GUID / 复制 GUID | 别默认显示（噪音） |
 | G17 存档 | 编辑器**不提供**存档 UI（那是运行时的事）；但要有"清空测试存档"命令 | |
 | G18 Prefab | ContentBrowser 拖拽创建 + Hierarchy 右键 Apply/Revert | 带撤销 |
@@ -1082,14 +1178,15 @@ M3 把"看得见但玩不动"补齐（**音频 + 动画驱动 + 玩家 UI**是"�
 | 物理事件 | 有接触对，**无回调** | Enter/Stay/Exit + 触发体 + 材质 | **G08** |
 | 相机 | 单个 `Camera` | 组件化 + 混合栈 + 震动 | G09 |
 | 动画 | `sample()`（**无驱动层**） | 状态机 + 混合 + 层 + 根运动 + 事件 + IK | **G11~G13** |
-| 音频 | **零** | 3D + 总线 + 流式 | **G14** |
+| 音频 | ~~**零**~~ → WASAPI + 自研 Mixer（2026-10-18 ✅） | 3D + 总线 + 流式 | **G14 ✅** |
 | 运行时 UI | **零**（只有编辑器 ImGui） | 图集 + SDF + 锚点布局 + 控制器导航 | **G15** |
-| 持久标识 | 运行时序号（会变） | GUID | **G16** |
-| 存档 | 只能存整份关卡 | 增量 + 槽位 + 版本迁移 | **G17** |
-| 预制体 | 无 | 资产 + 实例覆盖 + Apply/Revert | G18 |
-| 关卡流送 | 一次全加载 | 分块 + 异步（主线程上传） | G19 |
-| 世界 | 无地形/水/植被/动态天空 | 四件套 | G21~G24 |
-| 光照 | 全实时 | + lightmap / DDGI | G25 |
+| 持久标识 | 运行时序号（会变） | GUID | **G16**（设计 → `persistence_roadmap.md`） |
+| 存档 | 只能存整份关卡 | 增量 + 槽位 + 版本迁移 | **G17**（同上） |
+| 预制体 | 无 | 资产 + 实例覆盖 + Apply/Revert | **G18**（同上） |
+| 关卡流送 | 一次全加载 | 分块 + 异步（主线程上传） | **G19**（同上） |
+| 世界 | 无地形/水/植被/动态天空 | 四件套 | G21~G24（→ `world_scale_roadmap.md` W4~W7） |
+| 光照 | 全实时 | + lightmap / DDGI | G25（→ 同上 W6/W9） |
+| 材质 | 共享资产 + 唯一命名伪装逐物体；**无实例层**、身份是数组下标 | 母材质 + 实例 + 稀疏覆盖 | **W0~W2**（→ 同上） |
 | 脚本能力 | 只能属性动画 | 实体/组件 / 事件/输入 / 协程 | **G26~G28** |
 | 出货 | 无打包、无剔除 | `.pak` + shipping + dump | **G29~G31** |
 | 运行时可观测 | 无 | 性能 HUD + 开发者控制台 | G32 |

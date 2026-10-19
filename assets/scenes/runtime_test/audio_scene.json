@@ -1,0 +1,90 @@
+{
+  "_comment": "G14-5~G14-8 的音频验收场景。断言见 tools/verify_audio.py：D 组（序列化逐字段往返）/ E 组（Play 副本真的被消费）/ F 组（脚本内置函数）。⚠ Speaker 的 audio 块**每个字段都写了非默认值** —— 全是默认值时，读写两端的 bug（少读一个键）根本暴露不出来。",
+  "version": 1,
+  "generator": "venn runtime_test (G14 audio acceptance scene)",
+  "camera": {
+    "target": [0.0, 0.0, 1.5],
+    "yaw": 0.0,
+    "pitch": -12.0,
+    "distance": 6.0
+  },
+  "physics": {
+    "enabled": false,
+    "groundPlane": false
+  },
+  "entities": [
+    {
+      "name": "Ground",
+      "transform": {
+        "position": [0.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "locked": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "plane",
+        "size": 40.0,
+        "name": "rt_ground"
+      }
+    },
+    {
+      "name": "Speaker",
+      "transform": {
+        "position": [3.0, 2.0, 1.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "locked": false,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "rt_speaker"
+      },
+      "audio": {
+        "clip": "audio/click.wav",
+        "playOnAwake": true,
+        "loop": false,
+        "spatial": false,
+        "volume": 0.35,
+        "pitch": 1.75,
+        "minDist": 2.5,
+        "maxDist": 42.0,
+        "rolloff": 1.5,
+        "bus": 3,
+        "streaming": false
+      },
+      "audioListener": true
+    },
+    {
+      "name": "Caster",
+      "transform": {
+        "position": [-2.0, 0.0, 0.5],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "locked": false,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "sphere",
+        "size": 1.0,
+        "name": "rt_caster"
+      },
+      "script": {
+        "path": "scenes/runtime_test/audio_play.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    }
+  ]
+}

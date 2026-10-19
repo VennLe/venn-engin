@@ -192,8 +192,8 @@ void NotificationCenter::drawToasts() {
             if (t.fromLog) {
                 ImGui::TextColored(ImVec4(0.58f, 0.62f, 0.70f, 0.9f * a),
                                    t.level == core::LogLevel::Error
-                                       ? "click: open in Console"
-                                       : "click: dismiss");
+                                       ? TRL("click: open in Console")
+                                       : TRL("click: dismiss"));
             }
             hovered = ImGui::IsWindowHovered();
             y += ImGui::GetWindowHeight() + 6.0f;

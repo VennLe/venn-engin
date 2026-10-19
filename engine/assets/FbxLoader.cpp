@@ -23,6 +23,8 @@
 // ============================================================
 
 #include "assets/MeshLoader.h"
+
+#include "assets/Vmeta.h"
 #include "assets/AssetManager.h"
 #include "assets/AssetPath.h"
 #include "rhi/Device.h"
@@ -190,8 +192,26 @@ bool extractMesh(const ufbx_mesh& mesh, const ufbx_skin_deformer* skin,
 // ---- FBX 材质 → 引擎 PBR 材质（尽力而为）----
 // ufbx_material 提供 pbr.base_color / roughness / metalness 等 map。
 // 每个 map 可能是纯因子（value_*）或贴图（texture）。
+//
+// ⚠ 键里为什么带 matIdx：以前所有材质都叫 `modelName + "/mat"`，
+//   于是**同一 mesh 的多材质在 makeMaterialPBR 里塌成第一个**
+//   （anime_girl.fbx 的 7 个材质实测只剩 1 个）。单材质模型保持旧键
+//   `xxx/mat` 不变 —— 老场景文件里的 `name` 才不会失配。
+// ⚠ keyPrefix 与 modelKey 是**两个**东西，别合并：
+//   * keyPrefix（subName）= `AssetManager` 里材质的**缓存键**前缀 —— 每个
+//     submesh 一个，否则同一模型的多个材质会塌成一个（W0-1 之前的坑）；
+//   * modelKey（name）= **模型键** —— 材质 id 与"重载来源"都挂在它上面，
+//     和 glTF 路径完全对齐（`模型路径#材质名`）。以前这里传的是 subName，
+//     于是 FBX 材质的 id 是 `模型/mesh_0#Skin`，和 glTF 的 `模型#Skin` 不一致，
+//     `.vmeta` 的映射表也就无从对齐。
 Material* fbxMaterial(AssetManager& assets, const ufbx_material& mat,
-                      const std::string& modelName) {
+                      const std::string& keyPrefix, const std::string& modelKey,
+                      int matIdx, Vmeta* vm) {
+    const std::string key =
+        matIdx > 0 ? keyPrefix + "/mat" + std::to_string(matIdx)
+                   : keyPrefix + "/mat";
+    if (Material* cached = assets.findMaterial(key)) return cached;
+
     glm::vec4 baseColor(1.0f);
     float roughness = 0.5f, metallic = 0.0f;
     glm::vec3 emissive(0.0f);
@@ -234,12 +254,32 @@ Material* fbxMaterial(AssetManager& assets, const ufbx_material& mat,
     if (!tex) tex = mat.fbx.diffuse_color.texture;
     if (tex && tex->type == UFBX_TEXTURE_FILE && tex->filename.length) {
         const std::string fp(tex->filename.data, tex->filename.length);
-        albedo = assets.loadTexture(fp, modelName + "/albedo", true);
+        albedo = assets.loadTexture(fp, keyPrefix + "/albedo", true);
     }
 
-    return assets.makeMaterialPBR(modelName + "/mat", albedo, nullptr, nullptr,
-                                  baseColor, roughness, metallic, emissive,
-                                  false);
+    Material* out = assets.makeMaterialPBR(
+        key, albedo, nullptr, nullptr, baseColor, roughness, metallic, emissive,
+        false);
+    if (out) {
+        // 与 glTF 路径对齐：标记来源 + 稳定身份 + 导入快照。
+        // 以前 FBX 材质**不标记来源**，于是被当成 procedural 序列化，
+        // 参数原样写进场景 —— 表面上能往返，但"模型重导入后覆盖关系"
+        // 无从谈起（W0-3 的整个机制都挂不上）。
+        out->source.setModel(modelKey);
+        std::string nm;
+        if (mat.name.length) nm.assign(mat.name.data, mat.name.length);
+        const std::string mid =
+            vm ? resolveMaterialId(*vm, modelKey, nm, matIdx)
+               : (modelKey + "#" +
+                  (nm.empty() ? ("mat" + std::to_string(matIdx)) : nm));
+        assets.assignMaterialId(out, mid);
+        out->captureImportDefaults();
+        VK_LOG_INFO("ASSET-MAT-ID model=%s key=%s id=%s",
+                    assetLogSafe(modelKey).c_str(),
+                    assetLogSafe(key).c_str(),
+                    assetLogSafe(out->id).c_str());
+    }
+    return out;
 }
 
 // ---- 骨骼（skin_deformer → Skeleton）----
@@ -499,9 +539,20 @@ std::unique_ptr<Model> loadFBXModel(rhi::Device& device,
                                     const std::string& name) {
     (void)ctx;
 
+    // W2-2：导入设置 sidecar（与 glTF 同一套策略，见 assets/Vmeta.h）
+    Vmeta vmeta = beginModelImport(name);
+
     ufbx_load_opts opts = {};   // 全零 = 默认
     opts.target_axes = ufbx_axes_right_handed_z_up;   // Y-up → Z-up
-    opts.target_unit_meters = 1.0f;                    // 单位：米
+    // W2-2：`import.scale` 直接乘进单位换算 —— ufbx 会把它烘到所有节点变换里，
+    // 骨架的 bind pose 也跟着缩放，不会出现"模型缩了、骨架没缩"。
+    // ⚠⚠ 是**倒数**关系，实测出来的（不是猜的）：
+    //   anime_girl.fbx 上 target=1.0 → 归一化半径 0.822，
+    //   target=0.5 → 1.644（**放大**两倍）。即 r ∝ 1/target。
+    //   所以"scale = 尺寸倍数"（与 glTF 路径的语义一致）要写 1/scale。
+    //   写反的话 .vmeta 里填 0.5 会把模型放大一倍，而且看起来"设置生效了"。
+    opts.target_unit_meters =
+        (vmeta.import.scale > 0.0f) ? (1.0f / vmeta.import.scale) : 1.0f;
     opts.generate_missing_normals = true;
     opts.evaluate_skinning = false;   // 自己算蒙皮（走 Skeleton 路径）
     opts.clean_skin_weights = true;
@@ -606,6 +657,8 @@ std::unique_ptr<Model> loadFBXModel(rhi::Device& device,
                         msrc.name = name;
                         msrc.subMeshIndex = (int)p;
                         sm.mesh->setSource(msrc);
+                        // W2-2：generateLods=false → 这条网格不建 LOD 链
+                        sm.mesh->setNoLod(!vmeta.import.generateLods);
                     }
                     // 材质
                     if (pr.materialIndex >= 0 &&
@@ -613,13 +666,15 @@ std::unique_ptr<Model> loadFBXModel(rhi::Device& device,
                         sm.material =
                             fbxMaterial(assets,
                                         *n->materials.data[pr.materialIndex],
-                                        subName);
+                                        subName, name, pr.materialIndex,
+                                        &vmeta);
                     } else if (pr.materialIndex >= 0 &&
                                pr.materialIndex < (int)mesh.materials.count) {
                         sm.material =
                             fbxMaterial(assets,
                                         *mesh.materials.data[pr.materialIndex],
-                                        subName);
+                                        subName, name, pr.materialIndex,
+                                        &vmeta);
                     }
                     // 包围盒：先记 mesh 局部 AABB，walkNode 结束后统一
                     // 换算成世界空间做"归位"（见下方模型归位段）
@@ -692,6 +747,19 @@ std::unique_ptr<Model> loadFBXModel(rhi::Device& device,
         model->center = (bmin + bmax) * 0.5f;
         model->radius = glm::length(bmax - bmin) * 0.5f;
     }
+
+    // W2-2：`import.importAnimations=false` → 丢掉动画剪辑（骨架保留）
+    if (!vmeta.import.importAnimations && model->skeleton &&
+        !model->skeleton->clips.empty()) {
+        const std::size_t dropped = model->skeleton->clips.size();
+        model->skeleton->clips.clear();
+        VK_LOG_INFO("ASSET-VMETA-NOANIM model=%s dropped=%u",
+                    assetLogSafe(name).c_str(),
+                    static_cast<unsigned>(dropped));
+    }
+
+    // W2-2：把本次见到的材质名补进映射并写回 sidecar（内容没变就不写）
+    finishModelImport(name, vmeta);
 
     VK_LOG_INFO("FBX loaded: %s (%u submeshes, %s, %d joints)",
                 path.c_str(), (uint32_t)model->subMeshes.size(),

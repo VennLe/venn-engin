@@ -1,0 +1,24 @@
+{
+  "type": "material",
+  "version": 1,
+  "id": "materials/roof",
+  "emissive": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "doubleSided": false,
+  "normalScale": 1.0,
+  "ao": 1.0,
+  "alphaCutoff": 0.5,
+  "alphaMode": "opaque",
+  "shadingModel": "default",
+  "baseColor": [
+    0.2,
+    0.21,
+    0.23,
+    1.0
+  ],
+  "metallic": 0.0,
+  "roughness": 0.85
+}

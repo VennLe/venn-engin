@@ -101,6 +101,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from verify_hiz import run_once                                    # noqa: E402
 from verify_add_menu import kill_stale_editors                      # noqa: E402
 from verify_local_shadow import diff_stats, region_diff             # noqa: E402
+from safe_fs import safe_remove
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
@@ -924,7 +925,7 @@ def main():
     if not args.keep_scenes:
         for p in list(paths.values()):
             try:
-                os.remove(p)
+                safe_remove(p)
             except OSError:
                 pass
 

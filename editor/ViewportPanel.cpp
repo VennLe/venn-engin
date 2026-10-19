@@ -638,7 +638,7 @@ void ViewportPanel::drawToolbar() {
         char buf[32];
         // 平移吸附：0 = 关（UE 的 0 也是这个意思）
         const bool on = c.snapMove();
-        std::snprintf(buf, sizeof(buf), on ? "%g m" : "0", static_cast<double>(
+        std::snprintf(buf, sizeof(buf), on ? TR("%g m") : "0", static_cast<double>(
                           on ? c.snapMoveStep() : 0.0f));
         if (vpValueButton("vpt_snap_move", kVpIconSnapMove, buf,
                           TR("Move snapping step\nClick for the preset list."),
@@ -652,7 +652,7 @@ void ViewportPanel::drawToolbar() {
         if (void* p = render::paramPtr("grid.minorStep")) {
             g = *static_cast<float*>(p);
         }
-        std::snprintf(buf, sizeof(buf), "%g m", static_cast<double>(g));
+        std::snprintf(buf, sizeof(buf), TR("%g m"), static_cast<double>(g));
         if (vpValueButton("vpt_snap_grid", kVpIconSnapGrid, buf,
                           TR("Reference grid cell size"), "VP-SNAP grid"))
             openDropdown("##vp_snap_grid");
@@ -984,7 +984,7 @@ void ViewportPanel::drawSnapMenu(int which) {
         char label[32];
         const float v = values[i];
         if (which == 1) {
-            std::snprintf(label, sizeof(label), "%g m", static_cast<double>(v));
+            std::snprintf(label, sizeof(label), TR("%g m"), static_cast<double>(v));
         } else if (which == 2) {
             std::snprintf(label, sizeof(label), "%.0f°", static_cast<double>(v));
         } else {
@@ -1279,7 +1279,7 @@ void ViewportPanel::drawVpSettingsMenu() {
         m_renderer.skyEnabled() = true;
         VK_LOG_INFO("VP-SET sky=1");
     }
-    if (ImGui::RadioButton(TR("Solid"), !sky)) {
+    if (ImGui::RadioButton(TR("Solid color"), !sky)) {
         m_renderer.skyEnabled() = false;
         VK_LOG_INFO("VP-SET sky=0");
     }
@@ -1867,7 +1867,7 @@ void ViewportPanel::drawObjectMenu(const glm::vec2& vpPos,
              ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
                     ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
 
-    ImGui::SeparatorText(nm ? nm->c_str() : "Object");
+    ImGui::SeparatorText(nm ? nm->c_str() : TRL("Object"));
 
     // 父项矩形必须**无条件**打点（BeginMenu 只在子菜单展开时才返回 true，
     // 写在 if 里脚本会永远等不到它）—— 见 drawAddMenu 里的同一条注释。
@@ -1930,7 +1930,7 @@ void ViewportPanel::drawObjectMenu(const glm::vec2& vpPos,
                  ImGui::GetItemRectMax());
 
         ImGui::SeparatorText(
-            cc->shape == ecs::ColliderShape::ConvexHull ? "convex hull"
+            cc->shape == ecs::ColliderShape::ConvexHull ? TRL("convex hull")
                                                         : "capsule");
     }
 
@@ -1971,9 +1971,9 @@ void ViewportPanel::draw() {
     // 用 "###viewport" 固定窗口 ID：否则 [PLAYING] / [PAUSED] 前缀变化会被
     // ImGui 当成另一个窗口，位置与尺寸的记忆全部丢失
     const char* state = m_ctx.isPlaying()
-                            ? "  [PLAYING]"
-                            : (m_ctx.isPaused() ? "  [PAUSED]" : "");
-    std::snprintf(title, sizeof(title), "Viewport%s###viewport", state);
+                            ? TR("  [PLAYING]")
+                            : (m_ctx.isPaused() ? TR("  [PAUSED]") : "");
+    std::snprintf(title, sizeof(title), TR("Viewport%s###viewport"), state);
     if (!ImGui::Begin(title, &panels.viewport, flags)) {
         ImGui::End();
         if (gameFullscreen) ImGui::PopStyleVar();
@@ -2340,7 +2340,7 @@ void ViewportPanel::drawStatsHud(const glm::vec2& vpPos,
                               ImVec4(0.10f, 0.12f, 0.15f, 0.80f));
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.80f, 0.87f, 0.95f));
         const bool expand =
-            ImGui::Button(TR("Stats##vp_stats_expand"), ImVec2(cw, chh));
+            ImGui::Button(TRL("Stats##vp_stats_expand"), ImVec2(cw, chh));
         ImGui::PopStyleColor(2);
         logRect("VP-RECT stats", ImGui::GetItemRectMin(),
                 ImGui::GetItemRectMax());
@@ -2360,21 +2360,21 @@ void ViewportPanel::drawStatsHud(const glm::vec2& vpPos,
     std::vector<std::string> lines;
     char b[192];
     if (it.fps) {
-        std::snprintf(b, sizeof(b), "%.0f FPS",
+        std::snprintf(b, sizeof(b), TR("%.0f FPS"),
                       static_cast<double>(io.Framerate));
         lines.emplace_back(b);
     }
     if (it.frameMs) {
-        std::snprintf(b, sizeof(b), "%.2f ms",
+        std::snprintf(b, sizeof(b), TR("%.2f ms"),
                       io.Framerate > 0.0f ? 1000.0 / io.Framerate : 0.0);
         lines.emplace_back(b);
     }
     if (it.drawCalls) {
-        std::snprintf(b, sizeof(b), "draw calls  %u", rs.drawCalls);
+        std::snprintf(b, sizeof(b), TR("draw calls  %u"), rs.drawCalls);
         lines.emplace_back(b);
     }
     if (it.triangles) {
-        std::snprintf(b, sizeof(b), "triangles   %u", rs.triangles);
+        std::snprintf(b, sizeof(b), TR("triangles   %u"), rs.triangles);
         lines.emplace_back(b);
     }
     if (it.vram) {
@@ -2383,22 +2383,22 @@ void ViewportPanel::drawStatsHud(const glm::vec2& vpPos,
         const double gb = static_cast<double>(
                               m_renderer.device().deviceLocalHeapBytes()) /
                           (1024.0 * 1024.0 * 1024.0);
-        std::snprintf(b, sizeof(b), "VRAM        %.1f GB", gb);
+        std::snprintf(b, sizeof(b), TR("VRAM        %.1f GB"), gb);
         lines.emplace_back(b);
     }
     if (it.resolution) {
-        std::snprintf(b, sizeof(b), "viewport    %ux%u", m_requestedW,
+        std::snprintf(b, sizeof(b), TR("viewport    %ux%u"), m_requestedW,
                       m_requestedH);
         lines.emplace_back(b);
     }
     if (it.viewMode) {
-        std::snprintf(b, sizeof(b), "view mode   %s",
+        std::snprintf(b, sizeof(b), TR("view mode   %s"),
                       render::Renderer::viewModeName(m_renderer.viewMode()));
         lines.emplace_back(b);
     }
     if (it.entities) {
         const scene::Scene::LightStats ls = sc.lightStats();
-        std::snprintf(b, sizeof(b), "entities %zu   lights %zu",
+        std::snprintf(b, sizeof(b), TR("entities %zu   lights %zu"),
                       sc.objectCount(), ls.pointLights + ls.spotLights);
         lines.emplace_back(b);
     }
@@ -2406,25 +2406,25 @@ void ViewportPanel::drawStatsHud(const glm::vec2& vpPos,
         const std::string* nm = m_ctx.hasSelection()
                                     ? sc.world().name(m_ctx.selection())
                                     : nullptr;
-        std::snprintf(b, sizeof(b), "selected: %s", nm ? nm->c_str() : "(none)");
+        std::snprintf(b, sizeof(b), TR("selected: %s"), nm ? nm->c_str() : "(none)");
         lines.emplace_back(b);
     }
     if (it.gizmo) {
         if (!m_ctx.isEditing()) {
             // 视口渲染的就是**运行态副本**本身 —— 游戏画面与编辑画面共用
             // 同一条离屏渲染链，只是相机换成了自由飞行视角。
-            std::snprintf(b, sizeof(b), "%s  t=%.2fs%s",
-                          m_ctx.isPaused() ? "PAUSED" : "PLAYING",
+            std::snprintf(b, sizeof(b), TR("%s  t=%.2f 秒%s"),
+                          m_ctx.isPaused() ? TR("PAUSED") : TR("PLAYING"),
                           static_cast<double>(m_ctx.playTime()),
-                          m_ctx.gameFullscreen() ? "  [fullscreen]" : "");
+                          m_ctx.gameFullscreen() ? TR("  [fullscreen]") : "");
             lines.emplace_back(b);
         } else {
-            std::snprintf(b, sizeof(b), "EDIT   gizmo: %s / %s",
-                          m_ctx.gizmoMode() == GizmoMode::Translate ? "move"
-                          : m_ctx.gizmoMode() == GizmoMode::Rotate ? "rotate"
-                                                                  : "scale",
-                          m_ctx.gizmoSpace() == GizmoSpace::World ? "world"
-                                                                 : "local");
+            std::snprintf(b, sizeof(b), TR("EDIT   gizmo: %s / %s"),
+                          m_ctx.gizmoMode() == GizmoMode::Translate ? TR("move")
+                          : m_ctx.gizmoMode() == GizmoMode::Rotate ? TR("rotate")
+                                                                  : TR("scale"),
+                          m_ctx.gizmoSpace() == GizmoSpace::World ? TR("world")
+                                                                 : TR("local"));
             lines.emplace_back(b);
             // 拖动手柄时鼠标会挡住画面，这里报"沿哪个轴走了多少"
             // （吸附打开时末尾带 [snap]）是最直观的反馈。
@@ -2474,7 +2474,7 @@ void ViewportPanel::drawStatsHud(const glm::vec2& vpPos,
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.13f, 0.15f, 0.19f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
                           ImVec4(0.20f, 0.24f, 0.30f, 1.0f));
-    if (ImGui::SmallButton(TR("Stats  -##vp_stats_collapse"))) {
+    if (ImGui::SmallButton(TRL("Stats  -##vp_stats_collapse"))) {
         m_statsCollapsed = true;
         if (std::getenv("MYVK_LOG_RECTS")) VK_LOG_INFO("VP-STATS-COLLAPSE 1");
     }
@@ -2572,7 +2572,7 @@ void ViewportPanel::drawDisplayMenu(const glm::vec2& vpPos,
     for (int i = 0; i < 3; ++i) {
         ImGui::PushID(5000 + i);
         char lb[24];
-        std::snprintf(lb, sizeof(lb), "%g m", static_cast<double>(steps[i]));
+        std::snprintf(lb, sizeof(lb), TR("%g m"), static_cast<double>(steps[i]));
         if (ImGui::RadioButton(lb, std::fabs(curMinor - steps[i]) < 1e-4f)) {
             setGrid(steps[i], steps[i] * 10.0f);
         }
@@ -2590,7 +2590,7 @@ void ViewportPanel::drawDisplayMenu(const glm::vec2& vpPos,
             m_renderer.skyEnabled() = true;
         }
         ImGui::SameLine();
-        if (ImGui::RadioButton(TR("Solid"), !sky)) m_renderer.skyEnabled() = false;
+        if (ImGui::RadioButton(TR("Solid color"), !sky)) m_renderer.skyEnabled() = false;
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
                 TR("Solid = the sky pass is skipped and the scene clears to the\n"
@@ -2965,8 +2965,16 @@ void ViewportPanel::drawPlayHud(const glm::vec2& vpPos, const glm::vec2& vpSize)
     const float lineH = ImGui::GetTextLineHeightWithSpacing();
     const float frameH = ImGui::GetFrameHeightWithSpacing();
 
-    float textW = ImGui::CalcTextSize("Restore view  (F)").x;
-    textW = std::max(textW, ImGui::CalcTextSize("PLAYING   t = 0.00s").x);
+    // ⚠ 度量必须与绘制**同源**：写死英文串去量，一旦界面语言是中文，
+    //   算出来的宽度就偏窄 → EndChild 里的文字被裁掉。这里用一个
+    //   0 秒的探针串走同一套格式化，宽度自然跟着译文变。
+    //   （踩过的坑：`PLAYING` 只是 `%s` 的实参，本身没被 TR 包 → 中文界面
+    //   下这一行还是英文，而且是"看得见但翻不到"的那一类。）
+    char clockProbe[64];
+    std::snprintf(clockProbe, sizeof(clockProbe), TR("%s   t = %.2fs"),
+                  TR("PLAYING"), 0.0);
+    float textW = ImGui::CalcTextSize(TRL("Restore view  (F)")).x;
+    textW = std::max(textW, ImGui::CalcTextSize(clockProbe).x);
     const float cw = textW + st.WindowPadding.x * 2.0f + 8.0f;
     const float ch = frameH + lineH + st.WindowPadding.y * 2.0f;
 
@@ -2980,8 +2988,8 @@ void ViewportPanel::drawPlayHud(const glm::vec2& vpPos, const glm::vec2& vpSize)
     if (phPush) ImGui::PushStyleColor(ImGuiCol_Text, kOverlayText);
     ImGui::BeginChild("##play_hud", ImVec2(cw, ch), 0);
 
-    if (ImGui::Button(m_ctx.gameFullscreen() ? "Restore view  (F)"
-                                             : "Fullscreen  (F)",
+    if (ImGui::Button(m_ctx.gameFullscreen() ? TRL("Restore view  (F)")
+                                             : TRL("Fullscreen  (F)"),
                       ImVec2(-1.0f, 0.0f))) {
         m_ctx.toggleGameFullscreen();
     }
@@ -2989,7 +2997,7 @@ void ViewportPanel::drawPlayHud(const glm::vec2& vpPos, const glm::vec2& vpSize)
     ImGui::TextColored(m_ctx.isPlaying() ? ImVec4(0.55f, 0.9f, 0.58f, 1.0f)
                                          : ImVec4(0.95f, 0.8f, 0.4f, 1.0f),
                        TR("%s   t = %.2fs"),
-                       m_ctx.isPlaying() ? "PLAYING" : "PAUSED",
+                       m_ctx.isPlaying() ? TR("PLAYING") : TR("PAUSED"),
                        static_cast<double>(m_ctx.playTime()));
 
     ImGui::EndChild();

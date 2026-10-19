@@ -1,0 +1,25 @@
+{
+  "_comment": "__PROJECT_NAME__ 的运行时出厂配置。优先级: 命令行 > 环境变量(MYVK_RUNTIME_*) > 本文件 > 内置默认。画质不在这里 —— 见 config/render.json。",
+  "scene": "scenes/main.json",
+  "title": "__PROJECT_NAME__",
+  "width": 1280,
+  "height": 720,
+  "fullscreen": false,
+  "maxFps": 60,
+  "unfocusedFps": 15,
+  "timeScale": 1.0,
+  "language": "zh",
+  "startState": "playing",
+  "audio": {
+    "enabled": true,
+    "device": "default",
+    "master": 1.0,
+    "music": 0.7,
+    "sfx": 1.0,
+    "voice": 1.0,
+    "mute": false,
+    "muteOnFocusLost": false,
+    "duckDepth": 0.75,
+    "maxVoices": 64
+  }
+}

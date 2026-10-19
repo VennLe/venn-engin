@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "id": "third_person",
+  "label": "Third person",
+  "summary": "相机在角色斜后方，鼠标环绕 + 角色转身",
+  "gameType": "third_person",
+  "startScene": "scenes/main.json",
+  "placeholders": [
+    "__PROJECT_NAME__",
+    "__TEMPLATE_ID__"
+  ],
+  "files": [
+    "assets/game.json",
+    "assets/scenes/main.json",
+    "assets/scripts/main.vks",
+    "config/render.json"
+  ]
+}

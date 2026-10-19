@@ -67,6 +67,7 @@ layout(push_constant) uniform FxPush {
 layout(location = 0) in vec2 vUv;
 layout(location = 1) in vec4 vColor;
 layout(location = 2) in float vViewZ;
+layout(location = 3) in flat int vSprite;
 
 layout(location = 0) out vec4 outColor;
 
@@ -76,8 +77,47 @@ void main() {
     const vec2 d = vUv * 2.0 - 1.0;
     const float r2 = dot(d, d);
     if (r2 > 1.0) discard;  // 四角不属于这个圆盘
+    // ---- 贴图形状（ParticleSprite，见 ecs/Components.h）----
+    //
+    // 这里全是**距离场**，没有一张贴图：vSprite 由发射器决定，顶点阶段
+    // flat 传下来。0 号仍然是改动前那条 (1-r²)² —— 默认路径逐像素不变。
+    const float r = sqrt(r2);
     const float edge = 1.0 - r2;
-    const float feather = edge * edge;
+    float feather = edge * edge;
+    switch (vSprite) {
+        case 1:  // Glow：更软的外晕 + 亮芯
+            feather = feather * feather * 2.2 + edge * 0.25;
+            break;
+        case 2: {  // Spark：四角星芒
+            const float a = atan(d.y, d.x);
+            const float spike = pow(abs(cos(a * 2.0)), 7.0);
+            feather = spike * edge * 1.6 + edge * edge * 0.20;
+            break;
+        }
+        case 3: {  // Smoke：带起伏的团（两个正弦当廉价噪声）
+            const float n = 0.5 + 0.25 * sin(d.x * 9.0) * sin(d.y * 9.0) +
+                            0.25 * sin((d.x + d.y) * 6.0);
+            feather = pow(edge, 1.4) * (0.55 + 0.75 * n);
+            break;
+        }
+        case 4:  // Ring：空心环
+            feather = smoothstep(0.42, 0.72, r) * (1.0 - smoothstep(0.78, 1.0, r));
+            break;
+        case 5: {  // Streak：竖长条（雨丝 / 拖尾）
+            const float ax = abs(d.x);
+            const float ay = abs(d.y);
+            feather = pow(1.0 - ax, 2.0) * (1.0 - ay) * (1.0 - ay);
+            break;
+        }
+        case 6: {  // Flake：六角雪花
+            const float a = atan(d.y, d.x);
+            const float arms = pow(abs(cos(a * 3.0)), 9.0);
+            feather = edge * (0.18 + 0.9 * arms);
+            break;
+        }
+        default:
+            break;
+    }
 
     // ---------------------------------------------------------- ② 遮挡 + 软化
     // 屏幕 uv 必须用 gl_FragCoord 现算：vUv 是**四边形上的参数**，拿它当

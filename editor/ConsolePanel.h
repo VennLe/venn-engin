@@ -79,6 +79,9 @@ public:
     static constexpr size_t kMaxLines = 2048;   // 环形缓冲上限
 
 private:
+    // 超限回收：**优先丢最老的 Info**，WARN/ERROR 留到最后
+    // （理由见 .cpp 里的注释 —— 启动期 2000+ 条 INFO 会把 ERROR 顶掉）。
+    void evictOverflow();
     std::deque<Line> m_lines;
     std::vector<Command> m_commands;
     std::vector<std::string> m_history;   // ↑/↓ 翻的输入历史

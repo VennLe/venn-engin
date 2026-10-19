@@ -25,6 +25,7 @@
 #include "scene/Camera.h"
 #include "scene/Light.h"
 #include "scene/Scene.h"
+#include "terrain/Terrain.h"
 
 #include <algorithm>
 #include <cctype>
@@ -111,6 +112,12 @@ const char* sectionKeywords(const char* name) {
                              "blend environment"},
         {"Light", "light intensity range color spot point area ies shadow"},
         {"Script", "script vks enabled timescale path"},
+        // G14-7 音频源。与粒子那条同一条纪律：**每一个字段**都要列
+        //（少一个词，用户搜 "rolloff" 就会看到 "no component matches"）。
+        {"Audio Source",
+         "audio source sound sfx music voice clip volume pitch loop spatial "
+         "3d distance min max rolloff attenuation falloff bus streaming "
+         "play on awake listener"},
         {"Camera", "camera fov target distance yaw pitch"},
         // M2（G07~G09）：组件级关键词必须把**每一个字段**都列进来，
         // 否则用户搜 "step" / "trigger" 会看到"no component matches"
@@ -417,7 +424,7 @@ void InspectorPanel::draw() {
     // 搜索词非空时**跨所有页签**摊平命中项（见 drawTabContent），
     // 所以这行提示在头部，而不是塞进某一页里。
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##insp_search", "search components...",
+    ImGui::InputTextWithHint("##insp_search", TRL("search components..."),
                              m_search, sizeof(m_search));
     ImGui::Separator();
 
@@ -605,6 +612,7 @@ void InspectorPanel::drawTabObject(ecs::Entity e) {
 void InspectorPanel::drawTabTool(ecs::Entity e) {
     if (!e.valid()) { tabEmptyHint("an object"); return; }
     drawScript(e);
+    drawAudioSource(e);
     drawAddRemove(e);
 }
 
@@ -632,6 +640,7 @@ void InspectorPanel::drawTabRender(ecs::Entity e) {
     drawLights(e);
     drawDecalSection(e);
     drawReflectionProbeSection(e);
+    drawTerrainSection(e);
 }
 
 // ---- 全局渲染细节（FeatureRegistry 驱动）----
@@ -646,18 +655,18 @@ void InspectorPanel::drawRenderSettingsSection() {
     static int tier = 1;   // 渲染页默认 Advanced：Basic 太少，Debug 太吵
     ImGui::TextUnformatted(TR("Detail"));
     ImGui::SameLine();
-    ImGui::RadioButton(TR("Basic##render"), &tier, 0);
+    ImGui::RadioButton(TRL("Basic##render"), &tier, 0);
     ImGui::SameLine();
-    ImGui::RadioButton(TR("Adv##render"), &tier, 1);
+    ImGui::RadioButton(TRL("Adv##render"), &tier, 1);
     ImGui::SameLine();
-    ImGui::RadioButton(TR("Debug##render"), &tier, 2);
+    ImGui::RadioButton(TRL("Debug##render"), &tier, 2);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
             TR("How deep the parameter list goes.\n"
             "Same tiers as the Engine panel; values are the same storage."));
     }
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##renderfilter", "Filter render params...",
+    ImGui::InputTextWithHint("##renderfilter", TRL("Filter render params..."),
                              m_renderFilter, sizeof(m_renderFilter));
 
     // 只挑与"渲染"直接相关的分组。Lights / Scene 里的雾、Post 的后处理都
@@ -665,7 +674,7 @@ void InspectorPanel::drawRenderSettingsSection() {
     // 不在这里重复。
     static const char* kGroups[] = {"Rendering Path", "Rendering", "Culling",
                                     "Surface", "Shadows", "Lights", "Post",
-                                    "Scene", "Sky"};
+                                    "Scene", "Sky", "UI"};
     int shown = 0;
     for (const char* grp : kGroups) {
         bool first = true;
@@ -676,7 +685,7 @@ void InspectorPanel::drawRenderSettingsSection() {
                 continue;
             }
             if (first) {
-                ImGui::SeparatorText(grp);
+                ImGui::SeparatorText(TR(grp));
                 first = false;
             }
             ++shown;
@@ -965,15 +974,15 @@ void InspectorPanel::drawPhysicsWorldSection() {
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::DragFloat3("##phys-gravity", glm::value_ptr(ps.gravity), sp(0.05f));
     fieldEdit(m_ctx, "Gravity", &ps.gravity, g0);
-    ImGui::SetItemTooltip("Gravity (m/s^2). Z-up world, so the default -9.81 "
-                          "points down.");
+    ImGui::SetItemTooltip(TRL("Gravity (m/s^2). Z-up world, so the default -9.81 "
+                          "points down."));
 
     ImGui::SeparatorText(TR("Stepping"));
     // 固定步长：显示成 Hz 更直观（1/60 ↔ 60 Hz）
     const float step0 = ps.fixedTimeStep;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Step", &ps.fixedTimeStep, 1.0f / 240.0f, 1.0f / 30.0f,
-                       "%.5f s");
+    ImGui::SliderFloat(TRL("Step"), &ps.fixedTimeStep, 1.0f / 240.0f, 1.0f / 30.0f,
+                       TR("%.5f s"));
     fieldEdit(m_ctx, "Physics Step", &ps.fixedTimeStep, step0);
     ImGui::SameLine();
     ImGui::TextDisabled(TR("= %.0f Hz"), 1.0f / std::max(ps.fixedTimeStep, 1e-6f));
@@ -987,13 +996,13 @@ void InspectorPanel::drawPhysicsWorldSection() {
 
     const int sub0 = ps.maxSubSteps;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderInt("Max Substeps", &ps.maxSubSteps, 1, 10);
+    ImGui::SliderInt(TRL("Max Substeps"), &ps.maxSubSteps, 1, 10);
     fieldEdit(m_ctx, "Physics Substeps", &ps.maxSubSteps, sub0);
 
     ImGui::SeparatorText(TR("Solver"));
     const int vi0 = ps.velocityIterations;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderInt("Velocity Iters", &ps.velocityIterations, 1, 30);
+    ImGui::SliderInt(TRL("Velocity Iters"), &ps.velocityIterations, 1, 30);
     fieldEdit(m_ctx, "Velocity Iterations", &ps.velocityIterations, vi0);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
@@ -1003,12 +1012,12 @@ void InspectorPanel::drawPhysicsWorldSection() {
 
     const int pi0 = ps.positionIterations;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderInt("Position Iters", &ps.positionIterations, 0, 12);
+    ImGui::SliderInt(TRL("Position Iters"), &ps.positionIterations, 0, 12);
     fieldEdit(m_ctx, "Position Iterations", &ps.positionIterations, pi0);
 
     const float bau0 = ps.baumgarte;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Baumgarte", &ps.baumgarte, 0.0f, 0.9f, "%.3f");
+    ImGui::SliderFloat(TRL("Baumgarte"), &ps.baumgarte, 0.0f, 0.9f, "%.3f");
     fieldEdit(m_ctx, "Baumgarte", &ps.baumgarte, bau0);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
@@ -1018,7 +1027,7 @@ void InspectorPanel::drawPhysicsWorldSection() {
 
     const float slop0 = ps.slop;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Slop", &ps.slop, 0.0f, 0.02f, "%.4f m");
+    ImGui::SliderFloat(TRL("Slop"), &ps.slop, 0.0f, 0.02f, TR("%.4f m"));
     fieldEdit(m_ctx, "Slop", &ps.slop, slop0);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
@@ -1042,19 +1051,19 @@ void InspectorPanel::drawPhysicsWorldSection() {
     ImGui::BeginDisabled(!ps.allowSleep);
     const float slt0 = ps.sleepLinearThreshold;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Linear Thresh", &ps.sleepLinearThreshold, 0.0f, 0.5f,
-                       "%.3f m/s");
+    ImGui::SliderFloat(TRL("Linear Thresh"), &ps.sleepLinearThreshold, 0.0f, 0.5f,
+                       TR("%.3f m/s"));
     fieldEdit(m_ctx, "Sleep Linear Threshold", &ps.sleepLinearThreshold, slt0);
 
     const float sat0 = ps.sleepAngularThreshold;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Angular Thresh", &ps.sleepAngularThreshold, 0.0f, 1.0f,
-                       "%.3f rad/s");
+    ImGui::SliderFloat(TRL("Angular Thresh"), &ps.sleepAngularThreshold, 0.0f, 1.0f,
+                       TR("%.3f rad/s"));
     fieldEdit(m_ctx, "Sleep Angular Threshold", &ps.sleepAngularThreshold, sat0);
 
     const float st0 = ps.sleepTime;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Sleep Time", &ps.sleepTime, 0.0f, 3.0f, "%.2f s");
+    ImGui::SliderFloat(TRL("Sleep Time"), &ps.sleepTime, 0.0f, 3.0f, TR("%.2f s"));
     fieldEdit(m_ctx, "Sleep Time", &ps.sleepTime, st0);
     ImGui::EndDisabled();
 
@@ -1073,8 +1082,8 @@ void InspectorPanel::drawPhysicsWorldSection() {
             ImGui::GetItemRectMax());
     if (!info.active) {
         ImGui::TextDisabled(m_ctx.isEditing()
-                                ? "not simulating (edit mode - press Play)"
-                                : "not simulating (physics disabled)");
+                                ? TRL("not simulating (edit mode - press Play)")
+                                : TRL("not simulating (physics disabled)"));
     } else {
         ImGui::Text(TR("step %llu   t %.2f s"), info.steps,
                     static_cast<double>(info.simTime));
@@ -1151,7 +1160,7 @@ void InspectorPanel::drawRigidBodySection(ecs::Entity e) {
     static const char* kTypes[] = {"Static", "Kinematic", "Dynamic"};
     int type = static_cast<int>(rb->bodyType);
     ImGui::SetNextItemWidth(kPhysParamW);
-    if (ImGui::Combo(TR("Type"), &type, kTypes, 3)) {
+    if (ImGui::Combo(TR("Type"), &type, TrItems<3>(kTypes), 3)) {
         const ecs::PhysicsBodyType prev = rb->bodyType;
         rb->bodyType = static_cast<ecs::PhysicsBodyType>(type);
         discreteEdit(m_ctx, "Body Type", &rb->bodyType, prev);
@@ -1172,7 +1181,7 @@ void InspectorPanel::drawRigidBodySection(ecs::Entity e) {
                                     "Convex Hull"};
     int shape = static_cast<int>(rb->shape);
     ImGui::SetNextItemWidth(kPhysParamW);
-    if (ImGui::Combo(TR("Shape"), &shape, kShapes, 5)) {
+    if (ImGui::Combo(TR("Shape"), &shape, TrItems<5>(kShapes), 5)) {
         const ecs::PhysicsShapeType prev = rb->shape;
         rb->shape = static_cast<ecs::PhysicsShapeType>(shape);
         discreteEdit(m_ctx, "Body Shape", &rb->shape, prev);
@@ -1193,27 +1202,27 @@ void InspectorPanel::drawRigidBodySection(ecs::Entity e) {
     if (rb->shape == ecs::PhysicsShapeType::Sphere) {
         const float r0 = rb->radius;
         ImGui::SetNextItemWidth(kPhysParamW);
-        ImGui::SliderFloat("Radius", &rb->radius, 0.01f, 10.0f, "%.3f m");
+        ImGui::SliderFloat(TRL("Radius"), &rb->radius, 0.01f, 10.0f, TR("%.3f m"));
         fieldEdit(m_ctx, "Body Radius", &rb->radius, r0);
     } else if (rb->shape == ecs::PhysicsShapeType::Capsule) {
         const float r0 = rb->radius;
         ImGui::SetNextItemWidth(kPhysParamW);
-        ImGui::SliderFloat("Radius", &rb->radius, 0.01f, 10.0f, "%.3f m");
+        ImGui::SliderFloat(TRL("Radius"), &rb->radius, 0.01f, 10.0f, TR("%.3f m"));
         fieldEdit(m_ctx, "Body Radius", &rb->radius, r0);
         const float h0 = rb->halfHeight;
         ImGui::SetNextItemWidth(kPhysParamW);
-        ImGui::SliderFloat("Half Height", &rb->halfHeight, 0.0f, 10.0f,
-                           "%.3f m");
+        ImGui::SliderFloat(TRL("Half Height"), &rb->halfHeight, 0.0f, 10.0f,
+                           TR("%.3f m"));
         fieldEdit(m_ctx, "Body Half Height", &rb->halfHeight, h0);
-        ImGui::SetItemTooltip("Half height of the cylindrical section (the two "
-                              "hemispheres add Radius on top).");
+        ImGui::SetItemTooltip(TRL("Half height of the cylindrical section (the two "
+                              "hemispheres add Radius on top)."));
     } else if (rb->shape == ecs::PhysicsShapeType::Box) {
         const glm::vec3 h0 = rb->halfExtents;
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::DragFloat3("##phys-half", glm::value_ptr(rb->halfExtents),
                           sp(0.01f), 0.001f, 100.0f);
         fieldEdit(m_ctx, "Body Half Extents", &rb->halfExtents, h0);
-        ImGui::SetItemTooltip("Half extents (m)");
+        ImGui::SetItemTooltip(TRL("Half extents (m)"));
     } else {
         ImGui::TextDisabled(TR("shape is derived at Play time"));
     }
@@ -1221,7 +1230,7 @@ void InspectorPanel::drawRigidBodySection(ecs::Entity e) {
     ImGui::SeparatorText(TR("Mass"));
     const float m0 = rb->mass;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::DragFloat("Mass", &rb->mass, sp(1.0f), 0.0f, 100000.0f, "%.1f kg");
+    ImGui::DragFloat(TRL("Mass"), &rb->mass, sp(1.0f), 0.0f, 100000.0f, TR("%.1f kg"));
     fieldEdit(m_ctx, "Body Mass", &rb->mass, m0);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
@@ -1230,21 +1239,21 @@ void InspectorPanel::drawRigidBodySection(ecs::Entity e) {
     }
     const float d0 = rb->density;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::DragFloat("Density", &rb->density, sp(10.0f), 0.0f, 100000.0f,
-                     "%.0f kg/m3");
+    ImGui::DragFloat(TRL("Density"), &rb->density, sp(10.0f), 0.0f, 100000.0f,
+                     TR("%.0f kg/m3"));
     fieldEdit(m_ctx, "Body Density", &rb->density, d0);
-    ImGui::SetItemTooltip("Used only when Mass = 0. 500 kg/m3 = a 1 m cube "
-                          "weighs 250 kg.");
+    ImGui::SetItemTooltip(TRL("Used only when Mass = 0. 500 kg/m3 = a 1 m cube "
+                          "weighs 250 kg."));
 
     ImGui::SeparatorText(TR("Material"));
     const float sf0 = rb->staticFriction;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Static Friction", &rb->staticFriction, 0.0f, 1.5f,
+    ImGui::SliderFloat(TRL("Static Friction"), &rb->staticFriction, 0.0f, 1.5f,
                        "%.2f");
     fieldEdit(m_ctx, "Body Static Friction", &rb->staticFriction, sf0);
     const float df0 = rb->dynamicFriction;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Dynamic Friction", &rb->dynamicFriction, 0.0f, 1.5f,
+    ImGui::SliderFloat(TRL("Dynamic Friction"), &rb->dynamicFriction, 0.0f, 1.5f,
                        "%.2f");
     fieldEdit(m_ctx, "Body Dynamic Friction", &rb->dynamicFriction, df0);
     if (ImGui::IsItemHovered()) {
@@ -1255,19 +1264,19 @@ void InspectorPanel::drawRigidBodySection(ecs::Entity e) {
     }
     const float re0 = rb->restitution;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Restitution", &rb->restitution, 0.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Restitution"), &rb->restitution, 0.0f, 1.0f, "%.2f");
     fieldEdit(m_ctx, "Body Restitution", &rb->restitution, re0);
-    ImGui::SetItemTooltip("0 = dead stop on landing, 1 = perfectly bouncy.");
+    ImGui::SetItemTooltip(TRL("0 = dead stop on landing, 1 = perfectly bouncy."));
 
     ImGui::SeparatorText(TR("Behaviour"));
     const float ld0 = rb->linearDamping;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Linear Damping", &rb->linearDamping, 0.0f, 2.0f,
+    ImGui::SliderFloat(TRL("Linear Damping"), &rb->linearDamping, 0.0f, 2.0f,
                        "%.3f");
     fieldEdit(m_ctx, "Body Linear Damping", &rb->linearDamping, ld0);
     const float ad0 = rb->angularDamping;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Angular Damping", &rb->angularDamping, 0.0f, 2.0f,
+    ImGui::SliderFloat(TRL("Angular Damping"), &rb->angularDamping, 0.0f, 2.0f,
                        "%.3f");
     fieldEdit(m_ctx, "Body Angular Damping", &rb->angularDamping, ad0);
     if (ImGui::IsItemHovered()) {
@@ -1295,7 +1304,7 @@ void InspectorPanel::drawRigidBodySection(ecs::Entity e) {
     ImGui::DragFloat3("##phys-linvel", glm::value_ptr(rb->initialVelocity),
                       sp(0.1f));
     fieldEdit(m_ctx, "Body Initial Velocity", &rb->initialVelocity, lv0);
-    ImGui::SetItemTooltip("Applied once, the moment Play starts.");
+    ImGui::SetItemTooltip(TRL("Applied once, the moment Play starts."));
 
     const glm::vec3 av0 = rb->initialAngularVelocity;
     ImGui::SetNextItemWidth(-1.0f);
@@ -1356,14 +1365,14 @@ void InspectorPanel::drawCharacterSection(ecs::Entity e) {
     ImGui::SeparatorText(TR("Capsule"));
     const float r0 = cc->radius;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Radius", &cc->radius, 0.05f, 1.0f, "%.3f m");
+    ImGui::SliderFloat(TRL("Radius"), &cc->radius, 0.05f, 1.0f, TR("%.3f m"));
     fieldEdit(m_ctx, "Char Radius", &cc->radius, r0);
     const float hh0 = cc->halfHeight;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Half Height", &cc->halfHeight, 0.0f, 2.0f, "%.3f m");
+    ImGui::SliderFloat(TRL("Half Height"), &cc->halfHeight, 0.0f, 2.0f, TR("%.3f m"));
     fieldEdit(m_ctx, "Char Half Height", &cc->halfHeight, hh0);
-    ImGui::SetItemTooltip("Total height = 2 x (Half Height + Radius). The object "
-                          "origin is at the FEET, not the centre.");
+    ImGui::SetItemTooltip(TRL("Total height = 2 x (Half Height + Radius). The object "
+                          "origin is at the FEET, not the centre."));
     // 锚点记在**提前返回之后**（见项目纪律）：header 只要函数被调用就会
     // 打，只有 body 才能证明这一段真的展开着、控件真的建出来了。
     logRect("INS-PHYS-CHAR-BODY", ImGui::GetItemRectMin(),
@@ -1372,75 +1381,75 @@ void InspectorPanel::drawCharacterSection(ecs::Entity e) {
     ImGui::SeparatorText(TR("Walking"));
     const float st0 = cc->stepHeight;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Step Height", &cc->stepHeight, 0.0f, 1.0f, "%.3f m");
+    ImGui::SliderFloat(TRL("Step Height"), &cc->stepHeight, 0.0f, 1.0f, TR("%.3f m"));
     fieldEdit(m_ctx, "Char Step Height", &cc->stepHeight, st0);
-    ImGui::SetItemTooltip("Ledges up to this height are walked over instead of "
+    ImGui::SetItemTooltip(TRL("Ledges up to this height are walked over instead of "
                           "blocking. Roughly a third of the capsule radius is a "
-                          "good default; more looks like teleporting.");
+                          "good default; more looks like teleporting."));
     const float sl0 = cc->slopeLimitDeg;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Slope Limit", &cc->slopeLimitDeg, 10.0f, 89.0f,
-                       "%.0f deg");
+    ImGui::SliderFloat(TRL("Slope Limit"), &cc->slopeLimitDeg, 10.0f, 89.0f,
+                       TR("%.0f deg"));
     fieldEdit(m_ctx, "Char Slope Limit", &cc->slopeLimitDeg, sl0);
-    ImGui::SetItemTooltip("Steeper than this is not floor: gravity keeps "
-                          "pulling and the character slides down.");
+    ImGui::SetItemTooltip(TRL("Steeper than this is not floor: gravity keeps "
+                          "pulling and the character slides down."));
 
     bool snap = cc->groundSnap;
     if (ImGui::Checkbox(TR("Snap To Ground"), &snap)) {
         cc->groundSnap = snap;
         discreteEdit(m_ctx, "Char Ground Snap", &cc->groundSnap, !snap);
     }
-    ImGui::SetItemTooltip("Sticks to the floor when walking down slopes. Off = "
-                          "you bounce down every step of a staircase.");
+    ImGui::SetItemTooltip(TRL("Sticks to the floor when walking down slopes. Off = "
+                          "you bounce down every step of a staircase."));
     if (cc->groundSnap) {
         const float gs0 = cc->groundSnapDistance;
         ImGui::SetNextItemWidth(kPhysParamW);
-        ImGui::SliderFloat("Snap Distance", &cc->groundSnapDistance, 0.02f,
-                           1.0f, "%.2f m");
+        ImGui::SliderFloat(TRL("Snap Distance"), &cc->groundSnapDistance, 0.02f,
+                           1.0f, TR("%.2f m"));
         fieldEdit(m_ctx, "Char Snap Distance", &cc->groundSnapDistance, gs0);
     }
 
     ImGui::SeparatorText(TR("Motion"));
     const float ms0 = cc->maxSpeed;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Max Speed", &cc->maxSpeed, 0.5f, 20.0f, "%.2f m/s");
+    ImGui::SliderFloat(TRL("Max Speed"), &cc->maxSpeed, 0.5f, 20.0f, TR("%.2f m/s"));
     fieldEdit(m_ctx, "Char Max Speed", &cc->maxSpeed, ms0);
     const float sp0 = cc->sprintMultiplier;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Sprint x", &cc->sprintMultiplier, 1.0f, 4.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Sprint x"), &cc->sprintMultiplier, 1.0f, 4.0f, "%.2f");
     fieldEdit(m_ctx, "Char Sprint", &cc->sprintMultiplier, sp0);
     const float ac0 = cc->acceleration;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Acceleration", &cc->acceleration, 1.0f, 200.0f,
-                       "%.0f m/s2");
+    ImGui::SliderFloat(TRL("Acceleration"), &cc->acceleration, 1.0f, 200.0f,
+                       TR("%.0f m/s2"));
     fieldEdit(m_ctx, "Char Acceleration", &cc->acceleration, ac0);
-    ImGui::SetItemTooltip("How fast the character reaches Max Speed. Very high "
-                          "values feel like ice-free tank controls.");
+    ImGui::SetItemTooltip(TRL("How fast the character reaches Max Speed. Very high "
+                          "values feel like ice-free tank controls."));
     const float js0 = cc->jumpSpeed;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Jump Speed", &cc->jumpSpeed, 0.0f, 15.0f, "%.2f m/s");
+    ImGui::SliderFloat(TRL("Jump Speed"), &cc->jumpSpeed, 0.0f, 15.0f, TR("%.2f m/s"));
     fieldEdit(m_ctx, "Char Jump Speed", &cc->jumpSpeed, js0);
-    ImGui::SetItemTooltip("Initial upward speed. Height ~ v^2 / (2 * 9.81).");
+    ImGui::SetItemTooltip(TRL("Initial upward speed. Height ~ v^2 / (2 * 9.81)."));
     const float gsc0 = cc->gravityScale;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Gravity Scale", &cc->gravityScale, 0.0f, 3.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Gravity Scale"), &cc->gravityScale, 0.0f, 3.0f, "%.2f");
     fieldEdit(m_ctx, "Char Gravity Scale", &cc->gravityScale, gsc0);
     const float air0 = cc->airControl;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Air Control", &cc->airControl, 0.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Air Control"), &cc->airControl, 0.0f, 1.0f, "%.2f");
     fieldEdit(m_ctx, "Char Air Control", &cc->airControl, air0);
-    ImGui::SetItemTooltip("Fraction of the ground acceleration that still "
-                          "applies while airborne.");
+    ImGui::SetItemTooltip(TRL("Fraction of the ground acceleration that still "
+                          "applies while airborne."));
     const float ts0 = cc->turnSpeed;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Turn Speed", &cc->turnSpeed, 1.0f, 40.0f, "%.1f /s");
+    ImGui::SliderFloat(TRL("Turn Speed"), &cc->turnSpeed, 1.0f, 40.0f, "%.1f /s");
     fieldEdit(m_ctx, "Char Turn Speed", &cc->turnSpeed, ts0);
     const float ps0 = cc->pushStrength;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Push Strength", &cc->pushStrength, 0.0f, 5.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Push Strength"), &cc->pushStrength, 0.0f, 5.0f, "%.2f");
     fieldEdit(m_ctx, "Char Push", &cc->pushStrength, ps0);
-    ImGui::SetItemTooltip("How hard the kinematic proxy shoves dynamic bodies "
-                          "it walks into.");
+    ImGui::SetItemTooltip(TRL("How hard the kinematic proxy shoves dynamic bodies "
+                          "it walks into."));
 
     ImGui::Separator();
     if (ImGui::Button(TR("Remove Character Controller"))) {
@@ -1485,15 +1494,15 @@ void InspectorPanel::drawTriggerSection(ecs::Entity e) {
         tr->enabled = en;
         discreteEdit(m_ctx, "Trigger Enabled", &tr->enabled, !en);
     }
-    ImGui::SetItemTooltip("Off = the volume stays but reports nothing.");
+    ImGui::SetItemTooltip(TRL("Off = the volume stays but reports nothing."));
     bool stay = tr->reportStay;
     if (ImGui::Checkbox(TR("Report Stay"), &stay)) {
         tr->reportStay = stay;
         discreteEdit(m_ctx, "Trigger Stay", &tr->reportStay, !stay);
     }
-    ImGui::SetItemTooltip("Stay fires every frame for every overlapping body - "
+    ImGui::SetItemTooltip(TRL("Stay fires every frame for every overlapping body - "
                           "that is the main cost of a trigger. Turn it off when "
-                          "you only care about entering.");
+                          "you only care about entering."));
     int mask = static_cast<int>(tr->mask);
     ImGui::SetNextItemWidth(kPhysParamW);
     if (ImGui::InputInt(TR("Layer Mask"), &mask, 0, 0,
@@ -1502,8 +1511,8 @@ void InspectorPanel::drawTriggerSection(ecs::Entity e) {
         tr->mask = static_cast<unsigned>(mask);
         discreteEdit(m_ctx, "Trigger Mask", &tr->mask, prev);
     }
-    ImGui::SetItemTooltip("Bit mask of the layers this volume reports. "
-                          "0xFFFFFFFF = report everything.");
+    ImGui::SetItemTooltip(TRL("Bit mask of the layers this volume reports. "
+                          "0xFFFFFFFF = report everything."));
     logRect("INS-PHYS-TRIGGER-BODY", ImGui::GetItemRectMin(),
             ImGui::GetItemRectMax());
 
@@ -1540,23 +1549,23 @@ void InspectorPanel::drawPhysicsMaterialSection(ecs::Entity e) {
     ImGui::BeginDisabled(!m_ctx.isEditing());
     const float sf0 = pm->staticFriction;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Static Friction", &pm->staticFriction, 0.0f, 1.5f,
+    ImGui::SliderFloat(TRL("Static Friction"), &pm->staticFriction, 0.0f, 1.5f,
                        "%.2f");
     fieldEdit(m_ctx, "Mat Static Friction", &pm->staticFriction, sf0);
     const float df0 = pm->dynamicFriction;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Dynamic Friction", &pm->dynamicFriction, 0.0f, 1.5f,
+    ImGui::SliderFloat(TRL("Dynamic Friction"), &pm->dynamicFriction, 0.0f, 1.5f,
                        "%.2f");
     fieldEdit(m_ctx, "Mat Dynamic Friction", &pm->dynamicFriction, df0);
     const float re0 = pm->restitution;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Restitution", &pm->restitution, 0.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Restitution"), &pm->restitution, 0.0f, 1.0f, "%.2f");
     fieldEdit(m_ctx, "Mat Restitution", &pm->restitution, re0);
-    ImGui::SetItemTooltip("Two bodies touching: restitution takes the LARGER "
-                          "of the two, so one bouncy surface is enough.");
+    ImGui::SetItemTooltip(TRL("Two bodies touching: restitution takes the LARGER "
+                          "of the two, so one bouncy surface is enough."));
     const float de0 = pm->density;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Density", &pm->density, 1.0f, 5000.0f, "%.0f kg/m3");
+    ImGui::SliderFloat(TRL("Density"), &pm->density, 1.0f, 5000.0f, TR("%.0f kg/m3"));
     fieldEdit(m_ctx, "Mat Density", &pm->density, de0);
     logRect("INS-PHYS-MAT-BODY", ImGui::GetItemRectMin(),
             ImGui::GetItemRectMax());
@@ -1590,7 +1599,7 @@ void InspectorPanel::drawCameraComponentSection(ecs::Entity e) {
     ImGui::BeginDisabled(!m_ctx.isEditing());
     const float f0 = cam->fov;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("FOV", &cam->fov, 20.0f, 120.0f, "%.1f deg");
+    ImGui::SliderFloat(TRL("FOV"), &cam->fov, 20.0f, 120.0f, TR("%.1f deg"));
     fieldEdit(m_ctx, "Cam FOV", &cam->fov, f0);
     int prio = cam->priority;
     ImGui::SetNextItemWidth(kPhysParamW);
@@ -1599,9 +1608,9 @@ void InspectorPanel::drawCameraComponentSection(ecs::Entity e) {
         cam->priority = prio;
         discreteEdit(m_ctx, "Cam Priority", &cam->priority, prev);
     }
-    ImGui::SetItemTooltip("Highest priority among ENABLED cameras wins. Ties go "
+    ImGui::SetItemTooltip(TRL("Highest priority among ENABLED cameras wins. Ties go "
                           "to the lower entity id, so the winner never changes "
-                          "just because the tree was walked in another order.");
+                          "just because the tree was walked in another order."));
     bool en = cam->enabled;
     if (ImGui::Checkbox(TR("Enabled"), &en)) {
         cam->enabled = en;
@@ -1616,23 +1625,23 @@ void InspectorPanel::drawCameraComponentSection(ecs::Entity e) {
     ImGui::DragFloat3("##cam-target-offset", glm::value_ptr(cam->targetOffset),
                       sp(0.02f));
     fieldEdit(m_ctx, "Cam Target Offset", &cam->targetOffset, to0);
-    ImGui::SetItemTooltip("Look-at point relative to the capsule CENTRE (the "
-                          "object origin is at the feet).");
+    ImGui::SetItemTooltip(TRL("Look-at point relative to the capsule CENTRE (the "
+                          "object origin is at the feet)."));
     const float d0 = cam->distance;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Arm Length", &cam->distance, 0.2f, 20.0f, "%.2f m");
+    ImGui::SliderFloat(TRL("Arm Length"), &cam->distance, 0.2f, 20.0f, TR("%.2f m"));
     fieldEdit(m_ctx, "Cam Distance", &cam->distance, d0);
     const float md0 = cam->minDistance;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Min Arm", &cam->minDistance, 0.1f, 5.0f, "%.2f m");
+    ImGui::SliderFloat(TRL("Min Arm"), &cam->minDistance, 0.1f, 5.0f, TR("%.2f m"));
     fieldEdit(m_ctx, "Cam Min Distance", &cam->minDistance, md0);
     bool col = cam->collideWithWorld;
     if (ImGui::Checkbox(TR("Collide With World"), &col)) {
         cam->collideWithWorld = col;
         discreteEdit(m_ctx, "Cam Collide", &cam->collideWithWorld, !col);
     }
-    ImGui::SetItemTooltip("Shortens the arm when a wall is in the way. Off = the "
-                          "camera clips through geometry (cutscene shots).");
+    ImGui::SetItemTooltip(TRL("Shortens the arm when a wall is in the way. Off = the "
+                          "camera clips through geometry (cutscene shots)."));
     logRect("INS-CAM-COMP-BODY", ImGui::GetItemRectMin(),
             ImGui::GetItemRectMax());
 
@@ -1641,12 +1650,12 @@ void InspectorPanel::drawCameraComponentSection(ecs::Entity e) {
          "camera state is bit-for-bit what it was before this feature existed.");
     const float sa0 = cam->shakeAmplitude;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Amplitude", &cam->shakeAmplitude, 0.0f, 0.5f, "%.3f m");
+    ImGui::SliderFloat(TRL("Amplitude"), &cam->shakeAmplitude, 0.0f, 0.5f, TR("%.3f m"));
     fieldEdit(m_ctx, "Cam Shake Amp", &cam->shakeAmplitude, sa0);
     const float sf0 = cam->shakeFrequency;
     ImGui::SetNextItemWidth(kPhysParamW);
-    ImGui::SliderFloat("Frequency", &cam->shakeFrequency, 1.0f, 60.0f,
-                       "%.1f Hz");
+    ImGui::SliderFloat(TRL("Frequency"), &cam->shakeFrequency, 1.0f, 60.0f,
+                       TR("%.1f Hz"));
     fieldEdit(m_ctx, "Cam Shake Freq", &cam->shakeFrequency, sf0);
 
     ImGui::Separator();
@@ -1676,9 +1685,9 @@ void InspectorPanel::drawCameraComponentSection(ecs::Entity e) {
         const auto* oc = w.get<ecs::CameraComponent>(pr.second);
         const std::string* nm = w.name(pr.second);
         char label[128];
-        std::snprintf(label, sizeof(label), "%s  (prio %d)%s", 
+        std::snprintf(label, sizeof(label), TR("%s  (prio %d)%s"), 
                       nm ? nm->c_str() : "?", pr.first,
-                      oc && !oc->enabled ? "  [off]" : "");
+                      oc && !oc->enabled ? TR("  [off]") : "");
         if (rank == 0) {
             ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "%s",
                                label);
@@ -1731,9 +1740,53 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
         ImGui::TextDisabled(TR("skeleton: (no model bound)"));
     }
     ImGui::Text(TR("joint base index: %d"), sk->jointBase);
-    ImGui::Text(TR("clip time: %.3f s"), sk->time);
-    ImGui::SameLine();
-    ImGui::TextDisabled(TR("(advanced by the player)"));
+
+    // ---- 权威字段（A1）----
+    // 有 AnimatorComponent → 绑它的那四项（它是权威，AnimatorSystem 每帧
+    // 把它们镜像回 sk）；没有 → 绑 sk 的那四项（A0 老路径，行为逐位不变）。
+    //
+    // ⚠ 不能"两个都显示/两个都可写"：AnimatorSystem 每帧把 anim 的值写回
+    //   sk，于是写 sk 的那一半下一帧就被覆盖 —— 症状是"拖了时间轴又弹回去"，
+    //   而日志里 time 确实在变（变的是 anim 那一份）。
+    ecs::AnimatorComponent* an = w.get<ecs::AnimatorComponent>(e);
+    float& time = an ? an->time : sk->time;
+    float& speed = an ? an->speed : sk->speed;
+    bool& playing = an ? an->playing : sk->playing;
+    bool& loop = an ? an->loop : sk->loop;
+
+    // 当前 clip 与时长：换 clip 时这里立刻反映，不用再去猜时间轴右端在哪。
+    const assets::AnimationClip* clip = nullptr;
+    if (sk->model && sk->model->skeleton && !sk->clipName.empty())
+        clip = sk->model->skeleton->findClip(sk->clipName);
+    const float dur = clip ? clip->duration : 0.0f;
+    if (clip) {
+        ImGui::Text(TR("clip: %s  (%.3f s)"), clip->name.c_str(),
+                    static_cast<double>(dur));
+    } else if (sk->clipName.empty()) {
+        ImGui::TextDisabled(TR("clip: (rest pose - nothing playing)"));
+    } else {
+        ImGui::TextDisabled(TR("clip: '%s' NOT FOUND in this skeleton"),
+                            sk->clipName.c_str());
+    }
+
+    // ---- 时间轴（角色链 A0-3 的可见面；A1 起绑权威字段）----
+    // 拖它直接改权威 time，下一帧 AnimatorSystem 按新的 time 重算关节矩阵
+    // → 视口姿势立刻跟着动。这是"动画能可视化调"的最小入口；
+    // A7 的 Animator 面板会把它扩成带事件标记的完整时间轴。
+    const float t0 = time;
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::SliderFloat("##animtime", &time, 0.0f,
+                       dur > 0.0f ? dur : 0.001f, TR("%.3f s"));
+    logRect("INS-ANIM-TIME", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemActive()) m_ctx.dirty() = true;
+    fieldEdit(m_ctx, "Set Animation Time", &time, t0);
+
+    // time / duration 文本（A1 的验收原文要这一条）：滑条上看不出"现在
+    // 是第几秒 / 一共多长"，而截图断言与人工复核都需要一个能读的数字。
+    ImGui::TextDisabled(TR("time: %.3f / %.3f s"), static_cast<double>(time),
+                        static_cast<double>(dur));
+    logRect("INS-ANIM-TIMETEXT", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
 
     ImGui::SeparatorText(TR("Playback"));
 
@@ -1746,7 +1799,7 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
         m_skinnedBufFor = e;
     }
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##skinclip", "clip name (empty = rest pose)",
+    ImGui::InputTextWithHint("##skinclip", TRL("clip name (empty = rest pose)"),
                              m_skinnedBuf, sizeof(m_skinnedBuf));
     if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
         const std::string newClip = m_skinnedBuf;
@@ -1755,21 +1808,111 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
             // memcpy 一个 std::string 是未定义行为）→ 用闭包命令。
             m_ctx.structuralEdit("Set Animation Clip",
                                  [&]() { sk->clipName = newClip; });
+            // 换了 clip 就等于"用户自己指定了"，把一次性补 default 的闸门
+            // 关上 —— 否则把它清空之后系统又会按 defaultClip 填回来。
+            if (an) an->appliedDefaultClip = true;
         }
     }
 
-    const float s0 = sk->speed;
-    ImGui::SliderFloat("Speed", &sk->speed, 0.0f, 4.0f, "%.2fx");
-    fieldEdit(m_ctx, "Animation Speed", &sk->speed, s0);
+    const float s0 = speed;
+    ImGui::SliderFloat(TRL("Speed"), &speed, 0.0f, 4.0f, "%.2fx");
+    fieldEdit(m_ctx, "Animation Speed", &speed, s0);
 
-    bool playing = sk->playing;
+    const bool playing0 = playing;
     if (ImGui::Checkbox(TR("Playing"), &playing)) {
-        sk->playing = playing;
-        discreteEdit(m_ctx, "Toggle Animation Playing", &sk->playing,
-                     !playing);
+        discreteEdit(m_ctx, "Toggle Animation Playing", &playing, playing0);
     }
 
-    hint("no blend tree / state machine yet - this drives a single clip.");
+    // loop：播到末尾绕回开头（false = 停在末帧）。A0-3 新增字段，
+    // 默认 true —— "一段 Walk 播完应该接着走，而不是定格"。
+    const bool loop0 = loop;
+    if (ImGui::Checkbox(TR("Loop"), &loop)) {
+        discreteEdit(m_ctx, "Toggle Animation Loop", &loop, loop0);
+    }
+
+    // ================================================================
+    // Animator 段（A1）
+    // ================================================================
+    ImGui::Separator();
+    ImGui::TextUnformatted(TR("Animator"));
+    logRect("INS-ANIM-ATORHEADER", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    if (!an) {
+        hint("No animator: this entity plays a single clip straight from the "
+             "Skinned Mesh fields above. Add an Animator to get a controller "
+             "(state machine / blending lands in A2).");
+        if (ImGui::Button(TR("Add Animator"))) {
+            m_ctx.structuralEdit("Add Animator", [&]() {
+                ecs::AnimatorComponent a;
+                // defaultClip 从"当前正在播的那一段"接手：加完动画器不该
+                // 让画面变样（否则用户会以为按钮把动画弄坏了）。
+                a.defaultClip = sk->clipName;
+                a.time = sk->time;
+                a.speed = sk->speed;
+                a.playing = sk->playing;
+                a.loop = sk->loop;
+                w.add<ecs::AnimatorComponent>(e, a);
+            });
+        }
+        logRect("INS-ANIM-ADDANIM", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        return;
+    }
+
+    ImGui::TextDisabled(TR("state: %d   time in state: %.2f s"), an->stateIndex,
+                        static_cast<double>(an->stateTime));
+
+    // 控制器路径（A2 才有人读它；现在空着就是单 clip 直放模式）
+    const bool sameCtrl = (m_animCtrlBufFor == e);
+    if (!sameCtrl) {
+        std::snprintf(m_animCtrlBuf, sizeof(m_animCtrlBuf), "%s",
+                      an->controllerPath.c_str());
+        m_animCtrlBufFor = e;
+    }
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##animctrl", TRL("controller path (empty = single clip)"),
+                             m_animCtrlBuf, sizeof(m_animCtrlBuf));
+    if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+        const std::string nc = m_animCtrlBuf;
+        if (nc != an->controllerPath) {
+            m_ctx.structuralEdit("Set Animator Controller",
+                                 [&]() { an->controllerPath = nc; });
+        }
+    }
+
+    // defaultClip：只影响"clipName 还空着"的那一次（见 appliedDefaultClip）
+    const bool sameDef = (m_animDefBufFor == e);
+    if (!sameDef) {
+        std::snprintf(m_animDefBuf, sizeof(m_animDefBuf), "%s",
+                      an->defaultClip.c_str());
+        m_animDefBufFor = e;
+    }
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##animdef", TRL("default clip (used once)"),
+                             m_animDefBuf, sizeof(m_animDefBuf));
+    if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+        const std::string nd = m_animDefBuf;
+        if (nd != an->defaultClip) {
+            m_ctx.structuralEdit("Set Default Clip",
+                                 [&]() { an->defaultClip = nd; });
+        }
+    }
+
+    // 根运动（A4 才会真的驱动位移；这里先把契约摆出来）
+    static const char* const kRootMotion[3] = {
+        "Off", "From clip", "Delta only"};
+    int rm = static_cast<int>(an->rootMotion);
+    if (ImGui::Combo(TRL("Root motion"), &rm, TrItems<3>(kRootMotion), 3)) {
+        const auto prev = an->rootMotion;
+        an->rootMotion = static_cast<ecs::AnimatorComponent::RootMotionMode>(rm);
+        discreteEdit(m_ctx, "Set Root Motion Mode", &an->rootMotion, prev);
+    }
+    logRect("INS-ANIM-ROOTMOTION", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    hint("root motion is a placeholder until A4; the controller / state "
+         "machine lands in A2 (docs/character_pipeline_roadmap.md).");
 }
 
 // 输出页：引擎目前真的没有"输出设置"（分辨率 / 格式 / 保存路径都还没排进
@@ -1841,7 +1984,10 @@ bool InspectorPanel::sectionHeader(const char* name, bool defaultOpen,
     // 只在 ImGui 尚未建立该分区状态时施加初始值（首帧 / 注入折叠）；
     // 之后由 ImGui 自身存储接用户点击，这里只把当代状态同步回来。
     ImGui::SetNextItemOpen(wantOpen, ImGuiCond_Appearing);
-    const bool open = ImGui::CollapsingHeader(name);
+    // ⚠ 标题同时是 ImGui 的窗口内 ID：直接换成译文会让折叠状态在切语言时
+    //   全部失忆（m_sectionOpen 是按 k 记的，但 ImGui 自己的存储按 label 哈希）。
+    //   trId 返回 "译文###稳定 key"，显示中文、ID 永远是英文。
+    const bool open = ImGui::CollapsingHeader(trId(name, k));
     m_sectionOpen[k] = open;
     ++m_sectionsDrawn;
 
@@ -2079,30 +2225,30 @@ void InspectorPanel::drawCameraSection() {
         }
 
         glm::vec3 t = cam.target();
-        if (ImGui::DragFloat3("Target", glm::value_ptr(t), sp(0.05f))) {
+        if (ImGui::DragFloat3(TRL("Target"), glm::value_ptr(t), sp(0.05f))) {
             cam.setTarget(t);
         }
         float dist = cam.distance();
-        if (ImGui::DragFloat("Distance", &dist, sp(0.1f), 0.5f, 200.0f)) {
+        if (ImGui::DragFloat(TRL("Distance"), &dist, sp(0.1f), 0.5f, 200.0f)) {
             cam.setDistance(dist);
         }
         float fov = cam.fov();
-        if (ImGui::SliderFloat("FOV", &fov, 15.0f, 110.0f)) cam.setFov(fov);
+        if (ImGui::SliderFloat(TRL("FOV"), &fov, 15.0f, 110.0f)) cam.setFov(fov);
 
         // yaw / pitch 是角度，给个直观的滑块
         float yawDeg = glm::degrees(cam.yaw());
-        if (ImGui::SliderFloat("Yaw", &yawDeg, -180.0f, 180.0f, "%.1f deg")) {
+        if (ImGui::SliderFloat(TRL("Yaw"), &yawDeg, -180.0f, 180.0f, TR("%.1f deg"))) {
             cam.setYaw(glm::radians(yawDeg));
         }
         float pitchDeg = glm::degrees(cam.pitch());
-        if (ImGui::SliderFloat("Pitch", &pitchDeg, -85.0f, 85.0f, "%.1f deg")) {
+        if (ImGui::SliderFloat(TRL("Pitch"), &pitchDeg, -85.0f, 85.0f, TR("%.1f deg"))) {
             cam.setPitch(glm::radians(pitchDeg));
         }
 
         // ---- 导航灵敏度（原相机浮层的内容）----
         float sens = m_ctx.navSensitivity();
         ImGui::SetNextItemWidth(140.0f);
-        if (ImGui::InputFloat("Sensitivity", &sens, 0.0f, 0.0f, "%.2f")) {
+        if (ImGui::InputFloat(TRL("Sensitivity"), &sens, 0.0f, 0.0f, "%.2f")) {
             if (sens > 0.0f) {
                 m_ctx.navSensitivityRef() =
                     glm::clamp(sens, EditorContext::kMinSensitivity,
@@ -2190,20 +2336,20 @@ void InspectorPanel::drawSunSection() {
     if (sunOpen) {
         scene::Light& L = sc.light();
         const glm::vec3 db = L.direction;
-        ImGui::DragFloat3("Direction", glm::value_ptr(L.direction), sp(0.01f), -1.0f,
+        ImGui::DragFloat3(TRL("Direction"), glm::value_ptr(L.direction), sp(0.01f), -1.0f,
                           1.0f);
         discreteEdit(m_ctx, "Sun Direction", &L.direction, db);
 
         const glm::vec3 cb = L.color;
-        ImGui::ColorEdit3("Color", glm::value_ptr(L.color));
+        ImGui::ColorEdit3(TRL("Color"), glm::value_ptr(L.color));
         discreteEdit(m_ctx, "Sun Color", &L.color, cb);
 
         const float ib = L.intensity;
-        ImGui::SliderFloat("Intensity", &L.intensity, 0.0f, 4.0f);
+        ImGui::SliderFloat(TRL("Intensity"), &L.intensity, 0.0f, 4.0f);
         discreteEdit(m_ctx, "Sun Intensity", &L.intensity, ib);
 
         const float ab = L.ambientScale;
-        ImGui::SliderFloat("Ambient", &L.ambientScale, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat(TRL("Ambient"), &L.ambientScale, 0.0f, 1.0f, "%.2f");
         discreteEdit(m_ctx, "Ambient Scale", &L.ambientScale, ab);
         hint("Low ambient = indoor mood; 0.55 is a good outdoor default");
     }
@@ -2261,7 +2407,7 @@ void InspectorPanel::drawTransform(ecs::Entity e) {
                           "Uncheck this to adjust the ground."));
     }
     ImGui::SameLine();
-    ImGui::TextDisabled(locked ? "(fixed, cannot be picked or transformed)"
+    ImGui::TextDisabled(locked ? TRL("(fixed, cannot be picked or transformed)")
                                : "(unlocked)");
     ImGui::EndDisabled();
 
@@ -2270,10 +2416,10 @@ void InspectorPanel::drawTransform(ecs::Entity e) {
     // 位置
     const glm::vec3 pb = t->position;
     ImGui::SetNextItemWidth(-90.0f);
-    ImGui::DragFloat3("Position", glm::value_ptr(t->position), sp(0.02f));
+    ImGui::DragFloat3(TRL("Position"), glm::value_ptr(t->position), sp(0.02f));
     fieldEdit(m_ctx, ("Move " + who).c_str(), &t->position, pb);
     ImGui::SameLine();
-    if (ImGui::SmallButton(TR("R##pos")) && m_ctx.isEditing()) {
+    if (ImGui::SmallButton(TRL("R##pos")) && m_ctx.isEditing()) {
         const glm::vec3 zero(0.0f);
         m_ctx.commands().pushAlreadyApplied(
             std::make_unique<RawBytesEditCommand>("Reset Position",
@@ -2286,12 +2432,12 @@ void InspectorPanel::drawTransform(ecs::Entity e) {
     const glm::vec3 rb = t->rotation;
     glm::vec3 rotDeg = glm::degrees(rb);
     ImGui::SetNextItemWidth(-90.0f);
-    if (ImGui::DragFloat3("Rotation", glm::value_ptr(rotDeg), sp(0.5f))) {
+    if (ImGui::DragFloat3(TRL("Rotation"), glm::value_ptr(rotDeg), sp(0.5f))) {
         t->rotation = glm::radians(rotDeg);
     }
     fieldEdit(m_ctx, ("Rotate " + who).c_str(), &t->rotation, rb);
     ImGui::SameLine();
-    if (ImGui::SmallButton(TR("R##rot")) && m_ctx.isEditing()) {
+    if (ImGui::SmallButton(TRL("R##rot")) && m_ctx.isEditing()) {
         const glm::vec3 zero(0.0f);
         m_ctx.commands().pushAlreadyApplied(
             std::make_unique<RawBytesEditCommand>("Reset Rotation", &t->rotation,
@@ -2303,10 +2449,10 @@ void InspectorPanel::drawTransform(ecs::Entity e) {
     // 缩放
     const glm::vec3 sb = t->scale;
     ImGui::SetNextItemWidth(-90.0f);
-    ImGui::DragFloat3("Scale", glm::value_ptr(t->scale), sp(0.01f), 0.001f, 100.0f);
+    ImGui::DragFloat3(TRL("Scale"), glm::value_ptr(t->scale), sp(0.01f), 0.001f, 100.0f);
     fieldEdit(m_ctx, ("Scale " + who).c_str(), &t->scale, sb);
     ImGui::SameLine();
-    if (ImGui::SmallButton(TR("R##scl")) && m_ctx.isEditing()) {
+    if (ImGui::SmallButton(TRL("R##scl")) && m_ctx.isEditing()) {
         const glm::vec3 one(1.0f);
         m_ctx.commands().pushAlreadyApplied(
             std::make_unique<RawBytesEditCommand>("Reset Scale", &t->scale,
@@ -2367,6 +2513,9 @@ void InspectorPanel::drawMeshAndMaterial(ecs::Entity e) {
     drawDecalSection(e);
     drawReflectionProbeSection(e);
     drawParticleEmitterSection(e);
+    // ⚠ 追加在**最后**：`All` 页签的顺序是"旧堆叠顺序一字不改"，
+    //   9 个脚本的 INS-* 锚点都依赖它（MEMORY：别"优化"它）。
+    drawTerrainSection(e);
 }
 
 // ---------------------------------------------------------------- 碰撞体
@@ -2399,7 +2548,7 @@ void InspectorPanel::drawCollisionSection(ecs::Entity e) {
     int shape = static_cast<int>(cc->shape);
     const char* kShapes[] = {"Convex Hull", "Capsule"};
     ImGui::SetNextItemWidth(140.0f);
-    if (ImGui::Combo(TR("Shape"), &shape, kShapes, 2)) {
+    if (ImGui::Combo(TR("Shape"), &shape, TrItems<2>(kShapes), 2)) {
         const auto next = static_cast<ecs::ColliderShape>(shape);
         const auto prev = cc->shape;
         if (next != prev) {
@@ -2460,7 +2609,7 @@ void InspectorPanel::drawCollisionSection(ecs::Entity e) {
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::DragFloat3("##collider-pos", glm::value_ptr(cc->position), sp(0.01f));
     fieldEdit(m_ctx, "Collider Position", &cc->position, p0);
-    ImGui::SetItemTooltip("Position (relative to the object)");
+    ImGui::SetItemTooltip(TRL("Position (relative to the object)"));
 
     const glm::vec3 r0 = cc->rotation;
     ImGui::SetNextItemWidth(-1.0f);
@@ -2469,25 +2618,25 @@ void InspectorPanel::drawCollisionSection(ecs::Entity e) {
         cc->rotation = glm::radians(rotDeg);
     }
     fieldEdit(m_ctx, "Collider Rotation", &cc->rotation, r0);
-    ImGui::SetItemTooltip("Rotation (degrees)");
+    ImGui::SetItemTooltip(TRL("Rotation (degrees)"));
 
     const glm::vec3 s0 = cc->scale;
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::DragFloat3("##collider-scale", glm::value_ptr(cc->scale), sp(0.01f),
                       0.01f, 100.0f);
     fieldEdit(m_ctx, "Collider Scale", &cc->scale, s0);
-    ImGui::SetItemTooltip("Scale (uniform is not required)");
+    ImGui::SetItemTooltip(TRL("Scale (uniform is not required)"));
 
     // ---- 胶囊尺寸 ----
     if (cc->shape == ecs::ColliderShape::Capsule) {
         const float rad0 = cc->capsuleRadius;
         ImGui::SetNextItemWidth(140.0f);
-        ImGui::SliderFloat("Radius", &cc->capsuleRadius, 0.01f, 10.0f, "%.3f");
+        ImGui::SliderFloat(TRL("Radius"), &cc->capsuleRadius, 0.01f, 10.0f, "%.3f");
         fieldEdit(m_ctx, "Collider Radius", &cc->capsuleRadius, rad0);
 
         const float hh0 = cc->capsuleHalfHeight;
         ImGui::SetNextItemWidth(140.0f);
-        ImGui::SliderFloat("Half Height", &cc->capsuleHalfHeight, 0.0f, 10.0f,
+        ImGui::SliderFloat(TRL("Half Height"), &cc->capsuleHalfHeight, 0.0f, 10.0f,
                            "%.3f");
         fieldEdit(m_ctx, "Collider Half Height", &cc->capsuleHalfHeight, hh0);
     } else {
@@ -2542,7 +2691,7 @@ void InspectorPanel::drawDecalSection(ecs::Entity e) {
 
     // ---- 开关 ----
     bool en = dc->enabled;
-    if (ImGui::Checkbox(TR("Enabled##decal"), &en)) {
+    if (ImGui::Checkbox(TRL("Enabled##decal"), &en)) {
         dc->enabled = en;   // discreteEdit 的契约：*target 已持有新值
         discreteEdit(m_ctx, "Toggle Decal", &dc->enabled, !en);
     }
@@ -2558,7 +2707,7 @@ void InspectorPanel::drawDecalSection(ecs::Entity e) {
     // ---- 盒体尺寸（米，沿实体局部轴）----
     const glm::vec3 sz0 = dc->size;
     ImGui::SetNextItemWidth(-110.0f);
-    ImGui::DragFloat3("Size", glm::value_ptr(dc->size), sp(0.01f), 1e-4f, 500.0f,
+    ImGui::DragFloat3(TRL("Size"), glm::value_ptr(dc->size), sp(0.01f), 1e-4f, 500.0f,
                       "%.3f");
     fieldEdit(m_ctx, "Decal Size", &dc->size, sz0);
     if (ImGui::IsItemHovered()) {
@@ -2571,7 +2720,7 @@ void InspectorPanel::drawDecalSection(ecs::Entity e) {
     // ---- 覆盖度 ----
     const float op0 = dc->opacity;
     ImGui::SetNextItemWidth(-110.0f);
-    ImGui::SliderFloat("Opacity", &dc->opacity, 0.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Opacity"), &dc->opacity, 0.0f, 1.0f, "%.2f");
     fieldEdit(m_ctx, "Decal Opacity", &dc->opacity, op0);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(TR("Upper bound on the coverage written to the "
@@ -2581,7 +2730,7 @@ void InspectorPanel::drawDecalSection(ecs::Entity e) {
     labels += ",Opacity";
 
     const glm::vec3 t0 = dc->tint;
-    ImGui::ColorEdit3("Tint", glm::value_ptr(dc->tint),
+    ImGui::ColorEdit3(TRL("Tint"), glm::value_ptr(dc->tint),
                       ImGuiColorEditFlags_NoInputs);
     fieldEdit(m_ctx, "Decal Tint", &dc->tint, t0);
     if (ImGui::IsItemHovered()) {
@@ -2593,19 +2742,19 @@ void InspectorPanel::drawDecalSection(ecs::Entity e) {
     // ---- 贴花自己的 PBR 参数（按 coverage 覆盖被贴表面）----
     const float rg0 = dc->roughness;
     ImGui::SetNextItemWidth(-110.0f);
-    ImGui::SliderFloat("Roughness", &dc->roughness, 0.02f, 1.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Roughness"), &dc->roughness, 0.02f, 1.0f, "%.2f");
     fieldEdit(m_ctx, "Decal Roughness", &dc->roughness, rg0);
     labels += ",Roughness";
 
     const float mt0 = dc->metallic;
     ImGui::SetNextItemWidth(-110.0f);
-    ImGui::SliderFloat("Metallic", &dc->metallic, 0.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Metallic"), &dc->metallic, 0.0f, 1.0f, "%.2f");
     fieldEdit(m_ctx, "Decal Metallic", &dc->metallic, mt0);
     labels += ",Metallic";
 
     const float ns0 = dc->normalScale;
     ImGui::SetNextItemWidth(-110.0f);
-    ImGui::SliderFloat("Normal Scale", &dc->normalScale, 0.0f, 2.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Normal Scale"), &dc->normalScale, 0.0f, 2.0f, "%.2f");
     fieldEdit(m_ctx, "Decal Normal Scale", &dc->normalScale, ns0);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(TR("0 = the decal leaves the surface normal alone,\n"
@@ -2616,7 +2765,7 @@ void InspectorPanel::drawDecalSection(ecs::Entity e) {
     // ---- 淡出 ----
     const float ef0 = dc->edgeFade;
     ImGui::SetNextItemWidth(-110.0f);
-    ImGui::SliderFloat("Edge Fade", &dc->edgeFade, 0.0f, 0.5f, "%.2f");
+    ImGui::SliderFloat(TRL("Edge Fade"), &dc->edgeFade, 0.0f, 0.5f, "%.2f");
     fieldEdit(m_ctx, "Decal Edge Fade", &dc->edgeFade, ef0);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(TR("Soft border, as a fraction of the half extents.\n"
@@ -2627,13 +2776,13 @@ void InspectorPanel::drawDecalSection(ecs::Entity e) {
 
     const float fs0 = dc->fadeStart;
     ImGui::SetNextItemWidth(-110.0f);
-    ImGui::DragFloat("Fade Start", &dc->fadeStart, sp(0.05f), 0.0f, 1000.0f,
+    ImGui::DragFloat(TRL("Fade Start"), &dc->fadeStart, sp(0.05f), 0.0f, 1000.0f,
                      "%.2f");
     fieldEdit(m_ctx, "Decal Fade Start", &dc->fadeStart, fs0);
 
     const float fe0 = dc->fadeEnd;
     ImGui::SetNextItemWidth(-110.0f);
-    ImGui::DragFloat("Fade End", &dc->fadeEnd, sp(0.05f), 0.0f, 1000.0f, "%.2f");
+    ImGui::DragFloat(TRL("Fade End"), &dc->fadeEnd, sp(0.05f), 0.0f, 1000.0f, "%.2f");
     fieldEdit(m_ctx, "Decal Fade End", &dc->fadeEnd, fe0);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(TR("Distance fade, in metres from the camera to the "
@@ -2657,7 +2806,7 @@ void InspectorPanel::drawDecalSection(ecs::Entity e) {
                       const char* tip, assets::Texture** slot,
                       assets::Texture* before, bool srgb) {
         ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(label);
+        ImGui::TextUnformatted(TR(label));
         ImGui::SameLine(0.0f, 8.0f);
         const float avail =
             ImGui::GetWindowContentRegionMax().x - ImGui::GetCursorPosX() - 4.0f;
@@ -2732,7 +2881,7 @@ void InspectorPanel::drawReflectionProbeSection(ecs::Entity e) {
     std::string labels;   // 本帧画出的参数名（喂给 PROBE-PARAMS 签名日志）
 
     bool en = pc->enabled;
-    if (ImGui::Checkbox(TR("Enabled##probe"), &en)) {
+    if (ImGui::Checkbox(TRL("Enabled##probe"), &en)) {
         pc->enabled = en;   // discreteEdit 的契约：*target 已持有新值
         discreteEdit(m_ctx, "Toggle Reflection Probe", &pc->enabled, !en);
     }
@@ -2748,7 +2897,7 @@ void InspectorPanel::drawReflectionProbeSection(ecs::Entity e) {
     // ---- 盒体半轴（米，沿实体局部轴，再乘实体 scale）----
     const glm::vec3 ex0 = pc->extents;
     ImGui::SetNextItemWidth(-110.0f);
-    ImGui::DragFloat3("Extents", glm::value_ptr(pc->extents), sp(0.05f), 1e-3f,
+    ImGui::DragFloat3(TRL("Extents"), glm::value_ptr(pc->extents), sp(0.05f), 1e-3f,
                       1000.0f, "%.2f");
     fieldEdit(m_ctx, "Probe Extents", &pc->extents, ex0);
     if (ImGui::IsItemHovered()) {
@@ -2761,7 +2910,7 @@ void InspectorPanel::drawReflectionProbeSection(ecs::Entity e) {
 
     const float in0 = pc->intensity;
     ImGui::SetNextItemWidth(-110.0f);
-    ImGui::SliderFloat("Intensity", &pc->intensity, 0.0f, 4.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Intensity"), &pc->intensity, 0.0f, 4.0f, "%.2f");
     fieldEdit(m_ctx, "Probe Intensity", &pc->intensity, in0);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(TR("Multiplier on this probe's specular contribution.\n"
@@ -2771,7 +2920,7 @@ void InspectorPanel::drawReflectionProbeSection(ecs::Entity e) {
     labels += ",Intensity";
 
     bool bp = pc->boxProjection;
-    if (ImGui::Checkbox(TR("Box Projection##probe"), &bp)) {
+    if (ImGui::Checkbox(TRL("Box Projection##probe"), &bp)) {
         pc->boxProjection = bp;
         discreteEdit(m_ctx, "Toggle Box Projection", &pc->boxProjection, !bp);
     }
@@ -2786,7 +2935,7 @@ void InspectorPanel::drawReflectionProbeSection(ecs::Entity e) {
 
     const float bd0 = pc->blendDistance;
     ImGui::SetNextItemWidth(-110.0f);
-    ImGui::SliderFloat("Blend Distance", &pc->blendDistance, 0.01f, 20.0f,
+    ImGui::SliderFloat(TRL("Blend Distance"), &pc->blendDistance, 0.01f, 20.0f,
                        "%.2f");
     fieldEdit(m_ctx, "Probe Blend Distance", &pc->blendDistance, bd0);
     if (ImGui::IsItemHovered()) {
@@ -2835,6 +2984,213 @@ void InspectorPanel::drawReflectionProbeSection(ecs::Entity e) {
         });
         m_lastProbeParamSig.clear();
     }
+}
+
+// ---------------------------------------------------------------- 地形（W4-4）
+//
+// 与贴花 / 探针同一形态：位置与朝向复用实体的 Transform，这一段只管
+// 地形**自己的**那几个参数。
+//
+// 划分原则（路线图 §9 W4-4 原话「只做能看见，不做雕刻」）：
+//   · **只读**：来自 `.vterrain` 的物理事实 —— 采样点数、米每像素、
+//     世界尺寸、maxHeight、分块数。这些由文件决定，做成灰掉的输入框只会
+//     让人以为"是不是我没权限"。要改就去改 `.vterrain`（或生成器）。
+//   · **可改**：`visible`、`heightScale`、4 层材质的覆盖。
+//   · **不做**：高度笔刷（那是 E24 的活）。
+//
+// ⚠ `.vterrain` 的 JSON 只读一次并按路径缓存：面板每帧都画，而这份文件在
+//   交互期间不会变（换资产 = 换 source = 换 cache key）。
+//   缓存里只有 TerrainDesc，**不读** 264 KB 的高度图 —— 那是渲染层的活，
+//   `loadTerrainDesc` 存在的理由就是这个。
+void InspectorPanel::drawTerrainSection(ecs::Entity e) {
+    scene::Scene& sc = m_ctx.editorScene();
+    ecs::World& w = sc.world();
+
+    auto* tc = w.get<ecs::TerrainComponent>(e);
+    if (!tc) return;
+
+    const bool open = sectionHeader("Terrain", true, e);
+    logRect("INS-TERRAIN-HEADER", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (!open) return;
+
+    // ---- 资产信息（只读）----
+    static std::string cachedSource;
+    static terrain::TerrainDesc cachedDesc;
+    static std::string cachedErr;
+    if (cachedSource != tc->source) {
+        cachedSource = tc->source;
+        cachedErr.clear();
+        cachedDesc = terrain::TerrainDesc{};
+        if (!tc->source.empty() &&
+            !terrain::loadTerrainDesc(tc->source, cachedDesc, &cachedErr)) {
+            cachedDesc = terrain::TerrainDesc{};
+        }
+    }
+
+    const float kLabelX = 100.0f;
+    if (tc->source.empty()) {
+        ImGui::TextDisabled(TR("no terrain asset assigned"));
+    } else if (!cachedErr.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.40f, 1.0f), "%s",
+                           cachedErr.c_str());
+        hint("this .vterrain could not be parsed - the renderer skips it");
+    } else {
+        const float wm = static_cast<float>(cachedDesc.cols - 1) *
+                         cachedDesc.metersPerPixel;
+        const float hm = static_cast<float>(cachedDesc.rows - 1) *
+                         cachedDesc.metersPerPixel;
+        const int cxn = (cachedDesc.cols - 1) / terrain::kChunkCells;
+        const int cyn = (cachedDesc.rows - 1) / terrain::kChunkCells;
+
+        ImGui::TextDisabled(TR("samples"));
+        ImGui::SameLine(kLabelX);
+        ImGui::Text("%d x %d", cachedDesc.cols, cachedDesc.rows);
+        ImGui::SameLine();
+        ImGui::TextDisabled(TR("(%.2f m per sample)"),
+                            static_cast<double>(cachedDesc.metersPerPixel));
+
+        ImGui::TextDisabled(TR("world size"));
+        ImGui::SameLine(kLabelX);
+        ImGui::Text(TR("%.0f x %.0f m"), static_cast<double>(wm),
+                    static_cast<double>(hm));
+
+        ImGui::TextDisabled(TR("max height"));
+        ImGui::SameLine(kLabelX);
+        ImGui::Text("%.1f m", static_cast<double>(cachedDesc.maxHeight));
+        ImGui::SameLine();
+        ImGui::TextDisabled(TR("(edit the file to change)"));
+
+        ImGui::TextDisabled(TR("chunks"));
+        ImGui::SameLine(kLabelX);
+        ImGui::Text("%d x %d = %d", cxn, cyn, cxn * cyn);
+        ImGui::SameLine();
+        ImGui::TextDisabled(TR("(%.0f m each)"),
+                            static_cast<double>(terrain::kChunkCells) *
+                                static_cast<double>(cachedDesc.metersPerPixel));
+
+        ImGui::TextDisabled(TR("asset"));
+        ImGui::SameLine(kLabelX);
+        ImGui::TextUnformatted(tc->source.c_str());
+    }
+    logRect("INS-TERRAIN-ASSET", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    if (!m_ctx.isEditing()) {
+        ImGui::TextDisabled(TR("run mode - terrain is read-only here"));
+        return;
+    }
+
+    ImGui::Separator();
+
+    bool vis = tc->visible;
+    if (ImGui::Checkbox(TRL("Visible##terrain"), &vis)) {
+        tc->visible = vis;
+        discreteEdit(m_ctx, "Toggle Terrain", &tc->visible, !vis);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Off = the terrain is not drawn at all (and its\n"
+                          "physics height field stops answering).\n"
+                          "The object's own eye icon does the same thing; this "
+                          "one is\nthe terrain-specific switch and it is "
+                          "stored in the scene."));
+    }
+    logRect("INS-TERRAIN-VISIBLE", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    // ---- Height scale ----
+    // ⚠ 渲染侧读 `maxHeight * heightScale`，物理侧（Heightfield.heightScale）
+    //   必须读**同一个乘积**。所以拖这个滑条时"地形长高了、箱子陷进去了"
+    //   是**预期**的：箱子是按旧的 heightAt 摆的。要摆回去用 Drop to Floor。
+    const float hs0 = tc->heightScale;
+    ImGui::SetNextItemWidth(-110.0f);
+    // ⚠ 不用裸 `Height Scale`：那个键在词典里已经是**材质的**视差高度强度
+    //   （`{"Height Scale", "高度强度"}`，kZh 是 emplace = 先到先得）。
+    //   一词两义只能靠"让 UI 原文更具体"，不能靠加第二条译文。
+    ImGui::SliderFloat(TRL("Height Scale##terrain"), &tc->heightScale, 0.05f,
+                       4.0f, "%.2f");
+    fieldEdit(m_ctx, "Terrain Height Scale", &tc->heightScale, hs0);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Multiplier on the asset's max height, in metres.\n"
+                          "Rendering AND physics read this same value, so a "
+                          "character\nstanding on the terrain follows it. "
+                          "Props placed earlier do not -\nre-drop them with "
+                          "Drop to Floor."));
+    }
+    logRect("INS-TERRAIN-HEIGHTSCALE", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    ImGui::Spacing();
+    ImGui::TextDisabled(TR("Layer materials"));
+
+    // ---- 4 层材质槽 ----
+    // 空串 = 用 `.vterrain` 里那一个。做成"覆盖表"而不是"拷贝 4 个路径"：
+    // 改了 `.vterrain` 的第 3 层，没被覆盖的槽自动跟着变（与 D2 同一条理由）。
+    //
+    // ⚠ 改完必须置 `dirty`：4 层贴图绑在实例的描述符集里，只有重建实例
+    //   才换得掉（`Renderer::syncTerrains` 认这个位）。
+    for (int i = 0; i < 4; ++i) {
+        ImGui::PushID(i);
+        const std::string inher = cachedErr.empty() ? cachedDesc.layerIds[i]
+                                                    : std::string();
+        const bool overridden = !tc->layerOverrides[i].empty();
+        ImGui::Text("%d", i);
+        ImGui::SameLine(24.0f);
+
+        char buf[192];
+        std::snprintf(buf, sizeof(buf), "%s", tc->layerOverrides[i].c_str());
+        ImGui::SetNextItemWidth(-92.0f);
+        if (ImGui::InputTextWithHint(
+                "##terlayer", inher.empty() ? "(unused)" : inher.c_str(), buf,
+                sizeof(buf), ImGuiInputTextFlags_EnterReturnsTrue)) {
+            const std::string after = buf;
+            m_ctx.structuralEdit("Set Terrain Layer", [&] {
+                tc->layerOverrides[i] = after;
+                tc->dirty = true;
+            });
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(TR("Material id for this layer, e.g. "
+                              "materials/terrain_rock.\nLeave empty to inherit "
+                              "the one in the .vterrain file.\n"
+                              "Press Enter to apply."));
+        }
+        ImGui::SameLine();
+        if (overridden) {
+            if (ImGui::SmallButton(TRL("Reset##terlayer"))) {
+                m_ctx.structuralEdit("Reset Terrain Layer", [&] {
+                    tc->layerOverrides[i].clear();
+                    tc->dirty = true;
+                });
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(TR("Drop the override and inherit the "
+                                  "material from the .vterrain file."));
+            }
+        } else {
+            ImGui::TextDisabled(TR("inherit"));
+        }
+        // 每个槽一个独立锚点（`INS-TERRAIN-LAYER0..3`）：4 行共用一个 tag
+        // 的话 `last_rect` 只能证明"有至少一行"，数不出"是不是 4 行"。
+        char tag[32];
+        std::snprintf(tag, sizeof(tag), "INS-TERRAIN-LAYER%d", i);
+        logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        ImGui::PopID();
+    }
+    hint("weights (which layer wins where) live in the asset's splat map, not "
+         "here - the editor has no height/sculpt brush yet");
+
+    if (ImGui::Button(TR("Remove Terrain"))) {
+        m_ctx.structuralEdit("Remove Terrain", [&] {
+            w.remove<ecs::TerrainComponent>(e);
+        });
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Removes the terrain component. The asset file "
+                          "stays on disk."));
+    }
+    logRect("INS-TERRAIN-REMOVE", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
 }
 
 // 颜色渐变带编辑器（Colour over Lifetime 的核心控件）。
@@ -3279,7 +3635,8 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
         //   叫 "XXX##fx" —— 那样 12 个折叠会共用一个 ID、共用一个展开状态。
         //   唯一的 key 必须放进 "##" 后面。
         char label[96];
-        std::snprintf(label, sizeof(label), "%s##%s", title, key);
+        // 模块标题翻成中文，`##key` 原样保留（那是 ID，不是给人看的）。
+        std::snprintf(label, sizeof(label), "%s##%s", TR(title), key);
         const std::string k = std::string("fx/") + key;
         const auto it = m_sectionOpen.find(k);
         bool want = (it != m_sectionOpen.end()) ? it->second : defaultOpen;
@@ -3318,7 +3675,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
                "(This is separate from the global MYVK_FX switch.)", [&] {
         ImGui::SetNextItemWidth(-110.0f);
         const float dur0 = fx->duration;
-        ImGui::SliderFloat("Duration##fx", &fx->duration, 0.0f, 60.0f, "%.2f s");
+        ImGui::SliderFloat(TRL("Duration##fx"), &fx->duration, 0.0f, 60.0f, TR("%.2f s"));
         fieldEdit(m_ctx, "Emitter Duration", &fx->duration, dur0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Length of one emission cycle, in seconds.\n"
@@ -3330,7 +3687,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         {
             const bool b0 = fx->looping;
-            ImGui::Checkbox(TR("Looping##fx"), &fx->looping);
+            ImGui::Checkbox(TRL("Looping##fx"), &fx->looping);
             discreteEdit(m_ctx, "Emitter Looping", &fx->looping, b0);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip(TR("Repeat the cycle forever.\n"
@@ -3340,7 +3697,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
         }
         {
             const bool b0 = fx->prewarm;
-            ImGui::Checkbox(TR("Prewarm##fx"), &fx->prewarm);
+            ImGui::Checkbox(TRL("Prewarm##fx"), &fx->prewarm);
             discreteEdit(m_ctx, "Emitter Prewarm", &fx->prewarm, b0);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip(
@@ -3356,8 +3713,8 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float sd0 = fx->startDelay;
-        ImGui::SliderFloat("Start Delay##fx", &fx->startDelay, 0.0f, 30.0f,
-                           "%.2f s");
+        ImGui::SliderFloat(TRL("Start Delay##fx"), &fx->startDelay, 0.0f, 30.0f,
+                           TR("%.2f s"));
         fieldEdit(m_ctx, "Emitter Start Delay", &fx->startDelay, sd0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Nothing is emitted before this moment.\n"
@@ -3368,14 +3725,14 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float life0 = fx->lifetime;
-        ImGui::SliderFloat("Start Lifetime##fx", &fx->lifetime, 0.05f, 30.0f,
-                           "%.2fs", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat(TRL("Start Lifetime##fx"), &fx->lifetime, 0.05f, 30.0f,
+                           TR("%.2fs"), ImGuiSliderFlags_Logarithmic);
         fieldEdit(m_ctx, "Emitter Lifetime", &fx->lifetime, life0);
         markField("Lifetime");
 
         ImGui::SetNextItemWidth(-110.0f);
         const float lifeV0 = fx->lifetimeVariance;
-        ImGui::SliderFloat("Lifetime +/-##fx", &fx->lifetimeVariance, 0.0f, 1.0f,
+        ImGui::SliderFloat(TRL("Lifetime +/-##fx"), &fx->lifetimeVariance, 0.0f, 1.0f,
                            "%.2f");
         fieldEdit(m_ctx, "Emitter Lifetime Variance", &fx->lifetimeVariance,
                   lifeV0);
@@ -3388,21 +3745,21 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float spd0 = fx->startSpeed;
-        ImGui::SliderFloat("Start Speed##fx", &fx->startSpeed, 0.0f, 30.0f,
-                           "%.2f m/s");
+        ImGui::SliderFloat(TRL("Start Speed##fx"), &fx->startSpeed, 0.0f, 30.0f,
+                           TR("%.2f m/s"));
         fieldEdit(m_ctx, "Emitter Speed", &fx->startSpeed, spd0);
         markField("Speed");
 
         ImGui::SetNextItemWidth(-110.0f);
         const float spdV0 = fx->speedVariance;
-        ImGui::SliderFloat("Speed +/-##fx", &fx->speedVariance, 0.0f, 1.0f,
+        ImGui::SliderFloat(TRL("Speed +/-##fx"), &fx->speedVariance, 0.0f, 1.0f,
                            "%.2f");
         fieldEdit(m_ctx, "Emitter Speed Variance", &fx->speedVariance, spdV0);
         markField("SpeedVariance");
 
         ImGui::SetNextItemWidth(-110.0f);
         const glm::vec3 g0 = fx->gravity;
-        ImGui::DragFloat3("Gravity##fx", glm::value_ptr(fx->gravity), sp(0.1f),
+        ImGui::DragFloat3(TRL("Gravity##fx"), glm::value_ptr(fx->gravity), sp(0.1f),
                           -50.0f, 50.0f, "%.2f");
         fieldEdit(m_ctx, "Emitter Gravity", &fx->gravity, g0);
         if (ImGui::IsItemHovered()) {
@@ -3418,7 +3775,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
         static const char* kSpaceNames[] = {"Local", "World"};
         int space = static_cast<int>(fx->simulationSpace);
         ImGui::SetNextItemWidth(-110.0f);
-        if (ImGui::Combo(TR("Simulation Space##fx"), &space, kSpaceNames, 2)) {
+        if (ImGui::Combo(TRL("Simulation Space##fx"), &space, TrItems<2>(kSpaceNames), 2)) {
             const ecs::ParticleSimulationSpace before = fx->simulationSpace;
             fx->simulationSpace = static_cast<ecs::ParticleSimulationSpace>(space);
             discreteEdit(m_ctx, "Emitter Simulation Space", &fx->simulationSpace,
@@ -3458,7 +3815,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
         // ⚠ 线性而不是对数：ImGui 的对数滑条**要求两端都不为 0**
         //   （IM_ASSERT(v_min != 0.0f)），而 0 在这里是合法且有意义的取值
         //   （"只发一次性的 burst"）。
-        ImGui::SliderFloat("Rate over Time##fx", &fx->rate, 0.0f, 1000.0f,
+        ImGui::SliderFloat(TRL("Rate over Time##fx"), &fx->rate, 0.0f, 1000.0f,
                            "%.0f/s");
         fieldEdit(m_ctx, "Emitter Rate", &fx->rate, rate0);
         if (ImGui::IsItemHovered()) {
@@ -3472,7 +3829,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float rod0 = fx->rateOverDistance;
-        ImGui::SliderFloat("Rate over Distance##fx", &fx->rateOverDistance,
+        ImGui::SliderFloat(TRL("Rate over Distance##fx"), &fx->rateOverDistance,
                            0.0f, 300.0f, "%.0f/m");
         fieldEdit(m_ctx, "Emitter Rate Over Distance", &fx->rateOverDistance,
                   rod0);
@@ -3496,10 +3853,10 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
                                   ImGuiTableFlags_BordersInnerV)) {
             ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed,
                                     20.0f);
-            ImGui::TableSetupColumn("Time");
-            ImGui::TableSetupColumn("Count");
-            ImGui::TableSetupColumn("Cycles");
-            ImGui::TableSetupColumn("Interval");
+            ImGui::TableSetupColumn(TRL("Time"));
+            ImGui::TableSetupColumn(TRL("Count"));
+            ImGui::TableSetupColumn(TRL("Cycles"));
+            ImGui::TableSetupColumn(TRL("Interval"));
             ImGui::TableHeadersRow();
             for (int i = 0; i < ecs::kMaxBursts; ++i) {
                 ecs::ParticleBurst& b = fx->bursts[i];
@@ -3567,13 +3924,13 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
     // ================================================================= Shape
     module("Shape", "shape", true, nullptr, nullptr, [&] {
-        static const char* kShapeNames[] = {"Point",    "Box",    "Sphere",
+        static const char* kShapeNames[] = {"Point (origin)", "Box", "Sphere",
                                             "Hemisphere", "Cone", "Circle",
                                             "Edge"};
         int shape = static_cast<int>(fx->shape);
         ImGui::SetNextItemWidth(-110.0f);
-        if (ImGui::Combo(TR("Shape##fx"), &shape, kShapeNames,
-                         IM_ARRAYSIZE(kShapeNames))) {
+        if (ImGui::Combo(TRL("Shape##fx"), &shape, TrItems<7>(kShapeNames),
+                         7)) {
             const ecs::ParticleShape before = fx->shape;
             fx->shape = static_cast<ecs::ParticleShape>(shape);
             discreteEdit(m_ctx, "Emitter Shape", &fx->shape, before);
@@ -3593,8 +3950,8 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
         static const char* kEmitFromNames[] = {"Volume", "Edge", "Shell"};
         int from = static_cast<int>(fx->emitFrom);
         ImGui::SetNextItemWidth(-110.0f);
-        if (ImGui::Combo(TR("Emit From##fx"), &from, kEmitFromNames,
-                         IM_ARRAYSIZE(kEmitFromNames))) {
+        if (ImGui::Combo(TRL("Emit From##fx"), &from, TrItems<3>(kEmitFromNames),
+                         3)) {
             const ecs::ParticleEmitFrom before = fx->emitFrom;
             fx->emitFrom = static_cast<ecs::ParticleEmitFrom>(from);
             discreteEdit(m_ctx, "Emitter Emit From", &fx->emitFrom, before);
@@ -3613,7 +3970,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
         if (sk == ecs::ParticleShape::Box) {
             ImGui::SetNextItemWidth(-110.0f);
             const glm::vec3 ex0 = fx->shapeExtents;
-            ImGui::DragFloat3("Extents##fx", glm::value_ptr(fx->shapeExtents),
+            ImGui::DragFloat3(TRL("Extents##fx"), glm::value_ptr(fx->shapeExtents),
                               sp(0.05f), 0.0f, 100.0f, "%.2f");
             fieldEdit(m_ctx, "Emitter Extents", &fx->shapeExtents, ex0);
             if (ImGui::IsItemHovered()) {
@@ -3624,7 +3981,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
         } else if (sk != ecs::ParticleShape::Point) {
             ImGui::SetNextItemWidth(-110.0f);
             const float r0 = fx->shapeRadius;
-            ImGui::SliderFloat("Radius##fx", &fx->shapeRadius, 0.0f, 50.0f,
+            ImGui::SliderFloat(TRL("Radius##fx"), &fx->shapeRadius, 0.0f, 50.0f,
                                "%.2f");
             fieldEdit(m_ctx, "Emitter Radius", &fx->shapeRadius, r0);
             markField("Radius");
@@ -3636,7 +3993,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
             ImGui::BeginDisabled(!thicknessRelevant);
             ImGui::SetNextItemWidth(-110.0f);
             const float th0 = fx->radiusThickness;
-            ImGui::SliderFloat("Radius Thickness##fx", &fx->radiusThickness,
+            ImGui::SliderFloat(TRL("Radius Thickness##fx"), &fx->radiusThickness,
                                0.0f, 1.0f, "%.2f");
             fieldEdit(m_ctx, "Emitter Radius Thickness", &fx->radiusThickness,
                       th0);
@@ -3655,7 +4012,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
             ImGui::BeginDisabled(!arcRelevant);
             ImGui::SetNextItemWidth(-110.0f);
             const float arc0 = fx->arc;
-            ImGui::SliderFloat("Arc##fx", &fx->arc, 1.0f, 360.0f, "%.0f deg");
+            ImGui::SliderFloat(TRL("Arc##fx"), &fx->arc, 1.0f, 360.0f, TR("%.0f deg"));
             fieldEdit(m_ctx, "Emitter Arc", &fx->arc, arc0);
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
@@ -3669,8 +4026,8 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
             ImGui::SetNextItemWidth(-110.0f);
             const float sr0 = fx->shapeRotation;
-            ImGui::SliderFloat("Shape Rotation##fx", &fx->shapeRotation, -180.0f,
-                               180.0f, "%.0f deg");
+            ImGui::SliderFloat(TRL("Shape Rotation##fx"), &fx->shapeRotation, -180.0f,
+                               180.0f, TR("%.0f deg"));
             fieldEdit(m_ctx, "Emitter Shape Rotation", &fx->shapeRotation, sr0);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip(TR("Rotates the whole shape about local +Z -\n"
@@ -3681,7 +4038,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float sp0 = fx->spread;
-        ImGui::SliderFloat("Angle##fx", &fx->spread, 0.0f, 90.0f, "%.0f deg");
+        ImGui::SliderFloat(TRL("Angle##fx"), &fx->spread, 0.0f, 90.0f, TR("%.0f deg"));
         fieldEdit(m_ctx, "Emitter Spread", &fx->spread, sp0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
@@ -3743,7 +4100,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         {
             const bool b0 = fx->velOverLifeWorldSpace;
-            ImGui::Checkbox(TR("World Space##fx"), &fx->velOverLifeWorldSpace);
+            ImGui::Checkbox(TRL("World Space##fx"), &fx->velOverLifeWorldSpace);
             discreteEdit(m_ctx, "Emitter Velocity World Space",
                          &fx->velOverLifeWorldSpace, b0);
             if (ImGui::IsItemHovered()) {
@@ -3757,8 +4114,8 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
         ImGui::SeparatorText(TR("Orbital / radial"));
         ImGui::SetNextItemWidth(-110.0f);
         const glm::vec3 o0 = fx->orbital;
-        ImGui::DragFloat3("Orbital##fx", glm::value_ptr(fx->orbital), sp(1.0f),
-                          -720.0f, 720.0f, "%.0f deg/s");
+        ImGui::DragFloat3(TRL("Orbital##fx"), glm::value_ptr(fx->orbital), sp(1.0f),
+                          -720.0f, 720.0f, TR("%.0f deg/s"));
         fieldEdit(m_ctx, "Emitter Orbital", &fx->orbital, o0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Angular velocity about the emitter's local axes\n"
@@ -3770,8 +4127,8 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float oo0 = fx->orbitalOffset;
-        ImGui::SliderFloat("Orbital Offset##fx", &fx->orbitalOffset, 0.0f, 10.0f,
-                           "%.2f m");
+        ImGui::SliderFloat(TRL("Orbital Offset##fx"), &fx->orbitalOffset, 0.0f, 10.0f,
+                           TR("%.2f m"));
         fieldEdit(m_ctx, "Emitter Orbital Offset", &fx->orbitalOffset, oo0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Radius offset for the orbital motion - pushes\n"
@@ -3782,7 +4139,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float rd0 = fx->radial;
-        ImGui::SliderFloat("Radial##fx", &fx->radial, -20.0f, 20.0f, "%.2f m/s");
+        ImGui::SliderFloat(TRL("Radial##fx"), &fx->radial, -20.0f, 20.0f, TR("%.2f m/s"));
         fieldEdit(m_ctx, "Emitter Radial", &fx->radial, rd0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Speed along the direction away from the emitter\n"
@@ -3829,14 +4186,14 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
                "laser beam once gravity is small.", [&] {
         ImGui::SetNextItemWidth(-110.0f);
         const float ls0 = fx->limitSpeed;
-        ImGui::SliderFloat("Speed Limit##fx", &fx->limitSpeed, 0.0f, 50.0f,
-                           "%.2f m/s");
+        ImGui::SliderFloat(TRL("Speed Limit##fx"), &fx->limitSpeed, 0.0f, 50.0f,
+                           TR("%.2f m/s"));
         fieldEdit(m_ctx, "Emitter Limit Speed", &fx->limitSpeed, ls0);
         markField("LimitSpeed");
 
         ImGui::SetNextItemWidth(-110.0f);
         const float ld0 = fx->limitDampen;
-        ImGui::SliderFloat("Dampen##fx", &fx->limitDampen, 0.0f, 1.0f, "%.2f /s");
+        ImGui::SliderFloat(TRL("Dampen##fx"), &fx->limitDampen, 0.0f, 1.0f, "%.2f /s");
         fieldEdit(m_ctx, "Emitter Limit Dampen", &fx->limitDampen, ld0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Fraction of the excess speed removed per second\n"
@@ -3848,7 +4205,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
         ImGui::SeparatorText(TR("Air drag (engine extra)"));
         ImGui::SetNextItemWidth(-110.0f);
         const float drag0 = fx->drag;
-        ImGui::SliderFloat("Drag##fx", &fx->drag, 0.0f, 5.0f, "%.2f /s");
+        ImGui::SliderFloat(TRL("Drag##fx"), &fx->drag, 0.0f, 5.0f, "%.2f /s");
         fieldEdit(m_ctx, "Emitter Drag", &fx->drag, drag0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Exponential velocity damping (1/s), 0 = none.\n"
@@ -3874,7 +4231,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
                "Use it for wind and for rising heat.", [&] {
         ImGui::SetNextItemWidth(-110.0f);
         const glm::vec3 f0 = fx->force;
-        ImGui::DragFloat3("Force##fx", glm::value_ptr(fx->force), sp(0.1f),
+        ImGui::DragFloat3(TRL("Force##fx"), glm::value_ptr(fx->force), sp(0.1f),
                           -100.0f, 100.0f, "%.2f");
         fieldEdit(m_ctx, "Emitter Force", &fx->force, f0);
         if (ImGui::IsItemHovered()) {
@@ -3885,7 +4242,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float fr0 = fx->forceRandomize;
-        ImGui::SliderFloat("Randomize##fx", &fx->forceRandomize, 0.0f, 1.0f,
+        ImGui::SliderFloat(TRL("Randomize##fx"), &fx->forceRandomize, 0.0f, 1.0f,
                            "%.2f");
         fieldEdit(m_ctx, "Emitter Force Randomize", &fx->forceRandomize, fr0);
         if (ImGui::IsItemHovered()) {
@@ -3942,7 +4299,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
         ImGui::SetNextItemWidth(-110.0f);
         const float em0 = fx->emissive;
         // 线性：0 是合法值（"不发光，只当普通贴片"），对数滑条不允许 min = 0。
-        ImGui::SliderFloat("Emissive##fx", &fx->emissive, 0.0f, 20.0f, "%.2f");
+        ImGui::SliderFloat(TRL("Emissive##fx"), &fx->emissive, 0.0f, 20.0f, "%.2f");
         fieldEdit(m_ctx, "Emitter Emissive", &fx->emissive, em0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Multiplier on the colour. Above ~1 the particles\n"
@@ -3990,15 +4347,15 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
     module("Rotation over Lifetime", "rot", false, nullptr, nullptr, [&] {
         ImGui::SetNextItemWidth(-110.0f);
         const float sr0 = fx->startRotation;
-        ImGui::SliderFloat("Start Rotation##fx", &fx->startRotation, -180.0f,
-                           180.0f, "%.0f deg");
+        ImGui::SliderFloat(TRL("Start Rotation##fx"), &fx->startRotation, -180.0f,
+                           180.0f, TR("%.0f deg"));
         fieldEdit(m_ctx, "Emitter Start Rotation", &fx->startRotation, sr0);
         markField("StartRotation");
 
         ImGui::SetNextItemWidth(-110.0f);
         const float srv0 = fx->startRotationVariance;
-        ImGui::SliderFloat("Rotation +/-##fx", &fx->startRotationVariance, 0.0f,
-                           180.0f, "%.0f deg");
+        ImGui::SliderFloat(TRL("Rotation +/-##fx"), &fx->startRotationVariance, 0.0f,
+                           180.0f, TR("%.0f deg"));
         fieldEdit(m_ctx, "Emitter Start Rotation Variance",
                   &fx->startRotationVariance, srv0);
         if (ImGui::IsItemHovered()) {
@@ -4011,14 +4368,14 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float av0 = fx->angularVelocity;
-        ImGui::SliderFloat("Angular Velocity##fx", &fx->angularVelocity,
-                           -720.0f, 720.0f, "%.0f deg/s");
+        ImGui::SliderFloat(TRL("Angular Velocity##fx"), &fx->angularVelocity,
+                           -720.0f, 720.0f, TR("%.0f deg/s"));
         fieldEdit(m_ctx, "Emitter Angular Velocity", &fx->angularVelocity, av0);
         markField("AngularVelocity");
 
         ImGui::SetNextItemWidth(-110.0f);
         const float avv0 = fx->angularVelocityVariance;
-        ImGui::SliderFloat("Spin +/-##fx", &fx->angularVelocityVariance, 0.0f,
+        ImGui::SliderFloat(TRL("Spin +/-##fx"), &fx->angularVelocityVariance, 0.0f,
                            1.0f, "%.2f");
         fieldEdit(m_ctx, "Emitter Angular Velocity Variance",
                   &fx->angularVelocityVariance, avv0);
@@ -4039,7 +4396,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
                "particle_common.glsl for why).", [&] {
         ImGui::SetNextItemWidth(-110.0f);
         const float ns0 = fx->noiseStrength;
-        ImGui::SliderFloat("Strength##fx", &fx->noiseStrength, 0.0f, 20.0f,
+        ImGui::SliderFloat(TRL("Strength##fx"), &fx->noiseStrength, 0.0f, 20.0f,
                            "%.2f");
         fieldEdit(m_ctx, "Emitter Noise Strength", &fx->noiseStrength, ns0);
         if (ImGui::IsItemHovered()) {
@@ -4051,7 +4408,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float nf0 = fx->noiseFrequency;
-        ImGui::SliderFloat("Frequency##fx", &fx->noiseFrequency, 0.01f, 5.0f,
+        ImGui::SliderFloat(TRL("Frequency##fx"), &fx->noiseFrequency, 0.01f, 5.0f,
                            "%.2f");
         fieldEdit(m_ctx, "Emitter Noise Frequency", &fx->noiseFrequency, nf0);
         if (ImGui::IsItemHovered()) {
@@ -4062,7 +4419,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float nss0 = fx->noiseScrollSpeed;
-        ImGui::SliderFloat("Scroll Speed##fx", &fx->noiseScrollSpeed, 0.0f, 5.0f,
+        ImGui::SliderFloat(TRL("Scroll Speed##fx"), &fx->noiseScrollSpeed, 0.0f, 5.0f,
                            "%.2f");
         fieldEdit(m_ctx, "Emitter Noise Scroll Speed", &fx->noiseScrollSpeed,
                   nss0);
@@ -4075,7 +4432,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float nd0 = fx->noiseDamping;
-        ImGui::SliderFloat("Damping##fx", &fx->noiseDamping, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat(TRL("Damping##fx"), &fx->noiseDamping, 0.0f, 1.0f, "%.2f");
         fieldEdit(m_ctx, "Emitter Noise Damping", &fx->noiseDamping, nd0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Damps the noise contribution per second.\n"
@@ -4086,7 +4443,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const int no0 = fx->noiseOctaves;
-        ImGui::SliderInt("Octaves##fx", &fx->noiseOctaves, 1, 4, "%d");
+        ImGui::SliderInt(TRL("Octaves##fx"), &fx->noiseOctaves, 1, 4, "%d");
         fieldEdit(m_ctx, "Emitter Noise Octaves", &fx->noiseOctaves, no0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("fBm layers: 1 = one smooth field, 4 = the same\n"
@@ -4109,8 +4466,8 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
     module("Renderer", "renderer", true, nullptr, nullptr, [&] {
         ImGui::SetNextItemWidth(-110.0f);
         const float size0 = fx->startSize;
-        ImGui::SliderFloat("Start Size##fx", &fx->startSize, 0.005f, 2.0f,
-                           "%.3f m", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat(TRL("Start Size##fx"), &fx->startSize, 0.005f, 2.0f,
+                           TR("%.3f m"), ImGuiSliderFlags_Logarithmic);
         fieldEdit(m_ctx, "Emitter Start Size", &fx->startSize, size0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Edge length of the quad in metres (this engine\n"
@@ -4125,8 +4482,8 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
                                              "Vertical Billboard"};
         int rmode = static_cast<int>(fx->renderMode);
         ImGui::SetNextItemWidth(-110.0f);
-        if (ImGui::Combo(TR("Render Mode##fx"), &rmode, kRenderNames,
-                         IM_ARRAYSIZE(kRenderNames))) {
+        if (ImGui::Combo(TRL("Render Mode##fx"), &rmode, TrItems<4>(kRenderNames),
+                         4)) {
             const ecs::ParticleRenderMode before = fx->renderMode;
             fx->renderMode = static_cast<ecs::ParticleRenderMode>(rmode);
             discreteEdit(m_ctx, "Emitter Render Mode", &fx->renderMode, before);
@@ -4144,7 +4501,7 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
 
         ImGui::SetNextItemWidth(-110.0f);
         const float st0 = fx->stretchScale;
-        ImGui::SliderFloat("Stretch##fx", &fx->stretchScale, 0.0f, 5.0f, "%.2f");
+        ImGui::SliderFloat(TRL("Stretch##fx"), &fx->stretchScale, 0.0f, 5.0f, "%.2f");
         fieldEdit(m_ctx, "Emitter Stretch", &fx->stretchScale, st0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Stretched billboard only: the quad's length grows\n"
@@ -4157,8 +4514,8 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
                                            "Youngest First"};
         int smode = static_cast<int>(fx->sortMode);
         ImGui::SetNextItemWidth(-110.0f);
-        if (ImGui::Combo(TR("Sort Mode##fx"), &smode, kSortNames,
-                         IM_ARRAYSIZE(kSortNames))) {
+        if (ImGui::Combo(TRL("Sort Mode##fx"), &smode, TrItems<4>(kSortNames),
+                         4)) {
             const ecs::ParticleSortMode before = fx->sortMode;
             fx->sortMode = static_cast<ecs::ParticleSortMode>(smode);
             discreteEdit(m_ctx, "Emitter Sort Mode", &fx->sortMode, before);
@@ -4172,10 +4529,10 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
         }
         markField("SortMode");
 
-        static const char* kBlendNames[] = {"Additive", "Alpha"};
+        static const char* kBlendNames[] = {"Additive", "Alpha Blend"};
         int blend = static_cast<int>(fx->blend);
         ImGui::SetNextItemWidth(-110.0f);
-        if (ImGui::Combo(TR("Blend##fx"), &blend, kBlendNames, 2)) {
+        if (ImGui::Combo(TRL("Blend##fx"), &blend, TrItems<2>(kBlendNames), 2)) {
             const ecs::ParticleBlend before = fx->blend;
             fx->blend = static_cast<ecs::ParticleBlend>(blend);
             discreteEdit(m_ctx, "Emitter Blend", &fx->blend, before);
@@ -4205,8 +4562,8 @@ void InspectorPanel::drawParticleEmitterSection(ecs::Entity e) {
                "never cuts a hard square edge where it meets a wall.", [&] {
         ImGui::SetNextItemWidth(-110.0f);
         const float sd0 = fx->softDistance;
-        ImGui::SliderFloat("Soft Distance##fx", &fx->softDistance, 0.0f, 5.0f,
-                           "%.2f m");
+        ImGui::SliderFloat(TRL("Soft Distance##fx"), &fx->softDistance, 0.0f, 5.0f,
+                           TR("%.2f m"));
         fieldEdit(m_ctx, "Emitter Soft Distance", &fx->softDistance, sd0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Distance over which the fade happens (metres).\n"
@@ -4343,7 +4700,7 @@ void InspectorPanel::drawMeshSection(ecs::Entity e) {
         case ecs::MeshPrimitive::Cube:
         case ecs::MeshPrimitive::Plane: {
             ImGui::SetNextItemWidth(-110.0f);
-            ImGui::DragFloat("Size", &p.size, sp(0.01f), 0.01f, 500.0f, "%.3f");
+            ImGui::DragFloat(TRL("Size"), &p.size, sp(0.01f), 0.01f, 500.0f, "%.3f");
             probe("Size");
             edited |= ImGui::IsItemDeactivatedAfterEdit();
             labels = "Size";
@@ -4351,17 +4708,17 @@ void InspectorPanel::drawMeshSection(ecs::Entity e) {
         }
         case ecs::MeshPrimitive::Sphere: {
             ImGui::SetNextItemWidth(-110.0f);
-            ImGui::DragFloat("Radius", &p.radius, sp(0.005f), 0.001f, 200.0f, "%.3f");
+            ImGui::DragFloat(TRL("Radius"), &p.radius, sp(0.005f), 0.001f, 200.0f, "%.3f");
             probe("Radius");
             edited |= ImGui::IsItemDeactivatedAfterEdit();
             ImGui::SetNextItemWidth(-110.0f);
-            ImGui::DragInt("Segments", &p.segments, 0.5f, 3, 256);
+            ImGui::DragInt(TRL("Segments"), &p.segments, 0.5f, 3, 256);
             probe("Segments");
             edited |= ImGui::IsItemDeactivatedAfterEdit();
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(TR("longitude divisions - drives the vertex count"));
             ImGui::SetNextItemWidth(-110.0f);
-            ImGui::DragInt("Rings", &p.rings, 0.5f, 2, 256);
+            ImGui::DragInt(TRL("Rings"), &p.rings, 0.5f, 2, 256);
             probe("Rings");
             edited |= ImGui::IsItemDeactivatedAfterEdit();
             if (ImGui::IsItemHovered())
@@ -4371,11 +4728,11 @@ void InspectorPanel::drawMeshSection(ecs::Entity e) {
         }
         case ecs::MeshPrimitive::Cylinder: {
             ImGui::SetNextItemWidth(-110.0f);
-            ImGui::DragFloat("Radius", &p.radius, sp(0.005f), 0.001f, 200.0f, "%.3f");
+            ImGui::DragFloat(TRL("Radius"), &p.radius, sp(0.005f), 0.001f, 200.0f, "%.3f");
             probe("Radius");
             edited |= ImGui::IsItemDeactivatedAfterEdit();
             ImGui::SetNextItemWidth(-110.0f);
-            ImGui::DragInt("Segments", &p.segments, 0.5f, 3, 256);
+            ImGui::DragInt(TRL("Segments"), &p.segments, 0.5f, 3, 256);
             probe("Segments");
             edited |= ImGui::IsItemDeactivatedAfterEdit();
             labels = "Radius,Segments";
@@ -4674,10 +5031,10 @@ bool InspectorPanel::drawTextureChip(const char* slotId, const char* hintText,
             ImGui::SetTooltip(TR("%s\n\n%s\n\ndrag another image here to replace\n"
                               "right-click to clear"),
                               displayNameOf(tex).c_str(),
-                              hintText ? hintText : slotId);
+                              TR(hintText ? hintText : slotId));
         } else {
-            ImGui::SetTooltip(TR("%s\n\n%s"), hintText ? hintText : slotId,
-                              "drag an image from the Content Browser here");
+            ImGui::SetTooltip(TR("%s\n\n%s"), TR(hintText ? hintText : slotId),
+                              TR("drag an image from the Content Browser here"));
         }
     }
 
@@ -4736,6 +5093,34 @@ bool InspectorPanel::drawTextureChip(const char* slotId, const char* hintText,
     return changed;
 }
 
+// Inspector 的材质行标签 → 覆盖位（W1-3）。标签是**英文原文**（TR 之前），
+// 所以这张表与当前语言无关。
+static std::uint32_t overriddenBitOf(const char* label) {
+    using M = assets::Material;
+    struct Entry {
+        const char* name;
+        std::uint32_t bit;
+    };
+    static const Entry kTable[] = {
+        {"Base Color", M::kOvBaseColor},
+        {"Metallic", M::kOvMetallic},
+        {"Roughness", M::kOvRoughness},
+        {"Emissive", M::kOvEmissive},
+        {"AO", M::kOvAo},
+        {"Normal Scale", M::kOvNormalScale},
+        {"Height Scale", M::kOvHeightScale},
+        {"Alpha Mode", M::kOvAlphaMode},
+        {"Alpha Cutoff", M::kOvAlphaCutoff},
+        {"Dither Alpha", M::kOvDitherAlpha},
+        {"Shading Model", M::kOvShadingModel},
+        {"Double Sided", M::kOvDoubleSided},
+    };
+    for (const auto& t : kTable) {
+        if (std::strcmp(t.name, label) == 0) return t.bit;
+    }
+    return 0;
+}
+
 void InspectorPanel::drawMaterialSection(ecs::Entity e) {
     scene::Scene& sc = m_ctx.activeScene();
     ecs::World& w = sc.world();
@@ -4743,6 +5128,9 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
     auto* matc = w.get<ecs::MaterialComponent>(e);
     if (!matc || !matc->material) return;
     assets::Material* mat = matc->material;
+    // 本帧开始时的参数快照：函数结束时 diff 一次就知道用户动了哪几个字段。
+    // 这样不用在 12 个 fieldEdit 调用点各插一行（漏一个就静默不记覆盖）。
+    assets::Material::Params paramsAtStart = mat->captureParams();
 
     if (!sectionHeader("Material", true, e))
         return;
@@ -4752,6 +5140,129 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
             ImGui::GetItemRectMax());
 
     ImGui::Text(TR("name: %s"), mat->name.c_str());
+
+    // ============================================================
+    // 材质实例（W1-3）
+    //
+    // 关卡里 300 件东西引用同一个母材质时，改一次 roughness 要生效 300 次 ——
+    // 这就是"实例"这层的全部目的。反过来，某一件要不一样时，`Make Unique`
+    // 给它派生一个只属于自己的副本，之后改的只是它。
+    // ============================================================
+    {
+        const bool wasInstance = mat->isInstance();
+
+        if (wasInstance) {
+            const assets::Material* par = mat->parent;
+            ImGui::TextColored(ImVec4(0.62f, 0.82f, 1.0f, 1.0f),
+                               TR("Instance of %s"),
+                               par ? (par->id.empty() ? par->name.c_str()
+                                                      : par->id.c_str())
+                                   : "?");
+        } else {
+            ImGui::TextUnformatted(TR("Material (asset)"));
+        }
+        logRect("INS-MAT-INSTANCE", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+
+        ImGui::SameLine();
+        ImGui::BeginDisabled(wasInstance || mat->source.kind ==
+                                              assets::MaterialSource::Kind::Model);
+        if (ImGui::SmallButton(TR("Make Unique##mat"))) {
+            // 结构变化（换了一个材质对象）→ 走整场景快照的撤销
+            assets::Material* before = mat;
+            ecs::Entity ent = e;
+            const std::string instName =
+                mat->name + "@e" + std::to_string(static_cast<unsigned>(e.id));
+            m_ctx.structuralEdit("Material Make Unique", [this, ent, before,
+                                                          instName]() {
+                assets::Material* inst = m_ctx.assets().makeInstanceOf(
+                    before, instName);
+                if (!inst) return;
+                if (auto* mc = m_ctx.activeScene().world().get<
+                        ecs::MaterialComponent>(ent))
+                    mc->material = inst;
+            });
+            mat = m_ctx.activeScene().world().get<ecs::MaterialComponent>(e)
+                      ? m_ctx.activeScene().world()
+                            .get<ecs::MaterialComponent>(e)
+                            ->material
+                      : mat;
+            if (mat && mat != before) {
+                // 换了一个材质对象 → 参数基准也要跟着换，否则本帧末尾的
+                // diff 会拿"上一个材质的参数"当基准，把所有字段都算成覆盖。
+                paramsAtStart = mat->captureParams();
+                VK_LOG_INFO("MATERIAL-INSTANCE action=make-unique entity=%u "
+                            "parent=%s name=%s",
+                            static_cast<unsigned>(e.id),
+                            assets::assetLogSafe(before->id.empty()
+                                                     ? before->name
+                                                     : before->id)
+                                .c_str(),
+                            assets::assetLogSafe(mat->name).c_str());
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(
+                TR("Give this entity its own copy of the material.\n"
+                   "Edits then affect only this object; the rest keep following\n"
+                   "the shared material."));
+        logRect("INS-MAT-MAKEUNIQUE", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+
+        if (!mat) return;
+
+        // 覆盖项一览 + 逐字段 Revert（清除该位 → 重新跟随母材质）
+        if (mat->isInstance() && mat->overridden) {
+            static const struct {
+                assets::Material::OverrideBits bit;
+                const char* name;
+                const char* label;
+            } kOv[] = {
+                {assets::Material::kOvBaseColor, "base-color", "Base Color"},
+                {assets::Material::kOvMetallic, "metallic", "Metallic"},
+                {assets::Material::kOvRoughness, "roughness", "Roughness"},
+                {assets::Material::kOvNormalScale, "normal-scale", "Normal Scale"},
+                {assets::Material::kOvAo, "ao", "AO"},
+                {assets::Material::kOvEmissive, "emissive", "Emissive"},
+                {assets::Material::kOvAlphaMode, "alpha-mode", "Alpha Mode"},
+                {assets::Material::kOvAlphaCutoff, "alpha-cutoff", "Alpha Cutoff"},
+                {assets::Material::kOvDitherAlpha, "dither-alpha", "Dither Alpha"},
+                {assets::Material::kOvShadingModel, "shading-model", "Shading Model"},
+                {assets::Material::kOvDoubleSided, "double-sided", "Double Sided"},
+                {assets::Material::kOvHeightScale, "height-scale", "Height Scale"},
+            };
+            ImGui::TextUnformatted(TR("Overrides:"));
+            for (const auto& o : kOv) {
+                if ((mat->overridden & o.bit) == 0) continue;
+                ImGui::SameLine();
+                const std::string id =
+                    std::string("Revert##ov-") + o.name;
+                if (ImGui::SmallButton(id.c_str())) {
+                    const assets::Material::Params before = mat->captureParams();
+                    assets::Material::Params after = before;
+                    assets::Material::mergeParams(
+                        after, mat->parent->captureParams(), o.bit);
+                    mat->applyParams(after);
+                    mat->overridden &= ~static_cast<std::uint32_t>(o.bit);
+                    m_ctx.commands().pushAlreadyApplied(
+                        std::make_unique<LambdaCommand>(
+                            std::string("Material Revert ") + o.label,
+                            [mat, before]() { mat->applyParams(before); },
+                            [mat, after]() { mat->applyParams(after); }));
+                    m_ctx.dirty() = true;
+                }
+                const std::string anchor =
+                    std::string("INS-MAT-REVERT-") + o.name;
+                logRect(anchor.c_str(), ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        TR("Stop overriding %s and follow the parent again."),
+                        TR(o.label));
+            }
+        }
+    }
 
     // ---- 三列布局：属性名 | 值 | 纹理槽方块 ----
     //
@@ -4787,8 +5298,19 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
     auto rowBegin = [&](const char* label) {
         // AlignTextToFramePadding：文字要跟右边的输入框在**同一条基线上**，
         // 否则标签会贴着行顶，看起来像没对齐。
+        // ⚠ TR 放在这里而不是调用点：材质 / 光照页有几十个 `rowBegin("xxx")`，
+        //   逐处包一遍既啰嗦又必然漏（这几个是**自定义辅助函数**，不在
+        //   ImGui 调用里，扫描器也抓不到）。一处翻，全部受益。
         ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(label);
+        // 被覆盖的字段用高亮标出 —— 这是"我改的是这一件还是全部"的
+        // **唯一视觉线索**（W1-3）。用 TextColored 而不是 Push/PopStyleColor：
+        // 后者要在每个控件之后再弹一次，几十处必然漏。
+        const std::uint32_t bit = overriddenBitOf(label);
+        const char* lbl = TR(label);
+        if (mat->isInstance() && bit && (mat->overridden & bit))
+            ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.35f, 1.0f), "%s", lbl);
+        else
+            ImGui::TextUnformatted(lbl);
         ImGui::SameLine(colValue);
     };
 
@@ -4901,7 +5423,7 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
     const char* kAlpha[] = {"Opaque", "Blend", "Mask"};
     rowBegin("Alpha Mode");
     ImGui::SetNextItemWidth(valueW);
-    if (ImGui::Combo("##alpha-mode", &mode, kAlpha, 3)) {
+    if (ImGui::Combo("##alpha-mode", &mode, TrItems<3>(kAlpha), 3)) {
         const auto newMode = static_cast<assets::Material::AlphaMode>(mode);
         const auto oldMode = mat->alphaMode;
         if (newMode != oldMode) {
@@ -4955,7 +5477,7 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
         const char* kShading[] = {"Default", "Skin"};
         rowBegin("Shading Model");
         ImGui::SetNextItemWidth(valueW);
-        if (ImGui::Combo("##shading-model", &sm, kShading, 2)) {
+        if (ImGui::Combo("##shading-model", &sm, TrItems<2>(kShading), 2)) {
             const auto newSm = static_cast<assets::Material::ShadingModel>(sm);
             const auto oldSm = mat->shadingModel;
             if (newSm != oldSm) {
@@ -5022,6 +5544,21 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
                 render::variantShaderFile("pbr.frag", kw).c_str());
         }
         ImGui::TextDisabled(TR("  %s"), render::keywordNames(kw).c_str());
+    }
+
+    // ---- 本帧的编辑 → 覆盖位 / 母材质传播（W1-2 / W1-3）----
+    // ⚠ 必须在**所有控件之后**：ImGui 在被调用的那一刻就把新值写进 `mat` 了，
+    //   所以一次 diff 能抓全 12 个字段，不用在每处 fieldEdit 后面加一行。
+    const std::uint32_t touched =
+        assets::Material::diffParams(paramsAtStart, mat->captureParams());
+    if (touched) {
+        if (mat->isInstance()) {
+            // 实例：本地改过 = 覆盖，之后母材质再变也不跟这一位
+            mat->overridden |= touched;
+        } else {
+            // 母材质：把未覆盖该字段的实例全刷一遍
+            m_ctx.assets().materialChanged(mat);
+        }
     }
 }
 
@@ -5125,7 +5662,7 @@ void InspectorPanel::drawLights(ecs::Entity e) {
     int type = typeNow;
     ImGui::SetNextItemWidth(-110.0f);
     ImGui::BeginDisabled(isKeyLight);
-    const bool typeChanged = ImGui::Combo(TR("Type"), &type, kTypes, 3);
+    const bool typeChanged = ImGui::Combo(TR("Type"), &type, TrItems<3>(kTypes), 3);
     probe("Type");
     ImGui::EndDisabled();
     if (isKeyLight) {
@@ -5143,22 +5680,22 @@ void InspectorPanel::drawLights(ecs::Entity e) {
         ImGui::SeparatorText(TR("Directional"));
 
         const glm::vec3 d0 = dl->direction;
-        ImGui::DragFloat3("Direction", glm::value_ptr(dl->direction), sp(0.01f), -1.0f, 1.0f);
+        ImGui::DragFloat3(TRL("Direction"), glm::value_ptr(dl->direction), sp(0.01f), -1.0f, 1.0f);
         probe("Direction");
         fieldEdit(m_ctx, "Sun Direction", &dl->direction, d0);
 
         const glm::vec3 c0 = dl->color;
-        ImGui::ColorEdit3("Color", glm::value_ptr(dl->color));
+        ImGui::ColorEdit3(TRL("Color"), glm::value_ptr(dl->color));
         probe("Color");
         fieldEdit(m_ctx, "Sun Color", &dl->color, c0);
 
         const float i0 = dl->intensity;
-        ImGui::SliderFloat("Intensity", &dl->intensity, 0.0f, 4.0f);
+        ImGui::SliderFloat(TRL("Intensity"), &dl->intensity, 0.0f, 4.0f);
         probe("Intensity");
         fieldEdit(m_ctx, "Sun Intensity", &dl->intensity, i0);
 
         const float a0 = dl->ambientScale;
-        ImGui::SliderFloat("Ambient", &dl->ambientScale, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat(TRL("Ambient"), &dl->ambientScale, 0.0f, 1.0f, "%.2f");
         probe("Ambient");
         fieldEdit(m_ctx, "Sun Ambient Scale", &dl->ambientScale, a0);
         if (ImGui::IsItemHovered())
@@ -5178,17 +5715,17 @@ void InspectorPanel::drawLights(ecs::Entity e) {
         ImGui::SeparatorText(TR("Point"));
 
         const glm::vec3 c0 = pl->color;
-        ImGui::ColorEdit3("Color", glm::value_ptr(pl->color));
+        ImGui::ColorEdit3(TRL("Color"), glm::value_ptr(pl->color));
         probe("Color");
         fieldEdit(m_ctx, "Point Light Color", &pl->color, c0);
 
         const float i0 = pl->intensity;
-        ImGui::DragFloat("Intensity", &pl->intensity, sp(0.2f), 0.0f, 500.0f, "%.1f");
+        ImGui::DragFloat(TRL("Intensity"), &pl->intensity, sp(0.2f), 0.0f, 500.0f, "%.1f");
         probe("Intensity");
         fieldEdit(m_ctx, "Point Light Intensity", &pl->intensity, i0);
 
         const float r0 = pl->range;
-        ImGui::DragFloat("Range", &pl->range, sp(0.05f), 0.1f, 60.0f, "%.2f");
+        ImGui::DragFloat(TRL("Range"), &pl->range, sp(0.05f), 0.1f, 60.0f, "%.2f");
         probe("Range");
         fieldEdit(m_ctx, "Point Light Range", &pl->range, r0);
         labels = "Color,Intensity,Range,Enabled";
@@ -5210,22 +5747,22 @@ void InspectorPanel::drawLights(ecs::Entity e) {
         ImGui::SeparatorText(TR("Spot"));
 
         const glm::vec3 c0 = sl->color;
-        ImGui::ColorEdit3("Color", glm::value_ptr(sl->color));
+        ImGui::ColorEdit3(TRL("Color"), glm::value_ptr(sl->color));
         probe("Color");
         fieldEdit(m_ctx, "Spot Light Color", &sl->color, c0);
 
         const float i0 = sl->intensity;
-        ImGui::DragFloat("Intensity", &sl->intensity, sp(0.4f), 0.0f, 800.0f, "%.1f");
+        ImGui::DragFloat(TRL("Intensity"), &sl->intensity, sp(0.4f), 0.0f, 800.0f, "%.1f");
         probe("Intensity");
         fieldEdit(m_ctx, "Spot Light Intensity", &sl->intensity, i0);
 
         const float r0 = sl->range;
-        ImGui::DragFloat("Range", &sl->range, sp(0.05f), 0.1f, 80.0f, "%.2f");
+        ImGui::DragFloat(TRL("Range"), &sl->range, sp(0.05f), 0.1f, 80.0f, "%.2f");
         probe("Range");
         fieldEdit(m_ctx, "Spot Light Range", &sl->range, r0);
 
         const glm::vec3 d0 = sl->direction;
-        ImGui::DragFloat3("Direction", glm::value_ptr(sl->direction), sp(0.01f), -1.0f, 1.0f);
+        ImGui::DragFloat3(TRL("Direction"), glm::value_ptr(sl->direction), sp(0.01f), -1.0f, 1.0f);
         probe("Direction");
         fieldEdit(m_ctx, "Spot Light Direction", &sl->direction, d0);
 
@@ -5233,11 +5770,11 @@ void InspectorPanel::drawLights(ecs::Entity e) {
         float outerDeg = glm::degrees(sl->outerAngle);
         const float in0 = sl->innerAngle;
         const float out0 = sl->outerAngle;
-        if (ImGui::SliderFloat("Inner Cone", &innerDeg, 1.0f, 80.0f, "%.1f deg")) {
+        if (ImGui::SliderFloat(TRL("Inner Cone"), &innerDeg, 1.0f, 80.0f, TR("%.1f deg"))) {
             sl->innerAngle = glm::radians(innerDeg);
         }
         fieldEdit(m_ctx, "Spot Inner Cone", &sl->innerAngle, in0);
-        if (ImGui::SliderFloat("Outer Cone", &outerDeg, 1.0f, 89.0f, "%.1f deg")) {
+        if (ImGui::SliderFloat(TRL("Outer Cone"), &outerDeg, 1.0f, 89.0f, TR("%.1f deg"))) {
             sl->outerAngle = glm::radians(outerDeg);
         }
         fieldEdit(m_ctx, "Spot Outer Cone", &sl->outerAngle, out0);
@@ -5251,12 +5788,12 @@ void InspectorPanel::drawLights(ecs::Entity e) {
         ImGui::SeparatorText(TR("Modifiers"));
         {
             const float aw0 = sl->areaWidth;
-            ImGui::DragFloat("Area Width", &sl->areaWidth, sp(0.05f), 0.0f, 40.0f,
+            ImGui::DragFloat(TRL("Area Width"), &sl->areaWidth, sp(0.05f), 0.0f, 40.0f,
                              "%.2f");
             probe("AreaWidth");
             fieldEdit(m_ctx, "Spot Area Width", &sl->areaWidth, aw0);
             const float ah0 = sl->areaHeight;
-            ImGui::DragFloat("Area Height", &sl->areaHeight, sp(0.05f), 0.0f, 40.0f,
+            ImGui::DragFloat(TRL("Area Height"), &sl->areaHeight, sp(0.05f), 0.0f, 40.0f,
                              "%.2f");
             probe("AreaHeight");
             fieldEdit(m_ctx, "Spot Area Height", &sl->areaHeight, ah0);
@@ -5343,15 +5880,49 @@ void InspectorPanel::drawScript(ecs::Entity e) {
     hint("relative to the asset root, or an absolute path");
 
     bool en = scomp->enabled;
-    if (ImGui::Checkbox(TR("Enabled##script"), &en)) {
+    if (ImGui::Checkbox(TRL("Enabled##script"), &en)) {
         scomp->enabled = en;
         discreteEdit(m_ctx, "Toggle Script", &scomp->enabled, !en);
     }
     ImGui::SameLine();
     const float ts0 = scomp->timeScale;
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::SliderFloat("Time Scale", &scomp->timeScale, 0.0f, 4.0f, "%.2f");
+    ImGui::SliderFloat(TRL("Time Scale"), &scomp->timeScale, 0.0f, 4.0f, "%.2f");
     fieldEdit(m_ctx, "Script Time Scale", &scomp->timeScale, ts0);
+
+    // ★ S5：这个实体的脚本实例状态（Idle / Running / Waiting / Failed）。
+    //   面板上是"一列"，这里是"选中这一个" —— 排查"这个怪怎么不动"
+    //   时不用去右边那张表里找。
+    if (vks::ScriptRuntime* rt = m_ctx.scriptRuntime()) {
+        const vks::ScriptInstance* inst = rt->find(e);
+        if (inst) {
+            const char* st = rt->stateOf(*inst);
+            const ImVec4 col =
+                inst->failed
+                    ? ImVec4(1.0f, 0.45f, 0.42f, 1.0f)
+                    : inst->waitingNow ? ImVec4(1.0f, 0.85f, 0.45f, 1.0f)
+                                       : ImVec4(0.62f, 0.88f, 0.62f, 1.0f);
+            ImGui::TextColored(col, "%s", st);
+            logRect("INS-SCRIPT-STATE", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+            ImGui::SameLine();
+            ImGui::TextDisabled(TR("t=%.2fs  vars=%zu  runs=%u"),
+                                static_cast<double>(inst->localTime),
+                                inst->vars.size(), inst->runCount);
+            if (inst->failed && !inst->lastError.empty()) {
+                ImGui::TextWrapped("%s", inst->lastError.c_str());
+            }
+            if (ImGui::SmallButton(TR("Reset Script State##insp"))) {
+                rt->resetInstance(e);
+                m_ctx.notify(std::string(TR("Reset script on ")) +
+                             (w.name(e) ? *w.name(e) : std::string("?")));
+            }
+            logRect("INS-SCRIPT-RESET", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+        } else {
+            ImGui::TextDisabled(TR("no instance (not synced yet)"));
+        }
+    }
 
     // 脚本只在运行态求值 —— 这条提示很重要，否则用户会以为坏了
     if (m_ctx.isEditing()) {
@@ -5363,6 +5934,146 @@ void InspectorPanel::drawScript(ecs::Entity e) {
         m_ctx.structuralEdit("Remove Script",
                              [&]() { w.remove<ecs::ScriptComponent>(e); });
         m_scriptBufFor = ecs::Entity{};
+    }
+}
+
+// ---------------------------------------------------------------- 音频源（G14-7）
+
+// 放在 **Tool** 页签而不是新开一个页签：
+// 加页签要同时改 `kTabs[]` 的顺序（枚举值 == 图标栏顺序）、图标、
+// 落盘 id 和两处 `static_assert` —— 而音频的属性只有 9 个字段，
+// 语义上本来就属于"这个物体挂了什么行为"（与 Script 同一格）。
+void InspectorPanel::drawAudioSource(ecs::Entity e) {
+    scene::Scene& sc = m_ctx.activeScene();
+    ecs::World& w = sc.world();
+    auto* a = w.get<ecs::AudioSourceComponent>(e);
+    if (!a) return;
+
+    if (!sectionHeader("Audio Source", true, e, "Audio Source")) return;
+    // 锚点：编辑器里"音频段真的画出来了"的正面证据（verify_audio.py 用）
+    logRect("INS-AUDIO-HEADER", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    if (m_audioBufFor != e) {
+        std::snprintf(m_audioBuf, sizeof(m_audioBuf), "%s", a->clip.c_str());
+        m_audioBufFor = e;
+    }
+
+    ImGui::SetNextItemWidth(-96.0f);
+    ImGui::InputTextWithHint("##audioclip", "audio/click.wav", m_audioBuf,
+                             sizeof(m_audioBuf));
+    if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+        const std::string np = m_audioBuf;
+        if (np != a->clip) {
+            m_ctx.structuralEdit("Edit Audio Clip",
+                                 [&]() { a->clip = np; });
+        }
+    }
+    ImGui::SameLine();
+    // ▶ 试听：**不进撤销栈**（它不改变任何状态，只是"放一声"）。
+    // ⚠ 走 `requestAudioPreview` 而不是自己拿 AudioSystem：面板不该持有
+    //   引擎对象（否则 Inspector 就成了第二个 Assets 面板）。
+    const bool canPreview = !a->clip.empty();
+    ImGui::BeginDisabled(!canPreview);
+    if (ImGui::Button(TRL("Preview"))) {
+        m_ctx.requestAudioPreview(a->clip, a->volume);
+    }
+    ImGui::EndDisabled();
+    logRect("INS-AUDIO-PREVIEW", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered() && canPreview) {
+        ImGui::SetTooltip("%s", a->clip.c_str());
+    }
+
+    ImGui::BeginDisabled(!m_ctx.isEditing());
+
+    bool awake = a->playOnAwake;
+    if (ImGui::Checkbox(TRL("Play On Awake"), &awake))
+        discreteEdit(m_ctx, "Audio Play On Awake", &a->playOnAwake, !awake);
+    ImGui::SameLine();
+    bool loop = a->loop;
+    if (ImGui::Checkbox(TRL("Loop"), &loop))
+        discreteEdit(m_ctx, "Audio Loop", &a->loop, !loop);
+    ImGui::SameLine();
+    bool spatial = a->spatial;
+    if (ImGui::Checkbox(TRL("3D"), &spatial))
+        discreteEdit(m_ctx, "Audio Spatial", &a->spatial, !spatial);
+    ImGui::SetItemTooltip(
+        TRL("3D: gain falls off with distance and the sound is panned by "
+            "direction.\nOff: constant volume, centred (UI sounds)."));
+
+    const float v0 = a->volume;
+    ImGui::SetNextItemWidth(-1.0f);
+    // ⚠ 标签刻意写成 "Clip Volume" 而不是 "Volume"：词典里 "Volume" 已经
+    //   是粒子模块的**体积**。一词两义只能靠"让 UI 原文更具体"来区分 ——
+    //   共用一个键会让其中一个永远翻错（i18n 纪律）。
+    ImGui::SliderFloat(TRL("Clip Volume"), &a->volume, 0.0f, 1.0f, "%.2f");
+    fieldEdit(m_ctx, "Audio Volume", &a->volume, v0);
+
+    const float p0 = a->pitch;
+    ImGui::SetNextItemWidth(-1.0f);
+    // 同上：词典里的 "Pitch" 是相机的**俯仰**。
+    ImGui::SliderFloat(TRL("Clip Pitch"), &a->pitch, 0.25f, 4.0f, "%.2f");
+    fieldEdit(m_ctx, "Audio Pitch", &a->pitch, p0);
+
+    // ---- 3D 距离参数（只有 spatial 时才画：关着的时候它们完全没用）----
+    if (a->spatial) {
+        const float mn0 = a->minDist;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat(TRL("Min Distance"), &a->minDist, 0.1f, 50.0f,
+                           TR("%.2f m"));
+        fieldEdit(m_ctx, "Audio Min Distance", &a->minDist, mn0);
+
+        const float mx0 = a->maxDist;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat(TRL("Max Distance"), &a->maxDist, 1.0f, 500.0f,
+                           TR("%.1f m"));
+        fieldEdit(m_ctx, "Audio Max Distance", &a->maxDist, mx0);
+
+        const float ro0 = a->rolloff;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat(TRL("Rolloff"), &a->rolloff, 0.0f, 4.0f, "%.2f");
+        fieldEdit(m_ctx, "Audio Rolloff", &a->rolloff, ro0);
+
+        // ⚠ 一条**真的会无声**的配置必须当场说出来，否则用户只会觉得"坏了"
+        if (a->maxDist <= a->minDist) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                               TR("Max Distance must be greater than Min "
+                                  "Distance - this sound is silent."));
+        }
+    }
+
+    // ---- 总线 ----
+    static const char* kBusLabels[] = {"Music", "SFX", "Voice"};
+    int busIdx = a->bus - 1;
+    if (busIdx < 0 || busIdx > 2) busIdx = 1;
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::Combo(TRL("Bus"), &busIdx, kBusLabels, 3)) {
+        const int newBus = busIdx + 1;
+        const int oldBus = a->bus;
+        a->bus = newBus;
+        // ⚠ 撤销栈里存的是**枚举值**（1/2/3），不是下拉框下标 ——
+        //   下标会随标签顺序变，恢复出来的就是另一条总线了。
+        discreteEdit(m_ctx, "Audio Bus", &a->bus, oldBus);
+    }
+    ImGui::SetItemTooltip(
+        TRL("Voice = dialogue. While any Voice clip plays, the Music bus is "
+            "ducked automatically."));
+
+    bool streaming = a->streaming;
+    if (ImGui::Checkbox(TRL("Streaming"), &streaming))
+        discreteEdit(m_ctx, "Audio Streaming", &a->streaming, !streaming);
+    ImGui::SetItemTooltip(
+        TRL("Stream from disk with a 3 s ring buffer. Use it for long music\n"
+            "tracks; short effects should stay in memory."));
+
+    ImGui::EndDisabled();
+
+    if (removeButton() && m_ctx.isEditing()) {
+        m_ctx.structuralEdit("Remove Audio Source", [&]() {
+            m_ctx.editorScene().world().remove<ecs::AudioSourceComponent>(e);
+        });
+        m_audioBufFor = ecs::Entity{};
     }
 }
 
@@ -5410,6 +6121,32 @@ void InspectorPanel::drawAddRemove(ecs::Entity e) {
             });
             m_scriptBufFor = ecs::Entity{};
         }
+        // 动画器（A1）。只有**已经挂了蒙皮组件**的实体才配得上它 ——
+        // 没有骨架的实体挂一个动画器，界面上会全是"没东西可播"的空控件。
+        // 所以菜单项对普通物体直接灰掉（ImGui 的 enable 参数），而不是
+        // 加完再报错。
+        const bool hasAnimator = w.has<ecs::AnimatorComponent>(e);
+        const bool hasSkinned = w.has<ecs::SkinnedMeshComponent>(e);
+        if (ImGui::MenuItem(TR("Animator"), nullptr, false,
+                            hasSkinned && !hasAnimator)) {
+            m_ctx.structuralEdit("Add Animator", [&]() {
+                ecs::AnimatorComponent a;
+                if (const auto* sk0 = w.get<ecs::SkinnedMeshComponent>(e)) {
+                    // 从"当前正在播的那一段"接手，加完画面不变样
+                    a.defaultClip = sk0->clipName;
+                    a.time = sk0->time;
+                    a.speed = sk0->speed;
+                    a.playing = sk0->playing;
+                    a.loop = sk0->loop;
+                }
+                w.add<ecs::AnimatorComponent>(e, a);
+            });
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(TR("Only for entities that already have a "
+                                 "Skinned Mesh (the model root)."));
+        }
+
         // 延迟贴花（R4-4）：默认 1 m 立方体、不透明度 1、白色 tint，
         // 两张贴图都留空 —— 于是它一加出来就是个"能看见的纯色方块"，
         // 把贴图拖进 Inspector 的 Decal 段才算真正有内容。
@@ -5465,6 +6202,39 @@ void InspectorPanel::drawAddRemove(ecs::Entity e) {
                 "+Z. Simulated entirely on the GPU (compute) and drawn with\n"
                 "one indirect draw - CPU never counts them.\n"
                 "Needs the global switch MYVK_FX=1."));
+        }
+
+        // 音频源（G14-7）：默认 2D + 循环关 + 音量 1 —— 一加出来是"点开
+        // 自己填个 clip 就能响"的状态，不预设任何素材路径。
+        const bool hasAudio = w.has<ecs::AudioSourceComponent>(e);
+        if (ImGui::MenuItem(TR("Audio Source"), nullptr, false, !hasAudio)) {
+            m_ctx.structuralEdit("Add Audio Source", [&]() {
+                ecs::AudioSourceComponent a;
+                w.add<ecs::AudioSourceComponent>(e, a);
+            });
+            m_audioBufFor = ecs::Entity{};
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("Plays a wav/ogg clip from this object's position.\n"
+                "Turn 3D on to make it fall off with distance and pan\n"
+                "by direction."));
+        }
+
+        // 听者（G14-7）：挂在相机实体上可以覆盖"听者位置"（耳朵在角色
+        // 头上、相机在身后 3 m 的第三人称混音）。
+        const bool hasListener = w.has<ecs::AudioListenerComponent>(e);
+        if (ImGui::MenuItem(TR("Audio Listener"), nullptr, false, !hasListener)) {
+            m_ctx.structuralEdit("Add Audio Listener", [&]() {
+                ecs::AudioListenerComponent al;
+                w.add<ecs::AudioListenerComponent>(e, al);
+            });
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("Overrides where the listener (ears) sits. Only the\n"
+                "position is taken from here - orientation always comes\n"
+                "from the active camera."));
         }
 
         // 刚体（R7-1）：默认 Dynamic + Auto 形状 —— 一加出来"按下 Play 就会

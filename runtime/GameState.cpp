@@ -54,6 +54,29 @@ void BuiltinState::onUpdate(GameServices& svc, float dt) {
     // 只有 Playing 推进玩法。Paused/GameOver 在上面时，Playing 根本收不到
     // 这个回调（栈的 update 范围被 blocksUpdate 截断了）。
     if (m_id == StateId::Playing && svc.simulate) svc.simulate(dt);
+
+    // ---- Paused（U6/U8）：玩家在暂停菜单上选了什么就做什么 ----
+    //
+    // ⚠ 这里**只置意图**，绝不改栈：在 onUpdate 里 pop 自己会让
+    //   GameStateStack 正在遍历的 vector 失效（它的第 2 条约定）。
+    // ⚠ `uiAction` 由宿主的 UI tick 填。UI tick 在状态栈**之外**每帧都跑，
+    //   所以暂停菜单即使压住了 Playing 也照样收得到输入 —— 这正是
+    //   "暂停时菜单点不动"那条老 bug 的根治办法。
+    if (m_id == StateId::Paused && !svc.uiAction.empty()) {
+        if (svc.uiAction == "resume") {
+            VK_LOG_INFO("GAME-PAUSE action=resume → pop");
+            svc.popRequested = true;
+        } else if (svc.uiAction == "quit") {
+            // "退出" = 退出进程。回主菜单是另一条路：M1 还没有菜单 UI，
+            // 回 MainMenu 会停在不透明的空场景里，玩家点什么都点不到。
+            VK_LOG_INFO("GAME-PAUSE action=quit → quitRequested");
+            svc.quitRequested = true;
+        } else if (svc.uiAction == "settings") {
+            // G20 的运行时设置还没做。**明确打出来**，否则"点了没反应"
+            // 会看起来像输入坏了（这类最费时间）。
+            VK_LOG_INFO("UI2-ACTION id=settings handled=0 reason=not-implemented");
+        }
+    }
 }
 
 void BuiltinState::onRender(GameServices& svc) {

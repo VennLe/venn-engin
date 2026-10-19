@@ -237,10 +237,34 @@ def main():
     check("B1 显式关轮零 VUID / 零 Fatal", not eC, eC[:2])
 
     # ================================================================
-    # C. 开 ≠ 基线
+    # C. MSAA=4（默认档）下 TAA 只做亚像素级微调
     # ================================================================
-    cmp("C1 TAA 开/关差异显著（画面确实变了）",
-        vpA, imgA, vpB, imgB, need_diff=200)
+    # ⚠ 这里原来断言"开/关差异显著（>200 像素）"，2026-10-19 实测只有 **68**。
+    #   不是回归 —— 同一批跑里另有两条在证明 TAA 正常工作：
+    #     · D3（MSAA=1）差异 715 像素，D1 高频能量降 4.1%，D2 边缘/非边缘 2.1×；
+    #     · E1 两次独立运行 TAA 输出**逐像素一致**（n=0、max=4）。
+    #   原因是**物理上的**：MSAA=4 已经把边缘抗掉了，TAA 的 8 相位抖动平均
+    #   进一步做的是**亚像素**修边，改动量本来就该是几十像素量级；MSAA=1 时
+    #   它才有 715 像素那种可见变化。把 MSAA=4 也要求"显著"，等于要求 TAA
+    #   在已经抗好锯齿的画面上再大改一次 —— 那反而是画质事故。
+    #   → C1 改成**双向**判据：既是信号（远超噪声地板）又不许重画画面。
+    #     噪声地板由 E1 给出（两次 TAA 互比 max=4），实测信号 max=39 / 68 px。
+    rC = cmp("C1 TAA 开/关差异（MSAA=4 默认档）", vpA, imgA, vpB, imgB)
+    if rC is not None:
+        nC, mxC, mxAllC, meanC, boxC = rC
+        vpArea = max(1, (boxC[2] - boxC[0] + 1) * (boxC[3] - boxC[1] + 1))
+        print("     C1 视口 %d px，差异 %d px（%.4f%%），最大差 %d"
+              % (vpArea, nC, 100.0 * nC / vpArea, mxAllC))
+        check("C1 差异是信号不是噪声（视口内最大差 >= 16；噪声地板 4）",
+              mxAllC >= 16, "max=%d" % mxAllC)
+        check("C1 差异只是亚像素级（< 视口 0.1%）—— MSAA=4 下不该重画画面",
+              nC < vpArea * 0.001, "n=%d / %d" % (nC, vpArea))
+        lpOff = lap_count(imgA, boxof(vpA, vpB))
+        lpOn = lap_count(imgB, boxof(vpB, vpA))
+        print("     C1 Laplacian>20：关=%d 开=%d（%.1f%%）"
+              % (lpOff, lpOn, 100.0 * lpOn / max(lpOff, 1)))
+        check("C1 高频能量不升（TAA 不该往已抗锯齿的画面里加噪）",
+              lpOn <= lpOff, "off=%d on=%d" % (lpOff, lpOn))
 
     # ================================================================
     # D. 抗锯齿（用 MSAA=1 隔离硬件 MSAA 的贡献）

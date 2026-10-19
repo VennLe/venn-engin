@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -71,6 +72,22 @@ bool isScript(const std::string& name) { return lowerExt(name) == ".vks"; }
 
 bool isScene(const std::string& name) { return lowerExt(name) == ".json"; }
 
+// W4-4：地形资产。它**也是** JSON，但扩展名独立 —— 绝不能落进 isScene
+// 那条"替换当前场景"的分支里（双击一份地形会把整个关卡换掉）。
+bool isTerrain(const std::string& name) {
+    return lowerExt(name) == ".vterrain";
+}
+
+// G14-8：音频素材（双击 = 试听）。`.vaudio` 是路线图里预留的"预设"扩展名，
+// **当前没有实现** —— 它必须走"未实现"通知，绝不能静默无反应（§3.11）。
+bool isAudio(const std::string& name) {
+    const std::string e = lowerExt(name);
+    return e == ".wav" || e == ".ogg";
+}
+bool isAudioPreset(const std::string& name) {
+    return lowerExt(name) == ".vaudio";
+}
+
 // E13 着色器源码（类型过滤用）
 bool isShader(const std::string& name) {
     const std::string e = lowerExt(name);
@@ -123,6 +140,7 @@ ImU32 accentColor(const std::string& name) {
     if (isModel(name)) return IM_COL32(104, 190, 132, 255);
     if (isScript(name)) return IM_COL32(198, 132, 214, 255);
     if (isScene(name)) return IM_COL32(232, 176, 96, 255);
+    if (isTerrain(name)) return IM_COL32(150, 188, 104, 255);   // 土绿
     return IM_COL32(150, 156, 166, 255);
 }
 
@@ -509,7 +527,7 @@ void ContentBrowser::refresh() {
         // 只关心"有意义的"文件：目录 + 引擎认识的几类资源
         if (!e.isDir && !isImage(e.name) && !isModel(e.name) &&
             !isScript(e.name) && !isScene(e.name) && !isShader(e.name) &&
-            !isMaterial(e.name)) {
+            !isMaterial(e.name) && !isTerrain(e.name)) {
             continue;
         }
         // E13 类型过滤
@@ -636,6 +654,8 @@ bool ContentBrowser::entryMatchesType(const DirEntry& ent) const {
         case TypeFilter::Shader:  return !ent.isDir && isShader(ent.name);
         case TypeFilter::Scene:
             return !ent.isDir && isScene(ent.name) && !isMaterial(ent.name);
+        case TypeFilter::Terrain:
+            return !ent.isDir && isTerrain(ent.name);
     }
     return true;
 }
@@ -757,6 +777,8 @@ void ContentBrowser::drawTypePane(float w) {
 
     // 行距压到 2：抽屉默认高度只有 320 px，8 个单选按默认间距排下来正好
     // 把最后一项（Folders）挤到边界上（虽然能滚，但看起来像被裁了）。
+    // W4-4 追加 Terrains 后是 9 行 —— 最后一行落在边界外，靠滚动可见。
+    // 这是**有意的取舍**：再压行距会让单选按钮本身的点击区变小。
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 2.0f));
 
     // ⚠ 顺序 = TypeFilter 的枚举值（MYVK_EDITOR_CB_TYPE 的环境钩子、
@@ -764,8 +786,8 @@ void ContentBrowser::drawTypePane(float w) {
     //   依赖这个顺序，只能往后加、不能重排）。
     static const char* kTypeNames[] = {"All",     "Models",    "Textures",
                                        "Materials", "Scenes",  "Scripts",
-                                       "Shaders", "Folders"};
-    for (int i = 0; i < 8; ++i) {
+                                       "Shaders", "Folders",   "Terrains"};
+    for (int i = 0; i < 9; ++i) {
         if (ImGui::RadioButton(TR(kTypeNames[i]), m_typeFilterIdx == i)) {
             m_typeFilterIdx = i;
             m_typeFilter = static_cast<TypeFilter>(i);
@@ -961,20 +983,24 @@ void ContentBrowser::drawSortMenu() {
 // ⚠ key 一律 ASCII 小写（进日志 / 进文件头），label 是**英文原文**（过 TR()），
 //   ext 不带点。
 const ContentBrowser::AddKind* ContentBrowser::addKinds(int& count) {
+    // ⚠ **只列有加载器的类型**（W2-4）。
+    //
+    // 以前这里有 13 项，其中 8 项（animation / cinematic / media / water /
+    // physics / foliage / ui / worldmap）点下去只是落一个
+    // `{"type":...,"version":1}` 的空文件，谁都打不开 —— 那是"UI 面承诺了
+    // 能力、底下是空的"，与项目的五件套准入纪律直接冲突。
+    //
+    // 下架是**可逆**的（加回一行），实现不是。所以先摘掉，在 W4/W5/W8 逐项
+    // 加回来 —— 加回来的时候它已经能打开了。
     static const AddKind kKinds[] = {
         {"material",  "Material",       "vmat"},
         {"model",     "Model",          "vmodel"},
         {"scene",     "Scene",          "json"},
-        {"animation", "Animation",      "vanim"},
-        {"cinematic", "Cinematic Sequence", "vseq"},
-        {"media",     "Media",          "vmedia"},
-        {"water",     "Water",          "vwater"},
         {"texture",   "Texture",        "vtex"},
-        {"physics",   "Physics",        "vphys"},
         {"audio",     "Audio",          "vaudio"},
-        {"foliage",   "Foliage",        "vveg"},
-        {"ui",        "User Interface", "vui"},
-        {"worldmap",  "World Map",      "vmap"},
+        // W4-4 加回：`terrain` 现在有加载器了（engine/terrain/Terrain.cpp），
+        // 而且落下去的是**能直接打开**的平地三件套（见 createTerrainAsset）。
+        {"terrain",   "Terrain",        "vterrain"},
     };
     count = static_cast<int>(sizeof(kKinds) / sizeof(kKinds[0]));
     return kKinds;
@@ -1126,6 +1152,11 @@ void ContentBrowser::drawAddMenu() {
 void ContentBrowser::createAsset(const char* kindKey, const char* kindLabel,
                                  const char* ext) {
     const fs::path dir = fs::path(m_root) / m_rel;
+    // ---- 地形：目录三件套，走另一条路（见 createTerrainAsset）----
+    if (std::strcmp(kindKey, "terrain") == 0) {
+        createTerrainAsset(dir.string());
+        return;
+    }
     const std::string stem = std::string("New ") + kindLabel;
     const std::string path =
         uniqueChildPath(dir.string(), stem, std::string(".") + ext);
@@ -1137,10 +1168,29 @@ void ContentBrowser::createAsset(const char* kindKey, const char* kindLabel,
                     path.c_str());
         return;
     }
-    char body[192];
-    const int n = std::snprintf(body, sizeof(body),
-                                "{\n  \"type\": \"%s\",\n  \"version\": 1\n}\n",
-                                kindKey);
+    char body[512];
+    int n = 0;
+    if (std::strcmp(kindKey, "material") == 0) {
+        // W2-1：`.vmat` 是**真资产**，不是空壳。字段与场景里的 `procedural`
+        // 块逐字相同（SceneSerializer 的两端复用的是同一套解析器）。
+        //   `id` 决定"身份"：多个关卡引用同一个 .vmat 时靠它对上号，
+        //   所以它取相对路径去扩展名，而不是随机的文件名。
+        std::string rel = m_rel.empty() ? std::string() : (m_rel + "/");
+        const std::string base = fs::path(path).stem().string();
+        const std::string id = rel + base;
+        n = std::snprintf(
+            body, sizeof(body),
+            "{\n  \"type\": \"material\",\n  \"version\": 1,\n"
+            "  \"id\": \"%s\",\n"
+            "  \"baseColor\": [0.8, 0.8, 0.8, 1.0],\n"
+            "  \"metallic\": 0.0,\n  \"roughness\": 0.5,\n"
+            "  \"emissive\": [0.0, 0.0, 0.0],\n  \"doubleSided\": false\n}\n",
+            id.c_str());
+    } else {
+        n = std::snprintf(body, sizeof(body),
+                          "{\n  \"type\": \"%s\",\n  \"version\": 1\n}\n",
+                          kindKey);
+    }
     if (n > 0) std::fwrite(body, 1, static_cast<size_t>(n), f);
     std::fclose(f);
 
@@ -1149,6 +1199,83 @@ void ContentBrowser::createAsset(const char* kindKey, const char* kindLabel,
     beginRename(path, fs::path(path).filename().string());
     VK_LOG_INFO("CB-ADD kind=%s ext=%s path=%s", kindKey, ext, path.c_str());
     m_ctx.notify(std::string(TR("Created ")) + TR(kindLabel));
+}
+
+// Add ▸ Terrain（W4-4）：落一份**平地**地形，双击就能在世界里出现。
+//
+// 三件套的尺寸是刻意选的：**65×65 采样点 / 2 m** = 128×128 m、2×2=4 块
+// （`(cols-1) % kChunkCells == 0` 是加载器的硬约束，65-1=64=2×32）。
+// 高度全 0（一块平地，`maxHeight` 先写 20 m —— 平地时它无所谓，但
+// 一旦有了笔刷/高度图它就是缩放倍率）；权重图整片写**第 0 层 255**，
+// 也就是"全草地"，否则新建出来是一片纯黑（四层权重都为 0 → albedo=0）。
+//
+// ⚠ 目录名用 `NewTerrain` 而不是 `New Terrain`：资产 id / 日志 / 命令行
+//   里带空格会一路要加引号（项目铁律：`detail=` 里不能有空格）。
+// ⚠ 不走 beginRename：重命名只改一个文件，另外两个会立刻失联。
+void ContentBrowser::createTerrainAsset(const std::string& dir) {
+    constexpr int kCols = 65;            // (65-1)/32 = 2 块
+    constexpr int kRows = 65;
+    constexpr float kMpp = 2.0f;         // → 128 m × 128 m
+    constexpr float kMaxHeight = 20.0f;
+
+    std::error_code ec;
+    const fs::path folder = uniqueChildPath(dir, "NewTerrain", "");
+    fs::create_directories(folder, ec);
+    if (ec) {
+        m_ctx.notify(TR("Create failed: cannot create folder"));
+        VK_LOG_WARN("CB-ADD kind=terrain failed: %s", ec.message().c_str());
+        return;
+    }
+
+    const std::size_t samples = static_cast<std::size_t>(kCols) *
+                                static_cast<std::size_t>(kRows);
+
+    // height.r32：全 0（平地），列主序，32 位浮点
+    const fs::path hPath = folder / "height.r32";
+    if (std::FILE* f = std::fopen(hPath.string().c_str(), "wb")) {
+        std::vector<float> zeros(samples, 0.0f);
+        std::fwrite(zeros.data(), sizeof(float), zeros.size(), f);
+        std::fclose(f);
+    }
+
+    // splat.rgba8：R = 第 0 层（草）= 255，其余 0
+    const fs::path sPath = folder / "splat.rgba8";
+    if (std::FILE* f = std::fopen(sPath.string().c_str(), "wb")) {
+        std::vector<uint8_t> w(samples * 4u, 0u);
+        for (std::size_t i = 0; i < samples; ++i) w[i * 4u] = 255u;
+        std::fwrite(w.data(), 1, w.size(), f);
+        std::fclose(f);
+    }
+
+    const fs::path jPath = folder / "terrain.vterrain";
+    if (std::FILE* f = std::fopen(jPath.string().c_str(), "wb")) {
+        char body[1024];
+        const int n = std::snprintf(
+            body, sizeof(body),
+            "{\n  \"type\": \"terrain\",\n  \"version\": 1,\n"
+            "  \"name\": \"%s\",\n  \"cols\": %d,\n  \"rows\": %d,\n"
+            "  \"metersPerPixel\": %.1f,\n  \"maxHeight\": %.1f,\n"
+            "  \"splatRepeat\": 1.0,\n  \"layerTiling\": 6.0,\n"
+            "  \"height\": \"height.r32\",\n  \"splat\": \"splat.rgba8\",\n"
+            "  \"layers\": [\n    \"materials/terrain_grass\",\n"
+            "    \"materials/terrain_dirt\",\n"
+            "    \"materials/terrain_rock\",\n"
+            "    \"materials/terrain_snow\"\n  ]\n}\n",
+            folder.filename().string().c_str(), kCols, kRows,
+            static_cast<double>(kMpp), static_cast<double>(kMaxHeight));
+        if (n > 0) std::fwrite(body, 1, static_cast<std::size_t>(n), f);
+        std::fclose(f);
+    }
+
+    m_dirty = true;
+    m_selected = jPath.string();
+    VK_LOG_INFO("CB-ADD kind=terrain path=%s size=%dx%d mpp=%.1f",
+                jPath.string().c_str(), kCols, kRows,
+                static_cast<double>(kMpp));
+    // ⚠ 不要复用 `TR("Created ")`：词典里那个键是 ContentBrowser 列表的
+    //   "创建时间"列头（`{"Created ", "创建时间 "}`），拼出来是
+    //   "创建时间 地形" —— 一条看不懂的通知。这里给一句独立文案。
+    m_ctx.notify(TR("Created terrain - double-click it to place it in the scene"));
 }
 
 // "保存所有"：面板只置位，真正落盘由 EditorApp 做 —— 它才认识场景路径、
@@ -1589,6 +1716,46 @@ void ContentBrowser::openEntry(const DirEntry& ent) {
         } else {
             m_ctx.notify(TR("Failed: ") + ent.name);
         }
+    } else if (isTerrain(ent.name)) {
+        // W4-4：双击 `.vterrain` = 在世界原点放一份地形实体。
+        //
+        // 地形**没有网格**（几何由高度图在渲染层现生成），所以这里只挂
+        // TerrainComponent，不走 instantiateModel 那条"先找 glTF"的路。
+        //
+        // 同一份资产重复双击 = **只是选中已存在的那一个**，不叠第二份：
+        // 两份完全重合的地形在画面上毫无区别，却会让 64 块 ×2 全画一遍，
+        // 而且第二份的深度/阴影跟第一份 z-fighting —— 用户看到的是
+        // "双击了一下，画面开始闪"。
+        const std::string rel = assets::makeAssetRelative(ent.absPath);
+        scene::Scene& sc = m_ctx.editorScene();
+        ecs::Entity existing{};
+        sc.forEachTerrain([&](ecs::Entity te, ecs::TerrainComponent& tc) {
+            if (existing.valid() || tc.source != rel) return;
+            existing = te;
+        });
+        if (existing.valid()) {
+            m_ctx.select(existing);
+            m_ctx.notify(std::string(TR("Already in scene: ")) + ent.name);
+            VK_LOG_INFO("CB-OPEN terrain=existing path=%s entity=%u",
+                        rel.c_str(), existing.id);
+            return;
+        }
+        ecs::Entity created{};
+        m_ctx.structuralEdit("Add Terrain", [&] {
+            created = sc.createObject(fs::path(ent.name).stem().string());
+            ecs::TerrainComponent tc;
+            tc.source = rel;
+            sc.world().add<ecs::TerrainComponent>(created, tc);
+        });
+        if (created.valid()) {
+            m_ctx.select(created);
+            m_ctx.notify(std::string(TR("Added terrain ")) + ent.name);
+            VK_LOG_INFO("CB-OPEN terrain=added path=%s entity=%u",
+                        rel.c_str(), created.id);
+        } else {
+            m_ctx.notify(std::string(TR("Failed: ")) + ent.name);
+            VK_LOG_WARN("CB-OPEN terrain=failed path=%s", rel.c_str());
+        }
     } else if (isScript(ent.name)) {
         if (!m_ctx.hasSelection()) {
             m_ctx.notify(TR("Select an entity first, then double-click the script"));
@@ -1608,6 +1775,40 @@ void ContentBrowser::openEntry(const DirEntry& ent) {
             m_ctx.notify(std::string(TR("Assigned ")) + ent.name +
                       TR(" to selection"));
         }
+    } else if (isAudio(ent.name)) {
+        // 试听（G14-8）：双击同一个文件第二次 = 停止（**同一时刻只试听一个**）。
+        // ⚠ `m_previewPath` 存**绝对路径**：行绘制每帧都要拿它跟当前行比，
+        //   存相对路径就得每行都调一次 makeAssetRelative（纯字符串拼接，
+        //   1000 行 × 60 帧全在堆上分配）。
+        const std::string rel = assets::makeAssetRelative(ent.absPath);
+        if (m_previewPath == ent.absPath) {
+            m_previewPath.clear();
+            m_ctx.requestAudioStop();
+            VK_LOG_INFO("AUDIO-PREVIEW path=%s state=stopped", rel.c_str());
+            m_ctx.notify(std::string(TR("Stopped ")) + ent.name);
+        } else {
+            // ⚠ 先查存在性：`playOneShot` 失败只会打 `AUDIO-CLIP-FAIL`，
+            //   界面上"点了没反应"是最难查的一类（§3.11）。
+            std::error_code ec;
+            if (!fs::exists(ent.absPath, ec)) {
+                m_ctx.notify(std::string(TR("Cannot play: ")) + ent.name);
+                VK_LOG_WARN(
+                    "AUDIO-PREVIEW path=%s state=failed reason=not-found",
+                    rel.c_str());
+            } else {
+                m_previewPath = ent.absPath;
+                m_ctx.requestAudioPreview(rel, 1.0f);
+                VK_LOG_INFO("AUDIO-PREVIEW path=%s state=playing", rel.c_str());
+                m_ctx.notify(std::string(TR("Previewing ")) + ent.name);
+            }
+        }
+    } else if (isAudioPreset(ent.name)) {
+        // `.vaudio` 预设还没做。**必须**说一句 —— 双击了、什么都没发生，
+        // 是最容易让人以为"编辑器坏了"的那一种。
+        m_ctx.notify(std::string(TR("Unsupported: ")) + ent.name +
+                     TR(" (.vaudio presets are not implemented yet)"));
+        VK_LOG_WARN("AUDIO-PREVIEW path=%s state=unsupported",
+                    assets::makeAssetRelative(ent.absPath).c_str());
     }
 }
 
@@ -1883,7 +2084,7 @@ void ContentBrowser::drawEntryContextMenu() {
 
     const DirEntry ent = m_ctxEntry;   // 拷贝：动作里可能触发 refresh()
 
-    if (ImGui::MenuItem(ent.isDir ? "Open" : "Open / Run")) openEntry(ent);
+    if (ImGui::MenuItem(ent.isDir ? TRL("Open") : TRL("Open / Run"))) openEntry(ent);
     ImGui::Separator();
     if (ImGui::MenuItem(TR("Rename"), "F2")) beginRename(ent.absPath, ent.name);
     if (ImGui::MenuItem(TR("Duplicate"), "Ctrl+D")) duplicateEntry(ent);
@@ -1932,11 +2133,11 @@ void ContentBrowser::drawEmptyContextMenu() {
 
 void ContentBrowser::drawDeleteConfirm() {
     if (m_openDeleteConfirm) {
-        ImGui::OpenPopup("Delete###cb_delete");
+        ImGui::OpenPopup(TRL("Delete###cb_delete"));
         m_openDeleteConfirm = false;
     }
     ImGui::SetNextWindowSize(ImVec2(470.0f, 0.0f), ImGuiCond_Appearing);
-    if (!ImGui::BeginPopupModal("Delete###cb_delete", nullptr,
+    if (!ImGui::BeginPopupModal(TRL("Delete###cb_delete"), nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize)) {
         return;
     }
@@ -2031,6 +2232,16 @@ void ContentBrowser::drawListRow(const DirEntry& ent, float rowH) {
                              : IM_COL32(206, 212, 220, 255),
                     ent.name.c_str());
 
+        // 试听角标（G14-8）：正在试听的那一行名字后面贴一个 "▶"。
+        // 存在的理由是**可发现性** —— 声音一放完就没了，用户需要一个
+        // "刚才点的就是这一行"的静态证据；同一条矩形也是脚本的锚点。
+        if (!m_previewPath.empty() && m_previewPath == ent.absPath) {
+            const float nx = textX + ImGui::CalcTextSize(ent.name.c_str()).x + 6.0f;
+            dl->AddText(ImVec2(nx, textY), IM_COL32(120, 210, 160, 255), ">");
+            logRect("AUDIO-PREVIEW-ROW", ImVec2(p.x, p.y),
+                    ImVec2(p.x + w, p.y + rowH));
+        }
+
         // 右端：类型 + 大小
         const std::string right =
             std::string(ent.isDir ? "folder" : lowerExt(ent.name)) +
@@ -2095,7 +2306,7 @@ void ContentBrowser::drawList() {
     drawEmptyContextMenu();
 
     if (m_entries.empty()) {
-        ImGui::TextDisabled(m_filter.empty() ? "(empty folder)" : "(no match)");
+        ImGui::TextDisabled(m_filter.empty() ? TRL("(empty folder)") : TRL("(no match)"));
     } else {
         for (const DirEntry& e : m_entries) drawListRow(e, rowH);
     }
@@ -2139,7 +2350,7 @@ void ContentBrowser::drawGrid() {
     drawEmptyContextMenu();
 
     if (m_entries.empty()) {
-        ImGui::TextDisabled(m_filter.empty() ? "(empty folder)" : "(no match)");
+        ImGui::TextDisabled(m_filter.empty() ? TRL("(empty folder)") : TRL("(no match)"));
     } else {
         int col = 0;
         for (const DirEntry& e : m_entries) {
@@ -2214,8 +2425,8 @@ void ContentBrowser::drawBody() {
         if (const char* t = std::getenv("MYVK_EDITOR_CB_TYPE")) {
             static const char* kNames[] = {"all",    "model", "texture",
                                            "material", "scene", "script",
-                                           "shader", "folder"};
-            for (int i = 0; i < 8; ++i) {
+                                           "shader", "folder", "terrain"};
+            for (int i = 0; i < 9; ++i) {
                 if (lowerCopy(t) == kNames[i]) {
                     m_typeFilterIdx = i;
                     m_typeFilter = static_cast<TypeFilter>(i);
@@ -2236,8 +2447,7 @@ void ContentBrowser::drawBody() {
                 m_thumb = static_cast<ThumbSize>(idx);
             }
         }
-        // MYVK_EDITOR_CB_HIST="foo,bar"：预置"最近搜索"。
-        // 之所以要这个钩子：搜索历史是**用户输入**产生的，脚本要么真的
+        // MYVK_EDITOR_CB_HIST="foo,bar"：预置"最近搜索"。        // 之所以要这个钩子：搜索历史是**用户输入**产生的，脚本要么真的
         // 注入键盘（跨进程不稳），要么就得先有点历史才能验证"点空搜索框
         // 会摊开最近搜索"。给它一个可复现的起点。
         if (const char* s = std::getenv("MYVK_EDITOR_CB_HIST")) {

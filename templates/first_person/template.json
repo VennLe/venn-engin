@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "id": "first_person",
+  "label": "First person",
+  "summary": "相机在眼睛位置，鼠标直接转视角",
+  "gameType": "first_person",
+  "startScene": "scenes/main.json",
+  "placeholders": [
+    "__PROJECT_NAME__",
+    "__TEMPLATE_ID__"
+  ],
+  "files": [
+    "assets/game.json",
+    "assets/scenes/main.json",
+    "assets/scripts/main.vks",
+    "config/render.json"
+  ]
+}

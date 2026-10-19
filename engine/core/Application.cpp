@@ -77,7 +77,10 @@ int Application::run(uint64_t maxFrames) {
         const char* s = std::getenv("MYVK_STARTUP_DELAY");
         return s && s[0] != '0';
     }();
-    constexpr double kStartupShowDelay = 2.0;
+    // 缓冲时长由子类决定（默认 2 秒；启动器重写成 0，见 Application.h）。
+    // ⚠ 局部名不能叫 startupShowDelay —— 那会在初始化式里遮蔽同名成员
+    //   函数（C++ 的声明点就在初始化式之前），编译器把 RHS 当成 double。
+    const double showDelay = startupShowDelay();
     double elapsedSec = 0.0;
     bool windowShown = false;
 
@@ -145,7 +148,7 @@ int Application::run(uint64_t maxFrames) {
         if (!windowShown) {
             elapsedSec += m_time.deltaTime();
             const bool buffering = forceStartupDelay || !startupAutomation;
-            if (buffering ? (elapsedSec >= kStartupShowDelay) : true) {
+            if (buffering ? (elapsedSec >= showDelay) : true) {
                 m_window->show();
                 windowShown = true;
             }

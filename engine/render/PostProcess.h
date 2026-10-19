@@ -172,9 +172,31 @@ public:
     VkFormat sceneOutputFormat() const { return m_swapFormat; }
 
     // 录制场景链（bloom + 合成）。overlay 只在模式 A 下被调用。
+    //
+    // gameUi（U2 起）：**游戏 UI / HUD** 的绘制回调，在**两种模式**下都会被
+    // 调用，且一定排在 overlay 之前（游戏 UI 在底层、编辑器面板盖在上面）。
+    //
+    // ⚠ 为什么必须挂在**这个** Pass 内部，而不是"Post 之后再开一个 pass"：
+    //   两个输出 pass 的 finalLayout 是写死的（模式 A = PRESENT_SRC_KHR）。
+    //   pass 结束时图已经在 PRESENT_SRC，往同一张交换链图再开一个 pass
+    //   要重新 transition，而 PRESENT_SRC 作为 initialLayout 的 pass 限制
+    //   很严 —— 验证层会直接报 VUID。所以唯一干净的位置就是这里：
+    //   Post 输出 pass 内部、ImGui overlay 之前。
+    //
+    // ⚠ 模式 B（编辑器视口）也传：那是"在视口里预览 HUD"的能力，
+    //   由 `ui.hudInEditor` 控制（默认关 —— 开了会让编辑器截图像素整体漂）。
+    //
+    // ⚠⚠ 为什么 gameUi 的签名比 overlay **多一个 VkRenderPass**：实现方
+    //   （ui2/UiRenderer）的管线和 pass 是**强绑定**的 —— 两个输出 pass 除了
+    //   finalLayout，还差一条 subpass dependency，而 dependency **参与**兼容性
+    //   判定 → 一份管线两模式通用是错的（`VUID-vkCmdDraw-renderPass-02684`，
+    //   实测 2028 条/秒）。所以本类在两个包装里各给一个**确定**的 pass 句柄，
+    //   调用方只管拿它去取自己的管线，不用猜当前在哪个模式。
+    using GameUiDrawFn = std::function<void(VkCommandBuffer, VkRenderPass)>;
     void renderScene(VkCommandBuffer cmd, uint32_t imageIndex,
                      uint32_t frameIndex,
-                     const std::function<void(VkCommandBuffer)>& overlay);
+                     const std::function<void(VkCommandBuffer)>& overlay,
+                     const GameUiDrawFn& gameUi = {});
 
     // 模式 B 的第二步：清交换链 + 画 ImGui。
     void renderUiToSwapchain(VkCommandBuffer cmd, uint32_t imageIndex,

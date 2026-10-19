@@ -26,6 +26,8 @@
 // 名单里补一行（项目铁律：裸 env 漏网必须清零）。
 // ============================================================
 
+#include "audio/AudioSystem.h"   // AudioSettings（G14-5）
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -54,6 +56,20 @@ struct RuntimeConfig {
     // ---- 内容 ----
     std::string language = "en";
     std::string quality = "high";
+
+    // ---- 音频（G14-5）----
+    // 出厂默认来自 game.json 的 `audio` 块，可被 `MYVK_RUNTIME_AUDIO_*` 覆盖。
+    //
+    // ⚠ "产品默认开 / 自动化默认关"（docs/audio_roadmap.md §3.2）：
+    //   `--selftest` / `--frames`（= 脚本在跑）时**默认不开设备**，
+    //   否则每次回归都会去抢一次 WASAPI 的共享设备，还会往日志里塞
+    //   `AUDIO-INIT`，把既有基线搅花。要真开就显式给 `MYVK_RUNTIME_AUDIO=1`。
+    audio::AudioSettings audio;
+
+    // ⚠ **已废弃**：`game.json` 的老字段，只作为兼容别名读一次
+    //   （用户机器上的 game.json 可能已经被改过，直接删会让他的设备选择
+    //    静默失效）。读到非默认值会打一行 `GAME-CONFIG-DEPRECATED`，
+    //   真正的权威是上面的 `audio.device`。
     std::string audioDevice = "default";
 
     // ---- 诊断 ----

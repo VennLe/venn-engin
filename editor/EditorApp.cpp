@@ -24,6 +24,7 @@
 #include "PanelRegistry.h"
 #include "ParticlesPanel.h"
 #include "PhysicsPanel.h"
+#include "QualitySettingsPanel.h"
 #include "SceneHierarchy.h"
 #include "SplitLayout.h"
 #include "Toolbar.h"
@@ -33,6 +34,7 @@
 
 #include "assets/AssetPath.h"
 #include "core/Logger.h"
+#include "core/Version.h"
 #include "core/WindowGeometry.h"
 #include "ecs/Components.h"
 #include "physics/CollisionWorld.h"
@@ -43,8 +45,14 @@
 #include "scene/Camera.h"
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
+#include "project/ProjectCreate.h"
+#include "project/ProjectFile.h"
 #include "ui/ImGuiManager.h"
 #include "ui/ImGuiTheme.h"
+// U2：控制台 `ui.rect` 写的就是 ui2::debugRect()（Game UI 通道的调试图元）
+// U5：`ui.button` / `ui.click` 同上（按钮与命中测试的调试对象）
+#include "ui2/UiCanvas.h"
+#include "ui2/UiWidget.h"
 
 #include <imgui.h>
 // ⚠ 只有一处用到内部 API：抽屉每帧 BringWindowToDisplayFront（见
@@ -62,6 +70,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -119,10 +128,9 @@ constexpr float kStartupScreenFraction = 0.70f;
 constexpr int kFallbackWindowW = 1600;
 constexpr int kFallbackWindowH = 900;
 
-// 引擎版本号（Help ▸ About 显示）。与 CMakeLists 的
-// `project(Venn VERSION x.y.z)` 对齐 —— 那里没有把版本编进代码，
-// 所以这里是唯一的事实源；改版本时两处一起改。
-constexpr const char* kVennVersion = "0.2.0";
+// 引擎版本号（Help ▸ About 显示）。⚠ 实体在 `engine/core/Version.h` ——
+// 启动器也要显示版本，两个应用层不许各写一份（改版本必漏一处）。
+constexpr const char* kVennVersion = ::core::kVennVersion;
 
 // 自动化跑（冒烟测试 / 截图工具）不该覆写用户存下来的窗口几何：
 //   MYVK_FRAMES      —— 跑固定帧数自动退出
@@ -328,6 +336,10 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
          false, true, kSlotNone, &EditorApp::panelDrawPhysics},
         {"particles", "Particles", PanelGroup::Authoring, "", "spark",
          false, true, kSlotNone, &EditorApp::panelDrawParticles},
+        // E26：画质档位。归 Authoring（"调参类"），无快捷键 —— 它是一张
+        // 偶尔打开的面板（跟 Physics / Particles 同款），不该占 Alt+N。
+        {"quality", "Quality Settings", PanelGroup::Authoring, "", "sliders",
+         false, true, kSlotNone, &EditorApp::panelDrawQuality},
     };
 }
 
@@ -378,6 +390,11 @@ void EditorApp::panelDrawPhysics(EditorApp& a) {
 void EditorApp::panelDrawParticles(EditorApp& a) {
     if (a.m_particlesPanel) a.m_particlesPanel->draw();
 }
+// E26：画质档位。面板自己不持任何引擎引用（参数在 FeatureRegistry 里），
+// 于是它可以在没有设备的情况下被构造 —— 与 Physics/Particles 的差别仅此。
+void EditorApp::panelDrawQuality(EditorApp& a) {
+    if (a.m_qualityPanel) a.m_qualityPanel->draw();
+}
 
 void EditorApp::drawPlaceholderPanel(int panelIndex) {
     const char* title = panelTitle(panelIndex);
@@ -411,6 +428,69 @@ void EditorApp::drawPlaceholderPanel(int panelIndex) {
     if (!open) setPanelOpen(panelIndex, false);
 }
 
+// ============================================================
+// 分隔条遮挡：把"浮在分栏之上的一切"交给分栏器
+// ============================================================
+//
+// 为什么需要这个函数（2026-10-18 用户报的 bug）：
+//   分隔条画在 `GetForegroundDrawList()` 上 —— 那是**所有窗口之上**的最后
+//   一层，目的是"不被面板盖住"。代价是它同样会**穿过弹层**：点 `+` 打开的
+//   勾选菜单中间横着一条分栏线、右键菜单里也是、角色窗口里也是。用户的原话
+//   是"也包括其他所有的面板窗口或子菜单都有这个问题"。
+//
+// 做法：每帧在**所有窗口都画完**之后，把这一帧真正活着的顶层窗口矩形收集
+// 起来，分栏器逐段裁掉落在它们里面的部分（画和命中都用裁后的可见段）。
+//
+// 为什么要**排除布局面板**：分隔线正好压在两个面板的公共边界上
+// （A 的 x1 == B 的 x0），拿面板自己的矩形去裁，整条线会被裁成 0 长 ——
+// 那就等于把分隔条全弄没了。布局面板的位置就是 `LayoutRects` 里那些矩形，
+// 所以按"窗口矩形 == 某个布局矩形"来排除，几何自洽、也不用改各面板的
+// 窗口命名（改名 / 翻译都不会影响这里）。
+void EditorApp::collectSplitOccluders() {
+    m_split->clearOccluders();
+
+    const LayoutRects& L = m_ctx->layout();
+    const Rect layoutRects[] = {L.hierarchy, L.content, L.viewport, L.inspector,
+                                L.bottom,    L.status,  L.toolbar,  L.transport};
+
+    auto isLayoutPanel = [&layoutRects](const ImGuiWindow* w) {
+        constexpr float kEps = 2.0f;   // 面板位置有取整，留 2px 余量
+        for (const Rect& r : layoutRects) {
+            if (r.w <= 0.0f || r.h <= 0.0f) continue;
+            if (std::abs(w->Pos.x - r.x) <= kEps &&
+                std::abs(w->Pos.y - r.y) <= kEps &&
+                std::abs(w->Size.x - r.w) <= kEps &&
+                std::abs(w->Size.y - r.h) <= kEps) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // ---- 1) 浮层形态的 Content 抽屉（不在分栏树里）----
+    if (L.content.w > 0.0f && !m_contentDock) {
+        m_split->addOccluder(L.content.x, L.content.y,
+                             L.content.x + L.content.w,
+                             L.content.y + L.content.h);
+    }
+
+    // ---- 2) 其余所有活着的顶层窗口：弹层 / 菜单 / 浮动面板 / 角色窗口 /
+    //         tooltip / 通知 ----
+    // ⚠ 用 `WasActive`（本帧或上一帧用过）而不是 `Active`：菜单弹出那一帧
+    //   窗口刚被创建，用它自己上报的 Active 会漏掉一帧 —— 一帧的线穿过菜单
+    //   顶部，肉眼就是闪一下。
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    for (ImGuiWindow* w : g.Windows) {
+        if (!w) continue;
+        if (!w->WasActive || w->Hidden) continue;
+        if (w->Flags & ImGuiWindowFlags_ChildWindow) continue;   // 面板内部子窗口
+        if (w->Size.x < 2.0f || w->Size.y < 2.0f) continue;      // 折叠/占位
+        if (isLayoutPanel(w)) continue;                          // 见函数头注释
+        m_split->addOccluder(w->Pos.x, w->Pos.y, w->Pos.x + w->Size.x,
+                             w->Pos.y + w->Size.y);
+    }
+}
+
 void EditorApp::drawPanels() {
     const std::vector<PanelDesc>& t = panelTableVec();
     for (int i = 0; i < static_cast<int>(t.size()); ++i) {
@@ -426,10 +506,33 @@ void EditorApp::drawPanels() {
         if (p.layoutSlot != kSlotNone && !m_split->showsInLayout(p.layoutSlot)) {
             continue;
         }
+        const bool wasOpen = panelOpen(i);
         if (p.draw) {
             p.draw(*this);
         } else if (p.layoutSlot == kSlotNone) {
             drawPlaceholderPanel(i);
+        }
+
+        // ---- 标题栏的 × = "收进底栏"，不是"取消勾选" ----
+        //
+        // 2026-10-18（用户原话："点击叉号按钮关闭时下方的 Content 面板那里的
+        // 粒子按钮不能随之关闭"）。上一版：× 直接写回 panelOpen=false →
+        // 底栏那个按钮**整条消失**（底栏的循环里 `if (!panelOpen(i)) continue;`），
+        // 想再打开只能绕到底栏的 + 托盘里重新勾一次 —— 用户看到的就是"面板关
+        // 了、按钮也没了，状态对不上"。
+        //
+        // 现在把 × 归到和"最小化"同一条路径：勾选留着、`trayHidden` 置 1 →
+        // 窗口收起、底栏按钮**留在原地但变暗**，再点一下就回来。真正"移除
+        // 按钮"仍然只有一条路：底栏按钮自己右上角那个 ×（TrayHit::Remove）。
+        //
+        // 为什么判定放在这里：`drawPanels` 只对**本帧开着的面板**派发，而
+        // 派发期间唯一能把 `panelOpen(i)` 改掉的就是面板自己 Begin 里的
+        // p_open（= 标题栏的 ×）。菜单/快捷键/托盘叉号的关闭都发生在派发
+        // 之前或之后，不会落进这个窗口。
+        if (wasOpen && !panelOpen(i) && p.layoutSlot == kSlotNone) {
+            if (bool* openSlot = panelOpenSlot(i)) *openSlot = true;  // 勾选留着
+            panelTrayHiddenRef(i) = true;    // 窗口收起 → 底栏按钮变暗
+            VK_LOG_INFO("PANEL-XCLOSE %s hidden=1", p.id);
         }
 
         // 浮动面板抢层级 —— 和 Content 抽屉完全同一个理由（那边有长注释）：
@@ -472,6 +575,125 @@ scene::Scene& EditorApp::activeScene() {
 }
 
 void EditorApp::onInit() {
+    // ============================================================
+    // 当前工作目录 —— 启动器 D5 的**唯一可断言痕迹**
+    // ============================================================
+    // 引擎里所有"用户状态"（`config/editor_layout.json` / `config/editor_prefs.json`
+    // / `imgui.ini`）都是相对 CWD 的，而启动器是用 `CreateProcessW` 的
+    // `lpCurrentDirectory` 把 CWD 设成工程根的。
+    //
+    // ⚠ 为什么必须**打这一行**而不是靠"布局文件落在工程目录"来判断：
+    //   那份布局在**自动化跑**（`MYVK_FRAMES` / `MYVK_NO_WINDOW_SAVE` /
+    //   `MYVK_LOG_RECTS` / `MYVK_EDITOR_NO_HUD` 任一存在）里是被**拒写**的
+    //   （见 `editorLayoutAutomationRun`）。而验收脚本为了点控件必须开
+    //   `MYVK_LOG_RECTS` —— 于是"靠布局文件证明 CWD"在自动化里永远为假，
+    //   长得和"CWD 契约不成立"一模一样。日志行不受这条闸门影响。
+    {
+        std::error_code ec;
+        const auto cwd = std::filesystem::current_path(ec);
+        VK_LOG_INFO("EDITOR-CWD path=%s",
+                    ec ? "(unknown)" : cwd.generic_string().c_str());
+    }
+    // ============================================================
+    // 启动器拉起本进程时的第一件事：认工程（D7）
+    // ============================================================
+    // `MYVK_EDITOR_PROJECT` = 工程根，或 `<根>/venn.project.json`（两种都收：
+    // 前者给人手敲，后者是启动器拼好的现成路径）。
+    //
+    // 三件事，顺序不能换：
+    //   ① `current_path(根)` —— 引擎里所有"用户状态"（`config/editor_layout.json`
+    //      / `config/editor_prefs.json` / `imgui.ini`）都是**相对 CWD** 的。
+    //      不换就是"两个工程的布局互相覆盖"，而且不报错。
+    //   ② 读 `venn.project.json` → 标题栏挂工程名。⚠ 读失败**不改 CWD**：
+    //      半打开的工程比打不开难查十倍。
+    //   ③ 场景路径来自 `MYVK_EDITOR_SCENE`（下面那段既有钩子），这里不动它。
+    //
+    // ⚠ 启动器还会用 `CreateProcessW` 的 `lpCurrentDirectory` 直接把 CWD
+    //   设成工程根 —— 那才是主路径。这里是**兜底**：用户手敲 env 或者
+    //   手工双击 `Editor.exe` 时也能落到同一个状态。
+    if (const char* envProj = std::getenv("MYVK_EDITOR_PROJECT")) {
+        if (envProj[0] != '\0') {
+            namespace fs = std::filesystem;
+            std::string root(envProj);
+            for (char& c : root)
+                if (c == '\\') c = '/';
+            // 去掉末尾斜杠，再判断是不是 json 文件路径
+            while (root.size() > 1 && root.back() == '/') root.pop_back();
+            const std::string kFile = "venn.project.json";
+            if (root.size() > kFile.size() &&
+                root.compare(root.size() - kFile.size(), kFile.size(), kFile) == 0) {
+                const size_t slash = root.find_last_of('/');
+                root = (slash == std::string::npos) ? std::string(".")
+                                                   : root.substr(0, slash);
+            }
+
+            project::ProjectFile pf;
+            std::string perr;
+            if (project::loadProject(root, pf, &perr)) {
+                std::error_code ec;
+                fs::current_path(fs::path(root), ec);
+                if (ec) {
+                    VK_LOG_WARN("EDITOR-PROJECT: cannot chdir to '%s': %s",
+                                root.c_str(), ec.message().c_str());
+                }
+                // 工程声明了起始场景 → 记下来当**默认文档**。真正的加载
+                // 在下面那段 `MYVK_EDITOR_SCENE` 钩子里（显式 env 优先，
+                // 见那里的一句说明）。不在这里直接 loadScene —— 那段钩子
+                // 还要处理 `scenePath` / `pushRecentScene` / 失败降级，
+                // 两处各写一遍必然漂移。
+                m_projectScene = pf.startScene;
+                // 标题栏挂工程名 —— 自动化靠它断言"编辑器打开的确实是我
+                // 刚建的那个工程"（`Venn Editor - MyGame`）。
+                window().setTitle("Venn Editor - " + pf.name);
+
+                // ---- M5-b：外置代码根的一致性校验 ----
+                //
+                // 外置代码根靠**目录联接**（`assets/scripts -> <外部目录>`）
+                // 实现，引擎完全不知道这件事（脚本路径仍是资产相对路径）。
+                // 代价是：联接可以被外部悄悄改掉 / 被删掉 / 被指向别处，
+                // 而引擎只会看到"scripts 目录里没有那些文件" —— 表现是
+                // "脚本突然不跑了"，没有任何线索。
+                //
+                // 所以打开工程时对一次账：`venn.project.json` 说 linked，
+                // 文件系统上就**必须**真的是个联接、且指向声明的那个目录。
+                // 不一致只打 WARN 并继续（用户可以自己修），**不改任何文件**
+                // —— 打开工程就悄悄改磁盘是最不该做的事。
+                {
+                    const std::string scriptsDir = project::scriptsDirAbs(pf);
+                    const bool actualLink = project::isDirectoryLink(scriptsDir);
+                    if (pf.codeLinked && !actualLink) {
+                        VK_LOG_WARN("PROJ-CODE-LINK: %s should be a junction to "
+                                    "'%s' but is not linked; scripts may not load",
+                                    scriptsDir.c_str(), pf.codeRoot.c_str());
+                    } else if (!pf.codeLinked && actualLink) {
+                        VK_LOG_WARN("PROJ-CODE-LINK: %s IS linked but "
+                                    "venn.project.json says code.linked=false "
+                                    "(stale project file?)",
+                                    scriptsDir.c_str());
+                    } else if (pf.codeLinked) {
+                        const std::string target =
+                            project::normalizePath(project::directoryLinkTarget(
+                                scriptsDir));
+                        if (target != project::normalizePath(pf.codeRoot)) {
+                            VK_LOG_WARN("PROJ-CODE-LINK: junction points to '%s' "
+                                        "but venn.project.json says '%s'",
+                                        target.c_str(), pf.codeRoot.c_str());
+                        } else {
+                            VK_LOG_INFO("PROJ-CODE-LINK ok '%s' -> '%s'",
+                                        scriptsDir.c_str(), target.c_str());
+                        }
+                    }
+                }
+                VK_LOG_INFO("EDITOR-PROJECT name=%s type=%s scene=%s root=%s",
+                            pf.name.c_str(), project::gameTypeId(pf.gameType),
+                            pf.startScene.c_str(), pf.root.c_str());
+            } else {
+                VK_LOG_WARN("EDITOR-PROJECT: '%s' is not a project: %s",
+                            root.c_str(), perr.c_str());
+            }
+        }
+    }
+
     // 窗口几何**第一件事**就摆好：第一次跑 = 主显示器居中占 70%，
     // 之后 = 上次关闭时的位置 / 大小（见 core/WindowGeometry）。
     // 尺寸变化会置 resize 标志，Renderer 在下一帧重建交换链 —— 和用户
@@ -515,7 +737,94 @@ void EditorApp::onInit() {
         m_ctx->panels().content = true;
         m_contentDock = true;
     }
-    m_scripts = std::make_unique<vks::ScriptEngine>();
+    // ---- 脚本运行时（S0）----
+    m_scriptRuntime = std::make_unique<vks::ScriptRuntime>();
+    m_scripts = &m_scriptRuntime->engine();
+    // S5：面板 / Inspector / 控制台三处都从 Context 取它（只借不拥有）
+    m_ctx->setScriptRuntime(m_scriptRuntime.get());
+
+    // 宿主能力（ScriptServices）。**与 RuntimeApp 填的是同一批回调**，
+    // 差别只在实现：编辑器没有 HudModel → 用数值镜像；音频两边都有。
+    // S0 之前编辑器这份循环压根没接 HUD/音频，同一个脚本在编辑器 Play
+    // 里 `playSound` 静默不响（P2）。
+    {
+        vks::ScriptServices svc;
+        svc.setHealth = [this](float v) { m_hudMirror.health = v; };
+        svc.damage = [this](float v) {
+            m_hudMirror.health -= v;
+            ++m_hudMirror.popups;
+            m_hudMirror.lastPopup = v;
+        };
+        svc.popup = [this](float, float, float, float amount) {
+            ++m_hudMirror.popups;
+            m_hudMirror.lastPopup = amount;
+        };
+        svc.playSound = [this](const std::string& clip) {
+            m_audio.playOneShot(clip, audio::BusId::SFX, nullptr, 1.0f);
+        };
+        svc.stopAllSounds = [this]() { m_audio.stopAll(); };
+        svc.setBusVolume = [this](const std::string& bus, float v) {
+            const int idx = audio::busIndexFromName(bus.c_str());
+            if (idx < 0) {
+                // 认不出就留痕（与 RuntimeApp 同一条规矩：静默忽略会让
+                // "我把音量调到 0.3 了怎么没变"变成一次排查）
+                VK_LOG_WARN("Editor script setBusVolume: 未知总线 '%s'"
+                            "（可用：master|music|sfx|voice）",
+                            bus.c_str());
+                return;
+            }
+            m_audio.setBusGain(static_cast<audio::BusId>(idx), v);
+        };
+        // ---- 玩家 / 输入（S3）----
+        // 编辑器没有 PlayerController（那是 runtime 的概念），于是这里用
+        // **结构判据**：场景里第一个带 CharacterControllerComponent 的实体。
+        // 语义与 runtime 一致（"被接管的那一个"），只是接管者不同。
+        svc.act.player = [this]() -> ecs::Entity {
+            ecs::Entity found{};
+            m_ctx->runtimeScene().world().each<ecs::CharacterControllerComponent>(
+                [&](ecs::Entity e, ecs::CharacterControllerComponent&) {
+                    if (!found.valid()) found = e;
+                });
+            return found;
+        };
+        svc.act.pressed = [this](const std::string& a) {
+            return m_ctx->inputMap().wasPressed(a);
+        };
+        svc.act.held = [this](const std::string& a) {
+            return m_ctx->inputMap().isHeld(a);
+        };
+        svc.act.released = [this](const std::string& a) {
+            return m_ctx->inputMap().wasReleased(a);
+        };
+        svc.act.axis = [this](const std::string& a) {
+            return m_ctx->inputMap().axis(a);
+        };
+        m_scriptRuntime->setServices(std::move(svc));
+
+        m_scriptRuntime->setPrintSink(
+            [this](const vks::ScriptInstance& inst, const std::string& line) {
+                m_printLog.push_back(inst.path + ": " + line);
+                if (m_printLog.size() > 200) {
+                    m_printLog.erase(
+                        m_printLog.begin(),
+                        m_printLog.begin() + static_cast<std::ptrdiff_t>(
+                                                 m_printLog.size() - 200));
+                }
+            });
+        // ⚠ 日志措辞与 S0 之前**逐字相同**：
+        //   "Script not runnable (path): msg" / "Script runtime error (path): msg"
+        m_scriptRuntime->setErrorSink(
+            [this](const vks::ScriptInstance& inst, const std::string& msg) {
+                const bool compileErr =
+                    inst.errorKind == vks::ScriptInstance::ErrorKind::Compile;
+                m_scripts->logLine(
+                    std::string(compileErr ? "[compile] " : "[runtime] ") +
+                    inst.path + " > " + msg);
+                VK_LOG_WARN("Script %s (%s): %s",
+                            compileErr ? "not runnable" : "runtime error",
+                            inst.path.c_str(), msg.c_str());
+            });
+    }
     m_split = std::make_unique<SplitLayout>();
     m_toolbar = std::make_unique<Toolbar>(*m_ctx, *this);
     // E02：生成器写完参数值后回调这里（FTR-UI 日志 + 副作用）。
@@ -540,6 +849,9 @@ void EditorApp::onInit() {
     m_physicsPanel = std::make_unique<editor::PhysicsPanel>(*m_ctx);
     m_particlesPanel =
         std::make_unique<editor::ParticlesPanel>(*m_ctx, renderer());
+    // E26：画质档位面板。构造无副作用（不碰设备），参数走 FeatureRegistry ——
+    // 与启动器写进 `config/render.json` 的是同一份表（QualityPresets）。
+    m_qualityPanel = std::make_unique<editor::QualitySettingsPanel>();
     // E21：通知中心 —— 接管 Logger 的**第二条**通道（hook）。
     // ⚠ 顺序：必须先有 Console 再建通知中心。两条通道本身互不依赖，但
     //   "点 Error 的 toast → 打开 Console 滚到那条"这个动作要有 Console 可开。
@@ -623,6 +935,7 @@ void EditorApp::onInit() {
     // ---- 自动化钩子（截图 / 回归测试；正常使用不设这些变量就没有任何影响）----
     //   MYVK_EDITOR_SCENE=路径   启动即打开指定场景，而不是空场景
     //   MYVK_EDITOR_SELECT=名字  启动后按名字选中一个实体
+    //   MYVK_EDITOR_IMPORT=路径  启动即导入一个模型（等价于从 Content 拖进视口）
     //   MYVK_EDITOR_CAM="x,y,z,yawDeg,pitchDeg"   把视口相机摆到指定位姿
     //   MYVK_EDITOR_CLIP="near,far"               钉死视口相机裁剪面（默认 0.1/5000）
     //   MYVK_EDITOR_GIZMO=move|rotate|scale   启动即切手柄模式
@@ -632,7 +945,14 @@ void EditorApp::onInit() {
     //       自动化截图的像素断言需要"同一配置两次运行背景逐像素相同"，而
     //       叠加层里的 FPS / 帧时间每次都不同，会在背景上留下几阶噪声。
     if (std::getenv("MYVK_EDITOR_NO_HUD")) m_viewport->setHudVisible(false);
-    if (const char* envScene = std::getenv("MYVK_EDITOR_SCENE")) {
+    // 场景来源的优先级：显式 `MYVK_EDITOR_SCENE` > 工程的 `venn.project.json`
+    // 里声明的 `startScene`（启动器拉起时很常见：它只传工程根）。
+    // ⚠ 别把工程的 startScene **写回环境变量** —— 那是"改自己的环境去当
+    //   默认值"，同一进程里后续任何读到它的地方都会跟着变，且不可撤回。
+    const char* envScene = std::getenv("MYVK_EDITOR_SCENE");
+    if ((!envScene || envScene[0] == '\0') && !m_projectScene.empty())
+        envScene = m_projectScene.c_str();
+    if (envScene) {
         if (envScene[0] != '\0') {
             const std::string abs = assets::resolveAssetPath(envScene);
             const scene::SceneIoResult r =
@@ -655,6 +975,53 @@ void EditorApp::onInit() {
             }
         }
     }
+    // ---- MYVK_EDITOR_IMPORT=相对路径：启动即导入一个模型 ----
+    // 等价于"从 Content 面板把它拖进视口"。给自动化用：ImGui 的拖拽载荷
+    // 没法从外部模拟，而"拖进来会建 SkinnedMeshComponent"正是角色链
+    // A0-1 的核心断言（在这之前，主场景的导入路径根本不判 skinned）。
+    // 必须在 MYVK_EDITOR_SCENE 之后：先开文档，再往里放东西。
+    //
+    // 支持 `;` 分隔多个路径（`a.fbx;b.fbx`）—— A0-4 的否定测试要"同一个
+    // FBX 实例化 3 次"，靠它一次起完。第 i 个沿 +X 排开 1.5 m（Z-up 世界里
+    // X 是水平轴），三个都要在视口里分得开才截得到。名字由
+    // `EditorScene::instantiateModel` 的唯一化后缀区分（`anime_girl_1`…）。
+    if (const char* envImport = std::getenv("MYVK_EDITOR_IMPORT")) {
+        int slot = 0;
+        std::string all(envImport);
+        size_t pos = 0;
+        while (pos <= all.size()) {
+            const size_t semi = all.find(';', pos);
+            std::string one = all.substr(
+                pos, semi == std::string::npos ? std::string::npos : semi - pos);
+            const size_t b = one.find_first_not_of(" \t");
+            const size_t e2 = one.find_last_not_of(" \t");
+            one = (b == std::string::npos) ? std::string()
+                                           : one.substr(b, e2 - b + 1);
+            if (!one.empty()) {
+                const ImportResult ir = instantiateModel(
+                    m_ctx->editorScene(), am, one,
+                    glm::vec3(1.5f * static_cast<float>(slot), 0.0f, 0.0f));
+                if (ir.ok()) {
+                    m_ctx->select(ir.root);
+                    const bool skinned =
+                        m_ctx->editorScene()
+                            .world()
+                            .has<ecs::SkinnedMeshComponent>(ir.root);
+                    VK_LOG_INFO("IMPORT-AUTO path=%s slot=%d root=%u meshes=%d "
+                                "skinned=%d",
+                                one.c_str(), slot,
+                                static_cast<unsigned>(ir.root.id), ir.count(),
+                                skinned ? 1 : 0);
+                    ++slot;
+                } else {
+                    VK_LOG_WARN("IMPORT-AUTO failed: %s", one.c_str());
+                }
+            }
+            if (semi == std::string::npos) break;
+            pos = semi + 1;
+        }
+    }
+
     if (const char* envSel = std::getenv("MYVK_EDITOR_SELECT")) {
         if (envSel[0] != '\0') {
             const ecs::Entity found = m_ctx->editorScene().find(envSel);
@@ -875,6 +1242,31 @@ void EditorApp::onInit() {
     // 只编译、不执行：让 Scripts 面板能立刻报出脚本的语法/类型错误
     preloadScripts();
 
+    // ---- 音频（G14-7/8）----
+    //
+    // 编辑器默认**开**（试听按钮点下去要有声）；`MYVK_EDITOR_AUDIO=0` 关掉，
+    // 无声卡机器 / 想把设备让给别的进程时用。
+    // ⚠ 与运行时同一条纪律：设备打不开不是错误，`init` 内部进 Failed，
+    //   之后所有 API 是空操作 —— 编辑器照常能用，只是没声。
+    {
+        audio::AudioSettings as;
+        as.device = "default";
+        as.enabled = true;
+        if (const char* env = std::getenv("MYVK_EDITOR_AUDIO")) {
+            as.enabled = !(env[0] == '0' && env[1] == '\0');
+        }
+        // `MYVK_EDITOR_AUDIO_NULL=1`：只验证链路，不真的发声（静音环境）
+        if (std::getenv("MYVK_EDITOR_AUDIO_NULL")) as.forceNull = true;
+        // 编辑器的试听走 SFX 总线；音乐总线压低一点，将来 BGM 不至于太吵
+        as.music = 0.7f;
+        m_audio.init(as);
+        VK_LOG_INFO("EDITOR-AUDIO enabled=%d backend=%s device=%s sr=%u ch=%u",
+                    m_audio.running() ? 1 : 0, m_audio.backendName(),
+                    m_audio.deviceName().c_str(),
+                    m_audio.deviceFormat().sampleRate,
+                    m_audio.deviceFormat().channels);
+    }
+
     VK_LOG_INFO("Venn editor ready: %zu entities (empty scene, edit mode)",
                 m_ctx->editorScene().objectCount());
 
@@ -913,10 +1305,70 @@ void EditorApp::onUpdate(float dt) {
     // MYVK_EDITOR_CONSOLE_CMD="set ssr.enabled 1"：第 40 帧执行一次。
     // 走的是与 UI/命令面板完全同一条 execute 路径（含 emitParamChange
     // 的副作用），所以日志里能看到 FTR-UI / PRESET-APPLY 等锚点。
-    if (!m_consoleCmdDone && m_editorFrames >= 40) {
+    //
+    // 支持 `;` 分隔多条（`anim.clip Walk;anim.time 0.35`）：动画对照需要
+    // "先切 clip 再钉时间"两刀，而一个环境变量只能传一个字符串。
+    // ⚠ 现有命令的参数里没有 `;`，按它切是安全的；将来若有命令需要分号，
+    //   得先把它换成别的分隔符（比如 `|`）—— 别在下游偷偷加转义。
+    // MYVK_EDITOR_PANELS="scripts,console"：启动时按 id 打开面板。
+    // 为什么需要它：`MYVK_EDITOR_PANELS` 之前，自动化只能靠 Alt+N 快捷键，
+    // 而 ImGui 的 Alt 组合键要求宿主真的把 Alt 键状态喂进去 —— PostMessage
+    // 发过去时它常常是"半按"状态，于是快捷键时灵时不灵。面板的**打开**
+    // 这件事不该依赖键盘（S5 的 F1 就是被这个坑住了）。
+    if (!m_panelsOpenedOnce && m_editorFrames >= 3) {
+        m_panelsOpenedOnce = true;
+        if (const char* ids = std::getenv("MYVK_EDITOR_PANELS")) {
+            std::string all(ids);
+            size_t pos = 0;
+            while (pos <= all.size()) {
+                const size_t comma = all.find(',', pos);
+                std::string one = all.substr(
+                    pos, comma == std::string::npos ? std::string::npos
+                                                    : comma - pos);
+                if (!one.empty()) {
+                    const int idx = panelIndexOf(one.c_str());
+                    if (idx >= 0) {
+                        setPanelOpen(idx, true);
+                        // 收进托盘的话，面板"开着"却一帧都不画 —— 锚点
+                        // 全都不出现。自动化要的是"看得见"。
+                        panelTrayHiddenRef(idx) = 0;
+                        VK_LOG_INFO("PANEL %s open=1 reason=env", one.c_str());
+                    }
+                }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+        }
+    }
+
+    // `MYVK_EDITOR_CONSOLE_CMD_FRAME` 可把"第 40 帧"往后推 —— S5 的 F6 要在
+    // **Play 之后**读变量（编辑态脚本不跑，`script.vars` 只会是 0 条）。
+    static const long kConsoleCmdFrame = [] {
+        if (const char* v = std::getenv("MYVK_EDITOR_CONSOLE_CMD_FRAME")) {
+            const long n = std::atol(v);
+            if (n > 0) return n;
+        }
+        return 40L;
+    }();
+    if (!m_consoleCmdDone &&
+        static_cast<long>(m_editorFrames) >= kConsoleCmdFrame) {
         m_consoleCmdDone = true;
         if (const char* cmd = std::getenv("MYVK_EDITOR_CONSOLE_CMD")) {
-            if (cmd[0]) m_console->execute(cmd);
+            std::string all(cmd);
+            size_t pos = 0;
+            while (pos <= all.size()) {
+                const size_t semi = all.find(';', pos);
+                std::string one = all.substr(
+                    pos,
+                    semi == std::string::npos ? std::string::npos : semi - pos);
+                const size_t b = one.find_first_not_of(" \t");
+                const size_t e2 = one.find_last_not_of(" \t");
+                one = (b == std::string::npos) ? std::string()
+                                               : one.substr(b, e2 - b + 1);
+                if (!one.empty()) m_console->execute(one);
+                if (semi == std::string::npos) break;
+                pos = semi + 1;
+            }
         }
     }
 
@@ -952,6 +1404,11 @@ void EditorApp::onUpdate(float dt) {
     }
     m_ctx->validateSelection();
 
+    // ---- 音频（G14-7/8）----
+    // 放在这里而不是 `onImGui()`：只有 onUpdate 手里有 `dt`，而音频的
+    // ducking 包络 / 失败重试计时都要它（播放位置不靠它 —— 那是声卡时钟）。
+    syncEditorAudio(dt);
+
     // ---- 脚本热重载：定时扫文件时间戳 ----
     m_hotReloadTimer += dt;
     if (m_hotReloadTimer >= 0.5f) {
@@ -970,18 +1427,28 @@ void EditorApp::onUpdate(float dt) {
     m_timeScale = std::clamp(m_timeScale, 0.05f, 4.0f);
     const float simDt = dt * m_timeScale;
 
-    // ---- Run：游戏逻辑跑在**运行态副本**上；动画跑在编辑场景上 ----
+    // ---- Run：游戏逻辑跑在**运行态副本**上 ----
     // 渲染那一边不用额外做什么：activeScene() 在 Run 期间已经返回运行态，
     // 视口自然会显示这份世界。
+    //
+    // ⚠ 这条注释以前写的是"动画跑在编辑场景上"，与 `EditorContext` 的设计
+    //   （`EditorContext.h` 开头：脚本、**动画**只跑在运行态副本上）矛盾。
+    //   实际是**两边都没有骨骼动画系统** —— 直到 A0-3 才接上，现在遵循
+    //   设计：骨骼动画也在 activeScene() 上跑（Play 时 = 运行态副本）。
     if (m_ctx->isPlaying()) {
         // 一次新的 Play 开始（上一段 Play 的帧计数已被下面的 else 归零，
         // 或者这是启动即 Play、计数器还是初值）→ 把详细日志预算灌满。
         if (m_collisionFrames == 0) m_collisionLogBudget = 240;
+        m_scriptTableDropped = false;   // 下一段非运行态要重新丢一次
         m_ctx->advancePlayTime(simDt);
         runRuntimeScripts(simDt);
         // 玩家在脚本之后 / 碰撞之前：脚本可能挪物体，玩家再动自己，
         // 碰撞最后保证谁都不穿谁（玩家也被墙挡）。
         runPlayers(simDt);
+        // ---- 骨骼动画（A0-3）----
+        // 排在物理**之前**：A4 的根运动会把位移写进 TransformComponent，
+        // 物理要读到它这一帧的最终位置（与"运动学平台先摆好再求解"同理）。
+        m_animator.tick(m_ctx->activeScene(), simDt);
         // ---- R7-1 物理 ----
         // 世界在进入 Play 的第一帧建一次（`!m_physics` 就是"还没建"），
         // 之后每帧推进 + 把解算结果写回运行态 TransformComponent。
@@ -1000,7 +1467,23 @@ void EditorApp::onUpdate(float dt) {
         // 回到编辑态/暂停态就把帧计数归零，这样每次重新 Run
         // 都会重新打一条脚本执行汇总
         m_runtimeFrames = 0;
-        m_scriptErrors.clear();
+        // 实例表只在**真正 Stop**（含编辑态）时丢一次。
+        // ⚠ 以前这里是每帧无条件 `reset()`，两处后果：
+        //   ① Pause 也算"非 Play" → 一暂停表就没了 → 恢复时脚本从头再来，
+        //      `wait` 挂在哪、变量到几，全部丢掉（暂停 = 静默重启）；
+        //   ② 编辑态表永远是空的 → Instances 面板一帧都画不出行。
+        //   现在按 `usingRuntime()` 判（与物理世界丢弃用同一个判据）。
+        if (m_scriptRuntime && !m_ctx->usingRuntime() && !m_scriptTableDropped) {
+            m_scriptRuntime->reset();
+            m_scriptTableDropped = true;
+        }
+        // 编辑态：按**编辑场景**同步一张实例表（只列出来、一行都不执行）。
+        // 这是 Instances 面板 / Inspector 的 Script 段在编辑态唯一的数据源；
+        // 没有它，面板上连"这个物体挂了脚本"都看不见（S5 F1 就是栽在这）。
+        if (m_scriptRuntime && !m_ctx->usingRuntime()) {
+            m_scriptRuntime->sync(m_ctx->editorScene());
+        }
+        m_hudMirror = HudMirror{};
         m_collisionFrames = 0;
         m_collisionLogBudget = 240;
         // 物理世界随运行态一起丢弃（Stop 之后编辑场景从没被动过，所以
@@ -1015,6 +1498,11 @@ void EditorApp::onUpdate(float dt) {
             // 编辑态：物理没在跑（面板据此显示原因而不是一片 0）
             m_ctx->setPhysicsRuntime(PhysicsRuntimeInfo{});
         }
+        // ---- 骨骼动画：非 Play 态也要刷新 ----
+        // dt=0 → 不推进时间，只按**当前** time 重算关节矩阵。这是把
+        // "拖 Inspector 时间轴 / 换 clip 立刻能看到姿势"这件事接上的地方；
+        // 也让编辑态的画面与拆分前（updateSkinning 每帧现场采样）一致。
+        m_animator.tick(m_ctx->activeScene(), 0.0f);
     }
 
     // ---- 动画（编辑态脚本）：Play 走、Pause 冻结、Stop 恢复快照 ----
@@ -1023,7 +1511,6 @@ void EditorApp::onUpdate(float dt) {
         runAnimScripts(simDt);
     } else {
         m_animFrames = 0;
-        m_animErrors.clear();
     }
 }
 
@@ -1032,6 +1519,12 @@ void EditorApp::onUpdate(float dt) {
 // 关窗口 / 菜单 Quit / 跑满帧数都会走到这里（窗口此时还活着）。
 // 只做一件事：把窗口几何存下来，下次打开接着用。
 void EditorApp::onShutdown() {
+    // 音频先关：它有一条线程，必须在日志 / 引擎资源之前停掉。
+    // ⚠ 放在最前面而不是最后面 —— 后面的落盘代码会打日志，那没问题；
+    //   但 `onShutdown` 之后对象就析构了，晚一步就可能有一次回调落空。
+    m_audio.shutdown();
+    m_audioSrcs.clear();
+
     // E04 / E05 / E17：布局 + 工作区 + 偏好落盘（自动化时各自跳过）
     saveEditorLayoutToDisk();
     if (m_console) savePrefsToDisk();
@@ -1079,6 +1572,97 @@ void EditorApp::onShutdown() {
 // 为什么要做边沿检测：这里每帧都会算一遍"该不该全屏"。如果无条件
 // setFullscreen(want)，那么编辑态下 want=false，会把 F11 打开的纯窗口
 // 全屏立刻关掉。只在值真的变化时动窗口，两个入口就不会打架。
+// ---------------------------------------------------------------- 音频（G14-7/8）
+
+// 编辑器侧的音频每帧。三件事，顺序固定：
+//   ① 取走试听请求（Inspector 的 ▶ / Content 双击）→ playOneShot
+//   ② **只在 Play 态**同步场景里的 AudioSourceComponent（编辑态不该有声音）
+//   ③ 推进 AudioSystem（预读 / ducking 事件 / AUDIO-STATS）
+//
+// ⚠ `m_audio` 在编辑态与 Play 态是**同一个实例**：Play/Stop 之间不需要
+//   重建设备（重建会有一声爆音，而且 Stop 之后设备可能已经被别人占了）。
+//   Stop 的时候用 `stopAll()` 把 Play 留下的声音淡出掉。
+void EditorApp::syncEditorAudio(float dt) {
+    // ⓪ 停止试听（Content 面板"再双击同一个文件"）
+    if (m_ctx->takeAudioStop()) {
+        m_audio.stopAll();
+        VK_LOG_INFO("AUDIO-PREVIEW-STOP");
+    }
+
+    // ① 试听：`while` 而不是 `if` —— 同一个面板在同一帧里可能被点多次
+    //    （自动化的注入命令会连着发好几条），漏掉一条就是"点了没反应"。
+    {
+        std::string clip;
+        float vol = 1.0f;
+        while (m_ctx->takeAudioPreview(clip, vol)) {
+            if (clip.empty()) continue;
+            const bool ok = m_audio.playOneShot(clip, audio::BusId::SFX,
+                                                nullptr, vol);
+            VK_LOG_INFO("AUDIO-PREVIEW clip=%s vol=%.2f ok=%d", clip.c_str(),
+                        static_cast<double>(vol), ok ? 1 : 0);
+        }
+    }
+
+    // ② Play 态的声源同步
+    if (m_ctx->isPlaying()) {
+        scene::Scene& sc = m_ctx->runtimeScene();
+        ecs::World& w = sc.world();
+
+        // listener = Play 用的那台相机（Play 期间编辑器不驱动它）
+        const glm::vec3 lp = sc.camera().position();
+        const glm::vec3 fw = sc.camera().forwardAxis();
+        bool fromEntity = false;
+        glm::vec3 ep = lp;
+        w.each<ecs::AudioListenerComponent>(
+            [&](ecs::Entity ent, const ecs::AudioListenerComponent& c) {
+                if (fromEntity || !c.enabled) return;
+                ep = glm::vec3(sc.worldMatrix(ent)[3]);
+                fromEntity = true;
+            });
+        const float a[3] = {ep.x, ep.y, ep.z};
+        const float b[3] = {fw.x, fw.y, fw.z};
+        const float u[3] = {0.0f, 0.0f, 1.0f};   // Z-up
+        m_audio.setListener(a, b, u);
+
+        m_audioSrcs.clear();
+        w.each<ecs::AudioSourceComponent>(
+            [&](ecs::Entity ent, const ecs::AudioSourceComponent& as) {
+                if (as.clip.empty()) return;
+                audio::SourceUpdate u2;
+                u2.id = (static_cast<std::uint64_t>(ent.generation) << 32) |
+                        ent.id;
+                u2.clip = as.clip;
+                u2.bus = (as.bus >= 1 && as.bus <= 3)
+                             ? as.bus
+                             : static_cast<int>(audio::BusId::SFX);
+                u2.loop = as.loop;
+                u2.spatial = as.spatial;
+                u2.playing = as.playOnAwake;
+                u2.volume = as.volume;
+                u2.pitch = as.pitch;
+                u2.minDist = as.minDist;
+                u2.maxDist = as.maxDist;
+                u2.rolloff = as.rolloff;
+                if (as.spatial) {
+                    const glm::vec3 wp = glm::vec3(sc.worldMatrix(ent)[3]);
+                    u2.pos[0] = wp.x;
+                    u2.pos[1] = wp.y;
+                    u2.pos[2] = wp.z;
+                }
+                m_audioSrcs.push_back(u2);
+            });
+        m_audio.applySources(m_audioSrcs.data(), m_audioSrcs.size());
+    } else if (!m_audioSrcs.empty()) {
+        // 从 Play 退出的**那一帧**：把 Play 留下的声音淡出，并且只做一次。
+        // ⚠ 不清 `m_audioSrcs` 的话下一帧会再 stopAll 一次 —— 那会把用户
+        //   正在试听的那一声也停掉。
+        m_audio.stopAll();
+        m_audioSrcs.clear();
+    }
+
+    m_audio.update(dt);
+}
+
 void EditorApp::syncWindowFullscreen() {
     const bool want = !m_ctx->isEditing() && m_ctx->gameFullscreen();
     if (want == m_appliedWindowFullscreen) return;
@@ -1124,87 +1708,33 @@ void EditorApp::saveSceneNow() {
 
 // ---------------------------------------------------------------- 脚本执行
 
-// 在指定场景上执行所有启用了 ScriptComponent 的实体。
-// 运行态（Run）与动画（编辑场景）共用这一个内核，只有目标场景/时间源/
-// 错误表不同 —— 复制两份循环迟早会改出分叉。
-void EditorApp::runScriptsOn(scene::Scene& sc, double t, float dt,
-                             std::unordered_map<unsigned, std::string>& errors,
-                             const char* tag, uint64_t& summaryFrame) {
-    ecs::World& w = sc.world();
-    const uint64_t frame = time().frameCount();
-    const double dtd = static_cast<double>(dt);
+// 唯一的脚本 tick 内核：Run（运行态副本）与动画（编辑场景）共用。
+// ⚠ 这里**没有循环**了 —— 循环在 `ScriptRuntime::tick` 里（一份实现，
+//   编辑器与 Game.exe 共用）。本函数只负责"挑场景 + 挑时间源 + 打汇总"。
+void EditorApp::tickScripts(scene::Scene& sc, double simTime, float dt,
+                            const char* tag, uint64_t& summaryFrame) {
+    if (!m_scriptRuntime) return;
+    m_scriptRuntime->tick(sc, simTime, dt, time().frameCount());
 
-    int executed = 0;
-    int failed = 0;
-
-    w.each<ecs::ScriptComponent>(
-        [&](ecs::Entity e, ecs::ScriptComponent& scomp) {
-            if (!scomp.enabled || scomp.path.empty()) return;
-
-            vks::ScriptAsset* asset = m_scripts->get(scomp.path);
-            if (!asset) return;
-
-            vks::ScriptProgram* prog = asset->program();
-            if (!prog || !prog->valid()) {
-                // 编译就没过：只在错误内容变化时报一次，别刷屏
-                const std::string msg = asset->lastError().toString();
-                auto it = errors.find(e.id);
-                if (it == errors.end() || it->second != msg) {
-                    errors[e.id] = msg;
-                    m_scripts->logLine("[compile] " + scomp.path + " > " + msg);
-                    VK_LOG_WARN("Script not runnable (%s): %s", scomp.path.c_str(),
-                                msg.c_str());
-                }
-                ++failed;
-                return;
-            }
-
-            vks::ScriptHost host;
-            host.scene = &sc;
-            host.entity = e;
-
-            vks::ScriptError err;
-            const double ts = static_cast<double>(scomp.timeScale);
-            const bool ok = prog->run(host, t * ts, dtd * ts, frame, err);
-
-            if (!ok) {
-                const std::string msg = err.toString();
-                auto it = errors.find(e.id);
-                if (it == errors.end() || it->second != msg) {
-                    errors[e.id] = msg;
-                    m_scripts->logLine("[runtime] " + scomp.path + " > " + msg);
-                    VK_LOG_WARN("Script runtime error (%s): %s",
-                                scomp.path.c_str(), msg.c_str());
-                }
-                ++failed;
-                return;
-            }
-            errors.erase(e.id);
-            ++executed;
-
-            // print() 的输出累积成滚动日志（run() 每次会清空 prints）
-            for (const std::string& line : prog->prints()) {
-                m_printLog.push_back(scomp.path + ": " + line);
-            }
-            if (m_printLog.size() > 200) {
-                m_printLog.erase(m_printLog.begin(),
-                                 m_printLog.begin() +
-                                     static_cast<std::ptrdiff_t>(
-                                         m_printLog.size() - 200));
-            }
-        });
-
+    const auto& st = m_scriptRuntime->lastStats();
     // 第一帧打一条汇总：冒烟测试据此确认"场景 + 脚本执行"链路真的通了
     // （只看"没有 WARN"证明力不够）
     if (++summaryFrame == 1) {
+        const double t = simTime < 0.0
+                             ? static_cast<double>(m_ctx->playTime())
+                             : simTime;
         VK_LOG_INFO("%s scripts: %d executed, %d failed (t=%.3fs)", tag,
-                    executed, failed, t);
+                    static_cast<int>(st.executed),
+                    static_cast<int>(st.failed), t);
     }
 }
 
 void EditorApp::runRuntimeScripts(float dt) {
-    runScriptsOn(m_ctx->runtimeScene(), static_cast<double>(m_ctx->playTime()),
-                 dt, m_scriptErrors, "Runtime", m_runtimeFrames);
+    // ⚠ `kSelfTimed`：仿真态由**实例自己**累加本地时间（修 P3）。
+    //   以前传 `playTime()` 再乘 timeScale，倍速从 1.0 改到 0.5 的瞬间
+    //   脚本看到的 `time` 会倒退一半 —— 子弹时间一上来就踩。
+    tickScripts(m_ctx->runtimeScene(), vks::ScriptRuntime::kSelfTimed, dt,
+                "Runtime", m_runtimeFrames);
 }
 
 // ---------------------------------------------------------------- 运行态碰撞
@@ -1595,8 +2125,12 @@ void EditorApp::destroyPhysicsWorld() {
 
 // 动画：直接在**编辑场景**上跑脚本（Play 走 / Pause 冻结 / Stop 恢复快照）
 void EditorApp::runAnimScripts(float dt) {
-    runScriptsOn(m_ctx->editorScene(), static_cast<double>(m_ctx->animTime()),
-                 dt, m_animErrors, "Anim", m_animFrames);
+    // 动画预览是**预览态**：时间跟随 `animTime()`（能拖、能回放），
+    // 所以传真实时间而不是 kSelfTimed。时间轴被拖动时脚本看到的 time
+    // 跟着跳变，这是对的。
+    tickScripts(m_ctx->editorScene(),
+                static_cast<double>(m_ctx->animTime()), dt, "Anim",
+                m_animFrames);
 }
 
 // ---------------------------------------------------------------- 脚本预编译
@@ -1696,17 +2230,10 @@ void EditorApp::computeLayout() {
         L.content = {0.0f, 0.0f, 0.0f, 0.0f};
     }
 
-    // 浮层抽屉要"挖掉"分栏分隔线：分隔条画在 ForegroundDrawList 上（压在
-    // 所有面板之上），而抽屉不在分栏树里 —— 不告诉布局器的话，
-    // Hierarchy | Viewport 那条竖线会一路画进抽屉内部。
-    // 停靠形态不用管：bottomInset 已经把分隔条的下端收到抽屉上沿了。
-    if (drawerOpen && !m_contentDock) {
-        m_split->setOccluder(true, L.content.x, L.content.y,
-                             L.content.x + L.content.w,
-                             L.content.y + L.content.h);
-    } else {
-        m_split->setOccluder(false, 0.0f, 0.0f, 0.0f, 0.0f);
-    }
+    // 浮层抽屉的形状就是下面这个矩形；至于"要不要挖掉分隔线"以及弹层 /
+    // 浮动窗口的遮挡，统一在 collectSplitOccluders() 里收集（它读的正是
+    // m_ctx->layout()，所以这里不需要额外上报）。
+    // 停靠形态不用挖：bottomInset 已经把分隔条的下端收到抽屉上沿了。
 
     // transport（视口下方播放条）已停用：UI 被移除，矩形恒为 0×0。
     L.transport = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1740,8 +2267,10 @@ int slotForPanelId(const char* id) {
 
 const char* EditorApp::viewModeLabel(int mode) {
     using VM = render::Renderer::ViewMode;
-    if (mode < 0 || mode > static_cast<int>(VM::LightComplexity)) return "lit";
-    return render::Renderer::viewModeName(static_cast<VM>(mode));
+    if (mode < 0 || mode > static_cast<int>(VM::LightComplexity)) return TR("lit");
+    // ⚠ 引擎的 viewModeName() 也用于日志（VIEW-MODE init mode=unlit），所以它
+    //   不能就地翻；在编辑器这一层包一道：日志仍可 grep 英文，界面走译文。
+    return TR(render::Renderer::viewModeName(static_cast<VM>(mode)));
 }
 
 void EditorApp::syncViewportLayout() {
@@ -2393,6 +2922,9 @@ void EditorApp::onImGui() {
 
     // 分栏分隔条：在**所有面板之后**处理 —— 分隔线画在前景层（盖在面板上），
     // 拖拽用鼠标位置手动判断（不依赖面板窗口层级）
+    // 遮挡列表必须在这里收集：此刻 g.Windows 里才有这一帧**全部**窗口的
+    // 真实矩形（弹层/菜单也是这一帧才建起来的），早一帧就会漏。
+    collectSplitOccluders();
     m_split->handleSplitters();
 
     // "Reset Layout"：重置分栏比例
@@ -2557,7 +3089,13 @@ void EditorApp::drawStatusBar() {
         return;
     }
 
-    ImGui::TextUnformatted(m_ctx->status().c_str());
+    // ⚠ 状态串要在**显示时**过一遍 TR，而不是在 setStatus / 构造时。
+    //   原因：初始值 `m_status = "Ready"` 是成员默认初始化，那一刻界面语言
+    //   还没从存档 / MYVK_EDITOR_LANG 应用（applyAppearance 在后面跑），
+    //   在那里翻会永久钉死在英文。显示时翻则换语言立刻跟着变。
+    //   所有 setStatus 传进来的值本身已经 TR 过（中文），tr() 查不到就原样
+    //   返回 —— 所以这条对"播放失败: xxx"这类动态串是无害的。
+    ImGui::TextUnformatted(TR(m_ctx->status().c_str()));
     ImGui::SameLine();
     ImGui::TextDisabled(TR("| history %zu/%zu"),
                         m_ctx->commands().cursor(),
@@ -2583,9 +3121,9 @@ void EditorApp::drawStatusBar() {
     const bool playing = m_ctx->isPlaying();
     const bool paused = m_ctx->isPaused();
     const char* stateText = playing ? (m_ctx->gameFullscreen()
-                                           ? "PLAYING (fullscreen)"
-                                           : "PLAYING (in viewport)")
-                                    : (paused ? "PAUSED" : "EDITING");
+                                           ? TR("PLAYING (fullscreen)")
+                                           : TR("PLAYING (in viewport)"))
+                                    : (paused ? TR("PAUSED") : TR("EDITING"));
     const ImVec4 stateCol = playing ? ImVec4(0.55f, 0.85f, 0.55f, 1.0f)
                                     : (paused ? ImVec4(0.95f, 0.8f, 0.4f, 1.0f)
                                               : ImVec4(0.62f, 0.67f, 0.74f, 1.0f));
@@ -2615,7 +3153,7 @@ void EditorApp::drawStatusBar() {
     ImGui::SameLine();
     if (nTasks > 0) {
         char label[48];
-        std::snprintf(label, sizeof(label), "tasks %d", nTasks);
+        std::snprintf(label, sizeof(label), TR("tasks %d"), nTasks);
         ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.95f, 1.0f), TR("%s"), label);
         if (m_notifications->tasksMinimized() && ImGui::IsItemClicked())
             m_notifications->setTasksMinimized(false);
@@ -2997,6 +3535,16 @@ EditorApp::TrayHit EditorApp::trayButton(const char* id, const char* label,
     // 主体：点它 = 开关面板
     if (ImGui::InvisibleButton("##body", ImVec2(bodyW, h))) hit = TrayHit::Toggle;
     const bool bodyHovered = ImGui::IsItemHovered();
+    // 自动化锚点：每个托盘按钮自己的矩形（`BAR-TRAY-<面板id>`）。
+    // 之前只有 `BAR-TRAY-PLUS` 和右键菜单里的两项有锚点，脚本没法"点某个
+    // 面板的托盘按钮"——于是"最小化之后怎么恢复"根本没被覆盖过。
+    {
+        // id 传进来时带 "tray_" 前缀（见调用点），锚点里用干净的面板 id
+        const char* pid = (id && std::strncmp(id, "tray_", 5) == 0) ? id + 5 : id;
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "BAR-TRAY-%s", pid ? pid : "");
+        logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    }
     // 叉号：紧贴主体右侧的**整块**命中区。
     //
     // 这里踩过一次：一开始只放了 12x12 的小方块（视觉上 × 就这么大），
@@ -3016,7 +3564,7 @@ EditorApp::TrayHit EditorApp::trayButton(const char* id, const char* label,
         const std::string wname = trayWindowName(id + 5);   // 去掉 "tray_" 前缀
         ImGuiWindow* win = ImGui::FindWindowByName(wname.c_str());
         const bool collapsed = win ? (win->Collapsed != 0) : false;
-        if (ImGui::MenuItem(TR(collapsed ? "Expand" : "Minimize"))) {
+        if (ImGui::MenuItem(TR(collapsed ? TRL("Expand") : TRL("Minimize")))) {
             ImGui::SetWindowCollapsed(wname.c_str(), !collapsed);
             VK_LOG_INFO("PANEL-TRAY %s minimized=%d", id + 5,
                         collapsed ? 0 : 1);
@@ -3401,9 +3949,9 @@ void EditorApp::drawBottomBar() {
     // 右侧：资源统计（原来 Content 面板底行那一句，现在常驻）
     char stat[512];
     const std::string& rel = m_content->currentRel();
-    std::snprintf(stat, sizeof(stat), "%zu entries  |  %s",
+    std::snprintf(stat, sizeof(stat), TR("%zu entries  |  %s"),
                   m_content->entryCount(),
-                  rel.empty() ? "(root)" : rel.c_str());
+                  rel.empty() ? TR("(root)") : rel.c_str());
     const float tw = ImGui::CalcTextSize(stat).x;
     const float x = std::max(ImGui::GetWindowWidth() - tw - 12.0f,
                              ImGui::GetCursorPosX());
@@ -3650,9 +4198,9 @@ void EditorApp::drawTransportBar() {
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(runActive
-            ? "Stop the running game (editor scene was never touched)."
-            : "Run the game in the viewport (logic runs on a copy;\n"
-              "the editor scene is left untouched).  Space");
+            ? TRL("Stop the running game (editor scene was never touched).")
+            : TRL("Run the game in the viewport (logic runs on a copy;\n"
+              "the editor scene is left untouched).  Space"));
     }
 
     // ---- 动画 Play / Pause / Stop ----
@@ -3806,8 +4354,8 @@ void EditorApp::drawTransportBar() {
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip(canStep
-                    ? "Advance the animation by exactly one frame (1/60 s)"
-                    : "Pause the animation first (Play/Pause/Stop row)");
+                    ? TRL("Advance the animation by exactly one frame (1/60 s)")
+                    : TRL("Pause the animation first (Play/Pause/Stop row)"));
             }
             x += 56.0f + 10.0f;
         }
@@ -3819,7 +4367,7 @@ void EditorApp::drawTransportBar() {
             const float tmax = std::max(clockT + 0.5f, 1.0f);
             ImGui::SetCursorPos(ImVec2(x, rowY));
             ImGui::SetNextItemWidth(sliderW);
-            if (ImGui::SliderFloat("##timeline", &scrub, 0.0f, tmax, "%.2f s")) {
+            if (ImGui::SliderFloat("##timeline", &scrub, 0.0f, tmax, TR("%.2f s"))) {
                 if (m_ctx->isPlaying()) m_ctx->setPlayTime(scrub);
                 else m_ctx->setAnimTime(scrub);
             }
@@ -4201,7 +4749,7 @@ void EditorApp::drawScriptPanel() {
 
     ImGui::Separator();
     if (ImGui::BeginTabBar("##scripttabs")) {
-        if (ImGui::BeginTabItem("Loaded")) {
+        if (ImGui::BeginTabItem(TRL("Loaded"))) {
             for (const std::string& p : m_scripts->loadedPaths()) {
                 vks::ScriptAsset* a = m_scripts->get(p);
                 if (!a) continue;
@@ -4225,14 +4773,147 @@ void EditorApp::drawScriptPanel() {
                 ImGui::TextDisabled(TR("(the scene references no scripts)"));
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Log")) {
+        // ★ S5：Instances 页签 —— 脚本从"编辑器看不见"变成"能看见、能重置"。
+        //   这一页是五件套里的「UI 面」：没有它，`wait` 挂住、变量没涨、
+        //   熔断不出声，全都只能靠日志。
+        // `MYVK_EDITOR_SCRIPT_TAB=instances` 让这一页默认打开。
+        // ⚠ 只**选中一次**：每帧都 SetSelected 的话用户切到 Log 会立刻被弹回来。
+        static const bool kWantInstancesTab = [] {
+            const char* v = std::getenv("MYVK_EDITOR_SCRIPT_TAB");
+            return v && std::string(v) == "instances";
+        }();
+        const ImGuiTabItemFlags instFlags =
+            (kWantInstancesTab && !m_scriptTabForced)
+                ? ImGuiTabItemFlags_SetSelected
+                : ImGuiTabItemFlags_None;
+        if (ImGui::BeginTabItem(TRL("Instances"), nullptr, instFlags)) {
+            m_scriptTabForced = true;
+            const auto& insts = m_scriptRuntime->instances();
+            int nRun = 0, nWait = 0, nFail = 0, nIdle = 0;
+            for (const auto& ip : insts) {
+                const char* st = m_scriptRuntime->stateOf(*ip);
+                if (st[0] == 'R') ++nRun;
+                else if (st[0] == 'W') ++nWait;
+                else if (st[0] == 'F') ++nFail;
+                else ++nIdle;
+            }
+            ImGui::TextDisabled(TR("%d instance(s): %d running, %d waiting, "
+                                   "%d idle, %d failed"),
+                                static_cast<int>(insts.size()), nRun, nWait,
+                                nIdle, nFail);
+            ImGui::Separator();
+
+            if (insts.empty()) {
+                ImGui::TextDisabled(
+                    TR("(none - add a Script component to an object)"));
+            }
+            for (std::size_t i = 0; i < insts.size(); ++i) {
+                vks::ScriptInstance& in = *insts[i];
+                ImGui::PushID(static_cast<int>(i));
+
+                const char* st = m_scriptRuntime->stateOf(in);
+                const bool bad = in.failed;
+                const bool waiting = in.waitingNow;
+                // 四种状态四种颜色 —— `Idle` 与 `Running` **必须**不同色，
+                // 否则 F2 的"像素双证"没法做（两个都是绿的，截图一样）。
+                const ImVec4 col =
+                    bad ? ImVec4(1.0f, 0.42f, 0.40f, 1.0f)
+                        : waiting ? ImVec4(1.0f, 0.85f, 0.40f, 1.0f)
+                        : st[0] == 'I' ? ImVec4(0.62f, 0.62f, 0.66f, 1.0f)
+                                       : ImVec4(0.48f, 0.90f, 0.52f, 1.0f);
+
+                // 实体名（优先用场景里的名字；实体没了就退回 #id）
+                const std::string* nm =
+                    m_ctx->runtimeScene().world().name(in.entity);
+                char label[192];
+                std::snprintf(label, sizeof(label), "%s",
+                              nm ? nm->c_str() : "<no entity>");
+                ImGui::TextColored(col, "%s", label);
+                // ⚠ 锚点必须**贴着控件**取：再往后 SameLine 一改，
+                //   GetItemRect* 就变成按钮的矩形了。
+                logRect(("SCR-INST-" + std::to_string(i)).c_str(),
+                        ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+                // ⚠⚠ 这一行**只有**「名字 + 状态 + Reset 按钮」，脚本路径、
+                //   本地时间、变量数全部挪到第二行。
+                //   它们是硬塞不完的：路径是完整绝对路径（自动化下是
+                //   `...\Temp\venn_script_ed_xxxx\boss.vks`），一挤就把 Reset
+                //   推出窗口右边缘 —— 控件被裁掉之后 `GetItemRect*` **照样
+                //   返回真实坐标**，于是脚本拿着一个屏幕外的坐标去点，
+                //   命中 0 次、日志 0 行，而面板看起来"按钮明明在"。
+                //   （S5 的 F4/F5c 就是死在这里。）
+                ImGui::SameLine();
+                ImGui::TextColored(col, "%s", st);
+                ImGui::SameLine();
+                if (ImGui::SmallButton(TR("Reset"))) {
+                    const std::size_t before = in.vars.size();
+                    m_scriptRuntime->resetInstance(in.entity);
+                    // 自动化读这一行（F4）：`vars_after` 必须是 0 ——
+                    // 只断言"点了按钮"是不够的，"清了没清"才是要点。
+                    VK_LOG_INFO("SCR-RESET ok=1 source=panel entity=%u "
+                                "name=%s vars_before=%zu vars_after=%zu",
+                                in.entity.id, label, before, in.vars.size());
+                    m_ctx->notify(std::string(TR("Reset script on ")) + label);
+                }
+                // 路线图里写的锚点是 `SCR-INST-RESET`（无下标）。先打无下标的
+                // 保证那个名字存在，再打带下标的给"点第 N 个"用。
+                if (i == 0) {
+                    logRect("SCR-INST-RESET", ImGui::GetItemRectMin(),
+                            ImGui::GetItemRectMax());
+                }
+                logRect(("SCR-INST-RESET-" + std::to_string(i)).c_str(),
+                        ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+                // 第二行：文件名（不是全路径）+ 本地时间 + 变量数。
+                // 面板只有 360 px 宽，全路径一定被裁；名字够认出来就够了，
+                // 要全路径看 Loaded 页签或 Inspector。
+                {
+                    const std::string& p = in.path;
+                    const size_t slash = p.find_last_of("/\\");
+                    const std::string base =
+                        slash == std::string::npos ? p : p.substr(slash + 1);
+                    // ⚠ 格式串也要包 TR：`vars=` / `t=` 是屏幕上实打实的
+                    //   英文（i18n 体检 B 组会红）。占位符序列必须与原串
+                    //   完全一致 —— 这条是 F 组（崩溃级）的判据。
+                    ImGui::TextDisabled(TR("   %s  t=%.2fs  vars=%zu"),
+                                        base.c_str(),
+                                        static_cast<double>(in.localTime),
+                                        in.vars.size());
+                }
+
+                if (bad && !in.lastError.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.42f, 1.0f), "%s",
+                                       in.lastError.c_str());
+                }
+
+                // 变量查看器（只读）。默认收起 —— 一个实例可能有几十个变量。
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      ImVec4(0.72f, 0.72f, 0.75f, 1.0f));
+                const bool open = ImGui::TreeNodeEx(
+                    "##vars", ImGuiTreeNodeFlags_SpanAvailWidth, "vars (%zu)",
+                    in.vars.size());
+                ImGui::PopStyleColor();
+                if (open) {
+                    const auto rows = m_scriptRuntime->sortedVars(in);
+                    for (const auto& kv : rows) {
+                        ImGui::TextDisabled("%s = %s", kv.first.c_str(),
+                                            kv.second.c_str());
+                    }
+                    if (rows.empty()) ImGui::TextDisabled("(empty)");
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(TRL("Log"))) {
             ImGui::BeginChild("##log");
             const auto& log = m_scripts->log();
             for (const std::string& s : log) ImGui::TextWrapped(TR("%s"), s.c_str());
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("How it works")) {
+        if (ImGui::BeginTabItem(TRL("How it works"))) {
             ImGui::BeginChild("##howto");
             ImGui::TextWrapped(
                 TR("In edit mode scripts are only PRE-COMPILED: syntax errors "
@@ -4287,14 +4968,14 @@ void EditorApp::drawEnginePanel() {
     ImGui::SameLine();
     ImGui::RadioButton(TR("Debug"), &tier, 2);
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##ftrsearch", "Search features / params...",
+    ImGui::InputTextWithHint("##ftrsearch", TRL("Search features / params..."),
                              search, sizeof(search));
 
     // ---- 画质预设（E09；质量参数的档位化是 E26 的数据活，这里只拨开关）----
     static int preset = -1;            // -1 = Custom
     ImGui::SetNextItemWidth(140.0f);
     if (ImGui::BeginCombo(
-            "Preset", preset < 0 ? "Custom" : editor::qualityPresetName(preset))) {
+            TRL("Preset"), preset < 0 ? "Custom" : editor::qualityPresetName(preset))) {
         for (int i = 0; i < editor::qualityPresetCount(); ++i) {
             if (ImGui::Selectable(editor::qualityPresetName(i), preset == i)) {
                 preset = i;
@@ -4412,7 +5093,7 @@ void EditorApp::drawEngineCameras() {
             sc.camera(static_cast<size_t>(camIdx)) = sc.camera(0);
         }
     }
-    if (ImGui::SliderInt("View camera", &camIdx, 0, camCount - 1)) {
+    if (ImGui::SliderInt(TRL("View camera"), &camIdx, 0, camCount - 1)) {
         r.setViewCameraIndex(static_cast<size_t>(std::max(camIdx, 0)));
     }
 }
@@ -4427,7 +5108,7 @@ void EditorApp::drawEngineViewMode() {
         "Wireframe", "Overdraw", "Light Complexity"};
     int vmIdx = static_cast<int>(r.viewMode());
     ImGui::SetNextItemWidth(140.0f);
-    if (ImGui::Combo(TR("View mode"), &vmIdx, kViewModeLabels, 8)) {
+    if (ImGui::Combo(TR("View mode"), &vmIdx, TrItems<8>(kViewModeLabels), 8)) {
         r.setViewMode(static_cast<render::Renderer::ViewMode>(vmIdx));
     }
     if (ImGui::IsItemHovered()) {
@@ -4460,7 +5141,7 @@ void EditorApp::drawEngineMsaa() {
     }
     const char* kMsaaLabels[4] = {"1x (off)", "2x", "4x", "8x"};
     ImGui::SetNextItemWidth(120.0f);
-    if (ImGui::Combo(TR("MSAA##samples"), &msaaIdx, kMsaaLabels, 4)) {
+    if (ImGui::Combo(TRL("MSAA##samples"), &msaaIdx, TrItems<4>(kMsaaLabels), 4)) {
         VkSampleCountFlagBits bits = VK_SAMPLE_COUNT_4_BIT;
         switch (kMsaaItems[msaaIdx]) {
             case 1: bits = VK_SAMPLE_COUNT_1_BIT; break;
@@ -4748,6 +5429,429 @@ void EditorApp::registerConsoleCommands() {
                            editor::qualityPresetName(i);
                 }
             return "unknown preset '" + args[1] + "'";
+        });
+    // 定格动画时间 / 切换 clip（角色链 A0 的像素断言入口）。
+    //
+    // 为什么需要：`MYVK_EDITOR_IMPORT` 能把模型导进来，但"存盘 → 重开 →
+    // 蒙皮字段还在"这个往返必须能无人值守地跑；同理"时间真的驱动了姿势"
+    // 也要能无人值守地钉住。快捷键 Ctrl+S 走的是同一条 saveSceneNow()，
+    // 所以这里不是"测试专用路径"，只是给脚本一个入口。
+    //
+    // 为什么要专门钉时间：Idle 这类待机动画幅度极小（实测 0.4 秒内两帧只差
+    // 0.02/255），拿"自然播放的两帧"做像素断言没有判别力。而"同进程同相机
+    // 同 HUD，只改 clip/time 再各截一张"的差异只可能来自姿势 —— 这才是
+    // "时间 → 关节矩阵 → 屏幕"的干净因果。anime_girl 带 4 个 clip
+    // （Idle / Walk / Rig|Idle / Rig|Walk），所以还可以用 Walk 比对 Idle。
+    //
+    // 参数末尾可选 `<name>`：不给就作用于当前选中项，给了就按实体名找 ——
+    // A0-4 的否定测试要"同一个 FBX 的三个实例各钉不同时间"，选中集只有一个，
+    // 没有这个参数就改不到第二、三个。
+    auto resolveSkinned = [this](const std::vector<std::string>& args, size_t at,
+                                 ecs::Entity& outE,
+                                 ecs::SkinnedMeshComponent*& outSk,
+                                 std::string& err) -> bool {
+        ecs::Entity e;
+        if (args.size() > at) {
+            e = m_ctx->activeScene().find(args[at]);
+            if (!e.valid()) {
+                err = "entity not found: " + args[at];
+                return false;
+            }
+        } else {
+            e = m_ctx->selection();
+        }
+        auto* sk =
+            m_ctx->activeScene().world().get<ecs::SkinnedMeshComponent>(e);
+        if (!sk) {
+            err = "no SkinnedMeshComponent on entity " +
+                  std::to_string(static_cast<unsigned>(e.id));
+            return false;
+        }
+        outE = e;
+        outSk = sk;
+        return true;
+    };
+    // ---- 脚本（S5）----
+    // 这三条是"五件套里 UI 面"的控制台一半：面板能看，但自动化只能靠命令。
+    // ⚠ 日志前缀统一 `SCR-`，且**成功/失败都打**（失败不打 = 自动化以为命令
+    //   没执行，会去怀疑注册而不是选择集）。
+    con->addCommand("script.reset",
+        "script.reset <entityName>  reset one script instance (vars + coroutine)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: script.reset <entityName>";
+            ecs::World& w = m_ctx->activeScene().world();
+            ecs::Entity found{};
+            w.each<ecs::ScriptComponent>([&](ecs::Entity e,
+                                             ecs::ScriptComponent&) {
+                const std::string* n = w.name(e);
+                if (!found.valid() && n && *n == args[1]) found = e;
+            });
+            if (!found.valid()) {
+                VK_LOG_WARN("SCR-RESET ok=0 reason=not-found name=%s",
+                            args[1].c_str());
+                return "no script instance on '" + args[1] + "'";
+            }
+            m_scriptRuntime->resetInstance(found);
+            VK_LOG_INFO("SCR-RESET ok=1 entity=%u name=%s",
+                        static_cast<unsigned>(found.id), args[1].c_str());
+            return "reset " + args[1];
+        });
+    con->addCommand("script.vars",
+        "script.vars <entityName>  dump one instance's variables (sorted)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: script.vars <entityName>";
+            ecs::World& w = m_ctx->activeScene().world();
+            ecs::Entity found{};
+            w.each<ecs::ScriptComponent>([&](ecs::Entity e,
+                                             ecs::ScriptComponent&) {
+                const std::string* n = w.name(e);
+                if (!found.valid() && n && *n == args[1]) found = e;
+            });
+            const vks::ScriptInstance* inst =
+                found.valid() ? m_scriptRuntime->find(found) : nullptr;
+            if (!inst) {
+                VK_LOG_WARN("SCR-VARS ok=0 reason=no-instance name=%s",
+                            args[1].c_str());
+                return "no script instance on '" + args[1] + "'";
+            }
+            const auto rows = m_scriptRuntime->sortedVars(*inst);
+            VK_LOG_INFO("SCR-VARS ok=1 name=%s state=%s count=%zu",
+                        args[1].c_str(), m_scriptRuntime->stateOf(*inst),
+                        rows.size());
+            // 每个变量一行 —— 自动化按行数断言（F6 要 3 行以上）
+            for (const auto& kv : rows) {
+                VK_LOG_INFO("SCR-VARS %s=%s", kv.first.c_str(),
+                            kv.second.c_str());
+            }
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), TR("%zu variable(s)"),
+                          rows.size());
+            return buf;
+        });
+    con->addCommand("script.trace",
+        "script.trace on|off  per-frame script stats line",
+        [this](const std::vector<std::string>& args) -> std::string {
+            const bool on = args.size() >= 2 && args[1] == "on";
+            if (args.size() >= 2 && args[1] != "on" && args[1] != "off")
+                return "usage: script.trace on|off";
+            m_scriptRuntime->setTrace(on);
+            VK_LOG_INFO("SCR-TRACE on=%d", on ? 1 : 0);
+            return on ? "trace on" : "trace off";
+        });
+    con->addCommand("anim.time",
+        "anim.time <seconds> [name]  pin a skinned mesh to a time",
+        [this, resolveSkinned](const std::vector<std::string>& args)
+            -> std::string {
+            if (args.size() < 2) return "usage: anim.time <seconds> [name]";
+            ecs::Entity e;
+            ecs::SkinnedMeshComponent* sk = nullptr;
+            std::string err;
+            if (!resolveSkinned(args, 2, e, sk, err)) {
+                // 失败也要留一行：自动化那边等的是 ANIM-SETTIME，
+                // 只在成功路径打日志的话，"没选中"会表现成"命令没执行"，
+                // 排查时会去怀疑命令注册而不是选择集。
+                VK_LOG_WARN("ANIM-SETTIME ok=0 reason=unresolved detail=%s",
+                            err.c_str());
+                return err;
+            }
+            float t = 0.0f;
+            try {
+                t = std::stof(args[1]);
+            } catch (...) {
+                VK_LOG_WARN("ANIM-SETTIME ok=0 reason=bad-number '%s'",
+                            args[1].c_str());
+                return "bad number: " + args[1];
+            }
+            // 钉住时间：编辑态本来就不会推进（dt=0），顺手把 playing 关掉
+            // 能保证切到 Play 时也不被 AnimatorSystem 抢走。
+            // ⚠ A1：有 AnimatorComponent 的实体，**写它的那一份**。
+            //   写 sk->time 会在下一帧被 AnimatorSystem 的镜像覆盖回来
+            //   （日志里 ANIM-SETTIME ok=1 打出来了，画面却回到原处）。
+            auto* an =
+                m_ctx->activeScene().world().get<ecs::AnimatorComponent>(e);
+            if (an) {
+                an->time = t;
+                an->playing = false;
+            } else {
+                sk->time = t;
+                sk->playing = false;
+            }
+            VK_LOG_INFO("ANIM-SETTIME ok=1 entity=%u t=%.3f via=%s",
+                        static_cast<unsigned>(e.id), static_cast<double>(t),
+                        an ? "anim" : "sk");
+            return "time=" + args[1];
+        });
+    con->addCommand("anim.clip",
+        "anim.clip <clipName> [name]  switch the clip of a skinned mesh",
+        [this, resolveSkinned](const std::vector<std::string>& args)
+            -> std::string {
+            if (args.size() < 2) return "usage: anim.clip <clipName> [name]";
+            ecs::Entity e;
+            ecs::SkinnedMeshComponent* sk = nullptr;
+            std::string err;
+            if (!resolveSkinned(args, 2, e, sk, err)) {
+                VK_LOG_WARN("ANIM-SETCLIP ok=0 reason=unresolved detail=%s",
+                            err.c_str());
+                return err;
+            }
+            if (!sk->model || !sk->model->skeleton) {
+                VK_LOG_WARN("ANIM-SETCLIP ok=0 reason=no-skeleton entity=%u",
+                            static_cast<unsigned>(e.id));
+                return "the mesh has no skeleton";
+            }
+            if (!sk->model->skeleton->findClip(args[1])) {
+                VK_LOG_WARN("ANIM-SETCLIP ok=0 reason=unknown-clip '%s' "
+                            "entity=%u",
+                            args[1].c_str(), static_cast<unsigned>(e.id));
+                return "unknown clip: " + args[1];
+            }
+            sk->clipName = args[1];
+            // A1：换 clip 等于"用户自己指定了"，把 defaultClip 的一次性
+            // 补位闸门关上 —— 否则之后清空 clipName 会被系统填回去。
+            if (auto* an =
+                    m_ctx->activeScene().world().get<ecs::AnimatorComponent>(e))
+                an->appliedDefaultClip = true;
+            VK_LOG_INFO("ANIM-SETCLIP ok=1 entity=%u clip=%s t=%.3f",
+                        static_cast<unsigned>(e.id), sk->clipName.c_str(),
+                        static_cast<double>(sk->time));
+            return "clip=" + sk->clipName;
+        });
+    // 存盘（角色链 A0-2 的自动化入口）。快捷键 Ctrl+S 走同一条
+    // saveSceneNow()，所以这不算"测试专用路径"，只是给脚本一个入口。
+    con->addCommand("scene.save", "scene.save  save the current scene to its path",
+        [this](const std::vector<std::string>&) -> std::string {
+            saveSceneNow();
+            return "saved: " + m_ctx->scenePath();
+        });
+
+    // ---- 音频（G14-8）----
+    //
+    // 三个命令走的是**与 UI 完全相同**的那条路（`EditorContext` 请求 →
+    // `syncEditorAudio` → AudioSystem），不是"测试专用捷径"：所以
+    // `AUDIO-PREVIEW clip=... ok=1` 出现在日志里，等于证明了
+    // Inspector 的 ▶ 和 Content 的双击也会走通。
+    con->addCommand("audio.preview",
+        "audio.preview <clip>  play a wav/ogg once (same path as double-click)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: audio.preview <clip>";
+            m_ctx->requestAudioPreview(args[1], 1.0f);
+            VK_LOG_INFO("AUDIO-CMD preview clip=%s", args[1].c_str());
+            return "preview: " + args[1];
+        });
+    con->addCommand("audio.stop", "audio.stop  stop every one-shot / preview sound",
+        [this](const std::vector<std::string>&) -> std::string {
+            m_ctx->requestAudioStop();
+            return "stopped";
+        });
+    con->addCommand("audio.bus",
+        "audio.bus <master|music|sfx|voice> <0..1>  set a bus volume",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 3) return "usage: audio.bus <name> <volume>";
+            const int idx = audio::busIndexFromName(args[1].c_str());
+            if (idx < 0) {
+                // ⚠ 与脚本侧 `setBusVolume` 同一条纪律：认不出必须留痕
+                VK_LOG_WARN("AUDIO-CMD bus=unknown name=%s", args[1].c_str());
+                return "unknown bus: " + args[1];
+            }
+            const float v = static_cast<float>(std::atof(args[2].c_str()));
+            m_audio.setBusGain(static_cast<audio::BusId>(idx), v);
+            VK_LOG_INFO("AUDIO-CMD bus=%s vol=%.2f", args[1].c_str(),
+                        static_cast<double>(v));
+            return "bus " + args[1];
+        });
+    con->addCommand("audio.stats", "audio.stats  print one AUDIO-STATS line",
+        [this](const std::vector<std::string>&) -> std::string {
+            const audio::MixStats st = m_audio.stats();
+            VK_LOG_INFO("AUDIO-STATS voices=%d rms=%.4f peak=%.4f cpu=0.00 "
+                        "fill=0 sr=%u ch=%u muted=%d mem=%.0f msgs=0",
+                        st.voices, static_cast<double>(st.rms),
+                        static_cast<double>(st.peak),
+                        m_audio.deviceFormat().sampleRate,
+                        m_audio.deviceFormat().channels, m_audio.muted() ? 1 : 0,
+                        static_cast<double>(m_audio.cacheResidentBytes() +
+                                            m_audio.streamResidentBytes()));
+            return "voices=" + std::to_string(st.voices);
+        });
+
+    // ---- U2：游戏 UI 的"Hello World" ----
+    // ui.rect <x> <y> <w> <h> <#rrggbb[aa]|off>
+    //
+    // 为什么先做一条控制台命令、而不是先做控件：整条通道（挂点 / sRGB /
+    // 合批 / 顶点缓冲）都可能出错，而**一块纯色矩形**能把它们一次全部暴露
+    // —— 颜色不对就是 sRGB 问题、位置不对就是挂点或 NDC 问题、压根没有
+    // 就是回调没接上。用控件来验证会把这三类混在一起。
+    //
+    // 坐标是**输出像素**（不是逻辑像素）：这一步还没有布局系统，直接照
+    // 屏幕像素给，验收脚本就能用 "0 0 4096 4096" 一把铺满。
+    con->addCommand("ui.rect",
+        "ui.rect <x> <y> <w> <h> <#rrggbb|off>  draw a debug UI rect (U2)",
+        [](const std::vector<std::string>& args) -> std::string {
+            ui2::DebugRect& r = ui2::debugRect();
+            if (args.size() >= 2 && (args[1] == "off" || args[1] == "clear")) {
+                r.enabled = false;
+                VK_LOG_INFO("UI2-DEBUG-RECT on=0");
+                return "ui rect off";
+            }
+            if (args.size() < 5) {
+                return "usage: ui.rect <x> <y> <w> <h> <#rrggbb|off>";
+            }
+            float v[4] = {0, 0, 0, 0};
+            try {
+                for (int i = 0; i < 4; ++i) v[i] = std::stof(args[i + 1]);
+            } catch (...) {
+                return "bad number in ui.rect";
+            }
+            uint32_t color = r.color;   // 省略颜色 = 沿用上一次（默认中灰）
+            if (args.size() >= 6) {
+                std::string s = args[5];
+                if (!s.empty() && s[0] == '#') s.erase(0, 1);
+                if (s.size() != 6 && s.size() != 8) {
+                    return "color must be #rrggbb or #rrggbbaa";
+                }
+                unsigned long packed = 0;
+                try {
+                    packed = std::stoul(s, nullptr, 16);
+                } catch (...) {
+                    return "bad color: " + args[5];
+                }
+                color = (s.size() == 6) ? ui2::rgbA(packed, 255)
+                                        : static_cast<uint32_t>(packed);
+            }
+            r.enabled = true;
+            r.x = v[0];
+            r.y = v[1];
+            r.w = v[2];
+            r.h = v[3];
+            r.color = color;
+            VK_LOG_INFO("UI2-DEBUG-RECT on=1 x=%.1f y=%.1f w=%.1f h=%.1f "
+                        "color=%08X",
+                        static_cast<double>(r.x), static_cast<double>(r.y),
+                        static_cast<double>(r.w), static_cast<double>(r.h),
+                        color);
+            return "ui rect on";
+        });
+
+    // ---- U1：SDF 字体上屏 ----
+    // ui.text <x> <baselineY> <sizePx> <#rrggbb|-> <text...>
+    //
+    // 与 ui.rect 同一思路：先把"字体链路"单独钉住（图集读到了吗、uv 对吗、
+    // SDF 的平滑宽度对吗、汉字有没有缺字），再谈布局与控件。`-` 表示沿用
+    // 上次颜色。文本允许含空格（后面的参数会被拼回来）。
+    con->addCommand("ui.text",
+        "ui.text <x> <baselineY> <sizePx> <#rrggbb|-> <text>  draw SDF text (U1)",
+        [](const std::vector<std::string>& args) -> std::string {
+            ui2::DebugText& t = ui2::debugText();
+            if (args.size() >= 2 && (args[1] == "off" || args[1] == "clear")) {
+                t.enabled = false;
+                VK_LOG_INFO("UI2-DEBUG-TEXT on=0");
+                return "ui text off";
+            }
+            if (args.size() < 6) {
+                return "usage: ui.text <x> <baselineY> <sizePx> <#rrggbb|-> <text>";
+            }
+            float v[3] = {0, 0, 0};
+            try {
+                for (int i = 0; i < 3; ++i) v[i] = std::stof(args[i + 1]);
+            } catch (...) {
+                return "bad number in ui.text";
+            }
+            uint32_t color = t.color;
+            const std::string& cs = args[4];
+            if (cs != "-") {
+                std::string s = cs;
+                if (!s.empty() && s[0] == '#') s.erase(0, 1);
+                if (s.size() != 6 && s.size() != 8) {
+                    return "color must be #rrggbb, #rrggbbaa or -";
+                }
+                unsigned long packed = 0;
+                try {
+                    packed = std::stoul(s, nullptr, 16);
+                } catch (...) {
+                    return "bad color: " + cs;
+                }
+                color = (s.size() == 6) ? ui2::rgbA(packed, 255)
+                                        : static_cast<uint32_t>(packed);
+            }
+            std::string text = args[5];
+            for (size_t i = 6; i < args.size(); ++i) text += " " + args[i];
+            t.enabled = true;
+            t.x = v[0];
+            t.baselineY = v[1];
+            t.sizePx = v[2];
+            t.color = color;
+            t.utf8 = text;
+            VK_LOG_INFO("UI2-DEBUG-TEXT on=1 x=%.1f base=%.1f size=%.1f "
+                        "bytes=%u",
+                        static_cast<double>(t.x),
+                        static_cast<double>(t.baselineY),
+                        static_cast<double>(t.sizePx),
+                        static_cast<unsigned>(t.utf8.size()));
+            return "ui text on";
+        });
+
+    // ---- U5：一个真能被点中的按钮 ----
+    // ui.button <x> <y> <w> <h> <label...>   （**参考像素**，左上锚点）
+    // ui.button off
+    con->addCommand("ui.button",
+        "ui.button <x> <y> <w> <h> <label|off>  debug button (U5)",
+        [](const std::vector<std::string>& args) -> std::string {
+            ui2::DebugButton& d = ui2::debugButton();
+            if (args.size() >= 2 && (args[1] == "off" || args[1] == "clear")) {
+                d.enabled = false;
+                VK_LOG_INFO("UI2-DEBUG-BUTTON on=0");
+                return "ui button off";
+            }
+            if (args.size() < 6) {
+                return "usage: ui.button <x> <y> <w> <h> <label>";
+            }
+            float v[4] = {0, 0, 0, 0};
+            try {
+                for (int i = 0; i < 4; ++i) v[i] = std::stof(args[i + 1]);
+            } catch (...) {
+                return "bad number in ui.button";
+            }
+            std::string label = args[5];
+            for (size_t i = 6; i < args.size(); ++i) label += " " + args[i];
+
+            d.button.id = "debug";
+            d.button.label = label;
+            d.button.frame.anchor = ui2::UiAnchor::TopLeft;
+            d.button.frame.x = v[0];
+            d.button.frame.y = v[1];
+            d.button.frame.w = v[2];
+            d.button.frame.h = v[3];
+            d.button.enabled = true;
+            d.enabled = true;
+            VK_LOG_INFO("UI2-DEBUG-BUTTON on=1 x=%.1f y=%.1f w=%.1f h=%.1f "
+                        "label_bytes=%u",
+                        static_cast<double>(v[0]), static_cast<double>(v[1]),
+                        static_cast<double>(v[2]), static_cast<double>(v[3]),
+                        static_cast<unsigned>(label.size()));
+            return "ui button on";
+        });
+
+    // ---- U5：模拟一次点击 ----
+    // ui.click <x> <y> [ref|px]   默认 **ref**（参考像素，与 ui.button 同坐标系）
+    //
+    // 默认用参考像素是刻意的：验收脚本不知道视口多大，只知道"按钮设计在
+    // (100,100) 300×80"，于是点 (250,140) 就是点它的中心。换成输出像素的话，
+    // 脚本得先算 scale —— 那个 0.4948 之类的数字正是假红的高发区。
+    con->addCommand("ui.click",
+        "ui.click <x> <y> [ref|px]  simulate a click (U5)",
+        [](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 3) return "usage: ui.click <x> <y> [ref|px]";
+            float x = 0.0f, y = 0.0f;
+            try {
+                x = std::stof(args[1]);
+                y = std::stof(args[2]);
+            } catch (...) {
+                return "bad number in ui.click";
+            }
+            const bool px = (args.size() >= 4 && args[3] == "px");
+            if (px) ui2::requestClick(x, y);
+            else    ui2::requestClickRef(x, y);
+            // 真正的命中判定发生在下一帧"布局算完"之后（见 ui2/UiWidget.h）
+            return "click queued";
         });
     con->addCommand("stat", "stat gpu  print a GPU timestamp report to the console",
         [this](const std::vector<std::string>& args) -> std::string {
@@ -5222,7 +6326,7 @@ void EditorApp::drawSettingsPanel() {
     // ---- E17 顶栏：跨分类搜索 + 落盘 + Reset All（二次确认）----
     static char search[64] = "";
     ImGui::SetNextItemWidth(-330.0f);
-    ImGui::InputTextWithHint("##prefs_search", "Search settings...", search,
+    ImGui::InputTextWithHint("##prefs_search", TRL("Search settings..."), search,
                              sizeof(search));
     ImGui::SameLine();
     if (ImGui::Button(TR("Save"))) savePrefsToDisk();
@@ -5654,6 +6758,18 @@ void EditorApp::applyAppearance() {
         if (it.setChoice) it.setChoice(v);          // 夹范围 + 应用
         if (it.onChoiceChanged) it.onChoiceChanged(v);
     }
+
+    // ---- 验收钩子：`MYVK_EDITOR_LANG=zh` 强制中文 ----
+    // ⚠ 必须放在上面那条循环**之后**：它会把落盘的语言下标重新应用一遍，
+    //   存档里写着"英文"时会把外面设的值盖掉（这个坑和布局落盘那条同源）。
+    // ⚠ 只影响本次进程，不落盘 —— 交互式切换仍走 偏好设置 ▸ 外观 ▸ 语言。
+    if (const char* lang = std::getenv("MYVK_EDITOR_LANG")) {
+        const char c = lang[0];
+        const bool zh = (c == 'z' || c == 'Z' || c == 'c' || c == 'C' ||
+                         c == '1');
+        setLanguage(zh ? 1 : 0);
+        VK_LOG_INFO("EDITOR-LANG %s", zh ? "zh" : "en");
+    }
 }
 
 void EditorApp::applyPrefsFromDisk() {
@@ -5718,11 +6834,31 @@ void EditorApp::drawCharacterWindow() {
     // ---- 注册表 ⇄ 窗口 双向同步（每帧无条件跑，理由见 panelDrawCharacter）----
     const int idx = panelIndexOf("character");
     if (idx >= 0) {
+        // ⚠ 2026-10-18 用户报的 bug（原话："最小化按钮点击会消失且无法正常
+        //   最小化窗口，此后叉号也退不出去"）：
+        //
+        //   `drawPanelMinimizeButtons` 的"最小化"= 把 `panelTrayHiddenRef`
+        //   置 1（收进底栏托盘）。其它浮动面板靠 `drawPanels` 里那句
+        //   `if (panelTrayHiddenRef(i)) continue;` 生效 —— 但 Character 的
+        //   窗口是**由本函数无条件绘制的**（它有独立的 m_open 生命周期），
+        //   于是：位被置了、按钮因为 hidden 被跳过而消失、窗口却照画。
+        //   表现正是"点一下按钮就没了，窗口一点没缩小"。
+        //
+        //   修法：这里也认这个位。窗口对象**保持打开**（不动 m_open），
+        //   只是这一帧不提交 —— 从底栏托盘按钮恢复时它原样回来。
+        if (panelTrayHiddenRef(idx) && panelOpen(idx)) {
+            m_characterWasOpen = m_characterWindow->isOpen();
+            return;
+        }
+
         const bool wantOpen = panelOpen(idx);
         const bool isOpen = m_characterWindow->isOpen();
         if (wantOpen && !isOpen && m_characterWasOpen) {
             // 用户点的标题栏 ×：注册表跟着关，否则下一帧又会把它打开
             setPanelOpen(idx, false);
+            // 顺手把"托盘收起"位清掉：关掉的窗口不该还挂着"最小化"状态，
+            // 否则下次从菜单重新打开时那颗最小化按钮会继续缺席。
+            panelTrayHiddenRef(idx) = false;
             VK_LOG_INFO("PANEL character open=0 reason=user-close");
         } else if (wantOpen && !isOpen) {
             m_characterWindow->open(m_ctx->hasSelection() ? m_ctx->selection()

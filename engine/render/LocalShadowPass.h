@@ -103,11 +103,11 @@ public:
 
     // 在独立的 depth-only render pass 内渲染**第 layer 层**。
     //   clip == nullptr → 本层未使用：只清深度，不提交几何。
-    // jointBases：蒙皮网格的关节矩阵起始下标（与主前向路径同源）。
+    // 蒙皮网格的 jointBase 由 pass 自己按实体沿父链取（逐实体，见
+    // SkinnedMeshComponent::jointBase）。
     void render(VkCommandBuffer cmd, scene::Scene& scene,
                 VkDescriptorSet frameSet, uint32_t frameIndex, uint32_t layer,
-                const glm::mat4* clip,
-                const std::unordered_map<const assets::Mesh*, int>* jointBases);
+                const glm::mat4* clip);
 
     // 本帧第 layer 层的提交统计（验证脚本用：证明剔除真的在省）
     uint32_t submitted(uint32_t layer) const;

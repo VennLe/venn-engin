@@ -2,6 +2,9 @@
 
 #include "Localization.h"
 #include "DebugRects.h"
+#include "PanelRegistry.h"
+
+#include "core/Logger.h"
 #include "EditorDragDrop.h"
 #include "EditorIcons.h"
 #include "ecs/Components.h"
@@ -225,37 +228,44 @@ static void drawClippedText(ImDrawList* dl, ImVec2 p, float width, ImU32 col,
 }
 
 // 类型列的显示名（UE Outliner 的 "Type" 列那一套：文件夹显示成"文件夹"，
-// 其余按组件给一个类名）。留在英文是刻意的 —— 这些是类名，和 Inspector /
-// 日志里的叫法一致，翻成中文反而对不上。
+// 其余按组件给一个类名）。
+//
+// 2026-10-18 改：**全部走 TR**。原先这里刻意留英文（理由：是类名，和日志对得上），
+// 但 UE / Unity / Blender 三家的 Outliner 在中文界面下都会本地化显示名
+// （UE 中文的 Type 列就是"静态网格体"），所以"对齐行业基准"这条要求把原决定推翻了。
+// ⚠ 日志与 `type:` 过滤 token 用的是**另一个函数** nodeTypeName()（小写
+//   "mesh"/"light"），那个必须保持英文 —— 翻了这个函数不影响日志 grep。
 //
 // `brief` = 短名。Hierarchy 默认宽 285px，其中类型列只分到 ~77px，
 // "DirectionalLight" / "StaticMeshActor" 放不下，截断成 "Directio.." /
 // "StaticM.." 反而认不出是什么。所以**先试全名、放不下退短名、再放不下才截断**
 // （见 drawNode 里那段）。短名只做"去掉后缀/取首词"，不改叫法体系。
+// ⚠ 中文之后全名多数只有 3~5 字（比英文更窄），退短名的分支会少走很多 ——
+//   但**不能删**：用户可能把列拖宽/缩窄，宽度判定是按实际字宽算的。
 static const char* hierTypeLabel(const ecs::World& w, ecs::Entity e,
                                 bool brief = false) {
     if (const auto* h = w.get<ecs::HierarchyComponent>(e)) {
         if (h->group) return TR("Folder");
     }
     if (w.has<ecs::DirectionalLightComponent>(e))
-        return brief ? "DirLight" : "DirectionalLight";
+        return brief ? TR("DirLight") : TR("DirectionalLight");
     if (w.has<ecs::PointLightComponent>(e))
-        return brief ? "PointLight" : "PointLight";     // 本来就够短
+        return brief ? TR("PointLight") : TR("PointLight");   // 本来就够短
     if (w.has<ecs::SpotLightComponent>(e))
-        return brief ? "SpotLight" : "SpotLight";
+        return brief ? TR("SpotLight") : TR("SpotLight");
     if (w.has<ecs::ParticleEmitterComponent>(e))
-        return brief ? "Particles" : "ParticleEmitter";
+        return brief ? TR("Particles") : TR("ParticleEmitter");
     if (w.has<ecs::MeshComponent>(e))
-        return brief ? "Mesh" : "StaticMeshActor";
+        return brief ? TR("Mesh") : TR("StaticMeshActor");
     if (w.has<ecs::ScriptComponent>(e))
-        return brief ? "Script" : "ScriptActor";
+        return brief ? TR("Script") : TR("ScriptActor");
     if (w.has<ecs::CollisionComponent>(e))
-        return brief ? "Collider" : "ColliderActor";
+        return brief ? TR("Collider") : TR("ColliderActor");
     if (w.has<ecs::DecalComponent>(e))
-        return brief ? "Decal" : "DecalActor";
+        return brief ? TR("Decal") : TR("DecalActor");
     if (w.has<ecs::PlayerComponent>(e))
-        return brief ? "Player" : "PlayerStart";
-    return "Empty";
+        return brief ? TR("Player") : TR("PlayerStart");
+    return TR("Empty");
 }
 
 // 状态列：眼睛（可见性）。visible=false 时画成"闭眼"（轮廓 + 斜杠）。
@@ -554,8 +564,8 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
                 m_pendingLockToggles.push_back({e, !locked});
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(TR(locked ? "Unlock (viewport can pick)"
-                                           : "Lock (viewport cannot pick)"));
+                ImGui::SetTooltip(TR(locked ? TRL("Unlock (viewport can pick)")
+                                           : TRL("Lock (viewport cannot pick)")));
             ImGui::PopID();
             if (g_logRectRow.id == e.id)
                 logRect("HIER-LOCK row0", mn, ImVec2(mn.x + colW, mn.y + rowH));
@@ -580,8 +590,8 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
                 m_pendingVisToggles.push_back({e, !shown});
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(TR(shown ? "Hide (visible = false)"
-                                           : "Show (visible = true)"));
+                ImGui::SetTooltip(TR(shown ? TRL("Hide (visible = false)")
+                                           : TRL("Show (visible = true)")));
             ImGui::PopID();
             if (g_logRectRow.id == e.id)
                 logRect("HIER-EYE row0", mn, ImVec2(mn.x + colW, mn.y + rowH));
@@ -645,7 +655,7 @@ void SceneHierarchy::drawNodeContextMenu(ecs::Entity e) {
     // 所以标记由用户显式决定，而不是靠"没有组件"去猜。
     const auto* nodeH = m_ctx.editorScene().world().get<ecs::HierarchyComponent>(e);
     const bool isGroup = nodeH && nodeH->group;
-    if (ImGui::MenuItem(isGroup ? "Unmark as Folder" : "Mark as Folder")) {
+    if (ImGui::MenuItem(isGroup ? TRL("Unmark as Folder") : TRL("Mark as Folder"))) {
         m_groupTarget = e;
         m_groupValue = !isGroup;
         m_hasGroupToggle = true;
@@ -653,14 +663,14 @@ void SceneHierarchy::drawNodeContextMenu(ecs::Entity e) {
 
     // ---- E12：状态快捷开关（与行内 👁/🔒 图标同一 pending 通道）----
     if (const auto* vc = m_ctx.editorScene().world().get<ecs::VisibilityComponent>(e)) {
-        if (ImGui::MenuItem(TR(vc->visible ? "Hide" : "Show"))) {
+        if (ImGui::MenuItem(TR(vc->visible ? TRL("Hide") : TRL("Show")))) {
             m_pendingVisToggles.push_back({e, !vc->visible});
         }
     }
     const bool nowLocked =
         m_ctx.editorScene().world().has<ecs::LockedComponent>(e);
     if (ImGui::MenuItem(
-            TR(nowLocked ? "Unlock (pickable)" : "Lock (not pickable)"))) {
+            TR(nowLocked ? TRL("Unlock (pickable)") : TRL("Lock (not pickable)")))) {
         m_pendingLockToggles.push_back({e, !nowLocked});
     }
 
@@ -674,6 +684,37 @@ void SceneHierarchy::drawNodeContextMenu(ecs::Entity e) {
         m_unparentTarget = e;
         m_hasUnparent = true;
     }
+
+    // ---- 打开这个对象对应的功能面板 ----
+    //
+    // 2026-10-18（用户原话："左侧的层级面板中对应的粒子那一项在鼠标右键时
+    // 其对应的右键菜单中应该要有打开粒子面板这一选项"）。
+    //
+    // 为什么值得单开一项：粒子面板是个**浮动面板**，只能从底栏的 + 托盘里
+    // 勾出来；而"我在树里看见一个粒子发射器、想调它的参数"是最自然的一次
+    // 操作 —— 中间隔着一层"去找底栏的 +"就断了。这里顺手把选中也带过去：
+    // 命令的语义是"打开并**编辑这一个**"，不是"打开一个空面板"。
+    if (m_ctx.editorScene().world().has<ecs::ParticleEmitterComponent>(e)) {
+        if (ImGui::MenuItem(TR("Open Particles Panel"))) {
+            m_ctx.select(e);
+            const int idx = panelIndexOf("particles");
+            if (idx >= 0) setPanelOpen(idx, true);
+            VK_LOG_INFO("HIER-OPEN-PANEL particles entity=%u", e.id);
+        }
+        logRect("HIER-CTX-Particles", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+    }
+    if (m_ctx.editorScene().world().has<ecs::RigidBodyComponent>(e)) {
+        if (ImGui::MenuItem(TR("Open Physics Panel"))) {
+            m_ctx.select(e);
+            const int idx = panelIndexOf("physics");
+            if (idx >= 0) setPanelOpen(idx, true);
+            VK_LOG_INFO("HIER-OPEN-PANEL physics entity=%u", e.id);
+        }
+        logRect("HIER-CTX-Physics", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+    }
+
     ImGui::EndPopup();
 }
 
@@ -749,7 +790,7 @@ void SceneHierarchy::draw() {
                                    st.FramePadding.y));
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint(
-            "##filter", "search... (type:mesh / type:light)",
+            "##filter", TRL("search... (type:mesh / type:light)"),
             m_filter, sizeof(m_filter));
         ImGui::PopStyleVar();
         const ImVec2 mn = ImGui::GetItemRectMin();

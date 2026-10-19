@@ -363,7 +363,7 @@ void GpuTimelinePanel::draw(bool* open, ConsolePanel* console) {
         ImGui::TableSetupColumn("ms", ImGuiTableColumnFlags_WidthFixed, 70.0f);
         ImGui::TableSetupColumn("share", ImGuiTableColumnFlags_WidthFixed,
                                 70.0f);
-        ImGui::TableSetupColumn("avg (history)",
+        ImGui::TableSetupColumn(TRL("avg (history)"),
                                 ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
 

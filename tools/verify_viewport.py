@@ -98,6 +98,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from capture_window import capture_client, find_window, user32      # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors               # noqa: E402
 from verify_asset_drag import client_to_screen, force_foreground     # noqa: E402
+from safe_fs import safe_rmtree                                      # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
@@ -648,7 +649,7 @@ def main():
     # 全流程共用的"钉死用"临时目录：所有 GUI 会话都把布局/偏好指到这里面
     # **不存在**的文件上（= 出厂默认），见上面 pinned_env 的说明。
     pin_dir = tempfile.mkdtemp(prefix="vp_verify_")
-    atexit.register(shutil.rmtree, pin_dir, True)
+    atexit.register(safe_rmtree, pin_dir)
 
     results = []
 

@@ -2,6 +2,7 @@
 
 #include "DebugRects.h"
 #include "EditorContext.h"
+#include "Localization.h"
 
 #include "core/Logger.h"
 #include "ecs/Components.h"
@@ -636,15 +637,14 @@ void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
 
             char buf[128];
             if (axisIdx >= 0) {
-                std::snprintf(buf, sizeof(buf), "Move %s: %+.3f m%s",
-                              handleName(), static_cast<double>(readoutA),
-                              snap ? "  [snap]" : "");
+                std::snprintf(buf, sizeof(buf), TR("Move %s: %+.3f m%s"), TR(handleName()), static_cast<double>(readoutA),
+                              snap ? TR("  [snap]") : "");
             } else {
                 std::snprintf(buf, sizeof(buf),
-                              "Move %s: %+.3f / %+.3f m%s", handleName(),
+                              TR("Move %s: %+.3f / %+.3f m%s"), TR(handleName()),
                               static_cast<double>(readoutA),
                               static_cast<double>(readoutB),
-                              snap ? "  [snap]" : "");
+                              snap ? TR("  [snap]") : "");
             }
             m_readout = buf;
             break;
@@ -731,18 +731,18 @@ void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
             // 的含义了，倍率才是用户手上真正做出来的动作。
             char buf[128];
             if (axisIdx >= 0) {
-                std::snprintf(buf, sizeof(buf), "Scale %s: x%.3f%s", handleName(),
+                std::snprintf(buf, sizeof(buf), TR("Scale %s: x%.3f%s"), TR(handleName()),
                               static_cast<double>(factor),
-                              snap ? "  [snap]" : "");
+                              snap ? TR("  [snap]") : "");
             } else if (planeN >= 0) {
                 std::snprintf(buf, sizeof(buf),
-                              "Scale %s (2 axes): x%.3f%s", handleName(),
+                              TR("Scale %s (2 axes): x%.3f%s"), TR(handleName()),
                               static_cast<double>(factor),
-                              snap ? "  [snap]" : "");
+                              snap ? TR("  [snap]") : "");
             } else {
-                std::snprintf(buf, sizeof(buf), "Scale all: x%.3f%s",
+                std::snprintf(buf, sizeof(buf), TR("Scale all: x%.3f%s"),
                               static_cast<double>(factor),
-                              snap ? "  [snap]" : "");
+                              snap ? TR("  [snap]") : "");
             }
             m_readout = buf;
             break;
@@ -803,9 +803,9 @@ void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
             m_changed = true;
 
             char buf[128];
-            std::snprintf(buf, sizeof(buf), "Rotate %s: %+.1f deg%s",
-                          handleName(), static_cast<double>(glm::degrees(angle)),
-                          snap ? "  [snap]" : "");
+            std::snprintf(buf, sizeof(buf), TR("Rotate %s: %+.1f deg%s"),
+                          TR(handleName()), static_cast<double>(glm::degrees(angle)),
+                          snap ? TR("  [snap]") : "");
             m_readout = buf;
             break;
         }

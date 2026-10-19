@@ -17,6 +17,7 @@
 #include "scene/PostVolume.h"
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace scene {
@@ -37,6 +38,42 @@ public:
 
     // 世界矩阵 = 沿父链累乘各层 localMatrix
     glm::mat4 worldMatrix(ecs::Entity e) const;
+
+    // 沿父链向上找第一个带组件 T 的祖先（**含自己**）。找不到 → nullptr。
+    //
+    // 用来回答"这个网格属于哪具骨架"：`SkinnedMeshComponent` 挂在**模型根**
+    // 上，而每个 SubMesh 是它的子级；渲染层要拿到逐实体的 jointBase 就必须
+    // 从网格实体往上走一层。
+    //
+    // 为什么必须逐实体查、不能按 `Mesh*` 建映射：`AssetManager` 对同一个
+    // 文件返回同一个 `Model*`，它下面的 `Mesh*` 也就完全相同 —— 按 mesh
+    // 建映射时，同一 FBX 的第二个实例会覆盖第一个，三个敌人共享一份关节
+    // 矩阵（全部显示同一个姿势）。2026-10-18 角色链 A0-4 修的就是这个。
+    //
+    // 深度用 guard 夹住：环形父子关系（不该出现，但序列化能造出来）
+    // 不该让渲染线程死循环。
+    template <typename T>
+    T* findInAncestors(ecs::Entity e) {
+        int guard = 0;
+        while (e.valid() && guard++ < 128) {
+            if (T* c = m_world.get<T>(e)) return c;
+            const auto* h = m_world.get<ecs::HierarchyComponent>(e);
+            if (!h || h->parent == ecs::kInvalidEntity) return nullptr;
+            e = m_world.handle(h->parent);
+        }
+        return nullptr;
+    }
+    template <typename T>
+    const T* findInAncestors(ecs::Entity e) const {
+        int guard = 0;
+        while (e.valid() && guard++ < 128) {
+            if (const T* c = m_world.get<T>(e)) return c;
+            const auto* h = m_world.get<ecs::HierarchyComponent>(e);
+            if (!h || h->parent == ecs::kInvalidEntity) return nullptr;
+            e = m_world.handle(h->parent);
+        }
+        return nullptr;
+    }
 
     void update(float dt);
 
@@ -87,6 +124,25 @@ public:
             });
     }
 
+    // 所有**启用**的地形（W4，见 ecs::TerrainComponent）。
+    // 与贴花/探针/粒子同一条约定：地形也没有网格组件 —— 几何由高度图
+    // 在渲染层生成，场景侧只提供"哪份资产 + 什么变换"。
+    template <typename Fn>
+    void forEachTerrain(Fn&& fn) {
+        m_world.each<ecs::TerrainComponent>([&](ecs::Entity e,
+                                               ecs::TerrainComponent& tc) {
+            // ⚠ 两处都要认：`tc.visible` 是地形自己的开关（Inspector 里那一行），
+            //   `VisibilityComponent` 是**实体级**的（Hierarchy 的眼睛图标）。
+            //   地形是整片地面 —— 用户闭眼睛的时候期待它消失，只认前者会
+            //   出现"眼睛关掉了，山还在"。（贴花/探针历史上只认前者，但那两类
+            //   都是小物件，看不出问题；地形不一样，所以这里多认一次。）
+            const auto* vis = m_world.get<ecs::VisibilityComponent>(e);
+            if (vis && !vis->visible) return;
+            if (!tc.visible || tc.source.empty()) return;
+            fn(e, tc);
+        });
+    }
+
     // 所有**启用**的粒子发射器（R6-1，见 ecs::ParticleEmitterComponent）。
     // 与贴花 / 探针同一条约定：粒子也没有网格 —— 几何是顶点着色器现拼的
     // billboard，场景侧只提供世界矩阵（位置 + 朝向）与发射参数。
@@ -119,6 +175,21 @@ public:
         size_t depth = 0;     // 树高
     };
     SpatialStats spatialStats() const;
+
+    // ---- 脚本世界黑板（S2）----
+    //
+    // `worldAttr(key)` / `setWorldAttr(key, v)` 读写这里。与
+    // `ecs::ScriptVarsComponent` 的分工（刻意分开、别混）：
+    //   · ScriptVarsComponent = 逐实体的**本局**状态（血量/朝向），不存盘；
+    //   · 这里                = 整关的**世界**状态（门开过没有、拿到了几把钥匙），
+    //                           **进存档**。
+    //
+    // 为什么放在 Scene 而不是某个单例：存档的粒度就是 Scene，放在别处就得
+    // 单独设计一套"关卡级状态"的存盘/恢复流程。
+    std::unordered_map<std::string, double>& scriptVars() { return m_scriptVars; }
+    const std::unordered_map<std::string, double>& scriptVars() const {
+        return m_scriptVars;
+    }
 
     // ---- 相机（多相机）----
     // 相机是"观察者"而不是场景内容，所以不由 ECS 持有，而是 Scene 直接
@@ -213,6 +284,8 @@ private:
     PostVolumeSet m_postVolumes;
     PhysicsSettings m_physics;
     ecs::Entity m_lightEntity;
+    // 脚本世界黑板（S2）：进存档
+    std::unordered_map<std::string, double> m_scriptVars;
 
     // ---- 空间索引 ----
     Bvh m_bvh;

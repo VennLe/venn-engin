@@ -1,0 +1,24 @@
+# hud_counter.vks —— 记分板 + 计时挑战（挂在 Director 实体上）。
+#
+# 为什么「打在日志里」而不是画在屏幕上：这一份同时是**自动化判据**。
+#   `HUD-COUNT 5` 一行就是 G4 的终值断言（`worldAttr("picked") == 5`），
+#   `TIME-UP 5` 是"计时挑战真的到点了"的证据。真的 HUD 血量/血条
+#   由 `damage()` 的宿主回调走 `HUD-STATS`（那是另一条链，见 G2）。
+#
+# ⚠ `last` 初值取 -1 而不是 0：黑板一开始就是 0，用 0 当"没变过"的哨兵
+#   会把第一次读数吃掉 —— 那样"读回来是 5"的用例就只能靠后续变化来猜。
+
+let last = -1
+let done = 0
+
+on update {
+    p = worldAttr("picked", 0)
+    if (p != last) {
+        last = p
+        print("HUD-COUNT", p)
+    }
+    if (done == 0 && time > 15.0) {
+        done = 1
+        print("TIME-UP", p)
+    }
+}

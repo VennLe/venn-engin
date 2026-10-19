@@ -320,6 +320,53 @@ CharacterStepResult stepCharacter(const PhysicsWorld& world,
         const float maxD = halfTotal / std::max(cosSlope, 0.2f) + snap;
         glm::vec3 origin = pos;
         float travelled = 0.0f;
+
+        // ---- 一个地面候选能不能站、要不要吸附 ----
+        // 抽成 lambda 是因为现在有**两个**来源（高度场 / 物理体射线），
+        // 判定必须逐字相同 —— 两份拷贝一旦漂移，就会出现"地形的坡站得住、
+        // 木箱的坡站不住"这种没法解释的差异。
+        auto tryGround = [&](float dist, float nz) -> bool {
+            // 斜面上下垂距离天然比平面长 (hh+r)/nz；用这个基准算"多余量"
+            const float need = halfTotal / std::max(nz, 0.2f);
+            const float excess = dist - need;
+            if (excess < -0.02f || excess > snap) return false;
+            onGround = true;
+            groundNz = nz;
+            if (excess > 0.0f && desc.groundSnap) {
+                // ⚠ 吸附是"就近贴地"的启发式，**不能凌驾于"不许穿模"之上**。
+                //   胶囊搭在台阶棱上时，中心**正下方**是下面那层地面，一按
+                //   就按进台阶的立面里 —— 于是"刚踩上台阶"被下一帧的吸附
+                //   抵消，角色永远卡在台阶前 0.006 m 处（踩过两次）。
+                //   中心射线本来就看不见"支撑在胶囊侧面（棱）"这种情形，
+                //   这里用"按下去之后真的不穿"来兜住它。
+                //   小量吸附直接放行：普通下坡每帧只差 0.01~0.06 m，为它
+                //   多跑一遍全场景 collide 不值当。
+                if (excess <= 0.02f ||
+                    capsuleFree(world, desc.radius, desc.halfHeight,
+                                pos - glm::vec3(0.0f, 0.0f, excess),
+                                ignore, 5.0e-3f)) {
+                    pos.z -= excess;
+                }
+            }
+            return true;
+        };
+
+        // ---- ① 先问高度场（W4-3）----
+        // 只取"可站"的交点（n.z ≥ cosSlope）：陡坡不算地面，于是重力继续
+        // 作用、沿坡滑下去 —— 与物理体的坡度判定是同一个阈值。
+        float hfDist = -1.0f;
+        float hfNz = 1.0f;
+        if (desc.ground && desc.ground->valid()) {
+            HeightHit hh;
+            if (raycast(*desc.ground, origin, glm::vec3(0.0f, 0.0f, -1.0f),
+                        maxD, hh) &&
+                hh.normal.z >= cosSlope) {
+                hfDist = hh.t;
+                hfNz = hh.normal.z;
+            }
+        }
+
+        // ---- ② 再问物理世界 ----
         for (int i = 0; i < 4; ++i) {
             const RayHit h = world.raycast(origin, glm::vec3(0.0f, 0.0f, -1.0f),
                                            maxD - travelled, ignore);
@@ -335,33 +382,17 @@ CharacterStepResult stepCharacter(const PhysicsWorld& world,
             // 只有"可站"的接触才算地面：55° 的坡法线 n.z≈0.57 < cos46°≈0.69，
             // 于是它不算地面 → 重力继续作用 → 沿坡滑下去。
             if (nz >= cosSlope) {
-                // 斜面上下垂距离天然比平面长 (hh+r)/nz；用这个基准算"多余量"
-                const float need = halfTotal / std::max(nz, 0.2f);
                 const float dist = travelled + h.distance;
-                const float excess = dist - need;
-                if (excess >= -0.02f && excess <= snap) {
-                    onGround = true;
-                    groundNz = nz;
-                    if (excess > 0.0f && desc.groundSnap) {
-                        // ⚠ 吸附是"就近贴地"的启发式，**不能凌驾于"不许穿模"之上**。
-                        //   胶囊搭在台阶棱上时，中心**正下方**是下面那层地面，一按
-                        //   就按进台阶的立面里 —— 于是"刚踩上台阶"被下一帧的吸附
-                        //   抵消，角色永远卡在台阶前 0.006 m 处（踩过两次）。
-                        //   中心射线本来就看不见"支撑在胶囊侧面（棱）"这种情形，
-                        //   这里用"按下去之后真的不穿"来兜住它。
-                        //   小量吸附直接放行：普通下坡每帧只差 0.01~0.06 m，为它
-                        //   多跑一遍全场景 collide 不值当。
-                        if (excess <= 0.02f ||
-                            capsuleFree(world, desc.radius, desc.halfHeight,
-                                        pos - glm::vec3(0.0f, 0.0f, excess),
-                                        ignore, 5.0e-3f)) {
-                            pos.z -= excess;
-                        }
-                    }
-                }
+                // 地形比这个体更近 → 真正支撑角色的是地形（站在山脚下的
+                // 木箱上时，箱面才是支撑面；反过来站在山坡上、脚下 10 m 处
+                // 有个箱子，箱子不该把角色拽下去）。
+                if (hfDist >= 0.0f && hfDist < dist) break;
+                tryGround(dist, nz);
             }
             break;
         }
+        // ---- ③ 物理侧没有可站的面（或地形更近）→ 用高度场 ----
+        if (!onGround && hfDist >= 0.0f) tryGround(hfDist, hfNz);
     }
 
     state.position = pos;

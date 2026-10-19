@@ -1,0 +1,24 @@
+# door_timer.vks —— 定时门：玩家靠近 3 m 就开，**正好 2 秒**后关（S4 的协程）。
+#
+# 这一份是「`wait` 在 `on update` 的 `if` 里合法」的活票据：
+#   挂起时整个 update 钩子停在 `wait(2.0)` 那一行，帧照跑、别的脚本照跑，
+#   2 秒后从**同一行**接着往下执行（`busy = 0` 也在它后面）。
+#   如果执行器退化成"每帧重入"，这里会每帧重开一次门 —— G3 的
+#   `DOOR-CLOSED t=` 就永远等不到。
+#
+# `time` 是实例本地时间（kSelfTimed 自己累加），所以
+#   `DOOR-CLOSED t - DOOR-OPEN t` ≈ 2.0 可以**按时刻**断言而不是按帧。
+
+let busy = 0
+
+on update {
+    if (busy == 0 && dist(pos(self()), pos(player())) < 3.0) {
+        busy = 1
+        setRot(self(), vec3(0.0, 0.0, -90.0))
+        print("DOOR-OPEN", name(self()), time)
+        wait(2.0)
+        setRot(self(), vec3(0.0, 0.0, 0.0))
+        print("DOOR-CLOSED", name(self()), time)
+        busy = 0
+    }
+}

@@ -335,79 +335,68 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
     }
 
     // ------------------------------------------------------------
-    // 遮挡矩形裁切（浮层式 Content 抽屉，2026-10-17）
+    // 遮挡矩形裁切（浮层 / 弹层 / 浮动面板，2026-10-18 泛化）
     // ------------------------------------------------------------
-    // 这条线画在 ForegroundDrawList 上（压在所有面板之上），而抽屉是浮层、
-    // 不在分栏树里 —— 不裁的话，Hierarchy | Viewport 那条竖线会**穿过
-    // 抽屉内部**，看起来像"分割线渗透进了 Content 面板"。
-    // 裁切只对轴对齐线段做（分隔条本来就是横/竖），结果是 0~2 段：
-    //   · 整条落在遮挡矩形里 → 这一帧既不画也不接受命中
-    //   · 部分相交 → 只画露出来的那几段（抽屉贴底，通常就是上面那一段）
-    ImVec2 pieces[2][2];
-    int nPieces = 0;
-    {
-        const float x0 = std::min(segA.x, segB.x), x1 = std::max(segA.x, segB.x);
-        const float y0 = std::min(segA.y, segB.y), y1 = std::max(segA.y, segB.y);
-        if (!m_occlOn) {
-            pieces[0][0] = ImVec2(x0, y0);
-            pieces[0][1] = ImVec2(x1, y1);
-            nPieces = 1;
-        } else if (n.dir == SplitNode::Dir::Vertical) {
-            // 横线（上下分栏的界）：遮挡矩形在这一行上挖掉 x 区间
-            if (segA.y >= m_occlY0 && segA.y <= m_occlY1) {
-                const float gx0 = std::max(x0, m_occlX0);
-                const float gx1 = std::min(x1, m_occlX1);
-                if (gx0 < gx1) {
-                    if (gx0 - x0 > 0.5f) {
-                        pieces[nPieces][0] = ImVec2(x0, y0);
-                        pieces[nPieces][1] = ImVec2(gx0, y1);
-                        ++nPieces;
-                    }
-                    if (x1 - gx1 > 0.5f) {
-                        pieces[nPieces][0] = ImVec2(gx1, y0);
-                        pieces[nPieces][1] = ImVec2(x1, y1);
-                        ++nPieces;
-                    }
-                } else {
-                    pieces[0][0] = ImVec2(x0, y0);
-                    pieces[0][1] = ImVec2(x1, y1);
-                    nPieces = 1;
-                }
-            } else {
-                pieces[0][0] = ImVec2(x0, y0);
-                pieces[0][1] = ImVec2(x1, y1);
-                nPieces = 1;
-            }
+    // 这条线画在 ForegroundDrawList 上（压在所有面板之上），而浮在分栏之上
+    // 的东西（Content 抽屉、`+` 勾选菜单、右键菜单、下拉、角色窗口、浮动
+    // 面板、tooltip）都**不在分栏树里** —— 不裁的话那条线会直接穿过它们。
+    //
+    // 2026-10-17 只处理了抽屉一个矩形；用户随后报"`+` 菜单列表中间也穿插
+    // 着分割线，其他所有面板窗口/子菜单都一样"，所以这里改成**通用算法**：
+    // 把线段沿它的轴向参数化，减去所有遮挡矩形在该轴上的投影区间，
+    // 剩下的就是可见段（0..N 段）。
+    //
+    //   横线（上下分栏）：固定 y，遮挡矩形只要**跨过这一行**就挖掉它的 x 区间
+    //   竖线（左右分栏）：固定 x，遮挡矩形只要**跨过这一列**就挖掉它的 y 区间
+    const bool lineHoriz = (n.dir == SplitNode::Dir::Vertical);
+    float t0 = lineHoriz ? std::min(segA.x, segB.x) : std::min(segA.y, segB.y);
+    float t1 = lineHoriz ? std::max(segA.x, segB.x) : std::max(segA.y, segB.y);
+    const float lineC = lineHoriz ? segA.y : segA.x;   // 固定坐标
+
+    // 收集要挖掉的区间
+    std::vector<std::pair<float, float>> cut;
+    cut.reserve(m_occluders.size());
+    for (const OcclRect& o : m_occluders) {
+        const float lo = lineHoriz ? o.x0 : o.y0;
+        const float hi = lineHoriz ? o.x1 : o.y1;
+        const float c0 = lineHoriz ? o.y0 : o.x0;
+        const float c1 = lineHoriz ? o.y1 : o.x1;
+        if (lineC < c0 || lineC > c1) continue;        // 没跨过这条线
+        const float a = std::max(lo, t0), b = std::min(hi, t1);
+        if (b > a) cut.emplace_back(a, b);
+    }
+    // 排序 + 合并（多块遮挡可能重叠：抽屉和菜单会叠在一起）
+    std::sort(cut.begin(), cut.end());
+    std::vector<std::pair<float, float>> merged;
+    for (const auto& iv : cut) {
+        if (!merged.empty() && iv.first <= merged.back().second + 0.01f) {
+            merged.back().second = std::max(merged.back().second, iv.second);
         } else {
-            // 竖线（左右分栏的界）：遮挡矩形在这一列上挖掉 y 区间
-            if (segA.x >= m_occlX0 && segA.x <= m_occlX1) {
-                const float gy0 = std::max(y0, m_occlY0);
-                const float gy1 = std::min(y1, m_occlY1);
-                if (gy0 < gy1) {
-                    if (gy0 - y0 > 0.5f) {
-                        pieces[nPieces][0] = ImVec2(x0, y0);
-                        pieces[nPieces][1] = ImVec2(x1, gy0);
-                        ++nPieces;
-                    }
-                    if (y1 - gy1 > 0.5f) {
-                        pieces[nPieces][0] = ImVec2(x0, gy1);
-                        pieces[nPieces][1] = ImVec2(x1, y1);
-                        ++nPieces;
-                    }
-                } else {
-                    pieces[0][0] = ImVec2(x0, y0);
-                    pieces[0][1] = ImVec2(x1, y1);
-                    nPieces = 1;
-                }
-            } else {
-                pieces[0][0] = ImVec2(x0, y0);
-                pieces[0][1] = ImVec2(x1, y1);
-                nPieces = 1;
-            }
+            merged.push_back(iv);
         }
     }
-    if (nPieces == 0) {
-        // 整条都被抽屉盖住：不画、不记锚点、不参与命中。
+    // 相减 → 可见段
+    std::vector<std::pair<float, float>> spans;
+    float cur = t0;
+    for (const auto& iv : merged) {
+        if (iv.first - cur > 0.5f) spans.emplace_back(cur, iv.first);
+        cur = std::max(cur, iv.second);
+    }
+    if (t1 - cur > 0.5f) spans.emplace_back(cur, t1);
+
+    auto spanToSeg = [&](const std::pair<float, float>& s, ImVec2& outA,
+                         ImVec2& outB) {
+        if (lineHoriz) {
+            outA = ImVec2(s.first, segA.y);
+            outB = ImVec2(s.second, segB.y);
+        } else {
+            outA = ImVec2(segA.x, s.first);
+            outB = ImVec2(segB.x, s.second);
+        }
+    };
+
+    if (spans.empty()) {
+        // 整条都被盖住：不画、不记锚点、不参与命中。
         // ⚠ 若这一条正好在被拖着，得顺手结束拖拽 —— 否则 m_dragNode 卡在
         //   这里，鼠标松开也清不掉，之后再一点就会"线跟着鼠标跑"。
         if (m_dragNode == nodeIdx) {
@@ -416,10 +405,18 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
         }
         return;
     }
-    // ⚠ 锚点记**第一段**（露出来的那段）：拖拽脚本点的是锚点矩形的中心，
-    //   被裁之后中心仍然落在"这条线真实可见的位置"上，不用改脚本。
-    segA = pieces[0][0];
-    segB = pieces[0][1];
+    // ⚠ 锚点 / 抓手 / tooltip 都记在**最长的那一段**上：拖拽脚本点的是锚点
+    //   矩形的中心，被裁之后中心仍然落在"这条线真实可见的位置"上，不用改
+    //   脚本。（原来是 pieces[0]，泛化后第一段可能是被菜单切出来的一小截，
+    //   拿它当中心会点到菜单底下。）
+    size_t mainIdx = 0;
+    for (size_t i = 1; i < spans.size(); ++i) {
+        if (spans[i].second - spans[i].first >
+            spans[mainIdx].second - spans[mainIdx].first) {
+            mainIdx = i;
+        }
+    }
+    spanToSeg(spans[mainIdx], segA, segB);
 
     // ---- 命中 / 拖拽：手动判断鼠标是否落在**可见段**的热区内 ----
     const ImVec2 mouse = ImGui::GetIO().MousePos;
@@ -431,13 +428,11 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
     //   原来用 inRange = 整条跨度，抽屉盖上来的那截照样能拖分栏
     //   （线和抽屉的把手只差几像素时最容易误触）。
     bool inRange = false;
-    for (int i = 0; i < nPieces; ++i) {
-        const ImVec2 a = pieces[i][0];
-        const ImVec2 b = pieces[i][1];
+    for (const auto& s : spans) {
         if (horizontal) {
-            if (mouse.y >= a.y && mouse.y <= b.y) { inRange = true; break; }
+            if (mouse.y >= s.first && mouse.y <= s.second) { inRange = true; break; }
         } else {
-            if (mouse.x >= a.x && mouse.x <= b.x) { inRange = true; break; }
+            if (mouse.x >= s.first && mouse.x <= s.second) { inRange = true; break; }
         }
     }
     const bool hovered = (dist <= kSplitterHit * 0.5f) && inRange &&
@@ -454,12 +449,14 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
     const bool dragging = (m_dragNode == nodeIdx);
 
     // ---- 绘制：画在最顶层，确保不被面板盖住（E06-1 三态配色）----
-    // 逐段画：被抽屉裁开后可能是两段（抽屉横跨整宽时一般只剩上面那段）。
+    // 逐段画：被遮挡矩形裁开后可能不止两段（抽屉 + 菜单 + 浮动面板叠在一起）。
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     const ImU32 col = dragging ? kSplitDrag : (hovered ? kSplitHover : kSplitIdle);
     const float thick = (dragging || hovered) ? 2.0f : 1.0f;
-    for (int i = 0; i < nPieces; ++i) {
-        dl->AddLine(pieces[i][0], pieces[i][1], col, thick);
+    ImVec2 pa, pb;
+    for (const auto& s : spans) {
+        spanToSeg(s, pa, pb);
+        dl->AddLine(pa, pb, col, thick);
     }
 
     // 悬停时在两端各补一小段"抓手"，让"这里能拖"一眼可见
@@ -540,7 +537,7 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
             n.collapsed = true;
             n.ratio = nearA ? 0.0f : 1.0f;
         }
-        ImGui::SetTooltip(n.collapsed ? "collapsed (double-click to expand)"
+        ImGui::SetTooltip(n.collapsed ? TRL("collapsed (double-click to expand)")
                                       : "expanded");
     }
 
@@ -558,12 +555,12 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
         ImGui::OpenPopup(popupId);
     }
     if (ImGui::BeginPopup(popupId)) {
-        ImGui::SeparatorText(horizontal ? "Horizontal split" : "Vertical split");
+        ImGui::SeparatorText(horizontal ? TRL("Horizontal split") : TRL("Vertical split"));
         if (ImGui::MenuItem(TR("50 / 50"))) applyPreset(nodeIdx, 0.5f);
         if (ImGui::MenuItem(TR("70 / 30"))) applyPreset(nodeIdx, 0.7f);
         if (ImGui::MenuItem(TR("30 / 70"))) applyPreset(nodeIdx, 0.3f);
         ImGui::Separator();
-        if (ImGui::MenuItem(n.collapsed ? "Expand" : "Collapse")) {
+        if (ImGui::MenuItem(n.collapsed ? TRL("Expand") : TRL("Collapse"))) {
             if (n.collapsed) {
                 n.collapsed = false;
                 n.ratio = (n.savedRatio > 0.0f) ? n.savedRatio : 0.3f;
