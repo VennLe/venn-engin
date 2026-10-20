@@ -181,13 +181,17 @@ def main():
                   "实际: %s" % [p.split("/")[-1] for p in tus][:3])
 
         # ---- B4 ----
+        # ⚠ 库文件名随工具链变：MSVC → `VennEngine.lib`，MinGW → `libVennEngine.a`。
+        #   只认 MSVC 的名字会让 MinGW 构建永远红（本机就是 MinGW）。
+        ENGINE_LIB_NAMES = ("VennEngine.lib", "libVennEngine.a")
         for label, hits in (("Editor.exe", editor), ("Game.exe", runtime)):
             if not hits:
                 continue
             _, ins = hits[0]
-            check("B4 %s 链接 VennEngine.lib" % label,
-                  "VennEngine.lib" in ins,
-                  "输入里没有引擎库" if "VennEngine.lib" not in ins else "")
+            linked = [n for n in ENGINE_LIB_NAMES if n in ins]
+            check("B4 %s 链接引擎库" % label, bool(linked),
+                  "输入里没有引擎库（找过 %s）" % (ENGINE_LIB_NAMES,)
+                  if not linked else "")
 
         # ---- B5 ----
         if runtime:

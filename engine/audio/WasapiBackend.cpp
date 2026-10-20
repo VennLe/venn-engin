@@ -12,6 +12,21 @@
 // PKEY_Device_FriendlyName 在这个头里（mmdeviceapi.h 只给接口，不给属性键）
 #include <functiondiscoverykeys_devpkey.h>
 
+// ⚠ MinGW 坑：`<functiondiscoverykeys_devpkey.h>` 只在定义了 `INITGUID` 时
+// 用 `DEFINE_PROPERTYKEY` 生成**定义**，否则它只展开成一句
+// `extern "C" const PROPERTYKEY PKEY_Device_FriendlyName;`（见 propkeydef.h）。
+// MSVC 下这些数据符号来自 SDK 的 propsys.lib；MinGW 的 libpropsys.a
+// **不导出**它们 → 链接期报 `undefined reference to PKEY_Device_FriendlyName`
+// （编译期完全看不出来）。这里本地补一份定义。
+// `DECLSPEC_SELECTANY`(= __declspec(selectany)) 保证即使别处也定义了
+// 也不会重复符号。值必须与 SDK 一致：{a45c254e-df1c-4efd-8020-67d146a850e0}, 14。
+#if defined(__MINGW32__)
+EXTERN_C const PROPERTYKEY DECLSPEC_SELECTANY PKEY_Device_FriendlyName = {
+    {0xa45c254e, 0xdf1c, 0x4efd,
+     {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}},
+    14};
+#endif
+
 #include <algorithm>
 #include <cstring>
 

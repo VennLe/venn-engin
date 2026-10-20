@@ -180,8 +180,12 @@ target_link_libraries(VennEngine PUBLIC
 # G14-3：WASAPI 后端要 COM（ole32）+ 多媒体线程提升（avrt）+ 内核流（ksuser）
 # 与 waveOut 兜底的 winmm。全部只在 Windows 上存在；engine/audio/WasapiBackend.cpp
 # 整个文件被 `#if defined(_WIN32)` 包住，非 Windows 上是一个空 TU。
+# ⚠ propsys：`PKEY_Device_FriendlyName` 在 MSVC 下由 propsys.lib 提供；
+#   漏了它链接期才报 `undefined reference`（编译期完全看不出来）。
+#   MinGW 的 libpropsys.a **不导出**这些数据符号 → 那边由
+#   WasapiBackend.cpp 里的本地定义兜底（见该文件）。
 if(WIN32)
-    target_link_libraries(VennEngine PUBLIC ole32 avrt ksuser winmm)
+    target_link_libraries(VennEngine PUBLIC ole32 avrt ksuser winmm propsys)
 endif()
 if(NOT MSVC)
     target_compile_options(VennEngine PRIVATE -Wall -Wextra -Wno-unused-parameter)
