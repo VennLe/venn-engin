@@ -7,11 +7,15 @@
     `EDITOR-READY` 行里的实体数 = 模板实体数。」
 
 这个脚本把 M1（窗口）+ M2（创建）+ M3（拉起）串成**一条用户路径**：
-  新建向导 → 建出工程 → 点「打开编辑器」→ 启动器退出 → 编辑器接管。
+  新建向导 → 建出工程 → 点「打开编辑器」→ 启动器收进任务栏 → 编辑器接管。
 
 覆盖（O1~O10）：
   O1  点「打开编辑器」后日志出现 `LAUNCHER-SPAWN ok pid=`
-  O2  启动器**自己退出**（不是被 kill）—— 一个工程一个进程（§5.4）
+  O2  拉起之后启动器**收进任务栏**（`LAUNCHER-MINIMIZED` + IsIconic）——
+      2026-10-19 用户改的契约：启动器常驻，编辑器关掉之后还要在
+  O2b 启动器进程还活着（以前这里断言的是"它自己退出了"，已反转）
+  O2c 编辑器退出之后启动器仍在且仍是最小化
+  O2d 从任务栏点回来 → `LAUNCHER-RESTORED`
   O3  `Venn Editor` 窗口出现
   O4  窗口标题 == `Venn Editor - <工程名>`（标题栏真的挂上了工程名）
   O5  日志出现 `EDITOR-PROJECT name=<工程名>`
@@ -73,6 +77,16 @@ def main():
 
     editor_hwnd = 0
     try:
+        # ---- O0 窗口尺寸 = 1080×720（用户 2026-10-20 定的 16:9 版式）----
+        #
+        # ⚠ 量的是**客户区**（`GetClientRect`），不是外框：外框含标题栏和
+        #   边框，会随 DPI 缩放变化，拿它做断言在 125%/150% 缩放下必红。
+        cw, ch = kit.client_size(hwnd)
+        if (cw, ch) != (1080, 720):
+            fails.append("O0 启动器客户区 %dx%d，期望 1080x720" % (cw, ch))
+        else:
+            kit.log("CHECK O0 launcher client size 1080x720 OK")
+
         # ---- 走完向导（与 M2 同一条路径，这里不重复断言，只推进）----
         if not kit.click_anchor(hwnd, tap, "LAUNCH-TYPE-1"):
             fails.append("向导 Step1 点不到第三人称卡片")
@@ -104,16 +118,23 @@ def main():
                     kit.log("CHECK O1 %s" % l.split("] ", 1)[-1])
                     break
 
-        # ---- O2 启动器自己退出 ----
-        # ⚠ 这里**不能**用 `kit.shutdown`（那会发 WM_CLOSE）：
-        #   拉起成功后 `window().invalidate()` 会让主循环自己结束。
-        #   发 WM_CLOSE 就分不清"它自己退的"和"被我们关掉的"了。
-        try:
-            proc.wait(timeout=40)
-            kit.log("CHECK O2 launcher exited by itself rc=%s OK" % proc.returncode)
-        except Exception:  # noqa: BLE001
-            fails.append("O2 拉起之后启动器没有自己退出（还占着窗口）")
-            proc.kill()
+        # ---- O2 拉起之后启动器**收进任务栏**，不退出 ----
+        # 契约在 2026-10-19 被用户改反了：以前是"一个工程一个进程，拉起即
+        # 退出"；现在是"编辑器关掉之后启动器还要在"（换工程不用重新找图标）。
+        # ⚠ 因此**不能**再用 `proc.wait()` 断言它退出 —— 那样会把新契约
+        #   当成回归。判据拆成三条：日志 / 进程还活着 / Windows 真的收进任务栏。
+        if not tap.wait_line("LAUNCHER-MINIMIZED", timeout=30.0):
+            fails.append("O2 没有 LAUNCHER-MINIMIZED（拉起后没被最小化）")
+        else:
+            kit.log("CHECK O2 LAUNCHER-MINIMIZED OK")
+        time.sleep(1.5)
+        if proc.poll() is not None:
+            fails.append("O2b 拉起之后启动器退出了（rc=%s），应当常驻任务栏"
+                         % proc.returncode)
+        elif not kit.is_iconic(hwnd):
+            fails.append("O2b 启动器进程还在，但窗口没最小化（IsIconic=false）")
+        else:
+            kit.log("CHECK O2b launcher alive + iconic OK")
 
         # ---- O3/O4 编辑器窗口 + 标题 ----
         editor_hwnd, title = kit.wait_title(kit.EDITOR_TITLE, timeout=90.0)
@@ -208,6 +229,20 @@ def main():
                              "（onShutdown 没跑）")
             else:
                 kit.log("CHECK O9 onShutdown ran OK")
+
+        # ---- O2c/O2d 编辑器退出之后启动器仍在，且能点回前台 ----
+        time.sleep(1.5)
+        if proc.poll() is not None:
+            fails.append("O2c 编辑器退出后启动器也没了（rc=%s）" % proc.returncode)
+        elif not kit.is_iconic(hwnd):
+            fails.append("O2c 编辑器退出后启动器窗口不在最小化状态")
+        else:
+            kit.log("CHECK O2c launcher survived editor exit OK")
+            kit.restore_window(hwnd)
+            if not tap.wait_line("LAUNCHER-RESTORED", timeout=10.0):
+                fails.append("O2d 从任务栏恢复后没出现 LAUNCHER-RESTORED")
+            else:
+                kit.log("CHECK O2d restore from taskbar OK")
 
         with open(os.path.join(work, "open.log"), "w", encoding="utf-8") as f:
             f.write(tap.text())

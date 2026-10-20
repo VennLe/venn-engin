@@ -81,6 +81,13 @@ struct TerrainDesc {
     // 相对 `.vterrain` 所在目录的文件名
     std::string heightFile = "height.r32";
     std::string splatFile = "splat.rgba8";
+    // 挖洞遮罩（可选文件）。每采样点 1 字节：255 = 实心，0 = 挖穿。
+    // **允许缺失** —— 旧资产没有这个文件，读不到就整张填 255，
+    // 与"从来没挖过洞"等价。新增的洞用单独的灰度图而不是复用 splat 的
+    // 某个通道：splat 的 RGBA 四个通道分别属于 4 个材质层，任何一路
+    // 拿去存可见性都会让"层权重"和"可见性"互相污染 —— 而这两个量的
+    // 语义完全无关（挖穿之后那一格的权重根本没有意义）。
+    std::string holeFile = "holes.r8";
 
     // 4 个层材质 id（与 `.vmat` 的 id 同域，用 AssetManager 解析）
     std::array<std::string, 4> layerIds;
@@ -92,6 +99,10 @@ struct TerrainAsset {
     std::vector<float> heights;
     // RGBA8 权重，同样列主序：splat[(col * rows + row) * 4 + c]
     std::vector<uint8_t> splat;
+    // 挖洞遮罩，列主序，每采样点 1 字节（255 = 实心 / 0 = 挖穿）。
+    // 长度恒等于 cols*rows —— 缺文件时由 loadTerrain 填满 255，
+    // 渲染侧不用判空（少一个分支就少一处"偶尔不 discard"的坑）。
+    std::vector<uint8_t> holes;
 
     std::string path;  // 相对 assets/ 的 .vterrain 路径（日志 / 序列化用）
     bool ok = false;
@@ -118,8 +129,12 @@ bool loadTerrainDesc(const std::string& relPath, TerrainDesc& out,
 // ⚠ 尺寸校验是硬性失败而不是"尽力而为"：heights 少了 1 个字节，后面
 //   每一次 heightAt 都会越界读 —— 而越界读在这种裸指针视图里不会崩，
 //   只会给出一个看似合理的错误高度。
+//
+// quiet = true 时**不**打 TERRAIN-LOAD 成功日志。给地形笔刷的原地刷新
+// 路径用：那条路径每秒会重读两次，日志会被灌满；它自己有 TERRAIN-REFRESH。
+// 失败日志（TERRAIN-FAIL）不受 quiet 影响，永远打。
 bool loadTerrain(const std::string& relPath, TerrainAsset& out,
-                 std::string* err = nullptr);
+                 std::string* err = nullptr, bool quiet = false);
 
 // ------------------------------------------------------------
 // 网格

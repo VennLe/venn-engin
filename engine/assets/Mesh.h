@@ -30,8 +30,16 @@ struct Vertex {
     // PushConstants::skin.x 的 jointBase 定位到 SSBO 里的具体矩阵。
     glm::uvec4 joints{0, 0, 0, 0};
     glm::vec4 weights{0.0f, 0.0f, 0.0f, 0.0f};
-    // 32 → 64 字节。默认成员初始化保证所有旧代码（几何生成器逐字段
-    // 赋值 pos/normal/uv）不需要改。
+    // ---- 顶点色（Mesh Paint）----
+    // 默认全 1 = "不染色"：着色器里直接乘 albedo，所以没画过的网格与
+    // 加这个通道之前**逐像素一致**。放在蒙皮属性之后是因为：
+    //   · glTF / FBX 的 COLOR_0 是可选的，加载器不填时拿默认白；
+    //   · LOD 合并要做颜色平均（见 Lod.cpp）；
+    //   · 不打断已有的 location 0..4 —— depth_only / shadow 那几个着色器
+    //     只声明 0 号属性，多一个不会让它们的顶点布局失效。
+    // 64 → 80 字节。80 不是 2 的幂，但 Vulkan 只要求**属性偏移**对齐到
+    // 分量大小（vec4 = 4 字节），stride 本身没有对齐约束。
+    glm::vec4 color{1.0f, 1.0f, 1.0f, 1.0f};
 
     static VkVertexInputBindingDescription bindingDescription() {
         VkVertexInputBindingDescription b{};
@@ -41,8 +49,25 @@ struct Vertex {
         return b;
     }
 
+    // 完整的 6 个属性（含 location 5 顶点色）。
     static std::vector<VkVertexInputAttributeDescription> attributeDescriptions() {
-        std::vector<VkVertexInputAttributeDescription> attrs(5);
+        return attributeDescriptions(6);
+    }
+
+    // 只要前 `count` 个（0..count-1）属性。
+    //
+    // 为什么需要它：Vulkan 校验层对"管线声明了 location 5、但该管线的顶点
+    // 着色器没声明/没用到 location 5"会报
+    //     VUID-VkGraphicsPipelineCreateInfo-Input-07904
+    //     "Vertex attribute at location 5 not consumed by vertex shader"
+    // 阴影 / 贴花这两个管线的顶点着色器（shadow.vert / decal.vert）确实不读
+    // 顶点色，所以它们传 `attributeDescriptions(5)` —— 少喂一个属性，
+    // 警告就没了，语义也更准确（管线只声明它真会读的东西）。
+    //
+    // stride 仍然是 `sizeof(Vertex)`：属性偏移不变，少一个不影响其余几个。
+    static std::vector<VkVertexInputAttributeDescription> attributeDescriptions(
+        int count) {
+        std::vector<VkVertexInputAttributeDescription> attrs(6);
         attrs[0].binding = 0;
         attrs[0].location = 0;
         attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
@@ -64,6 +89,14 @@ struct Vertex {
         attrs[4].location = 4;
         attrs[4].format = VK_FORMAT_R32G32B32A32_SFLOAT;
         attrs[4].offset = offsetof(Vertex, weights);
+        // 顶点色：location 5（Mesh Paint 的落点）
+        attrs[5].binding = 0;
+        attrs[5].location = 5;
+        attrs[5].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attrs[5].offset = offsetof(Vertex, color);
+        if (count < 0) count = 0;
+        if (count > 6) count = 6;
+        attrs.resize(static_cast<std::size_t>(count));
         return attrs;
     }
 };
@@ -201,5 +234,32 @@ std::vector<uint32_t> makeSphereIndices(int segments = 48, int rings = 24);
 // 侧面 48 边 + 上下两片三角扇端盖，全部外法线、CCW 绕序。
 std::vector<Vertex> makeCylinderVertices(float radius, int segments = 48);
 std::vector<uint32_t> makeCylinderIndices(int segments = 48);
+
+// ------------------------------------------------------------
+// 植被（W5-1 的第一步，2026-10-20）
+//
+// 为什么植被要有自己的内置形状：撒点如果只能用 cube/sphere，"植被"看起来
+// 就是一堆绿方块。草叶最少要**交叉的卡片**（三张十字面片，任何角度看都
+// 有东西），树最少要有**干 + 冠**两段。两者都是程序化的，不需要美术资产，
+// 也不需要外部文件 —— 与 cube / sphere 同级。
+//
+// 尺寸约定：`size` = 世界高度（米），XY 宽度由形状自己按比例算。
+// 法线一律朝上（0,0,1）：草和树冠都是薄片，用面法线会在逆光时变黑，
+// 朝上法线拿的是"天光"，观感稳定。材质**必须** doubleSided（背面要能看见）。
+// ------------------------------------------------------------
+std::vector<Vertex> makeGrassVertices(float size);
+std::vector<uint32_t> makeGrassIndices();
+std::vector<Vertex> makeTreeVertices(float size);
+std::vector<uint32_t> makeTreeIndices();
+// 花：细杆（两张交叉窄片）+ 顶上一簇小花冠（三张交叉片）。
+// 与草的区别不只是尺寸 —— 草是"一片"，花是"一根杆挑一个头"，
+// 远看时轮廓完全不同，撒在草地里才有层次。
+std::vector<Vertex> makeFlowerVertices(float size);
+std::vector<uint32_t> makeFlowerIndices();
+// 石头：低面数、顶点随机位移、**逐面法线**（平面着色）的球。
+// 为什么要单独一份而不是压扁的 sphere：光滑球压扁之后仍然处处是圆滑的
+// 高光，一堆摆在一起像"塑料蛋"；平面着色 + 位移才有岩块的棱。
+std::vector<Vertex> makeRockVertices(float size, int seed = 0);
+
 
 } // namespace assets

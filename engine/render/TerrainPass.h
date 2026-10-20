@@ -130,6 +130,21 @@ public:
     // 全部拆掉（场景里地形实体的集合变了，或资产/层材质被改过）
     void clearInstances();
 
+    // ---- 笔刷专用：原地重传高度图 / 权重图 ----
+    //
+    // 高度在 terrain.vert 里是采样高度图加出来的，顶点本身是平坦格子 ——
+    // 所以刷地形不需要重建任何对象，只要把这张 R32 图重传一遍。
+    // 与 clearInstances + createTerrain 的区别：**不销毁任何 VkObject**、
+    // 不重传 3 MB 顶点、不重建 sampler / 描述符集，因此可以安全地按
+    // 十几赫兹的频率调用；而重建路径必须等 GPU 空闲，高频调用会撞上
+    // "destroy while in use" → VK_ERROR_DEVICE_LOST。
+    //
+    // index 是实例下标（与 instanceAt / Renderer::m_terrainEntities 同序）。
+    // splatToo = false 时只刷高度图（纯抬升/平滑不需要碰权重）。
+    // holesToo = false 时不动挖洞遮罩（只有 Hole 笔刷才置 true）。
+    // 失败返回 false（索引越界 / 资产尺寸变了 → 调用方应退回重建路径）。
+    bool refreshSurface(uint32_t index, bool splatToo, bool holesToo = false);
+
     // 在**前向 Pass 内**录制（调用方负责 RenderPass 的 begin/end 与 set 0）。
     // 返回本帧提交的三角形数（统计用）。
     uint64_t record(VkCommandBuffer cmd, const glm::vec3& camPos);
@@ -188,8 +203,13 @@ struct TerrainPass::Instance {
 
     std::unique_ptr<rhi::Image> heightImage;
     std::unique_ptr<rhi::Image> splatImage;
+    // 挖洞遮罩（R8_UNORM，每采样点 1 字节）。**永远存在** ——
+    // 没挖过洞的资产由 loadTerrain 填 255 生成一张全白图，
+    // 这样片元着色器里只有一条无条件采样 + 比较，没有"有没有洞图"的分支。
+    std::unique_ptr<rhi::Image> holeImage;
     VkSampler heightSampler = VK_NULL_HANDLE;
     VkSampler splatSampler = VK_NULL_HANDLE;
+    VkSampler holeSampler = VK_NULL_HANDLE;
 
     // 层材质：数值参数走 UBO（一次写入），贴图走描述符数组
     struct Layer {

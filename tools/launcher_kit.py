@@ -178,6 +178,25 @@ def close_window(hwnd):
     return bool(_user32.PostMessageW(ctypes.c_void_p(hwnd), WM_CLOSE, 0, 0))
 
 
+def is_iconic(hwnd):
+    """窗口是不是"最小化到任务栏"。
+
+    ⚠ 这是 `LAUNCHER-MINIMIZED` 的**外部**佐证：日志只能证明"我们调了
+      minimize()"，IsIconic 才能证明"Windows 真的把它收进任务栏了"。
+    """
+    if not hwnd or not _user32.IsWindow(ctypes.c_void_p(hwnd)):
+        return False
+    return bool(_user32.IsIconic(ctypes.c_void_p(hwnd)))
+
+
+def restore_window(hwnd):
+    """把最小化的窗口点回前台（等价于点任务栏按钮）。"""
+    if not hwnd or not _user32.IsWindow(ctypes.c_void_p(hwnd)):
+        return False
+    _user32.ShowWindow(ctypes.c_void_p(hwnd), SW_RESTORE)
+    return True
+
+
 def shutdown(proc, hwnd, wait=60.0):
     """正常关窗并等退出，返回 (done, rc)。
 
@@ -240,6 +259,17 @@ def client_to_screen(hwnd, cx, cy):
     pt = wt.POINT(int(cx), int(cy))
     _user32.ClientToScreen(ctypes.c_void_p(hwnd), ctypes.byref(pt))
     return pt.x, pt.y
+
+
+def client_size(hwnd):
+    """客户区尺寸（逻辑像素）。
+
+    ⚠ 用 `GetClientRect` 而不是 `GetWindowRect`：外框含标题栏 + 边框，
+      且随 DPI 缩放变化 —— 拿它断言"窗口是 1080×720"在 125%/150% 下必红。
+    """
+    r = wt.RECT()
+    _user32.GetClientRect(ctypes.c_void_p(hwnd), ctypes.byref(r))
+    return (r.right - r.left, r.bottom - r.top)
 
 
 def click(hwnd, cx, cy):

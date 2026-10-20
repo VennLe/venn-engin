@@ -37,6 +37,7 @@
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -158,11 +159,12 @@ def main():
             fails.append("没有 LAUNCHER-SPAWN（没拉起编辑器）")
             return kit.finish(fails)
         pid = kit.parse_spawn_pid(tap.text())
-        try:
-            proc.wait(timeout=40)
-        except Exception:  # noqa: BLE001
-            fails.append("拉起后启动器没有自己退出")
-            proc.kill()
+        # 契约反转（2026-10-19）：拉起之后启动器**不退出**，收进任务栏常驻。
+        # 这里以前等它自己退出，现在只等"最小化"这一行 —— 再等退出只会白等 40s。
+        if not tap.wait_line("LAUNCHER-MINIMIZED", timeout=30.0):
+            fails.append("拉起后启动器没有最小化（LAUNCHER-MINIMIZED 没出现）")
+        elif proc.poll() is not None:
+            fails.append("拉起后启动器退出了（应常驻任务栏）")
 
         editor_hwnd, title = kit.wait_title(kit.EDITOR_TITLE, timeout=90.0)
         if not editor_hwnd:
@@ -184,12 +186,32 @@ def main():
             kit.log("CHECK D5 PROJ-CODE-LINK ok OK")
 
         # ---- D6 脚本穿过联接被编译 ----
-        if not tap.wait_line("precompiled 1 script(s), 0 with errors", timeout=30.0):
+        #
+        # ⚠ 断言的是"**全部编译通过**"，不是"正好 1 个"。脚本数量是模板内容
+        #   （模板现在给 main.vks + pickup.vks 两份），把它写死在这里等于
+        #   "模板加一个脚本就得改验收脚本"—— 那是耦合，不是契约。
+        #   契约只有一条：`0 with errors`，且至少有一个脚本被找到。
+        m = None
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            m = re.search(r"precompiled (\d+) script\(s\), (\d+) with errors",
+                          tap.text())
+            if m:
+                break
+            time.sleep(0.2)
+        if m is None:
             lines = [l for l in tap.text().splitlines() if "precompiled" in l]
-            fails.append("D6 脚本没被编译成 1 个（实际: %s）"
+            fails.append("D6 没有 precompiled 行（实际: %s）"
                          % (lines[-1].split("] ", 1)[-1] if lines else "无该行"))
+        elif m.group(2) != "0":
+            fails.append("D6 有脚本编译失败（%s 个），模板脚本语法有问题"
+                         % m.group(2))
+        elif int(m.group(1)) < 2:
+            fails.append("D6 只编译了 %s 个脚本（模板应有 main.vks + pickup.vks）"
+                         % m.group(1))
         else:
-            kit.log("CHECK D6 precompiled 1 script (via junction) OK")
+            kit.log("CHECK D6 precompiled %s script(s), 0 with errors "
+                    "(via junction) OK" % m.group(1))
 
         # ---- D7/D8 改外部文件 → 热重载 ----
         #

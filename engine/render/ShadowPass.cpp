@@ -239,7 +239,10 @@ void ShadowPass::createPipeline() {
     desc.vertSpv = vkutil::readFile(resolveShaderPath("shadow.vert.spv"));
     desc.fragSpv = vkutil::readFile(resolveShaderPath("shadow.frag.spv"));
     desc.vertexBindings.push_back(assets::Vertex::bindingDescription());
-    desc.vertexAttributes = assets::Vertex::attributeDescriptions();
+    // 只喂 0..4：shadow.vert 不读顶点色（location 5）。多声明一个不会被读的
+    // 属性会触发校验层 "Vertex attribute at location 5 not consumed by
+    // vertex shader"。
+    desc.vertexAttributes = assets::Vertex::attributeDescriptions(5);
     desc.setLayouts = {m_frameSetLayout};
     desc.pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     desc.pushConstant.offset = 0;

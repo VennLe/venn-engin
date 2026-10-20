@@ -341,6 +341,11 @@ bool Window::maximized() const {
 
 void Window::maximize() { glfwMaximizeWindow(m_window); }
 
+void Window::minimize() {
+    if (!m_window) return;
+    glfwIconifyWindow(m_window);
+}
+
 bool Window::primaryMonitorWorkArea(int* x, int* y, int* w, int* h) const {
     GLFWmonitor* mon = glfwGetPrimaryMonitor();
     if (!mon) return false;

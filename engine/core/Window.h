@@ -46,6 +46,13 @@ public:
     void setTitle(const std::string& title);
     bool maximized() const;
     void maximize();
+    // 收进任务栏（不销毁窗口、不结束进程）。
+    //
+    // ⚠ 用 `glfwIconifyWindow` 而不是 `glfwHideWindow`：hide 会让任务栏按钮
+    //   也消失，用户就"找不回来"了；iconify 才是真正的"最小化"。
+    //   主循环对 iconified 已有专门分支（Application.cpp —— 只
+    //   `glfwWaitEvents` + continue，不渲染），所以最小化后基本不吃 CPU/GPU。
+    void minimize();
     // 主显示器工作区（已排除任务栏）。拿不到显示器时返回 false。
     bool primaryMonitorWorkArea(int* x, int* y, int* w, int* h) const;
     // 供"记住上次关闭时的大小"用：窗口模式下的几何。

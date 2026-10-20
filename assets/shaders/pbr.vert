@@ -87,10 +87,12 @@ layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
 layout(location = 3) in uvec4 inJoints;  // 骨架内 joint 下标
 layout(location = 4) in vec4 inWeights;  // 权重（和 > 0 才蒙皮）
+layout(location = 5) in vec4 inColor;    // 顶点色（Mesh Paint；默认全 1）
 
 layout(location = 0) out vec3 vWorldPos;
 layout(location = 1) out vec3 vNormal;
 layout(location = 2) out vec2 vUV;
+layout(location = 3) out vec4 vColor;
 // 注意：**没有** vLightSpacePos 了。改 CSM 之后级联是按视深度在片元阶段
 // 选的，顶点阶段不知道会落在哪一级，所以只传世界坐标，由 pbr.frag 用
 // ubo.lightSpace[cascade] 现算。
@@ -137,6 +139,7 @@ void main() {
     // 蒙皮后的法线：skinMat 含旋转+缩放，用归一化近似（角色均近似刚性）。
     vNormal = normalize(mat3(modelMat) * localNrm.xyz);
     vUV = inUV;
+    vColor = inColor;
 
     gl_Position = ubo.proj * ubo.view * world;
 }

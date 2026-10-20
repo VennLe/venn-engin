@@ -5,6 +5,9 @@
 #include "EditorDragDrop.h"
 #include "FeatureUIGen.h"   // emitParamChange：改 grid.* 后要标脏 + 记撤销
 #include "EditorScene.h"  // instantiateModel
+#include "LandscapeEditor.h"   // 编辑模式：地形笔刷 / 高度查询
+#include "FoliageEditor.h"     // 编辑模式：植被撒点
+#include "ToolkitEditors.h"  // 编辑模式：顶点色绘制 / 刷子体放置
 
 #include "render/Renderer.h"
 #include "render/FeatureRegistry.h"   // E14：视口设置直接写 grid.* 参数
@@ -2119,6 +2122,7 @@ void ViewportPanel::draw() {
     logRect("VP-RECT", imgMin,
             ImVec2(imgMin.x + imgSz.x, imgMin.y + imgSz.y));
 
+
     const glm::vec2 vpPos(pane0Min.x, pane0Min.y);
     const glm::vec2 vpSize(pane0Size.x, pane0Size.y);
 
@@ -2132,8 +2136,54 @@ void ViewportPanel::draw() {
 
     // 3) gizmo（先跑：它可能在本次点击里"吃掉"鼠标）。只在编辑态有效
     scene::Camera& cam = m_ctx.activeScene().camera();
+
+    // 2.5) 编辑模式的笔刷（2026-10-20）
+    //
+    // 地形 / 植被模式下**左键归工具**：不画手柄、不做点选。这三件事抢同一
+    // 个键（左键），必须在这里一次分派清楚 —— 分开写条件最容易出现
+    // "刷地形的时候顺手把下面的物体拖走了"。
+    //
+    // ⚠ 右键/中键的相机导航在上面已经处理过，不受影响：刷地形时仍然可以
+    //   一边按住右键转视角、一边左键刷。
+    const EditMode editMode = m_ctx.editMode();
+    // ⚠ 判据是"这个模式**自己**要吃左键"，**不是** "editMode != Select"。
+    //
+    // 上一版写的是 `editMode != EditMode::Select`，于是九项全部接进来之后，
+    // Modeling / Fracture / Animation / PCG 四个模式也把左键霸占了 —— 它们在
+    // 视口里根本不需要笔刷，结果是"进了建模模式就点不中任何物体，也拖不动
+    // 手柄，只能先切回 Select 选好再切回来"。UE5 里这四个模式是正常可选的
+    // （选中项就是操作对象），所以只有真正刷东西的四个模式才归"工具"。
+    //
+    // Modeling 也在这里：它的左键是"点选顶点/边/面"，同样必须独占 —— 否则
+    // 一按左键就先被 gizmo 或实体点选吃掉，"在建模模式里选不中任何一个面"。
+    const bool brushMode = editMode == EditMode::Landscape ||
+                           editMode == EditMode::Foliage ||
+                           editMode == EditMode::MeshPaint ||
+                           editMode == EditMode::BrushEdit ||
+                           editMode == EditMode::Modeling;
+    const bool modeToolActive = m_ctx.isEditing() && brushMode;
+    bool modeConsumed = false;
+    if (modeToolActive) {
+        if (editMode == EditMode::Landscape && m_landscapeEditor) {
+            modeConsumed =
+                m_landscapeEditor->viewportInput(vpPos, vpSize, hovered, dl);
+        } else if (editMode == EditMode::Foliage && m_foliageEditor) {
+            modeConsumed =
+                m_foliageEditor->viewportInput(vpPos, vpSize, hovered, dl);
+        } else if (editMode == EditMode::MeshPaint && m_meshPaintEditor) {
+            modeConsumed =
+                m_meshPaintEditor->viewportInput(vpPos, vpSize, hovered, dl);
+        } else if (editMode == EditMode::BrushEdit && m_brushEditor) {
+            modeConsumed =
+                m_brushEditor->viewportInput(vpPos, vpSize, hovered, dl);
+        } else if (editMode == EditMode::Modeling && m_modelingEditor) {
+            modeConsumed =
+                m_modelingEditor->viewportInput(vpPos, vpSize, hovered, dl);
+        }
+    }
+
     bool gizmoConsumed = false;
-    if (m_showGizmo && m_ctx.isEditing()) {
+    if (!modeToolActive && m_showGizmo && m_ctx.isEditing()) {
         gizmoConsumed = m_gizmo.update(m_ctx, cam, vpPos, vpSize, hovered, dl);
     }
 
@@ -2142,8 +2192,9 @@ void ViewportPanel::draw() {
     const ImGuiIO& io = ImGui::GetIO();
     const bool navGesture = ImGui::IsMouseDown(ImGuiMouseButton_Right) ||
                             ImGui::IsMouseDown(ImGuiMouseButton_Middle);
-    if (m_ctx.isEditing() && hovered && !gizmoConsumed && !navGesture &&
-        !m_gizmo.dragging() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    if (m_ctx.isEditing() && !modeToolActive && !modeConsumed && hovered &&
+        !gizmoConsumed && !navGesture && !m_gizmo.dragging() &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         const glm::vec2 mouse(io.MousePos.x, io.MousePos.y);
         // 先问"是不是点在**选中物体的碰撞框**那圈线上"。
         //

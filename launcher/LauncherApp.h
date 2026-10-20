@@ -48,6 +48,7 @@
 #include "project/ProjectFile.h"
 #include "project/RecentList.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -130,6 +131,18 @@ private:
     SpawnKind m_pendingSpawn = SpawnKind::None;
     std::string m_pendingRoot;
     std::string m_lastSpawnError;
+
+    // 拉起之后是不是已经收进任务栏了（每帧只在状态变化时打一行日志，
+    // 不刷屏）。见 runPendingSpawn 的注释：启动器**不退出**。
+    bool m_minimizedAfterSpawn = false;
+
+    // ---- 类型卡片的插图（第一/第三人称）----
+    // ImGui 的纹理句柄（VkDescriptorSet 转成的整数），0 = 还没有 / 加载失败。
+    // 懒加载：只有真的进到 Type 页才建，且失败一次就不重试（否则日志每帧
+    // 刷一行 WARN）。句柄必须在 ImGui 后端 shutdown 之前注销 —— 见 onShutdown。
+    std::uint64_t m_typeArt[2] = {0, 0};
+    bool m_typeArtTried = false;
+    void ensureTypeArt();
 
     // ---- 提示 ----
     struct Toast {

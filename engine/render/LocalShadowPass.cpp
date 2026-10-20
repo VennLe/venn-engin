@@ -319,7 +319,8 @@ void LocalShadowPass::createPipeline() {
     desc.vertSpv = vkutil::readFile(resolveShaderPath("shadow.vert.spv"));
     desc.fragSpv = vkutil::readFile(resolveShaderPath("shadow.frag.spv"));
     desc.vertexBindings.push_back(assets::Vertex::bindingDescription());
-    desc.vertexAttributes = assets::Vertex::attributeDescriptions();
+    // 同 ShadowPass：shadow.vert 不读 location 5，别多喂。
+    desc.vertexAttributes = assets::Vertex::attributeDescriptions(5);
     desc.setLayouts = {m_frameSetLayout};
     desc.pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     desc.pushConstant.offset = 0;

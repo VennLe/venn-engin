@@ -108,6 +108,10 @@ struct CellAccum {
     glm::vec3 pos{0.0f};
     glm::vec3 nrm{0.0f};
     glm::vec2 uv{0.0f};
+    // 顶点色**可以**求平均（它是"这一格被染成什么颜色"，不是索引）。
+    // 不累这一项的话，Mesh Paint 画过的模型一拉远就回到白色 —— 而且
+    // 因为 LOD 是按距离切换的，看起来像"颜色在某段距离突然消失"。
+    glm::vec4 col{0.0f};
     uint32_t count = 0;
     uint32_t outIndex = 0;
 
@@ -224,6 +228,7 @@ LodMeshData decimateClustered(const std::vector<Vertex>& vertices,
         c.pos += p;
         c.nrm += vin.normal;
         c.uv += vin.uv;
+        c.col += vin.color;
         ++c.count;
         // 蒙皮权重：只有真正带权重的顶点才累（weights 全 0 的静态顶点
         // 混进来会把归一化分母搞乱）
@@ -252,6 +257,7 @@ LodMeshData decimateClustered(const std::vector<Vertex>& vertices,
         // 算出 NaN 亮度。
         v.normal = (len > 1e-6f) ? (n / len) : glm::vec3(0.0f, 0.0f, 1.0f);
         v.uv = c.uv * inv;
+        v.color = c.col * inv;
 
         // ---- 蒙皮（W2-3）：把这一格累积到的 joint 权重收成 4 个槽 ----
         // 取权重最大的 4 个，然后**归一化到 1** —— 不归一化的话顶点会被

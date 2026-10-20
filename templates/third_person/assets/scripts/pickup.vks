@@ -1,0 +1,43 @@
+# ============================================================
+# pickup.vks --- 光球：玩家走近 1.6 m 就收走，并给世界黑板 +1
+# 挂在场景里每一个 Pickup_* 上（同一份脚本、5 个独立实例）
+# ============================================================
+#
+# 【为什么要 taken 这个守卫】
+#   捡到之后只是 setVisible(false) --- 实例还在跑。没有 taken 的话，
+#   玩家站在原地会每帧 +1，分数瞬间爆掉（而且不报错，只有分数看得出）。
+#
+# 【实例变量 vs 世界黑板】
+#   taken    逐实体一份（不存盘）-> 用来自我节流
+#   picked   全局一份（进存档）  -> 用来记总分
+#
+# 【动画】
+#   自转 + 上下浮动。这不是装饰：静止的小球在场景里很难被注意到，
+#   而"会动的、发光的"是玩家一眼就能识别出的可交互物。
+# ============================================================
+
+let taken = 0
+let R = 1.6                # 拾取半径（米）
+let SPIN = 90.0            # 自转速度（度/秒）
+let BOB = 0.18             # 上下浮动幅度（米）
+let base = vec3(0, 0, 0)   # 出生位置（start 里记下，浮动以它为基准）
+
+on start {
+    base = pos(self())
+}
+
+on update {
+    # 自转 + 浮动
+    r = rot(self())
+    setRot(self(), vec3(r.x, r.y, r.z + SPIN * dt))
+    setPos(self(), vec3(base.x, base.y, base.z + sin(time * 2.0) * BOB))
+
+    # 拾取（全部逻辑就这三行）
+    if (taken == 0 && dist(pos(self()), pos(player())) < R) {
+        taken = 1
+        setWorldAttr("picked", worldAttr("picked", 0) + 1)
+        setVisible(self(), false)
+        popup(10)
+        print("PICKUP", name(self()), worldAttr("picked", 0))
+    }
+}

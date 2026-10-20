@@ -763,9 +763,81 @@ assets/terrain/<name>/
 
 ### W4-4 编辑器：只做"能看见"，不做雕刻
 
+> **2026-10-19 用户明确扩大范围**（原话："对于游戏中的地形和植被系统可以优先制作
+> 出来"），于是这一条从"只看不打磨"升级成**真的能雕刻**。以下是当时的原计划，
+> 保留作为范围对照；实际落地见 §19 台账 W4-5。
+
 - ContentBrowser 双击 `.vterrain` → 视口里出现地形（等于把它实例化成一个实体）
 - Inspector 出一个 Terrain 段：尺寸 / maxHeight / 4 层材质槽 / `Height scale`
 - **不做**笔刷（E24 的活）
+
+### W4-5 雕刻笔刷（2026-10-19 追加落地）
+
+四个"必须按这个来不然会出事"的点：
+
+1. **笔刷刷新不能走"重建实例"**。`TerrainComponent::dirty` 的语义是
+   `clearInstances + createTerrain`（销毁 sampler / 重传 3 MB 顶点 / 等 GPU 空闲），
+   一次 ~10 ms。笔刷按 12 Hz 落盘，一秒就是十几次 —— 而 `clearInstances` 销毁的
+   sampler 还被**在飞行中的帧**引用着，验证层先报
+   `vkDestroySampler(): ... currently in use by VkCommandBuffer`，几秒后驱动直接
+   返回 `VK_ERROR_DEVICE_LOST`（实测编辑器整个进程没了）。
+   → 新增 `TerrainComponent::heightsDirty / splatDirty` + `TerrainPass::refreshSurface`，
+   只把 R32/RGBA8 两张图原地重传（264 KB），**不碰任何 VkObject**。
+   这是 `terrain.vert` 送的红利：`pos.z += texture(heightMap, uv).r * maxHeight`，
+   顶点本身是平坦格子，所以改高度不需要重传 VBO。
+2. **`clearInstances` 里必须 `vkDeviceWaitIdle`**。即使不走笔刷，任何结构变更
+   （加/删地形实体、改层材质）都会销毁正在被引用的资源。这一条以前是潜藏 bug。
+3. **属性名是 `dirty` 还是 `heightsDirty`，决定 12 Hz 能不能活** —— 上面两条的总结论。
+4. **"聚焦"不能用 `setTarget + setDistance`**：`Camera::setDistance` 钳在 100 m，
+   而地形 512 m 见方。要直接摆位置，并且 `z = 地形平均高度 + A·tan(pitch)`
+   （A = 视距），否则视线在 164 m 处只降到 27 m 以下 —— 画面是"一堵绿墙 + 一条
+   地平线"，起伏完全看不见（实测截图如此）。平均高度**从高度图算**，不要猜系数。
+5. **视距不能给固定系数，必须按视口长宽比算**（2026-10-20 修）。上一版硬编码
+   `A = 0.42·边长 = 215 m`，而 SplitLayout 下视口常年是竖窄的（实测 950×689
+   aspect 1.38，更窄时可到 0.85）；45° 竖直视场对应的水平半视场只有 19°，
+   215 m 处横向只装得下 512 m 地形的 ~34% —— 画面成了一条"连绵的绿带"，
+   看着像"地形全是草"，其实只是没装进去。现在的约束只有一条：
+   `d ≥ (0.5·span·1.06) / (tan(fovY/2)·aspect)`，再乘 `cos(pitch)` 换成水平后退量。
+   `EditorContext::viewportSize()` 为此新增（以前只有 `setViewportRect` 没有读端）。
+
+### W4-6 笔划撤销 + 参数补齐（2026-10-20）
+
+用户原话：「这个实现效果是否有些过于粗糙了，能否优化一下其中的详细参数和操作功能」。
+不加新功能大类，只把两套工具的参数与操作做厚：
+
+**地形 · 参数**：笔刷 5 → **6**（新增 `Noise`：特征尺度 / 倍频数 / 图案种子；
+`Erode`：休止角 / 每帧迭代），共性参数加 **单笔最大位移**（`Max displacement
+per stroke`，0 = 不限）。`drawToolParams()` 按当前工具切换面板，不是把所有
+参数一股脑堆出来。
+
+**地形 · 操作**：① **笔划撤销/重做**（`LandscapeEditor` 自带栈，深度 24）；
+② **笔划插值**：一帧内的位移按 `step = max(radius·0.25, mpp·1.5)` 拆成最多
+16 步，快速拖动不再是一串断开的圆点；③ **滚轮调半径**（Shift 调强度）；
+④ 三档整块操作（全图平滑 / 全图加噪 / 重置为默认地貌），各算一步撤销。
+
+撤销必须**自带实现**，不能借 `EditorContext::undo()`：那套是"整场景快照"，
+而高度存在磁盘上的 `.r32` 里、不在场景里 —— 快照撤不掉一笔，反而会把所有
+实体和相机弹回去（刷地形时是灾难）。做法是按下时 `beginSnapshot()` 全图拷贝，
+松开时 `commitSnapshot()` 扫出**脏矩形**只压那一块（~几十 KB，不是整张 264 KB），
+Ctrl+Z 写回 before。同理 `handleShortcuts()` 必须排在 `EditorApp` 的
+`if (io.KeyCtrl)` **之前**，否则 Ctrl+Z 会先被整场景撤销吃掉。
+
+滚轮是**唯一可靠的半径入口** —— `[` `]` 是 OEM 键，某些键盘布局下 GLFW 给的是
+`KEY_UNKNOWN`，ImGui 收不到事件（实测一条 `LS-KEY-DIAG` 都打不出来，而同一个
+进程里 Ctrl+Z 正常）。方括号保留作补充。
+
+**植被 · 参数**：物种 3 → **5**（新增 `Flower` 0.35 m / `Rock` 1.4 m，各有独立
+程序化网格与**序列化分支** —— 少了那个 `if (shape == "flower")` 分支，存盘再开
+花和石头会全部丢失）。新增 `Random tilt`、`Edge density falloff`、
+`Erase all kinds`、`Placement rules`（坡度上限 + 高度带上下限，逐物种不同）。
+
+**植被 · 观感**（"撒出来一片同色塑料"的四个解法）：逐实例色差（5 档亮度变体
+材质，**只动亮度** —— 动色相会出紫草粉树）、随机倾斜（按地表法线算 rx/ry 再叠
+抖动，石头额外随机翻滚）、坡度/高度过滤、边缘密度衰减（`pow(u, 0.5+f·1.1)`）。
+上限 4000 → **6000**。
+
+⚠ **仍未做**：splat 的独立层刷子可视化（UE 那种 Layers 缩略图列表）、
+笔刷形状（只有圆形 + falloff，没有方刷/纹理压印）、高度图导入导出。
 
 ### W4 的规模与依赖
 
@@ -805,6 +877,9 @@ vec3 offset = wind.dir * (gust * wind.strength * windWeight² * height);
   这样 Engine 面板 / env / 序列化三路自动派生
 
 ### W5-3 撒点：**编辑器里刷**还是**脚本生成**
+
+> **2026-10-19 第一版落地（偏离本方案）**：用的是"一堆普通实体"，不是
+> `FoliageVolumeComponent`。见 §19 台账 W5-0 的理由与代价。
 
 第一版用 **`FoliageVolumeComponent`**（盒体 + 密度 + 种子 + 类型表），
 运行时在 `onInit` 里按种子撒点（**不进场景文件**，只存 5 个参数）。
@@ -1084,6 +1159,10 @@ W6-1 要算 `probeWeight`，**正好需要同一个权重函数** → 一次实�
 | 2026-10-19 | **W2-4 空壳下架 ✅** | `Add ▸` 13 项 → **5 项**（material/model/scene/texture/audio），下架 8 个没有加载器的空壳（W4/W5/W8 逐项加回）。 |
 | 2026-10-19 | **W3 第一个真实关卡 ✅** | `tools/gen_first_level.py` → `assets/scenes/levels/first_level.json`：**373 个实体**，8 个母材质全部用上（crate 346 / metal 10 / wall 7 / cloth 2 / glass 2 / skin 2 / ground 1 / roof 1）+ 1 盏室内点光 + 1 个播 Walk 的角色。`verify_first_level.py` **10 条全绿**：加载 373 / 8 个母材质**各解析一次** / 往返 **0 处不同** / GPU **11.1 ms** / 增量 **24.0 ms（0.064 ms/实体，Debug）** / 改 `crate.vmat` 的 baseColor → **19.56%** 像素显著变化（基线 0.00%）/ 关太阳后室内 luma **0.268 vs 灯灭 0.014** / 单件覆盖往返仍是 `instance` + 1 个 override。 |
 | 2026-10-19 | **W4 地形 ✅**（W4-1~W4-4） | `engine/terrain/Terrain.{h,cpp}`（资产 + 分块 LOD 网格）+ `engine/physics/Heightfield.{h,cpp}`（高度场查询）+ `engine/render/TerrainPass.{h,cpp}`（独立管线）+ `terrain.vert/frag` + `assets/terrain/hills/`（**257² 采样点 / 2 m → 512×512 m / maxHeight 60 m / 4 层 / 64 块**）。`--selftest terrain` **pass=27 fail=0**；`verify_terrain.py` **16 条全绿**（LOD：贴地 35712 tris → 搬出地形外 4096 tris = **11.5%**；改层材质 **76.47%**；关地形 **76.41%**；GPU **8.22/9.84 ms**）；`verify_terrain_editor.py` **23 条全绿**（双击 `.vterrain` → 视口 **32.03%**；再双击不叠第二份；关 Visible **76.29%**；Ctrl+S 往返；重开自动恢复；Add ▸ Terrain 建出来的资产能直接打开）。`Add ▸` 5 项 → **6 项**（加回 terrain）。 |
+| 2026-10-19 | **W4-5 地形雕刻 ✅** / **W5-0 植被撒点 ✅** / **顶栏编辑模式下拉 ✅** | 用户原话："选择不同类型的模式就会打开不同的编辑器" + "地形和植被系统可以优先制作出来"。顶栏那颗 GizmoMode 下拉换成 UE 式 **9 项编辑模式**（选择/地形/植被/网格体绘制/建模/破裂/笔刷编辑/动画/PCG，矢量图标手绘、单选圆点、未实现项压暗 + `TODO` + 明确 toast，**不假装切过去**）；模式与 GizmoMode 正交共存。地形：**抬高/降低/平滑/压平/层绘制** 5 个笔刷 + 半径/强度/衰减，落盘 12 Hz，`MYVK_LANDSCAPE_AUTOCREATE=1` 可自动建。植被：**草/灌木/树** 三种程序化网格 + 极坐标均匀撒点 + 贴地 + 擦除/清空/上限 4000，实例挂在 `Foliage` 分组实体下（复用已有的同网格合批、拾取、序列化、阴影）。`verify_edit_modes.py` **24 条全绿 / 零 VUID**。⚠ 修掉 3 个真 bug：① 笔刷每 80 ms 走一次 `dirty` 重建 → 销毁在飞行的 sampler → **`VK_ERROR_DEVICE_LOST`**（编辑器直接崩）；② 浮动面板 ID 写成 `###landscape_panel`，与底栏托盘的 `###panel_<id>` 对不上 → 点一下视口面板就被盖住（看着像"自己关了"）；③ "聚焦"相机视线几乎水平贴地 → 一堵绿墙。新增地形默认**按高度+坡度自动铺 4 层 splat**（以前全刷第 0 层，另外 3 层材质一次都看不见）。 |
+| 2026-10-20 | **W4-6 地形/植被参数与操作补齐 ✅** | 用户原话：「这个实现效果是否有些过于粗糙了，能否优化一下其中的详细参数和操作功能」。**地形**：笔刷 5 → **6**（新增 Noise 的特征尺度/倍频/种子、Erode 的休止角/迭代）+ 单笔最大位移；**笔划撤销/重做**（脏矩形压缩，深度 24）+ **笔划插值**（快速拖动不再断成圆点）+ **滚轮调半径**（`[` `]` 是 OEM 键，某些布局下 ImGui 收不到事件 → 主入口改滚轮）+ 整块平滑/加噪/重置。**植被**：物种 3 → **5**（新增 Flower / Rock，各带程序化网格 + `SceneSerializer` 分支）+ Random tilt / Edge density falloff / Erase all kinds / 逐物种坡度·高度带过滤 + 5 档亮度变体材质 + 上限 4000→6000。⚠ 修掉 2 个"看着像功能缺失"的真 bug：① **岩石层覆盖率 0.0%** —— 门限 `clamp((slope-0.35)/0.55)` 要求 19° 起，而这片地形**最大坡度只有 22.4°**（p50 8.6° / p90 15.2°），材质表第 3 层一次都没显示过；按实测分布改成 11.3°~18.8°，四层权重实测 草 62.0% / 土 22.4% / 岩 9.3% / 雪 4.2%。② **"聚焦"只装得下地形横向 34%** —— 固定 `0.42·边长` 与视口长宽比无关，竖窄视口下画面成了一条绿带；改成 `d ≥ (0.5·span·1.06)/(tan(fovY/2)·aspect)`，并给 `EditorContext` 补 `viewportSize()` 读端。 |
+| 2026-10-20 | **W4-7 地形共面 + 挖洞/坡道笔刷 + 六模式落地 ✅** | 用户原话：「地形模式下的地面应该要和原来栅格化的地面保持同一平面」+「不支持挖洞的模式」+「笔刷的力度区间可以调更大一下」+「模式下拉列表中的其他模式和功能也需要一一实现完整」。**共面**：默认地貌乘边界渐变（`kEdgeFade=0.12` smoothstep→0），实测四边 `min=max=0`、中心 `max=0.7285`；⚠ 副作用是最大坡度 22°→65°，splat 门限按实测重设（草 60.9/土 17.3/岩 13.1/雪 8.7）。**挖洞**：`terrain.frag` 片元 `discard` + 独立 `holes.r8`（R8_UNORM，255 实心/0 挖穿，不复用 splat 通道）+ `TerrainPass` binding 5 + `holesDirty` 原地重传。**坡道**：p0→p1 投影插值端点高度（格子米坐标必须 `origin+index*mpp`）。**力度**：Strength 0.01..16（对数）/ Radius 1..500 / Max displacement 0..200，键盘与滚轮同钳位。**六模式**：`editor/ToolkitEditors.{h,cpp}` —— MeshPaint / Modeling / Fracture / BrushEdit / Animation / PCG，`editModeImplemented` 九项全 true，`serviceEditMode` 改表驱动。**验收**：`verify_landscape_ground.py` 14 条 + `verify_toolkit_modes.py` 34 条 **全绿 / 零 VUID**，`verify_i18n_coverage.py` 1883 条 PASS。⚠ 修掉 5 个真 bug：① 视口左键判据写成 `editMode != Select`，导致建模/破裂/动画/PCG 模式点不中物体；② PCG 面板 Generate 被挤到窗口可视区外（y≈958 vs 窗底 750）；③ `generate()` 静默提前返回（先打了 PCG-CLEAR 就没了下文）；④ Brush/PCG 找的 `materials/default` 根本不存在 → 空材质被颜色通道 `continue` 掉，实例看得见层级、看不见画面；⑤ `notify(TR("PCG placed %d instances"))` —— TR 不跑 printf，屏幕上原样显示 %d。 |
+| 2026-10-20 夜 | **W4-7b 三个"只做了一半"的补齐 ✅** | 用户原话：「关键帧只存在编辑器会话里，没进场景序列化；Fracture 的切面始终轴对齐（是"碎掉的感觉"，不是真正的断裂解算）；Modeling 只有全局几何操作，没有边/面选择。把这些也都实现一下，Modeling 可以按照 blender 建模软件去实现」。**① 关键帧进序列化**：新增 `ecs::AnimationClipComponent`（`TransformKey{t, pos, rot, scale}` + duration / loop / autoplay / time），写进 `scene.json` 的 `animClip` 段；`playing` 不存盘（重开由 `autoplay` 决定）、`time` 存盘；`EditorContext::structuralEdit` 会自动把它带进撤销快照。**② Voronoi 真断裂**：种子 = 规则格心 + `irregularity*0.48` 抖动 → 每个三角形用"本种子与邻居种子的中垂面"做 3D Sutherland-Hodgman 裁剪（不做 CSG）→ 扇形三角化 → 断面用 2D 凸包（Andrew monotone chain）封口。实测 `srcTris=12 outTris=108`、8 胞腔、`caps>=1`、碎块三角形数 `[12,13,14,15,16]` —— 不是方块。Grid 切法保留可对比。**③ Modeling 按 Blender Edit Mode 重做**：顶点 / 边 / 面三级选择（权威选区只有一份 `m_sel` = weld 组 id 集合，面 = 三角全选中、边 = 两端点选中），渲染顶点按位置量化 0.1 mm 焊成组（立方体 24→8）；视口射线点选，顶点按屏幕距离 24 px / 边 18 px 挑最近的；`1`/`2`/`3` 切层、`A` 全选、`Alt+A` 清空、`E` 挤出、`X` 删除、`M` 合并、`G`/`S`/`R` 模态（每次从 `m_modalBase` 重算，不累加）；挤出只复制选中面的原始顶点并给边界边补侧面，保持绕序。**验收**：`verify_toolkit_round2.py` 32 条全绿，旧的 `verify_toolkit_modes.py` 34 条全绿，`verify_i18n_coverage.py` PASS（1915 条）。⚠ 修掉 4 个真 bug：① 工具面板默认摆在 `DisplaySize.x*0.30`，1600 宽窗口下正好盖住视口中心 → 建模模式里点模型完全没反应（挪到 0.60）；② `extrude()` 里注释写"选区跟着顶面走"、代码却只 `m_sel.clear()`，于是挤出完 Delete 立刻 `skip=no-face-selected`；③ `subdivideSelected()` / `mergeSelection()` 同样清空选区，1→4 之后新中点不在 `m_sel` 里、四个子面一个都选不中；④ 验收脚本用 `=(` 当"锚点行"判据，把 `FRACTURE ... bounds=(..)-(..)` 整条吃掉，误报"Grid 切法没反应"。 |
 
 ### 19.1 W0 + W1 的实测数字与坑
 

@@ -93,6 +93,67 @@ void paintTransportIcon(ImDrawList* dl, ImVec2 p, float s, int glyph,
     }
 }
 
+// 编辑模式下拉里的一行：图标 + 名字 + 右侧状态。
+//
+// 排版与视口的"变换工具"下拉（ViewportPanel::vpToolRow）保持一致：单选
+// 用**圆点**而不是对勾 —— 对勾是"开关"，圆点是"我只可能是其中一个"。
+// 未实现的模式整行压暗 + 右侧标 TODO：用户点得下去（会得到一条 toast），
+// 但视觉上先说明"这一项还没有东西"。
+bool editModeRow(EditMode m, bool active) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float h = 28.0f;
+    const float w = 226.0f;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+
+    ImGui::PushID(editModeId(m));
+    const bool clicked = ImGui::Selectable("##row", false,
+                                           ImGuiSelectableFlags_None,
+                                           ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+    ImGui::PopID();
+
+    const bool impl = editModeImplemented(m);
+    const float cy = p.y + h * 0.5f;
+
+    // 单选圆点
+    if (active) {
+        dl->AddCircleFilled(ImVec2(p.x + 11.0f, cy), 4.2f,
+                            ImGui::GetColorU32(ui::tokens().accent), 12);
+    } else {
+        ImVec4 dc = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+        if (!impl) dc.w *= 0.55f;
+        dl->AddCircle(ImVec2(p.x + 11.0f, cy), 4.2f,
+                      ImGui::GetColorU32(dc), 12, 1.2f);
+    }
+
+    // 图标 + 名字
+    ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    if (!impl) tc.w *= 0.45f;
+    else if (!active && !hovered) tc.w *= 0.88f;
+    const ImU32 col = ImGui::GetColorU32(tc);
+    paintEditModeIcon(dl, ImVec2(p.x + 26.0f, cy - 8.0f), 16.0f, m, col);
+    dl->AddText(ImVec2(p.x + 50.0f, cy - ImGui::GetTextLineHeight() * 0.5f),
+                col, TR(editModeName(m)));
+
+    // 右侧状态：未实现 → TODO；实现但不是当前项 → 留空
+    if (!impl) {
+        const char* tag = "TODO";
+        const ImVec2 tw = ImGui::CalcTextSize(tag);
+        ImVec4 dc = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+        dc.w *= 0.8f;
+        dl->AddText(ImVec2(p.x + w - tw.x - 10.0f, cy - tw.y * 0.5f),
+                    ImGui::GetColorU32(dc), tag);
+    }
+
+    char rectTag[64];
+    std::snprintf(rectTag, sizeof(rectTag), "TB-EDITMODE-ITEM %s",
+                  editModeId(m));
+    logRect(rectTag, p, ImVec2(p.x + w, p.y + h));
+
+    if (hovered) ImGui::SetTooltip("%s", TR(editModeHint(m)));
+    return clicked;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- 文件操作
@@ -789,73 +850,87 @@ void Toolbar::drawBar() {
     // ⚠ 用户以为 1/2V/2H/4 是"渲染分辨率"，其实是**视口分屏布局**
     //   （1 屏 / 左右 2 屏 / 上下 2 屏 / 4 屏）。挪过去时名字改成"布局"，
     //   免得继续被当成分辨率。
+    //
+    // 2026-10-20：最后那句"这里只剩选择模式下拉"也不成立了 —— 这颗下拉
+    // 已经从"手柄模式"改成"编辑模式"（见下面 ① 的说明）。手柄模式的入口
+    // 现在只剩视口工具条与 Q/W/E/R。
     // ============================================================
 
-    const char* modeName = "Select";
-    switch (m_ctx.gizmoMode()) {
-        case GizmoMode::Translate: modeName = "Move"; break;
-        case GizmoMode::Rotate:    modeName = "Rotate"; break;
-        case GizmoMode::Scale:     modeName = "Scale"; break;
-        case GizmoMode::Select:    modeName = "Select"; break;
-    }
-
-    // ---------------------------------------------------------- ① 选择模式
+    // ---------------------------------------------------------- ① 编辑模式
     //
-    // 按钮上显示的永远是**当前模式**（Select / Move / Rotate / Scale），
-    // 点开才看到四个选项 —— 与用户给的 UE 截图一致：横条上不铺四个按钮，
-    // 只放一个"我现在是什么模式"的下拉。
+    // 2026-10-20：按用户给的 UE5 "Selection Mode" 截图重做。
+    //
+    // 原来这颗下拉里是 Select / Move / Rotate / Scale —— 那是**手柄模式**，
+    // 与 UE 那颗同名按钮里装的东西并不是一回事：UE 列的是"整套编辑工具"
+    // （选择 / 地形 / 植被 / 网格体绘制 / 建模 / 破裂 / 笔刷编辑 / 动画 /
+    // PCG），选哪个就换一套编辑器。所以这里换成 EditMode。
+    //
+    // 手柄模式没有丢：视口工具条那四个图标 + Q/W/E/R 一个都没动，顶栏这颗
+    // 只是它的第三个入口，现在让位给编辑模式。
     {
-        char label[96];
-        std::snprintf(label, sizeof(label), "%s", TR("Select Mode"));
-        // 右侧给矢量小三角留位置。为什么不用字符 "▼"：ImGui 自带字体里
-        // 那个字形要么是豆腐块要么宽得离谱（和视口工具条同一条经验）。
+        const EditMode cur = m_ctx.editMode();
+        const char* curLabel = TR(editModeName(cur));
+        const float iconS = 16.0f;
         const float caretW = 13.0f;
-        const bool hit =
-            ImGui::Button(label, ImVec2(btnW(label) + caretW, btnH));
+        const float w = btnW(curLabel) + iconS + 6.0f + caretW;
+
+        const bool hit = ImGui::Button("##editmode_btn", ImVec2(w, btnH));
         const ImVec2 a = ImGui::GetItemRectMin();
         const ImVec2 b = ImGui::GetItemRectMax();
+
+        // 按钮内容全部自绘：ImGui::Button 的标签是**居中**的，没法"左图标
+        // 右文字"，而空标签按钮又只画框 —— 所以图标、文字、小三角都在
+        // 同一个 DrawList 上补（与播放条 transportBtn 同一条经验）。
+        ImDrawList* bdl = ImGui::GetWindowDrawList();
+        const ImU32 fg = ImGui::GetColorU32(ImGuiCol_Text);
+        const float cy = (a.y + b.y) * 0.5f;
+        const float ix = a.x + st.FramePadding.x + 2.0f;
+        paintEditModeIcon(bdl, ImVec2(ix, cy - iconS * 0.5f), iconS, cur, fg);
+        bdl->AddText(ImVec2(ix + iconS + 6.0f,
+                            cy - ImGui::GetTextLineHeight() * 0.5f),
+                     fg, curLabel);
         {
-            const float cy = (a.y + b.y) * 0.5f;
             const float cx = b.x - st.FramePadding.x - 6.0f;
-            ImGui::GetWindowDrawList()->AddTriangleFilled(
-                ImVec2(cx - 4.0f, cy - 2.0f), ImVec2(cx + 4.0f, cy - 2.0f),
-                ImVec2(cx, cy + 3.0f),
-                ImGui::GetColorU32(ImGuiCol_TextDisabled));
+            bdl->AddTriangleFilled(ImVec2(cx - 4.0f, cy - 2.0f),
+                                   ImVec2(cx + 4.0f, cy - 2.0f),
+                                   ImVec2(cx, cy + 3.0f),
+                                   ImGui::GetColorU32(ImGuiCol_TextDisabled));
         }
-        if (hit) ImGui::OpenPopup("##selmode_popup");
-        logRect("TB-SELMODE", a, b);
+
+        if (hit) ImGui::OpenPopup("##editmode_popup");
+        logRect("TB-EDITMODE", a, b);
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(TR("What the left mouse button does in the viewport.\n"
-                              "Current: %s   (Q / W / E / R)"),
-                              TR(modeName));
+            ImGui::SetTooltip("%s\n%s", curLabel, TR(editModeHint(cur)));
         }
-        if (ImGui::BeginPopup("##selmode_popup")) {
-            logRect("TB-SELMODE-WIN", ImGui::GetWindowPos(),
+        if (ImGui::BeginPopup("##editmode_popup")) {
+            logRect("TB-EDITMODE-WIN", ImGui::GetWindowPos(),
                     ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
                            ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
-            ImGui::SeparatorText(TR("Select Mode"));
-            struct Item { GizmoMode m; const char* label; const char* key; };
-            const Item items[] = {
-                {GizmoMode::Select,    "Select", "Q"},
-                {GizmoMode::Translate, "Move",   "W"},
-                {GizmoMode::Rotate,    "Rotate", "E"},
-                {GizmoMode::Scale,     "Scale",  "R"},
-            };
-            for (const Item& it : items) {
-                const bool on = (m_ctx.gizmoMode() == it.m);
-                char item[96];
-                std::snprintf(item, sizeof(item), "%s\t%s", TR(it.label), it.key);
-                if (ImGui::MenuItem(item, nullptr, on)) {
-                    m_ctx.setGizmoMode(it.m);
-                    VK_LOG_INFO("TB-SELMODE mode=%s", it.label);
+            // 行自己管高度（每行 28 px），所以这里把 ItemSpacing 清零 ——
+            // 否则行与行之间会出现一道道竖向空隙，看起来像分组。
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+            for (int i = 0; i < kEditModeCount; ++i) {
+                const EditMode m = static_cast<EditMode>(i);
+                if (!editModeRow(m, cur == m)) continue;
+                if (editModeImplemented(m)) {
+                    m_ctx.setEditMode(m);
+                    VK_LOG_INFO("TB-EDITMODE item=%s", editModeId(m));
+                } else {
+                    // 未实现的模式**不假装切过去**：顶栏显示当前模式、面板
+                    // 跟着开，这是整套 UI 的契约，让一个"切过去了但什么都
+                    // 没有"的模式上屏等于破坏它。给一条明确的提示。
+                    m_ctx.notify(std::string(TR("Not implemented yet: ")) +
+                                 TR(editModeName(m)));
+                    VK_LOG_INFO("TB-EDITMODE todo=%s", editModeId(m));
                 }
-                char tag[64];
-                std::snprintf(tag, sizeof(tag), "TB-SELMODE-ITEM %s", it.label);
-                logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+                ImGui::CloseCurrentPopup();
+                break;
             }
+            ImGui::PopStyleVar();
             ImGui::EndPopup();
         }
     }
+
 
     // ---------------------------------------------------------- ② 添加
     ImGui::SameLine();

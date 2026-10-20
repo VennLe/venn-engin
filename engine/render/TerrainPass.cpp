@@ -121,6 +121,87 @@ std::unique_ptr<rhi::Image> upload2D(rhi::Device& device,
 
 } // namespace
 
+// ============================================================
+// 原地重传一张 2D 图（地形笔刷用）
+//
+// 三段，但只开**一个**一次性 command buffer：
+//   SHADER_READ_ONLY → TRANSFER_DST  (barrier)
+//   vkCmdCopyBufferToImage
+//   TRANSFER_DST → SHADER_READ_ONLY  (barrier)
+// endAndSubmit 内部有 vkQueueWaitIdle，所以 staging 可以直接析构。
+//
+// ⚠ 阶段掩码必须带上 VERTEX_SHADER：高度图是在 terrain.vert 里采样的。
+//   只写 FRAGMENT_SHADER 的话，"上一帧顶点读取"与"这一帧传输写"之间没有
+//   同步关系 —— 表现是刷完当场看不见变化，过一会儿才跳一下。
+//
+// ⚠ 不复用 rhi::Image::transitionLayout：它的阶段表只覆盖
+//   UNDEFINED↔TRANSFER_DST↔SHADER_READ_ONLY 三态，且 dstStage 只到
+//   片元；而且那是"一次提交一次等队列"，两次调用就是两次
+//   vkQueueWaitIdle。
+// ============================================================
+namespace {
+
+bool refillImage2D(rhi::Device& device, rhi::CommandPool& cmdPool,
+                   rhi::Image& img, const void* data, std::size_t bytes) {
+    if (!data || bytes == 0) return false;
+
+    // staging：HOST_VISIBLE + TRANSFER_SRC。**不是** createDeviceLocal ——
+    // 那条路径会再建一个中间缓冲并等一次队列，对 264 KB 的图不划算。
+    rhi::Buffer staging(device, static_cast<VkDeviceSize>(bytes),
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    staging.writeData(data, static_cast<VkDeviceSize>(bytes));
+
+    VkCommandBuffer cmd = cmdPool.beginOneTime();
+
+    VkImageMemoryBarrier b{};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img.get();
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.baseMipLevel = 0;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.baseArrayLayer = 0;
+    b.subresourceRange.layerCount = 1;
+
+    const VkPipelineStageFlags kSampleStages =
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+
+    b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, kSampleStages, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &b);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {img.width(), img.height(), 1};
+    vkCmdCopyBufferToImage(cmd, staging.get(), img.get(),
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, kSampleStages, 0,
+                         0, nullptr, 0, nullptr, 1, &b);
+
+    cmdPool.endAndSubmit(cmd);
+    return true;
+}
+
+} // namespace
+
 TerrainPass::~TerrainPass() { shutdown(); }
 
 bool TerrainPass::init(const InitInfo& info) {
@@ -136,9 +217,9 @@ bool TerrainPass::init(const InitInfo& info) {
     m_renderPass = info.renderPass;
     m_samples = info.samples;
 
-    // ---- set 1：地形专用（4 albedo + 4 normal + 权重 + 高度 + 层参数）----
+    // ---- set 1：地形专用（4 albedo + 4 normal + 权重 + 高度 + 层参数 + 挖洞遮罩）----
     {
-        VkDescriptorSetLayoutBinding b[5]{};
+        VkDescriptorSetLayoutBinding b[6]{};
         b[0].binding = 0;
         b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[0].descriptorCount = 4;
@@ -159,13 +240,20 @@ bool TerrainPass::init(const InitInfo& info) {
         b[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         b[4].descriptorCount = 1;
         b[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        // binding 5：挖洞遮罩（R8_UNORM）。只在片元里 discard 用 ——
+        // 顶点阶段不采，否则"挖穿"会让顶点位置也抖（洞的边缘会出现
+        // 一圈被拉向地心的三角形）。
+        b[5].binding = 5;
+        b[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[5].descriptorCount = 1;
+        b[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         m_terrainSetLayout = rhi::makeSetLayout(
-            *m_device, std::vector<VkDescriptorSetLayoutBinding>(b, b + 5));
+            *m_device, std::vector<VkDescriptorSetLayoutBinding>(b, b + 6));
     }
 
-    // 每实例 1 个 set，各 10 个采样器 + 1 个 UBO
+    // 每实例 1 个 set，各 11 个采样器 + 1 个 UBO
     m_descriptors = std::make_unique<rhi::DescriptorAllocator>(
-        *m_device, 4, 4, 40);
+        *m_device, 4, 4, 44);
 
     createPipeline();
     return m_pipeline != nullptr;
@@ -235,6 +323,20 @@ void TerrainPass::clearInstances() {
         m_instances.clear();
         return;
     }
+    // ⚠ 必须等设备空闲再销毁。
+    //
+    //   这条函数在 CPU 阶段被调用，而此时**前几帧的命令缓冲可能还在 GPU 上
+    //   跑**（帧在飞行中），里面正引用着下面这些 sampler / image / buffer。
+    //   直接 vkDestroy* 会触发验证层错误：
+    //     vkDestroySampler(): sampler can't be called on VkSampler 0x... that
+    //     is currently in use by VkCommandBuffer 0x...
+    //   在真机上这类错误不会崩，只是"随机花屏"；但有些驱动会直接返回
+    //   VK_ERROR_DEVICE_LOST（实测 RTX 上刷地形几秒钟就死，见
+    //   LandscapeEditor 的笔刷路径 —— 它以前每 80 ms 走一次重建）。
+    //
+    //   代价：一次全设备同步。只在"集合变了 / 层材质改了"时才会走到这里，
+    //   笔刷的常规刷新走 refreshSurface，不碰这条路径。
+    m_device->waitIdle();
     for (auto& inst : m_instances) {
         if (inst->heightSampler != VK_NULL_HANDLE) {
             vkDestroySampler(m_device->get(), inst->heightSampler, nullptr);
@@ -244,10 +346,69 @@ void TerrainPass::clearInstances() {
             vkDestroySampler(m_device->get(), inst->splatSampler, nullptr);
             inst->splatSampler = VK_NULL_HANDLE;
         }
+        if (inst->holeSampler != VK_NULL_HANDLE) {
+            vkDestroySampler(m_device->get(), inst->holeSampler, nullptr);
+            inst->holeSampler = VK_NULL_HANDLE;
+        }
     }
     m_instances.clear();
     m_loggedLod = false;
     m_lastLod = LodStats{};
+}
+
+// ============================================================
+// 笔刷的原地刷新（地形雕刻链路的关键一环）
+//
+// 与"重建"的区别就一句话：**不销毁、不新建任何 VkObject**。
+//   · 顶点缓冲不动（terrain.vert 里 pos.z 是采样高度图加出来的）
+//   · sampler / 描述符集不动（图还是那张图，只是内容换了）
+//   · 分块网格与 LOD 不动（块的 XY 中心不依赖高度）
+// 只做两件事：把磁盘上的新数据读回内存，再把 R32/RGBA8 两张图原地重传。
+//
+// 数据来源是**磁盘**而不是编辑器内存里的 vector：编辑器的笔刷本来就要
+// 落盘（渲染层与编辑器是两个独立的所有者，共享同一份 264 KB 的读回成本
+// 远小于再发明一套跨层通道）。读回 ~264 KB，在 12 Hz 下完全无感。
+// ============================================================
+bool TerrainPass::refreshSurface(uint32_t index, bool splatToo, bool holesToo) {
+    if (!m_device || !m_cmdPool || index >= m_instances.size()) return false;
+    Instance& inst = *m_instances[index];
+    if (!inst.heightImage || !inst.splatImage) return false;
+
+    terrain::TerrainAsset fresh;
+    std::string err;
+    if (!terrain::loadTerrain(inst.asset.path, fresh, &err, /*quiet=*/true)) {
+        VK_LOG_ERROR("TERRAIN-REFRESH-FAIL path=%s reason=%s",
+                     inst.asset.path.c_str(), err.c_str());
+        return false;
+    }
+    // 尺寸变了说明资产被换掉了，图片尺寸对不上 → 只能用重建路径
+    if (fresh.heights.size() != inst.asset.heights.size() ||
+        fresh.splat.size() != inst.asset.splat.size()) {
+        VK_LOG_ERROR("TERRAIN-REFRESH-SIZE path=%s got=%zu/%zu want=%zu/%zu",
+                     inst.asset.path.c_str(), fresh.heights.size(),
+                     fresh.splat.size(), inst.asset.heights.size(),
+                     inst.asset.splat.size());
+        return false;
+    }
+
+    inst.asset.heights = std::move(fresh.heights);
+    refillImage2D(*m_device, *m_cmdPool, *inst.heightImage,
+                  inst.asset.heights.data(),
+                  inst.asset.heights.size() * sizeof(float));
+    if (splatToo) {
+        inst.asset.splat = std::move(fresh.splat);
+        refillImage2D(*m_device, *m_cmdPool, *inst.splatImage,
+                      inst.asset.splat.data(), inst.asset.splat.size());
+    }
+    if (holesToo && inst.holeImage &&
+        fresh.holes.size() ==
+            static_cast<std::size_t>(inst.holeImage->width()) *
+                static_cast<std::size_t>(inst.holeImage->height())) {
+        inst.asset.holes = std::move(fresh.holes);
+        refillImage2D(*m_device, *m_cmdPool, *inst.holeImage,
+                      inst.asset.holes.data(), inst.asset.holes.size());
+    }
+    return true;
 }
 
 void TerrainPass::shutdown() {
@@ -381,6 +542,20 @@ bool TerrainPass::createInstanceResources(Instance& inst) {
     inst.splatImage = upload2D(*m_device, *m_cmdPool, w, h,
                                VK_FORMAT_R8G8B8A8_UNORM, inst.asset.splat.data(),
                                inst.asset.splat.size());
+    // 挖洞遮罩：R8。**必须 CLAMP_TO_EDGE + 线性**，与高度图同一套采样规则 ——
+    // 用 REPEAT 的话地形边界外半纹素会采到对边的遮罩，边缘出现"补回来的一圈地"。
+    if (inst.asset.holes.size() ==
+        static_cast<std::size_t>(w) * static_cast<std::size_t>(h)) {
+        inst.holeImage = upload2D(*m_device, *m_cmdPool, w, h,
+                                  VK_FORMAT_R8_UNORM, inst.asset.holes.data(),
+                                  inst.asset.holes.size());
+    } else {
+        // 兜底：全实心（1×1 的 255）。理论上走不到 —— loadTerrain 一定会
+        // 填满这个长度；但少一张图会让描述符写入读到空句柄。
+        const uint8_t solid = 255u;
+        inst.holeImage = upload2D(*m_device, *m_cmdPool, 1, 1,
+                                  VK_FORMAT_R8_UNORM, &solid, 1);
+    }
     // 高度：LINEAR + CLAMP_TO_EDGE。CLAMP 是必需的 —— uv 在边界上正好是
     // 半纹素，REPEAT 会把对边的高度拖过来（地形边缘出现一条"翻折"）。
     inst.heightSampler = makeSampler(*m_device, VK_FILTER_LINEAR,
@@ -388,6 +563,8 @@ bool TerrainPass::createInstanceResources(Instance& inst) {
     // 权重：LINEAR + REPEAT（splatRepeat 允许平铺）
     inst.splatSampler = makeSampler(*m_device, VK_FILTER_LINEAR,
                                     VK_SAMPLER_ADDRESS_MODE_REPEAT);
+    inst.holeSampler = makeSampler(*m_device, VK_FILTER_LINEAR,
+                                   VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
 
     // ---- 层参数 UBO ----
     inst.layerUbo = std::make_unique<rhi::Buffer>(
@@ -419,6 +596,8 @@ bool TerrainPass::createInstanceResources(Instance& inst) {
     m_descriptors->writeBuffer(inst.texSet, 4, inst.layerUbo->get(),
                                sizeof(TerrainLayerGpu) * 4,
                                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+    m_descriptors->writeTexture(inst.texSet, 5, inst.holeSampler,
+                                inst.holeImage->view());
     return true;
 }
 

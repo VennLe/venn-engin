@@ -107,6 +107,20 @@ void EditorContext::applyEditorCameraMode() {
     cam.setClipPlanes(0.1f, 5000.0f);
 }
 
+// 编辑模式切换。**只存状态 + 打日志**：
+//   · 面板跟模式走由 EditorApp 每帧按差做（它才拿得到面板表 / 焦点）；
+//   · 视口的笔刷输入由 ViewportPanel 读本状态；
+//   · 两者都不该在这里被调用 —— 否则"切模式"就成了一次副作用打包。
+//
+// 打日志的条件是"真的变了"：Toolbar 的下拉、脚本钩子、将来可能的快捷键
+// 都会走这里，重复设同一模式不该刷日志（自动化按它断言的）。
+void EditorContext::setEditMode(EditMode m) {
+    if (m == m_editMode) return;
+    m_editMode = m;
+    VK_LOG_INFO("EDITMODE %s implemented=%d", editModeId(m),
+                editModeImplemented(m) ? 1 : 0);
+}
+
 void EditorContext::play() {
     if (m_play == PlayState::Playing) return;
 

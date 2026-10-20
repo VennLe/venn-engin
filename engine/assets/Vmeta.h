@@ -28,6 +28,11 @@
 // ============================================================
 
 #include <array>
+#include <cstddef>   // std::size_t
+#include <cstdint>   // std::uint32_t —— ⚠ 不能靠 <string>/<map> 传递包含：
+                     //   Vmeta.cpp 里本头是**第一个** include，前面没有任何
+                     //   标准头替它把 <cstdint> 拉进来，于是 `std::uint32_t`
+                     //   直接"does not name a type"。头文件必须自足。
 #include <map>
 #include <set>
 #include <string>

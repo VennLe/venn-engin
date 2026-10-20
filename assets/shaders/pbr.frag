@@ -398,6 +398,9 @@ layout(push_constant) uniform Push {
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
 layout(location = 2) in vec2 vUV;
+// 顶点色（Mesh Paint）。默认 (1,1,1,1) → 这一段乘上去是恒等变换，
+// 所以没画过的网格与没有这个通道时逐像素一致。
+layout(location = 3) in vec4 vColor;
 
 layout(location = 0) out vec4 outColor;
 
@@ -1139,7 +1142,10 @@ void main() {
 
     // ---------------- 材质采样 ----------------
     vec4 albedoSample = texture(albedoMap, matUV);
-    vec3 albedo = albedoSample.rgb * push.baseColorFactor.rgb;
+    // 顶点色乘在**贴图与 baseColorFactor 之后**：Mesh Paint 画的是
+    // "把这块表面染成什么颜色"，它应该能压过贴图（否则在深色贴图上
+    // 永远画不出亮色）。alpha 不参与 —— 那是材质的不透明度，不是颜色。
+    vec3 albedo = albedoSample.rgb * push.baseColorFactor.rgb * vColor.rgb;
 #if VENN_ALPHA_BLEND
     // 只有半透明材质才让 albedo 的 alpha 参与输出 —— 管线侧同时开了混合、
     // 关了深度写（见 VariantPipelines::applyKeywordState），两边是一体的。

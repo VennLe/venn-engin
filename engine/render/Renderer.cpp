@@ -2801,6 +2801,14 @@ void Renderer::syncTerrains(scene::Scene& scene) {
     if (!m_terrain || !m_terrain->ready()) return;
 
     std::vector<TerrainItem> items;
+    // 笔刷的轻量刷新请求（实体 id + 要刷哪几张图）。攒起来等
+    // "集合没变"的判定出来再执行 —— 一旦走了重建，刷新就是多余的。
+    struct TerrainRefresh {
+        std::uint32_t entity = 0;
+        bool splatToo = false;
+        bool holesToo = false;
+    };
+    std::vector<TerrainRefresh> refresh;
     scene.forEachTerrain([&](ecs::Entity e, ecs::TerrainComponent& tc) {
         TerrainItem it;
         it.entity = e.id;
@@ -2812,6 +2820,12 @@ void Renderer::syncTerrains(scene::Scene& scene) {
             tc.dirty = false;
             // 层材质改了 → 位掩码/贴图/UBO 都在实例里，只能重建
             m_terrainEntities.clear();
+        }
+        if (tc.heightsDirty || tc.splatDirty || tc.holesDirty) {
+            refresh.push_back({e.id, tc.splatDirty, tc.holesDirty});
+            tc.heightsDirty = false;
+            tc.splatDirty = false;
+            tc.holesDirty = false;
         }
         items.push_back(std::move(it));
     });
@@ -2849,6 +2863,22 @@ void Renderer::syncTerrains(scene::Scene& scene) {
             inst->heightScale = (items[i].heightScale > 1.0e-4f)
                                     ? items[i].heightScale
                                     : 1.0f;
+        }
+
+        // ---- 笔刷刷新：只重传高度图 / 权重图 ----
+        // m_terrainEntities[i] 与 instanceAt(i) 同序（都是建成功的才 push），
+        // 所以按实体 id 反查下标即可。
+        for (const auto& r : refresh) {
+            std::size_t idx = m_terrainEntities.size();
+            for (std::size_t i = 0; i < m_terrainEntities.size(); ++i) {
+                if (m_terrainEntities[i] == r.entity) { idx = i; break; }
+            }
+            if (idx >= m_terrainEntities.size()) continue;   // 没建成的实体
+            if (!m_terrain->refreshSurface(static_cast<uint32_t>(idx), r.splatToo,
+                                           r.holesToo)) {
+                // 读不回/尺寸变了 → 退回重建（下一帧走 !same 分支）
+                m_terrainEntities.clear();
+            }
         }
     }
 }

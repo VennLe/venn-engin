@@ -10,9 +10,12 @@
     "__TEMPLATE_ID__"
   ],
   "files": [
+    "README.md",
     "assets/game.json",
     "assets/scenes/main.json",
     "assets/scripts/main.vks",
+    "assets/scripts/pickup.vks",
+    "assets/scripts/portal.vks",
     "config/render.json"
   ]
 }

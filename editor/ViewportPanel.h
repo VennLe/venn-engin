@@ -63,11 +63,34 @@ class Renderer;
 
 namespace editor {
 
+class LandscapeEditor;
+class FoliageEditor;
+
 class ViewportPanel {
 public:
     ViewportPanel(EditorContext& ctx, render::Renderer& renderer);
 
     void draw();
+
+    // 2026-10-20：挂上两个"编辑模式工具"（地形 / 植被）。
+    //
+    // 为什么由视口转发明键鼠，而不是让面板自己读 ImGui：视口是唯一知道
+    // "鼠标在哪一格、这一下点进没点进 3D 画面、右键是不是在转相机"的地方。
+    // 工具只认"给我一条射线 + 是不是按下"，其余判定全在这里。
+    // 指针可以不挂（headless / 单测），都判空。
+    void attachModeTools(LandscapeEditor* landscape, FoliageEditor* foliage) {
+        m_landscapeEditor = landscape;
+        m_foliageEditor = foliage;
+    }
+    // 2026-10-20 晚：另外两个模式也要视口交互（顶点色绘制 / 刷子体放置）。
+    // 单独一个入口而不是把 attachModeTools 改成四个参数：它已经被
+    // EditorApp 调用，加参数会让"没挂工具"的调用点全部要改（headless 测试）。
+    void attachToolkitTools(class MeshPaintEditor* paint, class BrushEditor* brush,
+                            class ModelingEditor* modeling = nullptr) {
+        m_meshPaintEditor = paint;
+        m_brushEditor = brush;
+        m_modelingEditor = modeling;
+    }
 
     // 手柄是否正在拖拽（Toolbar 之类的状态显示用）
     bool gizmoDragging() const { return m_gizmo.dragging(); }
@@ -162,6 +185,14 @@ private:
     PickingSystem m_picking;
     GizmoController m_gizmo;
     ColliderView m_colliders;
+
+    // 编辑模式工具（**不拥有**；生命周期归 EditorApp）。
+    // 见 attachModeTools：视口只负责把射线与键鼠状态发过去。
+    LandscapeEditor* m_landscapeEditor = nullptr;
+    FoliageEditor* m_foliageEditor = nullptr;
+    class MeshPaintEditor* m_meshPaintEditor = nullptr;
+    class BrushEditor* m_brushEditor = nullptr;
+    class ModelingEditor* m_modelingEditor = nullptr;
 
     std::uint32_t m_requestedW = 0;
     std::uint32_t m_requestedH = 0;

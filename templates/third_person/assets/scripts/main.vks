@@ -1,14 +1,97 @@
-# main.vks —— __PROJECT_NAME__ · 第三人称模板（__TEMPLATE_ID__）
+# ============================================================
+# main.vks --- __PROJECT_NAME__ 的游戏逻辑主脚本
+# 模板: __TEMPLATE_ID__   (VKS, 挂在 Player 实体上)
+# ============================================================
 #
-# 改这个文件，保存，编辑器里立刻热重载（不用重编译引擎）。
-# 这一行 print 是"脚本真的跑起来了"的观测点。
-let t = 0
+# 【引擎负责什么，脚本负责什么】
+#   C++ 引擎负责"能力"：渲染、物理、角色控制器（走/跑/跳）、输入采集。
+#   "玩法"全部写在这个 .vks 里 --- 不需要编译 C++，改一行、保存，
+#   编辑器立刻热重载（Console 里会多一行 VKS-RELOAD）。
+#
+# 【本工程的脚本分工】
+#   assets/scripts/main.vks     本文件：挂在 Player 上，管全局流程 / 胜负
+#   assets/scripts/pickup.vks   挂在 5 个 Pickup_* 光球上，管"被捡走"
+#   assets/scripts/portal.vks   挂在 Portal 上，管"收齐后点亮自己"
+#
+#   ⚠ 为什么"点亮传送门"不写在主脚本里：setEmissive 是**只对自己生效**的
+#     （它没有实体参数，改的是执行它的那个实体的材质）。想在 A 脚本里改
+#     B 的材质，只能给 B 自己挂一份脚本。这条限制是有意的 —— 见规则 ②。
+#
+# 【VKS 速查】
+#   let x = 0                 声明（文件开头的 let 先于 on start 生效）
+#   x = x + dt                赋值；变量跨帧存活（不是局部变量）
+#   if (...) { ... } else { ... }
+#   while (...) { ... }       foreach (e in 列表) { ... }
+#   on start { ... }          实例第一次执行前跑一次
+#   on update { ... }         每帧跑一次
+#   实体: self()  player()  find("名字")  exists(e)  name(e)
+#   变换: pos(e)  setPos(e, vec3)  rot(e)  setRot(e, vec3)
+#         visible(e)  setVisible(e, b)
+#   材质: setEmissive(r, g, b)        <-- 只改【自己】的材质，见规则 ②
+#   查询: dist(a, b)   near(center, 半径[, 上限])
+#   黑板: worldAttr(k[, 默认])  setWorldAttr(k, v)   全局、进存档
+#         attr(e, k[, 默认])    setAttr(e, k, v)     逐实体
+#   输入: pressed("Jump")  held("Sprint")  released("Interact")
+#         axis("MoveForward")     <-- 参数是 InputMap 里的动作名，不是键码
+#   表现: print(...)  popup(数字)
+#   协程: wait(秒)  waitFrames(n)  waitUntil(条件)   挂起这一句，不卡帧
+#   数学: sin cos atan2 abs floor ceil round sqrt pow min max clamp lerp
+#
+# 【三条硬规则】
+#   ① 角色移动交给 C++ 的 character 组件。不要在脚本里 setPos(player)：
+#      物理步进会把位置改回去，表现为"走两步被拽回原地"，且日志无痕迹。
+#   ② setEmissive 只能改【自己】的材质（没有实体参数），而且材质是按名字
+#      共享的。想让某个物体单独发光，给它一个独立的材质名 —— 场景里 5 个
+#      光球就是这么做的（template_pickup_1..5）。共用名字时，改一个会改全部。
+#   ③ "靠近了没有"用 dist() 判断，不要用 on collide：编辑器的 Play 态没有
+#      接触事件（只有运行时 Game.exe 有），同一份脚本在编辑器里会一动不动。
+# ============================================================
+
+# ---------------- 可调参数（集中在文件开头，方便调手感） ----------------
+let TOTAL = 5              # 光球总数（= 场景里 Pickup_* 的个数）
+let TIME_LIMIT = 120.0     # 限时（秒）；写 0 表示不限时
+
+# ---------------- 运行期状态（跨帧存活） ----------------
+let t = 0                  # 本局已过秒数
+let picked = 0             # 已收集光球数
+let lastPicked = -1        # 上一次读到的黑板值（只在变化时打日志）
+let done = 0               # 0=进行中  1=通关  2=超时
 
 on start {
-    print("HELLO", "__PROJECT_NAME__")
-    print("MODE", "third_person")
+    print("GAME-READY", "__PROJECT_NAME__")
+    print("GAME-MODE", "__TEMPLATE_ID__")
+    print("GAME-OBJ collect", TOTAL, "orbs before the timer runs out")
+
+    # 从零开始计分：世界黑板是进存档的，重开一局要清掉上一次的进度。
+    # 正式项目想"接着上次玩"，把这两行换成读档即可。
+    setWorldAttr("picked", 0)
+    setWorldAttr("total", TOTAL)   # 给 portal.vks 读（脚本之间靠黑板通信）
+    lastPicked = -1
+    setHealth(100)
 }
 
 on update {
     t = t + dt
+
+    # ---- 1. 收集进度：只在黑板变化时打日志（否则每帧一行，刷爆 Console）----
+    picked = worldAttr("picked", 0)
+    if (picked != lastPicked) {
+        lastPicked = picked
+        print("SCORE", picked, "/", TOTAL)
+    }
+
+    # ---- 2. 胜负判定 ----
+    #   "收齐 = 通关"。刻意的：终点不该依赖"玩家必须找到一个特定位置"，
+    #   模板的第一局要保证**一定能走完**。传送门是奖励性的视觉反馈
+    #   （portal.vks 负责点亮），不是必需条件。
+    if (done == 0 && picked >= TOTAL) {
+        done = 1
+        print("GAME-COMPLETE t=", t)
+        popup(100)
+        setHealth(100)
+    }
+    if (done == 0 && TIME_LIMIT > 0.0 && t > TIME_LIMIT) {
+        done = 2
+        print("GAME-TIMEOUT t=", t)
+    }
 }

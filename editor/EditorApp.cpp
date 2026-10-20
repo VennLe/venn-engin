@@ -20,6 +20,9 @@
 #include "EditorScene.h"
 #include "InputMapIO.h"
 #include "InspectorPanel.h"
+#include "LandscapeEditor.h"
+#include "FoliageEditor.h"
+#include "ToolkitEditors.h"
 #include "KeyBindingsPage.h"
 #include "PanelRegistry.h"
 #include "ParticlesPanel.h"
@@ -340,6 +343,27 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         // 偶尔打开的面板（跟 Physics / Particles 同款），不该占 Alt+N。
         {"quality", "Quality Settings", PanelGroup::Authoring, "", "sliders",
          false, true, kSlotNone, &EditorApp::panelDrawQuality},
+        // ---- 2026-10-20：编辑模式自带的两个编辑器 ----
+        // 它们的显隐**跟顶栏的编辑模式走**（见 serviceEditMode），但仍然是
+        // 普通面板表项 —— View 菜单、快捷键、布局持久化、底栏托盘自动跟上。
+        {"landscape", "Landscape", PanelGroup::Authoring, "", "mountain",
+         false, true, kSlotNone, &EditorApp::panelDrawLandscape},
+        {"foliage", "Foliage", PanelGroup::Authoring, "", "leaf",
+         false, true, kSlotNone, &EditorApp::panelDrawFoliage},
+        // 2026-10-20 晚：下拉里其余 6 个模式的面板。同一套约定 ——
+        // 显隐跟 EditMode 走，但仍是普通表项（View 菜单 / 托盘 / 落盘都跟得上）。
+        {"meshpaint", "Mesh Paint", PanelGroup::Authoring, "", "palette",
+         false, true, kSlotNone, &EditorApp::panelDrawMeshPaint},
+        {"modeling", "Modeling", PanelGroup::Authoring, "", "cube",
+         false, true, kSlotNone, &EditorApp::panelDrawModeling},
+        {"fracture", "Fracture", PanelGroup::Authoring, "", "bolt",
+         false, true, kSlotNone, &EditorApp::panelDrawFracture},
+        {"brushedit", "Brush Editing", PanelGroup::Authoring, "", "brush",
+         false, true, kSlotNone, &EditorApp::panelDrawBrushEdit},
+        {"animation", "Animation", PanelGroup::Authoring, "", "play",
+         false, true, kSlotNone, &EditorApp::panelDrawAnimation},
+        {"pcg", "PCG", PanelGroup::Authoring, "", "nodes",
+         false, true, kSlotNone, &EditorApp::panelDrawPCG},
     };
 }
 
@@ -394,6 +418,33 @@ void EditorApp::panelDrawParticles(EditorApp& a) {
 // 于是它可以在没有设备的情况下被构造 —— 与 Physics/Particles 的差别仅此。
 void EditorApp::panelDrawQuality(EditorApp& a) {
     if (a.m_qualityPanel) a.m_qualityPanel->draw();
+}
+
+// 2026-10-20：两个编辑模式各自的面板。它们自己判 panelOpenRef，所以这里
+// 只要指针非空就转发 —— 与 Physics / Particles 同一条写法。
+void EditorApp::panelDrawLandscape(EditorApp& a) {
+    if (a.m_landscape) a.m_landscape->drawPanel();
+}
+void EditorApp::panelDrawFoliage(EditorApp& a) {
+    if (a.m_foliage) a.m_foliage->drawPanel();
+}
+void EditorApp::panelDrawMeshPaint(EditorApp& a) {
+    if (a.m_meshPaint) a.m_meshPaint->drawPanel();
+}
+void EditorApp::panelDrawModeling(EditorApp& a) {
+    if (a.m_modeling) a.m_modeling->drawPanel();
+}
+void EditorApp::panelDrawFracture(EditorApp& a) {
+    if (a.m_fracture) a.m_fracture->drawPanel();
+}
+void EditorApp::panelDrawBrushEdit(EditorApp& a) {
+    if (a.m_brushEdit) a.m_brushEdit->drawPanel();
+}
+void EditorApp::panelDrawAnimation(EditorApp& a) {
+    if (a.m_animation) a.m_animation->drawPanel();
+}
+void EditorApp::panelDrawPCG(EditorApp& a) {
+    if (a.m_pcg) a.m_pcg->drawPanel();
 }
 
 void EditorApp::drawPlaceholderPanel(int panelIndex) {
@@ -489,6 +540,135 @@ void EditorApp::collectSplitOccluders() {
         m_split->addOccluder(w->Pos.x, w->Pos.y, w->Pos.x + w->Size.x,
                              w->Pos.y + w->Size.y);
     }
+}
+
+// ============================================================
+// 编辑模式（2026-10-20）
+// ============================================================
+//
+// 顶栏那颗下拉只负责改 EditorContext 里的状态；"开哪个面板 / 关哪个面板 /
+// 写未落盘的改动"全在这里做 —— 因为只有 EditorApp 同时拿得到面板表、
+// 焦点请求和两个编辑器的裸指针。
+//
+// 为什么用**差量**而不是在 Toolbar 的点击回调里直接调：
+//   · 模式还可能从别处改（环境变量钩子、将来 Foliage 面板里的
+//     "去建地形"按钮、脚本）；
+//   · 回调里做副作用会让"切模式"变成一次打包动作，很难测。
+// 编辑模式 → 它自己的面板 id（`PanelDesc::id`）。Select 没有面板：它就是
+// "点一下选中、W/E/R 变换"，面板是 Inspector。所以这里返回 nullptr。
+//
+// 抽成表而不是在 serviceEditMode 里写九个 if：九个模式里只有 Select 特例，
+// 剩下八个完全同构（关旧面板 / 开新面板 / sync / focus），一份表就够。
+// Toolbar 里那颗下拉也是按 EditMode 顺序枚举的 —— 加模式时这两处必须一起改。
+static const char* editModePanelId(EditMode m) {
+    switch (m) {
+        case EditMode::Landscape: return "landscape";
+        case EditMode::Foliage:   return "foliage";
+        case EditMode::MeshPaint: return "meshpaint";
+        case EditMode::Modeling:  return "modeling";
+        case EditMode::Fracture:  return "fracture";
+        case EditMode::BrushEdit: return "brushedit";
+        case EditMode::Animation: return "animation";
+        case EditMode::PCG:       return "pcg";
+        case EditMode::Select:    return nullptr;
+    }
+    return nullptr;
+}
+
+void EditorApp::serviceEditMode() {
+    // ---- 自动化：MYVK_LANDSCAPE_AUTOCREATE=1 ----
+    // 前 30 帧什么都别做：场景还要加载、面板要第一次落位。等到场景稳定
+    // 再建地形，否则 createTerrain 会挂在"场景已被替换"的旧句柄上。
+    if (m_autoCreateTerrain && !m_autoCreateDone && m_editorFrames >= 30) {
+        m_autoCreateDone = true;
+        if (m_landscape && !m_landscape->hasTerrain()) {
+            m_ctx->setEditMode(EditMode::Landscape);
+            m_landscape->createWithCurrentSettings();
+            VK_LOG_INFO("LS-AUTOCREATE done");
+        }
+    }
+
+    const EditMode cur = m_ctx->editMode();
+    const EditMode prev = m_lastEditMode;
+
+    // ---- 每帧都要跑的：动画时间轴 ----
+    // 必须在下面的 `cur == prev` 早退**之前**：切模式只发生一次，而播放要
+    // 逐帧推进。`AnimationEditor::sync` 自己会在没播放时立刻返回。
+    //
+    // 只在 Animation 模式下推进（而不是无条件）：用户切走之后时间轴就该停，
+    // 否则"在建模面板里改着网格，选中物体还在偷偷移动"。
+    if (cur == EditMode::Animation && m_animation) m_animation->sync();
+
+    if (cur == prev) return;
+    m_lastEditMode = cur;
+
+    // 离开地形模式：把最后一笔没赶上的落盘写完
+    if (prev == EditMode::Landscape && m_landscape) m_landscape->flush();
+
+    // 面板跟模式一一对应：先关掉上一个模式的编辑器（不叠加）
+    const char* prevId = editModePanelId(prev);
+    if (prevId) {
+        const int prevIdx = panelIndexOf(prevId);
+        if (prevIdx >= 0) setPanelOpen(prevIdx, false);
+    }
+
+    // ---- 打开新模式的编辑器 + 把相机对到能看见东西的地方 ----
+    const char* curId = editModePanelId(cur);
+    const int curIdx = curId ? panelIndexOf(curId) : -1;
+    if (curIdx >= 0) setPanelOpen(curIdx, true);
+
+    switch (cur) {
+        case EditMode::Landscape:
+            if (m_landscape) {
+                m_landscape->sync();
+                if (m_landscape->hasTerrain()) m_landscape->focusCamera();
+            }
+            break;
+        case EditMode::Foliage:
+            if (m_foliage) {
+                m_foliage->sync();
+                if (m_landscape && m_landscape->hasTerrain()) {
+                    m_landscape->focusCameraClose();
+                }
+            }
+            break;
+        // 下面六个的 sync 都是"把选中项重新绑一遍"：切过来的时候选中项可能
+        // 已经换了（在 Select 模式下点的另一个物体）。
+        case EditMode::MeshPaint:
+            if (m_meshPaint) m_meshPaint->sync();
+            break;
+        case EditMode::Modeling:
+            if (m_modeling) m_modeling->sync();
+            break;
+        case EditMode::Fracture:
+            if (m_fracture) m_fracture->sync();
+            break;
+        case EditMode::BrushEdit:
+            if (m_brushEdit) m_brushEdit->sync();
+            break;
+        case EditMode::Animation:
+            if (m_animation) m_animation->sync();
+            break;
+        case EditMode::PCG:
+            if (m_pcg) m_pcg->sync();
+            break;
+        case EditMode::Select:
+            m_ctx->setStatus(TR("Select mode: click to pick, W/E/R to transform"));
+            break;
+    }
+
+    if (curId) focusPanel(curId);
+
+    // 日志：老字段（landscape/foliage）保留 —— 已有脚本按它断言；新字段
+    // `panel`/`open` 覆盖全部八个有面板的模式。
+    const int lsIdx = panelIndexOf("landscape");
+    const int foIdx = panelIndexOf("foliage");
+    VK_LOG_INFO("EDITMODE-PANELS mode=%s landscape=%d foliage=%d panel=%s open=%d",
+                editModeId(cur),
+                (lsIdx >= 0 && panelOpen(lsIdx)) ? 1 : 0,
+                (foIdx >= 0 && panelOpen(foIdx)) ? 1 : 0,
+                curId ? curId : "-",
+                (curIdx >= 0 && panelOpen(curIdx)) ? 1 : 0);
 }
 
 void EditorApp::drawPanels() {
@@ -810,6 +990,16 @@ void EditorApp::onInit() {
                         m_printLog.begin() + static_cast<std::ptrdiff_t>(
                                                  m_printLog.size() - 200));
                 }
+                // 脚本的 print 默认只进面板（用户脚本可能每帧打印，落日志
+                // 会淹掉它）。自动化需要"脚本真的跑起来了"的硬证据，所以给
+                // 一个显式开关：`MYVK_LOG_SCRIPT_PRINT=1`。
+                static const bool logPrints = [] {
+                    const char* e = std::getenv("MYVK_LOG_SCRIPT_PRINT");
+                    return e && e[0] == '1';
+                }();
+                if (logPrints)
+                    VK_LOG_INFO("VKS-PRINT %s: %s", inst.path.c_str(),
+                                line.c_str());
             });
         // ⚠ 日志措辞与 S0 之前**逐字相同**：
         //   "Script not runnable (path): msg" / "Script runtime error (path): msg"
@@ -866,6 +1056,23 @@ void EditorApp::onInit() {
     // ImGuiManager::init 用出厂主题画的，不改这一步存档就形同虚设。
     applyAppearance();
     m_viewport = std::make_unique<ViewportPanel>(*m_ctx, renderer());
+    // 2026-10-20：地形 / 植被两个编辑模式。必须先于 ViewportPanel 的
+    // attach 构造 —— 视口每帧要把"模式工具"的输入转发给它们。
+    m_landscape = std::make_unique<LandscapeEditor>(*m_ctx);
+    // 2026-10-20 晚：编辑模式下拉里其余 6 个模式的实现（ToolkitEditors.h）。
+    // PCG 要问地形高度/坡度，所以拿 landscape 的引用；其余只要 ctx。
+    m_meshPaint = std::make_unique<MeshPaintEditor>(*m_ctx);
+    m_modeling = std::make_unique<ModelingEditor>(*m_ctx);
+    m_fracture = std::make_unique<FractureEditor>(*m_ctx);
+    m_brushEdit = std::make_unique<BrushEditor>(*m_ctx);
+    m_animation = std::make_unique<AnimationEditor>(*m_ctx);
+    if (m_landscape) {
+        m_pcg = std::make_unique<PCGEditor>(*m_ctx, *m_landscape);
+    }
+    m_foliage = std::make_unique<FoliageEditor>(*m_ctx, *m_landscape);
+    m_viewport->attachModeTools(m_landscape.get(), m_foliage.get());
+    m_viewport->attachToolkitTools(m_meshPaint.get(), m_brushEdit.get(),
+                                 m_modeling.get());
     m_hierarchy = std::make_unique<SceneHierarchy>(*m_ctx);
     m_inspector = std::make_unique<InspectorPanel>(*m_ctx);
     m_content = std::make_unique<ContentBrowser>(*m_ctx);
@@ -882,6 +1089,25 @@ void EditorApp::onInit() {
     loadEditorLayoutFromDisk();
     // 读盘会把面板显隐整份覆盖掉 → 显式 env 钩子要在它之后重新落一次
     if (std::getenv("MYVK_ENGINE_PANEL")) m_ctx->panels().engine = true;
+
+    // ---- 编辑模式（2026-10-20）----
+    // MYVK_EDITMODE=<select|landscape|foliage|...>：启动即进该模式。
+    // 自动化用它避开"点顶栏下拉"这条含 UI 坐标的路径（下拉还要先点开）。
+    if (const char* m = std::getenv("MYVK_EDITMODE")) {
+        bool hit = false;
+        for (int i = 0; i < kEditModeCount; ++i) {
+            const EditMode em = static_cast<EditMode>(i);
+            if (std::strcmp(editModeId(em), m) != 0) continue;
+            m_ctx->setEditMode(em);
+            // ⚠ 故意**不**同步 m_lastEditMode：让第一帧 serviceEditMode 看到
+            //   "从 Select 切到了 X"的差量，于是面板 / 焦点 / 相机一次性到位。
+            hit = true;
+            break;
+        }
+        if (!hit) VK_LOG_WARN("MYVK_EDITMODE: 未知模式 '%s'", m);
+    }
+    // MYVK_LANDSCAPE_AUTOCREATE=1：第 30 帧在空场景里建一片默认地形。
+    m_autoCreateTerrain = std::getenv("MYVK_LANDSCAPE_AUTOCREATE") != nullptr;
 
     // MYVK_EDITOR_WORKSPACE=<level|rendering|character|animation|cinematic|debug>
     if (const char* ws = std::getenv("MYVK_EDITOR_WORKSPACE")) {
@@ -2158,6 +2384,12 @@ void EditorApp::preloadScripts() {
             ++failed;
             m_scripts->logLine("[compile] " + p + " > " +
                                a->lastError().toString());
+            // ⚠ 同时进日志：面板只在用户打开 Scripts 面板时可见，而
+            //   "模板脚本编译失败"是**新建工程第一眼**就该看见的事。
+            //   以前只写面板 → 日志里只有一句 `1 with errors`，查不下去。
+            VK_LOG_WARN("Editor: script compile error '%s' line %d: %s",
+                        p.c_str(), a->lastError().line,
+                        a->lastError().message.c_str());
         }
     }
     VK_LOG_INFO("Editor: precompiled %zu script(s), %d with errors",
@@ -2678,7 +2910,25 @@ void EditorApp::handleShortcuts() {
     // 先跑：它们内部自带"不是 Shift 层就直接返回"的判断，放在这里是为了
     // 排在视口那套之前，免得被它的 return 吞掉。
     m_viewport->handleOverlayShortcuts();
+
+    // ---- Modeling 模式的网格编辑快捷键（Blender 键位）----
+    // **必须排在 handleViewShortcuts 之前**：那个函数认主键盘 1/3/7 当
+    // "视图方向"，而建模模式里 1/2/3 是"顶点/边/面"。顺序反过来就永远
+    // 切不到顶点模式（1 被当成"看 -Y"）。
+    // 内部自带 `editMode == Modeling` 判断与模态处理，返回 true = 已吃掉。
+    if (m_modeling && m_modeling->handleKeys()) return;
+
     if (!io.KeyAlt) m_viewport->handleViewShortcuts();
+
+    // ---- 地形笔刷快捷键 ----
+    // 必须排在 `if (io.KeyCtrl)` 之前：那一支会把 Ctrl+Z 交给
+    // EditorContext::undo()，也就是**整场景快照**回滚 —— 在刷地形时那是
+    // 灾难（一笔撤不掉，反而把所有实体和相机弹回去）。地形的高度图不在
+    // 场景里，它有自己的笔划撤销栈（见 LandscapeEditor::undoStroke）。
+    if (m_ctx->editMode() == EditMode::Landscape && m_landscape &&
+        m_landscape->handleShortcuts()) {
+        return;
+    }
 
     if (io.KeyCtrl) {
         if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) m_ctx->undo();
@@ -2883,6 +3133,11 @@ void EditorApp::onImGui() {
 
     // 菜单栏 + 工具栏（菜单里的 Panel ▸ / Workspace ▸ 都由注册表生成）
     m_toolbar->draw();
+
+    // 编辑模式（2026-10-20）：模式变了就开关对应的编辑器面板。
+    // 必须排在 drawPanels **之前** —— 面板的显隐在这一帧就要定下来，
+    // 晚一帧会出现"点了地形模式、面板闪一下才出来"。
+    serviceEditMode();
 
     // E04：所有面板**表驱动**绘制。顺序 = 表里的顺序（主面板在前、
     // 浮动调试面板在后），与改造前逐条一致。

@@ -217,6 +217,54 @@ struct AnimatorComponent {
     std::unordered_map<std::string, bool> triggerParams;
 };
 
+// ---------------- 实体 transform 关键帧（编辑器 Animation 模式）----------------
+//
+// 和上面的 `AnimatorComponent` **不是一回事**，两个都要有：
+//
+//   AnimatorComponent  播的是**骨骼动画片段**（导入的 clip / 状态机）。
+//                      它动的是 joints，实体自己的 transform 很可能一点不变；
+//                      数据来自 `.anim.json` 资产，实体上只存播放状态。
+//
+//   AnimationClipComponent  动的是**实体自身的 transform**（升降平台、
+//                      平移门、旋转的机关）。没有骨架、没有 clip 资产、
+//                      不需要蒙皮 —— 就是几组"时刻 → TRS"，直接存在场景里。
+//
+// 为什么不塞进 AnimatorComponent 里加个 `keys` 字段：这两者的时间轴语义
+// 不同（骨骼动画的时间是 clip 内时间，这里的是一段独立的轨道），混在一起
+// 之后播放器要判断"这次到底该驱动哪一层"，而 Inspector 上一个组件会同时
+// 出现两套互斥的参数。
+//
+// ⚠ 关键帧是**场景数据**，必须进序列化（`je["animClip"]`）。第一版把
+//   它们放在 `AnimationEditor::m_keys` 里，于是存盘再开全没了 —— 那一版的
+//   注释还写着"not saved with the scene yet"，这才是真正的缺口。
+struct TransformKey {
+    float t = 0.0f;
+    glm::vec3 position{0.0f};
+    glm::vec3 rotation{0.0f};   // 欧拉角（弧度），与 TransformComponent 同序
+    glm::vec3 scale{1.0f};
+};
+
+struct AnimationClipComponent {
+    // 按 t 升序（写入时排序，读档时也排一次 —— 手改 JSON 的顺序不能信）
+    std::vector<TransformKey> keys;
+
+    // 时间轴总长（秒）。**不强制等于最后一帧的时刻**：留着尾部空白是常见
+    // 做法（"播完停一会儿再循环"），所以它是独立的字段而不是 keys.back().t。
+    float duration = 4.0f;
+    bool loop = true;
+
+    // 场景一打开就播。编辑器里默认关掉 —— 否则一进场景所有带轨道的物体
+    // 都在动，根本没法摆平面。
+    bool autoplay = false;
+
+    // ---- 运行时（不参与"权威状态"，但存盘）----
+    // 播放头存盘是为了"存盘那一刻播到哪，重开就接在哪"。这跟 AnimatorComponent
+    // 的 time 一样。注意 `playing` **不存**：重开场景时是否在播由 autoplay
+    // 决定，不该由"上次退出时刚好在播"决定。
+    float time = 0.0f;
+    bool playing = false;
+};
+
 // ---------------- 碰撞体 ----------------
 //
 // 碰撞体是**独立于渲染网格**的一块凸几何：默认按网格生成（凸包紧紧包住
@@ -1067,6 +1115,23 @@ struct TerrainComponent {
     // 所以把 dirty 置位即可 —— 渲染层下一帧会重建。
     std::string layerOverrides[4];
     bool dirty = false;
+
+    // ---- 地形笔刷专用的轻量脏标记 ----
+    //
+    // 为什么不能复用上面的 dirty：dirty 走的是"销毁实例 → 重读资产 → 重建
+    // 顶点/纹理/sampler/描述符"，一次 ~10 ms 且必须等 GPU 空闲。凭空刷地形
+    // 每 80 ms 触发一次，几秒钟就会把设备拖死（实测 VK_ERROR_DEVICE_LOST）。
+    //
+    // 而 terrain.vert 里高度是**在顶点着色器里采样高度图**加出来的
+    // （pos.z += texture(heightMap, uv).r * maxHeight），顶点本身是平坦格子 ——
+    // 所以改高度只需要把那张 R32 图原地重传一遍：VBO、sampler、描述符、
+    // 分块全部不动。264 KB 的数据量，不重建任何对象。
+    bool heightsDirty = false;   // 高度图变了（刷高/降低/平滑/压平）
+    bool splatDirty = false;     // 权重图变了（层绘制）
+    // 挖洞遮罩变了（Hole 笔刷）。单独一位而不是"跟着 heightsDirty 一起刷"：
+    // 遮罩只有 66 KB，但它走的是**另一张图**，混进高度那条路径会让
+    // "只改了高度"的笔画多传一次遮罩（12 Hz 下是纯浪费）。
+    bool holesDirty = false;
 };
 
 } // namespace ecs

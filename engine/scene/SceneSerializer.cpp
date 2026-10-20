@@ -13,6 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <fstream>
@@ -746,6 +747,12 @@ assets::Mesh* resolveMesh(assets::AssetManager& am, const json& jm) {
         if (shape == "plane") return am.plane(size, name);
         if (shape == "sphere") return am.sphere(size, name, segments, rings);
         if (shape == "cylinder") return am.cylinder(size, name, segments);
+        // 植被（2026-10-20）：撒点生成的实例是普通实体，所以它们必须
+        // 能被重建 —— 否则"存盘再打开，植被全没了"，而日志一条错都没有。
+        if (shape == "grass") return am.grass(size, name);
+        if (shape == "tree") return am.tree(size, name);
+        if (shape == "flower") return am.flower(size, name);
+        if (shape == "rock") return am.rock(size, name);
         VK_LOG_WARN("SceneSerializer: unknown builtin shape '%s'", shape.c_str());
         return nullptr;
     }
@@ -1310,6 +1317,70 @@ bool animatorFromJson(assets::AssetManager& am, const json& j,
     out.boolParams.clear();
     out.triggerParams.clear();
     return true;
+}
+
+// ---------------- 实体 transform 关键帧轨道 ----------------
+//
+// 与上面的 animator（骨骼片段）刻意分开，理由见 Components.h。这里只是
+// 一段"时刻 → TRS"的数组，读写都直白。
+//
+// 两个刻意的取舍：
+//   · `playing` 不写盘 —— 重开场景时是否在播由 autoplay 决定，而不是由
+//     "上次退出那一刻刚好在播"决定（否则每次开场景都在动）。
+//   · `time` 写盘 —— 播放头位置是用户的观察点，重开接着看是符合预期的。
+json animClipToJson(const ecs::AnimationClipComponent& c) {
+    json j;
+    j["duration"] = c.duration;
+    j["loop"] = c.loop;
+    j["autoplay"] = c.autoplay;
+    j["time"] = c.time;
+    json arr = json::array();
+    for (const ecs::TransformKey& k : c.keys) {
+        arr.push_back(json{
+            {"t", k.t},
+            {"pos", vec3ToJson(k.position)},
+            {"rot", vec3ToJson(k.rotation)},
+            {"scale", vec3ToJson(k.scale)},
+        });
+    }
+    j["keys"] = std::move(arr);
+    return j;
+}
+
+ecs::AnimationClipComponent animClipFromJson(const json& j) {
+    ecs::AnimationClipComponent c;
+    if (!j.is_object()) return c;
+    c.duration = j.value("duration", 4.0f);
+    c.loop = j.value("loop", true);
+    c.autoplay = j.value("autoplay", false);
+    c.time = j.value("time", 0.0f);
+    if (j.contains("keys") && j["keys"].is_array()) {
+        for (const json& jk : j["keys"]) {
+            if (!jk.is_object()) continue;
+            ecs::TransformKey k;
+            k.t = jk.value("t", 0.0f);
+            k.position =
+                vec3FromJson(jk.contains("pos") ? jk["pos"] : json(), k.position);
+            k.rotation =
+                vec3FromJson(jk.contains("rot") ? jk["rot"] : json(), k.rotation);
+            k.scale =
+                vec3FromJson(jk.contains("scale") ? jk["scale"] : json(), k.scale);
+            c.keys.push_back(k);
+        }
+        // 手改过 JSON 的话顺序不可信 —— 插值是按相邻两帧做的，乱序会插出
+        // 完全错误的中间态（看起来像"动画在抽搐"）。
+        std::sort(c.keys.begin(), c.keys.end(),
+                  [](const ecs::TransformKey& a, const ecs::TransformKey& b) {
+                      return a.t < b.t;
+                  });
+    }
+    if (c.duration < 1e-3f) c.duration = 4.0f;
+    // 时长必须能罩住最后一帧，否则最后一帧永远播不到
+    if (!c.keys.empty() && c.duration < c.keys.back().t)
+        c.duration = c.keys.back().t;
+    c.time = std::clamp(c.time, 0.0f, c.duration);
+    c.playing = c.autoplay;
+    return c;
 }
 
 json particleEmitterToJson(const ecs::ParticleEmitterComponent& p) {
@@ -1973,6 +2044,13 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
                         an->controllerPath.empty() ? 0 : 1);
         }
 
+        // 实体 transform 关键帧轨道（编辑器 Animation 模式的产物）。
+        // 空轨道**不写** —— 否则每个用过的实体都会多一个 {"keys":[]}，
+        // 场景文件的 diff 全是噪音。
+        if (const auto* ac = w.get<ecs::AnimationClipComponent>(it.entity)) {
+            if (!ac->keys.empty()) je["animClip"] = animClipToJson(*ac);
+        }
+
         // 角色控制器（G07）。与刚体**互斥**：角色是运动学的，由
         // stepCharacter 驱动，不交给物理求解器（互斥关系在 Inspector 里
         // 会给出提示，见 InspectorPanel 的 "角色控制器" 段）。
@@ -2048,7 +2126,8 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
             je.contains("particleEmitter") || je.contains("rigidbody") ||
             je.contains("character") || je.contains("trigger") ||
             je.contains("physicsMaterial") || je.contains("camera") ||
-            je.contains("skinned") || je.contains("animator");
+            je.contains("skinned") || je.contains("animator") ||
+            je.contains("animClip");
         if (je["mesh"].is_null() && !hasNonMeshContent)
             ++r.skipped;
 
@@ -2245,6 +2324,24 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 VK_LOG_INFO("SCENE-ANIMATOR entity=%u ok=0",
                             static_cast<unsigned>(e.id));
             }
+        }
+
+        // 实体 transform 关键帧轨道
+        if (je.contains("animClip")) {
+            const ecs::AnimationClipComponent ac =
+                animClipFromJson(je["animClip"]);
+            if (auto* p = w.get<ecs::AnimationClipComponent>(e))
+                *p = ac;
+            else
+                w.add<ecs::AnimationClipComponent>(e, ac);
+            // 读回来必须说清楚"读到几条、多长"：用户存完再开发现关键帧
+            // 没了，这条日志是唯一能分辨"没写进去"和"写了但被覆盖"的地方。
+            VK_LOG_INFO("SCENE-ANIMCLIP entity=%u keys=%d dur=%.2f loop=%d "
+                        "autoplay=%d time=%.2f",
+                        static_cast<unsigned>(e.id),
+                        static_cast<int>(ac.keys.size()),
+                        static_cast<double>(ac.duration), ac.loop ? 1 : 0,
+                        ac.autoplay ? 1 : 0, static_cast<double>(ac.time));
         }
 
         // 局部光源组件
@@ -2458,7 +2555,8 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
             je.contains("particleEmitter") || je.contains("rigidbody") ||
             je.contains("character") || je.contains("trigger") ||
             je.contains("physicsMaterial") || je.contains("camera") ||
-            je.contains("skinned") || je.contains("animator");
+            je.contains("skinned") || je.contains("animator") ||
+            je.contains("animClip");
         if (!mesh && !mat && !hasNonMeshContent) ++r.skipped;
     }
 

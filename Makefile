@@ -139,6 +139,7 @@ DIST_DIR  ?= dist
 BIN_DIR    = $(BUILD_DIR)/bin
 EDITOR     = $(BIN_DIR)/Editor.exe
 GAME       = $(BIN_DIR)/Game.exe
+LAUNCHER   = $(BIN_DIR)/Launcher.exe
 SHADER_DIR = $(BIN_DIR)/shaders
 ASSET_DIR  = $(BIN_DIR)/assets
 
@@ -206,10 +207,14 @@ endif
 RUN_EDITOR  = $(CMAKE) -E chdir $(BIN_DIR) $(CMAKE) -E env $(RUN_ENV) Editor.exe  $(ARGS)
 # G01：运行时（Game.exe）。与编辑器完全平行 —— 同一个引擎库，另一个 main。
 RUN_GAME    = $(CMAKE) -E chdir $(BIN_DIR) $(CMAKE) -E env $(RUN_ENV) Game.exe    $(ARGS)
+# 启动器（Launcher.exe）。同理也是平行进程，**不**是 Editor 的外壳：
+# 它在工程还不存在时就要能跑，然后自己 CreateProcess 拉起 Editor / Game。
+RUN_LAUNCHER = $(CMAKE) -E chdir $(BIN_DIR) $(CMAKE) -E env $(RUN_ENV) Launcher.exe $(ARGS)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all build configure editor game shaders run run-editor run-game toolchain \
+.PHONY: all build configure editor game shaders run run-editor run-game \
+        run-launcher toolchain \
         smoke clean distclean rebuild package info help install-make-alias
 
 # ============================================================================
@@ -274,13 +279,24 @@ endif
 #  运行
 # ============================================================================
 
-## 编译并运行编辑器（Editor）—— 项目主入口
+## 编译并运行**启动器**（Launcher.exe）—— 项目主入口
+## ⚠ 为什么默认是它而不是编辑器：引擎**没有单一的 main()**。三个 exe 平级
+##   （launcher/ editor/ runtime/ 各一个 main，只共享 VennEngine 静态库），
+##   Windows 这边"启动引擎"这个动作原本只被接到了 Editor.exe 上 —— 于是
+##   启动器虽然编得出来，却没有任何入口去跑它。工程是启动器里选/建的，
+##   所以"启动引擎"= 启动启动器；想跳过它请显式用 run-editor。
 run: build
+	@echo [run] Launcher env: $(RUN_ENV)
+	$(RUN_LAUNCHER)
+
+## 直接进编辑器（**跳过**启动器）。此时没有工程上下文，资产根按
+## MYVK_ASSET_DIR → exe/assets → cwd/assets 的候选链退化，相当于"默认工程"。
+run-editor: build
 	@echo [run] Editor   env: $(RUN_ENV)
 	$(RUN_EDITOR)
 
-## run 的别名（旧脚本兼容）
-run-editor: run
+## run 的别名（旧脚本 / 肌肉记忆兼容）
+run-launcher: run
 
 ## 编译并运行**运行时**（Game.exe）—— 出货的那个程序
 run-game: build
@@ -363,7 +379,7 @@ else
 endif
 	@echo   parallel     : $(if $(strip $(JOBS)),$(JOBS),auto)
 	@echo   build dir    : $(BUILD_DIR)
-	@echo   binaries     : $(BIN_DIR)/Editor.exe  $(BIN_DIR)/Game.exe
+	@echo   binaries     : $(BIN_DIR)/Launcher.exe  $(BIN_DIR)/Editor.exe  $(BIN_DIR)/Game.exe
 	@echo   package name : $(PKG_NAME)
 	@echo   smoke frames : $(SMOKE_FRAMES)
 
@@ -404,7 +420,8 @@ help:
 	@echo   make game             build the runtime (Game.exe) only
 	@echo   make shaders          rebuild GLSL to SPIR-V only
 	@echo   ---
-	@echo   make run              build + run the editor (main entry)
+	@echo   make run              build + run the launcher (main entry: pick/create a project)
+	@echo   make run-editor       build + run the editor directly (skips the launcher)
 	@echo   make run-game         build + run the runtime (Game.exe)
 	@echo   make smoke            headless smoke test
 	@echo   ---

@@ -73,6 +73,7 @@
 // ============================================================
 
 #include "Command.h"
+#include "EditModes.h"      // 编辑模式（顶栏下拉：选择 / 地形 / 植被 / ...）
 #include "PanelRegistry.h"  // 面板显隐的权威存储 + panelOpenRef
 #include "Workspace.h"      // WorkspaceManager / ViewportLayout
 
@@ -323,6 +324,10 @@ public:
                mouse.x < m_viewportPos.x + m_viewportSize.x &&
                mouse.y < m_viewportPos.y + m_viewportSize.y;
     }
+    // 视口像素尺寸。给"取景"类逻辑用（例如地形聚焦要按长宽比算视距）：
+    // SplitLayout 下视口常常是竖窄的，同一个视距在 16:9 和 3:4 下装下的
+    // 世界宽度差一倍多 —— 固定系数必然有一边是错的。
+    glm::vec2 viewportSize() const { return m_viewportSize; }
 
     // 帧校验：句柄失效时按名字找回，找不回就清空。
     // （撤销删除、Play/Stop 之后都会依赖它把选择"接上"）
@@ -412,6 +417,20 @@ public:
     void setGizmoMode(GizmoMode m) { m_gizmoMode = m; }
     GizmoSpace gizmoSpace() const { return m_gizmoSpace; }
     void setGizmoSpace(GizmoSpace s) { m_gizmoSpace = s; }
+
+    // ---------------------------------------------------------- 编辑模式
+    // 顶栏那颗下拉（2026-10-20 按用户给的 UE5 Selection Mode 截图重做）。
+    //
+    // 与 GizmoMode **分家**：GizmoMode 是"手柄画成什么样、左键拖什么"，
+    // EditMode 是"整个编辑器换成哪套编辑工具"。两者会同时存在 ——
+    // 比如地形模式下 GizmoMode 仍然记着上次是 Move，切回选择模式时手柄
+    // 还是 Move（不该因为去过趟地形就把用户的手柄偏好重置）。
+    //
+    // 切换本身不打开/关闭任何面板：面板跟模式走这件事由 EditorApp 每帧
+    // 按状态差做（它才知道面板表与焦点）。这里只存状态 + 打一行日志
+    // （`EDITMODE <id>`，自动化断言用）。
+    EditMode editMode() const { return m_editMode; }
+    void setEditMode(EditMode m);
 
     // ---------------------------------------------------------- 吸附
     // 平移 / 旋转 / 缩放**各有一套独立的开关 + 步长** —— 这就是 UE5
@@ -760,6 +779,9 @@ private:
 
     GizmoMode m_gizmoMode = GizmoMode::Translate;
     GizmoSpace m_gizmoSpace = GizmoSpace::World;
+    // 当前编辑模式。默认 Select = 编辑器开门时的老行为（点选 + 手柄），
+    // 所以"从没碰过这颗下拉"的会话与引入本功能前逐帧一致。
+    EditMode m_editMode = EditMode::Select;
 
     // 吸附：三套独立（平移 / 旋转 / 缩放）。
     //

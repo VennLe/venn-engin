@@ -135,8 +135,8 @@ physics::Heightfield TerrainAsset::heightfield() const {
     return hf;
 }
 
-bool loadTerrain(const std::string& relPath, TerrainAsset& out,
-                 std::string* err) {
+bool loadTerrain(const std::string& relPath, TerrainAsset& out, std::string* err,
+                 bool quiet) {
     out = TerrainAsset{};
     out.path = relPath;
 
@@ -213,9 +213,27 @@ bool loadTerrain(const std::string& relPath, TerrainAsset& out,
     out.desc = d;
     out.heights = std::move(heights);
     out.splat = std::move(splat);
+
+    // ---- holes.r8（可选）----
+    // 读不到不是错误，只是"这块地形没挖过洞"。用 255 填满而不是留空：
+    // 渲染侧与笔刷侧都按"每采样点一个字节"无条件访问。
+    out.holes.assign(static_cast<std::size_t>(d.cols) *
+                         static_cast<std::size_t>(d.rows),
+                     255u);
+    {
+        std::vector<uint8_t> hmask;
+        if (readBinary(assets::resolveAssetPath(base + d.holeFile), hmask) &&
+            hmask.size() == out.holes.size()) {
+            out.holes.swap(hmask);
+        }
+    }
     out.ok = true;
 
     // detail 里**不能有空格**（项目铁律）。路径里的空格换成下划线。
+    // quiet：笔刷刷新时每 80 ms 读一次，日志会被这条灌满（实测一笔刷下来
+    // 几十行 TERRAIN-LOAD），而且渲染层的调用方自己会打更有用的
+    // TERRAIN-REFRESH —— 所以那条路径把它关掉。
+    if (quiet) return true;
     std::string p = relPath;
     for (char& c : p) if (c == ' ') c = '_';
     VK_LOG_INFO("TERRAIN-LOAD path=%s size=%dx%d mpp=%.3f maxh=%.2f "

@@ -43,6 +43,16 @@ public:
                  int segments = 48, int rings = 24);
     Mesh* cylinder(float radius = 0.5f, const std::string& name = "cylinder",
                    int segments = 48);
+    // 植被：草叶（三张交叉面片）/ 树（干 + 两层冠）。size = 世界高度（米）。
+    // 与 cube/sphere 同级的内置形状 —— 撒点用得上，且**能被场景序列化
+    // 重建**（MeshSource 里 shape = "grass" / "tree"）。
+    Mesh* grass(float size = 0.6f, const std::string& name = "grass");
+    Mesh* tree(float size = 5.0f, const std::string& name = "tree");
+    // 花（细杆 + 花冠）。见 Mesh.h 的说明。
+    Mesh* flower(float size = 0.35f, const std::string& name = "flower");
+    // 石头（位移 + 平面着色的低面数球）。见 Mesh.h 的说明。
+    Mesh* rock(float size = 1.4f, const std::string& name = "rock",
+               int seed = 0);
     Mesh* loadModel(const std::string& path,
                     const std::string& name = "model");
 
@@ -394,9 +404,62 @@ inline Mesh* AssetManager::cylinder(float radius, const std::string& name,
     return raw;
 }
 
+inline Mesh* AssetManager::grass(float size, const std::string& name) {
+    auto it = m_meshes.find(name);
+    if (it != m_meshes.end()) return it->second.get();
+    auto mesh = std::make_unique<Mesh>();
+    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, makeGrassVertices(size),
+                 makeGrassIndices());
+    Mesh* raw = mesh.get();
+    tagBuiltinMesh(raw, "grass", size, name);
+    m_meshes[name] = std::move(mesh);
+    return raw;
+}
+
+inline Mesh* AssetManager::tree(float size, const std::string& name) {
+    auto it = m_meshes.find(name);
+    if (it != m_meshes.end()) return it->second.get();
+    auto mesh = std::make_unique<Mesh>();
+    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, makeTreeVertices(size),
+                 makeTreeIndices());
+    Mesh* raw = mesh.get();
+    tagBuiltinMesh(raw, "tree", size, name);
+    m_meshes[name] = std::move(mesh);
+    return raw;
+}
+
+inline Mesh* AssetManager::flower(float size, const std::string& name) {
+    auto it = m_meshes.find(name);
+    if (it != m_meshes.end()) return it->second.get();
+    auto mesh = std::make_unique<Mesh>();
+    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, makeFlowerVertices(size),
+                 makeFlowerIndices());
+    Mesh* raw = mesh.get();
+    tagBuiltinMesh(raw, "flower", size, name);
+    m_meshes[name] = std::move(mesh);
+    return raw;
+}
+
+inline Mesh* AssetManager::rock(float size, const std::string& name, int seed) {
+    auto it = m_meshes.find(name);
+    if (it != m_meshes.end()) return it->second.get();
+    auto mesh = std::make_unique<Mesh>();
+    std::vector<Vertex> verts = makeRockVertices(size, seed);
+    // 三角形汤：索引就是 0..n-1。Mesh 的绘制路径是 index buffer，
+    // 走"无索引"要改渲染层，不值得为一份内置网格动。
+    std::vector<uint32_t> idx(verts.size());
+    for (std::size_t i = 0; i < idx.size(); ++i) {
+        idx[i] = static_cast<uint32_t>(i);
+    }
+    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, std::move(verts), std::move(idx));
+    Mesh* raw = mesh.get();
+    tagBuiltinMesh(raw, "rock", size, name);
+    m_meshes[name] = std::move(mesh);
+    return raw;
+}
+
 inline Mesh* AssetManager::loadModel(const std::string& path,
-                                     const std::string& name) {
-    std::string key = name.empty() ? path : name;
+                                     const std::string& name) {    std::string key = name.empty() ? path : name;
     auto it = m_meshes.find(key);
     if (it != m_meshes.end()) return it->second.get();
     auto mesh = loadOBJ(*m_ctx.device, *m_ctx.cmdPool, path);

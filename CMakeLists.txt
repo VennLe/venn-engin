@@ -593,6 +593,10 @@ function(myvk_copy_runtime_assets target)
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/models|assets/models"
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/textures|assets/textures"
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons|assets/icons"
+            # 启动器新建向导的类型卡片插图（第一/第三人称，动漫风格）。
+            # 只给 `Launcher.exe` 的 UI 用，但**跟着资产根走**：启动器也用
+            # `assets::resolveAssetPath`，和编辑器同一套候选链，不另开路径规则。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/launcher|assets/launcher"
             # U1（游戏 UI）：SDF 字体图集（PNG + JSON）由 tools/gen_sdf_atlas.py
             # **构建期离线生成**并提交进仓库。运行时不读系统字体 —— 否则
             # 打包到玩家机器上中文全是方块，且系统字体不可再分发。

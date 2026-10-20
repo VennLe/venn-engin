@@ -3,6 +3,8 @@
 #include "LauncherDialog.h"
 #include "LauncherSpawn.h"
 
+#include "assets/AssetPath.h"
+#include "assets/Texture.h"
 #include "core/Logger.h"
 #include "core/Version.h"
 #include "core/Window.h"
@@ -10,6 +12,7 @@
 #include "render/QualityPresets.h"
 #include "ui/DebugRects.h"
 
+#include <backends/imgui_impl_vulkan.h>
 #include <imgui.h>
 
 #include <cstdio>
@@ -34,9 +37,12 @@ namespace {
 
 using project::GameType;
 
-// ---- 尺寸（路线图 §5.1：默认 1100×680，最小 900×560）----
-constexpr int kWindowW = 1100;
-constexpr int kWindowH = 680;
+// ---- 尺寸（路线图 §5.1；2026-10-20 按用户要求定为 1080×720，最小 900×560）----
+// 1080×720 是 16:9，与类型卡片里的 16:9 插图同比例 —— 窗口整体看起来
+// 就是"一张图 + 一条边"，不会像 1280×800（16:10）那样上下留白。
+// 卡片宽度是自适应的（见 createWizard 里的 cardW 计算），改这里不用动布局。
+constexpr int kWindowW = 1080;
+constexpr int kWindowH = 720;
 constexpr float kHeaderH = 54.0f;
 constexpr float kFooterH = 56.0f;
 constexpr float kLeftW = 330.0f;
@@ -224,6 +230,16 @@ void LauncherApp::onInit() {
 }
 
 void LauncherApp::onShutdown() {
+    // 插图句柄必须在 ImGui 后端 shutdown **之前**注销：后端没了再去
+    // RemoveTexture 就是释放后使用。onShutdown 是最后一个安全点
+    // （Application 在这之后才 waitIdle + 析构 Renderer）。
+    for (std::uint64_t& ds : m_typeArt) {
+        if (ds != 0) {
+            ImGui_ImplVulkan_RemoveTexture(reinterpret_cast<VkDescriptorSet>(ds));
+            ds = 0;
+        }
+    }
+
     // 列表在**每个**改动点即时保存（见 remove / touch 的调用点），
     // 这里只补一次兜底 —— 异常退出路径上不至于把整次会话丢掉。
     std::string err;
@@ -274,8 +290,15 @@ void LauncherApp::onUpdate(float dt) {
         else ++i;
     }
     // 拉起子进程放在这里（onUpdate 早于 onImGui）：动作发生在**上一帧**
-    // 的点击之后，本帧不再画任何东西就直接退出。
+    // 的点击之后，本帧不再画任何东西（进程也不退出 —— 它会收进任务栏）。
     if (m_pendingSpawn != SpawnKind::None) runPendingSpawn();
+
+    // 从任务栏回来：只打一行日志。这一行也是自动化判断"最小化之后还能
+    // 被点回来"的唯一锚点（iconify 状态下主循环根本不进这里）。
+    if (m_minimizedAfterSpawn && !window().iconified()) {
+        m_minimizedAfterSpawn = false;
+        VK_LOG_INFO("LAUNCHER-RESTORED");
+    }
 }
 
 void LauncherApp::toast(const std::string& text, bool error) {
@@ -446,8 +469,20 @@ void LauncherApp::runPendingSpawn() {
     }
     VK_LOG_INFO("LAUNCHER-SPAWN ok pid=%lu kind=%s root=%s", r.pid,
                 kind == SpawnKind::Game ? "game" : "editor", pf.root.c_str());
-    // 拉起成功 → 本进程退出（路线图 §5.4：一个工程一个进程，干净）。
-    window().invalidate();
+
+    // 拉起成功 → **收进任务栏，不退出**。
+    //
+    // 以前这里是 `window().invalidate()`（"一个工程一个进程，干净"）。用户
+    // 2026-10-19 明确要求反过来：编辑器关掉之后启动器还要在 —— 换个工程
+    // 重开时不用再去桌面找图标。
+    //
+    // ⚠ 用 minimize 而不是 hide：hide 会把任务栏按钮一起拿走，用户就
+    //   找不回来了。iconify 之后主循环走 `iconified()` 分支（只
+    //   glfwWaitEvents，不渲染），常驻几乎不吃 CPU/GPU。
+    window().minimize();
+    m_minimizedAfterSpawn = true;
+    VK_LOG_INFO("LAUNCHER-MINIMIZED pid=%lu kind=%s", r.pid,
+                kind == SpawnKind::Game ? "game" : "editor");
 }
 
 // ============================================================
@@ -755,7 +790,41 @@ void LauncherApp::drawWizard() {
     ImGui::EndChild();
 }
 
+// ------------------------------------------------------------ 类型卡片插图
+
+void LauncherApp::ensureTypeArt() {
+    if (m_typeArtTried) return;
+    m_typeArtTried = true;
+
+    const char* files[2] = {"launcher/type_first_person.png",
+                            "launcher/type_third_person.png"};
+    for (int i = 0; i < 2; ++i) {
+        const std::string abs = assets::resolveAssetPath(files[i]);
+        assets::Texture* tex = nullptr;
+        try {
+            // 缓存键单独给：`loadTexture(path, name)` 的 name 就是缓存键。
+            // 不传的话键=路径，"以后换了插图文件名"会命中旧纹理 —— 症状是
+            // "我明明换了图，界面还是老图"，而日志里一行提示都没有。
+            const std::string key = std::string("launcher:type") + (i == 0 ? "fp" : "tp");
+            tex = assets().loadTexture(abs, key, true);
+        } catch (const std::exception& ex) {
+            VK_LOG_WARN("LAUNCHER-ART load failed (%s): %s", abs.c_str(), ex.what());
+        }
+        if (!tex || tex->view() == VK_NULL_HANDLE) {
+            VK_LOG_WARN("LAUNCHER-ART missing %s (卡片退回纯文字)", files[i]);
+            continue;
+        }
+        m_typeArt[i] = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(
+            ImGui_ImplVulkan_AddTexture(tex->view(),
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)));
+        VK_LOG_INFO("LAUNCHER-ART %s %ux%u ds=%llu", files[i], tex->width(),
+                    tex->height(), static_cast<unsigned long long>(m_typeArt[i]));
+    }
+}
+
 void LauncherApp::drawWizardType() {
+    ensureTypeArt();
+
     ImGui::TextUnformatted(TR("What kind of game is this?"));
     ImGui::Spacing();
 
@@ -774,36 +843,80 @@ void LauncherApp::drawWizardType() {
          "Camera sits behind and above", "Mouse orbits, character turns",
          "LAUNCH-TYPE-1"},
     };
+
+    // 卡片 = 16:9 插图 + 底部标题条。宽度随可用宽度收口（最宽 452），
+    // 于是窗口被拉到最小尺寸时也不会挤成一条。
+    const float gap = 18.0f;
+    const float availW = ImGui::GetContentRegionAvail().x;
+    float cardW = (availW - gap - 8.0f) * 0.5f;
+    if (cardW > 452.0f) cardW = 452.0f;
+    if (cardW < 240.0f) cardW = 240.0f;
+    const float imgH = cardW * 9.0f / 16.0f;
+    const float textH = 44.0f;
+    const float cardH = imgH + textH;
+
     for (int i = 0; i < 2; ++i) {
         const Card& c = cards[i];
         const bool sel = (m_wizType == c.type);
-        if (i > 0) ImGui::SameLine(0.0f, 16.0f);
+        if (i > 0) ImGui::SameLine(0.0f, gap);
         ImGui::PushID(i);
 
-        // 卡片就是**一个大按钮**（多行 label）。
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        // 整张卡就是一个 InvisibleButton —— hover / 点击都在**父窗口**里算。
         //
-        // ⚠ 别用"`BeginChild` 画卡片 + 在上面盖 `InvisibleButton`"那套：
-        //   子窗口是**独立窗口**，它会把后面画在父窗口里的 item 的 hover
-        //   全挡住 —— 表现是"卡片画出来了、锚点也有坐标、鼠标点下去毫无
-        //   反应"，而且日志里一个字都不会有（实测就是这么踩的：三轮向导
-        //   全部按**默认类型**建了工程，断言却只在"日志没有 type=" 上红）。
-        //   一个 Button 既解决 hover/点击，也省掉坐标换算。
-        char label[640];
-        std::snprintf(label, sizeof(label), "%s\n\n%s\n%s", TR(c.title),
-                      TR(c.line1), TR(c.line2));
-        const ImVec4 bg = sel ? ImVec4(0.18f, 0.30f, 0.50f, 1.0f)
-                              : ImVec4(0.14f, 0.14f, 0.16f, 1.0f);
-        const ImVec4 hot = sel ? ImVec4(0.22f, 0.36f, 0.58f, 1.0f)
-                               : ImVec4(0.20f, 0.20f, 0.23f, 1.0f);
-        ImGui::PushStyleColor(ImGuiCol_Button, bg);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hot);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, hot);
-        if (ImGui::Button(label, ImVec2(300, 120))) {
+        // ⚠ 别换成 `BeginChild` 画卡片：子窗口是独立窗口，会把后面画在父
+        //   窗口里的 item 的 hover 全挡住（"卡片画出来了、点下去没反应"，
+        //   历史上为此丢过三轮向导）。InvisibleButton 什么都不画，正好。
+        const bool clicked = ImGui::InvisibleButton("##type", ImVec2(cardW, cardH));
+        const bool hov = ImGui::IsItemHovered();
+        anchor(c.tag);   // 必须在 item 之后立刻取矩形
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p1(p0.x + cardW, p0.y + cardH);
+        const float rounding = 8.0f;
+        dl->AddRectFilled(p0, p1,
+                          sel ? IM_COL32(34, 56, 94, 255) : IM_COL32(30, 31, 35, 255),
+                          rounding);
+
+        // 插图区：图就是 16:9，卡片这块也是 16:9 → UV 直接整张给。
+        const ImVec2 i0(p0.x, p0.y), i1(p0.x + cardW, p0.y + imgH);
+        const std::uint64_t ds = m_typeArt[i];
+        if (ds != 0) {
+            dl->AddImageRounded(static_cast<ImTextureID>(ds), i0, i1,
+                                ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
+                                sel ? IM_COL32(255, 255, 255, 255)
+                                    : IM_COL32(255, 255, 255, hov ? 235 : 200),
+                                rounding, ImDrawFlags_RoundCornersTop);
+            if (!sel) {
+                // 没选中的压一层暗罩：一眼能看出"哪个是当前选择"。
+                // ⚠ 别压太重（试过 90）：插图里的角色视角特征会糊掉，
+                //   而这张图的存在意义就是"让人一眼看出相机在哪"。
+                dl->AddRectFilled(i0, i1, IM_COL32(8, 10, 16, hov ? 18 : 55),
+                                  rounding, ImDrawFlags_RoundCornersTop);
+            }
+        } else {
+            // 插图没加载出来也不崩：留一块底色 + 标题，卡片照样能点。
+            dl->AddRectFilled(ImVec2(p0.x, p0.y), i1, IM_COL32(46, 48, 55, 255),
+                              rounding, ImDrawFlags_RoundCornersTop);
+        }
+
+        dl->AddText(ImVec2(p0.x + 14.0f, p0.y + imgH + 13.0f),
+                    sel ? IM_COL32(236, 242, 255, 255) : IM_COL32(210, 214, 222, 255),
+                    TR(c.title));
+        // 选中：亮蓝描边；hover：灰白描边。
+        dl->AddRect(p0, p1,
+                    sel ? IM_COL32(110, 165, 255, 255)
+                        : (hov ? IM_COL32(126, 132, 144, 255)
+                               : IM_COL32(58, 60, 66, 255)),
+                    rounding, 0, sel ? 2.0f : 1.0f);
+
+        if (clicked) {
             m_wizType = c.type;
             VK_LOG_INFO("LAUNCHER-WIZARD type=%s", project::gameTypeId(c.type));
         }
-        ImGui::PopStyleColor(3);
-        anchor(c.tag);
+        // 注释文字**只在悬浮时**出现（用户要求：卡面保持干净）。
+        if (hov) ImGui::SetTooltip("%s\n%s", TR(c.line1), TR(c.line2));
+
         ImGui::PopID();
     }
     ImGui::NewLine();

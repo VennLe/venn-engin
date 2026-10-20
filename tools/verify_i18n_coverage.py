@@ -567,6 +567,22 @@ FMT_KEEP = (
     "SPLIT-%d", "##split_preset_%d",
     "NOTIF-DUMP toasts=%d history=%d warn=%d error=%d "
     "unread=%d tasks=%d minimized=%d",     # con->addCommand("notif.dump") 的开发期转储
+    # W4-5/W5-0：地形笔刷与植被物种的 `logRect` 锚点 + 材质/网格资产 key。
+    # 这些是**回归脚本按名字逐个等的稳定标识**，翻成中文脚本就抓不到了；
+    # 而且它们从不出现在屏幕上（只进日志），本来就不该翻。
+    "LS-TOOL-%d", "FO-KIND-%d", "TB-EDITMODE-ITEM %s",
+    "foliage/mesh/%s", "foliage/mat/%s/%d",
+    # 2026-10-20 晚：六个工具面板（ToolkitEditors.cpp）的锚点 / 资产 key /
+    # 自动生成的实体名。同样"从不上屏"：锚点只进日志，key 只进 AssetManager，
+    # 实体名是 `Chunk 010203` / `Brush Sphere 01` 这类**数据**（用户可在层级里
+    # 改），翻了反而让回归脚本与存档里的名字对不上。
+    "TK-%s", "BR-SHAPE-%d", "PCG-KIND-%d",
+    "toolkit/paint/%u/%d", "toolkit/model/%u/%d", "toolkit/mat/%s",
+    "Chunk %02d%02d%02d", "Chunk %02d", "Brush %s %02d", "PCG %s %03d",
+    # 2026-10-20 夜：Modeling 的选区层级按钮锚点 + Voronoi 的网格 key。
+    # 和上面同一类 —— 锚点只进日志（脚本按 MD-SELMODE-2 抓 Face 按钮），
+    # key 只进 AssetManager，翻成中文两边都立刻断。
+    "MD-SELMODE-%d", "toolkit/fracture/%u/%d/%d",
     # --- 纯 ID 拼接（## 之后是稳定 ID，前面是已经翻过的变量）---
     "%s###panel_%s", "%s##seg%d", "%s##speed", "%s##%s", "%s##ws_%s",
     "%s##recent%zu", "%s %s##hist%zu", "%s##vpl%d",

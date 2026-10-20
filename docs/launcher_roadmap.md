@@ -294,7 +294,38 @@ templates/
 | 摆腿动画 | 无 | 需要 6 个 `playerLimb`（Body/Head/ArmL/ArmR/LegL/LegR） | `Components.h:476` |
 | 场景相机 | 眼位（运行时由 `PlayerController` 驱动） | 角色后方，`distance` 来自 `camDistance` | `SpringArm` |
 | 输入映射 | 鼠标视角 + WASD | 鼠标环绕 + WASD + 转身插值 | `input_map.json` |
-| 起始脚本样板 | `main.vks`：准星/交互提示占位 | `main.vks`：跟随/朝向占位 | 模板自带 |
+| 起始脚本样板 | `main.vks` + `pickup.vks` + `portal.vks`（见 §4.1） | 同左（脚本内容逐字相同） | 模板自带 |
+
+### 4.1 模板自带的"基本游戏环境"（2026-10-20）
+
+创建出来的工程不再是一句 `print("HELLO")`，而是一个**能通关的小游戏**。
+这不是装饰：模板是用户读到的第一份代码，它示范的写法会被照抄。
+
+| 文件 | 挂在哪 | 职责 |
+|---|---|---|
+| `assets/scripts/main.vks` | `Player` | 参数区 / 状态区 / `on start` / `on update`；计时、收集进度、通关与超时 |
+| `assets/scripts/pickup.vks` | 5 个 `Pickup_*` | 自转 + 浮动 + 1.6 m 内拾取，给世界黑板 +1（同一份脚本 5 个实例） |
+| `assets/scripts/portal.vks` | `Portal` | 自转；收齐后 `setEmissive` 点亮自己并加速（跨脚本通信演示） |
+| `README.md` | — | 工程导览：代码在哪、怎么改、三个别做的事 |
+
+场景（8 个实体 + 场景太阳）：`Ground` / `Player` / `Pickup_1..5`（环半径 4 m）/
+`Portal`（(0,-8)，直径 1.5 m、高 3 m）。
+
+三条刻意的设计：
+
+① **通关 = 收齐 5 个球**，不需要"走进传送门"。终点位置依赖 Play 态相机
+朝向与玩家找路的运气，模板的第一局必须保证一定走得完。传送门是视觉奖励。
+
+② **5 个光球用 5 个不同的材质名**（`template_pickup_1..5`）。程序化材质按
+名字进 AssetManager 缓存，而 `setEmissive` 改的是共享材质本身 —— 同名会让
+"改一个"变成"改全部"，且不报错。
+
+③ **`setEmissive` 只对自己生效**（3 个参数，没有实体参数）。所以"点亮传送门"
+必须住在 `portal.vks` 里，主脚本改不了它。这是引擎刻意的窄接口，不是缺陷。
+
+⚠ 第一版把"走进传送门"写成通关条件、并把 Portal 摆在 (0,6)，实测发现
+**出生点根本看不见它**（相机朝向与 8 m 外的 47° 横向偏移），而日志里一条
+错都没有 —— 只有截图看得出。这就是设计 ① 的由来。
 
 ⚠⚠ **必须对用户说清楚的一条**：**今天的第三人称模板创建出来"看不到角色"**。
 程序化小人已在 2026-10-11 按用户要求删除，模型要走角色详情窗口绑定
@@ -309,7 +340,11 @@ templates/
 
 ### 5.1 窗口
 
-- 默认 1100 × 680，居中，可缩放，最小 900 × 560。
+- 默认 **1080 × 720**（16:9），居中，可缩放，最小 900 × 560。
+  （2026-10-19 从 1100 × 680 放大到 1280 × 800：类型卡片要放 16:9 插图 +
+  标题；2026-10-20 按用户要求定为 1080 × 720，与卡片的插图同比例，
+  不再有 16:10 的上下留白。卡片宽度是自适应的，改尺寸不用动布局。）
+  断言在 `verify_launcher_open.py` 的 **O0**（量 `GetClientRect`，不是外框）。
 - **不显示 3D 场景**（空场景；M6 之后可选做背景）。
 - 顶部：Logo + 引擎版本 + 语言切换（复用 `editor::tr` 的词条表）。
 - 底部状态条：GPU 名（`render::Renderer` 现成）、CMake 配置（Debug/Release）。
@@ -375,12 +410,23 @@ templates/
 ### 5.4 状态机
 
 ```
-Idle ──新建──► Wizard(1→2→3) ──确认──► Creating ──ok──► Done ──► (拉起编辑器) → 退出
+Idle ──新建──► Wizard(1→2→3) ──确认──► Creating ──ok──► Done ──► (拉起编辑器) → 收进任务栏
   ▲                    │                    │
   └──────取消──────────┘                    └─fail─► Wizard(3) + 错误行
-Idle ──选中+打开──► Spawning ──ok──► 退出（编辑器接管）
+Idle ──选中+打开──► Spawning ──ok──► 最小化到任务栏（进程常驻）
                         └─fail─► Idle + toast
 ```
+
+⚠ **"退出"已在 2026-10-19 改成"收进任务栏"**。原设计是"一个工程一个进程，
+拉起编辑器之后启动器自己退"，用户实测后要求反过来：编辑器关掉之后启动器还要在，
+换个工程重开时不用再去桌面找图标。于是 `runPendingSpawn` 里
+`window().invalidate()` → `window().minimize()`，并打 `LAUNCHER-MINIMIZED`；
+从任务栏点回来打 `LAUNCHER-RESTORED`（`verify_launcher_open.py` 的 O2/O2b/O2c/O2d
+就是这四条契约）。
+
+⚠ 用 `glfwIconifyWindow` 而不是 `glfwHideWindow`：hide 会把任务栏按钮一起拿走，
+用户就"找不回来"了。iconify 后主循环走 `iconified()` 分支（只 `glfwWaitEvents`，
+不渲染），常驻几乎不吃 CPU/GPU。
 
 ---
 
@@ -634,7 +680,9 @@ T2 生成物 `cmake --build` 产出 exe 并 `--selftest` 通过。
 | `verify_launcher_project`（M0） | FP / TP 各三条 PASS：`entities=3`、`camera.distance` 8.0 / 4.5、`config/editor_layout.json` 落在**工程目录**（不是仓库根） |
 | `verify_launcher_ui`（M1） | PASS：`header=(10,8)-(1090,54)`、`left.right=335 < right.left=537`、`list.bottom=160 < footer.y=640`、死路径被剔除后剩 2 条 |
 | `verify_launcher_create`（M2） | PASS：C1~C16 + F5~F16；`render.json keys=22`、`player.mode=third/first`、重名被拒 **且** 无 `.tmp` 残留 **且** 原工程 mtime 不变 |
-| `verify_launcher_open`（M3） | PASS：`LAUNCHER-SPAWN ok pid=…`、启动器自己退出 rc=0、标题 `Venn Editor - OpenGame`、`EDITOR-CWD`=工程根、`entities=3`、两个进程日志在**同一流**里、编辑器 rc=0 |
+| `verify_launcher_open`（M3） | PASS：`LAUNCHER-SPAWN ok pid=…`、标题 `Venn Editor - OpenGame`、`EDITOR-CWD`=工程根、`entities=3`、两个进程日志在**同一流**里、编辑器 rc=0。⚠ 2026-10-19 起 O2 断言反转：`LAUNCHER-MINIMIZED` + `IsIconic` + 编辑器退出后启动器仍在 + 从任务栏恢复 `LAUNCHER-RESTORED` |
+| 启动器常驻（2026-10-19） | `verify_launcher_open` 12 项 PASS；`verify_launcher_code`（D4~D9）、`verify_launcher_create`（C1~C16）、`verify_launcher_ui`（U1~U7）、`verify_launcher_display`（R5~R9）全 PASS |
+| 类型卡片插图（2026-10-19） | `LAUNCHER-ART launcher/type_first_person.png 1536x864`、`…type_third_person.png` 两张都绑上描述符；卡面 452×298（16:9 图 254 + 标题条 44），点选打 `LAUNCHER-WIZARD type=first_person` |
 | `verify_launcher_display`（M4） | PASS：1920×1080 / 1280×720 客户区、`RENDER-SET chain=project=22 total=22`、baseline 0.0929%、high-vs-low **5.1212% = 55.1×** |
 | `verify_launcher_code`（M5-b） | PASS D1~D9：junction 真存在、`PROJ-CODE-LINK ok`、`precompiled 1 script (via junction)`、`VKS-RELOAD-KEEP entity=2 path=scripts/main.vks vars=6`、工程侧文件跟着变、rc=0 |
 | `verify_i18n_coverage`（M6） | **PASS**：A1/A2/A3/A4/B/B2/C/D/E/F 全绿（词典 1682 条、重复键 0、占位符漂移 0） |
@@ -651,7 +699,21 @@ T2 生成物 `cmake --build` 产出 exe 并 `--selftest` 通过。
 
 **P14 · `ImGui::BeginChild` 是独立窗口** —— 盖在它上面的 `InvisibleButton` 的 hover
 被父窗口挡掉：卡片画出来了、锚点有坐标、**点下去日志一个字都没有**。向导的类型卡片
-最终改成"一个多行 `ImGui::Button` + 三个 `PushStyleColor`"，不用子窗口。
+一度改成"一个多行 `ImGui::Button` + 三个 `PushStyleColor`"，不用子窗口。
+> 2026-10-19 追加：要往卡片里塞插图时，多行 Button 就不够用了（Button 画不了图）。
+> 正解是**在父窗口里**放一个 `InvisibleButton` 当命中区、所有视觉都用
+> `window->DrawList` 自己画（`AddRectFilled` / `AddImageRounded` / `AddText`）——
+> `InvisibleButton` 在父窗口里，不会复现 P14 那个"子窗口挡 hover"。判据：
+> 点卡片仍然打 `LAUNCHER-WIZARD type=…`，锚点 `LAUNCH-TYPE-0/1` 仍然在。
+
+**P22 · ImGui 纹理句柄必须在后端 shutdown 之前注销** —— `ImGui_ImplVulkan_AddTexture`
+拿到的 `VkDescriptorSet` 一旦晚于后端销毁再 `RemoveTexture`，就是释放后使用。
+启动器的插图在 `onShutdown()` 里注销（`Application::run` 在这之后才 `waitIdle`
++ 析构 Renderer，是最后一个安全点）。
+
+**P23 · 新增的图片目录必须进"每次构建都拷"那一档** —— `POST_BUILD` 只在重新链接
+时跑，改了 png 却没重编 C++ 时，运行时读到的还是旧图（症状是"我明明换了插图，
+界面没变"）。`assets/launcher` 与 `assets/icons` 一样挂在 `VENN_ALWAYS_ASSET_DIRS` 里。
 
 **P15 · 创建完工程，最近列表被写回旧值** —— `createFromTemplate` 自己会往
 `recent.json` 追加，而启动器内存里是**启动时**读的旧列表，`onShutdown` 的 `save()`

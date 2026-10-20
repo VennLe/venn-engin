@@ -64,6 +64,8 @@ layout(set = 1, binding = 0) uniform sampler2D albedoLayer[4];
 layout(set = 1, binding = 1) uniform sampler2D normalLayer[4];
 layout(set = 1, binding = 2) uniform sampler2D splatMap;
 layout(set = 1, binding = 3) uniform sampler2D heightMap;
+// 挖洞遮罩（R8）：1 = 实心，0 = 挖穿。见 main() 里的 discard。
+layout(set = 1, binding = 5) uniform sampler2D holeMap;
 
 struct TerrainLayer {
     vec4 baseColor;  // rgb = 基色（线性），a = 未用
@@ -201,6 +203,21 @@ vec3 terrainNormal(vec2 uv) {
 }
 
 void main() {
+    // ---- 挖洞（UE 的 Landscape Visibility 层）----
+    // 放在**所有计算之前**：挖穿的像素连贴图都不该采（被挖掉的格子下面
+    // 通常什么都没有，白白算一遍 4 层 albedo + 阴影再丢掉）。
+    //
+    // ⚠ 用 discard 而不是把顶点压到地下：
+    //   · 顶点级方案会在洞的边缘留下"被拉成尖刺的三角形"（高度图是
+    //     双线性插值的，一半顶点的洞会把相邻三角形拽成斜面）；
+    //   · discard 是按像素的，洞边正好落在遮罩的插值边界上 —— 视觉上
+    //     就是 UE 那种"边缘略带抗锯齿的洞"。
+    // ⚠ 副作用（与 UE 一致，不是 bug）：被挖掉的部分**不写深度**，
+    //   所以洞下面的物体会露出来；同时它也不再遮挡阴影（地形本来就不投
+    //   阴影，这一条暂时无所谓）。
+    const float solid = texture(holeMap, vUv).r;
+    if (solid < 0.5) discard;
+
     const vec4 rawW = texture(splatMap, vUv * push.params.y);
     // 权重之和必须归一化到 1。CPU 侧（tools/gen_terrain.py）已经把四路
     // 量化成和恰好 255，这里再兜一次：手改过的权重图（或将来某个编辑器

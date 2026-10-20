@@ -82,6 +82,15 @@ class CharacterWindow;
 class PhysicsPanel;
 class ParticlesPanel;
 class QualitySettingsPanel;   // E26
+class LandscapeEditor;        // 2026-10-20：地形编辑模式
+class FoliageEditor;          // 2026-10-20：植被编辑模式
+// 2026-10-20 晚：下拉里其余 6 个模式（ToolkitEditors.h / .cpp）
+class MeshPaintEditor;
+class ModelingEditor;
+class FractureEditor;
+class BrushEditor;
+class AnimationEditor;
+class PCGEditor;
 class ParamEditCommand;
 
 // EditorApp 同时实现 EditorHost —— 菜单里那些"要动引擎"的动作
@@ -163,6 +172,15 @@ private:
     static void panelDrawParticles(EditorApp& a);
     // E26：画质档位面板
     static void panelDrawQuality(EditorApp& a);
+    // 2026-10-20：编辑模式自带的两张面板（地形 / 植被）
+    static void panelDrawLandscape(EditorApp& a);
+    static void panelDrawFoliage(EditorApp& a);
+    static void panelDrawMeshPaint(EditorApp& a);
+    static void panelDrawModeling(EditorApp& a);
+    static void panelDrawFracture(EditorApp& a);
+    static void panelDrawBrushEdit(EditorApp& a);
+    static void panelDrawAnimation(EditorApp& a);
+    static void panelDrawPCG(EditorApp& a);
 
     // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
     void drawPanels();
@@ -312,6 +330,19 @@ private:
     bool barButton(const char* id, const char* label, int icon,
                    bool active, const char* tip);
 
+    // ---- 编辑模式（2026-10-20）----
+    // 顶栏那颗下拉改的、视口笔刷用的都是它。这里每帧做两件事：
+    //   ① 模式变了 → 开关对应的编辑器面板 + 把上一个模式的未落盘改动写完；
+    //   ② 未实现的模式（网格体绘制 / 建模 / ...）保持"不假装切过去"。
+    void serviceEditMode();
+    // 上一帧的编辑模式（差量用）。初值与 EditorContext 一致。
+    EditMode m_lastEditMode = EditMode::Select;
+    // 自动化：MYVK_EDITMODE=landscape / foliage 启动即进对应模式；
+    // MYVK_LANDSCAPE_AUTOCREATE=1 在新场景里自动建一片地形（脚本不必
+    // 依赖"点面板按钮"这条含 UI 坐标的路径）。
+    bool m_autoCreateTerrain = false;
+    bool m_autoCreateDone = false;
+
     // ---- 底栏面板托盘（2026-10-17 晚）----
     // "CMD 右边一个 +，点开往上弹一列勾选；勾上的面板在 + 右侧出现一个
     //  带 Logo 的按钮，点按开关，按钮右上角的 × 把它移掉"。
@@ -400,6 +431,20 @@ private:
     std::unique_ptr<PhysicsPanel> m_physicsPanel;
     std::unique_ptr<ParticlesPanel> m_particlesPanel;
     std::unique_ptr<QualitySettingsPanel> m_qualityPanel;   // E26
+    // 2026-10-20：地形 / 植被编辑模式。它们**不是**普通面板：
+    //   · 面板只是它们的 UI，真正干活的是视口里的笔刷；
+    //   · 显隐跟顶栏的 EditMode 走（见 serviceEditMode）。
+    // 所以由 EditorApp 持有，ViewportPanel 只拿裸指针转发输入。
+    std::unique_ptr<LandscapeEditor> m_landscape;
+    std::unique_ptr<FoliageEditor> m_foliage;
+    // 2026-10-20 晚：下拉里其余 6 个模式的编辑器（见 ToolkitEditors.h）。
+    // 与上面两个同一套管理：显隐跟 EditMode 走，视口输入按模式转发。
+    std::unique_ptr<MeshPaintEditor> m_meshPaint;
+    std::unique_ptr<ModelingEditor> m_modeling;
+    std::unique_ptr<FractureEditor> m_fracture;
+    std::unique_ptr<BrushEditor> m_brushEdit;
+    std::unique_ptr<AnimationEditor> m_animation;
+    std::unique_ptr<PCGEditor> m_pcg;
     std::unique_ptr<ConsolePanel> m_console;
     // E16：MYVK_EDITOR_CONSOLE_CMD 注入命令只执行一次的哨兵。
     bool m_consoleCmdDone = false;
