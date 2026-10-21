@@ -19,6 +19,7 @@
 #include "render/FeatureRegistry.h"
 #include "render/RenderSettingsIO.h"
 #include "render/TerrainPass.h"
+#include "render/WaterPass.h"
 #include "ui2/Ui2Settings.h"
 
 // 编辑器视口要把它自己的离屏输出图注册成 ImGui 纹理
@@ -475,6 +476,12 @@ Renderer::~Renderer() {
         if (m_terrain) {
             m_terrain->shutdown();
             m_terrain.reset();
+        }
+
+        // 水面：同样自持 RenderPass / 图像 / 描述符集
+        if (m_water) {
+            m_water->shutdown();
+            m_water.reset();
         }
 
         // 析构顺序要点：
@@ -1649,6 +1656,32 @@ void Renderer::recreateParticles() {
                           depthViews);
 }
 
+// 水面通道的视图重喂（2026-10-21）。
+//
+// 为什么必须跟 recreateScreenSpace 走：WaterPass 借用两张外来视图 ——
+// HdrTarget 的 resolve 图（它往上画）和可采样深度图（它读来做遮挡）。
+// HdrTarget 一旦重建，这两张就被销毁了，而 **createPipelines 并不会因此
+// 重跑**（管线没变，只有附件变了）。于是 WaterPass 里留着一对悬垂句柄：
+//   · framebuffer 挂着已销毁的 resolve 视图 → vkCmdBeginRenderPass 报
+//     VUID-VkRenderPassBeginInfo-framebuffer-parameter；
+//   · 描述符写的是已销毁的深度视图 → VUID-...-02996；
+//   · m_extent 还是旧尺寸 → vkCmdCopyImage 的拷贝区域越界。
+// 这三条曾经一起出现（1600x900 缩到 789 宽时一次爆 18 条），根因都是
+// "setTargets 只在 createPipelines 里被调过"。
+void Renderer::recreateWater() {
+    if (!m_water || !m_water->ready()) return;
+    const uint32_t n = m_hdrTarget->framesInFlight();
+    std::vector<VkImageView> colorViews, depthViews;
+    colorViews.reserve(n);
+    depthViews.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        colorViews.push_back(m_hdrTarget->colorView(i));
+        depthViews.push_back(m_hdrTarget->depthSampledView(i));
+    }
+    m_water->setTargets(m_hdrTarget->extent(), m_hdrTarget->samples(),
+                        colorViews, depthViews);
+}
+
 // 收集场景里的探针 → GPU 表。同时**判定是否需要重捕**：
 //   · 被显式请求（Inspector 的 Capture 按钮 / console 命令）；
 //   · 数据哈希变了（探针增删 / 位置 / 盒体 / 开关任一变化）；
@@ -2215,6 +2248,9 @@ void Renderer::recreateScreenSpace() {
     // 片元 .spv 按 MSAA 选哪一份也在 recreate 里处理。
     recreateParticles();
 
+    // 水面：同一种"借 HdrTarget 视图"的通道，必须在这里重喂（见函数注释）。
+    recreateWater();
+
     // R2-2：MDI 的紧凑化着色器直接读 Hi-Z 金字塔与候选 AABB 缓冲 ——
     // 两者都属于 HiZOcclusion，重建后必须重新喂（顺序不能反）。
     if (m_mdi && m_hiz) {
@@ -2770,6 +2806,9 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
 
     // 地形实例与场景实体对齐（必须在录制命令之前，见 syncTerrains 的注释）
     syncTerrains(scene);
+
+    // 水体同理：新建/删除要走 waitIdle + 顶点上传，不能和录制撞在同一队列
+    syncWaters(scene);
 }
 
 // ============================================================
@@ -2807,6 +2846,10 @@ void Renderer::syncTerrains(scene::Scene& scene) {
         std::uint32_t entity = 0;
         bool splatToo = false;
         bool holesToo = false;
+        // 编辑器内存直传（2026-10-21）：非空就用它上传，不读盘。
+        // 见 ecs::TerrainComponent::liveHeights 的说明。
+        terrain::TerrainAsset live;
+        bool hasLive = false;
     };
     std::vector<TerrainRefresh> refresh;
     scene.forEachTerrain([&](ecs::Entity e, ecs::TerrainComponent& tc) {
@@ -2822,7 +2865,20 @@ void Renderer::syncTerrains(scene::Scene& scene) {
             m_terrainEntities.clear();
         }
         if (tc.heightsDirty || tc.splatDirty || tc.holesDirty) {
-            refresh.push_back({e.id, tc.splatDirty, tc.holesDirty});
+            TerrainRefresh r;
+            r.entity = e.id;
+            r.splatToo = tc.splatDirty;
+            r.holesToo = tc.holesDirty;
+            // 只有"编辑器挂了 live 高度"才走内存直传；缺任何一份就整份退回
+            // 读盘（部分直传会让三张图来自不同版本，比慢更糟）。
+            // 尺寸校验交给 refreshSurface —— 那里有 inst.asset 的权威尺寸。
+            if (tc.liveHeights && !tc.liveHeights->empty()) {
+                r.live.heights = *tc.liveHeights;
+                if (tc.liveSplat) r.live.splat = *tc.liveSplat;
+                if (tc.liveHoles) r.live.holes = *tc.liveHoles;
+                r.hasLive = true;
+            }
+            refresh.push_back(std::move(r));
             tc.heightsDirty = false;
             tc.splatDirty = false;
             tc.holesDirty = false;
@@ -2875,7 +2931,8 @@ void Renderer::syncTerrains(scene::Scene& scene) {
             }
             if (idx >= m_terrainEntities.size()) continue;   // 没建成的实体
             if (!m_terrain->refreshSurface(static_cast<uint32_t>(idx), r.splatToo,
-                                           r.holesToo)) {
+                                           r.holesToo,
+                                           r.hasLive ? &r.live : nullptr)) {
                 // 读不回/尺寸变了 → 退回重建（下一帧走 !same 分支）
                 m_terrainEntities.clear();
             }
@@ -2884,15 +2941,42 @@ void Renderer::syncTerrains(scene::Scene& scene) {
 }
 
 // ============================================================
-// 延迟贴花（R4-4）的收集
+// 水面（2026-10-21）
 //
-// 贴花没有网格组件 —— 盒体几何是 DecalBuffer 自建的单位立方体，
-// 所以这里只产出"世界矩阵 + 材质参数 + 两张贴图的 view/sampler"。
+// 与 syncTerrains 同一条约定：**必须在录制命令之前**（sync 里可能要
+// waitIdle + 上传顶点，不能和正在录制的命令缓冲撞在同一队列上）。
 //
-// 世界矩阵 = 实体世界矩阵 × scale(size)：于是盒体在实体局部轴上的
-// 三个半轴长度正好是 size/2，位置/朝向复用实体的 Transform（含父链
-// 累乘，与"移动物体"共用同一套机制）。
+// 与地形的区别：水体的参数全部是"写 UBO 就生效"的，只有形状/尺寸变了
+// 才重建网格。所以这条路每帧的常态是零 VkObject 创建 —— 面板上拖滑块
+// 全速 60 fps 也没有任何 GPU 资源抖动。
 // ============================================================
+uint32_t Renderer::waterCount() const {
+    return m_water ? m_water->bodyCount() : 0u;
+}
+
+void Renderer::syncWaters(scene::Scene& scene) {
+    if (!m_water || !m_water->ready()) return;
+
+    m_waterScratch.clear();
+    m_waterEntities.clear();
+    scene.forEachWater([&](ecs::Entity e, ecs::WaterComponent& wc) {
+        if (m_waterScratch.size() >= render::WaterPass::kMaxBodies) return;
+        m_waterScratch.push_back(wc.body);
+        m_waterEntities.push_back(e.id);
+    });
+
+    m_water->sync(m_waterScratch);
+
+    // 只在数量变化时打一条：这个函数每帧都跑，逐帧打日志会淹掉验收
+    if (m_waterLoggedCount != m_waterScratch.size()) {
+        m_waterLoggedCount = m_waterScratch.size();
+        VK_LOG_INFO("WATER-SYNC bodies=%u entities=%zu",
+                    static_cast<unsigned>(m_waterScratch.size()),
+                    m_waterEntities.size());
+    }
+}
+
+
 void Renderer::collectDecals(scene::Scene& scene) {
     m_decalScratch.clear();
     // 关着时一张都不收：这样 decalDraws 统计恒 0，与"没录 pass"口径一致。
@@ -3922,6 +4006,35 @@ void Renderer::createPipelines() {
     } else {
         m_terrain->recreatePipeline(m_hdrTarget->renderPass(),
                                     m_hdrTarget->samples());
+    }
+
+    // ---- 水面（2026-10-21）：独立 RenderPass ----
+    // 不复用 HdrTarget 的 render pass：它要采样"本帧画完的场景颜色"，
+    // 见 render/WaterPass.h 的文件头。这里只负责把**目标视图**给它：
+    //   · 写进去的是 resolve 图（单采样 HDR）
+    //   · 读的是可采样深度图（多采样时是 sampler2DMS）
+    if (!m_water) {
+        m_water = std::make_unique<render::WaterPass>();
+        render::WaterPass::InitInfo wi;
+        wi.device = m_device.get();
+        wi.cmdPool = m_commandPool.get();
+        wi.globalSetLayout = m_globalSetLayout;
+        wi.colorFormat = render::HdrTarget::kColorFormat;
+        wi.framesInFlight = m_hdrTarget->framesInFlight();
+        m_water->init(wi);
+    }
+    if (m_water && m_water->ready()) {
+        std::vector<VkImageView> colors;
+        std::vector<VkImageView> depths;
+        const uint32_t n = m_hdrTarget->framesInFlight();
+        colors.reserve(n);
+        depths.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            colors.push_back(m_hdrTarget->colorView(i));
+            depths.push_back(m_hdrTarget->depthSampledView(i));
+        }
+        m_water->setTargets(m_hdrTarget->extent(), m_hdrTarget->samples(),
+                            colors, depths);
     }
 
     // ---- 调试视图模式管线（R0-2）：Wireframe / Overdraw ----
@@ -5573,6 +5686,56 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
 
     vkCmdEndRenderPass(cmd);
     tsEnd(render::GpuTimer::kForward);
+
+    // ================= Pass 4.1：水面（2026-10-21）====================
+    // 位置：前向之后、粒子与 FrameGraph 之前。三条理由：
+    //   · 折射要采样"前向画完的场景颜色" → 只能在前向之后（前向内颜色
+    //     附件正在被写，同时采样它是 feedback loop，验证层直接报错）；
+    //   · 在粒子之前：粒子是叠在场景上的特效，水面属于"场景本体"，
+    //     让火花落在水面**之上**才自然；
+    //   · 在 FrameGraph 之前：SSR / DoF / Bloom / 色调映射都该作用在
+    //     "含水面"的画面上，否则水面是唯一没有泛光的东西。
+    //
+    // 顺序细节：先把 resolve 图拷一份可采样副本（折射源），再在**本类
+    // 自己的 RenderPass** 里把水面画回 resolve 图。两次布局迁移都在
+    // copySceneColor 内部完成，出来时 resolve 图仍是 SHADER_READ_ONLY。
+    if (m_water && m_water->ready() && m_water->bodyCount() > 0) {
+        m_waterTime += m_frameDt;
+        m_water->copySceneColor(cmd, m_currentFrame,
+                                m_hdrTarget->resolveImage(m_currentFrame));
+
+        const VkExtent2D wext = m_hdrTarget->extent();
+        VkClearValue waterClear{};
+        VkRenderPassBeginInfo wbi{};
+        wbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        wbi.renderPass = m_water->renderPass();
+        wbi.framebuffer = m_water->framebuffer(m_currentFrame);
+        wbi.renderArea.offset = {0, 0};
+        wbi.renderArea.extent = wext;
+        wbi.clearValueCount = 1;
+        wbi.pClearValues = &waterClear;
+        vkCmdBeginRenderPass(cmd, &wbi, VK_SUBPASS_CONTENTS_INLINE);
+
+        VkViewport wvp{};
+        wvp.width = static_cast<float>(wext.width);
+        wvp.height = static_cast<float>(wext.height);
+        wvp.minDepth = 0.0f;
+        wvp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &wvp);
+        VkRect2D wsc{};
+        wsc.extent = wext;
+        vkCmdSetScissor(cmd, 0, 1, &wsc);
+
+        // set 0（FrameUBO）与主前向共用同一份布局 —— 交给 record 一起绑，
+        // 因为它必须排在 vkCmdBindPipeline 之后（布局来自水面管线）。
+        const auto& wcam = scene.camera(m_viewCameraIndex);
+        m_waterTriangles = m_water->record(
+            cmd, m_currentFrame, m_waterTime, wcam.nearPlane(),
+            wcam.farPlane(), frame.globalUBOSet);
+        vkCmdEndRenderPass(cmd);
+    } else {
+        m_waterTriangles = 0;
+    }
 
     // ---- Hi-Z 遮挡剔除：建金字塔 + 测本帧候选（R2-1）----
     // 放在前向 pass 之后：此刻深度附件已是"只读 + 被写完"，正是 Hi-Z 的

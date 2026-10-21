@@ -103,12 +103,8 @@ private:
     void drawWorkspaceMenu();
     void drawViewModeMenu();
 
-    // 顶栏 "+ Add" 按钮弹出的添加菜单（Mesh / Light / Player）。
-    // 与视口里的 Shift+A 菜单是同一批工厂函数，区别只有**落点**：
-    // 视口菜单落在鼠标射线的地面交点上，顶栏没有鼠标上下文，按环形排队摆。
-    void drawAddBarMenu();
-    // 顶栏添加菜单的下一个落点（2m 间距的环，环满了往外扩一圈）
-    glm::vec3 nextAddSpot();
+    // 2026-10-21："+ Add" 菜单搬到视口工具条了（见 editor/AddMenu.h）——
+    // 顶栏不再有这颗按钮，也就不再需要这两个成员。
 
     void saveSceneAs(const std::string& relPath);
 
@@ -129,7 +125,6 @@ private:
     BarGroups m_groups;
 
     // 顶栏添加菜单的摆位计数（见 nextAddSpot）
-    int m_addCounter = 0;
 
     // 两个帮助窗口
     bool m_showAbout = false;

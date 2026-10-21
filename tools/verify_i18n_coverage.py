@@ -570,13 +570,17 @@ FMT_KEEP = (
     # W4-5/W5-0：地形笔刷与植被物种的 `logRect` 锚点 + 材质/网格资产 key。
     # 这些是**回归脚本按名字逐个等的稳定标识**，翻成中文脚本就抓不到了；
     # 而且它们从不出现在屏幕上（只进日志），本来就不该翻。
-    "LS-TOOL-%d", "FO-KIND-%d", "TB-EDITMODE-ITEM %s",
+    "LS-TOOL-%d", "FO-KIND-%d", "MODE-RAIL-ITEM %s", "MODE-RAIL-%d",
+    # W5-1：水体实体的自动命名（`Water_1`）。这是**对象名/标识**，会进
+    # 层级树、也会被 `scene.find(name)` 用来找回实体 —— 翻成中文既没必要
+    # （它本来就是个编号）也有副作用（跨语言的场景存档对不上名字）。
+    "Water_%d",
     "foliage/mesh/%s", "foliage/mat/%s/%d",
     # 2026-10-20 晚：六个工具面板（ToolkitEditors.cpp）的锚点 / 资产 key /
     # 自动生成的实体名。同样"从不上屏"：锚点只进日志，key 只进 AssetManager，
     # 实体名是 `Chunk 010203` / `Brush Sphere 01` 这类**数据**（用户可在层级里
     # 改），翻了反而让回归脚本与存档里的名字对不上。
-    "TK-%s", "BR-SHAPE-%d", "PCG-KIND-%d",
+    "TK-%s", "BR-SHAPE-%d", "PCG-KIND-%d", "MODE-RAIL-%d", "VTAB-%s",
     "toolkit/paint/%u/%d", "toolkit/model/%u/%d", "toolkit/mat/%s",
     "Chunk %02d%02d%02d", "Chunk %02d", "Brush %s %02d", "PCG %s %03d",
     # 2026-10-20 夜：Modeling 的选区层级按钮锚点 + Voronoi 的网格 key。

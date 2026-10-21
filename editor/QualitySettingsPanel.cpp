@@ -1,6 +1,7 @@
 #include "QualitySettingsPanel.h"
 
-#include "FeatureUIGen.h"        // editor::applyQualityPreset（共用编辑器侧钩子）
+#include "FeatureUIGen.h"
+#include "PanelDock.h"        // 视口标签页托管（见 PanelDock.h）
 #include "Localization.h"
 #include "PanelRegistry.h"       // panelOpenRef
 #include "ui/DebugRects.h"
@@ -123,15 +124,21 @@ void QualitySettingsPanel::draw() {
     bool& open = panelOpenRef("quality");
     if (!open) return;
 
-    const ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowSizeConstraints(ImVec2(480.0f, 360.0f),
-                                        ImVec2(FLT_MAX, FLT_MAX));
-    ImGui::SetNextWindowSize(ImVec2(560.0f, 520.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.28f,
-                                   io.DisplaySize.y * 0.12f),
-                            ImGuiCond_FirstUseEver);
+    // 2026-10-21：视口标签页的一页（见 PanelDock.h）
+    ImGuiWindowFlags wf = 0;
+    const bool docked = applyDockHint(wf);
+    if (!docked) {
+        const ImGuiIO& io = ImGui::GetIO();
+        ImGui::SetNextWindowSizeConstraints(ImVec2(480.0f, 360.0f),
+                                            ImVec2(FLT_MAX, FLT_MAX));
+        ImGui::SetNextWindowSize(ImVec2(560.0f, 520.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.28f,
+                                       io.DisplaySize.y * 0.12f),
+                                ImGuiCond_FirstUseEver);
+    }
 
-    if (!ImGui::Begin(trId("Quality Settings", "panel_quality"), &open)) {
+    if (!ImGui::Begin(trId("Quality Settings", "panel_quality"),
+                      docked ? nullptr : &open, wf)) {
         ImGui::End();
         return;
     }

@@ -393,6 +393,15 @@ void InspectorPanel::draw() {
         return;
     }
 
+    // 面板自身的屏幕矩形。验收脚本靠它判断"某个锚点是不是被滚出可视区了"——
+    // `logRect` 报的是 `GetItemRectMin/Max`，那是**未裁剪**的坐标：控件滚出
+    // 滚区之后照样有坐标，照它的中心点下去会落到面板外面（表现为"点了没反应"
+    // 且截图前后像素级一致，很像功能坏了，其实是点空了）。
+    // 和 `CONSOLE-PANEL` / `FO-PANEL` 同一个写法。
+    logRect("INS-PANEL", ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
+                   ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
+
     scene::Scene& sc = m_ctx.activeScene();
     const bool hasSel = m_ctx.hasSelection();
     const ecs::Entity e = hasSel ? m_ctx.selection() : ecs::Entity{};

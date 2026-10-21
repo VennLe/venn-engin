@@ -1,5 +1,7 @@
 #include "EditModes.h"
 
+#include <cmath>
+
 // 图标为什么手画：ImGui 自带字体只有 ASCII + 少量符号，UE 那套 9 个
 // 编辑模式图标（山 / 草 / 调色板 / 立方体 / 碎裂 / 笔刷 / 小人 / 节点）
 // 一个都不在字体里。用矢量画的好处是任意 DPI 都清楚、随主题变色 ——
@@ -122,6 +124,28 @@ void paintPcg(const Pen& g) {
     g.line(7.8f, 5.6f, 7.8f, 10.2f, 1.0f);
 }
 
+void paintWater(const Pen& g) {
+    // 两道水波（上疏下密）+ 一个水滴 —— 三条正弦折线的振幅递减，
+    // 与真实水面"一条主涌浪 + 表面细纹"的层次一致。
+    auto wave = [&g](float y, float amp, float th) {
+        const int segs = 8;
+        ImVec2 pts[segs + 1];
+        for (int i = 0; i <= segs; ++i) {
+            const float x = 1.2f + 13.6f * static_cast<float>(i) /
+                                       static_cast<float>(segs);
+            const float yy = y + amp * std::sin(static_cast<float>(i) * 1.35f);
+            pts[i] = g.p(x, yy);
+        }
+        g.dl->AddPolyline(pts, segs + 1, g.col, 0, th * g.k);
+    };
+    wave(6.4f, 1.5f, 1.15f);
+    wave(9.8f, 0.9f, 0.9f);
+    // 水滴：上面一个小圆点 + 下面两条收敛的斜线
+    g.dot(8.0f, 2.2f, 1.15f);
+    g.line(7.1f, 3.4f, 8.0f, 4.9f, 0.9f);
+    g.line(8.9f, 3.4f, 8.0f, 4.9f, 0.9f);
+}
+
 } // namespace
 
 const char* editModeName(EditMode m) {
@@ -135,6 +159,7 @@ const char* editModeName(EditMode m) {
         case EditMode::BrushEdit:  return "Brush Editing";
         case EditMode::Animation:  return "Animation";
         case EditMode::PCG:        return "PCG";
+        case EditMode::Water:      return "Water";
     }
     return "Select";
 }
@@ -150,6 +175,7 @@ const char* editModeId(EditMode m) {
         case EditMode::BrushEdit:  return "brush_edit";
         case EditMode::Animation:  return "animation";
         case EditMode::PCG:        return "pcg";
+        case EditMode::Water:      return "water";
     }
     return "select";
 }
@@ -174,6 +200,9 @@ const char* editModeHint(EditMode m) {
             return "Animate skeletons with a timeline and curves.";
         case EditMode::PCG:
             return "Generate content procedurally from a node graph.";
+        case EditMode::Water:
+            return "Drag out ponds, lakes and rivers, then shape the water "
+                   "colour, waves and flow.";
     }
     return "";
 }
@@ -200,6 +229,7 @@ bool editModeImplemented(EditMode m) {
         case EditMode::BrushEdit:
         case EditMode::Animation:
         case EditMode::PCG:
+        case EditMode::Water:
             return true;
     }
     return false;
@@ -225,6 +255,7 @@ void paintEditModeIcon(ImDrawList* dl, ImVec2 p, float s, EditMode m,
         case EditMode::BrushEdit:  paintBrushEdit(g); break;
         case EditMode::Animation:  paintAnimation(g); break;
         case EditMode::PCG:        paintPcg(g); break;
+        case EditMode::Water:      paintWater(g); break;
     }
 }
 

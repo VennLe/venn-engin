@@ -7,6 +7,7 @@
 // ============================================================
 
 #include "ecs/Entity.h"
+#include "water/WaterBody.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -1132,6 +1133,40 @@ struct TerrainComponent {
     // 遮罩只有 66 KB，但它走的是**另一张图**，混进高度那条路径会让
     // "只改了高度"的笔画多传一次遮罩（12 Hz 下是纯浪费）。
     bool holesDirty = false;
+
+    // ---- 内存直传通道（2026-10-21）----
+    //
+    // 上面三个 dirty 位只说明"要重传"，但没说明"用哪份数据"。原来的实现是
+    // 让渲染层**回磁盘再读一遍**（TerrainPass::refreshSurface → loadTerrain）：
+    // 编辑器先写盘、渲染层再读盘，一次刷新 2 MB 磁盘 I/O，跟着笔刷每 80 ms
+    // 来一遍 —— 这就是"刷地形延迟很大"的主因。
+    //
+    // 现在编辑器把当前这份资产（内存里的 vector）挂在这三个指针上，渲染层
+    // 直接拿它上传，不碰磁盘。指针的**生命周期由编辑器保证**（LandscapeEditor
+    // 的 m_asset 在它自己的存活期内一直有效）；场景卸载 / 换地形时编辑器会把
+    // 它们清成 nullptr，渲染层见 nullptr 就退回读盘 —— 所以"忘了清"只会变慢，
+    // 不会读到野指针以外的行为（而不是崩在别处）。
+    const std::vector<float>* liveHeights = nullptr;
+    const std::vector<std::uint8_t>* liveSplat = nullptr;
+    const std::vector<std::uint8_t>* liveHoles = nullptr;
+};
+
+// ============================================================
+// WaterComponent —— 一块水体（2026-10-21 第五轮）
+//
+// 一个实体 = 一块水体。和地形不同，水体**没有网格组件也没有资产**：
+//   · 几何是渲染层现生成的（圆形径向网格 / 矩形方格），尺寸变了就重生成；
+//   · 参数全在 `water::WaterBody` 里（浅/深水色、折射率、流速、波高…
+//     见 water/WaterBody.h 的注释），存盘时写进场景 JSON。
+//
+// 为什么水面高度（level）在 body 里而不是用实体的 position.z：
+//   水位是**水面**的位置，而实体位置是这块水体的"锚点"。两者在
+//   "拖出一个水塘"时并不一致 —— 锚点跟着鼠标落在 xz 上，水位来自
+//   当时命中的地表高度。把它分开存，后续调水位不会把整块水体挪走。
+// ============================================================
+struct WaterComponent {
+    water::WaterBody body = water::makeDefault();
+    bool visible = true;
 };
 
 } // namespace ecs

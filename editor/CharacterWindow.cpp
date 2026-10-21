@@ -3,6 +3,7 @@
 #include "Localization.h"
 #include "DebugRects.h"
 #include "EditorDragDrop.h"
+#include "PanelDock.h"
 
 #include "assets/AssetManager.h"
 #include "assets/AssetPath.h"
@@ -1070,16 +1071,24 @@ void CharacterWindow::draw() {
     const ImGuiIO& io = ImGui::GetIO();
     const float defW = glm::clamp(io.DisplaySize.x * 0.78f, 980.0f, 1500.0f);
     const float defH = glm::clamp(io.DisplaySize.y * 0.82f, 620.0f, 980.0f);
-    ImGui::SetNextWindowSize(ImVec2(defW, defH), ImGuiCond_FirstUseEver);
-    // 下限：低于这个尺寸三栏布局会互相挤扁（用户拖到很小也不会崩，但
-    // 预览视口会缩到看不见东西 —— 直接禁止）
-    ImGui::SetNextWindowSizeConstraints(ImVec2(880.0f, 560.0f),
-                                        ImVec2(FLT_MAX, FLT_MAX));
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.09f,
-                                   io.DisplaySize.y * 0.06f),
-                            ImGuiCond_FirstUseEver);
+    // 2026-10-21：被托管成**视口标签页**时，矩形由 EditorApp 给，浮动
+    // 默认值（含那条 880×560 的下限）全部跳过 —— 标签页内容区可能比它窄，
+    // 尺寸约束会把窗口顶出去、盖住右边的 Inspector。
+    ImGuiWindowFlags wf = 0;
+    const bool docked = applyDockHint(wf);
+    if (!docked) {
+        ImGui::SetNextWindowSize(ImVec2(defW, defH), ImGuiCond_FirstUseEver);
+        // 下限：低于这个尺寸三栏布局会互相挤扁（用户拖到很小也不会崩，但
+        // 预览视口会缩到看不见东西 —— 直接禁止）
+        ImGui::SetNextWindowSizeConstraints(ImVec2(880.0f, 560.0f),
+                                            ImVec2(FLT_MAX, FLT_MAX));
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.09f,
+                                       io.DisplaySize.y * 0.06f),
+                                ImGuiCond_FirstUseEver);
+    }
 
-    if (!ImGui::Begin(trId("Character", "character_v2"), &m_open)) {
+    if (!ImGui::Begin(trId("Character", "character_v2"),
+                      docked ? nullptr : &m_open, wf)) {
         ImGui::End();
         return;
     }

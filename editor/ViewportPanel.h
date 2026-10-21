@@ -78,9 +78,11 @@ public:
     // "鼠标在哪一格、这一下点进没点进 3D 画面、右键是不是在转相机"的地方。
     // 工具只认"给我一条射线 + 是不是按下"，其余判定全在这里。
     // 指针可以不挂（headless / 单测），都判空。
-    void attachModeTools(LandscapeEditor* landscape, FoliageEditor* foliage) {
+    void attachModeTools(LandscapeEditor* landscape, FoliageEditor* foliage,
+                         class WaterEditor* water = nullptr) {
         m_landscapeEditor = landscape;
         m_foliageEditor = foliage;
+        m_waterEditor = water;
     }
     // 2026-10-20 晚：另外两个模式也要视口交互（顶点色绘制 / 刷子体放置）。
     // 单独一个入口而不是把 attachModeTools 改成四个参数：它已经被
@@ -190,6 +192,8 @@ private:
     // 见 attachModeTools：视口只负责把射线与键鼠状态发过去。
     LandscapeEditor* m_landscapeEditor = nullptr;
     FoliageEditor* m_foliageEditor = nullptr;
+    // 2026-10-21：水体模式（拖出一块水体）
+    class WaterEditor* m_waterEditor = nullptr;
     class MeshPaintEditor* m_meshPaintEditor = nullptr;
     class BrushEditor* m_brushEditor = nullptr;
     class ModelingEditor* m_modelingEditor = nullptr;

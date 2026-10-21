@@ -197,6 +197,7 @@ struct ProbeFaceView {
 };
 
 class TerrainPass;  // render/TerrainPass.h（W4-2）：地形独立管线
+class WaterPass;    // render/WaterPass.h（2026-10-21）：水面独立通道
 
 class Renderer {
 public:
@@ -217,6 +218,12 @@ public:
     // 验证脚本靠这两个数与日志里的 TERRAIN-LOD 判断"地形真的画了"。
     uint32_t terrainCount() const;
     uint64_t terrainTriangles() const { return m_terrainTriangles; }
+
+    // ---- 水面（2026-10-21）----
+    // 已经上屏的水体数 / 上一帧提交的水面三角形数。验收脚本靠这两个
+    // 数与日志里的 WATER-DRAW 判断"水面真的画了"。
+    uint32_t waterCount() const;
+    uint64_t waterTriangles() const { return m_waterTriangles; }
 
     rhi::Device& device() { return *m_device; }
     ui::ImGuiManager& ui() { return *m_imgui; }
@@ -824,6 +831,9 @@ private:
     }
     // 与 HdrTarget 的重建同步：重挂 framebuffer 与深度视图。
     void recreateParticles();
+    // 水面通道同理：它借 HdrTarget 的 resolve 图 + 可采样深度图，
+    // 重建后必须重喂（否则帧缓冲与描述符里留着已销毁的视图）。
+    void recreateWater();
 
     // 主视口离屏目标（0 号）：建 HdrTarget + PostProcess + 离屏纹理。
     // 取代过去分开的 createHdrTarget / createPostProcess —— 两者本就是
@@ -1054,6 +1064,22 @@ private:
     uint64_t m_terrainTriangles = 0;
     // 这些私有方法在 private 区，公开的 terrainCount 要用它们的结果
     void syncTerrains(scene::Scene& scene);
+
+    // ---- 水面（2026-10-21）----
+    // 独立 RenderPass（见 render/WaterPass.h 的文件头：它要采样**本帧已经
+    // 画完的场景颜色**做折射，所以不能挂在前向 Pass 里）。
+    // 每帧在前向 Pass 之后、FrameGraph/后处理之前录制。
+    std::unique_ptr<WaterPass> m_water;
+    // 本帧有水体组件的实体（按遍历顺序），与 WaterPass 的 body 一一对应。
+    std::vector<std::uint32_t> m_waterEntities;
+    // 每帧从场景收上来的水体参数（syncWaters → WaterPass::sync）
+    std::vector<water::WaterBody> m_waterScratch;
+    uint64_t m_waterTriangles = 0;
+    std::size_t m_waterLoggedCount = 0;
+    // 水面动画时钟（秒）。累加 m_frameDt 而不是读系统时间：暂停/逐帧
+    // 调试时波形能跟着停，重放同一段录像也是同一个相位。
+    float m_waterTime = 0.0f;
+    void syncWaters(scene::Scene& scene);
 
     // ---- 前向渲染管线：按关键字掩码的**变体族**（都绑在 HdrTarget 的 render pass 上）----
     // 这里原来是 4 条手写成员（不透明 / 双面 / 透明 / 透明双面）＋ 三处

@@ -1,4 +1,4 @@
-"""端到端验证：地形与视口栅格共面 + 挖洞笔刷 + 坡道笔刷 + 力度上限（2026-10-20）。
+"""端到端验证：地形与视口栅格共面 + 形状雕刻 + 坡道笔刷 + 力度上限（2026-10-20）。
 
 被验证的用户需求（原话）：
   1) "地形模式下的地面应该要和原来栅格化的地面保持同一平面才是"
@@ -9,12 +9,18 @@
   A. 共面
      A1 新建地形的高度图**四条边**全是 0（栅格画在 z=0，地形最低点必须
         落在同一个平面上，否则地形边缘要么悬空、要么插到栅格下面）
-     A2 中心仍有起伏（max > 0.30，没被边界渐变削平成一块板）
-  B. 挖洞（Hole）
-     B1 面板里有 8 个工具（LS-TOOL-0..7），Hole 是第 8 个
-     B2 选中 Hole 后拖一笔 → LS-STROKE-BEGIN / END
-     B3 holes.r8 落盘，长度 == cols*rows，同时含 0（挖穿）和 255（实心）
-     B4 挖穿的采样点数 > 0（真的戳出了洞，不是全实心）
+     A2 中心仍有起伏，但**幅度受限**（2026-10-21 改）：
+        旧断言是 max > 0.30，那是"默认地形能顶到 1.0"时代的期望。
+        用户后来报的正是这个 —— 地形一起手就是几十米高，把模板场景
+        （Ground/Player/Pickup 全坐在 z≈0）整个埋掉。现在默认起伏被
+        归一化到 [0, 0.12]，判据反过来：有起伏（> 0.05）但不喧宾夺主
+        （<= 0.25）。
+  B. 形状雕刻（原挖洞，2026-10-21 重做）
+     B1 面板里有 8 个工具（LS-TOOL-0..7），Carve 是第 8 个
+     B2 选中 Carve 后拖一笔 → LS-STROKE-BEGIN / END
+     B3 走的是形状压印（LS-CARVE 日志），地表真的被压下去
+     B4 **不再写挖穿遮罩**：holes.r8 要么不存在，要么全 255。
+        这是本组最关键的断言 —— 用户明确要求"不能破坏地面拓扑"。
   C. 坡道（Ramp）
      C1 选 Ramp（LS-TOOL-3）后拖一笔 → 高度图 sum 变化
      C2 变化是**局部**的：绝大部分采样点没动（坡道不是全局平整）
@@ -288,8 +294,10 @@ def main():
         # （float 归一化 + smoothstep 的末端残差）。
         check(abs(bmin) <= 1.0e-4 and abs(bmax) <= 1.0e-4,
               "A1 四条边全为 0（min=%.6f max=%.6f）" % (bmin, bmax))
-        check(vmax > 0.30,
-              "A2 中心仍有起伏，没被削成平板 (max=%.4f)" % vmax)
+        # 上界 0.25 来自用户报的"地形把初始场景盖住了"：模板场景的实体都在
+        # z≈0..1，地形一起手就几十米高的话，一进编辑器看到的是一片山坡。
+        check(0.05 < vmax <= 0.25,
+              "A2 中心有起伏但不喧宾夺主（0.05 < max=%.4f <= 0.25）" % vmax)
         shoot(hwnd, "landscape_coplanar.png")
 
         vp = rect_of(tap, "VP-RECT", 6.0)
@@ -300,49 +308,54 @@ def main():
         bx = vp[0] + (vp[2] - vp[0]) * 0.16
         by = vp[1] + (vp[3] - vp[1]) * 0.72
 
-        # ================================================== B 挖洞
-        print("\n[B] 挖洞笔刷")
+        # ================================================== B 形状雕刻
+        print("\n[B] 形状雕刻笔刷（原挖洞）")
         tools = {}
         for i in range(8):
             tools[i] = rect_of(tap, "LS-TOOL-%d" % i, 2.0)
         missing = [i for i in range(8) if not tools[i]]
         check(not missing, "B1 8 个工具按钮齐全（缺: %s）" % (missing or "无"))
 
-        hole_btn = tools.get(7)
-        if not hole_btn:
-            check(False, "找不到 Hole 工具按钮（LS-TOOL-7）")
+        carve_btn = tools.get(7)
+        if not carve_btn:
+            check(False, "找不到 Carve 工具按钮（LS-TOOL-7）")
         else:
-            click(hwnd, *center(hole_btn))
+            click(hwnd, *center(carve_btn))
             time.sleep(0.5)
-            check(count(tap, "index=7 name=Hole") > 0,
-                  "B1b 选中 Hole 工具（index=7 name=Hole）")
+            check(count(tap, "index=7 name=Carve") > 0,
+                  "B1b 选中 Carve 工具（index=7 name=Carve）")
 
-            before_hole = count(tap, "LS-STROKE-BEGIN")
+            before_carve = read_grid()
+            n_stroke = count(tap, "LS-STROKE-BEGIN")
+            n_carve = count(tap, "LS-CARVE shape=")
             drag(hwnd, (bx, by), (bx + 46.0, by - 18.0))
             time.sleep(1.2)
-            check(count(tap, "LS-STROKE-BEGIN") > before_hole,
-                  "B2 挖洞那一笔落下（LS-STROKE-BEGIN 递增）")
+            check(count(tap, "LS-STROKE-BEGIN") > n_stroke,
+                  "B2 雕刻那一笔落下（LS-STROKE-BEGIN 递增）")
+            # 形状压印 vs 改遮罩：看日志有没有 LS-CARVE。被压下去的采样点
+            # 也要真的有，否则"日志对了但地形没动"会漏过去。
+            check(count(tap, "LS-CARVE shape=") > n_carve,
+                  "B3 走形状压印（LS-CARVE，不是改挖洞遮罩）")
+            after_carve = read_grid()
+            drop = 0
+            if before_carve and after_carve:
+                drop = sum(1 for a, b in zip(before_carve[2], after_carve[2])
+                           if b < a - 1.0e-4)
+            print("      · 雕刻后 %d 个采样点变低" % drop)
+            # 阈值 50：笔刷半径 12 m / mpp 2.0 → 半径 6 个采样点，扫过一小段
+            # 就有几百个。50 足以区分"真的压下去了"和"数值噪声"。
+            check(drop > 50,
+                  "B3b 地表被压出凹腔（%d 个采样点变低）" % drop)
 
-            # saveAssets 是"笔划中每 ~80 ms 落盘一次 + 松开时补一次"，
-            # 所以文件出现在松开之后 —— 给 2 s 余量。
-            deadline = time.time() + 3.0
-            while time.time() < deadline and not os.path.exists(HOLES):
-                time.sleep(0.15)
-            ok_size = False
-            dug = 0
-            vmin = vmax = -1
+            # B4 是本组最重要的一条：用户要求"不能破坏地面拓扑结构"。
+            # 形状雕刻只写高度图，**一行 holes 也不该写**。所以判据是
+            # "holes.r8 要么不存在，要么全 255（无挖穿）"。
+            intact = True
             if os.path.exists(HOLES):
                 raw = open(HOLES, "rb").read()
-                ok_size = (len(raw) == cols * rows)
-                if ok_size:
-                    vmin, vmax = min(raw), max(raw)
-                    dug = sum(1 for b in raw if b == 0)
-            check(os.path.exists(HOLES), "B3a holes.r8 已落盘")
-            check(ok_size, "B3b holes.r8 长度 == cols*rows (%d)" % (cols * rows))
-            check(dug > 0 and vmax > 0,
-                  "B3c 同时含挖穿(0)与实心(255) (dug=%d min=%d max=%d)"
-                  % (dug, vmin, vmax))
-            shoot(hwnd, "landscape_hole.png")
+                intact = bool(raw) and all(v == 255 for v in raw)
+            check(intact, "B4 没有挖穿遮罩（holes.r8 不存在或全 255）")
+            shoot(hwnd, "landscape_carve.png")
 
         # ================================================== C 坡道
         print("\n[C] 坡道笔刷")

@@ -143,7 +143,10 @@ public:
     // splatToo = false 时只刷高度图（纯抬升/平滑不需要碰权重）。
     // holesToo = false 时不动挖洞遮罩（只有 Hole 笔刷才置 true）。
     // 失败返回 false（索引越界 / 资产尺寸变了 → 调用方应退回重建路径）。
-    bool refreshSurface(uint32_t index, bool splatToo, bool holesToo = false);
+    // live != nullptr → 用编辑器内存里的那份资产上传（不碰磁盘）；
+    // live == nullptr → 退回读盘（历史路径，兼容"别的工具改了文件"）。
+    bool refreshSurface(uint32_t index, bool splatToo, bool holesToo = false,
+                        const terrain::TerrainAsset* live = nullptr);
 
     // 在**前向 Pass 内**录制（调用方负责 RenderPass 的 begin/end 与 set 0）。
     // 返回本帧提交的三角形数（统计用）。
@@ -225,6 +228,14 @@ struct TerrainPass::Instance {
     uint32_t normalMask = 0;  // bit i = 第 i 层挂了 normal 贴图
 
     float chunkSizeMeters = 0.0f;
+
+    // ---- 笔刷重传用的常驻 staging（2026-10-21）----
+    // 每帧新建一个 VkBuffer 是笔刷路径原先最大的固定开销，这里复用一块。
+    std::unique_ptr<rhi::Buffer> uploadBuf;
+
+    // TERRAIN-REFRESH 日志用的统计（每 8 次打一条）
+    uint32_t refreshCount = 0;
+    float refreshMaxMs = 0.0f;
 };
 
 } // namespace render

@@ -23,8 +23,12 @@
 #include "LandscapeEditor.h"
 #include "FoliageEditor.h"
 #include "ToolkitEditors.h"
+#include "WaterEditor.h"
 #include "KeyBindingsPage.h"
 #include "PanelRegistry.h"
+#include "PanelDock.h"
+#include "ModeRail.h"
+#include "ViewportTabs.h"
 #include "ParticlesPanel.h"
 #include "PhysicsPanel.h"
 #include "QualitySettingsPanel.h"
@@ -347,23 +351,26 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         // 它们的显隐**跟顶栏的编辑模式走**（见 serviceEditMode），但仍然是
         // 普通面板表项 —— View 菜单、快捷键、布局持久化、底栏托盘自动跟上。
         {"landscape", "Landscape", PanelGroup::Authoring, "", "mountain",
-         false, true, kSlotNone, &EditorApp::panelDrawLandscape},
+         false, true, kSlotModes, &EditorApp::panelDrawLandscape},
         {"foliage", "Foliage", PanelGroup::Authoring, "", "leaf",
-         false, true, kSlotNone, &EditorApp::panelDrawFoliage},
+         false, true, kSlotModes, &EditorApp::panelDrawFoliage},
         // 2026-10-20 晚：下拉里其余 6 个模式的面板。同一套约定 ——
         // 显隐跟 EditMode 走，但仍是普通表项（View 菜单 / 托盘 / 落盘都跟得上）。
         {"meshpaint", "Mesh Paint", PanelGroup::Authoring, "", "palette",
-         false, true, kSlotNone, &EditorApp::panelDrawMeshPaint},
+         false, true, kSlotModes, &EditorApp::panelDrawMeshPaint},
         {"modeling", "Modeling", PanelGroup::Authoring, "", "cube",
-         false, true, kSlotNone, &EditorApp::panelDrawModeling},
+         false, true, kSlotModes, &EditorApp::panelDrawModeling},
         {"fracture", "Fracture", PanelGroup::Authoring, "", "bolt",
-         false, true, kSlotNone, &EditorApp::panelDrawFracture},
+         false, true, kSlotModes, &EditorApp::panelDrawFracture},
         {"brushedit", "Brush Editing", PanelGroup::Authoring, "", "brush",
-         false, true, kSlotNone, &EditorApp::panelDrawBrushEdit},
+         false, true, kSlotModes, &EditorApp::panelDrawBrushEdit},
         {"animation", "Animation", PanelGroup::Authoring, "", "play",
-         false, true, kSlotNone, &EditorApp::panelDrawAnimation},
+         false, true, kSlotModes, &EditorApp::panelDrawAnimation},
         {"pcg", "PCG", PanelGroup::Authoring, "", "nodes",
-         false, true, kSlotNone, &EditorApp::panelDrawPCG},
+         false, true, kSlotModes, &EditorApp::panelDrawPCG},
+        // 2026-10-21：水体编辑模式。显隐跟 EditMode 走，与上面八个同构。
+        {"water", "Water", PanelGroup::Authoring, "", "water",
+         false, true, kSlotModes, &EditorApp::panelDrawWater},
     };
 }
 
@@ -443,6 +450,9 @@ void EditorApp::panelDrawBrushEdit(EditorApp& a) {
 void EditorApp::panelDrawAnimation(EditorApp& a) {
     if (a.m_animation) a.m_animation->drawPanel();
 }
+void EditorApp::panelDrawWater(EditorApp& a) {
+    if (a.m_water) a.m_water->drawPanel();
+}
 void EditorApp::panelDrawPCG(EditorApp& a) {
     if (a.m_pcg) a.m_pcg->drawPanel();
 }
@@ -501,8 +511,12 @@ void EditorApp::collectSplitOccluders() {
     m_split->clearOccluders();
 
     const LayoutRects& L = m_ctx->layout();
+    // m_tabBarRect 必须在这里：标签条是**独立窗口**，不在 LayoutRects 里，
+    // 不列进"布局面板"名单就会被当成浮层 → 左边的竖直分隔条在标签条高度
+    // 上被裁掉一截（7px 的断口，肉眼很明显）。
     const Rect layoutRects[] = {L.hierarchy, L.content, L.viewport, L.inspector,
-                                L.bottom,    L.status,  L.toolbar,  L.transport};
+                                L.modes,     m_tabBarRect, L.bottom,
+                                L.status,    L.toolbar,  L.transport};
 
     auto isLayoutPanel = [&layoutRects](const ImGuiWindow* w) {
         constexpr float kEps = 2.0f;   // 面板位置有取整，留 2px 余量
@@ -570,6 +584,7 @@ static const char* editModePanelId(EditMode m) {
         case EditMode::BrushEdit: return "brushedit";
         case EditMode::Animation: return "animation";
         case EditMode::PCG:       return "pcg";
+        case EditMode::Water:     return "water";
         case EditMode::Select:    return nullptr;
     }
     return nullptr;
@@ -652,6 +667,13 @@ void EditorApp::serviceEditMode() {
         case EditMode::PCG:
             if (m_pcg) m_pcg->sync();
             break;
+        case EditMode::Water:
+            if (m_water) {
+                m_water->sync();
+                m_ctx->setStatus(TR("Water mode: drag on the ground to create "
+                                    "a water body"));
+            }
+            break;
         case EditMode::Select:
             m_ctx->setStatus(TR("Select mode: click to pick, W/E/R to transform"));
             break;
@@ -673,6 +695,9 @@ void EditorApp::serviceEditMode() {
 
 void EditorApp::drawPanels() {
     const std::vector<PanelDesc>& t = panelTableVec();
+    // 2026-10-21：视口上方多了一条标签条，浮动面板全部变成它的标签页。
+    // `hosted` = 本帧真正要画进内容区的那个面板（-1 = 画 3D 视口）。
+    const int hosted = viewportTabDrawnPanel();
     for (int i = 0; i < static_cast<int>(t.size()); ++i) {
         if (!panelOpen(i)) continue;
         // 底栏按钮把窗口收起来了：不提交 = ImGui 认为它关着。勾选状态留着，
@@ -682,16 +707,33 @@ void EditorApp::drawPanels() {
         // Content 是"底栏抽屉"，不走表驱动绘制（它要盖在所有面板之上，
         // 而这里的顺序是表顺序 → 会被后画的视口盖住）。见 drawContentDrawer。
         if (p.layoutSlot == kSlotContent) continue;
-        // 分栏树里的面板：被"最大化"顶掉的那三个不画
+        // ---- 标签页宿主（layoutSlot == kSlotNone）----
+        // 只有**当前页**画进内容区，其余的根本不提交：它们仍是"开着"的，
+        // 只是这一帧不占屏幕 —— 这正是浏览器标签页的语义。
+        // 模式面板挂 kSlotModes，走不到这里（它们在左栏，见 ModeRail.h）。
+        const bool tabHosted = (p.layoutSlot == kSlotNone);
+        if (tabHosted && i != hosted) continue;
+        // 3D 视口：当前不是"视口"这一页时整块不画（连相机导航都不跑）。
+        // 不画而不是"画在零矩形里"：ViewportPanel 会在 draw 里读鼠标做
+        // 轨道/飞行，标签页盖着它的时候那些输入全都不该生效。
+        if (p.layoutSlot == kSlotViewport && hosted >= 0) continue;
+        // 分栏树里的面板：被"最大化"顶掉的那几个不画
         if (p.layoutSlot != kSlotNone && !m_split->showsInLayout(p.layoutSlot)) {
             continue;
         }
         const bool wasOpen = panelOpen(i);
+        if (tabHosted) {
+            // 钉到内容区 → 面板自己的 FirstUseEver 落位会被 applyDockHint
+            // 里的 Always 顶掉（见 PanelDock.h 的说明）
+            const Rect& vp = m_ctx->layout().viewport;
+            pushDockHint(vp.x, vp.y, vp.w, vp.h);
+        }
         if (p.draw) {
             p.draw(*this);
         } else if (p.layoutSlot == kSlotNone) {
             drawPlaceholderPanel(i);
         }
+        if (tabHosted) clearDockHint();
 
         // ---- 标题栏的 × = "收进底栏"，不是"取消勾选" ----
         //
@@ -1070,7 +1112,10 @@ void EditorApp::onInit() {
         m_pcg = std::make_unique<PCGEditor>(*m_ctx, *m_landscape);
     }
     m_foliage = std::make_unique<FoliageEditor>(*m_ctx, *m_landscape);
-    m_viewport->attachModeTools(m_landscape.get(), m_foliage.get());
+    // 2026-10-21：水体编辑（拖出水体 + 水质参数面板）
+    m_water = std::make_unique<WaterEditor>(*m_ctx);
+    m_viewport->attachModeTools(m_landscape.get(), m_foliage.get(),
+                                m_water.get());
     m_viewport->attachToolkitTools(m_meshPaint.get(), m_brushEdit.get(),
                                  m_modeling.get());
     m_hierarchy = std::make_unique<SceneHierarchy>(*m_ctx);
@@ -2469,6 +2514,53 @@ void EditorApp::computeLayout() {
 
     // transport（视口下方播放条）已停用：UI 被移除，矩形恒为 0×0。
     L.transport = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // ---- 视口标签条（2026-10-21）----
+    // 从视口矩形顶部切 kViewportTabBarH 给标签条，剩下的才是 3D 画面区。
+    // **放在最后一步**：前面两次 apply() 都会重写 L.viewport，早切会被盖掉。
+    // 切完 L.viewport 就等于"标签条下方的内容区"，于是：
+    //   · ViewportPanel 无需改动（它本来就画在 L.viewport 里）；
+    //   · 被托管的浮动面板也用这块矩形（drawPanels 里的 pushDockHint）。
+    m_tabBarRect = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (L.viewport.w > 8.0f && L.viewport.h > kViewportTabBarH + 60.0f) {
+        m_tabBarRect = {L.viewport.x, L.viewport.y, L.viewport.w,
+                        kViewportTabBarH};
+        L.viewport.y += kViewportTabBarH;
+        L.viewport.h -= kViewportTabBarH;
+    }
+
+    // ---- 布局摘要（只在矩形变化时打一行）----
+    // 自动化脚本靠它一次断言整棵分栏树：模式栏在最左、Hierarchy 在右栏
+    // 上半、Inspector 在其正下方、标签条紧贴视口顶部。
+    // 逐面板的锚点（HIER-* / TK-* / VIEWPORT）只能证明"某块面板在哪"，
+    // 证明不了"两块的上下关系"—— 而那正是这次改动的核心。
+    {
+        static Rect s_last[5] = {};
+        const Rect cur[5] = {L.modes, L.viewport, L.hierarchy, L.inspector,
+                             m_tabBarRect};
+        bool changed = false;
+        for (int i = 0; i < 5; ++i) {
+            if (std::fabs(cur[i].x - s_last[i].x) > 0.5f ||
+                std::fabs(cur[i].y - s_last[i].y) > 0.5f ||
+                std::fabs(cur[i].w - s_last[i].w) > 0.5f ||
+                std::fabs(cur[i].h - s_last[i].h) > 0.5f) {
+                changed = true;
+                s_last[i] = cur[i];
+            }
+        }
+        if (changed) {
+            VK_LOG_INFO("LAYOUT-RECTS modes=(%.0f,%.0f,%.0f,%.0f) "
+                        "hier=(%.0f,%.0f,%.0f,%.0f) "
+                        "insp=(%.0f,%.0f,%.0f,%.0f) "
+                        "tabs=(%.0f,%.0f,%.0f,%.0f) "
+                        "vp=(%.0f,%.0f,%.0f,%.0f)",
+                        cur[0].x, cur[0].y, cur[0].w, cur[0].h,
+                        cur[2].x, cur[2].y, cur[2].w, cur[2].h,
+                        cur[3].x, cur[3].y, cur[3].w, cur[3].h,
+                        cur[4].x, cur[4].y, cur[4].w, cur[4].h,
+                        cur[1].x, cur[1].y, cur[1].w, cur[1].h);
+        }
+    }
 }
 
 // ============================================================
@@ -3138,6 +3230,15 @@ void EditorApp::onImGui() {
     // 必须排在 drawPanels **之前** —— 面板的显隐在这一帧就要定下来，
     // 晚一帧会出现"点了地形模式、面板闪一下才出来"。
     serviceEditMode();
+
+    // 左栏（模式列表 + 当前模式参数）。列表先画：它是用户切换模式的入口，
+    // 参数区（各模式自己的 drawPanel）在后面由 drawPanels 派发。
+    drawModeRail(*m_ctx);
+
+    // 视口标签条：先把"面板开/关"同步成标签页切换，再画条。
+    // 顺序不能反 —— 否则这一帧点开的 Physics 要等下一帧才高亮。
+    syncViewportTabs();
+    drawViewportTabBar(m_tabBarRect);
 
     // E04：所有面板**表驱动**绘制。顺序 = 表里的顺序（主面板在前、
     // 浮动调试面板在后），与改造前逐条一致。
@@ -3913,6 +4014,10 @@ void EditorApp::focusPanel(const char* id) {
     if (idx < 0) return;
     // setPanelOpen 里带了"打开就把托盘收起态作废"，所以这里不用再清一次
     setPanelOpen(idx, true);
+    // 2026-10-21：视口标签页宿主里，"聚焦一张面板"= 切到它的那一页。
+    // 少了这一句，底栏点 Output Log（本来就是开着的）会静默无效 ——
+    // 面板确实活着，只是它那一页不是当前页。
+    setActiveViewportTab(idx);
     m_focusPanelWant = panelId(idx);
     VK_LOG_INFO("PANEL-FOCUS %s", id);
 }
@@ -3937,6 +4042,10 @@ void EditorApp::drawPanelMinimizeButtons() {
         const std::string wname = trayWindowName(pd.id);
         ImGuiWindow* w = ImGui::FindWindowByName(wname.c_str());
         if (!w || w->Collapsed || w->Hidden || !w->Active) continue;
+        // 2026-10-21：被托管成视口标签页的面板**没有标题栏**（标签条就是它的
+        // 标题），那个位置现在是内容区右上角 —— 在这里画一条"最小化横线"
+        // 会变成一件飘在内容上的怪东西，点一下还会把整页收走。跳过。
+        if (w->Flags & ImGuiWindowFlags_NoTitleBar) continue;
 
         // 关闭 X 的几何来自 imgui.cpp:RenderWindowTitleBarContents ——
         //   close_pos = (titleMax.x - FramePadding.x - FontSize, titleMin.y + FramePadding.y)
@@ -4184,6 +4293,11 @@ void EditorApp::drawBottomBar() {
                 // 只收窗口，不动勾选 —— 按钮必须留着，否则"再点一下打开"
                 // 就没有入口了（用户要的是按钮可点、叉号才移除按钮）。
                 panelTrayHiddenRef(i) = !panelTrayHiddenRef(i);
+                // 2026-10-21：标签页宿主还有第二层状态 —— 它是"开着"的，
+                // 但视口里现在显示的是别的页。光把 trayHidden 清掉，画面
+                // 一点变化都没有（用户会以为按钮坏了）。所以恢复可见时
+                // 顺手切到那一页。
+                if (!panelTrayHiddenRef(i)) setActiveViewportTab(i);
                 VK_LOG_INFO("PANEL-TRAY %s open=%d", pd.id,
                             panelTrayHiddenRef(i) ? 0 : 1);
                 break;
@@ -4654,10 +4768,16 @@ void EditorApp::drawStatsPanel() {
     const float x = io.DisplaySize.x - w660 - kFloatMargin;
     const float y = io.DisplaySize.y - kStatusH - kScriptsH - kFloatGap - kStatsH;
 
-    ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(w660, 0.0f), ImGuiCond_FirstUseEver);
+    // 2026-10-21：Stats 是视口标签页的一页（见 PanelDock.h）
+    ImGuiWindowFlags wf = 0;
+    const bool docked = applyDockHint(wf);
+    if (!docked) {
+        ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(w660, 0.0f), ImGuiCond_FirstUseEver);
+    }
 
-    if (!ImGui::Begin(trId("Stats", "panel_stats"), &m_ctx->panels().stats)) {
+    if (!ImGui::Begin(trId("Stats", "panel_stats"),
+                      docked ? nullptr : &m_ctx->panels().stats, wf)) {
         ImGui::End();
         return;
     }
@@ -4982,10 +5102,17 @@ void EditorApp::drawScriptPanel() {
     const float x = io.DisplaySize.x - kFloatW - kFloatMargin;
     const float y = io.DisplaySize.y - kStatusH - kScriptsH;
 
-    ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(kFloatW, kScriptsH), ImGuiCond_FirstUseEver);
+    // 2026-10-21：视口标签页的一页（见 PanelDock.h）
+    ImGuiWindowFlags wf = 0;
+    const bool docked = applyDockHint(wf);
+    if (!docked) {
+        ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(kFloatW, kScriptsH),
+                                 ImGuiCond_FirstUseEver);
+    }
 
-    if (!ImGui::Begin(trId("Scripts", "panel_scripts"), &m_ctx->panels().scripts)) {
+    if (!ImGui::Begin(trId("Scripts", "panel_scripts"),
+                      docked ? nullptr : &m_ctx->panels().scripts, wf)) {
         ImGui::End();
         return;
     }
@@ -5200,14 +5327,21 @@ void EditorApp::drawEnginePanel() {
     // 走注册表绑定的地址 —— 与 env 路径**同一份存储**。这里只剩
     // ① 顶栏（档位 / 搜索 / 画质预设）② 生成器表达不了的四小块
     // （见下面四个 drawEngineXxx：动作型控件与只读信息）。
-    const ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(
-        ImVec2(io.DisplaySize.x - kFloatW - kFloatMargin,
-               io.DisplaySize.y - kStatusH - kScriptsH),
-        ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(kFloatW, kScriptsH), ImGuiCond_FirstUseEver);
+    // 2026-10-21：视口标签页的一页（见 PanelDock.h）
+    ImGuiWindowFlags wf = 0;
+    const bool docked = applyDockHint(wf);
+    if (!docked) {
+        const ImGuiIO& io = ImGui::GetIO();
+        ImGui::SetNextWindowPos(
+            ImVec2(io.DisplaySize.x - kFloatW - kFloatMargin,
+                   io.DisplaySize.y - kStatusH - kScriptsH),
+            ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(kFloatW, kScriptsH),
+                                 ImGuiCond_FirstUseEver);
+    }
 
-    if (!ImGui::Begin(trId("Engine", "panel_engine"), &m_ctx->panels().engine)) {
+    if (!ImGui::Begin(trId("Engine", "panel_engine"),
+                      docked ? nullptr : &m_ctx->panels().engine, wf)) {
         ImGui::End();
         return;
     }
@@ -7127,7 +7261,22 @@ void EditorApp::drawCharacterWindow() {
     }
 
     // 每帧绘制（窗口内部自己判断是否打开）
-    m_characterWindow->draw();
+    //
+    // 2026-10-21：角色详情也是**视口标签页的一页**（它是表里唯一 "draw 是
+    // 空壳、窗口由这里无条件画" 的面板，所以托管只能在这一层做）。
+    //   · 不是当前标签页 → 整块不画（窗口对象活着，切回来原样恢复）
+    //   · 是当前标签页  → 推 dockHint，CharacterWindow::draw 里 applyDockHint
+    //                     会把矩形钉到内容区、并去掉标题栏
+    const int activeTab = activeViewportTab();
+    if (idx >= 0 && panelOpen(idx) && activeTab == idx &&
+        !panelTrayHiddenRef(idx)) {
+        const Rect& vp = m_ctx->layout().viewport;
+        pushDockHint(vp.x, vp.y, vp.w, vp.h);
+        m_characterWindow->draw();
+        clearDockHint();
+    }
+    // 不是当前页就**不提交** —— 这正是标签页的语义。窗口对象活着
+    // （m_open 不变），下次切回来时从自己的状态原样恢复。
 }
 
 } // namespace editor

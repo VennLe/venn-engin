@@ -151,6 +151,26 @@ private:
         std::vector<std::array<std::uint32_t, 3>> tri;      // 三角形 → 3 个组
         std::vector<std::array<std::uint32_t, 3>> triVert;  // 三角形 → 原始顶点
         std::vector<glm::vec3> triNormal;                   // 三角形法线
+        // ---- 多边形层（2026-10-21）----
+        //
+        // 渲染网格一定是三角形，但**建模要看的是面**：立方体一个正方形面在
+        // 缓冲里是 2 个三角形，照着三角形画面/选/操作，用户看到的就是
+        // "每个正方形都被一条对角线劈开"。
+        //
+        // 所以这里把"共面且共享一条边"的两个三角形合并成一个多边形（面）。
+        // 立方体 6 个面 → 6 个四边形；网格平面 → 每格一个四边形；球面因为
+        // 相邻三角形不共面 → 保持三角形（与 Blender 的三角球一致）。
+        struct Poly {
+            std::vector<std::uint32_t> v;     // 顶点（weld id），按绕序
+            std::vector<std::uint32_t> tris;  // 组成它的三角形下标
+            glm::vec3 normal{0.0f, 0.0f, 1.0f};
+            float area = 0.0f;
+        };
+        std::vector<Poly> poly;
+        std::vector<std::uint32_t> triPoly;  // 三角形 → 多边形下标
+        // 多边形**内部**的边（三角形对角线的那些）：边模式下不画、不可选 ——
+        // 否则用户能选中一条"本来不存在"的边。
+        std::unordered_set<std::uint64_t> innerEdge;
         bool valid = false;
     };
 
@@ -159,7 +179,32 @@ private:
     void upload(const char* op);
     void selectAll(bool on);
 
+    // 一次性编辑用的中间表示：多边形面表 + 每角指向"原来的渲染顶点"。
+    //
+    // 为什么需要它：三个新操作都要**增删面**，而且会动到没被选中的邻居面
+    // （倒角会切掉所有相邻面的角）。直接在三张索引表上做增量拼接，每种
+    // 操作都得写一套"旧三角形怎么删、新三角形怎么接"的胶水，一旦漏掉
+    // 一个角就是一堆碎面。
+    //
+    // 摊平成面表之后，"手术"就只是在 vector 上改面；写回时统一扇形三角化。
+    // 每角保留原渲染顶点下标，是为了**不动没被改过的面的硬边/UV** ——
+    // 没有这一条，一次倒角会把整个立方体的法线重算成圆角。
+    struct EditMesh {
+        std::vector<glm::vec3> pos;                     // weld 顶点位置
+        std::vector<std::vector<std::uint32_t>> faces;  // 面 → 顶点（绕序一致）
+        // 面 → 每个角对应的渲染顶点。kNewVert = 这个角是新建的（写回时建）
+        std::vector<std::vector<std::uint32_t>> cornerVert;
+        static constexpr std::uint32_t kNewVert = 0xFFFFFFFFu;
+    };
+    void buildEditMesh(EditMesh& em) const;
+    void commitEditMesh(EditMesh& em, const char* op);
+    // 按位置选点：新顶点在 upload 之后才被 weld，操作里拿不到组号，
+    // 只能记住"这几个位置要保持选中"，写回后按量化位置反查。
+    void selectByPosition(const std::vector<glm::vec3>& pts);
+
     std::vector<std::uint32_t> selFaces() const;   // 三个顶点全选中的面
+    // 选中多边形：所有顶点都在 m_sel 里的面（面模式下的真正选区单位）
+    std::vector<std::uint32_t> selPolys() const;
     glm::vec3 selectionCenter() const;
     glm::vec3 selectionNormal() const;
 
@@ -171,6 +216,16 @@ private:
     void flipSelected();       // 翻转选中的面
     void smoothAll(float amount);
     void mirrorX();
+
+    // ---- 2026-10-21 新增：Blender 的三把拓扑刷子 ----
+    //
+    // 三者共用一套"编辑网格"中间表示（见 .cpp 里的 EditMesh）：把当前的
+    // 多边形层摊成 (位置数组 + 面表 + 每角对应的原渲染顶点)，在它上面做
+    // 拓扑手术，再一次写回。这样三次操作互不干扰，也不用为每种操作单独
+    // 维护一套索引拼接逻辑（那正是上一版最容易出错的地方）。
+    void insetFaces();         // I  ：内插面
+    void bevelVertices();      // B  ：倒角（顶点倒角，等价于 Blender Ctrl+B 的角）
+    void loopCut();            // Ctrl+R：环切（沿四边形带插入一圈边）
 
     void beginModal(Modal m);
     void updateModal(const glm::vec2& mouse);
@@ -194,6 +249,19 @@ private:
     SelectMode m_selMode = SelectMode::Face;
     std::unordered_set<std::uint32_t> m_sel;  // weld 组 id
 
+    // 多边形分组的"跨操作保鲜"提示：每个面由几个**连续的**三角形组成，
+    // 顺序与 m_idx 里三角形的顺序一致（commitEditMesh 就是按面顺序扇形
+    // 三角化的）。
+    //
+    // 为什么必须有它：`rebuildTopo` 默认靠"共面两两合并"从三角形反推面，
+    // 那个办法只能还原四边形。倒角之后一个面是**八边形**，扇形三角化出
+    // 6 个三角形，两两配对只能合出 3~4 块 —— 用户会看到倒完角一圈被切成
+    // 好几段。几何是对的，丢的是"面"的分组。
+    // 所以拓扑操作做完时把它自己那份面表按"每面几个三角形"记下来，
+    // rebuildTopo 优先按它分组；其它操作（挤出/细分/镜像…）不设它，
+    // 自然退回启发式合并。
+    std::vector<std::uint32_t> m_polyHint;
+
     // 模态变换（G / S / R）：进入时备份 weldPos，鼠标移动时**从备份重算**
     // 而不是在上一帧结果上累加 —— 累加会随着鼠标抖动缓慢漂移，而且按
     // ESC 回不去（所有中间态都被吃进顶点里了）。
@@ -211,6 +279,13 @@ private:
     int m_selectedEdges = 0;
     float m_extrude = 0.25f;      // 面板上那个"挤出位移"
     float m_smoothAmount = 0.5f;  // 拉普拉斯平滑的混合系数
+    // 内插面的"往里收多少"（米）。对四边形就是每条边向内平移这个距离，
+    // 与 Blender 的 Offset 一致；超过面的一半会自动被夹住（否则面会翻面）。
+    float m_inset = 0.08f;
+    // 倒角的切角长度（米），沿每条相邻边从顶点往里量。
+    float m_bevel = 0.08f;
+    // 环切段数（1 = 中间切一刀；>1 时均匀插多条）
+    int m_loopCount = 1;
     bool m_smoothShade = true;
 };
 

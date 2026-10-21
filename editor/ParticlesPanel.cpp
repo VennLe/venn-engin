@@ -2,6 +2,7 @@
 
 #include "Command.h"
 #include "DebugRects.h"
+#include "PanelDock.h"
 #include "Localization.h"
 #include "PanelRegistry.h"
 
@@ -1185,18 +1186,25 @@ void ParticlesPanel::draw() {
     bool& open = panelOpenRef("particles");
     if (!open) return;
 
-    const ImGuiIO& io = ImGui::GetIO();
-    // 430x780 只在"第一次出现"时生效；老用户 imgui.ini 里存着更小的尺寸
-    // （380x520 那版）时就轮不到它了，属性行会被挤成一团。所以再加一条
-    // **最小尺寸约束** —— 它每帧都生效，会把存档里的尺寸顶上去。
-    ImGui::SetNextWindowSizeConstraints(ImVec2(430.0f, 560.0f),
-                                        ImVec2(FLT_MAX, FLT_MAX));
-    ImGui::SetNextWindowSize(ImVec2(470.0f, 780.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.34f,
-                                   io.DisplaySize.y * 0.10f),
-                            ImGuiCond_FirstUseEver);
+    // 2026-10-21：视口标签页的一页。托管时只用内容区矩形，浮动默认值
+    // （以及下面那条最小尺寸约束）一律不参与 —— 约束会让窗口顶出内容区。
+    ImGuiWindowFlags wf = 0;
+    const bool docked = applyDockHint(wf);
+    if (!docked) {
+        const ImGuiIO& io = ImGui::GetIO();
+        // 430x780 只在"第一次出现"时生效；老用户 imgui.ini 里存着更小的尺寸
+        // （380x520 那版）时就轮不到它了，属性行会被挤成一团。所以再加一条
+        // **最小尺寸约束** —— 它每帧都生效，会把存档里的尺寸顶上去。
+        ImGui::SetNextWindowSizeConstraints(ImVec2(430.0f, 560.0f),
+                                            ImVec2(FLT_MAX, FLT_MAX));
+        ImGui::SetNextWindowSize(ImVec2(470.0f, 780.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.34f,
+                                       io.DisplaySize.y * 0.10f),
+                                ImGuiCond_FirstUseEver);
+    }
 
-    if (!ImGui::Begin(trId("Particles", "panel_particles"), &open)) {
+    if (!ImGui::Begin(trId("Particles", "panel_particles"),
+                      docked ? nullptr : &open, wf)) {
         ImGui::End();
         return;
     }

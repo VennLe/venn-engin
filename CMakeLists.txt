@@ -496,7 +496,8 @@ list(APPEND SHADER_TARGETS ${PBR_MDI_OUT})
 # 4x（默认）时用后者。给空间.glsl 的函数族提供两种重载签名。
 set(SHADER_MSAA_DEPTH_SHADERS
     ssao.frag ssao_blur.frag fg_ssr.frag fg_ssgi.frag fg_godrays.frag
-    fg_dof.frag fg_motionblur.frag fg_taa.frag decal.frag particle.frag)
+    fg_dof.frag fg_motionblur.frag fg_taa.frag decal.frag particle.frag
+    water.frag)
 
 foreach(SRC ${SHADER_MSAA_DEPTH_SHADERS})
     set(SRC_PATH ${SHADER_SRC_DIR}/${SRC})

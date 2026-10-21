@@ -47,9 +47,13 @@ enum class EditMode : int {
     BrushEdit,      // 笔刷编辑
     Animation,      // 动画
     PCG,            // 程序化内容生成
+    // 2026-10-21：水体。**追加在末尾**而不是插在 Landscape 后面 ——
+    // 上面 9 项的顺序即整数下标，落盘的布局/模式用它。插在中间会让
+    // 老布局里的 "pcg"(8) 变成 "water"，属于静默改语义。
+    Water,
 };
 
-constexpr int kEditModeCount = 9;
+constexpr int kEditModeCount = 10;
 
 // 英文名（TR() 的键，也是日志里的 mode= 值）。下标 = EditMode 的整数值。
 const char* editModeName(EditMode m);

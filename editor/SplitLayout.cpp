@@ -30,7 +30,18 @@ constexpr float kLeftMax = 520.0f;
 constexpr float kRightFrac = 0.205f;
 constexpr float kRightMin = 330.0f;
 constexpr float kRightMax = 560.0f;
-constexpr float kLeftSplit = 0.50f;
+// 右栏里 Hierarchy / Inspector 的上下比例（Hierarchy 占 42%）。
+constexpr float kRightSplit = 0.42f;
+// 左栏（模式栏）的宽度下限。
+//
+// 320 是"9 行列表刚好放得下"的宽度，但左栏下半现在已经不是列表、而是**各
+// 模式自己的参数面板**，而它们原来是按 420~480 宽的浮动窗口设计的：建模面板
+// 那排 `Subdivide selected(150) + Flip selected(140) + Delete(110)` 是
+// SameLine 硬排的，横向合计 400 出头，加上窗口内边距 446 —— 320 宽时右边
+// 那个 Delete 直接被窗口裁掉（点都点不到），400 宽也还差一点。
+// 所以下限对齐"最宽的那块内容"，而不是列表：取 460（= 建模面板的设计宽度）。
+// 上限与右栏同档，避免宽屏上它吃掉视口。
+constexpr float kMinModeRail = 460.0f;
 
 // 分隔线配色（E06-1：三态）
 constexpr ImU32 kSplitIdle = IM_COL32(70, 75, 82, 255);
@@ -44,6 +55,7 @@ const char* slotName(int slot) {
         case kSlotContent:   return "Content";
         case kSlotViewport:  return "Viewport";
         case kSlotInspector: return "Inspector";
+        case kSlotModes:     return "Modes";
         default:             return "Panel";
     }
 }
@@ -53,43 +65,57 @@ const char* slotName(int slot) {
 void SplitLayout::buildDefault() {
     m_nodes.clear();
 
-    // 树结构（下标）：
-    //   0: Horizontal 切「左栏 | 右区」
-    //        A = 节点 1（Vertical：Hierarchy 上 / Content 下）
-    //        B = 节点 2（Horizontal：Viewport 左 / Inspector 右）
-    // 与 Blender 的默认 Screen 布局同构。
+    // 树结构（下标）—— 2026-10-21 按用户要求重排：
+    //   0: Horizontal 切「左栏(模式) | 右区」
+    //        A = 叶子 kSlotModes（模式列表 + 当前模式参数）
+    //        B = 节点 1
+    //   1: Horizontal 切「视口 | 右栏」
+    //        A = 叶子 kSlotViewport
+    //        B = 节点 2
+    //   2: Vertical 切「Hierarchy 上 / Inspector 下」
+    //        A = 叶子 kSlotHierarchy
+    //        B = 叶子 kSlotInspector
+    //
+    // 原来是「左栏(Hierarchy 上 / Content 下) | 视口 | Inspector」。用户原话：
+    // 「原本的 Hierarchy 面板挪到编辑器窗口右面的 Inspector 面板的上方，
+    //   即在原来 Inspector 面板呈上下结构。」—— Content 早在 2026-10-17
+    // 就改成了底栏抽屉（不占分栏），于是左栏正好空出来给模式栏。
+    //
+    // 节点数仍是 3（kNodeCount），所以工作区预设 / 落盘的数组长度不变；
+    // 变的是各节点的**语义** —— 见 EditorLayoutIO 里 kFormatVersion 的说明。
 
     SplitNode root;
     root.dir = SplitNode::Dir::Horizontal;
     root.ratio = 0.0f;    // 首帧按窗口尺寸初始化（见 beginFrame）
     root.autoRatio = true;
-    root.minA = kMinPane;
+    root.minA = kMinModeRail;   // 模式栏有下限：低于这个宽度按钮就挤成一团
     root.minB = 0.0f;
-    root.a = 1;
-    root.b = 2;
+    root.a = -1;
+    root.b = 1;
+    root.panelA = kSlotModes;
 
-    SplitNode left;
-    left.dir = SplitNode::Dir::Vertical;
-    left.ratio = kLeftSplit;
-    left.autoRatio = false;   // 上下比例是人为定的，不跟窗口宽度走
-    left.minA = kMinPane;
-    left.minB = kMinPane;
-    left.a = -1;  left.b = -1;
-    left.panelA = kSlotHierarchy;
-    left.panelB = kSlotContent;
+    SplitNode mid;
+    mid.dir = SplitNode::Dir::Horizontal;
+    mid.ratio = 0.0f;   // 首帧按窗口尺寸初始化
+    mid.autoRatio = true;
+    mid.minA = 0.0f;    // 视口可以被压得很小（视口优先反着来：右栏先折叠）
+    mid.minB = 0.0f;
+    mid.a = -1;
+    mid.b = 2;
+    mid.panelA = kSlotViewport;
 
     SplitNode right;
-    right.dir = SplitNode::Dir::Horizontal;
-    right.ratio = 0.0f;   // 首帧按窗口尺寸初始化
-    right.autoRatio = true;
-    right.minA = 0.0f;    // Viewport 可被压得很小（视口优先反着来：Inspector 先折叠）
+    right.dir = SplitNode::Dir::Vertical;
+    right.ratio = kRightSplit;   // Hierarchy 占右栏的 42%
+    right.autoRatio = false;     // 上下比例是人为定的，不跟窗口尺寸走
+    right.minA = kMinPane;
     right.minB = kMinPane;
     right.a = -1;  right.b = -1;
-    right.panelA = kSlotViewport;
+    right.panelA = kSlotHierarchy;
     right.panelB = kSlotInspector;
 
     m_nodes.push_back(root);   // 0
-    m_nodes.push_back(left);   // 1
+    m_nodes.push_back(mid);    // 1
     m_nodes.push_back(right);  // 2
     m_root = 0;
 
@@ -124,21 +150,25 @@ void SplitLayout::beginFrame(float w, float h) {
 
     const float bodyW = std::max(w, kMinPane * 3.0f);
 
+    // 节点 0：模式栏 | 其余
     SplitNode& root = m_nodes[m_root];
     const float leftW = root.autoRatio
-                            ? std::clamp(bodyW * kLeftFrac, kLeftMin, kLeftMax)
+                            ? std::clamp(bodyW * kLeftFrac, kMinModeRail,
+                                         std::max(kLeftMax, kMinModeRail))
                             : bodyW * root.ratio;
     if (root.autoRatio) root.ratio = std::clamp(leftW / bodyW, 0.05f, 0.45f);
 
-    SplitNode& right = m_nodes[2];
-    const float rightBodyW = std::max(bodyW - leftW, kMinPane);
-    const float rightW = right.autoRatio
+    // 节点 1：视口 | 右栏。右栏宽按窗口宽度自适应（夹在 330..560）
+    SplitNode& mid = m_nodes[1];
+    const float restW = std::max(bodyW - leftW, kMinPane);
+    const float rightW = mid.autoRatio
                              ? std::clamp(bodyW * kRightFrac, kRightMin, kRightMax)
-                             : rightBodyW * right.ratio;
-    if (right.autoRatio) {
-        right.ratio = std::clamp((bodyW - leftW - rightW) / rightBodyW, 0.10f, 1.0f);
+                             : restW * mid.ratio;
+    if (mid.autoRatio) {
+        mid.ratio = std::clamp((restW - rightW) / restW, 0.10f, 1.0f);
     }
 
+    // 节点 2（右栏上下）：kRightSplit 是人定的，autoRatio=false，这里不动它。
     m_initialized = true;
     m_lastInitW = w;
 }
@@ -163,6 +193,9 @@ void SplitLayout::syncPanelVisibility() {
             case kSlotContent:   return false;
             case kSlotViewport:  return panelOpen(panelIndexOf("viewport"));
             case kSlotInspector: return panelOpen(panelIndexOf("inspector"));
+            // 模式栏恒在：它是"当前在哪个模式 + 这个模式的参数"，关掉它等于
+            // 让整个编辑模式失去一切可见入口（顶栏下拉还在，但那是第二入口）。
+            case kSlotModes:     return true;
             default:             return true;
         }
     };
@@ -230,6 +263,7 @@ void SplitLayout::apply(LayoutRects& out) {
         out.content = {0.0f, 0.0f, 0.0f, 0.0f};
         out.viewport = {0.0f, 0.0f, 0.0f, 0.0f};
         out.inspector = {0.0f, 0.0f, 0.0f, 0.0f};
+        out.modes = {0.0f, 0.0f, 0.0f, 0.0f};
         writePanel(m_maximized, 0.0f, bodyY, W, bodyH, out);
     } else {
         resolve(m_root, 0.0f, bodyY, W, bodyH, out);
@@ -283,6 +317,7 @@ void SplitLayout::writePanel(int panel, float x, float y, float w, float h,
         case kSlotContent:   out.content   = {x, y, w, h}; break;
         case kSlotViewport:  out.viewport  = {x, y, w, h}; break;
         case kSlotInspector: out.inspector = {x, y, w, h}; break;
+        case kSlotModes:     out.modes     = {x, y, w, h}; break;
         default: break;
     }
 }

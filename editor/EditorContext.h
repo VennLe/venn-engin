@@ -144,8 +144,13 @@ struct LayoutRects {
     //
     // bottom = 状态栏正上方那条通栏（Content / 输出日志 / CMD 三个带图标的
     // 按钮 + 资源条目统计）。高度恒为 kBottomBarH（见 EditorApp）。
+    // modes = 2026-10-21 起窗口最左侧那一栏（模式列表 + 当前模式参数）。
+    // 它下面再切成两块：上半是 ModeRail 画的 9 行单选，下半是当前模式自己
+    // 的 drawPanel()。两块矩形由 ModeRail.h 的 modeRailListRect /
+    // modeRailBodyRect 从这一块推出来 —— LayoutRects 里只存整栏，
+    // 免得"分栏树多一个叶子"。
     Rect menu, toolbar, hierarchy, content, inspector, viewport, status,
-         transport, bottom;
+         transport, bottom, modes;
 };
 
 // 物理世界的**运行态只读快照**（R7-1）。

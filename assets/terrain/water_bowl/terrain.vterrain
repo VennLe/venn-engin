@@ -1,0 +1,19 @@
+{
+  "type": "terrain",
+  "version": 1,
+  "name": "water_bowl",
+  "cols": 257,
+  "rows": 257,
+  "metersPerPixel": 2.0,
+  "maxHeight": 40.0,
+  "splatRepeat": 1.0,
+  "layerTiling": 6.0,
+  "height": "height.r32",
+  "splat": "splat.rgba8",
+  "layers": [
+    "materials/terrain_grass",
+    "materials/terrain_dirt",
+    "materials/terrain_rock",
+    "materials/terrain_snow"
+  ]
+}

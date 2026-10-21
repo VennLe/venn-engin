@@ -1,6 +1,7 @@
 #include "PhysicsPanel.h"
 
 #include "DebugRects.h"
+#include "PanelDock.h"
 #include "Localization.h"
 #include "PanelRegistry.h"
 
@@ -38,13 +39,21 @@ void PhysicsPanel::draw() {
     bool& open = panelOpenRef("physics");
     if (!open) return;
 
-    const ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowSize(ImVec2(380.0f, 540.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.60f,
-                                   io.DisplaySize.y * 0.14f),
-                            ImGuiCond_FirstUseEver);
+    // 2026-10-21：这个面板现在是视口标签条上的一页（锚定哪一块由
+    // EditorApp::drawPanels 通过 dockHint 给出）。没在被托管时才用
+    // "第一次出现摆右上角"的浮动默认值。
+    ImGuiWindowFlags wf = 0;
+    const bool docked = applyDockHint(wf);
+    if (!docked) {
+        const ImGuiIO& io = ImGui::GetIO();
+        ImGui::SetNextWindowSize(ImVec2(380.0f, 540.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.60f,
+                                       io.DisplaySize.y * 0.14f),
+                                ImGuiCond_FirstUseEver);
+    }
 
-    if (!ImGui::Begin(trId("Physics", "panel_physics"), &open)) {
+    if (!ImGui::Begin(trId("Physics", "panel_physics"),
+                      docked ? nullptr : &open, wf)) {
         ImGui::End();
         return;
     }

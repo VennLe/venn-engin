@@ -5,6 +5,7 @@
 #include "EditorDragDrop.h"
 #include "FeatureUIGen.h"   // emitParamChange：改 grid.* 后要标脏 + 记撤销
 #include "EditorScene.h"  // instantiateModel
+#include "WaterEditor.h"
 #include "LandscapeEditor.h"   // 编辑模式：地形笔刷 / 高度查询
 #include "FoliageEditor.h"     // 编辑模式：植被撒点
 #include "ToolkitEditors.h"  // 编辑模式：顶点色绘制 / 刷子体放置
@@ -203,6 +204,7 @@ enum VpIcon {
     kVpIconGrid,
     kVpIconCaret,
     kVpIconAxis,
+    kVpIconPlus,   // "+"：工具条末尾那颗 add_object（2026-10-21 从顶栏搬来）
 };
 
 // 把图标画进 [p, p+s] 这个方块里。坐标系是"单位正方形缩放到 s"，
@@ -328,6 +330,14 @@ void paintVpIcon(ImDrawList* dl, ImVec2 p, float s, int kind, ImU32 c) {
                                    ctr.y + std::sin(a) * s * 0.38f),
                             c, th);
             }
+            break;
+        }
+        case kVpIconPlus: {
+            // 加号：两条等长线 + 圆角端点（直角的十字在小尺寸下像网格线）
+            dl->AddLine(ImVec2(X(0.24f), Y(0.5f)), ImVec2(X(0.76f), Y(0.5f)),
+                        c, th * 1.15f);
+            dl->AddLine(ImVec2(X(0.5f), Y(0.24f)), ImVec2(X(0.5f), Y(0.76f)),
+                        c, th * 1.15f);
             break;
         }
         case kVpIconCaret: {
@@ -550,6 +560,9 @@ void ViewportPanel::drawToolbar() {
         c.setGizmoMode(m);
     };
     const auto same = [&]() { ImGui::SameLine(0.0f, 2.0f); };
+    // 左组（工具 / 吸附 / Add）画完时，光标停在哪（窗口局部 x）。右组靠它
+    // 算"还剩多少地方"—— 见 ④b 里的说明。
+    float leftGroupEndX = 0.0f;
 
     // ---------------- ① 工具下拉（当前工具图标 + ▾）----------------
     {
@@ -681,10 +694,85 @@ void ViewportPanel::drawToolbar() {
             openDropdown("##vp_snap_scale");
     }
 
+    // ---------------- ④b "+ Add"（左组末尾）----------------
+    //
+    // 2026-10-21 用户要求把它从顶栏挪到"视口上侧工具条左侧的末尾"：
+    //   「还有旁边的那个 Add 的列表可以把它的位置调整到视口上侧工具条
+    //     左侧的末尾。」
+    //
+    // 放在左组最后、右对齐组之前 —— 再往右是"透视 / 布局 / 照明"那批
+    // **只读视图设置**，语义上分得开。
+    //
+    // ⚠ 这里**不复制一份菜单**：视口里已经有一套（Shift+A 那个
+    //   `drawAddMenu(vpPos, vpSize, hovered)`，按鼠标射线落地、带 #序号
+    //   锚点）。按钮只是**再开一次同一个弹层**（`##vp_add`），落点由
+    //   drawToolbar 侧算好塞进 m_addSpot。两套菜单必然漂移，一套最省事。
+    same();
+    vpBarSeparator();
+    same();
+    {
+        // 图标 + "Add" 手绘：ImGui::Button 的标签居中，而这里要和左边
+        // 那排图标按钮的视觉节奏一致（左图标右文字）。
+        const float h = 24.0f;
+        const char* txt = TR("Add");
+        const float w = ImGui::CalcTextSize(txt).x + 26.0f;
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const ImVec2 q(p.x + w, p.y + h);
+        const bool hit = ImGui::InvisibleButton("##vp_add_btn", ImVec2(w, h));
+        const bool hov = ImGui::IsItemHovered();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        if (hov) dl->AddRectFilled(p, q, IM_COL32(255, 255, 255, 30), 3.0f);
+        const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+        paintVpIcon(dl, ImVec2(p.x + 6.0f, p.y + 5.0f), 14.0f, kVpIconPlus, col);
+        dl->AddText(ImVec2(p.x + 24.0f,
+                           (p.y + q.y) * 0.5f - ImGui::GetTextLineHeight() * 0.5f),
+                    col, txt);
+        logRect("TB-ADD", p, q);   // 锚点名字沿用历史名（脚本按它点）
+        if (hov) {
+            // ⚠ 与词典里的那条**逐字符**一致（换行在 "the\n" 之后）：
+            //   改写成一个字面量会让 key 对不上，i18n 检查立刻红。
+            ImGui::SetTooltip(TR("Add an object to the scene (also: Shift+A in the\n"
+                              "viewport, which drops it where the mouse points)."));
+        }
+        // ⚠ 左组末端 = **这颗按钮的右边缘**（换算成窗口局部坐标），不是
+        //   `GetCursorPosX()`：ImGui 每画完一个 item 就把光标 x 收回到行首
+        //   （≈ 内边距），读到的永远是十几像素 —— 第一版就是这么写的，于是
+        //   "还剩多少地方"算成了整个窗口宽，右组照画在固定位置、和左边这排
+        //   重叠（截图里 "+ Add" 压在 "Perspective" 上就是这么来的）。
+        leftGroupEndX = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x;
+        if (hit) {
+            // 落点：鼠标此刻在工具条上，没有视口射线可用 —— 用"相机朝向前方
+            // 5 m 的地面"做基准，再按第几次打开做环形微偏移（连点两次不会
+            // 叠在一起，看着像"没加上"）。
+            scene::Camera& cam = m_ctx.activeScene().camera();
+            glm::vec3 fwd = cam.target() - cam.position();
+            if (glm::length(fwd) < 1.0e-4f) fwd = glm::vec3(0.0f, -1.0f, 0.0f);
+            m_addSpot = cam.position() + glm::normalize(fwd) * 5.0f;
+            m_addSpot.z = 0.0f;
+            if (m_addMenuSeq > 0) {
+                const float a = 2.39996f * static_cast<float>(m_addMenuSeq);
+                m_addSpot.x += std::cos(a) * 2.5f;
+                m_addSpot.y += std::sin(a) * 2.5f;
+            }
+            ++m_addMenuSeq;
+            VK_LOG_INFO("VP-ADD-OPEN seq=%d at=(%.1f,%.1f) via=toolbar",
+                        m_addMenuSeq, static_cast<double>(m_addSpot.x),
+                        static_cast<double>(m_addSpot.y));
+            ImGui::OpenPopup("##vp_add");
+        }
+    }
+
     // ---------------- ⑤ 右侧组：视口怎么看 ----------------
     //
-    // 右对齐。宽度先算再画：算出来放不下就**整组不画** —— 挤在边缘被裁掉
-    // 一半的按钮，比没有更让人困惑（而且会盖住左边那排的命中区）。
+    // **按预算贪心保留**：从左组末端到窗口右边缘就那么多地方，七颗按钮
+    // 全摆上去在这个视口宽度下根本放不下（实测需要 919px，可用 789px）。
+    // 原来的写法是"算出来放不下就整组不画"，但那个判断读的是
+    // `GetCursorPosX()`，而 ④b 的 Add 弹层会把光标 x 打回 0 —— 判断于是
+    // 永远成立，右组照画在固定位置，和左边那排**直接重叠**（截图里
+    // "+ Add" 压在 "Perspective" 上就是这么来的）。
+    //
+    // 现在改成：按重要性从高到低往预算里塞，塞不下的那颗就不画，并在
+    // 日志里列出被丢的是谁。宁可少两颗，也不重叠/不被裁一半。
     {
         char speedBuf[32];
         std::snprintf(speedBuf, sizeof(speedBuf), "%.2f",
@@ -693,59 +781,105 @@ void ViewportPanel::drawToolbar() {
         const char* persp = TR("Perspective");
         const char* layoutName = viewportLayoutShortName(c.viewportLayout());
 
-        const float rightW =
-            vpTextButtonWidth(persp) + 2.0f +
-            vpTextButtonWidth(layoutName) + 2.0f +
-            vpValueButtonWidth(speedBuf) +
-            2.0f + vpTextButtonWidth(lightName) + 2.0f + 24.0f + 2.0f + 24.0f +
-            2.0f + 24.0f + 8.0f;
+        // 顺序 = 重要性：投影 > 布局 > 照明 > 显示 > 设置 > 网格 > 相机速度
+        // （速度还能右键 + 滚轮调，所以排最后）。
+        struct VpBarItem { int id; float w; };
+        const VpBarItem items[] = {
+            {0, vpTextButtonWidth(persp)},      // 投影
+            {1, vpTextButtonWidth(layoutName)}, // 布局
+            {2, vpTextButtonWidth(lightName)},  // 照明
+            {3, 24.0f},                         // 显示开关
+            {4, 24.0f},                         // 视口设置
+            {5, 24.0f},                         // 网格
+            {6, vpValueButtonWidth(speedBuf)},  // 相机速度
+        };
+        constexpr int kItemCount = 7;
 
-        const float targetX =
-            ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rightW;
-        if (targetX > ImGui::GetCursorPosX() + 6.0f) {
+        const float budget =
+            ImGui::GetContentRegionMax().x - leftGroupEndX - 8.0f;
+        bool take[kItemCount] = {false};
+        float need = 0.0f;
+        int taken = 0;
+        for (int i = 0; i < kItemCount; ++i) {
+            const float w = items[i].w + (taken > 0 ? 2.0f : 0.0f);
+            if (need + w > budget) break;   // 后面的更不重要，直接停
+            take[items[i].id] = true;
+            need += w;
+            ++taken;
+        }
+
+        if (taken > 0) {
+            const float targetX = ImGui::GetContentRegionMax().x - need;
             ImGui::SameLine(targetX);
             logRect("VP-BAR-RIGHT", ImGui::GetCursorScreenPos(),
-                    ImVec2(ImGui::GetCursorScreenPos().x + rightW,
+                    ImVec2(ImGui::GetCursorScreenPos().x + need,
                            ImGui::GetCursorScreenPos().y + 24.0f));
+            // 自动化：这一帧实际画出了哪几颗（taken）与被丢掉的是谁（budget 不够）
+            if (std::getenv("MYVK_LOG_RECTS")) {
+                static int lastTaken = -1;
+                if (taken != lastTaken) {
+                    lastTaken = taken;
+                    // 只报数字：taken<7 就说明有条目因为放不下被丢了
+                    // （丢的永远是数组尾部那几颗，顺序在 items[] 里写死）
+                    VK_LOG_INFO("VP-BAR-FIT taken=%d/%d need=%.0f budget=%.0f",
+                                taken, kItemCount,
+                                static_cast<double>(need),
+                                static_cast<double>(budget));
+                }
+            }
 
-            if (vpTextButton("vpt_view", persp,
-                             TR("Projection, view directions and camera"),
-                             "VP-VIEW-BTN"))
-                openDropdown("##vp_view_menu");
-            same();
+            if (take[0]) {
+                if (vpTextButton("vpt_view", persp,
+                                 TR("Projection, view directions and camera"),
+                                 "VP-VIEW-BTN"))
+                    openDropdown("##vp_view_menu");
+                same();
+            }
             // 分屏布局（1 / 2V / 2H / 4）。**紧挨着"透视"**是用户明确要求的：
             // "把这些参数也一样放到和 Perspective 这些属性一起并排放置，
             //  点击后也是展开下拉勾选框列表去设置"。
-            if (vpTextButton("vpt_layout", layoutName,
-                             TR("Viewport split layout\n"
-                                "1 = single   2V = side by side\n"
-                                "2H = stacked   4 = quad"),
-                             "VP-LAYOUT-BTN"))
-                openDropdown("##vp_layout_menu");
-            same();
-            if (vpValueButton("vpt_speed", kVpIconMove, speedBuf,
-                              TR("Camera speed\nHold RMB + wheel to change it "
-                                 "without opening this menu."),
-                              "VP-SPEED"))
-                openDropdown("##vp_speed_menu");
-            same();
-            if (vpTextButton("vpt_light", lightName,
-                             TR("Lighting mode (how the scene is drawn)"),
-                             "VP-LIGHT"))
-                openDropdown("##vp_light_menu");
-            same();
-            if (vpIconButton("vpt_show", kVpIconEye, false,
-                             TR("Show flags"), 24.0f, "VP-SHOW"))
-                openDropdown("##vp_show_menu");
-            same();
-            if (vpIconButton("vpt_settings", kVpIconGear, false,
-                             TR("Viewport settings (grid / background)"), 24.0f,
-                             "VP-SET"))
-                openDropdown("##vp_settings_menu");
-            same();
-            if (vpIconButton("vpt_grid", kVpIconGrid, c.showGridRef(),
-                             TR("Reference grid on / off"), 24.0f, "VP-GRID"))
-                c.showGridRef() = !c.showGridRef();
+            if (take[1]) {
+                if (vpTextButton("vpt_layout", layoutName,
+                                 TR("Viewport split layout\n"
+                                    "1 = single   2V = side by side\n"
+                                    "2H = stacked   4 = quad"),
+                                 "VP-LAYOUT-BTN"))
+                    openDropdown("##vp_layout_menu");
+                same();
+            }
+            if (take[2]) {
+                if (vpTextButton("vpt_light", lightName,
+                                 TR("Lighting mode (how the scene is drawn)"),
+                                 "VP-LIGHT"))
+                    openDropdown("##vp_light_menu");
+                same();
+            }
+            if (take[3]) {
+                if (vpIconButton("vpt_show", kVpIconEye, false,
+                                 TR("Show flags"), 24.0f, "VP-SHOW"))
+                    openDropdown("##vp_show_menu");
+                same();
+            }
+            if (take[4]) {
+                if (vpIconButton("vpt_settings", kVpIconGear, false,
+                                 TR("Viewport settings (grid / background)"),
+                                 24.0f, "VP-SET"))
+                    openDropdown("##vp_settings_menu");
+                same();
+            }
+            if (take[5]) {
+                if (vpIconButton("vpt_grid", kVpIconGrid, c.showGridRef(),
+                                 TR("Reference grid on / off"), 24.0f, "VP-GRID"))
+                    c.showGridRef() = !c.showGridRef();
+                same();
+            }
+            if (take[6]) {
+                if (vpValueButton("vpt_speed", kVpIconMove, speedBuf,
+                                  TR("Camera speed\nHold RMB + wheel to change it "
+                                     "without opening this menu."),
+                                  "VP-SPEED"))
+                    openDropdown("##vp_speed_menu");
+            }
         }
     }
 
@@ -1965,9 +2099,14 @@ void ViewportPanel::draw() {
                              ImGuiWindowFlags_NoMove |
                              ImGuiWindowFlags_NoResize |
                              ImGuiWindowFlags_NoCollapse;
+    // 2026-10-21：视口上方现在有一条**标签条**（ViewportTabs），它的第一页
+    // 就叫 "Viewport" —— 再留一条窗口标题栏就是同一个名字写两遍，还白吃
+    // 30px。所以标题栏一律不要（全屏时本来也不要）。
+    // ⚠ 代价：标题栏那个 × 没了。关视口改走 View ▸ Viewport / Alt+4；
+    //   标签条上 Viewport 这一页是**不可关**的（关掉它整块区域就空了）。
+    flags |= ImGuiWindowFlags_NoTitleBar;
     if (gameFullscreen) {
-        flags |= ImGuiWindowFlags_NoTitleBar |
-                 ImGuiWindowFlags_NoBringToFrontOnFocus;
+        flags |= ImGuiWindowFlags_NoBringToFrontOnFocus;
     }
 
     char title[64];
@@ -1977,7 +2116,7 @@ void ViewportPanel::draw() {
                             ? TR("  [PLAYING]")
                             : (m_ctx.isPaused() ? TR("  [PAUSED]") : "");
     std::snprintf(title, sizeof(title), TR("Viewport%s###viewport"), state);
-    if (!ImGui::Begin(title, &panels.viewport, flags)) {
+    if (!ImGui::Begin(title, nullptr, flags)) {
         ImGui::End();
         if (gameFullscreen) ImGui::PopStyleVar();
         return;
@@ -2160,7 +2299,8 @@ void ViewportPanel::draw() {
                            editMode == EditMode::Foliage ||
                            editMode == EditMode::MeshPaint ||
                            editMode == EditMode::BrushEdit ||
-                           editMode == EditMode::Modeling;
+                           editMode == EditMode::Modeling ||
+                           editMode == EditMode::Water;
     const bool modeToolActive = m_ctx.isEditing() && brushMode;
     bool modeConsumed = false;
     if (modeToolActive) {
@@ -2179,6 +2319,9 @@ void ViewportPanel::draw() {
         } else if (editMode == EditMode::Modeling && m_modelingEditor) {
             modeConsumed =
                 m_modelingEditor->viewportInput(vpPos, vpSize, hovered, dl);
+        } else if (editMode == EditMode::Water && m_waterEditor) {
+            modeConsumed =
+                m_waterEditor->viewportInput(vpPos, vpSize, hovered, dl);
         }
     }
 

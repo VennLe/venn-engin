@@ -12,6 +12,7 @@
 #include "core/Logger.h"
 #include "imgui.h"
 #include "render/GpuTimer.h"
+#include "PanelDock.h"
 
 namespace editor {
 
@@ -196,12 +197,18 @@ void GpuTimelinePanel::driveHooks(int editorFrame) {
 // ---------------------------------------------------------------- 绘制
 
 void GpuTimelinePanel::draw(bool* open, ConsolePanel* console) {
-    ImGui::SetNextWindowPos(ImVec2(40.0f, 320.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(680.0f, 420.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(420.0f, 240.0f),
-                                        ImVec2(FLT_MAX, FLT_MAX));
+    // 2026-10-21：视口标签页的一页（见 PanelDock.h）
+    ImGuiWindowFlags wf = 0;
+    const bool docked = applyDockHint(wf);
+    if (!docked) {
+        ImGui::SetNextWindowPos(ImVec2(40.0f, 320.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(680.0f, 420.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(420.0f, 240.0f),
+                                            ImVec2(FLT_MAX, FLT_MAX));
+    }
 
-    if (!ImGui::Begin(trId("GPU Timeline", "panel_gputimeline"), open)) {
+    if (!ImGui::Begin(trId("GPU Timeline", "panel_gputimeline"),
+                      docked ? nullptr : open, wf)) {
         ImGui::End();
         return;
     }

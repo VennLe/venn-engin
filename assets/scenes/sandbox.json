@@ -2,10 +2,14 @@
   "version": 1,
   "generator": "venn sandbox (G05 sample level)",
   "camera": {
-    "target": [0.0, 0.0, 2.0],
-    "yaw": 35.0,
-    "pitch": -18.0,
-    "distance": 14.0
+    "target": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "yaw": 0.610865,
+    "pitch": 0.314159,
+    "distance": 16.0
   },
   "physics": {
     "enabled": true,
@@ -17,9 +21,21 @@
     {
       "name": "Ground",
       "transform": {
-        "position": [0.0, 0.0, 0.0],
-        "rotation": [0.0, 0.0, 0.0],
-        "scale": [1.0, 1.0, 1.0]
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
       },
       "parent": -1,
       "visible": true,
@@ -34,12 +50,21 @@
       "material": {
         "kind": "procedural",
         "name": "sandbox_ground_mat",
-        "baseColor": [0.42, 0.44, 0.47, 1.0],
+        "baseColor": [
+          0.42,
+          0.44,
+          0.47,
+          1.0
+        ],
         "metallic": 0.0,
         "roughness": 0.9,
         "normalScale": 0.0,
         "ao": 1.0,
-        "emissive": [0.0, 0.0, 0.0],
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
         "doubleSided": false,
         "alphaBlend": false
       }
@@ -47,9 +72,21 @@
     {
       "name": "BoxA",
       "transform": {
-        "position": [-2.5, 0.0, 3.0],
-        "rotation": [0.0, 0.0, 0.0],
-        "scale": [1.0, 1.0, 1.0]
+        "position": [
+          -2.5,
+          0.0,
+          3.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
       },
       "parent": -1,
       "visible": true,
@@ -67,19 +104,32 @@
       "material": {
         "kind": "procedural",
         "name": "sandbox_box_a_mat",
-        "baseColor": [0.82, 0.36, 0.26, 1.0],
+        "baseColor": [
+          0.82,
+          0.36,
+          0.26,
+          1.0
+        ],
         "metallic": 0.0,
         "roughness": 0.55,
         "normalScale": 0.0,
         "ao": 1.0,
-        "emissive": [0.0, 0.0, 0.0],
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
         "doubleSided": false,
         "alphaBlend": false
       },
       "rigidbody": {
         "bodyType": 2,
         "shape": 2,
-        "halfExtents": [0.5, 0.5, 0.5],
+        "halfExtents": [
+          0.5,
+          0.5,
+          0.5
+        ],
         "density": 500.0,
         "useGravity": true,
         "allowSleep": true
@@ -88,9 +138,21 @@
     {
       "name": "BoxB",
       "transform": {
-        "position": [0.0, 0.0, 6.0],
-        "rotation": [0.0, 0.0, 0.0],
-        "scale": [1.0, 1.0, 1.0]
+        "position": [
+          0.0,
+          0.0,
+          6.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
       },
       "parent": -1,
       "visible": true,
@@ -108,19 +170,32 @@
       "material": {
         "kind": "procedural",
         "name": "sandbox_box_b_mat",
-        "baseColor": [0.30, 0.62, 0.40, 1.0],
+        "baseColor": [
+          0.3,
+          0.62,
+          0.4,
+          1.0
+        ],
         "metallic": 0.0,
         "roughness": 0.55,
         "normalScale": 0.0,
         "ao": 1.0,
-        "emissive": [0.0, 0.0, 0.0],
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
         "doubleSided": false,
         "alphaBlend": false
       },
       "rigidbody": {
         "bodyType": 2,
         "shape": 2,
-        "halfExtents": [0.5, 0.5, 0.5],
+        "halfExtents": [
+          0.5,
+          0.5,
+          0.5
+        ],
         "density": 500.0,
         "useGravity": true,
         "allowSleep": true
@@ -129,9 +204,21 @@
     {
       "name": "BoxC",
       "transform": {
-        "position": [2.5, 0.0, 9.5],
-        "rotation": [0.0, 0.0, 0.0],
-        "scale": [1.0, 1.0, 1.0]
+        "position": [
+          2.5,
+          0.0,
+          9.5
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
       },
       "parent": -1,
       "visible": true,
@@ -149,19 +236,32 @@
       "material": {
         "kind": "procedural",
         "name": "sandbox_box_c_mat",
-        "baseColor": [0.32, 0.48, 0.78, 1.0],
+        "baseColor": [
+          0.32,
+          0.48,
+          0.78,
+          1.0
+        ],
         "metallic": 0.0,
         "roughness": 0.55,
         "normalScale": 0.0,
         "ao": 1.0,
-        "emissive": [0.0, 0.0, 0.0],
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
         "doubleSided": false,
         "alphaBlend": false
       },
       "rigidbody": {
         "bodyType": 2,
         "shape": 2,
-        "halfExtents": [0.5, 0.5, 0.5],
+        "halfExtents": [
+          0.5,
+          0.5,
+          0.5
+        ],
         "density": 500.0,
         "useGravity": true,
         "allowSleep": true

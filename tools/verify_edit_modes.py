@@ -6,11 +6,11 @@
   2) "对于游戏中的地形和植被系统可以优先制作出来"
 
 断言分组：
-  A. 顶栏下拉
-     A1 TB-EDITMODE 按钮存在且宽度够（图标 + 文字 + 小三角）
-     A2 点开后有 9 行：select / landscape / foliage / mesh_paint / modeling
-       / fracture / brush_edit / animation / pcg
-     A3 点 Modeling → 已实现，模式真的切过去 + 面板自动打开
+  A. 模式切换的入口（2026-10-21 改过）
+     A0 顶栏那颗"模式下拉"已经**删掉**（TB-EDITMODE 不该再出现）
+     A0b 顶栏也不该再有 "+ Add"（搬到视口工具条了，锚点 TB-ADD 换了位置）
+     A1 左栏模式栏出 9 行（MODE-RAIL-ITEM select…pcg 全在）
+     A3 点左栏 Modeling → 已实现，模式真的切过去 + 面板自动打开
        （2026-10-20 晚六个模式全部落地；逐模式动作见 verify_toolkit_modes.py）
   B. 地形编辑器
      B1 点 Landscape → EDITMODE landscape + EDITMODE-PANELS landscape=1
@@ -137,6 +137,22 @@ def focus_window(hwnd):
         time.sleep(0.3)
 
 
+def switch_mode(tap, hwnd, mode_id):
+    """切编辑模式：点**左栏模式栏**那一行。
+
+    ⚠ 2026-10-21 顶栏那颗下拉删掉了（用户：「模式类型的那个下拉框可以去掉了，
+      因为是冗余的」）。切换入口现在是左栏 ModeRail 的 9 行单选 —— 它一直
+      可见，不用先点开弹层。锚点 `MODE-RAIL-ITEM <id>` 是按 id 打的，
+      顺序变了也不会错位。
+    """
+    r = rect_of(tap, "MODE-RAIL-ITEM " + mode_id, 4.0)
+    if not r:
+        return False
+    click(hwnd, *center(r))
+    time.sleep(1.0)
+    return True
+
+
 def drag(hwnd, src, dst, steps=16):
     """按住左键从 src 拖到 dst（都是客户区坐标）。"""
     focus_window(hwnd)
@@ -240,64 +256,59 @@ def main():
             return 1
         time.sleep(2.0)
 
-        # ================================================== A 顶栏下拉
-        print("\n[A] 顶栏编辑模式下拉")
-        tb = rect_of(tap, "TB-EDITMODE")
-        check(tb is not None and (tb[2] - tb[0]) >= 90.0,
-              "A1 TB-EDITMODE 按钮存在且够宽 (w=%.0f)" % ((tb[2] - tb[0])
-                                                          if tb else -1))
+        # ================================================== A 模式入口
+        print("\n[A] 模式切换入口")
+        # 顶栏那颗下拉必须**不存在**了 —— 删掉的东西被谁加回来，这里第一个红。
+        bar = rect_of(tap, "TB-BAR", 4.0)
+        tb = rect_of(tap, "TB-EDITMODE", 1.2)
+        check(tb is None, "A0 顶栏的模式下拉已删除（TB-EDITMODE 不存在）")
 
-        click(hwnd, *center(tb))
-        time.sleep(0.6)
-        check(wait_line(tap, "TB-EDITMODE-WIN", 3.0), "A2a 下拉弹层打开")
+        # "+ Add" 搬到视口工具条：x 必须落在视口那一列里，而且 y 在标签条
+        # 下沿那条工具条上（比顶栏低 60px 左右）。
+        add = rect_of(tap, "TB-ADD", 4.0)
+        vp = rect_of(tap, "VP-RECT", 6.0)
+        if add and vp and bar:
+            check(add[0] >= vp[0] - 1.0 and add[3] < vp[3] and add[1] > bar[3],
+                  "A0b \"+ Add\" 在视口工具条上 (add=(%.0f,%.0f) vp.x=%.0f bar.h=%.0f)"
+                  % (add[0], add[1], vp[0], bar[3]))
+        else:
+            check(False, "A0b 拿不到 TB-ADD / VP-RECT / TB-BAR")
 
         ids = ["select", "landscape", "foliage", "mesh_paint", "modeling",
                "fracture", "brush_edit", "animation", "pcg"]
         rects = {}
         for i in ids:
-            rects[i] = rect_of(tap, "TB-EDITMODE-ITEM " + i, 2.0)
+            rects[i] = rect_of(tap, "MODE-RAIL-ITEM " + i, 2.0)
         missing = [i for i in ids if not rects[i]]
-        check(not missing, "A2b 9 行齐全（缺: %s）" % (missing or "无"))
-        shoot(hwnd, "editmode_dropdown.png")
+        check(not missing, "A1 左栏 9 行模式齐全（缺: %s）" % (missing or "无"))
+        shoot(hwnd, "editmode_rail.png")
 
         # 点 Modeling：2026-10-20 晚这一项已经落地（六个模式全部实现），
-        # 所以这里断言的是"真的切过去了 + 面板开出来了"，而不再是
-        # "打 todo=modeling 且模式不变"。逐模式的动作断言在
-        # tools/verify_toolkit_modes.py 里做。
+        # 所以这里断言的是"真的切过去了 + 面板开出来了"。
+        # ⚠ 不能数 "EDITMODE " 这个子串：日志里的 "MODE-RAIL ..." 之类
+        #   也可能含它。真正的"切换"只有 EditorContext::setEditMode 打的那行
+        #   "EDITMODE <id> implemented=N"，行首是 `] `。
         if rects.get("modeling"):
-            # ⚠ 不能数 "EDITMODE " 这个子串：日志里的
-            #   "TB-EDITMODE item=modeling" 也含它 → 永远对不上。
-            #   真正的"切换"只有 EditorContext::setEditMode 打的那行
-            #   "EDITMODE <id> implemented=N"，行首是 `] `。
             mode_switch = re.compile(r"\] EDITMODE [a-z_]+ implemented=")
             with tap.lock:
                 sw_before = sum(1 for l in tap.lines if mode_switch.search(l))
             click(hwnd, *center(rects["modeling"]))
             time.sleep(1.0)
-            check(count(tap, "TB-EDITMODE item=modeling") > 0,
-                  "A3a 点 Modeling 被当作已实现模式接收（item=modeling）")
             with tap.lock:
                 sw_after = sum(1 for l in tap.lines if mode_switch.search(l))
             check(sw_after > sw_before,
-                  "A3b 模式真的切过去了 (切换次数 %d → %d)"
+                  "A3a 模式真的切过去了 (切换次数 %d → %d)"
                   % (sw_before, sw_after))
             check(count(tap, "EDITMODE modeling implemented=1") > 0,
-                  "A3c Modeling 标记为已实现（implemented=1）")
+                  "A3b Modeling 标记为已实现（implemented=1）")
             check(wait_re(
                 tap, r"EDITMODE-PANELS mode=modeling\b.*panel=modeling open=1",
-                6.0), "A3d Modeling 面板自动打开")
-            check(count(tap, "TB-EDITMODE todo=") == 0,
-                  "A3e 不再出现 todo= 提示（九项全部落地）")
+                6.0), "A3c Modeling 面板自动打开")
 
         # ================================================== B 地形
         print("\n[B] 地形编辑器")
-        tb = rect_of(tap, "TB-EDITMODE")
-        click(hwnd, *center(tb))
-        time.sleep(0.5)
-        ls = rect_of(tap, "TB-EDITMODE-ITEM landscape", 3.0)
-        if ls:
-            click(hwnd, *center(ls))
-        time.sleep(1.2)
+        check(switch_mode(tap, hwnd, "landscape"), "B0 点左栏切到 Landscape")
+        time.sleep(0.2)
         check(count(tap, "EDITMODE landscape") > 0, "B1a EDITMODE landscape")
         check(count(tap, "EDITMODE-PANELS mode=landscape landscape=1") > 0,
               "B1b 地形面板自动打开")
@@ -332,13 +343,8 @@ def main():
 
         # ================================================== C 植被
         print("\n[C] 植被编辑器")
-        tb = rect_of(tap, "TB-EDITMODE")
-        click(hwnd, *center(tb))
+        check(switch_mode(tap, hwnd, "foliage"), "C0 点左栏切到 Foliage")
         time.sleep(0.5)
-        fo = rect_of(tap, "TB-EDITMODE-ITEM foliage", 3.0)
-        if fo:
-            click(hwnd, *center(fo))
-        time.sleep(1.5)
         check(count(tap, "EDITMODE foliage") > 0, "C1a EDITMODE foliage")
         check(count(tap, "EDITMODE-PANELS mode=foliage") > 0,
               "C1b 植被面板自动打开")
@@ -370,13 +376,8 @@ def main():
 
         # ================================================== D 回到选择
         print("\n[D] 回到选择模式")
-        tb = rect_of(tap, "TB-EDITMODE")
-        click(hwnd, *center(tb))
-        time.sleep(0.5)
-        sel = rect_of(tap, "TB-EDITMODE-ITEM select", 3.0)
-        if sel:
-            click(hwnd, *center(sel))
-        time.sleep(1.0)
+        check(switch_mode(tap, hwnd, "select"), "D0 点左栏切回 Select")
+        time.sleep(0.2)
         check(count(tap, "EDITMODE select") > 0, "D1a EDITMODE select")
         check(wait_re(tap, r"EDITMODE-PANELS mode=select .*landscape=0 foliage=0",
                       5.0), "D1b 两个编辑器面板都关掉")

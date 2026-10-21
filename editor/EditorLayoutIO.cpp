@@ -15,7 +15,12 @@ namespace {
 using json = nlohmann::json;
 
 constexpr const char* kDefaultPath = "config/editor_layout.json";
-constexpr int kFormatVersion = 1;
+// 2026-10-21 v1 → v2：分栏树的**节点语义**换了（左栏从 Hierarchy/Content
+// 变成模式栏；右栏变成 Hierarchy 上下 Inspector）。三个节点的 ratio 数组
+// 长度没变，但 v1 存档里的数字放到新树上会得到一套四不像的布局（左栏 50%
+// 宽、视口挤成一条）—— 所以版本不符直接当"没有存档"，回出厂布局。
+// 代价只有一次：用户自己拖过的比例丢掉一次。
+constexpr int kFormatVersion = 2;
 
 // 偏好存档**单独**的 schema 版本（布局继续用 kFormatVersion，互不牵连）。
 // 为什么要它：`editor_prefs.json` 里的键会**逐键覆盖**出厂默认值，所以只要
@@ -69,6 +74,13 @@ bool loadEditorLayout(LayoutState& out) {
         return false;
     }
     if (!j.is_object()) return false;
+
+    // 版本不符 = 老语义的存档，当没有（见 kFormatVersion 的注释）
+    if (j.value("version", 0) != kFormatVersion) {
+        VK_LOG_INFO("Editor layout: '%s' 版本 %d ≠ %d，改用出厂布局",
+                    path.c_str(), j.value("version", 0), kFormatVersion);
+        return false;
+    }
 
     LayoutState s;
 

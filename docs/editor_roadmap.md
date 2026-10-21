@@ -1863,3 +1863,654 @@ C 组（GUI，重开工程）
 
 ⚠ 未跑全量：`engine/**` / `editor/**` / `runtime/**` / `launcher/**` / `CMakeLists.txt`
 都在 `GLOBAL_GLOBS`（横切），按纪律**等明确下令**再 `--all`。
+
+---
+
+## 18 · 布局重排：模式栏 / 视口标签页 / 右栏上下结构（2026-10-21）✅
+
+> 用户原话三条：
+> 1. 创建第三人称模板后，初始视口**朝天看**（朝 +Z）、并且在地面栅格**之下**；
+> 2. 所有功能面板（地形 / 粒子 / 物理…）打开时**停靠在 Viewport 上、按标签页切换**，
+>    像浏览器那样；
+> 3. Hierarchy 挪到右栏 Inspector **上方**，模式类型列表 + 当前模式的参数放**左侧**。
+>
+> 第 3 条有一处歧义（模式面板放左栏还是视口标签页），问过之后用户选**左栏**：
+> 视口标签页只收"工具类面板"，模式面板挂在左栏。
+
+### 18.1 交付物
+
+| 文件 | 改动 |
+| --- | --- |
+| `editor/PanelDock.{h,cpp}` | **新建**：托管提示的全局单值（`pushDockHint` / `applyDockHint`） |
+| `editor/ViewportTabs.{h,cpp}` | **新建**：视口上方 30px 浏览器式标签条 + 当前页状态 |
+| `editor/ModeRail.{h,cpp}` | **新建**：左栏 9 行模式单选 + 当前模式参数区矩形 |
+| `editor/SplitLayout.cpp` | `buildDefault()` 重写成 `[模式栏 | [视口 | 右栏]]`、`[Hierarchy 上 / Inspector 下]`；`kMinModeRail` |
+| `editor/EditorLayoutIO.cpp` | `kFormatVersion` 1 → 2（节点语义变了，旧存档直接当没有） |
+| `editor/EditorApp.cpp` | 8 个模式面板 `kSlotNone` → `kSlotModes`；标签条矩形切分；宿主式绘制；`focusPanel` / 托盘恢复时同步当前页 |
+| `editor/ToolkitEditors.cpp` | `beginToolkitWindow(ctx, …)` 带 ctx，托管进左栏；Fracture 加 `FR-METHOD set=` 日志 |
+| `editor/ViewportPanel.cpp` | 加 `NoTitleBar`（标题条已是标签） |
+| `engine/scene/SceneSerializer.cpp` | `applyCamera` 加单位嗅探（度/弧度）+ `SCENE-CAMERA` 落位日志 |
+| `tools/gen_templates.py` | 两个模板的 camera 改成**弧度 + 正 pitch + yaw=π** |
+| `tools/verify_layout_v4.py` | **新建**，21 条断言（A 4 / B 5 / C 8 / D 4） |
+
+### 18.2 三条需求各自的根因与修法
+
+1. **相机朝天看 + 在地面之下** —— 不是相机代码，是**单位**。模板里写的是
+   `pitch=-18.0`（度），`SceneSerializer` 当**弧度**读 → `setPitch` 夹到
+   ±`kPitchLimit`(1.5533) → 相机几乎垂直向下俯视目标（等价于"镜头朝天"），
+   且距离被压到近平面附近，落在地面栅格以下。修法三层：模板改弧度；
+   `applyCamera` 嗅探 `|pitch| > kPitchLimit*1.001` 或显式 `deg` 字段时换算
+   （老存档兜底）；补 `SCENE-CAMERA eye=… target=… yaw=… pitch=…` 让"相机在哪"
+   可断言。实测 `eye=(-4.23,0,2.74) target=(0,0,1.2) yaw=3.14 pitch=0.35`。
+2. **标签页** —— 本工程**不用 ImGui docking 分支**，所以是自绘：`layoutSlot ==
+   kSlotNone` 的面板全部变成标签页（新面板自动跟上），标签条占视口顶部 30px，
+   `syncViewportTabs()` 负责"刚打开就切过去 / 当前页被关就回 3D 视口"。
+   面板宿主化后只画当前页，其余整块不提交。
+3. **布局重排** —— `SplitLayout` 仍是一棵 3 节点树，变的是**语义**：
+   `[0] 模式栏 | 其余`、`[1] 视口 | 右栏`、`[2] Hierarchy 上 / Inspector 下`。
+   工作区预设的 ratio 全部改成 `{0, 0, 0.42}`。
+
+### 18.3 三个踩过的坑（代码里都有注释）
+
+1. **`applyDockHint` 的 `static` 不能放 header**：header-only 里的 `static`
+   每个 TU 一份 → 宿主和面板各看各的矩形，表现为"面板钉在一个旧位置"。
+   真实的两个函数搬进 `PanelDock.cpp`。
+2. **模式列表高度不能写死**：行高是 `kRowH + ItemSpacing.y`，写死常量在字号
+   变大后最后两行掉出窗口（列表是 `NoScrollbar`，直接看不见）。现在是函数 +
+   `kRowGap` 常量，绘制侧和布局侧**同一份**。
+3. **左栏下限是"内容宽度"决定的，不是列表宽度**：建模面板那排
+   `Subdivide(150)+Flip(140)+Delete(110)` 是 SameLine 硬排的，320 宽时 Delete
+   被窗口裁掉（点都点不到）。下限取 460 = 建模面板的设计宽度。
+
+### 18.4 验收（只跑针对性，未跑全量）
+
+| 门 | 结果 |
+| --- | --- |
+| `verify_layout_v4.py` | **21/21 PASS**（相机 4 · 模式栏 5 · 标签页 8 · 右栏 4） |
+| `verify_toolkit_modes.py` | **34/34 PASS** |
+| `verify_toolkit_round2.py` | **32/32 PASS** |
+| `verify_i18n_coverage.py` | PASS（A1~F 全 0） |
+
+**参数区比窗口长这件事**：模式面板原是按 620~660 高的浮动窗口写的，塞进
+左栏下半（~400px）之后下半截控件在窗口外 —— 面板自带滚动条，真实用户滚轮
+就能看到，但两个验收脚本原来是"按锚点矩形直接点"，锚点报的是**未裁剪**的
+item 矩形，点到了窗口外面（表现成"点了没反应"）。给两个脚本补了
+`reveal()`：目标不在参数区里就滚轮滚过去再点，与用户行为一致。
+另外 `C3a` 原来判"切 Grid 后 FR-BREAK 的屏幕 y 变了"，滚到底时删掉一行会被
+滚动条 clamp 回来 → 假失败；改成断言面板自己那条 `FR-METHOD set=grid`。
+
+---
+
+## 19 · 顶栏瘦身 + 笔刷落点/实时性修复（2026-10-21 第三轮）✅
+
+> 用户原话两条：
+> 1. 编辑器上的原本的模式类型的那个下拉框可以去掉了，因为是冗余的，还有旁边的
+>    那个 Add 的列表可以把它的位置调整到**视口上侧工具条左侧的末尾**。
+> 2. 编辑器中的地形模式部分，其对于地编方面的操作是有问题的，**鼠标操作的地区
+>    和实际生效的位置是有不同的**，另外操作地编时也**不是实时的，延迟非常严重**。
+
+第 1 条是"两处入口指向同一状态"的收口，第 2 条是**两个独立 bug**：一个是坐标系，
+一个是 I/O。
+
+### 19.1 交付物
+
+| 文件 | 改动 |
+| --- | --- |
+| `editor/Toolbar.cpp` | 删掉 `editModeRow()`（模式下拉）与 `drawAddBarMenu()`（+Add）；顶栏只剩右对齐的播放控制 |
+| `editor/Toolbar.h` | 删掉两个声明 + `m_addCounter` |
+| `editor/ViewportPanel.cpp` | 新增 `kVpIconPlus`；左组末尾放 `+ Add`（复用视口已有的 `##vp_add` 弹层，**不新建第二套菜单**）；右组改成**按预算贪心保留** |
+| `editor/ModeRail.cpp` | 每行补 `MODE-RAIL-ITEM <id>` 锚点 —— 顶栏下拉删掉后，脚本切模式的唯一入口 |
+| `engine/render/TerrainPass.cpp` | `toRowMajor()` 转置；`refillImage2D` 支持常驻 staging；`refreshSurface` 优先吃内存、退路才读盘；`TERRAIN-REFRESH` 计时日志 |
+| `engine/render/TerrainPass.h` | `refreshSurface(..., const terrain::TerrainAsset* live = nullptr)`；`Instance` 加 `uploadBuf` / `refreshCount` / `refreshMaxMs` |
+| `engine/ecs/Components.h` | `TerrainComponent` 加 `liveHeights` / `liveSplat` / `liveHoles`（内存直传指针） |
+| `engine/render/Renderer.cpp` | `TerrainRefresh` 带上 live 资产；`syncTerrains` 组好之后直传 |
+| `editor/LandscapeEditor.{h,cpp}` | `publishToRenderer()` / `clearLiveBinding()` 与 `saveAssets()` 拆开：**拖拽只推内存、抬笔才落盘** |
+| `tools/verify_world_tools.py` | 新增 A0 组 6 条断言；修 A1/A1b/A5a/A6a 四处过时断言 |
+
+### 19.2 需求 1：冗余入口收口
+
+顶栏那个"模式类型"下拉和左栏 ModeRail 的 9 行单选写的是**同一个状态**
+（`ctx.editMode()`），留着只是让人犹豫该点哪个。删掉之后切换模式的唯一入口
+就是左栏，顺带把"切模式"的脚本锚点从 `TB-EDITMODE-ITEM` 换成
+`MODE-RAIL-ITEM <id>`（`verify_toolkit_*` / `verify_world_tools` 三份脚本同步）。
+
+`+ Add` 搬到视口工具条左组末尾时踩到一个 ImGui 光标坑：
+
+- 每画完一个 item，`GetCursorPosX()` 会被**收回到行首**；
+- `BeginPopup/EndPopup` 还会把光标 x 直接打回 0。
+
+于是"左组末端"不能用 `GetCursorPosX()` 取，必须用
+`GetItemRectMax().x - GetWindowPos().x`。取错的表现是右组与左组**重叠**
+（`+ Add` 压在 `Perspective` 上，截图里一眼看得出来）。右组同时从
+"全有或全无"改成**按预算贪心保留**（7 项按重要性排：投影 > 布局 > 照明 >
+显示 > 设置 > 网格 > 相机速度），窗口窄的时候先丢最不重要的。
+实测 `VP-BAR-FIT taken=3/7 need=194 budget=205`，`TB-ADD` 结束 1046、
+`VP-BAR-RIGHT` 从 1065 开始，不再重叠。
+
+### 19.3 需求 2 之一：鼠标落点 ≠ 生效位置
+
+**根因是存储序，不是射线、不是矩阵。**
+
+| 环节 | 约定 |
+| --- | --- |
+| `.r32` / `.rgba8` / `.r8` 文件、`physics::Heightfield` | **列主序** `heights[col*rows + row]` |
+| Vulkan 纹理 | **行主序** `texel(x,y) = data[y*w + x]` |
+| `terrain.vert` | `uv = ((col+0.5)/cols, (row+0.5)/rows)` |
+
+原样上传 = 采样点 `(col,row)` 读到 `h[row*cols + col]` —— 整片地形绕对角线
+**镜像**。实测 `hills` 地形（257×257）：
+
+- 峰值 CPU 认为在 `(64, -40)` 米；
+- 不转置则画在 `(-40, 64)` 米，**偏差 147 米**；
+- 65792/66049 = **99.6% 的采样点数值不同**。
+
+修法：上传前 `toRowMajor()` 翻成行主序，`inst.asset.heights` 仍保持列主序
+（下游的物理、笔刷插值全按列主序写，不动它们）。三张图（高度 / 权重 /
+挖洞）都过这个转置。
+
+### 19.4 需求 2 之二：不是实时、延迟严重
+
+**根因是每 80 ms 一次"写盘 → 再读回来"。**
+
+`refreshSurface` 原来是"编辑器写盘 → 渲染层 `loadTerrain` 重读 2 MB"，而且
+`refillImage2D` 每次还要新建/销毁一个 VkBuffer + 一次 `vkQueueWaitIdle`。
+一笔拖 0.5 秒就是十几次磁盘往返，全部算在帧时间里 → 手已经拖过去几十像素，
+画面还停在原处。
+
+两处修法：
+
+1. **内存直传**：`TerrainComponent` 挂 `liveHeights/liveSplat/liveHoles`
+   三个指针，渲染层直接用编辑器那份 `std::vector`，零 I/O。缺任何一份就
+   **整份退回读盘**（部分直传会让三张图来自不同版本，比慢更糟）。
+2. **拆开"推内存"与"落盘"**：新 `publishToRenderer()` 只置脏位 + 挂指针，
+   拖拽期间走它；`saveAssets()` = 落盘 + publish，只在抬笔
+   （`LS-STROKE-END`）/ 撤销 / 重做 / 手动保存时调。常驻 staging buffer
+   之后每次刷新只多一次 264 KB 拷贝。
+
+`clearLiveBinding()` 负责在换资产 / 解绑时把指针清成 `nullptr` 并清脏位 ——
+指针指向 `m_asset` 里的 vector，`m_asset` 一旦被整体替换就是悬垂指针。
+
+### 19.5 数据
+
+| 指标 | 修前 | 修后 |
+| --- | --- | --- |
+| 峰值落点偏差 | 147 m（镜像） | 0 |
+| 刷新数据来源 | `src=disk`（每次读 2 MB） | `src=memory`（7/7 次，0 次读盘） |
+| 单次刷新耗时 | 未测（含磁盘往返） | `lastMs=1.40` / `maxMs=1.40` |
+| 一笔 30 步的落盘次数 | ≈ 刷新次数（十几次） | **1 次**（抬笔时） |
+
+### 19.6 验收（只跑针对性，未跑全量）
+
+| 门 | 结果 |
+| --- | --- |
+| `verify_world_tools.py` | **32/32 PASS**（含新增 A0 组 6 条） |
+| `verify_edit_modes.py` | ALL PASS |
+
+脚本自身修掉的四处**过时断言**（都是"代码对了、断言先判死刑"）：
+
+1. `A1` 只查 6 个工具按钮 —— 现在有 8 个；
+2. `A5a/A6a` 按 `LS-TOOL <枚举值>` 断言，但按钮网格插过 Ramp 之后
+   视觉第 4 格是 Ramp（枚举值 7）、第 5 格才是 Noise（枚举值 3）。改成
+   按视觉序号取锚点、按 `name=Noise` / `name=Erode` 判成败；
+3. `A1b` 滚轮调半径：滚轮分支的前置条件是 `onTerrain`（射线打到地形），
+   刚自动建完地形那一两帧相机可能还在落位，射线打空时滚轮被视口拿去
+   推拉相机 → 一条 `LS-BRUSH` 都没有。加最多 3 轮重试；
+4. `verify_i18n_coverage.py` 的豁免表同步改名。
+
+---
+
+## 20 · 地形三件事：贴地 / 形状雕刻 / Raise 锥形（2026-10-21 第四轮）✅
+
+> 用户原话三条：
+>
+> 1. 每次通过地编的方式生成的地形，为什么在编辑器中运行游戏时，发现生成的地形是在
+>    原栅格地面的**正上方**的，并且是把原本的游戏初始化场景给**覆盖住**了，正常不应该
+>    地形地貌是建立在原来栅格地面的基础上的嘛。
+> 2. 地形编辑器中的挖洞的功能，不是将原地面中间剖开一个缺口，**不能是破坏地面的拓扑
+>    结构**，挖洞功能最好我觉得是能否通过选择一个简单的物体的方式，通过在地面中，拖动
+>    这个物体去慢慢贯穿整个机构表面来实现以这个物体的轮廓去给地面形变构造出对应的
+>    类似洞穴的结构。
+> 3. 地形编辑中的 Raise/Lower 在实际表现得效果来看，在抬升地形时的整个过程中，最后
+>    收尾的时候，总是会成**一个小平面**，以致于每次想通过它做成一个山峰，结果变成了
+>    一个类似**火山**的结构。
+
+三条是三个彼此独立的根因，凑巧都在 `LandscapeEditor` 里。
+
+### 20.1 需求 1：新建地形悬空 + 盖住初始场景
+
+两个原因叠在一起：
+
+1. `generateDefaultHeights()` 用的是**没归一化**的正弦叠加，值域大致 `[-1, 1]`
+   再被硬钳到 `[0, 1]` —— 一起手就有一大片顶在 1.0（= `maxHeight` = 60 m）。
+2. `createTerrain()` 建完实体**没有落座**，`position.z` 留在 0。模板场景
+   `third_person` 的实体（`Ground` / `Player` / `Pickup_1..5` / `Portal`）
+   全坐在 `z ≈ 0..1`，于是 60 m 高的地形把整个场景盖平了。
+
+修法：
+
+```cpp
+// 原始正弦先算出来，再**整体归一化**到 [0, kDefaultPeak]。
+constexpr float kDefaultPeak = 0.12f;      // 0.12 * 60 m = 7.2 m
+const float span = std::max(hi - lo, 1.0e-6f);
+heights[i] = (raw[i] - lo) / span * kDefaultPeak;
+```
+
+谷底严格为 0（四条边也全是 0，`verify_landscape_ground` 的 A1 一直盯着这条），
+峰值 7.2 m —— 有地貌感，但不会把 1 米高的拾取物埋掉。
+
+落座用的是一个**极小的 epsilon**，不是"随便垫高一点"：
+
+```cpp
+constexpr float kGroundEpsilon = 0.02f;    // 2 cm
+tr->position.z = kGroundEpsilon;
+VK_LOG_INFO("LS-CREATE-SEAT z=%.2f (ground plane + epsilon)", ...);
+```
+
+为什么不干脆 `z = 0`：模板场景里的 `Ground` 是一块**同样在 z=0 的平面**。
+两者共面 → z-fighting → 地面会闪。2 cm 足够躲开深度精度，肉眼看不出来
+（地形单位是米，2 cm 相当于 0.02 个采样点的高度）。
+
+### 20.2 需求 2：挖洞 → 形状雕刻（Carve）
+
+旧的 `Tool::Hole` 写的是 `holes.r8` 遮罩，片元着色器里 `discard` ——
+**这就是字面意义上的"把地面剖开"**：拓扑被破坏，射线打不中，物理高度场
+直接漏空。用户要的恰恰相反。
+
+改成 **形状压印**：选一个形状体（球 / 方块 / 圆柱），把它从地表"按"下去，
+只改**高度图**，一行遮罩都不写。
+
+```cpp
+enum class CarveShape : int { Sphere, Box, Cylinder };
+float m_carveDepth = 0.35f;   // 0.0 .. 1.2，下沉深度（× 半径）
+float m_carveCenterM = 0.0f;  // 形状体中心的绝对高度（米），落笔那一刻锚定
+```
+
+三个形状各自给一个"下表面半高" `half` 和归一化径向距离 `t`，然后：
+
+```cpp
+// 球：half = sqrt(R² - d²)  → 碗状凹坑
+// 方：half = R * 0.7        → 平底直壁基坑
+// 圆柱：half = R            → 竖井
+const float bottomN = (centerM - half) / unitM;   // 米 → 归一化
+if (bottomN < h) h += (bottomN - h) * k;          // 只往下削，不往上填
+```
+
+Shift 反向 `if (topN > h) h += (topN - h) * k;` —— 同一个轮廓**堆出**隆起，
+所以"压出凹腔"和"垒出土丘"是同一个算子的两个符号。
+
+**关键设计：形状体中心在落笔那一刻锚定，整笔不动。**
+第一版是每帧按"当前地表高度"重算中心，结果 Shift 隆起每帧把中心往上顶一截，
+自己喂自己，一路顶到 480 m（`A8f` 把一小片推到 8.0，`A9` 读到这个假顶点，
+`A9b` 的"突破 1.0"变成了一次**假通过**）。锚定之后没有正反馈回路。
+
+UI 侧顺手把工具网格的行高从 28 压到 22、`ItemSpacing` 收到 `(8, 5)`：
+第 8 个按钮（Carve）原来下沿顶到 `y=859`，而地形面板底边是 842 ——
+**按钮有 17 px 在面板外面**，点它的中心会打到底部 dock 上，把视口标签页
+从 Viewport 切成 Console，之后所有视口操作全部落空。这类"UI 溢出导致
+半段验收全 FAIL"的坑，上一轮已经吃过一次（`LS-TOOL-7`）。
+
+### 20.3 需求 3：Raise 收尾成平顶（火山口）
+
+根因就一行：
+
+```cpp
+h = std::clamp(h, 0.0f, 1.0f);     // ← 旧
+```
+
+笔心（权重 1.0）先撞到 1.0 停住，外圈（权重 0.5/0.2…）还在涨 ——
+最后**必然**收成一块顶面平整、边缘变陡的台地。那就是用户说的"火山"。
+
+修法分两步：
+
+```cpp
+constexpr float kMaxNorm = 8.0f;   // 归一化高度的上限，**不是 1.0**
+
+float raiseHeadroom(float h) {
+    if (h < 1.0f) return 1.0f;                     // 1.0 以下手感不变
+    return std::max(0.0f, (kMaxNorm - h) / (kMaxNorm - 1.0f));
+}
+```
+
+1. 天花板从 1.0 抬到 8.0（= 480 m），1.0 只是"等于 maxHeight"，不再是墙；
+2. 抬升量乘 `raiseHeadroom(h)` —— 越接近上限越慢，是**渐近**而不是撞墙。
+
+第 2 条才是"锥形"的来源：即使真的刷到很高，笔心也是缓缓收敛，
+外圈慢慢追上来，剖面始终是锥形，不会被一刀切平。
+
+### 20.4 顺带修掉的：`localHit.z` 单位误用（三处）
+
+`physics::Heightfield::height()` 的定义是 `raw * heightScale`，而
+`LandscapeEditor::raycast()` 给它的 `heightScale` 是
+`maxHeight * m_heightScale` —— 所以 **`hit.point.z` 已经是米**。
+三处代码把它继续当归一化用：
+
+| 位置 | 旧写法 | 症状 | 新写法 |
+| --- | --- | --- | --- |
+| `m_carveCenterM` | `localHit.z * unitM - ...` | 形状体被放到 **807 m** 高空，压印什么也碰不到（`A8d` 恒为 0 个采样点变低） | `localHit.z - m_carveDepth * R` |
+| `m_flattenHeight` | `localHit.z * maxHeight * heightScale` | Flatten 把地面直接顶到上限（烧成一片高台） | `localHit.z`（`applyStroke` 里自己除 `unitM`） |
+| `m_rampStartH` | `localHit.z`（米）直接和 `heights[idx]`（归一化）插值 | Ramp 把整块地形推向 8.0 —— C1 是"炸了也算改了"的假通过 | `localHit.z / unitM` |
+
+`A8d` 的日志把这条钉得很死：修前 `LS-CARVE ... centerZ=807.3`、压前后 absdiff
+`0.00000`；修后 `centerZ=7.7`、`668 个采样点变低`。
+
+### 20.5 数据
+
+| 指标 | 修前 | 修后 |
+| --- | --- | --- |
+| 默认地形峰值 | 1.0（60 m，顶住天花板） | 0.12（7.2 m） |
+| 默认地形谷底 | 0 | 0（严格，四条边也是 0） |
+| 地形实体落座 | `z = 0`（与模板 `Ground` 共面） | `z = 0.02`（2 cm） |
+| 挖洞是否改遮罩 | 是（写 `holes.r8` + `discard`） | 否（只改高度图） |
+| 落笔形状体中心 | 807.3 m（单位错） | 7.7 m |
+| 压印影响的采样点 | 0 | 668 |
+| Raise 上限 | `clamp(h, 0, 1)` 硬墙 | `kMaxNorm=8` + 渐近余量 |
+| 抬升顶点 / 同高采样点 | — | `top=1.113` / **1 个**（真锥形） |
+
+### 20.6 验收（只跑针对性，未跑全量）
+
+| 门 | 结果 |
+| --- | --- |
+| `verify_world_tools.py` | **全部 PASS**（A- 组 3 条、A8 组 8 条、A9 组 4 条为核心新增） |
+| `verify_landscape_ground.py` | **17/17 PASS** |
+| `verify_terrain_editor.py` | **23/23 PASS** |
+| `verify_terrain.py` | **16/0 PASS** |
+| `verify_edit_modes.py` | ALL PASS |
+| `verify_layout_v4.py` | ALL PASS |
+| `verify_toolkit_modes.py` | ALL PASS |
+| `verify_toolkit_round2.py` | ALL PASS |
+| `verify_i18n_coverage.py` | PASS（词典 1919 条，A1-A4/B/B2/D/E/F 全 0 缺） |
+
+### 20.7 脚本自身修掉的四处问题（都是"代码对了，断言先判死刑"）
+
+1. **`A9b` 在测机器速度。** 抬升量 ∝ `dt`，而引擎把 `dt` 钳在 0.05 s ——
+   慢帧下累积速度腰斩。同一份 Raise 代码，上一跑 `top=1.56`、这一跑 `0.63`，
+   看着像回归。改成**刷到达标（>1.10）就停**，上限 30 笔，与帧率无关。
+2. **`verify_landscape_ground` 的 A2** 要求 `max > 0.30` —— 那是"默认地形能顶到
+   1.0"时代的期望。现在需求正好反过来：有起伏（>0.05）但**不喧宾夺主**（≤0.25）。
+3. **同脚本 B 组整段是 `Hole`**（写 `holes.r8`、断言挖穿点 > 0）。重写成
+   Carve：选中它 → `LS-CARVE` → 采样点变低 → **`holes.r8` 不存在或全 255**
+   （拓扑完整，这条才是用户要的）。
+4. **`verify_terrain_editor` 的 D1 点空了。** `logRect` 报的是
+   `GetItemRectMin/Max`（**未裁剪**）。Inspector 是滚动窗口，Terrain 段排在
+   Transform / Visibility 之下，而本机桌面只有 1088×600（`settle` 想拉到
+   1600×900 拉不上去）→ 勾选框排到可视区外，锚点照样有坐标，点下去落在
+   面板外 → 前后截图**像素级一致**（sig=0.00%），看着像 Visible 开关坏了。
+   修法：`InspectorPanel` 补一个 `INS-PANEL` 锚点（与 `CONSOLE-PANEL` /
+   `FO-PANEL` 同写法），脚本加 `scroll_into_view()` 滚进可视区再点；
+   顺带把 sig 的对比框改成**重新取一次 `VP-RECT`**（D 组时 Content Browser
+   已收起，视口比 A 组高了一截，用旧 box 会漏掉下半屏）。修后 `sig=78.91%`。
+
+## 21 · 建模：多边形面表 + 内插/倒角/环切（2026-10-21 第五轮）✅
+
+用户原话：
+
+> "Modeling 建模模式中，对于立方体，为什么显示出的每个正方形面都是两个三角形
+> 拼接而成的，而不是一整个的正方形。这种对建模操作显示是不对的。另外，建模
+> 模式应该包含一下操作：挤出选区，内插面，倒角，环切。这些的具体细节和实现
+> 效果你可以参考下 blender 中。"
+
+### 21.1 面为什么看起来是三角形
+
+网格本体只有三角形（GPU 只吃三角形），所以"面"是**拓扑层**的事。原先的
+`ToolkitEditors::Topo` 只有三角形与边，面是"共面两两合并"反推出来的 ——
+这条反推的天花板就是四边形：
+
+* 立方体 6 个面恰好都能两两合并 → 看起来是对的；
+* 一旦**倒角**（八边形）或**环切**（细长条），一个面需要 3~4 个三角形才能
+  拼回，两两合并只能得到几块碎片 → 选中一个面只高亮一块，用户看到的就是
+  "这个面被切成了好几个三角形"。
+
+### 21.2 修法：让面表跨操作存活
+
+`Topo` 增加 `Poly{ tris, v, normal, area }` 与 `triPoly`（三角形 → 面），
+并加一个 **`m_polyHint`**：`commitEditMesh()` 写回网格时记下"每个面由几个
+三角形拼成"，`rebuildTopo()` 优先用它做**扇形三角化的逆运算**：
+
+```
+面 (v0,v1,v2,v3) → 三角形 (v0,v1,v2), (v0,v2,v3)
+逆运算 v = {tri[0].a, tri[0].b} + {tri[k].c for k in 0..n-1}
+```
+
+没有提示时（刚加载 / 刚绑定）才退回"共面合并"。法线用 `newell()` 而不是
+单三角形叉积 —— n 边形共面时挑错三角形会翻向。
+
+### 21.3 三个新操作
+
+| 操作 | 快捷键 | 实现要点 |
+| --- | --- | --- |
+| 内插面 Inset | `I` | 每个选中面沿其**面内**的两条边方向收缩 `dist`，外圈生成四边形环 |
+| 倒角 Bevel | `B` | 只在**选中顶点**处切角：每个入射面沿边各让出 width，角落补一个 n 边形 cap |
+| 环切 Loop cut | `Ctrl+R` | 找选中边所在的**四边形环带**，按边参数中点插一圈顶点并一分为二 |
+
+日志：`MODEL-INSET / MODEL-BEVEL / MODEL-LOOPCUT`，全部按**多边形**计数
+（`polys=` / `selF=`），这样"面是不是完整"本身就变成可断言的东西。
+
+### 21.4 验收（`tools/verify_modeling_topology.py` 全 PASS）
+
+| 断言 | 结果 |
+| --- | --- |
+| 立方体绑定即 `polys=6` | PASS（六张完整四边形，不再是 12 个三角面） |
+| 内插 | `faces=6 newVerts=24 dist=0.080 verts=96 tris=60 polys=30 selF=6` |
+| 倒角 | `corners=8 cuts=12 caps=8 verts=96 tris=44 polys=14 selV=12` |
+| 环切 | `faces=4 cuts=1 newQuads=8 verts=40 tris=20 polys=10` |
+
+⚠ 每个 phase 都**重新启动一次编辑器**：建模的输入是"当前网格"，连跑会让
+断言退化成"比上次多"这种没信息量的形式。
+
+---
+
+## 22 · 水体：独立通道 + 拖拽生成 + 5 种水质（2026-10-21 第五轮）✅
+
+用户原话（摘要）：水体要进左栏模式列表、参数进下方参数区；用圆形/矩形
+**拖拽**生成；参数面板实时控制范围/颜色/类型；默认给几种水质（山泉/湖/
+池塘/海/河），不同水质的透明度、折射、流速、波纹、涟漪都不同；水面要有
+真实的涟漪与波浪细纹。
+
+### 22.1 为什么水面必须是**独立 RenderPass**
+
+折射要采样"本帧已经画完的场景颜色"。在同一个 RenderPass 里，颜色附件正在
+被写，同时把它当纹理读就是 feedback loop，验证层直接报错。所以顺序固定：
+
+```
+前向 Pass 结束（resolve 出单采样 HDR）
+  ↓ vkCmdCopyImage：resolve → sceneCopy（本通道持有，可采样）
+  ↓ 水面 RenderPass（只有颜色附件，LOAD，单采样，**无深度附件**）
+```
+
+无深度附件的原因：HdrTarget 的深度图是 4x MSAA，而一个 RenderPass 里所有
+附件的采样数必须一致 —— 想同时把深度当附件和纹理又回到 feedback loop。
+于是水面走**单采样 + 手写深度测试**：`water.frag` 从深度图重建场景世界
+坐标，比它到相机的距离，前景更近就 `discard`。
+
+### 22.2 水感是怎么算的（六段）
+
+1. **波形**：4 项方向不同的深水重力波叠加，`h = Σ A·sin(k(d·p)+ωt+φ)`，
+   `ω = √(g·k)·0.35`（压低防混叠），振幅 ×0.55、波长 ×0.62 逐项衰减。
+2. **法线**：解析梯度 + 三层噪声（顺流向压扁 4 倍的那层给"水流感"，两层
+   各向同性给涟漪与细纹）。
+3. **折射**：采样 sceneCopy，偏移量随水深衰减；偏移后的样本若采到比水面
+   更近的几何（把岸边石头吸进水里 = 典型穿帮）就退回不偏移。
+4. **吸收**：Beer–Lambert，`absorb = 1 - exp(-depth*0.65/clarity)`。
+5. **反射**：菲涅尔 `f0 = ((ior-1)/(ior+1))²`（水 1.333 → 0.02），skyMap 采样。
+6. **泡沫**：岸边（浅）+ 浪尖（**陡度 A/λ** 起白浪，不是"波高"）。
+
+### 22.3 五个预设
+
+`clarity` 高 = 山泉（几乎不吸收），低 = 池塘（2 m 就浑）：
+
+| 水质 | clarity | 波高 | 流速 | 说明 |
+| --- | --- | --- | --- | --- |
+| 山泉水 | 3.2 | 0.05 | 1.1 | 清澈见底，细碎涟漪 |
+| 湖水 | 1.6 | 0.10 | 0.05 | 默认，几乎静止 |
+| 池塘水 | 0.45 | 0.02 | 0 | 浑、绿、无浪 |
+| 海水 | 1.2 | 0.55 | 0.35 | 大浪 + 白沫 |
+| 河水 | 0.9 | 0.08 | 1.5 | 明显流向条纹 |
+
+### 22.4 面板形态（两次返工后的结论）
+
+* **水质/形状用按钮行，不用 Combo**。5 选 1 的枚举不该"点开再点一项"，
+  而且弹出层行高依赖主题 —— 自动化只能猜像素（实测猜错了：点"海水"选到
+  了"河水"）。改成一排按钮后每个值有自己的锚点（`WATER-KIND sea`）。
+* **按用途折叠成 4 段**（Shape / Water quality / Surface motion / New water
+  body）。左栏参数区只有 ~400px 高，全部控件排下来近 1000px —— 一长串的
+  直接后果就是"尺寸/水位这些最常用的滑块要滚下去才点得到"，而滚出去的
+  控件看起来就是"功能坏了"。
+
+### 22.5 验收（`tools/verify_water.py` 26/26 PASS）
+
+A 模式入口与面板 / B 通道初始化 / C 建水体 + 像素变化 60.9% / D 预设与
+形状（含 `WATER-MESH shape=rect tris=800`）/ E 参数实时生效（拖半径→
+`radius=176.5`、拖水位→`level=160.66`）/ F 删除（bodies 2→1）/ G 零 VUID。
+
+### 22.6 这一轮修掉的四个"真 bug"
+
+1. **`WaterPass` 只在 `createPipelines()` 里 `setTargets`** → 视口 resize 后
+   它保留 1600×900 的 `m_extent` 与已销毁的 resolve/depth 视图。一次爆 18 条
+   验证错误（`vkCmdCopyImage` 越界、`vkCmdBeginRenderPass` 悬垂附件、
+   `vkUpdateDescriptorSets` 悬垂 imageView）。修法：新钩子
+   `Renderer::recreateWater()`，与粒子/SSAO 一样挂在 `recreateScreenSpace()`；
+   并且 `setTargets` 早退分支**逐句柄比对**、视图真变了要**连 framebuffer
+   一起重建**（原来只刷新字段，fb 还指着旧视图）。
+2. **湖面上长白斑**：浪尖泡沫只看"相对波高"，平静的湖也被判成白浪。改成
+   看陡度 `A/λ`（0.02 起、0.075 满）。
+3. **`WATER-SIZE halfExtent=` 只对"半深"滑块生效**：`IsItemDeactivatedAfterEdit()`
+   只认紧挨着的上一个 item，原来写在两个滑块之后 → 只拖"半宽"永远不打日志。
+   两个滑块各挂一次。
+4. **场景相机在栅格面之下仰视**：`assets/scenes/sandbox.json` 的
+   `"pitch": -18.0` 是**度**，被单位嗅探换算成 -0.314 rad —— 而 `Camera`
+   的约定是"正 = 在目标上方俯视"，负号 = 相机沉到地面以下往上仰。改写成
+   弧度正值，并加 `SCENE-CAMERA-LOW` 告警（pitch<0 或 eye.z<=0 直接报），
+   这类"渲染完全正常、只是看着怪"的问题以后能自证。
+
+### 22.7 脚本自身修掉的三处脆弱点
+
+1. **`open_section` 用 `rect_of` 判"已展开"** —— 拿到的是选区出现**之前**的
+   历史矩形（那时新建段不带折叠头），于是它以为已展开、没点折叠头，后面的
+   点击全落在旧坐标上（D 组 5 条连锁失败）。补 `drawn()`：先让面板滚一格
+   再滚回来（`logRect` 对不动的矩形不重复输出），数行数有没有涨。
+2. **拖滑块的坐标没过 `client_to_screen`** —— `SetCursorPos` 收屏幕坐标，
+   直接喂客户区坐标会把鼠标点到别处，表现为"拖动毫无反应"。
+3. **"先点一下再按下"**：间隔 < 双击阈值会被 ImGui 当成双击 →
+   `SliderFloat` 进入文本输入模式，之后拖动同样没反应。
+
+---
+
+## 23 · 水体：从"一张纸"到有厚度的水体 + 贴地（2026-10-21 第六轮）✅
+
+用户原话：
+
+> 1. "水体不是只有一个水的平面，还是要有一定水的深度的，并且也要符合水体
+>    反射和折射的视觉效果。而且创建水体的时候，其参数面板会什么会消失不见。"
+> 2. "水体创建的位置应该是紧贴在地面上的，不能出现反重力的现象，如果水体
+>    创建在比较低洼甚至凹凸不平的地形上，也要符合这个规律。"
+
+### 23.1 为什么它是一张纸
+
+上一轮的几何只有**顶面**：一个圆形/矩形网格，全部顶点在 `z = level` 上。
+这在俯视时没问题，但从低角度一看就露馅——水面边缘直接断在半空，没有厚度；
+地形一起伏，水面还会在山坡上"悬"着（用户说的"反重力"）。
+
+根因是三件事叠在一起：
+
+1. **没有侧壁**：水体只有上表面，边界没有截面。
+2. **水位跟着点击点走**：`level = hit.z + 0.35`，不管那片地形是坡是坑。
+3. **没有池底概念**：连"这块水有多深"这个量都不存在，`Beer–Lambert` 只能
+   靠深度图反推，面板上也没有任何水深读数。
+
+### 23.2 侧壁：一块水的截面
+
+顶点加了一个 `part` 字段（0 = 水面 / 1 = 侧壁顶 / 2 = 侧壁底），
+同一次 draw call 里两类几何一起画：
+
+```
+水面     z = 0（顶点着色器里加波浪）
+侧壁顶   z = 0（**也加波浪**：不加就会在水面波动时脱开一条缝）
+侧壁底   z = UBO.p4.y - level
+```
+
+侧壁的高度**不进顶点**：它只依赖"水面高度"和"池底高度"两个标量，放进
+UBO。于是拖水位滑块 = 写 16 字节，不需要重建任何缓冲（否则每拖一格都要
+`waitIdle` + 重新上传顶点）。
+
+侧壁的着色走另一条路径（`shadeSkirt`），因为它的语义不同：它后面是土，
+不是水底，所以**不做折射**，只做 Beer–Lambert（离水面越深越暗）+ 菲涅尔
++ 水面附近一条被噪声打散的水线。
+
+### 23.3 贴地：水位跟**岸线**，不跟池底
+
+```
+        rim = footprint 边界一圈的最低地形   ← 水位 = rim + 0.18
+   ┌────┴────┐
+   │  ~~~    │        bed = footprint 内最低地形   ← 侧壁底 = bed - 0.75
+   └─────────┘
+```
+
+* **水位跟岸线最低点**，不是池底：池底再深也不该把水面拽下去（那是"水漏了"
+  的语义）。岸线决定的是一个水平面能抬多高而不从岸边溢出去。
+* 抬 `+0.18 m` 是为了避开 z-fighting（波浪还会上下 ±0.1 m）。
+* **池底 = 区域内最低地形**，侧壁从它再往下沉 0.75 m。地形有起伏时，
+  统一的"最低点"保证任何角度的侧壁都被土埋住——多沉的部分不花代价。
+
+采样器 `GroundProbe` 在**构造时加载一次**地形（`height.r32` + JSON），
+之后每个点都是 O(1) 双线性插值。footprint 上撒约 150 个点（圆形 3 圈×48 段
++ 圆心，矩形 7×7）。**只在松手那一刻采样**——拖动过程里读盘会把帧率拖下去。
+
+`autoFit` 会记住"用户有没有手动拖过水位"：拖过就不要再自动改回去。
+
+### 23.4 面板："消失"的三个来源
+
+| 现象 | 根因 | 修法 |
+| --- | --- | --- |
+| 建完一块就找不到"再建一块" | 选中态把"新建"段挪到最后并默认收起 | 首屏固定一行 `＋ 新建水体` |
+| 面板看起来是空的 | 内容在"新建/选中"之间切换后 ImGui 保留了旧的 `scrollY` | 切换时 `SetScrollY(0)` |
+| 点了"＋ 新建"没反应 | `select({})` 不清 `m_selectionName`，下一帧 `validateSelection()` 按名字把它找回来了 | 改用 `clearSelection()` |
+
+第三条是这一轮最隐蔽的一个：日志（`WATER-NEW-ENTRY`）打了、按钮也确实
+被点中，但面板纹丝不动——因为选中项在下一帧被"按名字找回来"了。
+
+### 23.5 顺带调掉的两个观感问题
+
+1. **岸边一条结冰似的白带**：岸线泡沫的 `smoothstep(0, 1.5, depth)` 在缓坡
+   池塘上覆盖好几米宽。收窄到 0.10 m，再用阈值化噪声把它打成斑驳的碎块。
+2. **水面像一块灰白塑料**：掠射角下菲涅尔接近全反射，一片灰色天空直接
+   镜面反射就是"结冰"。给反射乘一点水色（`mix(vec3(1), shallow*1.8, 0.28)`），
+   并把 `bodyMix` 里 `opacity` 的系数从 1.0 降到 0.5——2 m 深的湖原本
+   82% 被水色盖住，一点底都透不出来。
+
+### 23.6 验收（`tools/verify_water_depth.py` 全 PASS）
+
+场景是 `scenes/water_bowl.json`：512 m 台地（14 m）+ 中心半径 120 m、深 12 m
+的碗，碗底还有 ±1.2 m 起伏——只有这种地形才同时测得到"小水浅、大水满"。
+
+| 断言 | 结果 |
+| --- | --- |
+| 侧壁生成 | `WATER-MESH ... tris=630 skirt=60` |
+| 采到真地形 | `WATER-GROUND src=terrain bed=1.42 rim=1.42 level=1.60` |
+| 水面不高于岸线 | `level ≤ rim + 0.25` |
+| 半径 10 m → 176 m | `rim 1.42 → 14.00`，`depth 0.18 → 12.18` |
+| 放大后仍不溢出 | `level=14.18 ≤ rim=14.00 + 0.25` |
+| 面板回到新建态 | `WATER-UNBIND` + 再建一块 `WATER-CREATE 1 → 2` |
+| 日志健康 | 零 VUID |
+
+另外 `verify_water.py` 26/26 仍全 PASS（`skirt=60` / `skirt=160`）。
+
+### 23.7 修掉的三个真 bug
+
+1. **`rimMinZ` 被圆心污染**：`measureGround` 用第一个采样点初始化
+   `rimMinZ`，而圆形的第一个点是**圆心**（碗底）。于是 176 m 的湖把
+   rim 记成 2.00 m（碗底）而不是 14.00 m（台地），水面只盖住碗底一小圈。
+   改成只用 rim 点算，`rimMinZ` 初始为 +∞。
+2. **`select(ecs::Entity{})` 取消不了选择**（见 23.4 第三条）。
+3. **水面与侧壁在波动时脱缝**：侧壁顶圈不加波浪位移，水面一波动上沿就
+   露出缝隙。改成 `part < 1.5` 都加。
+
+### 23.8 测试资产
+
+* `assets/terrain/water_bowl/`（257²、2 m/px、maxHeight 40）：碗形，
+  中心 2 m、台地 14 m，碗底带噪声。
+* `assets/scenes/water_bowl.json`：地形 + 一块 25 m 的水塘，打开即可看效果。
+
+⚠ 这两个目录**不在** CMake 的"每次拷贝"列表里（`scenes` 是运行时写的、
+`terrain` 是地形编辑会改的），所以 `verify_water_depth.py` 自己做了
+`ensure_scene_assets()`——否则场景打开失败会静默回退到默认场景，
+地形不存在，贴地断言全部退化成 `src=flat`。

@@ -3,6 +3,7 @@
 #include "DebugRects.h"
 #include "EditModes.h"
 #include "Localization.h"
+#include "ModeRail.h"
 #include "PanelRegistry.h"
 #include "PickingSystem.h"
 
@@ -78,23 +79,44 @@ void recomputeNormals(std::vector<assets::Vertex>& verts,
 // ============================================================
 // 公共：面板窗口 + 选中网格
 // ============================================================
-bool beginToolkitWindow(const char* id, const char* title, float w, float h) {
+// 2026-10-21：八个模式面板不再是浮动窗口，而是**左栏下半那一块**
+// （用户要求把"模式类型选择列表 + 各模式的配置参数"统一放左侧）。
+//
+// 具体做法：窗口矩形每帧钉到 `modeRailBodyRect(ctx.layout())`，并且
+// NoTitleBar | NoMove | NoResize | NoCollapse —— 标题由上面那 9 行单选
+// 表达（当前模式高亮），再挂一条标题栏只是白占 30px 高度。
+//
+// 为什么仍然用**独立顶层窗口**而不是主栏里的 BeginChild：
+//   面板代码几十处 `ImGui::End()`，改成 EndChild 得逐处改，漏一个就是
+//   Assert。顶层窗口只要换矩形，8 个模式的 drawPanel 一行都不用动。
+bool beginToolkitWindow(EditorContext& ctx, const char* id, const char* title,
+                        float w, float h) {
     bool& open = panelOpenRef(id);
     if (!open) return false;
 
-    const ImGuiIO& io = ImGui::GetIO();
     char win[128];
     std::snprintf(win, sizeof(win), "%s###panel_%s", TR(title), id);
+
+    ImGuiWindowFlags wf = 0;
+    if (beginModeRailPanel(ctx, wf)) {
+        if (!ImGui::Begin(win, nullptr, wf)) {
+            ImGui::End();
+            return false;
+        }
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "TK-%s", id);
+        logRect(tag, ImGui::GetWindowPos(),
+                ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
+                       ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
+        return true;
+    }
+
+    // 兜底：左栏被拖到折叠（宽度归零）时退回浮动窗口 —— 否则模式面板会
+    // 彻底失联（矩形 0 宽，点也点不到）。
+    const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowSizeConstraints(ImVec2(380.0f, 300.0f),
                                         ImVec2(FLT_MAX, FLT_MAX));
     ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_FirstUseEver);
-    // ⚠ 默认摆在**右侧**（0.60），不是左侧 0.30。
-    //
-    // 这几个模式全都要用手在视口里操作（刷顶点色 / 点选顶点和面 / 放刷子 /
-    // 在地形上撒点），而视口中心正是模型所在。摆在 0.30 处时面板左边界在
-    // 0.30·宽、宽 460 —— 1600 宽的窗口下它盖住 x∈[480,940]，把**视口中心
-    // 整个吞掉**。表现是"在建模模式里点模型完全没反应"，其实是点在面板上
-    // （`ImGui::IsItemHovered()` 对底下的视口 image 是 false）。
     const float px = io.DisplaySize.x * 0.60f;
     ImGui::SetNextWindowPos(ImVec2(px, io.DisplaySize.y * 0.10f),
                             ImGuiCond_FirstUseEver);
@@ -361,7 +383,7 @@ bool MeshPaintEditor::viewportInput(const glm::vec2& vpPos,
 }
 
 void MeshPaintEditor::drawPanel() {
-    if (!beginToolkitWindow("meshpaint", "Mesh Paint", 420.0f, 560.0f)) return;
+    if (!beginToolkitWindow(m_ctx, "meshpaint", "Mesh Paint", 420.0f, 560.0f)) return;
     ImGui::TextDisabled("%s", TR(editModeHint(EditMode::MeshPaint)));
     ImGui::Separator();
 
@@ -538,6 +560,172 @@ void ModelingEditor::rebuildTopo() {
         t.triNormal.push_back(len > 1e-12f ? n / len
                                            : glm::vec3(0.0f, 0.0f, 1.0f));
     }
+
+    // ------------------------------------------------------------
+    // 多边形层：把共面且共享一条边的两个三角形并成一个面
+    // ------------------------------------------------------------
+    // 渲染网格只有三角形，但**建模看的是面**。立方体一个正方形面在缓冲里
+    // 是两个三角形，如果照着三角形画选区、做操作，用户看到的就是"每个
+    // 正方形都被一条对角线劈成两半"——这就是用户报的那个显示问题。
+    //
+    // 只做**成对**合并（一个三角形最多和邻居合并一次），不做传递合并。
+    // 传递合并会把一块细分过的平面并成一整张 n 边形：选一个格子等于选中
+    // 整个地面，环切和内插也无从下手。成对合并给出的正好是"网格单元"
+    // ——立方体 6 个四边形、平面每格一个四边形，和 Blender 的观感一致。
+    t.poly.clear();
+    t.innerEdge.clear();
+    t.triPoly.assign(t.tri.size(), 0);
+    {
+        auto ekey = [](std::uint32_t a, std::uint32_t b) {
+            if (a > b) std::swap(a, b);
+            return (static_cast<std::uint64_t>(a) << 32) | b;
+        };
+        auto newell = [](const std::vector<std::uint32_t>& v,
+                         const std::vector<glm::vec3>& pos) {
+            glm::vec3 n(0.0f);
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                const glm::vec3& a = pos[v[i]];
+                const glm::vec3& b = pos[v[(i + 1) % v.size()]];
+                n.x += (a.y - b.y) * (a.z + b.z);
+                n.y += (a.z - b.z) * (a.x + b.x);
+                n.z += (a.x - b.x) * (a.y + b.y);
+            }
+            return n;
+        };
+
+        // 面表有两种来源：
+        //   ① 拓扑操作刚做完 → `m_polyHint` 里就是真面表（能还原 n 边形）；
+        //   ② 刚加载/刚绑定 → 没有提示，只能靠"共面两两合并"从三角形反推。
+        // ② 的极限就是四边形（倒角后的八边形会被切成好几块），所以①优先。
+        const bool useHint = [&] {
+            if (m_polyHint.empty()) return false;
+            std::size_t sum = 0;
+            for (std::uint32_t c : m_polyHint) sum += c;
+            return sum == t.tri.size();
+        }();
+
+        if (useHint) {
+            std::size_t ti = 0;
+            for (std::uint32_t count : m_polyHint) {
+                if (count < 1 || ti + count > t.tri.size()) break;
+                Topo::Poly p;
+                p.tris.reserve(count);
+                for (std::uint32_t k = 0; k < count; ++k)
+                    p.tris.push_back(static_cast<std::uint32_t>(ti + k));
+                // 扇形三角化 (v0,v1,v2), (v0,v2,v3)… 的逆运算
+                p.v.push_back(t.tri[ti][0]);
+                p.v.push_back(t.tri[ti][1]);
+                for (std::uint32_t k = 0; k < count; ++k)
+                    p.v.push_back(t.tri[ti + k][2]);
+                const glm::vec3 n = newell(p.v, t.weldPos);
+                const float len = glm::length(n);
+                p.area = len * 0.5f;
+                p.normal = len > 1e-12f ? n / len : t.triNormal[p.tris[0]];
+                const std::uint32_t pi = static_cast<std::uint32_t>(t.poly.size());
+                for (std::uint32_t tri : p.tris) t.triPoly[tri] = pi;
+                t.poly.push_back(std::move(p));
+                ti += count;
+            }
+            // 提示与实际三角形对不上（被别的操作改过）→ 剩下的自己成面，
+            // 至少不会把三角形归到错误的面里。
+            for (; ti < t.tri.size(); ++ti) {
+                Topo::Poly p;
+                p.tris.push_back(static_cast<std::uint32_t>(ti));
+                p.v = {t.tri[ti][0], t.tri[ti][1], t.tri[ti][2]};
+                p.normal = t.triNormal[ti];
+                p.area = 0.0f;
+                t.triPoly[ti] = static_cast<std::uint32_t>(t.poly.size());
+                t.poly.push_back(std::move(p));
+            }
+        } else {
+            std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> edgeTris;
+            edgeTris.reserve(t.tri.size() * 3);
+            for (std::uint32_t f = 0; f < t.tri.size(); ++f) {
+                for (int k = 0; k < 3; ++k)
+                    edgeTris[ekey(t.tri[f][k], t.tri[f][(k + 1) % 3])].push_back(f);
+            }
+            std::vector<int> partner(t.tri.size(), -1);
+            for (const auto& kv : edgeTris) {
+                if (kv.second.size() != 2) continue;   // 非流形边不合并
+                const std::uint32_t a = kv.second[0], b = kv.second[1];
+                if (partner[a] >= 0 || partner[b] >= 0) continue;
+                // 0.99995 ≈ 0.57°：法线差一点点就不合并，避免把球面磨成多边形
+                if (glm::dot(t.triNormal[a], t.triNormal[b]) < 0.99995f) continue;
+                partner[a] = static_cast<int>(b);
+                partner[b] = static_cast<int>(a);
+            }
+
+            // 两个三角形的有向边互相抵消，剩下的就是合并后的外轮廓。
+            auto boundaryLoop = [&](std::uint32_t triA, std::uint32_t triB) {
+                std::unordered_map<std::uint64_t,
+                                   std::pair<std::uint32_t, std::uint32_t>> keep;
+                auto addDir = [&](std::uint32_t a, std::uint32_t b) {
+                    const std::uint64_t k = ekey(a, b);
+                    auto it = keep.find(k);
+                    if (it == keep.end()) keep.emplace(k, std::make_pair(a, b));
+                    else keep.erase(it);              // 反向边 → 内部边，抵消
+                };
+                const std::uint32_t pair[2] = {triA, triB};
+                for (std::uint32_t f : pair)
+                    for (int k = 0; k < 3; ++k)
+                        addDir(t.tri[f][k], t.tri[f][(k + 1) % 3]);
+                std::unordered_map<std::uint32_t,
+                                   std::pair<std::uint32_t, std::uint32_t>> out;
+                for (const auto& kv : keep) out[kv.second.first] = kv.second;
+                std::vector<std::uint32_t> loop;
+                if (out.empty()) return loop;
+                const std::uint32_t start = out.begin()->second.first;
+                std::uint32_t cur = start;
+                for (std::size_t guard = 0; guard <= keep.size(); ++guard) {
+                    loop.push_back(cur);
+                    auto it = out.find(cur);
+                    if (it == out.end()) break;
+                    cur = it->second.second;
+                    if (cur == start) break;
+                }
+                return loop;
+            };
+
+            for (std::uint32_t f = 0; f < t.tri.size(); ++f) {
+                const int mate = partner[f];
+                // 伙伴编号小于自己的，说明这一对已经发过了
+                if (mate >= 0 && static_cast<std::uint32_t>(mate) < f) continue;
+                Topo::Poly p;
+                p.tris.push_back(f);
+                if (mate >= 0) {
+                    p.v = boundaryLoop(f, static_cast<std::uint32_t>(mate));
+                    p.tris.push_back(static_cast<std::uint32_t>(mate));
+                }
+                if (p.v.size() < 3)
+                    p.v = {t.tri[f][0], t.tri[f][1], t.tri[f][2]};
+                const glm::vec3 n = newell(p.v, t.weldPos);
+                const float len = glm::length(n);
+                p.area = len * 0.5f;
+                p.normal = len > 1e-12f ? n / len : t.triNormal[f];
+                const std::uint32_t pi = static_cast<std::uint32_t>(t.poly.size());
+                for (std::uint32_t tri : p.tris) t.triPoly[tri] = pi;
+                t.poly.push_back(std::move(p));
+            }
+
+
+        }
+        m_polyHint.clear();
+
+        // 多边形内部的边（三角形的对角线）：边模式下不画、不可选。
+        // 不排掉的话，用户能在立方体一个正方形面上选中一条"本来不存在"的
+        // 对角线 —— 那正是这次要修的东西。
+        std::unordered_set<std::uint64_t> boundary;
+        boundary.reserve(t.poly.size() * 4);
+        for (const auto& p : t.poly)
+            for (std::size_t i = 0; i < p.v.size(); ++i)
+                boundary.insert(ekey(p.v[i], p.v[(i + 1) % p.v.size()]));
+        for (const auto& tr : t.tri)
+            for (int k = 0; k < 3; ++k) {
+                const std::uint64_t key = ekey(tr[k], tr[(k + 1) % 3]);
+                if (!boundary.count(key)) t.innerEdge.insert(key);
+            }
+    }
+
     t.valid = true;
     m_vertices = static_cast<int>(m_verts.size());
     m_triangles = static_cast<int>(t.tri.size());
@@ -565,9 +753,12 @@ void ModelingEditor::bind() {
     m_idx = mesh->indices();
     m_sel.clear();
     rebuildTopo();
-    VK_LOG_INFO("MODEL-BIND entity=%u verts=%d welded=%d tris=%d",
+    // `polys=` 是 2026-10-21 加的：立方体必须报 6（六个四边形），
+    // 报 12 就说明共面合并没生效 —— 那正是"每个正方形被对角线劈开"的根。
+    VK_LOG_INFO("MODEL-BIND entity=%u verts=%d welded=%d tris=%d polys=%d",
                 static_cast<unsigned>(e.id), m_vertices,
-                static_cast<int>(m_topo.weldPos.size()), m_triangles);
+                static_cast<int>(m_topo.weldPos.size()), m_triangles,
+                static_cast<int>(m_topo.poly.size()));
 }
 
 void ModelingEditor::sync() {
@@ -583,13 +774,20 @@ void ModelingEditor::sync() {
     // 的编辑丢掉（拖动过程中每帧都会被清回原样，看起来像"拖不动"）。
     if (e.id == m_entity.id && mesh == m_src && m_topo.valid) {
         m_selectedVerts = static_cast<int>(m_sel.size());
-        m_selectedFaces = static_cast<int>(selFaces().size());
+        // 面数按**多边形**计：面板上写 "3 faces" 时，用户心里数的是立方体
+        // 上的三个正方形，不是六个三角形。
+        m_selectedFaces = static_cast<int>(selPolys().size());
         m_selectedEdges = 0;
         for (std::size_t f = 0; f < m_topo.tri.size(); ++f) {
             const auto& tr = m_topo.tri[f];
             for (int k = 0; k < 3; ++k) {
                 const std::uint32_t a = tr[k], b = tr[(k + 1) % 3];
-                if (a < b && m_sel.count(a) && m_sel.count(b)) ++m_selectedEdges;
+                if (a >= b || !m_sel.count(a) || !m_sel.count(b)) continue;
+                // 与覆盖层同一套口径：三角形对角线不算边
+                const std::uint64_t key =
+                    (static_cast<std::uint64_t>(a) << 32) | b;
+                if (m_topo.innerEdge.count(key)) continue;
+                ++m_selectedEdges;
             }
         }
         return;
@@ -609,6 +807,28 @@ std::vector<std::uint32_t> ModelingEditor::selFaces() const {
     return out;
 }
 
+// 选中多边形：所有顶点都在 m_sel 里的面。
+//
+// 这是面模式下**真正的选区单位**。`selFaces()`（三角形）仍然保留 ——
+// 挤出 / 细分 / 删除这些老操作按三角形走完全等价（一个四边形的两个三角形
+// 会一起被选中），而且不用改它们的实现。
+std::vector<std::uint32_t> ModelingEditor::selPolys() const {
+    std::vector<std::uint32_t> out;
+    if (!m_topo.valid) return out;
+    for (std::size_t i = 0; i < m_topo.poly.size(); ++i) {
+        const auto& p = m_topo.poly[i];
+        bool all = !p.v.empty();
+        for (std::uint32_t w : p.v) {
+            if (!m_sel.count(w)) {
+                all = false;
+                break;
+            }
+        }
+        if (all) out.push_back(static_cast<std::uint32_t>(i));
+    }
+    return out;
+}
+
 glm::vec3 ModelingEditor::selectionCenter() const {
     if (m_sel.empty()) return glm::vec3(0.0f);
     glm::vec3 sum(0.0f);
@@ -623,10 +843,18 @@ glm::vec3 ModelingEditor::selectionCenter() const {
 }
 
 glm::vec3 ModelingEditor::selectionNormal() const {
-    const std::vector<std::uint32_t> faces = selFaces();
+    // 用**多边形**法线而不是三角形法线：挤出一个正方形面时，两条三角形
+    // 法线本来就一样，结果相同；但选中多个面时按面积加权会更稳（不会被
+    // 一堆细碎三角形把方向拽偏）。
+    const std::vector<std::uint32_t> polys = selPolys();
     glm::vec3 n(0.0f);
-    for (std::uint32_t f : faces) {
-        if (f < m_topo.triNormal.size()) n += m_topo.triNormal[f];
+    for (std::uint32_t p : polys) {
+        if (p < m_topo.poly.size())
+            n += m_topo.poly[p].normal * std::max(m_topo.poly[p].area, 1e-6f);
+    }
+    if (glm::length(n) < 1e-6f) {
+        for (std::uint32_t f : selFaces())
+            if (f < m_topo.triNormal.size()) n += m_topo.triNormal[f];
     }
     const float len = glm::length(n);
     return (len > 1e-6f) ? (n / len) : glm::vec3(0.0f, 0.0f, 1.0f);
@@ -639,7 +867,7 @@ void ModelingEditor::selectAll(bool on) {
     }
     VK_LOG_INFO("MODEL-SEL mode=%s verts=%d faces=%d", on ? "all" : "none",
                 static_cast<int>(m_sel.size()),
-                static_cast<int>(selFaces().size()));
+                static_cast<int>(selPolys().size()));
 }
 
 // 把 weld 位置广播回所有渲染顶点 → 重算法线 → 注册新网格 → 换指针。
@@ -674,10 +902,12 @@ void ModelingEditor::upload(const char* op) {
     m_src = created;
     rebuildTopo();
     m_ctx.dirty() = true;
-    VK_LOG_INFO("MODEL-OP op=%s verts=%d->%d tris=%d rev=%d selV=%d selF=%d",
-                op, m_beforeVerts, m_vertices, m_triangles, m_rev,
+    VK_LOG_INFO("MODEL-OP op=%s verts=%d->%d tris=%d polys=%d rev=%d selV=%d "
+                "selF=%d",
+                op, m_beforeVerts, m_vertices, m_triangles,
+                static_cast<int>(m_topo.poly.size()), m_rev,
                 static_cast<int>(m_sel.size()),
-                static_cast<int>(selFaces().size()));
+                static_cast<int>(selPolys().size()));
 }
 
 // ------------------------------------------------------------ 拓扑操作
@@ -793,7 +1023,7 @@ void ModelingEditor::extrude() {
                 static_cast<int>(faces.size()), sides,
                 static_cast<double>(d), m_vertices, m_triangles,
                 static_cast<int>(m_sel.size()),
-                static_cast<int>(selFaces().size()));
+                static_cast<int>(selPolys().size()));
 }
 
 void ModelingEditor::deleteFaces() {
@@ -943,7 +1173,7 @@ void ModelingEditor::subdivideSelected(const char* opName) {
     }
     VK_LOG_INFO("MODEL-SUBDIV op=%s faces=%d tris=%d verts=%d selF=%d", opName,
                 static_cast<int>(faces.size()), m_triangles, m_vertices,
-                static_cast<int>(selFaces().size()));
+                static_cast<int>(selPolys().size()));
 }
 
 void ModelingEditor::flipSelected() {
@@ -1001,6 +1231,582 @@ void ModelingEditor::mirrorX() {
     m_sel.clear();
     upload("mirror");
     VK_LOG_INFO("MODEL-MIRROR axis=x verts=%d", m_vertices);
+}
+
+// ============================================================
+// 编辑网格（EditMesh）：三个新拓扑操作的公共地基
+// ============================================================
+//
+// 内插面 / 倒角 / 环切都要**增删面**，而且会动到没被选中的邻居面（倒角要
+// 切掉所有相邻面的角）。直接在三张索引表上做增量拼接的话，每个操作都得
+// 写一套"旧三角形怎么删、新三角形怎么接"的胶水代码，漏掉一个角就是一地
+// 碎面 —— 而且三种操作互相之间还会打架。
+//
+// 所以统一摊平成 EditMesh（位置数组 + 面表 + 每角对应的原渲染顶点），
+// 在面表上做手术，最后一次性写回。
+//
+// 为什么"每角保留原渲染顶点"这一条不能省：
+//   立方体一个角有 3 份渲染顶点（三个面法线不同）。如果写回时让同一位置的
+//   角共用一个渲染顶点，`recomputeNormals` 会把三条法线平均掉 ——
+//   一次倒角就能把整个立方体变成"圆角盒子"。
+
+void ModelingEditor::buildEditMesh(EditMesh& em) const {
+    em.pos = m_topo.weldPos;
+    em.faces.clear();
+    em.cornerVert.clear();
+    em.faces.reserve(m_topo.poly.size());
+    em.cornerVert.reserve(m_topo.poly.size());
+
+    for (const auto& p : m_topo.poly) {
+        em.faces.push_back(p.v);
+        std::vector<std::uint32_t> cv(p.v.size(), EditMesh::kNewVert);
+        // 优先用**本面自己**的三角形去找渲染顶点（不能随手拿 weldVerts[0]：
+        // 那是别的面的顶点，法线/UV 都是别的面的）。
+        for (std::uint32_t tri : p.tris) {
+            if (tri >= m_topo.tri.size()) continue;
+            const auto& tw = m_topo.tri[tri];
+            const auto& tv = m_topo.triVert[tri];
+            for (int k = 0; k < 3; ++k) {
+                for (std::size_t c = 0; c < p.v.size(); ++c)
+                    if (p.v[c] == tw[k] && cv[c] == EditMesh::kNewVert)
+                        cv[c] = tv[k];
+            }
+        }
+        // 兜底：万一某个角在三角形里找不到（理论上不会），退回 weld 组首项
+        for (std::size_t c = 0; c < cv.size(); ++c) {
+            if (cv[c] != EditMesh::kNewVert) continue;
+            const std::uint32_t w = p.v[c];
+            if (w < m_topo.weldVerts.size() && !m_topo.weldVerts[w].empty())
+                cv[c] = m_topo.weldVerts[w][0];
+        }
+        em.cornerVert.push_back(std::move(cv));
+    }
+}
+
+void ModelingEditor::commitEditMesh(EditMesh& em, const char* op) {
+    if (em.faces.empty()) return;
+
+    // 1) 新角 → 每个角建**一份独立的**渲染顶点（属性抄本面第一个老角）。
+    //    不能按 weld 去重：倒角的切点被两个相邻面共用，去重就意味着两个面
+    //    共用一个渲染顶点，法线被平均 → 硬边没了。
+    for (std::size_t f = 0; f < em.faces.size(); ++f) {
+        const auto& face = em.faces[f];
+        auto& cv = em.cornerVert[f];
+        if (cv.size() != face.size()) cv.assign(face.size(), EditMesh::kNewVert);
+        std::uint32_t tmpl = EditMesh::kNewVert;
+        for (std::uint32_t v : cv)
+            if (v != EditMesh::kNewVert && v < m_verts.size() && tmpl == EditMesh::kNewVert)
+                tmpl = v;
+        if (tmpl == EditMesh::kNewVert) tmpl = 0;
+        for (std::size_t c = 0; c < face.size(); ++c) {
+            if (cv[c] != EditMesh::kNewVert) continue;
+            assets::Vertex nv = m_verts[tmpl];
+            nv.pos = em.pos[face[c]];
+            cv[c] = static_cast<std::uint32_t>(m_verts.size());
+            m_verts.push_back(nv);
+        }
+    }
+
+    // 2) 老顶点：位置写回 weld 层（upload 会把组位置广播给所有渲染顶点）
+    const std::size_t nOld = std::min(m_topo.weldPos.size(), em.pos.size());
+    for (std::size_t w = 0; w < nOld; ++w) m_topo.weldPos[w] = em.pos[w];
+
+    // 3) 重建索引：每个面扇形三角化（面都是凸/近凸的，扇形足够）
+    //
+    //    同时把"每个面几个三角形"记进 m_polyHint：rebuildTopo 靠它把 n 边形
+    //    原样还原。没有这一条，倒角出来的八边形会被重新猜成 3~4 个四边形。
+    m_idx.clear();
+    m_idx.reserve(em.faces.size() * 6);
+    m_polyHint.clear();
+    m_polyHint.reserve(em.faces.size());
+    for (std::size_t f = 0; f < em.faces.size(); ++f) {
+        const auto& face = em.faces[f];
+        const auto& cv = em.cornerVert[f];
+        if (face.size() < 3) continue;
+        for (std::size_t k = 1; k + 1 < face.size(); ++k) {
+            m_idx.push_back(cv[0]);
+            m_idx.push_back(cv[k]);
+            m_idx.push_back(cv[k + 1]);
+        }
+        m_polyHint.push_back(static_cast<std::uint32_t>(face.size() - 2));
+    }
+    upload(op);
+}
+
+void ModelingEditor::selectByPosition(const std::vector<glm::vec3>& pts) {
+    m_sel.clear();
+    if (!m_topo.valid || pts.empty()) return;
+    std::unordered_map<PosKey, std::uint32_t, PosKeyHash, PosKeyEq> map;
+    map.reserve(m_topo.weldPos.size());
+    for (std::uint32_t i = 0; i < m_topo.weldPos.size(); ++i)
+        map.emplace(quantizePos(m_topo.weldPos[i]), i);
+    for (const auto& p : pts) {
+        auto it = map.find(quantizePos(p));
+        if (it != map.end()) m_sel.insert(it->second);
+    }
+}
+
+// ------------------------------------------------------------ 内插面（Inset）
+//
+// 每个选中的面往里收一圈，中间那块面保留、外圈补一圈四边形。
+// 与"把面放大缩小"的区别：这里是**每条边向内平移固定距离**（Blender 的
+// Offset），所以长条面收出来的内面还是长条，而不是等比缩小的形状。
+void ModelingEditor::insetFaces() {
+    m_beforeVerts = static_cast<int>(m_verts.size());
+    const std::vector<std::uint32_t> polys = selPolys();
+    if (polys.empty()) {
+        VK_LOG_INFO("MODEL-INSET skip=no-face-selected");
+        m_ctx.notify(TR("Inset needs at least one selected face."));
+        return;
+    }
+    EditMesh em;
+    buildEditMesh(em);
+    const float dist = std::max(m_inset, 1.0e-4f);
+
+    std::vector<glm::vec3> innerPts;   // 新内角的位置（写回后用来恢复选区）
+    int made = 0;
+
+    for (std::uint32_t pi : polys) {
+        if (pi >= em.faces.size()) continue;
+        std::vector<std::uint32_t> face = em.faces[pi];
+        const std::size_t n = face.size();
+        if (n < 3 || n > 256) continue;
+        const glm::vec3 nrm = m_topo.poly[pi].normal;
+
+        // 面平面内的正交基
+        glm::vec3 u(1.0f, 0.0f, 0.0f);
+        if (std::fabs(glm::dot(u, nrm)) > 0.9f) u = glm::vec3(0.0f, 1.0f, 0.0f);
+        u = glm::normalize(u - nrm * glm::dot(u, nrm));
+        const glm::vec3 v = glm::cross(nrm, u);
+        const float h = glm::dot(em.pos[face[0]], nrm);
+
+        std::vector<glm::vec2> p2(n);
+        glm::vec2 c2(0.0f);
+        for (std::size_t i = 0; i < n; ++i) {
+            const glm::vec3& q = em.pos[face[i]];
+            p2[i] = glm::vec2(glm::dot(q, u), glm::dot(q, v));
+            c2 += p2[i];
+        }
+        c2 /= static_cast<float>(n);
+
+        // 每条边的内法线（面内）。逆时针绕序时把边方向转 +90° 指向内侧。
+        std::vector<glm::vec2> nrm2(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            glm::vec2 e = p2[(i + 1) % n] - p2[i];
+            const float len = glm::length(e);
+            if (len < 1.0e-7f) {
+                nrm2[i] = glm::vec2(0.0f);
+                continue;
+            }
+            e /= len;
+            nrm2[i] = glm::vec2(-e.y, e.x);
+        }
+        // 绕序可能反（导入的网格不保证 CCW）：用"内法线是否指向重心"校验
+        float inward = 0.0f;
+        for (std::size_t i = 0; i < n; ++i)
+            inward += glm::dot(nrm2[i], c2 - p2[i]);
+        if (inward < 0.0f)
+            for (auto& d : nrm2) d = -d;
+
+        // 顶点 i = 边(i-1) 与 边(i) 各自向内平移 dist 后的交点
+        std::vector<glm::vec2> inner2(n);
+        bool bad = false;
+        for (std::size_t i = 0; i < n; ++i) {
+            const glm::vec2 n0 = nrm2[(i + n - 1) % n];
+            const glm::vec2 n1 = nrm2[i];
+            const float det = n0.x * n1.y - n0.y * n1.x;
+            if (std::fabs(det) < 1.0e-6f) {
+                // 两条边几乎共线（180° 的角）→ 直接沿法线平移
+                inner2[i] = p2[i] + n1 * dist;
+                continue;
+            }
+            const float b0 = dist + glm::dot(p2[(i + n - 1) % n], n0);
+            const float b1 = dist + glm::dot(p2[i], n1);
+            inner2[i] = glm::vec2((b0 * n1.y - b1 * n0.y) / det,
+                                  (b1 * n0.x - b0 * n1.x) / det);
+            // 收过头 → 内面会翻出去。这种情况退回"朝重心插值"。
+            if (glm::dot(inner2[i] - p2[i], n1) < -1.0e-4f) bad = true;
+        }
+        if (bad) {
+            float apothem = 1.0e30f;
+            for (std::size_t i = 0; i < n; ++i) {
+                const float d = glm::dot(c2 - p2[i], nrm2[i]);
+                if (d > 1.0e-5f) apothem = std::min(apothem, d);
+            }
+            if (apothem > 1.0e29f) apothem = 1.0f;
+            const float t = std::clamp(dist / apothem, 0.0f, 0.45f);
+            for (std::size_t i = 0; i < n; ++i)
+                inner2[i] = glm::mix(p2[i], c2, t);
+        }
+
+        // 建新顶点 + 换掉原面 + 补一圈四边形
+        std::vector<std::uint32_t> innerW(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const glm::vec3 p3 =
+                u * inner2[i].x + v * inner2[i].y + nrm * h;
+            innerW[i] = static_cast<std::uint32_t>(em.pos.size());
+            em.pos.push_back(p3);
+            innerPts.push_back(p3);
+        }
+        std::vector<std::vector<std::uint32_t>> ring(n);
+        std::vector<std::vector<std::uint32_t>> ringCv(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t j = (i + 1) % n;
+            ring[i] = {face[i], face[j], innerW[j], innerW[i]};
+            ringCv[i] = {em.cornerVert[pi][i], em.cornerVert[pi][j],
+                         EditMesh::kNewVert, EditMesh::kNewVert};
+        }
+        em.faces[pi] = innerW;
+        em.cornerVert[pi].assign(n, EditMesh::kNewVert);
+        for (std::size_t i = 0; i < n; ++i) {
+            em.faces.push_back(std::move(ring[i]));
+            em.cornerVert.push_back(std::move(ringCv[i]));
+        }
+        made += static_cast<int>(n);
+    }
+
+    if (innerPts.empty()) return;
+    commitEditMesh(em, "inset");
+    selectByPosition(innerPts);
+    VK_LOG_INFO("MODEL-INSET faces=%d newVerts=%d dist=%.3f verts=%d tris=%d "
+                "polys=%d selF=%d",
+                static_cast<int>(polys.size()), made,
+                static_cast<double>(dist), m_vertices, m_triangles,
+                static_cast<int>(m_topo.poly.size()),
+                static_cast<int>(selPolys().size()));
+}
+
+// ------------------------------------------------------------ 倒角（Bevel）
+//
+// 顶点倒角：每个选中的角，沿它的每条相邻边量出 bevel 距离切一刀，然后
+// 在角上补一个"切面"。全选一个立方体的 8 个角 → 倒角立方体（Blender
+// Ctrl+B 选全部顶点时的效果）。
+//
+// 为什么做顶点倒角而不是边倒角：边倒角要沿一条边把两侧的顶点各自劈成
+// 两份，还会在顶点处产生三岔的补角面 —— 那是半个 half-edge 内核的工作量。
+// 顶点倒角在**每个面上**都只是一次"corner truncation"，天然不会漏面。
+void ModelingEditor::bevelVertices() {
+    m_beforeVerts = static_cast<int>(m_verts.size());
+    if (m_sel.empty()) {
+        VK_LOG_INFO("MODEL-BEVEL skip=no-vertex-selected");
+        m_ctx.notify(TR("Bevel works on selected vertices: switch to 1 "
+                        "and select the corners you want to cut."));
+        return;
+    }
+    EditMesh em;
+    buildEditMesh(em);
+    const float dist = std::max(m_bevel, 1.0e-4f);
+    const float eps = 1.0e-4f;
+
+    // 建邻接（从面表推，不用三角形 —— 面表才是拓扑真相）
+    std::vector<std::unordered_set<std::uint32_t>> adj(em.pos.size());
+    for (const auto& face : em.faces)
+        for (std::size_t i = 0; i < face.size(); ++i) {
+            const std::uint32_t a = face[i];
+            const std::uint32_t b = face[(i + 1) % face.size()];
+            if (a >= adj.size() || b >= adj.size()) continue;
+            adj[a].insert(b);
+            adj[b].insert(a);
+        }
+
+    auto ekey = [](std::uint32_t a, std::uint32_t b) {
+        if (a > b) std::swap(a, b);
+        return (static_cast<std::uint64_t>(a) << 32) | b;
+    };
+
+    // 每条被切的边一个切点（两个相邻面共用同一个 weld 位置）
+    std::unordered_map<std::uint64_t, std::uint32_t> cut;
+    std::vector<glm::vec3> cutPts;
+    std::vector<std::uint32_t> beveled;
+    for (std::uint32_t v : m_sel) {
+        if (v >= em.pos.size()) continue;
+        beveled.push_back(v);
+        for (std::uint32_t u : adj[v]) {
+            const std::uint64_t k = ekey(v, u);
+            if (cut.count(k)) continue;
+            const glm::vec3 d3 = em.pos[u] - em.pos[v];
+            const float len = glm::length(d3);
+            if (len < eps) continue;
+            // 0.45 而不是 0.5：两端都倒角时两个切点才不会撞在一起
+            const float dd = std::min(dist, 0.45f * len);
+            const glm::vec3 p = em.pos[v] + d3 * (dd / len);
+            cut[k] = static_cast<std::uint32_t>(em.pos.size());
+            em.pos.push_back(p);
+            cutPts.push_back(p);
+        }
+    }
+    if (cut.empty()) {
+        VK_LOG_INFO("MODEL-BEVEL skip=degenerate");
+        return;
+    }
+
+    // 2) 每个面：把被倒角的角换成"两个切点"
+    for (std::size_t f = 0; f < em.faces.size(); ++f) {
+        const std::vector<std::uint32_t> face = em.faces[f];
+        const std::vector<std::uint32_t> cv = em.cornerVert[f];
+        const std::size_t n = face.size();
+        std::vector<std::uint32_t> nf, ncv;
+        nf.reserve(n + 2);
+        ncv.reserve(n + 2);
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint32_t w = face[i];
+            if (!m_sel.count(w)) {
+                nf.push_back(w);
+                ncv.push_back(cv.size() == n ? cv[i] : EditMesh::kNewVert);
+                continue;
+            }
+            const std::uint32_t prev = face[(i + n - 1) % n];
+            const std::uint32_t next = face[(i + 1) % n];
+            auto ip = cut.find(ekey(w, prev));
+            auto in = cut.find(ekey(w, next));
+            if (ip == cut.end() || in == cut.end()) {   // 退化边，保持原样
+                nf.push_back(w);
+                ncv.push_back(cv.size() == n ? cv[i] : EditMesh::kNewVert);
+                continue;
+            }
+            nf.push_back(ip->second);
+            ncv.push_back(EditMesh::kNewVert);
+            nf.push_back(in->second);
+            ncv.push_back(EditMesh::kNewVert);
+        }
+        em.faces[f] = std::move(nf);
+        em.cornerVert[f] = std::move(ncv);
+    }
+
+    // 3) 每个被倒角的角补一个"切面"
+    auto faceNormal = [&](const std::vector<std::uint32_t>& v) {
+        glm::vec3 n(0.0f);
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            const glm::vec3& a = em.pos[v[i]];
+            const glm::vec3& b = em.pos[v[(i + 1) % v.size()]];
+            n.x += (a.y - b.y) * (a.z + b.z);
+            n.y += (a.z - b.z) * (a.x + b.x);
+            n.z += (a.x - b.x) * (a.y + b.y);
+        }
+        return n;
+    };
+    int caps = 0;
+    for (std::uint32_t v : beveled) {
+        std::vector<std::uint32_t> ring;
+        for (std::uint32_t u : adj[v]) {
+            auto it = cut.find(ekey(v, u));
+            if (it != cut.end()) ring.push_back(it->second);
+        }
+        if (ring.size() < 3) continue;
+        // 顶点法线 = 相邻面法线之和（近似）
+        glm::vec3 vn(0.0f);
+        for (const auto& face : em.faces)
+            for (std::uint32_t w : face)
+                if (w == v) {
+                    vn += glm::normalize(faceNormal(face) + glm::vec3(1e-9f));
+                    break;
+                }
+        if (glm::length(vn) < 1e-6f) vn = glm::vec3(0.0f, 0.0f, 1.0f);
+        vn = glm::normalize(vn);
+        // 切面绕顶点排序（按绕 vn 的角度）→ 凸多边形，法线朝外
+        glm::vec3 t1(1.0f, 0.0f, 0.0f);
+        if (std::fabs(glm::dot(t1, vn)) > 0.9f) t1 = glm::vec3(0.0f, 1.0f, 0.0f);
+        t1 = glm::normalize(t1 - vn * glm::dot(t1, vn));
+        const glm::vec3 t2 = glm::cross(vn, t1);
+        std::sort(ring.begin(), ring.end(),
+                  [&](std::uint32_t a, std::uint32_t b) {
+                      const glm::vec3 da = em.pos[a] - em.pos[v];
+                      const glm::vec3 db = em.pos[b] - em.pos[v];
+                      return std::atan2(glm::dot(da, t2), glm::dot(da, t1)) <
+                             std::atan2(glm::dot(db, t2), glm::dot(db, t1));
+                  });
+        em.faces.push_back(ring);
+        em.cornerVert.push_back(std::vector<std::uint32_t>(
+            ring.size(), EditMesh::kNewVert));
+        ++caps;
+    }
+
+    commitEditMesh(em, "bevel");
+    selectByPosition(cutPts);
+    VK_LOG_INFO("MODEL-BEVEL corners=%d cuts=%d caps=%d dist=%.3f verts=%d "
+                "tris=%d polys=%d selV=%d",
+                static_cast<int>(beveled.size()), static_cast<int>(cut.size()),
+                caps, static_cast<double>(dist), m_vertices, m_triangles,
+                static_cast<int>(m_topo.poly.size()),
+                static_cast<int>(m_sel.size()));
+}
+
+// ------------------------------------------------------------ 环切（Loop cut）
+//
+// 沿一条四边形带插入一圈边。做法：
+//   1. 定 seed 边：边模式下选了正好两个点就用它；否则取选中面的最短边
+//      （最短边一定是"横向"的那条 —— 长条面环切不该顺着长边走）；
+//   2. 在四边形带里一路穿过去（进入边 → 对面边 → 邻面），直到回到起点
+//      （闭合环）或走出边界（开带）；
+//   3. 每条被穿过的边插入 m_loopCount 个点，每个四边形拆成一排四边形。
+void ModelingEditor::loopCut() {
+    m_beforeVerts = static_cast<int>(m_verts.size());
+    EditMesh em;
+    buildEditMesh(em);
+    if (em.faces.empty()) return;
+
+    auto ekey = [](std::uint32_t a, std::uint32_t b) {
+        if (a > b) std::swap(a, b);
+        return (static_cast<std::uint64_t>(a) << 32) | b;
+    };
+
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> edgeFaces;
+    for (std::uint32_t f = 0; f < em.faces.size(); ++f) {
+        const auto& face = em.faces[f];
+        for (std::size_t i = 0; i < face.size(); ++i)
+            edgeFaces[ekey(face[i], face[(i + 1) % face.size()])].push_back(f);
+    }
+
+    // ---- seed 边 ----
+    std::uint64_t seed = 0;
+    bool haveSeed = false;
+    if (m_selMode == SelectMode::Edge && m_sel.size() == 2) {
+        std::uint32_t a = 0, b = 0;
+        int n = 0;
+        for (std::uint32_t v : m_sel) (n++ == 0 ? a : b) = v;
+        if (a < em.pos.size() && b < em.pos.size()) {
+            seed = ekey(a, b);
+            haveSeed = edgeFaces.count(seed) > 0;
+        }
+    }
+    if (!haveSeed) {
+        const auto polys = selPolys();
+        if (!polys.empty()) {
+            const auto& face = em.faces[polys[0]];
+            float best = 1.0e30f;
+            for (std::size_t i = 0; i < face.size(); ++i) {
+                const float L = glm::length(em.pos[face[(i + 1) % face.size()]] -
+                                            em.pos[face[i]]);
+                if (L < best && L > 1.0e-6f) {
+                    best = L;
+                    seed = ekey(face[i], face[(i + 1) % face.size()]);
+                    haveSeed = true;
+                }
+            }
+        }
+    }
+    if (!haveSeed) {
+        VK_LOG_INFO("MODEL-LOOPCUT skip=no-seed-edge");
+        m_ctx.notify(TR("Loop cut needs a selected face (or two vertices in "
+                        "edge mode) to know which way the loop runs."));
+        return;
+    }
+
+    // ---- 沿四边形带游走 ----
+    std::vector<std::uint32_t> ring;
+    std::vector<std::uint64_t> splitEdges;
+    std::unordered_set<std::uint64_t> seenEdge;
+    const std::uint32_t startFace = edgeFaces[seed].front();
+    std::uint32_t f = startFace;
+    std::uint64_t cur = seed;
+    for (std::size_t guard = 0; guard <= em.faces.size(); ++guard) {
+        const auto& face = em.faces[f];
+        if (face.size() != 4) break;                  // 非四边形，带到此为止
+        if (seenEdge.count(cur)) break;
+        seenEdge.insert(cur);
+        splitEdges.push_back(cur);
+
+        std::uint32_t i0 = 4;
+        for (std::uint32_t i = 0; i < 4; ++i)
+            if (ekey(face[i], face[(i + 1) % 4]) == cur) {
+                i0 = i;
+                break;
+            }
+        if (i0 == 4) break;
+        ring.push_back(f);
+        const std::uint64_t opp =
+            ekey(face[(i0 + 2) % 4], face[(i0 + 3) % 4]);
+        auto it = edgeFaces.find(opp);
+        if (it == edgeFaces.end()) break;
+        std::uint32_t nf = 0xFFFFFFFFu;
+        for (std::uint32_t cand : it->second)
+            if (cand != f) {
+                nf = cand;
+                break;
+            }
+        if (nf == 0xFFFFFFFFu) break;                 // 边界
+        if (nf == startFace) {                        // 闭环：最后一刀落在 seed 上
+            if (!seenEdge.count(opp)) {
+                seenEdge.insert(opp);
+                splitEdges.push_back(opp);
+            }
+            break;
+        }
+        f = nf;
+        cur = opp;
+    }
+    if (ring.empty()) {
+        VK_LOG_INFO("MODEL-LOOPCUT skip=not-quad");
+        m_ctx.notify(TR("Loop cut only walks quads - select a quad first."));
+        return;
+    }
+
+    // ---- 每条边插入 m_loopCount 个点 ----
+    const int cuts = std::clamp(m_loopCount, 1, 10);
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> onEdge;
+    std::vector<glm::vec3> newPts;
+    for (std::uint64_t k : splitEdges) {
+        const std::uint32_t a = static_cast<std::uint32_t>(k >> 32);
+        const std::uint32_t b = static_cast<std::uint32_t>(k & 0xFFFFFFFFu);
+        std::vector<std::uint32_t> ids;
+        ids.reserve(cuts);
+        for (int c = 1; c <= cuts; ++c) {
+            const float t = static_cast<float>(c) / static_cast<float>(cuts + 1);
+            const glm::vec3 p = glm::mix(em.pos[a], em.pos[b], t);
+            ids.push_back(static_cast<std::uint32_t>(em.pos.size()));
+            em.pos.push_back(p);
+            newPts.push_back(p);
+        }
+        onEdge[k] = std::move(ids);
+    }
+
+    // ---- 拆分每个环内的四边形 ----
+    int madeQuads = 0;
+    for (std::uint32_t fi : ring) {
+        const std::vector<std::uint32_t> face = em.faces[fi];
+        const std::vector<std::uint32_t> cv = em.cornerVert[fi];
+        int ei = -1, eo = -1;
+        for (int i = 0; i < 4; ++i) {
+            const std::uint64_t k = ekey(face[i], face[(i + 1) % 4]);
+            if (!onEdge.count(k)) continue;
+            if (ei < 0) ei = i;
+            else eo = i;
+        }
+        if (ei < 0 || eo < 0) continue;
+        if ((eo + 4 - ei) % 4 != 2) continue;   // 两条边必须是对边
+
+        const std::uint32_t c0 = face[ei], c1 = face[(ei + 1) % 4];
+        const std::uint32_t c2 = face[(ei + 2) % 4], c3 = face[(ei + 3) % 4];
+        const auto& A = onEdge[ekey(c0, c1)];
+        const auto& B = onEdge[ekey(c2, c3)];
+        // 左轨：c0 → c1；右轨反着走：c3 → c2，这样四边形才不扭
+        std::vector<std::uint32_t> L, R, Lcv, Rcv;
+        L.push_back(c0);          Lcv.push_back(cv[ei]);
+        R.push_back(c3);          Rcv.push_back(cv[(ei + 3) % 4]);
+        for (int c = 0; c < cuts; ++c) {
+            L.push_back(A[c]);    Lcv.push_back(EditMesh::kNewVert);
+            R.push_back(B[cuts - 1 - c]); Rcv.push_back(EditMesh::kNewVert);
+        }
+        L.push_back(c1);          Lcv.push_back(cv[(ei + 1) % 4]);
+        R.push_back(c2);          Rcv.push_back(cv[(ei + 2) % 4]);
+
+        em.faces[fi] = {};        // 原面被拆掉，用下面这一排替代
+        em.cornerVert[fi] = {};
+        for (int c = 0; c <= cuts; ++c) {
+            em.faces.push_back({L[c], L[c + 1], R[c + 1], R[c]});
+            em.cornerVert.push_back({Lcv[c], Lcv[c + 1], Rcv[c + 1], Rcv[c]});
+            ++madeQuads;
+        }
+    }
+
+    if (newPts.empty()) return;
+    commitEditMesh(em, "loopcut");
+    selectByPosition(newPts);
+    VK_LOG_INFO("MODEL-LOOPCUT faces=%d cuts=%d newQuads=%d verts=%d tris=%d "
+                "polys=%d selV=%d",
+                static_cast<int>(ring.size()), cuts, madeQuads, m_vertices,
+                m_triangles, static_cast<int>(m_topo.poly.size()),
+                static_cast<int>(m_sel.size()));
 }
 
 // ------------------------------------------------------------ 模态变换
@@ -1169,6 +1975,22 @@ bool ModelingEditor::handleKeys() {
         extrude();
         return true;
     }
+    // ---- 拓扑刷子（Blender 键位）----
+    // I 内插面 / B 倒角 / Ctrl+R 环切。
+    // ⚠ Ctrl+R 必须排在裸 R **前面**：否则按住 Ctrl 也会先命中下面的
+    //   `R → 旋转模态`，环切永远按不出来。
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+        loopCut();
+        return true;
+    }
+    if (!io.KeyCtrl && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_I, false)) {
+        insetFaces();
+        return true;
+    }
+    if (!io.KeyCtrl && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_B, false)) {
+        bevelVertices();
+        return true;
+    }
     if (ImGui::IsKeyPressed(ImGuiKey_G, false)) {
         beginModal(Modal::Grab);
         return true;
@@ -1211,16 +2033,36 @@ void ModelingEditor::drawOverlay(const glm::vec2& vpPos, const glm::vec2& vpSize
     const ImU32 kSelFace = IM_COL32(255, 140, 30, 64);
 
     if (m_selMode == SelectMode::Face) {
-        for (std::uint32_t f : selFaces()) {
-            const auto& tv = m_topo.triVert[f];
-            glm::vec2 s0, s1, s2;
-            if (!toScreen(m_topo.weldPos[m_topo.weldOf[tv[0]]], s0)) continue;
-            if (!toScreen(m_topo.weldPos[m_topo.weldOf[tv[1]]], s1)) continue;
-            if (!toScreen(m_topo.weldPos[m_topo.weldOf[tv[2]]], s2)) continue;
-            dl->AddTriangleFilled(ImVec2(s0.x, s0.y), ImVec2(s1.x, s1.y),
-                                  ImVec2(s2.x, s2.y), kSelFace);
-            dl->AddTriangle(ImVec2(s0.x, s0.y), ImVec2(s1.x, s1.y),
-                            ImVec2(s2.x, s2.y), kSelEdge, 1.5f);
+        // 按**多边形**画：立方体一个正方形面就是一整块，没有对角线。
+        //
+        // 这里原来按三角形画（`selFaces()` + `AddTriangle`），于是每个平面
+        // 都被一条对角线劈开 —— 用户报的正是这个。
+        // 用 AddConcavePolyFilled 而不是 Convex 版：倒角/内插之后会出现
+        // 凹多边形（比如 L 形的面），凸版本会画出错误的填充。
+        std::vector<ImVec2> pts;
+        for (std::uint32_t pi : selPolys()) {
+            const auto& p = m_topo.poly[pi];
+            if (p.v.size() < 3) continue;
+            pts.clear();
+            pts.reserve(p.v.size());
+            bool ok = true;
+            for (std::uint32_t w : p.v) {
+                if (w >= m_topo.weldPos.size()) {
+                    ok = false;
+                    break;
+                }
+                glm::vec2 s;
+                if (!toScreen(m_topo.weldPos[w], s)) {
+                    ok = false;
+                    break;
+                }
+                pts.push_back(ImVec2(s.x, s.y));
+            }
+            if (!ok || pts.size() < 3) continue;
+            dl->AddConcavePolyFilled(pts.data(), static_cast<int>(pts.size()),
+                                     kSelFace);
+            dl->AddPolyline(pts.data(), static_cast<int>(pts.size()), kSelEdge,
+                            1.5f, ImDrawFlags_Closed);
         }
         return;
     }
@@ -1237,6 +2079,10 @@ void ModelingEditor::drawOverlay(const glm::vec2& vpPos, const glm::vec2& vpSize
             if (!m_sel.count(a) || !m_sel.count(b)) continue;
             const std::uint32_t lo = std::min(a, b), hi = std::max(a, b);
             const std::uint64_t key = (static_cast<std::uint64_t>(lo) << 32) | hi;
+            // 三角形对角线不是"真的边"：立方体一个正方形面上有两条三角形
+            // 拼出来的内部边，它在 Blender 里根本不存在，画出来/允许选中只会
+            // 让用户以为模型坏了。
+            if (m_topo.innerEdge.count(key)) continue;
             if (!drawnEdges.insert(key).second) continue;
             glm::vec2 s0, s1;
             if (!toScreen(m_topo.weldPos[a], s0)) continue;
@@ -1377,7 +2223,7 @@ bool ModelingEditor::viewportInput(const glm::vec2& vpPos,
 // ------------------------------------------------------------ 面板
 
 void ModelingEditor::drawPanel() {
-    if (!beginToolkitWindow("modeling", "Modeling", 460.0f, 660.0f)) return;
+    if (!beginToolkitWindow(m_ctx, "modeling", "Modeling", 460.0f, 660.0f)) return;
     ImGui::TextDisabled("%s", TR(editModeHint(EditMode::Modeling)));
     ImGui::Separator();
 
@@ -1453,6 +2299,33 @@ void ModelingEditor::drawPanel() {
                         TR("Viewport keys: G drag · S scale · R rotate · "
                            "M merge to center · X delete. Drag with the left "
                            "button to confirm, right button or Esc to cancel."));
+
+    // ---- 拓扑刷子（Blender 的 I / Ctrl+B / Ctrl+R）----
+    //
+    // 这三个是"改面表"的操作，与上面的挤出/细分同一个层级：都只作用在
+    // 选区上，都是一次上传。
+    ImGui::SeparatorText(TR("Topology brushes"));
+    rowSlider(TR("Inset amount"), "##md_inset", &m_inset, 0.005f, 1.0f,
+              "%.3f m");
+    rowSlider(TR("Bevel width"), "##md_bevel", &m_bevel, 0.005f, 1.0f,
+              "%.3f m");
+    rowSliderInt(TR("Loop cuts"), "##md_loops", &m_loopCount, 1, 8);
+
+    if (ImGui::Button(TR("Inset faces"), ImVec2(150.0f, 26.0f))) insetFaces();
+    logRect("MD-INSET", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Bevel"), ImVec2(120.0f, 26.0f))) bevelVertices();
+    logRect("MD-BEVEL", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Loop cut"), ImVec2(120.0f, 26.0f))) loopCut();
+    logRect("MD-LOOPCUT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    ImGui::TextDisabled("%s",
+                        TR("Inset: shrink each selected face and bridge the rim "
+                           "with a ring of quads (I).\nBevel: cut every corner "
+                           "of the selected vertices (B).\nLoop cut: walk the "
+                           "quad strip through the selected face and insert "
+                           "an edge ring (Ctrl+R)."));
 
     // ---- 整网格操作（不需要选区）----
     ImGui::SeparatorText(TR("Whole mesh"));
@@ -2070,7 +2943,7 @@ void FractureEditor::breakSelected() {
 }
 
 void FractureEditor::drawPanel() {
-    if (!beginToolkitWindow("fracture", "Fracture", 440.0f, 620.0f)) return;
+    if (!beginToolkitWindow(m_ctx, "fracture", "Fracture", 440.0f, 620.0f)) return;
     ImGui::TextDisabled("%s", TR(editModeHint(EditMode::Fracture)));
     ImGui::Separator();
 
@@ -2092,7 +2965,14 @@ void FractureEditor::drawPanel() {
     if (voronoi)
         ImGui::PushStyleColor(ImGuiCol_Button,
                               ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-    if (ImGui::Button(TR("Voronoi"), ImVec2(150.0f, 26.0f))) m_method = 0;
+    // 切换时打一条状态日志。验收脚本原来靠"FR-BREAK 的屏幕 y 变了"来判
+    // "Irregularity 那行消失了"，但左栏参数区只有 ~400px 高、面板滚到底时
+    // 删掉一行会被滚动条 clamp 回去 —— FR-BREAK 的 y 几乎不动，判据就假失败。
+    // 有这条日志就能直接断言"方法真的切了"，跟滚动位置无关。
+    if (ImGui::Button(TR("Voronoi"), ImVec2(150.0f, 26.0f)) && m_method != 0) {
+        m_method = 0;
+        VK_LOG_INFO("FR-METHOD set=voronoi");
+    }
     if (voronoi) ImGui::PopStyleColor();
     logRect("FR-METHOD-VORONOI", ImGui::GetItemRectMin(),
             ImGui::GetItemRectMax());
@@ -2100,7 +2980,10 @@ void FractureEditor::drawPanel() {
     if (!voronoi)
         ImGui::PushStyleColor(ImGuiCol_Button,
                               ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-    if (ImGui::Button(TR("Grid"), ImVec2(120.0f, 26.0f))) m_method = 1;
+    if (ImGui::Button(TR("Grid"), ImVec2(120.0f, 26.0f)) && m_method != 1) {
+        m_method = 1;
+        VK_LOG_INFO("FR-METHOD set=grid");
+    }
     if (!voronoi) ImGui::PopStyleColor();
     logRect("FR-METHOD-GRID", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     ImGui::TextDisabled("%s",
@@ -2258,7 +3141,7 @@ bool BrushEditor::viewportInput(const glm::vec2& vpPos,
 }
 
 void BrushEditor::drawPanel() {
-    if (!beginToolkitWindow("brushedit", "Brush Editing", 420.0f, 560.0f))
+    if (!beginToolkitWindow(m_ctx, "brushedit", "Brush Editing", 420.0f, 560.0f))
         return;
     ImGui::TextDisabled("%s", TR(editModeHint(EditMode::BrushEdit)));
     ImGui::Separator();
@@ -2514,7 +3397,7 @@ void AnimationEditor::sync() {
 }
 
 void AnimationEditor::drawPanel() {
-    if (!beginToolkitWindow("animation", "Animation", 480.0f, 620.0f)) return;
+    if (!beginToolkitWindow(m_ctx, "animation", "Animation", 480.0f, 620.0f)) return;
     ImGui::TextDisabled("%s", TR(editModeHint(EditMode::Animation)));
     ImGui::Separator();
 
@@ -2815,7 +3698,7 @@ void PCGEditor::generate() {
 }
 
 void PCGEditor::drawPanel() {
-    if (!beginToolkitWindow("pcg", "PCG", 440.0f, 660.0f)) return;
+    if (!beginToolkitWindow(m_ctx, "pcg", "PCG", 440.0f, 660.0f)) return;
     ImGui::TextDisabled("%s", TR(editModeHint(EditMode::PCG)));
     ImGui::Separator();
 

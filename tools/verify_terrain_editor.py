@@ -11,6 +11,10 @@ W4-4 的要求只有两条：「ContentBrowser 双击 `.vterrain` → 视口里�
   B 不叠第二份   同一份资产再双击 = 选中已有的那个（不是又叠一座山）
   C Inspector    Terrain 段出现，且有 Height Scale / 4 个层槽 / Remove 按钮
   D 关掉可见     点 Inspector 的 Visible → 视口显著变化（> 20%）
+                 ⚠ 点之前必须先把勾选框**滚进可视区**（`scroll_into_view`）：
+                   Inspector 是滚动窗口，Terrain 段在 Transform / Visibility
+                   之下，窗口一矮就排到可视区外，而未裁剪的锚点照样有坐标
+                   —— 点空会得到 sig=0.00%，看着像开关坏了。
   E 存档往返     Ctrl+S → 场景 JSON 里有 terrain 块；重开 → 地形自己回来
 
 ⚠ 全部锚点都走 `MYVK_LOG_RECTS`（`INS-TERRAIN-*` / `CB-CELL *`）——
@@ -144,6 +148,48 @@ def settle(hwnd, tap, w=1600, h=900):
     force_foreground(hwnd)
     time.sleep(0.8)
     return bool(wait_rect(tap, "VP-RECT", 10.0))
+
+
+MOUSEEVENTF_WHEEL = 0x0800
+
+
+def scroll_into_view(hwnd, tap, tag, tries=14):
+    """把 Inspector 里的目标锚点滚进**可视区**，返回可点的中心坐标。
+
+    ⚠ 为什么必须滚（2026-10-21 踩到）：`logRect` 报的是
+      `ImGui::GetItemRectMin/Max`，那是**未裁剪**的坐标 —— 控件被滚出滚区
+      之后照样有坐标。Inspector 是滚动窗口，Terrain 段排在 Transform /
+      Visibility 的下面，窗口一矮（这台机器桌面只有 1088x600，`settle` 想
+      拉到 1600x900 拉不上去）整段就排到了可视区之外。照锚点中心点下去
+      落在面板外面，表现为"点了没反应，前后截图像素级一致（sig=0.00%）"
+      —— 看起来像 Visible 开关坏了，其实是点空了。
+      和 `LS-TOOL-7` 被地形面板底边裁掉是同一类坑。
+    """
+    pnl = wait_rect(tap, "INS-PANEL", 4.0)
+    if not pnl:
+        return None
+    r = wait_rect(tap, tag, 4.0)
+    if not r:
+        return None
+    px = (pnl[0] + pnl[2]) * 0.5
+    py = (pnl[1] + pnl[3]) * 0.5
+    for _ in range(tries):
+        if r[1] >= pnl[1] + 4.0 and r[3] <= pnl[3] - 4.0:
+            return ((r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5)
+        # 目标在下方 → 滚轮向下（负 delta），内容上移
+        down = r[3] > pnl[3] - 4.0
+        force_foreground(hwnd)
+        user32.SetCursorPos(*client_to_screen(hwnd, px, py))
+        time.sleep(0.15)
+        for _n in range(2):
+            user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0,
+                               -120 if down else 120, 0)
+            time.sleep(0.05)
+        time.sleep(0.35)
+        r = wait_rect(tap, tag, 1.0)
+        if not r:
+            return None
+    return None
 
 
 def double_click(hwnd, cx, cy):
@@ -313,14 +359,19 @@ def stage_edit(exe):
         if not (vp and hs):
             check("D0 前置（视口 / Inspector 矩形）", False, "missing")
         else:
-            vis = tap.last_rect("INS-TERRAIN-VISIBLE")
+            vis = scroll_into_view(hwnd, tap, "INS-TERRAIN-VISIBLE")
             if not vis:
-                check("D0 Visible 勾选框锚点", False, "no INS-TERRAIN-VISIBLE")
+                check("D0 Visible 勾选框滚进可视区", False,
+                      "INS-TERRAIN-VISIBLE 滚不到（缺 INS-PANEL 锚点？）")
             else:
+                # ⚠ 重新取一次视口矩形：A 组那会儿 Content Browser 还开着，
+                #   视口只有上半截；到 D 组它已经收起，视口变形了。拿旧 box
+                #   去比 sig 会把"地形消失的下半屏"整块漏掉。
+                vp = tap.last_rect("VP-RECT") or vp
                 move_to(hwnd, 30, 840)
                 time.sleep(0.5)
                 shot_on = capture_client(hwnd)[0]
-                click(hwnd, (vis[0] + vis[2]) * 0.5, (vis[1] + vis[3]) * 0.5)
+                click(hwnd, vis[0], vis[1])
                 time.sleep(1.2)
                 shot_off = capture_client(hwnd)[0]
                 box = (int(vp[0]) + 4, int(vp[1]) + 4, int(vp[2]) - 4,
@@ -332,7 +383,7 @@ def stage_edit(exe):
                     shot_off.save(os.path.join(
                         OUT_DIR, "terrain_editor_02_hidden.png"))
                 # 复原（后面要存档，别把"看不见"存进去）
-                click(hwnd, (vis[0] + vis[2]) * 0.5, (vis[1] + vis[3]) * 0.5)
+                click(hwnd, vis[0], vis[1])
                 time.sleep(0.8)
 
         # ================================================ E

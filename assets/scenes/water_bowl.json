@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "generator": "venn sandbox (G05 sample level)",
+  "camera": {
+    "target": [
+      0.0,
+      0.0,
+      3.0
+    ],
+    "yaw": 0.418879,
+    "pitch": 0.593412,
+    "distance": 62.0
+  },
+  "physics": {
+    "enabled": true,
+    "groundPlane": true,
+    "fixedTimeStep": 0.0166666675,
+    "maxSubSteps": 4
+  },
+  "entities": [
+    {
+      "name": "Terrain",
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "terrain": {
+        "source": "terrain/water_bowl/terrain.vterrain",
+        "visible": true,
+        "heightScale": 1.0,
+        "layers": [
+          "",
+          "",
+          "",
+          ""
+        ]
+      }
+    },
+    {
+      "name": "Pond",
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": false,
+      "water": {
+        "visible": true,
+        "shape": 0,
+        "center": [
+          0.0,
+          0.0
+        ],
+        "halfExtent": [
+          25.0,
+          25.0
+        ],
+        "rotation": 0.0,
+        "level": 3.55,
+        "bedLevel": 1.45,
+        "autoFit": true,
+        "kind": 1,
+        "shallowColor": [
+          0.18,
+          0.44,
+          0.44
+        ],
+        "deepColor": [
+          0.02,
+          0.12,
+          0.2
+        ],
+        "opacity": 0.26,
+        "refraction": 0.4,
+        "ior": 1.333,
+        "clarity": 1.6,
+        "flowSpeed": 0.05,
+        "flowDir": [
+          1.0,
+          0.0
+        ],
+        "waveHeight": 0.1,
+        "waveLength": 6.0,
+        "ripple": 0.55,
+        "foam": 0.3,
+        "roughness": 0.07
+      }
+    }
+  ]
+}

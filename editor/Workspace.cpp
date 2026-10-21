@@ -50,23 +50,26 @@ const char* const kDebugClose[] = {"scripts", nullptr};
 } // namespace
 
 const WorkspacePreset kWorkspaces[] = {
-    // id          title         hint                                     ratio{根,左栏,右区}      布局                     viewMode  open          close
+    // ratio 三段的**语义**在 2026-10-21 变了（分栏树重排，节点数仍是 3）：
+    //   [0] 左栏(模式栏) | 其余   [1] 视口 | 右栏   [2] Hierarchy | Inspector
+    //   写 0 = 交给 SplitLayout 按窗口尺寸自适应（推荐），非 0 = 硬比例。
+    // id          title         hint                                     ratio{模式栏,视口,右栏上下}  布局                     viewMode  open          close
     {"level", "Level", "Level editing: hierarchy + content + viewport + inspector",
-     {0.0f, 0.50f, 0.0f}, ViewportLayout::Single, 0, kLevelOpen, kLevelClose},
+     {0.0f, 0.0f, 0.42f}, ViewportLayout::Single, 0, kLevelOpen, kLevelClose},
     {"rendering", "Rendering", "Render tuning: large viewport + Engine panel + stats",
-     {0.0f, 0.50f, 0.0f}, ViewportLayout::Single, 0, kRenderOpen, kRenderClose},
+     {0.0f, 0.0f, 0.42f}, ViewportLayout::Single, 0, kRenderOpen, kRenderClose},
     {"character", "Character", "Character: hierarchy + content browser + inspector",
-     {0.0f, 0.50f, 0.0f}, ViewportLayout::TwoVertical, 0, kCharOpen,
+     {0.0f, 0.0f, 0.42f}, ViewportLayout::TwoVertical, 0, kCharOpen,
      kCharClose},
     {"animation", "Animation", "Animation: scripts + hierarchy + inspector",
-     {0.0f, 0.55f, 0.0f}, ViewportLayout::TwoHorizontal, 0, kAnimOpen,
+     {0.0f, 0.0f, 0.42f}, ViewportLayout::TwoHorizontal, 0, kAnimOpen,
      kAnimClose},
     {"cinematic", "Cinematic", "Cinematic: the viewport dominates, everything else collapsed",
-     {0.10f, 0.50f, 1.0f}, ViewportLayout::Single, 0, kCineOpen, kCineClose},
+     {0.0f, 0.0f, 0.42f}, ViewportLayout::Single, 0, kCineOpen, kCineClose},
     // Debug 的视图模式 = LightComplexity(7)：这是"调试视角"该有的样子，
     // 也顺带验证"工作区能记住视图模式"这条语义确实生效。
     {"debug", "Debug", "Debug: everything open + per-cluster light-count heatmap",
-     {0.0f, 0.45f, 0.0f}, ViewportLayout::Quad, 7, kDebugOpen, kDebugClose},
+     {0.0f, 0.0f, 0.42f}, ViewportLayout::Quad, 7, kDebugOpen, kDebugClose},
 };
 
 const int kWorkspaceCount =

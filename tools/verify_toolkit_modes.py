@@ -38,6 +38,7 @@ from verify_add_menu import LogTap, click, kill_stale_editors  # noqa: E402
 from verify_asset_drag import client_to_screen  # noqa: E402
 from verify_nav_gizmo import MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP  # noqa: E402
 
+MOUSEEVENTF_WHEEL = 0x0800
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(ROOT, "..", "_venn_verify")
 EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
@@ -162,15 +163,12 @@ def shoot(hwnd, name):
 
 
 def switch_mode(tap, hwnd, mode_id):
-    """走真实用户路径：点顶栏那颗下拉 → 点第 N 行。"""
-    tb = rect_of(tap, "TB-EDITMODE", 5.0)
-    if not tb:
-        return False
-    click(hwnd, *center(tb))
-    time.sleep(0.55)
-    if not wait_line(tap, "TB-EDITMODE-WIN", 3.0):
-        return False
-    item = rect_of(tap, "TB-EDITMODE-ITEM " + mode_id, 3.0)
+    """走真实用户路径：点**左栏模式栏**那一行。
+
+    ⚠ 2026-10-21：顶栏那颗下拉删掉了（用户说它和左栏列表重复），所以这里
+      少一步"先点开弹层"—— 9 行一直可见，直接点行即可。
+    """
+    item = rect_of(tap, "MODE-RAIL-ITEM " + mode_id, 5.0)
     if not item:
         return False
     click(hwnd, *center(item))
@@ -193,12 +191,58 @@ def events(tap, pattern):
                    if rx.search(l) and not rect_like.search(l))
 
 
-def act(tap, hwnd, tag, label, pattern, timeout=8.0):
+def wheel(hwnd, cx, cy, notches=-2):
+    """在客户区 (cx,cy) 处滚轮。notches 为负 = 向下滚（内容上移）。"""
+    focus_window(hwnd)
+    user32.SetCursorPos(*client_to_screen(hwnd, cx, cy))
+    time.sleep(0.2)
+    for _ in range(abs(notches)):
+        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0,
+                           120 if notches > 0 else -120, 0)
+        time.sleep(0.1)
+    time.sleep(0.35)
+
+
+def inside(r, body):
+    """锚点中心是否落在参数区窗口内 —— 也就是"用户这一下点得到"。"""
+    cx, cy = center(r)
+    return (body[0] + 2 <= cx <= body[2] - 2) and \
+           (body[1] + 2 <= cy <= body[3] - 2)
+
+
+def reveal(tap, hwnd, tag, body_tag, tries=8):
+    """把左栏参数区滚到 `tag` 可见，再返回它的矩形。
+
+    为什么要滚：2026-10-21 把模式面板从浮动窗口挪进左栏下半之后，参数区
+    只有 ~400px 高，而 Modeling / Fracture 这些面板的默认尺寸是 460×660、
+    620 —— 内容天然比窗口长（面板自带滚动条，真实用户就是滚轮往下翻）。
+    而 logRect 报的是**未裁剪**的 item 矩形，按钮滚出窗口后中心点在窗口
+    外面，照着它点等于点在视口上 —— 表现为"点了没反应"，看起来像功能坏了。
+    这里补的就是用户那一下滚轮。
+    """
+    for _ in range(tries):
+        r = rect_of(tap, tag, 4.0)
+        body = rect_of(tap, body_tag, 4.0)
+        if not r or not body:
+            return r
+        if inside(r, body):
+            return r
+        down = center(r)[1] > body[3]
+        cx = (body[0] + body[2]) * 0.5
+        cy = (body[1] + body[3]) * 0.5
+        wheel(hwnd, cx, cy, -2 if down else 2)
+        new = rect_of(tap, tag, 2.0)
+        if new and abs(center(new)[1] - center(r)[1]) < 1.0:
+            break          # 滚不动了：已经到头，再滚也没用
+    return rect_of(tap, tag, 3.0)
+
+
+def act(tap, hwnd, tag, label, pattern, timeout=8.0, body_tag=None):
     """点一个 logRect 锚点上的按钮，断言它打出了匹配 `pattern` 的事件行。
 
     返回 (点到了, 日志出现)。
     """
-    r = rect_of(tap, tag, 4.0)
+    r = reveal(tap, hwnd, tag, body_tag or "TK-" + tag)
     if not r:
         check(False, "%s：找不到按钮锚点 %s" % (label, tag))
         return False, False
@@ -262,7 +306,7 @@ def main():
                         6.0), "A1 面板打开（open=1）")
         check(rect_of(tap, "TK-meshpaint", 5.0) is not None,
               "A2 面板矩形已上报（TK-meshpaint）")
-        hit, logged = act(tap, hwnd, "MP-RESET", "A3", r"MP-CLEAR verts=")
+        hit, logged = act(tap, hwnd, "MP-RESET", "A3", r"MP-CLEAR verts=", body_tag="TK-meshpaint")
         check(logged, "A3 顶点色重置并重新上传（MP-CLEAR）")
         shoot(hwnd, "toolkit_meshpaint.png")
 
@@ -278,7 +322,8 @@ def main():
         before = None
         with tap.lock:
             hits = [l for l in tap.lines if "MODEL-OP op=subdivide" in l]
-        hit, logged = act(tap, hwnd, "MD-SUBDIV", "B4", r"MODEL-OP op=subdivide")
+        hit, logged = act(tap, hwnd, "MD-SUBDIV", "B4", r"MODEL-OP op=subdivide",
+                body_tag="TK-modeling")
         check(logged, "B4 细分生效（MODEL-OP op=subdivide）")
         if logged:
             with tap.lock:
@@ -298,7 +343,7 @@ def main():
                         6.0), "C1 面板打开（open=1）")
         check(rect_of(tap, "TK-animation", 5.0) is not None,
               "C2 面板矩形已上报（TK-animation）")
-        hit, logged = act(tap, hwnd, "AN-ADDKEY", "C3", r"ANIM-KEY t=")
+        hit, logged = act(tap, hwnd, "AN-ADDKEY", "C3", r"ANIM-KEY t=", body_tag="TK-animation")
         check(logged, "C3 关键帧记录成功（ANIM-KEY）")
         shoot(hwnd, "toolkit_animation.png")
 
@@ -309,7 +354,8 @@ def main():
               "D1 面板打开（open=1）")
         check(rect_of(tap, "TK-pcg", 5.0) is not None,
               "D2 面板矩形已上报（TK-pcg）")
-        hit, logged = act(tap, hwnd, "PCG-GEN", "D3", r"PCG-GEN kind=", timeout=40.0)
+        hit, logged = act(tap, hwnd, "PCG-GEN", "D3", r"PCG-GEN kind=", timeout=40.0,
+                body_tag="TK-pcg")
         check(logged, "D3 撒点成功（PCG-GEN）")
         if logged:
             with tap.lock:
@@ -334,7 +380,7 @@ def main():
                         6.0), "E1 面板打开（open=1）")
         check(rect_of(tap, "TK-brushedit", 5.0) is not None,
               "E2 面板矩形已上报（TK-brushedit）")
-        sphere = rect_of(tap, "BR-SHAPE-2", 4.0)
+        sphere = reveal(tap, hwnd, "BR-SHAPE-2", "TK-brushedit")
         if sphere:
             click(hwnd, *center(sphere))
             time.sleep(0.4)
@@ -364,7 +410,8 @@ def main():
                         6.0), "F1 面板打开（open=1）")
         check(rect_of(tap, "TK-fracture", 5.0) is not None,
               "F2 面板矩形已上报（TK-fracture）")
-        hit, logged = act(tap, hwnd, "FR-BREAK", "F3", r"FRACTURE chunks=", timeout=20.0)
+        hit, logged = act(tap, hwnd, "FR-BREAK", "F3", r"FRACTURE chunks=", timeout=20.0,
+                body_tag="TK-fracture")
         check(logged, "F3 切碎成功（FRACTURE chunks=）")
         if logged:
             with tap.lock:

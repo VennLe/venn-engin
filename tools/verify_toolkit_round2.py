@@ -52,6 +52,8 @@ from verify_add_menu import LogTap, click, kill_stale_editors  # noqa: E402
 from verify_asset_drag import client_to_screen  # noqa: E402
 from verify_nav_gizmo import MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP  # noqa: E402
 
+MOUSEEVENTF_WHEEL = 0x0800
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(ROOT, "..", "_venn_verify")
 EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
@@ -115,6 +117,46 @@ def rect_of(tap, tag, timeout=6.0):
 
 def center(r):
     return (r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5
+
+
+def wheel(hwnd, cx, cy, notches=-2):
+    """在客户区 (cx,cy) 处滚轮。notches 为负 = 向下滚（内容上移）。"""
+    focus_window(hwnd)
+    user32.SetCursorPos(*client_to_screen(hwnd, cx, cy))
+    time.sleep(0.2)
+    for _ in range(abs(notches)):
+        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0,
+                           120 if notches > 0 else -120, 0)
+        time.sleep(0.1)
+    time.sleep(0.35)
+
+
+def reveal(tap, hwnd, tag, body_tag, tries=8):
+    """把左栏参数区滚到 `tag` 可见，再返回它的矩形。
+
+    2026-10-21 模式面板从浮动窗口挪进了左栏下半（参数区只有 ~400px 高），
+    而 Fracture / Modeling 面板的内容天然比这长（自带滚动条，真实用户就是
+    滚轮往下翻）。`logRect` 报的是**未裁剪**的 item 矩形，按钮滚出窗口后
+    中心点落在窗口外，照着它点等于点在视口上 —— 表现为"点了没反应"。
+    这里补的就是用户那一下滚轮。与 verify_toolkit_modes.py 里的同名函数一致。
+    """
+    for _ in range(tries):
+        r = rect_of(tap, tag, 4.0)
+        body = rect_of(tap, body_tag, 4.0)
+        if not r or not body:
+            return r
+        cx, cy = center(r)
+        if (body[0] + 2 <= cx <= body[2] - 2) and \
+           (body[1] + 2 <= cy <= body[3] - 2):
+            return r
+        down = cy > body[3]
+        bmx = (body[0] + body[2]) * 0.5
+        bmy = (body[1] + body[3]) * 0.5
+        wheel(hwnd, bmx, bmy, -2 if down else 2)
+        new = rect_of(tap, tag, 2.0)
+        if new and abs(center(new)[1] - cy) < 1.0:
+            break          # 滚不动了：已经到头
+    return rect_of(tap, tag, 3.0)
 
 
 def wait_line(tap, needle, timeout=8.0):
@@ -289,14 +331,9 @@ def click_until(tap, hwnd, tag, pattern, tries=4, settle=0.55):
 
 
 def switch_mode(tap, hwnd, mode_id):
-    tb = rect_of(tap, "TB-EDITMODE", 5.0)
-    if not tb:
-        return False
-    click(hwnd, *center(tb))
-    time.sleep(0.55)
-    if not wait_line(tap, "TB-EDITMODE-WIN", 3.0):
-        return False
-    item = rect_of(tap, "TB-EDITMODE-ITEM " + mode_id, 3.0)
+    # 2026-10-21：改成点左栏模式栏（顶栏下拉已删，见 verify_edit_modes.py
+    # 的 A0 断言）。少一步"点开弹层"，9 行一直可见。
+    item = rect_of(tap, "MODE-RAIL-ITEM " + mode_id, 5.0)
     if not item:
         return False
     click(hwnd, *center(item))
@@ -337,7 +374,7 @@ def part_a():
         #   进入拖拽、**不跳值**，点一下就松开等于什么都没做（第一版就是这么
         #   失败的，日志里 total 一直是 1）。用 Play 推进一秒再暂停，走的
         #   是用户真实路径，也不依赖控件实现细节。
-        pr = rect_of(tap, "AN-PLAY", 5.0)
+        pr = reveal(tap, hwnd, "AN-PLAY", "TK-animation")
         if not pr:
             check(False, "A2 找不到播放按钮")
             return
@@ -415,7 +452,7 @@ def part_b():
         check(rect_of(tap, "TK-modeling", 6.0) is not None, "B0c 面板已打开")
 
         # ---- 面模式 + 视口点选 ----
-        r = rect_of(tap, "MD-SELMODE-2", 5.0)
+        r = reveal(tap, hwnd, "MD-SELMODE-2", "TK-modeling")
         if not r:
             check(False, "B2 找不到 Face 选择模式按钮")
             return
@@ -477,7 +514,7 @@ def part_b():
         shoot(hwnd, "round2_model_select.png")
 
         # ---- 挤出 ----
-        r = rect_of(tap, "MD-EXTRUDE", 5.0)
+        r = reveal(tap, hwnd, "MD-EXTRUDE", "TK-modeling")
         if not r:
             check(False, "B3 找不到 Extrude 按钮")
             return
@@ -500,7 +537,7 @@ def part_b():
               % (m.group(0) if m else "抓不到"))
 
         # ---- 删除选中面 ----
-        r = rect_of(tap, "MD-DELETE", 5.0)
+        r = reveal(tap, hwnd, "MD-DELETE", "TK-modeling")
         n0 = events(tap, r"MODEL-DELETE faces=")
         click(hwnd, *center(r))
         time.sleep(0.9)
@@ -545,7 +582,7 @@ def part_c():
         time.sleep(2.5)
         check(rect_of(tap, "TK-fracture", 8.0) is not None, "C0b 面板已打开")
 
-        r = rect_of(tap, "FR-BREAK", 5.0)
+        r = reveal(tap, hwnd, "FR-BREAK", "TK-fracture")
         if not r:
             check(False, "C1 找不到 Break 按钮")
             return
@@ -588,34 +625,31 @@ def part_c():
         # ⚠ 这里原来点两下就断言，结果整组只有 1 条 FRACTURE —— 两次点击都
         #   被吃掉了。原因是第一次 break 之后 `notify(...)` 弹了个 toast 浮层，
         #   它盖在面板上，ImGui 的 IsItemHovered 对底下的按钮全变 false。
-        #   所以先等一下让 toast 自己消失，并且**用布局变化确认切换真的生效**
-        #   （切到 Grid 后 Irregularity 滑条消失，FR-BREAK 会整体上移），
-        #   没生效就再点一次 —— 不靠"点了就应该行"这种假设。
-        g = rect_of(tap, "FR-METHOD-GRID", 5.0)
+        #   所以先等一下让 toast 自己消失，并且**确认切换真的生效**，没生效
+        #   就再点一次 —— 不靠"点了就应该行"这种假设。
+        g = reveal(tap, hwnd, "FR-METHOD-GRID", "TK-fracture")
         if g:
-            before_break = rect_of(tap, "FR-BREAK", 3.0)
+            n_sw = events(tap, r"FR-METHOD set=grid")
             switched = False
             for attempt in range(4):
                 time.sleep(1.2 if attempt == 0 else 0.8)
                 click(hwnd, *center(g))
-                deadline = time.time() + 2.0
-                while time.time() < deadline:
-                    now_break = rect_of(tap, "FR-BREAK", 0.4)
-                    if (before_break and now_break and
-                            abs(now_break[1] - before_break[1]) > 4.0):
-                        switched = True
-                        break
-                    time.sleep(0.2)
-                if switched:
+                if events(tap, r"FR-METHOD set=grid") > n_sw:
+                    switched = True
                     break
-            check(switched, "C3a 切到 Grid 后布局真的变了（Irregularity 消失）")
+                # ⚠ 原来这里判的是"FR-BREAK 的屏幕 y 变了"。面板挪进左栏
+                #   （参数区 ~400px、自带滚动条）之后这个判据不成立：滚到底
+                #   时删掉一行会被滚动条 clamp 回来，y 几乎不动 —— 切换其实
+                #   成功了，断言却假失败。改成看面板自己那条状态日志。
+                g = reveal(tap, hwnd, "FR-METHOD-GRID", "TK-fracture") or g
+            check(switched, "C3a 点 Grid 真的切了方法（FR-METHOD set=grid）")
             if not switched:
                 dump_events(tap, ("FRACTURE", "FR-"), 20)
 
             n1 = events(tap, r"FRACTURE chunks=")
             # ⚠ 必须重新取矩形：切到 Grid 之后 "Irregularity" 滑条消失了，
             #   下面所有控件整体上移 —— 用切换前的坐标会点到别的控件上。
-            r2 = rect_of(tap, "FR-BREAK", 5.0)
+            r2 = reveal(tap, hwnd, "FR-BREAK", "TK-fracture")
             click(hwnd, *center(r2 if r2 else r))
             time.sleep(2.0)
             line = last_event(tap, r"FRACTURE chunks=")

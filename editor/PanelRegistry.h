@@ -43,6 +43,12 @@ enum LayoutSlot : int {
     kSlotContent = 1,
     kSlotViewport = 2,
     kSlotInspector = 3,
+    // 2026-10-21：窗口最左侧的"模式栏"（模式列表 + 当前模式参数）。
+    // 八个编辑模式面板（landscape / foliage / meshpaint / modeling /
+    // fracture / brushedit / animation / pcg）挂在这个槽位上 —— 它们不再
+    // 是浮动窗口，而是左栏下半那一块的内容，由 ToolkitEditors.cpp 的
+    // beginToolkitWindow 钉进 modeRailBodyRect()。
+    kSlotModes = 4,
 };
 
 // 面板分组 —— 决定 View/Window 菜单里的子菜单层级

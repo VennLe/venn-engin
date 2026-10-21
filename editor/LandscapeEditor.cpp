@@ -2,6 +2,7 @@
 
 #include "DebugRects.h"
 #include "Localization.h"
+#include "ModeRail.h"
 #include "PickingSystem.h"
 
 #include "assets/AssetPath.h"
@@ -13,6 +14,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -38,20 +40,48 @@ constexpr float kRaiseRate = 0.35f;
 // 实际因为在 ±0.5 之间摇摆，肉眼看到的是"表面逐渐长出颗粒"。
 constexpr float kNoiseRate = 0.80f;
 
-// 落盘节流：拖动时每 80 ms 写一次文件。
-// 为什么要节流而不是每帧写：写盘会触发渲染层重传贴图（一次
-// vkQueueWaitIdle），60 Hz 下写 257² 是纯浪费；80 ms 的延迟肉眼看不出来。
+// 上传节流：拖动时每 80 ms 把内存推给渲染层一次。
+// 为什么要节流而不是每帧推：每次是一次 264 KB 的 R32 图重传 + 一次
+// vkQueueWaitIdle，60 Hz 下推 257² 是纯浪费；80 ms 的延迟肉眼看不出来。
+//
+// 2026-10-21：这个节流**只针对上传**了。以前它同时决定"多久写一次盘"，
+// 而磁盘往返（写 264 KB → 渲染层读回 264 KB）是笔刷延迟的主因，现已改
+// 成拖拽期间完全不落盘，抬笔才 saveAssets。
 constexpr float kSaveInterval = 0.08f;
 
 // 撤销栈上限。一笔扫过整片地形的脏矩形按 1 MB 估，24 笔 ~24 MB 封顶；
 // 实际多数笔划只有几十 KB。
 constexpr std::size_t kUndoDepth = 24;
 
+// 归一化高度的上限。**不是 1.0**。
+//
+// 1.0 只代表"等于 maxHeight"，不是天花板。以前抬升笔刷写的是
+// `h = clamp(h, 0, 1)`，于是笔心先撞到 1.0、外圈继续涨 —— 最终一定是一块
+// 平顶（用户看到的就是"想刷山峰，结果刷出火山/台地"）。
+//
+// 留 8 倍余量之后：山峰可以一直长高、剖面保持锥形；同时 kMaxNorm 还是
+// 一个硬兜底，防止误操作把高度刷到天上（maxHeight=60 → 480 m 封顶）。
+constexpr float kMaxNorm = 8.0f;
+
+// 抬升方向的"剩余空间"系数：1.0 以下返回 1（手感与以前完全一致），
+// 超过 1.0 之后按剩余比例线性衰减到 0 —— 渐近线式逼近上限，
+// **永远不会出现"整片都被削成同一高度"的平台**。
+float raiseHeadroom(float h) {
+    if (h < 1.0f) return 1.0f;
+    return std::max(0.0f, (kMaxNorm - h) / (kMaxNorm - 1.0f));
+}
+
 // 新建地形的合法边长（(cols-1) 必须能被 kChunkCells=32 整除 —— 这是
 // 分块网格的硬约束，见 terrain::parseDesc）。
 constexpr int kSizeChoices[3] = {129, 257, 513};
 const char* kSizeLabels[3] = {"129 x 129  (128 m)", "257 x 257  (512 m)",
                               "513 x 513  (1 km)"};
+
+// 新建地形的实体高度。0 = 正好坐在视口栅格面上，这里只抬 2 cm：
+// 模板场景里本来就有一个叫 Ground 的面片也在 z=0，共面会 z-fighting
+// （画面里一条条闪烁的缝）。2 cm 在 512 m 见方的地形上肉眼不可见，
+// 角色站在上面也不会显得陷进地里。
+constexpr float kGroundEpsilon = 0.02f;
 
 // 新建地形默认的 4 个层材质 —— 直接引用工程里已有的 .vmat
 // （assets/materials/terrain_*.vmat）。写死名字是有意的：地形层是
@@ -145,34 +175,53 @@ float fbm(float x, float y, int octaves, std::uint32_t seed) {
     return (norm > 0.0f) ? (sum / norm) : 0.5f;
 }
 
-// 新建地形的默认高度：三层正弦叠出来的丘陵。
+// 新建地形的默认高度：三层正弦叠出来的缓坡丘陵。
 //
 // ------------------------------------------------------------
 // 为什么四边必须**压到 0**
 // ------------------------------------------------------------
 // 视口的地平面栅格画在 z = 0（Renderer 的 GridSettings::planeOffset），
-// 而地形表面是 `height * maxHeight`。如果默认地貌整体离开 0 面（上一版
-// 的高度区间是 0.082..0.830 → 4.9..49.8 m），那么地形块的四条边就是
-// **4.9~49.8 m 的垂直悬崖**，整块地形看起来像"浮在栅格上方的一块厚板"，
-// 而不是长在地面上的一片丘陵 —— 这就是"地形和栅格不在一个平面"。
+// 而地形表面是 `height * maxHeight`。地形块的四条边只要离开 0 面，就会
+// 变成"浮在栅格上方的一块厚板"，而不是长在地面上的一片丘陵 —— 这就是
+// "地形和栅格不在一个平面"。
 //
 // 所以这里乘一个**边界渐变**：距边界 12%（默认 512 m 地形约 61 m）以内
 // 用 smoothstep 平滑降到 0。效果是地形四边与栅格共面，接缝处没有台阶；
 // 中间该有的起伏一点没少。
 //
 // ⚠ 不能改成"整体减去最小值"：那样只有**最低点**贴地，其余边界仍然是
-//   几米到几十米不等的落差（正弦的取值沿边界一直在变），四周会出现一圈
-//   高度各不相同的墙 —— 看起来更像 bug。
+//   几米不等的落差（正弦的取值沿边界一直在变），四周会出现一圈高度各不
+//   相同的墙 —— 看起来更像 bug。
 //
 // 为什么不是随机噪声：噪声第一眼像"坏的"，而且每次新建都长得不一样，
-// 没法用截图做回归对比。三层不同频率的正弦叠加是**确定性**的：
-//   0.46 基面 + 0.24 大丘（~48 m 宽）+ 0.13 中坡 + 0.04 细纹
+// 没法用截图做回归对比。三层不同频率的正弦叠加是**确定性**的。
+//
+// 2026-10-21 改：默认地貌从"悬在 27 m 高空的台子"改成"贴着地面的缓坡"。
+//
+//   原来的基面是 0.46 —— `maxHeight=60` 时整片地形挂在 **+27.6 m**，而且
+//   512 m 见方。新建完地形，初始场景（Ground / Player / Pickup，都坐在
+//   z≈0..1）直接被这一整块地盖在下面；Play 时相机在 z≈2.7，比它**低**
+//   27 m，画面里只有地形的背面。用户的描述是"地形悬在栅格地面正上方，
+//   还盖住了原本的场景"。
+//
+//   现在两步：
+//     ① 正弦形状**归一化到 [0, 1]** —— 谷底严格等于 0，贴着地面；
+//     ② 再乘 kDefaultPeak（0.12 → 60 m 地形约 7 m 起伏）。
+//   于是"谷底落在地面上、山丘从地面长出来"。想做大起伏就自己刷 ——
+//   画布越平，越不可能误盖住已有场景（UE 新建 Landscape 默认全平，
+//   也是同一个理由）。
 std::vector<float> generateDefaultHeights(int cols, int rows) {
     // 边缘渐变宽度（占边长的比例）。0.12 → 512 m 地形约 61 m 的过渡带。
     // 太小（<0.05）在低多边形 LOD 下会看出折线；太大（>0.25）中心就没
     // 起伏了 —— 默认地貌会变成"一个大馒头"。
     constexpr float kEdgeFade = 0.12f;
-    std::vector<float> heights(static_cast<std::size_t>(cols) * rows, 0.0f);
+    // 默认起伏的峰值（归一化）。0.12 × 60 m ≈ 7.2 m —— 一眼看得出是"地形"，
+    // 又不会把站在 z≈1 的角色/场景挡住。
+    constexpr float kDefaultPeak = 0.12f;
+
+    const std::size_t n = static_cast<std::size_t>(cols) * rows;
+    std::vector<float> raw(n, 0.0f);
+    float lo = 1.0e30f, hi = -1.0e30f;
     for (int c = 0; c < cols; ++c) {
         for (int r = 0; r < rows; ++r) {
             const float u = static_cast<float>(c) / static_cast<float>(cols - 1);
@@ -185,8 +234,19 @@ std::vector<float> generateDefaultHeights(int cols, int rows) {
                                         std::min(v, 1.0f - v));
             float fade = std::clamp(edge / kEdgeFade, 0.0f, 1.0f);
             fade = fade * fade * (3.0f - 2.0f * fade);   // smoothstep
-            heights[sampleIndex(rows, c, r)] = std::clamp(h * fade, 0.0f, 1.0f);
+            const float val = h * fade;
+            raw[sampleIndex(rows, c, r)] = val;
+            lo = std::min(lo, val);
+            hi = std::max(hi, val);
         }
+    }
+
+    // 归一化到 [0, kDefaultPeak]。lo 一定是 0（边界被 fade 压平），
+    // 但这里按实际 min/max 归一化，改公式之后也不会漂。
+    const float span = std::max(hi - lo, 1.0e-6f);
+    std::vector<float> heights(n, 0.0f);
+    for (std::size_t i = 0; i < n; ++i) {
+        heights[i] = (raw[i] - lo) / span * kDefaultPeak;
     }
     return heights;
 }
@@ -291,6 +351,7 @@ void LandscapeEditor::sync() {
             VK_LOG_INFO("LS-TERRAIN none (scene has no terrain entity)");
             m_loggedMissing = true;
         }
+        clearLiveBinding();   // 组件可能已经没了，函数内部自己判空
         m_valid = false;
         m_entity = ecs::Entity{};
         m_source.clear();
@@ -319,11 +380,19 @@ void LandscapeEditor::sync() {
         return;
     }
     const bool switched = (!m_valid || m_source != tc->source);
+    // m_asset 要被整体替换 → 之前 publishToRenderer 挂出去的 &m_asset.heights
+    // 等地址全部作废。必须在 move 之前清，否则渲染层可能读到已释放的 vector。
+    clearLiveBinding();
     m_entity = found;
     m_source = tc->source;
     m_heightScale = (hs > 1.0e-4f) ? hs : 1.0f;
     m_asset = std::move(a);
     m_valid = true;
+    // 换绑到**另一个**实体时，上面的 clearLiveBinding 清的是旧实体的组件；
+    // 新实体的组件若在更早的绑定里留下过指针，这里再清一遍（此时 m_entity
+    // 已经是 found，清的就是新组件）。刚读盘加载完，GPU 侧由
+    // createInstanceResources 从盘上重传，所以顺手把脏位也归零。
+    clearLiveBinding();
     m_strokeCount = 0;
     // 换了资产 → 旧的撤销记录指向的像素已经不是同一张图了
     if (switched) {
@@ -498,6 +567,15 @@ bool LandscapeEditor::createTerrain(const std::string& name, int cols,
     });
     if (!created.valid()) return false;
 
+    // 坐在地平面上（只抬 2 cm 躲 z-fighting，见 kGroundEpsilon）。
+    // 山谷高度是 0（见 generateDefaultHeights），所以整片地的**最低点**
+    // 正好落在栅格上 —— 这就是"地形建立在原地面基础上"。
+    if (auto* tr = sc.world().get<ecs::TransformComponent>(created)) {
+        tr->position.z = kGroundEpsilon;
+    }
+    VK_LOG_INFO("LS-CREATE-SEAT z=%.2f (ground plane + epsilon)", 
+                static_cast<double>(kGroundEpsilon));
+
     m_ctx.select(created);
     m_ctx.notify(std::string(TR("Terrain created: ")) + name);
     m_ctx.dirty() = true;
@@ -608,8 +686,55 @@ bool LandscapeEditor::createWithCurrentSettings() {
 // ============================================================
 // 落盘
 // ============================================================
+void LandscapeEditor::publishToRenderer(bool splatToo, bool holesToo) {
+    // 渲染层只认"组件脏了"这件事 —— 但两种脏的代价差三个数量级：
+    //
+    //   dirty        → clearInstances + createTerrain：销毁/新建 sampler、
+    //                  重建描述符集、重传 3 MB 顶点、还要等 GPU 空闲。
+    //                  ~10 ms 一次，**只能**用于集合/层材质这种结构变更。
+    //   heightsDirty → 只把那张 264 KB 的 R32 图原地重传（顶点着色器直接
+    //                  采样高度图，顶点本身是平坦格子）。不碰任何 VkObject。
+    //
+    // 笔刷走后者。以前这里写的是 tc->dirty = true：一笔拖 0.5 秒就是十几次
+    // 重建，而重建会销毁还在飞行中的帧所引用的 sampler —— 实测几秒钟后
+    // 驱动返回 VK_ERROR_DEVICE_LOST，编辑器直接没了。
+    if (auto* tc = m_ctx.editorScene().world().get<ecs::TerrainComponent>(
+            m_entity)) {
+        tc->heightsDirty = true;
+        if (splatToo) tc->splatDirty = true;
+        if (holesToo) tc->holesDirty = true;
+        // 2026-10-21：把内存里这份挂上去，TerrainPass 就不再回磁盘重读。
+        // 地址会在下一次 sync/m_asset 重赋值时失效，所以每次 publish 都重挂；
+        // 换资产的地方由 clearLiveBinding() 显式清掉。
+        if (m_valid && !m_asset.heights.empty()) {
+            tc->liveHeights = &m_asset.heights;
+            tc->liveSplat = m_asset.splat.empty() ? nullptr : &m_asset.splat;
+            tc->liveHoles = m_asset.holes.empty() ? nullptr : &m_asset.holes;
+        }
+    }
+    m_ctx.dirty() = true;
+}
+
+void LandscapeEditor::clearLiveBinding() {
+    // editorScene 在 sync() 里才保证有效；这里只处理"已经绑过"的情况。
+    if (!m_entity.valid()) return;
+    if (auto* tc = m_ctx.editorScene().world().get<ecs::TerrainComponent>(
+            m_entity)) {
+        tc->liveHeights = nullptr;
+        tc->liveSplat = nullptr;
+        tc->liveHoles = nullptr;
+        // 指向活数据的指针没了，渲染层只能读盘 —— 但盘上那份可能还是旧的
+        // （拖拽期间没写）。所以顺手把"读盘"这条路也堵上：脏位清掉，
+        // 等下一次 publish/save 重新提供数据。
+        tc->heightsDirty = false;
+        tc->splatDirty = false;
+        tc->holesDirty = false;
+    }
+}
+
 void LandscapeEditor::saveAssets(bool splatToo, bool holesToo) {
     if (!m_valid) return;
+    const auto t0 = std::chrono::steady_clock::now();
     const std::string abs = assets::resolveAssetPath(m_source);
     const std::filesystem::path dir = std::filesystem::path(abs).parent_path();
 
@@ -640,34 +765,29 @@ void LandscapeEditor::saveAssets(bool splatToo, bool holesToo) {
         }
     }
 
-    // 渲染层只认"组件脏了"这件事 —— 但两种脏的代价差三个数量级：
-    //
-    //   dirty        → clearInstances + createTerrain：销毁/新建 sampler、
-    //                  重建描述符集、重传 3 MB 顶点、还要等 GPU 空闲。
-    //                  ~10 ms 一次，**只能**用于集合/层材质这种结构变更。
-    //   heightsDirty → 只把那张 264 KB 的 R32 图原地重传（顶点着色器直接
-    //                  采样高度图，顶点本身是平坦格子）。不碰任何 VkObject。
-    //
-    // 笔刷走后者。以前这里写的是 tc->dirty = true：一笔拖 0.5 秒就是十几次
-    // 重建，而重建会销毁还在飞行中的帧所引用的 sampler —— 实测几秒钟后
-    // 驱动返回 VK_ERROR_DEVICE_LOST，编辑器直接没了。
-    if (auto* tc = m_ctx.editorScene().world().get<ecs::TerrainComponent>(
-            m_entity)) {
-        tc->heightsDirty = true;
-        if (splatToo) tc->splatDirty = true;
-        if (holesToo) tc->holesDirty = true;
-    }
-    m_ctx.dirty() = true;
+    publishToRenderer(splatToo, holesToo);
     m_pendingSave = false;
     m_saveTimer = 0.0f;
+
+    // 一笔只落一次盘（抬笔时），把这次 I/O 的代价记下来。以前它发生在
+    // 每 80 ms 的拖拽路径上 —— 也就是每秒 12 次写 + 12 次回读。
+    const float ms = std::chrono::duration<float, std::milli>(
+                         std::chrono::steady_clock::now() - t0).count();
+    VK_LOG_INFO("LS-SAVE ms=%.2f bytes=%zu splat=%d holes=%d",
+                static_cast<double>(ms),
+                m_asset.heights.size() * sizeof(float), splatToo ? 1 : 0,
+                holesToo ? 1 : 0);
 }
 
 void LandscapeEditor::flush() {
-    if (m_valid && m_pendingSave) saveAssets(true);
+    // 先收尾笔划再落盘：commitSnapshot 会把脏矩形压进撤销栈，之后
+    // 这份数据才是"用户看到的最终态"。
     if (m_stroking) {
         m_stroking = false;
         commitSnapshot();
+        m_pendingSave = true;
     }
+    if (m_valid && m_pendingSave) saveAssets(true);
 }
 
 // ============================================================
@@ -962,8 +1082,15 @@ void LandscapeEditor::applyStroke(const glm::vec3& localHit, float dt,
             float& h = m_asset.heights[idx];
             switch (m_tool) {
                 case Tool::Raise: {
-                    // 抬高 / 降低是**同一个算子**的符号差异（Shift 反向）
-                    h += sign * m_strength * w * dt * kRaiseRate;
+                    // 抬高 / 降低是**同一个算子**的符号差异（Shift 反向）。
+                    //
+                    // 抬升方向额外乘"剩余空间"系数（raiseHeadroom）：1.0 以下
+                    // 恒为 1（手感与以前一模一样），超过 1.0 之后越接近
+                    // kMaxNorm 越慢。这是"山峰"和"火山口"的分水岭 ——
+                    // 硬钳在 1.0 的话，笔心先撞顶、外圈继续涨，收尾必然是一块
+                    // 平顶；有了余量，笔心能继续长高，剖面始终是锥形。
+                    const float room = (sign > 0.0f) ? raiseHeadroom(h) : 1.0f;
+                    h += sign * m_strength * w * dt * kRaiseRate * room;
                     break;
                 }
                 case Tool::Smooth: {
@@ -1002,11 +1129,11 @@ void LandscapeEditor::applyStroke(const glm::vec3& localHit, float dt,
                 case Tool::PaintLayer:
                     break;   // 走各自的专用通道
             }
-            h = std::clamp(h, 0.0f, 1.0f);
+            h = std::clamp(h, 0.0f, kMaxNorm);
             if (maxDeltaNorm > 0.0f) {
                 const float s = m_snapshotHeights[idx];
                 h = std::clamp(h, std::max(0.0f, s - maxDeltaNorm),
-                               std::min(1.0f, s + maxDeltaNorm));
+                               std::min(kMaxNorm, s + maxDeltaNorm));
             }
         }
     }
@@ -1048,7 +1175,7 @@ void LandscapeEditor::applyNoiseStroke(const glm::vec3& localHit, float dt) {
 
             float& h = m_asset.heights[sampleIndex(d.rows, c, r)];
             h += n * m_strength * w * dt * kNoiseRate * 2.0f;
-            h = std::clamp(h, 0.0f, 1.0f);
+            h = std::clamp(h, 0.0f, kMaxNorm);
         }
     }
     m_pendingSave = true;
@@ -1171,7 +1298,7 @@ void LandscapeEditor::applyErodeStroke(const glm::vec3& localHit, float dt) {
                                     static_cast<std::size_t>(ph) +
                                 static_cast<std::size_t>(r - r0 + 1)];
             m_asset.heights[sampleIndex(d.rows, c, r)] =
-                std::clamp(v, 0.0f, 1.0f);
+                std::clamp(v, 0.0f, kMaxNorm);
         }
     }
     m_pendingSave = true;
@@ -1221,18 +1348,33 @@ void LandscapeEditor::applyLayerStroke(const glm::vec3& localHit, float dt,
 }
 
 // ============================================================
-// 挖洞（UE 的 Landscape Visibility 层）
+// 形状雕刻（原"挖洞"，2026-10-21 重做）
 // ============================================================
-// 挖的是**遮罩**不是高度：片元着色器按遮罩 discard，所以洞下面是"真的空"，
-// 而不像"把高度压到 -100 m"那样留下一口能看见四周岩壁的深井。
+// 用户原话：
+//   "挖洞的功能，不是将原地面中间剖开一个缺口，不能是破坏地面的拓扑结构；
+//    最好是能否通过选择一简单的物体，在地面中拖动这个物体慢慢贯穿整个表面，
+//    以这个物体的轮廓去给地面形变，构造出对应的类似洞穴的结构。"
 //
-// 遮罩是 per-sample 的 8 位灰度，笔刷按权重往 0（挖穿）或 255（补回）走。
-// 为什么不 per-quad 二值化：那会让洞边全是锯齿（一格 2 m 的方块台阶），
-// 而双线性采样的遮罩 + 0.5 阈值正好把边缘放在两格中间 —— 视觉上足够干净。
-void LandscapeEditor::applyHoleStroke(const glm::vec3& localHit, float dt,
+// 旧实现是 UE 的 Visibility 层思路：写一张 holes 遮罩，片元着色器 discard
+// 那些像素 → 地面上真的开一个洞。问题是那**就是**在破坏拓扑：洞边是硬边、
+// 洞下面是空的（能看见天空/背面），而且高度图本身完全没变，物理和光照都
+// 对不上。
+//
+// 现在改成"形状体压印"：选一个形状（球 / 方块 / 圆柱），把它沉到地表以
+// 下，然后**按它的下表面削地形**。
+//   · 球   → 下表面是球冠 → 压出碗状凹腔，边缘是光滑的收口
+//   · 方块 → 平底 + 直壁的基坑，轮廓就是那个方形的边
+//   · 圆柱 → 平底 + 直壁 + 圆轮廓的竖井
+// 拖动 = 把形状体在地表里扫掠 → 一串连续的凹腔接成通道，也就是"贯穿"。
+// 全程只改高度图：不开洞、不 discard、拓扑永远是完整的矩形网格。
+//
+// ⚠ 高度图**做不出真正的洞穴**（有拱顶、有悬垂、内部空腔）：每个 (x, y)
+//   只能存一个高度，从上方看下去它必须是"单值曲面"。所以这里给的是
+//   "以物体轮廓压出来的凹腔 / 通道"。要带顶的洞得换体素或 SDF，
+//   那是另一条技术路线（本轮的取舍写进 docs/editor_roadmap.md §20）。
+void LandscapeEditor::applyCarveStroke(const glm::vec3& localHit, float dt,
                                       bool invert) {
     const TerrainDesc& d = m_asset.desc;
-    if (m_asset.holes.size() != m_asset.heights.size()) return;
     const physics::Heightfield hf = m_asset.heightfield();
     const glm::vec2 g = hf.gridOf(glm::vec2(localHit.x, localHit.y));
     const float rs = m_radius / d.metersPerPixel;
@@ -1242,24 +1384,76 @@ void LandscapeEditor::applyHoleStroke(const glm::vec3& localHit, float dt,
     const int c1 = std::min(d.cols - 1, static_cast<int>(std::ceil(g.x + rs)));
     const int r0 = std::max(0, static_cast<int>(std::floor(g.y - rs)));
     const int r1 = std::min(d.rows - 1, static_cast<int>(std::ceil(g.y + rs)));
+    if (c0 > c1 || r0 > r1) return;
 
-    // 目标值：Shift = 255（补回），默认 0（挖穿）。
-    const float target = invert ? 255.0f : 0.0f;
+    // 形状体的几何**全在米里算**，最后再除回归一化。用归一化算的话，
+    // 改 heightScale 之后"同样的笔刷压出来的坑"深度会跟着变，手感漂移。
+    const float unitM = std::max(d.maxHeight * m_heightScale, 1.0e-4f);
+    const float R = std::max(m_radius, d.metersPerPixel * 1.5f);
+    // 形状体中心用**落笔那一刻**锚定的绝对高度（m_carveCenterM，单位米），
+    // 整笔不再跟着当前地表走 —— 理由见 LandscapeEditor.h 里那个成员的注释。
+    const float centerM = m_carveCenterM;
+    // 方块半边长：同半径下方块看着比球"大一圈"，0.7 让三种形状的视觉体量接近。
+    const float halfBox = R * 0.7f;
+
+    // 每帧最多推进的比例。一帧压到位会很"跳"，而且拖动时落点间隔大于笔刷
+    // 半径就会啃出锯齿；按速率逼近则像"物体被慢慢压进去"。
+    const float rate = std::clamp(m_strength * dt * 14.0f, 0.0f, 1.0f);
+
     for (int c = c0; c <= c1; ++c) {
         for (int r = r0; r <= r1; ++r) {
-            const float dx = static_cast<float>(c) - g.x;
-            const float dy = static_cast<float>(r) - g.y;
-            const float t = std::sqrt(dx * dx + dy * dy) / rs;
-            const float w = brushWeight(t, m_falloff);
-            if (w <= 0.0f) continue;
-            // 速率先到 1.0 再乘 —— 力度很大时不该"一帧挖穿"，那样拖出来的
-            // 洞边会有毛刺（一帧的落点间隔比笔刷半径还大）。
-            const float k = std::clamp(m_strength * w * dt * 5.0f, 0.0f, 1.0f);
+            const float dx =
+                (static_cast<float>(c) - g.x) * d.metersPerPixel;
+            const float dy =
+                (static_cast<float>(r) - g.y) * d.metersPerPixel;
+            const float d2 = dx * dx + dy * dy;
+
+            // 该点在形状体里的"半厚度"（中心 → 下表面）以及轮廓参数 t
+            float half = 0.0f;
+            float t = 0.0f;
+            switch (m_carveShape) {
+                case CarveShape::Sphere: {
+                    if (d2 >= R * R) continue;
+                    half = std::sqrt(R * R - d2);
+                    t = std::sqrt(d2) / R;
+                    break;
+                }
+                case CarveShape::Box: {
+                    const float ax = std::fabs(dx);
+                    const float ay = std::fabs(dy);
+                    if (ax > halfBox || ay > halfBox) continue;
+                    half = halfBox;
+                    t = std::max(ax, ay) / halfBox;
+                    break;
+                }
+                case CarveShape::Cylinder: {
+                    if (d2 >= R * R) continue;
+                    half = R;               // 上下都是平的
+                    t = std::sqrt(d2) / R;
+                    break;
+                }
+            }
+
+            // 最外 5% 做窄过渡，避开"一个纹素的硬折线"；内部完全按形状的
+            // 精确剖面走 —— 只有这样才叫"以物体的轮廓形变"。
+            const float rim = std::clamp((1.0f - t) / 0.05f, 0.0f, 1.0f);
+            const float k = rate * rim;
+            if (k <= 0.0f) continue;
+
             const std::size_t idx = sampleIndex(d.rows, c, r);
-            float v = static_cast<float>(m_asset.holes[idx]);
-            v += (target - v) * k;
-            m_asset.holes[idx] =
-                static_cast<std::uint8_t>(std::clamp(v, 0.0f, 255.0f));
+            float& h = m_asset.heights[idx];
+            if (!invert) {
+                // 往下压：只在形状体的下表面**低于**当前地表时才动它。
+                // 形状体整颗抬到地面以上时自然什么都不发生 ——
+                // 这就是"物体压进去才有形变"。
+                const float bottomN = (centerM - half) / unitM;
+                if (bottomN < h) h += (bottomN - h) * k;
+            } else {
+                // Shift = 反向：按形状体的**上**表面堆出一个同轮廓的隆起
+                const float topN = (centerM + half) / unitM;
+                if (topN > h) h += (topN - h) * k;
+            }
+            h = std::clamp(h, 0.0f, kMaxNorm);
         }
     }
     m_pendingSave = true;
@@ -1319,7 +1513,7 @@ void LandscapeEditor::applyRampStroke(const glm::vec3& localHit, float dt) {
             const std::size_t idx = sampleIndex(d.rows, c, r);
             const float k = std::clamp(m_strength * w * dt * 6.0f, 0.0f, 1.0f);
             m_asset.heights[idx] += (target - m_asset.heights[idx]) * k;
-            m_asset.heights[idx] = std::clamp(m_asset.heights[idx], 0.0f, 1.0f);
+            m_asset.heights[idx] = std::clamp(m_asset.heights[idx], 0.0f, kMaxNorm);
         }
     }
     (void)scale;
@@ -1365,7 +1559,7 @@ void LandscapeEditor::wholeNoise() {
             const float wy = static_cast<float>(r) * d.metersPerPixel / scale;
             const float n = fbm(wx, wy, m_noiseOctaves, m_noiseSeed) - 0.5f;
             float& h = m_asset.heights[sampleIndex(d.rows, c, r)];
-            h = std::clamp(h + n * m_wholeNoiseAmp * 2.0f, 0.0f, 1.0f);
+            h = std::clamp(h + n * m_wholeNoiseAmp * 2.0f, 0.0f, kMaxNorm);
         }
     }
     commitSnapshot();
@@ -1494,10 +1688,10 @@ bool LandscapeEditor::viewportInput(const glm::vec2& vpPos,
                 col = IM_COL32(255, 140, 220, 235);
                 fill = IM_COL32(255, 140, 220, 26);
                 break;
-            case Tool::Hole:
-                // 挖洞是破坏性的 → 红色（Shift 补回是绿色）
+            case Tool::Carve:
+                // 形状雕刻：压出凹腔用暖红，Shift 反向隆起用绿
                 col = io.KeyShift ? IM_COL32(120, 230, 140, 235)
-                                  : IM_COL32(255, 90, 90, 235);
+                                  : IM_COL32(255, 120, 90, 235);
                 fill = io.KeyShift ? IM_COL32(120, 230, 140, 26)
                                    : IM_COL32(255, 90, 90, 26);
                 break;
@@ -1584,11 +1778,32 @@ bool LandscapeEditor::viewportInput(const glm::vec2& vpPos,
         m_stroking = true;
         m_strokeCount = 1;
         m_lastLocal = localHit;
-        // 压平的参考高度：按下那一刻笔心的**世界**高度
-        m_flattenHeight = localHit.z * m_asset.desc.maxHeight * m_heightScale;
-        // 坡道的起点
+        // ⚠️ 单位约定（这三个工具以前全错在这里）：
+        //   `localHit` 是 `physics::raycast` 的返回值，而 renderer 里给它的
+        //   `hf.heightScale` 是 `maxHeight * m_heightScale`，`Heightfield::
+        //   height()` 里已经乘过了 —— 所以 **`localHit.z` 就是米，不用再乘
+        //   任何东西**。以前这里又乘了一次 unitM，于是雕刻形状体被放到
+        //   807 米高空（地形才 15 米高），压印自然什么也碰不到。
+        // 反过来说，凡是和 `m_asset.heights[]` 直接打交道的量都是**归一化**，
+        // 要经过 unitM 换算。所以下面三处一个是一路（米）、一个是另一路。
+        const float unitM =
+            std::max(m_asset.desc.maxHeight * m_heightScale, 1.0e-4f);
+
+        // 形状雕刻：形状体的中心在**这一笔开始**时定死（单位米）。
+        // 之后整笔都用它 —— 拖到哪儿就削到哪儿，深度不再累积（否则每帧
+        // 都会把地表再推一截，形成自激循环，见 m_carveCenterM 的注释）。
+        if (m_tool == Tool::Carve) {
+            const float R = std::max(m_radius,
+                                     m_asset.desc.metersPerPixel * 1.5f);
+            m_carveCenterM = localHit.z - m_carveDepth * R;
+        }
+        // 压平的参考高度：按下那一刻笔心的**世界**高度（米）。
+        // `applyStroke` 里会自己除以 unitM 换成归一化。
+        m_flattenHeight = localHit.z;
+        // 坡道的起点：`applyRampStroke` 直接拿它去和 `heights[idx]`（归一化）
+        // 插值，所以这里要**换成归一化**，不能给米。
         m_rampStart = glm::vec2(localHit.x, localHit.y);
-        m_rampStartH = localHit.z;
+        m_rampStartH = localHit.z / unitM;
         m_rampEnd = m_rampStart;
         m_rampEndH = m_rampStartH;
         // 快照：位掩码 1=高度 2=权重 4=挖洞。
@@ -1597,7 +1812,7 @@ bool LandscapeEditor::viewportInput(const glm::vec2& vpPos,
         //   会混进一份没用的高度，undo 时把地形"顺手还原"了别的东西。
         int parts = 1;
         if (m_tool == Tool::PaintLayer) parts = 2;
-        else if (m_tool == Tool::Hole) parts = 4;
+        // Carve 只改高度图（不碰 holes 遮罩）→ 和 Raise 一样 parts = 1
         beginSnapshot(parts);
         // 按下立刻落一次 —— 单击（不拖）也必须有反应，否则用户会以为
         // "点一下没反应"，然后开始怀疑笔刷坏了。
@@ -1606,10 +1821,22 @@ bool LandscapeEditor::viewportInput(const glm::vec2& vpPos,
         if (m_tool == Tool::PaintLayer) applyLayerStroke(localHit, dt, invert);
         else if (m_tool == Tool::Noise) applyNoiseStroke(localHit, dt);
         else if (m_tool == Tool::Erode) applyErodeStroke(localHit, dt);
-        else if (m_tool == Tool::Hole) applyHoleStroke(localHit, dt, invert);
+        else if (m_tool == Tool::Carve) applyCarveStroke(localHit, dt, invert);
         else if (m_tool == Tool::Ramp) applyRampStroke(localHit, dt);
         else applyStroke(localHit, dt, invert);
         m_pendingSave = true;
+        if (m_tool == Tool::Carve) {
+            // 雕刻的"形状 + 下沉深度 + 落点"单独打一条：验收脚本要确认
+            // 真的走的是形状压印（而不是又退回到改遮罩开洞）。
+            VK_LOG_INFO("LS-CARVE shape=%d depth=%.2f size=%.1f centerZ=%.1f "
+                        "at=(%.1f,%.1f) mode=%s",
+                        static_cast<int>(m_carveShape),
+                        static_cast<double>(m_carveDepth),
+                        static_cast<double>(m_radius),
+                        static_cast<double>(m_carveCenterM),
+                        static_cast<double>(hit.x), static_cast<double>(hit.y),
+                        invert ? "mound" : "carve");
+        }
         VK_LOG_INFO("LS-STROKE-BEGIN tool=%d at=(%.1f,%.1f) radius=%.1f "
                     "strength=%.2f falloff=%.2f",
                     static_cast<int>(m_tool),
@@ -1625,7 +1852,8 @@ bool LandscapeEditor::viewportInput(const glm::vec2& vpPos,
         if (released) {
             m_stroking = false;
             commitSnapshot();
-            saveAssets(true, m_tool == Tool::Hole);
+            // 抬笔：高度必写；权重只在画层时写；holes 已经不再产生
+            saveAssets(m_tool == Tool::PaintLayer);
             VK_LOG_INFO("LS-STROKE-END strokes=%d undo=%d", m_strokeCount,
                         static_cast<int>(m_undo.size()));
         } else if (onTerrain && down && !navGesture) {
@@ -1654,7 +1882,7 @@ bool LandscapeEditor::viewportInput(const glm::vec2& vpPos,
                 if (m_tool == Tool::PaintLayer) applyLayerStroke(p, sub, invert);
                 else if (m_tool == Tool::Noise) applyNoiseStroke(p, sub);
                 else if (m_tool == Tool::Erode) applyErodeStroke(p, sub);
-                else if (m_tool == Tool::Hole) applyHoleStroke(p, sub, invert);
+                else if (m_tool == Tool::Carve) applyCarveStroke(p, sub, invert);
                 else if (m_tool == Tool::Ramp) applyRampStroke(p, sub);
                 else applyStroke(p, sub, invert);
             }
@@ -1662,7 +1890,13 @@ bool LandscapeEditor::viewportInput(const glm::vec2& vpPos,
 
             m_saveTimer += dt;
             if (m_pendingSave && m_saveTimer >= kSaveInterval) {
-                saveAssets(m_tool == Tool::PaintLayer, m_tool == Tool::Hole);
+                // 2026-10-21：拖拽期间**不落盘**，只把内存推给渲染层。
+                // 以前这里是 saveAssets(...)：每 80 ms 写 264 KB~1 MB，
+                // 然后 TerrainPass 再把它读回来 —— 磁盘往返就在这一帧里，
+                // 于是"手已经拖过去几十像素，画面还停在原处"。
+                publishToRenderer(m_tool == Tool::PaintLayer);
+                m_pendingSave = false;
+                m_saveTimer = 0.0f;
             }
             ++m_strokeCount;
         }
@@ -1681,18 +1915,23 @@ void LandscapeEditor::drawPanel() {
 
     sync();
 
-    const ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowSizeConstraints(ImVec2(400.0f, 420.0f),
-                                        ImVec2(FLT_MAX, FLT_MAX));
-    ImGui::SetNextWindowSize(ImVec2(440.0f, 700.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.30f,
-                                   io.DisplaySize.y * 0.10f),
-                            ImGuiCond_FirstUseEver);
+    // 2026-10-21：地形面板长在**左栏下半**（模式栏的当前模式参数区）。
+    // 左栏被拖到折叠时退回浮动窗口，见 ModeRail.h 的 beginModeRailPanel。
+    ImGuiWindowFlags wf = 0;
+    const bool railed = beginModeRailPanel(m_ctx, wf);
+    if (!railed) {
+        const ImGuiIO& io = ImGui::GetIO();
+        ImGui::SetNextWindowSizeConstraints(ImVec2(400.0f, 420.0f),
+                                            ImVec2(FLT_MAX, FLT_MAX));
+        ImGui::SetNextWindowSize(ImVec2(440.0f, 700.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.30f,
+                                       io.DisplaySize.y * 0.10f),
+                                ImGuiCond_FirstUseEver);
+    }
     // ⚠ ID 必须是 `###panel_<面板表里的 id>` —— 与 EditorApp::drawPlaceholderPanel
-    //   同一套命名。底栏托盘靠 `ImGui::FindWindowByName("###panel_landscape")`
-    //   把这个浮动窗口提到最前面（否则点一下视口，视口就跑到 g.Windows 末尾，
-    //   把面板整个盖住 —— 表现是"面板自己消失了"，但它其实还开着）。
-    if (!ImGui::Begin(TR("Landscape###panel_landscape"), &open)) {
+    //   同一套命名（底栏托盘按这个名字找窗口）。
+    if (!ImGui::Begin(TR("Landscape###panel_landscape"),
+                      railed ? nullptr : &open, wf)) {
         ImGui::End();
         return;
     }
@@ -1865,25 +2104,35 @@ void LandscapeEditor::drawToolParams() {
             ImGui::Checkbox(TR("Erase (paint back to grass)"), &m_eraseLayer);
             break;
         }
-        case Tool::Hole: {
-            ImGui::SeparatorText(TR("Dig hole"));
-            // 洞的实时统计：一眼看出"到底挖穿了多少"，而不是靠肉眼在绿色
-            // 地形上找那个洞（俯视时洞边常常和阴影混在一起）。
-            int dug = 0;
-            for (std::uint8_t v : m_asset.holes) {
-                if (v < 128u) ++dug;
+        case Tool::Carve: {
+            ImGui::SeparatorText(TR("Carve"));
+            // 形状体：球 / 方块 / 圆柱。尺寸复用上面的 Brush Size ——
+            // 再给一个"尺寸"滑条只会让人犹豫两个滑条谁说话。
+            const char* shapes[3] = {TR("Sphere"), TR("Box"), TR("Cylinder")};
+            int si = static_cast<int>(m_carveShape);
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::Combo("##carve_shape", &si, shapes, 3)) {
+                m_carveShape = static_cast<CarveShape>(si);
+                VK_LOG_INFO("LS-CARVE shape=%d", si);
             }
-            ImGui::Text(TR("Dug samples: %d / %d (%.2f%%)"), dug,
-                        static_cast<int>(m_asset.holes.size()),
-                        m_asset.holes.empty()
-                            ? 0.0f
-                            : 100.0f * static_cast<float>(dug) /
-                                  static_cast<float>(m_asset.holes.size()));
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::SliderFloat(TR("Sink depth"), &m_carveDepth, 0.0f,
+                                   1.2f, "%.2f")) {
+                VK_LOG_INFO("LS-CARVE depth=%.2f",
+                            static_cast<double>(m_carveDepth));
+            }
+            // 现场算一下"最深能压多少米"，免得用户在 60 m 的地形上用 0.05
+            // 的深度试半天看不出变化。
+            ImGui::Text(TR("Depth: %.1f m  |  Size: %.1f m"),
+                        static_cast<double>(m_carveDepth * m_radius),
+                        static_cast<double>(m_radius));
             ImGui::TextDisabled("%s",
-                                TR("Paints the visibility mask. The shader drops "
-                                   "those pixels, so you get a real opening "
-                                   "instead of a very deep pit. Hold Shift to "
-                                   "fill the hole back in."));
+                                TR("Drag a shape through the surface: the "
+                                   "terrain is carved down to the object's "
+                                   "lower outline, so sweeping it digs a "
+                                   "channel. Topology stays intact (no holes, "
+                                   "no discarded pixels). Hold Shift to push a "
+                                   "mound up with the same outline."));
             break;
         }
         case Tool::Ramp: {
@@ -1943,6 +2192,12 @@ void LandscapeEditor::drawBrushSection() {
     ImGui::SeparatorText(TR("Brush"));
 
     // 2 × 4 的按钮网格（8 个工具）。工具多了之后横排会挤成一条，两列刚好够读。
+    //
+    // ⚠ 行高 28 → 22、行距收紧：左栏下半只有 448 px（模式栏 394..842），
+    //   原来的 28 px 行高让第 4 行（Paint layer / Carve）整个掉到面板底边
+    //   之外 —— 用户滚轮能看到、但点不到（点下去落到面板外面）。
+    //   现在 4 行 × (22+5) = 108 px，末行底边 829 < 842，全部可见。
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 5.0f));
     struct Item { Tool t; const char* label; };
     const Item tools[kToolCount] = {
         {Tool::Raise, "Raise / Lower"},
@@ -1952,7 +2207,7 @@ void LandscapeEditor::drawBrushSection() {
         {Tool::Noise, "Noise"},
         {Tool::Erode, "Erode"},
         {Tool::PaintLayer, "Paint layer"},
-        {Tool::Hole, "Hole"},
+        {Tool::Carve, "Carve"},
     };
     for (int i = 0; i < kToolCount; ++i) {
         if (i % 2 == 1) ImGui::SameLine();
@@ -1962,13 +2217,13 @@ void LandscapeEditor::drawBrushSection() {
                 ImGuiCol_Button,
                 ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
         }
-        if (ImGui::Button(TR(tools[i].label), ImVec2(188.0f, 28.0f))) {
+        if (ImGui::Button(TR(tools[i].label), ImVec2(188.0f, 22.0f))) {
             m_tool = tools[i].t;
             // ⚠ 两个数字都要打出来，别再混用：`LS-TOOL-<i>` 这个**锚点**用的是
             //   按钮在网格里的视觉序号 i，而 `static_cast<int>(m_tool)` 是
             //   `Tool` 枚举值 —— 两者顺序不一样（枚举里 Noise/Erode/PaintLayer
-            //   排在 Hole/Ramp 前面，按钮却把 Ramp 放第 4 格、Hole 放第 8 格）。
-            //   只打枚举值时，"按第 8 格 → LS-TOOL 6"读起来像是点错了格。
+            //   排在 Carve/Ramp 前面，按钮却把 Ramp 放第 4 格、Carve 放第 8 格）。
+            //   只打枚举值时，"按第 8 格 → LS-TOOL 7"读起来像是点错了格。
             VK_LOG_INFO("LS-TOOL %d index=%d name=%s", static_cast<int>(m_tool),
                         i, tools[i].label);
         }
@@ -1977,6 +2232,7 @@ void LandscapeEditor::drawBrushSection() {
         std::snprintf(tag, sizeof(tag), "LS-TOOL-%d", i);
         logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     }
+    ImGui::PopStyleVar();   // ItemSpacing（见网格上方的说明）
 
     labeledSlider(TR("Radius"), "##ls_radius", &m_radius, 1.0f, 500.0f, "%.1f m",
                   /*logScale=*/true);

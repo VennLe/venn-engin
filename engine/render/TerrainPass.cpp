@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <fstream>
@@ -91,6 +92,46 @@ VkSampler makeSampler(rhi::Device& device, VkFilter filter,
     return s;
 }
 
+// ============================================================
+// 列主序 → 行主序（2026-10-21）
+//
+// ⚠ 这是"刷地形位置对不上"的根因，务必看清楚。
+//
+// 存储约定两边**不一样**：
+//   · `height.r32` / `splat.rgba8` / `holes.r8` 是**列主序**：
+//       heights[col * rows + row]
+//     （physics::Heightfield 的约定，Heightfield.h 顶部写明了；
+//      CPU 侧 heightAt / gridOf / 笔刷 applyStroke 全按这个顺序索引）
+//   · 纹理是**行主序**：texel(x, y) = data[y * width + x]
+//     而 terrain.vert 用 `uv = ((col+0.5)/cols, (row+0.5)/rows)` 采样，
+//     也就是"纹素 (x=col, y=row) 应该就是 H(col,row)"。
+//
+// 原样把列主序数组喂给 upload2D（width=cols, height=rows）意味着
+//   texel(col, row) = data[row * cols + col] = H(col=row, row=col)
+// —— 整片地形绕对角线**镜像**了。物理（角色踩地、笔刷射线）用的是
+// H(col,row)，屏幕上是 H(row,col)，于是"鼠标刷的地方和隆起出现的地方
+// 不同"，而且离对角线越远偏得越多（257×257 的地形上，最高点会被画到
+// 200 多米以外）。天空/噪声看起来还挺合理，所以肉眼不容易发现。
+//
+// 修法：上传前翻一次（264 KB，几十微秒），让"纹素 = H(col,row)"成立。
+// 注意**只翻上传的那份拷贝**：`inst.asset.heights` 必须保持列主序，
+// 因为 LOD 误差、CPU 侧查询都按列主序读它。
+// ============================================================
+template <typename T>
+std::vector<T> toRowMajor(const std::vector<T>& src, int cols, int rows) {
+    std::vector<T> out(src.size());
+    for (int c = 0; c < cols; ++c) {
+        const std::size_t cOff = static_cast<std::size_t>(c) *
+                                 static_cast<std::size_t>(rows);
+        for (int r = 0; r < rows; ++r) {
+            out[static_cast<std::size_t>(r) * static_cast<std::size_t>(cols) +
+                static_cast<std::size_t>(c)] = src[cOff +
+                                                   static_cast<std::size_t>(r)];
+        }
+    }
+    return out;
+}
+
 // 把一段像素（或浮点）数据上传成 2D 纹理。
 // ⚠ height 用 R32_SFLOAT：**没有 sRGB 变体**，所以"线性采样"是格式本身
 //   保证的，不依赖任何标志位（这正是 W4 选裸浮点的第二个理由）。
@@ -141,17 +182,29 @@ std::unique_ptr<rhi::Image> upload2D(rhi::Device& device,
 // ============================================================
 namespace {
 
+// reuse = 常驻 staging（笔刷路径传实例里的那块）。给 nullptr 就临时建一个。
+//
+// ⚠ 每帧新建/销毁 VkBuffer 是这个函数原先最大的开销（一次 refresh 一次
+//   分配 + 一次 vkQueueWaitIdle）。2026-10-21 加了这个复用参数：刷地形时
+//   只写数据、只提交拷贝，分配次数降到 0。
 bool refillImage2D(rhi::Device& device, rhi::CommandPool& cmdPool,
-                   rhi::Image& img, const void* data, std::size_t bytes) {
+                   rhi::Image& img, const void* data, std::size_t bytes,
+                   rhi::Buffer* reuse = nullptr) {
     if (!data || bytes == 0) return false;
 
     // staging：HOST_VISIBLE + TRANSFER_SRC。**不是** createDeviceLocal ——
     // 那条路径会再建一个中间缓冲并等一次队列，对 264 KB 的图不划算。
-    rhi::Buffer staging(device, static_cast<VkDeviceSize>(bytes),
-                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    staging.writeData(data, static_cast<VkDeviceSize>(bytes));
+    std::unique_ptr<rhi::Buffer> owned;
+    rhi::Buffer* staging = reuse;
+    if (!staging || staging->size() < static_cast<VkDeviceSize>(bytes)) {
+        owned = std::make_unique<rhi::Buffer>(
+            device, static_cast<VkDeviceSize>(bytes),
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        staging = owned.get();
+    }
+    staging->writeData(data, static_cast<VkDeviceSize>(bytes));
 
     VkCommandBuffer cmd = cmdPool.beginOneTime();
 
@@ -186,7 +239,7 @@ bool refillImage2D(rhi::Device& device, rhi::CommandPool& cmdPool,
     region.imageSubresource.baseArrayLayer = 0;
     region.imageSubresource.layerCount = 1;
     region.imageExtent = {img.width(), img.height(), 1};
-    vkCmdCopyBufferToImage(cmd, staging.get(), img.get(),
+    vkCmdCopyBufferToImage(cmd, staging->get(), img.get(),
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -363,50 +416,109 @@ void TerrainPass::clearInstances() {
 //   · 顶点缓冲不动（terrain.vert 里 pos.z 是采样高度图加出来的）
 //   · sampler / 描述符集不动（图还是那张图，只是内容换了）
 //   · 分块网格与 LOD 不动（块的 XY 中心不依赖高度）
-// 只做两件事：把磁盘上的新数据读回内存，再把 R32/RGBA8 两张图原地重传。
+// 只做三件事：取到新数据 → 翻成行主序 → 把 R32/RGBA8/R8 原地重传。
 //
-// 数据来源是**磁盘**而不是编辑器内存里的 vector：编辑器的笔刷本来就要
-// 落盘（渲染层与编辑器是两个独立的所有者，共享同一份 264 KB 的读回成本
-// 远小于再发明一套跨层通道）。读回 ~264 KB，在 12 Hz 下完全无感。
+// ------------------------------------------------------------
+// 数据从哪来（2026-10-21 改）
+// ------------------------------------------------------------
+// 原来**只**从磁盘读（loadTerrain）：编辑器先写盘、这里再读盘，一次
+// 刷新光 I/O 就是 2 MB，而且编辑器那边每 80 ms 就写一次 —— 合起来就是
+// "刷地形延迟很大"的主因。
+//
+// 现在优先用 `live`（编辑器内存里的那份资产，经 TerrainComponent 的
+// liveHeights/liveSplat/liveHoles 传下来）。live == nullptr 时才退回
+// 读盘（比如别的工具改了资产文件，或者编辑器没在刷）。
+//
+// 上传前必须 toRowMajor：见上面那个函数的注释（不做的话整片地形绕
+// 对角线镜像，"鼠标刷的位置"和"隆起出现的位置"对不上）。
 // ============================================================
-bool TerrainPass::refreshSurface(uint32_t index, bool splatToo, bool holesToo) {
+bool TerrainPass::refreshSurface(uint32_t index, bool splatToo, bool holesToo,
+                                 const terrain::TerrainAsset* live) {
     if (!m_device || !m_cmdPool || index >= m_instances.size()) return false;
     Instance& inst = *m_instances[index];
     if (!inst.heightImage || !inst.splatImage) return false;
 
-    terrain::TerrainAsset fresh;
-    std::string err;
-    if (!terrain::loadTerrain(inst.asset.path, fresh, &err, /*quiet=*/true)) {
-        VK_LOG_ERROR("TERRAIN-REFRESH-FAIL path=%s reason=%s",
-                     inst.asset.path.c_str(), err.c_str());
-        return false;
-    }
-    // 尺寸变了说明资产被换掉了，图片尺寸对不上 → 只能用重建路径
-    if (fresh.heights.size() != inst.asset.heights.size() ||
-        fresh.splat.size() != inst.asset.splat.size()) {
-        VK_LOG_ERROR("TERRAIN-REFRESH-SIZE path=%s got=%zu/%zu want=%zu/%zu",
-                     inst.asset.path.c_str(), fresh.heights.size(),
-                     fresh.splat.size(), inst.asset.heights.size(),
-                     inst.asset.splat.size());
-        return false;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    const int cols = inst.asset.desc.cols;
+    const int rows = inst.asset.desc.rows;
+
+    // ---- 取数据 ----
+    if (live) {
+        if (live->heights.size() != inst.asset.heights.size()) {
+            VK_LOG_ERROR("TERRAIN-REFRESH-SIZE path=%s live=%zu want=%zu",
+                         inst.asset.path.c_str(), live->heights.size(),
+                         inst.asset.heights.size());
+            return false;
+        }
+        inst.asset.heights = live->heights;
+        if (splatToo) inst.asset.splat = live->splat;
+        if (holesToo) inst.asset.holes = live->holes;
+    } else {
+        terrain::TerrainAsset fresh;
+        std::string err;
+        if (!terrain::loadTerrain(inst.asset.path, fresh, &err, /*quiet=*/true)) {
+            VK_LOG_ERROR("TERRAIN-REFRESH-FAIL path=%s reason=%s",
+                         inst.asset.path.c_str(), err.c_str());
+            return false;
+        }
+        // 尺寸变了说明资产被换掉了，图片尺寸对不上 → 只能用重建路径
+        if (fresh.heights.size() != inst.asset.heights.size() ||
+            fresh.splat.size() != inst.asset.splat.size()) {
+            VK_LOG_ERROR("TERRAIN-REFRESH-SIZE path=%s got=%zu/%zu want=%zu/%zu",
+                         inst.asset.path.c_str(), fresh.heights.size(),
+                         fresh.splat.size(), inst.asset.heights.size(),
+                         inst.asset.splat.size());
+            return false;
+        }
+        inst.asset.heights = std::move(fresh.heights);
+        if (splatToo) inst.asset.splat = std::move(fresh.splat);
+        if (holesToo) inst.asset.holes = std::move(fresh.holes);
     }
 
-    inst.asset.heights = std::move(fresh.heights);
-    refillImage2D(*m_device, *m_cmdPool, *inst.heightImage,
-                  inst.asset.heights.data(),
-                  inst.asset.heights.size() * sizeof(float));
+    // ---- 上传（列主序 → 行主序）----
+    if (!inst.uploadBuf ||
+        inst.uploadBuf->size() <
+            static_cast<VkDeviceSize>(inst.asset.heights.size() * sizeof(float))) {
+        inst.uploadBuf = std::make_unique<rhi::Buffer>(
+            *m_device,
+            static_cast<VkDeviceSize>(inst.asset.heights.size() * sizeof(float)),
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
+    const std::vector<float> hRow = toRowMajor(inst.asset.heights, cols, rows);
+    refillImage2D(*m_device, *m_cmdPool, *inst.heightImage, hRow.data(),
+                  hRow.size() * sizeof(float), inst.uploadBuf.get());
     if (splatToo) {
-        inst.asset.splat = std::move(fresh.splat);
-        refillImage2D(*m_device, *m_cmdPool, *inst.splatImage,
-                      inst.asset.splat.data(), inst.asset.splat.size());
+        const std::vector<std::uint8_t> sRow =
+            toRowMajor(inst.asset.splat, cols, rows);
+        refillImage2D(*m_device, *m_cmdPool, *inst.splatImage, sRow.data(),
+                      sRow.size(), inst.uploadBuf.get());
     }
     if (holesToo && inst.holeImage &&
-        fresh.holes.size() ==
+        inst.asset.holes.size() ==
             static_cast<std::size_t>(inst.holeImage->width()) *
                 static_cast<std::size_t>(inst.holeImage->height())) {
-        inst.asset.holes = std::move(fresh.holes);
-        refillImage2D(*m_device, *m_cmdPool, *inst.holeImage,
-                      inst.asset.holes.data(), inst.asset.holes.size());
+        const std::vector<std::uint8_t> oRow =
+            toRowMajor(inst.asset.holes, cols, rows);
+        refillImage2D(*m_device, *m_cmdPool, *inst.holeImage, oRow.data(),
+                      oRow.size(), inst.uploadBuf.get());
+    }
+
+    // ---- 计时日志（前几次每次都打，之后每 8 次一条）----
+    // 前几次不能省：验收脚本要读 maxMs 判断"笔刷是不是实时的"，而一笔短
+    // 拖拽只产生 1~3 次刷新，按 8 取模就一条都打不出来。
+    const float ms = std::chrono::duration<float, std::milli>(
+                         std::chrono::steady_clock::now() - t0).count();
+    ++inst.refreshCount;
+    inst.refreshMaxMs = std::max(inst.refreshMaxMs, ms);
+    if (inst.refreshCount <= 6u || (inst.refreshCount & 7u) == 0u) {
+        VK_LOG_INFO("TERRAIN-REFRESH n=%u lastMs=%.2f maxMs=%.2f "
+                    "(row-major, src=%s)",
+                    inst.refreshCount, static_cast<double>(ms),
+                    static_cast<double>(inst.refreshMaxMs),
+                    live ? "memory" : "disk");
     }
     return true;
 }
@@ -536,19 +648,28 @@ bool TerrainPass::createInstanceResources(Instance& inst) {
     // ---- 高度图 / 权重图 ----
     const uint32_t w = static_cast<uint32_t>(d.cols);
     const uint32_t h = static_cast<uint32_t>(d.rows);
+    // ⚠ 三张图都要先翻成**行主序**再上传（见 toRowMajor 的说明）：
+    //   资产是列主序，"原样上传"会让整片地形绕对角线镜像 —— 物理与屏幕
+    //   各说各话，笔刷自然"刷这里、那里鼓起"。
+    const std::vector<float> heightsRow =
+        toRowMajor(inst.asset.heights, d.cols, d.rows);
+    const std::vector<std::uint8_t> splatRow =
+        toRowMajor(inst.asset.splat, d.cols, d.rows);
     inst.heightImage = upload2D(*m_device, *m_cmdPool, w, h,
-                                VK_FORMAT_R32_SFLOAT, inst.asset.heights.data(),
-                                inst.asset.heights.size() * sizeof(float));
+                                VK_FORMAT_R32_SFLOAT, heightsRow.data(),
+                                heightsRow.size() * sizeof(float));
     inst.splatImage = upload2D(*m_device, *m_cmdPool, w, h,
-                               VK_FORMAT_R8G8B8A8_UNORM, inst.asset.splat.data(),
-                               inst.asset.splat.size());
+                               VK_FORMAT_R8G8B8A8_UNORM, splatRow.data(),
+                               splatRow.size());
     // 挖洞遮罩：R8。**必须 CLAMP_TO_EDGE + 线性**，与高度图同一套采样规则 ——
     // 用 REPEAT 的话地形边界外半纹素会采到对边的遮罩，边缘出现"补回来的一圈地"。
     if (inst.asset.holes.size() ==
         static_cast<std::size_t>(w) * static_cast<std::size_t>(h)) {
+        const std::vector<std::uint8_t> holesRow =
+            toRowMajor(inst.asset.holes, d.cols, d.rows);
         inst.holeImage = upload2D(*m_device, *m_cmdPool, w, h,
-                                  VK_FORMAT_R8_UNORM, inst.asset.holes.data(),
-                                  inst.asset.holes.size());
+                                  VK_FORMAT_R8_UNORM, holesRow.data(),
+                                  holesRow.size());
     } else {
         // 兜底：全实心（1×1 的 255）。理论上走不到 —— loadTerrain 一定会
         // 填满这个长度；但少一张图会让描述符写入读到空句柄。

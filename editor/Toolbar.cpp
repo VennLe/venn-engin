@@ -93,67 +93,6 @@ void paintTransportIcon(ImDrawList* dl, ImVec2 p, float s, int glyph,
     }
 }
 
-// 编辑模式下拉里的一行：图标 + 名字 + 右侧状态。
-//
-// 排版与视口的"变换工具"下拉（ViewportPanel::vpToolRow）保持一致：单选
-// 用**圆点**而不是对勾 —— 对勾是"开关"，圆点是"我只可能是其中一个"。
-// 未实现的模式整行压暗 + 右侧标 TODO：用户点得下去（会得到一条 toast），
-// 但视觉上先说明"这一项还没有东西"。
-bool editModeRow(EditMode m, bool active) {
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float h = 28.0f;
-    const float w = 226.0f;
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-
-    ImGui::PushID(editModeId(m));
-    const bool clicked = ImGui::Selectable("##row", false,
-                                           ImGuiSelectableFlags_None,
-                                           ImVec2(w, h));
-    const bool hovered = ImGui::IsItemHovered();
-    ImGui::PopID();
-
-    const bool impl = editModeImplemented(m);
-    const float cy = p.y + h * 0.5f;
-
-    // 单选圆点
-    if (active) {
-        dl->AddCircleFilled(ImVec2(p.x + 11.0f, cy), 4.2f,
-                            ImGui::GetColorU32(ui::tokens().accent), 12);
-    } else {
-        ImVec4 dc = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-        if (!impl) dc.w *= 0.55f;
-        dl->AddCircle(ImVec2(p.x + 11.0f, cy), 4.2f,
-                      ImGui::GetColorU32(dc), 12, 1.2f);
-    }
-
-    // 图标 + 名字
-    ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text);
-    if (!impl) tc.w *= 0.45f;
-    else if (!active && !hovered) tc.w *= 0.88f;
-    const ImU32 col = ImGui::GetColorU32(tc);
-    paintEditModeIcon(dl, ImVec2(p.x + 26.0f, cy - 8.0f), 16.0f, m, col);
-    dl->AddText(ImVec2(p.x + 50.0f, cy - ImGui::GetTextLineHeight() * 0.5f),
-                col, TR(editModeName(m)));
-
-    // 右侧状态：未实现 → TODO；实现但不是当前项 → 留空
-    if (!impl) {
-        const char* tag = "TODO";
-        const ImVec2 tw = ImGui::CalcTextSize(tag);
-        ImVec4 dc = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-        dc.w *= 0.8f;
-        dl->AddText(ImVec2(p.x + w - tw.x - 10.0f, cy - tw.y * 0.5f),
-                    ImGui::GetColorU32(dc), tag);
-    }
-
-    char rectTag[64];
-    std::snprintf(rectTag, sizeof(rectTag), "TB-EDITMODE-ITEM %s",
-                  editModeId(m));
-    logRect(rectTag, p, ImVec2(p.x + w, p.y + h));
-
-    if (hovered) ImGui::SetTooltip("%s", TR(editModeHint(m)));
-    return clicked;
-}
-
 } // namespace
 
 // ---------------------------------------------------------------- 文件操作
@@ -285,156 +224,6 @@ void Toolbar::toolbarSeparator() {
         ImGui::GetColorU32(ImGuiCol_Separator, 0.55f), 1.0f);
     // 占位：竖线本身没有"宽度"，不留空隙的话下一项会贴到线上
     ImGui::Dummy(ImVec2(7.0f, 1.0f));
-}
-
-// ---------------------------------------------------------------- 顶栏 Add 菜单
-//
-// 用户给的 UE5 截图里，主工具条左侧第二个按钮就是 "+ Add"。它和视口里的
-// Shift+A 菜单**用的是同一批工厂函数**（createPrimitiveOnGround /
-// createSunlight / createDirectionalLight / createPlayer），区别只有一个：
-// 落点。视口有鼠标射线可以算交点，顶栏没有 —— 于是按环形排队摆，
-// 免得连点两次加出两个完全重叠的物体（叠在一起看起来像"没加上"）。
-glm::vec3 Toolbar::nextAddSpot() {
-    const int n = m_addCounter++;
-    constexpr int kPerRing = 8;
-    const float angle = static_cast<float>(n % kPerRing) *
-                        (3.14159265f / static_cast<float>(kPerRing) * 2.0f);
-    const float radius = 3.0f * (1.0f + static_cast<float>(n / kPerRing));
-    return glm::vec3(std::cos(angle) * radius, std::sin(angle) * radius, 0.0f);
-}
-
-void Toolbar::drawAddBarMenu() {
-    // 自动化锚点：菜单窗口本身 + 每个条目（脚本按矩形中心点，不猜行高）
-    const auto menuRect = [](const char* tag, const ImVec2& a, const ImVec2& b) {
-        logRect(tag, a, b);
-    };
-    menuRect("TB-ADD-WIN", ImGui::GetWindowPos(),
-             ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
-                    ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
-
-    const auto add = [this](const char* what,
-                            const std::function<ecs::Entity()>& create) {
-        ecs::Entity created{};
-        m_ctx.structuralEdit(std::string("Add ") + what,
-                             [&]() { created = create(); });
-        if (created.valid()) {
-            m_ctx.select(created);
-            m_ctx.notify(std::string(TR("Added ")) + what);
-            VK_LOG_INFO("TB-ADD-ENTITY what=%s", what);
-        }
-    };
-
-    ImGui::SeparatorText(TR("Add"));
-
-    // ---- Mesh ----
-    {
-        const bool open = ImGui::BeginMenu(TR("Mesh"));
-        menuRect("TB-ADD-Mesh", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-        if (open) {
-            struct Item { const char* label; PrimitiveKind kind; };
-            const Item items[] = {
-                {"Cube", PrimitiveKind::Cube},
-                {"Sphere", PrimitiveKind::Sphere},
-                {"Cylinder", PrimitiveKind::Cylinder},
-                {"Plane", PrimitiveKind::Plane},
-                {"Empty (group)", PrimitiveKind::Empty},
-            };
-            for (const Item& it : items) {
-                const bool hit = ImGui::MenuItem(TR(it.label));
-                char tag[64];
-                std::snprintf(tag, sizeof(tag), "TB-ADD-%s", it.label);
-                menuRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-                if (hit) {
-                    const glm::vec3 spot = nextAddSpot();
-                    const PrimitiveKind k = it.kind;
-                    add(it.label, [this, k, spot]() {
-                        return createPrimitiveOnGround(m_ctx.editorScene(),
-                                                       m_ctx.assets(), k, spot);
-                    });
-                }
-            }
-            ImGui::EndMenu();
-        }
-    }
-
-    // ---- Light ----
-    {
-        const bool open = ImGui::BeginMenu(TR("Light"));
-        menuRect("TB-ADD-Light", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-        if (open) {
-            if (ImGui::MenuItem(TR("Sunlight"))) {
-                add("Sunlight", [this]() {
-                    return createSunlight(m_ctx.editorScene());
-                });
-            }
-            menuRect("TB-ADD-Sunlight", ImGui::GetItemRectMin(),
-                     ImGui::GetItemRectMax());
-            if (ImGui::MenuItem(TR("Directional Light"))) {
-                const glm::vec3 spot = nextAddSpot();
-                add("Directional Light", [this, spot]() {
-                    return createDirectionalLight(m_ctx.editorScene(), spot);
-                });
-            }
-            menuRect("TB-ADD-DirectionalLight", ImGui::GetItemRectMin(),
-                     ImGui::GetItemRectMax());
-            if (ImGui::MenuItem(TR("Spot Light"))) {
-                const glm::vec3 spot = nextAddSpot();
-                add("Spot Light", [this, spot]() {
-                    return createPrimitiveOnGround(m_ctx.editorScene(),
-                                                   m_ctx.assets(),
-                                                   PrimitiveKind::SpotLight,
-                                                   spot);
-                });
-            }
-            menuRect("TB-ADD-SpotLight", ImGui::GetItemRectMin(),
-                     ImGui::GetItemRectMax());
-            if (ImGui::MenuItem(TR("Point Light"))) {
-                const glm::vec3 spot = nextAddSpot();
-                add("Point Light", [this, spot]() {
-                    return createPrimitiveOnGround(m_ctx.editorScene(),
-                                                   m_ctx.assets(),
-                                                   PrimitiveKind::PointLight,
-                                                   spot);
-                });
-            }
-            menuRect("TB-ADD-PointLight", ImGui::GetItemRectMin(),
-                     ImGui::GetItemRectMax());
-            ImGui::EndMenu();
-        }
-    }
-
-    // ---- Player ----
-    {
-        const bool open = ImGui::BeginMenu(TR("Player"));
-        menuRect("TB-ADD-Player", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-        if (open) {
-            if (ImGui::MenuItem(TR("First-Person Player"))) {
-                const glm::vec3 spot = nextAddSpot();
-                add("First-Person Player", [this, spot]() {
-                    return createPlayer(m_ctx.editorScene(), m_ctx.assets(),
-                                        ecs::PlayerMode::FirstPerson, spot);
-                });
-            }
-            menuRect("TB-ADD-FirstPerson", ImGui::GetItemRectMin(),
-                     ImGui::GetItemRectMax());
-            if (ImGui::MenuItem(TR("Third-Person Player"))) {
-                const glm::vec3 spot = nextAddSpot();
-                add("Third-Person Player", [this, spot]() {
-                    return createPlayer(m_ctx.editorScene(), m_ctx.assets(),
-                                        ecs::PlayerMode::ThirdPerson, spot);
-                });
-            }
-            menuRect("TB-ADD-ThirdPerson", ImGui::GetItemRectMin(),
-                     ImGui::GetItemRectMax());
-            ImGui::EndMenu();
-        }
-    }
-
-    ImGui::Separator();
-    ImGui::MenuItem(TR("Place at cursor: Shift+A inside the viewport"), nullptr,
-                    false, false);
-    ImGui::MenuItem(TR("Particles: open the Particles panel"), nullptr, false,
-                    false);
 }
 
 // ---------------------------------------------------------------- 菜单栏
@@ -833,125 +622,24 @@ void Toolbar::drawBar() {
     const float textY = rowY + (btnH - ImGui::GetTextLineHeight()) * 0.5f;
 
     // ============================================================
-    // 2026-10-17 第四轮：整条顶栏按用户给的 UE5 主工具条重做。
+    // 2026-10-21：顶栏**只剩播放控制**（右对齐那一组）。
     //
-    // 用户原话："至于原来的 Move（W / E / R ），View：lit，Reload Shaders，
-    // Undo，Redo，这些按钮全都不需要，都移除掉。移除掉后可以重新按照
-    // <UE 截图> 这个样子重新去做，这个图片中的选择模式是个下拉列表"。
+    // 用户原话：
+    //   「编辑器上的原本的模式类型的那个下拉框可以去掉了，因为是冗余的，
+    //     还有旁边的那个 Add 的列表可以把它的位置调整到视口上侧工具条
+    //     左侧的末尾。」
     //
-    // 删掉的五样东西**没有丢功能**，只是不再占这条最显眼的横条：
-    //   · Move/Rotate/Scale  → 视口工具条那四个图标 + W/E/R/Q（这里只剩
-    //                          "选择模式"下拉，是同一份状态的另一个入口）
-    //   · View: lit          → 视口工具条的"照明"下拉（Ctrl+Shift 那套还在）
-    //   · Reload Shaders     → Build 菜单 / Ctrl+Shift+R
-    //   · Undo / Redo        → Edit 菜单 / Ctrl+Z / Ctrl+Y
-    //   · 1 / 2V / 2H / 4    → 视口工具条，"透视"右边（用户要求并排放）
+    // 两样东西的去向：
+    //   · 编辑模式下拉 → **删掉**。左栏 ModeRail 那 9 行单选是同一个状态的
+    //     另一个入口，而且更常驻（顶栏这颗要先把下拉点开才看得到九项）。
+    //     删掉后顶栏这条横条空出来，不再和"当前模式"抢注意力。
+    //   · "+ Add" 按钮 → 搬到**视口工具条左组末尾**（ViewportPanel::
+    //     drawToolbar）。它加的物体落在视口里，放在视口上沿比顶栏更近；
+    //     菜单内容见 editor/AddMenu.cpp。
     //
-    // ⚠ 用户以为 1/2V/2H/4 是"渲染分辨率"，其实是**视口分屏布局**
-    //   （1 屏 / 左右 2 屏 / 上下 2 屏 / 4 屏）。挪过去时名字改成"布局"，
-    //   免得继续被当成分辨率。
-    //
-    // 2026-10-20：最后那句"这里只剩选择模式下拉"也不成立了 —— 这颗下拉
-    // 已经从"手柄模式"改成"编辑模式"（见下面 ① 的说明）。手柄模式的入口
-    // 现在只剩视口工具条与 Q/W/E/R。
+    // 手柄模式（Q/W/E/R）的入口一直是视口工具条那四个图标，这两块删掉
+    // 不影响它。
     // ============================================================
-
-    // ---------------------------------------------------------- ① 编辑模式
-    //
-    // 2026-10-20：按用户给的 UE5 "Selection Mode" 截图重做。
-    //
-    // 原来这颗下拉里是 Select / Move / Rotate / Scale —— 那是**手柄模式**，
-    // 与 UE 那颗同名按钮里装的东西并不是一回事：UE 列的是"整套编辑工具"
-    // （选择 / 地形 / 植被 / 网格体绘制 / 建模 / 破裂 / 笔刷编辑 / 动画 /
-    // PCG），选哪个就换一套编辑器。所以这里换成 EditMode。
-    //
-    // 手柄模式没有丢：视口工具条那四个图标 + Q/W/E/R 一个都没动，顶栏这颗
-    // 只是它的第三个入口，现在让位给编辑模式。
-    {
-        const EditMode cur = m_ctx.editMode();
-        const char* curLabel = TR(editModeName(cur));
-        const float iconS = 16.0f;
-        const float caretW = 13.0f;
-        const float w = btnW(curLabel) + iconS + 6.0f + caretW;
-
-        const bool hit = ImGui::Button("##editmode_btn", ImVec2(w, btnH));
-        const ImVec2 a = ImGui::GetItemRectMin();
-        const ImVec2 b = ImGui::GetItemRectMax();
-
-        // 按钮内容全部自绘：ImGui::Button 的标签是**居中**的，没法"左图标
-        // 右文字"，而空标签按钮又只画框 —— 所以图标、文字、小三角都在
-        // 同一个 DrawList 上补（与播放条 transportBtn 同一条经验）。
-        ImDrawList* bdl = ImGui::GetWindowDrawList();
-        const ImU32 fg = ImGui::GetColorU32(ImGuiCol_Text);
-        const float cy = (a.y + b.y) * 0.5f;
-        const float ix = a.x + st.FramePadding.x + 2.0f;
-        paintEditModeIcon(bdl, ImVec2(ix, cy - iconS * 0.5f), iconS, cur, fg);
-        bdl->AddText(ImVec2(ix + iconS + 6.0f,
-                            cy - ImGui::GetTextLineHeight() * 0.5f),
-                     fg, curLabel);
-        {
-            const float cx = b.x - st.FramePadding.x - 6.0f;
-            bdl->AddTriangleFilled(ImVec2(cx - 4.0f, cy - 2.0f),
-                                   ImVec2(cx + 4.0f, cy - 2.0f),
-                                   ImVec2(cx, cy + 3.0f),
-                                   ImGui::GetColorU32(ImGuiCol_TextDisabled));
-        }
-
-        if (hit) ImGui::OpenPopup("##editmode_popup");
-        logRect("TB-EDITMODE", a, b);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s\n%s", curLabel, TR(editModeHint(cur)));
-        }
-        if (ImGui::BeginPopup("##editmode_popup")) {
-            logRect("TB-EDITMODE-WIN", ImGui::GetWindowPos(),
-                    ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
-                           ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
-            // 行自己管高度（每行 28 px），所以这里把 ItemSpacing 清零 ——
-            // 否则行与行之间会出现一道道竖向空隙，看起来像分组。
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
-            for (int i = 0; i < kEditModeCount; ++i) {
-                const EditMode m = static_cast<EditMode>(i);
-                if (!editModeRow(m, cur == m)) continue;
-                if (editModeImplemented(m)) {
-                    m_ctx.setEditMode(m);
-                    VK_LOG_INFO("TB-EDITMODE item=%s", editModeId(m));
-                } else {
-                    // 未实现的模式**不假装切过去**：顶栏显示当前模式、面板
-                    // 跟着开，这是整套 UI 的契约，让一个"切过去了但什么都
-                    // 没有"的模式上屏等于破坏它。给一条明确的提示。
-                    m_ctx.notify(std::string(TR("Not implemented yet: ")) +
-                                 TR(editModeName(m)));
-                    VK_LOG_INFO("TB-EDITMODE todo=%s", editModeId(m));
-                }
-                ImGui::CloseCurrentPopup();
-                break;
-            }
-            ImGui::PopStyleVar();
-            ImGui::EndPopup();
-        }
-    }
-
-
-    // ---------------------------------------------------------- ② 添加
-    ImGui::SameLine();
-    toolbarSeparator();
-    ImGui::SameLine();
-    {
-        char label[96];
-        std::snprintf(label, sizeof(label), "+  %s", TR("Add"));
-        if (ImGui::Button(label, ImVec2(btnW(label), btnH))) {
-            ImGui::OpenPopup("##tb_add_popup");
-        }
-        logRect("TB-ADD", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(TR("Add an object to the scene (also: Shift+A in the\n"
-                              "viewport, which drops it where the mouse points)."));
-        }
-        if (ImGui::BeginPopup("##tb_add_popup")) {
-            drawAddBarMenu();
-            ImGui::EndPopup();
-        }
-    }
 
     // ---------------------------------------------------------- ③ 播放控制（右对齐）
     //

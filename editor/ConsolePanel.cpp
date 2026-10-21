@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include "PanelDock.h"
 
 namespace editor {
 
@@ -172,7 +173,11 @@ void ConsolePanel::draw(bool* open) {
     // 440×169 的小窗凭空出现在左上角、正好压在 Hierarchy 标题栏上。用户
     // 报的"点 Output Log 没打开面板"就是这个：窗其实开了，只是那副样子
     // 怎么看都不像"输出日志开着"。给一个像样的默认位置和尺寸。
-    {
+    // 2026-10-21：视口标签页的一页。托管时矩形由 EditorApp 给，浮动默认
+    // 位置/尺寸一律跳过（FirstUseEver 会被 Always 顶掉，没必要设）。
+    ImGuiWindowFlags wf = 0;
+    const bool docked = applyDockHint(wf);
+    if (!docked) {
         const ImGuiIO& io = ImGui::GetIO();
         const float w = std::min(860.0f, io.DisplaySize.x * 0.62f);
         const float h = std::min(330.0f, io.DisplaySize.y * 0.40f);
@@ -182,7 +187,8 @@ void ConsolePanel::draw(bool* open) {
                                        io.DisplaySize.y - 48.0f),
                                 ImGuiCond_FirstUseEver, ImVec2(0.5f, 1.0f));
     }
-    if (!ImGui::Begin(trId("Console", "panel_console"), open)) {
+    if (!ImGui::Begin(trId("Console", "panel_console"),
+                      docked ? nullptr : open, wf)) {
         ImGui::End();
         return;
     }

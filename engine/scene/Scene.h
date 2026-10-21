@@ -143,6 +143,21 @@ public:
         });
     }
 
+    // 所有**启用**的水体（2026-10-21，见 ecs::WaterComponent）。
+    // 与地形同一条约定：没有网格组件 —— 几何由渲染层按形状现生成，
+    // 场景侧只提供"一块水体长什么样"。
+    template <typename Fn>
+    void forEachWater(Fn&& fn) {
+        m_world.each<ecs::WaterComponent>([&](ecs::Entity e,
+                                              ecs::WaterComponent& wc) {
+            // 与地形一样两处都认：组件自己的 visible + 实体级的眼睛图标。
+            const auto* vis = m_world.get<ecs::VisibilityComponent>(e);
+            if (vis && !vis->visible) return;
+            if (!wc.visible) return;
+            fn(e, wc);
+        });
+    }
+
     // 所有**启用**的粒子发射器（R6-1，见 ecs::ParticleEmitterComponent）。
     // 与贴花 / 探针同一条约定：粒子也没有网格 —— 几何是顶点着色器现拼的
     // billboard，场景侧只提供世界矩阵（位置 + 朝向）与发射参数。

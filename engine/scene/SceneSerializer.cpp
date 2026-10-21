@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <fstream>
@@ -836,12 +837,78 @@ void applyCamera(Camera& cam, const json& jc) {
     //   如果先设 target，后面三个 setter 一同步 target 就被旧位置盖掉 ——
     //   表现为"场景 JSON 里的相机没生效，画面看向莫名其妙的地方"。
     //   target 必须**最后**设（把相机精确钉到 target + dir*distance）。
-    cam.setYaw(jc.value("yaw", cam.yaw()));
-    cam.setPitch(jc.value("pitch", cam.pitch()));
+
+    float yaw = jc.value("yaw", cam.yaw());
+    float pitch = jc.value("pitch", cam.pitch());
+
+    // ------------------------------------------------------------
+    // 单位嗅探：pitch 写成"度"的历史存档（2026-10-21 修）
+    // ------------------------------------------------------------
+    // 本文件的写入方 cameraToJson 存的是**弧度**，Camera::pitch 的合法区间
+    // 也只有 ±89°（kPitchLimit ≈ 1.5533 rad）—— 于是"|pitch| 超出这个区间"
+    // 就只可能有一个原因：它是按度写的。
+    //
+    // 真实事故（用户原话："选择创建第三人称视角的游戏创建后，进去的初始化
+    // 游戏画面视口为什么是一个视角朝上的（朝向 Z 正方向的），并且是处于地面
+    // 栅格平面之下的一个位置"）：模板写的是 `"pitch": -18.0`（度），这里
+    // 当成 -18 **弧度** 读，setPitch 一夹就成了 -89° —— 相机沉到地面以下、
+    // 几乎垂直向上看。yaw 一起换算，否则画面对不上。
+    //
+    // 也接受显式的 `"angleUnit": "deg"`：新场景用不着（gen_templates 已经
+    // 改成写弧度），但手写 JSON 的人可以不用赌这条启发式。
+    const bool explicitDeg =
+        jc.contains("angleUnit") && jc["angleUnit"].is_string() &&
+        jc["angleUnit"].get<std::string>() == "deg";
+    const bool outOfRange = std::fabs(pitch) > Camera::kPitchLimit * 1.001f;
+    if (explicitDeg || outOfRange) {
+        const float yawDeg = yaw, pitchDeg = pitch;
+        yaw = glm::radians(yaw);
+        pitch = glm::radians(pitch);
+        VK_LOG_WARN("SCENE-CAMERA-UNIT 角度按度读入（yaw=%.2f pitch=%.2f deg）"
+                    " → rad (%.3f, %.3f)",
+                    static_cast<double>(yawDeg), static_cast<double>(pitchDeg),
+                    static_cast<double>(yaw), static_cast<double>(pitch));
+    }
+
+    cam.setYaw(yaw);
+    cam.setPitch(pitch);
     cam.setDistance(jc.value("distance", cam.distance()));
     cam.setTarget(vec3FromJson(
         jc.contains("target") ? jc["target"] : json(nullptr), cam.target()));
     cam.setFov(jc.value("fov", cam.fov()));
+
+    // 一行可断言的落位（脚本用它验证"相机在地面之上、俯视而不是仰视"）
+    const glm::vec3 eye = cam.position();
+    VK_LOG_INFO("SCENE-CAMERA eye=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f) "
+                "yaw=%.2f pitch=%.2f dist=%.2f",
+                static_cast<double>(eye.x), static_cast<double>(eye.y),
+                static_cast<double>(eye.z),
+                static_cast<double>(cam.target().x),
+                static_cast<double>(cam.target().y),
+                static_cast<double>(cam.target().z),
+                static_cast<double>(cam.yaw()),
+                static_cast<double>(cam.pitch()),
+                static_cast<double>(cam.distance()));
+
+    // ------------------------------------------------------------
+    // 自证：相机不该在栅格面之下
+    // ------------------------------------------------------------
+    // 2026-10-21（用户原话："为什么你创建的 3d 视角总是在栅格面底下朝上仰视
+    // 看的，就很怪"）：`pitch` 的符号是**正 = 相机在目标上方**，存档里写成
+    // 负数就等于把相机摆到地面以下往上看。这类错误渲染完全正常（没有任何
+    // VUID），只能靠"看着怪"发现 —— 所以在这里留一条可抓的告警：
+    //   · pitch < 0                → 相机在目标下方（仰视）
+    //   · eye.z <= 0               → 相机真的沉到栅格面以下了
+    // 注意判据是 z<=0 而不是 z<0：贴地（z 恰好 0）时画面同样是从地面往里看，
+    // 一样是坏的初始视角。
+    if (cam.pitch() < 0.0f || eye.z <= 0.0f) {
+        VK_LOG_WARN("SCENE-CAMERA-LOW eye.z=%.2f pitch=%.2f (%s) —— 相机在"
+                    "栅格面之下/仰视，检查场景 camera.pitch 的符号与单位"
+                    "（正 = 在上方俯视；用弧度写，度会触发单位嗅探）",
+                    static_cast<double>(eye.z),
+                    static_cast<double>(cam.pitch()),
+                    cam.pitch() < 0.0f ? "仰视" : "贴地");
+    }
 }
 
 // ============================================================
@@ -1125,6 +1192,92 @@ ecs::TerrainComponent terrainFromJson(const json& j) {
         }
     }
     return t;
+}
+
+// ------------------------------------------------------------
+// 水体（2026-10-21）
+//
+// 与地形相反：水体**没有资产**，全部参数都是场景数据，所以整份落盘。
+// 只有 20 来个标量 + 两个颜色，比"资产路径 + 反序列化"还短。
+// ------------------------------------------------------------
+json waterToJson(const ecs::WaterComponent& w) {
+    const water::WaterBody& b = w.body;
+    json j;
+    j["visible"] = w.visible;
+    j["shape"] = static_cast<int>(b.shape);
+    j["center"] = json::array({b.center.x, b.center.y});
+    j["halfExtent"] = json::array({b.halfExtent.x, b.halfExtent.y});
+    j["rotation"] = b.rotation;
+    j["level"] = b.level;
+    // 与地面的关系（第六轮）：池底高度 + 水位是否自动贴合。
+    // 不存这两个字段的话，重新载入后侧壁会退化成"以水面为基准的薄片"，
+    // 水体立刻又开始悬空。
+    j["bedLevel"] = b.bedLevel;
+    j["autoFit"] = b.autoFit;
+    j["kind"] = static_cast<int>(b.kind);
+    j["shallowColor"] = vec3ToJson(b.shallowColor);
+    j["deepColor"] = vec3ToJson(b.deepColor);
+    j["opacity"] = b.opacity;
+    j["refraction"] = b.refraction;
+    j["ior"] = b.ior;
+    j["clarity"] = b.clarity;
+    j["flowSpeed"] = b.flowSpeed;
+    j["flowDir"] = json::array({b.flowDir.x, b.flowDir.y});
+    j["waveHeight"] = b.waveHeight;
+    j["waveLength"] = b.waveLength;
+    j["ripple"] = b.ripple;
+    j["foam"] = b.foam;
+    j["roughness"] = b.roughness;
+    return j;
+}
+
+ecs::WaterComponent waterFromJson(const json& j) {
+    ecs::WaterComponent w;
+    water::WaterBody& b = w.body;
+    // 先按 kind 铺一遍预设，再逐字段覆盖 —— 老场景缺字段时拿到的是
+    // 该水质的合理默认值，而不是"零值水体"（透明、无波、无色）。
+    b.kind = water::kindFromIndex(j.value("kind", 1));
+    water::applyPreset(b, b.kind);
+
+    w.visible = j.value("visible", true);
+    b.shape = static_cast<water::Shape>(
+        std::clamp(j.value("shape", 0), 0, 1));
+    if (j.contains("center") && j["center"].is_array() &&
+        j["center"].size() >= 2) {
+        b.center = glm::vec2(j["center"][0].get<float>(),
+                             j["center"][1].get<float>());
+    }
+    if (j.contains("halfExtent") && j["halfExtent"].is_array() &&
+        j["halfExtent"].size() >= 2) {
+        b.halfExtent = glm::vec2(j["halfExtent"][0].get<float>(),
+                                 j["halfExtent"][1].get<float>());
+    }
+    if (j.contains("flowDir") && j["flowDir"].is_array() &&
+        j["flowDir"].size() >= 2) {
+        b.flowDir = glm::vec2(j["flowDir"][0].get<float>(),
+                              j["flowDir"][1].get<float>());
+    }
+    b.rotation = j.value("rotation", b.rotation);
+    b.level = j.value("level", b.level);
+    // 老场景没有这两个字段：bedLevel 退化成"水面下方 0.2 m"（侧壁很薄，
+    // 但仍然是贴地的），autoFit 默认 true，下次改尺寸就会重新对齐地形。
+    b.bedLevel = j.value("bedLevel", b.level - 0.2f);
+    b.autoFit = j.value("autoFit", true);
+    if (j.contains("shallowColor"))
+        b.shallowColor = vec3FromJson(j["shallowColor"], b.shallowColor);
+    if (j.contains("deepColor"))
+        b.deepColor = vec3FromJson(j["deepColor"], b.deepColor);
+    b.opacity = j.value("opacity", b.opacity);
+    b.refraction = j.value("refraction", b.refraction);
+    b.ior = j.value("ior", b.ior);
+    b.clarity = j.value("clarity", b.clarity);
+    b.flowSpeed = j.value("flowSpeed", b.flowSpeed);
+    b.waveHeight = j.value("waveHeight", b.waveHeight);
+    b.waveLength = j.value("waveLength", b.waveLength);
+    b.ripple = j.value("ripple", b.ripple);
+    b.foam = j.value("foam", b.foam);
+    b.roughness = j.value("roughness", b.roughness);
+    return w;
 }
 
 json reflectionProbeToJson(const ecs::ReflectionProbeComponent& p) {
@@ -2000,6 +2153,10 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         if (const auto* tc = w.get<ecs::TerrainComponent>(it.entity))
             je["terrain"] = terrainToJson(*tc);
 
+        // 水体（2026-10-21）：全部参数都是场景数据，整份落盘
+        if (const auto* wc = w.get<ecs::WaterComponent>(it.entity))
+            je["water"] = waterToJson(*wc);
+
         // 反射探针（R5-1）。与贴花同理：探针**没有网格**，
         // 下面那句 "mesh 为空 → skipped++" 对它也不适用。
         if (const auto* rp = w.get<ecs::ReflectionProbeComponent>(it.entity))
@@ -2121,8 +2278,8 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         // 都是"没有网格但有意义"的实体（隐形的墙、触发区域、相机机位、
         // 模型根节点）。
         const bool hasNonMeshContent =
-            je.contains("terrain") || je.contains("decal") ||
-            je.contains("probe") ||
+            je.contains("terrain") || je.contains("water") ||
+            je.contains("decal") || je.contains("probe") ||
             je.contains("particleEmitter") || je.contains("rigidbody") ||
             je.contains("character") || je.contains("trigger") ||
             je.contains("physicsMaterial") || je.contains("camera") ||
@@ -2481,6 +2638,16 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 w.add<ecs::TerrainComponent>(e, tc);
         }
 
+        // 水体（2026-10-21）。没有资产：读盘就把整块参数塞回组件，
+        // GPU 资源由渲染器在 syncWaters 里按形状现建。
+        if (je.contains("water") && je["water"].is_object()) {
+            const ecs::WaterComponent wc = waterFromJson(je["water"]);
+            if (auto* p = w.get<ecs::WaterComponent>(e))
+                *p = wc;
+            else
+                w.add<ecs::WaterComponent>(e, wc);
+        }
+
         // 反射探针（R5-1）。与贴花同一形态：实体只提供变换 + 参数，
         // 立方体贴图由渲染器烘（不落盘）。
         if (je.contains("probe") && je["probe"].is_object()) {
@@ -2550,8 +2717,8 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
         }
 
         const bool hasNonMeshContent =
-            je.contains("terrain") || je.contains("decal") ||
-            je.contains("probe") ||
+            je.contains("terrain") || je.contains("water") ||
+            je.contains("decal") || je.contains("probe") ||
             je.contains("particleEmitter") || je.contains("rigidbody") ||
             je.contains("character") || je.contains("trigger") ||
             je.contains("physicsMaterial") || je.contains("camera") ||

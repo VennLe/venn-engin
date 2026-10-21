@@ -117,7 +117,7 @@ public:
 private:
     // 工具：前 5 个是"改高度"的算子，PaintLayer 走权重图，Erode/Noise
     // 是这一轮补的"让地形有地貌感"的两把刷子（见 .cpp 里的说明），
-    // Hole 走**挖洞遮罩**（不碰高度，见 applyHoleStroke）。
+    // Carve 用**形状体**削出凹腔（见 applyCarveStroke）。
     enum class Tool : int {
         Raise = 0,   // Shift = 降低
         Smooth,
@@ -125,10 +125,22 @@ private:
         Noise,
         Erode,
         PaintLayer,
-        Hole,        // 挖穿 / Shift = 补回（对应 UE 的 Visibility 层）
+        Carve,       // 形状体压出凹腔 / Shift = 反向隆起（2026-10-21）
         Ramp,        // 坡道：从按下点的高度线性过渡到抬起点的高度
     };
     static constexpr int kToolCount = 8;
+
+    // 挖洞用哪种形状体。这三个都能用高度图表达（下表面 = 一个函数），
+    // 不需要体素/CSG —— 也就不会破坏地面拓扑。
+    //
+    // 真正的"内部洞穴"（有顶、有悬垂）在高度图上**做不到**：每个 (x,y)
+    // 只能存一个高度。所以这里给的是"以物体轮廓压出来的凹腔 / 通道"，
+    // 拖动即扫掠成隧道。要带拱顶的洞，得换体素或 SDF —— 那是另一条路线。
+    enum class CarveShape : int {
+        Sphere = 0,   // 球底剖面：压出来是碗状凹坑
+        Box,          // 平底 + 直壁：方形基坑
+        Cylinder,     // 平底 + 直壁 + 圆轮廓：竖井
+    };
 
     // 一笔的撤销记录（脏矩形 + 改动前的像素）
     struct StrokeRecord {
@@ -164,9 +176,10 @@ private:
     void applyNoiseStroke(const glm::vec3& localHit, float dt);
     // 热侵蚀：超过休止角的物质往低处搬
     void applyErodeStroke(const glm::vec3& localHit, float dt);
-    // 挖洞：改的是**遮罩**不是高度（片元着色器按遮罩 discard）
-    void applyHoleStroke(const glm::vec3& localHit, float dt, bool invert);
-    // 坡道：按下点记高度，抬起点记高度，笔刷范围内线性插值
+    // 形状雕刻：把一个形状体（球/方块/圆柱）沉到地表以下，按它的**下表面**
+    // 削地形。只改高度图 —— 不开洞、不断拓扑。Shift = 按上表面反向隆起。
+    //   carve：压出凹腔 / 基坑 / 竖井，拖动即扫掠成通道
+    void applyCarveStroke(const glm::vec3& localHit, float dt, bool invert);    // 坡道：按下点记高度，抬起点记高度，笔刷范围内线性插值
     void applyRampStroke(const glm::vec3& localHit, float dt);
     // 整块地形操作（全图平滑 / 全图噪声 / 重置），参数来自面板
     void wholeSmooth();
@@ -175,6 +188,24 @@ private:
 
     // 把内存里的高度/权重写回资产目录，并把 TerrainComponent 标脏
     void saveAssets(bool splatToo, bool holesToo = false);
+
+    // 2026-10-21：**只让画面变、不落盘**。
+    //
+    // 原来拖笔刷的路径每 80 ms 调一次 saveAssets，一次写 1 MB（257×257
+    // float = 264 KB，加上 splat 就是 1 MB 量级），写完渲染层还要回磁盘
+    // 再读一遍（见 TerrainPass::refreshSurface 的 src=disk 退路）。磁盘
+    // 往返 + 2 次 2 MB 拷贝全部算在一帧里 → 笔刷越拖越卡，抬笔才追上。
+    //
+    // 现在拆成两件事：
+    //   publishToRenderer → 挂 live 指针 + 置脏位，渲染层直接吃内存里的
+    //                       vector，零 I/O，下一帧就出画面；
+    //   saveAssets        → publishToRenderer + 真的写文件。
+    // 拖拽期间只走前者，抬笔（LS-STROKE-END）才走后者。
+    void publishToRenderer(bool splatToo, bool holesToo = false);
+
+    // 解绑/换资产时清掉挂在组件上的 live 指针 —— 它们指向 m_asset 里的
+    // vector，一旦 m_asset 被整体替换，旧地址就是悬垂指针。
+    void clearLiveBinding();
 
     // ---- 笔划快照 ----
     void beginSnapshot(int parts);   // 位掩码：1=高度 2=权重 4=挖洞
@@ -208,6 +239,21 @@ private:
     static constexpr float kMaxStrength = 16.0f;
     float m_falloff = 0.6f;          // 0 = 硬边，1 = 很软
     float m_maxDelta = 0.0f;         // 一笔之内最大位移（米），0 = 不限
+
+    // ---- 形状雕刻（Tool::Carve）----
+    // 形状体的尺寸**复用 m_radius**（世界米，滑条/滚轮同一套手感），
+    // 这里只多两个参数：用哪种形状、沉下去多深。
+    CarveShape m_carveShape = CarveShape::Sphere;
+    // 下沉深度，按**半径的倍数**算：0.35 = 球体埋进去三成。
+    // 用半径而不是 maxHeight 的比例，是为了缩放笔刷尺寸时深度自动跟着变。
+    float m_carveDepth = 0.35f;      // 0.0 .. 1.2
+    // 形状体中心的绝对高度（世界米），**落笔那一刻锚定**，整笔不再变。
+    //
+    // ⚠ 不能每帧按"当前地表"重算：那样每帧都会把地表往上/往下推一截，
+    //   形成自激循环 —— 实测按住 Shift 不放，一小片地形会被顶到 kMaxNorm
+    //   的收敛极限（480 m），普通下压则会一路钻到 0。锚定之后，"拖着物体
+    //   在地里走"的行为才是稳定的：深度由 m_carveDepth 决定，位置由手决定。
+    float m_carveCenterM = 0.0f;
     int m_layer = 0;                 // 0..3
     bool m_eraseLayer = false;
     float m_flattenHeight = 0.0f;    // 按下那一刻的世界高度（米）

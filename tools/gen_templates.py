@@ -70,7 +70,10 @@ TYPES = {
         },
         # 场景相机：第一人称由 PlayerController 每帧摆到眼位，
         # 这里的值只是"编辑器里第一次打开时"的观感。
-        "camera": {"distance": 8.0, "pitch": -12.0, "targetOffset": [0.0, 0.0, 1.0]},
+        # ⚠ 单位是**弧度**、pitch 是**相机在目标上方**的俯角（正 = 相机在上）。
+        #   2026-10-21 之前这里写的是度（-12.0 / -18.0），SceneSerializer 当
+        #   弧度读 → setPitch 夹到 -89° → 新工程一打开相机沉在地面以下朝天看。
+        "camera": {"distance": 8.0, "pitch": 0.20, "targetOffset": [0.0, 0.0, 1.0]},
         "body_visible": True,        # 占位胶囊（第一人称的实体本身还是要有）
         "script": "first_person",
     },
@@ -91,7 +94,9 @@ TYPES = {
             "camDistance": 4.5,
             "turnSpeed": 12.0,       # 角色朝移动方向平滑转身
         },
-        "camera": {"distance": 4.5, "pitch": -18.0, "targetOffset": [0.0, 0.0, 1.2]},
+        # 弧度、正数 = 相机在上方 → 越过角色的后肩往下看（第三人称该有的样子）。
+        # 0.35 rad ≈ 20°，4.5m 距离下相机离地 ~2.7m，稳稳在地面栅格之上。
+        "camera": {"distance": 4.5, "pitch": 0.35, "targetOffset": [0.0, 0.0, 1.2]},
         "body_visible": True,
         "script": "third_person",
     },
@@ -298,9 +303,20 @@ def build_scene(kind, spec):
         "version": 1,
         "generator": "gen_templates.py (%s) —— 起始场景，材质全部程序化，零外部路径"
                      % kind,
+        # ------------------------------------------------------------
+        # 场景相机（编辑器第一次打开这个场景时的取景）
+        # ------------------------------------------------------------
+        # ⚠⚠ 三个单位陷阱，2026-10-21 一次性踩全了（用户报的就是这个）：
+        #   1) **yaw / pitch 是弧度**，不是度（SceneSerializer 的 cameraToJson
+        #      存的就是弧度，Camera::setPitch 的合法区间也只有 ±1.5533）；
+        #   2) **pitch 与"视线仰角"反号**：Camera 的 pitch = 相机在目标
+        #      **上方**的角度。写负数 = 相机沉到目标下面朝天看 ——
+        #      "新工程一进去视角朝上、还在地面以下"就是这么来的；
+        #   3) yaw = π 才是"站在角色背后"：yaw=0 时相机在 +X 侧看向 -X，
+        #      而角色默认朝 +X —— 那是**正对着脸**拍。
         "camera": {
-            "target": [0.0, 0.0, 1.0],
-            "yaw": 0.0,
+            "target": list(cam["targetOffset"]),
+            "yaw": math.pi,
             "pitch": cam["pitch"],
             "distance": cam["distance"],
             "fov": 55.0,

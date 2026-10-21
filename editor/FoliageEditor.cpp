@@ -2,6 +2,7 @@
 
 #include "DebugRects.h"
 #include "Localization.h"
+#include "ModeRail.h"
 #include "PickingSystem.h"
 
 #include "assets/AssetManager.h"
@@ -553,15 +554,21 @@ void FoliageEditor::drawPanel() {
 
     sync();
 
-    const ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowSizeConstraints(ImVec2(380.0f, 360.0f),
-                                        ImVec2(FLT_MAX, FLT_MAX));
-    ImGui::SetNextWindowSize(ImVec2(420.0f, 680.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.32f,
-                                   io.DisplaySize.y * 0.10f),
-                            ImGuiCond_FirstUseEver);
+    // 2026-10-21：与地形同一个接法 —— 左栏下半是"当前模式的参数区"。
+    ImGuiWindowFlags wf = 0;
+    const bool railed = beginModeRailPanel(m_ctx, wf);
+    if (!railed) {
+        const ImGuiIO& io = ImGui::GetIO();
+        ImGui::SetNextWindowSizeConstraints(ImVec2(380.0f, 360.0f),
+                                            ImVec2(FLT_MAX, FLT_MAX));
+        ImGui::SetNextWindowSize(ImVec2(420.0f, 680.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.32f,
+                                       io.DisplaySize.y * 0.10f),
+                                ImGuiCond_FirstUseEver);
+    }
     // ID 必须是 `###panel_<面板表 id>`，理由见 LandscapeEditor::drawPanel
-    if (!ImGui::Begin(TR("Foliage###panel_foliage"), &open)) {
+    if (!ImGui::Begin(TR("Foliage###panel_foliage"),
+                      railed ? nullptr : &open, wf)) {
         ImGui::End();
         return;
     }

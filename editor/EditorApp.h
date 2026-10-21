@@ -91,6 +91,7 @@ class FractureEditor;
 class BrushEditor;
 class AnimationEditor;
 class PCGEditor;
+class WaterEditor;            // 2026-10-21：水体编辑模式
 class ParamEditCommand;
 
 // EditorApp 同时实现 EditorHost —— 菜单里那些"要动引擎"的动作
@@ -181,6 +182,7 @@ private:
     static void panelDrawBrushEdit(EditorApp& a);
     static void panelDrawAnimation(EditorApp& a);
     static void panelDrawPCG(EditorApp& a);
+    static void panelDrawWater(EditorApp& a);
 
     // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
     void drawPanels();
@@ -426,6 +428,12 @@ private:
     };
     HudMirror m_hudMirror;
     std::unique_ptr<SplitLayout> m_split;
+    // 2026-10-21：视口顶部那条标签条（浏览器式标签页，见 ViewportTabs.h）。
+    // 矩形由 computeLayout 在最后一步从 L.viewport 顶部切出来 —— 于是
+    // L.viewport 本身就是"标签条以下的 3D 画面区"，ViewportPanel 一行都不用改。
+    // 单独存一份是给 collectSplitOccluders 用的：标签条是独立窗口，
+    // 不记进"布局面板"名单就会被当成浮层，把左边的分隔条裁掉一截。
+    Rect m_tabBarRect;
     std::unique_ptr<CharacterWindow> m_characterWindow;
     // 2026-10-17 晚：底栏"+"托盘里的两张功能面板（Physics / Particles）
     std::unique_ptr<PhysicsPanel> m_physicsPanel;
@@ -445,6 +453,9 @@ private:
     std::unique_ptr<BrushEditor> m_brushEdit;
     std::unique_ptr<AnimationEditor> m_animation;
     std::unique_ptr<PCGEditor> m_pcg;
+    // 2026-10-21：水体编辑模式（拖出水体 + 水质参数面板）。
+    // 与地形/植被同一套管理：显隐跟 EditMode 走，视口输入按模式转发。
+    std::unique_ptr<WaterEditor> m_water;
     std::unique_ptr<ConsolePanel> m_console;
     // E16：MYVK_EDITOR_CONSOLE_CMD 注入命令只执行一次的哨兵。
     bool m_consoleCmdDone = false;
