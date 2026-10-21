@@ -177,6 +177,60 @@ templates/
 - 启动器创建工程 = **复制一个模板目录 + 替换白名单里的占位符**。
 - 加一种游戏类型（俯视角 / 横版 / 载具）= **加一个目录**，不改一行 C++。
   与"加面板 = 表里加一行"是同一条哲学。
+
+#### 2026-10-21 第八轮：模板场景改成"空场景 + 地形 + 出生点"
+
+用户要求："创建成功后初始化的场景不摆放任何物体，但地面要初始化一个完整的
+地形，颜色土黄色；场景中心放一个 GameStart 标记玩家出生位置。"
+
+- **场景内容**：`entities` 从 `[Ground, Player, 5×Pickup, Portal]` 变成
+  `[Terrain, GameStart]`；
+  · 地面从 20 m 平面换成 **257×257 真地形**（`metersPerPixel=2` → 514 m），
+    缓起伏 + 出生点周围 14 m 压平，4 层全指向 `materials/template_ground`
+    （baseColor `0.52,0.41,0.21` = 土黄）；
+  · 模板**自带**地形资产与材质（新工程的资产根是自己的 `assets/`，
+    看不到引擎目录 —— 这是 P3 那条"模板不许隐式依赖"的直接后果）。
+- **`GameStartComponent`**（仿 UE5 PlayerStart）：只有 `yaw` + `enabled`，
+  位置走实体 transform；视口里由**编辑器叠加层**画一个 Q 版小人
+  （大头 + 小身子 + 眼睛 + 笑脸 + 脚下朝向箭头），**不进场景实体**，
+  游戏画面里也不出现 —— 与 UE 里 PlayerStart 只在编辑器可见同一约定。
+- **运行时**：`RuntimeApp::spawnPlayerFromGameStart` 在场景里**没有**可用
+  `CharacterControllerComponent` 时，按 GameStart 生成玩家（Transform +
+  CharacterController + 占位胶囊 + 材质）。老场景自带 Player 时该函数
+  直接返回，行为完全不变。
+- **代价**：模板不再自带"收 5 球通关"的可玩 demo。`main.vks` 仍挂在
+  GameStart 上（它管世界流程，不依赖道具），`pickup.vks` / `portal.vks`
+  作为示例保留但不再被引用。
+- **验收**：`tools/verify_template_scene.py`（已进回归 DEFAULT）：
+  2 个实体 / 无网格物体 / 地形 257² / 二进制尺寸 / 土黄材质 / 标记在视口内 /
+  运行时 `GAME-PLAYER spawned at GameStart found=1` 且位置 = GameStart。
+  `verify_template_play.py` 的 P1 从"3 个脚本"改为"1 个脚本"（其余断言不变）。
+
+#### 2026-10-21 第九轮：地面贴图 + GameStart 的编辑器交互
+
+- **"地面模糊重影"不是后处理问题**：TAA 开/关、阴影开/关**逐像素相同**，
+  栅格开关只差 0.05%。真因是地形材质**一张贴图都没有** —— 几百像素的纯色
+  渐变 + 8bit 量化，眼睛读成"糊 + 重影"。
+  · `gen_templates.py` 用纯 Python（zlib/struct，不依赖 PIL）程序化生成
+    **无缝** albedo + normal（256²），挂到 `materials/template_ground`；
+  · 地面高频能量 0.81 → 3.11（3.8×）；
+  · ⚠ 顺带修了 `TerrainPass::loadLayerJson` 的真 bug：它把材质里的相对路径
+    **直接**交给 `Texture::fromFile`（相对进程 cwd），没走
+    `assets::resolveAssetPath` → 地形层一带贴图就 `can't fopen` → throw →
+    编辑器 Fatal。引擎自带地形都没贴图，这条从没被走到。另加 try/catch
+    降级（贴图丢了变纯色，不再拖垮编辑器）。
+- **GameStart 在编辑器里可点选 / 可落地 / 可双击聚焦**：
+  · `PickingSystem::pick` 增加竖直胶囊求交（r=0.45 / 高 1.75）——它没有网格、
+    不在 BVH 里，不补就点不中，于是既没有手柄、数字键 0 也被
+    `selectionFromViewport()` 挡掉；
+  · `dropSelectionToGround` 对 GameStart 用合成 AABB，且**地面高度改用地形**
+    （没地形时仍是 z=0，老场景行为不变）；
+  · Hierarchy 双击从"就地重命名"改成"选中 + 相机聚焦"（重命名保留在 F2 /
+    右键菜单），实现在新文件 `editor/EditorFocus.h::focusCameraOnEntity`，
+    F 键 / 右键菜单共用同一份。
+- **验收**：`tools/verify_gamestart_edit.py`（进 DEFAULT + TRIGGERS）：
+  点标记 → `GZ-ORIGIN` 落在标记上；`VK_NUMPAD0` → `dz=-2.0000` 落到地面；
+  双击 → `FOCUS-ENTITY` + 标记矩形随相机变化。
 - ⚠ 模板**不允许**引用 `build/bin/assets` 里的模型/材质（P3 的隐式依赖）——
   自检会扫模板里所有 `"path"` 字段，出现在工程外的就 FAIL。
 

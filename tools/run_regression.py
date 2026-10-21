@@ -72,6 +72,8 @@ DEFAULT = [
     "verify_frustum_cull", "verify_bvh", "verify_lod", "verify_ibl",
     "verify_csm", "verify_local_shadow", "verify_shadow_hardening",
     "verify_volumetric_fog", "verify_light_modifiers",
+    "verify_water", "verify_water_motion",
+    "verify_template_scene", "verify_gamestart_edit",
     "verify_shader_variants",
     "verify_shader_hotreload", "verify_fxaa", "verify_instancing",
     # R4-1：AlphaMode::Mask（alpha 裁切）+ 抖动裁切
@@ -509,6 +511,9 @@ RENDER_MODULES = [
     "engine/render/ShadowPass.*",
     "engine/render/TerrainPass.*",
     "engine/render/VolumetricFog.*",
+    # 水体：几何现生成 + 自己的 RenderPass/颜色拷贝图，是"泄漏"高发区
+    # （视图借自 HdrTarget，resize 后忘了重设就是悬垂句柄）。
+    "engine/render/WaterPass.*",
 ]
 
 # 用例 ← 触发它的源码/着色器。
@@ -560,6 +565,37 @@ TRIGGERS = {
                               "assets/shaders/fog_integrate.comp"],
     "verify_light_modifiers": ["engine/render/LightTextureLibrary.*",
                                "engine/render/ClusteredLighting.*"],
+    # ---- 水体 ----
+    # verify_water 测的是面板（创建/形状/滑块/水位/删除）；
+    # verify_water_motion 测的是"手柄能拖 + 浪况单旋钮"。
+    # ⚠ engine/water/** 不在 GLOBAL_GLOBS，所以必须在这里逐条登记 ——
+    #   否则改 WaterBody 只会跑"碰巧命中"的用例，水面参数悄悄回归无人发现。
+    "verify_water": ["engine/water/**", "engine/render/WaterPass.*",
+                     "assets/shaders/water.*",
+                     "assets/shaders/water_common.glsl",
+                     "editor/WaterEditor.*"],
+    "verify_water_motion": ["engine/water/**", "editor/WaterEditor.*",
+                            "editor/ViewportPanel.*", "editor/PickingSystem.*",
+                            "engine/render/WaterPass.*",
+                            "assets/shaders/water_common.glsl"],
+    # 新工程初始场景（地形 + GameStart）。断言落点：
+    #   · 模板内容          → templates/** 与生成脚本
+    #   · 出生点组件/序列化 → Components.h、SceneSerializer
+    #   · GAMESTART-MARK 锚点 → ViewportPanel（标记画在这里）
+    #   · 运行时出生        → RuntimeApp
+    "verify_template_scene": ["templates/**", "tools/gen_templates.py",
+                              "engine/ecs/Components.h",
+                              "engine/scene/SceneSerializer.cpp",
+                              "engine/render/TerrainPass.cpp",
+                              "runtime/RuntimeApp.cpp"],
+    # GameStart 在编辑器里的三条交互：点选 / 落地 / 双层聚焦。
+    # 断言落点分别在 PickingSystem（点中）、ViewportPanel（落地）、
+    # SceneHierarchy + EditorFocus（聚焦）。
+    "verify_gamestart_edit": ["editor/PickingSystem.*",
+                              "editor/ViewportPanel.*",
+                              "editor/SceneHierarchy.*",
+                              "editor/EditorFocus.h",
+                              "engine/ecs/Components.h"],
     # ---- 屏幕空间 / 后处理链 ----
     "verify_screenspace":    ["engine/render/SSAOPass.*",
                               "engine/render/PostProcess.*",

@@ -2,6 +2,7 @@
 
 #include "Localization.h"
 #include "DebugRects.h"
+#include "EditorFocus.h"   // 双击 → 相机聚焦（与 F 键共用一份）
 #include "PanelRegistry.h"
 
 #include "core/Logger.h"
@@ -497,10 +498,17 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
     const bool clicked = ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen();
     if (clicked) m_ctx.select(e);
 
+    // 双击 = **在视口里聚焦到它**（2026-10-21 第九轮，用户要求）。
+    //   之前双击是"就地重命名"，但用户的第一反应是"双击跳过去看看"——
+    //   尤其是视口里点不到的实体（GameStart 只有叠加层标记、水体没有网格），
+    //   双击层级是唯一能"跳过去"的手段。
+    //   重命名没丢：F2（beginRenameSelection）与右键菜单都还在。
     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
-        m_renameTarget = e;
-        m_renameFocus = true;
-        std::snprintf(m_renameBuf, sizeof(m_renameBuf), "%s", name.c_str());
+        m_ctx.select(e);
+        // 直接把相机对过去（与 F 键 / 右键菜单共用 EditorFocus.h 那一份）
+        editor::focusCameraOnEntity(m_ctx.editorScene(), e);
+        VK_LOG_INFO("HIER-FOCUS entity=%u name=%s", static_cast<unsigned>(e.id),
+                    name.c_str());
     }
 
     drawNodeContextMenu(e);

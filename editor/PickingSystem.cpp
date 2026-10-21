@@ -5,6 +5,7 @@
 #include "ecs/Components.h"
 #include "scene/Camera.h"
 #include "scene/Scene.h"
+#include "water/WaterBody.h"
 
 #include <algorithm>
 #include <cmath>
@@ -246,6 +247,105 @@ PickResult PickingSystem::pick(scene::Scene& scene, const Ray& ray) {
                     same ? 1 : 0, bvh.lastRayNodeVisits(),
                     bvh.lastRayLeafTests(), best.hit ? 1 : 0);
     }
+
+    // ---- 水体：没有网格 → 不在 BVH 里，单独按"水面圆/矩形"求交 ----
+    // 不补这一步，创建之后只能在层级里选中它、视口里点不到 —— 用户要的
+    // "创建后直接在水上拖"就缺了半截。
+    //
+    // 放在自检**之后**：PICK-DBG 对照的是"BVH vs 线性扫描（只有带网格的
+    // 实体）"，水体本来就不参与那一对照，混进来会让 same 恒为 0。
+    {
+        float bestWaterT = best.hit ? best.distance
+                                    : std::numeric_limits<float>::max();
+        ecs::Entity bestWater{};
+        scene.forEachWater([&](ecs::Entity e, ecs::WaterComponent& wc) {
+            if (scene.world().has<ecs::LockedComponent>(e)) return;
+            const water::WaterBody& b = wc.body;
+
+            float t = 0.0f;
+            if (!intersectPlane(ray,
+                                glm::vec3(b.center.x, b.center.y, b.level),
+                                glm::vec3(0.0f, 0.0f, 1.0f), t))
+                return;
+            if (t <= 0.0f || t >= bestWaterT) return;
+
+            const glm::vec3 P = ray.origin + ray.dir * t;
+            // 落到局部坐标（逆旋转）再比 footprint：圆看半径，矩形看半长
+            const glm::vec2 d(P.x - b.center.x, P.y - b.center.y);
+            const float rad = glm::radians(b.rotation);
+            const float c = std::cos(rad);
+            const float s = std::sin(rad);
+            const glm::vec2 l(d.x * c + d.y * s, -d.x * s + d.y * c);
+            const bool inside =
+                (b.shape == water::Shape::Circle)
+                    ? glm::length(l) <= b.halfExtent.x
+                    : (std::fabs(l.x) <= b.halfExtent.x &&
+                       std::fabs(l.y) <= b.halfExtent.y);
+            if (!inside) return;
+
+            bestWaterT = t;
+            bestWater = e;
+        });
+        const float limit =
+            best.hit ? best.distance : std::numeric_limits<float>::max();
+        if (bestWater.valid() && bestWaterT < limit) {
+            best.hit = true;
+            best.entity = bestWater;
+            best.distance = bestWaterT;
+            best.point = ray.origin + ray.dir * bestWaterT;
+        }
+    }
+
+    // ---- GameStart 出生点：视口里只有一个**叠加层小人**（没有网格），
+    //      所以也必须在 BVH 之外单独求交，否则鼠标点不中它 ——
+    //      点不中就没有手柄、数字键 0 的"落地"也会被
+    //      `selectionFromViewport()` 挡掉（用户报的正是这两件事）。
+    //
+    // 形状用"竖直胶囊"近似那个小人：半径 0.45 m、从脚下到头顶 1.75 m。
+    // 比真实像素轮廓宽容一点是对的 —— 这是个标记，不是可碰撞的物体。
+    {
+        float bestGsT = best.hit ? best.distance
+                                 : std::numeric_limits<float>::max();
+        ecs::Entity bestGs{};
+        scene.world().each<ecs::GameStartComponent>(
+            [&](ecs::Entity e, ecs::GameStartComponent& g) {
+                if (!g.enabled) return;
+                if (scene.world().has<ecs::LockedComponent>(e)) return;
+                const auto* tf = scene.world().get<ecs::TransformComponent>(e);
+                if (!tf) return;
+
+                const glm::vec3 c = tf->position + glm::vec3(0.0f, 0.0f, 0.875f);
+                const glm::vec3 base = tf->position;
+                const glm::vec3 axis(0.0f, 0.0f, 1.0f);
+                // 无限圆柱求交 → 再夹到 [0, 1.75] 的高度段
+                const glm::vec3 oc = ray.origin - base;
+                const glm::vec3 dPerp = ray.dir - axis * glm::dot(ray.dir, axis);
+                const glm::vec3 ocPerp = oc - axis * glm::dot(oc, axis);
+                const float a = glm::dot(dPerp, dPerp);
+                const float b = 2.0f * glm::dot(dPerp, ocPerp);
+                const float cc = glm::dot(ocPerp, ocPerp) - 0.45f * 0.45f;
+                if (a < 1e-8f) return;            // 射线与轴平行
+                const float disc = b * b - 4.0f * a * cc;
+                if (disc < 0.0f) return;
+                const float sq = std::sqrt(disc);
+                float t = (-b - sq) / (2.0f * a);
+                if (t <= 0.0f) t = (-b + sq) / (2.0f * a);
+                if (t <= 0.0f || t >= bestGsT) return;
+                const float h = glm::dot(ray.origin + ray.dir * t - base, axis);
+                if (h < 0.0f || h > 1.75f) return;
+                bestGsT = t;
+                bestGs = e;
+            });
+        const float gsLimit =
+            best.hit ? best.distance : std::numeric_limits<float>::max();
+        if (bestGs.valid() && bestGsT < gsLimit) {
+            best.hit = true;
+            best.entity = bestGs;
+            best.distance = bestGsT;
+            best.point = ray.origin + ray.dir * bestGsT;
+        }
+    }
+
     return best;
 }
 

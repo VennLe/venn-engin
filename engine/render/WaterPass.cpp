@@ -756,11 +756,15 @@ uint64_t WaterPass::record(VkCommandBuffer cmd, uint32_t frameIndex, float time,
         WaterUboGpu gpu{};
         gpu.shallow = glm::vec4(s.shallowColor, s.opacity);
         gpu.deep = glm::vec4(s.deepColor, s.clarity);
-        gpu.p0 = glm::vec4(s.level, s.waveHeight, s.waveLength, s.flowSpeed);
+        // 浪况 → 振幅 / 波长 / 细波 / 泡沫。**唯一**映射在
+        // water/WaterBody.h::deriveWaves —— 这里不许再写一份，否则面板
+        // 显示的"0 = 平静"和着色器实际吃到的值会悄悄分家。
+        const water::WaveDerived wd = water::deriveWaves(s.waves);
+        gpu.p0 = glm::vec4(s.level, wd.amplitude, wd.wavelength, s.flowSpeed);
         glm::vec2 fdir = s.flowDir;
         const float flen = glm::length(fdir);
         fdir = (flen > 1e-4f) ? (fdir / flen) : glm::vec2(1.0f, 0.0f);
-        gpu.p1 = glm::vec4(fdir, s.ripple, s.foam);
+        gpu.p1 = glm::vec4(fdir, wd.ripple, wd.foam);
         gpu.p2 = glm::vec4(s.refraction, s.ior, s.roughness, time);
         gpu.p3 = glm::vec4(static_cast<float>(static_cast<int>(s.kind)),
                            static_cast<float>(static_cast<int>(s.shape)),

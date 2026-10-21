@@ -1223,10 +1223,14 @@ json waterToJson(const ecs::WaterComponent& w) {
     j["clarity"] = b.clarity;
     j["flowSpeed"] = b.flowSpeed;
     j["flowDir"] = json::array({b.flowDir.x, b.flowDir.y});
-    j["waveHeight"] = b.waveHeight;
-    j["waveLength"] = b.waveLength;
-    j["ripple"] = b.ripple;
-    j["foam"] = b.foam;
+    // 浪况是**唯一**输入；下面四个是派生量，写出去只为让旧版本引擎还能
+    // 读出"看起来差不多"的水面（见 WaterBody.h 的 legacy 注释）。
+    const water::WaveDerived wd = water::deriveWaves(b.waves);
+    j["waves"] = b.waves;
+    j["waveHeight"] = wd.amplitude;
+    j["waveLength"] = wd.wavelength;
+    j["ripple"] = wd.ripple;
+    j["foam"] = wd.foam;
     j["roughness"] = b.roughness;
     return j;
 }
@@ -1277,7 +1281,38 @@ ecs::WaterComponent waterFromJson(const json& j) {
     b.ripple = j.value("ripple", b.ripple);
     b.foam = j.value("foam", b.foam);
     b.roughness = j.value("roughness", b.roughness);
+
+    // ---- 浪况（2026-10-21 第七轮）----
+    // 新场景直接读 waves；**老场景没有这个字段** → 由 waveHeight 反推出
+    // 一个等效浪况，保证"打开旧场景，水面看起来还是原来的样子"。
+    // 映射见 water/WaterBody.h::deriveWaves（amp = 0.60·t^1.35）。
+    if (j.contains("waves")) {
+        b.waves = std::clamp(j.value("waves", b.waves), 0.0f, 10.0f);
+    } else {
+        const float amp = std::max(b.waveHeight, 0.0f);
+        const float t = (amp > 0.0f)
+                            ? std::pow(amp / 0.6f, 1.0f / 1.35f)
+                            : 0.0f;
+        b.waves = std::clamp(t * 10.0f, 0.0f, 10.0f);
+    }
     return w;
+}
+
+// ---- 玩家出生点（GameStart，2026-10-21 第八轮）----
+// 只有"朝向 + 开关"两个字段：位置就是实体的 transform（与贴花/探针同一约定）。
+json gameStartToJson(const ecs::GameStartComponent& g) {
+    json j;
+    j["yaw"] = g.yaw;
+    j["enabled"] = g.enabled;
+    return j;
+}
+
+ecs::GameStartComponent gameStartFromJson(const json& j) {
+    ecs::GameStartComponent g;
+    if (!j.is_object()) return g;
+    g.yaw = j.value("yaw", g.yaw);
+    g.enabled = j.value("enabled", true);
+    return g;
 }
 
 json reflectionProbeToJson(const ecs::ReflectionProbeComponent& p) {
@@ -2157,6 +2192,11 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         if (const auto* wc = w.get<ecs::WaterComponent>(it.entity))
             je["water"] = waterToJson(*wc);
 
+        // 玩家出生点（仿 UE5 PlayerStart）。没有网格：只有一个位置 + 朝向，
+        // 视口里的 Q 版小人由编辑器叠加层画，不进场景实体。
+        if (const auto* gs = w.get<ecs::GameStartComponent>(it.entity))
+            je["gameStart"] = gameStartToJson(*gs);
+
         // 反射探针（R5-1）。与贴花同理：探针**没有网格**，
         // 下面那句 "mesh 为空 → skipped++" 对它也不适用。
         if (const auto* rp = w.get<ecs::ReflectionProbeComponent>(it.entity))
@@ -2646,6 +2686,16 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 *p = wc;
             else
                 w.add<ecs::WaterComponent>(e, wc);
+        }
+
+        // 玩家出生点（GameStart）
+        if (je.contains("gameStart") && je["gameStart"].is_object()) {
+            const ecs::GameStartComponent gs =
+                gameStartFromJson(je["gameStart"]);
+            if (auto* p = w.get<ecs::GameStartComponent>(e))
+                *p = gs;
+            else
+                w.add<ecs::GameStartComponent>(e, gs);
         }
 
         // 反射探针（R5-1）。与贴花同一形态：实体只提供变换 + 参数，

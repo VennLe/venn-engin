@@ -66,11 +66,18 @@ bool loadLayerJson(const std::string& layerId, TerrainLayerGpu& out,
     out.params.w = doc.value("normalScale", 1.0f);
 
     // 贴图：材质 JSON 里是 {"kind":"file","path":"textures/x.png"}
+    //
+    // ⚠ 这里必须走 `resolveAssetPath`：材质里存的是**相对资产根**的路径，
+    //   而 `Texture::fromFile` 直接把它交给 stbi_load —— 那是相对**进程 cwd**
+    //   打开的。之前引擎自带的两块地形材质都没有贴图，所以这条从来没被走到；
+    //   一旦地形层带贴图就立刻 `can't fopen` → throw → 整个编辑器 Fatal。
     auto texPath = [&doc](const char* key) -> std::string {
         if (!doc.contains(key) || !doc[key].is_object()) return std::string();
         const auto& o = doc[key];
         if (!o.contains("path") || !o["path"].is_string()) return std::string();
-        return o["path"].get<std::string>();
+        const std::string raw = o["path"].get<std::string>();
+        if (raw.empty()) return raw;
+        return assets::resolveAssetPath(raw);
     };
     *albedoPath = texPath("albedo");
     *normalPath = texPath("normal");
@@ -580,14 +587,28 @@ TerrainPass::Instance* TerrainPass::createTerrain(
         const bool ok = loadLayerJson(L.id, gpu, &albedoPath, &normalPath);
         L.baseColor = gpu.baseColor;
         L.params = gpu.params;
+        // ⚠ fromFile 失败会 throw —— 一块地形的贴图丢了不该让整个编辑器挂掉，
+        //   降级成"默认贴图"（纯色）继续渲染，并留一条可搜索的日志。
         if (ok && !albedoPath.empty()) {
-            L.albedo = std::make_unique<assets::Texture>();
-            L.albedo->fromFile(m_texCtx, albedoPath, true);
+            try {
+                L.albedo = std::make_unique<assets::Texture>();
+                L.albedo->fromFile(m_texCtx, albedoPath, true);
+            } catch (const std::exception& ex) {
+                L.albedo.reset();
+                VK_LOG_WARN("TERRAIN-LAYER-TEX-FAIL idx=%d albedo=%s (%s)", i,
+                            albedoPath.c_str(), ex.what());
+            }
         }
         if (ok && !normalPath.empty()) {
-            L.normal = std::make_unique<assets::Texture>();
-            L.normal->fromFile(m_texCtx, normalPath, false);
-            inst->normalMask |= (1u << i);
+            try {
+                L.normal = std::make_unique<assets::Texture>();
+                L.normal->fromFile(m_texCtx, normalPath, false);
+                inst->normalMask |= (1u << i);
+            } catch (const std::exception& ex) {
+                L.normal.reset();
+                VK_LOG_WARN("TERRAIN-LAYER-TEX-FAIL idx=%d normal=%s (%s)", i,
+                            normalPath.c_str(), ex.what());
+            }
         }
         VK_LOG_INFO("TERRAIN-LAYER idx=%d id=%s albedo=%s normal=%s",
                     i, L.id.c_str(), L.albedo ? "file" : "default",

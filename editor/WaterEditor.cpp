@@ -351,6 +351,90 @@ void WaterEditor::applyDrag(const glm::vec2& anchor, const glm::vec2& cur) {
 }
 
 // ============================================================
+// W/E/R 手柄 ↔ WaterBody（2026-10-21 第七轮）
+// ============================================================
+void WaterEditor::syncTransformFromBody(ecs::Entity e) {
+    if (!e.valid()) return;
+    ecs::World& w = m_ctx.editorScene().world();
+    const ecs::WaterComponent* wc = w.get<ecs::WaterComponent>(e);
+    ecs::TransformComponent* tf = w.get<ecs::TransformComponent>(e);
+    if (!wc || !tf) return;
+
+    const water::WaterBody& b = wc->body;
+    tf->position = glm::vec3(b.center.x, b.center.y, b.level);
+    // 水面永远是水平的 → 只允许绕 z 的偏航。X/Y 的倾斜会被这里抹掉，
+    // 这是**有意**的：把水面拖歪在物理上没有意义。
+    tf->rotation = glm::vec3(0.0f, 0.0f, glm::radians(b.rotation));
+    // 缩放是"手柄给的一次性倍率"，用完整进 halfExtent，所以这里恒为 1。
+    tf->scale = glm::vec3(1.0f);
+}
+
+void WaterEditor::applyTransformToBody(ecs::Entity e) {
+    if (!e.valid()) return;
+    ecs::World& w = m_ctx.editorScene().world();
+    ecs::WaterComponent* wc = w.get<ecs::WaterComponent>(e);
+    ecs::TransformComponent* tf = w.get<ecs::TransformComponent>(e);
+    if (!wc || !tf) return;
+
+    water::WaterBody& b = wc->body;
+    bool changed = false;
+
+    // ---- 移动：xz → center，z → level ----
+    const glm::vec2 c(tf->position.x, tf->position.y);
+    if (glm::distance(c, b.center) > 1e-5f) {
+        b.center = c;
+        changed = true;
+    }
+    if (std::fabs(tf->position.z - b.level) > 1e-5f) {
+        b.level = tf->position.z;
+        // 手动挪过水位就不再自动贴合地形（与面板滑块同一约定）
+        b.autoFit = false;
+        changed = true;
+    }
+
+    // ---- 旋转：只取绕 z 的偏航 ----
+    const float rotDeg = glm::degrees(tf->rotation.z);
+    if (std::fabs(rotDeg - b.rotation) > 1e-4f) {
+        b.rotation = rotDeg;
+        changed = true;
+    }
+
+    // ---- 缩放：gizmo 给的是**绝对**倍率（相对拖拽起点），只乘增量 ----
+    // 见 WaterEditor.h::m_scaleApplied 的注释：直接累乘会把 18 变成 2.4e9。
+    if (m_scaleAppliedId != e.id) {
+        m_scaleAppliedId = e.id;
+        m_scaleApplied = glm::vec2(1.0f);
+    }
+    const glm::vec2 f(std::fabs(tf->scale.x), std::fabs(tf->scale.y));
+    if (glm::distance(f, glm::vec2(1.0f)) < 1e-5f) {
+        // 倍率回到 1 = 这一轮拖拽结束（sync 每帧都会把它写回 1）。
+        // 只清基准，**不要**再除回去 —— 那会把刚缩好的尺寸撤销。
+        m_scaleApplied = glm::vec2(1.0f);
+    } else if (glm::distance(f, m_scaleApplied) > 1e-6f) {
+        const glm::vec2 ratio =
+            f / glm::max(m_scaleApplied, glm::vec2(1e-4f));
+        // 上下限是**兜底**：任何倍率 bug 都不该让半径跑到 1e9（会拖死网格
+        // 生成）。正常拖拽离 2000 m 远得很。
+        b.halfExtent = glm::clamp(b.halfExtent * ratio, glm::vec2(0.5f),
+                                  glm::vec2(2000.0f));
+        if (b.shape == water::Shape::Circle) b.halfExtent.y = b.halfExtent.x;
+        m_scaleApplied = f;
+        changed = true;
+    }
+
+    if (!changed) return;
+    m_ctx.dirty() = true;
+    // 自检锚点：验收脚本靠它判断"手柄拖了真的写进了 body"
+    VK_LOG_INFO("WATER-XFORM id=%u center=(%.2f,%.2f) level=%.3f rot=%.1f "
+                "halfExtent=(%.2f,%.2f)",
+                e.id, static_cast<double>(b.center.x),
+                static_cast<double>(b.center.y),
+                static_cast<double>(b.level), static_cast<double>(b.rotation),
+                static_cast<double>(b.halfExtent.x),
+                static_cast<double>(b.halfExtent.y));
+}
+
+// ============================================================
 // 贴地：水位/池底与地形对齐（2026-10-21 第六轮）
 // ============================================================
 void WaterEditor::fitToGround(water::WaterBody& b, bool followLevel) {
@@ -396,6 +480,20 @@ bool WaterEditor::viewportInput(const glm::vec2& vpPos,
                                 const glm::vec2& vpSize, bool hovered,
                                 ImDrawList* dl) {
     sync();
+
+    // 选中一块水体时，视口左键属于**变换手柄**（W/E/R），不属于"再拖一块"。
+    // 否则在手柄上按下的一瞬间就会新建一个水体，并把选中切走。
+    // 想再建一块：先点空处取消选中（点选会清掉 selection）。
+    // 注意仍然要把选中体的轮廓画出来 —— 那是"我现在在编辑哪块水"的唯一提示。
+    if (m_ctx.hasSelection()) {
+        if (dl) {
+            if (const ecs::WaterComponent* wc = selected()) {
+                drawFootprint(dl, vpPos, vpSize, wc->body,
+                              IM_COL32(120, 210, 255, hovered ? 170 : 90));
+            }
+        }
+        return false;
+    }
 
     const ImGuiIO& io = ImGui::GetIO();
     const glm::vec2 mouse(io.MousePos.x, io.MousePos.y);
@@ -826,6 +924,51 @@ void WaterEditor::drawShapeSection(ecs::WaterComponent& wc) {
     water::WaterBody& b = wc.body;
     // 段名由调用方的 CollapsingHeader 承担（见 drawPanel），不重复画
 
+    // ---- 浪况：单一 0..10 旋钮（2026-10-21 第七轮）----
+    // 用户第二条要求的落点："浪花波纹通过一个浮点参数控制，
+    // 0 = 无任何波纹的平静水面，10 = 汹涌的浪涛"。
+    //
+    // ⚠ 位置在 Shape 段**最上面**（形状按钮之前）：这个面板是滚动子窗口、
+    //   比窗口还高 —— 放在水位后面时滑块落在 y=759，而客户区只有 753，
+    //   正好被裁掉。主控项必须在首屏。
+    //   振幅/波长/细波/泡沫全部由它派生（WaterBody.h::deriveWaves），
+    //   面板不再暴露那四个会互相打架的独立滑块。
+    ImGui::SetNextItemWidth(-1.0f);
+    const bool wavesMoved =
+        ImGui::SliderFloat(TR("Waves"), &b.waves, 0.0f, 10.0f, "%.1f");
+    // ⚠ 锚点与"松手"必须紧贴 SliderFloat：中间插一行 TextDisabled 之后，
+    //   IsItemDeactivatedAfterEdit() 认的就是那行文字，日志永远打不出来。
+    logRect("WATER-WAVES", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    const bool wavesCommitted = ImGui::IsItemDeactivatedAfterEdit();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "%s",
+            TR("0 = no ripples at all (flat mirror)\n10 = violent swell\namplitude / wavelength / foam are derived from this"));
+    }
+    if (wavesMoved) m_ctx.dirty() = true;
+    {
+        const water::WaveDerived wd = water::deriveWaves(b.waves);
+        if (b.waves <= 0.01f) {
+            ImGui::TextDisabled("%s", TR("mirror-calm (no ripples)"));
+        } else {
+            // 格式串也要包 TR（项目约定：控件显示格式串一律 TR）
+            ImGui::TextDisabled(TR("%s %.2f m / %s %.1f m"), TR("amplitude"),
+                                static_cast<double>(wd.amplitude),
+                                TR("wavelength"),
+                                static_cast<double>(wd.wavelength));
+        }
+        if (wavesCommitted) {
+            VK_LOG_INFO("WATER-WAVES id=%u waves=%.2f amp=%.3f len=%.2f "
+                        "ripple=%.2f foam=%.2f",
+                        m_ctx.selection().id, static_cast<double>(b.waves),
+                        static_cast<double>(wd.amplitude),
+                        static_cast<double>(wd.wavelength),
+                        static_cast<double>(wd.ripple),
+                        static_cast<double>(wd.foam));
+        }
+    }
+
     // 形状换了 → footprint 换了（圆只认半径，矩形有半宽/半深）→ 池底与
     // 岸线都得重新采样，否则切形状之后水位会停在旧形状的位置上。
     const water::Shape before = b.shape;
@@ -899,6 +1042,8 @@ void WaterEditor::drawShapeSection(ecs::WaterComponent& wc) {
                     static_cast<double>(b.maxDepth()));
     }
 
+    // （浪况滑块已上移到 Shape 段最上面 —— 面板比窗口高，放在这里会被裁掉。）
+
     // 手动调过水位之后想回到"贴着地形"的状态，按这一个按钮就行
     if (ImGui::Button(TR("Fit to ground"), ImVec2(-1.0f, 0.0f))) {
         b.autoFit = true;
@@ -967,34 +1112,8 @@ void WaterEditor::drawMotionSection(ecs::WaterComponent& wc) {
     water::WaterBody& b = wc.body;
     // 段名由调用方的 CollapsingHeader 承担（见 drawPanel），不重复画
 
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::SliderFloat(TR("Wave height"), &b.waveHeight, 0.0f, 2.0f,
-                           TR("%.2f m"))) {
-        m_ctx.dirty() = true;
-    }
-    logRect("WATER-WAVEH", ImGui::GetItemRectMin(),
-            ImGui::GetItemRectMax());
-
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::SliderFloat(TR("Wave length"), &b.waveLength, 0.5f, 60.0f,
-                           TR("%.1f m"))) {
-        m_ctx.dirty() = true;
-    }
-    logRect("WATER-WAVEL", ImGui::GetItemRectMin(),
-            ImGui::GetItemRectMax());
-
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::SliderFloat(TR("Ripple"), &b.ripple, 0.0f, 2.0f, "%.2f")) {
-        m_ctx.dirty() = true;
-    }
-    logRect("WATER-RIPPLE", ImGui::GetItemRectMin(),
-            ImGui::GetItemRectMax());
-
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::SliderFloat(TR("Foam"), &b.foam, 0.0f, 1.0f, "%.2f")) {
-        m_ctx.dirty() = true;
-    }
-    logRect("WATER-FOAM", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    // 浪况滑块已上移到 Shape 段（见 drawShapeSection）：它是主控项，
+    // 而这一段默认折叠 —— 放在这里等于藏起来。
 
     ImGui::SetNextItemWidth(-1.0f);
     if (ImGui::SliderFloat(TR("Flow speed"), &b.flowSpeed, 0.0f, 5.0f,

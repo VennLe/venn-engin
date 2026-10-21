@@ -2400,6 +2400,15 @@ const Entry kZh[] = {
     {"IOR", "折射率"},
     {"Clarity", "清澈度"},
     {"Surface motion", "水面运动"},
+    // 2026-10-21 第七轮：浪况合成单一 0..10 旋钮（0 = 镜面平静，10 = 汹涌）
+    {"Waves", "浪况"},
+    {"amplitude", "振幅"},
+    {"wavelength", "波长"},
+    {"mirror-calm (no ripples)", "镜面平静（无波纹）"},
+    {"%s %.2f m / %s %.1f m", "%s %.2f 米 / %s %.1f 米"},
+    // ⚠ 必须写成**单个**字符串字面量：词典解析器按 `"..."` 逐个取键，
+    //   相邻字面量拼接（"..." "..."）会被截成第一段。
+    {"0 = no ripples at all (flat mirror)\n10 = violent swell\namplitude / wavelength / foam are derived from this", "0 = 完全没有波纹（镜面）\n10 = 汹涌浪涛\n振幅 / 波长 / 泡沫都由它派生"},
     {"Wave height", "波高"},
     {"Wave length", "波长"},
     {"Ripple", "涟漪"},

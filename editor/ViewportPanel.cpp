@@ -4,6 +4,7 @@
 #include "DebugRects.h"    // MYVK_LOG_RECTS：把视口矩形打给自动化脚本
 #include "EditorDragDrop.h"
 #include "FeatureUIGen.h"   // emitParamChange：改 grid.* 后要标脏 + 记撤销
+#include "EditorFocus.h"
 #include "EditorScene.h"  // instantiateModel
 #include "WaterEditor.h"
 #include "LandscapeEditor.h"   // 编辑模式：地形笔刷 / 高度查询
@@ -1437,16 +1438,12 @@ void ViewportPanel::drawVpSettingsMenu() {
 
 void ViewportPanel::focusSelection() const {
     if (!m_ctx.hasSelection()) return;
-    scene::Scene& sc = m_ctx.editorScene();
-    const glm::vec3 p = glm::vec3(sc.worldMatrix(m_ctx.selection())[3]);
+    focusEntity(m_ctx.selection());
+}
 
-    // 用网格包围盒估算一个合适的距离，避免"贴脸"或"看不见"
-    const Aabb b = m_picking.worldAabb(sc, m_ctx.selection());
-    float radius = 1.0f;
-    if (b.valid) radius = glm::max(glm::length(b.max - b.min) * 0.5f, 0.35f);
-
-    sc.camera().setTarget(p);
-    sc.camera().setDistance(radius / std::tan(glm::radians(sc.camera().fov() * 0.5f)) * 1.8f);
+void ViewportPanel::focusEntity(ecs::Entity e) const {
+    // 与 Hierarchy 双击共用同一份实现（editor/EditorFocus.h）
+    editor::focusCameraOnEntity(m_ctx.editorScene(), e);
 }
 
 // ---------------------------------------------------------------- 落地（数字键 0）
@@ -1481,13 +1478,30 @@ void ViewportPanel::dropSelectionToGround() {
     auto* t = sc.world().get<ecs::TransformComponent>(e);
     if (!t) return;
 
-    const Aabb box = m_picking.worldAabb(sc, e);
-    if (!box.valid) {   // 灯 / 相机 / 没有网格
-        VK_LOG_INFO("drop-to-floor: skipped ('%s' has no mesh bounds)", nm);
-        return;
+    // 地面高度：有地形就用地形，没地形才是栅格面 z=0。
+    // ⚠ 之前一律按 z=0 —— 那在"空场景 + 地形"的新工程里等于把物体埋进
+    //   土里（用户报的"按 0 落不到地面"就是这个）。heightAtWorld 在没有
+    //   地形时返回 0，所以老场景行为不变。
+    const float groundZ = m_landscapeEditor
+                              ? m_landscapeEditor->heightAtWorld(t->position.x,
+                                                                 t->position.y)
+                              : 0.0f;
+
+    Aabb box = m_picking.worldAabb(sc, e);
+    if (!box.valid) {
+        // 没有网格的实体（GameStart / 水体 / 灯）：
+        //   · GameStart 是"脚底在原点"的标记 → 直接把原点落到地面；
+        //   · 其它（灯 / 相机）仍然跳过，落地对它们没意义。
+        if (!sc.world().has<ecs::GameStartComponent>(e)) {
+            VK_LOG_INFO("drop-to-floor: skipped ('%s' has no mesh bounds)", nm);
+            return;
+        }
+        box.valid = true;
+        box.min = t->position;
+        box.max = t->position + glm::vec3(0.0f, 0.0f, 1.75f);
     }
 
-    const float dz = -box.min.z;   // 世界空间里要把"底部"抬多高
+    const float dz = groundZ - box.min.z;   // 世界空间里要把"底部"抬多高
     if (std::fabs(dz) < 1e-4f) {
         m_ctx.setStatus(TR("Already on the ground"));
         VK_LOG_INFO("drop-to-floor: '%s' already on the ground", nm);
@@ -2076,6 +2090,116 @@ void ViewportPanel::drawObjectMenu(const glm::vec2& vpPos,
 
 // ---------------------------------------------------------------- 主流程
 
+// ============================================================
+// GameStart 出生点标记：Q 版小人（编辑器叠加层，2026-10-21 第八轮）
+// ============================================================
+// 为什么画在叠加层、而不是给实体挂一个网格：
+//   · 出生点**不该出现在游戏画面里**（UE5 的 PlayerStart 同理只在编辑器可见）；
+//   · 场景里就不会多出一个"占位小人实体"，Hierarchy 保持干净（用户要求
+//     "场景里不摆放任何物体"）。
+// 比例由"投影 1.75 m 高得到的像素高度"决定 —— 离得远自然变小，和真实物体
+// 一样有透视感，而不是一个恒定大小的图标。
+namespace {
+
+void gsEllipse(ImDrawList* dl, float cx, float cy, float rx, float ry,
+               ImU32 col) {
+    ImVec2 pts[28];
+    for (int i = 0; i < 28; ++i) {
+        const float a = 6.2831853f * static_cast<float>(i) / 28.0f;
+        pts[i] = ImVec2(cx + std::cos(a) * rx, cy + std::sin(a) * ry);
+    }
+    dl->AddConvexPolyFilled(pts, 28, col);
+}
+
+void drawGameStartMarker(ImDrawList* dl, const glm::mat4& vp,
+                         const glm::vec2& vpPos, const glm::vec2& vpSize,
+                         const glm::vec3& feet, float yawRad) {
+    glm::vec2 f2(0.0f), t2(0.0f);
+    if (!PickingSystem::worldToScreen(vp, vpPos, vpSize, feet, f2)) return;
+    if (!PickingSystem::worldToScreen(vp, vpPos, vpSize,
+                                      feet + glm::vec3(0.0f, 0.0f, 1.75f),
+                                      t2))
+        return;
+
+    float H = std::fabs(f2.y - t2.y);
+    if (H < 16.0f) H = 16.0f;      // 远处保底：别缩成一个点
+    if (H > 240.0f) H = 240.0f;
+    const float cx = f2.x;
+    const float bottom = f2.y;
+
+    const ImU32 bodyCol = IM_COL32(86, 152, 255, 235);
+    const ImU32 skinCol = IM_COL32(255, 219, 186, 245);
+    const ImU32 lineCol = IM_COL32(46, 48, 66, 235);
+    const ImU32 eyeCol = IM_COL32(40, 40, 58, 255);
+
+    // 地面投影：先把小人"钉"在地上，不然读不出它站在哪
+    gsEllipse(dl, cx, bottom, H * 0.22f, H * 0.065f, IM_COL32(0, 0, 0, 90));
+
+    // 脚
+    dl->AddRectFilled(ImVec2(cx - H * 0.115f, bottom - H * 0.075f),
+                      ImVec2(cx - H * 0.015f, bottom), lineCol, H * 0.02f);
+    dl->AddRectFilled(ImVec2(cx + H * 0.015f, bottom - H * 0.075f),
+                      ImVec2(cx + H * 0.115f, bottom), lineCol, H * 0.02f);
+
+    // 身体：短粗的圆角块（Q 版的关键是"头大身子小"）
+    const float bodyTop = bottom - H * 0.46f;
+    dl->AddRectFilled(ImVec2(cx - H * 0.155f, bodyTop),
+                      ImVec2(cx + H * 0.155f, bottom - H * 0.055f), bodyCol,
+                      H * 0.075f);
+    dl->AddRect(ImVec2(cx - H * 0.155f, bodyTop),
+                ImVec2(cx + H * 0.155f, bottom - H * 0.055f), lineCol,
+                H * 0.075f, 0, 1.6f);
+
+    // 头：比身体还宽，压在肩膀上方一点点
+    const float headR = H * 0.235f;
+    const float headCy = bodyTop - headR * 0.82f;
+    dl->AddCircleFilled(ImVec2(cx, headCy), headR, skinCol, 32);
+    dl->AddCircle(ImVec2(cx, headCy), headR, lineCol, 32, 1.8f);
+
+    // 眼睛 + 嘴（"简单粗糙"就够，不做五官细节）
+    const float eyeDx = headR * 0.36f;
+    const float eyeR = std::max(headR * 0.15f, 1.0f);
+    dl->AddCircleFilled(ImVec2(cx - eyeDx, headCy - headR * 0.08f), eyeR,
+                        eyeCol, 12);
+    dl->AddCircleFilled(ImVec2(cx + eyeDx, headCy - headR * 0.08f), eyeR,
+                        eyeCol, 12);
+    dl->PathArcTo(ImVec2(cx, headCy + headR * 0.10f), headR * 0.42f, 0.35f,
+                  3.1415926f - 0.35f, 16);
+    dl->PathStroke(lineCol, 0, std::max(headR * 0.09f, 1.0f));
+
+    // 朝向：脚下一支小箭头（把 yaw 方向投影到屏幕，所以会跟着相机变）
+    glm::vec2 a2(0.0f), b2(0.0f);
+    const glm::vec3 dir(std::cos(yawRad), std::sin(yawRad), 0.0f);
+    if (PickingSystem::worldToScreen(vp, vpPos, vpSize, feet, a2) &&
+        PickingSystem::worldToScreen(vp, vpPos, vpSize, feet + dir * 1.4f,
+                                     b2)) {
+        glm::vec2 d(b2.x - a2.x, b2.y - a2.y);
+        const float len = glm::length(d);
+        if (len > 1.0f) {
+            d /= len;
+            const glm::vec2 n(-d.y, d.x);
+            const glm::vec2 p(b2.x, b2.y);
+            dl->AddTriangleFilled(
+                ImVec2(p.x + d.x * H * 0.10f, p.y + d.y * H * 0.10f),
+                ImVec2(p.x - d.x * H * 0.05f + n.x * H * 0.06f,
+                       p.y - d.y * H * 0.05f + n.y * H * 0.06f),
+                ImVec2(p.x - d.x * H * 0.05f - n.x * H * 0.06f,
+                       p.y - d.y * H * 0.05f - n.y * H * 0.06f),
+                IM_COL32(255, 214, 92, 230));
+        }
+    }
+
+    // 自动化锚点（整只小人的屏幕矩形）+ 名字标签
+    const ImVec2 tl(cx - H * 0.3f, headCy - headR - H * 0.16f);
+    const ImVec2 br(cx + H * 0.3f, bottom + H * 0.10f);
+    logRect("GAMESTART-MARK", tl, br);
+    dl->AddText(ImVec2(cx - ImGui::CalcTextSize("GameStart").x * 0.5f,
+                       br.y + 2.0f),
+                IM_COL32(180, 220, 255, 210), "GameStart");
+}
+
+} // namespace
+
 void ViewportPanel::draw() {
     EditorContext::PanelVisibility& panels = m_ctx.panels();
     if (!panels.viewport) return;
@@ -2299,9 +2423,18 @@ void ViewportPanel::draw() {
                            editMode == EditMode::Foliage ||
                            editMode == EditMode::MeshPaint ||
                            editMode == EditMode::BrushEdit ||
-                           editMode == EditMode::Modeling ||
-                           editMode == EditMode::Water;
-    const bool modeToolActive = m_ctx.isEditing() && brushMode;
+                           editMode == EditMode::Modeling;
+    // ⚠ Water 模式**不**整段独占输入（2026-10-21 第八轮，用户要求）：
+    //   "水体不是用鼠标拖动大小的，而是 W 拖 X/Y/Z 位置、R 缩放尺寸"。
+    //   之前把 Water 塞进 brushMode，等于把变换手柄整个关掉 —— 水体只能靠
+    //   鼠标拖出尺寸，正是用户不想用的那套。
+    //   现在按**有没有选中**分工：
+    //     · 选中了水体 → 手柄接管（W 平移 / E 旋转 / R 缩放）；
+    //     · 没选中     → 左键拖拽才创建新水体（见 WaterEditor::viewportInput）。
+    const bool waterToolActive =
+        editMode == EditMode::Water && !m_ctx.hasSelection();
+    const bool modeToolActive =
+        m_ctx.isEditing() && (brushMode || waterToolActive);
     bool modeConsumed = false;
     if (modeToolActive) {
         if (editMode == EditMode::Landscape && m_landscapeEditor) {
@@ -2325,9 +2458,37 @@ void ViewportPanel::draw() {
         }
     }
 
+    // ---- 水体：body → Transform（手柄要站在水面上）----
+    // 水体没有网格，变换手柄只认 TransformComponent；不先把 body 的位姿
+    // 镜像进去，手柄会站在原点、拖了水面也不动。见 WaterEditor.h 的注释。
+    if (m_ctx.isEditing() && m_ctx.hasSelection() && m_waterEditor) {
+        m_waterEditor->syncTransformFromBody(m_ctx.selection());
+    }
+
+    // ---- GameStart 出生点标记（只在编辑态画；游戏里不出现）----
+    if (m_ctx.isEditing() && dl) {
+        const glm::mat4 gvp = PickingSystem::viewProj(cam, vpSize);
+        ecs::World& gw = m_ctx.activeScene().world();
+        gw.each<ecs::GameStartComponent>(
+            [&](ecs::Entity ge, ecs::GameStartComponent& g) {
+                if (!g.enabled) return;
+                const auto* gtf = gw.get<ecs::TransformComponent>(ge);
+                if (!gtf) return;
+                drawGameStartMarker(dl, gvp, vpPos, vpSize, gtf->position,
+                                    gtf->rotation.z + g.yaw);
+            });
+    }
+
     bool gizmoConsumed = false;
     if (!modeToolActive && m_showGizmo && m_ctx.isEditing()) {
         gizmoConsumed = m_gizmo.update(m_ctx, cam, vpPos, vpSize, hovered, dl);
+    }
+
+    // ---- 水体：Transform → body（移动/旋转/缩放写回去）----
+    // 必须紧跟 gizmo.update：下一帧的 sync 会用 body 覆盖 Transform，
+    // 所以"读回"与"写出"是成对的，缺一半就会互相打架。
+    if (m_ctx.isEditing() && m_ctx.hasSelection() && m_waterEditor) {
+        m_waterEditor->applyTransformToBody(m_ctx.selection());
     }
 
     // 3) 点选（编辑态、点左键、不在导航手势里、手柄没吃掉）

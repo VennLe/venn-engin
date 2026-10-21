@@ -62,7 +62,8 @@ def find_window(title, timeout=45.0):
     return kit.find_window(title, timeout=timeout)
 
 
-def main():    ap = argparse.ArgumentParser()
+def main():
+    ap = argparse.ArgumentParser()
     ap.add_argument("--type", default="third_person",
                     choices=["first_person", "third_person"])
     ap.add_argument("--keep", action="store_true")
@@ -120,11 +121,14 @@ def main():    ap = argparse.ArgumentParser()
             fails.append("P1 没有 precompiled 行（场景没引用到模板脚本？）")
         elif m.group(2) != "0":
             fails.append("P1 模板脚本有 %s 个编译失败" % m.group(2))
-        elif int(m.group(1)) != 3:
-            fails.append("P1 编译了 %s 个脚本，模板应有 main/pickup/portal 三个"
+        elif int(m.group(1)) != 1:
+            # 2026-10-21 第八轮：模板场景改成"地形 + 出生点"，场上没有光球 /
+            # 传送门了，所以只剩挂在 GameStart 上的 main.vks 一个脚本。
+            # pickup.vks / portal.vks 仍随模板发布（示例），只是没被引用。
+            fails.append("P1 编译了 %s 个脚本，空场景模板应只有 main.vks 一个"
                          % m.group(1))
         else:
-            kit.log("CHECK P1 precompiled 3 script(s), 0 with errors OK")
+            kit.log("CHECK P1 precompiled 1 script(s) (main.vks), 0 errors OK")
 
         # ---- P2/P3 进 Play，看 on start / on update 的日志 ----
         kit.press_space(hwnd)

@@ -1,5 +1,6 @@
 #include "RuntimeApp.h"
 
+#include "assets/AssetManager.h"
 #include "assets/AssetPath.h"
 #include "core/Input.h"
 #include "core/Logger.h"
@@ -20,6 +21,74 @@
 #include <string>
 
 namespace runtime {
+
+namespace {
+
+// ============================================================
+// 按出生点生成玩家（仿 UE5 PlayerStart → Spawn Pawn）
+// ============================================================
+// 触发条件：场景里**没有**启用的 CharacterControllerComponent。
+//   · 老场景（自己摆了 Player 实体）→ 直接返回，行为一点不变；
+//   · 新模板场景（只有地形 + GameStart）→ 在这里造一个最小可玩的玩家。
+//
+// 为什么玩家不是场景里的实体：用户要"初始场景里不摆放任何物体"，
+// 出生点只标位置；玩家是运行时产物，存盘里也不该出现它。
+ecs::Entity spawnPlayerFromGameStart(scene::Scene& scene,
+                                     assets::AssetManager& am) {
+    ecs::World& w = scene.world();
+
+    bool hasCharacter = false;
+    w.each<ecs::CharacterControllerComponent>(
+        [&](ecs::Entity, ecs::CharacterControllerComponent& cc) {
+            if (cc.enabled) hasCharacter = true;
+        });
+    if (hasCharacter) return {};
+
+    glm::vec3 feet(0.0f);
+    float yaw = 0.0f;
+    bool found = false;
+    w.each<ecs::GameStartComponent>(
+        [&](ecs::Entity e, ecs::GameStartComponent& g) {
+            if (found || !g.enabled) return;
+            const auto* tf = w.get<ecs::TransformComponent>(e);
+            if (!tf) return;
+            feet = tf->position;
+            yaw = tf->rotation.z + g.yaw;
+            found = true;
+        });
+
+    const ecs::Entity e = scene.createObject("Player");
+    if (!e.valid()) return {};
+    if (auto* tf = w.get<ecs::TransformComponent>(e)) {
+        tf->position = feet;
+        tf->rotation = glm::vec3(0.0f, 0.0f, yaw);
+        tf->scale = glm::vec3(1.0f);
+    }
+
+    ecs::CharacterControllerComponent cc;
+    cc.bodyYaw = yaw;
+    w.add<ecs::CharacterControllerComponent>(e, cc);
+
+    // 占位身体：一个胶囊（圆柱 + 圆顶感靠颜色/光照，不做真胶囊网格）。
+    // ⚠ 材质名必须唯一：AssetManager 按名缓存，重名会和其他物体共用。
+    ecs::MeshComponent mc;
+    mc.mesh = am.cylinder(cc.radius, "runtime.player.body", 16);
+    w.add<ecs::MeshComponent>(e, mc);
+    ecs::MaterialComponent matc;
+    matc.material = am.makeMaterial("runtime.player.mat", nullptr,
+                                    glm::vec4(0.62f, 0.70f, 0.86f, 1.0f),
+                                    0.45f, 0.0f);
+    w.add<ecs::MaterialComponent>(e, matc);
+
+    VK_LOG_INFO("GAME-PLAYER spawned at GameStart found=%d "
+                "feet=(%.2f,%.2f,%.2f) yaw=%.3f",
+                found ? 1 : 0, static_cast<double>(feet.x),
+                static_cast<double>(feet.y), static_cast<double>(feet.z),
+                static_cast<double>(yaw));
+    return e;
+}
+
+} // namespace
 
 RuntimeApp::RuntimeApp(const RuntimeConfig& cfg)
     : core::Application(cfg.title, cfg.width, cfg.height), m_cfg(cfg) {
@@ -122,6 +191,12 @@ void RuntimeApp::onInit() {
     loadStartScene();
     buildPhysics();
     preloadScripts();
+
+    // ---- 出生点（GameStart，2026-10-21 第八轮）----
+    // 模板场景现在是"空场景"（只有地形 + 出生点），玩家由这里生成 ——
+    // 与 UE 的 PlayerStart → Spawn Pawn 同一个思路。老场景自带
+    // CharacterController 时这一步什么都不做，行为完全不变。
+    spawnPlayerFromGameStart(activeScene(), assets());
 
     // ---- 玩家（G10）：场景里有角色控制器才接管 ----
     m_player = std::make_unique<PlayerController>(m_input);

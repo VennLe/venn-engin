@@ -35,6 +35,7 @@
 #include <glm/glm.hpp>
 
 #include <algorithm>
+#include <cmath>
 
 namespace water {
 
@@ -135,10 +136,24 @@ struct WaterBody {
     float clarity = 1.0f;       // 清澈度倍率：越大越能看穿（吸收越弱）
     float flowSpeed = 0.0f;     // 表面流速（m/s）
     glm::vec2 flowDir{1.0f, 0.0f};  // 流向（会归一化）
+
+    // ---- 浪况（2026-10-21 第七轮：用户要求"一个浮点参数控制浪花波纹"）----
+    // 0 = **绝对平静**（振幅/细波/泡沫全 0 → 水面是一面镜子）
+    // 10 = 汹涌（0.60 m 涌浪 + 长波长 + 满泡沫）
+    //
+    // 为什么改成单一旋钮：之前 waveHeight / ripple / foam 三个滑块互相
+    // 打架 —— 把波高拉到 0 但 ripple 还留着，水面照样在抖，用户没法得到
+    // "真正平静的水"。现在所有波动量都从它派生（见 deriveWaves），
+    // 0 就是逐位平坦。
+    float waves = 2.6f;
+
+    // ⚠ legacy（只用于读老场景 + 写回 JSON 兼容）：
+    // 渲染**一律**走 waves，这三个字段不再参与任何计算。
     float waveHeight = 0.12f;   // 涌浪振幅（米，峰谷总高 = 2×它）
     float waveLength = 6.0f;    // 主波长（米）
     float ripple = 0.55f;       // 细波纹 / 涟漪强度（0..2）
     float foam = 0.35f;         // 岸边与浪尖泡沫（0..1）
+
     float roughness = 0.08f;    // 高光锐度（0 = 镜面，1 = 全漫反射）
 
     // 有效半径（圆形）或外接半径（矩形）—— 采样网格 / 视锥剔除 / 面板显示共用
@@ -151,6 +166,34 @@ struct WaterBody {
     // 挡住，面板该显示 0 而不是负数。
     float maxDepth() const { return std::max(level - bedLevel, 0.0f); }
 };
+
+// ============================================================
+// 浪况 → 物理量（**唯一**映射，别在别处再写一份）
+//
+//   waves=0  → 振幅 0、细波 0、泡沫 0 → 水面逐位平坦（镜面）
+//   waves=10 → 0.60 m 涌浪、20 m 波长、满泡沫 → 汹涌
+//
+// 指数 1.35 让 0..3 这段"看起来还很平"，接近 10 才凶起来 ——
+// 线性映射会让 5 就已经很浪，中间没有可用区间。
+// ============================================================
+struct WaveDerived {
+    float amplitude = 0.0f;    // 涌浪振幅（米）
+    float wavelength = 6.0f;   // 主波长（米）
+    float ripple = 0.0f;       // 细波纹 / 涟漪强度
+    float foam = 0.0f;         // 浪尖 + 岸边泡沫（0..1）
+};
+
+inline WaveDerived deriveWaves(float waves) {
+    WaveDerived d;
+    const float t = std::clamp(waves / 10.0f, 0.0f, 1.0f);
+    // 严格 0：直接返回全零，不走 pow —— 避免 1e-9 级残留让法线抖。
+    if (t <= 0.0f) return d;
+    d.amplitude = 0.60f * std::pow(t, 1.35f);
+    d.wavelength = 3.2f + 16.8f * t;
+    d.ripple = 1.70f * t;
+    d.foam = 0.95f * std::pow(t, 2.2f);
+    return d;
+}
 
 // 把预设写进 body（只动"水质"那一段，形状/位置/高度保持不动 ——
 // 用户在视口里拖出来的范围不该因为换了个水质类型就跑掉）。
@@ -167,10 +210,8 @@ inline void applyPreset(WaterBody& b, Kind k) {
             b.clarity      = 3.2f;
             b.flowSpeed    = 1.10f;
             b.flowDir      = glm::vec2(1.0f, 0.35f);
-            b.waveHeight   = 0.05f;
-            b.waveLength   = 1.8f;
-            b.ripple       = 1.35f;   // 细碎石子的水花感
-            b.foam         = 0.12f;
+            // 浪况：山泉浅而急，但整体波面不大（碎在石头上的是细波）
+            b.waves        = 1.6f;
             b.roughness    = 0.04f;
             break;
         case Kind::Lake:
@@ -183,10 +224,8 @@ inline void applyPreset(WaterBody& b, Kind k) {
             b.clarity      = 1.60f;
             b.flowSpeed    = 0.05f;
             b.flowDir      = glm::vec2(1.0f, 0.0f);
-            b.waveHeight   = 0.10f;
-            b.waveLength   = 6.0f;
-            b.ripple       = 0.55f;
-            b.foam         = 0.30f;
+            // 浪况：湖面开阔，慢涌浪
+            b.waves        = 2.6f;
             b.roughness    = 0.07f;
             break;
         case Kind::Pond:
@@ -199,10 +238,8 @@ inline void applyPreset(WaterBody& b, Kind k) {
             b.clarity      = 0.45f;
             b.flowSpeed    = 0.0f;
             b.flowDir      = glm::vec2(1.0f, 0.0f);
-            b.waveHeight   = 0.02f;
-            b.waveLength   = 1.5f;
-            b.ripple       = 0.30f;
-            b.foam         = 0.55f;
+            // 浪况：死水 —— 几乎平，但保留一点毛细波
+            b.waves        = 0.8f;
             b.roughness    = 0.16f;
             break;
         case Kind::Sea:
@@ -215,10 +252,8 @@ inline void applyPreset(WaterBody& b, Kind k) {
             b.clarity      = 1.20f;
             b.flowSpeed    = 0.35f;
             b.flowDir      = glm::vec2(0.85f, 0.52f);
-            b.waveHeight   = 0.55f;
-            b.waveLength   = 26.0f;
-            b.ripple       = 0.85f;
-            b.foam         = 0.80f;
+            // 浪况：海浪 —— 接近上限
+            b.waves        = 9.4f;
             b.roughness    = 0.05f;
             break;
         case Kind::River:
@@ -231,10 +266,8 @@ inline void applyPreset(WaterBody& b, Kind k) {
             b.clarity      = 0.90f;
             b.flowSpeed    = 1.50f;
             b.flowDir      = glm::vec2(1.0f, 0.0f);
-            b.waveHeight   = 0.08f;
-            b.waveLength   = 3.0f;
-            b.ripple       = 1.00f;
-            b.foam         = 0.35f;
+            // 浪况：河面被拉成流线，波面中等
+            b.waves        = 2.3f;
             b.roughness    = 0.10f;
             break;
     }

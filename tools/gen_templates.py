@@ -136,184 +136,291 @@ def transform(pos, scale=None):
     }
 
 
-def build_scene(kind, spec):
-    """一个模板的起始场景：Ground + Player + 5 个光球 + 传送门。
+# ============================================================
+# 地形（新工程的地面）
+# ============================================================
+# 模板必须**自带**一块地形，而不是引 engine 的 assets/terrain/*：
+# 新工程的资产根是它自己的 assets/，看不到引擎目录（见 ProjectCreate）。
+TERRAIN_COLS = 257
+TERRAIN_ROWS = 257
+TERRAIN_MPP = 2.0       # 每像素 2 m → 514 m 见方
+TERRAIN_MAX_H = 6.0     # 缓起伏，不是山地（新工程第一眼要能走）
+TERRAIN_FLAT_R = 14.0   # 出生点周围压平（米）
 
-    ⚠ 实体顺序是有语义的：Hierarchy 面板按创建顺序排，**也是脚本实例的
-      创建顺序**。Player 排在光球之前，于是 `main.vks` 的 `on start`
-      （重置世界黑板 `picked`）先于 `pickup.vks` 的实例执行 —— 反过来排的话，
-      新工程第一次进 Play 就可能带着上一次残留的分数。
 
-    ⚠ 光球用的是**环状分布**而不是随手写 5 个坐标：拾取半径 1.6 m 而环半径
-      4.0 m，相邻两颗间距 4.7 m，不会"走一步连吃三个"；也保证第三人称
-      （相机距离 4.5）在出生点就能看见至少两颗 —— "这里有东西可以捡"
-      这件事必须一眼可见，否则模板教不会任何人。
+def _hash2(ix, iy):
+    n = (ix * 374761393 + iy * 668265263) & 0xFFFFFFFF
+    n = ((n ^ (n >> 13)) * 1274126177) & 0xFFFFFFFF
+    return ((n ^ (n >> 16)) & 0xFFFFFFFF) / 0xFFFFFFFF
+
+
+def _value_noise(x, y):
+    ix, iy = math.floor(x), math.floor(y)
+    fx, fy = x - ix, y - iy
+    sx = fx * fx * (3.0 - 2.0 * fx)
+    sy = fy * fy * (3.0 - 2.0 * fy)
+    a = _hash2(ix, iy)
+    b = _hash2(ix + 1, iy)
+    c = _hash2(ix, iy + 1)
+    d = _hash2(ix + 1, iy + 1)
+    top = a + (b - a) * sx
+    bot = c + (d - c) * sx
+    return top + (bot - top) * sy
+
+
+def _fbm(x, y, octaves=4):
+    total, amp, freq, norm = 0.0, 1.0, 1.0, 0.0
+    for _ in range(octaves):
+        total += _value_noise(x * freq, y * freq) * amp
+        norm += amp
+        amp *= 0.5
+        freq *= 2.0
+    return total / norm
+
+
+def terrain_height(xm, ym):
+    """缓起伏地形（米）。出生点附近平滑压到 0 —— 否则玩家一落地就滑坡。"""
+    h = (_fbm(xm / 90.0, ym / 90.0, 4) - 0.5) * 2.0
+    # 幂次让谷底更平、脊线更圆，读起来像"自然土坡"而不是噪声
+    h = math.copysign(abs(h) ** 1.25, h)
+    z = h * TERRAIN_MAX_H * 0.5
+    r = math.hypot(xm, ym)
+    if r < TERRAIN_FLAT_R:
+        t = r / TERRAIN_FLAT_R
+        z *= t * t
+    return z
+
+
+def build_terrain_bytes():
+    """返回 (height.r32, splat.rgba8) 的字节。"""
+    import struct as _struct
+    half = (TERRAIN_COLS - 1) * 0.5
+    raw = []
+    for r in range(TERRAIN_ROWS):
+        for c in range(TERRAIN_COLS):
+            raw.append(terrain_height((c - half) * TERRAIN_MPP,
+                                      (r - half) * TERRAIN_MPP))
+    lo, hi = min(raw), max(raw)
+    span = max(hi - lo, 1e-6)
+    norm = [(v - lo) / span for v in raw]
+    height = _struct.pack("<%df" % len(norm), *norm)
+    # splat：4 层指向同一材质，权重全给第 0 层（想分层刷地表在编辑里改）
+    splat = bytearray(TERRAIN_COLS * TERRAIN_ROWS * 4)
+    for i in range(TERRAIN_COLS * TERRAIN_ROWS):
+        splat[i * 4] = 255
+    return height, bytes(splat)
+
+
+def build_terrain_json():
+    return {
+        "type": "terrain",
+        "version": 1,
+        "name": "ground",
+        "cols": TERRAIN_COLS,
+        "rows": TERRAIN_ROWS,
+        "metersPerPixel": TERRAIN_MPP,
+        "maxHeight": TERRAIN_MAX_H,
+        "splatRepeat": 1.0,
+        "layerTiling": 6.0,
+        "height": "height.r32",
+        "splat": "splat.rgba8",
+        "layers": ["materials/template_ground"] * 4,
+    }
+
+
+# ============================================================
+# 地面贴图（2026-10-21 第九轮：没有贴图的地面看起来"糊成一团"）
+# ============================================================
+# 用户报"视口里近处远处的地面明显模糊重影"。实测根因不是 TAA/阴影
+# （开关前后逐像素相同），而是**材质一张贴图都没有**：几百像素的纯渐变
+# 色带，眼睛读成"糊"+ 马赫带。
+#
+# 这里纯 Python 生成两张**无缝**贴图（不依赖 PIL：宿主裸 python 没装）：
+#   · albedo —— 土黄底 + 两个八度噪声 + 碎石子
+#   · normal —— 由同一张高度场求梯度，让地面在掠射角下真的"有颗粒"
+TEX_SIZE = 256
+
+
+def _periodic_noise(x, y, period, seed):
+    """周期性 value noise：period 用整数取模 → 贴图左右/上下无缝。"""
+    ix, iy = int(math.floor(x)), int(math.floor(y))
+    fx, fy = x - ix, y - iy
+    sx = fx * fx * (3.0 - 2.0 * fx)
+    sy = fy * fy * (3.0 - 2.0 * fy)
+
+    def h(i, j):
+        i %= period
+        j %= period
+        n = (i * 374761393 + j * 668265263 + seed * 1442695040) & 0xFFFFFFFF
+        n = ((n ^ (n >> 13)) * 1274126177) & 0xFFFFFFFF
+        return ((n ^ (n >> 16)) & 0xFFFFFFFF) / 0xFFFFFFFF
+
+    a, b = h(ix, iy), h(ix + 1, iy)
+    c, d = h(ix, iy + 1), h(ix + 1, iy + 1)
+    top = a + (b - a) * sx
+    bot = c + (d - c) * sx
+    return top + (bot - top) * sy
+
+
+def _ground_height(u, v):
+    """0..1 的表面高度场（无缝）。u/v ∈ [0,1)。
+
+    ⚠ 频率给得高一点（16/48/128）：低频大斑块在 6 米一铺的平铺下会读成
+      "一大片脏印子"，而且远处能看出重复；细颗粒才像土。
     """
-    p = spec["player"]
+    base = (_periodic_noise(u * 16.0, v * 16.0, 16, 1) - 0.5) * 0.34
+    mid = (_periodic_noise(u * 48.0, v * 48.0, 48, 2) - 0.5) * 0.30
+    fine = (_periodic_noise(u * 128.0, v * 128.0, 128, 3) - 0.5) * 0.22
+    return 0.5 + base + mid + fine
+
+
+def build_ground_textures():
+    """返回 (albedo_png_bytes, normal_png_bytes)。"""
+    n = TEX_SIZE
+    h = [[_ground_height(x / n, y / n) for x in range(n)] for y in range(n)]
+
+    # ---- albedo：土黄底 * 噪声明暗 + 少量深色石子 ----
+    base = (0.66, 0.53, 0.28)
+    albedo = bytearray(n * n * 3)
+    for y in range(n):
+        row = h[y]
+        for x in range(n):
+            v = row[x]
+            # ⚠ 对比度要克制：0.78~1.22 那档会把"土黄"压成"深褐"，
+            #   在土黄底上只留 ±10% 的明暗 + 一点点石子就够了。
+            shade = 0.93 + 0.14 * v
+            pebble = 1.0 if v < 0.22 else 0.0
+            r = base[0] * shade * (0.90 if pebble else 1.0)
+            g = base[1] * shade * (0.94 if pebble else 1.0)
+            b = base[2] * shade * (0.99 if pebble else 1.0)
+            i = (y * n + x) * 3
+            albedo[i] = max(0, min(255, int(r * 255)))
+            albedo[i + 1] = max(0, min(255, int(g * 255)))
+            albedo[i + 2] = max(0, min(255, int(b * 255)))
+
+    # ---- normal：中心差分梯度（环绕取样 = 无缝）----
+    strength = 1.3
+    normal = bytearray(n * n * 3)
+    for y in range(n):
+        for x in range(n):
+            hl = h[y][(x - 1) % n]
+            hr = h[y][(x + 1) % n]
+            hd = h[(y - 1) % n][x]
+            hu = h[(y + 1) % n][x]
+            nx = (hl - hr) * strength
+            ny = (hd - hu) * strength
+            nz = 1.0
+            ln = math.sqrt(nx * nx + ny * ny + nz * nz)
+            i = (y * n + x) * 3
+            normal[i] = int((nx / ln * 0.5 + 0.5) * 255)
+            normal[i + 1] = int((ny / ln * 0.5 + 0.5) * 255)
+            normal[i + 2] = int((nz / ln * 0.5 + 0.5) * 255)
+
+    return _png_rgb(n, n, albedo), _png_rgb(n, n, normal)
+
+
+def _png_rgb(w, h, rgb):
+    """最小 PNG 编码（zlib 已过滤=0）。确定性：同样的 RGB → 同样的字节。"""
+    import struct as _struct
+    import zlib as _zlib
+
+    def chunk(tag, data):
+        c = _struct.pack(">I", len(data)) + tag + data
+        return c + _struct.pack(">I", _zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    raw = bytearray()
+    stride = w * 3
+    for y in range(h):
+        raw.append(0)                      # filter = None
+        raw += rgb[y * stride:(y + 1) * stride]
+    out = bytearray(b"\x89PNG\r\n\x1a\n")
+    out += chunk(b"IHDR", _struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    out += chunk(b"IDAT", _zlib.compress(bytes(raw), 9))
+    out += chunk(b"IEND", b"")
+    return bytes(out)
+
+
+# 新工程的默认地面材质：土黄。比 terrain_dirt 亮一档 —— 太暗会把起伏吃掉，
+# 新建工程"第一眼看到一张有立体感的土坡"比"看到一块暗色平面"重要。
+# ⚠ albedo / normal 必须带上：没有贴图的纯色地面在视口里就是一片糊。
+TEMPLATE_GROUND_MAT = {
+    "type": "material",
+    "version": 1,
+    "id": "materials/template_ground",
+    "emissive": [0.0, 0.0, 0.0],
+    "doubleSided": False,
+    "normalScale": 1.0,
+    "ao": 1.0,
+    "alphaCutoff": 0.5,
+    "alphaMode": "opaque",
+    "shadingModel": "default",
+    "baseColor": [0.66, 0.53, 0.28, 1.0],
+    "metallic": 0.0,
+    "roughness": 0.92,
+    "albedo": {"kind": "file", "name": "template_ground_albedo",
+               "path": "textures/template_ground_albedo.png", "srgb": True},
+    "normal": {"kind": "file", "name": "template_ground_normal",
+               "path": "textures/template_ground_normal.png", "srgb": False},
+}
+
+
+def build_scene(kind, spec):
+    """起始场景：**只有地形 + 出生点**（2026-10-21 第八轮，用户要求）。
+
+    之前这里是"Ground 平面 + 5 个光球 + 传送门 + 玩家胶囊"（一套能通关的
+    小游戏）。用户要的是"新建工程进来是一张干净的地"：
+      · 地面换成**真地形**（高度图 + splat，土黄色），不再是 20 m 平面；
+      · 场上的道具全部取消；
+      · 玩家不再作为实体存在 —— 由 `GameStart` 标位置，运行时生成
+        （见 `RuntimeApp` 的 `spawnPlayerFromGameStart`）。
+
+    ⚠ `GameStart` 上挂 `main.vks`：它是**世界逻辑**脚本（打印 GAME-READY /
+    GAME-MODE / SCORE），不依赖某个道具实体。挂在这里而不是"没有挂载点"，
+    模板自带的脚本示例才还能跑、还能热重载。
+    """
     cam = spec["camera"]
 
-    ground = {
-        "name": "Ground",
+    terrain = {
+        "name": "Terrain",
         "transform": transform((0.0, 0.0, 0.0)),
         "parent": -1,
         "visible": True,
         "castShadow": False,
         # locked = 视口点选跳过它、不给变换手柄（引擎自带地面就是这么钉住的）
         "locked": True,
-        "mesh": {"kind": "builtin", "shape": "plane", "size": 60.0,
-                 "name": "template_ground"},
-        "material": procedural("template_ground",
-                               [0.26, 0.27, 0.29, 1.0],
-                               metallic=0.0, roughness=0.85),
+        "terrain": {
+            "source": "terrain/ground/terrain.vterrain",
+            "visible": True,
+            "heightScale": 1.0,
+            "layers": ["", "", "", ""],
+        },
     }
 
-    # ---- 5 个可收集光球（金色自发光，半径 0.3）----
-    #
-    # ⚠ **每个光球的材质名都不一样**（template_pickup_1..5）。
-    #   程序化材质按 name 进 AssetManager 缓存，同名即共享；而脚本的
-    #   `setEmissive()` 改的是**共享材质本身**。共用名字的话，将来某个
-    #   光球改成"被捡走后变红"，会一次改红全部 5 个 —— 而且没有任何报错。
-    pickups = []
-    for i in range(5):
-        a = -math.pi / 2 + i * (2.0 * math.pi / 5.0)   # 从 -Y 起，均分一圈
-        x = round(4.0 * math.cos(a), 4)
-        y = round(4.0 * math.sin(a), 4)
-        n = i + 1
-        pickups.append({
-            "name": "Pickup_%d" % n,
-            "transform": transform((x, y, 1.0)),
-            "parent": -1,
-            "visible": True,
-            "castShadow": True,
-            "mesh": {"kind": "builtin", "shape": "sphere", "size": 0.3,
-                     "name": "template_pickup_%d" % n},
-            "primitive": {"kind": "sphere", "size": 0.3, "radius": 0.3,
-                          "segments": 24, "rings": 16},
-            "material": procedural("template_pickup_%d" % n,
-                                   [0.95, 0.78, 0.25, 1.0],
-                                   metallic=0.15, roughness=0.3,
-                                   emissive=[0.55, 0.38, 0.05]),
-            # 每颗光球都是"同一份脚本的独立实例"：`taken` 各自一份。
-            "script": {"path": "scripts/pickup.vks", "enabled": True,
-                       "timeScale": 1.0},
-        })
-
-    # ---- 传送门：场地 -Y 一端的发光地标 ----
-    #
-    # ⚠ 它**不承担通关判定**（收齐光球即通关，见 main.vks）。原因是
-    #   "出生点能不能看见它"取决于 Play 态相机的朝向与距离，而这在编辑器里
-    #   受玩家 yaw / spring arm 影响 —— 一个模板不该把"第一局一定能走完"
-    #   押在镜头朝向上。它在这里的职责是**视觉奖励**：收齐后由
-    #   portal.vks 点亮 + 自转，让玩家看到"世界对完成有反应"。
-    #   直径 1.5 m、高 3 m：在 60 m 的地面上是一个明确的地标，又不挡路。
-    portal = {
-        "name": "Portal",
-        "transform": transform((0.0, -8.0, 0.0), scale=(1.0, 1.0, 2.0)),
+    # 出生点：站在原点。生成器已把原点周围 14 m 压平到 0，所以玩家落地
+    # 不会滑；朝向 0 = +X（与 third_person 的相机构图一致）。
+    game_start = {
+        "name": "GameStart",
+        "transform": transform((0.0, 0.0, 0.0)),
         "parent": -1,
         "visible": True,
         "castShadow": False,
-        "mesh": {"kind": "builtin", "shape": "cylinder", "size": 1.5,
-                 "name": "template_portal"},
-        "primitive": {"kind": "cylinder", "size": 1.5, "radius": 0.75,
-                      "segments": 32, "rings": 1},
-        "material": procedural("template_portal",
-                               [0.15, 0.55, 0.55, 1.0],
-                               metallic=0.0, roughness=0.25,
-                               emissive=[0.05, 0.45, 0.55]),
-        # 终点逻辑住在 portal.vks（setEmissive 只对自己生效，见该文件头）
-        "script": {"path": "scripts/portal.vks", "enabled": True,
+        "gameStart": {"yaw": 0.0, "enabled": True},
+        "script": {"path": "scripts/main.vks", "enabled": True,
                    "timeScale": 1.0},
-    }
-
-    player = {
-        "name": "Player",
-        "transform": transform((0.0, 0.0, 0.0)),
-        "parent": -1,
-        "visible": spec["body_visible"],
-        "castShadow": True,
-        # 占位胶囊（r=0.35, 圆柱段半高 0.55 → 总高约 1.8）。
-        # ⚠ 真正的角色模型要走角色详情窗口绑定（character_pipeline A1），
-        #   模板**不承诺**创建完就能看见一个第三人称小人。
-        "mesh": {"kind": "builtin", "shape": "cylinder", "size": 1.0,
-                 "name": "template_player"},
-        "primitive": {"kind": "cylinder", "size": 0.9, "radius": 0.35,
-                      "segments": 16, "rings": 1},
-        "material": procedural("template_player",
-                               [0.62, 0.70, 0.86, 1.0],
-                               metallic=0.0, roughness=0.45),
-        # 角色控制器（移动 / 贴地 / 跳跃）
-        "character": {
-            "radius": 0.35,
-            "halfHeight": 0.55,
-            "stepHeight": 0.35,
-            "slopeLimitDeg": 46.0,
-            "groundSnap": True,
-            "groundSnapDistance": 0.3,
-            "gravityScale": 1.0,
-            "maxSpeed": 4.5,
-            "sprintMultiplier": 2.0,
-            "jumpSpeed": 5.0,
-            "acceleration": 40.0,
-            "airControl": 0.25,
-            "turnSpeed": p["turnSpeed"],
-            "pushStrength": 1.0,
-            "enabled": True,
-        },
-        # 玩家（第一/第三人称）——**这一块就是两种类型最核心的差异**
-        "player": {
-            "mode": p["mode"],
-            "eyeHeight": p["eyeHeight"],
-            "moveSpeed": p["moveSpeed"],
-            "lookSpeed": p["lookSpeed"],
-            "yaw": p["yaw"],
-            "pitch": p["pitch"],
-            "camDistance": p["camDistance"],
-            "turnSpeed": p["turnSpeed"],
-        },
-        "camera": {
-            "fov": 55.0,
-            "priority": 10,
-            "enabled": True,
-            "targetOffset": list(cam["targetOffset"]),
-            "distance": cam["distance"],
-            "minDistance": 1.0,
-            "collideWithWorld": False,
-            "shakeAmplitude": 0.0,
-            "shakeFrequency": 24.0,
-        },
-        # 脚本（T1 · .vks）—— 把模板自带的 `assets/scripts/main.vks` **挂到
-        # 玩家身上**。
-        #
-        # ⚠ 这一行不是装饰。`EditorApp::preloadScripts()` 只收集**场景里
-        #   被 `ScriptComponent` 引用到的**脚本（不是扫描目录）—— 场景不引用
-        #   的话，模板自带的那份 `main.vks` 永远不会被编译、也不会热重载。
-        #   于是"改一行 .vks 保存 → 立刻生效"这条路径在新工程里根本不存在，
-        #   而界面上没有任何提示（脚本文件在那儿躺着，看起来一切正常）。
-        #
-        # 附带好处：新工程一打开，Console 里就有一条 `HELLO <工程名>`，
-        # "脚本管线通了"这件事**肉眼可见**，不用去猜。
-        "script": {
-            "path": "scripts/main.vks",
-            "enabled": True,
-            "timeScale": 1.0,
-        },
     }
 
     return {
         "version": 1,
-        "generator": "gen_templates.py (%s) —— 起始场景，材质全部程序化，零外部路径"
-                     % kind,
+        "generator": "gen_templates.py (%s) —— 空场景：地形 + 出生点" % kind,
         # ------------------------------------------------------------
         # 场景相机（编辑器第一次打开这个场景时的取景）
         # ------------------------------------------------------------
-        # ⚠⚠ 三个单位陷阱，2026-10-21 一次性踩全了（用户报的就是这个）：
-        #   1) **yaw / pitch 是弧度**，不是度（SceneSerializer 的 cameraToJson
-        #      存的就是弧度，Camera::setPitch 的合法区间也只有 ±1.5533）；
-        #   2) **pitch 与"视线仰角"反号**：Camera 的 pitch = 相机在目标
-        #      **上方**的角度。写负数 = 相机沉到目标下面朝天看 ——
-        #      "新工程一进去视角朝上、还在地面以下"就是这么来的；
+        # ⚠⚠ 三个单位陷阱（2026-10-21 一次性踩全了）：
+        #   1) **yaw / pitch 是弧度**，不是度；
+        #   2) **pitch 与"视线仰角"反号**：pitch = 相机在目标**上方**的角度，
+        #      写负数 = 相机沉到地面以下朝天看；
         #   3) yaw = π 才是"站在角色背后"：yaw=0 时相机在 +X 侧看向 -X，
-        #      而角色默认朝 +X —— 那是**正对着脸**拍。
+        #      而角色默认朝 +X —— 那是正对着脸拍。
         "camera": {
             "target": list(cam["targetOffset"]),
             "yaw": math.pi,
@@ -335,7 +442,7 @@ def build_scene(kind, spec):
             "maxSubSteps": 4,
             "allowSleep": True,
         },
-        "entities": [ground, player] + pickups + [portal],
+        "entities": [terrain, game_start],
     }
 
 
@@ -611,6 +718,13 @@ def build_template_json(kind, spec):
             "assets/scripts/main.vks",
             "assets/scripts/pickup.vks",
             "assets/scripts/portal.vks",
+            # 地形：vterrain + 两张二进制 + 默认材质
+            "assets/terrain/ground/terrain.vterrain",
+            "assets/terrain/ground/height.r32",
+            "assets/terrain/ground/splat.rgba8",
+            "assets/materials/template_ground.vmat",
+            "assets/textures/template_ground_albedo.png",
+            "assets/textures/template_ground_normal.png",
             "config/render.json",
         ],
     }
@@ -722,8 +836,15 @@ def generate_texts():
         # ⚠ 两个类型的脚本内容**逐字相同**（差异在场景的 player/camera 段）：
         #   玩法不该因为"第一人称"就分叉成两份要各自维护的源码。
         files[base + "/assets/scripts/main.vks"] = MAIN_VKS
+        # pickup/portal 两份脚本保留：它们是"脚本能干什么"的示例，新建工程
+        # 里没引用（场景里已经没有光球/传送门），想抄请自行挂到实体上。
         files[base + "/assets/scripts/pickup.vks"] = PICKUP_VKS
         files[base + "/assets/scripts/portal.vks"] = PORTAL_VKS
+        # 地形（新工程自带一整块土黄地面）+ 它的默认材质
+        files[base + "/assets/terrain/ground/terrain.vterrain"] = \
+            dump_json(build_terrain_json())
+        files[base + "/assets/materials/template_ground.vmat"] = \
+            dump_json(TEMPLATE_GROUND_MAT)
         files[base + "/README.md"] = build_readme(kind, spec)
     return files
 
@@ -751,6 +872,25 @@ def main():
         else:
             write_text(abs_path, text)
             written += 1
+
+    # ---- 地形二进制（不进 generate_texts：`--check` 走的是文本比对）----
+    if not args.check:
+        height, splat = build_terrain_bytes()
+        albedo, normal = build_ground_textures()
+        for kind in TYPES:
+            for name, data in (("height.r32", height),
+                               ("splat.rgba8", splat)):
+                p = os.path.join(OUT_ROOT, kind, "assets", "terrain",
+                                 "ground", name)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as f:
+                    f.write(data)
+            for name, data in (("template_ground_albedo.png", albedo),
+                               ("template_ground_normal.png", normal)):
+                p = os.path.join(OUT_ROOT, kind, "assets", "textures", name)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as f:
+                    f.write(data)
 
     if args.check:
         if drift:

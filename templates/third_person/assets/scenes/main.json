@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generator": "gen_templates.py (third_person) —— 起始场景，材质全部程序化，零外部路径",
+  "generator": "gen_templates.py (third_person) —— 空场景：地形 + 出生点",
   "camera": {
     "target": [
       0.0,
@@ -36,7 +36,7 @@
   },
   "entities": [
     {
-      "name": "Ground",
+      "name": "Terrain",
       "transform": {
         "position": [
           0.0,
@@ -58,141 +58,25 @@
       "visible": true,
       "castShadow": false,
       "locked": true,
-      "mesh": {
-        "kind": "builtin",
-        "shape": "plane",
-        "size": 60.0,
-        "name": "template_ground"
-      },
-      "material": {
-        "kind": "procedural",
-        "name": "template_ground",
-        "baseColor": [
-          0.26,
-          0.27,
-          0.29,
-          1.0
-        ],
-        "metallic": 0.0,
-        "roughness": 0.85,
-        "emissive": [
-          0.0,
-          0.0,
-          0.0
-        ],
-        "doubleSided": false,
-        "alphaMode": "opaque"
-      }
-    },
-    {
-      "name": "Player",
-      "transform": {
-        "position": [
-          0.0,
-          0.0,
-          0.0
-        ],
-        "rotation": [
-          0.0,
-          0.0,
-          0.0
-        ],
-        "scale": [
-          1.0,
-          1.0,
-          1.0
+      "terrain": {
+        "source": "terrain/ground/terrain.vterrain",
+        "visible": true,
+        "heightScale": 1.0,
+        "layers": [
+          "",
+          "",
+          "",
+          ""
         ]
-      },
-      "parent": -1,
-      "visible": true,
-      "castShadow": true,
-      "mesh": {
-        "kind": "builtin",
-        "shape": "cylinder",
-        "size": 1.0,
-        "name": "template_player"
-      },
-      "primitive": {
-        "kind": "cylinder",
-        "size": 0.9,
-        "radius": 0.35,
-        "segments": 16,
-        "rings": 1
-      },
-      "material": {
-        "kind": "procedural",
-        "name": "template_player",
-        "baseColor": [
-          0.62,
-          0.7,
-          0.86,
-          1.0
-        ],
-        "metallic": 0.0,
-        "roughness": 0.45,
-        "emissive": [
-          0.0,
-          0.0,
-          0.0
-        ],
-        "doubleSided": false,
-        "alphaMode": "opaque"
-      },
-      "character": {
-        "radius": 0.35,
-        "halfHeight": 0.55,
-        "stepHeight": 0.35,
-        "slopeLimitDeg": 46.0,
-        "groundSnap": true,
-        "groundSnapDistance": 0.3,
-        "gravityScale": 1.0,
-        "maxSpeed": 4.5,
-        "sprintMultiplier": 2.0,
-        "jumpSpeed": 5.0,
-        "acceleration": 40.0,
-        "airControl": 0.25,
-        "turnSpeed": 12.0,
-        "pushStrength": 1.0,
-        "enabled": true
-      },
-      "player": {
-        "mode": "third",
-        "eyeHeight": 1.7,
-        "moveSpeed": 3.0,
-        "lookSpeed": 0.0025,
-        "yaw": 0.0,
-        "pitch": -0.35,
-        "camDistance": 4.5,
-        "turnSpeed": 12.0
-      },
-      "camera": {
-        "fov": 55.0,
-        "priority": 10,
-        "enabled": true,
-        "targetOffset": [
-          0.0,
-          0.0,
-          1.2
-        ],
-        "distance": 4.5,
-        "minDistance": 1.0,
-        "collideWithWorld": false,
-        "shakeAmplitude": 0.0,
-        "shakeFrequency": 24.0
-      },
-      "script": {
-        "path": "scripts/main.vks",
-        "enabled": true,
-        "timeScale": 1.0
       }
     },
     {
-      "name": "Pickup_1",
+      "name": "GameStart",
       "transform": {
         "position": [
           0.0,
-          -4.0,
-          1.0
+          0.0,
+          0.0
         ],
         "rotation": [
           0.0,
@@ -203,345 +87,17 @@
           1.0,
           1.0,
           1.0
-        ]
-      },
-      "parent": -1,
-      "visible": true,
-      "castShadow": true,
-      "mesh": {
-        "kind": "builtin",
-        "shape": "sphere",
-        "size": 0.3,
-        "name": "template_pickup_1"
-      },
-      "primitive": {
-        "kind": "sphere",
-        "size": 0.3,
-        "radius": 0.3,
-        "segments": 24,
-        "rings": 16
-      },
-      "material": {
-        "kind": "procedural",
-        "name": "template_pickup_1",
-        "baseColor": [
-          0.95,
-          0.78,
-          0.25,
-          1.0
-        ],
-        "metallic": 0.15,
-        "roughness": 0.3,
-        "emissive": [
-          0.55,
-          0.38,
-          0.05
-        ],
-        "doubleSided": false,
-        "alphaMode": "opaque"
-      },
-      "script": {
-        "path": "scripts/pickup.vks",
-        "enabled": true,
-        "timeScale": 1.0
-      }
-    },
-    {
-      "name": "Pickup_2",
-      "transform": {
-        "position": [
-          3.8042,
-          -1.2361,
-          1.0
-        ],
-        "rotation": [
-          0.0,
-          0.0,
-          0.0
-        ],
-        "scale": [
-          1.0,
-          1.0,
-          1.0
-        ]
-      },
-      "parent": -1,
-      "visible": true,
-      "castShadow": true,
-      "mesh": {
-        "kind": "builtin",
-        "shape": "sphere",
-        "size": 0.3,
-        "name": "template_pickup_2"
-      },
-      "primitive": {
-        "kind": "sphere",
-        "size": 0.3,
-        "radius": 0.3,
-        "segments": 24,
-        "rings": 16
-      },
-      "material": {
-        "kind": "procedural",
-        "name": "template_pickup_2",
-        "baseColor": [
-          0.95,
-          0.78,
-          0.25,
-          1.0
-        ],
-        "metallic": 0.15,
-        "roughness": 0.3,
-        "emissive": [
-          0.55,
-          0.38,
-          0.05
-        ],
-        "doubleSided": false,
-        "alphaMode": "opaque"
-      },
-      "script": {
-        "path": "scripts/pickup.vks",
-        "enabled": true,
-        "timeScale": 1.0
-      }
-    },
-    {
-      "name": "Pickup_3",
-      "transform": {
-        "position": [
-          2.3511,
-          3.2361,
-          1.0
-        ],
-        "rotation": [
-          0.0,
-          0.0,
-          0.0
-        ],
-        "scale": [
-          1.0,
-          1.0,
-          1.0
-        ]
-      },
-      "parent": -1,
-      "visible": true,
-      "castShadow": true,
-      "mesh": {
-        "kind": "builtin",
-        "shape": "sphere",
-        "size": 0.3,
-        "name": "template_pickup_3"
-      },
-      "primitive": {
-        "kind": "sphere",
-        "size": 0.3,
-        "radius": 0.3,
-        "segments": 24,
-        "rings": 16
-      },
-      "material": {
-        "kind": "procedural",
-        "name": "template_pickup_3",
-        "baseColor": [
-          0.95,
-          0.78,
-          0.25,
-          1.0
-        ],
-        "metallic": 0.15,
-        "roughness": 0.3,
-        "emissive": [
-          0.55,
-          0.38,
-          0.05
-        ],
-        "doubleSided": false,
-        "alphaMode": "opaque"
-      },
-      "script": {
-        "path": "scripts/pickup.vks",
-        "enabled": true,
-        "timeScale": 1.0
-      }
-    },
-    {
-      "name": "Pickup_4",
-      "transform": {
-        "position": [
-          -2.3511,
-          3.2361,
-          1.0
-        ],
-        "rotation": [
-          0.0,
-          0.0,
-          0.0
-        ],
-        "scale": [
-          1.0,
-          1.0,
-          1.0
-        ]
-      },
-      "parent": -1,
-      "visible": true,
-      "castShadow": true,
-      "mesh": {
-        "kind": "builtin",
-        "shape": "sphere",
-        "size": 0.3,
-        "name": "template_pickup_4"
-      },
-      "primitive": {
-        "kind": "sphere",
-        "size": 0.3,
-        "radius": 0.3,
-        "segments": 24,
-        "rings": 16
-      },
-      "material": {
-        "kind": "procedural",
-        "name": "template_pickup_4",
-        "baseColor": [
-          0.95,
-          0.78,
-          0.25,
-          1.0
-        ],
-        "metallic": 0.15,
-        "roughness": 0.3,
-        "emissive": [
-          0.55,
-          0.38,
-          0.05
-        ],
-        "doubleSided": false,
-        "alphaMode": "opaque"
-      },
-      "script": {
-        "path": "scripts/pickup.vks",
-        "enabled": true,
-        "timeScale": 1.0
-      }
-    },
-    {
-      "name": "Pickup_5",
-      "transform": {
-        "position": [
-          -3.8042,
-          -1.2361,
-          1.0
-        ],
-        "rotation": [
-          0.0,
-          0.0,
-          0.0
-        ],
-        "scale": [
-          1.0,
-          1.0,
-          1.0
-        ]
-      },
-      "parent": -1,
-      "visible": true,
-      "castShadow": true,
-      "mesh": {
-        "kind": "builtin",
-        "shape": "sphere",
-        "size": 0.3,
-        "name": "template_pickup_5"
-      },
-      "primitive": {
-        "kind": "sphere",
-        "size": 0.3,
-        "radius": 0.3,
-        "segments": 24,
-        "rings": 16
-      },
-      "material": {
-        "kind": "procedural",
-        "name": "template_pickup_5",
-        "baseColor": [
-          0.95,
-          0.78,
-          0.25,
-          1.0
-        ],
-        "metallic": 0.15,
-        "roughness": 0.3,
-        "emissive": [
-          0.55,
-          0.38,
-          0.05
-        ],
-        "doubleSided": false,
-        "alphaMode": "opaque"
-      },
-      "script": {
-        "path": "scripts/pickup.vks",
-        "enabled": true,
-        "timeScale": 1.0
-      }
-    },
-    {
-      "name": "Portal",
-      "transform": {
-        "position": [
-          0.0,
-          -8.0,
-          0.0
-        ],
-        "rotation": [
-          0.0,
-          0.0,
-          0.0
-        ],
-        "scale": [
-          1.0,
-          1.0,
-          2.0
         ]
       },
       "parent": -1,
       "visible": true,
       "castShadow": false,
-      "mesh": {
-        "kind": "builtin",
-        "shape": "cylinder",
-        "size": 1.5,
-        "name": "template_portal"
-      },
-      "primitive": {
-        "kind": "cylinder",
-        "size": 1.5,
-        "radius": 0.75,
-        "segments": 32,
-        "rings": 1
-      },
-      "material": {
-        "kind": "procedural",
-        "name": "template_portal",
-        "baseColor": [
-          0.15,
-          0.55,
-          0.55,
-          1.0
-        ],
-        "metallic": 0.0,
-        "roughness": 0.25,
-        "emissive": [
-          0.05,
-          0.45,
-          0.55
-        ],
-        "doubleSided": false,
-        "alphaMode": "opaque"
+      "gameStart": {
+        "yaw": 0.0,
+        "enabled": true
       },
       "script": {
-        "path": "scripts/portal.vks",
+        "path": "scripts/main.vks",
         "enabled": true,
         "timeScale": 1.0
       }

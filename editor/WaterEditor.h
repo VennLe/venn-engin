@@ -61,6 +61,29 @@ public:
     // 当前有没有选中一块水体
     bool hasWater() const;
 
+    // ---- W/E/R 手柄 ↔ WaterBody 的镜像（2026-10-21 第七轮）----
+    //
+    // 水体**没有网格组件**，所以它不在场景绘制列表里；变换手柄（gizmo）
+    // 只认 `TransformComponent` —— 于是"手柄拖了但水面不动"。
+    //
+    // 做法：把 Transform 当成**手柄载体**，每帧双向同步一次：
+    //   · `syncTransformFromBody`：body → Transform（手柄站到水面上）
+    //   · `applyTransformToBody`：Transform → body（移动/旋转/缩放写回去）
+    // 调用点必须**成对**夹住 gizmo.update —— 上一帧写下去的 body 位置
+    // 就是这一帧手柄的起点；只做一半会让手柄与水面互相打架。
+    void syncTransformFromBody(ecs::Entity e);
+    void applyTransformToBody(ecs::Entity e);
+
+    // 缩放的"上一帧已乘进 halfExtent 的倍率"。
+    //
+    // ⚠ 必须记这个：gizmo 写的是**绝对**倍率（`m_startScale * factor`，
+    //   startScale 被 sync 钉成 1，所以 tf.scale 就是"相对拖拽起点"的
+    //   累计倍率）。如果每帧直接 `halfExtent *= tf.scale`，就会把累计量
+    //   反复乘进去 —— 实测一次拖拽把半径从 18 干到 2.4e9。
+    //   正解：只乘"本帧倍率 / 上帧倍率"这个**比值**。
+    glm::vec2 m_scaleApplied{1.0f, 1.0f};
+    std::uint32_t m_scaleAppliedId = 0;
+
 private:
     ecs::WaterComponent* selected();          // 可能为空
     const ecs::WaterComponent* selected() const;

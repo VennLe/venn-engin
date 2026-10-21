@@ -1,0 +1,19 @@
+{
+  "type": "terrain",
+  "version": 1,
+  "name": "ground",
+  "cols": 257,
+  "rows": 257,
+  "metersPerPixel": 2.0,
+  "maxHeight": 6.0,
+  "splatRepeat": 1.0,
+  "layerTiling": 6.0,
+  "height": "height.r32",
+  "splat": "splat.rgba8",
+  "layers": [
+    "materials/template_ground",
+    "materials/template_ground",
+    "materials/template_ground",
+    "materials/template_ground"
+  ]
+}

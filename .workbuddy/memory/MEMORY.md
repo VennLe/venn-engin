@@ -50,6 +50,22 @@ indexing 可用** —— 但**低端设备只保证 8** → 加纹理槽走 **bi
   三个实测 bug：①**同名静默合并**；②**身份是数组下标**（重导出即错位）；③**导入模型的材质覆盖存盘即丢**。
 - **动画/蒙皮**：`jointBase` 三路（MDI `aux.x` / 合批与基线 `push.skin.x`）；`invMeshNode` 与
   `push.model` 约掉 → 静态与蒙皮同一条 draw。⚠ **采样不许留在 Renderer 里**。
+- ⚠⚠ **水体没有网格** → 不在绘制列表 / BVH；`WaterPass` 只看 `WaterBody`（**不看实体
+  Transform**）→ W/E/R 要靠"Transform 当手柄 + 每帧成对镜像"；⚠ 缩放手柄给的是**绝对倍率**，
+  只能乘「本帧/上帧」比值（直接累乘实测 18 → 2.4e9）；拾取要单独做水面求交。
+  浪况 = `waves`(0..10) **单一输入** → `deriveWaves()` 派生（0 严格全零 = 镜面）；
+  旧 waveHeight 只在读老场景时反推。⚠⚠ **Water 不能算进 `brushMode`**（否则
+  `modeToolActive` 把变换手柄整段关掉，只能鼠标拖尺寸）→ 按"选中与否"分工：
+  选中=手柄接管，未选中才拖拽新建（见 `WaterEditor::viewportInput` 的早退）。
+- **出生点 = `GameStartComponent`**（仿 UE5 PlayerStart）：位置走实体 transform，
+  视口里由**编辑器叠加层**画 Q 版小人（锚点 `GAMESTART-MARK`），**不给实体挂网格**
+  （游戏画面里不该出现、Hierarchy 也不该多节点）；运行时
+  `RuntimeApp::spawnPlayerFromGameStart` 只在**没有** CharacterController 时才生成玩家。
+  模板场景 = **地形 + GameStart**（不再放道具）；地形资产与材质必须**随模板自带**
+  —— 新工程的资产根是自己的 `assets/`，看不到引擎的 `assets/terrain/*`。
+  ⚠ 它没有网格 → 点选/落地要单独开口（`pick()` 用竖直胶囊、落地用合成 AABB）；
+  地面"糊/重影"先查**材质有没有贴图**（纯色大面积 = 渐变+色带），不是 TAA；
+  地形层贴图路径必须过 `assets::resolveAssetPath`，否则 `can't fopen` → Fatal。
 ## 脚本（S0~S6 ✅；权威 → `docs/script_roadmap.md` §11）
 - **`engine/script/ScriptRuntime.{h,cpp}` = 唯一 tick 内核**。`let` **幂等声明**；内建名**编译期**
   解析；相位 **`声明区 → start → 接触事件 → 顶层 → update`**。
@@ -65,8 +81,11 @@ indexing 可用** —— 但**低端设备只保证 8** → 加纹理槽走 **bi
 - **加面板 = 表里加一行**（`panelTableVec()` + `PanelRegistry` → 菜单/快捷键/图标/落盘四路派生）；
   面板间**只准依赖 `EditorContext`**，动引擎走 `EditorHost`。开关权威是 `PanelRegistry.cpp` 的
   `g_open[kMaxPanels]`（**固定数组 + 引用**，vector 扩容 → `bool&` 悬垂）。
-- ⚠ **默认一律"全关"**（`config/render.json` 缺失 → **逐像素等于今天**）。⚠ **快捷键排他**（面板
-  `Alt+1..8` / 工作区 `Ctrl+Alt+1..6` / 视图键 `Ctrl+1..8`）；**别引入 ImGui docking**（自研 `SplitLayout`）。
+- ⚠ **默认一律"全关"**（`config/render.json` 缺失 → **逐像素等于今天**）。⚠ **快捷键排他**
+  （面板 `Alt+1..8` / 工作区 `Ctrl+Alt+1..6` / 视图键 `Ctrl+1..8`）。
+- ⚠ **2026-10-21 起已引入面板 docking**（新增 `ModeRail` / `PanelDock` / `ViewportTabs`，
+  `third_party/imgui` 也随之改动）—— 早先"别引入 docking、自研 SplitLayout"的约定作废。
+  ⚠ 布局一变，所有"按 rect 坐标点控件"的用例都会**静默漂移**（rect 仍在、但落到窗口外）。
 - ⚠ **Inspector 11 页签**：加页签 = `kTabs[]` 加一行 + 两处 `static_assert`；**枚举值 = 图标栏顺序**；
   **落盘写 id 不写下标**。⚠ **`All` 不是融合视图**（9 个脚本靠 `INS-*`）→ 自动化 `All`、交互 `Object`。
 - ⚠⚠ **布局/遮挡/托盘**：Content 是底栏**抽屉**；分隔条靠 `m_occluders`（**必须排除落在
@@ -85,13 +104,13 @@ indexing 可用** —— 但**低端设备只保证 8** → 加纹理槽走 **bi
   与放行条件同源**。⚠ 锚点拼错 = **断言永远为假**（静默 None）；`wait_rect` 读"最后一条" → 窗口收起
   后读到**旧值** → 假通过。- ⚠⚠ **`has_line` 证明不了"点了有反应"** → `wait_count(needle, before+1)`，**计数在点击之前取**。
   ⚠ **节流日志**不能 `sleep` 后读一把，要轮询。
-- ⚠⚠ **像素断言别用"整图平均差"**：角色占屏 4% → "站着 vs 跪着"只有 **0.41/255**。用**显著变化像素
-  占比**（裁到 `VP-RECT`，阈值 8）：> 0.5% **且 > 10× 基线**。⚠ 同 clip 钉两个时间不够 → **换 clip**。
-  ⚠ 同配置跑两次的**控制上限**写 0.1~0.3%（TAA 抖动），**不能写 0**。
-  ⚠⚠ **钉"主色是谁"而不是"某色占多少"**：差分包围盒会随布局缩放翻倍（实测 95x25→197x52），
-  占比型阈值当场红而画面完全正确；**"某状态色占 N%"等于把"控件此刻是否被悬停"判成 bug**。
-  ⚠⚠ **代理量会饱和**：平均差在位移超纹理格宽后撞顶（pom 45° 比 80° 还大）→ 换直接量或只断言单调。
-  ⚠⚠ **绝对容差不能用在计数型瞬时量上**（particles `alive` 跨运行差 1/5/10 随基数漂）→ `max(绝对值, 5%)`。
+- ⚠⚠ **像素断言别用"整图平均差"**（角色占屏 4% → 只差 0.41/255）→ 用**显著变化像素占比**
+  （裁 `VP-RECT`、阈值 8）：> 0.5% **且 > 10× 基线**；⚠ 同 clip 钉两个时间不够 → **换 clip**；
+  控制上限写 0.1~0.3%（TAA 抖动），**不能写 0**。
+- ⚠⚠ 像素断言的四个陷阱：①钉"主色是谁"而不是"某色占多少"（布局缩放会让差分包围盒翻倍，
+  占比阈值当场红而画面全对）；②**代理量会饱和**（平均差在位移超纹理格宽后撞顶，pom 45° 比
+  80° 还大）→ 换直接量或只断言单调；③**绝对容差不能用在计数型瞬时量上**（particles `alive`
+  跨运行漂 1/5/10）→ `max(绝对值, 5%)`；④"某状态色占 N%"等于把"控件是否被悬停"判成 bug。
 - ⚠⚠ **要截图的用例别用 `MYVK_FRAMES`**；**`Game.exe` 认 argv `--frames`，`Editor.exe` 只认
   `MYVK_FRAMES`**（`main.cpp` 丢 argv）。传错**无任何提示**，渲染到超时；叠加 Python **块缓冲** → 外面零日志。
 - ⚠⚠ **`PostMessage` 方向键必须带 `KF_EXTENDED`**（不带 → GLFW 翻成小键盘 2）；⚠ **`ctypes` 必须给
@@ -105,6 +124,9 @@ indexing 可用** —— 但**低端设备只保证 8** → 加纹理槽走 **bi
   摆 (0,0) + 光标挪右下**；⚠⚠ **真实点击要求窗口在最前**（不在最前第一下只"激活窗口"、进不了
   ImGui，日志一个字都没有）→ `click()` 前 `focus_window()`。⚠ **量测四坑**：扫描区间夹在被测
   控件矩形里 / 比两来源先**对齐采样窗口** / "点了没反应"先怀疑**送达** / 一行排 N 个按钮会超宽。
+  ⚠⚠ `MYVK_EDITOR_NO_HUD` **会连带关掉变换手柄**（`GZ-ORIGIN` 一条都不打）→ 拖手柄的用例
+  只能传 no_hud=False。⚠ `logRect` 是**客户区**坐标、`SetCursorPos` 要**屏幕**坐标 →
+  必须走 `verify_asset_drag.move_to(hwnd,…)`，直接用会让整段拖拽平移、抓不到手柄。
 - ⚠⚠ **`Popen(stdout=PIPE)` 必须有人排空**（64 KB 管道满即死锁 → "窗口不出现"）。
 - ⚠⚠ **`shutil.rmtree` 静默失败 = 全绿但一个字没验**（读到上一轮旧文件）→ `fresh_dir()` 删不掉**绝不
   降级复用**。⚠ 宿主有**批量删除保护**（按回合累计，阈值 50 文件）→ 一回合连跑三个 GUI 用例必撞。
@@ -131,8 +153,9 @@ indexing 可用** —— 但**低端设备只保证 8** → 加纹理槽走 **bi
 ## 路线图（权威 → `docs/*_roadmap.md`；已完成数字 → `roadmaps.md`）
 - 完成：启动器 M0~M6(缺 M5-c)·世界 W0~W4·渲染 R0~R4/R5-1/R6-1·编辑器 B/C/D/E11.1/E25/E26·
   运行时 M1+M2·物理 v1(仅 Play)·音频·UI/HUD U0~U8·脚本 S0~S6。
-- 下一项：**A2 状态机**（A1 ✅）·世界 **W5 植被**·编辑器 E20/E22·渲染 R6-2 水体·**G16-1**。
+- 下一项：**A2 状态机**（A1 ✅）·世界 **W5 植被**·编辑器 E20/E22·**G16-1**。
+  （R6-2 水体已实现到第七轮：W/E/R + 浪况单参数，见 render_roadmap.md）
   ⚠ **anim/sk 双份字段的权威规则**见 `roadmaps.md`。
-- ⚠ flaky：`bvh`/`csm`/`ibl` 偶发全红（单跑 PASS）→ **别补跑"凑干净"**。
-  **10-19 的 5 个红已全修**（camfx/taa/pom = 期望过期；particles = 交互+容差；
-  notifications = **Console 环形缓冲真缺陷**）→ 判据见 `ship_roadmap.md`「全量回归基线」。
+- ⚠ flaky：`bvh`/`csm`/`ibl` 偶发全红（单跑 PASS）→ **别补跑"凑干净"**（判据见
+  `ship_roadmap.md`「全量回归基线」）。10-21 起 `primitive/material_roundtrip` 因**面板
+  docking 重构**漂移（rect 落到窗口外）→ 修布局，别改期望。

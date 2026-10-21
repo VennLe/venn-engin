@@ -169,6 +169,9 @@ private:
     // 执行"往场景里加一个物体"并选中新实体（Inspector 随之显示它的参数）
     void addEntity(const char* what, const std::function<ecs::Entity()>& create);
     void focusSelection() const;
+    // 把相机对到任意实体（Hierarchy 双击走这条）。没有网格的实体
+    // （GameStart / 水体）用它自己的尺寸估距离，见 .cpp。
+    void focusEntity(ecs::Entity e) const;
 
     // 选中物体上的**右键菜单**：添加 / 移除碰撞体、切换"手柄编辑碰撞体"。
     //

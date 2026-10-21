@@ -1169,4 +1169,24 @@ struct WaterComponent {
     bool visible = true;
 };
 
+// ============================================================
+// GameStartComponent —— 玩家出生点（2026-10-21 第八轮）
+//
+// 对应 UE5 的 PlayerStart：一个**不带网格**的标记实体，运行时把玩家放在这里。
+// 与"摆一个 Player 实体"的区别：
+//   · Player 实体是**玩家本身**（有 CharacterController / Player 组件，
+//     编辑态就能走进场景试玩）；
+//   · GameStart 只是**一个位置 + 朝向**，玩家是运行时按它生成的。
+// 模板场景因此可以是"空的"：只有地形 + 一个出生点。
+//
+// 视口里的呈现走**编辑器叠加层**（见 ViewportPanel::drawGameStartMarkers），
+// 不占场景实体、也不会出现在游戏画面里 —— 与 UE 里 PlayerStart 只在编辑器
+// 可见是同一个约定。
+// ============================================================
+struct GameStartComponent {
+    // 出生朝向（弧度，绕 z）。相机与角色都从这里起。
+    float yaw = 0.0f;
+    bool enabled = true;
+};
+
 } // namespace ecs

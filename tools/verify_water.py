@@ -519,8 +519,13 @@ def main():
         print("失败 %d 条：" % len(vtm.fails))
         for f in vtm.fails:
             print("  -", f)
+        # ⚠ 结果行必须用 **ASCII 冒号**：run_regression 的 OK_RE/BAD_RE 只认
+        #   `结果: PASS` / `结果: FAIL`。只写"全部通过。"会被框架判成 FAIL
+        #   （本用例之前没进 DEFAULT，所以这个坑一直没暴露）。
+        print("结果: FAIL（%d 项）" % len(vtm.fails))
         return 1
     print("全部通过。")
+    print("结果: PASS")
     return 0
 
 

@@ -16,6 +16,12 @@
     "assets/scripts/main.vks",
     "assets/scripts/pickup.vks",
     "assets/scripts/portal.vks",
+    "assets/terrain/ground/terrain.vterrain",
+    "assets/terrain/ground/height.r32",
+    "assets/terrain/ground/splat.rgba8",
+    "assets/materials/template_ground.vmat",
+    "assets/textures/template_ground_albedo.png",
+    "assets/textures/template_ground_normal.png",
     "config/render.json"
   ]
 }

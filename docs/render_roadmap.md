@@ -1289,6 +1289,65 @@
 - **改动点**：Gerstner 波（法线位移）+ 菲涅尔 + 折射（采样不透明 HDR）+ 深度衰减颜色混合 + 简单焦散（噪声贴图滚动）；反射先接 SSR。
 - **规模**：M
 
+#### 2026-10-21 第七轮：可被 W/E/R 操作 + 浪况合成单一参数
+
+用户两条要求：
+1. "水体创建后必须是在 3D 视口中可以移动的，可以通过 W/E/R 控制位置、旋转、缩放。"
+2. "浪花波纹要通过一个浮点参数控制，0 = 无任何波纹的平静水面，10 = 汹涌的浪涛。"
+
+**① W/E/R 手柄**
+- 病灶：水体**没有网格组件**，而 gizmo 只认 `TransformComponent`；`WaterPass`
+  建模用 `body.center / level / rotation / halfExtent`，完全忽略实体变换 →
+  "拖了手柄水面不动"。
+- 做法（`editor/WaterEditor.cpp`）：把 Transform 当**手柄载体**，每帧成对同步：
+  `syncTransformFromBody`（body→Transform，手柄站到水面上）→ `gizmo.update`
+  → `applyTransformToBody`（Transform→body）。调用点成对夹住 gizmo，
+  只做一半会互相打架。
+- ⚠ **缩放必须乘"比值"**：gizmo 写的是**绝对**倍率（`m_startScale*factor`），
+  每帧直接乘会把累计量反复叠进去 —— 实测一次拖拽把半径从 18 干到 2.4e9。
+  改成 `halfExtent *= 本帧倍率 / 上帧倍率`（`m_scaleApplied`），并夹到
+  [0.5, 2000] m 兜底。
+- 另：`PickingSystem::pick` 补了**水面拾取**（射线 vs 水平圆/矩形），否则只能
+  在层级里选中它。水体没有网格 → 不在 BVH 里，所以放在 PICK-DBG 自检**之后**。
+
+**② 浪况 0..10**
+- `WaterBody::waves`（0..10）成为唯一输入；振幅/波长/细波/泡沫全部由
+  `deriveWaves()` 派生（**只有这一份映射**，`WaterPass` 与面板都调它）：
+  `amp = 0.60·t^1.35`、`λ = 3.2+16.8t`、`ripple = 1.70t`、`foam = 0.95·t^2.2`，
+  `t = waves/10`。**`t == 0` 直接返回全零**（不走 pow，避免 1e-9 残留让法线抖）。
+- 旧的 `waveHeight / waveLength / ripple / foam` 降级为 legacy：仍读写 JSON
+  （兼容），但**不参与渲染**。老场景（无 `waves`）由 `waveHeight` 反推出等效
+  浪况，保证"打开旧场景水面还是原样"。
+- 面板：4 个会互相打架的滑块合成 1 个 `Waves`，且必须放**首屏** —— 面板是
+  滚动子窗口、比窗口还高，放在水位后面时滑块落在 y=759 而客户区只有 753。
+- **验收**：`tools/verify_water_motion.py`（7 组）：
+  · move/rotate/scale 三组真的拖 `GZ-AXIS-X` / `GZ-RING-Z`，断言 `WATER-XFORM`
+    里 center / rot / halfExtent 变了且没串到别的分量；
+  · 水面**高频能量** 0→4→10 单调（0.15 → 0.50 → 0.92），waves=0 是镜面
+    （< waves=10 的 1/3），并有 waves=0 的**控制组**（两次差 < 0.05）；
+  · 面板滑块真的点得动（0 → 10）；
+  · 老场景（只有 waveHeight=0.55）迁移后能量 0.88 > waves=4 的 0.50。
+- ⚠ **NO_HUD 会连带关掉手柄**（实测 GZ-ORIGIN 一条都不打）→ 拖手柄的用例
+  不能设 `MYVK_EDITOR_NO_HUD`。
+- ⚠ `logRect` 给的是**客户区**坐标，`SetCursorPos` 要**屏幕**坐标 →
+  必须用 `verify_asset_drag.move_to(hwnd,…)` 换算，否则整段拖拽平移、抓不到手柄。
+
+#### 2026-10-21 第八轮：Water 模式内也能用 W/E/R
+
+用户："水体不是用鼠标去拖动大小的，而是 W 拖 X/Y/Z 轴位置、R 缩放尺寸。"
+
+- **病灶**：`ViewportPanel` 把 `EditMode::Water` 算进 `brushMode` →
+  `modeToolActive` 为真 → 变换手柄**整个被关掉**。水体在那套逻辑里只能靠
+  鼠标拖拽定尺寸，正是用户不想用的方式。
+- **修法**：Water 移出 `brushMode`，改成按"有没有选中"分工：
+  · 选中水体 → 手柄接管（W 平移 / E 旋转 / R 缩放）；
+  · 没选中     → 左键拖拽才创建新水体。
+  `WaterEditor::viewportInput` 在 `hasSelection()` 时直接返回（只画选中轮廓），
+  防止"在手柄上按下的一瞬间又新建一块水"。
+- 缩放仍走 `applyTransformToBody` 的**比值**累乘（见上一轮），一次拖拽 = ×2。
+- **验收**：`verify_water_motion.py` 增加一组 `editmode=water` 的 scale 拖拽，
+  断言 `halfExtent 18 → 36`（其余断言同前）。
+
 ### R6-3 植被风（顶点风动画）
 
 - **改动点**：全局风参数（方向/强度/gust 噪声）→ 顶点着色器按权重（顶点色 R 或贴图）摆动；instanced 草地（instancing 现成）。
