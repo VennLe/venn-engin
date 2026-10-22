@@ -30,12 +30,13 @@
   C8  `assets/game.json` 的 width/height == 1920x1080（向导默认档）
   C9  `config/render.json` 的 enable 键**全量**（= 引擎的 enable 参数个数）
   C10 High 档真的打开 ssao/taa、关掉 dof
-  C11 场景里 player.mode 与所选类型一致（第三人称 / 第一人称各一遍）
+  C11 场景里**没有** Player 实体、只有 GameStart 出生点（第八轮起的契约：
+      玩家是运行时产物；2026-10-22 改写，原来查的是 player.mode）
   C12 新工程进了 recent.json
   C13 重名创建被拒（日志 `PROJ-CREATE FAILED at Validate`）
   C14 被拒后**没有** `<name>.tmp` 残留
   C15 被拒后原工程的文件没被改动（mtime 不变）
-  C16 相机距离随类型不同（TP 4.5 / FP 8.0）
+  C16 相机取景随类型不同（TP distance 4.5 / pitch 0.35；FP 8.0 / 0.20）
        —— 第一人称那轮的同类断言前缀是 `F`（F5~F16），两轮编号不撞。
 
 用法：
@@ -137,6 +138,13 @@ def run_wizard(work, name, type_index, recent_path, expect_ok=True):
             else:
                 kit.log("CHECK C13 duplicate rejected at Validate OK")
     finally:
+        # 需求 A（2026-10-22）：创建成功即**自动**拉起编辑器。本用例只关心
+        # "工程文件建出来了没有"，那个编辑器是纯副作用 —— 不关掉的话三轮
+        # 向导会攒下三个编辑器窗口，后面用例的 `find_window("Venn Editor")`
+        # 就会认错人。⚠ 重名那一轮预期创建失败、压根没有 spawn，所以按
+        # `expect_ok` 区分，别白等。
+        if expect_ok:
+            kit.dismiss_spawned(tap)
         kit.shutdown(proc, hwnd)
 
     return True, fails, tap.text(), shot_ok
@@ -219,27 +227,52 @@ def check_project(root, name, kind, fails, prefix):
     else:
         kit.log("CHECK %s10 High preset (ssao/taa on, dof off) OK" % prefix)
 
-    # ---- C11 场景里的 player.mode 与所选类型一致 ----
+    # ---- C11 场景里**没有**玩家实体，只有一个出生点 ----
+    #
+    # ⚠⚠ 这条断言在 2026-10-22 被**改写**过（原样是查
+    #   `entities[Player].player.mode == "third"/"first"`）。那个契约已经被
+    #   用户改掉了，现在的契约是：
+    #
+    #     用户原话（第八轮，2026-10-21）："初始场景里不摆放任何物体"。
+    #
+    #   于是 `build_scene()` 只写 Terrain + GameStart，玩家由
+    #   `RuntimeApp::spawnPlayerFromGameStart` 在**运行时**造出来，存盘里
+    #   不该出现它（见那个函数上方那段注释）。所以"Player 实体缺失"现在
+    #   **不是 bug 而是契约**，旧断言永远不可能再绿 —— 留着它只会让
+    #   "红"变成噪音，真出现 Player 时反而没人看见。
+    #
+    #   两种类型的差异现在全在 `camera` 段（C16 查 distance / pitch）。
     with open(os.path.join(root, "assets", "scenes", "main.json"),
               encoding="utf-8") as f:
         scene = json.load(f)
-    player = next((e for e in scene.get("entities", [])
-                   if e.get("name") == "Player"), None)
-    want_mode = "first" if kind == "first_person" else "third"
-    got_mode = (player or {}).get("player", {}).get("mode")
-    if got_mode != want_mode:
-        fails.append("%s11 player.mode=%r，期望 %r" % (prefix, got_mode, want_mode))
+    names = [e.get("name") for e in scene.get("entities", [])]
+    if "Player" in names:
+        fails.append("%s11 场景里又出现了 Player 实体（第八轮起玩家是运行时"
+                     "产物，位置由 GameStart 决定）" % prefix)
+    elif "GameStart" not in names:
+        fails.append("%s11 场景里没有 GameStart（玩家没有出生点）" % prefix)
     else:
-        kit.log("CHECK %s11 player.mode=%s OK" % (prefix, want_mode))
+        kit.log("CHECK %s11 scene entities=%s (no Player, has GameStart) OK"
+                % (prefix, names))
 
-    # ---- C16 相机距离随类型不同 ----
-    want_dist = 8.0 if kind == "first_person" else 4.5
-    got_dist = scene.get("camera", {}).get("distance")
+    # ---- C16 相机取景随类型不同（现在**唯一**的类型差异载体）----
+    want_dist, want_pitch = {"first_person": (8.0, 0.20),
+                             "third_person": (4.5, 0.35)}[kind]
+    cam = scene.get("camera", {})
+    got_dist = cam.get("distance")
     if abs(float(got_dist or -1) - want_dist) > 1e-6:
         fails.append("%s16 camera.distance=%s，期望 %s"
                      % (prefix, got_dist, want_dist))
     else:
         kit.log("CHECK %s16 camera.distance=%s OK" % (prefix, got_dist))
+    # ⚠ pitch 是**弧度**、正数 = 相机在目标上方（2026-10-21 踩过一次
+    #   度/弧度混用：写成 -12.0 会被夹到 -89°，相机沉到地面以下朝天看）。
+    got_pitch = cam.get("pitch")
+    if abs(float(got_pitch if got_pitch is not None else -99.0) - want_pitch) > 1e-6:
+        fails.append("%s16 camera.pitch=%s，期望 %s rad（正数 = 相机在目标上方）"
+                     % (prefix, got_pitch, want_pitch))
+    else:
+        kit.log("CHECK %s16 camera.pitch=%.2f rad OK" % (prefix, want_pitch))
 
 
 def main():

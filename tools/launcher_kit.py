@@ -472,6 +472,61 @@ def parse_spawn_pid(text):
     return int(m.group(1)) if m else 0
 
 
+PROCESS_TERMINATE = 0x0001
+
+
+def kill_pid(pid, timeout_ms=20000):
+    """强制结束一个 pid（**只用于我们自己拉起来的验收进程**）。返回已退出。
+
+    ⚠ 这不是给 `verify_launcher_open/code` 用的 —— 那两个要断言编辑器的
+      退出码（`rc == 0`），必须走 `close_window` + `wait_pid_exit`。
+      这里是给"创建即自动拉起"带来的**副作用**收尾用的，见
+      `dismiss_spawned`。
+    """
+    if not pid:
+        return True
+    h = _kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE |
+                              PROCESS_QUERY_LIMITED_INFORMATION,
+                              False, int(pid))
+    if not h:
+        # 打不开 = 已经没有这个进程（或者已经被回收），当作已退出
+        return True
+    try:
+        _kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        _kernel32.TerminateProcess(h, 1)
+    finally:
+        _kernel32.CloseHandle(h)
+    return wait_pid_exit(pid, timeout_ms) is not None
+
+
+def dismiss_spawned(tap, wait=30.0):
+    """把本脚本**自己触发的**编辑器关掉，返回它的 pid（0 = 压根没拉起）。
+
+    ⚠⚠ 为什么需要它：2026-10-22 起「点创建 → 直接进编辑器」是**真契约**
+      （用户需求 A），于是**每一个**走完向导的验收脚本都会顺手拉起一个
+      编辑器。对 `verify_launcher_open/code` 那是被测对象；但对
+      `verify_launcher_create/display`（只关心"工程建出来了没有"）它是
+      纯副作用 —— 留着的话三个工程就是三个编辑器窗口，下一个用例的
+      `find_window("Venn Editor")` 前缀匹配会**认错人**（拿到上一轮那个
+      还没退干净的），断言就会时红时绿。
+
+    ⚠ 用 `taskkill` 式强杀而不是 `close_window`：这里没有"退出码"要断言，
+      而窗口可能还停在首帧 / 被别的窗口盖着，`find_window` 未必立刻找得到。
+      按 pid 杀是唯一无歧义的做法。
+    """
+    end = time.time() + wait
+    pid = 0
+    while time.time() < end and not pid:
+        pid = parse_spawn_pid(tap.text())
+        if not pid:
+            time.sleep(0.1)
+    if pid:
+        kill_pid(pid)
+        log("NOTE 已清掉自动拉起的编辑器 pid=%d（创建即进编辑器是需求 A 的"
+            "副作用，本用例不测它）" % pid)
+    return pid
+
+
 def drive_wizard(hwnd, tap, type_index=1, timeout=40.0):
     """把四步向导点完，停在「创建」之前，返回失败描述列表（空 = 一路顺）。
 

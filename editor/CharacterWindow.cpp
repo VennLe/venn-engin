@@ -4,6 +4,11 @@
 #include "DebugRects.h"
 #include "EditorDragDrop.h"
 #include "PanelDock.h"
+#include "PickingSystem.h"
+
+#include "animation/AnimatorSystem.h"
+#include "animation/Locomotion.h"
+#include "ui/KeyCodes.h"
 
 #include "assets/AssetManager.h"
 #include "assets/AssetPath.h"
@@ -44,6 +49,25 @@ bool endsWith(const std::string& s, const char* suffix) {
 
 bool isFbxPath(const std::string& p) {
     return endsWith(p, ".fbx") || endsWith(p, ".FBX");
+}
+
+// 四段移动动画的**内建键位**显示名（只读徽标）。nullptr = 这一段没有内建控制。
+//
+// 为什么要有它：这四段由 `animation/Locomotion` 的状态机直接驱动 ——
+//   Idle  停下就播（还带"静止 8 秒重放"）
+//   Walk  水平速度 > walkSpeed
+//   Run   水平速度 > runSpeed（鼠标右键长按 = 加速）
+//   Jump  空格敲击后"离地"这个事实
+// 面板上如果只有一个空的 [+] 键槽，用户会以为"还得先绑个键才能动"，
+// 于是把 W 绑给 Walk —— 绑完反而得到"按 W 强播一段固定动画、人不动"。
+// 这个徽标就是回答"那我到底要不要配"：不用。
+const char* builtinKeyLabel(const std::string& clip) {
+    static const animation::LocomotionConfig kDefault;
+    if (clip == kDefault.walkClip) return "WASD";
+    if (clip == kDefault.runClip) return "RMB";
+    if (clip == kDefault.jumpClip) return "Space";
+    if (clip == kDefault.idleClip) return "auto";
+    return nullptr;
 }
 
 std::string pathStem(const std::string& p) {
@@ -95,6 +119,29 @@ void CharacterWindow::open(ecs::Entity player) {
                             m->skeleton ? m->skeleton->clips.size() : 0);
             } else {
                 VK_LOG_WARN("CharacterWindow: auto-bind failed for '%s'", env);
+            }
+        }
+    }
+
+    // 没有显式指定 → 用玩家身上**已经绑好的**那个模型。
+    //
+    // 2026-10-22 起 `createPlayer` 默认就装配了角色（模型 + 骨骼 + 四段
+    // 动画），面板打开时若不认它，用户看到的是一具空胶囊预览 + "no model"，
+    // 得再拖一次同一个文件 —— 而"面板显示的角色"和"场上那个角色"本该是
+    // 同一个东西。
+    if (!m_model && m_player.valid()) {
+        if (const auto* sk =
+                m_ctx.editorScene().world().get<ecs::SkinnedMeshComponent>(
+                    m_player)) {
+            if (sk->model && sk->model->valid()) {
+                m_model = sk->model;
+                m_modelPath = sk->model->name;
+                m_previewDirty = true;
+                VK_LOG_INFO("CharacterWindow: adopted bound model '%s' "
+                            "(joints=%d clips=%zu)",
+                            m_modelPath.c_str(),
+                            m_model->skeleton ? m_model->skeleton->jointCount() : 0,
+                            m_model->skeleton ? m_model->skeleton->clips.size() : 0u);
             }
         }
     }
@@ -233,8 +280,35 @@ void CharacterWindow::rebuildPreviewScene() {
         hasBox ? (m_boundsMin + m_boundsMax) * 0.5f : glm::vec3(0.0f, 0.0f, 0.9f);
     const glm::vec3 boxSize =
         hasBox ? (m_boundsMax - m_boundsMin) : glm::vec3(1.0f);
-    m_previewTarget = boxCenter;
+
+    // ---- 把预览根抬到"脚踩地面"（2026-10-22）----
+    //
+    // 模型的 pivot 在**几何中心**，脚在 m_boundsMin.z（默认角色是 −0.902）。
+    // 根留在原点的话，预览那层栅格地面会从大腿上穿过去 —— 画面上就是
+    // "人半身埋在地里"，和需求 2（脚不能陷到地形下面）是同一个观感 bug，
+    // 只不过这里的地面是栅格。抬升之后：脚底 = z 0 = 栅格平面。
+    const float footLift = hasBox ? -m_boundsMin.z : 0.0f;
+    if (hasBox) {
+        if (auto* rt = m_previewScene.world().get<ecs::TransformComponent>(
+                m_previewRoot)) {
+            rt->position.z = footLift;
+        }
+    }
+    m_previewTarget = boxCenter + glm::vec3(0.0f, 0.0f, footLift);
     m_previewDistance = previewDistanceFor(boxSize);
+
+    // ---- 预览胶囊的初始尺寸（2026-10-22）----
+    // 按模型身高套同一组解剖比例（与 bindDefaultCharacter / RuntimeApp 的
+    // attachPlayerModel 同源），于是**一打开就是"套住人"的状态** ——
+    // 用户要调的是"差多少"，不是"从哪个数开始猜"。
+    // 脚底对齐模型的包围盒底：模型的 pivot 在几何中心，预览根已经抬到
+    // 脚底踩 z=0，所以胶囊也从 z=0 起（见上面 footLift 那段）。
+    if (hasBox) {
+        const float h = std::max(boxSize.z, 0.2f);
+        m_capsuleRadius = glm::clamp(h * 0.16f, 0.15f, 0.60f);
+        m_capsuleHalfHeight = std::max(0.10f, h * 0.5f - m_capsuleRadius);
+        m_capsulePos = glm::vec3(0.0f, 0.0f, 0.0f);
+    }
     VK_LOG_INFO("CharacterWindow: bounds=[%.3f,%.3f,%.3f]-[%.3f,%.3f,%.3f] "
                 "center=(%.3f,%.3f,%.3f) distance=%.3f",
                 m_boundsMin.x, m_boundsMin.y, m_boundsMin.z,
@@ -253,6 +327,14 @@ void CharacterWindow::rebuildPreviewScene() {
                 "submeshes, skinned=%d)",
                 m_model->name.c_str(), m_model->subMeshes.size(),
                 m_model->skinned() ? 1 : 0);
+    // 叠加层的开关状态 —— 自动化要能断言"栅格/胶囊真的开着"，而不是靠
+    // 一张截图里数绿色像素（那在不同配色主题下会漂）。
+    VK_LOG_INFO("CharacterWindow: preview overlay grid=%d capsule=%d gizmo=%d "
+                "capsuleR=%.3f capsuleHH=%.3f",
+                m_renderer.previewGridEnabled() ? 1 : 0, m_showCapsule ? 1 : 0,
+                m_showGizmo ? 1 : 0,
+                static_cast<double>(m_capsuleRadius),
+                static_cast<double>(m_capsuleHalfHeight));
 }
 
 // ---------------------------------------------------------------- 模型加载
@@ -271,6 +353,10 @@ void tip(const char* text) {
         ImGui::SetTooltip("%s", text);
     }
 }
+
+// 键码换算统一在 `engine/ui/KeyCodes`（ImGui 捕获 / GLFW 码 / 显示名
+// 三张面孔只有那一张表）。这里不再自带一份 —— 自带一份的后果是"面板上
+// 显示 F、实际绑的是别的码"这类只在真机上手才发现的问题。
 
 } // namespace
 
@@ -338,11 +424,12 @@ void CharacterWindow::handlePreviewNavigation(const glm::vec2& vpPos,
 void CharacterWindow::framePreviewCamera() {
     if (!m_model) return;
     if (!m_boundsValid) computeModelBounds();
-    const glm::vec3 center = m_boundsValid
-                                 ? (m_boundsMin + m_boundsMax) * 0.5f
-                                 : glm::vec3(0.0f, 0.0f, 0.9f);
+    glm::vec3 center = m_boundsValid ? (m_boundsMin + m_boundsMax) * 0.5f
+                                     : glm::vec3(0.0f, 0.0f, 0.9f);
     const glm::vec3 size =
         m_boundsValid ? (m_boundsMax - m_boundsMin) : glm::vec3(1.0f);
+    // 预览根被抬到了"脚底踩 z=0"（见 rebuildPreviewScene），取景也要跟着抬
+    center.z += m_boundsValid ? -m_boundsMin.z : 0.0f;
     m_previewTarget = center;
     m_previewDistance = previewDistanceFor(size);
     scene::Camera& cam = m_previewScene.camera();
@@ -370,9 +457,16 @@ float CharacterWindow::previewDistanceFor(const glm::vec3& size) const {
 // ---------------------------------------------------------------- 预览视口
 
 void CharacterWindow::drawPreviewViewport() {
+    // ---- 底部控件条先占位 ----
+    // 图片高度决定了**离屏目标的尺寸**，所以必须"先减掉控件条、再请求
+    // 尺寸"：反过来（画完再减）会让目标每帧重建一次，HDR 链重建是
+    // waitIdle 级别的操作，窗口会明显卡。
+    const float rowH = ImGui::GetFrameHeightWithSpacing();
+    const float stripH = rowH * 4.0f;
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const uint32_t wantW = static_cast<uint32_t>(std::max(avail.x, kMinPreview));
-    const uint32_t wantH = static_cast<uint32_t>(std::max(avail.y, kMinPreview));
+    const uint32_t wantH = static_cast<uint32_t>(
+        std::max(avail.y - stripH, kMinPreview));
 
     // 只在**真的变了**的时候请求重建。setPreviewSize 内部会去抖，但这里
     // 还多一层"非退化"保护：窗口被拖到极窄时 ImGui 会给 0 甚至负数，
@@ -405,7 +499,165 @@ void CharacterWindow::drawPreviewViewport() {
 
     const ImVec2 imgMin = ImGui::GetItemRectMin();
     const ImVec2 imgSz = ImGui::GetItemRectSize();
+    m_vpMin = imgMin;
+    m_vpSize = imgSz;
     const bool hovered = ImGui::IsItemHovered();
+
+    // ---- 胶囊投影（点选与日志共用一份几何）----
+    //
+    // m_capsulePos 是**脚底**，胶囊中轴的两端是两个球心：底 (r)、顶 (2hh+r)。
+    // 半径的像素值取"底球心 → 底球心 + X*r"的屏幕距离 —— 透视下它在远处会
+    // 变小，所以不能写死一个像素常数。
+    const scene::Camera& pcam = m_previewScene.camera();
+    const glm::mat4 pvp =
+        PickingSystem::viewProj(pcam, glm::vec2(imgSz.x, imgSz.y));
+    m_capScrValid = false;
+    if (m_showCapsule && m_capsuleRadius > 1.0e-4f && imgSz.x > 4.0f &&
+        imgSz.y > 4.0f) {
+        const glm::vec3 botC = m_capsulePos + glm::vec3(0.0f, 0.0f,
+                                                        m_capsuleRadius);
+        const glm::vec3 topC = m_capsulePos +
+                               glm::vec3(0.0f, 0.0f,
+                                         2.0f * m_capsuleHalfHeight +
+                                             m_capsuleRadius);
+        glm::vec2 sa, sb, se;
+        if (PickingSystem::worldToScreen(pvp, glm::vec2(imgMin.x, imgMin.y),
+                                         glm::vec2(imgSz.x, imgSz.y), botC, sa) &&
+            PickingSystem::worldToScreen(pvp, glm::vec2(imgMin.x, imgMin.y),
+                                         glm::vec2(imgSz.x, imgSz.y), topC, sb) &&
+            PickingSystem::worldToScreen(pvp, glm::vec2(imgMin.x, imgMin.y),
+                                         glm::vec2(imgSz.x, imgSz.y),
+                                         botC + glm::vec3(m_capsuleRadius, 0, 0),
+                                         se)) {
+            const float rx = se.x - sa.x;
+            const float ry = se.y - sa.y;
+            m_capScrR = std::sqrt(rx * rx + ry * ry);
+            m_capScrA = ImVec2(sa.x, sa.y);
+            m_capScrB = ImVec2(sb.x, sb.y);
+            m_capScrOff = ImVec2(rx, ry);
+            m_capScrValid = m_capScrR > 0.5f;
+        }
+    }
+    // 只在真的变了的时候打一行：相机一推拉这组数就变，逐帧打会刷爆日志
+    if (m_capScrValid) {
+        static ImVec2 la(-1.0e9f, -1.0e9f), lb(-1.0e9f, -1.0e9f);
+        static float lr = -1.0f;
+        constexpr float kEps = 1.5f;
+        if (std::fabs(la.x - m_capScrA.x) > kEps ||
+            std::fabs(la.y - m_capScrA.y) > kEps ||
+            std::fabs(lb.x - m_capScrB.x) > kEps ||
+            std::fabs(lb.y - m_capScrB.y) > kEps ||
+            std::fabs(lr - m_capScrR) > kEps) {
+            la = m_capScrA;
+            lb = m_capScrB;
+            lr = m_capScrR;
+            VK_LOG_INFO("CHAR-PREVIEW-CAPSULE-SCREEN a=(%.0f,%.0f) "
+                        "b=(%.0f,%.0f) r=%.1f off=(%.0f,%.0f)",
+                        m_capScrA.x, m_capScrA.y, m_capScrB.x, m_capScrB.y,
+                        static_cast<double>(m_capScrR), m_capScrOff.x,
+                        m_capScrOff.y);
+        }
+    }
+
+    // 叠加层：栅格以外的 3D 参照（胶囊线框 / 坐标轴 / 选中框）
+    //
+    // **必须排在点选之前**：胶囊线框的屏幕线段是这里画的时候记下来的
+    // （m_capScrSegs），点选量的是"眼睛里看到的那几根线"。反过来的话
+    // 量的是上一帧的几何，绕着模型转视角时点选会偏一帧。
+    drawPreviewOverlay(imgMin, imgSz);
+
+    // ---- 点选（选中模型 / 胶囊）----
+    // 只在**左键单击**（按下那一帧）时改选中：拖拽是导航（右键/中键），
+    // 两者不冲突。判定分三层，顺序就是"心里想点的那个东西"的优先级：
+    //
+    //   ① 鼠标离胶囊线框 ≤ 9 px → 胶囊。线框看得见，点它选中它是最不需要
+    //      解释的动作。
+    //   ② 否则射线命中模型包围盒 → 模型。
+    //   ③ 否则射线命中胶囊包围盒 → 胶囊（兜底：线框细，点到里面也算）。
+    //
+    // 不用"射线-AABB 取更近"：胶囊比人粗，正面看永远先撞胶囊，模型就
+    // 点不中了（实测就是：点身体选到胶囊、点脚底选到模型，正好反了）。
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        m_previewRoot.valid()) {
+        const ImVec2 mp = ImGui::GetIO().MousePos;
+        const Ray ray = PickingSystem::rayFromViewport(
+            m_previewScene.camera(), glm::vec2(imgMin.x, imgMin.y),
+            glm::vec2(imgSz.x, imgSz.y), glm::vec2(mp.x, mp.y));
+
+        auto hitAabb = [](const Ray& r, const glm::vec3& lo,
+                          const glm::vec3& hi, float* tOut) {
+            // 标准 slab 法（射线方向分量为 0 的轴单独处理，否则 0/0 = NaN）
+            float t0 = -1.0e30f, t1 = 1.0e30f;
+            for (int i = 0; i < 3; ++i) {
+                if (std::fabs(r.dir[i]) < 1.0e-8f) {
+                    if (r.origin[i] < lo[i] || r.origin[i] > hi[i]) return false;
+                    continue;
+                }
+                float a = (lo[i] - r.origin[i]) / r.dir[i];
+                float b = (hi[i] - r.origin[i]) / r.dir[i];
+                if (a > b) std::swap(a, b);
+                t0 = std::max(t0, a);
+                t1 = std::min(t1, b);
+                if (t0 > t1) return false;
+            }
+            if (t1 < 0.0f) return false;
+            *tOut = t0 > 0.0f ? t0 : t1;
+            return true;
+        };
+
+        // 点到线段的距离（屏幕空间）
+        auto segDist = [](const glm::vec2& p, const glm::vec2& a,
+                          const glm::vec2& b) {
+            const glm::vec2 ab = b - a;
+            const float len2 = glm::dot(ab, ab);
+            float u = len2 > 1.0e-6f ? glm::dot(p - a, ab) / len2 : 0.0f;
+            u = glm::clamp(u, 0.0f, 1.0f);
+            return glm::length(p - (a + ab * u));
+        };
+
+        PreviewPick best = PreviewPick::None;
+
+        // ① 线框（量 overlay 记下来的真实线段，不是"中轴 ± r"）
+        if (!m_capScrSegs.empty()) {
+            const glm::vec2 p(mp.x, mp.y);
+            float bestD = 1.0e30f;
+            for (std::size_t i = 0; i + 1 < m_capScrSegs.size(); i += 2) {
+                const glm::vec2 a(m_capScrSegs[i].x, m_capScrSegs[i].y);
+                const glm::vec2 b(m_capScrSegs[i + 1].x, m_capScrSegs[i + 1].y);
+                bestD = std::min(bestD, segDist(p, a, b));
+            }
+            if (bestD <= 9.0f) best = PreviewPick::Capsule;
+        }
+
+        // ② 模型包围盒（computeModelBounds 已经把各 SubMesh 的变换算进去了）
+        if (best == PreviewPick::None && m_boundsValid) {
+            float t = 0.0f;
+            const auto* rt = m_previewScene.world().get<ecs::TransformComponent>(
+                m_previewRoot);
+            const glm::vec3 off = rt ? rt->position : glm::vec3(0.0f);
+            if (hitAabb(ray, m_boundsMin + off, m_boundsMax + off, &t))
+                best = PreviewPick::Model;
+        }
+
+        // ③ 胶囊包围盒（**带 m_capsulePos**：拿它当原点算过一版，胶囊整体
+        //    高了 0.9 m，点脚底能中、点胸口点不中，查了很久）
+        if (best == PreviewPick::None && m_showCapsule) {
+            const glm::vec3 c = m_capsulePos +
+                                glm::vec3(0.0f, 0.0f, m_capsuleHalfHeight +
+                                                        m_capsuleRadius);
+            const glm::vec3 ext(m_capsuleRadius, m_capsuleRadius,
+                                m_capsuleHalfHeight + m_capsuleRadius);
+            float t = 0.0f;
+            if (hitAabb(ray, c - ext, c + ext, &t)) best = PreviewPick::Capsule;
+        }
+        m_pick = best;
+        VK_LOG_INFO("CHAR-PREVIEW-PICK target=%s",
+                    best == PreviewPick::Model     ? "model"
+                    : best == PreviewPick::Capsule ? "capsule"
+                                                   : "none");
+    }
+
+
     handlePreviewNavigation(glm::vec2(imgMin.x, imgMin.y),
                             glm::vec2(imgSz.x, imgSz.y), hovered);
 
@@ -414,7 +666,285 @@ void CharacterWindow::drawPreviewViewport() {
 
     // 导航提示改成**悬浮才出现**：视口里常驻一行小字会挡模型，也不符合
     // "面板上不写说明"的约定。
-    tip(TR("RMB: orbit   MMB: pan   wheel: dolly"));
+    tip(TR("LMB: body = model, outline = capsule.   RMB: orbit   wheel: zoom"));
+
+    // 底部：选中对象的位置 / 旋转 / 大小
+    drawPreviewTransformStrip();
+}
+
+// ---------------------------------------------------------------- 预览叠加层
+//
+// 三样东西画在**离屏图之上**的 ImGui draw list 里：
+//   ① 胶囊线框（绿）—— 隔着模型也看得见，这是"胶囊套没套住人"的唯一判据；
+//   ② 坐标轴 gizmo（红X 绿Y 蓝Z）—— 原点 + 选中对象的局部原点；
+//   ③ 选中框（黄）—— 点选后在包围盒上描一圈，明确"我现在在动谁"。
+//
+// 为什么全部走投影而不是做成场景实体：见头文件里的注释。这里只补一句
+// 实现层面的理由 —— **3D 线段投影之后仍然是直线**，所以两个端点各算一次
+// 屏幕坐标再连线就是精确的，不需要逐像素光栅化，也不会和深度缓冲打架。
+namespace {
+
+// 画一个水平圆（圆心 + 半径，Z-up 平面）。透视下投影成椭圆，靠分段逼近。
+void drawWorldCircle(ImDrawList* dl, const glm::vec3& center, float radius,
+                     const std::function<bool(const glm::vec3&, ImVec2&)>& proj,
+                     ImU32 col, float thickness, int seg = 28) {
+    const float step = 6.28318530718f / static_cast<float>(seg);
+    for (int i = 0; i < seg; ++i) {
+        const float a0 = step * static_cast<float>(i);
+        const float a1 = step * static_cast<float>(i + 1);
+        const glm::vec3 p0(center.x + std::cos(a0) * radius,
+                           center.y + std::sin(a0) * radius, center.z);
+        const glm::vec3 p1(center.x + std::cos(a1) * radius,
+                           center.y + std::sin(a1) * radius, center.z);
+        ImVec2 s0, s1;
+        if (proj(p0, s0) && proj(p1, s1)) dl->AddLine(s0, s1, col, thickness);
+    }
+}
+
+// 画一段半圆弧：从 center 朝 `dir` 方向"拱起"，用于胶囊两端的球冠。
+void drawWorldArc(ImDrawList* dl, const glm::vec3& center, const glm::vec3& dir,
+                  const glm::vec3& bend, float radius,
+                  const std::function<bool(const glm::vec3&, ImVec2&)>& proj,
+                  ImU32 col, float thickness, int seg = 14) {
+    const float step = 3.14159265f / static_cast<float>(seg);
+    for (int i = 0; i < seg; ++i) {
+        const float a0 = step * static_cast<float>(i);
+        const float a1 = step * static_cast<float>(i + 1);
+        const glm::vec3 p0 = center + dir * (radius * std::cos(a0)) +
+                             bend * (radius * std::sin(a0));
+        const glm::vec3 p1 = center + dir * (radius * std::cos(a1)) +
+                             bend * (radius * std::sin(a1));
+        ImVec2 s0, s1;
+        if (proj(p0, s0) && proj(p1, s1)) dl->AddLine(s0, s1, col, thickness);
+    }
+}
+
+} // namespace
+
+void CharacterWindow::drawPreviewOverlay(const ImVec2& imgMin,
+                                         const ImVec2& imgSz) {
+    // 先清：早退的分支（没模型 / 视口太小）不该留下上一帧的线段给点选用
+    m_capScrSegs.clear();
+    if (!m_previewRoot.valid() || imgSz.x < 4.0f || imgSz.y < 4.0f) return;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    // 裁到视口内：窗口被拖窄 / 模型出画时，线不能画到右栏的 Inspector 上
+    dl->PushClipRect(imgMin, ImVec2(imgMin.x + imgSz.x, imgMin.y + imgSz.y),
+                     true);
+
+    const scene::Camera& cam = m_previewScene.camera();
+    const glm::mat4 vp =
+        PickingSystem::viewProj(cam, glm::vec2(imgSz.x, imgSz.y));
+    const auto proj = [&](const glm::vec3& p, ImVec2& out) {
+        glm::vec2 s;
+        if (!PickingSystem::worldToScreen(vp, glm::vec2(imgMin.x, imgMin.y),
+                                          glm::vec2(imgSz.x, imgSz.y), p, s))
+            return false;
+        out = ImVec2(s.x, s.y);
+        return true;
+    };
+
+    // ---- ① 胶囊线框 ----
+    if (m_showCapsule && m_capsuleRadius > 1.0e-4f) {
+        const float r = m_capsuleRadius;
+        const float hh = std::max(m_capsuleHalfHeight, 0.0f);
+        const glm::vec3 base = m_capsulePos;
+        const glm::vec3 botC = base + glm::vec3(0.0f, 0.0f, r);
+        const glm::vec3 topC = base + glm::vec3(0.0f, 0.0f, 2.0f * hh + r);
+
+        // 记录版投影：画线的每个端点都进 m_capScrSegs，点选直接量这些线段。
+        // 顺序即成对顺序（每两个点之间就是一段线），见头文件那段注释。
+        const auto recProj = [&](const glm::vec3& p, ImVec2& out) {
+            if (!proj(p, out)) return false;
+            m_capScrSegs.push_back(out);
+            return true;
+        };
+
+        const bool sel = (m_pick == PreviewPick::Capsule);
+        const ImU32 col = sel ? IM_COL32(255, 226, 96, 235)
+                              : IM_COL32(120, 235, 150, 175);
+        const float th = sel ? 2.2f : 1.4f;
+
+        drawWorldCircle(dl, botC, r, recProj, col, th);
+        drawWorldCircle(dl, topC, r, recProj, col, th);
+        // 两条母线（X 方向的两个极端）—— 透视下正好是胶囊的左右轮廓
+        ImVec2 a0, a1, b0, b1;
+        if (recProj(botC + glm::vec3(r, 0, 0), a0) &&
+            recProj(topC + glm::vec3(r, 0, 0), a1))
+            dl->AddLine(a0, a1, col, th);
+        if (recProj(botC - glm::vec3(r, 0, 0), b0) &&
+            recProj(topC - glm::vec3(r, 0, 0), b1))
+            dl->AddLine(b0, b1, col, th);
+
+        // 两端球冠：XZ / YZ 各一条半圆（只画 2 条就足够读出"这是个胶囊"）
+        const glm::vec3 up(0.0f, 0.0f, 1.0f);
+        drawWorldArc(dl, topC, glm::vec3(1, 0, 0), up, r, recProj, col, th);
+        drawWorldArc(dl, topC, glm::vec3(0, 1, 0), up, r, recProj, col, th);
+        drawWorldArc(dl, botC, glm::vec3(1, 0, 0), -up, r, recProj, col, th);
+        drawWorldArc(dl, botC, glm::vec3(0, 1, 0), -up, r, recProj, col, th);
+
+        // 脚底中线：一眼看出"胶囊底 = 地面"（贴地问题的直接读数）
+        ImVec2 f0, f1;
+        if (proj(base, f0) && proj(base + glm::vec3(0.35f, 0, 0), f1))
+            dl->AddLine(f0, f1, IM_COL32(120, 235, 150, 120), 1.0f);
+        // 奇数个点说明中途有一段投影失败（点在相机后面），丢掉尾巴保配对
+        if (m_capScrSegs.size() & 1u) m_capScrSegs.pop_back();
+    }
+
+    // ---- ② 坐标轴 gizmo ----
+    if (m_showGizmo) {
+        // 选中谁就画在谁的原点上：模型 → 模型根的世界位置 + 包围盒底；
+        // 胶囊 → 胶囊脚底。都没选 → 世界原点。
+        glm::vec3 origin(0.0f);
+        const auto* rt =
+            m_previewScene.world().get<ecs::TransformComponent>(m_previewRoot);
+        if (m_pick == PreviewPick::Capsule) {
+            origin = m_capsulePos;
+        } else if (rt) {
+            // 模型：画在包围盒底（= 脚底），不是模型根（pivot 在几何中心）
+            origin = rt->position +
+                     glm::vec3(0.0f, 0.0f, m_boundsValid ? m_boundsMin.z : 0.0f);
+        }
+        const float L = 0.35f;
+        struct Ax {
+            glm::vec3 d;
+            ImU32 c;
+            const char* name;
+        };
+        const Ax axes[3] = {{glm::vec3(1, 0, 0), IM_COL32(236, 96, 96, 255), "X"},
+                            {glm::vec3(0, 1, 0), IM_COL32(110, 220, 110, 255), "Y"},
+                            {glm::vec3(0, 0, 1), IM_COL32(110, 160, 255, 255), "Z"}};
+        ImVec2 o;
+        if (proj(origin, o)) {
+            for (const Ax& ax : axes) {
+                ImVec2 t;
+                if (!proj(origin + ax.d * L, t)) continue;
+                dl->AddLine(o, t, ax.c, 2.0f);
+                // 末端方块：屏幕空间 5 px —— 世界大小会随距离缩，太小的
+                // 轴头在缩远时等于没有
+                dl->AddRectFilled(ImVec2(t.x - 3.0f, t.y - 3.0f),
+                                  ImVec2(t.x + 3.0f, t.y + 3.0f), ax.c);
+                dl->AddText(ImVec2(t.x + 5.0f, t.y - 7.0f), ax.c, ax.name);
+            }
+        }
+    }
+
+    // ---- ③ 选中框（模型）----
+    if (m_pick == PreviewPick::Model && m_boundsValid) {
+        const auto* rt =
+            m_previewScene.world().get<ecs::TransformComponent>(m_previewRoot);
+        const glm::vec3 off = rt ? rt->position : glm::vec3(0.0f);
+        glm::vec3 lo = m_boundsMin + off;
+        glm::vec3 hi = m_boundsMax + off;
+        // 8 个角 + 12 条棱
+        glm::vec3 c[8];
+        for (int i = 0; i < 8; ++i)
+            c[i] = glm::vec3((i & 1) ? hi.x : lo.x, (i & 2) ? hi.y : lo.y,
+                             (i & 4) ? hi.z : lo.z);
+        static const int kEdges[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7},
+                                          {0, 2}, {1, 3}, {4, 6}, {5, 7},
+                                          {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+        const ImU32 col = IM_COL32(255, 226, 96, 200);
+        for (const auto& ed : kEdges) {
+            ImVec2 s0, s1;
+            if (proj(c[ed[0]], s0) && proj(c[ed[1]], s1))
+                dl->AddLine(s0, s1, col, 1.6f);
+        }
+    }
+
+    dl->PopClipRect();
+}
+
+// ---------------------------------------------------------------- 变换控件条
+
+void CharacterWindow::drawPreviewTransformStrip() {
+    if (!m_previewRoot.valid()) return;
+    ecs::World& w = m_previewScene.world();
+    auto* rt = w.get<ecs::TransformComponent>(m_previewRoot);
+    if (!rt) return;
+
+    // ---- 选中切换 ----
+    // PushID：面板里别处也可能有名为 "Model" 的控件，同帧同窗口重名会让
+    // ImGui 的 ID 撞车（表现是点一个另一个也变）。
+    ImGui::PushID("##preview_pick");
+    if (ImGui::RadioButton(TR("Model"), m_pick == PreviewPick::Model))
+        m_pick = PreviewPick::Model;
+    ImGui::SameLine(0.0f, 8.0f);
+    if (ImGui::RadioButton(TR("Capsule"), m_pick == PreviewPick::Capsule))
+        m_pick = PreviewPick::Capsule;
+    ImGui::PopID();
+    ImGui::SameLine(0.0f, 12.0f);
+    ImGui::Checkbox(TR("Show capsule"), &m_showCapsule);
+    tip(TR("The capsule is the collision proxy. If it does not wrap the "
+           "character, the player is fatter / thinner than the model."));
+    ImGui::SameLine();
+    ImGui::Checkbox(TR("Gizmo"), &m_showGizmo);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%s)", m_pick == PreviewPick::Capsule ? "capsule"
+                            : m_pick == PreviewPick::Model ? "model"
+                                                           : "nothing");
+
+    const bool capsule = (m_pick == PreviewPick::Capsule);
+
+    // ---- 位置 ----
+    // 两个 DragFloat3 都作用在**各自的对象**上：模型改预览根实体的
+    // Transform，胶囊改它自己的状态（它没有实体）。这样"人站在哪、胶囊
+    // 套在哪"可以分别调 —— 正是"胶囊没包住人"时需要的那个自由度。
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TR("Pos"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    if (capsule) {
+        float p[3] = {m_capsulePos.x, m_capsulePos.y, m_capsulePos.z};
+        if (ImGui::DragFloat3("##cap_pos", p, 0.01f, -10.0f, 10.0f, "%.3f"))
+            m_capsulePos = glm::vec3(p[0], p[1], p[2]);
+    } else {
+        float p[3] = {rt->position.x, rt->position.y, rt->position.z};
+        if (ImGui::DragFloat3("##mdl_pos", p, 0.01f, -10.0f, 10.0f, "%.3f"))
+            rt->position = glm::vec3(p[0], p[1], p[2]);
+    }
+    tip(TR("Preview-only offset (does not touch the player entity)"));
+
+    // ---- 旋转（绕 Z：人形的朝向只有这一个自由度）----
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TR("Yaw"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    if (capsule) {
+        // 胶囊绕自身轴旋转不可见，但仍然给一个数（对齐口径、以后加盒子用）
+        ImGui::DragFloat("##cap_yaw", &m_capsuleYawDeg, 0.5f, -180.0f, 180.0f,
+                         TR("%.1f deg"));
+    } else {
+        float deg = glm::degrees(rt->rotation.z);
+        if (ImGui::DragFloat("##mdl_yaw", &deg, 0.5f, -180.0f, 180.0f,
+                             TR("%.1f deg")))
+            rt->rotation.z = glm::radians(deg);
+    }
+
+    // ---- 大小 ----
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TR("Size"));
+    ImGui::SameLine();
+    if (capsule) {
+        // 用 "半径 / 半高" 两个数（就是 CharacterControllerComponent 的字面字段），
+        // 不用"总高"—— 因为写回玩家时也是这两个字段，绕一层反而容易对不上。
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f - 4.0f);
+        ImGui::DragFloat(TR("R"), &m_capsuleRadius, 0.005f, 0.05f, 1.0f, "%.3f");
+        tip(TR("Capsule radius (metres)"));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::DragFloat(TR("HH"), &m_capsuleHalfHeight, 0.005f, 0.05f, 2.0f,
+                         "%.3f");
+        tip(TR("Half height of the cylindrical part; total height = "
+               "2 × (half height + radius)"));
+    } else {
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::DragFloat("##mdl_scale", &rt->scale.x, 0.005f, 0.05f, 5.0f,
+                             "%.3f"))
+            rt->scale = glm::vec3(rt->scale.x);
+        tip(TR("Uniform scale of the preview model"));
+        // 模型根的 scale 只影响预览里的观感，不写回玩家（绑定时按包围盒重算）
+    }
 }
 
 void CharacterWindow::drawToolbar() {
@@ -432,6 +962,13 @@ void CharacterWindow::drawToolbar() {
         m_previewScene.camera().setFov(m_previewFov);
     }
     tip(TR("Preview camera field of view"));
+
+    // 预览栅格：走渲染器自己的"预览栅格"参数（与主视口那份互不影响，
+    // 见 Renderer::previewGridSettings 的注释）。
+    ImGui::SameLine();
+    ImGui::Checkbox(TR("Grid"), &m_renderer.previewGridEnabled());
+    tip(TR("Ground grid in the preview viewport (independent of the "
+           "main viewport's grid)"));
 
     // 模型状态徽标（右端）
     ImGui::SameLine();
@@ -613,25 +1150,100 @@ void CharacterWindow::drawAnimationPanel() {
         return;
     }
 
-    // 片段列表：点击即播放。行尾显示时长，方便挑"哪条是 idle"。
+    // ---- 等按键状态（点击行尾的 [+] 进入）----
+    //
+    // 抓键走 ImGui 的键枚举，再**换算成 GLFW 码**存盘（两端同一套数，
+    // 见 ui/KeyCodes.h）。Esc 取消：不这么做的话，想放弃就只剩
+    // "随便按一个再把键清掉"这一条路。
+    if (!m_captureClip.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.35f, 1.0f),
+                           TR("Press a key for '%s'  (Esc cancels)"),
+                           m_captureClip.c_str());
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            m_captureClip.clear();
+        } else {
+            const int ik = ui_keys::captureImGuiKey();
+            const int glfwCode = (ik == static_cast<int>(ImGuiKey_None))
+                                     ? 0
+                                     : ui_keys::glfwFromImGui(ik);
+            if (glfwCode) {
+                const std::string clip = m_captureClip;
+                m_captureClip.clear();
+                bindClipKey(clip, glfwCode);
+            }
+        }
+    }
+
+    // 玩家实体不存在时映射无处可写 → 整列禁用（但仍然能点播预览）
+    const bool canBind = m_player.valid();
+    if (!canBind) {
+        ImGui::TextDisabled(TR("(no player - keys can't be saved)"));
+        tip(TR("Open this window from a player entity (Shift+A ▸ Player) so "
+               "key bindings have somewhere to live."));
+    }
+
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const float durW = ImGui::CalcTextSize("00.00s").x;
+    const float keyW = 52.0f;
+    const float builtinW = 46.0f;
+    const float rowW = ImGui::GetContentRegionAvail().x;
+
+    // 片段列表：点击名字即播放；行尾是时长、**内建键位**与按键绑定（P4）。
     for (const auto& clip : skel.clips) {
         ImGui::PushID(clip.name.c_str());
         const bool selected = (clip.name == m_currentClip);
-        if (ImGui::Selectable(clip.name.c_str(), selected)) playClip(clip.name);
-        // ⚠ 矩形必须在 Selectable **之后立刻**抓：下面还要在同一行画时长，
-        //   等画完再取 ImGui::GetItemRectMin 拿到的是时长文字那一小块 ——
-        //   自动化脚本按它去点就永远点不到条目（踩过）。
+        const float nameW = std::max(
+            60.0f, rowW - durW - keyW - builtinW - spacing * 4.0f);
+        if (ImGui::Selectable(clip.name.c_str(), selected, 0,
+                              ImVec2(nameW, 0)))
+            playClip(clip.name);
+        // ⚠ 矩形必须在 Selectable **之后立刻**抓：下面还要在同一行画时长
+        //   和绑定按钮，等画完再取 ImGui::GetItemRectMin 拿到的是最后一个
+        //   控件那一小块 —— 自动化脚本按它去点就永远点不到条目（踩过）。
         const ImVec2 itemMin = ImGui::GetItemRectMin();
         const ImVec2 itemMax = ImGui::GetItemRectMax();
+        tip(TR("Click to preview this clip in the viewport above"));
 
-        const float tw = ImGui::CalcTextSize("00.00s").x;
-        const float x = itemMax.x - tw - 4.0f;
         ImGui::SameLine();
-        ImGui::SetCursorScreenPos(ImVec2(x, itemMin.y));
         ImGui::TextDisabled("%.2fs", static_cast<double>(clip.duration));
+
+        // ---- 内建键位（2026-10-22）----
+        // 四段 loco clip 由状态机直接驱动，**不需要也不应该**先绑键：
+        //   Idle 自动（停下就播）/ Walk & Run 由 WASD + 鼠标右键的**速度**决定 /
+        //   Jump 由空格敲击后"离地"这个事实决定。
+        // 这里显示的是**只读徽标**，不是按钮 —— 有按钮就会被当成"还得点一下
+        // 才算配好"，而这正是用户这次要求去掉的步骤。
+        ImGui::SameLine();
+        if (const char* bl = builtinKeyLabel(clip.name)) {
+            ImGui::TextDisabled("%s", bl);
+            tip(TR("Built-in control (no key binding needed). "
+                   "Walk / Run follow your actual speed; Jump follows "
+                   "whether you are off the ground."));
+        }
+
+        ImGui::SameLine();
+        const int boundKey = clipKey(clip.name);
+        const bool capturing = (m_captureClip == clip.name);
+        const char* keyLabel = capturing ? "..."
+                                : boundKey ? ui_keys::label(boundKey)
+                                           : "+";
+        if (!canBind) ImGui::BeginDisabled();
+        if (ImGui::Button(keyLabel, ImVec2(keyW, 0.0f))) {
+            m_captureClip = capturing ? std::string() : clip.name;
+        }
+        const ImVec2 keyMin = ImGui::GetItemRectMin();
+        const ImVec2 keyMax = ImGui::GetItemRectMax();
+        tip(TR("Bind a keyboard key to this clip. In Play / Game.exe the key "
+               "plays the clip once, then locomotion takes over again.\n"
+               "Right-click to clear."));
+        // 右键清掉这段的绑定（不弹菜单，一个动作一个入口）
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && boundKey)
+            unbindClipKey(clip.name);
+        if (!canBind) ImGui::EndDisabled();
         ImGui::PopID();
 
         logRect(("CHAR-CLIP-" + clip.name).c_str(), itemMin, itemMax);
+        logRect(("CHAR-CLIP-KEY-" + clip.name).c_str(), keyMin, keyMax);
     }
 }
 
@@ -888,6 +1500,81 @@ void CharacterWindow::drawDetailsPanel() {
     }
 }
 
+// ---------------------------------------------------------------- 键盘映射
+
+int CharacterWindow::clipKey(const std::string& clip) const {
+    if (!m_player.valid()) return 0;
+    const scene::Scene& sc = m_ctx.editorScene();
+    const auto* km = sc.world().get<ecs::AnimKeyMapComponent>(m_player);
+    if (!km) return 0;
+    for (const auto& e : km->entries)
+        if (e.clip == clip) return e.key;
+    return 0;
+}
+
+// 绑 / 解绑都走 `structuralEdit`：这是**场景数据**（跟着角色存盘），
+// 与"拖模型 / 生成绑定"同级，用户应该能用 Ctrl+Z 撤掉。
+//
+// ⚠ 同一个键不能同时服务两段 clip：绑上去时把旧的清掉。留两份的话
+//   `pollKeyTrigger` 只会命中表里靠前那一段，另一段永远触发不到，而面板上
+//   两行都显示着同一个键 —— "明明绑了却不生效"。
+void CharacterWindow::bindClipKey(const std::string& clip, int key) {
+    if (!m_player.valid() || clip.empty() || key == 0) return;
+    m_ctx.structuralEdit("Bind animation key", [&]() {
+        ecs::World& w = m_ctx.editorScene().world();
+        ecs::AnimKeyMapComponent* km =
+            w.get<ecs::AnimKeyMapComponent>(m_player);
+        if (!km) {
+            ecs::AnimKeyMapComponent fresh;
+            w.add<ecs::AnimKeyMapComponent>(m_player, fresh);
+            km = w.get<ecs::AnimKeyMapComponent>(m_player);
+        }
+        if (!km) return;
+        // 该键被别的 clip 占着 → 先回收
+        for (auto& e : km->entries)
+            if (e.key == key && e.clip != clip) e.key = 0;
+        km->entries.erase(
+            std::remove_if(km->entries.begin(), km->entries.end(),
+                           [](const ecs::AnimKeyMapEntry& e) {
+                               return e.clip.empty() || e.key == 0;
+                           }),
+            km->entries.end());
+        bool found = false;
+        for (auto& e : km->entries) {
+            if (e.clip == clip) {
+                e.key = key;
+                found = true;
+                break;
+            }
+        }
+        if (!found) km->entries.push_back(ecs::AnimKeyMapEntry{clip, key});
+    });
+    m_ctx.dirty() = true;
+    VK_LOG_INFO("CHAR-KEYBIND clip=%s key=%d label=%s", clip.c_str(), key,
+                ui_keys::label(key));
+    m_ctx.notify(TR("Bound ") + clip + " -> " + ui_keys::label(key));
+}
+
+void CharacterWindow::unbindClipKey(const std::string& clip) {
+    if (!m_player.valid() || clip.empty()) return;
+    m_ctx.structuralEdit("Unbind animation key", [&]() {
+        ecs::World& w = m_ctx.editorScene().world();
+        ecs::AnimKeyMapComponent* km =
+            w.get<ecs::AnimKeyMapComponent>(m_player);
+        if (!km) return;
+        for (auto& e : km->entries)
+            if (e.clip == clip) e.key = 0;
+        km->entries.erase(
+            std::remove_if(km->entries.begin(), km->entries.end(),
+                           [](const ecs::AnimKeyMapEntry& e) {
+                               return e.clip.empty() || e.key == 0;
+                           }),
+            km->entries.end());
+    });
+    m_ctx.dirty() = true;
+    VK_LOG_INFO("CHAR-KEYUNBIND clip=%s", clip.c_str());
+}
+
 // ---------------------------------------------------------------- 播放控制
 
 void CharacterWindow::playClip(const std::string& clipName) {
@@ -900,12 +1587,31 @@ void CharacterWindow::playClip(const std::string& clipName) {
 
 void CharacterWindow::syncPreviewSkinning() {
     if (!m_previewRoot.valid() || !m_model || !m_model->skinned()) return;
-    if (auto* sk =
-            m_previewScene.world().get<ecs::SkinnedMeshComponent>(m_previewRoot)) {
-        sk->clipName = m_currentClip;
-        sk->time = m_animTime;
-        sk->playing = m_animPlaying;
-        sk->speed = m_animSpeed;
+    auto* sk =
+        m_previewScene.world().get<ecs::SkinnedMeshComponent>(m_previewRoot);
+    if (!sk) return;
+    sk->clipName = m_currentClip;
+    sk->time = m_animTime;
+    sk->playing = m_animPlaying;
+    sk->speed = m_animSpeed;
+
+    // ⚠ 这一行就是"预览里能不能看见动画"的全部关键（2026-10-22）。
+    //
+    // 预览场景**没有 AnimatorSystem**（那是主场景 / 运行时的系统），于是
+    // 没人推进这里的关节矩阵。渲染层确实有一条兜底（`updateSkinning` 里
+    // "size != jointCount 就现场采一次"），但实例化时矩阵已被填成
+    // jointCount 个（静止姿势）—— **尺寸永远是满的**，兜底一次都不会触发。
+    // 结果：时间轴在走、`sk.time` 在变、日志一切正常，屏幕上那个人一动不动。
+    //
+    // 现在由这里每帧把 `draw()` 采样出来的矩阵推进去。尺寸对不上就跳过
+    // （骨架换了 / 还没采过），让渲染层的兜底接住，不要写半截矩阵进去。
+    if (m_model->skeleton && sk->model && sk->model->skeleton) {
+        const std::size_t n =
+            static_cast<std::size_t>(sk->model->skeleton->jointCount());
+        if (m_jointMats.size() == n &&
+            sk->jointMatrices.size() != n)
+            sk->jointMatrices.resize(n);
+        if (m_jointMats.size() == n) sk->jointMatrices = m_jointMats;
     }
 }
 

@@ -65,7 +65,15 @@ public:
     int lastAnimatorCount() const { return m_lastAnimators; }
 
 private:
-    Pose m_pose;                 // 采样缓冲（复用，避免每帧分配）
+    // 采样缓冲（复用，避免每帧分配）。
+    //   m_pose      = 目标 clip 的姿势（每帧都采）
+    //   m_poseFrom  = 过渡时旧 clip 的姿势（只在 fading() 时采）
+    //   m_poseMix   = blendPose 的输出（只在 fading() 时用）
+    // 三份都要**成员**而不是局部变量：blendPose 的输出不能与输入同址，
+    // 而每帧构造 Pose 会反复分配 3 × jointCount 个向量。
+    Pose m_pose;
+    Pose m_poseFrom;
+    Pose m_poseMix;
     uint64_t m_frames = 0;
     int m_lastEntities = 0;
     int m_lastAnimators = 0;     // 其中挂了 AnimatorComponent 的

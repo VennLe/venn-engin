@@ -8,7 +8,12 @@
 
 #include "core/Logger.h"
 
+// 离线资产格式：`AssetManager::loadFBX` 要先探一下同名的 `.vmesh`。
+// 只用 vmeshPathFor()，不需要几何层，所以 include 头就够。
+#include "assetio/MeshFormat.h"
+
 #include <cstring>
+#include <filesystem>
 #include <functional>
 
 #define TINYOBJLOADER_IMPLEMENTATION
@@ -973,6 +978,61 @@ Model* AssetManager::loadFBX(const std::string& path,
     const std::string key = name.empty() ? path : name;
     auto it = m_models.find(key);
     if (it != m_models.end()) return it->second.get();
+
+    // ---- 优先走烤好的 .vmesh（2026-10-22 离线资产链）----
+    //
+    // 目录约定：`models/girl.fbx` 的缓存是**同名**的 `models/girl.vmesh`。
+    // 用 sidecar 而不是"换一种资产格式"有三个好处：
+    //   1. 场景文件里引用的永远是 .fbx，老存档一行都不用改；
+    //   2. 缓存删掉就自动退回 ufbx 解析，不会"资产缺失"；
+    //   3. 源文件比缓存新 → 自动走 FBX，避免"改了源、画面没变"。
+    //
+    // ⚠ 这里**不检查** .vmeta 的 import 参数是否变过：那些参数已经烘进
+    //   .vmesh 了，改了必须重新跑 AssetC。判据只能是 mtime，因为
+    //   importSignature 存在 sidecar 里、而 vmesh 里没有 —— 想判就得
+    //   把签名写进 vmesh，那是格式 v2 的事。
+    // ---- 情况 0：传进来的**本身就是 .vmesh**（引擎自带的烤制资产）----
+    //
+    // ⚠ 2026-10-22 实测的坑：默认角色资产是 `default_character.vmesh`，
+    //   场景里没有同名 FBX。`vmeshPathFor()` 把它当成"源"，于是
+    //   `vmeshIsFresh(src, bin)` 里 src == bin；而 `.vmeta` 是**加载成功之后**
+    //   才写的（finishModelImport），它的 mtime 永远比 .vmesh 新 →
+    //   下一条判据立刻判"缓存过期" → 回退去按 FBX 解析一个 .vmesh →
+    //   `Failed to load FBX: ...vmesh`，抛出后再也加载不出来。
+    //
+    //   症状极具迷惑性：**第一次一切正常，第二次起永远失败**（把 .vmeta
+    //   删掉又好一次）。所以这里直接短路：源就是烤制资产，不经任何
+    //   "新鲜度"判断 —— 它没有可比较的源文件。
+    if (assetio::vmeshPathFor(path) == path) {
+        if (auto model = loadVMeshModel(*m_ctx.device, *m_ctx.cmdPool, m_ctx,
+                                        *this, path, key,
+                                        makeAssetRelative(path))) {
+            Model* raw = model.get();
+            m_models[key] = std::move(model);
+            return raw;
+        }
+        VK_LOG_ERROR("VMESH 直接加载失败 key=%s path=%s",
+                     assetLogSafe(key).c_str(), path.c_str());
+        return nullptr;
+    }
+
+    const std::string binPath = assetio::vmeshPathFor(path);
+    if (vmeshIsFresh(path, binPath)) {
+        if (auto model = loadVMeshModel(*m_ctx.device, *m_ctx.cmdPool, m_ctx,
+                                        *this, binPath, key,
+                                        makeAssetRelative(path))) {
+            Model* raw = model.get();
+            m_models[key] = std::move(model);
+            return raw;
+        }
+        // 读失败（文件损坏 / 版本不兼容）→ 落到下面走 FBX。
+        // 打 WARN 而不是 ERROR：这是"缓存坏了但能自愈"，不是事故。
+        VK_LOG_WARN("MESH-BIN-FALLBACK key=%s bin=%s (parse failed, using FBX)",
+                    assetLogSafe(key).c_str(), binPath.c_str());
+    } else if (std::filesystem::exists(binPath)) {
+        VK_LOG_INFO("MESH-BIN-STALE key=%s（源比缓存新，回退 FBX 解析）",
+                    assetLogSafe(key).c_str());
+    }
 
     auto model = loadFBXModel(*m_ctx.device, *m_ctx.cmdPool, m_ctx, *this,
                               path, key);

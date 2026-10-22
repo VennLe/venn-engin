@@ -179,30 +179,73 @@ def _fbm(x, y, octaves=4):
 
 
 def terrain_height(xm, ym):
-    """缓起伏地形（米）。出生点附近平滑压到 0 —— 否则玩家一落地就滑坡。"""
+    """地形高度（米）。**恒 >= 0，且出生点（原点）恰好是 0**。
+
+    2026-10-22（第十轮）改的是"归一化基准"这件事 —— 这是一次真 bug 的修复：
+
+      以前：`terrain_height` 把出生点周围 14 m 压平到 0，然后
+            `build_terrain_bytes` 用**全局最低点**归一化 `(v - lo) / span`。
+            出生点那个 0 于是被抬到 (0 - lo)/span ≈ 0.56，乘 maxHeight 之后
+            **地面在 3.35 m**，而场景里 GameStart 写的是 z = (0,0,0)。
+            结果是新工程一进来，玩家的脚在地面下 3.35 m（用户原话：
+            "物理特性上不允许说有任何物体能陷入其中，包括 GameStart"）。
+
+      现在：世界 z = 0 **就是**地面。山脊往上长（0 .. max），洼地压到 0
+            （它们本来就是"低处"，压平之后是平地，不影响"能不能走"）。
+    """
     h = (_fbm(xm / 90.0, ym / 90.0, 4) - 0.5) * 2.0
     # 幂次让谷底更平、脊线更圆，读起来像"自然土坡"而不是噪声
     h = math.copysign(abs(h) ** 1.25, h)
-    z = h * TERRAIN_MAX_H * 0.5
+    # [-1, 1] → [0, TERRAIN_MAX_H]：0 是地面基准，往上的才是"坡"
+    z = (h * 0.5 + 0.5) * TERRAIN_MAX_H
     r = math.hypot(xm, ym)
     if r < TERRAIN_FLAT_R:
         t = r / TERRAIN_FLAT_R
-        z *= t * t
+        z *= t * t          # 出生点周围压平到 0（抬升量按 t² 渐入）
     return z
 
 
-def build_terrain_bytes():
-    """返回 (height.r32, splat.rgba8) 的字节。"""
-    import struct as _struct
+def _terrain_raw():
+    """所有采样点的高度（米）。
+
+    ⚠ 写入顺序必须与改动前**逐字节一致**（`for r: for c:`）。这份数组在
+      磁盘上是"逐行"写的，而读取侧（`physics::Heightfield` / `terrain.vert`）
+      按列主序解释 —— 两边一直是同一个约定，看起来就是把地形沿对角线翻了一
+      下。噪声地形翻不翻无所谓，但**改了写入顺序会让所有已生成工程的
+      地形形状变掉**，所以这里保持原样。
+    """
     half = (TERRAIN_COLS - 1) * 0.5
     raw = []
     for r in range(TERRAIN_ROWS):
         for c in range(TERRAIN_COLS):
             raw.append(terrain_height((c - half) * TERRAIN_MPP,
                                       (r - half) * TERRAIN_MPP))
-    lo, hi = min(raw), max(raw)
-    span = max(hi - lo, 1e-6)
-    norm = [(v - lo) / span for v in raw]
+    return raw
+
+
+_MAX_HEIGHT_CACHE = []
+
+
+def terrain_max_height():
+    """`.vterrain` 的 maxHeight = 实际最高点（归一化的分母）。
+
+    以前这里是常量 `TERRAIN_MAX_H`，而高度图被"全局 min..max"归一化 ——
+    两个数字取的不是同一把尺子，maxHeight 只是个近似值。现在归一化只除以
+    最高点，maxHeight 就**必须**等于它，否则地面高度会整体差一截。
+    """
+    if not _MAX_HEIGHT_CACHE:
+        _MAX_HEIGHT_CACHE.append(max(_terrain_raw()))
+    return _MAX_HEIGHT_CACHE[0]
+
+
+def build_terrain_bytes():
+    """返回 (height.r32, splat.rgba8) 的字节。"""
+    import struct as _struct
+    raw = _terrain_raw()
+    hi = max(raw)
+    # 只用"出生点以上"这一段做归一化：原点（0 m）→ 0.0，最高点 → 1.0。
+    # 负数（理论上没有，`terrain_height` 保证 >= 0）也钳到 0。
+    norm = [max(v, 0.0) / hi for v in raw]
     height = _struct.pack("<%df" % len(norm), *norm)
     # splat：4 层指向同一材质，权重全给第 0 层（想分层刷地表在编辑里改）
     splat = bytearray(TERRAIN_COLS * TERRAIN_ROWS * 4)
@@ -219,7 +262,7 @@ def build_terrain_json():
         "cols": TERRAIN_COLS,
         "rows": TERRAIN_ROWS,
         "metersPerPixel": TERRAIN_MPP,
-        "maxHeight": TERRAIN_MAX_H,
+        "maxHeight": round(terrain_max_height(), 6),
         "splatRepeat": 1.0,
         "layerTiling": 6.0,
         "height": "height.r32",
@@ -265,12 +308,20 @@ def _periodic_noise(x, y, period, seed):
 def _ground_height(u, v):
     """0..1 的表面高度场（无缝）。u/v ∈ [0,1)。
 
-    ⚠ 频率给得高一点（16/48/128）：低频大斑块在 6 米一铺的平铺下会读成
-      "一大片脏印子"，而且远处能看出重复；细颗粒才像土。
+    2026-10-22（第十轮）：低频削掉、高频加足。
+
+    上一版是 16/48/128 三个八度、幅度 0.34/0.30/0.22 —— 低频占主导，
+    256 像素铺 6 米时读出来是"几米一块的大斑"，配上法线贴图就是一层
+    **丝绸一样的方向性反光**。用户原话："地面光泽度太高了，需要粗糙点
+    看起来才自然些。"
+
+    现在：低频只留 0.10（给一点自然的明暗起伏），能量压到 48/128 两个
+    八度上 —— 那是"土颗粒"的尺度（1 米内几十个起伏）。远处的 mip 会把
+    高频平均掉，正好退化成"粗糙无光泽"，而不是"远处变成塑料"。
     """
-    base = (_periodic_noise(u * 16.0, v * 16.0, 16, 1) - 0.5) * 0.34
-    mid = (_periodic_noise(u * 48.0, v * 48.0, 48, 2) - 0.5) * 0.30
-    fine = (_periodic_noise(u * 128.0, v * 128.0, 128, 3) - 0.5) * 0.22
+    base = (_periodic_noise(u * 16.0, v * 16.0, 16, 1) - 0.5) * 0.10
+    mid = (_periodic_noise(u * 48.0, v * 48.0, 48, 2) - 0.5) * 0.24
+    fine = (_periodic_noise(u * 128.0, v * 128.0, 128, 3) - 0.5) * 0.36
     return 0.5 + base + mid + fine
 
 
@@ -286,20 +337,27 @@ def build_ground_textures():
         row = h[y]
         for x in range(n):
             v = row[x]
-            # ⚠ 对比度要克制：0.78~1.22 那档会把"土黄"压成"深褐"，
-            #   在土黄底上只留 ±10% 的明暗 + 一点点石子就够了。
-            shade = 0.93 + 0.14 * v
-            pebble = 1.0 if v < 0.22 else 0.0
-            r = base[0] * shade * (0.90 if pebble else 1.0)
-            g = base[1] * shade * (0.94 if pebble else 1.0)
-            b = base[2] * shade * (0.99 if pebble else 1.0)
+            # 第十轮：对比度从 ±10% 提到 ±20%，并且给一点"土不纯"的偏色
+            # （纯色底 + 弱噪声 = 塑料）。底线仍然是"读起来是土黄"，
+            # 不是"深褐泥巴"。
+            shade = 0.86 + 0.26 * v
+            # 逐纹素的细颗粒（period 必须整除贴图尺寸，否则左右/上下有缝：
+            # 256 纹素 × 0.5 = 128 = 正好一个周期）
+            grain = (_periodic_noise(x * 0.5, y * 0.5, 128, 7) - 0.5) * 0.10
+            shade *= 1.0 + grain
+            pebble = 1.0 if v < 0.25 else 0.0
+            r = base[0] * shade * (0.86 if pebble else 1.0)
+            g = base[1] * shade * (0.90 if pebble else 1.0)
+            b = base[2] * shade * (0.97 if pebble else 1.0)
             i = (y * n + x) * 3
             albedo[i] = max(0, min(255, int(r * 255)))
             albedo[i + 1] = max(0, min(255, int(g * 255)))
             albedo[i + 2] = max(0, min(255, int(b * 255)))
 
     # ---- normal：中心差分梯度（环绕取样 = 无缝）----
-    strength = 1.3
+    # 1.3 → 3.6：这个系数直接决定"平地上有没有颗粒感"。1.3 时法线最大
+    # 只偏 7°，掠射角下看到的是一层光滑的亮膜；3.6 才像干土。
+    strength = 3.6
     normal = bytearray(n * n * 3)
     for y in range(n):
         for x in range(n):
@@ -356,7 +414,11 @@ TEMPLATE_GROUND_MAT = {
     "shadingModel": "default",
     "baseColor": [0.66, 0.53, 0.28, 1.0],
     "metallic": 0.0,
-    "roughness": 0.92,
+    # 第十轮：0.92 → 1.0。土不会镜面反射，而地形着色器**没有**逐层粗糙度
+    # 贴图（只有这一个标量），0.92 留下的是一个能整片滑动的宽高光 ——
+    # 在平地上看起来就是"打了蜡"。拉满 = GGX 的 D 项退化成常数，
+    # 高光只剩菲涅尔那一点点边缘，视觉上立刻变"干"。
+    "roughness": 1.0,
     "albedo": {"kind": "file", "name": "template_ground_albedo",
                "path": "textures/template_ground_albedo.png", "srgb": True},
     "normal": {"kind": "file", "name": "template_ground_normal",

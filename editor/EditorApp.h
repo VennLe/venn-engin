@@ -36,6 +36,8 @@
 
 #include "core/Application.h"
 #include "animation/AnimatorSystem.h"
+// 四态 locomotion（P4）：编辑器 Play 与运行时共用同一份实现
+#include "animation/Locomotion.h"
 #include "audio/AudioSystem.h"
 #include "script/ScriptRuntime.h"
 
@@ -229,6 +231,11 @@ private:
     // WASD 移动 + 鼠标转视角（第一人称）或环绕轨道相机（第三人称），
     // 并把运行态相机摆到玩家视野 / 轨道位上。第三人称顺带驱动 walk 摆腿。
     void runPlayers(float dt);
+    // 编辑器 Play 态的"脚下地面高度"（米）：
+    //   · 运行态副本里有可见地形 → 地形高度场（与出包后是同一份算法）；
+    //   · 没有地形 → 0（编辑器里那块 0 高度的参考地面）。
+    // 只用**竖直**方向（抬脚 / 落地），水平方向仍由碰撞求解负责。
+    float editorGroundHeight(float x, float y) const;
     // 玩家状态探针的分帧计数（PLAYER-STATE 每 30 帧一条，防刷屏）
     int m_playerLogTick = 0;
     // 每帧在**运行态副本**上做碰撞求解（只在 Run 态、脚本之后调用）：
@@ -579,6 +586,14 @@ private:
     // 非 Play 态传 dt=0 调一次 —— 只刷新姿势、不推进时间，这样拖时间轴
     // 或改 clip 时视口立刻跟着变。
     animation::AnimatorSystem m_animator;
+
+    // ---- 玩家四态动画（P4：编辑器 Play 也要有走路动画）----
+    // 每条 PlayerComponent 实体一份游标（entity.id → 状态机）。
+    // 放在编辑器而不是组件里：它是**运行态**（不进场景 JSON，Stop 就丢），
+    // 塞进 PlayerComponent 会让存档多出一堆"这次 Play 走到第几步"的垃圾。
+    //
+    // 判据仍然是"真的在动"：速度取本帧位移 / dt，撞墙时位移为 0 → 播 idle。
+    std::unordered_map<unsigned, animation::LocomotionRuntime> m_playerLoco;
 
     // ---- 音频（G14-7/8）----
     // 编辑器自己也要一份：Inspector 的 ▶ 试听、Content 面板双击试听、

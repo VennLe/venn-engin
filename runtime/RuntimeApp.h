@@ -22,6 +22,10 @@
 
 #include "core/Application.h"
 #include "animation/AnimatorSystem.h"
+// 四态 locomotion 状态机：与编辑器 Play **共用**同一份实现
+// （见 engine/animation/Locomotion.h —— 以前它只长在本文件里，
+//  于是编辑器 Play 只有位移、没有走路动画）。
+#include "animation/Locomotion.h"
 
 #include "GameLoop.h"
 #include "GameState.h"
@@ -83,6 +87,14 @@ private:
     // UI tick（U6）：**每帧都跑，在状态栈之外**。采样导航键 → 推进焦点栈
     // → 产出 `m_svc.uiAction`（暂停菜单选了哪一项）。
     void tickUi(float dt);
+    // 玩家四段基础动画（P3）：按"水平速度 + 是否贴地"切
+    // idle / walk / run / jump 四段 clip。没有蒙皮模型时什么都不做。
+    //
+    // 为什么是四段硬状态而不是混合树：这一层要的是"走起来像个角色"，
+    // 而 A2 的控制器资产（`assets/animators/*.anim.json`）是给"要精细
+    // 过渡"的项目留的。四段足够验证绑骨 + 动画生成这条链真的通了；
+    // 想做混合，把这里换成控制器资产即可（clipName 的写入点还是同一个）。
+    void tickPlayerAnimation(float dt);
     // 音频每帧（G14-5）：listener = 相机；把场景里的 AudioSourceComponent
     // 收集成 SourceUpdate 喂给 AudioSystem。⚠ **只读世界**（§3.6）：
     // 这里一个 `world().get<T>()` 的非 const 引用都不许拿去写。
@@ -130,6 +142,22 @@ private:
     HudModel m_hudModel;
     ui2::UiFocusStack m_focus;
     int m_lastUiState = -1;   // -1 未知 / 0 游戏中 / 1 暂停；首次必应用
+
+    // ---- 鼠标捕获 / 操作态（P5，2026-10-22）----
+    //
+    // 用户要求："游戏启动运行后，必须要鼠标左键在 3d 视口中点击后才能开始
+    // 正常和角色开始交互；操作角色时鼠标要隐藏；退出操作可以点 Esc，此时
+    // 也显示鼠标。"
+    //
+    // 所以是**两态**而不是一个"可见/不可见"：
+    //   false = 未操作：光标可见、可自由移动（不锁在窗口里），玩家不响应输入
+    //   true  = 操作中：GLFW_CURSOR_DISABLED（隐藏 + 锁定 + 无限转视角）
+    //
+    // ⚠ 只要一个 bool 就够，不要另存"光标可见"：两者是同一件事的两种写法，
+    //   存两份必然有一天不一致（表现是"鼠标看不见但角色不动"）。
+    bool m_mouseCaptured = false;
+    // "未捕获"的提示只打一次（每帧打会把日志淹掉）
+    bool m_mouseIdleLogged = false;
     // 请求压 Paused（tickUi 只置意图，迁移在 onUpdate 末尾统一做）
     bool m_pauseRequested = false;
     bool pausedNow() const;
@@ -148,6 +176,12 @@ private:
     // 不透明状态在栈顶时（MainMenu）世界不画，但仍要提交一帧
     // （否则 ImGui 的帧不闭环、交换链也不推进）。用一份空场景当背景。
     std::unique_ptr<scene::Scene> m_menuScene;
+
+    // ---- 玩家四段动画（P3 / P4）----
+    // 状态机的**内容**已经搬到 `animation/Locomotion`（编辑器 Play 与运行时
+    // 共用一份），这里只留这份游标。历史注释保留：`GAME-ANIM` 只在状态
+    // 变化时打一行 —— 每帧一行会把别的锚点淹掉。
+    animation::LocomotionRuntime m_playerAnim;
 
     // 从进入 Playing 起算的仿真帧数（确定性对照用；与编辑器的
     // m_physicsFrames 同语义、同起点）

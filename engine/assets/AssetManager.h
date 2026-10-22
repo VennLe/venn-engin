@@ -73,6 +73,20 @@ public:
     Texture* loadTexture(const std::string& path, const std::string& name = "",
                          bool srgb = true);
 
+    // **容错版**：读不出来就返回 nullptr，不抛。
+    //
+    // 为什么必须有它：`Texture::fromFile` 在文件打不开时 `throw`
+    // （`Texture.cpp:665`），而调用点在**模型导入**的循环里 —— 一张贴图丢
+    // 就让整个模型加载失败、实体变空。而"贴图丢了"恰恰是资产链上最常见的
+    // 现场：换机器 / 漏拷 `textures/` 目录 / 改了相对路径。正确语义是
+    // **退化到默认材质继续渲染**，而不是拒绝整个模型。
+    //
+    // 所以：凡是**加载期从资产文件里读**的贴图都走这个版本，由调用方决定
+    // 打哪条 WARN（`VMESH-TEX-MISSING` / `FBX-TEX-MISSING`）。
+    // 而 glTF / 用户显式指定的贴图仍走 loadTexture —— 那条路上失败该报错。
+    Texture* tryLoadTexture(const std::string& path,
+                            const std::string& name = "", bool srgb = true);
+
     // ---- 材质 ----
     // 便捷版：只给 albedo 贴图，normal/orm 留空（渲染时绑中性缺省贴图）
     Material* makeMaterial(const std::string& name, Texture* albedo,
@@ -515,6 +529,21 @@ inline Texture* AssetManager::loadTexture(const std::string& path,
     tagTextureName(raw, key);
     m_textures[key] = std::move(tex);
     return raw;
+}
+
+inline Texture* AssetManager::tryLoadTexture(const std::string& path,
+                                             const std::string& name, bool srgb) {
+    if (path.empty()) return nullptr;
+    try {
+        return loadTexture(path, name, srgb);
+    } catch (const std::exception&) {
+        // 具体原因已经由 `Texture::fromFile` 打了 ERROR（路径 + stbi 的原因），
+        // 这里再打一遍就是重复刷屏。调用方会补一条带 model/mat 的 WARN，
+        // 那条才是排查时真正需要的上下文。
+        return nullptr;
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 inline Mesh* AssetManager::findMesh(const std::string& key) const {

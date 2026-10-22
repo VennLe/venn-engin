@@ -7,10 +7,16 @@
     `EDITOR-READY` 行里的实体数 = 模板实体数。」
 
 这个脚本把 M1（窗口）+ M2（创建）+ M3（拉起）串成**一条用户路径**：
-  新建向导 → 建出工程 → 点「打开编辑器」→ 启动器收进任务栏 → 编辑器接管。
+  新建向导 → 建出工程 → **自动**进编辑器 → 启动器收进任务栏 → 编辑器接管。
+
+⚠ 2026-10-22 用户把这一步的交互改了：第三步点「创建」**直接进编辑器**，
+  不再有"停在收尾页、再点 Open editor"这一手。所以 O1 现在断言的是
+  "**没人点任何东西**，创建成功之后编辑器自己起来了"。
 
 覆盖（O1~O10）：
-  O1  点「打开编辑器」后日志出现 `LAUNCHER-SPAWN ok pid=`
+  O1  点「创建」之后日志**自动**出现 `LAUNCHER-SPAWN ok pid=`
+  O1b 收尾页 `LAUNCH-DONE` 仍然画出来（spawn 失败时它是唯一的重试入口）
+  O1c `LAUNCHER-OPEN kind=editor` 恰好一次（多一次 = 又走了点按钮的老路）
   O2  拉起之后启动器**收进任务栏**（`LAUNCHER-MINIMIZED` + IsIconic）——
       2026-10-19 用户改的契约：启动器常驻，编辑器关掉之后还要在
   O2b 启动器进程还活着（以前这里断言的是"它自己退出了"，已反转）
@@ -102,21 +108,46 @@ def main():
         if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-create"):
             fails.append("向导 Step3 点不到创建")
             return kit.finish(fails)
-        if not tap.wait_rect("LAUNCH-DONE", timeout=40.0):
-            fails.append("创建没成功（没出现 LAUNCH-DONE）")
-            return kit.finish(fails)
 
-        # ---- O1 点「打开编辑器」----
-        if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-doneOpen"):
-            fails.append("O1 点不到「打开编辑器」")
-            return kit.finish(fails)
-        if not tap.wait_line("LAUNCHER-SPAWN ok", timeout=25.0):
-            fails.append("O1 没有 LAUNCHER-SPAWN ok（没拉起子进程）")
+        # ---- O1 创建成功 → **自动**进编辑器（2026-10-22 需求 A）----
+        #
+        # 用户原话："当操作到第三步的时候点击创建的时候，就直接进入引擎编辑器
+        # 即可，不需要其他的操作。"
+        #
+        # 所以这里**不再点** `LAUNCH-BTN-doneOpen`。`commitWizard()` 在创建
+        # 成功的那一帧就 `requestSpawn()`，下一帧 `onUpdate` 里拉子进程并
+        # 收进任务栏（见 LauncherApp.cpp）。
+        #
+        # ⚠ 三条断言缺一条，"契约被改回去"这件事就会**静默通过**：
+        #   ① SPAWN ok  —— 子进程真的起来了；
+        #   ② LAUNCH-DONE 仍然画出来 —— 收尾页不是被删掉了，只是**没人需要
+        #      点**。spawn 失败时它还是唯一的重试入口，删了就没有兜底；
+        #   ③ `LAUNCHER-OPEN kind=editor` 只出现一次 —— 两次就意味着又走了
+        #      "点 Open editor" 那条老路（一次来自 commitWizard，一次来自
+        #      按钮）。
+        if not tap.wait_line("LAUNCHER-SPAWN ok", timeout=45.0):
+            fails.append("O1 创建之后没有自动拉起编辑器（没有 LAUNCHER-SPAWN ok）")
         else:
             for l in tap.text().splitlines():
                 if "LAUNCHER-SPAWN ok" in l:
                     kit.log("CHECK O1 %s" % l.split("] ", 1)[-1])
                     break
+
+        # ⚠ 顺序说明：`LAUNCH-DONE` 的锚点行是在**下一帧的 onImGui** 才打的
+        #   （创建那一帧 `switch(m_page)` 走的还是 Step3），而 `LAUNCHER-SPAWN`
+        #   在同一帧的 `onUpdate` 里更早 —— 所以这条必须**排在 O1 之后**等。
+        if not tap.wait_rect("LAUNCH-DONE", timeout=15.0):
+            fails.append("O1b 收尾页 LAUNCH-DONE 没画出来"
+                         "（spawn 失败时它是唯一的重试入口，不能删）")
+        else:
+            kit.log("CHECK O1b done page still drawn (fallback entry) OK")
+
+        n_open = tap.count_line("LAUNCHER-OPEN kind=editor")
+        if n_open != 1:
+            fails.append("O1c LAUNCHER-OPEN kind=editor 出现 %d 次，期望 1"
+                         "（多出来说明还在走「点 Open editor」的老路）" % n_open)
+        else:
+            kit.log("CHECK O1c spawned exactly once, no manual click OK")
 
         # ---- O2 拉起之后启动器**收进任务栏**，不退出 ----
         # 契约在 2026-10-19 被用户改反了：以前是"一个工程一个进程，拉起即

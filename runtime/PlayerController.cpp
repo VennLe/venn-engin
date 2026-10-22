@@ -32,6 +32,15 @@ float lerpAngle(float a, float b, float t) {
 
 constexpr float kPi = 3.14159265f;
 
+// 物理层的 desc.maxSpeed 是**输入速度的硬上限**（stepCharacter 会把超过它
+// 的期望速度截回去）。冲刺是给期望速度乘 sprintMultiplier，所以这个上限
+// 必须留到冲刺速度 —— 否则按住 Shift 也只是"想要 9 m/s、被截成 4.5 m/s"，
+// 表现就是"冲刺完全没反应"（动画状态机的 run 阈值永远够不到）。
+float physicsMaxSpeed(const ecs::CharacterControllerComponent& cc) {
+    const float sprint = cc.sprintMultiplier > 1.0f ? cc.sprintMultiplier : 1.0f;
+    return cc.maxSpeed * sprint;
+}
+
 } // namespace
 
 PlayerController::PlayerController(core::InputMap& input) : m_input(input) {}
@@ -58,17 +67,47 @@ bool PlayerController::attach(scene::Scene& scene, physics::PhysicsWorld* world)
     m_desc.groundSnap = cc->groundSnap;
     m_desc.groundSnapDistance = cc->groundSnapDistance;
     m_desc.gravityScale = cc->gravityScale;
-    m_desc.maxSpeed = cc->maxSpeed;
+    m_desc.maxSpeed = physicsMaxSpeed(*cc);
     m_desc.jumpSpeed = cc->jumpSpeed;
     m_desc.acceleration = cc->acceleration;
     m_desc.airControl = cc->airControl;
     m_desc.pushStrength = cc->pushStrength;
+    // 地形高度场（第十轮，见 sync 里同一行）。
+    m_desc.ground = world ? world->heightfield() : nullptr;
 
     // 实体原点是**脚底**（与编辑器里摆人的习惯一致），物理状态要的是
     // 胶囊中心 —— 差一个 (halfHeight + radius)。
     const float halfTotal = cc->halfHeight + cc->radius;
     m_state = physics::CharacterState{};
     m_state.position = tc->position + glm::vec3(0.0f, 0.0f, halfTotal);
+
+    // ---- 出生点不能陷在地形里（2026-10-22 第十轮）----
+    //
+    // 用户原话："物理特性上不允许说有任何物体时能陷入其中的，包括 GameStart。"
+    //
+    // 根因有两个，**都要修**：
+    //   ① 模板地形曾经在原点处是 3.35 m（归一化基准取的是全局最低点），
+    //      而 GameStart 写的是 z=0 → 一开局脚就在土里 3.35 m；这条已经在
+    //      `tools/gen_templates.py` 里修掉（出生点 = 0 m）。
+    //   ② 用户也可能把 GameStart 摆到山坡上、或把地形刷高 —— 所以这里兜一次：
+    //      脚底低于地表就抬到地表。
+    //
+    // ⚠ 为什么放在 **attach（出生那一刻）**，而不是每一步的 `stepCharacter` 里：
+    //   后者等于"每帧强行把人按在地表"——在超过 slopeLimit 的陡坡上本该滑下去
+    //   （自检 D4 明确断言这一点），一按就永远滑不动了。出生时校正一次
+    //   才是对的语义：**摆错位置是编辑期问题，不是物理问题**。
+    if (m_desc.ground && m_desc.ground->valid()) {
+        const float surf = physics::heightAt(*m_desc.ground, tc->position.x,
+                                            tc->position.y);
+        if (tc->position.z < surf - 1.0e-3f) {
+            VK_LOG_INFO("GAME-PLAYER unburied feet=%.2f -> %.2f",
+                        static_cast<double>(tc->position.z),
+                        static_cast<double>(surf));
+            tc->position.z = surf;
+            m_state.position.z = surf + halfTotal;
+        }
+    }
+
     m_state.onGround = true;
     m_lastCenter = m_state.position;
     m_lastFeet = tc->position;
@@ -183,11 +222,15 @@ void PlayerController::update(scene::Scene& scene, physics::PhysicsWorld* world,
     m_desc.groundSnap = cc->groundSnap;
     m_desc.groundSnapDistance = cc->groundSnapDistance;
     m_desc.gravityScale = cc->gravityScale;
-    m_desc.maxSpeed = cc->maxSpeed;
+    m_desc.maxSpeed = physicsMaxSpeed(*cc);
     m_desc.jumpSpeed = cc->jumpSpeed;
     m_desc.acceleration = cc->acceleration;
     m_desc.airControl = cc->airControl;
     m_desc.pushStrength = cc->pushStrength;
+    // 地形高度场（第十轮）：物理世界已经把它当"真地面"（刚体走地形接触），
+    // 角色这边必须接上同一个指针 —— 否则会出现"木箱停在山坡上、人却穿进
+    // 山里走过去"这种两边不一致。
+    m_desc.ground = world ? world->heightfield() : nullptr;
 
     // ---------------- 视角 ----------------
     // ⚠ `m_pitch` 是**仰角**（正 = 相机在注视点上方、往下看），与
@@ -218,7 +261,9 @@ void PlayerController::update(scene::Scene& scene, physics::PhysicsWorld* world,
     if (dl > 1.0f) dir /= dl;
 
     const bool sprint = m_input.isHeld("Sprint");
-    const float speed = m_desc.maxSpeed * (sprint ? cc->sprintMultiplier : 1.0f);
+    // 走路速度永远取 cc->maxSpeed；m_desc.maxSpeed 是物理层的**截断上限**
+    // （已含冲刺余量），不能拿来当走路速度，否则不按 Shift 也会飞奔。
+    const float speed = cc->maxSpeed * (sprint ? cc->sprintMultiplier : 1.0f);
     const glm::vec3 desired = dir * speed;
 
     const bool jump = m_input.wasPressed("Jump");
@@ -229,6 +274,35 @@ void PlayerController::update(scene::Scene& scene, physics::PhysicsWorld* world,
 
     const physics::CharacterStepResult r = physics::stepCharacter(
         wref, m_desc, m_state, desired, dt, jump, m_proxy);
+
+    // ---------------- 兜底：脚底绝不允许留在地形下面 ----------------
+    //
+    // 用户原话："角色在踩在地形的地面时，应该是脚部踩在上面的，不允许脚底
+    // 踩到地形地面的下方。"
+    //
+    // `stepCharacter` 里的扫掠窗口（见 CharacterController.cpp 里的 sweep）
+    // 已经从根上避免"一帧跨过地面"，这里再放一道**保险**：万一还有没覆盖到
+    // 的情形（陡坎、地形刚加载完、脚本瞬移），也绝不允许角色留在土里。
+    // 因为"在地形内部"是**不可恢复**状态 —— 竖直射线从胶囊中心往下打不到
+    // 任何东西（地面在头顶），控制器再也不可能自己贴回去。
+    //
+    // 阈值 0.25 m：正常贴地误差是毫米级；超过 25 cm 只可能是真的陷进去了。
+    // 触发时打 WARN，日志里有据可查，不做静默修补。
+    if (m_desc.ground && m_desc.ground->valid() && !m_state.onGround) {
+        const float halfTotalR = cc->halfHeight + cc->radius;
+        const float surf = physics::heightAt(*m_desc.ground, m_state.position.x,
+                                            m_state.position.y);
+        const float feetZ = m_state.position.z - halfTotalR;
+        if (feetZ < surf - 0.25f) {
+            VK_LOG_WARN("GAME-PLAYER-RESCUE feet=%.3f surf=%.3f depth=%.3f",
+                        static_cast<double>(feetZ),
+                        static_cast<double>(surf),
+                        static_cast<double>(surf - feetZ));
+            m_state.position.z = surf + halfTotalR;
+            m_state.velocity.z = 0.0f;
+            m_state.onGround = true;
+        }
+    }
 
     // ---------------- 写回实体 ----------------
     const float halfTotal = cc->halfHeight + cc->radius;
@@ -384,6 +458,33 @@ int runPlayerSelfTest() {
         pcheck("A3 走的是 +X（相机 yaw=0 时 W = +X）",
                pc.characterCenter().x > p0.x + 1.0f,
                "dx=" + std::to_string(pc.characterCenter().x - p0.x));
+
+        // ---- A2b 冲刺：按住 Sprint 必须真的更快 ----
+        // 这一条是补回来的：物理层的 desc.maxSpeed 会截断期望速度，若它按走路
+        // 速度填，Sprint 就完全没反应（前文 physicsMaxSpeed 的注释）。
+        // 2026-10-22：出厂绑定从 LShift 换成**鼠标右键**，这里跟着换 —— 否则
+        // 自检会替一条已经不存在的手感背书（测的是新表里没有的键 = 测了个空）。
+        core::RawInput rawSprint;
+        rawSprint.keys[GLFW_KEY_W] = true;
+        rawSprint.mouse[GLFW_MOUSE_BUTTON_RIGHT] = true;
+        for (int i = 0; i < 30; ++i) {
+            in.pollRaw(rawSprint);
+            pc.update(s, &w, dt);
+        }
+        const float ds0 = pc.travelledDistance();
+        for (int i = 0; i < kFrames; ++i) {
+            in.pollRaw(rawSprint);
+            pc.update(s, &w, dt);
+        }
+        const float sprintMeasured = (pc.travelledDistance() - ds0) / secs;
+        const float sprintExpect = cc.maxSpeed * cc.sprintMultiplier;
+        const float sprintErr =
+            std::fabs(sprintMeasured - sprintExpect) / sprintExpect;
+        pcheck("A2b 冲刺速度 = maxSpeed × sprintMultiplier（±5%）",
+               sprintErr <= 0.05f,
+               "measured=" + std::to_string(sprintMeasured) + " expect=" +
+                   std::to_string(sprintExpect) +
+                   " err=" + std::to_string(sprintErr * 100.0f) + "%");
     }
 
     // ---- B. 相机遇墙缩臂（不穿墙）----

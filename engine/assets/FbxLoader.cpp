@@ -32,6 +32,7 @@
 
 #include "core/Logger.h"
 
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -212,6 +213,11 @@ Material* fbxMaterial(AssetManager& assets, const ufbx_material& mat,
                    : keyPrefix + "/mat";
     if (Material* cached = assets.findMaterial(key)) return cached;
 
+    // 材质名**提前**取出来：下面的"贴图缺失"WARN 也要用它（排查时 `mat=Skin`
+    // 比 `mat=3` 有用得多），而原本它是在函数末尾才算的。
+    std::string nm;
+    if (mat.name.length) nm.assign(mat.name.data, mat.name.length);
+
     glm::vec4 baseColor(1.0f);
     float roughness = 0.5f, metallic = 0.0f;
     glm::vec3 emissive(0.0f);
@@ -254,7 +260,13 @@ Material* fbxMaterial(AssetManager& assets, const ufbx_material& mat,
     if (!tex) tex = mat.fbx.diffuse_color.texture;
     if (tex && tex->type == UFBX_TEXTURE_FILE && tex->filename.length) {
         const std::string fp(tex->filename.data, tex->filename.length);
-        albedo = assets.loadTexture(fp, keyPrefix + "/albedo", true);
+        // 容错版：贴图丢了退化到默认材质，别让整个模型加载失败
+        // （`loadTexture` 在文件读不出来时会抛异常）。
+        albedo = assets.tryLoadTexture(fp, keyPrefix + "/albedo", true);
+        if (!albedo) {
+            VK_LOG_WARN("FBX-TEX-MISSING model=%s mat=%s path=%s",
+                        modelKey.c_str(), nm.c_str(), fp.c_str());
+        }
     }
 
     Material* out = assets.makeMaterialPBR(
@@ -266,8 +278,6 @@ Material* fbxMaterial(AssetManager& assets, const ufbx_material& mat,
         // 参数原样写进场景 —— 表面上能往返，但"模型重导入后覆盖关系"
         // 无从谈起（W0-3 的整个机制都挂不上）。
         out->source.setModel(modelKey);
-        std::string nm;
-        if (mat.name.length) nm.assign(mat.name.data, mat.name.length);
         const std::string mid =
             vm ? resolveMaterialId(*vm, modelKey, nm, matIdx)
                : (modelKey + "#" +
@@ -539,6 +549,11 @@ std::unique_ptr<Model> loadFBXModel(rhi::Device& device,
                                     const std::string& name) {
     (void)ctx;
 
+    // 加载耗时（2026-10-22）：与 `VMESH loaded` 同口径，用来对比
+    // "解析 FBX" 和 "读 .vmesh" 两条路的真实差距。不带这个数字的话，
+    // 离线编译器的收益只能靠感觉说。
+    const auto tLoad0 = std::chrono::steady_clock::now();
+
     // W2-2：导入设置 sidecar（与 glTF 同一套策略，见 assets/Vmeta.h）
     Vmeta vmeta = beginModelImport(name);
 
@@ -761,10 +776,12 @@ std::unique_ptr<Model> loadFBXModel(rhi::Device& device,
     // W2-2：把本次见到的材质名补进映射并写回 sidecar（内容没变就不写）
     finishModelImport(name, vmeta);
 
-    VK_LOG_INFO("FBX loaded: %s (%u submeshes, %s, %d joints)",
+    VK_LOG_INFO("FBX loaded: %s (%u submeshes, %s, %d joints, %.1f ms)",
                 path.c_str(), (uint32_t)model->subMeshes.size(),
                 skeleton ? "skinned" : "static",
-                skeleton ? skeleton->jointCount() : 0);
+                skeleton ? skeleton->jointCount() : 0,
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tLoad0).count());
 
     ufbx_free_scene(scene);
     return model;

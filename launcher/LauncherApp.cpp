@@ -383,6 +383,18 @@ void LauncherApp::commitWizard() {
             }
         VK_LOG_INFO("LAUNCHER-WIZARD created root=%s files=%d", m_create.root.c_str(),
                     m_create.filesCopied);
+
+        // ---- 建完**直接进编辑器**（2026-10-22 用户要求）----
+        // 用户原话："当操作到第三步的时候点击创建的时候，就直接进入引擎编辑器
+        // 即可，不需要其他的操作。"
+        //
+        // 以前这里停在 `Page::Done`（一张"建好了 / 写了几个文件 / 五个步骤"
+        // 的收尾页），要再点 footer 的"Open editor"才拉编辑器。
+        //
+        // ⚠ `Page::Done` **仍然要设**：`runPendingSpawn` 是下一帧的事，
+        //   而它可能失败（exe 不在、工程读不出来）。失败时停在收尾页上
+        //   还能点"Open editor"重试，不会退回到一个没有任何入口的空白。
+        requestSpawn(SpawnKind::Editor, m_create.root);
     } else {
         // **留在 Step3**，错误行就地显示（路线图 §5.3 Step4：不弹模态）。
         m_page = Page::Display;

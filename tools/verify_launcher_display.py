@@ -152,6 +152,10 @@ def make_one(work, name, res_index, quality_index, type_index=1):
     try:
         return kit.drive_wizard(hwnd, tap, type_index=type_index)
     finally:
+        # 需求 A（2026-10-22）：创建成功即自动拉起编辑器。本用例只借向导
+        # 建工程，那个编辑器是副作用 —— 三个工程就是三个窗口，不关掉的话
+        # `run_game` 的 `find_window` 会被它们干扰。
+        kit.dismiss_spawned(tap)
         kit.shutdown(proc, hwnd)
         if proc.poll() is None:
             proc.kill()

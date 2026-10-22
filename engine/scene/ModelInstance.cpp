@@ -6,6 +6,8 @@
 
 #include "core/Logger.h"
 
+#include "assets/Mesh.h"   // boundsMin()/boundsMax()（dropToGround 要用）
+
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
 
@@ -68,11 +70,61 @@ ModelInstanceResult instantiateModel(Scene& scene, assets::Model* model,
         w.add<ecs::MeshComponent>(e, mc);
         w.add<ecs::MaterialComponent>(e, ecs::MaterialComponent{sub.material});
 
-        if (auto* t = w.get<ecs::TransformComponent>(e))
-            applySubTransform(*t, sub.transform);
+        if (auto* t = w.get<ecs::TransformComponent>(e)) {
+            // 朝向补偿（见 opt.yawOffsetDeg）：**预乘**一个绕 Z 的旋转，
+            // 即 local = Rz(offset) * subTransform。
+            // ⚠ 不能改成"给 t->rotation.z 加上 offset"：子变换自己可能带
+            //   x/y 旋转，欧拉角逐分量相加在那种情况下不等于绕世界 Z 转。
+            //   预乘矩阵再 decompose 才是同一个几何。
+            glm::mat4 m = sub.transform;
+            if (opt.yawOffsetDeg != 0.0f) {
+                m = glm::rotate(glm::mat4(1.0f),
+                                glm::radians(opt.yawOffsetDeg),
+                                glm::vec3(0.0f, 0.0f, 1.0f)) * m;
+            }
+            applySubTransform(*t, m);
+        }
 
         scene.setParent(e, root);
         out.entities.push_back(e);
+    }
+
+    // ---- 落地对齐：把 position 当成"地面点"（见 opt.dropToGround 注释）----
+    //
+    // 放在这里而不是让调用方各算一遍：`min.z` 必须按**装配之后的实际子网格
+    // 变换**求，调用方再算一次就会得到第二套口径（拖放路径的
+    // `alignImportToGround` 走的是 picking 的世界 AABB，两者必须一致 ——
+    // 它是幂等的，所以这里的抬升到它那里会算出 shift.z=0）。
+    if (opt.dropToGround && !opt.parent.valid()) {
+        glm::vec3 lo(0.0f), hi(0.0f);
+        bool any = false;
+        for (const auto& sub : model->subMeshes) {
+            if (!sub.mesh) continue;
+            for (int c = 0; c < 8; ++c) {
+                const glm::vec3 corner(
+                    (c & 1) ? sub.mesh->boundsMax().x : sub.mesh->boundsMin().x,
+                    (c & 2) ? sub.mesh->boundsMax().y : sub.mesh->boundsMin().y,
+                    (c & 4) ? sub.mesh->boundsMax().z : sub.mesh->boundsMin().z);
+                const glm::vec3 p = glm::vec3(sub.transform * glm::vec4(corner, 1.0f));
+                lo = any ? glm::min(lo, p) : p;
+                hi = any ? glm::max(hi, p) : p;
+                any = true;
+            }
+        }
+        if (any) {
+            if (auto* t = w.get<ecs::TransformComponent>(root)) {
+                const float lift = opt.position.z - lo.z;
+                t->position.z += lift;
+                if (!opt.sourcePath.empty())
+                    VK_LOG_INFO("MODEL-GROUND path=%s bounds.z=%.3f..%.3f "
+                                "lift=%.3f (bottom -> %.3f)",
+                                opt.sourcePath.c_str(),
+                                static_cast<double>(lo.z),
+                                static_cast<double>(hi.z),
+                                static_cast<double>(lift),
+                                static_cast<double>(opt.position.z));
+            }
+        }
     }
 
     // ---- 蒙皮：挂在**模型根**上（所有 SubMesh 共享一份骨架/动画状态）----

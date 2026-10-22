@@ -107,6 +107,20 @@ struct TerrainAsset {
     std::string path;  // 相对 assets/ 的 .vterrain 路径（日志 / 序列化用）
     bool ok = false;
 
+    // 读盘时发现高度值超出 [0,1]（2026-10-22 第十一轮）。
+    //
+    // 来源：编辑器的抬升笔刷允许冲到 kMaxNorm = 8（那是"山峰不撞平顶"的
+    // 余量，见 LandscapeEditor.cpp 里 kMaxNorm 的说明），而老版本的
+    // `saveAssets()` 把这份**未收敛**的数据原样写进了 height.r32。下次读盘
+    // 撞上 [0,1] 契约 → 工程直接打不开。
+    //
+    // 现在 `loadTerrain` 不再硬失败，而是**按最高点重整**：
+    //     heights /= hi ， desc.maxHeight *= hi
+    // 世界高度是 `h * maxHeight`，两边同乘同除，**结果恒等** —— 地形长得
+    // 一模一样，只是数值回到规范区间。置这个位是为了让上层知道
+    // "**磁盘上那份还是脏的**，下次保存会写回规范数据"。
+    bool rescaled = false;
+
     glm::vec2 worldSize() const {
         return glm::vec2(static_cast<float>(desc.cols - 1) * desc.metersPerPixel,
                          static_cast<float>(desc.rows - 1) * desc.metersPerPixel);
@@ -135,6 +149,29 @@ bool loadTerrainDesc(const std::string& relPath, TerrainDesc& out,
 // 失败日志（TERRAIN-FAIL）不受 quiet 影响，永远打。
 bool loadTerrain(const std::string& relPath, TerrainAsset& out,
                  std::string* err = nullptr, bool quiet = false);
+
+// ------------------------------------------------------------
+// 值域收敛（2026-10-22 第十一轮）
+// ------------------------------------------------------------
+
+// 把 `heights` 收敛回 [0,1]，同时把 `desc.maxHeight` 同比放大。
+//
+// 世界高度 = `h × maxHeight`，两边同乘同除 → **结果恒等**：地形形状、
+// 物理高度、撤销栈里的"米"全都不用改，只是数值回到规范区间。
+//
+// 返回值是实际应用的缩放系数 `inv = 1/峰值`；返回 1.0 表示"本来就在
+// 范围内，什么都没改"。调用方拿到它去缩放自己的派生数据（编辑器的撤销栈
+// 存的是归一化高度，必须同比例缩，否则撤销一次地形会跳回 8 倍高）。
+//
+// 为什么这条逻辑住在 terrain 层而不是编辑器：`.r32 ∈ [0,1]` 是**资产契约**。
+// 抬升笔刷只是"一个会产生越界值的生产者"，把收敛写在编辑器里的话，
+// 以后任何新的写入者（地形导入、程序化生成、脚本）都得把它复制一遍 ——
+// 而这个 bug 的原始形态正是"写端和读端各自以为对方会收敛"。
+float normalizeHeightRange(TerrainAsset& asset);
+
+// 只改 `.vterrain` 里的 `maxHeight` 一个字段，其余字段原样保留
+// （读 JSON → 改一个键 → 写回，不重新手拼，免得漏字段）。
+bool rewriteMaxHeight(const std::string& relPath, float maxHeight);
 
 // ------------------------------------------------------------
 // 网格

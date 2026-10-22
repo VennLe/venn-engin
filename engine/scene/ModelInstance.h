@@ -45,6 +45,21 @@ struct ModelInstanceOptions {
     // parent 无效时根节点的名字。空 → 用 model->name，再空 → "model"。
     std::string rootName;
 
+    // **模型的"正面"绕 Z 轴的补偿角（度）**。装配时先把每个 SubMesh 的
+    // 局部变换预乘一个绕 Z 的旋转，于是"实体 +X = 模型正面"成为约定。
+    //
+    // 为什么需要它（2026-10-22，P5 实测）：引擎的实体朝向语义是
+    // `rotation.z = atan2(dir.y, dir.x)`，即 yaw=0 时正面朝 **+X**；
+    // 而 FBX/glTF 是 Y-up、源模型（Mixamo 等）正面朝 **+Z**，
+    // 经 ufbx 的 `right_handed_z_up` 映射 (x,-z,y) 之后落在 **-Y**。
+    // 不补偿的后果不是"稍微歪"，而是**横着平移**：人朝 -Y、却往 +X 走，
+    // 从镜头看就是侧身滑行 —— 用户原话"没有朝它的视线方向去移动"。
+    // 把 -Y 转到 +X 需要 **+90°**。
+    //
+    // 0 = 不补偿（默认，老场景逐位不变）。非 FBX 来源、或已经把正面烤成
+    // +X 的资产，保持 0。
+    float yawOffsetDeg = 0.0f;
+
     // 蒙皮组件建出来后 `playing` 的初值。
     //   游戏 / 编辑器主场景 → true（拖进来就在动）
     //   角色预览窗口     → false（由它自己的时间轴滑条决定）
@@ -53,6 +68,19 @@ struct ModelInstanceOptions {
     // 日志与断言用的资产标识（AssetManager 的 key 或相对路径）。
     // 空 → 不打 `MODEL-INSTANCE` 那行。
     std::string sourcePath;
+
+    // **把 `position` 解释成"地面点"而不是"模型原点"**。
+    //
+    // 为什么需要这个开关：模型的 pivot 在**几何中心**（见
+    // docs/external_model_pipeline.md §1），所以 `position = (0,0,0)` 会让
+    // 角色下半身埋进地里、上半身露出地面 —— 拖一个 1.8 m 的人进来，第一眼
+    // 看到的是"半个人"。编辑器想要的语义是"脚踩在这块地上"，于是把它打开，
+    // 装配完再按世界 AABB 把根节点整体抬 `-min.z`。
+    //
+    // 默认 false：`CharacterWindow` 的预览场景要的是"绕原点转"，抬头会让
+    // 模型在预览里跳一下；运行时的玩家挂载有自己的 lift 计算（还要跟胶囊
+    // 对齐），也不需要这个。
+    bool dropToGround = false;
 };
 
 struct ModelInstanceResult {

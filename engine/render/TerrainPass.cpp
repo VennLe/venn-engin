@@ -312,6 +312,14 @@ bool TerrainPass::init(const InitInfo& info) {
     }
 
     // 每实例 1 个 set，各 11 个采样器 + 1 个 UBO
+    // 描述符池：**首池**按 4 块地形估算（每块 1 set = 1 UBO + 11 sampler：
+    // 4 层 albedo + 4 层 normal + splat + height + hole）。
+    //
+    // ⚠ 这是**估算**不是上限（2026-10-22）：以前它是硬上限 —— 场景里放第 5
+    //   块地形就会在 allocate 上抛 VK_ERROR_OUT_OF_POOL_MEMORY
+    //   (-1000069000)，整个编辑器 `Fatal: Vulkan call failed`。
+    //   现在 `DescriptorAllocator` 池满会自动追加同规格的池，
+    //   所以这里写小了的代价只是"多建一个池"，不再是崩溃。
     m_descriptors = std::make_unique<rhi::DescriptorAllocator>(
         *m_device, 4, 4, 44);
 
@@ -376,6 +384,36 @@ void TerrainPass::recreatePipeline(VkRenderPass renderPass,
     m_samples = samples;
     m_pipeline.reset();
     createPipeline();
+}
+
+// ============================================================
+// Instance 析构：**必须**回收那 3 个裸 sampler
+// ============================================================
+//
+// 三个 VkSampler 是裸句柄，默认析构什么都不做。正常路径由 clearInstances
+// 显式销毁（它要先 waitIdle，见那段注释），但还有一条**异常路径**：
+//
+//   createTerrain → createInstanceResources 里 sampler 建在描述符集**之前**
+//   （line 703-709 在 726 的 allocate 之前），而 allocate 一旦失败就 throw。
+//   这时 Instance 还挂在局部 unique_ptr 上、从没进过 m_instances，
+//   unique_ptr 的析构就是它这辈子唯一一次清理机会 —— 没有这个析构函数，
+//   那 3 个 sampler 就永远漏在设备上。
+//
+// 症状（2026-10-22 用户报障）：
+//   `vkDestroyDevice(): VkDevice ... has 3 leaked objects`
+//   三个 VkSampler 的句柄连续 —— 一个实例的 height/splat/hole。
+//   ⚠ 泄漏是**次生**的：真正的病是描述符池满（见 DescriptorAllocator 的
+//     池链）。但把泄漏留在那里会掩盖病根 —— 下次池满时日志里还是只有
+//     "3 leaked objects"，看不出为什么会走到失败分支。
+TerrainPass::Instance::~Instance() {
+    if (device == VK_NULL_HANDLE) return;   // 半初始化（还没拿到设备）
+    VkSampler* all[3] = {&heightSampler, &splatSampler, &holeSampler};
+    for (VkSampler* s : all) {
+        if (*s != VK_NULL_HANDLE) {
+            vkDestroySampler(device, *s, nullptr);
+            *s = VK_NULL_HANDLE;
+        }
+    }
 }
 
 void TerrainPass::clearInstances() {
@@ -559,6 +597,8 @@ TerrainPass::Instance* TerrainPass::createTerrain(
     }
 
     auto inst = std::make_unique<Instance>();
+    // 设备句柄存进实例：3 个裸 sampler 的析构要用（见 ~Instance）。
+    inst->device = m_device->get();
     inst->model = model;
     inst->heightScale = (heightScale > 1.0e-4f) ? heightScale : 1.0f;
 

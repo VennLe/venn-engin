@@ -38,6 +38,10 @@
 #include "ViewportPanel.h"
 #include "Workspace.h"
 #include "script/ScriptEngine.h"
+// 四态 locomotion：与运行时共用同一份实现（P4）
+#include "animation/Locomotion.h"
+// 键码换算（编辑器侧判定走 ImGui 原始键状态，见 ui/KeyCodes.h）
+#include "ui/KeyCodes.h"
 
 #include "assets/AssetPath.h"
 #include "core/Logger.h"
@@ -45,6 +49,7 @@
 #include "core/WindowGeometry.h"
 #include "ecs/Components.h"
 #include "physics/CollisionWorld.h"
+#include "physics/CharacterController.h"   // physics::kGravity（编辑器跳跃同源）
 #include "physics/PhysicsWorld.h"
 // 场景 ⇄ 物理的绑定层（G01 从本文件提到引擎层，与 Game.exe 共用）
 #include "physics/ScenePhysics.h"
@@ -1766,6 +1771,10 @@ void EditorApp::onUpdate(float dt) {
         if (!m_ctx->usingRuntime()) {
             destroyPhysicsWorld();
             m_physicsFrames = 0;
+            // 停止后四态动画的游标一并丢掉：下一次 Play 从头起算
+            // （留着的话"上次 Play 停在第 16 秒 idle"会带着走 —— 一按 Play
+            //   就立刻重放一次 idle，看起来像"刚进游戏人自己抖了一下"）。
+            m_playerLoco.clear();
             // 编辑态：物理没在跑（面板据此显示原因而不是一片 0）
             m_ctx->setPhysicsRuntime(PhysicsRuntimeInfo{});
         }
@@ -2030,6 +2039,25 @@ void EditorApp::runRuntimeScripts(float dt) {
 //               角色平滑转身朝移动方向、边走边摆腿（walk 动画）。
 // 输入来源就是 ImGui IO：鼠标要在视口里才转视角；键盘全窗口生效
 // （游戏习惯）。玩家带胶囊碰撞体 → 移动后由 runCollision 保证不穿墙。
+// 编辑器 Play 态的脚下地面高度。
+//
+// 语义与运行时**必须是同一份**：运行时在 `PlayerController::attach` 里用
+// `physics::heightAt(*world->heightfield(), x, y)` 校正出生点，然后每帧由
+// `stepCharacter` 的 ⑥ 用同一条竖直射线贴地。编辑器这边没有物理世界，
+// 但只要 heightfield 是同一块资产、`heightAt` 是同一个函数，"站多高"
+// 就一致。
+//
+// ⚠ 没有地形时**返回 0 而不是"无穷低"**：编辑器视口里那块参考地面就在
+//   z=0（栅格也在那），把人放在 -∞ 会让他一路掉出屏幕。
+float EditorApp::editorGroundHeight(float x, float y) const {
+    if (m_physics) {
+        if (const physics::Heightfield* hf = m_physics->heightfield()) {
+            if (hf->valid()) return physics::heightAt(*hf, x, y);
+        }
+    }
+    return 0.0f;
+}
+
 void EditorApp::runPlayers(float dt) {
     scene::Scene& sc = m_ctx->runtimeScene();
     ecs::World& w = sc.world();
@@ -2071,7 +2099,16 @@ void EditorApp::runPlayers(float dt) {
             if (ImGui::IsKeyDown(ImGuiKey_A)) wish.y -= 1.0f;
         }
         const bool moving = (wish.x != 0.0f || wish.y != 0.0f);
-        const float speed = pc->moveSpeed * (io.KeyShift ? 2.0f : 1.0f);
+        // ---- 冲刺：**鼠标右键长按**（2026-10-22）----
+        // 与运行时同一套默认键位（`InputMap::makeDefault` 把 Sprint 绑在
+        // 右键上）。Play 态里视口导航是关的（见 ViewportPanel 的
+        // `if (m_ctx.isEditing()) handleNavigation(...)`），所以右键在游戏
+        // 里是空闲的，不会"一边跑一边转镜头"。
+        const bool sprinting = keysActive && io.MouseDown[ImGuiMouseButton_Right];
+        const float speed = pc->moveSpeed * (sprinting ? std::max(pc->sprintMultiplier, 1.0f) : 1.0f);
+        // 本帧实际位移的起点。走动之后用它算**真实水平速度**喂动画状态机
+        // —— 用输入轴的话，撞墙时输入满档但人没动，腿会在原地跑。
+        const glm::vec3 posBefore = tc->position;
 
         // 相机系水平基（与 Camera::angleDir 同约定：yaw=0 → +X，
         // yaw 增大向右转）。第一人称：forward = 视线水平分量；
@@ -2089,6 +2126,61 @@ void EditorApp::runPlayers(float dt) {
             const glm::vec2 dir2 = glm::normalize(wish);
             tc->position +=
                 (fwdH * dir2.x + rightH * dir2.y) * (speed * dt);
+        }
+
+        // ---- 竖直：跳跃 + 重力 + 贴地（2026-10-22）----
+        //
+        // 运行时那条链由 `physics::stepCharacter` 积分（真实胶囊扫掠、台阶、
+        // 斜坡、地形高度场）。编辑器 Play **没有** PlayerController（那是
+        // runtime 的概念），所以这里手写同一条抛物线 —— 但常量必须**同源**：
+        // 重力取 `physics::kGravity`，初速优先取实体上
+        // `CharacterControllerComponent::jumpSpeed`，于是"编辑器里跳多高"
+        // 与"出包后跳多高"不可能漂开。
+        //
+        // 为什么不做成"编辑器里也跑 stepCharacter"：那需要给 Play 态建一个
+        // 完整的物理世界 + 运动学代理，而编辑器 Play 的移动本来就是直接改
+        // 变换（不走物理）——半条链接上去只会得到"跳跃被物理推、走路不被
+        // 推"的混合手感，比没有更糟。
+        const float groundZ = editorGroundHeight(tc->position.x, tc->position.y);
+        if (!pc->started) {
+            pc->velocityZ = 0.0f;
+            pc->onGround = true;
+            if (tc->position.z < groundZ) tc->position.z = groundZ;
+        }
+        if (keysActive && pc->onGround &&
+            ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+            float v0 = pc->jumpSpeed;
+            if (const auto* cc = w.get<ecs::CharacterControllerComponent>(e)) {
+                if (cc->jumpSpeed > 0.0f) v0 = cc->jumpSpeed;
+            }
+            pc->velocityZ = v0;
+            pc->onGround = false;
+            // 锚点带上理论高度：0.70 m 是人能跳的高度，1.3 m 是"游戏里好看
+            // 但不真实"的高度。用户明确要求"符合实际"，所以这个数要能查。
+            VK_LOG_INFO("EDIT-JUMP v0=%.2f expectH=%.2fm airtime=%.2fs",
+                        static_cast<double>(v0),
+                        static_cast<double>(v0 * v0 / (2.0f * 9.81f)),
+                        static_cast<double>(2.0f * v0 / 9.81f));
+        }
+        if (!pc->onGround) {
+            float gScale = 1.0f;
+            if (const auto* cc = w.get<ecs::CharacterControllerComponent>(e))
+                gScale = cc->gravityScale;
+            pc->velocityZ += physics::kGravity * gScale * dt;
+            tc->position.z += pc->velocityZ * dt;
+            if (tc->position.z <= groundZ) {
+                tc->position.z = groundZ;   // 落地：脚踩在地表上
+                pc->velocityZ = 0.0f;
+                pc->onGround = true;
+            }
+        } else if (tc->position.z < groundZ) {
+            // 走上坡：抬起来（**不允许脚底沉到地表以下**）
+            tc->position.z = groundZ;
+        } else if (tc->position.z > groundZ + 0.02f) {
+            // 走下坡 / 走出坡沿：交给重力，别硬按着
+            pc->onGround = false;
+        } else {
+            tc->position.z = groundZ;      // 微差：贴住
         }
 
         // ---- 第三人称：转身 + walk 摆腿 ----
@@ -2145,6 +2237,49 @@ void EditorApp::runPlayers(float dt) {
                 });
         }
         pc->started = true;
+
+        // ---- 四态动画（P4）：移动就迈步、停下就待机 ----
+        //
+        // 与运行时共用 `animation/Locomotion`（见该文件头）。三条约定：
+        //   · 速度 = 本帧**实际**位移 / dt（撞墙 = 0 → 播 idle，不是"原地跑"）；
+        //   · 贴地 = `pc->onGround`（2026-10-22 起编辑器 Play 也有跳跃了，
+        //     之前这里恒传 true，jump 段在编辑器里永远走不到）；
+        //   · 锚点前缀 `EDIT-ANIM`，与运行时的 `GAME-ANIM` 分开
+        //     （两条链同时在跑时日志不会互相冒充）。
+        if (ecs::SkinnedMeshComponent* sk = w.get<ecs::SkinnedMeshComponent>(e)) {
+            if (sk->model && sk->model->skeleton) {
+                animation::LocomotionConfig cfg;
+                cfg.runSpeed = 0.0f;   // 自动：moveSpeed × 1.15
+                // 按键映射（角色面板里绑的键）。
+                // ⚠ 判定用 `ui_keys::pressed`（ImGui 原始键状态），
+                //   不能用 `core::Input` —— 后者被 `io.WantCaptureKeyboard`
+                //   门控，Play 时只要有 ImGui 窗口拿着键盘焦点就恒为 false。
+                if (const auto* km = w.get<ecs::AnimKeyMapComponent>(e)) {
+                    int key = 0;
+                    if (const std::string* clip =
+                            animation::pollKeyTrigger(*km, &ui_keys::pressed,
+                                                      &key)) {
+                        animation::playTriggerClip(
+                            m_playerLoco[e.id], *sk,
+                            w.get<ecs::AnimatorComponent>(e),
+                            *sk->model->skeleton, *clip, km->holdSeconds,
+                            "EDIT");
+                        VK_LOG_INFO("EDIT-ANIM-KEY-TRIGGER clip=%s key=%d",
+                                    clip->c_str(), key);
+                    }
+                }
+                const float hs =
+                    dt > 0.0f
+                        ? glm::length(glm::vec2(tc->position.x - posBefore.x,
+                                                tc->position.y - posBefore.y)) /
+                              dt
+                        : 0.0f;
+                animation::updateLocomotion(
+                    m_playerLoco[e.id], *sk, w.get<ecs::AnimatorComponent>(e),
+                    *sk->model->skeleton, hs, pc->onGround, pc->moveSpeed,
+                    dt, cfg, "EDIT");
+            }
+        }
 
         // ---- 相机 ----
         // Camera 不变式：position = target + angleDir * distance。
@@ -3099,7 +3234,13 @@ void EditorApp::handleShortcuts() {
     }
 
     // 播放 / 暂停（Shift+Space 已归"最大化"，所以这里要把 Shift 排除掉）
-    if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Space, false))
+    //
+    // ⚠ 2026-10-22：**只在编辑态**由 Space 触发。用户要求"角色跳跃是敲击
+    //   空格键"，Play 态下 Space 必须归玩家 —— 否则按一下跳起来的同时游戏
+    //   被暂停，看起来像"跳跃把游戏卡住了"。Play 态的暂停走工具栏按钮 /
+    //   Esc（见下方全屏退出）。
+    if (m_ctx->isEditing() && !io.KeyShift &&
+        ImGui::IsKeyPressed(ImGuiKey_Space, false))
         m_ctx->togglePlayPause();
 
     // ---- 运行态：F = 游戏全屏 / 恢复，Esc = 退出全屏，其余编辑快捷键失效 ----

@@ -68,6 +68,10 @@ public:
     bool springArmBlocked() const { return m_armBlocked; }
     bool onGround() const { return m_state.onGround; }
     glm::vec3 characterCenter() const { return m_state.position; }
+    // 角色速度（m/s，世界空间，含竖直分量）。给动画状态机用 —— 它要的是
+    // "这一帧真的在以多快移动"，而不是输入轴的大小（撞墙时输入满档但
+    // 速度为 0，腿不该还在跑）。
+    glm::vec3 velocity() const { return m_state.velocity; }
 
     void setTrace(bool on) { m_trace = on; }
 

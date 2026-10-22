@@ -2514,3 +2514,494 @@ UBO。于是拖水位滑块 = 写 16 字节，不需要重建任何缓冲（否�
 `terrain` 是地形编辑会改的），所以 `verify_water_depth.py` 自己做了
 `ensure_scene_assets()`——否则场景打开失败会静默回退到默认场景，
 地形不存在，贴地断言全部退化成 `src=flat`。
+
+## 24 · 创建即进编辑器 + 地形成"真地面"（2026-10-22 第十轮）✅
+
+用户原话：
+
+> 1. "引擎的启动器那里，当操作到第三步的时候点击创建的时候，就直接进入引擎
+>    编辑器即可，不需要其他的操作。"
+> 2. "引擎初始化时所生成的地形地面光泽度太高了，需要粗糙点看起来才自然些。
+>    并且，生成的地形地面就是真实的地面，物理特性上不允许说有任何物体时能
+>    陷入其中的，包括 GameStart。"
+> 3. "在地形编辑那里，参数 Strength 的上限值可以调大一些。"
+> 4. "鼠标右键加滑轮调整视口移动速度的那个可以灵敏度略高一些。"
+
+### 24.1 创建成功即 spawn 编辑器
+
+`commitWizard()` 在 `m_create.ok` 的分支末尾直接 `requestSpawn(SpawnKind::Editor,
+m_create.root)`。原来的路径是"停在 `Page::Done` 收尾页 → 用户点 footer 的
+Open editor"，现在这两步合一。
+
+**`Page::Done` 仍然要设**，理由不是审美：`runPendingSpawn()` 是**下一帧**的
+事（`onUpdate` 里跑），而它可能失败（`Editor.exe` 不在、工程读不出来）。
+失败时停在收尾页上还能点"Open editor"重试 —— 那是有且只有的兜底入口。
+把 `m_page` 直接改成 Idle 就等于"失败即失联"。
+
+日志顺序（自动化断言依赖它）：创建那一帧打 `LAUNCHER-WIZARD created` →
+`LAUNCHER-OPEN kind=editor`；下一帧 `onUpdate` 打 `LAUNCHER-SPAWN ok pid=` →
+`LAUNCHER-MINIMIZED`；同一帧的 `onImGui` 才画 `LAUNCH-DONE` 锚点。也就是
+说 **`LAUNCH-DONE` 比 `LAUNCHER-SPAWN` 晚**，验收脚本里的等待顺序必须照抄。
+
+### 24.2 地面从"打蜡"到"干土"
+
+问题的量级先摆这里：近地视角下整片地面是一条**又宽又亮的高光带**，像铺了
+一层丝绸。三个原因叠在一起：
+
+| 原因 | 改前 | 改后 |
+| --- | --- | --- |
+| 低频噪声主导高度场（大缓坡 = 大平面 = 大高光） | 0.34 | 0.10（能量压到 48/128 两个八度，"土颗粒"尺度） |
+| 法线贴图太平（几乎没细节去劈开高光） | strength 1.3 | 3.6 |
+| 材质 roughness 留了 8% 的镜面 | 0.92 | 1.0 |
+
+第四条是 albedo：对比度从 `0.93+0.14v`（±10%）放到 `0.86+0.26v`（±20%），
+再叠一层 ±10% 的逐纹素 grain。
+
+⚠ roughness 为什么直接拉到 1.0 而不是 0.97：地形着色器**没有逐层粗糙度
+贴图**，`roughness` 是**标量**。留在 0.92，GGX 的 D 项在整片地面上仍然
+解析得出一个宽峰，只是暗一点；拉到 1.0 之后 D 项退化成常数，高光才真正
+"碎"进法线细节里。
+
+截图度量（`_shot_tpl_ground.py`，同机同时段）：mean 124.3 → 120.8，
+**sd 26.3 → 27.55**。标准差变大 = 画面里"变化"更多 = 从平绒变土颗粒。
+
+### 24.3 地形成为真物理地面（连 GameStart 都不许陷）
+
+这一条挖出一个**从第六轮就存在的归一化基准 bug**，症状是"新工程一进来，
+玩家的脚在地面下 3.35 m"：
+
+```
+terrain_height()          原点被压平成 0（半径 14 m 内 t² 收缩）
+build_terrain_bytes()     用**全局 min..max** 归一化：(v-lo)/span
+                          → 原点那个 0 被抬到 0.5578
+                          → × maxHeight 6 = 3.35 m
+GameStart                 写的是 z = 0
+```
+
+也就是说"地面"在 3.35 m 高处，而出生点在地面以下。修法是让归一化的
+**基准与语义一致**：
+
+1. `terrain_height()` 的值域改成 `[0, maxHeight]`，原点**恰好**是 0；
+2. `build_terrain_bytes()` 只除最高点（`max(v, 0) / hi`），不再减去全局
+   最低点；
+3. `terrain.vterrain` 的 `maxHeight` 从常量 `TERRAIN_MAX_H`（6）改成
+   **实际最高点** `terrain_max_height()` = 5.193805。
+
+第 3 条是必须的：既然值域是 `[0, hi]`，`maxHeight` 就只能等于 `hi`，
+否则 1.0 那条归一化线会被拉伸到 6 m，整片地形的坡度全都虚高 15%。
+
+**物理侧**（`engine/physics/Narrowphase.cpp::terrainVsBody`）：
+
+* `Heightfield` 不是刚体形状，没有"面表"可以遍历。用**物体中心处的地表
+  切平面**当代表面：法线取 `normalAt(cx, cy)`，平面过
+  `(cx, cy, heightAt(cx, cy))`；
+* 然后把物体的**支撑点**（球心−n·r / 胶囊两端−n·r / 盒的 8 角 / 凸包顶点）
+  投到这个平面上，取最深的 4 个进流形；
+* 每个刚体只生成**一个**流形 —— 这是"切平面"近似的直接后果，也正好避开
+  "同一物体在相邻高度场单元上生成两份流形互相打架"。
+
+⚠ 锚点用 `B.position` 而不是"最深支撑点"：法线必须先定才能算深度，用
+支撑点定法线是循环依赖。
+
+**求解器要一个 A 侧刚体**（流形的 `bodyA` 必须是 `bodies[]` 的合法下标），
+而地形自己不在 `bodies` 里。做法是懒创建一个**伪静态刚体**：形状给
+`Shape::sphere(1e-3)`、位置放 `(0, 0, -1e6)` —— 宽相的 AABB 与任何真实
+物体都不相交，它只在流形里当 A 侧用。（用 `Plane` 不行：平面的 AABB 是
+无限大，会跟全世界配对。）
+
+**生命周期**：`buildSceneWorld()` 按值返回，`SceneBinding` 会被移动，
+所以 `Heightfield` 必须放 `unique_ptr`（堆地址稳定）、`heights` 指向
+`SceneBinding::terrainHeights` 那份 `vector` 拷贝。放值成员的话
+`PhysicsWorld::m_terrain` 在返回的那一刻就悬垂了。
+
+**出生校正放在 `PlayerController::attach()`，不是每帧**。一开始我写在
+`stepCharacter` 里（"每一步检查埋没就抬起来"），结果 `MYVK_RUNTIME_SELFTEST=terrain`
+的 D4 用例立刻红：60° 陡坡上本该滑下去，却原地不动（`dz=-0.41 dx=0`）——
+因为"角色中心 XY 处的地表高度"在斜面上本来就高于胶囊中心（中心到底面的
+竖直距离是 `(hh+r)/n.z`），每帧都被拎一次，人就钉在陡坡上了。
+语义更正：**摆错位置是编辑期问题，不是物理问题** —— 出生那一刻校正一次。
+
+### 24.4 两个手感参数
+
+| 位置 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `LandscapeEditor::kMaxStrength` | 16 | **64** | 514 m 的地形上 16 要按好几秒才抬一截；滑条 / 滚轮 / `,` `.` 三条入口都以它为准 |
+| `ViewportPanel::kSensitivityStep` | 0.10 | **0.25** | 从 1.0 调到 3.0 要滚 20 格，手感像"滚了没反应"；现在 8 格。上限仍是 `kMaxSensitivity`(20)，调不飞 |
+
+### 24.5 验收
+
+`MYVK_PHYS_TEST=1` → 29/29 PASS；`MYVK_RUNTIME_SELFTEST=terrain` → 27/27 PASS。
+
+新增 `tools/verify_terrain_physics.py`（自己用 Python 重算双线性
+`height_at()` 当独立真值，不读引擎的中间结果）：
+
+```
+PROBE terrain 257x257 mpp=2.0 maxh=5.1938 origin=(-256,-256) h(0,0)=0.0000
+CHECK A0 出生点处地形高度 = 0.0000 m（GameStart 站在 (0,0,0)）OK
+CHECK A1 地形已接进物理（terrains=1）OK
+CHECK A2 求解器代表体已创建 OK
+CHECK B3 玩家脚底 0.000 m ≈ 地形 0.000 m OK
+CHECK C BoxFlat 停在地形上 z=0.540（地形 0.083 + 0.5）OK
+CHECK C BoxFlat 底面 0.040 m ≥ 地表 0.083 m（没陷进去）OK
+CHECK C BoxSlope 停在地形上 z=2.586（地形 2.091 + 0.5）OK
+结果: PASS
+```
+
+启动器侧三条（全 PASS）：
+
+* `verify_launcher_create.py` —— 三轮向导，每轮创建成功顺带拉起一个编辑器
+  （需求 A 的副作用），脚本自己清掉；
+* `verify_launcher_open.py` —— **不点任何按钮**就等到 `LAUNCHER-SPAWN ok`；
+  `LAUNCH-DONE` 仍然画出来；`LAUNCHER-OPEN kind=editor` 恰好一次；
+* `verify_launcher_code.py` —— 外置代码根三项（junction / 编译 / 热重载）不变。
+
+### 24.6 顺带修正一条**早就过期**的断言
+
+`verify_launcher_create.py` 的 C11 原来查
+`entities[Player].player.mode == "third"/"first"`。这个契约在第八轮
+（2026-10-21）就被用户改掉了 —— **"初始场景里不摆放任何物体"**，玩家由
+`RuntimeApp::spawnPlayerFromGameStart()` 在运行时造出来，存盘里不该出现它。
+所以"Player 实体缺失"是**契约**而不是 bug，旧断言永远不可能再绿。
+
+改成当前契约：场景实体恰好是 `[Terrain, GameStart]`（无 Player、有出生点），
+并把"两种类型的差异"落到现在**唯一**的载体上 —— `camera.distance` +
+`camera.pitch`（TP 4.5 / 0.35 rad，FP 8.0 / 0.20 rad）。
+
+同一个根因还带红了 `verify_launcher_code.py` 的 D6：它断言
+`precompiled >= 2 script(s)`（"模板应有 main.vks + pickup.vks"）。引擎的
+预编译是**跟着场景引用走**的 —— 场上道具撤掉之后，只剩 GameStart 上挂的
+`main.vks` 一处引用，于是恒为 1。`pickup.vks` / `portal.vks` 还在模板里
+（`template.json` 的 `files[]` 仍列着），只是暂时没有实体引用它们。
+阈值改成 `>= 1`，注释里写清"数量是模板内容，不是契约"。
+
+⚠ 这两条都不是本轮引入的：`git diff` 显示模板场景与 HEAD 逐字相同，说明
+它们在第八轮就红了，只是那之后没跑过全量回归（用户 2026-10-22 明确取消了
+自动全量回归）。记在这里，免得下次又当成"新 bug"查一遍。
+
+### 24.7 遗留
+
+* `verify_terrain_physics.py` 还没登记进 `run_regression.py` 的
+  `DEFAULT` / `TRIGGERS`；
+* `verify_template_scene.py` 还缺一条"模板地形原点高度 = 0"的断言
+  （目前只在 `verify_terrain_physics.py` 的 A0 里覆盖）。
+
+## 25 · 报障修复：第 5 块地形 → 描述符池耗尽（2026-10-22）✅
+
+用户贴来的原始输出：
+
+```
+[VK_CHECK] Vulkan error -1000069000 at engine/rhi/DescriptorSet.inl:61
+[ERROR] [validation] vkDestroyDevice(): VkDevice 0x13c2a3bbe80 has 3 leaked
+        objects that have not been destroyed.
+VkSampler 0xc270000000c27, 0xc280000000c28, 0xc290000000c29
+[ERROR] Fatal: Vulkan call failed
+```
+
+### 25.1 这两行分别是什么
+
+`-1000069000` = **`VK_ERROR_OUT_OF_POOL_MEMORY`**（不是 DEVICE_LOST）。
+
+`DescriptorSet.inl:61` 是 `vkAllocateDescriptorSets` —— 一个**内联**函数，
+所有 pass 的描述符分配都落在同一行，所以行号只能说明"某个池满了"，**指不出
+是哪个池**。这是这次排查里最费时间的一点：错误信息看起来精确，其实是共享的。
+
+`3 leaked VkSampler` 是**次生**现象：某个对象建了一半就 throw，裸句柄没人回收。
+
+### 25.2 定位：把"池容量"和"用户动作"对上
+
+`TerrainPass` 的池是 `DescriptorAllocator(*m_device, 4, 4, 44)` ——
+**4 个 set / 4 个 UBO / 44 个 sampler**。而每块地形要 **1 个 set**：
+4 层 × (albedo + normal) + splat + height + hole = **11 个 sampler**。
+4 × 11 = 44。也就是说这个池是按**"最多 4 块地形"**精确定制的。
+
+复现方式普通到不能再普通：把模板场景 copy 一份，再复制 4 个 Terrain 实体
+（共 5 块），跑编辑器 —— 前 4 块 `TERRAIN-INSTANCE` 正常，第 5 块直接炸，
+输出与用户贴的一字不差。
+
+那 3 个 sampler 的来源也对上了：`createInstanceResources` 里 sampler 建在
+**描述符集之前**（line 703-709 vs 726），`allocate` 一 throw，那个 `Instance`
+还挂在局部 `unique_ptr` 上、从没进过 `m_instances` —— 于是 `unique_ptr` 的
+析构就是它唯一一次清理机会，而 `Instance` 没有析构函数，3 个裸句柄直接漏掉。
+三个句柄连续（0xc27/0xc28/0xc29）正是 height / splat / hole。
+
+### 25.3 修法：容量估算错误不该是崩溃
+
+两个层次，缺一不可：
+
+**① `rhi::DescriptorAllocator` 改成池链（`engine/rhi/DescriptorSet.{h,inl}`）**
+
+构造参数里的 `maxSets` / 各类型 `descriptorCount` 全都是**估算**（"这个 pass
+一般最多几张图"）。以前估小了就是 `VK_CHECK` throw → `Fatal`。现在
+`allocate()` 在拿到 `OUT_OF_POOL_MEMORY` / `FRAGMENTED_POOL` 时**追加一个
+同规格的池**重试：
+
+```cpp
+for (int i = 0; (r == OUT_OF_POOL_MEMORY || r == FRAGMENTED_POOL)
+                && i < kMaxGrow; ++i) {
+    if (!addPool()) break;
+    ai.descriptorPool = m_pool;              // 新池接任"当前池"
+    r = vkAllocateDescriptorSets(...);
+}
+```
+
+三个细节：
+
+* **旧池不能销毁** —— 里面的 set 还被管线引用着。所以是 `std::vector<
+  VkDescriptorPool> m_pools`（全部留着，析构时一起销毁），`m_pool` 只表示
+  "当前往哪个池里要"。
+* **只对这两种结果扩容**：别的失败（OOM、layout 与池不兼容）重试没意义，
+  硬试 8 次只会把真正的错误淹掉。
+* **上限 8 个池**：真到那一步说明每个 set 都在漏（每帧新建、从不释放），
+  那是泄漏 —— 该炸出来看日志，而不是无限建池把显存吃干净。扩容时打
+  `DESCRIPTOR-POOL 扩容：原池已满（maxSets=N），追加第 K 个池`。
+
+**② `TerrainPass::Instance` 补析构，回收 3 个 sampler**
+
+异常路径也要干净。`clearInstances()` 仍然显式销毁（它需要 `waitIdle()`），
+销毁后把句柄置空，析构里的判空就避免了二次销毁。
+
+⚠ 泄漏是次生的，但**必须修**：留着它，下次池满时日志里还是只有
+"3 leaked objects"，看不出为什么会走到失败分支 —— 那 3 个句柄连续，本身
+就是"某个实例建到一半"的指纹。
+
+### 25.4 验收（`tools/verify_multi_terrain.py`，全 PASS）
+
+6 块地形的场景跑 120 帧：
+
+```
+CHECK T1 6 blocks of terrain instantiated OK
+CHECK T2 no VK_CHECK / no OUT_OF_POOL_MEMORY OK
+CHECK T3 no leaked objects OK
+CHECK T4 DESCRIPTOR-POOL 扩容：原池已满（maxSets=4），追加第 2 个池 OK
+         共扩容 2 次
+CHECK T5 exit rc=0 + shutdown OK
+```
+
+⚠ **T4 是前提断言，不是装饰**：没有它的话，哪天首池被调大到 ≥ 6 块，
+T2/T3 会"因为根本没走到扩容"而假绿 —— 那不是修好的证据，只是没测到。
+所以用例要求**必须看到扩容日志**，否则红。
+
+顺带把 `engine/rhi/DescriptorSet.*` 的改动过了一遍冒烟：`verify_template_scene`
+与 `verify_terrain_physics` 仍全 PASS（未跑全量回归，按用户纪律等指令）。
+
+### 25.5 遗留 / 观察
+
+* 修完顺手撞到一件事：构建时 `bin/Launcher.exe` 被一个**残留的启动器进程**
+  占着 → `collect2.exe: error: ld returned 1 exit status`（真正的报错行被
+  ninja 吞了，只留一句"ld returned 1"）。以后链接失败先 `tasklist |
+  grep Launcher`，别去翻代码。
+* 那个残留实例对 `WM_CLOSE` 10 秒没反应（普通态 / 最小化态我都单独测过，
+  都是 0.2 s 内退出，所以是某种未复现的状态）。暂时只记录，不作为结论。
+
+## 26 · 报障修复：抬山保存 → 地形变砖 → DEVICE_LOST（2026-10-22 第十一轮）✅
+
+用户贴来的原始输出：
+
+```
+[ERROR] TERRAIN-INSTANCE-FAIL path=terrain/ground/terrain.vterrain
+        reason=height_not_normalized min=0.000 max=8.000
+[INFO ] NOTIF-PUSH level=Error ... history=71
+[ERROR] TERRAIN-CREATE-FAIL entity=1 path=terrain/ground/terrain.vterrain
+[VK_CHECK] Vulkan error -4 at engine/render/Renderer.cpp:6619
+[ERROR] Fatal: Vulkan call failed
+```
+
+### 26.1 这三行分别是什么
+
+`-4` = `VK_ERROR_DEVICE_LOST`，但它在 `vkQueueSubmit` 上 —— 那是"GPU 已经
+没了"的**次生**表现，不是根因。`Renderer.cpp:6619` 是个提交点，所有 pass
+都经过它，行号指不出是谁。
+
+真正的根因是三层，一层叠一层，缺任何一层都不会崩：
+
+| # | 缺陷 | 表现 |
+| --- | --- | --- |
+| ① | 写端允许 `[0,8]`，读端只接受 `[0,1]` | 抬山保存一次，工程再也打不开 |
+| ② | 创建失败被放大成**每帧**全量重建 | 帧时间冲破 Windows TDR 的 2 秒 → DEVICE_LOST |
+| ③ | 存量坏资产无法自愈（读端硬拒） | 用户连打开都做不到，更别提重新保存 |
+
+`max=8.000` 这个**整数**是关键线索：它恰好是
+`LandscapeEditor.cpp` 里的 `kMaxNorm = 8.0f` —— 抬升笔刷的 clamp 上限。
+
+### 26.2 根因①：抬山笔刷的余量与资产契约互相矛盾
+
+`kMaxNorm = 8` 是**故意的**，而且必须存在。源码里那段注释说得很清楚：
+
+> 1.0 只代表"等于 maxHeight"，不是天花板。以前抬升笔刷写的是
+> `h = clamp(h, 0, 1)`，于是笔心先撞到 1.0、外圈继续涨 —— 最终一定是一块
+> 平顶（用户看到的就是"想刷山峰，结果刷出火山/台地"）。
+
+配上 `raiseHeadroom()`（超过 1.0 之后按剩余比例线性衰减到 0）就得到
+"渐近线式"的锥形山峰。这套设计没有问题。
+
+问题在**另一头**：`height.r32` 的契约是归一化 `[0,1]`
+（`Terrain.h` 文件头、`Terrain.cpp:206` 的校验、`verify_template_scene.py`
+的断言，三处都写着），而老版本 `saveAssets()` 是"内存里是什么就写什么"。
+
+于是：
+
+```
+抬山（内存峰值 8.0）
+  → saveAssets 原样写盘 → height.r32 里 max = 8.000
+  → 下次 loadTerrain 撞上 [0,1] 校验 → height_not_normalized
+  → TERRAIN-INSTANCE-FAIL / TERRAIN-CREATE-FAIL
+```
+
+**写端以为读端会收拾，读端以为写端会收敛。** 这就是这个 bug 的全部。
+
+⚠ 上一轮（第十轮）我刚把 `kMaxStrength` 从 16 提到 **64**。`kRaiseRate`
+是 0.35，也就是满 strength 时每秒涨 `64 × 0.35 = 22.4` 归一化 —— 撞到 8
+只要 **0.36 秒**。所以这个一直存在的隐患是被那一改**显影**的，不是那一改
+引入的。
+
+### 26.3 根因②：一次失败被放大成每帧全量重建 → TDR
+
+`Renderer::syncTerrains()` 判断"集合变没变"：
+
+```cpp
+bool same = (items.size() == m_terrainEntities.size());   // ← 旧代码
+```
+
+`m_terrainEntities` 只装**创建成功的**（`if (createTerrain(...)) push`），
+而 `items` 是**请求过**的。只要有一个实体建失败，这个等式**永远**不成立 →
+每一帧都走 `!same` 分支 → `clearInstances()`。
+
+`clearInstances()` 里有 `m_device->waitIdle()`，然后销毁 sampler、重新读
+500 KB、重传 3 MB 顶点。单帧上百毫秒。跑满 120 帧就是十几秒的 GPU 独占；
+Windows 的 TDR（Timeout Detection and Recovery）上限是 **2 秒**，一到就
+重置驱动 → 所有在飞的命令作废 → `vkQueueSubmit` 返回 `DEVICE_LOST`。
+
+也就是说：**"一份打不开的资产"被放大成了"整个编辑器被 GPU 丢掉"**。
+这也解释了为什么用户看到的最后一行是 Fatal —— 编辑器根本没机会告诉用户
+"你的地形数据坏了"。
+
+### 26.4 根因③：存量坏数据没有出路
+
+读端硬拒 → 用户打开工程就报错 → 他没法进编辑器把山压回去 → 只能手改二进制。
+"报错报得对，但用户无路可走"。
+
+### 26.5 修法
+
+#### ① 收敛下沉到资产层（`engine/terrain/Terrain.{h,cpp}`）
+
+新增两个函数。放在 terrain 层而不是编辑器，理由是 `.r32 ∈ [0,1]`
+是**资产契约**，抬升笔刷只是"一个会产生越界值的生产者"；写在编辑器里的话，
+以后任何新写入者（地形导入、程序化生成、脚本）都得复制一遍 —— 而这个 bug
+的原始形态正是"写端和读端各自以为对方会收敛"。
+
+```cpp
+// 世界高度 = h × maxHeight，同乘同除 → 结果恒等。返回 inv = 1/峰值。
+float normalizeHeightRange(TerrainAsset& asset);
+// 只改 .vterrain 的 maxHeight 一个字段（读 JSON → 改键 → 写回）。
+bool rewriteMaxHeight(const std::string& relPath, float maxHeight);
+```
+
+#### ② 写端落盘前收敛（`LandscapeEditor::saveAssets`）
+
+```cpp
+const float inv = terrain::normalizeHeightRange(m_asset);
+if (inv != 1.0f) {
+    for (auto* stack : {&m_undo, &m_redo})
+        for (StrokeRecord& rec : *stack)
+            for (float& h : rec.height) h *= inv;          // ← 撤销栈必须跟着缩
+    terrain::rewriteMaxHeight(m_source, m_asset.desc.maxHeight);
+}
+```
+
+**内存也一起收敛**（不是只改磁盘）。否则会出现混合尺度：渲染层重建时从盘上
+读到新的 `maxHeight`（×8），而 `liveHeights` 还指向内存里峰值 8 的那份 →
+世界高度变成 64 倍。
+
+撤销栈也必须缩：`StrokeRecord::height` 存的是**归一化高度**，不缩的话撤销
+一次地形会跳回 8 倍高。而所有"米"量（`m_radius` / `m_maxDelta` /
+`m_flattenHeight` / `m_carveCenterM`）都不受影响 —— 这是"归一化存、
+米算"分层带来的红利。
+
+#### ③ 读端救援（`loadTerrain`）
+
+`hi > 1.01` 不再硬失败，而是按最高点重整，打 `TERRAIN-RENORMALIZE`，
+并置 `TerrainAsset::rescaled`。
+
+**负高度仍然硬失败**：抬山笔刷的下限是 0（`clamp(h, 0, kMaxNorm)`），编不出
+负数；负值只可能来自外部工具算错 —— 那就该炸出来看日志，而不是被"救援"
+悄悄抹平。同理 `hi > 1e6` 也硬失败（那是文件截断/字节序错读出的垃圾 float）。
+
+#### ④ 判据换成"请求全集"（`Renderer::syncTerrains`）
+
+```cpp
+std::vector<std::pair<std::uint32_t, std::string>> m_terrainRequested;
+bool m_terrainDegraded = false;
+int  m_terrainRetryTick = 0;
+```
+
+* `same` 比的是 `m_terrainRequested`（含失败的），不再是"成功数"；
+* 失败后**不逐帧重试**，而是每 `kTerrainRetryFrames = 120` 帧放行一次
+  （≈2 秒）—— 用户可能已经把资产换掉了，得留一条自动恢复的路；
+* `tc.dirty` 与 `refreshSurface` 失败这两处清空实例的地方，**必须连
+  `m_terrainRequested` 一起清**（只清 entities 会变成"实例没了、却认为集合
+  没变"→ 地形永久消失）；
+* 顺带修了 `else` 分支的下标错位：原来用 `items[i]` 配 `instanceAt(i)`，
+  而失败实体不在 `items`↔`m_terrainEntities` 的同一个序上，会把 A 的
+  model 写给 B。
+
+### 26.6 验收
+
+`MYVK_RUNTIME_SELFTEST=terrain` → **39/39 PASS**（新增 E 组 12 条）：
+
+```
+E1  已在 [0,1] 的资产不被改写              inv=1.0000 maxH=5.000
+E2  峰值 8 的资产被收敛到 [0,1]            inv=0.12500 peak=1.0000
+E2b 收敛前后世界高度逐点相同（无损）        worstWorldDiff=0.0000000
+E3c 改写后仍能读回，且 maxHeight 生效       ok=1 maxH=40.000 peak=1.000
+E3d 其余字段没被写丢（mpp / cols / 高度）   ok=1 mpp=2.00 cols=33
+E4b 越界资产不再被硬拒（rescaled=true）     rescaled=1
+E4d 救援后世界峰值仍是 8x5 = 40 m           worldPeak=40.00
+```
+
+E3/E4 走**真实文件往返**（写进系统临时目录，不碰 assets 根）—— 那个 bug
+就长在"写端以为读端会收拾"的接口上，不拿文件走一遍是测不到的。
+
+新增 `tools/verify_terrain_renorm.py`，三组跑 120 帧：
+
+```
+CHECK A  干净资产未触发重整 OK
+CHECK A  干净模板地形实例正常 OK
+PROBE B  把 height.r32 整体 ×8（峰值 1.000 → 8.000，maxHeight 仍是 5.193805）
+CHECK B1 救援触发 peak=8.000 maxHeight 5.1938 -> 41.5504 OK
+CHECK B2 世界高度恒等 maxHeight=old×peak=41.5504 OK
+CHECK B3 救援后地形实例建成 OK
+CHECK B4 不再出现 TERRAIN-INSTANCE-FAIL OK
+CHECK B5 不再出现 TERRAIN-CREATE-FAIL OK
+CHECK B6 不再出现 height_not_normalized OK
+CHECK B7 no VK_CHECK / no DEVICE_LOST OK
+CHECK C1 失败只记录 2 次 / 120 帧（没有逐帧重建）OK
+CHECK C2 TERRAIN-DEGRADED failed=1/1 retryEvery=120 frames OK
+CHECK C3 坏资产不再导致 DEVICE_LOST OK
+CHECK C4 exit rc=0 OK
+结果: PASS
+```
+
+**C1 是本轮最有价值的一条断言**：修复前是 120 次（每帧一次），修复后 2 次
+（首帧 + 一次节流重试）。那 120 次 `waitIdle` + 全量重建正是 DEVICE_LOST
+的成因 —— 数字本身就是证据。
+
+`verify_terrain_physics.py` / `verify_multi_terrain.py` 复跑仍全 PASS。
+
+### 26.7 一个字都不能少的说明：这是被上一轮"显影"的
+
+`kMaxNorm = 8` 与 `[0,1]` 校验的矛盾**一直存在**。上一轮把 `kMaxStrength`
+从 16 提到 64，抬山速度提高 4 倍，撞顶从"刷十几秒"变成"0.36 秒" —— 于是
+这个潜伏的契约错配第一次被真的踩到。
+
+记在这里，免得以后有人看到 `kMaxStrength = 64` 就以为它是本轮的罪魁。
+真正要改的是写端，不是那个手感参数。
+
+### 26.8 遗留
+
+* **启动器的 WM_CLOSE 偶发不响应**：本轮构建时又遇到一个残留 `Launcher.exe`
+  占着 `bin/Launcher.exe`，`WM_CLOSE` 送进去 10 秒没反应，最后按 pid 强杀。
+  上次（§25.5）测普通态/最小化态都是 0.2 s 内退出，没能复现；这次**复现了**
+  一次（窗口存在、消息送达、就是不退）。推测与"创建后自动 spawn 编辑器"
+  之后的状态有关，但没拿到证据。下次遇到先看是不是 `runPendingSpawn` 那条
+  路径留下的状态。
+* `_venn_verify/terrain_renorm.old-*`、`third_person.old-*` 等按惯例保留。

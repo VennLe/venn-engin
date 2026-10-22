@@ -14,6 +14,7 @@
 #include "scene/ModelInstance.h"
 #include "scene/Scene.h"
 
+#include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
 
@@ -189,6 +190,207 @@ ecs::Entity createPrimitiveOnGround(scene::Scene& scene,
 // 角色模型（静态网格 / 骨骼网格 + 动画）由"角色详情窗口"绑定。
 // 胶囊：r=0.30、圆柱段半高 0.55 → 总高 1.70，中心抬 z=0.85 底部贴地。
 // ------------------------------------------------------------
+// ---------------------------------------------------------------- 默认角色
+//
+// 2026-10-22 用户要求（原话）：
+//   "当创建角色时，请默认用你刚才的那套角色模型，骨骼绑定，还有动画。"
+//
+// "那套"= P2/P3 里做的 AutoRig + ProcAnim：一个 Mixamo 人形网格，用
+// `AssetC --strip-skin --autorig --procanim` 烤成 23 骨 + 四段程序化动画。
+// 产物随引擎发布（`assets/models/characters/`），所以**新建的工程不用自带
+// 一份 3 MB 的角色**：`resolveAssetPath` 在工程资产根里找不到时会落到
+// `<exe>/assets/`（AssetPath.cpp 的候选链），这条正好被用上。
+namespace {
+
+constexpr const char* kDefaultCharacterPath =
+    "models/characters/default_character.vmesh";
+
+// 模型正面补偿角（度）。FBX 源（Y-up、正面朝 +Z）经 ufbx 的 (x,-z,y) 映射
+// 后正面落在 **-Y**，而引擎实体的 yaw 语义是"0 = 朝 +X"，所以 +90°。
+// ⚠ 必须与 `RuntimeConfig::PlayerVisual::modelYaw` 的默认值相同：这条链上
+//   有两处装配（编辑器 createPlayer / 运行时 spawnPlayerFromGameStart），
+//   差一个符号就会变成"编辑器里朝前、Game.exe 里横着走"。
+constexpr float kDefaultModelYaw = 90.0f;
+
+// 模型包围盒的 Z 范围（8 个角点各乘一次 SubMesh 变换再取 min/max）。
+// 与 CharacterWindow::computeModelBounds / RuntimeApp::modelWorldBounds
+// 同一套算法 —— 对带旋转的部件不会算出偏小的盒子。
+bool modelBoundsZ(const assets::Model& m, float* lo, float* hi) {
+    bool any = false;
+    for (const auto& sub : m.subMeshes) {
+        if (!sub.mesh || !sub.mesh->hasBounds()) continue;
+        const glm::vec3 a = sub.mesh->boundsMin();
+        const glm::vec3 b = sub.mesh->boundsMax();
+        for (int i = 0; i < 8; ++i) {
+            const glm::vec3 c((i & 1) ? b.x : a.x, (i & 2) ? b.y : a.y,
+                              (i & 4) ? b.z : a.z);
+            const float z = (sub.transform * glm::vec4(c, 1.0f)).z;
+            if (!any) {
+                *lo = *hi = z;
+                any = true;
+            } else {
+                *lo = std::min(*lo, z);
+                *hi = std::max(*hi, z);
+            }
+        }
+    }
+    return any;
+}
+
+// 模型包围盒的 XY 跨度（含朝向补偿）。
+// 用来做 facing 自检：人形的**左右跨度必须大于前后跨度**
+// （肩宽 ~0.45 m vs 身体厚 ~0.25 m）。与 `RuntimeApp::modelWorldBoundsYaw`
+// 同一判据 —— 两边装配必须朝同一个方向。
+bool modelBoundsXY(const assets::Model& m, float yawDeg, glm::vec3* lo,
+                   glm::vec3* hi) {
+    const glm::mat4 rot =
+        glm::rotate(glm::mat4(1.0f), glm::radians(yawDeg),
+                    glm::vec3(0.0f, 0.0f, 1.0f));
+    bool any = false;
+    for (const auto& sub : m.subMeshes) {
+        if (!sub.mesh || !sub.mesh->hasBounds()) continue;
+        const glm::vec3 a = sub.mesh->boundsMin();
+        const glm::vec3 b = sub.mesh->boundsMax();
+        for (int i = 0; i < 8; ++i) {
+            const glm::vec3 c((i & 1) ? b.x : a.x, (i & 2) ? b.y : a.y,
+                              (i & 4) ? b.z : a.z);
+            const glm::vec3 p = glm::vec3(rot * sub.transform * glm::vec4(c, 1.0f));
+            if (!any) {
+                *lo = *hi = p;
+                any = true;
+            } else {
+                *lo = glm::min(*lo, p);
+                *hi = glm::max(*hi, p);
+            }
+        }
+    }
+    return any;
+}
+
+// 把默认角色装到玩家实体上：模型 + 蒙皮 + 胶囊/相机（按模型身高）+ 起始 clip。
+//
+// 失败时**什么也不做**（玩家退回胶囊占位体）并打一行 WARN：资产缺失不该让
+// "创建角色"这个动作整套失败。
+void bindDefaultCharacter(scene::Scene& scene, assets::AssetManager& am,
+                          ecs::Entity player) {
+    ecs::World& w = scene.world();
+
+    assets::Model* model = nullptr;
+    try {
+        model = am.loadFBX(assets::resolveAssetPath(kDefaultCharacterPath),
+                           kDefaultCharacterPath);
+    } catch (const std::exception& ex) {
+        VK_LOG_WARN("PLAYER-DEFAULT load failed path=%s error=%s",
+                    kDefaultCharacterPath, ex.what());
+        return;
+    }
+    if (!model || !model->valid()) {
+        VK_LOG_WARN("PLAYER-DEFAULT model invalid path=%s（玩家退回胶囊占位体）",
+                    kDefaultCharacterPath);
+        return;
+    }
+
+    scene::ModelInstanceOptions opt;
+    opt.parent = player;
+    opt.autoPlay = true;              // 挂上去就播（起始 = Idle）
+    opt.sourcePath = kDefaultCharacterPath;
+    // 朝向补偿（P5）：模型正面在 -Y，实体的 yaw 语义是"0 = 朝 +X"。
+    // 与 `RuntimeConfig::PlayerVisual::modelYaw` 的默认值同源 —— 两边不一致
+    // 的话，同一个角色在编辑器 Play 与 Game.exe 里会朝两个方向。
+    opt.yawOffsetDeg = kDefaultModelYaw;
+    const scene::ModelInstanceResult r = scene::instantiateModel(scene, model, opt);
+
+    // ---- 抬到脚底：模型的 pivot 在几何中心，玩家实体的原点是**脚** ----
+    //
+    // ⚠ 不能用 `dropToGround`：那条只在"自建根节点"时生效（见
+    //   ModelInstanceOptions 的注释），这里的父节点就是玩家。
+    float lo = 0.0f, hi = 0.0f;
+    const bool hasBounds = modelBoundsZ(*model, &lo, &hi);
+    const float height = hasBounds ? std::max(hi - lo, 0.2f) : 1.8f;
+    const float lift = hasBounds ? -lo : 0.0f;
+    if (hasBounds) {
+        for (ecs::Entity ce : r.entities) {
+            if (auto* t = w.get<ecs::TransformComponent>(ce))
+                t->position.z += lift;
+        }
+    }
+
+    // ---- 解剖比例（与 CharacterWindow::generateSkeletonBinding、
+    //      RuntimeApp::attachPlayerModel 同一套）：人形高 h →
+    //      半径 ≈ 0.16h，胶囊总高 = 2 × (halfHeight + radius) = h ----
+    const float radius = glm::clamp(height * 0.16f, 0.15f, 0.60f);
+    const float halfHeight = std::max(0.10f, height * 0.5f - radius);
+
+    ecs::CharacterControllerComponent ctrl;
+    ctrl.radius = radius;
+    ctrl.halfHeight = halfHeight;
+    ctrl.stepHeight = glm::clamp(height * 0.20f, 0.20f, 0.50f);
+    // ---- 跳跃：按身高缩放（2026-10-22）----
+    // 目标是"跳起 0.39 × 身高"：1.8 m 的人 → 0.70 m，这是普通人立定跳的
+    // 竖直高度（不是"游戏里好看"的 1.2 m）。v₀ = √(2gh) 反算初速，于是
+    // 跳得高的角色滞空也更长 —— 与 Jump clip 的 0.75 s 对齐。
+    ctrl.jumpSpeed = glm::clamp(std::sqrt(2.0f * 9.81f * 0.39f * height),
+                                3.0f, 5.0f);
+    ctrl.airControl = 0.45f;
+    w.add<ecs::CharacterControllerComponent>(player, ctrl);
+
+    // 编辑态的胶囊线框跟着模型走：以前是写死的 0.30/0.55（1.7 m），
+    // 换一个 2 m 的角色就"框比人小一圈"，撞墙判定会提前。
+    if (auto* col = w.get<ecs::CollisionComponent>(player)) {
+        col->capsuleRadius = radius;
+        col->capsuleHalfHeight = halfHeight;
+        col->position = glm::vec3(0.0f, 0.0f, halfHeight + radius);
+    }
+
+    // 编辑器 Play 的"便携移动"（runPlayers）读这三个数
+    if (auto* pc = w.get<ecs::PlayerComponent>(player)) {
+        pc->eyeHeight = height * 0.92f;
+        pc->camDistance = glm::clamp(height * 2.0f, 2.5f, 6.5f);
+    }
+
+    // 运行时 PlayerController 的弹簧臂参数（没有它镜头不跟随）
+    ecs::CameraComponent camC;
+    camC.targetOffset = glm::vec3(0.0f, 0.0f, height * 0.42f);
+    camC.distance = glm::clamp(height * 2.0f, 2.5f, 6.5f);
+    camC.minDistance = 0.6f;
+    w.add<ecs::CameraComponent>(player, camC);
+
+    // 起始 clip：Idle（状态机第一次跑之前也得有个合理姿势）
+    if (auto* sk = w.get<ecs::SkinnedMeshComponent>(player)) {
+        if (model->skeleton && model->skeleton->findClip("Idle"))
+            sk->clipName = "Idle";
+        sk->playing = true;
+        sk->loop = true;
+    }
+
+    VK_LOG_INFO("PLAYER-DEFAULT bound path=%s meshes=%d skinned=%d joints=%d "
+                "clips=%d height=%.3f capsule=%.3f/%.3f yaw=%.1f "
+                "lift=%.3f boundsZ=%.3f..%.3f -> bottom=%.4f",
+                kDefaultCharacterPath, static_cast<int>(r.entities.size()),
+                r.skinned ? 1 : 0, r.joints,
+                model->skeleton ? static_cast<int>(model->skeleton->clips.size()) : 0,
+                static_cast<double>(height), static_cast<double>(radius),
+                static_cast<double>(halfHeight),
+                static_cast<double>(kDefaultModelYaw),
+                static_cast<double>(lift), static_cast<double>(lo),
+                static_cast<double>(hi),
+                static_cast<double>(lo + lift));
+
+    // 朝向自检（与 RuntimeApp::attachPlayerModel 同判据，见那边的注释）
+    glm::vec3 fLo(0.0f), fHi(0.0f);
+    if (modelBoundsXY(*model, kDefaultModelYaw, &fLo, &fHi)) {
+        const float spanX = fHi.x - fLo.x;
+        const float spanY = fHi.y - fLo.y;
+        VK_LOG_INFO("PLAYER-DEFAULT facing yaw=%.1f spanX=%.3f spanY=%.3f "
+                    "shouldersAlong=%s ok=%d",
+                    static_cast<double>(kDefaultModelYaw),
+                    static_cast<double>(spanX), static_cast<double>(spanY),
+                    spanX < spanY ? "Y" : "X", spanX < spanY ? 1 : 0);
+    }
+}
+
+} // namespace
+
 ecs::Entity createPlayer(scene::Scene& scene, assets::AssetManager& assets,
                          ecs::PlayerMode mode,
                          const glm::vec3& groundSpot) {
@@ -217,9 +419,13 @@ ecs::Entity createPlayer(scene::Scene& scene, assets::AssetManager& assets,
     cc.capsuleHalfHeight = 0.55f;
     w.add<ecs::CollisionComponent>(root, cc);
 
-    // 第三人称不再程序化拼小人（2026-10-11 用户反馈"太粗糙"）—— 只保留
-    // 胶囊碰撞体作占位提示。真正的角色模型（静态网格 / 骨骼网格 + 动画）
-    // 通过"角色详情窗口"绑定，见 editor/CharacterWindow。
+    // 第三人称不再程序化拼小人（2026-10-11 用户反馈"太粗糙"）。
+    // 2026-10-22 起改成**默认装配自带角色**：模型 + 骨架 + 四段动画一次到位，
+    // 用户按 Shift+A 创建完就能在 Play 里看到人走路（以前要先打开角色窗口
+    // 手动拖模型、再点"生成骨骼绑定"两下，才有一具身体）。
+    if (mode == ecs::PlayerMode::ThirdPerson) {
+        bindDefaultCharacter(scene, assets, root);
+    }
     return root;
 }
 
@@ -314,6 +520,11 @@ ImportResult instantiateModel(scene::Scene& scene, assets::AssetManager& assets,
         opt.rootName = uniqueRootName(scene, pathStem(modelRelativePath));
         opt.autoPlay = true;    // 拖进主场景就该动起来
         opt.sourcePath = modelRelativePath;
+        // 拖进来的东西应该**站在地上**，而不是"几何中心在原点"。
+        // 模型 pivot 在几何中心，不抬的话 1.8 m 的人有一半埋在地里 ——
+        // 拖放路径后面还有 `alignImportToGround` 兜底，自动化导入
+        // （`MYVK_EDITOR_IMPORT`）没有，两条路就从这里分开。
+        opt.dropToGround = true;
 
         scene::ModelInstanceResult inst =
             scene::instantiateModel(scene, model, opt);

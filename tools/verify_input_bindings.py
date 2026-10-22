@@ -216,9 +216,13 @@ def group_c_editor_write(path: str) -> bool:
     check("C5 生效后的绑定表：Jump 的键盘是 F",
           key_of(got.get("Gameplay/Jump")) == "F",
           repr(got.get("Gameplay/Jump")))
-    # ⚠ 关键：改 Jump 不该顺手把别的动作打乱（尤其 Sprint 的 Shift 与手柄）
-    check("C6 Sprint 仍是 Shift（没被连带改掉）",
-          key_of(got.get("Gameplay/Sprint")) == "LShift",
+    # ⚠ 关键：改 Jump 不该顺手把别的动作打乱（尤其 Sprint 的鼠标右键与手柄）
+    #
+    # 2026-10-22：出厂 Sprint 从 LShift 换成**鼠标右键**（用户要求"run 动画
+    # 改为默认鼠标右键长按触发"）。这条断言跟着换 —— 否则它会替一个已经不
+    # 存在的绑定背书，"没被连带改掉"就变成了空话。
+    check("C6 Sprint 仍是鼠标右键（没被连带改掉）",
+          key_of(got.get("Gameplay/Sprint")) == "Mouse1",
           repr(got.get("Gameplay/Sprint")))
     check("C7 MoveForward 仍是 W",
           key_of(got.get("Gameplay/MoveForward")) == "W",

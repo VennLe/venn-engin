@@ -738,6 +738,40 @@ void LandscapeEditor::saveAssets(bool splatToo, bool holesToo) {
     const std::string abs = assets::resolveAssetPath(m_source);
     const std::filesystem::path dir = std::filesystem::path(abs).parent_path();
 
+    // ---- 落盘前把高度收敛回 [0,1]（2026-10-22 第十一轮）----
+    //
+    // 抬升笔刷**故意**允许冲到 `kMaxNorm = 8`（见文件顶部那段：不留余量的话
+    // 笔心先撞 1.0、外圈继续涨，收尾必然是一块平顶）。但 `.r32` 的契约为
+    // 归一化 [0,1]，而以前的这里是"内存里是什么就写什么"：
+    //
+    //     抬山 → 保存 → 磁盘上 max=8.000 → 下次读盘 height_not_normalized
+    //     → TERRAIN-INSTANCE-FAIL → 工程打不开
+    //
+    // 收敛本身在 `terrain::normalizeHeightRange`（那是**资产契约**，不属于
+    // 编辑器，所以住 engine/terrain 层、能被无窗口自检直接覆盖）。它会
+    // 同乘同除地保住世界高度 —— 地形长得一模一样。
+    //
+    // ⚠ 撤销栈必须跟着缩。记录里存的是**归一化高度**（`StrokeRecord::height`
+    //   是 vector<float>），不缩的话撤销一次地形会跳回 8 倍高。
+    //   `m_asset.splat/holes` 与所有"米"量（m_radius / m_maxDelta /
+    //   m_flattenHeight / m_carveCenterM）都不受影响。
+    const float inv = terrain::normalizeHeightRange(m_asset);
+    if (inv != 1.0f) {
+        for (auto* stack : {&m_undo, &m_redo}) {
+            for (StrokeRecord& rec : *stack) {
+                for (float& h : rec.height) h *= inv;
+            }
+        }
+        if (!terrain::rewriteMaxHeight(m_source, m_asset.desc.maxHeight)) {
+            VK_LOG_ERROR("LS-SAVE-FAIL vterrain path=%s", abs.c_str());
+        }
+        VK_LOG_INFO("LS-SAVE-RENORM scale=%.4f maxHeight=%.4f "
+                    "(undo=%zu redo=%zu)",
+                    static_cast<double>(inv),
+                    static_cast<double>(m_asset.desc.maxHeight), m_undo.size(),
+                    m_redo.size());
+    }
+
     {
         std::ofstream f(dir / m_asset.desc.heightFile, std::ios::binary);
         if (!f) {
@@ -2236,8 +2270,9 @@ void LandscapeEditor::drawBrushSection() {
 
     labeledSlider(TR("Radius"), "##ls_radius", &m_radius, 1.0f, 500.0f, "%.1f m",
                   /*logScale=*/true);
-    // 强度：对数滑条 + 上限 16。UE 的 Tool Strength 到 1.0 只是"标准档"，
-    // 整地/整坡时 3~8 才好用；原来卡在 1.0 让人以为"最大就这么快"。
+    // 强度：对数滑条 + 上限 64（第十轮从 16 提上来）。UE 的 Tool Strength
+    // 到 1.0 只是"标准档"，整地/整坡时 3~8 才好用；而 514 m 的整体地形上
+    // 连 16 都得按好几秒 —— 上限再宽一点，用户才不会觉得"到头了"。
     labeledSlider(TR("Strength"), "##ls_strength", &m_strength, 0.01f,
                   kMaxStrength, "%.2f", /*logScale=*/true);
     labeledSlider(TR("Falloff"), "##ls_falloff", &m_falloff, 0.0f, 1.0f, "%.2f");

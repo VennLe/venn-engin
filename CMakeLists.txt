@@ -119,6 +119,31 @@ if(MSVC)
     target_compile_options(ufbx PRIVATE /utf-8 /wd4819)
 endif()
 
+# ---- assetio（离线资产格式：.vmesh 读写 + FBX 导入 + 几何/动画修正）----
+# ------------------------------------------------------------
+# 这一层的依赖方向是刻意的：
+#
+#     assetc/  ─┐
+#                ├─► assetio ─► (glm, ufbx)
+#     engine/  ─┘
+#
+# **assetio 不认识 Vulkan，也不认识 engine/**。原因只有一条：
+# 离线编译器必须能在没有显卡、没有 Vulkan SDK 的机器上跑（构建机、CI、
+# 美术机器批量转码）。只要这一层不小心 include 了 `rhi/VulkanCommon.h`，
+# AssetC.exe 就会开始要求一个 Vulkan 环境 —— 而这个错误在开发机上
+# **永远不会暴露**（本机装着 SDK），只在别人机器上炸。
+# ============================================================
+file(GLOB_RECURSE ASSETIO_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/assetio/*.cpp
+)
+add_library(VennAssetIO STATIC ${ASSETIO_SOURCES})
+target_include_directories(VennAssetIO PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(VennAssetIO PUBLIC glm)
+target_link_libraries(VennAssetIO PRIVATE ufbx)
+if(NOT MSVC)
+    target_compile_options(VennAssetIO PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
 # ---- stb_vorbis（OGG 解码：stb_vorbis.c 既是声明也是实现）----
 #
 # ⚠ 与 ufbx 完全同款：`third_party/stb/stb_vorbis.c` 从 2026-10-14 起就在
@@ -176,6 +201,7 @@ target_link_libraries(VennEngine PUBLIC
     nlohmann_json
     vma
     stb_vorbis
+    VennAssetIO
 )
 # G14-3：WASAPI 后端要 COM（ole32）+ 多媒体线程提升（avrt）+ 内核流（ksuser）
 # 与 waveOut 兜底的 winmm。全部只在 Windows 上存在；engine/audio/WasapiBackend.cpp
@@ -738,3 +764,26 @@ myvk_copy_runtime_assets(VennRuntime)
 # 少一类"某个 exe 跑起来找不到 X"的差异。
 myvk_copy_runtime_assets(VennLauncher)
 
+
+# ============================================================
+# 离线资产编译器（assetc/ → AssetC.exe）
+# ------------------------------------------------------------
+# 它**只**链 `VennAssetIO`，故意不链 `VennEngine`：
+#
+#   · 链了 VennEngine 就会把 Vulkan / GLFW / VMA 一起带进来，
+#     于是"烤一个模型"变成"必须先有显卡驱动"；
+#   · 它是构建期工具，跟 editor/runtime/launcher 不是同一类东西
+#     （那三个是**应用**，这个是**工具**），所以不放进
+#     myvk_copy_runtime_assets 那套"三个 exe 目录一致"的约束里。
+#
+# 输出名 AssetC（与 Editor / Game / Launcher 一致：短、无版本号）。
+# ============================================================
+file(GLOB_RECURSE ASSETC_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/assetc/*.cpp
+)
+add_executable(VennAssetC ${ASSETC_SOURCES})
+set_target_properties(VennAssetC PROPERTIES OUTPUT_NAME AssetC)
+target_link_libraries(VennAssetC PRIVATE VennAssetIO)
+if(NOT MSVC)
+    target_compile_options(VennAssetC PRIVATE -Wall -Wextra)
+endif()

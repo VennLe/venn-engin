@@ -1,6 +1,7 @@
 #pragma once
 // DescriptorSet.h 的内联实现部分（被 .h 尾部 include）
 
+#include "core/Logger.h"
 #include "rhi/Device.h"
 
 namespace rhi {
@@ -40,14 +41,43 @@ inline DescriptorAllocator::DescriptorAllocator(Device& device, uint32_t maxSets
     ci.maxSets = maxSets;
     ci.flags = flags;
 
+    // 留底：扩容时原样复用（见 addPool）
+    for (uint32_t i = 0; i < poolSizeCount; ++i) m_sizes[i] = sizes[i];
+    m_sizeCount = poolSizeCount;
+    m_maxSets = maxSets;
+    m_flags = flags;
+
     VK_CHECK(vkCreateDescriptorPool(m_device.get(), &ci, nullptr, &m_pool));
+    m_pools.push_back(m_pool);
+}
+
+inline bool DescriptorAllocator::addPool() {
+    if (m_maxSets == 0) return false;   // 构造时没留底（不该发生）
+    VkDescriptorPoolCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    ci.poolSizeCount = m_sizeCount;
+    ci.pPoolSizes = m_sizes;
+    ci.maxSets = m_maxSets;
+    ci.flags = m_flags;
+
+    VkDescriptorPool p = VK_NULL_HANDLE;
+    if (vkCreateDescriptorPool(m_device.get(), &ci, nullptr, &p) != VK_SUCCESS)
+        return false;
+    // ⚠ 旧池**不能**销毁：里面的 set 还在被管线引用。只把它挪到"退役"位置，
+    //   新池接任当前池。
+    m_pool = p;
+    m_pools.push_back(p);
+    VK_LOG_WARN("DESCRIPTOR-POOL 扩容：原池已满（maxSets=%u），追加第 %zu 个池",
+                m_maxSets, m_pools.size());
+    return true;
 }
 
 inline DescriptorAllocator::~DescriptorAllocator() {
-    if (m_pool != VK_NULL_HANDLE) {
-        vkDestroyDescriptorPool(m_device.get(), m_pool, nullptr);
-        m_pool = VK_NULL_HANDLE;
-    }
+    // 销毁**所有**池（一次 vkDestroyDescriptorPool 连带释放其中的 set）。
+    for (VkDescriptorPool p : m_pools)
+        if (p != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_device.get(), p, nullptr);
+    m_pools.clear();
+    m_pool = VK_NULL_HANDLE;
 }
 
 inline VkDescriptorSet DescriptorAllocator::allocate(VkDescriptorSetLayout layout) {
@@ -58,7 +88,31 @@ inline VkDescriptorSet DescriptorAllocator::allocate(VkDescriptorSetLayout layou
     ai.pSetLayouts = &layout;
 
     VkDescriptorSet set = VK_NULL_HANDLE;
-    VK_CHECK(vkAllocateDescriptorSets(m_device.get(), &ai, &set));
+    VkResult r = vkAllocateDescriptorSets(m_device.get(), &ai, &set);
+
+    // 池满 / 池碎片 → 追加一个同规格的池再试。
+    //
+    // ⚠ 只对这两个结果扩容：别的失败（OOM、layout 与池不兼容）重试也没有
+    //   意义，硬试 8 次只会把真正的错误信息淹掉。
+    // ⚠ 上限 8 个池：真到这一步说明每个 set 都在漏（每帧新建、从不释放），
+    //   那是**泄漏**，该炸出来看日志，而不是无限建池把显存吃干净。
+    constexpr int kMaxGrow = 8;
+    for (int i = 0;
+         (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) &&
+         i < kMaxGrow;
+         ++i) {
+        if (!addPool()) break;
+        ai.descriptorPool = m_pool;
+        r = vkAllocateDescriptorSets(m_device.get(), &ai, &set);
+    }
+
+    if (r != VK_SUCCESS) {
+        std::fprintf(stderr,
+                     "[VK_CHECK] vkAllocateDescriptorSets 失败 %d（已扩到 %zu 个池）"
+                     " at %s:%d\n",
+                     static_cast<int>(r), m_pools.size(), __FILE__, __LINE__);
+        throw std::runtime_error("Vulkan call failed: descriptor pool exhausted");
+    }
     return set;
 }
 

@@ -61,7 +61,12 @@ constexpr float kNavMoveSpeed = 5.0f;
 // 这种直觉，也让滚轮和 WASD 共用同一套速度感。
 constexpr float kNavDollyPerNotch = 0.6f;
 // **按住右键**时滚轮每格的灵敏度增减量（"慢慢变大 / 变小"）
-constexpr float kSensitivityStep = 0.1f;
+//
+// 2026-10-22（第十轮）：0.1 → 0.25。用户反馈"右键 + 滚轮调视口移动速度
+// 那个可以灵敏度略高一些"—— 原来每格只加 0.1，从 1.0 调到 3.0 要滚 20 格，
+// 手感像"滚了没反应"。放大到 0.25 之后 8 格就到 3.0。
+// 上限仍是 `kMaxSensitivity`（20），所以调不飞。
+constexpr float kSensitivityStep = 0.25f;
 // Sensitivity 数值框的宽度。这个框是 InputFloat **不带 step 按钮**的，
 // 所以要能放下 "20.00"（上限）再加一点余量 —— 带按钮的版本会被两个
 // 方块挤掉一半宽度，数字直接显示不全（这是本次要修的问题）。

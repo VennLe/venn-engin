@@ -50,7 +50,11 @@ OLD = mk("assets/shaders/decal.frag",
          # M1（G01/G05）：运行时目标与出厂配置 —— 让下面对它们的两条 fixture
          # 是"改了"而不是"新增"（新增会顺带触发"未登记点名"，那是另一回事）。
          "runtime/GameLoop.cpp",
-         "assets/game.json")
+         "assets/game.json",
+         # 阶段六/七（2026-10-22）：自研二进制资产链的两个**新顶层目录**。
+         # 同样先放进基准，让下面的 fixture 是"改了"而不是"新增"。
+         "assetio/MeshFormat.cpp",
+         "assetc/main.cpp")
 
 
 def with_change(*paths, drop=()):
@@ -155,6 +159,74 @@ run("runtime/GameLoop.cpp → 三条运行时用例", OLD,
 run("assets/game.json → 只跑 verify_runtime_states + verify_audio", OLD,
     with_change("assets/game.json"),
     want={"verify_runtime_states", "verify_audio"})
+# 阶段六/七（2026-10-22）：`assetio/**` 是**格式本体**——引擎与离线工具共用
+# 同一份读写，改一处字段偏移两边一起坏，所以必须精确命中 verify_vmesh。
+# 注意 `engine/assets/**`（运行时加载器 / 自检）是 GLOBAL，那条路径走全量，
+# 不在这个 fixture 的期望里 —— 这也是"只登记非横切"的现场证明。
+run("assetio/MeshFormat.cpp → verify_vmesh", OLD,
+    with_change("assetio/MeshFormat.cpp"), want={"verify_vmesh"})
+run("assetc/main.cpp → verify_vmesh", OLD,
+    with_change("assetc/main.cpp"),
+    # 2026-10-22 起 assetc 还挂了绑骨（--autorig）与程序化动画（--procanim）
+    # 两组开关，它们各自有自己的验收脚本 → 三个 owner。
+    want={"verify_vmesh", "verify_autorig", "verify_procanim"})
+# 2026-10-22：自动绑骨 / 程序化动画是两条**独立**的离线链，各自只被自己的
+# 用例读。合成一条的话，"把 AutoRig 的比例表改坏"会让 procanim 也重跑，
+# 反过来一样 —— 跑得多但没人对结果负责，等于没登记。
+# ⚠ 期望里**必然**带 verify_vmesh：它登记了 `assetio/**` 与 `assetc/**`
+#   整层（.vmesh 的字节布局是格式总主，绑骨/动画也在往里写 joints 与 clips）。
+#   所以这里的判据是"自己那条一定在"，不是"只有自己那条"。
+run("assetio/AutoRig.cpp → 自动绑骨", OLD,
+    with_change("assetio/AutoRig.cpp"),
+    want={"verify_autorig", "verify_vmesh"})
+run("assetio/ProcAnim.cpp → 四段程序化动画", OLD,
+    with_change("assetio/ProcAnim.cpp"),
+    # 2026-10-22 P5 起它也是 verify_player_feel 的 owner：walk/run/idle 的
+    # hips 垂直偏移决定"脚会不会陷进地面"，那条用例 R1 盯的就是这件事。
+    # P6 再加一条 verify_player_jump：poseJump 的重写（双脚离地 / 0.75 s）
+    # 和 Jump 的初速是同一件事的两半。
+    want={"verify_procanim", "verify_vmesh", "verify_player_feel",
+          "verify_player_jump"})
+# 2026-10-22 编辑器闪退：离屏预览把主场景地形拆了（详见 verify_preview_terrain
+# 的文档头）。这两个文件的 owner 就是那一条 —— 谁改预览的资源生命周期或
+# 地形实例的销毁时机，都必须重跑它。
+# ⚠ 期望是**并集**不是"只有我"：CharacterWindow 早已被角色导入 / 角色窗口 /
+#   i18n 覆盖率三条占着（它带 TR() 字符串），RenderTarget 被碰撞 Play 与 DRS
+#   占着。判据是"自己那条一定在"，不是"别人不该在"。
+run("editor/CharacterWindow.cpp → 预览与地形并存", OLD,
+    with_change("editor/CharacterWindow.cpp"),
+    # 2026-10-22 P4 起它也是 verify_char_locomotion 的 owner（按键槽 / 绑键
+    # 捕获 / `CHAR-KEYBIND` 锚点都长在这个文件里）。
+    # P6 再加一条 verify_char_preview：预览叠加层（胶囊线框 / gizmo / 选中框）、
+    # 鼠标点选、位置-旋转-大小控件条 —— 整块都在这个文件里。
+    want={"verify_character_import", "verify_character_window",
+          "verify_i18n_coverage", "verify_preview_terrain",
+          "verify_char_locomotion", "verify_char_preview"})
+run("engine/render/RenderTarget.cpp → 预览与地形并存", OLD,
+    with_change("engine/render/RenderTarget.cpp"),
+    want={"verify_collision_play", "verify_drs", "verify_preview_terrain"})
+# 2026-10-22 P4：移动状态机抽成 `engine/animation/Locomotion.*`，编辑器 Play
+# 与 Game.exe 共用同一份。它错了的表现是"腿不动"或"停下不播 idle"——只有
+# verify_char_locomotion 看得见，所以它必须是 owner 之一。
+# ⚠ 期望里必然带 verify_anim_runtime / verify_character_import /
+#   verify_player_character：它们都登记了 `engine/animation/**` 整层。
+#   判据仍是"自己那条一定在"，不是"只有自己那条"。
+run("engine/animation/Locomotion.cpp → 默认角色移动", OLD,
+    with_change("engine/animation/Locomotion.cpp"),
+    # 2026-10-22 P5 起多一条 owner：crossfade 的 `blendSeconds` 与"切 clip 时
+    # 记下旧播放头"都长在这个文件里，verify_player_feel 的 R7 盯的就是它。
+    # P6 再加 verify_player_jump：jump 态的进入/退出与落地回 idle 也在这台
+    # 状态机里（跳跃物理在别处，但"什么时候算跳"在这儿）。
+    want={"verify_char_locomotion", "verify_anim_runtime",
+          "verify_character_import", "verify_player_character",
+          "verify_player_feel", "verify_player_jump"})
+# ⚠ 按键翻译表 `engine/ui/KeyCodes.*` **故意不做夹具**：`engine/ui/**` 在
+#   `GLOBAL_GLOBS` 里，改它走全量，登记进 TRIGGERS 反而会在 --narrow 下
+#   假跳过（check_regression_map 的 [E] 段会点名）。这里留一条反向断言，
+#   把这个事实钉住 —— 哪天有人把 KeyCodes 从横切里摘出来，得知道要补映射。
+run("engine/ui/KeyCodes.cpp → 横切（本来就全量，不该登记）", OLD,
+    with_change("engine/ui/KeyCodes.cpp"),
+    want=None)
 
 print("\n[B] 快照覆盖范围（真实扫描仓库）")
 s = rr.source_snapshot()

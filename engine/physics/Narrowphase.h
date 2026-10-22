@@ -33,6 +33,7 @@
 // ============================================================
 
 #include "physics/Contact.h"
+#include "physics/Heightfield.h"
 #include "physics/RigidBody.h"
 
 #include <vector>
@@ -58,5 +59,26 @@ struct ShapeQuery {
 // 返回穿透深度（>0 表示相交），并把法线（A→B）写进 outNormal。
 float penetrationDepth(const ShapeQuery& a, const ShapeQuery& b,
                        glm::vec3& outNormal);
+
+// ---------------------------------------------------------------- 地形
+// 刚体 vs 高度场（2026-10-22 第十轮）。
+//
+// 高度场**不是**一个刚体形状（见 Heightfield.h 文件头），所以它没有
+// `RigidBody` 可比。这里用"物体中心处的地表切平面"当代表面：
+//
+//   · 每个刚体只生成**一个**流形，法线取 `normalAt(中心 XY)`，
+//     平面过点 (cx, cy, heightAt(cx, cy))；
+//   · 然后把物体的支撑点（盒的 8 角 / 胶囊两端 / 凸包顶点 / 球心-半径）
+//     投到这个平面上，取最深的 4 个。
+//
+// 为什么可以这样"一条平面打天下"：一张 2 m/采样点的高度图，在 1~2 m 的
+// 物体尺度上曲率可以忽略；而"每个接触点各用各的法线"会让同一个流形里
+// 出现方向不一致的约束，求解器会来回分冲量（抖动）。
+//
+// `terrainIndex` 是 PhysicsWorld 里那个**伪静态刚体**的下标（求解器要
+// 一个合法的 A 侧，见 PhysicsWorld::setHeightfield 的说明）。
+bool terrainVsBody(const Heightfield& hf, const RigidBody& B,
+                   std::uint32_t terrainIndex, std::uint32_t bodyIndex,
+                   ContactManifold& out);
 
 } // namespace physics

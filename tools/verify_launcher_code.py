@@ -21,8 +21,9 @@
       不同 Python 版本上行为不一致）
   D4  外部目录里被种进了模板自带的 `main.vks`
   D5  编辑器日志 `PROJ-CODE-LINK ok`（一致性校验通过）
-  D6  `precompiled 1 script(s), 0 with errors`（场景引用的脚本**穿过联接**
-      被找到了 —— 模板场景现在把 `scripts/main.vks` 挂在 Player 上）
+  D6  `precompiled N script(s), 0 with errors`（场景引用的脚本**穿过联接**
+      被找到了 —— 模板现在只把 `scripts/main.vks` 挂在 GameStart 上，所以
+      N 恒为 1：预编译跟着场景引用走，没挂载的脚本不编译）
   D7  改外部 `main.vks` → 日志出现 `VKS-RELOAD-`（**在 Play 态下**，
       编辑态脚本不 tick，见该段注释）
   D8  工程里那份 `main.vks` 内容跟着变了（说明是**同一份文件**，不是副本）
@@ -106,9 +107,17 @@ def main():
         if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-create"):
             fails.append("点不到创建")
             return kit.finish(fails)
-        if not tap.wait_rect("LAUNCH-DONE", timeout=40.0):
-            fails.append("创建失败（没出现 LAUNCH-DONE）")
+
+        # ---- 创建成功 → **自动**进编辑器（2026-10-22 需求 A）----
+        # 以前这里还要点 `LAUNCH-BTN-doneOpen`；现在 `commitWizard()` 成功
+        # 就直接 requestSpawn 了。⚠ 不点不代表不测 —— `LAUNCHER-SPAWN ok`
+        # 本身就是断言（没起来就 red），后面的 D5/D6 全部依赖它。
+        if not tap.wait_line("LAUNCHER-SPAWN ok", timeout=45.0):
+            fails.append("创建之后没有自动拉起编辑器（没有 LAUNCHER-SPAWN ok）")
             return kit.finish(fails)
+        pid = kit.parse_spawn_pid(tap.text())
+        if not pid:
+            fails.append("日志里没有 LAUNCHER-SPAWN 的 pid，无法断言退出码")
 
         # ---- D2 工程文件 ----
         with open(os.path.join(root, "venn.project.json"), encoding="utf-8") as f:
@@ -151,14 +160,6 @@ def main():
             fails.append("D4 工程里看不到 main.vks（联接没生效）")
             return kit.finish(fails)
 
-        if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-doneOpen"):
-            fails.append("点不到「打开编辑器」")
-            return kit.finish(fails)
-        pid = 0
-        if not tap.wait_line("LAUNCHER-SPAWN ok", timeout=25.0):
-            fails.append("没有 LAUNCHER-SPAWN（没拉起编辑器）")
-            return kit.finish(fails)
-        pid = kit.parse_spawn_pid(tap.text())
         # 契约反转（2026-10-19）：拉起之后启动器**不退出**，收进任务栏常驻。
         # 这里以前等它自己退出，现在只等"最小化"这一行 —— 再等退出只会白等 40s。
         if not tap.wait_line("LAUNCHER-MINIMIZED", timeout=30.0):
@@ -187,10 +188,18 @@ def main():
 
         # ---- D6 脚本穿过联接被编译 ----
         #
-        # ⚠ 断言的是"**全部编译通过**"，不是"正好 1 个"。脚本数量是模板内容
-        #   （模板现在给 main.vks + pickup.vks 两份），把它写死在这里等于
-        #   "模板加一个脚本就得改验收脚本"—— 那是耦合，不是契约。
-        #   契约只有一条：`0 with errors`，且至少有一个脚本被找到。
+        # 契约只有两条：**至少有一个脚本被找到**（证明扫描穿过了联接）+ `0
+        # with errors`。数量**不写死** —— 它是模板内容，写死就等于"模板改
+        # 一个脚本就得改验收脚本"。
+        #
+        # ⚠⚠ 2026-10-22 把阈值从 `>= 2` 改成 `>= 1`：第八轮（2026-10-21）
+        #   用户要求"初始场景里不摆放任何物体"，场上的光球 / 传送门全撤了，
+        #   于是场景里只剩 GameStart 上挂的 `scripts/main.vks` 一处引用。
+        #   引擎的预编译是**跟着场景引用走**的（没被任何实体挂载的脚本不会
+        #   编译），所以从那时起这里恒为 1 —— 不是"联接坏了"，旧断言的
+        #   前提（"模板场景挂 2 个脚本"）早就不成立了。
+        #   `pickup.vks` / `portal.vks` 仍然在模板里（`template.json` 的
+        #   files[] 还列着），只是暂时没有实体引用它们。
         m = None
         deadline = time.time() + 30.0
         while time.time() < deadline:
@@ -206,9 +215,8 @@ def main():
         elif m.group(2) != "0":
             fails.append("D6 有脚本编译失败（%s 个），模板脚本语法有问题"
                          % m.group(2))
-        elif int(m.group(1)) < 2:
-            fails.append("D6 只编译了 %s 个脚本（模板应有 main.vks + pickup.vks）"
-                         % m.group(1))
+        elif int(m.group(1)) < 1:
+            fails.append("D6 一个脚本都没编译到（扫描没穿过联接？）")
         else:
             kit.log("CHECK D6 precompiled %s script(s), 0 with errors "
                     "(via junction) OK" % m.group(1))

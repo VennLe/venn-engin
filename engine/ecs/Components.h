@@ -139,6 +139,28 @@ struct SkinnedMeshComponent {
     // ⚠ 不要对它做按字节的撤销快照（它是 vector，memcpy 一个 std::vector
     //   是未定义行为）——Inspector 改动画字段走的是逐字段命令。
     std::vector<glm::mat4> jointMatrices;
+
+    // ---------------- 交叉淡入淡出（P5，2026-10-22）----------------
+    //
+    // 状态切换时"从哪一段过渡过来"。没有这组字段时切 clip 是硬切：直接改
+    // `clipName` 并把 `time` 归零 —— 腿的位置、手臂的摆幅在同一帧内跳变，
+    // 肉眼就是"机械、僵硬"（用户原话）。
+    //
+    // 语义：`fadeDur > 0 && !fadeFromClip.empty()` 时，采样阶段同时取
+    // **旧 clip（fadeFromTime 处）**与**新 clip（time 处）**，按
+    // `w = smoothstep(fadeT/fadeDur)` 混合。`fadeT` 由 AnimatorSystem 推进，
+    // 推到 1 就把 fadeFromClip 清空（之后回到"单 clip 直采"，零额外开销）。
+    //
+    // ⚠ 为什么不放进 AnimatorComponent：过渡是**采样层**的事，而采样层读的
+    //   是 SkinnedMeshComponent（预览场景没有 AnimatorComponent，也一样要
+    //   平滑）。放这里两边都能用。
+    // ⚠ 不进存档：过渡是"这一帧正在发生的事"，读档时不该恢复半个过渡。
+    std::string fadeFromClip;
+    float fadeFromTime = 0.0f;
+    float fadeT = 0.0f;
+    float fadeDur = 0.0f;
+
+    bool fading() const { return fadeDur > 0.0f && !fadeFromClip.empty(); }
 };
 
 // ---------------- 动画器（角色链 A1）----------------
@@ -216,6 +238,40 @@ struct AnimatorComponent {
     std::unordered_map<std::string, float> floatParams;
     std::unordered_map<std::string, bool> boolParams;
     std::unordered_map<std::string, bool> triggerParams;
+};
+
+// ---------------- 动画键盘映射（角色面板里给 clip 绑键）----------------
+//
+// 需求（2026-10-22 用户原话）：
+//   "角色如果有其他的动画，可以在其对应的角色动画面板中通过添加键盘映射
+//    去关联对应的按键去实现动画触发。"
+//
+// 所以它是**场景数据**（跟角色一起存盘），不是编辑器偏好：同一份工程发给
+// 别人，"按 F 挥手"这件事应当还在。挂在**拥有 SkinnedMeshComponent 的那个
+// 实体**上（玩家 / NPC 都是它）。
+//
+// 与 InputMap 的分工：InputMap 是**出厂 / 玩家自定义的输入方案**（config/
+// input_map.json，全局一份），改它会影响所有角色；本组件是**资产级绑定**
+// （这段动画归哪个键），跟着角色走。两者都只是"从键到 clip"的一层映射，
+// 真正的判定在 `animation/Locomotion` 的 pollKeyTrigger。
+//
+// ⚠ 键位存 **GLFW 键码**（`GLFW_KEY_F` = 70），不存字符串：字符串要解析、
+//   要处理大小写与别名，而 GLFW 键码在编辑器（ImGui 捕获后换算）与运行时
+//   （core::Input）里是同一套数，存它两边零转换。
+struct AnimKeyMapEntry {
+    std::string clip;   // 目标 clip 名（必须在骨架的 clips 里）
+    int key = 0;        // GLFW 键码；0 = 未绑定
+};
+
+struct AnimKeyMapComponent {
+    std::vector<AnimKeyMapEntry> entries;
+
+    // 强播多久（秒）。0 = 用 clip 自己的时长（播完自动回到 locomotion）。
+    // 给了正数 = "按住这段时间"，适合把长循环（呼吸 / 待机变体）当临时
+    // 表情用。
+    float holdSeconds = 0.0f;
+
+    bool enabled = true;
 };
 
 // ---------------- 实体 transform 关键帧（编辑器 Animation 模式）----------------
@@ -404,9 +460,10 @@ struct CharacterControllerComponent {
     float gravityScale = 1.0f;
     float maxSpeed = 4.5f;
     float sprintMultiplier = 2.0f;
-    float jumpSpeed = 5.0f;
+    // 0.70 m 的跳跃高度 / 0.75 s 滞空（= Jump 那段 clip 的时长）。
+    float jumpSpeed = 3.7f;
     float acceleration = 40.0f;
-    float airControl = 0.25f;
+    float airControl = 0.45f;
     float turnSpeed = 12.0f;      // 转身插值速度（1/s）
     float pushStrength = 1.0f;
 
@@ -576,8 +633,18 @@ struct PlayerComponent {
     PlayerMode mode = PlayerMode::FirstPerson;
 
     float eyeHeight = 1.7f;     // 第一人称眼睛离"脚"的高度
-    float moveSpeed = 3.0f;     // m/s（按住 Shift ×2）
+    float moveSpeed = 3.0f;     // m/s（按住鼠标右键 ×sprintMultiplier）
     float lookSpeed = 0.0025f;  // 鼠标灵敏度：弧度/像素
+
+    // 冲刺倍率。出厂 2.0（与 CharacterControllerComponent 同名字段一致的
+    // 手感）。编辑器 Play 态没有物理世界，走的是下面 hand-rolled 的那条
+    // 抛物线；它读这个值，所以两边"按住右键跑多快"由同一份数据决定。
+    float sprintMultiplier = 2.0f;
+
+    // 跳跃初速（m/s，**正 Z**）。0.70 m 的跳跃高度对应 3.7 m/s
+    // （h = v²/2g），这也是 Jump 那段 clip 的时长所对齐的滞空时间（0.75 s）。
+    // 编辑器 Play 用；运行时用 CharacterControllerComponent::jumpSpeed。
+    float jumpSpeed = 3.7f;
 
     // **视线仰角**：弧度，**正 = 抬头**（鼠标往上 → 抬头，两种模式一致）。
     // yaw 与 Camera 同约定：yaw=0 朝 +X，yaw 增大向右转。
@@ -595,6 +662,15 @@ struct PlayerComponent {
     float walkPhase = 0.0f;     // 四肢摆动相位
     float bodyYaw = 0.0f;       // 第三人称角色当前朝向（平滑转身用）
     bool  started = false;      // 本轮 Play 的第一帧（初始化 bodyYaw 等）
+
+    // ---- 跳跃的竖直运动（编辑器 Play 用，不序列化）----
+    //
+    // 运行时那条链的竖直速度在 `physics::CharacterState` 里，由
+    // `physics::stepCharacter` 积分；编辑器 Play **没有** PlayerController
+    // （那是 runtime 的概念），所以这里自带一份。常量全部取自
+    // `physics::kGravity` 与上面的 jumpSpeed，不会出现"编辑器跳得不一样"。
+    float velocityZ = 0.0f;
+    bool  onGround = true;
 };
 
 // 第三人称小人的肢体标记：运行态 walk 动画按 kind 摆动对应的肢体。

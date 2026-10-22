@@ -30,6 +30,16 @@ float wrapTime(float t, float dur) {
     return r;
 }
 
+// 交叉淡入淡出的权重曲线：smoothstep。
+//
+// 为什么不用线性：线性权重下**角速度在两端是突变的**，过渡的两头各有一个
+// 肉眼可见的"顿挫"（也就是做了过渡仍然显得僵硬）。smoothstep 的导数在
+// 0 与 1 处为 0，与两侧的稳态播放衔接得上 —— 这才是"看着顺"的关键。
+float fadeWeight(float t) {
+    const float x = std::clamp(t, 0.0f, 1.0f);
+    return x * x * (3.0f - 2.0f * x);
+}
+
 } // namespace
 
 int AnimatorSystem::tick(scene::Scene& scene, float dt) {
@@ -40,6 +50,7 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     int animators = 0;
     int mismatched = 0;
     int wrapped = 0;
+    int fading = 0;   // 本帧处于过渡中的实体数（ANIM-FADE 用）
     // 日志用副本而不是 c_str()：组件里的 clipName 随时可能被 Inspector
     // 改掉，存指针有悬垂风险。（只报最后一个跨圈 / 最后一个 animator，
     // 够断言用。）
@@ -143,8 +154,50 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
             }
 
             // ---- 5) 采样 → 关节矩阵（渲染层只负责搬运）----
-            samplePose(skel, clip, time, m_pose);
-            poseToJoints(skel, m_pose, sk.jointMatrices);
+            //
+            // P5（2026-10-22）：状态切换时走**双采样 + 混合**。见
+            // `SkinnedMeshComponent::fadeFromClip` 的字段注释。
+            // ⚠ 过渡推进用 `dt`（真实步长）而不是 `dt * speed`：过渡时长
+            //   是**时间**语义（0.2 s），不该被角色的播放速度缩放。
+            if (sk.fading()) {
+                // 过渡的**第一帧**（fadeT 还是 0）打一条锚点。
+                // ⚠ 不要靠 `ANIM-TICK ... fading=` 来断言"真的在混"：
+                //   ANIM-TICK 每 60 帧才打一行，而一次过渡只有 0.2 s（12 帧）
+                //   —— 采样点几乎必然落在过渡之外（实测 fading_seen=0，
+                //   功能是好的、判据是瞎的）。这里一帧一条，机器可判。
+                if (sk.fadeT <= 0.0f) {
+                    VK_LOG_INFO("ANIM-FADE begin from=%s to=%s dur=%.2fs",
+                                sk.fadeFromClip.c_str(), sk.clipName.c_str(),
+                                static_cast<double>(sk.fadeDur));
+                }
+                sk.fadeT += (advance ? dt : 0.0f) /
+                            std::max(sk.fadeDur, 1.0e-4f);
+                // 旧 clip 的播放头也要往前走：它仍在过自己的相位，冻住会让
+                // 混合出来的姿势"腿在半空中不动"（比硬切更怪）。
+                if (advance && playing) sk.fadeFromTime += dt * speed;
+
+                const assets::AnimationClip* fromClip =
+                    skel.findClip(sk.fadeFromClip);
+                if (sk.fadeT >= 1.0f || !fromClip) {
+                    // 过渡结束（或旧 clip 被删了）：回到单 clip 直采。
+                    // 这一帧就按纯新 clip 采，不留半混合的尾巴。
+                    sk.fadeT = 0.0f;
+                    sk.fadeDur = 0.0f;
+                    sk.fadeFromClip.clear();
+                    samplePose(skel, clip, time, m_pose);
+                    poseToJoints(skel, m_pose, sk.jointMatrices);
+                } else {
+                    const float w = fadeWeight(sk.fadeT);
+                    samplePose(skel, fromClip, sk.fadeFromTime, m_poseFrom);
+                    samplePose(skel, clip, time, m_pose);
+                    blendPose(m_poseFrom, m_pose, w, m_poseMix);
+                    poseToJoints(skel, m_poseMix, sk.jointMatrices);
+                    ++fading;
+                }
+            } else {
+                samplePose(skel, clip, time, m_pose);
+                poseToJoints(skel, m_pose, sk.jointMatrices);
+            }
         });
 
     m_lastEntities = count;
@@ -153,9 +206,10 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     // ---- 自检锚点 ----
     // 每 60 帧一条：证明"系统真的在跑"（而不是每帧都要看到它）。
     if ((m_frames % 60) == 1) {
-        VK_LOG_INFO("ANIM-TICK f=%llu entities=%d animators=%d dt=%.5f",
+        VK_LOG_INFO("ANIM-TICK f=%llu entities=%d animators=%d dt=%.5f "
+                    "fading=%d",
                     static_cast<unsigned long long>(m_frames), count, animators,
-                    static_cast<double>(dt));
+                    static_cast<double>(dt), fading);
         // 走 Animator 路径的那一份（time 每帧都在变，只按 60 帧的节奏报）。
         if (animators > 0) {
             VK_LOG_INFO("ANIM-ANIMATOR clip=%s time=%.3f speed=%.2f "

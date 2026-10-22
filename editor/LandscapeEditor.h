@@ -236,7 +236,10 @@ private:
     // 这样 —— 滑条到 1.0 只代表"标准档"，大范围整地时 3~8 才好用。
     // 0.01 的下限保留：0 会让笔刷完全无反应，看起来像坏了。
     float m_strength = 0.35f;        // 0.01 .. kMaxStrength
-    static constexpr float kMaxStrength = 16.0f;
+    // 2026-10-22（第十轮）：16 → 64。用户要求"上限值可以调大一些"。
+    // 16 在 514 m 的整体地形上仍然要按好几秒才抬起来一截；64 才够"一下子
+    // 堆出山"。三条入口（滑条 / 滚轮 / `,` `.` 键）都以它为准，改一处即可。
+    static constexpr float kMaxStrength = 64.0f;
     float m_falloff = 0.6f;          // 0 = 硬边，1 = 很软
     float m_maxDelta = 0.0f;         // 一笔之内最大位移（米），0 = 不限
 

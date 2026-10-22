@@ -9,9 +9,11 @@
 
 #include "physics/ScenePhysics.h"
 
+#include "core/Logger.h"
 #include "physics/CollisionWorld.h"   // meshAabb（网格 AABB 兜底）
 #include "ecs/Components.h"
 #include "scene/Scene.h"
+#include "terrain/Terrain.h"          // 地形高度场（见 attachTerrain）
 
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -41,6 +43,68 @@ Decomposed decomposeMatrix(const glm::mat4& m) {
     glm::decompose(m, d.scale, d.rotation, d.translation, skew, persp);
     d.rotation = glm::normalize(d.rotation);
     return d;
+}
+
+// ---------------------------------------------------------------- 地形
+//
+// 把场景里第一块 `TerrainComponent` 读成 CPU 高度场，挂到物理世界上。
+//
+// 为什么必须在这里做（而不是让 editor / runtime 各接一次）：地形是
+// **物理地面**这件事对"编辑器 Play"和"打包出的游戏"必须是同一套 ——
+// 分两处实现就一定会漂移（本文件头那段"两份实现必然漂移"的老账）。
+//
+// 代价是 `physics/` 反向 include 了 `terrain/`。但方向本来就有依赖
+// （`terrain/Terrain.h` include `physics/Heightfield.h`），且两者在同一个
+// 目标里，所以只是头文件层面的交叉，不构成编译环：`Terrain.h` 不会
+// include 本文件。
+//
+// ⚠ 只取第一块地形。多块地形的场景（拼接的大世界）暂时标注在日志里，
+//   而不是悄悄只认一块 —— "为什么站在西边那块地上会掉下去"必须有据可查。
+void attachTerrain(scene::Scene& scene, SceneBinding& out) {
+    ecs::Entity first{};
+    int count = 0;
+    scene.forEachTerrain([&](ecs::Entity e, ecs::TerrainComponent& tc) {
+        if (!tc.visible) return;
+        ++count;
+        if (!first.valid()) first = e;
+    });
+    out.terrains = count;
+    if (!first.valid()) return;
+
+    auto* tc = scene.world().get<ecs::TerrainComponent>(first);
+    if (!tc) return;
+
+    auto asset = std::make_unique<terrain::TerrainAsset>();
+    if (!terrain::loadTerrain(tc->source, *asset, nullptr, /*quiet=*/true)) {
+        VK_LOG_WARN("PHYS-TERRAIN-FAIL source=%s（地形不参与碰撞）",
+                    tc->source.c_str());
+        return;
+    }
+
+    // `heightfield()` 里已经按 maxHeight 换算过（归一化 → 米）；这里再乘
+    // 组件上的 `heightScale` 与实体缩放 —— 与渲染侧 `TerrainPass` 的口径
+    // 一致（那边是 `maxHeight × heightScale`，实体缩放由 model 矩阵带）。
+    physics::Heightfield hf = asset->heightfield();
+    // 实体自身的缩放/位移也要带上（地形被整体抬高一截的场景是合法的）。
+    // 高度场只支持"XY 平移 + 等比缩放"，所以这里只取平移与平均缩放。
+    const Decomposed d = decomposeMatrix(scene.worldMatrix(first));
+    const float s = (d.scale.x + d.scale.y) * 0.5f;
+    hf.origin = glm::vec2(d.translation) + glm::vec2(hf.origin) * s;
+    hf.metersPerPixel *= s;
+    hf.heightScale *= s * std::max(tc->heightScale, 1.0e-4f);
+
+    out.terrainHeights = asset->heights;   // 拷贝：asset 在本函数末尾就没了
+    out.terrainHf = std::make_unique<Heightfield>(hf);
+    out.terrainHf->heights = out.terrainHeights.data();
+    out.world->setHeightfield(out.terrainHf.get());
+
+    VK_LOG_INFO("PHYS-TERRAIN source=%s terrains=%d cols=%d rows=%d "
+                "mpp=%.2f maxh=%.2f origin=(%.1f,%.1f)",
+                tc->source.c_str(), count, hf.cols, hf.rows,
+                static_cast<double>(hf.metersPerPixel),
+                static_cast<double>(hf.heightScale),
+                static_cast<double>(hf.origin.x),
+                static_cast<double>(hf.origin.y));
 }
 
 } // namespace
@@ -283,6 +347,9 @@ SceneBinding buildSceneWorld(scene::Scene& scene, const SceneBuildOptions& opts)
 
     out.bodies = built + (out.ground ? 1 : 0);
     out.world = std::move(world);
+    // 地形接进物理（第十轮）：没有它，刚体和角色都只认 z=0 的无限地面，
+    // 于是"新工程一进去，玩家埋在地面下 3 米"。
+    attachTerrain(scene, out);
     return out;
 }
 

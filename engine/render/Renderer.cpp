@@ -318,6 +318,23 @@ void Renderer::bindFeatureParams() {
     render::bindParam("grid.fadeStart", &m_grid.fadeStart, ParamKind::Float);
     render::bindParam("grid.fadeEnd", &m_grid.fadeEnd, ParamKind::Float);
 
+    // ---- 角色预览的栅格尺度（2026-10-22）----
+    // 预览是一个 1.8 m 高的人形特写，世界栅格那套（1 m / 10 m、500 m 见方、
+    // 1500 m 处淡出）在距离 3 m 的镜头里等于"只有一条线"。这里换成
+    // 10 cm / 50 cm、4 m 见方、2.4 m 起淡出 —— 脚下那一小块地面刚好铺满
+    // 视口底部，格距与人物脚掌（约 25 cm）可比，看得出大小关系。
+    // 不做 env / UI 绑定：它只服务一个面板，暴露成全局参数只会让"我改的
+    // 到底是主视口还是预览"变成一次排查。
+    m_previewGrid.extent = 4.0f;
+    m_previewGrid.minorStep = 0.10f;
+    m_previewGrid.majorStep = 0.50f;
+    m_previewGrid.lineWidthPx = 1.2f;
+    m_previewGrid.fadeStart = 2.4f;
+    m_previewGrid.fadeEnd = 4.0f;
+    m_previewGrid.alpha = 0.50f;
+    m_previewGrid.minorStrength = 0.5f;
+    m_previewGrid.color = glm::vec3(0.62f, 0.66f, 0.72f);
+
     // ---- 游戏 UI / HUD（U0）----
     // 存储是 ui2::settings() 的普通成员（不是 Renderer 的成员）：游戏 UI
     // 的消费者是 RuntimeApp 与 UiRenderer，Renderer 只是"顺路把它绑上"
@@ -2804,11 +2821,37 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
     // 借用它来区分统计口径：离屏目标的物体数不该算进主场景的剔除统计。
     buildDrawLists(scene, camPosW, resetSkinning);
 
-    // 地形实例与场景实体对齐（必须在录制命令之前，见 syncTerrains 的注释）
-    syncTerrains(scene);
-
-    // 水体同理：新建/删除要走 waitIdle + 顶点上传，不能和录制撞在同一队列
-    syncWaters(scene);
+    // ---- 地形 / 水体实例：**只对主场景**对齐 ----
+    //
+    // 这两个都是"全局唯一实例集"（TerrainPass::m_instances / WaterPass 同理），
+    // 它们的键是**主场景里的实体**。离屏目标（角色预览 / 额外视角 / 反射探针
+    // 的面）各自带的是**另一个场景** —— 那个场景通常一个地形实体都没有，
+    // 于是 items 是空的、和 requested 对不上，`same` 判为 false → 走进
+    // "全量重建"分支。
+    //
+    // ⚠ 而离屏目标是在 recordFrame **录制途中**被调用的（见
+    //   recordOffscreenTarget）。在录制中间 clearInstances() 会销毁主场景
+    //   地形的 VBO / IBO 与 8 张层贴图的 sampler —— 它们**已经绑在这条正在
+    //   录制的命令缓冲上**，整条 CB 当场失效：
+    //     vkCmdBeginRenderPass(): ... invalid state ...
+    //     - VkBuffer 0x5b5 was destroyed
+    //     - VkSampler 0x5d0 was destroyed (used by VkDescriptorSet)
+    //   之后每个命令都报同一条，最终 vkQueueSubmit 返回 -4（DEVICE_LOST），
+    //   `Fatal: Vulkan call failed` 直接退出。现场还伴着"地形重建→贴图创建
+    //   失败→TERRAIN-LAYER-TEX-FAIL×8"——那是设备已经丢了之后的余波，不是原因。
+    //
+    // 复现：新建 third_person 工程（场景里带 Terrain 实体）→ Shift+A ▸ Player
+    //   ▸ Third-Person Player → 角色窗口打开的那一帧必崩。
+    //
+    // 判据用 `offscreenSlot < 0`：主场景调用不带离屏槽（见 recordFrame 里的
+    // `uploadSceneState(scene, renderExtent(), true, viewCam)`），预览与探针
+    // 面都带。顺带把 syncTerrains 的"必须在录制之前"从注释变成结构：
+    // 唯一能走到这里的路径就是录制前的主场景上传。
+    if (offscreenSlot < 0) {
+        syncTerrains(scene);
+        // 水体同理：新建/删除要走 waitIdle + 顶点上传，不能和录制撞在同一队列
+        syncWaters(scene);
+    }
 }
 
 // ============================================================
@@ -2830,6 +2873,14 @@ struct TerrainItem {
     float heightScale = 1.0f;
     std::array<std::string, 4> overrides;
 };
+
+// 地形创建失败后的重试间隔（帧）。
+//
+// 120 帧 ≈ 2 秒：足够让用户/工具把资产换掉，又不会让"重建"长期占着帧时间。
+// 为什么必须节流：一次重建 = `waitIdle` + 销毁/新建 sampler 与描述符集 +
+// 读 500 KB + 重传 3 MB 顶点，实测单帧上百毫秒；逐帧跑就是几百毫秒一帧，
+// Windows 的 TDR 2 秒上限一到，驱动直接重置 → DEVICE_LOST。
+constexpr int kTerrainRetryFrames = 120;
 } // namespace
 
 uint32_t Renderer::terrainCount() const {
@@ -2861,8 +2912,12 @@ void Renderer::syncTerrains(scene::Scene& scene) {
         for (int i = 0; i < 4; ++i) it.overrides[i] = tc.layerOverrides[i];
         if (tc.dirty) {
             tc.dirty = false;
-            // 层材质改了 → 位掩码/贴图/UBO 都在实例里，只能重建
+            // 层材质改了 → 位掩码/贴图/UBO 都在实例里，只能重建。
+            //
+            // ⚠ 两份都要清。`same` 判据现在看的是 requested，只清 entities
+            //   会变成"实例没了、却认为集合没变" → 地形永久消失。
             m_terrainEntities.clear();
+            m_terrainRequested.clear();
         }
         if (tc.heightsDirty || tc.splatDirty || tc.holesDirty) {
             TerrainRefresh r;
@@ -2886,38 +2941,75 @@ void Renderer::syncTerrains(scene::Scene& scene) {
         items.push_back(std::move(it));
     });
 
-    // 集合（实体 id + 资产路径 + 层覆盖）没变 → 只刷 model / heightScale
-    bool same = (items.size() == m_terrainEntities.size());
+    // 集合（实体 id + 资产路径）没变 → 只刷 model / heightScale
+    //
+    // ⚠ 判据用 `m_terrainRequested`（**请求过**的全集，含创建失败的），
+    //   不能用 `m_terrainEntities`（只装成功的）。用一个"成功数"去比
+    //   "请求数"，只要有一个实体建失败就永远不相等 —— 于是每一帧都
+    //   clearInstances()（waitIdle + 全量重建）→ 帧时间冲破 TDR 的 2 秒
+    //   → 驱动重置 → vkQueueSubmit 返回 DEVICE_LOST。那正是
+    //   "抬山保存 → 资产值域越界 → 编辑器整个被 GPU 丢掉" 的成因。
+    bool same = (items.size() == m_terrainRequested.size());
     if (same) {
         for (std::size_t i = 0; i < items.size(); ++i) {
-            if (items[i].entity != m_terrainEntities[i]) { same = false; break; }
-            const auto* inst = m_terrain->instanceAt(static_cast<uint32_t>(i));
-            if (!inst || inst->asset.path != items[i].source) { same = false; break; }
+            if (m_terrainRequested[i].first != items[i].entity ||
+                m_terrainRequested[i].second != items[i].source) {
+                same = false;
+                break;
+            }
+        }
+    }
+    // 上次有失败 → 隔一段时间放行一次重试（资产可能已经被修好）。
+    // 逐帧重试的代价见上：那不是"重试"，那是把 GPU 拖进 TDR。
+    if (same && m_terrainDegraded) {
+        if (++m_terrainRetryTick >= kTerrainRetryFrames) {
+            m_terrainRetryTick = 0;
+            same = false;
         }
     }
 
     if (!same) {
         m_terrain->clearInstances();
         m_terrainEntities.clear();
+        m_terrainRequested.clear();
+        m_terrainDegraded = false;
+        m_terrainRetryTick = 0;
         // 贴图上下文里有 textureSetLayout，它在 Renderer::init 的
         // "建完管线之后"才存在 —— 所以每次建实例前刷一次。
         m_terrain->setTextureContext(textureContext());
         for (const auto& it : items) {
+            m_terrainRequested.emplace_back(it.entity, it.source);
             if (m_terrain->createTerrain(it.source, it.model, it.heightScale,
                                          &it.overrides)) {
                 m_terrainEntities.push_back(it.entity);
             } else {
+                m_terrainDegraded = true;
                 VK_LOG_ERROR("TERRAIN-CREATE-FAIL entity=%u path=%s", it.entity,
                              it.source.c_str());
             }
         }
+        if (m_terrainDegraded) {
+            VK_LOG_ERROR("TERRAIN-DEGRADED failed=%zu/%zu retryEvery=%d frames",
+                         items.size() - m_terrainEntities.size(), items.size(),
+                         kTerrainRetryFrames);
+        }
     } else {
-        for (std::size_t i = 0; i < items.size(); ++i) {
-            auto* inst = m_terrain->instanceAt(static_cast<uint32_t>(i));
+        // m_terrainEntities[i] ↔ instanceAt(i) 一一对应（都只含建成功的），
+        // 但 items 里含有失败的条目，所以**不能**用同一个下标去取 items[i]。
+        for (std::size_t i = 0; i < m_terrainEntities.size(); ++i) {
+            auto* inst = m_terrain->instanceAt(static_cast<std::uint32_t>(i));
             if (!inst) continue;
-            inst->model = items[i].model;
-            inst->heightScale = (items[i].heightScale > 1.0e-4f)
-                                    ? items[i].heightScale
+            const TerrainItem* src = nullptr;
+            for (const auto& it : items) {
+                if (it.entity == m_terrainEntities[i]) {
+                    src = &it;
+                    break;
+                }
+            }
+            if (!src) continue;
+            inst->model = src->model;
+            inst->heightScale = (src->heightScale > 1.0e-4f)
+                                    ? src->heightScale
                                     : 1.0f;
         }
 
@@ -2933,8 +3025,16 @@ void Renderer::syncTerrains(scene::Scene& scene) {
             if (!m_terrain->refreshSurface(static_cast<uint32_t>(idx), r.splatToo,
                                            r.holesToo,
                                            r.hasLive ? &r.live : nullptr)) {
-                // 读不回/尺寸变了 → 退回重建（下一帧走 !same 分支）
+                // 读不回/尺寸变了 → 退回重建（下一帧走 !same 分支）。
+                //
+                // ⚠ 必须**连 requested 一起清**：只清 m_terrainEntities 的话，
+                //   `items.size() == m_terrainRequested.size()` 仍然成立 →
+                //   same 判据认为"什么都没变" → 地形永远回不来（实例被清空了，
+                //   却再也不重建）。这是"刷新一次失败 = 地形永久消失"。
                 m_terrainEntities.clear();
+                m_terrainRequested.clear();
+                m_terrainDegraded = true;
+                break;
             }
         }
     }
@@ -3722,6 +3822,37 @@ void Renderer::recordSceneInto(VkCommandBuffer cmd, scene::Scene& scene,
             drawMesh(cmd, m_forwardPipelines.layout(), model, gizmoMat,
                      *m_lightGizmoMesh);
         }
+    }
+
+    // ---------------- 地平面栅格（预览目标）----------------
+    //
+    // 主视口的栅格在 recordFrame 里画（用全局那份 m_grid）；这里服务
+    // 离屏目标（角色窗口的预览），用 m_previewGrid 自己的参数。
+    // 位置和主视口一致：不透明之后、透明之前 ——
+    //   · 吃深度测试 → 角色/胶囊会正确遮住身后的格线；
+    //   · 不写深度且排在透明之前 → 半透明胶囊能正常叠在它上面。
+    if (isPreview && m_previewGridEnabled && m_gridPipeline) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          m_gridPipeline->get());
+        const float far = scene.camera().farPlane();
+        const float fadeEnd =
+            std::min(std::min(m_previewGrid.fadeEnd, m_previewGrid.extent),
+                     far * 0.95f);
+        GridPushConstants gpc;
+        gpc.params = glm::vec4(
+            m_previewGrid.extent, std::max(m_previewGrid.minorStep, 1e-3f),
+            std::max(m_previewGrid.majorStep, 1e-3f), m_previewGrid.planeOffset);
+        gpc.color = glm::vec4(m_previewGrid.color, m_previewGrid.alpha);
+        gpc.fade = glm::vec4(std::min(m_previewGrid.fadeStart, fadeEnd * 0.9f),
+                             fadeEnd, std::max(m_previewGrid.lineWidthPx, 0.5f),
+                             m_previewGrid.minorStrength);
+        vkCmdPushConstants(cmd, m_gridPipeline->layout(),
+                           VK_SHADER_STAGE_VERTEX_BIT |
+                               VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(gpc), &gpc);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+        // 管线刚换过 → 变体绑定的缓存作废（照主视口那条的写法）
+        boundMask = kBindsNothing;
     }
 
     // 透明（绘制列表已按到相机距离降序排好，远 → 近）

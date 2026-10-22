@@ -43,6 +43,14 @@
 
 namespace physics {
 
+// 重力加速度（m/s²，Z-up 所以是**负值**）。
+//
+// 为什么放在头文件而不是 .cpp 的匿名命名空间里（2026-10-22）：编辑器
+// Play 态的跳跃要**手工积分**同一条抛物线（它没有 PlayerController /
+// 物理世界），如果那边自己写一个 -9.81，两边的跳跃高度迟早漂开 ——
+// 而"编辑器里跳得比出包后高"这种差异只能靠肉眼发现。
+constexpr float kGravity = -9.81f;
+
 class PhysicsWorld;
 
 struct CharacterDesc {
@@ -59,9 +67,14 @@ struct CharacterDesc {
     // ---- 运动 ----
     float gravityScale = 1.0f;
     float maxSpeed = 4.5f;            // m/s（输入侧的上限，供 PlayerController 用）
-    float jumpSpeed = 5.0f;           // m/s
+    // 跳跃初速 3.7 m/s → 高度 v²/2g ≈ 0.70 m、滞空 0.75 s。
+    // 之前的 5.0 m/s 是 1.27 m —— 那是游戏手感，不是人能跳的高度。
+    float jumpSpeed = 3.7f;           // m/s
     float acceleration = 40.0f;       // m/s²（地面）
-    float airControl = 0.25f;         // 空中加速度打折
+    // 空中操控 0.45：保留惯性（起跳前怎么跑，空中就怎么飞），但按住方向键
+    // 能明显把落点掰过去。0.25 时几乎掰不动；0.8 以上变成空中走路，
+    // 抛物线的手感就没了。
+    float airControl = 0.45f;         // 空中加速度打折
     float pushStrength = 1.0f;        // 推箱子的力度倍率（运动学代理的"质量感"）
 
     // ---- 地形高度场（W4-3）----

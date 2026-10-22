@@ -195,19 +195,60 @@ bool loadTerrain(const std::string& relPath, TerrainAsset& out, std::string* err
         return fail(buf);
     }
 
-    // 归一化检查：.r32 里存的必须是 0..1。超出 [−0.01, 1.01] 说明生成器
-    // 直接把"米"写进去了 —— 那样 maxHeight 会被乘两次，地形高度差出十几倍，
-    // 而画面只是"起伏很大"，很容易被当成"参数没调好"。
+    // ---- 归一化检查 / 自动救援（2026-10-22 第十一轮）----
+    //
+    // `.r32` 的契约是 [0, 1]：1.0 代表"等于 maxHeight"。
+    //
+    // 但编辑器的抬升笔刷**故意**允许冲到 kMaxNorm = 8（那是"山峰不撞平顶"
+    // 的余量），而老版本 `saveAssets()` 把这份未收敛的数组原样写盘了。
+    // 于是形成闭环矛盾：写端允许 8、读端只接受 1 —— 用户抬完山保存一
+    // 次，工程就再也打不开了（`TERRAIN-INSTANCE-FAIL height_not_normalized`）。
+    //
+    // 修法分两半，这里是"读端兜住存量坏数据"那一半：
+    //   · 写端（LandscapeEditor::saveAssets）落盘前先收敛，保证磁盘上永远
+    //     是 [0,1] —— 那是根治；
+    //   · 读端遇到已经写坏的资产**按最高点重整**，让用户能打开、能看见、
+    //     能继续编辑。因为世界高度是 `h * maxHeight`，同乘同除结果恒等。
+    //
+    // 为什么负高度仍然硬失败：抬山笔刷的下限是 0（`clamp(h, 0, kMaxNorm)`），
+    // 编不出负数。负值只可能来自外部工具/生成器算错 —— 那就该炸出来看日志，
+    // 而不是被"救援"悄悄抹平。
     float lo = 1.0e30f, hi = -1.0e30f;
     for (float h : heights) {
         lo = std::min(lo, h);
         hi = std::max(hi, h);
     }
-    if (lo < -0.01f || hi > 1.01f) {
+    if (!std::isfinite(lo) || !std::isfinite(hi) || lo < -0.01f) {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "height_not_normalized min=%.3f max=%.3f",
+        std::snprintf(buf, sizeof(buf),
+                      "height_not_normalized min=%.3f max=%.3f",
                       static_cast<double>(lo), static_cast<double>(hi));
         return fail(buf);
+    }
+    if (hi > 1.01f) {
+        // 上限保护：超过 1e6 的"最高点"不是抬山能产生的，多半是文件被截断/
+        // 字节序搞反了读出来的垃圾 float。这种重整出来的 maxHeight 会是 inf。
+        if (hi > 1.0e6f) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                          "height_not_normalized min=%.3f max=%.3f",
+                          static_cast<double>(lo), static_cast<double>(hi));
+            return fail(buf);
+        }
+        const float inv = 1.0f / hi;
+        for (float& h : heights) h *= inv;
+        const float oldMax = d.maxHeight;
+        d.maxHeight *= hi;
+        out.rescaled = true;
+        // 日志里的 min/max 要报**收敛后**的值，与内存里的 heights 一致。
+        // 否则日志写着 "max=8.000" 而实际数组是 [0,1]，下次排查会被它带偏。
+        lo *= inv;
+        hi *= inv;
+        VK_LOG_WARN("TERRAIN-RENORMALIZE path=%s peak=%.3f maxHeight %.4f -> "
+                    "%.4f（世界高度不变；下次保存会写回规范数据）",
+                    relPath.c_str(), static_cast<double>(1.0f / inv),
+                    static_cast<double>(oldMax),
+                    static_cast<double>(d.maxHeight));
     }
 
     out.desc = d;
@@ -244,6 +285,49 @@ bool loadTerrain(const std::string& relPath, TerrainAsset& out, std::string* err
                 chunkCountX(out), chunkCountY(out),
                 static_cast<double>(lo), static_cast<double>(hi));
     return true;
+}
+
+// ------------------------------------------------------------
+// 值域收敛（与 loadTerrain 里的救援共用同一套数学）
+// ------------------------------------------------------------
+float normalizeHeightRange(TerrainAsset& asset) {
+    if (asset.heights.empty()) return 1.0f;
+    float hi = 0.0f;
+    for (float h : asset.heights) {
+        if (h > hi) hi = h;
+    }
+    // 留 1e-5 的余量：笔刷的 clamp 是精确的 1.0，但浮点累加会给出
+    // 1.0000001 这种值 —— 不值得为它做一次全量缩放。
+    if (!(hi > 1.0f + 1.0e-5f)) return 1.0f;
+    // 上限保护：与 loadTerrain 的救援同口径。超过 1e6 的"峰值"不是抬山
+    // 能产生的，多半是文件被截断/读成垃圾 float —— 缩放它只会放大错误。
+    if (!std::isfinite(hi) || hi > 1.0e6f) return 1.0f;
+
+    const float inv = 1.0f / hi;
+    for (float& h : asset.heights) h *= inv;
+    asset.desc.maxHeight *= hi;
+    return inv;
+}
+
+bool rewriteMaxHeight(const std::string& relPath, float maxHeight) {
+    const std::string abs = assets::resolveAssetPath(relPath);
+    json j = json::object();
+    {
+        std::ifstream jf(abs);
+        if (jf) {
+            try {
+                jf >> j;
+            } catch (...) {
+                j = json::object();
+            }
+        }
+    }
+    if (!j.is_object()) j = json::object();
+    j["maxHeight"] = maxHeight;
+    std::ofstream jo(abs, std::ios::trunc);
+    if (!jo) return false;
+    jo << j.dump(2) << "\n";
+    return static_cast<bool>(jo);
 }
 
 // ------------------------------------------------------------

@@ -685,4 +685,85 @@ float penetrationDepth(const ShapeQuery& a, const ShapeQuery& b,
     return deepest;
 }
 
+// ================================================================
+//  地形 vs 刚体（2026-10-22 第十轮）
+// ================================================================
+//
+// 用户的要求："生成的地形地面就是真实的地面，物理特性上不允许说有任何
+// 物体时能陷入其中的，包括 GameStart。"
+//
+// 在此之前地形**只**是渲染物：物理世界里有它的高度场视图，但只有
+// `CharacterController`（而且只有自检里）会用它。于是新工程一进去，
+// 玩家 / 掉下来的箱子全部穿到地面以下 —— 因为物理只知道 z=0 的无限地面，
+// 而地形表面在别处。
+//
+// 做法见头文件的说明：拿"物体中心的地表切平面"当代表面，把支撑点投上去。
+// 下面是"支撑点"这一层的实现，全部复用 planeVsBody 里同一套形状视图
+// （WorldBox / WorldCapsule），避免两处对"盒子的 8 个角在哪"各写一遍。
+bool terrainVsBody(const Heightfield& hf, const RigidBody& B,
+                   std::uint32_t terrainIndex, std::uint32_t bodyIndex,
+                   ContactManifold& out) {
+    out.bodyA = terrainIndex;
+    out.bodyB = bodyIndex;
+    out.count = 0;
+    out.friction = combineFriction(B.material.dynamicFriction, 0.85f);
+    out.restitution = combineRestitution(B.material.restitution, 0.0f);
+
+    if (!hf.valid() || B.hasFlag(kBodyIsTrigger)) return false;
+
+    // 代表平面：过"物体正下方的地表点"，法线取该点的地形法线。
+    //
+    // ⚠ 取 `B.position` 的 XY 而不是"最深那个支撑点"的 XY：法线必须先定
+    //   下来才能算深度，而"哪个点最深"本身依赖法线 —— 用一个**与深度
+    //   无关**的锚点才能打破这个循环，也让结果对同一位置是确定的。
+    const float cx = B.position.x;
+    const float cy = B.position.y;
+    const glm::vec3 n = normalAt(hf, cx, cy);          // 地形 → 物体（朝上）
+    const glm::vec3 planePoint(cx, cy, heightAt(hf, cx, cy));
+    out.normal = n;
+
+    // 把一个世界空间点投到代表平面上。dist > 0 = 在地面之上 → 不接触。
+    auto addSupport = [&](const glm::vec3& v, std::uint64_t featureId) {
+        const float dist = glm::dot(v - planePoint, n);
+        if (dist > 0.0f) return;
+        addPoint(out, v - n * (dist * 0.5f), -dist, featureId);
+    };
+
+    switch (B.shape.kind) {
+        case ShapeKind::Sphere: {
+            const float r = B.shape.convex.radius;
+            addSupport(B.position - n * r, 0);
+            return out.count > 0;
+        }
+        case ShapeKind::Capsule: {
+            const WorldCapsule cap = makeCapsule(B);
+            // 两端各当一个球：球心沿 -n 退一个半径就是支撑点。
+            addSupport(cap.a - n * cap.r, 0);
+            addSupport(cap.b - n * cap.r, 0);
+            break;
+        }
+        case ShapeKind::Box: {
+            const WorldBox box = makeBox(B);
+            for (int i = 0; i < 8; ++i) {
+                addSupport(box.vertex(i), static_cast<std::uint64_t>(i + 1) << 8);
+            }
+            break;
+        }
+        case ShapeKind::ConvexHull: {
+            const std::vector<glm::vec3>& pts = B.shape.convex.hull;
+            const glm::mat3 R = glm::mat3_cast(B.rotation);
+            for (const glm::vec3& p : pts) {
+                addSupport(B.position + R * p, 0);
+            }
+            break;
+        }
+        case ShapeKind::Plane:
+            return false;   // 平面 vs 地形：没有意义
+    }
+
+    if (out.count == 0) return false;
+    trimToDeepest(out);
+    return true;
+}
+
 } // namespace physics

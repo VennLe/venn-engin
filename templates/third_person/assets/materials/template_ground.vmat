@@ -20,7 +20,7 @@
     1.0
   ],
   "metallic": 0.0,
-  "roughness": 0.92,
+  "roughness": 1.0,
   "albedo": {
     "kind": "file",
     "name": "template_ground_albedo",

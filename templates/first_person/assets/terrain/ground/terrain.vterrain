@@ -5,7 +5,7 @@
   "cols": 257,
   "rows": 257,
   "metersPerPixel": 2.0,
-  "maxHeight": 6.0,
+  "maxHeight": 5.193805,
   "splatRepeat": 1.0,
   "layerTiling": 6.0,
   "height": "height.r32",

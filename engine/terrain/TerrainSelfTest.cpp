@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -92,6 +93,50 @@ bool slurp(const std::string& rel, std::vector<std::uint8_t>& out) {
     f.seekg(0, std::ios::beg);
     out.resize(static_cast<std::size_t>(n));
     if (n > 0) f.read(reinterpret_cast<char*>(out.data()), n);
+    return true;
+}
+
+// 造一份地形资产（`.vterrain` + `height.r32` + `splat.rgba8`）。
+//
+// ⚠ 只往**系统临时目录**写，绝不往 assets 根写：自检可能在"仓库 templates
+//   只读"或"构建产物目录"里跑，往那儿写文件等于污染工作区。
+//   `assets::resolveAssetPath` 收到绝对路径是透传的（RHS 带 root-name 时
+//   `operator/` 直接替换），所以这里的路径原样可用。
+bool writeTempTerrain(const std::string& absVterrain, int n, float mpp,
+                      float maxH, const std::vector<float>& heights) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(absVterrain).parent_path();
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) return false;
+
+    {
+        std::ofstream f(absVterrain);
+        if (!f) return false;
+        f << "{\n  \"type\": \"terrain\",\n  \"version\": 1,\n"
+             "  \"name\": \"selftest\",\n"
+             "  \"cols\": " << n << ",\n"
+             "  \"rows\": " << n << ",\n"
+             "  \"metersPerPixel\": " << mpp << ",\n"
+             "  \"maxHeight\": " << maxH << ",\n"
+             "  \"height\": \"height.r32\",\n"
+             "  \"splat\": \"splat.rgba8\",\n"
+             "  \"layers\": [\"ground\", \"rock\", \"sand\", \"snow\"]\n}\n";
+    }
+    {
+        std::ofstream f((dir / "height.r32").string(), std::ios::binary);
+        if (!f) return false;
+        f.write(reinterpret_cast<const char*>(heights.data()),
+                static_cast<std::streamsize>(heights.size() * sizeof(float)));
+    }
+    {
+        std::vector<std::uint8_t> splat(
+            static_cast<std::size_t>(n) * static_cast<std::size_t>(n) * 4u, 255u);
+        std::ofstream f((dir / "splat.rgba8").string(), std::ios::binary);
+        if (!f) return false;
+        f.write(reinterpret_cast<const char*>(splat.data()),
+                static_cast<std::streamsize>(splat.size()));
+    }
     return true;
 }
 
@@ -506,6 +551,144 @@ int runTerrainSelfTest() {
                       static_cast<double>(st.position.z), st.onGround ? 1 : 0);
         check("D5 无高度场时回落到 groundPlane（z ≈ 0.9）",
               st.onGround && std::fabs(st.position.z - 0.9f) < 0.01f, buf);
+    }
+
+    // ============================================================
+    // E 组：值域收敛 / 抬山越界后的救援（2026-10-22 第十一轮）
+    // ============================================================
+    //
+    // 看守的那个 bug 链条：
+    //   抬升笔刷允许冲到 kMaxNorm=8（"不撞平顶"的余量）
+    //   → 老版本 saveAssets 原样写盘，height.r32 里出现 max=8.000
+    //   → 下次读盘 height_not_normalized 硬失败 → 工程再也打不开
+    //   → 又因为 syncTerrains 的 same 判据拿"成功数"比"请求数"，
+    //     每帧全量重建 → 帧时间冲破 TDR → DEVICE_LOST
+    //
+    // E1/E2 测纯数学（收敛 + 世界高度恒等），E3/E4 走真实文件往返 ——
+    // 那个 bug 就长在"写端以为读端会收拾、读端以为写端会收敛"的接口上，
+    // 不拿文件走一遍是测不到的。
+    {
+        // E1：本来就在 [0,1] 内的资产，一个字节都不该动
+        TerrainAsset a;
+        a.desc.maxHeight = 5.0f;
+        a.heights = {0.0f, 0.25f, 0.5f};
+        const float inv = normalizeHeightRange(a);
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "inv=%.4f maxH=%.3f",
+                      static_cast<double>(inv),
+                      static_cast<double>(a.desc.maxHeight));
+        check("E1 已在 [0,1] 的资产不被改写",
+              inv == 1.0f && a.desc.maxHeight == 5.0f, buf);
+    }
+    {
+        // E2：峰值 8 → 收敛到 1.0，且**世界高度逐点恒等**（这才是"无损"）
+        TerrainAsset a;
+        a.desc.maxHeight = 5.0f;
+        a.heights = {0.0f, 2.0f, 8.0f};
+        std::vector<float> worldBefore;
+        worldBefore.reserve(a.heights.size());
+        for (float h : a.heights) worldBefore.push_back(h * a.desc.maxHeight);
+
+        const float inv = normalizeHeightRange(a);
+        double peak = 0.0;
+        double worst = 0.0;
+        for (std::size_t i = 0; i < a.heights.size(); ++i) {
+            peak = std::max(peak, static_cast<double>(a.heights[i]));
+            worst = std::max(worst, std::fabs(static_cast<double>(
+                                        a.heights[i] * a.desc.maxHeight -
+                                        worldBefore[i])));
+        }
+        char buf[220];
+        std::snprintf(buf, sizeof(buf),
+                      "inv=%.5f peak=%.4f maxH=%.2f worstWorldDiff=%.7f",
+                      static_cast<double>(inv), peak,
+                      static_cast<double>(a.desc.maxHeight), worst);
+        check("E2 峰值 8 的资产被收敛到 [0,1]",
+              std::fabs(inv - 0.125f) < 1.0e-6f && peak <= 1.0 + 1.0e-5, buf);
+        check("E2b 收敛前后世界高度逐点相同（无损）", worst < 1.0e-5, buf);
+    }
+    {
+        // E3：改 maxHeight 只能动那一个字段 —— 其余必须原样活下来。
+        // 这条守的是"手拼 JSON 漏字段"：以前 createTerrain 手写整份 JSON，
+        // 任何新字段都得记得在三个地方加。
+        namespace fs = std::filesystem;
+        const fs::path tmp = fs::temp_directory_path() / "venn_selftest_renorm" /
+                             "terrain.vterrain";
+        const int n = 33;   // (33-1)/kChunkCells(32) = 1 → 满足分块硬约束
+        std::vector<float> hs(static_cast<std::size_t>(n) * n, 0.0f);
+        hs[0] = 0.5f;
+        hs.back() = 1.0f;
+        const bool wrote = writeTempTerrain(tmp.string(), n, 2.0f, 5.0f, hs);
+        check("E3 能写出临时地形资产（临时目录，不碰 assets）", wrote);
+        if (wrote) {
+            check("E3b rewriteMaxHeight 返回 true",
+                  rewriteMaxHeight(tmp.string(), 40.0f));
+
+            TerrainAsset back;
+            std::string rerr;
+            const bool rl = loadTerrain(tmp.string(), back, &rerr, true);
+            const float peak = back.heights.empty()
+                                   ? -1.0f
+                                   : *std::max_element(back.heights.begin(),
+                                                       back.heights.end());
+            char buf[220];
+            std::snprintf(buf, sizeof(buf),
+                          "ok=%d maxH=%.3f peak=%.3f mpp=%.2f cols=%d err=%s",
+                          rl ? 1 : 0, static_cast<double>(back.desc.maxHeight),
+                          static_cast<double>(peak),
+                          static_cast<double>(back.desc.metersPerPixel),
+                          back.desc.cols, rerr.c_str());
+            check("E3c 改写后仍能读回，且 maxHeight 生效",
+                  rl && std::fabs(back.desc.maxHeight - 40.0f) < 1.0e-3, buf);
+            check("E3d 其余字段没被写丢（mpp / cols / 高度）",
+                  rl && back.desc.cols == n &&
+                      std::fabs(back.desc.metersPerPixel - 2.0f) < 1.0e-5f &&
+                      std::fabs(peak - 1.0f) < 1.0e-5f,
+                  buf);
+            check("E3e 规范资产不该被标成 rescaled", rl && !back.rescaled, buf);
+        }
+        std::error_code ec;
+        fs::remove_all(tmp.parent_path(), ec);
+    }
+    {
+        // E4：磁盘上真的存在"峰值 8"的资产 → loadTerrain 必须救援而不是硬拒
+        namespace fs = std::filesystem;
+        const fs::path tmp = fs::temp_directory_path() /
+                             "venn_selftest_renorm_bad" / "terrain.vterrain";
+        const int n = 33;
+        // 模拟"抬山撞顶后保存"：0.25 的底 + 一个 8.0 的尖
+        std::vector<float> hs(static_cast<std::size_t>(n) * n, 0.25f);
+        hs[0] = 0.0f;
+        hs[hs.size() / 2] = 8.0f;
+        const bool wrote = writeTempTerrain(tmp.string(), n, 2.0f, 5.0f, hs);
+        check("E4 能写出越界资产（峰值 8.000，模拟抬山后保存）", wrote);
+        if (wrote) {
+            TerrainAsset back;
+            std::string rerr;
+            const bool rl = loadTerrain(tmp.string(), back, &rerr, true);
+            double peak = 0.0;
+            for (float h : back.heights) {
+                peak = std::max(peak, static_cast<double>(h));
+            }
+            // 原意是"峰值 8 × maxHeight 5 = 40 m 的山"，救援后必须还是 40 m
+            const double worldPeak =
+                peak * static_cast<double>(back.desc.maxHeight);
+            char buf[240];
+            std::snprintf(buf, sizeof(buf),
+                          "ok=%d rescaled=%d peak=%.4f maxH=%.3f worldPeak=%.2f "
+                          "err=%s",
+                          rl ? 1 : 0, back.rescaled ? 1 : 0, peak,
+                          static_cast<double>(back.desc.maxHeight), worldPeak,
+                          rerr.c_str());
+            check("E4b 越界资产不再被硬拒（rescaled=true）",
+                  rl && back.rescaled, buf);
+            check("E4c 救援后峰值收敛到 1.0（磁盘契约可满足）",
+                  rl && peak <= 1.0 + 1.0e-5, buf);
+            check("E4d 救援后世界峰值仍是 8x5 = 40 m（地形没变形）",
+                  rl && std::fabs(worldPeak - 40.0) < 0.05, buf);
+        }
+        std::error_code ec;
+        fs::remove_all(tmp.parent_path(), ec);
     }
 
     char summary[96];

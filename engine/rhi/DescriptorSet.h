@@ -30,8 +30,21 @@ public:
     DescriptorAllocator(const DescriptorAllocator&) = delete;
     DescriptorAllocator& operator=(const DescriptorAllocator&) = delete;
 
+    // 返回**当前**（最后创建、还有余量的那个）池。
+    // ⚠ 2026-10-22 起它不再等于"唯一的池"：见下面 m_pools 的说明。
     VkDescriptorPool pool() const { return m_pool; }
 
+    // 分配一个 set。**池满会自动扩容**，不会因为"估算小了"直接抛异常。
+    //
+    // 为什么要有扩容（2026-10-22 用户报障）：
+    //   构造参数里的 maxSets / 各类型 descriptorCount 全是**估算**（"这个
+    //   pass 一般最多几张图"）。估小了的时候，原来的实现让
+    //   vkAllocateDescriptorSets 返回 VK_ERROR_OUT_OF_POOL_MEMORY
+    //   (-1000069000)，VK_CHECK 直接 throw → 整个进程 `Fatal`。
+    //   实测触发点：`TerrainPass` 的池按 **4 块地形** 写死（4 sets /
+    //   44 samplers = 4×11），场景里放第 5 块地形就炸 —— 而"池里还有没有
+    //   位置"和用户做的事（多放一块地形）之间没有任何可见联系。
+    //   容量估算错误应该是**性能问题**（多建一个池），不该是**崩溃**。
     VkDescriptorSet allocate(VkDescriptorSetLayout layout);
 
     void writeBuffer(VkDescriptorSet set, uint32_t binding, VkBuffer buffer,
@@ -61,8 +74,22 @@ public:
                            VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL);
 
 private:
+    // 追加一个**同规格**的池（构造参数原样复用），并把它设为当前池。
+    // 失败返回 false（设备没了 / 分配器都不行）。
+    bool addPool();
+
     Device& m_device;
+    // **当前**池：allocate 打到它上面。池满时 addPool() 换新的。
     VkDescriptorPool m_pool = VK_NULL_HANDLE;
+    // 池链：**所有**池都要留着（池里还有活着的 set，销毁任何一个都会让那
+    // 些 set 失效），析构时一次性销毁 —— 这也顺带保证"每个 set 都属于
+    // 某个我们负责销毁的池"。
+    std::vector<VkDescriptorPool> m_pools;
+    // 构造参数的留底（扩容要原样复用）
+    VkDescriptorPoolSize m_sizes[4]{};
+    uint32_t m_sizeCount = 0;
+    uint32_t m_maxSets = 0;
+    VkDescriptorPoolCreateFlags m_flags = 0;
 };
 
 // 便捷：创建单个 set layout

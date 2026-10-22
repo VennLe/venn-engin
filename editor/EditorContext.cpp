@@ -14,6 +14,78 @@
 
 namespace editor {
 
+namespace {
+
+// ============================================================
+// 出生点（P5，2026-10-22）
+// ============================================================
+// 用户原话："角色初始化的位置为什么不是 GameStart 的位置，GameStart 只是
+// 视口里的标记作用，当游戏启动运行的时候，这个标记就要消失，然后创建的角色
+// 放在这个位置。"
+//
+// 语义上的分界很清楚：
+//   · **编辑态**：Player 实体摆在哪儿只是"看着方便"，GameStart 才是出生点；
+//   · **运行态**：Player 必须出生在 GameStart 上（与 Game.exe 的
+//     `spawnPlayerFromGameStart` 同一条规则）。
+//
+// 以前 Play 直接复制编辑态场景，于是"摆了一个 Player 在原点、GameStart 在
+// 山坡上"时，一按 Play 角色出现在原点 —— 而屏幕上那个 GameStart 标记看起来
+// 才是它该出现的地方，于是就是"角色没生在出生点"。
+//
+// 返回 false = 没有玩家实体，或者场景里没有启用的出生点（老场景）→ 一个
+// 字节都不动，行为与之前完全一致。
+bool placePlayerAtGameStart(scene::Scene& scene) {
+    ecs::World& w = scene.world();
+
+    ecs::Entity player;
+    w.each<ecs::CharacterControllerComponent>(
+        [&](ecs::Entity e, ecs::CharacterControllerComponent& cc) {
+            if (!player.valid() && cc.enabled) player = e;
+        });
+    if (!player.valid()) return false;
+
+    glm::vec3 feet(0.0f);
+    float yaw = 0.0f;
+    bool found = false;
+    w.each<ecs::GameStartComponent>(
+        [&](ecs::Entity e, ecs::GameStartComponent& g) {
+            if (found || !g.enabled) return;
+            const auto* tf = w.get<ecs::TransformComponent>(e);
+            if (!tf) return;
+            feet = tf->position;
+            yaw = tf->rotation.z + g.yaw;
+            found = true;
+        });
+    if (!found) return false;
+
+    if (auto* tc = w.get<ecs::TransformComponent>(player)) {
+        tc->position = feet;
+        tc->rotation = glm::vec3(0.0f, 0.0f, yaw);
+    }
+    // 胶囊中心与 `PlayerController::attach` 同一口径：脚底 + (半高 + 半径)。
+    if (auto* cc = w.get<ecs::CharacterControllerComponent>(player)) {
+        cc->bodyYaw = yaw;
+        cc->position =
+            feet + glm::vec3(0.0f, 0.0f, cc->halfHeight + cc->radius);
+    }
+    // 玩家的"起步"状态要清掉：出生点变了，上一轮 Play 残留的 started
+    // 会让起步动画/冲刺惯性直接跳过。
+    if (auto* pc = w.get<ecs::PlayerComponent>(player)) {
+        pc->started = false;
+        pc->walkPhase = 0.0f;
+        // 跳跃的竖直状态也要归零：上一轮 Play 若停在半空，不清的话这一轮
+        // 一进门就在下落（表现是"一按 Play 人就往下掉"）。
+        pc->velocityZ = 0.0f;
+        pc->onGround = true;
+    }
+    VK_LOG_INFO("EDIT-PLAYER-SPAWN at GameStart pos=(%.2f,%.2f,%.2f) yaw=%.3f",
+                static_cast<double>(feet.x), static_cast<double>(feet.y),
+                static_cast<double>(feet.z), static_cast<double>(yaw));
+    return true;
+}
+
+} // namespace
+
 EditorContext::EditorContext(assets::AssetManager& assets) : m_assets(assets) {
     // MYVK_GRID=0：连默认值一起关掉地平面栅格。
     // 用途是做像素级回归对比 —— 栅格是有抗锯齿的细线，任何一度视角变化
@@ -149,6 +221,11 @@ void EditorContext::play() {
         setStatus(TR("Play failed: ") + loaded.error);
         return;
     }
+
+    // ---- 出生点（P5）：玩家以 GameStart 为准，不是编辑态摆的位置 ----
+    // 放在相机设置之前：玩家的位置决定相机的注视点，反过来的话第一帧会
+    // 从旧位置"飞"到出生点。
+    placePlayerAtGameStart(m_runtimeScene);
 
     // 相机状态随快照一起复制过来，所以按下 Play 的瞬间画面与编辑画面连续。
     // 切成自由飞行：游戏视角是第一人称式的（转自己），不是绕着目标点打转。

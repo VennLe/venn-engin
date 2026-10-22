@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -124,6 +125,35 @@ def main():
         p = os.path.join(os.path.dirname(vpath), f)
         got = os.path.getsize(p) if os.path.isfile(p) else -1
         check("%s 尺寸正确" % f, got == expect, "%d / 期望 %d" % (got, expect))
+
+    # ---- 出生点处地表高度 == 0（2026-10-22 第十轮）----
+    #
+    # ⚠⚠ 这是"新工程一进来玩家陷进土里 3.35 m"那个 bug 的**回归哨**。
+    #   当时的成因是归一化基准不一致：`terrain_height()` 把原点压平成 0，
+    #   而 `build_terrain_bytes()` 用**全局 min..max** 归一化，于是原点那个
+    #   0 被抬到 0.5578，乘 maxHeight 之后地面跑到 3.35 m —— 而 GameStart
+    #   写的是 z=0，人就直接站在土里了。
+    #   契约：**原点处的归一化值恰好是 0**，且 `maxHeight` 等于地形真正的
+    #   最高点（值域 [0, hi] 才自洽，否则坡度全都虚高）。
+    import struct as _struct
+    hp = os.path.join(os.path.dirname(vpath), vj.get("height", "height.r32"))
+    if os.path.isfile(hp):
+        n = cols * rows
+        with open(hp, "rb") as f:
+            hs = _struct.unpack("<%df" % n, f.read(4 * n))
+        mpp = vj.get("metersPerPixel", 0.0)
+        maxh = vj.get("maxHeight", 0.0)
+        # 与 C++ `physics::heightAt` 同源：世界原点 → 列主序纹素下标
+        oc = int(round((0.0 - (-0.5 * (cols - 1) * mpp)) / mpp))
+        orow = int(round((0.0 - (-0.5 * (rows - 1) * mpp)) / mpp))
+        h0 = hs[oc * rows + orow] * maxh
+        check("出生点 (0,0) 处地表高度 == 0（玩家不会陷进地面）",
+              abs(h0) < 1e-3, "%.4f m（maxHeight=%.4f）" % (h0, maxh))
+        check("高度值域真的落在 [0, 1]", min(hs) >= -1e-6 and max(hs) <= 1.0 + 1e-6,
+              "min=%.4f max=%.4f" % (min(hs), max(hs)))
+        check("归一化最高点 == 1.0（maxHeight 是实测峰值，不是硬编码常量）",
+              abs(max(hs) - 1.0) < 1e-3,
+              "最高纹素=%.6f" % max(hs))
 
     layers = vj.get("layers", [])
     check("4 层都指向同一材质", len(layers) == 4 and len(set(layers)) == 1,

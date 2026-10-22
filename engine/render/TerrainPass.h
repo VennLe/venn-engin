@@ -188,6 +188,8 @@ private:
 
 // 一个地形实体在 GPU 上的全部资源
 struct TerrainPass::Instance {
+    ~Instance();
+
     terrain::TerrainAsset asset;
     std::vector<terrain::TerrainChunk> chunks;
     glm::mat4 model{1.0f};
@@ -210,6 +212,8 @@ struct TerrainPass::Instance {
     // 没挖过洞的资产由 loadTerrain 填 255 生成一张全白图，
     // 这样片元着色器里只有一条无条件采样 + 比较，没有"有没有洞图"的分支。
     std::unique_ptr<rhi::Image> holeImage;
+    // 设备句柄：**只为析构那 3 个裸 sampler 而存**（见 ~Instance 的说明）。
+    VkDevice device = VK_NULL_HANDLE;
     VkSampler heightSampler = VK_NULL_HANDLE;
     VkSampler splatSampler = VK_NULL_HANDLE;
     VkSampler holeSampler = VK_NULL_HANDLE;

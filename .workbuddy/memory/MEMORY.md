@@ -159,3 +159,71 @@ indexing 可用** —— 但**低端设备只保证 8** → 加纹理槽走 **bi
 - ⚠ flaky：`bvh`/`csm`/`ibl` 偶发全红（单跑 PASS）→ **别补跑"凑干净"**（判据见
   `ship_roadmap.md`「全量回归基线」）。10-21 起 `primitive/material_roundtrip` 因**面板
   docking 重构**漂移（rect 落到窗口外）→ 修布局，别改期望。
+- **资产链阶段六/七 ✅（2026-10-22）**：`assetio/`（共享格式层，只依赖 glm+ufbx）+
+  `assetc/`（离线 `AssetC.exe`）+ `engine/assets/VMeshLoader.cpp`，文档 `docs/fbx_asset_pipeline.md`。
+  实测 girl：顶点 43808→11338、ACMR 2.000→0.781、关键帧 7812→651（≤0.1°）、1.01 MB（3.55x）、
+  加载 43→14~16 ms。**未做**：贴图内嵌(BC7/ASTC)、量化、6.3~6.6（理由见文档 §7）。
+
+## 资产链（阶段六/七）的坑
+- ⚠⚠ **新增顶层目录必须进 `WATCH_ROOTS`**，否则影响分析里**完全看不见**（`assetio/`、`assetc/`
+  差点又踩 runtime/launcher 那个老坑）。`engine/assets/**` 是横切 → `verify_vmesh` 只登记
+  `assetio/**`+`assetc/**`，写横切文件会被 `check_regression_map` 判成假跳过。
+- ⚠⚠ **"写了容错分支" ≠ "容错生效"**：`Texture::fromFile` 打不开就 `throw`，于是
+  `VMeshLoader` 里 `if (!albedo) WARN("VMESH-TEX-MISSING")` 是**不可达死代码** ——
+  真实行为是**整模型加载失败**。修法：`AssetManager::tryLoadTexture()`（catch→nullptr），
+  FBX/vmesh 两条路的资产期贴图全走它。凡"上游会抛"的分支都要问一句"这行跑得到吗"。
+- ⚠ **造"缺贴图"现场**：不要造带贴图的 FBX（要 Blender），而是拿烤好的 `.vmesh` 把每条材质的
+  `albedoPath`/`albedoRaw` 下标改成**它自己的名字**，再**重算 MAT 区块 CRC32** —— 文件必须
+  仍**合法**（用损坏文件测到的是 `MESH-BIN-FALLBACK`，另一条分支）。
+- `.vmesh` 布局：头 32B / 区块表 32B 一条 / 子网格目录**定长 112B** / MAT 每条 **60B** /
+  STR 是 `u32 len + bytes`；CRC32 与 `zlib.crc32` 同构（seed=0）。
+- ⚠ **已知红（与资产链无关，未修）**：`verify_character_import` 的「点完之后 Animator 段出现」
+  连红 3 次（`InspectorPanel.cpp` 无改动、日志 0 条贴图消息、`verify_add_menu` 的点击正常）→
+  疑似 Add Animator 按钮落在裁剪区外/需滚动，留到 A2 轮查。
+
+## 外部模型 → 可玩角色（2026-10-22）
+文档 `docs/external_model_pipeline.md`（格式看 `fbx_asset_pipeline.md`，这份管
+"进场景之后"）。一条命令：`AssetC --strip-skin --autorig --procanim in.vmesh -o out.vmesh`；
+运行时用 `assets/game.json` 的 `player` 块或 `MYVK_RUNTIME_PLAYER_MODEL/_CLIP`。
+
+- **世界 = 米 / Z-up**，玩家胶囊 1.8 m。模型 pivot 在**几何中心**，玩家位置语义是
+  **脚** → 挂模型必须 `lift = -boundsMin.z`。`AssetC --info` 打 `size=`/`world=`。
+- **绑模型走 `scene::instantiateModel`**（每个 submesh 一个 `MeshComponent`）：
+  只挂 `SkinnedMeshComponent` 连绘制项都不生成。玩家实体还必须挂
+  **`CameraComponent`**，否则 `CameraSystem::selectActive` 直接 return（症状：人走、
+  镜头钉住）。
+- **`AutoRig`**：23 根 Mixamo 骨，比例表定 z、薄层顶点质心定 xy；权重 `1/d⁴` +
+  左右闸门 + 前 4 归一化。对原厂骨架误差 13 mm。
+- **`ProcAnim`**：关键姿势表 + smoothstep（**不要正弦叠加** —— 膝盖最大弯曲会落在
+  腿最后方 = 驴踢）。判"倒着走"用**摆动相平均前向速度**（前向位移范围是对称量）。
+  手臂 `armDown=80°`（72° 剩 18° 外张，斜后上方看像张开翅膀）。
+- 验收：`verify_model_scale` / `verify_player_character` / `verify_autorig` /
+  `verify_procanim`，全部已进 `run_regression.py` + `check_regression_map.py`。
+- ⚠⚠ **`desc.maxSpeed` 会截断冲刺**（`speed=maxSpeed×sprintMultiplier` 被截回走路
+  速度）→ sprint 是摆设。物理层上限要留冲刺余量（`physicsMaxSpeed()`）。
+- ⚠⚠ **`PostMessage` 合成的 Shift 会被 GLFW 当场撤销**（`glfwPollEvents` 末尾用
+  `GetKeyState` 复核物理键状态，不是真按下就强制 release）。**修饰键必须
+  `keybd_event` + 先 `SetForegroundWindow`**；测试开头要清修饰键残留，否则
+  "开局就按着冲刺"，日志里凭空冒出 run。
+
+## 渲染资源生命周期（2026-10-22，编辑器闪退后补）
+文档 `docs/render_resource_lifetime.md`。**铁律：一条命令缓冲在 recording
+状态时，它引用过的对象都不能销毁** —— 违反的后果不是画错一帧，而是整条 CB
+当场作废（`vkCmdXxx ... invalid state ... was destroyed` 刷屏）→
+`vkQueueSubmit` 返回 -4 (DEVICE_LOST) → `Fatal: Vulkan call failed` 退出。
+
+- **读日志只读第一条 `invalid state`**：它点名的对象才是被销毁的；后面几十条
+  是回声，排在最后的 `TERRAIN-LAYER-TEX-FAIL` 之类往往是余波（设备丢了之后
+  随便哪个 VK_CHECK 都抛）。**别从后往前读。**
+- **`uploadSceneState()` 的三个调用方不是一类东西**：相机/蒙皮/绘制列表是
+  逐场景的（离屏目标也要做）；`syncTerrains` / `syncWaters` 是**全局唯一实例
+  集**，键是主场景实体 → **只对主场景做**。判据用 `offscreenSlot < 0`
+  （`-1` = 主链 UBO = 主场景；预览/探针面都带槽）。**别用 `resetSkinning`**
+  当判据，它已被"统计口径"占着。
+- ⚠ 症状对照：新建 third_person 工程（含 Terrain）→ Shift+A ▸ Player ▸
+  Third-Person Player → 角色窗口那一帧必崩。修前 `TERRAIN-LOAD=2` +
+  8 条 TEX-FAIL + exit=1；修后 `TERRAIN-INSTANCE=1 TERRAIN-LOAD=1` 且 0 错误。
+- 验收 `tools/verify_preview_terrain.py`（8 条，已做反向验证确保不是永远绿）。
+  **这条用例必须带地形**：空场景下 `same` 恒真，再坏也抓不到。
+- 另一个 -4 的来路：**逐帧重建 → 单次提交超 Windows TDR 2 秒 → 驱动重置**。
+  任何"每帧比对、不一致就重建"的写法都要先问判据会不会恒为"不一致"。

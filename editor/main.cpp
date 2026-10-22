@@ -28,6 +28,7 @@
 
 #include "core/Logger.h"
 #include "animation/AnimationSelfTest.h"
+#include "assets/AssetSelfTest.h"
 #include "physics/PhysicsSelfTest.h"
 #include "project/ProjectFile.h"
 #include "render/RenderSettingsIO.h"
@@ -81,6 +82,16 @@ int main(int argc, char** argv) {
         // Renderer 里、必须开 GUI 才能验证。见 animation/AnimationSelfTest.h。
         if (std::getenv("MYVK_ANIM_TEST") != nullptr) {
             const int failures = animation::runAnimationSelfTest();
+            return failures == 0 ? 0 : 1;
+        }
+
+        // 离线资产链自检（.vmesh）：FBX 导入 → 几何修正 → 写盘 → 读盘
+        // → 语义等价，外加"坏文件必须被拒"。同样是纯 CPU、不建设备。
+        // 为什么挂在 Editor 上而不是 AssetC 上：AssetC 是**工具**，
+        // 工具自己的自检不该成为回归入口（它可能根本没被构建）；
+        // 而这条链的正确性直接影响渲染，应该跟着应用一起被验证。
+        if (std::getenv("MYVK_ASSET_TEST") != nullptr) {
+            const int failures = assets::runAssetSelfTest();
             return failures == 0 ? 0 : 1;
         }
 

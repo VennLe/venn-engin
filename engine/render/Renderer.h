@@ -109,6 +109,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -648,6 +649,19 @@ public:
     GridSettings& gridSettings() { return m_grid; }
     const GridSettings& gridSettings() const { return m_grid; }
 
+    // ---- 预览目标（角色窗口）的栅格 ----
+    //
+    // 与主视口**各自一份参数**是必须的：主视口是 500 m 见方的世界栅格
+    // （格距 1 m / 10 m），角色预览是个 2 m 高的特写 —— 用同一份参数时
+    // 屏幕上要么一条线也看不见，要么整片糊成灰。两边共用一个开关也不行：
+    // 关掉主视口栅格不该顺手把预览里的地面抹掉。
+    //
+    // 默认开：用户要的是"预览里有栅格地面"（2026-10-22）。
+    bool& previewGridEnabled() { return m_previewGridEnabled; }
+    bool previewGridEnabled() const { return m_previewGridEnabled; }
+    GridSettings& previewGridSettings() { return m_previewGrid; }
+    const GridSettings& previewGridSettings() const { return m_previewGrid; }
+
     // 是否启用了阴影（ImGui 上做显示用）
     bool shadowEnabled() const { return m_shadowPass != nullptr; }
 
@@ -903,6 +917,13 @@ private:
     // offscreenSlot >= 0 时把相机 UBO 写进"该离屏目标的本帧槽"而不是
     // 主链 UBO（见 FrameResources::OffscreenUbo 的注释），并把本场景要用的
     // set 0 记进 m_sceneGlobalSet 供紧随其后的 recordSceneInto 使用。
+    //
+    // ⚠ offscreenSlot < 0 == **主场景**：地形/水体实例的对齐（syncTerrains /
+    //   syncWaters）只对主场景做。那两套实例是全局唯一的，键是主场景里的
+    //   实体；离屏目标带的是另一个场景（通常没有地形），在那里对齐会被
+    //   判成"集合变了"→ 全量重建 → 在**录制途中**销毁主场景地形/水体的
+    //   buffer 与 sampler（它们已经绑在这条命令缓冲上）→ CB 失效 →
+    //   vkQueueSubmit 返回 DEVICE_LOST。详见 syncTerrains 调用点的注释。
     void uploadSceneState(scene::Scene& scene, VkExtent2D extent,
                           bool resetSkinning,
                           const scene::Camera* camOverride = nullptr,
@@ -1058,9 +1079,28 @@ private:
     // 独立管线 + 自己的一套 set（见 render/TerrainPass.h 的文件头）。
     // 每帧在前向 Pass 内、不透明几何之后录制。
     std::unique_ptr<TerrainPass> m_terrain;
-    // 本帧有地形组件的实体（按遍历顺序），实例与它一一对应。
-    // 集合变化时整批重建（地形是"关卡级"资源，不是每帧变动的东西）。
+    // 本帧**成功**建出实例的地形实体（按遍历顺序），与 TerrainPass 的
+    // instanceAt(i) 一一对应。**只装成功的** —— 失败的不 push，否则下标就
+    // 和实例错位了。
     std::vector<std::uint32_t> m_terrainEntities;
+
+    // 上次同步时**请求过的**地形全集（含创建失败的），(entity, source)。
+    //
+    // 判据必须用它，不能用 m_terrainEntities。后者只装成功的，一旦有一个
+    // 实体建失败，`items.size() == m_terrainEntities.size()` 就永远不成立
+    // → 每一帧都 clearInstances()（waitIdle + 销毁 sampler + 重建 + 重传
+    // 3 MB 顶点）→ 单帧耗时冲破 Windows TDR 的 2 秒上限 → 驱动重置 →
+    // `vkQueueSubmit` 返回 VK_ERROR_DEVICE_LOST(-4)。
+    // 2026-10-22 第十一轮的真实现场：抬山保存后资产值域越界，地形建不出来，
+    // 于是"打不开的资产"变成了"整个编辑器被 GPU 丢掉"。
+    std::vector<std::pair<std::uint32_t, std::string>> m_terrainRequested;
+
+    // 上一次同步里有实体创建失败。置位后不再逐帧重试，而是每
+    // `kTerrainRetryFrames` 帧才放行一次重建 —— 用户可能已经把资产修好了
+    // （比如换掉坏的 height.r32 / 重新生成），得留一条自动恢复的路。
+    bool m_terrainDegraded = false;
+    int m_terrainRetryTick = 0;
+
     uint64_t m_terrainTriangles = 0;
     // 这些私有方法在 private 区，公开的 terrainCount 要用它们的结果
     void syncTerrains(scene::Scene& scene);
@@ -1598,6 +1638,9 @@ private:
     // 地平面栅格（编辑器每帧写 gridEnabled；默认关）
     bool m_gridEnabled = false;
     GridSettings m_grid;
+    // 预览目标（角色窗口）的栅格 —— 参数见 previewGridSettings() 的注释。
+    bool m_previewGridEnabled = true;
+    GridSettings m_previewGrid;
 
     // ---- 编辑器视口（0,0 = 关闭；尺寸/纹理都在 m_targets[0] 里）----
     uint32_t m_viewportWidth = 0;

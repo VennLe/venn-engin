@@ -93,6 +93,67 @@ private:
     void drawTransportBar();     // 底部播放条（播放 / 循环 / 速度 / 时间轴）
     void drawDetailsPanel();     // 右栏 Details
 
+    // ---- 预览视口的叠加层（2026-10-22）----
+    //
+    // 画在 ImGui 的 draw list 上、压在那张离屏图之上。为什么这几样不做成
+    // 场景里的实体：
+    //   · **胶囊**要"隔着模型也能看清"——实体渲染会被角色自己挡住，
+    //     而 UE 的胶囊线框也是叠加层。半透明线框既是这个行业习惯，也免了
+    //     透明排序那一堆事。
+    //   · **gizmo** 同理：坐标轴必须永远在物体前面（选中时你要能看见它）。
+    //   · 两者的代价都只是一次投影，不碰渲染管线。
+    void drawPreviewOverlay(const ImVec2& imgMin, const ImVec2& imgSz);
+    // 预览下方那条"选中对象"控件（位置 / 旋转 / 大小）
+    void drawPreviewTransformStrip();
+
+    // 预览里的选中对象
+    enum class PreviewPick : int { None = 0, Model, Capsule };
+    PreviewPick m_pick = PreviewPick::None;
+
+    // 预览里的胶囊参数（与"生成骨骼绑定"写进玩家的那组是同一份来源）。
+    // 默认按人形身高 1.8 m 的解剖比例：r = 0.16h、总高 = h。
+    float m_capsuleRadius = 0.29f;
+    float m_capsuleHalfHeight = 0.61f;
+    // 胶囊在预览里的位置（**脚底**，与玩家实体同一口径）。默认原点 ——
+    // 模型也是从原点站着，于是"胶囊套住人"这件事一眼可查。
+    glm::vec3 m_capsulePos{0.0f, 0.0f, 0.0f};
+    // 胶囊绕自身轴的旋转。线框看不出差别（旋转对称），但控件必须有这一项 ——
+    // 用户要的是"位置 / 旋转 / 大小"三个自由度都在，缺一个会以为是没做完。
+    float m_capsuleYawDeg = 0.0f;
+    bool m_showCapsule = true;
+    bool m_showGizmo = true;
+
+    // 预览视口在屏幕上的矩形（overlay 与点选都要用；由
+    // drawPreviewViewport 每帧写）。
+    ImVec2 m_vpMin{0.0f, 0.0f};
+    ImVec2 m_vpSize{0.0f, 0.0f};
+
+    // 胶囊**在屏幕上**的样子：中轴两端（两个球心的屏幕坐标）+ 半径（像素）。
+    // 每帧由 drawPreviewViewport 投影一次，点选直接拿它算"鼠标离线框多远"。
+    //
+    // 为什么不能用射线-AABB 取更近：胶囊天生比人**粗**（r = 0.16h，人正面的
+    // 厚度只有 ±0.18 m），相机从正面看过来永远先撞上胶囊的 AABB —— 模型就
+    // 再也点不中了。实测就是这个现象：点身体中心选到胶囊，点脚底选到模型。
+    // 改成"点线框选胶囊、点身体选模型"之后两者都点得到，而且和画面一致
+    // （看得见的那圈线就是能点的那个东西）。
+    ImVec2 m_capScrA{0.0f, 0.0f};
+    ImVec2 m_capScrB{0.0f, 0.0f};
+    // 中轴 → 右母线 的屏幕偏移（像素）。透视下方向不一定水平，所以不能
+    // 用"往左挪 r 个像素"当左母线 —— 相机一偏航就点空了。
+    ImVec2 m_capScrOff{0.0f, 0.0f};
+    float m_capScrR = 0.0f;
+    bool m_capScrValid = false;
+
+    // 胶囊线框**实际画出来的每一段**（屏幕坐标，成对存：p0,p1,p2,p3…）。
+    // 由 drawPreviewOverlay 在画的时候顺手记下来，点选就量"鼠标到这串
+    // 线段的最短距离"。
+    //
+    // 为什么不用"到中轴的垂距 ≈ r"：胶囊的 X 轴投影是斜的（默认机位下
+    // off=(37,29)，垂距只有 37 px 而不是 47 px），于是线框的真实位置和
+    // "中轴 ± r" 差 10 px —— 点在线上了却判定 12 px 远，选不中。画什么
+    // 就量什么，是唯一不会漂的做法。
+    std::vector<ImVec2> m_capScrSegs;
+
     // 预览相机导航（右键转视角、滚轮推拉、中键平移）
     void handlePreviewNavigation(const glm::vec2& vpPos,
                                  const glm::vec2& vpSize, bool hovered);
@@ -103,6 +164,16 @@ private:
 
     // 选一个动画 clip 并开始预览播放
     void playClip(const std::string& clipName);
+
+    // ---- 动画键盘映射（P4，2026-10-22）----
+    // 把某个 clip 绑到某个键上，写进**玩家实体**的 `AnimKeyMapComponent`
+    // （跟着角色存盘，不是编辑器偏好 —— 理由见 Components.h 那个组件的注释）。
+    void bindClipKey(const std::string& clip, int key);
+    void unbindClipKey(const std::string& clip);
+    // 该 clip 现在绑在哪个键上（GLFW 键码）；0 = 没绑。
+    int clipKey(const std::string& clip) const;
+    // "等按键"状态：非空 = 下一帧抓到的第一个键就绑给这段 clip。
+    std::string m_captureClip;
 
     // 生成骨骼绑定：蒙皮组件 + 按模型尺寸算胶囊 + 相机眼高（写主场景）
     void generateSkeletonBinding();

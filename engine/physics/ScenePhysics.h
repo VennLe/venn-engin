@@ -35,11 +35,13 @@
 // ============================================================
 
 #include "ecs/Entity.h"
+#include "physics/Heightfield.h"
 #include "physics/PhysicsWorld.h"
 
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 namespace scene {
 class Scene;
@@ -72,6 +74,22 @@ struct SceneBinding {
     int materials = 0;
     bool ground = false;    // 是否加了无限地面
     bool enabled = false;   // 场景开关（或覆盖后）的最终值
+
+    // ---- 地形（第十轮）----
+    // 场景里的 `TerrainComponent` 会被读成一份 CPU 高度场交给物理世界，
+    // 于是地形是**真的地面**（刚体与角色都停在上面，不会陷进去）。
+    //
+    // ⚠ 为什么高度单独拷一份 `vector` 而不是留着 `terrain::TerrainAsset`：
+    //   · 那会把 `terrain/` 拖进 `ScenePhysics.h`（本头文件是物理的公共面，
+    //     不该为了一个成员引入上层模块的头）；
+    //   · `TerrainAsset::heights` 是 `vector`，内部指针不随对象移动而变，
+    //     但**`Heightfield` 这个结构体本身**会随 `SceneBinding` 一起被移动
+    //     ——`buildSceneWorld` 是按值返回的。所以 `Heightfield` 必须放在
+    //     `unique_ptr` 里（堆上地址稳定），否则 `PhysicsWorld::m_terrain`
+    //     立刻悬垂。
+    std::vector<float> terrainHeights;      // 列主序，原样拷贝
+    std::unique_ptr<Heightfield> terrainHf;  // 指向上面那块内存
+    int terrains = 0;       // 场景里的地形数（>1 时只用了第一块）
 };
 
 // 场景 → 物理世界。

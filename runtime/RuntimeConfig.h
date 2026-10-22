@@ -57,6 +57,68 @@ struct RuntimeConfig {
     std::string language = "en";
     std::string quality = "high";
 
+    // ---- 玩家外观（P1：把第三方角色模型绑到第三人称玩家上）----
+    //
+    // 出厂（空 model）= 现在这个胶囊占位体，行为与引入本块之前**逐位相同**。
+    //
+    // 为什么放在 game.json 而不是场景里：玩家实体是**运行时产物**
+    // （见 RuntimeApp.cpp 的 spawnPlayerFromGameStart —— 出生点只标位置，
+    // 存盘里没有玩家）。既然实体不落盘，它的外观就没有地方可写；而
+    // "这个游戏的主角长什么样"本来就是**出厂设置**，不是关卡设置。
+    //
+    // 模型路径按资产根解析（与场景里 `kind: "fbx"` 的 path 同一套规则）。
+    // .vmesh 烤制版存在时优先用它（loadFBX 内部决定），没有就走原始 FBX。
+    struct PlayerVisual {
+        std::string model;          // 空 = 胶囊占位体
+        std::string clip;           // 空 = 模型的第一段 clip
+        // 按模型高度反推胶囊 / 眼高（与编辑器 CharacterWindow 的
+        // generateSkeletonBinding 同一套解剖比例）。关掉 = 用下面的死值。
+        //
+        // ⚠ 这是"1:1 真实尺度"的保证点：胶囊**跟着模型走**，不是让模型
+        //   去迁就 1.8 m 的默认胶囊 —— 否则换个 2.05 m 的角色，模型会跟
+        //   地面的接触点错位（脚陷进去或悬空）。
+        bool fitBody = true;
+        // fitBody=false 时用的死值（米）。与 CharacterController 的默认一致。
+        float radius = 0.35f;
+        float halfHeight = 0.55f;
+
+        // 四段基础动画的 clip 名（P3：程序化生成的那四段）。
+        // 空 = 该状态不切 clip（保持 defaultClip 一直播）。
+        // ⚠ 名字对不上时**不报错也不沉默**：切不过去会打一行
+        //   `GAME-ANIM-MISSING`，因为"模型在动但动的是走路的季节"是最难
+        //   查的一类问题（姿势有、状态不对）。
+        std::string idleClip = "Idle";
+        std::string walkClip = "Walk";
+        std::string runClip = "Run";
+        std::string jumpClip = "Jump";
+        // 走 / 跑分界（m/s）：低于 walkSpeed 算 idle，高于 runSpeed 算 run。
+        // ⚠ runSpeed **默认 0 = 自动**（= 控制器 maxSpeed × 1.15）。只有
+        //   明确要做"小跑"这类中间档时才需要写死一个数。
+        float walkSpeed = 0.15f;
+        float runSpeed = 0.0f;
+        // 切 clip 时是否把播放头归零。true = 每步都从头迈（步伐清晰），
+        // false = 相位连续（不会每步"抖一下"，但停下再走会接在中间）。
+        bool restartOnSwitch = true;
+        // 静止多久重放一次 idle（秒）。0 = 关。
+        //
+        // 用户要求（2026-10-22）："停在原地如果不动长达 8 秒以上就触发
+        // idle 动画，此后如果一直没移动，则每隔 8 秒继续触发"。
+        // 语义见 `animation/Locomotion.h` —— 是**重放**（time 归零），
+        // 不是"等 8 秒才开始播"（那样人会在上一个姿势里僵 8 秒）。
+        float idleTriggerSec = 8.0f;
+
+        // 模型的"正面"补偿角（度，绕 Z）。见 `scene::ModelInstanceOptions::
+        // yawOffsetDeg` 的完整说明。
+        //
+        // 默认 **90**：本工程的主角是 Mixamo / FBX 来源（Y-up，正面朝 +Z），
+        // 经 ufbx 的 (x,-z,y) 映射后落在 **-Y**，而实体的 yaw 语义是
+        // "yaw=0 → 正面朝 +X"，所以差一个 +90°。
+        // 不补偿的症状是**横着平移**（人朝 -Y、往 +X 走），而不是"稍微歪"。
+        // 换成已经烤成 +X 正面的资产时，把它写 0。
+        float modelYaw = 90.0f;
+    };
+    PlayerVisual player;
+
     // ---- 音频（G14-5）----
     // 出厂默认来自 game.json 的 `audio` 块，可被 `MYVK_RUNTIME_AUDIO_*` 覆盖。
     //

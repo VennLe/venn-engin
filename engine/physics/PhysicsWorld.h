@@ -39,6 +39,7 @@
 
 #include "physics/Broadphase.h"
 #include "physics/Contact.h"
+#include "physics/Heightfield.h"
 #include "physics/Joints.h"
 #include "physics/RigidBody.h"
 #include "physics/Solver.h"
@@ -175,6 +176,25 @@ public:
                                 float radius, float halfHeight,
                                 BodyId ignore = kInvalidBody) const;
 
+    // ------------------------------------------------ 地形（高度场）
+    //
+    // 2026-10-22（第十轮）：让地形成为**真正的物理地面**。
+    //
+    // 传进来的指针**不拷贝**（和 `CharacterDesc::ground` 同一个约定）：
+    // 调用方负责让它活得比世界长 —— 见 `SceneBinding::terrainHf`，
+    // 那里用 `unique_ptr` 兜住了生命周期（`buildSceneWorld` 的返回值按值
+    // 移动，`unique_ptr` 指向的对象地址不会变，所以裸指针不会悬垂）。
+    //
+    // 传 nullptr = 关掉地形碰撞（行为与改动前逐位相同）。
+    //
+    // 实现上会**懒创建**一个"伪静态刚体"：求解器要求流形的 `bodyA` 是
+    // `bodies` 里的合法下标（它直接 `bodies[m.bodyA]`），所以地形必须有
+    // 一个逆质量为 0 的代表体。这个体放得很远、半径极小 —— 宽相配不到
+    // 任何东西，于是它**只**通过地形接触出场。
+    void setHeightfield(const Heightfield* hf);
+    const Heightfield* heightfield() const { return m_terrain; }
+    bool hasHeightfield() const { return m_terrain && m_terrain->valid(); }
+
     // ------------------------------------------------ 设置 / 统计
     PhysicsWorldSettings& settings() { return m_settings; }
     const PhysicsWorldSettings& settings() const { return m_settings; }
@@ -189,6 +209,9 @@ public:
 private:
     void updateAabbs();
     void collectContacts();
+    // 地形接触：不走宽相（它没有 AABB），每步 O(刚体数) 扫一遍。
+    // 只处理"会被推"的体（动态 + 醒着 + 不是触发器）。
+    void collectTerrainContacts();
     void wakeIslands();
     void updateSleep(float dt);
 
@@ -212,6 +235,10 @@ private:
 
     float m_accumulator = 0.0f;
     PhysicsStats m_stats;
+
+    // ---- 地形（见 setHeightfield）----
+    const Heightfield* m_terrain = nullptr;
+    std::uint32_t m_terrainBody = kInvalidBody;
 };
 
 } // namespace physics

@@ -49,4 +49,25 @@ std::unique_ptr<Model> loadFBXModel(rhi::Device& device,
                                     const std::string& path,
                                     const std::string& name);
 
+// ---- 自研二进制模型（`.vmesh`，见 assetio/MeshFormat.h）----
+//
+// 与 `loadFBXModel` 产出同一个 `assets::Model`，区别只在于**数据从哪来**：
+// 前者现场解析 FBX，后者直接 memcpy 烤好的字节。
+//
+// `vmeshAbsPath`  —— 实际要读的文件
+// `name`          —— 模型键（AssetManager 缓存 + 材质 id 的基名）
+// `sourceRelPath` —— 写进 `MeshSource::path` 的**源**路径（.fbx），
+//                    用于场景存盘往返；不是 .vmesh 路径。
+std::unique_ptr<Model> loadVMeshModel(rhi::Device& device,
+                                      rhi::CommandPool& cmdPool,
+                                      const TextureContext& ctx,
+                                      AssetManager& assets,
+                                      const std::string& vmeshAbsPath,
+                                      const std::string& name,
+                                      const std::string& sourceRelPath);
+
+// `.vmesh` 是否存在且不比源文件旧（源文件改了就该回去重烤）。
+// 这条判据是"改了 FBX 但画面没变"这类问题的唯一出口，别删。
+bool vmeshIsFresh(const std::string& sourcePath, const std::string& vmeshPath);
+
 } // namespace assets

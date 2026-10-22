@@ -4,10 +4,21 @@
 > 这是"补齐一条 3D 游戏链路"系列的**第一篇**（后续：音频、游戏 UI、存档与 GUID、打包各独立成篇）。
 > 所有结论都对着磁盘代码核过，行号是 2026-10-18 的版本。
 >
-> **进度**：**A0 ✅（2026-10-18）/ A1 ✅（2026-10-19）** → 下一项 **A2 状态机 + crossfade**。
+> **进度**：**A0 ✅（2026-10-18）/ A1 ✅（2026-10-19）/ A2a ✅（2026-10-22）/
+> A2b ✅（crossfade，2026-10-22）** → 下一项 **A3 层与遮罩**。
 > A1 的落地记录在 §2.y（含两轮否定测试的实测结果）。
+> A2a 的落地记录在 §A2 开头（硬切版移动状态机 + 默认角色 + 按键映射）。
+> A2b 只补了 crossfade（0.2 s smoothstep，双采样混合），**没有**做 `.anim.json`
+> 控制器资产 —— 那一项并进 A3 一起做（都要"多层/多状态"，一次画完 UI）。
+> 运行时侧的手感修复（脚陷地 / 出生点 / 鼠标两态 / 朝向补偿）
+> 见 `docs/player_feel.md`。
+> **P6（2026-10-22）** 又补了 A2 的两处短板 + A7 的预览视口：Jump 动画重写成
+> "双脚离地"、跳跃改成 0.70 m / 0.75 s 的真实抛物线、接触窗口按一帧位移扫掠
+> （脚不再陷进地形）、角色面板预览能真的播动画并带栅格/gizmo/可选胶囊。
+> **不改上面这个进度指针**（A2 早就 ✅，A3 仍是下一项）——
+> 详见 `docs/player_controls.md`。
 > ⚠ 下面 §0 的 D0~D8 是**动手前的诊断快照**：D0/D1/D2/D3/D6/D7/D8 都已被 A0/A1 修掉，
-> 保留它是为了回答"当初为什么要这么排"。**当前**未修的是 D4/D5（混合 / 分层 / 驱动层 = A2~A6）。
+> 保留它是为了回答"当初为什么要这么排"。**当前**未修的是 D4/D5（分层 / 驱动层 = A3~A6）。
 
 ---
 
@@ -501,6 +512,27 @@ A1 新增 11 条数值断言（全部 PASS，ANIM-TOTAL pass=27 fail=0）
 
 ### A2 · 状态机 + crossfade（G11，`XL`）
 
+> **A2a ✅ 已完成（2026-10-22，P4）**：先落了**硬切**的移动状态机 + 默认角色资产 +
+> 按键映射。
+> **A2b ✅ 已完成（2026-10-22，P5）**：crossfade 接上了 —— `Pose` / `blendPose`
+> 是 A0-5 就备好的底座，`AnimatorSystem` 加了双采样 + smoothstep 权重。
+> 用法与设计见 `docs/character_locomotion.md` + `docs/player_feel.md`，
+> 代码在 `engine/animation/Locomotion.*` 与 `engine/animation/AnimatorSystem.*`。
+> **仍未做**：`.anim.json` 控制器资产（并进 A3）。
+>
+> A2a 与本节规划的三处**有意偏离**（都是为了先把手感跑通、再谈过渡）：
+> 1. **没有参数表**：状态由**物理真值**判（水平速度 / 是否贴地），不由输入轴判。
+>    输入轴判的经典 bug 是"按着 W 撞墙"→ 人在原地蹬腿；物理真值天然免疫。
+> 2. **没有控制器资产**：`LocomotionConfig` 是 C++ 结构体，字段来自
+>    `RuntimeConfig::PlayerVisual`（Game.exe）与硬编码默认（编辑器 Play）。
+>    等 A2b 做 `.anim.json` 时再把它读进来。
+> 3. **四态硬切，无淡入淡出**：切 clip 只改 `clipName` 与 `time=0`。肉眼能看出
+>    跳帧，但**腿真的在动**（这比"过渡漂亮但腿不动"优先）。
+>
+> A2a 的验收在 `tools/verify_char_locomotion.py`（15 条，C0~C10），
+> `run_regression.py` 已登记。本节下面 §A2 原有的验收表（数值级 blending）**仍然有效**，
+> 是 A2b 的准入条件。
+
 **目标**：`Speed > 0.1` 从 Idle 切 Walk，切换用 0.2s 淡入淡出。
 
 #### 控制器资产 schema（`assets/animators/*.anim.json`）
@@ -680,6 +712,12 @@ A1 新增 11 条数值断言（全部 PASS，ANIM-TOTAL pass=27 fail=0）
 | `ANIM-TOTAL pass=.. fail=..` | 同上 | 汇总；脚本还要核对"每项都出现过" | A0-3/A0-5 |
 | `ANIM-STATE from=.. to=.. t=.. dur=..` | 转移采纳 | 状态序列与耗时 | A2 |
 | `ANIM-BLEND a=.. b=.. w=..` | 每帧（变化时） | 混合权重推进 | A2 |
+| `PLAYER-DEFAULT bound path=.. joints=.. clips=.. height=.. capsule=..` | 建角色 | 默认模型/骨骼/动画真的装上了，且三处比例同源 | **A2a** |
+| `EDIT-ANIM state=.. clip=.. (from=..) speed=..` | 状态变化 | 编辑器 Play 的移动状态机（`GAME-ANIM` 同格式） | **A2a** |
+| `EDIT-ANIM-IDLE retrigger=N idle=..s` | 静止计满 | 每 N 秒重放 idle 一次（`=2 idle=16.01s` 证明节奏对） | **A2a** |
+| `CHAR-CLIP-KEY-<clip>`（矩形） | 每帧 | Animation 页每条 clip 行尾真的画了键槽 | **A2a** |
+| `CHAR-KEYBIND clip=.. key=.. label=..` | 绑键 | 键码翻译与"一键一段"的回收都正确 | **A2a** |
+| `EDIT-ANIM-KEY-TRIGGER clip=.. key=..` / `GAME-ANIM-KEY-TRIGGER` | 按键 | 强播生效（顺带证明 `animKeys` 存读闭环） | **A2a** |
 | `ANIM-TRIGGER name=.. consumed=1` | trigger 消耗 | 只消耗一次 | A2 |
 | `ANIM-LAYER name=.. weight=.. masked=..` | 每帧（变化时） | 层权重与遮罩 | A3 |
 | `ANIM-ROOT mode=.. delta=..` | 每帧（变化时） | 根运动提取 | A4 |

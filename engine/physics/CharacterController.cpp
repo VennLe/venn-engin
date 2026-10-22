@@ -1,5 +1,6 @@
 #include "physics/CharacterController.h"
 
+#include "core/Logger.h"
 #include "physics/ConvexCollision.h"
 #include "physics/PhysicsShape.h"
 #include "physics/PhysicsWorld.h"
@@ -16,8 +17,6 @@ namespace physics {
 
 namespace {
 
-constexpr float kGravity = -9.81f;
-// 分步长度上限。见头文件"分步长度为什么是 0.05 m"。
 constexpr float kMaxSubStep = 0.05f;
 
 float length2D(const glm::vec3& v) { return std::sqrt(v.x * v.x + v.y * v.y); }
@@ -329,10 +328,53 @@ CharacterStepResult stepCharacter(const PhysicsWorld& world,
             // 斜面上下垂距离天然比平面长 (hh+r)/nz；用这个基准算"多余量"
             const float need = halfTotal / std::max(nz, 0.2f);
             const float excess = dist - need;
-            if (excess < -0.02f || excess > snap) return false;
+
+            // ---- 接触窗口要跟着"这一帧走了多远"变宽（2026-10-22）----
+            //
+            // 窗口原来是死的 ±0.02 m，可一帧的位移比窗口还宽：
+            //   · 快速下落：vz = -4.7、dt = 1/60 → 竖直走 0.078 m；
+            //   · 快速上坡：跑起来水平走 0.15 m，在 46° 坡上就是 0.155 m 的
+            //     抬升量（射线从胶囊中心往下打，坡面升多高，dist 就少多少）。
+            // 两种情况都会**整帧跨过窗口**：这一帧 excess 还是 +0.008，
+            // 下一帧已经是 -0.034，被 `excess < -0.02` 判成"这不是地面"
+            // → 重力接管 → 角色一直往下掉。实测：从 1.4 m 高处落地后 gap 掉到
+            // -277 m；跑步上坡到 x≈24 m 处 ground 翻 0，随后一路穿到 -36 m。
+            //
+            // 所以容差要按"这一帧物理上可能跨过的竖直距离"来给，而不是拍一个
+            // 常数：竖直速度那一项 + 水平步长在**最陡可行走坡**上的等效抬升 +
+            // 原本的 0.02 m 容差。这就等价于一次扫掠判定。
+            const float hStep = glm::length(hv) * dt;
+            const float maxRise =
+                hStep * std::sqrt(std::max(0.0f, 1.0f - cosSlope * cosSlope)) /
+                std::max(cosSlope, 0.2f);
+            const float sweep = std::max(0.0f, -vz) * dt + maxRise + 0.02f;
+            if (excess < -sweep || excess > snap) return false;
+
+            // ---- 在空中就别"贴地"（2026-10-22）----
+            //
+            // 用户要求"跳跃的轨迹是一个弧度、高度符合实际"。做成抛物线之后
+            // 实测滞空只有 0.63 s（理论 0.754），落地前那 0.3 m 像是被"吸"
+            // 下去的 —— 因为 groundSnap 的本意是**下坡吸附**（走下坡时每帧
+            // 只差几厘米，吸一下脚才不会一蹦一蹦），但它对"从 0.7 m 高掉
+            // 下来"同样生效：excess 一旦落进 snap 窗口就直接 pos.z -= excess，
+            // 于是最后一段自由落体被抹掉了。
+            //
+            // 判据用**竖直速度**而不是 excess 大小：下坡行走时 vz 恒为 0
+            // （贴地那一步就把竖直速度归零了，见 ②），只有真在掉的时候
+            // 才会有 -1.5 m/s 以下的速度。0.7 m 跳下来经过 snap 窗口时
+            // vz ≈ -2.4 m/s，稳稳落在这条之外。
+            //
+            // ⚠ 这条只拦"提前吸附"，**不能**拦"已经接触"（excess ≤ 0.02）：
+            //   否则快速下落永远落不了地（就是上面那个穿地形的 bug）。
+            if (excess > 0.02f && vz < -1.5f) return false;
+
             onGround = true;
             groundNz = nz;
-            if (excess > 0.0f && desc.groundSnap) {
+            if (excess < 0.0f) {
+                // 踩进去了：直接抬出来。穿透量最多一帧步长（sweep 兜住的），
+                // 所以不会把角色弹飞 —— 这是"不许穿模"的兜底。
+                pos.z -= excess;
+            } else if (excess > 0.0f && desc.groundSnap) {
                 // ⚠ 吸附是"就近贴地"的启发式，**不能凌驾于"不许穿模"之上**。
                 //   胶囊搭在台阶棱上时，中心**正下方**是下面那层地面，一按
                 //   就按进台阶的立面里 —— 于是"刚踩上台阶"被下一帧的吸附

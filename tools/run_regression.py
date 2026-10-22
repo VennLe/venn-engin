@@ -189,6 +189,37 @@ DEFAULT = [
     # PHYS-TEST 行），也是物理唯一"机器可判定"的正确性证据 —— 一叠箱子塌掉
     # 有一百种原因，浮点逐位一致只有一种解释。
     "verify_physics",
+    # ---- 地形成为**真物理地面**（2026-10-22 第十轮）----
+    # 起一个真工程跑 360 帧，断言：出生点地表高度 == 0（GameStart 不陷入）/
+    # 玩家脚底贴地 / 平地与斜坡上的箱子都停在"地表 + 半高"而不是沉进去。
+    # ⚠ 它会自己用 Python 重算双线性 `height_at()` 当**独立真值** —— 不读
+    #   引擎的中间结果，否则就是拿被测对象的输出证明它对。
+    "verify_terrain_physics",
+    # ---- 多块地形不再撞描述符池上限（2026-10-22）----
+    # 用户报障：`VK_ERROR_OUT_OF_POOL_MEMORY` at DescriptorSet.inl:61 +
+    # `3 leaked objects`。根因是 TerrainPass 的池按 4 块地形写死。
+    # 用例：6 块地形的场景跑 120 帧，断言零 VK_CHECK / 零泄漏 / 走了扩容。
+    # ⚠ T4「必须看到 DESCRIPTOR-POOL 扩容」是**前提断言**：没有它的话，
+    #   万一哪天首池被调大到 >= 6 块，T2/T3 会"因为没走到扩容"而假绿。
+    "verify_multi_terrain",
+    # ---- 抬山保存后地形变砖 / DEVICE_LOST（2026-10-22 第十一轮）----
+    # 用户报障：`TERRAIN-INSTANCE-FAIL reason=height_not_normalized
+    # min=0.000 max=8.000` + `VK_CHECK -4 at vkQueueSubmit`。
+    # 根因三层：① 抬升笔刷允许 kMaxNorm=8，而 `.r32` 契约是 [0,1]，
+    # 写端原样落盘 → 工程再也打不开；② syncTerrains 拿"成功数"比"请求数"，
+    # 建失败就每帧全量重建 → 帧时间冲破 TDR 2 秒 → DEVICE_LOST；
+    # ③ 存量坏资产无法自愈（读端硬拒）。
+    # 用例三组：干净模板（不许误伤）/ 高度×8（必须救援）/ 尺寸砍半
+    # （失败不许逐帧刷屏）。
+    "verify_terrain_renorm",
+    # ---- 自研二进制资产链（阶段六/七，2026-10-22）----
+    # FBX → `AssetC` → `.vmesh` → 运行时加载器，整条离线链路 + 引擎内自检。
+    # 判据分四组：离线编译（顶点/索引守恒、焊接、可复现）/ 工具自洽（开关
+    # 真的生效、两次编译逐字节相同）/ 运行时（真的走 `.vmesh`、缓存缺失与
+    # 过期都回退 FBX、`.vmesh` 更快）/ 引擎内 `MYVK_ASSET_TEST` 自检。
+    # ⚠ **刻意不做截图比对**：autoPlay 模型的截图取决于 wall clock，比对会
+    #   变成 flaky 用例；这条链的正确性由数值判据守。
+    "verify_vmesh",
     # ---- 2026-10-17：主题 / 语言 / 默认值 / 胶囊线框 / 启动露面 ----
     # 五套主题 + 中英映射替换 + 偏好存档 schema 门。判据只取 Preferences
     # 窗口内部的平均亮度（整窗均值会被 3D 视口拽平，第一版就栽在这）。
@@ -378,6 +409,84 @@ DEFAULT = [
     #   —— 这里用 Low↔Epic 达到同一条判据（Cinematic 只多一个 dof）。
     # ⚠ GUI 用例（2 次启动编辑器），不能与其它 GUI 用例并行。
     "verify_quality_presets",
+
+    # ---- 外部模型进场景：尺度 / 第三人称 / 绑骨 / 动画（2026-10-22）----
+    # 四件事各自一条，缺一条就有一整类"看起来能动、其实不对"没人看：
+    #   scale    第三方 FBX 进场景后**真实尺寸**对不对（1:1，不是"看着差不多"）
+    #   player   第三人称绑定：从出生点造出的玩家真的挂上了模型（脚底对齐 /
+    #            胶囊跟身高 / 关节矩阵进 SSBO / 按键真的走得动）
+    #   autorig  剥掉原厂 52 骨 → 一键自动绑骨 → 与厂商骨架**逐根比位置**
+    #            （这是"通用算法能绑"的唯一机器证据，肉眼看不出 3 cm 的偏差）
+    #   procanim 四条基础动作 idle/walk/run/jump：离线数值（步幅/抬脚/摆动相
+    #            前向速度/手臂横向）+ 运行时四态真的切得动
+    # ⚠ 后三条都会起 Game.exe（各 1 次，每次约 3 秒），不能与其它 GUI 用例并行。
+    # ⚠ procanim 的 B 组要按 Shift —— **修饰键必须用真实键事件**，理由见脚本里
+    #   `modifier()` 的注释（PostMessage 会被 GLFW 的防粘键补丁当场撤销）。
+    "verify_model_scale",
+    "verify_player_character",
+    "verify_autorig",
+    "verify_procanim",
+
+    # ---- 角色预览不能拆掉主场景的地形（2026-10-22，编辑器闪退）----
+    # 现场：新建 third_person 工程（场景里有 Terrain）→ Shift+A ▸ Player ▸
+    #   Third-Person Player → 角色窗口打开的那一帧 `invalid state` 刷屏，
+    #   最后 `vkQueueSubmit` 返回 -4 + `Fatal: Vulkan call failed` 直接退出。
+    # 根因：`uploadSceneState()` 无条件 syncTerrains/syncWaters，而离屏预览
+    #   是**录制途中**带着另一个（没有地形的）场景调进来的 → 判成"集合变了"
+    #   → 在录制中间 clearInstances()，销毁了已绑在命令缓冲上的地形 buffer 与
+    #   层贴图 sampler。修法：只有主场景（offscreenSlot < 0）才对这两个同步。
+    # ⚠ 这条用例**必须带地形**：空场景下主/预览两边 items 都是空，判据
+    #   `same` 恒真，再坏也抓不到（别把场景简化掉）。
+    "verify_preview_terrain",
+
+    # ---- 角色默认模型 + 移动/动画/按键映射（P4，2026-10-22）----
+    # 用户要求：①新建角色就自带模型/骨骼/动画；②WASD 走起来要**播 Walk**；
+    # ③静止满 8 秒触发 idle，之后每 8 秒继续；④任意 clip 可在角色面板绑键
+    # 触发；⑤角色面板就在视口标签栏。
+    # C0~C10 共 15 条断言，每条都能独立变红（第一轮实测 8 条红）。其中
+    # C6（走路截图）是**唯一不靠日志**的判据：早先版本用阻塞式 hold_key，
+    # 返回时键已松、人已回 idle —— 名字叫 walk 的截图里其实站着不动。
+    # C9 还顺带守 `animKeys` 的存读闭环（Play 副本是重新反序列化的）。
+    "verify_char_locomotion",
+
+    # ---- 运行时"手感四件事"（P5，2026-10-22）----
+    # 用户报障四条：①脚陷地 + 出生点不是 GameStart；②必须点视口才能操作、
+    # 操作时隐藏鼠标、Esc 退出；③移动没朝视线方向（**最关键**）；④状态切换
+    # 生硬要平滑过渡。
+    # R0~R9 十条，每条都能独立变红（R2 已做反向验证：把 modelYaw 从 90 改回 0
+    # → `spanX/spanY` 整好互换，只有 R2 红、其余 9 条仍绿）。
+    # ⚠ R2 刻意用**几何判据**（人形左右跨度 > 前后跨度）而不是截图比对：
+    #   像素宽高比实测在 0.367~0.429 之间飘，拿来断言就是 flaky。
+    "verify_player_feel",
+
+    # ---- 默认操控 + 真实跳跃（P6，2026-10-22）----
+    # 用户要求：WASD 走 / 右键长按跑 / 空格跳，全部**内建**（不需要在角色面板
+    # 里绑键）；跳跃动画换成"双脚离地"；高度 / 滞空 / 弧线 / 空中方向控制都要
+    # 符合物理直觉。
+    # J0~J9 十条，每条能独立变红。J2/J3 是**数值**判据（0.55~0.90 m、
+    # 0.60~0.95 s），不是"看着像"；J5 用轨迹单调性证明是抛物线而不是三段折线；
+    # J6 证明空气控制真的生效（落点横向位移 > 0.4 m）。
+    "verify_player_jump",
+
+    # ---- 脚踩地形表面，不许陷进去（P6，2026-10-22）----
+    # 用户原话："角色在踩在地形的地面时，应该是脚部踩在上面的，不允许脚底
+    # 踩到地形地面的下方。"
+    # G0~G7 八条。**必须带地形**（terrain/hills），空场景 + groundPlane 再坏
+    # 也抓不到 —— 这条用例第一次跑就抓到两个真 bug：
+    #   ① 一帧竖直位移（0.078 m）比接触窗口（±0.02 m）还宽 → 快速下落整帧
+    #      跨过地面 → 一路穿到 -277 m；
+    #   ② 跑上坡时水平一帧走 0.15 m，坡面升起量同样超过窗口 → ground 翻 0，
+    #      随后永远贴不回去。
+    # 两者都改成"按这一帧可能跨过的竖直距离给容差"（sweep）才修掉。
+    "verify_player_ground",
+
+    # ---- 角色面板预览视口（P6，2026-10-22）----
+    # 用户要求：预览要真的能**看动画播放**；视口要有栅格地面 + gizmo；胶囊
+    # 要看得见、能用鼠标选中，并能分别调角色/胶囊的位置・旋转・大小。
+    # P0~P8 十二条。P3 是**唯一不靠日志**的判据：隔 0.45 s 截两张，预览矩形
+    # 内像素差异 ≥ 0.4%（第一版就是靠它抓到"时间轴在走、模型不动"）；
+    # P5/P6 的点击坐标来自 `CHAR-PREVIEW-CAPSULE-SCREEN` 投影锚点，不猜。
+    "verify_char_preview",
 ]
 
 # 结果行：兼容四种写法。取**最后一条**，因为有的脚本会先打一堆中间断言。
@@ -408,6 +517,13 @@ WATCH_ROOTS = [
     # 产品本身（第一人称/第三人称的初值差异全在这里）。它不是运行时数据
     # ——只有 `tools/gen_templates.py` 会写它，所以可以进快照。
     "templates",
+    # 资产链（2026-10-22，阶段六/七）：`assetio/` 编进 `VennAssetIO` 静态库
+    # （引擎和离线工具**共用**同一份格式读写），`assetc/` 编成 `AssetC.exe`。
+    # ⚠ 和 runtime / launcher 一模一样的道理 —— 不在这里就等于"资产链没有
+    #   回归"：改了 `MeshFormat.cpp` 的一个字段偏移，`verify_vmesh` 该被叫醒，
+    #   但它连"变了"都看不见。只有编译输入，没有任何运行时数据，可以进快照。
+    "assetio",
+    "assetc",
     "assets/shaders",
     "assets/models",
     "assets/textures",
@@ -739,8 +855,74 @@ TRIGGERS = {
                                 # 逐 item jointBase 透传（阴影两条路径）
                                 "engine/render/ShadowPass.*",
                                 "engine/render/LocalShadowPass.*"],
-    # 游戏 UI / HUD（U0 起，docs/ui_hud_roadmap.md）。
-    # ⚠ `engine/ui2/**` **故意不进** `GLOBAL_GLOBS`：它只被 UI 通道引用，
+    # 角色默认模型 + 移动状态机（P4，2026-10-22）。
+    # `engine/animation/Locomotion.*` 是**编辑器 Play 与 Game.exe 共用**的那份
+    # 状态机（此前运行时有一半、编辑器完全没有 → Play 时腿不动）。它自己的
+    # 目录 `engine/animation/**` 已由 verify_anim_runtime / verify_character_import
+    # 登记，这里多登记一遍是**允许**的（这张表是"文件→用例"，不是互斥）。
+    # ⚠ `engine/ui/KeyCodes.*` 虽然是本轮新增的按键翻译表（GLFW ↔ ImGui，
+    #   错了的表现是"绑了键但不触发"），但 `engine/ui/**` 在 `GLOBAL_GLOBS`
+    #   里 → 改它本来就全量，写进来会在 `--narrow` 下假跳过。
+    # ⚠ `engine/assets/MeshLoader.*`、`engine/ecs/Components.h` 同理在横切表
+    #   里，按铁律**不写**。
+    "verify_char_locomotion": ["engine/animation/Locomotion.*",
+                               "editor/CharacterWindow.*",
+                               # bindDefaultCharacter / kDefaultCharacterPath
+                               "editor/EditorScene.*",
+                               # animKeys 的存 + 读（C9 的闭环全靠它）
+                               "engine/scene/SceneSerializer.*",
+                               # 编辑器没有的组件在 Play 里就不存在 → 接线在这儿
+                               "editor/EditorApp.*",
+                               # tickPlayerAnimation / idleTriggerSec
+                               "runtime/RuntimeApp.*",
+                               "runtime/RuntimeConfig.*",
+                               # 新增的 8 条界面词
+                               "engine/i18n/**",
+                               # 默认角色资产本身（23 骨 / 4 段 clip）
+                               "assets/models/characters/**"],
+    # 运行时"手感四件事"（P5，2026-10-22）。与上一条大量重叠是**故意**的：
+    # 两张表是"文件→用例"，一条修的是编辑器 Play 的腿，另一条修的是运行时的
+    # 朝向/鼠标/过渡，改坏任何一边另一条都不会红。
+    # ⚠ `engine/ecs/Components.h`（fade 字段）与 `engine/ui/**`（KeyCodes）
+    #   在横切表里，按铁律不写。
+    "verify_player_feel":    ["engine/animation/AnimatorSystem.*",  # crossfade
+                              "engine/animation/Locomotion.*",    # blend 配置
+                              "engine/scene/ModelInstance.*",     # yawOffsetDeg
+                              "runtime/RuntimeApp.*",             # 鼠标两态
+                              "runtime/RuntimeConfig.*",          # modelYaw
+                              # 出生点口径（脚底 + 胶囊中心）
+                              "runtime/PlayerController.*",
+                              # Play 时按 GameStart 摆玩家
+                              "editor/EditorContext.*",
+                              # 编辑器侧 facing 自检
+                              "editor/EditorScene.*",
+                              # hips 不再下沉（脚陷的根因）
+                              "assetio/ProcAnim.cpp",
+                              "assets/models/characters/**"],
+    # 默认操控 + 真实跳跃（P6，2026-10-22）。跳跃的物理在**两个地方**各写
+    # 一遍（运行时走 CharacterController，编辑器 Play 手写同一套抛物线），
+    # 所以两边都要盯着 —— 只改一边时另一条的 J/P 判据不会红，这正是本条
+    # 用例存在的价值。
+    # ⚠ 物理层（engine/physics/**）、Components.h、InputMap.cpp 都在
+    #   GLOBAL_GLOBS 里，按铁律**不重复登记**。
+    "verify_player_jump":    ["engine/animation/Locomotion.*",        # jump 状态
+                              # poseJump 的重写 + Jump clip 时长 0.75 s
+                              "assetio/ProcAnim.cpp",
+                              "assets/models/characters/**",
+                              "runtime/RuntimeApp.*",                 # 装配时的 jumpSpeed 公式
+                              "editor/EditorApp.*"],                  # 编辑器 Play 的抛物线
+    # 脚踩地形（P6，2026-10-22）。核心是 CharacterController 的**接触窗口**
+    # （在 GLOBAL 里，改它必然全量）；这里登记的是"探针 + 高度场装配"这一侧。
+    "verify_player_ground":  ["runtime/PlayerController.*",            # GAME-FEET / RESCUE
+                              "runtime/RuntimeApp.*"],                # 探针
+    # 角色面板预览视口（P6，2026-10-22）。三块拼起来才有"能看动画 + 有栅格 +
+    # 能选中胶囊"：面板（投影/点选/叠加层）、蒙皮（syncPreviewSkinning ——
+    # 预览不动的根因就在这儿）、预览栅格（Renderer 在 GLOBAL，不重复登记）。
+    "verify_char_preview":   ["editor/CharacterWindow.*",              # 叠加层 / 点选 / 控件条
+                              "engine/scene/ModelInstance.*",          # jointMatrices 接手
+                              "editor/EditorApp.*",                    # Play 态 Space 语义
+                              "assets/models/characters/**"],
+    # 游戏 UI / HUD（U0 起，docs/ui_hud_roadmap.md）。    # ⚠ `engine/ui2/**` **故意不进** `GLOBAL_GLOBS`：它只被 UI 通道引用，
     #   不像 `Renderer.*` / `engine/ecs/**` 那样横切。放进去会让全量永远
     #   点名，增量回归就失去意义了（这是路线图 §8.3 的明确决定）。
     "verify_ui2":            ["engine/ui2/**",
@@ -886,6 +1068,54 @@ TRIGGERS = {
     #   一次 CollisionWorld 的改动就只会跑 verify_physics，把
     #   verify_collision_play / verify_player / verify_drop_to_floor 判成
     #   "不受影响" —— 那才是真正的假跳过。宁可多跑。
+    # ---- 地形物理（2026-10-22 第十轮）----
+    # 实现主体 `terrainVsBody` 在 engine/physics/**（GLOBAL，同上"故意不登记"），
+    # 所以这里只登记**不被别人看守**的两处输入：
+    #   · runtime/PlayerController.*：出生校正（`attach` 里那次 unbury）在这里
+    #   · templates/**：高度图与 `maxHeight` 是本用例的夹具，而且它和
+    #     verify_template_scene 读**同一份** —— 两条都登记，模板一变就一起
+    #     重跑，才不会在 --narrow 下互相把对方判成"不受影响"
+    "verify_terrain_physics": ["templates/**", "tools/gen_templates.py",
+                               "runtime/PlayerController.*"],
+    # ---- 多块地形 / 描述符池（2026-10-22）----
+    # 断言落点两处，都在这里：
+    #   · 池链（扩容）      → engine/rhi/DescriptorSet.*（**已是 GLOBAL**，
+    #     改它本来就全量；列在这里只是让"改这个文件该跑哪些用例"这件事
+    #     在表里能查到，不会造成假跳过 —— 横切判定在 TRIGGERS 之前）
+    #   · 首池容量与实例析构 → engine/render/TerrainPass.*
+    # 夹具是 templates/third_person（复制成 6 块地形），与 template_scene /
+    # terrain_physics 共享同一个 glob —— 三条一起重跑才是对的。
+    "verify_multi_terrain": ["engine/render/TerrainPass.*", "templates/**"],
+    # ---- 地形值域收敛 / 坏资产救援（2026-10-22 第十一轮）----
+    # 断言分散在三层，所以三条都要登记 —— 少一条就会在 --narrow 下把
+    # 本用例判成"不受影响"，而它恰恰是唯一看守那条链的用例：
+    #   · 收敛数学 + 救援读盘 → engine/terrain/Terrain.*
+    #   · 落盘前收敛 + 撤销栈缩放 → editor/LandscapeEditor.*
+    #   · 失败不逐帧重建（TDR 那一层）→ engine/render/Renderer.*
+    # ⚠ editor/LandscapeEditor.* 也会命中 verify_landscape_* 那几个用例，
+    #   那是**对的**：同一个文件改了，两条都该跑。
+    "verify_terrain_renorm": ["engine/terrain/Terrain.*",
+                              "editor/LandscapeEditor.*",
+                              "engine/render/Renderer.*",
+                              "engine/render/TerrainPass.*",
+                              "templates/**"],
+    # ---- 自研二进制资产链（阶段六/七，2026-10-22）----
+    # 只登记**非横切**的两块，都是新顶层目录：
+    #   · assetio/** —— 格式本体（MeshFormat / VertexOps / AnimOps /
+    #     FbxImport / Binary）。引擎与离线工具共用，改一个字段偏移就是改契约。
+    #   · assetc/**  —— 离线编译器（`AssetC.exe`）。判据里的顶点数 / ACMR /
+    #     关键帧数 / 压缩比全由它打印，改它的输出格式这条用例立刻红。
+    # ⚠ 刻意**不**登记（`engine/assets/**` 就在 GLOBAL_GLOBS 里，写了在
+    #   `--narrow` 下会变成"看着有归属、其实没覆盖"的假映射）：
+    #     engine/assets/VMeshLoader.*    —— 运行时 `.vmesh` → `assets::Model`
+    #     engine/assets/AssetSelfTest.*  —— `MYVK_ASSET_TEST` 自检的 44 条断言
+    #     engine/assets/MeshLoader.*     —— `loadFBX` 先探同名 `.vmesh`
+    #     engine/assets/FbxLoader.*      —— FBX 直读那一路（回退路径）
+    #   这四块改了**本来就全量**（横切判定在 TRIGGERS 之前），所以安全；
+    #   列在这里只是让"改哪个文件该跑哪条用例"在表里查得到。
+    # ⚠ `CMakeLists.txt` 同样是横切（新增 `VennAssetIO` / `VennAssetC` 两个
+    #   目标就写在那儿），同理不登记。
+    "verify_vmesh": ["assetio/**", "assetc/**"],
     # ---- 阶段 M1：运行时骨架（G01~G05）----
     # 三条用例的实现主体全在 `runtime/**`（G01 拆出来的那个独立目标）。
     # 同一个 glob 挂到三条名下是**故意**的：改 runtime 的任何一行，
@@ -1104,6 +1334,42 @@ TRIGGERS = {
                                "editor/EditorApp.*",
                                "engine/project/ProjectDisplay.*",
                                "runtime/main.cpp"],
+
+    # ---- 外部模型进场景：尺度 / 第三人称 / 绑骨 / 动画（2026-10-22）----
+    # 这四条各管一段，**故意只登记自己那段**：
+    #   · `assetio/MeshFormat.*` 不挂在这里 —— 它是格式本体，已由
+    #     verify_vmesh 独家看守（改字段偏移两边一起坏，挂多份只会稀释
+    #     "谁该为它负责"这件事）。
+    #   · `engine/render/Renderer.*`、`engine/assets/**` 是横切，按铁律不登记。
+    "verify_model_scale": ["assetio/FbxImport.*",     # 导入/变换烘焙
+                           "assetio/VertexOps.*",     # 缩放/居中/翻转
+                           "assetio/SourceModel.h",   # 世界 AABB 的定义
+                           "editor/EditorScene.*",    # IMPORT-AUTO 落点
+                           "engine/scene/ModelInstance.*"],
+    "verify_player_character": ["runtime/RuntimeApp.*",       # 挂模型/相机/状态机
+                                "runtime/RuntimeConfig.*",    # player 块解析
+                                "runtime/PlayerController.*", # velocity()/sprint
+                                "engine/scene/SceneSerializer.*",  # gameStart 存读
+                                "engine/scene/ModelInstance.*",
+                                "engine/animation/**"],
+    "verify_autorig": ["assetio/AutoRig.*",
+                       # 权重归一化与左右闸门都在 VertexOps 那套工具里
+                       "assetio/VertexOps.*",
+                       "assetc/main.cpp"],           # --autorig/--strip-skin
+    "verify_procanim": ["assetio/ProcAnim.*",
+                        "assetc/main.cpp",           # --procanim/--anim-fps
+                        # 四态判据（run 阈值 / 冲刺倍率）跑在玩家控制器上
+                        "runtime/PlayerController.*",
+                        "runtime/RuntimeApp.*"],
+
+    # 角色预览 / 主场景地形并存。⚠ `engine/render/Renderer.cpp` 不在这里 ——
+    # 它是 GLOBAL_GLOBS，改它本来就全量重跑。这里登记的是"改了就会让
+    # 预览链换一套资源"的几个部件。
+    "verify_preview_terrain": ["editor/CharacterWindow.*",    # 预览场景与尺寸
+                               "editor/ViewportPanel.*",      # Shift+A 菜单
+                               "engine/render/RenderTarget.*",
+                               "engine/render/HdrTarget.*",
+                               "engine/render/TerrainPass.*"],
 }
 
 

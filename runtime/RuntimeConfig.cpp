@@ -128,6 +128,38 @@ void applyGameJson(RuntimeConfig& cfg) {
                     path.c_str());
     }
 
+    // ---- 玩家外观（P1）----
+    // 一个块都没写 = 胶囊占位体（与引入本块之前逐位相同）。
+    if (j.contains("player") && j["player"].is_object()) {
+        const json& p = j["player"];
+        auto pStr = [&](const char* k, std::string& dst) {
+            if (p.contains(k) && p[k].is_string()) dst = p[k].get<std::string>();
+        };
+        auto pBool = [&](const char* k, bool& dst) {
+            if (p.contains(k) && p[k].is_boolean()) dst = p[k].get<bool>();
+        };
+        auto pNum = [&](const char* k, float& dst) {
+            if (p.contains(k) && p[k].is_number()) dst = p[k].get<float>();
+        };
+        pStr("model", cfg.player.model);
+        pStr("clip", cfg.player.clip);
+        pBool("fitBody", cfg.player.fitBody);
+        pNum("radius", cfg.player.radius);
+        pNum("halfHeight", cfg.player.halfHeight);
+        pStr("idleClip", cfg.player.idleClip);
+        pStr("walkClip", cfg.player.walkClip);
+        pStr("runClip", cfg.player.runClip);
+        pStr("jumpClip", cfg.player.jumpClip);
+        pNum("walkSpeed", cfg.player.walkSpeed);
+        pNum("runSpeed", cfg.player.runSpeed);
+        pBool("restartOnSwitch", cfg.player.restartOnSwitch);
+        pNum("idleTrigger", cfg.player.idleTriggerSec);
+        pNum("modelYaw", cfg.player.modelYaw);
+    } else if (j.contains("player")) {
+        VK_LOG_WARN("GAME-CONFIG game.json 的 player 不是对象，忽略（%s）",
+                    path.c_str());
+    }
+
     // ---- 老字段兼容（只读一次，别静默丢掉用户的选择）----
     if (cfg.audioDevice != "default" && cfg.audioDevice != cfg.audio.device) {
         VK_LOG_WARN("GAME-CONFIG-DEPRECATED audioDevice='%s' 已废弃，"
@@ -181,6 +213,10 @@ void applyEnv(RuntimeConfig& cfg) {
     cfg.dumpScenePath = envStr("MYVK_RUNTIME_DUMP_SCENE", cfg.dumpScenePath);
     cfg.inputMapPath = envStr("MYVK_RUNTIME_INPUT_MAP", cfg.inputMapPath);
     cfg.startState = envStr("MYVK_RUNTIME_START_STATE", cfg.startState);
+    // 玩家外观：自动化只有一个"换成这个模型"的诉求，所以只开两个口子
+    // （模型 / clip）。其余字段是美术与手感参数，属于 game.json 的范畴。
+    cfg.player.model = envStr("MYVK_RUNTIME_PLAYER_MODEL", cfg.player.model);
+    cfg.player.clip = envStr("MYVK_RUNTIME_PLAYER_CLIP", cfg.player.clip);
     cfg.traceStates = envFlag("MYVK_RUNTIME_TRACE_STATES", cfg.traceStates);
     // `MYVK_RUNTIME=1`：运行时 verbose（每 60 帧一行 GAME-LOOP）。
     // 这个**裸**名字是 ship_roadmap 里写定的，所以保留（白名单里已登记）。

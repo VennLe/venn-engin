@@ -156,7 +156,17 @@ InputMap InputMap::makeDefault() {
     m.bindKey("Gameplay", "Jump", GLFW_KEY_SPACE);
     m.bindGamepadButton("Gameplay", "Jump", GLFW_GAMEPAD_BUTTON_A);
     m.defineAction("Gameplay", "Sprint");
-    m.bindKey("Gameplay", "Sprint", GLFW_KEY_LEFT_SHIFT);
+    // 冲刺 = **鼠标右键长按**（2026-10-22）。
+    //
+    // 为什么不是 Shift：第三人称里冲刺是"边跑边转视角"的连续动作，右手本来
+    // 就在鼠标上；Shift 要求把左手小指按住不放，长距离跑图很快就累。而且
+    // 右键在当前手感里是**空闲**的 —— 鼠标视角在光标锁定时是"移动即转"，
+    // 不需要按住任何键（见 PlayerController 的 lookDelta）。
+    //
+    // ⚠ 手柄的 LB 保留：手柄上没有"右键"，LB 就是它的冲刺键。
+    // ⚠ 老工程里存过 `Sprint=LShift` 的 `config/input.json` 不会被这条改掉
+    //   （存档优先于出厂值）—— 需要用户在输入设置里点一次"恢复默认"。
+    m.bindMouse("Gameplay", "Sprint", GLFW_MOUSE_BUTTON_RIGHT);
     m.bindGamepadButton("Gameplay", "Sprint", GLFW_GAMEPAD_BUTTON_LEFT_BUMPER);
     m.defineAction("Gameplay", "Interact");
     m.bindKey("Gameplay", "Interact", GLFW_KEY_E);

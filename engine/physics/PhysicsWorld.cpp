@@ -1,5 +1,6 @@
 #include "physics/PhysicsWorld.h"
 
+#include "core/Logger.h"
 #include "physics/ConvexCollision.h"
 #include "physics/Narrowphase.h"
 
@@ -157,6 +158,49 @@ void PhysicsWorld::clear() {
     m_cache.clear();
     m_accumulator = 0.0f;
     m_stats = PhysicsStats{};
+    // 地形本身不该被 clear 掉（它是世界里的一件"设施"），但那个伪刚体
+    // 已经随 m_bodies 一起没了 → 下次 setHeightfield / 下一步会重建。
+    m_terrainBody = kInvalidBody;
+}
+
+// ================================================================
+//  地形（高度场）
+// ================================================================
+
+void PhysicsWorld::setHeightfield(const Heightfield* hf) {
+    m_terrain = (hf && hf->valid()) ? hf : nullptr;
+    if (!m_terrain) {
+        // 关掉：伪刚体留着也没坏处（它配不到任何体），但为了让
+        // "关掉地形"之后的世界和改动前**完全一致**，直接摘掉。
+        if (m_terrainBody != kInvalidBody) {
+            removeBody(m_terrainBody);
+            m_terrainBody = kInvalidBody;
+        }
+        return;
+    }
+    if (m_terrainBody == kInvalidBody) {
+        // 伪静态刚体：求解器要求 `bodyA` 是 `bodies` 里的合法下标。
+        //
+        // 形状给一个**远在 -1e6 米、半径 1 mm** 的球 —— 宽相的 AABB 与
+        // 任何真实物体都不相交，于是它永远不会产出"球-盒"之类的接触，
+        // 只作为地形流形的 A 侧存在。（用 Plane 不行：平面 AABB 是无限大，
+        // 会和每个体配对，白白多跑 N 次窄相。）
+        RigidBody t;
+        t.type = BodyType::Static;
+        t.entity = 0xFFFFFFFFu;      // 没有实体 → 写回变换时自然跳过
+        t.shape = Shape::sphere(1.0e-3f);
+        t.position = glm::vec3(0.0f, 0.0f, -1.0e6f);
+        t.flags = 0;                 // 不受重力、不休眠
+        t.material.dynamicFriction = 0.85f;
+        t.material.staticFriction = 0.9f;
+        t.material.restitution = 0.0f;
+        m_terrainBody = addBody(std::move(t));
+        VK_LOG_INFO("PHYS-TERRAIN attach cols=%d rows=%d mpp=%.2f maxh=%.2f "
+                    "proxyBody=%u",
+                    m_terrain->cols, m_terrain->rows,
+                    static_cast<double>(m_terrain->metersPerPixel),
+                    static_cast<double>(m_terrain->heightScale), m_terrainBody);
+    }
 }
 
 // ================================================================
@@ -304,6 +348,29 @@ void PhysicsWorld::collectContacts() {
 
         ContactManifold m;
         if (collideBodies(A, B, pr.a, pr.b, m)) {
+            m_manifolds.push_back(m);
+        }
+    }
+
+    collectTerrainContacts();
+}
+
+// 地形接触：不走宽相（高度场没有 AABB），每步 O(N) 扫一遍。
+//
+// 为什么放在 collectContacts **之后**：热启动缓存按 (bodyA, bodyB) 存，
+// 顺序无关；放在同一个函数里保证"一帧的接触集合"是一个整体，
+// `wakeIslands` / `updateSleep` 看到的是完整的那一份。
+void PhysicsWorld::collectTerrainContacts() {
+    if (!hasHeightfield() || m_terrainBody == kInvalidBody) return;
+
+    for (RigidBody& b : m_bodies) {
+        if (b.id == kInvalidBody || b.id == m_terrainBody) continue;
+        // 与"体对"同一条规则：不会动或睡着的体不必解；触发器不产生冲量。
+        if (!b.movable() || !b.awake) continue;
+        if (b.hasFlag(kBodyIsTrigger)) continue;
+
+        ContactManifold m;
+        if (terrainVsBody(*m_terrain, b, m_terrainBody, b.id, m)) {
             m_manifolds.push_back(m);
         }
     }

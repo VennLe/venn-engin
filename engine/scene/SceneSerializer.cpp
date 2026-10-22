@@ -1979,6 +1979,45 @@ ecs::CharacterControllerComponent characterFromJson(const json& j) {
     return c;
 }
 
+// ---------------- 动画键盘映射（P4）----------------
+//
+// 空表**不写**整块（同 animClip 的道理）：没绑过键的角色不该在场景文件里
+// 多出一段 `{"entries":[]}` 的噪音。
+//
+// `key` 存 GLFW 键码（整数）。为什么不存 "F"：字符串要解析、要处理大小写与
+// 别名，而这个值唯一的用途是喂 `core::Input::keyPressed(int)` 与 ImGui 的
+// 捕获结果 —— 两者都是 GLFW 码，存整数是零转换。
+json animKeyMapToJson(const ecs::AnimKeyMapComponent& m) {
+    json entries = json::array();
+    for (const auto& e : m.entries) {
+        if (e.clip.empty() || e.key == 0) continue;   // 半截记录不落盘
+        entries.push_back(json{{"clip", e.clip}, {"key", e.key}});
+    }
+    return json{
+        {"entries", std::move(entries)},
+        {"holdSeconds", m.holdSeconds},
+        {"enabled", m.enabled},
+    };
+}
+
+ecs::AnimKeyMapComponent animKeyMapFromJson(const json& j) {
+    ecs::AnimKeyMapComponent m;
+    if (!j.is_object()) return m;
+    m.holdSeconds = j.value("holdSeconds", m.holdSeconds);
+    m.enabled = j.value("enabled", m.enabled);
+    if (j.contains("entries") && j["entries"].is_array()) {
+        for (const auto& e : j["entries"]) {
+            if (!e.is_object()) continue;
+            ecs::AnimKeyMapEntry one;
+            one.clip = e.value("clip", std::string());
+            one.key = e.value("key", 0);
+            if (one.clip.empty() || one.key == 0) continue;
+            m.entries.push_back(std::move(one));
+        }
+    }
+    return m;
+}
+
 // ---------------- 触发体（G08）----------------
 json triggerToJson(const ecs::TriggerComponent& t) {
     return json{
@@ -2264,6 +2303,11 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         if (const auto* cam = w.get<ecs::CameraComponent>(it.entity))
             je["camera"] = cameraComponentToJson(*cam);
 
+        // 动画键盘映射（P4）。空表不写（理由见 animKeyMapToJson）。
+        if (const auto* akm = w.get<ecs::AnimKeyMapComponent>(it.entity)) {
+            if (!akm->entries.empty()) je["animKeys"] = animKeyMapToJson(*akm);
+        }
+
         // 脚本（只有路径与开关，脚本源码本身是独立文件）
         if (const auto* sc = w.get<ecs::ScriptComponent>(it.entity)) {
             je["script"] = json{
@@ -2317,6 +2361,13 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         // 触发体 / 物理材质 / 相机 / **蒙皮** 任意一个存在就不算空 —— 它们
         // 都是"没有网格但有意义"的实体（隐形的墙、触发区域、相机机位、
         // 模型根节点）。
+        //
+        // ⚠ 这份名单必须与**读端**（loadSceneFromJson 末尾）一字不差。
+        //   两处不一致的后果不是崩溃，而是 `skipped` 计数骗人：
+        //   2026-11 实测，第三人称模板场景（2 个实体：地面 + 出生点）报
+        //   `entities=2 skipped=1` —— 出生点被当成"空实体"，可它其实
+        //   好好加载了。而回归脚本正是拿 `skipped=0` 断言"没丢东西"的，
+        //   假红比不报更费时间。
         const bool hasNonMeshContent =
             je.contains("terrain") || je.contains("water") ||
             je.contains("decal") || je.contains("probe") ||
@@ -2324,7 +2375,11 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
             je.contains("character") || je.contains("trigger") ||
             je.contains("physicsMaterial") || je.contains("camera") ||
             je.contains("skinned") || je.contains("animator") ||
-            je.contains("animClip");
+            je.contains("animClip") || je.contains("gameStart") ||
+            je.contains("animKeys") ||
+            je.contains("pointLight") || je.contains("spotLight") ||
+            je.contains("directionalLight") || je.contains("player") ||
+            je.contains("playerLimb") || je.contains("folder");
         if (je["mesh"].is_null() && !hasNonMeshContent)
             ++r.skipped;
 
@@ -2766,6 +2821,17 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 w.add<ecs::CameraComponent>(e, cm);
         }
 
+        // 动画键盘映射（P4）。与 skinned 同一实体；缺块 = 没绑过键（正常）。
+        if (je.contains("animKeys") && je["animKeys"].is_object()) {
+            const ecs::AnimKeyMapComponent akm =
+                animKeyMapFromJson(je["animKeys"]);
+            if (auto* p = w.get<ecs::AnimKeyMapComponent>(e))
+                *p = akm;
+            else
+                w.add<ecs::AnimKeyMapComponent>(e, akm);
+        }
+
+        // ⚠ 与写端（saveSceneFromJson 里那份）必须一字不差，理由见那里。
         const bool hasNonMeshContent =
             je.contains("terrain") || je.contains("water") ||
             je.contains("decal") || je.contains("probe") ||
@@ -2773,7 +2839,11 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
             je.contains("character") || je.contains("trigger") ||
             je.contains("physicsMaterial") || je.contains("camera") ||
             je.contains("skinned") || je.contains("animator") ||
-            je.contains("animClip");
+            je.contains("animClip") || je.contains("gameStart") ||
+            je.contains("animKeys") ||
+            je.contains("pointLight") || je.contains("spotLight") ||
+            je.contains("directionalLight") || je.contains("player") ||
+            je.contains("playerLimb") || je.contains("folder");
         if (!mesh && !mat && !hasNonMeshContent) ++r.skipped;
     }
 

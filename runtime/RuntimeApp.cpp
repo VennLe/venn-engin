@@ -2,12 +2,14 @@
 
 #include "assets/AssetManager.h"
 #include "assets/AssetPath.h"
+#include "assets/Model.h"
 #include "core/Input.h"
 #include "core/Logger.h"
 #include "ecs/Components.h"
 #include "i18n/I18n.h"
 #include "physics/PhysicsWorld.h"
 #include "scene/CameraSystem.h"
+#include "scene/ModelInstance.h"
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
 #include "script/ScriptEngine.h"
@@ -16,6 +18,10 @@
 
 #include <GLFW/glfw3.h>
 
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -33,8 +39,215 @@ namespace {
 //
 // 为什么玩家不是场景里的实体：用户要"初始场景里不摆放任何物体"，
 // 出生点只标位置；玩家是运行时产物，存盘里也不该出现它。
+//
+// ------------------------------------------------------------
+// 外观（P1，2026-11）：胶囊占位体 / 外部骨骼模型
+// ------------------------------------------------------------
+// 空 `game.json.player.model` → 还是原来那个圆柱占位体，逐位不变。
+// 给了模型 → 走 `scene::instantiateModel`（**唯一**会同时建
+// `SkinnedMeshComponent` + 每个 submesh 一个可绘制子实体的路径）。
+//
+// ⚠ 为什么不能只写一个 `skinned` 块：它只建"骨架 + 动画状态"，
+//   不建任何带 `MeshComponent` 的实体 —— 而渲染器的绘制列表是从
+//   `MeshComponent` 收的（Renderer.cpp:3255 附近）。于是"架子建好了、
+//   日志 SCENE-SKINNED ok=1、视口里什么都没有"。
+//   这个坑在手工拼场景 JSON 时踩过一次，所以这里的顺序是硬的。
+
+// 模型世界包围盒。算法与编辑器 CharacterWindow::computeModelBounds 相同
+// （8 个角点各乘一次 SubMesh 变换再取 min/max —— 对带旋转的部件不会算出
+// 偏小的盒子）。返回 false = 没有可用 bounds。
+//
+// `yawDeg` 把**装配时的朝向补偿**也算进去（见 ModelInstanceOptions::
+// yawOffsetDeg）。抬脚底只需要 z，用 0 即可；而"朝向对不对"必须用真实
+// 补偿角算 —— 见下面 facing 自检。
+bool modelWorldBoundsYaw(const assets::Model& m, float yawDeg, glm::vec3* lo,
+                         glm::vec3* hi) {
+    const glm::mat4 rot =
+        glm::rotate(glm::mat4(1.0f), glm::radians(yawDeg),
+                    glm::vec3(0.0f, 0.0f, 1.0f));
+    bool first = true;
+    for (const auto& sub : m.subMeshes) {
+        if (!sub.mesh || !sub.mesh->hasBounds()) continue;
+        const glm::vec3 a = sub.mesh->boundsMin();
+        const glm::vec3 b = sub.mesh->boundsMax();
+        for (int i = 0; i < 8; ++i) {
+            const glm::vec3 c((i & 1) ? b.x : a.x, (i & 2) ? b.y : a.y,
+                              (i & 4) ? b.z : a.z);
+            const glm::vec3 w =
+                glm::vec3(rot * sub.transform * glm::vec4(c, 1.0f));
+            if (first) {
+                *lo = *hi = w;
+                first = false;
+            } else {
+                *lo = glm::min(*lo, w);
+                *hi = glm::max(*hi, w);
+            }
+        }
+    }
+    return !first;
+}
+
+bool modelWorldBounds(const assets::Model& m, glm::vec3* lo, glm::vec3* hi) {
+    return modelWorldBoundsYaw(m, 0.0f, lo, hi);
+}
+
+// 把模型挂到玩家实体上。返回 true = 挂上了（此时调用方不该再建占位体）。
+//
+// 三件必须一起做的事：
+//   ① `instantiateModel` 建子网格实体（可绘制）+ 玩家身上的蒙皮组件；
+//   ② **抬到脚底**：模型 pivot 在几何中心（导入时归位过），而玩家实体的
+//      位置语义是**脚**（见 PlayerController::update 的 `feet`）—— 不抬
+//      就有一半身体埋在地下。抬升量取**实测下沿** `-lo.z` 而不是 `h/2`：
+//      带裙摆 / 武器的模型几何中心不等于半高。
+//   ③ 胶囊跟模型走（`fitBody`）：解剖比例取"高 h → 半径 0.16h、
+//      半高 h/2-r"，即胶囊总高**等于**模型身高 —— 这就是 1:1。
+bool attachPlayerModel(scene::Scene& scene, assets::AssetManager& am,
+                       ecs::Entity player,
+                       const RuntimeConfig::PlayerVisual& v) {
+    if (v.model.empty()) return false;
+
+    const std::string resolved = assets::resolveAssetPath(v.model);
+    assets::Model* model = nullptr;
+    try {
+        // 与场景里 `kind:"fbx"` 走同一个入口：`.vmesh` 烤制版存在时
+        // loadFBX 内部会优先用它（见 engine/assets/FBX 加载的重定向）。
+        model = am.loadFBX(resolved, v.model);
+    } catch (const std::exception& ex) {
+        VK_LOG_ERROR("GAME-PLAYER model load failed path='%s' error=%s",
+                     v.model.c_str(), ex.what());
+        return false;
+    }
+    if (!model || !model->valid()) {
+        VK_LOG_ERROR("GAME-PLAYER model invalid path='%s'", v.model.c_str());
+        return false;
+    }
+
+    glm::vec3 lo(0.0f), hi(0.0f);
+    const bool hasBounds = modelWorldBounds(*model, &lo, &hi);
+    const float height = hasBounds ? std::max(hi.z - lo.z, 0.05f) : 1.8f;
+
+    scene::ModelInstanceOptions opt;
+    opt.parent = player;
+    opt.autoPlay = true;          // 绑上去就该动（与 CharacterWindow 一致）
+    opt.sourcePath = v.model;     // 打开 MODEL-INSTANCE 锚点
+    // 朝向补偿：模型的正面（-Y）转到实体的 +X。见 RuntimeConfig::PlayerVisual
+    // ::modelYaw 与 ModelInstanceOptions::yawOffsetDeg 的说明。
+    opt.yawOffsetDeg = v.modelYaw;
+    const scene::ModelInstanceResult r = scene::instantiateModel(scene, model, opt);
+    if (!r.root.valid() || r.entities.empty()) {
+        VK_LOG_ERROR("GAME-PLAYER instantiate failed path='%s'",
+                     v.model.c_str());
+        return false;
+    }
+
+    ecs::World& w = scene.world();
+
+    // ② 抬到脚底。子实体的局部变换是 instantiateModel 写的，这里只加 z。
+    if (hasBounds) {
+        const float lift = -lo.z;
+        for (ecs::Entity ce : r.entities) {
+            if (auto* t = w.get<ecs::TransformComponent>(ce))
+                t->position.z += lift;
+        }
+        VK_LOG_INFO("GAME-PLAYER model lift=%.3f m (bounds z: %.3f..%.3f) "
+                    "yaw=%.1f deg -> bottom=%.4f",
+                    static_cast<double>(lift), static_cast<double>(lo.z),
+                    static_cast<double>(hi.z),
+                    static_cast<double>(v.modelYaw),
+                    static_cast<double>(lo.z + lift));
+
+        // ---- 朝向自检（P5）----
+        //
+        // 判据：**人形的"左右"跨度必须大于"前后"跨度**。
+        //   实测这具模型：臂展（左右）≈ 1.95 m、身体厚（前后）≈ 0.36 m ——
+        //   差距够大，是个很稳的判据。漏掉 90° 补偿时两者整好互换
+        //   （X 变成 1.95、Y 变成 0.36），这条立刻红。
+        //
+        //   ⚠ 为什么不比截图：`w/h` 的像素判据实测在 0.367~0.429 之间飘
+        //   （手臂前后摆会撑宽包围盒），拿来断言就是 flaky。几何量是确定的。
+        //   ⚠ 也不要拿"肩宽"当基准：装配的是 T/A-pose，包围盒量到的是**臂展**。
+        glm::vec3 fLo(0.0f), fHi(0.0f);
+        if (modelWorldBoundsYaw(*model, v.modelYaw, &fLo, &fHi)) {
+            const float spanX = fHi.x - fLo.x;
+            const float spanY = fHi.y - fLo.y;
+            VK_LOG_INFO("GAME-PLAYER facing yaw=%.1f spanX=%.3f spanY=%.3f "
+                        "shouldersAlong=%s ok=%d",
+                        static_cast<double>(v.modelYaw),
+                        static_cast<double>(spanX),
+                        static_cast<double>(spanY),
+                        spanX < spanY ? "Y" : "X",
+                        spanX < spanY ? 1 : 0);
+        }
+    }
+
+    // ③ 胶囊 / 眼高跟模型走
+    if (auto* cc = w.get<ecs::CharacterControllerComponent>(player)) {
+        if (v.fitBody) {
+            const float radius = glm::clamp(height * 0.16f, 0.15f, 0.60f);
+            cc->radius = radius;
+            cc->halfHeight = std::max(0.10f, height * 0.5f - radius);
+            cc->stepHeight = glm::clamp(height * 0.20f, 0.20f, 0.50f);
+        } else {
+            cc->radius = v.radius;
+            cc->halfHeight = v.halfHeight;
+        }
+        // 跳跃初速按身高缩放：跳起 0.39 × 身高（1.8 m → 0.70 m）。
+        // 与 `editor/EditorScene.cpp` 的 bindDefaultCharacter 同一个公式，
+        // 与 Jump clip 的 0.75 s 滞空对齐（2026-10-22）。
+        cc->jumpSpeed = glm::clamp(std::sqrt(2.0f * 9.81f * 0.39f * height),
+                                   3.0f, 5.0f);
+        cc->airControl = 0.45f;
+        VK_LOG_INFO("GAME-PLAYER capsule radius=%.3f halfHeight=%.3f "
+                    "totalHeight=%.3f (model=%.3f fit=%d) jumpV0=%.2f "
+                    "jumpH=%.2fm",
+                    static_cast<double>(cc->radius),
+                    static_cast<double>(cc->halfHeight),
+                    static_cast<double>(2.0f * (cc->halfHeight + cc->radius)),
+                    static_cast<double>(height), v.fitBody ? 1 : 0,
+                    static_cast<double>(cc->jumpSpeed),
+                    static_cast<double>(cc->jumpSpeed * cc->jumpSpeed /
+                                        (2.0f * 9.81f)));
+    }
+
+    // 取景跟上身高：2.05 m 的壮汉不该用 1.6 m 的镜头距离（会显得脸贴脸）。
+    // 1.9 倍身高 ≈ 让角色占屏 1/3，是第三人称的常规构图。
+    if (auto* camC = w.get<ecs::CameraComponent>(player)) {
+        camC->targetOffset = glm::vec3(0.0f, 0.0f, height * 0.42f);
+        camC->distance = glm::clamp(height * 2.0f, 2.5f, 6.5f);
+        VK_LOG_INFO("GAME-PLAYER camera distance=%.2f targetOffset.z=%.2f",
+                    static_cast<double>(camC->distance),
+                    static_cast<double>(camC->targetOffset.z));
+    }
+
+    // ①' 起手 clip：给了就用给的，否则用 instantiateModel 挑的第一段
+    if (auto* sk = w.get<ecs::SkinnedMeshComponent>(player)) {
+        if (!v.clip.empty()) {
+            if (sk->model && sk->model->skeleton &&
+                !sk->model->skeleton->findClip(v.clip)) {
+                VK_LOG_WARN("GAME-PLAYER clip '%s' 不在 '%s' 里"
+                            "（可用片段见 MODEL-CLIPS），改用第一段",
+                            v.clip.c_str(), v.model.c_str());
+            } else {
+                sk->clipName = v.clip;
+            }
+        }
+        // 有 AnimatorComponent 时它是权威，得把选好的 clip 交过去 ——
+        // 否则 AnimatorSystem 的"defaultClip 只补一次"会把空的补上、把
+        // 我们刚设的覆盖掉（顺序依赖，写在这里最安全）。
+        if (auto* an = w.get<ecs::AnimatorComponent>(player))
+            an->defaultClip = sk->clipName;
+    }
+
+    VK_LOG_INFO("GAME-PLAYER visual=model path=%s meshes=%d skinned=%d "
+                "height=%.3f m (1:1)",
+                v.model.c_str(), static_cast<int>(r.entities.size()),
+                r.skinned ? 1 : 0, static_cast<double>(height));
+    return true;
+}
+
 ecs::Entity spawnPlayerFromGameStart(scene::Scene& scene,
-                                     assets::AssetManager& am) {
+                                     assets::AssetManager& am,
+                                     const RuntimeConfig::PlayerVisual& vis) {
     ecs::World& w = scene.world();
 
     bool hasCharacter = false;
@@ -69,22 +282,44 @@ ecs::Entity spawnPlayerFromGameStart(scene::Scene& scene,
     cc.bodyYaw = yaw;
     w.add<ecs::CharacterControllerComponent>(e, cc);
 
-    // 占位身体：一个胶囊（圆柱 + 圆顶感靠颜色/光照，不做真胶囊网格）。
-    // ⚠ 材质名必须唯一：AssetManager 按名缓存，重名会和其他物体共用。
-    ecs::MeshComponent mc;
-    mc.mesh = am.cylinder(cc.radius, "runtime.player.body", 16);
-    w.add<ecs::MeshComponent>(e, mc);
-    ecs::MaterialComponent matc;
-    matc.material = am.makeMaterial("runtime.player.mat", nullptr,
-                                    glm::vec4(0.62f, 0.70f, 0.86f, 1.0f),
-                                    0.45f, 0.0f);
-    w.add<ecs::MaterialComponent>(e, matc);
+    // ⚠ 必须给玩家挂一个 `CameraComponent`，否则**相机根本不跟随**。
+    //   这是 `CameraSystem::update` 的第一条规则：场景里没有任何启用的
+    //   CameraComponent → `selectActive` 找不到 → 直接 return，此时
+    //   PlayerController 每帧写的"期望姿态"一个字都不会落进
+    //   `Scene::camera()`。症状是：角色自己走得挺好，镜头钉在出生点，
+    //   人越走越小（2026-11 实测截图上就是这个）。
+    //   编辑器侧 `createPlayer` 是同一个做法，两边保持一致。
+    {
+        ecs::CameraComponent camC;
+        // 注视点抬到胸部高度（眼高按身高的 0.92 处折算，与编辑器同一比例）
+        camC.targetOffset = glm::vec3(0.0f, 0.0f, 1.8f * 0.42f);
+        camC.distance = 3.6f;   // 1.8 m 的角色占屏 ~1/3，第三人称的常规取景
+        camC.minDistance = 0.6f;
+        w.add<ecs::CameraComponent>(e, camC);
+    }
+
+    // 外观：先试外部模型。挂上了就**不再建**占位体 —— 两个都在会看到
+    // "角色身体里插着一根蓝柱子"。
+    const bool bound = attachPlayerModel(scene, am, e, vis);
+
+    if (!bound) {
+        // 占位身体：一个胶囊（圆柱 + 圆顶感靠颜色/光照，不做真胶囊网格）。
+        // ⚠ 材质名必须唯一：AssetManager 按名缓存，重名会和其他物体共用。
+        ecs::MeshComponent mc;
+        mc.mesh = am.cylinder(cc.radius, "runtime.player.body", 16);
+        w.add<ecs::MeshComponent>(e, mc);
+        ecs::MaterialComponent matc;
+        matc.material = am.makeMaterial("runtime.player.mat", nullptr,
+                                        glm::vec4(0.62f, 0.70f, 0.86f, 1.0f),
+                                        0.45f, 0.0f);
+        w.add<ecs::MaterialComponent>(e, matc);
+    }
 
     VK_LOG_INFO("GAME-PLAYER spawned at GameStart found=%d "
-                "feet=(%.2f,%.2f,%.2f) yaw=%.3f",
+                "feet=(%.2f,%.2f,%.2f) yaw=%.3f visual=%s",
                 found ? 1 : 0, static_cast<double>(feet.x),
                 static_cast<double>(feet.y), static_cast<double>(feet.z),
-                static_cast<double>(yaw));
+                static_cast<double>(yaw), bound ? "model" : "capsule");
     return e;
 }
 
@@ -196,7 +431,7 @@ void RuntimeApp::onInit() {
     // 模板场景现在是"空场景"（只有地形 + 出生点），玩家由这里生成 ——
     // 与 UE 的 PlayerStart → Spawn Pawn 同一个思路。老场景自带
     // CharacterController 时这一步什么都不做，行为完全不变。
-    spawnPlayerFromGameStart(activeScene(), assets());
+    spawnPlayerFromGameStart(activeScene(), assets(), m_cfg.player);
 
     // ---- 玩家（G10）：场景里有角色控制器才接管 ----
     m_player = std::make_unique<PlayerController>(m_input);
@@ -553,16 +788,42 @@ void RuntimeApp::tickUi(float dt) {
             m_input.pushContext("Menu");
             // 菜单要用鼠标点，光标得看得见，并且锁在窗口内（GLFW 的
             // DISABLED 之外没有单独的 clip 模式；可见是菜单的硬需求）。
+            // ★ P5：进菜单 = **退出操作态**。Esc 因此天然满足"退出操作时
+            //   显示鼠标"，不需要再为 Esc 单独写一条路径。
+            m_mouseCaptured = false;
             window().setCursorVisible(true);
             m_focus.clearFocus();
         } else {
             if (m_input.depth() > 1) m_input.popContext();
-            window().setCursorVisible(false);
+            // ★ P5：回到 Gameplay **不自动捕获** —— 玩家必须再点一次视口。
+            //   否则"从菜单点继续 → 鼠标突然消失、镜头开始跟着鼠标转"，
+            //   玩家会以为鼠标失灵了。
+            m_mouseCaptured = false;
+            window().setCursorVisible(true);
             m_focus.endFrame();
         }
-        VK_LOG_INFO("UI2-PAUSE open=%d context=%s cursor=%d", state,
-                    m_input.topContext().c_str(),
+        VK_LOG_INFO("UI2-PAUSE open=%d context=%s cursor=%d",
+                    state, m_input.topContext().c_str(),
                     window().cursorVisible() ? 1 : 0);
+    }
+
+    // ---- ①b 点击视口 → 进入操作态（P5）----
+    //
+    // 只有 Gameplay 且未捕获时才收这个左键：暂停菜单里的点击属于 UI。
+    // 命中区域就是整个客户区 —— 游戏态没有吃点击的 UI（HUD 的血条只是
+    // 绘制，没有交互）。将来加可点击 HUD 时，这里要换成 ui2 的 hit test。
+    if (!paused && !m_mouseCaptured && core::Input::mousePressed(0)) {
+        m_mouseCaptured = true;
+        m_mouseIdleLogged = false;          // 下次退出操作时再提示一次
+        window().setCursorVisible(false);   // DISABLED = 隐藏 + 锁定 + 无限转
+        VK_LOG_INFO("GAME-MOUSE captured=1 reason=click "
+                    "(WASD on / cursor hidden; Esc releases)");
+    }
+    if (paused && m_mouseCaptured) {
+        // 兜底：任何绕过 state 变化的路径（脚本强切状态栈）都不该留在捕获态
+        m_mouseCaptured = false;
+        window().setCursorVisible(true);
+        VK_LOG_INFO("GAME-MOUSE captured=0 reason=paused");
     }
 
     // ---- ② 暂停开关（状态迁移的**意图**，真正改栈在 onUpdate 末尾）----
@@ -640,6 +901,72 @@ void RuntimeApp::tickUi(float dt) {
 
 // ---------------------------------------------------------------- 仿真
 
+// ============================================================
+// 玩家四段基础动画（P3 / P4）
+// ============================================================
+// 状态机的**内容**已经搬到 `animation/Locomotion`（2026-10-22）：编辑器
+// Play 与运行时以前各有一半（编辑器只有位移、没有走路动画），现在两边
+// 调同一个函数。这里只负责三件运行时才有的事：
+//   ① 取"物理真值"（PlayerController 的水平速度 / 贴地标志）；
+//   ② 把 RuntimeConfig 的 player 块翻译成 LocomotionConfig；
+//   ③ 轮询 `AnimKeyMapComponent` 的按键映射（角色面板里绑的那几个键）。
+void RuntimeApp::tickPlayerAnimation(float dt) {
+    if (!m_player || !m_player->attached()) return;
+
+    // 只在初始化时求一次实体句柄？不行 —— `attach` 可能在 Play 中途重建。
+    const ecs::Entity pe = m_player->entity();
+    if (!pe.valid()) return;
+
+    ecs::World& w = activeScene().world();
+    ecs::SkinnedMeshComponent* sk = w.get<ecs::SkinnedMeshComponent>(pe);
+    // 没有蒙皮模型（占位胶囊体）→ 这条链整段不参与，行为与引入之前一致。
+    if (!sk || !sk->model || !sk->model->skeleton) return;
+    const assets::Skeleton& skel = *sk->model->skeleton;
+
+    const RuntimeConfig::PlayerVisual& pv = m_cfg.player;
+
+    animation::LocomotionConfig cfg;
+    cfg.idleClip = pv.idleClip;
+    cfg.walkClip = pv.walkClip;
+    cfg.runClip = pv.runClip;
+    cfg.jumpClip = pv.jumpClip;
+    cfg.walkSpeed = pv.walkSpeed;
+    cfg.runSpeed = pv.runSpeed;
+    cfg.restartOnSwitch = pv.restartOnSwitch;
+    cfg.idleTriggerSec = pv.idleTriggerSec;
+
+    // 走 / 跑分界自动值的输入：控制器最大速度（没有就退回 4.5）
+    const auto* cc = w.get<ecs::CharacterControllerComponent>(pe);
+    const float maxSpeedHint = (cc && cc->maxSpeed > 0.0f) ? cc->maxSpeed : 4.5f;
+
+    ecs::AnimatorComponent* an = w.get<ecs::AnimatorComponent>(pe);
+
+    // ---- 按键映射（P4）：先轮询，按下就在这一帧强播 ----
+    //
+    // 放在状态机**之前**：同一帧里"按了键"应当压过"刚走起来"，否则玩家
+    // 按一下挥手的瞬间正好在走路的话，那一下会被 loco 覆盖掉（看起来像
+    // "按键没反应"，而日志里 key 是打了的 —— 最难查的一类）。
+    if (const auto* km = w.get<ecs::AnimKeyMapComponent>(pe)) {
+        int key = 0;
+        // 运行时的判定就用 `core::Input`：Game.exe 里没有 ImGui 抢键盘
+        // 这回事（编辑器侧必须换 `ui_keys::pressed`，理由见 Locomotion.h）。
+        if (const std::string* clip =
+                animation::pollKeyTrigger(*km, &core::Input::keyPressed, &key)) {
+            animation::playTriggerClip(m_playerAnim, *sk, an, skel, *clip,
+                                       km->holdSeconds, "GAME");
+            VK_LOG_INFO("GAME-ANIM-KEY-TRIGGER clip=%s key=%d", clip->c_str(),
+                        key);
+        }
+    }
+
+    const glm::vec3 v = m_player->velocity();
+    const float hs = std::sqrt(v.x * v.x + v.y * v.y);   // 水平速度（m/s）
+    const bool onGround = m_player->onGround();
+
+    animation::updateLocomotion(m_playerAnim, *sk, an, skel, hs, onGround,
+                                maxSpeedHint, dt, cfg, "GAME");
+}
+
 void RuntimeApp::simulate(float dt) {
     ++m_simFrames;
 
@@ -653,7 +980,26 @@ void RuntimeApp::simulate(float dt) {
     // 顺序（与编辑器 Play 一致，见 ship_roadmap §4 G10）：
     //   脚本 → 玩家 → 物理 → 接触事件
     // 玩家必须先于物理：它写入的变换/代理速度是这一步接触求解的输入。
-    if (m_player) m_player->update(activeScene(), m_binding.world.get(), dt);
+    //
+    // ⚠ P5：**没点视口之前不推进玩家**（用户要求"必须左键点视口后才能
+    //   开始交互"）。注意只门控这一处，不动 tickPlayerAnimation —— 否则
+    //   人会僵在出生点一动不动，看起来像卡死；点了之后才突然开始呼吸。
+    if (m_player) {
+        if (m_mouseCaptured)
+            m_player->update(activeScene(), m_binding.world.get(), dt);
+        else if (!m_mouseIdleLogged) {
+            // 只喊一次：这是"按了 W 却没反应"最常见的原因，日志里必须有。
+            m_mouseIdleLogged = true;
+            VK_LOG_INFO("GAME-MOUSE captured=0 (click the viewport to "
+                        "take control; player input is frozen until then)");
+        }
+    }
+
+    // ---- 玩家四段动画（P3）----
+    // 必须排在玩家更新**之后**（要用这一帧的速度 / 贴地）、AnimatorSystem
+    // **之前**（它是真正推进播放头并采样的那一步；晚一帧就会看到姿势滞后
+    // 一帧，跑起来时最明显）。
+    tickPlayerAnimation(dt);
 
     // ---- 骨骼动画（A0-3）----
     // 排在物理之前，与编辑器 Play 同位置：将来 A4 的根运动会把位移写进
@@ -679,6 +1025,32 @@ void RuntimeApp::simulate(float dt) {
                     "arm=%.4f",
                     static_cast<unsigned long long>(m_simFrames), p.x, p.y, p.z,
                     m_player->onGround() ? 1 : 0, m_player->springArmDistance());
+
+        // ---- 脚底 vs 地表（2026-10-22）----
+        //
+        // 用户报"角色在地形上脚陷进去了"。这条探针把两件事拆开：
+        //   feetZ = 实体原点。**实体原点是脚底**（见 PlayerController 顶部
+        //           的注释），所以它就是要和地表比的那个数；
+        //   surfZ = 地形高度场在 (x,y) 处的插值高度（与贴地用的是同一个
+        //           `heightAt`）。
+        // gap = feetZ - surfZ。**gap < 0 就是脚在地面以下**。
+        //
+        // 没有地形时不打 —— 否则会在所有"平地场景"里报一堆 gap，把真正
+        // 的问题淹掉。
+        if (m_binding.world && m_binding.world->hasHeightfield()) {
+            const ecs::Entity pe = m_player->entity();
+            const auto* tc = activeScene().world().get<ecs::TransformComponent>(pe);
+            const physics::Heightfield* hf = m_binding.world->heightfield();
+            if (tc && hf) {
+                const float surf = physics::heightAt(*hf, tc->position.x,
+                                                     tc->position.y);
+                VK_LOG_INFO("GAME-FEET f=%llu feetZ=%.4f surfZ=%.4f gap=%+.4f",
+                            static_cast<unsigned long long>(m_simFrames),
+                            static_cast<double>(tc->position.z),
+                            static_cast<double>(surf),
+                            static_cast<double>(tc->position.z - surf));
+            }
+        }
     }
 
     if (m_physicsDumpEvery > 0 &&
