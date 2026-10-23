@@ -118,6 +118,7 @@ private:
     bool m_wizExternal = false;
     std::string m_wizCodeRoot;
     int m_wizRes = 1;            // 0=1280x720 1=1920x1080 2=2560x1440 3=自定义
+                                 // （onInit 会按本机桌面分辨率改写推荐值）
     int m_wizCustomW = 1280;
     int m_wizCustomH = 720;
     bool m_wizFullscreen = false;

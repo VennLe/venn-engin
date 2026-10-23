@@ -197,6 +197,33 @@ void LauncherApp::onInit() {
     }
     syncWizardRoot();
 
+    // 分辨率默认值：**推荐当前电脑显示设备的分辨率**（2026-10-23）。
+    //   · 桌面分辨率恰好是某个预设 → 直接选中那个预设；
+    //   · 不是（比如 2880×1800）→ 选中"自定义"并把两个输入框预填成桌面值，
+    //     用户要么一键确认要么自己改，不用再手抄一遍自己屏幕的分辨率。
+    // ⚠ 放在 MYVK_LAUNCHER_TEST_RES **之前**：环境变量是自动化入口，
+    //   显式指定必须赢过"猜默认"，所以这里只填初值、后面 env 再覆盖。
+    {
+        int dw = 0, dh = 0;
+        if (window().primaryMonitorResolution(&dw, &dh)) {
+            int preset = -1;
+            for (int i = 0; i < kResCount; ++i)
+                if (kResPresets[i].w == dw && kResPresets[i].h == dh) {
+                    preset = i;
+                    break;
+                }
+            if (preset >= 0) {
+                m_wizRes = preset;
+            } else {
+                m_wizRes = kResCount - 1;   // Custom
+                m_wizCustomW = dw;
+                m_wizCustomH = dh;
+            }
+            VK_LOG_INFO("LAUNCHER-WIZARD res-default=%dx%d preset=%d", dw, dh,
+                        m_wizRes);
+        }
+    }
+
     if (envStr("MYVK_LAUNCHER_PAGE") == "new") beginWizard();
 
     // 画面初值（M4 验收用）。⚠ 同样只是**初值**：下拉框照样可以点开换。

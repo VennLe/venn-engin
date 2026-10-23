@@ -46,8 +46,8 @@
 #include <vector>
 
 namespace assets {
-class Model;
-class Skeleton;
+struct Model;
+struct Skeleton;
 } // namespace assets
 
 namespace render {

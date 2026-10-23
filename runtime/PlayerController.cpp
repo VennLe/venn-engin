@@ -275,6 +275,27 @@ void PlayerController::update(scene::Scene& scene, physics::PhysicsWorld* world,
     const physics::CharacterStepResult r = physics::stepCharacter(
         wref, m_desc, m_state, desired, dt, jump, m_proxy);
 
+    // ---------------- 足迹取最高点：脚不许插进坡面（2026-10-23）----------------
+    //
+    // stepCharacter 的贴地射线只看胶囊**中心**正下方一点。斜坡上行走时，
+    // 足迹前缘那半边地表比中心高 —— 物理胶囊有水平扫掠兜着，但**模型**的
+    // 脚是刚体，前脚正好插在高于中心的坡面里（用户报的"脚陷进地形"）。
+    // 把脚抬到足迹（中心 + ±半径的前后左右）内最高点 = "胶囊搁在地形棱
+    // 上"的同一语义。只对 onGround 生效：跳跃/下落的抛物线不能被改。
+    if (m_desc.ground && m_desc.ground->valid() && m_state.onGround) {
+        const float fr = m_desc.radius;
+        const float px = m_state.position.x;
+        const float py = m_state.position.y;
+        float surf = physics::heightAt(*m_desc.ground, px, py);
+        surf = std::max(surf, physics::heightAt(*m_desc.ground, px + fr, py));
+        surf = std::max(surf, physics::heightAt(*m_desc.ground, px - fr, py));
+        surf = std::max(surf, physics::heightAt(*m_desc.ground, px, py + fr));
+        surf = std::max(surf, physics::heightAt(*m_desc.ground, px, py - fr));
+        const float halfTotalR = cc->halfHeight + cc->radius;
+        if (m_state.position.z - halfTotalR < surf - 1.0e-4f)
+            m_state.position.z = surf + halfTotalR;
+    }
+
     // ---------------- 兜底：脚底绝不允许留在地形下面 ----------------
     //
     // 用户原话："角色在踩在地形的地面时，应该是脚部踩在上面的，不允许脚底

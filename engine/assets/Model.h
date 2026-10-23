@@ -21,7 +21,7 @@
 namespace assets {
 
 class Mesh;
-class Material;
+struct Material;
 
 struct SubMesh {
     Mesh* mesh = nullptr;

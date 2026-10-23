@@ -39,7 +39,7 @@
 #include <vector>
 
 namespace assets {
-class Material;
+struct Material;
 class Texture;
 } // namespace assets
 

@@ -48,7 +48,7 @@
 #include <string>
 
 namespace assets {
-class Skeleton;
+struct Skeleton;
 }
 
 namespace animation {

@@ -48,7 +48,7 @@ class DescriptorAllocator;
 } // namespace rhi
 
 namespace assets {
-class Material;
+struct Material;
 class Mesh;
 } // namespace assets
 

@@ -55,6 +55,9 @@ public:
     void minimize();
     // 主显示器工作区（已排除任务栏）。拿不到显示器时返回 false。
     bool primaryMonitorWorkArea(int* x, int* y, int* w, int* h) const;
+    // 主显示器**当前视频模式**的分辨率（桌面真实分辨率，不扣任务栏）。
+    // 启动器"推荐分辨率"用：推荐的就是用户看到的那块屏的分辨率。
+    bool primaryMonitorResolution(int* w, int* h) const;
     // 供"记住上次关闭时的大小"用：窗口模式下的几何。
     // 全屏时返回的是进入全屏**之前**记住的那份，而不是全屏尺寸。
     void windowedGeometry(int* x, int* y, int* w, int* h, bool* maxed) const;

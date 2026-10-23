@@ -353,6 +353,16 @@ bool Window::primaryMonitorWorkArea(int* x, int* y, int* w, int* h) const {
     return *w > 0 && *h > 0;
 }
 
+bool Window::primaryMonitorResolution(int* w, int* h) const {
+    GLFWmonitor* mon = glfwGetPrimaryMonitor();
+    if (!mon) return false;
+    const GLFWvidmode* vm = glfwGetVideoMode(mon);
+    if (!vm || vm->width <= 0 || vm->height <= 0) return false;
+    if (w) *w = vm->width;
+    if (h) *h = vm->height;
+    return true;
+}
+
 void Window::windowedGeometry(int* x, int* y, int* w, int* h,
                               bool* maxed) const {
     if (m_fullscreen) {

@@ -18,9 +18,9 @@
 
 namespace assets {
 class Mesh;
-class Material;
-class Model;
-class Skeleton;
+struct Material;
+struct Model;
+struct Skeleton;
 class Texture;
 }
 

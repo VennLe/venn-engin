@@ -2049,10 +2049,25 @@ void EditorApp::runRuntimeScripts(float dt) {
 //
 // ⚠ 没有地形时**返回 0 而不是"无穷低"**：编辑器视口里那块参考地面就在
 //   z=0（栅格也在那），把人放在 -∞ 会让他一路掉出屏幕。
-float EditorApp::editorGroundHeight(float x, float y) const {
+//
+// ⚠ 贴地高度取**足迹内最高点**（2026-10-23）：只取中心一个点时，斜坡上
+//   "前脚"所在的半边地表比中心高 → 模型的脚插进坡面（用户报的"脚陷进
+//   地形"）。对足迹圆盘（中心 + ±半径的前后左右）取 max，人就站在足迹的
+//   最高接触点上 —— 与"胶囊搁在地形棱上"是同一语义。
+float EditorApp::editorGroundHeight(float x, float y, float radius) const {
     if (m_physics) {
         if (const physics::Heightfield* hf = m_physics->heightfield()) {
-            if (hf->valid()) return physics::heightAt(*hf, x, y);
+            if (hf->valid()) {
+                const float center = physics::heightAt(*hf, x, y);
+                const float r = glm::max(radius, 0.0f);
+                if (r <= 0.0f) return center;
+                return glm::max(
+                    glm::max(physics::heightAt(*hf, x + r, y),
+                             physics::heightAt(*hf, x - r, y)),
+                    glm::max(physics::heightAt(*hf, x, y + r),
+                             glm::max(physics::heightAt(*hf, x, y - r),
+                                      center)));
+            }
         }
     }
     return 0.0f;
@@ -2141,7 +2156,11 @@ void EditorApp::runPlayers(float dt) {
         // 完整的物理世界 + 运动学代理，而编辑器 Play 的移动本来就是直接改
         // 变换（不走物理）——半条链接上去只会得到"跳跃被物理推、走路不被
         // 推"的混合手感，比没有更糟。
-        const float groundZ = editorGroundHeight(tc->position.x, tc->position.y);
+        // 足迹半径取胶囊半径（没有碰撞体组件就用出厂值）。
+        float footR = 0.35f;
+        if (const auto* cc = w.get<ecs::CharacterControllerComponent>(e))
+            footR = cc->radius;
+        const float groundZ = editorGroundHeight(tc->position.x, tc->position.y, footR);
         if (!pc->started) {
             pc->velocityZ = 0.0f;
             pc->onGround = true;
@@ -2176,9 +2195,29 @@ void EditorApp::runPlayers(float dt) {
         } else if (tc->position.z < groundZ) {
             // 走上坡：抬起来（**不允许脚底沉到地表以下**）
             tc->position.z = groundZ;
-        } else if (tc->position.z > groundZ + 0.02f) {
-            // 走下坡 / 走出坡沿：交给重力，别硬按着
-            pc->onGround = false;
+        } else if (tc->position.z > groundZ) {
+            // 走下坡：贴着地表走下去，**别跳着下去**（2026-10-23）。
+            //
+            // 旧实现：比新地表高 0.02 m 就直接交给重力（onGround=false）。
+            // 在起伏地形上下坡时，每帧的水平步长会让脚"掉出"贴地窗口
+            // 一两帧 → onGround 反复翻 false → 动画状态机 walk↔jump 横跳
+            // （restartOnSwitch 每次从头迈步）→ 用户报的"走路一卡一卡"。
+            //
+            // 现在按"一步最多能跨下的落差"来分：落差 ≤ 本帧水平步长 ×
+            // tan(slopeLimit) + 0.02 → 跟着地表走下去（保持贴地）；
+            // 真正的坡沿 / 陡坎（落差远超一步）仍然交给重力掉下去。
+            const float drop = tc->position.z - groundZ;
+            float tanSlope = 1.0356f;   // tan(46°)，与 slopeLimitDeg 出厂值同源
+            if (const auto* cc = w.get<ecs::CharacterControllerComponent>(e))
+                tanSlope = std::tan(glm::radians(
+                    glm::clamp(cc->slopeLimitDeg, 1.0f, 89.0f)));
+            const float maxDown =
+                (moving && keysActive ? speed * dt : 0.0f) * tanSlope + 0.02f;
+            if (drop <= maxDown) {
+                tc->position.z = groundZ;   // 跟着地形下坡（保持贴地）
+            } else {
+                pc->onGround = false;       // 坡沿 / 陡坎：交给重力
+            }
         } else {
             tc->position.z = groundZ;      // 微差：贴住
         }
