@@ -77,6 +77,11 @@ void Input::mouseDelta(double* dx, double* dy) {
     if (dy) *dy = g_uiMouse ? 0.0 : g_deltaY;
 }
 
+void Input::mouseDeltaRaw(double* dx, double* dy) {
+    if (dx) *dx = g_deltaX;
+    if (dy) *dy = g_deltaY;
+}
+
 double Input::scrollDelta() {
     return g_uiMouse ? 0.0 : g_scrollDelta;
 }

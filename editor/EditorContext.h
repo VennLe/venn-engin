@@ -242,13 +242,53 @@ public:
     bool& gameFullscreenRef() { return m_gameFullscreen; }
     void toggleGameFullscreen() { m_gameFullscreen = !m_gameFullscreen; }
 
+    // ---------------------------------------------------------- Play 鼠标捕获
+    //
+    // 用户要求（P8，2026-10-23）："游戏启动运行后，必须要鼠标左键在 3D 视口
+    // 中点击后才能开始和角色交互操作，并且此时鼠标是隐藏不显示的。按下 Esc
+    // 键，此时就正常显示鼠标。"
+    //
+    // 这就是**两态**，与运行时 Game.exe 里 `RuntimeApp::m_mouseCaptured`
+    // 完全同一套语义（那边早就实现了，这边 Play 一直缺）：
+    //   false = 未操作：光标可见可自由移动，玩家不响应键鼠（WASD / 跳跃 /
+    //           视角全冻结），编辑器面板照常可点
+    //   true  = 操作中：GLFW_CURSOR_DISABLED（隐藏 + 锁定 + 无限转视角），
+    //           ImGui 鼠标被关掉（否则锁在中心的那个"幽灵光标"会去点面板）
+    //
+    // 为什么状态放在 Context 而不是 EditorApp：ViewportPanel 是**发现**
+    // "玩家点了视口"的地方（只有它知道鼠标是否在自己这块矩形里），而
+    // EditorApp 是**执行**的地方（它拿得到 Window，能改光标模式）。
+    // 两边通过这三个接口对话，谁也不认识谁。
+    bool playMouseCaptured() const { return m_playMouseCaptured; }
+    void setPlayMouseCaptured(bool on) {
+        if (on == m_playMouseCaptured) return;
+        m_playMouseCaptured = on;
+        m_playCursorDirty = true;   // 让 EditorApp 把光标模式同步下去
+    }
+    // ViewportPanel：Play 态下左键确实点在视口第一格里 → 请求接管
+    void requestPlayMouseCapture() { m_playCaptureRequested = true; }
+    bool takePlayMouseCaptureRequest() {
+        const bool v = m_playCaptureRequested;
+        m_playCaptureRequested = false;
+        return v;
+    }
+    // EditorApp：捕获状态变了没（变了才去碰 GLFW / ImGui，避免每帧写光标模式）
+    bool takePlayCursorDirty() {
+        const bool v = m_playCursorDirty;
+        m_playCursorDirty = false;
+        return v;
+    }
+
     // ---------------------------------------------------------- 视口导航灵敏度
     // **编辑态视口**的导航灵敏度：移动与旋转共用一个系数（UE 视口那套）。
     // 默认 1、必须 > 0；视口右上角 HUD 可直接填数字，**按住右键 + 滚轮**
     // 上滑变大 / 下滑变小（单独滚轮是推拉相机，不碰这个值）。
     //
-    // 它**不作用于 Play 态** —— 游戏画面里的相机归游戏自己管，编辑器视口
-    // 在 Play 期间不抢任何键鼠输入（见 ViewportPanel 的导航分支）。
+    // 它**不作用于 Play 态** —— 游戏画面里的相机归游戏自己管。
+    //
+    // ⚠ 2026-10-23（P8）起 Play 态**会**吃键鼠，但只在"已接管"之后
+    //   （见下面 playMouseCaptured）：转视角的灵敏度用角色自己的
+    //   `PlayerComponent::lookSpeed`，与这个导航系数无关。
     static constexpr float kMinSensitivity = 0.05f;
     static constexpr float kMaxSensitivity = 20.0f;
     float navSensitivity() const { return m_navSensitivity; }
@@ -728,6 +768,11 @@ private:
     std::string m_animSnapshot;  // 按下动画 Play 时的场景 JSON（Stop 恢复用）
 
     bool m_gameFullscreen = false;
+    // Play 态鼠标捕获（见 playMouseCaptured 的注释）。三个成员各司其职：
+    // 状态本身、ViewportPanel→EditorApp 的请求、EditorApp→Window 的脏标记。
+    bool m_playMouseCaptured = false;
+    bool m_playCaptureRequested = false;
+    bool m_playCursorDirty = false;
     float m_navSensitivity = 1.0f;
     // 见 navSpeedScalesWithDistance()。默认关 = 行为与改动前完全一致。
     bool m_navSpeedByDistance = false;

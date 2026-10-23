@@ -1,5 +1,10 @@
 # 默认操控 · 真实跳跃 · 脚踩地形 · 角色预览（P6）
 
+> **P8 补充（2026-10-23）**：Play 态的键鼠是**两态**的 —— 进了 Play 也要先
+> 用左键在 3D 视口里点一下才开始响应（与此同时鼠标隐藏），按 Esc 交还。
+> 见 `docs/play_input_capture.md`。本文的"出厂键位"不变，但"什么时候生效"
+> 由那条文档说了算。
+>
 > 2026-10-22 · 承接 `docs/character_locomotion.md`（P4）与 `docs/player_feel.md`（P5）
 > 代码：`engine/core/InputMap.cpp`、`engine/physics/CharacterController.*`、
 > `runtime/PlayerController.cpp`、`editor/EditorApp.cpp`、`editor/CharacterWindow.*`、
@@ -68,6 +73,11 @@
 ---
 
 ## 3 · 脚不许踩到地形下面
+
+> **P7 补充（2026-10-23）**：编辑器 Play 里的同一个"读地形"动作，曾经让编辑器
+> 一按 Run 就崩（`0xC0000005`）—— 因为 `PhysicsWorld` 借的高度场指针是
+> 局部变量留下的悬垂指针。本文只讲**数值**（容差、吸附），**所有权**
+> 那半截见 `docs/editor_play_terrain.md`。
 
 ### 3.1 症状
 

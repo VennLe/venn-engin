@@ -80,13 +80,20 @@ struct SceneBinding {
     // 于是地形是**真的地面**（刚体与角色都停在上面，不会陷进去）。
     //
     // ⚠ 为什么高度单独拷一份 `vector` 而不是留着 `terrain::TerrainAsset`：
-    //   · 那会把 `terrain/` 拖进 `ScenePhysics.h`（本头文件是物理的公共面，
-    //     不该为了一个成员引入上层模块的头）；
-    //   · `TerrainAsset::heights` 是 `vector`，内部指针不随对象移动而变，
-    //     但**`Heightfield` 这个结构体本身**会随 `SceneBinding` 一起被移动
-    //     ——`buildSceneWorld` 是按值返回的。所以 `Heightfield` 必须放在
-    //     `unique_ptr` 里（堆上地址稳定），否则 `PhysicsWorld::m_terrain`
-    //     立刻悬垂。
+    //   那会把 `terrain/` 拖进 `ScenePhysics.h`（本头文件是物理的公共面，
+    //   不该为了一个成员引入上层模块的头）。
+    //
+    // ⚠ 2026-10-23：这两个成员**不再是** `PhysicsWorld::heightfield()`
+    //   存活的前提。世界现在会自己拷一份地形数据
+    //   （见 `PhysicsWorld::m_terrainOwned`），因为原先"借指针 + 调用方
+    //   保证活得比世界长"的约定有个洞：`SceneBinding` 一旦析构，
+    //   `terrainHeights` 的堆内存就还回去了，而 `terrainHf->heights`
+    //   还指着它 —— 编辑器 `std::move(binding.world)` 之后正是这个状态，
+    //   一进 Play 读地形就 ACCESS VIOLATION。
+    //
+    //   这里保留它们只是为了 `buildSceneWorld` 的返回结构稳定（以及
+    //   `terrainHf` 上算好的 origin/mpp/heightScale 那份"最终参数"），
+    //   不再承担所有权职责。新代码不要拿 `terrainHf.get()` 当长期指针用。
     std::vector<float> terrainHeights;      // 列主序，原样拷贝
     std::unique_ptr<Heightfield> terrainHf;  // 指向上面那块内存
     int terrains = 0;       // 场景里的地形数（>1 时只用了第一块）

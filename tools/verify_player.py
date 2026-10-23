@@ -39,16 +39,20 @@ OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify")
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
 
 VK_W, VK_A, VK_S, VK_D = 0x57, 0x41, 0x53, 0x44
 VK_SPACE = 0x20
-SC = {VK_W: 0x11, VK_A: 0x1E, VK_S: 0x1F, VK_D: 0x20, VK_SPACE: 0x39}
+VK_ESCAPE = 0x1B
+SC = {VK_W: 0x11, VK_A: 0x1E, VK_S: 0x1F, VK_D: 0x20, VK_SPACE: 0x39,
+      VK_ESCAPE: 0x01}
 
 STATE_RE = re.compile(
     r"PLAYER-STATE '([^']*)' mode=(\S+) "
     r"pos=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\) "
     r"yaw=(-?[\d.]+) pitch=(-?[\d.]+)"
-    r"(?: miv=(\d))?")
+    r"(?: miv=(\d))?(?: cap=(\d))?")
 
 
 def hold_key(hwnd, vk, seconds):
@@ -106,6 +110,11 @@ def _mouse_lparam(x, y):
 # 与真实光标无关。
 _mouse_pos = [None]
 
+# 是否处于"操作态"（光标隐藏 + 锁定）。见 mouse_move_rel 的说明。
+_captured = [False]
+
+MOUSEEVENTF_MOVE = 0x0001
+
 
 def mouse_set_client(hwnd, x, y):
     """把鼠标放到窗口客户端坐标 (x, y)。
@@ -133,7 +142,17 @@ def mouse_set_client(hwnd, x, y):
 
 
 def mouse_move_rel(hwnd, dx, dy):
-    """在"逻辑光标"上相对移动，并把新位置投递给窗口。"""
+    """在"逻辑光标"上相对移动，并把新位置投递给窗口。
+
+    ⚠ 捕获态（`GLFW_CURSOR_DISABLED`）走另一条路，见 `_captured`：
+    那时 GLFW 算 delta 用的是 `x - lastCursorPos`（真实光标），而 GLFW 每帧
+    会把光标 warp 回窗口中心并刷新 lastCursorPos。此时再按"逻辑坐标"
+    PostMessage，两者完全对不上 —— 实测**往下注入会变成往上**（pitch 反向），
+    横向因为起点恰好在中心附近才碰巧正确。捕获态改用系统级相对移动。
+    """
+    if _captured[0]:
+        user32.mouse_event(MOUSEEVENTF_MOVE, int(dx), int(dy), 0, 0)
+        return
     if _mouse_pos[0] is None:
         _mouse_pos[0] = (0, 0)
     x, y = _mouse_pos[0]
@@ -172,6 +191,43 @@ def latest_state(tap):
     """当前最后一条 PLAYER-STATE（没有就返回 (None, 0)）。"""
     ss = all_states(tap)
     return (ss[-1] if ss else None), len(ss)
+
+
+def click_client(hwnd, x, y):
+    """在客户端坐标上点一次左键（PostMessage，不需要真实前台焦点）。"""
+    lp = _mouse_lparam(x, y)
+    user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, lp)
+    time.sleep(0.08)
+    user32.PostMessageW(hwnd, WM_LBUTTONDOWN, 0x0001, lp)
+    time.sleep(0.06)
+    user32.PostMessageW(hwnd, WM_LBUTTONUP, 0x0000, lp)
+    time.sleep(0.25)
+
+
+def capture_ready(tap, hwnd, vp, timeout=8.0):
+    """点一下视口，等探针报 cap=1（= 已接管操作）。
+
+    ⚠ 2026-10-23（P8）起，编辑器 Play 的键鼠是**两态**的：进了 Play 也要
+    先用左键在视口里点一下才开始响应 WASD / 鼠标视角（就是用户要的"点了
+    才能交互"）。所以任何"注入键鼠然后断言角色动了"的用例，都必须先过这
+    一道 —— 以前只等 `miv=1`（鼠标在视口矩形内）就开打了，现在不够。
+
+    返回 True 表示 cap=1。
+    """
+    end = time.time() + timeout
+    clicked = 0.0
+    while time.time() < end:
+        ss = all_states(tap)
+        if ss and ss[-1].group(9) == "1":
+            _captured[0] = True     # 之后的注入改走系统级相对移动
+            return True
+        # 每 1.5 s 补一次点击（第一次可能落在还没就绪的视口上）
+        if time.time() - clicked > 1.5:
+            clicked = time.time()
+            cx, cy = center(vp)
+            click_client(hwnd, cx, cy)
+        time.sleep(0.2)
+    return False
 
 
 def hover_ready(tap, hwnd, timeout=12.0):
@@ -265,6 +321,8 @@ def run_case(exe, size, mode, fails, check):
     item_name, mode_word, png_base = label
 
     kill_stale_editors()
+    _captured[0] = False      # 新进程 = 新的两态，复位注入方式
+    _mouse_pos[0] = None
     tmpdir = tempfile.mkdtemp(prefix="player_%s_" % mode)
 
     proc, hwnd, tap = launch(exe, {}, size)
@@ -305,6 +363,34 @@ def run_case(exe, size, mode, fails, check):
             return 5
         n0 = n0 - 1  # wait_new_state 返回的是"已有条数"，用条数做游标
 
+        # ---- 2.5) 点视口接管操作（P8，2026-10-23）----
+        # 用户要求："游戏启动运行后，必须要鼠标左键在 3D 视口中点击后才能
+        # 开始正常和游戏画面内的角色开始交互操作。"
+        # 所以 Run 之后**先断言"没点之前不响应"**，再点一下，之后才测 WASD。
+        # 这两条是同一个需求的正反面，缺任何一条都不算验收：
+        #   · 不点就动 → 需求没实现
+        #   · 点了还不动 → 交互坏了
+        st_before, nb = wait_new_state(tap, n0, 4.0)
+        moved_before = 0.0
+        if st_before:
+            hold_key(hwnd, VK_W, 0.7)
+            st_after, nb2 = wait_new_state(tap, nb - 1, 4.0)
+            if st_after:
+                moved_before = abs(float(st_after.group(3)) -
+                                   float(st_before.group(3))) + \
+                               abs(float(st_after.group(4)) -
+                                   float(st_before.group(4)))
+                n0 = nb2 - 1
+        check("[%s] 接管之前 WASD 不响应（角色不动）" % mode,
+              moved_before < 0.05, "位移 %.3f m" % moved_before)
+
+        cx, cy = center(vp)
+        mouse_set_client(hwnd, cx, cy)
+        capOk = capture_ready(tap, hwnd, vp)
+        check("[%s] 左键点视口接管操作（探针 cap=1）" % mode, capOk)
+        if not capOk:
+            return 5
+
         # ---- 3) W 前进 ----
         hold_key(hwnd, VK_W, 1.0)
         st1, n1 = wait_new_state(tap, n0, 6.0)
@@ -334,15 +420,16 @@ def run_case(exe, size, mode, fails, check):
                 n0 = n2
 
         # ---- 5) 鼠标转视角（yaw / pitch 方向）----
-        # 前置条件：鼠标视角被 viewportHovered 硬门控，所以先把光标放回视口
-        # 中心并**等门控真的打开**（探针里的 miv=1）；门控没开就直接判失败，
-        # 免得后面三条断言一起报"0.000"、看不出真正原因。
-        # 注入策略见 mouse_look_burst：单次注入很难被 30 帧一次的探针采样到，
-        # 所以每个方向连打一组、断言累积变化。
+        # 前置条件（P8，2026-10-23 起）：编辑器 Play 的键鼠是**两态**的。
+        # 必须先用左键在视口里点一下接管操作（探针 cap=1），否则注入多少
+        # 位移 yaw 都不动 —— 这正是用户要的"点了才能交互"。
+        # 门控没开就直接判失败，免得后面三条断言一起报"0.000"、看不出真正
+        # 原因。注入策略见 mouse_look_burst：单次注入很难被 30 帧一次的
+        # 探针采样到，所以每个方向连打一组、断言累积变化。
         cx, cy = center(vp)
         mouse_set_client(hwnd, cx, cy)
-        hoverOk = hover_ready(tap, hwnd)
-        check("[%s] 视口悬停就绪（鼠标视角门控 miv=1）" % mode, hoverOk)
+        hoverOk = capture_ready(tap, hwnd, vp)
+        check("[%s] 点视口接管操作就绪（探针 cap=1）" % mode, hoverOk)
         if not hoverOk:
             return 6
 

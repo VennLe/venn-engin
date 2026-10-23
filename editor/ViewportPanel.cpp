@@ -2395,9 +2395,26 @@ void ViewportPanel::draw() {
     const glm::vec2 vpSize(pane0Size.x, pane0Size.y);
 
     // 1) 相机导航：**只在编辑态**。
-    //    Play 期间相机是运行态场景自己的东西，编辑器视口一个键鼠事件都不抢
-    //    —— 用户明确要的就是"运行前的视口按 UE 那套来，运行后归游戏管"。
+    //    Play 期间相机是运行态场景自己的东西 —— 用户明确要的就是"运行前的
+    //    视口按 UE 那套来，运行后归游戏管"。下面 1.5) 是"归游戏管"的入口。
     if (m_ctx.isEditing()) handleNavigation(hovered);
+
+    // 1.5) Play 态：**左键点视口 = 接管操作**（P8，2026-10-23）
+    //
+    // "发现"必须在这里：只有面板知道鼠标是不是真的落在视口里。执行在
+    // EditorApp::updatePlayMouse（它拿得到 Window，能改光标模式）。
+    //
+    // 只在**未捕获**时收这个点击：捕获态下光标已经隐藏且锁在窗口中心，
+    // ImGui 的鼠标被关掉了（NoMouse），这里的 hovered 恒为 false —— 两边
+    // 的判断是自洽的，不会出现"捕获中又点了一次视口"。
+    if (!m_ctx.isEditing() && !m_ctx.playMouseCaptured() && hovered &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        m_ctx.requestPlayMouseCapture();
+        // 正式锚点：证明"点击这一下"确实被视口收到了（而不是被别的面板吃掉）。
+        // 它和 EditorApp 的 `EDIT-MOUSE captured=1` 成对出现，中间任何一环
+        // 断掉都能从这两条日志里直接读出来。
+        VK_LOG_INFO("PLAY-CLICK viewport=1 (requesting capture)");
+    }
 
     // 2) 碰撞框线框（**先画**，让手柄压在它上面；X-ray，不参与深度测试）
     if (m_ctx.isEditing()) m_colliders.draw(m_ctx, vpPos, vpSize, dl, hovered);
@@ -3333,10 +3350,17 @@ void ViewportPanel::drawPlayHud(const glm::vec2& vpPos, const glm::vec2& vpSize)
     char clockProbe[64];
     std::snprintf(clockProbe, sizeof(clockProbe), TR("%s   t = %.2fs"),
                   TR("PLAYING"), 0.0);
+    // 第二行提示（P8）：未接管时的引导 / 接管后的"怎么退出"。
+    // 两句话都拿同一个探针量宽度，宽度跟着译文走（中文比英文短，用英文量
+    // 一定偏宽，但反过来漏量就会被裁）。取长者。
+    const char* hint = m_ctx.playMouseCaptured()
+                           ? TRL("In control - Esc shows the mouse")
+                           : TRL("Click the viewport to take control");
     float textW = ImGui::CalcTextSize(TRL("Restore view  (F)")).x;
     textW = std::max(textW, ImGui::CalcTextSize(clockProbe).x);
+    textW = std::max(textW, ImGui::CalcTextSize(hint).x);
     const float cw = textW + st.WindowPadding.x * 2.0f + 8.0f;
-    const float ch = frameH + lineH + st.WindowPadding.y * 2.0f;
+    const float ch = frameH + lineH * 2.0f + st.WindowPadding.y * 2.0f;
 
     ImGui::SetCursorScreenPos(
         ImVec2(vpPos.x + vpSize.x - cw - 10.0f, vpPos.y + 10.0f));
@@ -3359,6 +3383,8 @@ void ViewportPanel::drawPlayHud(const glm::vec2& vpPos, const glm::vec2& vpSize)
                        TR("%s   t = %.2fs"),
                        m_ctx.isPlaying() ? TR("PLAYING") : TR("PAUSED"),
                        static_cast<double>(m_ctx.playTime()));
+
+    ImGui::TextDisabled("%s", hint);
 
     ImGui::EndChild();
     ImGui::PopStyleColor(1 + phPush);

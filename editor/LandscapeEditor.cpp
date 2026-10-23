@@ -1684,9 +1684,23 @@ bool LandscapeEditor::viewportInput(const glm::vec2& vpPos,
         (hovered || m_stroking) &&
         raycast(ray.origin, ray.dir, hit, nrm, &localHit);
 
-    // ---- 笔刷光标：贴着地表的圆环 + 衰减内圈 + 填充 ----
-    // 用 32 段折线在地表上取点再投影到屏幕，而不是画一个屏幕空间的圆：
+    // ---- 笔刷光标：地表上的圆环 + 衰减内圈 + 填充 ----
+    // 用折线在世界里取点再投影到屏幕，而不是画一个屏幕空间的圆：
     // 俯视/侧视时地面上的圆在屏幕上是椭圆，画圆会明显错位。
+    //
+    // ⚠ 2026-10-23：整圈取**同一个高度**（不再逐点采地表高度）。
+    //   以前每个环点都写 `wp.z = heightAtWorld(x,y)`，圆环"贴着地表"——
+    //   一旦地表被笔刷推起来，环点就爬上自己刚堆出的山包，投影之后椭圆
+    //   被拉歪、压扁、出现凹口（用户报的"笔刷的圆圈明显在变形"）。
+    //   三条理由支持改成水平面：
+    //     ① 笔刷作用区本来就是**水平**圆盘（applyStroke 按 XY 半径筛格点），
+    //        圆环与它同面才是一致的；
+    //     ② 水平圆的透视投影严格是圆锥曲线（椭圆）—— 无论地形怎么变，
+    //        屏幕上的形状只由机位决定，不会随笔画自己抖；
+    //     ③ 圆环是画在视口图像**之上**的 2D 覆盖层（无深度测试），贴着
+    //        "地表"取点带来的遮挡关系一点也体现不出来，纯亏。
+    //   代价：陡坡上圆环会插进/浮出地表 —— UE / Unity 的地形笔刷也是这么
+    //   画的（一个平的圆盘），这是行业惯例，不是妥协。
     if (onTerrain && dl) {
         const glm::mat4 vp = PickingSystem::viewProj(
             m_ctx.editorScene().camera(), vpSize);
@@ -1739,46 +1753,64 @@ bool LandscapeEditor::viewportInput(const glm::vec2& vpPos,
             fill = IM_COL32(150, 150, 150, 18);
         }
 
-        // 把地表上的一个圆投影成屏幕折线。rings = 要画几圈（半径倍率）。
+        // 一个**局部**点 → 屏幕坐标。返回 false = 落在相机后面（这一圈就
+        // 别画了：折线会在屏幕上拉出一条横贯全屏的假边）。
+        const auto toScreen = [&](const glm::vec3& lp, ImVec2* out) -> bool {
+            const glm::vec4 clip = vp * (model * glm::vec4(lp, 1.0f));
+            if (clip.w <= 1.0e-5f) return false;
+            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            out->x = vpPos.x + (ndc.x * 0.5f + 0.5f) * vpSize.x;
+            out->y = vpPos.y + (ndc.y * 0.5f + 0.5f) * vpSize.y;
+            return true;
+        };
+
+        // 把水平面上的一个圆投影成屏幕折线。rings = 半径倍率。
+        // 段数 48：半径 12 m 贴脸看时 32 段的折角能看出来（屏幕上直径
+        // 三四百像素），48 段在同样的距离下折角小于 1 px。
+        constexpr int kSeg = 48;
         auto projectRing = [&](float radiusScale, ImVec2* pts) -> bool {
-            for (int i = 0; i <= 32; ++i) {
-                const float a = 6.2831853072f * static_cast<float>(i) / 32.0f;
-                const float r = m_radius * radiusScale;
+            const float r = m_radius * radiusScale;
+            for (int i = 0; i <= kSeg; ++i) {
+                const float a = 6.2831853072f * static_cast<float>(i) /
+                                static_cast<float>(kSeg);
                 const glm::vec3 lp(localHit.x + std::cos(a) * r,
-                                   localHit.y + std::sin(a) * r, 0.0f);
-                const glm::vec3 wp0 = glm::vec3(model * glm::vec4(lp, 1.0f));
-                glm::vec3 wp = wp0;
-                wp.z = heightAtWorld(wp0.x, wp0.y);
-                const glm::vec4 clip = vp * glm::vec4(wp, 1.0f);
-                if (clip.w <= 1.0e-5f) return false;
-                const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-                pts[i] = ImVec2(vpPos.x + (ndc.x * 0.5f + 0.5f) * vpSize.x,
-                                vpPos.y + (ndc.y * 0.5f + 0.5f) * vpSize.y);
+                                   localHit.y + std::sin(a) * r,
+                                   localHit.z);
+                if (!toScreen(lp, &pts[i])) return false;
             }
             return true;
         };
 
-        ImVec2 outer[33];
+        ImVec2 outer[kSeg + 1];
         if (projectRing(1.0f, outer)) {
-            // 半透明填充：一眼看出"覆盖多大一片"，比单线好读得多
-            dl->AddConcavePolyFilled(outer, 32, fill);
-            dl->AddPolyline(outer, 33, col, 0, 1.8f);
+            // 半透明填充：一眼看出"覆盖多大一片"，比单线好读得多。
+            // 水平圆的投影是凸的 → 用 Convex 版本（更快，且不会因为
+            // 凹多边形三角化把填充画成一团乱麻）。
+            dl->AddConvexPolyFilled(outer, kSeg, fill);
+            dl->AddPolyline(outer, kSeg + 1, col, 0, 1.8f);
 
             // 衰减内圈：满强度的核心范围。falloff 越大核心越小。
             if (m_falloff > 0.02f) {
-                ImVec2 inner[33];
+                ImVec2 inner[kSeg + 1];
                 const float innerScale = 1.0f - 0.55f * m_falloff;
                 if (innerScale > 0.12f && projectRing(innerScale, inner)) {
-                    dl->AddPolyline(inner, 33, (col & 0x00FFFFFFu) | 0x80000000u,
-                                    0, 1.0f);
+                    dl->AddPolyline(inner, kSeg + 1,
+                                    (col & 0x00FFFFFFu) | 0x80000000u, 0, 1.0f);
                 }
             }
 
-            // 笔心：小十字 + 点
-            const ImVec2 c0 = outer[0];
-            dl->AddCircleFilled(c0, 2.5f, col);
-            dl->AddLine(ImVec2(c0.x - 6.0f, c0.y), ImVec2(c0.x + 6.0f, c0.y), col, 1.0f);
-            dl->AddLine(ImVec2(c0.x, c0.y - 6.0f), ImVec2(c0.x, c0.y + 6.0f), col, 1.0f);
+            // 笔心：小十字 + 点。
+            // ⚠ 以前这里取 `outer[0]` —— 那是圆环**角度 0 的那个点**（圆
+            //   的最右侧），于是十字画在圆环边缘上，看着像"圆心跑偏了"。
+            //   笔心必须投影命中点本身。
+            ImVec2 c0;
+            if (toScreen(localHit, &c0)) {
+                dl->AddCircleFilled(c0, 2.5f, col);
+                dl->AddLine(ImVec2(c0.x - 6.0f, c0.y), ImVec2(c0.x + 6.0f, c0.y),
+                            col, 1.0f);
+                dl->AddLine(ImVec2(c0.x, c0.y - 6.0f), ImVec2(c0.x, c0.y + 6.0f),
+                            col, 1.0f);
+            }
         }
     }
 

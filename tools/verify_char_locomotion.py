@@ -13,13 +13,18 @@
 
 判据（每一条都能单独变红）：
 
-  C0 默认角色资产：23 骨 + Idle/Walk/Run/Jump 四段（AssetC --info）
+  C0 默认角色资产：128 骨 + Idle/Walk/Run/Jump 四段 + 全顶点有权重
+     （AssetC --info；**体检的是真·默认角色** alicia.vmesh）
   C1 Shift+A ▸ Player ▸ Third-Person Player 后打 `PLAYER-DEFAULT bound`
      —— 模型/骨骼/动画一次装好，不再是一具空胶囊
   C2 角色窗口**自动认领**场上那个模型（`adopted bound model`）
   C3 角色面板在**视口标签栏**上（`VTAB-character` 有非退化矩形）
   C4 动画页签里每段 clip 都有按键槽（`CHAR-CLIP-KEY-Jump`）
   C5 点按键槽 + 按 K → `CHAR-KEYBIND clip=Jump key=75`
+  C5b Play 态点视口接管鼠标（`EDIT-MOUSE captured=1`，两态门控）
+  C5c 切回 Viewport 标签后主视口**画面真的在变**（不是 T-pose）
+     —— 这一条专治"createPlayer 自动弹出 Character 预览窗口，把 T-pose
+        盖在主视口上，让人误判动画坏了"
   C6 进 Play（Space）后按 W → `EDIT-ANIM state=walk clip=Walk`
      —— 这就是"移动要结合行走动画"
   C7 松开 W → 回到 `EDIT-ANIM state=idle`
@@ -59,8 +64,11 @@ OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify", "char_locomotion")
 
 SCENE_NAME = "_p4_char_loco.json"
 SCENE_PATH = os.path.join(ASSETS, "scenes", SCENE_NAME)
-DEFAULT_CHAR = os.path.join(ASSETS, "models", "characters",
-                            "default_character.vmesh")
+DEFAULT_CHAR = os.path.join(ASSETS, "models", "characters", "alicia.vmesh")
+# 默认角色的身份指纹（C0 用）。改默认角色时**这两行必须一起改** —— 否则
+# C0 会继续对旧文件做体检、然后在"默认角色坏了"的情况下报绿。
+DEFAULT_JOINTS = 128
+DEFAULT_HEIGHT = 1.652
 SIZE = "1600x1000"
 
 VK_K = 0x4B
@@ -76,6 +84,9 @@ RE_KINDBIND = re.compile(r"CHAR-KEYBIND clip=(\S+) key=(\d+)")
 RE_ANIM = re.compile(r"EDIT-ANIM state=(\w+) clip=(\S+)")
 RE_IDLE = re.compile(r"EDIT-ANIM-IDLE retrigger=(\d+) idle=([\d.]+)s")
 RE_KEYTRIG = re.compile(r"EDIT-ANIM-KEY-TRIGGER clip=(\S+) key=(\d+)")
+# Play 态鼠标接管（P8，2026-10-23）：EditorApp::updatePlayMouse 的锚点。
+# 没有它就没有"点了才能交互"—— 下面的 W 会一帧都推不动。
+RE_EDIT_MOUSE = re.compile(r"EDIT-MOUSE captured=(\d)")
 RE_INFO_CLIP = re.compile(r'clip "([^"]+)" ([\d.]+) s')
 
 
@@ -180,6 +191,33 @@ def center(rect):
     return (int((rect[0] + rect[2]) * 0.5), int((rect[1] + rect[3]) * 0.5))
 
 
+def grab(hwnd):
+    try:
+        return capture_client(hwnd)[0].convert("RGB")
+    except Exception as exc:                                # noqa: BLE001
+        print("  截图失败:", exc)
+        return None
+
+
+def diff_ratio(a, b, rect, step=2):
+    """两张图在 rect 内的"明显不同"像素占比（同 verify_char_preview）。"""
+    if a is None or b is None:
+        return 0.0
+    x0, y0, x1, y1 = (int(v) for v in rect)
+    x0, y0 = max(x0, 0), max(y0, 0)
+    x1, y1 = min(x1, a.width, b.width), min(y1, a.height, b.height)
+    pa, pb = a.load(), b.load()
+    total = diff = 0
+    for y in range(y0, y1, step):
+        for x in range(x0, x1, step):
+            total += 1
+            ca, cb = pa[x, y], pb[x, y]
+            if (abs(ca[0] - cb[0]) + abs(ca[1] - cb[1])
+                    + abs(ca[2] - cb[2])) > 24:
+                diff += 1
+    return (diff / total) if total else 0.0
+
+
 # ---- 键盘注入 ----
 #
 # `verify_player` 的 tap_key / hold_key 走的是它自己那张**扫描码字典**（SC），
@@ -280,6 +318,9 @@ def main():
     make_scene()
 
     # ---- C0 默认角色资产 ----
+    # ⚠ 体检的是**真·默认角色**（`editor/EditorScene.cpp::kDefaultCharacterPath`），
+    #   不是随便一个能加载的角色。历史上这里写过 `default_character.vmesh`
+    #   （23 骨兜底资产），换默认角色后忘了改 → C0 一直绿，但测的是旧文件。
     p = subprocess.run([ASSETC, "--info", DEFAULT_CHAR],
                        cwd=BIN, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, text=True,
@@ -288,10 +329,19 @@ def main():
     joints = [l for l in info if "joints=" in l and "clips=" in l]
     clips = [m.group(1) for m in (RE_INFO_CLIP.search(l) for l in info) if m]
     n_joints = int(re.search(r"joints=(\d+)", joints[0]).group(1)) if joints else 0
-    check("C0 默认角色资产（23 骨 + 四段动画）",
-          p.returncode == 0 and n_joints == 23
-          and set(clips) >= {"Idle", "Walk", "Run", "Jump"},
-          "joints=%d clips=%s" % (n_joints, ",".join(clips)))
+    hm = [re.search(r"height\(Z\)=([\d.]+)", l) for l in info]
+    height = float(next(m.group(1) for m in hm if m)) if any(hm) else 0.0
+    skin = [l for l in info if "skinVerts=" in l]
+    skin_txt = skin[0].replace("ASSETC", "").strip() if skin else "?"
+    skin_ok = bool(skin) and re.search(r"skinVerts=(\d+) / (\d+)", skin[0]) \
+        and re.search(r"skinVerts=(\d+) / (\d+)", skin[0]).group(1) \
+        == re.search(r"skinVerts=(\d+) / (\d+)", skin[0]).group(2)
+    check("C0 默认角色资产（%d 骨 + 四段动画 + 全顶点有权重）" % DEFAULT_JOINTS,
+          p.returncode == 0 and n_joints == DEFAULT_JOINTS
+          and set(clips) >= {"Idle", "Walk", "Run", "Jump"} and skin_ok,
+          "joints=%d clips=%s %s" % (n_joints, ",".join(clips), skin_txt))
+    check("C0b 默认角色身高对得上（%.3f m）" % DEFAULT_HEIGHT,
+          abs(height - DEFAULT_HEIGHT) < 0.01, "height(Z)=%.3f" % height)
     if p.returncode != 0:
         print("  AssetC --info 失败:", info[-3:])
 
@@ -321,10 +371,16 @@ def main():
         check("C1b 创建即装配默认角色（模型+骨骼+动画）", m is not None,
               m.group(0)[:120] if m else "没有 PLAYER-DEFAULT bound")
         if m:
-            check("C1c 装的是蒙皮模型且 clip 齐（skinned=1 / clips=4）",
-                  m.group(3) == "1" and m.group(5) == "4",
-                  "skinned=%s clips=%s height=%s" %
-                  (m.group(3), m.group(5), m.group(6)))
+            # 骨架数必须和 C0 一致：路径、蒙皮、clip 数全对但 joints 是另一
+            # 个数 = 加载到的其实不是 C0 体检的那份资产（同名不同版本）。
+            check("C1c 装的是蒙皮模型且 clip 齐（skinned=1 / clips=4 / "
+                  "joints=%d）" % DEFAULT_JOINTS,
+                  m.group(1) in (DEFAULT_CHAR.replace(os.sep, "/"),
+                                 "models/characters/alicia.vmesh")
+                  and m.group(3) == "1" and m.group(5) == "4"
+                  and int(m.group(4)) == DEFAULT_JOINTS,
+                  "path=%s skinned=%s joints=%s clips=%s height=%s" %
+                  (m.group(1), m.group(3), m.group(4), m.group(5), m.group(6)))
 
         # ---- C2 角色窗口认领场上的模型 ----
         m, _ = wait_regex_after(tap, RE_ADOPT, 0, 12.0)
@@ -382,6 +438,49 @@ def main():
                 break
             time.sleep(0.1)
         time.sleep(1.5)                     # 让状态机先落一次 idle
+
+        # ---- P8（2026-10-23）：Play 态键鼠是两态的，先点视口接管 ----
+        # 用户要求"必须先用左键在 3D 视口里点一下才开始和角色交互"。所以
+        # 任何"进 Play 后注入 WASD 再断言动画"的用例都得先补这一下，否则下面
+        # 的 W 一帧都推不动（C6 会莫名其妙变成"一直 idle"）。
+        # ⚠ 偏移必须在**点击之前**取：click() 内部会 sleep 0.5 s，锚点在
+        #   那半秒里就打完了 —— 点完再取 offset 等于"从锚点之后开始找"，
+        #   永远等不到（第一版就栽在这儿，日志里明明有那一条）。
+        off_cap = len(tap.snapshot())
+        click(hwnd, mx, my)
+        m_cap, _ = wait_regex_after(tap, RE_EDIT_MOUSE, off_cap, 8.0)
+        check("C5b Play 态点视口接管鼠标（两态门控）", m_cap is not None,
+              m_cap.group(0) if m_cap else "没有 EDIT-MOUSE captured=1")
+
+        # ---- C5c 主视口里那个人到底动没动（T-pose 陷阱的正式判据）----
+        # `createPlayer` 成功后会**自动打开 Character 预览窗口**。那是一份
+        # 独立渲染的静止副本（编辑态 / clip 空 / play=0），而且它盖在视口
+        # 上面 —— 于是"截主视口的图"实际拍到的是预览窗口里那个 T-pose，
+        # 让人误判"引擎里的动画坏了"。这一条把"必须切回 Viewport 标签再
+        # 截图 + 画面必须真的在变"钉成判据：
+        #   · 切标签：标签栏有 `VTAB-viewport` 锚点，点它（不猜坐标）
+        #   · 判动：间隔 0.45 s 两帧的像素差异（静止 = 0%，Idle 有呼吸摆动）
+        vpt = wait_rect_visible(tap, "VTAB-viewport", 8.0)
+        if check("C5c0 拿到 Viewport 标签（能把预览窗口挤下去）",
+                 vpt is not None):
+            click(hwnd, *center(vpt))
+            time.sleep(0.9)                 # 等自动布局切完再截
+        a1 = grab(hwnd)
+        time.sleep(1.0)                     # ⚠ 1.0 s 不是随便取的：Idle 的
+        #   呼吸/重心浮动幅度很小，0.45 s 只有 ~0.03%（跟 tooltip 的文字刷新
+        #   同量级，分不开）。1.0 s 实测 0.5~0.6%，T-pose（静止）实测 ≤0.05%。
+        a2 = grab(hwnd)
+        ratio = diff_ratio(a1, a2, vp)
+        check("C5c 主视口里角色真的在动（不是预览窗口里的 T-pose）",
+              ratio >= 0.0015,
+              "视口内像素差异 %.3f%%（阈值 0.15%%，静止实测 ≤0.05%%）"
+              % (ratio * 100.0))
+        for img, nm in ((a1, "c5c_viewport_a.png"), (a2, "c5c_viewport_b.png")):
+            if img is not None:
+                img.save(os.path.join(OUT_DIR, nm))
+        # 切过标签后鼠标接管已经丢了（点在标签上 = 点在视口外），补一次
+        click(hwnd, mx, my)
+        time.sleep(0.4)
 
         # 行号偏移（不是"第几个匹配"），理由见 wait_regex_after
         off = len(tap.snapshot())

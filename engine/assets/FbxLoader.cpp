@@ -262,7 +262,11 @@ Material* fbxMaterial(AssetManager& assets, const ufbx_material& mat,
         const std::string fp(tex->filename.data, tex->filename.length);
         // 容错版：贴图丢了退化到默认材质，别让整个模型加载失败
         // （`loadTexture` 在文件读不出来时会抛异常）。
-        albedo = assets.tryLoadTexture(fp, keyPrefix + "/albedo", true);
+        // ⚠ 必须先过 `resolveAssetPath`：FBX 里存的是相对路径，而
+        //   `Texture::fromFile` 只按进程 cwd 打开 → 从 build/bin 启动时
+        //   一条都打不开，材质静默变纯色。与 VMeshLoader 同一条理由。
+        albedo = assets.tryLoadTexture(assets::resolveAssetPath(fp),
+                                       keyPrefix + "/albedo", true);
         if (!albedo) {
             VK_LOG_WARN("FBX-TEX-MISSING model=%s mat=%s path=%s",
                         modelKey.c_str(), nm.c_str(), fp.c_str());
@@ -453,6 +457,18 @@ void extractAnimations(const ufbx_scene& scene, const ufbx_skin_deformer& skin,
         clip.name = stack.name.length
                         ? std::string(stack.name.data, stack.name.length)
                         : ("clip" + std::to_string(s));
+        // Blender 的 FBX 导出（`bake_anim_use_all_actions`）把 take 名写成
+        // "<armature 对象名>|<action 名>"，例如 `ALICIA|Idle`。几乎所有
+        // 工具链都把 `|` 之后当 clip 名（Unity / UE / glTF 转换器都这么做），
+        // 这里照办 —— 否则 `Skeleton::findClip("Idle")` 逐字比较找不到，
+        // 角色会**静默退回 rest 姿势**（画面是 T-pose，日志全绿）。
+        // ⚠ 归一化只发生在**读资产**这一步；`findClip` 的逐字语义不变。
+        //   只剥第一个 `|` 之前的部分，且 `|` 后面必须有内容才剥（`"A|"` 保留）。
+        {
+            const std::size_t bar = clip.name.find('|');
+            if (bar != std::string::npos && bar + 1 < clip.name.size())
+                clip.name = clip.name.substr(bar + 1);
+        }
         const double t0 = stack.time_begin;
         const double t1 = stack.time_end;
         const double dur = (t1 > t0) ? (t1 - t0) : 0.0;

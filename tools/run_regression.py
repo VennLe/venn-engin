@@ -487,6 +487,44 @@ DEFAULT = [
     # 内像素差异 ≥ 0.4%（第一版就是靠它抓到"时间轴在走、模型不动"）；
     # P5/P6 的点击坐标来自 `CHAR-PREVIEW-CAPSULE-SCREEN` 投影锚点，不猜。
     "verify_char_preview",
+
+    # ---- 编辑器进 Play 时不崩（P7，2026-10-23）----
+    # 用户原话："我添加了一个第三人称角色，然后直接点击运行游戏，然后引擎
+    # 编辑器直接崩溃退出了。"
+    # 根因是**地形高度场的所有权**：SceneBinding 是局部变量，只 move 出
+    # world，`heightfield()->heights` 随即悬垂；P6 给编辑器 Play 加了
+    # `editorGroundHeight()` 之后第一次读它就 ACCESS VIOLATION。
+    # 关键在于**必须带地形**（water_bowl）：空场景/纯 groundPlane 的场景
+    # 根本不会建高度场，这条用例就退化成"进 Play 不崩"，抓不到这个 bug。
+    "verify_editor_play_terrain",
+
+    # ---- Play 态的鼠标两态（P8，2026-10-23）----
+    # 用户原话："游戏启动运行后，必须要鼠标左键在 3d 视口中点击后才能开始
+    # 正常和游戏画面内的角色开始交互操作，并且此时鼠标是隐藏不显示的。
+    # 按下 Esc 键，此时就正常显示鼠标。"
+    # M0~M11 十三条。两个"不可辩驳"的判据：
+    #   · M2/M5/M9 查 **GetCursorInfo 的 CURSOR_SHOWING 位** —— 日志说
+    #     captured=1 只能证明"我们想隐藏"，真正藏光标的是 GLFW；系统层的
+    #     显示位才是真的。
+    #   · M3 断言"没点之前 WASD 不动"，和 M6"点了就动"是一对：只测后者的话，
+    #     "进 Play 即接管"也能全绿，需求其实没实现。
+    "verify_play_mouse_capture",
+
+    # ---- 帧节奏（2026-10-23）----
+    # 用户原话："角色在移动时尤其是鼠标移动转换视角时，明显感觉角色动作在
+    # 卡顿，步伐也变得僵硬了起来。"
+    # 探针证明位移与动画相位都是干净的，脏的是**时基**：主循环在 60 Hz 的
+    # 屏上跑到 470~490 fps（呈现模式 MAILBOX 不锁帧），dt 抖动 31%。
+    # 判据两组对照：锁帧后 dt 抖动 < 8% + 零尖刺；MYVK_VSYNC=0 时 > 200 fps
+    # 且抖动 > 10%（证明开关是活的、而且这就是卡顿的来源）。
+    "verify_frame_pacing",
+
+    # ---- 地形笔刷圆环不随地形变形（2026-10-23）----
+    # 用户原话："Raise/Lower 这个笔刷操作地形时，笔刷的圆圈明显在变形。"
+    # 根因：环点逐点写 `wp.z = heightAtWorld()`（贴着被自己推起来的地表），
+    # 投影出来就不再是椭圆。判据是**像素级**的：r(θ) 的非椭圆分量 < 2%，
+    # 外加"笔心十字必须落在圆心"（旧代码画在 outer[0]，即圆的右边缘）。
+    "verify_brush_ring",
 ]
 
 # 结果行：兼容四种写法。取**最后一条**，因为有的脚本会先打一堆中间断言。
@@ -878,7 +916,10 @@ TRIGGERS = {
                                "runtime/RuntimeConfig.*",
                                # 新增的 8 条界面词
                                "engine/i18n/**",
-                               # 默认角色资产本身（23 骨 / 4 段 clip）
+                               # 默认角色资产本身（Alicia：128 骨 / 4 段 clip）。
+                               # ⚠ 换默认角色 = 换这个 glob 底下的文件，所以
+                               #   **只改 EditorScene 的路径常量不算"改了资产"**
+                               #   —— 那条由 editor/EditorScene.* 覆盖。
                                "assets/models/characters/**"],
     # 运行时"手感四件事"（P5，2026-10-22）。与上一条大量重叠是**故意**的：
     # 两张表是"文件→用例"，一条修的是编辑器 Play 的腿，另一条修的是运行时的
@@ -922,6 +963,29 @@ TRIGGERS = {
                               "engine/scene/ModelInstance.*",          # jointMatrices 接手
                               "editor/EditorApp.*",                    # Play 态 Space 语义
                               "assets/models/characters/**"],
+    # 编辑器进 Play 不崩（P7，2026-10-23）。这条盯的是**地形高度场的所有权**
+    # —— 谁能安全地 `heightfield()`。`PhysicsWorld::setHeightfield` 从"借指针"
+    # 改成"拷一份"之后，"是不是又有人把裸指针借出去"就是它的核心风险。
+    # ⚠ 按本节约定**只列非横切文件**：`engine/physics/**`、`engine/ecs/**`
+    #   都在 `GLOBAL_GLOBS` 里，改它们一改就全量，写进 TRIGGERS 会被
+    #   `check_regression_map.py` 标成"冗余的横切 glob"。
+    "verify_editor_play_terrain": ["editor/EditorApp.*"],               # buildPhysicsWorld / editorGroundHeight
+    # Play 态鼠标两态（P8，2026-10-23）。核心风险是**"谁能改光标模式"**：
+    # 状态机跨三个文件（Context 存状态 / 面板发请求 / App 落 GLFW），任何
+    # 一环改错的表现都是"鼠标消失但角色不动"或"按 Esc 没反应"。
+    # ⚠ `engine/core/Input.*` 在 GLOBAL_GLOBS 里（InputMap 同族），不重复登记。
+    "verify_play_mouse_capture": ["editor/EditorContext.*",             # 两态状态 + 脏标记
+                                  "editor/ViewportPanel.*",             # 点视口发请求
+                                  "editor/EditorApp.*"],                # updatePlayMouse / Esc 分流
+    # 帧节奏（2026-10-23）**故意不登记 TRIGGERS**：它的三个落点
+    # （`core/RunMode.h` / `rhi/Swapchain.*` / `core/Time.h`）全在
+    # GLOBAL_GLOBS 里 —— 那是"改了就全量重跑"的横切表。写进这张表会被
+    # check_regression_map.py 判成"整条都指向横切文件"（--narrow 下假跳过）。
+    # 也就是说：它是**无条件重跑**的用例，这正是对的。
+    # 地形笔刷圆环（2026-10-23）。只有一处：圆环怎么取点、怎么投影。
+    # `editor/LandscapeEditor.*` 同时被 verify_landscape_ground 用到，那条
+    # 用例不在本套件里（旧面板布局已漂移），这里单独登记。
+    "verify_brush_ring":     ["editor/LandscapeEditor.*"],
     # 游戏 UI / HUD（U0 起，docs/ui_hud_roadmap.md）。    # ⚠ `engine/ui2/**` **故意不进** `GLOBAL_GLOBS`：它只被 UI 通道引用，
     #   不像 `Renderer.*` / `engine/ecs/**` 那样横切。放进去会让全量永远
     #   点名，增量回归就失去意义了（这是路线图 §8.3 的明确决定）。

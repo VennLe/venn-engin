@@ -62,6 +62,12 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     float lastAnimSpeed = 1.0f;
     bool lastAnimPlaying = true;
     bool lastAnimLoop = true;
+    // 本帧"名字填了但骨架里找不到"的实体数。`samplePose(nullptr)` 会**静默
+    // 退回 rest 姿势**，所以这个数不为 0 时画面上看到的是 T-pose 而不是
+    // 报错 —— 极难从截图反推。ANIM-CLIP-MISSING 就是为了把这件事变成日志。
+    int missing = 0;
+    std::string missingName;
+    std::string availNames;
 
     const bool advance = dt > 0.0f;
 
@@ -114,6 +120,24 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
             const assets::AnimationClip* clip =
                 sk.clipName.empty() ? nullptr : skel.findClip(sk.clipName);
             const float dur = clip ? clip->duration : 0.0f;
+            // clipName 非空但没找到 → 下面 samplePose 会静默退回 rest。
+            // 数出来（带一份可用名单，省得再去翻 PLAYER-DEFAULT）。
+            if (!clip && !sk.clipName.empty()) {
+                if (missing == 0) {
+                    missingName = sk.clipName;
+                    for (const auto& c : skel.clips) {
+                        if (!availNames.empty()) availNames += ",";
+                        availNames += c.name;
+                    }
+                }
+                ++missing;
+            }
+            // 先按"老路径"收一份，后面 156 行处如果有 animator 会用它的四项
+            // 覆盖。两条路径都收**是必须的**：默认角色没有 AnimatorComponent，
+            // 而 ANIM-ANIMATOR 只在 `animators > 0` 时才打 —— 只在这里收，
+            // ANIM-TICK 才能报出"没有 animator 的实体到底在放哪个 clip"。
+            lastAnimClip = sk.clipName;
+            lastAnimTime = time;
 
             // ---- 3) 推进时间 ----
             if (advance && playing) {
@@ -207,9 +231,11 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     // 每 60 帧一条：证明"系统真的在跑"（而不是每帧都要看到它）。
     if ((m_frames % 60) == 1) {
         VK_LOG_INFO("ANIM-TICK f=%llu entities=%d animators=%d dt=%.5f "
-                    "fading=%d",
+                    "fading=%d lastclip=[%s] lasttime=%.3f",
                     static_cast<unsigned long long>(m_frames), count, animators,
-                    static_cast<double>(dt), fading);
+                    static_cast<double>(dt), fading,
+                    lastAnimClip.c_str(),
+                    static_cast<double>(lastAnimTime));
         // 走 Animator 路径的那一份（time 每帧都在变，只按 60 帧的节奏报）。
         if (animators > 0) {
             VK_LOG_INFO("ANIM-ANIMATOR clip=%s time=%.3f speed=%.2f "
@@ -224,6 +250,11 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
             VK_LOG_WARN("ANIM-MODEL-MISMATCH n=%d (animator->model 与 "
                         "skinned.model 不是同一份 → 姿势会对不上但不报错)",
                         mismatched);
+        }
+        if (missing > 0) {
+            VK_LOG_WARN("ANIM-CLIP-MISSING n=%d clipName=[%s] available=[%s] "
+                        "→ 已静默退回 rest（findClip 是逐字比较）",
+                        missing, missingName.c_str(), availNames.c_str());
         }
     }
     // 跨圈单独一条：fmod 的正确性靠它断（只报最后一次，避免高频刷屏）

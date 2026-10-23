@@ -5291,9 +5291,11 @@ void Renderer::updateSkinning(scene::Scene& scene, bool resetOffset) {
             const int prevBase = sk.jointBase;
             sk.jointBase = static_cast<int>(offset);
             if (prevBase != sk.jointBase) {
-                VK_LOG_INFO("ANIM-SKIN entity=%u jointBase=%d time=%.3f",
+                VK_LOG_INFO("ANIM-SKIN entity=%u jointBase=%d time=%.3f "
+                            "clip=[%s] play=%d joints=%d",
                             static_cast<unsigned>(e.id), sk.jointBase,
-                            static_cast<double>(sk.time));
+                            static_cast<double>(sk.time), sk.clipName.c_str(),
+                            sk.playing ? 1 : 0, n);
             }
 
             offset += static_cast<uint32_t>(n);

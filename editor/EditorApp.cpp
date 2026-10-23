@@ -45,6 +45,7 @@
 
 #include "assets/AssetPath.h"
 #include "core/Logger.h"
+#include "core/Input.h"       // Play 态的原始鼠标位移 / 右键（P8）
 #include "core/Version.h"
 #include "core/WindowGeometry.h"
 #include "ecs/Components.h"
@@ -702,7 +703,15 @@ void EditorApp::drawPanels() {
     const std::vector<PanelDesc>& t = panelTableVec();
     // 2026-10-21：视口上方多了一条标签条，浮动面板全部变成它的标签页。
     // `hosted` = 本帧真正要画进内容区的那个面板（-1 = 画 3D 视口）。
-    const int hosted = viewportTabDrawnPanel();
+    // ---- Play 期间内容区**永远**是 3D 视口（P8，2026-10-23）----
+    //
+    // 旧行为：`hosted` 完全由标签条决定。用户把内容区切到 Scripts / Physics
+    // 某一页之后按 Run，`hosted >= 0` 会让**视口整块不画** —— 表现是
+    // "游戏跑起来了，但看不见画面，也点不到视口"。视图口是 Play 的唯一
+    // 出口，所以 Play 态必须把它钉回来（标签条还照常显示，切过去也会立刻
+    // 被顶回视口，这正是"运行期间不该切页"的正确表现）。
+    const int hosted =
+        m_ctx->isEditing() ? viewportTabDrawnPanel() : -1;
     for (int i = 0; i < static_cast<int>(t.size()); ++i) {
         if (!panelOpen(i)) continue;
         // 底栏按钮把窗口收起来了：不提交 = ImGui 认为它关着。勾选状态留着，
@@ -1703,6 +1712,11 @@ void EditorApp::onUpdate(float dt) {
     m_timeScale = std::clamp(m_timeScale, 0.05f, 4.0f);
     const float simDt = dt * m_timeScale;
 
+    // ---- Play 态鼠标捕获（P8）：必须在 runPlayers 之前 ----
+    // runPlayers 按 `playMouseCaptured()` 门控键鼠；晚一帧就会出现"点了
+    // 视口还要再等一帧才能动"的黏滞感。
+    updatePlayMouse();
+
     // ---- Run：游戏逻辑跑在**运行态副本**上 ----
     // 渲染那一边不用额外做什么：activeScene() 在 Run 期间已经返回运行态，
     // 视口自然会显示这份世界。
@@ -1791,6 +1805,38 @@ void EditorApp::onUpdate(float dt) {
         runAnimScripts(simDt);
     } else {
         m_animFrames = 0;
+    }
+
+    // ---- 逐帧时基探针（MYVK_LOG_DT=1）----
+    //
+    // 用途：诊断"移动/转视角时角色动作卡顿"这一类**时基**问题。它把三件事
+    // 放在同一行里，缺一不可：
+    //   dt     —— 这一帧的真实步长（抖不抖、有没有尖刺）
+    //   pos    —— 玩家本帧的落点（位移在空间上是否连续）
+    //   animT  —— 骨骼动画的播放头（姿势相位是否按 dt 线性推进）
+    // 三者放在一起才能分辨"帧率抖"、"位移抖"、"动画相位抖" —— 只看帧率
+    // 数字会漏掉后两种，只看姿势又分不清前两种。
+    //
+    // 配套：`MYVK_VSYNC=1|0` 切呈现模式（见 core/RunMode.h）。量"锁帧之后
+    // 是不是真的每帧 16.7 ms"必须显式给 `MYVK_VSYNC=1` —— 自动化脚本默认
+    // 是不锁的（跑得越快越好）。
+    if (std::getenv("MYVK_LOG_DT")) {
+        double px = 0.0, py = 0.0, pz = 0.0, animT = -1.0;
+        if (m_ctx->isPlaying()) {
+            ecs::World& rw = m_ctx->runtimeScene().world();
+            rw.each<ecs::PlayerComponent>(
+                [&](ecs::Entity e, const ecs::PlayerComponent&) {
+                    if (const auto* t = rw.get<ecs::TransformComponent>(e))
+                        px = t->position.x, py = t->position.y, pz = t->position.z;
+                    if (const auto* s = rw.get<ecs::SkinnedMeshComponent>(e))
+                        animT = s->time;
+                });
+        }
+        VK_LOG_INFO("FRAME-DT f=%llu dt=%.5f play=%d cap=%d "
+                    "pos=(%.4f,%.4f,%.4f) animT=%.4f",
+                    static_cast<unsigned long long>(m_editorFrames),
+                    static_cast<double>(dt), m_ctx->isPlaying() ? 1 : 0,
+                    m_ctx->playMouseCaptured() ? 1 : 0, px, py, pz, animT);
     }
 }
 
@@ -2083,9 +2129,18 @@ void EditorApp::runPlayers(float dt) {
     if (players.empty()) return;
 
     const ImGuiIO& io = ImGui::GetIO();
-    const bool mouseInViewport =
-        m_ctx->mouseInViewport(glm::vec2(io.MousePos.x, io.MousePos.y));
     const bool keysActive = !io.WantTextInput;
+    // ---- 操作态（P8，2026-10-23）----
+    //
+    // 用户要求："游戏启动运行后，必须要鼠标左键在 3D 视口中点击后才能开始
+    // 正常和游戏画面内的角色开始交互操作。"
+    //
+    // 所以键鼠**不是**"进了 Play 就生效"，而是"投了币才生效"。未投币时：
+    //   · 视角不跟鼠标转（否则鼠标一划镜头就飞，玩家还以为游戏坏了）
+    //   · WASD / 跳跃 / 冲刺全部不响应，角色原地站住（动画照常呼吸）
+    //   · 但**重力与贴地照跑** —— 冻掉竖直积分的话，人在空中按 Esc 就会
+    //     悬在天上，看起来像卡死
+    const bool active = m_ctx->playMouseCaptured();
 
     for (ecs::Entity e : players) {
         auto* pc = w.get<ecs::PlayerComponent>(e);
@@ -2099,15 +2154,30 @@ void EditorApp::runPlayers(float dt) {
         // pitch 是**视线仰角**（正 = 抬头）：io.MouseDelta.y 向下为正，
         // 所以"鼠标往上"= 负值 = pitch 增大 = 抬头。市面游戏就是这样，
         // 第一/第三人称同一套语义。
-        if (mouseInViewport) {
-            pc->yaw += io.MouseDelta.x * pc->lookSpeed;
-            pc->pitch -= io.MouseDelta.y * pc->lookSpeed;
+        //
+        // ⚠ 2026-10-23（P8）：捕获态下改用 `Input::mouseDeltaRaw`，两条原因：
+        //   ① 捕获态里 ImGui 的鼠标被关掉了（NoMouse），io.MouseDelta 恒 0；
+        //   ② 未捕获时也不该转 —— 但那时 ImGui 的鼠标是"看得见的光标"，
+        //      拿它转视角等于"鼠标划过视口镜头就跟着乱转"，正是本次要修的病。
+        // 原来的 `mouseInViewport` 判定保留在**未捕获**分支里：光标在视口内
+        // 时仍允许用之前的拖拽习惯微调视线… 不，这里刻意不做——两态就是两态。
+        if (active) {
+            double rawDx = 0.0, rawDy = 0.0;
+            core::Input::mouseDeltaRaw(&rawDx, &rawDy);
+            // GLFW 的虚拟光标在窗口内 wrap：跨边界那一帧会给出 ±整窗宽 的
+            // 假位移。丢掉它（不丢会"轻轻一划镜头转半圈"，最难复现）。
+            const float dx = std::fabs(rawDx) > 400.0 ? 0.0f
+                                                      : static_cast<float>(rawDx);
+            const float dy = std::fabs(rawDy) > 400.0 ? 0.0f
+                                                      : static_cast<float>(rawDy);
+            pc->yaw += dx * pc->lookSpeed;
+            pc->pitch -= dy * pc->lookSpeed;
         }
         pc->pitch = glm::clamp(pc->pitch, -1.45f, 1.45f);
 
         // ---- WASD（(forward, right) 键位组合）----
         glm::vec2 wish(0.0f);
-        if (keysActive) {
+        if (keysActive && active) {
             if (ImGui::IsKeyDown(ImGuiKey_W)) wish.x += 1.0f;
             if (ImGui::IsKeyDown(ImGuiKey_S)) wish.x -= 1.0f;
             if (ImGui::IsKeyDown(ImGuiKey_D)) wish.y += 1.0f;
@@ -2119,7 +2189,8 @@ void EditorApp::runPlayers(float dt) {
         // 右键上）。Play 态里视口导航是关的（见 ViewportPanel 的
         // `if (m_ctx.isEditing()) handleNavigation(...)`），所以右键在游戏
         // 里是空闲的，不会"一边跑一边转镜头"。
-        const bool sprinting = keysActive && io.MouseDown[ImGuiMouseButton_Right];
+        const bool sprinting =
+            keysActive && active && core::Input::mouseDown(1);   // GLFW 1 = 右键
         const float speed = pc->moveSpeed * (sprinting ? std::max(pc->sprintMultiplier, 1.0f) : 1.0f);
         // 本帧实际位移的起点。走动之后用它算**真实水平速度**喂动画状态机
         // —— 用输入轴的话，撞墙时输入满档但人没动，腿会在原地跑。
@@ -2166,7 +2237,7 @@ void EditorApp::runPlayers(float dt) {
             pc->onGround = true;
             if (tc->position.z < groundZ) tc->position.z = groundZ;
         }
-        if (keysActive && pc->onGround &&
+        if (keysActive && active && pc->onGround &&
             ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
             float v0 = pc->jumpSpeed;
             if (const auto* cc = w.get<ecs::CharacterControllerComponent>(e)) {
@@ -2351,8 +2422,12 @@ void EditorApp::runPlayers(float dt) {
 
     // 自动化探针：每 30 帧报一次玩家状态（pos / yaw / pitch），
     // 验证脚本据此断言"按 D 玩家往右挪了 / 动鼠标视野转了"。
-    // 末尾带 miv = 鼠标是否落在视口矩形内：鼠标视角是它门控的，注入不生效
-    // 时第一眼就该看出是"鼠标不在视口里"还是"位移没收到"。
+    // 末尾带 miv = 鼠标是否落在视口矩形内；cap = 是否已接管操作（P8）。
+    //
+    // ⚠ 2026-10-23 起**门控是 cap 不是 miv**：进了 Play 也要先用左键点一下
+    //   视口才开始转视角。注入脚本时如果发现 yaw 不动，先看 cap 是几 ——
+    //   cap=0 就补一次"点视口"，miv=0 才是"鼠标压根不在视口里"。
+    //   （捕获态下 ImGui 的鼠标被关掉，miv 会读成 0，这属正常。）
     ++m_playerLogTick;
     if (m_playerLogTick >= 30) {
         m_playerLogTick = 0;
@@ -2362,7 +2437,7 @@ void EditorApp::runPlayers(float dt) {
             if (!pc || !tc) continue;
             const std::string* nm = w.name(e);
             VK_LOG_INFO("PLAYER-STATE '%s' mode=%s pos=(%.3f,%.3f,%.3f) "
-                        "yaw=%.3f pitch=%.3f miv=%d",
+                        "yaw=%.3f pitch=%.3f miv=%d cap=%d",
                         nm ? nm->c_str() : "?",
                         pc->mode == ecs::PlayerMode::ThirdPerson ? "third"
                                                                  : "first",
@@ -2371,7 +2446,9 @@ void EditorApp::runPlayers(float dt) {
                         static_cast<double>(tc->position.z),
                         static_cast<double>(pc->yaw),
                         static_cast<double>(pc->pitch),
-                        mouseInViewport ? 1 : 0);
+                        m_ctx->mouseInViewport(
+                            glm::vec2(io.MousePos.x, io.MousePos.y)) ? 1 : 0,
+                        active ? 1 : 0);
         }
     }
 }
@@ -3105,6 +3182,48 @@ void EditorApp::saveEditorLayoutToDisk() {
 
 // ---------------------------------------------------------------- 快捷键
 
+// Play 态鼠标捕获：状态机只有两格，但**谁改谁同步**必须说清楚。
+//
+//   未捕获 --(左键点视口)--> 捕获    ：ViewportPanel 发请求，这里执行
+//   捕获   --(Esc)---------> 未捕获  ：handleShortcuts 里做（和"退出全屏"
+//                                      抢同一个键，必须 if/else 分流）
+//   捕获   --(暂停 / Stop)--> 未捕获  ：这里兜底（Context 里也会置 false）
+//
+// 为什么"隐藏鼠标"必须配 `ImGuiConfigFlags_NoMouse`：
+//   GLFW_CURSOR_DISABLED 把光标锁在**窗口中心**，而编辑器窗口中心通常正
+//   落在 Hierarchy / Inspector 上。ImGui 照旧认为"鼠标在这儿"，于是玩家
+//   在游戏里按左键（射击 / 点地移动）会去点那些面板的按钮 —— 而且看不见
+//   光标，根本不知道点了什么。关掉 ImGui 的鼠标输入才是真的"鼠标归游戏"。
+void EditorApp::updatePlayMouse() {
+    // ---- ① 点视口 → 接管 ----
+    const bool requested = m_ctx->takePlayMouseCaptureRequest();
+    if (requested && m_ctx->isPlaying() && !m_ctx->playMouseCaptured()) {
+        m_ctx->setPlayMouseCaptured(true);
+    }
+
+    // ---- ② 只有 Playing 能保持捕获（Paused / Stopped 一律交还）----
+    if (m_ctx->playMouseCaptured() && !m_ctx->isPlaying()) {
+        m_ctx->setPlayMouseCaptured(false);
+    }
+
+    // ---- ③ 同步到 GLFW + ImGui ----
+    if (!m_ctx->takePlayCursorDirty()) return;
+    const bool captured = m_ctx->playMouseCaptured();
+    ImGuiIO& io = ImGui::GetIO();
+    if (captured) {
+        window().setCursorVisible(false);   // DISABLED = 隐藏 + 锁定 + 相对位移
+        io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
+    } else {
+        window().setCursorVisible(true);
+        io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
+    }
+    // 自动化锚点（tools/verify_play_mouse_capture.py 的判据就是这个）
+    VK_LOG_INFO("EDIT-MOUSE captured=%d viewport=%s", captured ? 1 : 0,
+                captured ? "input-live"
+                         : "input-frozen (LMB on the 3D viewport to take "
+                           "control, Esc releases)");
+}
+
 void EditorApp::handleShortcuts() {
     const ImGuiIO& io = ImGui::GetIO();
     // 正在文本输入（重命名 / 脚本路径）时不要抢键
@@ -3282,14 +3401,22 @@ void EditorApp::handleShortcuts() {
         ImGui::IsKeyPressed(ImGuiKey_Space, false))
         m_ctx->togglePlayPause();
 
-    // ---- 运行态：F = 游戏全屏 / 恢复，Esc = 退出全屏，其余编辑快捷键失效 ----
+    // ---- 运行态：F = 游戏全屏 / 恢复，Esc = ①交还鼠标 ②退出全屏 ----
     // 注意 F 在编辑态里是"聚焦选中项"，两种语义按 Play 状态分开，
     // 不会互相抢键。
+    //
+    // ⚠ 2026-10-23（P8）：Esc 在这一帧**只做一件事**，而且有优先级 ——
+    //   捕获中就交还鼠标（用户原话："按下 Esc 键，此时就正常显示鼠标"），
+    //   鼠标已经可见了才是"退出全屏"。写成两个独立 if 的话，全屏 + 捕获
+    //   时按一下 Esc 会同时交还鼠标和退全屏，玩家以为按了两次。
     if (!m_ctx->isEditing()) {
         if (ImGui::IsKeyPressed(ImGuiKey_F, false)) m_ctx->toggleGameFullscreen();
-        if (m_ctx->gameFullscreen() &&
-            ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-            m_ctx->gameFullscreenRef() = false;
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            if (m_ctx->playMouseCaptured()) {
+                m_ctx->setPlayMouseCaptured(false);
+            } else if (m_ctx->gameFullscreen()) {
+                m_ctx->gameFullscreenRef() = false;
+            }
         }
         return;
     }

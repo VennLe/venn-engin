@@ -6,6 +6,7 @@
 // fps：每 0.5 秒刷新一次的帧率
 // ============================================================
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 
@@ -35,6 +36,19 @@ public:
             m_deltaTime = m_fixedDelta;
         } else if (m_hasLast) {
             m_deltaTime = std::chrono::duration<float>(now - m_last).count();
+            // 单帧步长上限（0.1 s = 10 fps）。
+            //
+            // 一次真正的长停顿（着色器热重载、窗口被拖动、系统卡一下）之后
+            // 墙钟 dt 可能是 0.2~1 s。不夹住的话，这一帧里：
+            //   · 玩家按 `速度 × dt` 直接瞬移半米到几米（看起来像"闪一下"）
+            //   · 动画播放头一次跨过小半圈（腿的位置整个跳掉）
+            //   · 重力积分一步把角色推进地里
+            // 夹住之后这一帧最多推进 1/10 秒 —— 慢一点，但**连续**。
+            // 对"卡顿"的主观观感来说，长停顿本身的伤害远小于停顿之后的
+            // 那一记瞬移。
+            //
+            // ⚠ 这不影响确定性验证：MYVK_FIXED_DT 走的是上面那条分支。
+            m_deltaTime = std::min(m_deltaTime, 0.1f);
         }
         m_last = now;
         m_hasLast = true;

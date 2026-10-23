@@ -45,6 +45,7 @@
 #include "physics/Solver.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace physics {
@@ -180,10 +181,20 @@ public:
     //
     // 2026-10-22（第十轮）：让地形成为**真正的物理地面**。
     //
-    // 传进来的指针**不拷贝**（和 `CharacterDesc::ground` 同一个约定）：
-    // 调用方负责让它活得比世界长 —— 见 `SceneBinding::terrainHf`，
-    // 那里用 `unique_ptr` 兜住了生命周期（`buildSceneWorld` 的返回值按值
-    // 移动，`unique_ptr` 指向的对象地址不会变，所以裸指针不会悬垂）。
+    // ⚠ 2026-10-23：从"借用指针"改成**拷贝**。
+    //
+    // 原来的约定是"调用方负责让它活得比世界长"，指向
+    // `SceneBinding::terrainHf`。那个约定看着成立（unique_ptr 让结构体
+    // 地址在按值移动后仍然稳定），实际上**漏了 heights 这一层**：
+    // `Heightfield::heights` 指向 `SceneBinding::terrainHeights` 这个
+    // vector 的堆内存，SceneBinding 一析构就还回去了。编辑器恰好是
+    // `SceneBinding binding = buildSceneWorld(...)` 再用
+    // `std::move(binding.world)` 只拿走世界 —— 函数一返回，地形的
+    // 高度数据就是悬垂指针。Game.exe 因为把 binding 存成了成员才没暴露。
+    //
+    // 详见 `m_terrainOwned` 的注释（含崩溃偏移）。现在这里会把
+    // cols*rows 个 float 拷进世界自己名下，`heightfield()` 返回的指针
+    // 与世界同寿。
     //
     // 传 nullptr = 关掉地形碰撞（行为与改动前逐位相同）。
     //
@@ -238,6 +249,30 @@ private:
 
     // ---- 地形（见 setHeightfield）----
     const Heightfield* m_terrain = nullptr;
+    // 世界**自持**的地形副本（2026-10-23）。
+    //
+    // 曾经这里只有一个裸指针，所有权交给 `SceneBinding::terrainHf`
+    // ——那个约定有洞：`binding.terrainHf->heights` 指向的是
+    // `binding.terrainHeights`（vector）的堆内存，只要 SceneBinding 一析构，
+    // 结构体地址还在（unique_ptr 挡住了），**但 heights 指向的内存已经被
+    // 还回去了**。编辑器就是这么用的：
+    //
+    //     SceneBinding binding = buildSceneWorld(scene);   // 局部变量
+    //     m_physics = std::move(binding.world);            // 只拿走 world
+    //     // ← 函数返回，terrainHeights / terrainHf 析构
+    //
+    // 于是 `m_physics->heightfield()` 从此是悬垂指针。它在 P6 之前一直没
+    // 爆，是因为**编辑器里没有任何代码读它**；P6 给编辑器 Play 加了
+    // `editorGroundHeight()`（读地形做贴地），一进 Play 就 ACCESS
+    // VIOLATION（WER: Editor.exe+0x1ec64e，正好落在 Heightfield::raw 里
+    // `heights[col*rows+row]` 那条 movss 上）。
+    //
+    // 现在改成 setHeightfield **拷一份**进来：数据活多久由世界决定，
+    // 调用方不用再操心 SceneBinding 的生命周期（Game.exe 原先靠
+    // `m_binding` 当成员才侥幸没事）。尺寸就是 cols*rows 个 float
+    // （256×256 ≈ 256 KB），一次性拷贝，可忽略。
+    std::unique_ptr<Heightfield> m_terrainOwned;
+    std::vector<float> m_terrainHeights;
     std::uint32_t m_terrainBody = kInvalidBody;
 };
 

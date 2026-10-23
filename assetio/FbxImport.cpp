@@ -437,6 +437,18 @@ std::vector<SourceClip> extractAnimations(const ufbx_scene& scene,
 
         SourceClip clip;
         clip.name = stack.name.length ? str(stack.name) : ("clip" + std::to_string(s));
+        // Blender 的 FBX 导出（`bake_anim_use_all_actions`，本仓的角色管线就是
+        // 这么导的）把 take 名写成 "<armature 对象名>|<action 名>"，例如
+        // `ALICIA|Idle`。Unity / UE / glTF 转换器一律把 `|` 之后当 clip 名，
+        // 这里照办 —— 否则 `Skeleton::findClip("Idle")` 的逐字比较找不到，
+        // 角色会**静默退回 rest 姿势**：画面是不会动的 T-pose，日志却全绿。
+        // ⚠ 归一化只在**读资产**这一步；`findClip` 的逐字语义不变。
+        //   只剥第一个 `|` 之前的；`|` 后面为空（`"A|"`）时原样保留。
+        {
+            const std::size_t bar = clip.name.find('|');
+            if (bar != std::string::npos && bar + 1 < clip.name.size())
+                clip.name = clip.name.substr(bar + 1);
+        }
         const double t0 = stack.time_begin;
         const double t1 = stack.time_end;
         const double dur = (t1 > t0) ? (t1 - t0) : 0.0;

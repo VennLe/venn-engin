@@ -470,7 +470,8 @@ def scan_ui_literals():
                     continue
                 prefix = part[:gstart].rstrip()
                 if prefix.endswith("TR(") or prefix.endswith("TRL(") or \
-                        prefix.endswith("trId("):
+                        prefix.endswith("trId(") or \
+                        prefix.endswith("i18n::tr("):
                     continue
                 hits.append((gtext, os.path.relpath(path, ROOT),
                              line_of(text, m.start()), fn,
@@ -632,8 +633,12 @@ def scan_bare_formats():
             total += 1
             gstart, _gend, decoded = groups[0]
             # 已经被 TR(...) 包住？（口径同 B 组：看前一个非空字符是不是 '('）
+            # ⚠ engine/ 层的代码**不能**用 editor 的 `TR()` 宏（那是
+            #   editor/Localization.h 里的），只能用 `i18n::tr(...)`。
+            #   两种写法都算"已翻译"，否则 engine 层永远清不掉这一组。
             head = part[:gstart].rstrip()
-            if head.endswith("TR(") or head.endswith("TRL("):
+            if head.endswith("TR(") or head.endswith("TRL(") or \
+                    head.endswith("i18n::tr("):
                 continue
             if any(c > "\x7f" for c in decoded):
                 continue                    # 本来就是中文原文

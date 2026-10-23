@@ -199,6 +199,10 @@ void EditorContext::play() {
     if (m_play == PlayState::Paused) {
         // 从暂停恢复：运行态的实体与状态原封不动，直接继续
         m_play = PlayState::Playing;
+        // 恢复后**不自动接管鼠标**（P8）：玩家要再点一次视口。
+        // 理由与运行时"从暂停菜单继续"完全一致 —— 否则一按继续鼠标就消失，
+        // 玩家会以为鼠标失灵了。
+        setPlayMouseCaptured(false);
         setStatus(TR("Resumed"));
         return;
     }
@@ -237,6 +241,15 @@ void EditorContext::play() {
 
     m_playTime = 0.0f;
     m_play = PlayState::Playing;
+    // 进 Play **不自动接管鼠标**（P8，2026-10-23）：用户明确要求
+    // "必须先用左键在 3D 视口里点一下才开始和角色交互"。
+    // 光标这时是可见的，玩家可以先去点编辑器的面板 / 改参数。
+    //
+    // ⚠ 这里**绕开 setPlayMouseCaptured 的"值没变就不脏"短路**，直接置脏：
+    //   进 Play 时它本来就是 false，短路会让 `EDIT-MOUSE captured=0` 这条
+    //   锚点根本不打出来 —— 而验收脚本要拿它证明"进 Play 时鼠标是可见的"。
+    m_playMouseCaptured = false;
+    m_playCursorDirty = true;
 
     // 动画与 Run 互斥：进 Run 时丢掉动画快照（当前（可能已被动画改过）的
     // 编辑场景就是要被复制的那一份，无需恢复）
@@ -258,6 +271,8 @@ void EditorContext::play() {
 void EditorContext::pause() {
     if (m_play != PlayState::Playing) return;
     m_play = PlayState::Paused;
+    // 暂停 = 退出操作态（P8）：暂停时玩家要能用鼠标去点播放条 / 面板。
+    setPlayMouseCaptured(false);
     setStatus(TR("Paused"));
 }
 
@@ -270,6 +285,9 @@ void EditorContext::stop() {
     m_play = PlayState::Stopped;
     m_playTime = 0.0f;
     m_gameFullscreen = false;
+    // Stop 之后鼠标一定要回来（P8）—— 否则编辑态里光标是隐藏的，
+    // 用户会以为编辑器卡死了。
+    setPlayMouseCaptured(false);
 
     validateSelection();  // 把选择按名字接回编辑态
     VK_LOG_INFO("Editor: STOP (runtime discarded, editor scene restored)");

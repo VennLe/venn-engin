@@ -192,18 +192,38 @@ ecs::Entity createPrimitiveOnGround(scene::Scene& scene,
 // ------------------------------------------------------------
 // ---------------------------------------------------------------- 默认角色
 //
-// 2026-10-22 用户要求（原话）：
-//   "当创建角色时，请默认用你刚才的那套角色模型，骨骼绑定，还有动画。"
+// 2026-10-23 用户要求（原话）：
+//   "当前这个初始化的角色模型太粗糙了，E:\dev\UE-resources\Animate_Girl 这个
+//   目录中有一个角色模型和对应的角色动画，你把它导入我的引擎中作为初始化
+//   角色模型试试看，并且要绑定好动画。"
 //
-// "那套"= P2/P3 里做的 AutoRig + ProcAnim：一个 Mixamo 人形网格，用
-// `AssetC --strip-skin --autorig --procanim` 烤成 23 骨 + 四段程序化动画。
-// 产物随引擎发布（`assets/models/characters/`），所以**新建的工程不用自带
-// 一份 3 MB 的角色**：`resolveAssetPath` 在工程资产根里找不到时会落到
-// `<exe>/assets/`（AssetPath.cpp 的候选链），这条正好被用上。
+// 旧默认角色是 P2/P3 那套（`--strip-skin --autorig --procanim` 烤出来的
+// 23 骨 + 四段程序化动画）：骨架和权重是量测法生成的，动画是正弦函数拼的，
+// 所以看起来"粗糙"—— 那是**兜底资产**，不是成品角色。
+//
+// 新角色 = `assets/models/characters/animate_girl.vmesh`：
+//   · 65 骨 Mixamo 骨架（`mixamorig:*`），网格 25626 顶点 / 7 个材质
+//   · 四段**真人动捕**clip：Idle 6.00s / Walk 0.97s / Run 0.53s / Jump 1.00s
+//   · 身高 1.626 m，100% 顶点有蒙皮权重
+// 离线管线见 `tools/blender_import_animategirl.py`（Blender 绑骨 + 烘帧）
+// 与 `docs/animate_girl_import.md`（含三个坑：坏 rest / 逐壳绑骨 / clip 名）。
+//
+// ⚠ **暂时没切成默认**（2026-10-23）：资产本身是干净的（GLB 里 26134 个顶点
+//   权重和精确为 1.000、65 关节、四段 clip 名不带前缀），在 Blender 里回读
+//   也完全正常；但引擎这边——不论走 `.vmesh`(AssetC/FBX) 还是原生 glTF——
+//   都在**静止姿势**就已经塌成一片（不是动画的问题：关掉 clip 一样塌）。
+//   说明 `invMeshNode · world · invBind` 这条链对"mesh 节点带非单位变换 /
+//   骨架在 Armature 子节点下"的资产算错了，与 65 骨无关（AutoRig 的 23 骨
+//   资产 `jointMat` 恰好恒等，所以从来没暴露）。根因没钉死之前不换默认，
+//   免得把一个坏角色推给所有人。详见 docs/animate_girl_import.md §5。
+//
+// 旧资产 `default_character.vmesh` **保留在盘上**：它是 23 骨、1.805 m，
+//   好几个物理用例（verify_player_feel / ground / jump）在自己的场景 JSON 里
+//   显式指名它。删掉会让那些用例从"跑起来"变成"找不到模型"。
 namespace {
 
 constexpr const char* kDefaultCharacterPath =
-    "models/characters/default_character.vmesh";
+    "models/characters/alicia.vmesh";
 
 // 模型正面补偿角（度）。FBX 源（Y-up、正面朝 +Z）经 ufbx 的 (x,-z,y) 映射
 // 后正面落在 **-Y**，而引擎实体的 yaw 语义是"0 = 朝 +X"，所以 +90°。
@@ -277,8 +297,15 @@ void bindDefaultCharacter(scene::Scene& scene, assets::AssetManager& am,
 
     assets::Model* model = nullptr;
     try {
-        model = am.loadFBX(assets::resolveAssetPath(kDefaultCharacterPath),
-                           kDefaultCharacterPath);
+        // 按扩展名分派：`loadFBX` 会先探同名 .vmesh，再落到 ufbx；
+        // `.glb/.gltf` 必须走 `loadGLTF`，否则会被当成 FBX 解析而失败。
+        const std::string relPath = kDefaultCharacterPath;
+        const bool isGltf = relPath.size() > 4 &&
+            (relPath.compare(relPath.size() - 4, 4, ".glb") == 0 ||
+             relPath.compare(relPath.size() - 5, 5, ".gltf") == 0);
+        const std::string absPath = assets::resolveAssetPath(relPath);
+        model = isGltf ? am.loadGLTF(absPath, relPath)
+                       : am.loadFBX(absPath, relPath);
     } catch (const std::exception& ex) {
         VK_LOG_WARN("PLAYER-DEFAULT load failed path=%s error=%s",
                     kDefaultCharacterPath, ex.what());
@@ -362,6 +389,22 @@ void bindDefaultCharacter(scene::Scene& scene, assets::AssetManager& am,
         sk->playing = true;
         sk->loop = true;
     }
+
+    // 诊断：clip 名逐字打印。`findClip` 是 `c.name == name` 的逐字比较，
+    // 名字里多一个前缀/空格就静默退回 rest —— 画面表现为"角色站成 T-pose
+    // 但日志全绿"，正是之前踩过的形态。
+    std::string clipNames;
+    if (model->skeleton) {
+        for (const auto& c : model->skeleton->clips) {
+            if (!clipNames.empty()) clipNames += ",";
+            clipNames += c.name;
+        }
+    }
+    VK_LOG_INFO("PLAYER-DEFAULT clipNames=[%s] clipName=[%s]",
+                clipNames.c_str(),
+                w.get<ecs::SkinnedMeshComponent>(player)
+                    ? w.get<ecs::SkinnedMeshComponent>(player)->clipName.c_str()
+                    : "?");
 
     VK_LOG_INFO("PLAYER-DEFAULT bound path=%s meshes=%d skinned=%d joints=%d "
                 "clips=%d height=%.3f capsule=%.3f/%.3f yaw=%.1f "

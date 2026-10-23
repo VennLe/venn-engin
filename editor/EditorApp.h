@@ -153,6 +153,19 @@ private:
     void computeLayout();
     void handleShortcuts();
 
+    // Play 态的鼠标捕获同步（P8，2026-10-23）。
+    //
+    // 三件事，按顺序：
+    //   ① ViewportPanel 报告"左键点了视口" → 进入操作态（隐藏 + 锁定光标）
+    //   ② 不在 Playing 了 → 强制交还（暂停 / Stop / 崩溃恢复都走这条）
+    //   ③ 状态真的变了才去碰 GLFW 与 ImGui（每帧写光标模式会让 GLFW 反复
+    //     warp 光标，还会把 discardNextMouseDelta 用光）
+    //
+    // Esc 的**按键判定不在这里**：它和"退出全屏"抢同一个键，必须和
+    // `handleShortcuts` 里那段放在一起用 if/else 分流，否则一帧会既交还
+    // 鼠标又退出全屏。
+    void updatePlayMouse();
+
     // 每帧把所有"浮在分栏之上"的窗口矩形喂给分栏器（见 SplitLayout::addOccluder）。
     // 必须排在**所有窗口都画完**之后、handleSplitters 之前调用。
     void collectSplitOccluders();

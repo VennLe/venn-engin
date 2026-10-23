@@ -168,7 +168,26 @@ void PhysicsWorld::clear() {
 // ================================================================
 
 void PhysicsWorld::setHeightfield(const Heightfield* hf) {
-    m_terrain = (hf && hf->valid()) ? hf : nullptr;
+    // ---- 拷贝一份高度数据（2026-10-23）----
+    //
+    // 不再借用调用方的指针：`heights` 实际指向调用方（通常是
+    // `SceneBinding::terrainHeights`）的 vector 内存，那个 vector 一析构，
+    // 这里就成了悬垂。编辑器正是 `std::move(binding.world)` 之后让
+    // binding 立刻销毁的 —— 于是每次进 Play 读地形都踩释放过的内存。
+    // 详见 PhysicsWorld.h 里 `m_terrainOwned` 的注释。
+    if (hf && hf->valid()) {
+        const std::size_t n = static_cast<std::size_t>(hf->sampleCount());
+        m_terrainHeights.assign(hf->heights, hf->heights + n);
+        m_terrainOwned = std::make_unique<Heightfield>(*hf);
+        m_terrainOwned->heights = m_terrainHeights.data();
+        m_terrain = m_terrainOwned.get();
+    } else {
+        m_terrain = nullptr;
+        m_terrainOwned.reset();
+        m_terrainHeights.clear();
+        m_terrainHeights.shrink_to_fit();
+    }
+
     if (!m_terrain) {
         // 关掉：伪刚体留着也没坏处（它配不到任何体），但为了让
         // "关掉地形"之后的世界和改动前**完全一致**，直接摘掉。

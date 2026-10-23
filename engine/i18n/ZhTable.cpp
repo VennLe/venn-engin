@@ -1183,6 +1183,8 @@ const Entry kZh[] = {
      "圆柱段半高；总高 = 2 ×（半高 + 半径）"},
     {"Uniform scale of the preview model", "预览模型的等比缩放"},
     {"%.1f deg", "%.1f 度"},
+    // 键码兜底标签（engine/ui/KeyCodes.cpp：表里没有的键码）
+    {"Key%d", "按键%d"},
     {"Ground grid in the preview viewport (independent of the main viewport's grid)",
      "预览视口里的地面栅格（与主视口的栅格各自独立）"},
     {"Built-in control (no key binding needed). Walk / Run follow your actual speed; Jump follows whether you are off the ground.",
@@ -1821,6 +1823,9 @@ const Entry kZh[] = {
     {"Restore view  (F)", "恢复视图  (F)"},
     {"Fullscreen  (F)", "全屏  (F)"},
     {"PAUSED", "已暂停"},
+    // ---- Play 态鼠标接管（P8，2026-10-23）----
+    {"Click the viewport to take control", "点一下视口即可接管操作"},
+    {"In control - Esc shows the mouse", "操作中 —— 按 Esc 取回鼠标"},
     {"Box Projection", "盒式投影"},
     {"Looping", "循环"},
     {"Prewarm", "预热"},

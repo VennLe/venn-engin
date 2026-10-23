@@ -220,6 +220,20 @@ run("engine/animation/Locomotion.cpp → 默认角色移动", OLD,
     want={"verify_char_locomotion", "verify_anim_runtime",
           "verify_character_import", "verify_player_character",
           "verify_player_feel", "verify_player_jump"})
+# 2026-10-23 P11：默认角色换成 Alicia Solid（128 骨 / 4 段 clip，见
+# docs/alicia_import.md）。**`kDefaultCharacterPath` 这个常量本身长在
+# editor/EditorScene.cpp 里** —— "换默认角色"完全可以只改这一个文件、一点
+# 都不碰 assets/models/characters/，所以这个文件的 owner 必须包含
+# verify_char_locomotion（它的 C0/C1c 就是拿这个常量去对资产的）。
+# ⚠ 期望是并集：同一文件还管 createPrimitiveOnGround 的落点（verify_player /
+#   verify_collision_play / verify_drop_to_floor / verify_model_scale）和
+#   一批 TR() 词条（verify_i18n_coverage）。
+run("editor/EditorScene.cpp → 默认角色装配", OLD,
+    with_change("editor/EditorScene.cpp"),
+    want={"verify_char_locomotion", "verify_character_import",
+          "verify_collision_play", "verify_drop_to_floor",
+          "verify_i18n_coverage", "verify_model_scale", "verify_player",
+          "verify_player_feel"})
 # ⚠ 按键翻译表 `engine/ui/KeyCodes.*` **故意不做夹具**：`engine/ui/**` 在
 #   `GLOBAL_GLOBS` 里，改它走全量，登记进 TRIGGERS 反而会在 --narrow 下
 #   假跳过（check_regression_map 的 [E] 段会点名）。这里留一条反向断言，

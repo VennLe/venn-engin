@@ -39,6 +39,27 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// 贴图路径必须写成"**相对资产根**"，资产才能连同贴图一起拷到别的机器。
+// `--asset-root` 没给时按输入文件往上找最近的 `assets` 目录（本项目约定
+// `<root>/assets`）；找不到就退化成该文件所在目录 —— 结果仍然是相对路径，
+// 只是根不同。
+//
+// ⚠ 不推断的后果不是"贴图路径丑一点"，而是**全部为空**：
+//   `relativizeTo(p, "")` 里有 `if (assetRoot.empty()) return "";`，
+//   于是每个材质的 `albedoPath` 都是空 → `--info` 打 `albedo=-` →
+//   角色渲染成**纯白石膏像**。Alicia 就这么白了一整轮
+//   （见 docs/alicia_import.md §6 遗留 2）。
+std::string guessAssetRoot(const std::string& input) {
+    std::error_code ec;
+    fs::path p = fs::weakly_canonical(fs::path(input), ec);
+    if (ec) p = fs::path(input);
+    for (fs::path q = p.parent_path(); !q.empty(); q = q.parent_path()) {
+        if (q.filename() == "assets") return q.string();
+        if (q == q.root_path()) break;
+    }
+    return p.parent_path().string();
+}
+
 struct Args {
     std::vector<std::string> inputs;
     std::string output;        // -o：文件或目录
@@ -557,7 +578,7 @@ int main(int argc, char** argv) {
 
         assetio::ImportOptions io;
         io.scale = a.scale;
-        io.assetRoot = a.assetRoot;
+        io.assetRoot = a.assetRoot.empty() ? guessAssetRoot(in) : a.assetRoot;
         io.verbose = !a.quiet;
         assetio::SourceModel model = assetio::importFbx(in, io);
 

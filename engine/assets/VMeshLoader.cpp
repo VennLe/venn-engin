@@ -18,6 +18,7 @@
 #include "assets/MeshLoader.h"
 
 #include "assets/AssetManager.h"
+#include "assets/AssetPath.h"
 #include "assets/Vmeta.h"
 #include "core/Logger.h"
 
@@ -127,12 +128,22 @@ std::unique_ptr<Model> loadVMeshModel(rhi::Device& device,
         //   不能让整个模型加载失败。这条分支以前是死代码 —— 因为
         //   `loadTexture` 在文件读不出来时直接抛，根本走不到下面的 `!albedo`。
         Texture* albedo = nullptr;
+        // ⚠ 贴图路径来自 `.vmesh`，是**相对资产根**的（`models/xxx.png`）。
+        //   `Texture::fromFile` 只按**进程 cwd** 打开，不认资产根 —— 编辑器
+        //   从 `build/bin` 启动时相对路径一条都打不开，`tryLoadTexture` 静默
+        //   返回 nullptr，材质退化成纯白，角色就成了一整只石膏像（贴图明明
+        //   在盘上、`--info` 也显示 albedo 有值）。TerrainPass 踩过同一个坑
+        //   （docs/launcher_roadmap.md「地面模糊重影」），修法一样：先过
+        //   `resolveAssetPath` 把 `<exe>/assets` 这个根补上。
+        const auto resolve = [](const std::string& p) {
+            return p.empty() ? p : assets::resolveAssetPath(p);
+        };
         if (!sm.albedoPath.empty()) {
-            albedo = assets.tryLoadTexture(sm.albedoPath, key + "/albedo", true);
+            albedo = assets.tryLoadTexture(resolve(sm.albedoPath), key + "/albedo", true);
         } else if (!sm.albedoRaw.empty()) {
             // 离线期没解析出来 → 运行期再试一次原始路径。
             // 这一步的意义是"资产目录结构变了但贴图还在"，能救回来。
-            albedo = assets.tryLoadTexture(sm.albedoRaw, key + "/albedo", true);
+            albedo = assets.tryLoadTexture(resolve(sm.albedoRaw), key + "/albedo", true);
         }
         if (!albedo && (!sm.albedoRaw.empty() || !sm.albedoPath.empty())) {
             VK_LOG_WARN("VMESH-TEX-MISSING model=%s mat=%s path=%s",
@@ -142,9 +153,9 @@ std::unique_ptr<Model> loadVMeshModel(rhi::Device& device,
 
         Texture* normal = nullptr;
         if (!sm.normalPath.empty())
-            normal = assets.tryLoadTexture(sm.normalPath, key + "/normal", false);
+            normal = assets.tryLoadTexture(resolve(sm.normalPath), key + "/normal", false);
         else if (!sm.normalRaw.empty())
-            normal = assets.tryLoadTexture(sm.normalRaw, key + "/normal", false);
+            normal = assets.tryLoadTexture(resolve(sm.normalRaw), key + "/normal", false);
         if (!normal && (!sm.normalRaw.empty() || !sm.normalPath.empty())) {
             VK_LOG_WARN("VMESH-TEX-MISSING model=%s mat=%s kind=normal path=%s",
                         name.c_str(), sm.name.c_str(),

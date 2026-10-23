@@ -1,6 +1,7 @@
 #include "rhi/Swapchain.h"
 #include "rhi/Device.h"
 #include "core/Logger.h"
+#include "core/RunMode.h"
 
 #include <algorithm>
 
@@ -51,7 +52,23 @@ void Swapchain::create(uint32_t width, uint32_t height, VkSwapchainKHR old) {
         }
     }
 
-    // ---- 呈现模式：FIFO（全平台保证支持，垂直同步）----
+    // ---- 呈现模式 ----
+    //
+    // 2026-10-23 改：默认 **FIFO（锁垂直同步）**，不再是"有 MAILBOX 就用
+    // MAILBOX"。
+    //
+    // 原因（用户报的"角色在移动时、尤其是鼠标转视角时动作明显卡顿"）：
+    //   MAILBOX 不限制提交速率 —— 编辑器的空场景主循环实测跑到 **470 fps**
+    //   左右（dt 均值 2.1 ms、标准差 0.63 ms），而这块屏是 **60 Hz**。
+    //   渲染帧与显示刷新不是整数倍关系，合成器每次取的"最新一帧"距上次
+    //   刷新的时间长短不一（0~2 ms 的抖动摊在 16.7 ms 上就是 ±12%），
+    //   于是画面里的匀速运动（转视角时最明显：整个视野都在动）推进得不
+    //   均匀 —— 肉眼就是"一顿一顿"，走路的步频也跟着忽快忽慢。
+    //   锁到 FIFO 之后每帧严格对应一次刷新，步长恒定，帧率也顺带从 470
+    //  降到 60（顺带省掉 87% 的 GPU 空转）。
+    //
+    // 谁需要不锁：自动化（跑满 N 帧 / 逐帧钩子 / 截图对比都要"越快越好"），
+    //   以及量 GPU 峰值的手工测试 → `MYVK_VSYNC=0`，见 core/RunMode.h。
     uint32_t pmCount = 0;
     VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(m_device.physical(),
                                                        m_surface, &pmCount, nullptr));
@@ -60,13 +77,21 @@ void Swapchain::create(uint32_t width, uint32_t height, VkSwapchainKHR old) {
         VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(
             m_device.physical(), m_surface, &pmCount, modes.data()));
     }
+    const bool wantVsync = core::vsyncEnabled();
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    for (auto m : modes) {
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR) {
-            presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-            break;
+    if (!wantVsync) {
+        // 不锁的时候优先 MAILBOX（不撕裂的"尽快呈现"）；没有就退到 FIFO
+        // —— FIFO 是规范保证一定存在的模式，退过去只是变回锁帧，不会失败。
+        for (auto m : modes) {
+            if (m == VK_PRESENT_MODE_MAILBOX_KHR) {
+                presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+                break;
+            }
         }
     }
+    VK_LOG_INFO("Swapchain present mode = %s (vsync=%d)",
+                presentMode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO" : "MAILBOX",
+                wantVsync ? 1 : 0);
 
     // ---- 图像数量：min + 1，不超上限 ----
     uint32_t imageCount = caps.minImageCount + 1;

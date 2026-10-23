@@ -27,6 +27,14 @@ public:
     static bool mouseDown(int button);
     static bool mousePressed(int button);
     static void mouseDelta(double* dx, double* dy); // 本帧位移（已被消费置零）
+    // 同上，但**不受 `setUiCapturing` 门控**。
+    //
+    // 用途只有一个：`GLFW_CURSOR_DISABLED` 的"操作态"（编辑器 Play / 运行时
+    // 点击视口之后）。那时鼠标已经被游戏接管 —— 屏幕上根本没有光标可点，
+    // ImGui 却仍然坚持自己"占着鼠标"（鼠标锁在窗口中心，正好压在某个面板
+    // 上），于是 `g_uiMouse = true` 把所有游戏输入一起掐掉。此时要看的就是
+    // **原始位移**，而不是"UI 允不允许游戏看鼠标"。
+    static void mouseDeltaRaw(double* dx, double* dy);
     static double scrollDelta();                   // 本帧滚轮（消费置零）
     static void cursorPos(double* x, double* y);
 

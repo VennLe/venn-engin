@@ -64,6 +64,8 @@ RE_CAP_SCR = re.compile(r"CHAR-PREVIEW-CAPSULE-SCREEN a=\((-?[\d.]+),(-?[\d.]+)\
                         r"b=\((-?[\d.]+),(-?[\d.]+)\) r=([\d.]+) "
                         r"off=\((-?[\d.]+),(-?[\d.]+)\)")
 RE_JUMP = re.compile(r"EDIT-JUMP v0=([\d.]+) expectH=([\d.]+)m")
+# Play 态鼠标接管（P8）：EditorApp::updatePlayMouse 在状态变化时打一条
+RE_EDIT_MOUSE = re.compile(r"EDIT-MOUSE captured=1")
 
 
 def make_scene():
@@ -387,6 +389,19 @@ def main():
         off = len(tap.snapshot())
         tap_key(hwnd, VK_SPACE)          # 编辑态 Space = 进 Play
         time.sleep(2.0)
+
+        # ---- P7a（P8，2026-10-23）：Play 态键鼠是两态的 ----
+        # 进了 Play 不等于能操作 —— 必须先用左键在 3D 视口里点一下接管，
+        # 否则下面的 Space 不归玩家（用户要求"点了才能交互"）。
+        # 视口矩形沿用编辑态拿到的那份：Play 态只是少了工具栏，中心点必在
+        # 视口内。
+        ocx, ocy = center(vp)
+        off = len(tap.snapshot())
+        click(hwnd, ocx, ocy)
+        m_cap, _ = wait_regex_after(tap, RE_EDIT_MOUSE, off, 6.0)
+        check("P7a Play 态点视口接管鼠标（探针 captured=1）",
+              m_cap is not None, m_cap.group(0) if m_cap else "没有 EDIT-MOUSE")
+
         tap_key(hwnd, VK_SPACE)          # Play 态 Space = 跳跃
         m_jump, _ = wait_regex_after(tap, RE_JUMP, off, 6.0)
         check("P7 编辑器 Play 里敲空格 → 角色起跳（v0=3.70 / 0.70 m）",
