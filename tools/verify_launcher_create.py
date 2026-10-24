@@ -64,6 +64,12 @@ def run_wizard(work, name, type_index, recent_path, expect_ok=True):
             "MYVK_LAUNCHER_PAGE": "new",
             "MYVK_LAUNCHER_TEST_ROOT": work,
             "MYVK_LAUNCHER_TEST_NAME": name,
+            # 分辨率**钉死**成 1920x1080 那一档（2026-10-24）。
+            # 2026-10-23 起向导默认推荐"本机桌面分辨率"，于是 C8/F8 在
+            # 4K 机器上期望 1920x1080 就永远红 —— 那台机器上向导写
+            # 3840x2160 完全正确。本用例验的是"创建流程写出的工程"，不是
+            # "分辨率推荐值"，后者由 verify_launcher_display.py 覆盖。
+            "MYVK_LAUNCHER_TEST_RES": "1",
         })
     if not hwnd:
         proc.kill()
@@ -194,7 +200,7 @@ def check_project(root, name, kind, fails, prefix):
     else:
         kit.log("CHECK %s7 game.json title=%s OK" % (prefix, name))
     if (g.get("width"), g.get("height")) != (1920, 1080):
-        fails.append("%s8 game.json %sx%s，期望 1920x1080（向导默认档）"
+        fails.append("%s8 game.json %sx%s，期望 1920x1080（用例显式指定）"
                      % (prefix, g.get("width"), g.get("height")))
     else:
         kit.log("CHECK %s8 game.json 1920x1080 OK" % prefix)
@@ -341,6 +347,40 @@ def main():
             kit.log("CHECK C15 original project untouched OK")
     else:
         fails.append("C15 第一轮没建出工程，重名用例没法跑")
+
+    # ================= 第四轮：下次新建默认用"上次那个目录" =================
+    #
+    # 需求（2026-10-24 用户原话）："创建新游戏会设置游戏目录时不要每次都是
+    # C 盘的目录，如果之前有创建过的游戏目录，默认会以之前的目录为准。"
+    #
+    # 复现方式必须**不**给 TEST_ROOT —— 给了就等于绕过了这条需求本身。
+    # 前三轮已经成功建过两个工程，`newproject.json` 里应该记着 work。
+    saved = os.path.join(work, "newproject.json")
+    if not os.path.isfile(saved):
+        fails.append("C17 创建成功后没有写出 newproject.json（%s）" % saved)
+    else:
+        proc, tap, hwnd = kit.launch(
+            recent_path=recent_path,
+            env_extra={"MYVK_LAUNCHER_PAGE": "new"})   # ⚠ 没有 TEST_ROOT
+        try:
+            if not hwnd:
+                fails.append("C17 第四轮启动器没起来")
+            else:
+                tap.wait_line("LAUNCHER-WIZARD dir-default=", timeout=25.0)
+                line = next((l for l in tap.text().splitlines()
+                             if "LAUNCHER-WIZARD dir-default=" in l), None)
+                want_key = kit.project_key(work)
+                got = kit.project_key(line or "")
+                if line and "source=saved" in line and want_key in got:
+                    kit.log("CHECK C17 新建向导默认目录=上次目录(%s) OK" % work)
+                else:
+                    fails.append("C17 新建向导默认目录不是上次那个：%r（期望 %s）"
+                                 % (line, work))
+                # 正面断言之外再补一条反向：**不能**又是 Documents。
+                if line and "source=documents" in line:
+                    fails.append("C17 又回落到 Documents（C 盘）了")
+        finally:
+            kit.shutdown(proc, hwnd)
 
     return kit.finish(fails)
 

@@ -3206,6 +3206,19 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
         std::tan(glm::radians(scene.camera().fov()) * 0.5f);
     const float invTanHalf = tanHalfFovY > 1e-4f ? 1.0f / tanHalfFovY : 0.0f;
 
+    // MYVK_LOD_OFF=1 → 强制所有物体走第 0 级（A/B 对照用）。
+    //
+    // 存在的理由不是"省事"，而是"排查渲染异常时必须能一键排除 LOD"：
+    // 2026-10-24 的"角色脸变白板、腿消失"就是靠开关这一项在 30 秒内
+    // 定位到"低模把 UV 平均坏了"，而在那之前花了大半天怀疑材质/贴图/
+    // 蒙皮权重。UI 上也有 LOD 开关（`lodEnabled()`），但自动化脚本点
+    // 不到，命令行/环境变量这条路必须留一条。
+    static const bool s_dbgNoLod = [] {
+        const char* v = std::getenv("MYVK_LOD_OFF");
+        return v && v[0] && v[0] != '0';
+    }();
+    if (s_dbgNoLod) m_lodEnabled = false;
+
     ecs::World& w = scene.world();
     for (ecs::Entity e : m_visibleScratch) {
         auto* mc = w.get<ecs::MeshComponent>(e);
@@ -3298,6 +3311,7 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
         it.lodLevel = lodLevel;        const auto* matc = w.get<ecs::MaterialComponent>(e);
         it.material = matc ? matc->material : nullptr;
         it.model = model;
+
         // 无 LOD 的物体也要参与"如果全用 0 级会提交多少"的对照
         it.baseTriangles = static_cast<uint32_t>(
             mc->mesh->indices().size() / 3);
@@ -5745,7 +5759,18 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
     //   · 不写深度 + 排在透明之前 → 玻璃之类的透明物能正常叠在它上面
     // 顶点一个都不要：4 个 gl_VertexIndex 拼出铺满 extent 的四边形，
     // 格线图案全在片元里按像素算（见 assets/shaders/grid.frag）。
-    if (m_gridEnabled && m_gridPipeline) {
+    const bool terrainPresent =
+        m_terrain && m_terrain->ready() && m_terrain->instanceCount() > 0;
+    // 有地形时栅格退场（见 GridSettings::hideWhenTerrain）。
+    // 只在那里打一次日志：这条路径每帧都会走到，逐帧打日志会淹掉 Console。
+    const bool gridSuppressed = m_grid.hideWhenTerrain && terrainPresent;
+    if (gridSuppressed != m_gridSuppressedLogged) {
+        m_gridSuppressedLogged = gridSuppressed;
+        VK_LOG_INFO("GRID-SUPPRESS on=%d reason=terrain instances=%d",
+                    gridSuppressed ? 1 : 0,
+                    m_terrain ? static_cast<int>(m_terrain->instanceCount()) : 0);
+    }
+    if (m_gridEnabled && m_gridPipeline && !gridSuppressed) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                           m_gridPipeline->get());
 

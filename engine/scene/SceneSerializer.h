@@ -19,6 +19,7 @@
 
 namespace assets {
 class AssetManager;
+class Material;
 }
 namespace scene {
 class Scene;
@@ -58,5 +59,22 @@ SceneIoResult sceneToJson(const Scene& scene, std::string& outJson);
 // 从 JSON 文本恢复场景（同样会先清空当前世界）
 SceneIoResult sceneFromJson(Scene& scene, assets::AssetManager& assets,
                             const std::string& jsonText);
+
+// ============================================================
+// 单独加载一份 `.vmat`（编辑器"给选中网格体换材质"用）
+//
+// relPath 是**相对资产根**的路径（`assets::makeAssetRelative` 那种形式），
+// 例如 "materials/library/grass_ground.vmat"。
+//
+// 走的是与场景加载**完全相同**的那条分支（`resolveMaterial` 的 vmat 分支）：
+// id 去重、贴图解析、`captureImportDefaults` 全都在里面。所以同一个 .vmat
+// 被"场景引用"和"手动赋给某个物体"拿到的是**同一个 Material 对象** ——
+// 改一处两处都变，这是有意的（节省显存，且符合"材质资产是共享的"）。
+//
+// 失败返回 nullptr（文件不存在 / JSON 坏 / 贴图缺失都会走到这里，
+// 具体原因在日志里，锚点 ASSET-MAT-MISS / ASSET-VMAT）。
+// ============================================================
+assets::Material* loadMaterialAsset(assets::AssetManager& assets,
+                                    const std::string& relPath);
 
 } // namespace scene

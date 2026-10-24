@@ -62,6 +62,12 @@ def find_window(title, timeout=20.0):
 
     窗口标题现在带后缀（如 "Venn Editor"），
     FindWindowW 要求精确匹配会找不到，所以枚举所有顶层窗口做 startswith。
+
+    ⚠ **必须传 "Venn ..."（大写 V）**，别传小写 "venn"。桌面上只要开着一个
+    名叫 `venn-resource - 文件资源管理器` 的资源管理器窗口（很常见，因为
+    材质包就放在 `E:\\code\\cpp\\venn-resource`），小写前缀会先枚举到它，
+    拿到 `GetClientRect` = 0×0 的客户区 → `PrintWindow` 全黑 → 截图
+    **永远**失败，而报错只是含糊的 `capture failed`。踩过一次。
     """
     end = time.time() + timeout
     while time.time() < end:

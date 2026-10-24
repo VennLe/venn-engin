@@ -94,7 +94,9 @@
       "castShadow": false,
       "gameStart": {
         "yaw": 0.0,
-        "enabled": true
+        "enabled": true,
+        "mode": "first",
+        "spawnOnRun": true
       },
       "script": {
         "path": "scripts/main.vks",

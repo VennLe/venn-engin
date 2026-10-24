@@ -65,6 +65,9 @@ SCENE_PATH = os.path.join(ASSETS, "scenes", "_verify_play_terrain.json")
 SIZE = "1600x1000"
 
 RE_BOUND = re.compile(r"PLAYER-DEFAULT bound")
+# 2026-10-24：添加人称角色 = 配置出生点（不装配角色）
+RE_PSTART = re.compile(r"PLAYER-START (created|reconfigured) mode=")
+RE_PSPAWN = re.compile(r"PLAYER-SPAWN at GameStart feet=")
 RE_PLAY = re.compile(r"Editor: PLAY in viewport")
 RE_TERRAIN = re.compile(r"PHYS-TERRAIN attach cols=(\d+) rows=(\d+)")
 RE_RUNBTN = re.compile(
@@ -177,14 +180,23 @@ def main():
         user32.SetCursorPos(*client_to_screen(hwnd, mx, my))
         time.sleep(0.4)
 
-        # ---- T0 创建第三人称角色 ----
+        # ---- T0 创建第三人称角色（2026-10-24 起只是"配置出生点"）----
         ok = open_menu_and_click(tap, hwnd, mx, my, "VP-ADD-Player",
                                  "VP-ADD-ThirdPerson", "Third-Person Player")
         if not check("T0a Shift+A ▸ Player ▸ Third-Person Player", ok):
             return 3
-        check("T0b 角色装配完成（PLAYER-DEFAULT bound）",
-              last_regex(tap, RE_BOUND, 12.0) is not None)
-        time.sleep(1.5)
+        # 新语义：菜单只给 GameStart 写 mode，**不进视口**。
+        # 两条正反面都要断：写了配置（正面）+ 没装配角色（反面）。
+        pstart = last_regex(tap, RE_PSTART, 8.0)
+        check("T0b 出生点被配置（PLAYER-START created/reconfigured）",
+              pstart is not None,
+              "" if pstart else "没有 PLAYER-START 行")
+        leak = last_regex(tap, RE_BOUND, 0.6)
+        check("T0c 编辑态视口里没有角色（角色运行时才生成）",
+              leak is None,
+              "" if leak is None
+              else "出现了 PLAYER-DEFAULT bound —— 角色被加进视口了")
+        time.sleep(1.0)
 
         # ---- T1 点工具栏 Run ----
         btn = last_regex(tap, RE_RUNBTN, 8.0)
@@ -203,6 +215,11 @@ def main():
             how = "Space（没拿到 TB-PLAY-run 矩形）"
         check("T1 进入 Play（%s）" % how,
               last_regex(tap, RE_PLAY, 10.0) is not None)
+
+        # ---- T1b 角色在 Play 那一刻才装配（新语义的正面判据）----
+        check("T1b Play 后角色在 GameStart 处装配（PLAYER-SPAWN + bound）",
+              last_regex(tap, RE_PSPAWN, 10.0) is not None
+              and last_regex(tap, RE_BOUND, 15.0) is not None)
 
         # ---- 观察 12 秒：这段就是崩溃窗口 ----
         end = time.time() + 12.0

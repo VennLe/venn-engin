@@ -47,6 +47,7 @@
 
 #include "core/InputMap.h"
 #include "scene/CameraSystem.h"
+#include "scene/SpringArm.h"
 
 #include "PlayerController.h"
 #include "ui/HudSelfTest.h"
@@ -377,6 +378,13 @@ int main(int argc, char** argv) {
             return scene::runCameraSelfTest() == 0 ? 0 : 1;
         if (cfg.selftest == "player")
             return runtime::runPlayerSelfTest() == 0 ? 0 : 1;
+        // 第三人称弹簧臂（= UE SpringArmComponent 的球扫掠 + 穿透优先）。
+        // 纯几何 —— 只喂一个 `cast` 回调，不建物理世界，所以也不需要设备。
+        // 与 `player` 分开的理由：player 那一组要真的跑角色（物理 + 输入），
+        // 慢一个量级；而"墙角漏检 / 贴脸穿透 / 地面钳制符号"这几条是**纯函数**
+        // 的错，应该在几毫秒内就能定位。
+        if (cfg.selftest == "springarm")
+            return scene::runSpringArmSelfTest() == 0 ? 0 : 1;
         // U8：HUD 的血量追随 / 伤害数字寿命 / 血条几何 / config/ui.json 往返。
         // 全是纯数值与文件 IO，不需要窗口也不需要 GPU。
         if (cfg.selftest == "hud") return runtime::runHudSelfTest();

@@ -1,6 +1,7 @@
 #include "RuntimeApp.h"
 
 #include "assets/AssetManager.h"
+#include "assets/ModelOrientation.h"
 #include "assets/AssetPath.h"
 #include "assets/Model.h"
 #include "core/Input.h"
@@ -130,9 +131,22 @@ bool attachPlayerModel(scene::Scene& scene, assets::AssetManager& am,
     opt.parent = player;
     opt.autoPlay = true;          // 绑上去就该动（与 CharacterWindow 一致）
     opt.sourcePath = v.model;     // 打开 MODEL-INSTANCE 锚点
-    // 朝向补偿：模型的正面（-Y）转到实体的 +X。见 RuntimeConfig::PlayerVisual
-    // ::modelYaw 与 ModelInstanceOptions::yawOffsetDeg 的说明。
-    opt.yawOffsetDeg = v.modelYaw;
+    // 朝向补偿（P5 / 2026-10-24 重做）：**问骨架**，别信写死的角度。
+    // 与 `editor/EditorScene.cpp::bindDefaultCharacter` 同一套判定 —— 两处
+    // 装配必须给出同一个朝向，否则"编辑器里朝前、Game.exe 里倒着走"。
+    float modelYaw = v.modelYaw;
+    glm::vec2 localFwd(0.0f);
+    float rawYaw = modelYaw;
+    const bool modelYawDerived =
+        assets::modelForwardYawDeg(*model, &modelYaw, &localFwd, &rawYaw);
+    if (!modelYawDerived) modelYaw = v.modelYaw;
+    opt.yawOffsetDeg = modelYaw;
+    VK_LOG_INFO("GAME-PLAYER forward local=(%.3f,%.3f) rawYaw=%.1f yaw=%.1f "
+                "derived=%d (declared=%.1f)",
+                static_cast<double>(localFwd.x),
+                static_cast<double>(localFwd.y),
+                static_cast<double>(rawYaw), static_cast<double>(modelYaw),
+                modelYawDerived ? 1 : 0, static_cast<double>(v.modelYaw));
     const scene::ModelInstanceResult r = scene::instantiateModel(scene, model, opt);
     if (!r.root.valid() || r.entities.empty()) {
         VK_LOG_ERROR("GAME-PLAYER instantiate failed path='%s'",
@@ -153,7 +167,7 @@ bool attachPlayerModel(scene::Scene& scene, assets::AssetManager& am,
                     "yaw=%.1f deg -> bottom=%.4f",
                     static_cast<double>(lift), static_cast<double>(lo.z),
                     static_cast<double>(hi.z),
-                    static_cast<double>(v.modelYaw),
+                    static_cast<double>(modelYaw),
                     static_cast<double>(lo.z + lift));
 
         // ---- 朝向自检（P5）----
@@ -167,16 +181,28 @@ bool attachPlayerModel(scene::Scene& scene, assets::AssetManager& am,
         //   （手臂前后摆会撑宽包围盒），拿来断言就是 flaky。几何量是确定的。
         //   ⚠ 也不要拿"肩宽"当基准：装配的是 T/A-pose，包围盒量到的是**臂展**。
         glm::vec3 fLo(0.0f), fHi(0.0f);
-        if (modelWorldBoundsYaw(*model, v.modelYaw, &fLo, &fHi)) {
+        if (modelWorldBoundsYaw(*model, modelYaw, &fLo, &fHi)) {
             const float spanX = fHi.x - fLo.x;
             const float spanY = fHi.y - fLo.y;
             VK_LOG_INFO("GAME-PLAYER facing yaw=%.1f spanX=%.3f spanY=%.3f "
                         "shouldersAlong=%s ok=%d",
-                        static_cast<double>(v.modelYaw),
+                        static_cast<double>(modelYaw),
                         static_cast<double>(spanX),
                         static_cast<double>(spanY),
                         spanX < spanY ? "Y" : "X",
                         spanX < spanY ? 1 : 0);
+            // 带符号那一条：补偿后的脚尖方向必须落在 +X。
+            // 只比臂展轴的话 180° 相反也照样绿（见 EditorScene 的同名注释）。
+            const float cy = std::cos(glm::radians(modelYaw));
+            const float sy = std::sin(glm::radians(modelYaw));
+            const glm::vec2 face(cy * localFwd.x - sy * localFwd.y,
+                                 sy * localFwd.x + cy * localFwd.y);
+            const bool forwardOk = modelYawDerived ? (face.x > 0.9f) : true;
+            VK_LOG_INFO("GAME-PLAYER face=(%.3f,%.3f) forwardOk=%d",
+                        static_cast<double>(face.x),
+                        static_cast<double>(face.y), forwardOk ? 1 : 0);
+            if (!forwardOk)
+                VK_LOG_WARN("GAME-PLAYER 朝向补偿疑似差 180°（脸落到 -X）");
         }
     }
 
@@ -247,7 +273,8 @@ bool attachPlayerModel(scene::Scene& scene, assets::AssetManager& am,
 
 ecs::Entity spawnPlayerFromGameStart(scene::Scene& scene,
                                      assets::AssetManager& am,
-                                     const RuntimeConfig::PlayerVisual& vis) {
+                                     const RuntimeConfig::PlayerVisual& vis,
+                                     const physics::Heightfield* terrain) {
     ecs::World& w = scene.world();
 
     bool hasCharacter = false;
@@ -260,6 +287,9 @@ ecs::Entity spawnPlayerFromGameStart(scene::Scene& scene,
     glm::vec3 feet(0.0f);
     float yaw = 0.0f;
     bool found = false;
+    // 2026-10-24：出生点同时携带"怎么生成玩家"的配置（与编辑器 Play 同源）。
+    ecs::PlayerMode mode = ecs::PlayerMode::ThirdPerson;
+    bool spawnOnRun = true;
     w.each<ecs::GameStartComponent>(
         [&](ecs::Entity e, ecs::GameStartComponent& g) {
             if (found || !g.enabled) return;
@@ -267,8 +297,37 @@ ecs::Entity spawnPlayerFromGameStart(scene::Scene& scene,
             if (!tf) return;
             feet = tf->position;
             yaw = tf->rotation.z + g.yaw;
+            mode = g.mode;
+            spawnOnRun = g.spawnOnRun;
             found = true;
         });
+
+    // 出生点关掉"生成玩家"= 这个场景没有玩家（纯观览 / 过场）。
+    if (!found || !spawnOnRun) {
+        VK_LOG_INFO("GAME-PLAYER skipped found=%d spawnOnRun=%d",
+                    found ? 1 : 0, spawnOnRun ? 1 : 0);
+        return {};
+    }
+
+    // ---- 出生点贴地（2026-10-24）----
+    // 场景文件里的 GameStart 是一个**手写的** z 值：地形高度取决于高度图，
+    // 换个工程 / 重新刷过地形之后那个 z 十有八九是错的 —— 表现就是"一进游戏
+    // 人是埋在地里的，或者悬在空中再往下掉一截"。
+    //
+    // 这里用物理世界已经建好的高度场把它压回地表：只在**低于**地表时抬，
+    // 高于地表不动（那是"故意摆在台阶/桥面/二楼平台"的情况，抬或者压都会
+    // 破坏作者的意图；高于地表就让重力自己去落）。
+    if (found && terrain && terrain->valid()) {
+        const float gz = physics::heightAt(*terrain, feet.x, feet.y);
+        if (feet.z < gz - 1.0e-3f) {
+            VK_LOG_INFO("GAMESTART-SEAT runtime before_z=%.3f after_z=%.3f "
+                        "terrainH=%.3f at=(%.3f,%.3f)",
+                        static_cast<double>(feet.z), static_cast<double>(gz),
+                        static_cast<double>(gz), static_cast<double>(feet.x),
+                        static_cast<double>(feet.y));
+            feet.z = gz;
+        }
+    }
 
     const ecs::Entity e = scene.createObject("Player");
     if (!e.valid()) return {};
@@ -289,20 +348,33 @@ ecs::Entity spawnPlayerFromGameStart(scene::Scene& scene,
     //   `Scene::camera()`。症状是：角色自己走得挺好，镜头钉在出生点，
     //   人越走越小（2026-11 实测截图上就是这个）。
     //   编辑器侧 `createPlayer` 是同一个做法，两边保持一致。
+    const bool firstPerson = mode == ecs::PlayerMode::FirstPerson;
     {
         ecs::CameraComponent camC;
-        // 注视点抬到胸部高度（眼高按身高的 0.92 处折算，与编辑器同一比例）
-        camC.targetOffset = glm::vec3(0.0f, 0.0f, 1.8f * 0.42f);
-        camC.distance = 3.6f;   // 1.8 m 的角色占屏 ~1/3，第三人称的常规取景
-        camC.minDistance = 0.6f;
+        if (firstPerson) {
+            // 第一人称：相机就在眼睛上。distance = 0（SpringArm 对 0 有
+            // 专门分支：position = pivot），注视点抬到眼高。
+            camC.targetOffset = glm::vec3(0.0f, 0.0f, 1.7f * 0.42f + 0.75f);
+            camC.distance = 0.0f;
+            camC.minDistance = 0.0f;
+        } else {
+            // 注视点抬到胸部高度（眼高按身高的 0.92 处折算，与编辑器同一比例）
+            camC.targetOffset = glm::vec3(0.0f, 0.0f, 1.8f * 0.42f);
+            camC.distance = 3.6f;   // 1.8 m 的角色占屏 ~1/3，第三人称的常规取景
+            camC.minDistance = 0.6f;
+        }
         w.add<ecs::CameraComponent>(e, camC);
     }
 
     // 外观：先试外部模型。挂上了就**不再建**占位体 —— 两个都在会看到
     // "角色身体里插着一根蓝柱子"。
-    const bool bound = attachPlayerModel(scene, am, e, vis);
+    //
+    // 第一人称**不装身体**：相机就在头颅里，装了只会看到脸的内侧。这也
+    // 正好符合"第一人称看不见自己"的常识。
+    bool bound = false;
+    if (!firstPerson) bound = attachPlayerModel(scene, am, e, vis);
 
-    if (!bound) {
+    if (!bound && !firstPerson) {
         // 占位身体：一个胶囊（圆柱 + 圆顶感靠颜色/光照，不做真胶囊网格）。
         // ⚠ 材质名必须唯一：AssetManager 按名缓存，重名会和其他物体共用。
         ecs::MeshComponent mc;
@@ -316,10 +388,12 @@ ecs::Entity spawnPlayerFromGameStart(scene::Scene& scene,
     }
 
     VK_LOG_INFO("GAME-PLAYER spawned at GameStart found=%d "
-                "feet=(%.2f,%.2f,%.2f) yaw=%.3f visual=%s",
+                "feet=(%.2f,%.2f,%.2f) yaw=%.3f mode=%s visual=%s",
                 found ? 1 : 0, static_cast<double>(feet.x),
                 static_cast<double>(feet.y), static_cast<double>(feet.z),
-                static_cast<double>(yaw), bound ? "model" : "capsule");
+                static_cast<double>(yaw), firstPerson ? "first" : "third",
+                firstPerson ? "none(first-person)"
+                            : (bound ? "model" : "capsule"));
     return e;
 }
 
@@ -431,7 +505,9 @@ void RuntimeApp::onInit() {
     // 模板场景现在是"空场景"（只有地形 + 出生点），玩家由这里生成 ——
     // 与 UE 的 PlayerStart → Spawn Pawn 同一个思路。老场景自带
     // CharacterController 时这一步什么都不做，行为完全不变。
-    spawnPlayerFromGameStart(activeScene(), assets(), m_cfg.player);
+    spawnPlayerFromGameStart(activeScene(), assets(), m_cfg.player,
+                             m_binding.world ? m_binding.world->heightfield()
+                                             : nullptr);
 
     // ---- 玩家（G10）：场景里有角色控制器才接管 ----
     m_player = std::make_unique<PlayerController>(m_input);

@@ -65,6 +65,10 @@ public:
     // 统计（验证脚本读它）
     float travelledDistance() const { return m_travelled; }
     float springArmDistance() const { return m_armDistance; }
+    // 相机枢轴（= 胶囊中心 + CameraComponent::targetOffset）本帧的值。
+    // 自检用它断言"臂长 == |相机 - 枢轴|"（地面钳制反解自洽），
+    // 游戏逻辑本身不需要这个值。
+    glm::vec3 cameraPivot() const { return m_posePivot; }
     bool springArmBlocked() const { return m_armBlocked; }
     bool onGround() const { return m_state.onGround; }
     glm::vec3 characterCenter() const { return m_state.position; }
@@ -99,6 +103,15 @@ private:
     scene::CameraPose m_pose;
     float m_armDistance = 0.0f;
     bool m_armBlocked = false;
+    // 平滑后的臂长：缩短**立刻**生效（慢一帧就是镜头在墙里），伸长限速
+    // （拐出墙角不会"啪"地弹回全长）。见 update 里的相机段。
+    float m_armSmoothed = 0.0f;
+    // 实际交给 Camera 的俯仰角。平时与 m_pitch 逐位相同；只有"相机被地面
+    // 顶高"时才会不同 —— 那时仍然让镜头**看着枢轴**，而不是突然抬头看天。
+    // （反解逻辑在 scene::clampCameraAboveGround，与编辑器 Play 共用一份。）
+    float m_camPitchEff = 0.0f;
+    // 本帧的枢轴（见 cameraPivot()）
+    glm::vec3 m_posePivot{0.0f};
 
     float m_travelled = 0.0f;
     glm::vec3 m_lastCenter{0.0f};

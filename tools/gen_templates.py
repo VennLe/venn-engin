@@ -460,13 +460,24 @@ def build_scene(kind, spec):
 
     # 出生点：站在原点。生成器已把原点周围 14 m 压平到 0，所以玩家落地
     # 不会滑；朝向 0 = +X（与 third_person 的相机构图一致）。
+    #
+    # 2026-10-24：`gameStart` 多两个字段 —— `mode` / `spawnOnRun`。
+    #   · `mode` 决定运行时生成第几人称的玩家（以前这条信息挂在"场上那个
+    #     Player 实体"的 PlayerComponent 上，而场上的玩家已经取消了）；
+    #   · 不写的话解析出来是 third，**first_person 模板会一按 Play 就变第三
+    #     人称**，所以这里必须跟着 kind 走。
     game_start = {
         "name": "GameStart",
         "transform": transform((0.0, 0.0, 0.0)),
         "parent": -1,
         "visible": True,
         "castShadow": False,
-        "gameStart": {"yaw": 0.0, "enabled": True},
+        "gameStart": {
+            "yaw": 0.0,
+            "enabled": True,
+            "mode": "first" if kind == "first_person" else "third",
+            "spawnOnRun": True,
+        },
         "script": {"path": "scripts/main.vks", "enabled": True,
                    "timeScale": 1.0},
     }

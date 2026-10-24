@@ -12,6 +12,8 @@
 #include "assets/AssetManager.h"
 #include "assets/AssetPath.h"
 #include "assets/Material.h"
+#include "assets/MaterialImport.h"
+#include "assets/MaterialLibrary.h"
 #include "assets/Mesh.h"
 #include "assets/Model.h"
 #include "FeatureUIGen.h"
@@ -25,6 +27,7 @@
 #include "scene/Camera.h"
 #include "scene/Light.h"
 #include "scene/Scene.h"
+#include "scene/SceneSerializer.h"
 #include "terrain/Terrain.h"
 
 #include <algorithm>
@@ -137,6 +140,11 @@ const char* sectionKeywords(const char* name) {
          "physics material override friction static dynamic restitution "
          "bounce density surface"},
         {"Directional Light", "sun direction ambient sky"},
+        // 出生点（2026-10-24）：面板上所有字段都要能搜到。
+        {"Player Start",
+         "player start gamestart spawn spawnpoint respawn view mode first "
+         "third person camera spawn on run enabled yaw heading orientation "
+         "birth initial"},
         {"Scene", "scene entities stats statistics count"},
         // 粒子发射器（R6-1）。这里必须把**每一个模块名和每一个字段**都
         // 列进来：面板给搜索做了一次"两级过滤"——组件级关键词决定整段
@@ -2525,6 +2533,9 @@ void InspectorPanel::drawMeshAndMaterial(ecs::Entity e) {
     // ⚠ 追加在**最后**：`All` 页签的顺序是"旧堆叠顺序一字不改"，
     //   9 个脚本的 INS-* 锚点都依赖它（MEMORY：别"优化"它）。
     drawTerrainSection(e);
+    // 2026-10-24：同样追加在末尾 —— GameStart 的段落是新增的，排在任何
+    // 老段之前都会把老锚点的纵向位置整体推移。
+    drawGameStartSection(e);
 }
 
 // ---------------------------------------------------------------- 碰撞体
@@ -3011,6 +3022,216 @@ void InspectorPanel::drawReflectionProbeSection(ecs::Entity e) {
 //   交互期间不会变（换资产 = 换 source = 换 cache key）。
 //   缓存里只有 TerrainDesc，**不读** 264 KB 的高度图 —— 那是渲染层的活，
 //   `loadTerrainDesc` 存在的理由就是这个。
+// ---------------------------------------------------------------- 出生点
+//
+// 2026-10-24：GameStart 从"一个标记"升级成"玩家出生参数"——位置 + 朝向 +
+// 视角模式 + 要不要生成玩家。以前这两项（yaw / enabled）在面板上**根本改
+// 不了**，因为 GameStart 没有网格、也不属于任何已有的组件段；现在加进来，
+// 顺手把新增的两个字段也放这儿。
+//
+// 这一段是"添加人称角色"唯一的可编辑落点：视口菜单只负责建/选中，
+// 具体是第一人称还是第三人称在这里改。
+void InspectorPanel::drawGameStartSection(ecs::Entity e) {
+    ecs::World& w = m_ctx.editorScene().world();
+
+    auto* g = w.get<ecs::GameStartComponent>(e);
+    if (!g) return;
+
+    const bool open = sectionHeader("Player Start", true, e);
+    logRect("INS-GAMESTART-HEADER", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (!open) return;
+
+    if (!m_ctx.isEditing()) {
+        ImGui::TextDisabled(TR("run mode - player start is read-only here"));
+        return;
+    }
+
+    ImGui::TextDisabled(TR("The player is created here when the game runs"));
+    hint(TR("adding a person-view player only configures this marker - no body "
+            "is placed in the viewport"));
+
+    // ---- 视角模式 ----
+    // ⚠ Combo 的条目**不走** ImGui 的 label 路径，必须自己 TR 一遍，
+    //   否则中文界面里这一列永远是英文（与"下拉框里混着两种语言"同一个坑）。
+    const char* kModes[] = {TR("First person"), TR("Third person")};
+    int mode = g->mode == ecs::PlayerMode::FirstPerson ? 0 : 1;
+    ImGui::SetNextItemWidth(-110.0f);
+    if (ImGui::Combo(TRL("Player view##gamestart"), &mode, kModes, 2)) {
+        const ecs::PlayerMode before = g->mode;
+        g->mode = mode == 0 ? ecs::PlayerMode::FirstPerson
+                            : ecs::PlayerMode::ThirdPerson;
+        discreteEdit(m_ctx, "Player View Mode", &g->mode, before);
+        VK_LOG_INFO("INS-GAMESTART mode=%s",
+                    g->mode == ecs::PlayerMode::FirstPerson ? "first" : "third");
+    }
+    logRect("INS-GAMESTART-MODE", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("First person: the camera IS the player.\n"
+                          "Third person: a character with an orbit camera.\n"
+                          "Takes effect the next time you Run."));
+    }
+
+    // ---- 要不要生成玩家 ----
+    bool on = g->spawnOnRun;
+    if (ImGui::Checkbox(TRL("Spawn player on run##gamestart"), &on)) {
+        g->spawnOnRun = on;
+        discreteEdit(m_ctx, "Toggle Spawn On Run", &g->spawnOnRun, !on);
+    }
+    logRect("INS-GAMESTART-SPAWN", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Off = this scene has no player (fly-through /\n"
+                          "cut-scene levels). Nothing is spawned at all."));
+    }
+
+    // ---- 出生朝向（度；数据是弧度）----
+    float yawDeg = glm::degrees(g->yaw);
+    ImGui::SetNextItemWidth(-110.0f);
+    if (ImGui::DragFloat(TRL("Spawn yaw##gamestart"), &yawDeg, 0.5f, -360.0f,
+                         360.0f, "%.1f")) {
+        const float before = g->yaw;
+        g->yaw = glm::radians(yawDeg);
+        fieldEdit(m_ctx, "Spawn Yaw", &g->yaw, before);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Heading the character faces on spawn, added on "
+                          "top of the object's own rotation."));
+    }
+
+    bool en = g->enabled;
+    if (ImGui::Checkbox(TRL("Enabled##gamestart"), &en)) {
+        g->enabled = en;
+        discreteEdit(m_ctx, "Toggle Player Start", &g->enabled, !en);
+    }
+    logRect("INS-GAMESTART-ENABLED", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+}
+
+// ============================================================
+// 地形层材质：材质包目录 + 刷新（2026-10-24）
+//
+// 用户原话："在 Terrain 的属性面板中的 Layer materials 那里，那里的地形材质
+// 一般是指定一个目录里面，将对应的材质信息按照之前 E:\code\cpp\venn-resource
+// 中的材质信息的形式去自动添加，这个通过一个刷新按钮去找到最新的材质信息"
+//
+// 所以在 Layer materials 上方给两行：
+//   ① 目录输入框（回车 = 刷新；首次自动填"上次用过 / 猜到的"目录）
+//   ② 档位（1k / 2k / 4k）+ Refresh 按钮 + 当前库里的条数
+//
+// 刷新一次做完四件事：扫目录 → 复制贴图 → 生成 .vmat → 合并清单 + 重载仓库。
+// 以前这四件事只有 `tools/gen_material_library.py` 会做，用户加一个材质包
+// 就得退出编辑器跑 Python 再回来 —— 这正是用户要求干掉的那一步。
+// ============================================================
+bool InspectorPanel::drawMaterialSourceRow() {
+    static const char* kTiers[] = {"1k", "2k", "4k"};
+
+    // 首次画到这里才读设置文件：编辑器启动时不碰它（与材质仓库的惰性
+    // 加载同一个理由，见 EditorContext::materialLibrary）。
+    if (!m_matSrcLoaded) {
+        m_matSrcLoaded = true;
+        assets::MaterialSourceSettings s = assets::loadMaterialSourceSettings();
+        if (s.dir.empty()) s.dir = assets::guessMaterialSourceDir();
+        std::snprintf(m_matSrcDir, sizeof(m_matSrcDir), "%s", s.dir.c_str());
+        for (int i = 0; i < 3; ++i) {
+            if (s.tier == kTiers[i]) m_matSrcTier = i;
+        }
+        VK_LOG_INFO("INS-MATSRC-INIT dir=%s tier=%s", m_matSrcDir,
+                    kTiers[m_matSrcTier]);
+    }
+
+    bool imported = false;
+
+    // 唯一的导入入口。回车、Refresh 按钮、以及空的目录自动猜测都走它 ——
+    // 三条路各写一遍迟早漂移（和 createWithCurrentSettings 同一条理由）。
+    const auto doImport = [&]() {
+        assets::MaterialImportOptions o;
+        o.sourceDir = m_matSrcDir;
+        o.tier = kTiers[m_matSrcTier];
+        if (o.sourceDir.empty()) {
+            const std::string g = assets::guessMaterialSourceDir();
+            if (!g.empty()) {
+                std::snprintf(m_matSrcDir, sizeof(m_matSrcDir), "%s", g.c_str());
+                o.sourceDir = g;
+            }
+        }
+        assets::saveMaterialSourceSettings({o.sourceDir, o.tier});
+
+        const assets::MaterialImportResult r = assets::importMaterialPackages(o);
+        // 自动化锚点（verify_material_import 靠这一行判"刷新真的跑了"）
+        VK_LOG_INFO("INS-MATSRC-REFRESH dir=%s tier=%s ok=%d imported=%d "
+                    "added=%d",
+                    o.sourceDir.c_str(), o.tier.c_str(), r.ok ? 1 : 0,
+                    r.imported, r.added);
+        if (r.ok) {
+            // 结果文案自己拼，不用 `r.summary()` —— 那是给日志用的英文，
+            // 界面这条要走译文（i18n 的 F 组会校验占位符一致）。
+            char buf[192];
+            std::snprintf(buf, sizeof(buf), TR("%d imported, %d new"),
+                          r.imported, r.added);
+            m_matSrcStatus = buf;
+            if (!r.warnings.empty()) {
+                m_matSrcStatus += " (" + std::to_string(r.warnings.size()) +
+                                  " warning(s), see Console)";
+            }
+            m_ctx.reloadMaterialLibrary();   // 下拉 / 材质面板立刻能看到新条目
+            imported = true;
+            m_ctx.setStatus(std::string(TR("Materials imported: ")) + buf);
+        } else {
+            m_matSrcStatus = std::string(TR("Import failed: ")) + r.error;
+            m_ctx.setStatus(m_matSrcStatus);
+        }
+    };
+
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint(
+            "##matsrc_dir",
+            TR("folder of <name>/<name>_1k.gltf material packages"),
+            m_matSrcDir, sizeof(m_matSrcDir),
+            ImGuiInputTextFlags_EnterReturnsTrue)) {
+        doImport();
+    }
+    logRect("INS-MATSRC-DIR", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            TR("A folder laid out like venn-resource:\n"
+               "<name>/<name>_1k.gltf/  (glTF + .bin + textures/)\n"
+               "Press Enter or hit Refresh to import every package in it."));
+    }
+
+    ImGui::TextDisabled(TR("Tier"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(72.0f);
+    if (ImGui::Combo("##matsrc_tier", &m_matSrcTier, kTiers, 3)) {
+        // 档位也是"下次还想用"的设置，改完就落盘
+        assets::MaterialSourceSettings s;
+        s.dir = m_matSrcDir;
+        s.tier = kTiers[m_matSrcTier];
+        assets::saveMaterialSourceSettings(s);
+    }
+    logRect("INS-MATSRC-TIER", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TRL("Refresh##matsrc"))) doImport();
+    logRect("INS-MATSRC-REFRESH", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Scan the folder, copy its textures in, write the "
+                             ".vmat files, then reload the library."));
+    }
+
+    // 两行信息放按钮**下面**：Inspector 只有 300 来像素宽，跟在按钮后面的
+    // `SameLine` 文本会被截成 "3 mat..."（截图确认过）。
+    ImGui::TextDisabled(TR("%d material(s)"),
+                        static_cast<int>(m_ctx.materialLibrary().size()));
+    if (!m_matSrcStatus.empty()) {
+        ImGui::TextDisabled("%s", m_matSrcStatus.c_str());
+    }
+    logRect("INS-MATSRC-STATUS", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    return imported;
+}
+
 void InspectorPanel::drawTerrainSection(ecs::Entity e) {
     scene::Scene& sc = m_ctx.editorScene();
     ecs::World& w = sc.world();
@@ -3132,6 +3353,9 @@ void InspectorPanel::drawTerrainSection(ecs::Entity e) {
     ImGui::Spacing();
     ImGui::TextDisabled(TR("Layer materials"));
 
+    // 材质包目录 + 刷新（2026-10-24）。见 drawMaterialSourceRow 的说明。
+    drawMaterialSourceRow();
+
     // ---- 4 层材质槽 ----
     // 空串 = 用 `.vterrain` 里那一个。做成"覆盖表"而不是"拷贝 4 个路径"：
     // 改了 `.vterrain` 的第 3 层，没被覆盖的槽自动跟着变（与 D2 同一条理由）。
@@ -3148,7 +3372,7 @@ void InspectorPanel::drawTerrainSection(ecs::Entity e) {
 
         char buf[192];
         std::snprintf(buf, sizeof(buf), "%s", tc->layerOverrides[i].c_str());
-        ImGui::SetNextItemWidth(-92.0f);
+        ImGui::SetNextItemWidth(-158.0f);
         if (ImGui::InputTextWithHint(
                 "##terlayer", inher.empty() ? "(unused)" : inher.c_str(), buf,
                 sizeof(buf), ImGuiInputTextFlags_EnterReturnsTrue)) {
@@ -3163,6 +3387,36 @@ void InspectorPanel::drawTerrainSection(ecs::Entity e) {
                               "materials/terrain_rock.\nLeave empty to inherit "
                               "the one in the .vterrain file.\n"
                               "Press Enter to apply."));
+        }
+        ImGui::SameLine();
+        // 材质仓库下拉（2026-10-24）：从 `assets/materials/library.json`
+        // 里挑一个直接填进这个槽。InputText 保留给"手写一个不在仓库里的
+        // id" —— 两条路并存，谁都不挡谁。
+        if (ImGui::SmallButton(TRL("Pick##terlayer"))) {
+            ImGui::OpenPopup("##terlayer_pick");
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", TR("Pick a material from the library"));
+        }
+        if (ImGui::BeginPopup("##terlayer_pick")) {
+            const assets::MaterialLibrary& lib = m_ctx.materialLibrary();
+            if (lib.size() == 0) {
+                ImGui::TextDisabled("%s", TR("Material library is empty"));
+            }
+            for (const auto& le : lib.entries()) {
+                const bool cur = (tc->layerOverrides[i] == le.id);
+                std::string text = trBilingual(le.label, le.labelZh);
+                if (!le.hasAlbedo()) text += TR("  (flat)");
+                if (ImGui::Selectable(text.c_str(), cur)) {
+                    const std::string id = le.id;
+                    m_ctx.structuralEdit("Set Terrain Layer", [&] {
+                        tc->layerOverrides[i] = id;
+                        tc->dirty = true;
+                    });
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::EndPopup();
         }
         ImGui::SameLine();
         if (overridden) {
@@ -5149,6 +5403,61 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
             ImGui::GetItemRectMax());
 
     ImGui::Text(TR("name: %s"), mat->name.c_str());
+
+    // ============================================================
+    // 从材质仓库直接换（2026-10-24）
+    // ============================================================
+    // 用户的要求："将来可以……给各种其他的静态网格体在属性栏中绑定对应的
+    // 材质信息"。所以这一段的入口长在**属性栏**里，而不是只在材质面板里
+    // —— 选中一个网格体、展开 Material 段、点一下换成草地材质，这才是
+    // 最顺的一条路。
+    //
+    // 换的是 `MaterialComponent::material` 这**一个指针**（走 structuralEdit
+    // 以便撤销），不走"复制参数"：材质资产是共享的，改一处两处都变。
+    {
+        ImGui::SameLine();
+        if (ImGui::SmallButton(TRL("Pick##ins_mat_lib"))) {
+            ImGui::OpenPopup("##ins_mat_lib_pick");
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", TR("Replace this material with one from the library"));
+        }
+        if (ImGui::BeginPopup("##ins_mat_lib_pick")) {
+            const assets::MaterialLibrary& lib = m_ctx.materialLibrary();
+            if (lib.size() == 0) {
+                ImGui::TextDisabled("%s", TR("Material library is empty"));
+            }
+            for (const auto& le : lib.entries()) {
+                std::string text = trBilingual(le.label, le.labelZh);
+                if (!le.hasAlbedo()) text += TR("  (flat)");
+                if (ImGui::Selectable(text.c_str(), mat->id == le.id)) {
+                    // 解析走 SceneSerializer 那条路（id 去重 / 贴图解析 /
+                    // 导入默认值都在里面），与"场景里引用同一个 .vmat"
+                    // 拿到的是同一个对象。
+                    assets::Material* next =
+                        scene::loadMaterialAsset(m_ctx.assets(), le.vmatPath);
+                    if (next) {
+                        ecs::Entity ent = e;
+                        m_ctx.structuralEdit("Set Material From Library",
+                                             [this, ent, next]() {
+                            if (auto* mc = m_ctx.activeScene().world().get<
+                                    ecs::MaterialComponent>(ent)) {
+                                mc->material = next;
+                            }
+                        });
+                        VK_LOG_INFO("INS-MAT-LIB entity=%u id=%s",
+                                    static_cast<unsigned>(e.id),
+                                    le.id.c_str());
+                    } else {
+                        VK_LOG_WARN("INS-MAT-LIB-FAIL id=%s path=%s",
+                                    le.id.c_str(), le.vmatPath.c_str());
+                    }
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::EndPopup();
+        }
+    }
 
     // ============================================================
     // 材质实例（W1-3）

@@ -1,5 +1,6 @@
 #include "assets/LodSelfTest.h"
 
+#include "assets/AssetManager.h"   // lodKey()（E 组：缓存键唯一性）
 #include "assets/Lod.h"
 #include "core/Logger.h"
 
@@ -184,6 +185,43 @@ int runLodSelfTest() {
         std::vector<uint32_t> none;
         LodMeshData d = decimateClustered(one, none, 4);
         check("D1 空索引安全返回（不崩）", !d.ok);
+    }
+
+    // ---- E 组：LOD 缓存键必须**逐子网格**唯一 ----
+    //
+    // 事故回归（2026-10-24）：一个 FBX 的二十个子网格共用模型名，
+    // `lodKey` 只拼 name → 全都算成同一个键 → `registerMesh` 命中缓存，
+    // 19 个子网格的减面结果被静默丢弃，脸换上了别人的低模（纯白）、腿消失。
+    // 这里直接锁住"同模型不同子网格 → 键必须不同"这条契约：
+    // 它不依赖 GPU，纯字符串，所以放在 `--selftest lod` 里最合适。
+    {
+        Mesh a, b, c;
+        MeshSource sa;
+        sa.kind = MeshSource::Kind::FBX;
+        sa.name = "models/characters/alicia.vmesh";
+        sa.subMeshIndex = 10;                 // face_0
+        a.setSource(sa);
+        sa.subMeshIndex = 3;                  // body_under_0
+        b.setSource(sa);
+        check("E1 同模型不同子网格的 LOD 键不同",
+              lodKey(a, sa.name, 1) != lodKey(b, sa.name, 1));
+
+        MeshSource s1;
+        s1.name = "models/characters/alicia.vmesh";
+        s1.subMeshIndex = 10;
+        c.setSource(s1);
+        check("E2 同模型同子网格的 LOD 键稳定（可复用）",
+              lodKey(a, sa.name, 1) == lodKey(c, s1.name, 1));
+
+        // 程序化图元 subMeshIndex = -1：没有子网格概念，键里不该多出后缀
+        // （多出来的话会白扔一批缓存，且老场景的键全部变一遍）
+        Mesh prim;
+        MeshSource sp;
+        sp.kind = MeshSource::Kind::Builtin;
+        sp.name = "builtin_sphere_r1s32";
+        prim.setSource(sp);
+        check("E3 程序化图元的键保持原样（不带子网格后缀）",
+              lodKey(prim, sp.name, 2) == "builtin_sphere_r1s32#lod2");
     }
 
     char summary[96];

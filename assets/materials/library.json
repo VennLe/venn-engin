@@ -1,0 +1,58 @@
+{
+  "type": "material_library",
+  "version": 1,
+  "generatedBy": "tools/gen_material_library.py",
+  "tier": "1k",
+  "default": "materials/library/grass_ground",
+  "count": 2,
+  "entries": [
+    {
+      "id": "materials/library/grass_ground",
+      "name": "grass_ground",
+      "label": "Grass Ground",
+      "labelZh": "草地",
+      "category": "ground",
+      "categoryZh": "地面",
+      "tier": "1k",
+      "tiers": [
+        "1k",
+        "2k",
+        "4k"
+      ],
+      "default": true,
+      "vmat": "materials/library/grass_ground.vmat",
+      "textures": {
+        "albedo": "textures/materials/grass_ground/grass_ground_diff.jpg",
+        "normal": "textures/materials/grass_ground/grass_ground_nor_gl.jpg",
+        "orm": "textures/materials/grass_ground/grass_ground_arm.jpg"
+      },
+      "roughness": 0.937,
+      "metallic": 0.0,
+      "ao": 0.798
+    },
+    {
+      "id": "materials/library/concrete_moss",
+      "name": "concrete_moss",
+      "label": "Concrete Moss",
+      "labelZh": "苔藓混凝土",
+      "category": "concrete",
+      "categoryZh": "混凝土",
+      "tier": "1k",
+      "tiers": [
+        "1k",
+        "2k",
+        "4k"
+      ],
+      "default": false,
+      "vmat": "materials/library/concrete_moss.vmat",
+      "textures": {
+        "albedo": "textures/materials/concrete_moss/concrete_moss_diff.jpg",
+        "normal": "textures/materials/concrete_moss/concrete_moss_nor_gl.jpg",
+        "orm": "textures/materials/concrete_moss/concrete_moss_arm.jpg"
+      },
+      "roughness": 0.935,
+      "metallic": 0.0,
+      "ao": 0.995
+    }
+  ]
+}

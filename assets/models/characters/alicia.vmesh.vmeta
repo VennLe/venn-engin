@@ -1,0 +1,32 @@
+{
+  "appliedImportSig": "fnv1a:0xA0EB7C7A",
+  "import": {
+    "generateLods": true,
+    "importAnimations": true,
+    "importMaterials": true,
+    "lodGridRes": [
+      24,
+      12,
+      6
+    ],
+    "materialIdScheme": "name",
+    "scale": 1.0
+  },
+  "materials": {
+    "Alicia_body": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_body",
+    "Alicia_body_wear": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_body_wear",
+    "Alicia_eye": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_eye",
+    "Alicia_eye_white": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_eye_white",
+    "Alicia_face": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_face",
+    "Alicia_face_mastuge": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_face_mastuge",
+    "Alicia_hair": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_hair",
+    "Alicia_hair_trans": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_hair_trans",
+    "Alicia_hair_trans_zwrite": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_hair_trans_zwrite",
+    "Alicia_hair_wear": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_hair_wear",
+    "Alicia_other_zwrite": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_other_zwrite",
+    "Alicia_wear": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh#Alicia_wear"
+  },
+  "source": "E:\\code\\cpp\\venn-engin\\assets\\models\\characters\\alicia.vmesh",
+  "sourceHash": "fnv1a:0x5FCA1A93DB60D412",
+  "version": 1
+}

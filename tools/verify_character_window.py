@@ -77,8 +77,15 @@ def wait_line(tap, needle, timeout=8.0):
 
 
 def wait_clip_rect(tap, timeout=5.0):
-    """等待第一个 CHAR-CLIP-<名字>=(...) 矩形日志，返回 (x0,y0,x1,y1)。"""
-    rx = re.compile(r"CHAR-CLIP-[^=]+=\(([-\d.]+),([-\d.]+)\)-"
+    """等待第一个 CHAR-CLIP-<名字>=(...) 矩形日志，返回 (x0,y0,x1,y1)。
+
+    ⚠ 必须排除 `CHAR-CLIP-KEY-<名字>`（2026-10-22 加的按键槽锚点）：
+      那一行紧跟在名字行**之后**打印，而这里是倒序扫，不排除的话永远取到
+      按键槽那一小块 —— 点下去等于点了"绑键"按钮，`play clip` 一条都不出
+      （2026-10-24 实测：这条断言在键槽锚点引入之后就一直是红的，跟业务
+      代码无关，纯粹是这里选了错的矩形）。
+    """
+    rx = re.compile(r"CHAR-CLIP-(?!KEY-)[^=]+=\(([-\d.]+),([-\d.]+)\)-"
                     r"\(([-\d.]+),([-\d.]+)\)")
     end = time.time() + timeout
     while time.time() < end:
@@ -241,12 +248,34 @@ def main():
         # 不同显示器上跑，咬死 1231 就是给自己埋一个换机器才红的坑。
         win_rect = wait_valid_rect(tap, "CHAR-WIN", 5.0)
         check("拿到角色窗口矩形（CHAR-WIN）", win_rect is not None)
+        # ---- 形态判定：浮动窗口 vs 托管成视口标签页 ----
+        #
+        # 2026-10-21 起，这个面板默认会被 `PanelDock` 托管进**视口标签页**
+        # （见 editor/PanelDock.h：托管时加 NoTitleBar | NoMove | NoResize）。
+        # 那一版的矩形由 SplitLayout 决定，标题栏上也没有最小化/叉号 ——
+        # 下面那组"浮动窗口几何 + 标题栏按钮"的断言因此**不适用**，不是坏了。
+        #
+        # 判据用最小化按钮的锚点：有 = 浮动（标题栏存在），没有 = 托管。
+        # 两套形态各验自己该验的东西，任何一套都不放水。
+        docked_probe = wait_valid_rect(tap, "PANEL-MIN character", 2.5)
+        docked = docked_probe is None
+        if docked:
+            print("  形态: 托管（视口标签页）—— 标题栏/尺寸下限断言不适用")
         if win_rect:
             ww = win_rect[2] - win_rect[0]
             wh = win_rect[3] - win_rect[1]
-            check("角色窗口默认尺寸够大（>旧版 760×560）",
-                  ww > 800 and wh > 560,
-                  "%.0fx%.0f" % (ww, wh))
+            if docked:
+                # 托管形态该验的是：它确实铺在视口内容区里（而不是缩成一小块）
+                vpr = wait_rect(tap, "VP-RECT", 2.0)
+                ok_dock = (vpr is not None
+                           and abs(ww - (vpr[2] - vpr[0])) < 60.0
+                           and abs(wh - (vpr[3] - vpr[1])) < 90.0)
+                check("角色面板托管在视口标签页里（铺满内容区）", ok_dock,
+                      "%.0fx%.0f vs VP=%s" % (ww, wh, vpr))
+            else:
+                check("角色窗口默认尺寸够大（>旧版 760×560）",
+                      ww > 800 and wh > 560,
+                      "%.0fx%.0f" % (ww, wh))
 
         # ---- 9) 截图（拖动之前，人工核对预览视口 + 三栏布局）----
         time.sleep(1.2)
@@ -275,9 +304,13 @@ def main():
         #   N2 底栏托盘按钮 → 窗口原样回来（像素差 ≈ 0，不能是"重开了一个新的"）
         #   N3 叉号 → 窗口消失，且日志给出 user-close（而不是被同步逻辑又开回来）
         if win_rect:
-            min_rect = wait_valid_rect(tap, "PANEL-MIN character", 4.0)
-            check("拿到角色窗口的最小化按钮（PANEL-MIN character）",
-                  min_rect is not None)
+            min_rect = docked_probe
+            if docked:
+                print("  SKIP 拿到角色窗口的最小化按钮（PANEL-MIN character）"
+                      " —— 托管形态没有标题栏，N1/N2/N3 一并跳过")
+            else:
+                check("拿到角色窗口的最小化按钮（PANEL-MIN character）",
+                      min_rect is not None)
             if min_rect:
                 # ⚠ 采样区只用**标题栏左侧那一条**（静态文字，没有动画）。
                 #   不能拿整块窗口比 N1/N2：第七步点过动画条目，预览视口里
@@ -342,7 +375,17 @@ def main():
 
             time.sleep(0.5)
             final_rect = wait_valid_rect(tap, "CHAR-WIN", 2.0)
-            if resized and final_rect:
+            if docked:
+                # 托管形态 NoResize：拖边框本来就不该改变尺寸，所以只断
+                # "拖完还活着 + 尺寸没被拖坏"，不断下限（那个下限只在浮动
+                # 形态由 SetNextWindowSizeConstraints 施加）。
+                if resized and final_rect:
+                    fw = final_rect[2] - final_rect[0]
+                    fh = final_rect[3] - final_rect[1]
+                    check("托管形态下拖边框不会改变尺寸（NoResize）",
+                          abs(fw - ww) < 60.0 and abs(fh - wh) < 90.0,
+                          "%.0fx%.0f -> %.0fx%.0f" % (ww, wh, fw, fh))
+            elif resized and final_rect:
                 fw = final_rect[2] - final_rect[0]
                 fh = final_rect[3] - final_rect[1]
                 check("拖到很小也被下限兜住（>=880×560）",

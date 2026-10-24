@@ -85,6 +85,8 @@
 
 #include <glm/glm.hpp>
 
+#include "assets/MaterialLibrary.h"
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -182,6 +184,20 @@ public:
     explicit EditorContext(assets::AssetManager& assets);
 
     assets::AssetManager& assets() { return m_assets; }
+
+    // ---------------------------------------------------------- 材质仓库
+    // `assets/materials/library.json`（由 tools/gen_material_library.py 生成）。
+    //
+    // 惰性加载：构造 / 启动阶段**不碰磁盘**。只有一个入口真的要用仓库时
+    // （打开材质面板、地形笔刷要列材质、Inspector 要给网格体挑材质）才读
+    // 一次；之后全程命中缓存。失败只打 WARN、返回空库 —— 仓库坏掉不该
+    // 让编辑器起不来。
+    assets::MaterialLibrary& materialLibrary();
+    // 强制重扫（面板上的"刷新"按钮 / 用户手工丢了 .vmat 进来）
+    void reloadMaterialLibrary();
+    // 仓库"第几次重载"。缩略图缓存靠它失效 —— 换了档（1k → 2k）或
+    // 从材质包目录新导入了材质之后，缓存里的图就是旧的了。
+    int materialLibraryRevision() const { return m_materialLibraryRevision; }
 
     // ---------------------------------------------------------- 编辑态场景
     scene::Scene& editorScene() { return m_editorScene; }
@@ -753,6 +769,14 @@ public:
 
 private:
     assets::AssetManager& m_assets;
+
+    // 材质仓库：惰性加载（见 materialLibrary()）。放在 EditorContext 而不是
+    // AssetManager 里，是因为它只服务编辑器 UI（面板 / 笔刷 / Inspector 下拉），
+    // 运行期（Game.exe）一次都不需要 —— 放进去只会让出货包多一次无谓的文件扫描。
+    assets::MaterialLibrary m_materialLibrary;
+    bool m_materialLibraryTried = false;
+    // 见 materialLibraryRevision()
+    int m_materialLibraryRevision = 0;
 
     scene::Scene m_editorScene;
     scene::Scene m_runtimeScene;

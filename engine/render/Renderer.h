@@ -174,6 +174,18 @@ struct GridSettings {
     float lineWidthPx = 1.4f;
     float fadeStart = 1500.0f;
     float fadeEnd = 2000.0f;
+    // 有地形时**不画**地平面栅格（2026-10-24）。
+    //
+    // 用户的原话是"干脆就直接把原栅格地面当作地形地面去操作"：地形一旦
+    // 与栅格严格同面（LandscapeEditor 的 kGroundEpsilon 已改成 0），两个
+    // 同高度的面就只是互相遮挡 —— 栅格线会一格一格地透过草地，看起来像
+    // 地形贴图出了问题，而不是"地面上有格线"。既然地形本身已经是可见
+    // 的地面，栅格就该退场。
+    //
+    // 保留 `setGridEnabled` 的手动开关与 `MYVK_GRID=0`：前者是用户显式
+    // 要求"我要看栅格"，优先级高于这条自动规则（见 Renderer::recordFrame
+    // 里的判断顺序）。
+    bool hideWhenTerrain = true;
 };
 
 // R4-2：皮肤预积分散射的曲率缩放默认值。
@@ -1638,6 +1650,9 @@ private:
     // 地平面栅格（编辑器每帧写 gridEnabled；默认关）
     bool m_gridEnabled = false;
     GridSettings m_grid;
+    // "因为场景里有地形所以没画栅格" —— 只在翻边时打一行日志（见 recordFrame），
+    // 顺便给验收脚本一个可断言的锚点。
+    bool m_gridSuppressedLogged = false;
     // 预览目标（角色窗口）的栅格 —— 参数见 previewGridSettings() 的注释。
     bool m_previewGridEnabled = true;
     GridSettings m_previewGrid;

@@ -8,6 +8,7 @@
 #include "assets/Material.h"
 #include "assets/Mesh.h"
 #include "assets/Model.h"
+#include "assets/ModelOrientation.h"
 #include "core/Logger.h"
 #include "ecs/Components.h"
 #include "scene/Camera.h"
@@ -222,8 +223,7 @@ ecs::Entity createPrimitiveOnGround(scene::Scene& scene,
 //   显式指名它。删掉会让那些用例从"跑起来"变成"找不到模型"。
 namespace {
 
-constexpr const char* kDefaultCharacterPath =
-    "models/characters/alicia.vmesh";
+constexpr const char* kDefaultCharacterPath = kDefaultCharacterAsset;
 
 // 模型正面补偿角（度）。FBX 源（Y-up、正面朝 +Z）经 ufbx 的 (x,-z,y) 映射
 // 后正面落在 **-Y**，而引擎实体的 yaw 语义是"0 = 朝 +X"，所以 +90°。
@@ -321,11 +321,30 @@ void bindDefaultCharacter(scene::Scene& scene, assets::AssetManager& am,
     opt.parent = player;
     opt.autoPlay = true;              // 挂上去就播（起始 = Idle）
     opt.sourcePath = kDefaultCharacterPath;
-    // 朝向补偿（P5）：模型正面在 -Y，实体的 yaw 语义是"0 = 朝 +X"。
-    // 与 `RuntimeConfig::PlayerVisual::modelYaw` 的默认值同源 —— 两边不一致
-    // 的话，同一个角色在编辑器 Play 与 Game.exe 里会朝两个方向。
-    opt.yawOffsetDeg = kDefaultModelYaw;
+    // ---- 朝向补偿（P5 / 2026-10-24 重做）----
+    //
+    // 以前这里写死 `kDefaultModelYaw = 90`（"FBX 正面落在 -Y"）。默认角色
+    // 换成 VRM 来源的 alicia 之后那条假设失效了：它的正面在 **+Y**，+90°
+    // 会把人转成 -X —— 用户看到的就是"往前走、脸朝后"。
+    //
+    // 现在**问骨架**：由"脚踝 → 脚趾"的方向反解补偿角（见
+    // assets/ModelOrientation.h 的长注释）。骨架里找不到 toe 骨才退回声明的值。
+    float derivedYaw = kDefaultModelYaw;
+    glm::vec2 localFwd(0.0f);
+    float rawYaw = derivedYaw;
+    const bool derivedYawOk =
+        assets::modelForwardYawDeg(*model, &derivedYaw, &localFwd, &rawYaw);
+    if (!derivedYawOk) derivedYaw = kDefaultModelYaw;
+    opt.yawOffsetDeg = derivedYaw;
     const scene::ModelInstanceResult r = scene::instantiateModel(scene, model, opt);
+    // 验收锚点（别删）：朝向是"看起来对不对"里最难用像素断言的一项，
+    // 把判定依据整条打出来 —— 退回到声明值时也能从日志看出来。
+    VK_LOG_INFO("PLAYER-DEFAULT forward local=(%.3f,%.3f) rawYaw=%.1f "
+                "yaw=%.1f derived=%d (declared=%.1f)",
+                static_cast<double>(localFwd.x),
+                static_cast<double>(localFwd.y),
+                static_cast<double>(rawYaw), static_cast<double>(derivedYaw),
+                derivedYawOk ? 1 : 0, static_cast<double>(kDefaultModelYaw));
 
     // ---- 抬到脚底：模型的 pivot 在几何中心，玩家实体的原点是**脚** ----
     //
@@ -414,62 +433,178 @@ void bindDefaultCharacter(scene::Scene& scene, assets::AssetManager& am,
                 model->skeleton ? static_cast<int>(model->skeleton->clips.size()) : 0,
                 static_cast<double>(height), static_cast<double>(radius),
                 static_cast<double>(halfHeight),
-                static_cast<double>(kDefaultModelYaw),
+                static_cast<double>(derivedYaw),
                 static_cast<double>(lift), static_cast<double>(lo),
                 static_cast<double>(hi),
                 static_cast<double>(lo + lift));
 
     // 朝向自检（与 RuntimeApp::attachPlayerModel 同判据，见那边的注释）
+    //
+    // ⚠ 2026-10-24 追加了**带符号**的那一条。老判据只比"臂展轴 vs 体厚轴"，
+    //   而这恰好对 180° 相反**不敏感** —— alicia 戴反了 180° 它照样绿。
+    //   现在再加一条：补偿后的脚尖方向必须落在 +X（实体的"前"）。
     glm::vec3 fLo(0.0f), fHi(0.0f);
-    if (modelBoundsXY(*model, kDefaultModelYaw, &fLo, &fHi)) {
+    if (modelBoundsXY(*model, derivedYaw, &fLo, &fHi)) {
         const float spanX = fHi.x - fLo.x;
         const float spanY = fHi.y - fLo.y;
+        // 局部正面 → 补偿后的世界正面：R(yaw)·f
+        const float cy = std::cos(glm::radians(derivedYaw));
+        const float sy = std::sin(glm::radians(derivedYaw));
+        const glm::vec2 face(cy * localFwd.x - sy * localFwd.y,
+                             sy * localFwd.x + cy * localFwd.y);
+        const bool forwardOk = derivedYawOk ? (face.x > 0.9f) : true;
         VK_LOG_INFO("PLAYER-DEFAULT facing yaw=%.1f spanX=%.3f spanY=%.3f "
-                    "shouldersAlong=%s ok=%d",
-                    static_cast<double>(kDefaultModelYaw),
+                    "shouldersAlong=%s ok=%d face=(%.3f,%.3f) forwardOk=%d",
+                    static_cast<double>(derivedYaw),
                     static_cast<double>(spanX), static_cast<double>(spanY),
-                    spanX < spanY ? "Y" : "X", spanX < spanY ? 1 : 0);
+                    spanX < spanY ? "Y" : "X", spanX < spanY ? 1 : 0,
+                    static_cast<double>(face.x), static_cast<double>(face.y),
+                    forwardOk ? 1 : 0);
+        if (!forwardOk)
+            VK_LOG_WARN("PLAYER-DEFAULT 朝向补偿疑似差 180°（脸落到 -X，"
+                        "人会在倒退着走）——见 assets/ModelOrientation.h");
     }
 }
 
 } // namespace
 
+// ============================================================
+// 运行时装配：按 GameStart 生成玩家（2026-10-24）
+// ============================================================
+// 用户原话："GameStart 不仅仅是角色的一个标记，也是游戏运行后角色初始化的
+// 坐标，在添加人称角色时不需要直接把角色加入到 3d 视口中，只是在游戏运行
+// 后，把角色初始化到 GameStart 位置即可。"
+//
+// 于是场景文件里**不再有摆着的角色**：Player 实体是按下 Play 那一刻才生成
+// 的（Game.exe 里是 `RuntimeApp::spawnPlayerFromGameStart`，同一套口径）。
+//
+// 两份实现不能合并（editor/ 不能依赖 runtime/），所以约束写在这里：
+//   · 脚底 = GameStart 的 transform，朝向 = transform.rotation.z + yaw；
+//   · 第三人称装配默认角色（模型 + 骨骼 + 四段动画），第一人称**不装**
+//     （相机就在脑袋里，装了只会看到头颅内侧）；
+//   · 胶囊尺寸按角色真实身高折算（`bindDefaultCharacter` 内部做的）。
+ecs::Entity spawnPlayerAtGameStart(scene::Scene& scene,
+                                   assets::AssetManager& assets,
+                                   const glm::vec3& feet, float yaw,
+                                   ecs::PlayerMode mode,
+                                   ecs::Entity configFrom) {
+    ecs::World& w = scene.world();
+    ecs::Entity e = scene.createObject("Player");
+    if (!e.valid()) return {};
+    if (auto* t = w.get<ecs::TransformComponent>(e)) {
+        t->position = feet;
+        t->rotation = glm::vec3(0.0f, 0.0f, yaw);
+        t->scale = glm::vec3(1.0f);
+    }
+
+    // ---- 角色配置跟着出生点走 ----
+    //
+    // 角色面板（CharacterWindow）在编辑态绑的按键映射挂在**出生点**实体上
+    // （视口里没有 Player 可挂），而 `EditorApp::runPlayers` 是从**玩家实体**
+    // 上读 `AnimKeyMapComponent` 的。不搬这一手，用户绑的 K→Jump 在 Play 里
+    // 一声不响（2026-10-24 实测：C9 挂在"没有 EDIT-ANIM-KEY-TRIGGER"）。
+    //
+    // 只搬"配置型"组件，不搬网格/骨骼 —— 那些是运行时装配出来的。
+    if (configFrom.valid()) {
+        if (const auto* km = w.get<ecs::AnimKeyMapComponent>(configFrom))
+            w.add<ecs::AnimKeyMapComponent>(e, *km);
+    }
+
+    // ⚠ 顺序死板：PlayerComponent 必须先挂，`bindDefaultCharacter` 要按它写
+    //   eyeHeight / camDistance；CC / Camera 反而是它自己的产物（`add` 是
+    //   "有就覆盖"，先放一份兜底值不冲突，但第一人称没有那一步，得自己来）。
+    ecs::PlayerComponent pc;
+    pc.mode = mode;
+    pc.yaw = yaw;
+    pc.bodyYaw = yaw;
+    // 第三人称初始略微低头 → 相机落在角色斜上方俯视（与老 createPlayer 同）
+    if (mode == ecs::PlayerMode::ThirdPerson) pc.pitch = -0.35f;
+    w.add<ecs::PlayerComponent>(e, pc);
+
+    constexpr float kFallbackHeight = 1.8f;
+    {
+        const float radius = kFallbackHeight * 0.16f;
+        ecs::CharacterControllerComponent cc;
+        cc.radius = radius;
+        cc.halfHeight = kFallbackHeight * 0.5f - radius;
+        cc.bodyYaw = yaw;
+        // 实体原点是脚底，物理状态要胶囊中心 —— 差 (halfHeight + radius)。
+        cc.position = feet + glm::vec3(0.0f, 0.0f, cc.halfHeight + cc.radius);
+        w.add<ecs::CharacterControllerComponent>(e, cc);
+
+        ecs::CameraComponent camC;
+        camC.targetOffset = glm::vec3(0.0f, 0.0f, kFallbackHeight * 0.42f);
+        camC.distance = 3.6f;
+        camC.minDistance = 0.6f;
+        w.add<ecs::CameraComponent>(e, camC);
+    }
+
+    if (mode == ecs::PlayerMode::ThirdPerson)
+        bindDefaultCharacter(scene, assets, e);
+
+    VK_LOG_INFO("PLAYER-SPAWN at GameStart feet=(%.2f,%.2f,%.2f) yaw=%.3f "
+                "mode=%s visual=%s",
+                static_cast<double>(feet.x), static_cast<double>(feet.y),
+                static_cast<double>(feet.z), static_cast<double>(yaw),
+                mode == ecs::PlayerMode::FirstPerson ? "first" : "third",
+                mode == ecs::PlayerMode::FirstPerson ? "none(first-person)"
+                                                    : "default");
+    return e;
+}
+
+// ============================================================
+// 添加人称角色 = 配置出生点（不再往视口里塞角色）
+// ============================================================
+// 以前这里会建一个带网格的 "Player (Third-Person)" 实体并立刻装配角色：
+// 用户按 Shift+A 之后，一个角色出现在鼠标落点，同时场景里还有另一个叫
+// GameStart 的标记 —— 两个东西各指一处，Play 时到底以谁为准没人说得清。
+//
+// 现在只做三件事：
+//   ① 找（或新建）GameStart；
+//   ② 把它摆到鼠标落点、按地形高度贴地；
+//   ③ 写入视角模式。
+// 返回 GameStart 实体本身（选中它 → Inspector 里能看到并改这些参数）。
 ecs::Entity createPlayer(scene::Scene& scene, assets::AssetManager& assets,
                          ecs::PlayerMode mode,
                          const glm::vec3& groundSpot) {
+    (void)assets;   // 角色在运行时才装配，这里不需要任何资产
     ecs::World& w = scene.world();
 
-    const char* rootName = mode == ecs::PlayerMode::ThirdPerson
-                               ? "Player (Third-Person)"
-                               : "Player (First-Person)";
-    ecs::Entity root = scene.createObject(rootName);
-    if (auto* t = w.get<ecs::TransformComponent>(root))
-        t->position = groundSpot;   // 脚踩在落点上
+    ecs::Entity gs{};
+    w.each<ecs::GameStartComponent>(
+        [&](ecs::Entity e, ecs::GameStartComponent&) {
+            if (!gs.valid()) gs = e;   // 一个场景只认一个出生点
+        });
 
-    ecs::PlayerComponent pc;
-    pc.mode = mode;
-    // pitch = 视线仰角（正 = 抬头）：第三人称初始略微低头，
-    // 于是相机落在角色斜上方俯视（相机 pitch 取 -pc.pitch）。
-    if (mode == ecs::PlayerMode::ThirdPerson) pc.pitch = -0.35f;
-    pc.bodyYaw = pc.yaw;   // 出生时角色朝向 = 视线方向
-    w.add<ecs::PlayerComponent>(root, pc);
-
-    // 胶囊碰撞体：占位 + 运行态防穿墙。中心在 (0,0,0.85)。
-    ecs::CollisionComponent cc;
-    cc.shape = ecs::ColliderShape::Capsule;
-    cc.position = glm::vec3(0.0f, 0.0f, 0.85f);
-    cc.capsuleRadius = 0.30f;
-    cc.capsuleHalfHeight = 0.55f;
-    w.add<ecs::CollisionComponent>(root, cc);
-
-    // 第三人称不再程序化拼小人（2026-10-11 用户反馈"太粗糙"）。
-    // 2026-10-22 起改成**默认装配自带角色**：模型 + 骨架 + 四段动画一次到位，
-    // 用户按 Shift+A 创建完就能在 Play 里看到人走路（以前要先打开角色窗口
-    // 手动拖模型、再点"生成骨骼绑定"两下，才有一具身体）。
-    if (mode == ecs::PlayerMode::ThirdPerson) {
-        bindDefaultCharacter(scene, assets, root);
+    const bool created = !gs.valid();
+    if (created) {
+        gs = scene.createObject("GameStart");
+        if (!gs.valid()) return {};
+        if (auto* t = w.get<ecs::TransformComponent>(gs))
+            t->position = groundSpot;
     }
-    return root;
+
+    // 已有出生点就**只改模式、不搬家**：绝大多数工程里那个 GameStart 是
+    // 建地形时摆好的（已经贴着地表），为了"加个第三人称"把它拽到当前鼠标
+    // 位置，等于把作者摆好的出生点悄悄挪走。要挪的话它就在选中状态，
+    // W/E/R 手柄随手就能挪。
+    ecs::GameStartComponent g =
+        w.get<ecs::GameStartComponent>(gs) ? *w.get<ecs::GameStartComponent>(gs)
+                                           : ecs::GameStartComponent{};
+    g.mode = mode;
+    g.enabled = true;
+    g.spawnOnRun = true;
+    w.add<ecs::GameStartComponent>(gs, g);
+
+    glm::vec3 at = groundSpot;
+    if (const auto* t = w.get<ecs::TransformComponent>(gs)) at = t->position;
+    VK_LOG_INFO("PLAYER-START %s mode=%s pos=(%.2f,%.2f,%.2f) "
+                "(角色在运行时生成，编辑态视口里不出现)",
+                created ? "created" : "reconfigured",
+                mode == ecs::PlayerMode::FirstPerson ? "first" : "third",
+                static_cast<double>(at.x), static_cast<double>(at.y),
+                static_cast<double>(at.z));
+    return gs;
 }
 
 ecs::Entity createSunlight(scene::Scene& scene) {

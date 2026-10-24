@@ -32,6 +32,7 @@
 #include "ParticlesPanel.h"
 #include "PhysicsPanel.h"
 #include "QualitySettingsPanel.h"
+#include "MaterialLibraryPanel.h"
 #include "SceneHierarchy.h"
 #include "SplitLayout.h"
 #include "Toolbar.h"
@@ -56,6 +57,8 @@
 #include "physics/ScenePhysics.h"
 #include "render/Renderer.h"
 #include "scene/Camera.h"
+#include "scene/LookLimits.h"
+#include "scene/SpringArm.h"
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
 #include "project/ProjectCreate.h"
@@ -377,6 +380,12 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         // 2026-10-21：水体编辑模式。显隐跟 EditMode 走，与上面八个同构。
         {"water", "Water", PanelGroup::Authoring, "", "water",
          false, true, kSlotModes, &EditorApp::panelDrawWater},
+        // 2026-10-24：材质仓库（贴图版材质货架）。
+        // 归 Authoring 组、浮动窗口、无快捷键 —— 和 Physics / Particles /
+        // Quality 同款（"偶尔打开的一张面板"，不该占 Alt+N）。
+        // 它的两个动作分别服务地形笔刷（Landscape 模式）与属性栏换材质。
+        {"matlib", "Material library", PanelGroup::Authoring, "", "palette",
+         false, true, kSlotNone, &EditorApp::panelDrawMaterialLibrary},
     };
 }
 
@@ -423,6 +432,9 @@ void EditorApp::panelDrawGpuTimeline(EditorApp& a) {
 void EditorApp::panelDrawCharacter(EditorApp& a) { (void)a; }
 void EditorApp::panelDrawPhysics(EditorApp& a) {
     if (a.m_physicsPanel) a.m_physicsPanel->draw();
+}
+void EditorApp::panelDrawMaterialLibrary(EditorApp& a) {
+    if (a.m_materialLib) a.m_materialLib->draw();
 }
 void EditorApp::panelDrawParticles(EditorApp& a) {
     if (a.m_particlesPanel) a.m_particlesPanel->draw();
@@ -642,7 +654,10 @@ void EditorApp::serviceEditMode() {
         case EditMode::Landscape:
             if (m_landscape) {
                 m_landscape->sync();
-                if (m_landscape->hasTerrain()) m_landscape->focusCamera();
+                // 正常高度对着角色（2026-10-24）—— 以前是 focusCamera()，
+                // 那会把镜头甩到 500 m 外看地形全貌，切一次模式就被"弹飞"
+                // 一次。全貌仍然留在面板的 Focus 按钮上。
+                if (m_landscape->hasTerrain()) m_landscape->focusCameraAtPlayer();
             }
             break;
         case EditMode::Foliage:
@@ -1098,6 +1113,10 @@ void EditorApp::onInit() {
     // E26：画质档位面板。构造无副作用（不碰设备），参数走 FeatureRegistry ——
     // 与启动器写进 `config/render.json` 的是同一份表（QualityPresets）。
     m_qualityPanel = std::make_unique<editor::QualitySettingsPanel>();
+    // 2026-10-24：材质仓库面板。构造无副作用 —— 仓库本身是**惰性加载**的
+    // （见 EditorContext::materialLibrary），没打开面板就一次磁盘都不读。
+    // 地形编辑器的指针在它构造之后才 attach（此时 m_landscape 还没建）。
+    m_materialLib = std::make_unique<editor::MaterialLibraryPanel>(*m_ctx);
     // E21：通知中心 —— 接管 Logger 的**第二条**通道（hook）。
     // ⚠ 顺序：必须先有 Console 再建通知中心。两条通道本身互不依赖，但
     //   "点 Error 的 toast → 打开 Console 滚到那条"这个动作要有 Console 可开。
@@ -1130,6 +1149,9 @@ void EditorApp::onInit() {
     m_water = std::make_unique<WaterEditor>(*m_ctx);
     m_viewport->attachModeTools(m_landscape.get(), m_foliage.get(),
                                 m_water.get());
+    // 材质仓库面板要能"把材质设成地形笔刷"（写 layerOverrides + 切工具），
+    // 所以要等 m_landscape 建好之后再接线。
+    if (m_materialLib) m_materialLib->attachLandscape(m_landscape.get());
     m_viewport->attachToolkitTools(m_meshPaint.get(), m_brushEdit.get(),
                                  m_modeling.get());
     m_hierarchy = std::make_unique<SceneHierarchy>(*m_ctx);
@@ -2173,7 +2195,13 @@ void EditorApp::runPlayers(float dt) {
             pc->yaw += dx * pc->lookSpeed;
             pc->pitch -= dy * pc->lookSpeed;
         }
-        pc->pitch = glm::clamp(pc->pitch, -1.45f, 1.45f);
+        // 俯仰范围与运行时**同一口径**（见 scene/LookLimits.h 的单一来源）：
+        // pc->pitch 是**视线仰角**（正 = 抬头），所以"仰 55° / 俯 70°"在这里是
+        // [+kLookUpRad, -kLookDownRad]，与运行时那边的 m_pitch 反号。老值
+        // ±1.45（±83°）能让人把镜头转到"脚底板下面往上拍"，现实里没人这么
+        // 看东西 —— 而且那时相机早就沉到地面以下了。
+        pc->pitch = glm::clamp(pc->pitch, -scene::kLookDownRad,
+                               scene::kLookUpRad);
 
         // ---- WASD（(forward, right) 键位组合）----
         glm::vec2 wish(0.0f);
@@ -2295,7 +2323,22 @@ void EditorApp::runPlayers(float dt) {
 
         // ---- 第三人称：转身 + walk 摆腿 ----
         if (!firstPerson) {
-            if (!pc->started) pc->bodyYaw = pc->yaw;
+            if (!pc->started) {
+                // 出生朝向：**背对相机**。
+                //
+                // 第三人称进 Play 的第一眼应该看到角色的后脑勺，而不是两个人
+                // 脸对脸。本工程的约定是 facing = (cos b, -sin b)（见下面
+                // 移动分支的推导），而"远离相机"= fwdH = (-cos yaw, sin yaw)
+                // → b = yaw + π。
+                //
+                // 老代码是 `bodyYaw = yaw`：出生时角色正对着镜头，一按 W
+                // 才被下面的 moving 分支掰过去。用户报的"往前走时脸朝反方向"
+                // 是另一回事（模型朝向补偿差 180°，见 assets/ModelOrientation），
+                // 但两者叠在一起时"哪一帧脸朝哪边"就彻底说不清了 ——
+                // 所以出生姿势也必须钉死。
+                pc->bodyYaw = pc->yaw + 3.14159265f;
+                tc->rotation.z = -pc->bodyYaw;
+            }
             if (moving) {
                 const glm::vec3 dir =
                     glm::normalize(fwdH * wish.x + rightH * wish.y);
@@ -2408,15 +2451,106 @@ void EditorApp::runPlayers(float dt) {
             cam.setYaw(pc->yaw);
             cam.setPitch(pc->pitch);
         } else {
+            // ---- 第三人称：弹簧臂（2026-10-24 第二轮补上）----
+            //
+            // 以前这里直接把相机放在 target + dir*distance 上，**一点碰撞
+            // 检测都没有** —— 贴墙站就整个镜头钻进墙体内部，视野里全是
+            // 墙的背面（用户第六轮第 3 条）。运行时那条链（Game.exe）一直
+            // 有弹簧臂，编辑器 Play 没有，两边手感还不一致。
+            //
+            // 现在共用 `scene::resolveSpringArm`（UE SpringArmComponent 的
+            // 球扫掠 + 穿透优先），射线来源换成**场景 BVH + 地形高度场**：
+            // 编辑器 Play 没有物理世界，但有空间索引。
+            const float focusZ = 1.2f * std::max(1.0f, pc->eyeHeight / 1.7f);
             const glm::vec3 focus =
-                tc->position + glm::vec3(0.0f, 0.0f, 1.2f);
+                tc->position + glm::vec3(0.0f, 0.0f, focusZ);
+
+            // 从 focus 指向相机的方向。Camera 的 angleDir 是"相机方位"，
+            // 与 pc->pitch（视线仰角）反号 —— 见下面 setPitch 的注释。
+            const float cpc = std::cos(pc->pitch);
+            const glm::vec3 back(std::cos(pc->yaw) * cpc,
+                                 -std::sin(pc->yaw) * cpc,
+                                 -std::sin(pc->pitch));
+
+            // 角色自己的网格不能挡住相机：命中实体若在**本玩家**的子树里
+            // 就直接不算（沿父链往上找，深度很小）。
+            const ecs::EntityId selfId = e.id;
+            const auto& bvh = sc.spatialIndex();
+            const scene::SpringArmCast cast =
+                [&](const glm::vec3& o, const glm::vec3& d,
+                    float maxDist) -> float {
+                float best = maxDist;
+                const scene::BvhRay ray{o, d};
+                const scene::BvhHit hit = bvh.raycastFiltered(
+                    ray,
+                    [&](ecs::Entity cand) {
+                        ecs::EntityId cur = cand.id;
+                        for (int guard = 0; guard < 64 && cur != 0xFFFFFFFFu;
+                             ++guard) {
+                            if (cur == selfId) return false;
+                            const auto* hc =
+                                w.get<ecs::HierarchyComponent>(ecs::Entity{cur});
+                            if (!hc) break;
+                            cur = hc->parent;
+                        }
+                        return true;
+                    },
+                    maxDist);
+                if (hit.hit && hit.distance < best) best = hit.distance;
+                // 地形：heightfield 不在 BVH 里（它是高度场，不是网格实体）
+                constexpr int kSteps = 20;
+                for (int i = 1; i <= kSteps; ++i) {
+                    const float t = best * static_cast<float>(i) / kSteps;
+                    const glm::vec3 p = o + d * t;
+                    if (p.z < editorGroundHeight(p.x, p.y, 0.0f)) {
+                        best = t;
+                        break;
+                    }
+                }
+                return best;
+            };
+
+            constexpr float kCameraRadius = 0.25f;
+            constexpr float kArmMin = 0.60f;
+            const scene::SpringArmResult arm = scene::resolveSpringArm(
+                cast, focus, back, pc->camDistance, kArmMin, kCameraRadius);
+
+            // 臂长平滑：缩短立刻、伸长限速（与运行时同一条规则）。
+            // 首帧 m_playArmLen 还是 0：直接给全长，否则镜头会从角色脸上
+            // 慢慢"拉出去"，进 Play 的第一秒很难看。
+            if (m_playArmLen <= 1.0e-4f) m_playArmLen = pc->camDistance;
+            if (arm.distance < m_playArmLen) {
+                m_playArmLen = arm.distance;
+            } else {
+                m_playArmLen = std::min(arm.distance, m_playArmLen + 6.0f * dt);
+            }
+            float effPitch = -pc->pitch;
+            glm::vec3 camPos = focus + back * m_playArmLen;
+            // 地面钳制会改写"相机到枢轴的真实距离"，那是**输出**，不能回写
+            // 进 m_playArmLen —— 后者是臂长平滑的状态量，混用会让平滑在
+            // 贴地时来回翻（相机位置本身仍是确定的，只是状态被污染了）。
+            float camDistanceNow = m_playArmLen;
+            // 相机不许钻进地面：顶到地表之上，再按新高度反解俯仰 ——
+            // 镜头仍指着角色，不会突然看天。
+            //
+            // 反解走 `scene::clampCameraAboveGround`（与运行时共用一份）：
+            // 第一版这里是自己写的 `asin((groundHere - focus.z)/臂长)`，
+            // 分母用错了（钳制后相机到枢轴的真实距离变长了），而且符号约定
+            // 与运行时那份**相反**却没人发现。共用一份之后两边不可能漂。
+            const float groundHere =
+                editorGroundHeight(camPos.x, camPos.y, 0.0f) + 0.25f;
+            if (m_playArmLen > 1.0e-3f) {
+                scene::clampCameraAboveGround(focus, groundHere, &camPos,
+                                              &camDistanceNow, &effPitch);
+            }
+
             cam.setTarget(focus);
-            cam.setDistance(pc->camDistance);
+            cam.setDistance(camDistanceNow);
             cam.setYaw(pc->yaw);
             // Camera 的 pitch 是"相机在目标上方"的俯视角，与我们的视线
             // 仰角反号 —— 不取负的话"鼠标往上"会变成"相机升得更高、看得
             // 更低"（这正是 2026-10-11 修掉的那个上下颠倒）。
-            cam.setPitch(-pc->pitch);
+            cam.setPitch(effPitch);
         }
     }
 
@@ -2436,8 +2570,14 @@ void EditorApp::runPlayers(float dt) {
             const auto* tc = w.get<ecs::TransformComponent>(e);
             if (!pc || !tc) continue;
             const std::string* nm = w.name(e);
+            // arm / cam = 本帧的**弹簧臂长**与**相机世界位置**。
+            // 2026-10-24 加的：用户报"贴墙时镜头钻进墙体内部"，而这件的
+            // 唯一证据就是"臂长有没有被压下来、相机落在墙的哪一侧" ——
+            // 光看画面截图分不清"镜头贴在墙前"和"镜头在墙里往外看"。
+            const glm::vec3 camPos = sc.camera().position();
             VK_LOG_INFO("PLAYER-STATE '%s' mode=%s pos=(%.3f,%.3f,%.3f) "
-                        "yaw=%.3f pitch=%.3f miv=%d cap=%d",
+                        "yaw=%.3f pitch=%.3f arm=%.3f "
+                        "cam=(%.3f,%.3f,%.3f) miv=%d cap=%d",
                         nm ? nm->c_str() : "?",
                         pc->mode == ecs::PlayerMode::ThirdPerson ? "third"
                                                                  : "first",
@@ -2446,6 +2586,10 @@ void EditorApp::runPlayers(float dt) {
                         static_cast<double>(tc->position.z),
                         static_cast<double>(pc->yaw),
                         static_cast<double>(pc->pitch),
+                        static_cast<double>(m_playArmLen),
+                        static_cast<double>(camPos.x),
+                        static_cast<double>(camPos.y),
+                        static_cast<double>(camPos.z),
                         m_ctx->mouseInViewport(
                             glm::vec2(io.MousePos.x, io.MousePos.y)) ? 1 : 0,
                         active ? 1 : 0);

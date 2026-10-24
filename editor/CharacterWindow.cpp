@@ -3,6 +3,7 @@
 #include "Localization.h"
 #include "DebugRects.h"
 #include "EditorDragDrop.h"
+#include "EditorScene.h"
 #include "PanelDock.h"
 #include "PickingSystem.h"
 
@@ -76,13 +77,19 @@ std::string pathStem(const std::string& p) {
 }
 
 // 从路径加载模型（按扩展名分派 FBX / glTF），失败返回 null。
+//
+// ⚠ `.vmesh` 必须走 `loadFBX`：那条路会**先探同名 .vmesh**，探不到再落
+//   ufbx（见 AssetManager::loadFBX）。只按"是不是 .fbx"分流的话，
+//   `alicia.vmesh` 会被送进 `loadGLTF` → tinygltf 解析二进制网格 →
+//   `Fatal: Failed to load glTF` → **整个编辑器进程退出**（2026-10-24
+//   实测：加个第三人称角色，编辑器直接没了）。只有 .glb/.gltf 才必须
+//   走 GLTF，其它（.fbx/.FBX/.vmesh）一律 FBX 那条路。
 assets::Model* loadModelByPath(assets::AssetManager& am,
                                const std::string& relPath) {
     const std::string resolved = assets::resolveAssetPath(relPath);
-    if (isFbxPath(relPath)) {
-        return am.loadFBX(resolved, relPath);
-    }
-    return am.loadGLTF(resolved, relPath);
+    const bool isGltf = endsWith(relPath, ".glb") || endsWith(relPath, ".gltf");
+    if (isGltf) return am.loadGLTF(resolved, relPath);
+    return am.loadFBX(resolved, relPath);
 }
 
 } // namespace
@@ -143,6 +150,28 @@ void CharacterWindow::open(ecs::Entity player) {
                             m_model->skeleton ? m_model->skeleton->jointCount() : 0,
                             m_model->skeleton ? m_model->skeleton->clips.size() : 0u);
             }
+        }
+    }
+
+    // 还没有模型 → 预览里放**默认角色**（2026-10-24）。
+    //
+    // 语义变了：视口里不再摆角色（它在运行时才生成），所以"场上那个角色
+    // 身上绑的模型"这条来源消失了。但面板仍然得给出一具有动画的身体 ——
+    // 否则用户点开就是一片空白 + "no model"，只能自己去拖文件。
+    //
+    // ⚠ 只进**预览场景**（`m_previewScene`），一个实体都不写主场景。这条
+    //   边界是这个面板现在唯一的安全约束：预览怎么折腾都不会让角色重新
+    //   出现在视口里。
+    if (!m_model) {
+        assets::Model* m = loadModelByPath(m_ctx.assets(), kDefaultCharacterAsset);
+        if (m && m->valid()) {
+            m_model = m;
+            m_modelPath = kDefaultCharacterAsset;
+            m_previewDirty = true;
+            VK_LOG_INFO("CharacterWindow: preview-only default character '%s' "
+                        "(nothing is added to the viewport; the real character "
+                        "is spawned at GameStart on Run)",
+                        kDefaultCharacterAsset);
         }
     }
 }

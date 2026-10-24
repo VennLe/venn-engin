@@ -8,7 +8,8 @@
      A- 新建地形坐在栅格地面上（2026-10-21 追加）
         A-1 谷底严格贴地 / A-2 默认起伏不再悬空 / A-3 LS-CREATE-SEAT
      A0 笔刷落点 == 画面隆起位置，且操作实时（2026-10-21 追加）
-        A0a 离线：地形资产非对称，转置错误一定被抓到
+        A0a 离线：转置错误一定被抓到（判据 = 转置后整片的**最大高差**，
+            不是"峰值被挪动多少" —— 后者是数据巧合，见断言处注释）
         A0b 刷新全部走内存直传（src=memory，零 src=disk）
         A0c 单次刷新耗时峰值 < 12 ms
         A0d/A0e/A0f 拖拽期间持续刷新、但不写盘（抬笔才写）
@@ -22,7 +23,9 @@
      A6 Erode 工具真的搬运了物质
      A7 整块操作（Smooth all）可用且改了高度图
      A8 形状雕刻：按物体轮廓削地形，且**不**写出挖穿遮罩（拓扑完整）
-     A9 Raise 收尾是锥形（能突破 1.0），不是一块平顶
+     A9 Raise 收尾是锥形（山峰真的长高），不是一块平顶
+        ⚠ 判据只看**世界高度**（top × maxHeight）：落盘时
+          normalizeHeightRange 会把归一化值收回 [0,1] 并放大 maxHeight。
   B. 植被
      B1 种类从 3 种变 5 种（+Flower / Rock）
      B2 Rock 撒点成功
@@ -298,7 +301,7 @@ def transpose_probe(h, cols, rows, mpp):
     于是原样上传 = 采样点 (col,row) 读到 `h[row*cols + col]` —— 整片地形
     绕对角线镜像。
 
-    返回 (峰值CPU世界坐标, 峰值会被画到的世界坐标, 差异比例)。
+    返回 (峰值CPU世界坐标, 峰值会被画到的世界坐标, 差异比例, 最大高差)。
     """
     n = cols * rows
     peak = max(range(n), key=lambda i: h[i])
@@ -308,9 +311,16 @@ def transpose_probe(h, cols, rows, mpp):
     # 行主序解释：同一个下标 i 变成 row*cols + col
     nc, nr = peak % cols, peak // cols
     naive_w = ((nc - cx) * mpp, (nr - cy) * mpp)
-    mism = sum(1 for c in range(cols) for r in range(rows)
-               if abs(h[r * cols + c] - h[c * rows + r]) > 1e-6)
-    return cpu_w, naive_w, mism / float(n)
+    mism = 0
+    worst = 0.0
+    for c in range(cols):
+        for r in range(rows):
+            d = abs(h[c * rows + r] - h[r * cols + c])
+            if d > 1e-6:
+                mism += 1
+            if d > worst:
+                worst = d
+    return cpu_w, naive_w, mism / float(n), worst
 
 
 def parse_float(line, key):
@@ -504,17 +514,25 @@ def main():
         desc = read_desc(os.path.join(terrain_dir, "terrain.vterrain"))
         hh = read_heights(HEIGHT)
         if desc and hh:
-            cpu_w, naive_w, ratio = transpose_probe(
+            cpu_w, naive_w, ratio, worst = transpose_probe(
                 hh, desc["cols"], desc["rows"], desc["metersPerPixel"])
             gap = ((cpu_w[0] - naive_w[0]) ** 2 +
                    (cpu_w[1] - naive_w[1]) ** 2) ** 0.5
+            worst_m = worst * desc["maxHeight"]
             print("      · 地形 %dx%d  峰值 CPU=(%.1f,%.1f) 不转置会画到 "
-                  "(%.1f,%.1f)  偏差 %.0f m  差异采样 %.1f%%"
+                  "(%.1f,%.1f)  峰值偏差 %.0f m  差异采样 %.1f%%  "
+                  "最大高差 %.1f m"
                   % (desc["cols"], desc["rows"], cpu_w[0], cpu_w[1],
-                     naive_w[0], naive_w[1], gap, ratio * 100.0))
-            check(ratio > 0.5 and gap > 20.0,
-                  "A0a 地形资产非对称，转置错误必被抓到 (差异 %.0f%%, 偏差 %.0f m)"
-                  % (ratio * 100.0, gap))
+                     naive_w[0], naive_w[1], gap, ratio * 100.0, worst_m))
+            # ⚠ 判据别用"峰值会被挪动 > 20 m"：那依赖"默认地形的最高点离
+            #   对角线够远"，是**数据巧合** —— 默认噪声一改（2026-10-21 起的
+            #   [0,0.12] 归一化）峰值就靠近对角线了，实测只偏 17 m，于是
+            #   "转置 bug 会被抓到"这个真结论被一个假 FAIL 盖住。
+            #   改成直接量"转置之后整片地形差多少米"（最大高差），它与峰值
+            #   位置无关，正好就是转置 bug 的可见后果。
+            check(ratio > 0.5 and worst_m > 2.0,
+                  "A0a 转置错误必被抓到 (差异 %.0f%%, 最大高差 %.1f m)"
+                  % (ratio * 100.0, worst_m))
         else:
             check(False, "A0a 读不到地形资产，无法做离线断言")
 
@@ -717,7 +735,9 @@ def main():
         #
         # 根因是 `h = clamp(h, 0, 1)`：笔心先撞顶、外圈继续涨 → 必然平顶。
         # 现在允许超过 1.0（kMaxNorm=8，且越接近上限越慢），所以：
-        #   ① 顶点能突破 1.0；
+        #   ① 顶点能突破 1.0 —— ⚠ 这是**内存里**的事实；落盘时会被
+        #      normalizeHeightRange 收回 [0,1] 并放大 maxHeight（见下面的
+        #      长注释），所以这条要用**世界高度**来断言；
         #   ② 与顶点同高的采样点很少（锥形收尾），而不是一大片平台。
         print("\n[A9] Raise 收尾是锥形，不是平台")
         # 面板刚才被 A8 滚下去了，Raise 在第一行 —— 按同一套逻辑滚回来。
@@ -745,24 +765,39 @@ def main():
         #   改成"刷到达标就停"：结论与帧率无关，只影响刷几次。
         #   次数上限 30：满速下最多涨 30*0.575s*0.18/s ≈ 3.1，
         #   仍低于 A9b2 的饱和阈值 4.0，不会退化成测平台。
+        #
+        # ⚠⚠ 2026-10-22 起判据只能看**世界高度**，不能看磁盘上的归一化值：
+        #   `saveAssets` 落盘前会先 `terrain::normalizeHeightRange` 把高度
+        #   收敛回 [0,1]、并把 `maxHeight` 同乘放大（世界高度不变）——
+        #   那是 .r32 的资产契约。结果就是磁盘上的 `top` **恒为 1.000**，
+        #   旧的 `top > 1.02` 再也不可能成立（实测 1.000 = 数据契约，
+        #   不是功能回归）。用户看到的"山长高了没有"始终是
+        #   `top * maxHeight` 这个米数，所以判据、break 条件、上限全部换成米。
+        d0 = read_desc(os.path.join(terrain_dir, "terrain.vterrain"))
+        m0 = d0["maxHeight"] if d0 else 60.0
         strokes = 0
         top = 0.0
+        world = 0.0
         hr = []
         for _ in range(30):
             drag(hwnd, (bx - 30.0, by - 30.0), (bx - 27.0, by - 27.0), steps=5)
             strokes += 1
             hr = read_heights(HEIGHT)
+            dn = read_desc(os.path.join(terrain_dir, "terrain.vterrain"))
             top = max(hr) if hr else 0.0
-            if top > 1.10:
+            world = top * (dn["maxHeight"] if dn else m0)
+            if world > 1.10 * m0:
                 break
         flat = sum(1 for v in hr if v > top - 0.02) if hr else 0
-        print("      · 刷了 %d 笔  顶点 %.3f 归一化（=%.1f m）  "
-              "与顶点同高(±0.02)的采样点 %d"
-              % (strokes, top, top * 60.0, flat))
-        check(top > 1.02,
-              "A9b 抬升突破了旧的 1.0 天花板（top=%.3f）" % top)
-        check(top < 4.0,
-              "A9b2 没撞上限，测的不是饱和态（top=%.3f < 4.0）" % top)
+        print("      · 刷了 %d 笔  顶点 %.3f 归一化 · 世界 %.1f m"
+              "（起始 maxHeight %.1f m）  与顶点同高(±0.02)的采样点 %d"
+              % (strokes, top, world, m0, flat))
+        check(world > 1.02 * m0,
+              "A9b 抬升突破了旧的 1.0 天花板（世界 %.1f m > 起始 %.1f m × 1.02）"
+              % (world, m0))
+        check(world < 4.0 * m0,
+              "A9b2 没撞上限，测的不是饱和态（%.1f m < 4 × %.1f m）"
+              % (world, m0))
         check(flat < 60,
               "A9c 收尾是锥形不是平台（同高采样点 %d < 60）" % flat)
         shoot(hwnd, "_wt_landscape_tools.png")

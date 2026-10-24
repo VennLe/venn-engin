@@ -209,6 +209,17 @@ inline bool meshLooksSkinned(const Mesh& m) {
 
 // 给 LOD 网格起缓存键。name 为空（来源不明的网格）时退回用指针地址 ——
 // 不能留空，否则所有无名网格的第 1 级都会撞到同一个键、互相复用错网格。
+//
+// ⚠ `subMeshIndex` 是**必须**拼进来的（2026-10-24，事故修复）。
+//   `MeshSource::name` 对 glTF / FBX / `.vmesh` 存的是**模型**的缓存键
+//   （见 MeshSource 的注释），一个模型有几十个子网格、全都拿同一个 name。
+//   只用 name 拼键的后果不是"稍微重复"，而是**静默丢数据**：
+//   第一个子网格把自己的减面结果注册成 `alicia#lod1`，后面 19 个子网格
+//   再调 `registerMesh("alicia#lod1", ...)` 会命中缓存，各自算出来的
+//   减面顶点直接扔掉，于是脸、腿、头发统统去画那个"最先注册的"低模。
+//   症状（本次实测）：近距离正常，一拉远脸变成一块白板、腿消失 ——
+//   因为那 19 个子网格换上了别人的几何，UV 落在贴图的空白区。
+//   程序化图元 subMeshIndex = -1，不受影响；OBJ 的 name 就是它自己的键。
 inline std::string lodKey(const Mesh& base, const std::string& name, int lv) {
     std::string stem = name;
     if (stem.empty()) {
@@ -216,6 +227,8 @@ inline std::string lodKey(const Mesh& base, const std::string& name, int lv) {
             static_cast<unsigned long long>(
                 reinterpret_cast<uintptr_t>(&base)));
     }
+    const int sub = base.source().subMeshIndex;
+    if (sub >= 0) stem += "#s" + std::to_string(sub);
     return stem + "#lod" + std::to_string(lv);
 }
 
@@ -326,6 +339,29 @@ inline const LodChain* AssetManager::ensureLod(Mesh* base) {
         // （小道具、UI 图标这类东西减面反而更丑，省一次 CPU 减面）。
     } else if (src.kind == MeshSource::Kind::Builtin) {
         buildBuiltinLods(*base, src, *chain);
+    } else if (meshLooksSkinned(*base)) {
+        // ============================================================
+        // 蒙皮网格**不自动减面**（2026-10-24，事故修复）
+        // ============================================================
+        // 顶点聚类简化对"贴图密度均匀的静态道具"够用，但对角色是最坏的
+        // 组合，实测把整个角色毁掉（脸变白板、腿消失、鞋子悬空）：
+        //
+        //   ① 选层口径错：LOD 是按**每个子网格自己的包围球**算屏幕占高比的。
+        //      脸只有 19 cm 高，在 4 m 外的第三人称视角里比值 ≈ 0.06 →
+        //      直接落到第 3 级（阈值 0.04），1571 顶点被压到 100 上下。
+        //      人眼对"脸"的敏感度和对"远处一棵树"完全不是一回事。
+        //   ② UV 会被平均掉：聚类把一格里的 UV 求平均，而角色的脸/眼/
+        //      眉都是**同一张图集上切开的小岛**，平均后采样点落到图集的
+        //      空白处 —— 这就是"脸变成一块纯白、眼睛消失"的直接原因。
+        //   ③ 关节权重本来就要重新归一化，越减越糊。
+        //
+        // UE5 的骨骼网格体 LOD 也不是自动生成的：它按 **Model** 统一选层，
+        // 而且默认不给你生成，要靠 Skeletal Mesh Editor 里手动加+LOD 设置。
+        // 这里保持同样的克制：**没有专门的骨骼 LOD 管线之前，宁可不要 LOD**。
+        // 代价是大场景里的角色多画几十万三角形；错误地减面毁掉主角的脸，
+        // 代价比这高得多。
+        VK_LOG_INFO("LOD-SKIP-SKIN '%s'（蒙皮网格不做自动减面，见 ensureLod 注释）",
+                    src.name.c_str());
     } else {
         buildDecimatedLods(*base, *chain);
     }

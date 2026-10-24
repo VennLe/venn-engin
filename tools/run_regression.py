@@ -88,6 +88,11 @@ DEFAULT = [
     "verify_nav_gizmo",
     "verify_character_window", "verify_add_menu", "verify_mesh_params",
     "verify_collider_gizmo", "verify_player", "verify_collision_play",
+    # 第三人称相机：俯仰范围（仰 55/俯 70）+ 弹簧臂球扫掠 + 地面钳制。
+    # 它看守的三条断言都在**两个**二进制里（Game.exe 的两个无窗口自检 +
+    # 编辑器 Play 的贴墙场景），run_regression 只跑 Python 脚本，所以
+    # 自检由脚本自己 subprocess 拉起 —— 不需要额外登记自检用例。
+    "verify_third_person_camera",
     "verify_drop_to_floor", "verify_material_roundtrip",
     # 材质槽小方块（空态是小方框 / 绑定后变宽并显示文件名 / 拖拽真的生效）。
     # ⚠ 它此前**不在** DEFAULT 里 → 2026-10-16 那种"槽位被图标条挤到 48px、
@@ -525,6 +530,42 @@ DEFAULT = [
     # 投影出来就不再是椭圆。判据是**像素级**的：r(θ) 的非椭圆分量 < 2%，
     # 外加"笔心十字必须落在圆心"（旧代码画在 outer[0]，即圆的右边缘）。
     "verify_brush_ring",
+
+    # ---- 地形共面 / 形状雕刻 / 坡道 / 力度 / 取景（2026-10-24 收编）----
+    # 这条**之前不在套件里**，理由是"旧面板布局已漂移"（见 verify_brush_ring
+    # 上的注释）。漂移的真相在 2026-10-24 才查清：8 个工具按钮的第 4 行被
+    # 面板底边裁掉，`LS-TOOL-7` 的中心落在面板**下方**，点下去砸到底部通栏上、
+    # 把中间视口切成 Command Palette —— 之后 B/C/D 三组整片假 FAIL。
+    # 产品侧已把按钮网格压进可见区（并加 reveal() 兜底），脚本侧补了
+    # F 组（Ctrl+. / Focus player 的取景几何），现在 20 条全绿，收编进套件，
+    # 免得下次布局一动又悄悄烂掉。
+    "verify_landscape_ground",
+
+    # ---- 材质仓库 / 地形默认材质 / 出生点落地（2026-10-24）----
+    # 用户原话（四件事一起提）：
+    #   ① "GameStart 的标记任务比例不对需要和真人一比一还原"；
+    #   ② "它的初始位置是在地形位置一下的……要初始化在地形地面上面"；
+    #   ③ "初始化地形的地面要尽量保持和栅格地面是同一个平面"；
+    #   ④ "打造一个材质仓库……以后地形地面就默认用 grass_ground"。
+    # 静态段守磁盘产物（清单 / vmat / 三张贴图 / 生成脚本自检），
+    # 运行段起一次编辑器走 `MYVK_LANDSCAPE_AUTOCREATE`（= 面板上点"创建
+    # 地形"的同一条路径），断言：仓库被读进来 / 层 0 挂 grass_ground 且
+    # **贴图真的加载了**（albedo=file 而不是退回纯色）/ 地形 z=0 /
+    # 出生点被抬到 terrainH / 有地形时栅格退场 / 标记高宽比 2.64（Q 版 1.92）。
+    # ⚠ GUI 用例（1 次启动编辑器），不能与其它 GUI 用例并行。
+    "verify_material_library",
+
+    # ---- 地形层材质：从目录刷新导入（2026-10-24 第六轮）----
+    # 用户原话："那里的地形材质一般是指定一个目录里面，将对应的材质信息按照
+    # 之前 E:\code\cpp\venn-resource 中的材质信息的形式去自动添加，这个通过
+    # 一个刷新按钮去找到最新的材质信息"。
+    # 走真实 UI 路径：选中 Terrain → 属性栏 Layer materials 上方的目录框
+    # （由 `MYVK_MATERIAL_SOURCE` 给出）→ 点 `INS-MATSRC-REFRESH`。
+    # 断言产物（.vmat / 三张贴图 / 清单 2→3 条 / 重载 count=3）以及**幂等**
+    # （再点一次 added=0）。`MYVK_MATERIAL_NO_MIRROR=1` 防止测试材质被写回
+    # 仓库的 assets/。
+    # ⚠ GUI 用例（1 次启动编辑器），不能与其它 GUI 用例并行。
+    "verify_material_import",
 ]
 
 # 结果行：兼容四种写法。取**最后一条**，因为有的脚本会先打一堆中间断言。
@@ -749,6 +790,9 @@ TRIGGERS = {
                               "editor/ViewportPanel.*",
                               "editor/SceneHierarchy.*",
                               "editor/EditorFocus.h",
+                              # [1b]：Player Start 段（视角模式 / 运行即生成 /
+                              # 启用）只有 Inspector 里这一处编辑落点
+                              "editor/InspectorPanel.*",
                               "engine/ecs/Components.h"],
     # ---- 屏幕空间 / 后处理链 ----
     "verify_screenspace":    ["engine/render/SSAOPass.*",
@@ -911,6 +955,10 @@ TRIGGERS = {
                                "engine/scene/SceneSerializer.*",
                                # 编辑器没有的组件在 Play 里就不存在 → 接线在这儿
                                "editor/EditorApp.*",
+                               # 2026-10-24：C5d/C5e 的模型装配断言跑在 Play 之后
+                               # —— 出生点 → 玩家实体这一步在 EditorContext 的
+                               # preparePlayerAtGameStart 里（含 animKeyMap 复制）
+                               "editor/EditorContext.*",
                                # tickPlayerAnimation / idleTriggerSec
                                "runtime/RuntimeApp.*",
                                "runtime/RuntimeConfig.*",
@@ -969,7 +1017,15 @@ TRIGGERS = {
     # ⚠ 按本节约定**只列非横切文件**：`engine/physics/**`、`engine/ecs/**`
     #   都在 `GLOBAL_GLOBS` 里，改它们一改就全量，写进 TRIGGERS 会被
     #   `check_regression_map.py` 标成"冗余的横切 glob"。
-    "verify_editor_play_terrain": ["editor/EditorApp.*"],               # buildPhysicsWorld / editorGroundHeight
+    "verify_editor_play_terrain": ["editor/EditorApp.*",                 # buildPhysicsWorld / editorGroundHeight
+                                   # 2026-10-24：T0b/T0c 断言"加人称角色只
+                                   # 配置出生点、不往视口塞身体"（PLAYER-START
+                                   # 由 EditorScene::createPlayer 打），T1b 断言
+                                   # 进 Play 才生成（EditorContext →
+                                   # spawnPlayerAtGameStart）。三处缺一条就断链。
+                                   "editor/EditorScene.*",
+                                   "editor/EditorContext.*",
+                                   "editor/ViewportPanel.*"],
     # Play 态鼠标两态（P8，2026-10-23）。核心风险是**"谁能改光标模式"**：
     # 状态机跨三个文件（Context 存状态 / 面板发请求 / App 落 GLFW），任何
     # 一环改错的表现都是"鼠标消失但角色不动"或"按 Esc 没反应"。
@@ -983,9 +1039,15 @@ TRIGGERS = {
     # check_regression_map.py 判成"整条都指向横切文件"（--narrow 下假跳过）。
     # 也就是说：它是**无条件重跑**的用例，这正是对的。
     # 地形笔刷圆环（2026-10-23）。只有一处：圆环怎么取点、怎么投影。
-    # `editor/LandscapeEditor.*` 同时被 verify_landscape_ground 用到，那条
-    # 用例不在本套件里（旧面板布局已漂移），这里单独登记。
     "verify_brush_ring":     ["editor/LandscapeEditor.*"],
+    # 地形共面 / 雕刻 / 坡道 / 力度 / 取景（2026-10-24 收编）。落点全在
+    # LandscapeEditor：默认起伏与共面（createTerrain）、形状压印（Carve）、
+    # 坡道的最小段长、强度上限 kMaxStrength、取景几何（focusCamera /
+    # focusCameraAtPlayer）。`editor/EditorApp.*` 是"进入地形模式就取景"的
+    # 调用点；`editor/ViewportPanel.*` 那份 `Brush` 面板的可见区也在这里被断言。
+    "verify_landscape_ground": ["editor/LandscapeEditor.*",
+                                "editor/EditorApp.*",
+                                "editor/ViewportPanel.*"],
     # 游戏 UI / HUD（U0 起，docs/ui_hud_roadmap.md）。    # ⚠ `engine/ui2/**` **故意不进** `GLOBAL_GLOBS`：它只被 UI 通道引用，
     #   不像 `Renderer.*` / `engine/ecs/**` 那样横切。放进去会让全量永远
     #   点名，增量回归就失去意义了（这是路线图 §8.3 的明确决定）。
@@ -1039,6 +1101,16 @@ TRIGGERS = {
                               "editor/EditorDragDrop.*"],
     "verify_primitive_roundtrip": ["engine/scene/SceneSerializer.*"],
     "verify_player":         ["editor/EditorScene.*"],
+    # 第三人称相机三条：俯仰范围、弹簧臂、地面钳制。
+    #   · 弹簧臂实现（球扫掠 / 穿透优先 / 地面钳制反解）→ engine/scene/SpringArm.*
+    #   · 俯仰常量的单一来源                        → engine/scene/LookLimits.h
+    #   · 运行时的钳制与相机段                      → runtime/PlayerController.*
+    #   · 编辑器 Play 那条链（BVH + 地形的高度场）  → editor/EditorApp.*
+    # 少登记任何一条，在 --narrow 下改那一条就会把本用例判成"不受影响"。
+    "verify_third_person_camera": ["engine/scene/SpringArm.*",
+                                   "engine/scene/LookLimits.h",
+                                   "runtime/PlayerController.*",
+                                   "editor/EditorApp.*"],
     # ⚠ 这一例同时是**资源泄漏门**：全套里只有它会让编辑器**优雅退出**，
     #   因而也只有它的日志里会出现 `vkDestroyDevice(): ... leaked objects`
     #   （其余脚本都是强杀进程，泄漏报告根本不会产生）。
@@ -1163,6 +1235,45 @@ TRIGGERS = {
                               "engine/render/Renderer.*",
                               "engine/render/TerrainPass.*",
                               "templates/**"],
+    # ---- 材质仓库 / 地形默认材质 / 出生点落地（2026-10-24）----
+    # 断言落在五个地方，一条都不能漏（少一条就在 --narrow 下被误判"不受
+    # 影响"，而它是这条链上唯一的用例）：
+    #   · 仓库产物与清单        → assets/materials/library/**（新目录）
+    #   · 生成脚本              → tools/gen_material_library.py
+    #   · 仓库索引 + 面板       → editor/MaterialLibraryPanel.*
+    #     （`engine/assets/MaterialLibrary.*` **故意不登记**：`engine/assets/**`
+    #      在 GLOBAL_GLOBS 里，写了会变成"看着有归属、其实没覆盖"的假映射）
+    #   · 地形默认层 / 同面 / 出生点贴地 → editor/LandscapeEditor.*
+    #   · 有地形时栅格退场      → engine/render/Renderer.*（同上，**GLOBAL**）
+    #   · 运行期出生点贴地      → runtime/RuntimeApp.cpp
+    # ⚠ `editor/ViewportPanel.*` 里是标记的绘制（GAMESTART-MARK 锚点），
+    #   但它已经挂在 verify_gamestart_edit 名下；两条都登记，改标记就得
+    #   两条一起重跑。
+    "verify_material_library": ["assets/materials/library/**",
+                                "assets/materials/library.json",
+                                "tools/gen_material_library.py",
+                                "editor/MaterialLibraryPanel.*",
+                                "editor/LandscapeEditor.*",
+                                "editor/InspectorPanel.*",
+                                "editor/ViewportPanel.*",
+                                "runtime/RuntimeApp.cpp",
+                                "templates/**"],
+    # ---- 材质包目录导入（2026-10-24 第六轮）----
+    # 涉及面比看起来宽：引擎侧新增了 `assets/MaterialImport.*`（扫目录 +
+    # 解析 glTF + 写 vmat + 合并清单），属性栏多了两行控件，仓库重载要
+    # 让缩略图缓存失效。
+    #   · INS-MATSRC-* 锚点      → editor/InspectorPanel.*
+    #   · 导入后端本身            → engine/assets/MaterialImport.*
+    #   · 清单合并 / 目录补扫     → engine/assets/MaterialLibrary.*
+    #   · `materialLibraryRevision` → editor/EditorContext.*
+    #   · 缩略图失效              → editor/MaterialLibraryPanel.*
+    # ⚠ `engine/assets/**` 不在 GLOBAL_GLOBS 里（见本表末尾说明），所以
+    #   后端两个文件必须显式写。
+    "verify_material_import": ["editor/InspectorPanel.*",
+                               "engine/assets/MaterialImport.*",
+                               "engine/assets/MaterialLibrary.*",
+                               "editor/EditorContext.*",
+                               "editor/MaterialLibraryPanel.*"],
     # ---- 自研二进制资产链（阶段六/七，2026-10-22）----
     # 只登记**非横切**的两块，都是新顶层目录：
     #   · assetio/** —— 格式本体（MeshFormat / VertexOps / AnimOps /

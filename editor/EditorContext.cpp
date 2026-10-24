@@ -1,5 +1,6 @@
 #include "EditorContext.h"
 
+#include "EditorScene.h"
 #include "InputMapIO.h"
 #include "Localization.h"
 #include "assets/AssetManager.h"
@@ -17,36 +18,37 @@ namespace editor {
 namespace {
 
 // ============================================================
-// 出生点（P5，2026-10-22）
+// 出生点（P5，2026-10-22；2026-10-24 扩成"生成 + 归位"）
 // ============================================================
-// 用户原话："角色初始化的位置为什么不是 GameStart 的位置，GameStart 只是
-// 视口里的标记作用，当游戏启动运行的时候，这个标记就要消失，然后创建的角色
-// 放在这个位置。"
+// 用户原话（第一轮）："角色初始化的位置为什么不是 GameStart 的位置，
+// GameStart 只是视口里的标记作用，当游戏启动运行的时候，这个标记就要消失，
+// 然后创建的角色放在这个位置。"
 //
-// 语义上的分界很清楚：
-//   · **编辑态**：Player 实体摆在哪儿只是"看着方便"，GameStart 才是出生点；
-//   · **运行态**：Player 必须出生在 GameStart 上（与 Game.exe 的
-//     `spawnPlayerFromGameStart` 同一条规则）。
+// 用户原话（2026-10-24）："GameStart 不仅仅是角色的一个标记，也是游戏运行
+// 后角色初始化的坐标，在添加人称角色时不需要直接把角色加入到 3d 视口中，
+// 只是在游戏运行后，把角色初始化到 GameStart 位置即可。"
 //
-// 以前 Play 直接复制编辑态场景，于是"摆了一个 Player 在原点、GameStart 在
-// 山坡上"时，一按 Play 角色出现在原点 —— 而屏幕上那个 GameStart 标记看起来
-// 才是它该出现的地方，于是就是"角色没生在出生点"。
+// 所以 Play 要做的是**两件事之一**，按"运行态里有没有玩家实体"分：
+//   · **没有**（新语义，常态）→ 按 GameStart 现造一个（`spawnPlayerAtGameStart`），
+//     第三人称顺手装上默认角色。角色从这一刻才存在，编辑态场景里没有它。
+//   · **有**（老场景 / 脚本摆的 / 手工加过 PlayerComponent）→ 只把它归位到
+//     GameStart，行为与之前完全一致，不重复生成。
 //
-// 返回 false = 没有玩家实体，或者场景里没有启用的出生点（老场景）→ 一个
-// 字节都不动，行为与之前完全一致。
-bool placePlayerAtGameStart(scene::Scene& scene) {
+// `spawnOnRun = false` 的出生点表示"这个场景不要玩家"（纯观览），此时
+// 明明有出生点也不生成 —— 老场景里没有这个字段，解析时默认 true。
+//
+// 返回 true = 运行态里有玩家了（新造的或归位过的）。
+bool preparePlayerAtGameStart(scene::Scene& scene,
+                              assets::AssetManager& assets) {
     ecs::World& w = scene.world();
 
-    ecs::Entity player;
-    w.each<ecs::CharacterControllerComponent>(
-        [&](ecs::Entity e, ecs::CharacterControllerComponent& cc) {
-            if (!player.valid() && cc.enabled) player = e;
-        });
-    if (!player.valid()) return false;
-
+    // ---- 出生点：第一个启用的 ----
     glm::vec3 feet(0.0f);
     float yaw = 0.0f;
     bool found = false;
+    ecs::PlayerMode mode = ecs::PlayerMode::ThirdPerson;
+    bool spawnOnRun = true;
+    ecs::Entity startEntity{};
     w.each<ecs::GameStartComponent>(
         [&](ecs::Entity e, ecs::GameStartComponent& g) {
             if (found || !g.enabled) return;
@@ -54,8 +56,38 @@ bool placePlayerAtGameStart(scene::Scene& scene) {
             if (!tf) return;
             feet = tf->position;
             yaw = tf->rotation.z + g.yaw;
+            mode = g.mode;
+            spawnOnRun = g.spawnOnRun;
+            startEntity = e;
             found = true;
         });
+
+    // ---- 运行态里已经有玩家了吗 ----
+    ecs::Entity player;
+    w.each<ecs::CharacterControllerComponent>(
+        [&](ecs::Entity e, ecs::CharacterControllerComponent& cc) {
+            if (!player.valid() && cc.enabled) player = e;
+        });
+
+    if (!player.valid()) {
+        if (!found || !spawnOnRun) {
+            VK_LOG_INFO("EDIT-PLAYER-SPAWN skipped found=%d spawnOnRun=%d",
+                        found ? 1 : 0, spawnOnRun ? 1 : 0);
+            return false;
+        }
+        const ecs::Entity e =
+            spawnPlayerAtGameStart(scene, assets, feet, yaw, mode, startEntity);
+        VK_LOG_INFO("EDIT-PLAYER-SPAWN source=spawn mode=%s at=(%.2f,%.2f,%.2f) "
+                    "yaw=%.3f ok=%d",
+                    mode == ecs::PlayerMode::FirstPerson ? "first" : "third",
+                    static_cast<double>(feet.x), static_cast<double>(feet.y),
+                    static_cast<double>(feet.z), static_cast<double>(yaw),
+                    e.valid() ? 1 : 0);
+        return e.valid();
+    }
+
+    // 老场景：把已有玩家归位（一个字节的行为都不改，只是少了"没出生点就
+    // 留在原处"这个分支的日志噪音）。
     if (!found) return false;
 
     if (auto* tc = w.get<ecs::TransformComponent>(player)) {
@@ -78,7 +110,7 @@ bool placePlayerAtGameStart(scene::Scene& scene) {
         pc->velocityZ = 0.0f;
         pc->onGround = true;
     }
-    VK_LOG_INFO("EDIT-PLAYER-SPAWN at GameStart pos=(%.2f,%.2f,%.2f) yaw=%.3f",
+    VK_LOG_INFO("EDIT-PLAYER-SPAWN source=seat pos=(%.2f,%.2f,%.2f) yaw=%.3f",
                 static_cast<double>(feet.x), static_cast<double>(feet.y),
                 static_cast<double>(feet.z), static_cast<double>(yaw));
     return true;
@@ -94,6 +126,27 @@ EditorContext::EditorContext(assets::AssetManager& assets) : m_assets(assets) {
     if (const char* s = std::getenv("MYVK_GRID")) {
         if (s[0] == '0' || s[0] == 'f' || s[0] == 'F') m_showGrid = false;
     }
+}
+
+// ---------------------------------------------------------------- 材质仓库
+
+assets::MaterialLibrary& EditorContext::materialLibrary() {
+    // 惰性加载：第一次被问到才读盘。失败也记成"试过了"，
+    // 否则每帧都会重试一次 IO —— 空仓库时那就是每帧一次失败的 fopen。
+    if (!m_materialLibraryTried) {
+        m_materialLibraryTried = true;
+        m_materialLibrary.load();
+    }
+    return m_materialLibrary;
+}
+
+void EditorContext::reloadMaterialLibrary() {
+    m_materialLibraryTried = true;
+    m_materialLibrary.reload();
+    ++m_materialLibraryRevision;     // 缩略图缓存据此失效
+    // 笔刷面板上"当前层用的是哪个材质"的快照也要跟着失效 ——
+    // 材质被改名/删掉时，界面上不该继续显示一个已不存在的名字。
+    notify(TR("Material library reloaded"));
 }
 
 // ---------------------------------------------------------------- 最近打开
@@ -229,7 +282,7 @@ void EditorContext::play() {
     // ---- 出生点（P5）：玩家以 GameStart 为准，不是编辑态摆的位置 ----
     // 放在相机设置之前：玩家的位置决定相机的注视点，反过来的话第一帧会
     // 从旧位置"飞"到出生点。
-    placePlayerAtGameStart(m_runtimeScene);
+    preparePlayerAtGameStart(m_runtimeScene, m_assets);
 
     // 相机状态随快照一起复制过来，所以按下 Play 的瞬间画面与编辑画面连续。
     // 切成自由飞行：游戏视角是第一人称式的（转自己），不是绕着目标点打转。

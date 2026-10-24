@@ -136,7 +136,21 @@ run("editor/InspectorPanel.cpp → 面板块全家族", OLD,
           # （`INS-SCRIPT-STATE` / `INS-SCRIPT-RESET`）就长在这个文件的
           # `drawScript()` 里 —— 脚本的"实例状态"那一行是 S5 才加的，
           # 所以这条 fixture 必须跟着长一项。
-          "verify_script_editor"})
+          "verify_script_editor",
+          # 2026-10-24：地形层材质槽多了一个"从材质仓库挑"的下拉
+          # （`drawTerrainSection` 里的 `##terlayer_pick`）。
+          # 改这个文件本来就该重跑材质仓库那条用例 —— 它验的正是
+          # "属性栏里也能绑定对应的材质"。
+          "verify_material_library",
+          # 2026-10-24：GameStart 升级成"出生参数"，Inspector 新增
+          # `drawGameStartSection`（`INS-GAMESTART-HEADER/MODE/SPAWN/ENABLED`）。
+          # 那段是**编辑期唯一**能改视角模式（第一/第三人称）的落点，
+          # 所以 verify_gamestart_edit 的 [1b] 组必须跟着它跑。
+          "verify_gamestart_edit",
+          # 2026-10-24（第六轮）：Layer materials 上方新增"材质包目录 + 档位
+          # + Refresh"两行（`INS-MATSRC-DIR/TIER/REFRESH/STATUS`）。
+          # 这条用例走的就是那几个控件，改 `drawMaterialSourceRow` 必重跑。
+          "verify_material_import"})
 run("assets/shaders/fg_taa.frag → taa", OLD,
     with_change("assets/shaders/fg_taa.frag"), want={"verify_taa"})
 run("删除 decal.frag → 也算变更", OLD,
@@ -232,6 +246,10 @@ run("editor/EditorScene.cpp → 默认角色装配", OLD,
     with_change("editor/EditorScene.cpp"),
     want={"verify_char_locomotion", "verify_character_import",
           "verify_collision_play", "verify_drop_to_floor",
+          # 2026-10-24：`spawnPlayerAtGameStart` 住在这个文件里 —— 编辑器 Play
+          # 时才生成玩家实体（PLAYER-SPAWN 锚点），
+          # verify_editor_play_terrain 的 T1b 就是断它。
+          "verify_editor_play_terrain",
           "verify_i18n_coverage", "verify_model_scale", "verify_player",
           "verify_player_feel"})
 # ⚠ 按键翻译表 `engine/ui/KeyCodes.*` **故意不做夹具**：`engine/ui/**` 在

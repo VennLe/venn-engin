@@ -57,6 +57,9 @@ SIZE = "1600x1000"
 VK_SPACE, VK_ESCAPE = 0x20, 0x1B
 
 RE_DEFAULT = re.compile(r"PLAYER-DEFAULT bound path=(\S+)")
+# 2026-10-24：视口里没有角色，面板把默认角色装进**离屏预览**（不写主场景）。
+RE_PREVIEW_ONLY = re.compile(
+    r"CharacterWindow: preview-only default character '([^']*)'")
 RE_OVERLAY = re.compile(r"preview overlay grid=(\d) capsule=(\d) gizmo=(\d) "
                         r"capsuleR=([\d.]+) capsuleHH=([\d.]+)")
 RE_PICK = re.compile(r"CHAR-PREVIEW-PICK target=(\w+)")
@@ -281,9 +284,13 @@ def main():
                                  "VP-ADD-ThirdPerson", "Third-Person Player")
         if not check("P0a 菜单创建第三人称角色", ok):
             return 4
-        m_def, off = wait_regex_after(tap, RE_DEFAULT, 0, 14.0)
-        check("P0b 创建即装配默认角色", m_def is not None,
-              m_def.group(0) if m_def else "没有 PLAYER-DEFAULT bound")
+        # 2026-10-24：添加人称角色 = 只配置出生点，视口里不装配角色。
+        # 面板改成 preview-only 预览默认角色（只进离屏预览场景）。
+        # 断言口径不变：面板里那具身体必须就是运行时会被生成的那一份。
+        m_def, off = wait_regex_after(tap, RE_PREVIEW_ONLY, 0, 14.0)
+        check("P0b 面板 preview-only 加载默认角色（不往视口塞角色）",
+              m_def is not None,
+              m_def.group(0)[:120] if m_def else "没有 preview-only 行")
 
         # ---- P1 预览视口矩形 ----
         preview = wait_rect_visible(tap, "CHAR-PREVIEW", 14.0)

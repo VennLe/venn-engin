@@ -64,9 +64,15 @@ SPHERE_SEGS, SPHERE_RINGS = 48, 24
 
 BUILD_RE = re.compile(
     r"LOD-BUILD '([^']*)' kind=(\d+) levels=(\d+) tris=([0-9/]+)")
+SKIP_SKIN_RE = re.compile(r"LOD-SKIP-SKIN '([^']*)'")
 STATS_RE = re.compile(
     r"LOD-STATS ents=(\d+) l0=(\d+) l1=(\d+) l2=(\d+) l3=(\d+) "
     r"tris=(\d+) noLod=(\d+) switches=(\d+) forced=(-?\d+) bias=([\d.]+)")
+
+# 最近一次 run_once 的 LogTap —— 第 8 组要扫"某条日志出现过没有"，
+# 而 `last_build` 只回最后一条匹配。用模块级变量而不是改返回值：
+# run_once 返回的 5 元组在脚本里被解包了 8 处。
+_LAST_TAP = None
 
 
 def make_material():
@@ -206,6 +212,8 @@ def run_once(exe, scene, extra_env, shot_path=None, wait=12.0, cam=CAM):
                             bufsize=1)
     tap = LogTap()
     tap.start(proc)
+    global _LAST_TAP
+    _LAST_TAP = tap
     hwnd = None
     try:
         hwnd = find_window("Venn Editor")
@@ -449,13 +457,20 @@ def main():
               st8 and st8["ents"] == 1, st8 and st8["ents"])
     check("零 Vulkan 验证层报错", not errs8, errs8[:3])
 
-    # ============ 第 8 组：蒙皮网格也要被简化（W2-3）============
-    # ⚠ 2026-10-19 之前这里断言的是"停在 1 级"：`decimateClustered` 只合并
-    #   位置/法线/UV，会把 joints/weights 丢掉，减出来的网格顶点被吸到原点。
-    #   W2-3 让减面**按主影响 joint 分组**之后，蒙皮网格也能安全减面了，
-    #   于是这条断言整个反过来。纯数据部分（不跨骨合并 / 权重归一化）在
-    #   `Game.exe --selftest lod` 里，这里验的是"接上去以后还活着"。
-    print("\n== 第 8 组：蒙皮网格（anime_girl.glb）也生成 LOD（W2-3）==")
+    # ============ 第 8 组：蒙皮网格**不做**自动 LOD ============
+    # ⚠ 这条断言在 2026-10-24 反过来了两次：
+    #   ① 2026-10-19 之前：蒙皮网格停在 1 级（减面会丢 joints/weights）。
+    #   ② W2-3 之后：按主 joint 分组，蒙皮也能减面 → 断言"≥ 2 级"。
+    #   ③ 现在（事故修复）：**又回到 1 级**，但理由完全不是 ①。
+    #      真正的原因是顶点聚类对骨骼网格有两个致命副作用：
+    #        · 选层按**每个子网格自己的**包围球算屏幕占高比 —— 脸只有
+    #          19 cm，第三人称 4 m 外比值 ≈ 0.06，直接掉到第 3 级；
+    #        · UV 会被平均 —— 脸/眼/眉是同一张图集上切开的小岛，平均后
+    #          采样落在图集空白处。实测症状：**脸是一块白板、腿消失、
+    #          鞋子悬空**（近距离一切正常，因为那时是第 0 级）。
+    #      也就是说"能不能减"（W2-3 解决的）和"该不该减"是两件事。
+    #      与 UE5 对齐：骨骼网格体 LOD 走专门管线，不是自动减面能凑的。
+    print("\n== 第 8 组：蒙皮网格不生成自动 LOD（2026-10-24 事故修复）==")
     girl = os.path.abspath(os.path.join(
         ROOT, "assets", "models", "anime_girl.glb"))
     if not os.path.exists(girl):
@@ -467,21 +482,130 @@ def main():
             "subMeshIndex": 0, "name": "lod_skinned"})
         b9, s9, _, _, errs9 = run_once(exe, skin_scene, {}, cam=cam3)
         print("  LOD-BUILD:", b9.group(0) if b9 else None)
-        check("蒙皮网格生成了 >= 2 级（W2-3 之前是 1 级）",
-              b9 is not None and int(b9.group(3)) >= 2,
+        skipped = None
+        if _LAST_TAP is not None:
+            with _LAST_TAP.lock:
+                for line in _LAST_TAP.lines:
+                    m = SKIP_SKIN_RE.search(line)
+                    if m:
+                        skipped = m
+        print("  LOD-SKIP-SKIN:", skipped.group(1) if skipped else None)
+        check("蒙皮网格打了 LOD-SKIP-SKIN 锚点", skipped is not None,
+              skipped.group(1) if skipped else "没有这行日志")
+        check("蒙皮网格的链停在 1 级（不减面）",
+              b9 is not None and int(b9.group(3)) == 1,
               b9.group(0) if b9 else None)
-        # 三角形必须真的递减：只有 1 级 == 没简化；级数够但三角形不变也一样
-        if b9 is not None:
-            tris9 = [int(t) for t in b9.group(4).split("/")]
-            check("各级三角形严格递减",
-                  all(tris9[i + 1] < tris9[i] for i in range(len(tris9) - 1)),
-                  str(tris9))
-            check("末级至少比原网格少 2 倍",
-                  tris9[-1] * 2 <= tris9[0], "%d vs %d" % (tris9[-1], tris9[0]))
         st9 = parse_stats(s9)
-        check("渲染层接管了它（ents >= 1）",
-              st9 and st9["ents"] >= 1, st9 and st9["ents"])
+        # ⚠ 这里**不能**再断言 `ents >= 1`：`ents` 的定义是"被 LOD 接管的
+        #   实例数"，只有 1 级链的网格永远是 0。真正的判据是"画出来的三角形
+        #   等于第 0 级的三角形" —— 也就是远距离也**没有**换成低模。
+        base9 = int(b9.group(4).split("/")[0]) if b9 is not None else -1
+        check("没有任何实例被 LOD 接管（ents == 0）",
+              st9 and st9["ents"] == 0, st9 and st9["ents"])
+        check("画的三角形 == 原网格（远距离也没换低模）",
+              st9 and st9["tris"] == base9,
+              "%s vs %s" % (st9 and st9["tris"], base9))
         check("零 Vulkan 验证层报错", not errs9, errs9[:3])
+
+    # ============ 第 9 组：角色的**所有**子网格都不被减面（端到端）============
+    # 第 8 组只证明"单个蒙皮网格不建链"。但用户看到的是**整具角色**，
+    # 而 alicia 有 20 个子网格，逐个建链 —— 任何一个漏进去，脸上那块
+    # 19 cm 的面片就会被压成 100 个顶点。所以这里拿真实的 Game.exe 跑一遍
+    # 真实角色，断言：每个子网格都打了 `LOD-SKIP-SKIN` 且都是 1 级。
+    #
+    # 为什么不用编辑器场景：`kind:"fbx" + subMeshIndex` 这条静态子网格
+    # 路径当前不渲染（已知限制，见 docs），不渲染就不会建链，测不到。
+    # 走玩家生成那条路（`instantiateModel`）才是用户真正会看到的那条。
+    print("\n== 第 9 组：真实角色（alicia）的所有子网格都不减面 ==")
+    alicia = os.path.join(ROOT, "assets", "models", "characters",
+                          "alicia.vmesh")
+    game_exe = os.path.join(ROOT, "build", "bin", "Game.exe")
+    if not (os.path.exists(alicia) and os.path.exists(game_exe)):
+        print("  跳过（找不到 alicia.vmesh 或 Game.exe）")
+    else:
+        play_scene = os.path.join(ROOT, "build", "bin", "assets", "scenes",
+                                  "lod_test_play.json")
+        game_json = os.path.join(ROOT, "build", "bin", "assets",
+                                 "lod_test_game.json")
+        with open(play_scene, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": 1, "generator": "verify_lod: 角色 LOD 端到端",
+                "camera": {"target": [0.0, 0.0, 1.2], "yaw": 0.0,
+                           "pitch": 0.3, "distance": 5.0, "fov": 55.0},
+                "light": {"direction": [0.42, 0.72, -0.55],
+                          "color": [1.0, 0.96, 0.9], "intensity": 3.0,
+                          "castsShadow": False, "ambientScale": 1.0},
+                "physics": {"enabled": True, "groundPlane": True},
+                "entities": [
+                    {"name": "Ground",
+                     "transform": {"position": [0.0, 0.0, 0.0],
+                                   "rotation": [0.0, 0.0, 0.0],
+                                   "scale": [1.0, 1.0, 1.0]},
+                     "parent": -1, "visible": True, "castShadow": False,
+                     "locked": True,
+                     "mesh": {"kind": "builtin", "shape": "plane",
+                              "size": 40.0, "name": "lod_play_ground"},
+                     "material": {"kind": "color",
+                                  "color": [0.55, 0.58, 0.62, 1.0],
+                                  "roughness": 0.9, "metallic": 0.0,
+                                  "name": "lod_play_ground_mat"}},
+                    {"name": "GameStart",
+                     "transform": {"position": [0.0, 0.0, 0.0],
+                                   "rotation": [0.0, 0.0, 0.0],
+                                   "scale": [1.0, 1.0, 1.0]},
+                     "parent": -1, "visible": True, "castShadow": False,
+                     "gameStart": {"yaw": 0.0, "enabled": True}},
+                ],
+            }, f, ensure_ascii=False, indent=2)
+        with open(game_json, "w", encoding="utf-8") as f:
+            json.dump({
+                "scene": "scenes/lod_test_play.json",
+                "title": "LOD Test", "width": 640, "height": 360,
+                "audio": {"enabled": False}, "quality": "high",
+                "startState": "playing",
+                "player": {"model": "models/characters/alicia.vmesh"},
+            }, f, ensure_ascii=False, indent=2)
+
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MYVK_")}
+        env["MYVK_RUNTIME_GAME_JSON"] = game_json
+        env["MYVK_LOG_RECTS"] = ""
+        proc = subprocess.Popen([game_exe], cwd=os.path.dirname(game_exe),
+                                env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                encoding="utf-8", errors="replace", bufsize=1)
+        tap = LogTap()
+        tap.start(proc)
+        try:
+            end = time.time() + 25
+            while time.time() < end:
+                with tap.lock:
+                    if any("GAME-PLAYER visual=model" in l for l in tap.lines):
+                        break
+                time.sleep(0.4)
+            time.sleep(2.0)          # 让它渲染几帧，把所有子网格的链建出来
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+        builds, skips = [], 0
+        with tap.lock:
+            for line in tap.lines:
+                m = BUILD_RE.search(line)
+                if m and "alicia" in m.group(1):
+                    builds.append(m)
+                if SKIP_SKIN_RE.search(line):
+                    skips += 1
+        print("  子网格 LOD-BUILD 行数:", len(builds), " LOD-SKIP-SKIN:", skips)
+        if builds:
+            print("  示例:", builds[0].group(0))
+        check("角色的每个子网格都被拦下来了（LOD-SKIP-SKIN >= 10 行，"
+              "实测 20 个子网格）", skips >= 10, "skips=%d" % skips)
+        check("没有任何子网格建出多级 LOD",
+              all(int(m.group(3)) == 1 for m in builds),
+              [m.group(0) for m in builds if int(m.group(3)) != 1][:3])
 
     print("\n结果: %s" % ("PASS" if not fails else "FAIL: " + ", ".join(fails)))
     return 0 if not fails else 1

@@ -110,8 +110,13 @@ struct RuntimeConfig {
         // 模型的"正面"补偿角（度，绕 Z）。见 `scene::ModelInstanceOptions::
         // yawOffsetDeg` 的完整说明。
         //
-        // 默认 **90**：本工程的主角是 Mixamo / FBX 来源（Y-up，正面朝 +Z），
-        // 经 ufbx 的 (x,-z,y) 映射后落在 **-Y**，而实体的 yaw 语义是
+        // ⚠ 2026-10-24 起这只是**兜底值**：装配时先问骨架
+        //   （`assets::modelForwardYawDeg`，由"脚踝→脚趾"反解），
+        //   问不出来才用这里声明的数。原因见 assets/ModelOrientation.h
+        //   —— 同一个 90 对 FBX 资产是对的、对 VRM 资产正好差 180°。
+        //
+        // 默认 **90**：Mixamo / FBX 来源（Y-up，正面朝 +Z）经 ufbx 的
+        // (x,-z,y) 映射后正面落在 **-Y**，而实体的 yaw 语义是
         // "yaw=0 → 正面朝 +X"，所以差一个 +90°。
         // 不补偿的症状是**横着平移**（人朝 -Y、往 +X 走），而不是"稍微歪"。
         // 换成已经烤成 +X 正面的资产时，把它写 0。

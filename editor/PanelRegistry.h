@@ -75,7 +75,8 @@ struct PanelDesc {
 };
 
 // 上限：状态数组的容量。加面板时同步看一眼这个数（超了会 assert 出来）。
-constexpr int kMaxPanels = 24;
+// 2026-10-24：24 → 28（加材质仓库那一条时只剩一格余量，先留出空间）。
+constexpr int kMaxPanels = 28;
 
 // 表本体定义在 EditorApp.cpp（draw 指针要访问 EditorApp 的私有成员，
 // 只能在那里定义）。这里只给只读访问。

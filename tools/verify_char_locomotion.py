@@ -80,6 +80,10 @@ RE_DEFAULT = re.compile(
     r"clips=(\d+) height=([\d.]+) capsule=([\d.]+)/([\d.]+)")
 RE_ADOPT = re.compile(r"CharacterWindow: adopted bound model '([^']*)' "
                       r"\(joints=(\d+) clips=(\d+)\)")
+# 2026-10-24：添加人称角色 = 配置出生点（角色运行时才生成）。
+RE_PSTART = re.compile(r"PLAYER-START (created|reconfigured) mode=(\w+)")
+RE_PREVIEW_ONLY = re.compile(
+    r"CharacterWindow: preview-only default character '([^']*)'")
 RE_KINDBIND = re.compile(r"CHAR-KEYBIND clip=(\S+) key=(\d+)")
 RE_ANIM = re.compile(r"EDIT-ANIM state=(\w+) clip=(\S+)")
 RE_IDLE = re.compile(r"EDIT-ANIM-IDLE retrigger=(\d+) idle=([\d.]+)s")
@@ -367,25 +371,29 @@ def main():
         if not check("C1a 菜单创建第三人称角色", ok):
             return 4
 
-        m, _ = wait_regex_after(tap, RE_DEFAULT, 0, 12.0)
-        check("C1b 创建即装配默认角色（模型+骨骼+动画）", m is not None,
-              m.group(0)[:120] if m else "没有 PLAYER-DEFAULT bound")
-        if m:
-            # 骨架数必须和 C0 一致：路径、蒙皮、clip 数全对但 joints 是另一
-            # 个数 = 加载到的其实不是 C0 体检的那份资产（同名不同版本）。
-            check("C1c 装的是蒙皮模型且 clip 齐（skinned=1 / clips=4 / "
-                  "joints=%d）" % DEFAULT_JOINTS,
-                  m.group(1) in (DEFAULT_CHAR.replace(os.sep, "/"),
-                                 "models/characters/alicia.vmesh")
-                  and m.group(3) == "1" and m.group(5) == "4"
-                  and int(m.group(4)) == DEFAULT_JOINTS,
-                  "path=%s skinned=%s joints=%s clips=%s height=%s" %
-                  (m.group(1), m.group(3), m.group(4), m.group(5), m.group(6)))
+        m_start, _ = wait_regex_after(tap, RE_PSTART, 0, 12.0)
+        m_leak, _ = wait_regex_after(tap, RE_DEFAULT, 0, 0.6)
 
-        # ---- C2 角色窗口认领场上的模型 ----
-        m, _ = wait_regex_after(tap, RE_ADOPT, 0, 12.0)
-        check("C2 角色窗口自动认领场上的模型", m is not None,
-              m.group(0) if m else "没有 adopted bound model")
+        # ---- C1 设置人称角色（2026-10-24 起 = 只配置出生点）----
+        #
+        # 语义变了：Shift+A ▸ Player 不再往视口里放一具角色，只给 GameStart
+        # 写 `mode` / `enabled` / `spawnOnRun`；角色在按下 Play 那一刻才生成。
+        # 所以 C1b 断"配置写了 + 没有装配"，C1c 的"装的是蒙皮模型"必须挪到
+        # Play 之后（见 C5d）。
+        check("C1b 只配置出生点（PLAYER-START），不往视口里塞角色",
+              m_start is not None and m_leak is None,
+              m_start.group(0)[:90] if m_start else "没有 PLAYER-START")
+
+        # ---- C2 角色面板：用默认角色做 preview-only 预览 ----
+        #
+        # 以前这一条断"面板认领了场上那个模型"。现在场上没有模型可认领，
+        # 面板改为自己把**默认角色**装进预览场景（只进预览，不写主场景）。
+        # 断言点因此从 `adopted bound model` 换成 `preview-only` —— 保证的
+        # 是同一件事：面板里看到的那具身体就是运行时会被生成的那一具。
+        m, _ = wait_regex_after(tap, RE_PREVIEW_ONLY, 0, 12.0)
+        check("C2 角色面板 preview-only 预览默认角色（不写主场景）",
+              m is not None,
+              m.group(0)[:120] if m else "没有 preview-only default character")
 
         # ---- C3 角色面板在视口标签栏上 ----
         tabc = wait_rect_visible(tap, "VTAB-character", 8.0)
@@ -451,6 +459,23 @@ def main():
         m_cap, _ = wait_regex_after(tap, RE_EDIT_MOUSE, off_cap, 8.0)
         check("C5b Play 态点视口接管鼠标（两态门控）", m_cap is not None,
               m_cap.group(0) if m_cap else "没有 EDIT-MOUSE captured=1")
+
+        # ---- C5d 角色在 Play 那一刻才装配（新语义的正面判据）----
+        #
+        # 从 C1b 挪过来：模型/骨骼/动画的装配口径（路径、joints、clip 数）
+        # 一个都没放宽，只是发生时机从"点菜单"变成"按 Play"。
+        m, _ = wait_regex_after(tap, RE_DEFAULT, 0, 12.0)
+        check("C5d Play 后装配默认角色（PLAYER-DEFAULT bound）", m is not None,
+              m.group(0)[:120] if m else "没有 PLAYER-DEFAULT bound")
+        if m:
+            check("C5e 装的是蒙皮模型且 clip 齐（skinned=1 / clips=4 / "
+                  "joints=%d）" % DEFAULT_JOINTS,
+                  m.group(1) in (DEFAULT_CHAR.replace(os.sep, "/"),
+                                 "models/characters/alicia.vmesh")
+                  and m.group(3) == "1" and m.group(5) == "4"
+                  and int(m.group(4)) == DEFAULT_JOINTS,
+                  "path=%s skinned=%s joints=%s clips=%s height=%s" %
+                  (m.group(1), m.group(3), m.group(4), m.group(5), m.group(6)))
 
         # ---- C5c 主视口里那个人到底动没动（T-pose 陷阱的正式判据）----
         # `createPlayer` 成功后会**自动打开 Character 预览窗口**。那是一份

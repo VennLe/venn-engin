@@ -37,6 +37,11 @@ int language() { return i18n::language(); }
 
 bool isChinese() { return i18n::isChinese(); }
 
+const char* trBilingual(const std::string& english, const std::string& chinese) {
+    if (i18n::isChinese() && !chinese.empty()) return chinese.c_str();
+    return english.c_str();
+}
+
 const char* tr(const char* english) { return i18n::tr(english); }
 
 const char* trId(const char* english, const char* stableId) {

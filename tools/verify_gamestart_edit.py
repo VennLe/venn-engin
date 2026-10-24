@@ -13,6 +13,8 @@
 断言分三组：
 
   [1] 点视口里的标记 → 选中 + 变换手柄出现（`GZ-ORIGIN` 落在标记附近）
+  [1b] 选中后 Inspector 里有 Player Start 段（视角模式 / 运行即生成 / 启用）
+      —— 2026-10-24 起 GameStart 同时是"出生参数"，这里是唯一编辑落点
   [2] 按小键盘 0 → `drop-to-floor: 'GameStart'` 把原点落到地面
   [3] Hierarchy 双击 → `HIER-FOCUS` + 相机 target 变了
 
@@ -165,6 +167,20 @@ def main():
             # 手柄原点在脚底，标记矩形中心在胸口 —— 只要在同一块区域就行
             check("手柄落在标记上（屏幕距离 < 标记高度）",
                   d < (mark[3] - mark[1]) * 0.9, "d=%.0fpx" % d)
+        # ============ [1b] Inspector 的 "Player Start" 段 ============
+        # 2026-10-24：GameStart 从"一个标记"升级成"出生参数"（视角模式 /
+        # 运行时要不要生成玩家 / 朝向），编辑落点就是 Inspector 里这一段。
+        # 它挂在 `drawMeshAndMaterial` 的末尾 —— 重构时最容易被顺手删掉，
+        # 而删掉之后**编辑期没有任何别的地方**能改视角模式（视口菜单只负责
+        # 建/选中出生点）。所以这段的存在性本身就是断言。
+        print("\n[1b] Inspector 的 Player Start 段")
+        hdr = rect_of(lines, "INS-GAMESTART-HEADER")
+        check("GameStart 选中后出现 Player Start 段", hdr is not None, str(hdr))
+        for tag, label in (("INS-GAMESTART-MODE", "视角模式下拉"),
+                           ("INS-GAMESTART-SPAWN", "运行即生成玩家勾选框"),
+                           ("INS-GAMESTART-ENABLED", "启用勾选框")):
+            check("%s 在段内" % label, rect_of(lines, tag) is not None, tag)
+
         # ============ [2] 小键盘 0 → 落地 ============
         print("\n[2] 按小键盘 0（落地）")
         before = txt.count("drop-to-floor")

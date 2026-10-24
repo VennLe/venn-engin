@@ -1299,11 +1299,18 @@ ecs::WaterComponent waterFromJson(const json& j) {
 }
 
 // ---- 玩家出生点（GameStart，2026-10-21 第八轮）----
-// 只有"朝向 + 开关"两个字段：位置就是实体的 transform（与贴花/探针同一约定）。
+// 位置就是实体的 transform（与贴花/探针同一约定）；这里只存"朝向 + 开关
+// + 玩家生成配置"。
+//
+// 2026-10-24：`mode` 用**字符串**而不是枚举整数 —— 场景文件是给人看的，
+// `"third"` 比 `1` 好读，也不怕以后枚举顺序变。读的时候两种都认（老文件
+// 里没有这个键 → 默认第三人称）。
 json gameStartToJson(const ecs::GameStartComponent& g) {
     json j;
     j["yaw"] = g.yaw;
     j["enabled"] = g.enabled;
+    j["mode"] = g.mode == ecs::PlayerMode::FirstPerson ? "first" : "third";
+    j["spawnOnRun"] = g.spawnOnRun;
     return j;
 }
 
@@ -1312,6 +1319,20 @@ ecs::GameStartComponent gameStartFromJson(const json& j) {
     if (!j.is_object()) return g;
     g.yaw = j.value("yaw", g.yaw);
     g.enabled = j.value("enabled", true);
+    g.spawnOnRun = j.value("spawnOnRun", true);
+    if (j.contains("mode")) {
+        const json& m = j["mode"];
+        if (m.is_string()) {
+            const std::string s = m.get<std::string>();
+            g.mode = (s == "first" || s == "firstPerson" ||
+                      s == "FirstPerson")
+                         ? ecs::PlayerMode::FirstPerson
+                         : ecs::PlayerMode::ThirdPerson;
+        } else if (m.is_number_integer()) {
+            g.mode = m.get<int>() == 0 ? ecs::PlayerMode::FirstPerson
+                                       : ecs::PlayerMode::ThirdPerson;
+        }
+    }
     return g;
 }
 
@@ -2853,6 +2874,22 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
 }
 
 } // namespace
+
+// ============================================================
+// 公开接口：单独加载一份 .vmat
+// ============================================================
+// 只是把"场景里写成一个 vmat 块"这件事从 JSON 里搬到函数参数上 ——
+// 真正的活儿全在 resolveMaterial 的 vmat 分支里（id 去重 / 贴图解析 /
+// 导入默认值）。这样"手动赋材质"与"场景引用材质"走的**一定是同一条路**，
+// 不会出现两套 bug。
+assets::Material* loadMaterialAsset(assets::AssetManager& am,
+                                    const std::string& relPath) {
+    if (relPath.empty()) return nullptr;
+    json jm;
+    jm["kind"] = "vmat";
+    jm["path"] = relPath;
+    return resolveMaterial(am, jm);
+}
 
 // ============================================================
 // 公开接口：文件版

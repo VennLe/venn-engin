@@ -75,13 +75,39 @@ ecs::Entity createDirectionalLight(scene::Scene& scene,
 
 // ---- Player（Shift+A → Player → First-Person / Third-Person）----
 
-// 创建玩家。实体 position = 玩家的"脚"（贴在 groundSpot 上），带
-// PlayerComponent + 胶囊碰撞体（运行态不穿墙；编辑态线框就是占位提示）。
-// 第三人称会在下面挂一套程序化卡通小人（头/身体/四肢，PlayerLimbComponent
-// 标记肢体，运行态 walk 动画按它摆动）。
+// 默认角色资产（相对 assets/ 的路径）。
+//
+// 三个地方要用它，全部必须同源：`bindDefaultCharacter` 装配、运行时的
+// Game.exe（game.json 的 player.model 一般是同一个）、角色面板的
+// "preview-only" 预览（视口里没有角色了，面板得自己找一具身体）。
+// 放在头文件里就是为了不让第三处再抄一遍字符串。
+inline constexpr const char* kDefaultCharacterAsset =
+    "models/characters/alicia.vmesh";
+
+// 添加人称角色 = **配置出生点**，不是往场景里摆一个角色（2026-10-24）。
+//
+// 用户原话："在添加人称角色时不需要直接把角色加入到 3d 视口中，只是在游戏
+// 运行后，把角色初始化到 GameStart 位置即可。"
+//
+// 具体行为：
+//   · 场景里还没有 GameStart → 在当前落点建一个（脚底贴 groundSpot）；
+//   · 已经有了 → **只改视角模式**，位置原样保留（作者的摆位不被悄悄改掉）；
+//   · 两种情况都只写 `GameStartComponent`，不建网格、不装配角色。
+// 返回被配置的 GameStart 实体（调用方通常顺手选中它）。
 ecs::Entity createPlayer(scene::Scene& scene, assets::AssetManager& assets,
                          ecs::PlayerMode mode,
                          const glm::vec3& groundSpot);
+
+// 按出生点生成玩家（编辑器 Play 用；Game.exe 走 runtime 里同口径的一份）。
+// 第三人称会装配默认角色（模型 + 骨骼 + 动画），第一人称只有相机与胶囊。
+// `configFrom` = 出生点实体：上面挂的"角色配置"（目前是 `AnimKeyMapComponent`
+// 的按键映射）会复制到新玩家身上 —— 否则面板里绑的键在 Play 里不响应。
+// 返回新实体；失败返回无效句柄。
+ecs::Entity spawnPlayerAtGameStart(scene::Scene& scene,
+                                   assets::AssetManager& assets,
+                                   const glm::vec3& feet, float yaw,
+                                   ecs::PlayerMode mode,
+                                   ecs::Entity configFrom = ecs::Entity{});
 
 // ------------------------------------------------------------ 模型实例化
 //

@@ -78,6 +78,15 @@ const char* trLabel(const char* englishLabel);
 // 便捷：语言是中文吗（个别地方要分支，比如调字体宽度）
 bool isChinese();
 
+// 双语名词：数据**自带中英两份标签**的场合（材质仓库的条目就是这种）。
+//
+// 为什么不走 `TR()`：`TR()` 的入参必须是字面量（原文要永远可查），而这里
+// 的标签来自 `library.json` / `.vmat` —— 是运行时读进来的字符串，进不了
+// 词典。所以数据自己带一份中文，显示时二选一。
+// 当前是英文、或中文标签为空 → 回退英文（缺译文只会"某处还是英文"，
+// 与本文件开头的纪律一致）。
+const char* trBilingual(const std::string& english, const std::string& chinese);
+
 } // namespace editor
 
 // 调用点的统一入口。用宏而不是函数名，是为了让调用点短到不碍眼。

@@ -14,11 +14,15 @@
 
 #include <backends/imgui_impl_vulkan.h>
 #include <imgui.h>
+#include <nlohmann/json.hpp>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <string>
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -145,6 +149,87 @@ std::string envStr(const char* name) {
     return (v && v[0]) ? std::string(v) : std::string();
 }
 
+// ============================================================
+// 新建向导的"上次目录"（2026-10-24）
+// ============================================================
+// 用户原话："创建新游戏会设置游戏目录时不要每次都是 C 盘的目录，如果之前
+// 有创建过的游戏目录，默认会以之前的目录为准。"
+//
+// 上一版每次启动都把父目录重置成 `%USERPROFILE%/Documents` —— 那在装了
+// 系统盘的机器上就是 `C:/Users/xxx/Documents`，于是每次新建游戏都得从 C 盘
+// 一路点到 D 盘的游戏目录。
+//
+// 现在记在 `newproject.json`（与 recent.json **同一个目录**）里：
+//   · 和 recent.json 同目录是有意的 —— 自动化用 `MYVK_LAUNCHER_RECENT`
+//     重定向列表时，这个文件跟着一起被隔离，不会污染用户真实配置；
+//   · 坏文件 / 目录已被删掉 → 一律当成"没记过"，回退到"文档"，
+//     启动器不该因为一个手改坏的 json 打不开。
+std::string wizardStatePath() {
+    const std::filesystem::path rec(project::recentListPath());
+    return (rec.parent_path() / "newproject.json").generic_string();
+}
+
+std::string loadLastWizardParent() {
+    const std::string path = wizardStatePath();
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(std::filesystem::path(path), ec))
+        return {};
+    try {
+        std::ifstream f(path);
+        if (!f) return {};
+        nlohmann::json j;
+        f >> j;
+        if (!j.is_object() || !j.contains("parent") || !j["parent"].is_string())
+            return {};
+        const std::string p =
+            project::normalizePath(j["parent"].get<std::string>());
+        // 目录已经不在了就别用（用户可能删了/换了盘符）—— 让调用方回退。
+        if (p.empty() || !dirExists(p)) {
+            VK_LOG_INFO("LAUNCHER-WIZARD last-parent stale '%s' (ignored)",
+                        p.c_str());
+            return {};
+        }
+        return p;
+    } catch (const std::exception& e) {
+        VK_LOG_WARN("LAUNCHER-WIZARD last-parent unreadable (%s)", e.what());
+        return {};
+    }
+}
+
+void saveLastWizardParent(const std::string& parent) {
+    if (parent.empty()) return;
+    const std::string path = wizardStatePath();
+    std::error_code ec;
+    std::filesystem::create_directories(
+        std::filesystem::path(path).parent_path(), ec);
+    if (ec) {
+        VK_LOG_WARN("LAUNCHER-WIZARD cannot create state dir: %s",
+                    ec.message().c_str());
+        return;
+    }
+    nlohmann::json j;
+    j["parent"] = project::normalizePath(parent);
+    std::ofstream f(path);
+    if (!f) {
+        VK_LOG_WARN("LAUNCHER-WIZARD cannot write %s", path.c_str());
+        return;
+    }
+    f << j.dump(2) << "\n";
+    VK_LOG_INFO("LAUNCHER-WIZARD last-parent saved=%s", parent.c_str());
+}
+
+// 兜底链里"最近工程所在目录"那一档：recents 里第一条还在盘上的工程，
+// 取它的父目录。`newproject.json` 不存在时（老用户第一次升级）靠它接上。
+std::string lastRecentParent(const project::RecentList& rec) {
+    for (const auto& it : rec.items()) {
+        if (it.path.empty()) continue;
+        const std::string parent =
+            std::filesystem::path(it.path).parent_path().generic_string();
+        if (!parent.empty() && dirExists(parent)) return parent;
+    }
+    return {};
+}
+
 } // namespace
 
 // ============================================================
@@ -190,10 +275,26 @@ void LauncherApp::onInit() {
     if (const std::string n = envStr("MYVK_LAUNCHER_TEST_NAME"); !n.empty())
         m_wizName = n;
     if (m_wizParent.empty()) {
-        // 默认放在"文档"下；拿不到就用当前目录 —— 绝不写 `C:/` 根。
-        const char* home = std::getenv("USERPROFILE");
-        m_wizParent = home && home[0] ? std::string(home) + "/Documents"
-                                      : std::string(".");
+        // 优先"上次用过的目录"（2026-10-24）。三级兜底，全都不命中才落到
+        // "文档"—— 而"文档"这一档也只在拿得到 USERPROFILE 时用，绝不写 `C:/`。
+        m_wizParent = loadLastWizardParent();
+        if (!m_wizParent.empty()) {
+            VK_LOG_INFO("LAUNCHER-WIZARD dir-default=%s source=saved",
+                        m_wizParent.c_str());
+        } else {
+            m_wizParent = lastRecentParent(m_recent);
+            if (!m_wizParent.empty()) {
+                VK_LOG_INFO("LAUNCHER-WIZARD dir-default=%s source=recent",
+                            m_wizParent.c_str());
+            }
+        }
+        if (m_wizParent.empty()) {
+            const char* home = std::getenv("USERPROFILE");
+            m_wizParent = home && home[0] ? std::string(home) + "/Documents"
+                                          : std::string(".");
+            VK_LOG_INFO("LAUNCHER-WIZARD dir-default=%s source=documents",
+                        m_wizParent.c_str());
+        }
     }
     syncWizardRoot();
 
@@ -394,6 +495,11 @@ void LauncherApp::commitWizard() {
 
     if (m_create.ok) {
         m_page = Page::Done;
+        // 记住这次的父目录：下次"新建游戏"直接落在这里（2026-10-24）。
+        // ⚠ 只记**成功**的那一次：建失败时用户选的目录往往还不存在，
+        //   记下来等于下次开局就给他一个无效路径。
+        saveLastWizardParent(
+            std::filesystem::path(m_create.root).parent_path().generic_string());
         // ⚠⚠ 必须**重新读盘**，不能只 `refreshRecents(false)`。
         //   `createFromTemplate` 的第 5 步会自己往 recents 里追加一条
         //   （路线图 §7-M2 的明文要求），而启动器内存里那份是**启动时**读的。

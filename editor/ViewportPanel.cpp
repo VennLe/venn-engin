@@ -1801,10 +1801,27 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
         ImGui::EndMenu();
     }
 
-    // Player：两种相机视角的玩家（WASD + 鼠标，运行态驱动）
+    // Player：两种视角模式（2026-10-24 起只是"配置出生点"）
+    //
+    // 用户原话："GameStart 不仅仅是角色的一个标记，也是游戏运行后角色初始化
+    // 的坐标，在添加人称角色时不需要直接把角色加入到 3d 视口中，只是在游戏
+    // 运行后，把角色初始化到 GameStart 位置即可。"
+    //
+    // 所以这两个菜单项现在**不往视口里放角色**：它们只给 GameStart 写一个
+    // `mode`，角色在按下 Play / 启动游戏那一刻才在出生点上生成。
+    // 菜单项文案沿用旧名（"First-Person Player"），因为用户的动作语义没变 ——
+    // 他要的还是"这个游戏是第一/第三人称"。
     const bool playerOpen = ImGui::BeginMenu(TR("Player"));
     menuRect("VP-ADD-Player", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     if (playerOpen) {
+        // 落点贴地：m_addSpot 的 z 恒为 0（鼠标射线 ∩ 栅格面），有地形时
+        // 要换成地表高度，否则出生点会埋进土里（与"按 0 落地"同一判据）。
+        const float groundZ =
+            m_landscapeEditor
+                ? m_landscapeEditor->heightAtWorld(m_addSpot.x, m_addSpot.y)
+                : 0.0f;
+        const glm::vec3 seat(m_addSpot.x, m_addSpot.y, groundZ);
+
         const bool fp = ImGui::MenuItem(TR("First-Person Player"));
         menuRect("VP-ADD-FirstPerson", ImGui::GetItemRectMin(),
                  ImGui::GetItemRectMax());
@@ -1812,16 +1829,19 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
             ecs::Entity created{};
             addEntity("First-Person Player", [&]() {
                 created = createPlayer(m_ctx.editorScene(), m_ctx.assets(),
-                                       ecs::PlayerMode::FirstPerson, m_addSpot);
+                                       ecs::PlayerMode::FirstPerson, seat);
                 return created;
             });
-            // 创建后打开角色详情窗口（Persona 风格）
+            // 创建后仍然打开角色详情窗口（Persona 风格）—— 但它是
+            // **preview-only**：预览里那具身体只活在面板自己的离屏场景里，
+            // 一个实体都不写主场景（见 CharacterWindow::open 的 2026-10-24 段）。
             if (created.valid()) m_ctx.requestCharacterWindow(created);
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                TR("The camera IS the player.\n"
-                "Run (Play) then: WASD to move, mouse to look around."));
+                TR("Sets the spawn point to first person.\n"
+                   "No body is placed in the viewport — the camera-player\n"
+                   "is created at the GameStart marker when you Run (Play)."));
 
         const bool tp = ImGui::MenuItem(TR("Third-Person Player"));
         menuRect("VP-ADD-ThirdPerson", ImGui::GetItemRectMin(),
@@ -1830,17 +1850,16 @@ void ViewportPanel::drawAddMenu(const glm::vec2& vpPos, const glm::vec2& vpSize,
             ecs::Entity created{};
             addEntity("Third-Person Player", [&]() {
                 created = createPlayer(m_ctx.editorScene(), m_ctx.assets(),
-                                       ecs::PlayerMode::ThirdPerson, m_addSpot);
+                                       ecs::PlayerMode::ThirdPerson, seat);
                 return created;
             });
-            // 创建后打开角色详情窗口（Persona 风格）
             if (created.valid()) m_ctx.requestCharacterWindow(created);
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                TR("A little cartoon character with an orbit camera.\n"
-                "Run (Play) then: WASD moves the character (it turns with "
-                "you), mouse orbits the camera."));
+                TR("Sets the spawn point to third person.\n"
+                   "No body is placed in the viewport — the character is\n"
+                   "spawned on the GameStart marker when you Run (Play)."));
 
         ImGui::EndMenu();
     }
@@ -2096,7 +2115,7 @@ void ViewportPanel::drawObjectMenu(const glm::vec2& vpPos,
 // ---------------------------------------------------------------- 主流程
 
 // ============================================================
-// GameStart 出生点标记：Q 版小人（编辑器叠加层，2026-10-21 第八轮）
+// GameStart 出生点标记：真人比例的小人（编辑器叠加层）
 // ============================================================
 // 为什么画在叠加层、而不是给实体挂一个网格：
 //   · 出生点**不该出现在游戏画面里**（UE5 的 PlayerStart 同理只在编辑器可见）；
@@ -2104,6 +2123,17 @@ void ViewportPanel::drawObjectMenu(const glm::vec2& vpPos,
 //     "场景里不摆放任何物体"）。
 // 比例由"投影 1.75 m 高得到的像素高度"决定 —— 离得远自然变小，和真实物体
 // 一样有透视感，而不是一个恒定大小的图标。
+//
+// 2026-10-24：比例从 Q 版改成**真人 1:1**。用户的原话是"标记任务比例不对
+// 需要和真人一比一还原"。原来那头半径 0.235H（直径 ≈ 身高的 47%）是二头身
+// 卡通比例，站在 1.75 m 的尺子上完全读不出"人有多高"。
+//
+// 现在按经典的人体比例（7.5 头身，1.75 m 身高）铺开，各关键高度占全高的
+// 比例都是解剖学上的常见值，改任何一段都不会牵动别处：
+//     头顶 1.000   下颌 0.865   颈根 0.828   肩 0.820   胸 0.730
+//     腰   0.620   髋   0.530   裆 0.470    膝 0.285   踝 0.045
+//   头高 0.135H（≈23.6 cm）、肩宽 0.21H（≈37 cm）、头宽 0.096H（≈17 cm）
+// 这几条一起决定了"像不像人"：头不能大、肩不能窄、腿必须占到一半。
 namespace {
 
 void gsEllipse(ImDrawList* dl, float cx, float cy, float rx, float ry,
@@ -2114,6 +2144,29 @@ void gsEllipse(ImDrawList* dl, float cx, float cy, float rx, float ry,
         pts[i] = ImVec2(cx + std::cos(a) * rx, cy + std::sin(a) * ry);
     }
     dl->AddConvexPolyFilled(pts, 28, col);
+}
+
+void gsQuad(ImDrawList* dl, const ImVec2& a, const ImVec2& b, const ImVec2& c,
+            const ImVec2& d, ImU32 col) {
+    const ImVec2 pts[4] = {a, b, c, d};
+    dl->AddConvexPolyFilled(pts, 4, col);
+}
+
+// 一段"肢体"：从 p0 到 p1，两端半宽分别是 w0 / w1。
+// 用垂线方向撑出四条边 —— 手臂、大腿这类锥形段一次就画完，
+// 不用为每个部件写一堆坐标。
+void gsLimb(ImDrawList* dl, const ImVec2& p0, const ImVec2& p1, float w0,
+            float w1, ImU32 col) {
+    ImVec2 d(p1.x - p0.x, p1.y - p0.y);
+    const float len = std::sqrt(d.x * d.x + d.y * d.y);
+    if (len < 0.05f) return;
+    d.x /= len;
+    d.y /= len;
+    const ImVec2 n(-d.y, d.x);
+    gsQuad(dl, ImVec2(p0.x + n.x * w0, p0.y + n.y * w0),
+           ImVec2(p0.x - n.x * w0, p0.y - n.y * w0),
+           ImVec2(p1.x - n.x * w1, p1.y - n.y * w1),
+           ImVec2(p1.x + n.x * w1, p1.y + n.y * w1), col);
 }
 
 void drawGameStartMarker(ImDrawList* dl, const glm::mat4& vp,
@@ -2132,45 +2185,103 @@ void drawGameStartMarker(ImDrawList* dl, const glm::mat4& vp,
     const float cx = f2.x;
     const float bottom = f2.y;
 
-    const ImU32 bodyCol = IM_COL32(86, 152, 255, 235);
-    const ImU32 skinCol = IM_COL32(255, 219, 186, 245);
-    const ImU32 lineCol = IM_COL32(46, 48, 66, 235);
-    const ImU32 eyeCol = IM_COL32(40, 40, 58, 255);
+    const ImU32 shirtCol = IM_COL32(86, 152, 255, 240);
+    const ImU32 pantsCol = IM_COL32(62, 78, 118, 240);
+    const ImU32 skinCol = IM_COL32(255, 219, 186, 250);
+    const ImU32 bootCol = IM_COL32(44, 46, 62, 250);
+    const ImU32 lineCol = IM_COL32(30, 32, 46, 220);
+
+    // 高度比例 → 屏幕 y。t = 0 是脚底，t = 1 是头顶。
+    auto Y = [&](float t) { return bottom - H * t; };
 
     // 地面投影：先把小人"钉"在地上，不然读不出它站在哪
-    gsEllipse(dl, cx, bottom, H * 0.22f, H * 0.065f, IM_COL32(0, 0, 0, 90));
+    gsEllipse(dl, cx, bottom, H * 0.115f, H * 0.035f, IM_COL32(0, 0, 0, 90));
 
-    // 脚
-    dl->AddRectFilled(ImVec2(cx - H * 0.115f, bottom - H * 0.075f),
-                      ImVec2(cx - H * 0.015f, bottom), lineCol, H * 0.02f);
-    dl->AddRectFilled(ImVec2(cx + H * 0.015f, bottom - H * 0.075f),
-                      ImVec2(cx + H * 0.115f, bottom), lineCol, H * 0.02f);
+    // ---------------------------------------------------------- 腿
+    // 髋关节 0.520 → 膝 0.285 → 踝 0.045。两段锥形：大腿粗、小腿收。
+    const float hipX = H * 0.052f;
+    for (int s = -1; s <= 1; s += 2) {
+        const float hx = cx + s * hipX;
+        const float kx = cx + s * (hipX + H * 0.010f);
+        const float ax = cx + s * (hipX + H * 0.002f);
+        gsLimb(dl, ImVec2(hx, Y(0.520f)), ImVec2(kx, Y(0.285f)), H * 0.052f,
+               H * 0.038f, pantsCol);
+        gsLimb(dl, ImVec2(kx, Y(0.285f)), ImVec2(ax, Y(0.045f)), H * 0.036f,
+               H * 0.022f, pantsCol);
+    }
 
-    // 身体：短粗的圆角块（Q 版的关键是"头大身子小"）
-    const float bodyTop = bottom - H * 0.46f;
-    dl->AddRectFilled(ImVec2(cx - H * 0.155f, bodyTop),
-                      ImVec2(cx + H * 0.155f, bottom - H * 0.055f), bodyCol,
-                      H * 0.075f);
-    dl->AddRect(ImVec2(cx - H * 0.155f, bodyTop),
-                ImVec2(cx + H * 0.155f, bottom - H * 0.055f), lineCol,
-                H * 0.075f, 0, 1.6f);
+    // 脚：从踝往下一点到地面，往 yaw 方向稍稍探出（鞋头）
+    const glm::vec3 fwd(std::cos(yawRad), std::sin(yawRad), 0.0f);
+    glm::vec2 fw2(0.0f), fo2(0.0f);
+    float toeDx = 0.0f;
+    if (PickingSystem::worldToScreen(vp, vpPos, vpSize, feet, fw2) &&
+        PickingSystem::worldToScreen(vp, vpPos, vpSize,
+                                     feet + fwd * 0.28f, fo2)) {
+        toeDx = std::clamp((fo2.x - fw2.x) * 0.45f, -H * 0.06f, H * 0.06f);
+    }
+    for (int s = -1; s <= 1; s += 2) {
+        const float fx = cx + s * (hipX + H * 0.002f);
+        dl->AddRectFilled(ImVec2(fx - H * 0.030f + toeDx * 0.5f, Y(0.055f)),
+                          ImVec2(fx + H * 0.030f + toeDx * 0.5f, bottom),
+                          bootCol, H * 0.012f);
+    }
 
-    // 头：比身体还宽，压在肩膀上方一点点
-    const float headR = H * 0.235f;
-    const float headCy = bodyTop - headR * 0.82f;
-    dl->AddCircleFilled(ImVec2(cx, headCy), headR, skinCol, 32);
-    dl->AddCircle(ImVec2(cx, headCy), headR, lineCol, 32, 1.8f);
+    // ---------------------------------------------------------- 手臂（在躯干之后画）
+    // 肩关节 0.805 → 肘 0.625 → 腕 0.430。自然下垂、略微外张。
+    for (int s = -1; s <= 1; s += 2) {
+        const ImVec2 sh(cx + s * H * 0.100f, Y(0.805f));
+        const ImVec2 el(cx + s * H * 0.118f, Y(0.625f));
+        const ImVec2 wr(cx + s * H * 0.128f, Y(0.430f));
+        gsLimb(dl, sh, el, H * 0.026f, H * 0.022f, shirtCol);
+        gsLimb(dl, el, wr, H * 0.021f, H * 0.018f, skinCol);
+        gsEllipse(dl, wr.x + s * H * 0.006f, wr.y + H * 0.020f, H * 0.024f,
+                  H * 0.028f, skinCol);
+    }
 
-    // 眼睛 + 嘴（"简单粗糙"就够，不做五官细节）
-    const float eyeDx = headR * 0.36f;
-    const float eyeR = std::max(headR * 0.15f, 1.0f);
-    dl->AddCircleFilled(ImVec2(cx - eyeDx, headCy - headR * 0.08f), eyeR,
-                        eyeCol, 12);
-    dl->AddCircleFilled(ImVec2(cx + eyeDx, headCy - headR * 0.08f), eyeR,
-                        eyeCol, 12);
-    dl->PathArcTo(ImVec2(cx, headCy + headR * 0.10f), headR * 0.42f, 0.35f,
-                  3.1415926f - 0.35f, 16);
-    dl->PathStroke(lineCol, 0, std::max(headR * 0.09f, 1.0f));
+    // ---------------------------------------------------------- 躯干
+    // 肩 0.820（半宽 0.105）→ 腰 0.620（半宽 0.070）→ 髋 0.530（半宽 0.086）
+    gsQuad(dl, ImVec2(cx - H * 0.105f, Y(0.820f)),
+           ImVec2(cx + H * 0.105f, Y(0.820f)),
+           ImVec2(cx + H * 0.070f, Y(0.620f)),
+           ImVec2(cx - H * 0.070f, Y(0.620f)), shirtCol);
+    gsQuad(dl, ImVec2(cx - H * 0.070f, Y(0.620f)),
+           ImVec2(cx + H * 0.070f, Y(0.620f)),
+           ImVec2(cx + H * 0.086f, Y(0.530f)),
+           ImVec2(cx - H * 0.086f, Y(0.530f)), shirtCol);
+    // 肩线：一条横线让"肩是平的"读得出来（真人肩比躯干宽一截）
+    dl->AddLine(ImVec2(cx - H * 0.105f, Y(0.818f)),
+                ImVec2(cx + H * 0.105f, Y(0.818f)), lineCol,
+                std::max(H * 0.008f, 1.0f));
+
+    // ---------------------------------------------------------- 脖子 + 头
+    const float neckHalf = H * 0.026f;
+    dl->AddRectFilled(ImVec2(cx - neckHalf, Y(0.870f)),
+                      ImVec2(cx + neckHalf, Y(0.815f)), skinCol);
+
+    // 头：椭圆而不是正圆 —— 真人头是"高比宽大"。半宽 0.048H、半高 0.0675H，
+    // 合起来头高 0.135H ≈ 1.75 m / 7.4，正好是 7.5 头身。
+    // 远处（H 小）给一个绝对下限，否则头会缩成看不见的一点，整个人变成一根棍。
+    const float headRx = std::max(H * 0.048f, 2.6f);
+    const float headRy = std::max(H * 0.0675f, 3.4f);
+    const float headCy = Y(0.9325f);
+    gsEllipse(dl, cx, headCy, headRx, headRy, skinCol);
+    dl->AddEllipse(ImVec2(cx, headCy), ImVec2(headRx, headRy), lineCol, 0.0f,
+                   28, std::max(H * 0.006f, 1.0f));
+
+    // 五官：只在"头够大"时才画。小于 5 px 半径时两粒眼珠会把脸糊成一团，
+    // 不如留白 —— 剪影本身已经足够读出是个人。
+    if (headRx >= 5.0f) {
+        const float eyeDx = headRx * 0.42f;
+        const float eyeR = std::max(headRx * 0.17f, 1.0f);
+        const float eyeY = headCy - headRy * 0.12f;
+        dl->AddCircleFilled(ImVec2(cx - eyeDx, eyeY), eyeR,
+                            IM_COL32(40, 40, 58, 255), 10);
+        dl->AddCircleFilled(ImVec2(cx + eyeDx, eyeY), eyeR,
+                            IM_COL32(40, 40, 58, 255), 10);
+        dl->PathArcTo(ImVec2(cx, headCy + headRy * 0.30f), headRy * 0.26f, 0.5f,
+                      3.1415926f - 0.5f, 12);
+        dl->PathStroke(lineCol, 0, std::max(headRx * 0.12f, 1.0f));
+    }
 
     // 朝向：脚下一支小箭头（把 yaw 方向投影到屏幕，所以会跟着相机变）
     glm::vec2 a2(0.0f), b2(0.0f);
@@ -2194,9 +2305,11 @@ void drawGameStartMarker(ImDrawList* dl, const glm::mat4& vp,
         }
     }
 
-    // 自动化锚点（整只小人的屏幕矩形）+ 名字标签
-    const ImVec2 tl(cx - H * 0.3f, headCy - headR - H * 0.16f);
-    const ImVec2 br(cx + H * 0.3f, bottom + H * 0.10f);
+    // 自动化锚点（整只小人的屏幕矩形）+ 名字标签。
+    // 宽度取 ±0.22H：真人剪影只有 ±0.13H，但这是一块**点击热区**
+    // （verify_gamestart_edit.py 会点它的中心来选中出生点），留宽一点更好点。
+    const ImVec2 tl(cx - H * 0.22f, Y(1.0f) - H * 0.10f);
+    const ImVec2 br(cx + H * 0.22f, bottom + H * 0.06f);
     logRect("GAMESTART-MARK", tl, br);
     dl->AddText(ImVec2(cx - ImGui::CalcTextSize("GameStart").x * 0.5f,
                        br.y + 2.0f),

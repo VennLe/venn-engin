@@ -17,16 +17,30 @@
         （<= 0.25）。
   B. 形状雕刻（原挖洞，2026-10-21 重做）
      B1 面板里有 8 个工具（LS-TOOL-0..7），Carve 是第 8 个
+         ⚠ 点它之前必须 `reveal()`：锚点报的是**未裁剪**矩形，按钮只要有一
+           点被面板底边裁掉，中心就落在面板下方，点下去砸到底部通栏上（把
+           视口切成 Command Palette），后面 B/C/D 三组会整片假 FAIL。
      B2 选中 Carve 后拖一笔 → LS-STROKE-BEGIN / END
      B3 走的是形状压印（LS-CARVE 日志），地表真的被压下去
      B4 **不再写挖穿遮罩**：holes.r8 要么不存在，要么全 255。
         这是本组最关键的断言 —— 用户明确要求"不能破坏地面拓扑"。
   C. 坡道（Ramp）
      C1 选 Ramp（LS-TOOL-3）后拖一笔 → 高度图 sum 变化
+        ⚠ 拖的距离按视口宽度取（30%），不写死像素：坡道有最小段长 4 m，
+          镜头一近，60 px 就只剩 2 m，"一笔没动"会被误读成功能坏了。
+        （2026-10-24 进入地形模式的取景从 500 m 外全貌改成 18 m 对着角色。）
      C2 变化是**局部**的：绝大部分采样点没动（坡道不是全局平整）
   D. 力度区间
      D1 Shift + 滚轮向上 → LS-BRUSH strength= 日志出现
      D2 最终强度 > 1.0（证明上限已从 1.0 放到 16.0）
+  F. Ctrl+. 回到正常视角（2026-10-24）
+     F0 面板上的 Focus player 按钮也能取景（键盘入口的兜底 —— 中文 Windows
+        上 Ctrl+. 是微软拼音的"中英标点切换"热键，真实按键到不了应用）
+     F1 键真的收到了（LS-FRAME-PLAYER 递增）
+     F2 是"正常高度"那套常量（水平退 18 m / 俯角 0.49 rad）—— 有人把进入
+        模式的取景改回"整片地形全貌"（视距 ~500 m）这条立刻红
+     F3 几何自洽：相机在目标后方 back 米、抬高 back·tan(pitch) 米
+     F4 注视点是出生点；场景没有出生点时才退到地形中心
   E. 日志健康：零 VUID / 零 ERROR
 
 用法：python tools/verify_landscape_ground.py
@@ -34,6 +48,7 @@
 
 import ctypes
 import json
+import math
 import os
 import re
 import struct
@@ -47,6 +62,12 @@ from capture_window import capture_client, find_window  # noqa: E402
 from verify_add_menu import LogTap, click, kill_stale_editors  # noqa: E402
 from verify_asset_drag import client_to_screen  # noqa: E402
 from verify_nav_gizmo import MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP  # noqa: E402
+# reveal()：把面板里的锚点先滚到**完全可见**再返回中心点。锚点报的是 ImGui
+# item 的未裁剪矩形 —— 按钮只要有一点被面板底边裁掉，中心就落在面板外面，
+# 点下去砸到底部通栏上（会把中间视口切成 Command Palette），之后整段视口
+# 操作全部落空。2026-10-24 的 B/C/D 三组 FAIL 就是这么来的。定义在
+# verify_world_tools 里，复用而不是再抄一份。
+from verify_world_tools import reveal  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(ROOT, "..", "_venn_verify")
@@ -64,14 +85,22 @@ BAD_RE = r"VUID-|\[ERROR\]|Validation Error|leaked|SEGV"
 
 MOUSEEVENTF_WHEEL = 0x0800
 VK_SHIFT = 0x10
+VK_CONTROL = 0x11
+VK_OEM_PERIOD = 0xBE   # 主键盘区的 `.`
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
 
 fails = []
+n_pass = 0
 
 
 def check(ok, msg):
+    global n_pass
     print("    %-72s %s" % (msg, "PASS" if ok else "FAIL"))
     if not ok:
         fails.append(msg)
+    else:
+        n_pass += 1
     return ok
 
 
@@ -118,10 +147,6 @@ def rect_of(tap, tag, timeout=6.0):
                     return tuple(float(m.group(i)) for i in range(1, 5))
         time.sleep(0.12)
     return None
-
-
-def center(r):
-    return (r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5
 
 
 def wait_line(tap, needle, timeout=8.0):
@@ -188,6 +213,31 @@ def shift_wheel(hwnd, pos, notches=20):
     time.sleep(0.2)
     user32.keybd_event(VK_SHIFT, 0, 2, 0)
     time.sleep(0.5)
+
+
+def ctrl_period(hwnd):
+    """发一次 Ctrl+.（回到正常视角）。
+
+    ⚠ 不能"全真实事件"，也不能"全 PostMessage"，两头都有坑：
+      · 全真实（keybd_event 按 Ctrl 再按 .）：这台机器上 **Ctrl+. 是微软拼音
+        的"中英标点切换"热键**，IME 在消息循环里就把这一下吃掉了 —— 应用一条
+        日志都收不到（实测：单独按 `.` 好用、Ctrl+Z 好用，唯独 Ctrl+. 石沉
+        大海，而这跟产品代码无关）。
+      · 全 PostMessage：GLFW 的 `getMods()` 用 GetKeyState 读修饰键，投递的
+        Ctrl 在那里**看不见**，于是 `io.KeyCtrl` 永远是 false。
+    所以混合：Ctrl 走真实事件（GetKeyState 看得见），`.` 用 PostMessage 直接
+    投到窗口 proc（绕过 IME）。扫描码 0x34 必须带上 —— GLFW 是**按扫描码**
+    映射键值的，扫描码为 0 会被映射成 GLFW_KEY_UNKNOWN。
+    """
+    focus_window(hwnd)
+    user32.keybd_event(VK_CONTROL, 0, 0, 0)
+    time.sleep(0.12)
+    user32.PostMessageW(hwnd, WM_KEYDOWN, VK_OEM_PERIOD, (0x34 << 16) | 1)
+    time.sleep(0.10)
+    user32.PostMessageW(hwnd, WM_KEYUP, VK_OEM_PERIOD, (0x34 << 16) | 0xC0000001)
+    time.sleep(0.10)
+    user32.keybd_event(VK_CONTROL, 0, 2, 0)
+    time.sleep(0.7)
 
 
 def read_grid():
@@ -316,11 +366,11 @@ def main():
         missing = [i for i in range(8) if not tools[i]]
         check(not missing, "B1 8 个工具按钮齐全（缺: %s）" % (missing or "无"))
 
-        carve_btn = tools.get(7)
+        carve_btn = reveal(hwnd, tap, "LS-TOOL-7")
         if not carve_btn:
-            check(False, "找不到 Carve 工具按钮（LS-TOOL-7）")
+            check(False, "Carve 工具按钮滚不到可见区（LS-TOOL-7）")
         else:
-            click(hwnd, *center(carve_btn))
+            click(hwnd, *carve_btn)
             time.sleep(0.5)
             check(count(tap, "index=7 name=Carve") > 0,
                   "B1b 选中 Carve 工具（index=7 name=Carve）")
@@ -359,16 +409,25 @@ def main():
 
         # ================================================== C 坡道
         print("\n[C] 坡道笔刷")
-        ramp_btn = tools.get(3)
+        ramp_btn = reveal(hwnd, tap, "LS-TOOL-3")
         before_ramp = read_grid()
         if not ramp_btn:
-            check(False, "找不到 Ramp 工具按钮（LS-TOOL-3）")
+            check(False, "Ramp 工具按钮滚不到可见区（LS-TOOL-3）")
         else:
-            click(hwnd, *center(ramp_btn))
+            click(hwnd, *ramp_btn)
             time.sleep(0.5)
             check(count(tap, "index=3 name=Ramp") > 0,
                   "C0 选中 Ramp 工具（index=3 name=Ramp）")
-            drag(hwnd, (bx + 10.0, by + 6.0), (bx + 70.0, by + 6.0), steps=20)
+            # 拖多远：按视口宽度的 30% 取，**不写死像素**。
+            # ⚠ `applyRampStroke` 有一条最小段长：`segLen < mpp*2`（= 4 m）
+            #   直接 return（不然没拖动就把一整片压到起点高度）。而同样的
+            #   60 px 在不同取景下差几十倍：2026-10-24 把进入地形模式的取景
+            #   从"500 m 外看全貌"改成"18 m 外对着角色"之后，60 px 只剩 ~2 m
+            #   —— 一笔下去一个点都没变，症状看着像"坡道笔刷坏了"。
+            #   按视口比例取，取景再变也不会假 FAIL。
+            span = (vp[2] - vp[0]) * 0.30
+            drag(hwnd, (bx + 10.0, by + 6.0),
+                 (bx + 10.0 + span, by + 6.0), steps=24)
             time.sleep(1.0)
             after_ramp = read_grid()
             if before_ramp and after_ramp:
@@ -395,6 +454,16 @@ def main():
         shift_wheel(hwnd, (bx, by), notches=22)
         time.sleep(0.6)
         after_n = count(tap, "LS-BRUSH strength=")
+        if after_n == before_n:
+            # 偶发（实测约 1/5）：Shift 的真实按键没进前台队列的那一瞬间，
+            # 滚轮就被当成"调半径"了（日志里会出现 LS-BRUSH radius=）。这不是
+            # 产品问题，但断言不该被一次失手的注入判死 —— 重试一次，并把
+            # radius 条数打出来，下次真出问题能一眼分清是哪种。
+            print("      · 第一次 Shift+滚轮没生效（radius 日志 %d 条），重试"
+                  % count(tap, "LS-BRUSH radius="))
+            shift_wheel(hwnd, (bx, by), notches=22)
+            time.sleep(0.6)
+            after_n = count(tap, "LS-BRUSH strength=")
         check(after_n > before_n, "D1 Shift+滚轮 产生了 strength 日志（%d 条）"
               % (after_n - before_n))
         cur = last_float(tap, "LS-BRUSH strength=", "strength")
@@ -402,6 +471,96 @@ def main():
               "D2 强度可以超过 1.0（现在 %.2f，旧上限是 1.00）" % (cur or -1))
         check(cur is not None and cur <= 16.0 + 1.0e-4,
               "D3 强度不越界（<= 16.00，现在 %.2f）" % (cur or -1))
+
+        # ================================================== F Ctrl+. 正常视角
+        #
+        # 用户原话："在点击 Landscape 进入地形模式时会把视野拉得非常远，此时
+        # 如果按住 Ctrl+. 再次把视野调整到正常的高度和视角，并且对着角色的
+        # 位置。"
+        #
+        # 断言分三层，一层比一层具体：
+        #   F1 键真的收到了（锚点递增）
+        #   F2 是"正常高度"那套常量（水平退 18 m / 俯角 0.49 rad）——
+        #      有人把进入模式的取景改回 focusCamera()（整片 512 m 装进画面，
+        #      视距 ~500 m）这条立刻红
+        #   F3 几何自洽：相机在目标的**后方 back 米、抬高 back·tan(pitch) 米**
+        #      （只改常量不改公式、或者公式里少乘 cos/tan，都会被抓到）
+        #   F4 注视点 = 出生点；场景没有出生点时才退到地形中心（不许是别的）
+        print("\n[F] Ctrl+. 把视野拉回角色位置")
+        # F0 先验按钮入口：`Ctrl+.` 在中文 Windows 上会被微软拼音的"中英标点
+        # 切换"吃掉（真实按键到不了应用），所以面板上必须有一条不经过键盘的
+        # 路；两条入口走的是同一个 focusCameraAtPlayer()。
+        fps = rect_of(tap, "LS-FOCUS-PLAYER", 2.0)
+        if not fps:
+            check(False, "F0 面板上没有 Focus player 按钮（LS-FOCUS-PLAYER）")
+        else:
+            n_btn = count(tap, "LS-FRAME-PLAYER")
+            click(hwnd, (fps[0] + fps[2]) * 0.5, (fps[1] + fps[3]) * 0.5)
+            time.sleep(0.6)
+            check(count(tap, "LS-FRAME-PLAYER") > n_btn,
+                  "F0 面板 Focus player 按钮也能取景（不依赖键盘）")
+        n_frame = count(tap, "LS-FRAME-PLAYER")
+        ctrl_period(hwnd)
+        check(count(tap, "LS-FRAME-PLAYER") > n_frame,
+              "F1 Ctrl+. 触发一次取景（LS-FRAME-PLAYER 递增）")
+        frame_lines = lines_with(tap, "LS-FRAME-PLAYER")
+        line = frame_lines[-1] if frame_lines else ""
+
+        def fld(name):
+            m2 = re.search(re.escape(name) + r"=(-?[\d.]+)", line)
+            return float(m2.group(1)) if m2 else None
+
+        def vec3(name):
+            m2 = re.search(re.escape(name) +
+                           r"=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)", line)
+            return tuple(float(m2.group(i)) for i in (1, 2, 3)) if m2 else None
+
+        back, pitch = fld("back"), fld("pitch")
+        check(back is not None and abs(back - 18.0) < 0.5 and
+              pitch is not None and abs(pitch - 0.49) < 0.02,
+              "F2 是正常高度取景（back=%.1f m · pitch=%.2f rad）"
+              % (back if back is not None else -1.0,
+                 pitch if pitch is not None else -1.0))
+
+        tg, ps = vec3("target"), vec3("pos")
+        if tg and ps and back and pitch:
+            horiz = ((ps[0] - tg[0]) ** 2 + (ps[1] - tg[1]) ** 2) ** 0.5
+            rise = ps[2] - tg[2]
+            check(abs(horiz - back) < 0.3 and
+                  abs(rise - back * math.tan(pitch)) < 0.3,
+                  "F3 相机在目标后 %.1f m / 抬高 %.1f m（几何自洽）"
+                  % (horiz, rise))
+        else:
+            check(False, "F3 日志里缺 target/pos/back/pitch")
+
+        # 注视点：场景里的出生点优先，没有才退到地形中心。两者都要**证明**
+        # 是哪一个，避免"退化了还在报 PASS"。
+        srcm = re.search(r"source=(\S+)", line)
+        src = srcm.group(1) if srcm else "?"
+        gs = None
+        scene_json = os.path.join(ASSETS, "scenes", "scene.json")
+        if os.path.exists(scene_json):
+            try:
+                with open(scene_json, "r", encoding="utf-8") as f:
+                    doc = json.load(f)
+                for ent in doc.get("entities", []):
+                    gg = ent.get("gameStart")
+                    if gg and gg.get("enabled", True):
+                        gs = ent["transform"]["position"]
+                        break
+            except Exception:                   # noqa: BLE001
+                gs = None
+        if src == "gamestart" and gs and tg:
+            d = ((tg[0] - gs[0]) ** 2 + (tg[1] - gs[1]) ** 2 +
+                 (tg[2] - gs[2]) ** 2) ** 0.5
+            check(d < 1.0, "F4 对着出生点（source=gamestart，偏差 %.2f m）" % d)
+        elif src == "terrain-center" and tg:
+            check(abs(tg[0]) < 1.0 and abs(tg[1]) < 1.0,
+                  "F4 场景无出生点 → 对着地形中心（target=(%.1f,%.1f,%.1f)）"
+                  % tg)
+        else:
+            check(False, "F4 注视点说不清（source=%s target=%s）" % (src, tg))
+        shoot(hwnd, "landscape_ctrl_period.png")
 
         # ================================================== E 日志健康
         print("\n[E] 日志健康")
@@ -419,7 +578,14 @@ def main():
         except Exception:                       # noqa: BLE001
             proc.kill()
 
-    print("\n==== %s ====" % ("ALL PASS" if not fails else "FAILED %d" % len(fails)))
+    # 结果行必须长成 `tools/run_regression.py` 认的样子（OK_RE / BAD_RE）：
+    # 「全部断言 PASS」和「断言 N 项 FAIL」。原来这里打的是英文 `ALL PASS` /
+    # `FAILED N` —— 两套正则都匹配不上，于是这条用例既进不了套件，真跑挂了
+    # 也会被判成"无结论"。2026-10-24 修掉。
+    if not fails:
+        print("\n==== 全部断言 PASS（%d 条）====" % n_pass)
+    else:
+        print("\n==== 断言 %d 项 FAIL（过 %d 条）====" % (len(fails), n_pass))
     for f in fails:
         print("  -", f)
     return 0 if not fails else 1

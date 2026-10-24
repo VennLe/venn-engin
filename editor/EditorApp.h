@@ -84,6 +84,7 @@ class CharacterWindow;
 class PhysicsPanel;
 class ParticlesPanel;
 class QualitySettingsPanel;   // E26
+class MaterialLibraryPanel;   // 2026-10-24：材质仓库
 class LandscapeEditor;        // 2026-10-20：地形编辑模式
 class FoliageEditor;          // 2026-10-20：植被编辑模式
 // 2026-10-20 晚：下拉里其余 6 个模式（ToolkitEditors.h / .cpp）
@@ -198,6 +199,7 @@ private:
     static void panelDrawAnimation(EditorApp& a);
     static void panelDrawPCG(EditorApp& a);
     static void panelDrawWater(EditorApp& a);
+    static void panelDrawMaterialLibrary(EditorApp& a);
 
     // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
     void drawPanels();
@@ -254,6 +256,9 @@ private:
     float editorGroundHeight(float x, float y, float radius = 0.35f) const;
     // 玩家状态探针的分帧计数（PLAYER-STATE 每 30 帧一条，防刷屏）
     int m_playerLogTick = 0;
+    // Play 态第三人称的平滑臂长（缩短立刻、伸长限速）。跨帧状态，
+    // 所以要挂成员而不是局部变量 —— 见 runPlayers 的相机段。
+    float m_playArmLen = 0.0f;
     // 每帧在**运行态副本**上做碰撞求解（只在 Run 态、脚本之后调用）：
     //   1) 带碰撞体的实体两两分离 —— "不能互相穿过"
     //   2) 相机当成一个球推出碰撞体 —— "相机视角也不允许穿过"
@@ -462,6 +467,9 @@ private:
     std::unique_ptr<PhysicsPanel> m_physicsPanel;
     std::unique_ptr<ParticlesPanel> m_particlesPanel;
     std::unique_ptr<QualitySettingsPanel> m_qualityPanel;   // E26
+    // 2026-10-24：材质仓库面板。它要能"把材质设成地形笔刷"，
+    // 所以持有一个 LandscapeEditor 裸指针（在构造之后 attach）。
+    std::unique_ptr<MaterialLibraryPanel> m_materialLib;
     // 2026-10-20：地形 / 植被编辑模式。它们**不是**普通面板：
     //   · 面板只是它们的 UI，真正干活的是视口里的笔刷；
     //   · 显隐跟顶栏的 EditMode 走（见 serviceEditMode）。

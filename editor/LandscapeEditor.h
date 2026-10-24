@@ -99,6 +99,17 @@ public:
                              // 高，160 m 外是一堆像素点 —— 撒完看不见东西，
                              // 用户会以为"没撒上"。
 
+    // 进入地形模式 / Ctrl+. 用的"正常视角"（2026-10-24）。
+    //
+    // 用户原话："在点击 Landscape 进入地形模式时会把视野拉得非常远，此时
+    // 再次把视野调整到正常的高度和视角，并且对着角色的位置。"
+    //
+    // 与 focusCamera() 的区别只有取景范围：那个是"整片 512 m 地形全部装进
+    // 画面"，得退到 ~500 m 外，人眼看上去就是"飘到天上"；这个退 18 m、
+    // 抬 9 m 多一点，正好是一个工作高度 —— 能看清笔刷圆圈，也还能看出
+    // 地形起伏。注视点优先取 GameStart（角色出生位置），没有就取地形中心。
+    void focusCameraAtPlayer();
+
     // 每帧 unconditional 调用：场景里的地形实体变了就重新读资产。
     void sync();
 
@@ -113,6 +124,44 @@ public:
     bool undoStroke();
     bool redoStroke();
     int undoCount() const { return static_cast<int>(m_undo.size()); }
+
+    // ------------------------------------------------------------ 材质仓库联动
+    // 材质面板（MaterialLibraryPanel）"用这个材质刷地形"的落地接口。
+    //
+    // 为什么不直接暴露 Tool 枚举：`Tool` 是笔刷内部的算子清单，面板一旦
+    // 依赖它就等于把"笔刷有哪些工具"变成对外契约，后面加/删工具要改两处。
+    // 这里只开三个动作，语义就是用户真正想干的三件事。
+    //
+    // 把第 layer 层换成 materialId（写 TerrainComponent::layerOverrides，
+    // 并置 dirty 让渲染层重建实例 —— 4 层贴图绑在实例的描述符集里）。
+    // layer 越界 / 没有地形 / 材质不存在 → 返回 false，不改任何东西。
+    bool setLayerMaterial(int layer, const std::string& materialId);
+
+    // 切到"刷层权重"工具，目标层 = layer，并清掉擦除勾选。
+    void beginPaintLayer(int layer);
+
+    // 当前第 layer 层实际生效的材质 id（layerOverrides 优先，其次 .vterrain）
+    std::string layerMaterial(int layer) const;
+
+    // 当前正在刷的层（面板高亮用）
+    int paintLayer() const { return m_layer; }
+    // 当前工具是不是"刷层权重"（面板据此决定要不要画材质下拉）
+    bool isPaintingLayer() const;
+
+    // ------------------------------------------------------------ 出生点贴地
+    // 把场景里所有 GameStart 实体抬到**地形表面**上（脚底贴地）。
+    // 返回被移动的个数。
+    //
+    // 为什么需要它：`generateDefaultHeights()` 在中心区能到 maxHeight 的
+    // 一半以上，而模板场景里的 GameStart 写死在 z=0 —— 出生点连同那个
+    // 1.75 m 的小人标记一起被埋在土里（用户报的"初始位置在地形之下"）。
+    // 写死 z 是治不好的：地形高度取决于笔刷和随机种子，只能在"地形确定
+    // 之后"把出生点重新坐一次。
+    //
+    // 调用点有三处（都在本条链路上）：新建地形之后、首次绑定到某份地形
+    // 资产之后（= 打开一个已有工程）、以及 Inspector 里的手动"贴地"。
+    // 不做每帧自动贴地 —— 那样用户就没法把出生点抬到台阶/桥面上了。
+    int seatGameStartsOnTerrain();
 
 private:
     // 工具：前 5 个是"改高度"的算子，PaintLayer 走权重图，Erode/Noise
@@ -284,6 +333,11 @@ private:
     float m_saveTimer = 0.0f;
     int m_strokeCount = 0;
     glm::vec3 m_lastLocal{0.0f};     // 上一个落点（局部坐标）—— 插值用
+
+    // 笔刷圆环的诊断状态（2026-10-24）：圆环现在会按近平面裁成多条弧段，
+    // 这两项只用于 `LS-RING` 日志节流（段数变了 / 半径跨过 1 m 才打一行）。
+    int m_ringArcsLogged = -1;
+    float m_ringRadiusLogged = -1.0f;
 
     // ---- 撤销栈 ----
     std::deque<StrokeRecord> m_undo;

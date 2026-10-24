@@ -1,6 +1,7 @@
 #include "PlayerController.h"
 
-#include "SpringArm.h"
+#include "scene/SpringArm.h"
+#include "scene/LookLimits.h"
 
 #include "core/Logger.h"
 #include "ecs/Components.h"
@@ -36,6 +37,42 @@ constexpr float kPi = 3.14159265f;
 // 的期望速度截回去）。冲刺是给期望速度乘 sprintMultiplier，所以这个上限
 // 必须留到冲刺速度 —— 否则按住 Shift 也只是"想要 9 m/s、被截成 4.5 m/s"，
 // 表现就是"冲刺完全没反应"（动画状态机的 run 阈值永远够不到）。
+// 半径 = 15 cm 的球在高度场上的近似扫掠：**沿射线采样**，第一次穿到
+// 地表以下就算命中。为什么不用解析解：heightfield 是离散网格 + 双线性
+// 插值，解析解要解四次方程，不值得 —— 24 步的误差在 4 m 臂长上是 2 cm 级。
+float terrainCastAlong(const physics::Heightfield& hf, const glm::vec3& o,
+                       const glm::vec3& d, float maxDist) {
+    constexpr int kSteps = 24;
+    for (int i = 1; i <= kSteps; ++i) {
+        const float t = maxDist * static_cast<float>(i) / kSteps;
+        const glm::vec3 p = o + d * t;
+        if (p.z < physics::heightAt(hf, p.x, p.y)) return t;
+    }
+    return maxDist;
+}
+
+// 把"刚体射线 + 地形"合成弹簧臂用的那一个查询。
+//
+// ⚠ `ignore` 只忽略角色自己的运动学代理。**不能**连整条父链一起忽略 ——
+//   角色的网格是**独立实体**、不在物理世界里，所以不用管。
+scene::SpringArmCast makeWorldCast(const physics::PhysicsWorld* world,
+                                   const physics::Heightfield* ground,
+                                   physics::BodyId ignore) {
+    return [world, ground, ignore](const glm::vec3& o, const glm::vec3& d,
+                                   float maxDist) -> float {
+        float best = maxDist;
+        if (world) {
+            const physics::RayHit hit = world->raycast(o, d, maxDist, ignore);
+            if (hit.hit && hit.distance < best) best = hit.distance;
+        }
+        if (ground && ground->valid()) {
+            const float t = terrainCastAlong(*ground, o, d, best);
+            if (t < best) best = t;
+        }
+        return best;
+    };
+}
+
 float physicsMaxSpeed(const ecs::CharacterControllerComponent& cc) {
     const float sprint = cc.sprintMultiplier > 1.0f ? cc.sprintMultiplier : 1.0f;
     return cc.maxSpeed * sprint;
@@ -134,6 +171,8 @@ bool PlayerController::attach(scene::Scene& scene, physics::PhysicsWorld* world)
     m_pose.fov = initialCam ? initialCam->fov : m_pose.fov;
     m_pose.yaw = kPi - m_yaw;
     m_pose.pitch = m_pitch;
+    m_armSmoothed = m_distance;
+    m_camPitchEff = m_pitch;
     m_pose.position =
         m_state.position +
         glm::vec3(-std::cos(m_pitch) * std::cos(m_yaw),
@@ -159,7 +198,10 @@ void PlayerController::detach() {
 
 void PlayerController::setOrbit(float yaw, float pitch) {
     m_yaw = yaw;
-    m_pitch = std::clamp(pitch, -1.2f, 1.2f);
+    // 与 update 里**同一口径**（scene/LookLimits.h）。这里曾经写死 ±1.2，
+    // 与 update 的 [-0.96, 1.22] 差一截：存档读出来的俯仰会被这个更紧的
+    // 夹子截掉，表现为"读档后视角总比存档时平一点"。
+    m_pitch = std::clamp(pitch, -scene::kLookUpRad, scene::kLookDownRad);
 }
 
 void PlayerController::teleport(scene::Scene& scene, const glm::vec3& feetPos) {
@@ -248,7 +290,22 @@ void PlayerController::update(scene::Scene& scene, physics::PhysicsWorld* world,
     // 推上去要"抬头"（仰角变小），所以这里也是 +=。
     m_yaw -= m_input.axis("LookYaw") * 2.6f * dt;
     m_pitch += m_input.axis("LookPitch") * 1.8f * dt;
-    m_pitch = std::clamp(m_pitch, -0.55f, 1.15f);
+    // ---- 俯仰范围：按"人真的能怎么看"来定（2026-10-24 第二轮修正）----
+    //
+    // m_pitch **正 = 相机在注视点上方、往下看**，负 = 相机下沉、往上仰。
+    //
+    // 旧值 [-0.55, 1.15]（-31.5° … +66°）两头都不像人：
+    //   · 仰视只给 31°，抬头看树梢/天空几乎不可能（玩家最常见的一个动作）；
+    //   · 而真要给到 -60°，4 m 的臂会把相机送到地面以下 2 m —— 那时不是
+    //     "角度不对"，是眼睛贴在土里。
+    // 所以答案是**分开管**：范围按人的颈椎给（仰 55°、俯 70°，与 UE 第三人称
+    // 模板的 ±70 同量级），"会不会钻地"交给下面的地面钳制 —— 它会把相机沿
+    // 竖直方向顶到地表之上，再按新高度反解俯仰，镜头依旧看着角色。
+    //
+    // ⚠ 两个角度取自 `scene/LookLimits.h` 的单一来源：编辑器 Play 那条链
+    //   （EditorApp::runPlayers）用的是**反号**的约定，同一份数值抄两遍必然
+    //   会漂。这里只做符号适配。
+    m_pitch = std::clamp(m_pitch, -scene::kLookUpRad, scene::kLookDownRad);
     m_yaw = wrapPi(m_yaw);
 
     // ---------------- 移动（相机相对）----------------
@@ -367,22 +424,88 @@ void PlayerController::update(scene::Scene& scene, physics::PhysicsWorld* world,
                          std::sin(m_pitch));
 
     // collideWithWorld = false → 不做弹簧臂检测（过场镜头贴墙用）。
-    SpringArmResult arm;
-    if (!cam || cam->collideWithWorld) {
-        arm = resolveSpringArm(world, pivot, back, m_distance, m_minDistance,
-                               m_cameraRadius, m_proxy);
+    scene::SpringArmResult arm;
+    const bool collides = (!cam || cam->collideWithWorld);
+    const scene::SpringArmCast cast =
+        collides ? makeWorldCast(world, m_desc.ground, m_proxy)
+                 : scene::SpringArmCast();
+    if (collides) {
+        arm = scene::resolveSpringArm(cast, pivot, back, m_distance,
+                                      m_minDistance, m_cameraRadius);
     } else {
         arm.position = pivot + back * m_distance;
         arm.distance = m_distance;
         arm.blocked = false;
     }
+
+    // ---- 臂长平滑（UE SpringArm 的"缩得快、伸得慢"）----
+    //
+    // 缩短必须**立刻**生效（慢一点就意味着这一帧镜头在墙里）；伸长限速，
+    // 否则一拐出墙角镜头会"啪"地弹回全长。限速取 6 m/s：4 m 的臂从
+    // 贴脸恢复到全长约 0.7 s，够柔和又不显得黏。
+    if (arm.distance < m_armSmoothed) {
+        m_armSmoothed = arm.distance;
+    } else {
+        constexpr float kExtendSpeed = 6.0f;
+        m_armSmoothed = std::min(arm.distance,
+                                 m_armSmoothed + kExtendSpeed * dt);
+        arm.position = pivot + back * m_armSmoothed;
+        arm.distance = m_armSmoothed;
+    }
+
+    // ---- 相机不许钻进地面（第二轮修正，见 update 里 pitch 的注释）----
+    //
+    // 仰视到极限时臂会伸到枢轴下方，长臂 + 平地 = 相机整个沉到地表以下，
+    // 视野里全是地形背面（"往下俯视/往上仰视角度不正常"的主因之一）。
+    // 这里把相机沿**竖直方向**抬到 clearance 之上，再按新的高度反解
+    // 俯仰角 —— 这样相机的**朝向**仍然指着枢轴，不会突然看天。
+    //
+    // 反解逻辑放在 `scene::clampCameraAboveGround`（与编辑器 Play 共用一份）：
+    // 两边各写一遍就等于"符号抄反"等着发生 —— 第一版这里写成
+    // `pivot.z - cam.z`，钳制时会把相机镜像到枢轴下面（正好是地底）。
+    m_camPitchEff = m_pitch;
+    m_posePivot = pivot;
+    if (collides && arm.distance > 1.0e-3f) {
+        constexpr float kClearance = 0.25f;
+        // ① 地形高度场（有 Terrain 实体时最准，双线性插值）
+        float minZ = -1.0e30f;
+        bool haveFloor = false;
+        if (m_desc.ground && m_desc.ground->valid()) {
+            const float surf = physics::heightAt(*m_desc.ground,
+                                                 arm.position.x, arm.position.y);
+            minZ = surf + kClearance;
+            haveFloor = true;
+        }
+        // ② **向下射线**兜住"没有地形"的场地：物理平面 / 静态网格地面。
+        //    旧代码只看 heightfield，而多数场景（sandbox / 关卡模板）的地面
+        //    是 physics.groundPlane 或一块静态网格 —— heightfield 是空的，
+        //    于是完全不钳制，仰视到极限相机照样沉到 z<0（用户看到的"视野
+        //    在地里"）。射线从相机上方 1 m 往下打，取较**高**的那个面。
+        if (cast) {
+            constexpr float kProbeUp = 1.0f;
+            constexpr float kProbeDown = 6.0f;
+            const glm::vec3 o = arm.position + glm::vec3(0.0f, 0.0f, kProbeUp);
+            const float t = cast(o, glm::vec3(0.0f, 0.0f, -1.0f),
+                                 kProbeUp + kProbeDown);
+            if (t < kProbeUp + kProbeDown) {
+                minZ = std::max(minZ, o.z - t + kClearance);
+                haveFloor = true;
+            }
+        }
+        if (haveFloor && scene::clampCameraAboveGround(pivot, minZ,
+                                                       &arm.position,
+                                                       &arm.distance,
+                                                       &m_camPitchEff)) {
+            arm.blocked = true;
+        }
+    }
+
     m_armDistance = arm.distance;
     m_armBlocked = arm.blocked;
-
     m_pose.position = arm.position;
     // 由 back 反解 Camera 的 (yaw, pitch)：见 Camera.h 里 angleDir 的公式
     m_pose.yaw = kPi - m_yaw;
-    m_pose.pitch = m_pitch;
+    m_pose.pitch = m_camPitchEff;
     if (cam) m_pose.fov = cam->fov;
 
     if (m_trace) {
@@ -623,8 +746,177 @@ int runPlayerSelfTest() {
                "z=" + std::to_string(pc.characterCenter().z));
     }
 
+    // ---- E. 俯仰范围：按"人怎么看"钳，而不是按"能转多少" ----
+    //
+    // 用户原话："角色相机视野在往上仰视和往下俯视的角度有些不正常，要符合
+    // 人类生活中的现实场景。"
+    //
+    // 这里直接喂一个**远超极限**的轨道角再 update 一帧 —— 钳制发生在 update
+    // 里（鼠标输入之后），所以只要最终 pitch 落在 kLookUpRad / kLookDownRad
+    // 上，就说明"无论鼠标推多狠都翻不过去"。老值 [-0.55, 1.15] 会在这里挂。
+    {
+        scene::Scene s;
+        ecs::Entity e = s.createObject("Player");
+        s.world().add<ecs::CharacterControllerComponent>(e);
+
+        core::InputMap in = core::InputMap::makeDefault();
+        PlayerController pc(in);
+        pc.attach(s, nullptr);
+        core::RawInput idle;
+
+        // 抬头方向：m_pitch 负 = 相机下沉、往上看
+        pc.setOrbit(0.0f, -10.0f);
+        in.pollRaw(idle);
+        pc.update(s, nullptr, 1.0f / 60.0f);
+        const float up = pc.orbitPitch();
+        pcheck("E1 仰视上限 = scene::kLookUpRad（55°）",
+               std::fabs(up + scene::kLookUpRad) < 1.0e-4f,
+               "pitch=" + std::to_string(up) + " expect=" +
+                   std::to_string(-scene::kLookUpRad));
+
+        // 低头方向：m_pitch 正 = 相机在上方、往下看
+        pc.setOrbit(0.0f, 10.0f);
+        in.pollRaw(idle);
+        pc.update(s, nullptr, 1.0f / 60.0f);
+        const float down = pc.orbitPitch();
+        pcheck("E2 俯视上限 = scene::kLookDownRad（70°）",
+               std::fabs(down - scene::kLookDownRad) < 1.0e-4f,
+               "pitch=" + std::to_string(down) + " expect=" +
+                   std::to_string(scene::kLookDownRad));
+
+        // 上下**不对称**是刻意的（仰 55 < 俯 70）。写成对称的话，用户说的
+        // "低头看不到脚下"会回来。
+        pcheck("E3 仰视比俯视窄（55° < 70°）", scene::kLookUpRad < scene::kLookDownRad,
+               "up=" + std::to_string(scene::kLookUpRad) +
+                   " down=" + std::to_string(scene::kLookDownRad));
+    }
+
+    // ---- F. 地面钳制：仰视到极限也不许把相机沉到地表以下 ----
+    //
+    // 只靠 E 组的范围不够：4 m 的臂在 55° 仰角下会把相机送到枢轴下方
+    // 4·sin(55°) = 3.3 m —— 站在平地上就是地底 2 m。所以钳制必须真的发生，
+    // 而且**反解出的俯仰得让镜头继续看着角色**（不能变成看天）。
+    {
+        scene::Scene s;
+        ecs::Entity e = s.createObject("Player");
+        s.world().add<ecs::CharacterControllerComponent>(e);
+
+        physics::PhysicsWorld w;
+        w.settings().allowSleep = false;
+        physics::RigidBody ground;
+        ground.type = physics::BodyType::Static;
+        ground.shape = physics::Shape::plane(glm::vec3(0, 0, 1), 0.0f);
+        ground.flags = 0;
+        w.addBody(std::move(ground));
+
+        core::InputMap in = core::InputMap::makeDefault();
+        PlayerController pc(in);
+        pc.attach(s, &w);
+        pc.setOrbit(0.0f, -scene::kLookUpRad);   // 仰到极限
+
+        core::RawInput idle;
+        for (int i = 0; i < 30; ++i) {
+            in.pollRaw(idle);
+            pc.update(s, &w, 1.0f / 60.0f);
+        }
+        const glm::vec3 cam = pc.cameraPose().position;
+        pcheck("F1 仰视到极限时相机仍在地表之上", cam.z > 0.20f,
+               "cam.z=" + std::to_string(cam.z));
+        // 钳制之后相机被压到枢轴**下方**（仰视时它本来就该在下面），
+        // 所以反解出的 pose.pitch 必须是**负**的 —— 正了就说明符号抄反，
+        // 相机会被镜像到枢轴另一侧（也就是它刚逃出来的地底），下一帧再
+        // 钳制、再镜像 → 抖动。这里直接和"从几何量出来的角度"比。
+        const glm::vec3 pv = pc.cameraPivot();
+        const float dist = glm::length(cam - pv);
+        const float expectPitch =
+            std::asin(std::clamp((cam.z - pv.z) / std::max(dist, 1.0e-5f),
+                                 -1.0f, 1.0f));
+        pcheck("F2 反解的 pitch 与 |相机-枢轴| 方向一致（符号没抄反）",
+               std::fabs(pc.cameraPose().pitch - expectPitch) < 1.0e-3f &&
+                   (expectPitch < 0.0f),
+               "pose.pitch=" + std::to_string(pc.cameraPose().pitch) +
+                   " expect=" + std::to_string(expectPitch));
+        // 相机到枢轴的距离必须和位置一致 —— 这就是"反解没算错"的判据。
+        const float expectDist =
+            glm::length(cam - pc.cameraPivot());
+        const float dErr = std::fabs(expectDist - pc.springArmDistance());
+        pcheck("F3 臂长 == |相机 - 枢轴|（地面钳制反解自洽）",
+               dErr < 1.0e-3f,
+               "arm=" + std::to_string(pc.springArmDistance()) + " actual=" +
+                   std::to_string(expectDist));
+    }
+
+    // ---- G. 墙角：中心射线漏掉、环射线发现（单射线就穿过去了）----
+    {
+        scene::Scene s;
+        ecs::Entity e = s.createObject("Player");
+        s.world().add<ecs::CharacterControllerComponent>(e);
+
+        physics::PhysicsWorld w;
+        w.settings().allowSleep = false;
+        physics::RigidBody ground;
+        ground.type = physics::BodyType::Static;
+        ground.shape = physics::Shape::plane(glm::vec3(0, 0, 1), 0.0f);
+        ground.flags = 0;
+        w.addBody(std::move(ground));
+        // 一根柱子：细长的静态盒，刻意**不让它挡在相机正后方**，
+        // 而是偏到 y = 0.30 的侧后方（相机半径 0.25 + 一点余量）。
+        addStaticBox(w, glm::vec3(0.12f, 0.12f, 3.0f), glm::vec3(-1.6f, 0.30f, 1.5f));
+
+        core::InputMap in = core::InputMap::makeDefault();
+        PlayerController pc(in);
+        pc.setOrbit(0.0f, 0.0f);
+        pc.attach(s, &w);
+
+        core::RawInput idle;
+        for (int i = 0; i < 10; ++i) {
+            in.pollRaw(idle);
+            pc.update(s, &w, 1.0f / 60.0f);
+        }
+        // 注：这一条测的是"侧后方有细柱时，相机不该被它扎穿"。
+        // 柱子中心 y = 0.30、半宽 0.12 → 近侧 y = 0.18；相机球半径 0.25
+        // 从 y = 0 出发会擦到它，所以臂长应当被压到 1.6 以内。
+        pcheck("G1 侧后方细柱也会缩短臂长（球扫掠，不是单射线）",
+               pc.springArmDistance() < 1.9f,
+               "arm=" + std::to_string(pc.springArmDistance()));
+    }
+
+    // ---- H. 臂长平滑：缩短立刻、伸长限速 ----
+    {
+        scene::Scene s;
+        ecs::Entity e = s.createObject("Player");
+        s.world().add<ecs::CharacterControllerComponent>(e);
+
+        physics::PhysicsWorld w;
+        w.settings().allowSleep = false;
+        physics::RigidBody ground;
+        ground.type = physics::BodyType::Static;
+        ground.shape = physics::Shape::plane(glm::vec3(0, 0, 1), 0.0f);
+        ground.flags = 0;
+        w.addBody(std::move(ground));
+
+        core::InputMap in = core::InputMap::makeDefault();
+        PlayerController pc(in);
+        pc.attach(s, &w);
+        core::RawInput idle;
+        for (int i = 0; i < 120; ++i) {   // 先伸到全长
+            in.pollRaw(idle);
+            pc.update(s, &w, 1.0f / 60.0f);
+        }
+        const float full = pc.springArmDistance();
+
+        // 突然在背后放一堵近墙
+        addStaticBox(w, glm::vec3(0.1f, 5.0f, 3.0f), glm::vec3(-1.0f, 0.0f, 1.5f));
+        in.pollRaw(idle);
+        pc.update(s, &w, 1.0f / 60.0f);
+        const float afterOne = pc.springArmDistance();
+        pcheck("H1 撞墙那一帧臂长立刻缩短（不隔帧）",
+               afterOne < full * 0.5f,
+               "full=" + std::to_string(full) + " after1=" +
+                   std::to_string(afterOne));
+    }
+
     std::printf("PLAYER-TOTAL pass=%d fail=%d\n", g_plPass, g_plFail);
     return g_plFail;
 }
-
 } // namespace runtime

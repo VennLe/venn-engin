@@ -165,6 +165,14 @@ private:
     void drawReflectionProbeSection(ecs::Entity e);
     // W4-4：地形段（尺寸 / maxHeight / 4 层材质槽 / Height scale；不做笔刷）
     void drawTerrainSection(ecs::Entity e);
+    // 地形层的"材质包目录 + 刷新"（2026-10-24）。放进 drawTerrainSection
+    // 的 Layer materials 上方 —— 用户说材质"一般是指定一个目录里面"，
+    // 那个目录就该和材质槽挨着。
+    // 返回 true = 这一次真的导入了东西（调用方据此让缩略图缓存失效）。
+    bool drawMaterialSourceRow();
+    // 出生点段（2026-10-24）：视角模式 / 要不要生成玩家 / 出生朝向 / 启用。
+    // 只在实体**已经有** GameStartComponent 时出现。
+    void drawGameStartSection(ecs::Entity e);
     // GPU 粒子发射器段落（R6-1）：只在实体**已经有**
     // ParticleEmitterComponent 时出现。曲线编辑用的是"四根滑条 = 四个
     // 控制点"（路线图明确："曲线编辑先用滑条组"）。
@@ -368,6 +376,18 @@ private:
     int m_sectionsDrawn = 0;          // 本帧画出的分区数（搜索"无命中"提示用）
     // INSP-SECTIONS 日志去抖签名
     std::string m_lastSectionSig;
+
+    // ---- 地形层材质：材质包目录导入（2026-10-24）----
+    // 用户原话："那里的地形材质一般是指定一个目录里面，将对应的材质信息
+    // 按照之前 E:\code\cpp\venn-resource 中的材质信息的形式去自动添加，
+    // 这个通过一个刷新按钮去找到最新的材质信息"
+    //
+    // 目录与档位存在 `assets/materials/library.source.json`（loadMaterial
+    // SourceSettings），这里只是 UI 的镜像 —— 首次画这一段时读一次。
+    char m_matSrcDir[512] = "";
+    int m_matSrcTier = 0;             // kMatSrcTiers 的下标
+    bool m_matSrcLoaded = false;      // 是否已经从设置文件读过
+    std::string m_matSrcStatus;       // 上次导入的结果（灰色小字）
 };
 
 } // namespace editor

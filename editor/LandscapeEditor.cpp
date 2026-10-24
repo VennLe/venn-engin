@@ -77,19 +77,48 @@ constexpr int kSizeChoices[3] = {129, 257, 513};
 const char* kSizeLabels[3] = {"129 x 129  (128 m)", "257 x 257  (512 m)",
                               "513 x 513  (1 km)"};
 
-// 新建地形的实体高度。0 = 正好坐在视口栅格面上，这里只抬 2 cm：
-// 模板场景里本来就有一个叫 Ground 的面片也在 z=0，共面会 z-fighting
-// （画面里一条条闪烁的缝）。2 cm 在 512 m 见方的地形上肉眼不可见，
-// 角色站在上面也不会显得陷进地里。
-constexpr float kGroundEpsilon = 0.02f;
+// 新建地形的实体高度。
+//
+// 2026-10-24：0.02 → 0。用户明确要求"初始化地形的地面要尽量保持和栅格地面
+// 是同一个平面，干脆就直接把原栅格地面当作地形地面去操作"。原先那 2 cm
+// 是为了躲模板场景里那块也叫 Ground 的面片（共面 z-fighting）；现在策略变了
+// —— **有地形时栅格本身不再画**（见 Renderer 里 grid 那一段），共面对象只剩
+// 地形自己，2 cm 就没有理由继续留着。留着反而带来两个副作用：
+//   · 角色/箱子按 z=0 算高度时会浮空 2 cm（贴地验收的 ±0.08 余量被吃掉 1/4）；
+//   · 视口里的"栅格平面"与"地形最低点"不是同一个平面，对齐时对不准。
+constexpr float kGroundEpsilon = 0.0f;
 
-// 新建地形默认的 4 个层材质 —— 直接引用工程里已有的 .vmat
-// （assets/materials/terrain_*.vmat）。写死名字是有意的：地形层是
-// "草地/泥土/岩石/雪"这套通用语义，不是每个工程都该自己定一套。
-const char* kLayerIds[4] = {"materials/terrain_grass", "materials/terrain_dirt",
+// 新建地形默认的 4 个层材质。
+//
+// 层 0 = 材质仓库里的 `grass_ground`（用户要求："以后地形地面就默认用
+// grass_ground 来就行了"）。它带 albedo + normal + arm 三张贴图，所以新建
+// 出来的地形一落地就是"有草的土面"，而不是原来那种纯色块。
+// 层 1 给 `concrete_moss` —— 仓库里另一个材质，正好能当"铺装 / 石阶"用。
+// 层 2/3 保留引擎自带的岩石 / 雪，把"陡坡出石、高处积雪"的语义接上
+// （`generateDefaultSplat` 的门限就是按这四个层写的）。
+const char* kLayerIds[4] = {"materials/library/grass_ground",
+                            "materials/library/concrete_moss",
                             "materials/terrain_rock", "materials/terrain_snow"};
 
-const char* kLayerNames[4] = {"Grass", "Dirt", "Rock", "Snow"};
+// 层按钮的兜底显示名。只在材质 id 解析不出名字时用 —— 正常情况下按钮上
+// 显示的是**材质自己的名字**（见 shortMaterialName），因为 layerOverrides
+// 允许用户把任意一层换成任意材质，写死的 "Grass/Dirt/Rock/Snow" 一旦换了
+// 材质就会说错话。
+const char* kLayerNames[4] = {"Grass", "Moss", "Rock", "Snow"};
+
+// "materials/library/grass_ground" → "grass_ground"
+// 层按钮只有 96 px 宽，整条 id 塞不下；取末段既短又能认出是谁。
+std::string shortMaterialName(const std::string& id) {
+    if (id.empty()) return std::string();
+    const std::size_t slash = id.find_last_of('/');
+    std::string base = (slash == std::string::npos) ? id : id.substr(slash + 1);
+    const std::string ext = ".vmat";
+    if (base.size() > ext.size() &&
+        base.compare(base.size() - ext.size(), ext.size(), ext) == 0) {
+        base.resize(base.size() - ext.size());
+    }
+    return base;
+}
 
 // 笔刷权重：t = 0（笔心）→ 1；t = 1（边缘）→ 0。
 // falloff 越大越"软"：0 → 指数 3（中心强、边缘几乎没有），1 → 0.6（一大片
@@ -309,20 +338,22 @@ std::vector<std::uint8_t> generateDefaultSplat(const std::vector<float>& heights
             // 雪：0.55 起、0.68 满（33 m .. 41 m，最高峰 43.7 m）；陡壁挂不住雪
             float wSnow = std::clamp((h - 0.55f) / 0.13f, 0.0f, 1.0f) *
                           (1.0f - wRock);
-            // 泥土：0.36 起、0.46 满，0.50 起淡出、0.56 消失（再往上交给雪），
-            // 并且给岩石和雪让位
-            float wDirt = std::clamp((h - 0.36f) / 0.10f, 0.0f, 1.0f) *
-                          std::clamp((0.56f - h) / 0.06f, 0.0f, 1.0f) *
-                          (1.0f - wRock) * (1.0f - wSnow);
-            float wGrass = std::max(0.0f, 1.0f - wRock - wSnow - wDirt);
+            // 层 1（2026-10-24 起是 `concrete_moss`，原来是 terrain_dirt）：
+            // 0.36 起、0.46 满，0.50 起淡出、0.56 消失（再往上交给雪），
+            // 并且给岩石和雪让位。海拔中段露出来的裸土 / 旧铺装，语义没变，
+            // 只是材质从纯色泥土换成了带纹理的苔藓混凝土。
+            float wMid = std::clamp((h - 0.36f) / 0.10f, 0.0f, 1.0f) *
+                         std::clamp((0.56f - h) / 0.06f, 0.0f, 1.0f) *
+                         (1.0f - wRock) * (1.0f - wSnow);
+            float wGrass = std::max(0.0f, 1.0f - wRock - wSnow - wMid);
 
             // 四个通道加起来恒 = 1（见上面的叠放次序），不需要再归一化；
             // 保险起见仍按 sum 压一次，防浮点误差让 uint8 溢出。
-            const float sum = wGrass + wDirt + wRock + wSnow;
+            const float sum = wGrass + wMid + wRock + wSnow;
             const float k = (sum > 1.0f) ? (1.0f / sum) : 1.0f;
             const std::size_t base = sampleIndex(rows, c, r) * 4u;
             splat[base + 0] = static_cast<std::uint8_t>(wGrass * k * 255.0f);
-            splat[base + 1] = static_cast<std::uint8_t>(wDirt * k * 255.0f);
+            splat[base + 1] = static_cast<std::uint8_t>(wMid * k * 255.0f);
             splat[base + 2] = static_cast<std::uint8_t>(wRock * k * 255.0f);
             splat[base + 3] = static_cast<std::uint8_t>(wSnow * k * 255.0f);
         }
@@ -395,10 +426,12 @@ void LandscapeEditor::sync() {
     clearLiveBinding();
     m_strokeCount = 0;
     // 换了资产 → 旧的撤销记录指向的像素已经不是同一张图了
+    bool justSwitched = false;
     if (switched) {
         m_undo.clear();
         m_redo.clear();
         m_snapshotValid = false;
+        justSwitched = true;
     }
     VK_LOG_INFO("LS-TERRAIN path=%s cols=%d rows=%d mpp=%.2f maxH=%.1f "
                 "heightScale=%.2f",
@@ -406,6 +439,11 @@ void LandscapeEditor::sync() {
                 static_cast<double>(m_asset.desc.metersPerPixel),
                 static_cast<double>(m_asset.desc.maxHeight),
                 static_cast<double>(m_heightScale));
+
+    // 刚换绑到一份地形（= 打开了一个带地形的工程 / 换成另一块地形）：
+    // 把出生点抬到地表。**只在换绑这一刻做**，不做每帧 —— 每帧贴地的话
+    // 用户就没法把出生点摆到台阶、桥面、二楼平台上了。
+    if (justSwitched) seatGameStartsOnTerrain();
 }
 
 glm::mat4 LandscapeEditor::modelMatrix() const {
@@ -518,6 +556,17 @@ bool LandscapeEditor::createTerrain(const std::string& name, int cols,
 
     // ---- .vterrain（手写 JSON：字段与 terrain::parseDesc 一一对应）----
     {
+        // 顺手把材质仓库读进来（惰性加载的第一次触发点之一）：上面那 4 个
+        // 默认层材质 id 全是仓库里的条目，先确认它们在不在。
+        // 不确认的后果是渲染层那边打一条 TERRAIN-LAYER-MISS，然后层层贴图
+        // 静默退回纯色 —— 那时很难看出到底是"仓库没生成"还是"id 写错了"。
+        const assets::MaterialLibrary& lib = m_ctx.materialLibrary();
+        for (int i = 0; i < 4; ++i) {
+            if (lib.size() > 0 && !lib.find(kLayerIds[i])) {
+                VK_LOG_WARN("LS-LAYER-MISS idx=%d id=%s（材质仓库里没有这个 id，"
+                            "这一层会退回纯色）", i, kLayerIds[i]);
+            }
+        }
         std::ofstream f(dir / "terrain.vterrain");
         if (!f) return false;
         f << "{\n"
@@ -567,13 +616,13 @@ bool LandscapeEditor::createTerrain(const std::string& name, int cols,
     });
     if (!created.valid()) return false;
 
-    // 坐在地平面上（只抬 2 cm 躲 z-fighting，见 kGroundEpsilon）。
+    // 坐在栅格平面上（kGroundEpsilon = 0，地形最低点与栅格严格同面）。
     // 山谷高度是 0（见 generateDefaultHeights），所以整片地的**最低点**
     // 正好落在栅格上 —— 这就是"地形建立在原地面基础上"。
     if (auto* tr = sc.world().get<ecs::TransformComponent>(created)) {
         tr->position.z = kGroundEpsilon;
     }
-    VK_LOG_INFO("LS-CREATE-SEAT z=%.2f (ground plane + epsilon)", 
+    VK_LOG_INFO("LS-CREATE-SEAT z=%.2f (same plane as grid)",
                 static_cast<double>(kGroundEpsilon));
 
     m_ctx.select(created);
@@ -581,7 +630,12 @@ bool LandscapeEditor::createTerrain(const std::string& name, int cols,
     m_ctx.dirty() = true;
     m_valid = false;   // 强制 sync 重新绑定
     sync();            // 立刻绑定（本帧面板就会切到笔刷 UI）
-    focusCamera();
+    // 新地形一落地就把出生点抬到地表 —— 否则它继续躺在 z=0，被新地形埋掉。
+    // 顺序要在 sync() 之后：seat 依赖 m_valid / m_asset 已经指向新地形。
+    seatGameStartsOnTerrain();
+    // 取景也走"正常高度"那一档（2026-10-24）：刚建完地形紧接着就是刷地表，
+    // 这时候把镜头甩到 500 m 外看全貌，还得自己飞回来。
+    focusCameraAtPlayer();
     return m_valid;
 }
 
@@ -669,6 +723,63 @@ void LandscapeEditor::focusCamera() {
     // 兜底：极长/极窄的视口下别把相机甩到几公里外（远景会糊成一片）
     back = std::clamp(back, span * 0.30f, span * 6.0f);
     placeCamera(back, pitch, yaw);
+}
+
+// ============================================================
+// 正常视角：进入地形模式 / Ctrl+. 用（2026-10-24）
+// ============================================================
+// 用户原话："在点击 Landscape 进入地形模式时会把视野拉得非常远，此时再次
+// 把视野调整到正常的高度和视角，并且对着角色的位置。"
+//
+// 上一版进入模式就调 `focusCamera()`（整片 512 m 地形全部装进画面）：视距
+// 按视口长宽比反算出来 ~500 m 开外 —— 那个取景适合"看一眼地形全貌"，但每
+// 次切模式都被甩到天上去，还怎么刷地形。
+//
+// 这里换成工作高度：水平退 18 m、俯角 28°，相机离地表约 9.6 m。笔刷圆圈
+// （默认半径远小于 10 m）与地形起伏都在画面里，同时仍看得出层带分布。
+//
+// 朝向：**沿用当前 yaw**，不硬切到某个固定方位 —— 用户上一步可能正对着一
+// 道山脊，硬转 180° 会让人瞬间失去方位感。位置是相对注视点算的，所以"对着
+// 角色"这件事与 yaw 无关，永远成立。
+void LandscapeEditor::focusCameraAtPlayer() {
+    if (!m_valid) return;
+
+    // 注视点：第一个启用的 GameStart（角色就是在那儿生成的）。
+    // 没有出生点就退到地形中心 —— 与"按 0 落到地形上"的兜底同源。
+    glm::vec3 target(0.0f);
+    bool found = false;
+    ecs::World& w = m_ctx.editorScene().world();
+    w.each<ecs::GameStartComponent>(
+        [&](ecs::Entity e, ecs::GameStartComponent& g) {
+            if (found || !g.enabled) return;
+            if (const auto* tf = w.get<ecs::TransformComponent>(e)) {
+                target = tf->position;
+                found = true;
+            }
+        });
+    if (!found) target = glm::vec3(0.0f, 0.0f, heightAtWorld(0.0f, 0.0f));
+
+    constexpr float kBack = 18.0f;       // 水平后退量（米）
+    constexpr float kPitch = 0.49f;      // 28° 俯角
+    scene::Camera& cam = m_ctx.editorScene().camera();
+    const float yaw = cam.yaw();
+
+    // 与 placeCamera 同一套几何：angleDir = (cos p cos yaw, -cos p sin yaw,
+    // sin p)，相机 = target + angleDir·d，d = back / cos p。
+    const glm::vec3 pos(target.x + kBack * std::cos(yaw),
+                        target.y - kBack * std::sin(yaw),
+                        target.z + kBack * std::tan(kPitch));
+    cam.setYaw(yaw);
+    cam.setPitch(kPitch);
+    cam.setPosition(pos);
+    VK_LOG_INFO("LS-FRAME-PLAYER target=(%.2f,%.2f,%.2f) source=%s "
+                "back=%.1f pitch=%.2f yaw=%.2f pos=(%.2f,%.2f,%.2f)",
+                static_cast<double>(target.x), static_cast<double>(target.y),
+                static_cast<double>(target.z),
+                found ? "gamestart" : "terrain-center",
+                static_cast<double>(kBack), static_cast<double>(kPitch),
+                static_cast<double>(yaw), static_cast<double>(pos.x),
+                static_cast<double>(pos.y), static_cast<double>(pos.z));
 }
 
 void LandscapeEditor::focusCameraClose() {
@@ -1013,6 +1124,105 @@ void LandscapeEditor::captureCurrent(const StrokeRecord& shape,
     if (!shape.height.empty()) rectOut(out.height, m_asset.heights, rows, rc, 1);
     if (!shape.splat.empty()) rectOut(out.splat, m_asset.splat, rows, rc, 4);
     if (!shape.holes.empty()) rectOut(out.holes, m_asset.holes, rows, rc, 1);
+}
+
+// ============================================================
+// 材质仓库联动
+// ============================================================
+bool LandscapeEditor::setLayerMaterial(int layer, const std::string& materialId) {
+    if (layer < 0 || layer >= 4) return false;
+    if (!m_valid) return false;
+    if (materialId.empty()) return false;
+
+    // 校验材质真的存在：先问仓库，仓库里没有就退回"文件在不在"。
+    // 不校验的话手抖写错一个 id，画面上是"这一层突然变纯黑"，
+    // 而日志里什么都没有 —— 那是本项目最容易误判成渲染 bug 的一类故障。
+    const assets::MaterialLibrary& lib = m_ctx.materialLibrary();
+    const assets::MaterialLibraryEntry* e = lib.find(materialId);
+    if (!e && lib.size() > 0) {
+        VK_LOG_WARN("LS-LAYER-MAT-UNKNOWN layer=%d id=%s（仓库里没有这个材质）",
+                    layer, materialId.c_str());
+        return false;
+    }
+    const std::string id = e ? e->id : materialId;
+
+    auto* tc = m_ctx.editorScene().world().get<ecs::TerrainComponent>(m_entity);
+    if (!tc) return false;
+    if (tc->layerOverrides[layer] == id) return true;   // 没变
+
+    tc->layerOverrides[layer] = id;
+    // ⚠ 必须置 dirty：4 层贴图与层参数 UBO 都绑在实例的描述符集里，
+    //   只有重建实例才换得掉（Renderer::syncTerrains 认这一位）。
+    //   heightsDirty / splatDirty 走的是"原地重传一张图"，换不了材质。
+    tc->dirty = true;
+    m_ctx.dirty() = true;
+
+    VK_LOG_INFO("LS-LAYER-MAT layer=%d id=%s albedo=%s normal=%s", layer,
+                id.c_str(),
+                (e && e->hasAlbedo()) ? e->albedoPath.c_str() : "-",
+                (e && e->hasNormal()) ? e->normalPath.c_str() : "-");
+    return true;
+}
+
+std::string LandscapeEditor::layerMaterial(int layer) const {
+    if (layer < 0 || layer >= 4) return std::string();
+    if (!m_valid) return std::string();
+    // 组件覆盖优先 —— 与 TerrainPass::createTerrain 的取值顺序保持一致，
+    // 否则面板上显示的和画面上看到的会是两回事。
+    if (const auto* tc =
+            m_ctx.editorScene().world().get<ecs::TerrainComponent>(m_entity)) {
+        if (!tc->layerOverrides[layer].empty()) return tc->layerOverrides[layer];
+    }
+    return m_asset.desc.layerIds[static_cast<std::size_t>(layer)];
+}
+
+void LandscapeEditor::beginPaintLayer(int layer) {
+    m_tool = Tool::PaintLayer;
+    if (layer >= 0 && layer < 4) m_layer = layer;
+    m_eraseLayer = false;
+    VK_LOG_INFO("LS-TOOL paintlayer layer=%d", m_layer);
+}
+
+bool LandscapeEditor::isPaintingLayer() const {
+    return m_tool == Tool::PaintLayer;
+}
+
+int LandscapeEditor::seatGameStartsOnTerrain() {
+    if (!m_valid) return 0;
+    ecs::World& w = m_ctx.editorScene().world();
+
+    // 先收集再改：`each` 的循环体里改别的组件是安全的，但收集一次能让
+    // "判定"与"落笔"两段分开 —— 后面若要加撤销命令，这里就是天然的分界。
+    std::vector<ecs::Entity> targets;
+    w.each<ecs::GameStartComponent>(
+        [&](ecs::Entity e, ecs::GameStartComponent& g) {
+            if (g.enabled) targets.push_back(e);
+        });
+    if (targets.empty()) return 0;
+
+    int moved = 0;
+    for (const ecs::Entity e : targets) {
+        auto* tf = w.get<ecs::TransformComponent>(e);
+        if (!tf) continue;
+        const glm::vec3 before = tf->position;
+        // 世界 XY 处的**地表高度**（含地形实体的平移与 heightScale）
+        const float h = heightAtWorld(before.x, before.y);
+        if (std::fabs(before.z - h) < 1e-3f) continue;
+        tf->position.z = h;
+        ++moved;
+        const std::string* nmp = w.name(e);
+        // 断言锚点：验收脚本靠它核对"出生点真的落在 terrainH 上"。
+        VK_LOG_INFO("GAMESTART-SEAT name=%s before=(%.3f,%.3f,%.3f) "
+                    "after=(%.3f,%.3f,%.3f) terrainH=%.3f source=%s",
+                    nmp ? nmp->c_str() : "?", static_cast<double>(before.x),
+                    static_cast<double>(before.y), static_cast<double>(before.z),
+                    static_cast<double>(tf->position.x),
+                    static_cast<double>(tf->position.y),
+                    static_cast<double>(tf->position.z),
+                    static_cast<double>(h), m_source.c_str());
+    }
+    if (moved > 0) m_ctx.dirty() = true;
+    return moved;
 }
 
 bool LandscapeEditor::undoStroke() {
@@ -1635,6 +1845,15 @@ bool LandscapeEditor::handleShortcuts() {
         redoStroke();
         return true;
     }
+    // ---- Ctrl+. 回到"正常视角"（2026-10-24）----
+    // 用户原话："……此时再次把视野调整到正常的高度和视角，并且对着角色的位置。"
+    // 与进入地形模式同一条取景，随时可以把飞远/飞歪的镜头拉回来。
+    // ⚠ 必须放在下面那条 `if (io.KeyCtrl || io.KeyAlt) return false;` **之前**，
+    //   否则 Ctrl 一按下就直接短路，这个组合键永远收不到。
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Period, false)) {
+        focusCameraAtPlayer();
+        return true;
+    }
     if (io.KeyCtrl || io.KeyAlt) return false;
 
     // `[` / `]` 调半径、`,` / `.` 调强度 —— 与 UE 一致（那里是 [ ] 调刷子大小）。
@@ -1753,64 +1972,158 @@ bool LandscapeEditor::viewportInput(const glm::vec2& vpPos,
             fill = IM_COL32(150, 150, 150, 18);
         }
 
-        // 一个**局部**点 → 屏幕坐标。返回 false = 落在相机后面（这一圈就
-        // 别画了：折线会在屏幕上拉出一条横贯全屏的假边）。
-        const auto toScreen = [&](const glm::vec3& lp, ImVec2* out) -> bool {
-            const glm::vec4 clip = vp * (model * glm::vec4(lp, 1.0f));
-            if (clip.w <= 1.0e-5f) return false;
-            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-            out->x = vpPos.x + (ndc.x * 0.5f + 0.5f) * vpSize.x;
-            out->y = vpPos.y + (ndc.y * 0.5f + 0.5f) * vpSize.y;
-            return true;
+        // 局部点 → **裁剪空间**。刻意不直接返回屏幕坐标：屏幕坐标里看不出
+        // "这个点其实在相机背后"（w<=0 时除法会把点翻到画面的另一侧）。
+        const auto toClip = [&](const glm::vec3& lp) {
+            return vp * (model * glm::vec4(lp, 1.0f));
         };
 
-        // 把水平面上的一个圆投影成屏幕折线。rings = 半径倍率。
-        // 段数 48：半径 12 m 贴脸看时 32 段的折角能看出来（屏幕上直径
-        // 三四百像素），48 段在同样的距离下折角小于 1 px。
-        constexpr int kSeg = 48;
-        auto projectRing = [&](float radiusScale, ImVec2* pts) -> bool {
+        // 近平面。裁剪空间的 w = 该点在视线方向上的深度，w 越小离相机越近；
+        // w <= kNearW 一律当成"看不见"（贴到镜头上/在背后，屏幕坐标没有意义）。
+        constexpr float kNearW = 0.05f;
+
+        const auto clipToScreen = [&](const glm::vec4& c, ImVec2* out) {
+            const float w = (c.w > kNearW) ? c.w : kNearW;
+            out->x = vpPos.x + (c.x / w * 0.5f + 0.5f) * vpSize.x;
+            out->y = vpPos.y + (c.y / w * 0.5f + 0.5f) * vpSize.y;
+        };
+
+        // 两条视线段的连线与近平面的交点（按 w 线性插值 —— 投影变换对 w
+        // 是线性的，所以插出来的点**真的**落在近平面上）。
+        const auto toNear = [&](const glm::vec4& a, const glm::vec4& b) {
+            const float d = b.w - a.w;
+            const float t = (d > 1.0e-6f || d < -1.0e-6f)
+                                ? (kNearW - a.w) / d
+                                : 0.0f;
+            glm::vec4 x = a + (b - a) * t;
+            x.w = kNearW;
+            return x;
+        };
+
+        // 段数 64：半径 12 m 贴脸看时 48 段在屏幕上还能看出折角，64 段不会。
+        constexpr int kSeg = 64;
+
+        // 画一个水平圆盘（radiusScale = 半径倍率）。
+        //
+        // ⚠ 2026-10-24（第六轮）：**必须按近平面把圆裁成若干条可见弧段**，
+        //   不能"有一个点在相机背后就整圈不画"。
+        //   半径一旦超过"相机到圆心的水平距离"，圆的最远点必然跑到相机背后
+        //   —— 工作取景（退 18 m / 抬 9 m，见 focusCameraAtPlayer）下半径
+        //   只要超过 ~23 m 就会触发。老代码在这种情况下 `return false`，
+        //   于是用户把半径调大（或把地形垫到相机高度以上）时**圆圈突然消失**。
+        //   现在跨近平面的那一段插值出交点、圆被切成多条弧段，段与段之间
+        //   不连（连起来会拉出一条横贯全屏的假边）。
+        //
+        // 返回值 = 整圈都在相机前方（只有这时填充才是凸多边形，能安全填充）。
+        // behindOut = 有多少个环点落在相机背后（诊断 / 验收用：这个数 > 0 而
+        // 圆环还在画，就证明近平面裁剪这条路径是通的）。
+        int arcsDrawn = 0;
+        int ringBehind = 0;
+        const auto drawRing = [&](float radiusScale, ImU32 c, float thickness,
+                                  ImU32 fillCol, int* behindOut) -> bool {
             const float r = m_radius * radiusScale;
+            ImVec2 pts[kSeg + 2];
+            int n = 0;
+            bool allFront = true;
+            glm::vec4 prevC(0.0f);
+            bool prevFront = false;
+
+            // 结束当前弧段（段内点数 < 2 时直接丢掉：一个点画不出线）
+            const auto closeArc = [&]() {
+                if (n >= 2) {
+                    dl->AddPolyline(pts, n, c, 0, thickness);
+                    ++arcsDrawn;
+                }
+                n = 0;
+            };
+            const auto push = [&](const glm::vec4& cc) {
+                if (n < kSeg + 2) {
+                    clipToScreen(cc, &pts[n]);
+                    ++n;
+                }
+            };
+
             for (int i = 0; i <= kSeg; ++i) {
                 const float a = 6.2831853072f * static_cast<float>(i) /
                                 static_cast<float>(kSeg);
-                const glm::vec3 lp(localHit.x + std::cos(a) * r,
-                                   localHit.y + std::sin(a) * r,
-                                   localHit.z);
-                if (!toScreen(lp, &pts[i])) return false;
+                const glm::vec4 c0 =
+                    toClip(glm::vec3(localHit.x + std::cos(a) * r,
+                                     localHit.y + std::sin(a) * r,
+                                     localHit.z));
+                const bool front = (c0.w > kNearW);
+                if (!front) {
+                    allFront = false;
+                    if (behindOut) ++*behindOut;
+                }
+                if (i == 0) {
+                    if (front) push(c0);
+                } else if (front && prevFront) {
+                    push(c0);
+                } else if (front && !prevFront) {
+                    // 从相机背后绕回可见：先落到近平面交点，再进这段弧
+                    closeArc();
+                    push(toNear(prevC, c0));
+                    push(c0);
+                } else if (!front && prevFront) {
+                    // 从可见折向背后：以近平面交点收尾
+                    push(toNear(prevC, c0));
+                    closeArc();
+                }
+                prevC = c0;
+                prevFront = front;
             }
-            return true;
+
+            // 收尾最后一段。整圈没断过（n == kSeg+1）时才填充：
+            // 水平圆的投影是凸的 → 用 Convex 版本（更快，也不会因为凹多边形
+            // 三角化把填充画成一团乱麻）。
+            if (n >= 2) {
+                if (fillCol != 0 && allFront && n >= kSeg + 1) {
+                    dl->AddConvexPolyFilled(pts, kSeg, fillCol);
+                }
+                dl->AddPolyline(pts, n, c, 0, thickness);
+                ++arcsDrawn;
+                n = 0;
+            }
+            return allFront;
         };
 
-        ImVec2 outer[kSeg + 1];
-        if (projectRing(1.0f, outer)) {
-            // 半透明填充：一眼看出"覆盖多大一片"，比单线好读得多。
-            // 水平圆的投影是凸的 → 用 Convex 版本（更快，且不会因为
-            // 凹多边形三角化把填充画成一团乱麻）。
-            dl->AddConvexPolyFilled(outer, kSeg, fill);
-            dl->AddPolyline(outer, kSeg + 1, col, 0, 1.8f);
+        // 外圈（带半透明填充：一眼看出"覆盖多大一片"，比单线好读得多）
+        drawRing(1.0f, col, 1.8f, fill, &ringBehind);
 
-            // 衰减内圈：满强度的核心范围。falloff 越大核心越小。
-            if (m_falloff > 0.02f) {
-                ImVec2 inner[kSeg + 1];
-                const float innerScale = 1.0f - 0.55f * m_falloff;
-                if (innerScale > 0.12f && projectRing(innerScale, inner)) {
-                    dl->AddPolyline(inner, kSeg + 1,
-                                    (col & 0x00FFFFFFu) | 0x80000000u, 0, 1.0f);
-                }
+        // 衰减内圈：满强度的核心范围。falloff 越大核心越小。
+        if (m_falloff > 0.02f) {
+            const float innerScale = 1.0f - 0.55f * m_falloff;
+            if (innerScale > 0.12f) {
+                drawRing(innerScale, (col & 0x00FFFFFFu) | 0x80000000u, 1.0f, 0,
+                         nullptr);
             }
+        }
 
-            // 笔心：小十字 + 点。
-            // ⚠ 以前这里取 `outer[0]` —— 那是圆环**角度 0 的那个点**（圆
-            //   的最右侧），于是十字画在圆环边缘上，看着像"圆心跑偏了"。
-            //   笔心必须投影命中点本身。
+        // 笔心：小十字 + 点。
+        // ⚠ 以前这里取 `outer[0]` —— 那是圆环**角度 0 的那个点**（圆的最
+        //   右侧），于是十字画在圆环边缘上，看着像"圆心跑偏了"。
+        //   笔心必须投影命中点本身。
+        const glm::vec4 centerC = toClip(localHit);
+        if (centerC.w > kNearW) {
             ImVec2 c0;
-            if (toScreen(localHit, &c0)) {
-                dl->AddCircleFilled(c0, 2.5f, col);
-                dl->AddLine(ImVec2(c0.x - 6.0f, c0.y), ImVec2(c0.x + 6.0f, c0.y),
-                            col, 1.0f);
-                dl->AddLine(ImVec2(c0.x, c0.y - 6.0f), ImVec2(c0.x, c0.y + 6.0f),
-                            col, 1.0f);
-            }
+            clipToScreen(centerC, &c0);
+            dl->AddCircleFilled(c0, 2.5f, col);
+            dl->AddLine(ImVec2(c0.x - 6.0f, c0.y), ImVec2(c0.x + 6.0f, c0.y),
+                        col, 1.0f);
+            dl->AddLine(ImVec2(c0.x, c0.y - 6.0f), ImVec2(c0.x, c0.y + 6.0f),
+                        col, 1.0f);
+        }
+
+        // 诊断锚点：圆环被近平面切成几段、有多少点在相机背后。
+        // 只在"段数 / 背后点数变了、半径跨过 1 m"时打一行 —— 供
+        // `verify_brush_ring` 断言"调大半径之后圆环还在画"（老代码在这种
+        // 情况下会整圈 `return false`，屏幕上什么都没有）。
+        if (arcsDrawn != m_ringArcsLogged ||
+            std::abs(m_radius - m_ringRadiusLogged) > 1.0f) {
+            m_ringArcsLogged = arcsDrawn;
+            m_ringRadiusLogged = m_radius;
+            VK_LOG_INFO("LS-RING r=%.1f arcs=%d behind=%d",
+                        static_cast<double>(m_radius), arcsDrawn, ringBehind);
         }
     }
 
@@ -2102,6 +2415,20 @@ void LandscapeEditor::drawStatsSection() {
     if (ImGui::Button(TR("Focus"))) focusCamera();
     logRect("LS-FOCUS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     ImGui::SameLine();
+    // 2026-10-24：`Focus` 是"整片地形装进画面"（看全貌），这个是"回到角色身边"
+    // （干活用）。两个都要留 —— 用户要的是平时贴着角色刷地形，偶尔才想看全貌。
+    //
+    // ⚠ 为什么快捷键之外还要一个按钮：`Ctrl+.` 在中文 Windows 上会被**微软拼音
+    //   的"中英标点切换"**吃掉（实测真实按键到不了应用，同机单独按 `.` 却正常）。
+    //   快捷键留着（用户点名要的），但必须有这条不经过键盘的路。
+    if (ImGui::Button(TR("Focus player"))) focusCameraAtPlayer();
+    logRect("LS-FOCUS-PLAYER", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", TR("Camera back to the player at working "
+                                   "height (Ctrl+.)"));
+    }
+    ImGui::SameLine();
     if (ImGui::Button(TR("Save now"))) saveAssets(true);
     ImGui::SameLine();
     ImGui::TextDisabled(TR("auto-saves while you paint"));
@@ -2151,19 +2478,86 @@ void LandscapeEditor::drawToolParams() {
         }
         case Tool::PaintLayer: {
             ImGui::SeparatorText(TR("Layer"));
+            // 四个层按钮。按钮上显示的是**该层当前真的挂着哪个材质**，
+            // 不是写死的 "Grass/Dirt/Rock/Snow" —— 层材质可以由材质仓库
+            // 随时换掉，写死的名字一旦换过就说错了。
+            // 名称解析不出来时才退回 kLayerNames 的兜底。
             for (int i = 0; i < 4; ++i) {
                 if (i) ImGui::SameLine();
                 const bool on = (m_layer == i);
+                const std::string id = layerMaterial(i);
+                // 优先用仓库条目的显示名（短、且中英双语）；仓库里没有
+                // （用户手写的 .vmat / .vterrain 里的老 id）才退回 id 末段。
+                const assets::MaterialLibraryEntry* le =
+                    m_ctx.materialLibrary().find(id);
+                std::string label =
+                    le ? std::string(trBilingual(le->label, le->labelZh))
+                       : shortMaterialName(id);
+                if (label.empty()) label = std::string(TR(kLayerNames[i]));
+                label += "##lslayer";
+                label += std::to_string(i);
                 if (on) {
                     ImGui::PushStyleColor(
                         ImGuiCol_Button,
                         ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
                 }
-                if (ImGui::Button(TR(kLayerNames[i]), ImVec2(96.0f, 26.0f))) {
+                if (ImGui::Button(label.c_str(), ImVec2(96.0f, 26.0f))) {
                     m_layer = i;
-                    VK_LOG_INFO("LS-LAYER %d", i);
+                    VK_LOG_INFO("LS-LAYER %d id=%s", i, id.c_str());
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s", id.empty() ? "(unused)" : id.c_str());
                 }
                 if (on) ImGui::PopStyleColor();
+            }
+
+            // ---------------------------------------------------- 材质仓库
+            // 把"当前层用哪个材质"做成下拉。列表来自
+            // assets/materials/library.json（材质仓库），所以往仓库里丢一个
+            // .vmat 就能立刻拿来当笔刷用 —— 这正是这一轮的目的：
+            // 地形不只是"抬高度"，还要能"贴纹理"。
+            ImGui::SeparatorText(TR("Layer material"));
+            const assets::MaterialLibrary& lib = m_ctx.materialLibrary();
+            const std::string curId = layerMaterial(m_layer);
+            const assets::MaterialLibraryEntry* cur = lib.find(curId);
+            const char* preview =
+                cur ? trBilingual(cur->label, cur->labelZh)
+                    : (curId.empty() ? TR("(unused)") : curId.c_str());
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##ls_layer_mat", preview)) {
+                if (lib.size() == 0) {
+                    ImGui::TextDisabled("%s", TR("Material library is empty"));
+                    ImGui::TextDisabled("%s",
+                                        TR("Run tools/gen_material_library.py"));
+                }
+                for (const auto& e : lib.entries()) {
+                    const bool sel = (e.id == curId);
+                    // 有 albedo 的才能当"贴图笔刷"；没有的（纯数值材质）
+                    // 也能选，只是刷出来是纯色 —— 标一下让人有预期。
+                    std::string text = trBilingual(e.label, e.labelZh);
+                    if (!e.hasAlbedo()) text += TR("  (flat)");
+                    if (ImGui::Selectable(text.c_str(), sel)) {
+                        if (setLayerMaterial(m_layer, e.id)) {
+                            m_ctx.notify(std::string(TR("Layer material: ")) +
+                                         trBilingual(e.label, e.labelZh));
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            TR("%s\nalbedo: %s\nnormal: %s"), e.id.c_str(),
+                            e.hasAlbedo() ? e.albedoPath.c_str() : "-",
+                            e.hasNormal() ? e.normalPath.c_str() : "-");
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (cur) {
+                ImGui::TextDisabled("%s", cur->id.c_str());
+                ImGui::TextDisabled(TR("albedo: %s"),
+                                    cur->hasAlbedo() ? cur->albedoPath.c_str() : "-");
+            }
+            if (ImGui::Button(TR("Refresh library"), ImVec2(-1.0f, 0.0f))) {
+                m_ctx.reloadMaterialLibrary();
             }
             // 擦除 = 画回第 0 层。勾选与 Shift 是同一个意思（两条路都留，
             // 因为有人习惯按住 Shift、有人习惯点勾选框）。
@@ -2255,15 +2649,18 @@ void LandscapeEditor::drawWholeSection() {
 }
 
 void LandscapeEditor::drawBrushSection() {
-    ImGui::SeparatorText(TR("Brush"));
-
     // 2 × 4 的按钮网格（8 个工具）。工具多了之后横排会挤成一条，两列刚好够读。
     //
-    // ⚠ 行高 28 → 22、行距收紧：左栏下半只有 448 px（模式栏 394..842），
-    //   原来的 28 px 行高让第 4 行（Paint layer / Carve）整个掉到面板底边
-    //   之外 —— 用户滚轮能看到、但点不到（点下去落到面板外面）。
-    //   现在 4 行 × (22+5) = 108 px，末行底边 829 < 842，全部可见。
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 5.0f));
+    // ⚠ 网格**不设段标题**，直接顶在"整块操作"下面；`Brush` 这个标题挪到
+    //   网格之后、滑条之前（读起来就是"笔刷参数"）。理由（2026-10-24 实测）：
+    //   左栏下半在 1600×900 下只有 378 px（面板 446..842），统计 + 整块操作
+    //   已经吃到 y≈734。再加 25 px 的 `SeparatorText("Brush")`，第 4 行
+    //   （Paint layer / Carve）就整个掉到面板底边之外 —— 用户看得见、点不到，
+    //   自动化更糟：中心落在面板**下方**，砸到底部通栏上把中间视口切成了
+    //   Command Palette，之后所有视口操作全部落空（verify_landscape_ground
+    //   的 B/C/D 三组就是这么整片 FAIL 的，症状是"按钮齐全、笔划全无"）。
+    //   行高 22 → 20、行距 5 → 2：4 行 = 88 px，末行底边 ≈ 821 < 842（留 21 px）。
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 2.0f));
     struct Item { Tool t; const char* label; };
     const Item tools[kToolCount] = {
         {Tool::Raise, "Raise / Lower"},
@@ -2283,7 +2680,7 @@ void LandscapeEditor::drawBrushSection() {
                 ImGuiCol_Button,
                 ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
         }
-        if (ImGui::Button(TR(tools[i].label), ImVec2(188.0f, 22.0f))) {
+        if (ImGui::Button(TR(tools[i].label), ImVec2(188.0f, 20.0f))) {
             m_tool = tools[i].t;
             // ⚠ 两个数字都要打出来，别再混用：`LS-TOOL-<i>` 这个**锚点**用的是
             //   按钮在网格里的视觉序号 i，而 `static_cast<int>(m_tool)` 是
@@ -2300,6 +2697,8 @@ void LandscapeEditor::drawBrushSection() {
     }
     ImGui::PopStyleVar();   // ItemSpacing（见网格上方的说明）
 
+    // "Brush" 段标题：网格选中之后就是笔刷参数（半径/强度/衰减/单笔上限）。
+    ImGui::SeparatorText(TR("Brush"));
     labeledSlider(TR("Radius"), "##ls_radius", &m_radius, 1.0f, 500.0f, "%.1f m",
                   /*logScale=*/true);
     // 强度：对数滑条 + 上限 64（第十轮从 16 提上来）。UE 的 Tool Strength
@@ -2337,6 +2736,9 @@ void LandscapeEditor::drawBrushSection() {
                         TR("Left-drag to paint. Shift inverts (lower / erase). "
                            "Right-drag moves the camera. Scroll = radius, "
                            "Shift+scroll = strength."));
+    // 取景提示（2026-10-24）：进模式时镜头贴着角色，飞远了按这个回来。
+    ImGui::TextDisabled("%s", TR("Ctrl+. snaps the view back to the player "
+                                 "at a normal working height."));
     if (m_stroking) {
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "%s",
                            TR("painting..."));

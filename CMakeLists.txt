@@ -783,6 +783,7 @@ file(GLOB_RECURSE ASSETC_SOURCES CONFIGURE_DEPENDS
 )
 add_executable(VennAssetC ${ASSETC_SOURCES})
 set_target_properties(VennAssetC PROPERTIES OUTPUT_NAME AssetC)
+# nlohmann_json：MeshTweak 读侧车补丁用（头文件型 INTERFACE 库，零链接成本）。
 target_link_libraries(VennAssetC PRIVATE VennAssetIO)
 if(NOT MSVC)
     target_compile_options(VennAssetC PRIVATE -Wall -Wextra)
