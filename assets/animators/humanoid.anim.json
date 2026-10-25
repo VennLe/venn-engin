@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "defaultState": "Idle",
+
+  "//": "参数名 Speed / Grounded / Jump 是引擎侧的**约定名**（见 runtime/RuntimeApp.cpp 的 tickPlayerAnimation 与 editor/EditorApp.cpp 的 Play 分支）。改这三个名字不会报错，但那三行物理真值就喂不进来了 —— 表现是角色永远停在 Idle。",
+
+  "parameters": [
+    { "name": "Speed",    "type": "float", "default": 0.0 },
+    { "name": "Grounded", "type": "bool",  "default": true },
+    { "name": "Jump",     "type": "trigger" }
+  ],
+
+  "states": [
+    { "name": "Idle", "clip": "Idle", "speed": 1.0, "loop": true },
+    { "name": "Walk", "clip": "Walk", "speed": 1.0, "loop": true },
+    { "name": "Run",  "clip": "Run",  "speed": 1.0, "loop": true },
+    { "name": "Jump", "clip": "Jump", "speed": 1.0, "loop": false }
+  ],
+
+  "transitions": [
+    { "from": "Any",  "to": "Jump", "duration": 0.10,
+      "conditions": [ { "param": "Jump", "op": "trigger" } ] },
+
+    { "from": "Jump", "to": "Idle", "duration": 0.15,
+      "conditions": [ { "param": "Grounded", "op": "==", "value": true },
+                      { "param": "Speed",    "op": "<",  "value": 0.15 } ] },
+    { "from": "Jump", "to": "Walk", "duration": 0.15,
+      "conditions": [ { "param": "Grounded", "op": "==", "value": true },
+                      { "param": "Speed",    "op": ">=", "value": 0.15 } ] },
+
+    { "from": "Idle", "to": "Walk", "duration": 0.20,
+      "conditions": [ { "param": "Speed", "op": ">=", "value": 0.15 } ] },
+    { "from": "Walk", "to": "Idle", "duration": 0.25,
+      "conditions": [ { "param": "Speed", "op": "<", "value": 0.15 } ] },
+
+    { "from": "Walk", "to": "Run", "duration": 0.18, "restart": false,
+      "conditions": [ { "param": "Speed", "op": ">=", "value": 4.0 } ] },
+    { "from": "Run",  "to": "Walk", "duration": 0.18, "restart": false,
+      "conditions": [ { "param": "Speed", "op": "<", "value": 4.0 } ] },
+
+    { "from": "Run",  "to": "Idle", "duration": 0.25,
+      "conditions": [ { "param": "Speed", "op": "<", "value": 0.15 } ] }
+  ]
+}

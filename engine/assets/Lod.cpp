@@ -112,6 +112,8 @@ struct CellAccum {
     // 不累这一项的话，Mesh Paint 画过的模型一拉远就回到白色 —— 而且
     // 因为 LOD 是按距离切换的，看起来像"颜色在某段距离突然消失"。
     glm::vec4 col{0.0f};
+    // 第二套 UV（§13）同样可以求平均：它和 uv 是一样的语义。
+    glm::vec2 uv2{0.0f};
     uint32_t count = 0;
     uint32_t outIndex = 0;
 
@@ -228,6 +230,7 @@ LodMeshData decimateClustered(const std::vector<Vertex>& vertices,
         c.pos += p;
         c.nrm += vin.normal;
         c.uv += vin.uv;
+        c.uv2 += vin.uv2;
         c.col += vin.color;
         ++c.count;
         // 蒙皮权重：只有真正带权重的顶点才累（weights 全 0 的静态顶点
@@ -257,7 +260,20 @@ LodMeshData decimateClustered(const std::vector<Vertex>& vertices,
         // 算出 NaN 亮度。
         v.normal = (len > 1e-6f) ? (n / len) : glm::vec3(0.0f, 0.0f, 1.0f);
         v.uv = c.uv * inv;
+        v.uv2 = c.uv2 * inv;
         v.color = c.col * inv;
+        // ---- 2026-10-25（§13）：切线**故意不带到 LOD 上** ----
+        //
+        // `Vertex v;` 的默认构造已经把 tangent 留成 0（= 没有切线）、把
+        // morphBase 留成 kNoMorphBase（= 不参与 morph）。这是刻意接受的
+        // 两条局限，不是漏写：
+        //   · 切线：把两个手性相反的切线平均出来是一个**错**的切线，
+        //     而错的切线比没有切线更难查（没有切线至少还能退回屏幕空间
+        //     导数建 TBN）。真要做，得按"每组手性分别累加"来合。
+        //   · morph：LOD 顶点是**重新聚类**出来的，和原顶点的 morph
+        //     delta 没有对应关系。要让 LOD 支持形变，得在减面时同步
+        //     重算 delta 流 —— 那是 morph 那一刀（§13.5）的事。
+        // 两者都记进 §13.6「已知局限」。
 
         // ---- 蒙皮（W2-3）：把这一格累积到的 joint 权重收成 4 个槽 ----
         // 取权重最大的 4 个，然后**归一化到 1** —— 不归一化的话顶点会被

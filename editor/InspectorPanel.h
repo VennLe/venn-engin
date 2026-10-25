@@ -324,6 +324,23 @@ private:
     char m_animCtrlBuf[256] = {0};
     ecs::Entity m_animDefBufFor{};
     char m_animDefBuf[128] = {0};
+    // 弹簧骨的前缀列表（逗号分隔）。与上面两个同模式：buffer 跟着实体走，
+    // 换选中目标时重新灌一次，避免"在 A 上打的字出现在 B 上"。
+    ecs::Entity m_springPfxBufFor{};
+    char m_springPfxBuf[256] = {0};
+
+    // 两骨 IK 的三个骨名（第八刀）。共用**一个** For 标记：三个框属于同
+    // 一组，换实体时一起重灌；分开三个 For 没有任何收益，只是三个字段。
+    ecs::Entity m_ikBufFor{};
+    char m_ikRootBuf[64] = {0};
+    char m_ikMidBuf[64] = {0};
+    char m_ikEndBuf[64] = {0};
+
+    // 骨骼挂点的宿主名 + 骨名。宿主名比骨名长（实体名可能是
+    // "alicia (imported)" 这种），所以给 128。
+    ecs::Entity m_attachBufFor{};
+    char m_attachHostBuf[128] = {0};
+    char m_attachBoneBuf[64] = {0};
 
     // Mesh / Light 面板"这一帧到底画了哪些参数"的签名。
     //

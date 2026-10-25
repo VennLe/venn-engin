@@ -19,6 +19,63 @@ Mesh::~Mesh() {
     m_indexBuffer = nullptr;
 }
 
+// ---------------- morp（§14）----------------
+
+// ---------------- 顶点输入属性表（§13 / §15）----------------
+//
+// 位置 0..9 的**全表**。按 location 升序（Vulkan 要求），偏移一律取
+// `offsetof(Vertex, ...)` —— 手写数字是"改字段忘了改这里"的经典来源。
+VkVertexInputAttributeDescription Vertex::attributeAt(int location) {
+    VkVertexInputAttributeDescription a{};
+    a.binding = 0;
+    a.location = static_cast<uint32_t>(location);
+    switch (location) {
+        case 0: a.format = VK_FORMAT_R32G32B32_SFLOAT;    a.offset = offsetof(Vertex, pos);        break;
+        case 1: a.format = VK_FORMAT_R32G32B32_SFLOAT;    a.offset = offsetof(Vertex, normal);     break;
+        case 2: a.format = VK_FORMAT_R32G32_SFLOAT;       a.offset = offsetof(Vertex, uv);         break;
+        case 3: a.format = VK_FORMAT_R32G32B32A32_UINT;   a.offset = offsetof(Vertex, joints);     break;
+        case 4: a.format = VK_FORMAT_R32G32B32A32_SFLOAT; a.offset = offsetof(Vertex, weights);    break;
+        case 5: a.format = VK_FORMAT_R32G32B32A32_SFLOAT; a.offset = offsetof(Vertex, color);      break;
+        case 6: a.format = VK_FORMAT_R32G32_SFLOAT;       a.offset = offsetof(Vertex, uv2);        break;
+        case 7: a.format = VK_FORMAT_R32_UINT;            a.offset = offsetof(Vertex, morphBase);  break;
+        case 8: a.format = VK_FORMAT_R32_UINT;            a.offset = offsetof(Vertex, morphCount); break;
+        case 9: a.format = VK_FORMAT_R32G32B32A32_SFLOAT; a.offset = offsetof(Vertex, tangent);    break;
+        default: break;   // 调用方保证不越界；越界给一条"未定义但无害"的
+    }
+    return a;
+}
+
+std::vector<VkVertexInputAttributeDescription> Vertex::attributesFor(
+    std::initializer_list<int> locations) {
+    std::vector<VkVertexInputAttributeDescription> out;
+    out.reserve(locations.size());
+    for (int loc : locations) {
+        if (loc < 0 || loc > 9) continue;
+        out.push_back(attributeAt(loc));
+    }
+    return out;
+}
+
+std::vector<VkVertexInputAttributeDescription> Vertex::attributeDescriptions(
+    int count) {
+    // 连续前缀（0..count-1）。**只有"真的只读前几条"的管线能用它** ——
+    // 主前向读 0..5 + 7/8（跳过了 6 和 9），必须走 attributeDescriptions()。
+    std::vector<VkVertexInputAttributeDescription> out;
+    if (count < 0) count = 0;
+    if (count > 10) count = 10;
+    out.reserve(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) out.push_back(attributeAt(i));
+    return out;
+}
+
+void Mesh::setMorph(std::vector<MorphDelta> deltas,
+                    std::vector<std::string> names,
+                    std::vector<MorphChannel> channels) {
+    m_morphDeltas = std::move(deltas);
+    m_morphNames = std::move(names);
+    m_morphChannels = std::move(channels);
+}
+
 void Mesh::upload(rhi::Device& device, rhi::CommandPool& cmdPool,
                   std::vector<Vertex> vertices, std::vector<uint32_t> indices) {
     if (vertices.empty() || indices.empty()) {

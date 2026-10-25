@@ -331,6 +331,7 @@ void PlayerController::update(scene::Scene& scene, physics::PhysicsWorld* world,
 
     const physics::CharacterStepResult r = physics::stepCharacter(
         wref, m_desc, m_state, desired, dt, jump, m_proxy);
+    m_justJumped = r.jumped;
 
     // ---------------- 足迹取最高点：脚不许插进坡面（2026-10-23）----------------
     //

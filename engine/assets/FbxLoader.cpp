@@ -277,6 +277,23 @@ Material* fbxMaterial(AssetManager& assets, const ufbx_material& mat,
         key, albedo, nullptr, nullptr, baseColor, roughness, metallic, emissive,
         false);
     if (out) {
+        // 透明模式（P0-3）。**规则与 assetio/FbxImport.cpp 的
+        // convertMaterial 逐条一致** —— 两条导入路径（直连 FBX / 读烤好的
+        // .vmesh）必须给出同样的材质，否则"编辑器里看到的是 Blend、
+        // 打出来的包里变成 Opaque"这种差异会极难查。
+        // 判据与理由见那里的注释：FBX 没有三态枚举，只推得出 Blend。
+        {
+            const bool hasOpacityTex = mat.pbr.opacity.texture != nullptr;
+            const bool opacityOn = mat.features.opacity.enabled &&
+                                   mat.pbr.opacity.has_value &&
+                                   mat.pbr.opacity.value_real < 0.999;
+            const bool transparencyOn =
+                mat.fbx.transparency_factor.has_value &&
+                mat.fbx.transparency_factor.value_real < 0.999;
+            if (hasOpacityTex || opacityOn || transparencyOn) {
+                out->alphaMode = Material::AlphaMode::Blend;
+            }
+        }
         // 与 glTF 路径对齐：标记来源 + 稳定身份 + 导入快照。
         // 以前 FBX 材质**不标记来源**，于是被当成 procedural 序列化，
         // 参数原样写进场景 —— 表面上能往返，但"模型重导入后覆盖关系"

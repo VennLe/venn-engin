@@ -77,6 +77,15 @@ public:
     // 速度为 0，腿不该还在跑）。
     glm::vec3 velocity() const { return m_state.velocity; }
 
+    // 本帧是否真的起跳了（贴地 + 按下跳跃 + 物理接受）。
+    //
+    // 为什么要有它（2026-10-25，状态机接线）：
+    //   `physics::stepCharacter` 的返回值里一直有 `jumped`，但**只有自检在读**
+    //   —— 运行时没有任何消费者。而动画状态机的 `Jump` trigger 需要的正是
+    //   "起跳这一刻"，用 `!onGround` 代替是不行的：走下台阶也是 onGround=false,
+    //   那会把"落地/踏空"也当成起跳。
+    bool justJumped() const { return m_justJumped; }
+
     void setTrace(bool on) { m_trace = on; }
 
 private:
@@ -90,6 +99,7 @@ private:
     physics::CharacterDesc m_desc;
     physics::CharacterState m_state;
     physics::BodyId m_proxy = physics::kInvalidBody;
+    bool m_justJumped = false;   // 见 justJumped()
 
     // 轨道相机
     float m_yaw = 0.0f;

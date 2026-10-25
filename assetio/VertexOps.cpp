@@ -45,6 +45,23 @@ std::uint64_t vertexKey(const Vertex& v, float posEps) {
     for (int i = 0; i < 4; ++i) h = mix(h, static_cast<std::uint64_t>(v.joints[i]));
     for (int i = 0; i < 4; ++i) h = mix(h, quantize(v.weights[i], 1.0e5f));
     for (int i = 0; i < 4; ++i) h = mix(h, quantize(v.color[i], 1.0e5f));
+    // ---- 2026-10-25（§13）：新通道也必须进焊接键 ----
+    //
+    // 不把 uv2 / tangent 放进来，后果不是"多余顶点被多焊了几份"，而是
+    // **反过来的**：两个 uv2 不同的顶点被判成同一个，UV2 只剩其中一份。
+    // 面部 SDF 贴图在脸上会出现一块用错了坐标的区域 —— 那是最难定位
+    // 的一类 bug（几何完全正确，只有阴影纹理歪）。焊接键宁可多留顶点。
+    for (int i = 0; i < 2; ++i) h = mix(h, quantize(v.uv2[i], invUv));
+    for (int i = 0; i < 4; ++i) h = mix(h, quantize(v.tangent[i], 1.0e5f));
+    // morphBase 是**导入后**才定的下标，同一个顶点在两次烤之间应当一致；
+    // 放进键里是为了让"带 morph 的顶点"不会被焊到"不带 morph 的顶点"上
+    // —— 后者会静默丢掉形变。
+    h = mix(h, static_cast<std::uint64_t>(v.morphBase));
+    // morphCount 也进键：morphBase 在焊接阶段存的是归属哈希，两个顶点
+    // 哈希相同但参与 target 数不同是不可能的（哈希已经编码了全部记录），
+    // 这里加一道纯属双保险 —— 焊接错一次的代价是"某块几何静默失去形变"，
+    // 而多一个 u32 的哈希代价是零。
+    h = mix(h, static_cast<std::uint64_t>(v.morphCount));
     return h;
 }
 
@@ -64,6 +81,15 @@ bool vertexEqual(const Vertex& a, const Vertex& b, float posEps) {
         if (std::fabs(a.weights[i] - b.weights[i]) > 1.0e-5f) return false;
     for (int i = 0; i < 4; ++i)
         if (std::fabs(a.color[i] - b.color[i]) > 1.0e-5f) return false;
+    // 与 vertexKey 一一对应：键里有的字段这里也必须比，否则哈希说"同"
+    // 而实际"不同"时会直接把差异抹掉（碰撞本来就极少，但一旦发生就是
+    // 一次静默的数据丢失）。
+    for (int i = 0; i < 2; ++i)
+        if (std::fabs(a.uv2[i] - b.uv2[i]) > 1.0e-6f) return false;
+    for (int i = 0; i < 4; ++i)
+        if (std::fabs(a.tangent[i] - b.tangent[i]) > 1.0e-5f) return false;
+    if (a.morphBase != b.morphBase) return false;
+    if (a.morphCount != b.morphCount) return false;
     return true;
 }
 
@@ -102,8 +128,12 @@ float measureAcmr(const std::vector<std::uint32_t>& indices,
 // ------------------------------------------------------------ 焊接
 
 void weldVertices(std::vector<Vertex>& vertices,
-                  std::vector<std::uint32_t>& indices, float positionEpsilon) {
-    if (vertices.empty() || indices.empty()) return;
+                  std::vector<std::uint32_t>& indices, float positionEpsilon,
+                  std::vector<std::uint32_t>* remapOut) {
+    if (vertices.empty() || indices.empty()) {
+        if (remapOut) remapOut->clear();
+        return;
+    }
 
     std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> buckets;
     buckets.reserve(vertices.size() / 2 + 8);
@@ -129,6 +159,11 @@ void weldVertices(std::vector<Vertex>& vertices,
         }
         remap[i] = found;
     }
+
+    // remap 必须在**早退之前**交出去：早退时 remap 是恒等映射，
+    // 但调用方（morph 重映射）照样需要它。返回一个空 vector 会让
+    // "没焊"和"没算"变成两种状态 —— 而调用方无从分辨，只能猜。
+    if (remapOut) *remapOut = remap;
 
     if (out.size() == vertices.size()) return;   // 没得焊（已经是最简）
 
@@ -294,19 +329,198 @@ bool indicesFitU16(const std::vector<std::uint32_t>& indices) {
     return true;
 }
 
+// ------------------------------------------------------------ morph 的三步
+
+// 第 1 步（焊接**前**）：把"这个顶点参与哪些 target、偏移是多少"编码进
+// `morphBase` / `morphCount`，让焊接把它们当作顶点身份的一部分。
+//
+// 为什么要编码而不是直接留哨兵：`weldVertices` 只看 `Vertex` 的字段。
+// 如果 morph 归属不在字段里，一个"在 target_3 里往前鼓 2mm"的顶点会和
+// 一个"不在任何 target 里"的完全相同的顶点焊在一起 —— 形变静默丢失，
+// 而且几何完全正确，只有做表情的时候才看得出。
+//
+// 编码用 64 位 FNV 的低 32 位。碰撞概率 2^-32，再乘上"morphCount 也必须
+// 相等"这一道，实际风险可以忽略。焊接之后这里存的值会被
+// `buildMorphStream` 覆盖成真正的流下标 —— 所以它是**临时值**，
+// 不要在任何别处读它。
+void prepareMorphIdentity(SourceSubMesh& sm) {
+    const std::size_t V = sm.vertices.size();
+    if (sm.morphTargets.empty()) {
+        for (Vertex& v : sm.vertices) {
+            v.morphBase = kNoMorphBase;
+            v.morphCount = 0;
+        }
+        return;
+    }
+
+    std::vector<std::uint64_t> h(V, 0xcbf29ce484222325ull);
+    std::vector<std::uint32_t> cnt(V, 0);
+    for (std::size_t t = 0; t < sm.morphTargets.size(); ++t) {
+        const SourceMorphTarget& mt = sm.morphTargets[t];
+        for (std::size_t k = 0; k < mt.vertices.size(); ++k) {
+            const std::uint32_t v = mt.vertices[k];
+            if (v >= V) continue;
+            h[v] = mix(h[v], static_cast<std::uint64_t>(t));
+            if (k < mt.positionDeltas.size()) {
+                const glm::vec3& p = mt.positionDeltas[k];
+                h[v] = mix(h[v], quantize(p.x, 1.0e5f));
+                h[v] = mix(h[v], quantize(p.y, 1.0e5f));
+                h[v] = mix(h[v], quantize(p.z, 1.0e5f));
+            }
+            if (k < mt.normalDeltas.size()) {
+                const glm::vec3& n = mt.normalDeltas[k];
+                h[v] = mix(h[v], quantize(n.x, 1.0e5f));
+                h[v] = mix(h[v], quantize(n.y, 1.0e5f));
+                h[v] = mix(h[v], quantize(n.z, 1.0e5f));
+            }
+            ++cnt[v];
+        }
+    }
+    for (std::size_t v = 0; v < V; ++v) {
+        sm.vertices[v].morphBase = cnt[v]
+                                       ? static_cast<std::uint32_t>(h[v] ^ (h[v] >> 32))
+                                       : kNoMorphBase;
+        sm.vertices[v].morphCount = cnt[v];
+    }
+}
+
+// 第 2 步（焊接**后**）：按 remap 把 delta 表的顶点下标改到新空间。
+//
+// 两个旧顶点焊成一个新顶点时，它们的归属**必定相同**（焊接键里含归属
+// 哈希），所以取第一条、丢掉重复记录即可。结果按新下标升序，保证
+// "同一份 FBX 烤两次逐字节相同"。
+void remapMorphTargets(SourceSubMesh& sm, const std::vector<std::uint32_t>& remap) {
+    if (sm.morphTargets.empty() || remap.empty()) return;
+    const std::size_t V = sm.vertices.size();
+    for (SourceMorphTarget& mt : sm.morphTargets) {
+        std::vector<std::uint32_t> idx;
+        idx.reserve(mt.vertices.size());
+        for (std::uint32_t oldV : mt.vertices) {
+            const std::uint32_t nv =
+                (oldV < remap.size()) ? remap[oldV] : kNoMorphBase;
+            if (nv < V) idx.push_back(nv);
+        }
+        std::sort(idx.begin(), idx.end());
+        idx.erase(std::unique(idx.begin(), idx.end()), idx.end());
+
+        // 重新取值：新下标 nv 对应哪个旧下标。用"排序后的位置"反查会
+        // 丢掉"这条记录原来带的是什么" —— 所以先建映射再取。
+        std::unordered_map<std::uint32_t, std::size_t> firstOld;
+        for (std::size_t k = 0; k < mt.vertices.size(); ++k) {
+            const std::uint32_t oldV = mt.vertices[k];
+            const std::uint32_t nv =
+                (oldV < remap.size()) ? remap[oldV] : kNoMorphBase;
+            if (nv >= V) continue;
+            firstOld.emplace(nv, k);   // 只保留第一条（emplace 不覆盖）
+        }
+
+        std::vector<std::uint32_t> newV;
+        std::vector<glm::vec3> newP, newN;
+        newV.reserve(idx.size());
+        newP.reserve(idx.size());
+        newN.reserve(idx.size());
+        for (std::uint32_t nv : idx) {
+            auto it = firstOld.find(nv);
+            if (it == firstOld.end()) continue;
+            const std::size_t k = it->second;
+            newV.push_back(nv);
+            newP.push_back(k < mt.positionDeltas.size() ? mt.positionDeltas[k]
+                                                        : glm::vec3(0.0f));
+            newN.push_back(k < mt.normalDeltas.size() ? mt.normalDeltas[k]
+                                                      : glm::vec3(0.0f));
+        }
+        mt.vertices = std::move(newV);
+        mt.positionDeltas = std::move(newP);
+        mt.normalDeltas = std::move(newN);
+    }
+}
+
+// 第 3 步（所有会改下标的操作都做完之后）：把"每 target 的稀疏表"翻成
+// "扁平流 + 每个顶点的 (base, count)"。
+//
+// 顺序规则：按顶点升序；同一顶点内按 target 升序。这两条决定了字节级的
+// 输出，任何一条变了"烤两次相同"就没了 —— 所以显式排序，不依赖
+// `unordered_map` 的遍历顺序。
+void buildMorphStream(SourceSubMesh& sm) {
+    const std::size_t V = sm.vertices.size();
+    sm.morphStream.clear();
+
+    if (sm.morphTargets.empty()) {
+        for (Vertex& v : sm.vertices) {
+            v.morphBase = kNoMorphBase;
+            v.morphCount = 0;
+        }
+        return;
+    }
+
+    struct Slot {
+        std::uint32_t target;
+        glm::vec3 pos;
+        glm::vec3 nrm;
+    };
+    std::vector<std::vector<Slot>> per(V);
+    for (std::size_t t = 0; t < sm.morphTargets.size(); ++t) {
+        const SourceMorphTarget& mt = sm.morphTargets[t];
+        for (std::size_t k = 0; k < mt.vertices.size(); ++k) {
+            const std::uint32_t v = mt.vertices[k];
+            if (v >= V) continue;
+            Slot s;
+            s.target = static_cast<std::uint32_t>(t);
+            s.pos = k < mt.positionDeltas.size() ? mt.positionDeltas[k] : glm::vec3(0.0f);
+            s.nrm = k < mt.normalDeltas.size() ? mt.normalDeltas[k] : glm::vec3(0.0f);
+            per[v].push_back(s);
+        }
+    }
+
+    std::uint32_t cursor = 0;
+    for (std::size_t v = 0; v < V; ++v) {
+        std::vector<Slot>& lst = per[v];
+        if (lst.empty()) {
+            sm.vertices[v].morphBase = kNoMorphBase;
+            sm.vertices[v].morphCount = 0;
+            continue;
+        }
+        std::sort(lst.begin(), lst.end(), [](const Slot& a, const Slot& b) {
+            return a.target < b.target;
+        });
+        sm.vertices[v].morphBase = cursor;
+        sm.vertices[v].morphCount = static_cast<std::uint32_t>(lst.size());
+        for (const Slot& s : lst) {
+            SourceMorphDelta d;
+            d.position = s.pos;
+            d.target = s.target;
+            d.normal = s.nrm;
+            d.vertex = static_cast<std::uint32_t>(v);
+            sm.morphStream.push_back(d);
+            ++cursor;
+        }
+    }
+}
+
 OptimizeStats optimizeSubMesh(SourceSubMesh& sm, bool doWeld, bool doCache) {
     OptimizeStats st;
     st.verticesIn = static_cast<std::uint32_t>(sm.vertices.size());
     st.indicesIn = static_cast<std::uint32_t>(sm.indices.size());
     st.acmrIn = measureAcmr(sm.indices, st.verticesIn);
 
+    // 顺序是**有强制理由**的，不能重排：
+    //   ① 归属编码必须在焊接前 —— 否则焊接看不到 morph，会把
+    //      "带形变的顶点"和"不带形变的相同顶点"合并；
+    //   ② delta 重映射必须紧跟焊接 —— remap 只在那一刻有效；
+    //   ③ 流化必须最后 —— 它要在最终顶点下标空间上写 morphBase。
+    prepareMorphIdentity(sm);
+
     if (doWeld) {
         const std::size_t before = sm.vertices.size();
-        weldVertices(sm.vertices, sm.indices);
+        std::vector<std::uint32_t> remap;
+        weldVertices(sm.vertices, sm.indices, 1.0e-5f, &remap);
         st.welded = sm.vertices.size() < before;
+        remapMorphTargets(sm, remap);
     }
 
     if (doCache) optimizeForCache(sm.indices, static_cast<std::uint32_t>(sm.vertices.size()));
+
+    buildMorphStream(sm);
 
     st.verticesOut = static_cast<std::uint32_t>(sm.vertices.size());
     st.indicesOut = static_cast<std::uint32_t>(sm.indices.size());

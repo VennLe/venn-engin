@@ -54,7 +54,15 @@ OLD = mk("assets/shaders/decal.frag",
          # 阶段六/七（2026-10-22）：自研二进制资产链的两个**新顶层目录**。
          # 同样先放进基准，让下面的 fixture 是"改了"而不是"新增"。
          "assetio/MeshFormat.cpp",
-         "assetc/main.cpp")
+         "assetc/main.cpp",
+         # §13（顶点格式 112 B）：让下面的 fixture 是"改了"而不是"新增"。
+         # 新增会触发"未登记点名"，那验证的是另一条分支。
+         "assetio/Vertex.h",
+         # §16（两骨 IK，2026-10-25 第八刀）：同理 —— 让下面那两条 IK 的
+         # fixture 是"改了"而不是"新增"。
+         "engine/animation/TwoBoneIK.cpp",
+         "engine/animation/AnimatorSystem.cpp",
+         "engine/assets/Mesh.h")
 
 
 def with_change(*paths, drop=()):
@@ -150,7 +158,43 @@ run("editor/InspectorPanel.cpp → 面板块全家族", OLD,
           # 2026-10-24（第六轮）：Layer materials 上方新增"材质包目录 + 档位
           # + Refresh"两行（`INS-MATSRC-DIR/TIER/REFRESH/STATUS`）。
           # 这条用例走的就是那几个控件，改 `drawMaterialSourceRow` 必重跑。
-          "verify_material_import"})
+          "verify_material_import",
+          # 2026-10-25（A1）：Material 段的 shadingModel 下拉多了第三档
+          # "Toon"（`kShading[] = {"Default","Skin","Toon"}`）—— 改这个文件
+          # 当然该重跑"着色模型 → 变体掩码 → 像素"那条用例。
+          "verify_toon_shading",
+          # 2026-10-25（P0-2/B）：Material 段新增 Render Queue / Sort Order
+          # 两个输入框（紧跟 Double Sided 之后）。改这个文件当然该重跑
+          # "渲染顺序 → 谁画在上面"那条用例。
+          "verify_render_queue",
+          # 2026-10-25（§15）：Animation 页签新增 Morph 段（每根滑条一个
+          # `SliderFloat`，标签取自 `MorphRig::channels()[c].name`）。
+          # 滑条与 `morph.set` 命令走同一个 `assets::setMorphWeight`，
+          # 所以改这里要重跑 GPU 形变那条像素用例。
+          "verify_morph_gpu",
+          # 2026-10-25（§16 第八刀）：同一个 `drawTabAnimation` 末尾又多了
+          # 两段 —— `Two Bone IK`（Enabled / Target / 只读链解析 / 三个骨名 /
+          # Weight / Pole mode / Pole vector）与 `Bone Attachment`
+          # （host / bone / Offset / Local rot）。它们改的是**组件字段**，
+          # 而 verify_ik 的 K1/K2 正是"组件字段 → 求解 → 像素"那条链的判据。
+          "verify_ik"})
+# 2026-10-25（§16 第八刀）：两骨 IK 的求解器本体。
+# 期望里**必然**带 verify_anim_runtime / verify_character_import /
+# verify_player_character —— 它们三个都登记了 `engine/animation/**` 整层。
+# 判据是"自己那条一定在"，不是"只有自己那条"（与 AutoRig / ProcAnim 同理）：
+# 换个角度说，`verify_ik` 单独挂在这三个名字旁边，价值在于**标明归属** ——
+# 一眼能看出"改求解器是为了验 IK 的像素"，而不是"又要跑四条动画用例"。
+run("engine/animation/TwoBoneIK.cpp → 两骨 IK", OLD,
+    with_change("engine/animation/TwoBoneIK.cpp"),
+    want={"verify_ik", "verify_anim_runtime", "verify_character_import",
+          "verify_player_character"})
+# `AnimatorSystem.*` 比上面多一个 owner：三层（LookAt → IK → 弹簧骨）的
+# **施加顺序**与"perform 结束时推进弹簧骨"都在这里，`verify_player_feel`
+# 的平滑过渡判据读的也是这条链 → 改它必须连它一起跑。
+run("engine/animation/AnimatorSystem.cpp → 三层顺序", OLD,
+    with_change("engine/animation/AnimatorSystem.cpp"),
+    want={"verify_ik", "verify_anim_runtime", "verify_character_import",
+          "verify_player_character", "verify_player_feel"})
 run("assets/shaders/fg_taa.frag → taa", OLD,
     with_change("assets/shaders/fg_taa.frag"), want={"verify_taa"})
 run("删除 decal.frag → 也算变更", OLD,
@@ -178,7 +222,30 @@ run("assets/game.json → 只跑 verify_runtime_states + verify_audio", OLD,
 # 注意 `engine/assets/**`（运行时加载器 / 自检）是 GLOBAL，那条路径走全量，
 # 不在这个 fixture 的期望里 —— 这也是"只登记非横切"的现场证明。
 run("assetio/MeshFormat.cpp → verify_vmesh", OLD,
-    with_change("assetio/MeshFormat.cpp"), want={"verify_vmesh"})
+    with_change("assetio/MeshFormat.cpp"),
+    # 2026-10-25（§13）：MESH 区块的 stride 与区块版本搬到 verify_vertex_format
+    # 之后，这个文件变成**两个** owner。这不是"多跑一条以防万一"——
+    # 它真的同时是格式总主（offsets/区块表，verify_vmesh 的账目判据）和
+    # 顶点布局（stride/版本，verify_vertex_format 的 A1 判据）。
+    # §14 又加了**第三个**：MORPH 区块的读写也在这里（verify_morph 的
+    # A/B/C 三组）。三个 owner 不是设计失误 —— 这个文件就是"容器格式"
+    # 本身，容器增加一个区块，账目、顶点布局、区块内部数据三者都会动。
+    # §15 加了**第四个**：GPU 形变的 MORPH 区块 v2（channel 表 + offset_weights
+    # 预乘）也落在这里。像素用例看起来"只关心渲染"，但它读的那份 .vmesh
+    # 就是这里写出来的 —— 格式坏了它是第一个受害者（角色加载失败 = 视口空白）。
+    want={"verify_vmesh", "verify_vertex_format", "verify_morph",
+          "verify_morph_gpu"})
+# §13 的正主：顶点布局本身的改动只该惊动顶点格式那条。但 `assetio/**`
+# 被 verify_vmesh 整层登记着（格式总主），所以期望里必然带它 ——
+# 判据是"自己那条一定在"，不是"只有自己那条"（与下面 AutoRig/ProcAnim 同理）。
+run("assetio/Vertex.h → verify_vertex_format", OLD,
+    with_change("assetio/Vertex.h"),
+    want={"verify_vmesh", "verify_vertex_format"})
+# `engine/assets/Mesh.h` 是属性表 / stride 的来源，属**横切**（`engine/assets/**`
+# 登记为 GLOBAL）→ 期望全量。把它写成 fixture 是为了钉住"它确实横切"：
+# 哪天有人把 engine/assets/** 从 GLOBAL 摘出来，这条会立刻红。
+run("engine/assets/Mesh.h → 横切（全量）", OLD,
+    with_change("engine/assets/Mesh.h"), want=None)
 run("assetc/main.cpp → verify_vmesh", OLD,
     with_change("assetc/main.cpp"),
     # 2026-10-22 起 assetc 还挂了绑骨（--autorig）与程序化动画（--procanim）
@@ -218,7 +285,12 @@ run("editor/CharacterWindow.cpp → 预览与地形并存", OLD,
           "verify_char_locomotion", "verify_char_preview"})
 run("engine/render/RenderTarget.cpp → 预览与地形并存", OLD,
     with_change("engine/render/RenderTarget.cpp"),
-    want={"verify_collision_play", "verify_drs", "verify_preview_terrain"})
+    # 2026-10-25 加 verify_outline：描边的几何缓冲视图
+    # （`HdrTarget::geometryView()`）就是在 RenderTarget::apply /
+    # recreatePost 里跟着 recreate 传下去的 —— 漏传的表现是"第一帧有
+    # 描边、resize 一次之后描边读到已释放的图"。
+    want={"verify_collision_play", "verify_drs", "verify_preview_terrain",
+          "verify_outline"})
 # 2026-10-22 P4：移动状态机抽成 `engine/animation/Locomotion.*`，编辑器 Play
 # 与 Game.exe 共用同一份。它错了的表现是"腿不动"或"停下不播 idle"——只有
 # verify_char_locomotion 看得见，所以它必须是 owner 之一。

@@ -7,6 +7,19 @@
 // ============================================================
 
 #include "ecs/Entity.h"
+// 弹簧骨 / LookAt 的参数结构体（纯 POD）。
+//
+// 头注释那条"ecs 是叶子层"是针对 **assets** 的：组件里存 assets 的指针，
+// 所以只要前向声明就够了，依赖方向是 assets → ecs 单向。
+// 这里情况不同：`SpringBoneSettings` 是**值成员**（不是指针），必须有完整
+// 类型；而 `animation/SpringBone.h` 只依赖 assets + glm，**不反向依赖 ecs**
+// —— 所以这条路没有环。（`water/WaterBody.h` 是同一个先例。）
+//
+// 为什么不把参数摊平成 8 个字段塞进组件：那会让"哪些字段属于弹簧骨"变成
+// 隐性知识，Inspector、序列化、自检三处各维护一份字段清单，必然漂移。
+#include "animation/LookAt.h"
+#include "animation/SpringBone.h"
+#include "animation/TwoBoneIK.h"
 #include "water/WaterBody.h"
 
 #include <glm/glm.hpp>
@@ -163,6 +176,27 @@ struct SkinnedMeshComponent {
     bool fading() const { return fadeDur > 0.0f && !fadeFromClip.empty(); }
 };
 
+// ---------------- 表情 / 形变滑条（§15）----------------
+//
+// 挂在**模型根实体**上（与 SkinnedMeshComponent 同一位置、同一理由：
+// 一个角色的所有 primitive 共享一张滑条表）。
+//
+// 为什么权重表是"每通道一个 float"而不是"每 target 一个"：
+//   · target 下标是**子网格内局部**的（同一张脸按材质切成 19 个桶就有 19
+//     套编号），按 target 驱动等于要求调用方自己跨桶换算；
+//   · in-between shape key 让"一个滑条挂多个 target"，按通道驱动才是
+//     DCC 里的语义。
+// 换算（通道 → 每子网格每 target）由 `assets::MorphRig::evaluate` 做，
+// 每帧每角色一次。
+//
+// ⚠ `weights` 的长度语义：**允许短**。短了的部分一律当 0 —— 这样"只关心
+//   一个滑条"的调用方写 `weights[3] = 1` 也不必先开满整张表。写入前请
+//   用 `assets::setMorphWeight()`（它按下标 resize）。
+struct MorphComponent {
+    assets::Model* model = nullptr;      // 提供 MorphRig（可空 = 解析不了名字）
+    std::vector<float> weights;          // 下标 = MorphRig 的通道下标
+};
+
 // ---------------- 动画器（角色链 A1）----------------
 //
 // 与 SkinnedMeshComponent 的分工：
@@ -199,8 +233,13 @@ struct AnimatorComponent {
     // 一份）—— 这样"只有一个模型"的常见情况不用填两遍。
     assets::Model* model = nullptr;
 
-    // 控制器资产（A2 起是 `assets/animators/*.anim.json`）。
-    // **空 = 单 clip 直放模式**（A1 就是这一种），此时只用 defaultClip。
+    // 控制器资产（`assets/animators/*.anim.json`，schema 见
+    // `animation/AnimController.h` 的文件头）。
+    // **空 = 单 clip 直放模式**，此时只用 defaultClip。
+    //
+    // ✅ 2026-10-25 起**真的有读取者**：`AnimatorSystem::tick` 会按这个路径
+    //    加载控制器并每帧推进状态机（`animation/AnimController.*`）。
+    //    加载失败不崩 —— 打一条 `ANIM-CTL-BAD` 并回落到单 clip 直放。
     std::string controllerPath;
 
     // 单 clip 直放模式播哪一段。**只在 clipName 还空着时补一次**
@@ -219,8 +258,9 @@ struct AnimatorComponent {
     // 运行时（**不序列化**）
     // ==================================================================
 
-    // A2 的状态机游标：当前状态下标 + 在该状态里待了多久。
-    // -1 = 还没初始化（A1 的单 clip 模式一直是 -1）。
+    // 状态机游标：当前状态下标 + 在该状态里待了多久。
+    // -1 = 还没初始化（单 clip 直放模式一直是 -1）。
+    // ✅ 2026-10-25 起由 `animation/AnimController` 读写（hasExitTime 用它）。
     int stateIndex = -1;
     float stateTime = 0.0f;
 
@@ -238,6 +278,16 @@ struct AnimatorComponent {
     std::unordered_map<std::string, float> floatParams;
     std::unordered_map<std::string, bool> boolParams;
     std::unordered_map<std::string, bool> triggerParams;
+
+    // 参数黑板是否已按控制器声明初始化过。**不序列化**：
+    // 开新场景就该重新按 default 初始化。用 `appliedDefaultClip` 兼职不行
+    // —— 那是"补过 defaultClip"的标记，跟控制器是两件事（先走单 clip、
+    // 后挂控制器时会被误判为"已初始化"）。
+    bool paramsInitialized = false;
+
+    // 状态机"目标 clip 缺失"警告的按位去重（bit = state 下标）。
+    // 不加这个就会每帧刷一条 —— 而日志被刷屏的后果是**整段日志没人看**。
+    unsigned ctlWarnMask = 0;
 };
 
 // ---------------- 动画键盘映射（角色面板里给 clip 绑键）----------------
@@ -1286,6 +1336,78 @@ struct GameStartComponent {
 
     // 运行时是否按本点生成玩家。关掉 = 这个场景没有玩家（纯观览/过场场景）。
     bool spawnOnRun = true;
+};
+
+// ---------------- 弹簧骨（L4 表演层，2026-10-25）----------------
+//
+// 头发 / 裙摆 / 尾巴的质点弹簧。靠**骨骼名前缀**识别链，所以：
+//   · 资产格式不动（`.vmesh` 不升版本、模型不用重烤）
+//   · 没挂本组件的角色逐像素不变
+//
+// 链的判据见 `animation/SpringBone.h` 头文件 ②：
+//   自己匹配前缀 **且** 父骨也匹配 → 参与模拟
+//   自己匹配、父骨不匹配         → attach（受动画驱动，物理不碰）
+// 所以 `hair_01`（缝在 head 上）是固定端，`hair_02..04` 才会飘。
+//
+// ⚠ prefixes 空 = 用内置默认（**裸 `hair` / `skirt`**，不带分隔符）。
+//   真实资产的头发骨常叫 `hair1_L`（alicia 就是这样），所以默认不能写
+//   `hair_` —— 下划线在数字后面，一个都匹配不上。美术命名完全不合规时
+//   在这里手填，不区分大小写。
+//
+// ⚠ 运行时状态（质点位置）**不在这里** —— 它在 `AnimatorSystem` 里按实体
+//   索引。放组件里的话会跟着撤销快照与序列化走，读档时恢复半个物理状态
+//   比不恢复更怪（和 fadeT 不进存档是同一条理由）。
+struct SpringBoneComponent {
+    animation::SpringBoneSettings settings;
+    std::vector<std::string> prefixes;
+};
+
+// ---------------- LookAt（L2 表演层，2026-10-25）----------------
+//
+// 单骨（默认 head）看向一个**世界坐标点**。
+//
+// 注意是"世界点"而不是"目标实体"：指向实体要在上层每帧把实体位置写进
+// target。组件里存 Entity 会让序列化（实体 id 是运行时序号，见
+// character_pipeline_roadmap 的坑 8）与撤销复杂化，收益只是省一行代码。
+struct LookAtComponent {
+    animation::LookAtSettings settings;
+};
+
+// ---------------- 两骨 IK（L1 修正层，2026-10-25 第八刀）----------------
+//
+// 让 root→mid→end 这条两节链的末端落在 `settings.target` 上。
+// 求解器**无状态**（见 `animation/TwoBoneIK.h`），所以这个组件全是配置，
+// 没有任何"上一帧"字段 —— 也就没有"运行时状态要不要进存档"这个问题。
+//
+// 为什么 target 是**世界坐标点**而不是 Entity：与 LookAt 同一条约定。
+// 想把脚钉在一个移动的平台上，由控制层每帧写 target 即可。
+//
+// ⚠ `target` 是 **glTF 场景空间**（Y-up），不是引擎的 Z-up 世界空间。
+//   `Pose` 全程在 glTF 空间里，Y-up→Z-up 那一转在 push.model 里。
+//   在编辑器里"按视口点击位置填 target"必须先转回 glTF 空间，
+//   否则脚会去够一个转了 90° 的点（看起来像"IK 方向全错"）。
+struct TwoBoneIKComponent {
+    animation::TwoBoneIKSettings settings;
+};
+
+// ---------------- 骨骼挂点（2026-10-25 第八刀）----------------
+//
+// 把**本实体**钉在 `hostName` 那个角色实体的 `boneName` 骨骼上。
+//
+// 为什么宿主按**名字**引用：实体 id 是运行时序号，进存档/撤销都不稳定
+// （见 character_pipeline_roadmap 坑 8），而名字在场景 JSON 里是稳定的。
+// 代价是每帧一次线性查找 —— 挂点通常个位数，可以忽略。
+//
+// ⚠ 本实体**不要**做成宿主的子节点：组件每帧直接写它的（局部）变换，
+//   挂在宿主下面会叠加两次宿主变换，症状是挂点绕着宿主飞。
+//
+// offset / eulerDeg 在**骨骼空间**：换姿势、换骨架都会跟着动。
+struct BoneAttachmentComponent {
+    std::string hostName;
+    std::string boneName;
+    glm::vec3 offset{0.0f};
+    glm::vec3 eulerDeg{0.0f};
+    bool enabled = true;
 };
 
 } // namespace ecs

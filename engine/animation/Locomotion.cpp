@@ -9,6 +9,7 @@
 
 #include "animation/Locomotion.h"
 
+#include "animation/ClipSwitch.h"
 #include "assets/Skeleton.h"
 #include "core/Logger.h"
 
@@ -29,51 +30,6 @@ constexpr unsigned kTriggerMissingBit = 1u << 4;
 // 但**必须与默认值相等**，否则同一台机器上"走路切换"和"按 K 起跳"的
 // 过渡手感会不一致。
 constexpr float kTriggerBlendSec = 0.20f;
-
-// 把 clip / 播放头写到两处权威字段上。
-//
-// 为什么两处都写：没有 AnimatorComponent 时 `SkinnedMeshComponent` 的四项
-// 是权威；有它时**它的**四项是权威（见 Components.h）。这里两边都写，
-// 谁在权威位上都不会出现"改了不动"。
-//
-// `blendSec > 0` 且确实在换 clip 时，把旧的 clip 名与播放头记进
-// `fadeFrom*`，由 AnimatorSystem 在采样阶段做双采样混合（P5）。
-// ⚠ 旧播放头必须取**当时**的权威值（有 AnimatorComponent 时是 an->time），
-//   取错会从旧片段的第 0 帧开始淡入 —— 腿会突然"缩回去再迈出来"。
-void setClip(ecs::SkinnedMeshComponent& sk, ecs::AnimatorComponent* an,
-             const std::string& clip, bool restart, float blendSec) {
-    if (sk.clipName != clip) {
-        if (blendSec > 0.0f && !sk.clipName.empty()) {
-            sk.fadeFromClip = sk.clipName;
-            sk.fadeFromTime = an ? an->time : sk.time;
-            sk.fadeT = 0.0f;
-            sk.fadeDur = blendSec;
-        } else {
-            // 硬切（或第一次选 clip）：清掉残留的过渡，别让它淡进来
-            sk.fadeFromClip.clear();
-            sk.fadeT = 0.0f;
-            sk.fadeDur = 0.0f;
-        }
-        sk.clipName = clip;
-        if (restart) sk.time = 0.0f;
-    }
-    if (an) {
-        if (restart) an->time = 0.0f;
-        an->appliedDefaultClip = true;  // 我们亲自选了 clip，别再补 defaultClip
-    }
-}
-
-void setPlaying(ecs::SkinnedMeshComponent& sk, ecs::AnimatorComponent* an,
-                bool playing) {
-    sk.playing = playing;
-    if (an) an->playing = playing;
-}
-
-void setLoop(ecs::SkinnedMeshComponent& sk, ecs::AnimatorComponent* an,
-             bool loop) {
-    sk.loop = loop;
-    if (an) an->loop = loop;
-}
 
 } // namespace
 
@@ -100,7 +56,7 @@ LocomotionFrame updateLocomotion(LocomotionRuntime& rt,
             f.triggerActive = true;
             return f;
         }
-        setLoop(sk, an, rt.restoreLoop);
+        setClipLoop(sk, an, rt.restoreLoop);
         rt.triggerClip.clear();
     }
 
@@ -155,9 +111,9 @@ LocomotionFrame updateLocomotion(LocomotionRuntime& rt,
     // ---- 4) 套用 ----
     if (want != sk.clipName) {
         const std::string from = sk.clipName;
-        setClip(sk, an, want, cfg.restartOnSwitch, cfg.blendSeconds);
-        setPlaying(sk, an, true);
-        setLoop(sk, an, true);   // 状态机的四段永远是循环的
+        switchClip(sk, an, want, cfg.restartOnSwitch, cfg.blendSeconds);
+        setClipPlaying(sk, an, true);
+        setClipLoop(sk, an, true);   // 状态机的四段永远是循环的
         VK_LOG_INFO("%s-ANIM state=%s clip=%s (from='%s') speed=%.2f ground=%d "
                     "blend=%.2fs",
                     t, kName[state], want.c_str(), from.c_str(),
@@ -184,8 +140,8 @@ LocomotionFrame updateLocomotion(LocomotionRuntime& rt,
         ++rt.idleRetriggers;
         // 重放同一段 → **硬切**（blend=0）：这里不是"换动作"，是"同一段
         // 从头再来"，淡入淡出会让它看起来卡一下。
-        setClip(sk, an, want, true, 0.0f);
-        setPlaying(sk, an, true);
+        switchClip(sk, an, want, true, 0.0f);
+        setClipPlaying(sk, an, true);
         sk.time = 0.0f;
         if (an) an->time = 0.0f;
         VK_LOG_INFO("%s-ANIM-IDLE retrigger=%d idle=%.2fs clip=%s",
@@ -224,9 +180,9 @@ bool playTriggerClip(LocomotionRuntime& rt, ecs::SkinnedMeshComponent& sk,
 
     // 强播也走过渡（从当前姿态淡入）：直接跳到 Jump 的第 0 帧看不出是
     // "起跳"还是"闪现"。
-    setClip(sk, an, clip, true, kTriggerBlendSec);
-    setPlaying(sk, an, true);
-    setLoop(sk, an, false);   // 一次性动作：播到最后一帧就停（不循环）
+    switchClip(sk, an, clip, true, kTriggerBlendSec);
+    setClipPlaying(sk, an, true);
+    setClipLoop(sk, an, false);   // 一次性动作：播到最后一帧就停（不循环）
     sk.time = 0.0f;
     if (an) an->time = 0.0f;
 

@@ -53,9 +53,15 @@ float measureAcmr(const std::vector<std::uint32_t>& indices,
 //   变了但说不出哪里不对"的一类回归，宁可不焊。
 // ⚠ 蒙皮权重**必须**参与哈希：同一个位置在两组骨骼权重下是两个顶点，
 //   焊掉之后角色会有一部分顶点跟着错误的骨头动。
+//
+// `remapOut` 可选，返回"旧下标 → 新下标"。morph 的 delta 表按下标存，
+// 焊接换了下标就必须跟着改（否则整张脸按错误的顶点形变）。
+// **没有焊接时它也是恒等映射、而不是空的** —— 空 vector 会让调用方
+// 无法区分"没焊"和"没算"。
 void weldVertices(std::vector<Vertex>& vertices,
                   std::vector<std::uint32_t>& indices,
-                  float positionEpsilon = 1.0e-5f);
+                  float positionEpsilon = 1.0e-5f,
+                  std::vector<std::uint32_t>* remapOut = nullptr);
 
 // 面积加权法线重建（顶点法线 = 相邻三角形面法线 × 面积 的归一化和）。
 // 只在"法线全是 (0,0,0)"时才该被调用 —— 有法线就去覆盖它等于

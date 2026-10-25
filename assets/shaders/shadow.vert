@@ -59,6 +59,7 @@ layout(push_constant) uniform Push {
     vec4 skin;   // x = jointBase（y/z/w 未用）
     // x = 索引（级联号 或 阴影图层号）
     // y = 0 → CSM 取 FrameUBO.lightSpace[x]；1 → 局部光取 records[x].matrix
+    // z = morph 槽位（§15；0 = 没有形变）
     vec4 which;
 } push;
 
@@ -67,16 +68,52 @@ layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
 layout(location = 3) in uvec4 inJoints;
 layout(location = 4) in vec4 inWeights;
+// morph（§15）：影子必须跟着表情/形变走。不做的话"脸在笑、影子还是平的"
+// —— 对小幅表情看不出，对体型类形变（胖瘦、肌肉）一眼就能发现。
+layout(location = 7) in uint inMorphBase;
+layout(location = 8) in uint inMorphCount;
+
+// morph 三件套（与 pbr.vert 的 set0/binding 25/26/27 同一批 buffer）。
+struct MorphDelta {
+    vec3 position;   //  0
+    uint target;     // 12
+    vec3 normal;     // 16
+    uint vertex;     // 28
+};
+layout(set = 0, binding = 25) readonly buffer MorphDeltas {
+    MorphDelta morphDeltas[];
+};
+layout(set = 0, binding = 26) readonly buffer MorphWeights {
+    float morphWeights[];
+};
+layout(set = 0, binding = 27) readonly buffer MorphSlots {
+    uvec4 morphSlots[];
+};
 
 void main() {
-    vec4 localPos = vec4(inPos, 1.0);
+    // ---- 形变（在蒙皮之前，与 pbr.vert 逐位同一套算式）----
+    vec3 morphPos = vec3(0.0);
+    if (inMorphCount > 0u) {
+        const uint slot = uint(push.which.z + 0.5);
+        const uvec4 mi = morphSlots[slot];
+        if (mi.z > 0u) {
+            const uint base = mi.x + inMorphBase;
+            const uint n = min(inMorphCount, 256u);
+            for (uint i = 0u; i < n; ++i) {
+                const MorphDelta d = morphDeltas[base + i];
+                morphPos += d.position * morphWeights[mi.y + d.target];
+            }
+        }
+    }
+
+    vec4 localPos = vec4(inPos + morphPos, 1.0);
     if (dot(inWeights, vec4(1.0)) > 0.0) {
         mat4 skinMat =
               jointBuf.jointMats[int(push.skin.x) + int(inJoints.x)] * inWeights.x
             + jointBuf.jointMats[int(push.skin.x) + int(inJoints.y)] * inWeights.y
             + jointBuf.jointMats[int(push.skin.x) + int(inJoints.z)] * inWeights.z
             + jointBuf.jointMats[int(push.skin.x) + int(inJoints.w)] * inWeights.w;
-        localPos = skinMat * vec4(inPos, 1.0);
+        localPos = skinMat * vec4(inPos + morphPos, 1.0);
     }
 
     const int idx = int(push.which.x);

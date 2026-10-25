@@ -184,10 +184,21 @@ json overridesToJson(const assets::Material::Params& p, std::uint32_t bits) {
     if (bits & M::kOvAlphaCutoff) j["alphaCutoff"] = p.alphaCutoff;
     if (bits & M::kOvDitherAlpha) j["ditherAlpha"] = p.ditherAlpha;
     if (bits & M::kOvShadingModel)
-        j["shadingModel"] =
-            (p.shadingModel == M::ShadingModel::Skin) ? "skin" : "default";
+        j["shadingModel"] = M::shadingModelName(p.shadingModel);
     if (bits & M::kOvDoubleSided) j["doubleSided"] = p.doubleSided;
     if (bits & M::kOvHeightScale) j["heightScale"] = p.heightScale;
+    // 渲染顺序（P0-2/B）。只在被覆盖时写 —— 与上面同一条规则：
+    // overrides 里只出现"用户真的改过、或者该跟随母材质"的字段。
+    if (bits & M::kOvRenderQueue) j["renderQueue"] = p.renderQueue;
+    if (bits & M::kOvSortOrder) j["sortOrder"] = p.sortOrder;
+    // A 类语义槽的标量（2026-10-25）。与上面同一条规则：只写被覆盖的。
+    if (bits & M::kOvRampSteps) j["rampSteps"] = p.rampSteps;
+    if (bits & M::kOvMatcapStrength) j["matcapStrength"] = p.matcapStrength;
+    if (bits & M::kOvMatcapRotate) j["matcapRotate"] = p.matcapRotate;
+    if (bits & M::kOvSdfShadowStrength)
+        j["sdfShadowStrength"] = p.sdfShadowStrength;
+    if (bits & M::kOvDetailStrength) j["detailStrength"] = p.detailStrength;
+    if (bits & M::kOvDetailTiling) j["detailTiling"] = p.detailTiling;
     return j;
 }
 
@@ -235,9 +246,10 @@ std::uint32_t overridesFromJson(const json& jo, assets::Material::Params& p) {
         bits |= M::kOvDitherAlpha;
     }
     if (jo.contains("shadingModel")) {
-        p.shadingModel = (jo.value("shadingModel", std::string()) == "skin")
-                             ? M::ShadingModel::Skin
-                             : M::ShadingModel::Default;
+        // 字符串 → 枚举走 Material 的同名函数：新增着色模型（如 Toon）
+        // 只改那一处，序列化/Inspector/材质导入三条链自动跟上。
+        p.shadingModel =
+            M::shadingModelFromName(jo.value("shadingModel", std::string()));
         bits |= M::kOvShadingModel;
     }
     if (jo.contains("doubleSided")) {
@@ -247,6 +259,42 @@ std::uint32_t overridesFromJson(const json& jo, assets::Material::Params& p) {
     if (jo.contains("heightScale")) {
         p.heightScale = jo.value("heightScale", p.heightScale);
         bits |= M::kOvHeightScale;
+    }
+    // 渲染顺序（P0-2/B）。⚠ 用 int 读而不是 value<int32_t> 的默认：
+    // 老场景没有这两个键 → contains() 为 false → 位不亮 → 参数保持
+    // importDefaults/母材质的值，正好是"没改过"的语义。
+    if (jo.contains("renderQueue")) {
+        p.renderQueue = jo.value("renderQueue", p.renderQueue);
+        bits |= M::kOvRenderQueue;
+    }
+    if (jo.contains("sortOrder")) {
+        p.sortOrder = jo.value("sortOrder", p.sortOrder);
+        bits |= M::kOvSortOrder;
+    }
+    // A 类语义槽（2026-10-25）。同样是"键在 = 被覆盖"，缺席不亮位。
+    if (jo.contains("rampSteps")) {
+        p.rampSteps = jo.value("rampSteps", p.rampSteps);
+        bits |= M::kOvRampSteps;
+    }
+    if (jo.contains("matcapStrength")) {
+        p.matcapStrength = jo.value("matcapStrength", p.matcapStrength);
+        bits |= M::kOvMatcapStrength;
+    }
+    if (jo.contains("matcapRotate")) {
+        p.matcapRotate = jo.value("matcapRotate", p.matcapRotate);
+        bits |= M::kOvMatcapRotate;
+    }
+    if (jo.contains("sdfShadowStrength")) {
+        p.sdfShadowStrength = jo.value("sdfShadowStrength", p.sdfShadowStrength);
+        bits |= M::kOvSdfShadowStrength;
+    }
+    if (jo.contains("detailStrength")) {
+        p.detailStrength = jo.value("detailStrength", p.detailStrength);
+        bits |= M::kOvDetailStrength;
+    }
+    if (jo.contains("detailTiling")) {
+        p.detailTiling = jo.value("detailTiling", p.detailTiling);
+        bits |= M::kOvDetailTiling;
     }
     return bits;
 }
@@ -267,6 +315,13 @@ json materialTextureOverrides(const assets::Material* mat) {
     put("metallicMap", mat->metallicMap);
     put("emissiveMap", mat->emissiveMap);
     put("heightMap", mat->heightMap);
+    // A 类语义槽（2026-10-25）。与上面同一条规则：只写带 TextureSource
+    // 的（用户手工换上的），模型/资产自带的不写 —— 写出来是 null，
+    // 读回来不该去覆盖它。
+    put("rampMap", mat->rampMap);
+    put("matcapMap", mat->matcapMap);
+    put("sdfShadowMap", mat->sdfShadowMap);
+    put("detailMap", mat->detailMap);
     return tex;
 }
 
@@ -343,11 +398,11 @@ json materialToJson(const assets::Material* mat) {
     j["alphaBlend"] = (mat->alphaMode == assets::Material::AlphaMode::Blend);
     j["alphaCutoff"] = mat->alphaCutoff;
     j["ditherAlpha"] = mat->ditherAlpha;
-    // 着色模型（R4-2）：写字符串。"default" 不写也能读（见 resolveMaterial），
+    // 着色模型（R4-2 / A1）：写字符串。"default" 不写也能读（见 resolveMaterial），
     // 但显式写出让人一眼看得出这个材质走哪条漫反射路径。
-    j["shadingModel"] =
-        (mat->shadingModel == assets::Material::ShadingModel::Skin) ? "skin"
-                                                                   : "default";
+    // 用 Material 的枚举→名字函数，新增模型（Toon）不必再回来改这里 ——
+    // 这里曾经是 `== Skin ? "skin" : "default"`，加 Toon 时会静默存成 default。
+    j["shadingModel"] = assets::Material::shadingModelName(mat->shadingModel);
     j["albedo"] = textureSourceToJson(mat->albedoMap);
     j["normal"] = textureSourceToJson(mat->normalMap);
     j["orm"] = textureSourceToJson(mat->ormMap);
@@ -359,6 +414,25 @@ json materialToJson(const assets::Material* mat) {
     // 走非 PARALLAX 变体（逐像素与引入前相同），heightScale 也就不参与。
     j["heightMap"] = textureSourceToJson(mat->heightMap);
     j["heightScale"] = mat->heightScale;
+    // 渲染顺序（P0-2/B）。全量写（与 heightScale/alphaCutoff 同风格）：
+    // 默认的 2000/0 也写出来，读回来还是 2000/0，所以"写得多"不影响正确性，
+    // 换来的是"打开文件就能看见每个部件排在第几层"—— 二次元角色的排序
+    // 是美术要反复调的东西，藏在默认值里反而更难查。
+    j["renderQueue"] = mat->renderQueue;
+    j["sortOrder"] = mat->sortOrder;
+    // A 类语义槽（2026-10-25）。全量写（与 heightScale / renderQueue 同风格）：
+    // 默认值也写出来，读回来还是默认值，所以"写得多"不影响正确性；
+    // 换来的是打开文件就能看见"这个角色的明暗带是几档"。
+    j["rampMap"] = textureSourceToJson(mat->rampMap);
+    j["rampSteps"] = mat->rampSteps;
+    j["matcapMap"] = textureSourceToJson(mat->matcapMap);
+    j["matcapStrength"] = mat->matcapStrength;
+    j["matcapRotate"] = mat->matcapRotate;
+    j["sdfShadowMap"] = textureSourceToJson(mat->sdfShadowMap);
+    j["sdfShadowStrength"] = mat->sdfShadowStrength;
+    j["detailMap"] = textureSourceToJson(mat->detailMap);
+    j["detailStrength"] = mat->detailStrength;
+    j["detailTiling"] = mat->detailTiling;
     return j;
 }
 
@@ -382,6 +456,10 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
         if (auto* t = get("metallicMap")) m->metallicMap = t;
         if (auto* t = get("emissiveMap")) m->emissiveMap = t;
         if (auto* t = get("heightMap")) m->heightMap = t;
+        if (auto* t = get("rampMap")) m->rampMap = t;
+        if (auto* t = get("matcapMap")) m->matcapMap = t;
+        if (auto* t = get("sdfShadowMap")) m->sdfShadowMap = t;
+        if (auto* t = get("detailMap")) m->detailMap = t;
     };
 
     // ---- 实例（W1-4）----
@@ -601,6 +679,16 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
     // 所以 checker/solid/file 三种来源都能往返。
     assets::Texture* heightMap = resolveTexture(
         am, jm.contains("heightMap") ? jm["heightMap"] : json(nullptr));
+    // A 类语义槽（2026-10-25）。缺键 → resolveTexture 拿到 nullptr →
+    // 页表里兜底成白图 → 乘法/加法恒等 → 老场景逐像素不变。
+    assets::Texture* rampMap = resolveTexture(
+        am, jm.contains("rampMap") ? jm["rampMap"] : json(nullptr));
+    assets::Texture* matcapMap = resolveTexture(
+        am, jm.contains("matcapMap") ? jm["matcapMap"] : json(nullptr));
+    assets::Texture* sdfShadowMap = resolveTexture(
+        am, jm.contains("sdfShadowMap") ? jm["sdfShadowMap"] : json(nullptr));
+    assets::Texture* detailMap = resolveTexture(
+        am, jm.contains("detailMap") ? jm["detailMap"] : json(nullptr));
 
     assets::Material* mat = am.makeMaterialPBR(
         name, albedo, normal, orm, baseColor, roughness, metallic, emissive,
@@ -612,6 +700,17 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
         mat->emissiveMap = emissiveMap;
         mat->heightMap = heightMap;
         mat->heightScale = jm.value("heightScale", 0.05f);
+        // A 类语义槽（2026-10-25）
+        mat->rampMap = rampMap;
+        mat->rampSteps = jm.value("rampSteps", 0.0f);
+        mat->matcapMap = matcapMap;
+        mat->matcapStrength = jm.value("matcapStrength", 0.0f);
+        mat->matcapRotate = jm.value("matcapRotate", 0.0f);
+        mat->sdfShadowMap = sdfShadowMap;
+        mat->sdfShadowStrength = jm.value("sdfShadowStrength", 1.0f);
+        mat->detailMap = detailMap;
+        mat->detailStrength = jm.value("detailStrength", 1.0f);
+        mat->detailTiling = jm.value("detailTiling", 1.0f);
         mat->normalScale = normalScale;
         mat->ao = ao;
         mat->alphaMode = jm.value("alphaBlend", false)
@@ -629,11 +728,16 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
         }
         mat->alphaCutoff = jm.value("alphaCutoff", 0.5f);
         mat->ditherAlpha = jm.value("ditherAlpha", false);
-        // 着色模型（R4-2）。缺席 = 老场景 = Default（逐像素不变）。
-        mat->shadingModel =
-            (jm.value("shadingModel", std::string()) == "skin")
-                ? assets::Material::ShadingModel::Skin
-                : assets::Material::ShadingModel::Default;
+        // 着色模型（R4-2 / A1）。缺席 = 老场景 = Default（逐像素不变）。
+        // 走 Material 的字符串→枚举函数：这里曾经是
+        // `== "skin" ? Skin : Default`，新增 Toon 时会**静默读丢** ——
+        // 场景里写着 "toon"、读回来变成 Default，画面看着像"Toon 没生效"。
+        mat->shadingModel = assets::Material::shadingModelFromName(
+            jm.value("shadingModel", std::string()));
+        // 渲染顺序（P0-2/B）。缺席 = 老场景 = 2000/0 = 只按距离排，
+        // 与改造前逐像素一致。
+        mat->renderQueue = jm.value("renderQueue", mat->renderQueue);
+        mat->sortOrder = jm.value("sortOrder", mat->sortOrder);
     }
     return mat;
 }
@@ -1470,6 +1574,64 @@ bool skinnedFromJson(assets::AssetManager& am, const json& j,
 }
 
 // ------------------------------------------------------------
+// 表情滑条（§15，2026-10-25）
+// ------------------------------------------------------------
+//
+// 只存两件事：模型来源 + 每个滑条的当前值。
+//
+// ⚠ 权重**按名字**存，不按下标。
+//   下标是 `MorphRig` 建表顺序（子网格序 × channel 序），重烤一次 FBX
+//   就可能变（美术加了一个 shape、材质桶顺序变了都会重排）。按下标存
+//   的后果是"表情没报错、但套到了另一根滑条上"—— 比丢掉更糟。
+//   名字是唯一的语义键，也是 `setMorphWeight` 用的键。
+//
+// ⚠ 值为 0 的滑条**不写**：一只角色 49 根滑条、绝大多数时候全是 0，
+//   全写进去会把场景 JSON 撑出 49 行噪音。读回来时缺的键就是 0。
+json morphToJson(const ecs::MorphComponent& mp) {
+    json src = modelSourceToJson(mp.model);
+    if (src.is_null()) return nullptr;
+    json j = std::move(src);
+    json w = json::object();
+    if (mp.model) {
+        const assets::MorphRig& rig = mp.model->morphRig;
+        const std::size_t n = std::min(mp.weights.size(), rig.channelCount());
+        for (std::size_t c = 0; c < n; ++c) {
+            if (mp.weights[c] == 0.0f) continue;
+            w[rig.channels()[c].name] = mp.weights[c];
+        }
+    }
+    if (!w.empty()) j["weights"] = std::move(w);
+    return j;
+}
+
+// 返回 false = 重建失败（资产缺失 / 这个模型没有 morph）→ 调用方不建组件。
+bool morphFromJson(assets::AssetManager& am, const json& j,
+                   ecs::MorphComponent& out) {
+    if (!j.is_object()) return false;
+    assets::Model* model = modelFromSource(am, j, "morph");
+    if (!model) return false;
+    // 资产换了（比如美术重新导了个没有 blend shape 的版本）→ 不建组件，
+    // 而不是建一个"49 根滑条一条也不驱动"的空壳。
+    if (model->morphRig.empty()) return false;
+
+    out.model = model;
+    out.weights.assign(model->morphRig.channelCount(), 0.0f);
+    if (j.contains("weights") && j["weights"].is_object()) {
+        for (auto it = j["weights"].begin(); it != j["weights"].end(); ++it) {
+            // 认不出的名字**忽略**而不是报错：重烤后滑条改名是很常见的
+            // （target_0 → Blink_smile），为这个拒绝整张场景没道理。
+            const int ci = model->morphRig.channelIndex(it.key());
+            if (ci < 0) continue;
+            if (it.value().is_number()) {
+                out.weights[static_cast<std::size_t>(ci)] =
+                    it.value().get<float>();
+            }
+        }
+    }
+    return true;
+}
+
+// ------------------------------------------------------------
 // 动画器（角色链 A1，2026-10-19）
 // ------------------------------------------------------------
 //
@@ -1526,6 +1688,150 @@ bool animatorFromJson(assets::AssetManager& am, const json& j,
     out.boolParams.clear();
     out.triggerParams.clear();
     return true;
+}
+
+// ---------------- 弹簧骨 / LookAt（L2/L4 表演层，2026-10-25）----------------
+//
+// 两个都是"纯配置"，没有运行时字段要排除 —— 质点位置与上一帧的偏转角
+// 存在 `AnimatorSystem` 里，压根不在这两个组件上（见 Components.h 的注释）。
+//
+// ⚠ 老场景没有这两个键 → 不建组件 → `applyPerformance` 直接 return →
+//   与加功能之前逐像素相同。与 `skinned` / `animator` 同一条硬约束。
+json springBoneToJson(const ecs::SpringBoneComponent& sb) {
+    json j;
+    const animation::SpringBoneSettings& s = sb.settings;
+    j["enabled"] = s.enabled;
+    j["gravity"] = {s.gravity.x, s.gravity.y, s.gravity.z};
+    j["wind"] = {s.wind.x, s.wind.y, s.wind.z};
+    j["damping"] = s.damping;
+    j["restStiffness"] = s.restStiffness;
+    j["iterations"] = s.iterations;
+    j["maxStep"] = s.maxStep;
+    // 空 = 用内置默认前缀。写成 [] 而不是省略：用户可能刻意清空过它。
+    j["prefixes"] = sb.prefixes;
+    return j;
+}
+
+void springBoneFromJson(const json& j, ecs::SpringBoneComponent& out) {
+    if (!j.is_object()) return;
+    animation::SpringBoneSettings& s = out.settings;
+    s.enabled = j.value("enabled", true);
+    s.gravity = vec3FromJson(j.contains("gravity") ? j["gravity"] : json(nullptr),
+                             s.gravity);
+    s.wind = vec3FromJson(j.contains("wind") ? j["wind"] : json(nullptr), s.wind);
+    s.damping = j.value("damping", 0.90f);
+    s.restStiffness = j.value("restStiffness", 0.15f);
+    s.iterations = j.value("iterations", 3);
+    s.maxStep = j.value("maxStep", 1.0f / 30.0f);
+    out.prefixes.clear();
+    if (j.contains("prefixes") && j["prefixes"].is_array()) {
+        for (const auto& p : j["prefixes"]) {
+            if (p.is_string()) out.prefixes.push_back(p.get<std::string>());
+        }
+    }
+}
+
+json lookAtToJson(const ecs::LookAtComponent& la) {
+    json j;
+    const animation::LookAtSettings& s = la.settings;
+    j["enabled"] = s.enabled;
+    j["hasTarget"] = s.hasTarget;
+    j["boneName"] = s.boneName;
+    j["target"] = {s.target.x, s.target.y, s.target.z};
+    j["weight"] = s.weight;
+    j["maxAngleDeg"] = s.maxAngleDeg;
+    j["smoothRate"] = s.smoothRate;
+    j["forwardLocal"] = {s.forwardLocal.x, s.forwardLocal.y, s.forwardLocal.z};
+    return j;
+}
+
+void lookAtFromJson(const json& j, ecs::LookAtComponent& out) {
+    if (!j.is_object()) return;
+    animation::LookAtSettings& s = out.settings;
+    s.enabled = j.value("enabled", true);
+    s.hasTarget = j.value("hasTarget", false);
+    s.boneName = j.value("boneName", std::string());
+    s.target = vec3FromJson(j.contains("target") ? j["target"] : json(nullptr),
+                            s.target);
+    s.weight = j.value("weight", 1.0f);
+    s.maxAngleDeg = j.value("maxAngleDeg", 55.0f);
+    s.smoothRate = j.value("smoothRate", 12.0f);
+    s.forwardLocal = vec3FromJson(
+        j.contains("forwardLocal") ? j["forwardLocal"] : json(nullptr),
+        s.forwardLocal);
+}
+
+// ---------------- 两骨 IK / 骨骼挂点（L1 修正层，2026-10-25 第八刀）----------------
+//
+// 两个都是纯配置：IK 求解器**无状态**（见 `animation/TwoBoneIK.h`），
+// 挂点的矩阵每帧从活着的 jointMatrices 重算。所以没有"运行时字段要排除"。
+//
+// ⚠ `target` 是 **glTF 场景空间**（Y-up），不是引擎的 Z-up 世界空间。
+//   存盘时不做任何换算 —— 与 `Pose` / `LookAt::target` 保持同一套坐标，
+//   在这里转一次的话"读回来的值和存下去的值不同"，diff 场景时永远有噪音。
+//
+// ⚠ `poleMode` 存成**字符串**（"animation" / "vector"）而不是整数：
+//   枚举加值时整数会静默错位（旧文件里的 1 变成新枚举的另一项），
+//   字符串错了只会退回默认。
+json ikToJson(const ecs::TwoBoneIKComponent& ik) {
+    json j;
+    const animation::TwoBoneIKSettings& s = ik.settings;
+    j["enabled"] = s.enabled;
+    j["hasTarget"] = s.hasTarget;
+    j["target"] = {s.target.x, s.target.y, s.target.z};
+    j["rootBone"] = s.rootBone;
+    j["midBone"] = s.midBone;
+    j["endBone"] = s.endBone;
+    j["weight"] = s.weight;
+    j["poleMode"] = (s.poleMode == animation::TwoBoneIKSettings::PoleFromVector)
+                        ? "vector"
+                        : "animation";
+    j["poleVector"] = {s.poleVector.x, s.poleVector.y, s.poleVector.z};
+    j["maxReachScale"] = s.maxReachScale;
+    return j;
+}
+
+void ikFromJson(const json& j, ecs::TwoBoneIKComponent& out) {
+    if (!j.is_object()) return;
+    animation::TwoBoneIKSettings& s = out.settings;
+    s.enabled = j.value("enabled", true);
+    s.hasTarget = j.value("hasTarget", false);
+    s.target = vec3FromJson(j.contains("target") ? j["target"] : json(nullptr),
+                            s.target);
+    s.rootBone = j.value("rootBone", std::string());
+    s.midBone = j.value("midBone", std::string());
+    s.endBone = j.value("endBone", std::string());
+    s.weight = j.value("weight", 1.0f);
+    const std::string mode = j.value("poleMode", std::string("animation"));
+    s.poleMode = (mode == "vector")
+                     ? animation::TwoBoneIKSettings::PoleFromVector
+                     : animation::TwoBoneIKSettings::PoleFromAnimation;
+    s.poleVector = vec3FromJson(
+        j.contains("poleVector") ? j["poleVector"] : json(nullptr),
+        s.poleVector);
+    s.maxReachScale = j.value("maxReachScale", 0.999f);
+}
+
+json attachToJson(const ecs::BoneAttachmentComponent& a) {
+    json j;
+    j["enabled"] = a.enabled;
+    // 宿主按**名字**存（实体 id 是运行时序号，进存档不稳定）
+    j["host"] = a.hostName;
+    j["bone"] = a.boneName;
+    j["offset"] = {a.offset.x, a.offset.y, a.offset.z};
+    j["eulerDeg"] = {a.eulerDeg.x, a.eulerDeg.y, a.eulerDeg.z};
+    return j;
+}
+
+void attachFromJson(const json& j, ecs::BoneAttachmentComponent& out) {
+    if (!j.is_object()) return;
+    out.enabled = j.value("enabled", true);
+    out.hostName = j.value("host", std::string());
+    out.boneName = j.value("bone", std::string());
+    out.offset = vec3FromJson(j.contains("offset") ? j["offset"] : json(nullptr),
+                              out.offset);
+    out.eulerDeg = vec3FromJson(
+        j.contains("eulerDeg") ? j["eulerDeg"] : json(nullptr), out.eulerDeg);
 }
 
 // ---------------- 实体 transform 关键帧轨道 ----------------
@@ -2275,6 +2581,18 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
                         js.is_null() ? 0 : 1);
         }
 
+        // 表情滑条（§15）。与 skinned 同一个实体（模型根），紧跟其后。
+        if (const auto* mp = w.get<ecs::MorphComponent>(it.entity)) {
+            json jm = morphToJson(*mp);
+            if (!jm.is_null()) je["morph"] = std::move(jm);
+            VK_LOG_INFO("SCENE-MORPH entity=%u stored=%d channels=%d",
+                        static_cast<unsigned>(it.entity.id),
+                        jm.is_null() ? 0 : 1,
+                        mp->model
+                            ? static_cast<int>(mp->model->morphRig.channelCount())
+                            : 0);
+        }
+
         // GPU 粒子发射器（R6-1）。与贴花 / 探针同理：发射器**没有网格**
         //（几何是顶点着色器现拼的 billboard），同样不适用 skipped++ 那句。
         if (const auto* fx = w.get<ecs::ParticleEmitterComponent>(it.entity))
@@ -2300,6 +2618,17 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
                         an->loop ? 1 : 0,
                         an->controllerPath.empty() ? 0 : 1);
         }
+
+        // 表演层（L2/L4，2026-10-25）。紧跟 animator：三者是同一个角色的
+        // 三层（播什么 / 头看哪 / 头发怎么飘），读档顺序上也没有依赖。
+        if (const auto* sb = w.get<ecs::SpringBoneComponent>(it.entity))
+            je["springBone"] = springBoneToJson(*sb);
+        if (const auto* la = w.get<ecs::LookAtComponent>(it.entity))
+            je["lookAt"] = lookAtToJson(*la);
+        if (const auto* ik = w.get<ecs::TwoBoneIKComponent>(it.entity))
+            je["ik"] = ikToJson(*ik);
+        if (const auto* at = w.get<ecs::BoneAttachmentComponent>(it.entity))
+            je["attach"] = attachToJson(*at);
 
         // 实体 transform 关键帧轨道（编辑器 Animation 模式的产物）。
         // 空轨道**不写** —— 否则每个用过的实体都会多一个 {"keys":[]}，
@@ -2396,6 +2725,13 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
             je.contains("character") || je.contains("trigger") ||
             je.contains("physicsMaterial") || je.contains("camera") ||
             je.contains("skinned") || je.contains("animator") ||
+            je.contains("morph") ||
+            // 表演层三件套 + IK + 挂点。**必须在这里**：一个只挂 IK/挂点的
+            // 实体可以没有网格（挂点是"钉在别人骨头上的空物体"就是典型），
+            // 漏了它会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+            // springBone / lookAt 原来也漏在这儿（同一类 bug），一起补。
+            je.contains("springBone") || je.contains("lookAt") ||
+            je.contains("ik") || je.contains("attach") ||
             je.contains("animClip") || je.contains("gameStart") ||
             je.contains("animKeys") ||
             je.contains("pointLight") || je.contains("spotLight") ||
@@ -2574,6 +2910,27 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
             }
         }
 
+        // ---- 表情滑条（§15）----
+        // 在 skinned 之后：`modelFromSource` 命中的是同一个 AssetManager
+        // 缓存项（键 = modelKey），所以 morphRig 已经建好了。
+        // ⚠ 老场景没有这个键 → 不建组件 → 逐像素不变（滑条全 0 时
+        //   GPU 形变分支本来就不执行，见 pbr.vert 的 `mi.z > 0`）。
+        if (je.contains("morph")) {
+            ecs::MorphComponent mp;
+            if (morphFromJson(assets, je["morph"], mp)) {
+                if (auto* p = w.get<ecs::MorphComponent>(e))
+                    *p = mp;
+                else
+                    w.add<ecs::MorphComponent>(e, mp);
+                VK_LOG_INFO("SCENE-MORPH entity=%u channels=%d ok=1",
+                            static_cast<unsigned>(e.id),
+                            static_cast<int>(mp.weights.size()));
+            } else {
+                VK_LOG_INFO("SCENE-MORPH entity=%u ok=0",
+                            static_cast<unsigned>(e.id));
+            }
+        }
+
         // ---- 动画器（角色链 A1）----
         // 必须在 skinned **之后**：它的 model 可以为空，靠 AnimatorSystem
         // 回退到刚建好的 SkinnedMeshComponent::model。
@@ -2597,6 +2954,60 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
                 VK_LOG_INFO("SCENE-ANIMATOR entity=%u ok=0",
                             static_cast<unsigned>(e.id));
             }
+        }
+
+        // 表演层（L2/L4）。必须在 skinned 之后 —— 两者的算法都要骨架，
+        // 而骨架来自 SkinnedMeshComponent::model。
+        if (je.contains("springBone")) {
+            ecs::SpringBoneComponent sb;
+            springBoneFromJson(je["springBone"], sb);
+            if (auto* p = w.get<ecs::SpringBoneComponent>(e))
+                *p = sb;
+            else
+                w.add<ecs::SpringBoneComponent>(e, sb);
+            VK_LOG_INFO("SCENE-SPRINGBONE entity=%u enabled=%d prefixes=%d",
+                        static_cast<unsigned>(e.id), sb.settings.enabled ? 1 : 0,
+                        static_cast<int>(sb.prefixes.size()));
+        }
+        if (je.contains("lookAt")) {
+            ecs::LookAtComponent la;
+            lookAtFromJson(je["lookAt"], la);
+            if (auto* p = w.get<ecs::LookAtComponent>(e))
+                *p = la;
+            else
+                w.add<ecs::LookAtComponent>(e, la);
+            VK_LOG_INFO("SCENE-LOOKAT entity=%u enabled=%d target=%d weight=%.2f",
+                        static_cast<unsigned>(e.id), la.settings.enabled ? 1 : 0,
+                        la.settings.hasTarget ? 1 : 0,
+                        static_cast<double>(la.settings.weight));
+        }
+        // IK：必须在 skinned 之后（要骨架才能解析链）；
+        // 挂点则只要宿主**存在**即可，但它引用的 jointMatrices 要等运行时
+        // 第一次 tick 才有 —— 读档时链没解析出来是正常的，不是错误。
+        if (je.contains("ik")) {
+            ecs::TwoBoneIKComponent ik;
+            ikFromJson(je["ik"], ik);
+            if (auto* p = w.get<ecs::TwoBoneIKComponent>(e))
+                *p = ik;
+            else
+                w.add<ecs::TwoBoneIKComponent>(e, ik);
+            VK_LOG_INFO("SCENE-IK entity=%u enabled=%d target=%d weight=%.2f "
+                        "root=[%s]",
+                        static_cast<unsigned>(e.id), ik.settings.enabled ? 1 : 0,
+                        ik.settings.hasTarget ? 1 : 0,
+                        static_cast<double>(ik.settings.weight),
+                        ik.settings.rootBone.c_str());
+        }
+        if (je.contains("attach")) {
+            ecs::BoneAttachmentComponent at;
+            attachFromJson(je["attach"], at);
+            if (auto* p = w.get<ecs::BoneAttachmentComponent>(e))
+                *p = at;
+            else
+                w.add<ecs::BoneAttachmentComponent>(e, at);
+            VK_LOG_INFO("SCENE-ATTACH entity=%u host=[%s] bone=[%s]",
+                        static_cast<unsigned>(e.id), at.hostName.c_str(),
+                        at.boneName.c_str());
         }
 
         // 实体 transform 关键帧轨道
@@ -2860,6 +3271,13 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
             je.contains("character") || je.contains("trigger") ||
             je.contains("physicsMaterial") || je.contains("camera") ||
             je.contains("skinned") || je.contains("animator") ||
+            je.contains("morph") ||
+            // 表演层三件套 + IK + 挂点。**必须在这里**：一个只挂 IK/挂点的
+            // 实体可以没有网格（挂点是"钉在别人骨头上的空物体"就是典型），
+            // 漏了它会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+            // springBone / lookAt 原来也漏在这儿（同一类 bug），一起补。
+            je.contains("springBone") || je.contains("lookAt") ||
+            je.contains("ik") || je.contains("attach") ||
             je.contains("animClip") || je.contains("gameStart") ||
             je.contains("animKeys") ||
             je.contains("pointLight") || je.contains("spotLight") ||

@@ -296,6 +296,35 @@ static const ParamDesc kParamsPost[] = {
     PBool("post.fxaa", "FXAA", "MYVK_FXAA", ParamTier::Basic,
           "tonemap 之后的快速抗锯齿，补 MSAA 处理不了的贴图边缘锯齿。"),
 };
+
+// ---- 描边（NPR，2026-10-25）----
+// 数据来自**深度预通道顺带写出的几何缓冲**（世界法线 + 线性距离），
+// 不额外画一遍几何、不需要平滑法线、不动顶点格式。
+//
+// ⚠ 全部是 env + UI，**没有**写进 .vscene：描边是"项目级画风"而不是
+//   "某个物体的属性"，逐物体配置会让同一个角色在两张地图里线宽不同。
+static const ParamDesc kParamsOutline[] = {
+    PBool("outline.enabled", "Outline", "MYVK_OUTLINE", ParamTier::Basic,
+          "深度 + 法线双判据边缘检测描边。关闭时合成走与引入前"
+          "**逐像素相同**的路径（回归基线）。"),
+    PFloat("outline.width", "Width (px)", "MYVK_OUTLINE_WIDTH", 0.5f, 6.0f,
+           ParamTier::Basic,
+           "采样步长（渲染分辨率下的像素）。1.0 = 最细的一像素线。"),
+    PFloat("outline.depthThreshold", "Depth threshold", "MYVK_OUTLINE_DEPTH",
+           0.002f, 0.3f, ParamTier::Advanced,
+           "相邻像素的**相对**深度差阈值（|d0-d1|/min）。"
+           "0.05 ≈ 5% 的距离跳变；用相对值才能让远近物体的线一样粗。"
+           "调太低会把掠射角的大平面判成边缘（远处地面上一层星点）。"),
+    PFloat("outline.normalThreshold", "Normal threshold",
+           "MYVK_OUTLINE_NORMAL", 0.05f, 1.5f, ParamTier::Advanced,
+           "1-dot(n0,n1) 阈值。0.35 ≈ 49°；越小越容易把折痕也描出来。"),
+    PFloat("outline.strength", "Strength", "MYVK_OUTLINE_STRENGTH", 0.0f, 1.0f,
+           ParamTier::Basic, "线的不透明度（0 = 有线但看不见，用于对照）。"),
+    PColor3("outline.color", "Line color", "MYVK_OUTLINE_COLOR",
+            ParamTier::Basic,
+            "线的颜色（显示域，在 tonemap/调色/暗角之后混合，"
+            "所以不会被曝光和调色改变）。"),
+};
 static const ParamDesc kParamsAutoExp[] = {
     PBool("ae.enabled", "Auto exposure", "MYVK_AUTOEXP", ParamTier::Basic,
           "直方图 eye adaptation。开启后用自适应曝光替代 Exposure 滑条"
@@ -557,6 +586,13 @@ const FeatureDesc kFeatures[] = {
      ARRAY(kParamsColorGrading)},
     {"drs", "Dynamic Resolution", "Post", "R1-4", "post", "verify_drs",
      ARRAY(kParamsDrs)},
+
+    // ---- 描边（NPR）----
+    // 2026-10-25 新增。输入是深度预通道的几何缓冲 —— 不是另画一遍外壳，
+    // 所以它没有独立的 GPU 段（成本摊在 "post" 段里）。用例覆盖
+    // "开关两次画面必须回到基线"与"开描边确实产生边缘像素"。
+    {"outline", "Outline (NPR)", "Post", nullptr, "post", "verify_outline",
+     ARRAY(kParamsOutline)},
 
     // ---- 相机效果 ----
     {"dof", "Depth of Field", "Camera", nullptr, "framegraph", "verify_camfx",

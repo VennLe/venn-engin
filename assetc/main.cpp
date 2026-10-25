@@ -186,9 +186,21 @@ int doInfo(const Args& a) {
                     static_cast<unsigned long long>(info.vertexCount),
                     static_cast<unsigned long long>(info.indexCount),
                     info.index16 ? 1 : 0);
+        // 顶点格式世代（§13）。挂在**独立一行**上而不是接在上一行末尾：
+        // verify_vmesh 的 B2 正则是 `submeshes=(\d+) vertices=(\d+)
+        // indices=(\d+) index16=(\d)`，往它后面追加字段本身不会红，
+        // 但下一个人再追加就会踩在同一个位置上各写一遍。
+        std::printf("ASSETC   vfmt meshVersion=%u stride=%u\n",
+                    info.meshVersion, info.vertexStride);
         std::printf("ASSETC   joints=%u clips=%u materials=%u sourceHash=%016llx\n",
                     info.jointCount, info.clipCount, info.materialCount,
                     static_cast<unsigned long long>(info.sourceHash));
+        // morph 单独一行（§14）：0 也要打 —— "查过了，没有"和"忘了查"
+        // 在验收脚本里是两件事。
+        std::printf("ASSETC   morph targets=%u deltas=%llu channels=%u\n",
+                    info.morphTargetCount,
+                    static_cast<unsigned long long>(info.morphDeltaCount),
+                    info.morphChannelCount);
 
         // 世界包围盒 + "多高"。
         //
@@ -641,6 +653,12 @@ int main(int argc, char** argv) {
                     st.verticesIn, st.verticesOut, st.indicesIn, st.indicesOut,
                     static_cast<double>(st.acmrIn), static_cast<double>(st.acmrOut));
         std::printf("ASSETC   keys %zu -> %zu\n", st.keysIn, st.keysOut);
+        if (st.morphTargets > 0) {
+            std::printf("ASSETC   morph %u targets / %u channels, %zu deltas (%s)\n",
+                        st.morphTargets, st.morphChannels, st.morphDeltas,
+                        humanBytes(static_cast<std::uint32_t>(
+                            st.morphDeltas * sizeof(assetio::SourceMorphDelta))).c_str());
+        }
         std::printf("ASSETC   geometry %s -> file %s (%.2fx) in %.1f ms\n",
                     humanBytes(st.rawGeometryBytes).c_str(),
                     humanBytes(st.bytes).c_str(),

@@ -537,22 +537,27 @@ A1 新增 11 条数值断言（全部 PASS，ANIM-TOTAL pass=27 fail=0）
 > 按键映射。
 > **A2b ✅ 已完成（2026-10-22，P5）**：crossfade 接上了 —— `Pose` / `blendPose`
 > 是 A0-5 就备好的底座，`AnimatorSystem` 加了双采样 + smoothstep 权重。
+> **A2c ✅ 已完成（2026-10-25）**：`.anim.json` 控制器资产 + 数据驱动状态机 ——
+> `engine/animation/AnimController.*`（加载 / 校验 / 求值）+ `assets/animators/
+> humanoid.anim.json`（4 状态 8 转移）。`animator` 上七个占位字段里**五个**
+> 接通（`controllerPath` / `stateIndex` / `stateTime` / 三张参数表），
+> 只剩 `rootMotion` 仍是占位（A4）。验收在 `verify_anim_runtime.py`
+> 的 22 项 `sm_*` 断言；落地记录见 `docs/anime_gap_audit.md` §10。
 > 用法与设计见 `docs/character_locomotion.md` + `docs/player_feel.md`，
-> 代码在 `engine/animation/Locomotion.*` 与 `engine/animation/AnimatorSystem.*`。
-> **仍未做**：`.anim.json` 控制器资产（并进 A3）。
+> 代码在 `engine/animation/Locomotion.*`、`AnimController.*`、`ClipSwitch.*`
+> 与 `engine/animation/AnimatorSystem.*`。
 >
-> A2a 与本节规划的三处**有意偏离**（都是为了先把手感跑通、再谈过渡）：
+> A2a 与本节规划的**两处有意偏离**（第 3 条已由 A2bc 补齐）：
 > 1. **没有参数表**：状态由**物理真值**判（水平速度 / 是否贴地），不由输入轴判。
 >    输入轴判的经典 bug 是"按着 W 撞墙"→ 人在原地蹬腿；物理真值天然免疫。
-> 2. **没有控制器资产**：`LocomotionConfig` 是 C++ 结构体，字段来自
->    `RuntimeConfig::PlayerVisual`（Game.exe）与硬编码默认（编辑器 Play）。
->    等 A2b 做 `.anim.json` 时再把它读进来。
-> 3. **四态硬切，无淡入淡出**：切 clip 只改 `clipName` 与 `time=0`。肉眼能看出
->    跳帧，但**腿真的在动**（这比"过渡漂亮但腿不动"优先）。
+>    （A2c 起物理真值改成**喂进参数黑板**，判据仍是真值，只是可配了。）
+> 2. **没有控制器资产**：A2c 之前 `LocomotionConfig` 是 C++ 结构体。
+>    现在 `RuntimeConfig::PlayerVisual::controller` 指向
+>    `assets/animators/*.anim.json`，**空 = 仍走老的四态**（逐位不变）。
+> 3. ~~四态硬切，无淡入淡出~~ → A2b 已做 crossfade。
 >
-> A2a 的验收在 `tools/verify_char_locomotion.py`（15 条，C0~C10），
-> `run_regression.py` 已登记。本节下面 §A2 原有的验收表（数值级 blending）**仍然有效**，
-> 是 A2b 的准入条件。
+> A2a 的验收在 `tools/verify_char_locomotion.py`（20 条，C0~C10），
+> `run_regression.py` 已登记。本节下面 §A2 原有的验收表（数值级 blending）**仍然有效**。
 
 **目标**：`Speed > 0.1` 从 Idle 切 Walk，切换用 0.2s 淡入淡出。
 
@@ -584,6 +589,19 @@ A1 新增 11 条数值断言（全部 PASS，ANIM-TOTAL pass=27 fail=0）
 ```
 
 **实现要点**
+
+> **✅ 已全部落地（2026-10-25）**，代码在 `engine/animation/AnimController.*`。
+> 与本节原设计的**两处收敛**（都是实现时才发现原设计没有判别力）：
+> 1. **不加显式 `priority` 字段**。示例 JSON 里一度写了 `"priority": 10`，
+>    但解析器不读它 —— 那比没有更糟（写了以为生效）。`Any` 转移的优先级
+>    统一按**数组顺序**，与 §3.4 的决策一致。
+> 2. **目标 clip 不存在时忽略该转移**，而不是切过去。切过去的话
+>    `findClip` 返回 nullptr → `samplePose` 静默退回 rest → 画面是 T-pose，
+>    而日志里状态机一切正常。
+>
+> 校验清单全部实现（状态名重复 / 未知状态 / `from == to` / 条件引用未知参数
+> / 对 bool 用大小比较 / 对 trigger 用比较运算符 / clip 为空 / JSON 语法）。
+> 每条都带一句人话原因，失败时打 `ANIM-CTL-BAD path=... err=[...]`。
 
 - 参数：`float` / `bool` / `trigger`；**trigger 在一次转移被采纳后立即清零**
   （这是最容易写错的一条：不清零 → 每次回到 Idle 就立刻再跳一次）

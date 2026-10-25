@@ -87,25 +87,38 @@ double trackError(const AnimTrack& a, const AnimTrack& b, float time) {
 }
 
 struct ClipPair {
+    std::string name;       // 失败信息里要指到"哪一段 clip"
     std::vector<AnimTrack> before;
     std::vector<AnimTrack> after;
     float duration = 0.0f;
 };
 
-// 按 (joint,path) 配对。不能按下标 —— reduceClip 不删轨道，但**会**在
-// 未来的版本里合并同 joint 的 T/R/S，那时下标配对就会静默错位。
+// 按 (joint,path) 配对**轨道**。
+//
+// ⚠ 但**不**按名字配对 clip —— 这是 2026-10-25 改掉的一处错判：
+//   `FbxImport.cpp:527` 会把 `Namespace|Idle` 剥成 `Idle`，多 take 的
+//   FBX 于是能产出**两段同名 clip**（`anime_girl.fbx` 的 Idle 就是这样，
+//   这里实测 `sameName=2`）。按名字取"第一条"会让第二段的 before 去和
+//   第一段的 after 相比 —— 误差是一个恒定的 179.59°，看起来像"抽帧器
+//   把首帧删错了"，实际是拿错对象在比。查这个坑时先排除了"重复时间戳
+//   (dt0=0.0333)"和"同 joint 多通道 (dup=1)"，才轮到同名 clip。
+//
+//   改成**按下标配对**：`reduceClip` 原地改、既不删也不重排 clip，
+//   下标是精确对应关系。名字只用来在信息里指认，并作为"确实没重排"的
+//   断言 —— 主键是下标，不是名字。
 std::vector<ClipPair> pairClips(const std::vector<assetio::SourceClip>& before,
                                 const std::vector<assetio::SourceClip>& after) {
     std::vector<ClipPair> out;
-    for (const auto& a : before) {
-        const assetio::SourceClip* b = nullptr;
-        for (const auto& c : after)
-            if (c.name == a.name) { b = &c; break; }
-        if (!b) continue;
+    const std::size_t n = std::min(before.size(), after.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        const assetio::SourceClip& a = before[i];
+        const assetio::SourceClip& b = after[i];
+        if (a.name != b.name) continue;   // 重排过 → 不猜，跳过而不是错配
         ClipPair p;
+        p.name = a.name;
         p.duration = a.duration;
         for (const auto& t : a.tracks) p.before.push_back(toRuntimeTrack(t));
-        for (const auto& t : b->tracks) p.after.push_back(toRuntimeTrack(t));
+        for (const auto& t : b.tracks) p.after.push_back(toRuntimeTrack(t));
         out.push_back(std::move(p));
     }
     return out;
@@ -379,6 +392,131 @@ int runAssetSelfTest() {
             flag("rt_vertex_count_sane", countOk);
         }
 
+        // ---- 新顶点通道往返（§13，uv2 / morphBase / tangent）----
+        //
+        // ⚠ 上面那条 rt_vertex_subset 虽然按 sizeof(Vertex) 逐字节比过，
+        //   但它比的是"源里本来就有的值"。导入进来的资产**没有**切线、
+        //   没有 morph、多数没有 UV2 —— 于是那 24 个字节在两边都是 0，
+        //   比了等于没比。这一组才是"格式真的存下了这四个字段"的证据：
+        //   给读回来的模型人工注入可区分的值 → 再写一遍 → 再读一遍 →
+        //   按字节找回来。
+        //
+        // 也不能按下标找（焊接 + Forsyth 重排会改变顺序，见上面那段注释），
+        // 所以用"哈希分桶 + memcmp"的同一套办法定位。
+        {
+            assetio::SourceModel probe = rt;
+            bool seeded = false;
+            if (!probe.subMeshes.empty() && !probe.subMeshes[0].vertices.empty()) {
+                assetio::SourceSubMesh& sm = probe.subMeshes[0];
+                assetio::Vertex& v0 = sm.vertices[0];
+                v0.uv2[0] = 0.125f;
+                v0.uv2[1] = 0.875f;
+                v0.tangent[0] = 0.6f;   // 恰好是个单位向量（3-4-5）
+                v0.tangent[1] = 0.8f;
+                v0.tangent[2] = 0.0f;
+                v0.tangent[3] = -1.0f;
+                // morph 不能靠"直接写 morphBase = 12345"来验：读端有
+                // 硬自洽校验（流的下标必须真的指向这个顶点），伪造的值
+                // 会让整次读盘失败。所以造**真的** target 走完整条链：
+                // 两个 target 都影响顶点 0 → 焊接 → 流化 → 读回 → 逐条比对。
+                // 这比原来那条"注入一个假下标"强得多 —— 它测的是链路，
+                // 不是字段宽度。
+                sm.morphTargets.clear();
+                sm.morphTargets.resize(2);
+                sm.morphTargets[0].name = "probe_a";
+                sm.morphTargets[0].vertices = {0u};
+                sm.morphTargets[0].positionDeltas = {glm::vec3(0.11f, 0.22f, 0.33f)};
+                sm.morphTargets[0].normalDeltas = {glm::vec3(0.0f, 0.0f, 1.0f)};
+                sm.morphTargets[1].name = "probe_b";
+                sm.morphTargets[1].vertices = {0u};
+                sm.morphTargets[1].positionDeltas = {glm::vec3(-0.44f, 0.0f, 0.0f)};
+                sm.morphTargets[1].normalDeltas = {glm::vec3(1.0f, 0.0f, 0.0f)};
+                seeded = true;
+            }
+
+            std::vector<std::uint8_t> pb;
+            assetio::SourceModel back;
+            std::string perr;
+            bool pok = false;
+            if (seeded) {
+                pb = assetio::writeMeshFile(probe, wo);
+                pok = !pb.empty() &&
+                      assetio::readMeshFile(pb.data(), pb.size(), back, &perr);
+            }
+            bool found = false;
+            bool morphOk = false;
+            std::string morphWhy = "未执行";
+            if (pok && !back.subMeshes.empty()) {
+                // ⚠ 不能拿写盘**前**的顶点整字节 memcmp：`morphBase` /
+                //   `morphCount` 在写盘时才由 `buildMorphStream` 从
+                //   "哨兵 / 0" 重算成真实的流下标（§14）。那是**预期**
+                //   的变化，不是丢数据。所以比之前把这两个字段抹平，
+                //   其余 104 字节仍然逐字节比。
+                assetio::Vertex want = probe.subMeshes[0].vertices[0];
+                want.morphBase = 0;
+                want.morphCount = 0;
+                for (const auto& v : back.subMeshes[0].vertices) {
+                    assetio::Vertex got = v;
+                    got.morphBase = 0;
+                    got.morphCount = 0;
+                    if (std::memcmp(&got, &want, sizeof(assetio::Vertex)) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                // morph 的往返：名字 + 每条 delta 的 target/position/normal
+                const assetio::SourceSubMesh& bsm = back.subMeshes[0];
+                if (bsm.morphTargets.size() != 2) {
+                    morphWhy = "target 数 " + std::to_string(bsm.morphTargets.size()) +
+                               " != 2";
+                } else if (bsm.morphTargets[0].name != "probe_a" ||
+                           bsm.morphTargets[1].name != "probe_b") {
+                    morphWhy = "名字没往返";
+                } else if (bsm.morphStream.size() != 2) {
+                    morphWhy = "delta 数 " + std::to_string(bsm.morphStream.size()) +
+                               " != 2";
+                } else {
+                    // 顶点 0 在写盘的焊接里可能被并到别的下标，所以按
+                    // **值**找它，再用它的 morphBase/count 定位记录。
+                    const assetio::Vertex* pv = nullptr;
+                    for (const assetio::Vertex& v : bsm.vertices) {
+                        if (v.uv2[0] == 0.125f && v.uv2[1] == 0.875f) {
+                            pv = &v;
+                            break;
+                        }
+                    }
+                    if (!pv) {
+                        morphWhy = "带 morph 的顶点没找到";
+                    } else if (pv->morphCount != 2) {
+                        morphWhy = "morphCount " + std::to_string(pv->morphCount) + " != 2";
+                    } else if (static_cast<std::size_t>(pv->morphBase) + 2 >
+                               bsm.morphStream.size()) {
+                        morphWhy = "morphBase 越界";
+                    } else {
+                        const assetio::SourceMorphDelta& d0 = bsm.morphStream[pv->morphBase];
+                        const assetio::SourceMorphDelta& d1 =
+                            bsm.morphStream[pv->morphBase + 1];
+                        const bool ok =
+                            d0.target == 0 && d1.target == 1 &&
+                            d0.vertex == d1.vertex &&
+                            std::fabs(d0.position.x - 0.11f) < 1e-6f &&
+                            std::fabs(d1.position.x + 0.44f) < 1e-6f &&
+                            std::fabs(d0.normal.z - 1.0f) < 1e-6f &&
+                            std::fabs(d1.normal.x - 1.0f) < 1e-6f;
+                        morphOk = ok;
+                        morphWhy = ok ? "morph 两点往返一致"
+                                      : "delta 内容不一致";
+                    }
+                }
+            }
+            flag("rt_new_channels", seeded && pok && found,
+                 !seeded ? "没有可用的子网格"
+                         : (!pok ? ("读回失败: " + perr)
+                                 : (found ? "uv2/tangent 逐字节一致"
+                                          : "注入的顶点在写读后不存在")));
+            flag("rt_morph_roundtrip", seeded && pok && morphOk, morphWhy);
+        }
+
         // 动画
         {
             flag("rt_clips", rt.clips.size() == src.clips.size(),
@@ -426,6 +564,9 @@ int runAssetSelfTest() {
         const std::vector<ClipPair> pairs = pairClips(before, reduced);
         double worstKeyRot = 0.0, worstKeyPos = 0.0;
         double worstDenseRot = 0.0, worstDensePos = 0.0;
+        // 出错时只说"rot=179.59"是没法查的 —— 得知道是哪段 clip、哪根骨头、
+        // 哪个时刻。这些信息在循环里现成，只是第一版没留下来。
+        std::string worstAt;
         for (const auto& p : pairs) {
             for (const auto& tb : p.before) {
                 const AnimTrack* ta = findTrack(p.after, tb.joint,
@@ -433,10 +574,45 @@ int runAssetSelfTest() {
                 if (!ta) continue;
                 for (float t : tb.times) {
                     const double e = trackError(tb, *ta, t);
-                    if (tb.path == AnimTrack::Rotation)
-                        worstKeyRot = std::max(worstKeyRot, e);
-                    else if (tb.path == AnimTrack::Translation)
+                    if (tb.path == AnimTrack::Rotation) {
+                        if (e > worstKeyRot) {
+                            worstKeyRot = e;
+                            // `t0/dt0` 一起打出来：如果第一段的时间差是 0，
+                            // 说明轨道在起点有**重复时间戳**（烘焙产物常见），
+                            // 那时"在 t0 采样取哪一帧"本身是歧义的 ——
+                            // 一眼就能区分"抽帧器删错帧"和"数据本身有跳变"。
+                            const float t0 = tb.times.empty() ? 0.0f : tb.times[0];
+                            const float dt0 = tb.times.size() > 1
+                                                  ? tb.times[1] - tb.times[0]
+                                                  : 0.0f;
+                            // 同一 clip 里出现**多条**同 (joint,path) 的通道
+                            // 时，`findTrack` 只会拿到第一条 —— 这不是抽帧
+                            // 错了，是"拿另一个通道来比"。把条数打出来，
+                            // 一眼区分这两种完全不同的成因。
+                            int dup = 0;
+                            for (const auto& tt : p.after)
+                                if (tt.joint == tb.joint &&
+                                    static_cast<int>(tt.path) ==
+                                        static_cast<int>(tb.path))
+                                    ++dup;
+                            // 同名 clip 同样会错配：`pairClips` 按名字取
+                            // **第一条**。FBX 的 `Namespace|Idle` 被剥成
+                            // `Idle` 之后，多 take 文件里就会出现两个 `Idle`。
+                            int sameName = 0;
+                            for (const auto& q : pairs)
+                                if (q.name == p.name) ++sameName;
+                            worstAt = p.name + " joint=" + std::to_string(tb.joint) +
+                                      " t=" + std::to_string(t) +
+                                      " keys " + std::to_string(tb.times.size()) +
+                                      "->" + std::to_string(ta->times.size()) +
+                                      " t0=" + std::to_string(t0) +
+                                      " dt0=" + std::to_string(dt0) +
+                                      " dup=" + std::to_string(dup) +
+                                      " sameName=" + std::to_string(sameName);
+                        }
+                    } else if (tb.path == AnimTrack::Translation) {
                         worstKeyPos = std::max(worstKeyPos, e);
+                    }
                 }
                 // 密集采样：两点之间也会插值，误差可能略高于关键帧处
                 const float step = p.duration > 0.0f ? p.duration / 96.0f : 0.0f;
@@ -453,7 +629,7 @@ int runAssetSelfTest() {
         // 关键帧处：严格（容差的 1.05 倍，留浮点余量）
         flag("anim_err_at_keys", worstKeyRot <= 0.105 && worstKeyPos <= 1.05e-4,
              "rot=" + std::to_string(worstKeyRot) + ",pos=" +
-                 std::to_string(worstKeyPos));
+                 std::to_string(worstKeyPos) + (worstAt.empty() ? "" : (" @" + worstAt)));
         // 密集采样：3 倍容差（关键帧之间是长跨度插值，比逐帧插值误差大）
         flag("anim_err_dense", worstDenseRot <= 0.3 && worstDensePos <= 3.0e-4,
              "rot=" + std::to_string(worstDenseRot) + ",pos=" +

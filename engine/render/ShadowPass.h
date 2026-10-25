@@ -22,9 +22,11 @@
 // 本 Pass 不持有 set 0：贴图由 Renderer 绑到 set 0 / binding 1。
 // ============================================================
 
+#include "ecs/Entity.h"      // MorphSlotFn 的入参，30 行、只依赖 <cstdint>
 #include "render/RenderTypes.h"
 #include "rhi/VulkanCommon.h"
 
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -101,13 +103,19 @@ public:
     }
     VkSampler sampler() const { return m_sampler; }
 
+    // morph 槽位提供者（§15）：入参是**实体 + 该实体这次要画的网格**，
+    // 返回本帧 MorphInstances 的下标（0 = 没有形变）。
+    // 由 Renderer 注入 —— pass 不知道（也不该知道）morph SSBO 怎么分配。
+    using MorphSlotFn = std::function<std::uint32_t(scene::Scene&, ecs::Entity,
+                                                    const assets::Mesh&)>;
+
     // 在独立的 depth-only render pass 内渲染**第 cascade 级**。
     // 蒙皮网格的 jointBase 由 pass 自己按实体沿父链取
     // （`SkinnedMeshComponent::jointBase`，逐实体）—— 以前是由调用方传
     // 一份"mesh → 下标"的映射，同一 FBX 的多个实例会互相覆盖。
     void render(VkCommandBuffer cmd, scene::Scene& scene,
                 VkDescriptorSet frameSet, uint32_t frameIndex,
-                uint32_t cascade);
+                uint32_t cascade, MorphSlotFn morphSlot = {});
 
     // 本帧第 cascade 级的提交统计（验证脚本用：证明剔除真的在省）
     uint32_t submitted(uint32_t cascade) const;

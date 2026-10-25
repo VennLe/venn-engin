@@ -262,6 +262,30 @@ bool attachPlayerModel(scene::Scene& scene, assets::AssetManager& am,
         // 我们刚设的覆盖掉（顺序依赖，写在这里最安全）。
         if (auto* an = w.get<ecs::AnimatorComponent>(player))
             an->defaultClip = sk->clipName;
+
+        // ② 状态机控制器（A2b，2026-10-25）
+        //
+        // 非空 → **确保**有 AnimatorComponent 再挂路径。为什么是"确保"
+        // 而不是假定有：运行时的 Player 由 `instantiateModel` 建出来，
+        // 默认不带 AnimatorComponent（探测日志里 `animators=0` 就是这个
+        // 原因）。而状态机的全部状态（stateIndex / 参数黑板）都存在
+        // 那个组件上 —— 没有组件就没有地方放它们。
+        if (!v.controller.empty()) {
+            if (!w.get<ecs::AnimatorComponent>(player)) {
+                ecs::AnimatorComponent a;
+                // 从"当前正在播的那一段"接手：挂上控制器的瞬间画面不该变
+                // （第一帧状态机会硬切到 defaultState，所以这里给的
+                //  defaultClip 只是"状态机还没接管时的兜底"）。
+                a.defaultClip = sk->clipName;
+                a.time = sk->time;
+                a.speed = sk->speed;
+                a.playing = sk->playing;
+                a.loop = sk->loop;
+                w.add<ecs::AnimatorComponent>(player, a);
+            }
+            w.get<ecs::AnimatorComponent>(player)->controllerPath = v.controller;
+            VK_LOG_INFO("GAME-PLAYER controller=%s", v.controller.c_str());
+        }
     }
 
     VK_LOG_INFO("GAME-PLAYER visual=model path=%s meshes=%d skinned=%d "
@@ -1038,6 +1062,28 @@ void RuntimeApp::tickPlayerAnimation(float dt) {
     const glm::vec3 v = m_player->velocity();
     const float hs = std::sqrt(v.x * v.x + v.y * v.y);   // 水平速度（m/s）
     const bool onGround = m_player->onGround();
+
+    // ---- 状态机（A2b）：走控制器资产时，物理真值喂进参数黑板 ----
+    //
+    // 三条约定（写进 docs/character_pipeline_roadmap.md，资产里按这三个名字声明）：
+    //   Speed    = 水平速度 m/s（**不是**输入轴大小 —— 撞墙时输入满档但
+    //              速度为 0，腿不该还在跑）
+    //   Grounded = 是否贴地
+    //   Jump     = 一次性 trigger（只在真正起跳的那一帧为 true）
+    //
+    // 用**约定名**而不是"映射表"：多一层映射的结果是每个工程的控制器都要
+    // 额外配一遍映射，而真正的差异（走跑分界、跳跃条件）本来就在控制器的
+    // 转移条件里 —— 那才是该写的地方。控制器没声明这三个参数时，写进去
+    // 的条目不会被任何条件读到，是死数据（无害）。
+    if (an && !an->controllerPath.empty()) {
+        an->floatParams["Speed"] = hs;
+        an->boolParams["Grounded"] = onGround;
+        if (m_player->justJumped()) an->triggerParams["Jump"] = true;
+        // 状态机接管 → `Locomotion` 让位。
+        // ⚠ 必须 return：两套逻辑同时写 `sk.clipName` 的话，每帧互相覆盖，
+        //   症状是"角色在两个动作之间高频抖动"，而日志里两边都在正常输出。
+        return;
+    }
 
     animation::updateLocomotion(m_playerAnim, *sk, an, skel, hs, onGround,
                                 maxSpeedHint, dt, cfg, "GAME");

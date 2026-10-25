@@ -217,6 +217,8 @@ if(NOT MSVC)
     target_compile_options(VennEngine PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 # MSVC 侧：/utf-8 /W3 /permissive- 已在文件顶部的全局 add_compile_options 给出。
+# （VENN_KEYWORD_COUNT 的透传在下方"Shader 变体"一节末尾 —— 那时
+#   SHADER_KEYWORDS 才数得出长度。）
 
 # ============================================================
 # 编辑器（editor/ → Editor.exe）
@@ -353,57 +355,201 @@ file(GLOB SHADER_INCLUDES CONFIGURE_DEPENDS ${SHADER_SRC_DIR}/*.glsl)
 set(SHADER_TARGETS "")
 
 # ------------------------------------------------------------
-# Shader 变体 / 关键字系统（与 engine/render/ShaderKeywords.h 配套）
+# Shader 变体：维度声明 → 白名单（2026-10-25 重构）
 # ------------------------------------------------------------
-# 关键字**位序**必须与 ShaderKeywords.h 里的 ShaderKeyword 逐位一致：
-#   bit0 → VENN_DOUBLE_SIDED   bit1 → VENN_ALPHA_BLEND
-#   bit2 → VENN_NORMAL_MAP     bit3 → VENN_ALPHA_MASK
-#   bit4 → VENN_SHADING_SKIN   bit5 → VENN_PARALLAX
+# 【为什么改】
+# 旧实现是 `foreach(MASK RANGE 0..1<<N)`，把 2^N 种组合**无条件全展开**。
+# 纯 PBR 时代 6 位 = 64 份还勉强能接受；但二次元渲染要加 Toon / Hair /
+# Eye / FaceSDF 四个着色模型：9 位 = 512 组合 × 2 个 .spv 族 = 1024 份
+# （约 80 MB），第 10 位就是 160 MB，第 15 位直接是 5 GB —— 这条路走不通。
 #
-# 凡是源码里出现 #if VENN_* 的着色器，都必须列进 SHADER_VARIANT_SHADERS ——
-# 它会为 2^6 = 64 种组合各编一份 <名字>.k<掩码>.<阶段>.spv。
-# 文件名里的 k 数字就是掩码本身，由 render::variantShaderFile() 用同一条
-# 规则拼出来。位序改了而这里没改，运行时会读不到文件并在 stderr 报
-# "找不到变体着色器"（VariantPipelines.cpp），不会静默画错。
-set(SHADER_KEYWORDS VENN_DOUBLE_SIDED VENN_ALPHA_BLEND
-                    VENN_NORMAL_MAP VENN_ALPHA_MASK VENN_SHADING_SKIN
-                    VENN_PARALLAX)
+# 【新机制】按两个观察削掉绝大部分无效组合：
+#   ① 有些关键字**语义互斥**。alphaMode 只能是 Opaque / Blend / Mask 之一，
+#      shadingModel 只能是 Default / Skin / Toon 之一。"既 Blend 又 Mask"
+#      这个材质根本不存在，编它纯属浪费（旧机制编了 32 份这样的废品）。
+#   ② 有些关键字**只对特定模型有意义**。Parallax 视差贴图在 Toon 上没人用，
+#      按模型裁剪特性集，8 种组合直接降到 4 种。
+#
+# 于是组合数 = Σ_模型 (alpha 取值数 × 2^该模型允许的特性数)，
+# 加模型是**线性累加**而不是翻倍：
+#     pbr 3×8=24   skin 3×8=24   toon 3×4=12   → 60 份（旧机制 2^7 = 128）
+#     再加 hair/eye/face 各 12   → 96 份（旧机制 2^10 = 1024）—— 差 10.7 倍
+#
+# 【位序仍然必须与 C++ 一致】
+# 掩码值就是 .spv 文件名里的数字（render::variantShaderFile 用同一条规则拼）。
+# 这条一致性由下面的 -DVENN_KEYWORD_COUNT 与 ShaderKeywords.h 的
+# static_assert 兜住：两张表长度不等直接编译失败，而不是等到运行时
+# 报"找不到变体着色器 pbr.k<N>.frag.spv"。
+# ------------------------------------------------------------
+
+# ---- ① 位序（= engine/render/ShaderKeywords.h 的 ShaderKeyword 枚举顺序）----
+# 加一个关键字要改三处：这里追加一行、ShaderKeywords.h 加一位、着色器加
+# 一段 #if。漏改任何一处都会被 static_assert（长度不等）或运行时日志
+# （掩码对应的文件不存在）抓到。
+set(SHADER_KEYWORDS
+    VENN_DOUBLE_SIDED   # bit0  双面：关剔除 + 背面翻转法线
+    VENN_ALPHA_BLEND    # bit1  透明混合
+    VENN_NORMAL_MAP     # bit2  法线贴图
+    VENN_ALPHA_MASK     # bit3  裁切
+    VENN_SHADING_SKIN   # bit4  预积分皮肤散射（与 bit6 互斥）
+    VENN_PARALLAX       # bit5  POM 视差
+    VENN_SHADING_TOON   # bit6  二次元素描着色（与 bit4 互斥）
+    # bit7 是**纯状态位**（只改 depthTest/depthWrite，不改一行代码）：
+    # 它出现在这张表里只为两件事 —— 让位宽与 ShaderKeywords.h 对齐，
+    # 以及让 collect_variants 认得这个宏名。**不要把它写进任何
+    # FEATURES_<model>**：白名单里一旦出现它，combination 数立刻翻倍，
+    # 而编出来的 .spv 与不带的版本逐字节相同。
+    # 运行时由 VariantPipelines 的 spvMask 剔除，见 kKeywordStateOnly。
+    VENN_OVERLAY        # bit7  覆盖带：不写深度 + 深度测试恒通过（P0-2/B）
+)
+list(LENGTH SHADER_KEYWORDS KEYWORD_COUNT)
+
+# 宏名 → 位掩码。未声明的宏返回 0（生成时用不到，写错了会默默少一位，
+# 所以下面每个取值都来自本文件的声明，不接受外部拼字符串）。
+function(keyword_bit MACRO OUT)
+    set(idx 0)
+    set(bit 0)
+    foreach(kw ${SHADER_KEYWORDS})
+        if(kw STREQUAL "${MACRO}")
+            math(EXPR bit "1 << ${idx}")
+        endif()
+        math(EXPR idx "${idx} + 1")
+    endforeach()
+    set(${OUT} ${bit} PARENT_SCOPE)
+endfunction()
+
+# ---- ② 维度声明 ----
+# 互斥组：取值是宏名，组内**同时只能选一个**。
+#
+# ⚠ 用 "none" 表示"该组不激活"，**不能写空串** —— 这就是上面陷阱 1 的
+#   另一种形态：`set(GROUP_alpha "" A B)` 里的空串会被 CMake 的 list
+#   直接丢掉，于是这组只剩 2 个取值，所有"不透明"的变体（也就是最常见的
+#   那批）一份都不会生成。实测症状：60 份变成 40 份，且 configure 不报错。
+#   "none" 不在 SHADER_KEYWORDS 里，keyword_bit() 对它返回 0，正好等于
+#   "这一位不置"。
+set(GROUP_alpha none VENN_ALPHA_BLEND VENN_ALPHA_MASK)
+
+# 着色模型：名字列表 + 名字→宏（"" = Default / PBR）。
+# 名字同时是 FEATURES_<name> 的后缀，所以三者必须同名。
+set(SHADING_MODELS pbr skin toon)
+set(MODEL_MACRO_pbr  "")
+set(MODEL_MACRO_skin "VENN_SHADING_SKIN")
+set(MODEL_MACRO_toon "VENN_SHADING_TOON")
+
+# 每个模型允许叠加的自由开关 —— **省组合数的关键**。
+# Toon 不需要 POM（视差贴图在赛璐璐上没有意义），8 种组合降到 4 种。
+set(FEATURES_pbr  "VENN_DOUBLE_SIDED;VENN_NORMAL_MAP;VENN_PARALLAX")
+set(FEATURES_skin "VENN_DOUBLE_SIDED;VENN_NORMAL_MAP;VENN_PARALLAX")
+set(FEATURES_toon "VENN_DOUBLE_SIDED;VENN_NORMAL_MAP")
+
+# 每个 shader 支持哪些模型。不同 .frag 可以有不同集合（比如将来的
+# toon_hair.frag 只支持 toon）。
+set(SHADER_MODELS_pbr.frag "pbr;skin;toon")
+
+# 凡是源码里出现 #if VENN_<材质关键字> 的着色器，都必须列进来。
+# （VENN_BINDLESS / VENN_MDI / VENN_INSTANCING / VENN_MSAA_DEPTH 是
+#   **全局开关**，走各自独立的 .spv 族，不占关键字位。）
 set(SHADER_VARIANT_SHADERS pbr.frag)
 
-# 掩码 0..31 对应的 -D 参数表 —— **生成式**（R4-1 起从手写 8 行换成循环）。
-# 位序来自 SHADER_KEYWORDS 的列表顺序：第 i 个关键字对应 bit i。
-# 于是"关键字表改了、-D 表忘了改"这类错位从根上不可能发生。
-#
+# ---- ③ 生成白名单（掩码 + -D 串，两个平行列表）----
+# 一个 shader 一份。返回给调用方的是 PARENT_SCOPE 变量。
+function(collect_variants FNAME OUT_MASKS OUT_DEFS)
+    if(NOT DEFINED SHADER_MODELS_${FNAME})
+        message(FATAL_ERROR
+            "${FNAME} 列在 SHADER_VARIANT_SHADERS 里，但没有声明 "
+            "SHADER_MODELS_${FNAME}（它支持哪些着色模型）。")
+    endif()
+
+    set(masks "")
+    set(defs "")
+
+    foreach(MODEL ${SHADER_MODELS_${FNAME}})
+        set(model_macro "${MODEL_MACRO_${MODEL}}")
+        keyword_bit("${model_macro}" base_mask)
+
+        set(feats "${FEATURES_${MODEL}}")
+        list(LENGTH feats feat_n)
+        # 子集个数 = 2^feat_n；用子集位图枚举而不是递归，CMake 里最直白
+        math(EXPR sub_last "1 << ${feat_n}")
+        math(EXPR sub_last "${sub_last} - 1")
+
+        foreach(alpha ${GROUP_alpha})
+            keyword_bit("${alpha}" alpha_bit)
+
+            # ⚠ 必须把 `RANGE 0 ${sub_last}` 内联在 foreach 里。
+            #   写成 `set(r RANGE 0 7)` + `foreach(sub ${r})` 是**错的**：
+            #   ${r} 展开成 "RANGE;0;7" 三个**字面量**元素，foreach 会把
+            #   "RANGE" 和 "7" 当成子集编号传给 math(EXPR)，结果是静默少
+            #   生成（本次实测 60 份变成 40 份），不报错。
+            foreach(sub RANGE 0 ${sub_last})
+                set(mask ${base_mask})
+                math(EXPR mask "${mask} | ${alpha_bit}")
+                set(d "")
+                if(NOT model_macro STREQUAL "")
+                    list(APPEND d -D${model_macro}=1)
+                endif()
+                if(NOT alpha STREQUAL "none")
+                    list(APPEND d -D${alpha}=1)
+                endif()
+                set(fi 0)
+                foreach(f ${feats})
+                    math(EXPR fbit "1 << ${fi}")
+                    math(EXPR hit "${sub} & ${fbit}")
+                    if(hit)
+                        keyword_bit("${f}" f_mask)
+                        math(EXPR mask "${mask} | ${f_mask}")
+                        list(APPEND d -D${f}=1)
+                    endif()
+                    math(EXPR fi "${fi} + 1")
+                endforeach()
+                if(d)
+                    list(JOIN d " " d_str)
+                else()
+                    # 哨兵：**空串不能进 list**（陷阱 1）。第一个组合
+                    # （pbr + 不透明 + 无任何特性）的 -D 串正好是空的，
+                    # 直接 append 会被丢掉，于是 defs 比 masks 少一项、
+                    # 两者从此错位。实测症状：list index 59 out of range。
+                    set(d_str "_")
+                endif()
+                list(APPEND masks "${mask}")
+                list(APPEND defs "${d_str}")
+            endforeach()
+        endforeach()
+    endforeach()
+
+    set(${OUT_MASKS} "${masks}" PARENT_SCOPE)
+    set(${OUT_DEFS} "${defs}" PARENT_SCOPE)
+endfunction()
+
+# -D 串列表项 → glslc 参数。空组合在列表里存的是哨兵 "_"，这里还原成
+# "没有任何 -D"。两处消费点（主族 / bindless 族）共用，避免各写一遍
+# 还原逻辑、其中一处忘了就变成给 glslc 传一个字面量 "-D_=1"。
+macro(variant_defs_to_args STR OUT)
+    if("${STR}" STREQUAL "_")
+        set(${OUT} "")
+    else()
+        separate_arguments(${OUT} NATIVE_COMMAND "${STR}")
+    endif()
+endmacro()
+
+# 位宽透传给 C++：ShaderKeywords.h 用它 static_assert 与上面 SHADER_KEYWORDS
+# 的长度对齐。错位时的症状是运行期"找不到变体着色器 pbr.k<N>.frag.spv"——
+# 那时编译、链接、启动、加载场景全都跑完了，排查成本高得多。
+# PUBLIC 是因为 engine/editor/runtime 都可能间接 include 那个头。
+target_compile_definitions(VennEngine PUBLIC
+    VENN_KEYWORD_COUNT=${KEYWORD_COUNT}
+)
+
 # ⚠ 两个 CMake 陷阱（都踩过，写在这里免得后人重踩）：
 #   1. `list(APPEND tbl "${EMPTY}")` 会**丢掉空串** —— 展开后所有下标往前
-#      挪一位，k0/k2/k4… 全部错位。所以空项存一个哨兵串 "_"，取用时再
-#      换回空。
+#      挪一位，掩码与 -D 表全部错位。所以上面 collect_variants 里空项一律
+#      走 `if(d) ... else() set(d_str "")`，不往列表里塞空串。
 #   2. `${DEFS}` 本身是**列表**，直接 append 会被展平成多个表项。所以
-#      先用 list(JOIN) 拍成一个以空格分隔的单串，表项与掩码才一一对应。
-list(LENGTH SHADER_KEYWORDS KEYWORD_COUNT)
-math(EXPR VARIANT_COUNT "1 << ${KEYWORD_COUNT}")
-math(EXPR VARIANT_MAX "${VARIANT_COUNT} - 1")
-set(VARIANT_DEFINES_ALL "")
-foreach(MASK RANGE ${VARIANT_MAX})
-    set(DEFS "")
-    set(BIT 0)
-    foreach(KW ${SHADER_KEYWORDS})
-        math(EXPR BITVAL "1 << ${BIT}")
-        math(EXPR HIT "${MASK} & ${BITVAL}")
-        if(HIT)
-            list(APPEND DEFS -D${KW}=1)
-        endif()
-        math(EXPR BIT "${BIT} + 1")
-    endforeach()
-    if(DEFS)
-        list(JOIN DEFS " " DEFS_STR)   # 拍平成单串，避免上面的陷阱 2
-    else()
-        set(DEFS_STR "_")              # 哨兵，避免陷阱 1
-    endif()
-    list(APPEND VARIANT_DEFINES_ALL "${DEFS_STR}")
-endforeach()
-# 把哨兵换回空串（-D 位置留空 = 不定义任何关键字）。
-list(TRANSFORM VARIANT_DEFINES_ALL REPLACE "^_$" "")
+#      用 list(JOIN) 拍成一个以空格分隔的单串，compile 时再 separate_arguments。
+#
+# （旧的"2^N 全展开"代码在这里，2026-10-25 已由 collect_variants() 取代。
+#   它留下的 VARIANT_COUNT / VARIANT_MAX 仍被下面复用 —— 但那两个现在是
+#   **白名单长度**，不再是 2^位数，别按旧含义读。）
 
 foreach(SRC ${SHADER_GLSL_SOURCES})
     get_filename_component(FNAME ${SRC} NAME)       # 例：bloom_bright.frag
@@ -411,12 +557,20 @@ foreach(SRC ${SHADER_GLSL_SOURCES})
     string(REGEX REPLACE "^.*\\." "" EXT ${FNAME})       # frag
 
     if(FNAME IN_LIST SHADER_VARIANT_SHADERS)
-        # 带关键字的着色器：每种组合一份 .spv
-        foreach(MASK RANGE ${VARIANT_MAX})
-            list(GET VARIANT_DEFINES_ALL ${MASK} DEFS_STR)
-            # 与下面 bindless 那一族同理：DEFS_STR 是空格分隔的单串，
-            # 必须拆回多个参数（否则多关键字组合会拼成一个畸形 -D）。
-            separate_arguments(DEFS NATIVE_COMMAND "${DEFS_STR}")
+        # 带材质关键字的着色器：只编白名单里的组合（不是 2^N）
+        collect_variants(${FNAME} V_MASKS V_DEFS)
+        list(LENGTH V_MASKS V_N)
+        # configure 时打一行：改了维度声明立刻能看出组合数怎么变
+        # （旧机制的全展开份数是 2^位数，可以在改动前后直接对比）。
+        message(STATUS "shader variants: ${FNAME} -> ${V_N} 份（白名单）")
+        math(EXPR V_LAST "${V_N} - 1")
+        foreach(IDX RANGE ${V_LAST})
+            list(GET V_MASKS ${IDX} MASK)
+            list(GET V_DEFS ${IDX} DEFS_STR)
+            # DEFS_STR 是空格分隔的单串（空组合是哨兵 "_"），转成 glslc
+            # 参数列表。多关键字时若直接传单串会拼成一个畸形 -D，glslc
+            # 报 "unexpected tokens following directive"。
+            variant_defs_to_args("${DEFS_STR}" DEFS)
             set(OUT ${SHADER_OUT_DIR}/${STEM}.k${MASK}.${EXT}.spv)
             add_custom_command(
                 OUTPUT ${OUT}
@@ -443,7 +597,7 @@ endforeach()
 # ------------------------------------------------------------
 # pbr.bindless.frag —— Bindless 版片元着色器（R2-3）
 # ------------------------------------------------------------
-# 同一份 pbr.frag 再编 ${VARIANT_COUNT} 份，额外加 -DVENN_BINDLESS=1：六张贴图槽从
+# 同一份 pbr.frag 再编一遍白名单里的组合，额外加 -DVENN_BINDLESS=1：六张贴图槽从
 # "set 1..6 各一个 sampler2D" 改成 "set 1 binding 0 的运行时数组 + 材质页表"。
 #
 # 为什么仍然要 ×N 份而不是"把 bindless 做成一个关键字位"：
@@ -454,13 +608,21 @@ endforeach()
 #   .spv 文件族，名字是 pbr.bindless.k<N>.frag.spv。
 #   VariantPipelines 只要把 fragBaseName 换成 "pbr.bindless.frag" 即可命中
 #   （variantShaderFile 的拼法是 <stem>.k<N>.<ext>.spv）。
-foreach(MASK RANGE ${VARIANT_MAX})
-    list(GET VARIANT_DEFINES_ALL ${MASK} DEFS_STR)
-    # DEFS_STR 是"以空格分隔的单串"（见上面的生成式说明），必须用
-    # separate_arguments 拆回多个参数 —— 否则 k3 会变成**一个**带空格的
-    # 参数 `"-DVENN_DOUBLE_SIDED=1 -DVENN_ALPHA_BLEND=1"`，glslc 把它当成
-    # 一个畸形 -D 而报 "'#if' : unexpected tokens following directive"。
-    separate_arguments(DEFS NATIVE_COMMAND "${DEFS_STR}")
+#
+# 白名单与主族**是同一份**（collect_variants 幂等，同一组声明生成同一组
+# 掩码）—— 两个族的文件名数字必须一一对应，否则 bindless 开关一翻转就会
+# 读到不存在的变体。这里复用函数而不是复算一遍，就是为了不可能不一致。
+collect_variants(pbr.frag BL_MASKS BL_DEFS)
+list(LENGTH BL_MASKS BL_N)
+math(EXPR BL_LAST "${BL_N} - 1")
+foreach(IDX RANGE ${BL_LAST})
+    list(GET BL_MASKS ${IDX} MASK)
+    list(GET BL_DEFS ${IDX} DEFS_STR)
+    # 与主族同一个转换（空组合是哨兵 "_"）。多关键字时必须拆回多个参数，
+    # 否则会变成一个带空格的畸形 -D：
+    # `"-DVENN_DOUBLE_SIDED=1 -DVENN_ALPHA_BLEND=1"`，glslc 报
+    # "'#if' : unexpected tokens following directive"。
+    variant_defs_to_args("${DEFS_STR}" DEFS)
     set(OUT ${SHADER_OUT_DIR}/pbr.bindless.k${MASK}.frag.spv)
     add_custom_command(
         OUTPUT ${OUT}
@@ -567,6 +729,37 @@ foreach(SRC ${SHADER_MSAA_DEPTH_COMPUTE})
 endforeach()
 
 add_custom_target(Shaders ALL DEPENDS ${SHADER_TARGETS})
+
+# ------------------------------------------------------------
+# 清理白名单外的旧变体 .spv
+# ------------------------------------------------------------
+# 为什么需要这段：add_custom_command 只会"生成"，**从不删除**。一旦改了
+# SHADER_KEYWORDS 位序或白名单（比如把某个模型从 FEATURES_ 里去掉），
+# 上一轮编出来的那些 .spv 会原样留在输出目录里：
+#   · 运行时的 variantShaderFile() 按掩码拼文件名 → 旧文件"恰好"还能被
+#     读到，于是新配置本该报"找不到变体"的地方静默读到了**过期字节码**；
+#   · `ls *.spv | wc -l` 也不再能当作"当前白名单规模"的判据。
+# 这条清理只在 configure 时枚举，所以它准确对应"这一轮声明的白名单"。
+set(SHADER_STALE "")
+foreach(_stem pbr pbr.bindless)
+    file(GLOB _found ${SHADER_OUT_DIR}/${_stem}.k*.frag.spv)
+    foreach(_f ${_found})
+        get_filename_component(_n ${_f} NAME)
+        if(_n MATCHES "^${_stem}\\.k([0-9]+)\\.frag\\.spv$")
+            if(NOT CMAKE_MATCH_1 IN_LIST BL_MASKS)
+                list(APPEND SHADER_STALE ${_f})
+            endif()
+        endif()
+    endforeach()
+endforeach()
+# 在 **configure 阶段**删，而不是 POST_BUILD：configure 正是"白名单刚被
+# 重新声明"的时刻，语义最准，也不依赖 custom target 的构建顺序。
+if(SHADER_STALE)
+    list(LENGTH SHADER_STALE _stale_n)
+    file(REMOVE ${SHADER_STALE})
+    message(STATUS
+        "shader variants: 清理了 ${_stale_n} 个白名单外的旧 .spv")
+endif()
 # 两个可执行文件都要按构建顺序排在着色器之后（真正"每次都拷"在下面的
 # VennShadersCopy 里，这里管的是"编译顺序"）。
 add_dependencies(VennEditor Shaders)
@@ -643,6 +836,10 @@ function(myvk_copy_runtime_assets target)
             # 理由 —— 改一次高度图要立刻生效，否则"我明明加高了山"只能
             # 在重新链接之后才看得到。
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/terrain|assets/terrain"
+            # A2b（2026-10-25）：动画状态机控制器（`.anim.json`）。
+            # 同样是"改一次就想立刻看到"的资产（调一个转移的 duration 要
+            # 马上能试手感），所以进每次都拷这一档。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/animators|assets/animators"
         )
         set(always_asset_cmds "")
         foreach(item IN LISTS VENN_ALWAYS_ASSET_DIRS)

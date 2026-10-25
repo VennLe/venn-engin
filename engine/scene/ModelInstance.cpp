@@ -154,14 +154,37 @@ ModelInstanceResult instantiateModel(Scene& scene, assets::Model* model,
         out.joints = model->skeleton->jointCount();
     }
 
+    // ---- 表情滑条（§15）：挂点与蒙皮**相同**（模型根）----
+    //
+    // 为什么不挂在每个 SubMesh 实体上：滑条是**模型级**概念。「眨眼」在
+    // 皮肤桶里是 target_3、在睫毛桶里是 target_1，同一个滑条驱动多个
+    // 子网格的多个 target（见 MorphRig 的跨桶合并）。挂在子网格上会让
+    // 一个「眨眼」变成 19 根各管一段的滑条。
+    //
+    // 与蒙皮**不共用**一个组件：静态网格也可能带 morph（虽然罕见），
+    // 而且 MorphComponent 不参与动画姿态求解，混在一起会让"这段代码
+    // 该不该在 AnimatorSystem 里跑"变成一个问题。
+    if (!model->morphRig.empty()) {
+        ecs::MorphComponent mp;
+        mp.model = model;
+        // 按通道数预置 0：`setMorphWeight` 允许短表，但预置好省得第一帧
+        // 求值时还要 resize（求值发生在渲染的绘制列表构建里，不该分配）。
+        mp.weights.assign(model->morphRig.channelCount(), 0.0f);
+        if (auto* p = w.get<ecs::MorphComponent>(root))
+            *p = mp;
+        else
+            w.add<ecs::MorphComponent>(root, mp);
+        out.morphChannels = static_cast<int>(model->morphRig.channelCount());
+    }
+
     // ---- 自检锚点（每次导入一行，自动化断言就靠它）----
     if (!opt.sourcePath.empty()) {
         VK_LOG_INFO("MODEL-INSTANCE path=%s root=%u meshes=%d skinned=%d "
-                    "joints=%d parent=%d",
+                    "joints=%d morph=%d parent=%d",
                     opt.sourcePath.c_str(),
                     static_cast<unsigned>(root.id),
                     static_cast<int>(out.entities.size()),
-                    out.skinned ? 1 : 0, out.joints,
+                    out.skinned ? 1 : 0, out.joints, out.morphChannels,
                     opt.parent.valid() ? 1 : 0);
 
         // clip 清单单独一行：调试"模型进来了但不动"时，第一件事就是确认

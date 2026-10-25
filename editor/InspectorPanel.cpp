@@ -1848,6 +1848,71 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
     }
 
     // ================================================================
+    // Morph 段（§15，GPU 形变）
+    // ================================================================
+    //
+    // 放在 Skinned Mesh 与 Animator **之间**，而不是 Animator 之后：
+    // 那个分支在"没有 Animator"时会 `return`（见下面 1877 行附近），
+    // 放到后面就等于"没加动画器的模型看不到滑条" —— 而 alicia 拖进来
+    // 默认就是没有动画器的。
+    //
+    // 为什么滑条必须**按名字**列：磁盘上是逐子网格的 88 条 channel，
+    // 合并后 49 个唯一名。按下标列会让用户看到 49 行「target_0」之类
+    // 完全无法区分的条目（alicia 的 FBX 里名字本来就是 target_N，
+    // 详见 MorphRig.cpp 的文件头 —— 语义名只能靠美术侧改名）。
+    //
+    // 为什么非要有这个面板：GPU 形变接好之后，"链路是通的"唯一能直接
+    // 看到证据的动作就是推一根滑条看脸变不变。没有它，所有结论都只能
+    // 从日志和字节数去推断。
+    if (auto* mp = w.get<ecs::MorphComponent>(e)) {
+        if (mp->model && !mp->model->morphRig.empty()) {
+            const assets::MorphRig& rig = mp->model->morphRig;
+            const bool morphOpen = sectionHeader("Morph Targets", true, e);
+            if (morphOpen) {
+                std::size_t driving = 0;
+                for (const assets::MorphRigChannel& c : rig.channels())
+                    if (c.drives) ++driving;
+                ImGui::TextDisabled(TR("%d channel(s) driving %d sub-mesh(es)"),
+                                    static_cast<int>(driving),
+                                    static_cast<int>(mp->model->subMeshes.size()));
+
+                // 权重表允许是短表（求值时短的当 0），但这里每次都补齐：
+                // 滑条要写 `weights[c]`，短表就得先判断边界，白白多一层。
+                if (mp->weights.size() < rig.channelCount())
+                    mp->weights.resize(rig.channelCount(), 0.0f);
+
+                ImGui::PushID("morphweights");
+                for (std::size_t c = 0; c < rig.channelCount(); ++c) {
+                    const assets::MorphRigChannel& ch = rig.channels()[c];
+                    // 不驱动任何子网格的通道不出滑条：推它不会有任何
+                    // 视觉变化（烤制期已经把全空的丢掉了，这里是第二道）。
+                    if (!ch.drives) continue;
+                    ImGui::PushID(static_cast<int>(c));
+                    const float w0 = mp->weights[c];
+                    float wv = w0;
+                    ImGui::SetNextItemWidth(kPhysParamW);
+                    ImGui::SliderFloat("##w", &wv, 0.0f, 1.0f, "%.3f");
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(ch.name.c_str());
+                    ImGui::PopID();
+                    if (wv != w0) {
+                        mp->weights[c] = wv;
+                        const std::string label = "Morph " + ch.name;
+                        fieldEdit(m_ctx, label.c_str(), &mp->weights[c], w0);
+                    }
+                }
+                ImGui::PopID();
+
+                if (ImGui::Button(TR("Reset All"))) {
+                    m_ctx.structuralEdit("Reset Morph Weights", [mp]() {
+                        std::fill(mp->weights.begin(), mp->weights.end(), 0.0f);
+                    });
+                }
+            }
+        }
+    }
+
+    // ================================================================
     // Animator 段（A1）
     // ================================================================
     ImGui::Separator();
@@ -1877,10 +1942,17 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
         return;
     }
 
+    // 状态机游标（A2b 起是**真值**：AnimatorSystem 每帧读写它）
+    // -1 = 还没初始化（控制器为空，或刚加载还没跑过一帧）
     ImGui::TextDisabled(TR("state: %d   time in state: %.2f s"), an->stateIndex,
                         static_cast<double>(an->stateTime));
 
-    // 控制器路径（A2 才有人读它；现在空着就是单 clip 直放模式）
+    // ---- 控制器（2026-10-25 起**真的生效**）----
+    //
+    // 这一格在本轮之前是置灰的。置灰的理由是"填了没人读"，而现在
+    // `AnimatorSystem::tick` 会按这个路径加载控制器并每帧推进状态机
+    // （`animation/AnimController.*`）。所以它必须可编辑 —— 否则用户
+    // 永远没法把状态机挂上去。
     const bool sameCtrl = (m_animCtrlBufFor == e);
     if (!sameCtrl) {
         std::snprintf(m_animCtrlBuf, sizeof(m_animCtrlBuf), "%s",
@@ -1888,7 +1960,8 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
         m_animCtrlBufFor = e;
     }
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##animctrl", TRL("controller path (empty = single clip)"),
+    ImGui::InputTextWithHint("##animctrl",
+                             TRL("controller (empty = single clip)"),
                              m_animCtrlBuf, sizeof(m_animCtrlBuf));
     if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
         const std::string nc = m_animCtrlBuf;
@@ -1897,6 +1970,7 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
                                  [&]() { an->controllerPath = nc; });
         }
     }
+    logRect("INS-ANIM-CTRL", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
 
     // defaultClip：只影响"clipName 还空着"的那一次（见 appliedDefaultClip）
     const bool sameDef = (m_animDefBufFor == e);
@@ -1916,7 +1990,48 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
         }
     }
 
-    // 根运动（A4 才会真的驱动位移；这里先把契约摆出来）
+    // ---- 参数黑板（只读展示 + trigger 可手按）----
+    //
+    // 为什么显示：状态机"不动"最常见的两个原因是"参数名对不上"和"物理
+    // 真值没喂进来"。前者在资产里看得到，后者只在这里看得到 —— 面板上
+    // 空白 vs 有值，一眼就分得清。
+    //
+    // ⚠ 排序后再显示：`unordered_map` 的遍历顺序会随插入 / 删除变化，
+    //   每帧顺序都可能不同（肉眼是"参数行在跳"）。
+    if (!an->floatParams.empty() || !an->boolParams.empty() ||
+        !an->triggerParams.empty()) {
+        std::map<std::string, float> fs(an->floatParams.begin(),
+                                        an->floatParams.end());
+        std::map<std::string, bool> bs(an->boolParams.begin(),
+                                       an->boolParams.end());
+        std::map<std::string, bool> ts(an->triggerParams.begin(),
+                                       an->triggerParams.end());
+        ImGui::TextDisabled(TR("params (runtime, not saved):"));
+        for (const auto& kv : fs)
+            ImGui::TextDisabled("   %s = %.3f", kv.first.c_str(),
+                                static_cast<double>(kv.second));
+        for (const auto& kv : bs)
+            ImGui::TextDisabled("   %s = %s", kv.first.c_str(),
+                                kv.second ? "true" : "false");
+        for (const auto& kv : ts) {
+            ImGui::TextDisabled("   %s = %s", kv.first.c_str(),
+                                kv.second ? "true" : "false");
+            ImGui::SameLine();
+            // 手按一次 trigger：不落盘、不改资产，只置位让状态机下一帧吃掉。
+            // 这是编辑器里唯一不用进 Play 就能验证"状态机真的会转"的办法。
+            ImGui::PushID(kv.first.c_str());
+            if (ImGui::SmallButton(TR("fire"))) {
+                auto* mc = w.get<ecs::AnimatorComponent>(e);
+                if (mc) mc->triggerParams[kv.first] = true;
+            }
+            ImGui::PopID();
+            logRect("INS-ANIM-TRIGGER", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+        }
+    }
+
+    // 根运动（**仍是占位** —— A4 才会真的驱动位移）
+    ImGui::BeginDisabled();
     static const char* const kRootMotion[3] = {
         "Off", "From clip", "Delta only"};
     int rm = static_cast<int>(an->rootMotion);
@@ -1927,9 +2042,420 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
     }
     logRect("INS-ANIM-ROOTMOTION", ImGui::GetItemRectMin(),
             ImGui::GetItemRectMax());
+    ImGui::EndDisabled();
 
-    hint("root motion is a placeholder until A4; the controller / state "
-         "machine lands in A2 (docs/character_pipeline_roadmap.md).");
+    hint("Controller = assets/animators/*.anim.json, schema in "
+         "animation/AnimController.h.\n"
+         "Parameters Speed / Grounded / Jump are fed by the runtime and by "
+         "editor Play. Empty controller = single clip.\n"
+         "Root motion is the only field still greyed (A4).");
+
+    // ================================================================
+    // 弹簧骨（L4 表演层，2026-10-25）
+    // ================================================================
+    ImGui::Separator();
+    ImGui::TextUnformatted(TR("Spring Bone  (hair / skirt)"));
+    logRect("INS-ANIM-SPRINGHEADER", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    ecs::SpringBoneComponent* sb = w.get<ecs::SpringBoneComponent>(e);
+    if (!sb) {
+        hint("No spring bone. Chains are found by **bone-name prefix** "
+             "(hair / skirt), so adding it needs no re-export and "
+             "no asset change.");
+        if (ImGui::Button(TR("Add Spring Bone"))) {
+            m_ctx.structuralEdit("Add Spring Bone", [&]() {
+                ecs::SpringBoneComponent c;
+                w.add<ecs::SpringBoneComponent>(e, c);
+            });
+        }
+        logRect("INS-ANIM-ADDSPRING", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+    } else {
+        animation::SpringBoneSettings& s = sb->settings;
+
+        const bool sbe0 = s.enabled;
+        if (ImGui::Checkbox(TR("Enabled"), &s.enabled)) {
+            discreteEdit(m_ctx, "Toggle Spring Bone", &s.enabled, sbe0);
+        }
+
+        // 识别结果（只读）。这里每帧重算一次 buildSpringRig ——
+        // 它内部做一次静止姿势 FK（200 骨约几微秒），只有面板展开且选中
+        // 带弹簧的角色时才发生。为它加缓存不值：缓存失效的判据（前缀改了）
+        // 与 UI 编辑路径一样长，反而是新的不一致来源。
+        if (sk->model && sk->model->skeleton) {
+            const animation::SpringRig rig =
+                animation::buildSpringRig(*sk->model->skeleton, sb->prefixes);
+            ImGui::TextDisabled(TR("chains: %d simulated bones"), rig.count());
+            if (rig.count() == 0) {
+                hint("Nothing matched. Bone names must start with hair / "
+                     "skirt (case-insensitive), and the root bone "
+                     "(the one attached to head/spine) is the non-simulated "
+                     "anchor. Real-world names look like hair1_L or hair_01 - "
+                     "fill the prefix list below if the naming differs.");
+            }
+        }
+
+        const float damp0 = s.damping;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat(TRL("Damping"), &s.damping, 0.3f, 0.99f, "%.3f");
+        fieldEdit(m_ctx, "Spring Damping", &s.damping, damp0);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("How much velocity survives each frame.\n"
+                "0.99 = hair keeps swinging for a long time (steel wire),\n"
+                "0.70 = looks submerged in water. 0.85-0.95 is the anime "
+                "sweet spot."));
+        }
+
+        const float rest0 = s.restStiffness;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat(TRL("Rest stiffness"), &s.restStiffness, 0.0f, 0.8f,
+                           "%.3f");
+        fieldEdit(m_ctx, "Spring Rest Stiffness", &s.restStiffness, rest0);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("Pull back toward the modelled shape.\n"
+                "0 = plain cloth strip: a standing character's hair hangs "
+                "straight down and the hairstyle is gone.\n"
+                "0.1-0.3 = keeps the silhouette, adds sway."));
+        }
+
+        const glm::vec3 grav0 = s.gravity;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::DragFloat3(TRL("Gravity"), &s.gravity.x, 0.1f, -30.0f, 30.0f,
+                          "%.1f");
+        fieldEdit(m_ctx, "Spring Gravity", &s.gravity, grav0);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("In **glTF scene space**, so down is -Y (0,-9.8,0), not -Z.\n"
+                "The engine's Z-up rotation lives in PushConstants::model and "
+                "never reaches the pose."));
+        }
+
+        const glm::vec3 wind0 = s.wind;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::DragFloat3(TRL("Wind"), &s.wind.x, 0.05f, -20.0f, 20.0f, "%.2f");
+        fieldEdit(m_ctx, "Spring Wind", &s.wind, wind0);
+
+        const int iter0 = s.iterations;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderInt(TRL("Iterations"), &s.iterations, 1, 8);
+        fieldEdit(m_ctx, "Spring Iterations", &s.iterations, iter0);
+
+        // 前缀（逗号分隔）。空 = 内置默认。
+        const bool samePfx = (m_springPfxBufFor == e);
+        if (!samePfx) {
+            std::string joined;
+            for (size_t i = 0; i < sb->prefixes.size(); ++i) {
+                if (i) joined += ",";
+                joined += sb->prefixes[i];
+            }
+            std::snprintf(m_springPfxBuf, sizeof(m_springPfxBuf), "%s",
+                          joined.c_str());
+            m_springPfxBufFor = e;
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##springpfx",
+                                 TRL("prefixes, comma separated (empty = hair,"
+                                     " skirt)"),
+                                 m_springPfxBuf, sizeof(m_springPfxBuf));
+        if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+            std::vector<std::string> parsed;
+            std::string cur;
+            for (const char* p = m_springPfxBuf; *p; ++p) {
+                if (*p == ',') {
+                    if (!cur.empty()) parsed.push_back(cur);
+                    cur.clear();
+                } else if (*p != ' ') {
+                    cur += *p;
+                }
+            }
+            if (!cur.empty()) parsed.push_back(cur);
+            if (parsed != sb->prefixes) {
+                m_ctx.structuralEdit("Set Spring Prefixes", [&]() {
+                    sb->prefixes = parsed;
+                });
+            }
+        }
+    }
+
+    // ================================================================
+    // LookAt（L2 表演层，2026-10-25）
+    // ================================================================
+    ImGui::Separator();
+    ImGui::TextUnformatted(TR("Look At"));
+    logRect("INS-ANIM-LOOKATHEADER", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    ecs::LookAtComponent* la = w.get<ecs::LookAtComponent>(e);
+    if (!la) {
+        hint("No look-at. Single bone (default head), limited angle, "
+             "targeted at a world point.");
+        if (ImGui::Button(TR("Add Look At"))) {
+            m_ctx.structuralEdit("Add Look At", [&]() {
+                ecs::LookAtComponent c;
+                w.add<ecs::LookAtComponent>(e, c);
+            });
+        }
+        logRect("INS-ANIM-ADDLOOKAT", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+    } else {
+        animation::LookAtSettings& s = la->settings;
+
+        const bool lae0 = s.enabled;
+        if (ImGui::Checkbox(TR("Enabled"), &s.enabled)) {
+            discreteEdit(m_ctx, "Toggle Look At", &s.enabled, lae0);
+        }
+        const bool hat0 = s.hasTarget;
+        if (ImGui::Checkbox(TR("Has target"), &s.hasTarget)) {
+            discreteEdit(m_ctx, "Toggle Look At Target", &s.hasTarget, hat0);
+        }
+
+        // 解析结果（只读）：名字填错时这里会明说，而不是"头就是不动"。
+        if (sk->model && sk->model->skeleton) {
+            const int bone = animation::resolveLookAtBone(
+                *sk->model->skeleton, s.boneName);
+            if (bone >= 0) {
+                ImGui::TextDisabled(
+                    TR("bone: %s  (joint %d)"),
+                    sk->model->skeleton->joints[static_cast<size_t>(bone)]
+                        .name.c_str(),
+                    bone);
+            } else {
+                ImGui::TextDisabled(TR("bone: NOT FOUND (empty = auto 'head')"));
+            }
+        }
+
+        const glm::vec3 tgt0 = s.target;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::DragFloat3(TRL("Target"), &s.target.x, 0.05f, -1000.0f, 1000.0f,
+                          "%.2f");
+        fieldEdit(m_ctx, "Look At Target", &s.target, tgt0);
+
+        const float w0 = s.weight;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat(TRL("Weight"), &s.weight, 0.0f, 1.0f, "%.2f");
+        fieldEdit(m_ctx, "Look At Weight", &s.weight, w0);
+
+        const float ang0 = s.maxAngleDeg;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat(TRL("Max angle"), &s.maxAngleDeg, 0.0f, 120.0f,
+                           TR("%.0f deg"));
+        fieldEdit(m_ctx, "Look At Max Angle", &s.maxAngleDeg, ang0);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("Stops at the limit instead of twisting 180 degrees when "
+                "the target goes behind.\nAn unlimited head reads worse than "
+                "no head turn at all."));
+        }
+
+        const float rate0 = s.smoothRate;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat(TRL("Smooth rate"), &s.smoothRate, 0.0f, 30.0f,
+                           "%.1f /s");
+        fieldEdit(m_ctx, "Look At Smooth Rate", &s.smoothRate, rate0);
+    }
+
+    // ================================================================
+    // 两骨 IK（L1 修正层，2026-10-25 第八刀）
+    // ================================================================
+    ImGui::Separator();
+    ImGui::TextUnformatted(TR("Two Bone IK"));
+    logRect("INS-ANIM-IKHEADER", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    ecs::TwoBoneIKComponent* ik = w.get<ecs::TwoBoneIKComponent>(e);
+    if (!ik) {
+        hint("No IK. Analytic (cosine-law) two-bone solve: thigh->calf->foot "
+             "or upperarm->forearm->hand. The bend plane is taken from the "
+             "current animation, so knees keep pointing where the animator "
+             "put them.");
+        if (ImGui::Button(TR("Add Two Bone IK"))) {
+            m_ctx.structuralEdit("Add Two Bone IK", [&]() {
+                ecs::TwoBoneIKComponent c;
+                w.add<ecs::TwoBoneIKComponent>(e, c);
+            });
+        }
+        logRect("INS-ANIM-ADDIK", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+    } else {
+        animation::TwoBoneIKSettings& s = ik->settings;
+
+        const bool ike0 = s.enabled;
+        if (ImGui::Checkbox(TR("Enabled"), &s.enabled)) {
+            discreteEdit(m_ctx, "Toggle IK", &s.enabled, ike0);
+        }
+        const bool iht0 = s.hasTarget;
+        if (ImGui::Checkbox(TR("Has target"), &s.hasTarget)) {
+            discreteEdit(m_ctx, "Toggle IK Target", &s.hasTarget, iht0);
+        }
+
+        // 解析结果（只读）。名字填错 / 不成链时这里会明说 ——
+        // 否则症状只是"IK 组件在、腿不动"，而日志里一行都没有。
+        if (sk->model && sk->model->skeleton) {
+            const assets::Skeleton& skel = *sk->model->skeleton;
+            const animation::TwoBoneIKChain ch =
+                animation::resolveTwoBoneChain(skel, s);
+            if (ch.valid()) {
+                ImGui::TextDisabled(
+                    TR("chain: %s > %s > %s"),
+                    skel.joints[static_cast<size_t>(ch.root)].name.c_str(),
+                    skel.joints[static_cast<size_t>(ch.mid)].name.c_str(),
+                    skel.joints[static_cast<size_t>(ch.end)].name.c_str());
+            } else {
+                ImGui::TextDisabled(
+                    TR("chain: NOT RESOLVED (empty = auto; must be a real "
+                       "parent->child->child chain)"));
+            }
+        }
+
+        // 三个骨名缓冲：只在**换了选中实体**时从组件回填，
+        // 否则每帧回填会把用户正在输入的半截名字冲掉。
+        if (m_ikBufFor != e) {
+            std::snprintf(m_ikRootBuf, sizeof(m_ikRootBuf), "%s",
+                          s.rootBone.c_str());
+            std::snprintf(m_ikMidBuf, sizeof(m_ikMidBuf), "%s",
+                          s.midBone.c_str());
+            std::snprintf(m_ikEndBuf, sizeof(m_ikEndBuf), "%s",
+                          s.endBone.c_str());
+            m_ikBufFor = e;
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##ikroot",
+                                 TRL("root bone (empty = thigh / upperarm)"),
+                                 m_ikRootBuf, sizeof(m_ikRootBuf));
+        if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+            const std::string v = m_ikRootBuf;
+            if (v != s.rootBone)
+                m_ctx.structuralEdit("Set IK Root Bone",
+                                     [&]() { s.rootBone = v; });
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##ikmid", TRL("mid bone (empty = longest child)"),
+                                 m_ikMidBuf, sizeof(m_ikMidBuf));
+        if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+            const std::string v = m_ikMidBuf;
+            if (v != s.midBone)
+                m_ctx.structuralEdit("Set IK Mid Bone", [&]() { s.midBone = v; });
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##ikend",
+                                 TRL("end bone (empty = longest child)"),
+                                 m_ikEndBuf, sizeof(m_ikEndBuf));
+        if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+            const std::string v = m_ikEndBuf;
+            if (v != s.endBone)
+                m_ctx.structuralEdit("Set IK End Bone", [&]() { s.endBone = v; });
+        }
+
+        const glm::vec3 itgt0 = s.target;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::DragFloat3(TRL("Target"), &s.target.x, 0.02f, -1000.0f, 1000.0f,
+                          "%.3f");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("glTF scene space (Y-up), NOT the engine Z-up world.\n"
+                   "Same space as Pose / LookAt target."));
+        }
+        fieldEdit(m_ctx, "IK Target", &s.target, itgt0);
+
+        const float iw0 = s.weight;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat(TRL("Weight"), &s.weight, 0.0f, 1.0f, "%.2f");
+        fieldEdit(m_ctx, "IK Weight", &s.weight, iw0);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("0 = bitwise identical to no IK (regression baseline).\n"
+                   "Between 0 and 1 the two rotations are slerped, so the end "
+                   "bone does NOT land on the target."));
+        }
+
+        // 极向量模式。默认"从当帧动画反推"—— 这个下拉框存在的意义
+        // 只是给"资产里的膝盖朝向不可信"这类情况留一个出口。
+        static const char* const kPoleModes[] = {"from animation", "from vector"};
+        const auto pmPrev = s.poleMode;
+        int pm = static_cast<int>(s.poleMode);
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::Combo(TRL("Pole mode"), &pm, TrItems<2>(kPoleModes), 2)) {
+            s.poleMode = static_cast<animation::TwoBoneIKSettings::PoleMode>(pm);
+            discreteEdit(m_ctx, "Set IK Pole Mode", &s.poleMode, pmPrev);
+        }
+        if (s.poleMode == animation::TwoBoneIKSettings::PoleFromVector) {
+            const glm::vec3 ipv0 = s.poleVector;
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::DragFloat3(TRL("Pole vector"), &s.poleVector.x, 0.02f, -1.0f,
+                              1.0f, "%.2f");
+            fieldEdit(m_ctx, "IK Pole Vector", &s.poleVector, ipv0);
+        }
+    }
+
+    // ================================================================
+    // 骨骼挂点（第八刀）
+    // ================================================================
+    ImGui::Separator();
+    ImGui::TextUnformatted(TR("Bone Attachment"));
+    logRect("INS-ANIM-ATTACHHEADER", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    ecs::BoneAttachmentComponent* at = w.get<ecs::BoneAttachmentComponent>(e);
+    if (!at) {
+        hint("No attachment. Pins THIS object to a bone of another entity "
+             "(weapon in a hand, hat on a head). The host is referenced by "
+             "name on purpose: entity ids are runtime indices.\n"
+             "Do not parent this object to the host - it would be transformed "
+             "twice.");
+        if (ImGui::Button(TR("Add Bone Attachment"))) {
+            m_ctx.structuralEdit("Add Bone Attachment", [&]() {
+                ecs::BoneAttachmentComponent c;
+                w.add<ecs::BoneAttachmentComponent>(e, c);
+            });
+        }
+        logRect("INS-ANIM-ADDATTACH", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+    } else {
+        const bool ate0 = at->enabled;
+        if (ImGui::Checkbox(TR("Enabled"), &at->enabled)) {
+            discreteEdit(m_ctx, "Toggle Attachment", &at->enabled, ate0);
+        }
+
+        if (m_attachBufFor != e) {
+            std::snprintf(m_attachHostBuf, sizeof(m_attachHostBuf), "%s",
+                          at->hostName.c_str());
+            std::snprintf(m_attachBoneBuf, sizeof(m_attachBoneBuf), "%s",
+                          at->boneName.c_str());
+            m_attachBufFor = e;
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##atthost", TRL("host entity name"),
+                                 m_attachHostBuf, sizeof(m_attachHostBuf));
+        if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+            const std::string v = m_attachHostBuf;
+            if (v != at->hostName)
+                m_ctx.structuralEdit("Set Attachment Host",
+                                     [&]() { at->hostName = v; });
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##attbone", TRL("bone name (e.g. hand_r)"),
+                                 m_attachBoneBuf, sizeof(m_attachBoneBuf));
+        if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+            const std::string v = m_attachBoneBuf;
+            if (v != at->boneName)
+                m_ctx.structuralEdit("Set Attachment Bone",
+                                     [&]() { at->boneName = v; });
+        }
+
+        const glm::vec3 aoff0 = at->offset;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::DragFloat3(TRL("Offset"), &at->offset.x, 0.01f, -10.0f, 10.0f,
+                          "%.3f");
+        fieldEdit(m_ctx, "Attachment Offset", &at->offset, aoff0);
+        const glm::vec3 arot0 = at->eulerDeg;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::DragFloat3(TRL("Local rot"), &at->eulerDeg.x, 1.0f, -180.0f,
+                          180.0f, TR("%.0f deg"));
+        fieldEdit(m_ctx, "Attachment Rotation", &at->eulerDeg, arot0);
+    }
 }
 
 // 输出页：引擎目前真的没有"输出设置"（分辨率 / 格式 / 保存路径都还没排进
@@ -5786,16 +6312,20 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
         }
     }
 
-    // ---- 着色模型（R4-2）----
+    // ---- 着色模型（R4-2 / A1）----
     // Default = 标准金属-粗糙度 BRDF；Skin = 预积分次表面散射（漫反射改查
-    // (N·L, 曲率) LUT，鼻梁/耳缘泛红透光）。它是**关键字位**（bit4），所以
-    // 切一下就能从下面 "Shader Var" 那行看到 k 值跟着变 —— 生效与否可自证。
+    // (N·L, 曲率) LUT，鼻梁/耳缘泛红透光）；Toon = 二次元素描着色（明暗
+    // 交界二值化 + 阴影乘冷色调）。
+    // 三者都是**关键字位**（Toon 是 bit6），所以切一下就能从下面
+    // "Shader Var" 那行看到 k 值跟着变 —— 生效与否可自证。
+    // ⚠ 下标必须与 assets::Material::ShadingModel 的枚举顺序逐位一致
+    //   （static_cast 直接把下标当枚举值用）。
     {
         int sm = static_cast<int>(mat->shadingModel);
-        const char* kShading[] = {"Default", "Skin"};
+        const char* kShading[] = {"Default", "Skin", "Toon"};
         rowBegin("Shading Model");
         ImGui::SetNextItemWidth(valueW);
-        if (ImGui::Combo("##shading-model", &sm, TrItems<2>(kShading), 2)) {
+        if (ImGui::Combo("##shading-model", &sm, TrItems<3>(kShading), 3)) {
             const auto newSm = static_cast<assets::Material::ShadingModel>(sm);
             const auto oldSm = mat->shadingModel;
             if (newSm != oldSm) {
@@ -5814,8 +6344,12 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
                 "Skin = pre-integrated subsurface scattering: the diffuse term\n"
                 "looks up a baked (N.L, curvature) LUT instead of max(N.L,0),\n"
                 "so light wraps around the terminator and the red channel bleeds\n"
-                "furthest -> nose bridge / ear rims glow red. Default materials\n"
-                "are compiled without this code path entirely (pixel-identical)."));
+                "furthest -> nose bridge / ear rims glow red.\n\n"
+                "Toon = anime cel shading: half-lambert + two-step quantisation\n"
+                "turns the terminator into a line, and the shadow side is\n"
+                "multiplied by a cool tint instead of just getting darker.\n\n"
+                "All three are compile-time shader variants; the unused code\n"
+                "path is not compiled in at all (pixel-identical elsewhere)."));
         }
     }
 
@@ -5825,6 +6359,56 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
         const bool ob = mat->doubleSided;
         mat->doubleSided = ds;
         discreteEdit(m_ctx, "Material Double Sided", &mat->doubleSided, ob);
+    }
+
+    // ---- 渲染顺序（P0-2/B，2026-10-25）----
+    // 排序键是 (renderQueue, sortOrder, -距离)。前两个是**语义**：值小 =
+    // 先画 = 在下面。跨带时距离完全不参与 —— 这是"眉毛永远压在刘海上"
+    // 唯一能做对的方式（物理上刘海确实在前，深度排序永远给出相反答案）。
+    //
+    // >= kOverlayQueueStart(3000) 的材质额外进"覆盖带"：不写深度、深度
+    // 测试恒通过。眼睛凹在眼窝里、物理上在脸皮**后面**，只有放弃深度
+    // 裁决才画得出来。
+    {
+        int rq = mat->renderQueue;
+        rowBegin("Render Queue");
+        ImGui::SetNextItemWidth(valueW);
+        if (ImGui::InputInt("##render-queue", &rq, 10, 100)) {
+            const int prev = mat->renderQueue;
+            mat->renderQueue = rq;
+            discreteEdit(m_ctx, "Material Render Queue", &mat->renderQueue,
+                         prev);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("Draw order across materials. Small = drawn first = underneath.\n"
+                "Crossing bands ignores distance entirely; inside a band the\n"
+                "usual back-to-front distance order still applies.\n\n"
+                "Suggested bands (a starting point, not a rule):\n"
+                "  1900 sky    2000 body/cloth   2400 face skin\n"
+                "  2900 back hair   3000 front hair   3100 eye white+iris\n"
+                "  3200 lashes   3300 eyebrows   3400 blush/decal\n\n"
+                "Note eyes must be ABOVE front hair: anime eyes always draw\n"
+                "over the bangs, which no geometric ordering can express.\n\n"
+                ">= 3000 enters the overlay band: depth test off, no depth\n"
+                "write. Needed because anime eyes sit recessed inside the\n"
+                "eye socket and lose the depth fight against the face."));
+        }
+    }
+    {
+        int so = mat->sortOrder;
+        rowBegin("Sort Order");
+        ImGui::SetNextItemWidth(valueW);
+        if (ImGui::InputInt("##sort-order", &so, 1, 10)) {
+            const int prev = mat->sortOrder;
+            mat->sortOrder = so;
+            discreteEdit(m_ctx, "Material Sort Order", &mat->sortOrder, prev);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("Tie-breaker inside the same render queue. Raise it to lift\n"
+                "one part above another that shares its queue."));
+        }
     }
 
     // ---- 这个材质会被编成哪个着色器变体（见 render/ShaderKeywords.h）----

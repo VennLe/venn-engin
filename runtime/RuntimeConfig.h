@@ -91,6 +91,16 @@ struct RuntimeConfig {
         std::string walkClip = "Walk";
         std::string runClip = "Run";
         std::string jumpClip = "Jump";
+
+        // 动画状态机控制器（`assets/animators/*.anim.json`）。
+        // **空 = 走上面那四个 clip 名的硬编码四态**（Locomotion，P4 的行为）。
+        // 非空 = 状态机接管，上面四个 clip 名**不再生效** —— 因为"哪段动画
+        // 归哪个状态"已经写在控制器的 states 里了。两者同时生效的话，
+        // 每帧互相覆盖，症状是"角色在两个动作之间高频抖动"。
+        //
+        // 参数名约定（引擎侧写死，见 RuntimeApp::tickPlayerAnimation）：
+        //   Speed(float) / Grounded(bool) / Jump(trigger)
+        std::string controller;
         // 走 / 跑分界（m/s）：低于 walkSpeed 算 idle，高于 runSpeed 算 run。
         // ⚠ runSpeed **默认 0 = 自动**（= 控制器 maxSpeed × 1.15）。只有
         //   明确要做"小跑"这类中间档时才需要写死一个数。

@@ -161,6 +161,10 @@ PostProcess::~PostProcess() {
         vkDestroySampler(dev, m_sampler, nullptr);
         m_sampler = VK_NULL_HANDLE;
     }
+    if (m_geoNearestSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(dev, m_geoNearestSampler, nullptr);
+        m_geoNearestSampler = VK_NULL_HANDLE;
+    }
     if (m_setLayout != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(dev, m_setLayout, nullptr);
         m_setLayout = VK_NULL_HANDLE;
@@ -188,6 +192,25 @@ void PostProcess::createSetLayoutAndSampler() {
     si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     si.compareEnable = VK_FALSE;
     VK_CHECK(vkCreateSampler(m_device.get(), &si, nullptr, &m_sampler));
+
+    // ---- 几何缓冲专用的**最近邻**采样器 ----
+    // 描边的深度判据必须用点采样：线性过滤会在物体边缘把"前景 2 米 /
+    // 背景 8 米"插成 5 米，于是边缘处左右各出现半像素的中间值 →
+    // 一条轮廓被检出**两条**线（俗称双轮廓），而且宽度随物体远近变化。
+    // 法线同理（插值出来的法线两个都不像）。
+    {
+        VkSamplerCreateInfo ni{};
+        ni.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        ni.magFilter = VK_FILTER_NEAREST;
+        ni.minFilter = VK_FILTER_NEAREST;
+        ni.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        ni.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        ni.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        ni.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        ni.compareEnable = VK_FALSE;
+        VK_CHECK(vkCreateSampler(m_device.get(), &ni, nullptr,
+                                 &m_geoNearestSampler));
+    }
 
     // ---- 自动曝光测量链的 set layout（全 COMPUTE 阶段）----
     //   0 = 64×64 块平均 log2 亮度图（histogram.comp 采样）
@@ -390,18 +413,18 @@ std::unique_ptr<rhi::Pipeline> PostProcess::makeFullscreenPipeline(
 
 void PostProcess::createPipelines() {
     // bloom / fxaa 的推常量是 1 个 vec4（16B）；合成（post.frag）是 4 个
-    // vec4（64B：params + 相机效果 + 色彩分级 LUT + 升采样）。
-    // 合成的 set 数 = 3（HDR / bloom / LUT）—— 三者共用 m_setLayout
-    // （都是"一张图 + 一个采样器"的形状）。
+    // vec4（96B：params + 相机效果 + 色彩分级 LUT + 升采样 + 描边 2 组）。
+    // 合成的 set 数 = 4（HDR / bloom / LUT / 几何缓冲）—— 四者共用
+    // m_setLayout（都是"一张图 + 一个采样器"的形状）。
     m_brightPipeline =
         makeFullscreenPipeline(m_bloomRenderPass, "bloom_bright.frag.spv", 1, 16);
     m_blurPipeline =
         makeFullscreenPipeline(m_bloomRenderPass, "bloom_blur.frag.spv", 1, 16);
     m_postPipeline =
-        makeFullscreenPipeline(m_postRenderPass, "post.frag.spv", 3, 64);
+        makeFullscreenPipeline(m_postRenderPass, "post.frag.spv", 4, 96);
     // 离屏目标那条管线（编辑器视口模式才用得上）
     m_postOffscreenPipeline =
-        makeFullscreenPipeline(m_offscreenRenderPass, "post.frag.spv", 3, 64);
+        makeFullscreenPipeline(m_offscreenRenderPass, "post.frag.spv", 4, 96);
     // FXAA 两条：与合成的双管线结构对偶 —— 输出目标决定绑哪条 RenderPass。
     // fxaa.frag.spv 由 CMake 与其它 shader 一起编译（普通文件，无关键字）。
     m_fxaaPipeline =
@@ -571,13 +594,19 @@ void PostProcess::createFxaaFrames() {
     }
 }
 
-void PostProcess::destroyDescriptors() { m_descriptors.reset(); }
+void PostProcess::destroyDescriptors() {
+    m_descriptors.reset();
+    // 池一丢句柄就全失效。不清空的话 outlineReady() 会拿脏句柄报"就绪"，
+    // 而 recordComposite 会把它绑进命令缓冲（验证层直接报 use-after-free）。
+    m_geoSets.clear();
+}
 
 void PostProcess::buildDescriptorSets(
-    const std::vector<VkImageView>& hdrColorViews) {
-    // 输入集数量 = 帧数 × 4（HDR / bloomA / bloomB / fxaa）+ 自动曝光
+    const std::vector<VkImageView>& hdrColorViews,
+    const std::vector<VkImageView>& geometryViews) {
+    // 输入集数量 = 帧数 × 5（HDR / bloomA / bloomB / fxaa / 几何）+ 自动曝光
     // （帧数）+ 余量。
-    const uint32_t count = static_cast<uint32_t>(m_bloom.size()) * 4 + 8;
+    const uint32_t count = static_cast<uint32_t>(m_bloom.size()) * 5 + 8;
     // 第 5 个参数是 STORAGE_BUFFER 容量（自动曝光的 bins / result 用）。
     // 主池也预留 —— 那些集就是从这个池里分配的。
     m_descriptors = std::make_unique<rhi::DescriptorAllocator>(
@@ -587,6 +616,7 @@ void PostProcess::buildDescriptorSets(
     m_bloomASets.resize(m_bloom.size());
     m_bloomBSets.resize(m_bloom.size());
     m_fxaaSets.resize(m_bloom.size());
+    m_geoSets.assign(m_bloom.size(), VK_NULL_HANDLE);
 
     for (size_t i = 0; i < m_bloom.size(); ++i) {
         m_hdrSets[i] = m_descriptors->allocate(m_setLayout);
@@ -606,6 +636,21 @@ void PostProcess::buildDescriptorSets(
             m_descriptors->writeTexture(m_fxaaSets[i], 0, m_sampler,
                                         m_fxaa[i].view);
         }
+
+        // ---- 几何缓冲（set 3，描边输入）----
+        // 必须**总是**分配一个合法集：vkCmdBindDescriptorSets 里传
+        // VK_NULL_HANDLE 是硬错误（VUID-vkCmdBindDescriptorSets-
+        // pDescriptorSets-parameter），不是"跳过绑定"。
+        // 没有几何视图时用 HDR 那张兜底 —— 两者格式**相同**
+        // （R16G16B16A16_SFLOAT），绑上去不会触发格式不匹配；而且描边
+        // 关闭时着色器根本不采样它（push 里的开关整段跳过）。
+        m_geoSets[i] = m_descriptors->allocate(m_setLayout);
+        const VkImageView geoView =
+            (i < geometryViews.size() && geometryViews[i] != VK_NULL_HANDLE)
+                ? geometryViews[i]
+                : hdrColorViews[i];
+        m_descriptors->writeTexture(m_geoSets[i], 0, m_geoNearestSampler,
+                                    geoView);
     }
 
     // 自动曝光的集引用的是**固定尺寸**的亮度图与缓冲（不随 resize 变），
@@ -630,7 +675,8 @@ VkImageView PostProcess::sceneOutputView(uint32_t frameIndex) const {
 void PostProcess::recreate(const std::vector<VkImageView>& swapchainViews,
                            VkExtent2D swapchainExtent,
                            const std::vector<VkImageView>& hdrColorViews,
-                           VkExtent2D viewportExtent) {
+                           VkExtent2D viewportExtent,
+                           const std::vector<VkImageView>& geometryViews) {
     m_device.waitIdle();
 
     const bool wasSplit = m_splitOutput;
@@ -688,7 +734,7 @@ void PostProcess::recreate(const std::vector<VkImageView>& swapchainViews,
     destroyFxaaFrames();
     createFxaaFrames();
     createSwapFramebuffers(swapchainViews);
-    buildDescriptorSets(hdrColorViews);
+    buildDescriptorSets(hdrColorViews, geometryViews);
 }
 
 // ---------------------------------------------------------------- 录制
@@ -788,11 +834,16 @@ void PostProcess::recordComposite(
 
     // set 2 = 色彩分级 LUT（单张、帧间恒定；关着时仍要绑一个合法集，
     // 但着色器用 push 里的开关把它整段跳过 → 逐像素回到基线）。
-    VkDescriptorSet sets[3] = {m_hdrSets[fi], m_bloomASets[fi], m_lutSet};
-    // 64B 推常量：vec4 params（曝光 / 强度 / tonemap / 暗角）
+    // set 3 = 几何缓冲（法线 + 线性距离，描边输入）。
+    VkDescriptorSet sets[4] = {m_hdrSets[fi], m_bloomASets[fi], m_lutSet,
+                               m_geoSets.empty() ? VK_NULL_HANDLE
+                                                 : m_geoSets[fi]};
+    // 96B 推常量：vec4 params（曝光 / 强度 / tonemap / 暗角）
     //            + vec4 camFx（色差 / 暗角幂 / 保留）
     //            + vec4 lut（缩放 / 偏置 / 开关 / 混合权重）
     //            + vec4 ups（源纹素 x,y / 升采样开关 / 锐度）
+    //            + vec4 outline（开关 / 宽度 / 深度阈值 / 法线阈值）
+    //            + vec4 outlineRgb（rgb = 线颜色，a = 强度）
     // 曝光用 effectiveExposure()：自动曝光开着时是自适应值，
     // 关着时**精确等于** m_settings.exposure（逐像素回到基线）。
     const float post[8] = {effectiveExposure(), m_settings.bloomStrength,
@@ -808,20 +859,37 @@ void PostProcess::recordComposite(
     const float lut[4] = {lutScale, lutOffset,
                           m_settings.colorGrading ? 1.0f : 0.0f,
                           m_settings.cgLutBlend};
-    // 升采样：只有 renderScale < 1 时开。源纹素用**场景渲染分辨率**的
-    // 倒数（边缘感知核的步长）。scale == 1 时整段关闭 → 逐像素不变。
+    // 升采样：只有 renderScale < 1 时**生效**（z 是开关）。
+    // ⚠ xy 现在是**无条件**填的（过去只在 up 时填，否则留 0）—— 描边要用
+    //   同一个纹素尺寸算采样步长，而描边与 DRS 是两件独立的事。
+    //   这不改变基线：upsampleScene 在 z<=0.5 时第一行就 return，
+    //   根本不读 xy。
     const bool up = m_settings.renderScale < 0.999f;
     const float upv[4] = {
-        up && m_sceneExtent.width ? 1.0f / static_cast<float>(m_sceneExtent.width)
-                                  : 0.0f,
-        up && m_sceneExtent.height
-            ? 1.0f / static_cast<float>(m_sceneExtent.height) : 0.0f,
+        m_sceneExtent.width ? 1.0f / static_cast<float>(m_sceneExtent.width)
+                            : 0.0f,
+        m_sceneExtent.height ? 1.0f / static_cast<float>(m_sceneExtent.height)
+                             : 0.0f,
         up ? 1.0f : 0.0f, m_settings.drsSharpness};
-    float pc[16];
+    // 描边。**开关与"输入是否就绪"必须同时成立** —— 否则开了描边却没有
+    // 几何缓冲时，着色器会去采一张内容无意义的图（兜底绑的 HDR），
+    // 结果是整屏乱线。这类"看起来能开但没数据"的组合要在 CPU 侧掐掉。
+    const bool outlineOn = m_settings.outline && outlineReady();
+    const float outline[4] = {outlineOn ? 1.0f : 0.0f,
+                              m_settings.outlineWidth,
+                              m_settings.outlineDepthThreshold,
+                              m_settings.outlineNormalThreshold};
+    const float outlineRgb[4] = {m_settings.outlineColor[0],
+                                 m_settings.outlineColor[1],
+                                 m_settings.outlineColor[2],
+                                 m_settings.outlineStrength};
+    float pc[24];
     std::memcpy(pc, post, sizeof(post));
     std::memcpy(pc + 8, lut, sizeof(lut));
     std::memcpy(pc + 12, upv, sizeof(upv));
-    recordFullscreenPass(cmd, fb, rp, pipeline, targetExtent, sets, 3, pc,
+    std::memcpy(pc + 16, outline, sizeof(outline));
+    std::memcpy(pc + 20, outlineRgb, sizeof(outlineRgb));
+    recordFullscreenPass(cmd, fb, rp, pipeline, targetExtent, sets, 4, pc,
                          sizeof(pc), overlay);
 }
 

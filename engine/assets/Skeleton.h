@@ -49,6 +49,33 @@ struct AnimationClip {
     // 63 条通道的角色每帧也只是 63 次二分查找。
 };
 
+// ---- 按名字找关节的匹配选项（2026-10-25，第八刀）----
+//
+// 为什么要有标志位而不是三个函数：调用方要的组合是"精确 vs 包含"×
+// "要不要跳过末端辅助骨"，三份实现各漏一个组合的历史就是 §16.1 记的那件事。
+enum JointMatchFlags : unsigned {
+    kJointMatchExact = 0u,
+    // 名字比较不区分大小写。**几乎总是要开**：Mixamo 导出的骨叫
+    // `mixamorig:Head`，美术手填的是 `head`。
+    kJointMatchCaseInsensitive = 1u << 0,
+    // 精确没命中时退化成"包含"。开了才能在没记住 `mixamorig:` 前缀时也能用。
+    kJointMatchSubstring = 1u << 1,
+    // 跳过 `Head_end` / `*_tip` / `*Nub` 这类**末端辅助骨**。它们的位置在
+    // 骨尖上，拿它当"头"会让旋转轴跑偏（DCC 里几乎人手一根）。
+    //
+    // ⚠ 只作用于**包含匹配**（退化的那一轮）。精确匹配**永远不过滤** ——
+    //   否则显式要 `Head_end` 的人会拿到 -1，"我要的就是这根骨"变成不可能。
+    //   这条区分是第八刀的自检抓出来的：一开始两轮都过滤，
+    //   `findJoint("Head_end")` 直接返回 -1。
+    kJointMatchSkipEndTips = 1u << 2,
+};
+// 默认：不分大小写 + 允许包含 + **跳过末端辅助骨**。
+// 带上第三个的理由：在"返回 -1"和"返回一根错误的骨"之间，前者能查、
+// 后者只会表现成"这个角色的头转轴是歪的"。
+constexpr unsigned kJointMatchDefault = kJointMatchCaseInsensitive |
+                                        kJointMatchSubstring |
+                                        kJointMatchSkipEndTips;
+
 // ---- 骨骼 ----
 struct Skeleton {
     struct Joint {
@@ -78,6 +105,27 @@ struct Skeleton {
             if (c.name == name) return &c;
         return nullptr;
     }
+
+    // ---- 按名字找关节（全仓库唯一实现，2026-10-25）----
+    //
+    // 抽取原因：这套"精确（不分大小写）→ 退化成包含 → 跳过 end/tip"的
+    // 逻辑本来有两份 —— `animation/LookAt.cpp` 的 resolveLookAtBone，和
+    // `animation/SpringBone.cpp` 里手写的前缀扫描。两份的差别只在
+    // "找一根" vs "找一批"，而"找一根"那份的两个退化分支是被真实资产
+    // 逼出来的（`mixamorig:Head`），新加的 IK / 挂点如果各自复制一遍，
+    // 迟早有一份漏掉某个分支 —— 症状是"某个角色的手挂不上"。
+    //
+    // 返回 joint 下标；找不到返回 **-1**（不是 0 —— 静默取第 0 根会让
+    // "名字写错"表现成"在根骨骼上转"，几乎不可能从画面上反推）。
+    int findJoint(const std::string& name,
+                  unsigned flags = kJointMatchDefault) const;
+
+    // 批量：所有名字以 `prefix` 开头（不区分大小写）的 joint 下标，
+    // **按 joint 下标升序**（不是 topoOrder —— 调用方若要拓扑序自己排）。
+    // prefix 为空 → 不填任何东西（不是"填全部"：空前缀匹配一切，
+    // 而弹簧骨那里"空前缀"的语义是"用默认前缀表"，不是"整具骨架"）。
+    void findJointsWithPrefix(const std::string& prefix,
+                              std::vector<int>& out) const;
 
     // 采样出 jointCount() 个 joint 矩阵（invMeshNode * world * invBind）。
     // clip 传 nullptr → 静止姿势（rest pose）。out 会被 resize 到关节数。

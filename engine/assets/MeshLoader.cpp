@@ -823,7 +823,43 @@ std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
                         for (size_t i = 0; i < aPos.count; ++i)
                             verts[i].uv = readVec2(aUv, i);
                     }
-                    // TANGENT 故意忽略：着色器用屏幕空间导数构造 TBN
+                    // TEXCOORD_1（第二套 UV，§13）。与 TEXCOORD_0 同样不翻转。
+                    // glTF 里第二套 UV 常用来放 AO / 面部阴影这类"另存一张图"的通道。
+                    auto itUv2 = prim.attributes.find("TEXCOORD_1");
+                    AccessorView aUv2;
+                    if (itUv2 != prim.attributes.end() &&
+                        accessorView(gm, itUv2->second, aUv2)) {
+                        for (size_t i = 0; i < aPos.count; ++i)
+                            verts[i].uv2 = readVec2(aUv2, i);
+                    }
+
+                    // TANGENT（§13）。glTF 规定是 vec4：xyz = 沿 U 方向的切线，
+                    // w = 副切线手性（±1）。w 缺失时按 +1。
+                    // ⚠ 这里**不再**"故意忽略"：pbr.frag 目前的 TBN 仍然用
+                    //   屏幕空间导数（cotangent frame），切线只在将来的各向
+                    //   异性头发里用 —— 但导入链必须先把数据带进来，否则
+                    //   那时候又要重烤一遍。零长度切线按"没有"处理。
+                    auto itTan = prim.attributes.find("TANGENT");
+                    AccessorView aTan;
+                    if (itTan != prim.attributes.end() &&
+                        accessorView(gm, itTan->second, aTan)) {
+                        for (size_t i = 0; i < aPos.count; ++i) {
+                            // ⚠ 不用 readVec4：它的 FLOAT 分支无条件读 p+12，
+                            //   而 TANGENT 在少数导出器里是 VEC3（第 4 个分量
+                            //   由约定推为 +1）。那会读越界一个 float —— 恰好
+                            //   落在下一个元素的 x 上时"能用"，落在末尾时崩。
+                            const glm::vec3 t = readVec3(aTan, i);
+                            const float len2 =
+                                t.x * t.x + t.y * t.y + t.z * t.z;
+                            if (len2 <= 1.0e-12f) continue;
+                            float w = 1.0f;
+                            if (aTan.comps >= 4) {
+                                const uint8_t* p = aTan.data + i * aTan.stride;
+                                if (readFloat(p + 12) < 0.0f) w = -1.0f;
+                            }
+                            verts[i].tangent = glm::vec4(t.x, t.y, t.z, w);
+                        }
+                    }
 
                     // ---- 蒙皮：JOINTS_0 / WEIGHTS_0 ----
                     // 只有这个 primitive 属于带 skin 的 mesh 时才读。

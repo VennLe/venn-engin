@@ -14,9 +14,85 @@
 #include "animation/Pose.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 
 namespace assets {
+
+namespace {
+
+// ASCII 小写化。**不用 locale**：骨骼名是 ASCII 标识符，而 std::tolower
+// 在 C locale 之外会把某些字节映射成多字节序列，比较就永远不相等。
+std::string asciiLower(const std::string& s) {
+    std::string r = s;
+    for (char& c : r)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return r;
+}
+
+bool startsWith(const std::string& s, const std::string& p) {
+    return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
+}
+
+// 末端辅助骨的判据。为什么是"包含"而不是"以 _end 结尾"：
+// Blender 写 `Head_end`，3ds Max 的 Biped 写 `HeadNub`，Mixamo 写
+// `HeadTop_End`，UE mannequin 写 `head_end`。三个厂商三种写法，
+// 只有"名字里出现 end/tip/nub"是共通的。
+bool isEndTip(const std::string& lowered) {
+    return lowered.find("end") != std::string::npos ||
+           lowered.find("tip") != std::string::npos ||
+           lowered.find("nub") != std::string::npos;
+}
+
+} // namespace
+
+int Skeleton::findJoint(const std::string& name, unsigned flags) const {
+    const int n = jointCount();
+    if (n <= 0) return -1;
+
+    // 空名字 = "没指定"。**不是**匹配第 0 根 —— 调用方（LookAt / IK）
+    // 把空名字当"自动挑一根"，那个语义在上层，不在这里。
+    if (name.empty()) return -1;
+
+    const bool ci = (flags & kJointMatchCaseInsensitive) != 0u;
+    const bool sub = (flags & kJointMatchSubstring) != 0u;
+    const bool skipTips = (flags & kJointMatchSkipEndTips) != 0u;
+
+    const std::string want = ci ? asciiLower(name) : name;
+
+    // ---- 第一轮：精确 ----
+    // 精确优先是硬要求：`hand_l` 用包含匹配会先撞上 `hand_l_end`（如果它在
+    // 数组里更靠前），而两根骨的旋转轴完全不同。
+    //
+    // ⚠ 这一轮**不过滤** end/tip：显式写出了骨骼全名的人要的就是那一根。
+    //   过滤掉等于"精确匹配返回 -1"，比匹配错更难查 —— 调用方会以为
+    //   资产里没有这根骨。
+    for (int i = 0; i < n; ++i) {
+        const std::string& nm = joints[static_cast<size_t>(i)].name;
+        const std::string cur = ci ? asciiLower(nm) : nm;
+        if (cur == want) return i;
+    }
+
+    // ---- 第二轮：包含（这一轮才跳末端辅助骨）----
+    if (!sub) return -1;
+    for (int i = 0; i < n; ++i) {
+        const std::string& nm = joints[static_cast<size_t>(i)].name;
+        const std::string cur = ci ? asciiLower(nm) : nm;
+        if (skipTips && isEndTip(cur)) continue;
+        if (cur.find(want) != std::string::npos) return i;
+    }
+    return -1;
+}
+
+void Skeleton::findJointsWithPrefix(const std::string& prefix,
+                                    std::vector<int>& out) const {
+    if (prefix.empty()) return;
+    const int n = jointCount();
+    const std::string want = asciiLower(prefix);
+    for (int i = 0; i < n; ++i)
+        if (startsWith(asciiLower(joints[static_cast<size_t>(i)].name), want))
+            out.push_back(i);
+}
 
 glm::vec4 sampleTrack(const AnimTrack& t, float time) {
     if (t.times.empty()) return glm::vec4(0.0f);

@@ -57,6 +57,8 @@ Material::Params allDifferent() {
     p.shadingModel = Material::ShadingModel::Skin;
     p.doubleSided = true;
     p.heightScale = 0.077f;
+    p.renderQueue = 3100;
+    p.sortOrder = 7;
     return p;
 }
 
@@ -70,12 +72,15 @@ int runMaterialSelfTest() {
     // ---------------- A. 参数集 / 位序 ----------------
     {
         using M = Material;
-        // A1 位序冻结：12 个字段 = 0xFFF。这条断言存在的唯一目的，
+        // A1 位序冻结：20 个字段 = 0xFFFFF。这条断言存在的唯一目的，
         //    是"有人手滑改了位序"时立刻炸 —— 存档里存的是裸数字。
+        //    12 → 14 是 2026-10-25 追加 renderQueue/sortOrder（P0-2/B），
+        //    14 → 20 是同日追加 A 类语义槽的六个标量（材质页 96B），
+        //    **只追加不插队**，所以旧存档的低 12 位含义完全不变。
         char mb[32];
-        std::snprintf(mb, sizeof(mb), "mask=0x%03X",
+        std::snprintf(mb, sizeof(mb), "mask=0x%05X",
                       static_cast<unsigned>(M::kOvScalarMask));
-        check("A1 material_bits_frozen", M::kOvScalarMask == 0xFFFu, mb);
+        check("A1 material_bits_frozen", M::kOvScalarMask == 0xFFFFFu, mb);
 
         // A2 每个位各自独立（改一个字段 → 只有那一位亮）
         const M::Params base;
@@ -122,6 +127,35 @@ int runMaterialSelfTest() {
         p = base;
         p.heightScale = 0.9f;
         cases.push_back({"heightScale", M::kOvHeightScale, p});
+        p = base;
+        p.renderQueue = 3100;
+        cases.push_back({"renderQueue", M::kOvRenderQueue, p});
+        p = base;
+        p.sortOrder = 9;
+        cases.push_back({"sortOrder", M::kOvSortOrder, p});
+        // ---- A 类语义槽的六个标量（2026-10-25）----
+        // 每个都用与默认值不同的数：这里测的是"diffParams 认不认得出
+        // 这个字段变了"，写个等于默认值的数会让这条 case **静默失效**
+        // （diff 为 0，而 wrong 只看 d != bit，会立刻报出来 —— 但如果
+        //  有人把默认值也改了，测试就会以一种很难懂的方式变绿）。
+        p = base;
+        p.rampSteps = 4.0f;
+        cases.push_back({"rampSteps", M::kOvRampSteps, p});
+        p = base;
+        p.matcapStrength = 0.9f;
+        cases.push_back({"matcapStrength", M::kOvMatcapStrength, p});
+        p = base;
+        p.matcapRotate = 0.9f;
+        cases.push_back({"matcapRotate", M::kOvMatcapRotate, p});
+        p = base;
+        p.sdfShadowStrength = 0.9f;
+        cases.push_back({"sdfShadowStrength", M::kOvSdfShadowStrength, p});
+        p = base;
+        p.detailStrength = 0.9f;
+        cases.push_back({"detailStrength", M::kOvDetailStrength, p});
+        p = base;
+        p.detailTiling = 0.9f;
+        cases.push_back({"detailTiling", M::kOvDetailTiling, p});
 
         std::uint32_t seen = 0;
         int wrong = 0;
@@ -134,7 +168,7 @@ int runMaterialSelfTest() {
         std::snprintf(sb, sizeof(sb), "wrong=%d seen=0x%03X", wrong,
                       static_cast<unsigned>(seen));
         check("A2 material_diff_each_bit_isolated", wrong == 0, sb);
-        // 12 个字段全改 → 恰好是全集，且没有第 13 位
+        // 20 个字段全改 → 恰好是全集，且没有第 21 位
         check("A3 material_diff_all_bits", seen == M::kOvScalarMask, sb);
         check("A4 material_diff_identical_is_zero",
               M::diffParams(base, base) == 0u, "");

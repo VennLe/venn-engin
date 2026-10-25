@@ -49,6 +49,12 @@ enum SectionId : std::uint32_t {
     kSectionAnimation = 3,
     kSectionMaterial = 4,
     kSectionString = 5,
+    // morph target 的 delta 流（§14）。**可选区块** —— 没有 morph 的
+    // 资产不写它，老读端遇到不认识的 id 直接跳过（区块表的意义所在）。
+    // ⚠ 与材质不同：顶点里的 `morphBase` 是**指向本区块的下标**，
+    //   所以"MESH 里有非哨兵 morphBase 但 MORPH 区块缺失"是矛盾状态，
+    //   读端必须报错而不是静默当成"没有 morph"。
+    kSectionMorph = 6,
 };
 
 // 文件级标志
@@ -90,6 +96,11 @@ struct WriteStats {
     std::uint32_t clips = 0;
     std::uint32_t materials = 0;
     std::uint32_t rawGeometryBytes = 0;   // 未压缩的顶点+索引字节数
+    // morph（§14）：target 总数 / delta 记录数。`--verbose` 会打出来，
+    // 验收脚本也用它断言"alicia 的 target 数没在重烤里掉过"。
+    std::uint32_t morphTargets = 0;
+    std::size_t morphDeltas = 0;
+    std::uint32_t morphChannels = 0;
 };
 
 // 只读的"体检报告"（`AssetC --info`，不需要把整个模型读进内存）
@@ -98,10 +109,23 @@ struct MeshFileInfo {
     std::uint32_t flags = 0;
     std::uint64_t sourceHash = 0;
     std::uint32_t sectionCount = 0;
+    // MESH 区块自身的版本与顶点 stride。单列出来是为了让"这个文件是
+    // 哪一代顶点格式"能一眼看出来 —— §13 之后旧文件会被 readMeshFile
+    // 直接拒掉，而 `--info` 是唯一能**不加载**就检查它的手段。
+    std::uint32_t meshVersion = 0;
+    std::uint32_t vertexStride = 0;
     std::uint32_t subMeshCount = 0;
     std::uint32_t jointCount = 0;
     std::uint32_t clipCount = 0;
     std::uint32_t materialCount = 0;
+    // morph：target 总数（跨子网格累加）与 delta 记录总数。
+    // 单列出来是因为"这个资产到底有没有表情"必须能不加载就查得到 ——
+    // 验收脚本靠它区分"alicia 有 60 个 target"和"其余 5 个一个都没有"。
+    std::uint32_t morphTargetCount = 0;
+    std::uint64_t morphDeltaCount = 0;
+    // 滑条数（§15）。**不等于** morphTargetCount：in-between shape key 时
+    // 一个 channel 挂多个 target。相等是常见情况，不是定义。
+    std::uint32_t morphChannelCount = 0;
     std::uint64_t vertexCount = 0;
     std::uint64_t indexCount = 0;
     std::uint64_t bytes = 0;

@@ -104,7 +104,8 @@ bool envFloat(const char* name, float& out) {
     return true;
 }
 
-constexpr uint32_t kGlobalSetBindings = 25;
+// 25 = 25 个 binding（0..24）；§15 追加 25/26/27 三块 morph SSBO → 28。
+constexpr uint32_t kGlobalSetBindings = 28;
 
 // "当前没有绑定任何前向变体管线"的哨兵。
 // ⚠ 不能用 0：0 是**合法掩码**（三个关键字全关，也是最常见的材质）。
@@ -382,6 +383,21 @@ void Renderer::bindPostFeatureParams() {
     render::bindParam("drs.minScale", &ps.drsMinScale, ParamKind::Float);
     render::bindParam("drs.maxScale", &ps.drsMaxScale, ParamKind::Float);
     render::bindParam("drs.sharpness", &ps.drsSharpness, ParamKind::Float);
+
+    // ---- 描边（NPR，2026-10-25）----
+    // 这些参数没有对应成员变量在 HdrTarget 侧 —— 几何缓冲是**无条件**
+    // 创建的（描边关了它也照写）。理由：让 renderpass 的附件数量随开关
+    // 变化意味着开关一次就要 waitIdle + 重建 renderpass / pipeline /
+    // 描述符，而它只是一条 G16R16F 的写（与 HDR 同量级）。
+    // 描边关闭时是"没人读"，不是"没人写" —— 这是有意的取舍。
+    render::bindParam("outline.enabled", &ps.outline, ParamKind::Bool);
+    render::bindParam("outline.width", &ps.outlineWidth, ParamKind::Float);
+    render::bindParam("outline.depthThreshold", &ps.outlineDepthThreshold,
+                      ParamKind::Float);
+    render::bindParam("outline.normalThreshold", &ps.outlineNormalThreshold,
+                      ParamKind::Float);
+    render::bindParam("outline.strength", &ps.outlineStrength, ParamKind::Float);
+    render::bindParam("outline.color", &ps.outlineColor[0], ParamKind::Color3);
 }
 
 Renderer::Renderer(core::Window& window) : m_window(window) {
@@ -1051,6 +1067,23 @@ void Renderer::createDescriptorLayouts() {    // set 0：binding 0 = FrameUBO，
     bindings[24].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[24].descriptorCount = 1;
     bindings[24].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    // 25/26/27：GPU 形变的三块 SSBO（§15）。
+    //
+    // 全是 VERTEX 阶段（pbr.vert / shadow.vert 的形变段）。layout 里**永远
+    // 存在**这三项，即使引擎里一个带 morph 的资产都没有 —— 否则带 morph
+    // 变体的管线会在创建时报 layout-07988。缓冲也永远绑一块有效内存
+    // （初始 1 条），着色器按顶点 morphCount / 实例 targetCount 判空，
+    // 从不依赖"绑没绑"。
+    {
+        struct { uint32_t b; } morphBindings[] = {{25}, {26}, {27}};
+        for (const auto& mb : morphBindings) {
+            bindings[mb.b].binding = mb.b;
+            bindings[mb.b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[mb.b].descriptorCount = 1;
+            bindings[mb.b].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        }
+    }
 
     m_globalSetLayout = rhi::makeSetLayout(
         *m_device, std::vector<VkDescriptorSetLayoutBinding>(bindings,
@@ -3130,6 +3163,142 @@ void Renderer::collectDecals(scene::Scene& scene) {
 //
 // 剔除只对"有包围盒"的网格生效：顶点为空 / 包围盒未知的网格保守保留，
 // 宁可多画也不能漏画（漏画是肉眼可见的 bug）。
+// ============================================================
+// GPU 形变（§15）
+// ============================================================
+//
+// 数据流：
+//   每条带 morph 的绘制项 →  追加 delta 流（按网格去重）
+//                         →  追加 target 权重（逐实例，不去重）
+//                         →  写一条 MorphInstance{deltaBase, weightBase, n}
+//   顶点着色器按 `morphBase/morphCount`（逐顶点）遍历自己的 delta，
+//   用 `morphWeights[weightBase + delta.target]` 加权累加。
+//
+// 为什么 delta 流要去重、权重不去重：
+//   delta 只取决于网格（同一只角色的三个实例完全相同，566 KB × 3 是纯浪费），
+//   权重取决于实例（三个实例可以有三个表情）。
+void Renderer::resetMorphFrame() {
+    m_morphDeltaOffset = 0;
+    m_morphWeightOffset = 0;
+    m_morphDeltaBase.clear();
+    m_morphBudgetHit = false;
+    m_morphEvalOwner = nullptr;
+    m_morphStatDraws = 0;
+}
+
+bool Renderer::appendMorphDraw(const assets::Mesh& mesh,
+                               const std::vector<float>& targetWeights,
+                               MorphBases* out) {
+    if (!out) return false;
+    *out = MorphBases{};
+    auto& f = m_frames[m_currentFrame];
+    const std::uint32_t targets = mesh.morphTargetCount();
+    const std::vector<assets::MorphDelta>& deltas = mesh.morphDeltas();
+    if (targets == 0 || deltas.empty()) return false;
+
+    // ---- delta 流（按 Mesh* 去重）----
+    std::uint32_t deltaBase = 0;
+    auto found = m_morphDeltaBase.find(&mesh);
+    if (found != m_morphDeltaBase.end()) {
+        deltaBase = found->second;
+    } else {
+        const std::uint32_t n = static_cast<std::uint32_t>(deltas.size());
+        if (m_morphDeltaOffset + n > f.morphDeltaCapacity ||
+            !f.morphDeltasMapped) {
+            if (!m_morphBudgetWarned) {
+                m_morphBudgetWarned = true;
+                VK_LOG_WARN("MORPH: delta budget exhausted (%u + %u > %u) "
+                            "→ 本帧形变退化为静止姿势（提高 "
+                            "FrameResources::morphDeltaCapacity）",
+                            m_morphDeltaOffset, n, f.morphDeltaCapacity);
+            }
+            m_morphBudgetHit = true;
+            return false;
+        }
+        deltaBase = m_morphDeltaOffset;
+        std::memcpy(static_cast<assets::MorphDelta*>(f.morphDeltasMapped) +
+                        deltaBase,
+                    deltas.data(),
+                    static_cast<std::size_t>(n) * sizeof(assets::MorphDelta));
+        m_morphDeltaOffset += n;
+        m_morphDeltaBase.emplace(&mesh, deltaBase);
+    }
+
+    // ---- target 权重（逐实例，不去重）----
+    if (m_morphWeightOffset + targets > f.morphWeightCapacity ||
+        !f.morphWeightsMapped) {
+        if (!m_morphBudgetWarned) {
+            m_morphBudgetWarned = true;
+            VK_LOG_WARN("MORPH: weight budget exhausted (%u + %u > %u) "
+                        "→ 本帧形变退化为静止姿势",
+                        m_morphWeightOffset, targets, f.morphWeightCapacity);
+        }
+        m_morphBudgetHit = true;
+        return false;
+    }
+    const std::uint32_t weightBase = m_morphWeightOffset;
+    float* wdst = static_cast<float*>(f.morphWeightsMapped) + weightBase;
+    for (std::uint32_t i = 0; i < targets; ++i)
+        wdst[i] = (i < targetWeights.size()) ? targetWeights[i] : 0.0f;
+    m_morphWeightOffset += targets;
+
+    out->deltaBase = deltaBase;
+    out->weightBase = weightBase;
+    out->targets = targets;
+    return true;
+}
+
+void Renderer::writeMorphSlot(std::uint32_t slot, const MorphBases& bases) {
+    auto& f = m_frames[m_currentFrame];
+    if (!f.morphSlotsMapped || slot >= f.morphSlotCapacity) {
+        if (!m_morphBudgetWarned) {
+            m_morphBudgetWarned = true;
+            VK_LOG_WARN("MORPH: slot budget exhausted (slot=%u cap=%u)",
+                        slot, f.morphSlotCapacity);
+        }
+        m_morphBudgetHit = true;
+        return;
+    }
+    auto* rec = static_cast<render::MorphInstance*>(f.morphSlotsMapped) + slot;
+    if (bases.targets == 0) {
+        // **必须显式清零**，不能"什么都不做"：槽位是跨帧复用的，上一帧这里
+        // 可能躺着一个真有形变的记录，而着色器只按顶点的 morphCount 判断
+        // 要不要遍历 —— 一个"顶点说有 delta、记录说是别人"的组合会让它
+        // 用**别的实例**的权重去形变。targetCount = 0 是着色器的硬开关
+        // （见 pbr.vert 的 `mi.z > 0`）。
+        rec->aux = glm::uvec4(0, 0, 0, 0);
+        return;
+    }
+    rec->aux = glm::uvec4(bases.deltaBase, bases.weightBase, bases.targets, 0u);
+}
+
+// 阴影 Pass 用（级联 / 局部光源）：按实体现场算一份 morph 数据。
+//
+// 为什么阴影不"借用"前向那一次的槽位：阴影 Pass 遍历的是**投影体**
+// （forShadowCaster），与前向的可见列表不是同一集合 —— 屏幕外但仍投影的
+// 角色在前向里根本没有槽位。现场再算一次是最省心的做法：delta 流按
+// Mesh* 去重（不重复传 566 KB），只有几十个 float 的权重会多算一遍。
+std::uint32_t Renderer::morphSlotForShadow(scene::Scene& scene, ecs::Entity e,
+                                           const assets::Mesh& mesh) {
+    if (mesh.morphTargetCount() == 0) return 0;
+    const auto* mpc = scene.findInAncestors<ecs::MorphComponent>(e);
+    if (!mpc || !mpc->model || mpc->model->morphRig.empty()) return 0;
+    const int sub = mpc->model->subMeshIndexOf(&mesh);
+    if (sub < 0) return 0;
+    if (m_morphEvalOwner != mpc) {
+        mpc->model->morphRig.evaluate(mpc->weights, &m_morphWeightsScratch);
+        m_morphEvalOwner = mpc;
+    }
+    if (static_cast<std::size_t>(sub) >= m_morphWeightsScratch.size()) return 0;
+    MorphBases b;
+    if (!appendMorphDraw(mesh, m_morphWeightsScratch[static_cast<std::size_t>(sub)],
+                         &b))
+        return 0;
+    const std::uint32_t slot = m_instanceOffset++;
+    writeMorphSlot(slot, b);
+    return slot;
+}
+
 void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
                               bool isMain) {
     m_opaqueDraws.clear();
@@ -3146,6 +3315,7 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
     // 实例 SSBO 槽游标：主场景从头排（照骨骼 SSBO 的 resetOffset 模式），
     // 预览场景紧跟在主场景的槽后面继续累加 —— 同一块 buffer 互不覆盖。
     if (isMain) m_instanceOffset = 0;
+    if (isMain) resetMorphFrame();
 
     // ---- 1) 空间索引 ----
     // 本帧只取一次：每次调用都要把全场景的世界矩阵 + 8 个角点算一遍，
@@ -3323,22 +3493,92 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
                 scene.findInAncestors<ecs::SkinnedMeshComponent>(e))
             it.jointBase = skc->jointBase;
 
+        // ---- 表情滑条（§15）----
+        //
+        // 挂在**模型根**上（与 SkinnedMeshComponent 同位置），网格实体是
+        // 它的子级 → 沿父链找。求值一次得到"每子网格每 target"的权重，
+        // 这里只取本子网格那一行。
+        //
+        // ⚠ `mesh` 是**LOD 选层后**的网格。有 morph 的网格不许建 LOD 链
+        //   （见 AssetManager::ensureLod 的说明），所以这里的 mesh 与
+        //   MorphComponent 的 model 里的子网格一定是同一个对象。
+        if (mesh->morphTargetCount() > 0) {
+            if (const auto* mpc =
+                    scene.findInAncestors<ecs::MorphComponent>(e)) {
+                if (mpc->model && !mpc->model->morphRig.empty()) {
+                    const int sub = mpc->model->subMeshIndexOf(mesh);
+                    if (sub >= 0) {
+                        if (m_morphEvalOwner != mpc) {
+                            mpc->model->morphRig.evaluate(
+                                mpc->weights, &m_morphWeightsScratch);
+                            m_morphEvalOwner = mpc;
+                        }
+                        if (static_cast<std::size_t>(sub) <
+                            m_morphWeightsScratch.size()) {
+                            appendMorphDraw(
+                                *mesh,
+                                m_morphWeightsScratch[
+                                    static_cast<std::size_t>(sub)],
+                                &it.morph);
+                            if (it.morph.targets > 0) ++m_morphStatDraws;
+                        }
+                    }
+                }
+            }
+        }
+        // 槽位分配：
+        //   · 合批路径（isMain + instancing）→ **延后**到 buildOpaqueBatches，
+        //     因为那里才知道排序后的实例槽（批内必须连续）；
+        //   · 其余（基线 / 离屏预览）→ 现在就分配，绘制时作为 firstInstance
+        //     传给 gl_InstanceIndex（见 drawMesh 的调用点）。
+        // 两条路用**同一个游标** m_instanceOffset，所以主场景与预览场景的
+        // 槽区间天然不重叠 —— 那正是"预览的追加不会踩掉主视口数据"的保证。
+        if (it.morph.targets > 0 && !(isMain && m_instancingEnabled)) {
+            it.morphSlot = m_instanceOffset++;
+            writeMorphSlot(it.morphSlot, it.morph);
+        }
+
         // ---- Shader 变体：材质特性 → 关键字掩码 ----
         // 掩码在这里算一次，深度预通道与前向两条路径共用（见 DrawItem::keywords）。
         // 空材质（只有深度预通道会画）保持"全关"。
         const assets::Material* mat = it.material;
         it.keywords = mat ? effectiveKeywords(*mat) : kKeywordNone;
+        // 渲染顺序：与 keywords 一起在这里定一次（见 DrawItem 的注释）。
+        // 不在这里判空 —— 用材质结构体自己的默认值，空材质正好走 2000/0。
+        if (mat) {
+            it.renderQueue = mat->renderQueue;
+            it.sortOrder = mat->sortOrder;
+        }
+        // 覆盖带判定**刻意读材质本身**，不读 it.keywords。
+        // 理由：it.keywords 走的是 effectiveKeywords()，而它会被
+        // MYVK_SHADER_FORCE_MASK 整个替换掉。那个开关的语义是"强制某个
+        // 着色器分支"，不该顺手把绘制顺序也改了 —— 否则
+        // verify_shader_variants.py 的 FORCE_MASK=0 vs 4 逐像素对照，
+        // 一旦场景里有 overlay 材质，比的就不是同一个绘制顺序了。
+        const bool overlay = mat && mat->isOverlay();
 
         // ---- R4-1：Mask 不参与深度预通道 ----
         // 预通道的 depth_only.frag 不采样材质，无法知道哪里该镂空；让 Mask
         // 进去会把"该透光"的深度写死。掩码是唯一判据（与队列分类同一规则）。
-        it.skipDepthPrepass = hasKeyword(it.keywords, kKeywordAlphaMask);
+        // OVERLAY 同理：覆盖带的意义就是"不被深度裁决"，让预通道把它的
+        // 深度写进去，前向那条 depthTest=false 的管线倒是无所谓，但
+        // **后面的透明物体**会拿这个深度去做 early-Z → 睫毛/眉毛在
+        // 预通道里被当成实体几何，把身后的东西剔掉。
+        it.skipDepthPrepass = hasKeyword(it.keywords, kKeywordAlphaMask) ||
+                              overlay;
 
         // ---- 队列分类也由掩码推导 ----
         // 原来是再判一次 mat->alphaMode —— 那样"什么算半透明"就有两处
         // 定义（掩码里一处、这里一处），改关键字时必然漏掉一处。
         // 现在 ALPHA_BLEND 位是唯一判据。
-        if (hasKeyword(it.keywords, kKeywordAlphaBlend)) {
+        //
+        // OVERLAY 也进这个队列（P0-2/B）：它需要的是"按语义顺序绘制"，
+        // 而 opaque 队列排的是"按掩码/材质分组"（为了 instancing 合批）——
+        // 那个顺序由掩码数值决定，正好是**不能控**的那种。一支笔一支笔地
+        // 画脸，顺序必须由美术说了算。
+        // ⚠ 队列名还叫 transparent，语义已经是"需要排序的绘制项"，
+        //   改名会动 6 处引用，先留着。
+        if (hasKeyword(it.keywords, kKeywordAlphaBlend) || overlay) {
             const glm::vec3 d = glm::vec3(model[3]) - camPos;
             it.viewDepthSq = glm::dot(d, d);
             m_transparentDraws.push_back(it);
@@ -3352,6 +3592,47 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
     if (isMain) {
         // GPU instancing 合批要在统计之前 —— opaqueBatches 也进统计。
         buildOpaqueBatches();
+
+        // ---- GPU 形变自检（`MYVK_MORPH_DBG=1`，§15）----
+        //
+        // 一条日志把"表情不动"的三种可能分开：
+        //   draws=0                → CPU 侧根本没接上（数据链/组件/父链）
+        //   draws>0 但 deltas=0    → appendMorphDraw 提前返回（预算/空流）
+        //   draws>0 且 deltas>0    → CPU 全对，问题在 GPU 侧（描述符/槽位/
+        //                            顶点属性/着色器分支）
+        // 与 CULL-STATS 同频：每 30 帧一条，否则日志被刷爆。
+        static const bool morphDbg =
+            std::getenv("MYVK_MORPH_DBG") != nullptr;
+        static uint32_t morphTick = 0;
+        if (morphDbg && (morphTick++ % 30) == 1) {
+            // 顺带把前几个槽位的记录与权重读回来。这一条用来分辨
+            // "写进 SSBO 的就是对的" 与 "写进去了但 GPU 读不到"：
+            // 前者不对 → CPU 侧（appendMorphDraw/writeMorphSlot）；
+            // 前者对但画面不动 → GPU 侧（描述符 / 顶点属性 / 着色器分支）。
+            char slotsDump[192] = {0};
+            int off = 0;
+            auto& fr = m_frames[m_currentFrame];
+            const auto* rec =
+                static_cast<const render::MorphInstance*>(fr.morphSlotsMapped);
+            const auto* wts = static_cast<const float*>(fr.morphWeightsMapped);
+            const std::uint32_t show =
+                m_instanceOffset < 4u ? m_instanceOffset : 4u;
+            for (std::uint32_t s = 0; s < show && rec; ++s) {
+                off += std::snprintf(
+                    slotsDump + off, sizeof(slotsDump) - static_cast<size_t>(off),
+                    " [%u d=%u w=%u n=%u]%s%.2f", s, rec[s].aux.x, rec[s].aux.y,
+                    rec[s].aux.z,
+                    (rec[s].aux.z > 0u && wts) ? "w0=" : "", 
+                    (rec[s].aux.z > 0u && wts)
+                        ? static_cast<double>(wts[rec[s].aux.y])
+                        : 0.0);
+            }
+            VK_LOG_INFO("MORPH-FRAME f=%u draws=%u deltas=%u weights=%u "
+                        "slots=%u budget=%d%s",
+                        m_currentFrame, m_morphStatDraws, m_morphDeltaOffset,
+                        m_morphWeightOffset, m_instanceOffset,
+                        m_morphBudgetHit ? 1 : 0, slotsDump);
+        }
 
         // ---- Multi-draw indirect（R2-2）----
         // 必须在 buildOpaqueBatches **之后**：批表（谁跟谁一批）是它的输入。
@@ -3415,15 +3696,16 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
         // ---- Shader 变体统计 ----
         // 口径与前向真的提交了哪些绘制对齐：不透明里跳掉空材质项
         // （它们只有深度预通道会画），透明项全部计入。
-        for (uint32_t i = 0; i <= kKeywordAll; ++i) {
-            m_stats.variantCounts[i] = 0;
-        }
+        // 稀疏累加（见 RenderStats::variantCounts 的注释）。
+        m_stats.variantSlotCount = 0;
         for (const DrawItem& it : m_opaqueDraws) {
             if (!it.material) continue;
-            ++m_stats.variantCounts[it.keywords & kKeywordAll];
+            render::addVariantCount(m_stats.variantCounts,
+                                    m_stats.variantSlotCount, it.keywords);
         }
         for (const DrawItem& it : m_transparentDraws) {
-            ++m_stats.variantCounts[it.keywords & kKeywordAll];
+            render::addVariantCount(m_stats.variantCounts,
+                                    m_stats.variantSlotCount, it.keywords);
         }
         // POM（R4-3）：本帧有多少个不透明物体走了视差变体。用它做"POM
         // 真的进了管线"的正向证据（不依赖画面差异 —— 视差很小时画面差异
@@ -3490,11 +3772,34 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
         }
     }
 
-    // 透明物体：远 → 近。混合必须按这个顺序，否则 alpha 累加会错。
-    std::sort(m_transparentDraws.begin(), m_transparentDraws.end(),
-              [](const DrawItem& a, const DrawItem& b) {
-                  return a.viewDepthSq > b.viewDepthSq;
-              });
+    // 需要排序的绘制项：按**语义顺序**排，距离只做同带内的次级键。
+    //
+    // P0-2/B（2026-10-25）把单键排序改成三键，原因是二次元角色：
+    //   脸皮 / 眼白 / 虹膜 / 睫毛 / 眉毛 / 刘海 几乎在同一个球面上，
+    //   到相机的距离差不到 1 mm。单键排序里它们的大小关系由浮点噪声
+    //   决定 → 逐帧闪烁；更根本的是"眉毛要穿透刘海"这条硬规矩，
+    //   物理距离给出的答案永远相反。
+    //
+    // 三键的顺序不是随意的：
+    //   renderQueue  主键 —— 美术指定的"层带"，语义
+    //   sortOrder    次键 —— 同带内的微调，语义
+    //   -viewDepthSq 末键 —— 同带同序时的物理退让
+    // 玻璃/烟雾这类东西全在同一个带（默认 2000）、sortOrder 全是 0，
+    // 于是三键退化回单键 —— **既有行为一分不变**。
+    //
+    // ⚠ 必须 stable_sort：三键完全相同的两项（同一个带、同一个距离）
+    //   在 std::sort 下的相对顺序是**未定义**的，而每帧的录入顺序可能
+    //   因视锥查询的遍历顺序而变 → 又是闪烁。stable_sort 保住录入顺序，
+    //   至少同一场景逐帧一致。
+    std::stable_sort(m_transparentDraws.begin(), m_transparentDraws.end(),
+                     [](const DrawItem& a, const DrawItem& b) {
+                         if (a.renderQueue != b.renderQueue)
+                             return a.renderQueue < b.renderQueue;
+                         if (a.sortOrder != b.sortOrder)
+                             return a.sortOrder < b.sortOrder;
+                         // 远 → 近：混合必须按这个顺序，否则 alpha 累加会错。
+                         return a.viewDepthSq > b.viewDepthSq;
+                     });
 }
 
 // ============================================================
@@ -3565,8 +3870,14 @@ void Renderer::buildOpaqueBatches() {
         batch.jointBase = m_opaqueDraws[i].jointBase;
         batch.firstInstance = m_instanceOffset;
         batch.count = static_cast<uint32_t>(j - i + 1);
-        for (size_t k = i; k <= j; ++k)
+        for (size_t k = i; k <= j; ++k) {
             dst[k - i].model = m_opaqueDraws[k].model;
+            // morph 的槽位在这里才定得下来（= 实例槽，批内连续）。
+            // 与"基线路径现在就分配"是同一套记录格式，见 §15.4。
+            writeMorphSlot(batch.firstInstance +
+                               static_cast<std::uint32_t>(k - i),
+                           m_opaqueDraws[k].morph);
+        }
         dst += batch.count;
         m_instanceOffset += batch.count;
         m_opaqueBatches.push_back(batch);
@@ -3619,7 +3930,16 @@ bool Renderer::buildMdiFrameData() {
         rec.model = it.model;
         // jointBase 逐绘制项（A0-4）。合批路径把它放进 push.skin.x；
         // MDI 的 push 是"每组一次"，承载不了每网格的值 → 必须走实例记录。
-        rec.aux = glm::ivec4(it.jointBase, 0, 0, 0);
+        //
+        // aux.y = **morph 槽位**（§15）。MDI 的 gl_InstanceIndex 是**紧凑化
+        // 之后**的下标，不能拿去索引 MorphInstances（那是全局槽空间，
+        // mdi_compact.comp 还会把它打乱），所以必须由目录带过来。
+        // 槽位 = 批的实例槽基址 + 项在批内的偏移（与 buildOpaqueBatches
+        // 里 writeMorphSlot 用的是同一个算法）。
+        const std::uint32_t morphSlot =
+            m_opaqueBatches[bi].firstInstance +
+            static_cast<std::uint32_t>(i - cursor);
+        rec.aux = glm::ivec4(it.jointBase, static_cast<int>(morphSlot), 0, 0);
         m_mdiCatalogScratch[i] = rec;
 
         m_mdiAabbScratch[i] =
@@ -3698,8 +4018,13 @@ void Renderer::recordSceneInto(VkCommandBuffer cmd, scene::Scene& scene,
 
     // Pass 2：深度预通道（复用现有实现，但用传入的 hdr 目标）
     if (m_depthPrePipelines.initialized()) {
-        VkClearValue clear{};
-        clear.depthStencil = {1.0f, 0};
+        // 附件顺序见 HdrTarget::createRenderPasses： [0]=深度 [1]=几何。
+        // 几何缓冲清成 (0,0,0,0) —— a 通道 = 0 是描边侧的"没有几何"哨兵
+        // （天空像素）。不清成 0 的话，天空会被当成"距离 0 的物体"，
+        // 于是地平线以上整片区域被描成黑边。
+        VkClearValue clears[2]{};
+        clears[0].depthStencil = {1.0f, 0};
+        clears[1].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
         const VkExtent2D ext = hdr.extent();
         VkRenderPassBeginInfo rp{};
         rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -3707,8 +4032,8 @@ void Renderer::recordSceneInto(VkCommandBuffer cmd, scene::Scene& scene,
         rp.framebuffer = hdr.depthFramebuffer(m_currentFrame);
         rp.renderArea.offset = {0, 0};
         rp.renderArea.extent = ext;
-        rp.clearValueCount = 1;
-        rp.pClearValues = &clear;
+        rp.clearValueCount = 2;
+        rp.pClearValues = clears;
         vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
         VkViewport vp{};
@@ -3798,7 +4123,7 @@ void Renderer::recordSceneInto(VkCommandBuffer cmd, scene::Scene& scene,
         for (const DrawItem& it : m_opaqueDraws) {
             if (!it.material) continue;  // 空材质只有深度预通道会画
             drawMesh(cmd, m_forwardPipelines.layout(), it.model, *it.material,
-                     *it.mesh, 1, 0, it.jointBase);
+                     *it.mesh, 1, it.morphSlot, it.jointBase);
         }
     } else {
         for (const DrawItem& it : m_opaqueDraws) {
@@ -3806,7 +4131,7 @@ void Renderer::recordSceneInto(VkCommandBuffer cmd, scene::Scene& scene,
             bindForwardVariant(cmd, it.keywords, boundMask,
                                m_stats.variantSwitches);
             drawMesh(cmd, m_forwardPipelines.layout(), it.model, *it.material,
-                     *it.mesh, 1, 0, it.jointBase);
+                     *it.mesh, 1, it.morphSlot, it.jointBase);
         }
     }
 
@@ -3876,14 +4201,14 @@ void Renderer::recordSceneInto(VkCommandBuffer cmd, scene::Scene& scene,
                           dbgPipe->get());
         for (const DrawItem& it : m_transparentDraws) {
             drawMesh(cmd, m_forwardPipelines.layout(), it.model, *it.material,
-                     *it.mesh, 1, 0, it.jointBase);
+                     *it.mesh, 1, it.morphSlot, it.jointBase);
         }
     } else {
         for (const DrawItem& it : m_transparentDraws) {
             bindForwardVariant(cmd, it.keywords, boundMask,
                                m_stats.variantSwitches);
             drawMesh(cmd, m_forwardPipelines.layout(), it.model, *it.material,
-                     *it.mesh, 1, 0, it.jointBase);
+                     *it.mesh, 1, it.morphSlot, it.jointBase);
         }
     }
     vkCmdEndRenderPass(cmd);
@@ -4069,12 +4394,12 @@ static void fillForwardPipelineDesc(rhi::PipelineDesc& desc,
 }
 
 void Renderer::createPipelines() {
-    // ---- 深度预通道：只写深度，不输出颜色 ----
+    // ---- 深度预通道：写深度 + 几何缓冲（法线 / 线性距离）----
     // 顶点着色器**复用 pbr.vert**，保证与主 Pass 的顶点变换逐位一致
     // （否则主 Pass 的 LESS_OR_EQUAL 会因浮点误差出现深度闪烁）。
     //
     // 走 SingleSpv：所有掩码共用 depth_only.frag.spv，只有固定状态随
-    // 掩码变。它不输出颜色，ALPHA_BLEND / NORMAL_MAP 对它没有任何意义，
+    // 掩码变。它不做光照，ALPHA_BLEND / NORMAL_MAP 对它没有意义，
     // 所以 stateMask 只留 DOUBLE_SIDED（双面材质要两面都写深度，否则
     // 从背面看向双面板时预通道留不下深度、主 Pass 的 early-Z 白铺）。
     {
@@ -4093,7 +4418,11 @@ void Renderer::createPipelines() {
         desc.pushConstant.size = sizeof(PushConstants);
         desc.renderPass = m_hdrTarget->depthPrePass();
         desc.samples = m_hdrTarget->samples();
-        desc.colorAttachmentCount = 0;  // depth-only
+        // 2026-10-25：从 depth-only 变成"深度 + 几何缓冲"（描边用）。
+        // 颜色附件只有一个、**不开混合** —— 几何数据（法线 / 线性距离）
+        // 必须原样落盘，混一下就意味着"法线 = 前后两个表面法线的平均"，
+        // 边缘检测会检不出来。
+        desc.colorAttachmentCount = 1;
         desc.depthTest = true;
         desc.depthWrite = true;
         desc.cullMode = VK_CULL_MODE_BACK_BIT;  // 基线；掩码 1 会改成 NONE
@@ -4131,7 +4460,8 @@ void Renderer::createPipelines() {
             *m_device, desc,
             m_bindlessEnabled ? "pbr.bindless.frag" : "pbr.frag",
             render::ShaderPermutation::PerMask,
-            render::kKeywordDoubleSided | render::kKeywordAlphaBlend);
+            render::kKeywordDoubleSided | render::kKeywordAlphaBlend |
+                render::kKeywordOverlay);
     }
 
     // ---- 地形（W4-2）：独立管线 + 自己的 set 1 ----
@@ -4365,6 +4695,46 @@ void Renderer::createFrameResources() {
         f.instanceMapped = f.instanceModels->map();
         f.instanceCapacity = kInitialInstances;
 
+        // ---- GPU 形变的三块 SSBO（§15）----
+        //
+        // **固定容量、永不重建**（见 FrameResources.h 里的说明：扩容换
+        // buffer 会打穿"主视口已录制、预览还在追加"的那一帧）。
+        // 容量依据写在常量上：24 MB delta / 4 MB 权重 / 8192 槽。
+        const std::uint32_t kMorphDeltaCap = 24u * 1024u * 1024u / 32u;
+        const std::uint32_t kMorphWeightCap = 4u * 1024u * 1024u / 4u;
+        const std::uint32_t kMorphSlotCap = 8192u;
+        f.morphDeltas = std::make_unique<rhi::Buffer>(
+            *m_device, static_cast<VkDeviceSize>(kMorphDeltaCap) * 32u,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        f.morphDeltasMapped = f.morphDeltas->map();
+        f.morphDeltaCapacity = kMorphDeltaCap;
+        f.morphWeights = std::make_unique<rhi::Buffer>(
+            *m_device, static_cast<VkDeviceSize>(kMorphWeightCap) * 4u,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        f.morphWeightsMapped = f.morphWeights->map();
+        f.morphWeightCapacity = kMorphWeightCap;
+        f.morphSlots = std::make_unique<rhi::Buffer>(
+            *m_device, static_cast<VkDeviceSize>(kMorphSlotCap) *
+                           sizeof(render::MorphInstance),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        f.morphSlotsMapped = f.morphSlots->map();
+        f.morphSlotCapacity = kMorphSlotCap;
+        // 全零：`deltaBase = weightBase = targetCount = 0` 表示"没有形变"，
+        // 着色器对 targetCount == 0 的实例一个 delta 都不读。
+        std::memset(f.morphSlotsMapped, 0,
+                    static_cast<std::size_t>(kMorphSlotCap) *
+                        sizeof(render::MorphInstance));
+        std::memset(f.morphDeltasMapped, 0,
+                    static_cast<std::size_t>(kMorphDeltaCap) * 32u);
+        std::memset(f.morphWeightsMapped, 0,
+                    static_cast<std::size_t>(kMorphWeightCap) * 4u);
+
         f.globalUBOSet = m_descriptors->allocate(m_globalSetLayout);
     }
 }
@@ -4459,6 +4829,18 @@ void Renderer::writeGlobalSet(VkDescriptorSet set, uint32_t frameIndex,
     // buffer 对象时 writeGlobalDescriptors 会被重调，这里跟着刷新。
     m_descriptors->writeBuffer(set, 13, f.instanceModels->get(),
                                f.instanceModels->size(),
+                               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+
+    // binding 25/26/27：GPU 形变（§15）。固定容量、永不重建 → 这三行
+    // 只在 init 之后写一次，扩容路径不存在（这正是选"固定容量"的目的）。
+    m_descriptors->writeBuffer(set, 25, f.morphDeltas->get(),
+                               f.morphDeltas->size(),
+                               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    m_descriptors->writeBuffer(set, 26, f.morphWeights->get(),
+                               f.morphWeights->size(),
+                               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    m_descriptors->writeBuffer(set, 27, f.morphSlots->get(),
+                               f.morphSlots->size(),
                                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
 
     // binding 14：SSAO 遮蔽图。开关关着 / SSAO 未就绪时绑缺省
@@ -4728,6 +5110,12 @@ void Renderer::watchShaderFiles() {
     // 没有现成的重建入口 —— 需要时给对应类加一个 recreate 再注册进来）。
     m_shaderReload.watch("pbr.vert.spv");
     if (m_instancingEnabled) m_shaderReload.watch("pbr.inst.vert.spv");
+    // 遍历全部掩码而不是"白名单"：C++ 侧不持有白名单（它是 CMake 的维度
+    // 声明生成的，见 CMakeLists.txt 的 collect_variants），这里多注册的
+    // 那些路径不存在 —— ShaderHotReload 对不存在的文件只是 stat 失败后
+    // 跳过，0.25s 一轮，代价可忽略。反过来说：如果只注册"当前编译出来的"
+    // 那批，一旦 CMake 里加了新模型、而这里还没重跑 configure，热重载就会
+    // 漏听新文件 —— 多听几个空路径比漏听安全。
     for (uint32_t m = 0; m <= render::kKeywordAll; ++m)
         m_shaderReload.watch(render::variantShaderFile("pbr.frag", m));
     // bindless 那一族（R2-3）同样要听：热重载重建的入口是同一个
@@ -4918,7 +5306,13 @@ void Renderer::recordShadowPasses(VkCommandBuffer cmd, scene::Scene& scene,
     for (uint32_t c = 0; c < n; ++c) {
         // jointBase 不再以"mesh → 下标"的映射传进去：pass 自己按实体沿
         // 父链取 `SkinnedMeshComponent::jointBase`（逐实体，多实例正确）。
-        m_shadowPass->render(cmd, scene, frameSet, m_currentFrame, c);
+        // morph 槽位由本类现场分配（§15）：阴影与前向用同一个 MorphRig
+        // 求值结果，所以"脸在笑、影子还是平的"这类不一致不可能发生。
+        m_shadowPass->render(
+            cmd, scene, frameSet, m_currentFrame, c,
+            [this](scene::Scene& sc, ecs::Entity e, const assets::Mesh& m) {
+                return morphSlotForShadow(sc, e, m);
+            });
     }
 
     // 自检（MYVK_SHADOW_DBG=1）：每级"考虑了多少 / 实际提交了多少"。
@@ -5088,8 +5482,12 @@ void Renderer::recordLocalShadowPasses(VkCommandBuffer cmd,
         const bool used = m_localShadowLayerLight[layer] >= 0;
         // used == false 时传 nullptr：pass 内部只清深度（保证整张 array
         // 始终处于可采样的 READ_ONLY 布局）。**不能跳过这一步**。
-        m_localShadowPass->render(cmd, scene, frameSet, m_currentFrame, layer,
-                                  used ? &m_localShadowMatrices[layer] : nullptr);
+        m_localShadowPass->render(
+            cmd, scene, frameSet, m_currentFrame, layer,
+            used ? &m_localShadowMatrices[layer] : nullptr,
+            [this](scene::Scene& sc, ecs::Entity e, const assets::Mesh& m) {
+                return morphSlotForShadow(sc, e, m);
+            });
     }
 
     static const bool dbg = std::getenv("MYVK_SHADOW_DBG") != nullptr;
@@ -5382,7 +5780,10 @@ void Renderer::recordOpaqueDepthGeometry(VkCommandBuffer cmd) {
         vkCmdPushConstants(cmd, m_depthPrePipelines.layout(),
                            VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(PushConstants),
                            &push);
-        it.mesh->draw(cmd);
+        // firstInstance = morph 槽位（§15）：预通道与前向共用同一份顶点
+        // 着色器，形变位置必须**逐位一致**，否则 early-Z 会按静止姿势的
+        // 深度剔掉真正该画的片元（症状是表形变处的边缘闪烁）。
+        it.mesh->drawInstanced(cmd, 1, it.morphSlot);
     }
 }
 
@@ -5396,8 +5797,11 @@ void Renderer::recordDepthPrePass(VkCommandBuffer cmd, scene::Scene& scene) {
     // （原来判 m_pipelineDepthPrePass 是否为空）。改成问族对象自己。
     if (!m_depthPrePipelines.initialized()) return;
 
-    VkClearValue clear{};
-    clear.depthStencil = {1.0f, 0};  // 远平面
+    // 附件顺序见 HdrTarget::createRenderPasses： [0]=深度 [1]=几何。
+    // 几何缓冲清成 (0,0,0,0) —— a=0 是描边侧的"没有几何"哨兵（天空）。
+    VkClearValue clears[2]{};
+    clears[0].depthStencil = {1.0f, 0};  // 远平面
+    clears[1].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
 
     const VkExtent2D ext = m_hdrTarget->extent();
 
@@ -5407,8 +5811,8 @@ void Renderer::recordDepthPrePass(VkCommandBuffer cmd, scene::Scene& scene) {
     rp.framebuffer = m_hdrTarget->depthFramebuffer(m_currentFrame);
     rp.renderArea.offset = {0, 0};
     rp.renderArea.extent = ext;
-    rp.clearValueCount = 1;
-    rp.pClearValues = &clear;
+    rp.clearValueCount = 2;
+    rp.pClearValues = clears;
 
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -5678,7 +6082,7 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
             for (const DrawItem& it : m_opaqueDraws) {
                 if (!it.material) continue;
                 drawMesh(cmd, m_forwardPipelines.layout(), it.model,
-                         *it.material, *it.mesh, 1, 0, it.jointBase);
+                         *it.material, *it.mesh, 1, it.morphSlot, it.jointBase);
             }
         }
     } else if (useMdi) {
@@ -5700,7 +6104,7 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
             bindForwardVariant(cmd, it.keywords, boundMask,
                                m_stats.variantSwitches);
             drawMesh(cmd, m_forwardPipelines.layout(), it.model, *it.material,
-                     *it.mesh, 1, 0, it.jointBase);
+                     *it.mesh, 1, it.morphSlot, it.jointBase);
         }
     }
 
@@ -5830,14 +6234,14 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
                               dbgPipe->get());
             for (const DrawItem& it : m_transparentDraws) {
                 drawMesh(cmd, m_forwardPipelines.layout(), it.model,
-                         *it.material, *it.mesh, 1, 0, it.jointBase);
+                         *it.material, *it.mesh, 1, it.morphSlot, it.jointBase);
             }
         } else {
             for (const DrawItem& it : m_transparentDraws) {
                 bindForwardVariant(cmd, it.keywords, boundMask,
                                    m_stats.variantSwitches);
                 drawMesh(cmd, m_forwardPipelines.layout(), it.model,
-                         *it.material, *it.mesh, 1, 0, it.jointBase);
+                         *it.material, *it.mesh, 1, it.morphSlot, it.jointBase);
             }
         }
     }
@@ -6169,7 +6573,7 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
     static uint32_t varTick = 0;
     if (varDbg && (varTick++ % 30) == 1) {
         const std::string draws =
-            variantTable(m_stats.variantCounts, 1u << kKeywordCount);
+            variantTable(m_stats.variantCounts, m_stats.variantSlotCount);
         VK_LOG_INFO("SHADER-VARIANTS fwd_created=%u depth_created=%u "
                     "switches=%u forced=%d draws=%s",
                     m_forwardPipelines.created(),

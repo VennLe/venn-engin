@@ -46,6 +46,24 @@ void applyKeywordState(KeywordMask m, KeywordMask stateMask,
         desc.blendEnable = false;
         desc.depthWrite = true;
     }
+
+    // ---- 覆盖带（P0-2/B，2026-10-25）----
+    // 放在 ALPHA_BLEND **之后**：overlay 可能是不透明的（眼白），也可能是
+    // 混合的（睫毛），blendEnable 由上一段决定，这里只覆盖深度两项。
+    //
+    // depthTest = false → VK_FALSE，等价于"比较函数恒为 ALWAYS"：所有片元
+    // 都通过，且**完全不读深度缓冲**。这是"眉毛穿透刘海"唯一能做对的写法 ——
+    // 保留深度测试就一定会得出"刘海在前，眉毛被挡"的物理正确答案，
+    // 而二次元要的是语义答案。
+    //
+    // 代价（已知，先接受）：overlay 项会无条件画在已画内容之上，包括
+    // 它"物理上真该被挡住"的地方（侧脸时脸颊凸起挡住眼球边缘）。
+    // 更精细的做法是保留 LEQUAL + 给这些顶点一个深度偏置（depthBias），
+    // 那需要 PipelineDesc 再加一个字段；等真在某个资产上看到问题再做。
+    if (hasKeyword(bits, kKeywordOverlay)) {
+        desc.depthTest = false;
+        desc.depthWrite = false;
+    }
     // ALPHA_MASK 不参与固定状态：它**不改变**管线状态（写深度、不混合，
     // 与 Opaque 一模一样），只在片元里按 cutoff 丢弃片元。
     // 这正是它相对 Blend 的核心优势 —— 镂空物体照样写深度、照样能被
@@ -77,8 +95,13 @@ void VariantPipelines::init(rhi::Device& device,
     m_fragBaseName = fragBaseName;
     m_permutation = permutation;
     m_stateMask = stateMask;
-    m_spvMask = (permutation == ShaderPermutation::PerMask) ? kKeywordAll
-                                                            : kKeywordNone;
+    // ⚠ 剔掉"只改状态、不改代码"的位（kKeywordStateOnly，目前是 OVERLAY）：
+    //   它们参与缓存键（不同深度状态必须是不同管线），但不参与 .spv 选择
+    //   —— 编出来的字节码会和掩码 0 完全相同，白编一倍纯属浪费。
+    //   60 份变体 × 2 种深度状态 = 120 条管线，靠的就这一行。
+    m_spvMask = (permutation == ShaderPermutation::PerMask)
+                    ? (kKeywordAll & ~static_cast<KeywordMask>(kKeywordStateOnly))
+                    : kKeywordNone;
     m_keyMask = m_spvMask | m_stateMask;
 
     // 布局在这里就建好，让所有变体共用 —— 这样 layout() 可以在**一条管线
@@ -105,7 +128,10 @@ const rhi::Pipeline& VariantPipelines::get(KeywordMask m) {
     applyKeywordState(key, m_stateMask, desc);
 
     if (m_permutation == ShaderPermutation::PerMask) {
-        const std::string file = variantShaderFile(m_fragBaseName, key);
+        // key & m_spvMask：缓存键里有 OVERLAY（要区分管线），文件名里没有
+        // （字节码相同）。两件事用两个掩码分别表达，见 init 的注释。
+        const std::string file =
+            variantShaderFile(m_fragBaseName, key & m_spvMask);
         desc.fragSpv = loadSpv(file);
         if (desc.fragSpv.empty()) {
             std::fprintf(stderr,

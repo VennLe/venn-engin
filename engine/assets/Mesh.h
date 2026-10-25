@@ -1,12 +1,16 @@
 #pragma once
 // ============================================================
 // assets/Mesh —— 网格（CPU 数据 + GPU 顶点/索引缓冲）
-// 顶点布局：pos(3f) + normal(3f) + uv(2f) = 32 字节
+// 顶点布局：pos(3f) + normal(3f) + uv(2f) + joints(u4) + weights(4f)
+//           + color(4f) + uv2(2f) + morphBase(u1) + morphCount(u1)
+//           + tangent(4f) = 112 字节
 // 内置：立方体 / 平面生成器（CCW 正面、外法线）
 // ============================================================
 
+#include "assets/MorphRig.h"
 #include "rhi/VulkanCommon.h"
 #include <cstddef>
+#include <string>
 #include <vector>
 
 namespace rhi {
@@ -18,6 +22,11 @@ class Buffer;
 namespace assets {
 
 class LodChain;   // assets/Lod.h
+
+// morphBase 的哨兵：这个顶点不参与任何 morph target。
+// ⚠ 必须与 `assetio::kNoMorphBase`（assetio/Vertex.h）同值，
+//   VMeshLoader.cpp 里有 static_assert 锁死。
+constexpr uint32_t kNoMorphBase = 0xFFFFFFFFu;
 
 struct Vertex {
     glm::vec3 pos;
@@ -41,6 +50,24 @@ struct Vertex {
     // 分量大小（vec4 = 4 字节），stride 本身没有对齐约束。
     glm::vec4 color{1.0f, 1.0f, 1.0f, 1.0f};
 
+    // ---- 以下三个通道 2026-10-25 追加（§13），格式已落盘但**暂无消费者** ----
+    //
+    // 第二套 UV（面部 SDF / lightmap）。缺省全 0 = "没有"。用不用由
+    // **材质**决定，没有逐顶点标志位 —— 见 assetio/Vertex.h 的说明。
+    glm::vec2 uv2{0.0f, 0.0f};
+    // morph target 稀疏流的起始下标（MORPH 区块）。哨兵 = 不参与。
+    //
+    // ⚠ 必须带 NSDMI：`std::vector<Vertex>(n)` 是值初始化，没有 NSDMI
+    //   的成员会被清零，而 0 是**合法**的流下标。症状见 assetio/Vertex.h。
+    std::uint32_t morphBase{kNoMorphBase};
+    // delta 流里的记录条数（§14）。与 morphBase 严格自洽：
+    //   morphBase == kNoMorphBase  ⇔  morphCount == 0
+    // 上一刀它叫 `reserved0`（"必须是 0"），这一刀是它的第一次使用 ——
+    // 当初留这 4 字节就是为了"以后再要一个 u32 不必动 stride"。
+    std::uint32_t morphCount{0u};
+    // 切线：xyz = 沿 UV.x 的单位向量，w = 副切线手性（±1）。0 = 没有。
+    glm::vec4 tangent{0.0f, 0.0f, 0.0f, 0.0f};
+
     static VkVertexInputBindingDescription bindingDescription() {
         VkVertexInputBindingDescription b{};
         b.binding = 0;
@@ -49,57 +76,65 @@ struct Vertex {
         return b;
     }
 
-    // 完整的 6 个属性（含 location 5 顶点色）。
+    // 主前向管线真正消费的属性集合。
+    //
+    // ⚠ 这个集合**不是**"结构体有几个通道"，而是"顶点着色器读哪几个
+    //   location"，而且它**不是连续前缀**：
+    //     pbr.vert  读 0..5（pos/normal/uv/joints/weights/color）+ 7/8（morph）
+    //     —— 6（uv2）与 9（tangent）目前无人读
+    //   多喂一条没被消费的属性，校验层会报
+    //       VUID-VkGraphicsPipelineCreateInfo-Input-07904
+    //   而**少**喂一条被消费的是未定义行为（读到的全是 0，
+    //   对 morph 来说正好是"静默不形变"，最难发现的一种）。
+    //
+    //   所以属性表按 location **挑着给**，不能再用"前 N 条"。
+    //   加新通道时只有两处要改：这张表 + 顶点着色器的 location 声明。
     static std::vector<VkVertexInputAttributeDescription> attributeDescriptions() {
-        return attributeDescriptions(6);
+        return attributesFor({0, 1, 2, 3, 4, 5, 7, 8});
     }
 
-    // 只要前 `count` 个（0..count-1）属性。
-    //
-    // 为什么需要它：Vulkan 校验层对"管线声明了 location 5、但该管线的顶点
-    // 着色器没声明/没用到 location 5"会报
-    //     VUID-VkGraphicsPipelineCreateInfo-Input-07904
-    //     "Vertex attribute at location 5 not consumed by vertex shader"
-    // 阴影 / 贴花这两个管线的顶点着色器（shadow.vert / decal.vert）确实不读
-    // 顶点色，所以它们传 `attributeDescriptions(5)` —— 少喂一个属性，
-    // 警告就没了，语义也更准确（管线只声明它真会读的东西）。
-    //
-    // stride 仍然是 `sizeof(Vertex)`：属性偏移不变，少一个不影响其余几个。
-    static std::vector<VkVertexInputAttributeDescription> attributeDescriptions(
-        int count) {
-        std::vector<VkVertexInputAttributeDescription> attrs(6);
-        attrs[0].binding = 0;
-        attrs[0].location = 0;
-        attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-        attrs[0].offset = offsetof(Vertex, pos);
-        attrs[1].binding = 0;
-        attrs[1].location = 1;
-        attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-        attrs[1].offset = offsetof(Vertex, normal);
-        attrs[2].binding = 0;
-        attrs[2].location = 2;
-        attrs[2].format = VK_FORMAT_R32G32_SFLOAT;
-        attrs[2].offset = offsetof(Vertex, uv);
-        // 蒙皮：location 3 = 关节下标（uint），location 4 = 权重
-        attrs[3].binding = 0;
-        attrs[3].location = 3;
-        attrs[3].format = VK_FORMAT_R32G32B32A32_UINT;
-        attrs[3].offset = offsetof(Vertex, joints);
-        attrs[4].binding = 0;
-        attrs[4].location = 4;
-        attrs[4].format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        attrs[4].offset = offsetof(Vertex, weights);
-        // 顶点色：location 5（Mesh Paint 的落点）
-        attrs[5].binding = 0;
-        attrs[5].location = 5;
-        attrs[5].format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        attrs[5].offset = offsetof(Vertex, color);
-        if (count < 0) count = 0;
-        if (count > 6) count = 6;
-        attrs.resize(static_cast<std::size_t>(count));
-        return attrs;
+    // 阴影管线（shadow.vert / CSM 与局部光源共用一个着色器）。
+    // 它不读顶点色，但读 morph —— 影子必须跟着表情走，否则脸在笑、
+    // 影子还是静止的（见 §15.5）。
+    static std::vector<VkVertexInputAttributeDescription> attributeDescriptionsShadow() {
+        return attributesFor({0, 1, 2, 3, 4, 7, 8});
     }
+
+    // 连续前缀版（0..count-1）。只给"真的只读前几条"的管线用：
+    //   decal.vert 读 0..4 → 传 5
+    static std::vector<VkVertexInputAttributeDescription> attributeDescriptions(
+        int count);
+
+private:
+    // 位置 → 描述。位置 0..9 全表（按 location 升序，Vulkan 要求）。
+    static std::vector<VkVertexInputAttributeDescription> attributesFor(
+        std::initializer_list<int> locations);
+    static VkVertexInputAttributeDescription attributeAt(int location);
 };
+
+// ============================================================
+// morph delta（§14）—— 与 `assetio::SourceMorphDelta` 逐字节一致
+//
+//   position(12) target(4) normal(12) vertex(4)  = 32
+//
+// `target` = 该子网格内第几个 morph target（**子网格内局部**，与 joints
+// 是"骨架内下标"同一个套路）；`vertex` = 这条记录属于哪个顶点。
+//
+// ⚠ `vertex` 在 GPU 上是**填充位**（着色器不读），在文件里存的是真下标。
+//   它存在的唯一目的是让加载路径能校验"流的顺序 == 顶点顺序" —— 少了
+//   这道校验，一次"顶点重排了但流没跟着重排"会让整张脸按错误的顶点
+//   形变，而几何、法线、UV 全都正常。
+// ============================================================
+struct MorphDelta {
+    glm::vec3 position{0.0f};
+    std::uint32_t target = 0;
+    glm::vec3 normal{0.0f};
+    std::uint32_t vertex = 0;
+};
+static_assert(sizeof(MorphDelta) == 32, "MorphDelta 必须是 32 字节（GPU 侧按此布局）");
+static_assert(offsetof(MorphDelta, target) == 12, "MorphDelta.target 偏移");
+static_assert(offsetof(MorphDelta, normal) == 16, "MorphDelta.normal 偏移");
+static_assert(offsetof(MorphDelta, vertex) == 28, "MorphDelta.vertex 偏移");
 
 // ============================================================
 // MeshSource —— 网格的"来源描述"
@@ -143,6 +178,30 @@ public:
     // 从 CPU 数据上传 GPU
     void upload(rhi::Device& device, rhi::CommandPool& cmdPool,
                 std::vector<Vertex> vertices, std::vector<uint32_t> indices);
+
+    // ---- morph（§14）----
+    //
+    // delta 流：与顶点里的 `morphBase` / `morphCount` 严格对应
+    // （`vertices[v].morphBase` 是该顶点在流里的起点，`morphCount` 是条数）。
+    // 布局与磁盘上的 `assetio::SourceMorphDelta` 逐字节一致，将来接 GPU
+    // 时可以整块 memcpy 进 SSBO —— 这一刀只把它落到 CPU 侧 + 校验。
+    //
+    // 单独一个 setter 而不是塞进 `upload()` 的参数：upload 的调用点有
+    // 十几处（程序化图元、LOD、地形…），多一个参数就是十几处 `{}`。
+    // morph 是**导入资产专有**的东西，用独立的入口更诚实。
+    void setMorph(std::vector<MorphDelta> deltas, std::vector<std::string> names,
+                  std::vector<MorphChannel> channels = {});
+    const std::vector<MorphDelta>& morphDeltas() const { return m_morphDeltas; }
+    const std::vector<std::string>& morphNames() const { return m_morphNames; }
+    // 滑条（§15）。与 morphNames 是**多对一**：一个滑条可以挂多个 target。
+    const std::vector<MorphChannel>& morphChannels() const {
+        return m_morphChannels;
+    }
+    // target 数 = 这里 `morphBase` 能指向的范围。GPU 侧的权重数组按它开。
+    std::uint32_t morphTargetCount() const {
+        return static_cast<std::uint32_t>(m_morphNames.size());
+    }
+    bool hasMorph() const { return !m_morphDeltas.empty(); }
 
     // 录制绘制命令
     void draw(VkCommandBuffer cmd) const;
@@ -203,6 +262,9 @@ private:
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     MeshSource m_source;
+    std::vector<MorphDelta> m_morphDeltas;
+    std::vector<std::string> m_morphNames;
+    std::vector<MorphChannel> m_morphChannels;
     bool m_noLod = false;   // W2-2：禁用 LOD 链
 
     // 局部 AABB（upload 时算一次）。空网格 → m_hasBounds = false

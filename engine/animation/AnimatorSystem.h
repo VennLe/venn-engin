@@ -44,10 +44,20 @@
 //   `samplePose` 和一条 `blendPose`。
 // ============================================================
 
+#include "animation/AnimController.h"
+#include "animation/BoneAttachment.h"
+#include "animation/LookAt.h"
 #include "animation/Pose.h"
+#include "animation/SpringBone.h"
+#include "animation/TwoBoneIK.h"
 #include "scene/Scene.h"
 
+#include <chrono>
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace animation {
@@ -63,6 +73,19 @@ public:
     uint64_t frames() const { return m_frames; }
     int lastEntityCount() const { return m_lastEntities; }
     int lastAnimatorCount() const { return m_lastAnimators; }
+    // 本帧真的跑了弹簧物理 / 真的转了头的实体数（自检与 ANIM-SPRING 锚点用）
+    int lastSpringCount() const { return m_lastSpring; }
+    int lastLookAtCount() const { return m_lastLookAt; }
+    // 本帧真的解算了 IK 的实体数 / 其中"没落在目标上"的（够不着）
+    int lastIKCount() const { return m_lastIK; }
+    int lastIKMissCount() const { return m_lastIKMiss; }
+    // 本帧摆好的骨骼挂点数 / 解析失败的（宿主或骨名对不上）
+    int lastAttachCount() const { return m_lastAttach.placed; }
+    int lastAttachUnresolved() const { return m_lastAttach.unresolved; }
+    // 本帧真的由状态机驱动的实体数（A2b）
+    int lastControllerCount() const { return m_lastControllers; }
+    // 本帧状态机采纳的转移总数
+    int lastTransitionCount() const { return m_lastTransitions; }
 
 private:
     // 采样缓冲（复用，避免每帧分配）。
@@ -74,9 +97,88 @@ private:
     Pose m_pose;
     Pose m_poseFrom;
     Pose m_poseMix;
+
+    // ---- 表演层后处理（L2 LookAt / L1 IK / L4 弹簧骨）----
+    //
+    // 三者最终都落在 `Pose::rotation` 上（**局部**旋转），所以必须在
+    // `poseToJoints` 之前跑 —— 写进世界矩阵就没有"再 FK 一次"的机会了。
+    // 区别只在**改几根骨**：
+    //   · LookAt   一根（头 / 颈）
+    //   · IK       两根（root + mid；末端那根只被读，不被写）
+    //   · 弹簧骨   一条前缀链上的 N 根（每根一个四元数）
+    // 三者**都不写平移**：骨长不变是 FK 的前提，也是"脚落在目标上"能用
+    // 余弦定理解的前提。
+    //
+    // ⚠ 顺序是 **LookAt → IK → 弹簧骨**，三条理由：
+    //   ① LookAt 与 IK 都是"目标驱动"的旋转修正，弹簧骨是**动力学**；
+    //      动力学必须读"最终姿势"，否则头发会慢一帧（反向时快速转头能
+    //      看到头发慢半拍）。
+    //   ② IK 排在 LookAt 之后：接触约束（脚落地、手握物）应该是最接近
+    //      最终姿势的那一层修正 —— 它要吃掉前面所有层留下的误差。
+    //   ③ 前两层默认不重叠（腿/臂 vs 头），但**不假设**它们不重叠：
+    //      `rootBone` 完全可以配成 `neck` —— 那时顺序就有语义（LookAt 先
+    //      摆头，IK 再按目标校正）。固定顺序的价值不是"反正互不影响"，
+    //      而是"同一帧两次求值逐位相同"这条可断言的性质（
+    //      `ik_deterministic` 断的就是它）。
+    void applyPerformance(const assets::Skeleton& skel, Pose& pose,
+                          uint32_t entityId, float dt,
+                          const ecs::LookAtComponent* la,
+                          const ecs::TwoBoneIKComponent* ik,
+                          const ecs::SpringBoneComponent* sb);
+
+    // 弹簧拓扑缓存。key = (骨架, 前缀表) —— 同一角色实例化多次时共用一份，
+    // 不然每个实例都要做一次静止姿势 FK。
+    struct RigKey {
+        const assets::Skeleton* skel = nullptr;
+        std::string prefixes;
+        bool operator<(const RigKey& o) const {
+            if (skel != o.skel) return skel < o.skel;
+            return prefixes < o.prefixes;
+        }
+    };
+    const SpringRig& rigFor(const assets::Skeleton& skel,
+                            const std::vector<std::string>& prefixes);
+    std::map<RigKey, SpringRig> m_rigCache;
+
+    // 每角色运行时状态。按 `Entity::id` 索引（**只在内存里**）：
+    // 质点位置与"上一帧施加的偏转"都是"这一帧正在发生的事"，不进存档。
+    // 实体删除后由 cleanupStates 清掉 —— 不清理的话，长时间编辑会一直涨。
+    std::unordered_map<uint32_t, SpringBoneState> m_spring;
+    std::unordered_map<uint32_t, LookAtState> m_lookAt;
+    void cleanupStates(const std::vector<uint32_t>& seen);
+
+    // ---- 控制器资产的加载缓存（A2b）----
+    // key = `AnimatorComponent::controllerPath` 原样字符串。
+    // **按路径缓存而不是按实体**：同一份 humanoid.anim.json 被 20 个角色
+    // 引用时只该解析一次 JSON。用 `shared_ptr` 是因为失败也要缓存
+    // （`error` 非空的对象）—— 不缓存失败的话，配错路径的实体每帧都会
+    // 重新 fopen 一次，20 个角色 = 每秒 1200 次失败的磁盘访问。
+    const AnimController* controllerFor(const std::string& path);
+    std::map<std::string, std::shared_ptr<AnimController>> m_ctlCache;
+
     uint64_t m_frames = 0;
+    // 真实帧间隔（秒）。**只给物理用**，见 tick 里的说明。
+    std::chrono::steady_clock::time_point m_lastWall{};
+    float m_wallDt = 0.0f;
     int m_lastEntities = 0;
     int m_lastAnimators = 0;     // 其中挂了 AnimatorComponent 的
+    int m_lastSpring = 0;        // 本帧真的跑了物理的实体数（ANIM-SPRING 用）
+    int m_lastLookAt = 0;        // 本帧真的转了头的实体数
+    int m_lastIK = 0;            // 本帧真的解算了 IK 的实体数
+    int m_lastIKMiss = 0;        // 其中够不着的（目标超出可达范围）
+    // ANIM-IK 锚点用的"最后一个实体的账"。只报最后一个是刻意的：
+    // 同时有 20 个角色在跑时，逐条打印会把日志读成"20 个不同的问题"，
+    // 而实际只关心"有没有生效 + 差多少"（自检走数值断言，不看日志）。
+    float m_lastIKTarget = 0.0f;
+    float m_lastIKActual = 0.0f;
+    float m_lastIKBend = 0.0f;
+    std::string m_lastIKEndBone;
+    AttachmentStats m_lastAttach;
+    // 上一帧的挂点解析失败数 —— 只在**变化**时打日志。
+    // 放成员而不是函数内 static：两个场景会共用一个计数，自检里立刻串味。
+    int m_lastAttachUnresolvedSeen = 0;
+    int m_lastControllers = 0;   // 本帧真的被状态机驱动的实体数
+    int m_lastTransitions = 0;   // 本帧采纳的转移总数
 };
 
 } // namespace animation

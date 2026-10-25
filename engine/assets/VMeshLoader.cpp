@@ -42,6 +42,46 @@ static_assert(sizeof(assets::Vertex) == sizeof(assetio::Vertex),
 static_assert(sizeof(assets::Vertex) == assetio::kVertexSize,
               "assets::Vertex 尺寸变了：.vmesh 格式版本需要同步");
 
+// sizeof 相等**不能**证明布局一致：把两个字段互换位置，sizeof 一个字节
+// 都不变，直拷的结果是"法线读成 UV"这种运行期才会暴露的错位。
+// 所以逐字段对偏移 —— 这是唯一能被编译器证明"两份结构体是同一张表"的写法。
+#define VENN_VERTEX_LAYOUT_LOCK(f)                                            \
+    static_assert(offsetof(assets::Vertex, f) == offsetof(assetio::Vertex, f), \
+                  "assets::Vertex::" #f " 偏移与 assetio::Vertex 不一致")
+VENN_VERTEX_LAYOUT_LOCK(pos);
+VENN_VERTEX_LAYOUT_LOCK(normal);
+VENN_VERTEX_LAYOUT_LOCK(uv);
+VENN_VERTEX_LAYOUT_LOCK(joints);
+VENN_VERTEX_LAYOUT_LOCK(weights);
+VENN_VERTEX_LAYOUT_LOCK(color);
+VENN_VERTEX_LAYOUT_LOCK(uv2);
+VENN_VERTEX_LAYOUT_LOCK(morphBase);
+VENN_VERTEX_LAYOUT_LOCK(morphCount);
+VENN_VERTEX_LAYOUT_LOCK(tangent);
+#undef VENN_VERTEX_LAYOUT_LOCK
+
+static_assert(assets::kNoMorphBase == assetio::kNoMorphBase,
+              "morphBase 哨兵两份定义不一致 —— 判'这个顶点有没有 morph'会分叉");
+static_assert(assets::kNoMorphTarget == assetio::kNoMorphTarget,
+              "kNoMorphTarget 两份定义不一致 —— 断点会被当成真 target 去写权重");
+
+// morph delta 也要双向锁死：读端按 `sizeof(MorphDelta)` 整块 memcpy，
+// 布局差一个字段就是"整张脸按 Y 轴偏移形变"这种不可能靠肉眼定位的错。
+static_assert(sizeof(assets::MorphDelta) == sizeof(assetio::SourceMorphDelta),
+              "MorphDelta 与 SourceMorphDelta 尺寸不一致");
+static_assert(offsetof(assets::MorphDelta, position) ==
+                  offsetof(assetio::SourceMorphDelta, position),
+              "MorphDelta.position 偏移不一致");
+static_assert(offsetof(assets::MorphDelta, target) ==
+                  offsetof(assetio::SourceMorphDelta, target),
+              "MorphDelta.target 偏移不一致");
+static_assert(offsetof(assets::MorphDelta, normal) ==
+                  offsetof(assetio::SourceMorphDelta, normal),
+              "MorphDelta.normal 偏移不一致");
+static_assert(offsetof(assets::MorphDelta, vertex) ==
+                  offsetof(assetio::SourceMorphDelta, vertex),
+              "MorphDelta.vertex 偏移不一致");
+
 std::vector<std::uint8_t> slurp(const std::string& path, bool& ok) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { ok = false; return {}; }
@@ -166,6 +206,23 @@ std::unique_ptr<Model> loadVMeshModel(rhi::Device& device,
             key, albedo, normal, nullptr, sm.baseColor, sm.roughness, sm.metallic,
             sm.emissive, sm.doubleSided);
         if (m) {
+            // 透明模式（P0-3）：从 IR 带到运行时材质。
+            // ⚠ 必须在 captureImportDefaults() **之前** —— 否则"导入时的
+            //   默认值"记的是 Opaque，而材质实际是 Blend，diffParams 会认为
+            //   用户手工改过 alphaMode，存档里多一条无意义的覆盖项，
+            //   而且母材质更新时这个字段再也不会跟随。
+            switch (sm.alphaMode) {
+                case assetio::SourceMaterial::AlphaMode::Blend:
+                    m->alphaMode = Material::AlphaMode::Blend;
+                    break;
+                case assetio::SourceMaterial::AlphaMode::Mask:
+                    m->alphaMode = Material::AlphaMode::Mask;
+                    break;
+                case assetio::SourceMaterial::AlphaMode::Opaque:
+                default:
+                    break;
+            }
+            m->alphaCutoff = sm.alphaCutoff;
             m->source.setModel(name);
             const std::string mid =
                 resolveMaterialId(vmeta, name, sm.name, static_cast<int>(i));
@@ -179,6 +236,12 @@ std::unique_ptr<Model> loadVMeshModel(rhi::Device& device,
     }
 
     // ---------------- 子网格 ----------------
+    // morph 滑条的**跨子网格**视图（§15）：每个子网格各自一份 channel 表，
+    // 循环结束后合成模型级的 MorphRig。同名滑条在这里合并。
+    std::vector<std::vector<MorphChannel>> perSubChannels;
+    std::vector<std::uint32_t> targetCounts;
+    perSubChannels.reserve(src.subMeshes.size());
+    targetCounts.reserve(src.subMeshes.size());
     for (std::size_t i = 0; i < src.subMeshes.size(); ++i) {
         const assetio::SourceSubMesh& ss = src.subMeshes[i];
         const std::string subName =
@@ -207,6 +270,41 @@ std::unique_ptr<Model> loadVMeshModel(rhi::Device& device,
         mesh->setSource(msrc);
         mesh->setNoLod(!vmeta.import.generateLods);
 
+        // ---- morph（§14 / §15）----
+        // 逐字节搬运（布局已在文件顶部锁死）。target 名字是**子网格内局部**
+        // 的，与 delta 里的 `target` 同一个编号空间；滑条名是**跨子网格**
+        // 的语义键（同名合并，见 assets/MorphRig.h）。
+        if (!ss.morphStream.empty() || !ss.morphTargets.empty()) {
+            std::vector<MorphDelta> md(ss.morphStream.size());
+            if (!md.empty()) {
+                std::memcpy(md.data(), ss.morphStream.data(),
+                            md.size() * sizeof(MorphDelta));
+            }
+            std::vector<std::string> names;
+            names.reserve(ss.morphTargets.size());
+            for (const assetio::SourceMorphTarget& mt : ss.morphTargets)
+                names.push_back(mt.name);
+            std::vector<MorphChannel> chans;
+            chans.reserve(ss.morphChannels.size());
+            for (const assetio::SourceMorphChannel& sc : ss.morphChannels) {
+                MorphChannel c;
+                c.name = sc.name;
+                c.keys.reserve(sc.keys.size());
+                for (const assetio::SourceMorphChannelKey& sk : sc.keys)
+                    c.keys.push_back({sk.targetWeight, sk.target});
+                chans.push_back(std::move(c));
+            }
+            // 模型级滑条的原始表（下面 MorphRig 建完之后就不再需要，
+            // 但 Mesh 上留一份方便诊断/自检对照）。
+            perSubChannels.push_back(chans);
+            targetCounts.push_back(
+                static_cast<std::uint32_t>(ss.morphTargets.size()));
+            mesh->setMorph(std::move(md), std::move(names), std::move(chans));
+        } else {
+            perSubChannels.emplace_back();
+            targetCounts.push_back(0u);
+        }
+
         SubMesh sub;
         sub.mesh = mesh;
         sub.material = (ss.material >= 0 &&
@@ -219,6 +317,17 @@ std::unique_ptr<Model> loadVMeshModel(rhi::Device& device,
     }
 
     // ---------------- 骨架 + 动画 ----------------
+    // 滑条合并必须在**所有子网格**都装完之后（同名跨桶合并）。
+    model->morphRig.build(perSubChannels, targetCounts);
+    if (!model->morphRig.empty()) {
+        std::size_t driving = 0;
+        for (const MorphRigChannel& c : model->morphRig.channels())
+            if (c.drives) ++driving;
+        VK_LOG_INFO("VMESH-MORPH model=%s channels=%zu driving=%zu "
+                    "subMeshes=%zu",
+                    assetLogSafe(name).c_str(), model->morphRig.channelCount(),
+                    driving, model->subMeshes.size());
+    }
     if (!src.joints.empty()) {
         auto sk = std::make_shared<Skeleton>();
         sk->joints.resize(src.joints.size());
@@ -271,6 +380,38 @@ std::unique_ptr<Model> loadVMeshModel(rhi::Device& device,
                 static_cast<double>(model->radius), sourceRelPath.c_str(),
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - tLoad0).count());
+
+    // ---- 顶点通道体检（§13）----
+    // 单独一行而不是塞进上面那行：上面那行的正则被 verify_vmesh 的 C3~C6
+    // 钉着（`\(... ms\)`），改格式会让四条断言连带红 —— 那是判据的错位，
+    // 不是真的回归。新通道有自己的判据，就给它们自己的行。
+    //
+    // 为什么要打这个：uv2 / tangent / morphBase 现在**没有任何消费者**，
+    // 所以"导入器到底有没有把它们填进来"是这一刀唯一能验的东西。
+    // 靠人眼看字节是不现实的，靠截图更不可能（改不改变像素都一样）。
+    {
+        std::size_t nUv2 = 0, nTan = 0, nMorph = 0, nBad = 0, nTotal = 0;
+        std::size_t nDeltas = 0, nTargets = 0;
+        for (const assetio::SourceSubMesh& sm : src.subMeshes) {
+            nDeltas += sm.morphStream.size();
+            nTargets += sm.morphTargets.size();
+            for (const assetio::Vertex& v : sm.vertices) {
+                ++nTotal;
+                if (v.uv2[0] != 0.0f || v.uv2[1] != 0.0f) ++nUv2;
+                if (v.tangent[3] != 0.0f) ++nTan;
+                if (v.morphBase != assetio::kNoMorphBase) ++nMorph;
+                // "有 base 没 count / 有 count 没 base" 是矛盾状态。
+                // 读端（MeshFormat.cpp）已经硬拒过一次，这里再数一遍是
+                // 为了让**日志本身**能当判据 —— 验收脚本读的就是这一行。
+                if ((v.morphBase == assetio::kNoMorphBase) != (v.morphCount == 0))
+                    ++nBad;
+            }
+        }
+        VK_LOG_INFO("VMESH-VFMT stride=%zu verts=%zu uv2=%zu tangent=%zu "
+                    "morphVerts=%zu morphDeltas=%zu morphTargets=%zu morphBad=%zu",
+                    assetio::kVertexSize, nTotal, nUv2, nTan, nMorph, nDeltas,
+                    nTargets, nBad);
+    }
 
     return model;
 }

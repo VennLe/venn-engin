@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -122,6 +123,21 @@ struct PrimResult {
     std::vector<Vertex> verts;
     std::vector<std::uint32_t> indices;
     int materialIndex = -1;
+    // ---- morph（§14）----
+    // 与 verts **等长**：第 i 项列出顶点 i 参与了哪些 target 以及它的偏移。
+    // 用"每顶点一张小表"而不是"每 target 一张大表"，是因为分桶时按顶点
+    // 拷贝就是 O(顶点数)；反过来按 target 重映射要做 target × 记录数 ×
+    // 桶数 的三重循环（20 桶 × 60 target × 十万条记录，慢两个数量级）。
+    struct MorphRec {
+        std::uint32_t target = 0;
+        glm::vec3 pos{0.0f};
+        glm::vec3 nrm{0.0f};
+    };
+    std::vector<std::vector<MorphRec>> vertexMorph;
+    std::vector<std::string> morphNames;   // 下标 = target 下标
+    // 滑条表（§15）。名字与 target 名不同：channel 名是"会动的那个东西"，
+    // 一个 channel 可以有多个 target（in-between shape key）。
+    std::vector<SourceMorphChannel> morphChannels;
 };
 
 // ufbx 数据模型：
@@ -168,6 +184,90 @@ bool extractMesh(const ufbx_mesh& mesh, const ufbx_skin_deformer* skin,
     const bool hasUv = mesh.vertex_uv.exists;
     const bool hasSkin = skin != nullptr;
 
+    // ---- morph channel / target（§15）----
+    //
+    // ufbx 的数据模型有三层，上一刀（§14）只用了两层，把中间那层丢了：
+    //   blend_deformer → blend_channel（**滑条**）→ blend_keyframe（形状 + 位置）
+    // 一个 channel 通常只有 1 个 keyframe（这时"滑条推到底 = 到那个形状"），
+    // 但 Blender 的 in-between shape key 会有多个 —— 滑条拖到中途经过一个
+    // 中间形状。上一刀直接取 `ch->target_shape`（= 忽略中间形状的最终形状），
+    // alicia 恰好全是 keys=1 所以无损，但那是运气不是正确性。
+    //
+    // 现在的展开规则：**一个 keyframe = 一个 target**，channel 记下
+    // (targetWeight, target) 表；运行时按滑条权重在这张表上做分段线性插值
+    // （`assets::MorphRig::evaluate`）。keys=1 时插值退化成"权重直接传下去"，
+    // 与上一刀逐位一致。
+    //
+    // ⚠ 一个 mesh 可以有多个 blend_deformer（不同导出器行为不同）。按
+    //   deformer 顺序、再按 channel 顺序展开成一张扁平 target 表，下标
+    //   从此固定 —— 落盘后动画驱动靠的就是这个下标，不能重排。
+    struct MorphTargetSrc {
+        std::string name;
+        const ufbx_blend_shape* shape = nullptr;
+    };
+    std::vector<MorphTargetSrc> targetSrcs;
+    std::vector<SourceMorphChannel> channels;
+    // target 名字必须**子网格内唯一**：多 key 时加 `#i` 后缀（key0 用原名，
+    // 这样 keys=1 的资产名与上一刀完全一致，别名/存档不会失效）。
+    for (std::size_t d = 0; d < mesh.blend_deformers.count; ++d) {
+        const ufbx_blend_deformer* bd = mesh.blend_deformers.data[d];
+        if (!bd) continue;
+        for (std::size_t c = 0; c < bd->channels.count; ++c) {
+            const ufbx_blend_channel* ch = bd->channels.data[c];
+            if (!ch) continue;
+            const std::string chName = str(ch->name);
+            SourceMorphChannel chan;
+            chan.name = chName;
+            // keyframe 为空时退回 target_shape（少数导出器只给最终形状）。
+            const std::size_t kc =
+                ch->keyframes.count ? ch->keyframes.count : 1;
+            for (std::size_t k = 0; k < kc; ++k) {
+                const ufbx_blend_shape* shp = ch->keyframes.count
+                                                  ? ch->keyframes.data[k].shape
+                                                  : ch->target_shape;
+                if (!shp) continue;
+                const float tw =
+                    ch->keyframes.count
+                        ? static_cast<float>(ch->keyframes.data[k].target_weight)
+                        : 1.0f;
+                const std::uint32_t tIdx =
+                    static_cast<std::uint32_t>(targetSrcs.size());
+                targetSrcs.push_back(
+                    {kc == 1 ? chName : chName + "#" + std::to_string(k), shp});
+                chan.keys.push_back({tw, tIdx});
+            }
+            if (chan.keys.empty()) continue;
+            // 按 targetWeight 升序（ufbx 一般已经排好，但不保证）。
+            std::stable_sort(chan.keys.begin(), chan.keys.end(),
+                             [](const SourceMorphChannelKey& a,
+                                const SourceMorphChannelKey& b) {
+                                 return a.targetWeight < b.targetWeight;
+                             });
+            channels.push_back(std::move(chan));
+        }
+    }
+    const std::size_t morphTargetCount = targetSrcs.size();
+    // 反查表：逻辑顶点 → 该 target 的 delta 下标。**必须建表**，不能对每个
+    // 顶点调一次 `ufbx_get_blend_shape_offset_index`：那在内部是线性扫描，
+    // 21310 顶点 × 700 偏移 × 60 target ≈ 9 亿次比较，烤一个资产要等半分钟。
+    // 建表是 O(偏移数)，之后每次查询 O(1)。
+    std::vector<std::int32_t> deltaOf(mesh.num_vertices, -1);
+    std::vector<std::vector<PrimResult::MorphRec>> vertexMorph(n);
+    // ---- 2026-10-25（§13）：第二套 UV 与切线 ----
+    //
+    // ⚠ `uv_sets[0]` **等价于** `mesh.vertex_uv`（ufbx.h 里明写了
+    //   "The first set contains the same data as vertex_uv"），所以
+    //   第二套必须从下标 1 取。取 0 的后果不是报错，是"UV2 和 UV 一模一样"，
+    //   面部 SDF 会拿主贴图的 UV 去采样阴影图，看起来像一层没对准的脏污。
+    const bool hasUv2 =
+        mesh.uv_sets.count > 1 && mesh.uv_sets.data[1].vertex_uv.exists;
+    // 切线：FBX 里是**可选**的（Blender 默认不导出）。没有就是没有 ——
+    // 这里**不**从 UV 退化算：生成切线要按三角形累加再加 Gram-Schmidt，
+    // 而目前没有任何着色器读它（§13.5）。凭空生成一份没人验证过的
+    // 数据，只会让"头发各向异性"那一刀在排查时多一个可疑变量。
+    const bool hasTangent = mesh.vertex_tangent.exists;
+    const bool hasBitangent = mesh.vertex_bitangent.exists;
+
     for (std::size_t i = 0; i < n; ++i) {
         Vertex& v = verts[i];
         const glm::vec3 p = toGlm(ufbx_get_vertex_vec3(&mesh.vertex_position, i));
@@ -186,6 +286,38 @@ bool extractMesh(const ufbx_mesh& mesh, const ufbx_skin_deformer* skin,
             // FBX 的 UV 原点在左下，引擎（与 glTF / Vulkan）在左上
             v.uv[0] = uv.x;
             v.uv[1] = 1.0f - uv.y;
+        }
+        if (hasUv2) {
+            const glm::vec2 uv = toGlm(
+                ufbx_get_vertex_vec2(&mesh.uv_sets.data[1].vertex_uv, i));
+            // ⚠ 翻转方向必须与 uv 一致。一套翻一套不翻的话，两套 UV
+            //   叠在同一张脸上会变成上下镜像 —— 只有偏对称的脸才看不出来。
+            v.uv2[0] = uv.x;
+            v.uv2[1] = 1.0f - uv.y;
+        }
+        if (hasTangent) {
+            const glm::vec3 t = toGlm(ufbx_get_vertex_vec3(&mesh.vertex_tangent, i));
+            const float len2 = t.x * t.x + t.y * t.y + t.z * t.z;
+            // 零长度切线比"没有切线"更有害：着色器里 tangent.w != 0 是
+            // 唯一的存在判据，放一个零向量过去会让它拿 normalize(0) 建
+            // TBN，整片法线贴图变成 NaN 黑斑。所以这里显式退回"没有"。
+            if (len2 > 1.0e-12f) {
+                v.tangent[0] = t.x;
+                v.tangent[1] = t.y;
+                v.tangent[2] = t.z;
+                // 手性：w = sign(dot(cross(N, T), B))。
+                // 缺副切线时假 +1（右手系），这是绝大多数 DCC 的约定；
+                // w 错了的表现是"法线贴图里凹凸反向"，光从左边来却在右边起高光。
+                float w = 1.0f;
+                if (hasBitangent && hasNormal) {
+                    const glm::vec3 bt =
+                        toGlm(ufbx_get_vertex_vec3(&mesh.vertex_bitangent, i));
+                    const glm::vec3 nn(v.normal[0], v.normal[1], v.normal[2]);
+                    const glm::vec3 cr = glm::cross(nn, t);
+                    if (cr.x * bt.x + cr.y * bt.y + cr.z * bt.z < 0.0f) w = -1.0f;
+                }
+                v.tangent[3] = w;
+            }
         }
         v.color[0] = v.color[1] = v.color[2] = v.color[3] = 1.0f;
 
@@ -229,6 +361,72 @@ bool extractMesh(const ufbx_mesh& mesh, const ufbx_skin_deformer* skin,
         }
     }
 
+    // ---- morph delta：按 target-major 展开 ----
+    //
+    // 外层 target、内层顶点（而不是反过来），是为了让 `deltaOf` 只建一次
+    // 能复用整趟：建表 O(偏移数)、查表 O(1)，总代价 O(target × 顶点数)。
+    //
+    // 一个**渲染顶点**（面角）拿到的是它所属**逻辑顶点**的偏移。同一逻辑
+    // 顶点会出现在多个面角上，所以同一个 target 的多条记录指向不同的
+    // 渲染顶点、但值相同 —— 这是有意的：展开之后每条记录只认渲染顶点，
+    // 下游（焊接 / 分桶 / 落盘 / 上传）不必再理解"逻辑顶点"这个概念。
+    //
+    // ⚠ 这里产出的是**几何空间**的偏移。蒙皮网格的顶点会在 walk 里被
+    //   烘到世界空间（那里才有 node 的 `geometry_to_world`），偏移必须
+    //   在同一处过同一个线性变换 —— 分两个文件、两个函数各改一半，
+    //   迟早会出现"顶点动了、形变没动"。
+    //
+    // ---- offset_weights（§15）：为什么在**这里**折进 delta ----
+    // ufbx 的求值式是 `vertex += offset * weight * offset_weights[i]`
+    // （见 third_party/ufbx/ufbx.c 的 ufbx_add_blend_shape_vertex_offsets）。
+    // `offset_weights` 是**逐偏移的常数**，与运行期权重无关 →
+    //   等价于把 delta 预乘：`(offset * ow) * weight`
+    // 所以不需要多存一个通道、不需要改 32 字节布局、GPU 侧一行都不用动：
+    // **乘进 delta 就完事**。上一刀直接丢掉了它，于是「部分顶点才受影响」
+    // 的形状键会退化成「全部顶点一起动」。
+    // 实测 alicia 的每个 shape 都带满 offset_weights（nz == numOffsets），
+    // 不是理论情况。
+    if (morphTargetCount > 0) {
+        for (std::size_t t = 0; t < morphTargetCount; ++t) {
+            const ufbx_blend_shape* shape = targetSrcs[t].shape;
+            std::fill(deltaOf.begin(), deltaOf.end(), -1);
+            // ⚠ ufbx 明说 `offset_vertices` 可能**越界**（同一个 shape
+            //   被多个 mesh 共享时，偏移表是按并集建的）。越界的直接丢。
+            for (std::size_t k = 0; k < shape->num_offsets; ++k) {
+                const std::uint32_t lv = shape->offset_vertices.data[k];
+                if (lv < deltaOf.size()) deltaOf[lv] = static_cast<std::int32_t>(k);
+            }
+            const bool hasNOff = shape->normal_offsets.count >= shape->num_offsets &&
+                                 shape->num_offsets > 0;
+            // 与 ufbx 同一条判据：只有 `i < offset_weights.count` 才乘。
+            const std::size_t owCount = shape->offset_weights.count;
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::uint32_t logical = mesh.vertex_indices.data[i];
+                if (logical >= deltaOf.size()) continue;
+                const std::int32_t di = deltaOf[logical];
+                if (di < 0) continue;
+                const float ow = (static_cast<std::size_t>(di) < owCount)
+                                     ? static_cast<float>(
+                                           shape->offset_weights.data[di])
+                                     : 1.0f;
+                PrimResult::MorphRec rec;
+                rec.target = static_cast<std::uint32_t>(t);
+                const ufbx_vec3 po = shape->position_offsets.data[di];
+                rec.pos = glm::vec3(po.x, po.y, po.z) * ow;
+                if (hasNOff) {
+                    const ufbx_vec3 no = shape->normal_offsets.data[di];
+                    rec.nrm = glm::vec3(no.x, no.y, no.z) * ow;
+                }
+                // ow == 0 的顶点对形变没有任何贡献 —— 丢掉。留着的话
+                // 每帧都要传、GPU 每帧都要乘一个 0，纯浪费；而且
+                // morphCount 会更真实（"这个顶点参与几个 target"）。
+                if (rec.pos == glm::vec3(0.0f) && rec.nrm == glm::vec3(0.0f))
+                    continue;
+                vertexMorph[i].push_back(rec);
+            }
+        }
+    }
+
     // 按材质分桶（每个桶一个 primitive / 子网格 / 一次 draw call）
     std::map<int, std::vector<std::uint32_t>> buckets;
     for (std::size_t t = 0; t < tris.size() / 3; ++t)
@@ -239,6 +437,9 @@ bool extractMesh(const ufbx_mesh& mesh, const ufbx_skin_deformer* skin,
         pr.verts = std::move(verts);
         pr.indices = std::move(tris);
         pr.materialIndex = buckets.begin()->first;
+        pr.vertexMorph = std::move(vertexMorph);
+        for (const MorphTargetSrc& ms : targetSrcs) pr.morphNames.push_back(ms.name);
+        pr.morphChannels = channels;
         out.push_back(std::move(pr));
         return true;
     }
@@ -261,12 +462,22 @@ bool extractMesh(const ufbx_mesh& mesh, const ufbx_skin_deformer* skin,
             }
         }
         std::vector<Vertex> pv(remap.size());
-        for (const auto& kv2 : remap) pv[kv2.second] = verts[kv2.first];
+        std::vector<std::vector<PrimResult::MorphRec>> pm(remap.size());
+        for (const auto& kv2 : remap) {
+            pv[kv2.second] = verts[kv2.first];
+            // 按顶点整表拷贝（不是按 target 重映射）：一个顶点最多参与
+            // 几个 target，拷贝是常数级。反过来遍历 target 再查 remap
+            // 会变成 target × 记录 × 桶 的三重循环。
+            if (!vertexMorph.empty()) pm[kv2.second] = vertexMorph[kv2.first];
+        }
 
         PrimResult pr;
         pr.verts = std::move(pv);
         pr.indices = std::move(pi);
         pr.materialIndex = kv.first;
+        pr.vertexMorph = std::move(pm);
+        for (const MorphTargetSrc& ms : targetSrcs) pr.morphNames.push_back(ms.name);
+        pr.morphChannels = channels;
         out.push_back(std::move(pr));
     }
     return true;
@@ -309,6 +520,39 @@ SourceMaterial convertMaterial(const ufbx_material& mat, const fs::path& fbxDir,
     // 不是 pbr 字段。漏了它的后果是：树叶/布料/睫毛这类靠单面卡片的
     // 模型在引擎里有一半面消失（背面剔除）。
     out.doubleSided = mat.features.double_sided.enabled;
+
+    // ---- 透明模式（P0-3，2026-10-25）----
+    //
+    // FBX **没有** glTF 那种 "OPAQUE / MASK / BLEND" 三态枚举，只能从
+    // 三个迹象推断"这个材质是不是半透明"：
+    //   ① pbr.opacity 挂了贴图 —— 最硬的证据（睫毛/发丝卡片都是这条路）
+    //   ② features.opacity.enabled 且 opacity 的值 < 1
+    //   ③ fbx.transparency_factor < 1（老的 FBX 写法，UFBX 已归一化到 ①/②
+    //      但个别 DCC 只写这一个）
+    //
+    // ⚠ 只推 Blend，**推不出 Mask**。FBX 里没有"alpha test"这个东西 ——
+    //   镂空是靠贴图 alpha 做的，该走 Blend 还是 Mask 取决于美术意图：
+    //   Mask 不混合、能写深度（排序安全、边缘硬），Blend 边缘软但必须排序。
+    //   引擎侧默认给 Blend（更接近 DCC 里的观感），要 Mask 的人在
+    //   Inspector 里改一下 —— 这个决定不该由导入器替美术做。
+    //
+    // ⚠ 这条不改"眼睛被脸皮挡住"那个老问题。眼睛是**不透明**的，
+    //   它出不来是因为脸皮先写深度、眼睛在脸皮后面（P0-2/B 的 renderQueue
+    //   才是那条的正解）。这里修的是半透明部件变成硬边不透明的问题。
+    {
+        const bool hasOpacityTex = mat.pbr.opacity.texture != nullptr;
+        const bool opacityOn = mat.features.opacity.enabled &&
+                               mat.pbr.opacity.has_value &&
+                               mat.pbr.opacity.value_real < 0.999;
+        // transparency_factor 在 FBX 里语义是"透明度"（1 = 完全不透明），
+        // 与 opacity（1 = 完全不透明）**同向**，不用取反。
+        const bool transparencyOn =
+            mat.fbx.transparency_factor.has_value &&
+            mat.fbx.transparency_factor.value_real < 0.999;
+        if (hasOpacityTex || opacityOn || transparencyOn) {
+            out.alphaMode = SourceMaterial::AlphaMode::Blend;
+        }
+    }
 
     const ufbx_texture* tex = bc.texture;
     if (!tex) tex = mat.fbx.diffuse_color.texture;
@@ -640,6 +884,18 @@ SourceModel importFbx(const std::string& absPath, const ImportOptions& opt) {
                             v.normal[1] = nn.y;
                             v.normal[2] = nn.z;
                         }
+                        // morph 偏移也必须过**同一个**线性变换。漏掉它的
+                        // 表现是"顶点烘到世界空间了、形变还按几何空间走"：
+                        // 角色一捏表情就往斜上方飞，而且只在有缩放的节点下
+                        // 才明显 —— 平移到原点的节点看不出问题。
+                        // 法线偏移只做线性变换、**不重新归一化**：它是增量
+                        // 不是方向，归一化会把"轻微鼓包"放大成"整体膨胀"。
+                        for (std::vector<PrimResult::MorphRec>& lst : pr.vertexMorph) {
+                            for (PrimResult::MorphRec& rec : lst) {
+                                rec.pos = lin * rec.pos;
+                                rec.nrm = lin * rec.nrm;
+                            }
+                        }
                         sm.transform = glm::mat4(1.0f);
                     } else {
                         sm.transform = world;
@@ -653,6 +909,67 @@ SourceModel importFbx(const std::string& absPath, const ImportOptions& opt) {
                             sm.material = materialIndexOf(*n->materials.data[pr.materialIndex]);
                         } else if (pr.materialIndex < static_cast<int>(mesh.materials.count)) {
                             sm.material = materialIndexOf(*mesh.materials.data[pr.materialIndex]);
+                        }
+                    }
+
+                    // ---- 每顶点的小表 → 每 target 的稀疏表 ----
+                    //
+                    // **丢掉"一个偏移都没有"的 target**：alicia 的 eye 有 3 个
+                    // target、face 有 49 个，它们是各自 mesh 的 blend deformer
+                    // —— 本来就没有"跨子网格统一的 target 表"这种东西。
+                    // 保留空 target 的后果是每个子网格都背着自己用不到的那些
+                    // 名字，而且下标还各不连续。所以 target 下标是**子网格内
+                    // 局部**的，与 `joints` 是"骨架内下标"同一个套路。
+                    if (!pr.vertexMorph.empty()) {
+                        std::vector<SourceMorphTarget> all(pr.morphNames.size());
+                        for (std::size_t t = 0; t < pr.morphNames.size(); ++t)
+                            all[t].name = pr.morphNames[t];
+                        for (std::size_t v = 0; v < pr.vertexMorph.size(); ++v) {
+                            for (const PrimResult::MorphRec& rec : pr.vertexMorph[v]) {
+                                if (rec.target >= all.size()) continue;
+                                SourceMorphTarget& mt = all[rec.target];
+                                mt.vertices.push_back(static_cast<std::uint32_t>(v));
+                                mt.positionDeltas.push_back(rec.pos);
+                                mt.normalDeltas.push_back(rec.nrm);
+                            }
+                        }
+                        // 老下标 → 新下标（-1 = 这个 target 在本子网格里没有
+                        // 偏移，被丢掉了）。channels 必须跟着换下标。
+                        std::vector<std::int32_t> newIdx(all.size(), -1);
+                        for (std::size_t t = 0; t < all.size(); ++t) {
+                            if (all[t].vertices.empty()) continue;
+                            newIdx[t] = static_cast<std::int32_t>(
+                                sm.morphTargets.size());
+                            sm.morphTargets.push_back(std::move(all[t]));
+                        }
+                        // channel 的 key **不能**因为 target 被丢掉而丢掉：
+                        // 它仍然是分段插值的断点（见 kNoMorphTarget 的说明）。
+                        for (const SourceMorphChannel& ch : pr.morphChannels) {
+                            SourceMorphChannel oc;
+                            oc.name = ch.name;
+                            bool anyRealTarget = false;
+                            for (const SourceMorphChannelKey& k : ch.keys) {
+                                SourceMorphChannelKey nk = k;
+                                if (k.target >= newIdx.size()) {
+                                    nk.target = kNoMorphTarget;
+                                } else {
+                                    const std::int32_t ni = newIdx[k.target];
+                                    nk.target = (ni < 0)
+                                                    ? kNoMorphTarget
+                                                    : static_cast<std::uint32_t>(ni);
+                                }
+                                if (nk.target != kNoMorphTarget) anyRealTarget = true;
+                                oc.keys.push_back(nk);
+                            }
+                            // **全空**的滑条整条丢掉（一个 key 在本子网格里
+                            // 都没有偏移 → 它对这里没有任何作用）。
+                            // ⚠ 只丢"全空"的：只要有一个 key 真的写入，
+                            //   其余 kNoMorphTarget 的 key 就必须留着当断点。
+                            //   实测 alicia 的 face 有 60 个 shape key，按材质
+                            //   切成 20 个桶后，多数桶的多数滑条是全空的 ——
+                            //   不丢的话文件名副其实地多出一倍滑条。
+                            if (!oc.keys.empty() && anyRealTarget)
+                                sm.morphChannels.push_back(std::move(oc));
                         }
                     }
                     out.subMeshes.push_back(std::move(sm));

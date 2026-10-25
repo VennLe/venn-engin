@@ -242,7 +242,8 @@ void ShadowPass::createPipeline() {
     // 只喂 0..4：shadow.vert 不读顶点色（location 5）。多声明一个不会被读的
     // 属性会触发校验层 "Vertex attribute at location 5 not consumed by
     // vertex shader"。
-    desc.vertexAttributes = assets::Vertex::attributeDescriptions(5);
+    // 阴影读 pos/normal/uv/joints/weights + morph（§15）；不读顶点色。
+    desc.vertexAttributes = assets::Vertex::attributeDescriptionsShadow();
     desc.setLayouts = {m_frameSetLayout};
     desc.pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     desc.pushConstant.offset = 0;
@@ -380,7 +381,7 @@ void ShadowPass::updateCascades(const glm::mat4& camView,
 
 void ShadowPass::render(VkCommandBuffer cmd, scene::Scene& scene,
                         VkDescriptorSet frameSet, uint32_t frameIndex,
-                        uint32_t cascade) {
+                        uint32_t cascade, MorphSlotFn morphSlot) {
     if (m_frames.empty() || cascade >= m_cascadeCount) return;
     Frame& f = m_frames[frameIndex % m_frames.size()];
 
@@ -455,10 +456,17 @@ void ShadowPass::render(VkCommandBuffer cmd, scene::Scene& scene,
                                       1.0f, 0.0f);
             }
         }
+        // morph（§15）：槽位由 Renderer 现场分配（同一个 MorphRig::evaluate，
+        // 所以影子与实体的形变必然一致）。which.z 走 push —— 阴影的 push
+        // 只有 96 B，which.z/w 一直是空闲的，不必加宽。
+        std::uint32_t slot = 0;
+        if (morphSlot && mc.mesh->morphTargetCount() > 0)
+            slot = morphSlot(scene, e, *mc.mesh);
+        push.which.z = static_cast<float>(slot);
         vkCmdPushConstants(cmd, m_pipeline->layout(),
                            VK_SHADER_STAGE_VERTEX_BIT, 0,
                            sizeof(ShadowPushConstants), &push);
-        mc.mesh->draw(cmd);
+        mc.mesh->drawInstanced(cmd, 1, slot);
     });
 
     m_considered[cascade] = considered;

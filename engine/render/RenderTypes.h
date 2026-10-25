@@ -278,6 +278,29 @@ struct InstanceData {
 };
 static_assert(sizeof(InstanceData) == 64, "InstanceData 必须是一个裸 mat4");
 
+// ============================================================
+// GPU 形变的逐实例记录（§15，set 0 binding 26，std430）
+//
+//   x = deltaBase   本实例的 delta 流在 MorphDeltas 里的起点
+//   y = weightBase  本实例的 target 权重数组在 MorphWeights 里的起点
+//   z = targetCount 权重个数（= 本子网格的 morph target 数）
+//   w = 保留（0）
+//
+// 为什么这三项必须**逐实例**而不是逐材质/逐网格：
+//   · deltaBase 逐实例，是因为 delta 表**每帧**按用到的网格重新拼
+//     （见 Renderer::buildMorphFrameData 的"按 Mesh* 去重"），
+//     同一网格在不同帧可能落在不同位置；
+//   · weightBase 逐实例，是因为同一个网格的两个实例可以有不同表情。
+//
+// 与 `InstanceData` 分开成三块 buffer（slots / deltas / weights），
+// 而不是塞进 64 字节的实例记录：N 个实例 × 88 个 float 的权重表塞进去
+// 会让每个实例的记录从 64 字节涨到 400+ 字节，静态网格也跟着付这份钱。
+// ============================================================
+struct MorphInstance {
+    glm::uvec4 aux{0, 0, 0, 0};
+};
+static_assert(sizeof(MorphInstance) == 16, "MorphInstance 必须是 16 字节");
+
 // 地平面栅格的推送常量（与 assets/shaders/grid.{vert,frag} 一一对应）。
 // 数据只有 48 字节 —— 它不需要额外描述符（相机矩阵从 FrameUBO 读），
 // 所以单独开一份小的，而不是复用上面那 112 字节的 PushConstants。

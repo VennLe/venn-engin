@@ -26,6 +26,8 @@ const KeywordInfo kKeywords[kKeywordCount] = {
     {kKeywordAlphaMask, "VENN_ALPHA_MASK", "alpha-mask"},
     {kKeywordShadingSkin, "VENN_SHADING_SKIN", "shading-skin"},
     {kKeywordParallax, "VENN_PARALLAX", "parallax"},
+    {kKeywordShadingToon, "VENN_SHADING_TOON", "shading-toon"},
+    {kKeywordOverlay, "VENN_OVERLAY", "overlay"},
 };
 
 // 位序 → 表下标的换算。表按位序排，所以下标就是"这是第几个被置的位"。
@@ -89,26 +91,59 @@ KeywordMask keywordsOf(const assets::Material& mat) {
     // 等于不起作用），但那样同一个材质在拖动 normalScale 经过 0 时会
     // 反复切换变体、还要多编一份。少一份变体、多一次无害采样更划算。
     if (mat.normalMap) m |= kKeywordNormalMap;
-    if (mat.shadingModel == assets::Material::ShadingModel::Skin) {
-        m |= kKeywordShadingSkin;
+    // 着色模型：**一对一映射**，不是"叠加开关"。
+    // 枚举上 Toon 与 Skin 互斥，所以这里只会置其中一位 —— 但两者各占一个
+    // bit，掩码空间里"两位都置"的值仍然存在。CMake 的白名单不编它，运行时
+    // 也产不出它（只有这一个入口推导材质掩码）。见 ShaderKeywords.h 的说明。
+    switch (mat.shadingModel) {
+        case assets::Material::ShadingModel::Skin:
+            m |= kKeywordShadingSkin;
+            break;
+        case assets::Material::ShadingModel::Toon:
+            m |= kKeywordShadingToon;
+            break;
+        case assets::Material::ShadingModel::Default:
+        default:
+            break;
     }
     // POM：只看"有没有挂高度图"。heightScale == 0 时不置位也说得过去
     // （offset 恒 0 = 不起作用），但那样在编辑器里把滑条从 0 往上推的
     // 一瞬间才切变体、而且要多编一份"挂了图但不生效"的变体 ——
     // 与 normalScale 同一条取舍：少一份变体、多一次无害的采样。
     if (mat.heightMap) m |= kKeywordParallax;
+    // 覆盖带（P0-2/B）：由 renderQueue 推出，**没有独立的布尔开关**。
+    // 两个字段描述同一件事，迟早会出现"queue 设成 3100、开关忘了勾"
+    // 的不一致，那时症状是"眼睛又被脸皮挡回去"—— 和改造前一模一样，
+    // 却极难看出是配置问题而不是代码问题。
+    if (mat.isOverlay()) m |= kKeywordOverlay;
     return m;
 }
 
-std::string variantTable(const uint32_t* counts, uint32_t count) {
+bool addVariantCount(VariantSlot* slots, uint32_t& used, KeywordMask m) {
+    const KeywordMask key = m & kKeywordAll;
+    // 线性扫 —— 表通常只有个位数项，比 hash 快且没有分配。
+    for (uint32_t i = 0; i < used; ++i) {
+        if (slots[i].mask == key) {
+            ++slots[i].count;
+            return true;
+        }
+    }
+    if (used >= kMaxVariantSlots) return false;
+    slots[used].mask = key;
+    slots[used].count = 1;
+    ++used;
+    return true;
+}
+
+std::string variantTable(const VariantSlot* slots, uint32_t used) {
     // 格式 "k0=2,k3=1"：逗号分隔、不带空格，便于验证脚本直接正则截取。
     // 掩码到名字的映射单独由 keywordNames() 给出（见 SHADER-VARIANTS-BUILT
     // 那条日志），这里不复述名字，免得同一行太长看不清。
     std::string out;
-    char buf[32];
-    for (uint32_t i = 0; i < count && i <= kKeywordAll; ++i) {
-        if (counts[i] == 0) continue;  // 只列真的用到的，日志才读得动
-        std::snprintf(buf, sizeof(buf), "k%u=%u", i, counts[i]);
+    char buf[48];
+    for (uint32_t i = 0; i < used && i < kMaxVariantSlots; ++i) {
+        if (slots[i].count == 0) continue;  // 只列真的用到的，日志才读得动
+        std::snprintf(buf, sizeof(buf), "k%u=%u", slots[i].mask, slots[i].count);
         if (!out.empty()) out += ",";
         out += buf;
     }

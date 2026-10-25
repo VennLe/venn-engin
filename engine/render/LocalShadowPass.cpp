@@ -320,7 +320,8 @@ void LocalShadowPass::createPipeline() {
     desc.fragSpv = vkutil::readFile(resolveShaderPath("shadow.frag.spv"));
     desc.vertexBindings.push_back(assets::Vertex::bindingDescription());
     // 同 ShadowPass：shadow.vert 不读 location 5，别多喂。
-    desc.vertexAttributes = assets::Vertex::attributeDescriptions(5);
+    // 阴影读 pos/normal/uv/joints/weights + morph（§15）；不读顶点色。
+    desc.vertexAttributes = assets::Vertex::attributeDescriptionsShadow();
     desc.setLayouts = {m_frameSetLayout};
     desc.pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     desc.pushConstant.offset = 0;
@@ -345,7 +346,8 @@ void LocalShadowPass::createPipeline() {
 
 void LocalShadowPass::render(VkCommandBuffer cmd, scene::Scene& scene,
                              VkDescriptorSet frameSet, uint32_t frameIndex,
-                             uint32_t layer, const glm::mat4* clip) {
+                             uint32_t layer, const glm::mat4* clip,
+                             MorphSlotFn morphSlot) {
     if (m_frames.empty() || layer >= kMaxLayers) return;
     Frame& f = m_frames[frameIndex % m_frames.size()];
 
@@ -422,10 +424,15 @@ void LocalShadowPass::render(VkCommandBuffer cmd, scene::Scene& scene,
                                       1.0f, 0.0f);
             }
         }
+        // morph（§15）：与级联阴影同一条路 —— push.which.z 带槽位。
+        std::uint32_t slot = 0;
+        if (morphSlot && mc.mesh->morphTargetCount() > 0)
+            slot = morphSlot(scene, e, *mc.mesh);
+        push.which.z = static_cast<float>(slot);
         vkCmdPushConstants(cmd, m_pipeline->layout(),
                            VK_SHADER_STAGE_VERTEX_BIT, 0,
                            sizeof(ShadowPushConstants), &push);
-        mc.mesh->draw(cmd);
+        mc.mesh->drawInstanced(cmd, 1, slot);
     });
 
     m_considered[layer] = considered;

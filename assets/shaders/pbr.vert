@@ -75,12 +75,48 @@ layout(set = 0, binding = 13) readonly buffer InstanceModels {
 #ifdef VENN_MDI
 struct MdiInstance {
     mat4 model;
-    ivec4 aux;
+    ivec4 aux;   // x = jointBase（<0 静态），y = morph 槽位（§15）
 };
 layout(std430, set = 0, binding = 15) readonly buffer MdiInstances {
     MdiInstance items[];
 };
 #endif
+
+// ============================================================
+// GPU 形变（§15）
+//
+//   binding 25  MorphDeltas   delta 流（32 B/条；布局与磁盘逐字节一致）
+//   binding 26  MorphWeights  每实例一段 float，下标 = target 下标
+//   binding 27  MorphSlots    每实例一条 {deltaBase, weightBase, targetCount}
+//
+// 一个顶点只遍历**自己**的 delta（`inMorphCount` 条，紧凑排列在
+// `deltaBase + inMorphBase` 处），权重查 `weightBase + delta.target`。
+// 这就是"稀疏 morph"在 GPU 上的形态：没被任何 target 影响的顶点不进循环，
+// 一层表情只动几千个顶点，代价与"动了多少"成正比而不是与"有多少 target"
+// 成正比。
+//
+// ⚠ `MorphDelta` 的布局不能随手改：std430 下 vec3 的对齐是 16，所以
+//   position(0) target(12) normal(16) vertex(28) 正好 32 字节，
+//   与 C++ 的 `assets::MorphDelta` 逐字节相同（那边有 static_assert）。
+//   把 `target` 和 `normal` 的顺序换一下就会多出 12 字节填充，
+//   症状是"形变按错位的 target 施加"——几何全对，只有表情是乱的。
+// ============================================================
+struct MorphDelta {
+    vec3 position;   //  0
+    uint target;     // 12
+    vec3 normal;     // 16
+    uint vertex;     // 28（GPU 侧不读，文件里是"流序==顶点序"的校验锚）
+};
+
+layout(set = 0, binding = 25) readonly buffer MorphDeltas {
+    MorphDelta morphDeltas[];
+};
+layout(set = 0, binding = 26) readonly buffer MorphWeights {
+    float morphWeights[];
+};
+layout(set = 0, binding = 27) readonly buffer MorphSlots {
+    uvec4 morphSlots[];   // x=deltaBase y=weightBase z=targetCount w=保留
+};
 
 layout(location = 0) in vec3 inPos;
 layout(location = 1) in vec3 inNormal;
@@ -88,6 +124,12 @@ layout(location = 2) in vec2 inUV;
 layout(location = 3) in uvec4 inJoints;  // 骨架内 joint 下标
 layout(location = 4) in vec4 inWeights;  // 权重（和 > 0 才蒙皮）
 layout(location = 5) in vec4 inColor;    // 顶点色（Mesh Paint；默认全 1）
+// morph（§15）：x = delta 流起点，y = 条数（0 = 这个顶点不参与形变）。
+// 上一刀（§14）只把这两个字段落在顶点里没人读；这一刀才是它们的消费者。
+// 属性表那侧必须同时喂到 location 8（见 Mesh::attributeDescriptions），
+// 少喂一条读到的是全 0 —— 而 0 条 delta 意味着"静默不形变"。
+layout(location = 7) in uint inMorphBase;
+layout(location = 8) in uint inMorphCount;
 
 layout(location = 0) out vec3 vWorldPos;
 layout(location = 1) out vec3 vNormal;
@@ -106,30 +148,64 @@ void main() {
     //   基线  ：push.model，jointBase 走 push.skin.x
     mat4 modelMat;
     int jointBase;
+    // morph 槽位：合批 / 基线两条路径都等于 gl_InstanceIndex（基线把槽号
+    // 直接当 firstInstance 传给 vkCmdDrawIndexed），MDI 只能走 aux.y
+    // —— 它的 gl_InstanceIndex 是**紧凑化之后**的下标，与全局槽空间无关。
+    uint morphSlot;
 #ifdef VENN_MDI
     const MdiInstance rec = items[gl_InstanceIndex];
     modelMat = rec.model;
     jointBase = rec.aux.x;
+    morphSlot = uint(rec.aux.y);
 #elif defined(VENN_INSTANCING)
     modelMat = vennInstanceModels[gl_InstanceIndex];
     jointBase = int(push.skin.x);
+    morphSlot = uint(gl_InstanceIndex);
 #else
     modelMat = push.model;
     jointBase = int(push.skin.x);
+    morphSlot = uint(gl_InstanceIndex);
 #endif
+
+    // ---- GPU 形变（§15）：**在蒙皮之前**施加 ----
+    //
+    // 顺序不能反：delta 是与 `inPos` 同一个空间的偏移（导入时过了
+    // geometry_to_world 的线性部分），而 skinMat 是"静止世界 → 当前姿势"。
+    // 先形变再蒙皮 = 顶点在当前姿势下被推着走；反过来（先蒙皮再形变）
+    // 会让 delta 被当成世界空间的方向直接加，角色一转身表情就往侧边飞。
+    vec3 morphPos = vec3(0.0);
+    vec3 morphNrm = vec3(0.0);
+    if (inMorphCount > 0u) {
+        const uvec4 mi = morphSlots[morphSlot];
+        // mi.z == 0 → 这条实例没有形变（渲染层把"没有 morph 的项"的槽
+        // 显式清零，见 Renderer::writeMorphSlot）。不判它的话，槽里上一帧
+        // 的残留记录会让顶点拿**别的实例**的权重去形变。
+        if (mi.z > 0u) {
+            const uint base = mi.x + inMorphBase;
+            // 上限 256：morphCount 来自顶点缓冲，一份坏数据能让循环跑到
+            // 几十万次（GPU 挂起 = 驱动超时 + 设备丢失，比画错难查得多）。
+            const uint n = min(inMorphCount, 256u);
+            for (uint i = 0u; i < n; ++i) {
+                const MorphDelta d = morphDeltas[base + i];
+                const float w = morphWeights[mi.y + d.target];
+                morphPos += d.position * w;
+                morphNrm += d.normal * w;
+            }
+        }
+    }
 
     // ---- 蒙皮 ----
     // 静态网格：inWeights 全 0，走原路径（等价于恒等变换）。
-    vec4 localPos = vec4(inPos, 1.0);
-    vec4 localNrm = vec4(inNormal, 0.0);
+    vec4 localPos = vec4(inPos + morphPos, 1.0);
+    vec4 localNrm = vec4(inNormal + morphNrm, 0.0);
     if (dot(inWeights, vec4(1.0)) > 0.0) {
         mat4 skinMat =
               jointBuf.jointMats[jointBase + int(inJoints.x)] * inWeights.x
             + jointBuf.jointMats[jointBase + int(inJoints.y)] * inWeights.y
             + jointBuf.jointMats[jointBase + int(inJoints.z)] * inWeights.z
             + jointBuf.jointMats[jointBase + int(inJoints.w)] * inWeights.w;
-        localPos = skinMat * vec4(inPos, 1.0);
-        localNrm = skinMat * vec4(inNormal, 0.0);
+        localPos = skinMat * vec4(inPos + morphPos, 1.0);
+        localNrm = skinMat * vec4(inNormal + morphNrm, 0.0);
     }
 
     vec4 world = modelMat * localPos;

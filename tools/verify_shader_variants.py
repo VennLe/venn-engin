@@ -148,12 +148,19 @@ def ground(size=80.0, mat_name="sv_ground_mat"):
                   material(mat_name, (0.70, 0.70, 0.73)))
 
 
-def write_scene(path, ents, generator, sun=(0.10, 0.10)):
-    """写场景。太阳默认压暗 —— 让材质本身的明暗差别成为画面主要信号。"""
+def write_scene(path, ents, generator, sun=(0.10, 0.10), light_dir=None):
+    """写场景。太阳默认压暗 —— 让材质本身的明暗差别成为画面主要信号。
+
+    light_dir：光的**传播方向**（着色器里 Ld = -lightDir）。默认值让光从
+    相机背后照过来（适合看材质贴图）；要观察明暗交界线本身（例如验证 NPR
+    的量化台阶），必须传一个**侧向**的光，否则可见半球全是受光面，
+    根本看不到暗部。
+    """
     doc = {
         "version": 1,
         "generator": generator,
-        "light": {"direction": [-0.35, -0.5, -0.79], "color": [1.0, 0.97, 0.92],
+        "light": {"direction": list(light_dir or [-0.35, -0.5, -0.79]),
+                  "color": [1.0, 0.97, 0.92],
                   "intensity": sun[0], "castsShadow": True,
                   "ambientScale": sun[1]},
         "entities": ents,
@@ -296,6 +303,15 @@ def run_once(exe, scene, extra_env, shot_path, cam=CAM, wait=20.0):
 
         img = None
         if shot_path:
+            # ⚠ 重新取一次 VP-RECT：窗口被 SetWindowPos 改成 1280x800 之后，
+            #   编辑器会连续几帧输出**旧尺寸**的矩形。上面那次 wait_rect 拿到
+            #   的可能正是旧的（实测见过 (470,139)-(1259,834)：宽 789 高 695，
+            #   而截图只有 1258x744 —— 矩形高过了图片本身）。
+            #   拿旧矩形去切截图 = 采样区整体错位，症状是"判据测到了背景"，
+            #   看起来像渲染 bug，其实是坐标没对齐。截图前重读保证同一帧。
+            fresh = tap.last_rect("VP-RECT")
+            if fresh:
+                vp = fresh
             img = capture_nonempty(hwnd)
             if img is not None:
                 img.save(shot_path)

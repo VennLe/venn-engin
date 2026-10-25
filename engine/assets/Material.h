@@ -73,6 +73,52 @@ struct Material {
     // 关闭时（默认）Mask 走原样的硬 discard 路径 → 逐像素不变。
     bool ditherAlpha = false;
 
+    // ============================================================
+    // 渲染顺序（P0-2/B 类，2026-10-25）
+    //
+    // 为什么材质上需要"顺序"这个字段：
+    //   透明物过去只按 `viewDepthSq` 单键降序排。这对"玻璃、烟雾"这类
+    //   物理上真的分前后的东西是对的，但对**二次元角色**完全不成立 ——
+    //   脸皮、眼白、虹膜、睫毛、眉毛、刘海几乎在同一个球面上，到相机的
+    //   距离差不到 1 mm，谁前谁后由浮点噪声决定，于是逐帧闪烁。
+    //   更糟的是二次元有一条硬规矩：**眉毛要穿透刘海**。这两者物理上
+    //   就是"刘海在前"，距离排序给出的一定是错的答案。
+    //
+    // 所以答案只能是"由美术指定"，引擎不再猜：
+    //   renderQueue —— 主键，这个部件属于哪个"带"（数值小 = 先画 = 在下）
+    //   sortOrder   —— 次键，同带内的微调（0 是默认，正数往上层推）
+    //
+    // 排序键变成 (renderQueue, sortOrder, -viewDepthSq)：
+    //   前两个是**语义**，最后一个是**物理**。同一带内仍然按距离排，
+    //   所以玻璃/烟雾那类东西的既有行为一分不变；跨带时距离完全不参与，
+    //   "眉毛永远在刘海之上"就是一条字面意义上的保证。
+    //
+    // ⚠ 这两个字段和 alphaMode 是**正交**的：alphaMode 决定"怎么混合"，
+    //   renderQueue 决定"什么时候画"。一个不透明材质照样可以有
+    //   renderQueue（比如想让脸皮排在身体之后，好在它上面叠东西）。
+    //
+    // 默认 2000 / 0 = 现有行为（所有材质同带、同序 → 只按距离排）。
+    // 这条"默认值等于旧行为"不是巧合，是 P0-1 那条"关 = 基线"约定
+    // 在这一层的延续：没设过这两个字段的场景，逐像素与改造前一致。
+    // ------------------------------------------------------------
+    // 参考带序（美术起点，**不是引擎规则** —— 引擎只保证升序绘制）：
+    //   1900 背景/天空   2000 不透明身体/衣服   2400 脸皮
+    //   2900 后发        3000 前发/刘海         3100 眼白+虹膜
+    //   3200 睫毛        3300 眉毛              3400 腮红/贴花
+    // 注意头发(3000) 必须小于眼睛(3100)：二次元的眼睛要压在刘海上。
+    // "按部件类别自动分类"行不通，就是这个反例 —— 头发既要在脸之前，
+    // 又要在眼睛之后，任何类别枚举都表达不了。
+    std::int32_t renderQueue = 2000;
+    std::int32_t sortOrder = 0;
+
+    // 该材质是否走"覆盖带"（不写深度 + 深度测试恒通过）。
+    //
+    // 判据是 `renderQueue >= kOverlayQueueStart`，**不是**另存一个 bool：
+    // 两个字段描述同一件事就会有不一致的那一天（设了 queue=3100 却忘了
+    // 勾 overlay，于是眼睛又被脸皮挡回去）。
+    static constexpr std::int32_t kOverlayQueueStart = 3000;
+    bool isOverlay() const { return renderQueue >= kOverlayQueueStart; }
+
     // ---- 着色模型（R4-2）----
     // Default：标准金属-粗糙度 BRDF（漫反射 = max(N·L,0)）。
     // Skin   ：在此之上叠一层**预积分次表面散射** —— 用 (N·L, 曲率) 查一张
@@ -87,8 +133,32 @@ struct Material {
     // 语义上等价于"给这个材质换一个漫反射响应函数"，所以走**关键字变体**
     // （bit4 VENN_SHADING_SKIN）而不是运行时 uniform：Default 材质那段代码
     // 整段编掉 → 逐像素不变。
-    enum class ShadingModel { Default, Skin };
+    //
+    // Toon（A1，2026-10-25）：二次元赛璐璐。与 Skin 同为"换一个漫反射响应"，
+    // 但方向相反 —— Skin 是让明暗交界**更软**（光绕过交界线），Toon 是让
+    // 它**变成一条线**（半兰伯特 + 两档量化）。阴影部分是乘冷色调而不是
+    // 单纯变暗，这是二次元和写实最本质的一条差异：阴影有颜色，不是没有光。
+    //
+    // 三者**互斥**（一个材质只能是一种着色模型）。互斥关系由
+    // keywordsOf() 的 switch 保证 —— 它不会同时置两个位。
+    enum class ShadingModel { Default, Skin, Toon };
     ShadingModel shadingModel = ShadingModel::Default;
+
+    // 枚举 → 存档/材质文件里的字符串。序列化与 Inspector 共用这一个函数，
+    // 免得"UI 加了 Toon、存档却只认 skin/default"这类单边改动。
+    static const char* shadingModelName(ShadingModel m) {
+        switch (m) {
+            case ShadingModel::Skin: return "skin";
+            case ShadingModel::Toon: return "toon";
+            case ShadingModel::Default:
+            default: return "default";
+        }
+    }
+    static ShadingModel shadingModelFromName(const std::string& s) {
+        if (s == "skin") return ShadingModel::Skin;
+        if (s == "toon") return ShadingModel::Toon;
+        return ShadingModel::Default;
+    }
 
     // ---- 因子（线性空间）----
     glm::vec4 baseColorFactor{1.0f};
@@ -148,6 +218,59 @@ struct Material {
     Texture* heightMap = nullptr;
     float heightScale = 0.05f;
 
+    // ============================================================
+    // A 类语义槽（2026-10-25，材质页 32 B → 96 B）
+    //
+    // 这四个槽解决的是 P0-2/A 那条"同像素叠加"：SDF 阴影 / ramp /
+    // 腮红贴花 / 眼睛 matcap。它们不参与排序，是在着色器里当场算完的。
+    //
+    // **为什么这些参数只能放在这里**：push 常量恰好 128 B 已经满了，
+    // 纹理 set 也满 7 个 —— 逐材质浮点在全引擎**只有材质页这一个地方**
+    // 能放（见 render/Bindless.h 的容量账）。
+    //
+    // **缺省值全部是乘法恒等**（贴图缺省白、强度缺省 0 或 1），于是
+    // "没挂贴图"必然逐像素回到基线。这不是巧合，是 P0-1 那条
+    // "关 = 基线"约定在这一层的可断言形式：
+    //     rampMap = null   → 程序化 ramp × 1  = 原来的程序化 ramp
+    //     matcapStrength=0 → 加项恒为 +0
+    //     sdfShadowMap=null→ 受光系数 × 1
+    //     detailMap = null → albedo × 1
+    // ------------------------------------------------------------
+    // Toon 的明暗渐变带。**只读 R**，按 NdotL 映射后的位置采样。
+    // 为什么需要它：程序化 ramp（A1）只有固定的两三档，而二次元的
+    // 明暗交界"硬到什么程度、阴影是什么颜色"是每个角色一套的画风，
+    // 只能由美术画成一张 1×N 的图。
+    //   rampSteps = 0 → 直接按 NdotL 采样（贴图自带多少档就是多少档）
+    //   rampSteps > 0 → 先把 NdotL 量化成这么多档，再采
+    //                   （避免贴图被线性采样插成连续渐变 —— 那就不叫
+    //                    赛璐璐了。量化后采样点落在每个色带的中心。）
+    Texture* rampMap = nullptr;
+    float rampSteps = 0.0f;
+
+    // MatCap 球面高光（眼睛、发丝、金属小件）。
+    // 按**视图空间法线**的 xy 当 UV 采样 —— 于是高光"贴在物体身上"
+    // 而不是随光源动，这正是二次元想要的：眼睛的高光不该因为角色转身
+    // 就消失。matcapRotate 用来把高光转到美术想要的那个角度。
+    Texture* matcapMap = nullptr;
+    float matcapStrength = 0.0f;   // 0 = 不参与（缺省）
+    float matcapRotate = 0.0f;     // 弧度
+
+    // 面部 SDF 阴影图（左右对称的一张图，只读 R）。
+    // 与"用法线算阴影"的本质区别：法线算出来的明暗交界线会跟着脸的
+    // 几何抖，而 SDF 图里的交界是由**美术画的曲线**决定的 —— 二次元
+    // 脸上那条干净的鼻影就是这么来的。**缺省白 = 处处受光**。
+    //
+    // ⚠ 现在还只是通道打通 + 乘法调制，完整的算法（按头部空间算投影
+    //   方向、UV 要和头部 unwrap 对齐）是下一刀的事 —— 见 §11.9。
+    Texture* sdfShadowMap = nullptr;
+    float sdfShadowStrength = 1.0f;
+
+    // 细节/贴花（腮红、纹身、衣服印花）。**相乘**调制 albedo，
+    // detailTiling 控制平铺次数。缺省白 → 乘法恒等。
+    Texture* detailMap = nullptr;
+    float detailStrength = 1.0f;
+    float detailTiling = 1.0f;
+
     // glTF 双面标记（当前管线仍按背面剔除处理，留作扩展）
     bool doubleSided = false;
 
@@ -171,13 +294,13 @@ struct Material {
     // ============================================================
     // 可覆盖字段的参数集（W1 的位掩码就是这个字段序）
     //
-    // 把「12 个可被实例覆盖 / 被存档记录的标量字段」收成一个可拷贝的
+    // 把「可被实例覆盖 / 被存档记录的标量字段」收成一个可拷贝的
     // 结构，是为了三件事共用一份定义：
     //   · W0-3：导入模型的材质，靠它算出"用户到底改过哪几个字段"
     //   · W1-1：实例的 `overridden` 位掩码（位序写死在下面）
     //   · W1-2：母材质变更时按位刷新未覆盖字段
     //
-    // ⚠ 纹理槽（7 个）**不进参数集**：换纹理是"结构变化"，
+    // ⚠ 纹理槽（11 个）**不进参数集**：换纹理是"结构变化"，
     //   一律视为覆盖（见 kOvAllTextures），不进位掩码。
     // ============================================================
     struct Params {
@@ -193,6 +316,16 @@ struct Material {
         ShadingModel shadingModel = ShadingModel::Default;
         bool doubleSided = false;
         float heightScale = 0.05f;
+        // P0-2/B：渲染顺序（2026-10-25 追加，位序 12/13）
+        std::int32_t renderQueue = 2000;
+        std::int32_t sortOrder = 0;
+        // A 类语义槽的六个标量（2026-10-25，位序 14..19）
+        float rampSteps = 0.0f;
+        float matcapStrength = 0.0f;
+        float matcapRotate = 0.0f;
+        float sdfShadowStrength = 1.0f;
+        float detailStrength = 1.0f;
+        float detailTiling = 1.0f;
     };
 
     // 位序（W1-1）—— ⚠ 一旦发布就不能改：存档里是裸数字。
@@ -210,7 +343,23 @@ struct Material {
         kOvShadingModel = 1u << 9,
         kOvDoubleSided = 1u << 10,
         kOvHeightScale = 1u << 11,
-        kOvScalarMask  = (1u << 12) - 1u,
+        // ---- 12/13（2026-10-25 追加，P0-2/B 渲染顺序）----
+        // 追加而不插队：存档里是裸数字，插队等于把所有旧存档的
+        // heightScale 之后全部错位。这条纪律见文件上方的位序说明。
+        kOvRenderQueue = 1u << 12,
+        kOvSortOrder   = 1u << 13,
+        // ---- 14..19（2026-10-25 追加，A 类语义槽的标量）----
+        // 同样追加不插队。这六个字段是"每角色一套画风"的旋钮，
+        // 必须能被 .vmat 共享、被实例覆盖，所以必须进位掩码。
+        // ⚠ 纹理槽不进这里（换纹理是结构变化，一律视为覆盖），
+        //   所以四个新贴图槽**没有**对应的位 —— 与已有的 7 个槽一致。
+        kOvRampSteps         = 1u << 14,
+        kOvMatcapStrength    = 1u << 15,
+        kOvMatcapRotate      = 1u << 16,
+        kOvSdfShadowStrength = 1u << 17,
+        kOvDetailStrength    = 1u << 18,
+        kOvDetailTiling      = 1u << 19,
+        kOvScalarMask  = (1u << 20) - 1u,
     };
 
     // 取当前参数 / 写回参数
@@ -228,6 +377,14 @@ struct Material {
         p.shadingModel = shadingModel;
         p.doubleSided = doubleSided;
         p.heightScale = heightScale;
+        p.renderQueue = renderQueue;
+        p.sortOrder = sortOrder;
+        p.rampSteps = rampSteps;
+        p.matcapStrength = matcapStrength;
+        p.matcapRotate = matcapRotate;
+        p.sdfShadowStrength = sdfShadowStrength;
+        p.detailStrength = detailStrength;
+        p.detailTiling = detailTiling;
         return p;
     }
     void applyParams(const Params& p) {
@@ -243,6 +400,14 @@ struct Material {
         shadingModel = p.shadingModel;
         doubleSided = p.doubleSided;
         heightScale = p.heightScale;
+        renderQueue = p.renderQueue;
+        sortOrder = p.sortOrder;
+        rampSteps = p.rampSteps;
+        matcapStrength = p.matcapStrength;
+        matcapRotate = p.matcapRotate;
+        sdfShadowStrength = p.sdfShadowStrength;
+        detailStrength = p.detailStrength;
+        detailTiling = p.detailTiling;
     }
 
     // 逐字段比较，返回"不同的那几位"（0 = 完全一致）。
@@ -268,6 +433,14 @@ struct Material {
         if (a.shadingModel != b.shadingModel) d |= kOvShadingModel;
         if (a.doubleSided != b.doubleSided) d |= kOvDoubleSided;
         if (a.heightScale != b.heightScale) d |= kOvHeightScale;
+        if (a.renderQueue != b.renderQueue) d |= kOvRenderQueue;
+        if (a.sortOrder != b.sortOrder) d |= kOvSortOrder;
+        if (a.rampSteps != b.rampSteps) d |= kOvRampSteps;
+        if (a.matcapStrength != b.matcapStrength) d |= kOvMatcapStrength;
+        if (a.matcapRotate != b.matcapRotate) d |= kOvMatcapRotate;
+        if (a.sdfShadowStrength != b.sdfShadowStrength) d |= kOvSdfShadowStrength;
+        if (a.detailStrength != b.detailStrength) d |= kOvDetailStrength;
+        if (a.detailTiling != b.detailTiling) d |= kOvDetailTiling;
         return d;
     }
     // 按位把 b 的字段刷进 a（用于母材质变更传播 / 读档应用 overrides）
@@ -284,6 +457,14 @@ struct Material {
         if (bits & kOvShadingModel) a.shadingModel = b.shadingModel;
         if (bits & kOvDoubleSided) a.doubleSided = b.doubleSided;
         if (bits & kOvHeightScale) a.heightScale = b.heightScale;
+        if (bits & kOvRenderQueue) a.renderQueue = b.renderQueue;
+        if (bits & kOvSortOrder) a.sortOrder = b.sortOrder;
+        if (bits & kOvRampSteps) a.rampSteps = b.rampSteps;
+        if (bits & kOvMatcapStrength) a.matcapStrength = b.matcapStrength;
+        if (bits & kOvMatcapRotate) a.matcapRotate = b.matcapRotate;
+        if (bits & kOvSdfShadowStrength) a.sdfShadowStrength = b.sdfShadowStrength;
+        if (bits & kOvDetailStrength) a.detailStrength = b.detailStrength;
+        if (bits & kOvDetailTiling) a.detailTiling = b.detailTiling;
     }
 
     // ---- 导入快照（W0-3）----

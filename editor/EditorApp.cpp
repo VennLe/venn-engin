@@ -2273,6 +2273,10 @@ void EditorApp::runPlayers(float dt) {
             }
             pc->velocityZ = v0;
             pc->onGround = false;
+            // 状态机的 `Jump` trigger（A2b）。放在这里而不是"检测 onGround
+            // 变 false"：走下台阶也是 onGround 变 false，那会把踏空当起跳。
+            if (auto* anJump = w.get<ecs::AnimatorComponent>(e))
+                anJump->triggerParams["Jump"] = true;
             // 锚点带上理论高度：0.70 m 是人能跳的高度，1.3 m 是"游戏里好看
             // 但不真实"的高度。用户明确要求"符合实际"，所以这个数要能查。
             VK_LOG_INFO("EDIT-JUMP v0=%.2f expectH=%.2fm airtime=%.2fs",
@@ -2427,10 +2431,22 @@ void EditorApp::runPlayers(float dt) {
                                                 tc->position.y - posBefore.y)) /
                               dt
                         : 0.0f;
-                animation::updateLocomotion(
-                    m_playerLoco[e.id], *sk, w.get<ecs::AnimatorComponent>(e),
-                    *sk->model->skeleton, hs, pc->onGround, pc->moveSpeed,
-                    dt, cfg, "EDIT");
+                // 状态机（A2b）：配了控制器 → 喂参数 + 让位给状态机。
+                // 参数名约定与运行时**完全一致**（Speed / Grounded / Jump），
+                // 否则同一份 `.anim.json` 在编辑器里和出包后表现不同 ——
+                // 那是最难查的一类（"编辑器里好好的，打包就不对"）。
+                //
+                // ⚠ 用 if/else 而不是 `continue`：这一段后面还有相机更新，
+                //   `continue` 会把相机一起跳过（画面卡住但动画正常）。
+                auto* an2 = w.get<ecs::AnimatorComponent>(e);
+                if (an2 && !an2->controllerPath.empty()) {
+                    an2->floatParams["Speed"] = hs;
+                    an2->boolParams["Grounded"] = pc->onGround;
+                } else {
+                    animation::updateLocomotion(
+                        m_playerLoco[e.id], *sk, an2, *sk->model->skeleton, hs,
+                        pc->onGround, pc->moveSpeed, dt, cfg, "EDIT");
+                }
             }
         }
 
@@ -5392,17 +5408,21 @@ void EditorApp::drawStatsPanel() {
                         r.depthPrePipelines().created(), rs.variantSwitches);
 
             std::string vars, tip;
-            for (uint32_t m = 0; m <= render::kKeywordAll; ++m) {
-                if (rs.variantCounts[m] == 0) continue;
+            // 稀疏表遍历（见 RenderStats::variantCounts）——
+            // 原来的 `for m <= kKeywordAll` 在位宽增长后会变成扫几百个空槽，
+            // 而且用 `variantCounts[m]` 当下标数组的写法本身就不再成立。
+            for (uint32_t i = 0; i < rs.variantSlotCount; ++i) {
+                const render::VariantSlot& slot = rs.variantCounts[i];
+                if (slot.count == 0) continue;
                 char buf[24];
                 std::snprintf(buf, sizeof(buf), "%sk%u:%u",
-                              vars.empty() ? "" : " ", m, rs.variantCounts[m]);
+                              vars.empty() ? "" : " ", slot.mask, slot.count);
                 vars += buf;
 
                 char tbuf[96];
-                std::snprintf(tbuf, sizeof(tbuf), "k%u  %s  x%u\n", m,
-                              render::keywordNames(m).c_str(),
-                              rs.variantCounts[m]);
+                std::snprintf(tbuf, sizeof(tbuf), "k%u  %s  x%u\n", slot.mask,
+                              render::keywordNames(slot.mask).c_str(),
+                              slot.count);
                 tip += tbuf;
             }
             ImGui::TextDisabled(TR("%s"), vars.empty() ? TR("(no forward variant draws this frame)")
@@ -5411,7 +5431,7 @@ void EditorApp::drawStatsPanel() {
             if (!tip.empty() && ImGui::IsItemHovered()) {
                 ImGui::SetTooltip(TR("Objects drawn per forward variant this frame:\n%s"
                                   "\nbit0 double-sided / bit1 alpha-blend / "
-                                  "bit2 normal-map"), tip.c_str());
+                                  "bit2 normal-map / bit6 toon"), tip.c_str());
             }
 
             // 强制掩码：对照实验留下的印记。非 -1 时画面是被"篡改"过的，
@@ -6456,6 +6476,277 @@ void EditorApp::registerConsoleCommands() {
                         static_cast<double>(sk->time));
             return "clip=" + sk->clipName;
         });
+    // ---- 表情滑条（§15）----
+    //
+    // 与 Inspector 里的滑条**同一条路**：都调 `assets::setMorphWeight`
+    // → 写 `MorphComponent::weights` → Renderer 每帧求值 → GPU 形变。
+    // 所以这条命令能跑通，等于证明面板上的滑条也能跑通。
+    //
+    // 为什么必须按**名字**：`MorphRig` 的通道表是"跨材质桶合并后的唯一
+    // 名字"，下标是建表顺序（重烤就会变）。按下标驱动等于把脚本绑死在
+    // 某一次烤制的内部排序上。
+    //
+    // 用法：morph.set <channel> <weight> [entityName]
+    //       morph.list [entityName]
+    con->addCommand("morph.set",
+        "morph.set <channel> <weight> [name]  drive one blend-shape slider",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 3) return "usage: morph.set <channel> <weight> [name]";
+            ecs::Entity e = (args.size() > 3)
+                                ? m_ctx->activeScene().find(args[3])
+                                : m_ctx->selection();
+            if (!e.valid()) {
+                VK_LOG_WARN("MORPH-SET ok=0 reason=no-entity");
+                return "no entity";
+            }
+            auto* mp = m_ctx->activeScene().world().get<ecs::MorphComponent>(e);
+            if (!mp || !mp->model) {
+                VK_LOG_WARN("MORPH-SET ok=0 reason=no-component entity=%u",
+                            static_cast<unsigned>(e.id));
+                return "no MorphComponent";
+            }
+            const std::size_t n = mp->model->morphRig.channelCount();
+            float w = 0.0f;
+            try {
+                w = std::stof(args[2]);
+            } catch (...) {
+                VK_LOG_WARN("MORPH-SET ok=0 reason=bad-weight '%s'",
+                            args[2].c_str());
+                return "bad weight: " + args[2];
+            }
+            // 通道名不存在时**不要**静默当成功：`setMorphWeight` 返回
+            // false，这里把它变成一条 ok=0 的日志 + 一条 fmt，自动化才能
+            // 区分"名字写错了"和"形变没生效"。
+            if (!assets::setMorphWeight(mp->model->morphRig, mp->weights,
+                                        args[1], w)) {
+                VK_LOG_WARN("MORPH-SET ok=0 reason=unknown-channel '%s' "
+                            "entity=%u channels=%zu",
+                            args[1].c_str(), static_cast<unsigned>(e.id), n);
+                return "unknown channel: " + args[1];
+            }
+            VK_LOG_INFO("MORPH-SET ok=1 entity=%u channel=%s w=%.3f channels=%zu",
+                        static_cast<unsigned>(e.id), args[1].c_str(),
+                        static_cast<double>(w), n);
+            return args[1] + "=" + args[2];
+        });
+    con->addCommand("morph.list",
+        "morph.list [name]  print the blend-shape channels of a model",
+        [this](const std::vector<std::string>& args) -> std::string {
+            ecs::Entity e = (args.size() > 1)
+                                ? m_ctx->activeScene().find(args[1])
+                                : m_ctx->selection();
+            if (!e.valid()) return "no entity";
+            auto* mp = m_ctx->activeScene().world().get<ecs::MorphComponent>(e);
+            if (!mp || !mp->model) return "no MorphComponent";
+            std::string out;
+            for (std::size_t c = 0; c < mp->model->morphRig.channelCount(); ++c) {
+                if (c) out += " ";
+                out += mp->model->morphRig.channels()[c].name;
+            }
+            VK_LOG_INFO("MORPH-LIST entity=%u n=%zu %s",
+                        static_cast<unsigned>(e.id),
+                        mp->model->morphRig.channelCount(), out.c_str());
+            return out;
+        });
+
+    // ---- 两骨 IK / 骨骼挂点（第八刀，2026-10-25）----
+    //
+    // 为什么这两个功能**必须**有控制台入口："IK 生效了"在截图上不可见
+    // —— 脚踝离地面 2cm 和 20cm 在 1080p 里是同一只脚，而后者毁掉整段
+    // 走路。所以自动化只能靠 `IK-SET` / `ANIM-IK` 这两条数值锚点。
+    //
+    // ⚠ target 是 **glTF 场景空间**（Y-up），不是引擎的 Z-up 世界空间。
+    //   与 `Pose` / `LookAt::target` 同一套坐标。
+    con->addCommand("ik.set",
+        "ik.set <x> <y> <z> [name]  aim the two-bone IK target (glTF space)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 4) return "usage: ik.set <x> <y> <z> [name]";
+            ecs::Entity e = (args.size() > 4)
+                                ? m_ctx->activeScene().find(args[4])
+                                : m_ctx->selection();
+            if (!e.valid()) {
+                VK_LOG_WARN("IK-SET ok=0 reason=no-entity");
+                return "no entity";
+            }
+            auto* ik =
+                m_ctx->activeScene().world().get<ecs::TwoBoneIKComponent>(e);
+            // 没有组件就**建一个**，而不是报错。理由：`ik.set` 是自动化与
+            // 手敲命令的入口，"先加组件再设目标"两步会让脚本里多一条没信息量
+            // 的命令，而手工用户点 Inspector 那条路本来就有按钮。
+            // 走的仍是 structuralEdit —— 一次拖拽/一条命令 = 一步撤销。
+            int created = 0;
+            if (!ik) {
+                m_ctx->structuralEdit("Add Two Bone IK", [this, e]() {
+                    ecs::TwoBoneIKComponent c;
+                    m_ctx->activeScene().world().add<ecs::TwoBoneIKComponent>(e, c);
+                });
+                ik = m_ctx->activeScene().world().get<ecs::TwoBoneIKComponent>(e);
+                created = 1;
+            }
+            if (!ik) {
+                VK_LOG_WARN("IK-SET ok=0 reason=cannot-create entity=%u",
+                            static_cast<unsigned>(e.id));
+                return "cannot create TwoBoneIKComponent";
+            }
+            glm::vec3 t = ik->settings.target;
+            try {
+                t.x = std::stof(args[1]);
+                t.y = std::stof(args[2]);
+                t.z = std::stof(args[3]);
+            } catch (...) {
+                VK_LOG_WARN("IK-SET ok=0 reason=bad-target '%s,%s,%s'",
+                            args[1].c_str(), args[2].c_str(), args[3].c_str());
+                return "bad target";
+            }
+            ik->settings.target = t;
+            ik->settings.hasTarget = true;
+
+            // 顺手把**链解析**的结果打进日志：组件在、但链不成立时症状是
+            // "腿一动不动"，没有这条就只能靠猜是名字错了还是拓扑错了。
+            int resolved = 0;
+            std::string chain;
+            const auto* sk = m_ctx->activeScene()
+                                 .world()
+                                 .get<ecs::SkinnedMeshComponent>(e);
+            if (sk && sk->model && sk->model->skeleton) {
+                const assets::Skeleton& skel = *sk->model->skeleton;
+                const animation::TwoBoneIKChain ch =
+                    animation::resolveTwoBoneChain(skel, ik->settings);
+                if (ch.valid()) {
+                    resolved = 1;
+                    chain = skel.joints[static_cast<size_t>(ch.root)].name + ">" +
+                            skel.joints[static_cast<size_t>(ch.mid)].name + ">" +
+                            skel.joints[static_cast<size_t>(ch.end)].name;
+                }
+            }
+            VK_LOG_INFO("IK-SET ok=1 entity=%u target=%.3f,%.3f,%.3f "
+                        "resolved=%d chain=[%s] weight=%.2f created=%d",
+                        static_cast<unsigned>(e.id),
+                        static_cast<double>(t.x), static_cast<double>(t.y),
+                        static_cast<double>(t.z), resolved, chain.c_str(),
+                        static_cast<double>(ik->settings.weight), created);
+            m_ctx->dirty() = true;
+            return resolved ? ("chain=" + chain) : "target set (chain unresolved)";
+        });
+    con->addCommand("ik.weight",
+        "ik.weight <0..1> [name]  set the IK blend weight",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: ik.weight <0..1> [name]";
+            ecs::Entity e = (args.size() > 2)
+                                ? m_ctx->activeScene().find(args[2])
+                                : m_ctx->selection();
+            if (!e.valid()) return "no entity";
+            auto* ik =
+                m_ctx->activeScene().world().get<ecs::TwoBoneIKComponent>(e);
+            if (!ik) return "no TwoBoneIKComponent";
+            float w = 1.0f;
+            try {
+                w = std::stof(args[1]);
+            } catch (...) {
+                return "bad weight: " + args[1];
+            }
+            ik->settings.weight = w;
+            VK_LOG_INFO("IK-WEIGHT entity=%u weight=%.3f",
+                        static_cast<unsigned>(e.id), static_cast<double>(w));
+            m_ctx->dirty() = true;
+            return args[1];
+        });
+    con->addCommand("ik.list",
+        "ik.list [name]  print the resolved IK chain and its settings",
+        [this](const std::vector<std::string>& args) -> std::string {
+            ecs::Entity e = (args.size() > 1)
+                                ? m_ctx->activeScene().find(args[1])
+                                : m_ctx->selection();
+            if (!e.valid()) return "no entity";
+            const auto* sk = m_ctx->activeScene()
+                                 .world()
+                                 .get<ecs::SkinnedMeshComponent>(e);
+            auto* ik =
+                m_ctx->activeScene().world().get<ecs::TwoBoneIKComponent>(e);
+            // 没组件也照样解析一遍（用默认 settings）—— 这一条是"探路"用的：
+            // 拿到一个不认识的资产时，先 `ik.list` 看自动挑中的是哪三根骨，
+            // 再决定要不要手填名字。组件缺失时不能只回一句 no-component。
+            const animation::TwoBoneIKSettings def;
+            const animation::TwoBoneIKSettings& s = ik ? ik->settings : def;
+            int root = -1, mid = -1, end = -1;
+            std::string names;
+            if (sk && sk->model && sk->model->skeleton) {
+                const assets::Skeleton& skel = *sk->model->skeleton;
+                const auto ch = animation::resolveTwoBoneChain(skel, s);
+                root = ch.root;
+                mid = ch.mid;
+                end = ch.end;
+                if (ch.valid()) {
+                    names = skel.joints[static_cast<size_t>(ch.root)].name +
+                            ">" + skel.joints[static_cast<size_t>(ch.mid)].name +
+                            ">" + skel.joints[static_cast<size_t>(ch.end)].name;
+                }
+            }
+            VK_LOG_INFO("IK-LIST entity=%u hasComponent=%d root=%d mid=%d end=%d "
+                        "chain=[%s] hasTarget=%d weight=%.2f enabled=%d",
+                        static_cast<unsigned>(e.id), ik ? 1 : 0, root, mid, end,
+                        names.c_str(), s.hasTarget ? 1 : 0,
+                        static_cast<double>(s.weight), s.enabled ? 1 : 0);
+            return names.empty() ? std::string("chain unresolved")
+                                 : ("chain=" + names);
+        });
+    // 挂点。宿主按**名字**引用（实体 id 是运行时序号，进存档不稳定）。
+    con->addCommand("attach.bind",
+        "attach.bind <host> <bone> [child]  pin an object to a bone of <host>",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 3)
+                return "usage: attach.bind <host> <bone> [child]";
+            ecs::Entity host = m_ctx->activeScene().find(args[1]);
+            if (!host.valid()) {
+                VK_LOG_WARN("ATTACH-BIND ok=0 reason=no-host '%s'",
+                            args[1].c_str());
+                return "no host: " + args[1];
+            }
+            ecs::Entity child = (args.size() > 3)
+                                    ? m_ctx->activeScene().find(args[3])
+                                    : m_ctx->selection();
+            if (!child.valid()) {
+                VK_LOG_WARN("ATTACH-BIND ok=0 reason=no-child");
+                return "no child entity";
+            }
+            // 先解析一遍再决定日志里的 resolved —— 绑上去之后才发现骨名
+            // 打错的话，画面上的表现是"这个物体一动不动"，与"没绑定"一样。
+            int resolved = 0;
+            int joint = -1;
+            const auto* sk =
+                m_ctx->activeScene().world().get<ecs::SkinnedMeshComponent>(host);
+            if (sk && sk->model && sk->model->skeleton) {
+                joint = sk->model->skeleton->findJoint(args[2],
+                                                       assets::kJointMatchDefault);
+                resolved = (joint >= 0) ? 1 : 0;
+            }
+            const std::string hostName = args[1];
+            const std::string boneName = args[2];
+            m_ctx->structuralEdit("Bind Bone Attachment",
+                                  [this, child, hostName, boneName]() {
+                                      auto& w = m_ctx->activeScene().world();
+                                      if (auto* p =
+                                              w.get<ecs::BoneAttachmentComponent>(
+                                                  child)) {
+                                          p->hostName = hostName;
+                                          p->boneName = boneName;
+                                          p->enabled = true;
+                                      } else {
+                                          ecs::BoneAttachmentComponent c;
+                                          c.hostName = hostName;
+                                          c.boneName = boneName;
+                                          w.add<ecs::BoneAttachmentComponent>(
+                                              child, c);
+                                      }
+                                  });
+            VK_LOG_INFO("ATTACH-BIND ok=1 child=%u host=[%s] bone=[%s] "
+                        "joint=%d resolved=%d",
+                        static_cast<unsigned>(child.id), hostName.c_str(),
+                        boneName.c_str(), joint, resolved);
+            return resolved ? ("bound to " + boneName)
+                            : ("bound but bone NOT found: " + boneName);
+        });
+
     // 存盘（角色链 A0-2 的自动化入口）。快捷键 Ctrl+S 走同一条
     // saveSceneNow()，所以这不算"测试专用路径"，只是给脚本一个入口。
     con->addCommand("scene.save", "scene.save  save the current scene to its path",

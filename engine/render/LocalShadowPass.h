@@ -30,11 +30,13 @@
 // 本 Pass 不持有 set 0：贴图由 Renderer 绑到 set 0 / binding 12。
 // ============================================================
 
+#include "ecs/Entity.h"      // MorphSlotFn 的入参，30 行、只依赖 <cstdint>
 #include "render/RenderTypes.h"
 #include "rhi/VulkanCommon.h"
 
 #include <glm/glm.hpp>
 
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -105,9 +107,13 @@ public:
     //   clip == nullptr → 本层未使用：只清深度，不提交几何。
     // 蒙皮网格的 jointBase 由 pass 自己按实体沿父链取（逐实体，见
     // SkinnedMeshComponent::jointBase）。
+    // morph 槽位提供者（§15）。语义与 ShadowPass 的同名回调完全一致 ——
+    // 两个 pass 共用 shadow.vert，形变必须用同一套数据。
+    using MorphSlotFn = std::function<std::uint32_t(scene::Scene&, ecs::Entity,
+                                                    const assets::Mesh&)>;
     void render(VkCommandBuffer cmd, scene::Scene& scene,
                 VkDescriptorSet frameSet, uint32_t frameIndex, uint32_t layer,
-                const glm::mat4* clip);
+                const glm::mat4* clip, MorphSlotFn morphSlot = {});
 
     // 本帧第 layer 层的提交统计（验证脚本用：证明剔除真的在省）
     uint32_t submitted(uint32_t layer) const;

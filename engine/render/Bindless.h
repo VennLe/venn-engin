@@ -41,6 +41,7 @@
 
 #include <glm/glm.hpp>
 
+#include <cstddef>   // offsetof（材质页的布局断言）
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -67,13 +68,60 @@ namespace render {
 // （见 render/RenderTypes.h 的 PushConstants）。这样从旧路径切过来时，
 // 所有参与 PBR 计算的浮点数还是那同一份值 —— "开 = 关"的逐像素对照
 // 才可能是严格相等的。
+//
+// ------------------------------------------------------------
+// 32 B → 96 B（A 类槽位，2026-10-25）
+//
+// **为什么必须扩容、而不是再加一张贴图到 set 里**：三条 GPU 通道在
+// 32B 时代就已经全部占满了 ——
+//   · PushConstants 恰好 128 B（Vulkan 保证的下限），唯一空位
+//     `emissive.w` 已被页号占用；
+//   · 纹理 set 用满 7 个，加上 set0 正好等于 maxBoundDescriptorSets
+//     的规范下限 8；
+//   · 非 bindless 路径在结构上已经封死。
+// 所以二次元的四个语义槽（ramp / matcap / SDF 阴影 / 贴花）只能进页表。
+//
+// **为什么一次到 96 B 而不是先加 16 B**：页表格式一变，`pbr.frag` 的
+// std430 结构、C++ 结构、以及任何未来的读端都要同步；分批加就是分批
+// 改同一处。审计文档已经算过账：96 B × 4096 页 × 2 槽 = 768 KB，
+// 对显存不是问题，对"改一次改对"是。
+//
+// **语义槽而不是通用层栈**：这里刻意不做"任意层数的材质层栈"。
+// 层栈要每层一个变换/混合模式/UV 集，页表会变成不定长结构 + 二级
+// 索引，而二次元真正需要的只有**固定的那几件**。固定语义槽的另一个
+// 好处是着色器里可以直接写 `#define matcapMap textures[...]`。
 // ============================================================
 struct GpuMaterialPage {
-    glm::uvec4 tex0{0}; // x=albedo y=normal z=ORM w=roughness
-    glm::uvec4 tex1{0}; // x=metallic y=emissive z=height(R4-3 POM)
+    // ---- 前 32 B：与 32 B 时代**逐字节相同** ----
+    // 语义不变是刻意的：非 bindless 路径、老资产、以及"关 = 基线"的
+    // 逐像素对照都依赖这段布局没有动过。
+    glm::uvec4 tex0{0};  // 0  x=albedo y=normal z=ORM w=roughness
+    glm::uvec4 tex1{0};  // 16 x=metallic y=emissive z=height(R4-3 POM)
+                         //    w=ramp（原来是空位，A 类第一个落点）
+
+    // ---- 32 B ~ 48 B：A 类新增的三个语义槽 ----
+    glm::uvec4 tex2{0};  // 32 x=matcap y=sdfShadow z=detail w=(预留)
+
+    // ---- 48 B ~ 96 B：逐材质标量 ----
+    // push 常量已经满了，所以**这是全引擎唯一能放逐材质浮点的地方**。
+    // 它们不能走关键字变体：ramp 档数/强度是美术每帧都要调的连续量。
+    glm::vec4 params{0};   // 48 x=rampSteps y=matcapStrength
+                           //    z=sdfShadowStrength w=detailStrength
+    glm::vec4 params2{0};  // 64 x=detailTiling y=matcapRotate z/w=(预留)
+    // 80 B ~ 96 B：整块预留，给下一刀（形态键权重基址 / 分层遮罩）。
+    // 留白是**在页表格式上**留的：真的到了那天只要往里填，不必再动
+    // std430 结构、不必再改一次 pbr.frag 的声明。
+    glm::uvec4 spare{0};  // 80
 };
-static_assert(sizeof(GpuMaterialPage) == 32,
-              "GpuMaterialPage 必须与着色器里的 std430 布局一致（两个 uvec4）");
+static_assert(sizeof(GpuMaterialPage) == 96,
+              "GpuMaterialPage 必须与 pbr.frag 的 std430 布局一致（6 × 16B）");
+static_assert(offsetof(GpuMaterialPage, tex1) == 16 &&
+                  offsetof(GpuMaterialPage, tex2) == 32 &&
+                  offsetof(GpuMaterialPage, params) == 48 &&
+                  offsetof(GpuMaterialPage, params2) == 64 &&
+                  offsetof(GpuMaterialPage, spare) == 80,
+              "偏移必须逐 16B 对齐 —— std430 的 vec4 对齐规则，"
+              "差 4 字节就是采样到别的贴图（不报错的那种错）");
 
 struct BindlessStats {
     uint32_t textures = 0;        // 已注册纹理数（本帧累计，只增不减）
@@ -90,7 +138,9 @@ public:
     // —— 少数驱动（尤其集显）这个上限只有 128/256，硬写 4096 会让
     // vkCreateDescriptorSetLayout 直接崩。查到的容量写进 stats().maxTextures。
     static constexpr uint32_t kMaxTextures = 4096;
-    // 每帧槽的材质页容量。4096 页 × 32 B × 2 槽 = 256 KB，一次分到底。
+    // 每帧槽的材质页容量。4096 页 × 96 B × 2 槽 = 768 KB，一次分到底。
+    // 页表是 HOST_VISIBLE + 常驻映射的，扩容只影响这块缓冲的大小，
+    // 不影响分配/上传路径（见 Bindless.cpp 的 materialPage）。
     static constexpr uint32_t kMaxMaterialPages = 4096;
 
     BindlessTextures() = default;

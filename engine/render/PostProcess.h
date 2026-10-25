@@ -121,6 +121,26 @@ struct PostSettings {
     float drsMinScale = 0.5f;
     float drsMaxScale = 1.0f;
     float drsSharpness = 0.6f;
+
+    // ---- 描边（NPR，2026-10-25）----
+    // 数据来源是**深度预通道的几何缓冲**（世界法线 + 线性距离），
+    // 不是另画一遍外壳。判据两路取 max：
+    //   深度边缘 —— 相邻像素的相对距离差（|d0-d1|/min(d0,d1)）
+    //   法线边缘 —— 1 - dot(n0,n1)
+    // 相对深度差的意义：同一个阈值在 1 米和 50 米处效果一致。用绝对差
+    // 的话，"贴着镜头描边粗成一团、远处完全没有"。
+    //
+    // 关闭（默认）→ 合成走与引入前**逐像素相同**的路径（回归基线）。
+    // 这也是"关功能必须回到基线"这条纪律的可断言版本。
+    bool  outline = false;
+    float outlineWidth = 1.5f;        // 采样步长（渲染分辨率下的像素）
+    // 默认 0.05 而不是 0.02：**相对**深度差在掠射角的大平面上并不接近 0
+    // （看地面时相邻像素的距离差与距离成正比，相对差是个常数）。
+    // 0.02 会把远处地面的一堆像素点判成边缘 → 画面上一层"星点"。
+    float outlineDepthThreshold = 0.05f;   // 相对深度差阈值
+    float outlineNormalThreshold = 0.35f;  // 1-dot 阈值（≈ 49°）
+    float outlineStrength = 1.0f;     // 线的不透明度（0 = 不压暗）
+    float outlineColor[3] = {0.06f, 0.05f, 0.08f};  // 线的颜色（显示域）
 };
 
 // 由"输出分辨率"与缩放比算出"场景渲染分辨率"。
@@ -154,13 +174,22 @@ public:
     //   swapchainViews / swapchainExtent：交换链（UI 与模式 A 的场景输出）
     //   hdrColorViews                   ：HdrTarget 的 resolve 视图（每帧一张）
     //   viewportExtent                  ：{0,0} = 模式 A；否则模式 B 的离屏尺寸
+    //   geometryViews                   ：HdrTarget 的几何缓冲视图（法线+线性
+    //                                     深度，每帧一张）。**空 = 没有描边输入**
+    //                                     —— 合成里描边整段跳过，画面与引入
+    //                                     描边之前逐像素相同（回归基线）。
     void recreate(const std::vector<VkImageView>& swapchainViews,
                   VkExtent2D swapchainExtent,
                   const std::vector<VkImageView>& hdrColorViews,
-                  VkExtent2D viewportExtent);
+                  VkExtent2D viewportExtent,
+                  const std::vector<VkImageView>& geometryViews = {});
 
     // 是否处于"场景 → 离屏图"模式（编辑器视口）
     bool offscreen() const { return m_splitOutput; }
+    // 描边输入是否就绪（几何缓冲的每帧视图都拿到了）。
+    // 诊断用：面板上画着"描边已开"但这条是 false 的话，说明几何缓冲没接上
+    // —— 那是最难查的一类（开关亮着、画面没线、日志无错）。
+    bool outlineReady() const { return !m_geoSets.empty() && m_geoSets[0] != VK_NULL_HANDLE; }
     // 场景渲染分辨率（**缩放后**；模式 A = 交换链尺寸 × renderScale，
     // 模式 B = 视口尺寸 × renderScale）。HdrTarget / 链 / bloom 都用它。
     VkExtent2D sceneExtent() const { return m_sceneExtent; }
@@ -317,7 +346,8 @@ private:
     void destroySceneOutputFrames();
     void createFxaaFrames();
     void destroyFxaaFrames();
-    void buildDescriptorSets(const std::vector<VkImageView>& hdrColorViews);
+    void buildDescriptorSets(const std::vector<VkImageView>& hdrColorViews,
+                             const std::vector<VkImageView>& geometryViews);
     void destroyDescriptors();
 
     // ---- 自动曝光的亮度测量链（R1-2）----
@@ -452,6 +482,9 @@ private:
 
     VkDescriptorSetLayout m_setLayout = VK_NULL_HANDLE;
     VkSampler m_sampler = VK_NULL_HANDLE;
+    // 几何缓冲（描边）专用的**最近邻**采样器 —— 深度/法线的边缘判据
+    // 不能用线性过滤（会把边缘插成中间值 → 双轮廓）。
+    VkSampler m_geoNearestSampler = VK_NULL_HANDLE;
 
     VkRenderPass m_bloomRenderPass = VK_NULL_HANDLE;
     VkRenderPass m_postRenderPass = VK_NULL_HANDLE;       // → 交换链（PRESENT_SRC）
@@ -482,6 +515,8 @@ private:
     std::vector<VkDescriptorSet> m_hdrSets;
     std::vector<VkDescriptorSet> m_bloomASets;
     std::vector<VkDescriptorSet> m_bloomBSets;
+    // 几何缓冲（set 3，描边输入）。空 = 没有输入，合成里描边整段跳过。
+    std::vector<VkDescriptorSet> m_geoSets;
     // FXAA 的输入集（指向 fxaa 中间图）
     std::vector<VkDescriptorSet> m_fxaaSets;
 

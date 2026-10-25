@@ -85,20 +85,12 @@ void samplePose(const assets::Skeleton& skel, const assets::AnimationClip* clip,
     }
 }
 
-void poseToJoints(const assets::Skeleton& skel, const Pose& pose,
-                  std::vector<glm::mat4>& out) {
+void poseToWorld(const assets::Skeleton& skel, const Pose& pose,
+                 std::vector<glm::mat4>& out) {
     const int n = skel.jointCount();
     const size_t un = static_cast<size_t>(n);
-    // 与拆分前一致：只有尺寸变了才重置（topoOrder 是全覆盖的，见
-    // FbxLoader / MeshLoader 末尾的兜底循环，所以不会读到上一帧的残留）。
     if (out.size() != un) out.assign(un, glm::mat4(1.0f));
     if (n == 0) return;
-
-    // 世界矩阵。放在**局部**缓冲里，不再用 static thread_local ——
-    // 嵌套调用（分层 / IK 里回采）不会再互相踩。
-    // （每个角色每帧一次 4KB 级的分配；A8 若量出这是热点，再往 Pose 里
-    //   挂一个复用缓冲，不要退回 thread_local。）
-    std::vector<glm::mat4> world(un, glm::mat4(1.0f));
 
     const int pn = pose.count();
     for (int j : skel.topoOrder) {
@@ -117,10 +109,25 @@ void poseToJoints(const assets::Skeleton& skel, const Pose& pose,
         }
 
         const glm::mat4 base = jt.parent >= 0
-                                   ? world[static_cast<size_t>(jt.parent)]
+                                   ? out[static_cast<size_t>(jt.parent)]
                                    : jt.externalChain;
-        world[k] = base * composeTRS(local);
+        out[k] = base * composeTRS(local);
     }
+}
+
+void poseToJoints(const assets::Skeleton& skel, const Pose& pose,
+                  std::vector<glm::mat4>& out) {
+    const int n = skel.jointCount();
+    const size_t un = static_cast<size_t>(n);
+    if (out.size() != un) out.assign(un, glm::mat4(1.0f));
+    if (n == 0) return;
+
+    // 世界矩阵。放在**局部**缓冲里，不再用 static thread_local ——
+    // 嵌套调用（分层 / IK 里回采）不会再互相踩。
+    // （每个角色每帧一次 4KB 级的分配；A8 若量出这是热点，再往 Pose 里
+    //   挂一个复用缓冲，不要退回 thread_local。）
+    std::vector<glm::mat4> world;
+    poseToWorld(skel, pose, world);
 
     for (size_t j = 0; j < un; ++j)
         out[j] = skel.invMeshNode * world[j] * skel.joints[j].invBind;

@@ -339,6 +339,24 @@ inline const LodChain* AssetManager::ensureLod(Mesh* base) {
         // （小道具、UI 图标这类东西减面反而更丑，省一次 CPU 减面）。
     } else if (src.kind == MeshSource::Kind::Builtin) {
         buildBuiltinLods(*base, src, *chain);
+    } else if (base->hasMorph()) {
+        // ============================================================
+        // 有 morph 的网格**不建 LOD 链**（§15）
+        // ============================================================
+        // LOD 各级是**独立减面出来的 Mesh**，它们没有 delta 流
+        // （`morphTargetCount() == 0`），`Model::subMeshIndexOf()` 也找不到
+        // 它们 —— 于是 `MorphComponent` 求值出来的权重没有落点，
+        // `DrawItem::morph.targets` 恒为 0，着色器里那道 `mi.z > 0` 的硬开关
+        // 直接关掉。症状是：一旦掉到低模，**几何/法线/UV 全对，只有脸不动**
+        // —— 静默失效，没有任何报错或日志，人眼要盯着角色走近才看得出来。
+        //
+        // 本可以做的补救是「把 delta 重定向到减面后的最近面上」，但那需要
+        // 在减面时建立「新顶点 → 原顶点集合」的反查表（聚类已经把原来的顶点
+        // 对应关系丢掉了），是一条独立的管线，不能顺手塞进这里。
+        // 在此之前，宁可不要 LOD —— 与上面蒙皮那一支同样的取舍：
+        // 多画几十万三角形是可接受的代价，让主角的脸静默定格不是。
+        VK_LOG_INFO("LOD-SKIP-MORPH '%s'（网格带 morph 偏移，不做自动减面，见 ensureLod 注释）",
+                    src.name.c_str());
     } else if (meshLooksSkinned(*base)) {
         // ============================================================
         // 蒙皮网格**不自动减面**（2026-10-24，事故修复）

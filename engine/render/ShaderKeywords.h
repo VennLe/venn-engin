@@ -12,12 +12,40 @@
 // 方案：**关键字（keyword）**。一个关键字 = 一个编译期开关：
 //   1. 着色器里用 `#if VENN_XXX` 包住那段代码；
 //   2. 构建期对每一种关键字组合，用 `glslc -DVENN_XXX=1` 各编一份 .spv
-//      （见 CMakeLists.txt 的 SHADER_KEYWORDS / SHADER_VARIANT_SHADERS）；
+//      （见 CMakeLists.txt 的"维度声明 → 白名单"一节）；
 //   3. 运行时把关键字组合压成一个位掩码（KeywordMask），按掩码去缓存里
 //      取管线；没有就惰性建一条（见 VariantPipelines）。
 //
 // 于是"加一个特性"从"再加一条管线 + 再补三处 if"变成：
 // 在下面的表里加一行、在着色器里加一段 #if。其余全自动。
+//
+// ------------------------------------------------------------
+// ⚠ 位宽 ≠ 组合数（2026-10-25 改造的核心）
+// ------------------------------------------------------------
+// 早期版本用 `foreach(MASK RANGE 0..1<<N)` 把 2^N 种组合**无条件全展开**，
+// 于是"加一个关键字就翻倍"。这在纯 PBR 时代没问题（6 位 = 64 份），
+// 但二次元渲染要加 Toon / ToonHair / ToonEye / FaceSDF 四个着色模型：
+//
+//   · 旧机制：9 位 = 512 组合 × 2 个 .spv 族 = 1024 份，约 80 MB
+//   · 新机制：Σ_模型(alpha 取值数 × 2^该模型特性数) ≈ 84 份 × 2 = 168 份
+//
+// 差别来自两个观察：
+//   ① 有些关键字**语义互斥** —— alphaMode 只能是 Opaque / Blend / Mask
+//      之一，"既 Blend 又 Mask"这个材质根本不存在，编它纯属浪费；
+//      同理 shadingModel 也只能五选一。
+//   ② 有些关键字**只对特定模型有意义** —— Parallax 视差贴图在 Toon 上
+//      没人用，Ramp 渐变贴图在 PBR 上也没人用。按模型裁剪特性集，组合数
+//      按"该模型允许的特性数"算，而不是按全局位数算。
+//
+// 所以：**位宽（下表的 kKeywordCount）与编译出的组合数是解耦的。**
+// 位宽只决定 KeywordMask 的位空间与 .spv 文件名里的数字；编哪几种组合
+// 由 CMakeLists.txt 的 GROUP_*/FEATURES_*/MODELS_* 声明决定。加模型时
+// 位宽 +1、组合数 +Σ(该模型)，线性增长而不是翻倍。
+//
+// 两处的**位序**仍然必须逐位一致（掩码值就是文件名里的数字，错一位就
+// 读不到文件）。这条一致性由下面的 static_assert 钉死：CMake 会把
+// `-DVENN_KEYWORD_COUNT=<它数的位数>` 传进来，两张表长度不同直接编译
+// 失败 —— 比等到运行时报"找不到变体着色器"早得多。
 //
 // ⚠ 关键字掩码同时决定**两组东西**，这也是它必须由掩码统一推导的原因：
 //   · 编进 .spv 的代码路径（NORMAL_MAP 少一次纹理采样 + 一次 TBN，
@@ -33,9 +61,23 @@
 //   bit 3  ALPHA_MASK    alpha 裁切：按 cutoff discard（或不 discard 时抖动）
 //   bit 4  SHADING_SKIN  预积分皮肤散射：漫反射项改查 (N·L, 曲率) LUT
 //   bit 5  PARALLAX      POM 视差遮挡贴图：UV 沿切线空间视向推开（R4-3）
+//   bit 6  SHADING_TOON  二次元赛璐璐：明暗交界二值化 + 冷色调阴影（A1）
+//   bit 7  OVERLAY       覆盖带：不写深度 + 深度测试恒通过（P0-2/B）
+//
+// ⚠ OVERLAY 是一个**纯状态位**：它不改变任何一行片元代码，只改管线固定
+//   状态（depthTest/depthWrite）。这类位由 kKeywordStateOnly 标出来，
+//   VariantPipelines 拼 .spv 文件名时会把它剔掉 —— 于是 60 份变体
+//   不用因为"想多一个深度状态"翻倍到 120 份。这是本文件头那段
+//   "位宽 ≠ 组合数"的第二个应用场景（第一个是白名单）。
 //
 // ⚠ 位序就是"规范化顺序"：变体 ID、.spv 文件名、GLSL 宏名全部按它排。
 //   调换位序等于换掉所有变体的身份，改之前先搜一遍 CMakeLists.txt。
+//
+// ⚠ SHADING_SKIN 与 SHADING_TOON 在**语义上互斥**（一个材质只能是其中
+//   一种着色模型），但既然两者各占一位，掩码空间里就存在"两位都置"的
+//   非法值。CMake 的白名单不会编它，运行时 keywordsOf() 也产不出它 ——
+//   这里保留两立的表示只是为了让 ShadingModel 枚举能一对一映射到位，
+//   不要在别处手工拼这种掩码。
 // ============================================================
 
 #include <cstdint>
@@ -64,10 +106,39 @@ enum ShaderKeyword : uint32_t {
     kKeywordShadingSkin = 1u << 4,
     // 材质挂了高度图：UV 先做视差遮挡贴图（POM）再采样其余贴图（R4-3）
     kKeywordParallax = 1u << 5,
+    // shadingModel == Toon：漫反射响应二值化（赛璐璐），阴影用冷色调（A1）
+    kKeywordShadingToon = 1u << 6,
+    // 覆盖带（P0-2/B）：renderQueue >= Material::kOverlayQueueStart。
+    // 只改管线固定状态（depthTest=ALWAYS + depthWrite=false），
+    // **不改代码** —— 因此不参与 .spv 选择，见 kKeywordStateOnly。
+    kKeywordOverlay = 1u << 7,
 
-    kKeywordCount = 6,
+    // ⚠ 这里的数字只决定**位空间**，不决定编译出多少组合。
+    //   组合数由 CMakeLists.txt 的白名单（GROUP_*/FEATURES_*/MODELS_*）决定，
+    //   详见文件头"位宽 ≠ 组合数"。加模型时这里加一位即可，不会翻倍。
+    kKeywordCount = 8,
     kKeywordAll = (1u << kKeywordCount) - 1u,
+
+    // 只改管线固定状态、不改着色器代码的位。
+    //
+    // 拼 .spv 文件名时必须把它们从掩码里剔掉，否则会去找
+    // "pbr.k128.frag.spv" —— 而白名单根本不会编这个组合（它和 k0 的
+    // 字节码**逐字节相同**）。剔掉之后 60 份变体覆盖了 120 种管线状态。
+    kKeywordStateOnly = kKeywordOverlay,
 };
+
+// 与 CMakeLists.txt 的 SHADER_KEYWORDS 长度对齐。
+// CMake 传 -DVENN_KEYWORD_COUNT=<列表长度>；两边不等时的症状如果不在这里
+// 拦住，就是运行期"找不到变体着色器 pbr.k<N>.frag.spv"——而那时已经
+// 编译、链接、启动、加载场景全跑完了，排查成本高得多。
+#ifndef VENN_KEYWORD_COUNT
+// 非 CMake 构建（手工 g++ / IDE 直接打开）时的兜底。值与上表同步。
+#define VENN_KEYWORD_COUNT 8
+#endif
+static_assert(kKeywordCount == VENN_KEYWORD_COUNT,
+              "ShaderKeywords.h 的 kKeywordCount 与 CMakeLists.txt 的 "
+              "SHADER_KEYWORDS 长度不一致：位序表与 -D 表已经错位了，"
+              "编译出来的变体文件名会与运行时拼出来的对不上。");
 
 using KeywordMask = uint32_t;
 
@@ -130,8 +201,25 @@ std::string keywordNames(KeywordMask m);
 KeywordMask keywordsOf(const assets::Material& mat);
 
 // ------------------------------------------------------------
-// 帧末自检：本帧每个变体各画了多少个（counts 长度 = 1<<kKeywordCount）
+// 帧末自检：本帧每个变体各画了多少个
+//
+// ⚠ 稀疏表（2026-10-25）：原来传的是 `uint32_t counts[1<<kKeywordCount]`
+//   定长数组 —— 位宽一涨就是平方级浪费（7 位 512 B 尚可，15 位 128 KB，
+//   20 位 4 MB，而 Renderer 是值语义存的）。实测一帧里同时出现的组合
+//   通常不超过 10 种，所以改成"掩码 + 计数"的稀疏槽。
+//   数组由调用方提供（Renderer 里是帧统计的一部分），容量用
+//   kMaxVariantSlots，超出的项丢弃（只影响调试日志，不影响渲染）。
 // ------------------------------------------------------------
-std::string variantTable(const uint32_t* counts, uint32_t count);
+struct VariantSlot {
+    uint32_t mask = 0;
+    uint32_t count = 0;
+};
+inline constexpr uint32_t kMaxVariantSlots = 64;
+
+// 往稀疏表里累加一次。返回 false = 表满（调用方可以忽略）。
+bool addVariantCount(VariantSlot* slots, uint32_t& used, KeywordMask m);
+
+// 稀疏表 → 日志串 "k0=2,k3=1"；只列计数非 0 的项
+std::string variantTable(const VariantSlot* slots, uint32_t used);
 
 } // namespace render

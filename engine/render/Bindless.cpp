@@ -19,8 +19,13 @@ namespace render {
 
 namespace {
 
-// 页表用的是 std430 的 struct 数组（stride = 32，两个 uvec4 都是
-// align-16），与 GpuMaterialPage 的 C++ 布局逐字节一致 —— 直接 memcpy。
+// 页表用的是 std430 的 struct 数组（stride = 96 = 6 个 align-16 的块），
+// 与 GpuMaterialPage 的 C++ 布局逐字节一致 —— 直接 memcpy。
+// ⚠ std430 对"结构体数组"的 stride 规则是**向上取整到最大成员对齐**
+//   （这里是 16），不是 C++ 的 sizeof。96 恰好是 16 的整数倍，所以两边
+//   一致；如果哪天字段数变成奇数个 vec4（比如 5 块 = 80），也仍然是 16
+//   的倍数，依然安全。真正的坑是混入 vec2/float 造成的尾部填充 ——
+//   所以这个结构体里**只允许 vec4 / uvec4**。
 constexpr VkDeviceSize kPageTableBytes =
     static_cast<VkDeviceSize>(BindlessTextures::kMaxMaterialPages) *
     sizeof(GpuMaterialPage);
@@ -219,9 +224,35 @@ uint32_t BindlessTextures::materialPage(const assets::Material& mat) {
     // z = 高度图（R4-3 POM）。缺省槽位用**纯黑**而不是白：白 = 处处等高
     // → 视差射线会一路走到层数上限（退化成一个大偏移）；黑 = 处处最低
     // → 循环立刻停下 → offset 0（"没挂高度图"的中性行为）。
+    // w = Toon 的明暗渐变带（A 类，2026-10-25）。缺省**纯白**：着色器里
+    // 是"程序化 ramp × 贴图值"，白 = ×1 = 与没有这个槽逐像素一致。
+    // 这三个新槽（ramp / matcap / sdfShadow / detail）的缺省值必须都是
+    // **乘法恒等**的白，这是"关 = 基线"在页表这一层的可断言形式 ——
+    // 只要缺省值是白，没挂贴图就不可能改变任何像素。
     rec.tex1 = glm::uvec4(tex(mat.metallicMap, m_defaultWhite),
                           tex(mat.emissiveMap, m_defaultBlack),
-                          tex(mat.heightMap, m_defaultBlack), 0u);
+                          tex(mat.heightMap, m_defaultBlack),
+                          tex(mat.rampMap, m_defaultWhite));
+    // A 类语义槽：同样全部兜底白。
+    //   matcap  —— 球面高光贴图，强度 0 时整项不参与
+    //   sdfShadow —— 面部阴影图，"全白" = 处处受光 = 没有 SDF 阴影
+    //   detail  —— 细节/贴花，白 = 不调制 albedo
+    rec.tex2 = glm::uvec4(tex(mat.matcapMap, m_defaultWhite),
+                          tex(mat.sdfShadowMap, m_defaultWhite),
+                          tex(mat.detailMap, m_defaultWhite), 0u);
+
+    // 逐材质标量。rampMode 的三态是**着色器唯一能区分"有没有挂 ramp"的办法**
+    // （页表里空槽绑的是白图，着色器没法从下标反推"这张是不是缺省白"）：
+    //     -1 = 没挂 → 走程序化两档量化（**逐像素等于引入这个槽之前**）
+    //      0 = 挂了，纯渐变（按 NdotL 直接采样）
+    //     >0 = 挂了，量化成这么多档（采样点落在色带中心）
+    // 少了 -1 这一档，没挂 ramp 的材质会拿到"全白 × band"= 处处亮面，
+    // 整场景的 Toon 会一起变成一坨平光 —— 而且看起来像"打光错了"。
+    const float rampMode =
+        mat.rampMap ? std::max(mat.rampSteps, 0.0f) : -1.0f;
+    rec.params = glm::vec4(rampMode, mat.matcapStrength,
+                           mat.sdfShadowStrength, mat.detailStrength);
+    rec.params2 = glm::vec4(mat.detailTiling, mat.matcapRotate, 0.0f, 0.0f);
     m_pageMapped[m_frame][page] = rec;
 
     m_pageOf.emplace(&mat, page);

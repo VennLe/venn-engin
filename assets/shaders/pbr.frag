@@ -93,6 +93,14 @@
 #ifndef VENN_PARALLAX
 #define VENN_PARALLAX 0
 #endif
+// VENN_SHADING_TOON  二次元赛璐璐（A1，2026-10-25）：与 VENN_SHADING_SKIN
+//                  **互斥**（一个材质只能是一种着色模型），CMake 的白名单
+//                  同时只会给其中一个。它把方向光/局部光的漫反射响应从
+//                  "连续 N·L" 换成"半兰伯特 + 两档量化"，阴影色乘冷色调 ——
+//                  即明暗交界是**一条线**而不是一段渐变。
+#ifndef VENN_SHADING_TOON
+#define VENN_SHADING_TOON 0
+#endif
 // VENN_BINDLESS 是**全局开关**（Renderer 按它选 set 布局与 .spv），
 // 不是材质关键字位 —— 所以不参与掩码，只多编一族
 // pbr.bindless.k<掩码>.frag.spv（见 CMakeLists.txt）。
@@ -257,9 +265,19 @@ layout(set = 0, binding = 19) uniform sampler2D sssLut;
 // gMat 是文件级变量，在 main() 开头填一次（材质在一个 draw 内恒定，
 // 不值得每个采样点都查一次页表）。
 // ============================================================
+// 布局必须与 C++ 端 render/Bindless.h 的 GpuMaterialPage **逐字节一致**：
+// 6 × 16 B = 96 B，且每一块都从 16 的倍数开始（std430 的 vec4 对齐）。
+// 少一个 spare、或者顺序挪错一块，症状都不是编译错误，而是"采到了
+// 另一张贴图"——最难看懂的那类 bug。
+//
+// 前 32 B 的语义与 32 B 时代**完全没变**，这是"关 = 基线"能成立的前提。
 struct GpuMaterialPage {
-    uvec4 tex0;  // x=albedo y=normal z=ORM w=roughness
-    uvec4 tex1;  // x=metallic y=emissive z=height(R4-3)
+    uvec4 tex0;    // 0  x=albedo y=normal z=ORM w=roughness
+    uvec4 tex1;    // 16 x=metallic y=emissive z=height(R4-3) w=ramp
+    uvec4 tex2;    // 32 x=matcap y=sdfShadow z=detail w=(预留)
+    vec4  params;  // 48 x=rampMode y=matcapStrength z=sdfStrength w=detailStrength
+    vec4  params2; // 64 x=detailTiling y=matcapRotate z/w=(预留)
+    uvec4 spare;   // 80 整块预留
 };
 layout(set = 1, binding = 0) uniform sampler2D textures[];
 layout(std430, set = 1, binding = 1) readonly buffer MaterialPages {
@@ -275,6 +293,13 @@ GpuMaterialPage gMat;
 #define metallicMap  textures[gMat.tex1.x]
 #define emissiveMap  textures[gMat.tex1.y]
 #define heightMap    textures[gMat.tex1.z]
+// ---- A 类语义槽（2026-10-25）----
+// 四个槽的缺省都是**纯白**。凡是用到它们的地方一律写成"乘法/加法恒等"
+// 的形式，于是"没挂贴图"必然逐像素回到基线，不需要任何开关分支。
+#define rampMap      textures[gMat.tex1.w]
+#define matcapMap    textures[gMat.tex2.x]
+#define sdfShadowMap textures[gMat.tex2.y]
+#define detailMap    textures[gMat.tex2.z]
 #else
 layout(set = 1, binding = 0) uniform sampler2D albedoMap;
 layout(set = 2, binding = 0) uniform sampler2D normalMap;
@@ -430,6 +455,108 @@ float geometrySmith(vec3 N, vec3 V, vec3 L, float rough) {
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
+
+// ============================================================
+// 二次元（赛璐璐）直接光响应 —— A1
+//
+// 与 PBR 的差别只有三条，但每一条都是"二次元 vs 写实"的分水岭：
+//
+//   ① **半兰伯特**：dot(N,L)*0.5+0.5。背光面不是死黑而是 0.5 附近，
+//      所以暗部仍然有颜色。写实渲染里背光面靠环境光提亮，二次元不靠 ——
+//      二次元的暗部有色是**画出来的**，不是环境照出来的。
+//   ② **两档量化**：smoothstep(0.47,0.53) 把连续值压成 0/1 两档。
+//      交界宽度 0.06 是"一条线"的量级 —— 越窄越硬，越宽越像写实。
+//      这是"卡通感"最核心的一条：真实的明暗是渐变的，卡通的不是。
+//   ③ **阴影乘冷色调**：阴影色 = albedo * vec3(0.52,0.56,0.68)。
+//      不是"变暗"而是"变紫/变蓝"—— 人眼在阴影里看到的是被天光照亮的
+//      冷色，美术把这件事直接写死。写实渲染里这是 IBL 算出来的，不可控。
+//
+// 高光：保留一个阈值化的亮点（pow 48 + smoothstep），不要 GGX 的宽衰减。
+// 二次元的高光是"贴上去的一个形状"，不是物理反射。
+//
+// ⚠ 这个函数只返回**辐射度乘子**，乘以 radiance 由调用方做 ——
+//   方向光与局部光两条路径共用它，避免"方向光是卡通、点光还是写实"。
+//
+// ⚠⚠ shadow 必须传进函数、只乘**受光档**，不能在调用处整项乘一次：
+//   `shadowFactor()` 在 N·L <= 0 时直接返回 0（写实渲染里这是对的 ——
+//   背光面确实收不到直接光）。但赛璐璐的暗部是**一笔颜料**
+//   （albedo × 冷色调），不是"没有光"。整项乘 shadow 的结果是
+//   `mix(shadowed, lit, band) * 0 == 0` —— 背光面被压成纯黑，
+//   于是"阴影有颜色"这个 feature 在像素上等于不存在。
+//   实测症状：球的下半部三通道全 0，与写实 PBR 的暗部**完全一样**。
+//   修法：mix(shadowed, lit * shadow, band) —— band=0 时 shadow 不参与。
+// ============================================================
+#if VENN_SHADING_TOON
+// ============================================================
+// A 类：Toon 的明暗渐变带（ramp 贴图，2026-10-25）
+//
+// 返回值 = "这一像素属于亮面的程度"，喂给 toonDirect 与下面环境光的分档。
+// **只读 R**，按半兰伯特的 NdotL 采样。
+//
+// ⚠⚠ 语义是**乘法调制**，不是**替换**。这一点是实测之后才定下来的，
+//   踩过的坑值得写清楚：第一版写的是 `band = ramp 值`（替换），
+//   全白 ramp 的结果是**整个背光半球变成纯黑**。
+//   原因不在采样，在 toonDirect 的结构：band 同时是"走亮档"的开关，
+//   而亮档是 `lit * shadow`、暗档是 `dark`（冷色调）。band 恒 1 就意味着
+//   "处处走亮档"，于是所有阴影里的像素拿到 lit*0 = 0 ——
+//   A1 花力气建立的"阴影是有颜色的颜料，不是没有光"当场被抹掉。
+//   乘法调制则保持两者独立：band 决定**有没有越过交界**，ramp 决定
+//   **越过之后的亮度**。白 ramp = ×1 = 与没有这个槽严格相等。
+//
+//   代价（诚实记下来）：乘法**只能压暗受光档，扩不宽受光区**。
+//   想让贴图自己定义"哪一档是暗部色"，需要把暗部色的定义也交给贴图
+//   （一张色带图或三通道 ramp），那是下一刀的事。
+//
+// ⚠ 关闭的判据是 `params.x < 0`，**不是**"贴图是不是空的"：
+//   页表里空槽绑的是白图，着色器无法从下标反推"这张是不是缺省白"。
+//   所以 CPU 侧统一约定（见 Bindless::materialPage）：
+//       挂了 rampMap → params.x = max(rampSteps, 0)
+//       没挂        → params.x = -1
+//   两档都得有：只靠"白图 ×1"是不够的，因为采样一次仍要付纹理带宽，
+//   而 -1 让没挂 ramp 的材质（也就是绝大多数）连采样都不做。
+//
+// ⚠ 量化后的采样点采**色带中心** `(floor(u*n)+0.5)/n`，不采边界：
+//   边界正好落在两档交界上，线性过滤会插成半灰 —— 于是"每档都是平的"
+//   变成"档与档之间是渐变"，量化就白做了。
+// ============================================================
+float toonBandFactor(float ndl) {
+    const float band = smoothstep(0.47, 0.53, ndl * 0.5 + 0.5);
+#if VENN_BINDLESS
+    const float mode = gMat.params.x;
+    if (mode >= 0.0) {
+        float u = ndl * 0.5 + 0.5;
+        if (mode >= 1.0) {
+            const float n = floor(mode + 0.5);
+            u = (floor(u * n) + 0.5) / n;
+        }
+        // 白图 → 恰好 1.0（sRGB 解码后仍是 1.0）→ band * 1.0 逐位等于 band
+        return band * texture(rampMap, vec2(u, 0.5)).r;
+    }
+#endif
+    return band;
+}
+
+vec3 toonDirect(vec3 albedo, vec3 N, vec3 L, vec3 H, float shadow) {
+    const float ndl = max(dot(N, L), 0.0);
+    // ① 半兰伯特 → ② 量化（或 ramp 贴图，见 toonBandFactor）
+    const float band = toonBandFactor(ndl);
+    // ③ 两档的颜色本身。**交界处必须看得见台阶**，否则量化没有意义 ——
+    //   这是本函数唯一容易写错的地方，实测踩过：
+    //   上一版 lit = albedo*(0.55+0.45*ndl) 在交界处（ndl≈0）等于 0.55·albedo，
+    //   而暗部色 R 通道也是 0.56·albedo —— 两者几乎相等，明暗交界线消失，
+    //   整颗球看着像"均匀受光 + 稍微发蓝"，完全不是赛璐璐。
+    //   现在亮档抬到 0.80~1.00（保留一点体积渐变），暗档压到 0.45~0.62 且偏蓝：
+    //     交界台阶 R 1.78×（0.80 vs 0.45）—— 肉眼一眼能看出分界；
+    //     暗部 B/R = 0.62/0.45 = 1.38 —— "冷色阴影"而不是"死黑"。
+    const vec3 lit = albedo * (0.80 + 0.20 * ndl);
+    const vec3 dark = albedo * vec3(0.45, 0.49, 0.62);
+    // 硬高光：只有朝向光源半球时才有，且只取峰值附近
+    const float spec = smoothstep(0.88, 0.93,
+                                  pow(max(dot(N, H), 0.0), 48.0)) * band;
+    // 阴影只衰减受光档（band=1 → lit*shadow；band=0 → dark 原样）
+    return mix(dark, lit * shadow, band) + vec3(spec * shadow) * 0.6;
+}
+#endif
 
 // 旧路径的近似环境色。天空模型本身在 common.glsl 的 vennSkyColor()，
 // 与烘焙环境贴图用的是**同一个函数** —— 这条路径的意义是"用单次
@@ -1036,15 +1163,25 @@ vec3 shadeLocalLightMod(Light L, LightExt E, vec3 N, vec3 V, vec3 worldPos,
 
     const vec3 radiance =
         L.colorIntensity.rgb * L.colorIntensity.a * mod * shadow;
-#if VENN_SHADING_SKIN
+#if VENN_SHADING_TOON
+    // A1：局部光与方向光必须用**同一个**响应函数，否则会出现"太阳是卡通、
+    // 台灯还是写实"的割裂感。radiance 里已经含衰减与阴影，乘进去即可。
+    // 注意这里不乘 attD/attS —— toonDirect 返回的是完整辐射度乘子，
+    // 而 PBR 分支的 attD/attS 是"漫反射/镜面各自的角度项"。
+    // shadow 传 1.0：radiance 里已经乘过 shadow，再传真的会**平方衰减**。
+    const vec3 lit = toonDirect(albedo, N, Ls, H, 1.0);
+    return lit * radiance;
+#elif VENN_SHADING_SKIN
     // 面积光/IES/cookie 路径：漫反射同样换成曲率响应（含背阴面渗光，
     // 因为这里的提前退出是 "NdotLd<=0 且 NdotLs<=0"，单侧背阴仍会走到）。
     const vec3 diffuse = kD * albedo / PI * attD * skinDiffuse(N, Ld);
-#else
-    const vec3 diffuse = kD * albedo / PI * attD * NdotLd;
-#endif
     const vec3 spec = specular * attS * NdotLs;
     return (diffuse + spec) * radiance;
+#else
+    const vec3 diffuse = kD * albedo / PI * attD * NdotLd;
+    const vec3 spec = specular * attS * NdotLs;
+    return (diffuse + spec) * radiance;
+#endif
 }
 
 // ============================================================
@@ -1146,6 +1283,21 @@ void main() {
     // "把这块表面染成什么颜色"，它应该能压过贴图（否则在深色贴图上
     // 永远画不出亮色）。alpha 不参与 —— 那是材质的不透明度，不是颜色。
     vec3 albedo = albedoSample.rgb * push.baseColorFactor.rgb * vColor.rgb;
+#if VENN_BINDLESS
+    // ---------------- 细节/贴花（A 类，2026-10-25）----------------
+    // 腮红、纹身、衣服印花这类东西是"画在表面上的图案"，不是几何，
+    // 所以走**相乘**调制 albedo（与顶点色、baseColorFactor 同一个位置）。
+    //
+    // 恒等性：缺省槽绑的是纯白 + detailStrength 缺省 1.0 →
+    //   mix(1, 1, 1) = 1 → 乘法恒等，一个像素都不变。
+    // 之所以用 mix(白, 贴图色, 强度) 而不是直接乘贴图：强度是个 0..1 的
+    // "这个贴花有多显眼"旋钮，乘 0 会把它压成黑（= 变暗），mix 到 1 才是
+    // "完全不显示"。贴花淡出必须走 mix。
+    if (gMat.params.w != 1.0 || gMat.params2.x != 1.0) {
+        const vec3 dtex = texture(detailMap, matUV * gMat.params2.x).rgb;
+        albedo *= mix(vec3(1.0), dtex, gMat.params.w);
+    }
+#endif
 #if VENN_ALPHA_BLEND
     // 只有半透明材质才让 albedo 的 alpha 参与输出 —— 管线侧同时开了混合、
     // 关了深度写（见 VariantPipelines::applyKeywordState），两边是一体的。
@@ -1320,7 +1472,14 @@ void main() {
 
     // 阴影只衰减直接光；环境光不受遮挡影响（简化处理）
     float shadow = shadowFactor(vWorldPos, NdotL);
-#if VENN_SHADING_SKIN
+#if VENN_SHADING_TOON
+    // A1：赛璐璐响应整体替换 PBR 的 (kD*kDiffuse + specular*NdotL) 两项。
+    // kD/specular 在上面仍然算了 —— 无常量折叠之外的代价（编译器会把
+    // 没人用的分支消掉），换来的是这里读起来不必倒推"哪个变量还有效"。
+    // ⚠ shadow 传进函数、由函数只作用在受光档上；这里**不要**再乘一次，
+    //   否则背光面会被整项清零（见 toonDirect 的注释）。
+    vec3 direct = toonDirect(albedo, N, Ld, H, shadow) * radiance;
+#elif VENN_SHADING_SKIN
     // R4-2：漫反射乘子换成预积分散射响应（明暗交界线外也渗光 + 泛红），
     // 镜面项仍用真实 NdotL —— 高光不该被次表面散射糊掉。
     vec3 direct = (kD * albedo / PI * skinDiffuse(N, Ld) + specular * NdotL) *
@@ -1428,11 +1587,45 @@ void main() {
         ambient *= ssao;
     }
 
+    // ---------------- A1：环境光也要跟着亮暗分档 ----------------
+    // 只在 Toon 变体里做。理由：IBL 给的是**中性**天光（这里约 +0.14 线性值），
+    // 它会把暗部的冷色调冲淡 —— 实测不改这里时暗部 B/R 只有 1.07
+    // （线性理论值 1.38），肉眼完全看不出"阴影偏蓝"。
+    // 写实路径不动：Default 的环境光本来就是物理量，压它反而错。
+#if VENN_SHADING_TOON
+    // 与 toonDirect 用**同一个** band 函数：挂了 ramp 之后环境光的冷暖
+    // 分界也必须跟着贴图走，否则直接光已经换成分档、环境光还在用程序化
+    // 的 0.47/0.53 交界，两个交界错开就会出现一条"双重明暗线"。
+    const float toonBandAmb = toonBandFactor(max(dot(N, Ld), 0.0));
+    // 暗侧把环境光整体压暗并偏蓝，亮侧保持原样（1.0）
+    ambient *= mix(vec3(0.66, 0.72, 0.90), vec3(1.0), toonBandAmb);
+#endif
+
     // 自发光 = 因子 + 贴图。贴图槽空着时绑的是内置纯黑，加法恒等；
     // 放一张图进去立刻发光（因子保留 0 也亮），不用两头调。
     vec3 emissive = push.emissive.rgb + texture(emissiveMap, matUV).rgb;
 
     vec3 color = ambient + direct + localLights + emissive;
+
+#if VENN_BINDLESS
+    // ---------------- MatCap 球面高光（A 类，2026-10-25）----------------
+    // 用**视图空间法线**的 xy 当 UV 采样一张"球面光照贴图"。高光因此贴在
+    // 物体自身的朝向上，不随光源方向变化 —— 这正是二次元要的：眼睛的
+    // 那颗高光不该因为角色转身就消失（写实路径的 GGX 高光会）。
+    //
+    // 强度缺省 0 → 整段不进（`if` 在编译期之外，运行期一个分支，但
+    // 默认材质走的就是这条不采样的路，逐像素与基线一致）。
+    // 位置在雾之前：高光要跟着雾一起被吞掉，否则远处角色的眼睛会在
+    // 雾里发出一颗不合逻辑的亮点。
+    if (gMat.params.y > 0.0) {
+        const vec3 vsN = normalize(mat3(ubo.view) * N);
+        const float cs = cos(gMat.params2.y);
+        const float sn = sin(gMat.params2.y);
+        const vec2 ruv = vec2(vsN.x * cs - vsN.y * sn,
+                              vsN.x * sn + vsN.y * cs);
+        color += texture(matcapMap, ruv * 0.5 + 0.5).rgb * gMat.params.y;
+    }
+#endif
 
     // ---------------- 高度雾（指数雾 × 高度衰减，Z-up）----------------
     // f = 1 - exp(-距离 × 密度 × exp(-高度 × 衰减))：

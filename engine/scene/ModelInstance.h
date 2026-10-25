@@ -88,6 +88,7 @@ struct ModelInstanceResult {
     std::vector<ecs::Entity> entities;   // 每个 SubMesh 一个
     bool skinned = false;                // 是否建了 SkinnedMeshComponent
     int joints = 0;                      // 骨架关节数（非蒙皮为 0）
+    int morphChannels = 0;               // MorphRig 滑条数（无 morph 为 0）
 };
 
 // 装配。model 为空 / 无效时返回空结果（root 无效）。

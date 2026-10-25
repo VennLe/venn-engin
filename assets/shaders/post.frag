@@ -30,6 +30,13 @@
 //   **对比度自适应的边缘感知锐化**（TSR/DLSS 之前各家引擎的 "TAAU"
 //   空间分量；时间分量由 TAA 的抖动历史在渲染分辨率上累积提供）。
 //   关闭（scale=1，pc.ups.z <= 0.5）→ **单次采样，与引入前逐字相同**。
+//
+// 描边（NPR，2026-10-25）：
+//   输入是 set 3 的几何缓冲（rgb=世界法线，a=视图空间线性距离，米），
+//   由**深度预通道**顺带写出 —— 不额外画一遍几何。
+//   判据两路取 max：相对深度差 + 法线夹角。两者都过 smoothstep 软化，
+//   否则边缘是一条硬邦邦的 1 像素线（在 MSAA/FXAA 下会出现摩尔纹）。
+//   关闭（pc.outline.x <= 0.5）→ **整段跳过**，与引入前逐像素相同。
 // ============================================================
 
 layout(location = 0) in vec2 vUv;
@@ -39,14 +46,47 @@ layout(set = 0, binding = 0) uniform sampler2D hdrTex;
 layout(set = 1, binding = 0) uniform sampler2D bloomTex;
 // 色彩分级 LUT（32³ 3D 纹理，数组纹理不参与 —— 这是硬件三线性）
 layout(set = 2, binding = 0) uniform sampler3D lutTex;
+// 几何缓冲（深度预通道写出）：rgb = 世界法线（-1..1），a = 视图空间
+// 线性距离（米）。**用最近邻采样器**（C++ 侧 m_geoNearestSampler）——
+// 线性过滤会把物体边缘的深度插成中间值，一条轮廓被检出两条线。
+layout(set = 3, binding = 0) uniform sampler2D geoTex;
 
-// 推常量（64B，与 PostProcess::recordComposite 的 post[16] 逐字段一致）
+// 推常量（96B，与 PostProcess::recordComposite 的 post[24] 逐字段一致）
 layout(push_constant) uniform PC {
-    vec4 params;   // x=曝光 y=bloom 强度 z=tonemap 模式 w=暗角强度
-    vec4 camfx;    // x=色差强度 y=暗角径向幂 z/w=保留
-    vec4 lut;      // x=LUT 缩放 y=LUT 偏置 z=开关(>0.5) w=混合权重
-    vec4 ups;      // x/y=源纹素(1/渲染分辨率) z=升采样开关(>0.5) w=锐度
+    vec4 params;     // x=曝光 y=bloom 强度 z=tonemap 模式 w=暗角强度
+    vec4 camfx;      // x=色差强度 y=暗角径向幂 z/w=保留
+    vec4 lut;        // x=LUT 缩放 y=LUT 偏置 z=开关(>0.5) w=混合权重
+    vec4 ups;        // x/y=源纹素(1/渲染分辨率) z=升采样开关(>0.5) w=锐度
+    vec4 outline;    // x=描边开关 y=宽度(像素) z=深度阈值 w=法线阈值
+    vec4 outlineRgb; // rgb=线颜色（显示域） a=强度
 } pc;
+
+// ---- 描边：单侧边缘度量 ----
+// 返回 0 = 两侧是同一表面（连续），1 = 硬边或轮廓。
+//
+// 为什么深度用**相对差**而不是绝对差：
+//   透视投影下 1 像素对应的世界距离随距离线性增长。绝对差阈值必然
+//   "近处过敏感（皮肤纹理都成边）、远处完全失灵（人物没有描边）"。
+//   除以 min(a) 之后，1 米处 2cm 的台阶与 50 米处 1m 的台阶同量级。
+float geoEdge(vec4 gc, vec4 gn) {
+    const bool vc = gc.a > 1e-4;
+    const bool vn = gn.a > 1e-4;
+    if (!vc && !vn) return 0.0;   // 两边都是天空
+    if (vc != vn) return 1.0;     // 物体 vs 天空 → 轮廓（天空 a 被清成 0）
+
+    const float dRel = abs(gc.a - gn.a) / max(min(gc.a, gn.a), 1e-3);
+    // 1-dot：0 = 同向、1 = 垂直、2 = 反向。用 1-dot 而非 acos 是因为
+    // 它单调、无超越函数，且阈值可以直接表达成"夹角多少度"。
+    const float nRel = 1.0 - dot(gc.rgb, gn.rgb);
+
+    // 软化：硬阈值在 MSAA/FXAA 下会抖成虚线。深度那一侧上界取 3x
+    // （掠射角地面的相对深度差是个常数、贴着阈值时会闪烁；宽过渡带把
+    // 它压成很淡的一层而不是刺眼的散点）；法线取 1.6x（更窄，否则
+    // 圆球会被描成一片）。
+    const float dm = smoothstep(pc.outline.z, pc.outline.z * 3.0, dRel);
+    const float nm = smoothstep(pc.outline.w, pc.outline.w * 1.6, nRel);
+    return max(dm, nm);
+}
 
 // ACES filmic 近似（Narkowicz 2015）—— 便宜且观感接近正式 ACES
 vec3 acesFilm(vec3 x) {
@@ -143,6 +183,32 @@ void main() {
     const float r2 = dot(d, d) * 2.0;
     const float vig = 1.0 - pc.params.w * pow(max(r2, 0.0), pc.camfx.y);
     color *= clamp(vig, 0.0, 1.0);
+
+    // ---- 描边（NPR）----
+    // 位置很讲究：必须在 tonemap **之后**（线颜色是显示域值，跟着曝光
+    // 浮动会"人物换个灯光线就变灰"）、在 LUT 与暗角**之后**
+    // （线是风格化元素，不该被镜头暗角和调色改变）。
+    if (pc.outline.x > 0.5) {
+        // 8 邻域。步长取**渲染分辨率**的纹素（pc.ups.xy 现在是无条件填的，
+        // 与 DRS 开关无关），所以线宽是"渲染像素"而不是"输出像素" ——
+        // DRS 降分辨率时线会随之粗一档，升采样后仍是连续的细线。
+        const vec2 tx = pc.ups.xy * max(pc.outline.y, 1.0);
+        const vec4 gc = texture(geoTex, vUv);
+
+        vec2 kOff[8] = vec2[8](
+            vec2( 1.0,  0.0), vec2(-1.0,  0.0),
+            vec2( 0.0,  1.0), vec2( 0.0, -1.0),
+            vec2( 1.0,  1.0), vec2( 1.0, -1.0),
+            vec2(-1.0,  1.0), vec2(-1.0, -1.0));
+
+        float e = 0.0;
+        for (int i = 0; i < 8; ++i) {
+            const vec2 uv = clamp(vUv + kOff[i] * tx, vec2(0.0), vec2(1.0));
+            e = max(e, geoEdge(gc, texture(geoTex, uv)));
+        }
+        color = mix(color, pc.outlineRgb.rgb,
+                    clamp(e, 0.0, 1.0) * pc.outlineRgb.a);
+    }
 
     outColor = vec4(color, 1.0);
 }

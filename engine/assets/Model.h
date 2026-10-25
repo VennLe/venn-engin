@@ -11,6 +11,7 @@
 // 节点树结构。
 // ============================================================
 
+#include "assets/MorphRig.h"
 #include "assets/Skeleton.h"
 #include "rhi/VulkanCommon.h"
 
@@ -44,8 +45,24 @@ struct Model {
     // 采样出关节矩阵写入 SSBO，再按 slot 槽位被各 primitive 的绘制用。
     std::shared_ptr<Skeleton> skeleton;
 
+    // ---- 表情/形变（§15）----
+    // 同名滑条已跨子网格合并。`empty()` = 这个模型没有表情。
+    // 装载时由 VMeshLoader 建一次，运行期只读（求值走 `evaluate`）。
+    MorphRig morphRig;
+
     bool valid() const { return !subMeshes.empty(); }
     bool skinned() const { return skeleton && skeleton->jointCount() > 0; }
+
+    // 网格指针 → 子网格下标（-1 = 不属于本模型）。
+    //
+    // 为什么需要它：`MorphRig::evaluate` 的输出是**按子网格**分行的，而
+    // 渲染层手里只有 `Mesh*`（实体上挂的是 MeshComponent）。子网格数通常
+    // 十几到几十，线性扫描足够；建 map 反而要跟着 subMeshes 的生命周期走。
+    int subMeshIndexOf(const Mesh* mesh) const {
+        for (std::size_t i = 0; i < subMeshes.size(); ++i)
+            if (subMeshes[i].mesh == mesh) return static_cast<int>(i);
+        return -1;
+    }
 };
 
 } // namespace assets

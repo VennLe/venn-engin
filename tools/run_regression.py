@@ -80,6 +80,35 @@ DEFAULT = [
     "verify_alpha_mask",
     # R4-2：预积分 SSS（ShadingModel::Skin，bit4 VENN_SHADING_SKIN）
     "verify_sss",
+    # A1：二次元素描（ShadingModel::Toon，bit6 VENN_SHADING_TOON）。
+    # 它是"变体系统能不能容纳 NPR"的**活证明**：加一档着色模型 = 加一个
+    # 关键字位 + 在白名单里多声明一个模型，不再动 2^N 的组合数。
+    "verify_toon_shading",
+    # NPR 描边（2026-10-25）：**不是** inverted-hull，而是深度预通道顺带
+    # 写一张 G16R16F 的几何缓冲（世界法线 + 线性距离），post.frag 做
+    # 8 邻域的深度/法线双判据边缘检测。五轮 Game.exe 截图：
+    #   ① 关描边 ×2 逐像素相同（确定性）② 强度=0 与关描边逐像素相同
+    #   ③ 开描边差异 ≥5000 px 且变暗 ≥40/255 ④ 天空新增暗像素恰好 0
+    #   ⑤ 线宽 1.5→3 覆盖面积 +30% 以上。
+    # 第 ② 条与第 ④ 条是最容易写错的两处：前者是"mix 权重 0"，后者是
+    # "a=0 的哨兵被当成距离 0 的物体"（症状：整片天空被描成黑边）。
+    "verify_outline",
+    # P0-2/B：材质渲染顺序（renderQueue / sortOrder / 覆盖带 bit7）。
+    # 用两颗球验证"谁画在上面"：跨带时距离完全不参与，>=3000 进覆盖带
+    # （不写深度 + 深度测试恒通过）。这是"眼睛能压在脸皮和刘海之上"
+    # 唯一能做对的方式。
+    "verify_render_queue",
+    # 材质页 32B → 96B 的四个 A 类语义槽（2026-10-25）：ramp / matcap /
+    # SDF 阴影 / detail。八轮 Editor.exe 截图，只换材质不换机位，
+    # 判据分两类：
+    #   · **恒等类（恰好 0）**：ramp 白图 ×1、detail 白图强度 0.5、
+    #     matcap 黑图强度 0.9 —— 三条都真的进了采样分支，所以它们同时
+    #     证明"路径通"和"数学上是恒等"。这是"关 = 基线"在这一层的可断言形式。
+    #   · **行为类**：中灰 ramp 变暗、全黑 ramp 方差塌掉、matcap 白变亮、
+    #     detail 棋盘改变画面。
+    # ⚠ 必须显式 MYVK_BINDLESS=1：页表只在 bindless 路径存在（§8.2 的
+    #   结构事实），脚本自己断言了 Bindless: ready，否则失败信息会误导。
+    "verify_material_page",
     # Inspector 左侧图标导航条 + 按页签分区（2026-10-16 的 UI 重构）。
     # 放在这里跑是有讲究的：它逐个页签启动 16 次编辑器，是本套件里最慢的
     # 一个；而它同时**看守着其它脚本的默认页签**（自动化默认 = all），
@@ -225,6 +254,48 @@ DEFAULT = [
     # ⚠ **刻意不做截图比对**：autoPlay 模型的截图取决于 wall clock，比对会
     #   变成 flaky 用例；这条链的正确性由数值判据守。
     "verify_vmesh",
+    # 顶点格式 80 → 112 B（§13，2026-10-25）：uv2 / morphBase / tangent
+    # 三个通道落进 stride，老六个属性的偏移一个都没动。
+    # 判据**全部是字节级**（A 文件头/B 结构不变量/C 确定性/D 运行期统计
+    # 与文件解析互校/E 老 80 字节逐字节未变）—— 这一刀没有截图判据，
+    # 理由写在脚本头：没有任何着色器读新通道、老字节也没变，渲染结果
+    # 必然一样，一张"必然一样"的图证明不了什么。
+    # ⚠ E 组依赖 `_venn_verify/vmesh_bak`（手术前的一次性备份）。
+    #   没有备份时整组 SKIP 而不是红 —— 判据依赖临时产物就必须能自己退场，
+    #   否则它会在任何新机器上永远红，然后被人删掉。
+    "verify_vertex_format",
+    # morph 数据链（§14，2026-10-25）：FBX blend shape → MORPH 区块 →
+    # 顶点里的 morphBase/morphCount → 运行期 Mesh。
+    # 与上一刀（verify_vertex_format）的分工：那一刀验**格式**（112 B、
+    # 偏移没动、老 80 字节零变更），这一刀验**数据**（delta 是否与顶点
+    # 对齐、焊接换下标后有没有跟着 remap、target 下标有没有在子网格间串）。
+    # 判据同样是字节级：C 组在 Python 里独立实现了一遍 C++ 读端的同一道
+    # 自洽校验 —— 第一版就因为漏加区块基准偏移而三项全红，而 C++ 是绿的，
+    # 这正是"两条独立实现互校"要抓的东西。
+    "verify_morph",
+    # GPU 形变（§15，2026-10-25）：**像素级**。上面那条验到"数据是对的"
+    # 为止，这一条回答"顶点着色器真的读了吗"。
+    # 四次启动只有 console 命令不同（不设 / 设 0 / 设 1 / 设一个不存在的
+    # 名字），判据 = 三张图逐像素比 + MORPH-FRAME 的槽位转储。
+    # ⚠ 必须进 DEFAULT：它守着一个真实发生过的 bug —— `MorphRig::evaluate`
+    #   把"多个材质桶"当成"in-between 关键帧链"，一个滑条只驱动一块脸，
+    #   而数据层 34 项、日志、运行期计数**全绿**。只有像素能看出来。
+    "verify_morph_gpu",
+    # 两骨 IK + 挂点（§16，2026-10-25 第八刀）：**像素级**。
+    # 上面两条验的是"形变数据"和"GPU 真的读了"，这一条验的是**逆运动学**
+    # —— 从目标点反推关节旋转。
+    # 四次启动只有 console 命令不同（不发 / weight 0 / 可达目标 / 够不着），
+    # 判据 = 三张图逐像素比 + `ANIM-IK` 与 `IK-SET` 两行锚点。
+    # ⚠ 必须进 DEFAULT：它守着三个**只有像素能看见**的失效模式：
+    #   ① 求解器算对了但没写回 pose（`poseToJoints` 的顺序 / 覆盖问题）
+    #      → 日志里 `actual` 全是 0.0000，画面纹丝不动；
+    #   ② weight=0 时"接近不动"而不是"完全不动"（差几个像素，肉眼绝对看不出，
+    #      但会让 IK 变成一盏永远漏电的灯）→ K1 逐像素等于没开；
+    #   ③ 够不着时假装成功（腿伸直了却报 actual≈0）→ K5 要求 miss=1 且
+    #      actual > 0.05。真实渲染里这一条最阴：角色看着没够到，日志说够到了。
+    # ⚠ 它自己的判据也踩过一次单位坑（`diff_stats` 返回占比不是百分数），
+    #   细节写在脚本头 —— 那次让 K2b 变成恒真，等于该判据根本不存在。
+    "verify_ik",
     # ---- 2026-10-17：主题 / 语言 / 默认值 / 胶囊线框 / 启动露面 ----
     # 五套主题 + 中英映射替换 + 偏好存档 schema 门。判据只取 Preferences
     # 窗口内部的平均亮度（整窗均值会被 3D 视口拽平，第一版就栽在这）。
@@ -826,7 +897,28 @@ TRIGGERS = {
                               "engine/render/HdrTarget.*",
                               "engine/render/RenderTarget.*",
                               "engine/render/OffscreenImage.h"],
+    # 描边的输入是**深度预通道的颜色附件** —— 改 HdrTarget 的附件/布局、
+    # 改 depth_only.frag 的输出、改 post.frag 的采样都会动到它。
+    # FeatureRegistry 也登记：参数名或取值范围写错的表现是"面板上开不了"
+    # 或"开到底也没有线"，而像素断言会先红在更早的一条上。
+    "verify_outline":        ["engine/render/PostProcess.*",
+                              "engine/render/HdrTarget.*",
+                              "engine/render/RenderTarget.*",
+                              "engine/render/FeatureRegistry.*",
+                              "assets/shaders/post.frag",
+                              "assets/shaders/depth_only.frag"],
     "verify_viewmodes":      ["engine/render/ScreenSpaceSettings.h"],
+    # 材质页的形状由三处共同决定，任何一处单独改都会"编译过、画面错"：
+    #   · Bindless.h/.cpp   —— C++ 侧的 96B 布局与页表填充（含 rampMode 三态）
+    #   · pbr.frag          —— GLSL 侧的同名结构与四个宏
+    #   · Material.h        —— 四个贴图槽与六个标量
+    # 场景序列化也登记：新字段不往返的话，编辑器里设好、存盘就丢，
+    # 表现是"重开场景 ramp 没了"，而不是崩溃。
+    "verify_material_page":  ["engine/render/Bindless.*",
+                              "engine/assets/Material.h",
+                              "engine/scene/SceneSerializer.cpp",
+                              "engine/assets/MaterialSelfTest.cpp",
+                              "assets/shaders/pbr.frag"],
     # ---- 变体 / 热重载 / 时戳 ----
     # （verify_shader_variants 不登记：它的实现主体是 ShaderKeywords.* /
     #   VariantPipelines.* / CMakeLists.txt，全是横切文件 → 无条件重跑）
@@ -834,6 +926,19 @@ TRIGGERS = {
     "verify_gpu_timing":     ["engine/render/GpuTimer.*"],
     # ---- 材质特性 ----
     "verify_sss":            ["assets/textures/sss_lut*"],
+    # A1 二次元素描：着色器本体（pbr.frag）、关键字位（ShaderKeywords.*）、
+    # 变体白名单（CMakeLists.txt）**全在横切表里**，所以这里只挂非横切的
+    # 编辑器侧路径 —— shadingModel 下拉在 InspectorPanel，枚举 ↔ 字符串的
+    # 往返（"toon" / "skin" / "default"）在 SceneSerializer。
+    "verify_toon_shading":   ["editor/InspectorPanel.*",
+                              "engine/scene/SceneSerializer.*"],
+    # P0-2/B 渲染顺序：排序键在 Renderer.cpp、状态位在 VariantPipelines.* /
+    # ShaderKeywords.*、字段在 Material.h —— **全在横切表里**。这里只挂
+    # 真正属于本用例的非横切路径：材质参数的读写往返（SceneSerializer）
+    # 和 Inspector 上那两个输入框。序列化漏一个字段的症状是"面板上调了、
+    # 存档再打开又是 2000"，只有这个用例会发现。
+    "verify_render_queue":   ["engine/scene/SceneSerializer.*",
+                              "editor/InspectorPanel.*"],
     "verify_decals":         ["assets/shaders/decal.frag",
                               "assets/shaders/decal.vert",
                               "engine/render/DecalBuffer.*",
@@ -922,7 +1027,18 @@ TRIGGERS = {
     # `engine/ecs/**`、`engine/assets/**`、`engine/render/Renderer.*` 是横切，
     # 按铁律**不写**；`editor/EditorApp.cpp`（命令注册 / Play 挂载点 /
     # IMPORT 钩子）沿用项目惯例不登记（同文件里还有几十处别的接线）。
-    "verify_anim_runtime":   ["engine/animation/**"],
+    "verify_anim_runtime":   ["engine/animation/**",
+                              # 2026-10-25：SceneSerializer 新增 springBone /
+                              # lookAt 两段的读写。这两个段落的字段名和默认值
+                              # 一旦写错，症状是"存盘再开头发不飘了"，而
+                              # 动画自检看不到 —— 所以改序列化就重跑它。
+                              #
+                              # ⚠ 2026-10-25（§16）：`Skeleton::findJoint` 的
+                              #   三条断言（exact / substring / endtip）住在
+                              #   动画自检里，但 `engine/assets/**` 在
+                              #   `GLOBAL_GLOBS` —— 改 Skeleton.* 本来就全量，
+                              #   按铁律**不写**（写了会在 --narrow 下假跳过）。
+                              "engine/scene/SceneSerializer.*"],
     "verify_character_import": ["engine/animation/**",
                                 "engine/scene/ModelInstance.*",
                                 # SCENE-SKINNED / SCENE-ANIMATOR 四条锚点（存 + 读）
@@ -948,6 +1064,10 @@ TRIGGERS = {
     # ⚠ `engine/assets/MeshLoader.*`、`engine/ecs/Components.h` 同理在横切表
     #   里，按铁律**不写**。
     "verify_char_locomotion": ["engine/animation/Locomotion.*",
+                               # 2026-10-25：`switchClip` 从 Locomotion 的匿名
+                               # namespace 抽到了这里（状态机是第二个消费者）。
+                               # 改它等于改 C6/C7 的切换行为 —— 必须一起跑。
+                               "engine/animation/ClipSwitch.*",
                                "editor/CharacterWindow.*",
                                # bindDefaultCharacter / kDefaultCharacterPath
                                "editor/EditorScene.*",
@@ -1291,6 +1411,77 @@ TRIGGERS = {
     # ⚠ `CMakeLists.txt` 同样是横切（新增 `VennAssetIO` / `VennAssetC` 两个
     #   目标就写在那儿），同理不登记。
     "verify_vmesh": ["assetio/**", "assetc/**"],
+    # 顶点格式（§13）。触发面比 verify_vmesh **更窄**，这是刻意的：
+    #   · `assetio/Vertex.h`        —— 布局本身（kVertexSize / offsetof）
+    #   · `assetio/MeshFormat.*`    —— MESH 区块版本与 stride 校验
+    #   · `assetio/VertexOps.*`     —— 焊接键：漏一个字段就是把两套 UV2 焊成一个
+    #   · `assetio/FbxImport.*`     —— uv2 / tangent 的取值来源
+    #   · `engine/assets/VMeshLoader.cpp` —— 按字节直拷 + 布局锁 + VFMT 日志
+    #   · `engine/assets/AssetSelfTest.cpp` —— rt_new_channels 往返断言
+    # ⚠ **故意不挂**：
+    #   · `engine/assets/Mesh.h` —— 属性表与 stride 的来源，但它落在
+    #     `GLOBAL_GLOBS`（`engine/assets/**` 是横切），登记在这里属于
+    #     "冗余 glob"：写上去会让人以为它只影响本用例，实际影响全量。
+    #     `check_regression_map.py` 的 E 组会把这类冗余单独列出来。
+    #   · `engine/assets/Mesh.cpp`（程序化几何）/ `Lod.cpp` —— 前者不产生
+    #     新通道，后者只做 uv2 平均（B 组看不到差异）。挂了会让 `--narrow`
+    #     在每次改立方体生成器时白跑一遍。
+    "verify_vertex_format": ["assetio/Vertex.h",
+                             "assetio/MeshFormat.*",
+                             "assetio/VertexOps.*",
+                             "assetio/FbxImport.*",
+                             "engine/assets/VMeshLoader.cpp",
+                             "engine/assets/AssetSelfTest.cpp"],
+    # morph 数据链（§14）的触发面几乎完全覆盖了上一刀 —— 这两条用例读的是
+    # 同一批文件的不同侧面（一个是格式、一个是数据），所以故意让它们重叠：
+    # 改 `FbxImport.cpp` 的 blend shape 解析会同时影响 uv2/tangent 与 morph，
+    # 两个脚本都应该跑。
+    # ⚠ 与上一刀同样的**刻意不挂**：
+    #     · `engine/assets/Mesh.h` —— 横切（在 GLOBAL_GLOBS 里），写进来
+    #       不影响行为，但会让读代码的人以为"改它只影响这条用例"。
+    #     · `engine/assets/Mesh.cpp` —— `setMorph` 是纯 setter，没有逻辑。
+    "verify_morph": ["assetio/SourceModel.h",
+                     "assetio/MeshFormat.*",
+                     "assetio/VertexOps.*",
+                     "assetio/FbxImport.*",
+                     "engine/assets/VMeshLoader.cpp",
+                     "engine/assets/AssetSelfTest.cpp"],
+    # GPU 形变（§15）的**像素**用例。这里只登记非横切的输入：
+    #   · `engine/render/Renderer.*`、`engine/assets/**`、`pbr.vert` 全在
+    #     GLOBAL_GLOBS 里 —— 写进来会触发"全横切登记"检查（--narrow 下
+    #     假跳过），所以刻意不写（与 verify_morph 同一个理由）。
+    #   · `editor/EditorApp.cpp` 挂着 `morph.set` 命令，`InspectorPanel.cpp`
+    #     挂着滑条 —— 两者都走 `assets::setMorphWeight`，改任一条这条用例
+    #     都该重跑。
+    #   · `SceneSerializer.*` / `ModelInstance.*` 负责 MorphComponent 的
+    #     存盘与装配：读档丢了组件，视口里就一个滑条都没有。
+    "verify_morph_gpu": ["assetio/FbxImport.*",
+                         "assetio/MeshFormat.*",
+                         "assetio/SourceModel.h",
+                         "editor/EditorApp.cpp",
+                         "editor/InspectorPanel.cpp",
+                         "engine/scene/ModelInstance.*",
+                         "engine/scene/SceneSerializer.*"],
+    # ---- §16 两骨 IK + 挂点（2026-10-25 第八刀）----
+    # 这条用例的证据链是"console 命令 → 组件 → 求解器 → pose → 顶点 → 像素"，
+    # 所以上面每一环的**落点**都得登记，否则改中间一环时它会被判成"不受影响"：
+    #   · TwoBoneIK.*        求解器本体（余弦定理 / 极向量 / 可达区间）
+    #   · BoneAttachment.*   挂点：`jointMat · invBind⁻¹` 反推骨骼世界矩阵
+    #   · AnimatorSystem.*   三层的**施加顺序**（LookAt → IK → 弹簧骨）。
+    #     顺序错了的表现不是崩，是"走路时脚被头发拽歪"这种没法归因的怪。
+    #   · SceneSerializer.*  `ik` / `attach` 两段的读写：读档丢组件 = 视口里
+    #     看不出任何异常，但 IK 已经没了（K1 会绿，因为基线也没有）
+    #   · InspectorPanel.cpp `drawTabAnimation` 末尾的两段控件
+    #   · EditorApp.cpp      `ik.set` / `ik.weight` / `ik.list` / `attach.bind`
+    # ⚠ 刻意**不登记** `engine/assets/Skeleton.*`：`findJoint` 是本轮从
+    #   Animator/LookAt 抽出来的公共实现，但 `engine/assets/**` 在
+    #   `GLOBAL_GLOBS` 里 —— 改它本来就全量，写进来在 `--narrow` 下会假跳过。
+    "verify_ik": ["engine/animation/TwoBoneIK.*",
+                  "engine/animation/BoneAttachment.*",
+                  "engine/animation/AnimatorSystem.*",
+                  "engine/scene/SceneSerializer.*",
+                  "editor/InspectorPanel.cpp",
+                  "editor/EditorApp.cpp"],
     # ---- 阶段 M1：运行时骨架（G01~G05）----
     # 三条用例的实现主体全在 `runtime/**`（G01 拆出来的那个独立目标）。
     # 同一个 glob 挂到三条名下是**故意**的：改 runtime 的任何一行，

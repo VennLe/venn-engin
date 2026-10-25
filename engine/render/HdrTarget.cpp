@@ -68,60 +68,116 @@ void HdrTarget::createRenderPasses() {
 
     const bool msaa = msaaEnabled();
 
-    // ---- 1) 深度预通道：只有一个多采样深度附件 ----
+    // ---- 1) 几何预通道：深度 + 几何缓冲（法线/线性深度）----
+    //
+    // 附件排布（括号里是索引）：
+    //   深度 (0)  ·  几何 (1)  ·  [几何 resolve (2)，仅 MSAA]
+    // clearValueCount 因此是 2：只有 (0)(1) 需要清。(2) 是 DONT_CARE 的
+    // resolve 目标，规范只要求 clearValueCount 覆盖到"最高清屏附件索引"。
     {
-        VkAttachmentDescription depth{};
-        depth.format = m_depthFormat;
-        depth.samples = m_samples;
-        depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        VkAttachmentDescription att[3]{};
+
+        // (0) 深度
+        att[0].format = m_depthFormat;
+        att[0].samples = m_samples;
+        att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         // 必须 STORE —— 前向通道要用 LOAD 复用这份深度
-        depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         // finalLayout = DEPTH_READ_ONLY：预通道与前向之间可能插着
         // SSAO pass，它要把这张深度图当**纹理**采样。渲染pass结束
         // 时自动转到 READ_ONLY 布局，前向的 initialLayout 与之衔接。
-        depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
+        att[0].finalLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
+
+        // (1) 几何缓冲
+        att[1].format = kGeometryFormat;
+        att[1].samples = m_samples;
+        att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (msaa) {
+            // 多采样那张只是 resolve 的源，之后没人读 → DONT_CARE
+            att[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            att[1].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        } else {
+            // 无 MSAA：它本身就是最终可被采样的那张
+            att[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            att[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            att[1].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
+        uint32_t attachmentCount = 2;
+        if (msaa) {
+            // (2) resolve 目标：单采样、被后处理采样
+            att[2].format = kGeometryFormat;
+            att[2].samples = VK_SAMPLE_COUNT_1_BIT;
+            att[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            att[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            att[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            att[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            att[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            att[2].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            attachmentCount = 3;
+        }
 
         VkAttachmentReference depthRef{
             0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference geoRef{1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference geoResolveRef{
+            2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
 
         VkSubpassDescription subpass{};
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        subpass.colorAttachmentCount = 0;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &geoRef;
+        subpass.pResolveAttachments = msaa ? &geoResolveRef : nullptr;
         subpass.pDepthStencilAttachment = &depthRef;
 
         VkSubpassDependency deps[2]{};
-        // 外部 → 子过程：等该帧此前对同一深度图的使用结束
+        // 外部 → 子过程：等该帧此前对同一深度图/几何图的使用结束。
+        // 几何图多一类读者：**上一帧的后处理**把它当纹理采样（描边）。
+        // 少了 FRAGMENT_SHADER / SHADER_READ 这一对，就是"上一帧还在读、
+        // 这一帧已经在写"的 WAR 竞争 —— 表现是偶发的一帧描边乱闪。
         deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
         deps[0].dstSubpass = 0;
         deps[0].srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         deps[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                VK_ACCESS_SHADER_READ_BIT |
+                                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         deps[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        deps[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         // 子过程 → 外部：深度写"交出去"。读者有两类：
         //   · 前向通道继续当附件用（READ/WRITE，老语义）
-        //   · 屏幕空间效果把它当纹理采样（FRAGMENT + SHADER_READ，
-        //     2026-10-12 新增 —— 没有这条，SSAO 读到的是未同步内容）
+        //   · 屏幕空间效果 / 后处理把它们当纹理采样（FRAGMENT + SHADER_READ）
+        //     没有这条，SSAO 与描边读到的都是未同步内容
         deps[1].srcSubpass = 0;
         deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-        deps[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        deps[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        deps[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         deps[1].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
         deps[1].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                                 VK_ACCESS_SHADER_READ_BIT;
 
         VkRenderPassCreateInfo ci{};
         ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        ci.attachmentCount = 1;
-        ci.pAttachments = &depth;
+        ci.attachmentCount = attachmentCount;
+        ci.pAttachments = att;
         ci.subpassCount = 1;
         ci.pSubpasses = &subpass;
         ci.dependencyCount = 2;
@@ -281,13 +337,44 @@ void HdrTarget::createFrame(Frame& f) {
                                    &f.depthSampledView));
     }
 
-    // 深度预通道 framebuffer（只有深度）
+    // 几何缓冲（法线 + 线性深度）。
+    //   MSAA 开：一张多采样（只当 resolve 的源，storeOp=DONT_CARE）
+    //            + 一张单采样（resolve 目标，后处理采样这张）
+    //   MSAA 关：只建单采样那张（它同时是颜色附件）
+    // 采样数与 renderpass 的附件描述必须一致，否则 vkCreateFramebuffer
+    // 会直接报 VUID。
+    if (msaaEnabled()) {
+        createImage2D(m_device, m_extent.width, m_extent.height, kGeometryFormat,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                      VK_IMAGE_ASPECT_COLOR_BIT, f.geoImage, f.geoMemory,
+                      f.geoView, m_samples);
+    }
+    createImage2D(m_device, m_extent.width, m_extent.height, kGeometryFormat,
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_SAMPLED_BIT,
+                  VK_IMAGE_ASPECT_COLOR_BIT, f.geoResolveImage,
+                  f.geoResolveMemory, f.geoResolveView,
+                  VK_SAMPLE_COUNT_1_BIT);
+
+    // 深度预通道 framebuffer（深度 + 几何 + [几何 resolve]）
     {
+        VkImageView views[3]{};
+        views[0] = f.depthView;
+        uint32_t count = 0;
+        if (msaaEnabled()) {
+            views[1] = f.geoView;
+            views[2] = f.geoResolveView;
+            count = 3;
+        } else {
+            views[1] = f.geoResolveView;
+            count = 2;
+        }
+
         VkFramebufferCreateInfo fbci{};
         fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         fbci.renderPass = m_depthPrePass;
-        fbci.attachmentCount = 1;
-        fbci.pAttachments = &f.depthView;
+        fbci.attachmentCount = count;
+        fbci.pAttachments = views;
         fbci.width = m_extent.width;
         fbci.height = m_extent.height;
         fbci.layers = 1;
@@ -326,6 +413,9 @@ void HdrTarget::destroyFrame(Frame& f) {
         vkDestroyFramebuffer(dev, f.depthFb, nullptr);
         f.depthFb = VK_NULL_HANDLE;
     }
+    destroyImage2D(m_device, f.geoResolveImage, f.geoResolveMemory,
+                   f.geoResolveView);
+    destroyImage2D(m_device, f.geoImage, f.geoMemory, f.geoView);
     destroyImage2D(m_device, f.depthImage, f.depthMemory, f.depthView);
     if (f.depthSampledView != VK_NULL_HANDLE) {
         vkDestroyImageView(m_device.get(), f.depthSampledView, nullptr);

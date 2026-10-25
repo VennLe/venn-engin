@@ -83,7 +83,14 @@ void RenderTarget::apply(const std::vector<VkImageView>& swapViews,
         for (uint32_t i = 0; i < m_hdr->framesInFlight(); ++i)
             inputs.push_back(m_hdr->colorView(i));
     }
-    m_post->recreate(swapViews, swapExtent, inputs, postViewport);
+    // 几何缓冲（描边输入）。**必须**跟着一起重建：HdrTarget::recreate
+    // 底下会把每帧的几何图整组销毁重建，旧视图就是悬垂句柄 ——
+    // 拿它写描述符不会立刻报错，而是在下一帧采样时读已释放内存。
+    std::vector<VkImageView> geo;
+    geo.reserve(m_hdr->framesInFlight());
+    for (uint32_t i = 0; i < m_hdr->framesInFlight(); ++i)
+        geo.push_back(m_hdr->geometryView(i));
+    m_post->recreate(swapViews, swapExtent, inputs, postViewport, geo);
     refreshTextures();
 }
 
@@ -100,7 +107,11 @@ void RenderTarget::recreatePost(const std::vector<VkImageView>& swapViews,
     }
     const VkExtent2D postViewport =
         m_offscreen ? VkExtent2D{m_width, m_height} : VkExtent2D{0, 0};
-    m_post->recreate(swapViews, swapExtent, inputs, postViewport);
+    std::vector<VkImageView> geo;
+    geo.reserve(m_hdr->framesInFlight());
+    for (uint32_t i = 0; i < m_hdr->framesInFlight(); ++i)
+        geo.push_back(m_hdr->geometryView(i));
+    m_post->recreate(swapViews, swapExtent, inputs, postViewport, geo);
     refreshTextures();
 }
 

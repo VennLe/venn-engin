@@ -572,9 +572,13 @@ public:
         uint32_t lodSwitches = 0;
 
         // ---- Shader 变体（关键字系统，见 render/ShaderKeywords.h）----
-        // 本帧各变体各画了多少个，下标 = 关键字掩码（0..7）。
-        // 全 0 的项不在日志里打印，否则一行 8 段全是 0 根本读不动。
-        uint32_t variantCounts[1u << kKeywordCount] = {};
+        // 本帧各变体各画了多少个。**稀疏表**：一帧里实际出现的组合通常
+        // 不超过 10 种，用 `[1 << kKeywordCount]` 的定长数组在位宽增长时
+        // 是平方级浪费（7 位 512 B 尚可，15 位 128 KB，20 位 4 MB，而
+        // RenderStats 是值语义嵌在 Renderer 里的）。
+        // 超容量的项直接丢弃 —— 只影响调试日志，不影响渲染。
+        render::VariantSlot variantCounts[render::kMaxVariantSlots] = {};
+        uint32_t variantSlotCount = 0;
         // 因掩码变化而重绑管线的次数。和 drawCalls 一比就知道变体切换
         // 带来的绑定开销有多大（同掩码相邻的物体不会重绑）。
         uint32_t variantSwitches = 0;
@@ -988,6 +992,16 @@ private:
     //      一帧要算 3~4 遍。缓存下来是纯赚。
     // 之后所有几何提交路径都遍历这两张表，不再碰 ECS。
     // ------------------------------------------------------------
+    // ------------------------------------------------------------
+    // 一项的 morph 数据在**本帧**三块 SSBO 里的位置（§15）。
+    // 单独成结构而不是摊成 DrawItem 的三个字段：阴影 Pass 也要用同一套
+    // 数字（它按实体走一遍，没有 DrawItem），摊平之后两处就得各维护一份。
+    struct MorphBases {
+        std::uint32_t deltaBase = 0;   // MorphDeltas 的起点
+        std::uint32_t weightBase = 0;  // MorphWeights 的起点
+        std::uint32_t targets = 0;     // 权重个数（= 子网格 target 数），0 = 无
+    };
+
     struct DrawItem {
         const assets::Mesh* mesh = nullptr;
         const assets::Material* material = nullptr;  // 可能为空（走缺省材质）
@@ -1003,6 +1017,12 @@ private:
         // 前向两条路径各取一次掩码，算两遍既费又可能不一致。
         // 材质为空（只有深度预通道会画）时保持 kKeywordNone。
         KeywordMask keywords = kKeywordNone;
+        // 渲染顺序（P0-2/B）。从材质上取一次，理由同 keywords：排序时
+        // 要比较上百万次，每次解引用 `material` 再读两个 int 会多一层
+        // 间接（而且 material 可能为空，得处处判空）。
+        // 空材质沿用材质的默认值 2000/0 → 与改造前"只按距离排"一致。
+        int32_t renderQueue = 2000;
+        int32_t sortOrder = 0;
         // 该项在 Hi-Z 候选表（m_hizAabbScratch）里的下标；-1 = 没进候选表
         // （网格没有包围盒）。R2-2 要按**批序**重排候选 AABB，所以必须
         // 能从这里找回它，不能只靠"两个表的顺序恰好一样"。
@@ -1026,6 +1046,11 @@ private:
         //   `SkinnedMeshComponent::jointBase`（每个实体一份），建表时沿
         //   父链取一次填到这里。
         int32_t jointBase = -1;
+        // ---- GPU 形变（§15）----
+        // 本项在 morph 三块 SSBO 里的位置。`morph.targets == 0` = 没有形变
+        // （绝大多数网格），着色器按顶点的 morphCount == 0 直接跳过。
+        MorphBases morph;
+        std::uint32_t morphSlot = 0;      // MorphInstances 的下标
     };
 
     // 构建本帧绘制列表。isMain 为 true 时累积 RenderStats（预览场景是
@@ -1034,6 +1059,26 @@ private:
     // 走 Scene::spatialIndex()（BVH）取视锥内的候选集，不再线性扫全场景。
     void buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
                         bool isMain);
+
+    // ============================================================
+    // GPU 形变（§15）
+    // ============================================================
+    // 每帧开头（isMain）把三个游标与去重表归零。
+    void resetMorphFrame();
+    // 把一项的 delta 流 / target 权重追加进本帧的 SSBO。
+    // **delta 流按 Mesh* 去重**（同网格只传一份），权重逐实例。
+    // 超预算 → 返回 false（本项退化成静止姿势，并打一次 WARN）。
+    bool appendMorphDraw(const assets::Mesh& mesh,
+                         const std::vector<float>& targetWeights,
+                         MorphBases* out);
+    // 写 MorphInstances[slot]。`bases.targets == 0` 时**显式清零**该槽
+    // （槽是跨帧复用的，留着上帧的记录会让顶点拿别人的权重去形变）。
+    void writeMorphSlot(std::uint32_t slot, const MorphBases& bases);
+    // 阴影 Pass 用：按"实体 + 网格"现场算一份 morph 数据并分配槽位。
+    // 与 buildDrawLists 走**同一条** append 路径，槽位从同一个游标继续
+    // 分配 —— 两条路互不覆盖，且权重一定一致（同一个 MorphRig::evaluate）。
+    std::uint32_t morphSlotForShadow(scene::Scene& scene, ecs::Entity e,
+                                     const assets::Mesh& mesh);
 
     // 深度预通道的几何提交（遍历本帧不透明绘制列表）。
     // 调用方负责 RenderPass 的 begin/end 与 set 0 的绑定。
@@ -1574,6 +1619,37 @@ private:
     // 逐组件（`SkinnedMeshComponent::jointBase`）。这里只剩"本帧已写入
     // 骨骼 SSBO 的关节矩阵总数"（主场景 + 预览场景累加），用于算下标。
     uint32_t m_skinJointOffset = 0;
+
+    // ================= GPU 形变（§15）=================
+    //
+    // 每帧重建三块 SSBO 的内容（见 buildMorphFrameData）。三个游标在
+    // `isMain` 时归零：主场景先排、预览场景接着累加（照 m_instanceOffset）。
+    std::uint32_t m_morphDeltaOffset = 0;
+    std::uint32_t m_morphWeightOffset = 0;
+    // 本帧"这个 Mesh* 的 delta 流放在哪"——**同一网格只传一份**。
+    // 去重很值：一只角色 19 个子网格里 5 个有 morph，但同一只被摆三次时
+    // 不去重就是 3 × 566 KB/帧 的纯 memcpy。
+    std::unordered_map<const assets::Mesh*, std::uint32_t> m_morphDeltaBase;
+    // 求值输出（每子网格 × 每 target 的权重）。复用同一份，避免每项分配。
+    std::vector<std::vector<float>> m_morphWeightsScratch;
+    // 上一只求值过的模型：同一只角色的所有子网格只求一次。
+    //
+    // 缓存键是 **MorphComponent 的地址**，不是实体 id —— 每个子网格是
+    // 独立实体（`findInAncestors` 从子网格往上找才拿到同一个组件），
+    // 用实体 id 当键会让 19 个子网格各求一遍（白乘 19 的 O(target)，
+    // 虽然不致命但完全没有理由）。同一模型根的所有子网格拿到的
+    // `MorphComponent*` 是同一个对象，正好就是这个缓存想表达的身份。
+    // 用 void* 存是为了不在本头文件里拖进 Components.h。
+    const void* m_morphEvalOwner = nullptr;
+    // 本帧超预算（delta / 权重 / 槽位任一块装不下）→ 本帧整体退化成
+    // 静止姿势。**不静默**：打一条 WARN，并且只在"第一次超"时打。
+    bool m_morphBudgetHit = false;
+    bool m_morphBudgetWarned = false;
+    // 本帧"真的有形变数据"的绘制项数。诊断锚点（`MYVK_MORPH_DBG=1`）用它
+    // 把"表情不动"的三种可能分开：① 一项都没有（数据链没接上）、
+    // ② 有项但 delta/weights 游标没动（appendMorphDraw 提前返回）、
+    // ③ 游标动了但画面不动（问题在 GPU 侧）。
+    std::uint32_t m_morphStatDraws = 0;
 
     VkSampleCountFlagBits m_sampleCount = VK_SAMPLE_COUNT_4_BIT;
     bool m_depthPrePassEnabled = true;

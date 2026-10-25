@@ -61,6 +61,90 @@ EXPECTED = [
     "animator_default_once",    # 只在第一次补；之后清空就真的空着
     "animator_model_fallback",  # anim.model 空 → 用 sk.model
     "animator_joint_bitwise",   # Animator 路径的关节矩阵与参考实现逐位相同
+    # ---- 表演层（2026-10-25）：L2 LookAt + L4 弹簧骨 ----
+    # 全是数值断言：链识别 / 距离守恒 / 收敛 / 限幅。
+    # 头发歪 3cm 与歪 5cm 在 1080p 截图上长得一样，这些只能断数值。
+    "spring_rig_count",         # 匹配前缀且父骨也匹配 → 2 根（不是 3）
+    "spring_rig_restlen",       # 链长取自静止姿势（不是运行时姿势）
+    "spring_rig_nomatch",       # 前缀对不上 → 0 根，不崩
+    "spring_first_frame",       # 第一帧只初始化、不改姿态（返回 0）
+    "spring_len_attach",        # 到 attach 骨的距离 == 链长
+    "spring_len_chain",         # 链内相邻质点的距离 == 链长
+    "spring_converged",         # 静止 60 帧后位置不再变（收敛，不震荡）
+    "spring_lag",               # 头突然转 90° → 发梢落后于纯动画位置
+    "lookat_resolve_auto",      # 空名字 → 自动找到 head
+    "lookat_resolve_byname",    # 按名字精确命中
+    "lookat_resolve_missing",   # 找不到 → -1（而不是静默取第 0 根）
+    "lookat_unclamped_180",     # 不限幅时确实转得过去
+    "lookat_clamped_45",        # 限幅 45° 时停在 45°
+    "lookat_weight_zero",       # weight=0 → 姿态逐位不变
+    "spring_integration_first_frame",  # 走完整 tick 路径的第一帧逐位相同
+    # ---- 第八刀（2026-10-25）：Skeleton::findJoint 抽取 + 两骨 IK + 挂点 ----
+    # 名字匹配那一组不是"函数有返回值"，而是**那个标志位真的有用**：
+    # 不带 SkipEndTips 会命中 `Head_end`（骨尖辅助骨，2），带的时候命中真头（3）。
+    "find_joint_exact",          # 精确优先于数组顺序（hand_l 在 hand_l_end 之后）
+    "find_joint_substring",      # 不区分大小写 + 包含：HEAD → mixamorig:Head
+    "find_joint_endtip_exact",   # 精确写出 Head_end 时必须拿到它（精确不过滤）
+    "find_joint_endtip_hit",     # 不带标志位 → 命中骨尖（这就是标志位的理由）
+    "find_joint_endtip_skip",    # 带标志位 → 命中真头
+    "find_joint_empty",          # 空名字 → -1（不是 0）
+    "find_joint_missing",        # 对不上 → -1
+    "find_prefix_count",         # 前缀批量匹配
+    "find_prefix_empty",         # 空前缀**不**匹配一切
+    # IK 组：脚离地 2cm 和 20cm 在 1080p 里是同一只脚，只能断数值。
+    "ik_resolve_auto_root",      # 空名字 → 自动挑 thigh
+    "ik_resolve_auto_mid",       # → 最长子骨（小腿）
+    "ik_resolve_auto_end",       # → 再下一跳（脚）
+    "ik_resolve_byname",         # 显式名字
+    "ik_resolve_broken",         # 名字找得到但不成链 → 整条拒绝
+    "ik_resolve_missing",        # 名字对不上 → 拒绝
+    "ik_control_gt_10cm",        # **对照组**：不解算时差 >10cm（没有它等于没测）
+    "ik_applied",                # 真的写了 pose
+    "ik_reach_error",            # 末端落在目标上（<2mm）
+    "ik_bend_deg",               # 余弦定理的定值（d=0.728 → 弯 49.0°）
+    "ik_weight_zero",            # weight=0 → 姿态逐位不变
+    "ik_no_target",              # 无目标 → 不动
+    "ik_deterministic",          # 同一输入两次逐位相同（选解析解的核心理由）
+    "ik_pole_follows_anim_a",    # 极向量从当帧动画反推：A 侧
+    "ik_pole_follows_anim_b",    # 同一目标、换弯曲平面 → 弯向另一边
+    "ik_unreachable_finite",     # 够不着也不能出 NaN
+    "ik_unreachable_straight",   # 够不着时腿伸直（弯 <8°）
+    "ik_unreachable_error",      # 并且**如实**报出剩余误差（9.20）
+    "ik_too_close_fold",         # 目标贴脸 → 折到底（≈180°）
+    "ik_pole_degenerate_fallback",  # 腿完全伸直时极向量退化 → 退到 poleVector
+    "ik_integration_count",      # 组件真的被系统看见了
+    "ik_integration_reached",    # 走完整 tick 路径后关节矩阵里的末端在目标上
+    # 挂点组：位置可以走两条完全独立的算法（jointMatrices 反推 vs 纯 FK）
+    "attach_count",              # 真的摆好了
+    "attach_follows_anim",       # 与纯 FK 独立算出的位置一致（互校）
+    "attach_moved",              # 并且确实跟着动画转过去了
+    "attach_missing_count",      # 骨名对不上 → 计 1 次失败
+    "attach_missing_keeps_transform",  # 且不改写 TransformComponent
+    # ---- 状态机（2026-10-25）：A2b，把 animator 上的占位字段接成真的 ----
+    # 这一组是"七个假开关"里五个的验收：controllerPath 被读、stateIndex 与
+    # stateTime 被读写、三张参数表被条件消费。
+    "sm_load_ok",               # 内存 JSON 能解析成有效控制器
+    "sm_validate_rejects",      # 三类配置错误全部被拦下（未知状态 / 重名 / 未声明参数）
+    "sm_init_dt_zero_state",    # dt=0 也要初始化到 defaultState（编辑器语义）
+    "sm_init_dt_zero_clip",     # 且 clip 真的切过去了
+    "sm_init_dt_zero_time",     # 但 stateTime 不推进
+    "sm_init_state_time",       # dt>0 时 stateTime 开始走
+    "sm_transition_count",      # 条件成立 → 本帧采纳 1 条转移
+    "sm_transition_state",      # stateIndex 真的变了
+    "sm_transition_clip",       # clipName 真的变了
+    "sm_state_time_reset",      # 转移后 stateTime 归零（hasExitTime 靠它）
+    "sm_fade_dur",              # transition.duration 真的进了 fadeDur
+    "sm_fading",                # 真的进入了交叉淡入（不是硬切）
+    "sm_one_per_frame",         # 多条同时满足时一帧只走一步
+    "sm_trigger_consumed",      # trigger 被采纳后立即清零
+    "sm_trigger_no_reentry",    # 清零后不会重新触发（否则无限起跳）
+    "sm_exit_load",
+    "sm_exit_blocked",          # hasExitTime 未到点 → 不许走
+    "sm_exit_passed",           # 过点后放行
+    "sm_phase_continuous",      # restart=false 按归一化相位换算播放头
+    "sm_clip_missing_ignored",  # 目标 clip 不存在 → 忽略该转移（不切 T-pose）
+    "sm_clip_missing_kept_clip",# 且保持原 clip
+    "sm_load_fail_fallback",    # 路径不存在 → 不崩，回落到单 clip 直放
 ]
 
 TEST_RE = re.compile(r"ANIM-TEST\s+(\S+)\s+actual=(\S+)\s+expected=(\S+)\s+"
@@ -132,9 +216,12 @@ def main() -> int:
         print("    ANIM-TOTAL pass=%d fail=%d" % total)
         if total[1] != 0:
             failures.append("ANIM-TOTAL fail=%d" % total[1])
-        if total[0] != len(seen):
-            failures.append("ANIM-TOTAL pass=%d 与脚本数到的 %d 行不一致"
-                            % (total[0], len(seen)))
+        if total[0] + total[1] != len(seen):
+            # ⚠ 比的是 pass+fail 而不是只比 pass：只比 pass 的话，
+            #   任何一条 FAIL 都会连带报一条"计数不一致"，让人以为是
+            #   两个独立的问题（2026-10-25 加弹簧骨断言时踩到）。
+            failures.append("ANIM-TOTAL pass=%d fail=%d 与脚本数到的 %d 行不一致"
+                            % (total[0], total[1], len(seen)))
 
     missing = [n for n in EXPECTED if n not in seen]
     if missing:

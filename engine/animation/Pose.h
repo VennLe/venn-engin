@@ -63,6 +63,20 @@ void samplePose(const assets::Skeleton& skel, const assets::AnimationClip* clip,
 void poseToJoints(const assets::Skeleton& skel, const Pose& pose,
                   std::vector<glm::mat4>& out);
 
+// 局部姿态 → **每骨的世界矩阵**（不含 invMeshNode / invBind）。
+//
+// 为什么单拎出来（2026-10-25，L4 表演层）：
+//   弹簧骨 / LookAt / IK 这三类"姿态后处理"都需要"每骨在世界里的位置和
+//   旋转"，但它们改的是**局部旋转** —— 于是必须能"看世界、改局部"。
+//   以前这份累乘只存在于 poseToJoints 内部，外部拿不到，逼得每个后处理
+//   各写一份 FK。三份实现各错一点点的症状是"某根骨歪了 1 度"，几乎不可能查。
+//
+// `poseToJoints` 现在就是 `poseToWorld` + 乘 invBind 两段 —— 数学与表达式
+// 顺序都没变，所以 A0-5 那条"与 Skeleton::sample 输出 memcmp 级相同"的
+// 断言照样成立（`MYVK_ANIM_TEST` 的 refactor_identity 组会验）。
+void poseToWorld(const assets::Skeleton& skel, const Pose& pose,
+                 std::vector<glm::mat4>& out);
+
 // 两个姿态按 w ∈ [0,1] 混合：w=0 → a，w=1 → b。
 // ⚠ **端点必须短路**：`slerp(q,q,w)` 在浮点下不是恒等，
 //   w=0 走一次 slerp 会引入 1e-7 的漂移，长跑后角色会"慢慢转歪"。

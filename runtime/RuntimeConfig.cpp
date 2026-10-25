@@ -150,6 +150,7 @@ void applyGameJson(RuntimeConfig& cfg) {
         pStr("walkClip", cfg.player.walkClip);
         pStr("runClip", cfg.player.runClip);
         pStr("jumpClip", cfg.player.jumpClip);
+        pStr("controller", cfg.player.controller);
         pNum("walkSpeed", cfg.player.walkSpeed);
         pNum("runSpeed", cfg.player.runSpeed);
         pBool("restartOnSwitch", cfg.player.restartOnSwitch);
@@ -217,6 +218,9 @@ void applyEnv(RuntimeConfig& cfg) {
     // （模型 / clip）。其余字段是美术与手感参数，属于 game.json 的范畴。
     cfg.player.model = envStr("MYVK_RUNTIME_PLAYER_MODEL", cfg.player.model);
     cfg.player.clip = envStr("MYVK_RUNTIME_PLAYER_CLIP", cfg.player.clip);
+    // 状态机控制器：自动化要能"换成这个控制器跑一遍"（与换模型同一个诉求）。
+    cfg.player.controller =
+        envStr("MYVK_RUNTIME_CONTROLLER", cfg.player.controller);
     cfg.traceStates = envFlag("MYVK_RUNTIME_TRACE_STATES", cfg.traceStates);
     // `MYVK_RUNTIME=1`：运行时 verbose（每 60 帧一行 GAME-LOOP）。
     // 这个**裸**名字是 ship_roadmap 里写定的，所以保留（白名单里已登记）。
