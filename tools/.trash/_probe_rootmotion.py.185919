@@ -1,0 +1,36 @@
+"""临时探针：anime_girl 的 Walk 到底有没有根位移（决定 B3 的案例怎么写）。"""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verify_anim_layers as V                                  # noqa: E402
+
+EXE = V.DEFAULT_EXE
+
+# 1) 烤模板（9 个实体：Ground + 根 + 7 个子网格）
+V.bake_template(EXE)
+
+for clip in ("Walk", "Idle", "Run", "RigWalk"):
+    p = V.build_variant("rmprobe_" + clip, None, clip=clip, t=0.0)
+    with open(p, encoding="utf-8") as f:
+        doc = json.load(f)
+    for e in doc["entities"]:
+        if e.get("animator"):
+            e["animator"]["rootMotion"] = 1     # FromClip
+            e["animator"]["playing"] = True
+        if e.get("skinned"):
+            e["skinned"]["playing"] = True
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False)
+
+    lines, vp, img, errs = V.run_shot(EXE, p, dict(V.ENV),
+                                      os.path.join(V.OUT_DIR,
+                                                   "rm_%s.png" % clip),
+                                      cam=V.CAM, wait=6.0)
+    hits = [l for l in lines if "ANIM-ROOTMOTION" in l]
+    print("=== clip=%s ===" % clip)
+    if not hits:
+        print("   没有 ANIM-ROOTMOTION（dist 一直是 0 → 这段动画是原地做的）")
+    for l in hits[-3:]:
+        print("  ", l.strip())

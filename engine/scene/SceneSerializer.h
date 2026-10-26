@@ -19,7 +19,11 @@
 
 namespace assets {
 class AssetManager;
-class Material;
+// ⚠ 必须是 `struct` —— 与 assets/Material.h 的定义一致。
+//   写成 class 时 MSVC 会警告 C4099，而名字修饰会变成 `AEBV`（class）
+//   而不是 `AEBU`（struct）：增量构建看着没事（每个 TU 只见到一种），
+//   全量重编就 LNK2019。10-23 已经在这条上栽过一次，C4099 是唯一前兆。
+struct Material;
 }
 namespace scene {
 class Scene;

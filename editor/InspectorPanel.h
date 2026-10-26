@@ -77,6 +77,7 @@ public:
         Physics,     // 物理系统：碰撞体
         Material,    // 材质
         Animation,   // 动画：蒙皮与片段播放
+        Sequence,    // 过场时间轴（C1）：相机关键帧与事件
         All,         // 全部：旧的"一长条堆叠"视图
         Count,
     };
@@ -113,6 +114,7 @@ private:
     void drawTabPhysics(ecs::Entity e);
     void drawTabMaterial(ecs::Entity e);
     void drawTabAnimation(ecs::Entity e);
+    void drawTabSequence(ecs::Entity e);
     void drawTabAll(ecs::Entity e);
 
     // 该页签需要的组件在这个实体上没有 → 画一行"这里为什么是空的"。
@@ -324,6 +326,24 @@ private:
     char m_animCtrlBuf[256] = {0};
     ecs::Entity m_animDefBufFor{};
     char m_animDefBuf[128] = {0};
+
+    // 附加动画层（B1）的两个文本缓冲：层名 + 遮罩根骨（逗号分隔）。
+    // ⚠ 是**数组**而不是单个 buffer：一层一对，同时编辑多层时各自独立。
+    //   宽度 8 与 InspectorPanel.cpp 里的 `kMaxLayers` 必须一致（超出的层
+    //   不显示文本框，而不是越界写）。
+    static constexpr int kMaxLayerBufs = 8;
+    // 根运动骨名的输入缓冲（B3）。按实体回填 —— 和层的缓冲同一个纪律：
+    // 换选中实体时必须重填，否则用户看到的是上一个角色的骨名。
+    // C1 时间轴：路径输入框的编辑缓冲（按实体懒同步 —— 与 rootBoneBuf 同一套
+    // 写法，直接在组件字符串上 EditText 会让"输入到一半"被每帧覆盖）
+    ecs::Entity m_seqPathBufFor{};
+    char m_seqPathBuf[192] = {};
+    ecs::Entity m_rootBoneBufFor{};
+    char m_rootBoneBuf[96] = {};
+    ecs::Entity m_layerBufFor{};
+    int m_layerBufCount = -1;   // 回填时的层数快照
+    char m_layerNameBuf[kMaxLayerBufs][64] = {};
+    char m_layerMaskBuf[kMaxLayerBufs][192] = {};
     // 弹簧骨的前缀列表（逗号分隔）。与上面两个同模式：buffer 跟着实体走，
     // 换选中目标时重新灌一次，避免"在 A 上打的字出现在 B 上"。
     ecs::Entity m_springPfxBufFor{};

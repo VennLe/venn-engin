@@ -10,6 +10,7 @@
 #include "assets/Texture.h"
 #include "assets/Material.h"
 #include "assets/Model.h"
+#include "assets/RampAsset.h"
 
 // 同名材质冲突要打 WARN（W0-1）。以前这里没有日志依赖 ——
 // 冲突静默合并正是"三个 bug 里最难发现的那个"的根本原因。
@@ -113,6 +114,28 @@ public:
     Texture* findTexture(const std::string& key) const;
     Material* findMaterial(const std::string& key) const;
 
+    // ============================================================
+    // Toon 色带资产（A6，2026-10-26）
+    //
+    // 材质槽 `rampMap` 指向本管理器持有的 `RampAsset::texture` —— 材质本身
+    // **不拥有**色带（与其它纹理槽同一条语义：Texture* 是弱引用）。
+    // 缓存键：
+    //   · 从磁盘读 → 相对 assets/ 的路径（同一份 .vramp 全场共享一张纹理）
+    //   · 程序化新建 → 调用方给的 name
+    // ------------------------------------------------------------
+    // 读 `.vramp`；失败（文件缺失 / JSON 坏 / 目录不对）返回 nullptr 并打
+    // WARN，**不抛** —— 与 tryLoadTexture 同一条容错纪律。
+    RampAsset* loadRampAsset(const std::string& relPath,
+                             const std::string& name = "");
+    // 程序化新建（3 档预设）。同名已存在则直接复用。
+    RampAsset* makeRampAsset(const std::string& name);
+    RampAsset* findRampAsset(const std::string& key) const;
+    // 编辑色带之后必须调它：重新烘 256×1 纹理并**换掉** texture 指针。
+    // 调用方随后要把所有引用该色带的材质的 `rampMap` 指到新纹理上
+    // （见 InspectorPanel 的 commit 路径）。
+    void rebuildRampTexture(RampAsset& ramp);
+    const TextureContext& textureContext() const { return m_ctx; }
+
     // ---- 材质稳定身份（W0-2）----
     // 按 `Material::id`（`models/xxx.glb#Skin`）查。线性扫描 —— 材质数量在
     // 几百级，且只发生在读场景时，不做二级索引。
@@ -168,6 +191,12 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Material>> m_materials;
     std::unordered_map<std::string, std::unique_ptr<Model>> m_models;
     std::unordered_map<const Mesh*, std::unique_ptr<LodChain>> m_lods;
+    // Toon 色带（A6）。键同 m_textures 的约定：磁盘资产用相对路径，
+    // 程序化资产用调用方给的名字。
+    std::unordered_map<std::string, std::unique_ptr<RampAsset>> m_ramps;
+    // 重建色带时**退役**的旧纹理（见 rebuildRampTexture 的说明）：
+    // 留几帧再释放，避免销毁还在在途 CB 里的对象。
+    std::vector<std::unique_ptr<Texture>> m_rampRetired;
 
     // 同名材质冲突的编号源（W0-1）。只增不减 —— 编号进了存档，
     // 复用会让"同一个名字"在两次加载里指到不同的材质。
@@ -185,6 +214,7 @@ private:
 
 #include "assets/MeshLoader.h"
 #include "assets/Lod.h"
+#include "assets/AssetPath.h"
 #include "core/Logger.h"
 #include "rhi/Device.h"
 #include "rhi/CommandPool.h"
@@ -613,6 +643,94 @@ inline Texture* AssetManager::findTexture(const std::string& key) const {
 inline Material* AssetManager::findMaterial(const std::string& key) const {
     auto it = m_materials.find(key);
     return it == m_materials.end() ? nullptr : it->second.get();
+}
+
+// ---------------- Toon 色带（A6，2026-10-26）----------------
+
+inline RampAsset* AssetManager::findRampAsset(const std::string& key) const {
+    auto it = m_ramps.find(key);
+    return it == m_ramps.end() ? nullptr : it->second.get();
+}
+
+inline void AssetManager::rebuildRampTexture(RampAsset& ramp) {
+    // 1 texel 的过渡在 256 宽下已经是 0.4% —— 肉眼等价于硬边，
+    // 所以不需要为"色带必须硬切"再上 point 采样（那是采样器级改动，
+    // 会影响共享同一批 sampler 的其它纹理）。
+    constexpr uint32_t kWidth = 256;
+    std::vector<uint8_t> px;
+    assets::bakeRampPixels(ramp, kWidth, px);
+
+    auto tex = std::make_unique<Texture>();
+    tex->fromPixels(m_ctx, px.data(), kWidth, 1, true);
+
+    // ⚠⚠ 旧纹理**不能立刻销毁**：它可能还在在途命令缓冲里（材质页每帧
+    //   重算，但上一帧的 CB 可能还没执行完）。违反"recording 状态时引用
+    //   的对象不能销毁"的直接后果是 invalid state 刷屏 → submit -4 →
+    //   DEVICE_LOST（见 docs/render_resource_lifetime.md）。
+    //   做法：先挪进"退役区"多留几帧。一张 256×1 只占 1 KB，留 64 张
+    //   也就 64 KB —— 用这点内存换掉一整类崩溃。
+    if (ramp.texture) {
+        m_rampRetired.push_back(std::move(ramp.texture));
+        while (m_rampRetired.size() > 64) m_rampRetired.erase(m_rampRetired.begin());
+    }
+    // **先建新的再换** —— 不能让 texture 空一帧：材质页会把空指针位置写成
+    // 缺省白，那一帧角色会闪一下全亮。
+    ramp.texture = std::move(tex);
+
+    // 同一份色带可能被多个材质引用（共享资产语义）。它们的 `rampMap`
+    // 现在指向**已被换下来**的旧纹理，必须一起改过来 —— 漏一个就是
+    // "改了色带，某个部件没变"，最难查的那种不一致。
+    int fixed = 0;
+    for (auto& kv : m_materials) {
+        Material* m = kv.second.get();
+        if (m && m->ramp == &ramp) {
+            m->rampMap = ramp.texture.get();
+            ++fixed;
+        }
+    }
+    VK_LOG_INFO("RAMP-REBUILD key=%s bands=%u retargeted=%d", ramp.name.c_str(),
+                static_cast<unsigned>(ramp.steps()), fixed);
+}
+
+inline RampAsset* AssetManager::loadRampAsset(const std::string& relPath,
+                                              const std::string& name) {
+    const std::string key = name.empty() ? relPath : name;
+    if (auto* hit = findRampAsset(key)) return hit;
+    if (relPath.empty()) return nullptr;
+
+    const std::string full = assets::resolveAssetPath(relPath);
+    RampAsset ramp;
+    if (!assets::loadRamp(ramp, full)) {
+        VK_LOG_WARN("RAMP-MISSING path=%s", relPath.c_str());
+        return nullptr;
+    }
+    ramp.name = key;
+    // 落盘路径统一存**相对**形式，换机器还能找到（同 makeAssetRelative
+    // 的纪律；这里直接把调用方给的相对路径存回去）。
+    ramp.path = relPath;
+    rebuildRampTexture(ramp);
+
+    auto owned = std::make_unique<RampAsset>(std::move(ramp));
+    RampAsset* raw = owned.get();
+    m_ramps[key] = std::move(owned);
+    VK_LOG_INFO("RAMP-LOAD key=%s bands=%u edge=%.3f", key.c_str(),
+                static_cast<unsigned>(raw->steps()), raw->edge);
+    return raw;
+}
+
+inline RampAsset* AssetManager::makeRampAsset(const std::string& name) {
+    const std::string key = name.empty() ? "ramp" : name;
+    if (auto* hit = findRampAsset(key)) return hit;
+
+    RampAsset ramp = assets::makeRampPreset(assets::RampPreset::ThreeStep, key);
+    rebuildRampTexture(ramp);
+
+    auto owned = std::make_unique<RampAsset>(std::move(ramp));
+    RampAsset* raw = owned.get();
+    m_ramps[key] = std::move(owned);
+    VK_LOG_INFO("RAMP-NEW key=%s bands=%u", key.c_str(),
+                static_cast<unsigned>(raw->steps()));
+    return raw;
 }
 
 inline Mesh* AssetManager::registerMesh(const std::string& key,

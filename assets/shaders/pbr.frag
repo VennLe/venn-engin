@@ -190,6 +190,14 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     // y = 本帧探针数；z = 预过滤 cube array 的最大 mip；
     // w = 全局强度倍率。
     vec4 probeParams;
+
+    // ---- 角色光通道（A5，2026-10-26）----
+    // xyz = 世界空间"角色 → 光源"单位方向（**与 lightDir 差一个负号**：
+    //       lightDir 是光的传播方向，这里是"指向光源"的方向）。
+    // w = 总开关（1 开 / 0 关）。关着时下面整段短路。
+    vec4 charLightDir;
+    // rgb = 角色光颜色 × 强度（直射项辐射度）；w = 常量环境色强度。
+    vec4 charLightColor;
 } ubo;
 
 // 级联阴影贴图：一张 **2D array** 的深度图，第 i 层就是第 i 级级联。
@@ -266,18 +274,30 @@ layout(set = 0, binding = 19) uniform sampler2D sssLut;
 // 不值得每个采样点都查一次页表）。
 // ============================================================
 // 布局必须与 C++ 端 render/Bindless.h 的 GpuMaterialPage **逐字节一致**：
-// 6 × 16 B = 96 B，且每一块都从 16 的倍数开始（std430 的 vec4 对齐）。
+// 7 × 16 B = 112 B，且每一块都从 16 的倍数开始（std430 的 vec4 对齐）。
 // 少一个 spare、或者顺序挪错一块，症状都不是编译错误，而是"采到了
 // 另一张贴图"——最难看懂的那类 bug。
 //
 // 前 32 B 的语义与 32 B 时代**完全没变**，这是"关 = 基线"能成立的前提。
+// 扩容史：32 → 96（A1/A5/A6 的四个语义槽）→ 112（A3 眼睛，10-26）。
 struct GpuMaterialPage {
     uvec4 tex0;    // 0  x=albedo y=normal z=ORM w=roughness
     uvec4 tex1;    // 16 x=metallic y=emissive z=height(R4-3) w=ramp
     uvec4 tex2;    // 32 x=matcap y=sdfShadow z=detail w=(预留)
     vec4  params;  // 48 x=rampMode y=matcapStrength z=sdfStrength w=detailStrength
-    vec4  params2; // 64 x=detailTiling y=matcapRotate z/w=(预留)
-    uvec4 spare;   // 80 整块预留
+    vec4  params2; // 64 x=detailTiling y=matcapRotate z=rampEdge w=rampSoftness
+    // A 类语义位（2026-10-26 起不再是"预留"，改成 vec4 以便存 float）：
+    //   x = 标志位（1 = 材质级 useCharacterLight）
+    //   y = 面部 SDF 的采样偏移强度（sdfFaceShift）
+    //   z = 头发各向异性强度（anisoStrength；0 = 硬关）
+    //   w = 各向异性环位置（anisoShift）
+    vec4  spare;   // 80
+    // A3 眼睛（2026-10-26）：
+    //   x = eyeStrength（Unlit 混合权重，0 = 硬关）
+    //   y = eyeIrisDepth（虹膜 UV 视差强度）
+    //   z = eyeCatchlight（程序化眼神光强度，0 = 关）
+    //   w = 预留
+    vec4  spare2;  // 96
 };
 layout(set = 1, binding = 0) uniform sampler2D textures[];
 layout(std430, set = 1, binding = 1) readonly buffer MaterialPages {
@@ -426,6 +446,10 @@ layout(location = 2) in vec2 vUV;
 // 顶点色（Mesh Paint）。默认 (1,1,1,1) → 这一段乘上去是恒等变换，
 // 所以没画过的网格与没有这个通道时逐像素一致。
 layout(location = 3) in vec4 vColor;
+// 世界空间切线（A4 各向异性头发）。xyz 长度 0 = 这个顶点**没有**切线
+// （导入资产没带 TANGENT / LOD 层被刻意丢掉），frag 侧会回退到用
+// 屏幕空间导数现建一个 —— 见 anisoTangent()。
+layout(location = 4) in vec4 vTangent;
 
 layout(location = 0) out vec4 outColor;
 
@@ -519,42 +543,178 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
 //   边界正好落在两档交界上，线性过滤会插成半灰 —— 于是"每档都是平的"
 //   变成"档与档之间是渐变"，量化就白做了。
 // ============================================================
-float toonBandFactor(float ndl) {
-    const float band = smoothstep(0.47, 0.53, ndl * 0.5 + 0.5);
+float toonGate(float u) {
 #if VENN_BINDLESS
-    const float mode = gMat.params.x;
-    if (mode >= 0.0) {
-        float u = ndl * 0.5 + 0.5;
-        if (mode >= 1.0) {
-            const float n = floor(mode + 0.5);
-            u = (floor(u * n) + 0.5) / n;
-        }
-        // 白图 → 恰好 1.0（sRGB 解码后仍是 1.0）→ band * 1.0 逐位等于 band
-        return band * texture(rampMap, vec2(u, 0.5)).r;
+    if (gMat.params.x >= 0.0) {
+        // 交界位置/宽度来自**材质**（params2.z/w），与资产烘进纹理的台阶
+        // 是同一组数。两边不同步就会出现"双重明暗线"（一条来自纹理、
+        // 一条来自闸门），在脸上一眼能看出来。
+        // ⚠ params2.z <= 0 视为"没设过" → 0.5。CPU 侧会把 edge 钳到
+        //   [0.02, 0.98]，所以 0 这个值不可能是一个有意设的 edge。
+        const float e = (gMat.params2.z > 0.0) ? gMat.params2.z : 0.5;
+        const float w = max(gMat.params2.w, 0.0) * 0.5;
+        return (w > 0.0) ? smoothstep(e - w, e + w, u) : step(e, u);
     }
 #endif
-    return band;
+    return smoothstep(0.47, 0.53, u);
 }
 
-vec3 toonDirect(vec3 albedo, vec3 N, vec3 L, vec3 H, float shadow) {
+// ============================================================
+// A6（2026-10-26）：色带从"亮度乘子"升级成"颜色"
+//
+// 上一版 ramp 只读 R 通道，且**乘在程序化两档之上**。它解决了"交界位置
+// 能由美术定"的一半，另一半无解：**暗部的颜色仍然被引擎写死**成
+// vec3(0.45, 0.49, 0.62)。于是黄昏的紫影、树荫的绿影、烛光的暖影都画
+// 不出来 —— 而这几件事恰恰是"一眼看出是哪个游戏"的东西。
+//
+// 现在：ramp 的三个通道**就是**该档的乘子色。
+//   白 = 不改 albedo（缺省 → 与没有这个槽逐位相同，仍是"关 = 基线"）；
+//   0.45/0.49/0.62 = 暗部保留 45% R、蓝相对抬到 1.38 倍（冷影）。
+//
+// ⚠ rampSteps > 0 时的"等分重采样"语义保留：它不管资产里各档的 pos，
+//   强行把 u 分成 N 等份再采样。用途是"拿一张手绘渐变当 N 档色带"，
+//   与"色带自带位置"是两种不同工作流，默认（0）走后者。
+// ============================================================
+vec3 toonRampTint(float u) {
+#if VENN_BINDLESS
+    if (gMat.params.x >= 0.0) {
+        float su = u;
+        if (gMat.params.x >= 1.0) {
+            const float n = floor(gMat.params.x + 0.5);
+            su = (floor(su * n) + 0.5) / n;
+        }
+        // ⚠⚠ 采样点必须夹到**首末纹素的中心**，否则 u=0 会绕过一圈。
+        //
+        //   rampMap 走的是共享的 `textures[]`，那把采样器是 REPEAT ——
+        //   这是必需的（法线图、贴花要能平铺），不可能为色带单独换一把。
+        //   于是 su=0 的纹理坐标是 -0.5 纹素，回绕到 255.5，线性过滤把
+        //   **最后一档和第一档各取一半**：整条色带的平均色。
+        //
+        //   为什么这个 bug 特别能藏（实测踩了一整轮）：
+        //   ① 症状是"暗档不够暗"，看着像色带本身画得不对，不像采样错；
+        //   ② 缺省色带的首末两档**都接近白**，所以缺省色带下这个 bug
+        //      逐像素看不出来；
+        //   ③ 只有在"整片被钉到 u=0"（面部 SDF 全遮）时才暴露，而那时
+        //      人会先怀疑 SDF，不会怀疑色带坐标。
+        //   钉死它的办法见 verify_toon_shading 第 6 组 ④：用一张
+        //   纯红→纯蓝的两档色带，u=0 必须回**纯红**（B/R < 0.2）。
+        //   ⚠ 宽度不能写死 256 —— 资产烘培宽度是 CPU 侧的实现细节，
+        //     这里问纹理本身要，改宽度不会静默错位。
+        const int texW = max(textureSize(rampMap, 0).x, 1);
+        const float hw = 0.5 / float(texW);
+        su = clamp(su, hw, 1.0 - hw);
+        return texture(rampMap, vec2(su, 0.5)).rgb;
+    }
+#endif
+    return vec3(1.0);
+}
+
+// ============================================================
+// A1（2026-10-26）：面部 SDF 阴影
+//
+// 为什么脸上不能"用法线算阴影"：法线是几何量的插值，脸上那条明暗交界线
+// 会跟着网格的凹凸抖成锯齿；而二次元要的是**美术画的一条干净曲线**。
+// 所以离线把"脸在正光下的阴影形状"画成一张左右对称的 SDF/遮罩图，
+// 运行时只做两件事：按光照方向决定**采样点**，再按采样值决定**用哪一档
+// 颜色**。
+//
+// 采样点怎么算（这是"通道打通"与"真的能用"的分界线）：
+//   脸的法线基本朝前，于是"脸的右方向" ≈ 世界 up × N。用光在该切平面
+//   上的投影当 UV 偏移：
+//       u' = u + dot(L, right)  · shift
+//       v' = v - dot(L, faceUp) · shift
+//   光从右边来 → 采样点右移 → 阴影在脸上往左落。左右脸共用一张图，
+//   是因为**图本身左右对称**（美术按半张脸画再镜像）。
+//
+// ⚠ 这依赖"脸皮的 UV 就是正脸投影/展开"（角色管线的约定）。UV 不是脸部
+//   展开时，SDF 会出现在任意位置 —— 这是**资产**问题，不是着色器能兜的。
+// ⚠ 没有骨骼依赖：如果将来要做"按头部骨骼的真实投影"，把这里换成
+//   "头部世界矩阵求逆 + 光源方向"即可，接口不用动。
+// ============================================================
+float faceSdfMask(vec3 N, vec3 L) {
+#if VENN_BINDLESS
+    // params.z 是"挂了 SDF 图且有强度"的标志（CPU 侧保证：没挂 → 0）。
+    // 用 0 当闸门而不是"贴图是不是白的"，理由与 ramp 的 -1 相同：着色器
+    // 无法从纹理下标反推"这张是不是缺省白"，而白图采样一次也要付带宽。
+    if (gMat.params.z <= 0.0) return 1.0;
+    const vec3 up = vec3(0.0, 0.0, 1.0);   // 世界是 Z-up
+    vec3 right = cross(up, N);
+    right = (dot(right, right) > 1.0e-6) ? normalize(right) : vec3(1.0, 0.0, 0.0);
+    const vec3 faceUp = cross(N, right);
+    const float shift = gMat.spare.y;
+    const vec2 off = vec2(dot(L, right), -dot(L, faceUp)) * shift;
+    const vec2 uv = clamp(vUV + off, vec2(0.0), vec2(1.0));
+    // 取 R 通道：SDF 图是灰度遮罩（白 = 受光）。**线性采样**（srgb=false）
+    // —— 它是"遮罩"不是"颜色"，做 gamma 解码会让中间调整体偏移。
+    return texture(sdfShadowMap, uv).r;
+#else
+    return 1.0;
+#endif
+}
+
+// 把 SDF 结果接到半兰伯特坐标上：阴影处的 u 被推向 0（暗档），
+// 受光处原样。**连续**是关键 —— 用 min/max 会造出新的硬边，
+// 而乘法让"交界软化"这件事仍然由色带自己决定。
+float applyFaceSdf(float u, vec3 N, vec3 L) {
+#if VENN_BINDLESS
+    if (gMat.params.z <= 0.0) return u;
+    const float s = faceSdfMask(N, L);
+    return u * mix(1.0, s, clamp(gMat.params.z, 0.0, 1.0));
+#else
+    return u;
+#endif
+}
+
+// 原型：实现在文件后半（紧接 cotangentFrame，因为"没有顶点切线"的回退
+// 要用它）。GLSL 与 C 一样，先声明就可以先用。
+vec3 hairAnisoSpec(vec3 N, vec3 V, vec3 L, float strength, float shift,
+                   vec3 specColor);
+
+vec3 toonDirect(vec3 albedo, vec3 N, vec3 L, vec3 V, vec3 H, float shadow) {
     const float ndl = max(dot(N, L), 0.0);
-    // ① 半兰伯特 → ② 量化（或 ramp 贴图，见 toonBandFactor）
-    const float band = toonBandFactor(ndl);
-    // ③ 两档的颜色本身。**交界处必须看得见台阶**，否则量化没有意义 ——
-    //   这是本函数唯一容易写错的地方，实测踩过：
-    //   上一版 lit = albedo*(0.55+0.45*ndl) 在交界处（ndl≈0）等于 0.55·albedo，
-    //   而暗部色 R 通道也是 0.56·albedo —— 两者几乎相等，明暗交界线消失，
+    // ① 半兰伯特 → ② 面部 SDF（只对挂了 SDF 的脸生效）
+    const float u = applyFaceSdf(ndl * 0.5 + 0.5, N, L);
+    // ③ 硬高光：只有朝向光源半球时才有，且只取峰值附近
+    const float spec = smoothstep(0.88, 0.93, pow(max(dot(N, H), 0.0), 48.0));
+
+    // ④ A4：头发各向异性高光（Kajiya-Kay 双环）。
+    //    实现放在文件后半（要用 cotangentFrame 做"没有顶点切线"的回退），
+    //    所以这里只留一条原型声明。
+    //    ⚠ strength = 0 时函数**第一行就返回 0**，连切线都不算 ——
+    //      这是"关 = 基线"逐像素成立的依据，别把它改成"算了再乘 0"：
+    //      乘 0 虽然数学上也等价，但 anisoTangent 里的 normalize 在退化
+    //      输入上会先产出 NaN，而 NaN*0 仍然是 NaN。
+#if VENN_BINDLESS
+    const vec3 aniso = hairAnisoSpec(N, V, L, gMat.spare.z, gMat.spare.w,
+                                     mix(albedo, vec3(1.0), 0.55));
+#else
+    // 没有 bindless 就没有材质页 → 也没有 strength/shift 可读。
+    // 与 ramp/SDF 一致：A 类槽只在 VENN_BINDLESS 编译单元里存在。
+    const vec3 aniso = vec3(0.0);
+#endif
+
+#if VENN_BINDLESS
+    if (gMat.params.x >= 0.0) {
+        // 有色带：**颜色完全由色带决定**（暗部色也是美术画的，不再是
+        // 引擎写死的冷蓝），闸门只决定"阴影衰减哪一档"。
+        // 各向异性环**不乘 gate**：它是反射不是漫反射，赛璐璐里环本来
+        // 就横跨明暗交界（只吃 shadow —— 阴影里没有高光）。
+        const float gate = toonGate(u);
+        const vec3 tint = toonRampTint(u);
+        return albedo * tint * mix(1.0, shadow, gate) +
+               vec3(spec * gate * shadow) * 0.6 + aniso * shadow;
+    }
+#endif
+    // ⑤ 无色带：程序化两档（逐像素与引入色带之前一致）。
+    //   **交界处必须看得见台阶**，否则量化没有意义 —— 实测踩过：
+    //   lit = albedo*(0.55+0.45*ndl) 在交界处（ndl≈0）等于 0.55·albedo，
+    //   而暗部色 R 也是 0.56·albedo，两者几乎相等 → 明暗交界线消失，
     //   整颗球看着像"均匀受光 + 稍微发蓝"，完全不是赛璐璐。
-    //   现在亮档抬到 0.80~1.00（保留一点体积渐变），暗档压到 0.45~0.62 且偏蓝：
-    //     交界台阶 R 1.78×（0.80 vs 0.45）—— 肉眼一眼能看出分界；
-    //     暗部 B/R = 0.62/0.45 = 1.38 —— "冷色阴影"而不是"死黑"。
+    const float band = smoothstep(0.47, 0.53, u);
     const vec3 lit = albedo * (0.80 + 0.20 * ndl);
     const vec3 dark = albedo * vec3(0.45, 0.49, 0.62);
-    // 硬高光：只有朝向光源半球时才有，且只取峰值附近
-    const float spec = smoothstep(0.88, 0.93,
-                                  pow(max(dot(N, H), 0.0), 48.0)) * band;
-    // 阴影只衰减受光档（band=1 → lit*shadow；band=0 → dark 原样）
-    return mix(dark, lit * shadow, band) + vec3(spec * shadow) * 0.6;
+    return mix(dark, lit * shadow, band) + vec3(spec * band * shadow) * 0.6 +
+           aniso * shadow;
 }
 #endif
 
@@ -585,6 +745,105 @@ mat3 cotangentFrame(vec3 N, vec3 p, vec2 uv) {
     if (m < 1e-12) return mat3(vec3(1, 0, 0), vec3(0, 1, 0), N);
     float inv = inversesqrt(m);
     return mat3(T * inv, B * inv, N);
+}
+
+// ============================================================
+// A4（2026-10-26）：头发各向异性高光（Kajiya-Kay 天使环）
+//
+// 为什么头发不能用自己的高光：现在的 Toon 高光是 `pow(N·H, 48)` ——
+// 各向同性。也就是说"球面法线朝向合适的地方亮一片"。而真头发是一根根
+// **圆柱**，高光沿"垂直于发丝的方向"铺成一条环，绕着头顶走一圈
+// （天使环 / angel ring）。两者在近景里差得不是量，是**形状**：
+// 各向同性 = 一个圆点；各向异性 = 一条横贯的带子。
+//
+// 数学是 Kajiya-Kay 的化简版：
+//   理想圆柱上的反射满足 `sin(T, H) = 0`（T = 发丝方向，H = 半角向量）。
+//   于是高光强度取 `pow(sin(T,H), n)`，而不是 `pow(N·H, n)`。
+//   这里 `sin = sqrt(1 - (T·H)²)`。
+//
+// ⚠ 必须做**背向衰减**：纯 `sin²` 是偶函数，T 与 H 反向（dot<0，
+//   相当于光从发丝"背面"来）时同样亮 —— 高光会穿到头发内侧去。
+//   用 smoothstep(-1, 0, dot(T,H)) 把它掐掉。
+//
+// ⚠ shift 的作用不是"调亮度"，是**把环沿法线推着走**：
+//   `T' = T - N·(N·T)·shift` 把切线绕副切线轴倾一个角度，高光带就
+//   沿"垂直于发丝"的方向上下移动。二次元头发通常要**两圈**：
+//   主环（锐、贴着头顶）+ 副环（宽、淡、偏下发）。所以这里叠两层，
+//   第二层用更大的偏移与更小的指数 —— 硬编码在函数里，因为
+//   "两圈"是这类美术风格的约定，不是每个材质都要调的参数。
+//
+// ⚠⚠ 切线从哪来：`vTangent`（顶点属性 location 9，沿 UV.x）。
+//   **导入资产多数没有 TANGENT，LOD 层更是刻意被丢掉**（Lod.cpp 里
+//   写明"两个手性相反的切线平均出来是错的切线"）。所以必须有回退：
+//   长度 0 时用 `cotangentFrame()` 从屏幕空间导数现建一个 —— 它算的
+//   正好就是"沿 U 的切线"，与顶点切线语义一致，只是逐像素且会闪。
+//   没有这条回退，LOD 角色的头发会**静默**退回各向同性（画面只是
+//   "不那么好看"，没有任何报错）。
+// ============================================================
+vec3 anisoTangent(vec3 N) {
+    vec3 T = vTangent.xyz;
+    if (dot(T, T) < 1.0e-8) {
+        // 没有顶点切线：拿屏幕空间导数建一个（POM 用的同一个函数）。
+        T = cotangentFrame(N, vWorldPos, vUV)[0];
+    }
+    // 插值后的 T 与 N 未必严格正交（法线/切线各自线性插值），投影回去。
+    T -= N * dot(N, T);
+    if (dot(T, T) < 1.0e-8) {
+        // 退化（球极、UV 接缝、三角形在某方向被压扁）：随便挑一条与 N
+        // 正交的方向，保证不返回 NaN。宁可"环的方向不对"也不要整片消失。
+        const vec3 alt = abs(N.z) < 0.99 ? vec3(0.0, 0.0, 1.0)
+                                         : vec3(1.0, 0.0, 0.0);
+        T = cross(alt, N);
+    }
+    return normalize(T);
+}
+
+// 单环 Kajiya-Kay 项。power 越大环越窄越锐。
+float kajiyaKay(vec3 T, vec3 H, float power) {
+    const float d = dot(T, H);
+    const float sinT = sqrt(max(1.0 - d * d, 0.0));
+    // 背向衰减（见上）：光从发丝背面来时不该有高光。
+    const float atten = smoothstep(-1.0, 0.0, d);
+    return pow(sinT, power) * atten;
+}
+
+// Kajiya-Kay 的 shiftTangent：把切线朝法线方向**倾斜**，再归一化。
+//
+// ⚠⚠ 这里踩过一个很隐蔽的坑，写下来防止回归：第一版写的是
+//   `T' = normalize(T - N * dot(N,T) * shift)` —— 也就是"把切线在切平面
+//   内的分量保留、把法向分量乘个系数"。看起来像"沿法线推"，实际
+//   `anisoTangent()` 返回的 T **已经**被投影到切平面了（`dot(N,T) == 0`），
+//   于是推的量恒为 0，`T' == T`，**shift 成了一个死参数**。
+//   症状：三档 shift 渲出来的画面逐像素完全相同（实测质心 y 37.6/37.6/37.6），
+//   而且亮度、形状全都一样 —— 看着像"UI 没接线"，实际是数学退化。
+//   正确写法就是标准公式 `normalize(T + N*shift)`：直接加法向分量，
+//   归一化之后 T 与 H 的夹角就变了（于是环移动）。T 也不再严格垂直于 N，
+//   这正是有意的：高光带本来就该允许"绕出切平面"。
+vec3 shiftTangent(vec3 T, vec3 N, float shift) {
+    return normalize(T + N * shift);
+}
+
+// strength = 0 → 严格返回 0 且**不做任何计算**（"关 = 基线"的落点）。
+vec3 hairAnisoSpec(vec3 N, vec3 V, vec3 L, float strength, float shift,
+                   vec3 specColor) {
+    if (strength <= 0.0) return vec3(0.0);
+    const vec3 T0 = anisoTangent(N);
+    const vec3 H = normalize(L + V);
+    // 主环：换 shift；副环：再推 0.55（宽而淡）。两环一起移动、间距不变。
+    const vec3 T1 = shiftTangent(T0, N, shift);
+    const vec3 T2 = shiftTangent(T0, N, shift - 0.55);
+    // 主环锐（power 128），副环宽而淡（40，权重 0.2）。
+    // 这三个数是**量出来的**，不是拍的。`s > 0.058`（约等于 8/255 的
+    // 可见阈值，经 specColor×radiance 折算）对应的经度半宽：
+    //   power=48  → ±29°（横跨整颗球的可见宽度，看着像"半个球变亮"）
+    //   power=96  → ±19°（还是一条 144 px 宽的扇形，不为过）
+    //   power=128 → ±13.5°（约 88 px，一条真正的带子）
+    // 副环 weight 从 0.35 降到 0.2 同理：0.35 时副环在 376 px 宽的范围
+    // 内都超过可见阈值，把整条环的包围盒撑到"和球一样宽"，于是
+    // "这条是不是竖直的"这个判据永远测不出来。
+    const float s1 = kajiyaKay(T1, H, 128.0);
+    const float s2 = kajiyaKay(T2, H, 40.0);
+    return specColor * (s1 + 0.20 * s2) * strength;
 }
 
 #if VENN_PARALLAX
@@ -1169,7 +1428,9 @@ vec3 shadeLocalLightMod(Light L, LightExt E, vec3 N, vec3 V, vec3 worldPos,
     // 注意这里不乘 attD/attS —— toonDirect 返回的是完整辐射度乘子，
     // 而 PBR 分支的 attD/attS 是"漫反射/镜面各自的角度项"。
     // shadow 传 1.0：radiance 里已经乘过 shadow，再传真的会**平方衰减**。
-    const vec3 lit = toonDirect(albedo, N, Ls, H, 1.0);
+    // A4 起多传一个 V：各向异性高光需要视线方向（Kajiya-Kay 用 L 与 V
+    // 的半角向量同切线求 sin）。
+    const vec3 lit = toonDirect(albedo, N, Ls, V, H, 1.0);
     return lit * radiance;
 #elif VENN_SHADING_SKIN
     // 面积光/IES/cookie 路径：漫反射同样换成曲率响应（含背阴面渗光，
@@ -1274,6 +1535,37 @@ void main() {
         if (!gl_FrontFacing) geomN = -geomN;
 #endif
         matUV = parallaxUv(geomN, vWorldPos, vUV);
+    }
+#endif
+
+#if VENN_BINDLESS
+    // ---------------- A3：虹膜视差（2026-10-26）----------------
+    // 眼睛是**凹进眼窝的球冠**：正视时虹膜在正中，侧看时虹膜应该朝观察者
+    // 那一侧偏 —— 那点"玻璃珠"的立体感全部来自这个位移。
+    //
+    // 与上面 POM（R4-3）的区别，别混：POM 是**逐层测深**（要高度图，能做
+    // 自遮挡），这里只是沿切线平面对视线做一次**线性**投影 —— 要的是
+    // "虹膜在深处"，不是砖缝的遮挡。所以它一张贴图都不需要。
+    //
+    // 偏移必须写进 **matUV**（所有材质采样共用同一个点），不能只改 albedo：
+    // 虹膜 / 瞳孔 / 巩膜是同一张图上的三层，错开就会"瞳孔掉出虹膜"。
+    // 这也是它放在这里的唯一理由 —— 在材质采样之前。
+    //
+    // ⚠ 两个条件都要判：x（eyeStrength）= 0 时整段不进（关 = 基线），
+    //   y = 0 时也不必白算一次 cotangentFrame。
+    if (gMat.spare2.x > 0.0 && gMat.spare2.y != 0.0) {
+        vec3 eyeN = normalize(vNormal);
+#if VENN_DOUBLE_SIDED
+        if (!gl_FrontFacing) eyeN = -eyeN;
+#endif
+        // TBN 的列是 (T, B, N) → 转置即"世界 → 切线"（同 A1 的 SDF 那段）
+        const vec3 vTan =
+            transpose(cotangentFrame(eyeN, vWorldPos, vUV)) *
+            normalize(ubo.camPos.xyz - vWorldPos);
+        // 取 xy 是因为"横向看多少"由切平面的两个分量决定，z 是"扎进去多深"。
+        // ⚠ 符号只决定虹膜往哪边偏（判据只要求"跟着相机单调移动"），
+        //   不再赋予物理含义 —— 眼球半径/眼窝深度都是画风，不是几何。
+        matUV -= vTan.xy * gMat.spare2.y;
     }
 #endif
 
@@ -1457,6 +1749,28 @@ void main() {
 
     // ---------------- 方向光（唯一带阴影的灯）----------------
     vec3 Ld = normalize(-ubo.lightDir.xyz);
+    vec3 radiance = ubo.lightColor.rgb * ubo.lightDir.w;
+
+    // ---------------- 角色光通道（A5，2026-10-26）----------------
+    // 二次元角色必须"独立打光"：只吃一盏专用主光 + 一个常量环境色。
+    // 两件事同时发生，缺一不可：
+    //   ① 主光换成角色光 —— 脸的明暗交界位置相对**观众**稳定，不随场景
+    //      太阳的方位漂移；
+    //   ② 环境项换成常量色 —— 这条才是"脸不脏"的真正原因。IBL 会把天光
+    //      的蓝、草地的绿、黄昏的橙拌进肤色里，写实看着对，二次元看着脏。
+    // 两个闸门**都要**开：全局开关（ubo.charLightDir.w）与材质勾选
+    // （gMat.spare.x）。后者是关键 —— 它让"同一场景里角色走角色光、
+    // 场景道具走真实光照"成为可能，也是"关 = 基线"的落点（默认材质
+    // 不勾 → 一个像素都不变）。
+    float charLit = 0.0;
+#if VENN_BINDLESS
+    charLit = (ubo.charLightDir.w > 0.5 && gMat.spare.x > 0.5) ? 1.0 : 0.0;
+#endif
+    if (charLit > 0.5) {
+        Ld = normalize(ubo.charLightDir.xyz);
+        radiance = ubo.charLightColor.rgb;
+    }
+
     vec3 H = normalize(V + Ld);
     float NdotL = max(dot(N, Ld), 0.0);
 
@@ -1468,17 +1782,19 @@ void main() {
     vec3 kS = F;
     vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
 
-    vec3 radiance = ubo.lightColor.rgb * ubo.lightDir.w;
-
     // 阴影只衰减直接光；环境光不受遮挡影响（简化处理）
-    float shadow = shadowFactor(vWorldPos, NdotL);
+    // ⚠ 角色光材质**跳过 CSM**：级联阴影的 PCF 台阶（~8 px）在二次元
+    //   脸上是可见的锯齿（审计 P1-13 / A8），而角色光本身就"不是场景里
+    //   的那盏灯"，用它的阴影贴图本来就不自洽。想要场景投影（比如站在
+    //   树下的斑驳光）就不该勾角色光 —— 这是一个二选一，写在文档里。
+    float shadow = (charLit > 0.5) ? 1.0 : shadowFactor(vWorldPos, NdotL);
 #if VENN_SHADING_TOON
     // A1：赛璐璐响应整体替换 PBR 的 (kD*kDiffuse + specular*NdotL) 两项。
     // kD/specular 在上面仍然算了 —— 无常量折叠之外的代价（编译器会把
     // 没人用的分支消掉），换来的是这里读起来不必倒推"哪个变量还有效"。
     // ⚠ shadow 传进函数、由函数只作用在受光档上；这里**不要**再乘一次，
     //   否则背光面会被整项清零（见 toonDirect 的注释）。
-    vec3 direct = toonDirect(albedo, N, Ld, H, shadow) * radiance;
+    vec3 direct = toonDirect(albedo, N, Ld, V, H, shadow) * radiance;
 #elif VENN_SHADING_SKIN
     // R4-2：漫反射乘子换成预积分散射响应（明暗交界线外也渗光 + 泛红），
     // 镜面项仍用真实 NdotL —— 高光不该被次表面散射糊掉。
@@ -1587,18 +1903,39 @@ void main() {
         ambient *= ssao;
     }
 
+    // ---- 角色光：环境项换成常量色（不吃 IBL / 环境探针）----
+    // 位置必须在 IBL/旧路径**之后**、Toon 的分档**之前**：
+    // 放前面会被 IBL 赋值覆盖，放后面就吃不到 Toon 的冷暖分档了
+    // （暗部偏蓝这条是二次元的硬规矩，角色光也得遵守）。
+    // 也刻意**不乘 ao/ssao**：二次元的角色不做环境光遮蔽，脸上一块
+    // 灰是 bug 不是效果。
+    if (charLit > 0.5) {
+        ambient = albedo * ubo.charLightColor.rgb * ubo.charLightColor.w;
+    }
+
     // ---------------- A1：环境光也要跟着亮暗分档 ----------------
     // 只在 Toon 变体里做。理由：IBL 给的是**中性**天光（这里约 +0.14 线性值），
     // 它会把暗部的冷色调冲淡 —— 实测不改这里时暗部 B/R 只有 1.07
     // （线性理论值 1.38），肉眼完全看不出"阴影偏蓝"。
     // 写实路径不动：Default 的环境光本来就是物理量，压它反而错。
 #if VENN_SHADING_TOON
-    // 与 toonDirect 用**同一个** band 函数：挂了 ramp 之后环境光的冷暖
-    // 分界也必须跟着贴图走，否则直接光已经换成分档、环境光还在用程序化
-    // 的 0.47/0.53 交界，两个交界错开就会出现一条"双重明暗线"。
-    const float toonBandAmb = toonBandFactor(max(dot(N, Ld), 0.0));
-    // 暗侧把环境光整体压暗并偏蓝，亮侧保持原样（1.0）
-    ambient *= mix(vec3(0.66, 0.72, 0.90), vec3(1.0), toonBandAmb);
+    // 环境光必须与直接光**走同一条分档曲线**，否则直接光已经换成分档、
+    // 环境光还在用程序化的 0.47/0.53 交界，两个交界错开就会出现一条
+    // "双重明暗线"（实测能看见）。
+    //
+    // 有色带时：直接拿色带的颜色乘 —— 于是"暗部偏紫"这种画风在环境光里
+    //   也成立（只有直射光变色、环境光还是蓝的 = 一眼假）。
+    // 无色带时：原来的"暗侧压暗并偏蓝"（逐像素与引入色带之前一致）。
+    const float uAmb = applyFaceSdf(max(dot(N, Ld), 0.0) * 0.5 + 0.5, N, Ld);
+#if VENN_BINDLESS
+    if (gMat.params.x >= 0.0) {
+        ambient *= toonRampTint(uAmb);
+    } else
+#endif
+    {
+        const float bandAmb = smoothstep(0.47, 0.53, uAmb);
+        ambient *= mix(vec3(0.66, 0.72, 0.90), vec3(1.0), bandAmb);
+    }
 #endif
 
     // 自发光 = 因子 + 贴图。贴图槽空着时绑的是内置纯黑，加法恒等；
@@ -1606,6 +1943,45 @@ void main() {
     vec3 emissive = push.emissive.rgb + texture(emissiveMap, matUV).rgb;
 
     vec3 color = ambient + direct + localLights + emissive;
+
+#if VENN_BINDLESS
+    // ---------------- A3：眼睛 = Unlit 底 + 眼神光（2026-10-26）----------------
+    // 二次元的眼睛**不是算出来的，是画出来的**：巩膜白、虹膜渐变、瞳孔全在
+    // 一张贴图里，场景光不该动它 —— 一束逆光打过来，眼睛也不该变暗。
+    // （真实眼会变暗，二次元不会；这是画风约定，不是物理。）
+    //
+    // 所以这里是**整体替换** ambient+direct+localLights，而不是往里加项：
+    // 加法救不了"暗部眼睛被压黑"这件事 —— 压暗是乘出来的，只有替换能覆盖。
+    //
+    // 立体感只剩两件"贴上去"的东西：
+    //   ① 下面这段的程序化眼神光，位置锁在**头的朝向**（视图空间法线），
+    //      不随光源走 —— 与 matcap 同理，但不用美术再出一张图；
+    //   ② 紧跟其后的 matcap 加法段（材质挂了高光片才有）。
+    // 位置必须在**雾之前**：远处角色的眼睛要跟着雾一起被吞掉，否则会在雾里
+    // 留一颗不合逻辑的亮点。
+    if (gMat.spare2.x > 0.0) {
+        // 底色 = albedo（已含 baseColorFactor、顶点色、detail 贴花）。
+        // 留 ±4% 的法线朝向亮度差：完全没有方向性时圆眼珠会变成一张纯色
+        // 贴纸；而 4% 远低于"换了场景光"的可辨阈值 —— 判据"转太阳眼睛不变"
+        // 用的就是这条余量，别把它调大。
+        const vec3 vsNe = normalize(mat3(ubo.view) * N);
+        const float dome = 0.96 + 0.04 * clamp(vsNe.z, 0.0, 1.0);
+        vec3 eyeColor = albedo * dome;
+
+        // 程序化眼神光：视图空间法线上两个固定位置的高斯光斑
+        // （左上大、右下小 —— 二次元眼睛的通行画法）。
+        // 用 exp(-d²·k) 而不是 smoothstep：没有硬边，缩到几像素时不会成方块。
+        const vec2 sp1 = vsNe.xy - vec2(-0.22, 0.30);
+        const vec2 sp2 = vsNe.xy - vec2(0.30, -0.34);
+        const float catch1 = exp(-dot(sp1, sp1) * 120.0);
+        const float catch2 = exp(-dot(sp2, sp2) * 420.0) * 0.55;
+        eyeColor += vec3(catch1 + catch2) * gMat.spare2.z;
+
+        // mix 而不是 if：0 时与基线逐像素相同（0 已经在外面拦掉了，
+        // 这里只是给美术留 0.8 这种"半透塑料眼"的中间档）。
+        color = mix(color, eyeColor, clamp(gMat.spare2.x, 0.0, 1.0));
+    }
+#endif
 
 #if VENN_BINDLESS
     // ---------------- MatCap 球面高光（A 类，2026-10-25）----------------

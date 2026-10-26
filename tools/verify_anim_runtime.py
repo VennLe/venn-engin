@@ -145,6 +145,68 @@ EXPECTED = [
     "sm_clip_missing_ignored",  # 目标 clip 不存在 → 忽略该转移（不切 T-pose）
     "sm_clip_missing_kept_clip",# 且保持原 clip
     "sm_load_fail_fallback",    # 路径不存在 → 不崩，回落到单 clip 直放
+    # ---- 动画事件（2026-10-26）：B2，Notify ----
+    # 这一组的判据全是"**发了没有 / 几次 / 什么顺序**"，刻意选成可手算的
+    # 整数：三个事件落在 0.0/0.3/0.6、clip 时长 1.0 → 一圈 3 次、两圈 6 次。
+    # 任何"每帧都发"（60 次）、"边界重复发"（4 次）、"时间不推进"（0 次）
+    # 都一眼能看出来。
+    "ev_first_frame_t0",        # 半开区间的第一个受益者：t=0 第一帧就发
+    "ev_pause_no_fire",         # dt=0（prev==new）→ 一条不发
+    "ev_on_event_no_fire",      # 停在事件上 → 不发（闭区间会每帧发）
+    "ev_after_event_once",      # 从事件上往前走 → 只发一次
+    "ev_half_open_right_end",   # 正好落在 new 上 → 这一帧不发
+    "ev_half_open_next_frame",  # 但推到下一帧必发（不会丢）
+    "ev_zero_duration",         # 时长 0：没有"跨过"这回事
+    "ev_count_60fps",           # 5 秒 @60fps = 15 条
+    "ev_count_240fps",          # 同一段时间 @240fps 也是 15 条
+    "ev_count_fps_independent", # 两者相等（纯函数层）
+    "ev_wrap_tail_then_head",   # 跨圈：上圈尾巴先于新圈开头（排序会倒过来）
+    "ev_backward_nonloop_head_only",  # 非循环倒退：只收新圈开头，不补未播过的那段
+    "ev_t_at_duration_never_fires",   # t == duration 永远不发（wrapTime 到不了）
+    "ev_same_time_table_order", # 同刻多条按表顺序（stable）
+    "ev_scene_lap_count",       # 真场景：一圈 3 条
+    "ev_scene_two_laps_same_seq",     # 第二圈与第一圈逐条相同
+    "ev_scene_fps_independent", # 60/240 fps 的前三圈逐条相同
+    "ev_scene_dt0_no_fire",     # 真场景 dt=0 → 0 条（编辑器非 Play）
+    "ev_scene_seq",             # 序列内容 = Open / Footstep(walk1) / Footstep(walk2)
+    "ev_scene_fields",          # entity / clip / layer 三个字段都对
+    "ev_clip_switch_no_stale",  # 换 clip 那一帧不许发（旧播放头不能当新起点）
+    "ev_clip_switch_then_fires",# 换完之后到点照发
+    "ev_layer_fires_once",      # 附加层的事件带层名，一次
+    "ev_layer_base_unaffected", # 加层不影响底座事件数
+    "ev_sort_track",            # 按时间升序整理
+    "ev_find_empty",            # 空表查找 → nullptr
+    "ev_find_hit",              # 命中返回表地址
+    "ev_find_miss",             # 不命中 → nullptr
+
+    # ---- B3 根运动（2026-10-26）----
+    "rm_resolve_auto",          # 空名字 → 拓扑序第一根 parent==-1
+    "rm_resolve_named",         # 按名字找（不分大小写）
+    "rm_resolve_miss",          # 找不到 → -1（不是 0）
+    "rm_delta_valid",           # extract 会置 valid
+    "rm_delta_x",               # 位移 = 两矩阵之差
+    "rm_delta_yaw",             # 朝向增量（绕引擎 +Z）
+    "rm_delta_horizontal",      # horizontalOnly 丢 z
+    "rm_delta_vertical_kept",   # 不丢时 z 保留
+    "rm_yup_to_zup",            # glTF 的 Y-up 增量转到引擎 Z-up
+    "rm_strip_offset",          # 钳位返回被扣的偏移量
+    "rm_strip_back",            # 钳完根回到基准
+    "rm_strip_keep_z",          # horizontalOnly 时垂直不扣
+    "rm_twist_zero",            # 单位四元数 → 0
+    "rm_twist_90",              # 绕 Z 90° → 90°
+    "rm_twist_swing_is_zero",   # 纯 swing（绕 X）→ 扭转角 0
+    "rm_first_frame_no_delta",  # 第一帧只记基准
+    "rm_first_frame_no_move",   # 第一帧位移为 0（不窜天）
+    "rm_tick_moves",            # 真跑 60 帧 → 位移 ≈ 1 - 1/60
+    "rm_in_place",              # 根钳在基准：模型相对实体没动
+    "rm_yaw_applied",           # 朝向写进 rotation.z
+    "rm_off_transform_untouched",   # Off：Transform 逐位不变
+    "rm_off_pose_untouched",        # Off：姿势也不被钳
+    "rm_deltaonly_transform_untouched",  # DeltaOnly 不写 Transform
+    "rm_deltaonly_delta_valid",          # 但 delta 有效
+    "rm_deltaonly_delta_step",           # 每帧步长 = 1/60
+    "rm_wrap_discard",          # 跨圈丢增量 → 两圈累计 ~2 m
+    "rm_editor_scrub_no_move",  # dt=0 拖时间轴不产生位移
 ]
 
 TEST_RE = re.compile(r"ANIM-TEST\s+(\S+)\s+actual=(\S+)\s+expected=(\S+)\s+"

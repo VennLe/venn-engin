@@ -1,0 +1,488 @@
+{
+ "camera": {
+  "distance": 9.0,
+  "fov": 45.0,
+  "pitch": 0.34033921360969543,
+  "target": [
+   -2.998933792114258,
+   2.998933792114258,
+   -1.5042622089385986
+  ],
+  "yaw": 0.7853981852531433
+ },
+ "entities": [
+  {
+   "castShadow": false,
+   "locked": true,
+   "material": {
+    "albedo": {
+     "color": [
+      105,
+      108,
+      114,
+      255
+     ],
+     "kind": "solid",
+     "name": "editor_ground_default_tex",
+     "size": 4
+    },
+    "alphaBlend": false,
+    "alphaCutoff": 0.5,
+    "alphaMode": "opaque",
+    "ao": 1.0,
+    "baseColor": [
+     1.0,
+     1.0,
+     1.0,
+     1.0
+    ],
+    "detailMap": null,
+    "detailStrength": 1.0,
+    "detailTiling": 1.0,
+    "ditherAlpha": false,
+    "doubleSided": false,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "emissiveMap": null,
+    "heightMap": null,
+    "heightScale": 0.05000000074505806,
+    "id": "editor_ground_default",
+    "kind": "procedural",
+    "matcapMap": null,
+    "matcapRotate": 0.0,
+    "matcapStrength": 0.0,
+    "metallic": 0.0,
+    "metallicMap": null,
+    "name": "editor_ground_default",
+    "normal": null,
+    "normalScale": 1.0,
+    "orm": null,
+    "rampEdge": 0.5,
+    "rampMap": null,
+    "rampPath": "",
+    "rampSoftness": 0.03999999910593033,
+    "rampSteps": 0.0,
+    "renderQueue": 2000,
+    "roughness": 0.8999999761581421,
+    "roughnessMap": null,
+    "sdfFaceShift": 0.15000000596046448,
+    "sdfShadowMap": null,
+    "sdfShadowStrength": 1.0,
+    "shadingModel": "default",
+    "sortOrder": 0,
+    "useCharacterLight": false
+   },
+   "mesh": {
+    "kind": "builtin",
+    "name": "editor_ground",
+    "shape": "plane",
+    "size": 1.0
+   },
+   "name": "Ground",
+   "parent": -1,
+   "transform": {
+    "position": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     120.0,
+     120.0,
+     1.0
+    ]
+   },
+   "visible": true
+  },
+  {
+   "castShadow": true,
+   "material": null,
+   "mesh": null,
+   "name": "anime_girl",
+   "parent": -1,
+   "skinned": {
+    "clipName": "Walk",
+    "kind": "fbx",
+    "loop": true,
+    "modelKey": "assets/models/anime_girl.fbx",
+    "path": "models/anime_girl.fbx",
+    "playing": true,
+    "speed": 1.0,
+    "time": 0.0
+   },
+   "transform": {
+    "position": [
+     0.0,
+     0.0,
+     0.7779995799064636
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "visible": true,
+   "animator": {
+    "defaultClip": "Walk",
+    "controllerPath": "",
+    "time": 0.0,
+    "speed": 1.0,
+    "playing": true,
+    "loop": true,
+    "rootMotion": 0
+   }
+  },
+  {
+   "castShadow": true,
+   "material": {
+    "id": "assets/models/anime_girl.fbx#Skin",
+    "kind": "model",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "name": "assets/models/anime_girl.fbx/mat0"
+   },
+   "mesh": {
+    "kind": "fbx",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "path": "models/anime_girl.fbx",
+    "subMeshIndex": 0
+   },
+   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_0_inst",
+   "parent": 1,
+   "transform": {
+    "position": [
+     0.0,
+     4.470348358154297e-08,
+     -0.7779995799064636
+    ],
+    "rotation": [
+     0.0,
+     -0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "visible": true
+  },
+  {
+   "castShadow": true,
+   "material": {
+    "id": "assets/models/anime_girl.fbx#Hair",
+    "kind": "model",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "name": "assets/models/anime_girl.fbx/mat1"
+   },
+   "mesh": {
+    "kind": "fbx",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "path": "models/anime_girl.fbx",
+    "subMeshIndex": 1
+   },
+   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_1_inst",
+   "parent": 1,
+   "transform": {
+    "position": [
+     0.0,
+     4.470348358154297e-08,
+     -0.7779995799064636
+    ],
+    "rotation": [
+     0.0,
+     -0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "visible": true
+  },
+  {
+   "castShadow": true,
+   "material": {
+    "id": "assets/models/anime_girl.fbx#Cloth",
+    "kind": "model",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "name": "assets/models/anime_girl.fbx/mat2"
+   },
+   "mesh": {
+    "kind": "fbx",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "path": "models/anime_girl.fbx",
+    "subMeshIndex": 2
+   },
+   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_2_inst",
+   "parent": 1,
+   "transform": {
+    "position": [
+     0.0,
+     4.470348358154297e-08,
+     -0.7779995799064636
+    ],
+    "rotation": [
+     0.0,
+     -0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "visible": true
+  },
+  {
+   "castShadow": true,
+   "material": {
+    "id": "assets/models/anime_girl.fbx#EyeWhite",
+    "kind": "model",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "name": "assets/models/anime_girl.fbx/mat3"
+   },
+   "mesh": {
+    "kind": "fbx",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "path": "models/anime_girl.fbx",
+    "subMeshIndex": 3
+   },
+   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_3_inst",
+   "parent": 1,
+   "transform": {
+    "position": [
+     0.0,
+     4.470348358154297e-08,
+     -0.7779995799064636
+    ],
+    "rotation": [
+     0.0,
+     -0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "visible": true
+  },
+  {
+   "castShadow": true,
+   "material": {
+    "id": "assets/models/anime_girl.fbx#Iris",
+    "kind": "model",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "name": "assets/models/anime_girl.fbx/mat4"
+   },
+   "mesh": {
+    "kind": "fbx",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "path": "models/anime_girl.fbx",
+    "subMeshIndex": 4
+   },
+   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_4_inst",
+   "parent": 1,
+   "transform": {
+    "position": [
+     0.0,
+     4.470348358154297e-08,
+     -0.7779995799064636
+    ],
+    "rotation": [
+     0.0,
+     -0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "visible": true
+  },
+  {
+   "castShadow": true,
+   "material": {
+    "id": "assets/models/anime_girl.fbx#Shoe",
+    "kind": "model",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "name": "assets/models/anime_girl.fbx/mat5"
+   },
+   "mesh": {
+    "kind": "fbx",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "path": "models/anime_girl.fbx",
+    "subMeshIndex": 5
+   },
+   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_5_inst",
+   "parent": 1,
+   "transform": {
+    "position": [
+     0.0,
+     4.470348358154297e-08,
+     -0.7779995799064636
+    ],
+    "rotation": [
+     0.0,
+     -0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "visible": true
+  },
+  {
+   "castShadow": true,
+   "material": {
+    "id": "assets/models/anime_girl.fbx#Lash",
+    "kind": "model",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "name": "assets/models/anime_girl.fbx/mat6"
+   },
+   "mesh": {
+    "kind": "fbx",
+    "modelKey": "assets/models/anime_girl.fbx",
+    "path": "models/anime_girl.fbx",
+    "subMeshIndex": 6
+   },
+   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_6_inst",
+   "parent": 1,
+   "transform": {
+    "position": [
+     0.0,
+     4.470348358154297e-08,
+     -0.7779995799064636
+    ],
+    "rotation": [
+     0.0,
+     -0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "visible": true
+  },
+  {
+   "name": "Director",
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "locked": false,
+   "mesh": null,
+   "material": null,
+   "transform": {
+    "position": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "sequencer": {
+    "path": "sequences/opening.seq.json",
+    "enabled": true,
+    "playing": true,
+    "loop": false,
+    "startTime": 0.0,
+    "speed": 1.0,
+    "priority": 10
+   }
+  },
+  {
+   "name": "CutsceneCam",
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "locked": false,
+   "mesh": null,
+   "material": null,
+   "transform": {
+    "position": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "camera": {
+    "fov": 45.0,
+    "priority": 0,
+    "enabled": true,
+    "targetOffset": [
+     0.0,
+     0.0,
+     0.76
+    ],
+    "distance": 4.0,
+    "minDistance": 0.6,
+    "collideWithWorld": false,
+    "shakeAmplitude": 0.0,
+    "shakeFrequency": 24.0
+   }
+  }
+ ],
+ "generator": "make_sequencer_demo",
+ "light": {
+  "ambientScale": 0.550000011920929,
+  "castsShadow": true,
+  "color": [
+   1.0,
+   0.9700000286102295,
+   0.9200000166893005
+  ],
+  "direction": [
+   -0.330647349357605,
+   -0.3654523491859436,
+   -0.8701246380805969
+  ],
+  "intensity": 1.600000023841858
+ },
+ "version": 1
+}

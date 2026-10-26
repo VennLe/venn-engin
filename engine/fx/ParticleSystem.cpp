@@ -48,7 +48,7 @@ constexpr uint32_t kDrawPushBytes = 48;
 constexpr uint32_t kCountPushBytes = 32;
 // 粒子绘制管线绑定的 FrameUBO **前缀**大小：view + proj + lightDir +
 // lightColor + camPos = 176 字节（shader 只声明到 camPos）。
-// ⚠ 描述符的 range 不能超过 buffer 的实际大小（FrameUBO = 768）。
+// ⚠ 描述符的 range 不能超过 buffer 的实际大小（FrameUBO = 800）。
 constexpr VkDeviceSize kFrameUboPrefixBytes = 176;
 
 // 计数 / 排序管线的 push 常量结构。与 particle_count.comp 的 SortPC 一致。

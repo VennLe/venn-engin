@@ -93,6 +93,24 @@ DEFAULT = [
     # 第 ② 条与第 ④ 条是最容易写错的两处：前者是"mix 权重 0"，后者是
     # "a=0 的哨兵被当成距离 0 的物体"（症状：整片天空被描成黑边）。
     "verify_outline",
+    # A4 头发各向异性高光（2026-10-26）：Kajiya-Kay 天使环。判据的核心
+    # 不是"变亮了"，是**形状**：高光在屏幕上从"一片"变成"沿经线的一条
+    # 窄带"（std_x/std_y 0.43 → 0.17）。另有两条零容差的恒等判据：
+    #   · strength=0 跑两次逐像素相同（确定性）
+    #   · strength=0 时改 shift 画面 0 px 变化 —— 证明 strength 是**硬闸门**
+    #     而不是"算了再乘 0"（后者会让 normalize 的 NaN 从乘法里逃出来）
+    # ⚠ 必须显式 MYVK_BINDLESS=1：anisoStrength 走材质页 spare.z/w，
+    #   而 A 类槽只在 VENN_BINDLESS 编译单元里存在 —— 不开就是"静默失效"。
+    "verify_hair_aniso",
+    # A3 眼睛专用着色（2026-10-26）：Unlit 底 + 虹膜视差 + 程序化眼神光。
+    # 五组像素判据，核心是第 2 组 —— 同一颗球翻太阳方向：
+    #   · eyeStrength=1 → 画面必须 **0 px**（眼睛不吃场景光）
+    #   · eyeStrength=0 → 必须显著变化（对照，证明这个场景本来对光敏感）
+    # 另有"strength=0 时 iris/sparkle 完全不参与"（硬闸门）、视差随 depth
+    # 单调且两侧机位位移方向相反、眼神光在中心线以上且是变亮、强度单调。
+    # ⚠ 必须显式 MYVK_BINDLESS=1：三个字段走材质页 spare2.xyz，A 类槽只在
+    #   VENN_BINDLESS 编译单元里存在。
+    "verify_eye_shading",
     # P0-2/B：材质渲染顺序（renderQueue / sortOrder / 覆盖带 bit7）。
     # 用两颗球验证"谁画在上面"：跨带时距离完全不参与，>=3000 进覆盖带
     # （不写深度 + 深度测试恒通过）。这是"眼睛能压在脸皮和刘海之上"
@@ -296,6 +314,60 @@ DEFAULT = [
     # ⚠ 它自己的判据也踩过一次单位坑（`diff_stats` 返回占比不是百分数），
     #   细节写在脚本头 —— 那次让 K2b 变成恒真，等于该判据根本不存在。
     "verify_ik",
+    # 动画层 / 骨骼遮罩（B1，2026-10-26）：**像素级**。
+    # 上面的 morph / ik 验的都是"往姿势上叠加一件事"，这一条验的是**分区**
+    # —— 同一帧里第 1 层只覆盖遮罩里的骨，其余骨逐位保持底座。
+    # 十二次启动（十一次像素 + 一次 UI 面）只改 `animator.layers`
+    # （权重 / mask 模式 / 根骨名 / clip），判据 = 与基线图的逐像素比，分**两条带**统计：
+    #   上半带（视口 0~28%）= 只有头/发/肩      → chest 子树能改，thigh 碰不到
+    #   下半带（视口 52~100%）= 只有膝下/脚     → thigh 子树能改，chest 碰不到
+    # ⚠ 必须进 DEFAULT：它守着四个**只有屏幕能看见**的失效模式：
+    #   ① 遮罩被忽略（当成 All）→ 上半带 5.6% → 3.9%，判据红。实测过：
+    #      把 mask 去掉后上半带从 0.000% 跳到 3.903%，这条判据有判别力。
+    #   ② 根骨匹配 0 根被当成"全部骨"→ 整具身体被覆盖（数值用例守着，
+    #      但"看起来对不对"只有这里能确认）。
+    #   ③ `w>=1` 的端点用 slerp 而不是逐位赋值 → 长跑姿势慢慢转歪，
+    #      每一帧都"差不多"，第 ⑤ 条要求它与"直接播那段"**0 px** 相同。
+    #   ④ 层的时间/淡入把 `playingClip` 清了 → 滑块拉回来动作从第一帧重来。
+    # ⚠ 取景是这份脚本最大的坑（写进脚本头了）：手写的 `skinned` 实体
+    #   **一个像素都不画**（子网格实体才是被渲染的东西），所以在进 DEFAULT
+    #   之前它一直"全 0% 假通过"。
+    "verify_anim_layers",
+    # 动画事件 / Notify（2026-10-26，B2）。八组判据全在**编辑器 Play + 固定
+    # dt** 上跑：① 事件真的发且 kind/t/payload 与配置逐条一致；② 两圈序列
+    # 相同；③ 60fps 与 120fps 前六条相同；④ 否定测试（越界事件不发、同表
+    # 其它事件照发；没有事件表 → 0 条）；⑤ `scene.save` 往返逐字段保留、
+    # 且不写运行时字段；⑥ Inspector 画出事件段与事件行。
+    # ⚠ 数值侧（半开区间 / 跨圈拆分 / 换 clip 归零）在 verify_anim_runtime
+    #   的 28 条 `ev_*` 里，这两条用例是**互补**的，别只跑一条。
+    # ⚠ 它复用 verify_anim_layers 烤的模板（`anim_layers_tpl.json`）——
+    #   模板不在时会自己烤一份（约 20 秒）。
+    "verify_anim_events",
+    # 根运动（2026-10-26，B3）。**只验接线**，位移语义全在数值侧：
+    # 这份资产（anime_girl 的 Walk/Idle/Run/RigWalk）四段**全是原地动画**，
+    # 根骨一步不动 → "角色真的走了 1 米"没法在真实资产上验。所以四条判据是
+    # ① 自动选骨（cfg=1 + bone= 是真名）；② 骨名填错 → BONE-MISS（不静默
+    # 改用根骨）；③ `scene.save` 往返（rootMotionBone 保留、运行时字段不落盘）；
+    # ④ Inspector 画出下拉 + 根骨输入框。
+    # ⚠ 位移的正确性（钳回基准 / 跨圈丢弃 / Y-up→Z-up / 水平只提 xz）在
+    #   verify_anim_runtime 的 27 条 `rm_*` 里 —— 三条做过否定测试。两条互补，
+    #   别只跑一条（"只跑这条"的话把 strip 改成减增量也照样全绿）。
+    "verify_root_motion",
+    # 过场时间轴（2026-10-26，C1）。**只验"接到一起之后还对不对"** —— 解析 /
+    # 采样 / yaw 最短弧 / step 硬切 / 半开区间 / 跨圈 / 夹步长全在数值侧
+    # （`Game.exe --selftest sequence` 的 48 条 `SEQ-TEST`）。
+    # 八组：① 序列化读侧建出组件；② 资产解析（dur/keys/events）；③ 四条事件
+    # 按时刻与顺序发出（真实帧率下唯一能证明半开区间 + 跨圈写法的证据）；
+    # ④ 第一帧相机 = 第一关键帧（演示场景里相机实体在原点 → 只可能来自时间轴）；
+    # ⑤ 硬切是瞬间的（**倍率**判据，不用绝对米数）；⑥ 走到底并收敛到末关键帧；
+    # ⑦ Inspector 画出路径框/滑条/预览按钮；⑧ `scene.save` 往返（path 保留、
+    # 运行时字段一个不落盘）。
+    # ⚠ ⑥ **验不了"播完撒手"**：`CAM-POSE` 只在姿态变化时打印，"停住"= 没有
+    #   日志行。那条由 `--selftest sequence` 的 `tick_finished_no_pose` 负责。
+    # ⚠ 帧数由 `--max-frames 260` 钉死（进程自己退出，不靠 kill）—— 否则日志
+    #   截到第几秒取决于当时 fps，末帧断言会随机红。
+    # ⚠ 场景里必须有 `CameraComponent` 实体，否则运镜被静默丢弃（事件照发）。
+    "verify_sequencer",
     # ---- 2026-10-17：主题 / 语言 / 默认值 / 胶囊线框 / 启动露面 ----
     # 五套主题 + 中英映射替换 + 偏好存档 schema 门。判据只取 Preferences
     # 窗口内部的平均亮度（整窗均值会被 3D 视口拽平，第一版就栽在这）。
@@ -932,6 +1004,20 @@ TRIGGERS = {
     # 往返（"toon" / "skin" / "default"）在 SceneSerializer。
     "verify_toon_shading":   ["editor/InspectorPanel.*",
                               "engine/scene/SceneSerializer.*"],
+    # A4 头发各向异性（2026-10-26）：切线生成在 Mesh.cpp、顶点通道在
+    # Mesh.h、材质字段在 Material.h —— 都在 `engine/assets/**`（横切）；
+    # pbr.vert / pbr.frag 也是横切；Renderer 的管线接线同样横切。
+    # 所以这里只能挂**非横切**的那几个落点：页表填充（Bindless，安类槽的
+    # 唯一写入口）与 Inspector 的两行滑块。
+    "verify_hair_aniso":     ["engine/render/Bindless.*",
+                              "editor/InspectorPanel.*"],
+    # A3 眼睛（2026-10-26）：与 A4 同构 —— 字段在 Material.h、着色器在
+    # pbr.frag、管线接线在 Renderer（三者全是横切），所以只挂非横切的
+    # 那几个落点：页表填充（A 类槽的唯一写入口）+ Inspector 的三行滑块 +
+    # 材质参数往返（三个字段漏一个的症状是"面板调了、存档重开又归零"）。
+    "verify_eye_shading":    ["engine/render/Bindless.*",
+                              "engine/scene/SceneSerializer.*",
+                              "editor/InspectorPanel.*"],
     # P0-2/B 渲染顺序：排序键在 Renderer.cpp、状态位在 VariantPipelines.* /
     # ShaderKeywords.*、字段在 Material.h —— **全在横切表里**。这里只挂
     # 真正属于本用例的非横切路径：材质参数的读写往返（SceneSerializer）
@@ -1482,6 +1568,64 @@ TRIGGERS = {
                   "engine/scene/SceneSerializer.*",
                   "editor/InspectorPanel.cpp",
                   "editor/EditorApp.cpp"],
+    # 动画层 / 骨骼遮罩（B1，2026-10-26）。**只挂非横切的落点**：
+    #   · BoneMask.*                    遮罩解算与混合本身（新文件）
+    #   · AnimatorSystem.*              层的采样/权重/淡入位置（tick 里那一段）
+    #   · SceneSerializer.*             `layers` 的存 + 读（只能在非空时写键）
+    #   · InspectorPanel.*              Animation Layers 整段 + 八个锚点
+    #   · AnimationSelfTest.cpp         26 条数值断言（layer_* / mask_*）
+    # ⚠ 刻意**不**登记：
+    #     · engine/ecs/Components.h（`ecs::AnimLayer` 的定义）—— 横切表里，
+    #       改它本来就全量，写进来在 --narrow 下会假跳过。
+    #     · engine/i18n/**（新增 11 条界面词）—— 同上，横切。
+    "verify_anim_layers": ["engine/animation/BoneMask.*",
+                           "engine/animation/AnimatorSystem.*",
+                           "engine/animation/AnimationSelfTest.cpp",
+                           "engine/scene/SceneSerializer.*",
+                           "editor/InspectorPanel.*"],
+    # 动画事件 / Notify（B2，2026-10-26）。落点与上面那条**大量重叠是故意的**：
+    # `AnimatorSystem.*` 里同时住着"分层混合"和"事件分发"，改哪一半两边都得
+    # 重跑。B2 独有的落点是 `AnimEvent.*`（含头文件里那段"为什么半开区间"）。
+    # ⚠ 刻意**不**登记：
+    #     · engine/ecs/Components.h（`eventTracks` / `eventPrev` 的定义）—— 横切
+    #     · engine/i18n/**（新增 9 条界面词）—— 横切
+    "verify_anim_events": ["engine/animation/AnimEvent.*",
+                           "engine/animation/AnimatorSystem.*",
+                           "engine/animation/AnimationSelfTest.cpp",
+                           "engine/scene/SceneSerializer.*",
+                           "editor/InspectorPanel.*"],
+    # 根运动（B3，2026-10-26）。落点与 B1/B2 **重叠是故意的**：三个功能
+    # 都住在 `AnimatorSystem.cpp` 和 `InspectorPanel.cpp` 里，改任何一处
+    # 三条都该重跑。B3 独有的是 `RootMotion.*`。
+    # ⚠ 刻意**不**登记的三处：
+    #     · engine/ecs/Components.h、engine/i18n/**（横切）
+    #     · **engine/assets/Skeleton.h** —— 这一条很容易想当然地写进来
+    #       （B3 往它加了 `skeletonToEngine`，改错会让根运动方向转 90°），
+    #       但它在 `GLOBAL_GLOBS` 里，**改它本来就全量**；写进来只会在
+    #       `--narrow` 下变成一条假跳过。
+    "verify_root_motion": ["engine/animation/RootMotion.*",
+                           "engine/animation/AnimatorSystem.*",
+                           "engine/animation/AnimationSelfTest.cpp",
+                           "engine/scene/SceneSerializer.*",
+                           "editor/InspectorPanel.*"],
+    # 过场时间轴（C1，2026-10-26）。落点：
+    #     · engine/sequence/**  —— 新目录（解析/采样/播放器/自检）
+    #     · engine/scene/CameraSystem.* —— `setDesiredPose` / `applyPoseToSceneCamera`
+    #       走的就是它的 setter；改它等于改"运镜怎么落到画面上"
+    #     · assets/sequences/** —— **夹具即被测物**：`EXPECTED_EVENTS` 是照
+    #       `opening.seq.json` 写死的，改资产必须重跑（其它 `assets/**` 不进
+    #       快照是因为编辑器会写它们；这里是手写资产，没这个问题）
+    # ⚠ 刻意**不**登记：
+    #     · engine/ecs/**（`SequencerComponent` 定义在这里）、engine/i18n/**、
+    #       engine/scene/Scene.* —— 全在 `GLOBAL_GLOBS` 里，本来就全量
+    #     · runtime/** 与 editor/EditorApp.cpp —— 接线两行，但它们已经挂在
+    #       verify_runtime_* 名下（同一个文件挂两条是**故意**的，见 M1 那条注释）；
+    #       这里再挂一遍只会让"改 runtime"变成两条一起红，信息量没增加
+    "verify_sequencer": ["engine/sequence/**",
+                         "engine/scene/CameraSystem.*",
+                         "engine/scene/SceneSerializer.*",
+                         "editor/InspectorPanel.*",
+                         "assets/sequences/**"],
     # ---- 阶段 M1：运行时骨架（G01~G05）----
     # 三条用例的实现主体全在 `runtime/**`（G01 拆出来的那个独立目标）。
     # 同一个 glob 挂到三条名下是**故意**的：改 runtime 的任何一行，

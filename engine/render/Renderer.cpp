@@ -167,6 +167,19 @@ void Renderer::bindFeatureParams() {
                          ParamKind::Float);
     render::bindParam("pom.maxLayers", &m_pomMaxLayers, ParamKind::Float);
 
+    // ---- 角色光通道（A5，2026-10-26）----
+    // ⚠ 绑定必须发生在成员默认初始化之后、loadEnvOverrides() 之前（见
+    //   FeatureRegistry 头部的约束 ②），否则"默认值"会取成 0。
+    render::bindParam("charlight.enabled", &m_charLightEnabled, ParamKind::Bool);
+    render::bindParam("charlight.follow", &m_charLightFollowCamera,
+                      ParamKind::Bool);
+    render::bindParam("charlight.intensity", &m_charLightIntensity,
+                      ParamKind::Float);
+    render::bindParam("charlight.ambient", &m_charLightAmbient,
+                      ParamKind::Float);
+    render::bindParam("charlight.color", &m_charLightColor[0],
+                      ParamKind::Color3);
+
     // ---- 级联阴影 ----
     render::bindParam("shadow.enabled", &m_shadowsEnabled, ParamKind::Bool);
     render::bindParam("shadow.cascades", &m_shadowCascades, ParamKind::Int);
@@ -2522,6 +2535,36 @@ void Renderer::uploadSceneState(scene::Scene& scene, VkExtent2D extent,
     ubo.lightDir = glm::vec4(ld, sunIntensity);
     ubo.lightColor = glm::vec4(scene.light().color, 1.0f);
     ubo.camPos = glm::vec4(camPosW, 1.0f);
+
+    // ---- 角色光通道（A5，2026-10-26）----
+    // 方向：
+    //   · 跟随相机（默认）= 相机空间里"右上偏前"绕出来的世界方向。
+    //     为什么不是固定世界方向：二次元角色永远在特写里看，主光位置
+    //     必须相对**观众**成立 —— 角色转身 30° 脸就一半黑是写实逻辑，
+    //     不是二次元逻辑。相机空间里取 (0.42, 0.38, -0.82)（Vulkan 视图
+    //     空间朝 -Z）就是把灯摆在"观众右上前方 45°"。
+    //   · 不跟随 = 用场景太阳方向的反向（`-ld`，ld 是传播方向）。
+    // ⚠ 强度为 0 或特性关闭时 w 写 0 → pbr.frag 整段短路。这是"关 =
+    //   基线"的实现依据：不看材质有没有勾，先看这里是不是 0。
+    {
+        glm::vec3 dirToLight;
+        if (m_charLightFollowCamera) {
+            // view 只含旋转 + 平移，3×3 逆 = 转置（比 glm::inverse 便宜且
+            // 不会有"带缩放时求逆"的数值噪声；相机矩阵没有缩放）。
+            const glm::mat3 camToWorld = glm::transpose(glm::mat3(ubo.view));
+            dirToLight =
+                glm::normalize(camToWorld * glm::vec3(0.42f, 0.38f, -0.82f));
+        } else {
+            dirToLight = -ld;
+        }
+        const bool on = m_charLightEnabled && m_charLightIntensity > 0.0f;
+        ubo.charLightDir = glm::vec4(dirToLight, on ? 1.0f : 0.0f);
+        ubo.charLightColor = glm::vec4(
+            glm::vec3(m_charLightColor[0], m_charLightColor[1],
+                      m_charLightColor[2]) *
+                m_charLightIntensity,
+            m_charLightAmbient);
+    }
 
     // 近远平面**必须从相机读**，不能写死常量：级联分割点、切片角点的
     // NDC 换算、以及分簇的对数切片都假设"这里的 near/far"与

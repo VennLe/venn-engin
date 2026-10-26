@@ -107,19 +107,34 @@ struct GpuMaterialPage {
     // 它们不能走关键字变体：ramp 档数/强度是美术每帧都要调的连续量。
     glm::vec4 params{0};   // 48 x=rampSteps y=matcapStrength
                            //    z=sdfShadowStrength w=detailStrength
-    glm::vec4 params2{0};  // 64 x=detailTiling y=matcapRotate z/w=(预留)
-    // 80 B ~ 96 B：整块预留，给下一刀（形态键权重基址 / 分层遮罩）。
-    // 留白是**在页表格式上**留的：真的到了那天只要往里填，不必再动
-    // std430 结构、不必再改一次 pbr.frag 的声明。
-    glm::uvec4 spare{0};  // 80
+    glm::vec4 params2{0};  // 64 x=detailTiling y=matcapRotate
+                           //    z=rampEdge（明暗交界位置）w=rampSoftness（交界宽度）
+    // 2026-10-26 起从"整块预留"变成 A 类语义位（类型同时由 uvec4 改为 vec4，
+    // 布局仍是 16 B —— 只是不再需要把 float 按位塞进 uint）：
+    //   x = 标志位（bit0 = 材质级 useCharacterLight）
+    //   y = 面部 SDF 采样偏移强度（sdfFaceShift）
+    //   z = 头发各向异性强度（anisoStrength；**0 = 硬关**，着色器直接绕开）
+    //   w = 各向异性环位置（anisoShift，沿法线推切线，不是亮度）
+    glm::vec4 spare{0};  // 80
+
+    // ---- 96 B ~ 112 B：A3 眼睛专用着色（2026-10-26）----
+    // 为什么又加一块而不是塞进 spare：spare 的四个角已经各有主人，
+    // 而"往里塞半精度"这种事会在下一次读端改动时变成一个谜。
+    // 112 B × 4096 页 × 2 槽 ≈ 1.4 MB，账不用重新算。
+    //   x = eyeStrength（unlit 混合权重，0 = 硬关）
+    //   y = eyeIrisDepth（虹膜 UV 视差强度）
+    //   z = eyeCatchlight（程序化眼神光强度，0 = 关）
+    //   w = 预留（下一刀：眼白/虹膜分离的阈值之类）
+    glm::vec4 spare2{0};  // 96
 };
-static_assert(sizeof(GpuMaterialPage) == 96,
-              "GpuMaterialPage 必须与 pbr.frag 的 std430 布局一致（6 × 16B）");
+static_assert(sizeof(GpuMaterialPage) == 112,
+              "GpuMaterialPage 必须与 pbr.frag 的 std430 布局一致（7 × 16B）");
 static_assert(offsetof(GpuMaterialPage, tex1) == 16 &&
                   offsetof(GpuMaterialPage, tex2) == 32 &&
                   offsetof(GpuMaterialPage, params) == 48 &&
                   offsetof(GpuMaterialPage, params2) == 64 &&
-                  offsetof(GpuMaterialPage, spare) == 80,
+                  offsetof(GpuMaterialPage, spare) == 80 &&
+                  offsetof(GpuMaterialPage, spare2) == 96,
               "偏移必须逐 16B 对齐 —— std430 的 vec4 对齐规则，"
               "差 4 字节就是采样到别的贴图（不报错的那种错）");
 

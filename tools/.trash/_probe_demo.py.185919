@@ -1,0 +1,22 @@
+"""临时探针：把演示场景真跑一遍，收集日志锚点 + 截图（文档要用）。"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verify_anim_layers as V                                  # noqa: E402
+
+DEMO = os.path.join(V.ROOT, "assets", "scenes", "anime_demo.json")
+
+lines, vp, img, errs = V.run_shot(
+    V.DEFAULT_EXE, DEMO,
+    {"MYVK_FIXED_DT": "0.0166667", "MYVK_EDITOR_PLAY": "1"},
+    os.path.join(V.OUT_DIR, "demo_character.png"),
+    cam=V.CAM, wait=10.0)
+print("vp =", vp, " img =", img.size if img else None)
+print("errs =", errs[:3])
+for key in ("ANIM-LAYER", "ANIM-MASK", "ANIM-EVENT", "ANIM-ROOTMOTION",
+            "ANIM-SKIN ", "SCENE-SKINNED"):
+    hits = [l.strip() for l in lines if key in l]
+    print("=== %s x%d ===" % (key, len(hits)))
+    for l in hits[:4]:
+        print("   ", l)

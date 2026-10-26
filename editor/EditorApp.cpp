@@ -41,6 +41,8 @@
 #include "script/ScriptEngine.h"
 // 四态 locomotion：与运行时共用同一份实现（P4）
 #include "animation/Locomotion.h"
+// 过场时间轴（C1）：编辑器侧走"直接写 scene::Camera"这条路
+#include "sequence/SequencerSystem.h"
 // 键码换算（编辑器侧判定走 ImGui 原始键状态，见 ui/KeyCodes.h）
 #include "ui/KeyCodes.h"
 
@@ -1761,6 +1763,19 @@ void EditorApp::onUpdate(float dt) {
         // 排在物理**之前**：A4 的根运动会把位移写进 TransformComponent，
         // 物理要读到它这一帧的最终位置（与"运动学平台先摆好再求解"同理）。
         m_animator.tick(m_ctx->activeScene(), simDt);
+        // ---- 过场时间轴（C1）----
+        // 排在动画之后：运镜与姿势是两条独立的时间线，先后无所谓；放在
+        // 这里是因为它必须早于本帧的渲染，且要拿到**本帧最终**的物体位置
+        // 才好对焦（将来做 LookAt 轨道时这一点是硬要求）。
+        //
+        // ⚠ 编辑器视口是**自由相机**（不经过 `CameraSystem`），所以直接写
+        //   `scene.camera()`。运行时要走 `CameraSystem`，见 RuntimeApp。
+        {
+            sequence::SequencerSystem& seq = sequence::activeSequencerSystem();
+            seq.tick(m_ctx->activeScene(), simDt);
+            if (seq.hasPose())
+                sequence::applyPoseToSceneCamera(m_ctx->activeScene(), seq.pose());
+        }
         // ---- R7-1 物理 ----
         // 世界在进入 Play 的第一帧建一次（`!m_physics` 就是"还没建"），
         // 之后每帧推进 + 把解算结果写回运行态 TransformComponent。

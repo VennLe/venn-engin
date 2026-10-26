@@ -17,6 +17,14 @@
 //
 // 为什么不把参数摊平成 8 个字段塞进组件：那会让"哪些字段属于弹簧骨"变成
 // 隐性知识，Inspector、序列化、自检三处各维护一份字段清单，必然漂移。
+#include "animation/BoneMask.h"   // BoneMaskSpec / BoneMaskMode（B1 动画层）
+#include "animation/RootMotion.h" // RootMotionDelta（B3 根运动）
+// ⚠ 两个头都只依赖 assets/Skeleton.h，不反向依赖 ecs —— 不会成环。
+#include "animation/AnimEvent.h"  // AnimEventTrack（B2 动画事件）
+// C1 过场时间轴。**这不构成循环**：`sequence/SequenceAsset.h` 只依赖
+// glm / string / vector，它刻意不 include `scene/CameraSystem.h`（见那个
+// 文件头的说明），所以 ecs → sequence 是单向的。
+#include "sequence/SequenceAsset.h"
 #include "animation/LookAt.h"
 #include "animation/SpringBone.h"
 #include "animation/TwoBoneIK.h"
@@ -197,6 +205,71 @@ struct MorphComponent {
     std::vector<float> weights;          // 下标 = MorphRig 的通道下标
 };
 
+// ---------------- 动画层（B1，2026-10-26）----------------
+//
+// 需求（用户原话）："上半身挥手 + 下半身走路"。在此之前引擎只有**一份**
+// 姿势：状态机切 clip 是整具身体一起换，所以"边移动边攻击 / 边说话边做
+// 手势"这一类玩法动画全都做不了。
+//
+// 语义（一句话）：**第 0 层是底座（就是今天的行为），第 1..N 层各自播一段
+// clip，按骨骼遮罩把结果盖到骨架上**。层的播放头、循环、速度都是独立的
+// —— 上层挥手转一圈的同时，下层走路可以已经走了三步。
+//
+// ⚠⚠ 三条不能想当然的语义（都有自检盯着）：
+//
+// ① **层是按骨覆盖，不是按骨"相加"**。所以 Base 里那根被打中（被遮罩
+//    允许）的骨，最终姿势**完全**由该层决定（权重 1 时与只播该层的
+//    结果逐位相同）。想同时要两段动作的位移（呼吸 + 走路）属于 additive，
+//    那是 B7，这里刻意不做 —— 混着做的话"权重 0.5"同时意味着"各取一半
+//    姿态"和"幅度减半"，美术永远调不明白。
+//
+// ② **遮罩之外的骨与本层完全无关**，包括它的平移。所以"上半身"遮罩
+//    通常要选在脊柱上而不是骨盆上：骨盆被允许的话，另一段 clip 的胯部
+//    位移会把整个角色拽走（症状是"挥个手人却在飘"）。
+//
+// ③ **空 clip = 该层关闭**，不是"播 T-pose"。层配了一半（还没选 clip）
+//    是最常见的中间状态，那时候必须什么都不发生。
+//
+// 与状态机的分工：状态机（`AnimController`）管第 0 层；层**不**跑状态机
+// （每层一个控制器是 B7 之后的混合树，现在每层就是一段 clip + 播放控制）。
+// 想"按下键让上半身挥一下"就用层的 clip 字段 + 脚本/按键直接改它。
+struct AnimLayer {
+    std::string name = "Layer";   // 面板上的显示名（不参与逻辑）
+
+    // 本层播的 clip。空 = 本层关闭（见上面 ③）。
+    std::string clip;
+
+    // 整体权重 [0,1]：与遮罩逐骨相乘。0 = 完全不影响（**逐位**回到只有
+    // 底座的结果，回归基线靠它）。
+    float weight = 1.0f;
+
+    float speed = 1.0f;
+    bool loop = true;
+    bool playing = true;
+
+    // 骨骼遮罩（解算在 `animation/BoneMask.h`）。
+    // `mode=All` 或 roots 空 = 全骨 —— 老数据/刚加的行天然落在这里。
+    animation::BoneMaskSpec mask;
+
+    // 换 clip 时淡入的时长（秒）。0 = 硬切。
+    // ⚠ 它只作用于"换 clip / 刚配上 clip"那一下，**不**作用于 weight 滑块
+    //   （拖权重是要立刻看到结果的，加个淡入会让滑块"追不上手")。
+    float fadeDur = 0.15f;
+
+    // ================================================================
+    // 运行时（**不序列化**）
+    // ================================================================
+    // 上一层 clip 名。与 `clip` 不同 = 这一帧要重置播放头并开始淡入。
+    std::string playingClip;
+    float time = 0.0f;    // 本层播放头（秒）
+    float fadeT = 1.0f;   // 淡入进度 [0,1]，1 = 已经完全生效
+
+    // 上一帧的播放头（B2 事件用）。`time` 推进**之前**的那个值 ——
+    // 事件区间是 `[eventPrev, time)`，没有它就只能用"落在附近就发"，
+    // 那是每帧发一次。
+    float eventPrev = 0.0f;
+};
+
 // ---------------- 动画器（角色链 A1）----------------
 //
 // 与 SkinnedMeshComponent 的分工：
@@ -246,6 +319,20 @@ struct AnimatorComponent {
     // （见下面的 appliedDefaultClip）。
     std::string defaultClip;
 
+    // ---- 附加动画层（B1）----
+    // 空 = 只有底座（**与加这个字段之前逐位相同**，老场景不会飘）。
+    // 非空时 `AnimatorSystem` 在底座姿势上按层顺序逐层遮罩混合，
+    // **在 LookAt / IK / 弹簧骨之前** —— 表演层必须吃最终姿势。
+    std::vector<AnimLayer> layers;
+
+    // ---- 动画事件（B2）----
+    // 每段 clip 一张 `{time, kind, payload}` 表；空 = 不发任何事件
+    // （**与加这个字段之前逐位相同**）。
+    // ⚠ 挂在组件上而不是 `assets::AnimationClip` 上：clip 是只读资产、
+    //   每次重载重新生成，写进去活不过一次重新导入（详见 `AnimEvent.h`
+    //   文件头）。这里跟场景一起落盘，与 layers 同一套作者工作流。
+    std::vector<animation::AnimEventTrack> eventTracks;
+
     // ---- 权威播放状态（有本组件时以这四个为准）----
     float time = 0.0f;      // 当前时刻（秒）
     float speed = 1.0f;     // 播放速度倍率
@@ -253,6 +340,15 @@ struct AnimatorComponent {
     bool loop = true;
 
     RootMotionMode rootMotion = RootMotionMode::Off;
+
+    // ---- 根运动从哪根骨提（B3）----
+    // 空 = 自动（拓扑序里第一根 `parent == -1` 的骨，通常就是骨盆）。
+    //
+    // ⚠ 什么时候必须填：骨架多一层静止的 `Root`（Blender 常见导出形态）
+    //   时，自动会选到那根**不动的**骨 → 增量恒为 0 → 表现成"开了根运动
+    //   但角色一步都不走"。引擎在 `ANIM-ROOTMOTION bone=<实际用到的>`
+    //   里报出真名，跟美术说的骨名对不上就能看出来。
+    std::string rootMotionBone;
 
     // ==================================================================
     // 运行时（**不序列化**）
@@ -269,6 +365,36 @@ struct AnimatorComponent {
     // Inspector 上那句 "empty = rest pose" 就成了谎话（点不掉的控件比
     // 没有更糟）。
     bool appliedDefaultClip = false;
+
+    // ---- 动画事件的播放头（B2，运行时，不序列化）----
+    // `eventClip` 是上一帧播放头所属的 clip 名。与当前 `clipName` 不同 =
+    // 这一帧换了片段 → `eventPrev` 归零（否则新片段的事件表会被"上一段的
+    // 播放头"当起点，第一个事件随机漏发）。见 `AnimEvent.h` 语义 ③。
+    std::string eventClip;
+    float eventPrev = 0.0f;
+
+    // ---- 根运动的上一帧（B3，运行时，不序列化）----
+    //
+    // `rootPrevWorld` 是**上一帧根骨的世界矩阵（骨架空间）**，逐帧做差就是
+    // 增量。第一帧没有"上一帧" → `rootPrevValid = false`，只记录不提取。
+    //
+    // ⚠ 不能把第一帧的增量当成 `cur - 单位阵`：人形骨架的骨盆离地约 1 m，
+    //   第一帧会提取出 (0,0,~1) 的"位移"，角色一进 Play 就**往天上窜 1 米**。
+    //   这是根运动最经典的第一帧坑（UE 的 root motion 也必须先 align）。
+    //
+    // 不序列化的理由与 `eventPrev` 一样：这是"这一局正在发生的事"，
+    // 写进存档会让下次进 Play 的第一帧凭空吃掉一大段位移。
+    bool rootPrevValid = false;
+    glm::mat4 rootPrevWorld{1.0f};
+    // 基准点（引擎空间，米）：第一次提取时根骨的世界位置。**每帧都把根骨
+    // 钳回这里**，于是模型相对实体恒为 0、实体吃掉全部位移。
+    // ⚠ 不存进文件：它是"这一局开始时"的位置，跟场景无关。
+    glm::vec3 rootBasePos{0.0f};
+
+    // 本帧提取出来的根运动增量（也**不序列化**）。
+    // 存在组件上而不是只走 `RootMotionSystem` 的返回值：物理/脚本下一帧
+    // 才拿到它时（比如物理在动画之后跑），需要一个稳定的落脚点。
+    animation::RootMotionDelta rootDelta;
 
     // ---- 参数黑板（A2 的状态机从这里读）----
     // 三张表分开存而不是一个 variant：脚本侧 setFloat / setBool / setTrigger
@@ -288,6 +414,52 @@ struct AnimatorComponent {
     // 状态机"目标 clip 缺失"警告的按位去重（bit = state 下标）。
     // 不加这个就会每帧刷一条 —— 而日志被刷屏的后果是**整段日志没人看**。
     unsigned ctlWarnMask = 0;
+};
+
+// ---------------- 过场时间轴（C1）----------------
+//
+// 一段过场 = 一份 `.seq.json`（相机关键帧 + 事件）+ 一个播放头。
+// 组件挂在**场景里的任意实体**上；同一场景可以挂多个（A 段入场、B 段
+//  Boss 亮相），由 `priority` 决定这一帧谁在跑。
+//
+// ------------------------------------------------------------
+// 为什么运镜要"托管给 `SequencerSystem`"而不是写在组件里
+// ------------------------------------------------------------
+// 组件是纯数据 —— 这样 `SceneSerializer` 只要存字段，`InspectorPanel`
+// 只要画字段，两者都不必知道"插值怎么算"。所有决策（选哪段、推多快、
+// 该发哪些事件）都在系统里，只有一处。
+//
+// ------------------------------------------------------------
+// `loop` 与资产里的 `loop` 是 **或** 关系（不是覆盖）
+// ------------------------------------------------------------
+// `effectiveLoop = 组件.loop || 资产.loop`。选"或"而不是"组件覆盖"的理由：
+// 覆盖会让"作者在资产里写了循环、却因为组件默认 false 而关掉"，也就是
+// 一个默认值把另一处显式意图悄悄吃掉；"或"是单调的，只能加不能减，
+// 想停循环就在资产里改。**这个坑在每个"组件 vs 资产都有一份同名开关"
+// 的地方都会出现**，值得记住。
+struct SequencerComponent {
+    // 资产路径，相对 `assets/`（例：`sequences/opening.seq.json`）。
+    std::string sequencePath;
+
+    // ---- 纯数据（序列化）----
+    bool enabled = true;
+    bool playing = true;
+    bool loop = false;          // 见上面：与资产里的 loop 取"或"
+    float startTime = 0.0f;     // 起播时间（秒）；>0 = 从中间某处开始
+    float speed = 1.0f;         // 0.5 = 慢放，2 = 快进
+    int priority = 0;           // 高者胜。⚠ 与 CameraComponent::priority 无关
+
+    // ---- 运行时（**不序列化**）----
+    // 解析出来的资产缓存。放在组件里而不是系统里的 map：实体销毁时
+    // 跟着回收，不必额外维护"哪些 entry 该清"。
+    sequence::SequenceAsset asset;
+    bool assetLoaded = false;
+    // 资产加载失败时只喊一次 —— 每帧喊会把日志刷死（那等于没有日志）。
+    bool loadFailedLogged = false;
+
+    float playhead = 0.0f;      // 当前时刻（秒）
+    bool started = false;       // 是否已经过了"首帧"
+    bool finished = false;      // 非循环播放已经走到结尾
 };
 
 // ---------------- 动画键盘映射（角色面板里给 clip 绑键）----------------

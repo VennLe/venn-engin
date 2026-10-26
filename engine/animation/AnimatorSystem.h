@@ -45,7 +45,9 @@
 // ============================================================
 
 #include "animation/AnimController.h"
+#include "animation/AnimEvent.h"
 #include "animation/BoneAttachment.h"
+#include "animation/BoneMask.h"
 #include "animation/LookAt.h"
 #include "animation/Pose.h"
 #include "animation/SpringBone.h"
@@ -86,6 +88,33 @@ public:
     int lastControllerCount() const { return m_lastControllers; }
     // 本帧状态机采纳的转移总数
     int lastTransitionCount() const { return m_lastTransitions; }
+    // 本帧配了附加层的实体数 / 其中真的混合了至少一层的（B1）
+    // 两者之差 = "配了层但一段都没生效"（clip 空 / weight 0 / 遮罩一根都
+    // 没命中），这是配错时最常见的形态，必须能从日志一眼看出来。
+    int lastLayerCount() const { return m_lastLayers; }
+    int lastLayerApplied() const { return m_lastLayersApplied; }
+    // 本帧发出的事件数（B2）。与 `eventsThisFrame()` 直接相关：
+    // 前者给日志/断言，后者给消费方（脚本 / 音频 / 特效）。
+    int lastEventCount() const { return m_lastEvents; }
+    // 本帧真的提取了根运动位移的实体数（B3）。注意它统计的是
+    // **"提到了非零增量"**，不是"配了 rootMotion ≠ Off" —— 两者之差 =
+    // 配了但一步没走（骨选错 / 动画是原地做的 / 第一帧）。
+    int lastRootMotionCount() const { return m_lastRootMotion; }
+    // 本帧最近一次提取用的骨名 + 位移量（ANIM-ROOTMOTION 锚点用）。
+    const std::string& lastRootBone() const { return m_lastRootBone; }
+
+    // ---- 本帧发出的事件（B2，2026-10-26）----
+    //
+    // 每次 `tick` 开头清空，逐条 push。**消费方必须在同一帧里读完**
+    // （下一帧就被清掉了）—— 这是刻意的：事件是"这一帧发生的事"，
+    // 攒起来让下游"稍后处理"会让音效晚一帧、伤害判定在死亡之后才结算。
+    //
+    // ⚠ 引擎内部**不消费**这个数组，只打 `ANIM-EVENT` 锚点。谁是消费方
+    //   由应用层决定（`runtime/RuntimeApp` 或脚本）—— 引擎里塞一个默认
+    //   实现（比如"自动播音效"）会让"没接线的系统"看起来像接好了。
+    const std::vector<FiredAnimEvent>& eventsThisFrame() const {
+        return m_frameEvents;
+    }
 
 private:
     // 采样缓冲（复用，避免每帧分配）。
@@ -97,6 +126,10 @@ private:
     Pose m_pose;
     Pose m_poseFrom;
     Pose m_poseMix;
+    // 附加层采样缓冲（B1）。与上面三份同理：**成员**而不是局部变量，
+    // 否则每帧每层都要分配 3 × jointCount 个向量（4 层 × 63 骨 × 60 fps
+    // = 每秒 4.5 万次分配）。
+    Pose m_poseLayer;
 
     // ---- 表演层后处理（L2 LookAt / L1 IK / L4 弹簧骨）----
     //
@@ -125,6 +158,60 @@ private:
                           const ecs::LookAtComponent* la,
                           const ecs::TwoBoneIKComponent* ik,
                           const ecs::SpringBoneComponent* sb);
+
+    // ---- 附加动画层（B1，2026-10-26）----
+    //
+    // 就地改 `pose`：逐层采样 → 按骨骼遮罩混合进 pose。
+    //
+    // ⚠ 必须在 `applyPerformance` **之前**、`poseToJoints` 之前：
+    //   弹簧骨/LookAt/IK 都要读"最终姿势"，否则头发会跟着底座（下半身）
+    //   的头走、脚部 IK 会把上层动画的腿又拉回去。
+    // ⚠ 这里**只写局部 TRS**，不碰平移以外的世界量 —— 与表演层同一个理由。
+    //
+    // 返回本帧真的混合进去的层数（0 = 一层都没生效）。
+    int applyLayers(const assets::Skeleton& skel, Pose& pose,
+                    ecs::AnimatorComponent& an, float dt, bool advance,
+                    uint32_t entityId);
+
+    // ---- 动画事件分发（B2，2026-10-26）----
+    //
+    // 把 `track` 在 `[prevTime, newTime)` 里跨过的事件全部 push 进
+    // `m_frameEvents`。纯粹的"落库"动作，判定本身在
+    // `animation::collectAnimEvents`（那是能脱离场景跑用例的纯函数）。
+    //
+    // `layer` 非空 → 事件带上层名（附加层的事件要能和底座区分开，
+    // 否则"上层挥拳的 Hit 事件"会被当成底座跑步的）。
+    void dispatchEvents(const AnimEventTrack& track, float prevTime,
+                        float newTime, float duration, bool looped,
+                        uint32_t entityId, const std::string& layer);
+    // 一次分发最多 push 多少条（防一个巨大 dt 把日志/队列打爆）。超出的
+    // 只计数不发 —— 判据是"稳态下一次跨圈的事件数远小于它"。
+    static constexpr int kMaxEventsPerDispatch = 32;
+    std::vector<int> m_eventScratch;   // collectAnimEvents 的输出缓冲
+
+    // ---- 根运动（B3，2026-10-26）----
+    //
+    // 就地改 `pose`（把增量扣掉 = in-place），并按 mode 决定要不要写
+    // `TransformComponent`。返回"本帧真的提到了位移"。
+    //
+    // ⚠ 位置是硬约束：**在 applyPerformance 之后、poseToJoints 之前**。
+    //   取的是"最终姿势"里根骨的世界矩阵 —— 否则 IK / 弹簧骨算完之后
+    //   根骨的位置跟渲染出来的差一点点，位移会缓慢打滑。
+    // ⚠ `wrapped` = 这一帧播放头刚回绕过 → **增量必须丢弃**（见 RootMotion.h）。
+    // ⚠ `advance == false`（编辑器非 Play）时也不提取：拖时间轴 = 任意跳帧，
+    //   每一跳都会被当成一次位移，角色会跟着滑条在场景里乱窜。
+    bool applyRootMotion(const assets::Skeleton& skel, Pose& pose,
+                         ecs::AnimatorComponent& an,
+                         ecs::TransformComponent* tf, bool wrapped,
+                         bool advance);
+
+    // 遮罩解算缓存。key = 骨架地址 + spec 摘要 —— 同一具骨架被 20 个角色
+    // 共用时只算一次（每次算要沿父链走 n·depth 步）。
+    // ⚠ 用 `std::map` 而不是 `unordered_map`：返回的是**引用**，
+    //   unordered_map rehash 会让引用失效（与 rigFor 同一个坑）。
+    const BoneMask& maskFor(const assets::Skeleton& skel,
+                            const BoneMaskSpec& spec);
+    std::map<std::string, BoneMask> m_maskCache;
 
     // 弹簧拓扑缓存。key = (骨架, 前缀表) —— 同一角色实例化多次时共用一份，
     // 不然每个实例都要做一次静止姿势 FK。
@@ -179,6 +266,15 @@ private:
     int m_lastAttachUnresolvedSeen = 0;
     int m_lastControllers = 0;   // 本帧真的被状态机驱动的实体数
     int m_lastTransitions = 0;   // 本帧采纳的转移总数
+    int m_lastLayers = 0;        // 本帧配了附加层的实体数
+    int m_lastLayersApplied = 0; // 其中真的混进去至少一层的
+    int m_lastEvents = 0;        // 本帧发出的事件数（B2）
+    std::vector<FiredAnimEvent> m_frameEvents;   // 本帧的事件（tick 开头清空）
+    int m_lastRootMotion = 0;    // 本帧真的提到了非零根位移的实体数（B3）
+    std::string m_lastRootBone;  // 最近一次用到的根骨名（"配错了没"只能靠它）
+    float m_lastRootDist = 0.0f; // 最近一次的位移模长（米）
+    float m_lastRootYaw = 0.0f;  // 最近一次的朝向增量（弧度）
+    bool m_rootBoneMissing = false;  // 本帧有实体填了骨名但找不到（B3）
 };
 
 } // namespace animation

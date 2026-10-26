@@ -105,6 +105,263 @@ const SpringRig& AnimatorSystem::rigFor(const assets::Skeleton& skel,
     return ins.first->second;
 }
 
+const BoneMask& AnimatorSystem::maskFor(const assets::Skeleton& skel,
+                                       const BoneMaskSpec& spec) {
+    // key = 骨架地址 + spec 摘要。地址进 key 是必须的：同一份 spec
+    // （"spine"）落到不同骨架上，解出来的 weights 长度都不一样。
+    std::string key = std::to_string(
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(&skel)));
+    key += '\x1f';
+    key += boneMaskKey(spec);
+
+    const auto it = m_maskCache.find(key);
+    if (it != m_maskCache.end()) return it->second;
+
+    BoneMask m = buildBoneMask(skel, spec);
+    // 只在**新建**时打一条（缓存命中不打了）。这是"配了层却一动不动"的
+    // 唯一直接证据：`included=0` 一定是 root 名字没命中（真实资产的骨叫
+    // `mixamorig:Spine1`，第一版默认 root 写 `spine_01` 就在这里栽过）。
+    if (m.unresolved > 0 || m.empty()) {
+        VK_LOG_WARN("ANIM-MASK-UNRESOLVED mode=%s roots=%d first=[%s] "
+                    "joints=%d included=%d → 该 root 一根骨都没命中，"
+                    "这一层等于不生效",
+                    boneMaskModeName(spec.mode),
+                    static_cast<int>(spec.roots.size()),
+                    m.firstProblem.c_str(), skel.jointCount(), m.included);
+    } else {
+        VK_LOG_INFO("ANIM-MASK mode=%s roots=%d joints=%d included=%d",
+                    boneMaskModeName(spec.mode),
+                    static_cast<int>(spec.roots.size()), skel.jointCount(),
+                    m.included);
+    }
+    return m_maskCache.emplace(std::move(key), std::move(m)).first->second;
+}
+
+int AnimatorSystem::applyLayers(const assets::Skeleton& skel, Pose& pose,
+                                ecs::AnimatorComponent& an, float dt,
+                                bool advance, uint32_t entityId) {
+    int applied = 0;
+    for (size_t li = 0; li < an.layers.size(); ++li) {
+        ecs::AnimLayer& L = an.layers[li];
+
+        // ---- 层关闭的三种形态，一律"什么都不做" ----
+        // ① clip 空：配了一半的中间状态（见 Components.h 的约束 ③）
+        // ② weight 0：用户把滑块拉到底 = 逐位回到没有这一层
+        // ③ 遮罩一根骨都没命中：buildBoneMask 会给全 0，blend 直接短路
+        if (L.clip.empty() || L.weight <= 0.0f) {
+            // ⚠ 这里**不清** playingClip：清掉的话，用户把 weight 拉回 0.8
+            //   会重新触发一次淡入（"拉滑块 → 动作从第一帧重来"）。
+            continue;
+        }
+
+        const assets::AnimationClip* c = skel.findClip(L.clip);
+        if (!c) {
+            // 逐层只喊一次（用 playingClip 当"喊过了"的标记有点脏，所以
+            // 这里改用 time < 0 的哨兵：不值得为此加一个字段，而每帧
+            // fopen/刷日志的代价是整段日志没人看）。
+            if (L.playingClip != L.clip) {
+                VK_LOG_WARN("ANIM-LAYER-CLIP-MISSING layer=[%s] clip=[%s] "
+                            "→ 该层跳过（findClip 是逐字比较）",
+                            L.name.c_str(), L.clip.c_str());
+                L.playingClip = L.clip;
+            }
+            continue;
+        }
+
+        // ---- 换 clip：重置播放头 + 重新开始淡入 ----
+        if (L.playingClip != L.clip) {
+            L.playingClip = L.clip;
+            L.time = 0.0f;
+            L.fadeT = L.fadeDur > 0.0f ? 0.0f : 1.0f;
+            // ⚠ 事件的上一帧播放头也要归零（B2）。不归零的话，新 clip 的
+            //   事件表会被"上一段停在哪"当起点 —— 第一个事件随机漏发。
+            L.eventPrev = 0.0f;
+        }
+
+        // ---- 播放头 ----
+        // 与底座同一个 wrapTime 语义（负 speed 也兜住、恰好整圈也归零）。
+        const float dur = c->duration;
+        const float evPrev = L.eventPrev;
+        if (advance && L.playing) {
+            L.time += dt * L.speed;
+            if (dur > 0.0f) {
+                if (L.loop) {
+                    if (L.time >= dur || L.time < 0.0f)
+                        L.time = wrapTime(L.time, dur);
+                } else {
+                    L.time = std::clamp(L.time, 0.0f, dur);
+                }
+            } else if (L.time < 0.0f) {
+                L.time = 0.0f;
+            }
+        }
+        // ⚠ 无论这一层最终有没有混进去，`eventPrev` 都要推进：权重被拉到 0
+        //   的那段时间播放头仍在走（只是不参与混合），不推进的话下次把权重
+        //   拉回来会一次性把中间整段的事件全吐出来（"凭空多出 40 次脚步声"）。
+        L.eventPrev = L.time;
+
+        // ---- 淡入 ----
+        // ⚠ `!advance`（编辑器非 Play，dt=0）时**视为已经淡完**：
+        //   否则用户刚配好一层、还没进 Play，在视口里看到的是 weight=0
+        //   的姿态 —— 与"层没生效"完全一样，是这条功能最容易挨骂的地方。
+        float fadeW = 1.0f;
+        if (advance && L.fadeDur > 0.0f && L.fadeT < 1.0f) {
+            L.fadeT = std::min(1.0f,
+                               L.fadeT + dt / std::max(L.fadeDur, 1.0e-4f));
+            fadeW = fadeWeight(L.fadeT);
+        } else if (!advance) {
+            L.fadeT = 1.0f;
+        }
+
+        const float w = L.weight * fadeW;
+        if (w <= 0.0f) continue;
+
+        // ---- 事件（B2）----
+        // 只有"真的混进去了"的层才发事件：权重 0 的层在画面上不存在，
+        // 它的脚步声也不该响（否则"关掉上层"变成"声音还在"）。
+        if (!an.eventTracks.empty()) {
+            const AnimEventTrack* tr = findAnimEventTrack(an.eventTracks, L.clip);
+            if (tr) dispatchEvents(*tr, evPrev, L.time, dur, L.loop, entityId, L.name);
+        }
+
+        // ---- 采样 + 按遮罩混合 ----
+        // ⚠ 采样进 `m_poseLayer` 而不是局部 Pose：见头文件的说明（分配）。
+        samplePose(skel, c, L.time, m_poseLayer);
+        const BoneMask& mask = maskFor(skel, L.mask);
+        if (mask.empty()) continue;   // 一根骨都没命中，等价于没这一层
+        blendPoseMasked(pose, m_poseLayer, mask, w, m_poseMix);
+        // 就地接管：`m_poseMix` 与 `pose` 同址时这一步是自赋值（安全，
+        // 见 blendPoseMasked 的约束 ③），不同址时是一次拷贝。
+        pose = m_poseMix;
+        ++applied;
+    }
+    return applied;
+}
+
+void AnimatorSystem::dispatchEvents(const AnimEventTrack& track, float prevTime,
+                                    float newTime, float duration, bool looped,
+                                    uint32_t entityId, const std::string& layer) {
+    collectAnimEvents(track, prevTime, newTime, duration, looped, m_eventScratch);
+    if (m_eventScratch.empty()) return;
+
+    const int total = static_cast<int>(m_eventScratch.size());
+    const int n = std::min(total, kMaxEventsPerDispatch);
+    for (int i = 0; i < n; ++i) {
+        const AnimEvent& e =
+            track.events[static_cast<size_t>(m_eventScratch[static_cast<size_t>(i)])];
+        FiredAnimEvent f;
+        f.entity = entityId;
+        f.clip = track.clip;
+        f.layer = layer;
+        f.time = e.time;
+        f.kind = e.kind;
+        f.payload = e.payload;
+        m_frameEvents.push_back(f);
+        ++m_lastEvents;
+        // 一帧一条、带**事件自身的时间**（不是播放头）。
+        // ⚠ 这条是"序列不随帧率变"能被验证的原因：播放头在不同帧率下落在
+        //   不同位置，而 `t=` 永远是作者填的那个数 → 两份日志可以逐条比对。
+        VK_LOG_INFO("ANIM-EVENT entity=%u clip=%s layer=[%s] kind=%s t=%.4f "
+                    "payload=[%s]",
+                    static_cast<unsigned>(entityId), track.clip.c_str(),
+                    layer.c_str(), e.kind.c_str(),
+                    static_cast<double>(e.time), e.payload.c_str());
+    }
+    if (total > n) {
+        VK_LOG_WARN("ANIM-EVENT-DROPPED n=%d cap=%d (一个 dt 跨过了太多事件："
+                    "检查事件表时间是否挤在一起，或 dt 是否异常)",
+                    total - n, kMaxEventsPerDispatch);
+    }
+}
+
+bool AnimatorSystem::applyRootMotion(const assets::Skeleton& skel, Pose& pose,
+                                     ecs::AnimatorComponent& an,
+                                     ecs::TransformComponent* tf, bool wrapped,
+                                     bool advance) {
+    // 先清空：上一帧的 delta 不能漏到这一帧（消费方按"本帧有效"读）。
+    an.rootDelta = RootMotionDelta{};
+
+    const int root = resolveRootBone(skel, an.rootMotionBone);
+    if (root < 0) {
+        // 骨架一根骨都没有 / 名字没命中 → 整条链关掉，不报错（用户可能是
+        // 刚把 mode 打开、骨名还没填）。
+        // ⚠ 这里必须**清空** bone 名：不清的话锚点会报上一个实体的骨，
+        //   而"填的名字找不到"看起来就像"填对了在跑"。
+        m_lastRootBone.clear();
+        m_rootBoneMissing = !an.rootMotionBone.empty();
+        return false;
+    }
+    m_lastRootBone = skel.joints[static_cast<size_t>(root)].name;
+
+    const glm::mat4 cur = boneWorldInSkeleton(skel, pose, root);
+    const glm::vec3 curPos = boneWorldPosition(skel, pose, root);
+
+    // ---- 第一帧：只记录基准，不提取 ----
+    // ⚠ 人形骨架的骨盆离地约 1 m，把第一帧当成 `cur - 单位阵` 会让角色
+    //   一进 Play 就往天上窜 1 米。这是根运动最经典的第一帧坑。
+    if (!an.rootPrevValid) {
+        an.rootPrevValid = true;
+        an.rootPrevWorld = cur;
+        an.rootBasePos = curPos;
+        return false;
+    }
+
+    const bool horizontalOnly =
+        an.rootMotion == ecs::AnimatorComponent::RootMotionMode::DeltaOnly;
+
+    // ⚠ 两个"不要提取"的时刻，理由不同但后果一样（角色乱窜）：
+    //   · `wrapped`：循环点根骨从"前方 1.5 m"瞬回原点 → 增量 -1.5 m，
+    //     不丢就是"每走一步被拉回原地"（原地抽搐）
+    //   · `!advance`：编辑器非 Play 拖时间轴 = 任意跳帧，每一跳都成了位移
+    RootMotionDelta d;
+    if (!wrapped && advance) {
+        d = extractRootMotion(skel, an.rootPrevWorld, cur, horizontalOnly);
+    }
+    an.rootPrevWorld = cur;
+    if (!d.valid) return false;
+    an.rootDelta = d;
+
+    // ---- "真的动了"的阈值 ----
+    // ⚠ `RootMotionDelta::isZero()` 是**逐位**比较（它要保证 Off/端点那条
+    //   逐位纪律），而浮点下"两帧之间零位移"几乎不会精确成立：实测原地
+    //   动画的 dist 在 1e-6 量级抖动，于是 `n` 计数会在 0 和 1 之间来回跳
+    //   （日志里 `n=1 dist=0.0000 yaw=0.00deg` —— 自相矛盾，看着像 bug）。
+    //   这里用物理量级卡一道：0.1 毫米 / 0.01 度以下不算位移。
+    //   （60 fps 下 0.1 mm/帧 = 0.006 m/s，比这慢的移动本来也看不出来。）
+    constexpr float kMovedEps = 1.0e-4f;          // 米
+    constexpr float kYawEps = 1.7453292e-4f;      // 0.01 度（弧度）
+    const bool moved = glm::length(d.position) > kMovedEps ||
+                       std::abs(d.yaw) > kYawEps;
+
+    // ---- 钳回基准（in-place）----
+    // ⚠ 无论哪种 mode 都要钳，而且**不是减本帧增量**（那是双倍位移，
+    //   见 RootMotion.h）。钳完之后根相对实体恒为 0，位移全在实体上。
+    // ⚠ 钳位用的是"当前相对基准的总偏移"，所以它会**累积**被扣的量；
+    //   这也意味着跨圈那一帧虽然丢了增量，姿势该钳还是钳（根仍在基准）。
+    const glm::vec3 stripped =
+        stripRootMotion(skel, pose, root, curPos, an.rootBasePos, horizontalOnly);
+    (void)stripped;
+
+    if (!moved) return false;
+
+    // ---- FromClip：引擎直接把位移写到实体上 ----
+    // `DeltaOnly` 刻意**不写**：那是给"物理/CharacterController 自己算速度"
+    // 的场景准备的，引擎替它移动会与物理打架（每帧两个写入点 = 抖动）。
+    if (an.rootMotion == ecs::AnimatorComponent::RootMotionMode::FromClip &&
+        tf) {
+        tf->position += d.position;
+        // 朝向写 `rotation.z`：TransformComponent 只存欧拉角，而引擎是
+        // Z-up —— "绕竖轴转"就是绕 Z。写成 rotation.y 的话角色会绕
+        // 前后轴翻跟头（第一次接上时踩过）。
+        tf->rotation.z += d.yaw;
+    }
+
+    m_lastRootDist = glm::length(d.position);
+    m_lastRootYaw = d.yaw;
+    return true;
+}
+
 void AnimatorSystem::applyPerformance(const assets::Skeleton& skel, Pose& pose,
                                       uint32_t entityId, float dt,
                                       const ecs::LookAtComponent* la,
@@ -211,6 +468,21 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     int mismatched = 0;
     int wrapped = 0;
     int fading = 0;   // 本帧处于过渡中的实体数（ANIM-FADE 用）
+    int layersConfigured = 0;   // 配了附加层的实体数（B1）
+    int layersApplied = 0;      // 其中真的混进去至少一层的
+    int rootMotions = 0;        // 本帧真的提到了非零根位移的实体数（B3）
+    int rootMotionCfg = 0;      // 本帧配了 rootMotion != Off 的实体数（B3）
+    // 本帧的事件队列（B2）。**必须在遍历前清空**：消费方约定"同一帧读完"，
+    // 攒着会让音效晚一帧、伤害判定在死亡之后才结算。
+    m_frameEvents.clear();
+    m_lastEvents = 0;
+    m_lastRootMotion = 0;
+    // ⚠ 必须在这里（tick 开头）清，不能放在遍历之后的汇总区 —— 那个位置
+    //   在 `applyRootMotion` **之后**，会把这一帧刚设上的 true 立刻抹掉，
+    //   于是 BONE-MISS 永远不打（第一版就是这么写的，端到端 ② 直接红）。
+    m_rootBoneMissing = false;
+    m_lastRootDist = 0.0f;
+    m_lastRootYaw = 0.0f;
     m_lastSpring = 0;
     m_lastLookAt = 0;
     m_lastIK = 0;
@@ -342,6 +614,15 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
             lastAnimTime = time;
 
             // ---- 3) 推进时间 ----
+            //
+            // 事件（B2）需要**推进前**的播放头。这里存一份，且必须处理
+            // "这一帧换了 clip"：状态机改 `sk.clipName` 时通常也会把 time
+            // 重置成 0，但单 clip 路径下换 clip 是用户直接改字段 —— time
+            // 会留着上一段的位置。`eventClip` 就是判据（见 AnimEvent.h ③）。
+            const bool clipChanged = an && an->eventClip != sk.clipName;
+            const float evPrev = clipChanged ? 0.0f : (an ? an->eventPrev : time);
+            // B3：本帧播放头有没有回绕过（根运动增量要据此丢弃）
+            bool wrappedThisFrame = false;
             if (advance && playing) {
                 time += dt * speed;
 
@@ -351,6 +632,9 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
                         if (time >= dur || time < 0.0f) {
                             time = wrapTime(time, dur);
                             ++wrapped;
+                            // B3：这一帧的根运动增量必须丢弃 —— 根骨刚从
+                            // "前方 N 米"瞬回原点，那个负增量不是位移。
+                            wrappedThisFrame = true;
                             wrapClip = sk.clipName;
                             wrapT = time;
                             wrapDur = dur;
@@ -362,6 +646,29 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
                 } else if (time < 0.0f) {
                     time = 0.0f;
                 }
+            }
+
+            // ---- 3.5) 底座 clip 的事件（B2）----
+            //
+            // 位置在"推进时间之后、采样之前"。采样要在事件**之后**也无所谓
+            // （事件只读时间），但必须在推进之后 —— 跨过的边界只在这一帧
+            // 存在过一次。
+            //
+            // ⚠ 只有挂了 AnimatorComponent 的实体才有事件表（表就存在组件
+            //   上）。老路径（只有 SkinnedMeshComponent）**逐位不变**。
+            if (an) {
+                if (!an->eventTracks.empty() && clip) {
+                    const AnimEventTrack* tr =
+                        findAnimEventTrack(an->eventTracks, sk.clipName);
+                    if (tr) {
+                        dispatchEvents(*tr, evPrev, time, dur, loop, ent.id, "");
+                    }
+                }
+                // 无论有没有事件表都推进：否则"先播了几圈再加事件表"的第一帧
+                // 会把 prev 当成 0，而 time 已经在 3.7 s —— 一次性吐 3.7 秒
+                // 内所有事件。
+                an->eventClip = sk.clipName;
+                an->eventPrev = time;
             }
 
             // ---- 4) 镜像回 SkinnedMeshComponent（animator 路径）----
@@ -379,12 +686,19 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
                 lastAnimLoop = an->loop;
             }
 
-            // ---- 5) 采样 → 关节矩阵（渲染层只负责搬运）----
+            // ---- 5) 采样 → 底座姿势 ----
             //
             // P5（2026-10-22）：状态切换时走**双采样 + 混合**。见
             // `SkinnedMeshComponent::fadeFromClip` 的字段注释。
             // ⚠ 过渡推进用 `dt`（真实步长）而不是 `dt * speed`：过渡时长
             //   是**时间**语义（0.2 s），不该被角色的播放速度缩放。
+            //
+            // B1（2026-10-26）：这里只负责产出**底座**姿势（`base` 指向
+            // `m_pose` 或过渡时的 `m_poseMix`），附加层与表演层在下面统一
+            // 处理。三条分支收敛到一处输出是刻意的：以前"表演层 + 关节
+            // 矩阵"在两个分支里各写一遍，加第三件事（附加层）时必然只改
+            // 到其中一条 —— 症状是"只有过渡的时候层不生效"。
+            Pose* base = &m_pose;
             if (sk.fading()) {
                 // 过渡的**第一帧**（fadeT 还是 0）打一条锚点。
                 // ⚠ 不要靠 `ANIM-TICK ... fading=` 来断言"真的在混"：
@@ -411,28 +725,61 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
                     sk.fadeDur = 0.0f;
                     sk.fadeFromClip.clear();
                     samplePose(skel, clip, time, m_pose);
-                    applyPerformance(skel, m_pose, ent.id, physDt, laComp, ikComp, sbComp);
-                    poseToJoints(skel, m_pose, sk.jointMatrices);
                 } else {
                     const float w = fadeWeight(sk.fadeT);
                     samplePose(skel, fromClip, sk.fadeFromTime, m_poseFrom);
                     samplePose(skel, clip, time, m_pose);
                     blendPose(m_poseFrom, m_pose, w, m_poseMix);
-                    // 表演层作用在**混合之后**：作用在混合前会被过渡抹平，
-                    // 表现为"切 clip 的那 0.2 秒头发停止摆动"。
-                    applyPerformance(skel, m_poseMix, ent.id, physDt, laComp, ikComp, sbComp);
-                    poseToJoints(skel, m_poseMix, sk.jointMatrices);
+                    base = &m_poseMix;
                     ++fading;
                 }
             } else {
                 samplePose(skel, clip, time, m_pose);
-                applyPerformance(skel, m_pose, ent.id, physDt, laComp, ikComp, sbComp);
-                poseToJoints(skel, m_pose, sk.jointMatrices);
             }
+
+            // ---- 5.5) 附加动画层（B1）----
+            //
+            // 就地叠在底座上：逐层采样 → 按骨骼遮罩混合。
+            // ⚠ 位置是硬约束：**在 applyPerformance 之前**。弹簧骨/LookAt/
+            //   IK 都必须吃最终姿势 —— 放在后面的话，头发会跟着底座的头部
+            //   运动、脚部 IK 会把上层动画的腿拉回去，症状是"挥手时头发
+            //   在飘但手不动"这种一半对一半错的样子。
+            if (an && !an->layers.empty()) {
+                ++layersConfigured;
+                if (applyLayers(skel, *base, *an, advance ? dt : 0.0f,
+                                advance, ent.id) > 0) {
+                    ++layersApplied;
+                }
+            }
+
+            // ---- 6) 表演层后处理 → 关节矩阵 ----
+            // 表演层作用在**混合之后**：作用在混合前会被过渡抹平，
+            // 表现为"切 clip 的那 0.2 秒头发停止摆动"。
+            applyPerformance(skel, *base, ent.id, physDt, laComp, ikComp,
+                             sbComp);
+
+            // ---- 6.5) 根运动（B3）----
+            // 位置是硬约束：**表演层之后、poseToJoints 之前**。
+            // 取的是"最终姿势"里根骨的世界矩阵；挪到前面的话 IK / 弹簧骨
+            // 算完之后根骨位置会跟渲染出来的差一点点，位移会缓慢打滑。
+            if (an && an->rootMotion !=
+                          ecs::AnimatorComponent::RootMotionMode::Off) {
+                ++rootMotionCfg;
+                if (applyRootMotion(skel, *base, *an,
+                                    w.get<ecs::TransformComponent>(ent),
+                                    wrappedThisFrame, advance)) {
+                    ++rootMotions;
+                }
+            }
+
+            poseToJoints(skel, *base, sk.jointMatrices);
         });
 
     m_lastEntities = count;
     m_lastAnimators = animators;
+    m_lastLayers = layersConfigured;
+    m_lastLayersApplied = layersApplied;
+    m_lastRootMotion = rootMotions;
     // 必须在遍历**之后**：seen 是这一帧真正处理过的实体。
     cleanupStates(seen);
 
@@ -511,6 +858,33 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
         if (m_lastControllers > 0) {
             VK_LOG_INFO("ANIM-CTL active=%d trans=%d", m_lastControllers,
                         m_lastTransitions);
+        }
+        // 附加层（B1）：`configured` 与 `applied` 之差就是"配了但没生效"。
+        // 稳态下几乎恒为 0/0（没人配层），所以只在真有人配时才打。
+        if (m_lastLayers > 0) {
+            VK_LOG_INFO("ANIM-LAYER configured=%d applied=%d", m_lastLayers,
+                        m_lastLayersApplied);
+        }
+        // 根运动（B3）：`cfg` = 配了的人，`n` = 本帧真的走动了的人。
+        // ⚠ **`cfg > 0` 就打**，哪怕 `n == 0`。这是刻意的：最常见的两种
+        //   失败（骨选错 / 这段动画是原地做的）都表现为"n 一直是 0"，
+        //   而"没有日志"和"日志说 0"对排查是天壤之别 —— 前者让人以为
+        //   功能没接线（引擎里根本没有这条路径），后者指向资产或配置。
+        if (rootMotionCfg > 0) {
+            // ⚠ yaw 用**角度**并且两位小数：走路时骨盆本来就左右摆
+            //   （实测 0.5° 上下），用弧度三位小数它永远是 0.000 —— 于是
+            //   "n=1 但 dist=0.0000 yaw=0.000" 看起来像自相矛盾。
+            VK_LOG_INFO("ANIM-ROOTMOTION cfg=%d n=%d bone=%s dist=%.4f "
+                        "yaw=%.2fdeg",
+                        rootMotionCfg, m_lastRootMotion,
+                        m_lastRootBone.empty() ? "(none)" : m_lastRootBone.c_str(),
+                        static_cast<double>(m_lastRootDist),
+                        static_cast<double>(glm::degrees(m_lastRootYaw)));
+        }
+        if (m_rootBoneMissing) {
+            VK_LOG_WARN("ANIM-ROOTMOTION-BONE-MISS rootMotionBone 填了名字但"
+                        "骨架里找不到 → 该实体的根运动整条关闭（保持原样，"
+                        "不会退化成\"用根骨\"）");
         }
     }
     // 跨圈单独一条：fmod 的正确性靠它断（只报最后一次，避免高频刷屏）

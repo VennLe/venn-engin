@@ -5,6 +5,7 @@
 #include "EditorDragDrop.h"
 #include "EditorLayoutIO.h"
 #include "InspectorIcons.h"
+#include "sequence/SequencerSystem.h"
 #include "PrimitiveBuilder.h"
 
 #include "ui/ImGuiTheme.h"
@@ -282,6 +283,7 @@ const TabDesc kTabs[] = {
     {"physics", "Physics", "Colliders", iconPhysics},
     {"material", "Material", "Material factors and textures", iconMaterial},
     {"animation", "Animation", "Skinning and animation clips", iconAnimation},
+    {"sequence", "Sequence", "Cutscene timeline: camera moves and events", iconSequence},
     {"all", "All", "Everything (the old stacked view)", iconAll},
 };
 constexpr int kTabCount = static_cast<int>(sizeof(kTabs) / sizeof(kTabs[0]));
@@ -295,6 +297,17 @@ static_assert(static_cast<int>(InspectorPanel::InspTab::All) == kTabCount - 1,
 // 页签名（给日志用）；越界返回 "?"。
 const char* tabNameAt(int i) {
     return (i >= 0 && i < kTabCount) ? kTabs[i].id : "?";
+}
+
+// 一段 clip 的时长（没骨架 / 没这段 → 0）。
+//
+// 存在的唯一理由：事件面板要能告诉用户"你写的 t 超过这段的长度了，它
+// 永远不会发"。这件事**只能**在这里算出来 —— `AnimatorSystem` 那边是
+// 丢弃（半开区间），不会报错，症状是"加了个事件但从来没响"。
+float clipDurationOf(const assets::Skeleton* skel, const std::string& clip) {
+    if (!skel || clip.empty()) return 0.0f;
+    const assets::AnimationClip* c = skel->findClip(clip);
+    return c ? c->duration : 0.0f;
 }
 
 } // namespace
@@ -570,6 +583,7 @@ void InspectorPanel::drawTabContent(ecs::Entity e) {
         case InspTab::Physics:   drawTabPhysics(e); break;
         case InspTab::Material:  drawTabMaterial(e); break;
         case InspTab::Animation: drawTabAnimation(e); break;
+        case InspTab::Sequence:  drawTabSequence(e); break;
         case InspTab::All:       drawTabAll(e); break;
         case InspTab::Count:     break;
     }
@@ -2030,25 +2044,468 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
         }
     }
 
-    // 根运动（**仍是占位** —— A4 才会真的驱动位移）
-    ImGui::BeginDisabled();
+    // 根运动（B3，2026-10-26 —— 真的会驱动位移了）
+    //
+    // 三档语义（详见 `Components.h` 的 RootMotionMode）：
+    //   Off        不动（原地跑 + 代码移动）
+    //   From clip  引擎自己把位移写进 Transform（过场 / 精确对齐）
+    //   Delta only 只把每帧位移算出来给物理，引擎不替它移动
+    // ⚠ From clip 和**物理驱动**不能同时开：两个写入点每帧打架，症状是
+    //   角色抖动 / 走不动。这一条只能靠文档，代码里没法判断（物理组件
+    //   在别的 module 里，且在运行时才挂上）。
     static const char* const kRootMotion[3] = {
         "Off", "From clip", "Delta only"};
     int rm = static_cast<int>(an->rootMotion);
     if (ImGui::Combo(TRL("Root motion"), &rm, TrItems<3>(kRootMotion), 3)) {
         const auto prev = an->rootMotion;
         an->rootMotion = static_cast<ecs::AnimatorComponent::RootMotionMode>(rm);
+        // 换档要重新对基准：上一档留下的 `rootPrevWorld` 是"上一帧的根骨"，
+        // 而这一档可能已经关了很久（插值全变了），拿它做差会算出一个
+        // 假的巨大位移 —— 表现是"一开根运动角色就瞬移一下"。
+        an->rootPrevValid = false;
         discreteEdit(m_ctx, "Set Root Motion Mode", &an->rootMotion, prev);
     }
     logRect("INS-ANIM-ROOTMOTION", ImGui::GetItemRectMin(),
             ImGui::GetItemRectMax());
-    ImGui::EndDisabled();
+
+    if (an->rootMotion != ecs::AnimatorComponent::RootMotionMode::Off) {
+        // 骨名：空 = 自动（拓扑序里第一根 parent == -1）。
+        // ⚠ 只在这一档显示 —— Off 时显示一个填了也不生效的输入框，
+        //   比不显示更糟（用户会以为填了就能用）。
+        if (m_rootBoneBufFor != e) {
+            m_rootBoneBufFor = e;
+            std::snprintf(m_rootBoneBuf, sizeof(m_rootBoneBuf), "%s",
+                          an->rootMotionBone.c_str());
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::InputTextWithHint(TRL("root bone"), TRL("auto (first root)"),
+                                     m_rootBoneBuf, sizeof(m_rootBoneBuf))) {
+            an->rootMotionBone = m_rootBoneBuf;
+            an->rootPrevValid = false;   // 换了骨就要重新对基准
+        }
+        logRect("INS-ANIM-ROOTBONE", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        // 只读回显：这一帧实际用的是哪根骨、走了多远。
+        // 这是"配了但一步都不走"唯一能自查的地方（骨名填错时画面
+        // 与 Off 完全一样）。
+        const float dist = glm::length(an->rootDelta.position);
+        ImGui::TextDisabled("root: %s  |Δ| = %.4f m / frame, Δyaw = %.2f°",
+                            an->rootDelta.valid ? "(extracted)" : "(no delta)",
+                            static_cast<double>(dist),
+                            static_cast<double>(glm::degrees(an->rootDelta.yaw)));
+    }
 
     hint("Controller = assets/animators/*.anim.json, schema in "
          "animation/AnimController.h.\n"
          "Parameters Speed / Grounded / Jump are fed by the runtime and by "
          "editor Play. Empty controller = single clip.\n"
-         "Root motion is the only field still greyed (A4).");
+         "Root motion needs the animation to actually move the root bone;\n"
+         "if the clip was baked in place, distance per frame stays 0.");
+
+    // ================================================================
+    // 附加动画层 / 骨骼遮罩（B1，2026-10-26）
+    // ================================================================
+    //
+    // 这一段的唯一目的：让"上半身挥手 + 下半身走路"能在**界面上**配出来
+    // （不是只能手改 JSON）。所以每层必须有：一段 clip、一个权重、一个
+    // 遮罩根骨 —— 三样齐了才是可用的功能。
+    ImGui::Separator();
+    ImGui::TextUnformatted(TR("Animation Layers  (upper / lower body)"));
+    logRect("INS-ANIM-LAYERS", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    if (an->layers.empty()) {
+        hint("No layers: the base layer alone drives the whole skeleton "
+             "(the single clip / controller above).\n"
+             "Add a layer to play another clip on part of the body - an upper "
+             "body wave while the legs keep walking.\n"
+             "Mask = a bone name; the layer then covers that bone and "
+             "everything under it. Empty mask = the whole body.");
+    }
+
+    constexpr int kMaxLayers = 8;   // 与缓冲数组同宽（见 InspectorPanel.h）
+    ImGui::BeginDisabled(static_cast<int>(an->layers.size()) >= kMaxLayers);
+    if (ImGui::Button(TR("Add Layer"))) {
+        m_ctx.structuralEdit("Add Anim Layer", [&]() {
+            ecs::AnimLayer L;
+            L.name = "Layer " + std::to_string(an->layers.size() + 1);
+            an->layers.push_back(L);
+        });
+        m_layerBufFor = ecs::Entity{};   // 层数变了 → 下一帧重灌缓冲
+    }
+    ImGui::EndDisabled();
+    logRect("INS-LAYER-ADD", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    const int layerCount = static_cast<int>(an->layers.size());
+    // 缓冲回填：**换实体**或**层数变了**才重灌（否则每帧回填会把正在
+    // 输入的名字/骨名冲掉 —— 与 IK 那三个骨名缓冲同一个纪律）。
+    if (m_layerBufFor != e || m_layerBufCount != layerCount) {
+        for (int i = 0; i < kMaxLayers && i < layerCount; ++i) {
+            const ecs::AnimLayer& L = an->layers[static_cast<size_t>(i)];
+            std::snprintf(m_layerNameBuf[i], sizeof(m_layerNameBuf[i]), "%s",
+                          L.name.c_str());
+            // 骨名列表用**逗号分隔**的一行（与弹簧骨前缀同一种写法：
+            // 多值字段用一个文本行，比"加一行减一行"的表格快得多）
+            std::string roots;
+            for (const std::string& r : L.mask.roots) {
+                if (!roots.empty()) roots += ",";
+                roots += r;
+            }
+            std::snprintf(m_layerMaskBuf[i], sizeof(m_layerMaskBuf[i]), "%s",
+                          roots.c_str());
+        }
+        m_layerBufFor = e;
+        m_layerBufCount = layerCount;
+    }
+
+    int removeLayer = -1;
+    // 层里的 clip 下拉要用骨架的 clips 名单（手打 clip 名必然会写错，
+    // 而写错的症状是"这一层完全没反应"，只有 ANIM-LAYER-CLIP-MISSING
+    // 一条日志能看出来）。
+    const assets::Skeleton* layerSkel =
+        (sk->model && sk->model->skeleton) ? sk->model->skeleton.get()
+                                           : nullptr;
+    for (int li = 0; li < layerCount; ++li) {
+        ImGui::PushID(li);
+        ecs::AnimLayer& L = an->layers[static_cast<size_t>(li)];
+
+        // 标题带上"生效吗"：配了层却没效果是最常见的问题，光看名字看不出来
+        const bool live = !L.clip.empty() && L.weight > 0.0f;
+        std::string title = L.name;
+        title += live ? "  (" : "  [off] (";
+        title += L.clip.empty() ? "-" : L.clip;
+        title += ")";
+        ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+        const bool open = ImGui::CollapsingHeader(title.c_str());
+        logRect("INS-LAYER-HDR", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+
+        if (open && li < kMaxLayers) {
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##lname", TRL("layer name"),
+                                     m_layerNameBuf[li],
+                                     sizeof(m_layerNameBuf[li]));
+            if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+                const std::string v = m_layerNameBuf[li];
+                if (v != L.name && !v.empty()) {
+                    m_ctx.structuralEdit("Rename Anim Layer",
+                                         [&]() { L.name = v; });
+                }
+            }
+
+            // ---- clip ----
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##lclip",
+                                  L.clip.empty() ? TR("(none)")
+                                                 : L.clip.c_str())) {
+                if (ImGui::Selectable(TR("(none)"), L.clip.empty())) {
+                    m_ctx.structuralEdit("Clear Layer Clip", [&]() {
+                        L.clip.clear();
+                        L.playingClip.clear();
+                    });
+                }
+                if (layerSkel) {
+                    for (const assets::AnimationClip& c : layerSkel->clips) {
+                        const bool sel = (c.name == L.clip);
+                        if (ImGui::Selectable(c.name.c_str(), sel) && !sel) {
+                            const std::string v = c.name;
+                            m_ctx.structuralEdit("Set Layer Clip", [&]() {
+                                L.clip = v;
+                                // 换 clip 必须让播放头归零 + 重新淡入，
+                                // 否则新 clip 从旧相位的中段开始播
+                                L.playingClip.clear();
+                                L.time = 0.0f;
+                                L.fadeT = 0.0f;
+                            });
+                        }
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            logRect("INS-LAYER-CLIP", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+
+            // ---- 权重 ----
+            const float w0 = L.weight;
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::SliderFloat(TRL("Weight"), &L.weight, 0.0f, 1.0f, "%.2f");
+            fieldEdit(m_ctx, "Set Layer Weight", &L.weight, w0);
+            logRect("INS-LAYER-WEIGHT", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+
+            // ---- 播放 ----
+            if (ImGui::Checkbox(TR("Playing"), &L.playing)) {
+                m_ctx.structuralEdit("Toggle Layer Playing",
+                                     [&]() { L.playing = !L.playing; });
+            }
+            ImGui::SameLine();
+            if (ImGui::Checkbox(TR("Loop"), &L.loop)) {
+                m_ctx.structuralEdit("Toggle Layer Loop",
+                                     [&]() { L.loop = !L.loop; });
+            }
+
+            // ---- 遮罩 ----
+            static const char* const kMaskModes[3] = {
+                "All bones", "Allow roots", "Deny roots"};
+            int mm = static_cast<int>(L.mask.mode);
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::Combo(TRL("Mask"), &mm, TrItems<3>(kMaskModes), 3)) {
+                const auto v = static_cast<animation::BoneMaskMode>(mm);
+                m_ctx.structuralEdit("Set Layer Mask Mode",
+                                     [&]() { L.mask.mode = v; });
+            }
+            logRect("INS-LAYER-MASKMODE", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##lmask",
+                                     TRL("mask roots (comma separated: spine)"),
+                                     m_layerMaskBuf[li],
+                                     sizeof(m_layerMaskBuf[li]));
+            if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+                std::vector<std::string> roots;
+                std::string cur;
+                for (const char* p = m_layerMaskBuf[li]; ; ++p) {
+                    if (*p == ',' || *p == '\0') {
+                        // 去掉前后空白（用户打 "spine, neck" 很常见）
+                        const size_t b = cur.find_first_not_of(" \t");
+                        const size_t epos = cur.find_last_not_of(" \t");
+                        if (b != std::string::npos)
+                            roots.push_back(cur.substr(b, epos - b + 1));
+                        cur.clear();
+                        if (*p == '\0') break;
+                    } else {
+                        cur += *p;
+                    }
+                }
+                if (roots != L.mask.roots) {
+                    m_ctx.structuralEdit("Set Layer Mask Roots",
+                                         [&]() { L.mask.roots = roots; });
+                }
+            }
+            logRect("INS-LAYER-MASKROOTS", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+
+            // 解算结果（只读）：名字打错时这里会明说 —— 否则症状只是
+            // "这一层配好了但身体一点没动"。
+            if (layerSkel) {
+                const animation::BoneMask bm =
+                    animation::buildBoneMask(*layerSkel, L.mask);
+                if (bm.empty()) {
+                    ImGui::TextDisabled(
+                        TR("mask: NO BONE MATCHED (roots not found)"));
+                } else {
+                    ImGui::TextDisabled(TR("mask: %d / %d bones"),
+                                        bm.included, bm.count());
+                }
+            }
+
+            if (ImGui::Button(TR("Remove Layer"))) removeLayer = li;
+            logRect("INS-LAYER-REMOVE", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+        }
+        ImGui::PopID();
+    }
+    // 删除**放在循环之后**：在循环里 erase 会让后面所有层的引用失效
+    // （症状是"删掉第 1 层，第 2 层的值跑到第 3 层上"）。
+    if (removeLayer >= 0) {
+        const int idx = removeLayer;
+        m_ctx.structuralEdit("Remove Anim Layer", [&]() {
+            if (idx < static_cast<int>(an->layers.size()))
+                an->layers.erase(an->layers.begin() + idx);
+        });
+        m_layerBufFor = ecs::Entity{};
+    }
+
+    // ================================================================
+    // 动画事件 / Notify（B2，2026-10-26）
+    // ================================================================
+    //
+    // 为什么**不**并进上面那段"层"里：事件对**底座 clip 也**成立
+    // （跑步的脚步声、落地音效）。塞进层里会让"没配层 = 没有脚步声"，
+    // 而脚步声恰恰是最常用的一条。
+    //
+    // 这一段的验收点不是"能编辑"，而是**改完立刻在 Play 里听得到/看得到
+    // ANIM-EVENT 锚点** —— 所以时间输入框必须是连续拖拽（DragFloat），
+    // 用 InputText 会逼用户"改完还得失焦"，而拖到哪一秒的声音对不对是
+    // 靠反复微调出来的。
+    ImGui::Separator();
+    ImGui::TextUnformatted(TR("Animation Events  (footstep / hit / sound)"));
+    logRect("INS-ANIM-EVENTS", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    if (an->eventTracks.empty()) {
+        hint("No events: this clip fires nothing. Add a track to call sound / "
+             "VFX / damage code at an exact time inside a clip.\n"
+             "Fires when the playhead CROSSES the time (not while it sits "
+             "on it) - so one event = one fire per lap.\n"
+             "The table lives on this component, not in the model file - "
+             "re-importing the model keeps it.");
+    }
+
+    if (ImGui::Button(TR("Add Event Track"))) {
+        // 默认挂"当前正在播的那段"：绝大多数人就是给眼前这段加事件。
+        // 退回到 defaultClip，再退到骨架的第一段 —— 三个都空就建空名，
+        // 让用户在下面的下拉里自己选（比"按钮点不动"好）。
+        std::string defClip = sk->clipName;
+        if (defClip.empty()) defClip = an->defaultClip;
+        if (defClip.empty() && layerSkel && !layerSkel->clips.empty())
+            defClip = layerSkel->clips.front().name;
+        m_ctx.structuralEdit("Add Anim Event Track", [&]() {
+            animation::AnimEventTrack tr;
+            tr.clip = defClip;
+            // 给一条 t=0 的空事件：**看得见才能改**。只建空表的话面板上
+            // 是一行都不显示，用户会以为按钮没生效。
+            animation::AnimEvent e;
+            e.time = 0.0f;
+            e.kind = "Event";
+            tr.events.push_back(std::move(e));
+            an->eventTracks.push_back(std::move(tr));
+        });
+    }
+    logRect("INS-EV-ADD", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    int removeTrack = -1;
+    for (int ti = 0; ti < static_cast<int>(an->eventTracks.size()); ++ti) {
+        animation::AnimEventTrack& tr = an->eventTracks[ti];
+        ImGui::PushID(3000 + ti);
+
+        // 标题带 count + 生效与否（clip 名打错 / 空 = 这张表永远不会发）
+        std::string title = tr.clip.empty() ? std::string("-") : tr.clip;
+        title += "  (";
+        title += std::to_string(tr.events.size());
+        title += tr.clip.empty() ? " events, no clip)" : " events)";
+        ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+        const bool open = ImGui::CollapsingHeader(title.c_str());
+        logRect("INS-EV-TRACK", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+
+        if (open) {
+            // ---- 挂在哪段 clip ----
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##evclip",
+                                  tr.clip.empty() ? TR("(none)")
+                                                  : tr.clip.c_str())) {
+                if (layerSkel) {
+                    for (const assets::AnimationClip& c : layerSkel->clips) {
+                        const bool sel = (c.name == tr.clip);
+                        if (ImGui::Selectable(c.name.c_str(), sel) && !sel) {
+                            const std::string v = c.name;
+                            m_ctx.structuralEdit("Set Anim Event Track Clip",
+                                                 [&]() { tr.clip = v; });
+                        }
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            logRect("INS-EV-CLIP", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+            if (tr.clip.empty() && layerSkel) {
+                ImGui::TextDisabled(
+                    TR("no clip: this track never fires"));
+            }
+
+            // ---- 事件行 ----
+            const float dur = clipDurationOf(layerSkel, tr.clip);
+            int removeEvent = -1;
+            for (int ei = 0; ei < static_cast<int>(tr.events.size()); ++ei) {
+                animation::AnimEvent& e = tr.events[ei];
+                ImGui::PushID(4000 + ei);
+
+                ImGui::SetNextItemWidth(74.0f);
+                // 上限不是 dur：写超了应该**看得见**（红色提示下面给），
+                // 而不是被输入框悄悄夹住 —— 夹住之后"我明明写的 2.0 怎么
+                // 变成 0.9 了"没有任何线索。
+                const float t0 = e.time;
+                ImGui::DragFloat("##t", &e.time, 0.005f, 0.0f, 8.0f, "%.3f");
+                fieldEdit(m_ctx, "Set Anim Event Time", &e.time, t0);
+                logRect("INS-EV-TIME", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(120.0f);
+                char kindBuf[64];
+                std::snprintf(kindBuf, sizeof(kindBuf), "%s", e.kind.c_str());
+                ImGui::InputTextWithHint("##kind", TRL("kind (Footstep)"),
+                                         kindBuf, sizeof(kindBuf));
+                if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+                    const std::string v = kindBuf;
+                    if (v != e.kind) {
+                        m_ctx.structuralEdit("Set Anim Event Kind",
+                                             [&]() { e.kind = v; });
+                    }
+                }
+                logRect("INS-EV-KIND", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-46.0f);
+                char payBuf[128];
+                std::snprintf(payBuf, sizeof(payBuf), "%s", e.payload.c_str());
+                ImGui::InputTextWithHint("##pay", TRL("payload (optional)"),
+                                         payBuf, sizeof(payBuf));
+                if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+                    const std::string v = payBuf;
+                    if (v != e.payload) {
+                        m_ctx.structuralEdit("Set Anim Event Payload",
+                                             [&]() { e.payload = v; });
+                    }
+                }
+                logRect("INS-EV-PAYLOAD", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x##ev")) removeEvent = ei;
+                logRect("INS-EV-REMOVE", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+
+                // 越界提示：`t >= dur` 的事件**永远不会发**（半开区间的
+                // 右端被 wrapTime 吃掉），这是最容易写错又最难看出的形态。
+                if (dur > 0.0f && e.time >= dur) {
+                    ImGui::TextDisabled(
+                        TR("t >= clip duration (%.2fs): never fires"),
+                        static_cast<double>(dur));
+                } else if (e.time < 0.0f) {
+                    ImGui::TextDisabled(TR("t < 0: never fires"));
+                }
+                ImGui::PopID();
+            }
+            if (removeEvent >= 0) {
+                const int idx = removeEvent;
+                m_ctx.structuralEdit("Remove Anim Event", [&]() {
+                    if (idx < static_cast<int>(tr.events.size()))
+                        tr.events.erase(tr.events.begin() + idx);
+                });
+            }
+
+            if (ImGui::Button(TR("Add Event"))) {
+                // 新事件放在"最后一条 + 0.2 s"，而不是 0：
+                // 都放 0 的话第二条要手动拖到后半段，而两条重叠在 0 时
+                // 看不出"是不是少发了一条"。
+                m_ctx.structuralEdit("Add Anim Event", [&]() {
+                    animation::AnimEvent e;
+                    e.time = tr.events.empty() ? 0.0f : tr.events.back().time + 0.2f;
+                    if (dur > 0.0f) e.time = std::min(e.time, dur * 0.999f);
+                    e.kind = "Event";
+                    tr.events.push_back(std::move(e));
+                    animation::sortAnimEventTrack(tr);
+                });
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(TR("Remove Track"))) removeTrack = ti;
+            logRect("INS-EV-TRACKREMOVE", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+        }
+        ImGui::PopID();
+    }
+    // 与层同一个纪律：删除放在循环之后（循环里 erase 会让后面所有引用失效）
+    if (removeTrack >= 0) {
+        const int idx = removeTrack;
+        m_ctx.structuralEdit("Remove Anim Event Track", [&]() {
+            if (idx < static_cast<int>(an->eventTracks.size()))
+                an->eventTracks.erase(an->eventTracks.begin() + idx);
+        });
+    }
 
     // ================================================================
     // 弹簧骨（L4 表演层，2026-10-25）
@@ -2496,6 +2953,174 @@ void InspectorPanel::drawTabWorld(ecs::Entity e) {
 
 // 全部：旧的"一长条堆叠"视图，一字不改地沿用原来的调用顺序 ——
 // 它同时是自动化运行下的默认页签，所以**改了顺序就等于改了历史基线**。
+// ---------------------------------------------------------------- C1 过场时间轴
+//
+// 这一段是"时间轴的**播放控制台**"，不是轨道编辑器（拖关键帧的曲线视图是
+// 后续工作）。它要能回答四个问题：
+//   ① 我配的是哪份资产，它到底解析成功了没有
+//   ② 它多长、有几个关键帧、几个事件
+//   ③ 现在播到哪，拖一下能不能看到画面（→ Preview）
+//   ④ 有没有那种"写了但永远不会发"的东西（→ 明确报出来，而不是静默丢）
+void InspectorPanel::drawTabSequence(ecs::Entity e) {
+    if (!e.valid()) { tabEmptyHint("an object"); return; }
+
+    scene::Scene& sc = m_ctx.activeScene();
+    ecs::World& w = sc.world();
+    auto* sq = w.get<ecs::SequencerComponent>(e);
+    if (!sq) {
+        tabEmptyHint("cutscene sequence");
+        hint("Tool tab → Add Component → Cutscene Sequence.\n"
+             "Attach it to an empty object and treat that object as the director.");
+        return;
+    }
+
+    const bool open = sectionHeader("Cutscene Sequence", true, e);
+    logRect("INS-SEQ-HEADER", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (!open) return;
+
+    ImGui::PushID("seq");
+
+    // ---- 资产路径 ----
+    // 编辑缓冲按实体懒同步：直接 EditText 到 `std::string` 上，第二帧就会被
+    // 组件里的旧值覆盖回去（打一个字消失一个）。
+    if (m_seqPathBufFor != e) {
+        m_seqPathBufFor = e;
+        std::snprintf(m_seqPathBuf, sizeof(m_seqPathBuf), "%s",
+                      sq->sequencePath.c_str());
+    }
+    ImGui::TextUnformatted(TR("Sequence asset"));
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint("##seqpath", "sequences/opening.seq.json",
+                                 m_seqPathBuf, sizeof(m_seqPathBuf))) {
+        // 路径一改就作废缓存：否则用户填了新路径、界面还是旧资产的名字，
+        // 看起来像"路径没生效"。
+        sq->sequencePath = m_seqPathBuf;
+        sq->assetLoaded = false;
+        sq->loadFailedLogged = false;
+        sq->started = false;
+        sq->finished = false;
+        sq->playhead = 0.0f;
+    }
+    logRect("INS-SEQ-PATH", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    hint("Relative to assets/. Keys and events live in that JSON — see "
+         "docs/cutscene_sequencer.md.");
+
+    // 懒加载一次（tick 也会加载，但编辑态下 tick 可能没被调，这里兜一下，
+    // 否则"页面全空"要等到进 Play 才有内容）。
+    if (!sq->assetLoaded && !sq->sequencePath.empty()) {
+        sq->assetLoaded = true;
+        loadSequence(sq->sequencePath, sq->asset);
+    }
+
+    if (!sq->sequencePath.empty() && !sq->asset.valid) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s",
+                           TR("Cannot load this sequence."));
+        if (!sq->asset.error.empty())
+            ImGui::TextDisabled("%s", sq->asset.error.c_str());
+    } else if (sq->asset.valid) {
+        ImGui::TextDisabled(TR("%s  |  %.2f s  |  %d camera keys, %d events"),
+                            sq->asset.name.c_str(),
+                            static_cast<double>(sq->asset.duration),
+                            static_cast<int>(sq->asset.cameraKeys.size()),
+                            static_cast<int>(sq->asset.events.size()));
+        // "写了但永远不发"的那些 —— 这是配时间轴最常见的坑，必须显式说。
+        int dead = 0;
+        for (const auto& ev : sq->asset.events)
+            if (ev.t >= sq->asset.duration - sequence::kSeqTimeEps) ++dead;
+        if (dead > 0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
+                               TR("%d event(s) at or past the end will never fire."),
+                               dead);
+        }
+    }
+
+    // ---- 播放控制 ----
+    ImGui::Checkbox(TR("Playing"), &sq->playing);
+    ImGui::SameLine();
+    ImGui::Checkbox(TR("Loop"), &sq->loop);
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragFloat(TR("Speed"), &sq->speed, 0.01f, 0.0f, 8.0f, "%.2f");
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragFloat(TR("Start time"), &sq->startTime, 0.01f, 0.0f, 3600.0f,
+                     TR("%.2f s"));
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragInt(TR("Priority"), &sq->priority, 0.1f, -100, 100);
+    hint("Higher priority wins when several sequences are enabled in the same "
+         "scene. This is NOT the camera priority.");
+
+    // ---- 时间滑条 ----
+    // 拖它能预览运镜：`dt == 0` 的 tick 只按当前播放头采样姿态，不推进时间、
+    // 不发事件（见 SequencerSystem.h）。所以拖动是"看"而不是"播"。
+    if (sq->asset.valid && sq->asset.duration > 0.0f) {
+        float t = std::clamp(sq->playhead, 0.0f, sq->asset.duration);
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::SliderFloat("##seqtime", &t, 0.0f, sq->asset.duration,
+                               TR("%.3f s"))) {
+            sq->playhead = t;
+            sq->started = true;
+            sq->finished = false;
+        }
+        logRect("INS-SEQ-TIME", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        // 拖动中实时预览；松手停止接管（之后用户拖相机不会被抢回来）。
+        if (ImGui::IsItemActive() || ImGui::IsItemDeactivatedAfterEdit()) {
+            sequence::SequencerSystem& sys = sequence::activeSequencerSystem();
+            sys.tick(sc, 0.0f);
+            if (sys.hasPose())
+                sequence::applyPoseToSceneCamera(sc, sys.pose());
+        }
+
+        ImGui::SameLine();
+        if (ImGui::SmallButton(TR("Preview"))) {
+            sequence::SequencerSystem& sys = sequence::activeSequencerSystem();
+            sys.tick(sc, 0.0f);
+            if (sys.hasPose())
+                sequence::applyPoseToSceneCamera(sc, sys.pose());
+        }
+        logRect("INS-SEQ-PREVIEW", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(TR("Apply this time to the viewport camera once."));
+    }
+
+    // ---- 回显（本帧统计）----
+    const sequence::SequencerSystem& sys = sequence::activeSequencerSystem();
+    ImGui::TextDisabled(TR("head %.3f / %.3f  |  running %d  |  last fired %d"),
+                        static_cast<double>(sq->playhead),
+                        static_cast<double>(sq->asset.duration),
+                        sys.lastRunning(),
+                        static_cast<int>(sys.firedEvents().size()));
+    if (sq->finished) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", TR("(finished)"));
+    }
+
+    // ---- 事件表（只读）----
+    // 第一版**不做**在这里加删事件：事件写进 `.seq.json` 才是权威，
+    // 在 UI 上改再回写资产文件是"两套真值"的开头。等需要了再做。
+    if (!sq->asset.events.empty()) {
+        // ⚠ `ImGui::TreeNode` 的 `(fmt, ...)` 变体在新版 ImGui 里已经移除，
+        //   只剩 `(const char*)` —— 所以必须自己先拼好。
+        char treeLabel[96];
+        std::snprintf(treeLabel, sizeof(treeLabel), TR("Events (%d)"),
+                      static_cast<int>(sq->asset.events.size()));
+        if (ImGui::TreeNode(treeLabel)) {
+            for (const auto& ev : sq->asset.events) {
+                const bool reached = sq->playhead >= ev.t - sequence::kSeqTimeEps;
+                // 拼好再画：直接把格式串交给 ImGui 会绕过翻译（数据行也
+                // 要能被 i18n 工具看到，见 docs 的 E 组"控件显示格式串"）。
+                char row[256];
+                std::snprintf(row, sizeof(row), TR("%7.3f   %s   %s"),
+                              static_cast<double>(ev.t), ev.kind.c_str(),
+                              ev.payload.c_str());
+                ImGui::TextDisabled("%s", row);
+                if (reached) ImGui::SameLine(), ImGui::TextDisabled("%s", TR("✓"));
+            }
+            ImGui::TreePop();
+        }
+    }
+
+    ImGui::PopID();
+}
+
 void InspectorPanel::drawTabAll(ecs::Entity e) {
     if (!e.valid()) {
         drawSceneryFallback();
@@ -2506,6 +3131,9 @@ void InspectorPanel::drawTabAll(ecs::Entity e) {
     drawMeshAndMaterial(e);
     drawLights(e);
     drawScript(e);
+    // C1：All 视图也要有这一段 —— `All` 是自动化默认页签（见文件头），
+    // 漏了它，"All 里能配时间轴"这件事就断言不到。
+    drawTabSequence(e);
     drawAddRemove(e);
 }
 
@@ -6353,6 +6981,339 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
         }
     }
 
+    // ============================================================
+    // Toon / NPR 段（A6 色带 · A1 面部 SDF · A5 角色光，2026-10-26）
+    //
+    // 为什么紧挨着"着色模型"：这四行的生效前提是 Shading Model = Toon
+    // （着色器里整段在 `#if VENN_SHADING_TOON` 内，别的模型配了也不生效）。
+    // ⚠ 但**灰掉而不是隐藏**：隐藏会让人以为"这个引擎没有色带"，
+    //   而灰掉能看出"有这个东西，但要先切到 Toon"。
+    // ------------------------------------------------------------
+    {
+        const bool toonOn =
+            mat->shadingModel == assets::Material::ShadingModel::Toon;
+        ImGui::BeginDisabled(!toonOn);
+
+        // 一次编辑 = 一次重建。重建会把旧纹理挪进退役区并把**所有**引用
+        // 这份色带的材质的 rampMap 重新指过去（见 AssetManager）。
+        auto commitRamp = [&](const char* why) {
+            if (!mat->ramp) return;
+            mat->ramp->normalize();
+            mat->rampEdge = mat->ramp->edge;
+            mat->rampSoftness = mat->ramp->softness;
+            m_ctx.assets().rebuildRampTexture(*mat->ramp);
+            m_ctx.dirty() = true;
+            VK_LOG_INFO("NPR-RAMP action=%s entity=%u bands=%u edge=%.3f "
+                        "soft=%.3f",
+                        why, static_cast<unsigned>(e.id),
+                        static_cast<unsigned>(mat->ramp->steps()),
+                        mat->ramp->edge, mat->ramp->softness);
+        };
+
+        rowBegin("Toon Ramp");
+        if (mat->ramp) {
+            ImGui::Text("%s (%u)", mat->ramp->name.c_str(),
+                        static_cast<unsigned>(mat->ramp->steps()));
+        } else if (mat->rampMap) {
+            ImGui::TextUnformatted(TR("flat texture"));
+        } else {
+            ImGui::TextDisabled("%s", TR("none"));
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                TR("The band colours of cel shading. With no ramp the shader\n"
+                   "uses the built-in two-step (dark = cool blue), which is\n"
+                   "what every material did before this asset existed.\n\n"
+                   "\"flat texture\" = a plain gradient image is bound to the\n"
+                   "ramp slot but it has no band data to edit."));
+        logRect("INS-NPR-RAMP", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+
+        // ---- 新建 ----
+        ImGui::SameLine();
+        if (ImGui::SmallButton(TRL("New##npr_ramp_new"))) {
+            const std::string rname =
+                "ramp@e" + std::to_string(static_cast<unsigned>(e.id));
+            if (assets::RampAsset* ra = m_ctx.assets().makeRampAsset(rname)) {
+                mat->ramp = ra;
+                mat->rampPath.clear();
+                mat->rampMap = ra->texture.get();
+                // rampSteps = 0 → 按**资产自带的档位位置**采样，而不是
+                // 等分重采样。这是 .vramp 的默认工作流（美术定位置）。
+                mat->rampSteps = 0.0f;
+                mat->rampEdge = ra->edge;
+                mat->rampSoftness = ra->softness;
+                m_ctx.dirty() = true;
+                VK_LOG_INFO("NPR-RAMP action=new entity=%u key=%s",
+                            static_cast<unsigned>(e.id), rname.c_str());
+            }
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(mat->ramp == nullptr);
+        if (ImGui::SmallButton(TRL("Edit##npr_ramp_edit")))
+            ImGui::OpenPopup("##npr_ramp_popup");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(TRL("Save##npr_ramp_save"))) {
+            // 落盘到 assets/ramps/<key>.vramp。**存相对路径**（换机器可用）。
+            const std::string rel = "ramps/" + mat->ramp->name + ".vramp";
+            const std::string full = assets::resolveAssetPath(rel);
+            mat->ramp->path = rel;
+            mat->ramp->name = rel;
+            if (assets::saveRamp(*mat->ramp, full)) {
+                mat->rampPath = rel;
+                m_ctx.dirty() = true;
+                VK_LOG_INFO("NPR-RAMP action=save path=%s", rel.c_str());
+            } else {
+                VK_LOG_WARN("NPR-RAMP-SAVE-FAIL path=%s", rel.c_str());
+            }
+        }
+        ImGui::EndDisabled();
+
+        // ---- 编辑弹窗：档位列表 + 预设 ----
+        if (ImGui::BeginPopup("##npr_ramp_popup")) {
+            assets::RampAsset* ra = mat->ramp;
+            if (ra) {
+                // 预设：只换 bands / edge / softness，**纹理指针必须保留**
+                // ——直接 `*ra = preset` 会连 unique_ptr 一起赋值，旧纹理当场
+                // 析构，而它可能还在在途命令缓冲里（DEVICE_LOST）。
+                auto applyPreset = [&](assets::RampPreset kind) {
+                    auto keep = std::move(ra->texture);
+                    const assets::RampAsset preset =
+                        assets::makeRampPreset(kind, ra->name);
+                    ra->bands = preset.bands;
+                    ra->edge = preset.edge;
+                    ra->softness = preset.softness;
+                    ra->texture = std::move(keep);
+                    commitRamp("preset");
+                };
+                if (ImGui::Button(TRL("2-step##rp")))
+                    applyPreset(assets::RampPreset::TwoStep);
+                ImGui::SameLine();
+                if (ImGui::Button(TRL("3-step##rp")))
+                    applyPreset(assets::RampPreset::ThreeStep);
+                ImGui::SameLine();
+                if (ImGui::Button(TRL("4-step##rp")))
+                    applyPreset(assets::RampPreset::FourStep);
+                ImGui::Separator();
+                ImGui::TextUnformatted(TR("Bands (position = half-lambert u)"));
+                int removeAt = -1;
+                for (size_t i = 0; i < ra->bands.size(); ++i) {
+                    ImGui::PushID(static_cast<int>(i));
+                    assets::RampBand& b = ra->bands[i];
+                    ImGui::SetNextItemWidth(96.0f);
+                    // 第 0 档的 pos 恒 0（normalize 会强制），所以不给拖 ——
+                    // 给它一个能拖的控件只会让人以为拖了有用。
+                    if (i == 0) {
+                        ImGui::TextDisabled("pos 0.00");
+                    } else if (ImGui::SliderFloat("##pos", &b.pos, 0.0f, 1.0f,
+                                                  "pos %.2f")) {
+                        if (ImGui::IsItemDeactivatedAfterEdit())
+                            commitRamp("band-pos");
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::ColorEdit3("##col", &b.color.x,
+                                          ImGuiColorEditFlags_NoInputs |
+                                              ImGuiColorEditFlags_NoLabel)) {
+                        if (ImGui::IsItemDeactivatedAfterEdit())
+                            commitRamp("band-color");
+                    }
+                    ImGui::SameLine();
+                    if (ra->bands.size() > 1 &&
+                        ImGui::SmallButton(TRL("x##rp_del")))
+                        removeAt = static_cast<int>(i);
+                    ImGui::PopID();
+                }
+                if (removeAt >= 0) {
+                    ra->bands.erase(ra->bands.begin() + removeAt);
+                    commitRamp("band-del");
+                }
+                if (ra->bands.size() < 8 && ImGui::SmallButton(TRL("Add band##rp"))) {
+                    // 新档插在中间偏上的位置（美术加"高光档"时就是往那儿加）
+                    assets::RampBand nb;
+                    nb.pos = 0.85f;
+                    nb.color = ra->bandAt(ra->bands.size() - 1).color;
+                    ra->bands.push_back(nb);
+                    commitRamp("band-add");
+                }
+                ImGui::Separator();
+                ImGui::TextDisabled("%s", TR("First boundary softness only"));
+            }
+            ImGui::EndPopup();
+        }
+
+        // ---- 明暗交界位置 / 宽度 ----
+        // 这两个值**同时**写进材质（着色器的阴影闸门）和资产（烘像素时的
+        // 台阶），所以只有一处真值来源：改这个控件 = 改两份。
+        ImGui::BeginDisabled(mat->ramp == nullptr);
+        rowBegin("Term. Edge");
+        ImGui::SetNextItemWidth(valueW);
+        float edge = mat->ramp ? mat->ramp->edge : mat->rampEdge;
+        if (ImGui::SliderFloat("##npr_edge", &edge, 0.02f, 0.98f, "%.2f")) {
+            mat->rampEdge = edge;
+            if (mat->ramp) mat->ramp->edge = edge;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) commitRamp("edge");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                TR("Where the lit/shadowed boundary sits on the half-lambert\n"
+                   "axis (0.5 = N.L = 0). Push it up to grow the shadow side."));
+
+        rowBegin("Term. Width");
+        ImGui::SetNextItemWidth(valueW);
+        float soft = mat->ramp ? mat->ramp->softness : mat->rampSoftness;
+        if (ImGui::SliderFloat("##npr_soft", &soft, 0.0f, 0.30f, "%.3f")) {
+            mat->rampSoftness = soft;
+            if (mat->ramp) mat->ramp->softness = soft;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) commitRamp("softness");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                TR("Width of that boundary. 0 = hard cel edge; 0.02~0.05 =\n"
+                   "soft cel. Only the first boundary is affected -- the\n"
+                   "inner bands stay hard, otherwise the face turns to mush."));
+        ImGui::EndDisabled();
+
+        // ---- 面部 SDF（A1）----
+        // 槽位本身还是走上面的纹理方块体系（"Sdf" chip），这里只放两个
+        // 只有 SDF 才有的参数：强度与采样偏移。
+        rowBegin("Face SDF");
+        ImGui::SetNextItemWidth(valueW);
+        if (ImGui::SliderFloat("##npr_sdf", &mat->sdfShadowStrength, 0.0f,
+                               1.0f, "%.2f"))
+            m_ctx.dirty() = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                TR("How strongly the face SDF map pushes a face texel into the\n"
+                   "shadow band. Needs an image in the Sdf texture slot whose\n"
+                   "UV is the frontal face unwrap."));
+        logRect("INS-NPR-SDF", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+
+        rowBegin("SDF Shift");
+        ImGui::SetNextItemWidth(valueW);
+        if (ImGui::SliderFloat("##npr_sdfshift", &mat->sdfFaceShift, 0.0f, 0.6f,
+                               "%.2f"))
+            m_ctx.dirty() = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                TR("How far the SDF sampling point slides as the light turns.\n"
+                   "0 = the map is shown as painted (fixed-camera portraits);\n"
+                   "0.15 = normal; >0.3 = the map only supplies the shape."));
+
+        // ---- 角色光（A5）----
+        rowBegin("Char. Light");
+        bool ucl = mat->useCharacterLight;
+        if (ImGui::Checkbox("##npr_charlight", &ucl)) {
+            const bool ob = mat->useCharacterLight;
+            mat->useCharacterLight = ucl;
+            discreteEdit(m_ctx, "Material Use Character Light",
+                         &mat->useCharacterLight, ob);
+            VK_LOG_INFO("NPR-CHARLIGHT entity=%u on=%d",
+                        static_cast<unsigned>(e.id), ucl ? 1 : 0);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                TR("Light this material with the dedicated character light\n"
+                   "instead of the scene: one key light plus a flat ambient\n"
+                   "colour. This is what keeps an anime face from being\n"
+                   "tinted green under trees or orange at dusk.\n\n"
+                   "Side effect: CSM shadows are skipped (their PCF stair-step\n"
+                   "is visible on a cel-shaded face). Pick one or the other.\n\n"
+                   "The light itself is tuned in Render > Character Light."));
+        logRect("INS-NPR-CHARLIGHT", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+
+        // ---- 头发各向异性高光（A4）----
+        // 两个数都在材质页 spare.z/w（96 B 的最后两个空位），所以只对
+        // Toon 材质有意义 —— 外层已经 BeginDisabled(!toonOn)。
+        rowBegin("Hair Aniso");
+        ImGui::SetNextItemWidth(valueW);
+        if (ImGui::SliderFloat("##npr_aniso", &mat->anisoStrength, 0.0f, 2.0f,
+                               "%.2f"))
+            m_ctx.dirty() = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                TR("Kajiya-Kay angel ring: a band of light running ALONG the\n"
+                   "hair strands instead of a round blob. Needs vertex tangents\n"
+                   "on the mesh (the built-in sphere/cube/plane have them; most\n"
+                   "imported meshes do not, and LOD levels drop them on purpose\n"
+                   "-- those fall back to a screen-space tangent, which is\n"
+                   "correct but shimmers).\n\n"
+                   "0 = off (pixel-identical to before this existed).\n"
+                   "0.6~1.2 is the useful range for hair. Above ~1.5 the ring\n"
+                   "clips to flat white and stops reading as a highlight."));
+        logRect("INS-NPR-ANISO", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+
+        rowBegin("Ring Shift");
+        ImGui::SetNextItemWidth(valueW);
+        if (ImGui::SliderFloat("##npr_anisoshift", &mat->anisoShift, -1.0f,
+                               1.0f, "%.2f"))
+            m_ctx.dirty() = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                TR("Slides the ring up or down across the surface. This is a\n"
+                   "POSITION knob, not a brightness knob -- the ring moves, it\n"
+                   "does not get brighter.\n\n"
+                   "The second, wider ring is placed at (this - 0.55), so both\n"
+                   "halves move together and keep their spacing."));
+        logRect("INS-NPR-ANISO-SHIFT", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+
+        ImGui::EndDisabled();
+    }
+
+    // ---- 眼睛专用着色（A3）----
+    // 三个数在材质页 spare2.xyz（112 B 的新增块），**只在 bindless 编译
+    // 单元里存在** —— 所以和 ramp/SDF/aniso 一样，UI 上永远可调、但
+    // MYVK_BINDLESS 关着时什么都不发生（这就是 A 类槽的验收必须带
+    // MYVK_BINDLESS=1 的原因）。
+    rowBegin("Eye Unlit");
+    ImGui::SetNextItemWidth(valueW);
+    if (ImGui::SliderFloat("##npr_eye", &mat->eyeStrength, 0.0f, 1.0f,
+                           "%.2f"))
+        m_ctx.dirty() = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            TR("Anime eyes are PAINTED, not lit: sclera, iris gradient and\n"
+               "pupil are one texture, and the scene light must not move\n"
+               "them -- eyes do not go dark under backlight.\n\n"
+               "1 = fully unlit (base colour + catchlight only).\n"
+               "0 = off (pixel-identical to before this existed).\n"
+               "Middle values are for semi-transparent plastic eyes."));
+    logRect("INS-NPR-EYE", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    rowBegin("Iris Depth");
+    ImGui::SetNextItemWidth(valueW);
+    if (ImGui::SliderFloat("##npr_iris", &mat->eyeIrisDepth, 0.0f, 0.10f,
+                           "%.3f"))
+        m_ctx.dirty() = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            TR("Parallax on the iris: the eye is a hollow socket, so the\n"
+               "iris should slide toward the viewer when seen from the\n"
+               "side. Shifts the UV of ALL material maps at once -- iris,\n"
+               "pupil and sclera must not drift apart.\n\n"
+               "0 = flat decal; 0.02 = normal; 0.05+ = glass-marble."));
+    logRect("INS-NPR-IRIS", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    rowBegin("Catchlight");
+    ImGui::SetNextItemWidth(valueW);
+    if (ImGui::SliderFloat("##npr_spark", &mat->eyeCatchlight, 0.0f, 2.0f,
+                           "%.2f"))
+        m_ctx.dirty() = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            TR("Procedural catchlight: two soft spots locked to the HEAD's\n"
+               "orientation (view-space normal), not to the light -- the\n"
+               "painted highlight of an anime eye does not slide when the\n"
+               "sun moves.\n\n"
+               "0 = off; ~1 = normal; above 2 the spots clip to flat white."));
+    logRect("INS-NPR-SPARK", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
     bool ds = mat->doubleSided;
     rowBegin("Double Sided");
     if (ImGui::Checkbox("##double-sided", &ds)) {
@@ -7047,6 +8008,23 @@ void InspectorPanel::drawAddRemove(ecs::Entity e) {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(TR("Only for entities that already have a "
                                  "Skinned Mesh (the model root)."));
+        }
+
+        // 过场时间轴（C1）。**任何实体**都能挂 —— 它通常挂在"空物体"上
+        // 当导演轨用，与网格/骨架毫无关系。所以不像 Animator 那样要门控。
+        const bool hasSequencer = w.has<ecs::SequencerComponent>(e);
+        if (ImGui::MenuItem(TR("Cutscene Sequence"), nullptr, false,
+                            !hasSequencer)) {
+            m_ctx.structuralEdit("Add Cutscene Sequence", [&]() {
+                ecs::SequencerComponent sq;
+                w.add<ecs::SequencerComponent>(e, sq);
+            });
+            m_seqPathBufFor = ecs::Entity{};
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(TR("A timeline of camera keys + events stored in\n"
+                                 "assets/sequences/*.seq.json. Attach it to an\n"
+                                 "empty object and treat that object as the director."));
         }
 
         // 延迟贴花（R4-4）：默认 1 m 立方体、不透明度 1、白色 tint，

@@ -81,7 +81,8 @@ struct Vertex {
     // ⚠ 这个集合**不是**"结构体有几个通道"，而是"顶点着色器读哪几个
     //   location"，而且它**不是连续前缀**：
     //     pbr.vert  读 0..5（pos/normal/uv/joints/weights/color）+ 7/8（morph）
-    //     —— 6（uv2）与 9（tangent）目前无人读
+    //               + 9（tangent，A4 各向异性头发起才有人读）
+    //     —— 只剩 6（uv2）无人读
     //   多喂一条没被消费的属性，校验层会报
     //       VUID-VkGraphicsPipelineCreateInfo-Input-07904
     //   而**少**喂一条被消费的是未定义行为（读到的全是 0，
@@ -90,7 +91,7 @@ struct Vertex {
     //   所以属性表按 location **挑着给**，不能再用"前 N 条"。
     //   加新通道时只有两处要改：这张表 + 顶点着色器的 location 声明。
     static std::vector<VkVertexInputAttributeDescription> attributeDescriptions() {
-        return attributesFor({0, 1, 2, 3, 4, 5, 7, 8});
+        return attributesFor({0, 1, 2, 3, 4, 5, 7, 8, 9});
     }
 
     // 阴影管线（shadow.vert / CSM 与局部光源共用一个着色器）。

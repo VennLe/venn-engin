@@ -19,13 +19,14 @@ namespace render {
 
 namespace {
 
-// 页表用的是 std430 的 struct 数组（stride = 96 = 6 个 align-16 的块），
-// 与 GpuMaterialPage 的 C++ 布局逐字节一致 —— 直接 memcpy。
+// 页表用的是 std430 的 struct 数组（stride = sizeof(GpuMaterialPage)，
+// 目前 112 = 7 个 align-16 的块），与 GpuMaterialPage 的 C++ 布局逐字节
+// 一致 —— 直接 memcpy。
 // ⚠ std430 对"结构体数组"的 stride 规则是**向上取整到最大成员对齐**
-//   （这里是 16），不是 C++ 的 sizeof。96 恰好是 16 的整数倍，所以两边
-//   一致；如果哪天字段数变成奇数个 vec4（比如 5 块 = 80），也仍然是 16
-//   的倍数，依然安全。真正的坑是混入 vec2/float 造成的尾部填充 ——
+//   （这里是 16），不是 C++ 的 sizeof。每块都是 16 B，所以两边一致；
+//   真正的坑是混入 vec2/float 造成的尾部填充 ——
 //   所以这个结构体里**只允许 vec4 / uvec4**。
+//   （10-26 A3 从 6 块扩到 7 块，历史：32 → 96 → 112。）
 constexpr VkDeviceSize kPageTableBytes =
     static_cast<VkDeviceSize>(BindlessTextures::kMaxMaterialPages) *
     sizeof(GpuMaterialPage);
@@ -250,9 +251,38 @@ uint32_t BindlessTextures::materialPage(const assets::Material& mat) {
     // 整场景的 Toon 会一起变成一坨平光 —— 而且看起来像"打光错了"。
     const float rampMode =
         mat.rampMap ? std::max(mat.rampSteps, 0.0f) : -1.0f;
-    rec.params = glm::vec4(rampMode, mat.matcapStrength,
-                           mat.sdfShadowStrength, mat.detailStrength);
-    rec.params2 = glm::vec4(mat.detailTiling, mat.matcapRotate, 0.0f, 0.0f);
+    // sdfShadowStrength 的闸门（A1，2026-10-26）：
+    // **没挂 SDF 图 → 写 0**，而不是"写强度、靠白图 ×1 兜底"。
+    // 理由与 rampMode 的 -1 完全相同：着色器分不清"这张是不是缺省白"，
+    // 一次次采样白图 = 纯浪费带宽；而 0 让 faceSdfMask 直接 return 1.0。
+    // 顺带修掉一个旧隐患：这个字段的默认值是 1.0，若哪天有人把 SDF 槽
+    // 接上缺省白以外的图，旧写法会让所有没配 SDF 的材质跟着变。
+    const float sdfStrength = mat.sdfShadowMap ? mat.sdfShadowStrength : 0.0f;
+    rec.params = glm::vec4(rampMode, mat.matcapStrength, sdfStrength,
+                           mat.detailStrength);
+    // params2.z/w（A6）：色带的明暗交界位置与宽度。着色器的 toonGate 读它，
+    // 与资产烘进纹理的台阶必须是同一组数 —— 这里直接取材质字段，材质字段
+    // 又在 Inspector 编辑时与资产同步写，所以不存在两套真值。
+    rec.params2 = glm::vec4(mat.detailTiling, mat.matcapRotate,
+                            mat.rampEdge, mat.rampSoftness);
+    // spare（A5/A1/A4）：x = 材质级角色光开关，y = 面部 SDF 采样偏移强度，
+    // z = 头发各向异性强度，w = 各向异性环的位置偏移。
+    // 用 vec4 而不是 uvec4 是为了不用把 float 按位塞进 uint —— 布局都是
+    // 16 B，改类型不影响 std430 偏移（C++ 端已同步改，见 Bindless.h）。
+    // ⚠ z 的 0 是**硬闸门**：pbr.frag 的 hairAnisoSpec 第一行就
+    //   `if (strength <= 0) return 0`，所以没开各向异性的材质连切线都
+    //   不算 —— 这是"关 = 基线"逐像素成立的落点，不要改成"算了再乘 0"。
+    rec.spare = glm::vec4(mat.useCharacterLight ? 1.0f : 0.0f,
+                          mat.sdfFaceShift, mat.anisoStrength,
+                          mat.anisoShift);
+    // spare2（A3，2026-10-26）：眼睛的三个旋钮。
+    // ⚠ x（eyeStrength）的 0 同样是**硬闸门**：pbr.frag 里两条 eye 分支
+    //   都以 `> 0` 开头，没配眼睛的材质不做虹膜视差、也不进 unlit 混合 ——
+    //   "关 = 基线逐像素"靠的就是这个分支，不是"算出 eye 色再 mix 到 0"
+    //   （后者在 float 精度边缘仍会改动最低位，且虹膜视差会白算一次
+    //   cotangentFrame）。
+    rec.spare2 = glm::vec4(mat.eyeStrength, mat.eyeIrisDepth,
+                           mat.eyeCatchlight, 0.0f);
     m_pageMapped[m_frame][page] = rec;
 
     m_pageOf.emplace(&mat, page);

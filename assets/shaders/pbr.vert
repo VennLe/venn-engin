@@ -130,11 +130,19 @@ layout(location = 5) in vec4 inColor;    // 顶点色（Mesh Paint；默认全 1
 // 少喂一条读到的是全 0 —— 而 0 条 delta 意味着"静默不形变"。
 layout(location = 7) in uint inMorphBase;
 layout(location = 8) in uint inMorphCount;
+// 切线（§13 落盘，A4 2026-10-26 起有消费者）：xyz = 沿 UV.x 的单位向量，
+// w = 副切线手性。**0 = 没有切线**（程序化以外的旧资产、LOD 层都是 0）。
+// ⚠ 属性表那侧必须同时喂到 location 9（Mesh::attributeDescriptions），
+//   少喂一条读到的是全 0 —— 对切线来说正好是"静默没有各向异性"。
+layout(location = 9) in vec4 inTangent;
 
 layout(location = 0) out vec3 vWorldPos;
 layout(location = 1) out vec3 vNormal;
 layout(location = 2) out vec2 vUV;
 layout(location = 3) out vec4 vColor;
+// 世界空间切线（xyz 单位化，w 原样传手性）。长度 0 = 这个顶点没有切线，
+// 片元侧据此回退到屏幕空间导数建切线基（见 pbr.frag 的 anisoTangent）。
+layout(location = 4) out vec4 vTangent;
 // 注意：**没有** vLightSpacePos 了。改 CSM 之后级联是按视深度在片元阶段
 // 选的，顶点阶段不知道会落在哪一级，所以只传世界坐标，由 pbr.frag 用
 // ubo.lightSpace[cascade] 现算。
@@ -198,6 +206,9 @@ void main() {
     // 静态网格：inWeights 全 0，走原路径（等价于恒等变换）。
     vec4 localPos = vec4(inPos + morphPos, 1.0);
     vec4 localNrm = vec4(inNormal + morphNrm, 0.0);
+    // 切线：只过蒙皮/模型变换，**不过 morph**（morph delta 流没有切线通道，
+    // 表情形变对头发切线的影响可以忽略）。
+    vec3 localTan = inTangent.xyz;
     if (dot(inWeights, vec4(1.0)) > 0.0) {
         mat4 skinMat =
               jointBuf.jointMats[jointBase + int(inJoints.x)] * inWeights.x
@@ -206,6 +217,7 @@ void main() {
             + jointBuf.jointMats[jointBase + int(inJoints.w)] * inWeights.w;
         localPos = skinMat * vec4(inPos + morphPos, 1.0);
         localNrm = skinMat * vec4(inNormal + morphNrm, 0.0);
+        localTan = (skinMat * vec4(inTangent.xyz, 0.0)).xyz;
     }
 
     vec4 world = modelMat * localPos;
@@ -214,6 +226,13 @@ void main() {
     // 注：非等比缩放时严格应使用逆转置矩阵，当前场景均为均匀缩放。
     // 蒙皮后的法线：skinMat 含旋转+缩放，用归一化近似（角色均近似刚性）。
     vNormal = normalize(mat3(modelMat) * localNrm.xyz);
+    // 切线同上；⚠ **不能无条件 normalize**：没有切线的顶点（导入资产多数
+    // 没有 TANGENT、LOD 层全部没有）在这里是零向量，normalize(0) = NaN，
+    // 而 NaN 会在光栅化插值里扩散成整片"神秘消失"的三角形。
+    // 所以零长度原样传 0，片元侧据长度判断"要不要回退到屏幕空间导数"。
+    const vec3 wTan = mat3(modelMat) * localTan;
+    const float tanLen = length(wTan);
+    vTangent = vec4(tanLen > 1.0e-5 ? wTan / tanLen : vec3(0.0), inTangent.w);
     vUV = inUV;
     vColor = inColor;
 

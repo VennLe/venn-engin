@@ -48,12 +48,15 @@
 #include "core/InputMap.h"
 #include "scene/CameraSystem.h"
 #include "scene/SpringArm.h"
+#include "sequence/SequencerSystem.h"
+#include "dialogue/DialogueRunner.h"
 
 #include "PlayerController.h"
 #include "ui/HudSelfTest.h"
 
 #include "audio/AudioSelfTest.h"
 #include "assets/LodSelfTest.h"
+#include "assets/RampSelfTest.h"
 #include "assets/MaterialSelfTest.h"
 #include "render/QualityPresets.h"
 #include "project/ProjectCreate.h"
@@ -376,6 +379,16 @@ int main(int argc, char** argv) {
             return physics::runContactSelfTest() == 0 ? 0 : 1;
         if (cfg.selftest == "camera")
             return scene::runCameraSelfTest() == 0 ? 0 : 1;
+        // C1 过场时间轴：解析 / 采样（含 yaw 最短弧 + step）/ 事件半开区间 /
+        // 播放器（首帧 t=0、起点晚播不补发、夹步长、循环回绕、编辑态）。
+        // 全部是纯数值 —— 不建 Vulkan 设备，几毫秒跑完。
+        if (cfg.selftest == "sequence")
+            return sequence::runSequencerSelfTest() == 0 ? 0 : 1;
+        // C2 对话（数据层）：解析 / 校验（跳转缺失与 next+choices 并存都算
+        // **加载失败**，不是警告）/ 打字机（`cps<=0` = 立刻全出）/ 播放器
+        // （有选项时 advance 必须原地不动、越界选择不改状态、结束即撒手）。
+        if (cfg.selftest == "dialogue")
+            return dialogue::runDialogueSelfTest() == 0 ? 0 : 1;
         if (cfg.selftest == "player")
             return runtime::runPlayerSelfTest() == 0 ? 0 : 1;
         // 第三人称弹簧臂（= UE SpringArmComponent 的球扫掠 + 穿透优先）。
@@ -413,6 +426,10 @@ int main(int argc, char** argv) {
         // 纯数据 —— `decimateClustered` 不碰 GPU，所以这个自检也不需要设备。
         if (cfg.selftest == "lod")
             return assets::runLodSelfTest() == 0 ? 0 : 1;
+        // A6：Toon 色带（查找 / sRGB 编码 / 烘像素一致 / 数据自愈 / 往返）。
+        // 纯数据 + 临时文件，不开窗口也不要 GPU。
+        if (cfg.selftest == "ramp")
+            return assets::runRampSelfTest() == 0 ? 0 : 1;
         // W4：地形资产格式 / 高度场双线性与射线 / 分块 LOD 与裙边 /
         // 角色在 30° 坡上不下滑。纯数值 + 文件 IO，不开窗口也不要 GPU。
         if (cfg.selftest == "terrain")

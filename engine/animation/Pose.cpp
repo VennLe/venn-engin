@@ -35,11 +35,18 @@ TRS decomposeTRS(const glm::mat4& m) {
 }
 
 glm::mat4 composeTRS(const TRS& t) {
-    return glm::translate(glm::mat4(1.0f), t.translation) *
-           glm::mat4_cast(t.orient) * glm::scale(glm::mat4(1.0f), t.scale);
+    return composeLocalTRS(t.translation, t.orient, t.scale);
 }
 
 } // namespace
+
+// ⚠ 表达式与拆分前**逐字符一致**（`translate * mat4_cast * scale`）。
+//   这条是 A0-5「重构前后关节矩阵 memcmp 级相同」的一部分，别"顺手优化"。
+glm::mat4 composeLocalTRS(const glm::vec3& translation,
+                          const glm::quat& orient, const glm::vec3& scale) {
+    return glm::translate(glm::mat4(1.0f), translation) *
+           glm::mat4_cast(orient) * glm::scale(glm::mat4(1.0f), scale);
+}
 
 void Pose::resize(int n) {
     if (n < 0) n = 0;

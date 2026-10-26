@@ -15,7 +15,9 @@
 //     floatParams    → 转移条件的数值输入
 //     boolParams     → 转移条件的布尔输入
 //     triggerParams  → 一次性事件（被采纳后立即清零）
-//   `rootMotion` 仍然占位（A4 才做，见 roadmap）。
+//   `rootMotion` 当时仍是占位 —— **2026-10-26 的 B3 已经接上了**
+//   （`animation/RootMotion.*`，状态机切 clip 时它照常工作：位移按
+//   增量提，切 clip 那一帧因为 `wrapTime` 不跨圈所以照提，不需要特判）。
 //
 // ------------------------------------------------------------
 // 资产 schema（`assets/animators/*.anim.json`，schema 定稿见

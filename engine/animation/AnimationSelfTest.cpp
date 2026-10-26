@@ -5,6 +5,8 @@
 #include "animation/AnimationSelfTest.h"
 
 #include "animation/AnimatorSystem.h"
+#include "animation/AnimEvent.h"
+#include "animation/RootMotion.h"
 #include "animation/BoneAttachment.h"
 #include "animation/Pose.h"
 #include "animation/TwoBoneIK.h"
@@ -19,6 +21,7 @@
 #include <glm/gtx/matrix_decompose.hpp>
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -241,6 +244,205 @@ ecs::AnimatorComponent& anim(Fixture& f) {
 // 用固定步长跑 n 帧。
 void runFrames(AnimatorSystem& sys, Fixture& f, int n, float dt) {
     for (int i = 0; i < n; ++i) sys.tick(f.scene, dt);
+}
+
+// ============================================================
+// B1（2026-10-26）：分层夹具 + 可手算的判别式
+//
+// 层的语义要能**手算**，所以两段 clip 各自只动一根骨：
+//   base  → joint0(root) 绕 Z 0→90°，hand 缩放 1→2（1.0 秒）
+//   upper → joint1(arm)  绕 X 0→90°，hand 缩放 1→3（1.0 秒）
+// 于是"遮罩落在哪一根上，差异就只出现在那一根上"，断言不用写整条算式。
+//
+// ⚠ hand 的**缩放**是刻意挑的判别式：世界矩阵第 0 列的长度等于该骨的
+//   scale.x，且与父骨的旋转无关 —— 所以"这一层有没有覆盖到 hand"可以直接
+//   读一个数，不必再比一遍旋转（比旋转要先算夹角，写错了还看不出）。
+// ============================================================
+
+assets::AnimationClip makeUpperClip(float dur, const std::string& name) {
+    assets::AnimationClip c;
+    c.name = name;
+    c.duration = dur;
+
+    const glm::quat q0(1.0f, 0.0f, 0.0f, 0.0f);
+    const glm::quat q1 =
+        glm::angleAxis(glm::radians(90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+    assets::AnimTrack rot;
+    rot.joint = 1;
+    rot.path = assets::AnimTrack::Rotation;
+    rot.times = {0.0f, dur};
+    rot.values = {glm::vec4(q0.x, q0.y, q0.z, q0.w),
+                  glm::vec4(q1.x, q1.y, q1.z, q1.w)};
+    c.tracks.push_back(rot);
+
+    assets::AnimTrack sc;
+    sc.joint = 2;
+    sc.path = assets::AnimTrack::Scale;
+    sc.times = {0.0f, dur};
+    sc.values = {glm::vec4(1.0f, 1.0f, 1.0f, 0.0f),
+                 glm::vec4(3.0f, 3.0f, 3.0f, 0.0f)};
+    c.tracks.push_back(sc);
+    return c;
+}
+
+// 带 AnimatorComponent 的夹具（层挂在它上面）。
+void buildLayerFixture(Fixture& f) {
+    auto skel = std::make_shared<assets::Skeleton>(makeChainSkeleton());
+    skel->clips.push_back(makeClip(1.0f, "base"));
+    skel->clips.push_back(makeUpperClip(1.0f, "upper"));
+    f.model.skeleton = skel;
+
+    f.root = f.scene.createObject("layered");
+    ecs::SkinnedMeshComponent sk;
+    sk.model = &f.model;
+    sk.clipName = "base";
+    sk.playing = true;
+    sk.loop = true;
+    f.scene.world().add<ecs::SkinnedMeshComponent>(f.root, sk);
+
+    ecs::AnimatorComponent a;
+    a.playing = true;
+    a.loop = true;
+    a.defaultClip = "base";
+    f.scene.world().add<ecs::AnimatorComponent>(f.root, a);
+}
+
+// 逐位比较 [from, to) 区间内的关节矩阵，返回不同的个数。
+// ⚠ 逐位（`memcmp`）而不是容差：这组的核心判据就是"没被遮罩碰过的骨
+//   **一个 bit 都不许变**"，容差会让"多混了 1e-7"这种真 bug 混过去。
+int countDiffMats(const std::vector<glm::mat4>& a,
+                  const std::vector<glm::mat4>& b, size_t from, size_t to) {
+    int bad = 0;
+    const size_t m = std::min(a.size(), b.size());
+    for (size_t i = from; i < std::min(to, m); ++i) {
+        if (std::memcmp(&a[i], &b[i], sizeof(glm::mat4)) != 0) ++bad;
+    }
+    return bad;
+}
+
+// 世界矩阵第 0 列的长度 = 该骨的 scale.x（与父骨旋转无关）。
+float matScaleX(const glm::mat4& m) {
+    return glm::length(glm::vec3(m[0]));
+}
+
+// ============================================================
+// B2（2026-10-26）：动画事件
+// ============================================================
+//
+// 事件表的判据几乎全是"**发了没有 / 发了几次**"，所以夹具刻意让每件事
+// 都是可数的整数：三个事件落在 0.0 / 0.3 / 0.6，clip 时长 1.0。
+// 一圈正好 3 次、两圈 6 次 —— 任何"每帧都发"（60 次）、"边界重复发"
+// （4 次）、"时间不推进"（0 次）都一眼能看出来。
+// ⚠ 不用"落在区间内就发"来写判据：那种实现一圈会发 60 次，而 60 这个数
+//   在不同 dt 下还会变 —— 一旦把它当成期望值，用例就跟着实现走了。
+
+// 造一张固定的事件表（0.0 / 0.3 / 0.6）。
+animation::AnimEventTrack makeEventTrack(const std::string& clip) {
+    animation::AnimEventTrack tr;
+    tr.clip = clip;
+    tr.events = {
+        {0.0f, "Open", ""},
+        {0.3f, "Footstep", "walk1"},
+        {0.6f, "Footstep", "walk2"},
+    };
+    return tr;
+}
+
+// 在 buildLayerFixture（base + upper，各 1.0 秒）上挂事件表。
+void buildEventFixture(Fixture& f, bool loop) {
+    buildLayerFixture(f);
+    ecs::AnimatorComponent& a = anim(f);
+    a.loop = loop;
+    a.eventTracks.push_back(makeEventTrack("base"));
+}
+
+// 把 FiredAnimEvent 压成一个可比对的短串。`t` 用的是**事件自身的时间**，
+// 这正是"序列不随帧率变"能被逐条比对的原因（播放头位置会变，事件时间不会）。
+std::string evKey(const FiredAnimEvent& e) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "%s@%.4f#%s", e.kind.c_str(),
+                  static_cast<double>(e.time), e.payload.c_str());
+    return std::string(buf);
+}
+
+// 跑一段时间，把发出的事件按"圈"分组。
+// 判圈靠**播放头回绕**（`time` 比上一帧小）：事件自己不会告诉我们那是
+// 第几圈，而 runFrames 的帧数在两圈之间又对不齐（1/60 × 60 并不精确等于
+// 1.0），所以只能看播放头。
+std::vector<std::vector<std::string>> runLaps(AnimatorSystem& sys, Fixture& f,
+                                             float dt, int frames) {
+    std::vector<std::vector<std::string>> laps(1);
+    float last = -1.0f;
+    for (int i = 0; i < frames; ++i) {
+        sys.tick(f.scene, dt);
+        const float t = anim(f).time;
+        if (t < last) laps.emplace_back();   // 回绕 = 新的一圈
+        last = t;
+        for (const FiredAnimEvent& e : sys.eventsThisFrame())
+            laps.back().push_back(evKey(e));
+    }
+    return laps;
+}
+
+// ============================================================
+// B3（2026-10-26）：根运动
+// ============================================================
+//
+// 夹具要能让"走了多远"**手算**出来：根骨沿 +X 从 0 匀速走到 1.0 m，
+// clip 时长 1.0 s → 每帧位移恒为 `dt × 1.0` 米。同时绕 +Z 转 30°，
+// 于是"位移"和"朝向"两条链各有一个能被反推的数。
+// ⚠ 用**匀速直线**而不是缓动曲线：缓动的期望值得积一次分，而积分写错
+//   之后"看起来差不多"（差个系数），断言反而失去判别力。
+assets::AnimationClip makeRootMotionClip(float dur, const std::string& name) {
+    assets::AnimationClip c;
+    c.name = name;
+    c.duration = dur;
+
+    assets::AnimTrack tr;
+    tr.joint = 0;
+    tr.path = assets::AnimTrack::Translation;
+    tr.times = {0.0f, dur};
+    tr.values = {glm::vec4(0.0f, 0.0f, 0.0f, 0.0f),
+                 glm::vec4(1.0f, 0.0f, 0.0f, 0.0f)};
+    c.tracks.push_back(tr);
+
+    const glm::quat q0(1.0f, 0.0f, 0.0f, 0.0f);
+    const glm::quat q1 =
+        glm::angleAxis(glm::radians(30.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+    assets::AnimTrack rot;
+    rot.joint = 0;
+    rot.path = assets::AnimTrack::Rotation;
+    rot.times = {0.0f, dur};
+    rot.values = {glm::vec4(q0.x, q0.y, q0.z, q0.w),
+                  glm::vec4(q1.x, q1.y, q1.z, q1.w)};
+    c.tracks.push_back(rot);
+    return c;
+}
+
+void buildRootFixture(Fixture& f,
+                      ecs::AnimatorComponent::RootMotionMode mode, bool loop) {
+    auto skel = std::make_shared<assets::Skeleton>(makeChainSkeleton());
+    skel->clips.push_back(makeRootMotionClip(1.0f, "walk"));
+    f.model.skeleton = skel;
+
+    f.root = f.scene.createObject("walker");
+    ecs::SkinnedMeshComponent sk;
+    sk.model = &f.model;
+    sk.clipName = "walk";
+    sk.playing = true;
+    sk.loop = loop;
+    f.scene.world().add<ecs::SkinnedMeshComponent>(f.root, sk);
+
+    ecs::AnimatorComponent a;
+    a.playing = true;
+    a.loop = loop;
+    a.defaultClip = "walk";
+    a.rootMotion = mode;
+    f.scene.world().add<ecs::AnimatorComponent>(f.root, a);
+}
+
+ecs::TransformComponent& xf(Fixture& f) {
+    return *f.scene.world().get<ecs::TransformComponent>(f.root);
 }
 
 } // namespace
@@ -1493,6 +1695,800 @@ int runAnimationSelfTest() {
                        "clip=" + comp(f).clipName +
                            ",ctl=" + std::to_string(sys.lastControllerCount()));
         }
+    }
+
+    // ================================================================
+    // B1（2026-10-26）：动画层 / 骨骼遮罩
+    // ================================================================
+    //
+    // 这一组要证明的四件事，按"错了会怎样"排序：
+    //   ① **没配层 / 权重 0 / 名字没命中 → 逐位回到基线**（否则老场景会飘，
+    //      而且这种偏移是"整体略微不同"，肉眼根本发现不了）；
+    //   ② **遮罩真的按骨起作用**（不是"整具身体都被覆盖"）；
+    //   ③ **权重是连续混合**（0.5 落在中间，不是"要么 0 要么 1"）；
+    //   ④ **层的播放头独立**（与底座不是同一个 time，且各自回绕）。
+    {
+        // 基线：完全不配层，跑 30 帧（0.5 s）。
+        // 这个时刻是刻意选的：两段 clip 的时长都是 1.0 s，于是
+        //   base 的 hand 缩放 = 1.5、upper 的 hand 缩放 = 2.0
+        // 都是"一眼能算出来"的数。
+        Fixture f0;
+        buildLayerFixture(f0);
+        AnimatorSystem s0;
+        runFrames(s0, f0, 30, 1.0f / 60.0f);
+        const std::vector<glm::mat4> base = comp(f0).jointMatrices;
+        const float baseHandScale = matScaleX(base[2]);
+        report("layer_base_hand_scale", static_cast<double>(baseHandScale), 1.5,
+               1.0e-4);
+
+        // ---- ① 三种"不生效"，都必须逐位等于基线 ----
+        {   // clip 空 = 该层关闭（配了一半的中间状态）
+            Fixture f;
+            buildLayerFixture(f);
+            ecs::AnimLayer L;
+            L.clip.clear();
+            L.fadeDur = 0.0f;
+            anim(f).layers.push_back(L);
+            AnimatorSystem sys;
+            runFrames(sys, f, 30, 1.0f / 60.0f);
+            report("layer_empty_clip_identity",
+                   static_cast<double>(
+                       countDiffMats(base, comp(f).jointMatrices, 0, 3)),
+                   0.0, 0.0);
+            // 配了但没生效 → configured=1 / applied=0（日志就靠这个差判）
+            report("layer_empty_clip_configured", sys.lastLayerCount(), 1.0,
+                   0.0);
+            report("layer_empty_clip_applied", sys.lastLayerApplied(), 0.0, 0.0);
+        }
+        {   // weight 0 = 用户把滑块拉到底
+            Fixture f;
+            buildLayerFixture(f);
+            ecs::AnimLayer L;
+            L.clip = "upper";
+            L.weight = 0.0f;
+            L.fadeDur = 0.0f;
+            anim(f).layers.push_back(L);
+            AnimatorSystem sys;
+            runFrames(sys, f, 30, 1.0f / 60.0f);
+            report("layer_weight0_identity",
+                   static_cast<double>(
+                       countDiffMats(base, comp(f).jointMatrices, 0, 3)),
+                   0.0, 0.0);
+        }
+        {   // 遮罩名字一根骨都没命中
+            Fixture f;
+            buildLayerFixture(f);
+            ecs::AnimLayer L;
+            L.clip = "upper";
+            L.fadeDur = 0.0f;
+            L.mask.mode = BoneMaskMode::Allow;
+            L.mask.roots = {"no_such_bone"};
+            anim(f).layers.push_back(L);
+            AnimatorSystem sys;
+            runFrames(sys, f, 30, 1.0f / 60.0f);
+            report("layer_unresolved_identity",
+                   static_cast<double>(
+                       countDiffMats(base, comp(f).jointMatrices, 0, 3)),
+                   0.0, 0.0);
+            report("layer_unresolved_applied", sys.lastLayerApplied(), 0.0, 0.0);
+            // 解算结果本身也要对：0 根命中 + 1 个 root 没解析成功
+            const BoneMask m = buildBoneMask(*f.model.skeleton, L.mask);
+            reportFlag("layer_unresolved_spec",
+                       m.included == 0 && m.unresolved == 1 &&
+                           m.firstProblem == "no_such_bone",
+                       "inc=" + std::to_string(m.included) + ",unres=" +
+                           std::to_string(m.unresolved));
+        }
+
+        // ---- ② 遮罩 Allow[hand]：只换 hand，root/arm 逐位不动 ----
+        {
+            Fixture f;
+            buildLayerFixture(f);
+            ecs::AnimLayer L;
+            L.clip = "upper";
+            L.weight = 1.0f;
+            L.fadeDur = 0.0f;
+            L.mask.mode = BoneMaskMode::Allow;
+            L.mask.roots = {"hand"};
+            anim(f).layers.push_back(L);
+            AnimatorSystem sys;
+            runFrames(sys, f, 30, 1.0f / 60.0f);
+            const auto& m = comp(f).jointMatrices;
+            // root / arm：一根 bit 都不许变
+            report("layer_mask_keeps_root_arm",
+                   static_cast<double>(countDiffMats(base, m, 0, 2)), 0.0,
+                   0.0);
+            // hand：必须变，且缩放 = 层的 2.0（不是基线的 1.5）
+            report("layer_mask_changes_hand",
+                   static_cast<double>(countDiffMats(base, m, 2, 3)), 1.0,
+                   0.0);
+            report("layer_mask_hand_scale", static_cast<double>(matScaleX(m[2])),
+                   2.0, 1.0e-4);
+            report("layer_applied_count", sys.lastLayerApplied(), 1.0, 0.0);
+        }
+
+        // ---- ②-b 遮罩 Deny[hand]：arm 吃层、hand 不吃 ----
+        // 与 Allow 是镜像判据：如果两种模式被写成同一个分支，这一条会红。
+        {
+            Fixture f;
+            buildLayerFixture(f);
+            ecs::AnimLayer L;
+            L.clip = "upper";
+            L.weight = 1.0f;
+            L.fadeDur = 0.0f;
+            L.mask.mode = BoneMaskMode::Deny;
+            L.mask.roots = {"hand"};
+            anim(f).layers.push_back(L);
+            AnimatorSystem sys;
+            runFrames(sys, f, 30, 1.0f / 60.0f);
+            const auto& m = comp(f).jointMatrices;
+            // hand 的缩放仍是基线的 1.5（被排除在遮罩外）
+            report("layer_deny_hand_scale",
+                   static_cast<double>(matScaleX(m[2])), 1.5, 1.0e-4);
+            // arm 的**局部旋转**被换了 → 它自己的世界矩阵必须变
+            report("layer_deny_changes_arm",
+                   static_cast<double>(countDiffMats(base, m, 1, 2)), 1.0,
+                   0.0);
+        }
+
+        // ---- ③ 权重连续：0.5 → hand 缩放落在 1.5 与 2.0 的中间 ----
+        {
+            Fixture f;
+            buildLayerFixture(f);
+            ecs::AnimLayer L;
+            L.clip = "upper";
+            L.weight = 0.5f;
+            L.fadeDur = 0.0f;
+            L.mask.mode = BoneMaskMode::Allow;
+            L.mask.roots = {"hand"};
+            anim(f).layers.push_back(L);
+            AnimatorSystem sys;
+            runFrames(sys, f, 30, 1.0f / 60.0f);
+            report("layer_half_hand_scale",
+                   static_cast<double>(matScaleX(comp(f).jointMatrices[2])),
+                   1.75, 1.0e-4);
+        }
+
+        // ---- ④ 层的播放头独立推进、独立回绕 ----
+        {
+            Fixture f;
+            buildLayerFixture(f);
+            ecs::AnimLayer L;
+            L.clip = "upper";
+            L.weight = 1.0f;
+            L.fadeDur = 0.0f;
+            anim(f).layers.push_back(L);
+            AnimatorSystem sys;
+            runFrames(sys, f, 30, 1.0f / 60.0f);   // 0.5 s
+            report("layer_time_advance",
+                   static_cast<double>(anim(f).layers[0].time), 0.5, 1.0e-4);
+            // 再跑 40 帧（累计 1.1667 s）→ 自己的 dur 是 1.0 → 回绕到 0.1667
+            runFrames(sys, f, 40, 1.0f / 60.0f);
+            report("layer_time_wrap",
+                   static_cast<double>(anim(f).layers[0].time), 0.1666667,
+                   1.0e-3);
+            // 底座的播放头同样累计到 1.1667 后回绕 —— 两者**彼此独立**
+            report("layer_base_time_wrap",
+                   static_cast<double>(comp(f).time), 0.1666667, 1.0e-3);
+        }
+
+        // ---- ⑤ 混合原语本身（pose 空间，手算）----
+        // 上面几组走的是完整 tick；这一组单独盯 `blendPoseMasked` 的
+        // 端点短路与局部 TRS 语义 —— 它们错了以后"看着只是差一点点"。
+        {
+            const assets::Skeleton s = makeChainSkeleton();
+            Pose A, B, out;
+            A.setRest(s);
+            B.setRest(s);
+            for (int j = 0; j < 3; ++j) {
+                A.rotation[static_cast<size_t>(j)] =
+                    glm::angleAxis(glm::radians(10.0f), glm::vec3(0, 0, 1));
+                B.rotation[static_cast<size_t>(j)] =
+                    glm::angleAxis(glm::radians(40.0f), glm::vec3(1, 0, 0));
+            }
+            A.scale[2] = glm::vec3(1.5f);
+            B.scale[2] = glm::vec3(2.5f);
+            A.translation[1] = glm::vec3(0.5f, 0.0f, 0.0f);
+            B.translation[1] = glm::vec3(0.5f, 0.3f, 0.0f);
+
+            BoneMaskSpec spec;
+            spec.mode = BoneMaskMode::Allow;
+            spec.roots = {"hand"};
+            const BoneMask mk = buildBoneMask(s, spec);
+            report("mask_included_hand", static_cast<double>(mk.included), 1.0,
+                   0.0);
+
+            // w = 1 + 遮罩 → 未遮罩的骨逐位等于 A，遮罩内的骨逐位等于 B
+            blendPoseMasked(A, B, mk, 1.0f, out);
+            reportFlag("mask_w1_untouched_bitwise",
+                       std::memcmp(&out.rotation[0], &A.rotation[0],
+                                   sizeof(glm::quat)) == 0 &&
+                           std::memcmp(&out.rotation[1], &A.rotation[1],
+                                       sizeof(glm::quat)) == 0 &&
+                           std::memcmp(&out.translation[1], &A.translation[1],
+                                       sizeof(glm::vec3)) == 0,
+                       "r0,r1,t1");
+            reportFlag("mask_w1_covered_bitwise",
+                       std::memcmp(&out.rotation[2], &B.rotation[2],
+                                   sizeof(glm::quat)) == 0 &&
+                           std::memcmp(&out.scale[2], &B.scale[2],
+                                       sizeof(glm::vec3)) == 0,
+                       "r2,s2");
+
+            // w = 0 → 全部逐位等于 A（回归基线的唯一保证）
+            blendPoseMasked(A, B, mk, 0.0f, out);
+            reportFlag("mask_w0_identity_bitwise",
+                       std::memcmp(out.rotation.data(), A.rotation.data(),
+                                   A.rotation.size() * sizeof(glm::quat)) ==
+                               0 &&
+                           std::memcmp(out.scale.data(), A.scale.data(),
+                                       A.scale.size() * sizeof(glm::vec3)) ==
+                               0,
+                       "all");
+
+            // w = 0.5 → slerp 中点 + 线性插值的缩放（局部 TRS 混合）
+            // ⚠ 平移的判据也在这儿：遮罩外的骨**平移**同样一个 bit 都不许动
+            //   （B 把 arm 的平移挪了 0.3，遮罩不含 arm → 仍然是 A 的 0）
+            blendPoseMasked(A, B, mk, 0.5f, out);
+            report("mask_w05_scale", static_cast<double>(out.scale[2].x), 2.0,
+                   1.0e-6);
+            reportFlag("mask_w05_translation_masked",
+                       out.translation[1].y == 0.0f,
+                       "ty=" + std::to_string(out.translation[1].y));
+
+            // 遮罩全开时平移才是真的混：0.3 × 0.5 = 0.15
+            BoneMaskSpec allSpec;   // mode = All（默认）
+            const BoneMask mkAll = buildBoneMask(s, allSpec);
+            reportFlag("mask_all_included", mkAll.full() && mkAll.included == 3,
+                       "inc=" + std::to_string(mkAll.included));
+            blendPoseMasked(A, B, mkAll, 0.5f, out);
+            report("mask_w05_translation", static_cast<double>(out.translation[1].y),
+                   0.15, 1.0e-6);
+        }
+    }
+
+    // ================================================================
+    // B2：动画事件 / Notify（2026-10-26）
+    // ================================================================
+    //
+    // 分两半，缺一不可：
+    //   ① `collectAnimEvents` 纯函数 —— 边界语义只能在这里钉死。这一半的
+    //      判据是"发了没有 / 几次 / 什么顺序"，全部可手算。
+    //   ② 真场景（`AnimatorSystem::tick`）—— 证明它**真的被接上了**。
+    //      只测 ① 的话，函数再对、tick 里没调也是全绿。
+    {
+        // ---------------- ① 纯函数 ----------------
+        const AnimEventTrack tr = makeEventTrack("base");
+        const float dur = 1.0f;
+        std::vector<int> hit;
+
+        // 第一帧：prev=0 → [0, dt) 里落着 t=0 那条。
+        // ⚠ 这条是"半开区间"的第一个受益者：改成 `(prev,new]` 之后
+        //   t=0 永远不会发，而"开场音效"是最常见的需求。
+        collectAnimEvents(tr, 0.0f, 1.0f / 60.0f, dur, true, hit);
+        reportFlag("ev_first_frame_t0", hit.size() == 1 && hit[0] == 0,
+                   "n=" + std::to_string(hit.size()));
+
+        // dt = 0（编辑器非 Play / 暂停）：prev == new → 空区间 → 一条不发。
+        // ⚠ 这是"每帧都发"最容易溜进来的地方：暂停时播放头停在 0.3 上，
+        //   闭区间实现会每帧发一次。
+        collectAnimEvents(tr, 0.5f, 0.5f, dur, true, hit);
+        reportFlag("ev_pause_no_fire", hit.empty(),
+                   "n=" + std::to_string(hit.size()));
+
+        // 停在事件上 → 不发；从事件上往前走 → 只发一次（不是两次）
+        collectAnimEvents(tr, 0.3f, 0.3f, dur, true, hit);
+        reportFlag("ev_on_event_no_fire", hit.empty(),
+                   "n=" + std::to_string(hit.size()));
+        collectAnimEvents(tr, 0.3f, 0.35f, dur, true, hit);
+        reportFlag("ev_after_event_once", hit.size() == 1 && hit[0] == 1,
+                   "n=" + std::to_string(hit.size()));
+
+        // 端点：正好落在 new 上的事件**不丢，只是推到下一帧**
+        // （闭区间在这里会发两次；`(prev,new]` 会漏掉从左端进入的那一次）
+        collectAnimEvents(tr, 0.29f, 0.30f, dur, true, hit);
+        reportFlag("ev_half_open_right_end", hit.empty(),
+                   "n=" + std::to_string(hit.size()));
+        collectAnimEvents(tr, 0.30f, 0.31f, dur, true, hit);
+        reportFlag("ev_half_open_next_frame", hit.size() == 1 && hit[0] == 1,
+                   "n=" + std::to_string(hit.size()));
+
+        // 时长 0（单帧 clip）：没有"跨过"这回事，一条都不发。
+        {
+            const AnimEventTrack z = makeEventTrack("base");
+            std::vector<int> h2;
+            collectAnimEvents(z, 0.0f, 0.0f, 0.0f, true, h2);
+            reportFlag("ev_zero_duration", h2.empty(),
+                       "n=" + std::to_string(h2.size()));
+        }
+
+        // ---- 帧率无关（纯函数层）----
+        // 用 0.1 / 0.4 / 0.7（**避开 0.0 与 1.0 两个回绕端点**）：5 秒 → 15 条。
+        // ⚠ 端点上的事件每次回绕都会发一次，把它算进"次数相同"里会让这条
+        //   判据测的是回绕而不是帧率。
+        {
+            AnimEventTrack t5;
+            t5.clip = "base";
+            t5.events = {{0.1f, "A", ""}, {0.4f, "B", ""}, {0.7f, "C", ""}};
+            auto countAt = [&](float dt) {
+                const int frames = static_cast<int>(std::lround(5.0f / dt));
+                float prev = 0.0f, t = 0.0f;
+                int n = 0;
+                std::vector<int> h;
+                for (int i = 0; i < frames; ++i) {
+                    t += dt;
+                    if (t >= dur) t -= dur;
+                    collectAnimEvents(t5, prev, t, dur, true, h);
+                    n += static_cast<int>(h.size());
+                    prev = t;
+                }
+                return n;
+            };
+            const int c60 = countAt(1.0f / 60.0f);
+            const int c240 = countAt(1.0f / 240.0f);
+            report("ev_count_60fps", static_cast<double>(c60), 15.0, 0.0);
+            report("ev_count_240fps", static_cast<double>(c240), 15.0, 0.0);
+            reportFlag("ev_count_fps_independent", c60 == c240,
+                       "c60=" + std::to_string(c60) + ",c240=" +
+                           std::to_string(c240));
+        }
+
+        // ---- 跨圈：上圈尾巴 → 新圈开头，顺序不能倒 ----
+        // ⚠ 这是"合并成一个大区间再排序"会错的地方：0.95 的事件发生在
+        //   0.0 的事件**之前**，而按时间排序会把它们倒过来。
+        {
+            AnimEventTrack tw;
+            tw.clip = "base";
+            tw.events = {{0.0f, "Head", ""}, {0.95f, "Tail", ""}};
+            std::vector<int> h;
+            collectAnimEvents(tw, 0.90f, 0.05f, dur, true, h);
+            const bool order =
+                h.size() == 2 &&
+                tw.events[static_cast<size_t>(h[0])].kind == "Tail" &&
+                tw.events[static_cast<size_t>(h[1])].kind == "Head";
+            reportFlag("ev_wrap_tail_then_head", order,
+                       "n=" + std::to_string(h.size()) +
+                           ",first=" +
+                           (h.empty() ? std::string("-")
+                                      : tw.events[static_cast<size_t>(h[0])].kind));
+
+            // 非循环却倒退（脚本把 time 改小）：只收新圈开头那一截，
+            // **不许**把 [prev,dur] 也收进来 —— 那一段没有播放过。
+            collectAnimEvents(tw, 0.90f, 0.05f, dur, false, h);
+            reportFlag("ev_backward_nonloop_head_only",
+                       h.size() == 1 &&
+                           tw.events[static_cast<size_t>(h[0])].kind == "Head",
+                       "n=" + std::to_string(h.size()));
+        }
+
+        // ---- 永远不会发的两种写法 ----
+        // ① `t == duration`：`wrapTime` 之后播放头到不了这里，半开区间又把
+        //    右端排除 → 永远不发（写在 0 上才对）。
+        // ② `t < 0`：区间下界是 0，负时间永远落在外面。
+        {
+            AnimEventTrack tb;
+            tb.clip = "base";
+            tb.events = {{1.0f, "AtDur", ""}, {-0.5f, "Negative", ""}};
+            float prev = 0.0f, t = 0.0f;
+            int n = 0;
+            std::vector<int> h;
+            for (int i = 0; i < 300; ++i) {   // 5 秒 = 5 圈
+                t += 1.0f / 60.0f;
+                if (t >= dur) t -= dur;
+                collectAnimEvents(tb, prev, t, dur, true, h);
+                n += static_cast<int>(h.size());
+                prev = t;
+            }
+            reportFlag("ev_t_at_duration_never_fires", n == 0,
+                       "n=" + std::to_string(n));
+        }
+
+        // ---- 同一时刻多条：按表里的顺序发（stable）----
+        {
+            AnimEventTrack ts;
+            ts.clip = "base";
+            ts.events = {{0.5f, "X", ""}, {0.5f, "Y", ""}};
+            std::vector<int> h;
+            collectAnimEvents(ts, 0.45f, 0.55f, dur, true, h);
+            reportFlag("ev_same_time_table_order",
+                       h.size() == 2 && h[0] == 0 && h[1] == 1,
+                       "n=" + std::to_string(h.size()) + ",f=" +
+                           (h.empty() ? std::string("-")
+                                      : std::to_string(h[0])));
+        }
+
+        // ---------------- ② 真场景 ----------------
+        // 一圈 = 3 条（0.0 / 0.3 / 0.6）。第二圈与第一圈必须**逐条相同**。
+        {
+            Fixture f;
+            buildEventFixture(f, /*loop=*/true);
+            AnimatorSystem sys;
+            const auto laps = runLaps(sys, f, 1.0f / 60.0f, 180);
+            reportFlag("ev_scene_lap_count",
+                       laps.size() >= 2 && laps[0].size() == 3,
+                       "laps=" + std::to_string(laps.size()) + ",lap0=" +
+                           std::to_string(laps.empty() ? 0 : laps[0].size()));
+            reportFlag("ev_scene_two_laps_same_seq",
+                       laps.size() >= 2 && laps[0] == laps[1],
+                       "lap0=" + std::to_string(laps.empty() ? 0 : laps[0].size()) +
+                           ",lap1=" +
+                           std::to_string(laps.size() < 2 ? 0 : laps[1].size()));
+        }
+
+        // ---- 帧率无关（真场景）：60 fps 与 240 fps 的前三圈逐条相同 ----
+        {
+            Fixture f1;
+            buildEventFixture(f1, true);
+            AnimatorSystem s1;
+            const auto l1 = runLaps(s1, f1, 1.0f / 60.0f, 300);
+
+            Fixture f2;
+            buildEventFixture(f2, true);
+            AnimatorSystem s2;
+            const auto l2 = runLaps(s2, f2, 1.0f / 240.0f, 1200);
+
+            bool same = l1.size() >= 3 && l2.size() >= 3;
+            if (same) {
+                for (int i = 0; i < 3; ++i) same = same && (l1[i] == l2[i]);
+            }
+            reportFlag("ev_scene_fps_independent", same,
+                       "l1=" + std::to_string(l1.size()) + ",l2=" +
+                           std::to_string(l2.size()));
+        }
+
+        // ---- dt = 0（编辑器非 Play）：一条都不发 ----
+        {
+            Fixture f;
+            buildEventFixture(f, true);
+            AnimatorSystem sys;
+            sys.tick(f.scene, 0.0f);
+            reportFlag("ev_scene_dt0_no_fire", sys.eventsThisFrame().empty(),
+                       "n=" + std::to_string(sys.eventsThisFrame().size()));
+        }
+
+        // ---- 字段完整：kind / payload / entity / clip / layer ----
+        {
+            Fixture f;
+            buildEventFixture(f, /*loop=*/false);   // 不循环，免得回绕混进来
+            AnimatorSystem sys;
+            std::vector<std::string> seq;
+            std::vector<FiredAnimEvent> raw;
+            for (int i = 0; i < 60; ++i) {
+                sys.tick(f.scene, 1.0f / 60.0f);
+                for (const FiredAnimEvent& e : sys.eventsThisFrame()) {
+                    seq.push_back(evKey(e));
+                    raw.push_back(e);
+                }
+            }
+            const bool ok = seq.size() == 3 && seq[0] == "Open@0.0000#" &&
+                            seq[1] == "Footstep@0.3000#walk1" &&
+                            seq[2] == "Footstep@0.6000#walk2";
+            reportFlag("ev_scene_seq", ok,
+                       "n=" + std::to_string(seq.size()));
+            reportFlag("ev_scene_fields",
+                       raw.size() == 3 && raw[1].entity == f.root.id &&
+                           raw[1].clip == "base" && raw[1].layer.empty(),
+                       "ent=" + std::to_string(raw.size() > 1 ? raw[1].entity : 0));
+        }
+
+        // ---- 换 clip：上一段的播放头不许当新段的起点 ----
+        //
+        // ⚠ 这是 `eventPrev` 唯一不能省的地方。真实来路是**状态机**：
+        //   `AnimController::switchClip` 换片段时会把 `time` 归零（或按相位
+        //   换算成另一个值），而 `eventPrev` 还停在旧片段的 0.5 s。此时
+        //   `[0.5, 1.0)` 会被当成"这一帧跨过的区间" → 新片段里 0.8 的事件
+        //   **立刻发一次**（它其实才刚开始）。
+        //
+        //   所以这里必须**同时**改 clipName 与 time（只改 clipName 的话
+        //   time 还是 0.5，`[0.5, 0.5166)` 本来就不含 0.8，测不出区别 ——
+        //   第一版就是这么写的，去掉修复后照样全绿）。
+        {
+            Fixture f;
+            buildEventFixture(f, /*loop=*/true);
+            AnimatorSystem sys;
+            for (int i = 0; i < 30; ++i) sys.tick(f.scene, 1.0f / 60.0f);
+
+            ecs::AnimatorComponent& a = anim(f);
+            AnimEventTrack ut;
+            ut.clip = "upper";
+            ut.events = {{0.8f, "UpperLate", ""}};
+            a.eventTracks.push_back(ut);
+            comp(f).clipName = "upper";
+            a.time = 0.0f;   // = AnimController::switchClip(restart)
+            comp(f).time = 0.0f;
+
+            sys.tick(f.scene, 1.0f / 60.0f);
+            const int onSwitch = static_cast<int>(sys.eventsThisFrame().size());
+
+            int later = 0;
+            for (int i = 0; i < 60; ++i) {   // 再跑 1 秒，跨过 0.8
+                sys.tick(f.scene, 1.0f / 60.0f);
+                later += static_cast<int>(sys.eventsThisFrame().size());
+            }
+            reportFlag("ev_clip_switch_no_stale", onSwitch == 0,
+                       "onSwitch=" + std::to_string(onSwitch));
+            reportFlag("ev_clip_switch_then_fires", later == 1,
+                       "later=" + std::to_string(later));
+        }
+
+        // ---- 附加层的事件带上层名，底座事件不受影响 ----
+        {
+            Fixture f;
+            buildEventFixture(f, /*loop=*/false);
+            ecs::AnimatorComponent& a = anim(f);
+            ecs::AnimLayer L;
+            L.name = "upper";
+            L.clip = "upper";
+            L.mask.mode = BoneMaskMode::All;
+            a.layers.push_back(L);
+            AnimEventTrack ut;
+            ut.clip = "upper";
+            ut.events = {{0.5f, "Cast", "fireball"}};
+            a.eventTracks.push_back(ut);
+
+            AnimatorSystem sys;
+            int layerEv = 0, layerOk = 0, baseEv = 0;
+            for (int i = 0; i < 60; ++i) {
+                sys.tick(f.scene, 1.0f / 60.0f);
+                for (const FiredAnimEvent& e : sys.eventsThisFrame()) {
+                    if (e.layer.empty()) {
+                        ++baseEv;
+                    } else {
+                        ++layerEv;
+                        if (e.layer == "upper" && e.kind == "Cast" &&
+                            e.payload == "fireball")
+                            ++layerOk;
+                    }
+                }
+            }
+            reportFlag("ev_layer_fires_once", layerEv == 1 && layerOk == 1,
+                       "n=" + std::to_string(layerEv));
+            reportFlag("ev_layer_base_unaffected", baseEv == 3,
+                       "base=" + std::to_string(baseEv));
+        }
+
+        // ---- 序列化：只在非空时写 / 读回来逐字段相同 ----
+        {
+            // 这里只验"整理后的顺序"与"空表不写"两个纯函数性质；
+            // 落盘的往返在 `tools/verify_anim_events.py` 里过真 JSON。
+            AnimEventTrack u;
+            u.clip = "base";
+            u.events = {{0.6f, "C", ""}, {0.1f, "A", ""}, {0.3f, "B", ""}};
+            sortAnimEventTrack(u);
+            const bool sorted = u.events[0].kind == "A" &&
+                                u.events[1].kind == "B" &&
+                                u.events[2].kind == "C";
+            reportFlag("ev_sort_track", sorted,
+                       "first=" + u.events[0].kind);
+
+            const std::vector<AnimEventTrack> none;
+            reportFlag("ev_find_empty",
+                       findAnimEventTrack(none, "base") == nullptr,
+                       "n=0");
+            std::vector<AnimEventTrack> one{u};
+            reportFlag("ev_find_hit",
+                       findAnimEventTrack(one, "base") == &one[0], "n=1");
+            reportFlag("ev_find_miss",
+                       findAnimEventTrack(one, "nope") == nullptr, "n=1");
+        }
+    }
+
+    // ============================================================
+    // B3（2026-10-26）：根运动
+    //
+    // 分两层验：先验**纯函数**（增量 / 钳位 / 坐标空间，全部手算得出），
+    // 再验**系统**（Transform 真的动了 / Off 逐位不动 / 跨圈丢弃）。
+    // 分开的理由：纯函数层能精确到 1e-5，系统层只能验"动没动、朝哪动" ，
+    // 混在一起写会逼着系统层用大容差，于是"偏移了 20%"也能过。
+    // ============================================================
+    {
+        assets::Skeleton chain = makeChainSkeleton();
+
+        // ---- 骨名解析 ----
+        reportFlag("rm_resolve_auto", resolveRootBone(chain, "") == 0,
+                   "joint=0 (first parent==-1)");
+        // 不分大小写：美术嘴里说 "Arm"，文件里是 "arm"
+        reportFlag("rm_resolve_named", resolveRootBone(chain, "ARM") == 1,
+                   "case-insensitive -> 1");
+        // ⚠ 找不到必须是 -1 而不是 0：静默取 0 号会让"名字写错"表现成
+        //   "在根骨上提位移"（角色原地打转），几乎不可能从画面上反推。
+        reportFlag("rm_resolve_miss", resolveRootBone(chain, "no_such") == -1,
+                   "-1");
+
+        // ---- 增量 ----
+        const glm::mat4 m0 = glm::mat4(1.0f);
+        glm::mat4 m1 =
+            glm::translate(glm::mat4(1.0f), glm::vec3(0.25f, 0.0f, 0.0f));
+        m1 = m1 * glm::mat4_cast(
+                      glm::angleAxis(glm::radians(15.0f), glm::vec3(0, 0, 1)));
+        const RootMotionDelta d1 = extractRootMotion(chain, m0, m1, false);
+        reportFlag("rm_delta_valid", d1.valid, "extract sets valid");
+        reportFlag("rm_delta_x", std::abs(d1.position.x - 0.25f) < 1.0e-6f,
+                   "d=" + std::to_string(d1.position.x));
+        reportFlag("rm_delta_yaw",
+                   std::abs(d1.yaw - glm::radians(15.0f)) < 1.0e-5f,
+                   "yaw=" + std::to_string(d1.yaw));
+
+        // ---- horizontalOnly 丢掉垂直分量（引擎 up = +Z）----
+        const glm::mat4 m2 =
+            glm::translate(glm::mat4(1.0f), glm::vec3(0.25f, 0.0f, 0.5f));
+        const RootMotionDelta dH = extractRootMotion(chain, m0, m2, true);
+        reportFlag("rm_delta_horizontal",
+                   dH.position.z == 0.0f &&
+                       std::abs(dH.position.x - 0.25f) < 1.0e-6f,
+                   "z=" + std::to_string(dH.position.z));
+        const RootMotionDelta dV = extractRootMotion(chain, m0, m2, false);
+        reportFlag("rm_delta_vertical_kept",
+                   std::abs(dV.position.z - 0.5f) < 1.0e-6f,
+                   "z=" + std::to_string(dV.position.z));
+
+        // ---- 骨架空间 → 引擎空间（glTF 是 Y-up，这一条就是那个坑）----
+        // 骨架空间里"往上走 1 m" = (0,1,0)。glTF 的骨架要求引擎侧看到
+        // (0,0,1)。不转的话角色会**朝天上飞**，而每帧日志都对。
+        assets::Skeleton yUp = makeChainSkeleton();
+        yUp.skeletonToEngine = glm::rotate(
+            glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(1, 0, 0));
+        const glm::mat4 y1 =
+            glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+        const RootMotionDelta dy = extractRootMotion(yUp, m0, y1, false);
+        reportFlag("rm_yup_to_zup",
+                   std::abs(dy.position.z - 1.0f) < 1.0e-6f &&
+                       std::abs(dy.position.y) < 1.0e-6f,
+                   "z=" + std::to_string(dy.position.z) +
+                       ",y=" + std::to_string(dy.position.y));
+
+        // ---- 钳回基准（这才是 in-place）----
+        {
+            Pose p;
+            p.setRest(chain);
+            p.translation[0] = glm::vec3(0.4f, 0.0f, 0.0f);
+            const glm::vec3 cur = boneWorldPosition(chain, p, 0);
+            const glm::vec3 off =
+                stripRootMotion(chain, p, 0, cur, glm::vec3(0.0f), false);
+            reportFlag("rm_strip_offset", std::abs(off.x - 0.4f) < 1.0e-6f,
+                       "off=" + std::to_string(off.x));
+            // 钳完之后根回到基准（0）—— 模型相对实体静止
+            reportFlag("rm_strip_back",
+                       std::abs(p.translation[0].x) < 1.0e-6f,
+                       "x=" + std::to_string(p.translation[0].x));
+        }
+        {
+            // horizontalOnly：水平被钳、垂直保留（"脚不打滑但不离地"）
+            Pose p;
+            p.setRest(chain);
+            p.translation[0] = glm::vec3(0.4f, 0.0f, 0.7f);
+            const glm::vec3 cur = boneWorldPosition(chain, p, 0);
+            stripRootMotion(chain, p, 0, cur, glm::vec3(0.0f), true);
+            reportFlag("rm_strip_keep_z",
+                       std::abs(p.translation[0].x) < 1.0e-6f &&
+                           std::abs(p.translation[0].z - 0.7f) < 1.0e-6f,
+                       "x=" + std::to_string(p.translation[0].x) +
+                           ",z=" + std::to_string(p.translation[0].z));
+        }
+
+        // ---- twist 分解 ----
+        reportFlag("rm_twist_zero",
+                   std::abs(twistAngleAround(glm::quat(1, 0, 0, 0),
+                                             glm::vec3(0, 0, 1))) < 1.0e-6f,
+                   "identity -> 0");
+        // 绕 +Z 转 90°：扭转角就是 90°（不是 0、也不是 180°）
+        reportFlag(
+            "rm_twist_90",
+            std::abs(twistAngleAround(
+                         glm::angleAxis(glm::radians(90.0f), glm::vec3(0, 0, 1)),
+                         glm::vec3(0, 0, 1)) -
+                     glm::radians(90.0f)) < 1.0e-5f,
+            "90deg");
+        // 绕 +X 转 90°（纯 swing，没有扭转）→ 扭转角必须是 0。
+        // 这一条钉住"别把 swing 当成 yaw 累加进 Transform"—— 否则角色
+        // 每跳一下都会连带转一点朝向。
+        reportFlag(
+            "rm_twist_swing_is_zero",
+            std::abs(twistAngleAround(
+                         glm::angleAxis(glm::radians(90.0f), glm::vec3(1, 0, 0)),
+                         glm::vec3(0, 0, 1))) < 1.0e-5f,
+            "swing -> 0");
+    }
+
+    // ---- 系统层：真跑 tick ----
+    {
+        Fixture f;
+        buildRootFixture(f, ecs::AnimatorComponent::RootMotionMode::FromClip,
+                         /*loop=*/false);
+        AnimatorSystem sys;
+
+        // 第一帧：只记基准，**一点位移都不许提**
+        // ⚠ 人形骨架的骨盆离地 ~1 m，这一条挡的就是"一进 Play 就窜天"。
+        sys.tick(f.scene, 1.0f / 60.0f);
+        reportFlag("rm_first_frame_no_delta", !anim(f).rootDelta.valid,
+                   "valid=0");
+        reportFlag("rm_first_frame_no_move", xf(f).position.x == 0.0f,
+                   "x=" + std::to_string(xf(f).position.x));
+
+        // 记下第一帧的根骨世界位置（= 基准点）
+        const float rootP1 = comp(f).jointMatrices[0][3][0];
+
+        // 再跑 59 帧 → 共 60 帧，播放头到 1.0（= clip 末尾，clamp）
+        runFrames(sys, f, 59, 1.0f / 60.0f);
+
+        // 位移 = cur(1.0) - cur(1/60) = 1 - 1/60（第一帧不提，所以差一帧）
+        reportFlag("rm_tick_moves",
+                   std::abs(xf(f).position.x - (59.0f / 60.0f)) < 1.0e-4f,
+                   "x=" + std::to_string(xf(f).position.x));
+
+        // 根被钳在基准 → 模型相对实体**没动**（jointMatrices 是
+        // invMeshNode*world*invBind，这个夹具里两者都是单位阵，所以
+        // [3] 就是根骨的世界位置）
+        const float rootP60 = comp(f).jointMatrices[0][3][0];
+        reportFlag("rm_in_place", std::abs(rootP60 - rootP1) < 1.0e-4f,
+                   "p1=" + std::to_string(rootP1) + ",p60=" +
+                       std::to_string(rootP60));
+
+        // 朝向：整段 clip 转 30°，这里差了第一帧 → 30° × 59/60
+        reportFlag("rm_yaw_applied",
+                   std::abs(xf(f).rotation.z - glm::radians(30.0f)) < 0.02f,
+                   "rotZ=" + std::to_string(xf(f).rotation.z));
+    }
+    {
+        // Off：Transform **逐位不动**，姿势也不被钳（与加 B3 之前一致）
+        Fixture f;
+        buildRootFixture(f, ecs::AnimatorComponent::RootMotionMode::Off,
+                         /*loop=*/false);
+        AnimatorSystem sys;
+        const glm::vec3 before = xf(f).position;
+        runFrames(sys, f, 60, 1.0f / 60.0f);
+        reportFlag("rm_off_transform_untouched",
+                   xf(f).position == before, "bitwise equal");
+        reportFlag("rm_off_pose_untouched",
+                   std::abs(comp(f).jointMatrices[0][3][0] - 1.0f) < 1.0e-4f,
+                   "root follows clip -> x=" +
+                       std::to_string(comp(f).jointMatrices[0][3][0]));
+    }
+    {
+        // DeltaOnly：姿势钳住、delta 有效，但**引擎不替它移动**
+        Fixture f;
+        buildRootFixture(f, ecs::AnimatorComponent::RootMotionMode::DeltaOnly,
+                         /*loop=*/false);
+        AnimatorSystem sys;
+        const glm::vec3 before = xf(f).position;
+        runFrames(sys, f, 60, 1.0f / 60.0f);
+        reportFlag("rm_deltaonly_transform_untouched",
+                   xf(f).position == before, "bitwise equal");
+        const RootMotionDelta& d = anim(f).rootDelta;
+        reportFlag("rm_deltaonly_delta_valid", d.valid, "valid=1");
+        // 最后一帧的增量 = 1/60 米（匀速 1 m/s × 1/60 s）
+        reportFlag("rm_deltaonly_delta_step",
+                   std::abs(d.position.x - (1.0f / 60.0f)) < 1.0e-4f,
+                   "dx=" + std::to_string(d.position.x));
+    }
+    {
+        // 跨圈：两圈之后必须**累计到 ~2 m**（而不是回到 0）。
+        // 走路循环接回首帧时根骨从"前方 1 m"瞬回原点，那一帧的增量是
+        // -1 m —— 丢掉它才是对的。不丢的话两圈跑完停在 -0.05 m（角色
+        // 原地抽搐，而且日志里 dist 一帧一个数、看不出问题）。
+        Fixture f;
+        buildRootFixture(f, ecs::AnimatorComponent::RootMotionMode::FromClip,
+                         /*loop=*/true);
+        AnimatorSystem sys;
+        runFrames(sys, f, 120, 1.0f / 60.0f);
+        reportFlag("rm_wrap_discard", xf(f).position.x > 1.5f,
+                   "x=" + std::to_string(xf(f).position.x) +
+                       " (不丢会是 ~-0.05)");
+    }
+    {
+        // 编辑器非 Play（dt == 0）：**不提取**。
+        // 用户拖时间轴 = 任意跳帧，每一跳都会被当成一次位移 ——
+        // 角色会跟着滑条在场景里乱窜，而"拖到 0.9 秒"本身不该让角色移动。
+        Fixture f;
+        buildRootFixture(f, ecs::AnimatorComponent::RootMotionMode::FromClip,
+                         /*loop=*/true);
+        AnimatorSystem sys;
+        sys.tick(f.scene, 0.0f);
+        anim(f).playing = false;
+        anim(f).time = 0.9f;
+        for (int i = 0; i < 5; ++i) sys.tick(f.scene, 0.0f);
+        reportFlag("rm_editor_scrub_no_move", xf(f).position.x == 0.0f,
+                   "x=" + std::to_string(xf(f).position.x));
     }
 
     const int failures = g_fail;

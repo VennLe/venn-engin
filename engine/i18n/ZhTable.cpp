@@ -1073,6 +1073,54 @@ const Entry kZh[] = {
     {"Generate mipmaps", "生成 mipmap"},
     {"DDS mip streaming", "DDS mip 流式加载"},
     {"Anisotropy override", "各向异性覆盖"},
+    {"Character light", "角色光"},
+    {"Follow camera", "跟随相机"},
+    {"Light color", "光色"},
+    // ---- Inspector ▸ Toon/NPR 段（A1/A4/A5/A6）----
+    // ⚠ 缺译文**不报错**，界面上就那么留着英文（verify_i18n_coverage
+    //   会数出来但不阻断）—— 所以每加一行界面标签，别忘了这一处。
+    {"Toon Ramp", "Toon 色带"},
+    {"Term. Edge", "交界位置"},
+    {"Term. Width", "交界宽度"},
+    {"Face SDF", "面部 SDF"},
+    {"SDF Shift", "SDF 偏移"},
+    {"Char. Light", "角色光"},
+    {"Hair Aniso", "头发各向异性"},
+    {"Ring Shift", "环位置"},
+    {"Eye Unlit", "眼睛无光照"},
+    {"Iris Depth", "虹膜视差"},
+    {"Catchlight", "眼神光"},
+    // 特性名（FeatureRegistry 的 desc.name，渲染设置面板里按分组列出来）。
+    // ⚠ 这三条是 `verify_i18n_coverage.py` 的 A3 组抓出来的：特性名走的是
+    //   `FeatureDesc.name` 这条通道，不在参数 label / tooltip 那两组的视野里，
+    //   加新特性时最容易漏 —— 漏了的表现是"英文模式下正常、中文模式下
+    //   这一行还是英文"，不会报错。
+    {"Hair Anisotropy", "头发各向异性"},
+    {"Eye Shading", "眼睛着色"},
+    {"Outline (NPR)", "描边（NPR）"},
+    {"Toon", "卡通"},
+    // 附加动画层 / 骨骼遮罩（B1，2026-10-26）
+    {"Animation Layers  (upper / lower body)", "动画层（上半身 / 下半身）"},
+    {"Add Layer", "添加层"},
+    {"Remove Layer", "删除层"},
+    {"layer name", "层名称"},
+    {"Weight", "权重"},
+    {"All bones", "全部骨骼"},
+    {"Allow roots", "只含根骨子树"},
+    {"Deny roots", "排除根骨子树"},
+    {"mask roots (comma separated: spine)", "遮罩根骨（逗号分隔，如 spine）"},
+    {"mask: NO BONE MATCHED (roots not found)", "遮罩：没有命中任何骨骼（根骨名找不到）"},
+    {"mask: %d / %d bones", "遮罩：%d / %d 根骨骼"},
+    {"Animation Events  (footstep / hit / sound)", "动画事件（脚步声 / 打击 / 音效）"},
+    {"Add Event Track", "添加事件表"},
+    {"Add Event", "添加事件"},
+    {"Remove Track", "删除事件表"},
+    {"kind (Footstep)", "类型（如 Footstep）"},
+    {"payload (optional)", "参数（可空）"},
+    {"no clip: this track never fires", "没有 clip：这张表永远不会触发"},
+    {"t >= clip duration (%.2fs): never fires",
+     "t 超过片段长度 (%.2fs)：永远不会触发"},
+    {"t < 0: never fires", "t 小于 0：永远不会触发"},
     {"Force keyword mask", "强制关键字掩码"},
     {"Freeze TAA phase", "冻结 TAA 相位"},
     {"Game UI", "游戏 UI"},
@@ -1092,6 +1140,7 @@ const Entry kZh[] = {
     {"Pre-integrated SSS", "预积分次表面散射"},
     {"Surface", "表面"},
     {"Parallax Occlusion Mapping", "视差遮蔽映射"},
+    {"Character Light", "角色光通道"},
     {"Cascaded Shadow Maps", "级联阴影"},
     {"Local Light Shadows", "局部光源阴影"},
     {"Light Modifiers", "光照修饰"},
@@ -2323,6 +2372,23 @@ const Entry kZh[] = {
     {"Root motion", "根运动"},
     {"From clip", "来自片段"},
     {"Delta only", "仅增量"},
+    // ---- B3 根运动（2026-10-26）----
+    {"root bone", "根骨骼"},
+    {"auto (first root)", "自动（第一根根骨）"},
+    {"root: %s  |Δ| = %.4f m / frame, Δyaw = %.2f°",
+     "根骨：%s  每帧位移 %.4f 米，朝向 %.2f°"},
+    {"Controller = assets/animators/*.anim.json, schema in "
+     "animation/AnimController.h.\n"
+     "Parameters Speed / Grounded / Jump are fed by the runtime and by "
+     "editor Play. Empty controller = single clip.\n"
+     "Root motion needs the animation to actually move the root bone;\n"
+     "if the clip was baked in place, distance per frame stays 0.",
+     "控制器 = assets/animators/*.anim.json，字段说明见 "
+     "animation/AnimController.h。\n"
+     "Speed / Grounded / Jump 三个参数由运行时和编辑器 Play 喂。"
+     "控制器留空 = 单片段直放。\n"
+     "根运动要求动画**真的**移动了根骨；如果这段动画是原地烤的，"
+     "每帧位移会一直是 0。"},
     {"controller path (empty = single clip)", "控制器路径（空 = 单片段直放）"},
     {"default clip (used once)", "默认片段（只在首次生效）"},
     {"No animator: this entity plays a single clip straight from the Skinned Mesh fields above. Add an Animator to get a controller (state machine / blending lands in A2).",
@@ -2487,6 +2553,29 @@ const Entry kZh[] = {
      "在坡道起点按下、拖到终点松开：笔刷会在两个高度之间做线性过渡，得到能走上去的缓坡而不是断崖。"},
     {"From %.1f m to %.1f m", "从 %.1f 米到 %.1f 米"},
     {"%.2f s", "%.2f 秒"},
+    {"Kajiya-Kay angel ring: a band of light running ALONG the\nhair strands instead of a round blob. Needs vertex tangents\non the mesh (the built-in sphere/cube/plane have them; most\nimported meshes do not, and LOD levels drop them on purpose\n-- those fall back to a screen-space tangent, which is\ncorrect but shimmers).\n\n0 = off (pixel-identical to before this existed).\n0.6~1.2 is the useful range for hair. Above ~1.5 the ring\nclips to flat white and stops reading as a highlight.",
+     "Kajiya-Kay 天使环：一条**沿着发丝方向**走的光带，而不是一团圆斑。需要网格带"
+     "顶点切线（内置的球/立方体/平面都带；导入的模型大多不带，LOD 层是故意丢掉的"
+     "——那些会退回用屏幕空间导数现建的切线，方向对，但会闪）。\n\n"
+     "0 = 关（与加这个特性之前逐像素相同）。\n"
+     "头发常用区间 0.6~1.2；超过 1.5 环会削顶成死白，就不像高光了。"},
+    {"Slides the ring up or down across the surface. This is a\nPOSITION knob, not a brightness knob -- the ring moves, it\ndoes not get brighter.\n\nThe second, wider ring is placed at (this - 0.55), so both\nhalves move together and keep their spacing.",
+     "把环沿表面上下推移。这是**位置**参数，不是亮度参数——环会移动，但不会变亮。\n\n"
+     "第二道更宽的副环固定放在（本值 − 0.55）处，所以两道环一起移动、间距不变。"},
+    {"Anime eyes are PAINTED, not lit: sclera, iris gradient and\npupil are one texture, and the scene light must not move\nthem -- eyes do not go dark under backlight.\n\n1 = fully unlit (base colour + catchlight only).\n0 = off (pixel-identical to before this existed).\nMiddle values are for semi-transparent plastic eyes.",
+     "二次元的眼睛是**画出来的**，不是照出来的：巩膜白、虹膜渐变、瞳孔都在同一张图里，"
+     "场景光不该改变它们——逆光打过来眼睛也不该变暗。\n\n"
+     "1 = 完全不吃场景光（只剩底色 + 眼神光）。\n"
+     "0 = 关（与加这个特性之前逐像素相同）。\n"
+     "中间值留给「半透塑料眼」那种做法。"},
+    {"Parallax on the iris: the eye is a hollow socket, so the\niris should slide toward the viewer when seen from the\nside. Shifts the UV of ALL material maps at once -- iris,\npupil and sclera must not drift apart.\n\n0 = flat decal; 0.02 = normal; 0.05+ = glass-marble.",
+     "虹膜视差：眼睛是凹进眼窝的，所以侧看时虹膜会朝观察者一侧滑。"
+     "它移动的是**所有材质贴图共用的 UV**——虹膜、瞳孔、巩膜必须一起动，不能错开。\n\n"
+     "0 = 平贴（像贴纸）；0.02 = 常规；0.05 以上 = 玻璃珠。"},
+    {"Procedural catchlight: two soft spots locked to the HEAD's\norientation (view-space normal), not to the light -- the\npainted highlight of an anime eye does not slide when the\nsun moves.\n\n0 = off; ~1 = normal; above 2 the spots clip to flat white.",
+     "程序化眼神光：两个软光斑锁在**头部朝向**（视图空间法线）上，不跟着光源走 —— "
+     "二次元眼睛那颗画上去的高光，太阳转了它也不会滑。\n\n"
+     "0 = 关；1 左右是常规；超过 2 会削顶成死白。"},
 
     // ============================================================ Mesh Paint
     {"Select an entity that has a mesh. Painting writes per-vertex colors, so the change travels with the mesh (and survives LOD reduction).",
@@ -2744,6 +2833,46 @@ const Entry kZh[] = {
     {"Import failed: ", "导入失败："},
     {"%d imported, %d new", "导入 %d 个，其中 %d 个是新的"},
     {"%d material(s)", "%d 个材质"},
+
+    // ---- C1 过场时间轴（2026-10-26）----
+    // 术语统一：Sequence = 时间轴（不是"序列"—— 中文里"序列"太泛，
+    // 而这里的东西就是一段带运镜的过场）；Camera key = 相机关键帧。
+    {"Cutscene Sequence", "过场时间轴"},
+    {"Sequence asset", "时间轴资产"},
+    {"Cannot load this sequence.", "这份时间轴加载失败。"},
+    {"%s  |  %.2f s  |  %d camera keys, %d events",
+     "%s  |  %.2f 秒  |  %d 个相机关键帧，%d 个事件"},
+    {"%d event(s) at or past the end will never fire.",
+     "%d 个事件在结尾处或之后，永远不会触发。"},
+    {"Start time", "起始时间"},
+    {"Preview", "预览"},
+    {"Apply this time to the viewport camera once.",
+     "把当前时刻喂给视口相机一次（拖滑条时会自动跟随）。"},
+    {"head %.3f / %.3f  |  running %d  |  last fired %d",
+     "播放头 %.3f / %.3f  |  在跑 %d 段  |  本帧派发 %d 条"},
+    {"(finished)", "（已播完）"},
+    {"✓", "✓"},
+    // 数据行：只有数字与名字，翻译成同一份格式串即可（否则 i18n 工具的
+    // "控件显示格式串"那一组会把它当成漏翻）。
+    {"%7.3f   %s   %s", "%7.3f   %s   %s"},
+    {"Events (%d)", "事件（%d）"},
+    {"Relative to assets/. Keys and events live in that JSON — see "
+     "docs/cutscene_sequencer.md.",
+     "相对 assets/ 的路径。关键帧与事件都写在那份 JSON 里 —— 见 "
+     "docs/cutscene_sequencer.md。"},
+    {"Higher priority wins when several sequences are enabled in the same "
+     "scene. This is NOT the camera priority.",
+     "同一场景里有多段时间轴同时启用时，优先级高的那段生效。"
+     "这个优先级与相机优先级无关。"},
+    {"Tool tab → Add Component → Cutscene Sequence.\n"
+     "Attach it to an empty object and treat that object as the director.",
+     "「Tool」页签 → 添加组件 → 过场时间轴。\n"
+     "挂在空物体上，把那个物体当成导演轨。"},
+    {"A timeline of camera keys + events stored in\n"
+     "assets/sequences/*.seq.json. Attach it to an\n"
+     "empty object and treat that object as the director.",
+     "一份存在 assets/sequences/*.seq.json 里的时间轴（相机关键帧 + 事件）。\n"
+     "挂在空物体上，把那个物体当成导演轨。"},
 };
 
 // 跨 TU 拿不到 sizeof(kZh)（这里是不完整类型），所以长度单独导出。

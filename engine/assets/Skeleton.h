@@ -93,6 +93,26 @@ struct Skeleton {
     glm::mat4 invMeshNode{1.0f};
     std::map<int, int> nodeMap;      // glTF node 下标 → joint 下标
 
+    // 骨架空间 → 引擎世界空间（Z-up）的变换。**默认恒等**。
+    //
+    // 为什么需要这个字段（2026-10-26，B3 根运动）：
+    //   两条加载路径给出的 `joints` 不在同一个坐标系里 ——
+    //     · glTF：`restLocal` / `externalChain` 取的是**文件原始空间**
+    //       （Y-up，见 MeshLoader.cpp 的 parseSkeleton），Y-up→Z-up 的旋转
+    //       藏在 `invMeshNode` 里，两者相乘时才约掉。所以
+    //       `poseToWorld` 的输出是 **Y-up 空间**。
+    //     · FBX ：ufbx 用 `target_axes = right_handed_z_up` 在加载时就把
+    //       一切转成了引擎的 Z-up（FbxLoader.cpp 文件头），`invMeshNode`
+    //       是单位阵。所以 `poseToWorld` 的输出**已经是 Z-up**。
+    //   平时这个差别看不出来（渲染链里 `invMeshNode` 与 `push.model`
+    //   恰好抵消），但根运动要把位移**写进 `TransformComponent`**
+    //   —— 那是引擎世界空间。不知道骨架在哪个空间，写进去的位移就会
+    //   "跑着跑着朝天上飞"（Y-up 的 y 当成 Z-up 的 y）。
+    //
+    // ⚠ 这个量只描述**旋转+缩放**，不含平移（骨架根在哪个原点不影响
+    //   方向）。用的时候按矩阵用就行，别当"模型的世界矩阵"。
+    glm::mat4 skeletonToEngine{1.0f};
+
     std::vector<AnimationClip> clips;
 
     int jointCount() const { return static_cast<int>(joints.size()); }

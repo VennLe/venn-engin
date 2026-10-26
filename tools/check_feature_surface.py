@@ -284,6 +284,21 @@ FEATURES = [
          env=["MYVK_UI", "MYVK_UI_HUD_IN_EDITOR", "MYVK_UI_SCALE",
               "MYVK_UI_DEBUG_BOUNDS", "MYVK_UI_FONT_SIZE"],
          test="verify_ui2", gpu=None),
+
+    # ---------------- 二次元着色（A1/A5/A6，2026-10-26）----------------
+    # ⚠ 这里只登记 A5 的**全局**灯光通道参数组。A1 的面部 SDF 与 A6 的色带
+    #   是**材质级**字段（sdfShadowMap / sdfFaceShift / rampPath / rampEdge /
+    #   rampSoftness / useCharacterLight），它们不走 env —— 落点是场景 JSON
+    #   + Inspector 的 Toon/NPR 段，所以既没有 env 可登记，也不该进白名单
+    #   （进白名单等于断言"用户不需要在界面上摸到"，而它们恰恰只能在界面上
+    #   编辑）。C 组的 ui token 用参数 id 前缀，与上面对齐。
+    dict(id="charlight", name="角色光通道（NPR 独立打光）", roadmap="A5",
+         scope="Engine", panel="Engine ▸ Rendering",
+         ui=["charlight."],
+         env=["MYVK_CHARLIGHT", "MYVK_CHARLIGHT_INTENSITY",
+              "MYVK_CHARLIGHT_AMBIENT", "MYVK_CHARLIGHT_COLOR",
+              "MYVK_CHARLIGHT_FOLLOW"],
+         test="verify_toon_shading", gpu="forward"),
 ]
 
 # ============================================================

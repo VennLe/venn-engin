@@ -77,6 +77,16 @@ void poseToJoints(const assets::Skeleton& skel, const Pose& pose,
 void poseToWorld(const assets::Skeleton& skel, const Pose& pose,
                  std::vector<glm::mat4>& out);
 
+// 局部 TRS → 矩阵。
+//
+// 抽出来导出是因为 B3（根运动）要"只算某根骨的世界矩阵"，而世界矩阵的
+// 乘法顺序必须与 `poseToWorld` **逐字符一致** —— 差一个顺序（比如把
+// scale 提到 translate 前面）在静止姿势下看不出来，一旦骨骼带非均匀缩放
+// 就会让"提取出来的位移"和"画面上的位移"差一个系数，症状是走一段之后
+// 角色越走越偏，而每一帧的日志看着都对。
+glm::mat4 composeLocalTRS(const glm::vec3& translation,
+                          const glm::quat& orient, const glm::vec3& scale);
+
 // 两个姿态按 w ∈ [0,1] 混合：w=0 → a，w=1 → b。
 // ⚠ **端点必须短路**：`slerp(q,q,w)` 在浮点下不是恒等，
 //   w=0 走一次 slerp 会引入 1e-7 的漂移，长跑后角色会"慢慢转歪"。

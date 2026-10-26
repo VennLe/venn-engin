@@ -81,6 +81,28 @@ static const ParamDesc kParamsPom[] = {
            ParamTier::Advanced, "步进的最大层数（典型 16~64）。", 4.0f),
 };
 
+// ---- 角色光通道（A5，2026-10-26）----
+// 注意这里的开关**不是**"打开这个特性画面就变"：还要材质自己勾
+// `Use Character Light`。两道闸门是刻意的 —— 全局关 = 一键回基线
+// （拍对照截图用），材质关 = 场景里只有角色走角色光、道具仍走实光。
+static const ParamDesc kParamsCharLight[] = {
+    PBool("charlight.enabled", "Character light", "MYVK_CHARLIGHT",
+          ParamTier::Basic,
+          "角色专用主光 + 常量环境色。材质侧还要勾 Use Character Light"
+          " 才会生效。"),
+    PBool("charlight.follow", "Follow camera", "MYVK_CHARLIGHT_FOLLOW",
+          ParamTier::Advanced,
+          "方向跟随相机（右上前方 45°），特写永远受光；关掉则用场景太阳。"),
+    PFloat("charlight.intensity", "Intensity", "MYVK_CHARLIGHT_INTENSITY",
+           0.0f, 4.0f, ParamTier::Basic,
+           "直射项强度倍率。= 0 等价于关闭（pbr.frag 整段短路）。"),
+    PFloat("charlight.ambient", "Ambient", "MYVK_CHARLIGHT_AMBIENT", 0.0f, 2.0f,
+           ParamTier::Basic,
+           "常量环境色强度 —— 替代 IBL。这是\"脸不被环境色污染\"的关键。"),
+    PColor3("charlight.color", "Light color", "MYVK_CHARLIGHT_COLOR",
+            ParamTier::Advanced, "角色主光颜色（二次元通常略偏暖）。"),
+};
+
 // ---- 级联阴影 ----
 static const ParamDesc kParamsShadow[] = {
     PBool("shadow.enabled", "Shadows", "MYVK_SHADOW", ParamTier::Basic,
@@ -537,6 +559,23 @@ const FeatureDesc kFeatures[] = {
      ARRAY(kParamsSss)},
     {"pom", "Parallax Occlusion Mapping", "Surface", "R4-3", nullptr,
      "verify_pom", ARRAY(kParamsPom)},
+    {"charlight", "Character Light", "Surface", "A5", nullptr,
+     "verify_toon_shading", ARRAY(kParamsCharLight)},
+    // ---- 头发各向异性（A4，2026-10-26）----
+    // ⚠ 这一条**没有全局参数**，是刻意的：A4 的开关是材质字段
+    //   `anisoStrength`，没有"引擎级总开关"这种东西 —— 加上一个纯为
+    //   了拍对照截图的全局倍率，就要占一份 UBO（800 B 已无空位），
+    //   而验收本来就用"两个材质、两个场景"做对照，用不到运行时 A/B。
+    //   所以这里只登记"特性存在 / 谁在验它"，params 传空。
+    {"hair", "Hair Anisotropy", "Surface", "A4", nullptr, "verify_hair_aniso",
+     nullptr, 0},
+
+    // ---- 眼睛专用着色（A3，2026-10-26）----
+    // 与 A4 同一条理由：开关是材质字段（eyeStrength / eyeIrisDepth /
+    // eyeCatchlight），没有引擎级总开关 —— 不想为了拍一张对照图去占一份
+    // 已经没空位的 UBO。验收用"同一颗球、两个材质"做对照。
+    {"eye", "Eye Shading", "Surface", "A3", nullptr, "verify_eye_shading",
+     nullptr, 0},
 
     // ---- 阴影 ----
     {"shadow", "Cascaded Shadow Maps", "Shadows", "R3-1", "shadows",

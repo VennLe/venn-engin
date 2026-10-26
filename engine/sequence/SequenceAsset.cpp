@@ -1,0 +1,344 @@
+// ============================================================
+// sequence/SequenceAsset.cpp
+// ============================================================
+
+#include "sequence/SequenceAsset.h"
+
+#include "assets/AssetPath.h"
+#include "core/Logger.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <sstream>
+
+namespace sequence {
+
+namespace {
+
+using json = nlohmann::json;
+
+constexpr float kPi = 3.14159265358979323846f;
+
+// 时间比较的物理阈值。0.1 ms —— 比任何一帧都小三个数量级，
+// 但足够吸收 JSON 里 `0.1 + 0.2` 这类浮点噪声（0.30000000000000004）。
+// ⚠ 不用"逐位相等"判浮点时间：那会让"t 正好等于关键帧"永远不成立，
+// 插值段就永远走 `u = 0` 分支，画面看起来像"怎么都不动"。
+constexpr float kTimeEps = 1.0e-4f;
+
+float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+
+// smoothstep：一阶导在两端为 0 —— 运镜起停不"顿"。
+// ⚠ 与 `CameraSystem::blendTo(smoothStep=true)` 用的是同一条曲线，
+// 两处不一致的话，"时间轴运镜"和"代码 blendTo"会有肉眼可见的手感差。
+float smoothstep01(float u) { return u * u * (3.0f - 2.0f * u); }
+
+float wrapPi(float a) {
+    while (a > kPi) a -= 2.0f * kPi;
+    while (a <= -kPi) a += 2.0f * kPi;
+    return a;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------- 枚举
+
+const char* easeName(Ease e) {
+    switch (e) {
+    case Ease::Linear: return "linear";
+    case Ease::Smooth: return "smooth";
+    case Ease::Step: return "step";
+    }
+    return "smooth";
+}
+
+bool parseEase(const std::string& s, Ease& out) {
+    // 与 `AnimController` 的 parseOp 同一态度：**不做大小写兼容**。
+    // 资产里的拼写错误要在加载期报出来，而不是被"智能匹配"吃掉。
+    if (s == "linear") { out = Ease::Linear; return true; }
+    if (s == "smooth") { out = Ease::Smooth; return true; }
+    if (s == "step") { out = Ease::Step; return true; }
+    return false;
+}
+
+// ---------------------------------------------------------------- 查询
+
+float SequenceAsset::lastCameraTime() const {
+    return cameraKeys.empty() ? 0.0f : cameraKeys.back().t;
+}
+
+float SequenceAsset::lastEventTime() const {
+    return events.empty() ? 0.0f : events.back().t;
+}
+
+// ---------------------------------------------------------------- 解析
+
+bool parseSequence(const std::string& text, const std::string& sourcePath,
+                   SequenceAsset& out) {
+    out = SequenceAsset{};
+    out.sourcePath = sourcePath;
+
+    json j;
+    try {
+        j = json::parse(text);
+    } catch (const std::exception& e) {
+        out.error = std::string("JSON parse failed: ") + e.what();
+        return false;
+    }
+    if (!j.is_object()) {
+        out.error = "top level is not an object";
+        return false;
+    }
+
+    out.name = j.value("name", std::string());
+    if (out.name.empty()) {
+        // 文件名兜底（`sequences/opening.seq.json` → `opening`）
+        std::string s = sourcePath;
+        const std::size_t slash = s.find_last_of("/\\");
+        if (slash != std::string::npos) s = s.substr(slash + 1);
+        const std::string suf = ".seq.json";
+        if (s.size() > suf.size() &&
+            s.compare(s.size() - suf.size(), suf.size(), suf) == 0)
+            s = s.substr(0, s.size() - suf.size());
+        out.name = s.empty() ? "<unnamed>" : s;
+    }
+    out.loop = j.value("loop", false);
+
+    // ---- 相机关键帧 ----
+    if (j.contains("camera") && j["camera"].is_array()) {
+        int idx = 0;
+        for (const auto& k : j["camera"]) {
+            SeqCameraKey ck;
+            ck.t = k.value("t", 0.0f);
+            if (k.contains("pos") && k["pos"].is_array() && k["pos"].size() == 3) {
+                ck.position = glm::vec3(k["pos"][0].get<float>(),
+                                        k["pos"][1].get<float>(),
+                                        k["pos"][2].get<float>());
+            } else if (k.contains("position") && k["position"].is_array() &&
+                       k["position"].size() == 3) {
+                // 接受长名 —— 手写资产时 `pos` / `position` 都会有人写。
+                ck.position = glm::vec3(k["position"][0].get<float>(),
+                                        k["position"][1].get<float>(),
+                                        k["position"][2].get<float>());
+            }
+            ck.yaw = k.value("yaw", 0.0f);
+            ck.pitch = k.value("pitch", -0.25f);
+            ck.fov = k.value("fov", 45.0f);
+
+            const std::string es = k.value("ease", std::string("smooth"));
+            if (!parseEase(es, ck.ease)) {
+                out.error = "camera key #" + std::to_string(idx) + ": unknown ease '" +
+                            es + "' (linear / smooth / step)";
+                return false;
+            }
+            out.cameraKeys.push_back(ck);
+            ++idx;
+        }
+    }
+
+    // ---- 事件 ----
+    if (j.contains("events") && j["events"].is_array()) {
+        int idx = 0;
+        for (const auto& e : j["events"]) {
+            SeqEvent ev;
+            ev.t = e.value("t", 0.0f);
+            ev.kind = e.value("kind", std::string());
+            ev.payload = e.value("payload", std::string());
+            if (ev.kind.empty()) {
+                out.error = "event #" + std::to_string(idx) + ": 'kind' is required";
+                return false;
+            }
+            out.events.push_back(ev);
+            ++idx;
+        }
+    }
+
+    // ---- 排序（见文件头 ②）----
+    // ⚠ 用 stable_sort：同一 t 上的多个事件保持作者的书写顺序。
+    //   普通 sort 会把它们换个位置，日志读起来跟资产对不上。
+    std::stable_sort(out.cameraKeys.begin(), out.cameraKeys.end(),
+                     [](const SeqCameraKey& a, const SeqCameraKey& b) {
+                         return a.t < b.t;
+                     });
+    std::stable_sort(out.events.begin(), out.events.end(),
+                     [](const SeqEvent& a, const SeqEvent& b) { return a.t < b.t; });
+
+    // 重复关键帧：不致命（退化成硬切），但要让人知道。
+    for (std::size_t i = 1; i < out.cameraKeys.size(); ++i) {
+        if (std::fabs(out.cameraKeys[i].t - out.cameraKeys[i - 1].t) < kTimeEps) {
+            out.warnings.push_back(
+                "duplicate camera key time t=" +
+                std::to_string(out.cameraKeys[i].t) + "s (behaves as a hard cut)");
+        }
+    }
+
+    // 负时间：作者手滑写成 −1，那个关键帧/事件永远轮不到 → 必须说。
+    for (const auto& k : out.cameraKeys)
+        if (k.t < -kTimeEps)
+            out.warnings.push_back("camera key with negative t=" + std::to_string(k.t));
+    for (const auto& e : out.events)
+        if (e.t < -kTimeEps)
+            out.warnings.push_back("event '" + e.kind + "' with negative t=" +
+                                   std::to_string(e.t));
+
+    // ---- duration ----
+    const float explicitDur = j.value("duration", 0.0f);
+    const float derived =
+        std::max({out.lastCameraTime(), out.lastEventTime(), 0.0f});
+    if (explicitDur > kTimeEps) {
+        out.duration = explicitDur;
+        // 显式 duration 比内容短 → 后半段被切掉。这在"我加了台词却不播"里
+        // 是头号原因，必须报（否则就是静默丢内容）。
+        if (derived > explicitDur + kTimeEps) {
+            out.warnings.push_back(
+                "duration=" + std::to_string(explicitDur) +
+                "s is shorter than content (" + std::to_string(derived) +
+                "s) — the tail will never play");
+        }
+    } else {
+        out.duration = derived;
+    }
+
+    // ---- `t == duration` 的事件（见文件头 ③）----
+    for (const auto& e : out.events) {
+        if (e.t >= out.duration - kTimeEps) {
+            out.warnings.push_back(
+                "event '" + e.kind + "' at t=" + std::to_string(e.t) +
+                "s never fires (interval is [from,to); t must be < duration=" +
+                std::to_string(out.duration) + "s)");
+        }
+    }
+
+    if (out.cameraKeys.empty() && out.events.empty()) {
+        out.error = "no 'camera' keys and no 'events' — nothing to play";
+        return false;
+    }
+
+    out.valid = true;
+
+    for (const auto& w : out.warnings)
+        VK_LOG_WARN("SEQ-ASSET-WARN name=%s %s", out.name.c_str(), w.c_str());
+
+    VK_LOG_INFO("SEQ-ASSET name=%s dur=%.3f loop=%d keys=%d events=%d path=%s",
+                out.name.c_str(), static_cast<double>(out.duration),
+                out.loop ? 1 : 0, static_cast<int>(out.cameraKeys.size()),
+                static_cast<int>(out.events.size()), sourcePath.c_str());
+    return true;
+}
+
+bool loadSequence(const std::string& path, SequenceAsset& out) {
+    out = SequenceAsset{};
+    out.sourcePath = path;
+
+    if (path.empty()) {
+        out.error = "empty path";
+        return false;
+    }
+
+    const std::string abs = assets::resolveAssetPath(path);
+    std::ifstream f(abs, std::ios::binary);
+    if (!f) {
+        out.error = "cannot open '" + abs + "'";
+        VK_LOG_WARN("SEQ-ASSET-MISS path=%s resolved=%s", path.c_str(), abs.c_str());
+        return false;
+    }
+
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    if (!parseSequence(ss.str(), path, out)) {
+        VK_LOG_WARN("SEQ-ASSET-BAD path=%s err=%s", path.c_str(),
+                    out.error.c_str());
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- 采样
+
+float shortestAngle(float from, float to) {
+    // 先 wrap 到 (−π, π]，再取差 —— 直接 `to - from` 在跨越 ±π 时
+    // 会给出 −340° 这种"绕远路"的值（见文件头 ①）。
+    return wrapPi(wrapPi(to) - wrapPi(from));
+}
+
+int cameraKeyIndexAt(const SequenceAsset& seq, float t) {
+    const int n = static_cast<int>(seq.cameraKeys.size());
+    if (n <= 0) return -1;
+    if (t <= seq.cameraKeys[0].t) return 0;
+
+    // 逆序扫到第一个 `t <= key.t` 的前一帧。关键帧数量是个位到几十，
+    // 线性扫足够；用二分反而要处理"重复 t"的边界。
+    for (int i = n - 1; i >= 0; --i) {
+        if (seq.cameraKeys[static_cast<std::size_t>(i)].t <= t + kTimeEps) return i;
+    }
+    return 0;
+}
+
+bool sampleCamera(const SequenceAsset& seq, float t, SeqCameraKey& out) {
+    const int n = static_cast<int>(seq.cameraKeys.size());
+    if (n <= 0) return false;
+
+    if (n == 1) {
+        out = seq.cameraKeys[0];
+        return true;
+    }
+
+    const int i = cameraKeyIndexAt(seq, t);
+    if (i >= n - 1) {
+        out = seq.cameraKeys[static_cast<std::size_t>(n - 1)];
+        return true;
+    }
+
+    const SeqCameraKey& a = seq.cameraKeys[static_cast<std::size_t>(i)];
+    const SeqCameraKey& b = seq.cameraKeys[static_cast<std::size_t>(i + 1)];
+    const float span = b.t - a.t;
+
+    // 重复 t / 零长度区间 → 直接取后半帧（等价硬切）。
+    if (span <= kTimeEps) {
+        out = b;
+        return true;
+    }
+
+    const float u = clamp01((t - a.t) / span);
+
+    // ⚠ `Ease::Step` 的作用是"**这一段**保持前帧，在 b.t 那一刻跳过去"。
+    //   所以 u 严格 < 1 时全部取 a，只有真的到达 b 才切。这不是"插值",
+    //   是"选择"—— 写成 lerp(a,b, u>0.5?1:0) 会在段中间就跳，位置错了。
+    if (a.ease == Ease::Step) {
+        out = a;
+        return true;
+    }
+
+    const float w = (a.ease == Ease::Linear) ? u : smoothstep01(u);
+
+    out = a;
+    out.t = t;
+    out.position = glm::mix(a.position, b.position, w);
+    // yaw 走最短弧；pitch 不会绕圈（±π/2 以内），直接线性。
+    out.yaw = wrapPi(a.yaw + shortestAngle(a.yaw, b.yaw) * w);
+    out.pitch = a.pitch + (b.pitch - a.pitch) * w;
+    out.fov = a.fov + (b.fov - a.fov) * w;
+    out.ease = a.ease;   // 采样结果没有"下一段"，保留来源只为诊断
+    return true;
+}
+
+int collectEvents(const SequenceAsset& seq, float from, float to,
+                  std::vector<int>* out) {
+    if (to <= from) return 0;   // 空区间 / 反向：什么都不发（调用方负责拆跨圈）
+
+    int added = 0;
+    for (std::size_t i = 0; i < seq.events.size(); ++i) {
+        const float et = seq.events[i].t;
+        // 半开 [from, to)。用 kTimeEps 是为了让 `from` 正好等于事件时间时
+        // 算"已经越过"而不是"又要发一次"。
+        if (et >= from - kTimeEps && et < to - kTimeEps) {
+            if (out) out->push_back(static_cast<int>(i));
+            ++added;
+        }
+    }
+    return added;
+}
+
+} // namespace sequence

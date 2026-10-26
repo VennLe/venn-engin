@@ -1532,6 +1532,23 @@ private:
     // 全局倍率兼开关。= 0 → 整段 ray-march 短路（"关掉 POM"的对照组）。
     float m_pomCoverageScale = 1.0f;
 
+    // ---- 角色光通道（A5，2026-10-26，→ FrameUBO.charLight*）----
+    // 二次元角色要"独立打光"：只吃一盏专用主光 + 一个常量环境色，不吃
+    // 场景 IBL / CSM。**材质必须自己勾 useCharacterLight 才走这条路**，
+    // 所以这里的默认值（开）不会改变任何现有场景的像素 —— "关 = 基线"
+    // 的闸门在材质那一侧。
+    //   m_charLightEnabled     —— 总开关（MYVK_CHARLIGHT=0 关）
+    //   m_charLightFollowCamera—— 方向跟相机走（右上偏前，特写永远好看）；
+    //                             关掉则用场景太阳方向的反向
+    //   m_charLightIntensity   —— 直射项强度倍率
+    //   m_charLightAmbient     —— 常量环境色强度（替代 IBL 的那一块）
+    //   m_charLightColor       —— 光的颜色（二次元主光通常略偏暖）
+    bool m_charLightEnabled = true;
+    bool m_charLightFollowCamera = true;
+    float m_charLightIntensity = 1.15f;
+    float m_charLightAmbient = 0.30f;
+    float m_charLightColor[3] = {1.00f, 0.97f, 0.93f};
+
     // 灯光可视化：每盏灯画一个小自发光球（由 Renderer 自己建网格，
     // 不经过 AssetManager —— 它是渲染器的调试设施，不是场景资产）
     std::unique_ptr<assets::Mesh> m_lightGizmoMesh;

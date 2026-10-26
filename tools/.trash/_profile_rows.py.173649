@@ -1,0 +1,46 @@
+"""临时：量 legs / arms 两个变体的"变化像素"在屏幕上的纵向分布，
+用来定 SPLIT_Y（分割线必须在髋关节上，而不是画面正中）。"""
+
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from verify_shader_variants import OUT_DIR                       # noqa: E402
+from verify_local_shadow import crop_pair                        # noqa: E402
+from PIL import Image                                            # noqa: E402
+
+
+def load(tag):
+    return Image.open(os.path.join(OUT_DIR, "anim_layers_%s.png" % tag))
+
+
+def main():
+    a = load("base_a")
+    for tag in ("legs", "arms"):
+        b = load(tag)
+        pa, pb, x0, y0 = crop_pair(a, b, None)   # vp=None → 整窗
+        m = np.abs(pa - pb).max(axis=2) > 8
+        print("=== %s  (window %dx%d) ===" % (tag, pa.shape[1], pa.shape[0]))
+        ys, xs = np.nonzero(m)
+        if len(ys) == 0:
+            print("  没有任何变化")
+            continue
+        print("  bbox: x %d..%d  y %d..%d  (n=%d)"
+              % (xs.min(), xs.max(), ys.min(), ys.max(), len(ys)))
+        h = m.shape[0]
+        for k in range(0, 40):
+            y0b = int(h * k / 40.0)
+            y1b = int(h * (k + 1) / 40.0)
+            n = int(m[y0b:y1b].sum())
+            if n == 0:
+                continue
+            print("  y %.3f..%.3f  rows %4d..%4d  n=%6d  %s"
+                  % (k / 40.0, (k + 1) / 40.0, y0b, y1b, n,
+                     "#" * min(60, n // 60)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

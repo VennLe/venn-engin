@@ -62,6 +62,11 @@ OLD = mk("assets/shaders/decal.frag",
          # fixture 是"改了"而不是"新增"。
          "engine/animation/TwoBoneIK.cpp",
          "engine/animation/AnimatorSystem.cpp",
+         # B1（动画层 / 骨骼遮罩，2026-10-26）：同上 —— 先放进基准，让下面的
+         # fixture 是"改了"而不是"新增"。
+         "engine/animation/BoneMask.cpp",
+         # B2（动画事件 / Notify，2026-10-26）：同上。
+         "engine/animation/AnimEvent.cpp",
          "engine/assets/Mesh.h")
 
 
@@ -177,7 +182,42 @@ run("editor/InspectorPanel.cpp → 面板块全家族", OLD,
           # Weight / Pole mode / Pole vector）与 `Bone Attachment`
           # （host / bone / Offset / Local rot）。它们改的是**组件字段**，
           # 而 verify_ik 的 K1/K2 正是"组件字段 → 求解 → 像素"那条链的判据。
-          "verify_ik"})
+          "verify_ik",
+          # 2026-10-26（A4）：Material 段的「Toon/NPR」块新增两行 ——
+          # `Hair Aniso`（`INS-NPR-ANISO`）与 `Ring Shift`
+          # （`INS-NPR-ANISO-SHIFT`）。这两个滑条写的是材质的
+          # `anisoStrength` / `anisoShift`，而 verify_hair_aniso 验的正是
+          # "这两个字段 → 材质页 spare.z/w → Kajiya-Kay 环"整条链。
+          "verify_hair_aniso",
+          # 2026-10-26（A3）：同一段 NPR 之后又多了三行 —— `Eye Unlit`
+          # （`INS-NPR-EYE`）/ `Iris Depth`（`INS-NPR-IRIS`）/ `Catchlight`
+          # （`INS-NPR-SPARK`）。它们写的是 `eyeStrength` / `eyeIrisDepth` /
+          # `eyeCatchlight`，而 verify_eye_shading 验的正是"这三个字段 →
+          # 材质页 spare2.xyz → Unlit 底/视差/眼神光"整条链。
+          "verify_eye_shading",
+          # 2026-10-26（B1）：`drawTabAnimation` 里新增整段
+          # `Animation Layers  (upper / lower body)`（八个锚点：LAYERS 段 /
+          # ADD / HDR / CLIP / WEIGHT / MASKMODE / MASKROOTS / REMOVE）。
+          # 它改的是 `AnimatorComponent::layers`，而 verify_anim_layers 的
+          # ⑨ 组就是"这段 UI 真的画出来了"，另一头（写入 → 存盘 → 读回）
+          # 也在同一条链上。改这个文件当然该重跑它。
+          "verify_anim_layers",
+          # 2026-10-26（B2）：同一页又多了 `Animation Events  (footstep / hit /
+          # sound)` 整段（八个锚点：EVENTS 段 / ADD / TRACK / CLIP / TIME /
+          # KIND / PAYLOAD / REMOVE）。verify_anim_events 的 ⑥ 组就是
+          # "这段 UI 真的画出来了"，⑤ 组验写入 → 存盘 → 读回。
+          "verify_anim_events",
+          # 2026-10-26（B3）：这一页的 `Root motion` 下拉**解除了 BeginDisabled**
+          # （它在 A1 之后一直是灰的占位），下面还多了根骨输入框
+          # （`INS-ANIM-ROOTBONE`，只在 mode != Off 时画）。也就是说"这个
+          # 控件从此会真的改到引擎状态" —— 改这一页必须重跑根运动用例。
+          "verify_root_motion",
+          # 2026-10-26（C1）：Inspector 多了一整个 `sequence` 页签
+          # （`INS-SEQ-HEADER/PATH/TIME/PREVIEW` 四个锚点：路径框 / 时间滑条 /
+          # Preview 按钮 / 只读事件树）。verify_sequencer 的 ⑦ 组验的正是
+          # "这些控件真的画出来了"，而拖动滑条走的是 `tick(sc, 0.0f)` +
+          # `applyPoseToSceneCamera` —— 改这个文件必须重跑时间轴那条。
+          "verify_sequencer"})
 # 2026-10-25（§16 第八刀）：两骨 IK 的求解器本体。
 # 期望里**必然**带 verify_anim_runtime / verify_character_import /
 # verify_player_character —— 它们三个都登记了 `engine/animation/**` 整层。
@@ -193,10 +233,45 @@ run("engine/animation/TwoBoneIK.cpp → 两骨 IK", OLD,
 # 的平滑过渡判据读的也是这条链 → 改它必须连它一起跑。
 run("engine/animation/AnimatorSystem.cpp → 三层顺序", OLD,
     with_change("engine/animation/AnimatorSystem.cpp"),
+    # ⚠ 2026-10-26（B1）：加了 verify_anim_layers —— 附加层的采样 / 权重 /
+    #   淡入推进就写在 AnimatorSystem.cpp（`applyLayers`），而那张表的
+    #   TRIGGERS 里登记了它。这一条正是"加一条用例必须同步 fixture"的样子。
     want={"verify_ik", "verify_anim_runtime", "verify_character_import",
-          "verify_player_character", "verify_player_feel"})
+          "verify_player_character", "verify_player_feel",
+          "verify_anim_layers",
+          # B2：`dispatchEvents` 的调用点也在这里（底座在 tick 里、附加层在
+          # applyLayers 里），所以改这个文件同样要重跑事件用例。
+          "verify_anim_events",
+          # B3：`applyRootMotion` 的调用点也在这里（表演层之后、poseToJoints
+          # 之前），`resolveRootBone` / 钳位 / 跨圈丢弃全在这一段里。
+          "verify_root_motion"})
 run("assets/shaders/fg_taa.frag → taa", OLD,
     with_change("assets/shaders/fg_taa.frag"), want={"verify_taa"})
+# 2026-10-26（B1）：遮罩解算 + 分层混合的原语（`engine/animation/BoneMask.*`）。
+# 期望里除自己之外必然带三条 —— 它们的 TRIGGERS 都是 `engine/animation/**`
+# 整层（换姿势就等于换所有动画用例的输入）。与 verify_ik 那条同理：
+# `verify_anim_layers` 出现在这里，价值在于**标明归属**。
+run("engine/animation/BoneMask.cpp → 遮罩原语", OLD,
+    with_change("engine/animation/BoneMask.cpp"),
+    want={"verify_anim_layers", "verify_anim_runtime",
+          "verify_character_import", "verify_player_character"})
+# 2026-10-26（B2）：事件边界判定（`engine/animation/AnimEvent.*`）。
+# 期望里带 verify_anim_runtime（28 条 `ev_*` 数值断言就在它的自检里）与
+# verify_anim_events（端到端那份）。⚠ 别把 `BoneMask.cpp` 与它写成同一条 ——
+# 两者的 owner 不同，合并之后"改遮罩却要跑事件用例"会变成假信号。
+run("engine/animation/AnimEvent.cpp → 事件边界", OLD,
+    with_change("engine/animation/AnimEvent.cpp"),
+    want={"verify_anim_events", "verify_anim_runtime",
+          "verify_character_import", "verify_player_character"})
+# 2026-10-26（C1）：过场时间轴的解析 / 采样 / 播放器本体
+# （`engine/sequence/**`）。这一层只有 verify_sequencer 一条用例登记，
+# 所以期望是**恰好一条**（别的 fixture 都是"自己那条一定在"）—— 哪天有人
+# 把 `engine/sequence/**` 挂到第二条用例上，这条会跟着红，提醒去同步。
+# ⚠ 数值侧（48 条 `SEQ-TEST`）住在 `SequenceSelfTest.cpp`，同属一层，
+#   跑 `--selftest sequence` 才执行 —— 端到端那条**不能**替代它。
+run("engine/sequence/SequenceAsset.cpp → 过场时间轴", OLD,
+    with_change("engine/sequence/SequenceAsset.cpp"),
+    want={"verify_sequencer"})
 run("删除 decal.frag → 也算变更", OLD,
     with_change(drop=("assets/shaders/decal.frag",)),
     want={"verify_decals"})

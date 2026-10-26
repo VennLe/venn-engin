@@ -96,6 +96,22 @@ def material_model(name, model, base=(0.78, 0.78, 0.78)):
     }
 
 
+def material_npr(name, ramp=None, char_light=False, model="toon"):
+    """带 NPR 扩展字段的材质（A6/A5，2026-10-26）。
+
+    ⚠ 这些字段是**场景 JSON 里直接写**的（`resolveMaterial` 读它们），
+      不需要先经过编辑器 —— 这也顺便证明了"手写场景能驱动新特性"。
+    """
+    m = material_model(name, model)
+    if ramp:
+        # rampSteps=0 = 按资产自带档位位置采样（.vramp 的默认工作流）
+        m["rampPath"] = ramp
+        m["rampSteps"] = 0.0
+    if char_light:
+        m["useCharacterLight"] = True
+    return m
+
+
 def build_scene(path, model):
     """一颗球 + 没有地面实体：像素统计不被地面/网格干扰。"""
     ents = [entity("Ball", BALL_POS,
@@ -288,6 +304,239 @@ def main():
     check("Skin 的暗部仍是 PBR 口径（比 Toon 暗得多，说明 Skin≠Toon）",
           (avg_skin or 0) < (avg_toon or 0) * 0.5,
           "R=%.1f vs %.1f" % (avg_skin or 0, avg_toon or 0))
+
+    # ---------------- 第 4 组：色带（A6，2026-10-26）----------------
+    # 判据的核心是**颜色方向**，不是"有没有变化"：
+    #   没有色带 → 暗部由引擎写死成冷蓝（实测 B/R ≈ 1.08，第 3 组已断言）；
+    #   挂了"暖色暗部"的色带 → 暗部必须变成红主导（B/R 明显 < 1）。
+    # 这个差异**只可能**来自"色带的三通道被当成颜色用了" —— 上一版只读 R
+    # 通道做乘法调制，无论画什么颜色的色带都改不出红暗部。
+    print("\n== 第 4 组：色带把暗部颜色交给美术（A6）==")
+    ramp_rel = "ramps/toon_warm_3step.vramp"
+    ramp_scene = os.path.join(OUT_DIR, "toon_ramp.json")
+    write_scene(ramp_scene,
+                [entity("Ball", BALL_POS,
+                        {"shape": "sphere", "size": BALL_SIZE,
+                         "name": "toon_ramp_ball"},
+                        material_npr("toon_ramp_mat", ramp=ramp_rel))],
+                "verify_toon: ramp", sun=SUN, light_dir=LIGHT_DIR)
+    ramp_shot = os.path.join(OUT_DIR, "toon_ramp.png")
+    # ⚠⚠ **必须开 bindless**：色带/MatCap/SDF/细节这四个 A 类语义槽与
+    #   材质页（set1/binding1 的 96 B 记录）是同一套东西，而 bindless 默认
+    #   **关**（`rp.bindless`，MYVK_BINDLESS）。关着时着色器里根本没有
+    #   `gMat`，四个槽全部失效 —— 表现是"配了色带但画面一点没变"，
+    #   而且不报任何错。这是本轮实测踩到的第一个坑。
+    NPR_ENV = {"MYVK_SHADER_VARIANTS": "1", "MYVK_GRID": "0",
+               "MYVK_BINDLESS": "1"}
+    r_lines, r_vp, r_img, r_errs = run_once(exe, ramp_scene, NPR_ENV,
+                                            ramp_shot)
+    check("ramp 场景零 Vulkan 验证层报错", not r_errs, r_errs[:2])
+    if r_vp is None or r_img is None:
+        print("  ramp 场景没拿到视口/截图")
+        fails.append("ramp 截图")
+        print("\n结果: FAIL: " + ", ".join(fails))
+        return 5
+    # 资产真的被读到了 —— 否则着色器会静默退回程序化两档（画面看着"没变化"，
+    # 而不是报错）。这条日志是"路径解析成功"的唯一证据。
+    loaded = [ln for ln in r_lines if "RAMP-LOAD key=" in ln]
+    check("色带资产被加载（RAMP-LOAD 日志出现）", bool(loaded),
+          loaded[-1][-90:] if loaded else "no RAMP-LOAD line")
+    check("日志里的 band 数 = 3",
+          bool(loaded) and "bands=3" in loaded[-1],
+          loaded[-1][-60:] if loaded else "")
+
+    r_rgb = to_np_rgb(r_img)
+    p_ramp = center_patch(r_rgb, r_vp)
+    l_ramp = luma(p_ramp)
+    ratio_ramp, avg_ramp, n_ramp = shadow_stats(p_ramp, l_ramp)
+    print("     暗部  toon: B/R=%s R=%.1f | ramp: B/R=%s R=%.1f"
+          % ("%.3f" % r_toon if r_toon else "n/a", avg_toon or 0,
+             "%.3f" % ratio_ramp if ratio_ramp else "n/a", avg_ramp or 0))
+    check("ramp 场景采到足够暗部像素", (n_ramp or 0) > 500, str(n_ramp))
+    if ratio_ramp and r_toon:
+        check("挂了暖色色带后暗部转红主导（B/R < 0.85）",
+              ratio_ramp < 0.85, "%.3f" % ratio_ramp)
+        check("比无色带的冷蓝暗部明显更暖（低 30% 以上）",
+              ratio_ramp < r_toon * 0.70,
+              "%.3f vs %.3f" % (ratio_ramp, r_toon))
+    else:
+        check("ramp 暗部有红分量（B/R 可算）", False, "ratio=%s" % ratio_ramp)
+        check("ramp 与无色带的色比可比", False, "")
+    diff_r = int((np.abs(p_toon - p_ramp).max(axis=2) > 12).sum())
+    tot_r = p_ramp.shape[0] * p_ramp.shape[1]
+    print("     toon vs ramp 差异像素 %d / %d (%.1f%%)"
+          % (diff_r, tot_r, 100.0 * diff_r / tot_r))
+    check("色带真的改变了画面（>3% 像素）", diff_r > tot_r * 0.03,
+          "%d px" % diff_r)
+
+    # ---------------- 第 5 组：角色光通道（A5，2026-10-26）----------------
+    # 三条判据一起构成"通道语义正确"的证据链：
+    #   ① 材质**没勾** useCharacterLight 时，开不开角色光逐像素相同
+    #      （= "关 = 基线"，它证明这道 gate 在材质侧而不是全局）；
+    #   ② 勾了之后，开/关角色光画面显著不同（= 通道真的接进了着色）；
+    #   ③ 勾了之后的开/关差异**大于** ①的差异一个量级（防"①只是噪声"）。
+    print("\n== 第 5 组：角色光通道（A5）==")
+
+    def cl_run(tag, ramp, char_light, env_extra):
+        sc = os.path.join(OUT_DIR, "toon_cl_%s.json" % tag)
+        write_scene(sc,
+                    [entity("Ball", BALL_POS,
+                            {"shape": "sphere", "size": BALL_SIZE,
+                             "name": "toon_cl_ball_%s" % tag},
+                            material_npr("toon_cl_mat_%s" % tag, ramp=ramp,
+                                         char_light=char_light))],
+                    "verify_toon: charlight " + tag, sun=SUN,
+                    light_dir=LIGHT_DIR)
+        shot = os.path.join(OUT_DIR, "toon_cl_%s.png" % tag)
+        env = dict(NPR_ENV)
+        env.update(env_extra)
+        lines, vp, img, errs = run_once(exe, sc, env, shot)
+        check("%s 零 Vulkan 验证层报错" % tag, not errs, errs[:2])
+        if img is None:
+            return None, lines
+        return center_patch(to_np_rgb(img), vp), lines
+
+    # ① 材质不勾：角色光开着也必须与 toon 基线逐像素一致
+    p_noflag, _ = cl_run("noflag", None, False, {})
+    if p_noflag is None:
+        fails.append("charlight noflag 截图")
+    else:
+        d = int((np.abs(p_toon - p_noflag).max(axis=2) > 12).sum())
+        tot = p_noflag.shape[0] * p_noflag.shape[1]
+        print("     材质未勾选时 charlight=on vs 基线：差异 %d px (%.2f%%)"
+              % (d, 100.0 * d / tot))
+        check("材质没勾 useCharacterLight 时画面与基线一致（<0.3%）",
+              d < tot * 0.003, "%d px" % d)
+
+    # ② 勾了 + 角色光开 / 关
+    p_on, lines_on = cl_run("on", None, True, {"MYVK_CHARLIGHT": "1"})
+    p_off, _ = cl_run("off", None, True, {"MYVK_CHARLIGHT": "0"})
+    if p_on is None or p_off is None:
+        fails.append("charlight on/off 截图")
+    else:
+        d2 = int((np.abs(p_on - p_off).max(axis=2) > 12).sum())
+        tot2 = p_on.shape[0] * p_on.shape[1]
+        print("     勾选后 charlight on vs off：差异 %d px (%.1f%%)"
+              % (d2, 100.0 * d2 / tot2))
+        check("勾选后角色光开/关显著不同（>3% 像素）", d2 > tot2 * 0.03,
+              "%d px" % d2)
+        # ③ 比①的噪声大一个量级
+        if p_noflag is not None:
+            d1 = int((np.abs(p_toon - p_noflag).max(axis=2) > 12).sum())
+            check("开/关差异远大于\"材质没勾\"的噪声（>10 倍）",
+                  d2 > max(d1 * 10, tot2 * 0.03), "%d vs %d" % (d2, d1))
+        # 角色光材质跳过 CSM：球的自遮挡阴影应当消失 →
+        # "最暗一小撮像素"占比下降。这是一条独立于方向变化的判据。
+        lo_on = float(np.percentile(luma(p_on), 2))
+        lo_off = float(np.percentile(luma(p_off), 2))
+        print("     2%% 分位亮度  on=%.1f off=%.1f" % (lo_on, lo_off))
+        check("角色光材质不吃 CSM（最暗像素比开 CSM 时更亮）",
+              lo_on >= lo_off - 1.0, "%.1f vs %.1f" % (lo_on, lo_off))
+
+    # ---------------- 第 6 组：面部 SDF 阴影（A1，2026-10-26）----------------
+    # 判据用**三重对照**，而不是"看起来变暗了"：
+    #   ① 白图（处处受光）→ 与基线**逐像素相同**：证明通道没有副作用；
+    #   ② 黑图 + strength=1 → 画面显著变化且**分布塌成一条线**：
+    #      证明掩码真的把每个片元都钉到了同一档；
+    #   ③ 黑图 + strength=0 → 又与基线**逐像素相同**：证明是"强度"这个
+    #      旋钮在起作用，而不是"挂了图就有副作用"。
+    #
+    # ⚠ 这里刻意**不**断言"黑图让画面变暗"。第一次写的就是这条，实测失败：
+    #   本场景的可见半球全在受光档，而受光档被 CSM 自遮挡压到 156；
+    #   Toon 的"暗档"是**冷色中间调**（199），比被压暗的受光面还亮。
+    #   "暗档 ≠ 更暗"是赛璐璐的常识（阴影是有颜色的颜料），用亮度当判据
+    #   本身就是错的 —— 换成"偏冷（B > R）"+ "分布塌缩"。
+    print("\n== 第 6 组：面部 SDF 阴影（A1）==")
+
+    def sdf_run(tag, tex, strength, ramp=None, frac=0.42):
+        sc = os.path.join(OUT_DIR, "toon_sdf_%s.json" % tag)
+        mat = material_npr("toon_sdf_mat_%s" % tag, ramp=ramp)
+        if tex:
+            mat["sdfShadowMap"] = tex
+        mat["sdfShadowStrength"] = strength
+        mat["sdfFaceShift"] = 0.15
+        write_scene(sc,
+                    [entity("Ball", BALL_POS,
+                            {"shape": "sphere", "size": BALL_SIZE,
+                             "name": "toon_sdf_ball_%s" % tag}, mat)],
+                    "verify_toon: sdf " + tag, sun=SUN, light_dir=LIGHT_DIR)
+        shot = os.path.join(OUT_DIR, "toon_sdf_%s.png" % tag)
+        lines, vp, img, errs = run_once(exe, sc, NPR_ENV, shot)
+        check("%s 零 Vulkan 验证层报错" % tag, not errs, errs[:2])
+        if img is None:
+            return None
+        return center_patch(to_np_rgb(img), vp, frac=frac)
+
+    TEX_W = {"kind": "solid", "name": "sdf_white", "color": [255, 255, 255, 255]}
+    TEX_B = {"kind": "solid", "name": "sdf_black", "color": [0, 0, 0, 255]}
+    p_w = sdf_run("white", TEX_W, 1.0)
+    p_b = sdf_run("black", TEX_B, 1.0)
+    p_b0 = sdf_run("black0", TEX_B, 0.0)
+    if p_w is None or p_b is None or p_b0 is None:
+        fails.append("sdf 截图")
+    else:
+        tot = p_b.shape[0] * p_b.shape[1]
+        d_w = int((np.abs(p_toon - p_w).max(axis=2) > 12).sum())
+        d_0 = int((np.abs(p_toon - p_b0).max(axis=2) > 12).sum())
+        d_b = int((np.abs(p_w - p_b).max(axis=2) > 12).sum())
+        print("     白图 vs 基线 %d px | 黑图strength=0 vs 基线 %d px | "
+              "黑 vs 白 %d px (%.1f%%)"
+              % (d_w, d_0, d_b, 100.0 * d_b / tot))
+        check("① 白 SDF（处处受光）与基线逐像素一致（<0.3%）",
+              d_w < tot * 0.003, "%d px" % d_w)
+        check("③ 黑 SDF 但 strength=0 与基线一致（<0.3%）—— 强度是唯一的闸门",
+              d_0 < tot * 0.003, "%d px" % d_0)
+        check("② 黑 SDF（strength=1）画面显著变化（>20% 像素）",
+              d_b > tot * 0.20, "%d px" % d_b)
+
+        l_w, l_b = luma(p_w), luma(p_b)
+        s_w, s_b = float(l_w.std()), float(l_b.std())
+        print("     亮度标准差 白=%.1f 黑=%.1f（塌成一条线 = 全脸同一档）"
+              % (s_w, s_b))
+        check("② 黑 SDF 让明暗分布塌缩（std ≤ 白图的 10%）",
+              s_b <= max(s_w * 0.10, 2.0), "%.1f vs %.1f" % (s_b, s_w))
+
+        # ④ 方向性判据：换成一张**纯红→纯蓝**的两档探针色带
+        #    （assets/ramps/toon_probe_rb.vramp：第 0 档纯红，0.5 起纯蓝）。
+        #    黑 SDF 把 u 钉成 0 → 必须回**纯红**；白 SDF → 红蓝各半。
+        #
+        #    ⚠ 上一版判据是"暖色带下 B/R 更低"，实测判不出来：暖色带的
+        #      暗档 (0.70,0.26,0.20) 与受光档白之间在 tonemap + 天空背景
+        #      稀释之后只差几个百分点，两个数落到 0.76/0.92，看着"反了"
+        #      其实只是分辨率不够。探针色带的红/蓝在通道上**互斥**
+        #      （G 恒 0），任何混合都只能落在中间，没有灰度歧义。
+        #
+        #    ⚠⚠ 这条断言同时是"色带采样坐标"的回归 —— 写它的时候抓到
+        #      一个真 bug：rampMap 用的是共享 REPEAT 采样器，su=0 的纹理
+        #      坐标是 -0.5 纹素，回绕到 255.5，线性过滤把**首末两档各取
+        #      一半**，于是"最暗档"变成了整条色带的平均色 (0.5,0,0.5)。
+        #      缺省色带首末两档都接近白，逐像素完全看不出来。
+        probe_rel = "ramps/toon_probe_rb.vramp"
+        p_rw = sdf_run("rampwhite", TEX_W, 1.0, ramp=probe_rel, frac=0.15)
+        p_rb = sdf_run("rampblack", TEX_B, 1.0, ramp=probe_rel, frac=0.15)
+        if p_rw is None or p_rb is None:
+            fails.append("sdf+ramp 截图")
+        else:
+            def br(a):
+                m = a.reshape(-1, 3).mean(axis=0)
+                return float(m[2] / max(m[0], 1.0)), m
+
+            br_w, m_w2 = br(p_rw)
+            br_b, m_b2 = br(p_rb)
+            print("     探针色带下 白 SDF B/R=%.3f (%.0f,%.0f,%.0f) | "
+                  "黑 SDF B/R=%.3f (%.0f,%.0f,%.0f)"
+                  % (br_w, m_w2[0], m_w2[1], m_w2[2],
+                     br_b, m_b2[0], m_b2[1], m_b2[2]))
+            check("④ 黑 SDF 把整片钉到第 0 档 = 纯红（B/R < 0.2）",
+                  br_b < 0.20, "%.3f" % br_b)
+            check("④ 白 SDF 保持红蓝两档混合（B/R ≥ 黑 SDF 的 3 倍）",
+                  br_w >= max(br_b * 3.0, 0.5), "%.3f vs %.3f" % (br_w, br_b))
+            # 两张图都必须几乎**没有绿**：G 只可能来自色带 tint 之外
+            # （albedo 被 tint 乘掉了、没有局部光、没有自发光）。这一条
+            # 是"颜色真的由色带决定"的旁证，比看主色更直接。
+            check("④ 探针色带把 G 通道压到 ≈0（颜色由色带决定）",
+                  m_w2[1] <= 12 and m_b2[1] <= 12,
+                  "G=%.0f/%.0f" % (m_w2[1], m_b2[1]))
 
     print("\n结果: %s" % ("PASS" if not fails else "FAIL: " + ", ".join(fails)))
     return 0 if not fails else 1

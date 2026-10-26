@@ -191,6 +191,17 @@ inline void iconAnimation(ImDrawList* dl, ImVec2 p, float s, ImU32 col) {
     k.line(0.64f, 0.24f, 0.94f, 0.24f);
 }
 
+// 过场时间轴（C1）：一条轨道 + 三根关键帧刻度 + 一根播放头竖杆。
+// 不用"胶片/场记板"那种画法：19px 下齿孔会糊成虚线，反而像"列表"。
+inline void iconSequence(ImDrawList* dl, ImVec2 p, float s, ImU32 col) {
+    const IconPen k(dl, p, s, col);
+    k.line(0.10f, 0.60f, 0.94f, 0.60f);              // 轨道
+    k.line(0.18f, 0.46f, 0.18f, 0.74f);              // 关键帧刻度
+    k.line(0.46f, 0.46f, 0.46f, 0.74f);
+    k.line(0.74f, 0.46f, 0.74f, 0.74f);
+    k.rectFill(0.60f, 0.14f, 0.66f, 0.46f, 0.0f);    // 播放头
+}
+
 // 全部：三条横杠（列表 = "把上面所有页签摊平"）
 inline void iconAll(ImDrawList* dl, ImVec2 p, float s, ImU32 col) {
     const IconPen k(dl, p, s, col);

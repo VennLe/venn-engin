@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "name": "ch01_open_01",
+  "//": "C2 对话资产的第一份示例。**文件名就是台词 id** —— 时间轴里 {kind:\"Line\", payload:\"ch01_open_01\"} 直接指到这里（下一步接线时按 payload 找 assets/dialogues/<payload>.dlg.json）。speaker 是**显示名**不是 id；同一个名字多处写同一个字符串。id 全局唯一，goto / next 必须指向存在的 id（加载时校验，不合法就整份加载失败）。",
+  "start": "l1",
+  "lines": [
+    {
+      "id": "l1",
+      "speaker": "千夏",
+      "text": "……又是这个梦。",
+      "next": "l2"
+    },
+    {
+      "id": "l2",
+      "speaker": "千夏",
+      "text": "每次都在同一个地方醒过来。\n今天的风，好像有点不一样。",
+      "next": "q1"
+    },
+    {
+      "id": "q1",
+      "speaker": "千夏",
+      "text": "先做什么？",
+      "//": "有 choices 的节点**不能**再写 next —— 加载时会判错（两种语义会给出两种行为）。",
+      "choices": [
+        { "text": "去天台看看", "goto": "roof" },
+        { "text": "回教室再睡一会", "goto": "sleep" }
+      ]
+    },
+    {
+      "id": "roof",
+      "speaker": "千夏",
+      "text": "……果然，今天的天空不正常。",
+      "next": "roof_end"
+    },
+    {
+      "id": "roof_end",
+      "speaker": "我",
+      "text": "（这一段的结局还没写。）"
+    },
+    {
+      "id": "sleep",
+      "speaker": "千夏",
+      "text": "……五分钟。就五分钟。",
+      "next": "sleep_end"
+    },
+    {
+      "id": "sleep_end",
+      "speaker": "我",
+      "text": "（结果睡过头了。）"
+    }
+  ]
+}

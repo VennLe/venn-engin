@@ -417,6 +417,10 @@ std::shared_ptr<Skeleton> buildSkeleton(const ufbx_skin_deformer& skin,
     // 落在这个空间：静止时 jointMat = W·invBind = I（invBind = inv(W_rest)）。
     // push.model（实体变换 = T(-center)）负责归位平移。
     sk->invMeshNode = glm::mat4(1.0f);
+    // B3：ufbx 已经把一切都转成引擎的 Z-up（见文件头），所以骨架空间
+    // **就是**引擎空间，根运动不需要再转一次。
+    // ⚠ 别在这里"顺手"再乘 kYupToZup —— 那会让根运动的方向转错 90°。
+    sk->skeletonToEngine = glm::mat4(1.0f);
 
     // 诊断：静止姿势一致性。jointMat(rest) = W(j) * invBind(j) 应为单位阵。
     {

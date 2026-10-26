@@ -1,0 +1,110 @@
+"""一次性引导脚本：用"从 Content 拖进视口"的既有钩子，导出一份**带子网格
+实体**的场景模板，供 verify_anim_layers.py 改写成各个变体。
+
+为什么必须这么绕（本轮第二大坑，写在这里省得下次重踩）：
+  `skinned` 块只建 `SkinnedMeshComponent`（它只提供 jointBase），真正被渲染
+  的是**每个 submesh 一个子实体**（MeshComponent + MaterialComponent）。
+  手写一个 `{"skinned": {...}}`、`mesh=None` 的实体，日志里
+  `SCENE-SKINNED ok=1 joints=21` 一切正常，**但视口里一个像素都没有** ——
+  于是像素判据全 0%，看起来像"遮罩没生效"。
+  唯一会同时建"组件 + 子网格实体"的地方是 `scene::instantiateModel`，
+  所以先用 `MYVK_EDITOR_IMPORT` + `scene.save` 把模板烤出来，
+  之后所有变体都在这份模板上改 `animator.layers`。
+
+用法：python tools/_boot_anim_layers.py
+产物：<repo>/../_venn_verify/anim_layers_tpl.json + _boot.png
+"""
+
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from capture_window import capture_client, find_window, user32          # noqa: E402
+from verify_add_menu import LogTap, wait_rect                            # noqa: E402
+from verify_shader_variants import OUT_DIR, ROOT                         # noqa: E402
+
+EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
+MODEL = "assets/models/anime_girl.fbx"
+TPL = os.path.join(OUT_DIR, "anim_layers_tpl.json")
+CAM = "3,-3,1.5,45,19.5"
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    if os.path.isfile(TPL):
+        os.remove(TPL)
+    env = dict(os.environ)
+    env.update({
+        "MYVK_EDITOR_SCENE": TPL,
+        "MYVK_EDITOR_IMPORT": MODEL,
+        "MYVK_EDITOR_CAM": CAM,
+        "MYVK_EDITOR_CONSOLE_CMD": "scene.save",
+        "MYVK_EDITOR_NO_HUD": "1",
+        "MYVK_NO_WINDOW_SAVE": "1",
+        "MYVK_NIGHTLY": "0",
+        "MYVK_LOG_RECTS": "1",
+        "MYVK_GRID": "0",
+        "MYVK_TAA": "0",
+        "MYVK_SHADOW": "0",
+    })
+    proc_like = __import__("subprocess").Popen(
+        [EXE], cwd=os.path.dirname(EXE), env=env,
+        stdout=__import__("subprocess").PIPE,
+        stderr=__import__("subprocess").STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1)
+    tap = LogTap()
+    tap.start(proc_like)
+    hwnd = find_window("Venn Editor")
+    if not hwnd:
+        print("FAIL 窗口没出现")
+        return 1
+    user32.ShowWindow(hwnd, 9)
+    time.sleep(1.5)
+    user32.SetWindowPos(hwnd, 0, 0, 0, 1280, 800, 0x0002 | 0x0004)
+    time.sleep(3.0)
+    wait_rect(tap, "VP-RECT", 12.0)
+    end = time.time() + 30
+    while time.time() < end:
+        with tap.lock:
+            saved = any("Scene saved:" in l for l in tap.lines)
+        if saved:
+            break
+        time.sleep(0.3)
+    time.sleep(2.0)
+    img, ok = capture_client(hwnd)
+    if ok and img is not None:
+        img.save(os.path.join(OUT_DIR, "_boot.png"))
+    with tap.lock:
+        lines = list(tap.lines)
+    try:
+        user32.PostMessageW(hwnd, 0x0010, 0, 0)
+    except Exception:
+        pass
+    time.sleep(0.4)
+    if proc_like.poll() is None:
+        proc_like.terminate()
+
+    for l in lines:
+        if any(k in l for k in ("MODEL-INSTANCE", "IMPORT-AUTO", "Scene saved",
+                                "SCENE-SKINNED", "SceneSerializer")):
+            print(l.rstrip())
+    if not os.path.isfile(TPL):
+        print("FAIL 模板没落盘")
+        return 1
+    with open(TPL, encoding="utf-8") as f:
+        doc = json.load(f)
+    print("--- entities ---")
+    for i, e in enumerate(doc.get("entities", [])):
+        print(i, e.get("name"), "parent=", e.get("parent"),
+              "mesh=", bool(e.get("mesh")), "skinned=", bool(e.get("skinned")),
+              "animator=", bool(e.get("animator")))
+    print("--- keys ---", sorted(doc.keys()))
+    print("--- camera ---", doc.get("camera"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

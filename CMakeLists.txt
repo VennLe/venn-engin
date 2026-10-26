@@ -840,6 +840,16 @@ function(myvk_copy_runtime_assets target)
             # 同样是"改一次就想立刻看到"的资产（调一个转移的 duration 要
             # 马上能试手感），所以进每次都拷这一档。
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/animators|assets/animators"
+            # A6（2026-10-26）：Toon 色带（`.vramp`）。美术调一档阴影颜色就要
+            # 立刻看到效果 —— 不重新链接就看不到是最伤迭代速度的一类 bug，
+            # 所以同样进"每次都拷"这一档。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/ramps|assets/ramps"
+            # C1（2026-10-26）：过场时间轴（`.seq.json`）。调一段运镜的关键帧
+            # 要能"改完就看到"，所以同样进"每次都拷"这一档。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/sequences|assets/sequences"
+            # C2（2026-10-26）：对话资产（`.dlg.json`）。写台词是**最高频**的
+            # 迭代动作（改一个字就要看效果），必须每次都拷。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/dialogues|assets/dialogues"
         )
         set(always_asset_cmds "")
         foreach(item IN LISTS VENN_ALWAYS_ASSET_DIRS)

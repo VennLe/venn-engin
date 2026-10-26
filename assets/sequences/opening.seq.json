@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "name": "opening",
+  "//": "yaw / pitch 单位是 **弧度**（与 assets/scenes/*.json 的 camera 块同一口径，不是度）。ease 描述的是'从这一帧到下一帧'的插值方式：smooth = 平滑（默认），linear = 匀速，step = 这一段保持本帧、到下一帧那一刻**硬切**过去。所以硬切的切点落在**下一个关键帧**上 —— 想在第 4 秒切镜头，就把 step 写在 2.5 秒那一帧上。",
+  "loop": false,
+  "duration": 8.0,
+
+  "camera": [
+    { "t": 0.0, "pos": [5.5, -1.2, 1.90], "yaw": 0.20,  "pitch": -0.12, "fov": 45.0, "ease": "smooth" },
+    { "t": 2.5, "pos": [3.0, -0.7, 1.55], "yaw": 0.22,  "pitch": -0.09, "fov": 42.0, "ease": "step"   },
+    { "t": 4.0, "pos": [1.6,  1.4, 1.35], "yaw": -0.72, "pitch": -0.06, "fov": 38.0, "ease": "smooth" },
+    { "t": 6.0, "pos": [2.2, -2.2, 0.55], "yaw": 0.79,  "pitch":  0.10, "fov": 50.0, "ease": "smooth" },
+    { "t": 8.0, "pos": [6.5,  0.0, 2.40], "yaw": 0.00,  "pitch": -0.16, "fov": 45.0 }
+  ],
+
+  "events": [
+    { "t": 0.0, "kind": "Fade",     "payload": "in"           },
+    { "t": 1.2, "kind": "Footstep", "payload": "left"         },
+    { "t": 4.0, "kind": "Line",     "payload": "ch01_open_01" },
+    { "t": 6.5, "kind": "Music",    "payload": "calm_loop"    }
+  ]
+}

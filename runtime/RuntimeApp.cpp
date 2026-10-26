@@ -15,6 +15,7 @@
 #include "scene/SceneSerializer.h"
 #include "script/ScriptEngine.h"
 #include "script/ScriptRuntime.h"
+#include "sequence/SequencerSystem.h"
 #include "ui2/UiCanvas.h"
 
 #include <GLFW/glfw3.h>
@@ -565,6 +566,19 @@ void RuntimeApp::onInit() {
         // 用**真实帧时长**（不是固定步）：镜头不该被 timeScale 冻结。
         if (m_player)
             scene::activeCameraSystem().setDesiredPose(m_player->cameraPose());
+        // ---- 过场时间轴（C1）----
+        // ⚠⚠ 位置是硬约束：**玩家之后、`update()` 之前**。
+        //   · 排在玩家之前 → 每帧被玩家的相机意图覆盖（过场根本不动）
+        //   · 排在 update 之后 → 这一帧的运镜丢掉（画面退化成玩家视角）
+        // 用同一个 vdt：过场是表现层的东西，暂停时该一起停。
+        //
+        // 时间轴本身**不碰相机系统**（见 SequencerSystem.h），这里显式把
+        // 它的意图喂进去 —— 走 desired 才能让震动叠在运镜上。
+        // 没有 pose（没在播 / 播完）时**什么都不做**，玩家相机自然接管。
+        sequence::SequencerSystem& seq = sequence::activeSequencerSystem();
+        seq.tick(activeScene(), vdt);
+        if (seq.hasPose())
+            scene::activeCameraSystem().setDesiredPose(seq.pose());
         scene::activeCameraSystem().update(activeScene(), vdt);
     };
     m_svc.renderWorld = [this] {

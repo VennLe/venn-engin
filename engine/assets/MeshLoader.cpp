@@ -548,7 +548,8 @@ glm::vec4 readVec4(const AccessorView& v, size_t i) {
 // 渲染代码无需感知节点树。
 std::shared_ptr<Skeleton> parseSkeleton(const tinygltf::Model& gm,
                                         int skinIdx,
-                                        const glm::mat4& meshNodeWorld) {
+                                        const glm::mat4& meshNodeWorld,
+                                        const glm::mat4& skeletonToEngine) {
     if (skinIdx < 0 || skinIdx >= static_cast<int>(gm.skins.size()))
         return nullptr;
     const auto& skin = gm.skins[skinIdx];
@@ -646,6 +647,8 @@ std::shared_ptr<Skeleton> parseSkeleton(const tinygltf::Model& gm,
         if (!done[j]) sk->topoOrder.push_back(j);
 
     sk->invMeshNode = glm::inverse(meshNodeWorld);
+    // B3：告诉上层"这份 joints 在哪个坐标系里" —— 见 Skeleton.h 的字段注释。
+    sk->skeletonToEngine = skeletonToEngine;
     return sk;
 }
 
@@ -973,7 +976,8 @@ std::unique_ptr<Model> loadGLTFModel(rhi::Device& device,
 
     // ---- 蒙皮骨架 + 动画 ----
     if (foundSkin) {
-        model->skeleton = parseSkeleton(gm, skinnedSkinIdx, skinnedMeshWorld);
+        model->skeleton = parseSkeleton(gm, skinnedSkinIdx, skinnedMeshWorld,
+                                        kYupToZup);
         if (model->skeleton) {
             parseAnimations(gm, *model->skeleton);
             VK_LOG_INFO("glTF: skinned model, %d joints, %d clips",

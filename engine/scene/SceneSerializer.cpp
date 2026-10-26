@@ -198,6 +198,15 @@ json overridesToJson(const assets::Material::Params& p, std::uint32_t bits) {
     if (bits & M::kOvSdfShadowStrength)
         j["sdfShadowStrength"] = p.sdfShadowStrength;
     if (bits & M::kOvDetailStrength) j["detailStrength"] = p.detailStrength;
+    // A6（2026-10-26）：色带的交界位置/宽度
+    if (bits & M::kOvRampEdge) j["rampEdge"] = p.rampEdge;
+    if (bits & M::kOvRampSoftness) j["rampSoftness"] = p.rampSoftness;
+    if (bits & M::kOvAnisoStrength) j["anisoStrength"] = p.anisoStrength;
+    if (bits & M::kOvAnisoShift) j["anisoShift"] = p.anisoShift;
+    // A3（2026-10-26）：眼睛的 unlit 权重 / 虹膜视差 / 眼神光
+    if (bits & M::kOvEyeStrength) j["eyeStrength"] = p.eyeStrength;
+    if (bits & M::kOvEyeIrisDepth) j["eyeIrisDepth"] = p.eyeIrisDepth;
+    if (bits & M::kOvEyeCatchlight) j["eyeCatchlight"] = p.eyeCatchlight;
     if (bits & M::kOvDetailTiling) j["detailTiling"] = p.detailTiling;
     return j;
 }
@@ -295,6 +304,37 @@ std::uint32_t overridesFromJson(const json& jo, assets::Material::Params& p) {
     if (jo.contains("detailTiling")) {
         p.detailTiling = jo.value("detailTiling", p.detailTiling);
         bits |= M::kOvDetailTiling;
+    }
+    // A6（2026-10-26）
+    if (jo.contains("rampEdge")) {
+        p.rampEdge = jo.value("rampEdge", p.rampEdge);
+        bits |= M::kOvRampEdge;
+    }
+    if (jo.contains("rampSoftness")) {
+        p.rampSoftness = jo.value("rampSoftness", p.rampSoftness);
+        bits |= M::kOvRampSoftness;
+    }
+    // A4（2026-10-26）：头发各向异性强度 / 环位置
+    if (jo.contains("anisoStrength")) {
+        p.anisoStrength = jo.value("anisoStrength", p.anisoStrength);
+        bits |= M::kOvAnisoStrength;
+    }
+    if (jo.contains("anisoShift")) {
+        p.anisoShift = jo.value("anisoShift", p.anisoShift);
+        bits |= M::kOvAnisoShift;
+    }
+    // A3（2026-10-26）：眼睛三字段
+    if (jo.contains("eyeStrength")) {
+        p.eyeStrength = jo.value("eyeStrength", p.eyeStrength);
+        bits |= M::kOvEyeStrength;
+    }
+    if (jo.contains("eyeIrisDepth")) {
+        p.eyeIrisDepth = jo.value("eyeIrisDepth", p.eyeIrisDepth);
+        bits |= M::kOvEyeIrisDepth;
+    }
+    if (jo.contains("eyeCatchlight")) {
+        p.eyeCatchlight = jo.value("eyeCatchlight", p.eyeCatchlight);
+        bits |= M::kOvEyeCatchlight;
     }
     return bits;
 }
@@ -433,6 +473,24 @@ json materialToJson(const assets::Material* mat) {
     j["detailMap"] = textureSourceToJson(mat->detailMap);
     j["detailStrength"] = mat->detailStrength;
     j["detailTiling"] = mat->detailTiling;
+    // A6/A1/A5（2026-10-26）。全量写（同 heightScale 的风格）。
+    // ⚠ `rampPath` 是**相对 assets/ 的路径**，不是缓存键 —— 缓存键带
+    //   加载时的 name 前缀，写进存档换台机器就找不到了。
+    j["rampPath"] = mat->rampPath;
+    j["rampEdge"] = mat->rampEdge;
+    j["rampSoftness"] = mat->rampSoftness;
+    j["sdfFaceShift"] = mat->sdfFaceShift;
+    j["useCharacterLight"] = mat->useCharacterLight;
+    // A4（2026-10-26）：头发各向异性。**只在非 0 时写**（0 是缺省 = 关），
+    // 这样没开这个特性的场景 JSON 与引入之前逐字节相同 —— 老场景不会被
+    // 多出两行"看起来像改过"的字段。
+    if (mat->anisoStrength != 0.0f) j["anisoStrength"] = mat->anisoStrength;
+    if (mat->anisoShift != 0.0f) j["anisoShift"] = mat->anisoShift;
+    // A3（2026-10-26）：眼睛。同样**只在非 0 时写** —— 三个字段的缺省都是 0
+    // （= 不吃眼睛通道），所以没配眼睛的场景与引入之前逐字节相同。
+    if (mat->eyeStrength != 0.0f) j["eyeStrength"] = mat->eyeStrength;
+    if (mat->eyeIrisDepth != 0.0f) j["eyeIrisDepth"] = mat->eyeIrisDepth;
+    if (mat->eyeCatchlight != 0.0f) j["eyeCatchlight"] = mat->eyeCatchlight;
     return j;
 }
 
@@ -718,12 +776,15 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
                              : assets::Material::AlphaMode::Opaque;
         // alphaMode 字符串优先（新格式）。缺席时退回上面的 alphaBlend 布尔
         // —— 老场景文件没有这个字段，不能因此把 Mask/Blend 读丢。
-        const std::string am = jm.value("alphaMode", std::string());
-        if (am == "blend") {
+        // ⚠ 变量名**不能叫 am** —— 那是本函数的参数（AssetManager&），
+        //   遮蔽之后 `am.loadRampAsset(...)` 会编译成 "std::string 没有
+        //   这个成员"（2026-10-26 实测踩过）。
+        const std::string alphaModeStr = jm.value("alphaMode", std::string());
+        if (alphaModeStr == "blend") {
             mat->alphaMode = assets::Material::AlphaMode::Blend;
-        } else if (am == "mask") {
+        } else if (alphaModeStr == "mask") {
             mat->alphaMode = assets::Material::AlphaMode::Mask;
-        } else if (am == "opaque") {
+        } else if (alphaModeStr == "opaque") {
             mat->alphaMode = assets::Material::AlphaMode::Opaque;
         }
         mat->alphaCutoff = jm.value("alphaCutoff", 0.5f);
@@ -738,6 +799,38 @@ assets::Material* resolveMaterial(assets::AssetManager& am, const json& jm) {
         // 与改造前逐像素一致。
         mat->renderQueue = jm.value("renderQueue", mat->renderQueue);
         mat->sortOrder = jm.value("sortOrder", mat->sortOrder);
+        // A6/A1/A5（2026-10-26）
+        mat->rampEdge = jm.value("rampEdge", mat->rampEdge);
+        mat->rampSoftness = jm.value("rampSoftness", mat->rampSoftness);
+        mat->sdfFaceShift = jm.value("sdfFaceShift", mat->sdfFaceShift);
+        mat->useCharacterLight = jm.value("useCharacterLight", false);
+        // A4（2026-10-26）：头发各向异性。缺省 0 = 关，所以老场景读回来
+        // 就是"关"，与引入这条通道之前逐像素相同。
+        mat->anisoStrength = jm.value("anisoStrength", 0.0f);
+        mat->anisoShift = jm.value("anisoShift", 0.0f);
+        // A3（2026-10-26）：眼睛。缺省全是 0 = 关 → 老场景读回来与引入
+        // 这条通道之前逐像素相同。
+        mat->eyeStrength = jm.value("eyeStrength", 0.0f);
+        mat->eyeIrisDepth = jm.value("eyeIrisDepth", 0.0f);
+        mat->eyeCatchlight = jm.value("eyeCatchlight", 0.0f);
+        // 色带资产：**有 rampPath 就以它为准**，把 rampMap 换成资产烘出来的
+        // 纹理。理由：rampMap 存的是"纹理来源"（file/solid/checker），而色带
+        // 是**程序化烘出来的**，那条路根本表达不了 bands —— 只靠 rampMap
+        // 往返会把色带退化成一张静态图，编辑界面上再也改不动。
+        // 顺序上必须在 `mat->rampMap = rampMap;` 之后（见上）。
+        const std::string rampPath = jm.value("rampPath", std::string());
+        if (!rampPath.empty()) {
+            if (assets::RampAsset* ra = am.loadRampAsset(rampPath)) {
+                mat->ramp = ra;
+                mat->rampPath = rampPath;
+                mat->rampMap = ra->texture.get();
+            } else {
+                // 资产丢了：保留 rampMap（可能是一张手工贴的渐变图），
+                // 但清掉 ramp 指针，免得界面显示"有色带"却改不动。
+                mat->ramp = nullptr;
+                mat->rampPath.clear();
+            }
+        }
     }
     return mat;
 }
@@ -1651,10 +1744,69 @@ json animatorToJson(const ecs::AnimatorComponent& an) {
     j["playing"] = an.playing;
     j["loop"] = an.loop;
     j["rootMotion"] = static_cast<int>(an.rootMotion);
+    // 根运动骨名（B3）：**只在非空时写** —— 老场景没有这个键，输出逐字节
+    // 不变。空 = 自动，而"自动"是读档时的同一份默认值，所以不写也是对的。
+    if (!an.rootMotionBone.empty()) j["rootMotionBone"] = an.rootMotionBone;
     // 骨架来源只在**显式给过**的时候才写：空 = 用 skinned 那一份。
     // 写一个空对象会让读档的人以为"这里本来有东西被清掉了"。
     json src = modelSourceToJson(an.model);
     if (!src.is_null()) j["model"] = std::move(src);
+
+    // ---- 附加动画层（B1，2026-10-26）----
+    // ⚠ **只在非空时写这个键**：老场景没有 `layers` → 输出逐字节不变，
+    //   回归快照与"存档 diff"都不受影响。这与 SkinnedMesh 的 fade 四件套
+    //   同一个纪律。
+    // ⚠ 运行时字段（playingClip / time / fadeT）**一律不写**：它们是"这一
+    //   帧正在发生的事"，读档时恢复半个淡入比不复原更怪；而且它们每帧都在
+    //   变，写进去会让 `structuralEdit` 的快照前后永不相等（每次改一个
+    //   滑块都会进一条"什么都没变"的撤销记录）。
+    if (!an.layers.empty()) {
+        json arr = json::array();
+        for (const ecs::AnimLayer& L : an.layers) {
+            json o;
+            o["name"] = L.name;
+            o["clip"] = L.clip;
+            o["weight"] = L.weight;
+            o["speed"] = L.speed;
+            o["loop"] = L.loop;
+            o["playing"] = L.playing;
+            o["fadeDur"] = L.fadeDur;
+            // 遮罩：All + 空 roots 是默认值，不写（读回来也是它）
+            if (!L.mask.isAll()) {
+                json m;
+                m["mode"] = static_cast<int>(L.mask.mode);
+                m["roots"] = L.mask.roots;
+                o["mask"] = std::move(m);
+            }
+            arr.push_back(std::move(o));
+        }
+        j["layers"] = std::move(arr);
+    }
+
+    // ---- 动画事件（B2，2026-10-26）----
+    // 同一条纪律：**只在非空时写**（老场景逐字节不变）。每段 clip 一个对象，
+    // 空事件表也跳过 —— 一个只有 clip 名的空表在语义上和"没有这段"完全一样，
+    // 写出去只会在存档 diff 里多一行噪音。
+    if (!an.eventTracks.empty()) {
+        json arr = json::array();
+        for (const animation::AnimEventTrack& tr : an.eventTracks) {
+            if (tr.clip.empty() || tr.events.empty()) continue;
+            json evs = json::array();
+            for (const animation::AnimEvent& e : tr.events) {
+                json eo;
+                eo["t"] = e.time;
+                eo["kind"] = e.kind;
+                // payload 空 → 不写（绝大多数事件没有参数）
+                if (!e.payload.empty()) eo["payload"] = e.payload;
+                evs.push_back(std::move(eo));
+            }
+            json to;
+            to["clip"] = tr.clip;
+            to["events"] = std::move(evs);
+            arr.push_back(std::move(to));
+        }
+        if (!arr.empty()) j["events"] = std::move(arr);
+    }
     return j;
 }
 
@@ -1679,15 +1831,134 @@ bool animatorFromJson(assets::AssetManager& am, const json& j,
     out.rootMotion = (rm >= 0 && rm <= 2)
                          ? static_cast<ecs::AnimatorComponent::RootMotionMode>(rm)
                          : ecs::AnimatorComponent::RootMotionMode::Off;
+    // 根运动骨名（B3）。空 = 自动（第一根 parent == -1 的骨）。
+    out.rootMotionBone = j.value("rootMotionBone", std::string());
+
+    // ---- 附加动画层（B1）----
+    // 容错优先：单条坏数据（不是对象 / roots 不是数组）只丢**那一条**，
+    // 不能连累整块 animator 配置。理由与文件头一致 —— 用户下次打开工程
+    // 发现"动画时间被重置"比"少了一个层"严重得多。
+    out.layers.clear();
+    if (j.contains("layers") && j["layers"].is_array()) {
+        for (const json& lo : j["layers"]) {
+            if (!lo.is_object()) continue;
+            ecs::AnimLayer L;
+            L.name = lo.value("name", std::string("Layer"));
+            L.clip = lo.value("clip", std::string());
+            L.weight = lo.value("weight", 1.0f);
+            L.speed = lo.value("speed", 1.0f);
+            L.loop = lo.value("loop", true);
+            L.playing = lo.value("playing", true);
+            L.fadeDur = lo.value("fadeDur", 0.15f);
+            if (lo.contains("mask") && lo["mask"].is_object()) {
+                const json& m = lo["mask"];
+                animation::BoneMaskMode mode = animation::BoneMaskMode::All;
+                // 越界 / 非整数 → 保持 All（= 这一层不按骨过滤），
+                // 而不是"随便挑一个模式"—— 后者会让角色突然少半边身子。
+                animation::boneMaskModeFromInt(m.value("mode", 0), &mode);
+                L.mask.mode = mode;
+                if (m.contains("roots") && m["roots"].is_array()) {
+                    for (const json& r : m["roots"]) {
+                        if (r.is_string())
+                            L.mask.roots.push_back(r.get<std::string>());
+                    }
+                }
+            }
+            // 运行时：重置（与上面 stateIndex 同一理由）
+            L.playingClip.clear();
+            L.time = 0.0f;
+            L.fadeT = 1.0f;
+            out.layers.push_back(std::move(L));
+        }
+    }
+
+    // ---- 动画事件（B2）----
+    // 与 layers 同一套容错：坏的一条只丢那一条。事件表本身按时间升序整理
+    // 一次 —— 文件可能是手写的 / 用户拖过时间输入框（把 0.8 改成 0.2），
+    // 而分发侧假设"表里顺序即时间顺序"只在同刻多事件时有意义，整理一遍
+    // 让"同刻事件的先后"变成可复现的。
+    out.eventTracks.clear();
+    if (j.contains("events") && j["events"].is_array()) {
+        for (const json& to : j["events"]) {
+            if (!to.is_object()) continue;
+            animation::AnimEventTrack tr;
+            tr.clip = to.value("clip", std::string());
+            if (tr.clip.empty()) continue;   // 没 clip 名 = 挂不上，丢掉
+            if (to.contains("events") && to["events"].is_array()) {
+                for (const json& eo : to["events"]) {
+                    if (!eo.is_object()) continue;
+                    animation::AnimEvent e;
+                    e.time = eo.value("t", 0.0f);
+                    e.kind = eo.value("kind", std::string());
+                    e.payload = eo.value("payload", std::string());
+                    // ⚠ 负时间 / 越界时间**照收**（不 clamp）：写错的事件应该
+                    //   在面板上看得见并从"永远不发"里被发现，而不是读档时
+                    //   被悄悄改成 0 —— 那会变成"开场每圈都响一次"。
+                    tr.events.push_back(std::move(e));
+                }
+            }
+            if (tr.events.empty()) continue;
+            animation::sortAnimEventTrack(tr);
+            out.eventTracks.push_back(std::move(tr));
+        }
+    }
+
     // 运行时：一律重置（绝不能从文件里读回来，那会让"这一局"的状态
     // 跟着存档走）
     out.stateIndex = -1;
     out.stateTime = 0.0f;
     out.appliedDefaultClip = false;
+    // 事件的播放头同理：读档 = 从这一帧重新开始数
+    out.eventClip.clear();
+    out.eventPrev = 0.0f;
+    // 根运动的"上一帧"同理，而且**更要紧**：留着上一局的基准矩阵，
+    // 读档后的第一帧会算出 `cur - 上一局的 cur` —— 如果两局之间角色被
+    // 搬到别处，那是一个巨大的位移，读档瞬间角色直接飞出去。
+    out.rootPrevValid = false;
+    out.rootPrevWorld = glm::mat4(1.0f);
+    out.rootBasePos = glm::vec3(0.0f);
+    out.rootDelta = animation::RootMotionDelta{};
     out.floatParams.clear();
     out.boolParams.clear();
     out.triggerParams.clear();
     return true;
+}
+
+// ---------------- 过场时间轴（C1，2026-10-26）----------------
+//
+// 只存**纯数据**（路径 / 播放控制 / 优先级）。资产内容不落进场景：
+// `.seq.json` 是独立资产，两个场景可以引用同一段过场，把内容抄进场景
+// 就会出现"改一处只更新了一个场景"的分叉。
+//
+// ⚠ 运行时字段（asset / playhead / started / finished / loadFailedLogged）
+//   一律不写 —— 理由与 animator 那边一样：读档后应该从 `startTime` 重新
+//   起播，而不是接着上次的位置（那是存档系统的活，不是场景的）。
+json sequencerToJson(const ecs::SequencerComponent& sc) {
+    json j;
+    j["path"] = sc.sequencePath;
+    j["enabled"] = sc.enabled;
+    j["playing"] = sc.playing;
+    j["loop"] = sc.loop;
+    j["startTime"] = sc.startTime;
+    j["speed"] = sc.speed;
+    j["priority"] = sc.priority;
+    return j;
+}
+
+bool sequencerFromJson(const json& j, ecs::SequencerComponent& out) {
+    if (!j.is_object()) return false;
+    out = ecs::SequencerComponent{};
+    out.sequencePath = j.value("path", std::string());
+    out.enabled = j.value("enabled", true);
+    out.playing = j.value("playing", true);
+    out.loop = j.value("loop", false);
+    out.startTime = j.value("startTime", 0.0f);
+    out.speed = j.value("speed", 1.0f);
+    out.priority = j.value("priority", 0);
+    // 路径空 → 组件等于没配，**不建**（返回 false 让调用方跳过）。
+    // 否则场景里会留一堆"配了但什么也不做"的实体，Inspector 上看着像
+    // 功能坏了。
+    return !out.sequencePath.empty();
 }
 
 // ---------------- 弹簧骨 / LookAt（L2/L4 表演层，2026-10-25）----------------
@@ -2630,6 +2901,22 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
         if (const auto* at = w.get<ecs::BoneAttachmentComponent>(it.entity))
             je["attach"] = attachToJson(*at);
 
+        // 过场时间轴（C1，2026-10-26）。挂在任意实体上；同一场景可以挂多段，
+        // 由 priority 决定这一帧谁在跑。空路径不写（与 animClip 同一条理由：
+        // 别给每个实体都添一个空块，场景 diff 会全是噪音）。
+        if (const auto* sq = w.get<ecs::SequencerComponent>(it.entity)) {
+            if (!sq->sequencePath.empty()) {
+                je["sequencer"] = sequencerToJson(*sq);
+                VK_LOG_INFO("SCENE-SEQUENCER entity=%u path=%s dur=%.3f "
+                            "keys=%d events=%d pri=%d",
+                            static_cast<unsigned>(it.entity.id),
+                            sq->sequencePath.c_str(),
+                            static_cast<double>(sq->asset.duration),
+                            static_cast<int>(sq->asset.cameraKeys.size()),
+                            static_cast<int>(sq->asset.events.size()), sq->priority);
+            }
+        }
+
         // 实体 transform 关键帧轨道（编辑器 Animation 模式的产物）。
         // 空轨道**不写** —— 否则每个用过的实体都会多一个 {"keys":[]}，
         // 场景文件的 diff 全是噪音。
@@ -2734,6 +3021,10 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
             je.contains("ik") || je.contains("attach") ||
             je.contains("animClip") || je.contains("gameStart") ||
             je.contains("animKeys") ||
+            // C1 过场时间轴。挂它的实体**通常没有网格**（就是一根"导演轨"），
+            // 漏在这里会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+            // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
+            je.contains("sequencer") ||
             je.contains("pointLight") || je.contains("spotLight") ||
             je.contains("directionalLight") || je.contains("player") ||
             je.contains("playerLimb") || je.contains("folder");
@@ -2953,6 +3244,23 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
             } else {
                 VK_LOG_INFO("SCENE-ANIMATOR entity=%u ok=0",
                             static_cast<unsigned>(e.id));
+            }
+        }
+
+        // 过场时间轴（C1）。与 springBone 那几块无关，位置随意；
+        // 资产是**懒加载**的（第一次 tick 才读盘），所以这里只存路径。
+        if (je.contains("sequencer")) {
+            ecs::SequencerComponent sq;
+            if (sequencerFromJson(je["sequencer"], sq)) {
+                if (auto* p = w.get<ecs::SequencerComponent>(e))
+                    *p = sq;
+                else
+                    w.add<ecs::SequencerComponent>(e, sq);
+                VK_LOG_INFO("SCENE-SEQUENCER entity=%u path=%s pri=%d ok=1",
+                            static_cast<unsigned>(e.id), sq.sequencePath.c_str(),
+                            sq.priority);
+            } else {
+                VK_LOG_INFO("SCENE-SEQUENCER entity=%u ok=0", static_cast<unsigned>(e.id));
             }
         }
 
@@ -3280,6 +3588,10 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
             je.contains("ik") || je.contains("attach") ||
             je.contains("animClip") || je.contains("gameStart") ||
             je.contains("animKeys") ||
+            // C1 过场时间轴。挂它的实体**通常没有网格**（就是一根"导演轨"），
+            // 漏在这里会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+            // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
+            je.contains("sequencer") ||
             je.contains("pointLight") || je.contains("spotLight") ||
             je.contains("directionalLight") || je.contains("player") ||
             je.contains("playerLimb") || je.contains("folder");

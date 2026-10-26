@@ -1,0 +1,98 @@
+"""临时：探"角色到底多大 / 为什么只有两个小坨"。
+
+用模板（9 个实体，根 `anime_girl` 带 7 个子网格）改几组参数各拍一张：
+  · v1 相机凑近（1.2 m）
+  · v2 根节点放大 4 倍（feet 补偿）
+  · v3 放大 4 倍 + 相机 2.6 m
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from capture_window import capture_client, find_window, user32          # noqa: E402
+from verify_add_menu import LogTap, wait_rect                            # noqa: E402
+from verify_shader_variants import OUT_DIR, ROOT                         # noqa: E402
+
+EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
+TPL = os.path.join(OUT_DIR, "anim_layers_tpl.json")
+
+
+def make(name, scale, cam):
+    with open(TPL, encoding="utf-8") as f:
+        doc = json.load(f)
+    for e in doc["entities"]:
+        if e.get("skinned"):
+            base = e["transform"]["position"][2]
+            e["transform"]["scale"] = [scale, scale, scale]
+            e["transform"]["position"][2] = base * scale
+    doc["camera"]["distance"] = 9.0
+    p = os.path.join(OUT_DIR, "probe_%s.json" % name)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1)
+    return p
+
+
+def shot(tag, scene, cam):
+    env = dict(os.environ)
+    env.update({
+        "MYVK_EDITOR_SCENE": scene,
+        "MYVK_EDITOR_CAM": cam,
+        "MYVK_EDITOR_NO_HUD": "1",
+        "MYVK_NO_WINDOW_SAVE": "1",
+        "MYVK_GRID": "0", "MYVK_TAA": "0", "MYVK_SHADOW": "0",
+        "MYVK_LOG_RECTS": "1",
+    })
+    p = subprocess.Popen([EXE], cwd=os.path.dirname(EXE), env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, encoding="utf-8", errors="replace",
+                         bufsize=1)
+    tap = LogTap()
+    tap.start(p)
+    hwnd = find_window("Venn Editor")
+    if not hwnd:
+        print("FAIL window", tag)
+        return
+    user32.ShowWindow(hwnd, 9)
+    time.sleep(1.5)
+    user32.SetWindowPos(hwnd, 0, 0, 0, 1280, 800, 0x0002 | 0x0004)
+    time.sleep(2.5)
+    wait_rect(tap, "VP-RECT", 12.0)
+    end = time.time() + 20
+    while time.time() < end:
+        with tap.lock:
+            n = sum(1 for l in tap.lines if "ANIM-TICK " in l)
+        if n >= 2:
+            break
+        time.sleep(0.25)
+    time.sleep(1.2)
+    img, ok = capture_client(hwnd)
+    if ok and img is not None:
+        img.save(os.path.join(OUT_DIR, "probe_%s.png" % tag))
+        print("shot", tag, img.size)
+    try:
+        user32.PostMessageW(hwnd, 0x0010, 0, 0)
+    except Exception:
+        pass
+    time.sleep(0.4)
+    if p.poll() is None:
+        p.terminate()
+
+
+def main():
+    jobs = [
+        ("v1", 1.0, "1.20,-1.20,0.90,45,10"),
+        ("v2", 4.0, "2.60,-2.60,1.20,45,8"),
+        ("v3", 4.0, "1.60,-1.60,1.00,45,6"),
+    ]
+    for tag, sc, cam in jobs:
+        shot(tag, make(tag, sc, cam), cam)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

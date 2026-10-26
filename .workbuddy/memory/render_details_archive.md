@@ -1533,3 +1533,61 @@ Window::show()     → glfwShowWindow + glfwFocusWindow + VK_LOG_INFO("Window sh
 - `loadEditorPrefs`：`json["version"] < kPrefsVersion`（**含缺 version 的老档**）→ **整份丢弃**、
   回出厂默认，并 `VK_LOG_INFO` 打出"seen=vN, need=v2, 已忽略"。
 - 这样**改默认值**时才不会被老档顶回（本轮的吸附默认 / 栅格默认正依赖它生效）。
+
+## 二次元着色 A1~A6 + 动画层 B1（2026-10-26 从 MEMORY.md 迁入的细则）
+
+权威 → `docs/anime_gap_review_2026-10-26.md` §2/§3 + 「B1 落地记录」。这里只留**迁移原文**。
+
+### A1~A6 着色
+
+- **A 类槽（ramp/matcap/SDF/detail/aniso/eye）+ 角色光只在 `VENN_BINDLESS` 编译单元里存在**，
+  而 `MYVK_BINDLESS` **默认关** → 不开就是"全部静默失效、零报错"。**A 类槽验收必须带它**。
+  材质页 **112 B / 7 块**：`params=(steps|−1, matcap, sdfStrength, detailStrength)`／
+  `params2=(tiling, rotate, rampEdge, rampSoftness)`／`spare=(useCharLight, sdfShift, anisoStrength,
+  anisoShift)`／`spare2=(eyeStrength, eyeIrisDepth, eyeCatchlight, 预留)`。
+- **色带/1D LUT 的 `u=0` 会被共享 REPEAT 采样器回绕** → 首末各取一半 = **整条 LUT 平均色**。
+  采样前夹到首末纹素中心（`0.5/textureSize(t,0).x`）；查法 = **纯红→纯蓝探针**（混成
+  `(0.5,0,0.5)` 就是中招；缺省色带首末都近白，逐像素看不出来）。
+  **"白 ramp = 恒等"在 A6 之后不成立**（色带三通道**接管**明暗曲线）→ 恒等律落点是 `params.x = -1`。
+- 赛璐璐 **"暗档 ≠ 更暗"** → 判据用**分布塌缩(std)** + **方向性主色**，别用"亮度下降"。
+- **A4 各向异性**：切线走顶点 **location 9** → `pbr.vert vTangent` → Kajiya-Kay 双环。
+  **`shiftTangent` 必须是 `normalize(T + N*shift)`** —— "先投影再沿法线推"（`T - N*dot(N,T)*s`）
+  在 `dot(N,T)==0` 已成立时推的量恒为 0，**shift 变死参数且画面逐像素相同**（像 UI 没接线）。
+  `attributeDescriptions()` 必须同步加 9；零长度切线**原样传 0**（`normalize(0)`=NaN）。
+- **A3 眼睛**：Unlit 底 = **整段替换**光照和（加法覆盖不了"暗部被压暗"）；虹膜视差在**所有采样
+  之前**偏移 `matUV`；眼神光 = 视图空间法线上两个高斯光斑（锁头朝向、不锁光源）。
+- **"某特性不吃 X"必须用对照材质自证响应度**：A3 判"翻太阳眼睛 0 px"，而"场景本来对光
+  不敏感"时照样 0 px → 同场景必须跑 `eyeStrength=0` 的对照（实测 19.58%）。这是"带对照区"
+  在**响应度**维度上的版本（A4 的对照区是空间维度）。
+- **相机 yaw 是 `yaw = 180° − φ`，不是 φ**（`forward = -angleDir()`，水平 `(-cos,+sin)`）。
+  A3 第一版写反 → **根本没拍到目标**（零暗像素），"0 px 变化"看着像没接线。
+  **诊断顺序：先确认被测物在画面里，再谈它动没动。**
+- **周期图案（棋盘）判不了"位移方向"**：位移过半格时变化像素数**饱和**，质心又把
+  "接缝移动"和"面积变化"混成一个数。判方向要用非周期贴图 + 相位相关（= 要美术资产）。
+
+### B1 动画层 / 骨骼遮罩
+
+- `engine/animation/BoneMask.*` + `ecs::AnimLayer` + `AnimatorSystem::applyLayers`；
+  `layers` 空 = **逐位同以前**。**不注册 `FeatureRegistry`**（动画特性，没有 `MYVK_*` 开关，
+  入口在 Inspector；硬塞一条只会让"特性数"失真）。
+- 遮罩 = **根骨 + 父链子树**，匹配**不分大小写/子串/全收**（不能用 `findJoint`：
+  命中即返回 → `hand` 只进一根）；**0 命中 = 该层不生效**（不是"全部"）。
+- 顺序硬约束：底座 → **附加层** → `applyPerformance`(LookAt/IK/弹簧骨) → `poseToJoints`。
+- 端点**逐位**：`w<=0`=base、`w>=1`=layer（`slerp(q,l,1)` **不是**恒等）；`out` 不可与 layer 同址。
+- `dt==0`（编辑器非 Play）**层视为已淡完**，否则刚配好一层在视口里看不见；权重 0 **不清** `playingClip`。
+- **手写的 `skinned` 实体在视口里一个像素都不画**（`skinned` 块只建 `SkinnedMeshComponent`、
+  只提供 `jointBase`；渲染的是**每个 submesh 的子实体** = Mesh + Material）→ 日志
+  `SCENE-SKINNED ok=1` / `ANIM-SKIN ok=1` 全绿而画面全空。验收必须先 `MYVK_EDITOR_IMPORT` +
+  `scene.save` 烤模板（`verify_anim_layers.py` 文件头）。唯一同时建两者的地方是
+  `scene::instantiateModel`（`verify_model_scale.py` 早记过，10-26 又踩一遍）。
+- `anime_girl.fbx` 的 **`Idle` 段数据是坏的**（腿压成尖刺，10-19 `char_import_edit.png` 就是那根
+  竖条）→ 底座/上层都用 `Walk`，只按**相位**区分（底座 0.30 s、层 0 s；层的 `time` 不落盘，
+  这是唯一能造两个相位的办法）；只有 `Allow=chest` 那组敢用 `Idle` 当上层（坏腿在遮罩外）。
+- 像素判据的"上半身/下半身"是**两条带**（视口 **0~28%** 与 **52~100%**）：这个角色是长腿
+  chibi、手臂垂在大腿旁，实测 thigh 变化落 0.28~0.72、chest 落 0.00~0.48，**重叠段 0.28~0.48**
+  → 任何单条中线都会把手臂和大腿混成一团（第一版 0.52 → "上半身没动"量出 5.23%，判据红实现对）。
+  换机位/换角色必须**重量这两个比例**。
+- **"变化像素数随权重单调"不成立**（0.5 → 6404 px、1.0 → 6356 px，反了 0.7%）：变化像素是
+  **集合**量，对位移会饱和。改成"0.5 与 1 不是同一张图（5.75%）**且** 0.5 与基线也不是
+  同一张图（5.61%）"；"0.5 恰好一半"交给数值用例（`mask_w05_scale=2.0`，逐位量）。
+- 否定测试：去掉遮罩（`Mask=All`）→ 上半带 0.000% → **3.903%**，③ 会红。判据有判别力。

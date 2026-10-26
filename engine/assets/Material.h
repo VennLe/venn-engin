@@ -19,6 +19,10 @@
 namespace assets {
 
 class Texture;
+// A6：色带资产（弱引用）。**必须是 struct** —— 与 RampAsset.h 的定义一致，
+// MSVC 对 struct/class 的名字修饰不同，声明错一个就会在链接期才炸（见
+// MEMORY 里 2026-10-23 那次 LNK2019）。
+struct RampAsset;
 
 // ============================================================
 // MaterialSource —— 材质的"来源描述"（供场景序列化重建）
@@ -265,6 +269,82 @@ struct Material {
     Texture* sdfShadowMap = nullptr;
     float sdfShadowStrength = 1.0f;
 
+    // ---- 面部 SDF 的采样参数（A1，2026-10-26）----
+    // SDF 图是"正脸投影"下的灰度遮罩，运行时按光照方向偏移采样点
+    // （见 pbr.frag 的 faceSdfMask）。shift 就是那个偏移的幅度：
+    //   0    = 不随光动（图怎么画就怎么显示，只适合固定机位的立绘）
+    //   0.15 = 常规（光转 90° 时采样点移动 15% 的脸宽）
+    //   >0.3 = 夸张（阴影几乎完全由光的方向决定，图只提供形状）
+    // ⚠ 依赖"脸皮的 UV 就是正脸展开"这个资产约定 —— UV 不对，阴影就会
+    //   出现在脸上任意位置。这是资产问题，着色器兜不住。
+    float sdfFaceShift = 0.15f;
+
+    // ---- Toon 色带资产（A6，2026-10-26）----
+    // `ramp` 是**弱引用**（AssetManager 持有，材质不拥有）；`rampMap` 是它
+    // 烘出来的 256×1 纹理，之所以两个都留着：渲染只认 `rampMap`（与其它
+    // 纹理槽一致），而编辑/存盘/换档位要认 `ramp`（拿到 bands 数据）。
+    // ⚠ 重建纹理后 **`rampMap` 必须重新指向** `ramp->texture.get()`，
+    //   否则材质页还在采旧纹理（旧对象已被 unique_ptr 释放）。
+    // `rampPath` 是相对 assets/ 的 .vramp 路径；空 = 程序化 / 还没存盘。
+    std::string rampPath;
+    RampAsset* ramp = nullptr;
+    // 明暗交界（band0 ↔ band1）的位置与软化宽度。**与资产里的同名值
+    // 是同一组数**：资产负责烘像素，这里负责着色器的"阴影闸门"，两边
+    // 不同步就会出现双重明暗线。所以编辑色带时要一起写。
+    float rampEdge = 0.5f;
+    float rampSoftness = 0.04f;
+
+    // ---- 角色光通道（A5，2026-10-26）----
+    // 勾上 = 这个材质只吃"角色光"（专用主光 + 常量环境色），不吃场景
+    // IBL / 太阳 / CSM。二次元角色几乎都要勾；道具/场景**不要**勾。
+    // 缺省 false = 与引入这条通道之前逐像素相同（"关 = 基线"）。
+    bool useCharacterLight = false;
+
+    // ---- 头发各向异性高光（A4，2026-10-26）----
+    // Kajiya-Kay 天使环。二次元头发的"亮"不是一片，是绕着头顶的一条带子 ——
+    // 由**切线**（顶点属性 location 9，沿 UV.x）而不是法线决定，见
+    // pbr.frag 的 hairAnisoSpec。
+    //
+    // anisoStrength：0 = 关（缺省，逐像素等于基线）；0.6~1.2 是头发常用区间。
+    //   超过 1.5 会把整条环推到削顶（一条死白的带子），不像高光了。
+    // anisoShift：把环沿**法线**推着走的位置参数。
+    //   0     = 主环贴着 N·T 的原始位置
+    //   ±0.3  = 环上下移动，配合美术手画的需求
+    //   ⚠ 它不是"亮度"参数 —— 调它只会让环移动，不会变亮变暗。
+    //
+    // ⚠ 这两个数只对 **Toon** 材质生效（Kajiya-Kay 是赛璐璐语汇，
+    //   Default/Skin 那条 PBR 分支没有这个项）。
+    float anisoStrength = 0.0f;
+    float anisoShift = 0.0f;
+
+    // ---- 眼睛专用着色（A3，2026-10-26）----
+    // 二次元的眼睛**不是算出来的，是画出来的**：底色（巩膜白 + 虹膜渐变 +
+    // 瞳孔）是美术出的一张图，场景光不该改变它；立体感只靠两件事 ——
+    // 一层"贴上去"的高光片（MatCap 或下面的眼神光）、以及虹膜的**视差**
+    // （眼窝是凹的，侧看时虹膜会朝观察者一侧偏）。
+    //
+    // eyeStrength：Unlit 混合权重。0 = 关（缺省，逐像素等于基线）；
+    //   1 = 完全不吃场景光（只保留 albedo 底色 + 眼神光）。
+    //   中间值可以给"半透的塑料眼"之类留余地，但二次元角色几乎总是 1。
+    // ⚠ 它是**混合权重**而不是布尔：写成 mix() 才能让"0 = 基线"逐像素成立；
+    //   写成 `if (eyeStrength > 0)` 也能关，但美术拿不到 0.8 这一档。
+    //
+    // eyeIrisDepth：虹膜视差的强度（沿切线平面偏移 UV 的比例）。
+    //   0    = 不偏移（正视平贴，像贴纸）
+    //   0.02 = 常规（人眼的眼球半径/可视宽度量级）
+    //   0.05 = 夸张（"玻璃珠"那种水润感）
+    //   ⚠ 只对 Unlit 的眼睛有意义的量；它偏移的是 **matUV**（所有贴图
+    //     采样点一起动），所以虹膜、瞳孔、巩膜会一起位移 —— 这是对的，
+    //     因为它们本来就在同一张图里、贴在同一个凹面上。
+    //
+    // eyeCatchlight：程序化眼神光的强度。二次元眼睛那颗"白点"是画上去的，
+    //   位置固定在**头的朝向**上（视图空间法线），不随光源走 —— 这与 MatCap
+    //   同理，区别是它不需要美术再出一张图。
+    //   0 = 关（缺省）；1.0 左右是常规；>2 会削顶成死白。
+    float eyeStrength = 0.0f;
+    float eyeIrisDepth = 0.0f;
+    float eyeCatchlight = 0.0f;
+
     // 细节/贴花（腮红、纹身、衣服印花）。**相乘**调制 albedo，
     // detailTiling 控制平铺次数。缺省白 → 乘法恒等。
     Texture* detailMap = nullptr;
@@ -326,6 +406,20 @@ struct Material {
         float sdfShadowStrength = 1.0f;
         float detailStrength = 1.0f;
         float detailTiling = 1.0f;
+        // A6/A1（2026-10-26，位序 20/21）：色带的交界位置与宽度
+        // ⚠ 只进位掩码的**标量**。`rampPath` / `sdfFaceShift` /
+        //   `useCharacterLight` 刻意不进：它们不是"画风旋钮"，而是
+        //   "这个材质是哪一类东西"的身份标记（换色带 / 开关角色光属于
+        //   结构变化，与换纹理槽同一条纪律）。
+        float rampEdge = 0.5f;
+        float rampSoftness = 0.04f;
+        // A4（2026-10-26，位序 22/23）：头发各向异性高光的强度与环位置
+        float anisoStrength = 0.0f;
+        float anisoShift = 0.0f;
+        // A3（2026-10-26，位序 24/25/26）：眼睛的 unlit 权重 / 虹膜视差 / 眼神光
+        float eyeStrength = 0.0f;
+        float eyeIrisDepth = 0.0f;
+        float eyeCatchlight = 0.0f;
     };
 
     // 位序（W1-1）—— ⚠ 一旦发布就不能改：存档里是裸数字。
@@ -359,7 +453,24 @@ struct Material {
         kOvSdfShadowStrength = 1u << 17,
         kOvDetailStrength    = 1u << 18,
         kOvDetailTiling      = 1u << 19,
-        kOvScalarMask  = (1u << 20) - 1u,
+        // ---- 20/21（2026-10-26 追加，A6 色带的交界位置/宽度）----
+        kOvRampEdge          = 1u << 20,
+        kOvRampSoftness      = 1u << 21,
+        // ---- 22/23（2026-10-26 追加，A4 头发各向异性）----
+        // 同样是"画风旋钮"而不是身份标记：同一个头发材质要做"干发/湿发"
+        // 两种劲度，靠的就是实例覆盖这两个数。
+        kOvAnisoStrength     = 1u << 22,
+        kOvAnisoShift        = 1u << 23,
+        // ---- 24/25/26（2026-10-26 追加，A3 眼睛）----
+        // 三个都是"每个角色一套画风"的旋钮（同一张眼睛图要做"普通/水润/
+        // 死鱼眼"），所以进位掩码可以被实例覆盖。
+        kOvEyeStrength       = 1u << 24,
+        kOvEyeIrisDepth      = 1u << 25,
+        kOvEyeCatchlight     = 1u << 26,
+        // ⚠ 掩码跟着扩。位序 27..31 是最后 **5** 个空位 —— 用完之后
+        //   `Params` 这个"C 风格 POD 快照"就得换结构（位掩码是 u32），
+        //   届时要升 kMaterialVersion 并写迁移，不能硬塞第二个 u32。
+        kOvScalarMask  = (1u << 27) - 1u,
     };
 
     // 取当前参数 / 写回参数
@@ -385,6 +496,13 @@ struct Material {
         p.sdfShadowStrength = sdfShadowStrength;
         p.detailStrength = detailStrength;
         p.detailTiling = detailTiling;
+        p.rampEdge = rampEdge;
+        p.rampSoftness = rampSoftness;
+        p.anisoStrength = anisoStrength;
+        p.anisoShift = anisoShift;
+        p.eyeStrength = eyeStrength;
+        p.eyeIrisDepth = eyeIrisDepth;
+        p.eyeCatchlight = eyeCatchlight;
         return p;
     }
     void applyParams(const Params& p) {
@@ -408,6 +526,13 @@ struct Material {
         sdfShadowStrength = p.sdfShadowStrength;
         detailStrength = p.detailStrength;
         detailTiling = p.detailTiling;
+        rampEdge = p.rampEdge;
+        rampSoftness = p.rampSoftness;
+        anisoStrength = p.anisoStrength;
+        anisoShift = p.anisoShift;
+        eyeStrength = p.eyeStrength;
+        eyeIrisDepth = p.eyeIrisDepth;
+        eyeCatchlight = p.eyeCatchlight;
     }
 
     // 逐字段比较，返回"不同的那几位"（0 = 完全一致）。
@@ -441,6 +566,13 @@ struct Material {
         if (a.sdfShadowStrength != b.sdfShadowStrength) d |= kOvSdfShadowStrength;
         if (a.detailStrength != b.detailStrength) d |= kOvDetailStrength;
         if (a.detailTiling != b.detailTiling) d |= kOvDetailTiling;
+        if (a.rampEdge != b.rampEdge) d |= kOvRampEdge;
+        if (a.rampSoftness != b.rampSoftness) d |= kOvRampSoftness;
+        if (a.anisoStrength != b.anisoStrength) d |= kOvAnisoStrength;
+        if (a.anisoShift != b.anisoShift) d |= kOvAnisoShift;
+        if (a.eyeStrength != b.eyeStrength) d |= kOvEyeStrength;
+        if (a.eyeIrisDepth != b.eyeIrisDepth) d |= kOvEyeIrisDepth;
+        if (a.eyeCatchlight != b.eyeCatchlight) d |= kOvEyeCatchlight;
         return d;
     }
     // 按位把 b 的字段刷进 a（用于母材质变更传播 / 读档应用 overrides）
@@ -465,6 +597,13 @@ struct Material {
         if (bits & kOvSdfShadowStrength) a.sdfShadowStrength = b.sdfShadowStrength;
         if (bits & kOvDetailStrength) a.detailStrength = b.detailStrength;
         if (bits & kOvDetailTiling) a.detailTiling = b.detailTiling;
+        if (bits & kOvRampEdge) a.rampEdge = b.rampEdge;
+        if (bits & kOvRampSoftness) a.rampSoftness = b.rampSoftness;
+        if (bits & kOvAnisoStrength) a.anisoStrength = b.anisoStrength;
+        if (bits & kOvAnisoShift) a.anisoShift = b.anisoShift;
+        if (bits & kOvEyeStrength) a.eyeStrength = b.eyeStrength;
+        if (bits & kOvEyeIrisDepth) a.eyeIrisDepth = b.eyeIrisDepth;
+        if (bits & kOvEyeCatchlight) a.eyeCatchlight = b.eyeCatchlight;
     }
 
     // ---- 导入快照（W0-3）----

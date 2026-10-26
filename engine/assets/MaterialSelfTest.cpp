@@ -72,15 +72,20 @@ int runMaterialSelfTest() {
     // ---------------- A. 参数集 / 位序 ----------------
     {
         using M = Material;
-        // A1 位序冻结：20 个字段 = 0xFFFFF。这条断言存在的唯一目的，
+        // A1 位序冻结：27 个字段 = 0x7FFFFFF。这条断言存在的唯一目的，
         //    是"有人手滑改了位序"时立刻炸 —— 存档里存的是裸数字。
         //    12 → 14 是 2026-10-25 追加 renderQueue/sortOrder（P0-2/B），
         //    14 → 20 是同日追加 A 类语义槽的六个标量（材质页 96B），
-        //    **只追加不插队**，所以旧存档的低 12 位含义完全不变。
+        //    20 → 22 是 2026-10-26 追加色带的 rampEdge/rampSoftness（A6），
+        //    22 → 24 是同日追加头发各向异性的 anisoStrength/anisoShift（A4），
+        //    24 → 27 是同日追加眼睛的 eyeStrength/eyeIrisDepth/eyeCatchlight（A3），
+        //    **只追加不插队**，所以旧存档的低 24 位含义完全不变。
+        //    ⚠ 位 27..31 是最后 **5** 个空位。用完之后 `Params` 这个 POD
+        //      快照就要换结构（位掩码是 u32），那时必须升 kMaterialVersion。
         char mb[32];
         std::snprintf(mb, sizeof(mb), "mask=0x%05X",
                       static_cast<unsigned>(M::kOvScalarMask));
-        check("A1 material_bits_frozen", M::kOvScalarMask == 0xFFFFFu, mb);
+        check("A1 material_bits_frozen", M::kOvScalarMask == 0x7FFFFFFu, mb);
 
         // A2 每个位各自独立（改一个字段 → 只有那一位亮）
         const M::Params base;
@@ -156,6 +161,30 @@ int runMaterialSelfTest() {
         p = base;
         p.detailTiling = 0.9f;
         cases.push_back({"detailTiling", M::kOvDetailTiling, p});
+        // ---- A6（2026-10-26）：色带的交界位置/宽度 ----
+        p = base;
+        p.rampEdge = 0.31f;
+        cases.push_back({"rampEdge", M::kOvRampEdge, p});
+        p = base;
+        p.rampSoftness = 0.11f;
+        cases.push_back({"rampSoftness", M::kOvRampSoftness, p});
+        // ---- A4（2026-10-26）：头发各向异性的强度 / 环位置 ----
+        p = base;
+        p.anisoStrength = 0.85f;
+        cases.push_back({"anisoStrength", M::kOvAnisoStrength, p});
+        p = base;
+        p.anisoShift = -0.27f;
+        cases.push_back({"anisoShift", M::kOvAnisoShift, p});
+        // ---- A3（2026-10-26）：眼睛的 unlit 权重 / 虹膜视差 / 眼神光 ----
+        p = base;
+        p.eyeStrength = 1.0f;
+        cases.push_back({"eyeStrength", M::kOvEyeStrength, p});
+        p = base;
+        p.eyeIrisDepth = 0.021f;
+        cases.push_back({"eyeIrisDepth", M::kOvEyeIrisDepth, p});
+        p = base;
+        p.eyeCatchlight = 1.35f;
+        cases.push_back({"eyeCatchlight", M::kOvEyeCatchlight, p});
 
         std::uint32_t seen = 0;
         int wrong = 0;
@@ -168,7 +197,7 @@ int runMaterialSelfTest() {
         std::snprintf(sb, sizeof(sb), "wrong=%d seen=0x%03X", wrong,
                       static_cast<unsigned>(seen));
         check("A2 material_diff_each_bit_isolated", wrong == 0, sb);
-        // 20 个字段全改 → 恰好是全集，且没有第 21 位
+        // 27 个字段全改 → 恰好是全集，且没有第 28 位
         check("A3 material_diff_all_bits", seen == M::kOvScalarMask, sb);
         check("A4 material_diff_identical_is_zero",
               M::diffParams(base, base) == 0u, "");

@@ -64,7 +64,7 @@ SCENE_DIR = os.path.join(OUT_DIR, "material_page")
 # 同名不同色会让后一个变体悄悄拿到前一个的图（症状是"判据全绿但画面没变"）。
 VARIANTS = [
     ("ref", "参考：只开着色模型，一个语义槽都不挂", {}),
-    ("ramp_white", "ramp 全白 → band × 1 → 必须逐像素等于参考", {
+    ("ramp_white", "ramp 全白 → 色带接管明暗曲线 → 整片用 albedo 本色（会变亮变平）", {
         "rampMap": {"kind": "solid", "name": "mp_ramp_w",
                     "color": [255, 255, 255, 255]},
         "rampSteps": 0.0,
@@ -209,15 +209,40 @@ def main():
         return float(np.abs(a - b).max())
 
     # ---------------- A. 恒等类 ----------------
-    # 判据是**恰好 0**，不是"小于阈值"：ramp 白图是 band × 1.0、
-    # detail 是 mix(1, 1, 0.5)、matcap 是 +0 × 0.9 —— 三者在浮点里
-    # 都是精确恒等，任何非零值都说明采样出来的不是纯白/纯黑，
-    # 或者混进了一个本该被消掉的项。
-    for tag in ("ramp_white", "detail_white", "matcap_black"):
+    # 判据是**恰好 0**，不是"小于阈值"：detail 是 mix(1, 1, 0.5)、matcap 是
+    # +0 × 0.9 —— 两者在浮点里都是精确恒等，任何非零值都说明采样出来的
+    # 不是纯白/纯黑，或者混进了一个本该被消掉的项。
+    #
+    # ⚠⚠ ramp_white **不在**这一组，这是 A6（2026-10-26）的语义变更：
+    #   ramp 曾经只是"乘在程序化两档之上的亮度乘子"，那时白图 = ×1 =
+    #   恒等，写在这里是对的。现在色带的**三个通道就是该档的乘子色**，
+    #   它**接管**了明暗曲线本身（暗部色交给美术画，不再是引擎写死的
+    #   冷蓝）。于是"白"的含义变成了"整片都用 albedo 本色"，而程序化
+    #   路径的受光档还乘着 (0.80 + 0.20·N·L)、暗部档乘着 (0.45,0.49,0.62)
+    #   —— 两者**本来就不该相等**。
+    #   "关 = 基线"这条纪律并没有松：它的落点是 `params.x = -1`
+    #   （**没挂色带**时连采样都不做），由 verify_toon_shading 第 ⑥ 组
+    #   ①②③ 以 0 px 逐像素证明。白图是"显式打开色带但选了最平的曲线"，
+    #   属于开着，不是关着。
+    for tag in ("detail_white", "matcap_black"):
         if tag in shots:
             d = max_diff(tag)
             check("%s_is_identity" % tag, d == 0.0,
                   "max diff=%.3f（必须恰好 0）" % d)
+
+    # ramp 白图：两条因果判据（方向由模型直接推出，不靠试出来的阈值）
+    #   · 受光区：ref 乘 (0.80+0.20·N·L) ≤ 1，白 ramp 乘 1 → 必然不更暗
+    #   · 暗部区：ref 乘 (0.45,0.49,0.62)，白 ramp 乘 1 → 必然明显更亮
+    #   合起来"整体变亮"，并且 N·L 的连续变化不再进入直接光 → 方差塌缩。
+    if "ramp_white" in shots:
+        m_w, m_ref = mean_lum("ramp_white"), ref_lum
+        s_w, s_ref = std_lum("ramp_white"), std_lum("ref")
+        print("     ramp_white mean=%.1f (ref %.1f) | std=%.1f (ref %.1f)"
+              % (m_w, m_ref, s_w, s_ref))
+        check("ramp_white_brightens", m_w > m_ref * 1.05,
+              "mean=%.2f ref=%.2f (%.2fx)" % (m_w, m_ref, m_w / max(m_ref, 1e-3)))
+        check("ramp_white_flattens", s_w < s_ref * 0.5,
+              "std=%.2f ref=%.2f" % (s_w, s_ref))
 
     # ---------------- B. 行为类 ----------------
     # ⚠ 这里**不**断言"变亮/变暗"的方向，因为 toonDirect 里 band 同时是

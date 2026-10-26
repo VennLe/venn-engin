@@ -59,7 +59,7 @@ std::vector<VkVertexInputAttributeDescription> Vertex::attributesFor(
 std::vector<VkVertexInputAttributeDescription> Vertex::attributeDescriptions(
     int count) {
     // 连续前缀（0..count-1）。**只有"真的只读前几条"的管线能用它** ——
-    // 主前向读 0..5 + 7/8（跳过了 6 和 9），必须走 attributeDescriptions()。
+    // 主前向读 0..5 + 7/8/9（跳过 6），必须走 attributeDescriptions()。
     std::vector<VkVertexInputAttributeDescription> out;
     if (count < 0) count = 0;
     if (count > 10) count = 10;
@@ -147,6 +147,11 @@ void Mesh::addFace(std::vector<Vertex>& verts, std::vector<uint32_t>& idx,
         vtx.pos = center + u * (signs[i][0] * half) + v * (signs[i][1] * half);
         vtx.normal = n;
         vtx.uv = uvs[i];
+        // 切线 = UV.x 的增长方向 = 这个面的 u 轴（addFace 的入参已保证
+        // u、v、n 两两正交且 u×v=n，所以 u 直接就是单位切线）。
+        // w = +1（副切线手性）：v 方向 = cross(n, u) 与 v 同向。
+        // §13 落盘至今没有消费者，A4（各向异性头发）是它的第一个消费者。
+        vtx.tangent = glm::vec4(u, 1.0f);
         verts.push_back(vtx);
     }
     idx.push_back(base + 0);
@@ -179,6 +184,10 @@ std::vector<Vertex> makeCubeVertices(float size) {
     for (auto& v : verts) {
         v.pos = toZup(v.pos);
         v.normal = toZup(v.normal);
+        // ⚠ 切线必须跟法线一起转。漏了这一句不会编译错、也不会运行错，
+        //   只会让立方体上每条棱的高光条带都指向"Y-up 时代"的方向 ——
+        //   在球上验不出来，只有在立方体上对比才看得见。
+        v.tangent = glm::vec4(toZup(glm::vec3(v.tangent)), v.tangent.w);
     }
     return verts;
 }
@@ -237,6 +246,15 @@ std::vector<Vertex> makeSphereVertices(float radius, int segments, int rings) {
             vert.pos = n * radius;
             vert.normal = n;  // 单位球上：外法线就等于归一化位置
             vert.uv = {u, v};
+            // 切线 = UV.x（经度 theta）的增长方向。对 n 求 theta 的导数：
+            //   dn/dθ = (-sinφ·sinθ, -sinφ·cosθ, 0)
+            // 归一化后就是 (-sinθ, -cosθ, 0) —— 与 φ 无关，**处处是纬线方向**。
+            // 这正好是"天使环沿纬线绕一圈"的那条环，也是本引擎内置几何里
+            // 唯一能拿来做 A4（各向异性）像素验收的曲面：环是一条纬线，
+            // 在屏幕上是一条水平弧，方向可断言。
+            // w = +1：副切线 = cross(n, T)，与 +v（朝南极）同向。
+            vert.tangent = glm::vec4(-std::sin(theta), -std::cos(theta), 0.0f,
+                                     1.0f);
             verts.push_back(vert);
         }
     }
