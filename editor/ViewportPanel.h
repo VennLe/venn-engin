@@ -193,6 +193,22 @@ private:
     GizmoController m_gizmo;
     ColliderView m_colliders;
 
+    // ---- 框选（2026-10-27 #316）----
+    //
+    // 只在"左键按在空白处"时开：按了手柄（gizmo）或是笔刷模式的左键，
+    // 都在上面被别的分支吃掉了，走不到这里。
+    bool m_boxActive = false;
+    bool m_boxAdditive = false;   // 按下时按着 Shift/Ctrl = 叠加到现有选中
+    glm::vec2 m_boxStart{0.0f};
+    glm::vec2 m_boxCurrent{0.0f};
+    // 小于这个边长就当"点了一下空白"（清空选中）而不是拉框。
+    // 4px 是手抖的上限：定大了"点空白清选中"会变得很难点中。
+    static constexpr float kBoxSelectMinPx = 4.0f;
+    // e 的屏幕投影矩形是否与框 [a,b] 有交集（碰到就选，见 .cpp 里的说明）
+    bool entityInsideBox(ecs::Entity e, const glm::mat4& viewProj,
+                         const glm::vec2& vpPos, const glm::vec2& vpSize,
+                         const glm::vec2& a, const glm::vec2& b);
+
     // 编辑模式工具（**不拥有**；生命周期归 EditorApp）。
     // 见 attachModeTools：视口只负责把射线与键鼠状态发过去。
     LandscapeEditor* m_landscapeEditor = nullptr;

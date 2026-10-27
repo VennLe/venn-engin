@@ -10,6 +10,7 @@
 #include "ecs/Components.h"
 #include "physics/CollisionWorld.h"
 #include "scene/Scene.h"
+#include "scene/SceneEntityIO.h"
 
 #include <nlohmann/json.hpp>
 
@@ -1961,6 +1962,41 @@ bool sequencerFromJson(const json& j, ecs::SequencerComponent& out) {
     return !out.sequencePath.empty();
 }
 
+// ---------------- 对话（C2，2026-10-26）----------------
+//
+// 与 sequencer 同一条纪律：**只存纯数据**（路径 / 语速 / 起点 / 优先级）。
+// 资产内容不落盘 —— `.dlg.json` 是独立资产，两个 NPC 可以引用同一段台词，
+// 把内容抄进场景就会出现"改一处只更新了一个场景"。
+//
+// ⚠ 运行时字段（`player` / `started` / `loadFailedLogged`）一个都不写：
+//   `player` 里有播放头、资产缓存与打字机进度，写进去等于把"演到第几句"
+//   变成场景的一部分 —— 下次开门那张场景会从中途开始说话。
+//   这也是 C1 那条"`playhead` 不落盘"的同一个判断。
+json dialogueToJson(const ecs::DialogueComponent& dc) {
+    json j;
+    j["path"] = dc.dialoguePath;
+    j["enabled"] = dc.enabled;
+    j["autoStart"] = dc.autoStart;
+    j["cps"] = dc.cps;
+    // 空串也写：作者可能刻意清空过它（"从资产自己的 start 开始"是显式意图）。
+    j["startNode"] = dc.startNode;
+    j["priority"] = dc.priority;
+    return j;
+}
+
+bool dialogueFromJson(const json& j, ecs::DialogueComponent& out) {
+    if (!j.is_object()) return false;
+    out = ecs::DialogueComponent{};
+    out.dialoguePath = j.value("path", std::string());
+    out.enabled = j.value("enabled", true);
+    out.autoStart = j.value("autoStart", false);
+    out.cps = j.value("cps", 30.0f);
+    out.startNode = j.value("startNode", std::string());
+    out.priority = j.value("priority", 0);
+    // 路径空 → 组件等于没配，**不建**（同 sequencerFromJson 的理由）。
+    return !out.dialoguePath.empty();
+}
+
 // ---------------- 弹簧骨 / LookAt（L2/L4 表演层，2026-10-25）----------------
 //
 // 两个都是"纯配置"，没有运行时字段要排除 —— 质点位置与上一帧的偏转角
@@ -2692,6 +2728,851 @@ ecs::CameraComponent cameraComponentFromJson(const json& j) {
 // 场景 → JSON（文件版与内存版共用的核心）
 // ============================================================
 
+// ============================================================
+// 单实体 → JSON（场景与 Prefab 共用的**唯一一份**字段实现）
+//
+// 为什么抽出来：Prefab 的资产格式与场景文件**同构**（平铺 entities + parent
+// 下标），如果 Prefab 自己再写一遍"哪些组件、哪些字段"，以后每加一个组件
+// 都要记得改两处 —— 而漏改不会报错，只会让 Prefab 默默丢字段（存一次就
+// 永久丢）。这里的 `indexOf` 由调用方给：写整场景时是"全场景 id → 下标"，
+// 写子树时是"子树成员 id → 子树内下标"，根节点因此自然得到 parent=-1。
+//
+// 返回 false = 这个实体"没有内容"（既没网格，也没有任何非网格组件），
+// 由调用方决定怎么计数（场景算 skipped，Prefab 直接拒收）。
+// ============================================================
+bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
+                      const ecs::TransformComponent& tr,
+                      const std::unordered_map<ecs::EntityId, int>& indexOf,
+                      json& out) {
+    json je;
+    const std::string* nm = w.name(e);
+    je["name"] = nm ? *nm : std::string("Entity");
+
+    je["transform"] = json{
+        {"position", vec3ToJson(tr.position)},
+        {"rotation", vec3ToJson(tr.rotation)},
+        {"scale", vec3ToJson(tr.scale)},
+    };
+
+    if (const auto* vis = w.get<ecs::VisibilityComponent>(e)) {
+        je["visible"] = vis->visible;
+        je["castShadow"] = vis->castShadow;
+    }
+
+    // 编辑器锁定（"看得见、动不了"；自带地面就是靠它固定的）
+    if (w.has<ecs::LockedComponent>(e)) je["locked"] = true;
+
+    int parentIndex = -1;
+    if (const auto* h = w.get<ecs::HierarchyComponent>(e)) {
+        if (h->parent != ecs::kInvalidEntity) {
+            auto f = indexOf.find(h->parent);
+            if (f != indexOf.end()) parentIndex = f->second;
+        }
+        // "文件夹"标记（Hierarchy 里显示成目录图标的纯分组节点）
+        if (h->group) je["folder"] = true;
+    }
+    je["parent"] = parentIndex;
+
+    const auto* mc = w.get<ecs::MeshComponent>(e);
+    const auto* matc = w.get<ecs::MaterialComponent>(e);
+    je["mesh"] = meshSourceToJson(mc ? mc->mesh : nullptr);
+    je["material"] = materialToJson(matc ? matc->material : nullptr);
+    // 内置图元的生成参数（编辑器可回改，见 ecs::MeshComponent::primitive）
+    if (mc) {
+        json jp = primitiveParamsToJson(*mc);
+        if (!jp.is_null()) je["primitive"] = jp;
+    }
+
+    // 局部光源（位置在 transform 里，已经存过了）
+    if (const auto* pl = w.get<ecs::PointLightComponent>(e))
+        je["pointLight"] = pointLightToJson(*pl);
+    if (const auto* sl = w.get<ecs::SpotLightComponent>(e))
+        je["spotLight"] = spotLightToJson(*sl);
+    // 实体级方向光（补光；场景级太阳走顶层 "light" 字段）
+    if (const auto* dl = w.get<ecs::DirectionalLightComponent>(e))
+        je["directionalLight"] = directionalLightToJson(*dl);
+
+    // 碰撞体（几何是派生数据，只存来源与摆放，见 collisionToJson）
+    if (const auto* cc = w.get<ecs::CollisionComponent>(e))
+        je["collision"] = collisionToJson(*cc);
+
+    // 延迟贴花（R4-4）。注意：贴花**没有网格**，所以下面那句
+    // "mesh 为空 → skipped++" 对它不适用 —— 只有贴花的实体是合法的。
+    if (const auto* dc = w.get<ecs::DecalComponent>(e))
+        je["decal"] = decalToJson(*dc);
+
+    // 地形（W4）。它**没有网格组件** —— 几何由高度图在渲染层生成，
+    // 所以同样不适用下面那句 "mesh 为空 → skipped++"。
+    if (const auto* tc = w.get<ecs::TerrainComponent>(e))
+        je["terrain"] = terrainToJson(*tc);
+
+    // 水体（2026-10-21）：全部参数都是场景数据，整份落盘
+    if (const auto* wc = w.get<ecs::WaterComponent>(e))
+        je["water"] = waterToJson(*wc);
+
+    // 玩家出生点（仿 UE5 PlayerStart）。没有网格：只有一个位置 + 朝向，
+    // 视口里的 Q 版小人由编辑器叠加层画，不进场景实体。
+    if (const auto* gs = w.get<ecs::GameStartComponent>(e))
+        je["gameStart"] = gameStartToJson(*gs);
+
+    // 反射探针（R5-1）。与贴花同理：探针**没有网格**，
+    // 下面那句 "mesh 为空 → skipped++" 对它也不适用。
+    if (const auto* rp = w.get<ecs::ReflectionProbeComponent>(e))
+        je["probe"] = reflectionProbeToJson(*rp);
+
+    // 蒙皮 / 骨骼动画（角色链 A0-2）。模型根实体**没有网格**，
+    // 所以它同样不适用下面那句 "mesh 为空 → skipped++"。
+    if (const auto* sk = w.get<ecs::SkinnedMeshComponent>(e)) {
+        json js = skinnedToJson(*sk);
+        if (!js.is_null()) je["skinned"] = js;
+        VK_LOG_INFO("SCENE-SKINNED entity=%u clip=%s speed=%.2f "
+                    "playing=%d loop=%d stored=%d",
+                    static_cast<unsigned>(e.id),
+                    sk->clipName.c_str(), static_cast<double>(sk->speed),
+                    sk->playing ? 1 : 0, sk->loop ? 1 : 0,
+                    js.is_null() ? 0 : 1);
+    }
+
+    // 表情滑条（§15）。与 skinned 同一个实体（模型根），紧跟其后。
+    if (const auto* mp = w.get<ecs::MorphComponent>(e)) {
+        json jm = morphToJson(*mp);
+        if (!jm.is_null()) je["morph"] = std::move(jm);
+        VK_LOG_INFO("SCENE-MORPH entity=%u stored=%d channels=%d",
+                    static_cast<unsigned>(e.id),
+                    jm.is_null() ? 0 : 1,
+                    mp->model
+                        ? static_cast<int>(mp->model->morphRig.channelCount())
+                        : 0);
+    }
+
+    // GPU 粒子发射器（R6-1）。与贴花 / 探针同理：发射器**没有网格**
+    //（几何是顶点着色器现拼的 billboard），同样不适用 skipped++ 那句。
+    if (const auto* fx = w.get<ecs::ParticleEmitterComponent>(e))
+        je["particleEmitter"] = particleEmitterToJson(*fx);
+
+    // 刚体（R7-1）。与贴花 / 探针 / 发射器同理：它也不带网格 ——
+    // "隐形的墙"就是一个只有刚体的实体，所以下面那句 skipped++ 同样
+    // 要为它开一个口子。位置/朝向已经在 transform 里，这里只存参数。
+    if (const auto* rb = w.get<ecs::RigidBodyComponent>(e))
+        je["rigidbody"] = rigidBodyToJson(*rb);
+
+    // 动画器（角色链 A1）。挂在同一个模型根实体上，紧跟 skinned 之后。
+    // 存盘顺序 = 读档顺序，所以 animatorFromJson 里的 modelFromSource
+    // 一定能命中 AssetManager 缓存（键 = modelKey）。
+    if (const auto* an = w.get<ecs::AnimatorComponent>(e)) {
+        je["animator"] = animatorToJson(*an);
+        VK_LOG_INFO("SCENE-ANIMATOR entity=%u clip=%s time=%.3f "
+                    "speed=%.2f playing=%d loop=%d ctrl=%d",
+                    static_cast<unsigned>(e.id),
+                    an->defaultClip.c_str(),
+                    static_cast<double>(an->time),
+                    static_cast<double>(an->speed), an->playing ? 1 : 0,
+                    an->loop ? 1 : 0,
+                    an->controllerPath.empty() ? 0 : 1);
+    }
+
+    // 表演层（L2/L4，2026-10-25）。紧跟 animator：三者是同一个角色的
+    // 三层（播什么 / 头看哪 / 头发怎么飘），读档顺序上也没有依赖。
+    if (const auto* sb = w.get<ecs::SpringBoneComponent>(e))
+        je["springBone"] = springBoneToJson(*sb);
+    if (const auto* la = w.get<ecs::LookAtComponent>(e))
+        je["lookAt"] = lookAtToJson(*la);
+    if (const auto* ik = w.get<ecs::TwoBoneIKComponent>(e))
+        je["ik"] = ikToJson(*ik);
+    if (const auto* at = w.get<ecs::BoneAttachmentComponent>(e))
+        je["attach"] = attachToJson(*at);
+
+    // 过场时间轴（C1，2026-10-26）。挂在任意实体上；同一场景可以挂多段，
+    // 由 priority 决定这一帧谁在跑。空路径不写（与 animClip 同一条理由：
+    // 别给每个实体都添一个空块，场景 diff 会全是噪音）。
+    if (const auto* sq = w.get<ecs::SequencerComponent>(e)) {
+        if (!sq->sequencePath.empty()) {
+            je["sequencer"] = sequencerToJson(*sq);
+            VK_LOG_INFO("SCENE-SEQUENCER entity=%u path=%s dur=%.3f "
+                        "keys=%d events=%d pri=%d",
+                        static_cast<unsigned>(e.id),
+                        sq->sequencePath.c_str(),
+                        static_cast<double>(sq->asset.duration),
+                        static_cast<int>(sq->asset.cameraKeys.size()),
+                        static_cast<int>(sq->asset.events.size()), sq->priority);
+        }
+    }
+
+    // 对话（C2）。空路径不写（同 animClip 的理由：别给每个实体都添一个
+    // 空块，场景 diff 会全是噪音）。
+    if (const auto* dlg = w.get<ecs::DialogueComponent>(e)) {
+        if (!dlg->dialoguePath.empty()) {
+            je["dialogue"] = dialogueToJson(*dlg);
+            VK_LOG_INFO("SCENE-DIALOGUE entity=%u path=%s auto=%d cps=%.1f "
+                        "pri=%d",
+                        static_cast<unsigned>(e.id),
+                        dlg->dialoguePath.c_str(), dlg->autoStart ? 1 : 0,
+                        static_cast<double>(dlg->cps), dlg->priority);
+        }
+    }
+
+    // 实体 transform 关键帧轨道（编辑器 Animation 模式的产物）。
+    // 空轨道**不写** —— 否则每个用过的实体都会多一个 {"keys":[]}，
+    // 场景文件的 diff 全是噪音。
+    if (const auto* ac = w.get<ecs::AnimationClipComponent>(e)) {
+        if (!ac->keys.empty()) je["animClip"] = animClipToJson(*ac);
+    }
+
+    // 角色控制器（G07）。与刚体**互斥**：角色是运动学的，由
+    // stepCharacter 驱动，不交给物理求解器（互斥关系在 Inspector 里
+    // 会给出提示，见 InspectorPanel 的 "角色控制器" 段）。
+    if (const auto* chc =
+            w.get<ecs::CharacterControllerComponent>(e))
+        je["character"] = characterToJson(*chc);
+
+    // 触发体（G08）/ 物理材质（G08）/ 相机（G09）
+    if (const auto* trg = w.get<ecs::TriggerComponent>(e))
+        je["trigger"] = triggerToJson(*trg);
+    if (const auto* pmat =
+            w.get<ecs::PhysicsMaterialComponent>(e))
+        je["physicsMaterial"] = physicsMaterialToJson(*pmat);
+    if (const auto* cam = w.get<ecs::CameraComponent>(e))
+        je["camera"] = cameraComponentToJson(*cam);
+
+    // 动画键盘映射（P4）。空表不写（理由见 animKeyMapToJson）。
+    if (const auto* akm = w.get<ecs::AnimKeyMapComponent>(e)) {
+        if (!akm->entries.empty()) je["animKeys"] = animKeyMapToJson(*akm);
+    }
+
+    // 脚本（只有路径与开关，脚本源码本身是独立文件）
+    if (const auto* sc = w.get<ecs::ScriptComponent>(e)) {
+        je["script"] = json{
+            {"path", sc->path},
+            {"enabled", sc->enabled},
+            {"timeScale", sc->timeScale},
+        };
+    }
+
+    // 音频源（G14-7）。字段少 → **全写**（读端每个字段都有默认，
+    // 所以旧场景不受影响；而"只写非默认值"会让"我把 volume 调回 1.0
+    // 之后存档里为什么没这个键"变成一个要解释的问题）。
+    if (const auto* asc = w.get<ecs::AudioSourceComponent>(e)) {
+        je["audio"] = json{
+            {"clip", asc->clip},
+            {"playOnAwake", asc->playOnAwake},
+            {"loop", asc->loop},
+            {"spatial", asc->spatial},
+            {"volume", asc->volume},
+            {"pitch", asc->pitch},
+            {"minDist", asc->minDist},
+            {"maxDist", asc->maxDist},
+            {"rolloff", asc->rolloff},
+            {"bus", asc->bus},
+            {"streaming", asc->streaming},
+        };
+    }
+    // 听者标记：只有一个 bool，直接用裸 bool（对象形式没有第二个字段可放）
+    if (const auto* al = w.get<ecs::AudioListenerComponent>(e))
+        je["audioListener"] = al->enabled;
+
+    // 玩家（walkPhase/bodyYaw/started 是运行态派生值，不存）
+    if (const auto* pc = w.get<ecs::PlayerComponent>(e)) {
+        je["player"] = json{
+            {"mode", pc->mode == ecs::PlayerMode::ThirdPerson
+                         ? "third"
+                         : "first"},
+            {"eyeHeight", pc->eyeHeight},
+            {"moveSpeed", pc->moveSpeed},
+            {"lookSpeed", pc->lookSpeed},
+            {"yaw", pc->yaw},
+            {"pitch", pc->pitch},
+            {"camDistance", pc->camDistance},
+            {"turnSpeed", pc->turnSpeed},
+        };
+    }
+    if (const auto* limb = w.get<ecs::PlayerLimbComponent>(e))
+        je["playerLimb"] = limb->kind;
+
+    // 预制体成员标记（G18）。写在这一块的理由与别的组件一样：它是"内容"，
+    // 不是诊断 —— 少了它，存一次盘实例就"脱钩"（改母版不再跟着变）。
+    if (const auto* pl = w.get<ecs::PrefabLinkComponent>(e)) {
+        json jp = json{
+            {"path", pl->prefabPath},
+            {"localId", pl->localId},
+            {"instance", pl->instance},
+        };
+        if (pl->root) jp["root"] = true;
+        // 覆盖表只在根上有意义，为空时**不写** —— 让文件里"没有覆盖"和
+        // "有 0 条覆盖"是同一件事（少一个要解释的状态）。
+        if (!pl->overrides.empty()) jp["overrides"] = pl->overrides;
+        je["prefab"] = std::move(jp);
+    }
+
+    // "有没有内容"：没有网格时，贴花 / 探针 / 发射器 / 刚体 / 角色 /
+    // 触发体 / 物理材质 / 相机 / **蒙皮** 任意一个存在就不算空 —— 它们
+    // 都是"没有网格但有意义"的实体（隐形的墙、触发区域、相机机位、
+    // 模型根节点）。
+    //
+    // ⚠ 这份名单必须与**读端**（entityFromJsonImpl 末尾）一字不差 ——
+    //   2026-10-27 之前它是 loadSceneFromJson 的一整段，抽成单实体函数后
+    //   两份仍在，改一处必须改两处。
+    //   两处不一致的后果不是崩溃，而是 `skipped` 计数骗人：
+    //   2026-11 实测，第三人称模板场景（2 个实体：地面 + 出生点）报
+    //   `entities=2 skipped=1` —— 出生点被当成"空实体"，可它其实
+    //   好好加载了。而回归脚本正是拿 `skipped=0` 断言"没丢东西"的，
+    //   假红比不报更费时间。
+    const bool hasNonMeshContent =
+        je.contains("terrain") || je.contains("water") ||
+        je.contains("decal") || je.contains("probe") ||
+        je.contains("particleEmitter") || je.contains("rigidbody") ||
+        je.contains("character") || je.contains("trigger") ||
+        je.contains("physicsMaterial") || je.contains("camera") ||
+        je.contains("skinned") || je.contains("animator") ||
+        je.contains("morph") ||
+        // 表演层三件套 + IK + 挂点。**必须在这里**：一个只挂 IK/挂点的
+        // 实体可以没有网格（挂点是"钉在别人骨头上的空物体"就是典型），
+        // 漏了它会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+        // springBone / lookAt 原来也漏在这儿（同一类 bug），一起补。
+        je.contains("springBone") || je.contains("lookAt") ||
+        je.contains("ik") || je.contains("attach") ||
+        je.contains("animClip") || je.contains("gameStart") ||
+        je.contains("animKeys") ||
+        // C1 过场时间轴。挂它的实体**通常没有网格**（就是一根"导演轨"），
+        // 漏在这里会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+        // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
+        je.contains("sequencer") ||
+        // C2 对话。同样通常挂在没有网格的"导演轨"实体上 —— 漏了会被
+        // 算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+        je.contains("dialogue") ||
+        je.contains("pointLight") || je.contains("spotLight") ||
+        je.contains("directionalLight") || je.contains("player") ||
+        je.contains("playerLimb") || je.contains("folder") ||
+        // G18 预制体成员标记。prefab 里可以有"纯分组节点"（没有网格、
+        // 只有 children），漏了它会被算进 skipped。
+        je.contains("prefab");
+    if (je["mesh"].is_null() && !hasNonMeshContent)
+        return false;
+
+    out = std::move(je);
+        return true;
+}
+
+
+// ============================================================
+// JSON → 单实体（与 `entityToJsonImpl` 成对，场景与 Prefab 共用）
+//
+// 调用前提（顺序是硬依赖，Prefab 实例化必须照做）：
+//   1. 实体已经由 `Scene::createObject` 建好，并且 transform / visible /
+//      locked 已经写过（那三样在"第一遍"里，父子关系要先于它们存在吗？
+//      不需要 —— 但 `setParent` 必须在 `mesh` 之前：蒙皮的 model 解析会
+//      沿着父链找骨架）。
+//   2. `created` 是"文件下标 → 实体"的映射，父引用（`parent`）靠它解析。
+//      写子树时传"子树内的下标表"，跨集合的父引用**不支持**（Roadmap D3）。
+//   3. 组件块顺序不能换：mesh → material → skinned → morph → animator →
+//      表演层。`modelFromSource` 命中 AssetManager 缓存靠的就是这个顺序。
+//
+// 返回 true = 这个实体"有内容"（有网格/材质，或挂着任一非网格组件）。
+// ============================================================
+bool entityFromJsonImpl(Scene& scene, assets::AssetManager& assets,
+                        const json& je, ecs::Entity e,
+                        const std::vector<ecs::Entity>& created) {
+    ecs::World& w = scene.world();
+    const int parentIndex = je.value("parent", -1);
+    if (parentIndex >= 0 &&
+        parentIndex < static_cast<int>(created.size()) &&
+        created[static_cast<size_t>(parentIndex)].valid()) {
+        scene.setParent(e, created[static_cast<size_t>(parentIndex)]);
+    }
+
+    // "文件夹"标记
+    if (je.value("folder", false)) {
+        if (auto* h = w.get<ecs::HierarchyComponent>(e)) h->group = true;
+    }
+
+    assets::Mesh* mesh = resolveMesh(
+        assets, je.contains("mesh") ? je["mesh"] : json(nullptr));
+    assets::Material* mat = resolveMaterial(
+        assets, je.contains("material") ? je["material"] : json(nullptr));
+
+    if (mesh) {
+        if (!w.has<ecs::MeshComponent>(e)) {
+            ecs::MeshComponent fresh;
+            fresh.mesh = mesh;
+            w.add<ecs::MeshComponent>(e, fresh);
+        }
+        if (auto* mc = w.get<ecs::MeshComponent>(e)) {
+            mc->mesh = mesh;
+            // 图元生成参数（没有就是默认值 —— 老场景文件也走这条）
+            if (je.contains("primitive"))
+                primitiveParamsFromJson(*mc, je["primitive"]);
+        }
+    }
+    if (mat) {
+        if (auto* matc = w.get<ecs::MaterialComponent>(e))
+            matc->material = mat;
+        else
+            w.add<ecs::MaterialComponent>(e, ecs::MaterialComponent{mat});
+    }
+
+    // ---- 蒙皮 / 骨骼动画（A0-2）----
+    // ⚠ 放在网格重建**之后**：那时 AssetManager 里模型已经热了，
+    //   `loadFBX/loadGLTF` 直接命中缓存（键 = `modelKey`）。
+    // ⚠ 老场景没有这个键 → 不建组件 → 逐像素等于今天。
+    if (je.contains("skinned")) {
+        ecs::SkinnedMeshComponent sk;
+        if (skinnedFromJson(assets, je["skinned"], sk)) {
+            if (auto* p = w.get<ecs::SkinnedMeshComponent>(e))
+                *p = sk;
+            else
+                w.add<ecs::SkinnedMeshComponent>(e, sk);
+            VK_LOG_INFO("SCENE-SKINNED entity=%u clip=%s speed=%.2f "
+                        "playing=%d loop=%d time=%.3f joints=%d ok=1",
+                        static_cast<unsigned>(e.id), sk.clipName.c_str(),
+                        static_cast<double>(sk.speed), sk.playing ? 1 : 0,
+                        sk.loop ? 1 : 0, static_cast<double>(sk.time),
+                        sk.model ? sk.model->skeleton->jointCount() : 0);
+        } else {
+            VK_LOG_INFO("SCENE-SKINNED entity=%u ok=0",
+                        static_cast<unsigned>(e.id));
+        }
+    }
+
+    // ---- 表情滑条（§15）----
+    // 在 skinned 之后：`modelFromSource` 命中的是同一个 AssetManager
+    // 缓存项（键 = modelKey），所以 morphRig 已经建好了。
+    // ⚠ 老场景没有这个键 → 不建组件 → 逐像素不变（滑条全 0 时
+    //   GPU 形变分支本来就不执行，见 pbr.vert 的 `mi.z > 0`）。
+    if (je.contains("morph")) {
+        ecs::MorphComponent mp;
+        if (morphFromJson(assets, je["morph"], mp)) {
+            if (auto* p = w.get<ecs::MorphComponent>(e))
+                *p = mp;
+            else
+                w.add<ecs::MorphComponent>(e, mp);
+            VK_LOG_INFO("SCENE-MORPH entity=%u channels=%d ok=1",
+                        static_cast<unsigned>(e.id),
+                        static_cast<int>(mp.weights.size()));
+        } else {
+            VK_LOG_INFO("SCENE-MORPH entity=%u ok=0",
+                        static_cast<unsigned>(e.id));
+        }
+    }
+
+    // ---- 动画器（角色链 A1）----
+    // 必须在 skinned **之后**：它的 model 可以为空，靠 AnimatorSystem
+    // 回退到刚建好的 SkinnedMeshComponent::model。
+    // ⚠ 老场景没有这个键 → 不建组件 → 走 A0 老路径，逐像素不变。
+    if (je.contains("animator")) {
+        ecs::AnimatorComponent an;
+        if (animatorFromJson(assets, je["animator"], an)) {
+            if (auto* p = w.get<ecs::AnimatorComponent>(e))
+                *p = an;
+            else
+                w.add<ecs::AnimatorComponent>(e, an);
+            VK_LOG_INFO("SCENE-ANIMATOR entity=%u clip=%s time=%.3f "
+                        "speed=%.2f playing=%d loop=%d model=%d ok=1",
+                        static_cast<unsigned>(e.id),
+                        an.defaultClip.c_str(),
+                        static_cast<double>(an.time),
+                        static_cast<double>(an.speed),
+                        an.playing ? 1 : 0, an.loop ? 1 : 0,
+                        an.model ? 1 : 0);
+        } else {
+            VK_LOG_INFO("SCENE-ANIMATOR entity=%u ok=0",
+                        static_cast<unsigned>(e.id));
+        }
+    }
+
+    // 过场时间轴（C1）。与 springBone 那几块无关，位置随意；
+    // 资产是**懒加载**的（第一次 tick 才读盘），所以这里只存路径。
+    if (je.contains("sequencer")) {
+        ecs::SequencerComponent sq;
+        if (sequencerFromJson(je["sequencer"], sq)) {
+            if (auto* p = w.get<ecs::SequencerComponent>(e))
+                *p = sq;
+            else
+                w.add<ecs::SequencerComponent>(e, sq);
+            VK_LOG_INFO("SCENE-SEQUENCER entity=%u path=%s pri=%d ok=1",
+                        static_cast<unsigned>(e.id), sq.sequencePath.c_str(),
+                        sq.priority);
+        } else {
+            VK_LOG_INFO("SCENE-SEQUENCER entity=%u ok=0", static_cast<unsigned>(e.id));
+        }
+    }
+
+    // 对话（C2）。与 sequencer 一样是懒加载（第一次 tick 才读盘），
+    // 所以这里只存路径与配置。
+    if (je.contains("dialogue")) {
+        ecs::DialogueComponent dlg;
+        if (dialogueFromJson(je["dialogue"], dlg)) {
+            if (auto* p = w.get<ecs::DialogueComponent>(e))
+                *p = dlg;
+            else
+                w.add<ecs::DialogueComponent>(e, dlg);
+            VK_LOG_INFO("SCENE-DIALOGUE entity=%u path=%s auto=%d cps=%.1f "
+                        "start=[%s] pri=%d ok=1",
+                        static_cast<unsigned>(e.id),
+                        dlg.dialoguePath.c_str(), dlg.autoStart ? 1 : 0,
+                        static_cast<double>(dlg.cps), dlg.startNode.c_str(),
+                        dlg.priority);
+        } else {
+            VK_LOG_INFO("SCENE-DIALOGUE entity=%u ok=0", static_cast<unsigned>(e.id));
+        }
+    }
+
+    // 表演层（L2/L4）。必须在 skinned 之后 —— 两者的算法都要骨架，
+    // 而骨架来自 SkinnedMeshComponent::model。
+    if (je.contains("springBone")) {
+        ecs::SpringBoneComponent sb;
+        springBoneFromJson(je["springBone"], sb);
+        if (auto* p = w.get<ecs::SpringBoneComponent>(e))
+            *p = sb;
+        else
+            w.add<ecs::SpringBoneComponent>(e, sb);
+        VK_LOG_INFO("SCENE-SPRINGBONE entity=%u enabled=%d prefixes=%d",
+                    static_cast<unsigned>(e.id), sb.settings.enabled ? 1 : 0,
+                    static_cast<int>(sb.prefixes.size()));
+    }
+    if (je.contains("lookAt")) {
+        ecs::LookAtComponent la;
+        lookAtFromJson(je["lookAt"], la);
+        if (auto* p = w.get<ecs::LookAtComponent>(e))
+            *p = la;
+        else
+            w.add<ecs::LookAtComponent>(e, la);
+        VK_LOG_INFO("SCENE-LOOKAT entity=%u enabled=%d target=%d weight=%.2f",
+                    static_cast<unsigned>(e.id), la.settings.enabled ? 1 : 0,
+                    la.settings.hasTarget ? 1 : 0,
+                    static_cast<double>(la.settings.weight));
+    }
+    // IK：必须在 skinned 之后（要骨架才能解析链）；
+    // 挂点则只要宿主**存在**即可，但它引用的 jointMatrices 要等运行时
+    // 第一次 tick 才有 —— 读档时链没解析出来是正常的，不是错误。
+    if (je.contains("ik")) {
+        ecs::TwoBoneIKComponent ik;
+        ikFromJson(je["ik"], ik);
+        if (auto* p = w.get<ecs::TwoBoneIKComponent>(e))
+            *p = ik;
+        else
+            w.add<ecs::TwoBoneIKComponent>(e, ik);
+        VK_LOG_INFO("SCENE-IK entity=%u enabled=%d target=%d weight=%.2f "
+                    "root=[%s]",
+                    static_cast<unsigned>(e.id), ik.settings.enabled ? 1 : 0,
+                    ik.settings.hasTarget ? 1 : 0,
+                    static_cast<double>(ik.settings.weight),
+                    ik.settings.rootBone.c_str());
+    }
+    if (je.contains("attach")) {
+        ecs::BoneAttachmentComponent at;
+        attachFromJson(je["attach"], at);
+        if (auto* p = w.get<ecs::BoneAttachmentComponent>(e))
+            *p = at;
+        else
+            w.add<ecs::BoneAttachmentComponent>(e, at);
+        VK_LOG_INFO("SCENE-ATTACH entity=%u host=[%s] bone=[%s]",
+                    static_cast<unsigned>(e.id), at.hostName.c_str(),
+                    at.boneName.c_str());
+    }
+
+    // 实体 transform 关键帧轨道
+    if (je.contains("animClip")) {
+        const ecs::AnimationClipComponent ac =
+            animClipFromJson(je["animClip"]);
+        if (auto* p = w.get<ecs::AnimationClipComponent>(e))
+            *p = ac;
+        else
+            w.add<ecs::AnimationClipComponent>(e, ac);
+        // 读回来必须说清楚"读到几条、多长"：用户存完再开发现关键帧
+        // 没了，这条日志是唯一能分辨"没写进去"和"写了但被覆盖"的地方。
+        VK_LOG_INFO("SCENE-ANIMCLIP entity=%u keys=%d dur=%.2f loop=%d "
+                    "autoplay=%d time=%.2f",
+                    static_cast<unsigned>(e.id),
+                    static_cast<int>(ac.keys.size()),
+                    static_cast<double>(ac.duration), ac.loop ? 1 : 0,
+                    ac.autoplay ? 1 : 0, static_cast<double>(ac.time));
+    }
+
+    // 局部光源组件
+    if (je.contains("pointLight")) {
+        const ecs::PointLightComponent pl =
+            pointLightFromJson(je["pointLight"]);
+        if (auto* p = w.get<ecs::PointLightComponent>(e))
+            *p = pl;
+        else
+            w.add<ecs::PointLightComponent>(e, pl);
+    }
+    if (je.contains("spotLight")) {
+        const ecs::SpotLightComponent sl =
+            spotLightFromJson(je["spotLight"]);
+        if (auto* p = w.get<ecs::SpotLightComponent>(e))
+            *p = sl;
+        else
+            w.add<ecs::SpotLightComponent>(e, sl);
+    }
+    if (je.contains("directionalLight") &&
+        je["directionalLight"].is_object()) {
+        const ecs::DirectionalLightComponent dl =
+            directionalLightFromJson(je["directionalLight"]);
+        if (auto* p = w.get<ecs::DirectionalLightComponent>(e))
+            *p = dl;
+        else
+            w.add<ecs::DirectionalLightComponent>(e, dl);
+    }
+
+    // 脚本
+    if (je.contains("script") && je["script"].is_object()) {
+        const json& js = je["script"];
+        ecs::ScriptComponent sc;
+        sc.path = js.value("path", std::string());
+        sc.enabled = js.value("enabled", true);
+        sc.timeScale = js.value("timeScale", 1.0f);
+        if (!sc.path.empty()) {
+            if (auto* p = w.get<ecs::ScriptComponent>(e))
+                *p = sc;
+            else
+                w.add<ecs::ScriptComponent>(e, sc);
+        }
+    }
+
+    // 音频源（G14-7）
+    //
+    // ⚠ `clip` 为空也照样把组件加上：那是编辑器里"刚点击 Add Audio
+    //   Source、还没选素材"的正常中间态。跳过它会让"加完组件存盘再
+    //   打开就没了"，而用户完全看不出原因。
+    if (je.contains("audio") && je["audio"].is_object()) {
+        const json& ja = je["audio"];
+        ecs::AudioSourceComponent as;
+        as.clip = ja.value("clip", std::string());
+        as.playOnAwake = ja.value("playOnAwake", as.playOnAwake);
+        as.loop = ja.value("loop", as.loop);
+        as.spatial = ja.value("spatial", as.spatial);
+        as.volume = ja.value("volume", as.volume);
+        as.pitch = ja.value("pitch", as.pitch);
+        as.minDist = ja.value("minDist", as.minDist);
+        as.maxDist = ja.value("maxDist", as.maxDist);
+        as.rolloff = ja.value("rolloff", as.rolloff);
+        as.bus = ja.value("bus", as.bus);
+        as.streaming = ja.value("streaming", as.streaming);
+        if (auto* p = w.get<ecs::AudioSourceComponent>(e))
+            *p = as;
+        else
+            w.add<ecs::AudioSourceComponent>(e, as);
+    }
+    if (je.contains("audioListener") && je["audioListener"].is_boolean()) {
+        ecs::AudioListenerComponent al;
+        al.enabled = je["audioListener"].get<bool>();
+        if (auto* p = w.get<ecs::AudioListenerComponent>(e))
+            *p = al;
+        else
+            w.add<ecs::AudioListenerComponent>(e, al);
+    }
+
+    // 玩家 / 肢体标记
+    if (je.contains("player") && je["player"].is_object()) {
+        const json& jp = je["player"];
+        ecs::PlayerComponent pc;
+        pc.mode = (jp.value("mode", std::string("first")) == "third")
+                      ? ecs::PlayerMode::ThirdPerson
+                      : ecs::PlayerMode::FirstPerson;
+        pc.eyeHeight = jp.value("eyeHeight", pc.eyeHeight);
+        pc.moveSpeed = jp.value("moveSpeed", pc.moveSpeed);
+        pc.lookSpeed = jp.value("lookSpeed", pc.lookSpeed);
+        pc.yaw = jp.value("yaw", pc.yaw);
+        pc.pitch = jp.value("pitch", pc.pitch);
+        pc.camDistance = jp.value("camDistance", pc.camDistance);
+        pc.turnSpeed = jp.value("turnSpeed", pc.turnSpeed);
+        if (auto* p = w.get<ecs::PlayerComponent>(e))
+            *p = pc;
+        else
+            w.add<ecs::PlayerComponent>(e, pc);
+    }
+    if (je.contains("playerLimb") && je["playerLimb"].is_number_integer()) {
+        ecs::PlayerLimbComponent limb;
+        limb.kind = je["playerLimb"].get<int>();
+        if (auto* p = w.get<ecs::PlayerLimbComponent>(e))
+            p->kind = limb.kind;
+        else
+            w.add<ecs::PlayerLimbComponent>(e, limb);
+    }
+
+    // 碰撞体。position/rotation/scale 从文件读；**凸包顶点按网格重建**
+    // —— 它没进 JSON（见 collisionToJson 的说明）。
+    if (je.contains("collision") && je["collision"].is_object()) {
+        ecs::CollisionComponent cc = collisionFromJson(je["collision"]);
+        if (cc.shape == ecs::ColliderShape::ConvexHull) {
+            const auto* mc = w.get<ecs::MeshComponent>(e);
+            if (mc && mc->mesh) physics::refreshHullGeometry(*mc->mesh, cc);
+        }
+        if (auto* p = w.get<ecs::CollisionComponent>(e))
+            *p = cc;
+        else
+            w.add<ecs::CollisionComponent>(e, cc);
+    }
+
+    // 延迟贴花（R4-4）。组件只描述"盒体 + 参数 + 贴图"—— 盒体几何
+    // 由渲染器自建，所以这里不碰 MeshComponent（贴花实体通常没有网格）。
+    if (je.contains("decal") && je["decal"].is_object()) {
+        const ecs::DecalComponent dc = decalFromJson(assets, je["decal"]);
+        if (auto* p = w.get<ecs::DecalComponent>(e))
+            *p = dc;
+        else
+            w.add<ecs::DecalComponent>(e, dc);
+    }
+
+    // 地形（W4）。读盘只恢复组件；GPU 资源由渲染器在
+    // syncTerrains 里按需建（见 render/Renderer.cpp）。
+    if (je.contains("terrain") && je["terrain"].is_object()) {
+        const ecs::TerrainComponent tc = terrainFromJson(je["terrain"]);
+        if (auto* p = w.get<ecs::TerrainComponent>(e))
+            *p = tc;
+        else
+            w.add<ecs::TerrainComponent>(e, tc);
+    }
+
+    // 水体（2026-10-21）。没有资产：读盘就把整块参数塞回组件，
+    // GPU 资源由渲染器在 syncWaters 里按形状现建。
+    if (je.contains("water") && je["water"].is_object()) {
+        const ecs::WaterComponent wc = waterFromJson(je["water"]);
+        if (auto* p = w.get<ecs::WaterComponent>(e))
+            *p = wc;
+        else
+            w.add<ecs::WaterComponent>(e, wc);
+    }
+
+    // 玩家出生点（GameStart）
+    if (je.contains("gameStart") && je["gameStart"].is_object()) {
+        const ecs::GameStartComponent gs =
+            gameStartFromJson(je["gameStart"]);
+        if (auto* p = w.get<ecs::GameStartComponent>(e))
+            *p = gs;
+        else
+            w.add<ecs::GameStartComponent>(e, gs);
+    }
+
+    // 反射探针（R5-1）。与贴花同一形态：实体只提供变换 + 参数，
+    // 立方体贴图由渲染器烘（不落盘）。
+    if (je.contains("probe") && je["probe"].is_object()) {
+        const ecs::ReflectionProbeComponent rp =
+            reflectionProbeFromJson(je["probe"]);
+        if (auto* p = w.get<ecs::ReflectionProbeComponent>(e))
+            *p = rp;
+        else
+            w.add<ecs::ReflectionProbeComponent>(e, rp);
+    }
+
+    // GPU 粒子发射器（R6-1）。粒子本身**不落盘**（瞬时状态），
+    // 存的是发射器的配置；打开场景时从帧号 1 重新发射。
+    if (je.contains("particleEmitter") &&
+        je["particleEmitter"].is_object()) {
+        const ecs::ParticleEmitterComponent fx =
+            particleEmitterFromJson(je["particleEmitter"]);
+        if (auto* p = w.get<ecs::ParticleEmitterComponent>(e))
+            *p = fx;
+        else
+            w.add<ecs::ParticleEmitterComponent>(e, fx);
+    }
+
+    // 刚体（R7-1）。只是**数据**：真正的 physics::RigidBody 由编辑器在
+    // 进入 Play 时按它建（见 EditorApp::buildPhysicsWorld）。编辑态读盘
+    // 之后场景里就多了一个"待仿真的物体"，仅此而已。
+    if (je.contains("rigidbody") && je["rigidbody"].is_object()) {
+        const ecs::RigidBodyComponent rb = rigidBodyFromJson(je["rigidbody"]);
+        if (auto* p = w.get<ecs::RigidBodyComponent>(e))
+            *p = rb;
+        else
+            w.add<ecs::RigidBodyComponent>(e, rb);
+    }
+
+    // 角色控制器（G07）/ 触发体 / 物理材质（G08）/ 相机（G09）。
+    // 全是纯数据：真正的行为由运行时或编辑器在 Play 时消费。
+    if (je.contains("character") && je["character"].is_object()) {
+        const ecs::CharacterControllerComponent ch =
+            characterFromJson(je["character"]);
+        if (auto* p = w.get<ecs::CharacterControllerComponent>(e))
+            *p = ch;
+        else
+            w.add<ecs::CharacterControllerComponent>(e, ch);
+    }
+    if (je.contains("trigger") && je["trigger"].is_object()) {
+        const ecs::TriggerComponent tr = triggerFromJson(je["trigger"]);
+        if (auto* p = w.get<ecs::TriggerComponent>(e))
+            *p = tr;
+        else
+            w.add<ecs::TriggerComponent>(e, tr);
+    }
+    if (je.contains("physicsMaterial") && je["physicsMaterial"].is_object()) {
+        const ecs::PhysicsMaterialComponent pm =
+            physicsMaterialFromJson(je["physicsMaterial"]);
+        if (auto* p = w.get<ecs::PhysicsMaterialComponent>(e))
+            *p = pm;
+        else
+            w.add<ecs::PhysicsMaterialComponent>(e, pm);
+    }
+    if (je.contains("camera") && je["camera"].is_object()) {
+        const ecs::CameraComponent cm =
+            cameraComponentFromJson(je["camera"]);
+        if (auto* p = w.get<ecs::CameraComponent>(e))
+            *p = cm;
+        else
+            w.add<ecs::CameraComponent>(e, cm);
+    }
+
+    // 动画键盘映射（P4）。与 skinned 同一实体；缺块 = 没绑过键（正常）。
+    if (je.contains("animKeys") && je["animKeys"].is_object()) {
+        const ecs::AnimKeyMapComponent akm =
+            animKeyMapFromJson(je["animKeys"]);
+        if (auto* p = w.get<ecs::AnimKeyMapComponent>(e))
+            *p = akm;
+        else
+            w.add<ecs::AnimKeyMapComponent>(e, akm);
+    }
+
+    // 预制体成员标记（G18）。**必须读回来**：少了它，存一次盘实例就脱钩
+    // （改母版不再跟着变），而画面上完全看不出来 —— 这是本功能最容易
+    // "看起来做完了其实没做"的地方。
+    if (je.contains("prefab") && je["prefab"].is_object()) {
+        const json& jp = je["prefab"];
+        ecs::PrefabLinkComponent pl;
+        pl.prefabPath = jp.value("path", std::string());
+        pl.localId = jp.value("localId", std::string());
+        pl.instance = jp.value("instance", 0u);
+        pl.root = jp.value("root", false);
+        if (jp.contains("overrides") && jp["overrides"].is_array()) {
+            for (const auto& o : jp["overrides"])
+                if (o.is_string()) pl.overrides.push_back(o.get<std::string>());
+        }
+        w.add<ecs::PrefabLinkComponent>(e, pl);
+    }
+
+    // ⚠ 与写端（saveSceneFromJson 里那份）必须一字不差，理由见那里。
+    const bool hasNonMeshContent =
+        je.contains("terrain") || je.contains("water") ||
+        je.contains("decal") || je.contains("probe") ||
+        je.contains("particleEmitter") || je.contains("rigidbody") ||
+        je.contains("character") || je.contains("trigger") ||
+        je.contains("physicsMaterial") || je.contains("camera") ||
+        je.contains("skinned") || je.contains("animator") ||
+        je.contains("morph") ||
+        // 表演层三件套 + IK + 挂点。**必须在这里**：一个只挂 IK/挂点的
+        // 实体可以没有网格（挂点是"钉在别人骨头上的空物体"就是典型），
+        // 漏了它会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+        // springBone / lookAt 原来也漏在这儿（同一类 bug），一起补。
+        je.contains("springBone") || je.contains("lookAt") ||
+        je.contains("ik") || je.contains("attach") ||
+        je.contains("animClip") || je.contains("gameStart") ||
+        je.contains("animKeys") ||
+        // C1 过场时间轴。挂它的实体**通常没有网格**（就是一根"导演轨"），
+        // 漏在这里会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+        // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
+        je.contains("sequencer") ||
+        // C2 对话。同样通常挂在没有网格的"导演轨"实体上 —— 漏了会被
+        // 算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+        je.contains("dialogue") ||
+        je.contains("pointLight") || je.contains("spotLight") ||
+        je.contains("directionalLight") || je.contains("player") ||
+        je.contains("playerLimb") || je.contains("folder") ||
+        // G18 预制体成员标记。prefab 里可以有"纯分组节点"（没有网格、
+        // 只有 children），漏了它会被算进 skipped。
+        je.contains("prefab");
+    return mesh || mat || hasNonMeshContent;
+}
+
+
 json buildSceneJson(const Scene& scene, SceneIoResult& r) {
     const ecs::World& w = scene.world();
 
@@ -2763,275 +3644,11 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
 
     root["entities"] = json::array();
     for (const Item& it : items) {
-        json je;
-        const std::string* nm = w.name(it.entity);
-        je["name"] = nm ? *nm : std::string("Entity");
-
-        je["transform"] = json{
-            {"position", vec3ToJson(it.transform->position)},
-            {"rotation", vec3ToJson(it.transform->rotation)},
-            {"scale", vec3ToJson(it.transform->scale)},
-        };
-
-        if (const auto* vis = w.get<ecs::VisibilityComponent>(it.entity)) {
-            je["visible"] = vis->visible;
-            je["castShadow"] = vis->castShadow;
-        }
-
-        // 编辑器锁定（"看得见、动不了"；自带地面就是靠它固定的）
-        if (w.has<ecs::LockedComponent>(it.entity)) je["locked"] = true;
-
-        int parentIndex = -1;
-        if (const auto* h = w.get<ecs::HierarchyComponent>(it.entity)) {
-            if (h->parent != ecs::kInvalidEntity) {
-                auto f = indexOf.find(h->parent);
-                if (f != indexOf.end()) parentIndex = f->second;
-            }
-            // "文件夹"标记（Hierarchy 里显示成目录图标的纯分组节点）
-            if (h->group) je["folder"] = true;
-        }
-        je["parent"] = parentIndex;
-
-        const auto* mc = w.get<ecs::MeshComponent>(it.entity);
-        const auto* matc = w.get<ecs::MaterialComponent>(it.entity);
-        je["mesh"] = meshSourceToJson(mc ? mc->mesh : nullptr);
-        je["material"] = materialToJson(matc ? matc->material : nullptr);
-        // 内置图元的生成参数（编辑器可回改，见 ecs::MeshComponent::primitive）
-        if (mc) {
-            json jp = primitiveParamsToJson(*mc);
-            if (!jp.is_null()) je["primitive"] = jp;
-        }
-
-        // 局部光源（位置在 transform 里，已经存过了）
-        if (const auto* pl = w.get<ecs::PointLightComponent>(it.entity))
-            je["pointLight"] = pointLightToJson(*pl);
-        if (const auto* sl = w.get<ecs::SpotLightComponent>(it.entity))
-            je["spotLight"] = spotLightToJson(*sl);
-        // 实体级方向光（补光；场景级太阳走顶层 "light" 字段）
-        if (const auto* dl = w.get<ecs::DirectionalLightComponent>(it.entity))
-            je["directionalLight"] = directionalLightToJson(*dl);
-
-        // 碰撞体（几何是派生数据，只存来源与摆放，见 collisionToJson）
-        if (const auto* cc = w.get<ecs::CollisionComponent>(it.entity))
-            je["collision"] = collisionToJson(*cc);
-
-        // 延迟贴花（R4-4）。注意：贴花**没有网格**，所以下面那句
-        // "mesh 为空 → skipped++" 对它不适用 —— 只有贴花的实体是合法的。
-        if (const auto* dc = w.get<ecs::DecalComponent>(it.entity))
-            je["decal"] = decalToJson(*dc);
-
-        // 地形（W4）。它**没有网格组件** —— 几何由高度图在渲染层生成，
-        // 所以同样不适用下面那句 "mesh 为空 → skipped++"。
-        if (const auto* tc = w.get<ecs::TerrainComponent>(it.entity))
-            je["terrain"] = terrainToJson(*tc);
-
-        // 水体（2026-10-21）：全部参数都是场景数据，整份落盘
-        if (const auto* wc = w.get<ecs::WaterComponent>(it.entity))
-            je["water"] = waterToJson(*wc);
-
-        // 玩家出生点（仿 UE5 PlayerStart）。没有网格：只有一个位置 + 朝向，
-        // 视口里的 Q 版小人由编辑器叠加层画，不进场景实体。
-        if (const auto* gs = w.get<ecs::GameStartComponent>(it.entity))
-            je["gameStart"] = gameStartToJson(*gs);
-
-        // 反射探针（R5-1）。与贴花同理：探针**没有网格**，
-        // 下面那句 "mesh 为空 → skipped++" 对它也不适用。
-        if (const auto* rp = w.get<ecs::ReflectionProbeComponent>(it.entity))
-            je["probe"] = reflectionProbeToJson(*rp);
-
-        // 蒙皮 / 骨骼动画（角色链 A0-2）。模型根实体**没有网格**，
-        // 所以它同样不适用下面那句 "mesh 为空 → skipped++"。
-        if (const auto* sk = w.get<ecs::SkinnedMeshComponent>(it.entity)) {
-            json js = skinnedToJson(*sk);
-            if (!js.is_null()) je["skinned"] = js;
-            VK_LOG_INFO("SCENE-SKINNED entity=%u clip=%s speed=%.2f "
-                        "playing=%d loop=%d stored=%d",
-                        static_cast<unsigned>(it.entity.id),
-                        sk->clipName.c_str(), static_cast<double>(sk->speed),
-                        sk->playing ? 1 : 0, sk->loop ? 1 : 0,
-                        js.is_null() ? 0 : 1);
-        }
-
-        // 表情滑条（§15）。与 skinned 同一个实体（模型根），紧跟其后。
-        if (const auto* mp = w.get<ecs::MorphComponent>(it.entity)) {
-            json jm = morphToJson(*mp);
-            if (!jm.is_null()) je["morph"] = std::move(jm);
-            VK_LOG_INFO("SCENE-MORPH entity=%u stored=%d channels=%d",
-                        static_cast<unsigned>(it.entity.id),
-                        jm.is_null() ? 0 : 1,
-                        mp->model
-                            ? static_cast<int>(mp->model->morphRig.channelCount())
-                            : 0);
-        }
-
-        // GPU 粒子发射器（R6-1）。与贴花 / 探针同理：发射器**没有网格**
-        //（几何是顶点着色器现拼的 billboard），同样不适用 skipped++ 那句。
-        if (const auto* fx = w.get<ecs::ParticleEmitterComponent>(it.entity))
-            je["particleEmitter"] = particleEmitterToJson(*fx);
-
-        // 刚体（R7-1）。与贴花 / 探针 / 发射器同理：它也不带网格 ——
-        // "隐形的墙"就是一个只有刚体的实体，所以下面那句 skipped++ 同样
-        // 要为它开一个口子。位置/朝向已经在 transform 里，这里只存参数。
-        if (const auto* rb = w.get<ecs::RigidBodyComponent>(it.entity))
-            je["rigidbody"] = rigidBodyToJson(*rb);
-
-        // 动画器（角色链 A1）。挂在同一个模型根实体上，紧跟 skinned 之后。
-        // 存盘顺序 = 读档顺序，所以 animatorFromJson 里的 modelFromSource
-        // 一定能命中 AssetManager 缓存（键 = modelKey）。
-        if (const auto* an = w.get<ecs::AnimatorComponent>(it.entity)) {
-            je["animator"] = animatorToJson(*an);
-            VK_LOG_INFO("SCENE-ANIMATOR entity=%u clip=%s time=%.3f "
-                        "speed=%.2f playing=%d loop=%d ctrl=%d",
-                        static_cast<unsigned>(it.entity.id),
-                        an->defaultClip.c_str(),
-                        static_cast<double>(an->time),
-                        static_cast<double>(an->speed), an->playing ? 1 : 0,
-                        an->loop ? 1 : 0,
-                        an->controllerPath.empty() ? 0 : 1);
-        }
-
-        // 表演层（L2/L4，2026-10-25）。紧跟 animator：三者是同一个角色的
-        // 三层（播什么 / 头看哪 / 头发怎么飘），读档顺序上也没有依赖。
-        if (const auto* sb = w.get<ecs::SpringBoneComponent>(it.entity))
-            je["springBone"] = springBoneToJson(*sb);
-        if (const auto* la = w.get<ecs::LookAtComponent>(it.entity))
-            je["lookAt"] = lookAtToJson(*la);
-        if (const auto* ik = w.get<ecs::TwoBoneIKComponent>(it.entity))
-            je["ik"] = ikToJson(*ik);
-        if (const auto* at = w.get<ecs::BoneAttachmentComponent>(it.entity))
-            je["attach"] = attachToJson(*at);
-
-        // 过场时间轴（C1，2026-10-26）。挂在任意实体上；同一场景可以挂多段，
-        // 由 priority 决定这一帧谁在跑。空路径不写（与 animClip 同一条理由：
-        // 别给每个实体都添一个空块，场景 diff 会全是噪音）。
-        if (const auto* sq = w.get<ecs::SequencerComponent>(it.entity)) {
-            if (!sq->sequencePath.empty()) {
-                je["sequencer"] = sequencerToJson(*sq);
-                VK_LOG_INFO("SCENE-SEQUENCER entity=%u path=%s dur=%.3f "
-                            "keys=%d events=%d pri=%d",
-                            static_cast<unsigned>(it.entity.id),
-                            sq->sequencePath.c_str(),
-                            static_cast<double>(sq->asset.duration),
-                            static_cast<int>(sq->asset.cameraKeys.size()),
-                            static_cast<int>(sq->asset.events.size()), sq->priority);
-            }
-        }
-
-        // 实体 transform 关键帧轨道（编辑器 Animation 模式的产物）。
-        // 空轨道**不写** —— 否则每个用过的实体都会多一个 {"keys":[]}，
-        // 场景文件的 diff 全是噪音。
-        if (const auto* ac = w.get<ecs::AnimationClipComponent>(it.entity)) {
-            if (!ac->keys.empty()) je["animClip"] = animClipToJson(*ac);
-        }
-
-        // 角色控制器（G07）。与刚体**互斥**：角色是运动学的，由
-        // stepCharacter 驱动，不交给物理求解器（互斥关系在 Inspector 里
-        // 会给出提示，见 InspectorPanel 的 "角色控制器" 段）。
-        if (const auto* chc =
-                w.get<ecs::CharacterControllerComponent>(it.entity))
-            je["character"] = characterToJson(*chc);
-
-        // 触发体（G08）/ 物理材质（G08）/ 相机（G09）
-        if (const auto* trg = w.get<ecs::TriggerComponent>(it.entity))
-            je["trigger"] = triggerToJson(*trg);
-        if (const auto* pmat =
-                w.get<ecs::PhysicsMaterialComponent>(it.entity))
-            je["physicsMaterial"] = physicsMaterialToJson(*pmat);
-        if (const auto* cam = w.get<ecs::CameraComponent>(it.entity))
-            je["camera"] = cameraComponentToJson(*cam);
-
-        // 动画键盘映射（P4）。空表不写（理由见 animKeyMapToJson）。
-        if (const auto* akm = w.get<ecs::AnimKeyMapComponent>(it.entity)) {
-            if (!akm->entries.empty()) je["animKeys"] = animKeyMapToJson(*akm);
-        }
-
-        // 脚本（只有路径与开关，脚本源码本身是独立文件）
-        if (const auto* sc = w.get<ecs::ScriptComponent>(it.entity)) {
-            je["script"] = json{
-                {"path", sc->path},
-                {"enabled", sc->enabled},
-                {"timeScale", sc->timeScale},
-            };
-        }
-
-        // 音频源（G14-7）。字段少 → **全写**（读端每个字段都有默认，
-        // 所以旧场景不受影响；而"只写非默认值"会让"我把 volume 调回 1.0
-        // 之后存档里为什么没这个键"变成一个要解释的问题）。
-        if (const auto* asc = w.get<ecs::AudioSourceComponent>(it.entity)) {
-            je["audio"] = json{
-                {"clip", asc->clip},
-                {"playOnAwake", asc->playOnAwake},
-                {"loop", asc->loop},
-                {"spatial", asc->spatial},
-                {"volume", asc->volume},
-                {"pitch", asc->pitch},
-                {"minDist", asc->minDist},
-                {"maxDist", asc->maxDist},
-                {"rolloff", asc->rolloff},
-                {"bus", asc->bus},
-                {"streaming", asc->streaming},
-            };
-        }
-        // 听者标记：只有一个 bool，直接用裸 bool（对象形式没有第二个字段可放）
-        if (const auto* al = w.get<ecs::AudioListenerComponent>(it.entity))
-            je["audioListener"] = al->enabled;
-
-        // 玩家（walkPhase/bodyYaw/started 是运行态派生值，不存）
-        if (const auto* pc = w.get<ecs::PlayerComponent>(it.entity)) {
-            je["player"] = json{
-                {"mode", pc->mode == ecs::PlayerMode::ThirdPerson
-                             ? "third"
-                             : "first"},
-                {"eyeHeight", pc->eyeHeight},
-                {"moveSpeed", pc->moveSpeed},
-                {"lookSpeed", pc->lookSpeed},
-                {"yaw", pc->yaw},
-                {"pitch", pc->pitch},
-                {"camDistance", pc->camDistance},
-                {"turnSpeed", pc->turnSpeed},
-            };
-        }
-        if (const auto* limb = w.get<ecs::PlayerLimbComponent>(it.entity))
-            je["playerLimb"] = limb->kind;
-
-        // "有没有内容"：没有网格时，贴花 / 探针 / 发射器 / 刚体 / 角色 /
-        // 触发体 / 物理材质 / 相机 / **蒙皮** 任意一个存在就不算空 —— 它们
-        // 都是"没有网格但有意义"的实体（隐形的墙、触发区域、相机机位、
-        // 模型根节点）。
-        //
-        // ⚠ 这份名单必须与**读端**（loadSceneFromJson 末尾）一字不差。
-        //   两处不一致的后果不是崩溃，而是 `skipped` 计数骗人：
-        //   2026-11 实测，第三人称模板场景（2 个实体：地面 + 出生点）报
-        //   `entities=2 skipped=1` —— 出生点被当成"空实体"，可它其实
-        //   好好加载了。而回归脚本正是拿 `skipped=0` 断言"没丢东西"的，
-        //   假红比不报更费时间。
-        const bool hasNonMeshContent =
-            je.contains("terrain") || je.contains("water") ||
-            je.contains("decal") || je.contains("probe") ||
-            je.contains("particleEmitter") || je.contains("rigidbody") ||
-            je.contains("character") || je.contains("trigger") ||
-            je.contains("physicsMaterial") || je.contains("camera") ||
-            je.contains("skinned") || je.contains("animator") ||
-            je.contains("morph") ||
-            // 表演层三件套 + IK + 挂点。**必须在这里**：一个只挂 IK/挂点的
-            // 实体可以没有网格（挂点是"钉在别人骨头上的空物体"就是典型），
-            // 漏了它会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
-            // springBone / lookAt 原来也漏在这儿（同一类 bug），一起补。
-            je.contains("springBone") || je.contains("lookAt") ||
-            je.contains("ik") || je.contains("attach") ||
-            je.contains("animClip") || je.contains("gameStart") ||
-            je.contains("animKeys") ||
-            // C1 过场时间轴。挂它的实体**通常没有网格**（就是一根"导演轨"），
-            // 漏在这里会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
-            // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
-            je.contains("sequencer") ||
-            je.contains("pointLight") || je.contains("spotLight") ||
-            je.contains("directionalLight") || je.contains("player") ||
-            je.contains("playerLimb") || je.contains("folder");
-        if (je["mesh"].is_null() && !hasNonMeshContent)
+        json jent;
+        if (entityToJsonImpl(w, it.entity, *it.transform, indexOf, jent))
+            root["entities"].push_back(std::move(jent));
+        else
             ++r.skipped;
-
-        root["entities"].push_back(std::move(je));
     }
 
     r.entities = static_cast<int>(items.size());
@@ -3108,28 +3725,8 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
         }
         const std::string name = je.value("name", std::string("Entity"));
         ecs::Entity e = scene.createObject(name);
-
-        if (je.contains("transform") && je["transform"].is_object()) {
-            const json& jt = je["transform"];
-            if (auto* t = w.get<ecs::TransformComponent>(e)) {
-                if (jt.contains("position"))
-                    t->position = vec3FromJson(jt["position"], t->position);
-                if (jt.contains("rotation"))
-                    t->rotation = vec3FromJson(jt["rotation"], t->rotation);
-                if (jt.contains("scale"))
-                    t->scale = vec3FromJson(jt["scale"], glm::vec3(1.0f));
-            }
-        }
-
-        if (auto* vis = w.get<ecs::VisibilityComponent>(e)) {
-            vis->visible = je.value("visible", true);
-            vis->castShadow = je.value("castShadow", true);
-        }
-
-        if (je.value("locked", false)) {
-            if (!w.has<ecs::LockedComponent>(e)) w.add<ecs::LockedComponent>(e);
-        }
-
+        // 外壳（transform / visible / locked）与 Prefab 实例化共用一份实现
+        entityApplyShell(scene, je, e);
         created.push_back(e);
     }
 
@@ -3141,461 +3738,7 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
         ecs::Entity e = created[i];
         if (!e.valid()) continue;
 
-        const int parentIndex = je.value("parent", -1);
-        if (parentIndex >= 0 &&
-            parentIndex < static_cast<int>(created.size()) &&
-            created[static_cast<size_t>(parentIndex)].valid()) {
-            scene.setParent(e, created[static_cast<size_t>(parentIndex)]);
-        }
-
-        // "文件夹"标记
-        if (je.value("folder", false)) {
-            if (auto* h = w.get<ecs::HierarchyComponent>(e)) h->group = true;
-        }
-
-        assets::Mesh* mesh = resolveMesh(
-            assets, je.contains("mesh") ? je["mesh"] : json(nullptr));
-        assets::Material* mat = resolveMaterial(
-            assets, je.contains("material") ? je["material"] : json(nullptr));
-
-        if (mesh) {
-            if (!w.has<ecs::MeshComponent>(e)) {
-                ecs::MeshComponent fresh;
-                fresh.mesh = mesh;
-                w.add<ecs::MeshComponent>(e, fresh);
-            }
-            if (auto* mc = w.get<ecs::MeshComponent>(e)) {
-                mc->mesh = mesh;
-                // 图元生成参数（没有就是默认值 —— 老场景文件也走这条）
-                if (je.contains("primitive"))
-                    primitiveParamsFromJson(*mc, je["primitive"]);
-            }
-        }
-        if (mat) {
-            if (auto* matc = w.get<ecs::MaterialComponent>(e))
-                matc->material = mat;
-            else
-                w.add<ecs::MaterialComponent>(e, ecs::MaterialComponent{mat});
-        }
-
-        // ---- 蒙皮 / 骨骼动画（A0-2）----
-        // ⚠ 放在网格重建**之后**：那时 AssetManager 里模型已经热了，
-        //   `loadFBX/loadGLTF` 直接命中缓存（键 = `modelKey`）。
-        // ⚠ 老场景没有这个键 → 不建组件 → 逐像素等于今天。
-        if (je.contains("skinned")) {
-            ecs::SkinnedMeshComponent sk;
-            if (skinnedFromJson(assets, je["skinned"], sk)) {
-                if (auto* p = w.get<ecs::SkinnedMeshComponent>(e))
-                    *p = sk;
-                else
-                    w.add<ecs::SkinnedMeshComponent>(e, sk);
-                VK_LOG_INFO("SCENE-SKINNED entity=%u clip=%s speed=%.2f "
-                            "playing=%d loop=%d time=%.3f joints=%d ok=1",
-                            static_cast<unsigned>(e.id), sk.clipName.c_str(),
-                            static_cast<double>(sk.speed), sk.playing ? 1 : 0,
-                            sk.loop ? 1 : 0, static_cast<double>(sk.time),
-                            sk.model ? sk.model->skeleton->jointCount() : 0);
-            } else {
-                VK_LOG_INFO("SCENE-SKINNED entity=%u ok=0",
-                            static_cast<unsigned>(e.id));
-            }
-        }
-
-        // ---- 表情滑条（§15）----
-        // 在 skinned 之后：`modelFromSource` 命中的是同一个 AssetManager
-        // 缓存项（键 = modelKey），所以 morphRig 已经建好了。
-        // ⚠ 老场景没有这个键 → 不建组件 → 逐像素不变（滑条全 0 时
-        //   GPU 形变分支本来就不执行，见 pbr.vert 的 `mi.z > 0`）。
-        if (je.contains("morph")) {
-            ecs::MorphComponent mp;
-            if (morphFromJson(assets, je["morph"], mp)) {
-                if (auto* p = w.get<ecs::MorphComponent>(e))
-                    *p = mp;
-                else
-                    w.add<ecs::MorphComponent>(e, mp);
-                VK_LOG_INFO("SCENE-MORPH entity=%u channels=%d ok=1",
-                            static_cast<unsigned>(e.id),
-                            static_cast<int>(mp.weights.size()));
-            } else {
-                VK_LOG_INFO("SCENE-MORPH entity=%u ok=0",
-                            static_cast<unsigned>(e.id));
-            }
-        }
-
-        // ---- 动画器（角色链 A1）----
-        // 必须在 skinned **之后**：它的 model 可以为空，靠 AnimatorSystem
-        // 回退到刚建好的 SkinnedMeshComponent::model。
-        // ⚠ 老场景没有这个键 → 不建组件 → 走 A0 老路径，逐像素不变。
-        if (je.contains("animator")) {
-            ecs::AnimatorComponent an;
-            if (animatorFromJson(assets, je["animator"], an)) {
-                if (auto* p = w.get<ecs::AnimatorComponent>(e))
-                    *p = an;
-                else
-                    w.add<ecs::AnimatorComponent>(e, an);
-                VK_LOG_INFO("SCENE-ANIMATOR entity=%u clip=%s time=%.3f "
-                            "speed=%.2f playing=%d loop=%d model=%d ok=1",
-                            static_cast<unsigned>(e.id),
-                            an.defaultClip.c_str(),
-                            static_cast<double>(an.time),
-                            static_cast<double>(an.speed),
-                            an.playing ? 1 : 0, an.loop ? 1 : 0,
-                            an.model ? 1 : 0);
-            } else {
-                VK_LOG_INFO("SCENE-ANIMATOR entity=%u ok=0",
-                            static_cast<unsigned>(e.id));
-            }
-        }
-
-        // 过场时间轴（C1）。与 springBone 那几块无关，位置随意；
-        // 资产是**懒加载**的（第一次 tick 才读盘），所以这里只存路径。
-        if (je.contains("sequencer")) {
-            ecs::SequencerComponent sq;
-            if (sequencerFromJson(je["sequencer"], sq)) {
-                if (auto* p = w.get<ecs::SequencerComponent>(e))
-                    *p = sq;
-                else
-                    w.add<ecs::SequencerComponent>(e, sq);
-                VK_LOG_INFO("SCENE-SEQUENCER entity=%u path=%s pri=%d ok=1",
-                            static_cast<unsigned>(e.id), sq.sequencePath.c_str(),
-                            sq.priority);
-            } else {
-                VK_LOG_INFO("SCENE-SEQUENCER entity=%u ok=0", static_cast<unsigned>(e.id));
-            }
-        }
-
-        // 表演层（L2/L4）。必须在 skinned 之后 —— 两者的算法都要骨架，
-        // 而骨架来自 SkinnedMeshComponent::model。
-        if (je.contains("springBone")) {
-            ecs::SpringBoneComponent sb;
-            springBoneFromJson(je["springBone"], sb);
-            if (auto* p = w.get<ecs::SpringBoneComponent>(e))
-                *p = sb;
-            else
-                w.add<ecs::SpringBoneComponent>(e, sb);
-            VK_LOG_INFO("SCENE-SPRINGBONE entity=%u enabled=%d prefixes=%d",
-                        static_cast<unsigned>(e.id), sb.settings.enabled ? 1 : 0,
-                        static_cast<int>(sb.prefixes.size()));
-        }
-        if (je.contains("lookAt")) {
-            ecs::LookAtComponent la;
-            lookAtFromJson(je["lookAt"], la);
-            if (auto* p = w.get<ecs::LookAtComponent>(e))
-                *p = la;
-            else
-                w.add<ecs::LookAtComponent>(e, la);
-            VK_LOG_INFO("SCENE-LOOKAT entity=%u enabled=%d target=%d weight=%.2f",
-                        static_cast<unsigned>(e.id), la.settings.enabled ? 1 : 0,
-                        la.settings.hasTarget ? 1 : 0,
-                        static_cast<double>(la.settings.weight));
-        }
-        // IK：必须在 skinned 之后（要骨架才能解析链）；
-        // 挂点则只要宿主**存在**即可，但它引用的 jointMatrices 要等运行时
-        // 第一次 tick 才有 —— 读档时链没解析出来是正常的，不是错误。
-        if (je.contains("ik")) {
-            ecs::TwoBoneIKComponent ik;
-            ikFromJson(je["ik"], ik);
-            if (auto* p = w.get<ecs::TwoBoneIKComponent>(e))
-                *p = ik;
-            else
-                w.add<ecs::TwoBoneIKComponent>(e, ik);
-            VK_LOG_INFO("SCENE-IK entity=%u enabled=%d target=%d weight=%.2f "
-                        "root=[%s]",
-                        static_cast<unsigned>(e.id), ik.settings.enabled ? 1 : 0,
-                        ik.settings.hasTarget ? 1 : 0,
-                        static_cast<double>(ik.settings.weight),
-                        ik.settings.rootBone.c_str());
-        }
-        if (je.contains("attach")) {
-            ecs::BoneAttachmentComponent at;
-            attachFromJson(je["attach"], at);
-            if (auto* p = w.get<ecs::BoneAttachmentComponent>(e))
-                *p = at;
-            else
-                w.add<ecs::BoneAttachmentComponent>(e, at);
-            VK_LOG_INFO("SCENE-ATTACH entity=%u host=[%s] bone=[%s]",
-                        static_cast<unsigned>(e.id), at.hostName.c_str(),
-                        at.boneName.c_str());
-        }
-
-        // 实体 transform 关键帧轨道
-        if (je.contains("animClip")) {
-            const ecs::AnimationClipComponent ac =
-                animClipFromJson(je["animClip"]);
-            if (auto* p = w.get<ecs::AnimationClipComponent>(e))
-                *p = ac;
-            else
-                w.add<ecs::AnimationClipComponent>(e, ac);
-            // 读回来必须说清楚"读到几条、多长"：用户存完再开发现关键帧
-            // 没了，这条日志是唯一能分辨"没写进去"和"写了但被覆盖"的地方。
-            VK_LOG_INFO("SCENE-ANIMCLIP entity=%u keys=%d dur=%.2f loop=%d "
-                        "autoplay=%d time=%.2f",
-                        static_cast<unsigned>(e.id),
-                        static_cast<int>(ac.keys.size()),
-                        static_cast<double>(ac.duration), ac.loop ? 1 : 0,
-                        ac.autoplay ? 1 : 0, static_cast<double>(ac.time));
-        }
-
-        // 局部光源组件
-        if (je.contains("pointLight")) {
-            const ecs::PointLightComponent pl =
-                pointLightFromJson(je["pointLight"]);
-            if (auto* p = w.get<ecs::PointLightComponent>(e))
-                *p = pl;
-            else
-                w.add<ecs::PointLightComponent>(e, pl);
-        }
-        if (je.contains("spotLight")) {
-            const ecs::SpotLightComponent sl =
-                spotLightFromJson(je["spotLight"]);
-            if (auto* p = w.get<ecs::SpotLightComponent>(e))
-                *p = sl;
-            else
-                w.add<ecs::SpotLightComponent>(e, sl);
-        }
-        if (je.contains("directionalLight") &&
-            je["directionalLight"].is_object()) {
-            const ecs::DirectionalLightComponent dl =
-                directionalLightFromJson(je["directionalLight"]);
-            if (auto* p = w.get<ecs::DirectionalLightComponent>(e))
-                *p = dl;
-            else
-                w.add<ecs::DirectionalLightComponent>(e, dl);
-        }
-
-        // 脚本
-        if (je.contains("script") && je["script"].is_object()) {
-            const json& js = je["script"];
-            ecs::ScriptComponent sc;
-            sc.path = js.value("path", std::string());
-            sc.enabled = js.value("enabled", true);
-            sc.timeScale = js.value("timeScale", 1.0f);
-            if (!sc.path.empty()) {
-                if (auto* p = w.get<ecs::ScriptComponent>(e))
-                    *p = sc;
-                else
-                    w.add<ecs::ScriptComponent>(e, sc);
-            }
-        }
-
-        // 音频源（G14-7）
-        //
-        // ⚠ `clip` 为空也照样把组件加上：那是编辑器里"刚点击 Add Audio
-        //   Source、还没选素材"的正常中间态。跳过它会让"加完组件存盘再
-        //   打开就没了"，而用户完全看不出原因。
-        if (je.contains("audio") && je["audio"].is_object()) {
-            const json& ja = je["audio"];
-            ecs::AudioSourceComponent as;
-            as.clip = ja.value("clip", std::string());
-            as.playOnAwake = ja.value("playOnAwake", as.playOnAwake);
-            as.loop = ja.value("loop", as.loop);
-            as.spatial = ja.value("spatial", as.spatial);
-            as.volume = ja.value("volume", as.volume);
-            as.pitch = ja.value("pitch", as.pitch);
-            as.minDist = ja.value("minDist", as.minDist);
-            as.maxDist = ja.value("maxDist", as.maxDist);
-            as.rolloff = ja.value("rolloff", as.rolloff);
-            as.bus = ja.value("bus", as.bus);
-            as.streaming = ja.value("streaming", as.streaming);
-            if (auto* p = w.get<ecs::AudioSourceComponent>(e))
-                *p = as;
-            else
-                w.add<ecs::AudioSourceComponent>(e, as);
-        }
-        if (je.contains("audioListener") && je["audioListener"].is_boolean()) {
-            ecs::AudioListenerComponent al;
-            al.enabled = je["audioListener"].get<bool>();
-            if (auto* p = w.get<ecs::AudioListenerComponent>(e))
-                *p = al;
-            else
-                w.add<ecs::AudioListenerComponent>(e, al);
-        }
-
-        // 玩家 / 肢体标记
-        if (je.contains("player") && je["player"].is_object()) {
-            const json& jp = je["player"];
-            ecs::PlayerComponent pc;
-            pc.mode = (jp.value("mode", std::string("first")) == "third")
-                          ? ecs::PlayerMode::ThirdPerson
-                          : ecs::PlayerMode::FirstPerson;
-            pc.eyeHeight = jp.value("eyeHeight", pc.eyeHeight);
-            pc.moveSpeed = jp.value("moveSpeed", pc.moveSpeed);
-            pc.lookSpeed = jp.value("lookSpeed", pc.lookSpeed);
-            pc.yaw = jp.value("yaw", pc.yaw);
-            pc.pitch = jp.value("pitch", pc.pitch);
-            pc.camDistance = jp.value("camDistance", pc.camDistance);
-            pc.turnSpeed = jp.value("turnSpeed", pc.turnSpeed);
-            if (auto* p = w.get<ecs::PlayerComponent>(e))
-                *p = pc;
-            else
-                w.add<ecs::PlayerComponent>(e, pc);
-        }
-        if (je.contains("playerLimb") && je["playerLimb"].is_number_integer()) {
-            ecs::PlayerLimbComponent limb;
-            limb.kind = je["playerLimb"].get<int>();
-            if (auto* p = w.get<ecs::PlayerLimbComponent>(e))
-                p->kind = limb.kind;
-            else
-                w.add<ecs::PlayerLimbComponent>(e, limb);
-        }
-
-        // 碰撞体。position/rotation/scale 从文件读；**凸包顶点按网格重建**
-        // —— 它没进 JSON（见 collisionToJson 的说明）。
-        if (je.contains("collision") && je["collision"].is_object()) {
-            ecs::CollisionComponent cc = collisionFromJson(je["collision"]);
-            if (cc.shape == ecs::ColliderShape::ConvexHull) {
-                const auto* mc = w.get<ecs::MeshComponent>(e);
-                if (mc && mc->mesh) physics::refreshHullGeometry(*mc->mesh, cc);
-            }
-            if (auto* p = w.get<ecs::CollisionComponent>(e))
-                *p = cc;
-            else
-                w.add<ecs::CollisionComponent>(e, cc);
-        }
-
-        // 延迟贴花（R4-4）。组件只描述"盒体 + 参数 + 贴图"—— 盒体几何
-        // 由渲染器自建，所以这里不碰 MeshComponent（贴花实体通常没有网格）。
-        if (je.contains("decal") && je["decal"].is_object()) {
-            const ecs::DecalComponent dc = decalFromJson(assets, je["decal"]);
-            if (auto* p = w.get<ecs::DecalComponent>(e))
-                *p = dc;
-            else
-                w.add<ecs::DecalComponent>(e, dc);
-        }
-
-        // 地形（W4）。读盘只恢复组件；GPU 资源由渲染器在
-        // syncTerrains 里按需建（见 render/Renderer.cpp）。
-        if (je.contains("terrain") && je["terrain"].is_object()) {
-            const ecs::TerrainComponent tc = terrainFromJson(je["terrain"]);
-            if (auto* p = w.get<ecs::TerrainComponent>(e))
-                *p = tc;
-            else
-                w.add<ecs::TerrainComponent>(e, tc);
-        }
-
-        // 水体（2026-10-21）。没有资产：读盘就把整块参数塞回组件，
-        // GPU 资源由渲染器在 syncWaters 里按形状现建。
-        if (je.contains("water") && je["water"].is_object()) {
-            const ecs::WaterComponent wc = waterFromJson(je["water"]);
-            if (auto* p = w.get<ecs::WaterComponent>(e))
-                *p = wc;
-            else
-                w.add<ecs::WaterComponent>(e, wc);
-        }
-
-        // 玩家出生点（GameStart）
-        if (je.contains("gameStart") && je["gameStart"].is_object()) {
-            const ecs::GameStartComponent gs =
-                gameStartFromJson(je["gameStart"]);
-            if (auto* p = w.get<ecs::GameStartComponent>(e))
-                *p = gs;
-            else
-                w.add<ecs::GameStartComponent>(e, gs);
-        }
-
-        // 反射探针（R5-1）。与贴花同一形态：实体只提供变换 + 参数，
-        // 立方体贴图由渲染器烘（不落盘）。
-        if (je.contains("probe") && je["probe"].is_object()) {
-            const ecs::ReflectionProbeComponent rp =
-                reflectionProbeFromJson(je["probe"]);
-            if (auto* p = w.get<ecs::ReflectionProbeComponent>(e))
-                *p = rp;
-            else
-                w.add<ecs::ReflectionProbeComponent>(e, rp);
-        }
-
-        // GPU 粒子发射器（R6-1）。粒子本身**不落盘**（瞬时状态），
-        // 存的是发射器的配置；打开场景时从帧号 1 重新发射。
-        if (je.contains("particleEmitter") &&
-            je["particleEmitter"].is_object()) {
-            const ecs::ParticleEmitterComponent fx =
-                particleEmitterFromJson(je["particleEmitter"]);
-            if (auto* p = w.get<ecs::ParticleEmitterComponent>(e))
-                *p = fx;
-            else
-                w.add<ecs::ParticleEmitterComponent>(e, fx);
-        }
-
-        // 刚体（R7-1）。只是**数据**：真正的 physics::RigidBody 由编辑器在
-        // 进入 Play 时按它建（见 EditorApp::buildPhysicsWorld）。编辑态读盘
-        // 之后场景里就多了一个"待仿真的物体"，仅此而已。
-        if (je.contains("rigidbody") && je["rigidbody"].is_object()) {
-            const ecs::RigidBodyComponent rb = rigidBodyFromJson(je["rigidbody"]);
-            if (auto* p = w.get<ecs::RigidBodyComponent>(e))
-                *p = rb;
-            else
-                w.add<ecs::RigidBodyComponent>(e, rb);
-        }
-
-        // 角色控制器（G07）/ 触发体 / 物理材质（G08）/ 相机（G09）。
-        // 全是纯数据：真正的行为由运行时或编辑器在 Play 时消费。
-        if (je.contains("character") && je["character"].is_object()) {
-            const ecs::CharacterControllerComponent ch =
-                characterFromJson(je["character"]);
-            if (auto* p = w.get<ecs::CharacterControllerComponent>(e))
-                *p = ch;
-            else
-                w.add<ecs::CharacterControllerComponent>(e, ch);
-        }
-        if (je.contains("trigger") && je["trigger"].is_object()) {
-            const ecs::TriggerComponent tr = triggerFromJson(je["trigger"]);
-            if (auto* p = w.get<ecs::TriggerComponent>(e))
-                *p = tr;
-            else
-                w.add<ecs::TriggerComponent>(e, tr);
-        }
-        if (je.contains("physicsMaterial") && je["physicsMaterial"].is_object()) {
-            const ecs::PhysicsMaterialComponent pm =
-                physicsMaterialFromJson(je["physicsMaterial"]);
-            if (auto* p = w.get<ecs::PhysicsMaterialComponent>(e))
-                *p = pm;
-            else
-                w.add<ecs::PhysicsMaterialComponent>(e, pm);
-        }
-        if (je.contains("camera") && je["camera"].is_object()) {
-            const ecs::CameraComponent cm =
-                cameraComponentFromJson(je["camera"]);
-            if (auto* p = w.get<ecs::CameraComponent>(e))
-                *p = cm;
-            else
-                w.add<ecs::CameraComponent>(e, cm);
-        }
-
-        // 动画键盘映射（P4）。与 skinned 同一实体；缺块 = 没绑过键（正常）。
-        if (je.contains("animKeys") && je["animKeys"].is_object()) {
-            const ecs::AnimKeyMapComponent akm =
-                animKeyMapFromJson(je["animKeys"]);
-            if (auto* p = w.get<ecs::AnimKeyMapComponent>(e))
-                *p = akm;
-            else
-                w.add<ecs::AnimKeyMapComponent>(e, akm);
-        }
-
-        // ⚠ 与写端（saveSceneFromJson 里那份）必须一字不差，理由见那里。
-        const bool hasNonMeshContent =
-            je.contains("terrain") || je.contains("water") ||
-            je.contains("decal") || je.contains("probe") ||
-            je.contains("particleEmitter") || je.contains("rigidbody") ||
-            je.contains("character") || je.contains("trigger") ||
-            je.contains("physicsMaterial") || je.contains("camera") ||
-            je.contains("skinned") || je.contains("animator") ||
-            je.contains("morph") ||
-            // 表演层三件套 + IK + 挂点。**必须在这里**：一个只挂 IK/挂点的
-            // 实体可以没有网格（挂点是"钉在别人骨头上的空物体"就是典型），
-            // 漏了它会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
-            // springBone / lookAt 原来也漏在这儿（同一类 bug），一起补。
-            je.contains("springBone") || je.contains("lookAt") ||
-            je.contains("ik") || je.contains("attach") ||
-            je.contains("animClip") || je.contains("gameStart") ||
-            je.contains("animKeys") ||
-            // C1 过场时间轴。挂它的实体**通常没有网格**（就是一根"导演轨"），
-            // 漏在这里会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
-            // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
-            je.contains("sequencer") ||
-            je.contains("pointLight") || je.contains("spotLight") ||
-            je.contains("directionalLight") || je.contains("player") ||
-            je.contains("playerLimb") || je.contains("folder");
-        if (!mesh && !mat && !hasNonMeshContent) ++r.skipped;
+        if (!entityFromJsonImpl(scene, assets, je, e, created)) ++r.skipped;
     }
 
     r.ok = true;
@@ -3604,6 +3747,64 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
 }
 
 } // namespace
+
+// ============================================================
+// 公开：单实体 ↔ JSON（见 scene/SceneEntityIO.h）
+//
+// 这两个壳只做一件事：把匿名 namespace 里的 `entityTo*Impl` 递出去。
+// **不要**在这里写第二套字段处理 —— 那正是抽它们出来要避免的。
+// ============================================================
+
+bool entityToJson(const ecs::World& w, ecs::Entity e,
+                  const std::unordered_map<ecs::EntityId, int>& indexOf,
+                  nlohmann::json& out) {
+    const auto* tr = w.get<ecs::TransformComponent>(e);
+    if (!tr) {
+        // 没有变换的实体（场景级太阳）从来没进过场景 JSON；
+        // Prefab 也不该收它 —— 判"没内容"比判"没变换"更诚实的是后者，
+        // 但调用方只关心"要不要这个实体"，两种都返回 false。
+        out = nlohmann::json();
+        return false;
+    }
+    return entityToJsonImpl(w, e, *tr, indexOf, out);
+}
+
+bool entityFromJson(Scene& scene, assets::AssetManager& assets,
+                    const nlohmann::json& je, ecs::Entity e,
+                    const std::vector<ecs::Entity>& created) {
+    return entityFromJsonImpl(scene, assets, je, e, created);
+}
+
+void entityApplyShell(Scene& scene, const nlohmann::json& je, ecs::Entity e) {
+    ecs::World& w = scene.world();
+    if (!e.valid()) return;
+
+    if (je.contains("transform") && je["transform"].is_object()) {
+        const json& jt = je["transform"];
+        if (auto* t = w.get<ecs::TransformComponent>(e)) {
+            if (jt.contains("position"))
+                t->position = vec3FromJson(jt["position"], t->position);
+            if (jt.contains("rotation"))
+                t->rotation = vec3FromJson(jt["rotation"], t->rotation);
+            // ⚠ scale 的默认值是 1 而不是 `t->scale`：缺 key 时若保留旧值，
+            //   "把 scale 从 prefab 里删掉"就永远不生效。
+            if (jt.contains("scale"))
+                t->scale = vec3FromJson(jt["scale"], glm::vec3(1.0f));
+        }
+    }
+
+    if (auto* vis = w.get<ecs::VisibilityComponent>(e)) {
+        vis->visible = je.value("visible", true);
+        vis->castShadow = je.value("castShadow", true);
+    }
+
+    if (je.value("locked", false)) {
+        if (!w.has<ecs::LockedComponent>(e)) w.add<ecs::LockedComponent>(e);
+    } else if (w.has<ecs::LockedComponent>(e)) {
+        // 反向也要生效，否则 Revert 之后"锁定"会一直粘着。
+        w.remove<ecs::LockedComponent>(e);
+    }
+}
 
 // ============================================================
 // 公开接口：单独加载一份 .vmat

@@ -245,6 +245,39 @@ private:
     TransformSnapshot m_after;
 };
 
+// ---- 多选时的一次拖拽（2026-10-27 #316）----
+//
+// 为什么不是"每实体压一条 TransformEditCommand"：那样一次拖拽会在历史里
+// 留下 N 条同名记录，Ctrl+Z 要按 N 下才回到拖之前 —— 用户认为自己只做了
+// **一个**动作，历史里就该只有一条。
+//
+// 也不复用 TransformEditCommand 的合并逻辑（同实体 + 同名字 → 就地更新）：
+// 多选时"同名字"是常态，合并键要变成实体集合，改它反而会污染单选的路径。
+class MultiTransformEditCommand : public Command {
+public:
+    // 单项 = 一个实体在拖拽前后的 TRS 快照。
+    struct Item {
+        ecs::Entity entity{};
+        TransformSnapshot before;
+        TransformSnapshot after;
+    };
+
+    MultiTransformEditCommand(std::string name, scene::Scene* scene,
+                             std::vector<Item> items)
+        : m_name(std::move(name)), m_scene(scene), m_items(std::move(items)) {}
+
+    void undo() override;
+    void redo() override;
+    const char* name() const override { return m_name.c_str(); }
+
+    const std::vector<Item>& items() const { return m_items; }
+
+private:
+    std::string m_name;
+    scene::Scene* m_scene = nullptr;
+    std::vector<Item> m_items;
+};
+
 // 碰撞体的 TRS 编辑（W/E/R 拖手柄、Inspector 里的数值框）。
 //
 // 为什么不复用 TransformEditCommand：它写的是实体的 TransformComponent，
@@ -326,6 +359,45 @@ private:
     assets::AssetManager* m_assets = nullptr;
     std::string m_before;
     std::string m_after;
+};
+
+// ============================================================
+// 预制体 Apply：**文件 + 场景**一起回滚（G18）
+//
+// ⚠ 为什么不能用 `structuralEdit`：它只快照**场景**，而 Apply 同时改了
+//   磁盘上的 `.vprefab.json`。撤销场景而文件不回滚 → 下一次重新加载就把
+//   改动"复活"了，而屏幕上、撤销栈里一切正常 —— 这种"撤销了但没撤销"
+//   是本功能最难查的一类 bug（docs/persistence_roadmap.md §6.4 也点了名）。
+//
+// 场景那半边直接**组合**一个 `SceneSnapshotCommand`，不重写恢复逻辑：
+// 两份恢复代码迟早会不一致，而不一致的后果是"撤销后场景半新半旧"。
+// ============================================================
+class PrefabApplyCommand : public Command {
+public:
+    PrefabApplyCommand(std::string name, scene::Scene* scene,
+                       assets::AssetManager* assets, std::string prefabFullPath,
+                       std::string prefabBefore, std::string prefabAfter,
+                       std::string sceneBefore, std::string sceneAfter)
+        : m_name(std::move(name)),
+          m_sceneCmd(m_name, scene, assets, std::move(sceneBefore),
+                     std::move(sceneAfter)),
+          m_prefabPath(std::move(prefabFullPath)),
+          m_prefabBefore(std::move(prefabBefore)),
+          m_prefabAfter(std::move(prefabAfter)) {}
+
+    void undo() override;
+    void redo() override;
+    const char* name() const override { return m_name.c_str(); }
+
+private:
+    static void writePrefab(const std::string& fullPath,
+                            const std::string& text);
+
+    std::string m_name;
+    SceneSnapshotCommand m_sceneCmd;
+    std::string m_prefabPath;
+    std::string m_prefabBefore;
+    std::string m_prefabAfter;
 };
 
 } // namespace editor

@@ -75,11 +75,44 @@ bool parseDialogue(const std::string& text, const std::string& sourcePath,
 // 读盘后走 `parseDialogue`。路径按 `assets::resolveAssetPath` 解析。
 bool loadDialogue(const std::string& path, DialogueAsset& out);
 
+// ------------------------------------------------------------
+// 写回（剧本编辑器的存盘路径）
+// ------------------------------------------------------------
+// `toJson` 只写**作者写的东西**，四样东西刻意不写：
+//   · `index` —— 它是 `parseDialogue` 重建的缓存。落盘等于把"身份"写进
+//     文件，与 ① 那条坑同源（改一句 → 下标全错）。
+//   · `error` / `warnings` —— 加载期的诊断，不是内容。写进去下次读盘会
+//     把上次的警告当成"这次也这样"。
+//   · 空 `next` / 空 `choices` —— 整个字段省略。写 `"next": ""` 会让
+//     校验器以为作者显式指定了"跳到空 id"。
+//   · 中文**不转义**（`ensure_ascii=false`）：转义之后 diff 是一屏
+//     `\u5343\u590f`，作者没法用 git 看自己改了什么。
+//
+// `saveDialogue` 是**写临时文件再改名**，不是直接覆盖：写一半断电/磁盘满
+// 的后果是"文件打不开"，而存档点就在一个快捷键之外。
+bool saveDialogue(const std::string& path, const DialogueAsset& a,
+                  std::string& err);
+std::string toJson(const DialogueAsset& a);
+
 // id → 下标；找不到返回 -1。⚠ 调用方必须处理 -1，别拿它当"最后一个"。
 int findNode(const DialogueAsset& a, const std::string& id);
 
 // 打字机：`elapsed` 秒后应该显示多少个字符。
 // `cps <= 0` → 立刻全出（见 ④）；结果夹在 `[0, total]`。
 int revealedChars(float elapsed, float cps, int total);
+
+// ------------------------------------------------------------
+// UTF-8：打字机按**字符**走，不是按字节
+// ------------------------------------------------------------
+// ⚠⚠ 这是"省了就错"的第五条：`text[i]` 切出来的不是字，是字节。一个汉字
+//     占 3 字节，按字节截断会在中间劈开 —— 症状是**整行变成一串 `?`**
+//     （SdfFont 的缺字兜底），而且 `shown` 计数看起来"很合理"，日志也对。
+//     `str.substr(0, n)` 同理。
+//
+// 两个工具都按**码点**计：`utf8Count` 数出 n 个字符，`utf8Prefix` 取前 n 个
+// 字符。非法序列按 1 字节前进（与 `ui2::utf8Next` 同一条纪律：不能跳整段，
+// 否则一个坏字节会让后面整行字全丢）。
+int utf8Count(const std::string& s);
+std::string utf8Prefix(const std::string& s, int chars);
 
 } // namespace dialogue

@@ -26,6 +26,8 @@
 
 #include "EditorApp.h"
 
+#include "MultiSelectSelfTest.h"
+
 #include "core/Logger.h"
 #include "animation/AnimationSelfTest.h"
 #include "assets/AssetSelfTest.h"
@@ -108,6 +110,13 @@ int main(int argc, char** argv) {
         // （见文件头 P1：`Editor.exe --frames` 会照常渲染到超时且零提示）。
         if (std::getenv("MYVK_PROJECT_TEST") != nullptr) {
             const int failures = project::runProjectSelfTest();
+            return failures == 0 ? 0 : 1;
+        }
+
+        // 多选自检（#316）：选择集语义 / 支点 / 多目标撤销。纯 CPU，
+        // 同样在 Vulkan 与窗口之前返回。见 editor/MultiSelectSelfTest.h。
+        if (std::getenv("MYVK_MULTISELECT_TEST") != nullptr) {
+            const int failures = editor::runMultiSelectSelfTest();
             return failures == 0 ? 0 : 1;
         }
 

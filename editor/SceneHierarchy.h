@@ -32,6 +32,10 @@ public:
     // ---- 快捷键入口（由 EditorApp 转发，见 .cpp 里的说明）----
     void beginRenameSelection();   // F2
     void duplicateSelection();     // Ctrl+D
+    // Del / 右键 Delete。**多选时一次全删**（一条撤销记录），这是 #316 之后
+    // 与单选最大的行为差别 —— 所以两个入口（快捷键 / 右键菜单）都收敛到
+    // 这一个函数，谁也别自己再写一遍删除。
+    void deleteSelection();
 
 private:
     void drawNode(ecs::Entity e, int depth);
@@ -66,6 +70,19 @@ private:
     ecs::Entity m_pendingDelete{};
     ecs::Entity m_pendingDuplicate{};
     ecs::Entity m_pendingFocus{};
+    // 本帧的**可见行顺序**（DFS 结果，受过滤影响）。Shift 范围选择要它：
+    // 场景里没有"树的顺序"这种东西，只有 HierarchyComponent::children 的
+    // 顺序；而"哪些行真的画出来了"又是本面板自己的事。
+    // ⚠ 必须在画行**之前**整棵走完（不能边画边记）：点击落在第 5 行时，
+    //   第 6 行以后的顺序还没进表，Shift 会选出半个范围。
+    std::vector<ecs::Entity> m_flatOrder;
+    void collectFlatOrder(ecs::Entity e);
+
+    // 每行矩形的日志节流（见 .cpp 里的 HIER-ROW）。这两个成员只为自动化
+    // 服务：`m_rowLogNames` 记"上次这一行打印时叫什么"，名字没变就不打。
+    static constexpr int kMaxLoggedRows = 16;
+    int m_rowCursor = 0;
+    std::vector<std::string> m_rowLogNames;
     bool m_pendingCreate = false;
     PrimitiveKind m_pendingCreateKind = PrimitiveKind::Cube;
     // 新建到哪一级（无效 = 根下）；m_createAsFolder = 建成名为 Folder 的空节点
@@ -76,6 +93,16 @@ private:
     ecs::Entity m_reparentParent{};
     bool m_hasUnparent = false;
     ecs::Entity m_unparentTarget{};
+
+    // ---- G18 预制体（右键菜单三项）----
+    // 与删除/重设父级同样是 pending：菜单项的回调发生在遍历 ECS 的过程里，
+    // 而这三项都要建/改实体，只能等树画完之后再做。
+    bool m_hasPrefabCreate = false;
+    ecs::Entity m_prefabCreateTarget{};
+    bool m_hasPrefabApply = false;
+    ecs::Entity m_prefabApplyTarget{};
+    bool m_hasPrefabRevert = false;
+    ecs::Entity m_prefabRevertTarget{};
     // 文件夹标记（Mark / Unmark as Folder）
     bool m_hasGroupToggle = false;
     ecs::Entity m_groupTarget{};

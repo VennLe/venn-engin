@@ -49,7 +49,8 @@ bool endsWith(const std::string& s, const char* suffix) {
 }
 
 bool isFbxPath(const std::string& p) {
-    return endsWith(p, ".fbx") || endsWith(p, ".FBX");
+    // 判定本体在 `assets/AssetPath.*`（运行时的 `spawn()` 也走这一份）。
+    return assets::isFbxPath(p);
 }
 
 // 四段移动动画的**内建键位**显示名（只读徽标）。nullptr = 这一段没有内建控制。

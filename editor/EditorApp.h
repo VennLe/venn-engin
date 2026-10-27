@@ -85,6 +85,9 @@ class PhysicsPanel;
 class ParticlesPanel;
 class QualitySettingsPanel;   // E26
 class MaterialLibraryPanel;   // 2026-10-24：材质仓库
+class DialogueEditorWindow;   // 2026-10-27：剧本编辑器（#310）
+class TimelineEditorWindow;   // 2026-10-27：时间轴轨道编辑器（#311）
+class UiEditorWindow;         // 2026-10-27：UI 编辑器（#312）
 class LandscapeEditor;        // 2026-10-20：地形编辑模式
 class FoliageEditor;          // 2026-10-20：植被编辑模式
 // 2026-10-20 晚：下拉里其余 6 个模式（ToolkitEditors.h / .cpp）
@@ -200,6 +203,15 @@ private:
     static void panelDrawPCG(EditorApp& a);
     static void panelDrawWater(EditorApp& a);
     static void panelDrawMaterialLibrary(EditorApp& a);
+    // 剧本编辑器：和 Character 一样，窗口对象自己管 open/close，表项只做
+    // 显隐同步（真正的 draw 在 drawDialogueEditorWindow 里，每帧无条件跑）
+    static void panelDrawDialogueEditor(EditorApp& a);
+    // 时间轴编辑器（#311）：与 Script editor 完全同构（窗口对象自己管
+    // open/close，表项只做显隐同步），真正的 draw 在 drawTimelineEditorWindow。
+    static void panelDrawTimelineEditor(EditorApp& a);
+    // UI 编辑器（#312）：与上面两个完全同构（窗口对象自己管 open/close，
+    // 表项只做显隐同步），真正的 draw 在 drawUiEditorWindow。
+    static void panelDrawUiEditor(EditorApp& a);
 
     // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
     void drawPanels();
@@ -346,6 +358,15 @@ private:
     void drawSettingsPanel();
     // 角色详情窗口（创建第一/第三人称角色时弹出）
     void drawCharacterWindow();
+    // 剧本编辑器（#310）：接管 Inspector dialogue 页签的 "Edit script…"
+    // 与 View 菜单里的入口，并负责面板勾选 ↔ 窗口 × 的双向同步。
+    void drawDialogueEditorWindow();
+    // 时间轴编辑器（#311）：同上，入口是 sequence 页签的 "Edit timeline…"。
+    void drawTimelineEditorWindow();
+    // UI 编辑器（#312）：入口是 View 菜单 / 托盘 / `MYVK_EDITOR_UIED`。
+    // 与另两个资产编辑器不同，它**没有** Inspector 入口 —— UI 文档不是
+    // 场景里的组件，没有哪一行能挂一个 "Edit…" 按钮。
+    void drawUiEditorWindow();
     // 视口正下方那一行播放条（Run = 运行游戏；Play/Pause/Stop = 动画）。
     //
     // ⚠ 2026-10-17：UI 被用户要求移除，**这个函数不再被调用**（保留实现
@@ -463,6 +484,13 @@ private:
     // 不记进"布局面板"名单就会被当成浮层，把左边的分隔条裁掉一截。
     Rect m_tabBarRect;
     std::unique_ptr<CharacterWindow> m_characterWindow;
+    // 2026-10-27：剧本编辑器。它的位置在 CharacterWindow 之后 —— 生命周期
+    // 与它同构（构造在 init 里、draw 在 onImGui 末尾）。
+    std::unique_ptr<DialogueEditorWindow> m_dlgEditor;
+    // 2026-10-27（#311）：时间轴编辑器。生命周期与上面那个同构。
+    std::unique_ptr<TimelineEditorWindow> m_tlEditor;
+    // 2026-10-27（#312）：UI 编辑器。同样与上面两个同构。
+    std::unique_ptr<UiEditorWindow> m_uiEditor;
     // 2026-10-17 晚：底栏"+"托盘里的两张功能面板（Physics / Particles）
     std::unique_ptr<PhysicsPanel> m_physicsPanel;
     std::unique_ptr<ParticlesPanel> m_particlesPanel;

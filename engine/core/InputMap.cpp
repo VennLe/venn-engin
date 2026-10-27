@@ -1092,8 +1092,15 @@ int runInputSelfTest() {
         icheck("H12 resetActionBinding 成功",
                m.resetActionBinding("Gameplay", "Sprint"));
         const std::string reset = m.describeBinding("Gameplay", "Sprint");
-        icheck("H13 重置后回到出厂（Shift 回来了）",
-               reset.find("Shift") != std::string::npos, reset);
+        // ⚠ 别把出厂键位写死成字符串。2026-10-22 把 Sprint 的键盘从 LShift
+        //   改成"右键长按"之后，这里写死的 "Shift" 就一直红着 —— 而红字
+        //   看起来像"重置坏了"，谁也想不到是断言过期（这条红了很久没人管，
+        //   因为改动输入系统的人只跑自己的用例）。
+        //   改成拿 `makeDefault()` 的描述比对：默认值怎么改，断言跟着走。
+        const std::string factory =
+            InputMap::makeDefault().describeBinding("Gameplay", "Sprint");
+        icheck("H13 重置后回到出厂键位（与 makeDefault 一致）",
+               reset == factory, reset + " vs " + factory);
 
         // H14/H15 清空键盘绑定 ≠ 删动作（动作是轴的锚点）
         m.clearActionBinding("Gameplay", "Sprint", InputSource::Key);

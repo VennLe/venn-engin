@@ -78,6 +78,7 @@ public:
         Material,    // 材质
         Animation,   // 动画：蒙皮与片段播放
         Sequence,    // 过场时间轴（C1）：相机关键帧与事件
+        Dialogue,    // 对话（C2）：剧本资产 / 打字速度 / 起播方式
         All,         // 全部：旧的"一长条堆叠"视图
         Count,
     };
@@ -115,6 +116,7 @@ private:
     void drawTabMaterial(ecs::Entity e);
     void drawTabAnimation(ecs::Entity e);
     void drawTabSequence(ecs::Entity e);
+    void drawTabDialogue(ecs::Entity e);
     void drawTabAll(ecs::Entity e);
 
     // 该页签需要的组件在这个实体上没有 → 画一行"这里为什么是空的"。
@@ -152,6 +154,29 @@ private:
     void drawSceneStatsSection();
     void drawTransform(ecs::Entity e);
     void drawVisibility(ecs::Entity e);
+
+    // ---- 多选（2026-10-27 #316）----
+    //
+    // 多选时那些"按组件编辑"的页签换成这一页：只做**批量**编辑。
+    // 为什么不照常画主选中项的组件：那些控件改的是一个实体，界面上却写着
+    // "3 objects selected" —— 用户改完发现只有第一个变了，比不显示更糟。
+    void drawMultiPanel();
+    // 多选的 Transform 区：值一致时正常显示、不一致时标 (multi) 并按
+    // **增量 / 比例**语义批量写（见 .cpp 里的推导）。
+    void drawTransformMulti(ecs::Entity primary);
+    // 把一次批量改动写成**一条**撤销记录（MultiTransformEditCommand）。
+    // 用 std::function 而不是模板：调用点只有三处，模板会把整段实现拖进
+    // 头文件，而这个头被十几个 TU 包含。
+    void applyMultiTransform(
+        const std::string& label,
+        const std::function<void(ecs::Entity, ecs::TransformComponent&)>& fn);
+    // 多选时临时把某个向量字段的"共同值 / 是否混合"聚合出来
+    struct Vec3Agg {
+        glm::vec3 common{0.0f};
+        bool mixed = false;
+    };
+    // INSP-MULTI 的去抖签名（"几个 + 三项各自是否混合"），只在变化时打一行。
+    std::string m_lastMultiSig;
     void drawMeshAndMaterial(ecs::Entity e);
     void drawMeshSection(ecs::Entity e);
     void drawMaterialSection(ecs::Entity e);
@@ -338,6 +363,14 @@ private:
     // 写法，直接在组件字符串上 EditText 会让"输入到一半"被每帧覆盖）
     ecs::Entity m_seqPathBufFor{};
     char m_seqPathBuf[192] = {};
+    // C2 对话：两个输入框（资产路径 / 起始节点 id）的编辑缓冲。
+    // 与 m_seqPathBuf 同一纪律：按实体懒同步，不直接 EditText 组件字符串。
+    ecs::Entity m_dlgBufFor{};
+    char m_dlgPathBuf[192] = {};
+    char m_dlgStartBuf[96] = {};
+    // `INS-DLG-ASSET` 的去重键：只在"挂的资产 / 解析结果"变化时打一行。
+    // 每帧打会把日志刷死 —— 等于没有日志。
+    std::string m_dlgLogKey;
     ecs::Entity m_rootBoneBufFor{};
     char m_rootBoneBuf[96] = {};
     ecs::Entity m_layerBufFor{};
@@ -394,6 +427,11 @@ private:
     std::string m_lastTabSig;
     // INS-TAB-EMPTY 的去抖签名（"<页签>/<缺什么组件>"），见 tabEmptyHint。
     std::string m_lastEmptySig;
+
+    // ---- G18 预制体条 ----
+    // INSP-PREFAB 的去抖签名（"<路径>/<实例>/<覆盖数>"）。只在变化时打一行，
+    // 供 tools/verify_prefab.py 断言"选中的这一份是不是 prefab 实例、覆盖了几条"。
+    std::string m_lastPrefabSig;
 
     // ---- E11 分区折叠 / 搜索 / 剪贴板 ----
     // 折叠状态**按分区名**持久化：面板级成员，切实体、切场景都保留。

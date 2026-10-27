@@ -60,18 +60,13 @@ assets::Material* paletteMaterial(assets::AssetManager& am, const char* name,
                            glm::vec4(1.0f), roughness, metallic);
 }
 
-bool endsWith(const std::string& s, const char* suffix) {
-    const size_t n = std::char_traits<char>::length(suffix);
-    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
-}
-
 bool isObjPath(const std::string& p) {
-    return endsWith(p, ".obj") || endsWith(p, ".OBJ");
+    // 判定本体已提到 `assets/AssetPath.*`（运行时的 `spawn()` 也要问同一句）。
+    // 这里保留同名薄壳：本文件里几十个调用点不必改。
+    return assets::isObjPath(p);
 }
 
-bool isFbxPath(const std::string& p) {
-    return endsWith(p, ".fbx") || endsWith(p, ".FBX");
-}
+bool isFbxPath(const std::string& p) { return assets::isFbxPath(p); }
 
 // "assets/models/Cube/Cube.gltf" → "Cube"
 // ⚠ std::filesystem::path 不能直接赋给 std::string，必须显式 .string()

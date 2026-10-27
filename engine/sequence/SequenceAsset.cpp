@@ -11,8 +11,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <system_error>
 
 namespace sequence {
 
@@ -105,6 +107,9 @@ bool parseSequence(const std::string& text, const std::string& sourcePath,
         out.name = s.empty() ? "<unnamed>" : s;
     }
     out.loop = j.value("loop", false);
+    // `"//"` 是作者写的说明（JSON 没有注释语法）。**必须读进来**：不读的话
+    // 编辑器存一次盘就把它抹掉了，而作者不会想到"点 Save 会删注释"。
+    out.comment = j.value("//", std::string());
 
     // ---- 相机关键帧 ----
     if (j.contains("camera") && j["camera"].is_array()) {
@@ -252,6 +257,98 @@ bool loadSequence(const std::string& path, SequenceAsset& out) {
                     out.error.c_str());
         return false;
     }
+    return true;
+}
+
+// ---------------------------------------------------------------- 写回
+
+std::string toJson(const SequenceAsset& a) {
+    // `ordered_json`：键序保持插入顺序。用普通 `json` 的话键会按字典序排
+    // （camera / duration / events / loop / name / version），作者打开文件
+    // 最先看到的是 `camera`，而 `version` 被甩到最后 —— 与 docs 里的示例
+    // 对不上，diff 也难读。
+    nlohmann::ordered_json doc = nlohmann::ordered_json::object();
+    doc["version"] = 1;
+    doc["name"] = a.name;
+    // 作者写的说明原样带回去（见 .h 里那段 ⚠⚠）。
+    if (!a.comment.empty()) doc["//"] = a.comment;
+    doc["loop"] = a.loop;
+    // ① 永远写显式 duration（见 .h）
+    doc["duration"] = a.duration;
+
+    nlohmann::ordered_json keys = nlohmann::ordered_json::array();
+    for (const auto& k : a.cameraKeys) {
+        nlohmann::ordered_json jk = nlohmann::ordered_json::object();
+        jk["t"] = k.t;
+        // 位置写短名 `pos`（`parseSequence` 两种都收，但 `pos` 是这个格式
+        // 一直以来的写法，老资产全是它）
+        jk["pos"] = nlohmann::ordered_json::array({k.position.x, k.position.y,
+                                                   k.position.z});
+        // ⚠ yaw / pitch 是**弧度**，与场景 JSON 的 `camera.yaw` 同一口径。
+        //   界面上的度 → 弧度转换在编辑器里做，资产层只管弧度。
+        jk["yaw"] = k.yaw;
+        jk["pitch"] = k.pitch;
+        jk["fov"] = k.fov;
+        jk["ease"] = easeName(k.ease);   // ② 总是写
+        keys.push_back(std::move(jk));
+    }
+    doc["camera"] = std::move(keys);
+
+    nlohmann::ordered_json evs = nlohmann::ordered_json::array();
+    for (const auto& e : a.events) {
+        nlohmann::ordered_json je = nlohmann::ordered_json::object();
+        je["t"] = e.t;
+        je["kind"] = e.kind;
+        if (!e.payload.empty()) je["payload"] = e.payload;
+        evs.push_back(std::move(je));
+    }
+    doc["events"] = std::move(evs);
+
+    // indent=2 / 空格 / ensure_ascii=false：中文 payload 不转义（转义之后
+    // diff 是一屏 \uXXXX，作者没法用 git 看自己改了什么）。
+    return doc.dump(2, ' ', false) + "\n";
+}
+
+bool saveSequence(const std::string& path, const SequenceAsset& a,
+                  std::string& err) {
+    err.clear();
+    if (path.empty()) {
+        err = "empty path";
+        return false;
+    }
+    const std::string text = toJson(a);
+    const std::string full = assets::resolveAssetPath(path);
+    const std::string tmp = full + ".tmp";
+
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            err = "cannot open " + tmp + " for writing";
+            return false;
+        }
+        f.write(text.data(), static_cast<std::streamsize>(text.size()));
+        f.flush();
+        if (!f.good()) {
+            err = "write failed: " + tmp;
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmp, full, ec);
+    if (ec) {
+        // 改名失败（目标被占用 / 只读）时把临时文件清掉，不要留一地 .tmp
+        std::error_code ec2;
+        std::filesystem::remove(tmp, ec2);
+        err = "rename to " + full + " failed: " + ec.message();
+        return false;
+    }
+
+    VK_LOG_INFO("SEQ-SAVE path=%s full=%s keys=%d events=%d dur=%.3f bytes=%zu",
+                path.c_str(), full.c_str(),
+                static_cast<int>(a.cameraKeys.size()),
+                static_cast<int>(a.events.size()),
+                static_cast<double>(a.duration), text.size());
     return true;
 }
 

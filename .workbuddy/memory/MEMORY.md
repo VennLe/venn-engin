@@ -87,6 +87,16 @@ submit -4 (DEVICE_LOST)。**读日志只读第一条 `invalid state`**（后面�
   → "撒手"只能靠数值断言；硬切判**倍率**（2.1 m vs 0.32 m/帧）。端到端还要 `MYVK_LOG_RECTS=1`
   + `MYVK_EDITOR_PANELS=inspector`，否则锚点一个都不出现。
 
+## 对话 C2（10-26 ✅；权威 → `docs/dialogue.md`）
+- ⚠⚠ **`cue()` 绝不给场景加组件**（会被 `scene.save` 永久写进磁盘）；**cue 优先于组件
+  `autoStart`**；cue 只借宿主的 `cps`，起点**永远**用资产的 `start`。
+- ⚠⚠ 四条语义：节点按 **id** 寻址｜`goto/next` 悬空 = **整份加载失败**｜**有 choices 时
+  `advance()` 一步不走**（`next` 与 `choices` 并存判错）｜`cps<=0` = **立刻全出**（≠ 永不出）。
+- ⚠⚠ **`Press::NeedChoice` 运行时不可达**（分发是 `atChoice ? choose() : pressAdvance()`）——
+  端到端别断言它。`DLG-END` 打**两条**（runner 只有 steps/last，system 那条才带 `asset/src`）。
+- ⚠ 空格在输入表里是 `Jump`，而 `wasPressed` 是**边沿查询不是消费** → `setJumpBlocked`
+  **只挡跳跃不挡移动**。字幕框几何不变量：等比缩放 / 水平居中 / **底边对齐**（向上长高）。
+
 ## 脚本 / 编辑器（细则 → 归档一/二/三/九；权威 → `docs/script_roadmap.md` §11）
 - **`ScriptRuntime.{h,cpp}` = 唯一 tick 内核**。`let` 幂等声明；相位 **`声明区 → start → 接触事件 →
   顶层 → update`**；热重载用 `ScriptAsset::version()`。⚠⚠ **`ScriptProgram`/`HookBlock` 构造析构

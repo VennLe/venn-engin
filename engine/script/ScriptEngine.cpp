@@ -102,6 +102,23 @@ enum class Builtin : uint16_t {
     // ---- 可见 / 材质 ----
     SetVisible, SetEmissive,
 
+    // ---- 演出（C6 导演 API）----
+    // 这三件让脚本能"指挥"而不是"摆弄"：播过场 / 弹对话 / 切动画。
+    // ⚠ 它们全是**宿主动作**（`ScriptWorldActions` 里的 std::function），
+    //   engine 不认识 SequencerSystem / DialogueSystem 的具体形态 ——
+    //   与 `playSound` 同一条分层理由，也顺带让编辑器 Play 与 Game.exe
+    //   各自注入自己的实现。
+    PlaySequence, ShowDialogue, PlayAnim,
+
+    // ---- 世界控制（C6 第二批）----
+    // 演出三件让脚本"指挥一段表演"，这四件让它"改一局游戏"：
+    //   setFlag / getFlag  叙事分支的状态（好感度 / 见过没见过）
+    //   spawn              刷实体进场景（刷怪 / 刷掉落物）
+    //   loadScene          换关卡（下一章 / 回标题）
+    // ⚠ 全是宿主动作：旗标存在 runtime 的 `GameFlags` 里、场景在
+    //   `core::Application::m_scene` 里 —— engine 两样都够不着。
+    SetFlag, GetFlag, Spawn, LoadScene,
+
     Count_
 };
 
@@ -294,6 +311,10 @@ const BuiltinInfo kBuiltins[] = {
     {"setColor", 3, 3}, {"setIntensity", 1, 1}, {"setRange", 1, 1},
     {"setDirection", 3, 3},
     {"setVisible", 1, 2}, {"setEmissive", 3, 3},
+    // C6：演出三件。`playAnim` 的第二个参数是可选的显式实体。
+    {"playSequence", 1, 1}, {"showDialogue", 1, 1}, {"playAnim", 1, 2},
+    // C6 第二批：世界四件。`spawn` 的位置可选（不给 = 原点）。
+    {"setFlag", 2, 2}, {"getFlag", 1, 1}, {"spawn", 1, 2}, {"loadScene", 1, 1},
 };
 
 static_assert(sizeof(kBuiltins) / sizeof(kBuiltins[0]) ==
@@ -1249,6 +1270,20 @@ private:
         m_err.message = std::string("expected an entity for ") + what +
                         ", got " + v.typeName();
         return ecs::Entity{};
+    }
+
+    // 路径 / 名字参数（C6 起的"演出三件"）。
+    //
+    // ⚠ 为什么不像 `playSound` 那样直接 `toStr()`：`toStr()` 会把数字
+    //   转成字符串，于是 `playSequence(3)` 变成去读一个叫 "3" 的资产，
+    //   报出来的错是"资产不存在"—— 排查方向从一开始就错了。
+    //   `playSound` 保持宽松是因为它比这条纪律早了两天，不改它。
+    std::string strOf(const Value& v, int line, const char* what) {
+        if (v.k == Value::K::Str) return v.s;
+        m_err.line = line;
+        m_err.message = std::string("expected a string for ") + what + ", got " +
+                        v.typeName();
+        return {};
     }
 
     // ---- 世界查询（S1：朴素版；S2 换成 BVH 快查 + 补扫）----
@@ -2327,6 +2362,183 @@ Value Evaluator::call(Builtin b, const std::vector<Value>& a, int line) {
                                         f(2, "setEmissive"));
             }
             return Value::number(0.0);
+        }
+
+        // ---- 演出（C6 导演 API）----
+        //
+        // 三件的共同契约：**失败必须报错，不许静默返回 true**。宿主动作
+        // 缺失（编辑器 Play 没注入 / Game.exe 没接）也报错 —— "这一局没有
+        // 演出能力"本身就是需要知道的事实。
+        case Builtin::PlaySequence: {
+            const std::string path = strOf(a[0], line, "playSequence(path)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!m_host.act.playSequence) {
+                m_err.line = line;
+                m_err.message =
+                    "playSequence() is not available in this host (no "
+                    "sequencer wired up)";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.playSequence(path);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message = "playSequence('" + path +
+                                "'): failed to load (see the SEQ-CUE-FAIL "
+                                "log line for err=)";
+            }
+            return Value::boolean(ok);
+        }
+        case Builtin::ShowDialogue: {
+            const std::string id = strOf(a[0], line, "showDialogue(id)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!m_host.act.showDialogue) {
+                m_err.line = line;
+                m_err.message =
+                    "showDialogue() is not available in this host (no "
+                    "dialogue system wired up)";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.showDialogue(id);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message = "showDialogue('" + id +
+                                "'): failed to load (see the DLG-LOAD-FAIL "
+                                "log line for the reason)";
+            }
+            return Value::boolean(ok);
+        }
+        case Builtin::PlayAnim: {
+            // `playAnim(clip)` → 隐式 self；`playAnim(e, clip)` → 指定的那个。
+            // ⚠ 用 `a.size()` 而不是"第二个参数是否为空"来判形态：脚本没有
+            //   "空参数"，只有"少传参数"。
+            const std::size_t n = a.size();
+            const ecs::Entity e = (n >= 2)
+                                      ? entityOf(a[0], line, "playAnim(entity)")
+                                      : m_host.entity;
+            const std::string clip = strOf(a[n - 1], line, "playAnim(clip)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!m_host.act.playAnim) {
+                m_err.line = line;
+                m_err.message =
+                    "playAnim() is not available in this host (no animator "
+                    "wired up)";
+                return Value::boolean(false);
+            }
+            if (!alive(e)) {
+                m_err.line = line;
+                m_err.message = "playAnim(): target entity is invalid or "
+                                "already destroyed";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.playAnim(e, clip);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message = "playAnim('" + clip + "'): '" + nameOf(e) +
+                                "' has no Animator component (or the clip does "
+                                "not exist in its skeleton)";
+            }
+            return Value::boolean(ok);
+        }
+
+        // ============================================================
+        // C6 第二批：世界控制
+        // ============================================================
+        case Builtin::SetFlag: {
+            const std::string name = strOf(a[0], line, "setFlag(name)");
+            // 值是 Num 或 Bool：`setFlag("met_alice", true)` 与
+            // `setFlag("affection", 42)` 都是正常写法，两者在表里都存
+            // 成 double（Bool → 1/0）。字符串 / vec3 / 实体一律报错 ——
+            // 这张表是**数值**表，混进字符串就会在存档格式上炸开。
+            double v = 0.0;
+            if (a[1].k == Value::K::Bool) {
+                v = a[1].b ? 1.0 : 0.0;
+            } else {
+                v = numOf(a[1], line, "setFlag(value)");
+            }
+            if (!m_err.ok()) return Value::boolean(false);
+            if (name.empty()) {
+                m_err.line = line;
+                m_err.message = "setFlag(): the flag name is empty";
+                return Value::boolean(false);
+            }
+            if (!m_host.act.setFlag) {
+                m_err.line = line;
+                m_err.message =
+                    "setFlag() is not available in this host (no flag store "
+                    "wired up)";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.setFlag(name, v);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message = "setFlag('" + name + "') was rejected by the "
+                                "host (see the RUNTIME-FLAG log line)";
+            }
+            return Value::boolean(ok);
+        }
+        case Builtin::GetFlag: {
+            const std::string name = strOf(a[0], line, "getFlag(name)");
+            if (!m_err.ok()) return Value::number(0.0);
+            if (name.empty()) {
+                m_err.line = line;
+                m_err.message = "getFlag(): the flag name is empty";
+                return Value::number(0.0);
+            }
+            if (!m_host.act.getFlag) {
+                m_err.line = line;
+                m_err.message =
+                    "getFlag() is not available in this host (no flag store "
+                    "wired up)";
+                return Value::number(0.0);
+            }
+            // ⚠ 未设过 = 0 且**不报错**（见 ScriptEngine.h 的注释）。
+            return Value::number(m_host.act.getFlag(name));
+        }
+        case Builtin::Spawn: {
+            // `spawn(path)` → 原点；`spawn(path, vec3(x,y,z))` → 指定位置。
+            const std::string path = strOf(a[0], line, "spawn(path)");
+            glm::vec3 pos(0.0f);
+            if (a.size() >= 2) pos = vecOf(a[1], line, "spawn(pos)");
+            if (!m_err.ok()) return Value::makeEntity(ecs::Entity{});
+            if (!m_host.act.spawn) {
+                m_err.line = line;
+                m_err.message =
+                    "spawn() is not available in this host (no scene "
+                    "instantiation wired up)";
+                return Value::makeEntity(ecs::Entity{});
+            }
+            const ecs::Entity e = m_host.act.spawn(path, pos);
+            if (!e.valid()) {
+                // 失败必须报错：刷不出来却静默返回一个无效句柄，下一句
+                // `setPos(e, ...)` 只会说"实体无效"，根因就此消失。
+                m_err.line = line;
+                m_err.message = "spawn('" + path +
+                                "'): failed to instantiate the model (see the "
+                                "RUNTIME-SPAWN-FAIL log line for why)";
+                return Value::makeEntity(ecs::Entity{});
+            }
+            return Value::makeEntity(e, nameOf(e));
+        }
+        case Builtin::LoadScene: {
+            const std::string path = strOf(a[0], line, "loadScene(path)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!m_host.act.loadScene) {
+                m_err.line = line;
+                m_err.message =
+                    "loadScene() is not available in this host (no scene "
+                    "router wired up)";
+                return Value::boolean(false);
+            }
+            // 返回值 = "请求已受理"（下一帧生效），见 ScriptEngine.h。
+            const bool ok = m_host.act.loadScene(path);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message =
+                    "loadScene('" + path +
+                    "'): the scene file does not exist or cannot be read "
+                    "(nothing was scheduled)";
+            }
+            return Value::boolean(ok);
         }
 
         case Builtin::None:

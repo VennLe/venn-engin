@@ -10,8 +10,10 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <system_error>
 
 namespace dialogue {
 
@@ -54,6 +56,47 @@ int revealedChars(float elapsed, float cps, int total) {
     const float n = std::floor(elapsed * cps);
     if (n >= static_cast<float>(total)) return total;
     return static_cast<int>(n);
+}
+
+// ------------------------------------------------------------ UTF-8
+
+namespace {
+
+// 从一个 UTF-8 头字节推出这个码点占几字节。非法头字节（0x80~0xBF 续字节、
+// 或 0xF8+）返回 1 —— 与 `ui2::utf8Next` 的"非法按 1 字节前进"一致。
+int utf8Len(unsigned char c) {
+    if (c < 0x80u) return 1;
+    if ((c & 0xE0u) == 0xC0u) return 2;
+    if ((c & 0xF0u) == 0xE0u) return 3;
+    if ((c & 0xF8u) == 0xF0u) return 4;
+    return 1;
+}
+
+} // namespace
+
+int utf8Count(const std::string& s) {
+    int n = 0;
+    for (size_t i = 0; i < s.size();) {
+        const int len = utf8Len(static_cast<unsigned char>(s[i]));
+        // 长度越界（截断的尾巴）也按 1 字节走，绝不能 `i += len` 冲出 end()
+        i += (i + static_cast<size_t>(len) <= s.size()) ? static_cast<size_t>(len)
+                                                        : 1u;
+        ++n;
+    }
+    return n;
+}
+
+std::string utf8Prefix(const std::string& s, int chars) {
+    if (chars <= 0) return {};
+    int n = 0;
+    size_t i = 0;
+    while (i < s.size() && n < chars) {
+        const int len = utf8Len(static_cast<unsigned char>(s[i]));
+        i += (i + static_cast<size_t>(len) <= s.size()) ? static_cast<size_t>(len)
+                                                        : 1u;
+        ++n;
+    }
+    return s.substr(0, i);
 }
 
 bool parseDialogue(const std::string& text, const std::string& sourcePath,
@@ -213,6 +256,84 @@ bool loadDialogue(const std::string& path, DialogueAsset& out) {
         return false;
     }
     return parseDialogue(text, path, out);
+}
+
+// ---------------------------------------------------------------- 写回
+
+std::string toJson(const DialogueAsset& a) {
+    // ⚠ `ordered_json` 而不是 `json`：后者的键序是**字典序**（choices /
+    //   id / next / speaker / text），作者打开文件看到的第一个字段是
+    //   `choices` —— 一份剧本里最不常改的东西排在最前面。
+    //   `ordered_json` 保持插入顺序，于是落盘长得和 docs 里的示例一致。
+    nlohmann::ordered_json lines = nlohmann::ordered_json::array();
+    for (const auto& n : a.nodes) {
+        nlohmann::ordered_json jn = nlohmann::ordered_json::object();
+        jn["id"] = n.id;
+        if (!n.speaker.empty()) jn["speaker"] = n.speaker;
+        jn["text"] = n.text;
+        if (!n.nextId.empty()) jn["next"] = n.nextId;
+        if (!n.choices.empty()) {
+            nlohmann::ordered_json jc = nlohmann::ordered_json::array();
+            for (const auto& c : n.choices) {
+                nlohmann::ordered_json o = nlohmann::ordered_json::object();
+                o["text"] = c.text;
+                o["goto"] = c.gotoId;
+                jc.push_back(std::move(o));
+            }
+            jn["choices"] = std::move(jc);
+        }
+        lines.push_back(std::move(jn));
+    }
+
+    nlohmann::ordered_json doc = nlohmann::ordered_json::object();
+    doc["version"] = 1;
+    doc["name"] = a.name;
+    if (!a.startId.empty()) doc["start"] = a.startId;
+    doc["lines"] = std::move(lines);
+    // indent=2 / 空格缩进 / ensure_ascii=false（见 .h 的四条"不写"）
+    return doc.dump(2, ' ', false) + "\n";
+}
+
+bool saveDialogue(const std::string& path, const DialogueAsset& a,
+                  std::string& err) {
+    err.clear();
+    if (path.empty()) {
+        err = "empty path";
+        return false;
+    }
+    const std::string text = toJson(a);
+    const std::string full = assets::resolveAssetPath(path);
+    const std::string tmp = full + ".tmp";
+
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            err = "cannot open " + tmp + " for writing";
+            return false;
+        }
+        f.write(text.data(), static_cast<std::streamsize>(text.size()));
+        f.flush();
+        if (!f.good()) {
+            err = "write failed: " + tmp;
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmp, full, ec);
+    if (ec) {
+        // 改名失败（目标被占用 / 只读）时把临时文件清掉，不要留一地 .tmp
+        std::error_code ec2;
+        std::filesystem::remove(tmp, ec2);
+        err = "rename to " + full + " failed: " + ec.message();
+        return false;
+    }
+
+    VK_LOG_INFO("DLG-SAVE path=%s full=%s lines=%d start=%s bytes=%zu",
+                path.c_str(), full.c_str(),
+                static_cast<int>(a.nodes.size()), a.startId.c_str(),
+                text.size());
+    return true;
 }
 
 } // namespace dialogue

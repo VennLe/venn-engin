@@ -88,6 +88,19 @@ public:
 
     void setTrace(bool on) { m_trace = on; }
 
+    // 对话/过场期间把**跳跃**挡掉。
+    //
+    // 为什么需要它（C2，2026-10-26）：字幕的"推进"用 Space（= `Jump`），
+    // 而 `InputMap` 的 `wasPressed` 是**边沿查询、不是消费** —— 同一帧
+    // 对话推进完，`PlayerController::update` 照样能读到那一次按下，
+    // 于是"按空格翻页"顺带让角色跳了一下。玩家不会报这个 bug，只会觉得
+    // 手感怪。
+    //
+    // ⚠ 只挡跳跃，不挡移动：`MoveForward` 的轴值是连续的，按着 W 说话
+    //   仍然应该能走（对话里走动是常见需求）；而跳跃是一次性事件，
+    //   挡掉它不会有"按着不放却不动"的怪异感。
+    void setJumpBlocked(bool on) { m_jumpBlocked = on; }
+
 private:
     void ensureProxy(physics::PhysicsWorld* world);
     void syncProxy(physics::PhysicsWorld* world, float dt);
@@ -100,6 +113,7 @@ private:
     physics::CharacterState m_state;
     physics::BodyId m_proxy = physics::kInvalidBody;
     bool m_justJumped = false;   // 见 justJumped()
+    bool m_jumpBlocked = false;  // 见 setJumpBlocked()
 
     // 轨道相机
     float m_yaw = 0.0f;

@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -87,6 +88,31 @@ struct MockHost {
     // ---- S3：输入 ----
     std::unordered_map<std::string, bool> pressedMap, heldMap, releasedMap;
     std::unordered_map<std::string, float> axisMap;
+
+    // ---- C6：演出三件（记录器）----
+    // `*Ok` 是宿主"能不能播"的回答：false = 资产不存在 / 没挂 Animator。
+    // 真链路的成败由 `verify_director_api.py` 验（那边有真的资产和骨架）。
+    std::vector<std::string> sequences, dialogues;
+    std::vector<std::string> animClips;
+    ecs::Entity lastAnimEntity{};
+    bool playSequenceOk = true;
+    bool showDialogueOk = true;
+    bool playAnimOk = true;
+
+    // ---- C6 第二批：世界控制（记录器）----
+    // 旗标故意用**真的一张 map**而不是计数器：要验的是"写进去的能被读
+    // 回来"，不是"调用发生了"。
+    std::map<std::string, double> flags;
+    int setFlagCalls = 0;
+    bool setFlagOk = true;
+    // spawn：`spawnEntity` 由用例自己先造好（真实体，所以脚本能接着
+    // `setPos()` / `alive()` 用它）。默认无效 = "刷不出来"。
+    std::vector<std::string> spawnPaths;
+    std::vector<glm::vec3> spawnPositions;
+    ecs::Entity spawnEntity{};
+    // loadScene：只记请求，真切换由 verify_world_api.py 验（那边有真文件）
+    std::vector<std::string> sceneRequests;
+    bool loadSceneOk = true;
 };
 
 void installMock(ScriptRuntime& rt, MockHost& mh) {
@@ -142,6 +168,39 @@ void installMock(ScriptRuntime& rt, MockHost& mh) {
         auto it = mh.axisMap.find(a);
         return it == mh.axisMap.end() ? 0.0f : it->second;
     };
+    // C6 演出三件：记录 + 由 `*Ok` 决定"宿主说什么"。
+    svc.act.playSequence = [&mh](const std::string& path) {
+        mh.sequences.push_back(path);
+        return mh.playSequenceOk;
+    };
+    svc.act.showDialogue = [&mh](const std::string& id) {
+        mh.dialogues.push_back(id);
+        return mh.showDialogueOk;
+    };
+    svc.act.playAnim = [&mh](ecs::Entity e, const std::string& clip) {
+        mh.lastAnimEntity = e;
+        mh.animClips.push_back(clip);
+        return mh.playAnimOk;
+    };
+    // C6 第二批：旗标是真的存、spawn / loadScene 只记录。
+    svc.act.setFlag = [&mh](const std::string& name, double v) {
+        ++mh.setFlagCalls;
+        if (mh.setFlagOk) mh.flags[name] = v;
+        return mh.setFlagOk;
+    };
+    svc.act.getFlag = [&mh](const std::string& name) {
+        auto it = mh.flags.find(name);
+        return it == mh.flags.end() ? 0.0 : it->second;
+    };
+    svc.act.spawn = [&mh](const std::string& path, glm::vec3 pos) {
+        mh.spawnPaths.push_back(path);
+        mh.spawnPositions.push_back(pos);
+        return mh.spawnEntity;
+    };
+    svc.act.loadScene = [&mh](const std::string& path) {
+        mh.sceneRequests.push_back(path);
+        return mh.loadSceneOk;
+    };
     rt.setServices(std::move(svc));
     rt.setErrorSink([&mh](const ScriptInstance& inst, const std::string& msg) {
         ++mh.errorReports;
@@ -178,6 +237,26 @@ std::string varStr(const ScriptInstance* inst, const char* key) {
     if (!inst) return "<no instance>";
     auto it = inst->vars.find(key);
     return it == inst->vars.end() ? std::string("<absent>") : it->second.toStr();
+}
+
+// 变量里的实体句柄（C17）。不是实体 / 不存在 → 无效句柄。
+// ⚠ 不能用 `varNum` 顶替：`Value::asNum()` 对 Entity 走 default 分支返回 0
+//   （见 Value 的注释："那正是最难查的那类 bug"）。
+ecs::Entity varEntity(const ScriptInstance* inst, const char* key) {
+    if (!inst) return ecs::Entity{};
+    auto it = inst->vars.find(key);
+    if (it == inst->vars.end() || it->second.k != Value::K::Entity)
+        return ecs::Entity{};
+    return it->second.e;
+}
+
+// 变量里的 vec3（C17）。不是 vec3 → 返回一个不可能的哨兵值，让断言自己红。
+glm::vec3 varVec(const ScriptInstance* inst, const char* key) {
+    if (!inst) return glm::vec3(-1e30f);
+    auto it = inst->vars.find(key);
+    if (it == inst->vars.end() || it->second.k != Value::K::Vec3)
+        return glm::vec3(-1e30f);
+    return it->second.v;
 }
 
 // 只编译、不求值。B 组的负向用例全靠它 —— 编译期检查的价值就在于
@@ -1044,6 +1123,254 @@ pos(d)
 }
 
 
+// C13 演出三件（C6 导演 API）正向：三条都能调通、参数原样送到宿主、
+// `playAnim` 的隐式 self 与显式实体两种形态都成立。
+//
+// ⚠ 这一组验的是**接线**，不是"过场真的播了" —— 那个由
+//   `tools/verify_director_api.py` 端到端验（那边有真的资产和骨架）。
+//   在这里铺一套假 SequencerSystem 只会把"宿主实现了什么"和"引擎传了什么"
+//   混成一个结论。
+void testC13() {
+    scene::Scene sc;
+    ScriptRuntime rt;
+    MockHost mh;
+    installMock(rt, mh);
+    const ecs::Entity e = runScript(sc, rt, "C13", R"VKS(
+let a = playSequence("sequences/opening.seq.json")
+let b = showDialogue("ch01_open_01")
+let c = playAnim("Run")
+let me = self()
+let d = playAnim(me, "Idle")
+)VKS", 1);
+    const ScriptInstance* inst = rt.find(e);
+
+    const bool bothOk = mh.sequences.size() == 1 &&
+                        mh.sequences[0] == "sequences/opening.seq.json" &&
+                        mh.dialogues.size() == 1 &&
+                        mh.dialogues[0] == "ch01_open_01" &&
+                        mh.animClips.size() == 2 && mh.animClips[0] == "Run" &&
+                        mh.animClips[1] == "Idle";
+    check("C13 演出三件：参数原样到宿主、playAnim 两种形态都对",
+          varBool(inst, "a") && varBool(inst, "b") && varBool(inst, "c") &&
+              varBool(inst, "d") && bothOk &&
+              // 隐式 self 与显式 `self()` 必须落到**同一个**实体上
+              mh.lastAnimEntity.id == e.id,
+          fmt("seq=%d dlg=%d anim=%d first=[%s] last=[%s] ent=%u/%u",
+              static_cast<int>(mh.sequences.size()),
+              static_cast<int>(mh.dialogues.size()),
+              static_cast<int>(mh.animClips.size()),
+              mh.animClips.empty() ? "" : mh.animClips[0].c_str(),
+              mh.animClips.size() < 2 ? "" : mh.animClips[1].c_str(),
+              static_cast<unsigned>(mh.lastAnimEntity.id),
+              static_cast<unsigned>(e.id)));
+}
+
+// C14 演出三件负向：宿主说"播不了"时，脚本必须拿到 false **并且报错**。
+//
+// ⚠ 这是本组真正的价值所在。静默返回 true 的症状是"剧本写完了、日志全绿、
+//   画面什么都没发生"—— 排查时第一个怀疑的永远是"资产路径写错了"，而
+//   实际原因是宿主那边根本没实现。与 `setVel` 缺刚体时 `noBody()` 报错
+//   同一条纪律：**没钱就说没钱**。
+void testC14() {
+    scene::Scene sc;
+    ScriptRuntime rt;
+    MockHost mh;
+    installMock(rt, mh);
+    mh.playSequenceOk = false;
+    const ecs::Entity e = runScript(sc, rt, "C14", R"VKS(
+let a = playSequence("nope.seq.json")
+)VKS", 2);
+    const ScriptInstance* inst = rt.find(e);
+    const bool errored =
+        inst && (inst->failed ||
+                 inst->lastError.find("playSequence") != std::string::npos);
+    // ⚠ 判据是 `!varBool(inst, "a", false)` —— **默认给 false**，不是 true。
+    //   运行期错误会让那条语句**中止**，于是 `let a = ...` 的赋值根本没发生
+    //   （日志里是 `a=<absent>`）。默认值给 true 的话，"没赋值"会被读成
+    //   "成功了"，整条断言直接反过来（第一版就是这么红的）。
+    //   所以这条测的是：**要么 a 是 false、要么 a 压根不存在**，两者都算
+    //   "没有静默成功"。
+    check("C14 点播失败必须报错并返回 false（不许静默成功）",
+          !varBool(inst, "a", false) && errored,
+          inst ? fmt("failed=%d a=%s err=%s",
+                     inst->failed ? 1 : 0, varStr(inst, "a").c_str(),
+                     inst->lastError.c_str())
+               : std::string("<no instance>"));
+}
+
+// C15 类型纪律：路径参数必须是字符串。传数字时**不许**被 `toStr()` 静默
+// 转成 "3"（那样报出来的错会是"资产不存在"，排查方向从一开始就错了）。
+void testC15() {
+    scene::Scene sc;
+    ScriptRuntime rt;
+    MockHost mh;
+    installMock(rt, mh);
+    const ecs::Entity e = runScript(sc, rt, "C15", R"VKS(
+let a = playSequence(3)
+)VKS", 2);
+    const ScriptInstance* inst = rt.find(e);
+    check("C15 playSequence(数字) 报类型错、不送进宿主",
+          inst && inst->lastError.find("expected a string") != std::string::npos &&
+              mh.sequences.empty(),
+          inst ? fmt("calls=%d err=%s",
+                     static_cast<int>(mh.sequences.size()),
+                     inst->lastError.c_str())
+               : std::string("<no instance>"));
+}
+
+// ============================================================ C6 第二批
+// 世界控制：旗标 / 刷实体 / 换场景。
+//
+// 这一组全部是"接线"层面的断言（参数到宿主、返回值到脚本、失败必报错）。
+// **真链路**（旗标真的能跨场景留着、spawn 出来的东西真的出现在画面上、
+// loadScene 真的把世界换掉）由 `tools/verify_world_api.py` 验 —— 那边有
+// 真场景、真模型、真渲染循环。这里不重复造那个场地。
+
+// C16 旗标：写进去 / 读回来 / 布尔写法 / 未设过 = 0 / 覆盖不累加。
+//
+// ⚠ "未设过 = 0 且**不报错**"是刻意的语义：`getFlag("met_alice")` 在第 1 章
+//   问到第 5 章的角色时，正确答案就是 0。把它做成错误会让每个分支判断都要
+//   先记得初始化一遍。
+void testC16() {
+    scene::Scene sc;
+    ScriptRuntime rt;
+    MockHost mh;
+    installMock(rt, mh);
+    const ecs::Entity e = runScript(sc, rt, "C16", R"VKS(
+let a = setFlag("affection", 42)
+let b = getFlag("affection")
+let c = setFlag("met_alice", true)
+let d = getFlag("met_alice")
+let m = getFlag("never_set")
+let o = setFlag("affection", 60)
+let n = getFlag("affection")
+)VKS", 1);
+    const ScriptInstance* inst = rt.find(e);
+    const bool ok = inst && varBool(inst, "a") && varBool(inst, "c") &&
+                    varBool(inst, "o") &&
+                    varNum(inst, "b") == 42.0 && varNum(inst, "d") == 1.0 &&
+                    varNum(inst, "m") == 0.0 &&
+                    // 覆盖而不是累加：42 + 60 = 102 是错的，正确答案是 60
+                    varNum(inst, "n") == 60.0 &&
+                    mh.setFlagCalls == 3 && mh.flags.size() == 2 &&
+                    mh.flags.count("affection") == 1 &&
+                    mh.flags.at("affection") == 60.0;
+    check("C16 旗标：写读往返 / bool→1 / 未设过=0 / 覆盖不累加", ok,
+          inst ? fmt("b=%.1f d=%.1f m=%.1f n=%.1f calls=%d keys=%zu",
+                     varNum(inst, "b"), varNum(inst, "d"), varNum(inst, "m"),
+                     varNum(inst, "n"), mh.setFlagCalls, mh.flags.size())
+               : std::string("<no instance>"));
+}
+
+// C17 spawn：位置参数原样到宿主，返回的句柄**当场可用**。
+//
+// ⚠ 后半句是这条用例的重点。宿主这里返回的是一个**真实体**（用例自己
+//   `createObject` 造的），于是紧接着的 `pos(s)` 必须能读到它的变换 ——
+//   这就把"返回值是真的能用的句柄"和"只是回了个数"区分开了。真实装配
+//   （Model → 实体 + 组件）在 verify_world_api.py 里验。
+void testC17() {
+    scene::Scene sc;
+    ScriptRuntime rt;
+    MockHost mh;
+    installMock(rt, mh);
+    mh.spawnEntity = sc.createObject("slime");   // 宿主"刷出来"的东西
+    const ecs::Entity e = runScript(sc, rt, "C17", R"VKS(
+let s = spawn("models/slime.vmesh", vec3(1, 2, 3))
+let t = spawn("models/slime.vmesh")
+setPos(s, vec3(5, 6, 7))
+let p = pos(s)
+)VKS", 1);
+    const ScriptInstance* inst = rt.find(e);
+    const bool twoCalls = mh.spawnPaths.size() == 2 &&
+                          mh.spawnPositions.size() == 2 &&
+                          mh.spawnPositions[0] == glm::vec3(1.0f, 2.0f, 3.0f) &&
+                          // 不给位置 = 原点（不是"上一次的位置"）
+                          mh.spawnPositions[1] == glm::vec3(0.0f);
+    const glm::vec3 p0 =
+        mh.spawnPositions.empty() ? glm::vec3(-1e30f) : mh.spawnPositions[0];
+    const glm::vec3 pv = varVec(inst, "p");
+    check("C17 spawn：两种形态的位置都对、返回的句柄当场可 setPos/pos",
+          inst && varEntity(inst, "s").id == mh.spawnEntity.id &&
+              varEntity(inst, "t").id == mh.spawnEntity.id && twoCalls &&
+              pv == glm::vec3(5.0f, 6.0f, 7.0f),
+          inst ? fmt("spawns=%zu p0=(%.1f,%.1f,%.1f) sid=%u/%u p=(%.1f,%.1f,%.1f)",
+                     mh.spawnPaths.size(), static_cast<double>(p0.x),
+                     static_cast<double>(p0.y), static_cast<double>(p0.z),
+                     static_cast<unsigned>(varEntity(inst, "s").id),
+                     static_cast<unsigned>(mh.spawnEntity.id),
+                     static_cast<double>(pv.x), static_cast<double>(pv.y),
+                     static_cast<double>(pv.z))
+               : std::string("<no instance>"));
+}
+
+// C18 spawn 失败：宿主返回无效句柄时必须报错。
+//
+// ⚠ 静默返回一个无效句柄的后果：下一句 `setPos(s, ...)` 只会说"实体无效"，
+//   而真正的原因（模型路径拼错 / 加载器不支持这个格式）就此消失。
+void testC18() {
+    scene::Scene sc;
+    ScriptRuntime rt;
+    MockHost mh;
+    installMock(rt, mh);
+    // spawnEntity 保持无效 = "刷不出来"
+    const ecs::Entity e = runScript(sc, rt, "C18", R"VKS(
+let s = spawn("models/nope.vmesh")
+)VKS", 2);
+    const ScriptInstance* inst = rt.find(e);
+    const bool errored =
+        inst && (inst->failed ||
+                 inst->lastError.find("spawn") != std::string::npos);
+    check("C18 spawn 失败必须报错（不许静默返回无效句柄）",
+          !varEntity(inst, "s").valid() && errored && mh.spawnPaths.size() == 1,
+          inst ? fmt("calls=%d err=%s", static_cast<int>(mh.spawnPaths.size()),
+                     inst->lastError.c_str())
+               : std::string("<no instance>"));
+}
+
+// C19 loadScene：正向（路径原样到宿主 + 拿到 true）与负向（宿主拒绝 →
+// false + 报错）。
+//
+// ⚠ 类型纪律（`loadScene(3)`）不在这里重测：它走的是 C15 已经钉住的
+//   同一个 `strOf()`。再加一条只会让"strOf 坏了"表现为两处红，没有新信息。
+void testC19() {
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        installMock(rt, mh);
+        const ecs::Entity e = runScript(sc, rt, "C19A", R"VKS(
+let a = loadScene("scenes/ch02.json")
+)VKS", 1);
+        const ScriptInstance* inst = rt.find(e);
+        check("C19a loadScene 正向：路径原样到宿主、脚本拿到 true",
+              inst && varBool(inst, "a") && mh.sceneRequests.size() == 1 &&
+                  mh.sceneRequests[0] == "scenes/ch02.json",
+              fmt("reqs=%zu first=[%s]", mh.sceneRequests.size(),
+                  mh.sceneRequests.empty() ? "" : mh.sceneRequests[0].c_str()));
+    }
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        installMock(rt, mh);
+        mh.loadSceneOk = false;   // 宿主：文件不存在 / 读不了
+        const ecs::Entity e = runScript(sc, rt, "C19B", R"VKS(
+let a = loadScene("scenes/nope.json")
+)VKS", 2);
+        const ScriptInstance* inst = rt.find(e);
+        const bool errored =
+            inst && (inst->failed ||
+                     inst->lastError.find("loadScene") != std::string::npos);
+        // ⚠ 默认值给 false：运行期错误会**中止**那条语句，`let a = ...`
+        //   根本没赋值 —— 默认给 true 会把"没赋值"读成"成功了"（C14 踩过）。
+        check("C19b loadScene 失败必须报错并返回 false（不许静默受理）",
+              !varBool(inst, "a", false) && errored && mh.sceneRequests.size() == 1,
+              inst ? fmt("reqs=%zu err=%s", mh.sceneRequests.size(),
+                         inst->lastError.c_str())
+                   : std::string("<no instance>"));
+    }
+}
+
 // ============================================================ D 组（S3）
 // 事件与输入：脚本从"每帧跑一遍"变成"能响应"。
 
@@ -1846,6 +2173,15 @@ int runScriptSelfTest() {
     testC10();
     testC11();
     testC12();
+    // C6：演出三件（正向接线 / 失败必报错 / 路径参数类型纪律）
+    testC13();
+    testC14();
+    testC15();
+    // C6 第二批：世界控制（旗标 / spawn / loadScene）
+    testC16();
+    testC17();
+    testC18();
+    testC19();
     VK_LOG_INFO("--- S3 事件与输入 ---");
     testD0();
     testD1();

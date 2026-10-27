@@ -409,6 +409,186 @@ int runSequencerSelfTest() {
         report("seq_takeover_fov", sys.pose().fov, 70.0, 1e-3);
     }
 
+    // ============================================================
+    // E. 点播（C6 脚本导演 API）
+    // ============================================================
+    // ⚠ 这一组的场景**一个 SequencerComponent 都不建** —— 它同时钉住
+    //   "点播不依赖场景里的实体"。真要按组件走的话 `selectActive` 扫不到
+    //   任何东西，`tick` 直接 return，playhead 永远 0。
+
+    // E1 点播成功：返回 true、`cuePlaying()` 为真、tick 之后播放头在走。
+    {
+        scene::Scene s;
+        SequencerSystem sys;
+        const bool ok = sys.cue(s, "sequences/opening.seq.json");
+        reportFlag("seq_cue_ok", ok, sys.cuePath());
+        reportFlag("seq_cue_playing", sys.cuePlaying(), sys.cuePath());
+
+        sys.tick(s, 0.1f);
+        report("seq_cue_playhead", sys.lastPlayhead(), 0.1, 1e-3);
+        report("seq_cue_running", sys.lastRunning(), 1.0, 0.5);
+        reportFlag("seq_cue_has_pose", sys.hasPose(), "opening 首帧应有相机键");
+    }
+
+    // E2 资产不存在 → false，且**不进播放态**（否则 tick 会一直空转）。
+    {
+        scene::Scene s;
+        SequencerSystem sys;
+        const bool ok = sys.cue(s, "sequences/__no_such_file__.seq.json");
+        reportFlag("seq_cue_missing_false", !ok, "不存在的资产必须返回 false");
+        reportFlag("seq_cue_missing_not_playing", !sys.cuePlaying(), "");
+        sys.tick(s, 0.1f);
+        report("seq_cue_missing_no_playhead", sys.lastPlayhead(), 0.0, 1e-6);
+    }
+
+    // E3 播完自动让位：`cuePlaying()` 变回 false。
+    // ⚠ 判据读的是**访问器**，不是 `lastRunning` —— 后者每帧被清。
+    //   opening 是 8 秒，kMaxStep=0.10 让每帧最多走 0.1 秒，所以要 80+ 帧。
+    {
+        scene::Scene s;
+        SequencerSystem sys;
+        sys.cue(s, "sequences/opening.seq.json");
+        for (int i = 0; i < 120; ++i) sys.tick(s, 0.1f);
+        reportFlag("seq_cue_finished_releases", !sys.cuePlaying(),
+                   "播完必须把播放权还给场景组件");
+    }
+
+    // E4 点播压过场景组件（脚本说"现在播这段"就是现在播）。
+    // 场景里放一个 priority=99 的组件，点播仍应胜出 —— 胜出的证据是
+    // 播放头按 cue 那段走（而不是场景那段 1 秒的）。
+    {
+        scene::Scene s;
+        std::string j = R"({"duration":1,"camera":[{"t":0,"pos":[99,0,3]}]})";
+        addSeq(s, "SceneSeq", parse(j.c_str()), 99);
+        SequencerSystem sys;
+        sys.cue(s, "sequences/opening.seq.json");
+        sys.tick(s, 0.1f);
+        reportFlag("seq_cue_beats_component",
+                   sys.lastSequenceName() == "opening",
+                   "点播应胜过 priority=99 的场景组件：" + sys.lastSequenceName());
+    }
+
+    // ========================================================
+    // F 写回往返（#311 时间轴编辑器）
+    //
+    // 判据只有一句：**`toJson` 之后 `parseSequence` 一遍，内容逐字段相等。**
+    // 这不是"顺便测一下"—— 编辑器每次改动都走这条路做校验（与剧本编辑器
+    // 同一条纪律），这里红了就代表"面板上看到的"与"存进磁盘的"是两份东西。
+    // ========================================================
+    {
+        // 造一份带**所有字段非默认**的资产：默认值会让断言失去分辨力
+        //（`ease` 若取默认 smooth，"写没写 ease" 都读回 smooth）。
+        SequenceAsset src;
+        src.name = "roundtrip";
+        src.loop = true;
+        src.duration = 12.5f;
+        SeqCameraKey k0;
+        k0.t = 0.0f;
+        k0.position = glm::vec3(1.5f, -2.25f, 3.75f);
+        k0.yaw = 0.8125f;
+        k0.pitch = -0.4375f;
+        k0.fov = 37.5f;
+        k0.ease = Ease::Step;
+        SeqCameraKey k1;
+        k1.t = 4.25f;
+        k1.position = glm::vec3(-6.0f, 0.5f, 2.0f);
+        k1.yaw = -2.5f;
+        k1.pitch = 0.125f;
+        k1.fov = 52.0f;
+        k1.ease = Ease::Linear;
+        src.cameraKeys.push_back(k0);
+        src.cameraKeys.push_back(k1);
+        src.events.push_back(SeqEvent{1.0f, "Sound", "se_footstep"});
+        src.events.push_back(SeqEvent{4.25f, "Line", "千夏：小心脚下"});
+
+        const std::string text = toJson(src);
+        SequenceAsset dst;
+        const bool parsed = parseSequence(text, "roundtrip.seq.json", dst);
+
+        // F1 框架层往返：能被读回、且 cameraKeys 全字段相等
+        bool keysEqual = parsed && dst.cameraKeys.size() == 2;
+        if (keysEqual) {
+            for (int i = 0; i < 2; ++i) {
+                const SeqCameraKey& a = src.cameraKeys[static_cast<std::size_t>(i)];
+                const SeqCameraKey& b = dst.cameraKeys[static_cast<std::size_t>(i)];
+                keysEqual = keysEqual && std::fabs(a.t - b.t) < 1.0e-4f &&
+                            std::fabs(a.position.x - b.position.x) < 1.0e-5f &&
+                            std::fabs(a.position.y - b.position.y) < 1.0e-5f &&
+                            std::fabs(a.position.z - b.position.z) < 1.0e-5f &&
+                            std::fabs(a.yaw - b.yaw) < 1.0e-5f &&
+                            std::fabs(a.pitch - b.pitch) < 1.0e-5f &&
+                            std::fabs(a.fov - b.fov) < 1.0e-5f && a.ease == b.ease;
+            }
+        }
+        char f1[160];
+        std::snprintf(f1, sizeof(f1), "parsed=%d,keys=%d,dur=%.3f", parsed ? 1 : 0,
+                      static_cast<int>(dst.cameraKeys.size()),
+                      static_cast<double>(dst.duration));
+        reportFlag("rt_camera_keys", keysEqual, f1);
+
+        // F2 事件往返（含中文 payload：ensure_ascii=false 才留得住）
+        const bool eventsEqual = dst.events.size() == 2 &&
+                                 dst.events[0].kind == "Sound" &&
+                                 dst.events[0].payload == "se_footstep" &&
+                                 dst.events[1].kind == "Line" &&
+                                 dst.events[1].payload == "千夏：小心脚下";
+        char f2[128];
+        std::snprintf(f2, sizeof(f2), "events=%d", static_cast<int>(dst.events.size()));
+        reportFlag("rt_events", eventsEqual, f2);
+
+        // F3 duration 是**显式**写出的，不是按内容推算
+        //    内容最晚才 4.25s，而 duration=12.5 —— 只有写了才可能读回 12.5
+        char f3[96];
+        std::snprintf(f3, sizeof(f3), "dur=%.3f", static_cast<double>(dst.duration));
+        reportFlag("rt_duration_explicit", std::fabs(dst.duration - 12.5f) < 1.0e-4f, f3);
+
+        // F4 诊断字段不进文件（`valid` / `error` / `sourcePath` 都不该出现）
+        const bool noDiag = text.find("\"valid\"") == std::string::npos &&
+                            text.find("\"error\"") == std::string::npos &&
+                            text.find("\"sourcePath\"") == std::string::npos &&
+                            text.find("\"warnings\"") == std::string::npos;
+        reportFlag("rt_no_diagnostics", noDiag, "");
+
+        // F5 中文没被转义成 \uXXXX（转义之后 git diff 全废）
+        const bool rawUtf8 = text.find("千夏") != std::string::npos &&
+                             text.find("\\u") == std::string::npos;
+        reportFlag("rt_utf8_raw", rawUtf8, "");
+
+        // F6 `ease` 总是写出来（默认 smooth 也要写：它是"这两帧怎么走"的
+        //    唯一表述，省略就得翻代码查默认值）
+        const bool easeWritten = text.find("\"ease\": \"step\"") != std::string::npos &&
+                                 text.find("\"ease\": \"linear\"") != std::string::npos;
+        reportFlag("rt_ease_always_written", easeWritten, "");
+
+        // F7 空的 payload 整个字段省略（不写 `"payload": ""`）
+        SequenceAsset noPayload;
+        noPayload.duration = 1.0f;
+        noPayload.cameraKeys.push_back(SeqCameraKey{});
+        noPayload.events.push_back(SeqEvent{0.5f, "Flag", ""});
+        const std::string t7 = toJson(noPayload);
+        reportFlag("rt_empty_payload_omitted",
+                   t7.find("\"payload\"") == std::string::npos, "");
+
+        // F8 作者的 `"//"` 说明必须原样往返。
+        //    JSON 没有注释语法，`opening.seq.json` 里那段"yaw 是弧度、step
+        //    的切点落在下一帧"是用 `"//"` 键写的**唯一一份格式说明**。
+        //    不往返的话：作者第一次按 Save，注释就无声消失了。
+        SequenceAsset withNote;
+        withNote.comment = "yaw is radians; step cuts at the NEXT key";
+        withNote.duration = 2.0f;
+        withNote.cameraKeys.push_back(SeqCameraKey{});
+        const std::string t8 = toJson(withNote);
+        SequenceAsset back8;
+        parseSequence(t8, "note.seq.json", back8);
+        reportFlag("rt_comment_roundtrip",
+                   back8.comment == withNote.comment && back8.valid,
+                   back8.comment.size() > 40 ? "len=long" : "len=short,got=empty");
+
+        // F9 没写过注释的资产**不要**凭空长出一个空的 `"//": ""`
+        reportFlag("rt_empty_comment_omitted",
+                   toJson(noPayload).find("\"//\"") == std::string::npos, "");
+    }
+
     const int failures = g_fail;
     VK_LOG_INFO("SEQ-TOTAL pass=%d fail=%d", g_pass, g_fail);
     return failures;

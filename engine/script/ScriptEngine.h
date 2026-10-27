@@ -43,6 +43,8 @@
 //                     setColor setIntensity setRange setDirection
 //                     setVisible setEmissive
 //                     setHealth damage popup      # HUD（U8）
+//                     playSequence showDialogue playAnim   # 演出（C6）
+//                     spawn setFlag getFlag loadScene      # 世界（C6 第二批）
 //                     print
 //
 //   数值一律是 double；角度（rotate）单位是**度**。
@@ -119,6 +121,56 @@ struct ScriptWorldActions {
     // 输入（S3）。动作名走 InputMap，不是键码。
     std::function<bool(const std::string&)> pressed, held, released;
     std::function<float(const std::string&)> axis;
+
+    // ---- 演出（C6 导演 API）----
+    //
+    // 这三件是"剧本/过场脚本"能不能写的前提：没有它们，`.vks` 只能摆位置、
+    // 改颜色、放音效 —— 一台能动的演示，不是游戏。
+    //
+    // ⚠ 放在 `act` 里而不是 `ScriptHost` 的直属字段：它们是**宿主动作**
+    //   （要有 SequencerSystem / DialogueSystem / AnimatorSystem 才成立），
+    //   而 `ScriptHost` 的直属 std::function（HUD / 音频）是不依赖任何
+    //   engine 子系统的窄动作。分层上这两类不是一个东西。
+    //
+    // 返回值是 `bool`，不是 `void`：资产不存在 / 实体没挂 Animator 时必须
+    // 让脚本那条语句**报错**。静默返回成功会让"我改完剧本怎么没反应"变成
+    // 玄学 —— 与 `setVel` 缺失时 `noBody()` 报错同一条纪律。
+    //
+    // 路径一律**相对 assets/**（`"sequences/opening.seq.json"`、
+    // `"ch01_open_01"` 两种写法由各自的 `resolve*Path()` 归一）。
+    std::function<bool(const std::string&)> playSequence;
+    std::function<bool(const std::string&)> showDialogue;
+    // `playAnim(e, "Run")` / `playAnim("Run")`（后者 = 隐式 self）。
+    // 目标必须有 `AnimatorComponent` + 骨架里真有这段，否则返回 false。
+    std::function<bool(ecs::Entity, const std::string&)> playAnim;
+
+    // ---- 世界控制（C6 第二批）----
+    //
+    // 演出三件让脚本能"指挥一段"，这四件让脚本能"改一局"：
+    // 刷东西 / 记旗标 / 换关卡 / 读旗标。少了它们，`.vks` 写不出
+    // "打赢了就进下一关"这种最基础的流程。
+    //
+    // `spawn(path, pos)` → 新实体。无效句柄 = 失败（模型加载不了）。
+    //   ⚠ 返回的是**真句柄**，所以脚本能紧接着 `setPos(e, ...)` /
+    //     `playAnim(e, ...)` —— 刷出来的东西当场就能摆弄。
+    //   ⚠ 刷出来的实体**不进物理世界**（场景物理在启动/换场景时构建一次）。
+    //     要它参与碰撞请在场景里预放；这条限制写在 spawn 的实现旁边。
+    //
+    // `loadScene(path)` → "请求已受理"，**不是**"已经切完了"。
+    //   真正的切换在下一帧开头做：脚本执行时正遍历着旧世界的实体，
+    //   这时候销毁世界就是拿迭代器开玩笑。所以语义是"排队 + 下一帧生效"，
+    //   返回值只回答"路径存在、请求已记下" —— 于是路径拼错**当场**报错，
+    //   而不是等到下一帧黑屏。
+    std::function<bool(const std::string&)> loadScene;
+    std::function<ecs::Entity(const std::string&, glm::vec3)> spawn;
+
+    // 剧情旗标（见 `runtime/GameFlags.h` 的头注释）。
+    // 存在宿主那边，engine 只认这两次调用 —— 于是"旗标怎么存、进不进
+    // 存档、要不要脏标记"全都不是引擎的事。
+    // ⚠ `getFlag` 未设过返回 **0**，不报错（"第 1 章没遇见的人，
+    //   好感度就是 0"是正确语义，不是笔误）。
+    std::function<bool(const std::string&, double)> setFlag;
+    std::function<double(const std::string&)> getFlag;
 };
 
 struct ScriptHost {

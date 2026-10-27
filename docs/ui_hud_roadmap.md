@@ -993,3 +993,75 @@ UI tick 在状态栈**之外**）→ U8（血条/准星/伤害数字/暂停菜�
 ⚠ `verify_ui2.py` 与 `gen_sdf_atlas.py` 里的 `DICT_SRC` 都已指向新路径 —— 搬家时
 只改一处会让"词典全覆盖"这条硬断言**静默失去意义**（旧路径只剩 101 行转发壳，
 数字从 956 掉到 211，红得"变小"，最难发现）。
+
+---
+
+## 15 · 执行进度（2026-10-27：#312 UI 编辑器最小版）
+
+**目标：让"界面上有什么"从 C++ 里搬出来，变成一份能拖着改的资产。**
+
+在此之前，血条坐标写死在 `runtime/ui/Hud.cpp`、暂停菜单写死在 `PauseMenu.cpp` ——
+改一个按钮的位置要重编译。这一轮之后，一份 `.ui.json` 就能描述整层界面，
+编辑器里拖控件 / 点九宫格换锚点 / 存盘，运行时 `Game.exe --ui-doc <path>` 直接读。
+
+| 交付物 | 内容 |
+|---|---|
+| `engine/ui2/UiDocument.{h,cpp}`（约 1100 行） | 文档格式 + `parseUiDocument` / `toJson` / `saveUiDocument`（临时文件 + rename）+ `placeDocument` / `drawDocument` + `UiBindings` |
+| `engine/ui2/UiLayout.cpp` 新增 `placeRectIn(parent, …)` | 子控件锚点相对**父矩形**；顶层相对屏幕 —— 两处共用同一套"左/中/右、上/中/下"符号约定 |
+| `editor/UiEditorWindow.{h,cpp}`（约 1500 行） | 三栏：控件树（230）/ 设计画布（16:9）/ Inspector（330）+ 底部校验条 |
+| `runtime/RuntimeConfig` + `RuntimeApp` | `uiDoc` 配置项（json / env `MYVK_RUNTIME_UI_DOC` / `--ui-doc`）+ 每帧重建 `UiBindings` 后 `drawDocument` |
+| `assets/ui/docs/hud_demo.ui.json` | 7 个控件（含 3 个嵌套子控件），带中文 `"//"` 注释，兼作 B 组的"往返不丢东西"夹具 |
+| `tools/verify_ui_editor.py`（约 680 行）+ 回归登记 | A~H 八组 **46 条**，已进 `DEFAULT` / `TRIGGERS` / `check_regression_map` |
+
+**验收实测**
+
+| 门 | 结果 |
+|---|---|
+| `verify_ui_editor` | **46/46 PASS** · `结果: PASS` |
+| `MYVK_UI2_TEST=1` 数值自检 | **`UI2-TOTAL pass=86 fail=0`**（53 → 86，新增 30 条 `uidoc_*` + 3 条清单项） |
+| `verify_ui2` / `verify_hud` / `verify_dialogue` | PASS（图集重生成后逐个复跑） |
+| `verify_i18n_coverage` | **73 项**（A1=5 / B=1 / B2=66 / E=1），与基线一致 |
+| `check_regression_map.py` | PASS |
+
+### 六条约束（写在 `UiEditorWindow.h` 头注释里，代码要服从它）
+
+1. **校验只有一份**：存盘前把文档 `toJson` 再 `parseUiDocument` 一遍，能解析回来才算通过。
+2. **读盘失败 → 只读**：坏文件不许被残片覆盖（D3 断言原文件 SHA 不变）。
+3. **换锚点保持屏幕位置**：`actSetAnchorKeepRect` 用 `placeRectIn` 的逆运算反解 x/y。
+4. **拖动只改 x/y**，不做尺寸手柄（最小版），尺寸走 Inspector。
+5. **画布缩放与 `ui.scale` 无关**：设计画布走 `placeDocumentAt(canvas, scale=1)`。
+6. **不做运行时预览**：编辑器和 `Game.exe` 各读同一份文件，不内置"边编边跑"。
+
+### 这一轮踩到的六个坑（都已写进代码注释）
+
+1. **"保持屏幕位置"不等于"rect 不变"**。`resume` 从 `bottom-right` 换到 `top-right`：
+   文档里 `rect` 的 x/y 是**距锚点那一侧**的距离，所以 y 必须从 24 变成 992，
+   而**屏幕矩形**仍是 `1656,992,240,64`。验收脚本第一版拿文档 rect 去对屏幕 rect，
+   把正确实现判成 FAIL —— 判据要分开写（C2 查文档、C3 查屏幕）。
+2. **`drawn=1` 是写死的**。`UIDOC-STATS` 里那个 `drawn` 原来直接抄了源码里的字面量，
+   于是这份日志只能证明"进了绘制函数"，证明不了"画了 7 个"。改成 `drawDocument`
+   真返回的 `UiDocDrawStats`，并加 `skipped` / `texts`。
+3. **锚点日志的节流点要包含第 1 帧**。验收夹具是 `frame == 60` 扣血，而节流是
+   "每 60 帧一行"—— 拿到的样本全在扣血之后，`fill` 一条直线，明明绑对了也证明不了。
+   改成 `m_uiDocFrames == 1 || … % 60 == 0` 后，fill 序列从"213.3 213.3 213.3"
+   变成 **"213.3 → 149.3"**（= 70%），绑定是否通一眼可见。
+4. **绑到不存在的键时 Progress 要按 0 算**。`w.value` 默认 1.0，缺失时会画出**满槽**——
+   "看起来血是满的"是最容易骗过验收的假象。`bind` / `bindMax` 缺失一律 0（空槽）。
+5. **`reason=(\S+)` 会被 NOTIF-PUSH 的回显行截走**。日志里 `UIED-SAVE-BLOCKED … reason=read-only`
+   紧接着还有一条 `text="UIED-SAVE-BLOCKED … reason=read-only"`，`\S+` 一路吃掉结尾的引号，
+   断言拿到的值是 `read-only"`，永远不等。改 `[\w-]+`。
+6. **`UI2-TEST` 的 actual/expected 允许有空格**。`HP 70/100`、`70 70.5` 会被 `(\S+)` 判成
+   "行格式解析失败"，红字全指向解析器而不是产品。改 `(.+?)` 靠后面的字面量做边界。
+
+### 回归纪律上的一处连带修复
+
+图集（2048×3072 / 1138 字形）早就装不下词典了：**HEAD 上就已缺 56 个汉字**，
+这一轮新增的 33 条 UI 编辑器词条又多了 8 个（`§九剧品宫旗校议`）。这类缺失
+"跑起来、有字、界面上看不出来"，只有图集覆盖率断言会红。已重生成：
+
+    python tools/gen_sdf_atlas.py --atlas-h 4096     # 1200 字形 / 2048×4096 / 0.61 MB
+
+⚠ 2048×3072 需要 6.7 M 像素，差 6% 装不下；4096² 只用 66.8%。`--atlas-h` 是 U7 那一轮
+加的，这次直接复用 —— 字号 48 / spread 6 / ascent 48 三个数**一个都没动**，
+所以字形位图逐位相同，只有打包位置变了：`verify_hud`（白字墨迹 ≥ 1%）与
+`verify_dialogue`（字幕底边对齐）复跑都 PASS，证明文本像素没有漂移。

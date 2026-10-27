@@ -8,7 +8,10 @@
 > `engine/scene/SceneSerializer.cpp`（读写）、
 > `runtime/RuntimeApp.cpp` + `editor/EditorApp.cpp`（接线两行）、
 > `editor/InspectorPanel.cpp`（`sequence` 页签）
-> 验收：`Game.exe --selftest sequence`（48 条）+ `tools/verify_sequencer.py`（8 组端到端）
+> 面板：`editor/TimelineEditorWindow.{h,cpp}`（时间轴轨道编辑器，§9）+
+> `editor/InspectorPanel.cpp` 的 `drawTabSequence`（组件配置台）
+> 验收：`Game.exe --selftest sequence`（67 条）+ `tools/verify_sequencer.py`（8 组端到端）
+> + `tools/verify_timeline_editor.py`（6 组 / 34 条）
 > 演示：`tools/make_sequencer_demo.py` → `assets/scenes/cutscene_demo.json`
 
 ---
@@ -35,6 +38,10 @@
 从零自己配：Hierarchy 选中任一物体 → Inspector 的 **Tool** 页 → **Add Component** →
 **Cutscene Sequence** → 在 `Sequence asset` 里填 `sequences/opening.seq.json`
 （**相对 `assets/`**，不要写绝对路径、也不要带 `assets/` 前缀）。
+
+**不想手写 JSON？** 点同一个页签里的 **Edit timeline…** 打开时间轴编辑器（§9），
+按 **New sequence** 就有一帧骨架，摆好机位按 **Capture** 就在播放头处打一个
+关键帧 —— 整段运镜都在轨道上排，不必自己算 yaw 的弧度。
 
 > ⚠ 相机被谁的 `CameraComponent` 接管，运镜就落在谁身上。**场景里没有
 > `CameraComponent` 实体时，运镜会被静默丢弃** —— 事件照发、资产照加载、
@@ -228,8 +235,8 @@ python tools/verify_sequencer.py
 
 | 想做的事 | 现状 |
 |---|---|
-| 在视口里拖关键帧、看曲线 | ❌ 只有时间滑条 + 只读事件树；关键帧要改 JSON |
-| 在 UI 上加 / 删事件 | ❌ 刻意不做：事件写进 `.seq.json` 才是权威，UI 改再回写是"两套真值" |
+| 在**轨道上**排关键帧 / 加删事件 | ✅ **2026-10-27 已做**（#311，§9）—— 拖、改、存盘都在面板里 |
+| 在**视口里**拖关键帧、看空间曲线 | ❌ 轨道是一维的（只有时间轴）。要做需要一条"视口 gizmo → 时间轴"的反向通道（见 §9.8） |
 | 事件真的触发对话 / 音效 / 转场 | ❌ 现在只打日志（`SEQ-EVENT`），消费端属于 C2 / 音频 / 后期 |
 | 过场结束把进度存下来 | ❌ 运行时字段不落盘，属于 **C3 存档** |
 | 多条时间轴做"接力" | ⚠ 同时跑会按 `priority` 选一条；接力需要等 C2 的调度 |
@@ -237,3 +244,172 @@ python tools/verify_sequencer.py
 
 排期在 `docs/anime_gap_review_2026-10-26.md` 的「B/C/D」三刀里：C1（本文）→
 C2 对话 → C3 存档 → 之后是 D 组（打包 / 本地化 / 性能门槛）。
+
+---
+
+## 9 · 时间轴轨道编辑器（把运镜排出来，不写 JSON）
+
+> #311 · `editor/TimelineEditorWindow.{h,cpp}`（约 1000 行）+
+> `sequence::toJson` / `saveSequence`（写回）
+> 验收：`tools/verify_timeline_editor.py`（6 组 / 34 条）
+> + `--selftest sequence` 的 F 组（`rt_*` 九条往返断言）
+
+### 9.1 三个入口
+
+| 从哪进 | 带什么 |
+|---|---|
+| Inspector → Tool → **Cutscene Sequence** 页签 → **Edit timeline…** | 组件上配的那份路径 |
+| **View / Window 菜单**（或底栏 `+` 托盘）→ **Timeline editor** | 空手开窗，只剩"新建" |
+| `MYVK_EDITOR_TLED=<路径>`（自动化） | 指定路径 |
+
+三个入口汇到同一个 `open(path)`，走的是 `EditorContext` 里的一次性请求 ——
+所以自动化那句和手点按钮是**同一条路**，不是给测试开的旁路。
+
+### 9.2 界面
+
+```
+┌ 时间轴编辑器 — opening *─────────────────────────────────────────────────┐
+│ 资产路径 [sequences/opening.seq.json        ] [重新加载] [保存]           │
+│ 时长 [8.00 秒] 循环[ ] 播放头 [0.000 秒]                                  │
+│ [抓取机位] [+ 关键帧] [+ 事件] [删除] [新建过场]                          │
+├────────┬─────────────────────────────────────────────────────────────────┤
+│        │ 0s    1s    2s    3s    4s    5s    6s    7s    8s              │
+│ 相机 5 │ ◆──────◆┈┈┈┈┈┈◆───────────◆──────────────◆                     │
+│ 事件 4 │   ●Fade    ●Footstep      ●Line              ●Music              │
+├────────┴─────────────────────────────────────────────────────────────────┤
+│ 0.000 秒 t  [5.500][-1.200][1.900] pos  11.5° yaw  -6.9° pitch  45.0 fov │
+│ smooth ease      第 1 / 5 个 | 弧度 yaw=0.2000 pitch=-0.1200             │
+├──────────────────────────────────────────────────────────────────────────┤
+│ 加载校验：通过   5 个关键帧，4 个事件，8.00 秒                            │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+轨道图上的三件事一眼可读：
+
+| 形状 | 含义 |
+|---|---|
+| 蓝色**菱形** | 相机关键帧（选中的是黄色，超出时长的是红色） |
+| 实线 | 这一段是插值过去的（`linear` / `smooth`） |
+| **虚线** | 这一段是 `ease=step` —— 保持前一帧，到下一帧那一刻**硬切** |
+| 彩色**圆点** | 事件。颜色由 `kind` 哈希决定（同一个 kind 永远同一个色），右边的字是 kind |
+| 竖线 + 顶部三角 | 播放头 |
+
+### 9.3 六条"省了就错"的约束
+
+| # | 约束 | 省了会怎样 |
+|---|---|---|
+| ① | 拖关键帧时**松手才重排**，拖动中不排 | 拖到一半，鼠标下面那一帧在数组里跳到别处 → 选中项换成别人 |
+| ② | UI 用**度**，资产用**弧度** | 作者不会用弧度思考（180° 写成 3.1416 没人算得出）。反过来，转换写错后 `yaw=0.2` 显示成 11.5° 看着"挺合理"，等镜头发疯才发现 |
+| ③ | 拖播放头走 `tick(sc, 0.0f)`（只采样，不推进、不发事件） | 拖一下就变成"播"，事件也跟着发 —— 那是在编辑态跑运行时 |
+| ④ | 校验**不在面板里实现**（序列化 → 丢回 `parseSequence`） | 两套规则。症状是"编辑器说没问题，进 Play 镜头不动" |
+| ⑤ | 读盘失败 → **只读** | `parseSequence` 边解析边填，存盘会把 40 帧的过场截成 3 帧 |
+| ⑥ | 存盘后把场景里引用同一份资产的组件**标记重读** | 窗口里是新运镜、Save 成功、进 Play 还是旧的 |
+
+### 9.4 写回（`sequence::toJson` / `saveSequence`）
+
+从 #311 起 `SequenceAsset` 能写。四样东西刻意**不写**：
+
+| 不写 | 为什么 |
+|---|---|
+| `valid` / `error` / `warnings` | 加载期诊断，不是内容。写进去下次读盘会把上次的警告当成"这次也这样" |
+| `sourcePath` | 它是"从哪读来的"，不是资产属性。换个目录打开就指回老路径 |
+| 空的 `payload` | 整个字段省略。写 `"payload": ""` 与不写是同一件事，diff 里却多一行噪声 |
+| `\uXXXX` 转义 | `ensure_ascii=false`。转义之后 diff 是一屏 `\u5343\u590f`，作者没法用 git 看自己改了什么 |
+
+反过来，**有两样东西必须写**：
+
+| 必写 | 为什么 |
+|---|---|
+| `duration` | `parseSequence` 的口径是"`duration <= 0` → 按内容推算"。编辑器把它变成可拖的字段之后，不写显式值的话，"我把最后一帧从 8s 拖到 9s"会看起来什么都没发生 |
+| `ease` | 它是"这两帧之间怎么走"的唯一表述。省略就得去翻代码里的默认值 —— 而 `step` 和 `smooth` 的画面差一个数量级 |
+
+再加一条**不丢东西**的：
+
+> ⚠⚠ `"//"` 键是作者写的说明（JSON 没有注释语法，约定用它）。
+> `opening.seq.json` 里那段"yaw 是弧度、step 的切点落在下一帧"是这份格式
+> 唯一一份触手可及的文档 —— 编辑器**必须原样带回去**，否则作者第一次按
+> Save 就无声地失去了它。`--selftest sequence` 的 `rt_comment_roundtrip`
+> 钉的就是这条。
+
+`saveSequence` 是**写临时文件再改名**，不是直接覆盖：写一半断电的后果是
+"文件打不开"，而存档点就在一个快捷键之外。
+
+### 9.5 存盘之后：场景里的组件会被刷新
+
+作者按 Save 后，场景里**引用同一份资产**的 `SequencerComponent` 会被标记
+`assetLoaded = false`，下一帧 `SequencerSystem::tick` 就会重读。
+
+不做这件事的话症状很怪：窗口里是新运镜、按 Save 成功、进 Play 还是旧的 ——
+因为 `assetLoaded` 的语义就是"读过一次就别再读了"。
+
+**正在播的那一段不打断**（`started && !finished && playing` → 记
+`TLED-SCENE-SKIP`，等它下一次起播）。中途换运镜会让画面在一帧之内跳到
+一个完全不同的机位，比"这次预览是旧的"更糟。
+
+### 9.6 自动化
+
+```bash
+python tools/verify_timeline_editor.py            # 6 组 / 34 条
+python tools/verify_timeline_editor.py --only c   # 只跑某个用例
+python tools/verify_timeline_editor.py --keep     # 留临时目录
+```
+
+两个注入钩子（与 `MYVK_EDITOR_REBIND` 同一条纪律：**只跑一次**）：
+
+```
+MYVK_EDITOR_TLED=<路径>                  启动即打开这份资产
+MYVK_EDITOR_TLED_SCRIPT="sel:camera:1;settime:3.0;save"   按顺序执行
+MYVK_EDITOR_TLED_DUMP=<路径>             把当前资产落成 JSON（不写盘也能看）
+```
+
+命令表：`sel:<camera|events>:<i>` `addkey` `capture` `addevent[:kind]` `del`
+`settime:<秒>` `setpos:<x,y,z>` `setyaw:<度>` `setpitch:<度>` `setfov:<f>`
+`setease:<linear|smooth|step>` `setkind:<k>` `setpayload:<s>` `setdur:<秒>`
+`head:<秒>` `loop:<0|1>` `new` `save` `saveforce` `saveas:<路径>` `reload`
+`check` `dump`。
+
+> ⚠ 注入的文本**用 ASCII**：`std::getenv` 在 Windows 上按 ANSI 代码页转换
+> 环境块，中文进去会变成 GBK 字节 —— 那验的是"编码没配好"，不是编辑器对不对。
+
+> ⚠ `setyaw` / `setpitch` 收的是**度**（与界面一致），写进文件的是弧度。
+> 验收里那条 `setyaw:90 → 1.5708` 就是钉这个换算的 —— 写成 90 或者
+> 5156 都是错的，而两种错都"看着像个数"。
+
+### 9.7 日志锚点
+
+```
+TLED-OPEN             path= ok= keys= events= dur= readOnly=
+TLED-CHECK            ok= keys= events= dur= warns= err=     ← 只在结论变化时打
+TLED-SEL              track= i= t=
+TLED-ADDKEY           t= keys= sel=
+TLED-CAPTURE          mode=insert|overwrite t= sel=
+TLED-ADDEVENT         t= kind= events= sel=
+TLED-DEL              track= ... 
+TLED-SETTIME          track= t= sel=
+TLED-SETEASE          t= ease=
+TLED-SETDUR           dur=
+TLED-REORDER          track= from= to= t=                    ← 拖拽与输入框共用
+TLED-DRAG-END         track= from= to= t=                    ← 只在松手时
+TLED-REJECT           op= reason=                            ← 每个被拒的操作都有
+TLED-SAVE             path= keys= events= force=
+TLED-SAVE-BLOCKED     path= reason=read-only|no-path|check
+TLED-SAVE-FAIL        path= err=
+TLED-SCENE-RELOAD     path= reloaded= skipped=
+TLED-CLOSE-DIRTY      path=                                  ← 带着未存改动关窗
+SEQ-SAVE              path= full= keys= events= dur= bytes=   ← 由 SequenceAsset 打
+```
+
+`TLED-REORDER` 单独存在是有意的：它是**唯一**会改变"下标 ↔ 身份"对应关系
+的动作，而拖拽和输入框改 t 都走它。验收里 C 组断言的就是这条 —— 不管从
+哪条路改的 t，数组都必须重排、且被改的仍然是同一帧。
+
+### 9.8 这一版**不做**的
+
+| 想做的事 | 现状 |
+|---|---|
+| 在视口里拖关键帧 / 看空间曲线 | ✗ 轨道是一维的。要做需要"视口 gizmo → 时间轴"的反向通道，而那要穿过 EditorScene / ViewportPanel / Gizmo 三层（编辑器视口是自由相机，不经过 `CameraSystem`） |
+| 撤销（Ctrl+Z） | ✗ 资产不在场景里，改动不进 `EditorContext` 的 undo 栈。**存盘**就是检查点，Reload 就是整体回滚 |
+| 多选 / 框选关键帧 | ✗ 一次只选一个。批量挪动是下一个自然的扩展 |
+| 复制粘贴关键帧 | ✗ 同上 |
+| 贝塞尔曲线缓动 | ✗ 只有 `linear` / `smooth` / `step` 三档（与资产格式一致） |
+| 把"当前视口机位"实时跟随成轨道预览 | ✗ 预览是"拖播放头 → 写场景相机"，反过来（拖相机 → 关键帧跟着走）需要上面那条通道 |

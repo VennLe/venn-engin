@@ -70,6 +70,14 @@ struct SequenceAsset {
     std::string name;        // 诊断用；缺省取文件名
     std::string sourcePath;  // 解析时给的路径（相对或绝对）
 
+    // 作者写在文件里的 `"//"` 说明（JSON 没有注释语法，约定用这个键）。
+    //
+    // ⚠⚠ **写回时必须原样带回去**。`opening.seq.json` 里那一段解释
+    //     "yaw 是弧度、step 的切点落在下一帧" 的话，是这份格式唯一
+    //     触手可及的文档 —— 编辑器存一次盘就把它抹掉的话，作者的注释
+    //     会在他第一次点 Save 时无声消失，而那时他正忙着看运镜。
+    std::string comment;
+
     float duration = 0.0f;   // <=0 → 加载时按最晚的关键帧/事件推算
     bool loop = false;
 
@@ -91,6 +99,39 @@ bool parseSequence(const std::string& text, const std::string& sourcePath,
 
 // ---- 加载（走 `assets::resolveAssetPath` 的候选链）----
 bool loadSequence(const std::string& path, SequenceAsset& out);
+
+// ============================================================
+// 写回（#311 时间轴编辑器用）
+// ============================================================
+//
+// ⚠⚠ **写出来的东西必须能被 `parseSequence` 原样读回**。这是整个写回层
+//     唯一的正确性判据，也是自检 `rt_*` 那几条在钉的事：`toJson` 之后
+//     `parseSequence` 一遍，`cameraKeys` / `events` / `duration` 必须逐字段相等。
+//
+// 四样东西刻意**不写**（与 `dialogue::toJson` 同一套理由）：
+//   · `valid` / `error` / `warnings` —— 加载期诊断，不是内容。写进去下次读盘
+//     会把上次的警告当成"这次也这样"，作者永远甩不掉一条已经修好的警告
+//   · `sourcePath` —— 它是**从哪读来的**，不是资产属性。写进文件里，下次
+//     换个目录打开就指回老路径
+//   · 空的 `payload` —— 整个字段省略。写 `"payload": ""` 与不写是同一件事，
+//     但 diff 里会多出一行噪声
+//   · `duration <= 0` 的推算意图 —— 见下面 ①
+//
+// ⚠⚠ ① **`duration` 只在"显式值"和"推算值一致之外"时才有歧义。**
+//     `parseSequence` 的口径是：`duration <= 0` → 按最晚的关键帧/事件推算。
+//     编辑器把 duration 变成可拖的字段之后，必须**总是显式写出**它 ——
+//     否则"我把最后一帧从 8s 拖到 9s"会因为 duration 仍按内容推算而
+//     看起来什么都没发生（实际上是 duration 跟着长了，但那不是作者的意图：
+//     他是想把这一帧往后挪，让尾巴留白）。写显式值之后这条语义才稳定。
+//
+// ⚠⚠ ② `ease` 总是写。它是"这两帧之间怎么走"的唯一表述，省略就得去翻
+//     代码里的默认值。作者看文件时要能一眼看出哪一段是硬切。
+std::string toJson(const SequenceAsset& a);
+
+// 写：临时文件 + rename（写一半断电 = 文件打不开，而存档点就在一个
+// 快捷键之外）。失败时 `err` 是人话。
+bool saveSequence(const std::string& path, const SequenceAsset& a,
+                  std::string& err);
 
 // ============================================================
 // 采样

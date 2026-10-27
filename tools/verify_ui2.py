@@ -212,10 +212,35 @@ EXPECTED_SELFTEST = [
     "hit_inside", "hit_outside", "hit_right_exclusive", "hit_disabled",
     "button_idle_color", "button_hover_color", "button_press_beats_hover",
     "button_with_label_verts",
+    # #312：`.ui.json` 文档层（解析 / 往返 / 放置 / 绑定 / 绘制）。
+    # 这 30 条是"算得对"的那一半（另一半"面板上按下去真写了"在
+    # tools/verify_ui_editor.py）。逐个列名字而不是只数总数：删掉一条时
+    # 总数也会跟着少，但只有名字在这里才能指出**缺的是哪一条**。
+    "uidoc_parse_ok", "uidoc_parse_widgets", "uidoc_parse_comment",
+    "uidoc_parse_warn_free",
+    "uidoc_roundtrip_bytes",
+    "uidoc_place_count", "uidoc_place_order",
+    "uidoc_anchor_top_center_x", "uidoc_anchor_bottom_left_x",
+    "uidoc_anchor_bottom_left_y",
+    "uidoc_child_in_parent_x", "uidoc_child_in_parent_w",
+    "uidoc_scale_independent",
+    "uidoc_bind_text", "uidoc_bind_int_vs_float", "uidoc_bind_unknown_kept",
+    "uidoc_bind_progress_fill", "uidoc_bind_missing_zero",
+    "uidoc_draw_widgets", "uidoc_draw_texts", "uidoc_draw_rect_verts",
+    "uidoc_hidden_parent_skips_children", "uidoc_zero_extent",
+    "uidoc_reject_dup_id", "uidoc_reject_dup_id_msg",
+    "uidoc_reject_bad_anchor", "uidoc_reject_missing_rect",
+    "uidoc_reject_unknown_type", "uidoc_reject_id_with_space",
+    "uidoc_bad_color_warns",
 ]
 
-TEST_RE = re.compile(r"UI2-TEST\s+(\S+)\s+actual=(\S+)\s+expected=(\S+)\s+"
-                     r"tol=(\S+)\s+result=(PASS|FAIL)")
+TEST_RE = re.compile(r"UI2-TEST\s+(\S+)\s+actual=(.+?)\s+expected=(.+?)\s+"
+                     r"tol=(\S+)\s+result=(PASS|FAIL)\s*$")
+# ↑ actual / expected 用 `(.+?)` 而不是 `(\S+)`：断言值里**可以有空格**
+#   （`HP 70/100`、`70 70.5`、`self-test fixture`）。原来用 `\S+` 时这三条
+#   直接被判成"行格式解析失败"，而 `UI2-TOTAL pass` 与数到的行数又对不上
+#   （86 vs 83），红字全指向解析器而不是产品。靠后面紧跟的 ` expected=` /
+#   ` tol=` / ` result=` 这几个字面量做边界，值里不含这些串就不会歧义。
 TOTAL_RE = re.compile(r"UI2-TOTAL\s+pass=(\d+)\s+fail=(\d+)")
 
 

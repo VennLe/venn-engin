@@ -52,4 +52,45 @@ UiRect placeRect(const UiPlacement& p, uint32_t outW, uint32_t outH) {
     return placeRect(p, outW, outH, computeScale(outW, outH));
 }
 
+UiRect placeRectIn(const UiRect& parent, const UiPlacement& p, float scale) {
+    UiRect r;
+    // 父矩形为空（父被裁掉 / 尺寸 0）或 scale 非法 → 空矩形。
+    // ⚠ 不在这里"顺手取 max(1, ...)"：那会画出 1×1 的残影，而它看起来
+    //   像"控件画歪了"，实际原因是父矩形为 0。
+    if (parent.w <= 0.0f || parent.h <= 0.0f || scale <= 0.0f) return r;
+
+    // 父矩形换算回**参考像素**再按 placeRect 的同一套公式走。
+    const float pw = parent.w / scale;
+    const float ph = parent.h / scale;
+
+    const bool left = p.anchor == UiAnchor::TopLeft ||
+                      p.anchor == UiAnchor::MiddleLeft ||
+                      p.anchor == UiAnchor::BottomLeft;
+    const bool midX = p.anchor == UiAnchor::TopCenter ||
+                      p.anchor == UiAnchor::Center ||
+                      p.anchor == UiAnchor::BottomCenter;
+    const bool top = p.anchor == UiAnchor::TopLeft ||
+                     p.anchor == UiAnchor::TopCenter ||
+                     p.anchor == UiAnchor::TopRight;
+    const bool midY = p.anchor == UiAnchor::MiddleLeft ||
+                      p.anchor == UiAnchor::Center ||
+                      p.anchor == UiAnchor::MiddleRight;
+
+    float x = 0.0f;
+    if (left)      x = p.x;
+    else if (midX) x = pw * 0.5f + p.x - p.w * 0.5f;
+    else           x = pw - p.x - p.w;
+
+    float y = 0.0f;
+    if (top)       y = p.y;
+    else if (midY) y = ph * 0.5f + p.y - p.h * 0.5f;
+    else           y = ph - p.y - p.h;
+
+    r.x = parent.x + x * scale;
+    r.y = parent.y + y * scale;
+    r.w = p.w * scale;
+    r.h = p.h * scale;
+    return r;
+}
+
 }  // namespace ui2

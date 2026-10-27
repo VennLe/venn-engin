@@ -57,4 +57,15 @@ UiRect placeRect(const UiPlacement& p, uint32_t outW, uint32_t outH,
 // 常用重载：scale 走 computeScale（受 ui.scale 影响）。
 UiRect placeRect(const UiPlacement& p, uint32_t outW, uint32_t outH);
 
+// 在**给定的父矩形**里放置（`UiDocument` 的子控件用，见 #312）。
+//
+// 语义与 `placeRect` 逐字相同，只是"画布"换成了父矩形的内部：
+// 左锚 = 父左边 + x、右锚 = 父右边 - x - w、中锚 = 父中心 + x - w/2。
+// ⚠ `parent` 是**输出像素**，`p` 的 x/y/w/h 是**参考像素**，内部乘 scale
+//   —— 父矩形本身也是"参考尺寸 × scale"算出来的，所以 `parent.w / scale`
+//   就是父的参考宽度，不会累积误差（同一帧同一 scale）。
+// ⚠ 为什么放这里而不是 UiDocument 里：锚点符号约定只该有一份实现。
+//   抄一份到别处的后果是"父锚点和屏幕锚点差一个 w"这种最难查的偏移。
+UiRect placeRectIn(const UiRect& parent, const UiPlacement& p, float scale);
+
 }  // namespace ui2

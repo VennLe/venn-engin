@@ -47,6 +47,12 @@ class Scene;
 struct CameraPose;
 }
 
+namespace ecs {
+// 只前向声明：`m_cue` 用 unique_ptr 持有，析构在 .cpp 里实例化。
+// 直接 include `ecs/Components.h` 会把 1600 行拖进每个引用本头的 TU。
+struct SequencerComponent;
+}
+
 namespace sequence {
 
 // 时间比较阈值，与 `SequenceAsset.cpp` 里的那份同源（0.1 ms）。
@@ -54,6 +60,14 @@ constexpr float kSeqTimeEps = 1.0e-4f;
 
 class SequencerSystem {
 public:
+    // 析构必须在 .cpp 里（`m_cue` 持有不完整类型的 unique_ptr）。
+    // 拷贝/移动一律禁用：本类持有播放头与相机意图，复制一份等于两个
+    // 播放器推同一个场景 —— 那种 bug 只会表现为"过场播了两次"。
+    SequencerSystem();
+    ~SequencerSystem();
+    SequencerSystem(const SequencerSystem&) = delete;
+    SequencerSystem& operator=(const SequencerSystem&) = delete;
+
     // 每帧调用。`dt` 用**游戏时间**（含 timeScale）：过场在暂停时该停。
     //
     // ⚠⚠ **本函数不碰任何相机系统。** 它只把采样结果放进 `pose()`，由
@@ -92,6 +106,27 @@ public:
     // （路径、speed 那些是作者写的，不该被抹掉）。
     void resetRuntime(scene::Scene& scene);
 
+    // ---- 点播（C6 脚本导演 API）----
+    //
+    // `playSequence("sequences/opening.seq.json")` 落到这里。
+    //
+    // ⚠⚠ **点播不写进场景。** 与 `DialogueSystem::cue()` 同一条纪律：给场景
+    //   动态加一个组件，`scene.save` 会把它**永久**写进磁盘，作者下次打开
+    //   发现多了一段自己没配过的轨道。所以这里用一份内部播放状态。
+    //
+    // 优先级：点播**压过**场景里所有组件（脚本说"现在播这段"就是现在播）。
+    // 播完（非循环走到底）自动让位，场景里原本配好的时间轴重新接管。
+    //
+    // 返回 false = 资产不存在/解析失败（宿主会把它翻成脚本运行期错误）。
+    bool cue(scene::Scene& scene, const std::string& assetPath);
+
+    // 正在点播吗（日志 / 自检 / 脚本回读 `isSequencing()`）。
+    // ⚠ 访问器一律"从事实推导"，不另存标志位 —— 标志位会出现
+    //   "cue() 之后 tick() 之前读到 false"这种半截状态（DialogueSystem
+    //   的 sys_active 就是被这个咬过的）。
+    bool cuePlaying() const;
+    const std::string& cuePath() const;
+
     void setTrace(bool on) { m_trace = on; }
 
 private:
@@ -112,6 +147,11 @@ private:
     // （include `scene/CameraSystem.h` 会把 scene 头拖进每个用组件的地方）。
     std::unique_ptr<scene::CameraPose> m_pose;
     bool m_hasPose = false;
+
+    // 脚本点播那一段。nullptr = 从没点播过（不是"没在播" —— 没在播看
+    // `playing` 字段）。保留这份状态而不是每次 new：连续点播时省一次
+    // 分配，且 `cuePath()` 能一直回读上次播的是哪段。
+    std::unique_ptr<ecs::SequencerComponent> m_cue;
 
     bool m_trace = false;
     bool m_loggedNoCamera = false;

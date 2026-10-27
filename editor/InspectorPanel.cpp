@@ -5,6 +5,7 @@
 #include "EditorDragDrop.h"
 #include "EditorLayoutIO.h"
 #include "InspectorIcons.h"
+#include "MultiEditMath.h"
 #include "sequence/SequencerSystem.h"
 #include "PrimitiveBuilder.h"
 
@@ -27,6 +28,7 @@
 #include "render/ShaderKeywords.h"
 #include "scene/Camera.h"
 #include "scene/Light.h"
+#include "scene/Prefab.h"
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
 #include "terrain/Terrain.h"
@@ -284,6 +286,7 @@ const TabDesc kTabs[] = {
     {"material", "Material", "Material factors and textures", iconMaterial},
     {"animation", "Animation", "Skinning and animation clips", iconAnimation},
     {"sequence", "Sequence", "Cutscene timeline: camera moves and events", iconSequence},
+    {"dialogue", "Dialogue", "Dialogue asset: typing speed / auto start / start node", iconDialogue},
     {"all", "All", "Everything (the old stacked view)", iconAll},
 };
 constexpr int kTabCount = static_cast<int>(sizeof(kTabs) / sizeof(kTabs[0]));
@@ -432,10 +435,21 @@ void InspectorPanel::draw() {
     // 刻意放在**导航栏上方**、占满整宽：它就是"我现在在编辑谁"，
     // 是整页的上下文，不该只在 Object 页里出现。
     if (hasSel) {
-        const std::string* np = sc.world().name(e);
-        ImGui::Text(TR("Entity: %s"), np ? np->c_str() : "(unnamed)");
-        ImGui::SameLine();
-        ImGui::TextDisabled(TR("#%u.%u"), e.id, e.generation);
+        // 多选：头部说清"现在有几个 / 主选中项是谁"。
+        // 主选中项决定手柄的坐标系与 Inspector 里"共享字段"的取值来源，
+        // 所以它不是个内部细节，得写在脸上。
+        if (m_ctx.multiSelected()) {
+            const std::string* np = sc.world().name(e);
+            ImGui::Text(TR("%zu objects selected"), m_ctx.selectionCount());
+            ImGui::TextDisabled(TR("primary: %s   #%u.%u"),
+                                np ? np->c_str() : "(unnamed)", e.id,
+                                e.generation);
+        } else {
+            const std::string* np = sc.world().name(e);
+            ImGui::Text(TR("Entity: %s"), np ? np->c_str() : "(unnamed)");
+            ImGui::SameLine();
+            ImGui::TextDisabled(TR("#%u.%u"), e.id, e.generation);
+        }
         if (!m_ctx.isEditing()) {
             ImGui::SameLine();
             ImGui::TextColored(
@@ -448,6 +462,43 @@ void InspectorPanel::draw() {
         ImGui::SameLine();
         ImGui::TextDisabled(TR("(World / Scene / Output still work)"));
     }
+    ImGui::Separator();
+
+    // ---- G18 预制体条 ----
+    //
+    // 为什么放在头部而不是 Object 页里：它回答的是"我现在编辑的**是谁**"，
+    // 与"编辑什么属性"无关。翻到 Physics 页也照样该看见"这是 prefab 的一份
+    // 实例、有 1 条覆盖" —— 否则改完物理参数不知道自己在改母版还是改这一份。
+    if (hasSel) {
+        const auto* pl = sc.world().get<ecs::PrefabLinkComponent>(e);
+        if (pl) {
+            const int ov = scene::countOverrides(sc, pl->instance);
+            ImGui::TextDisabled(TR("Prefab: %s"), pl->prefabPath.c_str());
+            ImGui::SameLine();
+            ImGui::TextDisabled(TR("(instance %u, %d override)"), pl->instance,
+                                ov);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(TR("Apply##prefab")))
+                m_ctx.prefabApply(e);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(TR("Revert##prefab")))
+                m_ctx.prefabRevert(e);
+
+            // 去抖：只在"选中的这份实例或它的覆盖数"变化时打一行。
+            const std::string sig = pl->prefabPath + "/" +
+                                    std::to_string(pl->instance) + "/" +
+                                    std::to_string(ov);
+            if (m_lastPrefabSig != sig) {
+                m_lastPrefabSig = sig;
+                core::logMessage(core::LogLevel::Info,
+                                 "INSP-PREFAB path=%s instance=%u overrides=%d",
+                                 pl->prefabPath.c_str(), pl->instance, ov);
+            }
+        } else {
+            m_lastPrefabSig.clear();
+        }
+    }
+
     ImGui::Separator();
 
     // ---- E11 组件搜索：过滤分区与其字段关键词 ----
@@ -567,6 +618,27 @@ void InspectorPanel::drawNavBar() {
 // 内容派发。搜索词非空时**忽略页签选择**、跨所有页签摊平 ——
 // 和 Preferences 窗口的搜索行为保持一致：搜东西的时候不该还要先猜它在哪页。
 void InspectorPanel::drawTabContent(ecs::Entity e) {
+    // ---- 多选：实体相关的页签统一换成"批量编辑"页（#316）----
+    //
+    // World / Scene / Output 三页是**全局**设置（灯光、物理、日志），与
+    // "选中谁"无关，多选时照常显示；Render 页有一半是引擎级特性开关，
+    // 也不能为了多选把它藏了。剩下那些页签画的全是"这一个实体的组件"。
+    if (m_ctx.multiSelected()) {
+        const InspTab t = static_cast<InspTab>(m_tab);
+        const bool entityScoped = t == InspTab::Object || t == InspTab::Tool ||
+                                  t == InspTab::Particles ||
+                                  t == InspTab::Physics ||
+                                  t == InspTab::Material ||
+                                  t == InspTab::Animation ||
+                                  t == InspTab::Sequence ||
+                                  t == InspTab::Dialogue || t == InspTab::All;
+        if (entityScoped) {
+            ImGui::TextDisabled(TR("(multi-selection)"));
+            drawMultiPanel();
+            return;
+        }
+    }
+
     if (m_search[0] != '\0') {
         ImGui::TextDisabled(TR("(searching across all tabs)"));
         drawTabAll(e);
@@ -584,6 +656,7 @@ void InspectorPanel::drawTabContent(ecs::Entity e) {
         case InspTab::Material:  drawTabMaterial(e); break;
         case InspTab::Animation: drawTabAnimation(e); break;
         case InspTab::Sequence:  drawTabSequence(e); break;
+        case InspTab::Dialogue:  drawTabDialogue(e); break;
         case InspTab::All:       drawTabAll(e); break;
         case InspTab::Count:     break;
     }
@@ -3005,6 +3078,25 @@ void InspectorPanel::drawTabSequence(ecs::Entity e) {
     hint("Relative to assets/. Keys and events live in that JSON — see "
          "docs/cutscene_sequencer.md.");
 
+    // ---- 打开时间轴编辑器（#311）----
+    // 这是"从组件跳到它引用的那份资产"的唯一入口。与 dialogue 页签的
+    // "Edit script…" 同一套路：只往 ctx 里推一个请求，编辑器窗口由
+    // EditorApp 负责开（Inspector 不该认识那个窗口）。
+    //
+    // ⚠ 路径为空也**允许**点：编辑器能空手开窗、用 "New sequence" 从零建
+    //   一份（见 TimelineEditorWindow::actNewSequence）。禁掉的话，"我想排
+    //   一段新过场"就只剩"先随便填个不存在的路径"这一条路。
+    if (ImGui::Button(TR("Edit timeline..."))) {
+        m_ctx.requestTimelineEditor(sq->sequencePath);
+        VK_LOG_INFO("INS-SEQ-EDIT path=%s",
+                    sq->sequencePath.empty() ? "(none)"
+                                             : sq->sequencePath.c_str());
+    }
+    logRect("INS-SEQ-EDIT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", TR("Camera keys and events on a track — no JSON "
+                                 "by hand."));
+
     // 懒加载一次（tick 也会加载，但编辑态下 tick 可能没被调，这里兜一下，
     // 否则"页面全空"要等到进 Play 才有内容）。
     if (!sq->assetLoaded && !sq->sequencePath.empty()) {
@@ -3116,6 +3208,167 @@ void InspectorPanel::drawTabSequence(ecs::Entity e) {
             }
             ImGui::TreePop();
         }
+    }
+
+    ImGui::PopID();
+}
+
+// ---------------------------------------------------------------- C2 对话
+//
+// 这一段是剧本的**配置台**，不是剧本编辑器（逐句写台词的编辑器是后续工作）。
+// 它要能回答四个问题 ——
+//   ① 挂的是哪份剧本，它到底解析成功了没有（失败要给出**人能读懂的**那句）
+//   ② 有几行、从哪开始、几行带分支
+//   ③ 打字速度是多少 —— `cps <= 0` 是"立刻全出"，这个语义**不写出来没人
+//      猜得到**（症状是"字幕一出现就是整句"，看起来像打字机坏了）
+//   ④ 起播方式是 `autoStart` 还是等时间轴 `kind=Line` 点名
+//
+// ⚠ 与 `sequence` 页签同构，但有一条差别：时间轴在编辑态能靠 `tick(sc, 0)`
+//   预览运镜，对话**没有**这个能力 —— `DialogueSystem` 只在运行时被 tick。
+//   所以这里不做"预览播放"按钮：放一个按下去什么都不动的按钮，比没有更糟。
+void InspectorPanel::drawTabDialogue(ecs::Entity e) {
+    if (!e.valid()) { tabEmptyHint("an object"); return; }
+
+    scene::Scene& sc = m_ctx.activeScene();
+    ecs::World& w = sc.world();
+    auto* dlg = w.get<ecs::DialogueComponent>(e);
+    if (!dlg) {
+        tabEmptyHint("dialogue");
+        hint("Tool tab → Add Component → Dialogue.\n"
+             "Attach it to the NPC (or the director object) that should speak.");
+        return;
+    }
+
+    const bool open = sectionHeader("Dialogue", true, e);
+    logRect("INS-DLG-HEADER", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (!open) return;
+
+    ImGui::PushID("dlg");
+
+    // 两个输入框共用一份"当前实体"标记：换选中对象必须同时重填两个，
+    // 否则换到另一个 NPC 上会看到上一个的路径 + 这一个的起始节点。
+    if (m_dlgBufFor != e) {
+        m_dlgBufFor = e;
+        std::snprintf(m_dlgPathBuf, sizeof(m_dlgPathBuf), "%s",
+                      dlg->dialoguePath.c_str());
+        std::snprintf(m_dlgStartBuf, sizeof(m_dlgStartBuf), "%s",
+                      dlg->startNode.c_str());
+    }
+
+    // ---- 资产路径 ----
+    ImGui::TextUnformatted(TR("Dialogue asset"));
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint("##dlgpath", "dialogues/ch01_open_01.dlg.json",
+                                 m_dlgPathBuf, sizeof(m_dlgPathBuf))) {
+        dlg->dialoguePath = m_dlgPathBuf;
+        // 路径一改就重新加载并把播放状态归零。不归零的话 `started` 还是
+        // true，换了一份剧本也不会重新起播 —— 表现为"改了路径没反应"。
+        dlg->started = false;
+        dlg->loadFailedLogged = false;
+        if (!dlg->dialoguePath.empty()) dlg->player.load(dlg->dialoguePath);
+    }
+    logRect("INS-DLG-PATH", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    hint("Relative to assets/. Lines and choices live in that JSON — see "
+         "docs/dialogue.md.");
+
+    // 懒加载：编辑态下 `DialogueSystem` 不会 tick（只有运行时才 tick），
+    // 不在这里读一次，页签会一直显示"空"。
+    if (!dlg->dialoguePath.empty() && !dlg->player.ready())
+        dlg->player.load(dlg->dialoguePath);
+
+    const dialogue::DialogueAsset* asset = dlg->player.asset();
+    {
+        // 结构化锚点（供 `tools/verify_dialogue_editor.py`）：`TextDisabled`
+        // 画的文字**不进日志**，所以"资产真的解析出 7 行"这件事只能靠这一行。
+        // 去重键含 ok 与路径 —— 换剧本、改坏路径都会再打一次。
+        const std::string key =
+            dlg->dialoguePath + "|" + (asset ? (asset->valid ? "1" : "0") : "n");
+        if (m_dlgLogKey != key) {
+            m_dlgLogKey = key;
+            int withChoices = 0;
+            if (asset && asset->valid)
+                for (const auto& n : asset->nodes)
+                    if (!n.choices.empty()) ++withChoices;
+            VK_LOG_INFO("INS-DLG-ASSET path=%s ok=%d lines=%d choices=%d start=%s",
+                        dlg->dialoguePath.c_str(),
+                        (asset && asset->valid) ? 1 : 0,
+                        asset ? static_cast<int>(asset->nodes.size()) : 0,
+                        withChoices,
+                        asset ? asset->startId.c_str() : "");
+        }
+    }
+    if (!dlg->dialoguePath.empty() && (!asset || !asset->valid)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s",
+                           TR("Cannot load this dialogue."));
+        if (asset && !asset->error.empty())
+            ImGui::TextDisabled("%s", asset->error.c_str());
+    } else if (asset && asset->valid) {
+        int withChoices = 0;
+        for (const auto& n : asset->nodes)
+            if (!n.choices.empty()) ++withChoices;
+        ImGui::TextDisabled(TR("%s  |  %d lines  |  %d with choices  |  start=%s"),
+                            asset->name.c_str(),
+                            static_cast<int>(asset->nodes.size()), withChoices,
+                            asset->startId.c_str());
+        // 校验是**加载时**做的（`parseDialogue`），warnings 是"能加载但有
+        // 隐患"那一档（比如某句的 next 指向了自己）。逐条摆出来。
+        for (const auto& warn : asset->warnings)
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f), "%s",
+                               warn.c_str());
+    }
+
+    // ---- 打开剧本编辑器（#310）----
+    // 这里以前只有"配置台"：能选资产、能设打字速度，正文得去文本编辑器里
+    // 手写 JSON。现在正文也在引擎里改。
+    //
+    // ⚠ 路径为空也**允许**点：编辑器可以空手开窗、用 "New script" 从零建
+    //   一份（见 DialogueEditorWindow::actNewScript）。把它禁掉的话，"我想
+    //   写个新剧本"就只剩"先随便填个不存在的路径"这一条路。
+    if (ImGui::Button(TR("Edit script..."))) {
+        m_ctx.requestDialogueEditor(dlg->dialoguePath);
+        VK_LOG_INFO("INS-DLG-EDIT path=%s",
+                    dlg->dialoguePath.empty() ? "(none)"
+                                              : dlg->dialoguePath.c_str());
+    }
+    logRect("INS-DLG-EDIT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", TR("Lines, choices and jumps — no JSON by hand."));
+
+    // ---- 起播方式 ----
+    ImGui::Checkbox(TR("Enabled"), &dlg->enabled);
+    ImGui::SameLine();
+    ImGui::Checkbox(TR("Auto start"), &dlg->autoStart);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(TR("Play as soon as the scene starts.\n"
+                             "Cutscene lines should use kind=Line on the "
+                             "timeline instead."));
+
+    // ---- 打字机 ----
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::DragFloat(TR("Chars / sec"), &dlg->cps, 0.5f, 0.0f, 200.0f, "%.0f");
+    if (dlg->cps <= 0.0f)
+        hint("0 = show the whole line at once (typewriter off).");
+
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::DragInt(TR("Priority"), &dlg->priority, 0.1f, -100, 100);
+    hint("Higher wins when several dialogues are enabled. A timeline cue always "
+         "beats components.");
+
+    // ---- 起始节点 ----
+    ImGui::TextUnformatted(TR("Start node"));
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint("##dlgstart", TR("(asset start)"),
+                                 m_dlgStartBuf, sizeof(m_dlgStartBuf)))
+        dlg->startNode = m_dlgStartBuf;
+    logRect("INS-DLG-START", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    // ⚠ 填了个不存在的 id 必须说出来。运行时会**容错**回落到资产的 start，
+    //   于是"我从第 20 句开始看"变成"怎么又从第一句开始了" —— 而且日志
+    //   里一行错都没有（容错路径不报错）。
+    if (!dlg->startNode.empty() && asset && asset->valid &&
+        asset->index.find(dlg->startNode) == asset->index.end()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s",
+                           TR("No such node id in this asset (falls back to "
+                              "its start)."));
     }
 
     ImGui::PopID();
@@ -3543,9 +3796,222 @@ void InspectorPanel::drawSceneStatsSection() {
     }
 }
 
+// ---------------------------------------------------------------- 多选（#316）
+
+void InspectorPanel::applyMultiTransform(
+    const std::string& label,
+    const std::function<void(ecs::Entity, ecs::TransformComponent&)>& fn) {
+    scene::Scene& sc = m_ctx.activeScene();
+    std::vector<MultiTransformEditCommand::Item> items;
+    for (ecs::Entity e : m_ctx.selectionSet()) {
+        if (!sc.world().get<ecs::TransformComponent>(e)) continue;
+        items.push_back(
+            {e, TransformSnapshot::capture(sc, e), TransformSnapshot{}});
+    }
+    if (items.empty()) return;
+
+    for (auto& it : items) {
+        if (auto* t = sc.world().get<ecs::TransformComponent>(it.entity))
+            fn(it.entity, *t);
+    }
+    // 抓 after，并把"数值没变"的那些剔掉（拖了一下又拖回来 / 值本来就
+    // 等于要写进去的值）。留着它们会让 Ctrl+Z 之后多几条空记录。
+    std::size_t n = 0;
+    for (auto& it : items) {
+        it.after = TransformSnapshot::capture(sc, it.entity);
+        const bool changed =
+            !glm::all(glm::equal(it.after.position, it.before.position)) ||
+            !glm::all(glm::equal(it.after.rotation, it.before.rotation)) ||
+            !glm::all(glm::equal(it.after.scale, it.before.scale));
+        if (!changed) continue;
+        items[n++] = it;
+    }
+    items.resize(n);
+    if (items.empty()) return;
+
+    const std::size_t count = items.size();
+    m_ctx.commands().pushAlreadyApplied(
+        std::make_unique<MultiTransformEditCommand>(label, &sc, std::move(items)));
+    m_ctx.setStatus(label);
+    m_ctx.dirty() = true;
+    VK_LOG_INFO("INSP-MULTI-EDIT '%s' n=%zu", label.c_str(), count);
+}
+
+void InspectorPanel::drawTransformMulti(ecs::Entity primary) {
+    scene::Scene& sc = m_ctx.activeScene();
+    ecs::World& w = sc.world();
+
+    if (!sectionHeader("Transform", true, primary)) return;
+
+    // 聚合：共同值 + "有没有人不一致"
+    const auto agg = [&](const std::function<glm::vec3(ecs::TransformComponent&)>&
+                             get) {
+        Vec3Agg a;
+        bool first = true;
+        for (ecs::Entity x : m_ctx.selectionSet()) {
+            auto* t = w.get<ecs::TransformComponent>(x);
+            if (!t) continue;
+            const glm::vec3 v = get(*t);
+            if (first) {
+                a.common = v;
+                first = false;
+            } else if (glm::any(glm::notEqual(v, a.common))) {
+                a.mixed = true;
+            }
+        }
+        return a;
+    };
+
+    // ---- 语义（这是整块里唯一需要解释的地方）----
+    //
+    // 显示值一致时，控件里是**绝对值**：拖到哪，全部就设成哪。
+    // 显示值不一致时（标 (multi)），控件里从 0 / 1 起步 —— 表示的是
+    // **这次改动量**本身，而不是任何一个物体当前的绝对值：
+    //   · 位置 / 旋转 = 增量（每个都加上去）
+    //   · 缩放        = 比例（每个乘上去）
+    // 两种情形用同一个公式表达：`new = base * (edit / prior)`（缩放）与
+    // `new = base + (edit - prior)`（位置 / 旋转），其中 prior 是"这一帧
+    // 编辑之前控件里的值"（一致时 = 共同值，不一致时 = 0 / 1）。于是
+    // "一致 → 设成绝对值"和"不一致 → 相对改动"就是同一个式子的两个端点，
+    // 不需要两套代码，也不会出现"拖到一半语义突变"。
+    enum class Field { Pos, Rot, Scale };
+
+    // 三个字段先各聚合一次：控件要用，日志也要用（"一共几个 / 哪几项是混合的"
+    // 是自动化唯一能断言的信号 —— 那些 (multi) 标记画在控件标签里，截图之外
+    // 读不到）。
+    Vec3Agg aggPos =
+        agg([](ecs::TransformComponent& t) { return t.position; });
+    Vec3Agg aggRot = agg([](ecs::TransformComponent& t) {
+        return glm::degrees(t.rotation);   // 界面上用角度（内部是弧度）
+    });
+    Vec3Agg aggScl = agg([](ecs::TransformComponent& t) { return t.scale; });
+    {
+        const std::string sig = std::to_string(m_ctx.selectionCount()) +
+                                (aggPos.mixed ? "1" : "0") +
+                                (aggRot.mixed ? "1" : "0") +
+                                (aggScl.mixed ? "1" : "0");
+        if (m_lastMultiSig != sig) {
+            m_lastMultiSig = sig;
+            VK_LOG_INFO("INSP-MULTI n=%zu pos=%s rot=%s scale=%s",
+                        m_ctx.selectionCount(), aggPos.mixed ? "mixed" : "same",
+                        aggRot.mixed ? "mixed" : "same",
+                        aggScl.mixed ? "mixed" : "same");
+        }
+    }
+
+    const auto field = [&](const char* label, Field f, float speed) {
+        const bool isScale = (f == Field::Scale);
+        const Vec3Agg a = (f == Field::Pos)   ? aggPos
+                          : (f == Field::Rot) ? aggRot
+                                              : aggScl;
+
+        std::string text = TR(label);
+        if (a.mixed) text += "  (multi)";
+
+        const glm::vec3 prior = a.mixed ? (isScale ? glm::vec3(1.0f)
+                                                   : glm::vec3(0.0f))
+                                        : a.common;
+        glm::vec3 edit = prior;
+        ImGui::SetNextItemWidth(-90.0f);
+        bool changed = false;
+        if (isScale)
+            changed = ImGui::DragFloat3(text.c_str(), glm::value_ptr(edit),
+                                        speed, 0.001f, 1000.0f);
+        else
+            changed = ImGui::DragFloat3(text.c_str(), glm::value_ptr(edit),
+                                        speed);
+        if (!changed || !m_ctx.isEditing()) return;
+
+        const std::string cmd = std::string(TR("Set ")) + TR(label);
+        if (isScale) {
+            // 比例语义（含 prior 某分量为 0 的保护，见 MultiEditMath.h）
+            applyMultiTransform(cmd, [&](ecs::Entity, ecs::TransformComponent& t) {
+                t.scale = batchMul(t.scale, edit, prior);
+            });
+        } else if (f == Field::Pos) {
+            applyMultiTransform(cmd, [&](ecs::Entity, ecs::TransformComponent& t) {
+                t.position = batchAdd(t.position, edit, prior);
+            });
+        } else {
+            // 角度域上算（batchAdd 的 prior/编辑值都是角度），回来再转弧度
+            applyMultiTransform(cmd, [&](ecs::Entity, ecs::TransformComponent& t) {
+                t.rotation = glm::radians(
+                    batchAdd(glm::degrees(t.rotation), edit, prior));
+            });
+        }
+    };
+
+    ImGui::TextDisabled(TR("Editing %zu objects (values apply to all)"),
+                        m_ctx.selectionCount());
+    ImGui::BeginDisabled(!m_ctx.isEditing());
+    field("Position", Field::Pos, sp(0.02f));
+    field("Rotation", Field::Rot, sp(0.5f));
+    field("Scale", Field::Scale, sp(0.01f));
+    ImGui::EndDisabled();
+
+    ImGui::TextDisabled(TR("Mixed values show (multi): the number is the change,"
+                           " not an absolute value."));
+}
+
+void InspectorPanel::drawMultiPanel() {
+    scene::Scene& sc = m_ctx.activeScene();
+    const std::size_t n = m_ctx.selectionCount();
+
+    ImGui::TextDisabled(TR("%zu objects selected"), n);
+    ImGui::SameLine();
+    ImGui::TextDisabled(TR("(primary: %s)"),
+                        [&] {
+                            const std::string* np =
+                                sc.world().name(m_ctx.selection());
+                            return np ? np->c_str() : "(unnamed)";
+                        }());
+
+    drawTransformMulti(m_ctx.selection());
+
+    // ---- 可见性：批量开/关（这是多选下第二个真正能批量的字段）----
+    if (sectionHeader("Visibility", true, m_ctx.selection())) {
+        bool anyHidden = false;
+        bool anyVisible = false;
+        for (ecs::Entity e : m_ctx.selectionSet()) {
+            const auto* v = sc.world().get<ecs::VisibilityComponent>(e);
+            const bool vis = !v || v->visible;
+            if (vis) anyVisible = true;
+            else anyHidden = true;
+        }
+        ImGui::BeginDisabled(!m_ctx.isEditing());
+        bool show = anyVisible || !anyHidden;   // 全隐藏时复选框是空的
+        std::string label = TR("Visible");
+        if (anyHidden && anyVisible) label += "  (multi)";
+        if (ImGui::Checkbox(label.c_str(), &show) && m_ctx.isEditing()) {
+            applyMultiTransform(show ? "Show objects" : "Hide objects",
+                               [&](ecs::Entity e, ecs::TransformComponent&) {
+                                   if (auto* v = sc.world().get<
+                                           ecs::VisibilityComponent>(e)) {
+                                       v->visible = show;
+                                   } else {
+                                       ecs::VisibilityComponent nv{};
+                                       nv.visible = show;
+                                       sc.world().add<ecs::VisibilityComponent>(
+                                           e, nv);
+                                   }
+                               });
+        }
+        ImGui::EndDisabled();
+    }
+
+    hint("Component editing is single-selection. Narrow the selection to one "
+         "object to edit its mesh / material / script / physics.");
+}
+
 // ---------------------------------------------------------------- 变换
 
 void InspectorPanel::drawTransform(ecs::Entity e) {
+    // 多选 → 换成批量版本（一行里改全部，见 drawTransformMulti）。
+    if (m_ctx.multiSelected()) {
+        drawTransformMulti(e);
+        return;
+    }
+
     scene::Scene& sc = m_ctx.activeScene();
     auto* t = sc.world().get<ecs::TransformComponent>(e);
     if (!t) return;
@@ -8025,6 +8491,28 @@ void InspectorPanel::drawAddRemove(ecs::Entity e) {
             ImGui::SetTooltip(TR("A timeline of camera keys + events stored in\n"
                                  "assets/sequences/*.seq.json. Attach it to an\n"
                                  "empty object and treat that object as the director."));
+        }
+
+        // 对话（C2）。与 Cutscene Sequence 同一条规则：**任何实体**都能挂 ——
+        // NPC 用它自报台词，导演空物体用它当"开场独白"的宿主。
+        //
+        // ⚠ 这一条是补 C2 第二步漏掉的入口：那一步做完了资产/播放器/系统/
+        //   字幕框/时间轴接线，但 `editor/` 里**零引用** `DialogueComponent`
+        //   —— 引擎能播对话，开发者却连组件都挂不上，只能手改 scene.json。
+        const bool hasDialogue = w.has<ecs::DialogueComponent>(e);
+        if (ImGui::MenuItem(TR("Dialogue"), nullptr, false, !hasDialogue)) {
+            m_ctx.structuralEdit("Add Dialogue", [&]() {
+                ecs::DialogueComponent dc;
+                w.add<ecs::DialogueComponent>(e, dc);
+            });
+            // 缓冲归零：新组件没有路径，不重置的话刚加出来的段落会显示
+            // 上一次选中过的那个 NPC 的路径。
+            m_dlgBufFor = ecs::Entity{};
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(TR("A .dlg.json script: speaker / text / choices.\n"
+                                 "Attach it to an NPC, or to the director object\n"
+                                 "and cue it from the timeline (kind=Line)."));
         }
 
         // 延迟贴花（R4-4）：默认 1 m 立方体、不透明度 1、白色 tint，

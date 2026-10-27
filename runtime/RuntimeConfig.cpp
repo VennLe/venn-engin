@@ -99,6 +99,8 @@ void applyGameJson(RuntimeConfig& cfg) {
         cfg.timeScale = j["timeScale"].get<float>();
     getStr("language", cfg.language);
     getStr("quality", cfg.quality);
+    // #312：UI 文档（`assets/ui/docs/*.ui.json`）。空 = 不画。
+    getStr("uiDoc", cfg.uiDoc);
     getStr("audioDevice", cfg.audioDevice);
     getStr("startState", cfg.startState);
 
@@ -183,6 +185,8 @@ void applyEnv(RuntimeConfig& cfg) {
     cfg.timeScale = envFloat("MYVK_RUNTIME_TIMESCALE", cfg.timeScale);
     cfg.language = envStr("MYVK_RUNTIME_LANGUAGE", cfg.language);
     cfg.quality = envStr("MYVK_RUNTIME_QUALITY", cfg.quality);
+    // #312：UI 文档。自动化钩子（`MYVK_RUNTIME_` 前缀天然进白名单）。
+    cfg.uiDoc = envStr("MYVK_RUNTIME_UI_DOC", cfg.uiDoc);
 
     // ---- 音频（G14-5）----
     // ⚠ 全套带 `MYVK_RUNTIME_AUDIO` 前缀（`check_feature_surface.py` 按前缀
@@ -297,6 +301,8 @@ void applyCli(RuntimeConfig& cfg, const std::vector<std::string>& args) {
             takeValue("--input-map", cfg.inputMapPath);
         } else if (matchKey(a, "--language", val, inlineSet)) {
             takeValue("--language", cfg.language);
+        } else if (matchKey(a, "--ui-doc", val, inlineSet)) {
+            takeValue("--ui-doc", cfg.uiDoc);
         } else if (matchKey(a, "--start-state", val, inlineSet)) {
             takeValue("--start-state", cfg.startState);
         } else if (matchKey(a, "--audio", val, inlineSet)) {
@@ -391,13 +397,13 @@ RuntimeConfig parseRuntimeConfig(const std::vector<std::string>& args) {
     VK_LOG_INFO("GAME-CONFIG scene='%s' window=%dx%d fullscreen=%d "
                 "maxFps=%d unfocusedFps=%d timeScale=%.2f language=%s "
                 "quality=%s startState=%s selftest='%s' verbose=%d "
-                "source='%s'",
+                "uiDoc='%s' source='%s'",
                 cfg.scenePath.c_str(), cfg.width, cfg.height,
                 cfg.fullscreen ? 1 : 0, cfg.maxFps, cfg.unfocusedFps,
                 static_cast<double>(cfg.timeScale), cfg.language.c_str(),
                 cfg.quality.c_str(), cfg.startState.c_str(),
                 cfg.selftest.empty() ? "-" : cfg.selftest.c_str(),
-                cfg.verbose ? 1 : 0,
+                cfg.verbose ? 1 : 0, cfg.uiDoc.c_str(),
                 cfg.configPath.empty() ? "(defaults)" : cfg.configPath.c_str());
     return cfg;
 }
@@ -417,6 +423,7 @@ const char* runtimeHelpText() {
         "  --frames <n>          跑满 n 帧后退出（冒烟测试）\n"
         "  --time-scale <f>      时间缩放（0 = 停住，1 = 正常）\n"
         "  --language <en|zh>    界面语言\n"
+        "  --ui-doc <path>       UI 文档（.ui.json）；不给 = 不画界面层\n"
         "  --start-state <s>     boot | mainmenu | playing（默认 playing）\n"
         "  --verbose             每 60 帧打一行 GAME-LOOP\n"
         "  --trace-states        每次状态迁移打一行 GAME-STATE\n"

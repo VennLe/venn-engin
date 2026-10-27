@@ -10,6 +10,7 @@
 #include "EditorIcons.h"
 #include "ecs/Components.h"
 #include "scene/Camera.h"
+#include "scene/Prefab.h"
 #include "scene/Scene.h"
 
 #include <imgui.h>
@@ -330,6 +331,39 @@ bool SceneHierarchy::subtreeMatches(ecs::Entity e) const {
     return false;
 }
 
+// 收集 e 及其全部后代（含顺序 = 树里的顺序，父在前）。批量删除要它：
+// destroy() **不递归**，只 destroy 父节点会留下一堆"parent 指向死 id"的
+// 孤儿实体 —— 它们既不在树里（不是根节点），又还在渲染，等于凭空多出一堆
+// 点不中、删不掉的幽灵。
+void collectSubtreeIds(ecs::World& w, ecs::Entity e,
+                       std::vector<ecs::Entity>& out, int depth = 0) {
+    if (!e.valid() || !w.alive(e) || depth > 128) return;
+    for (ecs::Entity k : out)
+        if (k.id == e.id) return;
+    out.push_back(e);
+    if (const auto* h = w.get<ecs::HierarchyComponent>(e)) {
+        for (ecs::EntityId cid : h->children) {
+            const ecs::Entity ce = w.handle(cid);
+            if (ce.valid()) collectSubtreeIds(w, ce, out, depth + 1);
+        }
+    }
+}
+
+// 在**画行之前**把整棵树按可见顺序摊平（见 m_flatOrder 的注释）。
+void SceneHierarchy::collectFlatOrder(ecs::Entity e) {
+    if (!e.valid()) return;
+    const bool filterActive = m_filter[0] != '\0';
+    if (filterActive && !subtreeMatches(e)) return;
+    m_flatOrder.push_back(e);
+    const ecs::World& w = m_ctx.editorScene().world();
+    if (const auto* h = w.get<ecs::HierarchyComponent>(e)) {
+        for (ecs::EntityId cid : h->children) {
+            const ecs::Entity ce = w.handle(cid);
+            if (ce.valid()) collectFlatOrder(ce);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- 单节点
 
 void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
@@ -386,7 +420,7 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
                                ImGuiTreeNodeFlags_AllowOverlap;
     if (!hasChildren)
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-    if (m_ctx.selection() == e) flags |= ImGuiTreeNodeFlags_Selected;
+    if (m_ctx.isSelected(e)) flags |= ImGuiTreeNodeFlags_Selected;
 
     // 名字后缀只留**状态**（隐藏 / 不投影 / 锁定）。
     // "这个节点是什么"已经由右侧的类型列回答（mesh / DirectionalLight / ...），
@@ -495,8 +529,55 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
                 ImGui::GetItemRectMax());
     }
 
+    // ---- 每一行的矩形（2026-10-27 #316）----
+    //
+    // 多选的 Ctrl / Shift 点击必须用**真鼠标**点第 N 行（这是修饰键分派唯一
+    // 可信的验证方式），而自动化拿不到行坐标就只能瞎猜 —— 行高随 DPI /
+    // 主题变，猜一次错一次。
+    //
+    // 两条节流，缺一条都会出事：
+    //   · 最多 16 行（超出的不记，验证脚本用不到那么深）；
+    //   · **名字变了才打一次**。drawNode 是递归的、每帧都走一遍，无条件
+    //     打就是 60fps × 行数 的日志洪水（这个项目真踩过，两分钟 30MB，
+    //     而且取"最后一行"拿到的是随机某一行）。
+    if (m_rowCursor < kMaxLoggedRows) {
+        const int idx = m_rowCursor++;
+        if (m_rowLogNames.size() <= static_cast<std::size_t>(idx))
+            m_rowLogNames.resize(static_cast<std::size_t>(idx) + 1);
+        if (m_rowLogNames[static_cast<std::size_t>(idx)] != name) {
+            m_rowLogNames[static_cast<std::size_t>(idx)] = name;
+            const std::string tag = "HIER-ROW " + std::to_string(idx);
+            logRect(tag.c_str(), ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+        }
+    }
+
     const bool clicked = ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen();
-    if (clicked) m_ctx.select(e);
+    if (clicked) {
+        // ---- 三种点法（2026-10-27 #316）----
+        //   普通点   → 单选（集合被替换成一项）
+        //   Ctrl+点  → 加/减一项
+        //   Shift+点 → 从"上次点的那项"到这一项的一整段
+        // ImGui 的 KeyCtrl 在 macOS 上也会认 Cmd（io.ConfigMacOSXBehaviors），
+        // 所以这里不用再区分平台。
+        const ImGuiIO& io = ImGui::GetIO();
+        if (io.KeyCtrl) {
+            m_ctx.selectToggle(e);
+            VK_LOG_INFO("HIER-SELECT mode=ctrl id=%u name=%s n=%zu",
+                        static_cast<unsigned>(e.id), name.c_str(),
+                        m_ctx.selectionCount());
+        } else if (io.KeyShift) {
+            m_ctx.selectRange(e, m_flatOrder);
+            VK_LOG_INFO("HIER-SELECT mode=range id=%u name=%s n=%zu",
+                        static_cast<unsigned>(e.id), name.c_str(),
+                        m_ctx.selectionCount());
+        } else {
+            m_ctx.select(e);
+            VK_LOG_INFO("HIER-SELECT mode=single id=%u name=%s n=%zu",
+                        static_cast<unsigned>(e.id), name.c_str(),
+                        m_ctx.selectionCount());
+        }
+    }
 
     // 双击 = **在视口里聚焦到它**（2026-10-21 第九轮，用户要求）。
     //   之前双击是"就地重命名"，但用户的第一反应是"双击跳过去看看"——
@@ -682,8 +763,43 @@ void SceneHierarchy::drawNodeContextMenu(ecs::Entity e) {
         m_pendingLockToggles.push_back({e, !nowLocked});
     }
 
+    // ---- G18 预制体 ----
+    //
+    // 三项放在一起，因为它们是一条链：一份子树 → 一个资产 → 之后每次改
+    // 都在"改母版"或"改这一份"之间二选一。分开摆的话用户找不到对应关系。
+    //
+    // 后两项对"不是 prefab 成员"的对象没有意义：用 BeginDisabled 而不是
+    // 直接不画 —— 菜单项忽有忽无会让整张菜单的高度跳变，用户下一次会去
+    // 错误的位置点上一秒还在这里的 Delete。
+    if (ImGui::MenuItem(TR("Create Prefab from Selection"))) {
+        m_prefabCreateTarget = e;
+        m_hasPrefabCreate = true;
+    }
+    const bool isPrefabMember = scene::isPrefabMember(m_ctx.editorScene(), e);
+    ImGui::BeginDisabled(!isPrefabMember);
+    if (ImGui::MenuItem(TR("Apply to Prefab"))) {
+        m_prefabApplyTarget = e;
+        m_hasPrefabApply = true;
+    }
+    if (ImGui::MenuItem(TR("Revert from Prefab"))) {
+        m_prefabRevertTarget = e;
+        m_hasPrefabRevert = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::Separator();
+
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.5f, 1.0f));
-    if (ImGui::MenuItem(TR("Delete"), "Del")) m_pendingDelete = e;
+    // 多选时写明"删几个"：菜单上的 Delete 与 Del 键走的是**同一条**路径
+    // （都进 deleteSelection），文案不一致会让人以为右键只删这一个。
+    const bool multiHere = m_ctx.multiSelected() && m_ctx.isSelected(e);
+    char delLabel[64];
+    if (multiHere) {
+        std::snprintf(delLabel, sizeof(delLabel), TR("Delete %zu Objects"),
+                      m_ctx.selectionCount());
+    } else {
+        std::snprintf(delLabel, sizeof(delLabel), "%s", TR("Delete"));
+    }
+    if (ImGui::MenuItem(delLabel, "Del")) m_pendingDelete = e;
     ImGui::PopStyleColor();
 
     ImGui::Separator();
@@ -939,6 +1055,12 @@ void SceneHierarchy::draw() {
         const auto* h = w.get<ecs::HierarchyComponent>(e);
         if (!h || h->parent == ecs::kInvalidEntity) roots.push_back(e);
     });
+    // 可见行顺序（Shift 范围选择要用）：**先**整棵走一遍再画行，
+    // 理由见 m_flatOrder 的注释。
+    m_flatOrder.clear();
+    for (ecs::Entity e : roots) collectFlatOrder(e);
+
+    m_rowCursor = 0;   // HIER-ROW 的"第几行"从 0 重新数
     for (ecs::Entity e : roots) drawNode(e, 0);
 
     // ---- E13 拖放落点：树下方的空白区接住从 Content 拖来的模型 ----
@@ -1128,6 +1250,10 @@ void SceneHierarchy::flushPending() {
                 nv.visible = vt.value;
                 w.add<ecs::VisibilityComponent>(vt.e, nv);
             }
+            // G18：可见性也是"字段"，实例上改过就记一条覆盖。
+            // 不记的话，下次母版同步会把 👁 悄悄改回去 —— 而用户以为自己
+            // 只改了缩放（"我的隐藏又自己弹出来了"是最难联想的症状）。
+            scene::recordOverride(sc, vt.e, "visible");
         });
         m_ctx.dirty() = true;
     }
@@ -1141,6 +1267,10 @@ void SceneHierarchy::flushPending() {
                                      w.add<ecs::LockedComponent>(lt);
                                  else
                                      w.remove<ecs::LockedComponent>(lt);
+                                 // 同上：锁定状态也要记账（"我锁住的实例
+                                 // 又变回可拖了"是同一类 bug）。
+                                 scene::recordOverride(sc, lt,
+                                                       "locked");
                              });
         m_ctx.dirty() = true;
     }
@@ -1169,6 +1299,33 @@ void SceneHierarchy::flushPending() {
         }
     }
 
+    if (m_hasPrefabCreate) {
+        m_hasPrefabCreate = false;
+        const ecs::Entity target = m_prefabCreateTarget;
+        m_prefabCreateTarget = ecs::Entity{};
+        if (target.valid()) {
+            const std::string* np = w.name(target);
+            // 路径由引擎侧统一取名（撞名自动 _2、_3），编辑器不做第二套口径
+            const std::string rel =
+                scene::prefabDefaultPath(np ? *np : std::string("prefab"));
+            m_ctx.prefabCreateFromSelection(rel);
+        }
+    }
+
+    if (m_hasPrefabApply) {
+        m_hasPrefabApply = false;
+        const ecs::Entity target = m_prefabApplyTarget;
+        m_prefabApplyTarget = ecs::Entity{};
+        if (target.valid()) m_ctx.prefabApply(target);
+    }
+
+    if (m_hasPrefabRevert) {
+        m_hasPrefabRevert = false;
+        const ecs::Entity target = m_prefabRevertTarget;
+        m_prefabRevertTarget = ecs::Entity{};
+        if (target.valid()) m_ctx.prefabRevert(target);
+    }
+
     if (m_hasReparent) {
         m_hasReparent = false;
         const ecs::Entity child = m_reparentChild;
@@ -1187,27 +1344,13 @@ void SceneHierarchy::flushPending() {
     if (m_pendingDelete.valid()) {
         const ecs::Entity victim = m_pendingDelete;
         m_pendingDelete = ecs::Entity{};
-        const std::string* np = w.name(victim);
-        const std::string label =
-            "Delete " + (np ? *np : std::string("Entity"));
-        m_ctx.structuralEdit(label, [&]() {
-            // 先把自己从父节点的 children 里摘掉，避免留下悬空 id
-            if (auto* h = w.get<ecs::HierarchyComponent>(victim)) {
-                if (h->parent != ecs::kInvalidEntity) {
-                    const ecs::Entity parent = w.handle(h->parent);
-                    if (auto* ph = w.get<ecs::HierarchyComponent>(parent)) {
-                        auto& kids = ph->children;
-                        kids.erase(std::remove(kids.begin(), kids.end(),
-                                               victim.id),
-                                   kids.end());
-                    }
-                }
-            }
-            w.destroy(victim);
-        });
-        m_ctx.validateSelection();
-        m_ctx.dirty() = true;
-        m_ctx.setStatus(label);
+        // 右键点在"已经选中的一员"身上（且多选）→ 删**整个集合**，与 Del
+        // 键同一个语义；右键点了个没选中的节点 → 只删它一个（用户指的
+        // 就是这一行）。两条路都收敛到 deleteSelection()，别在这儿再写一遍
+        // 删除逻辑（树里的孤儿就是这么来的）。
+        if (!(m_ctx.multiSelected() && m_ctx.isSelected(victim)))
+            m_ctx.select(victim);
+        deleteSelection();
     }
 
     if (m_pendingFocus.valid()) {
@@ -1237,24 +1380,93 @@ void SceneHierarchy::beginRenameSelection() {
 
 void SceneHierarchy::duplicateSelection() {
     if (!m_ctx.isEditing()) return;
-    const ecs::Entity src = m_ctx.selection();
-    if (!src.valid()) return;
-
     scene::Scene& sc = m_ctx.editorScene();
     ecs::World& w = sc.world();
-    const std::string* np = w.name(src);
-    const std::string newName =
-        (np ? *np : std::string("Entity")) + " Copy";
 
-    ecs::Entity dup{};
-    m_ctx.structuralEdit("Duplicate " + newName, [&]() {
-        dup = duplicateEntity(sc, src, newName);
+    // 一批复制：集合里每一项都复制一份（**一次** structuralEdit —— 撤销
+    // 一次全部回滚）。父子关系不复制（duplicateEntity 只带 8 类内容组件），
+    // 复制出来的都是根节点下的散件，与单选时代一致。
+    std::vector<ecs::Entity> sources;
+    for (ecs::Entity e : m_ctx.selectionSet())
+        if (e.valid() && w.alive(e)) sources.push_back(e);
+    if (sources.empty()) return;
+
+    std::vector<ecs::Entity> dups;
+    const std::string onlyName = [&] {
+        const std::string* np = w.name(sources.front());
+        return (np ? *np : std::string("Entity")) + " Copy";
+    }();
+    const std::string label = sources.size() > 1
+                                  ? "Duplicate " + std::to_string(sources.size()) +
+                                        " objects"
+                                  : "Duplicate " + onlyName;
+
+    m_ctx.structuralEdit(label, [&] {
+        for (ecs::Entity src : sources) {
+            const std::string* np = w.name(src);
+            // uniqueName 是**边建边查**的：同一批里第二个 "Crate Copy"
+            // 会自然变成 "Crate Copy 2"，不用自己维护计数。
+            const std::string base = (np ? *np : std::string("Entity")) + " Copy";
+            dups.push_back(duplicateEntity(sc, src, uniqueName(sc, base)));
+        }
     });
-    if (dup.valid()) {
-        m_ctx.select(dup);
+
+    if (!dups.empty()) {
+        m_ctx.selectMany(dups);
         m_ctx.dirty() = true;
-        m_ctx.notify(TR("Duplicated ") + newName);
+        m_ctx.notify(sources.size() > 1
+                         ? TR("Duplicated ") + std::to_string(dups.size()) +
+                               TR(" objects")
+                         : TR("Duplicated ") + onlyName);
+        VK_LOG_INFO("HIER-DUP n=%zu", dups.size());
     }
+}
+
+void SceneHierarchy::deleteSelection() {
+    if (!m_ctx.isEditing()) return;
+    scene::Scene& sc = m_ctx.editorScene();
+    ecs::World& w = sc.world();
+
+    // ① 先摊平：每个待删实体连**整棵子树**一起删。
+    //    destroy() 不递归，只删父节点会留下"parent 指向死 id"的孤儿 ——
+    //    它们不在树里（不是根），却还在渲染，等于凭空多出一堆点不中的幽灵。
+    std::vector<ecs::Entity> victims;
+    for (ecs::Entity e : m_ctx.selectionSet()) {
+        if (!e.valid() || !w.alive(e)) continue;
+        collectSubtreeIds(w, e, victims);
+    }
+    if (victims.empty()) return;
+
+    const std::string* np = w.name(victims.front());
+    const std::string label =
+        victims.size() > 1
+            ? "Delete " + std::to_string(victims.size()) + " objects"
+            : "Delete " + (np ? *np : std::string("Entity"));
+
+    m_ctx.structuralEdit(label, [&] {
+        for (ecs::Entity victim : victims) {
+            // 先把自己从父节点的 children 里摘掉，避免留下悬空 id
+            if (auto* h = w.get<ecs::HierarchyComponent>(victim)) {
+                if (h->parent != ecs::kInvalidEntity) {
+                    const ecs::Entity parent = w.handle(h->parent);
+                    if (auto* ph = w.get<ecs::HierarchyComponent>(parent)) {
+                        auto& kids = ph->children;
+                        kids.erase(std::remove(kids.begin(), kids.end(),
+                                               victim.id),
+                                   kids.end());
+                    }
+                }
+            }
+            w.destroy(victim);
+        }
+    });
+
+    // 集合里的成员全没了 → validateSelection 会按名字逐个找回 / 丢掉，
+    // 最后主选中项也一起失效。这里不用手动清。
+    m_ctx.validateSelection();
+    m_ctx.dirty() = true;
+    m_ctx.setStatus(label);
+    VK_LOG_INFO("HIER-DEL n=%zu", victims.size());
 }
 
 } // namespace editor

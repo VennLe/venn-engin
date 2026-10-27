@@ -30,6 +30,7 @@
 #include "GameLoop.h"
 #include "GameState.h"
 #include "GameStateStack.h"
+#include "GameFlags.h"          // C6 第二批：剧情旗标（纯数据，无依赖）
 #include "PlayerController.h"
 #include "RuntimeConfig.h"
 
@@ -37,6 +38,8 @@
 #include "ui/Hud.h"
 #include "ui/HudModel.h"
 #include "ui/PauseMenu.h"
+#include "ui/Subtitle.h"
+#include "ui2/UiDocument.h"
 #include "ui2/UiFocus.h"
 #include "audio/AudioSystem.h"        // G14-5：整条音频链的门面
 #include "physics/ContactEvents.h"
@@ -78,6 +81,21 @@ protected:
 
 private:
     void loadStartScene();
+    // 脚本点播的换场景（C6 第二批）。
+    //   ① `requestSceneSwitch` 只**验路径 + 记下请求**，当场返回；
+    //   ② `applyPendingSceneSwitch` 在每帧**最开头**执行真正的切换。
+    //
+    // ⚠ 为什么必须拆成两半：`.vks` 的 `loadScene()` 是在
+    //   `ScriptRuntime::tick` 里被调用的，此刻正遍历着旧世界的
+    //   `ScriptComponent` 池。这时候销毁世界 = 把正在用的迭代器指向
+    //   已释放的内存。拆开之后"销毁世界"永远发生在没有任何人遍历它
+    //   的那一刻（下一帧 start-of-frame），语义也从"立即"变成
+    //   "下一帧生效" —— 这条**必须**写进 ScriptEngine.h 的注释里，
+    //   否则脚本作者会以为下一句就能查新场景的实体（不能）。
+    bool requestSceneSwitch(const std::string& relPath);
+    void applyPendingSceneSwitch();
+    // 按模型路径装配一个实体（`spawn` 的实现）。失败返回无效句柄。
+    ecs::Entity spawnModelEntity(const std::string& relPath, glm::vec3 pos);
     void buildPhysics();
     void preloadScripts();
     void simulate(float dt);
@@ -117,6 +135,15 @@ private:
     vks::ScriptEngine* m_scripts = nullptr;  // = &m_scriptRuntime->engine()
     physics::SceneBinding m_binding;
 
+    // ---- C6 第二批：世界控制 ----
+    // 剧情旗标。**不进 ECS**：它是"一局游戏"的状态，不是"一个实体"的状态
+    // —— 换场景要留着，读档要恢复，跟实体生命周期完全无关。
+    GameFlags m_flags;
+    // 已受理、待执行的换场景请求（空 = 没有）。见 requestSceneSwitch 的注释。
+    std::string m_pendingScenePath;
+    // 本局换过几次场景（GAME-SCENE-SWITCH 的计数，也给将来"回到标题"用）
+    int m_sceneSwitches = 0;
+
     // 骨骼动画（A0-3）：推进 SkinnedMeshComponent::time 并重算关节矩阵。
     // 在 simulate() 里排在物理**之前**（A4 的根运动是物理的输入），
     // 与编辑器 Play 的顺序一致。
@@ -142,6 +169,38 @@ private:
     HudModel m_hudModel;
     ui2::UiFocusStack m_focus;
     int m_lastUiState = -1;   // -1 未知 / 0 游戏中 / 1 暂停；首次必应用
+
+    // ---- UI 文档（#312）----
+    //
+    // `m_cfg.uiDoc` 为空 = 这条路**完全不存在**（一个顶点都不画，画面与
+    // #311 之后逐位相同）。指定了就把 `.ui.json` 读进来、每帧按绑定值绘制。
+    //
+    // 为什么文档放 runtime 而不是 engine：读盘/热更/降级都是宿主的事
+    // （engine 不认识文件系统策略，也不该认识"这个游戏的 HUD 是哪一份"）。
+    // 文档本身的数据结构与绘制都在 `engine/ui2/UiDocument`（纯 CPU、可自检）。
+    ui2::UiDocument m_uiDoc;
+    ui2::UiBindings m_uiBindings;
+    int m_uiDocFrames = 0;    // UIDOC-BOUNDS / UIDOC-STATS 的节流计数
+    // 每帧把 HudModel + GameFlags 抄成绑定表（见 .cpp 的注释）
+    void buildUiBindings();
+
+    // ---- 字幕框（C2，2026-10-26）----
+    // 与 HUD 同一条分工：`dialogue::DialogueSystem` 在 engine（推进状态），
+    // 这里每帧把它的状态抄成 `SubtitleModel`（纯数据），由 `SubtitleBox`
+    // 画。于是"字幕长什么样"可以脱离对话逻辑单独改。
+    SubtitleBox m_subtitle;
+    // 选项焦点。**存在这里而不是 `DialogueSystem` 里**：焦点是 UI 的输入
+    // 状态（和 `m_focus` 一类），跑不到 ECS 里去，也不该进存档。
+    int m_dlgFocus = 0;
+    // 焦点归属的那一行台词 id。换行时把焦点复位到 0 —— 不复位的话，
+    // 上一题选了第 3 项，下一题一出来光标就停在第 3 项上（选项少的时候
+    // 还会越界，得靠下面的 clamp 兜着）。
+    std::string m_dlgFocusId;
+    // 自动推进（`MYVK_DLG_AUTO=<秒>`）：验收脚本用，走**同一条**
+    // `pressAdvance()`/`choose()`，不是另一套"测试模式"分支。
+    // 0 = 关（正式运行的默认值）。
+    float m_dlgAutoSec = 0.0f;
+    float m_dlgAutoTimer = 0.0f;
 
     // ---- 鼠标捕获 / 操作态（P5，2026-10-22）----
     //

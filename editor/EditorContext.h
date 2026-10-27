@@ -347,6 +347,44 @@ public:
     bool hasSelection() const;
     bool selectionFromViewport() const { return m_selectionFromViewport; }
 
+    // ---------------------------------------------------------- 选择集（多选，2026-10-27 #316）
+    //
+    // **`selection()` 的语义一个字没变：它仍然是"主选中项"。**
+    // 手柄的坐标系 / Inspector 上半部分 / 状态栏都只认它；单选时集合里就它
+    // 一个，于是"多选"这件事对那几处代码是**不可见的** —— 这是本次要的
+    // "零破坏"：不改一行既有调用点，只往上加。
+    //
+    // 为什么主选中项要**单独存**，而不是"集合里的第一个"：
+    //   Ctrl 点掉中间那一项之后，集合的顺序会变，"第一个"可能换人 ——
+    //   用户没碰任何东西，手柄的本地坐标系却突然转了 90°。主选中项只由
+    //   "最后一次点击"决定，这与单选时代完全一致。
+    //
+    // 不变式（由 .cpp 里那几个入口共同保证，`validateSelection()` 负责修补）：
+    //   · 集合为空 ⇔ m_selection 无效
+    //   · 集合非空 ⇒ m_selection 一定在集合里
+    const std::vector<ecs::Entity>& selectionSet() const { return m_selectionSet; }
+    std::size_t selectionCount() const { return m_selectionSet.size(); }
+    bool isSelected(ecs::Entity e) const;
+    bool multiSelected() const { return m_selectionSet.size() > 1; }
+
+    // Ctrl+点：在集合里加 / 减一项。主选中项 = 刚点的那一项；
+    // 取消选中时退回集合里最后一项（集合空了就彻底清空）。
+    void selectToggle(ecs::Entity e);
+    // Shift+点：把 order 里"上次点的那项 ↔ e"之间的一段全选上。
+    // order 必须由**面板**传进来（层级树的可见行顺序）—— 场景里没有
+    // "树的顺序"这种东西，只有 HierarchyComponent 的 children 顺序，
+    // 而它受过滤 / 折叠影响。让 EditorContext 自己去猜顺序就会和屏幕上
+    // 看到的行顺序不一致（Shift 选中的范围"跳过"了明明在中间的行）。
+    void selectRange(ecs::Entity e, const std::vector<ecs::Entity>& order);
+    // 框选 / 全选：整个集合被替换。主选中项沿用旧值（如果它还在新集合里），
+    // 否则取第一个 —— 保证"拖了一次框，手柄不会莫名换坐标系"。
+    void selectMany(const std::vector<ecs::Entity>& list);
+    void selectAll();
+
+    // 多选时手柄的支点（世界坐标）= 各成员**世界位置**的 AABB 中心。
+    // 单选时就是那个实体的世界位置。
+    glm::vec3 selectionPivot();
+
     // ---------------------------------------------------------- 碰撞体编辑
     // 当前 W/E/R 手柄作用在**哪儿**：
     //   false → 实体的 TransformComponent（常规）
@@ -393,6 +431,19 @@ public:
     // 帧校验：句柄失效时按名字找回，找不回就清空。
     // （撤销删除、Play/Stop 之后都会依赖它把选择"接上"）
     void validateSelection();
+
+    // ---------------------------------------------------------- 预制体（G18）
+    //
+    // 四个动作都自带"存盘 / 记撤销 / 通知"，面板只负责调用与刷新 ——
+    // 否则 ContentBrowser、Hierarchy、Inspector 三处各写一遍，迟早不一致。
+    //
+    // ⚠ Apply 走的是 `PrefabApplyCommand`（**文件 + 场景**一起回滚），不是
+    //   `structuralEdit`：后者管不了磁盘上的 `.vprefab.json`，撤销之后文件
+    //   还是新的，下次重载就把改动"复活"了 —— 而屏幕上一切正常。
+    bool prefabCreateFromSelection(const std::string& relPath);
+    bool prefabApply(ecs::Entity member);
+    bool prefabRevert(ecs::Entity member);
+    bool prefabInstantiate(const std::string& relPath, const glm::vec3& at);
 
     const std::string& selectionName() const { return m_selectionName; }
 
@@ -727,6 +778,58 @@ public:
         return e;
     }
 
+    // ---------------------------------------------------------- 剧本编辑器
+    // Inspector 的 dialogue 页签点 "Edit script…" 时置位，EditorApp 每帧取走
+    // 并打开剧本编辑器窗口（`DialogueEditorWindow`）。
+    // 与角色窗口同一个套路：本类不认识那个窗口（那要把整条对话依赖拖进来）。
+    // ⚠ 存的是**路径**而不是实体：剧本是资产，跟哪个 NPC 挂的无关 ——
+    //   两个 NPC 引用同一份剧本时，从哪点进来都是同一份文件。
+    void requestDialogueEditor(const std::string& path) {
+        m_dlgEditorPath = path;
+        m_dlgEditorRequest = true;
+    }
+    bool takeDialogueEditorRequest(std::string& path) {
+        if (!m_dlgEditorRequest) return false;
+        m_dlgEditorRequest = false;
+        path = m_dlgEditorPath;
+        m_dlgEditorPath.clear();
+        return true;
+    }
+
+    // ---------------------------------------------------------- 时间轴编辑器
+    // Inspector 的 sequence 页签点 "Edit timeline…" 时置位（#311）。
+    // 与剧本编辑器**完全同构**，而且刻意共用同一个套路：两个资产编辑器
+    // 各发明一套请求机制的话，"从 Inspector 打开一个编辑器"这件事就有
+    // 两种行为，而这种不一致没有任何好处。
+    void requestTimelineEditor(const std::string& path) {
+        m_tlEditorPath = path;
+        m_tlEditorRequest = true;
+    }
+    bool takeTimelineEditorRequest(std::string& path) {
+        if (!m_tlEditorRequest) return false;
+        m_tlEditorRequest = false;
+        path = m_tlEditorPath;
+        m_tlEditorPath.clear();
+        return true;
+    }
+
+    // ---------------------------------------------------------- UI 编辑器（#312）
+    // ⚠ 它**没有 Inspector 入口**（UI 文档不是场景组件），但通道照样走
+    //   `EditorContext`：`MYVK_EDITOR_UIED` 与"从菜单空手开窗"要落到同一个
+    //   出口，否则自动化验的就不是用户那条路。三个资产编辑器共用一套模式
+    //   的代价只有这六行，收益是"加第四个编辑器时不用重新想一遍"。
+    void requestUiEditor(const std::string& path) {
+        m_uiEditorPath = path;
+        m_uiEditorRequest = true;
+    }
+    bool takeUiEditorRequest(std::string& path) {
+        if (!m_uiEditorRequest) return false;
+        m_uiEditorRequest = false;
+        path = m_uiEditorPath;
+        m_uiEditorPath.clear();
+        return true;
+    }
+
     // ---------------------------------------------------------- 反射探针（R5-1）
     // Inspector 的 "Capture" 按钮请求**立刻重捕一次**全部探针。
     // 与角色窗口同一个套路：本类不认识 Renderer（那要拖进整条渲染头
@@ -811,6 +914,14 @@ private:
     bool m_selectionFromViewport = false;
     // W/E/R 手柄作用在碰撞体上？（见 colliderEdit()）
     bool m_colliderEdit = false;
+
+    // ---- 选择集（见上面的 public 说明）----
+    // 与集合**同下标**的名字数组：句柄失效（撤销删除 / Play / Stop）之后
+    // 只能靠名字逐个接回来，而名字是跨"场景重建"唯一的稳定标识。
+    std::vector<ecs::Entity> m_selectionSet;
+    std::vector<std::string> m_selectionNames;
+    // 集合入口共用：把 m_selection 换成 e，并保证不变式（见 public 说明）。
+    void setSelectionPrimary(ecs::Entity e);
 
     // 视口矩形（ImGui 屏幕坐标；Player 运行态鼠标门控，见 setViewportRect）
     glm::vec2 m_viewportPos{0.0f};
@@ -909,6 +1020,18 @@ private:
 
     // 待打开角色详情窗口的玩家实体（无效 = 无请求）
     ecs::Entity m_pendingCharacter{};
+
+    // 待打开剧本编辑器的资产路径（见 requestDialogueEditor）
+    bool m_dlgEditorRequest = false;
+    std::string m_dlgEditorPath;
+
+    // 待打开时间轴编辑器的资产路径（见 requestTimelineEditor）
+    bool m_tlEditorRequest = false;
+    std::string m_tlEditorPath;
+
+    // 待打开 UI 编辑器的资产路径（见 requestUiEditor）
+    bool m_uiEditorRequest = false;
+    std::string m_uiEditorPath;
 
     // R5-1：待处理的"立刻重捕反射探针"请求（Inspector 的 Capture 按钮）
     bool m_probeCaptureRequest = false;

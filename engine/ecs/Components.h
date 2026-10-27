@@ -25,6 +25,11 @@
 // glm / string / vector，它刻意不 include `scene/CameraSystem.h`（见那个
 // 文件头的说明），所以 ecs → sequence 是单向的。
 #include "sequence/SequenceAsset.h"
+// C2 对话。`DialoguePlayer` 是**值成员**（不是指针）：它自带资产所有权
+// （shared_ptr）与播放状态，所以必须有完整类型。
+// ⚠ 同样不成环：`dialogue/DialoguePlayer.h` → `DialogueRunner.h` →
+//   `DialogueAsset.h`，整条链只依赖 string / vector / memory。
+#include "dialogue/DialoguePlayer.h"
 #include "animation/LookAt.h"
 #include "animation/SpringBone.h"
 #include "animation/TwoBoneIK.h"
@@ -460,6 +465,50 @@ struct SequencerComponent {
     float playhead = 0.0f;      // 当前时刻（秒）
     bool started = false;       // 是否已经过了"首帧"
     bool finished = false;      // 非循环播放已经走到结尾
+};
+
+// ---------------- 对话 / 字幕（C2）----------------
+//
+// 一份 `.dlg.json` + 一个播放头。挂在**任意实体**上（导演轨、NPC、玩家都行），
+// 同一场景多个时由 `priority` 选一个在播 —— 与时间轴同一条规则。
+//
+// ------------------------------------------------------------
+// 为什么不把 `DialogueRunner` 直接放进组件
+// ------------------------------------------------------------
+// runner 只认"当前是哪一句 + 怎么走"；打字机进度、两段式推进、资产所有权
+// 都是**表现**。分成 `DialoguePlayer`（表现）+ `DialogueRunner`（状态机）两层，
+// 好处是 runner 的 49 条自检不必等真实时间，而"按一下先补完打字机"这种
+// 手感可以随时改而不动语义。
+//
+// ------------------------------------------------------------
+// `startNode` 只对组件生效，对时间轴的 cue **不生效**
+// ------------------------------------------------------------
+// 过场里的 `kind=Line` 点名的是"这段台词"，从哪句开始是资产自己的事；
+// 组件是调试入口（"从第 20 句开始看"），所以它才有这个覆盖字段。
+//
+// ------------------------------------------------------------
+// `cps` 与"打字机开关"是**同一个字段**
+// ------------------------------------------------------------
+// `cps <= 0` = 关掉打字机（立刻全出），不是"永远不显示" —— 见
+// `DialogueAsset.h` ④。这里不额外加一个 `typewriter` 开关：两个字段表达
+// 同一件事，必然会出现"关了开关却还设了速度"这种自相矛盾的存档。
+struct DialogueComponent {
+    // 资产路径，相对 `assets/`（例：`dialogues/ch01_open_01.dlg.json`）。
+    std::string dialoguePath;
+
+    // ---- 纯数据（序列化）----
+    bool enabled = true;
+    // 进 Play 自动起播。过场里的台词应该走**时间轴**（`kind=Line`），
+    // 这个开关是给"靠近就说话的 NPC / 开场独白"用的。
+    bool autoStart = false;
+    float cps = 30.0f;          // <=0 = 立刻全出
+    std::string startNode;      // 空 = 资产的 `start`
+    int priority = 0;           // 高者胜（cue 永远优先于组件）
+
+    // ---- 运行时（**不序列化**）----
+    dialogue::DialoguePlayer player;
+    bool started = false;           // autoStart 用过一次就别再自动起播
+    bool loadFailedLogged = false;  // 加载失败只喊一次
 };
 
 // ---------------- 动画键盘映射（角色面板里给 clip 绑键）----------------
@@ -1580,6 +1629,33 @@ struct BoneAttachmentComponent {
     glm::vec3 offset{0.0f};
     glm::vec3 eulerDeg{0.0f};
     bool enabled = true;
+};
+
+// ------------------------------------------------------------
+// 预制体实例的成员标记（G18）
+//
+// 挂在**实例的每一个成员**上（不只是根）。三件事都靠它：
+//   ① 身份：`localId` 是"这个成员在 prefab 文件里是谁"，同一份 prefab 摆
+//      3 份时 3 份的 localId 相同、实体 id 不同 —— 这就是"改母版 → 3 份一起变"
+//      能工作的前提。
+//   ② 归属：`instance` 把成员分组到具体实例（同一 prefab 的 3 份各有一个编号），
+//      `root` 标出哪一个是根（Apply/Revert/选中的落点）。
+//   ③ 覆盖：`overrides` 是**显式路径列表**（`transform.position`、
+//      `visible`、`script.path` …），只有根上的那份有意义。
+//      ⚠ 为什么不用"值与 prefab 默认值比对"来隐式推导：源一改，比对结果
+//      就整体反转 —— 昨天没覆盖的字段今天会"自动变成覆盖"，而作者从没
+//      动过它。见 docs/persistence_roadmap.md D3。
+//
+// ⚠ 不存 guid：`localId` 是 prefab **文件内**的稳定 id，与场景实体 id
+//   没有关系（场景里没有任何实体持有 prefab 的 localId 作为 id）。
+//   混用会让"按 localId 找实体"永远落空。
+// ------------------------------------------------------------
+struct PrefabLinkComponent {
+    std::string prefabPath;      // 相对资产根：prefabs/crate.vprefab.json
+    std::string localId;         // 在 prefab 文件内的稳定 id（跨实例相同）
+    std::uint32_t instance = 0;  // 实例编号（同一 prefab 的 N 份各不相同）
+    bool root = false;           // 是不是实例根
+    std::vector<std::string> overrides;  // 覆盖路径（只在 root 上有意义）
 };
 
 } // namespace ecs

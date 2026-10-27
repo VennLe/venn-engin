@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "name": "hud_demo",
+  "canvas": [1920, 1080],
+  "//": "UI 文档示例（#312）。改这个文件 → 用 `Game.exe --ui-doc ui/docs/hud_demo.ui.json` 看效果；用 Window ▸ UI editor 打开可以拖着改。{health}/{maxHealth} 是运行时绑定：脚本 setHealth/damage 改的数会直接出现在这里。",
+  "widgets": [
+    {
+      "id": "hud",
+      "type": "nine",
+      "anchor": "bottom-left",
+      "rect": [24, 24, 340, 74],
+      "color": "#0E1116E6",
+      "color2": "#1A1F27F2",
+      "radius": 8,
+      "inset": 2,
+      "children": [
+        {
+          "id": "hpbar",
+          "type": "progress",
+          "rect": [10, 10, 320, 18],
+          "color": "#D93A3AFF",
+          "color2": "#00000080",
+          "radius": 9,
+          "bind": "health",
+          "bindMax": "maxHealth"
+        },
+        {
+          "id": "hpnum",
+          "type": "text",
+          "rect": [10, 34, 320, 26],
+          "color": "#F2F5FAFF",
+          "text": "HP {health} / {maxHealth}",
+          "size": 18,
+          "align": "right"
+        },
+        {
+          "id": "hint",
+          "type": "text",
+          "rect": [10, 34, 170, 26],
+          "color": "#9FB3C8FF",
+          "text": "{hint}",
+          "size": 16,
+          "align": "left"
+        }
+      ]
+    },
+    {
+      "id": "title",
+      "type": "text",
+      "anchor": "top-center",
+      "rect": [0, 36, 900, 48],
+      "color": "#F2F5FAFF",
+      "text": "Chapter 1",
+      "size": 32,
+      "align": "center"
+    },
+    {
+      "id": "resume",
+      "type": "button",
+      "anchor": "bottom-right",
+      "rect": [24, 24, 240, 64],
+      "color": "#2A2E36F2",
+      "color2": "#FFFFFFFF",
+      "radius": 10,
+      "text": "Resume",
+      "size": 22,
+      "align": "center"
+    },
+    {
+      "id": "topline",
+      "type": "panel",
+      "rect": [0, 0, 1920, 4],
+      "color": "#7F5AF0FF"
+    }
+  ]
+}

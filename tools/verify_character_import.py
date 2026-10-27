@@ -68,6 +68,8 @@ import sys
 import tempfile
 import time
 
+import ctypes
+
 from PIL import ImageChops
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -90,6 +92,9 @@ CAM_CLOSE = "1.8,-1.8,1.2,45,16"
 # （用 CAM_CLOSE 时第二、三个会跑出视口，截图上只剩一个 —— 那这张"三个姿势
 # 不同"的截图就没有验收价值了）。
 CAM_WIDE = "6,-6,3.2,45,18"
+
+# 滚轮一格（Windows 的 WHEEL_DELTA）。只给 `scroll_tag_into_view` 用。
+MOUSEEVENTF_WHEEL = 0x0800
 
 # anime_girl.fbx 自带 4 个 clip（`MODEL-CLIPS` 锚点会打出来）：
 #   Idle / Walk / Rig|Idle / Rig|Walk
@@ -589,6 +594,56 @@ def case_multi_instance(exe: str):
 # G：AnimatorComponent 接管 time（A1，2026-10-19）
 # ============================================================
 
+def scroll_tag_into_view(hwnd, tap, tag, margin=48.0, max_steps=14):
+    """把 Inspector 内容区滚到某个控件**真的落在客户区里**，返回最新矩形。
+
+    ⚠ 为什么需要这一步（2026-10-27 实测，一条只值 30 秒的断言花了半小时）：
+
+      `ui::logRect` 对**被裁剪掉的**控件照样打日志 —— 它只做去重，不做可见性
+      判断。于是"矩形在日志里"完全推不出"控件在屏幕上"。Animation 页的
+      `Add Animator` 就长在页面下方：
+
+        窗口 1440x900 → 客户区只有 **1418x844**
+        `INS-ANIM-ADDANIM` = (1192,858)-(1307,886)   ← 整块在客户区外
+
+      此时 `click_tag` 会：拿到矩形（成功）→ 把鼠标 SendInput 到客户区外
+      （毫无反应）→ 断言红。而它的两行前置断言（"按钮存在"、"点了"）
+      **全是 PASS** —— "点了没反应但日志全绿"的经典形态。
+
+      所以判据必须是"点之前先确认它在屏幕内"，而不是"矩形拿到了"。
+      滚轮这一步就是用户会做的动作（滚动找按钮），对布局漂移免疫。
+    """
+    from verify_asset_drag import force_foreground, move_to
+
+    class _ClientRect(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    rc = _ClientRect()
+    user32.GetClientRect(hwnd, ctypes.byref(rc))
+    cw, ch = rc.right, rc.bottom
+
+    if not force_foreground(hwnd):
+        return tap.last_rect(tag)
+    # 指针落在内容区中部偏右（Inspector 停靠在右侧）。⚠ 别贴右边框：
+    # 那里是滚动条，滚轮事件会被它吃掉（实测 x=cw-60 滚不动，x=cw-100 能滚）。
+    move_to(hwnd, cw - 100, int(ch * 0.5))
+    time.sleep(0.4)
+
+    for _ in range(max_steps):
+        r = tap.last_rect(tag)
+        if not r:
+            return None
+        cy = (r[1] + r[3]) * 0.5
+        if margin <= cy <= ch - margin:
+            return r
+        # 负 = 向下滚内容（控件 y 变小）
+        delta = -120 if cy > ch - margin else 120
+        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+        time.sleep(0.25)
+    return tap.last_rect(tag)
+
+
 def click_tag(hwnd, tap, tag, timeout=8.0):
     """按日志矩形点一个 ImGui 控件。
 
@@ -606,7 +661,28 @@ def click_tag(hwnd, tap, tag, timeout=8.0):
     if not force_foreground(hwnd):
         print("    (诊断) force_foreground 失败")
         return False
-    _click(hwnd, (r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5)
+
+    # ⚠ 落点取矩形的**上 1/4**，不是中心。
+    #
+    #   被面板底边裁掉一半的控件（`Add Animator` 正好如此：矩形
+    #   (1192,900)-(1307,928)，而客户区高 944、面板底边约 914 —— 只有
+    #   y=900~914 那 14 px 在面板里），中心 y=914 恰好压在裁切线上，
+    #   鼠标点下去等于点"面板外"。
+    #
+    #   上 1/4 对**正常控件**也一样可用（ImGui 的命中区是整个矩形），
+    #   而且不依赖"面板底边到底在哪"这种随主题/DPI 变化的魔数。
+    class _ClientRect(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    rc = _ClientRect()
+    user32.GetClientRect(hwnd, ctypes.byref(rc))
+    cx = (r[0] + r[2]) * 0.5
+    cy = r[1] + (r[3] - r[1]) * 0.25
+    # 兜底：万一把窗口缩到控件真在客户区外，也别把鼠标点到别的程序上。
+    cy = min(max(cy, 4.0), rc.bottom - 6.0)
+    cx = min(max(cx, 4.0), rc.right - 6.0)
+    _click(hwnd, cx, cy)
     return True
 
 
@@ -669,7 +745,28 @@ def case_animator(exe: str, scene_path: str):
         "MYVK_EDITOR_CAM": CAM_CLOSE,
         "MYVK_EDITOR_NO_HUD": "1",
     }
-    proc, hwnd, tap = launch(exe, env1, "1440x900")
+    # ⚠ 窗口从 1440x900 提到 **1440x1200**（2026-10-27）。这一改动是本轮
+    #   唯一"非功能"的改动，必须记账，因为它踩的坑很典型：
+    #
+    #   `Add Animator` 按钮长在 Animation 页的末尾。1440x900 时客户区只有
+    #   **1418x844**，而按钮矩形是 (1192,858)-(1307,886) —— **整块在
+    #   客户区之外**。这个坑极难自证，因为：
+    #     · `ui::logRect` 对**被裁剪的**控件照样打日志（只去重，不做可见性判断）
+    #       → "INS-ANIM-ADDANIM 存在" PASS
+    #     · `click_tag` 只回报"矩形拿到了 + 点发出去了"
+    #       → "点了 Add Animator" PASS
+    #     · 但鼠标被 SendInput 到客户区外面 → 按钮压根没收到
+    #       → "Animator 段出现" FAIL
+    #   三行前置断言全绿、最后一行红，而根因在窗口高度上。
+    #
+    #   加高到 1200（屏幕 2560x1440）后：按钮落在 y=984（客户区 1144），
+    #   余量 130 px —— 实测点击生效（`INS-ANIM-ROOTMOTION` 出现，
+    #   位置 y=1079）。1000 高**不够**：那时按钮在 y=900、面板底边约 914，
+    #   只剩 14 px 在面板里，ImGui 的命中测试照样点不中。
+    #
+    #   另外 `click_tag` 的落点改成"矩形上 1/4"，`scroll_tag_into_view`
+    #   负责在必要时滚一滚 —— 两者是给别的用例兜底的，这里其实用不到。
+    proc, hwnd, tap = launch(exe, env1, "1440x1200")
     if not hwnd:
         check("编辑器启动（G1）", False)
         return False
@@ -678,7 +775,11 @@ def case_animator(exe: str, scene_path: str):
                         wait_rect_local(tap, "INS-ANIM-TIMETEXT", 10.0) is not None)
         ok_all &= check("INS-ANIM-ADDANIM 存在（还没有动画器时的入口）",
                         tap.last_rect("INS-ANIM-ADDANIM") is not None)
-        clicked = click_tag(hwnd, tap, "INS-ANIM-ADDANIM", 8.0)
+        # ⚠ 先滚进可见区再点：`INS-ANIM-ADDANIM` 在页面下方，1440x900 下
+        #   会整块落在客户区外面（见 `scroll_tag_into_view` 的长注释）。
+        r_btn = scroll_tag_into_view(hwnd, tap, "INS-ANIM-ADDANIM")
+        ok_all &= check("Add Animator 在可见区内（滚轮滚进去）", r_btn is not None)
+        clicked = bool(r_btn) and click_tag(hwnd, tap, "INS-ANIM-ADDANIM", 5.0)
         ok_all &= check("点了 Add Animator", clicked)
         got = wait_rect_local(tap, "INS-ANIM-ROOTMOTION", 8.0)
         ok_all &= check("点完之后 Animator 段出现（组件真的加上了）", got is not None)

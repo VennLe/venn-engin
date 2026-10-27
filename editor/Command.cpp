@@ -8,6 +8,11 @@
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
 
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <system_error>
+
 namespace editor {
 
 // ---------------------------------------------------------------- 命令栈
@@ -104,6 +109,23 @@ void TransformEditCommand::redo() {
     if (m_scene) m_after.apply(*m_scene, m_entity);
 }
 
+// ---------------------------------------------------------------- 多选变换
+
+void MultiTransformEditCommand::undo() {
+    if (!m_scene) return;
+    // 逆序回滚：严格说逐项独立写字段，顺序无关；但倒着走能保证"若将来越来越
+    // 多的命令会带派生数据（比如刚体同步），父节点先于子节点恢复不会露馅"。
+    for (auto it = m_items.rbegin(); it != m_items.rend(); ++it)
+        it->before.apply(*m_scene, it->entity);
+    VK_LOG_INFO("MULTI-UNDO '%s' n=%zu", m_name.c_str(), m_items.size());
+}
+
+void MultiTransformEditCommand::redo() {
+    if (!m_scene) return;
+    for (const Item& it : m_items) it.after.apply(*m_scene, it.entity);
+    VK_LOG_INFO("MULTI-REDO '%s' n=%zu", m_name.c_str(), m_items.size());
+}
+
 // ---------------------------------------------------------------- 碰撞体变换
 
 namespace {
@@ -191,5 +213,42 @@ void SceneSnapshotCommand::restore(const std::string& json) {
 
 void SceneSnapshotCommand::undo() { restore(m_before); }
 void SceneSnapshotCommand::redo() { restore(m_after); }
+
+// ---------------------------------------------------------------- PrefabApply
+
+void PrefabApplyCommand::writePrefab(const std::string& fullPath,
+                                     const std::string& text) {
+    if (fullPath.empty()) return;
+    const std::string tmp = fullPath + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            VK_LOG_ERROR("PrefabApplyCommand: cannot write %s", tmp.c_str());
+            return;
+        }
+        f.write(text.data(), static_cast<std::streamsize>(text.size()));
+        f.flush();
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, fullPath, ec);
+    if (ec) {
+        VK_LOG_ERROR("PrefabApplyCommand: rename failed: %s", ec.message().c_str());
+        std::error_code ec2;
+        std::filesystem::remove(tmp, ec2);
+        return;
+    }
+    VK_LOG_INFO("PREFAB-UNDO-WRITE path=%s bytes=%d", fullPath.c_str(),
+                static_cast<int>(text.size()));
+}
+
+void PrefabApplyCommand::undo() {
+    writePrefab(m_prefabPath, m_prefabBefore);
+    m_sceneCmd.undo();
+}
+
+void PrefabApplyCommand::redo() {
+    writePrefab(m_prefabPath, m_prefabAfter);
+    m_sceneCmd.redo();
+}
 
 } // namespace editor

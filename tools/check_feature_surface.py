@@ -354,6 +354,15 @@ ALLOW_EXACT = {
     #  界面无开关；它只用来抵消 `MYVK_NO_WINDOW_SAVE` 顺带跳过缓冲的副作用，
     #  让 `verify_startup_show` 可测且不写 imgui.ini）→ 纯测试钩子，同 `MYVK_FRAMES`。
     "MYVK_STARTUP_DELAY",
+    # `MYVK_DLG_AUTO=<秒>`：每 N 秒自动按一次空格推进对话（0 / 不设 = 关）。
+    # 只在 `tools/verify_dialogue.py` 的"自动推进"用例里用 —— 没有它就得往
+    # 窗口里注入按键才能跑完一段台词，而那个用例本身**不是**在测按键
+    # （按键单独有一个用例）。属于"测试注入"，同 `MYVK_FIXED_DT`。
+    # ⚠ 刻意**不**改成 `MYVK_RUNTIME_*`：它消费的是"玩家按键"这条真实链路，
+    #   带上前缀会让人以为它是运行时的正式开关（正式开关该有 UI），
+    #   而玩家侧真正的自动播放（跳过整段 / 快进）还没做 —— 见
+    #   `docs/dialogue.md` 第 9 节"现在还不能做的"。
+    "MYVK_DLG_AUTO",
     # ① 测试钩子：为了构造确定性对照而存在的"注入点"，
     #    源码里明确写着"正常使用不设即无影响" → 不需要 UI。
     "MYVK_FG_SUN_UV",

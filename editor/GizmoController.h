@@ -70,7 +70,9 @@
 
 #include <glm/glm.hpp>
 
+#include <cstddef>
 #include <string>
+#include <vector>
 
 namespace scene {
 class Scene;
@@ -125,7 +127,30 @@ public:
     // 擦除后为空串。
     const std::string& readout() const { return m_readout; }
 
+    // 本次拖拽实际写了几个实体（1 = 单选）。供状态栏 / 自动化日志断言用。
+    std::size_t targetCount() const { return m_targets.size(); }
+
 private:
+    // ---- 多选拖拽的一个目标（2026-10-27 #316）----
+    //
+    // 快照全部在**按下鼠标那一刻**冻结，理由与 m_dragOrigin 同一个（见文件头
+    // "拖拽的参考线必须冻结"）：拖拽期间每帧都从"当前值"重算，位移会被
+    // 反复迭进参考量里 → 正反馈。
+    struct Target {
+        ecs::Entity entity{};
+        TransformSnapshot before;        // 按下时的 TRS（撤销用）
+        glm::vec3 startWorldPos{0.0f};   // 按下时的世界位置（绕支点旋转要用）
+        glm::vec3 localAxes[3]{glm::vec3(1, 0, 0), glm::vec3(0, 1, 0),
+                               glm::vec3(0, 0, 1)};
+        // 父节点**世界矩阵**在按下时的样子。有它就能把"世界里挪了 Δ"
+        // 换成"父空间里挪了多少"，而且不必关心父节点是不是也在这批目标里
+        // （都是被选中的话子节点根本不会进目标表，见 beginDrag）。
+        glm::mat4 parentWorld{1.0f};
+        bool hasParent = false;
+    };
+    std::vector<Target> m_targets;
+    bool multiTarget() const { return m_targets.size() > 1; }
+
     // 旋转环用折线近似，段数越高越圆（绘制与命中测试共用同一组点）
     static constexpr int kRingSegments = 48;
 
@@ -163,6 +188,19 @@ private:
     // 手柄的世界矩阵：实体世界矩阵（作用在实体上）
     // 或 实体世界矩阵 × 碰撞体局部矩阵（作用在碰撞体上）
     glm::mat4 targetWorld(scene::Scene& scene, ecs::Entity e) const;
+
+    // ---- 把一次拖拽算出来的"世界量"分发到所有目标上（多选，见 m_targets）----
+    //   Translate：worldDelta ← 世界空间位移
+    //   Rotate   ：D          ← 世界空间旋转增量（多选时绕支点）
+    //   Scale    ：factor + **每个目标自己的**局部轴权重
+    // 单选（含碰撞体）那条分支的算术与引入多选之前**逐位一致**（各实现里
+    // 有对应说明）；多选走各自的循环。
+    void applyTranslateToTargets(scene::Scene& scene, const TrsPointers& tp,
+                                 const glm::vec3& worldDelta);
+    void applyScaleToTargets(scene::Scene& scene, const TrsPointers& tp,
+                            float factor, int axisIdx, int planeN);
+    void applyRotateToTargets(scene::Scene& scene, const TrsPointers& tp,
+                             const glm::mat3& D, bool worldApply);
 
     // 投影缓存：每帧算一次，绘制与命中测试共用
     glm::vec2 m_originScreen{0.0f};

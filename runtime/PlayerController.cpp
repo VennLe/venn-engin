@@ -323,7 +323,7 @@ void PlayerController::update(scene::Scene& scene, physics::PhysicsWorld* world,
     const float speed = cc->maxSpeed * (sprint ? cc->sprintMultiplier : 1.0f);
     const glm::vec3 desired = dir * speed;
 
-    const bool jump = m_input.wasPressed("Jump");
+    const bool jump = !m_jumpBlocked && m_input.wasPressed("Jump");
 
     // 没有物理世界时也要能跑（纯镜头调试）：给一个空世界，角色只会自由落体。
     static physics::PhysicsWorld kEmptyWorld;

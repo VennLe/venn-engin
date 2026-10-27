@@ -202,6 +202,18 @@ inline void iconSequence(ImDrawList* dl, ImVec2 p, float s, ImU32 col) {
     k.rectFill(0.60f, 0.14f, 0.66f, 0.46f, 0.0f);    // 播放头
 }
 
+// 对话（C2）：三行文字 + 一个尾巴，像一块字幕框。
+// ⚠ 不做"气泡轮廓"：IconPen 只有 `line` / `rectFill`，画轮廓要 12 条线，
+//   在这个 14 px 的尺寸上看不出圆角，只有糊。三行实心条 + 尾巴反而更像
+//   "字幕框"这个它真正代表的东西。
+inline void iconDialogue(ImDrawList* dl, ImVec2 p, float s, ImU32 col) {
+    const IconPen k(dl, p, s, col);
+    k.rectFill(0.10f, 0.16f, 0.90f, 0.30f, 0.04f);   // 说话人
+    k.rectFill(0.10f, 0.40f, 0.72f, 0.52f, 0.03f);   // 正文第 1 行
+    k.rectFill(0.10f, 0.60f, 0.56f, 0.72f, 0.03f);   // 正文第 2 行
+    k.line(0.74f, 0.72f, 0.74f, 0.90f);              // 继续箭头（尾巴）
+}
+
 // 全部：三条横杠（列表 = "把上面所有页签摊平"）
 inline void iconAll(ImDrawList* dl, ImVec2 p, float s, ImU32 col) {
     const IconPen k(dl, p, s, col);

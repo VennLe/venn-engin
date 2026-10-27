@@ -930,6 +930,49 @@ class PrefabApplyCommand : public Command {
 - ❌ 跨 chunk 引用计数（G19 第一版用"拒绝卸载"）
 - ❌ `MYVK_GUID_SEED`（没有用例需要，别加开关）
 
+### G18 实测（2026-10-26，任务 #315）
+
+**数字**：`--selftest prefab` **36 条**全过；`tools/verify_prefab.py` **45 条**全过
+（A 4 + B 15 + C 12 + D 8 + E 6），4 次编辑器启动约 62 s。
+
+**与上面计划的三处偏差**（都是"依赖还没做"导致的，不是偷工）：
+
+| 计划 | 实际 | 为什么 |
+|---|---|---|
+| 实例成员带 `(prefabGuid, localGuid)` | 只有 `localId`（文件内稳定） | **G16 没做** —— 全仓没有 `EntityGuid`，而 Prefab 只需要"节点在文件内稳定"，`localId` 就够 |
+| 复用 `parseSceneDocument` / `remapEntityRefs` | 把 `SceneSerializer.cpp` 里 600 行**单实体**字段处理机械抽成 `entityToJson` / `entityFromJson`（`scene/SceneEntityIO.h`） | **G16-5 没做** —— 没有三段 API。抽出来的好处一样：场景与 prefab 共用**唯一一份**实现，以后加组件不会漏改第二处 |
+| 编辑器：Content 拖拽 + Hierarchy 右键 | Hierarchy 右键三项 + Inspector prefab 条 + **控制台六条 `prefab.*`** | 拖拽要动 Content 的拖放协议；命令那六条是同一份 `EditorContext` 方法，且顺带进了命令面板（E18 从控制台表派生） |
+
+**新增了一条计划里没有的语义：落点记账。**
+`instantiatePrefab(at)` 若 `at` 与母版里作者写的根位置不同，**当场记一条
+`<localId>/transform.position` 覆盖**。不记的后果不是"少一条账"：用户把实例摆到
+(3,0,0)，之后母版改了个缩放，再同步 —— 实例**自己跳回**母版坐标。而且现象像
+"缩放把位置也带歪了"，排查方向完全是错的。
+
+**踩到的坑**（写下来是因为每一个都花了时间）：
+
+1. **改了 `engine/**` 必须把两个 exe 都重编**。`VennEditor` 用 `libVennEngine.a`
+   静态链，只 `build VennRuntime` 的话 Editor.exe 还是旧引擎 —— 症状是
+   "`--selftest` 里落点记账绿、编辑器里 `overrides=0`"，看起来像跨层 bug，
+   实际是链接产物过期。
+2. **覆盖路径的前缀必须是 `localId`**，不是组件名。一份 prefab 有多个节点，
+   写 `transform.position` 根本不知道是谁的。
+3. **`structuralEdit` 返回 `void`**，不能写成 `const bool ok = structuralEdit(...)`。
+4. **E 组（真鼠标拖 gizmo）依赖 `MYVK_LOG_RECTS=1`** 才会打 `GZ-ORIGIN` /
+   `GZ-AXIS-X`；同时**不能**设 `MYVK_EDITOR_NO_HUD=1` —— 整块视口叠加层不画，
+   手柄也就没有矩形，症状是"GZ-ORIGIN 永远等不到"，很像"选中失败"。
+5. **名字去重不是可选项**：3 份长得一样的实例是最典型的同名来源，而
+   `Scene::find(name)`（撤销后接回选中、脚本按名字找）只命中第一个。
+   `instantiatePrefab` 里用 `nameUse` 计数表生成 `Crate / Crate 2 / Crate 3`。
+6. **可见性 / 锁定也是"字段"**。母版同步会重写外壳（`entityApplyShell`），
+   实例上手改的 👁 / 🔒 会被悄悄改回去 → 这两处也要 `recordOverride`
+   （`SceneHierarchy` 的 pending 切换里）。`visible` 恒写、`locked` 只在 true
+   时写，所以"解锁"这条覆盖的 `getPath` 拿到 null → 不叠加 → 语义自动正确。
+
+**明确不做（v1）**：嵌套 prefab（文件里出现 `prefab` 块只警告并忽略）、
+删组件传播（`entityFromJson` 只加/改不删）、数组下标覆盖
+（`material.textures[2]` —— 需要半个 JSON pointer 解析器，要那个粒度就覆盖整块）。
+
 ---
 
 ## 14 · 速查卡
@@ -953,11 +996,17 @@ guid: 每实体必写; parent: 下标（本文件内，不变）; parentGuid: �
 version + kMigrations；v1 发完立刻加 v2 空跑一次，别留空表
 sceneHash = 排序后的 guid 集合（只含身份，不含值）
 
-◆ Prefab
-文件与场景同构（平铺 + parent 下标）→ 复用解析器
-实例化 = 分配新 guid + localGuid→newGuid 映射 + remapEntityRefs（唯一入口）
-覆盖 = 显式路径列表（transform.position），加载时"未列出的字段跟随源"
-Apply 要清所有实例的对应覆盖；撤销用专用 Command（文件 + 场景一起回滚）
+◆ Prefab（G18 已落地，2026-10-26）
+文件与场景同构（平铺 entities[] + parent 下标），只多 localId（没有 guid，G16 未做）
+单实体读写 = scene/SceneEntityIO.h 的 entityToJson / entityFromJson（与存场景同一份）
+实例化 = 每个节点建实体 + PrefabLinkComponent{path, localId, instance, root}
+         名字按 nameUse 计数表去重（Crate / Crate 2 / Crate 3）
+覆盖 = 显式路径列表 `<localId>/<component>[.<field>]`，只在实例**根**上
+       同步 = prefab 值 + 实例当前值盖回被覆盖的字段；name / parent 从 base 剔除
+落点 ≠ 母版位置 → 当场记一条 `<localId>/transform.position`（否则改母版时实例跳回去）
+Apply 写回资产后**必须**重新 loadPrefab + syncInstances（否则别的实例还是旧值）
+撤销用 PrefabApplyCommand（文件 + 场景一起回滚；structuralEdit 管不了文件）
+编辑器：层级右键三项 / Inspector 头部条 / 控制台六条 prefab.* / 命令面板自动有
 
 ◆ 坑
 Editor.exe 只认 MYVK_FRAMES（--frames 会被丢弃 → 挂死到超时）

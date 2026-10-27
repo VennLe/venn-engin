@@ -6,6 +6,7 @@
 #include "assets/Model.h"
 #include "core/Input.h"
 #include "core/Logger.h"
+#include "dialogue/DialogueSystem.h"
 #include "ecs/Components.h"
 #include "i18n/I18n.h"
 #include "physics/PhysicsWorld.h"
@@ -26,11 +27,96 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 
 namespace runtime {
 
 namespace {
+
+// ============================================================
+// 运行时切一段动画（C6 `playAnim` 的落地）
+// ============================================================
+// 返回 false = 切不了（没 Animator / 没骨架 / 骨架里没有这段 clip）。
+//
+// ⚠⚠ 必须**同时**写两个组件：
+//   · `SkinnedMeshComponent::clipName` 是采样层真正读的字段；
+//   · `AnimatorComponent::defaultClip` 只在 `!appliedDefaultClip` 时补一次
+//     （见 AnimatorSystem.cpp 那个分支）。
+//   只写后者 = **什么都没发生**：脚本回 true、日志干净、画面不动。
+//   这类 bug 的特征是"越看代码越对"，因为代码确实对 —— 只是写错了对象。
+//
+// ⚠ 走 crossfade 而不是硬切 `time = 0`：硬切在腿/手臂上是同一帧内的
+//   跳变（B 组那次用户原话是"机械、僵硬"）。0.2 s 是"看得出在过渡、
+//   又不拖沓"的档位，与 AnimController 的默认淡入同量级。
+bool switchAnimClip(scene::Scene& scene, ecs::Entity e, const std::string& clip) {
+    ecs::World& w = scene.world();
+    auto* sk = w.get<ecs::SkinnedMeshComponent>(e);
+    auto* an = w.get<ecs::AnimatorComponent>(e);
+    // ⚠ 三种失败必须分开报。"没有 Animator / 没有骨架 / 没有这段 clip"
+    //   合并成一句话的后果是：开发者拼错一个 clip 名，看到的提示是
+    //   "has no Animator component"，于是去查组件挂没挂 —— 方向从一开始
+    //   就错了。可用 clip 列表直接打出来，拼错这件事一秒就能发现。
+    if (!sk || !an) {
+        VK_LOG_WARN("RUNTIME-SWITCH-ANIM-MISS entity=%u clip=%s "
+                    "reason=no-animator (needs SkinnedMesh + Animator)",
+                    static_cast<unsigned>(e.id), clip.c_str());
+        return false;
+    }
+    if (!sk->model || !sk->model->skeleton) {
+        VK_LOG_WARN("RUNTIME-SWITCH-ANIM-MISS entity=%u clip=%s "
+                    "reason=no-skeleton",
+                    static_cast<unsigned>(e.id), clip.c_str());
+        return false;
+    }
+    if (clip.empty()) {
+        VK_LOG_WARN("RUNTIME-SWITCH-ANIM-MISS entity=%u clip=<empty> "
+                    "reason=empty-clip",
+                    static_cast<unsigned>(e.id));
+        return false;
+    }
+
+    const assets::Skeleton& skel = *sk->model->skeleton;
+    // 骨架里没有这段 clip 就不切 —— 切了会让采样回落到 rest pose（T-pose），
+    // 而"角色突然摆成 T 字"看起来像渲染 bug，实际是名字拼错了。
+    if (!skel.findClip(clip)) {
+        std::string avail;
+        for (const auto& c : skel.clips) {
+            if (!avail.empty()) avail += "|";
+            avail += c.name;
+        }
+        VK_LOG_WARN("RUNTIME-SWITCH-ANIM-MISS entity=%u clip=%s "
+                    "reason=no-such-clip available=[%s]",
+                    static_cast<unsigned>(e.id), clip.c_str(), avail.c_str());
+        return false;
+    }
+
+    if (!sk->clipName.empty() && sk->clipName != clip) {
+        sk->fadeFromClip = sk->clipName;
+        sk->fadeFromTime = sk->time;
+        sk->fadeDur = 0.2f;
+        sk->fadeT = 0.0f;
+    }
+    const std::string from = sk->clipName;
+    sk->clipName = clip;
+    sk->time = 0.0f;
+    sk->playing = true;
+
+    an->defaultClip = clip;
+    // 标成"已经补过"：否则下一次 AnimatorSystem 会拿 defaultClip 再覆盖一遍
+    // （值相同、无害，但会在切到别的 clip 后又把它改回去）。
+    an->appliedDefaultClip = true;
+    an->time = 0.0f;
+    an->playing = true;
+
+    // 锚点：**这一行是"脚本说切、宿主真切了"的唯一直接证据**。
+    // 没有它，端到端只能看到 `ANIM-FADE`（那是采样层的反应，切错对象时
+    // 一样可能出现）—— 而 `playAnim` 最典型的失败模式正是"改了个没人读
+    // 的字段，日志全绿、画面不动"。
+    VK_LOG_INFO("RUNTIME-SWITCH-ANIM entity=%u from=[%s] to=%s",
+                static_cast<unsigned>(e.id), from.c_str(), clip.c_str());
+    return true;
+}
 
 // ============================================================
 // 按出生点生成玩家（仿 UE5 PlayerStart → Spawn Pawn）
@@ -446,6 +532,13 @@ RuntimeApp::RuntimeApp(const RuntimeConfig& cfg)
         m_contactTrace = (c[0] != '0');
         m_contacts.setTrace(m_contactTrace);
     }
+    // 字幕自动推进（C2 验收用）。按**秒**给间隔，0/缺省 = 关。
+    // ⚠ 它走的是同一条 `pressAdvance()`，不是"跳过字幕"的另一条分支 ——
+    //   否则用例验的就不是玩家真正走的那条路了。
+    if (const char* a = std::getenv("MYVK_DLG_AUTO")) {
+        const double v = std::atof(a);
+        if (v > 0.0) m_dlgAutoSec = static_cast<float>(v);
+    }
 }
 
 RuntimeApp::~RuntimeApp() = default;
@@ -580,6 +673,37 @@ void RuntimeApp::onInit() {
         if (seq.hasPose())
             scene::activeCameraSystem().setDesiredPose(seq.pose());
         scene::activeCameraSystem().update(activeScene(), vdt);
+
+        // ---- 对话 / 字幕（C2）----
+        // ⚠ 位置同样是硬约束：**时间轴之后**。`kind=Line` 的事件是在
+        //   `seq.tick` 里 `cue()` 出来的，排在它前面这一帧的字幕就要等到
+        //   下一帧才起步（起播晚一帧在过场里是很明显的"嘴型对不上"）。
+        // 用同一个 vdt：对话框在暂停时该一起停。
+        dialogue::DialogueSystem& dlg = dialogue::activeDialogueSystem();
+        dlg.tick(activeScene(), vdt);
+
+        // ---- 自动推进（仅 `MYVK_DLG_AUTO`）----
+        if (m_dlgAutoSec > 0.0f) {
+            m_dlgAutoTimer += vdt;
+            if (m_dlgAutoTimer >= m_dlgAutoSec) {
+                m_dlgAutoTimer = 0.0f;
+                const dialogue::DialoguePlayer* p = dlg.activePlayer(activeScene());
+                if (p) {
+                    // 有选项 → 选第一个（`pressAdvance` 在选项上会一直返回
+                    // NeedChoice，不另开一条路就永远卡住）。
+                    if (p->atChoice() && p->fullyRevealed())
+                        dlg.choose(activeScene(), 0);
+                    else
+                        dlg.pressAdvance(activeScene());
+                }
+            }
+        }
+
+        // 对话期间把跳跃挡掉：字幕推进也用 Space（= `Jump`），而
+        // `wasPressed` 是边沿查询不是消费 —— 不挡的话"按空格翻页"会顺带
+        // 起跳一次（见 PlayerController::setJumpBlocked）。
+        if (m_player)
+            m_player->setJumpBlocked(dlg.active(activeScene()));
     };
     m_svc.renderWorld = [this] {
         m_renderedWorldThisFrame = true;
@@ -609,6 +733,25 @@ void RuntimeApp::onInit() {
         if (loadUiConfig(p, &uc)) m_hud.setConfig(uc);
     }
 
+    // ---- UI 文档（#312）----
+    //
+    // 只在配置指定了 `.ui.json` 时才读。读失败**不阻止启动**（同场景加载：
+    // 窗口照开、日志说清楚原因）—— 但也不静默降级成"硬编码 HUD"，因为
+    // 那会让作者以为"我的文档没被用上，是因为文档不生效"，而不是"路径错了"。
+    if (!m_cfg.uiDoc.empty()) {
+        if (ui2::loadUiDocument(m_cfg.uiDoc, m_uiDoc)) {
+            VK_LOG_INFO("UIDOC-LOAD path=%s ok=1 widgets=%d name=%s ref=%dx%d",
+                        m_cfg.uiDoc.c_str(),
+                        ui2::countWidgets(m_uiDoc.widgets),
+                        m_uiDoc.name.c_str(), m_uiDoc.refW, m_uiDoc.refH);
+            for (const auto& w : m_uiDoc.warnings)
+                VK_LOG_WARN("UIDOC-WARN %s", w.c_str());
+        } else {
+            VK_LOG_ERROR("UIDOC-LOAD path=%s ok=0 err=%s", m_cfg.uiDoc.c_str(),
+                         m_uiDoc.error.c_str());
+        }
+    }
+
     // ---- 游戏 UI 的绘制挂点（U6/U8）----
     // `engine` 不认识 `runtime`（分层是 runtime → engine），所以由这里把
     // "画什么"注进去。回调在 Post 输出 pass 内、ImGui 之前被调用。
@@ -625,7 +768,76 @@ void RuntimeApp::onInit() {
             cam.viewMatrix();
         m_hud.build(c, m_hudModel, vp, w, h, ui2::frameFont());
 
-        // ② 暂停菜单盖在最上面
+        // ①b UI 文档（#312）—— 在 HUD 之后、字幕之前。
+        //
+        // 顺序的理由：文档是"这个游戏自己的界面层"（美术摆的面板/文本/按钮），
+        // 它该盖住引擎的调试 HUD（血条那一套是兜底）；而对话框与暂停菜单
+        // 是**交互层**，永远压在它上面（否则文档里一个满屏面板会把菜单吞掉）。
+        if (m_uiDoc.valid) {
+            buildUiBindings();
+            const ui2::UiDocDrawStats docStats =
+                ui2::drawDocument(c, m_uiDoc, m_uiBindings, w, h,
+                                  ui2::frameFont());
+            // 锚点节流：**第 1 帧** + 之后每 60 帧一行 `UIDOC-BOUNDS` 加一行
+            // `UIDOC-STATS`。
+            //
+            // 为什么非要有第 1 帧那一次：验收脚本要量"绑定随时间变化"，而
+            // 第 60 帧往往**正好**是脚本扣血的那一帧（hud_damage.vks 就是
+            // `frame == 60`）。只在 60 的整数倍打，拿到的样本全在扣血之后，
+            // 血条 fill 一条直线 —— 明明绑对了也证明不了，看起来像绑定没通。
+            // 第 1 帧一定是"满血"，和后面一对比，变化才看得见。
+            if (++m_uiDocFrames == 1 || m_uiDocFrames % 60 == 0) {
+                const auto placed = ui2::placeDocument(m_uiDoc, m_uiBindings, w, h);
+                for (const auto& p : placed) {
+                    VK_LOG_INFO("UIDOC-BOUNDS id=%s type=%s x=%.1f y=%.1f "
+                                "w=%.1f h=%.1f fill=%.1f",
+                                p.id.c_str(), ui2::typeName(p.type),
+                                static_cast<double>(p.rect.x),
+                                static_cast<double>(p.rect.y),
+                                static_cast<double>(p.rect.w),
+                                static_cast<double>(p.rect.h),
+                                static_cast<double>(p.fill.w));
+                }
+                // `drawn` 用 drawDocument 真返回的数，别写死 1 —— 写死之后
+                // 这份日志只能证明"进了绘制函数"，证明不了"画了几个"。
+                VK_LOG_INFO("UIDOC-STATS widgets=%d drawn=%d skipped=%d "
+                            "texts=%d out=%ux%u bindings=%d",
+                            static_cast<int>(placed.size()),
+                            docStats.widgets, docStats.skipped, docStats.texts,
+                            w, h,
+                            static_cast<int>(m_uiBindings.numbers.size()));
+            }
+        }
+
+        // ② 字幕框（C2）—— 在 HUD 之后、暂停菜单之前。
+        //    顺序有讲究：对话框要盖住血条（左下角会重叠），但暂停菜单要盖住
+        //    对话框（暂停时对话还在，不该压在菜单上面）。
+        const dialogue::DialogueSystem& dlgSys = dialogue::activeDialogueSystem();
+        if (const dialogue::DialoguePlayer* p = dlgSys.activePlayer(activeScene())) {
+            SubtitleModel sm;
+            sm.visible = true;
+            sm.id = p->currentId();
+            if (const dialogue::DlgNode* n = p->current()) {
+                sm.speaker = n->speaker;
+                sm.text = p->shownText();
+                sm.totalChars = p->lineChars();
+                sm.shownChars = p->revealed();
+                sm.typing = !p->fullyRevealed();
+                // ⚠ 选项**等正文出完才显示**：一边打字一边把选项摆出来，
+                //   玩家会先看到按钮再读到问题，而"按空格"到底是"补完
+                //   文字"还是"选第一个"就说不清了。
+                sm.atChoice = p->atChoice() && p->fullyRevealed();
+                if (sm.atChoice) {
+                    sm.focus = m_dlgFocus;
+                    sm.choices.reserve(n->choices.size());
+                    for (const dialogue::DlgChoice& ch : n->choices)
+                        sm.choices.push_back(ch.text);
+                }
+            }
+            m_subtitle.build(c, sm, w, h, ui2::frameFont());
+        }
+
+        // ③ 暂停菜单盖在最上面
         if (m_lastUiState > 0)
             m_pause.build(c, w, h, ui2::frameFont(), m_focus.focusId());
     });
@@ -633,6 +845,32 @@ void RuntimeApp::onInit() {
     VK_LOG_INFO("GAME-INIT ready — state=%s entities=%zu bodies=%d scripts=%zu",
                 m_stateStack.topName(), activeScene().world().entityCount(),
                 m_binding.bodies, m_scripts->scriptCount());
+}
+
+// ---------------------------------------------------------------- UI 文档绑定
+//
+// 谁往绑定表里填：**宿主**。脚本 `setHealth` / `setFlag` 改的是 HudModel 与
+// GameFlags，这里每帧把它们抄成"字符串 → 数"的一张表，`UiDocument` 只读。
+// 于是 UI 不认识脚本引擎、不认识 ECS —— 而"脚本变量能驱动界面文本"这件事
+// 成立（`{affection}` 就是脚本里那个旗标）。
+//
+// ⚠ 每帧重建而不是增量维护：旗标可能被脚本**删掉**（`clear()`），增量维护
+//   会留下"上一个场景的旗标还在界面上"；而这张表只有几十项，重建的代价
+//   与一次 `std::map` 遍历同量级。
+void RuntimeApp::buildUiBindings() {
+    m_uiBindings.clear();
+    for (const auto& kv : m_flags.entries())
+        m_uiBindings.setNumber(kv.first, static_cast<float>(kv.second));
+
+    // 保留名放最后 = **HUD 口径优先**：旗标里也可以叫 `health`（某些玩法会这么
+    // 写），但界面上的 `{health}` 必须是血条那个数 —— 否则血条与数字不一致，
+    // 而这种不一致只在"某个脚本恰好设了同名旗标"时出现，几乎查不到。
+    m_uiBindings.setNumber("health", m_hudModel.health);
+    m_uiBindings.setNumber("maxHealth", m_hudModel.maxHealth);
+    m_uiBindings.setNumber("healthShown", m_hudModel.healthShown);
+    m_uiBindings.setNumber("healthRatio", m_hudModel.healthRatio());
+    m_uiBindings.setNumber("ammo", static_cast<float>(m_hudModel.ammo));
+    m_uiBindings.setText("hint", m_hudModel.hint);
 }
 
 void RuntimeApp::loadStartScene() {
@@ -669,8 +907,198 @@ void RuntimeApp::loadStartScene() {
     }
 }
 
-void RuntimeApp::buildPhysics() {
-    // 与编辑器**同一份**绑定逻辑（engine/physics/ScenePhysics.cpp）——
+// ---------------------------------------------------------------- 世界控制
+// （C6 第二批：`spawn` / `loadScene` / 剧情旗标）
+
+bool RuntimeApp::requestSceneSwitch(const std::string& relPath) {
+    if (relPath.empty()) {
+        VK_LOG_WARN("RUNTIME-SCENE-REQ rejected reason=empty-path");
+        return false;
+    }
+    const std::string resolved = assets::resolveAssetPath(relPath);
+
+    // 先验"能打开"。理由不是怕 `loadScene` 崩，而是**怕受理一个注定失败的
+    // 请求**：受理了就得等下一帧才知道失败，而那一刻旧世界已经被清掉了
+    // （`loadSceneFromJson` 第一件事就是 `scene.clear()`）。脚本那边看到的
+    // 现象是"`loadScene` 返回了 true，然后屏幕黑了" —— 最难查的一类。
+    // 在这里挡掉，拼错路径当场报错、旧场景原地不动。
+    {
+        std::ifstream probe(resolved, std::ios::binary);
+        if (!probe.good()) {
+            VK_LOG_WARN("RUNTIME-SCENE-REQ rejected path=%s reason=cannot-open "
+                        "(nothing was scheduled)",
+                        resolved.c_str());
+            return false;
+        }
+    }
+
+    // 同一帧内连叫两次：后说的算（"先切 A 再切 B"的结果只该是 B）。
+    // 留一行 INFO 是因为"我明明写了切 A"这类困惑必须有据可查。
+    if (!m_pendingScenePath.empty() && m_pendingScenePath != relPath) {
+        VK_LOG_INFO("RUNTIME-SCENE-REQ superseded old='%s' new='%s'",
+                    m_pendingScenePath.c_str(), relPath.c_str());
+    } else {
+        VK_LOG_INFO("RUNTIME-SCENE-REQ path=%s (applies at the next frame start)",
+                    resolved.c_str());
+    }
+    m_pendingScenePath = relPath;
+    return true;
+}
+
+void RuntimeApp::applyPendingSceneSwitch() {
+    if (m_pendingScenePath.empty()) return;
+    const std::string rel = m_pendingScenePath;
+    m_pendingScenePath.clear();
+    const std::string resolved = assets::resolveAssetPath(rel);
+
+    // ① 先让"函数内静态单例"撒手。这两个系统各自持有一个**指向旧世界实体**
+    //    的播放器；不 reset 的话，换场景后它们会继续 tick 一个已经不存在的
+    //    实体（表现：字幕/运镜卡在上一关的最后一帧，而且点不动）。
+    //    ⚠ 顺序：**先**这两个，再动场景。反过来的话 reset 里读场景就已经
+    //      在新世界上了。
+    sequence::activeSequencerSystem().resetRuntime(activeScene());
+    dialogue::activeDialogueSystem().resetRuntime(activeScene());
+
+    // ② 玩家控制器握着实体句柄 + 物理世界指针，必须在新世界建好之前放掉。
+    if (m_player) {
+        m_player->detach();
+        m_player.reset();
+    }
+
+    // ③ 3D 声源跟着旧世界一起没了，先掐掉（2D 音效/音乐不停：那是"整局"
+    //    的声音，换关卡把 BGM 打断才是 bug）。
+    m_audio.stopAll();
+
+    // ④ 剧情旗标**不清**。换场景要留着 —— 那正是分支的用法。
+    //    只有"新游戏"才清，那是将来 New Game 按钮的事。
+
+    const scene::SceneIoResult r =
+        scene::loadScene(activeScene(), assets(), resolved);
+    if (!r.ok) {
+        // 打开成功但解析失败：`loadSceneFromJson` 已经 `clear()` 过了，
+        // 只剩一个空世界。这时**必须**把话说清楚 —— 空世界 + 一句 ERROR
+        // 至少能查；换成静默的话就是"换了关之后什么都没有"。
+        VK_LOG_ERROR("RUNTIME-SCENE-SWITCH failed path=%s error=%s "
+                     "(the world is now empty)",
+                     resolved.c_str(), r.error.c_str());
+        return;
+    }
+
+    // ⑤ 与 `onInit` 同一套重建：物理 → 脚本 → 出生点 → 玩家接管。
+    buildPhysics();
+    preloadScripts();   // 内部先 `clear()`，所以旧实例不会带着旧实体活着
+    spawnPlayerFromGameStart(activeScene(), assets(), m_cfg.player,
+                             m_binding.world ? m_binding.world->heightfield()
+                                             : nullptr);
+    m_player = std::make_unique<PlayerController>(m_input);
+    const bool attached =
+        m_player->attach(activeScene(), m_binding.world.get());
+    if (attached) {
+        activeScene().camera().setUseGlobalInput(false);
+    } else {
+        // 新场景没有角色控制器是**合法**的（菜单场景 / 纯过场场景）。
+        // 但不能静默：日志里要看得出"这一关没有玩家"。
+        m_player.reset();
+    }
+
+    ++m_sceneSwitches;
+    VK_LOG_INFO("RUNTIME-SCENE-SWITCH path=%s entities=%d skipped=%d "
+                "bodies=%d scripts=%zu player=%d count=%d",
+                resolved.c_str(), r.entities, r.skipped, m_binding.bodies,
+                m_scripts ? m_scripts->scriptCount() : 0, attached ? 1 : 0,
+                m_sceneSwitches);
+}
+
+ecs::Entity RuntimeApp::spawnModelEntity(const std::string& relPath,
+                                         glm::vec3 pos) {
+    if (relPath.empty()) {
+        VK_LOG_WARN("RUNTIME-SPAWN-FAIL reason=empty-path");
+        return ecs::Entity{};
+    }
+    const std::string resolved = assets::resolveAssetPath(relPath);
+    try {
+        // ---- .obj：单网格（与编辑器拖放同一条分派）----
+        if (assets::isObjPath(relPath)) {
+            assets::Mesh* mesh = assets().loadModel(resolved, relPath);
+            if (!mesh || !mesh->valid()) {
+                VK_LOG_WARN("RUNTIME-SPAWN-FAIL path=%s reason=mesh-load",
+                            relPath.c_str());
+                return ecs::Entity{};
+            }
+            const ecs::Entity e = activeScene().createObject(relPath);
+            ecs::World& w = activeScene().world();
+            if (auto* t = w.get<ecs::TransformComponent>(e)) t->position = pos;
+            ecs::MeshComponent mc;
+            mc.mesh = mesh;   // params 留 None：几何由文件决定
+            w.add<ecs::MeshComponent>(e, mc);
+            // ⚠ OBJ 不带材质（格式里就没有）。不给的话渲染层拿到的是空
+            //   MaterialComponent —— 那等于**看不见**。这里给一块中性灰，
+            //   与编辑器 `paletteMaterial(..., "editor_obj_default")` 同一个
+            //   意思（同一个资产名，两边颜色不会漂）。
+            uint8_t c[4] = {190, 190, 195, 255};
+            assets::Material* mat = assets().makeMaterial(
+                "editor_obj_default", assets().solid("editor_obj_default_tex", c),
+                glm::vec4(1.0f), 0.6f, 0.0f);
+            w.add<ecs::MaterialComponent>(e, ecs::MaterialComponent{mat});
+            VK_LOG_INFO("RUNTIME-SPAWN entity=%u path=%s pos=(%.2f,%.2f,%.2f) "
+                        "skinned=0",
+                        e.id, relPath.c_str(), static_cast<double>(pos.x),
+                        static_cast<double>(pos.y), static_cast<double>(pos.z));
+            return e;
+        }
+
+        // ---- 其余按 FBX / glTF 分派（两者都产出 Model + SubMesh）----
+        assets::Model* model = assets::isFbxPath(relPath)
+                                   ? assets().loadFBX(resolved, relPath)
+                                   : assets().loadGLTF(resolved, relPath);
+        if (!model || !model->valid()) {
+            VK_LOG_WARN("RUNTIME-SPAWN-FAIL path=%s reason=model-load",
+                        relPath.c_str());
+            return ecs::Entity{};
+        }
+        scene::ModelInstanceOptions opt;
+        opt.subNameSuffix = "_spawn";
+        opt.position = pos;
+        // 实体名取文件名主干（`models/slime.vmesh` → `slime`），而不是整条
+        // 路径：Hierarchy / 日志里出现 `models/slime.vmesh` 这种名字没法看。
+        // ⚠ 不做**唯一化**（编辑器那边有 `uniqueRootName`）：刷十只史莱姆
+        //   就该叫十次 `slime`，玩家在场景里本来就是这么理解的。
+        {
+            std::string stem = relPath;
+            const size_t slash = stem.find_last_of("/\\");
+            if (slash != std::string::npos) stem = stem.substr(slash + 1);
+            const size_t dot = stem.find_last_of('.');
+            if (dot != std::string::npos) stem = stem.substr(0, dot);
+            opt.rootName = stem.empty() ? std::string("Spawned") : stem;
+        }
+        opt.autoPlay = true;
+        opt.sourcePath = relPath;    // 打开 MODEL-INSTANCE 锚点
+        // ⚠ `dropToGround` **关着**：spawn 的位置是**调用方给的世界坐标**，
+        //   不是"请把脚放地上"。刷一个悬空的宝箱是正常需求，自动落地会
+        //   让"我在天上刷了一只鸟"变成"地上多了一只鸟"。
+        const scene::ModelInstanceResult inst =
+            scene::instantiateModel(activeScene(), model, opt);
+        if (!inst.root.valid()) {
+            VK_LOG_WARN("RUNTIME-SPAWN-FAIL path=%s reason=instantiate",
+                        relPath.c_str());
+            return ecs::Entity{};
+        }
+        VK_LOG_INFO("RUNTIME-SPAWN entity=%u path=%s pos=(%.2f,%.2f,%.2f) "
+                    "skinned=%d joints=%d meshes=%zu",
+                    inst.root.id, relPath.c_str(), static_cast<double>(pos.x),
+                    static_cast<double>(pos.y), static_cast<double>(pos.z),
+                    inst.skinned ? 1 : 0, inst.joints, inst.entities.size());
+        return inst.root;
+    } catch (const std::exception& ex) {
+        // 加载器会抛（坏文件 / 不支持的版本）。这一层必须兜住：脚本的
+        // 一条 `spawn()` 不该把整局游戏带走。
+        VK_LOG_WARN("RUNTIME-SPAWN-FAIL path=%s reason=exception what=%s",
+                    relPath.c_str(), ex.what());
+        return ecs::Entity{};
+    }
+}
+
+void RuntimeApp::buildPhysics() {    // 与编辑器**同一份**绑定逻辑（engine/physics/ScenePhysics.cpp）——
     // 这是"编辑器里调好的手感，出包一样"的结构保证。
     m_binding = physics::buildSceneWorld(activeScene());
     if (!m_binding.enabled) {
@@ -705,6 +1133,15 @@ void RuntimeApp::preloadScripts() {
 void RuntimeApp::onUpdate(float dt) {
     // 时间缩放的权威在服务面（状态可以改它，M3 的子弹时间就靠这个）
     m_loop.config().timeScale = m_svc.timeScale;
+
+    // ---- 待执行的换场景请求（C6 第二批）----
+    // ⚠ **必须是这一帧的第一件事**，理由有两条：
+    //   ① 上一帧的脚本可能在 tick 里叫了 `loadScene`，此刻没有任何人
+    //      在遍历世界 —— 销毁它是安全的；
+    //   ② 放在渲染/输入之后会让"新场景的第一帧"混进旧场景的输入与相机状态
+    //      （表现是换关瞬间镜头闪一下上一个位置）。
+    // 没请求时它是一条 if + 空字符串判断，代价可忽略。
+    applyPendingSceneSwitch();
 
     // 失焦降频：GLFW 没有"焦点变化"以外更便宜的做法，每帧读一次窗口属性
     // 就是最省的（`glfwGetWindowAttrib` 是纯状态查询，不触发任何系统调用）。
@@ -952,6 +1389,38 @@ void RuntimeApp::tickUi(float dt) {
     // ---- ③ 没有菜单 → UI 不吃任何输入 ----
     if (!paused) {
         m_svc.uiAction.clear();
+
+        // ---- 对话输入（C2）----
+        // ⚠ 只在这一支里处理：暂停时 Space 是菜单确认键，两条路各吃一次
+        //   按下会出现"在暂停菜单里选掉了一个对白选项"。
+        dialogue::DialogueSystem& dlg = dialogue::activeDialogueSystem();
+        if (const dialogue::DialoguePlayer* p = dlg.activePlayer(activeScene())) {
+            // 换行 → 焦点复位（见 RuntimeApp.h 的 m_dlgFocusId 说明）
+            if (p->currentId() != m_dlgFocusId) {
+                m_dlgFocusId = p->currentId();
+                m_dlgFocus = 0;
+            }
+            const bool atChoice = p->atChoice() && p->fullyRevealed();
+            if (atChoice) {
+                // 方向键**不进 InputMap**：它不是玩法动作（重绑没有意义），
+                // 而且 Menu 上下已经用 Up/Down 了，两处共用一个物理键才一致。
+                // ⚠ 刻意**不**用 W/S：那是移动键，同一个物理键既是"后退"
+                //   又是"选下一项"，在选项上按一下会连人一起往后退。
+                const int n = p->choiceCount();
+                if (core::Input::keyPressed(GLFW_KEY_UP))
+                    m_dlgFocus = (m_dlgFocus + n - 1) % n;
+                if (core::Input::keyPressed(GLFW_KEY_DOWN))
+                    m_dlgFocus = (m_dlgFocus + 1) % n;
+                if (m_dlgFocus < 0 || m_dlgFocus >= n) m_dlgFocus = 0;
+            }
+            if (m_input.wasPressed("Jump")) {
+                if (atChoice)
+                    dlg.choose(activeScene(), m_dlgFocus);
+                else
+                    dlg.pressAdvance(activeScene());   // 两段式：先补完再翻页
+            }
+        }
+
         // HUD 一直有内容（血条 + 准星），所以这条恒为 true。
         // `ui.enabled=0` 的守卫不在这里 —— 在 Renderer：通道没建就根本
         // 不会走到 buildOverlay（逐位不变的保证在那儿）。
@@ -1253,6 +1722,49 @@ void RuntimeApp::installScriptServices() {
     svc.act.held = [this](const std::string& a) { return m_input.isHeld(a); };
     svc.act.released = [this](const std::string& a) { return m_input.wasReleased(a); };
     svc.act.axis = [this](const std::string& a) { return m_input.axis(a); };
+
+    // ---- 演出（C6 导演 API）----
+    //
+    // 三件都直接落到引擎里"函数内静态单例"上 —— 一个场景只该有一个播放头
+    // （`activeSequencerSystem()` / `activeDialogueSystem()` 就是为这个存在
+    // 的），所以宿主不自己持有第二份。
+    svc.act.playSequence = [this](const std::string& path) {
+        return sequence::activeSequencerSystem().cue(activeScene(), path);
+    };
+    svc.act.showDialogue = [this](const std::string& id) {
+        // 宿主取玩家实体：它是"谁在说话"的默认宿主。没有玩家时传无效句柄
+        // —— 对话本来就不依赖宿主（DLG-START 里 host=0 一样能读）。
+        const ecs::Entity host = m_player ? m_player->entity() : ecs::Entity{};
+        return dialogue::activeDialogueSystem().cue(activeScene(), host, id);
+    };
+    svc.act.playAnim = [this](ecs::Entity e, const std::string& clip) {
+        return switchAnimClip(activeScene(), e, clip);
+    };
+
+    // ---- 世界控制（C6 第二批）----
+    //
+    // 旗标：直接从宿主自己的表上读写。`RUNTIME-FLAG` 只在**写**时打一行
+    // （读太频繁，每帧打会把日志淹掉）；坏情况是"脚本设的键名拼错、
+    // 另一处读不到"，而那条线索正好在这行里。
+    svc.act.setFlag = [this](const std::string& name, double v) {
+        m_flags.set(name, v);
+        VK_LOG_INFO("RUNTIME-FLAG set name=%s value=%.4f total=%zu",
+                    name.c_str(), v, m_flags.size());
+        return true;
+    };
+    svc.act.getFlag = [this](const std::string& name) {
+        return m_flags.get(name);
+    };
+    // 刷实体：**当场**建（不是排队）。理由见 `spawn()` 的脚本侧注释：
+    // 返回值要能立刻用。ECS 容器允许在 `each` 之外追加实体，而
+    // `ScriptRuntime::tick` 遍历的是它自己的实例表（`m_instances`），
+    // 不是在遍历 `each<ScriptComponent>` —— 所以这一刻追加是安全的。
+    svc.act.spawn = [this](const std::string& path, glm::vec3 pos) {
+        return spawnModelEntity(path, pos);
+    };
+    svc.act.loadScene = [this](const std::string& path) {
+        return requestSceneSwitch(path);
+    };
 
     m_scriptRuntime->setServices(std::move(svc));
 

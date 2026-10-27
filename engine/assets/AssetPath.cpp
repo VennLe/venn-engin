@@ -95,4 +95,31 @@ std::string makeAssetRelative(const std::string& path) {
     return fs::path(path).generic_string();
 }
 
+// ---------------------------------------------------------------- 路径类型
+//
+// ⚠ 大小写不敏感（`std::tolower` 逐字符比）：`.FBX` / `.Fbx` / `.fbx` 都是
+//   FBX。资源商店的包里三种写法都出现过，按字节比会漏掉一半。
+// ⚠ 用后缀比而不是 `fs::path::extension()`：后者对 `a.b/c` 这类没有扩展名
+//   的路径返回空串是**对的**，但它不处理大小写，还要多一次构造。
+namespace {
+
+bool hasSuffixCI(const std::string& s, const char* suffix) {
+    const size_t n = std::char_traits<char>::length(suffix);
+    if (s.size() < n) return false;
+    for (size_t i = 0; i < n; ++i) {
+        char a = s[s.size() - n + i];
+        char b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool isObjPath(const std::string& p) { return hasSuffixCI(p, ".obj"); }
+bool isFbxPath(const std::string& p) { return hasSuffixCI(p, ".fbx"); }
+
 } // namespace assets
+

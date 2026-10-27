@@ -3,10 +3,12 @@
 #include "DebugRects.h"
 #include "EditorContext.h"
 #include "Localization.h"
+#include "MultiEditMath.h"
 
 #include "core/Logger.h"
 #include "ecs/Components.h"
 #include "scene/Camera.h"
+#include "scene/Prefab.h"
 #include "scene/Scene.h"
 
 #include <imgui.h>
@@ -505,6 +507,75 @@ void GizmoController::beginDrag(EditorContext& ctx, scene::Scene& scene,
     m_dragging = true;
     m_dragHandles = m_hover;
 
+    // ---- 目标表（多选，2026-10-27 #316）----
+    //
+    // 三条过滤，每条都对应一个具体的"否则会出怪现象"：
+    //   ① 没有 Transform 的跳过 —— 没东西可写。
+    //   ② 上锁的跳过（自带地面）—— 它在视口里连点都点不到，批量拖拽把它
+    //      一起挪走属于"我没碰它它却动了"。
+    //   ③ **祖先也在集合里的跳过** —— 父节点动，子节点跟着动（Hierarchy
+    //      已经保证了这一点）。如果子节点也进目标表，它会**动两次**：
+    //      一次被父节点带着，一次被自己写进去。这个 bug 的现象是"批量拖
+    //      带层级的一堆物体时，子物体飞得比父物体远"，很难联想到是这里。
+    m_targets.clear();
+    if (!m_onCollider) {
+        const std::vector<ecs::Entity>& sel = ctx.selectionSet();
+        auto hasSelectedAncestor = [&](ecs::Entity x) {
+            const ecs::World& w = scene.world();
+            ecs::Entity cur = x;
+            for (int depth = 0; depth < 64; ++depth) {
+                const auto* h = w.get<ecs::HierarchyComponent>(cur);
+                if (!h || h->parent == ecs::kInvalidEntity) return false;
+                cur = w.handle(h->parent);
+                if (!cur.valid()) return false;
+                for (ecs::Entity s : sel)
+                    if (s.id == cur.id) return true;
+            }
+            return false;
+        };
+        for (ecs::Entity s : sel) {
+            if (!scene.world().alive(s)) continue;
+            if (!scene.world().has<ecs::TransformComponent>(s)) continue;
+            if (scene.world().has<ecs::LockedComponent>(s)) continue;
+            if (s.id != e.id && hasSelectedAncestor(s)) continue;
+
+            Target t;
+            t.entity = s;
+            t.before = TransformSnapshot::capture(scene, s);
+            const glm::mat4 wm = scene.worldMatrix(s);
+            t.startWorldPos = glm::vec3(wm[3]);
+            extractBasisXform(wm, /*local=*/true, t.localAxes);
+            if (const auto* h = scene.world().get<ecs::HierarchyComponent>(s)) {
+                if (h->parent != ecs::kInvalidEntity) {
+                    const ecs::Entity pe = scene.world().handle(h->parent);
+                    if (pe.valid()) {
+                        t.parentWorld = scene.worldMatrix(pe);
+                        t.hasParent = true;
+                    }
+                }
+            }
+            m_targets.push_back(t);
+        }
+        // 主选中项必须排在第一个：手柄的轴、读数、撤销后的选中都以它为准
+        // （集合里是 Ctrl 点击顺序，主选中项不一定是第一个）。
+        for (std::size_t i = 1; i < m_targets.size(); ++i) {
+            if (m_targets[i].entity.id == e.id) {
+                std::swap(m_targets[0], m_targets[i]);
+                break;
+            }
+        }
+    }
+    if (m_targets.empty()) {
+        // 集合为空 / 参选的都被过滤掉了 → 退化成"只动主选中项"。
+        Target t;
+        t.entity = e;
+        t.before = m_before;
+        const glm::mat4 wm = targetWorld(scene, e);
+        t.startWorldPos = glm::vec3(wm[3]);
+        extractBasisXform(wm, /*local=*/true, t.localAxes);
+        m_targets.push_back(t);
+    }
+
     // ---- 冻结参考线（本次拖拽全程只认这份快照）----
     // 为什么不能直接用每帧更新的 m_origin：物体自己走过的位移会在下一帧
     // 被重新算进"鼠标沿轴的参数"里 → D_new = Δ + D_old，正反馈，越拖越快。
@@ -573,6 +644,161 @@ void GizmoController::beginDrag(EditorContext& ctx, scene::Scene& scene,
                 targetName());
 }
 
+// ---------------------------------------------------------------- 多选分发
+//
+// 三个 apply*ToTargets 的分工：**数学在这里，读写在这里，也算"写给谁"**。
+// applyDrag 只负责算出"这一次拖了多少"（世界位移 / 统一倍率 / 旋转增量），
+// 然后交给这里发到 1~N 个目标上。
+//
+// ⚠ 单选（含碰撞体编辑）那条分支是**原样搬过来的旧代码**，一个字都没改：
+//   多选是新功能，不应该让既有行为产生哪怕 1e-7 的偏移（像素级回归对比
+//   就靠这个）。多选走的是下面那个循环。
+
+namespace {
+
+// 世界位移 → 父空间位移：把父链的旋转/缩放抵消掉
+glm::vec3 toLocalDelta(const glm::mat4& parentWorld, const glm::vec3& worldDelta) {
+    const glm::mat3 pm(parentWorld);
+    const float det = glm::determinant(pm);
+    if (std::fabs(det) <= 1e-8f) return worldDelta;
+    return glm::inverse(pm) * worldDelta;
+}
+
+} // namespace
+
+void GizmoController::applyTranslateToTargets(scene::Scene& scene,
+                                             const TrsPointers& tp,
+                                             const glm::vec3& worldDelta) {
+    if (m_targets.size() <= 1) {
+        glm::vec3 localDelta = worldDelta;
+        if (const auto* h =
+                scene.world().get<ecs::HierarchyComponent>(m_entity)) {
+            if (h->parent != ecs::kInvalidEntity) {
+                const ecs::Entity pe = scene.world().handle(h->parent);
+                localDelta = toLocalDelta(scene.worldMatrix(pe), worldDelta);
+            }
+        }
+        *tp.pos = m_startPos + localDelta;
+        return;
+    }
+
+    for (const Target& t : m_targets) {
+        auto* tt = scene.world().get<ecs::TransformComponent>(t.entity);
+        if (!tt) continue;
+        // 每个目标用自己的父矩阵换算：多选里有的在根下、有的挂在一个
+        // 转过 90° 的父节点下，用同一个局部位移会让它们朝不同方向走。
+        const glm::vec3 d =
+            t.hasParent ? toLocalDelta(t.parentWorld, worldDelta) : worldDelta;
+        tt->position = t.before.position + d;
+    }
+}
+
+// ---- 拖拽方向 → 局部轴的缩放权重 ----
+//
+// 这里是用户报的"拖 Y 却在 Z 方向拉伸"的根因所在。
+//
+// 手柄拖的是**世界**里的某一根轴（世界空间下就是世界轴本身），
+// 而 TransformComponent::scale 是**局部**的（M = T·R·S）——
+// 它作用在物体自己的三根轴上。物体一转，两套轴就不再重合：
+//   物体绕 X 转 +90° 后，它的局部 Y 正指着世界的 Z。
+//   于是"拖绿轴（世界 Y）"写进 scale.y，物体却沿着世界 Z 长；
+//   "拖蓝轴（世界 Z）"写进 scale.z=局部 Z=世界 -Y，又朝着 Y 长。
+// 表现就是两根轴"换了位置"。
+//
+// 正确做法：把拖拽方向投影到物体的三根**局部**轴上，按投影强度
+// 分配缩放量。轴对齐时（绝大多数情况、也是旧代码唯一做对的情况）
+// 投影恰好是 0/1，公式退化成"只改对得上那一维"，与旧行为一致；
+// 物体转过之后则自动落到真正对得上的那一维上。
+//
+// ⚠ 多选时**每个目标各算一遍权重**（这是多选唯一必须重算的东西）：
+//   一批物体朝向不同，同一次"沿世界 X 拖"对各目标意味着不同的局部维。
+//   用主选中项的权重套到别人身上，转过 90° 的那个会在**另一个方向**上
+//   变胖 —— 而且它变完还是"物体没动、形状变了"，很像拾取错了目标。
+void GizmoController::applyScaleToTargets(scene::Scene& scene,
+                                          const TrsPointers& tp, float factor,
+                                          int axisIdx, int planeN) {
+    // 权重：axisIdx >= 0 是单轴，planeN >= 0 是平面（两根腿加一起），
+    // 都不是 = 屏幕手柄（等比，与朝向无关）。
+    const auto weightsFor = [&](const glm::vec3 axesLocal[3], glm::vec3& w) {
+        w = glm::vec3(0.0f);
+        if (axisIdx >= 0) {
+            for (int i = 0; i < 3; ++i)
+                w[i] = std::fabs(glm::dot(m_dragAxis, axesLocal[i]));
+        } else if (planeN >= 0) {
+            for (int i = 0; i < 3; ++i)
+                w[i] = std::fabs(glm::dot(m_dragU, axesLocal[i])) +
+                       std::fabs(glm::dot(m_dragV, axesLocal[i]));
+        }
+    };
+
+    if (m_targets.size() <= 1) {
+        glm::vec3 sc = m_startScale;
+        if (axisIdx >= 0 || planeN >= 0) {
+            glm::vec3 w;
+            weightsFor(m_dragLocalAxes, w);
+            for (int i = 0; i < 3; ++i)
+                sc[i] = m_startScale[i] * (1.0f + (factor - 1.0f) * w[i]);
+        } else {
+            sc = m_startScale * factor;   // 整体等比：与朝向无关
+        }
+        *tp.scale = sc;
+        return;
+    }
+
+    for (const Target& t : m_targets) {
+        auto* tt = scene.world().get<ecs::TransformComponent>(t.entity);
+        if (!tt) continue;
+        if (axisIdx < 0 && planeN < 0) {
+            tt->scale = t.before.scale * factor;
+            continue;
+        }
+        glm::vec3 w;
+        weightsFor(t.localAxes, w);
+        for (int i = 0; i < 3; ++i)
+            tt->scale[i] = t.before.scale[i] * (1.0f + (factor - 1.0f) * w[i]);
+    }
+}
+
+// ---- 旋转 ----
+//
+// 单选：与引入多选之前逐位一致（起始姿态 * 增量）。
+// 多选：**绕支点转** —— 位置和朝向一起转。
+//   只转朝向不转位置的后果是"每个物体在各自原地转身"，彼此的相对布局
+//   一点没变，用户看到的是"转了，但看起来像没转"（如果物体是球体，那
+//   就是完全没变化）。UE / Blender 都是绕支点。
+//
+// ⚠ 缩放**不**绕支点（与旋转不同）。两件事的不对称是有意的：
+//   旋转只有**一个**矩阵 D，所有目标共用它，绕支点的位置换算无歧义；
+//   缩放按"每目标自己的局部轴"分配权重，一批朝向不同的物体根本没有
+//   共同的缩放基 —— 硬凑一个只会得到"物体一边各自变形、一边彼此漂开"。
+//   所以多选缩放是"各自绕自己中心变大变小"，位置不动。这条写进验收。
+void GizmoController::applyRotateToTargets(scene::Scene& scene,
+                                           const TrsPointers& tp,
+                                           const glm::mat3& D, bool worldApply) {
+    if (m_targets.size() <= 1) {
+        const glm::mat3 R0 = rotationFromEuler(m_startRot);
+        *tp.rot = eulerFromRotation(worldApply ? (D * R0) : (R0 * D));
+        return;
+    }
+
+    const glm::vec3 pivot = m_dragOrigin;   // = 多选时的包围盒中心（见 update）
+    for (const Target& t : m_targets) {
+        auto* tt = scene.world().get<ecs::TransformComponent>(t.entity);
+        if (!tt) continue;
+        const glm::mat3 R0 = rotationFromEuler(t.before.rotation);
+        tt->rotation = eulerFromRotation(worldApply ? (D * R0) : (R0 * D));
+
+        // 位置绕支点转：世界 → 父空间的换算用**按下时冻结**的父矩阵。
+        const glm::vec3 wp = orbitPosition(t.startWorldPos, pivot, D);
+        if (t.hasParent) {
+            const glm::mat4 inv = glm::inverse(t.parentWorld);
+            tt->position = glm::vec3(inv * glm::vec4(wp, 1.0f));
+        } else {
+            tt->position = wp;
+        }
+    }
+}
+
 void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
                                const Ray& ray, const glm::vec2& mouse) {
     if (m_dragHandles == Handle::None) return;
@@ -618,21 +844,8 @@ void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
                 worldDelta = m_dragU * readoutA + m_dragV * readoutB;
             }
 
-            // 世界位移 → 局部位移：把父链的旋转/缩放抵消掉
-            glm::vec3 localDelta = worldDelta;
-            if (const auto* h =
-                    scene.world().get<ecs::HierarchyComponent>(m_entity)) {
-                if (h->parent != ecs::kInvalidEntity) {
-                    const ecs::Entity pe = scene.world().handle(h->parent);
-                    const glm::mat3 pm = glm::mat3(scene.worldMatrix(pe));
-                    const float det = glm::determinant(pm);
-                    if (std::fabs(det) > 1e-8f) {
-                        localDelta = glm::inverse(pm) * worldDelta;
-                    }
-                }
-            }
-
-            *tp.pos = m_startPos + localDelta;
+            // 世界位移 → 局部位移与"写给谁"都在这里（多选时逐个目标各算一遍）
+            applyTranslateToTargets(scene, tp, worldDelta);
             m_changed = true;
 
             char buf[128];
@@ -688,42 +901,10 @@ void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
             if (snap) factor = std::round(factor / sstep) * sstep;
             factor = glm::max(factor, 0.01f);
 
-            glm::vec3 sc = m_startScale;
-
-            // ---- 拖拽方向 → 局部轴的缩放权重 ----
-            //
-            // 这里是用户报的"拖 Y 却在 Z 方向拉伸"的根因所在。
-            //
-            // 手柄拖的是**世界**里的某一根轴（世界空间下就是世界轴本身），
-            // 而 TransformComponent::scale 是**局部**的（M = T·R·S）——
-            // 它作用在物体自己的三根轴上。物体一转，两套轴就不再重合：
-            //   物体绕 X 转 +90° 后，它的局部 Y 正指着世界的 Z。
-            //   于是"拖绿轴（世界 Y）"写进 scale.y，物体却沿着世界 Z 长；
-            //   "拖蓝轴（世界 Z）"写进 scale.z=局部 Z=世界 -Y，又朝着 Y 长。
-            // 表现就是两根轴"换了位置"。
-            //
-            // 正确做法：把拖拽方向投影到物体的三根**局部**轴上，按投影强度
-            // 分配缩放量。轴对齐时（绝大多数情况、也是旧代码唯一做对的情况）
-            // 投影恰好是 0/1，公式退化成"只改对得上那一维"，与旧行为一致；
-            // 物体转过之后则自动落到真正对得上的那一维上。
-            glm::vec3 w(0.0f);
-            if (axisIdx >= 0) {
-                for (int i = 0; i < 3; ++i)
-                    w[i] = std::fabs(glm::dot(axis, m_dragLocalAxes[i]));
-            } else if (planeN >= 0) {
-                // 平面手柄：两根腿的方向各算一次，加起来（对角拖 = 两根一起放大）
-                for (int i = 0; i < 3; ++i)
-                    w[i] = std::fabs(glm::dot(m_dragU, m_dragLocalAxes[i])) +
-                           std::fabs(glm::dot(m_dragV, m_dragLocalAxes[i]));
-            }
-
-            if (axisIdx >= 0 || planeN >= 0) {
-                for (int i = 0; i < 3; ++i)
-                    sc[i] = m_startScale[i] * (1.0f + (factor - 1.0f) * w[i]);
-            } else {
-                sc = m_startScale * factor;   // 整体等比：与朝向无关
-            }
-            *tp.scale = sc;
+            // 拖拽方向 → 每个目标**自己的**局部轴上的缩放权重，以及"写给谁"。
+            // 推导见 applyScaleToTargets 上方的长注释（拖 Y 却在 Z 方向拉伸
+            // 那个 bug 的根因就在那里）。
+            applyScaleToTargets(scene, tp, factor, axisIdx, planeN);
             m_changed = true;
 
             // 读数报**倍率**而不是那一维的绝对值 —— 旋转过的物体会把缩放
@@ -792,14 +973,15 @@ void GizmoController::applyDrag(EditorContext& ctx, scene::Scene& scene,
                 angle = std::round(angle / step) * step;
             }
 
-            // 始终在**拖拽起始姿态**上叠加，不做增量累乘
-            const glm::mat3 R0 = rotationFromEuler(m_startRot);
+            // 始终在**拖拽起始姿态**上叠加，不做增量累乘。
+            // 每个目标用的是**自己**的起始姿态（多选时各自的朝向不同）——
+            // 用主选中项的起始姿态去套别的物体，转过 90° 的那几个会被
+            // 强行掰到和它一样的朝向。
             const glm::mat3 D = glm::mat3(
                 glm::rotate(glm::mat4(1.0f), angle, glm::normalize(rotAxis)));
             // 自由旋转（arcball）的轴是**世界系**算出来的，所以固定走世界空间
             const bool worldApply = m_worldSpace || screenHandle;
-            const glm::mat3 R = worldApply ? (D * R0) : (R0 * D);
-            *tp.rot = eulerFromRotation(R);
+            applyRotateToTargets(scene, tp, D, worldApply);
             m_changed = true;
 
             char buf[128];
@@ -821,9 +1003,15 @@ void GizmoController::endDrag(EditorContext& ctx, scene::Scene& scene) {
     m_dragHandles = Handle::None;
     m_readout.clear();
 
-    if (!m_changed) return;
+    if (!m_changed) {
+        m_targets.clear();
+        return;
+    }
     const TrsPointers tp = trsOf(scene, m_entity, m_onCollider);
-    if (!tp.valid()) return;
+    if (!tp.valid()) {
+        m_targets.clear();
+        return;
+    }
 
     const TransformSnapshot after{*tp.pos, *tp.rot, *tp.scale};
 
@@ -832,13 +1020,52 @@ void GizmoController::endDrag(EditorContext& ctx, scene::Scene& scene) {
         glm::all(glm::equal(after.position, m_before.position)) &&
         glm::all(glm::equal(after.rotation, m_before.rotation)) &&
         glm::all(glm::equal(after.scale, m_before.scale));
-    if (same) return;
+    if (same && m_targets.size() <= 1) {
+        m_targets.clear();
+        return;
+    }
+
+    // ---- 收集"真的变了的"目标 ----
+    //
+    // 为什么要按目标过滤而不是"反正都写了"：多选里常有上锁的 / 已经和
+    // 别人对齐的物体，它们这一帧的数值没动 —— 把它们塞进撤销记录会让
+    // Ctrl+Z 之后的场景与按下之前"看起来一样，但历史里多了几条空命令"。
+    //
+    // ⚠ 碰撞体那条分支**不能**走这里：它改的是 CollisionComponent，
+    //   TransformComponent 一个字都没动，逐目标比对会全部判成"没变"，
+    //   于是拖了半天的碰撞体最后一脚被吞掉。
+    std::vector<MultiTransformEditCommand::Item> items;
+    if (!m_onCollider) {
+        items.reserve(m_targets.size());
+        for (const Target& t : m_targets) {
+            const TransformSnapshot now =
+                TransformSnapshot::capture(scene, t.entity);
+            const bool moved =
+                !glm::all(glm::equal(now.position, t.before.position)) ||
+                !glm::all(glm::equal(now.rotation, t.before.rotation)) ||
+                !glm::all(glm::equal(now.scale, t.before.scale));
+            if (!moved) continue;
+            items.push_back({t.entity, t.before, now});
+        }
+        if (items.empty()) {
+            m_targets.clear();
+            return;
+        }
+    }
 
     const std::string* nm = scene.world().name(m_entity);
-    const std::string label =
-        std::string(modeName()) + " " +
-        (m_onCollider ? "collider of " : "") +
-        (nm ? *nm : std::string("Object"));
+    std::string label;
+    if (items.size() > 1) {
+        // "Move 3 objects" —— 名字用主选中项的话，"3 个物体一起动了"
+        // 这件事在状态栏 / 历史里就看不出来（历史里会出现三条同名记录
+        // 那样的误解，而这里其实只有一条）。
+        label = std::string(modeName()) + " " + std::to_string(items.size()) +
+                " objects";
+    } else {
+        label = std::string(modeName()) + " " +
+                (m_onCollider ? "collider of " : "") +
+                (nm ? *nm : std::string("Object"));
+    }
 
     // 自动化探针：拖拽结束后的落地值。断言"拖 X 只改 scale.x"这类
     // 不变量就靠它（读数是界面文案，这条是数据）。
@@ -859,14 +1086,46 @@ void GizmoController::endDrag(EditorContext& ctx, scene::Scene& scene) {
 
     // 碰撞体用另一条命令：它写的是 CollisionComponent 的三个分量，
     // 不是实体的 TransformComponent（见 ColliderEditCommand 的说明）。
+    // 碰撞体编辑天然单选（ctx.colliderEdit() 在多选时被强制关掉）。
     if (m_onCollider) {
         ctx.commands().pushAlreadyApplied(std::make_unique<ColliderEditCommand>(
             label, &scene, m_entity, m_before, after));
+    } else if (items.size() > 1) {
+        ctx.commands().pushAlreadyApplied(
+            std::make_unique<MultiTransformEditCommand>(label, &scene,
+                                                        std::move(items)));
     } else {
+        // 单选（包括"多选了但只有一个真的动了"）：走老命令，保留它与
+        // Inspector 数值框之间的合并判定（同一个实体 + 同一名字 → 就地更新）。
+        const MultiTransformEditCommand::Item& it = items.front();
         ctx.commands().pushAlreadyApplied(std::make_unique<TransformEditCommand>(
-            label, &scene, m_entity, m_before, after));
+            label, &scene, it.entity, it.before, it.after));
     }
     ctx.setStatus(label);
+    // ---- G18：把"用户真的动过的分量"记成 prefab 覆盖 ----
+    //
+    // 只记**变了**的分量。三个全记的后果很隐蔽：一次平移就把 rotation /
+    // scale 一起钉死，之后改母版的旋转对这棵树永远不再生效 —— 而作者
+    // 从没碰过旋转。覆盖是**记账**，不是"与母版比差异"（见 Prefab.h 决定 ③）。
+    //
+    // 碰撞体那条分支不改 TransformComponent，不参与覆盖。
+    if (!m_onCollider) {
+        for (const Target& t : m_targets) {
+            const TransformSnapshot now =
+                TransformSnapshot::capture(scene, t.entity);
+            if (!glm::all(glm::equal(now.position, t.before.position)))
+                scene::recordOverride(scene, t.entity, "transform", "position");
+            if (!glm::all(glm::equal(now.rotation, t.before.rotation)))
+                scene::recordOverride(scene, t.entity, "transform", "rotation");
+            if (!glm::all(glm::equal(now.scale, t.before.scale)))
+                scene::recordOverride(scene, t.entity, "transform", "scale");
+        }
+    }
+    if (m_targets.size() > 1) {
+        VK_LOG_INFO("MULTI-DRAG n=%zu mode=%s handle=%s", m_targets.size(),
+                    modeName(), draggedHandle.c_str());
+    }
+    m_targets.clear();
     ctx.dirty() = true;
     m_changed = false;
 }
@@ -920,8 +1179,13 @@ bool GizmoController::update(EditorContext& ctx, const scene::Camera& camera,
     // 手柄这次作用在哪一组 TRS 上？
     //   · ctx.colliderEdit() 为真 **且** 选中项真的有碰撞体 → 碰撞体
     //   · 否则退回实体（哪怕开关还开着 —— 选中项被删了碰撞体也要能用）
-    m_onCollider =
-        ctx.colliderEdit() && sc.world().has<ecs::CollisionComponent>(e);
+    //
+    // 多选时**强制回到实体**：一次拖拽写 N 个碰撞体在语义上没法自洽
+    // （碰撞体是"这个物体身上的盒子"，N 个盒子一起挪没有任何含义），
+    // 而选择集里只要有一个没碰撞体，那一条路径就要写空指针。
+    const bool multiSel = ctx.multiSelected();
+    m_onCollider = !multiSel && ctx.colliderEdit() &&
+                   sc.world().has<ecs::CollisionComponent>(e);
 
     // 上锁的实体（自带地面）**不给手柄** —— 它固定不动，画个能拖的手柄
     // 只会误导（拖了没反应）。视口点选本来就会跳过它，这里挡的是"从
@@ -943,7 +1207,10 @@ bool GizmoController::update(EditorContext& ctx, const scene::Camera& camera,
     // 手柄的世界矩阵：作用在实体上就是实体世界矩阵；作用在碰撞体上还要
     // 再乘一层碰撞体自己的局部矩阵（于是手柄画在碰撞体的中心、轴也跟它转）。
     const glm::mat4 handleXform = targetWorld(sc, e);
-    m_origin = glm::vec3(handleXform[3]);
+    // 多选时手柄画在**包围盒中心**（各成员世界位置的 AABB 中心），
+    // 轴仍然取主选中项的 —— 一批朝向不同的物体没有"共同的朝向"，
+    // 取平均出来的朝向既不属于谁，也没法预测转过头会怎样。
+    m_origin = multiSel ? ctx.selectionPivot() : glm::vec3(handleXform[3]);
 
     // 手柄的世界长度：让它在屏幕上恒为 ~90px
     if (!PickingSystem::worldToScreen(m_viewProj, viewportPos, viewportSize,

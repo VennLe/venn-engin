@@ -424,6 +424,14 @@
     "startTime": 0.0,
     "speed": 1.0,
     "priority": 10
+   },
+   "dialogue": {
+    "path": "dialogues/ch01_open_01.dlg.json",
+    "enabled": true,
+    "autoStart": false,
+    "cps": 24.0,
+    "startNode": "",
+    "priority": 10
    }
   },
   {

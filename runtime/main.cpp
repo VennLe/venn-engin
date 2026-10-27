@@ -47,6 +47,7 @@
 
 #include "core/InputMap.h"
 #include "scene/CameraSystem.h"
+#include "scene/Prefab.h"
 #include "scene/SpringArm.h"
 #include "sequence/SequencerSystem.h"
 #include "dialogue/DialogueRunner.h"
@@ -398,6 +399,11 @@ int main(int argc, char** argv) {
         // 的错，应该在几毫秒内就能定位。
         if (cfg.selftest == "springarm")
             return scene::runSpringArmSelfTest() == 0 ? 0 : 1;
+        // G18：预制体（解析 / 实例化 / 改母版传播 / 覆盖挡传播 / Apply 写回 /
+        // Revert / 场景往返 / 从子树导出 / 文件往返）。纯数据 + 空设备
+        // AssetManager —— 不开窗口、不建 Vulkan。
+        if (cfg.selftest == "prefab")
+            return scene::runPrefabSelfTest() == 0 ? 0 : 1;
         // U8：HUD 的血量追随 / 伤害数字寿命 / 血条几何 / config/ui.json 往返。
         // 全是纯数值与文件 IO，不需要窗口也不需要 GPU。
         if (cfg.selftest == "hud") return runtime::runHudSelfTest();

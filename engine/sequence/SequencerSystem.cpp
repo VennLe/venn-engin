@@ -5,11 +5,13 @@
 #include "sequence/SequencerSystem.h"
 
 #include "core/Logger.h"
+#include "dialogue/DialogueSystem.h"
 #include "ecs/Components.h"
 #include "scene/CameraSystem.h"
 #include "scene/Scene.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 
@@ -40,12 +42,76 @@ int wrapInto(float& t, float dur) {
     return wraps;
 }
 
+// `kind` 是否是"该说话了"。**不区分大小写**：资产是手写的，
+// `Line` / `line` / `Dialogue` 都会出现；要求大小写一致只是给人添麻烦。
+// `Dialogue` 当别名收下，因为 B2 的 `AnimEvent` 那边就有人这么写。
+bool kindIsLine(const std::string& k) {
+    std::string s;
+    s.reserve(k.size());
+    for (const char c : k)
+        s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return s == "line" || s == "dialogue";
+}
+
 } // namespace
+
+SequencerSystem::SequencerSystem() = default;
+// 定义在 .cpp：`m_cue` 的 unique_ptr 需要一个完整的 `ecs::SequencerComponent`
+// 才析构得了。写在头里（隐式析构）会让 SequenceSelfTest.cpp 那些栈对象
+// 在各自的 TU 里实例化析构 → "incomplete type"。
+SequencerSystem::~SequencerSystem() = default;
 
 SequencerSystem& activeSequencerSystem() {
     // 函数内静态：避免静态初始化顺序问题（与 `activeCameraSystem` 一致）。
     static SequencerSystem s;
     return s;
+}
+
+// ---------------------------------------------------------------- 点播
+
+bool SequencerSystem::cue(scene::Scene& scene, const std::string& assetPath) {
+    (void)scene;
+    if (assetPath.empty()) return false;
+
+    if (!m_cue) m_cue = std::make_unique<ecs::SequencerComponent>();
+    // 整份重置：上一段可能 `loop = true`，不重置会让新的一段也循环。
+    *m_cue = ecs::SequencerComponent{};
+    m_cue->sequencePath = assetPath;
+    // 资产在**点播时**就加载：这里失败要能立刻返回 false 让脚本那条
+    // 语句报错，而不是"打一行 WARN、然后过场永远不出现"。
+    m_cue->assetLoaded = true;
+    if (!loadSequence(assetPath, m_cue->asset)) {
+        m_cue->playing = false;
+        VK_LOG_WARN("SEQ-CUE-FAIL path=%s err=%s", assetPath.c_str(),
+                    m_cue->asset.error.c_str());
+        return false;
+    }
+
+    m_cue->enabled = true;
+    m_cue->playing = true;
+    m_cue->loop = false;             // 点播默认单次；要循环写资产里的 loop
+    m_cue->startTime = 0.0f;
+    m_cue->speed = 1.0f;
+    m_cue->priority = std::numeric_limits<int>::max();
+    m_cue->started = false;
+    m_cue->finished = false;
+    m_cue->playhead = 0.0f;
+
+    VK_LOG_INFO("SEQ-CUE path=%s dur=%.3f keys=%d events=%d",
+                assetPath.c_str(),
+                static_cast<double>(m_cue->asset.duration),
+                static_cast<int>(m_cue->asset.cameraKeys.size()),
+                static_cast<int>(m_cue->asset.events.size()));
+    return true;
+}
+
+bool SequencerSystem::cuePlaying() const {
+    return m_cue && m_cue->playing;
+}
+
+const std::string& SequencerSystem::cuePath() const {
+    static const std::string kEmpty;
+    return m_cue ? m_cue->sequencePath : kEmpty;
 }
 
 void applyPoseToSceneCamera(scene::Scene& scene, const scene::CameraPose& p) {
@@ -120,13 +186,25 @@ void SequencerSystem::tick(scene::Scene& scene, float dt) {
     m_hasPose = false;      // 没在播的帧绝不能残留上一帧的姿态
 
     int running = 0;
-    const ecs::Entity active = selectActive(scene, &running);
+    ecs::Entity active{};
+    ecs::SequencerComponent* sc = nullptr;
+
+    // ---- 谁在播：点播 > 场景组件 ----
+    // 点播没有宿主实体（`m_active` 因此是无效的），但事件派发要一个实体
+    // 当参数 —— `fire()` 那边只在 `kind=Line` 时用它当对话的 host，
+    // 无效句柄是容忍的（对话本来就不需要宿主也能播）。
+    if (m_cue && m_cue->playing) {
+        sc = m_cue.get();
+        running = 1;
+    } else {
+        active = selectActive(scene, &running);
+        if (active.valid())
+            sc = scene.world().get<ecs::SequencerComponent>(active);
+    }
+
     m_lastRunning = running;
     m_active = active;
 
-    if (!active.valid()) return;
-
-    auto* sc = scene.world().get<ecs::SequencerComponent>(active);
     if (!sc || !sc->asset.valid) return;
 
     const SequenceAsset& seq = sc->asset;
@@ -228,11 +306,24 @@ void SequencerSystem::tick(scene::Scene& scene, float dt) {
                     static_cast<int>(ids.size()), wrapped ? 1 : 0,
                     sc->finished ? 1 : 0);
     }
+
+    // ---- 点播播完 → 让位 ----
+    // 点播是"插播"，不是"抢占"：播完要把位置还给场景里作者原本配好的
+    // 时间轴。不这么做的话 `m_cue->playing` 一直是 true，场景组件永远
+    // 选不上（`tick` 开头那条 `if (m_cue && m_cue->playing)` 会一直短路）。
+    // ⚠ 只在 `finished` 时停：循环点播走的是 `wrapInto` 分支，永远到不了
+    //   这里，所以"循环播到一半被掐掉"不会发生。
+    if (m_cue && sc == m_cue.get() && sc->finished) {
+        sc->playing = false;
+        VK_LOG_INFO("SEQ-CUE-END path=%s dur=%.3f",
+                    sc->sequencePath.c_str(),
+                    static_cast<double>(dur));
+    }
 }
 
 // ---------------------------------------------------------------- 派发
 
-void SequencerSystem::fire(scene::Scene& /*scene*/, ecs::Entity /*e*/,
+void SequencerSystem::fire(scene::Scene& scene, ecs::Entity e,
                            const SeqEvent& ev) {
     FiredEvent f;
     f.kind = ev.kind;
@@ -240,13 +331,22 @@ void SequencerSystem::fire(scene::Scene& /*scene*/, ecs::Entity /*e*/,
     f.t = ev.t;
     m_fired.push_back(f);
 
-    // ⚠ 现在这一层**只记录 + 打日志**，「让事件真的驱动东西」是 C6
-    // （脚本导演 API）的活。诚实的说法是：这一版能证明"到点了"，还不能
-    // 让"到点了"去开灯。写在这里而不是散在调用方，是为了将来接 C6 时
-    // 只有这一个地方要改。
+    // ⚠ 这一层**只做两件事**：记录（给 UI / 脚本读）+ 把 `kind=Line` 转成
+    //   对话。其余 kind（音效 / 旗标 / 镜头特效）仍然只记录 —— 让它们真的
+    //   驱动东西是 C6（脚本导演 API）的活。写在这个函数里而不是散在
+    //   调用方，是为了将来接 C6 时只有这一个地方要改。
     VK_LOG_INFO("SEQ-EVENT seq=%s kind=%s t=%.4f payload=[%s]",
                 m_lastName.c_str(), ev.kind.c_str(),
                 static_cast<double>(ev.t), ev.payload.c_str());
+
+    // ---- kind=Line → 起一段对话 ----
+    // `payload` 就是台词 id（例：`ch01_open_01`），由 `resolveDialoguePath`
+    // 解析成 `dialogues/<id>.dlg.json`。
+    // ⚠ 宿主传的是**时间轴所在的那个实体**：过场通常把 `DialogueComponent`
+    //   和时间轴挂在同一个"导演轨"上，语速就从那份组件借。
+    if (kindIsLine(ev.kind)) {
+        dialogue::activeDialogueSystem().cue(scene, e, ev.payload);
+    }
 }
 
 // ---------------------------------------------------------------- 重置
@@ -264,6 +364,15 @@ void SequencerSystem::resetRuntime(scene::Scene& scene) {
     m_lastPlayhead = 0.0f;
     m_lastName.clear();
     m_fired.clear();
+    // 点播状态也要清：切场景后不该还记着"上一局那段的播放头"。
+    // ⚠ 保留 `m_cue` 对象本身（省一次分配），只把播放状态归零 ——
+    //   与下面组件"asset 缓存保留"同一条理由。
+    if (m_cue) {
+        m_cue->playing = false;
+        m_cue->started = false;
+        m_cue->finished = false;
+        m_cue->playhead = 0.0f;
+    }
 }
 
 } // namespace sequence

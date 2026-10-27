@@ -364,10 +364,77 @@ DEFAULT = [
     # 运行时字段一个不落盘）。
     # ⚠ ⑥ **验不了"播完撒手"**：`CAM-POSE` 只在姿态变化时打印，"停住"= 没有
     #   日志行。那条由 `--selftest sequence` 的 `tick_finished_no_pose` 负责。
-    # ⚠ 帧数由 `--max-frames 260` 钉死（进程自己退出，不靠 kill）—— 否则日志
+    # ⚠ 帧数由 `--frames 260` 钉死（进程自己退出，不靠 kill）—— 否则日志
     #   截到第几秒取决于当时 fps，末帧断言会随机红。
+    #   参数名是 `--frames`，**不是** `--max-frames`：未知参数被 `applyCli`
+    #   静默忽略（那条"不该让游戏起不来"的兜底），拼错了也照样能跑过，
+    #   只是实际靠超时 kill 收场。
     # ⚠ 场景里必须有 `CameraComponent` 实体，否则运镜被静默丢弃（事件照发）。
     "verify_sequencer",
+    # 对话（2026-10-26，C2 第二步）。数值层（解析 / 校验 / 打字机 / 播放头 /
+    # 选项 / 调度优先级）在 `Game.exe --selftest dialogue` 的 97 条 `DLG-TEST`；
+    # 这里只验"接到一起之后还对不对"，两个用例：
+    # A 自动推进（`MYVK_DLG_AUTO`）——① 时间轴 `kind=Line` 真的 cue 到对话；
+    #   ② 资产加载；③ 五句顺序 + **码点**字数（l2 = 27 字 / 79 字节，抓"按字节
+    #   截断"）；③b 全部 `src=cue`（不是实体 autoStart）；④ 打字机 `shown` 递增；
+    #   ⑤ 字幕框几何（等比缩放 / 水平居中 / **底边对齐**、向上长高 / 底边距 = 96·s）；
+    #   ⑥ 选项等正文出完才出现且焦点在 0；⑦ 选完接 roof、`DLG-END src=cue`。
+    # B 按键推进（PostMessage 真按键 + `MYVK_RUNTIME_TIMESCALE=0.5` 拉宽打字窗口）
+    #   ——⑧ 打字中按 = 补完（`DLG-PRESS reveal`）；⑨ 那一下**不会顺手把选项
+    #   选掉**（q1 的 reveal 早于任何 `DLG-CHOICE`）；⑩ ↓ 之后按空格选中的是
+    #   **1 号**（走到 `sleep` 分支 → 证明确实用了焦点）；⑪ 换分支成功。
+    # ⚠ 不设 `MYVK_DLG_AUTO` 时对话会**永远停在第一句**（本来就该等玩家按）——
+    #   "跑满 1000 帧什么都没发生"看着极像"接线断了"，用例 B 必须自己按键。
+    # ⚠ 不验 `DLG-PRESS need-choice`：它在运行时**不可达**（分发是
+    #   `atChoice ? choose() : pressAdvance()`，pressAdvance 只在 !atChoice 时被
+    #   调）。那条语义归 `--selftest dialogue` 的 `player_q1_needchoice`。
+    # ⚠ `--frames` 不是 `--max-frames`：未知参数被静默忽略，拼错也能"跑过"。
+    # ⚠ PostMessage 的三个坑都在脚本头注释里：down/up 之间要停、方向键要带
+    #   扩展位、`SUB-BOX` 别用 `choices=2` 子串去等（`DLG-LINE` 也有这段）。
+    "verify_dialogue",
+    # ---- C6 脚本导演 API：`.vks` 能不能指挥演出 ----
+    # 三件（playSequence / showDialogue / playAnim）落地的端到端。
+    # ⚠ 数值侧（参数到宿主、失败必报错、类型纪律）在
+    #   `Game.exe --selftest script` 的 C13/C14/C15，那边宿主是 MockHost
+    #   只会记录；本脚本验**另外半条链**：宿主那边真的动了没有。
+    # ⚠ 探针场景 + 探针脚本都写在 build/bin 下（Game.exe 的 cwd），跑完删。
+    "verify_director_api",
+    # ---- C6 第三步：`DialogueComponent` 的编辑期入口 ----
+    # Inspector 第 13 个页签（`dialogue`）+ Add Component 菜单里的 `Dialogue` 项。
+    # 验三件事：页签 id 被认出来 / 三个控件真的画出来了 / 资产真的解析成
+    # 7 行台词 1 个选项。判据是 `INS-DLG-*` 结构化锚点，不数像素 ——
+    # `ImGui::TextDisabled` 画的 "3 nodes / 7 lines" 压根不进日志。
+    # ⚠ 不验"点 Add Component 加组件"：那个菜单是 `BeginPopup` 弹的，
+    #   要额外一次 PostMessage 且依赖上一帧的窗口位置，时序不稳。
+    #   那一半靠 `structuralEdit` 的代码可达性 —— 与 Cutscene Sequence 同路径。
+    "verify_dialogue_editor",
+    # ---- #310：剧本编辑器（面板上写台词，不再手写 JSON）----
+    # 六次真启动编辑器：打开 / 改一句+加一行+存盘 / 删被引用的一句（校验红 +
+    # Save 被拒 + 原文件没动）/ 改 id（引用自动打补丁）/ 打开坏文件（只读）/
+    # 存到场景正在用的那份（组件 reloaded=1）。
+    # ⚠ 数值侧（`toJson` / `saveDialogue` 的往返）在
+    #   `Game.exe --selftest dialogue` 的 G 组（rt_*），两条不能互相替代：
+    #   那边验"写出来的字对不对"，这边验"面板上按下去真的写了"。
+    # ⚠ G 用例会**临时改写** `assets/dialogues/ch01_open_01.dlg.json`，
+    #   跑完在 finally 里原样写回并校验哈希。
+    "verify_dialogue_script",
+    # ---- C6 第二批：脚本世界控制 API（旗标 / 刷实体 / 换场景）----
+    # 七条断言：旗标写进宿主 / spawn 走真 FBX 装配 / 换场景请求受理 /
+    # 下一帧真切换 / **旗标跨场景保留** / 五步顺序 / 没有失败锚点。
+    # ⚠ 数值侧（参数到宿主、返回的句柄可用、失败必报错）在
+    #   `Game.exe --selftest script` 的 C16~C19，那边宿主是 MockHost。
+    #   本脚本验另外半条链：宿主真的刷了实体、真的换了世界。
+    # ⚠ 探针场景 ×2 + 探针脚本 ×2 都写在 build/bin 下，跑完删。
+    # ---- #311：时间轴轨道编辑器（关键帧可视化 + 拖动 + 播放头）----
+    # 六次真启动编辑器：打开 / 改帧+加帧+存盘（含度→弧度）/ 拖动重排 /
+    # 坏文件只读 / 从零新建 / 存到场景在用的那份（组件 reloaded=1）。
+    # ⚠ 数值侧（`toJson` ↔ `parseSequence` 的 9 条往返）在
+    #   `Game.exe --selftest sequence` 的 F 组（rt_*），两条不能互相替代：
+    #   那边验"写出来的字对不对"，这边验"面板上按下去真的写了"。
+    # ⚠ F 用例会**临时改写** `assets/sequences/opening.seq.json`，
+    #   跑完在 finally 里原样写回并校验哈希。
+    "verify_timeline_editor",
+    "verify_world_api",
     # ---- 2026-10-17：主题 / 语言 / 默认值 / 胶囊线框 / 启动露面 ----
     # 五套主题 + 中英映射替换 + 偏好存档 schema 门。判据只取 Preferences
     # 窗口内部的平均亮度（整窗均值会被 3D 视口拽平，第一版就栽在这）。
@@ -438,6 +505,23 @@ DEFAULT = [
     # ③ 像素守卫（`ui.enabled=1` 但没有 UI 数据 → 与关掉整条通道逐位相同）。
     # ⚠ 它是 GUI 用例（2 次启动 + 1 次自检），不能与其它 GUI 用例并行。
     "verify_ui2",
+    # ---- #312：UI 编辑器（界面变成一份资产，2026-10-27）----
+    # A~H 八组，验的是"界面从 C++ 里搬出来"这件事的每一环：
+    #   A 打开（`UIED-OPEN` 7 控件 + 13 个控件矩形锚点 + 画布 16:9 + 三栏不重叠）
+    #   B 改数值存盘（位置/尺寸/颜色/圆角/字号/对齐落进 JSON，**注释与中文
+    #     原样保住**、没有 \u 转义、走临时文件+rename）
+    #   C 换锚点**保屏幕位置**（bottom-right→top-right：文档 rect 重算成
+    #     24,992 而屏幕矩形仍是 1656,992 —— 两者混为一谈的断言会误判实现）
+    #   D 打开坏文件 → 只读 + Save 被拒 + 原文件 1 字节没动
+    #   E 空手 New → 三控件骨架能存能加载
+    #   F 运行时 `--ui-doc` 真读了（几何/锚点/子控件相对父矩形 + drawn 计数）
+    #   G 数据绑定（脚本 damage(30) → 血条 fill 213.3→149.3，**量几何**不量颜色）
+    #   H 截图 diff（同配置两遍基线噪声 0，改一个控件 → 2.47% 像素变化，
+    #     包围盒内密度 5.5% —— 证明是零星改动而非整块重排）
+    # ⚠ 数值侧（解析/往返/锚点数学/绑定格式化）在 `MYVK_UI2_TEST=1` 的 86 条
+    #   里，两条不能互相替代：那边验"算得对"，这边验"面板上按下去真的写了"。
+    # ⚠ GUI 用例（十几次启动编辑器 + 1 次 Game.exe），不能与其它 GUI 用例并行。
+    "verify_ui_editor",
     # ---- 中文化覆盖率（2026-10-18）----
     # 纯静态扫描，不开窗口、不开 Vulkan、几百毫秒。八组体检：
     #   A1/A2/A3 参数 label·tooltip·特性名、A4 Combo 选项、
@@ -709,6 +793,63 @@ DEFAULT = [
     # 仓库的 assets/。
     # ⚠ GUI 用例（1 次启动编辑器），不能与其它 GUI 用例并行。
     "verify_material_import",
+
+    # ---- 预制体（2026-10-26 #315，G18）----
+    # 用户原话："Prefab：.prefab.json 资产（一个子树）/ 实例化 / 覆盖（实例改过
+    # 的字段）+ Apply / Revert / 改母版 → 所有实例更新"。
+    # 五组 46 条（详细分工见脚本头，这里只说"为什么必须都验"）：
+    #   A 无窗口 `--selftest prefab` 36 条 —— 解析（含 5 条负向）/ 实例化 /
+    #     传播 / 覆盖 / Apply / Revert / 场景往返 / 从子树导出。数值语义在这。
+    #   B GUI 从零建一份 prefab 并摆两份 —— 证明编辑器入口（`prefab.create` /
+    #     `prefab.instantiate`，与层级右键菜单**同一个** EditorContext 方法）
+    #     真把文件写出来了，且存盘之后实例标记还在（少了它＝存一次盘就脱钩）。
+    #     顺带钉住"落点记账"：摆到与母版不同的位置必须当场记一条覆盖。
+    #   C GUI 改母版 scale 1→2 + `prefab.reload` —— 判据是同一场景里**三个
+    #     互不相等的数** 2/3/2：写成"全等于 2"（覆盖失效）或"全等于 3"
+    #     （传播失效）都会被抓。被覆盖的落点 x=5 也必须保留（母版是 0）。
+    #     同一次启动里再跑 Revert：`cleared=2` 且重新同步一次。
+    #   D GUI Apply —— `wrote=2 cleared=2`，母版文件被改，且**别的实例**
+    #     跟着变（写进文件的值才是权威值）。这是"Apply 到底生效没有"的唯一证据。
+    #   E GUI **真鼠标拖 gizmo** —— 覆盖是"记账"不是"与母版比差异"，而真实
+    #     交互里只有 gizmo 松手那一刻会记账。判据是"只动了一个分量 → 只记
+    #     1 条"。三个分量全记的话，之后改母版的旋转对这棵树永远不再生效，
+    #     而作者从没碰过旋转（这条比看起来重要）。
+    # ⚠ E 组依赖 `MYVK_LOG_RECTS=1` 打出的 `GZ-ORIGIN` / `GZ-AXIS-X`；
+    #   同时**不能**设 `MYVK_EDITOR_NO_HUD=1`（整块视口叠加层不画，手柄也就
+    #   没有矩形 —— 症状是"GZ-ORIGIN 永远等不到"，看起来像选中失败）。
+    # ⚠ GUI 用例（4 次启动编辑器），不能与其它 GUI 用例并行。
+    "verify_prefab",
+
+    # ---- 多选编辑（2026-10-27 #316）----
+    # 用户原话："多选（selection() 返回单个 Entity）：多选选择集、框选 /
+    # 批量移动/旋转/缩放、批量改属性（混合值显示）/ 批量复制/删除"。
+    # 五组 39 条（详细分工见脚本头，这里只说"为什么必须都验"）：
+    #   A 无窗口 `MYVK_MULTISELECT_TEST=1` 25 条 —— 选择集语义（Ctrl 增删 /
+    #     Shift 范围 / 框选替换 / 全选跳过上锁）、支点、多目标撤销，以及
+    #     **批量数学**（增量 / 比例 / 绕支点旋转）。数值语义全在这儿：它们
+    #     错了界面看起来完全正常（数字会变、物体也会动，只是方向 / 幅度不对）。
+    #   B GUI 层级树里的**真 Ctrl / Shift 点击** —— 修饰键 → 调哪个 API 的
+    #     分派只有真鼠标能验；写错了的现象是"点了没反应"，最难从日志反推。
+    #   C GUI **框选** —— 两条互相咬住的判据：框住全场景 → 全选中；框住天空
+    #     一小块 → 一个都不选。只有前者的话"框选 == 全选"也会绿。
+    #   D GUI **多选拖 gizmo** —— 判据是"两个物体各走了**一样**的位移"
+    #     （不是"都动了"）：只动主选中项、或子物体被父节点带着走一遍再自己
+    #     写一遍（动两次），这两种错法都会被这一条抓出来。松开后按一次
+    #     Ctrl+Z，`MULTI-UNDO n=2` 必须出现且两个都回原位（一条记录撤销整批
+    #     —— 每实体压一条命令的话要按 N 次）。
+    #   E GUI **批量复制 / 删除** —— Ctrl+D 复制 3 个（`HIER-DUP n=3`）、
+    #     Del 删掉 3 个（`HIER-DEL n=3`），存盘后场景里副本一个不剩、原来的
+    #     4 个还在（批量删除连**子树**一起删，否则 destroy() 不递归会留下
+    #     "parent 指向死 id" 的孤儿：不在树里、却还在渲染）。
+    # ⚠ GUI 用例（4 次启动编辑器），不能与其它 GUI 用例并行。
+    # ⚠ 依赖 `MYVK_LOG_RECTS=1` 打出的 `HIER-ROW <i>` / `GZ-ORIGIN`；
+    #   行号**不能**假设等于场景数组下标 —— 加载器会补一个 DirectionalLight，
+    #   它没有 Transform 但确实是树里的一行（脚本用"点一遍读名字"来对）。
+    # ⚠ 这条用例**特别**怕被抢前台：它靠真鼠标点第 N 行，而这五组要跑两分
+    #   多钟。整套第一次跑就撞上了 —— B/D/E 红了 7 条，同样几个组单独跑全绿
+    #   （D 组的 WARN 里能看到"前台被抢走"）。现在每次发事件前都会重新确认
+    #   前台，被抢就抢回来并把那一下点击重试一次；跑这条时别去动鼠标。
+    "verify_multiselect",
 ]
 
 # 结果行：兼容四种写法。取**最后一条**，因为有的脚本会先打一堆中间断言。
@@ -1283,6 +1424,22 @@ TRIGGERS = {
                               "engine/script/ScriptEngine.*",  # 脚本 damage/popup
                               "engine/render/PostProcess.*",   # uiOutputExtent 同源
                               "assets/shaders/ui2.*"],         # 同样是像素依赖
+    # UI 编辑器（#312，docs/ui_hud_roadmap.md）。
+    # ⚠ `engine/ui2/UiCanvas.*` / `assets/shaders/ui2.*` 已经在 verify_ui2 与
+    #   verify_hud 名下，这里只列**本用例真正独占**的新增面；重复登记会让
+    #   `check_regression_map.py` 的 D/E 项报"冗余横切"吗？不会 —— 那张表只
+    #   查"某用例的 globs 全落在 GLOBAL_GLOBS 里"，跨用例重复是允许的（同一
+    #   文件影响多个用例本来就正常）。这里仍然只写独占的，是为了让人读得动。
+    "verify_ui_editor":      ["engine/ui2/UiDocument.*",    # 文档格式 + 放置 + 绘制
+                              "engine/ui2/UiLayout.*",      # placeRectIn（锚点唯一实现）
+                              "engine/ui2/Ui2SelfTest.cpp",  # `--selftest ui2` 那 86 条
+                              "editor/UiEditorWindow.*",    # 面板本体
+                              "editor/EditorContext.*",     # 三入口同构的请求通道
+                              "editor/EditorApp.cpp",       # 面板表项 + 窗口调度
+                              "runtime/RuntimeApp.cpp",     # `--ui-doc` 的绘制与绑定
+                              "runtime/RuntimeConfig.*",    # uiDoc 配置项
+                              "assets/ui/docs/**",          # 被编辑的资产本身
+                              "tools/verify_ui_editor.py"],
     # 中文化覆盖率：**取值域是整个 editor/**。
     # 判据是"屏幕上还有没有英文"，而任何一处新加的 UI 字面量都可能破坏它 ——
     # 没法收敛到几个文件。所以这里用 `editor/**` 而不是列举。
@@ -1480,6 +1637,62 @@ TRIGGERS = {
                                "engine/assets/MaterialLibrary.*",
                                "editor/EditorContext.*",
                                "editor/MaterialLibraryPanel.*"],
+
+    # ---- 预制体（2026-10-26 #315，G18）----
+    # 这条用例的判据横跨**五个**文件，缺一条就会"看着有归属、其实漏了"：
+    #   · engine/scene/Prefab.*        —— 资产读写 / 实例化 / 覆盖 / 同步 /
+    #                                     Apply。整条语义都在这里。
+    #   · engine/scene/PrefabSelfTest.cpp —— `--selftest prefab` 的 35 条
+    #   · engine/scene/SceneEntityIO.h —— 与场景**共用**的单实体读写接口
+    #                                     （场景格式一变，prefab 跟着变）
+    #   · engine/scene/SceneSerializer.cpp —— `prefab` 块的写/读两端 + 提供
+    #                                     entityToJson/entityFromJson 本体
+    #   · editor/EditorContext.*       —— create / apply / revert /
+    #                                     instantiate 四个动作
+    #   · editor/SceneHierarchy.*      —— 右键菜单三项
+    #                                     （`HIER-PREFAB` 锚点来源）
+    #   · editor/InspectorPanel.*      —— 头部 prefab 条
+    #                                     （`INSP-PREFAB` 锚点来源）
+    #   · editor/GizmoController.*     —— 松手时的 `recordOverride` 记账
+    #   · editor/EditorApp.cpp         —— 命令串入口
+    #                                     （`MYVK_EDITOR_CONSOLE_CMD` 敲的那
+    #                                      六条 `prefab.*` 就注册在这里）
+    #   · editor/Command.*             —— `PrefabApplyCommand`（文件+场景一起
+    #                                     回滚；只有它能撤销 Apply）
+    #   · runtime/main.cpp             —— `--selftest prefab` 的注册点
+    # ⚠ `engine/scene/Scene.*` 与 `engine/ecs/**` 在 GLOBAL_GLOBS 里，写了在
+    #   `--narrow` 下会变成假映射，所以不写（它们改了本来就全量）。
+    "verify_prefab": ["engine/scene/Prefab.*",
+                      "engine/scene/PrefabSelfTest.cpp",
+                      "engine/scene/SceneEntityIO.h",
+                      "engine/scene/SceneSerializer.*",
+                      "editor/EditorContext.*",
+                      "editor/SceneHierarchy.*",
+                      "editor/InspectorPanel.*",
+                      "editor/GizmoController.*",
+                      "editor/EditorApp.*",
+                      "editor/Command.*",
+                      "runtime/main.cpp"],
+    # ---- 多选编辑（#316）----
+    # 改了下面任意一处，"一次拖拽写 N 个实体 / 一条命令撤销整批 / 混合值的
+    # 增量 vs 比例语义"都可能变，而它们只有 verify_multiselect 在验。
+    #   · editor/EditorContext.*   —— 选择集本体（不变式都在这里）
+    #   · editor/GizmoController.* —— 多目标分发（m_targets / 支点 / 绕支点旋转）
+    #   · editor/MultiEditMath.h   —— 批量数学（增量 / 比例 / orbit），A 组直接测它
+    #   · editor/SceneHierarchy.*  —— Ctrl/Shift 点选、批量复制/删除、HIER-ROW 锚点
+    #   · editor/ViewportPanel.*   —— 框选（投影 AABB）与视口内 Ctrl+点
+    #   · editor/InspectorPanel.*  —— 混合值聚合与批量写（一条撤销记录）
+    #   · editor/Command.*         —— `MultiTransformEditCommand`
+    #   · editor/EditorApp.*       —— Del / Ctrl+D 的转发
+    # ⚠ 刻意**不**登记 `editor/main.cpp`：它在 GLOBAL_GLOBS 里（改它就是全量）。
+    "verify_multiselect": ["editor/EditorContext.*",
+                           "editor/GizmoController.*",
+                           "editor/MultiEditMath.h",
+                           "editor/SceneHierarchy.*",
+                           "editor/ViewportPanel.*",
+                           "editor/InspectorPanel.*",
+                           "editor/Command.*",
+                           "editor/EditorApp.*"],
     # ---- 自研二进制资产链（阶段六/七，2026-10-22）----
     # 只登记**非横切**的两块，都是新顶层目录：
     #   · assetio/** —— 格式本体（MeshFormat / VertexOps / AnimOps /
@@ -1626,6 +1839,113 @@ TRIGGERS = {
                          "engine/scene/SceneSerializer.*",
                          "editor/InspectorPanel.*",
                          "assets/sequences/**"],
+    # ---- 对话（2026-10-26，C2 第二步）----
+    # 断言落点：
+    #   · 数据层 + 调度层（解析 / 播放头 / 打字机 / cue 优先级）→ engine/dialogue/**
+    #   · `kind=Line` 的接线（时间轴 → cue）                      → SequencerSystem.*
+    #   · `dialogue` 块的读写（写侧不落运行时字段）                → SceneSerializer.*
+    #   · 字幕框几何（缩放 / 居中 / 底边对齐）                     → runtime/ui/Subtitle.*
+    #   · 自动推进 / 输入分发 / 绘制挂点                            → runtime/RuntimeApp.cpp
+    #   · 对话期间挡跳跃（Space 既是 Jump 又是推进）               → PlayerController.*
+    #   · 夹具（台词字数断言全靠它）                                → assets/dialogues/**
+    # ⚠ `engine/ecs/Components.h`（`DialogueComponent` 定义处）在 `GLOBAL_GLOBS`
+    #   里，本来就全量，**刻意不登记**（登记了在 `--narrow` 下会变假跳过）。
+    # ⚠ 只挂 `SequencerSystem.*` 而不是 `engine/sequence/**`：`engine/sequence/**`
+    #   已经整目录挂在 verify_sequencer 名下，这里要的是"cue 那一行"这个落点。
+    # ⚠ `runtime/RuntimeApp.cpp` 与 verify_runtime_* 重挂是**故意**的 ——
+    #   同一个文件挂两条在 M1 那条注释里已经解释过：只挂一条会让 `--narrow`
+    #   把另一条判成"不受影响"，那就是假跳过。
+    "verify_dialogue": ["engine/dialogue/**",
+                        "engine/sequence/SequencerSystem.*",
+                        "engine/scene/SceneSerializer.*",
+                        "runtime/ui/Subtitle.*",
+                        "runtime/RuntimeApp.cpp",
+                        "runtime/PlayerController.*",
+                        "assets/dialogues/**"],
+    # C6 脚本导演 API。挂在三组人身上：
+    #   · `ScriptEngine.*` —— 内建表 / 分发 / 参数类型纪律（三处同步硬要求）
+    #   · `SequencerSystem.*` —— `cue()` 是点播的落地，组件路径与它共用一份
+    #     `tick`（改一处两边都要重跑）
+    #   · `RuntimeApp.cpp` —— 三个窄动作的注入 + `switchAnimClip` 的写入点
+    # 资产三角（sequence / dialogue / 基底场景）也要挂：这条用例断的是
+    # "真的播出来了"，资产改名或结构变动会让它红，那是**对的**。
+    "verify_director_api": ["engine/script/ScriptEngine.*",
+                            "engine/script/ScriptSelfTest.cpp",
+                            "engine/sequence/SequencerSystem.*",
+                            "runtime/RuntimeApp.cpp",
+                            "assets/sequences/**",
+                            "assets/dialogues/**",
+                            "assets/scenes/cutscene_demo.json"],
+    # C6 第三步：`DialogueComponent` 的编辑期入口（第 13 个页签）。四个落点：
+    #   · `editor/InspectorPanel.*`  —— `kTabs[]` 那一行 + `drawTabDialogue` 整段
+    #     + Add Component 菜单项。改页签表或那段控件必重跑。
+    #   · `editor/InspectorIcons.h`  —— `iconDialogue` 就长在这里。
+    #     与 verify_hierarchy_status 重挂是**故意**的：同一个图标两处用，
+    #     改它两条都该跑（`--narrow` 下只挂一条会把另一条判成不受影响）。
+    #   · `engine/dialogue/**`       —— 页签的懒加载走的就是 `DialogueAsset::load`，
+    #     解析器的口径一变，`INS-DLG-ASSET` 那行的行数/选项数就变。
+    #   · `assets/dialogues/**` + 基底场景 —— 夹具本身。
+    # ⚠ 刻意**不**登记 `engine/ecs/Components.h`（`DialogueComponent` 定义处）：
+    #   它在 `GLOBAL_GLOBS` 里，本来就走全量；写进来会被 check_regression_map
+    #   判成"全横切登记 = 假跳过"。
+    "verify_dialogue_editor": ["editor/InspectorPanel.*",
+                               "editor/InspectorIcons.h",
+                               "engine/dialogue/**",
+                               "assets/dialogues/**",
+                               "assets/scenes/cutscene_demo.json"],
+    # ---- C6 第二批：脚本世界控制（旗标 / spawn / loadScene）----
+    # 这条用例的判据是"宿主那边真的动了"，所以每一环的落点都要登记：
+    #   · `ScriptEngine.*`    内建表 / 分发 / 参数类型纪律（三处同步硬要求）
+    #   · `ScriptSelfTest.cpp` C16~C19 的数值侧
+    #   · `RuntimeApp.cpp`    四个窄动作的注入 + `applyPendingSceneSwitch`
+    #     的整段重建（物理 / 脚本 / 出生点 / 玩家接管）——**换场景
+    #     漏一步**的表现是"新场景一片黑但日志没红"，只有这条能抓到
+    #   · `GameFlags.h`       旗标存储本体（跨场景保留的那一条断言就在验它）
+    #   · 基底场景 + 被 spawn 的模型：探针场地就是这两个资产
+    # ⚠ 刻意**不登记** `engine/assets/AssetPath.*`（`isObjPath/isFbxPath`
+    #   被本用例的 spawn 分派用到）：`engine/assets/**` 在 `GLOBAL_GLOBS`
+    #   里，写进来会被判成"全横切登记 = 假跳过"。
+    # ---- #310：剧本编辑器面板 ----
+    # 这条用例的每一环都要登记，否则 `--narrow` 会把它判成"不受影响"：
+    #   · `editor/DialogueEditorWindow.*` 面板本体
+    #   · `engine/dialogue/DialogueAsset.*` 含**写回**（toJson / saveDialogue）
+    #     —— 它是这条用例真正的新东西，存盘格式错一个字，B/D 两组全红
+    #   · `engine/dialogue/DialogueSelfTest.cpp` G 组的 rt_*（数值侧）
+    #   · `editor/EditorApp.cpp` 面板表项 + 窗口生命周期 + `MYVK_EDITOR_DLGED`
+    #     钩子（钩子没了这一条根本开不了窗，症状是"等满超时全红"）
+    #   · `editor/EditorContext.h` 的一次性请求（Inspector → 窗口那条线）
+    #   · `editor/InspectorPanel.*` 的 "Edit script..." 按钮
+    # ⚠ 刻意**不登记** `engine/ecs/Components.h`：它在 `GLOBAL_GLOBS` 里。
+    "verify_dialogue_script": ["editor/DialogueEditorWindow.*",
+                               "editor/EditorContext.h",
+                               "editor/InspectorPanel.*",
+                               "editor/EditorApp.cpp",
+                               "engine/dialogue/DialogueAsset.*",
+                               "engine/dialogue/DialogueSelfTest.cpp",
+                               "assets/dialogues/**"],
+    # ---- #311：时间轴轨道编辑器 ----
+    # 每一环都要登记，否则 `--narrow` 会把它判成"不受影响"：
+    #   · `editor/TimelineEditorWindow.*` 面板本体
+    #   · `engine/sequence/SequenceAsset.*` 含**写回**（toJson / saveSequence）
+    #   · `engine/sequence/SequenceSelfTest.cpp` F 组的 rt_*（数值侧）
+    #   · `editor/EditorApp.cpp` 面板表项 + 窗口生命周期 + `MYVK_EDITOR_TLED`
+    #     钩子（钩子没了这一条根本开不了窗，症状是"等满超时全红"）
+    #   · `editor/EditorContext.h` 的一次性请求（Inspector → 窗口那条线）
+    #   · `editor/InspectorPanel.*` 的 "Edit timeline..." 按钮
+    # ⚠ 刻意**不登记** `engine/ecs/Components.h`：它在 `GLOBAL_GLOBS` 里。
+    "verify_timeline_editor": ["editor/TimelineEditorWindow.*",
+                               "editor/EditorContext.h",
+                               "editor/InspectorPanel.*",
+                               "editor/EditorApp.cpp",
+                               "engine/sequence/SequenceAsset.*",
+                               "engine/sequence/SequenceSelfTest.cpp",
+                               "assets/sequences/**"],
+    "verify_world_api": ["engine/script/ScriptEngine.*",
+                         "engine/script/ScriptSelfTest.cpp",
+                         "runtime/RuntimeApp.cpp",
+                         "runtime/GameFlags.h",
+                         "assets/scenes/cutscene_demo.json",
+                         "assets/models/anime_girl.fbx"],
     # ---- 阶段 M1：运行时骨架（G01~G05）----
     # 三条用例的实现主体全在 `runtime/**`（G01 拆出来的那个独立目标）。
     # 同一个 glob 挂到三条名下是**故意**的：改 runtime 的任何一行，

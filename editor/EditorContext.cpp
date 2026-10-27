@@ -5,10 +5,19 @@
 #include "Localization.h"
 #include "assets/AssetManager.h"
 #include "core/Logger.h"
+#include "scene/Prefab.h"
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
 
+#include "assets/AssetPath.h"
+
+#include <filesystem>
+#include <fstream>
+
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
+#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
@@ -463,6 +472,16 @@ void EditorContext::select(ecs::Entity e, bool fromViewport) {
         else
             m_selectionName.clear();
     }
+
+    // ---- 选择集：单选入口把集合**替换**成一项 ----
+    // 所有既有调用点（层级点选、内容浏览器导入、撤销后的重接、prefab 实例化
+    // 之后的选中……）走的都是这里，所以它们的语义与多选之前逐位一致。
+    m_selectionSet.clear();
+    m_selectionNames.clear();
+    if (e.valid()) {
+        m_selectionSet.push_back(e);
+        m_selectionNames.push_back(m_selectionName);
+    }
 }
 
 void EditorContext::clearSelection() {
@@ -470,29 +489,386 @@ void EditorContext::clearSelection() {
     m_selectionName.clear();
     m_selectionFromViewport = false;
     m_colliderEdit = false;
+    m_selectionSet.clear();
+    m_selectionNames.clear();
 }
 
 bool EditorContext::hasSelection() const {
     return m_selection.valid() && activeScene().world().alive(m_selection);
 }
 
-void EditorContext::validateSelection() {
-    scene::Scene& sc = activeScene();
+// ---------------------------------------------------------------- 选择集（多选）
 
-    if (m_selection.valid() && sc.world().alive(m_selection)) {
-        if (const std::string* n = sc.world().name(m_selection))
-            m_selectionName = *n;
+bool EditorContext::isSelected(ecs::Entity e) const {
+    if (!e.valid()) return false;
+    for (ecs::Entity s : m_selectionSet)
+        if (s.id == e.id && s.generation == e.generation) return true;
+    return false;
+}
+
+// 改主选中项的唯一入口（集合的增删另有自己的路径，但要在这里收口，否则
+// "主选中项 ∈ 集合"这条不变式迟早被某一条支路打破）。
+void EditorContext::setSelectionPrimary(ecs::Entity e) {
+    if (e.valid() && !activeScene().world().alive(e)) e = ecs::Entity{};
+    m_selection = e;
+    m_colliderEdit = false;
+    // 支路（Ctrl 点、框选、全选）里主选中项都是"刚操作的那一个"，
+    // 而不是"在视口里点中的"—— 与 selectFromViewport 的出处标记无关。
+    m_selectionFromViewport = false;
+    m_selectionName.clear();
+    if (!e.valid()) return;
+    if (const std::string* n = activeScene().world().name(e)) m_selectionName = *n;
+    // 名字数组也跟着修一下：主选中项那一项的缓存可能已经过期（改过名）。
+    for (std::size_t i = 0; i < m_selectionSet.size(); ++i)
+        if (m_selectionSet[i].id == e.id) m_selectionNames[i] = m_selectionName;
+}
+
+void EditorContext::selectToggle(ecs::Entity e) {
+    if (!e.valid() || !activeScene().world().alive(e)) return;
+
+    const auto it = std::find_if(
+        m_selectionSet.begin(), m_selectionSet.end(),
+        [&](ecs::Entity s) { return s.id == e.id; });
+    if (it != m_selectionSet.end()) {
+        m_selectionNames.erase(m_selectionNames.begin() +
+                               (it - m_selectionSet.begin()));
+        m_selectionSet.erase(it);
+        // 取消掉的是主选中项 → 退回集合里最后一项（"最后点过的"那个）。
+        // 集合空了就整个清空（m_selection 必须跟着失效，见不变式）。
+        setSelectionPrimary(m_selectionSet.empty() ? ecs::Entity{}
+                                                   : m_selectionSet.back());
         return;
     }
 
-    // 句柄失效 —— 撤销删除 / Play / Stop 之后都会走到这里。
-    // 名字是跨"场景重建"唯一稳定的标识，按它找回来。
-    m_selection = ecs::Entity{};
-    // 新建出来的组件是全新的，手柄不能再指着一个"已经不存在的碰撞体"
-    m_colliderEdit = false;
-    if (!m_selectionName.empty()) {
-        const ecs::Entity found = sc.find(m_selectionName);
-        if (found.valid()) m_selection = found;
+    m_selectionSet.push_back(e);
+    const std::string* n = activeScene().world().name(e);
+    m_selectionNames.push_back(n ? *n : std::string());
+    setSelectionPrimary(e);
+}
+
+void EditorContext::selectRange(ecs::Entity e,
+                               const std::vector<ecs::Entity>& order) {
+    if (!e.valid()) return;
+    // "锚点" = 上一次点的那一项。它已经不在 order 里（被删了 / 被过滤掉）
+    // 时退化成"只选这一项"，不要硬凑一个范围出来。
+    int anchor = -1;
+    int target = -1;
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        if (order[i].id == e.id) target = static_cast<int>(i);
+        if (m_selection.valid() && order[i].id == m_selection.id)
+            anchor = static_cast<int>(i);
+    }
+    if (target < 0) return;
+    if (anchor < 0) {
+        select(e);
+        return;
+    }
+
+    const int lo = std::min(anchor, target);
+    const int hi = std::max(anchor, target);
+    m_selectionSet.clear();
+    m_selectionNames.clear();
+    for (int i = lo; i <= hi; ++i) {
+        const ecs::Entity s = order[static_cast<std::size_t>(i)];
+        // 上锁的实体可以进集合（层级里手选不算"点视口"），这里不过滤。
+        m_selectionSet.push_back(s);
+        const std::string* n = activeScene().world().name(s);
+        m_selectionNames.push_back(n ? *n : std::string());
+    }
+    setSelectionPrimary(e);
+}
+
+void EditorContext::selectMany(const std::vector<ecs::Entity>& list) {
+    ecs::World& w = activeScene().world();
+    const ecs::Entity prev = m_selection;
+
+    m_selectionSet.clear();
+    m_selectionNames.clear();
+    for (ecs::Entity s : list) {
+        if (!s.valid() || !w.alive(s)) continue;
+        if (isSelected(s)) continue;          // 去重（框选 + Shift 叠加时会撞）
+        m_selectionSet.push_back(s);
+        const std::string* n = w.name(s);
+        m_selectionNames.push_back(n ? *n : std::string());
+    }
+
+    if (m_selectionSet.empty()) {
+        setSelectionPrimary(ecs::Entity{});
+        return;
+    }
+    // 旧主选中项还在新集合里就留着 —— "拖一次框，手柄的坐标系不该跳"。
+    const bool keep = prev.valid() && isSelected(prev);
+    setSelectionPrimary(keep ? prev : m_selectionSet.front());
+}
+
+void EditorContext::selectAll() {
+    ecs::World& w = activeScene().world();
+    std::vector<ecs::Entity> all;
+    w.each<ecs::TransformComponent>([&](ecs::Entity e, ecs::TransformComponent&) {
+        // 上锁的（自带地面）不参与：它既点不到也拖不动，进集合只会在
+        // 批量移动时制造一条"这个怎么没动"的困惑。
+        if (w.has<ecs::LockedComponent>(e)) return;
+        all.push_back(e);
+    });
+    selectMany(all);
+    VK_LOG_INFO("SELECT all n=%zu", m_selectionSet.size());
+}
+
+glm::vec3 EditorContext::selectionPivot() {
+    scene::Scene& sc = activeScene();
+    if (m_selectionSet.empty()) {
+        if (!m_selection.valid()) return glm::vec3(0.0f);
+        return glm::vec3(sc.worldMatrix(m_selection)[3]);
+    }
+    glm::vec3 lo(0.0f);
+    glm::vec3 hi(0.0f);
+    bool first = true;
+    for (ecs::Entity s : m_selectionSet) {
+        if (!sc.world().alive(s)) continue;
+        const glm::vec3 p = glm::vec3(sc.worldMatrix(s)[3]);
+        if (first) {
+            lo = hi = p;
+            first = false;
+        } else {
+            lo = glm::min(lo, p);
+            hi = glm::max(hi, p);
+        }
+    }
+    if (first) return glm::vec3(0.0f);
+    return (lo + hi) * 0.5f;
+}
+
+// ---------------------------------------------------------------- 预制体（G18）
+
+namespace {
+
+std::string readWholeFile(const std::string& full) {
+    std::ifstream in(full, std::ios::binary);
+    if (!in) return {};
+    return std::string((std::istreambuf_iterator<char>(in)),
+                       std::istreambuf_iterator<char>());
+}
+
+// 名字 → 资产路径用的 slug（`Crate 2` → `crate_2`）
+// （已搬到 `scene::prefabDefaultPath` —— 层级右键菜单也要用同一套取名口径，
+//   两处各写一份必然出现 "crate.vprefab.json" 与 "crate_2.vprefab.json"）
+
+} // namespace
+
+bool EditorContext::prefabCreateFromSelection(const std::string& relPath) {
+    if (!isEditing()) return false;
+    const ecs::Entity src = m_selection;
+    if (!src.valid()) {
+        notify(TR("Select an object first"));
+        return false;
+    }
+
+    scene::PrefabAsset asset;
+    std::string err;
+    if (!scene::prefabFromSubtree(m_editorScene, src, asset, &err)) {
+        notify(TR("Create prefab failed: ") + err);
+        return false;
+    }
+    asset.path = relPath;
+    const std::string* nm = m_editorScene.world().name(src);
+    asset.name = nm ? *nm : std::string("Prefab");
+    asset.comment = "由编辑器从选中子树导出（Create Prefab from Selection）。";
+
+    // 目录可能还不存在（第一次给这个工程做 prefab）
+    const std::string full = assets::resolveAssetPath(relPath);
+    std::error_code ec;
+    std::filesystem::create_directories(
+        std::filesystem::path(full).parent_path(), ec);
+
+    if (!scene::savePrefab(asset, err)) {
+        notify(TR("Create prefab failed: ") + err);
+        return false;
+    }
+
+    // 就地绑定：这棵子树**当场**成为实例 1。否则作者要先删掉再拖一份
+    // 进来，而"删了才发现没存上"是最典型的踩坑顺序。
+    std::uint32_t inst = 0;
+    structuralEdit(TR("Create Prefab"), [&] {
+        scene::prefabBindExistingSubtree(m_editorScene, asset, src, &inst);
+    });
+    notify(TR("Prefab created: ") + relPath);
+    setStatus(TR("Create Prefab"));
+    VK_LOG_INFO("HIER-PREFAB create=1 path=%s nodes=%d instance=%u",
+                relPath.c_str(), static_cast<int>(asset.nodes.size()), inst);
+    return true;
+}
+
+bool EditorContext::prefabApply(ecs::Entity member) {
+    if (!isEditing() || !member.valid()) return false;
+    const auto* pl = m_editorScene.world().get<ecs::PrefabLinkComponent>(member);
+    if (!pl) return false;
+    const std::string rel  = pl->prefabPath;
+    const std::uint32_t id = pl->instance;
+
+    const std::string full   = assets::resolveAssetPath(rel);
+    const std::string before = readWholeFile(full);
+
+    scene::PrefabAsset asset;
+    if (!scene::loadPrefab(rel, asset)) {
+        notify(TR("Apply failed: cannot load ") + rel);
+        return false;
+    }
+
+    const std::string sceneBefore = snapshot();
+    int cleared = 0;
+    const int wrote = scene::applyInstanceToAsset(m_editorScene, asset, id, &cleared);
+    std::string err;
+    if (!scene::savePrefab(asset, err)) {
+        notify(TR("Apply failed: ") + err);
+        return false;
+    }
+
+    // Apply 之后**必须**让该 prefab 的所有实例重新同步：覆盖已清空，但
+    // 别的实例手里还是旧值 —— 不同步的话只有被 Apply 的那一份变，
+    // 看起来像"Apply 只对一半生效"。
+    {
+        scene::PrefabAsset fresh;
+        if (scene::loadPrefab(rel, fresh))
+            scene::syncInstances(m_editorScene, m_assets, fresh);
+    }
+
+    const std::string sceneAfter = snapshot();
+    const std::string after      = readWholeFile(full);
+    if (sceneBefore != sceneAfter || before != after) {
+        m_commands.pushAlreadyApplied(std::make_unique<editor::PrefabApplyCommand>(
+            TR("Apply to Prefab"), &m_editorScene, &m_assets, full, before, after,
+            sceneBefore, sceneAfter));
+        m_dirty = true;
+    }
+    setStatus(TR("Apply to Prefab"));
+    notify(TR("Applied to ") + rel);
+    VK_LOG_INFO("HIER-PREFAB apply=1 path=%s instance=%u wrote=%d cleared=%d",
+                rel.c_str(), id, wrote, cleared);
+    return true;
+}
+
+bool EditorContext::prefabRevert(ecs::Entity member) {
+    if (!isEditing() || !member.valid()) return false;
+    const auto* pl = m_editorScene.world().get<ecs::PrefabLinkComponent>(member);
+    if (!pl) return false;
+    const std::string rel  = pl->prefabPath;
+    const std::uint32_t id = pl->instance;
+
+    scene::PrefabAsset asset;
+    if (!scene::loadPrefab(rel, asset)) {
+        notify(TR("Revert failed: cannot load ") + rel);
+        return false;
+    }
+
+    int cleared = 0;
+    structuralEdit(TR("Revert from Prefab"), [&] {
+        cleared = scene::clearInstanceOverrides(m_editorScene, id);
+        scene::syncInstances(m_editorScene, m_assets, asset);
+    });
+    notify(TR("Reverted to ") + rel);
+    setStatus(TR("Revert from Prefab"));
+    VK_LOG_INFO("HIER-PREFAB revert=1 path=%s instance=%u cleared=%d",
+                rel.c_str(), id, cleared);
+    return true;
+}
+
+bool EditorContext::prefabInstantiate(const std::string& relPath,
+                                      const glm::vec3& at) {
+    if (!isEditing()) return false;
+    scene::PrefabAsset asset;
+    if (!scene::loadPrefab(relPath, asset)) {
+        notify(TR("Instantiate failed: cannot load ") + relPath);
+        VK_LOG_ERROR("HIER-PREFAB instantiate=0 path=%s err=%s",
+                     relPath.c_str(), asset.error.c_str());
+        return false;
+    }
+    scene::PrefabInstance inst;
+    std::string err;
+    structuralEdit(TR("Instantiate Prefab"), [&] {
+        scene::instantiatePrefab(m_editorScene, m_assets, asset, at, inst, &err);
+    });
+    if (!inst.root.valid()) {
+        notify(TR("Instantiate failed: ") + err);
+        return false;
+    }
+    select(inst.root);
+    notify(TR("Instantiated ") + relPath);
+    setStatus(TR("Instantiate Prefab"));
+    VK_LOG_INFO("HIER-PREFAB instantiate=1 path=%s root=%u members=%d",
+                relPath.c_str(), static_cast<unsigned>(inst.root.id),
+                static_cast<int>(inst.members.size()));
+    return true;
+}
+
+void EditorContext::validateSelection() {
+    scene::Scene& sc = activeScene();
+    ecs::World& w = sc.world();
+
+    // ---- ① 逐个修补集合成员 ----
+    // 句柄失效 —— 撤销删除 / Play / Stop 之后都会走到这里。名字是跨"场景
+    // 重建"唯一稳定的标识，按它找回来；名字也找不到就**丢掉那一项**，
+    // 否则下一次批量移动会拿一个死句柄去写内存。
+    std::vector<ecs::Entity> set;
+    std::vector<std::string> names;
+    set.reserve(m_selectionSet.size());
+    names.reserve(m_selectionSet.size());
+    std::size_t restored = 0;
+    std::size_t dropped = 0;
+    for (std::size_t i = 0; i < m_selectionSet.size(); ++i) {
+        ecs::Entity s = m_selectionSet[i];
+        const std::string nm =
+            (i < m_selectionNames.size()) ? m_selectionNames[i] : std::string();
+        if (!s.valid() || !w.alive(s)) {
+            s = nm.empty() ? ecs::Entity{} : sc.find(nm);
+            if (!s.valid()) {
+                ++dropped;
+                continue;
+            }
+            ++restored;
+        }
+        bool dup = false;
+        for (ecs::Entity k : set)
+            if (k.id == s.id) dup = true;
+        if (dup) continue;
+        const std::string* np = w.name(s);
+        set.push_back(s);
+        names.push_back(np ? *np : nm);
+    }
+
+    // ---- ② 修主选中项 ----
+    if (m_selection.valid() && w.alive(m_selection)) {
+        if (const std::string* n = w.name(m_selection))
+            m_selectionName = *n;
+    } else {
+        // 新建出来的组件是全新的，手柄不能再指着一个"已经不存在的碰撞体"
+        m_colliderEdit = false;
+        m_selection = ecs::Entity{};
+        if (!m_selectionName.empty()) {
+            const ecs::Entity found = sc.find(m_selectionName);
+            if (found.valid()) m_selection = found;
+        }
+    }
+
+    // ---- ③ 收口不变式：集合为空 ⇔ 主选中项无效 ----
+    if (m_selectionSet.size() != set.size() || restored || dropped) {
+        VK_LOG_INFO("SELECT set repaired n=%zu restored=%zu dropped=%zu",
+                    set.size(), restored, dropped);
+    }
+    m_selectionSet.swap(set);
+    m_selectionNames.swap(names);
+
+    if (m_selectionSet.empty()) {
+        if (m_selection.valid()) {
+            // 主选中项还活着但没进集合（历史上只可能来自"直接改 m_selection"
+            // 的支路）—— 以它为准建一个单元素集合，别把它悄悄丢了。
+            m_selectionSet.push_back(m_selection);
+            m_selectionNames.push_back(m_selectionName);
+        }
+        return;
+    }
+    if (!m_selection.valid()) {
+        m_selection = m_selectionSet.front();
+        if (const std::string* n = w.name(m_selection)) m_selectionName = *n;
     }
 }
 

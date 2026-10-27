@@ -4,10 +4,12 @@
 #include "ui2/SdfFont.h"
 #include "ui2/Ui2Settings.h"
 #include "ui2/UiCanvas.h"
+#include "ui2/UiDocument.h"
 #include "ui2/UiFocus.h"
 #include "ui2/UiLayout.h"
 #include "ui2/UiWidget.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -442,6 +444,265 @@ void testFocus() {
     }
 }
 
+// ---- UI 文档（#312）：解析 / 往返 / 锚点 / 绑定 / 绘制 ----
+//
+// 这一组的价值在于"界面长什么样"第一次变成**可断言的数据**：矩形从哪来、
+// 绑定取到几、存回去有没有变样，全都不用开窗口。刻意**不读磁盘**（JSON
+// 用字面量）—— 资产改了不该让自检红；资产本身由 `verify_ui_editor.py` 管。
+void testDocument(const SdfFont& f) {
+    // 一份"最小但每种控件都出现一次"的文档：面板 → 两个子控件，
+    // 外加一个顶层文本。层级是刻意做的 —— 子控件锚点是相对**父矩形**的，
+    // 那正是最容易写成"相对屏幕"的一段。
+    static const char* kDoc = R"JSON({
+  "version": 1,
+  "name": "selftest",
+  "canvas": [1920, 1080],
+  "//": "self-test fixture",
+  "widgets": [
+    {
+      "id": "hud",
+      "type": "nine",
+      "anchor": "bottom-left",
+      "rect": [24, 24, 320, 64],
+      "color": "#101319FF",
+      "color2": "#1B2028FF",
+      "radius": 6,
+      "inset": 2,
+      "children": [
+        {
+          "id": "hp",
+          "type": "progress",
+          "rect": [8, 8, 260, 16],
+          "color": "#D93A3AFF",
+          "color2": "#00000096",
+          "radius": 8,
+          "bind": "health",
+          "bindMax": "maxHealth"
+        },
+        {
+          "id": "hpnum",
+          "type": "text",
+          "rect": [8, 30, 260, 24],
+          "text": "HP {health}/{maxHealth}",
+          "size": 16,
+          "align": "right"
+        }
+      ]
+    },
+    { "id": "title", "type": "text", "anchor": "top-center", "rect": [0, 40, 600, 40],
+      "text": "Chapter 1", "size": 28, "align": "center" }
+  ]
+})JSON";
+
+    UiDocument d;
+    const bool ok = parseUiDocument(kDoc, "selftest.ui.json", d);
+    report("uidoc_parse_ok", ok ? "1" : "0", "1", 0, ok);
+    if (!ok) {
+        VK_LOG_WARN("UI2-TEST uidoc error=%s", d.error.c_str());
+        return;
+    }
+    report("uidoc_parse_widgets", std::to_string(countWidgets(d.widgets)), "4",
+           0, countWidgets(d.widgets) == 4);
+    report("uidoc_parse_warn_free", std::to_string(d.warnings.size()), "0", 0,
+           d.warnings.empty());
+    report("uidoc_parse_comment", d.comment, "self-test fixture", 0,
+           d.comment == "self-test fixture");
+
+    // ---- 往返：`toJson → parse → toJson` 必须**逐字节**相同 ----
+    // 这一条是"编辑器按 Save 不丢东西"的最硬判据。只比"字段还在"是不够的
+    // ——漏写一个字段、把 `2.0f` 写成 `2`、把颜色大小写改了，都要红。
+    const std::string j1 = toJson(d);
+    UiDocument d2;
+    const bool ok2 = parseUiDocument(j1, "roundtrip", d2);
+    const std::string j2 = ok2 ? toJson(d2) : std::string("<parse failed>");
+    report("uidoc_roundtrip_bytes", std::to_string(j2.size()) + "B",
+           std::to_string(j1.size()) + "B", 0, ok2 && j1 == j2);
+
+    // ---- 锚点：右下角 320×64，距边 24 ----
+    {
+        const UiDocument& doc = d;
+        UiBindings b;
+        const auto placed = placeDocument(doc, b, 1920, 1080);
+        report("uidoc_place_count", std::to_string(placed.size()), "4", 0,
+               placed.size() == 4);
+        if (placed.size() == 4) {
+            // 深度优先：hud → hp → hpnum → title
+            report("uidoc_place_order", placed[0].id + ">" + placed[1].id + ">" +
+                                            placed[2].id + ">" + placed[3].id,
+                   "hud>hp>hpnum>title", 0,
+                   placed[0].id == "hud" && placed[1].id == "hp" &&
+                       placed[2].id == "hpnum" && placed[3].id == "title");
+            const UiRect& hud = placed[0].rect;
+            report("uidoc_anchor_bottom_left_x", f2s(hud.x), "24.0000", 1e-3,
+                   std::fabs(hud.x - 24.0f) < 1e-3f);
+            report("uidoc_anchor_bottom_left_y", f2s(hud.y), "992.0000", 1e-3,
+                   std::fabs(hud.y - (1080.0f - 24.0f - 64.0f)) < 1e-3f);
+
+            // 子控件在父矩形里：x=8 → hud.x + 8
+            const UiRect& hp = placed[1].rect;
+            report("uidoc_child_in_parent_x", f2s(hp.x), f2s(hud.x + 8.0f),
+                   1e-3, std::fabs(hp.x - (hud.x + 8.0f)) < 1e-3f);
+            report("uidoc_child_in_parent_w", f2s(hp.w), "260.0000", 1e-3,
+                   std::fabs(hp.w - 260.0f) < 1e-3f);
+
+            // 顶层居中：600 宽在 1920 里 → x = (1920-600)/2 = 660
+            const UiRect& title = placed[3].rect;
+            report("uidoc_anchor_top_center_x", f2s(title.x), "660.0000", 1e-3,
+                   std::fabs(title.x - 660.0f) < 1e-3f);
+        }
+    }
+
+    // ---- 分辨率无关：1280×720 下"占屏比例"必须与 1920×1080 一致 ----
+    {
+        UiBindings b;
+        const auto a = placeDocument(d, b, 1920, 1080);
+        const auto c = placeDocument(d, b, 1280, 720);
+        bool same = (a.size() == c.size()) && !a.empty();
+        double worst = 0.0;
+        for (std::size_t i = 0; same && i < a.size(); ++i) {
+            const double rx = a[i].rect.x / 1920.0;
+            const double cx = c[i].rect.x / 1280.0;
+            const double rw = a[i].rect.w / 1920.0;
+            const double cw = c[i].rect.w / 1280.0;
+            worst = std::max(worst, std::max(std::fabs(rx - cx),
+                                             std::fabs(rw - cw)));
+        }
+        report("uidoc_scale_independent", f2s(worst), "<0.002", 2e-3,
+               same && worst < 2e-3);
+    }
+
+    // ---- 绑定：文本替换 + 进度条几何 ----
+    {
+        UiBindings b;
+        b.setNumber("health", 70.0f);
+        b.setNumber("maxHealth", 100.0f);
+        report("uidoc_bind_text",
+               formatBound("HP {health}/{maxHealth}", b), "HP 70/100", 0,
+               formatBound("HP {health}/{maxHealth}", b) == "HP 70/100");
+        {
+            // 整数写整数、非整数留一位小数 —— 血条旁边出现 "70.0 / 100" 是
+            // 二次元 UI 里最碍眼的一种瑕疵。
+            UiBindings t;
+            t.setNumber("a", 70.0f);
+            t.setNumber("c", 70.5f);
+            const std::string got = formatBound("{a} {c}", t);
+            report("uidoc_bind_int_vs_float", got, "70 70.5", 0,
+                   got == "70 70.5");
+        }
+        // 拼错的 key **原样保留** —— 静默变空会让作者以为绑定没生效
+        report("uidoc_bind_unknown_kept", formatBound("[{maxHelth}]", b),
+               "[{maxHelth}]", 0,
+               formatBound("[{maxHelth}]", b) == "[{maxHelth}]");
+
+        const auto placed = placeDocument(d, b, 1920, 1080);
+        const float wantW = (260.0f - 0.0f) * 0.7f;  // hp: inset 未设
+        report("uidoc_bind_progress_fill",
+               placed.size() > 1 ? f2s(placed[1].fill.w) : "n/a",
+               f2s(wantW), 1e-2,
+               placed.size() > 1 && std::fabs(placed[1].fill.w - wantW) < 1e-2f);
+
+        // 没绑定时退回静值（value），且 maxHealth=0 不能除零
+        UiBindings none;
+        const auto p2 = placeDocument(d, none, 1920, 1080);
+        report("uidoc_bind_missing_zero",
+               p2.size() > 1 ? f2s(p2[1].fill.w) : "n/a", "0.0000", 1e-3,
+               p2.size() > 1 && std::fabs(p2[1].fill.w) < 1e-3f);
+    }
+
+    // ---- 绘制：图元数与"不可见整棵子树跳过" ----
+    {
+        UiBindings b;
+        b.setNumber("health", 70.0f);
+        b.setNumber("maxHealth", 100.0f);
+        UiCanvas c;
+        c.begin();
+        const UiDocDrawStats st = drawDocument(c, d, b, 1920, 1080, &f);
+        report("uidoc_draw_widgets", std::to_string(st.widgets), "4", 0,
+               st.widgets == 4);
+        // 4 个控件 = 4 个矩形图元（nine 外框+内芯、progress 槽+填充）+
+        // 两段文字。⚠ 字形是**逐字** 6 顶点的，所以只断言"矩形图元那 24
+        // 个顶点一定在"，再单独断言文字段数 —— 把字数写死等于字体图集
+        // 一改就红，而那条断言什么也没证明。
+        const std::size_t base = 24;   // 6 顶点 × 4 个矩形
+        report("uidoc_draw_rect_verts",
+               std::to_string(c.vertices().size()), ">=24", 0,
+               c.vertices().size() >= base &&
+                   (f.valid() ? c.vertices().size() > base
+                              : c.vertices().size() == base));
+        report("uidoc_draw_texts", std::to_string(st.texts),
+               f.valid() ? "2" : "0", 0, st.texts == (f.valid() ? 2 : 0));
+
+        // 隐藏父 → 父与两个子一起消失（3 个控件），只剩顶层文本
+        UiDocument h = d;
+        h.widgets[0].visible = false;
+        UiCanvas c2;
+        c2.begin();
+        const UiDocDrawStats st2 = drawDocument(c2, h, b, 1920, 1080, &f);
+        report("uidoc_hidden_parent_skips_children",
+               std::to_string(st2.widgets) + "/" + std::to_string(st2.skipped),
+               "1/1", 0, st2.widgets == 1 && st2.skipped == 1);
+
+        // 输出尺寸为 0（窗口最小化）→ 一个顶点都不许吐
+        UiCanvas c3;
+        c3.begin();
+        drawDocument(c3, d, b, 0, 0, &f);
+        report("uidoc_zero_extent", std::to_string(c3.vertices().size()), "0", 0,
+               c3.vertices().empty());
+    }
+
+    // ---- 坏文档必须被拒（每一条都对应一种"静默画歪"）----
+    {
+        UiDocument bad;
+        const bool r1 = parseUiDocument(
+            R"({"widgets":[{"id":"a","type":"text","rect":[0,0,10,10]},
+                          {"id":"a","type":"text","rect":[0,0,10,10]}]})",
+            "dup", bad);
+        report("uidoc_reject_dup_id", r1 ? "accepted" : "rejected", "rejected",
+               0, !r1);
+        report("uidoc_reject_dup_id_msg",
+               bad.error.find("duplicate") != std::string::npos ? "1" : "0",
+               "1", 0, bad.error.find("duplicate") != std::string::npos);
+
+        UiDocument bad2;
+        const bool r2 = parseUiDocument(
+            R"({"widgets":[{"id":"a","type":"text","anchor":"middle-upp",
+                            "rect":[0,0,10,10]}]})",
+            "anchor", bad2);
+        report("uidoc_reject_bad_anchor", r2 ? "accepted" : "rejected",
+               "rejected", 0, !r2);
+
+        UiDocument bad3;
+        const bool r3 = parseUiDocument(
+            R"({"widgets":[{"id":"a","type":"text"}]})", "rect", bad3);
+        report("uidoc_reject_missing_rect", r3 ? "accepted" : "rejected",
+               "rejected", 0, !r3);
+
+        UiDocument bad4;
+        const bool r4 = parseUiDocument(
+            R"({"widgets":[{"id":"a","type":"slider","rect":[0,0,10,10]}]})",
+            "type", bad4);
+        report("uidoc_reject_unknown_type", r4 ? "accepted" : "rejected",
+               "rejected", 0, !r4);
+
+        UiDocument bad5;
+        const bool r5 = parseUiDocument(
+            R"({"widgets":[{"id":"a b","type":"text","rect":[0,0,10,10]}]})",
+            "id", bad5);
+        report("uidoc_reject_id_with_space", r5 ? "accepted" : "rejected",
+               "rejected", 0, !r5);
+
+        // 颜色写错只是**警告**（控件照样画，用默认色）—— 与上面五条不同：
+        // 它不会让画面结构错位，只是颜色不对。
+        UiDocument warn;
+        const bool r6 = parseUiDocument(
+            R"({"widgets":[{"id":"a","type":"panel","rect":[0,0,10,10],
+                            "color":"0x123456"}]})",
+            "color", warn);
+        report("uidoc_bad_color_warns", r6 ? "1" : "0", "1", 0,
+               r6 && warn.warnings.size() == 1);
+    }
+}
+
 }  // namespace
 
 int runUi2SelfTest() {
@@ -459,6 +720,7 @@ int runUi2SelfTest() {
     testLayout();
     testWidget(font);
     testFocus();
+    testDocument(font);
 
     VK_LOG_INFO("UI2-TOTAL pass=%d fail=%d", g_pass, g_fail);
     return g_fail;

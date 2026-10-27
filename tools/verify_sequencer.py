@@ -91,9 +91,15 @@ CUT_MAX_COUNT = 1           # opening.seq.json 里只有一个 step 关键帧
 TRAVEL_MIN = 4.0
 STOP_EPS = 0.08             # 收尾三帧的位移上限（实测 0.012，留 5 倍余量）
 
-# 帧数：过场 8 秒。实测相机活跃段 ~194 帧里跑完 8 秒（24 fps 上下），
-# 前面还有 ~66 帧在加载/编管线。260 帧刚好越过末帧再留一点余量。
-MAX_FRAMES = 260
+# 帧数：过场 8 秒 + 前面 ~66 帧加载/编管线。
+# ⚠⚠ 这个数**以前是假的**：因为参数名写错成 `--max-frames`，引擎根本没看到
+#   它（`applyCli` 静默忽略未知参数），进程一直跑，靠 `communicate(timeout=45)`
+#   到点 kill —— 实际跑到 1000 多帧，260 这个数从来没被真正用上。改成正确的
+#   `--frames` 之后它才生效，于是 260 帧**根本没跑完 8 秒**：③ 事件缺尾巴、
+#   ⑥ 相机没走到底，两条一起红。
+# ⚠ 取 700 而不是"算出来的 330"：fps 是浮的（`maxFps=60` 上限，实测 20~40），
+#   60 fps 下 8 秒就是 480 帧 + 启动 66 帧。宁可多跑几秒，也不能卡在边界上。
+MAX_FRAMES = 700
 
 POS_RE = re.compile(r"CAM-POSE name=(\S+) pos=\(([-\d.]+),([-\d.]+),([-\d.]+)\)")
 EVENT_RE = re.compile(r"SEQ-EVENT seq=(\S+) kind=(\S+) t=([\d.]+) payload=\[([^\]]*)\]")
@@ -115,15 +121,22 @@ def run_game(scene, wait_s=45.0, timeout=90.0):
     ⚠ 必须用 `communicate()`（或专门的排空线程）收输出：`Popen(stdout=PIPE)`
       却没人读，64 KB 管道满的那一刻进程会**永久阻塞**——症状是"跑到一半
       不动了"，而不是报错。
-    ⚠ 用 `--max-frames` 让进程**自己退出**，别靠 `kill()`。靠 kill 的时候
+    ⚠ 用 `--frames` 让进程**自己退出**，别靠 `kill()`。靠 kill 的时候
       "日志截到哪一帧"取决于墙钟，而 8 秒的过场能不能跑完取决于当时 fps ——
       于是同一份代码有时截到第 6 秒（末帧断言全红）、有时截到第 9 秒（全绿）。
       帧数一钉，日志窗口就固定了。
+    ⚠⚠ 参数名是 `--frames`，**不是** `--max-frames`。`RuntimeConfig::applyCli`
+      末尾对未知参数**不报错**（注释写明"快捷方式里塞进来的东西不该让游戏
+      起不来"），所以拼错一个名字完全静默：进程照常跑、日志照常打、断言照常
+      过 —— 只不过它其实一直没退出，是 `communicate(timeout=45)` 到点后
+      **被 kill** 的。本脚本第一版就写成 `--max-frames`，于是"不靠 kill"那句
+      注释是假的：真跑起来是"靠 45 秒超时 + kill，恰好 kill 前已经越过第 260
+      帧"。已改成 `--frames`。
     """
     env = dict(os.environ)
     env["MYVK_LOG_DT"] = ""          # 不要逐帧探针，日志已经够长
     argv = [GAME_EXE, "--scene", scene, "--trace-states",
-            "--max-frames", str(MAX_FRAMES)]
+            "--frames", str(MAX_FRAMES)]
     proc = subprocess.Popen(argv, cwd=os.path.dirname(GAME_EXE), env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:

@@ -2,6 +2,9 @@
 
 #include "Localization.h"
 #include "CharacterWindow.h"
+#include "DialogueEditorWindow.h"
+#include "TimelineEditorWindow.h"
+#include "UiEditorWindow.h"
 #include "CommandRegistry.h"
 #include "ContentBrowser.h"
 #include "DebugRects.h"
@@ -60,6 +63,7 @@
 #include "render/Renderer.h"
 #include "scene/Camera.h"
 #include "scene/LookLimits.h"
+#include "scene/Prefab.h"
 #include "scene/SpringArm.h"
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
@@ -388,6 +392,21 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         // 它的两个动作分别服务地形笔刷（Landscape 模式）与属性栏换材质。
         {"matlib", "Material library", PanelGroup::Authoring, "", "palette",
          false, true, kSlotNone, &EditorApp::panelDrawMaterialLibrary},
+        // 2026-10-27（#310）：剧本编辑器。与 Character 同款 —— 窗口对象自己
+        // 管 open/close（它还要带一个资产路径），表项只做"显隐 + 快捷键 +
+        // 落盘"三路，真正的 draw 在 drawDialogueEditorWindow 里每帧无条件跑。
+        {"dialogueed", "Script editor", PanelGroup::Authoring, "", "code",
+         false, true, kSlotNone, &EditorApp::panelDrawDialogueEditor},
+        // 2026-10-27（#311）：时间轴轨道编辑器。与上面那一格**完全同构** ——
+        // 同样是"窗口对象自己管 open/close + 带一个资产路径"，表项只做
+        // 显隐 / 快捷键 / 落盘三路，真正的 draw 在 drawTimelineEditorWindow。
+        {"timelineed", "Timeline editor", PanelGroup::Authoring, "", "timeline",
+         false, true, kSlotNone, &EditorApp::panelDrawTimelineEditor},
+        // 2026-10-27（#312）：UI 编辑器（`.ui.json` 控件树 + 锚点 + 绑定）。
+        // 与上两格**完全同构**：窗口对象自己管 open/close，表项只做
+        // 显隐 / 落盘，真正的 draw 在 drawUiEditorWindow。
+        {"uied", "UI editor", PanelGroup::Authoring, "", "layout",
+         false, true, kSlotNone, &EditorApp::panelDrawUiEditor},
     };
 }
 
@@ -432,6 +451,14 @@ void EditorApp::panelDrawGpuTimeline(EditorApp& a) {
 //   由此区分两种"勾着但没开"：**用户刚关的**（上帧开过）与**刚被勾上的**
 //   （上帧没开）。前者把注册表也关掉，后者才打开。
 void EditorApp::panelDrawCharacter(EditorApp& a) { (void)a; }
+// 同款空壳：drawDialogueEditorWindow 每帧无条件被调用（见 onImGui），
+// 这里留一个入口只是为了让面板表有一项 draw（否则表项没有 draw 且
+// slot == kSlotNone 时 drawPanels 会画一个"待建设"占位窗口）。
+void EditorApp::panelDrawDialogueEditor(EditorApp& a) { (void)a; }
+// 同上：drawTimelineEditorWindow 每帧无条件被调用，这里只给面板表一个入口。
+void EditorApp::panelDrawTimelineEditor(EditorApp& a) { (void)a; }
+// 同上（#312）：drawUiEditorWindow 每帧无条件被调用。
+void EditorApp::panelDrawUiEditor(EditorApp& a) { (void)a; }
 void EditorApp::panelDrawPhysics(EditorApp& a) {
     if (a.m_physicsPanel) a.m_physicsPanel->draw();
 }
@@ -1160,6 +1187,12 @@ void EditorApp::onInit() {
     m_inspector = std::make_unique<InspectorPanel>(*m_ctx);
     m_content = std::make_unique<ContentBrowser>(*m_ctx);
     m_characterWindow = std::make_unique<CharacterWindow>(*m_ctx, renderer());
+    // #310 剧本编辑器（窗口对象，生命周期与 Character 同构）
+    m_dlgEditor = std::make_unique<DialogueEditorWindow>(*m_ctx);
+    // #311 时间轴编辑器（同上）
+    m_tlEditor = std::make_unique<TimelineEditorWindow>(*m_ctx);
+    // #312 UI 编辑器（同上）
+    m_uiEditor = std::make_unique<UiEditorWindow>(*m_ctx);
 
     // E18：命令注册表（命令面板 / 快捷键表 / 总览共用）。必须在所有面板
     // 与 Renderer 都就绪之后 —— 命令的 handler 会摸它们。
@@ -1341,6 +1374,37 @@ void EditorApp::onInit() {
                 VK_LOG_WARN("Editor: auto-select '%s' not found", envSel);
             }
         }
+    }
+
+    // ---- MYVK_EDITOR_DLGED=<路径>：启动即打开剧本编辑器（#310）----
+    // 走的是和 Inspector "Edit script…" 按钮**同一条**请求通道（ctx 里那个
+    // 一次性请求），所以自动化验的是真入口，不是给测试开的旁路。
+    // 配套的两个钩子在 DialogueEditorWindow 自己手里：
+    //   MYVK_EDITOR_DLGED_SCRIPT="sel:2;settext:…;save"   注入命令（只跑一次）
+    //   MYVK_EDITOR_DLGED_DUMP=<路径>                     把当前资产落成 JSON
+    if (const char* envDlg = std::getenv("MYVK_EDITOR_DLGED")) {
+        m_ctx->requestDialogueEditor(envDlg);
+        VK_LOG_INFO("Editor: script-editor request path='%s'", envDlg);
+    }
+
+    // ---- MYVK_EDITOR_TLED=<路径>：启动即打开时间轴编辑器（#311）----
+    // 与上面 DLGED 那条**同一条**请求通道（ctx 的一次性请求），所以自动化
+    // 验的是"Inspector 点 Edit timeline…"那个真入口。
+    // 配套两个钩子在 TimelineEditorWindow 自己手里：
+    //   MYVK_EDITOR_TLED_SCRIPT="sel:camera:1;settime:2.5;save"  注入命令
+    //   MYVK_EDITOR_TLED_DUMP=<路径>                             把资产落成 JSON
+    if (const char* envTl = std::getenv("MYVK_EDITOR_TLED")) {
+        m_ctx->requestTimelineEditor(envTl);
+        VK_LOG_INFO("Editor: timeline-editor request path='%s'", envTl);
+    }
+
+    // ---- MYVK_EDITOR_UIED=<路径>：启动即打开 UI 编辑器（#312）----
+    // 第三个资产编辑器，走同一条 ctx 一次性请求通道。
+    //   MYVK_EDITOR_UIED_SCRIPT="sel:hud/hpbar;setpos:40,40;save"  注入命令
+    //   MYVK_EDITOR_UIED_DUMP=<路径>                               落成 JSON
+    if (const char* envUi = std::getenv("MYVK_EDITOR_UIED")) {
+        m_ctx->requestUiEditor(envUi);
+        VK_LOG_INFO("Editor: ui-editor request path='%s'", envUi);
     }
 
     // ---- MYVK_EDITOR_CAM="x,y,z,yawDeg,pitchDeg"：把视口相机摆到指定位姿 ----
@@ -3617,31 +3681,11 @@ void EditorApp::handleShortcuts() {
     if (ImGui::IsKeyPressed(ImGuiKey_F2, false)) m_hierarchy->beginRenameSelection();
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) m_ctx->clearSelection();
 
-    // 删除
-    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && m_ctx->isEditing()) {
-        const ecs::Entity victim = m_ctx->selection();
-        const std::string* np = m_ctx->editorScene().world().name(victim);
-        const std::string label =
-            "Delete " + (np ? *np : std::string("Entity"));
-
-        scene::Scene& sc = m_ctx->editorScene();
-        m_ctx->structuralEdit(label, [&]() {
-            ecs::World& w = sc.world();
-            if (auto* h = w.get<ecs::HierarchyComponent>(victim)) {
-                if (h->parent != ecs::kInvalidEntity) {
-                    const ecs::Entity parent = w.handle(h->parent);
-                    if (auto* ph = w.get<ecs::HierarchyComponent>(parent)) {
-                        auto& kids = ph->children;
-                        kids.erase(std::remove(kids.begin(), kids.end(),
-                                               victim.id),
-                                   kids.end());
-                    }
-                }
-            }
-            w.destroy(victim);
-        });
-        m_ctx->validateSelection();
-    }
+    // 删除：**多选时一次全删**（一条撤销记录）。逻辑收敛在 SceneHierarchy
+    // 里 —— 右键菜单的 Delete 走的是同一个函数，两处各写一遍的话迟早
+    // 出现"右键删得干净、按 Del 留下孤儿"。
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && m_ctx->isEditing())
+        m_hierarchy->deleteSelection();
 }
 
 // ---------------------------------------------------------------- UI 编排
@@ -3740,6 +3784,9 @@ void EditorApp::onImGui() {
 
     if (m_ctx->showSettings()) drawSettingsPanel();
     drawCharacterWindow();
+    drawDialogueEditorWindow();
+    drawTimelineEditorWindow();
+    drawUiEditorWindow();
 
     // 浮动面板标题栏的"最小化"按钮。必须排在**所有窗口画完之后**：它要读
     // 每个窗口这一帧的 Pos/Size 才能把那一格摆到关闭 X 的左边（见函数注释）。
@@ -6770,6 +6817,91 @@ void EditorApp::registerConsoleCommands() {
             return "saved: " + m_ctx->scenePath();
         });
 
+    // ---- 预制体（G18）----
+    //
+    // 六条命令走的是与层级右键菜单**完全相同**的 EditorContext 方法，不是
+    // 测试专用捷径。因此它们同时干三件事：
+    //   ① 自动化（`MYVK_EDITOR_CONSOLE_CMD`）能把"建 → 摆 → 改母版 → Apply /
+    //      Revert"整条链跑一遍，且断言落在 `HIER-PREFAB` / `PREFAB-*` 上；
+    //   ② 命令面板自动多出六项（E18 的命令表就是从这张控制台表派生的）；
+    //   ③ 用户可以在控制台里先手动做一次，再复制成脚本。
+    //
+    // `prefab.reload` 单独说一句：母版是**磁盘上的文件**，用户可能在外部
+    // 编辑器里改了它。没有这条命令，"改母版 → 所有实例跟着变"在编辑器里
+    // 就没有触发点（文件监听是下一步的事）。
+    con->addCommand("prefab.create",
+        "prefab.create [name]  export the selected subtree as a prefab asset",
+        [this](const std::vector<std::string>& args) -> std::string {
+            const ecs::Entity sel = m_ctx->selection();
+            const std::string* np = m_ctx->activeScene().world().name(sel);
+            const std::string nm = args.size() >= 2
+                                       ? args[1]
+                                       : (np ? *np : std::string("prefab"));
+            const std::string rel = scene::prefabDefaultPath(nm);
+            if (!m_ctx->prefabCreateFromSelection(rel)) return "create failed";
+            return "created: " + rel;
+        });
+    con->addCommand("prefab.instantiate",
+        "prefab.instantiate <path> [x y z]  place a prefab into the scene",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: prefab.instantiate <path> [x y z]";
+            glm::vec3 at(0.0f);
+            if (args.size() >= 5) {
+                at = glm::vec3(static_cast<float>(std::atof(args[2].c_str())),
+                               static_cast<float>(std::atof(args[3].c_str())),
+                               static_cast<float>(std::atof(args[4].c_str())));
+            }
+            if (!m_ctx->prefabInstantiate(args[1], at)) return "instantiate failed";
+            return "instantiated: " + args[1];
+        });
+    con->addCommand("prefab.apply",
+        "prefab.apply  write the selected instance's overrides back to the asset",
+        [this](const std::vector<std::string>&) -> std::string {
+            const ecs::Entity sel = m_ctx->selection();
+            if (!m_ctx->prefabApply(sel)) return "apply failed";
+            return "applied";
+        });
+    con->addCommand("prefab.revert",
+        "prefab.revert  drop the selected instance's overrides (back to the asset)",
+        [this](const std::vector<std::string>&) -> std::string {
+            const ecs::Entity sel = m_ctx->selection();
+            if (!m_ctx->prefabRevert(sel)) return "revert failed";
+            return "reverted";
+        });
+    con->addCommand("prefab.reload",
+        "prefab.reload <path>  re-read the asset from disk and re-sync every instance",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: prefab.reload <path>";
+            scene::PrefabAsset a;
+            if (!scene::loadPrefab(args[1], a))
+                return "load failed: " + a.error;
+            const scene::PrefabSyncResult r =
+                scene::syncInstances(m_ctx->activeScene(), m_ctx->assets(), a);
+            m_ctx->dirty() = true;
+            return "synced: instances=" + std::to_string(r.instances) +
+                   " applied=" + std::to_string(r.applied) +
+                   " failed=" + std::to_string(r.failed);
+        });
+    con->addCommand("prefab.info",
+        "prefab.info  print the selected entity's prefab link (PREFAB-INFO)",
+        [this](const std::vector<std::string>&) -> std::string {
+            scene::Scene& sc = m_ctx->activeScene();
+            const ecs::Entity sel = m_ctx->selection();
+            const auto* pl = sc.world().get<ecs::PrefabLinkComponent>(sel);
+            if (!pl) {
+                // 也打一条锚点：脚本要能区分"不是实例"与"命令没跑"
+                VK_LOG_INFO("PREFAB-INFO ok=0 reason=not-a-member");
+                return "not a prefab member";
+            }
+            const int ov = scene::countOverrides(sc, pl->instance);
+            VK_LOG_INFO("PREFAB-INFO ok=1 path=%s instance=%u root=%d "
+                        "localId=%s overrides=%d",
+                        pl->prefabPath.c_str(), pl->instance,
+                        pl->root ? 1 : 0, pl->localId.c_str(), ov);
+            return pl->prefabPath + "  instance " + std::to_string(pl->instance) +
+                   "  overrides " + std::to_string(ov);
+        });
+
     // ---- 音频（G14-8）----
     //
     // 三个命令走的是**与 UI 完全相同**的那条路（`EditorContext` 请求 →
@@ -8034,6 +8166,156 @@ void EditorApp::drawCharacterWindow() {
     }
     // 不是当前页就**不提交** —— 这正是标签页的语义。窗口对象活着
     // （m_open 不变），下次切回来时从自己的状态原样恢复。
+}
+
+// ---------------------------------------------------------------- 剧本编辑器
+//
+// 三个入口，全部汇到 `DialogueEditorWindow::open(path)`：
+//   ① Inspector 的 dialogue 页签 → "Edit script…"（走 ctx 请求）
+//   ② View / Window 菜单或底栏托盘（走面板表，空手开窗）
+//   ③ `MYVK_EDITOR_DLGED=<path>`（自动化）
+//
+// ⚠ 显隐的**唯一真源是面板表那一格**（panelOpen("dialogueed")），窗口对象
+//   只是跟着它走。反过来的写法（窗口自己说了算，面板表去追）会在"点 × 关
+//   窗口"时打架：窗口关了、表里还勾着 → 下一帧同步又给它打开（Character
+//   在 2026-10-17 踩过这个坑，见 panelDrawCharacter 的长注释）。
+void EditorApp::drawDialogueEditorWindow() {
+    if (!m_dlgEditor) return;
+    const int idx = panelIndexOf("dialogueed");
+    if (idx < 0) return;
+
+    // ---- ① 请求：Inspector 点了 "Edit script…" ----
+    std::string reqPath;
+    if (m_ctx->takeDialogueEditorRequest(reqPath)) {
+        m_dlgEditor->open(reqPath);
+        setPanelOpen(idx, true);
+        panelTrayHiddenRef(idx) = false;
+        VK_LOG_INFO("PANEL dialogueed open=1 reason=edit-request path=%s",
+                    reqPath.c_str());
+    }
+
+    // ---- ② 托盘收起：窗口对象保持打开，这一帧不提交 ----
+    // 与 Character 同款：否则"最小化"会把窗口收走、按钮也跟着消失。
+    if (panelTrayHiddenRef(idx) && panelOpen(idx)) return;
+
+    // ---- ③ 表 → 窗口 ----
+    bool& open = panelOpenRef("dialogueed");
+    if (!open) {
+        if (m_dlgEditor->isOpen()) {
+            m_dlgEditor->close();
+            VK_LOG_INFO("PANEL dialogueed open=0");
+        }
+        return;
+    }
+    if (!m_dlgEditor->isOpen()) {
+        // 从菜单/托盘打开且手上没有资产：空手开窗（只剩 "New script" 与
+        // 路径输入框）。不自动猜"当前选中的 NPC 挂的那份" —— 选中项可能
+        // 是个灯，猜错等于把一份无关剧本怼到作者脸上。
+        m_dlgEditor->open(std::string());
+        VK_LOG_INFO("PANEL dialogueed open=1 reason=menu");
+    }
+
+    // ---- ④ 画 ----
+    // `keep` 是这一帧的"还想开着吗"：窗口的 × 会把它置 false，我们再把
+    // 面板表那一格跟着关掉 —— 双源冲突就此消失。
+    bool keep = true;
+    m_dlgEditor->draw(keep);
+    if (!keep) setPanelOpen(idx, false);
+}
+
+// ---------------------------------------------------------------- 时间轴编辑器
+//
+// 与上面那个**逐行同构**（#311）。三个入口：
+//   ① Inspector 的 sequence 页签 → "Edit timeline…"（走 ctx 请求）
+//   ② View / Window 菜单或底栏托盘（走面板表，空手开窗）
+//   ③ `MYVK_EDITOR_TLED=<path>`（自动化）
+//
+// ⚠ 两个资产编辑器刻意写成同一个形状：差别只在"打开时带不带资产路径"。
+//   如果哪天要给它们加"关闭前确认"，应该改一处、两处都受益 —— 而不是
+//   因为抄得走样，变成两种行为。
+void EditorApp::drawTimelineEditorWindow() {
+    if (!m_tlEditor) return;
+    const int idx = panelIndexOf("timelineed");
+    if (idx < 0) return;
+
+    // ---- ① 请求：Inspector 点了 "Edit timeline…" ----
+    std::string reqPath;
+    if (m_ctx->takeTimelineEditorRequest(reqPath)) {
+        m_tlEditor->open(reqPath);
+        setPanelOpen(idx, true);
+        panelTrayHiddenRef(idx) = false;
+        VK_LOG_INFO("PANEL timelineed open=1 reason=edit-request path=%s",
+                    reqPath.c_str());
+    }
+
+    // ---- ② 托盘收起：窗口对象保持打开，这一帧不提交 ----
+    if (panelTrayHiddenRef(idx) && panelOpen(idx)) return;
+
+    // ---- ③ 表 → 窗口 ----
+    bool& open = panelOpenRef("timelineed");
+    if (!open) {
+        if (m_tlEditor->isOpen()) {
+            m_tlEditor->close();
+            VK_LOG_INFO("PANEL timelineed open=0");
+        }
+        return;
+    }
+    if (!m_tlEditor->isOpen()) {
+        // 空手开窗：只剩 "New sequence" 与路径输入框。
+        m_tlEditor->open(std::string());
+        VK_LOG_INFO("PANEL timelineed open=1 reason=menu");
+    }
+
+    // ---- ④ 画 ----
+    bool keep = true;
+    m_tlEditor->draw(keep);
+    if (!keep) setPanelOpen(idx, false);
+}
+
+// ---------------------------------------------------------------- UI 编辑器
+//
+// 与上面两个**逐行同构**（#312）。差别只有一处：它没有 Inspector 入口
+// （UI 文档不是场景里的组件），所以三个入口是
+//   ① View 菜单 / 底栏托盘（走面板表，空手开窗）
+//   ② `MYVK_EDITOR_UIED=<path>`（自动化）
+//   ③ 将来：Content 里双击 `.ui.json`（等 ContentBrowser 认识这个扩展名）
+void EditorApp::drawUiEditorWindow() {
+    if (!m_uiEditor) return;
+    const int idx = panelIndexOf("uied");
+    if (idx < 0) return;
+
+    // ---- ① 请求：`MYVK_EDITOR_UIED` ----
+    std::string reqPath;
+    if (m_ctx->takeUiEditorRequest(reqPath)) {
+        m_uiEditor->open(reqPath);
+        setPanelOpen(idx, true);
+        panelTrayHiddenRef(idx) = false;
+        VK_LOG_INFO("PANEL uied open=1 reason=edit-request path=%s",
+                    reqPath.c_str());
+    }
+
+    // ---- ② 托盘收起：窗口对象保持打开，这一帧不提交 ----
+    if (panelTrayHiddenRef(idx) && panelOpen(idx)) return;
+
+    // ---- ③ 表 → 窗口 ----
+    bool& open = panelOpenRef("uied");
+    if (!open) {
+        if (m_uiEditor->isOpen()) {
+            m_uiEditor->close();
+            VK_LOG_INFO("PANEL uied open=0");
+        }
+        return;
+    }
+    if (!m_uiEditor->isOpen()) {
+        // 空手开窗：只剩 "New"（与另两个资产编辑器同一条路）。
+        m_uiEditor->open(std::string());
+        VK_LOG_INFO("PANEL uied open=1 reason=menu");
+    }
+
+    // ---- ④ 画 ----
+    bool keep = true;
+    m_uiEditor->draw(keep);
+    if (!keep) setPanelOpen(idx, false);
 }
 
 } // namespace editor

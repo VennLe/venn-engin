@@ -67,6 +67,9 @@ OLD = mk("assets/shaders/decal.frag",
          "engine/animation/BoneMask.cpp",
          # B2（动画事件 / Notify，2026-10-26）：同上。
          "engine/animation/AnimEvent.cpp",
+         # G18（预制体，2026-10-26 #315）：同上 —— 让下面那条 fixture 是
+         # "改了"而不是"新增"（新增走的是另一条分支：未登记点名）。
+         "engine/scene/Prefab.cpp",
          "engine/assets/Mesh.h")
 
 
@@ -217,7 +220,56 @@ run("editor/InspectorPanel.cpp → 面板块全家族", OLD,
           # Preview 按钮 / 只读事件树）。verify_sequencer 的 ⑦ 组验的正是
           # "这些控件真的画出来了"，而拖动滑条走的是 `tick(sc, 0.0f)` +
           # `applyPoseToSceneCamera` —— 改这个文件必须重跑时间轴那条。
-          "verify_sequencer"})
+          "verify_sequencer",
+          # 2026-10-26（C6 第三步）：Inspector 又多了第 13 个页签 `dialogue`
+          # （`INS-DLG-HEADER/PATH/START` 三个锚点 + `INS-DLG-ASSET` 那一行
+          # 结构化摘要），Add Component 菜单里也多了 `Dialogue` 项。
+          # verify_dialogue_editor 验的就是"这一页真的画出来了 + 资产真的
+          # 解析出 7 行台词"，改这个文件当然该重跑它。
+          "verify_dialogue_editor",
+          # 2026-10-27（#310）：这一页多了 "Edit script..." 按钮
+          # （`INS-DLG-EDIT` 锚点）—— 剧本编辑器面板的三个入口之一，
+          # 它把 `requestDialogueEditor(path)` 推给 ctx。
+          # 改这里当然该重跑剧本编辑器那条（它验的第一件事就是这个入口）。
+          "verify_dialogue_script",
+          # 2026-10-27（#311）：`sequence` 页签多了 "Edit timeline..." 按钮
+          # （`INS-SEQ-EDIT` 锚点）—— 时间轴编辑器面板的三个入口之一，
+          # 它把 `requestTimelineEditor(path)` 推给 ctx。
+          # 改这里当然该重跑时间轴编辑器那条（它验的第一件事就是这个入口）。
+          "verify_timeline_editor",
+          # 2026-10-26（#315）：头部多了一整条 prefab 栏（`INSP-PREFAB` 锚点，
+          # Apply / Revert 两个小按钮）—— 它改的是 `PrefabLinkComponent` 的
+          # 覆盖表（Apply 写回资产 / Revert 清覆盖），而 verify_prefab 的
+          # "Apply 到底生效没有""Revert 清了几条"读的正是这里。
+          "verify_prefab",
+          # 2026-10-27（#316）：Transform 段最前面多了一个分叉 —— 多选时改走
+          # `drawTransformMulti`（每个字段聚合一次，混合值显示 `—`／写 0·1，
+          # 改动走 `batchAdd` / `batchMul` 并压成**一条** `MultiTransformEditCommand`）。
+          # verify_multiselect 的 B 组断的就是 `INSP-MULTI ... pos=mixed` 那几个
+          # 聚合结果，改这里当然该重跑它。
+          "verify_multiselect"})
+# 2026-10-27（#316）：选择集本体（`editor/EditorContext.*`）。
+# 期望是**并集**，而且这份并集本身就是这份 fixture 的价值：`EditorContext`
+# 是十几个用例共用的中枢，改它的"选择"语义会被一长串名字一起拖下水。
+# 判据是"verify_multiselect 一定在"（它是这一层新加的 owner），但把整张表
+# 钉住能顺手证明另一件事：这套改动**没有**把选择语义的连带面悄悄扩大。
+# ⚠ 里面那条 verify_i18n_coverage 不是噪声 —— 它扫 `editor/**` 的界面字面量，
+#   而这个文件确实带 `TR()` 词条。
+run("editor/EditorContext.cpp → 选择集（多选）", OLD,
+    with_change("editor/EditorContext.cpp"),
+    want={"verify_audio", "verify_char_locomotion", "verify_editor_play_terrain",
+          "verify_i18n_coverage", "verify_material_import",
+          "verify_multiselect", "verify_play_mouse_capture",
+          "verify_player_feel", "verify_prefab", "verify_script_editor",
+          "verify_ui_editor", "verify_viewport_bar"})
+# 2026-10-27（#316）：批量数学（`editor/MultiEditMath.h`）—— 一个**纯函数**头，
+# 只被 GizmoController 与 InspectorPanel 两处共用，所以 owner 应该**只有**
+# verify_multiselect（外加扫字面量的 i18n 覆盖面）。
+# 这条 fixture 钉的是"新加的纯函数不许偷偷挂到别人名下"：哪天有人把它
+# include 进第三条链，这里会红，提醒想清楚那条链到底要不要验数值。
+run("editor/MultiEditMath.h → 批量数学", OLD,
+    with_change("editor/MultiEditMath.h"),
+    want={"verify_multiselect", "verify_i18n_coverage"})
 # 2026-10-25（§16 第八刀）：两骨 IK 的求解器本体。
 # 期望里**必然**带 verify_anim_runtime / verify_character_import /
 # verify_player_character —— 它们三个都登记了 `engine/animation/**` 整层。
@@ -263,15 +315,74 @@ run("engine/animation/AnimEvent.cpp → 事件边界", OLD,
     with_change("engine/animation/AnimEvent.cpp"),
     want={"verify_anim_events", "verify_anim_runtime",
           "verify_character_import", "verify_player_character"})
+# 2026-10-26（#315，G18）：预制体本体（`engine/scene/Prefab.*`）。
+# 这一层的语义（资产读写 / 实例化 / 覆盖 / 同步 / Apply / Revert）只被
+# `--selftest prefab` 那 35 条和 verify_prefab 两处覆盖，所以期望是**恰好
+# 一条** —— 哪天有人往第二条用例上挂 `engine/scene/Prefab.*`，这条会红，
+# 提醒把两边的断言分工写清楚（数值 vs 端到端）。
+# ⚠ 别在这里顺带断言 SceneSerializer：它被八条用例共享（见上面那些
+#   `verify_*` 的 SceneSerializer 登记），拿它当输入只会得到一大片无关名字。
+run("engine/scene/Prefab.cpp → 预制体", OLD,
+    with_change("engine/scene/Prefab.cpp"), want={"verify_prefab"})
 # 2026-10-26（C1）：过场时间轴的解析 / 采样 / 播放器本体
 # （`engine/sequence/**`）。这一层只有 verify_sequencer 一条用例登记，
 # 所以期望是**恰好一条**（别的 fixture 都是"自己那条一定在"）—— 哪天有人
 # 把 `engine/sequence/**` 挂到第二条用例上，这条会跟着红，提醒去同步。
 # ⚠ 数值侧（48 条 `SEQ-TEST`）住在 `SequenceSelfTest.cpp`，同属一层，
 #   跑 `--selftest sequence` 才执行 —— 端到端那条**不能**替代它。
-run("engine/sequence/SequenceAsset.cpp → 过场时间轴", OLD,
+# 2026-10-27（#311）起是**两条**：`SequenceAsset` 从这一版开始能**写回**
+# （`toJson` / `saveSequence`），而时间轴编辑器每次改动都靠"序列化 → 丢回
+# `parseSequence`"做校验 —— 存盘格式错一个字段，编辑器那条会立刻红。
+# ⚠ 数值侧（`rt_*` 那 9 条往返断言）住在 `SequenceSelfTest.cpp`，跑
+#   `--selftest sequence` 才执行 —— 端到端那条**不能**替代它。
+run("engine/sequence/SequenceAsset.cpp → 过场时间轴 × 轨道编辑器", OLD,
     with_change("engine/sequence/SequenceAsset.cpp"),
-    want={"verify_sequencer"})
+    want={"verify_sequencer", "verify_timeline_editor"})
+# 2026-10-26（C2 第二步）：对话层（`engine/dialogue/**`）。
+# ⚠ 数值侧（97 条 `DLG-TEST`）住在 `DialogueSelfTest.cpp`，跑
+#   `--selftest dialogue` 才执行 —— 端到端那条**不能**替代它。
+# ⚠ 这里挑 `DialogueSystem.cpp`（调度层）而不是 `DialogueAsset.cpp`：前者同时
+#   牵动"时间轴 cue"和"组件驱动"两条路，是这一层真正的接线中枢。
+# ⚠ 别改成 `DialoguePlayer.cpp` 去测"只挂一条" —— 它同理，但用调度层能顺带
+#   证明"改了调度就必须重跑端到端"这件真正想钉的事。
+# ⚠ 2026-10-26（C6 第三步）起是**两条**：`verify_dialogue_editor` 的页签懒加载
+#   走的也是 `DialogueAsset::load`，解析口径一变 `INS-DLG-ASSET` 那行的
+#   行数/选项数就变。哪天有人把编辑期那条摘掉，这条会红 —— 那是它在工作。
+run("engine/dialogue/DialogueSystem.cpp → 对话 × 对话页签", OLD,
+    with_change("engine/dialogue/DialogueSystem.cpp"),
+    want={"verify_dialogue", "verify_dialogue_editor"})
+# 2026-10-27（#310）：剧本编辑器的**写回**（`toJson` / `saveDialogue`）。
+# 期望恰好三条 —— 这一层现在被三张网兜着：
+#   · `verify_dialogue`        解析口径（存出来的东西必须还能被它读回）
+#   · `verify_dialogue_editor` Inspector 页签那一行 `INS-DLG-ASSET`（行数/选项数）
+#   · `verify_dialogue_script` 编辑器面板自己（B/D 两组直接比对落盘 JSON）
+# 哪天有人把 `engine/dialogue/**` 从某条名下摘掉，这条会红 —— 那是它在工作。
+run("engine/dialogue/DialogueAsset.cpp → 对话 × 两个编辑器入口", OLD,
+    with_change("engine/dialogue/DialogueAsset.cpp"),
+    want={"verify_dialogue", "verify_dialogue_editor", "verify_dialogue_script"})
+# 2026-10-27（#310）：剧本编辑器面板本体。
+# 期望两条：除了自己那条，还有 verify_i18n_coverage —— 它扫描 `editor/*.cpp`
+# 里的界面字面量，而新面板一口气加了 40 条 TR 词条（缺了就是"面板一半英文"）。
+# ⚠ 这条**必须**留着：新加面板最容易漏的就是词条，而漏了不崩。
+run("editor/DialogueEditorWindow.cpp → 剧本编辑器 × 中文化", OLD,
+    with_change("editor/DialogueEditorWindow.cpp"),
+    want={"verify_dialogue_script", "verify_i18n_coverage"})
+# 2026-10-27（#311）：时间轴编辑器面板本体。
+# 期望两条：除了自己那条，还有 verify_i18n_coverage —— 它扫描 `editor/*.cpp`
+# 里的界面字面量，而新面板一口气加了 60 条 TR 词条（缺了就是"面板一半英文"）。
+# ⚠ 这条**必须**留着：新加面板最容易漏的就是词条，而漏了不崩。
+run("editor/TimelineEditorWindow.cpp → 时间轴编辑器 × 中文化", OLD,
+    with_change("editor/TimelineEditorWindow.cpp"),
+    want={"verify_timeline_editor", "verify_i18n_coverage"})
+# `SequencerSystem.cpp` 是 **C1 / C2 / C6 的交界**：
+#   · C1 组件路径（playhead / 关键帧 / 事件）
+#   · C2 `kind=Line` → 一次 `cue()`
+#   · C6 `cue()` 本身（脚本点播，与组件共用同一份 `tick`）
+# 所以它必须同时挂在三条用例名下 —— 期望恰好三条。哪天有人只留两条
+# （比如嫌"改时间轴为什么要跑脚本点播"），这条会红。
+run("engine/sequence/SequencerSystem.cpp → 时间轴 × 对话 × 脚本导演", OLD,
+    with_change("engine/sequence/SequencerSystem.cpp"),
+    want={"verify_sequencer", "verify_dialogue", "verify_director_api"})
 run("删除 decal.frag → 也算变更", OLD,
     with_change(drop=("assets/shaders/decal.frag",)),
     want={"verify_decals"})

@@ -1451,6 +1451,59 @@ void ViewportPanel::focusEntity(ecs::Entity e) const {
     editor::focusCameraOnEntity(m_ctx.editorScene(), e);
 }
 
+// ---------------------------------------------------------------- 框选（#316）
+//
+// **判据是"碰到"而不是"整框住"** —— 这一条是刻意的：
+//   整框住要求物体投影**完全**落在框里，于是"框住半个地面"选不中地面、
+//   框住大半个模型的躯干选不中模型 —— 用户手上做的就是"扫一片"，被扫到的
+//   就该被选中。UE / Blender 的框选也都是碰到就选。
+//
+// 有网格的用世界 AABB 的 8 个角投影（旋转过的物体用点做包含判定会漏掉它
+// 的"角"伸进框里的情况）；点光源 / 空节点这类没有包围盒的，退化成"投影
+// 点落在框里"。
+bool ViewportPanel::entityInsideBox(ecs::Entity e, const glm::mat4& viewProj,
+                                    const glm::vec2& vpPos,
+                                    const glm::vec2& vpSize,
+                                    const glm::vec2& a, const glm::vec2& b) {
+    const auto inBox = [&](const glm::vec2& p) {
+        return p.x >= a.x && p.x <= b.x && p.y >= a.y && p.y <= b.y;
+    };
+
+    scene::Scene& sc = m_ctx.activeScene();
+    const Aabb box = m_picking.worldAabb(sc, e);
+    if (box.valid) {
+        bool anyIn = false;
+        glm::vec2 lo(1e30f);
+        glm::vec2 hi(-1e30f);
+        for (int i = 0; i < 8; ++i) {
+            const glm::vec3 c((i & 1) ? box.max.x : box.min.x,
+                              (i & 2) ? box.max.y : box.min.y,
+                              (i & 4) ? box.max.z : box.min.z);
+            glm::vec2 p;
+            if (!PickingSystem::worldToScreen(viewProj, vpPos, vpSize, c, p))
+                continue;   // 在相机背后：这个角不参与判定
+            lo = glm::min(lo, p);
+            hi = glm::max(hi, p);
+            if (inBox(p)) anyIn = true;
+        }
+        if (anyIn) return true;
+        // 没有角落进框，但框**整个落在**它的投影矩形里（贴脸看一面墙时
+        // 就是这样）—— 也算碰到。
+        const bool overlap =
+            hi.x >= a.x && lo.x <= b.x && hi.y >= a.y && lo.y <= b.y;
+        return overlap;
+    }
+
+    // 没有网格（点光 / 空节点 / 太阳）：用世界位置一个点。
+    // 太阳这类"场景级"实体的位置常常在原点，框到原点就会被选中 —— 可以
+    // 接受：它在层级里是个真节点，框选把它带上是可解释的。
+    glm::vec2 p;
+    if (!PickingSystem::worldToScreen(viewProj, vpPos, vpSize,
+                                      glm::vec3(sc.worldMatrix(e)[3]), p))
+        return false;
+    return inBox(p);
+}
+
 // ---------------------------------------------------------------- 落地（数字键 0）
 //
 // 把选中的物体**竖直**挪到地面上：x / y 一点都不动，只改 z，让它的世界
@@ -2653,21 +2706,105 @@ void ViewportPanel::draw() {
                 PickingSystem::rayFromViewport(cam, vpPos, vpSize, mouse);
             const PickResult hit = m_picking.pick(m_ctx.activeScene(), ray);
             if (hit.hit) {
-                // 记下"这是在 3D 视口里点中的"——数字键 0 的落地只认这种选中
-                m_ctx.selectFromViewport(hit.entity);
-                const std::string* n =
-                    m_ctx.activeScene().world().name(hit.entity);
-                m_ctx.setStatus(TR("Selected ") +
-                                (n ? *n : std::string("Object")));
-                // 打一行日志：自动化脚本靠它断言"这一下点中了谁 / 有没有点中"
-                // （比如点在地面上应当什么都不选中 —— 地面是 LockedComponent）。
-                VK_LOG_INFO("pick: selected '%s' (from viewport)",
-                            n ? n->c_str() : "?");
+                // 视口里的 Ctrl / Shift + 左键 = 往选择集里加 / 减一个，
+                // 与层级树里的点法一致（#316）。Shift 也认 —— "Shift 加选"
+                // 在资源管理器那类界面里同样是肌肉记忆。
+                if (io.KeyCtrl || io.KeyShift) {
+                    m_ctx.selectToggle(hit.entity);
+                    const std::string* n2 =
+                        m_ctx.activeScene().world().name(hit.entity);
+                    VK_LOG_INFO("pick: toggled '%s' n=%zu",
+                                n2 ? n2->c_str() : "?", m_ctx.selectionCount());
+                    m_ctx.setStatus(TR("Selection: ") +
+                                    std::to_string(m_ctx.selectionCount()) +
+                                    TR(" objects"));
+                } else {
+                    // 记下"这是在 3D 视口里点中的"——数字键 0 的落地只认它
+                    m_ctx.selectFromViewport(hit.entity);
+                    const std::string* n =
+                        m_ctx.activeScene().world().name(hit.entity);
+                    m_ctx.setStatus(TR("Selected ") +
+                                    (n ? *n : std::string("Object")));
+                    // 打一行日志：自动化脚本靠它断言"这一下点中了谁 /
+                    // 有没有点中"（比如点在地面上应当什么都不选中 ——
+                    // 地面是 LockedComponent）。
+                    VK_LOG_INFO("pick: selected '%s' (from viewport)",
+                                n ? n->c_str() : "?");
+                }
             } else {
-                m_ctx.clearSelection();
-                VK_LOG_INFO("pick: nothing hit -> selection cleared");
+                // ---- 点空 = 开始框选（2026-10-27 #316）----
+                //
+                // 这里**不再立刻清空**选中：一次"按下 → 松开"如果没怎么动，
+                // 松开时才当成"点空白 → 清空"；动了就是在拉框。两者的差别
+                // 只在松手那一刻由位移阈值决定，按下时先按"可能要拉框"记账。
+                m_boxActive = true;
+                m_boxStart = mouse;
+                m_boxCurrent = mouse;
+                m_boxAdditive = io.KeyShift || io.KeyCtrl;
+                VK_LOG_INFO("pick: nothing hit -> box select start");
             }
         }
+    }
+
+    // 2.9) 框选（#316）
+    //
+    // 与上面那段的关系：按下时由点选分支**开启**，之后的每帧在这里更新，
+    // 松手时在这里结算。分开放是因为"什么时候开始"完全由拾取结果决定，
+    // 而"怎么画 / 怎么结束"是另一件事。
+    if (m_boxActive && m_ctx.isEditing()) {
+        m_boxCurrent = glm::vec2(io.MousePos.x, io.MousePos.y);
+        const glm::vec2 a(std::min(m_boxStart.x, m_boxCurrent.x),
+                          std::min(m_boxStart.y, m_boxCurrent.y));
+        const glm::vec2 b(std::max(m_boxStart.x, m_boxCurrent.x),
+                          std::max(m_boxStart.y, m_boxCurrent.y));
+        // 半透明填充 + 描边：只有描边在浅色背景（比如对着天空）上看不清，
+        // 只有填充又会把框里的物体糊掉。
+        dl->AddRectFilled(ImVec2(a.x, a.y), ImVec2(b.x, b.y),
+                          IM_COL32(90, 150, 235, 40));
+        dl->AddRect(ImVec2(a.x, a.y), ImVec2(b.x, b.y),
+                    IM_COL32(120, 175, 255, 220));
+
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            m_boxActive = false;
+            // 阈值 4px：手抖 1~2 像素不该被当成"拉了一个小框"，否则点击
+            // 空白永远清不掉选中（框里有东西就被选中了）。
+            const float w = b.x - a.x;
+            const float h = b.y - a.y;
+            if (w < kBoxSelectMinPx && h < kBoxSelectMinPx) {
+                m_ctx.clearSelection();
+                VK_LOG_INFO("pick: nothing hit -> selection cleared");
+            } else {
+                std::vector<ecs::Entity> found;
+                const glm::mat4 vp = PickingSystem::viewProj(cam, vpSize);
+                ecs::World& w2 = m_ctx.activeScene().world();
+                w2.each<ecs::TransformComponent>(
+                    [&](ecs::Entity e, ecs::TransformComponent&) {
+                        // 上锁的（自带地面）永远不参与框选 —— 一次拖框把
+                        // 地面选中，接下来随便拖个手柄就把整个场景的参照系
+                        // 挪走了。
+                        if (w2.has<ecs::LockedComponent>(e)) return;
+                        if (m_ctx.isSelected(e)) return;   // 已有 + 叠加模式
+                        if (entityInsideBox(e, vp, vpPos, vpSize, a, b))
+                            found.push_back(e);
+                    });
+                if (m_boxAdditive && m_ctx.multiSelected()) {
+                    std::vector<ecs::Entity> merged = m_ctx.selectionSet();
+                    merged.insert(merged.end(), found.begin(), found.end());
+                    m_ctx.selectMany(merged);
+                } else if (!found.empty()) {
+                    m_ctx.selectMany(found);
+                } else {
+                    m_ctx.clearSelection();
+                }
+                VK_LOG_INFO("BOX-SELECT n=%zu additive=%d rect=(%.0f,%.0f)-(%.0f,%.0f)",
+                            m_ctx.selectionCount(), m_boxAdditive ? 1 : 0,
+                            static_cast<double>(a.x), static_cast<double>(a.y),
+                            static_cast<double>(b.x), static_cast<double>(b.y));
+            }
+            m_boxAdditive = false;
+        }
+    } else if (m_boxActive) {
+        m_boxActive = false;   // 掉到运行态 / 面板切走时别留一个半截的框
     }
 
     // 3.5) Shift+A 添加菜单（仅编辑态；每帧无条件提交 popup）
