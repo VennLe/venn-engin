@@ -80,9 +80,16 @@ private:
 
     // 每行矩形的日志节流（见 .cpp 里的 HIER-ROW）。这两个成员只为自动化
     // 服务：`m_rowLogNames` 记"上次这一行打印时叫什么"，名字没变就不打。
+    //
+    // ⚠ 2026-10-28（#323）：光比名字**不够**。名字没变但位置挪了（窗口首帧
+    //   才定尺寸 → 整块面板重排一行；树被滚动；分割条被拖）时不会补打，
+    //   于是 `wait_rect` 一直返回**旧坐标**，脚本点下去落到隔壁行。
+    //   实测症状是"Ctrl+点 CubeB，日志里却是 name=CubeC"，而且只在连着跑
+    //   多个用例时出现（单跑时窗口早就定好尺寸了）。所以再记一份矩形。
     static constexpr int kMaxLoggedRows = 16;
     int m_rowCursor = 0;
     std::vector<std::string> m_rowLogNames;
+    std::vector<glm::vec4> m_rowLogRects;   // (x0,y0,x1,y1)，0.5px 容差比
     bool m_pendingCreate = false;
     PrimitiveKind m_pendingCreateKind = PrimitiveKind::Cube;
     // 新建到哪一级（无效 = 根下）；m_createAsFolder = 建成名为 Folder 的空节点

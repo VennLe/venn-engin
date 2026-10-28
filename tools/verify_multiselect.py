@@ -365,6 +365,30 @@ def sel_line(tap):
     return m.group(0) if m else "-"
 
 
+def settle_rows(tap, n_rows=5, timeout=5.0, quiet=0.4):
+    """等 HIER-ROW 的矩形**不再动**再开始点。
+
+    为什么要这一步（2026-10-28，#323）：编辑器窗口是**首帧之后**才被
+    SetWindowPos 定到 1600×900 的，面板会跟着重排一次 —— 表现为整棵树往下
+    挪一行。单跑时这一步早就过去了；连着跑多个用例时刚好卡在 1.0s 那个
+    sleep 的边缘上，于是 `row_map` 量到的是**挪之前**的坐标，后面点
+    `rows["CubeB"]` 就落到 CubeC 上（日志里 `name=CubeC`，看着像产品选错了，
+    其实是脚本点错了）。
+
+    判据：连续两次采样（间隔 quiet）拿到完全相同的 n_rows 个矩形。产品侧
+    `HIER-ROW` 现在"名字或位置变了就补打"，所以这里能真的看见变化。
+    """
+    last = None
+    end = time.time() + timeout
+    while time.time() < end:
+        cur = tuple(tap.last_rect("HIER-ROW %d" % i) for i in range(n_rows))
+        if cur == last and all(r is not None for r in cur):
+            return True
+        last = cur
+        time.sleep(quiet)
+    return False
+
+
 def row_map(tap, hwnd, n_rows=8):
     """点一遍前 n_rows 行，返回 {实体名: (行号, 中心点)}。
 
@@ -374,6 +398,9 @@ def row_map(tap, hwnd, n_rows=8):
     Ctrl 点到了"本来就选中"的那一个 → n=0）。名字对名字才是稳的。
     """
     out, seen = {}, []
+    # 先等布局稳定（见 settle_rows）；等不到也照跑 —— 真坏了要让断言去红，
+    # 不能在这里悄悄跳过。
+    settle_rows(tap)
     for i in range(n_rows):
         c = row_center(tap, i)
         if not c:

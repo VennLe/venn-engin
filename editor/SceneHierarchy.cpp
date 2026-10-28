@@ -16,6 +16,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -537,18 +538,35 @@ void SceneHierarchy::drawNode(ecs::Entity e, int depth) {
     //
     // 两条节流，缺一条都会出事：
     //   · 最多 16 行（超出的不记，验证脚本用不到那么深）；
-    //   · **名字变了才打一次**。drawNode 是递归的、每帧都走一遍，无条件
+    //   · **名字或位置变了才打一次**。drawNode 是递归的、每帧都走一遍，无条件
     //     打就是 60fps × 行数 的日志洪水（这个项目真踩过，两分钟 30MB，
     //     而且取"最后一行"拿到的是随机某一行）。
+    //
+    // ⚠ 2026-10-28（#323）：位置这一半是补上的。原来只比名字，名字没变但行
+    //   挪了地方就不补打 —— 窗口首帧才定尺寸（整块面板重排一行）、树被滚
+    //   动、分割条被拖，都会让脚本手里的矩形变成**旧坐标**，然后精确地点到
+    //   隔壁那一行。症状是 `Ctrl+点 CubeB` 却打出 `name=CubeC`，且只在连着
+    //   跑多个用例时出现（单跑时窗口早定好尺寸了）。
     if (m_rowCursor < kMaxLoggedRows) {
         const int idx = m_rowCursor++;
-        if (m_rowLogNames.size() <= static_cast<std::size_t>(idx))
-            m_rowLogNames.resize(static_cast<std::size_t>(idx) + 1);
-        if (m_rowLogNames[static_cast<std::size_t>(idx)] != name) {
-            m_rowLogNames[static_cast<std::size_t>(idx)] = name;
+        const auto k = static_cast<std::size_t>(idx);
+        if (m_rowLogNames.size() <= k) m_rowLogNames.resize(k + 1);
+        if (m_rowLogRects.size() <= k) m_rowLogRects.resize(k + 1, glm::vec4(0.0f));
+        const ImVec2 mn = ImGui::GetItemRectMin();
+        const ImVec2 mx = ImGui::GetItemRectMax();
+        const glm::vec4 rc(mn.x, mn.y, mx.x, mx.y);
+        const glm::vec4& prev = m_rowLogRects[k];
+        // 0.5px 容差：ImGui 的矩形是整数像素，真正的抖动是"整行挪走"（十几
+        // 到几十像素），留这么点余量只为吃掉浮点比较的噪声。
+        const bool moved = std::abs(prev.x - rc.x) > 0.5f ||
+                           std::abs(prev.y - rc.y) > 0.5f ||
+                           std::abs(prev.z - rc.z) > 0.5f ||
+                           std::abs(prev.w - rc.w) > 0.5f;
+        if (m_rowLogNames[k] != name || moved) {
+            m_rowLogNames[k] = name;
+            m_rowLogRects[k] = rc;
             const std::string tag = "HIER-ROW " + std::to_string(idx);
-            logRect(tag.c_str(), ImGui::GetItemRectMin(),
-                    ImGui::GetItemRectMax());
+            logRect(tag.c_str(), mn, mx);
         }
     }
 
