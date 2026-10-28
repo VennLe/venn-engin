@@ -134,7 +134,17 @@ DEFAULT = [
     "verify_inspector_tabs",
     "verify_nav_gizmo",
     "verify_character_window", "verify_add_menu", "verify_mesh_params",
+    # 主菜单栏的"接线"（P2）：Select All / Invert / Duplicate / Project
+    # Settings / Save As / Import 六个入口。它看守的是**灰项与提示语**
+    # 这类"不报错、只骗人"的债 —— 功能做完了但菜单还灰着，任何崩溃日志
+    # 都不会有，只有"点了之后有没有真的发生"能证明。
+    "verify_menu_wiring",
     "verify_collider_gizmo", "verify_player", "verify_collision_play",
+    # 关节（J5）：组件 → 场景 JSON → buildSceneWorld → physics::Joint，外加
+    # Inspector 的 Joint 段与 Physics 面板的关节总览。它看守的是**静默**
+    # 失败 —— 关节没建起来时物体照常下落，一行错误都不报，只能靠"到铰点
+    # 的距离有没有被锁住"来判（带自由落体对照）。
+    "verify_joints",
     # 第三人称相机：俯仰范围（仰 55/俯 70）+ 弹簧臂球扫掠 + 地面钳制。
     # 它看守的三条断言都在**两个**二进制里（Game.exe 的两个无窗口自检 +
     # 编辑器 Play 的贴墙场景），run_regression 只跑 Python 脚本，所以
@@ -371,6 +381,38 @@ DEFAULT = [
     #   只是实际靠超时 kill 收场。
     # ⚠ 场景里必须有 `CameraComponent` 实体，否则运镜被静默丢弃（事件照发）。
     "verify_sequencer",
+    # 稳定身份（2026-10-27，G16-1~G16-4）。数值层 26 条在
+    # `Game.exe --selftest guid`（World 层分配/反查/冲突/销毁 + 场景往返 +
+    # 选择接回）；本用例补"经过真实场景文件"那一段：
+    #   A 自检全绿 · B v1 老场景全部补发 dup=0 · C v2 场景 assigned=0
+    #   （证明读端真读了文件里的值）· D 文件内重复 guid → dup=1 不致命。
+    # ⚠ `engine/ecs/**` 是横切文件 → 改 World.h/Entity.h 走全量，
+    #   这条用例靠下面的 TRIGGERS 抓"改了 SceneSerializer / Scene / EditorContext"。
+    "verify_guid",
+    # 序列化器三段拆分（2026-10-27，G16-5 = G17 存档 / G19 流送的硬前置）。
+    # 数值层 39 条在 `Game.exe --selftest sceneio`（解析 / 全局块 / raw 保留 /
+    # 无效槽位 / guid 补发 / 下标与 guid 两种父引用 / 文件夹 / 相机应用 /
+    # **版本校验必须在 clear 之前** / 三段与一把梭逐字节同）；
+    # 本用例补"经过真实文件"那一段 + 一条**静态护栏**：
+    #   A 自检全绿 · B 真实场景 total 对得上 · C 写出→再读 assigned=0
+    #   （写端真的写了 guid 的唯一运行时证据）· D `parseSceneDocument` /
+    #   `instantiateDocument` 的**签名**里不许出现 AssetManager。
+    # ⚠ D 组看起来像语法检查，但它抓的正是"撤销这次拆分"的动作 ——
+    #   有人图方便把 assets 加进 ①②，编译一样过、别的用例一样绿，
+    #   而"后台线程解析"从此再也做不成。全仓只有这一处能发现它。
+    # ⚠ 本用例与 verify_guid 重挂 `SceneSerializer.*` 是**故意**的：只挂一处会让
+    #   `--narrow` 把另一条判成不受影响（同 verify_viewport 那条注释）。
+    "verify_sceneio",
+    # 存档**文件层**（2026-10-27，G17-1 = C3 存档的第一刀）。
+    # 数值层 33 条在 `Game.exe --selftest save`（结构指纹 / 格式逐字节往返 /
+    # v1→v2 迁移 / 原子写 / 校验）；本用例补两件数值层看不见的事：
+    #   A 自检全绿 + **分组存在性** + `SAVE-MIGRATE` 锚点（证明迁移**真跑过**，
+    #     而不是一张空跑的表）；B 自检**真的落到磁盘**了（文件在、是合法 JSON、
+    #     version 对、每条 guid 16 位、`.bak` 已生成）。
+    # ⚠ B 组不是重复 A：A 可以在"写进了别处 / 只写进内存"时全绿。
+    # ⚠ 待补：`--selftest save-crash`（写到一半 `_exit(3)`，父进程断言旧档仍可读）
+    #   需要脚本起子进程 + C++ 侧加一个专门的 CLI 子模式，留给 G17-1 的尾巴。
+    "verify_persistence",
     # 对话（2026-10-26，C2 第二步）。数值层（解析 / 校验 / 打字机 / 播放头 /
     # 选项 / 调度优先级）在 `Game.exe --selftest dialogue` 的 97 条 `DLG-TEST`；
     # 这里只验"接到一起之后还对不对"，两个用例：
@@ -446,6 +488,36 @@ DEFAULT = [
     # 球冠收窄；副用例把"对 1m 立方体拟合出来的其实是球（halfHeight=0）"
     # 钉成事实。
     "verify_capsule_shape",
+    # ---- 2026-10-27：二次元风格改造（用户六条需求）----
+    # 启动器放大 / 圆角度量 / 10 套主题 / 色卡可切。见 docs/anime_ui_restyle.md。
+    # ⚠ 它的主体编辑器侧断言走 `EditorApp.cpp`（**故意不登记** → 改它全量），
+    #   所以本条目只登记启动器与自检注册点。
+    "verify_theme_anime",
+    # ---- 2026-10-27：E29-1 槽位 → 面板 映射运行时可写 ----
+    # 自检（33 条）+ 落盘读回生效 + **对照组**（没有 slots 段时走默认树）。
+    # 见 editor/SplitLayout.h 的"叶子面板组"一节。
+    "verify_layout_slots",
+    # ---- 2026-10-27：E29-2 拖拽换位（标题栏 drag source / 四格 drop target）----
+    # 自检 F 组（58 条里的 25 条）+ **真鼠标拖**（PostMessage 序列）+ 对照组（只点不拖）。
+    # 见 editor/PanelDragDrop.h。
+    "verify_layout_drag",
+    # ---- 2026-10-28：植被网格精度 + 自定义网格绑定 + 随机区间 ----
+    # 用户报「五种内置植被太粗糙」「要能从本地资源拖模型绑定，偏移/旋转/
+    # 缩放区间也要能设」。三件事都不会崩：粗细只是观感、绑定没生效只是
+    # "撒出来还是程序化草"、区间没生效只是范围不对 —— 所以判据全落在数字
+    # 上（三角数 / 资产路径 / 实测 scale 与 maxOff）。
+    "verify_foliage_mesh",
+    # ---- 2026-10-28：出包（E28-1）----
+    # 「工程能不能变成拷到别处就能跑的目录」。这条路上没有一个错误会自己
+    # 叫出来：少一个资产 = 玩家黑屏，覆盖 dist = 发错版本，Debug 包 =
+    # 别人双击没反应。所以单列一条，默认跑。
+    "verify_package",
+    # ---- 2026-10-28：G30 shipping 构建剔除 ----
+    # 「出货版到底少没少东西」。这条最容易假绿：宏写了、`#if` 漏了，症状是
+    # **游戏照常跑**。所以判据是可数的：出货 exe 里四个开发字符串各 0 次，
+    # dev exe 里各 > 0（对照区），build-ship 的 ninja 清单里没有编辑器目标。
+    # ⚠ 它会**构建一次 build-ship**（首次几分钟），有 `--no-build` 可跳过。
+    "verify_shipping",
     # 启动不闪白 + 缓冲两秒才露面：断言"首次可见时刻"落在 1.6~4.5s、露面后
     # 连拍无白帧。它需要 MYVK_STARTUP_DELAY=1 才跑得出缓冲（MYVK_NO_WINDOW_SAVE
     # 会顺带跳过缓冲，而那个变量又必须设 —— 否则退出时会覆盖用户的 imgui.ini）。
@@ -1225,6 +1297,57 @@ TRIGGERS = {
     # 胶囊线框的顶点/边数组全部由 ColliderView.* 自己生成（点与边都在这里
     # 算完直接喂 AddLine）；拟合半径那一路在 engine/physics/**（= GLOBAL）。
     "verify_capsule_shape":  ["editor/ColliderView.*"],
+    # 二次元风格改造（2026-10-27）：
+    #   · 主题表 / 度量 / 压暗 / tokens          → engine/ui/ImGuiTheme.*（= GLOBAL）
+    #   · 渐变 / 卡片 / 药丸按钮                 → engine/ui/UiChrome.*  （= GLOBAL）
+    #   · 22 条数值断言                          → engine/ui/ThemeSelfTest.cpp（= GLOBAL）
+    #   以上三样都在 `engine/ui/**` 里、本来就会触发全量，**刻意不登记**
+    #   （登记了在 `--narrow` 下会变成假跳过）。
+    #   真正需要单独点名的是这两处：
+    #   · 启动器窗口尺寸 / 顶栏渐变 / 药丸按钮     → launcher/LauncherApp.cpp
+    #   · `--selftest theme` 的注册点             → runtime/main.cpp
+    "verify_theme_anime": ["launcher/LauncherApp.*", "runtime/main.cpp"],
+    # E29-1：叶子面板组 / 搬家族 / 读盘恢复全在 SplitLayout；落盘字段在
+    # EditorLayoutIO；id ↔ 槽位（含 moderail 合成槽位）在 EditorApp。
+    # ⚠ 自检注册点 editor/main.cpp 也点名 —— 删掉那行 env 开关，用例会变成
+    #   "跑了个空编辑器然后超时"，而不是明确报错。
+    "verify_layout_slots": ["editor/SplitLayout.*",
+                            "editor/EditorLayoutIO.*",
+                            "editor/LayoutSelfTest.*",
+                            "editor/main.cpp"],
+    # E29-2：状态机在 PanelDragDrop；接进帧循环 / 画高亮在 EditorApp。
+    # ⚠ EditorApp.* **故意不登记**（横切文件）→ 改它走全量。
+    # 2026-10-28：E 组加进来之后，`SplitLayout` 的**拖动夹取**（minA）和
+    # "贴边不算穿过"的遮挡裁切也是这条用例在守 —— 前者定左栏能缩到多窄，
+    # 后者决定分隔条到底能不能被悬停/拖动（这两个都曾经把分隔条弄"死")。
+    # 2026-10-28：植被类型的"自定义网格 + 随机区间"全在 FoliageEditor；
+    # 内置网格几何在 engine/assets/FoliageMesh.cpp —— 那是 GLOBAL，不重复登记
+    # （登记了会被"横切文件别写进 TRIGGERS"的检查点名）。
+    "verify_foliage_mesh": ["editor/FoliageEditor.*"],
+    # 2026-10-28 出包：内核在 engine/project/ProjectBuild；入口两处 ——
+    # 运行时（`--package`）与编辑器（File ▸ Package）。`runtime/main.cpp`
+    # 是"所有无窗口自检的入口"，登记在这里意味着改它会跑这一条；
+    # 它同时也是别的 runtime 用例的入口，那些用例各自的 TRIGGERS 里
+    # 已经有各自的文件，行为不变（这条只是把出包也挂上去）。
+    "verify_package": ["engine/project/AssetScan.*",
+                       "engine/project/ProjectBuild.*",
+                       "engine/project/ProjectFile.*",
+                       "runtime/main.cpp",
+                       "editor/Toolbar.*"],
+    # G30 shipping 剔除：判定在 CMakeLists（VENN_SHIPPING / 目标裁剪 /
+    # git 号透传）、core/Build.h（风味唯一事实源）、runtime/main.cpp（
+    # --version / 开发钩子闸门）与 engine/rhi/Instance.cpp（校验层）。
+    # ⚠ engine/core/** 与 engine/rhi/** 都在 GLOBAL_GLOBS 里，不重复登记
+    #   （登记了会被"横切文件别写进 TRIGGERS"的检查点名）。
+    # ⚠ CMakeLists.txt / Makefile **不登记**：它们是横切文件（改了本来就全量），
+    #   写进来只会被 check_regression_map 标成"冗余的横切 glob"。
+    "verify_shipping": ["runtime/main.cpp",
+                        "runtime/RuntimeConfig.*",
+                        "runtime/RuntimeApp.*"],
+    "verify_layout_drag": ["editor/PanelDragDrop.*",
+                           "editor/LayoutSelfTest.*",
+                           "editor/SplitLayout.*",
+                           "editor/main.cpp"],
     # E12 行尾状态列：图标绘制 / 命中矩形 / pending 队列全在 SceneHierarchy；
     # 可见性组件的语义在 engine/scene/Scene.cpp（= GLOBAL）。
     "verify_hierarchy_status": ["editor/SceneHierarchy.*",
@@ -1239,6 +1362,34 @@ TRIGGERS = {
                               # 是**从面板表生成**的，工作区子菜单也从预设生成 ——
                               # 表或预设改一个字，这一例的菜单断言就可能变。
                               "editor/PanelRegistry.*", "editor/Workspace.*"],
+    # 主菜单接线（2026-10-27 P2）。菜单项在 Toolbar；它调的三个动作分别住在
+    # EditorContext（全选/反选）、SceneHierarchy（Duplicate，经 EditorHost）、
+    # ContentBrowser（Import 对话框，经 EditorHost）—— 而转发壳在 EditorApp。
+    # 四路都要登记：只写 Toolbar 的话，"把 duplicateSelection 的实现改坏"
+    # 不会让这一例重跑。
+    "verify_menu_wiring":    ["editor/Toolbar.*", "editor/EditorContext.*",
+                              "editor/ContentBrowser.*", "editor/EditorApp.*"],
+    # 关节（J5，2026-10-27）。三个非横切文件是它的归属地：
+    #   · InspectorPanel —— Joint 段（有才画 / 类型下拉 / 另一端下拉 / 限位马达）
+    #   · PhysicsPanel   —— 关节总览（悬空标红 / 点一行就选中 / Add to selection）
+    #   · SceneSerializer —— jointToJson / jointFromJson（存盘往返那一组断言）
+    # ⚠ `engine/ecs/**`（JointComponent）与 `engine/physics/**`（buildSceneWorld
+    #   里的翻译）**故意不写**：它们在 GLOBAL_GLOBS 里，写进来会让 `--narrow`
+    #   假跳过（check_regression_map 的 E 项专门盯这个）。
+    # 关节 J5：组件 → 序列化 → Inspector → 求解器 → 视口拾取 → 脚本 API。
+    # ⚠ `engine/physics/**`、`engine/ecs/**`、`engine/render/Renderer.*`、
+    #   `engine/render/FeatureRegistry.*` 都在 GLOBAL_GLOBS 里（改了就全跑），
+    #   所以这里只登记**非横切**的那几处接线点，别把它们重复写进来。
+    "verify_joints":         ["editor/InspectorPanel.*", "editor/PhysicsPanel.*",
+                              "engine/scene/SceneSerializer.*",
+                              # 视口拾取（锚点状态在 EditorContext，消费在 Viewport）
+                              "editor/ViewportPanel.*", "editor/EditorContext.*",
+                              # Esc 三档判断 + Play 侧的 joints 注入点
+                              "editor/EditorApp.*",
+                              # 脚本内建 joint/jointAnchors/...（九件）
+                              "engine/script/ScriptEngine.*",
+                              # 运行时侧的同一套注入（Game.exe 里脚本调关节）
+                              "runtime/RuntimeApp.*"],
     # 底栏 + Content 抽屉：底栏与抽屉的外框都在 EditorApp；主体的让位高度
     # 走 SplitLayout 的 bottomInset；抽屉里画的是 ContentBrowser::drawBody；
     # 默认开关来自面板表与工作区预设（Workspace.*）。
@@ -1393,6 +1544,11 @@ TRIGGERS = {
     # focusCameraAtPlayer）。`editor/EditorApp.*` 是"进入地形模式就取景"的
     # 调用点；`editor/ViewportPanel.*` 那份 `Brush` 面板的可见区也在这里被断言。
     "verify_landscape_ground": ["editor/LandscapeEditor.*",
+                                # 2026-10-28：8 个工具按钮改成"按可用宽度换列"
+                                # 的响应式网格（`PanelLayout.h`）。列数一变，
+                                # `LS-TOOL-<i>` 的坐标就整体挪 —— 这条用例正是
+                                # 按锚点去点、并且守"末行不许掉出面板"的。
+                                "editor/PanelLayout.h",
                                 "editor/EditorApp.*",
                                 "editor/ViewportPanel.*"],
     # 游戏 UI / HUD（U0 起，docs/ui_hud_roadmap.md）。    # ⚠ `engine/ui2/**` **故意不进** `GLOBAL_GLOBS`：它只被 UI 通道引用，
@@ -1839,6 +1995,57 @@ TRIGGERS = {
                          "engine/scene/SceneSerializer.*",
                          "editor/InspectorPanel.*",
                          "assets/sequences/**"],
+    # ---- 稳定身份（2026-10-27，G16）----
+    # 断言落点：
+    #   · 分配 / 反查 / 冲突 / 销毁 / hex 表示        → engine/ecs/GuidSelfTest.cpp
+    #   · 场景 JSON 的 guid / parentGuid / version    → engine/scene/SceneSerializer.*
+    #   · `reconnectByGuidOrName`（撤销后选中接回）    → engine/scene/Scene.*
+    #   · 编辑器的 `m_selectionGuid` 快照             → editor/EditorContext.*
+    #   · 夹具（v1/v2/重复 guid 三个变体都从这里派生） → assets/scenes/**
+    # ⚠ `engine/ecs/World.h` / `World.cpp` / `Entity.h` **刻意不登记** ——
+    #   它们在 `GLOBAL_GLOBS` 里，改了就全量；登记进来只会在 `--narrow` 下
+    #   变成一条"看起来被点名了、其实被全量吞掉"的假精确。
+    # ⚠ `engine/scene/Scene.*` 与 verify_viewport / verify_prefab 重挂是**故意**的，
+    #   理由同 verify_dialogue 那条：只挂一处会让 `--narrow` 把另一条判成不受影响。
+    "verify_guid": ["engine/ecs/GuidSelfTest.cpp",
+                    "engine/scene/SceneSerializer.*",
+                    "engine/scene/Scene.*",
+                    "editor/EditorContext.*",
+                    "assets/scenes/**"],
+    # ---- 序列化器三段拆分（2026-10-27，G16-5）----
+    # 断言落点：
+    #   · 三段 API 的**签名**（D 组静态护栏读的就是它）        → SceneDocument.h
+    #   · 39 条数值断言                                        → SceneIoSelfTest.cpp
+    #   · 读/写两端（guid、parentGuid、folder、raw 保留）      → SceneSerializer.*
+    #   · `--selftest sceneio` 的注册点                          → runtime/main.cpp
+    #   · B/C 两组用的真实夹具                                  → assets/scenes/**
+    # ⚠ `engine/scene/Scene.*` 不登记：`instantiateDocument` 只调它的
+    #   createObject / setParent / clear / light()，改这些会同时打挂
+    #   verify_guid / verify_viewport（它们都挂了 Scene.*），这里再挂只是噪音。
+    # ⚠ `engine/ecs/Components.h` 在 `GLOBAL_GLOBS` 里 → 改组件本来全量，
+    #   登记进来只会在 `--narrow` 下变成一条"看起来被点名、其实被全量吞掉"的假精确。
+    "verify_sceneio": ["engine/scene/SceneDocument.h",
+                    "engine/scene/SceneIoSelfTest.cpp",
+                    "engine/scene/SceneSerializer.*",
+                    "runtime/main.cpp",
+                    "assets/scenes/**"],
+    # ---- 存档：文件层 G17-1 + 应用层 G17-2（2026-10-27）----
+    # 断言落点：
+    #   · 格式 / 原子写 / 迁移表 / 单实体 JSON / 增量抓档        → SaveGame.*
+    #   · 基线 / diff / applySaveGame / 悬挂父修正               → SaveGameState.*
+    #   · 77 条数值断言                                          → PersistenceSelfTest.cpp
+    #   · `entityToJson(..., includeEmpty)` 的新参数（存档要全量）→ SceneSerializer.*
+    #   · `--selftest save` 的注册点                              → runtime/main.cpp
+    # ⚠ 与 verify_sceneio / verify_guid / verify_prefab 重挂 `SceneSerializer.*`
+    #   是**故意**的：只挂一处会让 `--narrow` 把另一条判成不受影响。
+    # ⚠ `engine/ecs/Components.h`（World/组件定义）在 `GLOBAL_GLOBS` 里 → 改动本来
+    #   全量，**刻意不登记**（登记了在 `--narrow` 下会变假跳过）。
+    # ⚠ `engine/scene/Scene.{h,cpp}` 同样在 `GLOBAL_GLOBS` 里 → 也刻意不写。
+    "verify_persistence": ["engine/scene/SaveGame.*",
+                           "engine/scene/SaveGameState.*",
+                           "engine/scene/PersistenceSelfTest.cpp",
+                           "engine/scene/SceneSerializer.*",
+                           "runtime/main.cpp"],
     # ---- 对话（2026-10-26，C2 第二步）----
     # 断言落点：
     #   · 数据层 + 调度层（解析 / 播放头 / 打字机 / cue 优先级）→ engine/dialogue/**

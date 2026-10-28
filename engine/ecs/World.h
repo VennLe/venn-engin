@@ -45,6 +45,14 @@ public:
 
     size_t entityCount() const { return m_aliveCount; }
 
+    // ---------------- 稳定身份（G16） ----------------
+    // 与 EntityId 无关的持久身份。存档 / 跨文件引用一律用它，详见 Entity.h。
+    // 不变量：同一时刻 `m_byGuid[guid(e)] == e.id`，且 `guid(e) == 0` 表示"无身份"。
+    EntityGuid guid(Entity e) const;             // 无效实体 / 无 guid → kInvalidGuid
+    Entity     find(EntityGuid g) const;         // 找不到 → Entity{}（valid()==false）
+    bool       setGuid(Entity e, EntityGuid g);  // 已被别的存活实体占用 → false
+    EntityGuid allocateGuid();                   // 由 create() 内部调用，也供自检单测
+
     // ---------------- 组件 ----------------
     template <typename T>
     T& add(Entity e, T value = T{});
@@ -91,6 +99,9 @@ private:
         uint32_t generation = 0;
         bool alive = false;
         std::string name;
+        // ⚠ 必须在 `create()` 的 `m_records.emplace_back()` **之后**赋值 ——
+        //   emplace_back 造出的是带默认 guid=0 的 Record，顺序写反会读到 0。
+        EntityGuid guid = kInvalidGuid;
     };
 
     // 只取已存在的组件池，不存在返回 nullptr（const 版遍历用）
@@ -99,6 +110,9 @@ private:
 
     std::vector<Record> m_records;
     std::vector<EntityId> m_free;  // 可复用的槽位
+    // guid → EntityId 的反查表。**只增删，不重建**：重建会让 guid 的顺序影响
+    // find() 的结果，而 guid 是随机值，顺序不稳定 = 偶发不一致。
+    std::unordered_map<EntityGuid, EntityId> m_byGuid;
     size_t m_aliveCount = 0;
     std::unordered_map<std::type_index, std::unique_ptr<IComponentPool>> m_pools;
 };

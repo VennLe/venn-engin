@@ -15,13 +15,25 @@
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
 
+#include "project/ProjectBuild.h"
+#include "project/ProjectFile.h"
+
 #include <imgui.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
+#include <string>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <commdlg.h>
+#endif
 
 namespace editor {
 
@@ -93,6 +105,69 @@ void paintTransportIcon(ImDrawList* dl, ImVec2 p, float s, int glyph,
     }
 }
 
+// ---- "另存为"的原生对话框 ----
+//
+// 为什么必须换成对话框：原来这一项写死 `assets/scenes/scene.json`，
+// 于是"打开 level2.json → Save As"会**覆盖 scene.json**，而用户以为
+// 自己另存了一份。这不是难看，是丢数据。
+//
+// ⚠ `OFN_NOCHANGEDIR` 不能省：不带它，对话框会把**进程当前目录**改成用户
+//   最后浏览的那个文件夹 —— 这套引擎的资源查找 / m_root 全建立在
+//   "工作目录 = 项目根"上，一改就全盘错位，且下次启动还开在那儿。
+//   （ContentBrowser 的导入对话框踩过同一个坑。）
+std::string askSaveSceneAbsPath(const std::string& currentRel) {
+#ifdef _WIN32
+    // 自动化：脚本点不了系统对话框，而"Save As 到底写到哪个文件"恰恰是
+    // 要断言的语义 —— 所以给一个直接给目标路径的开关。
+    if (const char* env = std::getenv("MYVK_EDITOR_SAVEAS_PATH")) {
+        if (env[0] != '\0') {
+            VK_LOG_INFO("SAVEAS path_from_env=%s", env);
+            return std::string(env);
+        }
+    }
+    // 连"只走流程"也不要（与导入那边的开关同名）
+    if (std::getenv("MYVK_EDITOR_CB_NO_DIALOG")) {
+        VK_LOG_INFO("SAVEAS dialog=suppressed");
+        return std::string();
+    }
+
+    // 默认落点 = 当前场景所在目录 + 同名文件。
+    std::filesystem::path guess(currentRel);
+    if (guess.is_relative()) guess = std::filesystem::absolute(guess);
+    std::string defaultName = guess.filename().string();
+    if (defaultName.empty()) defaultName = "scene.json";
+    const std::wstring seed =
+        (guess.parent_path() / std::filesystem::path(defaultName)).wstring();
+
+    std::vector<wchar_t> buf(4096, L'\0');
+    {
+        const std::size_t n = seed.copy(buf.data(), buf.size() - 1);
+        buf[n] = L'\0';
+    }
+
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = GetActiveWindow();
+    if (!ofn.hwndOwner) ofn.hwndOwner = GetForegroundWindow();
+    ofn.lpstrFilter = L"Scene (*.json)\0*.json\0All files\0*.*\0";
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = static_cast<DWORD>(buf.size());
+    ofn.lpstrTitle = L"Save scene as";
+    ofn.lpstrDefExt = L"json";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_EXPLORER |
+                OFN_NOCHANGEDIR;
+
+    if (!GetSaveFileNameW(&ofn)) {
+        VK_LOG_INFO("SAVEAS cancelled");
+        return std::string();
+    }
+    return std::filesystem::path(std::wstring(buf.data())).u8string();
+#else
+    (void)currentRel;
+    return std::string();
+#endif
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- 文件操作
@@ -142,6 +217,98 @@ void Toolbar::saveSceneAs(const std::string& relPath) {
 }
 
 void Toolbar::saveSceneToCurrentPath() { saveSceneAs(m_ctx.scenePath()); }
+
+void Toolbar::saveSceneAsDialog() {
+    const std::string abs = askSaveSceneAbsPath(m_ctx.scenePath());
+    if (abs.empty()) {
+        // 取消 / 非 Windows / 自动化抑制。**绝不能**退回到"写 scene.json"
+        // —— 那正是这个入口原来的 bug（把另一个场景覆盖掉）。
+        VK_LOG_INFO("SAVEAS abort (no path)");
+        return;
+    }
+    // 对话框给的是绝对路径；存盘与 scenePath 都用项目相对路径
+    // （`makeAssetRelative` 在"逃出资产根"时原样返回绝对路径，仍然可用）。
+    saveSceneAs(assets::makeAssetRelative(abs));
+    VK_LOG_INFO("SAVEAS abs=%s", abs.c_str());
+}
+
+// ---------------------------------------------------------------- 出包（E28-1）
+void Toolbar::packageProject(bool asPak) {
+    namespace fs = std::filesystem;
+
+    // 工程根 = 当前工作目录。编辑器在认到 `MYVK_EDITOR_PROJECT` 时会
+    // `chdir` 到工程根（EditorApp 里那段 "D7"），所以这里不需要再问环境变量；
+    // 反过来说，**没打开工程**时 CWD 就是仓库根 —— 那里没有
+    // `venn.project.json`，下面会明确拒绝，而不是"打包出一个空壳"。
+    std::error_code ec;
+    const fs::path cwd = fs::current_path(ec);
+    if (ec) {
+        m_ctx.notify(TR("Package failed: ") + ec.message());
+        return;
+    }
+
+    project::ProjectFile pf;
+    std::string perr;
+    if (!project::loadProject(cwd.generic_string(), pf, &perr)) {
+        m_ctx.notify(TR("Package needs an open project: ") + perr);
+        VK_LOG_WARN("PACKAGE-FAIL no project at %s (%s)",
+                    cwd.generic_string().c_str(), perr.c_str());
+        return;
+    }
+
+    // 打包用的是 **Game.exe**，不是 Editor.exe —— 出包出去的东西里不能有
+    // 编辑器。两者是同一个构建目录里的兄弟文件（`build/bin/`）。
+    const std::string self = project::engineExePath();
+    const size_t slash = self.find_last_of('/');
+    const std::string exeDir = (slash == std::string::npos) ? std::string(".")
+                                                            : self.substr(0, slash);
+    const std::string gameExe = exeDir + "/Game.exe";
+    if (!fs::is_regular_file(fs::path(gameExe), ec)) {
+        m_ctx.notify(TR("Package failed: Game.exe not found next to the editor"));
+        VK_LOG_WARN("PACKAGE-FAIL game exe missing: %s", gameExe.c_str());
+        return;
+    }
+
+    project::BuildSpec spec;
+    spec.projectRoot = cwd.generic_string();
+    spec.engineExe = gameExe;
+    spec.usePak = asPak;
+    // 输出到 `<工程根>/dist/<Name>`。**不自动覆盖**：上一次的包还在的话
+    // 会明确失败并告诉你删哪个目录 —— 出包覆盖是最容易"以为发了新版、
+    // 其实发的还是旧包"的地方。
+    std::string name = pf.name.empty() ? std::string("Game") : pf.name;
+    for (char& c : name) {
+        if (c == ' ' || c == '/' || c == '\\' || c == ':' || c == '*' ||
+            c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+            c = '_';
+        }
+    }
+    spec.outDir = (fs::path(spec.projectRoot) / "dist" / name).generic_string();
+
+    VK_LOG_INFO("PACKAGE-START from=%s out=%s pak=%d", spec.projectRoot.c_str(),
+                spec.outDir.c_str(), asPak ? 1 : 0);
+    const project::BuildResult r = project::buildProject(spec, nullptr);
+    for (const auto& w : r.warnings) {
+        VK_LOG_WARN("PACKAGE-WARN %s", w.c_str());
+    }
+    if (!r.ok) {
+        // 通知条只放第一行（多行会把 toast 撑爆），完整原因进日志。
+        std::string first = r.error.substr(0, r.error.find('\n'));
+        m_ctx.notify(TR("Package failed: ") + first);
+        VK_LOG_ERROR("PACKAGE-FAIL %s", r.error.c_str());
+        return;
+    }
+    // ⚠ 成功提示用**一条**完整格式串，不要把"已打包"/数字/单位拼起来：
+    //   语序不同的语言里拼出来是断的（本项目 i18n 检查也只看整条带 TR 的
+    //   格式串，拼接出来的碎片它数不到，于是"缺译文"会一直挂着）。
+    char msg[320];
+    std::snprintf(msg, sizeof(msg), TR("Packaged %d files · %lld KB  →  %s"),
+                  r.files, static_cast<long long>(r.bytes / 1024),
+                  r.outDir.c_str());
+    m_ctx.notify(msg);
+    VK_LOG_INFO("PACKAGE-OK out=%s files=%d bytes=%lld warnings=%zu",
+                r.outDir.c_str(), r.files, r.bytes, r.warnings.size());
+}
 
 // ---------------------------------------------------------------- 菜单子项
 
@@ -234,7 +401,16 @@ void Toolbar::drawMenuBar() {
     // ================================================================
     // File
     // ================================================================
-    if (ImGui::BeginMenu(TR("File"))) {
+    // 一级菜单的锚点（E08 之后第一次被自动化覆盖）：
+    // 菜单项**没有** ImGui ID 可查，脚本只能按矩形点 —— 所以每个要点进去
+    // 的项都留一个 logRect。标签一律 ASCII（脚本按它取坐标）。
+    auto tagMenu = [](const char* tag) {
+        logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    };
+
+    const bool fileMenuOpen = ImGui::BeginMenu(TR("File"));
+    tagMenu("MENU-FILE");   // ⚠ 锚点必须在 if 之前：菜单没展开时也要能点到它
+    if (fileMenuOpen) {
         if (ImGui::MenuItem(TR("New Scene"), "Ctrl+N")) newScene();
 
         ImGui::Separator();
@@ -262,22 +438,49 @@ void Toolbar::drawMenuBar() {
 
         ImGui::Separator();
         if (ImGui::MenuItem(TR("Save"), "Ctrl+S")) saveSceneToCurrentPath();
-        if (ImGui::MenuItem(TR("Save As (assets/scenes/scene.json)"))) {
-            saveSceneAs("assets/scenes/scene.json");
+        tagMenu("MENU-SAVE");
+        // 走原生"另存为"对话框（默认落在当前场景目录、预填同名文件）。
+        // 原来这里写死 `assets/scenes/scene.json` —— 打开别的场景后点它
+        // 会把那个场景覆盖掉，而用户以为自己另存了一份。
+        if (ImGui::MenuItem(TR("Save As"))) saveSceneAsDialog();
+        tagMenu("MENU-SAVEAS");
+
+        ImGui::Separator();
+        // ---- E28-1 出包 ----
+        // 放在 File 里、不单开一个 Build 菜单：现在只有一条命令，为它开一个
+        // 顶级菜单只会让人以为下面还有东西（UE 那个 Platforms 菜单是几十年
+        // 攒出来的，我们还没到那一步）。等有了"Cook 内容 / 平台 / 签名"
+        // 才值得开。
+        if (ImGui::MenuItem(TR("Package project..."))) packageProject(false);
+        tagMenu("MENU-PACKAGE");
+        // 第一版 pak 单列一条，不做成"出包对话框里的一个勾选框"：
+        // 现在没有出包对话框（就一条同步命令），为一个布尔值先造一套对话框
+        // 不值。而且两条菜单项**各自有名字**，用户能直接看出区别；
+        // 一个勾选框藏在哪、默认是什么，反而要试。
+        if (ImGui::MenuItem(TR("Package project as .pak..."))) {
+            packageProject(true);
         }
+        tagMenu("MENU-PACKAGE-PAK");
 
         ImGui::Separator();
         // ---- Import / Export ----
-        // Import 走的是**拖拽进视口**那条既有路径（见 ViewportPanel 的
-        // AcceptDragDropPayload）—— 这里给的是同一个动作的菜单入口：
-        // 打开内容浏览器看一眼能拖什么。真正的"文件选择对话框"要等
-        // 平台层有原生对话框（E28 打包 UI 会同批做）。
-        if (ImGui::BeginMenu(TR("Import"))) {
+        // Import 现在是**真入口**：转到 ContentBrowser 那条既有的原生
+        // 文件对话框（`OPENFILENAMEW` + 同名不覆盖），不再只是"去看一眼"。
+        // 原来这里有一条灰着的 `Native file dialog (E28)`，注释写着"等平台
+        // 层有原生对话框"—— 可 Content 里早就在跑了。同一个能力两个入口，
+        // 一个能用、一个灰着，只会让人以为引擎没有它。
+        const bool importMenuOpen = ImGui::BeginMenu(TR("Import"));
+        tagMenu("MENU-FILE-IMPORT");
+        if (importMenuOpen) {
+            if (ImGui::MenuItem(TR("Import assets..."))) {
+                m_host.requestImportDialog();
+            }
+            tagMenu("MENU-IMPORT-ASSETS");
             if (ImGui::MenuItem(TR("Reveal assets/ in Content Browser"))) {
+                panelOpenRef("content") = true;
                 m_ctx.notify(TR("Drag a .gltf/.obj/.fbx from the Content "
                              "browser into the viewport to place it"));
             }
-            ImGui::MenuItem(TR("Native file dialog (E28)"), nullptr, false, false);
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu(TR("Export"))) {
@@ -298,7 +501,9 @@ void Toolbar::drawMenuBar() {
     // ================================================================
     // Edit
     // ================================================================
-    if (ImGui::BeginMenu(TR("Edit"))) {
+    const bool editMenuOpen = ImGui::BeginMenu(TR("Edit"));
+    tagMenu("MENU-EDIT");
+    if (editMenuOpen) {
         ImGui::BeginDisabled(!m_ctx.commands().canUndo());
         std::string undoLabel = "Undo";
         if (m_ctx.commands().canUndo())
@@ -334,31 +539,36 @@ void Toolbar::drawMenuBar() {
 
         ImGui::Separator();
         ImGui::BeginDisabled(!m_ctx.hasSelection());
+        // 真的复制（`SceneHierarchy::duplicateSelection()`：uniqueName +
+        // 一批一次 structuralEdit，撤销一次全回滚）。原来这里只弹一句
+        // "用 Ctrl+D"——菜单项自己不做事的唯一结果是让人以为功能没做。
         if (ImGui::MenuItem(TR("Duplicate"), "Ctrl+D")) {
-            m_ctx.notify(TR("Use Ctrl+D / the Hierarchy context menu"));
+            m_host.duplicateSelection();
         }
+        tagMenu("MENU-EDIT-DUP");
         ImGui::EndDisabled();
 
         ImGui::Separator();
         // ---- 选择 ----
-        // ⚠ Select All / Invert 需要**多选**，而当前的选择模型是单个
-        //   Entity（EditorContext::m_selection）。这两项故意禁用而不是
-        //   假装能用 —— 多选随 E11（Inspector 升级）/ E22（选择增强）落地。
-        ImGui::MenuItem(TR("Select None"), "Esc", false, false);
-        if (ImGui::MenuItem(TR("Deselect"))) m_ctx.clearSelection();
-        ImGui::BeginDisabled(true);
-        ImGui::MenuItem(TR("Select All"), "Ctrl+A", false, false);
-        ImGui::MenuItem(TR("Invert Selection"), nullptr, false, false);
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(TR("multi-selection lands with E11 / E22"));
-        }
+        // 多选（selectionSet / selectMany / selectAll）2026-10-27 就落地了，
+        // 这三项跟着接线。原来三项全灰着、tooltip 写"multi-selection lands
+        // with E11 / E22"—— 那两件早就做完了，菜单还停在当时的注上。
+        if (ImGui::MenuItem(TR("Select None"), "Esc")) m_ctx.clearSelection();
+        tagMenu("MENU-EDIT-SELECTNONE");
+        if (ImGui::MenuItem(TR("Select All"), "Ctrl+A")) m_ctx.selectAll();
+        tagMenu("MENU-EDIT-SELECTALL");
+        if (ImGui::MenuItem(TR("Invert Selection"))) m_ctx.invertSelection();
+        tagMenu("MENU-EDIT-INVERT");
 
         ImGui::Separator();
+        // E26 落地的是**画质档位**面板（`quality`）。这一项当时是占位提示
+        // （"lands with E26"），现在直接接到那张面板上 —— 编辑器里现存的
+        // 项目级设置就是画质档位；输入映射在 Preferences ▸ Keymap 页。
         if (ImGui::MenuItem(TR("Project Settings..."))) {
-            m_ctx.notify(TR("Project settings panel lands with E26 "
-                         "(quality tiers)"));
+            panelOpenRef("quality") = true;
+            m_ctx.notify(TR("Project settings: quality tiers"));
         }
+        tagMenu("MENU-EDIT-PROJSET");
         if (ImGui::MenuItem(TR("Editor Preferences..."))) m_ctx.showSettings() = true;
         ImGui::EndMenu();
     }
@@ -366,7 +576,9 @@ void Toolbar::drawMenuBar() {
     // ================================================================
     // GameObject（保持既有内容不动）
     // ================================================================
-    if (ImGui::BeginMenu(TR("GameObject"))) {
+    const bool gameObjectMenuOpen = ImGui::BeginMenu(TR("GameObject"));
+    tagMenu("MENU-GAMEOBJECT");
+    if (gameObjectMenuOpen) {
         static const PrimitiveKind kinds[] = {
             PrimitiveKind::Cube,      PrimitiveKind::Sphere,
             PrimitiveKind::Cylinder,  PrimitiveKind::Plane,
@@ -383,6 +595,11 @@ void Toolbar::drawMenuBar() {
                     });
                 if (created.valid()) m_ctx.select(created);
             }
+            // 按**枚举值**打锚点（Cube=0 / Sphere=1 / … / Empty=6），
+            // 不用可翻译的名字：锚点是脚本的契约，不能随界面语言变。
+            char tag[32];
+            std::snprintf(tag, sizeof(tag), "MENU-GO-%d", static_cast<int>(k));
+            tagMenu(tag);
         }
         // 特殊灯光条目（语义不在 PrimitiveKind 里，见 EditorScene.h）
         ImGui::Separator();

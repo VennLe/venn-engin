@@ -466,11 +466,18 @@ void EditorContext::select(ecs::Entity e, bool fromViewport) {
     // 换了选中项，"手柄是否作用在碰撞体上"必须复位 —— 否则新选中的物体
     // 会莫名其妙地拖到旧物体的碰撞体上（或者干脆拖不动）。
     m_colliderEdit = false;
+    // 关节锚点拾取同理，而且后果更严重：拾取模式记着"要写进哪个实体"，
+    // 换了选中项之后那一条就是**过期目标**，接着点视口会把锚点写到
+    // 用户已经不看的东西身上。宁可让他重点一次按钮。
+    cancelAnchorPick();
     if (e.valid()) {
         if (const std::string* n = activeScene().world().name(e))
             m_selectionName = *n;
         else
             m_selectionName.clear();
+        m_selectionGuid = activeScene().world().guid(e);
+    } else {
+        m_selectionGuid = ecs::kInvalidGuid;
     }
 
     // ---- 选择集：单选入口把集合**替换**成一项 ----
@@ -487,8 +494,10 @@ void EditorContext::select(ecs::Entity e, bool fromViewport) {
 void EditorContext::clearSelection() {
     m_selection = ecs::Entity{};
     m_selectionName.clear();
+    m_selectionGuid = ecs::kInvalidGuid;
     m_selectionFromViewport = false;
     m_colliderEdit = false;
+    cancelAnchorPick();
     m_selectionSet.clear();
     m_selectionNames.clear();
 }
@@ -512,12 +521,15 @@ void EditorContext::setSelectionPrimary(ecs::Entity e) {
     if (e.valid() && !activeScene().world().alive(e)) e = ecs::Entity{};
     m_selection = e;
     m_colliderEdit = false;
+    cancelAnchorPick();
     // 支路（Ctrl 点、框选、全选）里主选中项都是"刚操作的那一个"，
     // 而不是"在视口里点中的"—— 与 selectFromViewport 的出处标记无关。
     m_selectionFromViewport = false;
     m_selectionName.clear();
+    m_selectionGuid = ecs::kInvalidGuid;
     if (!e.valid()) return;
     if (const std::string* n = activeScene().world().name(e)) m_selectionName = *n;
+    m_selectionGuid = activeScene().world().guid(e);
     // 名字数组也跟着修一下：主选中项那一项的缓存可能已经过期（改过名）。
     for (std::size_t i = 0; i < m_selectionSet.size(); ++i)
         if (m_selectionSet[i].id == e.id) m_selectionNames[i] = m_selectionName;
@@ -612,6 +624,41 @@ void EditorContext::selectAll() {
     });
     selectMany(all);
     VK_LOG_INFO("SELECT all n=%zu", m_selectionSet.size());
+}
+
+void EditorContext::invertSelection() {
+    ecs::World& w = activeScene().world();
+    // 判据必须与 selectAll 逐字相同（同样跳过上锁的），否则会出现
+    // "全选里有 A、反选里也有 A"这种自相矛盾的集合。
+    std::vector<ecs::Entity> rest;
+    w.each<ecs::TransformComponent>([&](ecs::Entity e, ecs::TransformComponent&) {
+        if (w.has<ecs::LockedComponent>(e)) return;
+        if (isSelected(e)) return;      // ← 与 selectAll 的**唯一**差别
+        rest.push_back(e);
+    });
+    selectMany(rest);                   // selectMany 会整份替换 → 结果就是反选
+    VK_LOG_INFO("SELECT invert n=%zu", m_selectionSet.size());
+}
+
+void EditorContext::cancelAnchorPick() {
+    if (m_anchorPick == AnchorPick::None) return;
+    // 打出来：调用方可能是"换选中项"这种不相干的地方，用户不会想到
+    // 自己配到一半的锚点拾取是被它清掉的。
+    VK_LOG_INFO("JOINT-PICK cancel reason=implicit state=%d entity=%u",
+                static_cast<int>(m_anchorPick), m_anchorPickEntity.id);
+    m_anchorPick = AnchorPick::None;
+    m_anchorPickEntity = ecs::Entity{};
+}
+
+bool EditorContext::advanceAnchorPick() {
+    if (m_anchorPick == AnchorPick::Self) {
+        m_anchorPick = AnchorPick::Target;
+        return true;
+    }
+    // Target 之后收工；None 调进来就是"本来就没在拾取"，同样返回 false。
+    m_anchorPick = AnchorPick::None;
+    m_anchorPickEntity = ecs::Entity{};
+    return false;
 }
 
 glm::vec3 EditorContext::selectionPivot() {
@@ -839,13 +886,25 @@ void EditorContext::validateSelection() {
     if (m_selection.valid() && w.alive(m_selection)) {
         if (const std::string* n = w.name(m_selection))
             m_selectionName = *n;
+        // 活着就顺手刷新身份快照 —— 这样"改名之后撤销"也能靠 guid 接回来
+        m_selectionGuid = w.guid(m_selection);
     } else {
         // 新建出来的组件是全新的，手柄不能再指着一个"已经不存在的碰撞体"
         m_colliderEdit = false;
         m_selection = ecs::Entity{};
-        if (!m_selectionName.empty()) {
-            const ecs::Entity found = sc.find(m_selectionName);
-            if (found.valid()) m_selection = found;
+        // guid 优先、名字兜底（见 `Scene::reconnectByGuidOrName` 的说明）。
+        // ⚠ 顺序不能反：撤销会把整个世界**重建**，两个同名 `Crate` 时按名字找
+        //   永远返回第一个 —— 用户选的是第二个，撤销一次就跳到第一个，
+        //   而画面、层级、属性面板全都"看着正常"。这就是 H5 的现网 bug。
+        m_selection = sc.reconnectByGuidOrName(m_selectionGuid, m_selectionName);
+        if (m_selection.valid()) {
+            // 接回来的可能是新 guid（老场景里原来没有，是加载时补发的）
+            m_selectionGuid = w.guid(m_selection);
+        } else if (m_selectionGuid != ecs::kInvalidGuid || !m_selectionName.empty()) {
+            VK_LOG_WARN("INS-SELECT reconnect failed name='%s' guid=%016llx",
+                        m_selectionName.c_str(),
+                        static_cast<unsigned long long>(m_selectionGuid));
+            m_selectionGuid = ecs::kInvalidGuid;
         }
     }
 
@@ -869,6 +928,7 @@ void EditorContext::validateSelection() {
     if (!m_selection.valid()) {
         m_selection = m_selectionSet.front();
         if (const std::string* n = w.name(m_selection)) m_selectionName = *n;
+        m_selectionGuid = w.guid(m_selection);
     }
 }
 

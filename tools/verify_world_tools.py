@@ -649,6 +649,86 @@ def main():
             m = re.search(r"total=(\d+)", cnt[-1])
             total = int(m.group(1)) if m else 0
         check(0 < total <= 6000, "B5 实例总数正常 (total=%d)" % total)
+
+        # ---------------------------------------------------- B6~B10 面板重做
+        #
+        # 2026-10-28：Foliage 面板按 UE5 重做（工具行 / 类型列表带眼睛 /
+        # 每类型参数 / Reapply）。这一段的判据全部落在**新控件真的接通了**
+        # 上：点了工具 → 日志变→ 视口行为跟着变，而不是"按钮画出来了"。
+        #
+        # ⚠ 类型列表和工具行在面板顶部（默认可见）；Reapply 在面板下方，
+        #   要先 `reveal` 滚进来 —— 被裁掉的控件"有矩形却点不到"。
+        tools = [rect_of(tap, "FO-TOOL-%d" % i, 3.0) for i in range(4)]
+        check(all(tools), "B6 工具行四格齐全（Paint/Erase/Single/Select，缺 %s）"
+              % ([i for i, r in enumerate(tools) if not r] or "无"))
+
+        # B7 Single：点一株（不是撒一片）
+        click_rect(hwnd, tools[2], "Single 工具")
+        check(count(tap, "FOLIAGE-TOOL single") > 0, "B7a 切到 Single 工具")
+        bp3 = brush_point(tap)
+        focus_window(hwnd)
+        click(hwnd, bp3[0], bp3[1])
+        time.sleep(0.9)
+        single = lines_with(tap, "FOLIAGE-SINGLE")
+        ok_single = bool(single) and "placed=1" in single[-1]
+        check(ok_single, "B7b 一次单击只放 1 株（FOLIAGE-SINGLE placed=1）")
+        if single:
+            print("      ·", single[-1].strip()[-120:])
+
+        # B8 Erase：真的删掉了
+        click_rect(hwnd, tools[1], "Erase 工具")
+        check(count(tap, "FOLIAGE-TOOL erase") > 0, "B8a 切到 Erase 工具")
+        focus_window(hwnd)
+        drag(hwnd, (bp3[0] - 20.0, bp3[1]), (bp3[0] + 20.0, bp3[1]), steps=10)
+        time.sleep(0.9)
+        erased = [l for l in lines_with(tap, "FOLIAGE-ERASE")
+                  if "removed=0" not in l]
+        check(bool(erased), "B8b 擦除真的删了实例（FOLIAGE-ERASE removed>0）")
+        if erased:
+            print("      ·", erased[-1].strip()[-120:])
+
+        # B9 眼睛：可见性开关（不是删除）
+        vis = rect_of(tap, "FO-VIS-3", 3.0)
+        # ⚠ `before_total` 必须**当场重读**，不能沿用 B5 那个值：
+        #   B8 的擦除把株数改了，而 `recount(false)` 是**不打日志**的
+        #   （只在条数变化时打）。沿用旧值会把"擦除让 18 变 5"算到"隐藏"
+        #   头上 —— 上一版就是这么假红的（18 → 5）。
+        cnt_prev = lines_with(tap, "FOLIAGE-COUNT total=")
+        before_total = total
+        if cnt_prev:
+            m = re.search(r"total=(\d+)", cnt_prev[-1])
+            before_total = int(m.group(1)) if m else total
+        if vis:
+            click_rect(hwnd, vis, "Flower 眼睛")
+            check(count(tap, "FOLIAGE-VIS flower=0") > 0,
+                  "B9a 点眼睛 → FOLIAGE-VIS flower=0")
+            cnt2 = lines_with(tap, "FOLIAGE-COUNT total=")
+            t2 = before_total
+            if cnt2:
+                m = re.search(r"total=(\d+)", cnt2[-1])
+                t2 = int(m.group(1)) if m else t2
+            check(t2 == before_total,
+                  "B9b 只是隐藏，实例数没变（%d → %d）" % (before_total, t2))
+            click_rect(hwnd, vis, "Flower 眼睛（点回来）")
+            check(count(tap, "FOLIAGE-VIS flower=1") > 0,
+                  "B9c 再点一次恢复显示 → FOLIAGE-VIS flower=1")
+        else:
+            check(False, "B9 找到 FO-VIS-3 锚点")
+
+        # B10 Reapply：把参数重新套到已有实例上（UE 的招牌按钮）
+        pt = reveal(hwnd, tap, "FO-REAPPLY", panel_tag="FO-PANEL", tries=14)
+        if pt:
+            focus_window(hwnd)
+            click(hwnd, pt[0], pt[1])
+            time.sleep(1.0)
+            check(count(tap, "FOLIAGE-REAPPLY kind=") > 0,
+                  "B10 Reapply 执行并写了日志（FOLIAGE-REAPPLY kind=…）")
+            rp = lines_with(tap, "FOLIAGE-REAPPLY kind=")
+            if rp:
+                print("      ·", rp[-1].strip()[-120:])
+        else:
+            check(False, "B10 FO-REAPPLY 滚不进可视区（面板太窄/滚轮没到）")
+
         shoot(hwnd, "_wt_foliage_kinds.png")
         # ============================================== A8 形状雕刻（原"挖洞"）
         #

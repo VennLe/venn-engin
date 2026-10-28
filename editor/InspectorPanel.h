@@ -147,6 +147,7 @@ private:
     void drawCharacterSection(ecs::Entity e);        // G07 角色控制器
     void drawTriggerSection(ecs::Entity e);          // G08 触发体
     void drawPhysicsMaterialSection(ecs::Entity e);  // G08 材质覆盖层
+    void drawJointSection(ecs::Entity e);            // J5 关节 / 约束
     void drawCameraComponentSection(ecs::Entity e);  // G09 相机组件 + 相机列表
     // 给选中实体挂/摘刚体（走 structuralEdit 进撤销栈）。
     void addRigidBodyTo(ecs::Entity e);

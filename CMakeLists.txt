@@ -40,6 +40,62 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 find_package(Vulkan REQUIRED)
 
 # ============================================================
+# 构建风味：dev / shipping（G30）
+# ------------------------------------------------------------
+#   cmake -S . -B build-ship -DVENN_SHIPPING=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+#   （日常用法：`make ship` —— 见 Makefile 里那个 target）
+#
+# shipping 改的是**产物的成分**，不是"优化开关"：
+#   ① 不构建 Editor.exe / Launcher.exe（连 target 都不声明）；
+#   ② `VENN_SHIPPING=1` 编进代码 → 校验层强制关、开发命令/自检编译期剔除
+#      （判据见 `tools/verify_shipping.py`：按**字节**证明字符串不在）；
+#   ③ 链接带 `/DEBUG`（MSVC）→ 符号在单独的 .pdb 里，出包时可归档，
+#      **玩家拿到的 exe 本身不含调试符号**。
+#
+# ⚠ 一律定义成 0/1（而不是 shipping 时才定义）：`#if VENN_SHIPPING` 在
+#   未定义时等于 `#if 0`，但 MSVC /W3 对未定义标识符在 #if 里会给 C4668，
+#   而两个分支都写死数字就不存在"漏定义"这条分支了。
+# ============================================================
+option(VENN_SHIPPING "Shipping build: runtime only, no validation, no dev hooks" OFF)
+if(VENN_SHIPPING)
+    add_compile_definitions(VENN_SHIPPING=1)
+else()
+    add_compile_definitions(VENN_SHIPPING=0)
+endif()
+
+# ------------------------------------------------------------
+# git 版本号：编进二进制（`core::kGitDescribe`）
+# ------------------------------------------------------------
+# `${VENN_SHIPPING}` 与 CMAKE_BUILD_TYPE 的组合本身也是"这份包是什么"的
+# 一部分，所以一起打日志。⚠ configure 时刻的快照，改 git 后要重新 configure。
+execute_process(
+    COMMAND git describe --tags --always --dirty
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE VENN_GIT_DESCRIBE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE VENN_GIT_RC
+)
+if(NOT VENN_GIT_RC EQUAL 0 OR VENN_GIT_DESCRIBE STREQUAL "")
+    set(VENN_GIT_DESCRIBE "nogit")
+endif()
+if(VENN_SHIPPING)
+    set(VENN_FLAVOR_MSG "shipping")
+else()
+    set(VENN_FLAVOR_MSG "dev")
+endif()
+message(STATUS "venn: build flavor=${VENN_FLAVOR_MSG} git=${VENN_GIT_DESCRIBE} type=${CMAKE_BUILD_TYPE}")
+
+if(VENN_SHIPPING AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # 不拦（本机自测 shipping 的行为时用得上），但必须很响 ——
+    # 带 /RTC1 的 Debug 体在玩家机器上会**直接弹断言框卡死**。
+    message(WARNING
+        "VENN_SHIPPING=ON with CMAKE_BUILD_TYPE=Debug: Debug builds carry "
+        "/RTC1 runtime checks and the debug CRT, which cannot ship. "
+        "Use -DCMAKE_BUILD_TYPE=RelWithDebInfo for real packages.")
+endif()
+
+# ============================================================
 # Windows 图标资源（venn 的豚鼠 logo）
 # ------------------------------------------------------------
 # 用 MinGW 自带的 windres 把 assets/icons/venn.rc（引用同目录的 venn.ico）
@@ -189,6 +245,11 @@ add_library(venn ALIAS VennEngine)
 target_include_directories(VennEngine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/engine
 )
+# git 号透传（`core/Build.h` 的 `kGitDescribe`）。PUBLIC：三个应用层都要能
+# 打出一行相同的 `GAME-BUILD` / `EDITOR-BUILD`。
+target_compile_definitions(VennEngine PUBLIC
+    "VENN_GIT_DESCRIBE=\"${VENN_GIT_DESCRIBE}\""
+)
 target_link_libraries(VennEngine PUBLIC
     Vulkan::Vulkan
     glfw
@@ -225,7 +286,12 @@ endif()
 # ------------------------------------------------------------
 # editor/ 里是只读依赖 engine/，反过来 engine/ 不认识 editor/。
 # （曾经还有一个 Sandbox 独立示例程序，2026-10-09 按用户要求整体删除。）
+#
+# ⚠ G30：shipping 构建里**连 target 都不声明**。这不是"编了但不用"——
+#   声明了就会被 `cmake --build`（无 target 参数）编出来，然后被人误拷进
+#   发行目录。判据：`build-ship/build.ninja` 里搜不到 Editor.exe。
 # ============================================================
+if(NOT VENN_SHIPPING)
 file(GLOB_RECURSE EDITOR_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/editor/*.cpp
 )
@@ -249,6 +315,7 @@ if(WIN32)
     # 在链接期报 LNK2019: __imp_GetOpenFileNameW。
     target_link_libraries(VennEditor PRIVATE comdlg32)
 endif()
+endif()   # if(NOT VENN_SHIPPING)  ← Editor
 
 # ============================================================
 # 运行时（runtime/ → Game.exe）
@@ -281,6 +348,8 @@ target_link_libraries(VennRuntime PRIVATE VennEngine)
 #   直接 `i18n::tr`）。这是"启动器能独立发出去"的前提，也让
 #   `engine/` 之外的三份应用层互不影响。
 # ============================================================
+# ⚠ G30：shipping 构建里不声明启动器（理由同 editor/ 那一段）。
+if(NOT VENN_SHIPPING)
 file(GLOB_RECURSE LAUNCHER_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/launcher/*.cpp
 )
@@ -298,16 +367,37 @@ if(WIN32)
     # （WASAPI 需要），这里补另外两个。
     target_link_libraries(VennLauncher PRIVATE shell32 uuid)
 endif()
+endif()   # if(NOT VENN_SHIPPING)  ← Launcher
 
 if(NOT MSVC)
-    target_link_options(VennEditor PRIVATE -static-libgcc -static-libstdc++)
     target_link_options(VennRuntime PRIVATE -static-libgcc -static-libstdc++)
-    target_link_options(VennLauncher PRIVATE -static-libgcc -static-libstdc++)
     if(WIN32)
-        target_link_options(VennEditor PRIVATE -static)
         target_link_options(VennRuntime PRIVATE -static)
-        target_link_options(VennLauncher PRIVATE -static)
     endif()
+    if(NOT VENN_SHIPPING)
+        target_link_options(VennEditor PRIVATE -static-libgcc -static-libstdc++)
+        target_link_options(VennLauncher PRIVATE -static-libgcc -static-libstdc++)
+        if(WIN32)
+            target_link_options(VennEditor PRIVATE -static)
+            target_link_options(VennLauncher PRIVATE -static)
+        endif()
+    endif()
+endif()
+
+# ============================================================
+# 符号（G30）
+# ------------------------------------------------------------
+# MSVC：`/DEBUG` 把调试信息写进**单独的** .pdb，exe 里只留一个指向它的
+#   GUID —— 这正是"剥符号"想要的效果（PDB 归档、exe 干净）。
+#   `/OPT:REF,ICF` 顺手去掉没被引用到的函数与等价代码段：
+#   这是"shipping 里不含开发命令"的第二道保险（第一道是 `#if`）。
+# MinGW：`-s` 直接 strip。
+# ⚠ 不给 Release 关 `/DEBUG`：没有 pdb 就没有栈符号，崩溃了只能看地址。
+# ============================================================
+if(MSVC)
+    target_link_options(VennRuntime PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+elseif(VENN_SHIPPING)
+    target_link_options(VennRuntime PRIVATE -s)
 endif()
 
 # Windows 上窗口程序若要隐藏控制台可改 WIN32，v1 保留控制台便于看日志
@@ -762,7 +852,11 @@ if(SHADER_STALE)
 endif()
 # 两个可执行文件都要按构建顺序排在着色器之后（真正"每次都拷"在下面的
 # VennShadersCopy 里，这里管的是"编译顺序"）。
-add_dependencies(VennEditor Shaders)
+# ⚠ shipping 构建里没有 VennEditor 这个 target（G30）—— 直接
+#   add_dependencies 会在 configure 阶段报"non-existent target"。
+if(NOT VENN_SHIPPING)
+    add_dependencies(VennEditor Shaders)
+endif()
 add_dependencies(VennRuntime Shaders)
 
 # ============================================================
@@ -963,13 +1057,17 @@ function(myvk_copy_runtime_assets target)
     endif()
 endfunction()
 
+if(NOT VENN_SHIPPING)
 myvk_copy_runtime_assets(VennEditor)
+endif()
 myvk_copy_runtime_assets(VennRuntime)
 # 启动器也要 `templates/`（新建工程时复制它）与 `assets/icons/`（窗口图标）。
 # 不需要着色器 —— 启动器一个 3D 也不画；但那个函数会一并拷进来，
 # 代价只是磁盘上多一份 shader，换来"三个 exe 的目录布局完全一致"，
 # 少一类"某个 exe 跑起来找不到 X"的差异。
+if(NOT VENN_SHIPPING)
 myvk_copy_runtime_assets(VennLauncher)
+endif()
 
 
 # ============================================================
@@ -984,7 +1082,12 @@ myvk_copy_runtime_assets(VennLauncher)
 #     myvk_copy_runtime_assets 那套"三个 exe 目录一致"的约束里。
 #
 # 输出名 AssetC（与 Editor / Game / Launcher 一致：短、无版本号）。
+#
+# ⚠ G30：shipping 构建里不声明它。它不是"应用"，是**构建期工具** ——
+#   发行目录里出现一个"能把资产烤来烤去"的 exe，等于把工具链一起发了。
+#   于是 `build-ship/bin/` 里只有一个文件（Game.exe），这是可断言的。
 # ============================================================
+if(NOT VENN_SHIPPING)
 file(GLOB_RECURSE ASSETC_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/assetc/*.cpp
 )
@@ -995,3 +1098,4 @@ target_link_libraries(VennAssetC PRIVATE VennAssetIO)
 if(NOT MSVC)
     target_compile_options(VennAssetC PRIVATE -Wall -Wextra)
 endif()
+endif()   # if(NOT VENN_SHIPPING)  ← AssetC

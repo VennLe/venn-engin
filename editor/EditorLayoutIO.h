@@ -9,6 +9,7 @@
 //   viewportLayout  视口布局（single / 2v / 2h / quad）
 //   viewMode        渲染视图模式（lit / unlit / normal / …）
 //   maximized       被最大化的面板 id（"" = 没有）
+//   slots[]         叶子 → 面板（E29-1；缺省 = 默认树）
 //
 // ------------------------------------------------------------
 // 两条硬规则（和 core/WindowGeometry 同一套）
@@ -43,6 +44,11 @@ struct LayoutState {
     bool splitCollapsed[kLayoutSplitNodes] = {false, false, false};
     float splitSaved[kLayoutSplitNodes] = {0.30f, 0.50f, 0.60f};
 
+    // 叶子 → 面板 的映射（E29-1）。slots[node][side]，side: 0=A 1=B。
+    // **存面板 id 字符串，不存槽位下标** —— 与 inspTab 同一条理由：下标会
+    // 随着"往表中间插一个面板"整体漂移，老配置读回来就落到别的面板上。
+    // 空 = 用默认树（老文件没有这一段，读回来行为与改造前完全一致）。
+    std::vector<std::string> slotGroups[kLayoutSplitNodes][2];
     int viewportLayout = 0;   // 0=single 1=2v 2=2h 3=quad
     int viewMode = 0;         // Renderer::ViewMode 的整数值
     std::string maximized;    // 被最大化的面板 id（"" = 无）

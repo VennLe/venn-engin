@@ -10,6 +10,7 @@
 #include "ecs/Components.h"
 #include "physics/CollisionWorld.h"
 #include "scene/Scene.h"
+#include "scene/SceneDocument.h"
 #include "scene/SceneEntityIO.h"
 
 #include <nlohmann/json.hpp>
@@ -29,7 +30,10 @@ namespace {
 
 using json = nlohmann::json;
 
-constexpr int kFormatVersion = 1;
+// ⚠ 真正的定义在 `scene/SceneDocument.h`（`kSceneFormatVersion`）。这里只
+//   起一个匿名 namespace 内的别名，让下面 4 处调用点保持原样。
+//   两份字面量会漂，一个别名不会。
+constexpr int kFormatVersion = kSceneFormatVersion;
 
 // ============================================================
 // 基础类型 <-> JSON
@@ -2537,6 +2541,57 @@ json rigidBodyToJson(const ecs::RigidBodyComponent& b) {
     };
 }
 
+json jointToJson(const ecs::JointComponent& j) {
+    // ⚠ `target` 存 **16 位 hex 字符串**，不存下标、也不存 JSON number ——
+    //   下标会在"销毁一个实体"之后指到别人身上；number 会被中间工具
+    //   （Python json → float、JS → 精度截断）改坏。理由与 `parentGuid`
+    //   完全一致，见 Entity.h 顶部那段。
+    return json{
+        {"kind", static_cast<int>(j.kind)},
+        {"target", j.target == ecs::kInvalidGuid ? std::string()
+                                                 : ecs::guidToHex(j.target)},
+        {"anchorSelf", vec3ToJson(j.anchorSelf)},
+        {"anchorTarget", vec3ToJson(j.anchorTarget)},
+        {"axis", vec3ToJson(j.axis)},
+        {"distance", j.distance},
+        {"useLimit", j.useLimit},
+        {"lowerLimit", j.lowerLimit},
+        {"upperLimit", j.upperLimit},
+        {"useMotor", j.useMotor},
+        {"motorSpeed", j.motorSpeed},
+        {"maxMotorForce", j.maxMotorForce},
+        {"enabled", j.enabled},
+    };
+}
+
+ecs::JointComponent jointFromJson(const json& j) {
+    ecs::JointComponent out;   // 缺字段 = 保持默认（与 rigidBodyFromJson 同一条规矩）
+    if (!j.is_object()) return out;
+
+    out.kind = static_cast<ecs::JointKind>(
+        j.value("kind", static_cast<int>(out.kind)));
+    // 空串 / 解析失败都归到"未指定"，让 Play 时走那条明确的 WARN 分支，
+    // 而不是拿着一个 0 去 find(0)（那会静默返回无效实体）。
+    if (j.contains("target") && j["target"].is_string()) {
+        const std::string hex = j["target"].get<std::string>();
+        out.target = hex.empty() ? ecs::kInvalidGuid : ecs::parseGuidHex(hex);
+    }
+    if (j.contains("anchorSelf"))
+        out.anchorSelf = vec3FromJson(j["anchorSelf"], out.anchorSelf);
+    if (j.contains("anchorTarget"))
+        out.anchorTarget = vec3FromJson(j["anchorTarget"], out.anchorTarget);
+    if (j.contains("axis")) out.axis = vec3FromJson(j["axis"], out.axis);
+    out.distance = j.value("distance", out.distance);
+    out.useLimit = j.value("useLimit", out.useLimit);
+    out.lowerLimit = j.value("lowerLimit", out.lowerLimit);
+    out.upperLimit = j.value("upperLimit", out.upperLimit);
+    out.useMotor = j.value("useMotor", out.useMotor);
+    out.motorSpeed = j.value("motorSpeed", out.motorSpeed);
+    out.maxMotorForce = j.value("maxMotorForce", out.maxMotorForce);
+    out.enabled = j.value("enabled", out.enabled);
+    return out;
+}
+
 ecs::RigidBodyComponent rigidBodyFromJson(const json& j) {
     ecs::RigidBodyComponent b;   // 从默认值出发：缺字段 = 该字段保持默认
     if (!j.is_object()) return b;
@@ -2743,10 +2798,17 @@ ecs::CameraComponent cameraComponentFromJson(const json& j) {
 bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
                       const ecs::TransformComponent& tr,
                       const std::unordered_map<ecs::EntityId, int>& indexOf,
-                      json& out) {
+                      json& out, bool includeEmpty) {
     json je;
     const std::string* nm = w.name(e);
     je["name"] = nm ? *nm : std::string("Entity");
+
+    // ---- 身份紧跟 name（G16-2）----
+    // ⚠ 位置是有意的：别插在 `parent` 后面。读文件的人第一眼该看到"这是谁"，
+    //   而不是先读三行变换再去找一个 16 位 hex。
+    // 无身份（guid==0）就不写 —— 只可能出现在自检手工构造的 World 里。
+    const ecs::EntityGuid selfGuid = w.guid(e);
+    if (selfGuid != ecs::kInvalidGuid) je["guid"] = ecs::guidToHex(selfGuid);
 
     je["transform"] = json{
         {"position", vec3ToJson(tr.position)},
@@ -2763,15 +2825,25 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
     if (w.has<ecs::LockedComponent>(e)) je["locked"] = true;
 
     int parentIndex = -1;
+    ecs::EntityId parentId = ecs::kInvalidEntity;
     if (const auto* h = w.get<ecs::HierarchyComponent>(e)) {
-        if (h->parent != ecs::kInvalidEntity) {
-            auto f = indexOf.find(h->parent);
+        parentId = h->parent;
+        if (parentId != ecs::kInvalidEntity) {
+            auto f = indexOf.find(parentId);
             if (f != indexOf.end()) parentIndex = f->second;
         }
         // "文件夹"标记（Hierarchy 里显示成目录图标的纯分组节点）
         if (h->group) je["folder"] = true;
     }
     je["parent"] = parentIndex;
+
+    // 父**不在本次导出集合里** → 下标表达不了，只能写 guid。
+    // 出现的场合：Prefab 子树的根（它的父在场景里）、G19 分块的边界实体。
+    // 父已死则 guid 取到 0，什么都不写（留一个 -1 比留一个指不到人的 guid 好）。
+    if (parentIndex < 0 && parentId != ecs::kInvalidEntity) {
+        const ecs::EntityGuid pg = w.guid(w.handle(parentId));
+        if (pg != ecs::kInvalidGuid) je["parentGuid"] = ecs::guidToHex(pg);
+    }
 
     const auto* mc = w.get<ecs::MeshComponent>(e);
     const auto* matc = w.get<ecs::MaterialComponent>(e);
@@ -2855,6 +2927,12 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
     // 要为它开一个口子。位置/朝向已经在 transform 里，这里只存参数。
     if (const auto* rb = w.get<ecs::RigidBodyComponent>(e))
         je["rigidbody"] = rigidBodyToJson(*rb);
+
+    // 关节（J5）。这条实体是关节的 **A 侧**，另一端由 `target` 的 guid 指。
+    // 与刚体同款：它也不带网格（通常正好挂在"只有刚体 + 关节"的实体上，
+    // 比如门轴），所以同样要为 skipped++ 开一个口子。
+    if (const auto* jt = w.get<ecs::JointComponent>(e))
+        je["joint"] = jointToJson(*jt);
 
     // 动画器（角色链 A1）。挂在同一个模型根实体上，紧跟 skinned 之后。
     // 存盘顺序 = 读档顺序，所以 animatorFromJson 里的 modelFromSource
@@ -3020,6 +3098,7 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
         je.contains("terrain") || je.contains("water") ||
         je.contains("decal") || je.contains("probe") ||
         je.contains("particleEmitter") || je.contains("rigidbody") ||
+        je.contains("joint") ||
         je.contains("character") || je.contains("trigger") ||
         je.contains("physicsMaterial") || je.contains("camera") ||
         je.contains("skinned") || je.contains("animator") ||
@@ -3045,11 +3124,15 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
         // G18 预制体成员标记。prefab 里可以有"纯分组节点"（没有网格、
         // 只有 children），漏了它会被算进 skipped。
         je.contains("prefab");
-    if (je["mesh"].is_null() && !hasNonMeshContent)
+    // ⚠ `includeEmpty` 只给**存档**用（G17-1）。场景文件要的是"不写空壳"，
+    //   存档要的是"全量" —— 一个只挂 Transform 的空物体（玩家、出生点、
+    //   纯分组节点）在场景里确实没什么好存的，但存档漏了它 = 读档后
+    //   那个物体"消失了"（或者被补发一个新 guid）。
+    if (!includeEmpty && je["mesh"].is_null() && !hasNonMeshContent)
         return false;
 
     out = std::move(je);
-        return true;
+    return true;
 }
 
 
@@ -3068,22 +3151,55 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
 //
 // 返回 true = 这个实体"有内容"（有网格/材质，或挂着任一非网格组件）。
 // ============================================================
-bool entityFromJsonImpl(Scene& scene, assets::AssetManager& assets,
-                        const json& je, ecs::Entity e,
-                        const std::vector<ecs::Entity>& created) {
+
+// ---- G16-5 两段拆分 ----
+// 上面那份注释里的"三件事"其实只有两种依赖：父子/文件夹是**纯 CPU**，
+// 组件与资产要 AssetManager。劈开之后：
+//   * `entityApplyHierarchyImpl` → ② 段（无设备），
+//   * `entityApplyComponentsImpl` → ③ 段（要设备）。
+// 公开壳在外层（`entityApplyHierarchy` / `entityApplyComponents`），
+// `entityFromJsonImpl` 只是把两段串起来 —— 这样 Prefab 与场景加载
+// **仍然只有一条路**，不会出现"拆完之后 Prefab 漏了父子"这种事故。
+void entityApplyHierarchyImpl(Scene& scene, const json& je, ecs::Entity e,
+                              const std::vector<ecs::Entity>& created) {
     ecs::World& w = scene.world();
-    const int parentIndex = je.value("parent", -1);
-    if (parentIndex >= 0 &&
-        parentIndex < static_cast<int>(created.size()) &&
-        created[static_cast<size_t>(parentIndex)].valid()) {
-        scene.setParent(e, created[static_cast<size_t>(parentIndex)]);
+    // ---- 父子关系：跨集合用 `parentGuid`，本文件内用 `parent` 下标 ----
+    // 两条路互斥：写了 `parentGuid` 就以它为准（Prefab 子树的根、G19 分块的边界
+    // 实体都只有 guid 可用，它们的父不在这份文件里，下标无从谈起）。
+    if (je.contains("parentGuid") && je["parentGuid"].is_string()) {
+        const ecs::EntityGuid pg = ecs::parseGuidHex(je["parentGuid"].get<std::string>());
+        const ecs::Entity p = w.find(pg);
+        if (p.valid()) {
+            scene.setParent(e, p);
+        } else {
+            // 不 fail 整份加载：父可能在还没流送进来的块里（G19），先让实体独立存在。
+            VK_LOG_WARN("SCENE-PARENT-GUID-MISS guid=%s entity=%u",
+                        je["parentGuid"].get<std::string>().c_str(), e.id);
+        }
+    } else {
+        // ⚠ 必须显式判 `is_number_integer()`：`je.value("parent", -1)` 遇到字符串会抛
+        //   `type_error.302`，而手写 / 别的工具导出的文件里 `"parent": "-1"` 完全可能。
+        const int parentIndex =
+            (je.contains("parent") && je["parent"].is_number_integer()) ? je["parent"].get<int>()
+                                                                        : -1;
+        if (parentIndex >= 0 && parentIndex < static_cast<int>(created.size()) &&
+            created[static_cast<size_t>(parentIndex)].valid()) {
+            scene.setParent(e, created[static_cast<size_t>(parentIndex)]);
+        }
     }
 
     // "文件夹"标记
+    // ⚠ 它读的是 `folder` 布尔，写端在 `entityToJsonImpl` 里 —— 两处别漏一处：
+    //   漏了读端，存一次盘所有文件夹就摊平成普通空物体（在选择树里完全看不出来）。
     if (je.value("folder", false)) {
         if (auto* h = w.get<ecs::HierarchyComponent>(e)) h->group = true;
     }
+}
 
+// ③ 段：组件值与资产。**这里才开始碰 AssetManager**。
+bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
+                               const json& je, ecs::Entity e) {
+    ecs::World& w = scene.world();
     assets::Mesh* mesh = resolveMesh(
         assets, je.contains("mesh") ? je["mesh"] : json(nullptr));
     assets::Material* mat = resolveMaterial(
@@ -3478,6 +3594,17 @@ bool entityFromJsonImpl(Scene& scene, assets::AssetManager& assets,
             w.add<ecs::RigidBodyComponent>(e, rb);
     }
 
+    // 关节（J5）。同样是**纯数据**：Play 建物理世界时由 ScenePhysics 翻译成
+    // physics::Joint。`target` 里是 guid，不需要在这里解析成实体 ——
+    // 解析放在建世界那一步，这样读盘顺序与 guid 分配顺序无关。
+    if (je.contains("joint") && je["joint"].is_object()) {
+        const ecs::JointComponent jc = jointFromJson(je["joint"]);
+        if (auto* p = w.get<ecs::JointComponent>(e))
+            *p = jc;
+        else
+            w.add<ecs::JointComponent>(e, jc);
+    }
+
     // 角色控制器（G07）/ 触发体 / 物理材质（G08）/ 相机（G09）。
     // 全是纯数据：真正的行为由运行时或编辑器在 Play 时消费。
     if (je.contains("character") && je["character"].is_object()) {
@@ -3544,6 +3671,7 @@ bool entityFromJsonImpl(Scene& scene, assets::AssetManager& assets,
         je.contains("terrain") || je.contains("water") ||
         je.contains("decal") || je.contains("probe") ||
         je.contains("particleEmitter") || je.contains("rigidbody") ||
+        je.contains("joint") ||
         je.contains("character") || je.contains("trigger") ||
         je.contains("physicsMaterial") || je.contains("camera") ||
         je.contains("skinned") || je.contains("animator") ||
@@ -3572,6 +3700,14 @@ bool entityFromJsonImpl(Scene& scene, assets::AssetManager& assets,
     return mesh || mat || hasNonMeshContent;
 }
 
+// 两段的**唯一**串联点。保留这个函数体只有两行，是为了让"拆完之后
+// Prefab 与场景加载仍然是同一条路"这件事在代码上无法被悄悄改坏。
+bool entityFromJsonImpl(Scene& scene, assets::AssetManager& assets,
+                        const json& je, ecs::Entity e,
+                        const std::vector<ecs::Entity>& created) {
+    entityApplyHierarchy(scene, je, e, created);
+    return entityApplyComponents(scene, assets, je, e);
+}
 
 json buildSceneJson(const Scene& scene, SceneIoResult& r) {
     const ecs::World& w = scene.world();
@@ -3645,7 +3781,7 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
     root["entities"] = json::array();
     for (const Item& it : items) {
         json jent;
-        if (entityToJsonImpl(w, it.entity, *it.transform, indexOf, jent))
+        if (entityToJsonImpl(w, it.entity, *it.transform, indexOf, jent, /*includeEmpty=*/false))
             root["entities"].push_back(std::move(jent));
         else
             ++r.skipped;
@@ -3659,105 +3795,230 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
 // JSON → 场景（文件版与内存版共用的核心）
 // ============================================================
 
-SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets,
-                                const json& root) {
+// `path` 只为日志（`SCENE-GUID ... path=`）而传：内存版 `sceneFromJson` 给默认值，
+// 读盘版给真实路径。它**不**参与解析，所以别拿它做任何路径解析。
+//
+// ---- G16-5：这里现在是三段的**组合**，不再是三件事的混合体 ----
+// 想"后台解析 / 主线程上传"的话，把 ① ② 搬到工作线程、只把 ③ 留在这里即可。
+SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets, const json& root,
+                                const std::string& path = "<memory>") {
     SceneIoResult r;
 
-    if (!root.is_object()) {
-        r.error = "root JSON value is not an object";
+    // ① 解析（版本校验在里，早于任何 `clear`）
+    SceneDocument doc;
+    std::string err;
+    if (!parseSceneDocument(root, doc, err)) {
+        r.error = err;
         return r;
     }
 
-    // 清空旧场景（AssetManager 的网格/材质/纹理缓存保留并可复用）
-    scene.clear();
-
-    applyCamera(scene.camera(), root.contains("camera") ? root["camera"]
-                                                        : json(nullptr));
-    // 额外相机（多相机）。顶层 "camera" 已经钉好 0 号，这里从 1 号起补。
-    if (root.contains("cameras") && root["cameras"].is_array()) {
-        const json& cams = root["cameras"];
-        for (size_t i = 0; i < cams.size(); ++i) {
-            Camera& cam = (scene.cameraCount() > i + 1)
-                              ? scene.camera(i + 1)
-                              : scene.camera(scene.addCamera());
-            applyCamera(cam, cams[i]);
-        }
-    }
-    applyLight(scene.light(), root.contains("light") ? root["light"]
-                                                     : json(nullptr));
-
-    // 物理世界（R7-1）。scene.clear() 已经把 m_physics 复位成默认值，
-    // 所以"老场景没有 physics 字段"这条路径**什么都不用做**就是对的。
-    physicsFromJson(scene.physicsSettings(),
-                    root.contains("physics") ? root["physics"] : json(nullptr));
-
-    // 后处理体积
-    // 脚本世界黑板（S2）
-    scene.scriptVars().clear();
-    if (root.contains("scriptVars") && root["scriptVars"].is_object()) {
-        for (auto it = root["scriptVars"].begin();
-             it != root["scriptVars"].end(); ++it) {
-            if (it.value().is_number())
-                scene.scriptVars()[it.key()] = it.value().get<double>();
-        }
-    }
-    if (root.contains("postVolumes") && root["postVolumes"].is_array()) {
-        for (const json& jv : root["postVolumes"])
-            scene.postVolumes().add(postVolumeFromJson(jv));
-    }
-
-    if (!root.contains("entities") || !root["entities"].is_array()) {
-        r.ok = true;  // 只有相机/光照的空场景也算成功
-        return r;
-    }
-
-    const json& ents = root["entities"];
-    ecs::World& w = scene.world();
-
-    // ---- 第一遍：建实体 + 名字 + 变换 + 可见性 ----
+    // ② 建骨架（纯 CPU）
     std::vector<ecs::Entity> created;
-    created.reserve(ents.size());
+    std::unordered_map<ecs::EntityGuid, ecs::Entity> guidMap;
+    DocumentStats st;
+    instantiateDocument(scene, doc, created, guidMap, st);
 
-    for (const json& je : ents) {
-        if (!je.is_object()) {
-            created.push_back(ecs::Entity{});
-            continue;
-        }
-        const std::string name = je.value("name", std::string("Entity"));
-        ecs::Entity e = scene.createObject(name);
-        // 外壳（transform / visible / locked）与 Prefab 实例化共用一份实现
-        entityApplyShell(scene, je, e);
-        created.push_back(e);
-    }
+    // 一条汇总，不是每实体一条 —— 42 个实体刷 42 行会把真正的问题淹没。
+    VK_LOG_INFO("SCENE-GUID assigned=%d dup=%d total=%d path=%s", st.guidAssigned, st.guidDup,
+                st.entities, path.c_str());
 
-    // ---- 第二遍：父子关系 + 网格 + 材质 ----
-    // 网格放在材质之前解析：glTF 网格一加载，配套材质也就登记好了
-    for (size_t i = 0; i < ents.size(); ++i) {
-        const json& je = ents[i];
-        if (!je.is_object()) continue;
-        ecs::Entity e = created[i];
-        if (!e.valid()) continue;
-
-        if (!entityFromJsonImpl(scene, assets, je, e, created)) ++r.skipped;
-    }
+    // ③ 资产（唯一要设备的一句）
+    resolveDocumentAssets(scene, assets, doc, created, st);
 
     r.ok = true;
-    r.entities = static_cast<int>(created.size());
+    r.entities = st.entities;
+    r.skipped = st.skipped;
     return r;
 }
 
 } // namespace
 
 // ============================================================
+// 公开：G16-5 三段（见 scene/SceneDocument.h）
+//
+// ⚠ 定义必须在匿名 namespace **外面**：里面定义就是内部链接，而头文件
+//   声明的是外部链接 —— 别的 TU 会拿到"未定义引用"，报错点在链接期。
+//   但它们要用的 `applyCamera` / `physicsFromJson` / `entityApplyComponentsImpl`
+//   全在匿名 namespace 里，所以实现只能留在本文件（这就是为什么没有
+//   `SceneDocument.cpp`）。
+// ============================================================
+
+// ① 解析 + 校验。纯 CPU。
+bool parseSceneDocument(const nlohmann::json& root, SceneDocument& out, std::string& err) {
+    out = SceneDocument{};
+
+    if (!root.is_object()) {
+        err = "root JSON value is not an object";
+        return false;
+    }
+
+    // ---- 格式版本（G16-2）----
+    // v1 → v2：实体多了 `guid` / `parentGuid`。**旧文件照读**（缺 guid 就补发），
+    // 所以这里只拒绝"比我们新"的版本。
+    if (root.contains("version") && root["version"].is_number_integer()) {
+        const int v = root["version"].get<int>();
+        out.formatVersion = v;
+        if (v > kSceneFormatVersion) {
+            err = "scene format version " + std::to_string(v) + " is newer than supported (" +
+                  std::to_string(kSceneFormatVersion) + ")";
+            VK_LOG_ERROR("SCENE-VERSION too-new found=%d supported=%d", v, kSceneFormatVersion);
+            return false;
+        }
+    }
+
+    // ---- 全局块：原样留着，由 ② 段按 key 应用 ----
+    // 白名单是刻意的（列出"认识的"，而不是"排除 entities"）：漏掉一个 key =
+    // 读档后那个设置静默回到默认值，而画面上未必看得出来；反过来用排除法，
+    // 将来的未知块也会被搬进来，`documentToJson` 写回时就变成垃圾。
+    static const char* kGlobalKeys[] = {"camera", "cameras",     "light",
+                                        "physics", "scriptVars", "postVolumes"};
+    for (const char* k : kGlobalKeys) {
+        if (root.contains(k)) out.globals[k] = root[k];
+    }
+
+    if (!root.contains("entities") || !root["entities"].is_array()) {
+        // 只有相机 / 光照的空场景也算成功（老文件与"新建场景"都走这条）。
+        out.hasEntities = false;
+        return true;
+    }
+    out.hasEntities = true;
+
+    const nlohmann::json& ents = root["entities"];
+    out.entities.reserve(ents.size());
+    for (const nlohmann::json& je : ents) {
+        DocumentEntity de;
+        if (!je.is_object()) {
+            // ⚠ 保留占位：`parent` 下标是**文件下标**，压缩一下后面全体错位。
+            //   用"raw 不是 object"当无效标记，② 段据此跳过。
+            de.name.clear();
+            de.raw = nlohmann::json(nullptr);
+            out.entities.push_back(std::move(de));
+            continue;
+        }
+        de.name = je.value("name", std::string("Entity"));
+        // 空串 / 非法 / 全零 → `kInvalidGuid`（② 段会保留 create() 随机补发的那个）。
+        if (je.contains("guid") && je["guid"].is_string())
+            de.guid = ecs::parseGuidHex(je["guid"].get<std::string>());
+        if (je.contains("parentGuid") && je["parentGuid"].is_string())
+            de.parentGuid = ecs::parseGuidHex(je["parentGuid"].get<std::string>());
+        de.parentIndex = (je.contains("parent") && je["parent"].is_number_integer())
+                             ? je["parent"].get<int>()
+                             : -1;
+        de.raw = je;
+        out.entities.push_back(std::move(de));
+    }
+    return true;
+}
+
+// ② 建世界骨架。纯 CPU —— 参数表里没有 AssetManager，这是判据不是巧合。
+void instantiateDocument(Scene& scene, const SceneDocument& doc,
+                         std::vector<ecs::Entity>& created,
+                         std::unordered_map<ecs::EntityGuid, ecs::Entity>& guidMap,
+                         DocumentStats& stats) {
+    created.clear();
+    guidMap.clear();
+
+    // 清空旧场景（AssetManager 的网格/材质/纹理缓存保留并可复用）
+    scene.clear();
+
+    const nlohmann::json& g = doc.globals;
+    auto has = [&g](const char* k) { return g.contains(k); };
+
+    applyCamera(scene.camera(), has("camera") ? g["camera"] : nlohmann::json(nullptr));
+    // 额外相机（多相机）。顶层 "camera" 已经钉好 0 号，这里从 1 号起补。
+    if (has("cameras") && g["cameras"].is_array()) {
+        const nlohmann::json& cams = g["cameras"];
+        for (size_t i = 0; i < cams.size(); ++i) {
+            Camera& cam = (scene.cameraCount() > i + 1) ? scene.camera(i + 1)
+                                                        : scene.camera(scene.addCamera());
+            applyCamera(cam, cams[i]);
+        }
+    }
+    applyLight(scene.light(), has("light") ? g["light"] : nlohmann::json(nullptr));
+
+    // 物理世界（R7-1）。scene.clear() 已经把 m_physics 复位成默认值，
+    // 所以"老场景没有 physics 字段"这条路径**什么都不用做**就是对的。
+    physicsFromJson(scene.physicsSettings(),
+                    has("physics") ? g["physics"] : nlohmann::json(nullptr));
+
+    // 脚本世界黑板（S2）+ 后处理体积
+    scene.scriptVars().clear();
+    if (has("scriptVars") && g["scriptVars"].is_object()) {
+        for (auto it = g["scriptVars"].begin(); it != g["scriptVars"].end(); ++it) {
+            if (it.value().is_number()) scene.scriptVars()[it.key()] = it.value().get<double>();
+        }
+    }
+    if (has("postVolumes") && g["postVolumes"].is_array()) {
+        for (const nlohmann::json& jv : g["postVolumes"])
+            scene.postVolumes().add(postVolumeFromJson(jv));
+    }
+
+    created.reserve(doc.entities.size());
+
+    // ---- 第一遍：建实体 + 名字 + guid + 变换 + 可见性 ----
+    // ⚠ guid 必须在这里（早于任何其它字段）落定：后面的 `parentGuid` 解析
+    //   要按 guid 反查实体，而反查表是在这一步建起来的。
+    ecs::World& w = scene.world();
+    for (const DocumentEntity& de : doc.entities) {
+        if (!de.raw.is_object()) {
+            created.push_back(ecs::Entity{});
+            continue;
+        }
+        ecs::Entity e = scene.createObject(de.name);
+
+        // `createObject` 已经给了随机 guid，这里用文件里的值**覆盖**。
+        // 空串 / 非法 / 全零 → 都算"没有身份"，保留随机值（老场景与手写用例走这条）。
+        if (de.guid == ecs::kInvalidGuid) {
+            ++stats.guidAssigned;
+        } else if (!w.setGuid(e, de.guid)) {
+            ++stats.guidDup;
+            VK_LOG_WARN("SCENE-GUID-DUP guid=%s action=reassign entity=%u",
+                        ecs::guidToHex(de.guid).c_str(), e.id);
+        }
+        guidMap[w.guid(e)] = e;
+
+        // 外壳（transform / visible / locked）与 Prefab 实例化共用一份实现
+        entityApplyShell(scene, de.raw, e);
+        created.push_back(e);
+    }
+
+    // ---- 第二遍：父子关系 + 文件夹 ----
+    // ⚠ 必须等**所有**实体建完：`parentGuid` 要按 guid 反查，`parent` 下标
+    //   可能指向文件里靠后的实体。
+    // ⚠ 这一段是纯 CPU，所以它属于 ② 而不是 ③ —— 拆错的话"后台解析"出来的
+    //   文档就带着一个没接好的层级，而且不报错。
+    for (size_t i = 0; i < created.size(); ++i) {
+        if (!created[i].valid()) continue;
+        entityApplyHierarchy(scene, doc.entities[i].raw, created[i], created);
+    }
+
+    stats.entities = static_cast<int>(created.size());
+}
+
+// ③ 资产与其余组件。唯一要 AssetManager 的一段。
+void resolveDocumentAssets(Scene& scene, assets::AssetManager& assets,
+                           const SceneDocument& doc,
+                           const std::vector<ecs::Entity>& created,
+                           DocumentStats& stats) {
+    if (!doc.hasEntities) return;
+    const size_t n = std::min(created.size(), doc.entities.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (!created[i].valid()) continue;
+        if (!entityApplyComponents(scene, assets, doc.entities[i].raw, created[i]))
+            ++stats.skipped;
+    }
+}
+
+// ============================================================
 // 公开：单实体 ↔ JSON（见 scene/SceneEntityIO.h）
 //
-// 这两个壳只做一件事：把匿名 namespace 里的 `entityTo*Impl` 递出去。
+// 这几个壳只做一件事：把匿名 namespace 里的 `entityTo*Impl` 递出去。
 // **不要**在这里写第二套字段处理 —— 那正是抽它们出来要避免的。
 // ============================================================
 
 bool entityToJson(const ecs::World& w, ecs::Entity e,
                   const std::unordered_map<ecs::EntityId, int>& indexOf,
-                  nlohmann::json& out) {
+                  nlohmann::json& out, bool includeEmpty) {
     const auto* tr = w.get<ecs::TransformComponent>(e);
     if (!tr) {
         // 没有变换的实体（场景级太阳）从来没进过场景 JSON；
@@ -3766,13 +4027,27 @@ bool entityToJson(const ecs::World& w, ecs::Entity e,
         out = nlohmann::json();
         return false;
     }
-    return entityToJsonImpl(w, e, *tr, indexOf, out);
+    return entityToJsonImpl(w, e, *tr, indexOf, out, includeEmpty);
 }
 
 bool entityFromJson(Scene& scene, assets::AssetManager& assets,
                     const nlohmann::json& je, ecs::Entity e,
                     const std::vector<ecs::Entity>& created) {
     return entityFromJsonImpl(scene, assets, je, e, created);
+}
+
+// 两段拆分（G16-5）的公开壳：与 `entityFromJson` 同样的形态 —— 只把
+// 匿名 namespace 里的 impl 递出去，**不**在这里写第二套。
+void entityApplyHierarchy(Scene& scene, const nlohmann::json& je, ecs::Entity e,
+                          const std::vector<ecs::Entity>& created) {
+    if (!e.valid()) return;
+    entityApplyHierarchyImpl(scene, je, e, created);
+}
+
+bool entityApplyComponents(Scene& scene, assets::AssetManager& assets,
+                           const nlohmann::json& je, ecs::Entity e) {
+    if (!e.valid()) return false;
+    return entityApplyComponentsImpl(scene, assets, je, e);
 }
 
 void entityApplyShell(Scene& scene, const nlohmann::json& je, ecs::Entity e) {
@@ -3865,7 +4140,7 @@ SceneIoResult loadScene(Scene& scene, assets::AssetManager& assets,
         return r;
     }
 
-    SceneIoResult r = loadSceneFromJson(scene, assets, root);
+    SceneIoResult r = loadSceneFromJson(scene, assets, root, path);
     if (r.ok) {
         VK_LOG_INFO("Scene loaded: %s (%d entities, %d skipped)", path.c_str(),
                     r.entities, r.skipped);

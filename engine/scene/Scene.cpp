@@ -173,6 +173,18 @@ ecs::Entity Scene::find(const std::string& name) {
     return found;
 }
 
+ecs::Entity Scene::reconnectByGuidOrName(ecs::EntityGuid guid, const std::string& name) {
+    // ① guid 优先（跨"整场重建"稳定，且能区分同名实体）
+    if (guid != ecs::kInvalidGuid) {
+        const ecs::Entity byGuid = m_world.find(guid);
+        if (byGuid.valid()) return byGuid;
+    }
+    // ② 名字兜底（老场景 / 文件里没写 guid）。⚠ 多个同名时返回**第一个**，
+    //    这正是这条兜底不能当首选的原因。
+    if (!name.empty()) return find(name);
+    return ecs::Entity{};
+}
+
 void Scene::clear() {
     m_world.clear();
     // 世界清空后旧句柄可能"碰巧"仍通过 alive 检查（generation 归零），

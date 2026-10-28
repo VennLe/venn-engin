@@ -1,0 +1,125 @@
+"""临时探针：诊断 SPLIT-0 拖动 + B 组拖拽。用完即删。"""
+import ctypes
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from capture_window import find_window
+from verify_add_menu import LogTap, kill_stale_editors
+from verify_asset_drag import force_foreground
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BIN = os.path.join(ROOT, "build", "bin")
+EDITOR = os.path.join(BIN, "Editor.exe")
+user32 = ctypes.windll.user32
+
+ANY = re.compile(r"\b([A-Z][A-Z0-9_-]*)=\(([-\d.]+),([-\d.]+)\)-\(([-\d.]+),([-\d.]+)\)")
+LAYOUT = re.compile(r"LAYOUT-RECTS modes=\(([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)\) "
+                    r"hier=\(([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)\) "
+                    r"insp=\(([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)\)")
+
+
+def rects(tap, name):
+    out = []
+    with tap.lock:
+        for line in tap.lines:
+            for m in ANY.finditer(line):
+                if m.group(1) == name:
+                    out.append(tuple(float(m.group(i)) for i in range(2, 6)))
+    return out
+
+
+def layouts(tap):
+    out = []
+    with tap.lock:
+        for line in tap.lines:
+            m = LAYOUT.search(line)
+            if m:
+                out.append(tuple(float(m.group(i)) for i in range(1, 13)))
+    return out
+
+
+def dbg(tap):
+    out = []
+    with tap.lock:
+        for line in tap.lines:
+            if "SPLITDBG" in line:
+                out.append(line.strip())
+    return out
+
+
+def c2s(hwnd, x, y):
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+    pt = POINT(int(x), int(y))
+    user32.ClientToScreen(hwnd, ctypes.byref(pt))
+    return pt.x, pt.y
+
+
+def drag_post(hwnd, x0, y0, x1, y1, steps=16):
+    def lp(x, y):
+        return (int(x) & 0xFFFF) | ((int(y) & 0xFFFF) << 16)
+    user32.PostMessageW(hwnd, 0x0200, 0, lp(x0, y0))
+    user32.SetCursorPos(*c2s(hwnd, x0, y0))
+    time.sleep(0.2)
+    user32.PostMessageW(hwnd, 0x0201, 1, lp(x0, y0))
+    time.sleep(0.2)
+    for i in range(1, steps + 1):
+        px = x0 + (x1 - x0) * i / steps
+        py = y0 + (y1 - y0) * i / steps
+        user32.PostMessageW(hwnd, 0x0200, 1, lp(px, py))
+        user32.SetCursorPos(*c2s(hwnd, px, py))
+        time.sleep(0.05)
+    user32.PostMessageW(hwnd, 0x0202, 0, lp(x1, y1))
+    time.sleep(0.5)
+
+
+env = dict(os.environ)
+env["MYVK_NO_WINDOW_SAVE"] = "1"
+env["MYVK_LOG_RECTS"] = "1"
+env["MYVK_SPLIT_DEBUG"] = "1"
+env.pop("MYVK_EDITOR_LAYOUT", None)
+kill_stale_editors()
+proc = subprocess.Popen([EDITOR], cwd=BIN, env=env, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True,
+                        encoding="utf-8", errors="replace", bufsize=1)
+tap = LogTap()
+tap.start(proc)
+hwnd = find_window("Venn Editor", timeout=45)
+force_foreground(hwnd)
+time.sleep(3.5)
+L0 = layouts(tap)
+print("layout lines", len(L0), "last", L0[-1] if L0 else None)
+sp = rects(tap, "SPLIT-0")
+print("SPLIT-0", sp[-1] if sp else None)
+lx = (sp[-1][0] + sp[-1][2]) * 0.5 if sp else 0
+ly = (sp[-1][1] + sp[-1][3]) * 0.5 if sp else 0
+
+# 悬停不按：看 SPLITDBG
+user32.SetCursorPos(*c2s(hwnd, lx, ly))
+time.sleep(0.6)
+print("hover dbg:", dbg(tap)[-3:])
+n0 = len(layouts(tap))
+drag_post(hwnd, lx, ly, lx - 140, ly)
+print("after splitter drag: layouts", len(layouts(tap)), "dbg", dbg(tap)[-2:])
+print("SPLIT-0 now", (rects(tap, "SPLIT-0") or [None])[-1])
+
+# B 组：Inspector 标题 → modes 中部
+L = layouts(tap)[-1] if layouts(tap) else None
+if L:
+    ix, iy, iw, ih = L[8:12]
+    mx, my, mw, mh = L[0:4]
+    print("insp", ix, iy, iw, ih, "modes", mx, my, mw, mh)
+    drag_post(hwnd, ix + iw * 0.5, iy + 12.0, mx + mw * 0.5, my + mh * 0.5)
+    with tap.lock:
+        has = [l for l in tap.lines if "LAYOUT-DRAG" in l]
+    print("LAYOUT-DRAG:", has[-1].strip() if has else "NONE")
+    print("layouts after B drag", len(layouts(tap)))
+proc.terminate()
+try:
+    proc.wait(timeout=8)
+except Exception:
+    proc.kill()

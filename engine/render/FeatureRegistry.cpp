@@ -464,6 +464,12 @@ static const ParamDesc kParamsRendering[] = {
           "⚠ 切换会重建整组前向管线。"),
     PBool("rp.gizmos", "Light gizmos", "MYVK_LIGHT_GIZMOS", ParamTier::Advanced,
           "每盏灯画一个自发光小球（渲染器的调试设施，不是场景资产）。"),
+    // J5-3：关节可视化。默认关 —— 一个场景里十条关节就是三十个几何体，
+    // 只有配关节的时候才想看。蓝色小球 = 自己这端、橙色 = 另一端、
+    // 红色 = 另一端没指定、黄色 = 有一端没挂刚体、绿色 = 铰链/滑动的轴。
+    PBool("rp.jointGizmos", "Joint gizmos", "MYVK_JOINT_GIZMOS",
+          ParamTier::Advanced,
+          "把每条关节画成 两端小球 + 连杆 + 轴（吃深度测试，不是叠加层）。"),
     PBool("rp.extraView", "Extra render target", "MYVK_EXTRA_VIEW",
           ParamTier::Debug, "额外建一个离屏目标（通用 RT 演示/验证）。"),
 };

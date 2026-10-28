@@ -1,0 +1,78 @@
+"""临时探针：Inspector 的 ##insp_content 到底能不能用滚轮滚动。
+
+若滚不动，用例里"先滚进可视区"这条路就是假的 —— 得换别的办法
+（折叠分区 / 更大窗口）。
+"""
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from capture_window import find_window, user32              # noqa: E402
+from verify_add_menu import LogTap                          # noqa: E402
+from verify_asset_drag import force_foreground, move_to     # noqa: E402
+from verify_mesh_params import wait_rect                    # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
+MOUSEEVENTF_WHEEL = 0x0800
+
+
+def wheel(hwnd, x, y, notches):
+    force_foreground(hwnd)
+    move_to(hwnd, x, y)
+    time.sleep(0.2)
+    for _ in range(abs(notches)):
+        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0,
+                           -120 if notches > 0 else 120, 0)
+        time.sleep(0.15)
+    time.sleep(0.5)
+
+
+def main():
+    env = dict(os.environ)
+    env["MYVK_LOG_RECTS"] = "1"
+    env["MYVK_NO_WINDOW_SAVE"] = "1"
+    env["MYVK_CONTENT_DIR"] = "assets/models/Cube"
+    env["MYVK_EDITOR_SELECT"] = "Ground"
+    proc = subprocess.Popen([EXE], cwd=os.path.dirname(EXE), env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            bufsize=1)
+    tap = LogTap()
+    tap.start(proc)
+    try:
+        hwnd = find_window("Venn Editor")
+        user32.ShowWindow(hwnd, 9)
+        time.sleep(2.0)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 1600, 1220, 0x0002 | 0x0004)
+        time.sleep(3.0)
+        force_foreground(hwnd)
+        time.sleep(1.0)
+
+        hdr = wait_rect(tap, "INS-MESH-HEADER", 10.0)
+        slot0 = wait_rect(tap, "MAT-SLOT metallic", 10.0)
+        print("header =", hdr, " metallic =", slot0)
+        if not hdr or not slot0:
+            return 3
+        hx, hy = (hdr[0] + hdr[2]) // 2, (hdr[1] + hdr[3]) // 2
+
+        for label, (px, py), n in (
+                ("header 处向下 3 格", (hx, hy), 3),
+                ("header 上方 80px 向下 3 格", (hx, hy - 80), 3),
+                ("header 处向上 3 格", (hx, hy), -3)):
+            wheel(hwnd, px, py, n)
+            r = wait_rect(tap, "MAT-SLOT metallic", 2.5)
+            print("%-28s -> %s" % (label, r))
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

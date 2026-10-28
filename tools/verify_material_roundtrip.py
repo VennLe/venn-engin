@@ -40,9 +40,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from capture_window import find_window, user32                      # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors              # noqa: E402
 from verify_asset_drag import force_foreground, move_to             # noqa: E402
-from verify_material_chips import drag                              # noqa: E402
-from verify_mesh_params import wait_rect                            # noqa: E402
-from verify_primitive_roundtrip import press_ctrl_s                 # noqa: E402
+from verify_material_chips import drag, wheel_at                  # noqa: E402
+from verify_mesh_params import wait_rect                          # noqa: E402
+from verify_primitive_roundtrip import press_ctrl_s               # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
@@ -96,6 +96,24 @@ def stop(proc):
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
+
+
+def scroll_slot_into_view(hwnd, tap, tag, limit_y, tries=10):
+    """把 tag 那块控件滚到 limit_y 之上（Inspector 内容比窗口高时必需的）。
+
+    本文件用的是 `verify_mesh_params.wait_rect(tap, tag, ...)` 的接口，
+    与 verify_material_chips 里同名函数（走自己的 LogTap）不同，所以各写一份。
+    """
+    r = wait_rect(tap, tag, 4.0)
+    for _ in range(tries):
+        if not r or r[3] <= limit_y:
+            return r
+        hdr = wait_rect(tap, "INS-MESH-HEADER", 2.0)
+        if not hdr:
+            return r
+        wheel_at(hwnd, (hdr[0] + hdr[2]) // 2, (hdr[1] + hdr[3]) // 2, 1)
+        r = wait_rect(tap, tag, 2.5)
+    return r
 
 
 def chip_of(tap, slot):
@@ -171,7 +189,8 @@ def main():
         if not hwnd:
             print("未找到窗口")
             return 2
-        if settle(hwnd, tap, args.size) is None:
+        vp = settle(hwnd, tap, args.size)
+        if vp is None:
             print("缺 VP-RECT")
             return 3
 
@@ -184,6 +203,15 @@ def main():
             r = wait_rect(tap, "MAT-SLOT " + slot, 12.0)
             if not r:
                 check("拿到 %s 槽的矩形" % slot, False, "缺失")
+                continue
+            # Inspector 内容比窗口高时，靠下的槽会在面板外面（logRect 照样
+            # 打逻辑坐标，于是坐标"有"、鼠标点不到）。先滚进可视区 ——
+            # 与 verify_material_chips 同一套办法，理由见那边的注释。
+            r = scroll_slot_into_view(hwnd, tap, "MAT-SLOT " + slot, vp[3])
+            if r and r[3] > vp[3]:
+                check("拖到 %s" % slot, False,
+                      "槽 y=[%.0f,%.0f] 滚不进可视区（≤%.0f）"
+                      % (r[1], r[3], vp[3]))
                 continue
             ok = False
             for attempt in range(3):

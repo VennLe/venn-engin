@@ -1,5 +1,7 @@
 #include "assets/AssetPath.h"
 
+#include "assets/AssetSource.h"
+
 #include <cstdlib>
 #include <filesystem>
 #include <system_error>
@@ -59,9 +61,22 @@ std::string resolveAssetPath(const std::string& relative) {
         candidates.push_back(joinRoot(root, relative));
     }
 
+    // ① 磁盘优先。散文件目录永远赢 —— 编辑器改完立刻生效、热重载也靠它。
     for (const auto& c : candidates) {
         if (fs::exists(c)) return c;
     }
+
+    // ② 磁盘上没有 → 看看是不是打成了包（G29-b）。
+    //    这里调用的是**幂等**探测：第一次走到这条分支才去找
+    //    `<exeDir>/assets.pak`，之后不再碰文件系统。
+    //    包内路径 = "assets/" + 相对路径（包是**相对 dist 根**布局的，
+    //    见 AssetSource.h 的说明）。
+    const std::string entry = "assets/" + relative;
+    if (ensureAssetPakMounted() && assetPakHas(entry)) {
+        const std::string mat = materializePakEntry(entry);
+        if (!mat.empty()) return mat;
+    }
+
     return candidates.front();  // 交给读取处报出可读的错误
 }
 
@@ -69,6 +84,13 @@ std::string makeAssetRelative(const std::string& path) {
     std::error_code ec;
     const fs::path abs = fs::absolute(fs::path(path), ec);
     if (ec) return path;
+
+    // ⓪ 从包里落出来的文件：绝对路径在用户的缓存目录里，**不能**写进场景。
+    //    先问一遍反查表，命中就还原成原始相对路径。
+    {
+        std::string rel;
+        if (relativeForMaterialized(abs.generic_string(), rel)) return rel;
+    }
 
     // 依次尝试各资产根：只要能算出"不逃出该根"的相对路径就采用
     // （用 generic_string() 统一成正斜杠，跨平台 JSON 才不会变味）

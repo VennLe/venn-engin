@@ -49,6 +49,11 @@ public:
     // 重建**（MeshSource 里 shape = "grass" / "tree"）。
     Mesh* grass(float size = 0.6f, const std::string& name = "grass");
     Mesh* tree(float size = 5.0f, const std::string& name = "tree");
+    // 灌木（4 团位移叶簇 + 8 张叶卡）。旧版借 sphere() 拿压扁球 ——
+    // 远看就是一个绿球，2026-10-28 单独成一份。
+    // ⚠ shape 记的是 "bush"（不是 "sphere"）：FoliageEditor 的统计与
+    //   擦除按 shape 分流，两个都要认（老场景里的灌木还是 sphere）。
+    Mesh* bush(float size = 1.1f, const std::string& name = "bush");
     // 花（细杆 + 花冠）。见 Mesh.h 的说明。
     Mesh* flower(float size = 0.35f, const std::string& name = "flower");
     // 石头（位移 + 平面着色的低面数球）。见 Mesh.h 的说明。
@@ -506,8 +511,12 @@ inline Mesh* AssetManager::grass(float size, const std::string& name) {
     auto it = m_meshes.find(name);
     if (it != m_meshes.end()) return it->second.get();
     auto mesh = std::make_unique<Mesh>();
-    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, makeGrassVertices(size),
-                 makeGrassIndices());
+    // 2026-10-28：几何**顶点和索引一次出**（见 Mesh.h 的说明：旧的两半分法
+    // 一改叶片数就会"顶点够、索引指到别的叶片上"）。
+    std::vector<Vertex> verts;
+    std::vector<uint32_t> idx;
+    buildGrassMesh(size, verts, idx);
+    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, std::move(verts), std::move(idx));
     Mesh* raw = mesh.get();
     tagBuiltinMesh(raw, "grass", size, name);
     m_meshes[name] = std::move(mesh);
@@ -518,8 +527,10 @@ inline Mesh* AssetManager::tree(float size, const std::string& name) {
     auto it = m_meshes.find(name);
     if (it != m_meshes.end()) return it->second.get();
     auto mesh = std::make_unique<Mesh>();
-    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, makeTreeVertices(size),
-                 makeTreeIndices());
+    std::vector<Vertex> verts;
+    std::vector<uint32_t> idx;
+    buildTreeMesh(size, verts, idx);
+    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, std::move(verts), std::move(idx));
     Mesh* raw = mesh.get();
     tagBuiltinMesh(raw, "tree", size, name);
     m_meshes[name] = std::move(mesh);
@@ -530,10 +541,30 @@ inline Mesh* AssetManager::flower(float size, const std::string& name) {
     auto it = m_meshes.find(name);
     if (it != m_meshes.end()) return it->second.get();
     auto mesh = std::make_unique<Mesh>();
-    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, makeFlowerVertices(size),
-                 makeFlowerIndices());
+    std::vector<Vertex> verts;
+    std::vector<uint32_t> idx;
+    buildFlowerMesh(size, verts, idx);
+    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, std::move(verts), std::move(idx));
     Mesh* raw = mesh.get();
     tagBuiltinMesh(raw, "flower", size, name);
+    m_meshes[name] = std::move(mesh);
+    return raw;
+}
+
+// 灌木：4 团位移叶簇 + 8 张叶卡（2026-10-28 从"一颗 8×5 球"升级）。
+// 之前是借 `sphere()` 拿压扁球 —— 远看就是一个绿球，和"灌木"没关系。
+inline Mesh* AssetManager::bush(float size, const std::string& name) {
+    auto it = m_meshes.find(name);
+    if (it != m_meshes.end()) return it->second.get();
+    auto mesh = std::make_unique<Mesh>();
+    std::vector<Vertex> verts;
+    std::vector<uint32_t> idx;
+    buildBushMesh(size, verts, idx);
+    mesh->upload(*m_ctx.device, *m_ctx.cmdPool, std::move(verts), std::move(idx));
+    Mesh* raw = mesh.get();
+    // shape 记 "bush"：FoliageEditor 的统计按 shape 分流，旧的 "sphere"
+    // 分支仍然保留（老场景里的灌木还是 sphere）。
+    tagBuiltinMesh(raw, "bush", size, name);
     m_meshes[name] = std::move(mesh);
     return raw;
 }
@@ -542,13 +573,10 @@ inline Mesh* AssetManager::rock(float size, const std::string& name, int seed) {
     auto it = m_meshes.find(name);
     if (it != m_meshes.end()) return it->second.get();
     auto mesh = std::make_unique<Mesh>();
-    std::vector<Vertex> verts = makeRockVertices(size, seed);
-    // 三角形汤：索引就是 0..n-1。Mesh 的绘制路径是 index buffer，
-    // 走"无索引"要改渲染层，不值得为一份内置网格动。
-    std::vector<uint32_t> idx(verts.size());
-    for (std::size_t i = 0; i < idx.size(); ++i) {
-        idx[i] = static_cast<uint32_t>(i);
-    }
+    std::vector<Vertex> verts;
+    std::vector<uint32_t> idx;
+    // 三角形汤：索引就是 0..n-1（逐面法线要求不共用顶点）。
+    buildRockMesh(size, seed, verts, idx);
     mesh->upload(*m_ctx.device, *m_ctx.cmdPool, std::move(verts), std::move(idx));
     Mesh* raw = mesh.get();
     tagBuiltinMesh(raw, "rock", size, name);

@@ -34,8 +34,8 @@
 > | G24 动态天空与大气 | ❌ 未做（阻塞于 R6-5） | `render_roadmap.md` R6-5 |
 > | G25 光照烘焙的运行时消费端 | ❌ 未做（阻塞于 R5-2） | `render_roadmap.md` R5-2 |
 > | G26~G28 `.vks` 实体/事件/协程 | ✅ 已完成（`script_roadmap.md` S2~S4） | `script_roadmap.md` |
-> | G29 资产打包 `.pak` | ❌ 未做（仓库里没有 pak 相关代码） | 本文 §10 |
-> | G30 Shipping 剔除 | ❌ 未做（`CMakeLists.txt` 里没有 `VENN_SHIPPING`） | 本文 §10 |
+> | G29 资产打包 `.pak` | ✅ 已完成（`--pak` → 一个 `game.pak`，含 shader 直读） | `package_roadmap.md` §7 §8 |
+> | G30 Shipping 剔除 | ✅ 已完成（`make ship` / `VENN_SHIPPING` / `verify_shipping.py`） | 本文 §10 |
 > | G31 崩溃回收（minidump） | ❌ 未做（没有 `MiniDumpWriteDump` 相关代码） | 本文 §10 |
 > | G32 运行时性能 HUD / 控制台 | ❌ 未做 | 本文 §10 |
 >
@@ -959,6 +959,26 @@ Jump 绑到 Space 的那一刻会先把场景跑起来。
 
 ### G29 · 资产打包（`.pak` + 索引 + 压缩）
 
+> 🟡 **2026-10-28 部分交付（E28-1）**：出包的**第一刀**已经能用了 ——
+> `Game.exe --package` / 编辑器 `File ▸ Package project...` → `dist/<Name>/`
+> （exe + shaders + assets + config + build.json，模板工程实测 321 个文件 / 38.6 MB）。
+> 详见 `docs/package_roadmap.md`，判据 `tools/verify_package.py`（39 条）。
+>
+> ⚠ **本节的目标仍未达成**：现在打的是"整棵 assets + 白名单引擎资产"（宁可多带，
+> 保证不漏），**没有引用闭包、没有 .pak、没有压缩**。下一步是 G29-a（先写引用
+> 扫描器 + 未解析即失败），再 G29-b（.pak）。
+>
+> ✅ **2026-10-28 更新：G29-a + G29-b 都已交付。**
+> · G29-a 引用闭包：只打被引用的资产，悬空引用 = 打包失败（`tools/verify_package.py` I 组）。
+> · G29-b 资产包：`--pak` → 单个 `assets.pak`（自带 LZ4 block 编解码，无外部依赖），
+>   运行时按需解包到内容寻址缓存（K/J 组各 27/12 条）。
+> · G29-c shader 进包 + G29-d 直读：`shaders/` 也收进同一个 `game.pak`，
+>   shader 走 `pak:` 虚拟路径**直读包内存**（不落盘）。
+>   实测模板工程分发从 **317 个文件 / 38.8 MB** 变成 **5 个文件 / 32.3 MB**。
+> 仍未做：**资产直读**（贴图/场景还走"按需落缓存"）、**pak 当默认**、
+> Shipping 剔除（G30）。详见 `docs/package_roadmap.md` §7 §8。
+
+
 - **目标**：从"几千个小文件散在磁盘上"变成"一个包"。**这不是可选项**——
   散装文件的加载慢、易被误删、无法校验完整性。
 - **改动点**
@@ -980,21 +1000,64 @@ Jump 绑到 Space 的那一刻会先把场景跑起来。
 
 ### G30 · Shipping 构建剔除（编辑器 / 调试 / 校验层）
 
-- **目标**：出包版本**不能**带编辑器、调试绘制、开发命令。
-- **改动点**
-  1. CMake 加 `VENN_SHIPPING` 宏：
-     - `VennRuntime` **只链引擎**（`VennEditor` 本来就不参与）；
-     - `VK_LAYER_KHRONOS_validation` 不启用；调试绘制（碰撞线框、栅格、gizmo）编译期剔除；
-     - 断言从"崩溃"改为"记日志继续"（玩家不能看到断言框）；
-     - 开发用命令行 / `MYVK_*` 钩子在 shipping 下**不注册**（⚠ 但要留**一个**总开关给 QA 版）；
-  2. 剥离符号（release + PDB 单独存档）；
-  3. 版本号：`git describe` 编进二进制，标题栏/日志可见（**排查现场问题时唯一线索**）。
-- **验收**
-  1. shipping 二进制里**搜不到**编辑器面板的字符串（`strings` 辅助；⚠ 注意 MEMORY 记的
-     "`strings` 抓不到 ASCII 常量"这条坑 → **以行为证据为准**：运行 shipping 版**没有**任何编辑器入口）；
-  2. 崩溃时不弹断言框，而是走 G31 的 dump；
-  3. QA 版（`VENN_SHIPPING` 关）行为与今天一致。
-- **规模**：**M**　**依赖**：`!G29`
+> ✅ **2026-10-28 已交付**。一句话：`make ship` → `build-ship/bin/Game.exe`，
+> 那份 exe **不是**"dev 版加了个宏"，而是**成分不同**的一份二进制。
+> 判据 → `tools/verify_shipping.py`（A~D 共 39 条，`--no-build` 可跳过构建）。
+>
+> 交付了什么（对应原计划的四条）
+>
+> | 计划 | 实际做法 | 判据 |
+> |---|---|---|
+> | CMake 加 `VENN_SHIPPING` | `-DVENN_SHIPPING=ON` + `add_compile_definitions(VENN_SHIPPING=0/1)`；**Editor / Launcher 的 target 根本不声明** | B2~B5（`build-ship/build.ninja` 里搜不到 Editor.exe / Launcher.exe） |
+> | 不启 validation | `rhi::Instance` 在 shipping 下**强制** `requestValidation=false`（env 也不给翻盘口子） | C10（日志 `INSTANCE build=shipping … validation=off`） |
+> | 开发命令不注册 | `--selftest` / `--dump-scene` / `--package` / `MYVK_RUNTIME_SELFTEST` / `MYVK_FIXED_DT` / `MYVK_PHYS_DUMP` 全部 `#if !VENN_SHIPPING`（**编译期**） | C4（四个开发字符串在出货 exe 里各 **0** 次，dev exe 里各 > 0 —— 对照区） |
+> | 剥符号 | MSVC 链接带 `/DEBUG` → 符号在**单独的** `Game.pdb`；出包时归档进 `dist/<Name>/debug/` | B6 / D4 / D5（pdb 在包里、**不在 exe 旁边**） |
+> | 版本号 | `git describe --tags --always --dirty` → `core::kGitDescribe`；`--version` / 日志 `GAME-BUILD` / shipping 标题栏 `[<git>]` | A1~A3 / C1~C3 / D3 |
+>
+> 实测（2026-10-28，本机）：dev `Game.exe` **11.7 MB**（Debug）→ shipping
+> `Game.exe` **4.44 MB**（RelWithDebInfo）。四个开发字符串在出货 exe 里各 0 次。
+> 打包体积不变（多一个 `debug/Game.pdb`，**发版时可以把它单独留档再删掉**）。
+>
+> 三条设计决定（都有理由，别随手改）
+>
+> 1. **风味只有一个事实源**：`engine/core/Build.h` 的 `core::kShipping`。
+>    任何地方都不许自己写 `#ifdef NDEBUG` / `#ifdef _DEBUG` 去猜 —— 猜错的
+>    方向恒是"以为关掉了，其实还开着"。
+> 2. **判据必须是数字**：这一整套改动最大的风险是**假绿**（宏写了、`#if`
+>    漏了，症状是"游戏照常跑"）。所以判据不是"能起来"，而是"这四个字符串
+>    在出货 exe 里出现 0 次"，并配 dev exe 的**对照区**（否则"扫到 0 次"
+>    也可能只是扫描方法失效）。
+> 3. **出包工具 = dev 版，打进去的 exe = 出货版**：`Game.exe --package X
+>    --engine build-ship/bin/Game.exe`。shipping 版**没有** `--package`
+>    （玩家手上的 exe 不该带着一个能把自己的资产吐出来的工具）；包里的
+>    `build.json` 记 `flavor` / `git`，pdb 归档默认**跟着风味走**
+>    （shipping 归档、dev 不归档 —— Debug 的 pdb 上百 MB）。
+>
+> ⚠ 三个踩过的坑
+>
+> - `add_dependencies(VennEditor Shaders)` 在 shipping 下 **configure 直接失败**
+>   （"non-existent target"）。凡是按名字点 target 的地方都要跟着 `if(NOT
+>   VENN_SHIPPING)`。同族：`myvk_copy_runtime_assets(VennEditor)`。
+> - `make ship` 第一版写成 `cmake -E env … cmd /c msvc-build.cmd`：Git Bash 会把
+>   `/c` 当路径改写成 `C:/`，cmd 进**交互式**模式等 stdin —— 现象是"挂着十分钟
+>   一声不响、连 build-ship/ 都没建出来"。改成 **target-specific `export`** 变量
+>   （与一直好用的 `make build` 同一条路径）。
+> - `--version` 是**出货版保留**的唯一开发味参数：玩家报问题时第一句话是
+>   "哪个版本"，而他们没有别的办法告诉你。它必须在开日志 / 建窗口之前返回
+>   （也不能顺手写日志 —— 出包时的风味探测就靠它，探测不该有副作用）。
+>
+> 还没做：**崩溃转储**（G31，`VENN_SHIPPING` 只是"不弹断言框"，真正的
+> `MiniDumpWriteDump` 在 G31）；**调试绘制**本来就不在 runtime（编辑器专属），
+> 所以"编译期剔除 gizmo"这一条在 runtime 上是空集。
+>
+> 原计划的验收 1 提到"用 `strings` 搜编辑器面板字符串" —— 实测这条**没有
+> 意义**：Editor.exe 是另一个 target，runtime 从来没有链过它。真正会漏的
+> 是"开发命令字符串"，所以判据换成了那四个（更小、更准、可对照）。
+>
+> 原计划保留（对照）
+>
+> - **目标**：出包版本**不能**带编辑器、调试绘制、开发命令。
+> - **规模**：**M**　**依赖**：`!G29`
 
 ### G31 · 崩溃回收与日志（minidump + 栈 + 回传）
 

@@ -12,7 +12,10 @@
 
 #include <imgui.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 namespace editor {
 
@@ -33,6 +36,234 @@ void PhysicsPanel::labelValue(const char* label, const char* tooltip) {
     if (tooltip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", TR(tooltip));
     ImGui::SameLine(kLabelW);
     ImGui::SetNextItemWidth(-1.0f);
+}
+
+// ============================================================
+// 关节总览
+//
+// 为什么要单独一块：`JointComponent` 的 `target` 是一个 guid，指向"另一端"。
+// 从任何**单端**视角（Inspector）都看不出下面这三种坏法：
+//   · 另一端被删了        → guid 悬空，Play 时 WARN 跳过，屏幕上看不出原因
+//   · 另一端没有刚体      → 同样建不出来
+//   · 另一端悄悄改了名    → 你以为连着的是 A，其实早换成 B 了
+// 而这三类恰恰是搭链条时最常见的。所以这里按场景全局列一遍，坏的标红，
+// 点一行就选中 —— 选不中/选错了才能立刻发现。
+//
+// 判定顺序是有讲究的：先判**自己**再判对面。自己没刚体时，无论对面是什么
+// 都建不成，此时报"对面缺刚体"是误导（用户会去对面乱加东西）。
+// ============================================================
+void PhysicsPanel::drawJointList() {
+    ecs::World& w = m_ctx.editorScene().world();
+    const PhysicsRuntimeInfo& rt = m_ctx.physicsRuntime();
+
+    struct Row {
+        ecs::Entity self{};
+        const ecs::JointComponent* jc = nullptr;
+        ecs::Entity other{};
+        const char* state = "ok";   // ok / no-self-body / no-target / missing /
+                                    // no-other-body
+    };
+    std::vector<Row> rows;
+    w.each<ecs::JointComponent>([&](ecs::Entity e, ecs::JointComponent& jc) {
+        Row r;
+        r.self = e;
+        r.jc = &jc;
+        if (!w.has<ecs::RigidBodyComponent>(e)) {
+            r.state = "no-self-body";
+        } else if (jc.target == ecs::kInvalidGuid) {
+            r.state = "no-target";
+        } else {
+            const ecs::Entity o = w.find(jc.target);
+            if (!o.valid()) {
+                r.state = "missing";
+            } else if (!w.has<ecs::RigidBodyComponent>(o)) {
+                r.state = "no-other-body";
+            } else {
+                r.other = o;
+            }
+        }
+        rows.push_back(r);
+    });
+
+    // 按名字排（同名的用 guid 定序）—— 和 Inspector 里那个下拉用同一条规则，
+    // 免得两边顺序不一致让人以为选错了。
+    auto nameOf = [&](ecs::Entity e) -> std::string {
+        const std::string* n = w.name(e);
+        return n ? *n : std::string();
+    };
+    std::sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) {
+        const std::string sa = nameOf(a.self), sb = nameOf(b.self);
+        if (sa != sb) return sa < sb;
+        return w.guid(a.self) < w.guid(b.self);
+    });
+
+    const bool open = ImGui::CollapsingHeader(TR("Joints"),
+                                              ImGuiTreeNodeFlags_DefaultOpen);
+    logRect("PHYS-JOINTS-HEADER", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (!open) return;
+
+    int bad = 0, off = 0;
+    for (const Row& r : rows) {
+        const bool broken = std::strcmp(r.state, "ok") != 0;
+        if (broken) ++bad;
+        if (!r.jc->enabled) ++off;
+    }
+
+    // 建成的条数只有在跑起来之后才有意义 —— 编辑态显示 authored 数会被
+    // 误读成"已经建好了"。
+    if (rt.active) {
+        ImGui::Text(TR("%d joint(s), %d built"), static_cast<int>(rows.size()),
+                    rt.joints);
+    } else {
+        ImGui::Text(TR("%d joint(s)"), static_cast<int>(rows.size()));
+    }
+    logRect("PHYS-JOINTS-COUNT", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    if (bad > 0) {
+        ImGui::TextColored(ImVec4(0.93f, 0.55f, 0.42f, 1.0f), "%s",
+                           TR("some joints cannot be built - see the red rows"));
+    }
+    if (rt.active && bad == 0 && rt.joints < static_cast<int>(rows.size()) - off) {
+        // authored 的都能建，但实际建成的比"启用且有效"的少：说明有别的原因
+        // （世界没建起来 / 目标在另一个场景……）。不猜，直接指日志。
+        ImGui::TextColored(ImVec4(0.92f, 0.72f, 0.35f, 1.0f), "%s",
+                           TR("fewer joints were built than authored - check "
+                              "the PHYS-JOINT lines in the log"));
+    }
+
+    if (rows.empty()) {
+        ImGui::TextDisabled(TR("No joints in this scene."));
+    }
+
+    if (ImGui::BeginTable("##phys_joints", 2,
+                          ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_BordersInnerV)) {
+        const ecs::Entity sel = m_ctx.selection();
+        int i = 0;
+        for (const Row& r : rows) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID(i);
+
+            const bool broken = std::strcmp(r.state, "ok") != 0;
+            if (broken) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      ImVec4(0.95f, 0.48f, 0.38f, 1.0f));
+            } else if (!r.jc->enabled) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      ImVec4(0.55f, 0.55f, 0.58f, 1.0f));
+            }
+
+            // 行标签 = 名字 → 另一端名字。名字为空时给个稳定占位，否则
+            // 整行只剩箭头（ImGui 也会因为没有唯一 label 而抢 ID）。
+            std::string label = nameOf(r.self);
+            if (label.empty()) label = "(unnamed)";
+            label += "  ->  ";
+            if (r.other.valid()) {
+                const std::string on = nameOf(r.other);
+                label += on.empty() ? "(unnamed)" : on;
+            } else if (std::strcmp(r.state, "no-target") == 0) {
+                label += TR("(no target)");
+            } else if (std::strcmp(r.state, "missing") == 0) {
+                label += TR("(deleted)");
+            } else {
+                label += TR("(no rigid body)");
+            }
+
+            if (ImGui::Selectable(label.c_str(), sel.valid() &&
+                                                       sel.id == r.self.id)) {
+                m_ctx.select(r.self);
+                VK_LOG_INFO("PHYS-JOINTS pick entity=%u state=%s", r.self.id,
+                            r.state);
+            }
+            if (broken || !r.jc->enabled) ImGui::PopStyleColor();
+
+            char tag[48];
+            std::snprintf(tag, sizeof(tag), "PHYS-JOINT-ROW-%d", i);
+            logRect(tag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+            // 右键：跳到这一端 / 跳到另一端 / 删掉。
+            // "Select other end" 是这块面板最实用的一条 —— 顺着链条往下走，
+            // 不用在 Hierarchy 里翻。
+            if (ImGui::BeginPopupContextItem("##joint_ctx")) {
+                if (ImGui::MenuItem(TR("Select this object"))) {
+                    m_ctx.select(r.self);
+                }
+                if (ImGui::MenuItem(TR("Select the other end"),
+                                    nullptr, false, r.other.valid())) {
+                    m_ctx.select(r.other);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem(TR("Remove joint"))) {
+                    const ecs::Entity self = r.self;
+                    m_ctx.structuralEdit("Remove Joint", [&] {
+                        w.remove<ecs::JointComponent>(self);
+                    });
+                    m_ctx.dirty() = true;
+                    VK_LOG_INFO("PHYS-JOINTS remove entity=%u", self.id);
+                    ImGui::EndPopup();
+                    ImGui::PopID();
+                    break;   // w 改过了，rows 里的指针立刻失效
+                }
+                ImGui::EndPopup();
+            }
+
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", TR(ecs::jointKindName(r.jc->kind)));
+            ImGui::PopID();
+            ++i;
+        }
+        ImGui::EndTable();
+    }
+
+    // ---- 新加一条：省得为了"加关节"跑一趟 Inspector ----
+    // 只在**恰好选中一个、带刚体、还没有关节**的实体上可用。三个条件缺一个
+    // 都说明用户还没准备好，给灰按钮比给一个点了没反应的按钮好。
+    const ecs::Entity one = m_ctx.selection();
+    const bool canAdd = one.valid() && w.has<ecs::RigidBodyComponent>(one) &&
+                        !w.has<ecs::JointComponent>(one) && m_ctx.isEditing();
+    ImGui::BeginDisabled(!canAdd);
+    if (ImGui::Button(TR("Add joint to selection"))) {
+        m_ctx.structuralEdit("Add Joint", [&] {
+            w.add<ecs::JointComponent>(one, ecs::JointComponent{});
+        });
+        m_ctx.dirty() = true;
+        VK_LOG_INFO("PHYS-JOINTS add entity=%u", one.id);
+    }
+    ImGui::EndDisabled();
+    logRect("PHYS-JOINTS-ADD", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip(
+            TR("Select one object that has a rigid body (and no joint yet).\n"
+               "The other end is picked inside the Inspector."));
+    }
+
+    // ---- 状态日志（签名变了才打）----
+    std::string sig;
+    for (const Row& r : rows) {
+        char buf[192];
+        std::snprintf(buf, sizeof(buf), "%u:%d:%d:%llx:%s|", r.self.id,
+                      static_cast<int>(r.jc->kind), r.jc->enabled ? 1 : 0,
+                      static_cast<unsigned long long>(r.jc->target), r.state);
+        sig += buf;
+    }
+    if (sig != m_jointSig) {
+        m_jointSig = sig;
+        VK_LOG_INFO("PHYS-JOINTS authored=%d bad=%d off=%d built=%d",
+                    static_cast<int>(rows.size()), bad, off,
+                    rt.active ? rt.joints : -1);
+        for (std::size_t k = 0; k < rows.size(); ++k) {
+            const Row& r = rows[k];
+            VK_LOG_INFO("PHYS-JOINT-LIST i=%d entity=%u kind=%d en=%d state=%s",
+                        static_cast<int>(k), r.self.id,
+                        static_cast<int>(r.jc->kind), r.jc->enabled ? 1 : 0,
+                        r.state);
+        }
+    }
 }
 
 void PhysicsPanel::draw() {
@@ -105,6 +336,11 @@ void PhysicsPanel::draw() {
     } else {
         ImGui::TextDisabled(TR("Run the scene (green Play) to see live numbers."));
     }
+
+    ImGui::Separator();
+
+    // ---------------------------------------------------------- 关节总览
+    drawJointList();
 
     ImGui::Separator();
 

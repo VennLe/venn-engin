@@ -4,6 +4,7 @@
 #include "assets/ModelOrientation.h"
 #include "assets/AssetPath.h"
 #include "assets/Model.h"
+#include "core/Build.h"
 #include "core/Input.h"
 #include "core/Logger.h"
 #include "dialogue/DialogueSystem.h"
@@ -511,17 +512,29 @@ ecs::Entity spawnPlayerFromGameStart(scene::Scene& scene,
 } // namespace
 
 RuntimeApp::RuntimeApp(const RuntimeConfig& cfg)
-    : core::Application(cfg.title, cfg.width, cfg.height), m_cfg(cfg) {
+    // G30：出货版在标题栏挂 git 号 —— 玩家截图/录屏发过来时，那是判断
+    // "他跑的是哪一版"的唯一线索（也是我们要求他们附带的最小信息）。
+    // ⚠ dev 版**不加**：现有几十条 GUI 用例按窗口标题精确匹配找窗口。
+    : core::Application(
+          core::kShipping
+              ? (cfg.title + " [" + core::kGitDescribe + "]")
+              : cfg.title,
+          cfg.width, cfg.height),
+      m_cfg(cfg) {
     m_loop.config().maxFps = cfg.maxFps;
     m_loop.config().unfocusedFps = cfg.unfocusedFps;
     m_loop.config().timeScale = cfg.timeScale;
     // GAME-LOOP 每 60 帧一行：只在 verbose 下打（正常玩不需要刷屏）。
     m_loop.setLogInterval(cfg.verbose ? 60 : 0);
 
+    // G30：物理逐体转储是**开发钩子** —— shipping 版里这段不存在
+    // （`MYVK_PHYS_DUMP` 这个字符串也不在二进制里）。
+#if !VENN_SHIPPING
     if (const char* dump = std::getenv("MYVK_PHYS_DUMP")) {
         const int n = std::atoi(dump);
         if (n > 0) m_physicsDumpEvery = n;
     }
+#endif
     // M2 的两个调试口子。刻意都用 `MYVK_RUNTIME_` 前缀：它与其他运行时
     // 开关同一条规矩（前缀放行），不需要再往白名单里加裸名字。
     if (const char* d = std::getenv("MYVK_RUNTIME_PLAYER_DUMP")) {
@@ -1764,6 +1777,196 @@ void RuntimeApp::installScriptServices() {
     };
     svc.act.loadScene = [this](const std::string& path) {
         return requestSceneSwitch(path);
+    };
+
+    // ---- 关节（J5-4）----
+    //
+    // 每一条动作都要**同时**改两处，缺一处就是"脚本改了、画面没动"：
+    //   ① `JointComponent`  —— 作者侧数据（Inspector / 存档看到的这份）
+    //   ② `physics::rebuildJoints` —— 求解器侧（真正约束物体运动的那份）
+    //
+    // ⚠ 绝不用 `buildSceneWorld` 重建：它连刚体一起重来，场景里每个物体
+    //   的位置与速度都回到初始值。改一个关节把整局撞回原点，没人能接受。
+    //
+    // ⚠ 每条失败路径都有 `GAME-JOINT` WARN：脚本侧只拿到 false，看不到
+    //   原因（"没有组件"和"类型名拼错"要做的下一步完全不同）。
+    const auto jointName = [this](ecs::Entity e) -> std::string {
+        if (!e.valid()) return std::string("<none>");
+        const std::string* n = activeScene().world().name(e);
+        return n ? *n : std::string("<unnamed>");
+    };
+    const auto jointOf = [this](ecs::Entity e) -> ecs::JointComponent* {
+        if (!e.valid()) return nullptr;
+        ecs::World& w = activeScene().world();
+        if (!w.alive(e)) return nullptr;
+        return w.get<ecs::JointComponent>(e);
+    };
+    const auto refreshJoints = [this]() {
+        return physics::rebuildJoints(activeScene(), m_binding);
+    };
+
+    svc.act.joints.set = [this, jointOf, refreshJoints, jointName](
+                             ecs::Entity self, ecs::Entity other,
+                             const std::string& kind) -> bool {
+        ecs::JointComponent* jc = jointOf(self);
+        if (!jc) {
+            VK_LOG_WARN("GAME-JOINT set: '%s' has no Joint component "
+                        "(add it in the Inspector, Physics tab)",
+                        jointName(self).c_str());
+            return false;
+        }
+        ecs::JointKind k;
+        if (!ecs::parseJointKind(kind.c_str(), k)) {
+            VK_LOG_WARN("GAME-JOINT set: unknown kind '%s' for '%s' "
+                        "(expect fixed / ball / hinge / slider / distance)",
+                        kind.c_str(), jointName(self).c_str());
+            return false;
+        }
+        ecs::World& w = activeScene().world();
+        if (!w.alive(other)) {
+            VK_LOG_WARN("GAME-JOINT set: '%s' targets a dead/invalid entity",
+                        jointName(self).c_str());
+            return false;
+        }
+        if (!w.has<ecs::RigidBodyComponent>(self) ||
+            !w.has<ecs::RigidBodyComponent>(other)) {
+            VK_LOG_WARN("GAME-JOINT set: both ends need a RigidBody "
+                        "('%s' has=%d, '%s' has=%d)",
+                        jointName(self).c_str(),
+                        w.has<ecs::RigidBodyComponent>(self) ? 1 : 0,
+                        jointName(other).c_str(),
+                        w.has<ecs::RigidBodyComponent>(other) ? 1 : 0);
+            return false;
+        }
+        jc->kind = k;
+        jc->target = w.guid(other);
+        // 上一次可能被 `jointOn(e,false)` 关过 —— 重新配一次就该生效，
+        // 不然脚本会陷入"我明明 joint() 了还是不动"。
+        jc->enabled = true;
+        const std::size_t built = refreshJoints();
+        VK_LOG_INFO("GAME-JOINT set self=%u other=%u kind=%s built=%zu",
+                    self.id, other.id, ecs::jointKindName(k), built);
+        return true;
+    };
+    svc.act.joints.anchors = [this, jointOf, refreshJoints, jointName](
+                                 ecs::Entity self, glm::vec3 a,
+                                 glm::vec3 b) -> bool {
+        ecs::JointComponent* jc = jointOf(self);
+        if (!jc) {
+            VK_LOG_WARN("GAME-JOINT anchors: '%s' has no Joint component",
+                        jointName(self).c_str());
+            return false;
+        }
+        jc->anchorSelf = a;
+        jc->anchorTarget = b;
+        refreshJoints();
+        VK_LOG_INFO("GAME-JOINT anchors self=%u a=(%.3f,%.3f,%.3f) "
+                    "b=(%.3f,%.3f,%.3f)",
+                    self.id, a.x, a.y, a.z, b.x, b.y, b.z);
+        return true;
+    };
+    svc.act.joints.axis = [this, jointOf, refreshJoints, jointName](
+                              ecs::Entity self, glm::vec3 ax) -> bool {
+        ecs::JointComponent* jc = jointOf(self);
+        if (!jc) {
+            VK_LOG_WARN("GAME-JOINT axis: '%s' has no Joint component",
+                        jointName(self).c_str());
+            return false;
+        }
+        jc->axis = ax;
+        refreshJoints();
+        VK_LOG_INFO("GAME-JOINT axis self=%u axis=(%.3f,%.3f,%.3f)", self.id,
+                    ax.x, ax.y, ax.z);
+        return true;
+    };
+    svc.act.joints.limit = [this, jointOf, refreshJoints, jointName](
+                               ecs::Entity self, bool on, float lo,
+                               float hi) -> bool {
+        ecs::JointComponent* jc = jointOf(self);
+        if (!jc) {
+            VK_LOG_WARN("GAME-JOINT limit: '%s' has no Joint component",
+                        jointName(self).c_str());
+            return false;
+        }
+        if (jc->kind != ecs::JointKind::Hinge &&
+            jc->kind != ecs::JointKind::Slider) {
+            VK_LOG_WARN("GAME-JOINT limit: '%s' is a %s joint - only hinge / "
+                        "slider support a limit",
+                        jointName(self).c_str(),
+                        ecs::jointKindName(jc->kind));
+            return false;
+        }
+        jc->useLimit = on;
+        jc->lowerLimit = lo;
+        jc->upperLimit = hi;
+        refreshJoints();
+        VK_LOG_INFO("GAME-JOINT limit self=%u on=%d range=[%.3f,%.3f]",
+                    self.id, on ? 1 : 0, lo, hi);
+        return true;
+    };
+    svc.act.joints.motor = [this, jointOf, refreshJoints, jointName](
+                               ecs::Entity self, float speed,
+                               float force) -> bool {
+        ecs::JointComponent* jc = jointOf(self);
+        if (!jc) {
+            VK_LOG_WARN("GAME-JOINT motor: '%s' has no Joint component",
+                        jointName(self).c_str());
+            return false;
+        }
+        if (jc->kind != ecs::JointKind::Hinge &&
+            jc->kind != ecs::JointKind::Slider) {
+            VK_LOG_WARN("GAME-JOINT motor: '%s' is a %s joint - only hinge / "
+                        "slider support a motor",
+                        jointName(self).c_str(),
+                        ecs::jointKindName(jc->kind));
+            return false;
+        }
+        // force <= 0 = 关掉。这个约定与 Inspector 里的提示一致
+        // （"max force 0 = the motor cannot push at all"）—— 留一个
+        // 推不动的马达开着，等于让用户以为"速度设了却没反应"。
+        jc->useMotor = force > 0.0f;
+        jc->motorSpeed = speed;
+        jc->maxMotorForce = force;
+        refreshJoints();
+        VK_LOG_INFO("GAME-JOINT motor self=%u speed=%.3f force=%.3f on=%d",
+                    self.id, speed, force, jc->useMotor ? 1 : 0);
+        return true;
+    };
+    svc.act.joints.enable = [this, jointOf, refreshJoints, jointName](
+                                ecs::Entity self, bool on) -> bool {
+        ecs::JointComponent* jc = jointOf(self);
+        if (!jc) {
+            VK_LOG_WARN("GAME-JOINT enable: '%s' has no Joint component",
+                        jointName(self).c_str());
+            return false;
+        }
+        jc->enabled = on;
+        const std::size_t built = refreshJoints();
+        VK_LOG_INFO("GAME-JOINT enable self=%u on=%d built=%zu", self.id,
+                    on ? 1 : 0, built);
+        return true;
+    };
+    svc.act.joints.remove = [this, jointOf, refreshJoints, jointName](
+                                ecs::Entity self) -> bool {
+        ecs::JointComponent* jc = jointOf(self);
+        if (!jc) {
+            VK_LOG_WARN("GAME-JOINT remove: '%s' has no Joint component",
+                        jointName(self).c_str());
+            return false;
+        }
+        activeScene().world().remove<ecs::JointComponent>(self);
+        const std::size_t built = refreshJoints();
+        VK_LOG_INFO("GAME-JOINT remove self=%u built=%zu", self.id, built);
+        return true;
+    };
+    svc.act.joints.kindOf = [jointOf](ecs::Entity self) -> const char* {
+        const ecs::JointComponent* jc = jointOf(self);
+        return jc ? ecs::jointKindName(jc->kind) : nullptr;
+    };
+    svc.act.joints.target = [this, jointOf](ecs::Entity self) -> ecs::Entity {
+        const ecs::JointComponent* jc = jointOf(self);
+        if (!jc || jc->target == ecs::kInvalidGuid) return ecs::Entity{};
+        return activeScene().world().find(jc->target);
     };
 
     m_scriptRuntime->setServices(std::move(svc));

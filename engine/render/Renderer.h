@@ -653,6 +653,22 @@ public:
     bool& lightGizmosEnabled() { return m_showLightGizmos; }
     float& lightGizmoScale() { return m_lightGizmoScale; }
 
+    // ---- 关节可视化（J5-3）----
+    //
+    // 每一条 `JointComponent` 画成：两端锚点各一颗小球 + 一条连杆 +
+    // （铰链/滑动）一根轴。**默认关** —— 它比灯球吵得多（一个场景里
+    // 十条关节就是三十个几何体），而且只有配关节的时候才想看。
+    //
+    // ⚠ 为什么走普通 mesh 绘制（跟灯球同一条路）而不是新开一条线管线：
+    //   灯球那条路**吃深度测试**、并且夹在"不透明之后、透明之前" ——
+    //   正好是调试几何该待的位置（被墙挡住、能叠在玻璃下面）。
+    //   ImGui 叠加层做不到深度，穿墙可见会让用户误判"这个锚点在墙外"。
+    //   `RP-DRAW` 用的细长立方体在视觉上与线等价，成本却只有一次 draw。
+    bool& jointGizmosEnabled() { return m_showJointGizmos; }
+    // 锚点小球的半径（米）。关节的尺度差别很大（门铰链 2 cm / 起重机 2 m），
+    // 固定值总有一半场景看不清，所以留一个可调的。
+    float& jointGizmoScale() { return m_jointGizmoScale; }
+
     // ============================================================
     // 地平面参考栅格（编辑器视口用）
     //
@@ -825,6 +841,12 @@ private:
     void createDescriptorLayouts();
     void createDefaultTextures();
     void createLightGizmoMesh();
+    // 关节可视化用到的单位立方体（球复用灯球的网格）
+    void createJointGizmoMesh();
+    // 把本帧要画的关节几何算出来（**纯 CPU**，不进 GPU）。抽出来是为了让
+    // "算了几条 / 跳过几条"能打一行日志 —— 可视化的失败形态是"什么都没
+    // 画"，光看画面分不清是没数据还是没提交。
+    void collectJointGizmos(scene::Scene& scene, bool isPreview);
     void createShadowPass();
     void createEnvironment();
 
@@ -1553,6 +1575,21 @@ private:
     // 不经过 AssetManager —— 它是渲染器的调试设施，不是场景资产）
     std::unique_ptr<assets::Mesh> m_lightGizmoMesh;
 
+    // 关节可视化（J5-3）：球画锚点、单位立方体拉伸成连杆与轴。
+    // 球直接复用 `m_lightGizmoMesh`（半径 1 的球，按不变量缩放即可），
+    // 只额外建一个立方体 —— 两个都从 makeXxx 现生，没有磁盘资产。
+    std::unique_ptr<assets::Mesh> m_gizmoCubeMesh;
+    // 逐帧复用的关节绘制记录（避免每条关节都构造一次 Material）
+    struct JointGizmoDraw {
+        glm::mat4 model{1.0f};
+        glm::vec4 color{1.0f};
+        bool sphere = false;
+    };
+    std::vector<JointGizmoDraw> m_jointGizmoScratch;
+    // 上一次打的"画了几条"（-1 = 还没打过）。只在数量变化时打日志 ——
+    // 每帧一条会把 Console 淹掉。
+    int m_jointGizmoLogged = -1;
+
     // 每帧复用的灯列表（避免每帧分配）
     std::vector<scene::LightInstance> m_lightScratch;
     // R3-3：逐灯修饰（CPU 名字描述 → 解析成 GPU LightExtInstance）
@@ -1677,6 +1714,9 @@ private:
     bool m_skyEnabled = true;
     bool m_showLightGizmos = true;
     float m_lightGizmoScale = 0.05f;
+    // 关节可视化（J5-3）：默认关（见 jointGizmosEnabled 的说明）
+    bool m_showJointGizmos = false;
+    float m_jointGizmoScale = 0.12f;
 
     // ---- 级联阴影（CSM）----
     bool m_shadowsEnabled = true;

@@ -380,6 +380,10 @@ public:
     // 否则取第一个 —— 保证"拖了一次框，手柄不会莫名换坐标系"。
     void selectMany(const std::vector<ecs::Entity>& list);
     void selectAll();
+    // 反选：集合 = 全部（同样跳过上锁的）\ 当前集合。
+    // 与 selectAll 共用"什么算可选"这一条判据 —— 两处各写一份的话，
+    // 迟早出现"全选含 A、反选不含 A"这种自相矛盾。
+    void invertSelection();
 
     // 多选时手柄的支点（世界坐标）= 各成员**世界位置**的 AABB 中心。
     // 单选时就是那个实体的世界位置。
@@ -399,6 +403,44 @@ public:
     // 永远只对当前选中项有效"。
     bool colliderEdit() const { return m_colliderEdit; }
     void setColliderEdit(bool on) { m_colliderEdit = on; }
+
+    // ---------------------------------------------------------- 关节锚点视口拾取（J5-2）
+    //
+    // 关节的锚点是**刚体局部坐标**，在 Inspector 里手填数字基本等于盲填：
+    // 用户看得见盒子的一个角，但那个角在局部坐标里是 (0.5,0.5,-0.5) 还是
+    // (0.5,0.5,0.5) 得靠心算。所以给一条"在视口里点一下"的路。
+    //
+    // 状态为什么放 EditorContext 而不是 InspectorPanel：**发起者在 Inspector
+    // （按钮），消费者在 Viewport**。两个面板之间只准通过 EditorContext 说话
+    // （见 MEMORY 的"面板间只准依赖 EditorContext"）。放在 Inspector 里就得
+    // 让 Viewport 反向去够它 —— 依赖方向反了。
+    //
+    // ⚠ 它**不是**组件、不进序列化：这是"我现在正在点哪个锚点"的瞬时交互
+    //   状态，跟 colliderEdit 同类（那条注释说的理由这里同样成立）。
+    enum class AnchorPick : int {
+        None = 0,
+        Self = 1,    // 正在点 A 端（挂关节的那个实体自己的局部坐标）
+        Target = 2,  // 正在点 B 端（target 实体的局部坐标）
+    };
+
+    AnchorPick anchorPick() const { return m_anchorPick; }
+    ecs::Entity anchorPickEntity() const { return m_anchorPickEntity; }
+
+    // 进入拾取模式。`e` 必须是挂 JointComponent 的那个实体 —— 记下来是为了
+    // 在视口里能确认"用户中途换了选中项"（那时拾取应当作废，而不是把锚点
+    // 写到另一个实体身上）。
+    void beginAnchorPick(AnchorPick which, ecs::Entity e) {
+        m_anchorPick = which;
+        m_anchorPickEntity = e;
+    }
+    // 实现放在 .cpp —— 它要打一行日志。**静默取消是最难查的一类**：
+    // 拾取状态被"换选中项"顺手清掉时，用户看到的是"点了按钮、点了视口、
+    // 什么都没发生"，而日志里一个字都没有。
+    void cancelAnchorPick();
+    // 拾取完一端后自动接着点另一端（"点两下"）。返回是否还有下一段。
+    // 只有 Self 后面跟着 Target；Target 之后结束。**故意不循环回 Self**：
+    // 三个来回之后用户就不知道自己在改哪一端了。
+    bool advanceAnchorPick();
 
     // ---- 视口矩形（ViewportPanel 每帧写）----
     //
@@ -582,6 +624,12 @@ public:
     // 想彻底禁掉（比如做像素回归对比）可以设 MYVK_GRID=0 再启动。
     bool showGrid() const { return m_showGrid; }
     bool& showGridRef() { return m_showGrid; }
+
+    // 左栏模式列表折叠开关（见 m_modeRailCollapsed 的说明）。默认展开。
+    // ModeRail 画表头上的箭头，modeRailListHeight() 按它算高度 ——
+    // 高度一变，参数面板的矩形**自动**跟着变（同一个函数算出来的）。
+    bool modeRailCollapsed() const { return m_modeRailCollapsed; }
+    bool& modeRailCollapsedRef() { return m_modeRailCollapsed; }
 
     // ---------------------------------------------------------- 视口浮层（E14）
     // 视口里两块浮层，**各自独立显隐**（右键视口空白处的 "Viewport
@@ -910,10 +958,17 @@ private:
 
     ecs::Entity m_selection{};
     std::string m_selectionName;
+    // 主选中项的**稳定身份**（G16-4）。与 `m_selectionName` 同时抓、同时刷新。
+    // 为什么还要 guid：名字在"两个同名实体"时指不准 —— 撤销一次就跳到另一个，
+    // 而 `m_selectionName` 只在实体**活着**时才能刷新，句柄一失效就只剩名字可用。
+    ecs::EntityGuid m_selectionGuid = ecs::kInvalidGuid;
     // 当前选中项是不是"在 3D 视口里用左键点中的"（见 selectionFromViewport）
     bool m_selectionFromViewport = false;
     // W/E/R 手柄作用在碰撞体上？（见 colliderEdit()）
     bool m_colliderEdit = false;
+    // 正在视口里点哪个关节锚点（见 anchorPick()）
+    AnchorPick m_anchorPick = AnchorPick::None;
+    ecs::Entity m_anchorPickEntity{};
 
     // ---- 选择集（见上面的 public 说明）----
     // 与集合**同下标**的名字数组：句柄失效（撤销删除 / Play / Stop）之后
@@ -985,6 +1040,11 @@ private:
 
     // 地平面栅格（编辑态视口）
     bool m_showGrid = true;
+
+    // 左栏模式列表是否折叠（2026-10-28）。
+    // 折叠后只留表头那一行，把 ~310px 让给"当前模式的参数面板" ——
+    // Landscape 的 8 个工具 + 4 条滑条一屏放不下，用户报的就是"太挤"。
+    bool m_modeRailCollapsed = false;
 
     // 视口浮层 / 统计 HUD 逐项 / 相机书签（E14）
     ViewportOverlay m_vpOverlay;

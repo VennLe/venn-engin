@@ -193,8 +193,28 @@ def main():
             check(abs(drawer[3] - bar[1]) <= 2.0,
                   "B2c 抽屉底边贴着底栏上沿 (%.0f vs %.0f)"
                   % (drawer[3], bar[1]))
-            check(drawer[0] <= 2.0 and abs(drawer[2] - W) <= 3.0,
-                  "B2d 抽屉横跨整窗 (x∈[%.0f,%.0f])" % (drawer[0], drawer[2]))
+            # ⚠ 2026-10-27 改：浮层抽屉**不再横跨整窗**，右缘止于右栏左缘。
+            #   原来断言 `drawer[2] ≈ W`，理由是"底栏是通栏"。这个理由在
+            #   视觉上成立，但它让抽屉盖住了 Inspector 下半部的七个材质纹理槽
+            #   —— 而那七个槽正是拖放接收端。结果"从 Content 拖图到材质槽"
+            #   在默认（浮层）形态下压根不可能：鼠标落在抽屉上，接收端收不到
+            #   hover。详情见 EditorApp.cpp 的 computeLayout / L.content。
+            #   停靠形态仍然横跨整窗（它是布局的一部分，不会遮任何东西），
+            #   由下面 D2b 守着 —— 两个形态各断言各的，别只守一个。
+            vp_now = tap.last_rect("VP-RECT")
+            if vp_now:
+                # 抽屉右缘 == 右栏左缘，视口右缘在它左边隔一条 12px 分隔条
+                # （kSplitterHit=7 + 两侧边框）。所以断言写成"紧贴视口右侧
+                # 那一小段"，而不是严格相等 —— 严格相等会在分隔条宽度一改
+                # 就红，而它守的其实是"右栏有没有让出来"这件事（差值一旦
+                # 变成 300+ 就是又横跨整窗了）。
+                gap = drawer[2] - vp_now[2]
+                check(0.0 <= gap <= 20.0,
+                      "B2d 浮层抽屉右缘止于右栏左缘（右栏留出来）"
+                      " (差 %.0fpx，视口右缘 %.0f / 抽屉右缘 %.0f)"
+                      % (gap, vp_now[2], drawer[2]))
+            else:
+                check(False, "B2d 浮层抽屉右缘止于右栏左缘", "缺 VP-RECT")
 
         n_close = count(tap, "CONTENT-DRAWER open=0")
         ok_close = click_until(hwnd, tap, *center(btns[0][1]),
@@ -220,16 +240,31 @@ def main():
                     "CONTENT-DRAWER open=1", count(tap, "CONTENT-DRAWER open=1"))
         time.sleep(0.4)
         dock = wait_rect(tap, "CONTENT-DRAWER-DOCK", 5.0)
+        drawer_d = tap.last_rect("CONTENT-DRAWER")
+        # 复选框贴着**抽屉**的右上角。2026-10-27 起浮层抽屉不再横跨整窗，
+        # 所以基准是抽屉右缘而不是窗口右缘（原来是 W - 220，会让这条永远红）。
+        drawer_right = drawer_d[2] if drawer_d else W
         if not dock:
             check(False, "D1 抽屉右上角有 Dock in layout")
         else:
-            check(dock[2] > W - 220.0 and dock[1] < bar[1] - 250.0,
-                  "D1 Dock 复选框在抽屉右上角 (x1=%.0f, y=%.0f)"
-                  % (dock[2], dock[1]))
+            check(dock[2] > drawer_right - 220.0 and dock[1] < bar[1] - 250.0,
+                  "D1 Dock 复选框在抽屉右上角 (x1=%.0f, 抽屉右缘 %.0f, y=%.0f)"
+                  % (dock[2], drawer_right, dock[1]))
             n_dock = count(tap, "CONTENT-DRAWER dock=1")
             ok_dock = click_until(hwnd, tap, *center(dock),
                                   "CONTENT-DRAWER dock=1", n_dock, wait=1.2)
             check(ok_dock, "D2 勾 Dock → 日志 dock=1")
+            # 停靠形态**仍然**横跨整窗：它是布局的一部分，谁也不遮。
+            # 这一条与 B2d 是一对 —— 少了它，"抽屉宽度"这件事就只守住了一半，
+            # 哪天改成"停靠也让位"会静默通过。
+            time.sleep(0.4)
+            drawer_dk = tap.last_rect("CONTENT-DRAWER")
+            if drawer_dk:
+                check(drawer_dk[0] <= 2.0 and abs(drawer_dk[2] - W) <= 3.0,
+                      "D2b 停靠后抽屉横跨整窗 (x∈[%.0f,%.0f], W=%d)"
+                      % (drawer_dk[0], drawer_dk[2], W))
+            else:
+                check(False, "D2b 停靠后抽屉横跨整窗", "缺抽屉矩形")
             vp_after = tap.last_rect("VP-RECT")
             if vp_before and vp_after:
                 drop = (vp_before[3] - vp_before[1]) - (vp_after[3] - vp_after[1])

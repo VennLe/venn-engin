@@ -313,6 +313,7 @@ void Renderer::bindFeatureParams() {
     render::bindParam("rp.mdi", &m_mdiEnabled, ParamKind::Bool);
     render::bindParam("rp.bindless", &m_bindlessEnabled, ParamKind::Bool);
     render::bindParam("rp.gizmos", &m_showLightGizmos, ParamKind::Bool);
+    render::bindParam("rp.jointGizmos", &m_showJointGizmos, ParamKind::Bool);
     render::bindParam("rp.extraView", &m_extraViewWanted, ParamKind::Bool);
 
     render::bindParam("tex.mipmaps", &m_texMipmaps, ParamKind::Bool);
@@ -571,6 +572,7 @@ Renderer::~Renderer() {
         // 环境图被 set 0 的描述符引用 → 必须早于 m_descriptors 释放
         m_environment.reset();
         m_lightGizmoMesh.reset();
+        m_gizmoCubeMesh.reset();
         m_defaultFlatNormal.reset();
         m_defaultWhite.reset();
         m_defaultBlack.reset();
@@ -691,6 +693,8 @@ void Renderer::init() {
 
     // 5) 灯光可视化用的单位球（Renderer 自建，不进 AssetManager）
     createLightGizmoMesh();
+    // 5.5) 关节可视化用的单位立方体（J5-3）：细长立方体当线段用
+    createJointGizmoMesh();
 
     // 6) 阴影 Pass（要在 createFrameResources 之前，因为后者的
     //    set 0 需要绑定阴影贴图视图）
@@ -1190,6 +1194,138 @@ void Renderer::createLightGizmoMesh() {
     m_lightGizmoMesh->upload(*m_device, *m_commandPool,
                              assets::makeSphereVertices(1.0f, 12, 8),
                              assets::makeSphereIndices(12, 8));
+}
+
+void Renderer::createJointGizmoMesh() {
+    // 单位立方体（-0.5..0.5，中心在原点）。关节的连杆与轴都靠**非均匀
+    // 缩放**它得到：一条从 p0 到 p1 的线段 = 一个 z 轴拉伸到 |p1-p0|、
+    // xy 压到线宽的立方体。比真画线省掉一整条管线（顶点格式、拓扑、
+    // shader、descriptor 全都不用动），视觉上无可分辨的差别。
+    m_gizmoCubeMesh = std::make_unique<assets::Mesh>();
+    m_gizmoCubeMesh->upload(*m_device, *m_commandPool,
+                            assets::makeCubeVertices(1.0f),
+                            assets::makeCubeIndices());
+}
+
+// 把本帧要画的关节几何算成一组 (model 矩阵, 颜色, 是球吗)。**纯 CPU**。
+//
+// 为什么不直接画：
+//   · 逐条关节的模型矩阵要算两遍（一次在提交时算会与剔除/统计错开）
+//   · 可视化的失败形态是"什么都没画"。把"算了几条"独立打一行日志，才能
+//     区分"场景里没关节"与"有数据但没提交"——这两种情况在画面上一样。
+void Renderer::collectJointGizmos(scene::Scene& scene, bool isPreview) {
+    // 预览（材质预览 / 探针捕获）不参与：既没有关节可配，也会被绿线糊住。
+    // ⚠ 提前 return 而不是先 clear：预览是在主场景之后录制的，clear 掉会
+    //   把主场景已经算好的那一批一起抹了（画面上表现为"开了可视化但没东西"）。
+    if (isPreview) return;
+    m_jointGizmoScratch.clear();
+    if (!m_showJointGizmos) return;
+    if (!m_lightGizmoMesh || !m_gizmoCubeMesh) return;
+
+    const float r = m_jointGizmoScale;
+    if (r <= 1.0e-4f) return;
+    // 连杆 / 轴的粗细跟着球半径走。定死 1 cm 的话，把球调到 0.5 m 时
+    // 连杆细得像头发丝；反过来球调到 2 cm 时连杆比球还粗。
+    const float thick = r * 0.16f;
+
+    ecs::World& w = scene.world();
+    int total = 0, dangling = 0, missingBody = 0;
+
+    // 线段 → 拉长的立方体（z 轴对齐线段，xy 取一组正交基）
+    const auto line = [&](const glm::vec3& p0, const glm::vec3& p1,
+                          float halfWidth, const glm::vec4& c) {
+        const glm::vec3 d = p1 - p0;
+        const float len = glm::length(d);
+        if (len < 1.0e-5f) return;   // 两端重合：没有方向可对齐
+        const glm::vec3 z = d / len;
+        // ⚠ 参考轴不能与 z 平行，否则 cross 得到零向量 —— 竖直方向的连杆
+        //   （比如摆锤的竖直绳）会整个消失，而且不报错。
+        const glm::vec3 ref = (std::fabs(z.z) > 0.99f) ? glm::vec3(0.0f, 1.0f, 0.0f)
+                                                      : glm::vec3(0.0f, 0.0f, 1.0f);
+        const glm::vec3 xc = glm::cross(ref, z);
+        const float xl = glm::length(xc);
+        // 退化基**不提交**：三根轴里有两根是零向量时，立方体在屏幕上的
+        // 尺寸是 0 —— 既可能是"看不见"，也可能是 NaN（某些驱动下整帧
+        // 变黑），两种都表现为"少画了一根线、日志全绿"。
+        // 直接 return 会让 `verts` 少一个，用例 H3 判的是它的**精确值**
+        // （竖直连杆 = 4，漏了就 3），于是这条分支漏写会当场变红，而不是
+        // 安静地少一根绳子。
+        if (xl < 1.0e-6f) return;
+        const glm::vec3 x = xc / xl;
+        const glm::vec3 y = glm::cross(z, x);
+        glm::mat4 m(1.0f);
+        m[0] = glm::vec4(x * halfWidth, 0.0f);
+        m[1] = glm::vec4(y * halfWidth, 0.0f);
+        m[2] = glm::vec4(z * len, 0.0f);
+        m[3] = glm::vec4((p0 + p1) * 0.5f, 1.0f);
+        m_jointGizmoScratch.push_back({m, c, false});
+    };
+    const auto ball = [&](const glm::vec3& p, const glm::vec4& c) {
+        glm::mat4 m = glm::translate(glm::mat4(1.0f), p);
+        m = glm::scale(m, glm::vec3(r));
+        m_jointGizmoScratch.push_back({m, c, true});
+    };
+
+    w.each<ecs::JointComponent>([&](ecs::Entity e, ecs::JointComponent& jc) {
+        ++total;
+        // `enabled=false` 的**照画、只是压暗**。用户关掉一条关节往往正是
+        // 在调它；这时候把它藏起来会让人以为组件丢了。
+        const float dim = jc.enabled ? 1.0f : 0.22f;
+        const glm::mat4 mA = scene.worldMatrix(e);
+        const glm::vec3 pa = glm::vec3(mA * glm::vec4(jc.anchorSelf, 1.0f));
+
+        const ecs::Entity other = w.find(jc.target);
+        glm::vec3 pb = pa;
+        const bool ok = other.valid();
+        if (ok) {
+            pb = glm::vec3(scene.worldMatrix(other) *
+                           glm::vec4(jc.anchorTarget, 1.0f));
+        } else {
+            ++dangling;
+        }
+
+        // 红 = 另一端根本没指定；黄 = 指定了但任一端没刚体（Play 时会被
+        // `PHYS-JOINT skip` 拦掉）。分开配色能省掉一次翻日志 ——
+        // "还没配"和"配错了"是两种不同的下一步动作。
+        const bool hasBodyA = w.has<ecs::RigidBodyComponent>(e);
+        const bool hasBodyB = ok && w.has<ecs::RigidBodyComponent>(other);
+        if (ok && !(hasBodyA && hasBodyB)) ++missingBody;
+
+        glm::vec4 cA(0.25f, 0.68f, 1.00f, 1.0f);
+        glm::vec4 cB = ok ? glm::vec4(1.00f, 0.55f, 0.15f, 1.0f)
+                          : glm::vec4(1.00f, 0.12f, 0.10f, 1.0f);
+        glm::vec4 cL = ok ? glm::vec4(0.82f, 0.85f, 0.88f, 1.0f) : cB;
+        if (ok && !(hasBodyA && hasBodyB)) {
+            cB = glm::vec4(1.00f, 0.85f, 0.10f, 1.0f);
+            cL = cB;
+        }
+
+        ball(pa, cA * dim);
+        ball(pb, cB * dim);
+        line(pa, pb, thick, cL * dim);
+
+        // 铰链 / 滑动有轴（绿色）；焊死 / 球窝 / 距离没有方向性，不画。
+        if (jc.kind == ecs::JointKind::Hinge ||
+            jc.kind == ecs::JointKind::Slider) {
+            const glm::vec3 ax = glm::mat3(mA) * jc.axis;
+            const float len = glm::length(ax);
+            if (len > 1.0e-5f) {
+                const glm::vec3 u = ax / len;
+                const float half = r * 3.0f;
+                line(pa - u * half, pa + u * half, thick * 0.8f,
+                     glm::vec4(0.30f, 1.00f, 0.45f, 1.0f) * dim);
+            }
+        }
+    });
+
+    // 只在**条数变化**的那一刻打一行（同栅格抑制的纪律：逐帧打会把
+    // Console 淹掉）。用例靠它断言"可视化真的算出来了"。
+    if (total != m_jointGizmoLogged) {
+        m_jointGizmoLogged = total;
+        VK_LOG_INFO("RENDER joint-gizmos n=%d dangling=%d missing-body=%d "
+                    "verts=%zu",
+                    total, dangling, missingBody, m_jointGizmoScratch.size());
+    }
 }
 
 void Renderer::createShadowPass() {
@@ -6196,6 +6332,47 @@ void Renderer::recordFrame(VkCommandBuffer cmd, uint32_t imageIndex,
             ++m_stats.drawCalls;
             m_stats.triangles += static_cast<uint32_t>(
                 m_lightGizmoMesh->indices().size() / 3);
+        }
+    }
+
+    // ---------------- 关节可视化（J5-3）----------------
+    // 与灯球同一段：**不透明之后、栅格与透明之前**。理由是同一个 ——
+    // 它必须吃深度测试（被墙挡住的关节就该看不见），而不是做成 ImGui
+    // 叠加层浮在所有东西上面。
+    //
+    // 几何在 `collectJointGizmos` 里算好（纯 CPU），这里只负责提交。
+    // 拆开是因为两个失败形态完全不同：算不出来（没数据 / 目标悬空）与
+    // 提交不出去（管线 / 描述符），日志里一眼能分开。
+    if (m_showJointGizmos) {
+        // 这一段在 `recordFrame`（主链）里，预览走的是 `recordSceneInto` ——
+        // 所以 isPreview 恒为 false。预览窗口不画关节是有意的：它只有几十
+        // 像素宽，画上去也只是一团色块，而关节本身在那里也配不了。
+        collectJointGizmos(scene, /*isPreview=*/false);
+        if (!m_jointGizmoScratch.empty()) {
+            assets::Material jm;
+            jm.baseColorFactor = glm::vec4(0.0f);
+            jm.metallic = 0.0f;
+            jm.roughness = 1.0f;
+            jm.normalScale = 0.0f;
+            jm.ao = 1.0f;
+            // 与灯球同款：临时构造的材质天生是掩码 0，但走 effectiveKeywords
+            // 才能让"强制掩码"的对照实验也管得到它。
+            const KeywordMask jkw = effectiveKeywords(jm);
+            for (const JointGizmoDraw& g : m_jointGizmoScratch) {
+                const assets::Mesh* mesh =
+                    g.sphere ? m_lightGizmoMesh.get() : m_gizmoCubeMesh.get();
+                if (!mesh) continue;
+                // 自发光压到 0.9：再高会被 Bloom 糊成一团白，
+                // 而关节可视化最要紧的恰恰是"颜色能分辨"。
+                jm.emissive = glm::clamp(glm::vec3(g.color) * 0.9f,
+                                         glm::vec3(0.0f), glm::vec3(3.0f));
+                bindForwardVariant(cmd, jkw, boundMask,
+                                   m_stats.variantSwitches);
+                drawMesh(cmd, m_forwardPipelines.layout(), g.model, jm, *mesh);
+                ++m_stats.drawCalls;
+                m_stats.triangles +=
+                    static_cast<uint32_t>(mesh->indices().size() / 3);
+            }
         }
     }
 

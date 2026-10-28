@@ -299,6 +299,19 @@ FEATURES = [
               "MYVK_CHARLIGHT_AMBIENT", "MYVK_CHARLIGHT_COLOR",
               "MYVK_CHARLIGHT_FOLLOW"],
          test="verify_toon_shading", gpu="forward"),
+    # ---------------- NPR 描边（A7 的前置件，2026-10-25）----------------
+    # 描边参数是**渲染级**的（"项目画风"），不是逐物体属性 —— 所以它有
+    # env，也有 UI（Engine ▸ Rendering 的 Outline 组由 FeatureUIGen 从
+    # kParamsOutline 生成）。ui token 取参数 id 前缀 `outline.`：它出现在
+    # FeatureRegistry.cpp 里，而 _collect_editor_sources() 把那份注册表也
+    # 拼进去了（Engine 面板的控件就是它生成的，参数 id = "点得到"的证据）。
+    dict(id="outline", name="NPR 描边（深度 + 法线边缘检测）", roadmap="A7",
+         scope="Engine", panel="Engine ▸ Rendering ▸ Outline",
+         ui=["outline."],
+         env=["MYVK_OUTLINE", "MYVK_OUTLINE_WIDTH", "MYVK_OUTLINE_DEPTH",
+              "MYVK_OUTLINE_NORMAL", "MYVK_OUTLINE_STRENGTH",
+              "MYVK_OUTLINE_COLOR"],
+         test="verify_outline", gpu="forward"),
 ]
 
 # ============================================================
@@ -412,6 +425,48 @@ ALLOW_EXACT = {
     #    `MYVK_PROJECT_TEST` = 工程层 112 条；`MYVK_QUALITY_TEST` = E26 的
     #    15 条档位表断言。都在 app.run() 之前 return，界面上不存在。
     "MYVK_PROJECT_TEST", "MYVK_QUALITY_TEST",
+    # ① 2026-10-27 补：一批"只在自动化 / 自检 / 日志探针里"的变量。
+    #    它们此前一直没登记，`check_feature_surface` 的 D 组因此长期红着
+    #    21 条 —— 而闸门红着就等于"新特性有没有 UI 面"这件事没人查。
+    #    · 无窗口自检入口（app.run() 前 return，界面不存在也不该存在）：
+    "MYVK_ASSET_TEST", "MYVK_ASSET_TEST_MODEL",   # 离线资产链（AssetSelfTest）
+    "MYVK_LAYOUT_TEST",                            # 布局树 97 条（E29-1~3）
+    "MYVK_MULTISELECT_TEST",                       # 多选批量编辑（#316）
+    #    · 脚本侧的输入（只在 tools/*.py 里出现，引擎根本不读 —— 扫到它们
+    #      是因为扫描范围包含 tools/）：`MYVK_SCENE` 给 verify_template_scene
+    #      指场景，`MYVK_ASSET_ROOT` 给 verify_morph 指资产根。
+    "MYVK_SCENE", "MYVK_ASSET_ROOT",
+    #    · 自动化构造现场的注入点（正常使用不设即无影响）：
+    "MYVK_EDITMODE",              # 启动即进该编辑模式（正式入口 = 模式栏/快捷键）
+    "MYVK_LANDSCAPE_AUTOCREATE",  # 第 30 帧在空场景里建一片默认地形
+    "MYVK_MATERIAL_NO_MIRROR",    # 临时工程跑时关掉"回写源目录"
+    "MYVK_LOD_OFF",               # 强制全走第 0 级 LOD（A/B 对照）
+    #    · 路径 / 来源覆盖（同 `MYVK_RENDER_SETTINGS`）：
+    "MYVK_MATERIAL_SOURCE",       # 材质导入时"源目录在哪"
+    #    · 日志探针（只打日志、不改行为）：
+    "MYVK_LOG_DT",                # 逐帧时基（_probe_frame_dt.py 读它）
+    "MYVK_LOG_SCRIPT_PRINT",      # 把脚本 print 同时抄进引擎日志
+    #    · `MYVK_VSYNC`：RunMode 的重点是"显式指定"这一分支（量 GPU 峰值 /
+    #      延迟时强制不锁）。正式入口是渲染设置文件的 vsync 字段，编辑器里
+    #      没有复选框 —— 所以它**不是**欠账，而是"命令行式的显式覆盖"。
+    "MYVK_VSYNC",
+    # ① 2026-10-28 补：G29-b / 植被第二轮 / J5 留下的**登记欠账**。
+    #    这几条一直是"D 组红着 7 条"的状态，红着的闸门等于没有闸门 ——
+    #    这次补上不是因为它们"变正式了"，而是为了让 D 组重新成为有效判据。
+    #    · `MYVK_ASSET_CACHE` —— pak 落盘缓存的**根目录覆盖**（同
+    #      `MYVK_RENDER_SETTINGS`）。正式行为是 `%LOCALAPPDATA%\Venn\assetcache`，
+    #      玩家不该也不能选；它只给用例"从空缓存开始跑"。
+    "MYVK_ASSET_CACHE",
+    #    · `MYVK_FOLIAGE_{KIND,MESH,OFFSET,ROT,SCALE}` —— 植被面板的
+    #      **自动化注入点**。正式的入口全在 Foliage 面板上（类型下拉 /
+    #      网格槽 / 三个区间滑条，见 `docs/foliage_mesh_2026-10-28.md`），
+    #      这几条只是让 `verify_foliage_mesh` 不用鼠标也能把参数设到位。
+    "MYVK_FOLIAGE_KIND", "MYVK_FOLIAGE_MESH", "MYVK_FOLIAGE_OFFSET",
+    "MYVK_FOLIAGE_ROT", "MYVK_FOLIAGE_SCALE",
+    #    · `MYVK_JOINT_GIZMOS=1` —— 关节面板的**可视化**开关（连杆/枢轴球）。
+    #      正式入口是 Inspector ▸ Joint 页签上的复选框；这条给
+    #      `verify_joints` 做"开了才有 / 关了就没了"的对照。
+    "MYVK_JOINT_GIZMOS",
 }
 # ③ 诊断 dump（`*_DBG`）。`*_DUMP` 同义：只打日志、不改行为，
 #    与 `MYVK_PHYS_DUMP=<N>`（每 N 帧一行 `PHYS-BODY`）是同一类。

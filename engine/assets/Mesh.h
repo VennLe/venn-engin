@@ -233,6 +233,11 @@ public:
 
     bool valid() const { return m_vertexBuffer != nullptr; }
 
+    // 索引数（= 三角形数 × 3）。给诊断/回归用：`FOLIAGE-TYPE-MESH` 那行
+    // 日志靠它证明"精细化之后三角形真的涨了"，而不是只看截图感觉。
+    std::uint32_t indexCount() const { return m_indexCount; }
+    std::uint32_t triangleCount() const { return m_indexCount / 3; }
+
     // ---- 局部空间 AABB（上传时从顶点算一次，之后只读）----
     // 用途：渲染层的阴影正交范围、编辑器的拾取/贴地都需要"物体的实际
     // 尺寸"。没有它就只能退化成拿实体原点当包围盒 —— 单个物体算出来
@@ -299,30 +304,52 @@ std::vector<Vertex> makeCylinderVertices(float radius, int segments = 48);
 std::vector<uint32_t> makeCylinderIndices(int segments = 48);
 
 // ------------------------------------------------------------
-// 植被（W5-1 的第一步，2026-10-20）
+// 植被（W5-1 的第一步，2026-10-20；2026-10-28 精细化重写）
 //
 // 为什么植被要有自己的内置形状：撒点如果只能用 cube/sphere，"植被"看起来
-// 就是一堆绿方块。草叶最少要**交叉的卡片**（三张十字面片，任何角度看都
-// 有东西），树最少要有**干 + 冠**两段。两者都是程序化的，不需要美术资产，
-// 也不需要外部文件 —— 与 cube / sphere 同级。
+// 就是一堆绿方块。草叶最少要**交叉的卡片**，树最少要有**干 + 冠**两段。
+// 两者都是程序化的，不需要美术资产，也不需要外部文件 —— 与 cube / sphere
+// 同级。
 //
 // 尺寸约定：`size` = 世界高度（米），XY 宽度由形状自己按比例算。
 // 法线一律朝上（0,0,1）：草和树冠都是薄片，用面法线会在逆光时变黑，
 // 朝上法线拿的是"天光"，观感稳定。材质**必须** doubleSided（背面要能看见）。
+//
 // ------------------------------------------------------------
-std::vector<Vertex> makeGrassVertices(float size);
-std::vector<uint32_t> makeGrassIndices();
-std::vector<Vertex> makeTreeVertices(float size);
-std::vector<uint32_t> makeTreeIndices();
-// 花：细杆（两张交叉窄片）+ 顶上一簇小花冠（三张交叉片）。
-// 与草的区别不只是尺寸 —— 草是"一片"，花是"一根杆挑一个头"，
-// 远看时轮廓完全不同，撒在草地里才有层次。
-std::vector<Vertex> makeFlowerVertices(float size);
-std::vector<uint32_t> makeFlowerIndices();
+// 2026-10-28：用户报"生成的 grass/tree/flower/bush/rock 都太粗糙"
+// ------------------------------------------------------------
+// 第一版全都压到了极致（草 3 张平面卡 = 2 个三角形、树 2 个八边锥、
+// 灌木一颗 8×5 球、石头 9×6），理由是"撒几百株也无所谓"。问题在于
+// **几百株同一种粗糙轮廓叠在一起，粗糙本身会被放大**：草是一撮绿毛、
+// 树是一排圣诞树、石头是一地面包里滚出来的蛋。
+//
+// 所以这一版把每种的"可辨认特征"补上，代价是三角形涨 5~40 倍（一棵树
+// ~1100 tri，仍然低于 UE 的 5k~20k 一个量级）：
+//   · 草   = 9 片**带弯曲、带锥度、分 4 段**的叶片（72 tri）
+//   · 花   = 2 株（弯曲茎 + 6 瓣花冠 + 花心）（~90 tri）
+//   · 灌木 = 4 个位移球 + 8 张叶卡（~500 tri）
+//   · 树   = 锥形弯曲树干 + 3 根树枝 + 6 团位移树冠（~1100 tri）
+//   · 石头 = 14×9 四倍频位移 + 平面着色（~500 tri，形体更像岩块）
+//
+// ⚠ API 从"verts / indices 各一个函数"改成**一次出两者**：旧的两半写法
+//   要求两份代码里的形状参数逐字相同（树的注释里专门警告过），而
+//   grass/flower 的索引表是硬编码"每片 4 个顶点"的 —— 一改叶片数就整块
+//   错位（顶点够、索引指到别的叶片上，画出来是一团乱线）。合成一个函数
+//   之后这类错位在结构上不可能发生。
+// ------------------------------------------------------------
+void buildGrassMesh(float size, std::vector<Vertex>& verts,
+                    std::vector<uint32_t>& idx);
+void buildFlowerMesh(float size, std::vector<Vertex>& verts,
+                     std::vector<uint32_t>& idx);
+void buildBushMesh(float size, std::vector<Vertex>& verts,
+                   std::vector<uint32_t>& idx);
+void buildTreeMesh(float size, std::vector<Vertex>& verts,
+                   std::vector<uint32_t>& idx);
 // 石头：低面数、顶点随机位移、**逐面法线**（平面着色）的球。
 // 为什么要单独一份而不是压扁的 sphere：光滑球压扁之后仍然处处是圆滑的
 // 高光，一堆摆在一起像"塑料蛋"；平面着色 + 位移才有岩块的棱。
-std::vector<Vertex> makeRockVertices(float size, int seed = 0);
+void buildRockMesh(float size, int seed, std::vector<Vertex>& verts,
+                   std::vector<uint32_t>& idx);
 
 
 } // namespace assets

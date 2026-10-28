@@ -38,8 +38,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from capture_window import capture_stable, find_window                # noqa: E402
+from capture_window import capture_stable, find_window, user32      # noqa: E402
 from verify_add_menu import LogTap, click, force_foreground           # noqa: E402
+from verify_asset_drag import move_to                                # noqa: E402
 from verify_local_shadow import to_np                                # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -63,6 +64,41 @@ def check(ok, msg):
 
 def center(r):
     return (r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5
+
+
+MOUSEEVENTF_WHEEL = 0x0800
+
+
+def wheel(hwnd, x, y, notches):
+    """在 (x,y) 处滚 notches 格（正 = 向下滚 → 内容上移）。"""
+    force_foreground(hwnd)
+    move_to(hwnd, x, y)
+    time.sleep(0.15)
+    for _ in range(abs(notches)):
+        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0,
+                           -120 if notches > 0 else 120, 0)
+        time.sleep(0.12)
+    time.sleep(0.4)
+
+
+def scroll_into(hwnd, tap, node_tag, box_tag, tries=8):
+    """把 node 那条滚进 box 里（目录树内容比可视区高时必需的）。
+
+    ⚠ 为什么要有这一步：`logRect` 打的是**逻辑坐标**，节点被滚出可视区
+      之后日志照样有一行矩形，但鼠标点上去什么也点不到 —— 用例于是表现成
+      "点了没反应"，而不是"节点不可见"。`scenes` 是树的最后一个节点，
+      窗口 1600x900 时它正好压在最底下，点它等于点在底栏上。
+    """
+    box = tap.last_rect(box_tag)
+    node = tap.last_rect(node_tag)
+    for _ in range(tries):
+        if not box or not node:
+            return node
+        if node[3] <= box[3] - 2 and node[1] >= box[1] + 2:
+            return node
+        wheel(hwnd, (box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5, 1)
+        node = tap.last_rect(node_tag)
+    return node
 
 
 def count(tap, needle):
@@ -253,6 +289,7 @@ def main():
         node = tap.last_rect("CB-TREE-NODE scenes")
         check(node is not None, "B1 树里有 scenes 节点")
         if node:
+            node = scroll_into(hwnd, tap, "CB-TREE-NODE scenes", "CB-TREE")
             ok = click_until(hwnd, tap, *center(node), "CB-ENTRIES dir=assets/scenes",
                              count(tap, "CB-ENTRIES dir=assets/scenes"))
             check(ok, "B2 点 scenes → 右栏切到 assets/scenes")

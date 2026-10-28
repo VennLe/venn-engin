@@ -1,0 +1,64 @@
+"""临时探针：抽屉变窄后，Content 三栏的矩形还合理吗？
+
+verify_content_three_pane 的 B2（点目录树 scenes 节点 → 右栏切目录）在
+抽屉让出右栏之后开始红，先确认是几何问题还是点击没落上。
+"""
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from capture_window import find_window, user32          # noqa: E402
+from verify_add_menu import LogTap                      # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
+
+TAGS = ("CONTENT-DRAWER=", "CB-TREE=", "CB-TYPES=", "CB-ITEMS=",
+        "CB-TREE-NODE scenes", "CB-TREE-ROOT", "CB-ENTRIES dir=",
+        "CB-FILTER type=", "VP-RECT=")
+
+
+def main():
+    env = dict(os.environ)
+    env["MYVK_LOG_RECTS"] = "1"
+    env["MYVK_NO_WINDOW_SAVE"] = "1"
+    env["MYVK_EDITOR_CONTENT_DRAWER"] = "1"
+    proc = subprocess.Popen([EXE], cwd=os.path.dirname(EXE), env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            bufsize=1)
+    tap = LogTap()
+    tap.start(proc)
+    try:
+        hwnd = find_window("Venn Editor")
+        if not hwnd:
+            print("no window")
+            return 2
+        user32.ShowWindow(hwnd, 9)
+        time.sleep(2.0)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 1600, 900, 0x0002 | 0x0004)
+        time.sleep(3.0)
+        with tap.lock:
+            lines = list(tap.lines)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    seen = set()
+    for ln in lines:
+        if any(k in ln for k in TAGS):
+            key = ln.split("=")[0]
+            if key in seen:
+                continue
+            seen.add(key)
+            print(ln.rstrip())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

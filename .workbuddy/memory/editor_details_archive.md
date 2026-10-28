@@ -1030,3 +1030,800 @@ Make 用 sh 跑配方 → `echo` 里不能有 `(` `)` `|`。⚠ 资产拷贝必�
   **关键帧按 `t` 排序**；**事件半开且跨圈扫两段**（只用 `[prev,next)` 在回绕时 from>to → 一条不发）；
   **首帧 `prev = playhead - eps`** 否则 t=0 的事件永不发；`startTime>0` **不补发**；每帧夹 `0.10 s`。
 - ⚠ 编辑态 `dt==0` **要应用姿态、不推进不发事件**（与 B3「`dt==0` 不提取根运动」**正好相反**）。
+
+---
+
+## 十三、2026-10-27（G16 稳定身份 1~4 落地）：判据原文
+
+> MEMORY.md 只留三条，这里是**完整版**（含每条断言的落点与否定测试结果）。
+> 权威文档：`docs/persistence_roadmap.md` §3（设计）、§12.1（落地记录）。
+
+### 13.1 数据模型（已落地）
+
+```cpp
+// ecs/Entity.h
+using EntityGuid = std::uint64_t;
+constexpr EntityGuid kInvalidGuid = 0;   // 0 = 无身份，不参与存档
+std::string  guidToHex(EntityGuid);      // 16 位小写，**必须补前导零**
+EntityGuid   parseGuidHex(const std::string&);  // 严格 16 位；不抛、不吃 0x、不吃尾随垃圾
+
+// ecs/World.h
+struct Record { uint32_t generation; bool alive; std::string name; EntityGuid guid; };
+std::unordered_map<EntityGuid, EntityId> m_byGuid;   // 反查表，只增删不重建
+EntityGuid guid(Entity) const;  Entity find(EntityGuid) const;
+bool setGuid(Entity, EntityGuid);  EntityGuid allocateGuid();
+```
+
+**分配**：进程级 `std::mt19937_64`（`seed_seq{rd(),rd(),rd(),rd(),steady_clock}`）。
+⚠ 不能放进 `World`：各持一份会让"清空再加载"重放同一串 → 场景合并交集非空。
+
+**生命周期三处**（顺序都是硬依赖）：
+| 位置 | 动作 | 写反的后果 |
+|---|---|---|
+| `create` | 在 `emplace_back` **之后**赋 `r.guid = allocateGuid()`，再 `m_byGuid[g]=id` | 读到默认 0 |
+| `destroy` | **先** `m_byGuid.erase(r.guid)`，**再** `r.guid = 0` | 拿 0 去 erase → 旧键留表里 → 槽位复用后**旧 guid 复活** |
+| `clear` | `m_byGuid.clear()` | 跨场景串号 |
+
+### 13.2 场景 JSON（v1 → v2）
+
+- 写端：`guid` 紧跟 `name`（**别插在 `parent` 后面** —— 读文件的人第一眼该看到"这是谁"）；
+  `parentGuid` **只在父不在本次导出集合里**时写（Prefab 子树根 / G19 分块边界）。
+- 读端：第一遍建实体时就 `setGuid` 覆盖（`create` 已给随机值）；
+  `want==0` → `assigned++`；`setGuid` 失败 → `dup++` + `SCENE-GUID-DUP`。
+  父解析：有 `parentGuid` 走 `find(guid)`（失败只 warn，不 fail 整份 —— 父可能在还没流送的块里）；
+  否则走 `parent` 下标，且**必须 `is_number_integer()` 先判**（`value("parent",-1)` 遇字符串抛 302）。
+- 版本：`kFormatVersion = 2`；读端只拒绝 **> 2**，**1 照读**（否则仓库里所有既有场景打不开）。
+  ⚠ 校验必须在 `scene.clear()` **之前**。
+- 锚点：一次加载一条 `SCENE-GUID assigned=%d dup=%d total=%d path=%s`（不是每实体一条）。
+
+### 13.3 选择接回（G16-4）
+
+逻辑抽成 `Scene::reconnectByGuidOrName(guid, name)`（**guid 优先、名字兜底**），
+`EditorContext::validateSelection` 调它。`m_selectionGuid` 与 `m_selectionName` 同时抓、同时刷新。
+⚠ 集合成员（多选）**仍是名字兜底**，没改成 guid —— 这是已知的剩余缺口。
+
+### 13.4 验收 26 条（`Game.exe --selftest guid`）
+
+| 组 | 断言 |
+|---|---|
+| 分配 | `guid_unique_100k` · `guid_never_zero` |
+| 反查 | `guid_find_roundtrip`（1000）· `guid_find_zero_empty` · `guid_invalid_entity_zero` |
+| 冲突 | `guid_set_duplicate_rejected` · `guid_set_self_ok`（**自己占自己的键要成功**，钉 `it->second != e.id`） |
+| 幽灵 | `guid_no_ghost_after_set` · `guid_set_chain_no_ghost`（**期望 1**，漏 erase 是 100） |
+| 生命周期 | `guid_destroy_unmaps`（含 `old=REVIVED` 判据）· `guid_reuse_not_recycled` · `guid_clear_unmaps` |
+| 跨 World | `guid_two_worlds_disjoint` |
+| hex | `guid_hex_leading_zeros` · `guid_hex_case_insensitive` · `guid_hex_rejects_garbage` |
+| 场景 | `scene_guid_roundtrip` · `scene_guid_stable_twice`（逐字节）· `scene_guid_assigned` · `scene_guid_dup_reassign` · `scene_merge_no_collision` · `scene_version_too_new`（含 `kept=1`）· `scene_parent_guid_miss_safe` |
+| 选择 | `selection_reconnect_by_guid` · `selection_fixture_has_ambiguity`（**对照区**：证明夹具真造出了歧义）· `selection_reconnect_no_hint_empty` |
+
+端到端 `tools/verify_guid.py` 8 组：A 自检全绿 · B v1 补发 dup=0 · C v2 `assigned=0`
+（**唯一能证明"读端真读了文件里的值"的一条**）· C2 无 skipped · C3 大写 hex · D dup=1 + 锚点。
+
+### 13.5 否定测试（4 次，都实测到红 → 还原 → 绿）
+
+1. 去 `setGuid` 的 erase → `old=ghost` + `hits=100`。
+2. `destroy` 顺序写反 → `old=REVIVED`。
+3. 写端不写 guid → `roundtrip same=0` 红；**`stable_twice` 仍绿**（两边都不写，长度一样）
+   → 说明它抓的是**读端重算**。
+4. 读端不 `setGuid` → 两条都红，且 `len=5082/5082` **相同**、内容不同
+   → **只判长度会漏，逐字节判据是必要的**。
+
+### 13.6 夹具的坑（最容易再踩）
+
+**只挂 Transform/Name 的实体不进场景文件**（`hasNonMeshContent` 名单不含它们）→
+第一次跑 `scene_guid_roundtrip` 拿到 `n=500` 字节、`same=0`：10 个实体全被当空实体跳过，
+"往返"比的是**两份空文件**，而 `stable_twice` 还 PASS。修法是给夹具加 `folder` 标记
+（`h->group = true`，最轻、不引资产）。修好后 `n=5082`。
+
+---
+
+## 十四、2026-10-27（G16-5 序列化器三段拆分）：判据原文
+
+### 14.1 三段的**签名**就是判据
+
+```cpp
+// engine/scene/SceneDocument.h
+bool parseSceneDocument(const nlohmann::json& root, SceneDocument& out, std::string& err);
+void instantiateDocument(Scene&, const SceneDocument&,
+                         std::vector<ecs::Entity>& created,
+                         std::unordered_map<ecs::EntityGuid, ecs::Entity>& guidMap,
+                         DocumentStats& stats);
+void resolveDocumentAssets(Scene&, assets::AssetManager&, const SceneDocument&,
+                           const std::vector<ecs::Entity>& created, DocumentStats& stats);
+```
+
+* ①② **不许**出现 `AssetManager` —— 出现就等于把"后台线程解析"这条路焊死了。
+  `tools/verify_save.py` D 组用**纯静态**文本检查盯这一条（不用编译），否定测试实测能抓到。
+* 实现留在 `SceneSerializer.cpp`（不是 `.cpp` 分开）：`applyCamera` / `physicsFromJson` /
+  `entityApplyComponentsImpl` 全在匿名 namespace 里，另起 TU 只能复制一份。
+* 定义必须在匿名 namespace **外**（头文件声明是外部链接，里面定义就是内部链接 → 链接期未定义引用）。
+
+### 14.2 三处"看着更好其实更糟"的设计（都是刻意不做）
+
+| 放弃了 | 改成 | 理由 |
+|---|---|---|
+| `DocumentEntity` 每组件一个 `optional` | 只留 `raw`（原始 JSON 块） | 搬组件就要搬每个 `xxxFromJson`，其中十几个要解析资产 → ③ 段变成第二份实现，加组件必漏改 |
+| 单独 `AssetRequest` 表 | ③ 段直接遍历实体 | 拆它等于把 `entityApplyComponents` 按组件再拆一遍；等 G19 真要"资产预取清单"再生成 |
+| `documentToJson` 反向 | 未做 | 目前没消费者（G18 Apply 还没到）。**空接口比错接口便宜** |
+
+### 14.3 落地结构（改动点清单）
+
+* `entityFromJsonImpl` 原地劈成 `entityApplyHierarchyImpl`（纯 CPU：父子 + folder）+
+  `entityApplyComponentsImpl`（要资产：mesh/material/skinned/…全部）。
+* 保留一个**只有两行**的 `entityFromJsonImpl` 当唯一串联点 —— 这样"拆完之后 Prefab
+  与场景加载仍然走同一条路"在代码上无法被悄悄改坏。
+* 公开壳 `entityApplyHierarchy` / `entityApplyComponents` 进 `SceneEntityIO.h`。
+* `loadSceneFromJson` = 三段组合 + 一行注释"想后台解析就把 ①② 搬走、只留 ③"。
+* `kFormatVersion` 提到头文件 `kSceneFormatVersion`，源文件留别名（两份字面量会漂）。
+* `SceneDocument.globals` 是**白名单**（`camera/cameras/light/physics/scriptVars/postVolumes`），
+  不是"排除 entities"。新增全局块要同时改白名单 + ② 段的 `has()` 分支。
+
+### 14.4 验收数字
+
+```
+--selftest save                → SAVE-TOTAL pass=39 fail=0
+tools/verify_save.py           → 14/14 PASS（7.4 s）
+tools/verify_runtime_m2.py     → RESULT: PASS（C 组 12 项逐字段）
+--selftest guid / verify_guid  → 26/26 · 8/8（拆分无回归）
+```
+
+`verify_save.py` 四组：A 自检 + **分组存在性**（只数总数的话"整组被删"也能凑够）·
+B 真实场景 total 对得上 · C 写出→再读 `assigned=0`（**写端真写了 guid 的唯一运行时证据**）·
+D 签名护栏。
+
+### 14.5 否定测试（5 次，都实测到红 → 还原 → 绿）
+
+1. 父子第二遍注释掉 → `instantiate_parent_by_index` / `.._by_guid` / `.._folder` /
+   `equiv_parent_shape` **4 条红**（最后一条证明"等价性断言"能抓到"父子只在一处做"）。
+2. `raw` 改成 `json::object()` → **6 条红**（`parse_keeps_raw` + transform + 两条父引用 + folder + equiv）。
+3. `scene.clear()` 挪到 parse **之前** → `parse_fail_keeps_scene` 红且 `n=0`。
+4. 给 `instantiateDocument` 加 `assets::AssetManager&` 参数 → `verify_save.py` D3 红（`sig=dirty`）。
+5. 写端不写 `guid` → `verify_save.py` C3 红（`got=(11,0,11)` 全部补发）。
+
+### 14.6 这轮踩的两个新坑（都属工具/参数层）
+
+* **`--max-frames` 不是有效参数，正解是 `--frames`**。写错 = 进程不退出 = 脚本靠
+  45 s 超时 kill 收场。`verify_guid.py`（上一轮写的）也中了这一枪，每跑一次白等 4 分钟，
+  本轮一并修掉。**全仓 `tools/*.py` 现已无 `--max-frames`**。
+* **`--scene <绝对路径>` 打不开却不报错**：运行时把场景名当"资产根下的相对路径"，
+  绝对路径失败就退回默认流程继续跑 —— 症状是"脚本 90 秒无输出"而不是报错。
+  夹具产物一律落 `build/bin/` 下、用**相对文件名**再读。
+* `Scene::light()` 在找不到方向光组件时**自己造一个实体** → `entityCount()` 恒比"文件实体数"多 1。
+  断言"清空旧场景"要按**名字**判旧实体是否还在，别写死总数。
+
+---
+
+## 十五、2026-10-27（G17-1 存档文件层）：判据原文
+
+### 15.1 分层边界（这条先看，否则会重复劳动）
+
+`SaveGame.{h,cpp}` 只管 **格式 / 原子写 / 迁移 / 校验**。
+「算 diff」「应用到已有世界」「悬挂父修正」= G17-2。混在一起的话，
+"格式对不对"和"应用对不对"的失败长得一模一样（都表现为"读档后箱子回到原位"）。
+
+`kSaveVersion = 2`。**v2 的唯一理由**是让迁移机制被真的走过一遍 ——
+空跑的迁移表比没有更糟（给人虚假安全感，等真需要迁移时才发现机制是坏的）。
+`migrateV1ToV2` 只补 `globals.playerStamina`，**不重建整份 globals**。
+
+### 15.2 原子写的顺序（不能换）
+
+```
+write tmp → fflush → _commit(fileno) → 备份旧档(失败不阻断) → MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)
+```
+
+* 先 rename 再 fsync：崩在中间会留下"改好名但内容是空的"档，而它看起来完全合法。
+* Windows 上**不能**用 `std::rename` 做替换的**理由**不是"它会失败"（MSVC 的
+  `rename` 其实能覆盖，实测否定测试没红），而是它不保证 write-through。
+  代码注释已按这个真实理由写，别再传"rename 会失败"的说法。
+* `.bak` 备份失败**不许**阻断替换：备份失败不能变成"存不了档"。
+* 读档：主档解析失败 → 退 `.bak`（只退一次，避免坏 `.bak` 时死循环）。
+
+### 15.3 结构指纹（`sceneStructureHash`）
+
+guid 集合**排序后**顺序喂 FNV-1a。两个坑：
+
+1. **必须排序**：`World` 池子按分配顺序遍历，同内容不同顺序 → 不排序的哈希会
+   "无缘无故地变"，于是每次进游戏都报"关卡漂移"，而所有人都会去查 JSON。
+2. **必须顺序喂字节**：对每个 guid 单独调一次 `fnv1a64` 再"混合"，等于每次都从
+   offset 重新开始 → 只在算最后一个 guid，加/删实体哈希都不变。
+
+### 15.4 `entityToJson` 的 `includeEmpty`（存档要全量）
+
+默认 `false` = 场景文件语义"不写空壳"（只挂 Transform 的实体返回 false）。
+**存档必须传 `true`** —— 否则玩家 / 出生点 / 纯分组节点一条都进不了档，
+读档后它们"消失"或被随机补发新 guid，而画面上看起来像"读档没生效"。
+
+### 15.5 验收数字
+
+```
+--selftest save 33/33 · verify_persistence.py 8/8 · sceneio 39/39 · guid 26/26
+verify_runtime_m2 PASS（C 组 12 项逐字段）· check_regression_map PASS
+```
+
+四组：A 结构指纹（5）· B 格式往返（7 + capture 4）· C 迁移（6）· D 原子写/读（11）。
+`verify_persistence.py` 的 B 组看**磁盘**：A 组可以在"写进了别处 / 只写进内存"时全绿。
+
+### 15.6 否定测试（3 次红 + 1 次"没红"）
+
+1. 不排序 → `hash_order_independent` 红（`fwd=847875,rev=96d7a8`）。
+2. 迁移重建 globals → `migrate_v1_keeps_old` 红（`actual=4`，4 个老字段全丢）。
+3. `captureSaveGame` 用默认 `includeEmpty=false` → 3 条 `capture_*` 红（`actual=0`）。
+4. `replaceFile` 换 `std::rename` → **没红**。记下来：`file_write_twice_replaces` 抓的是
+   "写第二遍这个场景"，不是 rename 语义。**"否定测试没红"也是结论，要写进文档**，
+   否则下一轮会以为这条断言能防住 rename。
+
+### 15.7 两个新坑
+
+* **自检故意造坏数据必须收尾**：为测 `.bak` 兜底把主档写成 `{ this is not json`，
+  不收尾就在磁盘上留一份坏档 → 脚本 B 组红，而人会去查"写端是不是坏了"。
+  加 `file_restore_valid_after_negative`。
+* **`Scene` 不可拷贝/不可移动**（有 BVH 与池子）→ 不能写"返回 Scene 的 lambda"（C2280）。
+
+### 15.8 遗留
+
+* `--selftest save-crash`（写 tmp 后 `_exit(3)`，父进程断言旧档可读）—— 需要专用
+  CLI 子模式 + 脚本起子进程；纯 C++ 自检做不到"自我杀进程后再断言"。
+* 槽位目录 / CLI / 控制台 `save.*` = G17-3。本层路径由调用方给（engine 不拼目录）。
+
+---
+
+## 十六、2026-10-27（G17-2 存档应用层）：判据原文
+
+### 16.1 分层边界
+
+`SaveGame.{h,cpp}`（文件层：格式 / 原子写 / 迁移 / 校验）vs
+`SaveGameState.{h,cpp}`（应用层：基线 / diff / apply / 悬挂父）。
+混在一起的失败长得一模一样（都表现成"读档后箱子回到原位"），排查无下手处。
+
+### 16.2 基线的三个状态
+
+| 基线里有 | 存活 | 含义 | diff |
+|---|---|---|---|
+| 否 | 是 | 运行时新生成 | 写整条 |
+| 是(h) | 是 | 关卡自带 | `h` 同 → 跳过；不同 → 整条 |
+| 是(h) | 否 | 已销毁 | 写 `_destroyed`（**每次**） |
+| 否 | 否 | 关卡没有 / 生成后又被销毁 | 不写 |
+
+⚠⚠ 「已销毁」**粘性**：`noteApplied` 里对 destroyed 条目写 `kDeadHash`（0），**不要 erase**。
+erase 之后下一次存档不再写 `_destroyed` → 它被读进**还带着那个实体**的关卡 → 怪复活。
+
+### 16.3 存档的"一条实体 JSON"（`saveEntityJson`）
+
+= `entityToJson(w, e, /*空下标表*/, je, /*includeEmpty=*/true)` + `je.erase("parent")`。
+给空下标表是为了让 `entityToJson` 自己走"父不在导出集合里"那条分支写 `parentGuid`。
+
+**三条理由（缺一条都不该改回下标）**：① 应用不读层级；② 增量档只写一部分实体，下标指错人；
+③⚠⚠ 下标让"销毁一个实体"把别人哈希带翻。
+
+⚠⚠ **`World` 的池子是 swap-and-pop**：销毁下标 i 时**只有最后一个元素**被搬到 i，其余纹丝不动。
+所以"销毁第一个"的夹具**测不出**下标耦合（父的下标不变）——夹具必须让**父排在最后**。
+这条是"断言看似覆盖、其实假绿"的教科书案例：第一版夹具写错了，否定测试时那条是绿的。
+
+### 16.4 应用顺序（`applySaveGame`）
+
+① 漂移统计（`missing / total > kMaxMissingRatio(0.5)` → **拒读，一个实体都不许动**）
+② `_destroyed` 先销毁 → ③ 逐条覆盖（`entityApplyShell` + `entityApplyComponents`）
+④ `fixOrphanParents`（**无条件**跑，手改的档也会造出悬挂）
+⑤ `globals.vars` **合并**进 `scene.scriptVars()`（不清空：脚本 `let` 的关卡常量不在存档里）
+
+⚠ ②③ 的顺序**观测不到**（两种顺序的终态一样），别为它编断言；写在前面的理由是"白写一遍 + 短暂悬空"。
+⚠ 覆盖**复用**组件解析，不写"值白名单" —— 白名单 = 第二套字段解析，加组件必漏改且不报错。
+
+### 16.5 无设备自检怎么跑应用层
+
+`assets::AssetManager am{assets::TextureContext{}}`（`device = nullptr`）。夹具**不许**有
+`mesh` / `material` / `skinned` 等块：`resolveMesh(am, json(nullptr))` 直接 `return nullptr`
+（`!jm.is_object()` 那条短路），一次 GPU 调用都不会发生。加了资产键 = 自检进程直接崩，不是 FAIL。
+
+### 16.6 验收数字 / 断言分组
+
+```
+--selftest save         SAVE-TOTAL pass=77 fail=0（A 5 / B 11 / C 6 / D 13 / E 12 / F 25 / G 5）
+verify_persistence.py   20/20（A1~A7 + B1~B7）
+sceneio 39 · guid 26 · dialogue 105 · sequence 67 · verify_runtime_m2 PASS · regression_map PASS
+```
+
+`verify_persistence.py` 新增四条**锚点**断言（A4~A7）：`SAVE-APPLY` / `SAVE-ORPHAN` /
+`SAVE-SCENE-DRIFT` / `SAVE-DRIFT-REJECT` —— 只看数值断言数不够，自检可以"全绿"而应用路径一次没走。
+
+### 16.7 否定测试（6 次，全部实测到红 → 还原 → 绿）
+
+1. `captureDiff` 不传基线 → **18 条红**（diff 全组 + 销毁/悬挂父全组）。
+2. `saveEntityJson` 改回下标 → 首轮只有 2 条红（`json_has_parent_guid` / `.._value`），
+   `diff_no_index_coupling` **假绿** → 改夹具（父排最后）重做 → **4 条红**。
+3. `noteApplied` 用 `erase` 代替 `kDeadHash` → `diff_dead_sticky` 红（`d1=0,d2=0`）。
+4. `kMaxMissingRatio = 1.0` → `apply_drift_reject` + `.._untouched` 红。
+5. 不调 `fixOrphanParents` → `apply_orphan_parent_fixed` / `.._count` 红。
+6. `hashEntityJson` 只哈希 `transform` → `diff_detects_visible` + `hash_is_dump_fnv` +
+   `apply_orphan_fixture_total` 红。
+
+### 16.8 已知边界
+
+* `HierarchyComponent::children` 存 `EntityId`（无 generation）→ 槽位复用后 `alive()` 会误判，
+  悬挂父清扫**可能漏判**。彻底修要存 `{id, generation}`，属 G16 延伸。
+* 父被销毁后子实体的 `parentGuid` 写不出来（`w.guid(handle(dead))` = 0）→ 销毁一个父会让所有子
+  都被判"改过"（**正确**：持久化的父引用确实变了）。写死"只 1 条"的期望会把这个行为当 bug 抹掉。
+
+---
+
+## 十七、二次元 UI 主题改造（10-27，第 1/2/3/5部分/6 条）
+
+**权威 → `docs/anime_ui_restyle.md`**（需求状态表 / 压暗原理 / 两条路线 / 实测数字）。
+
+### 17.1 本轮最反直觉的一条：`c^(1/2.2)`
+
+本工程交换链把 ImGui 浮点色**当线性值再编码一次**（坑点 #34）→ 设 `0.106` 上屏是
+**RGB 92（中灰）**。所以「深色主题从来不真黑」不是色号选错，是**整条链路多了一次 gamma**。
+
+修法：`darkenThemeColors(Theme&, float k)` 遍历 **60 个 `ImVec4*`** 做 `pow(c, k)`。
+动漫档 `k = 1.45` → 保 0 与 1、保色相、只压暗部。
+实测：窗口底 `rgb(95,90,99)` → **`rgb(73,69,77)`**，luma 71.1。
+
+⚠ 只对**深色**动漫档压（`if (!t.tok.isLight)`）；浅色档压了会变脏。
+⚠ **老 5 套（0~4）一个系数都不许动** —— `verify_theme_language` 的亮度分区是护栏，
+改完必须逐位复测（本轮 102.4/85.2/122.5/109.9/245.3 全部不变）。
+
+### 17.2 圆角必须从「全局 Style」里拆出来
+
+`WindowPadding / ItemSpacing / FramePadding.x` 一动，**所有面板矩形全变**
+→ 按 rect 点控件的用例静默漂移。圆角只动四角几十个像素。
+
+所以新增 `ThemeMetrics`（圆角 7 项 + 边框 4 项 + `framePadY`），
+`applyBaseMetrics()` 仍全局共用一份 padding/spacing。`applyTheme` 末尾同时更新
+`g_tokens / g_metrics`，`metrics()` 供自绘件读。
+
+动漫档度量：`window/child 12 · frame/grab/tab 9 · popup 14 · scrollbar 10`，
+**边框全 0**（`popupBorder = 1` 例外，弹窗没边会飘）；工程档 8/6 + 保留 1px。
+
+### 17.3 主题下标**只能追加不能插队**
+
+偏好落盘存的是**整数下标**。往 `ThemeId` 中间插一套 → 老配置静默换主题。
+新增 5 套一律追加在 5~9：`SakuraNight / MatchaMint / SunsetPop / CyberNeon / SakuraDay`；
+`kDefaultThemeIndex = SakuraNight(5)`。
+`--selftest theme` **A 组**就是这条护栏：`venn_window_bg` / `venn_accent_r/g/b` /
+`daylight_is_light` 四条硬编码旧值。
+
+### 17.4 `applyTheme` 必须能在**没有 ImGui 上下文**时跑
+
+`--selftest theme` 是纯数值、不建窗口。`StyleColors*` / `GetStyle()` 在
+`GImGui == nullptr` 时直接断言崩：
+
+```cpp
+if (ImGui::GetCurrentContext() == nullptr) { g_tokens = t.tok; g_metrics = t.met; return; }
+```
+
+没有这行，整个自检只能靠开窗口跑（慢、要 GPU、GUI 用例还不能并行）。
+
+### 17.5 三个「看着更好其实更糟」的决定
+
+1. **`ImGui::AddRectFilledMultiColor` 不支持圆角** → `gradientRectV` 的绕法：
+   先铺一整块 bottom 色**圆角**矩形 → `PushClipRect` 把渐变限制在上半段 →
+   接缝处补一条同色细线。直接拿 MultiColor 画会露出**方角**。
+2. **`pillButton` 用 `InvisibleButton` 而不是 `Button`** —— 保留 ImGui 的命中 /
+   Hover / 键盘导航 / Item 注册，只接管绘制。尺寸由调用方给，语义等同 `ImGui::Button`
+   → 「按钮换形状」不会让锚点矩形漂移（三个 CTA 尺寸与原来逐像素一致）。
+3. **只自绘按钮一类纯点击控件**。`Checkbox / Slider` 内部还有键盘导航、拖拽、
+   tooltip，重画必丢。勾选框的"圆润"靠 `FrameRounding = 9` 拿，不重画。
+
+### 17.6 混色系数：量级差会把它变成「粉条」
+
+动漫档派生完 `header = mix(bg, accent, k)`，`k` 从 0.28 一路收到 **0.14 / 0.20 / 0.28**
+（normal/hover/active）；`headerBand` 的 `mix(barBg, accent, ×)` 收到 **0.05**、
+底边线 0.55 → **0.40**。
+
+原因：压暗后 `barBg ≈ 0.04` 而 `accent ≈ 0.97`，**量级差 20 倍** → 混 0.24 得到的是
+一整条高饱和粉（实测 `rgb(138,85,113)`），不是"淡淡的顶栏"。
+
+### 17.7 `BeginChild(..., true)` 用的是 `ImGuiCol_ChildBg`
+
+只改 `tok.cardBg` 不够 —— 两栏与窗口底只差 3 个色阶（看起来像没分层）。
+动漫档必须补一句 `t.childBg = t.tok.cardBg;`。
+
+### 17.8 色卡：`themeSwatch(i, bg, accent)`
+
+纯查询接口，**不改当前主题**。Preferences 的 `id == "theme"` 行特判画 10 枚
+（上 = 强调色、下 = 窗口底的竖向渐变 + 7px 圆角 + 选中描边），
+锚点 `PREFS-THEMECHIP-%d`，点击 `VK_LOG_INFO("EDITOR-THEME index=%d name=%s")`。
+
+⚠⚠ **色卡只在 Appearance 页画，Preferences 默认停在 Interface 页** →
+`verify_theme_anime.py` 的 C 组**顺序不能反**：先 `PREFS-TAB-Appearance` 点击切页，
+再数色卡。反了就是白等 10×12 s 全红，而 C2（点击后变绿）却是绿的 —— 这种
+"部分绿"的形态最容易骗过自己。
+
+### 17.9 播放条颜色改 token 后要复跑 `verify_add_menu`
+
+五个写死常量换成 `tk.ok / tk.error / tk.info / tk.warn` 后，`TR-BAR` 区间的
+高饱和中点断言仍 PASS（底栏/菜单锚点无漂移）。**换颜色 = 换像素 = 必须复跑像素用例**。
+
+### 17.10 本轮实测
+
+```
+--selftest theme              22/22
+--selftest save               77/77（存档无回归）
+verify_theme_anime.py          9/9   A3 + B3 + C1/C2/C2b
+verify_theme_language.py      12/12  （主题 0~4 逐位不变）
+verify_add_menu.py            全 PASS
+check_regression_map.py       PASS
+```
+
+`TRIGGERS["verify_theme_anime"] = ["launcher/LauncherApp.*", "runtime/main.cpp"]`；
+`engine/ui/**` 在 `GLOBAL_GLOBS` 里 → **刻意不登记**，否则 `--narrow` 下会假跳过。
+
+### 17.11 遗留
+
+第 4 条（Blender 式自由拖拽 / 合并**区域**）**本轮没做**，两条路线对比见
+`docs/anime_ui_restyle.md` §5。推荐 **B：把 `SplitLayout` 升级成可变树**，
+分三刀 ① 槽位映射运行时可写 → ② 拖拽换位 → ③ 合并成标签组。
+A（换 ImGui docking 分支）改动量小但等于换掉整个上游分支，编译期风险不可控。
+
+---
+
+## 十八、E29-1 面板槽位映射运行时可写（10-27 ✅）
+
+**权威 → `docs/editor_docking_roadmap.md`**（三刀拆分 / 坑 / 下一刀落点）。
+用户需求：「各个功能面板应该是灵活可变的，且支持自由拖拽和合并区域的，就和
+blender 中的差不多」。路线定了 **B：`SplitLayout` 升可变树**（A = 换 ImGui
+docking 分支，本机无外网拉不下来，且 20+ 面板的定位语义全要重写）。
+
+### 18.1 数据结构：叶子从 int 变成「面板组 + 活动下标」
+
+```cpp
+std::vector<int> groupA, groupB;   // 槽位值（kSlot*）
+int activeA = 0, activeB = 0;      // E29-3 的标签页选中项
+int panelA() const;                // 派生值，空组 → kSlotNone
+```
+
+`resolve` / `syncPanelVisibility` / tooltip / 最大化全部改走 `panelA()` ——
+**"组里装几个"对它们透明**，所以 E29-3 加标签条只是画的问题。
+
+⚠ `panelA()` 是**函数不是字段**：`组 + 活动下标`是组合状态，就地派生才不会出现
+"组换了、缓存没跟上"。
+
+### 18.2 ⚠⚠ 读盘必须 `restoreGroups` 整份替换，不能逐格 setGroup
+
+第一版逐格调：
+```
+setGroup(2,A,[inspector]) → 清 A（原 hier）；加 inspector 时它在 (2,B) → 跨位置去重跳过 → A 空
+setGroup(2,B,[hierarchy]) → 清 B（原 insp）；hierarchy 在 A 已空 → 成功
+结果：右栏只剩一格
+```
+**而 `insp.y < hier.y` 这条断言还是绿的**（insp 是 0 矩形，0 < 394）—— 假绿。
+是旁边"两格同宽同列"（insp=(0,0) vs hier=(1137,463)）把它抓出来的。
+→ `restoreGroups(groups[3][2])` 一次性清空再灌，顺序无关。
+
+### 18.3 ⚠⚠ `apply()` 必须先把树内四个槽位清 0
+
+`LayoutRects` **逐帧复用**。面板被搬走 / 合并后那个槽位在树里不存在了，不清零
+就留着上一帧矩形 → 同一面板在旧位置和新位置**各画一遍**（"面板被劈成两块"）。
+`out.content` **不清**：它由底栏抽屉直接写，不经过分栏树。
+
+### 18.4 ⚠⚠ `kSlotModes` 是**合成槽位**
+
+模式栏（模式列表 + 当前模式参数）由 `ToolkitEditors` 直接钉进 `modes` 矩形，
+**表里没有 id=="modes" 的 PanelDesc**，而**八个模式参数面板共用**
+`layoutSlot == kSlotModes`。于是：
+* `panelIndexOf("modes")` 查不到 → 落盘会静默丢掉这一格（实测 `applied=3` 而不是 4）
+* 靠 `layoutSlot` 反查会命中 **`landscape`**（第一个共用它的面板）
+→ 落盘 id 用 **`moderail`**，读盘**兼容别名 `modes`**（日志锚点/文档都叫它 modes）。
+这一格的丢失还很隐蔽：左栏宽度会从 460 塌成 0，而右栏变宽 —— 只有"同宽同列"那类
+断言能看出来。
+
+### 18.5 落盘：`"slots"` 段
+
+```json
+"slots": [{"a": ["modes"], "b": []}, {"a": ["viewport"], "b": []},
+          {"a": ["inspector"], "b": ["hierarchy"]}]
+```
+* **只在"与默认树不同"时写** → 没动过布局的用户，文件与改造前逐字节相同。
+* 老文件没有这一段 → 保持默认树（**不覆盖**）。
+* 空数组在这一阶段无法与"没写"区分 → 一律按"保持默认"（`kDefLeaf` 先填进 groups）。
+* ⚠ **不升 `kFormatVersion`**：加字段是向后兼容的，升版本会把所有老布局当"没有"，
+  白丢用户的窗口尺寸/比例。
+
+### 18.6 自检（`MYVK_LAYOUT_TEST=1`，33 条）
+
+走 **env 不是 argv** —— `Editor.exe` 丢弃命令行（本仓 P1 坑），且自检必须在
+Vulkan / 窗口之前 return。分组：A 默认树（6）· B 定位（4）· C 搬家（11）·
+D 交换（5）· E 矩形（4）。
+
+⚠ **E 组才是关键**：只断言 `groupPanel()` 变了证明不了"接上了 LayoutRects"
+（可能根本没写矩形）。`rect_follows_swap` / `rect_vanished_viewport_zeroed`
+两条是唯一能证明端到端的。
+
+### 18.7 两次"期望写错、实现是对的"
+
+1. `rect_vanished_slot_zeroed` 断言 `inspector.w == 0`，实际 330 —— 搬走的是
+   **Hierarchy**，消失的是 **Viewport**（它与 Hierarchy 同组，活动项变成后者）。
+2. `LAYOUT-SLOTS applied=2` —— `applied` 数的是**文件里指定并成功解析的条目数**
+   （4 个），不是"换了几个"。
+
+### 18.8 实测
+
+```
+MYVK_LAYOUT_TEST=1 Editor.exe   LAYOUT-TOTAL pass=33 fail=0
+verify_layout_slots.py          9/9   A1~A2 + B1~B3 + C1~C2
+verify_layout_v4.py             全部 PASS（默认布局零漂移：模式栏 x=0 w=460、
+                                右栏 x=1270 w=330、hier 底 394 贴 insp 顶 394）
+check_regression_map.py         PASS
+```
+
+`TRIGGERS["verify_layout_slots"] = ["editor/SplitLayout.*",
+"editor/EditorLayoutIO.*", "editor/LayoutSelfTest.*", "editor/main.cpp"]`
+（`EditorApp.*` **故意不登记** → 改它走全量）。
+
+### 18.9 下一刀（E29-2）
+
+标题栏 `BeginDragDropSource`（payload = 面板 id）→ 四格 `BeginDragDropTarget`
+→ 落下 `locatePanel` + `swapActive`；落点高亮画在 `ForegroundDrawList` 并
+`addOccluder()` 挡住分隔条。未决：视口能不能被搬走（建议允许换位、不允许并入
+别人的标签组）。
+
+---
+
+## 十九、E29-2 面板拖拽换位（10-27 ✅）
+
+**权威 → `docs/editor_docking_roadmap.md` §5**。用户需求：「各个功能面板应该是
+灵活可变的，且支持自由拖拽和合并区域的，就和 blender 中的差不多」。
+
+### 19.1 ⚠⚠ 为什么**不用** `ImGui::BeginDragDropSource`
+
+它是**挂在 item 上**的（要求 `g.LastItemData` 是刚提交的 item）。本工程的面板是
+普通顶层窗口，**标题栏是 ImGui 在 `Begin()` 内部画的，不是 item**。绕过去只有：
+① 在内容区塞一个盖住标题栏的 `InvisibleButton`（抢折叠/×/双击，还要掰 ClipRect）；
+② 铺一层全屏 overlay（抢整个编辑器输入）。两条都得不偿失。
+
+→ 改成**只读鼠标状态**（`IsMouseClicked / IsMouseDown / MousePos`）自建状态机，不提交
+任何 item。树内面板本来就 `NoMove`，所以 ImGui 那边不会同时拖窗口，没有"两个拖拽打架"。
+
+### 19.2 语义前提：**槽位矩形 = 面板矩形**（E29-1 送的）
+
+`LayoutRects` 的字段是**按面板槽位**写的（`SplitLayout::writePanel`），不是按格子。
+面板搬到别的格子后矩形自动跟着走 → **抓手/落点的命中直接用 `L.hierarchy / L.inspector / ...`，
+不需要知道树结构**；树只在**落下那一刻**用一次（`locatePanel`）。
+这一条想反了就会去写"格子矩形"那一套，然后发现和 LayoutRects 对不上。
+
+### 19.3 抓手高度：算，不要找窗口
+
+`titleH = FontSize + FramePadding.y * 2`。
+⚠ **不要**去取 `ImGuiWindow::TitleBarRect()`：那得先按名字找到每个面板窗口，而名字
+各不相同 —— Hierarchy/Inspector 是 `trId()` 的翻译结果、模式栏是 `###mode_rail`、
+视口是动态标题。槽位矩形本身就是窗口矩形，顶部这一段必然是标题栏。
+
+### 19.4 状态机三段（每段都有非它不可的理由）
+
+| 段 | 判定 | 少了它会怎样 |
+|---|---|---|
+| `armed` | 按下点落在标题栏 → 只记候选 | 一按下就进拖拽态 → 点标题栏（切模式 / 给焦点）变成拖拽 |
+| `active` | 位移 **> 6px** | 手抖 1px 也算拖 → 点击几乎不可用 |
+| 落下 | 松开时鼠标所在**整格** | 只认标题栏的话，"拖到目标格中间"落不下去（Blender 手感是整格） |
+
+其它两条：
+* **Esc 取消** —— 少了它，中途按 Esc 再松开会在松手处**照样**交换。
+* 落 = `swapActive`（**交换**，不是搬走）—— E29-3 之后"搬走"会让源格变空、
+  越拖越空；交换则格子数恒定。
+* `armed` 只在 `clicked` 那一帧判定：之后鼠标再移进标题栏**不再 arm**，
+  否则"从视口划出来经过标题栏"会凭空开始一次拖拽。
+
+### 19.5 `kSlotModes` 只能当落点，不能当抓手
+
+合成槽位（8 个模式参数面板共用一块）+ 顶部是 9 行模式单选。拖走"模式栏"没有语义，
+而误吞点击会让人以为"点模式没反应"。头文件里 `canDragSlot()` 就这一条例外。
+
+### 19.6 高亮：`ForegroundDrawList` + 主题圆角
+
+源格 accent 6% 填充 / 30% 描边；目标格 16% / 95% 2.5px；圆角 `ui::metrics().windowRounding`。
+必须画在前景层（和分隔条同一条理由：面板都是顶层窗口，普通 DrawList 压不住）。
+
+### 19.7 验收（`verify_layout_drag.py`，9 条）
+
+```
+A 自检 F 组 25 条（`MYVK_LAYOUT_TEST=1` 共 58 条）：命中面 / 阈值 / Esc / 落下 / 原地与空白
+B 真鼠标拖（PostMessage WM_LBUTTONDOWN → 14 步 WM_MOUSEMOVE → WM_LBUTTONUP）
+  modes=(0,70,454,716) hier=(1253,70,325,301) insp=(1253,371,325,415)
+→ modes=(1253,371,325,415) hier=(1253,70,325,301) insp=(0,70,454,716)
+  LAYOUT-DRAG from=inspector to=moderail     ← 两格**逐位互换**
+C 对照：同一位置按下再原地点开 → 无 LAYOUT-DRAG、矩形一位不变
+```
+
+⚠ **B 组必须存在**：F 组只能证明状态机对，证明不了"鼠标事件真的喂进去了"
+（`IsMouseClicked` 没接上 / 标题栏高度算错 / 坐标不是客户区坐标，都只在真窗口暴露）。
+⚠ B/C 的判据用**矩形互换**而不是"日志里出现 LAYOUT-DRAG"：后者在"换了又换回来"时也是绿的。
+
+### 19.8 本轮的诚实记录
+
+**一次通过，没有踩坑** —— 因为前面 19.1~19.5 这五条都是"先想反了会怎样"再写。
+唯一改动过的是把 `drag_hit_outside` 的坐标从面板内挪到菜单栏（`5,5`）：
+原写法在"点落在 hierarchy 矩形内"时永远命中，测不出边界。
+
+### 19.9 下一刀（E29-3 合并成标签组）
+
+见 `docs/editor_docking_roadmap.md` §6：格顶 22px 标签条（锚点 `LAYOUT-TAB-<slot>`）、
+面板矩形下移 22px（**最易让像素用例漂移的一步**）、拖到格中部 = `movePanel` 追加、
+拖到边缘 = `swapActive`（已实现）。未决：**视口不许并入标签组**（非活动标签不画 →
+3D 视口会消失），建议 E29-3 明确禁止。
+
+---
+
+## 二十、E29-3 一格多面板（标签组，10-27 ✅）
+
+**权威 → `docs/editor_docking_roadmap.md` §6**。需求：「支持自由拖拽和合并区域的，
+就和 blender 中的差不多」——这是最后一条没做的 UI 需求。
+
+### 20.1 ⚠⚠ 最反直觉的决定：标签条**画在标题行里**，矩形一个像素都不动
+
+原计划（写在路线文档里）是"格顶画 22px 标签条、面板矩形下移 22px"。真动手时否掉：
+
+* 下移 22px ⇒ **所有按 rect 点控件的用例集体漂移**（本仓最贵的一类回归），
+  而且标签条 + 窗口自己的标题栏 = **46px 双层 chrome**，比不合并更丑；
+* 标签条和标题栏本来就是**同一行东西**（都写在这格顶上）→ 直接
+  `ForegroundDrawList` 画几个圆角 pill 盖住标题文字，就是 Blender 的样子。
+
+⇒ 零漂移（`verify_layout_v4` 全 PASS 就是证据）。代价是标题栏原有的折叠/×
+被盖住 —— 树内面板本来 `NoCollapse`，× 在右侧留 26px 没盖。
+
+### 20.2 手势：中部 = 并入，边缘 = 交换
+
+| 落点 | 动作 |
+|---|---|
+| 目标格中部（四周各留 25% 边） | `movePanel` 追加成标签（源格被摘空 → 收成 0 宽） |
+| 目标格边缘 | `swapActive` 整格交换（E29-2 老行为） |
+
+⚠ 边距夹在 `[min(8px,40%), 40%]`：窄栏按纯 25% 算中部落点只剩 2px，对不准。
+⚠⚠ **中部落在"不能当标签"的格子上要退回交换**，不能静默无反应 —— 否则用户
+分不清"被拒绝"和"没接住"。E29-2 的老用例因此从"拖中部"改成"拖边缘"，
+**语义没变、机器一位没动**。
+
+### 20.3 ⚠⚠ 视口 / 模式栏**不能当标签成员**（`canBeTabMember`）
+
+非活动标签**不绘制** → 视口一旦被并进去，用户看到"3D 视口消失"，只会以为坏了。
+`canDragSlot` 与 `canBeTabMember` **刻意是两个函数**：**能拖 ≠ 能并**。
+视口仍可整格交换（拖到边缘），只是不能被合并。
+
+### 20.4 ⚠⚠ 单向门：双击标签 = 送回老家
+
+并入后**源格被收成 0 宽**（E06-5 既有机制）→ 鼠标再也点不到它。没有退路的话
+用户并一次就少一格，只能 Reset Layout。
+`homeCellOf(slot)` 给四个树内槽位各定一个"老家"，与 `buildDefault` 的四个叶子
+**一一对应**（改那边必须改这边）—— 一一对应是"送回去永远有地方放"的唯一理由。
+双击判 `ImGui::IsMouseDoubleClicked`，**两次 `WM_LBUTTONDOWN` 间隔必须 < 0.30s**，
+所以 `verify_layout_drag.py` 里双击单独一个函数（`drag()` 那些 0.15s sleep
+永远判不出双击），并且**重试 3 次**。
+
+### 20.5 ⚠⚠ `trId()` 返回 `"译文###stableId"`
+
+第一版直接把它当标签文字 → 画面上是 `Hierarchy###panel_hierarchy`，而
+**`CalcTextSize` 也按整串算宽**（两倍多）→ 第二枚标签被"放不下就截断"挤掉，
+**标签组里只剩第一个面板的标签**。数据层完全正常，只是"少画了一个"，
+极具误导性。修法：`tabVisibleLabel()` 在 `"##"` 处截断。`trLabel()` 也不适用
+（它保留 `##id` 后缀）。
+
+### 20.6 落盘：活动标签靠**顺序**记住
+
+`restoreGroups` 读盘一律 `activeIndex = 0`（要"顺序无关"，见 §18.2），所以
+"当前显示哪个标签"只能靠组成员顺序 → **写盘把活动面板写最前面**。
+不写的话重开编辑器永远显示第一个成员，用户以为"我选的标签没保存"。
+
+### 20.7 验收（`verify_layout_drag.py` 22 条 / 自检 97 条）
+
+```
+A 自检（阈值 >=90）：97 条全绿，其中 G 组 39 条
+D 真拖合并：
+  LAYOUT-MERGE from=hierarchy to=inspector size=2
+  hier=(1270,70,330,772)（整格） / insp=(0,0,0,0)（非活动不占矩形）
+  标签锚点 hier x=1369..1459 / insp x=1276..1365
+  LAYOUT-TABCLICK panel=inspector idx=0 → insp 可见、hier.w=0
+  LAYOUT-TABHOME panel=hierarchy -> 2/0 → 拆回 hier=(1270,70,330,324)
+                                          insp=(1270,394,330,448)
+B 交换（旧行为）：落模式栏中部 → 因为它不能当标签成员，退回交换
+```
+
+⚠ 自检 G 组里唯一"能证明端到端"的仍是**矩形**：`merge_inactive_rect_zero` /
+`merge_active_rect_is_whole_cell` / `detach_rects_both_visible`。只看
+`groupSize == 2` 证明不了"画面上真的并了"。
+
+### 20.8 本轮诚实记录
+
+一次通过（97/97 + 22/22）。唯一被打回来的是 **20.5 的 `###id`**，而且它是
+**D5 断言抓出来的**（"两个标签锚点都在" → `hier=False`）—— 当时第一反应是
+"logRect 去抖把第二枚吞了"，实际是宽度把第二枚挤掉了。
+教训：**"少画了一个"这类缺陷要靠"数量断言"抓，不要靠"有没有"断言**。
+
+## 二十一、2026-10-27 晚：清掉遗留红（5 条）＋一条产品行为变更
+
+起因：用户问"有没有遗留的未解决的 bug"。清单上的"N 条已知红"里，
+**只有 1 条是真 bug**，其余是记账债与夹具陈旧 —— 而这个区分本身才是重点。
+
+### 21.1 真 bug：浮层 Content 抽屉遮住右栏 → 材质拖放不可用
+
+现象：`verify_material_chips` / `verify_material_roundtrip` 三槽全不落地，
+日志里连一行 DROP 都没有，retry 三次仍 `(empty)`。
+
+取证（截图，`_venn_verify/probe_drag/1_armed.png`）：
+拖拽源**是好的**（预览窗 "drop on a Material texture slot to bind" 跟着
+鼠标走），但整块材质区在抽屉**后面**。几何：抽屉 `(0,786)-(1578,1106)`
+横跨整窗，材质槽 `metallic=(1473,1074)-(1501,1102)` 完全落在里面。
+→ 鼠标落点被抽屉吃掉，接收端 `IsItemHovered()` 永远 false。
+
+修法（`computeLayout` 的 `L.content`）：**浮层形态让出右栏**，右缘取
+`L.inspector.x`（Hierarchy 并进标签组时取 `L.hierarchy.x`）；右栏 < 160px
+时视同没有右栏、退回通栏。停靠形态不变（它是布局的一部分，谁也不遮）。
+
+⚠ 这条会连带影响三处期望，改的时候一起改（否则"修一处红三处"）：
+- `verify_bottom_bar` B2d 原来断言"抽屉横跨整窗" → 改成"右缘止于右栏左缘
+  （与视口右缘差 0~20px，中间是 12px 分隔条）"；新增 D2b 守"停靠后仍横跨
+  整窗"（**两个形态各守一条，别只守一个**）。
+- `verify_bottom_bar` D1 的基准从 `W-220` 改成 `抽屉右缘-220`。
+- `verify_content_three_pane` G2/G3（分隔线下沿被裁）自动跟随（它读的正是
+  `L.content`），实测仍绿。
+
+### 21.2 用例坑：`logRect` 是**逻辑坐标**，滚出可视区的控件仍报矩形
+
+材质槽 `roughness y=1111..1139` / `emissive y=1148..1176`，而 Inspector 底边
+= 底栏上沿 1106（窗口客户区 1164）→ 两行在面板**外面**（被 ImGui 裁掉），
+但 `logRect` 照样打它们的布局坐标。于是用例"有坐标 → 拖 → 没反应"，连
+"矩形缺失"这种明确错误都报不出来。
+
+修法：拖之前用 `wheel_at` 把目标滚进可视区（`verify_material_chips` 的
+`scroll_slot_into_view`；`verify_material_roundtrip` 有一份等价实现，因为它
+用的是 `verify_mesh_params.wait_rect` 而不是自带 LogTap 的接口），并加一条
+"滚不进来就明确 FAIL"的断言。
+
+⚠⚠ **同一个坑在目录树上又踩了一次**：`verify_content_three_pane` B2 与
+`verify_content_action_row` F0 都点 `CB-TREE-NODE scenes` —— 那是树的最后
+一个节点，1600x900 时压在最底下，点击等于点在底栏上。两条用例因此长期红。
+修法同上（`verify_asset_drag.wheel_at` + 各自滚到自己那块容器里）。
+
+### 21.3 夹具陈旧：`verify_viewport` 的 V1d / V3（#317 关掉）
+
+三处都钉在"某个历史时刻的像素坐标"上，布局一改就全错位，而且**报的话与
+真因无关**（"VP_INNER 不在视口里"，真因是左栏 300→460）：
+- `CONVERGED_VP` 还是 `(305,145,1241,778)` → 永远不收敛（每次启动 WARN）。
+  实测新值 **`(463,139,1241,778)`**。
+- `VP_INNER=(330,200,1200,750)` 绝对坐标 → 改成 `vp_inner(VP-RECT)` 相对
+  推导（内缩 25/55/41/28）。顺带把 `V1d` 拆成两条真断言：视口宽≥600 高≥400
+  ＋左边界压在屏幕上一根真实分隔线上（±8px）——后者能抓"改分栏没同步日志"。
+- `tools/vp_nohud_baseline.png` 是 **E14 浅色主题**截图 → 按当前默认布局＋
+  默认主题**重抓**；`BASE_VP_TOP` 184 → **139**。
+  ⚠ 旧骨架第三条 `1574` **不是面板分隔线**，是浅色主题下才看得见的窗口右
+  边框；深色档下检测不到，所以"少一条"不是布局回退。
+结果：42 项全 PASS。
+
+### 21.4 记账债：i18n 102 条 / 特性面 21 条
+
+i18n（`verify_i18n_coverage`）：A1=5 A2=0 B=1 B2=95 D=2 E=1。全是 10-26/27
+新面板（Prefab / 弹簧骨 / 双骨 IK / 注视 / 挂点 / 对话 / 多选 / 卡通材质
+tooltip）—— `TR()` 包了但词典没条目，中文界面静默显示英文。补 102 条
+（20 条多行 tooltip，占位符逐个对过），词典 2229 → **2331**。
+⚠ 两条**不该翻**（进 `FMT_KEEP`）：`LAYOUT-TAB-%s`（E29-3 的 logRect 锚点）、
+`PREFS-THEMECHIP-%d`（色卡按钮的 widget ID）—— 翻了脚本抓不到、按钮状态丢。
+`pos 0.00` / `pos %.2f` 是字段名，包 `TR()` 但译文与英文**逐字相同**。
+
+特性面（`check_feature_surface`）：21 条裸 env = 14 条测试/自检/日志探针
+（进 `ALLOW_EXACT`，逐条写理由）+ 6 条描边参数（新增 `id="outline"` 特性项，
+ui token 用参数 id 前缀 `outline.` —— `_collect_editor_sources()` 把
+FeatureRegistry.cpp 也拼进去了）+ 1 条 **`MYVK_X`**：它在 `RunMode.h` 的
+**注释**里当例子，扫描是纯正则、不认注释 → 改写成 `MYVK_<NAME>`。
+结果：裸 env 0 / 特性 37 个全有 UI 面。剩 25 条 `*_DBG` 只是 WARN。
+
+### 21.5 判据（写进 MEMORY 的就是这三条）
+
+1. **"闸门红了" ≠ "真的漏"**：先数条目属于哪类（真漏 / 记账没记 / 夹具
+   陈旧）。三类的修法完全不同，混在一起会按最贵的那类排期。
+2. **"期望值过时"和"实现回退"在日志里长得一样**：都要先问"这个量靠什么
+   成立"。凡是钉在绝对像素坐标上的断言，布局一改就该跟着改夹具。
+3. **拖放类用例的两个隐形前提**：目标必须在可视区内（`logRect` 证明不了
+   这点），且源与目标之间不能被更高层的窗口盖住（浮层通栏尤其危险）。
+
+### 21.6 本轮实测（可复现）
+
+```
+check_feature_surface.py      结果: PASS（37 特性 / 裸 env 0）        原 FAIL 21
+verify_i18n_coverage.py       结果: PASS（0 项缺中文，词典 2331）     原 FAIL 104
+verify_viewport.py            结果: PASS（42 项）                     原 FAIL 2
+verify_material_chips.py      RESULT: PASS（三槽 + 着色器生效）        原 FAIL 10
+verify_material_roundtrip.py  RESULT: PASS（存盘/读盘闭环）            原 FAIL 14
+verify_bottom_bar.py          结果: PASS（B2d/D1/D2b 已按新语义）      原 PASS→改动后回归
+verify_content_three_pane.py  结果: PASS（树节点先滚进可视区）          原 FAIL 2
+verify_content_action_row.py  全部 PASS                               原 FAIL 4
+verify_terrain_editor.py      （见今日流水）
+```

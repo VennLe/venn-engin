@@ -278,6 +278,20 @@ public:
 
     ecs::Entity find(const std::string& name);
 
+    // ---- 把一个"曾经指向某实体"的引用接回当前世界（G16-4）----
+    //
+    // 需要它的场合：撤销 / 进 Play 再 Stop / 重新加载 —— 世界被整场重建，
+    // 旧句柄全失效，而调用方还记着"我刚才选的是谁"。
+    //
+    // **guid 优先，名字兜底**。顺序不能反：
+    //   * 名字找的是"第一个同名的"，场景里有两个 `Crate` 时会跳到**另一个** ——
+    //     这是 H5 的现网 bug（撤销一次就选错），而它看起来完全正常。
+    //   * guid 是随机 64 位，重建后仍然唯一（只要快照里存了 guid）。
+    //   * 老场景 / 手写文件没有 guid → 退化成名字，保持旧行为（不变得更糟）。
+    //
+    // guid == kInvalidGuid 且 name 为空 → 返回 Entity{}（没有线索，接不回来）。
+    ecs::Entity reconnectByGuidOrName(ecs::EntityGuid guid, const std::string& name);
+
     // 清空场景（含方向光实体句柄的重置）
     // 注意：只清 ECS 世界，不动 AssetManager 里的网格/材质缓存
     void clear();

@@ -166,6 +166,90 @@ glm::vec3 eulerXYZFromMatrix(const glm::mat3& m) {
 
 // ---------------------------------------------------------------- 建世界
 
+// ---------------------------------------------------------------- 关节（J5）
+//
+// 场景里的 `JointComponent` → 物理世界的 `Joint`。**必须在所有刚体建完
+// 之后**调用：两端都要求已经在 `binding.entityToBody` 里。
+// 翻译是"作者侧 → 求解器侧"的逐字段搬运：kind 一一对应，锚点/轴本来就
+// 是局部空间（`physics::Joint` 也吃局部量），distance / 限位 / 马达照抄。
+//
+// 失败路径一律**打 WARN 再跳过**，绝不静默也绝不抛：
+//   · target == 0             —— 还没选另一端（新加的组件就是这状态）
+//   · guid 在本场景找不到     —— 被删了 / 从别的场景拷过来的
+//   · 任一端没有刚体          —— 常见是"只加了关节忘了加刚体"
+// 静默跳过最恶劣：用户看到"关节配好了、物体却纹丝不动"，无从下手。
+//
+// ⚠ 抽成独立函数是为了**运行时单独重建**（J5-4 脚本改关节 / 运行时改
+//   kind）：`buildSceneWorld` 会连刚体一起重建，物体的位置与速度全丢
+//   —— "改一个关节把整局撞回原点"没人能接受。
+//
+// 参数是 `world` + `map` 而不是整个 `SceneBinding`：编辑器侧的刚体映射住在
+// `EditorApp::m_physicsEntityToBody`（不是 SceneBinding），要让编辑器在 Play
+// 中途也能调 `rebuildJoints` 就得能只凭这两样工作。`SceneBinding` 那条重载
+// 内部转发到这里。
+static std::size_t buildJoints(
+    scene::Scene& scene, PhysicsWorld& world,
+    const std::unordered_map<ecs::EntityId, BodyId>& entityToBody,
+    bool logSkips) {
+    ecs::World& w = scene.world();
+    int jointsBuilt = 0;
+    int jointsSkipped = 0;
+
+    w.each<ecs::JointComponent>([&](ecs::Entity e, ecs::JointComponent& jc) {
+        if (!jc.enabled) return;   // 故意关掉的，不算 skip
+        if (jc.target == ecs::kInvalidGuid) {
+            if (logSkips)
+                VK_LOG_WARN("PHYS-JOINT skip entity=%u reason=no-target", e.id);
+            ++jointsSkipped;
+            return;
+        }
+        const ecs::Entity target = w.find(jc.target);
+        if (!target.valid()) {
+            if (logSkips)
+                VK_LOG_WARN(
+                    "PHYS-JOINT skip entity=%u reason=target-missing guid=0x%s",
+                    e.id, ecs::guidToHex(jc.target).c_str());
+            ++jointsSkipped;
+            return;
+        }
+        const auto itA = entityToBody.find(e.id);
+        const auto itB = entityToBody.find(target.id);
+        if (itA == entityToBody.end() || itB == entityToBody.end()) {
+            if (logSkips)
+                VK_LOG_WARN(
+                    "PHYS-JOINT skip entity=%u target=%u reason=no-rigid-body"
+                    " hasA=%d hasB=%d",
+                    e.id, target.id, itA != entityToBody.end() ? 1 : 0,
+                    itB != entityToBody.end() ? 1 : 0);
+            ++jointsSkipped;
+            return;
+        }
+        Joint j;
+        j.type = static_cast<JointType>(static_cast<int>(jc.kind));
+        j.bodyA = itA->second;
+        j.bodyB = itB->second;
+        j.localAnchorA = jc.anchorSelf;
+        j.localAnchorB = jc.anchorTarget;
+        j.localAxisA = jc.axis;
+        j.distance = jc.distance;
+        j.useLimit = jc.useLimit;
+        j.lowerLimit = jc.lowerLimit;
+        j.upperLimit = jc.upperLimit;
+        j.useMotor = jc.useMotor;
+        j.motorSpeed = jc.motorSpeed;
+        j.maxMotorForce = jc.maxMotorForce;
+        world.addJoint(j);
+        ++jointsBuilt;
+        VK_LOG_INFO("PHYS-JOINT built a=%u b=%u kind=%d limit=%d motor=%d",
+                    e.id, target.id, static_cast<int>(jc.kind),
+                    jc.useLimit ? 1 : 0, jc.useMotor ? 1 : 0);
+    });
+    if (logSkips && jointsSkipped > 0) {
+        VK_LOG_WARN("PHYS-JOINT skipped=%d（上面每一条都有原因）", jointsSkipped);
+    }
+    return static_cast<std::size_t>(jointsBuilt);
+}
+
 SceneBinding buildSceneWorld(scene::Scene& scene, const SceneBuildOptions& opts) {
     SceneBinding out;
 
@@ -347,10 +431,41 @@ SceneBinding buildSceneWorld(scene::Scene& scene, const SceneBuildOptions& opts)
 
     out.bodies = built + (out.ground ? 1 : 0);
     out.world = std::move(world);
+    // 关节必须在**刚体全部建完之后**翻译（它靠 entityToBody 找两端），
+    // 而且要在 out.world 交出去之后 —— buildJoints 直接往世界里加。
+    out.joints = static_cast<int>(
+        buildJoints(scene, *out.world, out.entityToBody, /*logSkips=*/true));
+
     // 地形接进物理（第十轮）：没有它，刚体和角色都只认 z=0 的无限地面，
     // 于是"新工程一进去，玩家埋在地面下 3 米"。
     attachTerrain(scene, out);
     return out;
+}
+
+// 只重建**关节**，不动刚体。运行时改关节（脚本 J5-4 / 运行时 Inspector）
+// 之后调它 —— 理由见 buildJoints 上面那段。
+//
+// ⚠ 先 `joints().clear()` 而不是"逐条替换"：作者侧删掉一条关节之后，
+//   求解器里那条旧记录没有任何字段能指向它（Joint 不存实体 id，只有
+//   bodyA/bodyB 下标）—— 按内容匹配会在"同一对刚体上有两条关节"时错删。
+//   全清再重建是这个数据结构下唯一不会错的做法，代价只是几十条记录的搬运。
+std::size_t rebuildJoints(scene::Scene& scene, SceneBinding& binding) {
+    if (!binding.world) return 0;
+    binding.world->joints().clear();
+    const std::size_t built =
+        buildJoints(scene, *binding.world, binding.entityToBody,
+                    /*logSkips=*/true);
+    binding.joints = static_cast<int>(built);
+    return built;
+}
+
+// 同上，但映射由调用方直接给（编辑器：`EditorApp::m_physicsEntityToBody`）。
+// 语义**逐字相同** —— 两条重载走的是同一个 `buildJoints`，不会漂移。
+std::size_t rebuildJoints(
+    scene::Scene& scene, PhysicsWorld& world,
+    const std::unordered_map<ecs::EntityId, BodyId>& entityToBody) {
+    world.joints().clear();
+    return buildJoints(scene, world, entityToBody, /*logSkips=*/true);
 }
 
 // ---------------------------------------------------------------- 运动学同步

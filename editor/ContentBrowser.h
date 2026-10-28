@@ -55,6 +55,12 @@ public:
     std::size_t entryCount();
     const std::string& currentRel() const { return m_rel; }
 
+    // 从别处（File ▸ Import 菜单）触发**同一条**导入通道。
+    // 只置位、不开窗：对话框必须等本帧 ImGui 数据提交完再弹（见 .cpp 里
+    // "导入对话框放在最后"那段注释）。⚠ 调用方有责任保证本面板这一帧
+    // 会被 draw —— 被收进底栏托盘时 draw 不跑，置位会一直挂着。
+    void requestImportFileDialog();
+
 private:
     struct DirEntry {
         std::string name;

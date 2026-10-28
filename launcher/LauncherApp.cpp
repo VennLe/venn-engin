@@ -11,12 +11,15 @@
 #include "i18n/I18n.h"
 #include "render/QualityPresets.h"
 #include "ui/DebugRects.h"
+#include "ui/ImGuiTheme.h"
+#include "ui/UiChrome.h"
 
 #include <backends/imgui_impl_vulkan.h>
 #include <imgui.h>
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -41,15 +44,22 @@ namespace {
 
 using project::GameType;
 
-// ---- 尺寸（路线图 §5.1；2026-10-20 按用户要求定为 1080×720，最小 900×560）----
-// 1080×720 是 16:9，与类型卡片里的 16:9 插图同比例 —— 窗口整体看起来
-// 就是"一张图 + 一条边"，不会像 1280×800（16:10）那样上下留白。
-// 卡片宽度是自适应的（见 createWizard 里的 cardW 计算），改这里不用动布局。
-constexpr int kWindowW = 1080;
-constexpr int kWindowH = 720;
-constexpr float kHeaderH = 54.0f;
-constexpr float kFooterH = 56.0f;
-constexpr float kLeftW = 330.0f;
+// ---- 尺寸 ----
+// 2026-10-27 用户第 1 条：「启动器部分窗口大小可以大一些，宽高调大一些」。
+// 1080×720 → **1400×880**（仍保持 16:9 附近的观感，但左右两栏都宽得多，
+// 最近列表能一眼看到 8 条以上，右侧详情不再挤成一坨）。
+//
+// ⚠ 不能无脑写死：这块屏如果是 1366×768 的笔记本，1400×880 会有一半在
+//   屏幕外。所以 onInit 里按**工作区**夹一次（见 kWinWPct / kWinHPct），
+//   夹完仍然居中。用例靠锚点算点击位置，窗口多大都不影响。
+constexpr int kWindowW = 1400;
+constexpr int kWindowH = 880;
+// 工作区占比上限（夹窗口用）。0.94 / 0.90 留出任务栏与标题栏的空间。
+constexpr float kWinWPct = 0.94f;
+constexpr float kWinHPct = 0.90f;
+constexpr float kHeaderH = 76.0f;
+constexpr float kFooterH = 64.0f;
+constexpr float kLeftW = 380.0f;
 
 constexpr float kToastSeconds = 6.0f;
 
@@ -251,8 +261,19 @@ void LauncherApp::onInit() {
     //   两栏宽度全错。所以这里只做居中，不读任何存档。
     int wx = 0, wy = 0, ww = 0, wh = 0;
     if (window().primaryMonitorWorkArea(&wx, &wy, &ww, &wh)) {
-        const int cx = wx + (ww - kWindowW) / 2;
-        const int cy = wy + (wh - kWindowH) / 2;
+        // 大窗口优先，但**永远不超过工作区**（笔记本 1366×768 上 1400×880
+        // 会有一半跑到屏幕外）。夹完再居中 —— 顺序不能反：先居中再缩，
+        // 窗口会从中心往右下缩，看起来像"跑到右边去了"。
+        const int winW = std::min(kWindowW, static_cast<int>(ww * kWinWPct));
+        const int winH = std::min(kWindowH, static_cast<int>(wh * kWinHPct));
+        if (winW > 640 && winH > 480 &&
+            (winW != kWindowW || winH != kWindowH)) {
+            window().setWindowSize(winW, winH);
+            VK_LOG_INFO("LAUNCHER-WINSIZE clamp=%dx%d (want %dx%d work=%dx%d)",
+                        winW, winH, kWindowW, kWindowH, ww, wh);
+        }
+        const int cx = wx + (ww - winW) / 2;
+        const int cy = wy + (wh - winH) / 2;
         window().setWindowPos(cx, cy);
     }
 
@@ -665,10 +686,23 @@ void LauncherApp::onImGui() {
 }
 
 void LauncherApp::drawHeader() {
+    // 顶栏做成一条"高光带"（左深右亮的水平渐变 + 底部一条亮线）。
+    // 子窗口自己不再画底色（PushStyleColor ChildBg 透明），让渐变透出来 ——
+    // 否则 ImGui 会先铺一块纯色，渐变只能盖在上面、圆角处露边。
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##header", ImVec2(0, kHeaderH - 8), false);
-    ImGui::SetCursorPosY(10);
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetWindowPos();
+        const ImVec2 sz = ImGui::GetWindowSize();
+        ui::headerBand(dl, p0, ImVec2(p0.x + sz.x, p0.y + sz.y),
+                       ui::tokens().radiusLg);
+    }
+    ImGui::SetCursorPosY(16);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10, 6));
+    ImGui::SetWindowFontScale(1.30f);
     ImGui::TextUnformatted("Venn Engine");
+    ImGui::SetWindowFontScale(1.0f);
     ImGui::SameLine();
     ImGui::TextDisabled("%s", core::kVennVersion);
 
@@ -688,9 +722,9 @@ void LauncherApp::drawHeader() {
     }
     ImGui::PopStyleVar();
     ImGui::EndChild();
+    ImGui::PopStyleColor();
     // 锚点：整条 header 的矩形（脚本可据此判断"窗口起来了且画到了 UI"）。
     anchor("LAUNCH-RECT-header");
-    ImGui::Separator();
 }
 
 void LauncherApp::drawIdle() {
@@ -798,10 +832,13 @@ void LauncherApp::drawDetailColumn() {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    if (ImGui::Button(TR("Open editor"), ImVec2(170, 36))) openSelected();
+    // 主 CTA 用药丸按钮（大圆角 + 渐变 + 悬停发亮）—— 用户第 5 条要的
+    // "按钮形状"就是它。尺寸与原来的 ImGui::Button 完全一致，锚点不动。
+    if (ui::pillButton("openEditor", TR("Open editor"), ImVec2(170, 36), 1))
+        openSelected();
     anchor("LAUNCH-BTN-openEditor");
     ImGui::SameLine();
-    if (ImGui::Button(TR("Run game"), ImVec2(170, 36))) {
+    if (ui::pillButton("runGame", TR("Run game"), ImVec2(170, 36), 0)) {
         if (m_detailOk) requestSpawn(SpawnKind::Game, m_detail.root);
         else toast(TR("This project cannot be opened."), true);
     }
@@ -832,7 +869,8 @@ void LauncherApp::drawFooter() {
     ImGui::BeginChild("##footer", ImVec2(0, kFooterH - 12), false);
 
     if (m_page == Page::Idle) {
-        if (ImGui::Button(TR("+ New game"), ImVec2(180, 34))) beginWizard();
+        if (ui::pillButton("newGame", TR("+ New game"), ImVec2(180, 34), 1))
+            beginWizard();
         anchor("LAUNCH-BTN-new");
     } else if (m_page == Page::Done) {
         if (ImGui::Button(TR("Open editor"), ImVec2(170, 34))) {

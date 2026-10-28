@@ -13,6 +13,8 @@
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
 
+#include "ui/ImGuiTheme.h"
+
 #include <imgui.h>
 #include <backends/imgui_impl_vulkan.h>
 
@@ -1292,6 +1294,11 @@ void ContentBrowser::importFiles() {
     VK_LOG_INFO("CB-IMPORT request dir=%s", m_rel.c_str());
 }
 
+void ContentBrowser::requestImportFileDialog() {
+    m_importRequest = true;
+    VK_LOG_INFO("CB-IMPORT request source=menu dir=%s", m_rel.c_str());
+}
+
 void ContentBrowser::openImportDialog() {
 #ifdef _WIN32
     // 自动化脚本点不了系统对话框 —— 给它一个"只走流程、不开窗"的开关。
@@ -2152,7 +2159,7 @@ void ContentBrowser::drawDeleteConfirm() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.62f, 0.24f, 0.22f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ui::tokens().error);
     if (ImGui::Button(TR("Delete"), ImVec2(120.0f, 0.0f))) {
         doDelete();
         ImGui::CloseCurrentPopup();

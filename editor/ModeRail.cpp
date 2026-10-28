@@ -34,13 +34,30 @@ constexpr float kRowH = 28.0f;
 // 字号一变两边就对不上。
 constexpr float kRowGap = 3.0f;
 
+// 折叠态（2026-10-28）。为什么用文件级静态而不是参数：
+// `modeRailListHeight()` / `modeRailListRect()` / `modeRailBodyRect()` 是
+// 三个**没有 EditorContext 参数**的几何函数（头文件里那份签名被
+// ToolkitEditors 与 EditorApp 一起用），加一个 bool 参数要改一整串调用点，
+// 而它们全在同一帧里被问同一个问题。
+//
+// ⚠ 写入时机固定成两处：`drawModeRail()` 开头（读 ctx）与
+//   `beginModeRailPanel()` 开头（读 ctx）。两处都在**用几何之前**，所以
+//   不存在"读到上一帧的值"——除非有人新加一个更早的调用点，那种情况会
+//   表现为"折叠后参数面板晚一帧才长大"，肉眼看不出来，不影响功能。
+bool g_modeRailCollapsed = false;
+
 } // namespace
 
 float modeRailListHeight() {
     const ImGuiStyle& st = ImGui::GetStyle();
-    const float rows = static_cast<float>(kEditModeCount) * (kRowH + kRowGap);
     // 表头：一行文字 + 一点间距（+ 下面那条线画在光标处，不额外占高度）
     const float header = ImGui::GetTextLineHeight() + st.ItemSpacing.y + 4.0f;
+    // 折叠态：只剩表头那一行（2026-10-28）。参数面板因此多拿 ~310px ——
+    // Landscape 的 8 个工具按钮 + 4 条滑条一屏放不下，用户报的就是"太挤"。
+    if (g_modeRailCollapsed) {
+        return header + st.WindowPadding.y * 2.0f;
+    }
+    const float rows = static_cast<float>(kEditModeCount) * (kRowH + kRowGap);
     return header + rows + st.WindowPadding.y * 2.0f;
 }
 
@@ -56,6 +73,7 @@ Rect modeRailBodyRect(const LayoutRects& L) {
 }
 
 bool beginModeRailPanel(EditorContext& ctx, ImGuiWindowFlags& flags) {
+    g_modeRailCollapsed = ctx.modeRailCollapsed();
     const Rect body = modeRailBodyRect(ctx.layout());
     if (body.w < 80.0f || body.h < 80.0f) return false;
     ImGui::SetNextWindowPos(ImVec2(body.x, body.y), ImGuiCond_Always);
@@ -71,6 +89,7 @@ bool beginModeRailPanel(EditorContext& ctx, ImGuiWindowFlags& flags) {
 }
 
 void drawModeRail(EditorContext& ctx) {
+    g_modeRailCollapsed = ctx.modeRailCollapsed();
     const LayoutRects& L = ctx.layout();
     const Rect R = modeRailListRect(L);
     if (R.w < 8.0f || R.h < 8.0f) return;
@@ -96,24 +115,76 @@ void drawModeRail(EditorContext& ctx) {
             ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
                    ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
 
-    // ---- 表头 ----
+    // ---- 表头：折叠箭头 + 标题（+ 展开时的提示 / 折叠时的当前模式名）----
+    //
+    // 2026-10-28：加这个箭头是因为**纵向空间不够**。9 行列表吃掉 ~310px，
+    // 1600×900 下参数面板只剩 ~290px —— Landscape 那 8 个工具按钮 + 4 条
+    // 滑条一屏放不下，用户报的"过于紧凑"有一半是这里来的。折叠后列表只剩
+    // 表头一行，参数面板直接多拿 310px。
     {
         const ui::ThemeTokens& tk = ui::tokens();
-        ImVec4 c = tk.textDim;
-        ImGui::PushStyleColor(ImGuiCol_Text, c);
+        const float lh = ImGui::GetTextLineHeight();
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+
+        ImGui::PushID("##rail_fold");
+        const bool hitFold = ImGui::InvisibleButton("fold", ImVec2(lh, lh));
+        ImGui::PopID();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 c(p.x + lh * 0.5f, p.y + lh * 0.5f);
+        const ImU32 acol = ImGui::GetColorU32(
+            hitFold ? tk.accent : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+        // 三角：展开时朝下，折叠时朝右（"点我展开列表"）
+        if (g_modeRailCollapsed) {
+            dl->AddTriangleFilled(ImVec2(c.x - 2.5f, c.y - 4.0f),
+                                  ImVec2(c.x - 2.5f, c.y + 4.0f),
+                                  ImVec2(c.x + 3.5f, c.y), acol);
+        } else {
+            dl->AddTriangleFilled(ImVec2(c.x - 4.0f, c.y - 2.5f),
+                                  ImVec2(c.x + 4.0f, c.y - 2.5f),
+                                  ImVec2(c.x, c.y + 3.5f), acol);
+        }
+        logRect("MODE-RAIL-FOLD", p, ImVec2(p.x + lh, p.y + lh));
+        if (hitFold) {
+            ctx.modeRailCollapsedRef() = !g_modeRailCollapsed;
+            g_modeRailCollapsed = ctx.modeRailCollapsed();
+            VK_LOG_INFO("MODE-RAIL fold=%d", g_modeRailCollapsed ? 1 : 0);
+        }
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, tk.textDim);
         ImGui::TextUnformatted(TR("Modes"));
         ImGui::PopStyleColor();
-        ImGui::SameLine(ImGui::GetWindowWidth() - 92.0f);
-        ImGui::PushStyleColor(ImGuiCol_Text, tk.textFaint);
-        ImGui::TextUnformatted(TR("click to switch"));
-        ImGui::PopStyleColor();
+
+        // ⚠ 这两段都必须先看宽度：左栏现在能被拖到 300，`SameLine(w-92)`
+        //   在窄栏里会变成负数（ImGui 会夹到 0，于是提示压在标题上）。
+        const float right = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
+        if (g_modeRailCollapsed) {
+            const float nameX = ImGui::GetCursorPosX() + 10.0f;
+            if (nameX < right - 60.0f) {
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, tk.textFaint);
+                ImGui::TextUnformatted(TR(editModeName(ctx.editMode())));
+                ImGui::PopStyleColor();
+            }
+        } else if (right > 190.0f) {
+            ImGui::SameLine(right - 92.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, tk.textFaint);
+            ImGui::TextUnformatted(TR("click to switch"));
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::NewLine();
+        }
         // 表头下面一条细线：把"列表"和"参数区"划开（参数区是另一个窗口，
         // 那条线正好落在两个窗口的接缝上）
-        ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         dl->AddLine(ImVec2(R.x, p0.y + 1.0f), ImVec2(R.x + R.w, p0.y + 1.0f),
                     ImGui::GetColorU32(ImGuiCol_Separator), 1.0f);
         ImGui::Dummy(ImVec2(0.0f, 2.0f));
+    }
+
+    // 折叠态：列表不画，参数面板从表头下面开始（modeRailBodyRect 已经算好了）
+    if (g_modeRailCollapsed) {
+        ImGui::End();
+        return;
     }
 
     // ---- 9 行单选 ----

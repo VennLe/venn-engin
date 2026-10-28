@@ -1,6 +1,7 @@
 #include "RuntimeConfig.h"
 
 #include "assets/AssetPath.h"
+#include "core/Build.h"
 #include "core/Logger.h"
 
 #include <nlohmann/json.hpp>
@@ -214,8 +215,27 @@ void applyEnv(RuntimeConfig& cfg) {
         cfg.audio.enabled = true;
     cfg.audio.retryOnFailure =
         envFlag("MYVK_RUNTIME_AUDIO_RETRY", cfg.audio.retryOnFailure);
+
+    // ------------------------------------------------------------
+    // 开发钩子（G30）：shipping 版**不读**这些环境变量。
+    // ------------------------------------------------------------
+    // 为什么要 `#if`（编译期）而不是 `if (kShipping)`（运行期）：
+    //   ① 变量名本身就是信息 —— 出货二进制里不该出现
+    //      `MYVK_RUNTIME_SELFTEST` 这种字符串（判据按字节比对）；
+    //   ② 运行期判断还得把"我忽略了"这件事写进日志，而那句话又把名字
+    //      带回了二进制 —— 绕一圈等于没做。
+    // 所以出货版里这些开关**连名字都不存在**，设了它们跟没设一样，
+    // 表现为"游戏照常跑"（而不是报错），这正是玩家该看到的。
+#if VENN_SHIPPING
+    // 保留 `MYVK_FRAMES`（下方）：它只是"跑满 N 帧退出"，是自动化收尾
+    // 用的，不是玩家能拿来作弊的面；去掉它只会让出货版的用例只能靠
+    // 超时 kill 收场（日志尾巴丢掉、退出码没意义）。
+#else
     cfg.selftest = envStr("MYVK_RUNTIME_SELFTEST", cfg.selftest);
     cfg.dumpScenePath = envStr("MYVK_RUNTIME_DUMP_SCENE", cfg.dumpScenePath);
+    cfg.traceStates = envFlag("MYVK_RUNTIME_TRACE_STATES", cfg.traceStates);
+#endif
+
     cfg.inputMapPath = envStr("MYVK_RUNTIME_INPUT_MAP", cfg.inputMapPath);
     cfg.startState = envStr("MYVK_RUNTIME_START_STATE", cfg.startState);
     // 玩家外观：自动化只有一个"换成这个模型"的诉求，所以只开两个口子
@@ -225,7 +245,6 @@ void applyEnv(RuntimeConfig& cfg) {
     // 状态机控制器：自动化要能"换成这个控制器跑一遍"（与换模型同一个诉求）。
     cfg.player.controller =
         envStr("MYVK_RUNTIME_CONTROLLER", cfg.player.controller);
-    cfg.traceStates = envFlag("MYVK_RUNTIME_TRACE_STATES", cfg.traceStates);
     // `MYVK_RUNTIME=1`：运行时 verbose（每 60 帧一行 GAME-LOOP）。
     // 这个**裸**名字是 ship_roadmap 里写定的，所以保留（白名单里已登记）。
     cfg.verbose = envFlag("MYVK_RUNTIME", cfg.verbose);
@@ -293,10 +312,15 @@ void applyCli(RuntimeConfig& cfg, const std::vector<std::string>& args) {
             std::string v;
             takeValue("--time-scale", v);
             if (!v.empty()) cfg.timeScale = static_cast<float>(std::atof(v.c_str()));
+        // G30：`--selftest` / `--dump-scene` 是开发钩子 —— shipping 版里
+        // **整条分支都不存在**（连参数名这个字符串都不进二进制）。设了它们
+        // = 未识别参数 = 照常启动游戏。判据见 tools/verify_shipping.py。
+#if !VENN_SHIPPING
         } else if (matchKey(a, "--selftest", val, inlineSet)) {
             takeValue("--selftest", cfg.selftest);
         } else if (matchKey(a, "--dump-scene", val, inlineSet)) {
             takeValue("--dump-scene", cfg.dumpScenePath);
+#endif
         } else if (matchKey(a, "--input-map", val, inlineSet)) {
             takeValue("--input-map", cfg.inputMapPath);
         } else if (matchKey(a, "--language", val, inlineSet)) {
@@ -409,39 +433,54 @@ RuntimeConfig parseRuntimeConfig(const std::vector<std::string>& args) {
 }
 
 const char* runtimeHelpText() {
-    return
-        "Venn Game (VennRuntime)\n"
-        "\n"
-        "用法: Game.exe [选项]\n"
-        "\n"
-        "  --scene <path>        起始场景（相对资产根，或绝对路径）\n"
-        "  --width  <n>          窗口宽（默认 1280）\n"
-        "  --height <n>          窗口高（默认 720）\n"
-        "  --fullscreen | --windowed\n"
-        "  --fps <n>             帧率上限，0 = 不限（默认 60）\n"
-        "  --unlocked            等价于 --fps 0\n"
-        "  --frames <n>          跑满 n 帧后退出（冒烟测试）\n"
-        "  --time-scale <f>      时间缩放（0 = 停住，1 = 正常）\n"
-        "  --language <en|zh>    界面语言\n"
-        "  --ui-doc <path>       UI 文档（.ui.json）；不给 = 不画界面层\n"
-        "  --start-state <s>     boot | mainmenu | playing（默认 playing）\n"
-        "  --verbose             每 60 帧打一行 GAME-LOOP\n"
-        "  --trace-states        每次状态迁移打一行 GAME-STATE\n"
-        "  --selftest <name>     无窗口自检后退出: states | determinism | input |\n"
-        "                        character | contact | camera | player |\n"
-        "                        springarm | hud | audio |\n"
-        "                        material | lod | terrain | script | scriptbench |\n"
-        "                        project（工程数据模型）| audio-config（只打印音频配置）\n"
-        "  --audio <on|off>      开 / 关声音（= MYVK_RUNTIME_AUDIO）\n"
-        "  --audio-device <name> 设备名子串；__none__ = 显式无设备（不回落）\n"
-        "  --audio-null          强制 NullBackend（链路通但不发声）\n"
-        "  --mute                输出静音（声部照常跑，不是停播）\n"
-        "  --dump-scene <path>   把读进来的场景再写一份（读→写往返自检）\n"
-        "  --input-map <path>    键位绑定表（默认 assets/input_map.json）\n"
-        "  --help                显示这段文字\n"
-        "\n"
-        "配置优先级: 命令行 > 环境变量(MYVK_RUNTIME_*) > assets/game.json > 默认\n"
-        "日志落在 %LOCALAPPDATA%/Venn/<game>/logs/，不写安装目录。\n";
+    // ⚠ 拼成一个 std::string 而不是一个大字面量：开发钩子那几行要在
+    //   shipping 里**整段消失**（`--help` 的输出也是判据之一）。复制一份
+    //   完整文本到 `#else` 里必然与前一份漂，所以只切开发那几行。
+    static const std::string text = [] {
+        std::string s =
+            "Venn Game (VennRuntime)\n"
+            "构建: ";
+        s += core::buildStamp();
+        s += "\n"
+             "\n"
+             "用法: Game.exe [选项]\n"
+             "\n"
+             "  --scene <path>        起始场景（相对资产根，或绝对路径）\n"
+             "  --width  <n>          窗口宽（默认 1280）\n"
+             "  --height <n>          窗口高（默认 720）\n"
+             "  --fullscreen | --windowed\n"
+             "  --fps <n>             帧率上限，0 = 不限（默认 60）\n"
+             "  --unlocked            等价于 --fps 0\n"
+             "  --frames <n>          跑满 n 帧后退出（冒烟测试）\n"
+             "  --time-scale <f>      时间缩放（0 = 停住，1 = 正常）\n"
+             "  --language <en|zh>    界面语言\n"
+             "  --ui-doc <path>       UI 文档（.ui.json）；不给 = 不画界面层\n"
+             "  --start-state <s>     boot | mainmenu | playing（默认 playing）\n"
+             "  --verbose             每 60 帧打一行 GAME-LOOP\n"
+             "  --version             打印版本 / 构建风味 / git 号后退出\n";
+#if !VENN_SHIPPING
+        s +=
+            "  --trace-states        每次状态迁移打一行 GAME-STATE\n"
+            "  --selftest <name>     无窗口自检后退出: states | determinism | input |\n"
+            "                        character | contact | camera | player |\n"
+            "                        springarm | hud | audio |\n"
+            "                        material | lod | terrain | script | scriptbench |\n"
+            "                        project（工程数据模型）| audio-config（只打印音频配置）\n"
+            "  --dump-scene <path>   把读进来的场景再写一份（读→写往返自检）\n";
+#endif
+        s +=
+            "  --audio <on|off>      开 / 关声音（= MYVK_RUNTIME_AUDIO）\n"
+            "  --audio-device <name> 设备名子串；__none__ = 显式无设备（不回落）\n"
+            "  --audio-null          强制 NullBackend（链路通但不发声）\n"
+            "  --mute                输出静音（声部照常跑，不是停播）\n"
+            "  --input-map <path>    键位绑定表（默认 assets/input_map.json）\n"
+            "  --help                显示这段文字\n"
+            "\n"
+            "配置优先级: 命令行 > 环境变量(MYVK_RUNTIME_*) > assets/game.json > 默认\n"
+            "日志落在 %LOCALAPPDATA%/Venn/<game>/logs/，不写安装目录。\n";
+        return s;
+    }();
+    return text.c_str();
 }
 
 } // namespace runtime

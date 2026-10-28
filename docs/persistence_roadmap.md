@@ -298,44 +298,48 @@ H3：`sceneFromJson` 在同一趟里干了三件事 —— 建实体（纯 CPU�
    想拆线程只能重写；
 3. **自检无法覆盖读档**：每次 `--selftest` 都得起设备，跟音频那条"混音不能锁在库里"是同一类错误。
 
-### 4.2 三段 API
+### 4.2 三段 API（✅ 已按此落地，实际签名见 §4.2.1）
 
 ```cpp
 // engine/scene/SceneDocument.h（新建）—— 纯 POD，不 include 任何 rhi/vulkan 头
-struct EntityDesc {
-    std::string            name;
-    ecs::EntityGuid        guid = ecs::kInvalidGuid;
-    ecs::EntityGuid        parentGuid = ecs::kInvalidGuid;
-    int                    parentIndex = -1;         // 文件内下标（同 guid 二选一）
-    // 组件的"值"部分：全是平凡可拷贝的 POD / std::string，**没有指针**
-    std::optional<ecs::TransformComponent>  transform;
-    std::optional<ecs::VisibilityComponent> visibility;
-    std::optional<ecs::PointLightComponent> pointLight;
-    /* …每个组件一个 optional；**不含** mesh/material/texture 指针… */
-    nlohmann::json         raw;      // 原样留一份：给"未识别的块"和存档 overlay 用
-};
-struct AssetRequest {               // 需要在主线程解析的资源槽
-    ecs::EntityGuid owner;
-    enum class Kind { Mesh, Material, Skinned, Decal, Probe, Particle } kind;
-    nlohmann::json  desc;           // 就是今天 resolveMesh 吃的那个 json
+struct DocumentEntity {
+    std::string     name;
+    ecs::EntityGuid guid = ecs::kInvalidGuid;
+    ecs::EntityGuid parentGuid = ecs::kInvalidGuid;
+    int             parentIndex = -1;      // 文件内下标（与 parentGuid 二选一）
+    nlohmann::json  raw;                   // 原样留一份：③ 段与存档 overlay 都用它
 };
 struct SceneDocument {
-    int  formatVersion = 2;
-    CameraDesc camera; … LightDesc light; … PhysicsDesc physics; …
-    std::vector<EntityDesc>  entities;    // 顺序 = 文件顺序（parentIndex 依赖它）
-    std::vector<AssetRequest> assets;
+    int  formatVersion = 0;
+    bool hasEntities = false;
+    nlohmann::json globals;                // camera/cameras/light/physics/scriptVars/postVolumes
+    std::vector<DocumentEntity> entities;  // 顺序 = 文件顺序（parentIndex 依赖它）
 };
 
 // ① 纯 CPU，无设备、无 AssetManager、可后台线程
 bool parseSceneDocument(const nlohmann::json& root, SceneDocument& out, std::string& err);
 
-// ② 纯 CPU：建实体 / 名字 / guid / 组件值 / 层级。返回 guid → Entity
-bool instantiateDocument(Scene&, const SceneDocument&,
-                         std::unordered_map<ecs::EntityGuid, ecs::Entity>& outGuidMap);
+// ② 纯 CPU：清空 + 相机/光照/物理/黑板 + 建实体 + guid + 外壳 + 父子 + 文件夹
+void instantiateDocument(Scene&, const SceneDocument&,
+                         std::vector<ecs::Entity>& created,                    // 与 entities 一一对应
+                         std::unordered_map<ecs::EntityGuid, ecs::Entity>& guidMap,
+                         DocumentStats& stats);
 
-// ③ 主线程、要 AssetManager：只碰 assets 列表
-void resolveDocumentAssets(Scene&, const SceneDocument&, assets::AssetManager&);
+// ③ 主线程、要 AssetManager：只碰组件与资产
+void resolveDocumentAssets(Scene&, assets::AssetManager&, const SceneDocument&,
+                           const std::vector<ecs::Entity>& created, DocumentStats& stats);
 ```
+
+#### 4.2.1 实际落地与上面草案的三处差异（**以本条为准**）
+
+| 草案 | 实际 | 为什么 |
+|---|---|---|
+| `EntityDesc` 里每个组件一个 `std::optional<…>` | 只有 `raw`（原始 JSON 块） | 搬组件就得把每个 `xxxFromJson` 一起搬，而它们中间十几个要解析资产（mesh/material/skinned/morph/animator）。那样 ③ 段就变成"第二份实现"，以后加组件必漏改一处 —— 这恰恰是 `SceneEntityIO` 当初抽出来要避免的。**`raw` 让 ③ 段原样复用唯一实现。** |
+| 单独一张 `AssetRequest` 表 | 没有；③ 段直接遍历实体 | 同上：拆 `AssetRequest` 等于把 `entityApplyComponents` 按组件再拆一遍。等 G19 真要做"资产预取清单"时再生成，那时才有第二个消费者 |
+| `documentToJson(Scene&, const SceneDocument&)` | 未做 | 目前没有消费者（G18 的 Apply 还没到）。等它到了再加，**空接口比错接口便宜** |
+
+> 另：常量从 `SceneSerializer.cpp` 的匿名 namespace 提到 `SceneDocument.h`
+> （`kSceneFormatVersion`），`SceneSerializer.cpp` 里只留一个别名 —— 两份字面量会漂，一个别名不会。
 
 **旧 API 变成三段的组合**（调用点零改动）：
 
@@ -889,13 +893,13 @@ class PrefabApplyCommand : public Command {
 
 | # | 任务 | 规模 | 验收 |
 |---|---|---|---|
-| **G16-1** | `World::Record.guid` + `m_byGuid` + `guid/find/setGuid/allocateGuid` + 三处生命周期同步 | S | `--selftest guid` 第 1~7 条绿 |
-| **G16-2** | 场景 JSON：写 `guid` / 读 `guid`(setGuid+dup+assigned) / `parentGuid` 双分支 / `kFormatVersion=2` + 读端版本校验 | M | 第 8~13 条绿；`verify_runtime_m2` C 组仍绿 |
-| **G16-3** | `--selftest guid` 13 条 + 否定测试 4 条 | M | `GUID-TOTAL pass=13 fail=0` |
-| **G16-4** | `validateSelection` 改 guid 优先 + Hierarchy `Copy GUID` / `Select by GUID` | S | 同名实体撤销后选中不错位（否定测试必须做） |
-| **G16-5** | 序列化器三段拆分（`SceneDocument` / `parseSceneDocument` / `instantiateDocument` / `resolveDocumentAssets`） | M | `verify_runtime_m2` C 组绿 + `--selftest save` 能无设备跑 |
-| **G17-1** | `SaveGame.{h,cpp}`：格式 + 原子写 + 迁移表 + `readSaveGame/writeSaveGame` | L | 第 1、4、5、7 条绿 |
-| **G17-2** | `SaveGameState`：基线哈希 + diff 生成 + `applySaveGame` + 悬挂父修正 | L | 第 2、3、9、10、11 条绿 |
+| **G16-1** ✅ | `World::Record.guid` + `m_byGuid` + `guid/find/setGuid/allocateGuid` + 三处生命周期同步 | S | `--selftest guid` 第 1~7 条绿 |
+| **G16-2** ✅ | 场景 JSON：写 `guid` / 读 `guid`(setGuid+dup+assigned) / `parentGuid` 双分支 / `kFormatVersion=2` + 读端版本校验 | M | 第 8~13 条绿；`verify_runtime_m2` C 组仍绿 |
+| **G16-3** ✅ | `--selftest guid` **26 条**（原计划 13 条，见 §12.1） | M | `GUID-TOTAL pass=26 fail=0` |
+| **G16-4** ◐ | `validateSelection` 改 **guid 优先**（逻辑抽成 `Scene::reconnectByGuidOrName`，可无窗口自检）· Hierarchy `Copy GUID` / `Select by GUID` **未做** | S | 同名实体重建后选中不错位（`selection_reconnect_by_guid` + 对照区 `selection_fixture_has_ambiguity`） |
+| **G16-5** ✅ | 序列化器三段拆分（`SceneDocument` / `parseSceneDocument` / `instantiateDocument` / `resolveDocumentAssets`） | M | `verify_runtime_m2` C 组绿 + `--selftest save` 能无设备跑（**39 条**，见 §12.2） |
+| **G17-1** ✅ | `SaveGame.{h,cpp}`：格式 + 原子写 + 迁移表 + `readSaveGame/writeSaveGame` | L | 第 1、4、5、7 条绿（**33 条**，见 §12.3） |
+| **G17-2** ✅ | `SaveGameState.{h,cpp}`：基线哈希 + diff 生成 + `applySaveGame` + 悬挂父修正 | L | 第 1、2、3、9、10、11 条绿（**77 条**，见 §12.4） |
 | **G17-3** | 槽位（`slot1..3` / `quick` / `auto`）+ 目录 + CLI（`--save/--load/--slot`）+ 控制台 `save.*` | M | `SAVE-WRITE` / `SAVE-READ` 锚点出现 |
 | **G17-4** | `verify_persistence.py` A~E 组 + 回归登记 | M | `结果: PASS` |
 | **G18-1** | `Prefab.{h,cpp}`：资产解析（复用 `parseSceneDocument`）+ `instantiatePrefab` + `remapEntityRefs` + 两个组件 | L | 验收 1、9 条绿 |
@@ -906,6 +910,105 @@ class PrefabApplyCommand : public Command {
 
 **每完成一行**：跑该行的自检 → 补 `TRIGGERS` → `check_regression_map.py` → 在本文档 §13 追加
 "实测数字 + 踩到的坑"。
+
+### 12.1 G16-1~4 落地记录（2026-10-27）
+
+**实测数字**
+
+```
+Game.exe --selftest guid   → GUID-TOTAL pass=26 fail=0
+tools/verify_guid.py       → 8/8 PASS（结果: PASS）
+真实场景（v1，11 实体）     → SCENE-GUID assigned=11 dup=0 total=11
+v2 夹具（11 个 guid）       → SCENE-GUID assigned=0  dup=0 total=11
+v2 夹具（第 2 个抄第 1 个） → SCENE-GUID assigned=0  dup=1 total=11
+```
+
+**为什么是 26 条而不是计划的 13 条**：原计划只覆盖 World 层（13 条）。但
+"读端真的读了文件里的 guid"这件事，World 层测不出来 —— 读端若完全忽略该字段、
+每次随机补发，World 层的断言**全绿**。所以补了 7 条场景往返（`scene_*`）
+与 3 条选择接回（`selection_*`），加上 3 条 hex 表示，共 26 条。
+
+**踩到的坑（都对应用例）**
+
+| 坑 | 症状 | 钉住它的断言 |
+|---|---|---|
+| `setGuid` 忘了先 `m_byGuid.erase(旧guid)` | 一个"幽灵 guid"能被 `find()` 命中直到 `clear()`；其它断言全绿 | `guid_no_ghost_after_set` / `guid_set_chain_no_ghost`（期望 1，漏写是 100） |
+| `destroy` 里"先清零再 erase"（顺序写反） | 旧键留在表里指向被复用的槽位 → 新实体起来后**旧 guid 复活**，旧存档的引用静默换了个物体 | `guid_destroy_unmaps` 的 `old=REVIVED`（否定测试实测到） |
+| `guidToHex` 不补前导零 | 低位 guid 的实体"存一次再读"就变成另一个物体（`parseGuidHex` 长度检查判非法 → 补发新 guid） | `guid_hex_leading_zeros` |
+| `parseGuidHex` 用 `std::stoull` | 接受 `"0x…"` 与尾随垃圾、非法输入抛异常 | `guid_hex_rejects_garbage` |
+| **空实体不进场景文件** | 只挂 Transform/Name 的夹具写端算 `skipped` → json 只有 500 B、一个实体都没写，"往返"比的是**两份空文件**，而且 PASS | `scene_guid_roundtrip` 的 `n=<json 字节数>`（修好后 5082） |
+| 版本校验放在 `scene.clear()` **之后** | 打开新版文件 → `ok=false` 但当前场景已被清空 | `scene_version_too_new` 的 `kept=1` |
+| `je.value("parent", -1)` 遇字符串 `type_error` | 手写 `"parent": "-1"` 抛异常并打断整份加载 | 改成 `is_number_integer()` 先判（本文件 §3.3 早就写了，这次落实） |
+
+**做过的否定测试**（改坏 → 看到红 → 还原 → 看到绿）
+
+1. 去掉 `setGuid` 的 `erase` → `guid_no_ghost_after_set`（`old=ghost`）+ `guid_set_chain_no_ghost`（100 vs 1）红。
+2. `destroy` 顺序写反 → `guid_destroy_unmaps`（`old=REVIVED`）红。
+3. 写端不写 `guid` → `scene_guid_roundtrip`（`same=0`）红；`scene_guid_stable_twice` **仍绿**
+   （两边都不写，长度还一样）—— 说明它抓的是**读端重算 guid**。
+4. 读端不 `setGuid` 覆盖 → 两条都红，且 `stable_twice` 的 `len=5082/5082` **相同**、
+   内容不同 —— 只判长度会漏，逐字节判据是必要的。
+
+**未做（留给下一轮）**：G16-4 的 Hierarchy 右键 `Copy GUID` / `Select by GUID`（纯调试便利，
+不影响任何验收）。
+
+### 12.2 G16-5 落地记录（2026-10-27）
+
+**实测数字**
+
+```
+Game.exe --selftest save        → SAVE-TOTAL pass=39 fail=0
+tools/verify_save.py            → 14/14 PASS（结果: PASS，7.4 s）
+tools/verify_runtime_m2.py      → RESULT: PASS（C 组 12 项逐字段全绿）
+Game.exe --selftest guid        → GUID-TOTAL pass=26 fail=0（拆分无回归）
+tools/verify_guid.py            → 8/8 PASS
+真实场景（cutscene_demo）        → SCENE-GUID assigned=11 dup=0 total=11
+dump 出来的文件再读            → SCENE-GUID assigned=0  dup=0 total=11
+```
+
+**做了什么**
+
+* 新建 `engine/scene/SceneDocument.h`：`DocumentEntity` / `SceneDocument` /
+  `DocumentStats` + 三个函数声明。**实现留在 `SceneSerializer.cpp`**（不是偷懒 ——
+  `applyCamera` / `physicsFromJson` / `entityApplyComponentsImpl` 全在匿名 namespace 里，
+  另起 TU 就只能复制一份，而复制的那份一定会漏改）。
+* `entityFromJsonImpl` 原地劈成 `entityApplyHierarchyImpl`（纯 CPU）+ `entityApplyComponentsImpl`
+  （要资产），公开壳 `entityApplyHierarchy` / `entityApplyComponents` 进 `SceneEntityIO.h`。
+  ⚠ 保留一个**只有两行**的 `entityFromJsonImpl` 当"唯一串联点"：这样"拆完之后 Prefab
+  与场景加载仍然走同一条路"在代码上无法被悄悄改坏。
+* `loadSceneFromJson` 变成三段的**组合**，一行注释写明"想后台解析就把 ①② 搬走、只留 ③"。
+* `kFormatVersion` 从匿名 namespace 提到头文件（`kSceneFormatVersion`），源文件里留别名。
+
+**踩到的坑（都对应用例）**
+
+| 坑 | 症状 | 钉住它的断言 |
+|---|---|---|
+| `Scene::light()` 找不到方向光组件时**自己造一个实体** | 断言写 `entityCount()==6` 永远红在 7，而**代码是对的** | `instantiate_clears_old` 改按**名字**判旧实体是否消失 |
+| `--max-frames` **不是**有效参数（正解 `--frames`） | 进程不退出 → 脚本靠 45 s 超时 kill 收场，"不靠 kill"那句注释是假的。`verify_guid.py` 也中了这一枪（每跑一次白等 4 分钟），这轮一并修掉 | `verify_save.py` 三处全改 `--frames`，脚本从"卡到超时"变成 7.4 s |
+| `--scene <绝对路径>` 打不开却不报错 | 运行时把场景名当**资产根下的相对路径**，绝对路径失败就退回默认流程**继续跑**，症状是"脚本 90 秒无输出" | `verify_save.py` C 组把 dump 产物落在 `build/bin` 下、用**相对文件名**再读 |
+| `parse` 阶段顺手保留组件 optional | 会诱导 ③ 段变成第二份组件实现 | 用 `raw` + 一条 `parse_keeps_raw`（否定测试：`raw=object()` → 6 条红） |
+
+**做过的否定测试**（改坏 → 看到红 → 还原 → 看到绿）
+
+1. `instantiateDocument` 里的父子第二遍注释掉 → `instantiate_parent_by_index` /
+   `instantiate_parent_by_guid` / `instantiate_folder` / `equiv_parent_shape` **4 条红**。
+   （最后一条说明"等价性断言"确实能抓到"父子只在一段里做了"。）
+2. `parseSceneDocument` 不保留 `raw`（改 `json::object()`）→ `parse_keeps_raw` +
+   `instantiate_transform` + 两条父引用 + `equiv_parent_shape` **6 条红**。
+3. `loadSceneFromJson` 里把 `scene.clear()` 挪到 parse **之前** → `parse_fail_keeps_scene`
+   红且 `n=0`（当前场景被清空）—— 这条正是 G16-2 留下的债，拆分段最容易搬错位置。
+4. `SceneDocument.h` 给 `instantiateDocument` 加一个 `assets::AssetManager&` 参数 →
+   `verify_save.py` D3 红（`sig=dirty`）。**这条不用编译**，是纯静态护栏。
+5. 写端不写 `guid` → `verify_save.py` C3 红（`got=(11,0,11)`，全部补发）。
+
+**给下一轮的判据**
+
+* 判断"这次改动有没有破坏自由 CPU 性"：看 `parseSceneDocument` / `instantiateDocument`
+  的**参数表**。加了 `AssetManager*` 就是破了，`verify_save.py` D 组会红。
+* `SceneDocument.globals` 用的是**白名单**（列出认识的 key），不是"排除 entities"。
+  新增一个全局块（比如 G17 的 `globals.playerGuid`）要同时改两处：白名单 + ② 段的 `has()` 分支。
+* `created` 与 `doc.entities` **一一对应**，无效槽位保留占位。任何"顺手压缩一下"都会让
+  `parent` 下标全体错位 —— 而且不报错。
 
 ---
 
@@ -1014,3 +1117,120 @@ duplicateEntity 是手写字段拷贝 → 新组件必须同步；guid 不能拷
 engine/ecs/** 是横切 → 全量回归需明确下令
 存档里的字段只覆盖值，不增删组件
 ```
+
+### 12.3 G17-1 落地记录（2026-10-27）
+
+**实测数字**
+
+```
+Game.exe --selftest save     → SAVE-TOTAL pass=33 fail=0
+tools/verify_persistence.py  → 8/8 PASS
+--selftest sceneio / guid    → 39/39 · 26/26（`includeEmpty` 新参数无回归）
+verify_runtime_m2.py         → RESULT: PASS（C 组 12 项逐字段）
+check_regression_map.py      → PASS
+```
+
+**落地内容**
+
+* `engine/scene/SaveGame.{h,cpp}`：`SaveGame` / `SaveEntity` / `SaveGlobals` /
+  `SaveIoResult` + `fnv1a64` / `sceneStructureHash` / `captureSaveGame` /
+  `saveGameToJson` / `saveGameFromJson` / `writeSaveGame` / `readSaveGame`。
+* `engine/scene/PersistenceSelfTest.{h,cpp}`（33 条，`--selftest save`）四组：
+  **A 结构指纹** · **B 格式逐字节往返** · **C 迁移** · **D 原子写/读**。
+* `tools/verify_persistence.py`：A 自检 + **分组存在性** + `SAVE-MIGRATE` 锚点；
+  B **磁盘侧**（文件真在、合法 JSON、version 对、guid 16 位、`.bak` 已生成）。
+* `kSaveVersion = 2`。**v2 的唯一理由**是让迁移机制被真的走过一遍（§5.6 的原则：
+  空跑的迁移表比没有更糟）。迁移函数 `migrateV1ToV2` 只补 `globals.playerStamina`。
+* `entityToJson` 多一个 `bool includeEmpty = false` 参数。
+
+**踩到的坑（都对应用例）**
+
+| 坑 | 症状 | 钉住它的断言 |
+|---|---|---|
+| `--selftest save` 这个名字被 G16-5 先占了 | 两个功能抢一个子命令 → 后人会以为"存档自检只要跑这个就行" | G16-5 改名 `--selftest sceneio`（锚点 `SCENEIO-*`、脚本 `verify_sceneio.py`） |
+| `captureSaveGame` 直接复用 `entityToJson`（**默认**过滤空壳） | 玩家 / 出生点 / 纯分组节点**一条都进不了档**（只挂 Transform 的实体返回 false）→ 读数 0 条 | `capture_entity_count`：修法是加 `includeEmpty=true` 让存档走**全量**语义 |
+| `sceneStructureHash` 对每个 guid 单独算一次 FNV 再"混合" | 等于只在算最后一个 guid —— 加/删实体哈希都不变，语义完全失效 | `hash_detects_add` / `hash_detects_remove` / `hash_order_independent` |
+| 自检为了测 `.bak` 兜底把主档**写坏后不收尾** | 磁盘长期留一份坏档 → `verify_persistence.py` B 组红，而人会去查"写端是不是坏了" | `file_restore_valid_after_negative`（凡是"故意造坏数据"的用例都要有收尾） |
+| `Scene` 不可拷贝/不可移动 | "返回 Scene 的 lambda"编不过（`C2280`） | `hash_order_independent` 改成直接建两个 Scene |
+
+**做过的否定测试**（改坏 → 看到红 → 还原 → 看到绿）
+
+1. `sceneStructureHash` 不排序 → `hash_order_independent` 红（`fwd=847875,rev=96d7a8`）。
+2. `migrateV1ToV2` 重建整份 `globals`（只留新字段）→ `migrate_v1_keeps_old` 红
+   （`actual=4`，4 个老字段全丢）。
+3. `captureSaveGame` 用默认 `includeEmpty=false` → `capture_entity_count` /
+   `capture_entities_have_guid` / `capture_entities_have_name` **3 条红**（`actual=0`）。
+4. `replaceFile` 换成 `std::rename` → **没红**。原因：MSVC 的 `rename` 本身就能覆盖，
+   所以 `file_write_twice_replaces` 抓的是"**写第二遍**这个场景"，不是 rename 语义。
+   `MoveFileExW` 保留的理由改成了 `MOVEFILE_WRITE_THROUGH`（真正落盘），并在代码里写清楚。
+
+**未做（G17-1 的尾巴，不阻塞 G17-2）**
+
+* `--selftest save-crash`：写到 tmp 之后、rename 之前 `_exit(3)`，父进程（脚本）断言
+  旧档仍可读。需要 C++ 侧一个专门的 CLI 子模式 + 脚本起子进程，纯 C++ 自检做不到
+  "自我杀进程后再断言"。
+* 槽位目录（`%LOCALAPPDATA%/Venn/<game>/saves/`）、CLI（`--save/--load/--slot`）、
+  控制台 `save.*` —— 都是 **G17-3**。本层的路径由调用方给（engine 层不拼目录）。
+
+### 12.4 G17-2 落地记录（2026-10-27）
+
+**实测数字**
+
+```
+Game.exe --selftest save     → SAVE-TOTAL pass=77 fail=0（G17-1 的 33 + 本层 44）
+tools/verify_persistence.py  → 20/20 PASS（A1~A7 + B1~B7）
+--selftest sceneio / guid    → 39/39 · 26/26（无回归）
+verify_sceneio / verify_guid → PASS
+verify_runtime_m2.py         → RESULT: PASS（C 组 12 项逐字段）
+check_regression_map.py      → PASS
+```
+
+**新增 / 改动**
+
+| 文件 | 内容 |
+|---|---|
+| `engine/scene/SaveGameState.{h,cpp}`（新） | `SaveGameState`（基线 / diff / `noteApplied`）· `applySaveGame` · `fixOrphanParents` · `kMaxMissingRatio` |
+| `engine/scene/SaveGame.{h,cpp}` | 新增 `saveEntityJson` / `saveEntityHash`；`captureSaveGame` 多一个 `baseline` 参数（**全量与增量只剩一个实现**） |
+| `engine/scene/PersistenceSelfTest.cpp` | 新增 E（增量 12 条）/ F（应用 24 条）/ G（形状 5 条）三组 |
+| `tools/verify_persistence.py` | 断言下限 32 → **77**；A2 分段加 `incremental` / `apply` / `shape`；新增 A4~A7 四条**锚点**断言 |
+| `tools/run_regression.py` | `TRIGGERS["verify_persistence"]` 加 `engine/scene/SaveGameState.*` |
+
+**三个"看着能用其实会出事"的决定**
+
+| 放弃了 | 改成 | 理由 |
+|---|---|---|
+| 存档的父子写 `parent` **下标**（与场景文件完全同构） | 写 `parentGuid`，`parent` 直接删 | ① 应用时根本不读层级（层级归关卡）；② 增量档只写一部分实体，下标会指错人；③⚠⚠ 下标让**销毁一个实体把后面实体的哈希全带翻** —— 而 `World` 的池子是 swap-and-pop，**只有最后一个元素会跳位**，所以这个 bug 在某些夹具下完全看不出来 |
+| 应用时只覆盖"值组件"（transform / 音频 / 灯…）的白名单 | 复用 `entityApplyShell` + `entityApplyComponents` | 白名单 = 第二套字段解析，以后加组件必漏改，而**漏改不报错**（读档后那个字段静默不还原）。复用同一条路 = 存档与场景文件永远同源 |
+| 销毁后把 guid 从基线里**摘掉** | 保留 guid、值记 `kDeadHash` | 摘掉之后下一次存档不再写 `_destroyed`，而它会被读进**还带着那个实体**的关卡里 → "打死的怪读档后复活" |
+
+**踩到的坑（都对应用例）**
+
+| 坑 | 症状 | 钉住它的断言 |
+|---|---|---|
+| `World` 池子是 swap-and-pop，销毁下标 i 时**只有最后一个元素**跳到 i | 用"销毁第一个"的夹具验"下标耦合"，父的下标纹丝不动 → 断言**假绿** | `diff_no_index_coupling` 的夹具改成"父**排在最后**"（创建顺序被算过，注释写死在代码里） |
+| `captureSaveGame` 造 `_destroyed` 条目时 `raw` 留默认 `{}` | 与 `saveGameFromJson` 读出来的 `null` 不一致，"存→读→存"在两种形态间跳 | `diff_destroyed_flag` 断言 `raw.is_null()` |
+| 父被销毁后，子实体的 `parentGuid` 写不出来（`w.guid(handle(dead)).`→0） | 销毁一个父会让**所有子实体**都被判成"改过"（不是 bug，是持久化的父引用真的变了） | `apply_orphan_fixture_total == 2` —— 写死 1 的期望会把这个行为当 bug 抹掉 |
+| `--selftest save` 无设备跑应用层要 `AssetManager` | 直接 new 会崩 | 自检用 `AssetManager{TextureContext{}}`（device 为 null）；夹具里**不许有** `mesh`/`material`/`skinned` 块，`resolveMesh` 拿到 `null` 直接返回 nullptr |
+
+**做过的否定测试**（6 次，全部实测到红 → 还原 → 绿）
+
+1. `captureDiff` 不传基线 → **18 条红**（diff 全组 + apply 的销毁/悬挂父全组）。这条证明
+   "增量"不是一个可选优化，而是**整组断言的前提**。
+2. `saveEntityJson` 改回"传整世界下标表 + 不删 `parent`" → 第一次只有 2 条红
+   （`json_has_parent_guid` / `json_parent_guid_value`），`diff_no_index_coupling` **假绿**
+   → 改夹具（父排最后）后重做 → **4 条红**。
+3. `noteApplied` 用 `erase` 代替 `kDeadHash` → `diff_dead_sticky` 红（`d1=0,d2=0`）。
+4. `kMaxMissingRatio` 改 1.0 → `apply_drift_reject` + `apply_drift_reject_untouched` 红。
+5. `applySaveGame` 里不调 `fixOrphanParents` → `apply_orphan_parent_fixed` /
+   `apply_orphan_count` 红（`orphans=0`）。
+6. `hashEntityJson` 只哈希 `transform` 子对象 → `diff_detects_visible` 红 +
+   `hash_is_dump_fnv` 红 + `apply_orphan_fixture_total` 红（子的父引用变化看不见）。
+
+**未做（G17-2 的边界，留给后面）**
+
+* 槽位 / 目录 / CLI / 控制台命令 = **G17-3**；`SaveGameState` 的生命周期（关卡加载完成时
+  `captureBaseline`）也由 runtime 在那一步接上。
+* `--selftest save-crash`（G17-1 的尾巴）仍未做。
+* ⚠ `HierarchyComponent::children` 存的是 `EntityId`（不带 generation）→ 槽位复用后
+  "看起来还活着"。`fixOrphanParents` 里的 `alive()` 判据因此**可能漏判**；
+  要彻底修得让 children 存 `{id, generation}`，那是 G16 的延伸，不在本轮。

@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from capture_window import capture_stable, find_window                # noqa: E402
 from verify_add_menu import LogTap, click, force_foreground           # noqa: E402
+from verify_asset_drag import wheel_at                               # noqa: E402
 from safe_fs import safe_remove
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -250,6 +251,16 @@ def main():
         # ---------------------------------------------------------- F（先做导航，需要历史）
         print("[F] 上一层 / 下一层")
         node = tap.last_rect("CB-TREE-NODE scenes")
+        tree = tap.last_rect("CB-TREE")
+        # `scenes` 是目录树的最后一个节点，窗口 1600x900 时它压在树的可视区
+        # 底部之外：`logRect` 照样报矩形，但点上去等于点在底栏上（实测就是
+        # "点了没反应"）。先把它滚进来，再点。
+        for _ in range(8):
+            if not node or not tree or node[3] <= tree[3] - 2:
+                break
+            wheel_at(hwnd, (tree[0] + tree[2]) * 0.5,
+                     (tree[1] + tree[3]) * 0.5, 1)
+            node = tap.last_rect("CB-TREE-NODE scenes")
         if node:
             click_until(hwnd, tap, *center(node),
                         "CB-ENTRIES dir=assets/scenes",

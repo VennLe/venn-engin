@@ -1,4 +1,5 @@
 #include "rhi/Instance.h"
+#include "core/Build.h"
 #include "core/Logger.h"
 
 #define GLFW_INCLUDE_NONE
@@ -25,10 +26,22 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
 }
 
 Instance::Instance(bool requestValidation) {
-    // 环境变量：MYVK_VALIDATION=0 关闭 / =1 强制开启
-    const char* env = std::getenv("MYVK_VALIDATION");
-    if (env && std::strcmp(env, "0") == 0) requestValidation = false;
-    if (env && std::strcmp(env, "1") == 0) requestValidation = true;
+    // G30：出货构建**不装**校验层。理由不是"省一点开销"，而是玩家机器上
+    // 大概率没装 `VK_LAYER_KHRONOS_validation` —— 那时代码会照常创建实例、
+    // 只是白查一次层列表；更糟的是**开发机上有层**，于是"我这里 0 报错"
+    // 变成假象。所以 shipping 下这条是**强制关**，env 也不给翻盘的口子
+    // （要验校验层就用 dev/QA 版，那是同一个源码的另一种构建）。
+    if (core::kShipping) {
+        if (requestValidation) {
+            VK_LOG_INFO("INSTANCE validation forced OFF (shipping build)");
+        }
+        requestValidation = false;
+    } else {
+        // 环境变量：MYVK_VALIDATION=0 关闭 / =1 强制开启
+        const char* env = std::getenv("MYVK_VALIDATION");
+        if (env && std::strcmp(env, "0") == 0) requestValidation = false;
+        if (env && std::strcmp(env, "1") == 0) requestValidation = true;
+    }
 
     m_validation = requestValidation && hasLayer("VK_LAYER_KHRONOS_validation");
     create();
@@ -36,6 +49,10 @@ Instance::Instance(bool requestValidation) {
 
     VK_LOG_INFO("Vulkan instance created (validation: %s)",
                 m_validation ? "ON" : "OFF");
+    // 单独一行打风味：**不动上面那行的原文** —— 十几条既有用例按
+    // `VALIDATION|VUID| ERROR` 扫日志判红，改措辞的风险远大于收益。
+    VK_LOG_INFO("INSTANCE build=%s git=%s validation=%s", core::kBuildFlavor,
+                core::kGitDescribe, m_validation ? "on" : "off");
 }
 
 Instance::~Instance() {

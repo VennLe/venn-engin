@@ -40,6 +40,7 @@ DEFAULT_EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
 
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_WHEEL = 0x0800
 
 RECT_RE = re.compile(
     r"(CB-CELL [^=]+|VP-RECT|HIER-RECT row0|HIER-RECT drop)"
@@ -101,6 +102,23 @@ def client_to_screen(hwnd, cx, cy):
 def move_to(hwnd, cx, cy):
     sx, sy = client_to_screen(hwnd, cx, cy)
     user32.SetCursorPos(sx, sy)
+
+
+def wheel_at(hwnd, cx, cy, notches):
+    """在客户区 (cx,cy) 处滚 notches 格（正 = 向下滚 → 内容上移）。
+
+    ⚠ 面板内容比它的可视区高时（目录树、Inspector 的材质区），控件虽然
+      还在 `logRect` 里报矩形，但鼠标点上去什么也点不到 —— 用例会表现成
+      "点了没反应"。凡是"按 rect 点一个可能被滚出去的控件"，先滚进来。
+    """
+    force_foreground(hwnd)
+    move_to(hwnd, cx, cy)
+    time.sleep(0.15)
+    for _ in range(abs(notches)):
+        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0,
+                           -120 if notches > 0 else 120, 0)
+        time.sleep(0.12)
+    time.sleep(0.4)
 
 
 def press():

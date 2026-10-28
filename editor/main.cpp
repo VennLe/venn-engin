@@ -26,6 +26,7 @@
 
 #include "EditorApp.h"
 
+#include "LayoutSelfTest.h"
 #include "MultiSelectSelfTest.h"
 
 #include "core/Logger.h"
@@ -120,6 +121,13 @@ int main(int argc, char** argv) {
             return failures == 0 ? 0 : 1;
         }
 
+        // E29-1 分栏槽位映射（`--selftest` 的等价物，走 env）：老位置 / 搬家 /
+        // 交换 / 矩形跟随。⚠ 走 env 而不是 argv —— 本文件头 P1：`Editor.exe`
+        // 丢弃命令行，`--frames` 会照常渲染到超时且零提示。
+        if (std::getenv("MYVK_LAYOUT_TEST") != nullptr) {
+            const int failures = editor::runLayoutSelfTest();
+            return failures == 0 ? 0 : 1;
+        }
         editor::EditorApp app;
         return app.run(maxFrames);    } catch (const std::exception& e) {
         VK_LOG_ERROR("Fatal: %s", e.what());

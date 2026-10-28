@@ -78,6 +78,15 @@ public:
     virtual void showCommandPalette() = 0;
     // ---- E21 通知历史（Help 菜单的入口）----
     virtual void showNotificationHistory() = 0;
+
+    // ---- Edit ▸ Duplicate ----
+    // 实现是 `SceneHierarchy::duplicateSelection()`；Toolbar 不持有 Hierarchy
+    // （面板之间只准依赖 EditorContext），所以只发意图。
+    virtual void duplicateSelection() = 0;
+
+    // ---- File ▸ Import ▸ Import assets... ----
+    // 原生文件对话框属于 ContentBrowser；这里只请求"打开它"。
+    virtual void requestImportDialog() = 0;
 };
 
 class Toolbar {
@@ -91,6 +100,17 @@ public:
     void saveSceneToCurrentPath();
     // 打开某个相对路径的场景（File ▸ Open Recent / 启动钩子用）
     void openScene(const std::string& relPath);
+    // File ▸ Save As / Ctrl+Shift+S：先弹原生"另存为"对话框，再走 saveSceneAs。
+    // 单独一个函数是因为它要碰 Win32（Toolbar.cpp 里那段 #ifdef）。
+    void saveSceneAsDialog();
+
+    // File ▸ Package project…（E28-1）：把当前工程打成 `dist/<Name>/`。
+    // 同步执行（模板工程几 MB，一秒内完事）+ 结果走通知条；
+    // 不做成"后台任务 + 进度条"是因为那需要一条任务队列，
+    // 而这条命令现在的实际耗时支撑不起那套设施。
+    // `asPak=true` = `assets/` + `shaders/` 收成单个 `game.pak`（G29-b/c）。
+    // 默认 false（散文件）：出包后能直接翻目录核对，调试包的时候有用。
+    void packageProject(bool asPak = false);
 
 private:
     void drawMenuBar();

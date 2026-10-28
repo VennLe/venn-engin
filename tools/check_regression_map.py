@@ -247,7 +247,12 @@ run("editor/InspectorPanel.cpp → 面板块全家族", OLD,
           # 改动走 `batchAdd` / `batchMul` 并压成**一条** `MultiTransformEditCommand`）。
           # verify_multiselect 的 B 组断的就是 `INSP-MULTI ... pos=mixed` 那几个
           # 聚合结果，改这里当然该重跑它。
-          "verify_multiselect"})
+          "verify_multiselect",
+          # 2026-10-27（J5）：Physics 页签末尾多了整段 `Joint`
+          # （`INS-JOINT-HEADER/ADD/ENABLED/KIND/TARGET/LIMIT/MOTOR` 七个锚点）。
+          # 它是**作者侧唯一**能配关节的地方 —— verify_joints 的 D 组验的就是
+          # 这段画出来没有、以及"没有关节时是 Add、有了之后才是字段"这个分叉。
+          "verify_joints"})
 # 2026-10-27（#316）：选择集本体（`editor/EditorContext.*`）。
 # 期望是**并集**，而且这份并集本身就是这份 fixture 的价值：`EditorContext`
 # 是十几个用例共用的中枢，改它的"选择"语义会被一长串名字一起拖下水。
@@ -261,7 +266,21 @@ run("editor/EditorContext.cpp → 选择集（多选）", OLD,
           "verify_i18n_coverage", "verify_material_import",
           "verify_multiselect", "verify_play_mouse_capture",
           "verify_player_feel", "verify_prefab", "verify_script_editor",
-          "verify_ui_editor", "verify_viewport_bar"})
+          "verify_ui_editor", "verify_viewport_bar",
+          # 2026-10-27（G16-4）：`m_selectionGuid` 的快照与 `validateSelection`
+          # 的接回顺序都落在这个文件里。选中接错**不会报错**，只会让属性面板
+          # 显示另一个同名物体 —— 所以改这里必须重跑 identity 那条用例。
+          "verify_guid",
+          # 2026-10-27（P2）：全选 / 反选（`selectAll` / `invertSelection`）
+          # 就在这个文件里，而菜单接线用例正是靠 `SELECT all n=` /
+          # `SELECT invert n=` 两行日志判断"点了真的发生了"。
+          "verify_menu_wiring",
+          # 2026-10-27（J5-1）：视口拾取锚点的**状态本体**就在这个文件里
+          # （`AnchorPick` 三态 + `cancelAnchorPick` / `advanceAnchorPick`），
+          # 而且三个选择入口都要顺手取消拾取 —— 取消漏一处，表现是
+          # "点了别的物体之后拾取还挂着，下一次点视口把锚点写到新物体上"。
+          # verify_joints 的 G 组断的就是这条链路。
+          "verify_joints"})
 # 2026-10-27（#316）：批量数学（`editor/MultiEditMath.h`）—— 一个**纯函数**头，
 # 只被 GizmoController 与 InspectorPanel 两处共用，所以 owner 应该**只有**
 # verify_multiselect（外加扫字面量的 i18n 覆盖面）。

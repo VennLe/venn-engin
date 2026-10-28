@@ -235,6 +235,30 @@ bool editModeImplemented(EditMode m) {
     return false;
 }
 
+// ------------------------------------------------------------
+// 左栏最小宽度：谁家的面板能换列，谁就能被拖窄
+// ------------------------------------------------------------
+// 判据只有一条：**面板在 300 宽时按钮还点得到吗**。
+//   · Landscape / Foliage / Select —— 按钮按 `GetContentRegionAvail()` 换列，
+//     300 时退化成 1~2 列，全都还在窗口里 → 300。
+//   · 其余六项是一条 `SameLine` 硬排到底（建模面板那排合计 400 出头），
+//     300 宽时最右边那个按钮会被窗口裁掉 —— 裁掉的控件"有矩形但点不到"，
+//     比直接不给拖更糟 → 460。
+//
+// ⚠ 这个数字**不是**"默认宽度"：默认宽度仍是 SplitLayout 里那句
+//   `clamp(bodyW * kLeftFrac, kMinModeRail, ...)`。分开是为了让默认布局
+//   逐像素不动（verify_viewport 的 CONVERGED_VP 与像素基线都钉着它）。
+float editModeRailMinWidth(EditMode m) {
+    switch (m) {
+        case EditMode::Select:
+        case EditMode::Landscape:
+        case EditMode::Foliage:
+            return 300.0f;
+        default:
+            return 460.0f;
+    }
+}
+
 EditMode clampEditMode(int v) {
     if (v < 0) v = 0;
     if (v >= kEditModeCount) v = kEditModeCount - 1;

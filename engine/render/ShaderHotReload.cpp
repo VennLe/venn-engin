@@ -23,6 +23,10 @@ int64_t fileWriteTime(const std::string& path) {
 void ShaderHotReload::watch(const std::string& spvFile) {
     Watched w;
     w.name = spvFile;
+    // ⚠ 出包后 `resolveShaderPath` 返回的是 `pak:shaders/x.spv` 这种**虚拟路径**，
+    //   下面的 last_write_time 必然失败 → 记 0 → 永远不会报"变了"。
+    //   这是**正确**行为：包里的 .spv 改不了，热重载在发行版里没有意义。
+    //   （开发态永远是磁盘路径，热重载照常工作 —— 磁盘优先那条分支。）
     w.resolved = resolveShaderPath(spvFile);
     w.lastWrite = fileWriteTime(w.resolved);
     m_watched.push_back(std::move(w));

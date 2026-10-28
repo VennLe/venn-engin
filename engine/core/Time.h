@@ -24,10 +24,15 @@ public:
         // 逐位比较才有意义（见 tools/verify_runtime_determinism.py）。
         //
         // ⚠ 正常使用**不设**即为真实墙钟；它不是给玩家用的旋钮。
+        //
+        // G30：shipping 版**不读**它（它是确定性回归的工具，不是运行时功能）。
+        //   整段 `#if` 掉而不是运行期判断 —— 名字不该出现在玩家版二进制里。
+#if !VENN_SHIPPING
         if (const char* s = std::getenv("MYVK_FIXED_DT")) {
             const float v = static_cast<float>(std::atof(s));
             if (v > 0.0f) m_fixedDelta = v;
         }
+#endif
     }
 
     void update() {

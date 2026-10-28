@@ -45,6 +45,9 @@
 #include "NotificationCenter.h"  // E21：m_notifications（同上，unique_ptr 析构）
 #include "GpuTimelinePanel.h"    // E25：m_gpuTimeline（同上）
 #include "PanelRegistry.h"   // PanelDesc（面板表是 EditorApp 的静态成员）
+// E29-2：面板拖拽换位。只放**纯数据**结构（DragInput / PanelDragState），
+// 这个头文件仍然不 include imgui.h —— 拖拽的 ImGui 读取全在 .cpp 里。
+#include "PanelDragDrop.h"
 #include "Toolbar.h"         // EditorHost（菜单里那些"要动引擎"的动作走它）
 
 #include <memory>
@@ -134,6 +137,18 @@ public:
     // ---- E21 通知历史（Help 菜单入口）----
     // 与 showCommandPalette 同一个理由：Toolbar 拿不到窗口状态位。
     void showNotificationHistory() override;
+
+    // ---- Edit ▸ Duplicate ----
+    // 真正的复制在 `SceneHierarchy::duplicateSelection()`（它才知道
+    // uniqueName / 一批一次 structuralEdit 那套约定）。Toolbar 只认
+    // EditorContext，拿不到 Hierarchy 对象 —— 所以走这条窄接口。
+    void duplicateSelection() override;
+
+    // ---- File ▸ Import ▸ Import assets... ----
+    // 原生文件对话框在 ContentBrowser 里（`OPENFILENAMEW` + 不覆盖同名
+    // 的 uniqueChildPath）。这里只转发"请打开它"这个意图 —— 实际弹窗必须
+    // 等本帧 ImGui 数据提交完（ContentBrowser 用 m_importRequest 延后一帧）。
+    void requestImportDialog() override;
 
     // ---------------------------------------------------------- E04 面板表
     // 表本体在 EditorApp.cpp（表项里的 draw 指针要指向本类的私有绘制函数）。
@@ -423,6 +438,11 @@ private:
     // 对象算出"关闭 X 左边那一格"，用该窗口自己的 DrawList 画、再手动判命中。
     // 命中前要求 `HoveredWindow == 该窗口`，所以被别的窗口盖住时点不到。
     void drawPanelMinimizeButtons();
+    // E29-2：面板标题栏拖拽换位。**必须排在最后**（所有窗口画完之后）——
+    // 它要读这一帧真实的 LayoutRects 与鼠标位置，早一帧拿到的是旧矩形，
+    // 表现是"拖到一半落点闪一下旧位置"。
+    void drawPanelDragLayer();
+
     // 把某个面板弄到"真的看得见"：清掉托盘的临时收起 + 打开 + 请求焦点。
     // 底栏的 Output Log / CMD 按钮走这条路 —— 上一版直接 `open = !open`，
     // 一旦面板处于"勾着但被收起"的状态，点一下只是把勾取了，屏幕上什么都
@@ -431,6 +451,12 @@ private:
     // 下一帧要 `SetWindowFocus` 的面板 id（空 = 不请求）。窗口还没建起来的
     // 那一帧调 SetWindowFocus 是无效的，所以延后一帧。
     const char* m_focusPanelWant = nullptr;
+    // E29-2：拖拽换位的跨帧状态（armed → active → 落下）。
+    PanelDragState m_panelDrag;
+    // E29-5：角落抓手（两条分隔条的交点）的拖拽态。与 m_panelDrag 并列而
+    // 不合并 —— 两者抓的东西不一样（一个抓标题栏、一个抓交点），同一帧
+    // 只可能有一个 active，但状态各自独立更不容易互相污染。
+    CornerDragState m_cornerDrag;
     // Character 窗口"上一帧是不是开着"。它自己管 `m_open`，点 × 时只改自己
     // 的成员，面板注册表那边还是勾着的 —— 于是下一帧同步逻辑又把它打开，
     // 表现就是"叉号关不掉"。靠这个字段把"用户关的"和"刚被勾上"区分开。

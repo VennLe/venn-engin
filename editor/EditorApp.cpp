@@ -11,6 +11,7 @@
 #include "EditorContext.h"
 #include "EditorIcons.h"
 #include "ui/ImGuiTheme.h"
+#include "ui/UiChrome.h"
 #include "EditorLayoutIO.h"
 #include "ConsolePanel.h"
 #include "FeatureUIGen.h"
@@ -31,6 +32,7 @@
 #include "PanelRegistry.h"
 #include "PanelDock.h"
 #include "ModeRail.h"
+#include "EditModes.h"
 #include "ViewportTabs.h"
 #include "ParticlesPanel.h"
 #include "PhysicsPanel.h"
@@ -561,9 +563,17 @@ void EditorApp::collectSplitOccluders() {
     // m_tabBarRect 必须在这里：标签条是**独立窗口**，不在 LayoutRects 里，
     // 不列进"布局面板"名单就会被当成浮层 → 左边的竖直分隔条在标签条高度
     // 上被裁掉一截（7px 的断口，肉眼很明显）。
+    //
+    // 2026-10-28：左栏那两块（模式列表 `###mode_rail` + 当前模式的参数面板）
+    // 也必须算"布局面板"。它们的矩形由 `modeRailListRect` / `modeRailBodyRect`
+    // 推出，尺寸与 `L.modes` **不同**，所以按 L.modes 匹配不上 → 被当成浮层
+    // 加进遮挡列表 → 它们的右边界正好压在根分隔条上 → 整条线被裁光
+    // （这正是"视口往左拖扩不开、Modes 一动不动"的直接原因之一；
+    //   另一半修在 SplitLayout 的"贴边不算穿过"）。
     const Rect layoutRects[] = {L.hierarchy, L.content, L.viewport, L.inspector,
                                 L.modes,     m_tabBarRect, L.bottom,
-                                L.status,    L.toolbar,  L.transport};
+                                L.status,    L.toolbar,  L.transport,
+                                modeRailListRect(L), modeRailBodyRect(L)};
 
     auto isLayoutPanel = [&layoutRects](const ImGuiWindow* w) {
         constexpr float kEps = 2.0f;   // 面板位置有取整，留 2px 余量
@@ -1079,6 +1089,203 @@ void EditorApp::onInit() {
         svc.act.axis = [this](const std::string& a) {
             return m_ctx->inputMap().axis(a);
         };
+
+        // ---- 关节（J5-4）----
+        //
+        // 与 `runtime/RuntimeApp.cpp` 那九条**语义逐字相同**（改组件 →
+        // `physics::rebuildJoints` → 打日志），差别只有两点：
+        //   · 日志前缀 `EDITOR-JOINT`（本工程的惯例是**按宿主分前缀**：
+        //     runtime 打 `GAME-*`，编辑器打自己的 —— 看一行日志就能知道
+        //     这是 Play 里跑出来的还是出包后跑出来的）；
+        //   · 刚体映射来自本类成员（`m_physics` / `m_physicsEntityToBody`），
+        //     不是 `SceneBinding` —— 编辑器那份 binding 是
+        //     `buildPhysicsWorld()` 的局部变量，函数返回时就搬走了。
+        //
+        // ⚠ 绝不用 `buildSceneWorld` 重建：它连刚体一起重来，Runtime 场景里
+        //   每个物体的位置与速度都回到初始值 —— "改一个关节，整局撞回原点"。
+        // ⚠ `m_physics` 可能为空（场景关了物理 / 还没进 Play）：那时
+        //   `refreshJoints` 返回 0，组件照样改（下一次 Play 生效），
+        //   不当作错误。
+        const auto jointName = [this](ecs::Entity e) -> std::string {
+            if (!e.valid()) return std::string("<none>");
+            const std::string* n =
+                m_ctx->runtimeScene().world().name(e);
+            return n ? *n : std::string("<unnamed>");
+        };
+        const auto jointOf = [this](ecs::Entity e) -> ecs::JointComponent* {
+            if (!e.valid()) return nullptr;
+            ecs::World& w = m_ctx->runtimeScene().world();
+            if (!w.alive(e)) return nullptr;
+            return w.get<ecs::JointComponent>(e);
+        };
+        const auto refreshJoints = [this]() -> std::size_t {
+            if (!m_physics) return 0;
+            return physics::rebuildJoints(m_ctx->runtimeScene(), *m_physics,
+                                          m_physicsEntityToBody);
+        };
+
+        svc.act.joints.set = [this, jointOf, refreshJoints, jointName](
+                                 ecs::Entity self, ecs::Entity other,
+                                 const std::string& kind) -> bool {
+            ecs::JointComponent* jc = jointOf(self);
+            if (!jc) {
+                VK_LOG_WARN("EDITOR-JOINT set: '%s' has no Joint component "
+                            "(add it in the Inspector, Physics tab)",
+                            jointName(self).c_str());
+                return false;
+            }
+            ecs::JointKind k;
+            if (!ecs::parseJointKind(kind.c_str(), k)) {
+                VK_LOG_WARN("EDITOR-JOINT set: unknown kind '%s' for '%s' "
+                            "(expect fixed / ball / hinge / slider / distance)",
+                            kind.c_str(), jointName(self).c_str());
+                return false;
+            }
+            ecs::World& w = m_ctx->runtimeScene().world();
+            if (!w.alive(other)) {
+                VK_LOG_WARN("EDITOR-JOINT set: '%s' targets a dead/invalid "
+                            "entity",
+                            jointName(self).c_str());
+                return false;
+            }
+            if (!w.has<ecs::RigidBodyComponent>(self) ||
+                !w.has<ecs::RigidBodyComponent>(other)) {
+                VK_LOG_WARN(
+                    "EDITOR-JOINT set: both ends need a RigidBody "
+                    "('%s' has=%d, '%s' has=%d)",
+                    jointName(self).c_str(),
+                    w.has<ecs::RigidBodyComponent>(self) ? 1 : 0,
+                    jointName(other).c_str(),
+                    w.has<ecs::RigidBodyComponent>(other) ? 1 : 0);
+                return false;
+            }
+            jc->kind = k;
+            jc->target = w.guid(other);
+            jc->enabled = true;
+            const std::size_t built = refreshJoints();
+            VK_LOG_INFO("EDITOR-JOINT set self=%u other=%u kind=%s built=%zu",
+                        self.id, other.id, ecs::jointKindName(k), built);
+            return true;
+        };
+        svc.act.joints.anchors = [this, jointOf, refreshJoints, jointName](
+                                     ecs::Entity self, glm::vec3 a,
+                                     glm::vec3 b) -> bool {
+            ecs::JointComponent* jc = jointOf(self);
+            if (!jc) {
+                VK_LOG_WARN("EDITOR-JOINT anchors: '%s' has no Joint component",
+                            jointName(self).c_str());
+                return false;
+            }
+            jc->anchorSelf = a;
+            jc->anchorTarget = b;
+            refreshJoints();
+            VK_LOG_INFO("EDITOR-JOINT anchors self=%u a=(%.3f,%.3f,%.3f) "
+                        "b=(%.3f,%.3f,%.3f)",
+                        self.id, a.x, a.y, a.z, b.x, b.y, b.z);
+            return true;
+        };
+        svc.act.joints.axis = [this, jointOf, refreshJoints, jointName](
+                                  ecs::Entity self, glm::vec3 ax) -> bool {
+            ecs::JointComponent* jc = jointOf(self);
+            if (!jc) {
+                VK_LOG_WARN("EDITOR-JOINT axis: '%s' has no Joint component",
+                            jointName(self).c_str());
+                return false;
+            }
+            jc->axis = ax;
+            refreshJoints();
+            VK_LOG_INFO("EDITOR-JOINT axis self=%u axis=(%.3f,%.3f,%.3f)",
+                        self.id, ax.x, ax.y, ax.z);
+            return true;
+        };
+        svc.act.joints.limit = [this, jointOf, refreshJoints, jointName](
+                                   ecs::Entity self, bool on, float lo,
+                                   float hi) -> bool {
+            ecs::JointComponent* jc = jointOf(self);
+            if (!jc) {
+                VK_LOG_WARN("EDITOR-JOINT limit: '%s' has no Joint component",
+                            jointName(self).c_str());
+                return false;
+            }
+            if (jc->kind != ecs::JointKind::Hinge &&
+                jc->kind != ecs::JointKind::Slider) {
+                VK_LOG_WARN("EDITOR-JOINT limit: '%s' is a %s joint - only "
+                            "hinge / slider support a limit",
+                            jointName(self).c_str(),
+                            ecs::jointKindName(jc->kind));
+                return false;
+            }
+            jc->useLimit = on;
+            jc->lowerLimit = lo;
+            jc->upperLimit = hi;
+            refreshJoints();
+            VK_LOG_INFO("EDITOR-JOINT limit self=%u on=%d range=[%.3f,%.3f]",
+                        self.id, on ? 1 : 0, lo, hi);
+            return true;
+        };
+        svc.act.joints.motor = [this, jointOf, refreshJoints, jointName](
+                                   ecs::Entity self, float speed,
+                                   float force) -> bool {
+            ecs::JointComponent* jc = jointOf(self);
+            if (!jc) {
+                VK_LOG_WARN("EDITOR-JOINT motor: '%s' has no Joint component",
+                            jointName(self).c_str());
+                return false;
+            }
+            if (jc->kind != ecs::JointKind::Hinge &&
+                jc->kind != ecs::JointKind::Slider) {
+                VK_LOG_WARN("EDITOR-JOINT motor: '%s' is a %s joint - only "
+                            "hinge / slider support a motor",
+                            jointName(self).c_str(),
+                            ecs::jointKindName(jc->kind));
+                return false;
+            }
+            // force <= 0 = 关掉（与 Inspector 的提示同一约定）。
+            jc->useMotor = force > 0.0f;
+            jc->motorSpeed = speed;
+            jc->maxMotorForce = force;
+            refreshJoints();
+            VK_LOG_INFO("EDITOR-JOINT motor self=%u speed=%.3f force=%.3f on=%d",
+                        self.id, speed, force, jc->useMotor ? 1 : 0);
+            return true;
+        };
+        svc.act.joints.enable = [this, jointOf, refreshJoints, jointName](
+                                    ecs::Entity self, bool on) -> bool {
+            ecs::JointComponent* jc = jointOf(self);
+            if (!jc) {
+                VK_LOG_WARN("EDITOR-JOINT enable: '%s' has no Joint component",
+                            jointName(self).c_str());
+                return false;
+            }
+            jc->enabled = on;
+            const std::size_t built = refreshJoints();
+            VK_LOG_INFO("EDITOR-JOINT enable self=%u on=%d built=%zu", self.id,
+                        on ? 1 : 0, built);
+            return true;
+        };
+        svc.act.joints.remove = [this, jointOf, refreshJoints, jointName](
+                                    ecs::Entity self) -> bool {
+            ecs::JointComponent* jc = jointOf(self);
+            if (!jc) {
+                VK_LOG_WARN("EDITOR-JOINT remove: '%s' has no Joint component",
+                            jointName(self).c_str());
+                return false;
+            }
+            m_ctx->runtimeScene().world().remove<ecs::JointComponent>(self);
+            const std::size_t built = refreshJoints();
+            VK_LOG_INFO("EDITOR-JOINT remove self=%u built=%zu", self.id, built);
+            return true;
+        };
+        svc.act.joints.kindOf = [jointOf](ecs::Entity self) -> const char* {
+            const ecs::JointComponent* jc = jointOf(self);
+            return jc ? ecs::jointKindName(jc->kind) : nullptr;
+        };
+        svc.act.joints.target = [this, jointOf](ecs::Entity self) -> ecs::Entity {
+            const ecs::JointComponent* jc = jointOf(self);
+            if (!jc || jc->target == ecs::kInvalidGuid) return ecs::Entity{};
+            return m_ctx->runtimeScene().world().find(jc->target);
+        };
+
         m_scriptRuntime->setServices(std::move(svc));
 
         m_scriptRuntime->setPrintSink(
@@ -2942,6 +3149,12 @@ void EditorApp::computeLayout() {
     m_split->setToolbarHeight(m_ctx->toolbarHeight());
     m_split->beginFrame(io.DisplaySize.x, io.DisplaySize.y);
 
+    // 2026-10-28：左栏拖动下限按**当前模式**问一次。
+    // 之前它恒等于 460 —— 而那正好是默认宽度，于是"往左拖视口扩不开"。
+    // 必须在 beginFrame 之后：setLeftMinWidth 要读 m_dispW 才能判断
+    // "当前宽度够不够，要不要顶上去"。
+    m_split->setLeftMinWidth(editModeRailMinWidth(m_ctx->editMode()));
+
     // E06-5：面板被关掉时那一侧收成 0（邻居吃掉空间，而不是留一块空白）。
     // 必须在 apply() 之前 —— resolve 读的就是这里算出来的 liveA/liveB。
     m_split->syncPanelVisibility();
@@ -2988,10 +3201,35 @@ void EditorApp::computeLayout() {
     L.bottom = {0.0f, io.DisplaySize.y - kStatusH - kBottomBarH,
                 io.DisplaySize.x, kBottomBarH};
 
-    // 抽屉矩形：横跨整窗、贴着底栏上沿往上长（停靠/浮层用同一个矩形，
-    // 区别只在"有没有从布局里扣掉"）。
+    // 抽屉矩形：贴着底栏上沿往上长。停靠形态横跨整窗；**浮层形态让出右栏**。
+    //
+    // ⚠⚠ 为什么浮层必须让出右栏（2026-10-27 修）：
+    //   抽屉是"浮在最上层的通栏"，而右栏 Inspector 里有一整排**拖放接收端**
+    //   （材质的 albedo/metallic/roughness/emissive/orm/normal/height 七个
+    //   纹理槽）。抽屉一旦盖住它们，从 Content 拖资产到材质槽在几何上就
+    //   不可能成立：鼠标落点被抽屉吃掉，`IsItemHovered()` 在接收端永远是
+    //   false —— 画面看着像"拖过去了没反应"，日志里连一行 DROP 都没有。
+    //   实测（_venn_verify/probe_drag/1_armed.png）拖拽源是好的（预览窗跟着
+    //   鼠标），只是整块材质区在抽屉后面。两条用例同时红：
+    //   `verify_material_chips` / `verify_material_roundtrip` 三槽全不落地。
+    //
+    //   让位的代价只有"抽屉窄了 330px"；不让位的代价是**材质拖放功能在
+    //   默认形态下不可用**，而默认形态就是浮层（用户明确要求 Dock 默认不勾）。
+    //   停靠形态不用让：它已经是布局的一部分，主体整体缩上去了。
     if (drawerOpen) {
-        L.content = {0.0f, L.bottom.y - m_contentDrawerH, io.DisplaySize.x,
+        float drawerW = io.DisplaySize.x;
+        if (!m_contentDock) {
+            // 右栏左缘 = Hierarchy / Inspector 任一可见者的 x（两者同列；
+            // 被并成标签组时其中一个会收成 0 宽）。
+            const float rightColX = L.inspector.w > 1.0f
+                                        ? L.inspector.x
+                                        : (L.hierarchy.w > 1.0f ? L.hierarchy.x
+                                                                : drawerW);
+            // 右栏拖到极窄（< 160）时视同"没有右栏"，退回通栏 —— 否则抽屉
+            // 会被挤成一条缝，用户反而找不到它。
+            if (rightColX > 160.0f && rightColX < drawerW) drawerW = rightColX;
+        }
+        L.content = {0.0f, L.bottom.y - m_contentDrawerH, drawerW,
                      m_contentDrawerH};
     } else {
         L.content = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -3059,8 +3297,18 @@ void EditorApp::computeLayout() {
 namespace {
 
 // 布局槽位 → 面板 id（落盘用）
+// ⚠ kSlotModes 是**合成槽位**，不是 PanelDesc：模式栏（模式列表 + 当前模式的
+//   参数）由 ToolkitEditors 直接钉进 modes 矩形，而八个模式参数面板**共用**
+//   layoutSlot == kSlotModes。所以
+//     · panelIndexOf("modes") 查不到（表里没有这一条）
+//     · 靠 layoutSlot 反查会命中 "landscape"（第一个共用它的面板）
+//   落盘需要 id ↔ 槽位双向可逆，于是给模式栏一个专用 id。它不是面板，只用来
+//   在 layout 文件里指代"模式栏这一格"。
+constexpr const char* kModeRailPanelId = "moderail";
+
 const char* slotPanelId(int slot) {
     if (slot == kSlotNone) return "";
+    if (slot == kSlotModes) return kModeRailPanelId;   // 合成槽位：见上
     const std::vector<PanelDesc>& t = EditorApp::panelTableVec();
     for (const PanelDesc& p : t) {
         if (p.layoutSlot == slot) return p.id ? p.id : "";
@@ -3070,6 +3318,12 @@ const char* slotPanelId(int slot) {
 
 // 面板 id → 布局槽位（读盘用）。找不到 / 不在分栏树里 → kSlotNone。
 int slotForPanelId(const char* id) {
+    // "modes" 作为**别名**照收：日志锚点 / 文档 / 手写配置里一直叫它 modes，
+    // 只认 "moderail" 会让"我照着文档写了个 modes"变成静默失效。
+    if (id && (std::strcmp(id, kModeRailPanelId) == 0 ||
+               std::strcmp(id, "modes") == 0)) {
+        return kSlotModes;
+    }
     const int i = panelIndexOf(id);
     if (i < 0) return kSlotNone;
     const std::vector<PanelDesc>& t = EditorApp::panelTableVec();
@@ -3353,6 +3607,52 @@ void EditorApp::loadEditorLayoutFromDisk() {
         }
         m_split->setSavedRatio(n, s.splitSaved[n]);
     }
+    // ---- 叶子 → 面板（E29-1）----
+    // 缺省（老文件没有 slots 段）= 保持默认树；**只在文件里真给了才覆盖**。
+    // id → 槽位在这一层做：EditorLayoutIO 不认识 PanelRegistry（见 LayoutState
+    // 里 slotGroups 的注释），认不出来的 id 静默丢掉。
+    //
+    // ⚠⚠ **必须一次 restoreGroups 整份灌进去，不能逐格 setGroup**：
+    //   两个叶子互换面板时，逐格会互相把对方摘掉（见 restoreGroups 的注释）。
+    // ⚠ 空数组在这一阶段**无法与"没写"区分** → 一律按"保持默认"处理；
+    //   否则文件里没写的格子会被清空，Hierarchy / Inspector 直接消失。
+    {
+        bool any = false;
+        for (int n = 0; n < SplitLayout::kNodeCount && !any; ++n)
+            any = !s.slotGroups[n][0].empty() || !s.slotGroups[n][1].empty();
+        if (any) {
+            // 默认树的叶子（与 SplitLayout::buildDefault 对齐）。kSlotNone = 该侧是子树。
+            static const int kDefLeaf[SplitLayout::kNodeCount][2] = {
+                {kSlotModes,     kSlotNone},
+                {kSlotViewport,  kSlotNone},
+                {kSlotHierarchy, kSlotInspector},
+            };
+            std::vector<int> groups[SplitLayout::kNodeCount][2];
+            for (int n = 0; n < SplitLayout::kNodeCount; ++n) {
+                for (int side = 0; side < 2; ++side) {
+                    if (kDefLeaf[n][side] != kSlotNone)
+                        groups[n][side].push_back(kDefLeaf[n][side]);
+                }
+            }
+
+            int applied = 0;
+            for (int n = 0; n < SplitLayout::kNodeCount; ++n) {
+                for (int side = 0; side < 2; ++side) {
+                    if (s.slotGroups[n][side].empty()) continue;
+                    groups[n][side].clear();
+                    for (const std::string& id : s.slotGroups[n][side]) {
+                        const int sl = slotForPanelId(id.c_str());
+                        if (sl == kSlotNone) continue;
+                        groups[n][side].push_back(sl);
+                        ++applied;
+                    }
+                }
+            }
+            m_split->restoreGroups(groups);
+            VK_LOG_INFO("LAYOUT-SLOTS applied=%d", applied);
+        }
+    }
+
     m_split->markNeedsAutoRecalc();
     m_split->setMaximized(slotForPanelId(s.maximized.c_str()));
 
@@ -3406,6 +3706,48 @@ void EditorApp::saveEditorLayoutToDisk() {
                               : m_split->ratio(n);
         s.splitCollapsed[n] = collapsed;
         s.splitSaved[n] = m_split->savedRatio(n);
+    }
+    // 叶子映射（E29-1）。**与默认树一致就不写** —— 用户没动过布局时，
+    // 落盘文件与改造前逐字节相同（老文件读回来也不会触发 LAYOUT-SLOTS）。
+    {
+        // 默认树的叶子（与 SplitLayout::buildDefault 对齐）。kSlotNone = 该侧是子树。
+        static const int kDefLeaf[SplitLayout::kNodeCount][2] = {
+            {kSlotModes,     kSlotNone},
+            {kSlotViewport,  kSlotNone},
+            {kSlotHierarchy, kSlotInspector},
+        };
+        bool same = true;
+        for (int n = 0; n < SplitLayout::kNodeCount; ++n) {
+            for (int side = 0; side < 2; ++side) {
+                const int want = kDefLeaf[n][side];
+                const int have = m_split->groupSize(n, side);
+                if (want == kSlotNone) {
+                    if (have != 0) same = false;
+                    continue;
+                }
+                if (have != 1 || m_split->groupPanel(n, side, 0) != want) same = false;
+            }
+        }
+        if (!same) {
+            for (int n = 0; n < SplitLayout::kNodeCount; ++n) {
+                for (int side = 0; side < 2; ++side) {
+                    const int sz = m_split->groupSize(n, side);
+                    const int act = m_split->activeIndex(n, side);
+                    auto emit = [&](int k) {
+                        const char* id = slotPanelId(m_split->groupPanel(n, side, k));
+                        if (id && *id) s.slotGroups[n][side].emplace_back(id);
+                    };
+                    // **活动标签写在最前面**：读盘时 `restoreGroups` 一律把
+                    // activeIndex 归 0（它要"顺序无关"），所以"哪个标签是
+                    // 当前显示的"只能靠**顺序**记住。不这么写的话，重开编辑器
+                    // 后标签组永远显示第一个成员 —— 用户会以为"我选的标签没保存"。
+                    if (act >= 0 && act < sz) emit(act);
+                    for (int k = 0; k < sz; ++k) {
+                        if (k != act) emit(k);
+                    }
+                }
+            }
+        }
     }
     s.viewportLayout = static_cast<int>(m_ctx->viewportLayout());
     s.viewMode = static_cast<int>(renderer().viewMode());
@@ -3565,7 +3907,21 @@ void EditorApp::handleShortcuts() {
         if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
             reloadShaders();
         }
-        if (ImGui::IsKeyPressed(ImGuiKey_S, false)) saveSceneNow();
+        if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+            // Ctrl+Shift+S = 另存为（弹原生对话框）；Ctrl+S = 存回当前路径。
+            // 两者必须互斥 —— 原来 Ctrl+S 没排除 Shift，按 Ctrl+Shift+S 会
+            // 先悄悄存一次旧路径，然后才弹框。
+            if (io.KeyShift)
+                m_toolbar->saveSceneAsDialog();
+            else
+                saveSceneNow();
+        }
+        // Ctrl+A = 全选。⚠ 只在**没有文本输入焦点**时算"选场景对象"：
+        // 重命名实体 / 在控制台敲字时，Ctrl+A 必须是 ImGui 自己的"选中
+        // 全部文本"，否则会一边给输入框全选、一边把整个场景选上。
+        if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+            m_ctx->selectAll();
+        }
         return;  // 带 Ctrl 的组合键到此为止
     }
 
@@ -3679,7 +4035,18 @@ void EditorApp::handleShortcuts() {
     }
     // F2：就地重命名（Hierarchy 面板里会换成输入框）。只在编辑态有效。
     if (ImGui::IsKeyPressed(ImGuiKey_F2, false)) m_hierarchy->beginRenameSelection();
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) m_ctx->clearSelection();
+    // Esc 的**优先级**（J5-2 起是三档）：拾取模式 → 取消拾取；否则取消选择。
+    // 快捷键在 `m_viewport->draw()` **之前**跑，所以这里必须先挡一道，
+    // 否则用户按 Esc 想退出锚点拾取，结果是"拾取还在、选中项没了" ——
+    // Inspector 当场变空，他连自己刚才在配哪个对象都找不回来。
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        if (m_ctx->anchorPick() != EditorContext::AnchorPick::None) {
+            m_ctx->cancelAnchorPick();
+            VK_LOG_INFO("JOINT-PICK cancel reason=esc(hotkey)");
+        } else {
+            m_ctx->clearSelection();
+        }
+    }
 
     // 删除：**多选时一次全删**（一条撤销记录）。逻辑收敛在 SceneHierarchy
     // 里 —— 右键菜单的 Delete 走的是同一个函数，两处各写一遍的话迟早
@@ -3791,6 +4158,12 @@ void EditorApp::onImGui() {
     // 浮动面板标题栏的"最小化"按钮。必须排在**所有窗口画完之后**：它要读
     // 每个窗口这一帧的 Pos/Size 才能把那一格摆到关闭 X 的左边（见函数注释）。
     drawPanelMinimizeButtons();
+
+    // E29-2：面板标题栏拖拽换位。位置在**所有窗口画完之后**：
+    //   · 它要读这一帧真实的矩阵（`m_ctx->layout()`）与鼠标位置，早一帧拿到
+    //     的是旧矩形，表现是"拖到一半落点闪一下旧位置"；
+    //   · 高亮画在前景层，必须最后画才压得住面板（和分隔条同一条理由）。
+    drawPanelDragLayer();
 
     // 上一帧请求的焦点（窗口那时可能还没建起来，所以延后一帧）
     if (m_focusPanelWant) {
@@ -4614,6 +4987,252 @@ void EditorApp::drawPanelMinimizeButtons() {
     }
 }
 
+// ============================================================
+// E29-2 / E29-3：面板拖拽（交换 / 并成标签组）
+// ============================================================
+// 状态机在 `PanelDragDrop.cpp`（纯数据输入，自检能完整跑），这里只做三件事：
+//   ① 把 ImGui 的鼠标状态翻译成 `DragInput`；
+//   ② 画标签条（一格多面板）并处理点标签 / 双击拆出；
+//   ③ 把"谁在拖、要落到哪、会做什么"画出来。
+//
+// 为什么画在 `ForegroundDrawList`：面板窗口是自己 `Begin/End` 的顶层窗口，
+// 想让一轮高亮**盖过所有面板**只有前景层一个选择（分隔条也是这么画的）。
+//
+// ⚠⚠ E29-3 刻意**没有**去动面板矩形。计划里写的是"面板矩形下移 22px 给标签条
+//   让位"，实际做法是**标签条直接画在标题行里**：标签条和标题栏本来就是同一
+//   行东西（都写在这格顶上），重叠着画就是 Blender 的样子 —— 而"下移 22px"
+//   会让每个面板矮 22px、所有按矩形点控件的用例集体漂移，还多出一层标题栏
+//   （标签条 + 窗口自己的标题）= 46px 的双层 chrome。省掉这一步，像素零漂移。
+namespace {
+
+// 标签上显示什么。复用面板标题的翻译 id（不新增词条 —— 新词条要同步
+// zh 表，漏了就是"缺译文"而不是编译错）。
+//
+// ⚠⚠ 必须把 `###稳定ID` 切掉：`trId` 返回的是 `"译文###stableId"`（见
+//   Localization.cpp），直接拿去 AddText 会把 `###panel_hierarchy` 一起画出来，
+//   而 **CalcTextSize 也按整串算宽** —— 实测标签宽度翻了两倍多，第二枚标签
+//   直接被"放不下就截断"的规则挤掉，画面上只剩一个标签。
+//   第一版就是这么错的，症状是"标签组里只有第一个面板的标签"。
+std::string tabVisibleLabel(int slot) {
+    const char* full = slotPanelId(slot);
+    if (slot == kSlotHierarchy) full = trId("Hierarchy", "panel_hierarchy");
+    else if (slot == kSlotInspector) full = trId("Inspector", "panel_inspector");
+    std::string s = full ? full : "";
+    const std::size_t cut = s.find("##");
+    if (cut != std::string::npos) s.resize(cut);
+    return s;
+}
+
+} // namespace
+
+void EditorApp::drawPanelDragLayer() {
+    const LayoutRects& L = m_ctx->layout();
+
+    // 标题栏高度：与 ImGui 内部算法一致（字号 + 两倍 FramePadding.y）。
+    // 不去取 `ImGuiWindow::TitleBarRect()` 的理由：那要先按名字找到每个面板
+    // 的窗口对象，而它们的名字各不相同（Hierarchy / Inspector 用翻译后的
+    // 标题，模式栏是 "###mode_rail"），且视口的窗口名是动态的。槽位矩形
+    // 本身就是窗口矩形 —— 顶部这一段必然是标题栏，不需要窗口对象。
+    const float titleH =
+        ImGui::GetFontSize() + ImGui::GetStyle().FramePadding.y * 2.0f;
+
+    const ImVec2 mp = ImGui::GetIO().MousePos;
+    const bool clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    const bool dblClicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const ui::ThemeTokens& tk = ui::tokens();
+    const float rounding = ui::metrics().windowRounding;
+    auto shade = [](const ImVec4& c, float a) {
+        return ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, c.w * a));
+    };
+
+    // ============================================================
+    // ① 标签条（E29-3）
+    // ============================================================
+    // 装在同一个格子里的面板，在标题行里并排显示成标签。点标签 = 切换活动
+    // 面板（`activateInGroup`），双击 = 把它**送回老家**（`homeCellOf`）。
+    //
+    // ⚠ 必须有"送回老家"这条路：面板被并进别的格子后，它原来那一格会被
+    //   收成 0 宽（E06-5 的既有机制），鼠标再也点不到那里 —— 没有出口，
+    //   用户就会觉得"并进去就拿不出来了"。
+    {
+        // static：这两个容器每帧长一个样，没必要反复分配（标签条在帧尾，
+        // 静态生命周期不影响任何一帧的语义）。
+        static std::vector<TabGroupInfo> groups;
+        static std::vector<TabPill> pills;
+        static std::vector<float> widths;
+
+        groups.clear();
+        collectTabGroups(*m_split, L, groups);
+
+        for (const TabGroupInfo& g : groups) {
+            widths.clear();
+            for (int p : g.panels) {
+                // +22 = 左右各 11px 内边距：标签得像个按钮，贴着字太挤。
+                const std::string lbl = tabVisibleLabel(p);
+                widths.push_back(ImGui::CalcTextSize(lbl.c_str()).x + 22.0f);
+            }
+            const Rect cell{g.x, g.y, g.w, g.h};
+            if (tabStripPills(cell, titleH, g.panels, g.active, widths, pills) <= 0.0f) {
+                continue;   // 格子太窄 / 行高太小 → 这一帧不画（也不吃点击）
+            }
+
+            for (const TabPill& pill : pills) {
+                const ImVec2 p0(pill.x, pill.y);
+                const ImVec2 p1(pill.x + pill.w, pill.y + pill.h);
+                const bool hot = mp.x >= p0.x && mp.x < p1.x && mp.y >= p0.y &&
+                                 mp.y < p1.y;
+
+                // 活动标签用强调色实心块，其余是"卡片色 + 细边"——
+                // 一眼能分出"现在显示的是哪个"。
+                const ImVec4 bg = pill.active ? tk.accent
+                                              : (hot ? tk.cardBgHover : tk.cardBg);
+                dl->AddRectFilled(p0, p1, shade(bg, pill.active ? 0.90f : 1.0f), 7.0f);
+                if (!pill.active) {
+                    dl->AddRect(p0, p1, shade(tk.borderSoft, hot ? 1.0f : 0.75f),
+                                7.0f, ImDrawFlags_RoundCornersAll, 1.0f);
+                }
+
+                const std::string lbl = tabVisibleLabel(pill.panel);
+                const ImVec2 ts = ImGui::CalcTextSize(lbl.c_str());
+                // 强调色在深色主题里是亮粉 → 深字；浅色主题里强调色偏深 → 白字。
+                const ImU32 tc = pill.active
+                                     ? (tk.isLight ? IM_COL32(255, 255, 255, 255)
+                                                   : IM_COL32(26, 20, 30, 255))
+                                     : ImGui::GetColorU32(ImGuiCol_Text);
+                dl->AddText(ImVec2(p0.x + (pill.w - ts.x) * 0.5f,
+                                   p0.y + (pill.h - ts.y) * 0.5f),
+                            tc, lbl.c_str());
+
+                // 自动化锚点：`LAYOUT-TAB-<面板id>=(x0,y0)-(x1,y1)`。
+                // logRect 自带去抖（只在矩形变化时打），不会刷屏。
+                char tag[64];
+                std::snprintf(tag, sizeof(tag), "LAYOUT-TAB-%s",
+                              slotPanelId(pill.panel));
+                logRect(tag, p0, p1);
+
+                if (!clicked || !hot) continue;
+
+                if (dblClicked) {
+                    int hn = -1, hs = -1;
+                    int cn = -1, cs = -1, ci = -1;
+                    if (!homeCellOf(pill.panel, hn, hs)) continue;
+                    // 已经在家（而且家就是当前这格）→ 无事可做。
+                    // 不判这一条会打一行假的 TABHOME，脚本以为拆出去了。
+                    if (m_split->locatePanel(pill.panel, cn, cs, ci) && cn == hn &&
+                        cs == hs) {
+                        continue;
+                    }
+                    if (m_split->movePanel(pill.panel, hn, hs)) {
+                        VK_LOG_INFO("LAYOUT-TABHOME panel=%s -> %d/%d",
+                                    slotPanelId(pill.panel), hn, hs);
+                    }
+                } else if (pill.index != g.active) {
+                    if (m_split->activateInGroup(g.node, g.side, pill.index)) {
+                        VK_LOG_INFO("LAYOUT-TABCLICK panel=%s idx=%d",
+                                    slotPanelId(pill.panel), pill.index);
+                    }
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    // ② 拖拽状态机
+    // ============================================================
+    DragInput in;
+    in.clicked = clicked;
+    in.down = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    in.esc = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+    in.x = mp.x;
+    in.y = mp.y;
+
+    const PanelDragOutcome out =
+        panelDragStep(*m_split, L, m_panelDrag, in, titleH);
+
+    // ---- 角落（E29-5）----
+    // 交点上按住拖 = 合并/换位（不是调大小）。分隔条那边的悬停已经被
+    // SplitLayout 让出来了（`m_splitHoverTaken`），这里只负责动作与日志。
+    const int cornerIdx = m_split->cornerHot();
+    const SplitCorner* hotCorner =
+        (cornerIdx >= 0 && cornerIdx < static_cast<int>(m_split->corners().size()))
+            ? &m_split->corners()[static_cast<size_t>(cornerIdx)]
+            : nullptr;
+    const PanelDragOutcome cornerOut =
+        cornerDragStep(*m_split, L, hotCorner, m_cornerDrag, in);
+
+    // 两条路共用一个日志器：锚点不同（LAYOUT-* / LAYOUT-CORNER-*），
+    // 脚本才能分清"拖标题栏"和"拽角落"。
+    auto logOutcome = [&](const PanelDragOutcome& o, const char* prefix) {
+        const char* a = slotPanelId(o.from);
+        const char* b = slotPanelId(o.to);
+        if (!a) a = "?";
+        if (!b) b = "?";
+        // 两个**不同的**锚点：脚本要能一眼分出"交换了"和"并进去了"。
+        // 只打一行、只在真的生效时打 —— 每帧无条件打会让"没生效"和
+        //   "生效后又反悔"在日志里长得一模一样。
+        if (o.action == DropAction::Merge) {
+            int n = -1, sd = -1, i = -1;
+            const int sz = m_split->locatePanel(o.from, n, sd, i)
+                               ? m_split->groupSize(n, sd)
+                               : 0;
+            VK_LOG_INFO("%s-MERGE from=%s to=%s size=%d", prefix, a, b, sz);
+        } else {
+            VK_LOG_INFO("%s-DRAG from=%s to=%s", prefix, a, b);
+        }
+    };
+    if (out.applied()) logOutcome(out, "LAYOUT");
+    if (cornerOut.applied()) logOutcome(cornerOut, "LAYOUT-CORNER");
+
+    // 哪个手势在拖（同一帧只可能有一个 active）
+    const bool cornerDragging = m_cornerDrag.active;
+    if (!m_panelDrag.active && !cornerDragging) return;
+
+    // ============================================================
+    // ③ 拖拽高亮
+    // ============================================================
+    // 角落手势复用同一套画法：源格压暗、目标格按 Merge/Swap 换样子。
+    // 用户看不出"这次是抓角落还是抓标题栏"，也不该看出 —— 松手结果一样。
+    const int srcSlot = cornerDragging ? m_cornerDrag.srcSlot
+                                       : m_panelDrag.srcSlot;
+    const int tgt = cornerDragging ? m_cornerDrag.targetSlot
+                                   : m_panelDrag.targetSlot;
+    const DropAction act = cornerDragging ? m_cornerDrag.action
+                                          : m_panelDrag.targetAction;
+
+    // ---- 源格：压暗一点，表示"这一格的东西正在被搬走" ----
+    float x, y, w, h;
+    slotRectOf(L, srcSlot, x, y, w, h);
+    if (w > 1.0f && h > 1.0f) {
+        dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+                          shade(tk.accent, 0.06f), rounding);
+        dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), shade(tk.accent, 0.30f),
+                    rounding, 0, 1.5f);
+    }
+
+    // ---- 目标格 ----
+    // 两种动作必须**看上去不一样**，否则用户不知道松手是"换"还是"并"：
+    //   · Swap  —— 整格外框（1.5px，95%），一眼是"这一格整体要变"
+    //   · Merge —— 弱外框 + 内嵌一块半透明实心（60% 大小），像"塞进去"
+    if (tgt != kSlotNone) {
+        slotRectOf(L, tgt, x, y, w, h);
+        if (w > 1.0f && h > 1.0f) {
+            const ImVec2 p0(x, y), p1(x + w, y + h);
+            if (act == DropAction::Merge) {
+                dl->AddRect(p0, p1, shade(tk.accent, 0.55f), rounding, 0, 1.5f);
+                const float ix = std::min(w, h) * 0.18f;
+                const ImVec2 q0(x + ix, y + ix), q1(x + w - ix, y + h - ix);
+                dl->AddRectFilled(q0, q1, shade(tk.accent, 0.22f), rounding);
+                dl->AddRect(q0, q1, shade(tk.accent, 0.95f), rounding, 0, 2.0f);
+            } else {
+                dl->AddRectFilled(p0, p1, shade(tk.accent, 0.16f), rounding);
+                dl->AddRect(p0, p1, shade(tk.accent, 0.95f), rounding, 0, 2.5f);
+            }
+        }
+    }
+}
+
 // "+" 的勾选列表。分三段：
 //   ① 浮动功能面板（勾上 → 底栏出现按钮）
 //   ② 底栏已有按钮的（Content / Output Log，只显示状态，不能重复勾）
@@ -5061,11 +5680,21 @@ void EditorApp::drawTransportBar() {
         return;
     }
 
-    constexpr ImVec4 kRunCol(0.20f, 0.52f, 0.26f, 1.0f);   // Run 绿
-    constexpr ImVec4 kExitCol(0.48f, 0.22f, 0.22f, 1.0f);  // Exit Run 红
-    constexpr ImVec4 kPlayCol(0.16f, 0.42f, 0.52f, 1.0f);  // 动画 Play 青蓝
-    constexpr ImVec4 kPauseCol(0.62f, 0.50f, 0.16f, 1.0f); // Pause 琥珀
-    constexpr ImVec4 kStopCol(0.48f, 0.22f, 0.22f, 1.0f);  // Stop 红
+    // 2026-10-27：从写死的深绿/深红改成**跟着主题走**的语义色。
+    // 原来那五个字面量是按 VennDark（中灰底）调的；换成樱花粉的深底之后，
+    // 一片 0.20 的墨绿按钮看着像"贴错了图"—— 用户说的"按钮颜色不像二次元"
+    // 有一半是这类硬编码造成的。语义不变：Run 绿 / Exit 红 / Play 青 /
+    // Pause 琥珀 / Stop 红。
+    //
+    // ⚠ 仍然是**高饱和**的：`verify_add_menu` 扫的是 TR-BAR 里高饱和像素的
+    //   中点，而这一组本来就居中，所以换色不影响那条断言；左侧那块灰阶控件
+    //   也没有被碰到。
+    const ui::ThemeTokens& tk = ui::tokens();
+    const ImVec4 kRunCol = tk.ok;
+    const ImVec4 kExitCol = tk.error;
+    const ImVec4 kPlayCol = tk.info;
+    const ImVec4 kPauseCol = tk.warn;
+    const ImVec4 kStopCol = tk.error;
 
     const bool runActive = m_ctx->isPlaying();
     const char* runLabel = runActive ? "Exit Run" : "Run";
@@ -7546,6 +8175,20 @@ void EditorApp::showCommandPalette() { m_showCommandPalette = true; }
 
 void EditorApp::showNotificationHistory() { m_showNotificationHistory = true; }
 
+void EditorApp::duplicateSelection() {
+    // 唯一实现放在 SceneHierarchy（uniqueName / 一批一次 structuralEdit）。
+    // 菜单只是另一个入口，语义与 Ctrl+D / 右键 Duplicate 完全一致。
+    if (m_hierarchy) m_hierarchy->duplicateSelection();
+}
+
+void EditorApp::requestImportDialog() {
+    // ⚠ 必须先把内容抽屉打开：ContentBrowser 的 m_importRequest 是在
+    //   draw() 末尾消费的，抽屉收着（默认就是关的）时 draw 不跑，
+    //   置位会一直挂着 —— 表现是"点了菜单没反应"。
+    panelOpenRef("content") = true;
+    if (m_content) m_content->requestImportFileDialog();
+}
+
 // ---------------------------------------------------------------- 设置
 //
 // Preferences：对标 Blender 首选项的"大窗口"布局 ——
@@ -7992,6 +8635,54 @@ void EditorApp::drawPrefRow(const PrefItem& it) {
             ImGui::SetTooltip(TR("Reset '%s' to default (%s)"), TR(it.label),
                               TR(it.options[d]));
         }
+
+        // ---- 主题色卡（2026-10-27）----
+        // 用户第 6 条：「主题颜色风格不要太单一硬朗，可以多样化供用户选择」。
+        // 只给一个下拉名是不够的 —— "Sunset Pop" 这四个字看不出它长什么样，
+        // 用户不会去一个个点开试。这里把每套主题的**窗口底 + 强调色**画成
+        // 一枚色卡，点一下就换。
+        //
+        // ⚠ 只对 `theme` 这一项画（按 id 判）。别的选项型（语言）没有颜色
+        //   概念，画一排色块只会让人以为是坏掉了。
+        // ⚠ 落盘仍然只存下标（`setChoice`），色卡不引入第二份状态。
+        if (std::string(it.id) == "theme") {
+            ImGui::Spacing();
+            const float chipW = 30.0f;
+            const float chipH = 22.0f;
+            for (int i = 0; i < n; ++i) {
+                if (i) ImGui::SameLine(0.0f, 6.0f);
+                ImGui::PushID(i);
+                ImVec4 cbg, cac;
+                ui::themeSwatch(i, cbg, cac);
+                const ImVec2 p0 = ImGui::GetCursorScreenPos();
+                const ImVec2 p1(p0.x + chipW, p0.y + chipH);
+                const bool hit = ImGui::InvisibleButton("##chip", ImVec2(chipW, chipH));
+                const bool hov = ImGui::IsItemHovered();
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                // 上 = 强调色、下 = 窗口底：一眼能看出"这套主题亮不亮/什么色"
+                ui::gradientRectV(dl, p0, p1, ImGui::GetColorU32(cac),
+                                  ImGui::GetColorU32(cbg), 7.0f);
+                const bool sel = (i == cur);
+                dl->AddRect(p0, p1,
+                            ImGui::GetColorU32(sel ? cac
+                                                   : (hov ? ui::tokens().borderSoft
+                                                          : ui::tokens().borderSoft)),
+                            7.0f, ImDrawFlags_RoundCornersAll, sel ? 2.0f : 1.0f);
+                char tag[48];
+                std::snprintf(tag, sizeof(tag), "PREFS-THEMECHIP-%d", i);
+                ui::logRect(tag, p0, p1);
+                if (hit) {
+                    if (it.setChoice) it.setChoice(i);
+                    if (it.onChoiceChanged) it.onChoiceChanged(i);
+                    cur = i;
+                    VK_LOG_INFO("EDITOR-THEME index=%d name=%s", i,
+                                ui::themeName(i));
+                }
+                if (hov) ImGui::SetTooltip("%s", ui::themeName(i));
+                ImGui::PopID();
+            }
+        }
+
         ImGui::PopID();
         return;
     }

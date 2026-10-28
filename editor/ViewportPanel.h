@@ -187,6 +187,17 @@ private:
     void addCollisionBody(ecs::Entity e, ecs::ColliderShape shape);
     void removeCollisionBody(ecs::Entity e);
 
+    // ---- 关节锚点的视口拾取（J5-2）----
+    // 返回 true = 本次视口的左键归拾取所有（别再做点选 / 框选）。
+    //
+    // ⚠ 为什么返回"是否吃掉"而不是直接改组件：调用点在同一帧的**点选之前**
+    //   一个 if 里，吃掉与否决定了后面那条长分支跑不跑。
+    bool handleAnchorPick(const scene::Camera& cam, const glm::vec2& vpPos,
+                          const glm::vec2& vpSize, bool hovered);
+    // 拾取模式下的视口提示条（左上角）。做成 ImGui 文字而不是 3D 标记：
+    // 它的作用是告诉用户"现在点一下会发生什么"，与场景内容无关。
+    void drawAnchorPickHint(const glm::vec2& vpPos, const glm::vec2& vpSize);
+
     EditorContext& m_ctx;
     render::Renderer& m_renderer;
     PickingSystem m_picking;

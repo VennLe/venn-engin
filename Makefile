@@ -213,7 +213,7 @@ RUN_LAUNCHER = $(CMAKE) -E chdir $(BIN_DIR) $(CMAKE) -E env $(RUN_ENV) Launcher.
 
 .DEFAULT_GOAL := all
 
-.PHONY: all build configure editor game shaders run run-editor run-game \
+.PHONY: all build configure editor game shaders ship run run-editor run-game \
         run-launcher toolchain \
         smoke clean distclean rebuild package info help install-make-alias
 
@@ -274,6 +274,43 @@ ifeq ($(TOOLCHAIN),msvc)
 else
 	$(CMAKE) --build $(BUILD_DIR) --target Shaders $(PARALLEL)
 endif
+
+# ---------------------------------------------------------------- shipping（G30）
+# 产物与 `build/` **完全分开**（build-ship/）：一份源码同时有 dev 与 shipping
+# 两套二进制，混在一个目录里迟早有人拷错。
+#
+#   make ship            → build-ship/bin/Game.exe（去编辑器 / 去校验层 / 去开发钩子）
+#   make ship SHIP_BUILD_TYPE=Release
+#
+# ⚠ 用 RelWithDebInfo 而不是 Release：链接带了 /DEBUG → 符号在 Game.pdb 里，
+#   出包时归档那个 pdb；Release 不带 pdb，"崩溃了只有地址"。
+SHIP_BUILD_DIR  ?= build-ship
+SHIP_BUILD_TYPE ?= RelWithDebInfo
+SHIP_CMAKE_ARGS ?= -DVENN_SHIPPING=ON
+
+# ⚠ 三个变量用 **target-specific + export** 传给 msvc-build.cmd，而不是把它们
+#   拼成 `cmake -E env ... cmd ...`：那种写法在 Git Bash 下会让 MSYS 把命令
+#   开关 `/c` 当成路径改写成 `C:/`，cmd 于是进了**交互式**模式等 stdin ——
+#   现象是 `make ship` 挂着十分钟一声不响、连 build-ship/ 都没建出来
+#   （2026-10-28 实测）。下面这条写法与一直好用的 `make build` 同一条路径。
+ship: export VENN_BUILD_DIR  := $(SHIP_BUILD_DIR)
+ship: export VENN_BUILD_TYPE := $(SHIP_BUILD_TYPE)
+ship: export VENN_CMAKE_ARGS := $(SHIP_CMAKE_ARGS)
+ship:
+	@echo [ship] dir=$(SHIP_BUILD_DIR) type=$(SHIP_BUILD_TYPE) VENN_SHIPPING=ON
+ifeq ($(TOOLCHAIN),msvc)
+	$(MSVC_BUILD) configure
+	$(MSVC_BUILD) build
+else
+	$(CMAKE) -S . -B $(SHIP_BUILD_DIR) -G $(GENERATOR) \
+		-DCMAKE_BUILD_TYPE=$(SHIP_BUILD_TYPE) \
+		"-DCMAKE_C_COMPILER=$(CC_BIN)" \
+		"-DCMAKE_CXX_COMPILER=$(CXX_BIN)" \
+		"-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
+		$(SHIP_CMAKE_ARGS)
+	$(CMAKE) --build $(SHIP_BUILD_DIR) $(PARALLEL)
+endif
+	@echo [ship] out=$(SHIP_BUILD_DIR)/bin/Game.exe
 
 # ============================================================================
 #  运行

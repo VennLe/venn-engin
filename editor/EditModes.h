@@ -64,6 +64,17 @@ const char* editModeHint(EditMode m);
 // 这个模式在本工程里有没有真实编辑器
 bool editModeImplemented(EditMode m);
 
+// 这个模式的参数面板**最少要多宽**（像素）。
+//
+// 2026-10-28（用户报的 bug）：左栏的拖动下限原来写死 460，而那正好又是默认
+// 宽度 —— 于是"往左拖视口扩不开、左边的 Modes 一动不动"。下限改成按模式问
+// 之后，响应式面板（按钮按可用宽度换列）可以报 300，而一条 SameLine 硬排到底
+// 的面板仍然报 460（低于这个宽度按钮会被窗口裁掉，裁掉的部分点都点不到）。
+//
+// ⚠ 改这里的数字要同步跑 `verify_layout_v4`（B1 断言 modes 宽 280..520）
+//   与 `verify_viewport`（CONVERGED_VP 钉的是**默认**宽度，不是下限）。
+float editModeRailMinWidth(EditMode m);
+
 // 把 EditMode 夹到合法范围（落盘文件 / 环境变量里可能是脏数据）
 EditMode clampEditMode(int v);
 

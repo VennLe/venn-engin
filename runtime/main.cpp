@@ -35,12 +35,22 @@
 #include "RuntimeConfig.h"
 #include "RuntimeLog.h"
 
+#include "core/Build.h"
 #include "core/Logger.h"
 
+// ------------------------------------------------------------
+// G30：下面这些头**只有 dev / QA 版**需要（自检夹具 + 出包子命令）。
+// ------------------------------------------------------------
+// shipping 版把它们一起 `#if` 掉，不是为了少编译几个文件 —— 而是因为
+// 编译进来就会把自检的**输出字符串**（`GAME-STATE-TOTAL` 等）带进
+// 二进制。判据 `tools/verify_shipping.py` 是按字节扫 exe 的，所以这里
+// 一漏，那个断言就会红（这是有意的：它逼着人别再往 dev 区外面写钩子）。
+#if !VENN_SHIPPING
 #include "GameState.h"
 #include "GameStateStack.h"
 #include "GameLoop.h"
 
+#include "ecs/GuidSelfTest.h"
 #include "physics/CharacterController.h"
 #include "physics/ContactEvents.h"
 #include "physics/PhysicsWorld.h"
@@ -48,6 +58,9 @@
 #include "core/InputMap.h"
 #include "scene/CameraSystem.h"
 #include "scene/Prefab.h"
+#include "scene/PersistenceSelfTest.h"
+#include "scene/SceneIoSelfTest.h"
+#include "ui/ThemeSelfTest.h"
 #include "scene/SpringArm.h"
 #include "sequence/SequencerSystem.h"
 #include "dialogue/DialogueRunner.h"
@@ -60,12 +73,16 @@
 #include "assets/RampSelfTest.h"
 #include "assets/MaterialSelfTest.h"
 #include "render/QualityPresets.h"
+#include "assets/Pak.h"
+#include "project/AssetScan.h"
+#include "project/ProjectBuild.h"
 #include "project/ProjectCreate.h"
 #include "project/ProjectDisplay.h"
 #include "project/ProjectFile.h"
 #include "project/RecentList.h"
 #include "script/ScriptSelfTest.h"
 #include "terrain/TerrainSelfTest.h"
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -73,6 +90,7 @@
 #include <string>
 #include <vector>
 
+#if !VENN_SHIPPING
 namespace {
 
 // ---------------------------------------------------------------- 自检工具
@@ -338,19 +356,83 @@ int runDeterminismSelftest() {
 }
 
 } // namespace
+#endif   // !VENN_SHIPPING（自检夹具区）
 
 int main(int argc, char** argv) {
-    std::vector<std::string> args;
-    args.reserve(argc > 1 ? static_cast<std::size_t>(argc - 1) : 0);
+    // --help / --version 先拦掉：它们不该创建日志文件、也不该起窗口 / 出包。
     for (int i = 1; i < argc; ++i) {
-        // --help 先拦掉：它不该创建日志文件、也不该起窗口
         if (std::strcmp(argv[i], "--help") == 0 ||
             std::strcmp(argv[i], "-h") == 0) {
             std::printf("%s", runtime::runtimeHelpText());
             return 0;
         }
-        args.emplace_back(argv[i]);
+        // G30：`--version` 是**出货版也保留**的（现场排查第一句话是
+        // "你装的是哪个版本"，而玩家没有别的办法告诉你）。
+        // 输出必须是单行、稳定格式：`venn 0.2.0 shipping git=xxx`。
+        if (std::strcmp(argv[i], "--version") == 0 ||
+            std::strcmp(argv[i], "-v") == 0) {
+            std::printf("%s\n", core::buildStamp());
+            return 0;
+        }
     }
+
+#if !VENN_SHIPPING
+    // E28-1 出包：`--package <工程根> [--out <目录>] [--release-only]`
+    //
+    // 为什么出包是**运行时自己的子命令**，而不是一个新的 exe：
+    //   · 出包要复制的"游戏 exe"就是运行时的二进制 —— 交给别的工具去读，
+    //     就有"工具读到的 exe 和实际跑的不是同一个"的风险（两个 target、
+    //     两种构建配置、两份时间戳）。这里直接用 `GetModuleFileNameA` 拿
+    //     自己，**打的就是正在执行的那份字节**。
+    //   · 也不用多养一条 CMake target / 一个图标 / 一份依赖清单。
+    // 代价：`Game.exe` 多认识两个参数（`--help` 里已列出）。
+    //
+    // ⚠ G30：整段只在 dev/QA 版存在。shipping 的 Game.exe 里**没有**
+    //   "给自己打包"这个能力 —— 出包是构建机上的事，玩家手上的 exe 不该
+    //   带着一个能把自己的资产吐出来的工具。
+    std::vector<std::string> args;
+    args.reserve(argc > 1 ? static_cast<std::size_t>(argc - 1) : 0);
+    std::string pkgRoot;
+    std::string pkgOut;
+    bool pkgReleaseOnly = false;
+    // G29-a：闭包默认**开**（只打被引用到的资产）。`--no-closure` 退回整棵拷 —
+    // 这是出包失败时的第一排查动作："是不是闭包漏了？"
+    bool pkgNoClosure = false;
+    // G29-b：`--pak` 把 `assets/` 收成单个 `assets.pak`。
+    // 默认关 —— 见 ProjectBuild.h 里 BuildSpec::usePak 的说明（pak 必须
+    // 单独验过"拷到别处能跑"才配当默认）。
+    bool pkgPak = false;
+    // G30：要打进包的 exe（空 = 自己这份）。`make` 出来后 bin/ 里同时躺着
+    // dev 与 shipping 两份 Game.exe 时，用它可以"用 dev 版当工具、打 shipping 版进去"。
+    std::string pkgEngine;
+    // pdb 归档：-1 = 按风味自动（shipping 归档 / dev 不归档），0/1 = 显式。
+    int pkgPdb = -1;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        // 支持 `--k v` 与 `--k=v`（与 parseRuntimeConfig 的取值方式一致）
+        auto take = [&](std::string& dst) {
+            const std::size_t eq = a.find('=');
+            if (eq != std::string::npos) dst = a.substr(eq + 1);
+            else if (i + 1 < argc) dst = argv[++i];
+        };
+        if (a == "--package") take(pkgRoot);
+        else if (a.rfind("--package=", 0) == 0) take(pkgRoot);
+        else if (a == "--out") take(pkgOut);
+        else if (a.rfind("--out=", 0) == 0) take(pkgOut);
+        else if (a == "--engine") take(pkgEngine);
+        else if (a.rfind("--engine=", 0) == 0) take(pkgEngine);
+        else if (a == "--release-only") pkgReleaseOnly = true;
+        else if (a == "--no-closure") pkgNoClosure = true;
+        else if (a == "--pak") pkgPak = true;
+        else if (a == "--pdb") pkgPdb = 1;
+        else if (a == "--no-pdb") pkgPdb = 0;
+        else args.push_back(a);
+    }
+#else
+    // shipping：没有出包子命令，命令行原样交给运行时配置去解析
+    // （未识别的参数会被忽略 —— 玩家双击快捷方式时带什么都无害）。
+    std::vector<std::string> args(argv + 1, argv + argc);
+#endif
 
     try {
         VK_LOG_INFO("=== Venn Engine - Runtime (Game.exe) ===");
@@ -361,13 +443,93 @@ int main(int argc, char** argv) {
         const std::string logPath = log.open("venn");
         if (!logPath.empty()) VK_LOG_INFO("GAME-LOG path=%s", logPath.c_str());
 
+        // G30：风味 / git 号 —— 玩家发来的日志里第一眼要看的就是这一行。
+        // 单独一行（而不是塞进 GAME-CONFIG）是因为它**与配置无关**，
+        // 配错参数时 GAME-CONFIG 可能压根打不出来。
+        VK_LOG_INFO("GAME-BUILD %s", core::buildStamp());
+
         const runtime::RuntimeConfig cfg = runtime::parseRuntimeConfig(args);
 
+#if !VENN_SHIPPING
+        // ---- E28-1 出包：不建窗口、不碰 GPU，做完就退 ----
+        if (!pkgRoot.empty()) {
+            std::string root = pkgRoot;
+            for (char& c : root) {
+                if (c == '\\') c = '/';
+            }
+            while (root.size() > 1 && root.back() == '/') root.pop_back();
+
+            project::BuildSpec bs;
+            bs.projectRoot = root;
+            bs.engineExe = pkgEngine.empty() ? project::engineExePath() : pkgEngine;
+            bs.allowDebugEngine = !pkgReleaseOnly;
+            bs.useClosure = !pkgNoClosure;
+            bs.usePak = pkgPak;
+            // pdb 归档默认**跟着打进包的那个 exe 走**：shipping 归档（崩溃
+            // 要能还原栈），dev 不归档（Debug 的 pdb 上百 MB，且拿到包的
+            // 那个人本来就有源码）。
+            {
+                std::string git;
+                const std::string flavor =
+                    project::probeExeFlavor(bs.engineExe, git);
+                bs.copyPdb = (pkgPdb < 0) ? (flavor == "shipping") : (pkgPdb == 1);
+                VK_LOG_INFO("PACKAGE-ENGINE exe=%s flavor=%s git=%s pdb=%d",
+                            bs.engineExe.c_str(), flavor.c_str(),
+                            git.empty() ? "-" : git.c_str(),
+                            bs.copyPdb ? 1 : 0);
+            }
+            if (pkgOut.empty()) {
+                // 默认落在工程自己的 `dist/` 下。**不设在工程外**：
+                // 工程可能被移到别的盘，"包跟着工程走"最不容易丢。
+                // ⚠ 只打包 `assets/` 与 `config/`，所以 `dist/` 不会被卷进
+                //   下一次打包（不会自我膨胀）。
+                project::ProjectFile pf;
+                std::string perr;
+                std::string name = "Game";
+                if (project::loadProject(root, pf, &perr) && !pf.name.empty()) {
+                    name = pf.name;
+                }
+                for (char& c : name) {
+                    if (c == ' ' || c == '/' || c == '\\' || c == ':') c = '_';
+                }
+                bs.outDir = root + "/dist/" + name;
+            } else {
+                bs.outDir = pkgOut;
+                for (char& c : bs.outDir) {
+                    if (c == '\\') c = '/';
+                }
+            }
+
+            const project::BuildResult br = project::buildProject(bs, nullptr);
+            for (const auto& w : br.warnings) {
+                VK_LOG_WARN("PACKAGE-WARN %s", w.c_str());
+            }
+            if (!br.ok) {
+                VK_LOG_ERROR("PACKAGE-FAIL %s", br.error.c_str());
+                std::printf("PACKAGE-FAIL\n%s\n", br.error.c_str());
+                return 2;
+            }
+            VK_LOG_INFO("PACKAGE-OK out=%s files=%d bytes=%lld pruned=%d",
+                        br.outDir.c_str(), br.files, br.bytes, br.pruned);
+            std::printf("PACKAGE-OK out=%s files=%d bytes=%lld warnings=%zu "
+                        "pruned=%d pak=%d pakEntries=%d pakRaw=%llu "
+                        "pakPacked=%llu\n",
+                        br.outDir.c_str(), br.files, br.bytes, br.warnings.size(),
+                        br.pruned, br.pak ? 1 : 0, br.pakEntries,
+                        br.pakRaw, br.pakPacked);
+            return 0;
+        }
+#endif   // !VENN_SHIPPING（出包子命令）
+
+#if !VENN_SHIPPING
         // ---- 无窗口自检：在 Vulkan / 窗口之前返回 ----
         // （与 editor/main.cpp 的 MYVK_PHYS_TEST 同一个位置、同一条理由：
         //   自检不依赖 GPU，就该能在任何机器上跑，且跑得飞快。）
         if (cfg.selftest == "states") return runStateSelftest();
         if (cfg.selftest == "determinism") return runDeterminismSelftest();
+
+        // ---- G16 稳定身份（纯内存，无设备）----
+        if (cfg.selftest == "guid") return ecs::runGuidSelfTest() == 0 ? 0 : 1;
 
         // ---- M2 的五个无窗口自检 ----
         // 每一个都是"跑完打印 TOTAL，失败数当退出码"，与上面两个同一条规矩：
@@ -390,6 +552,22 @@ int main(int argc, char** argv) {
         // （有选项时 advance 必须原地不动、越界选择不改状态、结束即撒手）。
         if (cfg.selftest == "dialogue")
             return dialogue::runDialogueSelfTest() == 0 ? 0 : 1;
+        // G16-5 序列化器三段拆分：parse（纯 CPU）/ instantiate（纯 CPU）/
+        // resolve（唯一要 AssetManager）。验收就是**这两段能在没有设备时跑完**，
+        // 以及"三段加起来 == 原来那个一把梭的 sceneFromJson"。
+        // ⚠ 名字是 `sceneio` 不是 `save`：`save` 已被存档（G17）占了，
+        //   两个功能抢一个子命令会让人以为"存档自检只要跑这个就行"。
+        if (cfg.selftest == "sceneio")
+            return scene::runSceneIoSelfTest() == 0 ? 0 : 1;
+        // G17-1 存档**文件层**：结构指纹 / 格式逐字节往返 / v1→v2 迁移 /
+        // 原子写（写两次、退 .bak、拒重复 guid）。无窗口无设备。
+        // ⚠ diff 与应用（`applySaveGame`）是 G17-2，不在这里。
+        if (cfg.selftest == "save")
+            return scene::runPersistenceSelfTest() == 0 ? 0 : 1;
+        // 主题系统（2026-10-27 二次元改造）：下标稳定 / 每套不同 / 明暗自洽 /
+        // 度量 / 越界夹取。纯数值，**不建窗口也不需要 ImGui 上下文** ——
+        // applyTheme 在没有 GImGui 时只更新数据（见 ImGuiTheme.cpp）。
+        if (cfg.selftest == "theme") return ui::runThemeSelfTest() == 0 ? 0 : 1;
         if (cfg.selftest == "player")
             return runtime::runPlayerSelfTest() == 0 ? 0 : 1;
         // 第三人称弹簧臂（= UE SpringArmComponent 的球扫掠 + 穿透优先）。
@@ -461,13 +639,27 @@ int main(int argc, char** argv) {
         if (cfg.selftest == "project")
             return project::runAllProjectSelfTests() == 0 ? 0 : 1;
 
+        // E28-1 出包（P 组）：临时造一个工程 → 打包 → 清单对账 / 缺入口必须
+        // 失败 / 目标非空必须拒绝 / Debug 引擎必须带 WARNING。纯文件 IO。
+        //
+        // ⚠ **不并进 `project` 那一组**：那一组测的是"建工程"（模板复制、
+        //   占位符、目录联接），这一组测的是"出包"（拷贝、哈希、拒绝覆盖）。
+        //   混在一起以后，红了要先把 40 条看完才知道是建错了还是打错了。
+        if (cfg.selftest == "package") return project::runBuildSelfTest() == 0 ? 0 : 1;
+        // G29-a 引用闭包（S 组）：索引 / 三种引用写法 / 环引用 / 坏 JSON /
+        // 未解析必须失败。纯文件 IO，不开窗口。
+        if (cfg.selftest == "scan") return project::runScanSelfTest() == 0 ? 0 : 1;
+        // G29-b pak 容器（K 组）：编解码往返 / 容器往返 / 三种坏包必须拒绝。
+        if (cfg.selftest == "pak") return assets::runPakSelfTest() == 0 ? 0 : 1;
+
         if (!cfg.selftest.empty()) {
             VK_LOG_WARN("未知自检项 '%s'（可用：states | determinism | input | "
                         "character | contact | camera | player | hud | audio |\n"
                         "                        audio-config | material | lod | "
-                        "terrain | script | scriptbench | project）",
+                        "terrain | script | scriptbench | project | package | scan | pak）",
                         cfg.selftest.c_str());
         }
+#endif   // !VENN_SHIPPING（无窗口自检区）
 
         runtime::RuntimeApp app(cfg);
         const int rc = app.run(cfg.maxFrames);

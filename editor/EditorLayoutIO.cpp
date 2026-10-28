@@ -111,6 +111,26 @@ bool loadEditorLayout(LayoutState& out) {
         }
     }
 
+    // ---- slots（E29-1：叶子 → 面板）----
+    // 形状：{"slots": [{"a": ["modes"], "b": []}, ...]}，数组长度 = 节点数。
+    // 缺这一段 = 老文件 = 保持默认树（**不覆盖**，所以读回来与改造前一致）。
+    if (j.contains("slots") && j["slots"].is_array()) {
+        const auto& arr = j["slots"];
+        const int n = static_cast<int>(arr.size());
+        for (int i = 0; i < kLayoutSplitNodes && i < n; ++i) {
+            const json& n0 = arr[static_cast<size_t>(i)];
+            if (!n0.is_object()) continue;
+            for (int side = 0; side < 2; ++side) {
+                const char* key = (side == 0) ? "a" : "b";
+                if (!n0.contains(key) || !n0[key].is_array()) continue;
+                for (const auto& it : n0[key]) {
+                    if (it.is_string()) {
+                        s.slotGroups[i][side].push_back(it.get<std::string>());
+                    }
+                }
+            }
+        }
+    }
     s.viewportLayout = j.value("viewportLayout", 0);
     s.viewMode = j.value("viewMode", 0);
     s.maximized = j.value("maximized", std::string(""));
@@ -162,6 +182,21 @@ bool saveEditorLayout(const LayoutState& s) {
     }
     j["split"] = std::move(split);
 
+    // 叶子映射（E29-1）。**只在非空时写** —— 默认树不落盘，这样"用户没动过
+    // 布局"的文件与改造前逐字节相同，老读者的 diff 是零。
+    {
+        bool any = false;
+        for (int i = 0; i < kLayoutSplitNodes && !any; ++i)
+            any = !s.slotGroups[i][0].empty() || !s.slotGroups[i][1].empty();
+        if (any) {
+            json slots = json::array();
+            for (int i = 0; i < kLayoutSplitNodes; ++i) {
+                slots.push_back(json{{"a", s.slotGroups[i][0]},
+                                     {"b", s.slotGroups[i][1]}});
+            }
+            j["slots"] = std::move(slots);
+        }
+    }
     j["viewportLayout"] = s.viewportLayout;
     j["viewMode"] = s.viewMode;
     j["maximized"] = s.maximized;

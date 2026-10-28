@@ -40,9 +40,10 @@ OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify")
 
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_WHEEL = 0x0800
 
 RECT_RE = re.compile(
-    r"(CB-CELL [^=]+|MAT-SLOT [^=]+|MAT-CHIP [^ ]+|VP-RECT)"
+    r"(CB-CELL [^=]+|MAT-SLOT [^=]+|MAT-CHIP [^ ]+|VP-RECT|INS-MESH-HEADER)"
     r"=\((-?\d+),(-?\d+)\)-\((-?\d+),(-?\d+)\)")
 # MAT-CHIP <slot> shows="<file name>"  （空槽是 "(empty)"）
 CHIP_RE = re.compile(r'MAT-CHIP (\S+) shows="([^"]*)"')
@@ -139,6 +140,40 @@ def drag(hwnd, src, dst, label):
     time.sleep(0.3)
     user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
     time.sleep(1.1)
+
+
+def wheel_at(hwnd, x, y, notches):
+    """在 (x,y) 处滚 notches 格（正 = 向下滚 → 内容上移）。"""
+    force_foreground(hwnd)
+    move_to(hwnd, x, y)
+    time.sleep(0.15)
+    for _ in range(abs(notches)):
+        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0,
+                           -120 if notches > 0 else 120, 0)
+        time.sleep(0.12)
+    time.sleep(0.4)
+
+
+def scroll_slot_into_view(hwnd, tap, tag, limit_y, tries=10):
+    """把 tag 那块控件滚到 limit_y 之上。
+
+    ⚠ 为什么必须滚（2026-10-27 修）：Inspector 的内容比窗口高时，材质区
+      整个落在面板**外面**（ImGui 会裁掉，但 `logRect` 打的还是逻辑坐标），
+      于是 rect 看着"有"，鼠标点上去却什么也没点中 —— 表现是"拖过去没反应"，
+      而且因为坐标还在，用例连"矩形缺失"这种明确错误都报不出来，只会反复
+      retry 然后 FAIL。窗口 1600x1220 时 roughness/emissive 两行就是这种。
+      先滚进来，再拖。
+    """
+    r = tap.wait_rect(tag, 4.0)
+    for _ in range(tries):
+        if not r or r[3] <= limit_y:
+            return r
+        hdr = tap.wait_rect("INS-MESH-HEADER", 2.0)
+        if not hdr:
+            return r
+        wheel_at(hwnd, (hdr[0] + hdr[2]) // 2, (hdr[1] + hdr[3]) // 2, 1)
+        r = tap.wait_rect(tag, 2.5)
+    return r
 
 
 def mean_luma(img, box):
@@ -260,8 +295,16 @@ def main():
 
         for slot in ("metallic", "roughness", "emissive"):
             got = None
+            # Inspector 内容可能比窗口高 → 先把目标槽滚进可视区（见
+            # scroll_slot_into_view 的注释）。已可见时它是幂等的。
+            r = scroll_slot_into_view(hwnd, tap, "MAT-SLOT " + slot, vp[3])
+            if r and r[3] > vp[3]:
+                check("拖到 %s" % slot, False,
+                      "槽 y=[%.0f,%.0f] 滚不进可视区（≤%.0f）"
+                      % (r[1], r[3], vp[3]))
+                continue
             for attempt in range(3):
-                r = tap.wait_rect("MAT-SLOT " + slot, 6.0)
+                r = scroll_slot_into_view(hwnd, tap, "MAT-SLOT " + slot, vp[3])
                 cell = tap.wait_rect("CB-CELL " + args.asset, 6.0)
                 if not r or not cell:
                     check("拖到 %s" % slot, False, "矩形缺失")

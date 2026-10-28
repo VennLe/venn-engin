@@ -106,6 +106,47 @@ struct ScriptError {
 // ⚠ 没有安装的函数 = 该能力在本宿主里不存在。`vel/setVel/impulse` 缺失时
 //   **报错**（静默返回 0 会让"忘了加 RigidBody"藏起来）；`grounded` 缺失
 //   时返回 false（"不在空中"是合理的默认，且地形缺失时游戏仍应能跑）。
+// ---------------------------------------------------------------- 关节（J5-4）
+//
+// 脚本能不能配关节，决定了"玩法里能不能临时拴住 / 放开一个东西"：
+// 被抓的箱子吊上钩子、被打断的吊桥、上了锁就要转钥匙的门 —— 这些都不是
+// 场景加载时能定死的，必须由脚本在运行时改。
+//
+// ⚠ 为什么每个动作都返回 **bool** 而不是 void：
+//   传错 kind 字符串、目标没有刚体、实体身上根本没有 `JointComponent`
+//   （要先在 Inspector 里 Add Joint）—— 这些都是**配置错误**，必须让那条
+//   语句报错。静默成功会变成"我脚本写了关节，怎么没效果"，而根因在另一个
+//   工具里（Inspector / 场景文件），从脚本这一侧完全看不见。
+//
+// ⚠ 为什么没有"创建关节"：关节是**两个已有刚体之间**的关系，而脚本没有
+//   能力凭空给一个实体加刚体（那是场景编辑的活）。所以 `set()` 的前提是
+//   那个实体身上已经有组件 —— 没有就报错并说清楚。
+//
+// ⚠ self 一律是**显式参数**（与 S2 的 `setPos(e, ...)` 一致，而不是老的
+//   `move(x,y,z)` 那种隐式 self）：脚本最常见的用法是"把别人的门锁上"，
+//   隐式 self 会把这类用法逼成 `self()` + 变量中转。
+struct ScriptJointActions {
+    // `joint(self, other, "hinge")`。other 无效（none）也算失败。
+    std::function<bool(ecs::Entity, ecs::Entity, const std::string&)> set;
+    // `jointAnchors(self, ax, ay, az, bx, by, bz)` —— 都是各自的**局部**坐标。
+    std::function<bool(ecs::Entity, glm::vec3, glm::vec3)> anchors;
+    // `jointAxis(self, x, y, z)` —— self 的局部坐标。
+    std::function<bool(ecs::Entity, glm::vec3)> axis;
+    // `jointLimit(self, on, lo, hi)` —— 铰链是弧度、滑动是米。
+    std::function<bool(ecs::Entity, bool, float, float)> limit;
+    // `jointMotor(self, speed, force)` —— force <= 0 等于关掉（推不动）。
+    std::function<bool(ecs::Entity, float, float)> motor;
+    std::function<bool(ecs::Entity, bool)> enable;
+    // 返回 false = 那个实体身上本来就没有关节（不是"删失败"）。
+    std::function<bool(ecs::Entity)> remove;
+    // 返回的是静态字符串（"hinge" / "ball" / ...），nullptr = 没有关节。
+    // 不返回 std::string：调用方只读，不拥有。
+    std::function<const char*(ecs::Entity)> kindOf;
+    // 另一端。没指定 / 找不到时返回**无效句柄**（不是报错）——
+    // 脚本里 `if exists(jointTarget(e))` 就能判，不必额外查错。
+    std::function<ecs::Entity(ecs::Entity)> target;
+};
+
 struct ScriptWorldActions {
     // 谁是玩家。engine 不知道（那是 app 的概念），所以由宿主告诉它。
     std::function<ecs::Entity()> player;
@@ -171,6 +212,10 @@ struct ScriptWorldActions {
     //   好感度就是 0"是正确语义，不是笔误）。
     std::function<bool(const std::string&, double)> setFlag;
     std::function<double(const std::string&)> getFlag;
+
+    // 关节（J5-4）。全部未安装时，脚本调用会**报错**而不是静默无操作
+    // —— 与 `setVel` 缺失时 `noBody()` 报错同一条纪律。
+    ScriptJointActions joints;
 };
 
 struct ScriptHost {

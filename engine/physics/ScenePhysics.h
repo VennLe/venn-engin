@@ -69,6 +69,10 @@ struct SceneBinding {
     int rigidEntities = 0;  // 场景里带 RigidBodyComponent 的实体数
     // 触发体数量（G08）：带 TriggerComponent 的实体。它们也算 `bodies`。
     int triggers = 0;
+    // 关节（J5）：这一帧真正建进物理世界的条数。**只统计成功的** ——
+    // 悬空 target / 缺刚体 / enabled=false 都会被跳过并打一行 WARN，
+    // 所以要判断"我配的关节生效了吗"就读这个数（面板上也显示它）。
+    int joints = 0;
     // 物理材质覆盖（G08）：带 PhysicsMaterialComponent 的体数。
     // 0 = 全部走 RigidBodyComponent 的字段（= G08 之前的行为）。
     int materials = 0;
@@ -104,6 +108,26 @@ struct SceneBinding {
 // 因为它会被写回变换。
 SceneBinding buildSceneWorld(scene::Scene& scene,
                              const SceneBuildOptions& opts = {});
+
+// 只重建**关节**，不动刚体（J5-4）。
+//
+// 什么时候用它：**运行时**改动了关节（脚本 `joint()` / `jointOn()` /
+// `jointRemove()`，或以后运行态 Inspector 的编辑）。这时绝不能调
+// `buildSceneWorld` —— 它会连刚体一起重建，场景里每个物体的位置与速度
+// 都会回到初始值（"改一个关节，整局撞回原点"）。
+//
+// 返回重建后真正建成的条数（跳过的不算，口径与 `SceneBinding::joints` 一致）。
+// `binding.world` 为空（场景关了物理）时返回 0，不报错。
+std::size_t rebuildJoints(scene::Scene& scene, SceneBinding& binding);
+
+// 同一个操作，但刚体映射由调用方直接给。
+//
+// 编辑器 Play 用的就是这条：它的 `SceneBinding` 是 `buildPhysicsWorld()` 的
+// 局部变量（刚体世界与映射在函数返回时就分别搬进了 `EditorApp` 的两个成员），
+// 拿不到那份 binding 本体。两条重载走的是同一个 `buildJoints`，语义不会漂移。
+std::size_t rebuildJoints(
+    scene::Scene& scene, PhysicsWorld& world,
+    const std::unordered_map<ecs::EntityId, BodyId>& entityToBody);
 
 // 运动学体：由**实体**推物理（而不是反过来）。
 // 脚本 / 动画把运动学对象挪到哪，它就以那个速度去撞别人 —— 位置差除以 dt

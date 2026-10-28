@@ -3,6 +3,7 @@
 #include "DebugRects.h"
 #include "Localization.h"
 #include "ModeRail.h"
+#include "PanelLayout.h"
 #include "PickingSystem.h"
 
 #include "assets/AssetPath.h"
@@ -2388,11 +2389,14 @@ void LandscapeEditor::drawStatsSection() {
     const glm::vec2 size = m_asset.worldSize();
 
     ImGui::SeparatorText(TR("Terrain"));
-    ImGui::Text("%s", m_source.c_str());
-    ImGui::Text(TR("%d x %d samples  ·  %.0f x %.0f m  ·  %.2f m / sample"),
-                d.cols, d.rows, static_cast<double>(size.x),
-                static_cast<double>(size.y),
-                static_cast<double>(d.metersPerPixel));
+    // 2026-10-28：源文件路径与尺寸合成一行。
+    // ⚠ 这不是"顺手挤一挤"：左栏参数面板只有 ~417px 高，而下面工具网格
+    //   有 8 个按钮 —— 上面每多占一行（~20px），网格最后一行就往下掉 20px，
+    //   掉出面板之后**有矩形却点不到**（旧注释记过这条坑）。少一行 = 网格
+    //   多一行安全余量。
+    ImGui::Text(TR("%s  ·  %d x %d samples  ·  %.0f x %.0f m"),
+                m_source.c_str(), d.cols, d.rows,
+                static_cast<double>(size.x), static_cast<double>(size.y));
 
     // 高度范围 + 平均：给"笔刷到底改没改到东西"一个数字证据
     float lo = 1.0f, hi = 0.0f;
@@ -2412,26 +2416,38 @@ void LandscapeEditor::drawStatsSection() {
                 static_cast<double>(hi * scale),
                 static_cast<double>(mean * scale), static_cast<double>(scale));
 
-    if (ImGui::Button(TR("Focus"))) focusCamera();
+    // 2026-10-28：三个按钮原来是一行 SameLine 硬排、"auto-saves while you
+    // paint" 那句话再挤在同一行末尾 —— 窄栏里最后一个按钮直接被裁。
+    // 现在按钮走响应式网格（够宽 3 列、窄了 2 列 + 换行），说明文字另起一行。
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const int cols = panelGridColumns(avail, 110.0f, kBtnGap);
+    const float bw = panelGridWidth(avail, cols, kBtnGap);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(kBtnGap, kBtnGap));
+    if (panelGridButton(TR("Focus"), 0, cols, bw, kBtnRowH)) focusCamera();
     logRect("LS-FOCUS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-    ImGui::SameLine();
     // 2026-10-24：`Focus` 是"整片地形装进画面"（看全貌），这个是"回到角色身边"
     // （干活用）。两个都要留 —— 用户要的是平时贴着角色刷地形，偶尔才想看全貌。
     //
     // ⚠ 为什么快捷键之外还要一个按钮：`Ctrl+.` 在中文 Windows 上会被**微软拼音
     //   的"中英标点切换"**吃掉（实测真实按键到不了应用，同机单独按 `.` 却正常）。
     //   快捷键留着（用户点名要的），但必须有这条不经过键盘的路。
-    if (ImGui::Button(TR("Focus player"))) focusCameraAtPlayer();
+    if (panelGridButton(TR("Focus player"), 1, cols, bw, kBtnRowH))
+        focusCameraAtPlayer();
     logRect("LS-FOCUS-PLAYER", ImGui::GetItemRectMin(),
             ImGui::GetItemRectMax());
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("%s", TR("Camera back to the player at working "
                                    "height (Ctrl+.)"));
     }
-    ImGui::SameLine();
-    if (ImGui::Button(TR("Save now"))) saveAssets(true);
-    ImGui::SameLine();
-    ImGui::TextDisabled(TR("auto-saves while you paint"));
+    if (panelGridButton(TR("Save now"), 2, cols, bw, kBtnRowH)) saveAssets(true);
+    logRect("LS-SAVE-NOW", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    // "auto-saves while you paint" 原来是按钮右边的一行 TextDisabled —— 单独
+    // 占一行的说明文字在这里是奢侈品（见本函数开头关于 20px 的注释），
+    // 改成按钮的 tooltip：想确认的时候悬停就有，不想看的时候不占地方。
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", TR("auto-saves while you paint"));
+    }
+    ImGui::PopStyleVar();
 }
 
 void LandscapeEditor::drawToolParams() {
@@ -2482,8 +2498,15 @@ void LandscapeEditor::drawToolParams() {
             // 不是写死的 "Grass/Dirt/Rock/Snow" —— 层材质可以由材质仓库
             // 随时换掉，写死的名字一旦换过就说错了。
             // 名称解析不出来时才退回 kLayerNames 的兜底。
+            //
+            // 2026-10-28：原来是 4 × 96px 硬排一行（合计 384 + 3 个间距），
+            // 460 宽时刚好塞满、300 宽时后两个直接被裁。改成响应式网格。
+            const float layAvail = ImGui::GetContentRegionAvail().x;
+            const int layCols = panelGridColumns(layAvail, 104.0f, kBtnGap);
+            const float layW = panelGridWidth(layAvail, layCols, kBtnGap);
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                                ImVec2(kBtnGap, kBtnGap));
             for (int i = 0; i < 4; ++i) {
-                if (i) ImGui::SameLine();
                 const bool on = (m_layer == i);
                 const std::string id = layerMaterial(i);
                 // 优先用仓库条目的显示名（短、且中英双语）；仓库里没有
@@ -2501,7 +2524,8 @@ void LandscapeEditor::drawToolParams() {
                         ImGuiCol_Button,
                         ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
                 }
-                if (ImGui::Button(label.c_str(), ImVec2(96.0f, 26.0f))) {
+                if (panelGridButton(label.c_str(), i, layCols, layW,
+                                    kBtnRowH)) {
                     m_layer = i;
                     VK_LOG_INFO("LS-LAYER %d id=%s", i, id.c_str());
                 }
@@ -2510,6 +2534,7 @@ void LandscapeEditor::drawToolParams() {
                 }
                 if (on) ImGui::PopStyleColor();
             }
+            ImGui::PopStyleVar();
 
             // ---------------------------------------------------- 材质仓库
             // 把"当前层用哪个材质"做成下拉。列表来自
@@ -2617,24 +2642,27 @@ void LandscapeEditor::drawToolParams() {
 }
 
 void LandscapeEditor::drawWholeSection() {
-    // 一行三个按钮 + 一个振幅拖动框，尽量少占竖直空间。
-    // ⚠ 这块**不能**放进折叠头：折叠时按钮根本不被渲染，rect 锚点也就
-    //   没有 —— 自动化点不到，用户也想不到里面还有东西。同理也不能太长：
-    //   面板高度固定 700，内容超出后下面的按钮会滚出可视区，看起来像
-    //   "面板少了一半控件"。
+    // 整块操作。2026-10-28：原来"三个按钮挤一行（avail*0.32/0.30 + 振幅框）"，
+    // 在 300~360 宽时每个按钮只剩 ~100px、振幅框只剩 ~80px —— 数字都显示不全。
+    // 改成两行：先两个按钮，振幅框单独一行（带标签），最后再一个整宽按钮。
     ImGui::SeparatorText(TR("Whole terrain"));
 
     const float avail = ImGui::GetContentRegionAvail().x;
-    if (ImGui::Button(TR("Smooth all"), ImVec2(avail * 0.32f, 24.0f)))
+    const float halfW = panelGridWidth(avail, 2, kBtnGap);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(kBtnGap, kBtnGap));
+    if (ImGui::Button(TR("Smooth all"), ImVec2(halfW, kBtnRowH)))
         wholeSmooth();
     logRect("LS-WHOLE-SMOOTH", ImGui::GetItemRectMin(),
             ImGui::GetItemRectMax());
     ImGui::SameLine();
-    if (ImGui::Button(TR("Add noise"), ImVec2(avail * 0.30f, 24.0f)))
+    if (ImGui::Button(TR("Add noise"), ImVec2(halfW, kBtnRowH)))
         wholeNoise();
     logRect("LS-WHOLE-NOISE", ImGui::GetItemRectMin(),
             ImGui::GetItemRectMax());
-    ImGui::SameLine();
+    ImGui::PopStyleVar();
+
+    // ⚠ 不再单列一行 "Noise amplitude" 标题：拖动框自己的格式串就是
+    //   `amp %.3f`，标签已经在里面了。省下 20px 留给工具网格（见 stats 段）。
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::DragFloat("##ls_whole_amp", &m_wholeNoiseAmp, 0.002f, 0.005f, 0.30f,
                      TR("amp %.3f"));
@@ -2642,14 +2670,23 @@ void LandscapeEditor::drawWholeSection() {
         ImGui::SetTooltip("%s", TR("Noise amplitude"));
     }
 
-    if (ImGui::Button(TR("Reset to default shape"), ImVec2(-1.0f, 24.0f)))
+    if (ImGui::Button(TR("Reset to default shape"), ImVec2(-1.0f, kBtnRowH)))
         wholeReset();
     logRect("LS-WHOLE-RESET", ImGui::GetItemRectMin(),
             ImGui::GetItemRectMax());
 }
 
 void LandscapeEditor::drawBrushSection() {
-    // 2 × 4 的按钮网格（8 个工具）。工具多了之后横排会挤成一条，两列刚好够读。
+    // 工具按钮网格（8 个）。
+    //
+    // 2026-10-28：原来是硬编码 2 列 × 188px、行高 20、行距 2 —— 用户报
+    // 「按钮太拥挤、过于紧凑」。三个数字都动了：
+    //   · 行高 20 → 26（`kBtnRowH`），点得准，也是 UE 那里工具胶囊的高度；
+    //   · 纵向间距 3 → 6（`kBtnGap`），横向 8 → 6（列宽按可用宽度均分，
+    //     所以横向间距不再需要靠"留白"来凑）；
+    //   · **列数按可用宽度算**：460 宽时是 3 列 3 行（高度 90，与原来 4 行
+    //     88 几乎一样，不会把下面的控件顶出面板）；被拖到 300 宽时退成
+    //     2 列 4 行，按钮仍然全在窗口里（硬编码 188 时右边那个会被裁掉）。
     //
     // ⚠ 网格**不设段标题**，直接顶在"整块操作"下面；`Brush` 这个标题挪到
     //   网格之后、滑条之前（读起来就是"笔刷参数"）。理由（2026-10-24 实测）：
@@ -2659,8 +2696,12 @@ void LandscapeEditor::drawBrushSection() {
     //   自动化更糟：中心落在面板**下方**，砸到底部通栏上把中间视口切成了
     //   Command Palette，之后所有视口操作全部落空（verify_landscape_ground
     //   的 B/C/D 三组就是这么整片 FAIL 的，症状是"按钮齐全、笔划全无"）。
-    //   行高 22 → 20、行距 5 → 2：4 行 = 88 px，末行底边 ≈ 821 < 842（留 21 px）。
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 2.0f));
+    //   现在多了一件事托底：左栏模式列表可以折叠（表头上的箭头），折叠后
+    //   参数面板直接多拿 ~310 px。
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const int cols = panelGridColumns(avail, 132.0f, kBtnGap);
+    const float btnW = panelGridWidth(avail, cols, kBtnGap);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(kBtnGap, kBtnGap));
     struct Item { Tool t; const char* label; };
     const Item tools[kToolCount] = {
         {Tool::Raise, "Raise / Lower"},
@@ -2673,14 +2714,13 @@ void LandscapeEditor::drawBrushSection() {
         {Tool::Carve, "Carve"},
     };
     for (int i = 0; i < kToolCount; ++i) {
-        if (i % 2 == 1) ImGui::SameLine();
         const bool on = (m_tool == tools[i].t);
         if (on) {
             ImGui::PushStyleColor(
                 ImGuiCol_Button,
                 ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
         }
-        if (ImGui::Button(TR(tools[i].label), ImVec2(188.0f, 20.0f))) {
+        if (panelGridButton(TR(tools[i].label), i, cols, btnW, kBtnRowH)) {
             m_tool = tools[i].t;
             // ⚠ 两个数字都要打出来，别再混用：`LS-TOOL-<i>` 这个**锚点**用的是
             //   按钮在网格里的视觉序号 i，而 `static_cast<int>(m_tool)` 是
@@ -2716,18 +2756,24 @@ void LandscapeEditor::drawBrushSection() {
     drawToolParams();
 
     // ---- 撤销 / 重做 ----
+    // 2026-10-28：原来是写死 184 + 184（= 368 + 间距），左栏被拖到 300 时
+    // 右边那个 Redo 直接出窗口。改成按可用宽度对半分。
     ImGui::Spacing();
     const bool canUndo = !m_undo.empty();
     const bool canRedo = !m_redo.empty();
+    const float halfW = panelGridWidth(ImGui::GetContentRegionAvail().x, 2,
+                                       kBtnGap);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(kBtnGap, kBtnGap));
     if (!canUndo) ImGui::BeginDisabled();
-    if (ImGui::Button(TR("Undo stroke"), ImVec2(184.0f, 26.0f))) undoStroke();
+    if (ImGui::Button(TR("Undo stroke"), ImVec2(halfW, kBtnRowH))) undoStroke();
     logRect("LS-UNDO-BTN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     if (!canUndo) ImGui::EndDisabled();
     ImGui::SameLine();
     if (!canRedo) ImGui::BeginDisabled();
-    if (ImGui::Button(TR("Redo"), ImVec2(184.0f, 26.0f))) redoStroke();
+    if (ImGui::Button(TR("Redo"), ImVec2(halfW, kBtnRowH))) redoStroke();
     logRect("LS-REDO-BTN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     if (!canRedo) ImGui::EndDisabled();
+    ImGui::PopStyleVar();
     ImGui::TextDisabled(TR("%d undo steps  ·  Ctrl+Z / Ctrl+Shift+Z"),
                         static_cast<int>(m_undo.size()));
 

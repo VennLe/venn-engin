@@ -79,7 +79,7 @@ void hint(const char* text) {
 // 组件的"移除"按钮（跟在同行控件后面）
 bool removeButton() {
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.16f, 0.16f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ui::tokens().error);
     const bool clicked = ImGui::SmallButton(TR("Remove"));
     ImGui::PopStyleColor();
     return clicked;
@@ -1027,6 +1027,317 @@ void InspectorPanel::drawTabPhysics(ecs::Entity e) {
     drawCharacterSection(e);
     drawTriggerSection(e);
     drawPhysicsMaterialSection(e);
+    // J5：关节。**排在最后** —— 它要求两端都已经是刚体，所以天然是"最后
+    // 才配"的那一步；摆在材质覆盖前面会让读者以为它比材质更基础。
+    drawJointSection(e);
+}
+
+// ---------------------------------------------------------------- 关节（J5）
+//
+// 这一段补的是"引擎早就能算、用户一直配不了"的那一半：`physics/Joints.h`
+// 里的球窝/铰链/滑动/距离/焊死全都实现了，但编辑器里连组件都加不上，
+// 于是门、摆锤、链条、布娃娃这些**最常见的物理玩法**一个都做不出来。
+//
+// 三条设计取舍：
+//   · **有才画** —— 没有 JointComponent 时只留一个 Add 按钮。关节不像刚体
+//     那样人人都有，铺一整段"未指定"的空控件只会让页签变吵。
+//   · 另一头用**下拉选名字**，不让人填 guid：guid 是 16 位 hex，没人记得住，
+//     而选错一个字符的后果是"关节静默不生效"（最难查的那种）。
+//     候选只列**带刚体**的实体 —— 没有刚体的一端建不出关节（ScenePhysics
+//     会 WARN 跳过），先在这里挡掉比 Play 之后再看日志好。
+//   · 所有改动都进撤销栈（`fieldEdit` / `discreteEdit`）。
+void InspectorPanel::drawJointSection(ecs::Entity e) {
+    if (!e.valid()) return;
+    scene::Scene& sc = m_ctx.editorScene();
+    ecs::World& w = sc.world();
+    auto* jc = w.get<ecs::JointComponent>(e);
+
+    const bool open = sectionHeader("Joint", true, e);
+    logRect("INS-JOINT-HEADER", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (!open) return;
+
+    if (!jc) {
+        ImGui::TextDisabled(TR("This object has no joint."));
+        if (ImGui::Button(TR("Add Joint"))) {
+            m_ctx.structuralEdit("Add Joint", [&] {
+                w.add<ecs::JointComponent>(e, ecs::JointComponent{});
+            });
+            m_ctx.dirty() = true;
+        }
+        logRect("INS-JOINT-ADD", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                TR("Locks this object to another one: hinge = door / pendulum,\n"
+                   "slider = piston, distance = rope, fixed = welded.\n"
+                   "Both ends need a rigid body, and joints only run in Play."));
+        }
+        hint("A joint needs a second object. Add a rigid body to both, then "
+             "pick the other end here.");
+        return;
+    }
+
+    if (!m_ctx.isEditing()) {
+        ImGui::TextDisabled(TR("run mode - joints are read-only here"));
+    }
+    ImGui::BeginDisabled(!m_ctx.isEditing());
+
+    // ---- 启用开关 ----
+    bool en = jc->enabled;
+    if (ImGui::Checkbox(TR("Enabled"), &en)) {
+        jc->enabled = en;
+        discreteEdit(m_ctx, "Joint Enabled", &jc->enabled, !en);
+    }
+    logRect("INS-JOINT-ENABLED", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(TR("Off keeps the settings but does not build this\n"
+                             "joint on Play - handy while building a chain."));
+    }
+
+    // ---- 类型 ----
+    // 名字表在 Components.h（kjJointKindNames），和 PhysicsPanel 的关节列表
+    // 共用一份 —— 别在这里再手抄一遍。
+    static_assert(ecs::kJointKindCount == 5,
+                  "JointKind 新增了类型 → 同步 kJointKindNames 与下面这行");
+    int kind = static_cast<int>(jc->kind);
+    ImGui::SetNextItemWidth(kPhysParamW);
+    if (ImGui::Combo(TR("Type"), &kind, TrItems<5>(ecs::kJointKindNames), 5)) {
+        const ecs::JointKind prev = jc->kind;
+        jc->kind = static_cast<ecs::JointKind>(kind);
+        discreteEdit(m_ctx, "Joint Type", &jc->kind, prev);
+    }
+    logRect("INS-JOINT-KIND", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            TR("Fixed    - position and rotation both locked (welded).\n"
+               "Ball     - position locked, rotation free (universal).\n"
+               "Hinge    - one rotation axis left free (door / wheel).\n"
+               "Slider   - one translation axis left free (piston / drawer).\n"
+               "Distance - keeps the two anchors a fixed distance apart (rope)."));
+    }
+
+    // ---- 另一端 ----
+    // 候选 = 场景里**带刚体**的实体（不含自己、不含没有 guid 的）。
+    // 按名字排序是为了"界面上找得到"；同名的再用 guid 定序保证稳定。
+    std::vector<ecs::Entity> cand;
+    w.each<ecs::RigidBodyComponent>([&](ecs::Entity o, ecs::RigidBodyComponent&) {
+        if (o.id == e.id) return;
+        if (w.guid(o) == ecs::kInvalidGuid) return;   // 没有身份 ⇒ 存不了引用
+        cand.push_back(o);
+    });
+    std::sort(cand.begin(), cand.end(), [&](ecs::Entity a, ecs::Entity b) {
+        const std::string* na = w.name(a);
+        const std::string* nb = w.name(b);
+        const std::string sa = na ? *na : std::string();
+        const std::string sb = nb ? *nb : std::string();
+        if (sa != sb) return sa < sb;
+        return w.guid(a) < w.guid(b);
+    });
+
+    const ecs::Entity curTarget =
+        jc->target == ecs::kInvalidGuid ? ecs::Entity{} : w.find(jc->target);
+    std::string preview;
+    if (curTarget.valid()) {
+        const std::string* cn = w.name(curTarget);
+        preview = cn ? *cn : TR("(unnamed)");
+    } else {
+        preview = TR("(none)");
+    }
+    ImGui::SetNextItemWidth(kPhysParamW);
+    if (ImGui::BeginCombo(TR("Connected to"), preview.c_str())) {
+        if (ImGui::Selectable(TR("(none)"), !curTarget.valid())) {
+            const ecs::EntityGuid prev = jc->target;
+            jc->target = ecs::kInvalidGuid;
+            discreteEdit(m_ctx, "Joint Target", &jc->target, prev);
+        }
+        for (ecs::Entity o : cand) {
+            const std::string* on = w.name(o);
+            const ecs::EntityGuid og = w.guid(o);
+            ImGui::PushID(static_cast<int>(o.id));
+            const bool sel = curTarget.valid() && o.id == curTarget.id;
+            if (ImGui::Selectable(on ? on->c_str() : "(unnamed)", sel)) {
+                const ecs::EntityGuid prev = jc->target;
+                jc->target = og;
+                discreteEdit(m_ctx, "Joint Target", &jc->target, prev);
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    logRect("INS-JOINT-TARGET", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (!curTarget.valid()) {
+        ImGui::TextColored(ImVec4(0.92f, 0.72f, 0.35f, 1.0f), "%s",
+                           TR("pick the other end, otherwise this joint is skipped on Play"));
+    }
+
+    // ---- 锚点 / 轴 ----
+    // 局部空间：跟着物体动。用世界量会让关节"粘在原地"（见 JointComponent）。
+    ImGui::SeparatorText(TR("Anchors"));
+    // 每端一个"在视口里点一下"的按钮（J5-2）。手填局部坐标基本等于盲填 ——
+    // 用户看得见盒子的角，但那个角是 (0.5,0.5,0.5) 还是 (0.5,0.5,-0.5) 要心算。
+    //
+    // ⚠ 拾取写进去的**一定是局部坐标**：命中点是世界坐标，这里只是发请求，
+    //   真正的换算在 ViewportPanel（它才知道该用谁的世界矩阵求逆）。
+    const auto pickButton = [&](const char* id, EditorContext::AnchorPick which,
+                                const char* rectTag, bool enable) {
+        const bool active = m_ctx.anchorPick() == which &&
+                            m_ctx.anchorPickEntity().id == e.id;
+        if (active) {
+            // 激活态必须一眼可辨：按钮文字变成"正在点"，且染成强调色。
+            // 否则用户点了按钮、视口里没反应（其实在等下一次点击）。
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.86f, 0.36f, 0.28f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                  ImVec4(0.94f, 0.44f, 0.34f, 1.0f));
+        }
+        ImGui::BeginDisabled(!enable);
+        // ⚠ 必须 PushID：两个按钮的文字相同（中文译文更是逐字一样），
+        //   ImGui 按 label 算 ID，不隔离的话第二个按钮永远点不动。
+        ImGui::PushID(id);
+        bool clicked = false;
+        if (ImGui::Button(active ? TRL("click in viewport... (Esc)")
+                                 : TRL("Pick in viewport"))) {
+            clicked = true;
+        }
+        ImGui::PopID();
+        ImGui::EndDisabled();
+        if (active) ImGui::PopStyleColor(2);
+        logRect(rectTag, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        if (clicked) {
+            if (active) {
+                m_ctx.cancelAnchorPick();
+                VK_LOG_INFO("JOINT-PICK cancel entity=%u", e.id);
+            } else {
+                m_ctx.beginAnchorPick(which, e);
+                VK_LOG_INFO("JOINT-PICK begin=%s entity=%u",
+                            which == EditorContext::AnchorPick::Self ? "self"
+                                                                     : "target",
+                            e.id);
+            }
+        }
+    };
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TRL("On this object"));
+    ImGui::SameLine();
+    pickButton("##pick-self", EditorContext::AnchorPick::Self,
+               "INS-JOINT-PICK-SELF", true);
+
+    const glm::vec3 a0 = jc->anchorSelf;
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::DragFloat3("##joint-anchor-self", glm::value_ptr(jc->anchorSelf),
+                      sp(0.01f), -100.0f, 100.0f);
+    fieldEdit(m_ctx, "Joint Anchor Self", &jc->anchorSelf, a0);
+    ImGui::SetItemTooltip(TRL("Anchor on this object (local space, m)"));
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TRL("On the other object"));
+    ImGui::SameLine();
+    // 没有目标实体时禁用：命中点是世界坐标，必须换算进**它的**局部空间，
+    // 目标不存在就无从换算（不是"先随便存个世界坐标"）。
+    pickButton("##pick-target", EditorContext::AnchorPick::Target,
+               "INS-JOINT-PICK-TARGET", curTarget.valid());
+
+    const glm::vec3 b0 = jc->anchorTarget;
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::DragFloat3("##joint-anchor-target", glm::value_ptr(jc->anchorTarget),
+                      sp(0.01f), -100.0f, 100.0f);
+    fieldEdit(m_ctx, "Joint Anchor Target", &jc->anchorTarget, b0);
+    ImGui::SetItemTooltip(TRL("Anchor on the other object (its local space)"));
+
+    if (jc->kind == ecs::JointKind::Hinge ||
+        jc->kind == ecs::JointKind::Slider) {
+        const glm::vec3 ax0 = jc->axis;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::DragFloat3("##joint-axis", glm::value_ptr(jc->axis), sp(0.01f),
+                          -1.0f, 1.0f);
+        fieldEdit(m_ctx, "Joint Axis", &jc->axis, ax0);
+        ImGui::SetItemTooltip(TRL("Free axis, in this object's local space"));
+    }
+    if (jc->kind == ecs::JointKind::Distance) {
+        const float d0 = jc->distance;
+        ImGui::SetNextItemWidth(kPhysParamW);
+        ImGui::DragFloat(TRL("Distance"), &jc->distance, sp(0.01f), 0.0f, 100.0f,
+                         TR("%.3f m"));
+        fieldEdit(m_ctx, "Joint Distance", &jc->distance, d0);
+    }
+
+    // ---- 限位 / 马达 ----
+    if (jc->kind == ecs::JointKind::Hinge ||
+        jc->kind == ecs::JointKind::Slider) {
+        const bool isHinge = jc->kind == ecs::JointKind::Hinge;
+        ImGui::SeparatorText(TR("Limit"));
+        bool ul = jc->useLimit;
+        if (ImGui::Checkbox(TR("Use limit"), &ul)) {
+            jc->useLimit = ul;
+            discreteEdit(m_ctx, "Joint Use Limit", &jc->useLimit, !ul);
+        }
+        logRect("INS-JOINT-LIMIT", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        ImGui::BeginDisabled(!jc->useLimit);
+        // 铰链的限位是**弧度**、滑动是**米** —— 单位不能含糊，否则 15 和
+        // 15 度会差 57 倍（用户会以为限位坏了）。
+        const float lo0 = jc->lowerLimit, hi0 = jc->upperLimit;
+        if (isHinge) {
+            ImGui::SetNextItemWidth(kPhysParamW);
+            ImGui::DragFloat(TRL("Lower"), &jc->lowerLimit, sp(0.01f), -6.283f,
+                             0.0f, TR("%.3f rad"));
+            fieldEdit(m_ctx, "Joint Lower Limit", &jc->lowerLimit, lo0);
+            ImGui::SetNextItemWidth(kPhysParamW);
+            ImGui::DragFloat(TRL("Upper"), &jc->upperLimit, sp(0.01f), 0.0f,
+                             6.283f, TR("%.3f rad"));
+            fieldEdit(m_ctx, "Joint Upper Limit", &jc->upperLimit, hi0);
+        } else {
+            ImGui::SetNextItemWidth(kPhysParamW);
+            ImGui::DragFloat(TRL("Lower"), &jc->lowerLimit, sp(0.01f), -100.0f,
+                             0.0f, TR("%.3f m"));
+            fieldEdit(m_ctx, "Joint Lower Limit", &jc->lowerLimit, lo0);
+            ImGui::SetNextItemWidth(kPhysParamW);
+            ImGui::DragFloat(TRL("Upper"), &jc->upperLimit, sp(0.01f), 0.0f,
+                             100.0f, TR("%.3f m"));
+            fieldEdit(m_ctx, "Joint Upper Limit", &jc->upperLimit, hi0);
+        }
+        ImGui::EndDisabled();
+
+        ImGui::SeparatorText(TR("Motor"));
+        bool um = jc->useMotor;
+        if (ImGui::Checkbox(TR("Use motor"), &um)) {
+            jc->useMotor = um;
+            discreteEdit(m_ctx, "Joint Use Motor", &jc->useMotor, !um);
+        }
+        logRect("INS-JOINT-MOTOR", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        ImGui::BeginDisabled(!jc->useMotor);
+        const float ms0 = jc->motorSpeed, mf0 = jc->maxMotorForce;
+        ImGui::SetNextItemWidth(kPhysParamW);
+        ImGui::DragFloat(TRL("Speed"), &jc->motorSpeed, sp(0.01f), -50.0f, 50.0f,
+                         isHinge ? TR("%.3f rad/s") : TR("%.3f m/s"));
+        fieldEdit(m_ctx, "Joint Motor Speed", &jc->motorSpeed, ms0);
+        ImGui::SetNextItemWidth(kPhysParamW);
+        ImGui::DragFloat(TRL("Max force"), &jc->maxMotorForce, sp(1.0f), 0.0f,
+                         100000.0f, "%.0f");
+        fieldEdit(m_ctx, "Joint Motor Force", &jc->maxMotorForce, mf0);
+        if (jc->maxMotorForce <= 0.0f) {
+            ImGui::TextDisabled(TR("%s"),
+                                TR("max force 0 = the motor cannot push at all"));
+        }
+        ImGui::EndDisabled();
+    }
+
+    ImGui::EndDisabled();
+
+    if (ImGui::Button(TRL("Remove joint"))) {
+        m_ctx.structuralEdit("Remove Joint", [&] {
+            w.remove<ecs::JointComponent>(e);
+        });
+        m_ctx.dirty() = true;
+    }
+    hint("Joints are built when Play starts, between the two rigid bodies you "
+         "picked. Check the Physics panel for how many were actually built.");
 }
 
 void InspectorPanel::drawPhysicsWorldSection() {
@@ -7570,9 +7881,12 @@ void InspectorPanel::drawMaterialSection(ecs::Entity e) {
                     // 第 0 档的 pos 恒 0（normalize 会强制），所以不给拖 ——
                     // 给它一个能拖的控件只会让人以为拖了有用。
                     if (i == 0) {
-                        ImGui::TextDisabled("pos 0.00");
+                        // `pos` 是字段名（与 t/yaw 那一批同口径：中英一致），
+                        // 但仍然要包 TR —— 否则 i18n 体检会把它算成"漏翻"的
+                        // 显示格式串（E 组），而它其实只是不该改写的字段名。
+                        ImGui::TextDisabled(TR("pos 0.00"));
                     } else if (ImGui::SliderFloat("##pos", &b.pos, 0.0f, 1.0f,
-                                                  "pos %.2f")) {
+                                                  TR("pos %.2f"))) {
                         if (ImGui::IsItemDeactivatedAfterEdit())
                             commitRamp("band-pos");
                     }

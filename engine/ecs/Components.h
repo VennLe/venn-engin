@@ -706,6 +706,119 @@ struct RigidBodyComponent {
     glm::vec3 initialAngularVelocity{0.0f};
 };
 
+// ---------------- 关节 / 约束（J5，2026-10-27）----------------
+//
+// 引擎里 `physics::Joint` 早就有了（球窝 / 铰链 / 滑动 / 距离 / 焊死，见
+// `physics/Joints.h`），但它**不能直接当组件用**，两个原因：
+//   · 它按**刚体槽位下标**寻址（`bodyA/bodyB` 是 uint32）—— 每次 Play 重建
+//     物理世界下标都会变，存进场景文件等于存了一堆随机数；
+//   · 它有半数字段是求解器的草稿纸（rows[] / 累积冲量 / worldAnchor…），
+//     每帧被改写，序列化它们毫无意义、还会把"热启动"状态冻进文件。
+//
+// 所以这里是**作者侧**的孪生结构：只存"用户配了什么"。
+// 另一头用 **guid** 指（不是 EntityId —— 槽位会被复用，见 Entity.h 顶部），
+// Play 建世界时由 `physics::ScenePhysics` 翻译成 `physics::Joint`。
+//
+// ⚠ 自己这一侧永远是 A、被指的那一侧永远是 B。这样"谁绕着谁转"是确定的，
+//   不用再存一个"我是 A 还是 B"的方向位。
+// ⚠ 双方都必须有 RigidBodyComponent（或 CollisionComponent + 运动学体），
+//   否则 Play 时这条关节会被跳过并打一行 WARN —— 静默丢弃是"关节没生效"
+//   最常见的现场。
+enum class JointKind : int {
+    Fixed = 0,     // 焊死：位置与朝向全锁
+    Ball = 1,      // 球窝：位置锁、朝向自由（万向节）
+    Hinge = 2,     // 铰链：位置锁、只留一个转轴（门 / 轮子 / 摆锤）
+    Slider = 3,    // 滑动：位置只留一个轴向、朝向锁（活塞 / 抽屉）
+    Distance = 4,  // 距离：两点间距保持（绳子 / 弹簧）
+};
+
+// 展示名。**唯一一份** —— Inspector 的类型下拉和 PhysicsPanel 的关节列表
+// 都读它。两处各写一份的话，加一种关节时改一个忘一个，就会变成"下拉里叫
+// Hinge、列表里叫 Hinge2"，或者更糟：下拉有了新类型、列表下标越界。
+// 顺序必须与 enum 一致（同下标）。i18n 在**调用点**过 TR()。
+inline constexpr const char* kJointKindNames[] = {"Fixed", "Ball", "Hinge",
+                                                  "Slider", "Distance"};
+inline constexpr int kJointKindCount =
+    static_cast<int>(sizeof(kJointKindNames) / sizeof(kJointKindNames[0]));
+
+inline const char* jointKindName(JointKind k) {
+    const int i = static_cast<int>(k);
+    return (i >= 0 && i < kJointKindCount) ? kJointKindNames[i] : "?";
+}
+
+// 名字 → 枚举（**大小写不敏感**）。
+//
+// 为什么需要它：脚本里写 `joint(e, o, "hinge")` 是小写肌肉记忆，而场景
+// JSON / Inspector 显示的是 "Hinge"。两处各自 `if (name == "Hinge")` 之类
+// 的实现迟早对不上（一个认小写一个不认），所以只留这一份。
+//
+// ⚠ 返回 false = 名字不认识。调用方**必须报错**，不能"认不出就当成
+//   Hinge" —— 那会让 `joint(e, o, "hing")`（少个 e）变成一条铰链，
+//   而用户在脚本里看到的是"配了个不存在的类型却成功了"。
+inline bool parseJointKind(const char* name, JointKind& out) {
+    if (!name || !*name) return false;
+    char lower[16] = {0};
+    int n = 0;
+    for (const char* p = name; *p && n < 15; ++p, ++n) {
+        const char c = *p;
+        lower[n] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    }
+    for (int i = 0; i < kJointKindCount; ++i) {
+        char want[16] = {0};
+        int m = 0;
+        for (const char* p = kJointKindNames[i]; *p && m < 15; ++p, ++m) {
+            const char c = *p;
+            want[m] =
+                (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+        }
+        if (n == m) {
+            bool same = true;
+            for (int k = 0; k < n; ++k) {
+                if (lower[k] != want[k]) { same = false; break; }
+            }
+            if (same) {
+                out = static_cast<JointKind>(i);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+struct JointComponent {
+    JointKind kind = JointKind::Hinge;
+    // 另一端的实体 guid。0 = 还没选（Inspector 里显示"未指定"，Play 时跳过）。
+    EntityGuid target = kInvalidGuid;
+
+    // 锚点：各自体的**局部空间**。用局部量而不是世界量，是因为物体动了之后
+    // 锚点要跟着动 —— 世界量会让关节"粘在原地"（physics::Joint 同一个理由）。
+    glm::vec3 anchorSelf{0.0f};
+    glm::vec3 anchorTarget{0.0f};
+
+    // 铰链 / 滑动的轴（**自己这一侧**的局部空间）。Z-up 引擎里默认绕 Z 转，
+    // 也就是"门轴竖直"这件事最常被用到。
+    glm::vec3 axis{0.0f, 0.0f, 1.0f};
+
+    // 距离关节的目标间距（米）。kind != Distance 时忽略。
+    float distance = 1.0f;
+
+    // ---- 限位（铰链 = 弧度 / 滑动 = 米）----
+    bool useLimit = false;
+    float lowerLimit = 0.0f;
+    float upperLimit = 0.0f;
+
+    // ---- 马达（铰链 = 角速度 rad/s / 滑动 = 线速度 m/s）----
+    bool useMotor = false;
+    float motorSpeed = 0.0f;
+    float maxMotorForce = 0.0f;
+
+    // 关掉 = 保留配置但 Play 时不建这条关节。
+    // 为什么需要：搭一条链条要 5 条关节，调试时想一条条开 —— 没有这个开关
+    // 就只能删了再加回来，锚点全丢。
+    bool enabled = true;
+};
+
+
 // ---------------- 角色控制器（G07）----------------
 //
 // 与 RigidBodyComponent 的 Dynamic 体是**两种东西**：

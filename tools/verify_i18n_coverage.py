@@ -566,12 +566,17 @@ FMT_KEEP = (
     "VP-LAYOUTITEM %s", "VP-LIGHTITEM %d", "VP-SETITEM %s",
     "FX-ROW %d", "FX-BURST-%d", "FX-PRESET %d",
     "SPLIT-%d", "##split_preset_%d",
+    # E29-5：角落抓手的锚点（纯 ASCII，回归脚本按名字等它）。
+    "SPLIT-CORNER-%d",
     "NOTIF-DUMP toasts=%d history=%d warn=%d error=%d "
     "unread=%d tasks=%d minimized=%d",     # con->addCommand("notif.dump") 的开发期转储
     # W4-5/W5-0：地形笔刷与植被物种的 `logRect` 锚点 + 材质/网格资产 key。
     # 这些是**回归脚本按名字逐个等的稳定标识**，翻成中文脚本就抓不到了；
     # 而且它们从不出现在屏幕上（只进日志），本来就不该翻。
     "LS-TOOL-%d", "FO-KIND-%d", "MODE-RAIL-ITEM %s", "MODE-RAIL-%d",
+    # 2026-10-28：Foliage 面板重做时新增的两组锚点（工具格 / 每类型的眼睛）。
+    # 同上 —— 只进日志，回归脚本按名字逐个等，翻成中文立刻断。
+    "FO-TOOL-%d", "FO-VIS-%d",
     # W5-1：水体实体的自动命名（`Water_1`）。这是**对象名/标识**，会进
     # 层级树、也会被 `scene.find(name)` 用来找回实体 —— 翻成中文既没必要
     # （它本来就是个编号）也有副作用（跨语言的场景存档对不上名字）。
@@ -598,6 +603,17 @@ FMT_KEEP = (
     "f%-6d %.2fs", "k%u  %s  x%u\n",
     "%.1f KB", "%.1f MB",          # 只有单位，没有标签
     "%s", "%d", "%u", "%.3f", "(%.2f,%.2f,%.2f)",
+    # --- 2026-10-27：自动化锚点 / ImGui ID 前缀 ---
+    # 这两个 %s/%d 拼出来的是**给回归脚本和 ImGui 认的标识**，不是屏幕上
+    # 的句子：`LAYOUT-TAB-<面板id>` 是 E29-3 标签条的 logRect 锚点，
+    # `PREFS-THEMECHIP-%d` 是 Appearance 页色卡按钮的 widget ID。
+    # 翻了前者脚本立刻抓不到（`verify_layout_drag.py` 按名字等），
+    # 后者更糟 —— ID 变了按钮状态就丢。所以它们是**不该翻**，不是漏翻。
+    "LAYOUT-TAB-%s", "PREFS-THEMECHIP-%d",
+    # 自动化锚点的 tag 模板（`logRect` 的键）。它们**永远不会上屏**，
+    # 翻成中文反而会让 `verify_*.py` 里的 `has_line("MENU-GO-0")` 全部失效 ——
+    # 这类"看着是英文、其实是断言契约"的格式串必须留白名单里。
+    "MENU-GO-%d", "PHYS-JOINT-ROW-%d",
 )
 
 

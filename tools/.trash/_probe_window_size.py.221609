@@ -1,0 +1,72 @@
+"""临时探针：窗口尺寸为什么只有 1578x1106。
+
+SetWindowPos 请求 1600x1220，但 ImGui 的 DisplaySize 是 1578x1106。
+区分三种可能：① 系统限高（工作区比屏幕小）② DPI 缩放
+③ 编辑器自己夹了尺寸（SetNextWindowSizeConstraints / 最大尺寸偏好）。
+"""
+import ctypes
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from capture_window import find_window, user32              # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                ("r", ctypes.c_long), ("b", ctypes.c_long)]
+
+
+def report(tag, hwnd):
+    wr, cr = RECT(), RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(wr))
+    user32.GetClientRect(hwnd, ctypes.byref(cr))
+    print("%-10s window=(%d,%d)-(%d,%d) = %dx%d   client=%dx%d"
+          % (tag, wr.l, wr.t, wr.r, wr.b, wr.r - wr.l, wr.b - wr.t,
+             cr.r - cr.l, cr.b - cr.t))
+
+
+def main():
+    user32.SetProcessDPIAware()
+    print("screen      =", user32.GetSystemMetrics(0), "x",
+          user32.GetSystemMetrics(1))
+    wa = RECT()
+    ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(wa), 0)
+    print("work area   = (%d,%d)-(%d,%d) = %dx%d"
+          % (wa.l, wa.t, wa.r, wa.b, wa.r - wa.l, wa.b - wa.t))
+
+    env = dict(os.environ)
+    env["MYVK_NO_WINDOW_SAVE"] = "1"
+    proc = subprocess.Popen([EXE], cwd=os.path.dirname(EXE), env=env,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    try:
+        hwnd = find_window("Venn Editor")
+        if not hwnd:
+            print("no window")
+            return 2
+        user32.ShowWindow(hwnd, 9)
+        time.sleep(2.5)
+        report("initial", hwnd)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 1600, 1220, 0x0002 | 0x0004)
+        time.sleep(2.5)
+        report("1600x1220", hwnd)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 1500, 1400, 0x0002 | 0x0004)
+        time.sleep(2.5)
+        report("1500x1400", hwnd)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

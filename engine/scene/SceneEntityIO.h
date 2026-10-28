@@ -47,6 +47,30 @@ namespace scene {
 // `e` 必须已经由 `Scene::createObject` 建好（它自带 Name/Transform/Visibility）。
 void entityApplyShell(Scene& scene, const nlohmann::json& je, ecs::Entity e);
 
+// ---- G16-5：把 `entityFromJson` 劈成"纯 CPU"与"要资产"两半 ----
+//
+// 存在的理由见 `scene/SceneDocument.h`：`sceneFromJson` 原来把「建实体」
+// 和「上传网格到 GPU」写在同一个函数体里，导致 G17 无处落脚、G19 拆不了线程、
+// `--selftest` 覆盖不到读档。
+//
+// 两个函数**合起来**与 `entityFromJson` 等价（`entityFromJson` 就是先调前者
+// 再调后者 —— 只有那一处串联，所以 Prefab 与场景加载不会走出两条路）。
+
+// 只做「父子关系 + 文件夹标记」。**纯 CPU**：不解析任何资产。
+//
+// 调用前提：`created` 已经是"文件下标 → 实体"的完整表。父子必须等所有
+// 实体建完再做第二遍 —— `parentGuid` 要按 guid 反查，`parent` 下标可能
+// 指向文件里靠后的实体。
+void entityApplyHierarchy(Scene& scene, const nlohmann::json& je, ecs::Entity e,
+                          const std::vector<ecs::Entity>& created);
+
+// 只做「组件值与资产」。**会**解析 mesh / material / 骨骼 / 贴图（= 可能上传
+// GPU），是整条读档链上唯一必须留在主线程的一段。
+//
+// 返回 true = 这个实体"有内容"（与 `entityFromJson` 的返回值同一含义）。
+bool entityApplyComponents(Scene& scene, assets::AssetManager& assets,
+                           const nlohmann::json& je, ecs::Entity e);
+
 // 一个实体 → JSON（组件字段的唯一一份实现）。
 //
 // `indexOf` 是"实体 id → 文件内下标"，由调用方给：
@@ -59,9 +83,13 @@ void entityApplyShell(Scene& scene, const nlohmann::json& je, ecs::Entity e);
 //
 // ⚠ 实体**必须**有 `TransformComponent`（场景写端只遍历带变换的实体，
 //   场景级的太阳没有变换、从不进 JSON）。
+// `includeEmpty`（G17-1 存档用）：默认 `false` = 场景文件语义，"没内容的空壳"
+// 返回 false 让调用方算 skipped。存档必须传 `true` —— 只挂 Transform 的实体
+// （玩家 / 出生点 / 纯分组节点）在场景里没什么好存，但存档漏了它 = 读档后
+// 那个物体直接消失（或者被随机补发一个新 guid）。
 bool entityToJson(const ecs::World& w, ecs::Entity e,
                   const std::unordered_map<ecs::EntityId, int>& indexOf,
-                  nlohmann::json& out);
+                  nlohmann::json& out, bool includeEmpty = false);
 
 // JSON → 一个已建好的实体（与 entityToJson 成对）。
 //

@@ -119,6 +119,13 @@ enum class Builtin : uint16_t {
     //   `core::Application::m_scene` 里 —— engine 两样都够不着。
     SetFlag, GetFlag, Spawn, LoadScene,
 
+    // ---- 关节（J5-4）----
+    // `joint(e, other, kind)` 建/改；其余都是对**已有**关节的细调。
+    // `jointKind` / `jointTarget` 是读（写玩法分支时要用：先看有没有
+    // 关节，再决定是"锁上"还是"先装上"）。
+    Joint, JointAnchors, JointAxis, JointLimit, JointMotor,
+    JointOn, JointRemove, JointKindOf, JointTargetOf,
+
     Count_
 };
 
@@ -315,6 +322,12 @@ const BuiltinInfo kBuiltins[] = {
     {"playSequence", 1, 1}, {"showDialogue", 1, 1}, {"playAnim", 1, 2},
     // C6 第二批：世界四件。`spawn` 的位置可选（不给 = 原点）。
     {"setFlag", 2, 2}, {"getFlag", 1, 1}, {"spawn", 1, 2}, {"loadScene", 1, 1},
+    // J5-4：关节九件。全部要求**显式 self**（见 ScriptJointActions 的说明）。
+    // ⚠ 这里是**公开签名**（编译期按它查 arity），改实现时必须同步改这里：
+    //   对不上就是"整份脚本 not runnable"，一行日志都不像脚本的错。
+    {"joint", 3, 3}, {"jointAnchors", 3, 3}, {"jointAxis", 2, 2},
+    {"jointLimit", 4, 4}, {"jointMotor", 3, 3}, {"jointOn", 2, 2},
+    {"jointRemove", 1, 1}, {"jointKind", 1, 1}, {"jointTarget", 1, 1},
 };
 
 static_assert(sizeof(kBuiltins) / sizeof(kBuiltins[0]) ==
@@ -2539,6 +2552,207 @@ Value Evaluator::call(Builtin b, const std::vector<Value>& a, int line) {
                     "(nothing was scheduled)";
             }
             return Value::boolean(ok);
+        }
+
+        // ---- 关节九件（J5-4）----
+        //
+        // 共同的前置：宿主要装了那一件、self 要活着。`handle()` 里那个
+        // "还没装"的分支必须**报错**而不是返回 false —— 脚本看到 false
+        // 会以为是"关节配错了"，而真正的原因是"这台宿主没有关节能力"
+        // （编辑器 Play 与 Game.exe 各自注入，见 ScriptJointActions）。
+        case Builtin::Joint: {
+            const ecs::Entity e = entityOf(a[0], line, "joint(self)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!alive(e)) return badEntity(line, "joint()", e);
+            const ecs::Entity other =
+                entityOf(a[1], line, "joint(other)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!alive(other))
+                return badEntity(line, "joint(other)", other);
+            const std::string kind = strOf(a[2], line, "joint(kind)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!m_host.act.joints.set) {
+                m_err.line = line;
+                m_err.message =
+                    "joint() is not available in this host (no physics "
+                    "binding wired up)";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.joints.set(e, other, kind);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message =
+                    "joint('" + nameOf(e) + "', '" + nameOf(other) + "', '" +
+                    kind +
+                    "'): failed - check the kind name, and that BOTH ends "
+                    "have a RigidBody while this one also has a Joint "
+                    "component (add it in the Inspector, Physics tab)";
+            }
+            return Value::boolean(ok);
+        }
+        case Builtin::JointAnchors: {
+            const ecs::Entity e = entityOf(a[0], line, "jointAnchors(self)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!alive(e)) return badEntity(line, "jointAnchors()", e);
+            // 两个锚点各是一个 **vec3**（不是六个标量）。理由与其他 API 一致：
+            // 位置类参数在脚本里一律是 `vec3`（`setPos(e, vec3)` / `near(c, r)`），
+            // 只有这里是六个数字的话，用户得同时记住"哪个是 xyz、第几个是另一
+            // 端"，写错顺序的表现是"一按播放物体被拽飞"。
+            //
+            // ⚠ 两个 vec3 是**不同的空间**：第一个是**自己**的局部坐标，第二个
+            //   是**另一端**的局部坐标。写反了同样是被拽飞。
+            //
+            // ⚠ 这里曾经声明成 7 个参数（self + 六个标量）。那样任何按
+            //   `jointAnchors(e, v1, v2)` 写的脚本都会**编译期**报
+            //   "expects 7 argument(s), got 3" —— 整份脚本 not runnable，
+            //   表现是"什么日志都没有"。教训：内建的 arity 就是它的公开签名，
+            //   改实现时**必须**连 `kBuiltins[]` 一起改，否则脚本侧完全不可用。
+            const glm::vec3 pa = v3(1, "jointAnchors(anchorSelf)");
+            if (!m_err.ok()) return Value::boolean(false);
+            const glm::vec3 pb = v3(2, "jointAnchors(anchorTarget)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!m_host.act.joints.anchors) {
+                m_err.line = line;
+                m_err.message =
+                    "jointAnchors() is not available in this host";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.joints.anchors(e, pa, pb);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message = "jointAnchors('" + nameOf(e) +
+                                "'): that entity has no joint";
+            }
+            return Value::boolean(ok);
+        }
+        case Builtin::JointAxis: {
+            const ecs::Entity e = entityOf(a[0], line, "jointAxis(self)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!alive(e)) return badEntity(line, "jointAxis()", e);
+            // 轴也是 vec3（与 jointAnchors 同一条理由，见那里的注释）。
+            const glm::vec3 ax = v3(1, "jointAxis(axis)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!m_host.act.joints.axis) {
+                m_err.line = line;
+                m_err.message = "jointAxis() is not available in this host";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.joints.axis(e, ax);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message = "jointAxis('" + nameOf(e) +
+                                "'): that entity has no joint";
+            }
+            return Value::boolean(ok);
+        }
+        case Builtin::JointLimit: {
+            const ecs::Entity e = entityOf(a[0], line, "jointLimit(self)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!alive(e)) return badEntity(line, "jointLimit()", e);
+            const bool on = a[1].truthy();
+            const float lo = f(2, "jointLimit(lower)");
+            const float hi = f(3, "jointLimit(upper)");
+            if (!m_host.act.joints.limit) {
+                m_err.line = line;
+                m_err.message = "jointLimit() is not available in this host";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.joints.limit(e, on, lo, hi);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message =
+                    "jointLimit('" + nameOf(e) +
+                    "'): that entity has no joint, or its kind has no limit "
+                    "(only hinge / slider do)";
+            }
+            return Value::boolean(ok);
+        }
+        case Builtin::JointMotor: {
+            const ecs::Entity e = entityOf(a[0], line, "jointMotor(self)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!alive(e)) return badEntity(line, "jointMotor()", e);
+            const float speed = f(1, "jointMotor(speed)");
+            const float force = f(2, "jointMotor(maxForce)");
+            if (!m_host.act.joints.motor) {
+                m_err.line = line;
+                m_err.message = "jointMotor() is not available in this host";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.joints.motor(e, speed, force);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message =
+                    "jointMotor('" + nameOf(e) +
+                    "'): that entity has no joint, or its kind has no motor "
+                    "(only hinge / slider do)";
+            }
+            return Value::boolean(ok);
+        }
+        case Builtin::JointOn: {
+            const ecs::Entity e = entityOf(a[0], line, "jointOn(self)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!alive(e)) return badEntity(line, "jointOn()", e);
+            if (!m_host.act.joints.enable) {
+                m_err.line = line;
+                m_err.message = "jointOn() is not available in this host";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.joints.enable(e, a[1].truthy());
+            if (!ok) {
+                m_err.line = line;
+                m_err.message = "jointOn('" + nameOf(e) +
+                                "'): that entity has no joint";
+            }
+            return Value::boolean(ok);
+        }
+        case Builtin::JointRemove: {
+            const ecs::Entity e = entityOf(a[0], line, "jointRemove(self)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!alive(e)) return badEntity(line, "jointRemove()", e);
+            if (!m_host.act.joints.remove) {
+                m_err.line = line;
+                m_err.message = "jointRemove() is not available in this host";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.joints.remove(e);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message = "jointRemove('" + nameOf(e) +
+                                "'): that entity has no joint to remove";
+            }
+            return Value::boolean(ok);
+        }
+        case Builtin::JointKindOf: {
+            const ecs::Entity e = entityOf(a[0], line, "jointKind(self)");
+            if (!m_err.ok()) return Value::str("");
+            if (!alive(e)) {
+                m_err.line = line;
+                m_err.message = "jointKind() got an invalid or deleted entity";
+                return Value::str("");
+            }
+            if (!m_host.act.joints.kindOf) {
+                m_err.line = line;
+                m_err.message = "jointKind() is not available in this host";
+                return Value::str("");
+            }
+            const char* k = m_host.act.joints.kindOf(e);
+            // 没有关节 → 空串（不是报错）：`if jointKind(e) == ""` 是
+            // 合法且常用的写法（"还没装上就先装上"）。
+            return Value::str(k ? k : "");
+        }
+        case Builtin::JointTargetOf: {
+            const ecs::Entity e = entityOf(a[0], line, "jointTarget(self)");
+            if (!m_err.ok()) return Value::makeEntity(ecs::Entity{});
+            if (!alive(e)) return badEntity(line, "jointTarget()", e);
+            if (!m_host.act.joints.target) {
+                m_err.line = line;
+                m_err.message = "jointTarget() is not available in this host";
+                return Value::makeEntity(ecs::Entity{});
+            }
+            // 另一端没指定时返回空句柄 —— `exists()` 对它返回 false，
+            // 脚本侧不用额外判空。
+            const ecs::Entity t = m_host.act.joints.target(e);
+            return Value::makeEntity(t, nameOf(t));
         }
 
         case Builtin::None:

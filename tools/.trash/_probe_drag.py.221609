@@ -1,0 +1,113 @@
+"""临时探针：把"拖图进材质槽"整个过程拆成截图，看是哪一步断的。
+
+断点假设：
+  ① 拖拽源没点火（画面里没有 DnD 预览窗）→ ContentBrowser 那边的问题；
+  ② 点火了但落点被别的东西遮住（没有目标高亮）→ 几何遮挡；
+  ③ 落点高亮正常但松开没生效 → 目标端 / 载荷格式的问题。
+"""
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from capture_window import find_window, user32, capture_client   # noqa: E402
+from verify_add_menu import LogTap                               # noqa: E402
+from verify_asset_drag import force_foreground, move_to          # noqa: E402
+from verify_mesh_params import wait_rect                          # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
+OUT = os.path.join(ROOT, "_venn_verify", "probe_drag")
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+
+
+def shot(hwnd, name):
+    os.makedirs(OUT, exist_ok=True)
+    img, ok = capture_client(hwnd)
+    if ok:
+        p = os.path.join(OUT, name)
+        img.save(p)
+        print("  shot:", p)
+    return img
+
+
+def main():
+    env = dict(os.environ)
+    env["MYVK_LOG_RECTS"] = "1"
+    env["MYVK_NO_WINDOW_SAVE"] = "1"
+    env["MYVK_CONTENT_DIR"] = "assets/models/Cube"
+    env["MYVK_EDITOR_SELECT"] = "Ground"
+    proc = subprocess.Popen([EXE], cwd=os.path.dirname(EXE), env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            bufsize=1)
+    tap = LogTap()
+    tap.start(proc)
+    try:
+        hwnd = find_window("Venn Editor")
+        if not hwnd:
+            print("no window")
+            return 2
+        user32.ShowWindow(hwnd, 9)
+        time.sleep(2.0)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 1600, 1220, 0x0002 | 0x0004)
+        time.sleep(3.0)
+        force_foreground(hwnd)
+        time.sleep(1.0)
+
+        cell = wait_rect(tap, "CB-CELL Cube_BaseColor.png", 12.0)
+        slot = wait_rect(tap, "MAT-SLOT metallic", 12.0)
+        drawer = tap.last_rect("CONTENT-DRAWER")
+        print("cell=", cell, "slot=", slot, "\ndrawer=", drawer)
+        if not cell or not slot:
+            return 3
+        sx, sy = (cell[0] + cell[2]) // 2, (cell[1] + cell[3]) // 2
+        tx, ty = (slot[0] + slot[2]) // 2, (slot[1] + slot[3]) // 2
+        print("drag (%d,%d) -> (%d,%d)" % (sx, sy, tx, ty))
+
+        shot(hwnd, "0_before.png")
+        move_to(hwnd, sx, sy)
+        time.sleep(0.3)
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.3)
+        for dx in (4, 10, 16):
+            move_to(hwnd, sx + dx, sy + dx // 2)
+            time.sleep(0.2)
+        shot(hwnd, "1_armed.png")     # 应该已经出现 DnD 预览
+
+        mx, my = sx + 16, sy + 8
+        for i in range(1, 7):
+            nx = mx + (tx - mx) * i // 6
+            ny = my + (ty - my) * i // 6
+            move_to(hwnd, nx, ny)
+            time.sleep(0.18)
+            if i == 3:
+                shot(hwnd, "2_midway.png")
+        shot(hwnd, "3_on_target.png")
+        with tap.lock:
+            tail1 = [l for l in tap.lines if "DROP" in l or "BIND" in l
+                     or "MAT-CHIP metallic" in l][-6:]
+        print("  during:", tail1)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        time.sleep(1.4)
+        shot(hwnd, "4_after.png")
+        with tap.lock:
+            lines = list(tap.lines)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    for ln in lines:
+        if any(k in ln for k in ("DROP", "BIND", "MAT-CHIP metallic",
+                                 "MAT-SLOT metallic", "CONTENT-DRAWER=")):
+            print(ln.rstrip())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

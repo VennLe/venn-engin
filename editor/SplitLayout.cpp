@@ -39,14 +39,33 @@ constexpr float kRightSplit = 0.42f;
 // 那排 `Subdivide selected(150) + Flip selected(140) + Delete(110)` 是
 // SameLine 硬排的，横向合计 400 出头，加上窗口内边距 446 —— 320 宽时右边
 // 那个 Delete 直接被窗口裁掉（点都点不到），400 宽也还差一点。
-// 所以下限对齐"最宽的那块内容"，而不是列表：取 460（= 建模面板的设计宽度）。
-// 上限与右栏同档，避免宽屏上它吃掉视口。
+//
+// ⚠ 2026-10-28：这个常量现在只当**首帧 / 窗口大幅缩放时的默认宽度下限**。
+//   真正参与拖动的是 `root.minA`，它由 `setLeftMinWidth()` 按当前编辑模式
+//   写进来（响应式的 Landscape / Foliage 报 300，硬排的 Modeling 报 460）。
+//   两者分开，是为了让"默认布局逐像素不动"（verify_viewport 里钉了
+//   CONVERGED_VP = (463,139,1241,778)，改默认宽度会让它和像素基线一起飘），
+//   同时又能让用户往下拖。
 constexpr float kMinModeRail = 460.0f;
+// 拖动时**绝对**下限：再窄的话，左栏连"9 行列表 + 一列按钮"都放不下，
+// 而且模式列表的图标 + 文字（x+50 起）会被裁。
+constexpr float kMinModeRailDrag = 300.0f;
 
 // 分隔线配色（E06-1：三态）
 constexpr ImU32 kSplitIdle = IM_COL32(70, 75, 82, 255);
 constexpr ImU32 kSplitHover = IM_COL32(110, 150, 205, 255);
 constexpr ImU32 kSplitDrag = IM_COL32(140, 190, 250, 255);
+
+// 角落抓手（E29-5）。命中半径 12px 是个权衡：
+//   · 太小（6~8）→ 用户得怼准一个 4px 的交点，实际点不中；
+//   · 太大（16+）→ 把分隔条两端各吃掉一大截，"在边上调大小"变得难。
+// 12px 与 Windows 自己的窗口角缩放手感接近。
+constexpr float kCornerHit = 12.0f;
+// 静息态：只画一个很淡的加号（不画底块）——"这里有个东西"但不会看成按钮。
+constexpr ImU32 kCornerIdle = IM_COL32(96, 104, 114, 170);
+// 命中态：加号变强调色 + 描一个细框。
+constexpr ImU32 kCornerHotFg = IM_COL32(150, 200, 255, 255);
+constexpr ImU32 kCornerHotBg = IM_COL32(40, 52, 68, 210);
 
 // 面板名（tooltip 用）
 const char* slotName(int slot) {
@@ -88,11 +107,13 @@ void SplitLayout::buildDefault() {
     root.dir = SplitNode::Dir::Horizontal;
     root.ratio = 0.0f;    // 首帧按窗口尺寸初始化（见 beginFrame）
     root.autoRatio = true;
-    root.minA = kMinModeRail;   // 模式栏有下限：低于这个宽度按钮就挤成一团
+    // ⚠ `minA` 是**拖动下限**，由 setLeftMinWidth() 按当前编辑模式写；
+    //   这里先给绝对下限（300），EditorApp 每帧会按模式把它顶到该有的值。
+    root.minA = kMinModeRailDrag;
     root.minB = 0.0f;
     root.a = -1;
     root.b = 1;
-    root.panelA = kSlotModes;
+    root.groupA.push_back(kSlotModes);
 
     SplitNode mid;
     mid.dir = SplitNode::Dir::Horizontal;
@@ -102,7 +123,7 @@ void SplitLayout::buildDefault() {
     mid.minB = 0.0f;
     mid.a = -1;
     mid.b = 2;
-    mid.panelA = kSlotViewport;
+    mid.groupA.push_back(kSlotViewport);
 
     SplitNode right;
     right.dir = SplitNode::Dir::Vertical;
@@ -111,8 +132,8 @@ void SplitLayout::buildDefault() {
     right.minA = kMinPane;
     right.minB = kMinPane;
     right.a = -1;  right.b = -1;
-    right.panelA = kSlotHierarchy;
-    right.panelB = kSlotInspector;
+    right.groupA.push_back(kSlotHierarchy);
+    right.groupB.push_back(kSlotInspector);
 
     m_nodes.push_back(root);   // 0
     m_nodes.push_back(mid);    // 1
@@ -127,6 +148,34 @@ void SplitLayout::buildDefault() {
 void SplitLayout::reset() {
     buildDefault();
     m_maximized = kSlotNone;
+    m_leftMin = 0.0f;
+}
+
+void SplitLayout::setLeftMinWidth(float px) {
+    if (m_root < 0) return;
+    const float want =
+        std::clamp(px, kMinModeRailDrag, std::max(kLeftMax, kMinModeRailDrag));
+    m_leftMin = want;
+
+    SplitNode& root = m_nodes[static_cast<size_t>(m_root)];
+    root.minA = want;
+
+    // 上限**抬高**时（切到需要宽排的模式）把当前宽度顶上去。
+    // ⚠ 必须主动顶：`ratio` 是用户/首帧定的，光改 minA 不会让已有宽度变大，
+    //   于是"在 Landscape 里拖窄 → 切到 Modeling"会得到一条 300 宽、
+    //   按钮被裁掉一半的左栏（而且裁掉的部分点都点不到）。
+    const float bodyW = std::max(m_dispW, kMinPane * 3.0f);
+    const float curW = bodyW * root.ratio;
+    if (curW < want - 0.5f) {
+        root.ratio = std::clamp(want / std::max(bodyW, 1.0f), 0.0f, 1.0f);
+        root.autoRatio = false;
+        root.collapsed = false;
+    }
+}
+
+float SplitLayout::leftMinWidth() const {
+    if (m_root < 0) return kMinModeRailDrag;
+    return m_nodes[static_cast<size_t>(m_root)].minA;
 }
 
 void SplitLayout::beginFrame(float w, float h) {
@@ -204,12 +253,12 @@ void SplitLayout::syncPanelVisibility() {
         if (n.a >= 0) {
             n.liveA = true;   // 子树：它自己的活性由更下层决定
         } else {
-            n.liveA = live(n.panelA);
+            n.liveA = live(n.panelA());
         }
         if (n.b >= 0) {
             n.liveB = true;
         } else {
-            n.liveB = live(n.panelB);
+            n.liveB = live(n.panelB());
         }
     }
 
@@ -266,6 +315,15 @@ void SplitLayout::apply(LayoutRects& out) {
         out.modes = {0.0f, 0.0f, 0.0f, 0.0f};
         writePanel(m_maximized, 0.0f, bodyY, W, bodyH, out);
     } else {
+        // E29-1：先把四个树内槽位清成 0。
+        // ⚠ 必须清：面板被搬走 / 合并成标签组后，那个槽位在树里就不存在了，
+        //   而 LayoutRects 是**逐帧复用**的 —— 不清就会留着上一帧的矩形，
+        //   于是同一个面板在旧位置和新位置各画一遍（"面板被劈成两块"）。
+        //   out.content 不清：它由 EditorApp 的底栏抽屉直接写，不经过分栏树。
+        out.hierarchy = {0.0f, 0.0f, 0.0f, 0.0f};
+        out.viewport = {0.0f, 0.0f, 0.0f, 0.0f};
+        out.inspector = {0.0f, 0.0f, 0.0f, 0.0f};
+        out.modes = {0.0f, 0.0f, 0.0f, 0.0f};
         resolve(m_root, 0.0f, bodyY, W, bodyH, out);
     }
 
@@ -304,10 +362,10 @@ void SplitLayout::resolve(int nodeIdx, float x, float y, float w, float h,
 
     // A 半边：子节点或叶子面板
     if (n.a >= 0) resolve(n.a, ax, ay, aW, aH, out);
-    else writePanel(n.panelA, ax, ay, aW, aH, out);
+    else writePanel(n.panelA(), ax, ay, aW, aH, out);
     // B 半边
     if (n.b >= 0) resolve(n.b, bx, by, bW, bH, out);
-    else writePanel(n.panelB, bx, by, bW, bH, out);
+    else writePanel(n.panelB(), bx, by, bW, bH, out);
 }
 
 void SplitLayout::writePanel(int panel, float x, float y, float w, float h,
@@ -324,12 +382,152 @@ void SplitLayout::writePanel(int panel, float x, float y, float w, float h,
 
 void SplitLayout::handleSplitters() {
     m_splitHoverTaken = false;   // 每帧清一次：见 processSplitters 里的说明
+    m_corners.clear();
+    m_vLines.clear();
+    m_hLines.clear();
+    m_cornerHot = -1;
     if (m_root < 0) return;
     if (m_maximized != kSlotNone) return;  // 最大化时不画分隔条
 
     float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
     bodyRect(m_dispW, m_dispH, x, y, w, h);
+
+    // ------------------------------------------------------------
+    // ① 先算交点（只算几何，不画）
+    // ------------------------------------------------------------
+    // 顺序很要紧：角落要在 processSplitters 之前决定"这次悬停归谁"，
+    // 否则两条线都已经各自判过命中，再补一句"角上优先"就是事后打补丁
+    // （而且 m_splitHoverTaken 已经被其中一条占掉了）。
+    collectCornerLines(m_root, x, y, w, h);
+    // 横线 × 竖线求交。交点必须**落在两条线的跨度内**才算数。
+    // ⚠ 容差 1.5px：T 形交点处横线的端点在数学上正好等于竖线坐标，但
+    //   比例是浮点算出来的（`bx = x + w * ratio`），窗口缩放非整数比例时
+    //   会差个零点几像素 —— 不留容差就会"有的窗口尺寸下有角、有的没有"。
+    constexpr float kTouchEps = 1.5f;
+    for (const LineSeg& H : m_hLines) {
+        for (const LineSeg& V : m_vLines) {
+            if (V.c < H.t0 - kTouchEps || V.c > H.t1 + kTouchEps) continue;
+            if (H.c < V.t0 - kTouchEps || H.c > V.t1 + kTouchEps) continue;
+            // 被浮层（抽屉 / 菜单 / 浮动面板）盖住的交点既不画也不能点：
+            // 分隔线本来就会在这些矩形处被裁开，角上不裁的话会出现一个
+            // 浮在菜单之上的加号。
+            bool covered = false;
+            for (const OcclRect& o : m_occluders) {
+                if (V.c > o.x0 && V.c < o.x1 && H.c > o.y0 && H.c < o.y1) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (covered) continue;
+            SplitCorner sc;
+            sc.x = V.c;
+            sc.y = H.c;
+            sc.hNode = H.node;
+            sc.vNode = V.node;
+            m_corners.push_back(sc);
+        }
+    }
+
+    // ------------------------------------------------------------
+    // ② 命中：取最近的那个交点在 kCornerHit 以内
+    // ------------------------------------------------------------
+    {
+        const ImVec2 mp = ImGui::GetIO().MousePos;
+        float best = kCornerHit;
+        for (size_t i = 0; i < m_corners.size(); ++i) {
+            const float dx = mp.x - m_corners[i].x;
+            const float dy = mp.y - m_corners[i].y;
+            const float d = std::sqrt(dx * dx + dy * dy);
+            // `<=` 而不是 `<`：`best` 从 kCornerHit 起算，正好在半径上的
+            // 点也该算命中（边界只有一种写法，免得"看起来在里面却点不到"）。
+            if (d <= best) {
+                best = d;
+                m_cornerHot = static_cast<int>(i);
+            }
+        }
+        // 浮层/弹窗正在接管鼠标时不算命中（与分隔条同一套判据）。
+        if (m_cornerHot >= 0 && ImGui::IsAnyItemHovered()) m_cornerHot = -1;
+    }
+    // 命中角落 → 本帧所有分隔条都不响应悬停（它们只画线）。
+    // 少了这一句，角和线会抢同一个像素：光标在双箭头和加号之间跳，
+    // 拖拽时"到底在合并还是在改比例"取决于哪条线先被处理。
+    if (m_cornerHot >= 0) m_splitHoverTaken = true;
+
     processSplitters(m_root, x, y, w, h);
+    drawCornerGrips();   // 画在最后：压在分隔线之上
+}
+
+void SplitLayout::collectCornerLines(int nodeIdx, float x, float y, float w,
+                                     float h) {
+    SplitNode& n = m_nodes[static_cast<size_t>(nodeIdx)];
+
+    // ⚠ 这里的 eff / aW / bx 必须与 resolve() 和 processSplitters() 逐字一致。
+    //   三处各算一遍本来就是隐患，但把"切分"抽成公共函数要连 resolve 的
+    //   递归签名一起动（它会写 LayoutRects），改动面比收益大。用注释钉住。
+    float eff = n.ratio;
+    if (!n.liveA) eff = 0.0f;
+    else if (!n.liveB) eff = 1.0f;
+
+    float aW = w, aH = h, bW = w, bH = h;
+    float ax = x, ay = y, bx = x, by = y;
+    if (n.dir == SplitNode::Dir::Horizontal) {
+        aW = w * eff;
+        bW = w - aW;
+        bx = x + aW;
+    } else {
+        aH = h * eff;
+        bH = h - aH;
+        by = y + aH;
+    }
+
+    if (n.a >= 0) collectCornerLines(n.a, ax, ay, aW, aH);
+    if (n.b >= 0) collectCornerLines(n.b, bx, by, bW, bH);
+
+    if (!n.liveA || !n.liveB) return;   // 收起的那一侧没有线（与 processSplitters 一致)
+
+    if (n.dir == SplitNode::Dir::Horizontal) {
+        if (w <= 1.0f) return;
+        m_vLines.push_back({bx, y, y + h, nodeIdx});
+    } else {
+        if (h <= 1.0f) return;
+        m_hLines.push_back({by, x, x + w, nodeIdx});
+    }
+}
+
+void SplitLayout::drawCornerGrips() {
+    if (m_corners.empty()) return;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+    for (size_t i = 0; i < m_corners.size(); ++i) {
+        const SplitCorner& c = m_corners[i];
+        const bool hot = (static_cast<int>(i) == m_cornerHot);
+
+        // 加号的两根短线：静息 3px、命中 4.5px。
+        const float g = hot ? 4.5f : 3.0f;
+        const ImU32 fg = hot ? kCornerHotFg : kCornerIdle;
+        if (hot) {
+            const float r = 7.0f;
+            dl->AddRectFilled(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r),
+                              kCornerHotBg, 3.0f);
+            dl->AddRect(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), fg,
+                        3.0f, 0, 1.0f);
+        }
+        dl->AddLine(ImVec2(c.x - g, c.y), ImVec2(c.x + g, c.y), fg, 1.6f);
+        dl->AddLine(ImVec2(c.x, c.y - g), ImVec2(c.x, c.y + g), fg, 1.6f);
+
+        // 自动化锚点：`SPLIT-CORNER-<i>=(x0,y0)-(x1,y1)`，中心就是交点。
+        // 用**可见的加号尺寸**而不是 kCornerHit：脚本按锚点中心去按，落在
+        // 半径内即可命中，但日志里读到的位置要与人眼看到的一致。
+        char tag[40];
+        std::snprintf(tag, sizeof(tag), "SPLIT-CORNER-%d", static_cast<int>(i));
+        logRect(tag, ImVec2(c.x - 6.0f, c.y - 6.0f),
+                ImVec2(c.x + 6.0f, c.y + 6.0f));
+    }
+
+    // 光标：四向箭头（Windows 的 IDC_SIZEALL，视觉上就是一个"加号/十字"）。
+    // 用户原话要的就是"显示成一个加号"；自绘的加号 + 这个光标一起给，
+    // 因为纯自绘的加号在鼠标遮住的地方会看不全。
+    if (m_cornerHot >= 0) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
 }
 
 void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
@@ -389,6 +587,17 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
     const float lineC = lineHoriz ? segA.y : segA.x;   // 固定坐标
 
     // 收集要挖掉的区间
+    //
+    // ⚠⚠ 判据必须是**严格穿过**，不能是"碰到也算"（2026-10-28 修）：
+    //   布局里的面板是**紧贴着**分隔条摆的 —— 左栏窗口的右边界正好落在
+    //   分隔条那个 x 上（`x1 == lineC`）。用 `lineC < c0 || lineC > c1`
+    //   来判断时，`lineC == c1` 不算越界 → 这条"只是贴边"的窗口被当成
+    //   "盖住了整条线"，于是**整条分隔条被裁光**（spans 为空 → 不画、
+    //   不悬停、不能拖）。用户看到的就是"往左拖视口扩不开、左边 Modes
+    //   一动不动"；而日志里 `SPLIT-0` 锚点**还在**（首帧遮挡列表为空时
+    //   打过一次），所以按锚点去拖也毫无反应。
+    //   左右各留 0.5px 的余量：真正的浮层（抽屉、菜单、浮动面板）总是
+    //   明显地横跨这条线，不会被这点余量误放行。
     std::vector<std::pair<float, float>> cut;
     cut.reserve(m_occluders.size());
     for (const OcclRect& o : m_occluders) {
@@ -396,7 +605,7 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
         const float hi = lineHoriz ? o.x1 : o.y1;
         const float c0 = lineHoriz ? o.y0 : o.x0;
         const float c1 = lineHoriz ? o.y1 : o.x1;
-        if (lineC < c0 || lineC > c1) continue;        // 没跨过这条线
+        if (lineC <= c0 + 0.5f || lineC >= c1 - 0.5f) continue;   // 没穿过这条线
         const float a = std::max(lo, t0), b = std::min(hi, t1);
         if (b > a) cut.emplace_back(a, b);
     }
@@ -553,8 +762,8 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
     // ---- 拖动中跟一条比例 tooltip（E06-1）----
     if (dragging && mouseDown) {
         m_hoverFrac = n.ratio;
-        ImGui::SetTooltip(TR("%s %.0f%%  |  %s %.0f%%"), slotName(n.panelA),
-                          n.ratio * 100.0f, slotName(n.panelB),
+        ImGui::SetTooltip(TR("%s %.0f%%  |  %s %.0f%%"), slotName(n.panelA()),
+                          n.ratio * 100.0f, slotName(n.panelB()),
                           (1.0f - n.ratio) * 100.0f);
     }
 
@@ -607,10 +816,10 @@ void SplitLayout::processSplitters(int nodeIdx, float x, float y, float w,
         }
         ImGui::Separator();
         if (ImGui::MenuItem(TR("Maximize side A"))) {
-            setMaximized(n.panelA);
+            setMaximized(n.panelA());
         }
         if (ImGui::MenuItem(TR("Maximize side B"))) {
-            setMaximized(n.panelB);
+            setMaximized(n.panelB());
         }
         ImGui::EndPopup();
     }
@@ -708,6 +917,197 @@ void SplitLayout::applyPreset(int node, float aFrac) {
 
     // 刻意**不做**级联重算：树只有两层，"改根比例"与"改子比例"在用户视角
     // 下是两件独立的事，级联会让"我明明点的是 70/30"变成别的数字。
+}
+
+
+// ============================================================
+// 叶子面板组（E29-1：槽位 → 面板的映射从常量变成运行时可写）
+// ============================================================
+//
+// 这一层只做"谁在哪个位置"，不碰绘制。E29-2 的拖拽落点、E29-3 的标签组
+// 都调这里的 movePanel / swapActive / setGroup。
+namespace {
+
+// 能进分栏树的面板槽位。
+// ⚠ kSlotContent **不在**其中：Content 早在 2026-10-17 就改成了底栏抽屉，
+//   它恒不 live（见 syncPanelVisibility 的 case 注释）。放它进树会得到
+//   "一个永远不显示的槽位"，而那个槽位还会把邻居挤窄 —— 所以直接拒绝。
+bool isTreeSlot(int slot) {
+    switch (slot) {
+        case kSlotHierarchy:
+        case kSlotViewport:
+        case kSlotInspector:
+        case kSlotModes:
+            return true;
+        default:
+            return false;
+    }
+}
+
+} // namespace
+
+bool SplitLayout::isLeaf(int node, int side) const {
+    if (node < 0 || node >= static_cast<int>(m_nodes.size())) return false;
+    const SplitNode& n = m_nodes[static_cast<size_t>(node)];
+    if (side == kSideA) return n.a < 0;
+    if (side == kSideB) return n.b < 0;
+    return false;
+}
+
+int SplitLayout::groupSize(int node, int side) const {
+    if (!isLeaf(node, side)) return 0;
+    const SplitNode& n = m_nodes[static_cast<size_t>(node)];
+    return static_cast<int>((side == kSideA ? n.groupA : n.groupB).size());
+}
+
+int SplitLayout::groupPanel(int node, int side, int idx) const {
+    if (!isLeaf(node, side)) return kSlotNone;
+    const SplitNode& n = m_nodes[static_cast<size_t>(node)];
+    const std::vector<int>& g = (side == kSideA) ? n.groupA : n.groupB;
+    if (idx < 0 || idx >= static_cast<int>(g.size())) return kSlotNone;
+    return g[static_cast<size_t>(idx)];
+}
+
+int SplitLayout::activeIndex(int node, int side) const {
+    if (!isLeaf(node, side)) return -1;
+    const SplitNode& n = m_nodes[static_cast<size_t>(node)];
+    return (side == kSideA) ? n.activeA : n.activeB;
+}
+
+bool SplitLayout::setGroup(int node, int side, const std::vector<int>& panels,
+                           int active) {
+    if (!isLeaf(node, side)) return false;
+    SplitNode& n = m_nodes[static_cast<size_t>(node)];
+    std::vector<int>& g = (side == kSideA) ? n.groupA : n.groupB;
+
+    g.clear();
+    for (int p : panels) {
+        if (!isTreeSlot(p)) continue;                       // 非法槽位：静默丢掉
+        if (std::find(g.begin(), g.end(), p) != g.end()) continue;  // 组内去重
+        // 跨位置去重：同一面板不能同时出现在树里两处（否则写矩形会后者覆盖
+        // 前者，而绘制是两处各画一遍 —— 视觉上"面板被劈成两块"）。
+        int qn = -1, qs = -1, qi = -1;
+        if (locatePanel(p, qn, qs, qi)) continue;
+        g.push_back(p);
+    }
+
+    int& a = (side == kSideA) ? n.activeA : n.activeB;
+    if (g.empty()) a = 0;
+    else a = std::clamp(active, 0, static_cast<int>(g.size()) - 1);
+
+    syncPanelVisibility();   // 摘空的一侧立刻收成 0，不等下一帧
+    return true;
+}
+
+bool SplitLayout::activateInGroup(int node, int side, int idx) {
+    if (!isLeaf(node, side)) return false;
+    SplitNode& n = m_nodes[static_cast<size_t>(node)];
+    const std::vector<int>& g = (side == kSideA) ? n.groupA : n.groupB;
+    if (idx < 0 || idx >= static_cast<int>(g.size())) return false;
+    int& a = (side == kSideA) ? n.activeA : n.activeB;
+    a = idx;
+    syncPanelVisibility();
+    return true;
+}
+
+void SplitLayout::restoreGroups(const std::vector<int> (&groups)[kNodeCount][2]) {
+    // 先整棵清空，再一次性灌进去。中间没有"面板已经在别处"这种状态，
+    // 所以互换、轮转、整体重排都能一次到位。
+    for (SplitNode& n : m_nodes) {
+        if (n.a < 0) { n.groupA.clear(); n.activeA = 0; }
+        if (n.b < 0) { n.groupB.clear(); n.activeB = 0; }
+    }
+
+    // 全树范围内去重：同一面板出现在两处时，**先出现的赢**，后者丢弃。
+    // （写矩形是后者覆盖前者、绘制却是两处各画一遍 —— 视觉上是"面板被劈成
+    //   两块"，比丢掉更难查。）
+    std::vector<int> used;
+    for (int i = 0; i < kNodeCount && i < static_cast<int>(m_nodes.size()); ++i) {
+        for (int side = 0; side < 2; ++side) {
+            if (!isLeaf(i, side)) continue;
+            SplitNode& n = m_nodes[static_cast<size_t>(i)];
+            std::vector<int>& g = (side == kSideA) ? n.groupA : n.groupB;
+            int& a = (side == kSideA) ? n.activeA : n.activeB;
+            for (int panel : groups[i][side]) {
+                if (!isTreeSlot(panel)) continue;
+                if (std::find(used.begin(), used.end(), panel) != used.end()) continue;
+                used.push_back(panel);
+                g.push_back(panel);
+            }
+            a = 0;
+        }
+    }
+    syncPanelVisibility();
+}
+bool SplitLayout::locatePanel(int panel, int& node, int& side, int& idx) const {
+    node = -1; side = -1; idx = -1;
+    if (!isTreeSlot(panel)) return false;
+    for (int i = 0; i < static_cast<int>(m_nodes.size()); ++i) {
+        const SplitNode& n = m_nodes[static_cast<size_t>(i)];
+        for (int k = 0; k < static_cast<int>(n.groupA.size()); ++k) {
+            if (n.groupA[static_cast<size_t>(k)] == panel) {
+                node = i; side = kSideA; idx = k;
+                return true;
+            }
+        }
+        for (int k = 0; k < static_cast<int>(n.groupB.size()); ++k) {
+            if (n.groupB[static_cast<size_t>(k)] == panel) {
+                node = i; side = kSideB; idx = k;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool SplitLayout::movePanel(int panel, int node, int side) {
+    if (!isTreeSlot(panel)) return false;
+    if (!isLeaf(node, side)) return false;   // 目标是子节点侧 → 拒绝（E29-2 再做切分）
+
+    int on = -1, os = -1, oi = -1;
+    const bool found = locatePanel(panel, on, os, oi);
+
+    // 已经在目标组里 → 只切活动项。**这不算失败**：拖到自己身上是常见的
+    // 误操作，返回 false 会让落点逻辑弹出"不能放在这里"的提示。
+    if (found && on == node && os == side) return activateInGroup(node, side, oi);
+
+    if (found) {
+        SplitNode& src = m_nodes[static_cast<size_t>(on)];
+        std::vector<int>& sg = (os == kSideA) ? src.groupA : src.groupB;
+        sg.erase(sg.begin() + oi);
+        int& sa = (os == kSideA) ? src.activeA : src.activeB;
+        // 摘掉后活动下标可能越界：夹到组内最后一格（组空则归 0）
+        sa = sg.empty() ? 0 : std::min(sa, static_cast<int>(sg.size()) - 1);
+    }
+
+    SplitNode& dst = m_nodes[static_cast<size_t>(node)];
+    std::vector<int>& dg = (side == kSideA) ? dst.groupA : dst.groupB;
+    dg.push_back(panel);
+    int& da = (side == kSideA) ? dst.activeA : dst.activeB;
+    da = static_cast<int>(dg.size()) - 1;
+
+    syncPanelVisibility();
+    return true;
+}
+
+bool SplitLayout::swapActive(int nodeA, int sideA, int nodeB, int sideB) {
+    if (!isLeaf(nodeA, sideA) || !isLeaf(nodeB, sideB)) return false;
+    if (nodeA == nodeB && sideA == sideB) return true;   // 自己换自己：幂等
+
+    SplitNode& na = m_nodes[static_cast<size_t>(nodeA)];
+    SplitNode& nb = m_nodes[static_cast<size_t>(nodeB)];
+    std::vector<int>& ga = (sideA == kSideA) ? na.groupA : na.groupB;
+    std::vector<int>& gb = (sideB == kSideA) ? nb.groupA : nb.groupB;
+    int& ia = (sideA == kSideA) ? na.activeA : na.activeB;
+    int& ib = (sideB == kSideA) ? nb.activeA : nb.activeB;
+
+    if (ga.empty() || gb.empty()) return false;   // 空侧没有可交换的东西
+    if (ia < 0 || ia >= static_cast<int>(ga.size())) return false;
+    if (ib < 0 || ib >= static_cast<int>(gb.size())) return false;
+
+    std::swap(ga[static_cast<size_t>(ia)], gb[static_cast<size_t>(ib)]);
+    syncPanelVisibility();
+    return true;
 }
 
 } // namespace editor

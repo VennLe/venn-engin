@@ -2,6 +2,7 @@
 
 #include "Localization.h"
 #include "DebugRects.h"    // MYVK_LOG_RECTS：把视口矩形打给自动化脚本
+#include "Command.h"       // 拾取关节锚点要压一条 RawBytesEditCommand
 #include "EditorDragDrop.h"
 #include "FeatureUIGen.h"   // emitParamChange：改 grid.* 后要标脏 + 记撤销
 #include "EditorFocus.h"
@@ -2025,6 +2026,187 @@ void ViewportPanel::removeCollisionBody(ecs::Entity e) {
     m_ctx.notify(TR("Removed collision body"));
 }
 
+// ============================================================
+// 关节锚点的视口拾取（J5-2）
+// ============================================================
+//
+// 作者侧的痛点：`JointComponent` 的两个锚点是**两端各自的局部坐标**。
+// 在 Inspector 里手填数字时，用户看得见"我要把这个角钉住"，但那个角在局部
+// 空间里是 (0.5,0.5,-0.5) 还是 (0.5,0.5,0.5) 得靠脑内做加法 —— 而且物体
+// 一旦被旋转过，脑内加法直接不成立。于是给一条"在视口里点一下"的路。
+//
+// 三条设计约束（都是踩过才知道的）：
+//
+// ① **换算到谁的空间**。命中点是世界坐标，要写进 `anchorSelf` 就得过**本
+//    实体**世界矩阵的逆，要写进 `anchorTarget` 就得过**target 实体**的逆。
+//    拿自己的逆去转对方的锚点，是最容易写错的一行 —— 症状是"锚点点上去
+//    位置看着对，一按 Play 物体被拽到十万八千里"。所以下面把"用谁的空间"
+//    显式算成一个变量（`spaceEnt`），不靠分支里就地取。
+//
+// ② **点空也要能用**。关节锚点常常在**空中**（摆锤的铰点、绳子的端点），
+//    那里根本没有表面可点。所以没命中任何东西时退到"过该实体原点、正对
+//    相机的平面"上取点 —— 与 gizmo 拖拽的兜底同一套（intersectPlane）。
+//
+// ③ **Esc 优先级**。编辑器里 Esc = 取消选择。拾取模式按 Esc 必须只退出
+//    拾取，不能顺手把选中项也清了（清了之后 Inspector 变空，用户找不到
+//    自己刚才在配哪个对象）。
+bool ViewportPanel::handleAnchorPick(const scene::Camera& cam,
+                                     const glm::vec2& vpPos,
+                                     const glm::vec2& vpSize, bool hovered) {
+    const EditorContext::AnchorPick which = m_ctx.anchorPick();
+    if (which == EditorContext::AnchorPick::None) return false;
+
+    // 进了 Play 就没有"作者侧锚点"这回事了：运行态的组件是场景副本，
+    // 改了也留不下来（Stop 就没了），而且会让人以为改到了资产上。
+    if (!m_ctx.isEditing()) {
+        m_ctx.cancelAnchorPick();
+        VK_LOG_INFO("JOINT-PICK cancel reason=not-editing");
+        return false;
+    }
+
+    ecs::World& w = m_ctx.activeScene().world();
+    const ecs::Entity owner = m_ctx.anchorPickEntity();
+    ecs::JointComponent* jc =
+        owner.valid() ? w.get<ecs::JointComponent>(owner) : nullptr;
+    if (!jc) {
+        // 实体被删了 / 关节被摘了 —— 静默失效比写进野指针好。
+        m_ctx.cancelAnchorPick();
+        VK_LOG_WARN("JOINT-PICK cancel reason=no-joint entity=%u", owner.id);
+        return false;
+    }
+
+    // ---- Esc：只退出拾取（见上面第 ③ 条）----
+    // 放在点选之前，且不看 hovered —— 鼠标可能停在视口外（刚点完按钮），
+    // 这时按 Esc 用户期望的仍然是"取消"。
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        m_ctx.cancelAnchorPick();
+        VK_LOG_INFO("JOINT-PICK cancel reason=esc entity=%u", owner.id);
+        return true;
+    }
+
+    // 模式激活期间**吃掉**视口左键：返回 true 让外层跳过点选。鼠标不在
+    // 视口里时不吃（用户可能去点别的面板）。
+    if (!hovered) return true;
+    if (!ImGui::IsMouseClicked(ImGuiMouseButton_Left)) return true;
+
+    // ---- 用谁的空间（见上面第 ① 条）----
+    ecs::Entity spaceEnt = owner;
+    if (which == EditorContext::AnchorPick::Target) {
+        spaceEnt = w.find(jc->target);
+        if (!spaceEnt.valid()) {
+            // 下拉里还没选"另一端"。Inspector 里那个按钮本来就是禁用的，
+            // 但状态可能在上一帧之后才失效（另一端被删了）。
+            m_ctx.cancelAnchorPick();
+            VK_LOG_WARN("JOINT-PICK cancel reason=no-target entity=%u", owner.id);
+            return true;
+        }
+    }
+
+    const ImGuiIO& io = ImGui::GetIO();
+    const glm::vec2 mouse(io.MousePos.x, io.MousePos.y);
+    const Ray ray = PickingSystem::rayFromViewport(cam, vpPos, vpSize, mouse);
+    const PickResult hit = m_picking.pick(m_ctx.activeScene(), ray);
+
+    glm::vec3 world(0.0f);
+    const char* source = "surface";
+    if (hit.hit) {
+        world = hit.point;
+    } else {
+        // 兜底：过该实体原点、正对射线的平面（见上面第 ② 条）。
+        const glm::vec3 c(
+            glm::vec3(m_ctx.activeScene().worldMatrix(spaceEnt)[3]));
+        const glm::vec3 n = -glm::normalize(ray.dir);
+        float t = 0.0f;
+        if (!PickingSystem::intersectPlane(ray, c, n, t)) return true;
+        world = ray.origin + ray.dir * t;
+        source = "camera-plane";
+    }
+
+    const glm::mat4 worldM = m_ctx.activeScene().worldMatrix(spaceEnt);
+    const glm::vec3 local =
+        glm::vec3(glm::inverse(worldM) * glm::vec4(world, 1.0f));
+
+    glm::vec3* slot = (which == EditorContext::AnchorPick::Self)
+                          ? &jc->anchorSelf
+                          : &jc->anchorTarget;
+    const glm::vec3 before = *slot;
+    bool changed = false;
+    if (glm::length(before - local) > 1.0e-6f) {
+        *slot = local;
+        m_ctx.commands().pushAlreadyApplied(std::make_unique<RawBytesEditCommand>(
+            (which == EditorContext::AnchorPick::Self)
+                ? "Pick Joint Anchor (self)"
+                : "Pick Joint Anchor (target)",
+            slot, &before, slot, sizeof(glm::vec3)));
+        m_ctx.dirty() = true;
+        changed = true;
+    }
+
+    // ⚠ 这一行是给用例的唯一判据：世界点 + 局部点 + 用的是谁的空间。
+    //   只打"点了一下"没法区分"换算对了"和"换算错了但恰好数值相近"。
+    VK_LOG_INFO("JOINT-PICK apply=%s entity=%u space=%u source=%s "
+                "world=(%.3f,%.3f,%.3f) local=(%.3f,%.3f,%.3f) changed=%d",
+                (which == EditorContext::AnchorPick::Self) ? "self" : "target",
+                owner.id, spaceEnt.id, source, world.x, world.y, world.z,
+                local.x, local.y, local.z, changed ? 1 : 0);
+
+    // ---- 点完这一端：能接着点另一端就接着点（"点两下"）----
+    if (which == EditorContext::AnchorPick::Self) {
+        if (w.find(jc->target).valid()) {
+            m_ctx.advanceAnchorPick();
+            VK_LOG_INFO("JOINT-PICK next=target entity=%u", owner.id);
+        } else {
+            // 另一端还没选，自动进 target 模式会让下一次点击无处可写 ——
+            // 与其写不进去，不如在这里收工并说清楚。
+            m_ctx.cancelAnchorPick();
+            VK_LOG_INFO("JOINT-PICK next=none reason=no-target entity=%u",
+                        owner.id);
+        }
+    } else {
+        m_ctx.cancelAnchorPick();
+        VK_LOG_INFO("JOINT-PICK next=none entity=%u", owner.id);
+    }
+    return true;
+}
+
+void ViewportPanel::drawAnchorPickHint(const glm::vec2& vpPos,
+                                       const glm::vec2& vpSize) {
+    const EditorContext::AnchorPick which = m_ctx.anchorPick();
+    if (which == EditorContext::AnchorPick::None) return;
+
+    const ecs::Entity owner = m_ctx.anchorPickEntity();
+    const char* who = (which == EditorContext::AnchorPick::Self)
+                          ? TR("Place the anchor on THIS object")
+                          : TR("Place the anchor on the OTHER object");
+    const char* how = TR("left click = place, Esc = cancel");
+
+    // 顶部居中：视口左上角已经有视图模式条，右上角有统计 HUD，中间那条
+    // 横带是空的，而且它就在用户正在看的画面正中偏上，不容易漏掉。
+    const ImVec2 ts = ImGui::CalcTextSize(who);
+    const ImVec2 ts2 = ImGui::CalcTextSize(how);
+    const float boxW = std::max(ts.x, ts2.x) + 16.0f;
+    const float boxH = ts.y + ts2.y + 12.0f;
+    const ImVec2 p0(vpPos.x + (vpSize.x - boxW) * 0.5f, vpPos.y + 34.0f);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(p0.x, p0.y),
+                      ImVec2(p0.x + boxW, p0.y + boxH),
+                      IM_COL32(30, 26, 24, 215), 4.0f);
+    dl->AddRect(ImVec2(p0.x, p0.y), ImVec2(p0.x + boxW, p0.y + boxH),
+                IM_COL32(220, 92, 72, 235), 4.0f);
+    dl->AddText(ImVec2(p0.x + 8.0f, p0.y + 5.0f), IM_COL32(245, 225, 200, 255),
+                who);
+    dl->AddText(ImVec2(p0.x + 8.0f, p0.y + 7.0f + ts.y),
+                IM_COL32(180, 170, 160, 255), how);
+
+    // 自动化锚点：`MYVK_LOG_RECTS=1` 时把它报出去 —— 用例靠它断言"拾取
+    // 模式下确实有提示"，以及拿到一块**不该被点**的区域（提示条盖在视口
+    // 中央，用例要点视口别处）。
+    logRect("VP-JOINTPICK-HINT", ImVec2(p0.x, p0.y),
+            ImVec2(p0.x + boxW, p0.y + boxH));
+    (void)owner;
+}
+
 void ViewportPanel::drawObjectMenu(const glm::vec2& vpPos,
                                    const glm::vec2& vpSize, bool hovered) {
     if (!m_ctx.isEditing()) return;
@@ -2684,8 +2866,17 @@ void ViewportPanel::draw() {
     const ImGuiIO& io = ImGui::GetIO();
     const bool navGesture = ImGui::IsMouseDown(ImGuiMouseButton_Right) ||
                             ImGui::IsMouseDown(ImGuiMouseButton_Middle);
+
+    // 2.95) 关节锚点拾取（J5-2）—— **必须排在点选之前**。
+    //       拾取时点视口是"取一个世界坐标"，不是"换选中项"：顺序反了就没法
+    //       在**别的物体**表面上取点（一点就换选中项，Inspector 跟着跳走，
+    //       用户正在配的那个关节从屏幕上消失）。
+    const bool anchorPickConsumed =
+        handleAnchorPick(cam, vpPos, vpSize, hovered);
+
     if (m_ctx.isEditing() && !modeToolActive && !modeConsumed && hovered &&
-        !gizmoConsumed && !navGesture && !m_gizmo.dragging() &&
+        !gizmoConsumed && !anchorPickConsumed && !navGesture &&
+        !m_gizmo.dragging() &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         const glm::vec2 mouse(io.MousePos.x, io.MousePos.y);
         // 先问"是不是点在**选中物体的碰撞框**那圈线上"。
@@ -2812,6 +3003,9 @@ void ViewportPanel::draw() {
 
     // 3.6) 选中物体上的右键菜单：添加 / 移除碰撞体、切换手柄目标
     drawObjectMenu(vpPos, vpSize, hovered);
+
+    // 3.7) 关节锚点拾取的提示条（J5-2）。只在拾取模式激活时出现。
+    drawAnchorPickHint(vpPos, vpSize);
 
     // 4) 叠加信息：E14 起全部走四角浮层（drawStatsHud 等，见下面第 6 步）。
     //    原来这里的 drawOverlay（左上角统计文字）已经并进统计 HUD ——
