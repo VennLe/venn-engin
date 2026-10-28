@@ -56,6 +56,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import launcher_kit as kit                                        # noqa: E402
 from capture_window import find_window, user32                    # noqa: E402
 from verify_asset_drag import force_foreground, move_to           # noqa: E402
+from verify_add_menu import kill_stale_editors                    # noqa: E402
 
 MOUSE_LDOWN = 0x0002      # MOUSEEVENTF_LEFTDOWN
 MOUSE_LUP = 0x0004        # MOUSEEVENTF_LEFTUP
@@ -206,6 +207,20 @@ def run_selftest():
 # ------------------------------------------------------------------ 起编辑器
 
 def launch(scene_path, select="", gizmo="", console_cmd=""):
+    # ⚠ 一次只能有一个编辑器活着（2026-10-28，#323 回归揪出来的）。
+    #
+    # 五个组各 launch 一次，原来**不清理上一组**：跑到 E 组时已经有四份
+    # Editor.exe 同时存在。`find_window` 只会摸到其中一个，而 click() /
+    # drag() 走的是真实 SetCursorPos + mouse_event —— 事件打给"最上层且在前台
+    # 的窗口"。多份窗口互相抢前台的结果是：日志里能看到一串
+    # `WARN 前台被抢走，抢回来：成功`，紧跟着某些点击/按键**整个丢掉**，
+    # 于是同一份二进制三次运行红在三处不同地方：
+    #   · 批量跑：D3 拖拽不生效（end=0）+ E1 row_map 点到别的行
+    #   · 单跑 1：E1/E2/E3/E4（Ctrl+D 只复制了 2 个）
+    #   · 单跑 2：D8 撤销按丢 + E 组点不动
+    # 这不是产品坏了，是"四份窗口抢焦点"。所以每次 launch 前先清场并等窗口
+    # 真的消失（kill_stale_editors 内部会枚举到没有 "Venn Editor" 才返回）。
+    kill_stale_editors()
     env = kit.clean_env({
         "MYVK_EDITOR_SCENE": scene_path,
         "MYVK_LOG_RECTS": "1",          # HIER-ROW / GZ-* / VP-RECT 全靠它

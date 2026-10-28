@@ -182,7 +182,7 @@ void drawViewportTabBar(const Rect& bar) {
                           : ImGui::GetColorU32(ImGuiCol_TitleBg, 0.92f);
         if (!active && hovered) bg = ImGui::GetColorU32(ImGuiCol_HeaderHovered);
         dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), bg, 4.0f,
-                          ImDrawFlags_RoundCornersTop);
+                          ImDrawFlags_RoundTop);
         if (active) {
             // 激活页顶部一条强调色 —— 标签条上看"我在哪一页"最快的信号
             dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + 2.0f),

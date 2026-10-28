@@ -239,7 +239,7 @@ void drawPageIcon(ImDrawList* dl, ImVec2 p, float s, ImU32 accent, int glyph) {
                     accent, 1.5f, 0, 1.6f);
         dl->AddRectFilled(ImVec2(cx - u, cy - u * 0.8f),
                           ImVec2(cx + u, cy - u * 0.24f), accent, 1.5f,
-                          ImDrawFlags_RoundCornersTop);
+                          ImDrawFlags_RoundTop);
     }
 }
 

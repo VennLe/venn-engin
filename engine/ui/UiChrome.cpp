@@ -65,7 +65,7 @@ void cardBackground(ImDrawList* dl, ImVec2 a, ImVec2 b, float rounding,
                           ImVec2(b.x + 2.0f, b.y + 2.0f), u32(g2), r * 1.1f);
         dl->AddRect(ImVec2(a.x - 1.0f, a.y - 1.0f),
                     ImVec2(b.x + 1.0f, b.y + 1.0f), u32(g1), r,
-                    ImDrawFlags_RoundCornersAll,
+                    ImDrawFlags_RoundAll,
                     1.0f + 1.2f * std::min(glow, 1.0f));
     }
 
@@ -77,7 +77,7 @@ void cardBackground(ImDrawList* dl, ImVec2 a, ImVec2 b, float rounding,
     gradientRectV(dl, a, b, u32(top), u32(bot), rounding);
     dl->AddRect(a, b, u32(hot ? mixC(t.borderSoft, t.accent, 0.55f)
                               : t.borderSoft),
-                rounding, ImDrawFlags_RoundCornersAll, 1.0f);
+                rounding, ImDrawFlags_RoundAll, 1.0f);
 }
 
 void headerBand(ImDrawList* dl, ImVec2 a, ImVec2 b, float rounding) {
@@ -154,7 +154,7 @@ bool pillButton(const char* id, const char* label, ImVec2 size, int kind) {
 
     // 边框：主/危险按钮用自身亮一档，普通按钮用软边框
     const ImVec4 edge = (kind == 0) ? t.borderSoft : shiftC(base, 0.18f);
-    dl->AddRect(a, b, u32(edge), r, ImDrawFlags_RoundCornersAll, 1.0f);
+    dl->AddRect(a, b, u32(edge), r, ImDrawFlags_RoundAll, 1.0f);
 
     // 悬停高光：顶部一条半透明白线（玻璃质感）
     if (hovered) {
@@ -185,7 +185,7 @@ void statusPill(const char* text, const ImVec4& color) {
     bg.w *= 0.22f;
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), u32(bg), h * 0.5f);
     dl->AddRect(p, ImVec2(p.x + w, p.y + h), u32(color), h * 0.5f,
-                ImDrawFlags_RoundCornersAll, 1.0f);
+                ImDrawFlags_RoundAll, 1.0f);
     dl->AddText(ImVec2(p.x + 7.0f, p.y + 2.0f), u32(color), text);
 
     ImGui::Dummy(ImVec2(w, h));
