@@ -158,6 +158,22 @@ public:
     void setLeftMinWidth(float px);
     float leftMinWidth() const;
 
+    // 左栏的**默认**宽度下限（同样由当前编辑模式声明）。
+    //
+    // 2026-10-28 第二刀：只改"拖动下限"没解决问题 —— 默认宽度仍是写死的
+    // 460（`kMinModeRail`），于是新装用户第一眼看到的视口只有 778px 宽
+    // （1600×900 下），右侧工具条 7 颗按钮只放得下 3 颗，尾巴上那 4 颗
+    // （显示开关 / 视口设置 / 栅格 / 相机速度）**静默消失**。
+    //
+    // 默认宽度改成"按当前模式取"，Select / Landscape / Foliage = 300 →
+    // 视口回到 936px，7 颗刚好放得下；Modeling 这些仍要 460，切过去时
+    // `setLeftMinWidth` 会把宽度顶上去。
+    //
+    // ⚠ 与 `setLeftMinWidth` 分开、且必须**在 beginFrame 之前**调用：
+    //   后者要在 beginFrame 之后（它读 m_dispW 判断"当前宽度够不够"），
+    //   而首帧的默认宽度在 beginFrame 里就要算出来。
+    void setLeftDefaultMinWidth(float px);
+
     // 主体区底部要**额外**留出的高度（状态栏之上）。
     //
     // 2026-10-17：底栏（Content / 输出日志 / CMD 那一行）从这里扣。
@@ -326,6 +342,11 @@ private:
 
     // 左栏拖动下限（按当前编辑模式由 setLeftMinWidth 写入节点 0 的 minA）
     float m_leftMin = 0.0f;
+
+    // 左栏**默认**宽度下限（按当前模式，见 setLeftDefaultMinWidth）。
+    // 0 = 没人指定 → beginFrame 退回历史默认 `kMinModeRail`（460），
+    // 也就是"不调用它时行为与改动之前逐像素一致"。
+    float m_leftDefaultMin = 0.0f;
 
     // 遮挡矩形（浮层 / 弹层 / 浮动面板）。见 addOccluder。
     // 刻意用一组 float 而不是 ImVec2：这个头文件不 include imgui.h

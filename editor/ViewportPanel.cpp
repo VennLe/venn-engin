@@ -780,10 +780,20 @@ void ViewportPanel::drawToolbar() {
     //
     // 现在改成：按重要性从高到低往预算里塞，塞不下的那颗就不画，并在
     // 日志里列出被丢的是谁。宁可少两颗，也不重叠/不被裁一半。
+    //
+    // ⚠ 2026-10-28（#317）：预算的算法微调过两处，都是为了"7 颗在
+    //   1600×900 笔记本（客户区 1583×861）上真的放得下"：
+    //     · 右留白 8 → **2** px（那 8px 只是习惯，没有任何东西要它）；
+    //     · 右组按钮间距 2 → **1** px（`sameTight`，只在右组用；左组不变）。
+    //   实测 need 346→**340**、budget 341→**347** —— 改之前差 5px，
+    //   第 7 颗（相机速度）在 1583 宽时**被静默丢掉**，表现就是
+    //   "有时有速度按钮、有时没有"，连带 verify_viewport_bar 的 V3a 时红时绿。
     {
         char speedBuf[32];
         std::snprintf(speedBuf, sizeof(speedBuf), "%.2f",
                       static_cast<double>(c.navSensitivity()));
+        // 右组专用：间距 1px。见上面那段"为什么是 1"的说明。
+        const auto sameTight = [&]() { ImGui::SameLine(0.0f, 1.0f); };
         const char* lightName = TR(render::Renderer::viewModeName(m_renderer.viewMode()));
         const char* persp = TR("Perspective");
         const char* layoutName = viewportLayoutShortName(c.viewportLayout());
@@ -803,12 +813,14 @@ void ViewportPanel::drawToolbar() {
         constexpr int kItemCount = 7;
 
         const float budget =
-            ImGui::GetContentRegionMax().x - leftGroupEndX - 8.0f;
+            ImGui::GetContentRegionMax().x - leftGroupEndX - 2.0f;
         bool take[kItemCount] = {false};
         float need = 0.0f;
         int taken = 0;
         for (int i = 0; i < kItemCount; ++i) {
-            const float w = items[i].w + (taken > 0 ? 2.0f : 0.0f);
+            // 间距必须和下面实际绘制用的 sameTight()（1px）一模一样，
+            // 否则 need 会虚高、预算判据和真实绘制脱钩。
+            const float w = items[i].w + (taken > 0 ? 1.0f : 0.0f);
             if (need + w > budget) break;   // 后面的更不重要，直接停
             take[items[i].id] = true;
             need += w;
@@ -840,7 +852,7 @@ void ViewportPanel::drawToolbar() {
                                  TR("Projection, view directions and camera"),
                                  "VP-VIEW-BTN"))
                     openDropdown("##vp_view_menu");
-                same();
+                sameTight();
             }
             // 分屏布局（1 / 2V / 2H / 4）。**紧挨着"透视"**是用户明确要求的：
             // "把这些参数也一样放到和 Perspective 这些属性一起并排放置，
@@ -852,33 +864,33 @@ void ViewportPanel::drawToolbar() {
                                     "2H = stacked   4 = quad"),
                                  "VP-LAYOUT-BTN"))
                     openDropdown("##vp_layout_menu");
-                same();
+                sameTight();
             }
             if (take[2]) {
                 if (vpTextButton("vpt_light", lightName,
                                  TR("Lighting mode (how the scene is drawn)"),
                                  "VP-LIGHT"))
                     openDropdown("##vp_light_menu");
-                same();
+                sameTight();
             }
             if (take[3]) {
                 if (vpIconButton("vpt_show", kVpIconEye, false,
                                  TR("Show flags"), 24.0f, "VP-SHOW"))
                     openDropdown("##vp_show_menu");
-                same();
+                sameTight();
             }
             if (take[4]) {
                 if (vpIconButton("vpt_settings", kVpIconGear, false,
                                  TR("Viewport settings (grid / background)"),
                                  24.0f, "VP-SET"))
                     openDropdown("##vp_settings_menu");
-                same();
+                sameTight();
             }
             if (take[5]) {
                 if (vpIconButton("vpt_grid", kVpIconGrid, c.showGridRef(),
                                  TR("Reference grid on / off"), 24.0f, "VP-GRID"))
                     c.showGridRef() = !c.showGridRef();
-                same();
+                sameTight();
             }
             if (take[6]) {
                 if (vpValueButton("vpt_speed", kVpIconMove, speedBuf,

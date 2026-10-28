@@ -337,13 +337,42 @@ build\AssetC.exe --check assets\models\girl.vmesh
 
 ```
 ASSETC OK <in>
-ASSETC   submeshes=7 joints=21 clips=4 materials=7
+ASSETC   submeshes=7 joints=21 clips=2 materials=7
 ASSETC   vertices 43808 -> 11338  indices 65712 -> 65712  acmr 2.000 -> 0.781
 ASSETC   keys 7812 -> 651
 ASSETC   geometry 3.59 MB -> file 1.01 MB (3.55x) in 102.4 ms
 ASSETC   wrote <out>
 ASSETC TOTAL files=1 fail=0 geometry=3.59 MB output=1.01 MB
 ```
+
+#### 5.1.1 `FBX-CLIPDUP`：take 名归一化之后的重名去重（2026-10-28，#329）
+
+Blender 的 `bake_anim_use_all_actions` 会把 take 名写成 `<armature>|<action>`，
+读入时一律剥掉 `|` 前缀（Unity / UE / glTF 转换器都这么做）。剥完之后**可能撞名**：
+`anime_girl.fbx` 里就有 4 个 AnimationStack —— `Rig|Idle` ×2 + `Rig|Walk` ×2，
+归一化后是 `[Idle, Walk, Idle, Walk]`。撞名的代价不是"列表难看"：
+
+- `Skeleton::findClip(name)` 逐字取第一个匹配 → 第二段永远播不到；
+- 角色窗口的片段列表两行同名 → ImGui 判 ID 冲突 → 弹**模态**告警窗，
+  之后**所有鼠标点击全被它吃掉**（界面看着正常、点哪都没反应）。
+
+规则（`assetio/ClipDedup.h`，`AssetC` 与引擎 `FbxLoader` **共用同一份实现**）：
+
+| 情况 | 处置 | 理由 |
+|------|------|------|
+| 同名 **同时长**（容差 1e-4 s） | **丢弃**后一段 | 同一动作被导出了两遍；时长相同是最强的证据 |
+| 同名 **不同时长** | **改名** `<name>_2`、`_3`… | 是撞名不是重复，丢数据不可逆，改名只是难看 |
+
+决策发生在**逐帧采样之前**（丢掉的段不必再算 61 帧 × N 骨 × 3 通道）。
+`AssetC` 与引擎各打一行（同一段文字，`clipDedupLine()` 生成）：
+
+```
+FBX-CLIPDUP take='Rig|Idle' name='Idle' dur=1.0000 action=drop (same name & same duration -> duplicate export)
+FBX-CLIPDUP take='Rig|Walk' name='Walk' dur=1.0000 action=rename to='Walk_2' (same name, different duration -> keep both)
+```
+
+⚠ `anime_girl.vmesh` 因此从 `clips=4` 变成 `clips=2`（几何/骨骼/材质一字节没动，
+只有动画段少了一段重复）。`verify_vertex_format.BASE` 已同步这一项。
 
 ### 5.2 引擎内自检（无窗口、不开 Vulkan）
 

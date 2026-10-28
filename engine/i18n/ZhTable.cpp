@@ -3261,6 +3261,105 @@ const Entry kZh[] = {
     {"Package needs an open project: ", "打包需要先打开一个工程："},
     {"Package failed: Game.exe not found next to the editor", "打包失败：编辑器旁边找不到 Game.exe"},
     {"Packaged %d files · %lld KB  →  %s", "已打包 %d 个文件 · %lld KB  →  %s"},
+
+    // ---- R6 曲线编辑器（Graph Editor，2026-10-28）----
+    {"Curve editor", "曲线编辑器"},
+    {"Channel", "通道"},
+    {"Channels", "通道列表"},
+    {"Cursor", "光标"},
+    {"Fit", "适配"},
+    {"V: fit handle", "V：重算手柄"},
+    {"handles retime all channels", "手柄会同时改所有通道的节奏"},
+    {"No key selected — click a key on the canvas, or drag a box across several.", "没有选中关键帧 —— 在画布上点一帧，或者拖个框圈住几帧。"},
+    {"The canvas draws one scalar channel at a time. The handles belong to the segment, not to the channel: dragging one retimes all four position/yaw/pitch/fov channels at once.", "画布一次只画一个标量通道。手柄属于「段」而不是通道：拖它会同时改 position / yaw / pitch / fov 四个通道的节奏。"},
+    {"Recompute both handles of this segment from a rule (auto / auto clamped / vector / aligned). The result is written as numbers: this data has no handle-type field, because the whole segment shares one pair of handles.", "按一条规则重算这一段的两根手柄（auto / auto_clamped / vector / aligned）。算出来的是**数值**，写回之后就等于自由手柄 —— 这份数据没有「手柄类型」字段，因为整段四个通道共用一组手柄。"},
+    {"linear / smooth / step / bezier. T cycles them. step is the curve core's 'constant', smooth is 'linear + ease in-out'.", "linear / smooth / step / bezier，按 T 循环。step 对应曲线核心的 constant，smooth 是 linear + 缓入缓出。"},
+    {"Scrubbing only samples; it does not play.", "拖光标只是采样，不播放。"},
+    {"Camera keys in this sequence. This panel edits them; a new key still comes from the timeline editor (one owner per operation).", "这份过场里的相机关键帧。本面板只改已有帧；新增关键帧仍然在时间轴编辑器里做（每个操作只有一个入口）。"},
+    {"Load check failed:", "加载校验失败："},
+    {"Round-trip OK", "存取往返一致"},
+    {"canvas vs runtime:", "画布 ↔ 运行时："},
+    {"cannot map the next ease", "映射不到下一个插值模式"},
+    {"cannot map the next handle type", "映射不到下一种手柄类型"},
+    {"the last key has no outgoing segment", "最后一帧没有出段"},
+    // R6 磁盘冲突（两个编辑器同时开同一份资产时唯一的护栏）。
+    {"Not saved — the file changed on disk after it was opened (another editor saved it). Press Reload to take its version, or Save anyway to overwrite it.", "没有保存 —— 文件在打开之后被改过（大概是另一个编辑器存了一遍）。点「重新读取」接受它那一份，或者点「仍然保存」覆盖它。"},
+
+    // ---- R5 时间轴编辑器漏掉的 5 条（2026-10-28 补）----
+    // ⚠ 这五条是跑 `verify_i18n_coverage` 才现形的：R5 那时没人跑过它，
+    //   于是"贝塞尔手柄"那一整块在中文界面下一直是英文 —— 不崩、不报错，
+    //   只是切了语言没反应。
+    {"out x", "出 x"},
+    {"out y", "出 y"},
+    {"in x", "入 x"},
+    {"in y", "入 y"},
+    // 原文里那两个 "%" 是**裸百分号**（不是占位符），而 F 组会把它当成
+    // printf 的 `%o` —— 于是中文译文里被迫也带上 "% o"，读起来是乱的。
+    // 改成 0..1 之后原文没有 % 了，译文可以写成人话，而且顺便说明白
+    // 归一化的取值范围（这本来就是作者最想问的）。
+    {"Bezier handles (normalised: x = 0..1 of this segment, y = 0..1 of the value change)", "贝塞尔手柄（归一化：x 是占本段时长的比例，y 是占本段值差的比例，都取 0~1）"},
+
+    // ---- R7 骨骼关键帧编辑 + Pose Mode（#319，2026-10-28）----
+    // 三处术语的定调：
+    //   pose      → 姿势（不是"姿态"：面板上一律用"姿势"，和"摆姿势"一致）
+    //   key       → 关键帧 / 帧；动词那个 "key" 译成"打帧"
+    //   base clip → 基础片段（它是**叠加的底子**，不是"父片段"）
+    {"Pose Mode", "姿势模式"},
+    {"Pose Mode: pick a bone, rotate it with the gizmo, press I to key. Keys are stored in a .anim.json asset (the imported clip stays read-only).", "姿势模式：选一根骨，用圆形手柄旋转，按 I 打帧。打好的帧存在 .anim.json 资产里（导入的片段始终是只读的）。"},
+    {"Pose", "姿势"},
+    {"EDIT CLIP", "编辑片段"},
+    {"Where the .anim.json lives. The imported clip is never modified — this asset only stores the keys you author here.", ".anim.json 存在哪儿。导入的片段永远不被改写 —— 这份资产只存你在这里打的帧。"},
+    {"Load", "读取"},
+    {"Throw away every key in this asset (the file on disk is untouched until you press Save)", "清空这份资产里的所有帧（磁盘上的文件在你点「保存」之前不受影响）"},
+    {"Base clip", "基础片段"},
+    {"(rest pose)", "（静止姿势）"},
+    {"Keys are layered on top of this clip. Bones you never key keep playing it; '(rest pose)' means the unkeyed bones stay still.", "帧是叠在这段片段**之上**的。你没打过帧的骨继续跟着它动；选「静止姿势」则没打帧的骨保持不动。"},
+    {"STATS", "统计"},
+    {"Resolved", "已解析"},
+    {"How many of the stored tracks found their bone in this skeleton. Keys are stored by bone NAME, so a re-import with shifted joint indices still works.", "存下来的轨道里有多少在这具骨架上找到了对应的骨。帧是按**骨名**存的，所以重新导入导致骨骼下标整体平移也不会错位。"},
+    {"Missing bones", "缺失的骨"},
+    {"KEYS", "关键帧"},
+    {"(no keys yet — pick a bone and press I)", "（还没有帧 —— 选一根骨然后按 I）"},
+    {"POSE LIBRARY", "姿势库"},
+    {"Store", "存入库"},
+    {"Save the pose currently on screen under this name (whole body)", "把屏幕上当前这个姿势按这个名字存进库（整具骨架）"},
+    {"POSE", "姿势"},
+    {"(pick a bone in the Skeleton tab)", "（在「骨骼」页里选一根骨）"},
+    {"Bone translation relative to its parent (rest offset included)", "骨相对父骨的平移（已含静止姿势的偏移）"},
+    {"Rot", "旋转"},
+    {"Bone rotation in degrees. Same convention as glm::eulerAngles, so the numbers here and the script API agree.", "骨的旋转，单位是度。约定与 glm::eulerAngles 一致，所以这里的数字和脚本接口是同一套。"},
+    {"Key (I)", "打帧 (I)"},
+    {"Rot only", "只打旋转"},
+    {"Loc only", "只打平移"},
+    {"Scl only", "只打缩放"},
+    {"Write the current values as keys at the playhead. Only the bones you key are stored — everything else keeps following the base clip.", "把当前这组值按播放头所在时刻打成帧。**只有你打过帧的骨**会被存下来，其余的继续跟着基础片段走。"},
+    {"Revert bone", "撤销这根骨的改动"},
+    {"Drop the un-keyed changes on this bone and fall back to the keys / base clip", "丢掉这根骨上还没打帧的改动，回到关键帧 / 基础片段的样子"},
+    {"Keys on this bone", "这根骨的帧"},
+
+    // ---- R8 动画摄影表（#320，2026-10-28）----
+    // 术语延续 R7 的定调，另有两条新的：
+    //   dope sheet → 摄影表（"动画摄影表"是 Blender 中文版的叫法）
+    //   extreme / breakdown / inbetween → 极端 / 间断 / 中间（**只读节奏的标记**，
+    //     不是"插值方式"；译文里不出现"插值"两个字，免得误导）
+    {"Dope sheet", "摄影表"},
+    {"Open the dope sheet on this clip — select, drag, mirror and align the keys you just made. It edits this same in-memory clip.", "打开这份片段的摄影表 —— 框选、拖动、镜像、对齐循环长度，改的就是刚刚打的那批帧（同一份内存数据，不用先存盘）。"},
+    {"Bound to Pose Mode — edit it there, or unbind first.", "已绑定姿势模式 —— 请在那里修改，或先解绑。"},
+    {"Bound to Pose Mode — save from the Character window.", "已绑定姿势模式 —— 请从角色窗口保存。"},
+    {"No path.", "还没有路径。"},
+    {"pose mode", "姿势模式"},
+    {" (live)", "（实时）"},
+    {"Editing the clip open in Pose Mode. Save it from the Character window — one owner per file.", "正在编辑姿势模式里打开的那份片段。保存请走角色窗口 —— 一个文件只能有一个写者。"},
+    {"Total keys / selected keys. Wheel scrolls rows, Ctrl+wheel zooms time, Shift+wheel pans.", "总帧数 / 选中帧数。滚轮上下滚动，Ctrl+滚轮缩放时间轴，Shift+滚轮左右平移。"},
+    {"No keys yet — press I on a bone in Pose Mode.", "还没有帧 —— 在姿势模式里选根骨按 I 打一帧。"},
+    {"(nothing selected)", "（没有选中）"},
+    {"key / extreme / breakdown / inbetween. These are markers only — they never change the evaluated pose.", "普通 / 极端 / 间断 / 中间。这四个只是**标记**，永远不改变求值出来的姿势。"},
+    {"key type", "关键帧类型"},
+    {"Mirror", "镜像"},
+    {"Reflect the selected keys in TIME around the playhead: t' = 2·pivot − t.", "把选中的帧在**时间轴**上绕播放头镜像：t' = 2·支点 − t。"},
+    {"Align cycle", "对齐循环长度"},
+    {"Scale the selected keys in time so the last one lands exactly on the clip duration. The first selected key stays put (phase anchor).", "把选中帧在时间轴上等比缩放，让最后一帧正好落在片段时长上。第一个选中的帧不动（它是相位锚点）。"},
+    {"G grab · M mirror · Y align · 1/2/3 type", "G 抓取 · M 镜像 · Y 对齐循环 · 1/2/3 设类型"},
 };
 
 // 跨 TU 拿不到 sizeof(kZh)（这里是不完整类型），所以长度单独导出。

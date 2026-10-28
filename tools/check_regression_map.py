@@ -253,6 +253,21 @@ run("editor/InspectorPanel.cpp → 面板块全家族", OLD,
           # 它是**作者侧唯一**能配关节的地方 —— verify_joints 的 D 组验的就是
           # 这段画出来没有、以及"没有关节时是 Add、有了之后才是字段"这个分叉。
           "verify_joints"})
+# 2026-10-28（#317）：分栏 → 视口几何。
+# `editor/SplitLayout.*` 管的是"左栏多宽"，而视口的左右边界就是它算出来的：
+#   · verify_viewport      —— CONVERGED_VP / V1d2 / V3 骨架全跟着分栏走；
+#   · verify_viewport_bar  —— 工具条右组放不放得下（7/7 vs 3/7）也是它；
+#   · verify_layout_drag   —— 根分隔条的拖动夹取（minA）；
+#   · verify_layout_slots  —— 叶子面板组 / 读盘恢复；
+#   · 另外三条是"按宽度排版"的历史 owner（底栏 / 三栏内容 / 材质 chip），
+#     它们读到的是面板矩形，所以一并钉住。
+# 判据：verify_viewport 与 verify_viewport_bar **一定**在（本轮就是给它们
+# 补的映射 —— 以前改分栏不会触发视口用例，属于漏网）。
+run("editor/SplitLayout.cpp → 分栏与视口几何", OLD,
+    with_change("editor/SplitLayout.cpp"),
+    want={"verify_bottom_bar", "verify_content_three_pane", "verify_i18n_coverage",
+          "verify_layout_drag", "verify_layout_slots", "verify_material_chips",
+          "verify_viewport", "verify_viewport_bar"})
 # 2026-10-27（#316）：选择集本体（`editor/EditorContext.*`）。
 # 期望是**并集**，而且这份并集本身就是这份 fixture 的价值：`EditorContext`
 # 是十几个用例共用的中枢，改它的"选择"语义会被一长串名字一起拖下水。
@@ -352,11 +367,15 @@ run("engine/scene/Prefab.cpp → 预制体", OLD,
 # 2026-10-27（#311）起是**两条**：`SequenceAsset` 从这一版开始能**写回**
 # （`toJson` / `saveSequence`），而时间轴编辑器每次改动都靠"序列化 → 丢回
 # `parseSequence`"做校验 —— 存盘格式错一个字段，编辑器那条会立刻红。
+# 2026-10-28（#318）起是**三条**：曲线编辑器读的是同一份 `.seq.json` 的
+# ease / 手柄字段，而且 `saveSequence` 写回之后它要能原样读回（G 用例比对
+# 落盘 JSON）—— 换算表与序列化口径任何一边变了，画布画出来的东西就不再
+# 等于运行时采样的那一份。
 # ⚠ 数值侧（`rt_*` 那 9 条往返断言）住在 `SequenceSelfTest.cpp`，跑
 #   `--selftest sequence` 才执行 —— 端到端那条**不能**替代它。
 run("engine/sequence/SequenceAsset.cpp → 过场时间轴 × 轨道编辑器", OLD,
     with_change("engine/sequence/SequenceAsset.cpp"),
-    want={"verify_sequencer", "verify_timeline_editor"})
+    want={"verify_sequencer", "verify_timeline_editor", "verify_curve_editor"})
 # 2026-10-26（C2 第二步）：对话层（`engine/dialogue/**`）。
 # ⚠ 数值侧（97 条 `DLG-TEST`）住在 `DialogueSelfTest.cpp`，跑
 #   `--selftest dialogue` 才执行 —— 端到端那条**不能**替代它。
@@ -393,6 +412,59 @@ run("editor/DialogueEditorWindow.cpp → 剧本编辑器 × 中文化", OLD,
 run("editor/TimelineEditorWindow.cpp → 时间轴编辑器 × 中文化", OLD,
     with_change("editor/TimelineEditorWindow.cpp"),
     want={"verify_timeline_editor", "verify_i18n_coverage"})
+# 2026-10-28（#318）：曲线编辑器面板本体。
+# 期望两条：除了自己那条，还有 verify_i18n_coverage —— 它扫描 `editor/*.cpp`
+# 里的界面字面量，而新面板一口气加了 19 条 TR 词条（缺了就是"面板一半英文"）。
+# ⚠ 这条**必须**留着：新加面板最容易漏的就是词条，而漏了不崩。
+# ⚠ 期望里**没有** verify_timeline_editor：两个编辑器共享的是数据
+#   （`SequenceAsset`），不是面板代码 —— 把面板本体挂到对方名下会让
+#   "改曲线画布却要跑时间轴那六次启动"变成假信号。共享的那份数据由上面
+#   `SequenceAsset.cpp` 那条 fixture 负责。
+run("editor/CurveEditorPanel.cpp → 曲线编辑器 × 中文化", OLD,
+    with_change("editor/CurveEditorPanel.cpp"),
+    want={"verify_curve_editor", "verify_i18n_coverage"})
+# 2026-10-28（#320）：摄影表面板本体。
+# 期望两条：除了自己那条，还有 verify_i18n_coverage —— 它扫描 `editor/*.cpp`
+# 里的界面字面量，而新面板一口气加了 18 条 TR 词条（缺了就是"面板一半英文"）。
+# ⚠ 期望里**没有** verify_curve_editor / verify_pose_mode：三者共享的是数据
+#   （`ClipEdit`）与宿主（`CharacterWindow`），不是面板代码 —— 把面板本体挂
+#   到对方名下会让"改摄影表却要跑曲线那九次启动"变成假信号。共享的那两份
+#   由下面 `ClipEdit.cpp` 与 `CharacterWindow.cpp` 的 fixture 负责。
+run("editor/DopeSheetWindow.cpp → 摄影表 × 中文化", OLD,
+    with_change("editor/DopeSheetWindow.cpp"),
+    want={"verify_dope_sheet", "verify_i18n_coverage"})
+# 2026-10-28（#318）：曲线求值本体（`engine/animation/Curve.*`）。
+# 期望是"自己那条一定在"的大并集：`engine/animation/**` 整层被四条动画用例
+# 登记着（换求值 = 换它们的输入），而画布画的就是同一份采样。
+# 这里挑 `Curve.cpp` 而不是别的动画文件，价值在于把 `verify_curve_editor`
+# **标明归属** —— 一眼能看出"改求值是为了验画布"，而不是"又要跑四条动画用例"。
+# ⚠ 并集里没有 verify_ik：它登记的是 `TwoBoneIK.*` 那一类具体文件，不是整层
+#   （上面那条 fixture 可以对照）。verify_sequencer 在是因为过场采样也走这份
+#   求值 —— 改它等于改过场播放器看到的值。
+run("engine/animation/Curve.cpp → 曲线求值 × 画布", OLD,
+    with_change("engine/animation/Curve.cpp"),
+    want={"verify_curve_editor", "verify_timeline_editor", "verify_sequencer",
+          "verify_anim_runtime", "verify_character_import",
+          "verify_player_character"})
+# 2026-10-28（#319）：Pose Mode 的数据层（`engine/animation/ClipEdit.*`）。
+# `engine/animation/**` 整层被几条动画用例登记着，所以 affected 是四条并集；
+# 这条 fixture 的价值是把 `verify_pose_mode` **标明归属** —— 一眼能看出
+# "改打帧实现是为了验姿势模式"。
+# 2026-10-28（#320）起是**五条**：三个批量操作（move / mirror / align）与
+# 关键帧类型表都长在这个文件里，摄影表那条用例直接调它们 —— 改成逐帧累加
+# 实现会让"相对间距逐位不变"当场红，而那正是它存在的理由。
+run("engine/animation/ClipEdit.cpp → 骨骼打帧 × 姿势模式", OLD,
+    with_change("engine/animation/ClipEdit.cpp"),
+    want={"verify_pose_mode", "verify_dope_sheet", "verify_anim_runtime",
+          "verify_character_import", "verify_player_character"})
+# `Pose.cpp` 是**全动画链的地基**（采样 / FK / 混合），ClipEdit 只是叠在它
+# 上面的一层。⚠ 并集里没有 verify_curve_editor / verify_timeline_editor /
+#   verify_sequencer —— 它们登记的是 `engine/animation/Curve.*` 与
+#   `engine/sequence/**`，不是 `engine/animation/**` 整层；把它们写进来会红。
+run("engine/animation/Pose.cpp → 采样地基 × 姿势模式", OLD,
+    with_change("engine/animation/Pose.cpp"),
+    want={"verify_pose_mode", "verify_anim_runtime", "verify_character_import",
+          "verify_player_character"})
 # `SequencerSystem.cpp` 是 **C1 / C2 / C6 的交界**：
 #   · C1 组件路径（playhead / 关键帧 / 事件）
 #   · C2 `kind=Line` → 一次 `cue()`
@@ -455,7 +527,11 @@ run("assetc/main.cpp → verify_vmesh", OLD,
     with_change("assetc/main.cpp"),
     # 2026-10-22 起 assetc 还挂了绑骨（--autorig）与程序化动画（--procanim）
     # 两组开关，它们各自有自己的验收脚本 → 三个 owner。
-    want={"verify_vmesh", "verify_autorig", "verify_procanim"})
+    # 2026-10-28（#329）再加 verify_clip_dedup：take 名去重后的
+    # `FBX-CLIPDUP` 行是由 assetc/main.cpp **打印**的（assetio 不链 Logger，
+    # 只产出文本），格式改了只有那条用例会红。
+    want={"verify_vmesh", "verify_autorig", "verify_procanim",
+          "verify_clip_dedup"})
 # 2026-10-22：自动绑骨 / 程序化动画是两条**独立**的离线链，各自只被自己的
 # 用例读。合成一条的话，"把 AutoRig 的比例表改坏"会让 procanim 也重跑，
 # 反过来一样 —— 跑得多但没人对结果负责，等于没登记。
@@ -485,9 +561,14 @@ run("editor/CharacterWindow.cpp → 预览与地形并存", OLD,
     # 捕获 / `CHAR-KEYBIND` 锚点都长在这个文件里）。
     # P6 再加一条 verify_char_preview：预览叠加层（胶囊线框 / gizmo / 选中框）、
     # 鼠标点选、位置-旋转-大小控件条 —— 整块都在这个文件里。
+    # R7（#319）再加 verify_pose_mode：姿势模式的面板、旋转环 gizmo、打帧、
+    # 姿态库、以及 `MYVK_EDITOR_POSE_SCRIPT` 的注入点全长在这个文件里。
+    # R8（#320）再加 verify_dope_sheet：`syncDopeSheet()` 与 "Dope sheet" 按钮
+    # 也长在这里 —— 它决定"摄影表看的是哪一份 clip"，改错了绑定态整张表是空的。
     want={"verify_character_import", "verify_character_window",
           "verify_i18n_coverage", "verify_preview_terrain",
-          "verify_char_locomotion", "verify_char_preview"})
+          "verify_char_locomotion", "verify_char_preview",
+          "verify_pose_mode", "verify_dope_sheet"})
 run("engine/render/RenderTarget.cpp → 预览与地形并存", OLD,
     with_change("engine/render/RenderTarget.cpp"),
     # 2026-10-25 加 verify_outline：描边的几何缓冲视图

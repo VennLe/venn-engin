@@ -4,6 +4,8 @@
 #include "CharacterWindow.h"
 #include "DialogueEditorWindow.h"
 #include "TimelineEditorWindow.h"
+#include "CurveEditorPanel.h"
+#include "DopeSheetWindow.h"
 #include "UiEditorWindow.h"
 #include "CommandRegistry.h"
 #include "ContentBrowser.h"
@@ -409,6 +411,19 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         // 显隐 / 落盘，真正的 draw 在 drawUiEditorWindow。
         {"uied", "UI editor", PanelGroup::Authoring, "", "layout",
          false, true, kSlotNone, &EditorApp::panelDrawUiEditor},
+        // 2026-10-28（R6）：曲线编辑器。与上面三格**完全同构** —— 窗口对象
+        // 自己管 open/close，表项只做显隐 / 快捷键 / 落盘三路，真正的 draw
+        // 在 drawCurveEditorWindow 里每帧无条件跑。
+        // ⚠ 它的窗口稳定 ID 必须写成 `###panel_curveed`（= trayWindowName
+        //   的结果），否则底栏托盘的最小化 / 置顶按 id 找不到这个窗口。
+        {"curveed", "Curve editor", PanelGroup::Authoring, "", "curve",
+         false, true, kSlotNone, &EditorApp::panelDrawCurveEditor},
+        // 2026-10-28（R8）：动画摄影表。与上面四格**完全同构** —— 窗口对象
+        // 自己管 open/close，表项只做显隐 / 快捷键 / 落盘三路，真正的 draw
+        // 在 drawDopeSheetWindow 里每帧无条件跑。
+        // ⚠ 稳定 ID 必须写成 `###panel_dope`（= trayWindowName("dope")）。
+        {"dope", "Dope sheet", PanelGroup::Authoring, "", "timeline",
+         false, true, kSlotNone, &EditorApp::panelDrawDopeSheet},
     };
 }
 
@@ -461,6 +476,10 @@ void EditorApp::panelDrawDialogueEditor(EditorApp& a) { (void)a; }
 void EditorApp::panelDrawTimelineEditor(EditorApp& a) { (void)a; }
 // 同上（#312）：drawUiEditorWindow 每帧无条件被调用。
 void EditorApp::panelDrawUiEditor(EditorApp& a) { (void)a; }
+// 同上（R6）：drawCurveEditorWindow 每帧无条件被调用。
+void EditorApp::panelDrawCurveEditor(EditorApp& a) { (void)a; }
+// 同上（R8）：drawDopeSheetWindow 每帧无条件被调用。
+void EditorApp::panelDrawDopeSheet(EditorApp& a) { (void)a; }
 void EditorApp::panelDrawPhysics(EditorApp& a) {
     if (a.m_physicsPanel) a.m_physicsPanel->draw();
 }
@@ -628,8 +647,8 @@ void EditorApp::collectSplitOccluders() {
 // 编辑模式 → 它自己的面板 id（`PanelDesc::id`）。Select 没有面板：它就是
 // "点一下选中、W/E/R 变换"，面板是 Inspector。所以这里返回 nullptr。
 //
-// 抽成表而不是在 serviceEditMode 里写九个 if：九个模式里只有 Select 特例，
-// 剩下八个完全同构（关旧面板 / 开新面板 / sync / focus），一份表就够。
+// 抽成表而不是在 serviceEditMode 里写十个 if：十个模式里只有 Select 特例，
+// 剩下九个完全同构（关旧面板 / 开新面板 / sync / focus），一份表就够。
 // Toolbar 里那颗下拉也是按 EditMode 顺序枚举的 —— 加模式时这两处必须一起改。
 static const char* editModePanelId(EditMode m) {
     switch (m) {
@@ -1400,6 +1419,15 @@ void EditorApp::onInit() {
     m_tlEditor = std::make_unique<TimelineEditorWindow>(*m_ctx);
     // #312 UI 编辑器（同上）
     m_uiEditor = std::make_unique<UiEditorWindow>(*m_ctx);
+    // R6 曲线编辑器（同上）。它不持 Renderer：画布是 ImGui 自绘，
+    // 与渲染器无关 —— 这也是它能被单独自动化起来的原因。
+    m_curveEditor = std::make_unique<CurveEditorPanel>(*m_ctx);
+    // R8 动画摄影表（同上）。它比前几个多一个"绑定"形态：Pose Mode 打开时
+    // 编辑 CharacterWindow 内存里那份 EditClip。两边的指针在构造之后互相
+    // 注入（见下面的 attachDopeSheet），谁都不在构造函数里碰对方 ——
+    // 构造期互相引用是循环依赖的典型起点。
+    m_dopeSheet = std::make_unique<DopeSheetWindow>(*m_ctx);
+    if (m_characterWindow) m_characterWindow->attachDopeSheet(m_dopeSheet.get());
 
     // E18：命令注册表（命令面板 / 快捷键表 / 总览共用）。必须在所有面板
     // 与 Renderer 都就绪之后 —— 命令的 handler 会摸它们。
@@ -1471,6 +1499,15 @@ void EditorApp::onInit() {
         m_gpuTimelineOpenDone = true;
         // 这一行是给自动化的证据：launch 之后面板状态必须**可见**地变了。
         // （onInit 里没有其它 logPanelStates 调用点，不打就只剩"closed"。）
+        logPanelStates();
+    }
+
+    // 角色详情窗口（Persona）。2026-10-28 加的，为 Pose Mode 的验收服务：
+    // 正常路径是"右键视口 → Add → Player"才会弹出来，而那要一路点 GUI；
+    // 摆姿势这件事跟"有没有先加过一个玩家"没有关系，脚本不该为此去点菜单。
+    // 配合 `MYVK_CHARACTER_MODEL`（CharacterWindow 自己认的那个）一起用。
+    if (std::getenv("MYVK_CHARACTER_WINDOW")) {
+        if (bool* p = panelOpenSlotById("character")) *p = true;
         logPanelStates();
     }
 
@@ -1612,6 +1649,40 @@ void EditorApp::onInit() {
     if (const char* envUi = std::getenv("MYVK_EDITOR_UIED")) {
         m_ctx->requestUiEditor(envUi);
         VK_LOG_INFO("Editor: ui-editor request path='%s'", envUi);
+    }
+
+    // ---- MYVK_EDITOR_CURVED=<路径>：启动即打开曲线编辑器（R6）----
+    // 这个窗口**没有**走 ctx 的一次性请求通道：它没有 Inspector 入口
+    // （见 EditorApp.h 的注释），直接开就行。
+    //   MYVK_EDITOR_CURVED_SCRIPT="chan:position.x;sel:1;dragkey:1:40:0;save"
+    //   MYVK_EDITOR_CURVED_DUMP=<路径>                        落成 JSON
+    if (const char* envCv = std::getenv("MYVK_EDITOR_CURVED")) {
+        if (m_curveEditor) {
+            m_curveEditor->open(envCv);
+            const int idx = panelIndexOf("curveed");
+            if (idx >= 0) {
+                setPanelOpen(idx, true);
+                panelTrayHiddenRef(idx) = false;
+            }
+            VK_LOG_INFO("PANEL curveed open=1 reason=env path=%s", envCv);
+        }
+    }
+
+    // ---- MYVK_EDITOR_DOPE=<路径>：启动即打开动画摄影表（R8）----
+    // 与上面 CURVED 同款（没有 Inspector 入口 → 不走 ctx 的请求通道）。
+    //   MYVK_EDITOR_DOPE_SCRIPT="selall;move:0.25;save"   注入命令
+    // ⚠ 绑定形态（Pose Mode）下这个钩子不起作用：数据源由 CharacterWindow
+    //   推过来，路径参数没有意义。
+    if (const char* envDope = std::getenv("MYVK_EDITOR_DOPE")) {
+        if (m_dopeSheet) {
+            m_dopeSheet->open(envDope);
+            const int idx = panelIndexOf("dope");
+            if (idx >= 0) {
+                setPanelOpen(idx, true);
+                panelTrayHiddenRef(idx) = false;
+            }
+            VK_LOG_INFO("PANEL dope open=1 reason=env path=%s", envDope);
+        }
     }
 
     // ---- MYVK_EDITOR_CAM="x,y,z,yawDeg,pitchDeg"：把视口相机摆到指定位姿 ----
@@ -3147,13 +3218,20 @@ void EditorApp::computeLayout() {
     // 分栏交界处可拖动调整，侧栏可拖到 0 折叠（视口优先）。
     // 工具栏高度是用户可调的（设置面板），每帧同步进布局器。
     m_split->setToolbarHeight(m_ctx->toolbarHeight());
+    // 2026-10-28 第二刀（#317）：**默认宽度**也按当前模式取。
+    // 只把"拖动下限"按模式放开是不够的 —— 默认宽度仍是写死的 460，
+    // 新装用户第一眼看到的视口只有 778px，右侧工具条 7 颗按钮里尾巴 4 颗
+    // 静默消失。默认值必须在 beginFrame **之前**就位（首帧的默认宽度在
+    // 那里算），所以和下面那个 setLeftMinWidth 分成两个入口。
+    const float modeRailW = editModeRailMinWidth(m_ctx->editMode());
+    m_split->setLeftDefaultMinWidth(modeRailW);
     m_split->beginFrame(io.DisplaySize.x, io.DisplaySize.y);
 
     // 2026-10-28：左栏拖动下限按**当前模式**问一次。
     // 之前它恒等于 460 —— 而那正好是默认宽度，于是"往左拖视口扩不开"。
     // 必须在 beginFrame 之后：setLeftMinWidth 要读 m_dispW 才能判断
     // "当前宽度够不够，要不要顶上去"。
-    m_split->setLeftMinWidth(editModeRailMinWidth(m_ctx->editMode()));
+    m_split->setLeftMinWidth(modeRailW);
 
     // E06-5：面板被关掉时那一侧收成 0（邻居吃掉空间，而不是留一块空白）。
     // 必须在 apply() 之前 —— resolve 读的就是这里算出来的 liveA/liveB。
@@ -4154,6 +4232,8 @@ void EditorApp::onImGui() {
     drawDialogueEditorWindow();
     drawTimelineEditorWindow();
     drawUiEditorWindow();
+    drawCurveEditorWindow();
+    drawDopeSheetWindow();
 
     // 浮动面板标题栏的"最小化"按钮。必须排在**所有窗口画完之后**：它要读
     // 每个窗口这一帧的 Pos/Size 才能把那一格摆到关闭 X 的左边（见函数注释）。
@@ -4820,12 +4900,26 @@ EditorApp::TrayHit EditorApp::trayButton(const char* id, const char* label,
     }
     if (ImGui::BeginPopup("##tray_ctx")) {
         const std::string wname = trayWindowName(id + 5);   // 去掉 "tray_" 前缀
-        ImGuiWindow* win = ImGui::FindWindowByName(wname.c_str());
-        const bool collapsed = win ? (win->Collapsed != 0) : false;
-        if (ImGui::MenuItem(TR(collapsed ? TRL("Expand") : TRL("Minimize")))) {
-            ImGui::SetWindowCollapsed(wname.c_str(), !collapsed);
-            VK_LOG_INFO("PANEL-TRAY %s minimized=%d", id + 5,
-                        collapsed ? 0 : 1);
+        // "最小化"在本项目里 = **把窗口收进底栏这个按钮**（`panelTrayHiddenRef`），
+        // 与标题栏那颗"–"、以及再点一次托盘按钮走的是同一条状态。
+        //
+        // ⚠ 2026-10-28（#317）：这里原来调 `ImGui::SetWindowCollapsed` ——
+        //   那是**另一套**状态，而所有浮动面板都被托管成视口标签页
+        //   （`applyDockHint` 加 NoTitleBar | NoCollapse），ImGui 在 Begin 里
+        //   会直接把 `Collapsed` 按回 false 并清掉 `WantCollapseToggle`。
+        //   结果是：点"Minimize"**什么都没发生**，却照样打 `minimized=1`；
+        //   而 PANEL-STATE 读的那份状态永远是 0 —— T8b 长期红着指不到真因。
+        const int pi = panelIndexOf(id + 5);
+        const bool hidden = pi >= 0 && panelTrayHiddenRef(pi);
+        if (ImGui::MenuItem(TR(hidden ? TRL("Expand") : TRL("Minimize")))) {
+            if (pi >= 0) {
+                panelTrayHiddenRef(pi) = !hidden;
+                VK_LOG_INFO("PANEL-TRAY %s minimized=%d", id + 5,
+                            hidden ? 0 : 1);
+            } else {
+                VK_LOG_WARN("PANEL-TRAY %s minimize: unknown panel '%s'",
+                            id + 5, wname.c_str());
+            }
         }
         logRect("BAR-TRAY-CTX-min", ImGui::GetItemRectMin(),
                 ImGui::GetItemRectMax());
@@ -4876,22 +4970,34 @@ EditorApp::TrayHit EditorApp::trayButton(const char* id, const char* label,
     return hit;
 }
 
-// 托盘面板的"最小化"（= ImGui 的折叠）状态上报。
+// 托盘面板的"打开 / 最小化"状态上报。
 //
-// 为什么需要它：折叠状态是 ImGui 窗口自己的，改动发生在**标题栏那颗折叠
-// 箭头**上（或者双击标题栏），我们没有任何控件回调可以挂。而"面板可以
-// 最小化"是用户明确要的能力 —— 没有可断言的痕迹，就没法证明它没坏。
-// 每帧读一次窗口对象，只有变化才打一行，成本可以忽略。
+// 2026-10-28（#317）改过口径，原因是下面这条链路**从来就没通过**：
+//
+//   · 原来 `min` 读的是 ImGui 窗口的 `Collapsed`（标题栏那颗折叠箭头 /
+//     右键菜单里的 Minimize 调 `SetWindowCollapsed`）；
+//   · 但本项目的浮动面板**都是视口标签页的宿主**（`layoutSlot == kSlotNone`
+//     → `applyDockHint` 加上 `NoTitleBar | NoCollapse`），而 ImGui 在
+//     `Begin()` 里对带这两个 flag 的窗口会**直接** `Collapsed = false`，
+//     连 `WantCollapseToggle` 一起清掉；
+//   · 于是 `min` 恒为 0，而右键菜单那一下照样打 `minimized=1` —— 两边对不上，
+//     断言（verify_viewport_bar 的 T8b）长期红着却指不到真因。
+//
+// 现在的语义是**一套状态**（用户 2026-10-17 提的就是这个）：
+//   `minimized` = 窗口收进了底栏那个托盘按钮 = `panelTrayHiddenRef(i)`。
+//   标题栏那颗"–"、右键菜单的 Minimize、再点一次托盘按钮，三处入口一份状态。
+//
+//   open = 面板是"勾上"的（底栏那个按钮在不在）
+//   min  = 勾上了、但收进了托盘（窗口这一帧不画）
+// 只有变化才打一行，成本可以忽略。
 void EditorApp::servicePanelTrayState() {
     for (int i = 0; i < panelCount(); ++i) {
         const PanelDesc& pd = panelTable()[i];
         // 用 panelFloating 而不是 panelTrayEligible：Console 没有托盘按钮，
         // 但它有最小化按钮，收起状态同样要上报（自动化断言要用）。
         if (!panelFloating(pd)) continue;
-        const bool isOpen = panelOpen(i) && !panelTrayHiddenRef(i);
-        const std::string wname = trayWindowName(pd.id);
-        ImGuiWindow* win = isOpen ? ImGui::FindWindowByName(wname.c_str()) : nullptr;
-        const int min = (win && win->Collapsed) ? 1 : 0;
+        const bool isOpen = panelOpen(i);
+        const int min = panelTrayHiddenRef(i) ? 1 : 0;
         if (isOpen != m_trayStateOpen[i] || min != m_trayStateMin[i]) {
             m_trayStateOpen[i] = isOpen;
             m_trayStateMin[i] = min;
@@ -5091,7 +5197,7 @@ void EditorApp::drawPanelDragLayer() {
                 dl->AddRectFilled(p0, p1, shade(bg, pill.active ? 0.90f : 1.0f), 7.0f);
                 if (!pill.active) {
                     dl->AddRect(p0, p1, shade(tk.borderSoft, hot ? 1.0f : 0.75f),
-                                7.0f, ImDrawFlags_RoundCornersAll, 1.0f);
+                                7.0f, ImDrawFlags_RoundAll, 1.0f);
                 }
 
                 const std::string lbl = tabVisibleLabel(pill.panel);
@@ -8667,7 +8773,7 @@ void EditorApp::drawPrefRow(const PrefItem& it) {
                             ImGui::GetColorU32(sel ? cac
                                                    : (hov ? ui::tokens().borderSoft
                                                           : ui::tokens().borderSoft)),
-                            7.0f, ImDrawFlags_RoundCornersAll, sel ? 2.0f : 1.0f);
+                            7.0f, ImDrawFlags_RoundAll, sel ? 2.0f : 1.0f);
                 char tag[48];
                 std::snprintf(tag, sizeof(tag), "PREFS-THEMECHIP-%d", i);
                 ui::logRect(tag, p0, p1);
@@ -8963,6 +9069,45 @@ void EditorApp::drawTimelineEditorWindow() {
     if (!keep) setPanelOpen(idx, false);
 }
 
+// ---------------------------------------------------------------- 曲线编辑器
+//
+// 与上面三个**逐行同构**（R6）。两个入口：
+//   ① View / Window 菜单或底栏托盘（走面板表，空手开窗）
+//   ② `MYVK_EDITOR_CURVED=<path>`（自动化）
+//
+// ⚠ 它没有 Inspector 入口，而且**不需要**：曲线是"某一段的属性"，
+//   Inspector 的 sequence 页签是按组件给的，挂不上"编辑第 2 段的手柄"。
+//   真正缺的那条入口是"从时间轴编辑器跳过来"（选中一段 → Edit curve…），
+//   记在 docs/animation_authoring_roadmap.md 的 R6 后续里。
+void EditorApp::drawCurveEditorWindow() {
+    if (!m_curveEditor) return;
+    const int idx = panelIndexOf("curveed");
+    if (idx < 0) return;
+
+    // ---- ① 托盘收起：窗口对象保持打开，这一帧不提交 ----
+    if (panelTrayHiddenRef(idx) && panelOpen(idx)) return;
+
+    // ---- ② 表 → 窗口 ----
+    bool& open = panelOpenRef("curveed");
+    if (!open) {
+        if (m_curveEditor->isOpen()) {
+            m_curveEditor->close();
+            VK_LOG_INFO("PANEL curveed open=0");
+        }
+        return;
+    }
+    if (!m_curveEditor->isOpen()) {
+        // 空手开窗：只剩 "Reload" 与路径输入框。
+        m_curveEditor->open(std::string());
+        VK_LOG_INFO("PANEL curveed open=1 reason=menu");
+    }
+
+    // ---- ③ 画 ----
+    bool keep = true;
+    m_curveEditor->draw(keep);
+    if (!keep) setPanelOpen(idx, false);
+}
+
 // ---------------------------------------------------------------- UI 编辑器
 //
 // 与上面两个**逐行同构**（#312）。差别只有一处：它没有 Inspector 入口
@@ -9006,6 +9151,55 @@ void EditorApp::drawUiEditorWindow() {
     // ---- ④ 画 ----
     bool keep = true;
     m_uiEditor->draw(keep);
+    if (!keep) setPanelOpen(idx, false);
+}
+
+// ---------------------------------------------------------------- 动画摄影表
+//
+// 与上面四个资产编辑器**逐行同构**（#310/#311/#312/R6）。唯一多出来的一件事
+// 是"绑定形态"：Pose Mode 打开时 CharacterWindow 每帧把它的 `m_edit` 推进
+// DopeSheetWindow（见 CharacterWindow::draw 末尾），这时：
+//   · 面板表的"开" = 要不要把这张表画出来（不再决定数据源）；
+//   · 窗口的 Save 会变灰 —— 一个文件只能有一个写者（DopeSheetWindow.h ⚠⑤）。
+// 绑定态下窗口自己**不**关：从 Pose Mode 退出来之后作者往往还要接着看这张
+// 表，数据源没了就显示空表 + 提示，比窗口凭空消失好。
+void EditorApp::drawDopeSheetWindow() {
+    if (!m_dopeSheet) return;
+    const int idx = panelIndexOf("dope");
+    if (idx < 0) return;
+
+    // ---- ① 托盘收起：窗口对象保持打开，这一帧不提交 ----
+    if (panelTrayHiddenRef(idx) && panelOpen(idx)) return;
+
+    const bool bound = m_dopeSheet->bound();
+
+    // ---- ② 表 → 窗口 ----
+    bool& open = panelOpenRef("dope");
+    if (!open) {
+        // ⚠ 绑定态下**不关窗口对象**：`bind()` 会把 m_open 置真（数据源就在
+        //   眼前，窗口随时可画），这里若关掉，下一帧 bind 又置真 —— 每帧
+        //   关一次开一次，日志里刷满 DOPE-CLOSE。面板表那一格才是"画不画"
+        //   的唯一真源。
+        if (m_dopeSheet->isOpen() && !bound) {
+            m_dopeSheet->close();
+            VK_LOG_INFO("PANEL dope open=0");
+        }
+        return;
+    }
+    if (!m_dopeSheet->isOpen()) {
+        // 空手开窗：只剩路径框。绑定态下**不要**空手开 —— 数据源就在眼前，
+        // 开一张空表只会让人以为"帧丢了"。
+        if (!bound) {
+            m_dopeSheet->open(std::string());
+            VK_LOG_INFO("PANEL dope open=1 reason=menu");
+        } else {
+            return;
+        }
+    }
+
+    // ---- ③ 画 ----
+    bool keep = true;
+    m_dopeSheet->draw(keep);
     if (!keep) setPanelOpen(idx, false);
 }
 

@@ -207,6 +207,37 @@ EXPECTED = [
     "rm_deltaonly_delta_step",           # 每帧步长 = 1/60
     "rm_wrap_discard",          # 跨圈丢增量 → 两圈累计 ~2 m
     "rm_editor_scrub_no_move",  # dt=0 拖时间轴不产生位移
+    # ---- R5（2026-10-28）：F-Curve 核心（`engine/animation/Curve.*`）----
+    # 这一组是"曲线能不能算"的唯一机器证据：贝塞尔求根、四种外推、七种
+    # 缓动形状、三种自动手柄。图编辑器（下一步）只画它们，不另算一遍。
+    "curve_empty",                      # 空曲线 → 0，不崩
+    "curve_single_key",                 # 单帧 → 该值（任意 t）
+    "curve_linear_mid",                 # 线性中点
+    "curve_constant_hold",              # 常量：整段保持左端（不是"快到终点了"）
+    "curve_constant_at_end",            # 到右端点才切
+    "curve_bezier_free_is_smoothstep",  # 显式 (1/3,0)/(-1/3,0) == Hermite smoothstep
+    "curve_bezier_auto_is_line",        # 同数值换 AutoClamped → 退化直线（手柄类型真的生效）
+    "curve_bezier_mid",
+    "curve_bezier_straight_handles",    # 手柄拉到对角 → 退化成直线
+    "curve_bezier_monotonic",           # x 单调 → 值不回头（求根没解错）
+    "curve_extrap_hold_after",
+    "curve_extrap_linear",              # 沿端点切线继续
+    "curve_extrap_cycle",
+    "curve_extrap_cycle_offset",        # 每圈累加 (末 − 首)
+    "curve_extrap_cycle_flipped",       # 奇数圈镜像
+    "ease_smooth_inout",                # 迁移锚：逐位等于老 smoothstep01
+    "ease_quad_in",
+    "ease_quad_out",
+    "ease_bounce_out_end",
+    "ease_back_overshoot",              # Back 必须过冲，否则它没有意义
+    "ease_none_identity",               # None 逐位恒等
+    "handle_autoclamped_extremum_flat", # 极值处压平 → 不过冲
+    "handle_auto_extremum_not_flat",    # Auto 不压平（两条必须分得开）
+    "handle_vector_points_next",        # Vector = 指向下一帧 = 直线
+    "segment_index_before",
+    "segment_index_first",
+    "segment_index_last",
+    "curve_two_entries_agree",          # 两个入口（带/不带容器）结果逐位相同
 ]
 
 TEST_RE = re.compile(r"ANIM-TEST\s+(\S+)\s+actual=(\S+)\s+expected=(\S+)\s+"

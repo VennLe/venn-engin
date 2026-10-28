@@ -4,6 +4,7 @@
 
 #include "sequence/SequenceAsset.h"
 
+#include "animation/Curve.h"
 #include "assets/AssetPath.h"
 #include "core/Logger.h"
 
@@ -32,10 +33,15 @@ constexpr float kTimeEps = 1.0e-4f;
 
 float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
-// smoothstep：一阶导在两端为 0 —— 运镜起停不"顿"。
-// ⚠ 与 `CameraSystem::blendTo(smoothStep=true)` 用的是同一条曲线，
-// 两处不一致的话，"时间轴运镜"和"代码 blendTo"会有肉眼可见的手感差。
-float smoothstep01(float u) { return u * u * (3.0f - 2.0f * u); }
+// smoothstep 现在住在 `animation/easeFn`（`EaseShape::Smooth` + `InOut`），
+// 这里是同一套公式的本地副本 —— **只给自检用**，让"统一之后逐位不变"
+// 这件事有一个**独立**的比对对象（拿新实现和新实现比是循环论证）。
+// ⚠ 两份会漂移（有人改了 Curve 忘改这里），那正是 `sample_legacy_bitwise`
+//   这条断言要抓的；`[[maybe_unused]]` 是因为生产路径已经不再调用它。
+// ⚠ 它与 `CameraSystem::blendTo(smoothStep=true)` 也是同一条曲线。
+[[maybe_unused]] float smoothstep01(float u) {
+    return u * u * (3.0f - 2.0f * u);
+}
 
 float wrapPi(float a) {
     while (a > kPi) a -= 2.0f * kPi;
@@ -52,6 +58,7 @@ const char* easeName(Ease e) {
     case Ease::Linear: return "linear";
     case Ease::Smooth: return "smooth";
     case Ease::Step: return "step";
+    case Ease::Bezier: return "bezier";
     }
     return "smooth";
 }
@@ -62,6 +69,7 @@ bool parseEase(const std::string& s, Ease& out) {
     if (s == "linear") { out = Ease::Linear; return true; }
     if (s == "smooth") { out = Ease::Smooth; return true; }
     if (s == "step") { out = Ease::Step; return true; }
+    if (s == "bezier") { out = Ease::Bezier; return true; }
     return false;
 }
 
@@ -135,9 +143,30 @@ bool parseSequence(const std::string& text, const std::string& sourcePath,
             const std::string es = k.value("ease", std::string("smooth"));
             if (!parseEase(es, ck.ease)) {
                 out.error = "camera key #" + std::to_string(idx) + ": unknown ease '" +
-                            es + "' (linear / smooth / step)";
+                            es + "' (linear / smooth / step / bezier)";
                 return false;
             }
+
+            // ---- 贝塞尔手柄（可选；`ease` 不是 bezier 时读也白读，但读了
+            //      才能"切回 bezier 时手柄还在"，作者不会因为切一次就丢设置）----
+            auto readHandle = [&](const char* key, glm::vec2& h, bool isOut) {
+                if (!k.contains(key) || !k[key].is_array() || k[key].size() != 2)
+                    return;
+                h.x = k[key][0].get<float>();
+                h.y = k[key][1].get<float>();
+                // ⚠ x 的符号约束（见 .h）：倒了就是曲线倒流。钳回并留痕，
+                //   不拒收 —— 一个手柄写反不该让整个过场打不开。
+                if (isOut) {
+                    if (h.x < 0.0f) h.x = 0.0f;
+                } else {
+                    if (h.x > 0.0f) h.x = 0.0f;
+                }
+                if (h.x > 1.0f) h.x = 1.0f;
+                if (h.x < -1.0f) h.x = -1.0f;
+            };
+            readHandle("outHandle", ck.outHandle, true);
+            readHandle("inHandle", ck.inHandle, false);
+
             out.cameraKeys.push_back(ck);
             ++idx;
         }
@@ -290,6 +319,14 @@ std::string toJson(const SequenceAsset& a) {
         jk["pitch"] = k.pitch;
         jk["fov"] = k.fov;
         jk["ease"] = easeName(k.ease);   // ② 总是写
+        // 手柄只在 bezier 上写：其余模式的段根本不看这两个数，写出来会让
+        // diff 里多两行噪声，还会让人以为"改这个有用"。
+        if (k.ease == Ease::Bezier) {
+            jk["outHandle"] = nlohmann::ordered_json::array({k.outHandle.x,
+                                                             k.outHandle.y});
+            jk["inHandle"] = nlohmann::ordered_json::array({k.inHandle.x,
+                                                            k.inHandle.y});
+        }
         keys.push_back(std::move(jk));
     }
     doc["camera"] = std::move(keys);
@@ -408,7 +445,36 @@ bool sampleCamera(const SequenceAsset& seq, float t, SeqCameraKey& out) {
         return true;
     }
 
-    const float w = (a.ease == Ease::Linear) ? u : smoothstep01(u);
+    // ---- 四个 ease 模式 → 一个标量 w（2026-10-28 / R5）----
+    //
+    // 这里是"三份插值实现"收敛的第一处：w 不再由 `if (linear) ... else
+    // smoothstep01(u)` 现场决定，而是交给 `animation::evaluateSegmentEase`
+    // —— 和骨骼轨道、实体关键帧将来共用同一份缓动/贝塞尔求根。
+    //
+    // ⚠⚠ 老三分支必须**逐位不变**：
+    //     · linear → Interp::Linear + EaseMode::None → 恒等映射，w == u；
+    //     · smooth → Linear + InOut + Smooth → 特判成 Hermite smoothstep，
+    //       逐位等于原来的 `smoothstep01(u)`；
+    //     · step   → 上面已经早退（它连 `out.t` 都要保持 a.t）。
+    //   证据在 `SequenceSelfTest` 的 `sample_legacy_bitwise_*` 三条。
+    animation::Interp ip = animation::Interp::Linear;
+    animation::EaseMode em = animation::EaseMode::None;
+    animation::EaseShape sh = animation::EaseShape::Linear;
+    switch (a.ease) {
+    case Ease::Linear:
+        break;   // 全默认 = 恒等
+    case Ease::Smooth:
+        em = animation::EaseMode::InOut;
+        sh = animation::EaseShape::Smooth;
+        break;
+    case Ease::Bezier:
+        ip = animation::Interp::Bezier;
+        break;
+    case Ease::Step:
+        break;   // 不可达（上面已早退），留着让 switch 完整
+    }
+    const float w = animation::evaluateSegmentEase(ip, em, sh, a.outHandle,
+                                                   a.inHandle, u);
 
     out = a;
     out.t = t;

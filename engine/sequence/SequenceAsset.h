@@ -41,10 +41,15 @@ namespace sequence {
 
 // 缓动。`Step` = 在**这一帧的时间点**直接切过去（硬切镜头），
 // 用于"从远景一下切到特写"，这是过场里最常用的一种转场。
+//
+// 2026-10-28（R5）：新增 `Bezier` —— 真贝塞尔，形状由两根手柄决定。
+// 三个老模式**一个字节都没动**（`sampleCamera` 里同一个 `w` 出口，
+// 老分支的结果逐位不变，见 SequenceSelfTest 的 `sample_legacy_bitwise`）。
 enum class Ease : int {
     Linear = 0,
     Smooth = 1,   // smoothstep（默认）
     Step = 2,     // 保持前一帧，到下一帧瞬间切换
+    Bezier = 3,   // 三次贝塞尔，手柄见 SeqCameraKey::outHandle / inHandle
 };
 
 const char* easeName(Ease e);
@@ -58,6 +63,22 @@ struct SeqCameraKey {
     float pitch = -0.25f;           // 弧度，正 = 相机在上方俯视
     float fov = 45.0f;              // 度
     Ease ease = Ease::Smooth;       // 从**这一帧**到下一帧的插值方式
+
+    // ---- 贝塞尔手柄（`ease == Bezier` 时生效）----
+    //
+    // ⚠⚠ 坐标是**归一化段内坐标**，不是绝对 (秒, 弧度)：
+    //      x ∈ [0,1] 是"这一段的时间比例"，y 是"这一段的进度比例"。
+    //    于是同一组手柄能被 position / yaw / pitch / fov **四个通道共用**
+    //    （它们本来就共用同一个 w），而不用为每个通道各存两根手柄 ——
+    //    Blender 存的是绝对值，因为它的每个通道是独立的 F-Curve；
+    //    这里一个段只有一个标量时间重映射，归一化才是对的抽象。
+    //
+    // 默认 `{1/3, 0} / {-1/3, 0}` = 标准 ease-in-out（等价于老 Smooth
+    // 的"两头慢"，但不是同一条曲线：Bezier 可以过冲，smoothstep 不能）。
+    // ⚠ x 的符号有约束：out.x >= 0、in.x <= 0。写反了曲线会倒流
+    //   （同一时刻两个值），加载期钳回，见 parseSequence。
+    glm::vec2 outHandle{1.0f / 3.0f, 0.0f};    // 相对本帧
+    glm::vec2 inHandle{-1.0f / 3.0f, 0.0f};    // 相对**下一帧**
 };
 
 struct SeqEvent {

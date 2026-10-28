@@ -1,6 +1,7 @@
 #include "assetio/FbxImport.h"
 
 #include "assetio/Binary.h"
+#include "assetio/ClipDedup.h"
 
 #include <algorithm>
 #include <cmath>
@@ -659,8 +660,11 @@ std::vector<SourceJoint> buildSkeleton(const ufbx_skin_deformer& skin,
 // ------------------------------------------------------------ 动画
 std::vector<SourceClip> extractAnimations(const ufbx_scene& scene,
                                           const ufbx_skin_deformer& skin,
-                                          const std::vector<SourceJoint>& joints) {
+                                          const std::vector<SourceJoint>& joints,
+                                          std::vector<std::string>* notes) {
     std::vector<SourceClip> clips;
+    // 已收下 clip 的 (名字, 时长)，供重名去重判据用（见 ClipDedup.h）
+    std::vector<std::pair<std::string, float>> keptClips;
     const float kFps = 30.0f;   // 与 FbxLoader 一致：逐帧重采样成固定帧率
 
     const int nJoints = static_cast<int>(joints.size());
@@ -688,16 +692,31 @@ std::vector<SourceClip> extractAnimations(const ufbx_scene& scene,
         // 角色会**静默退回 rest 姿势**：画面是不会动的 T-pose，日志却全绿。
         // ⚠ 归一化只在**读资产**这一步；`findClip` 的逐字语义不变。
         //   只剥第一个 `|` 之前的；`|` 后面为空（`"A|"`）时原样保留。
-        {
-            const std::size_t bar = clip.name.find('|');
-            if (bar != std::string::npos && bar + 1 < clip.name.size())
-                clip.name = clip.name.substr(bar + 1);
-        }
+        clip.name = clipNameFromTake(clip.name);
         const double t0 = stack.time_begin;
         const double t1 = stack.time_end;
         const double dur = (t1 > t0) ? (t1 - t0) : 0.0;
         clip.duration = static_cast<float>(dur);
         if (dur <= 0.0) continue;
+
+        // 重名去重（2026-10-28，#329）。必须放在**逐帧采样之前**：丢掉的
+        // 那一段没必要再算一遍 61 帧 × N 骨 × 3 通道。规则见 ClipDedup.h。
+        {
+            const ClipNamePlan plan =
+                planClipName(keptClips, clip.name, clip.duration);
+            if (!plan.keep || plan.renamed) {
+                ClipDedupEvent ev;
+                ev.take = str(stack.name);
+                ev.name = clip.name;
+                ev.duration = clip.duration;
+                ev.dropped = !plan.keep;
+                ev.finalName = plan.keep ? plan.name : std::string();
+                if (notes) notes->push_back(clipDedupLine(ev));
+            }
+            if (!plan.keep) continue;
+            clip.name = plan.name;
+            keptClips.emplace_back(clip.name, clip.duration);
+        }
 
         const int frames = static_cast<int>(std::ceil(dur * kFps)) + 1;
         std::vector<SourceTrack> trk(static_cast<std::size_t>(nJoints) * 3);
@@ -788,7 +807,8 @@ std::uint64_t hashFile(const std::string& path) {
 // ============================================================
 // 入口
 // ============================================================
-SourceModel importFbx(const std::string& absPath, const ImportOptions& opt) {
+SourceModel importFbx(const std::string& absPath, const ImportOptions& opt,
+                      std::vector<std::string>* notes) {
     SourceModel out;
     out.name = fs::path(absPath).stem().string();
     out.sourceHash = hashFile(absPath);
@@ -986,7 +1006,7 @@ SourceModel importFbx(const std::string& absPath, const ImportOptions& opt) {
     out.topoOrder = std::move(topo);
     out.invMeshNode = glm::mat4(1.0f);
     if (skinForAnim && opt.importAnimations && !out.joints.empty())
-        out.clips = extractAnimations(*scene, *skinForAnim, out.joints);
+        out.clips = extractAnimations(*scene, *skinForAnim, out.joints, notes);
 
     // ---- 5. pivot 归位（与 FbxLoader 完全同一套）----
     // FBX 里的节点可以在世界任意远处（Blender 导出的常带几公里外的

@@ -80,7 +80,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from capture_window import capture_stable, find_window                # noqa: E402
-from verify_add_menu import LogTap, click, force_foreground           # noqa: E402
+from verify_add_menu import (LogTap, click as _click_raw,           # noqa: E402
+                             force_foreground)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(ROOT, "..", "_venn_verify")
@@ -129,6 +130,27 @@ def rect_of(tap, tag):
         return found
 
 
+def wait_rect_of(tap, tag, timeout=8.0, min_w=0.0):
+    """等到 `tag` 的矩形出现在日志里再返回；超时返回 None。
+
+    ⚠ 为什么不是"睡固定时长再读"：弹层/托盘的矩形是**点完之后下一帧**才
+      画出来的，而首帧那一版还是"没 autosize"的 20×16 占位（日志里真有这
+      一行）。旧写法 `time.sleep(1.0)` 撞上启动初期"点得早/帧慢"就会读到
+      None —— Q1/Q2/Q3、T2/T3 就是这么偶发红的，而紧接着的 Q4（点进去）
+      反而是绿的，因为它是用 `click_until` 等日志涨行、天然有重试。
+
+      `min_w` 用来跳过那个占位矩形：弹层真正成型后一定比 40px 宽。
+      这不是放宽断言 —— 断言仍然要求矩形存在且位置正确，只是**不再赌时间**。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        r = rect_of(tap, tag)
+        if r and (r[2] - r[0]) >= min_w:
+            return r
+        time.sleep(0.1)
+    return None
+
+
 def count(tap, needle):
     with tap.lock:
         return sum(1 for l in tap.lines if needle in l)
@@ -136,6 +158,19 @@ def count(tap, needle):
 
 def has_line(tap, needle):
     return count(tap, needle) > 0
+
+
+def wait_has(tap, needle, timeout=6.0):
+    """等某条日志真的出现。
+
+    `LogTap`（来自 verify_add_menu）只有 has_line，**没有** wait_* 系列 ——
+    直接写 `tap.wait_line(...)` 会 AttributeError（本轮踩过）。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        if has_line(tap, needle):
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def click_until(hwnd, tap, x, y, needle, n_before=None, tries=3, wait=0.8):
@@ -149,8 +184,32 @@ def click_until(hwnd, tap, x, y, needle, n_before=None, tries=3, wait=0.8):
     return False
 
 
+def ensure_foreground(hwnd):
+    """发事件前确认窗口还在前台，不在就抢回来。
+
+    ⚠ 为什么每一下都要查：`click()` 走的是**真实**的 `SetCursorPos` +
+    `mouse_event`，事件打给"光标底下最上层的窗口"，不是我们手里的 hwnd。
+    这条用例要跑一分多钟，只要中途有什么东西把前台抢走（跑回归时是别的
+    脚本的窗口、人手动切一下、系统弹了通知），后面每一次点都**什么都不
+    发生** —— 现象与"控件坏了"逐字相同。实测：单独跑全绿、从
+    `run_regression.py` 跑就红 5 条（V6 那一组全部），就是这一条。
+    """
+    if user32.GetForegroundWindow() == hwnd:
+        return True
+    ok = force_foreground(hwnd)
+    if not ok:
+        print("      WARN 抢不回前台（hwnd=%s），后续点击可能落空" % hwnd)
+    return ok
+
+
+def click(hwnd, cx, cy):
+    ensure_foreground(hwnd)
+    _click_raw(hwnd, cx, cy)
+
+
 def right_click(hwnd, cx, cy):
     from verify_asset_drag import client_to_screen
+    ensure_foreground(hwnd)
     sx, sy = client_to_screen(hwnd, cx, cy)
     user32.SetCursorPos(sx, sy)
     time.sleep(0.25)
@@ -322,9 +381,14 @@ def part_p(tap):
     check(vp is not None and rs["VP-TOOLBTN"][3] <= vp[1],
           "P6 工具条在 3D 图像上方（%.0f ≤ %.0f）"
           % (rs["VP-TOOLBTN"][3], vp[1] if vp else -1))
-    check(abs(rs["VP-GRID"][2] - vp[2]) < 40.0 if vp else False,
+    # ⚠ 用**右组整体**（VP-BAR-RIGHT）判"贴着右沿"，不能用 VP-GRID：
+    #   VP-GRID 是第 6 颗，它右边还有"相机速度"那一颗 —— 7/7 都放得下之后
+    #   差 74px 是**对**的（速度按钮宽 ~62 + 间隙）。这条断言写于"只有 6 颗"
+    #   的年代，2026-10-28（#317）默认左栏回到 300、第 7 颗第一次真正画出来
+    #   时才暴露。
+    check(abs(rs["VP-BAR-RIGHT"][2] - vp[2]) < 40.0 if vp else False,
           "P6b 右组右沿贴着视口右沿（差 %.0f px）"
-          % (abs(rs["VP-GRID"][2] - vp[2]) if vp else -1))
+          % (abs(rs["VP-BAR-RIGHT"][2] - vp[2]) if vp else -1))
 
 
 def part_q(hwnd, tap):
@@ -334,14 +398,13 @@ def part_q(hwnd, tap):
     if not check(btn is not None, "Q0 工具下拉按钮矩形存在"):
         return
     click(hwnd, *center(btn))
-    time.sleep(1.0)
-    win = rect_of(tap, "VP-TOOLMENU-WIN")
+    win = wait_rect_of(tap, "VP-TOOLMENU-WIN", min_w=40.0)
     check(win is not None and win[1] >= btn[3] - 2.0,
           "Q1 弹层出现在按钮下方（弹层顶 %.0f ≥ 按钮底 %.0f）"
           % (win[1] if win else -1, btn[3]))
-    search = rect_of(tap, "VP-TOOLSEARCH")
+    search = wait_rect_of(tap, "VP-TOOLSEARCH", min_w=40.0)
     check(search is not None, "Q2 弹层里有搜索框")
-    items = {k: rect_of(tap, "VP-TOOLITEM " + k)
+    items = {k: wait_rect_of(tap, "VP-TOOLITEM " + k, timeout=6.0, min_w=40.0)
              for k in ("Select", "Move", "Rotate", "Scale")}
     check(all(v is not None for v in items.values()),
           "Q3 四个工具项齐全")
@@ -369,8 +432,7 @@ def part_q(hwnd, tap):
 
     # 搜索过滤：打开工具菜单，在搜索框里输入 "rot"。
     click(hwnd, *center(btn))
-    time.sleep(0.8)
-    search = rect_of(tap, "VP-TOOLSEARCH")
+    search = wait_rect_of(tap, "VP-TOOLSEARCH", min_w=40.0)
     if search:
         click(hwnd, *center(search))
         time.sleep(0.4)
@@ -383,7 +445,16 @@ def part_q(hwnd, tap):
         check(has_line(tap, "VP-TOOLSEARCH q=rot rows=1"),
               "Q6 搜索 rot → 只剩 Rotate 一行（VP-TOOLSEARCH rows=1）")
         # 顺手确认"行真的没提交"：弹层也该跟着变矮（次要断言）
+        # 等它真的变矮再判（弹层高度是下一帧才缩的）—— 但**不替它找理由**：
+        # 超时后拿到的还是原高度，那就该红。
         win2 = rect_of(tap, "VP-TOOLMENU-WIN")
+        if win is not None:
+            end = time.time() + 5.0
+            while time.time() < end:
+                win2 = rect_of(tap, "VP-TOOLMENU-WIN") or win2
+                if win2 and (win2[3] - win2[1]) < (win[3] - win[1]):
+                    break
+                time.sleep(0.1)
         check(win2 is not None and win is not None and
               (win2[3] - win2[1]) < (win[3] - win[1]),
               "Q6b 过滤后弹层变矮（%s < %s）"
@@ -444,6 +515,47 @@ def part_r(hwnd, tap):
 def part_v(hwnd, tap):
     """V：右侧"视口怎么看"的六个菜单。"""
     print("[V] 右侧视口菜单")
+
+    # ---- ① 相机速度（**放在最前面**）----
+    #
+    # ⚠ 顺序不是随手排的：这一步原来排在"视图"菜单之后，而"视图方向"那几项
+    #   点完弹层**不会自动关**。紧接着去点速度按钮，那一下只会被 ImGui 用来
+    #   "关掉上层弹层"（点弹层外面关掉它、且**点击被吞掉**是标准行为），
+    #   速度菜单根本不开 —— V3a 红了一个月，看着像"速度控件坏了"，其实
+    #   是测试把一个真实的两步操作压成了一步（探针里单独点第一次就开）。
+    #   排到最前面之后，这里没有任何未关的弹层。
+    speed = rect_of(tap, "VP-SPEED")
+    if speed:
+        sl = None
+        n = count(tap, "VP-SPEED ")
+        for _ in range(2):
+            click(hwnd, *center(speed))
+            sl = wait_rect_of(tap, "VP-SPEEDITEM", timeout=5.0, min_w=40.0)
+            if sl:
+                break
+            speed = rect_of(tap, "VP-SPEED") or speed
+        # 点滑条矩形靠右 1/4 处 = 变大（用真实矩形，不估位置）
+        if not check(sl is not None, "V3a 相机速度滑条有矩形"):
+            # 红了就把"这一下点在哪 / 那附近还有什么"打出来 —— 否则只能看到
+            # 一句"滑条没有矩形"，分不清是没开弹层还是弹层开在别处。
+            print("      speed rect = %s / vp = %s"
+                  % (speed, tap.last_rect("VP-RECT")))
+            with tap.lock:
+                for l in tap.lines[-6:]:
+                    print("      |", l[:120])
+        if sl is not None:
+            n = count(tap, "VP-SPEED ")
+            click(hwnd, sl[0] + (sl[2] - sl[0]) * 0.75, (sl[1] + sl[3]) * 0.5)
+            # 改值后 VP-SPEED 会重打一行（带新的值），等它真的涨
+            end = time.time() + 4.0
+            while time.time() < end and count(tap, "VP-SPEED ") <= n:
+                time.sleep(0.1)
+            check(count(tap, "VP-SPEED ") > n, "V3 相机速度可改（VP-SPEED 日志）")
+        # 关掉速度弹层，别把未关的弹层留给下一步
+        click(hwnd, *center(tap.last_rect("VP-RECT")))
+        time.sleep(0.4)
+
+    # ---- ② 视图（投影方式 / 方向）----
     view = rect_of(tap, "VP-VIEW-BTN")
     if check(view is not None, "V0 透视按钮矩形存在"):
         click(hwnd, *center(view))
@@ -460,24 +572,14 @@ def part_v(hwnd, tap):
             check(count(tap, "VP-VIEWDIR Top") > n,
                   "V2 顶视图菜单生效（VP-VIEWDIR Top）")
 
-    speed = rect_of(tap, "VP-SPEED")
-    if speed:
-        click(hwnd, *center(speed))
-        time.sleep(0.9)
-        n = count(tap, "VP-SPEED ")
-        # 点滑条矩形靠右 1/4 处 = 变大（用真实矩形，不估位置）
-        sl = rect_of(tap, "VP-SPEEDITEM")
-        if check(sl is not None, "V3a 相机速度滑条有矩形"):
-            click(hwnd, sl[0] + (sl[2] - sl[0]) * 0.75, (sl[1] + sl[3]) * 0.5)
-            time.sleep(0.6)
-            check(count(tap, "VP-SPEED ") > n, "V3 相机速度可改（VP-SPEED 日志）")
-        click(hwnd, *center(tap.last_rect("VP-RECT")))
-
     light = rect_of(tap, "VP-LIGHT")
     if light:
         click(hwnd, *center(light))
-        time.sleep(0.9)
-        items = [rect_of(tap, "VP-LIGHTITEM %d" % i) for i in range(8)]
+        # 等**最后一行**（第 8 个模式）出来，而不是睡 0.9s —— 菜单是一行一行
+        # 画的，早读一帧就会得到"8 个里缺 1 个"的假红。
+        items = [None] * 8
+        if wait_rect_of(tap, "VP-LIGHTITEM 7", timeout=8.0, min_w=10.0):
+            items = [rect_of(tap, "VP-LIGHTITEM %d" % i) for i in range(8)]
         check(all(v is not None for v in items), "V4 光照菜单 8 个模式齐全")
         if items[1]:
             n = count(tap, "VP-LIGHT unlit")
@@ -526,12 +628,11 @@ def part_t(hwnd, tap):
     if not plus:
         return
     click(hwnd, *center(plus))
-    time.sleep(1.0)
-    win = rect_of(tap, "BAR-PICKER-WIN")
+    win = wait_rect_of(tap, "BAR-PICKER-WIN", timeout=8.0, min_w=40.0)
     check(win is not None and win[3] <= plus[1] + 2.0,
           "T2 勾选列表在 + 上方（列表底 %.0f ≤ + 顶 %.0f）"
           % (win[3] if win else -1, plus[1]))
-    picks = {k: rect_of(tap, "BAR-PICK-" + k)
+    picks = {k: wait_rect_of(tap, "BAR-PICK-" + k, timeout=6.0, min_w=40.0)
              for k in ("character", "physics", "particles", "stats")}
     check(all(v is not None for v in picks.values()),
           "T3 列表里 character / physics / particles / stats 都在")
@@ -589,10 +690,13 @@ def part_t(hwnd, tap):
                 n = count(tap, "PANEL-TRAY physics minimized=1")
                 click_until(hwnd, tap, *center(mini),
                             "PANEL-TRAY physics minimized=1", n)
-                time.sleep(0.6)
-                # 日志格式是 "PANEL-STATE <id> open=<0|1> min=<0|1>"，
-                # 别写成 "PANEL-STATE physics min=1" —— 那是另一个字符串。
-                check(has_line(tap, "PANEL-STATE physics open=1 min=1"),
+                # ⚠ 状态行要**两帧之后**才出现：`SetWindowCollapsed` 只是排队
+                #   （`WantCollapseToggle`），真正的折叠在下一个 `Begin()` 里
+                #   落地，而 `servicePanelTrayState` 读的是再下一帧的窗口对象。
+                #   原来睡 0.6s 再读一次 —— 帧慢的时候刚好读在中间那帧上。
+                #   日志格式是 "PANEL-STATE <id> open=<0|1> min=<0|1>"，
+                #   别写成 "PANEL-STATE physics min=1"（那是另一个字符串）。
+                check(wait_has(tap, "PANEL-STATE physics open=1 min=1", 6.0),
                       "T8b 最小化生效（PANEL-STATE physics open=1 min=1）")
 
     # ---- particles ----

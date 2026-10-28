@@ -2,6 +2,7 @@
 
 #include "Localization.h"
 #include "DebugRects.h"
+#include "DopeSheetWindow.h"
 #include "EditorDragDrop.h"
 #include "EditorScene.h"
 #include "PanelDock.h"
@@ -21,6 +22,7 @@
 
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
+#include <glm/gtx/quaternion.hpp>   // eulerAngles（Pose Mode 的欧拉角编辑）
 
 #include <algorithm>
 #include <cctype>
@@ -410,6 +412,76 @@ bool CharacterWindow::jointWorldPosition(int joint, glm::vec3& out) const {
     return true;
 }
 
+bool CharacterWindow::jointWorldMatrix(int joint, glm::mat4& out) const {
+    if (!m_model || !m_model->skeleton) return false;
+    const assets::Skeleton& skel = *m_model->skeleton;
+    if (joint < 0 || joint >= skel.jointCount()) return false;
+    if (joint >= static_cast<int>(m_jointMats.size())) return false;
+    out = glm::inverse(skel.invMeshNode) *
+          m_jointMats[static_cast<size_t>(joint)] *
+          glm::inverse(skel.joints[static_cast<size_t>(joint)].invBind);
+    return true;
+}
+
+// ---------------------------------------------------------------- 采样链
+
+void CharacterWindow::revalidateEdit() {
+    m_editDirty = false;
+    m_editResolved.clear();
+    m_editStats = animation::ResolveStats{};
+    if (!m_model || !m_model->skeleton) return;
+    m_editStats =
+        animation::resolveEditTracks(*m_model->skeleton, m_edit, m_editResolved);
+}
+
+void CharacterWindow::samplePoseInto() {
+    if (!m_model || !m_model->skeleton) {
+        m_jointMats.clear();
+        m_worldMats.clear();
+        m_pose.resize(0);
+        return;
+    }
+    const assets::Skeleton& skel = *m_model->skeleton;
+
+    if (!m_poseMode) {
+        // ⚠ 这一支必须与改动前**逐位相同**：条件、顺序、参数一个都不能动。
+        //   老路径是 `sample(cond ? curClip : nullptr, m_animTime, out)`，
+        //   而 sample 就是 samplePose + poseToJoints —— 于是拆开写等价。
+        const assets::AnimationClip* clip =
+            (m_animPlaying || m_animTime > 0.0f) ? skel.findClip(m_currentClip)
+                                                 : nullptr;
+        animation::samplePose(skel, clip, m_animTime, m_pose);
+        animation::poseToJoints(skel, m_pose, m_jointMats);
+        m_worldMats.clear();   // 非 Pose Mode 不算第二遍 FK
+        return;
+    }
+
+    // ---- Pose Mode ----
+    // 底子：base clip（没设就纯静止姿势），然后编辑轨道只覆盖它自己那几个
+    // (joint, path)。所以"只动了右臂"的资产不会把其他 60 根骨锁死。
+    const assets::AnimationClip* base =
+        m_edit.baseClip.empty() ? nullptr : skel.findClip(m_edit.baseClip);
+    animation::samplePose(skel, base, m_animTime, m_pose);
+    if (m_editDirty) revalidateEdit();
+    animation::overlayEditPose(m_editResolved, m_animTime, m_pose);
+
+    // 瞬态层盖在最上面：用户手摆出来、还没打帧的那几根骨。
+    {
+        const size_t n = static_cast<size_t>(m_pose.count());
+        ensureTransient(m_pose.count());
+        for (size_t k = 0; k < n; ++k) {
+            if (!m_touched[k]) continue;
+            m_pose.translation[k] = m_touchedT[k];
+            m_pose.rotation[k] = m_touchedR[k];
+            m_pose.scale[k] = m_touchedS[k];
+        }
+    }
+
+    animation::poseToJoints(skel, m_pose, m_jointMats);
+    // gizmo 要"骨在哪 + 朝向哪"，世界矩阵单独一遍（63 根骨，可忽略）。
+    animation::poseToWorld(skel, m_pose, m_worldMats);
+}
+
 // ---------------------------------------------------------------- 预览导航
 
 void CharacterWindow::handlePreviewNavigation(const glm::vec2& vpPos,
@@ -607,8 +679,11 @@ void CharacterWindow::drawPreviewViewport() {
     //
     // 不用"射线-AABB 取更近"：胶囊比人粗，正面看永远先撞胶囊，模型就
     // 点不中了（实测就是：点身体选到胶囊、点脚底选到模型，正好反了）。
+    // ⚠ `!m_gizmoConsumed`：Pose Mode 下按在旋转环上的那一下是"开始转骨"，
+    //   不是"改选中对象"。不挡的话，按住环拖的同时还会把 m_pick 换掉
+    //   （拖右臂结果选中了胶囊，脚下那条变换条跟着变，非常迷惑）。
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-        m_previewRoot.valid()) {
+        !m_gizmoConsumed && m_previewRoot.valid()) {
         const ImVec2 mp = ImGui::GetIO().MousePos;
         const Ray ray = PickingSystem::rayFromViewport(
             m_previewScene.camera(), glm::vec2(imgMin.x, imgMin.y),
@@ -882,6 +957,15 @@ void CharacterWindow::drawPreviewOverlay(const ImVec2& imgMin,
         }
     }
 
+    // ---- ④ 骨骼旋转 gizmo（Pose Mode）----
+    //
+    // ⚠ 放在 overlay 里而不是"点选之后"，是因为这个函数在
+    //   drawPreviewViewport 里**先于**点选跑（overlay 是第 654 行、点选在
+    //   其后）。命中判定与绘制放在同一个函数里，就不会出现"画出来的环
+    //   和能点中的环不是同一圈"——胶囊线框当初踩过这个坑（见 m_capScrSegs
+    //   那段注释），这次直接按"画什么就量什么"来做。
+    if (m_poseMode) drawBoneGizmo(imgMin, imgSz, vp);
+
     dl->PopClipRect();
 }
 
@@ -984,6 +1068,51 @@ void CharacterWindow::drawToolbar() {
     if (ImGui::Button(TR("Fit View"))) framePreviewCamera();
     tip(TR("Frame the whole model (same as F in UE's viewport)"));
     logRect("CHAR-FIT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    // ---- Pose Mode（R7）----
+    //
+    // 和 Animation 页是两件事：那边是"播导入的片段"，这边是"自己摆姿势并
+    // 打帧"。开的时候顺手把 baseClip 设成当前正在预览的片段 —— 你看到什么
+    // 就该编辑什么，否则一开 Pose Mode 姿势会跳回静止，用户第一反应是
+    // "刚才那段动画丢了"。
+    ImGui::SameLine();
+    {
+        const bool was = m_poseMode;
+        const ImVec4 onCol(0.35f, 0.62f, 0.95f, 1.0f);
+        if (was) ImGui::PushStyleColor(ImGuiCol_Button, onCol);
+        if (ImGui::Button(TR("Pose Mode"))) {
+            m_poseMode = !m_poseMode;
+            if (m_poseMode) {
+                if (m_edit.baseClip.empty()) m_edit.baseClip = m_currentClip;
+                if (m_edit.name.empty())
+                    m_edit.name = m_currentClip.empty() ? std::string("custom")
+                                                        : m_currentClip;
+                if (m_editPath.empty()) {
+                    const std::string nm =
+                        m_edit.name.empty() ? std::string("clip") : m_edit.name;
+                    m_editPath = "assets/anims/" + nm + ".anim.json";
+                    std::snprintf(m_editPathBuf, sizeof(m_editPathBuf), "%s",
+                                  m_editPath.c_str());
+                }
+                m_editDirty = true;
+                m_animPlaying = false;   // 摆姿势要一个静止的画面
+                m_focusPoseTab = true;   // 左栏自动切到 Pose 页
+            }
+        }
+        if (was) ImGui::PopStyleColor();
+        logRect("CHAR-POSE-MODE", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        tip(TR("Pose Mode: pick a bone, rotate it with the gizmo, press I to "
+               "key. Keys are stored in a .anim.json asset (the imported clip "
+               "stays read-only)."));
+        if (was != m_poseMode) {
+            VK_LOG_INFO("CHAR-POSE-MODE on=%d base='%s' tracks=%d keys=%d "
+                        "path=%s",
+                        m_poseMode ? 1 : 0, m_edit.baseClip.c_str(),
+                        static_cast<int>(m_edit.tracks.size()),
+                        m_edit.totalKeys(), m_editPath.c_str());
+        }
+    }
 
     ImGui::SameLine();
     ImGui::SetNextItemWidth(130.0f);
@@ -1219,8 +1348,19 @@ void CharacterWindow::drawAnimationPanel() {
     const float rowW = ImGui::GetContentRegionAvail().x;
 
     // 片段列表：点击名字即播放；行尾是时长、**内建键位**与按键绑定（P4）。
-    for (const auto& clip : skel.clips) {
-        ImGui::PushID(clip.name.c_str());
+    //
+    // ⚠ PushID 用**下标**，不用 clip.name（2026-10-28 实测踩到）。名字看起来
+    //   天然唯一，实际不是：`anime_girl.fbx` 里就有 4 个动画栈，归一化掉
+    //   `<armature>|` 前缀之后变成 [Idle, Walk, Idle, Walk] —— 于是两行 "Walk"
+    //   同帧同 ID。ImGui 的 ID 冲突检测会**弹一个模态告警窗**（"Programmer
+    //   error: 2 visible items with conflicting ID!"），模态窗一出现，后面
+    //   所有鼠标点击全被它吃掉：`verify_character_window` 的"点动画条目触发
+    //   播放"就是这么红的 —— 界面看起来完全正常，只是点哪都没反应。
+    //   下标在同一个 skel 里一定唯一，`logRect` 的锚点仍按名字打（脚本要看
+    //   的是"哪一段"，不是"第几行"）。
+    for (std::size_t ci = 0; ci < skel.clips.size(); ++ci) {
+        const assets::AnimationClip& clip = skel.clips[ci];
+        ImGui::PushID(static_cast<int>(ci));
         const bool selected = (clip.name == m_currentClip);
         const float nameW = std::max(
             60.0f, rowW - durW - keyW - builtinW - spacing * 4.0f);
@@ -1285,23 +1425,32 @@ void CharacterWindow::drawTransportBar() {
         (hasClip && m_model && m_model->skeleton)
             ? m_model->skeleton->findClip(m_currentClip)
             : nullptr;
-    const float dur = clip ? clip->duration : 0.0f;
+    // Pose Mode 下时间轴归编辑资产管：长度是 m_edit.duration，而且**没有
+    // 导入片段也要能拖**（从零手 K 一段动画是完全正常的用法）。
+    const float dur = m_poseMode ? std::max(m_edit.duration, 1.0e-3f)
+                                 : (clip ? clip->duration : 0.0f);
+    const bool disabled = !hasClip && !m_poseMode;
 
-    if (!hasClip) ImGui::BeginDisabled();
+    if (disabled) ImGui::BeginDisabled();
     if (ImGui::Button(m_animPlaying ? TR("Pause") : TR("Play"))) {
         m_animPlaying = !m_animPlaying;
+        // 播放 = 时间要动 → 未打帧的姿态该丢掉（Blender 同语义）。
+        // 不丢的话播放时那几根骨会卡着不动，看起来像"播放坏了"。
+        if (m_animPlaying) clearTransient();
     }
     tip(TR("Play / pause the preview (space in UE's Persona)"));
     ImGui::SameLine();
     if (ImGui::Button(TR("Stop"))) {
         m_animPlaying = false;
         m_animTime = 0.0f;
+        clearTransient();
     }
     tip(TR("Stop and rewind to 0"));
     ImGui::SameLine();
     if (ImGui::Button(TR("|<<"))) {
         m_animTime = 0.0f;
         m_animPlaying = false;
+        clearTransient();
     }
     tip(TR("Jump to the first frame"));
     ImGui::SameLine();
@@ -1316,16 +1465,17 @@ void CharacterWindow::drawTransportBar() {
 
     // 时间轴：占满剩余宽度（拖动即定格，方便看姿势）
     ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - 130.0f));
-    if (ImGui::SliderFloat("##timeline", &m_animTime, 0.0f, dur > 0.0f ? dur : 1.0f,
-                           TR("%.2fs"))) {
+    if (ImGui::SliderFloat("##timeline", &m_animTime, 0.0f,
+                           dur > 0.0f ? dur : 1.0f, TR("%.2fs"))) {
         m_animPlaying = false;
+        clearTransient();
     }
     tip(TR("Scrub the clip. Dragging pauses playback so you can inspect a pose."));
     logRect("CHAR-TRANSPORT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     ImGui::SameLine();
     ImGui::TextDisabled("%.2f / %.2fs", static_cast<double>(m_animTime),
                         static_cast<double>(dur));
-    if (!hasClip) ImGui::EndDisabled();
+    if (disabled) ImGui::EndDisabled();
 }
 
 // ---------------------------------------------------------------- 右栏 Details
@@ -1424,13 +1574,19 @@ void CharacterWindow::drawDetailsPanel() {
         tip(TR("Pick a bone in the Skeleton tab to inspect it here"));
     }
 
+    // ---- Pose Mode：选中骨的局部 TRS + 打帧 ----
+    drawPoseDetails();
+
     // ---- 选中的动画片段 ----
     //
     // UE 的 Persona 右栏在选中动画时显示 Clip 详情 + 一条带关键帧刻度的
-    // 时间条。这里做同一件事，但**只读**：引擎没有"把关键帧写回资产"的
-    // 通路（clip 是加载 glTF/FBX 时解析出来的，没有序列化格式），所以
-    // 与其摆一排点不动的按钮，不如把"这条片段到底有多少帧、关键帧在哪"
-    // 如实画出来 —— 编辑动作仍然只有播放 / 循环 / 变速（见底部播放条）。
+    // 时间条。这里做同一件事，但**只读**。
+    //
+    // ⚠ 这里原来写着"引擎没有把关键帧写回资产的通路"。2026-10-28（R7）
+    //   之后这句话只对了一半：写回通路有了，但它写的是**自己的**
+    //   `.anim.json`（见 animation/ClipEdit），导入片段依然是只读的 ——
+    //   重新导入一次就把用户数据冲掉的设计不能要。所以这一栏仍然只用来
+    //   "看这条片段长什么样"，改动作请切 Pose Mode。
     ImGui::Spacing();
     ImGui::TextDisabled(TR("CLIP"));
     ImGui::Separator();
@@ -1755,6 +1911,944 @@ void CharacterWindow::generateSkeletonBinding() {
 
 // ---------------------------------------------------------------- 主流程
 
+// ================================================================
+// Pose Mode（R7）
+// ================================================================
+//
+// 这一段有三层，从上到下：
+//   ① 瞬态姿态（m_touched*）—— 用户摆出来但还没打帧的东西
+//   ② 关键帧轨道（m_edit.tracks）—— 打了帧的
+//   ③ base clip（导入的）—— 剩下没被覆盖的骨
+//
+// 为什么要 ①：摆姿势的时候不能每动一下就写一个关键帧（Blender / UE 也都
+// 不是）。但 `samplePoseInto()` 每帧都从头重算，所以"摆出来的角度"必须
+// 存在某个地方，否则鼠标一松就弹回去。所以有一条独立的瞬态层：
+//   · 拖动 gizmo / 拨 TRS 控件 → 写瞬态
+//   · 按 I → 把瞬态写进轨道，并**清掉该骨的瞬态**（之后由轨道驱动）
+//   · 拖时间轴 / 播放 → 清掉全部瞬态（Blender 里"未打帧的姿态在跳帧时
+//     丢弃"就是这个语义）
+
+namespace {
+
+// 屏幕空间点到线段距离（与点选那块用的是同一套算法，见 drawPreviewViewport）
+float screenSegDist(const ImVec2& p, const ImVec2& a, const ImVec2& b) {
+    const glm::vec2 ab(b.x - a.x, b.y - a.y);
+    const glm::vec2 ap(p.x - a.x, p.y - a.y);
+    const float len2 = glm::dot(ab, ab);
+    float u = len2 > 1.0e-6f ? glm::dot(ap, ab) / len2 : 0.0f;
+    u = glm::clamp(u, 0.0f, 1.0f);
+    const glm::vec2 d = ap - ab * u;
+    return glm::length(d);
+}
+
+constexpr float kGizmoHitPx = 8.0f;   // 环的命中半径（像素）
+constexpr int   kGizmoSeg = 40;       // 每个环分多少段
+
+const char* axisName(int a) {
+    return a == 0 ? "x" : a == 1 ? "y" : a == 2 ? "z" : "-";
+}
+
+} // namespace
+
+void CharacterWindow::clearTransient() {
+    int n = 0;
+    for (char c : m_touched) {
+        if (c) ++n;
+    }
+    std::fill(m_touched.begin(), m_touched.end(), 0);
+    if (n > 0) VK_LOG_INFO("CHAR-POSE-TRANSIENT-CLEAR n=%d", n);
+}
+
+void CharacterWindow::ensureTransient(int n) {
+    if (n < 0) n = 0;
+    if (static_cast<int>(m_touched.size()) == n) return;
+    m_touched.assign(static_cast<size_t>(n), 0);
+    m_touchedT.assign(static_cast<size_t>(n), glm::vec3(0.0f));
+    m_touchedR.assign(static_cast<size_t>(n), glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
+    m_touchedS.assign(static_cast<size_t>(n), glm::vec3(1.0f));
+}
+
+void CharacterWindow::touchBone(int j) {
+    if (j < 0 || j >= m_pose.count()) return;
+    ensureTransient(m_pose.count());
+    const size_t k = static_cast<size_t>(j);
+    if (m_touched[k]) return;        // 已经碰过了，别把改动抄回去
+    // 三个通道各抄一份当前值（见头文件里的 ⚠）
+    m_touchedT[k] = m_pose.translation[k];
+    m_touchedR[k] = m_pose.rotation[k];
+    m_touchedS[k] = m_pose.scale[k];
+    m_touched[k] = 1;
+}
+
+void CharacterWindow::drawBoneGizmo(const ImVec2& imgMin, const ImVec2& imgSz,
+                                   const glm::mat4& viewProj) {
+    m_gizmoHoverAxis = -1;
+    m_gizmoConsumed = false;
+    if (!m_poseMode || !m_showBoneGizmo) return;
+    if (!m_model || !m_model->skeleton) return;
+    const assets::Skeleton& skel = *m_model->skeleton;
+    const int j = m_selectedJoint;
+    if (j < 0 || j >= skel.jointCount()) return;
+    if (j >= static_cast<int>(m_worldMats.size())) return;
+    if (imgSz.x < 4.0f || imgSz.y < 4.0f) return;
+
+    const glm::mat4& W = m_worldMats[static_cast<size_t>(j)];
+    const glm::vec3 center(W[3]);
+    const glm::vec3 ax = glm::normalize(glm::vec3(W[0]));
+    const glm::vec3 ay = glm::normalize(glm::vec3(W[1]));
+    const glm::vec3 az = glm::normalize(glm::vec3(W[2]));
+
+    // 环的半径按模型高度取：写死米数的话，给一只 3 cm 的小虫子和 1.8 m 的
+    // 角色调同一份代码，一边是麻花一边是看不见。
+    float h = 1.8f;
+    if (m_boundsValid) h = std::max(m_boundsMax.z - m_boundsMin.z, 0.05f);
+    const float r = glm::clamp(h * 0.11f, 0.02f, 2.0f);
+
+    const auto proj = [&](const glm::vec3& p, ImVec2& out) {
+        glm::vec2 s;
+        if (!PickingSystem::worldToScreen(viewProj,
+                                          glm::vec2(imgMin.x, imgMin.y),
+                                          glm::vec2(imgSz.x, imgSz.y), p, s))
+            return false;
+        out = ImVec2(s.x, s.y);
+        return true;
+    };
+
+    const ImVec2 mp = ImGui::GetIO().MousePos;
+    const bool hovered = mp.x >= imgMin.x && mp.x <= imgMin.x + imgSz.x &&
+                         mp.y >= imgMin.y && mp.y <= imgMin.y + imgSz.y;
+
+    // 三个环：绕 X（红，在 YZ 平面）/ 绕 Y（绿，XZ）/ 绕 Z（蓝，XY）
+    const glm::vec3 u[3] = {ay, ax, ax};
+    const glm::vec3 v[3] = {az, az, ay};
+    const ImU32 base[3] = {IM_COL32(226, 86, 86, 210), IM_COL32(96, 208, 116, 210),
+                           IM_COL32(96, 148, 235, 210)};
+    const ImU32 hot[3] = {IM_COL32(255, 150, 150, 255), IM_COL32(160, 255, 180, 255),
+                          IM_COL32(170, 205, 255, 255)};
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // ---- 命中：先算三个环的屏幕折线，再量鼠标到折线的最近距离 ----
+    float bestD[3] = {1.0e30f, 1.0e30f, 1.0e30f};
+    for (int a = 0; a < 3; ++a) {
+        ImVec2 prev;
+        bool havePrev = false;
+        for (int i = 0; i <= kGizmoSeg; ++i) {
+            // 360° 的环但绕轴旋转时是 360°；这里刻意只画 360°，因为
+            // 半环会让"往哪个方向转"变得含糊（Blender 的旋转环是整圈）。
+            const float t = 6.28318530718f * static_cast<float>(i) /
+                            static_cast<float>(kGizmoSeg);
+            const glm::vec3 p =
+                center + u[a] * (std::cos(t) * r) + v[a] * (std::sin(t) * r);
+            ImVec2 s;
+            if (!proj(p, s)) { havePrev = false; continue; }
+            if (havePrev && hovered)
+                bestD[a] = std::min(bestD[a], screenSegDist(mp, prev, s));
+            prev = s;
+            havePrev = true;
+        }
+    }
+    if (hovered) {
+        int best = -1;
+        float bd = kGizmoHitPx;
+        for (int a = 0; a < 3; ++a) {
+            if (bestD[a] <= bd) { bd = bestD[a]; best = a; }
+        }
+        m_gizmoHoverAxis = best;
+    }
+
+    // ---- 拖拽状态机 ----
+    if (m_boneDragAxis < 0) {
+        if (m_gizmoHoverAxis >= 0 &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const int a = m_gizmoHoverAxis;
+            m_boneDragAxis = a;
+            m_boneDragStart = glm::vec2(mp.x, mp.y);
+            m_boneDragAccum = 0.0f;
+            m_boneDragApplied = 0.0f;
+            m_boneDragOrig = m_pose.rotation[static_cast<size_t>(j)];
+            // 父骨世界旋转：把"绕世界轴转多少"换算成"本骨局部转多少"要用它。
+            // 根骨（parent < 0）的父空间就是模型空间 → 单位四元数。
+            const int pj = skel.joints[static_cast<size_t>(j)].parent;
+            if (pj >= 0 && pj < static_cast<int>(m_worldMats.size())) {
+                m_boneDragParentWorld = glm::quat_cast(glm::mat3(
+                    glm::mat4(glm::mat3(m_worldMats[static_cast<size_t>(pj)]))));
+            } else {
+                m_boneDragParentWorld = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+            }
+            // 切向：屏幕空间里"往上/往右划过环"对应哪个旋转方向。
+            // 用环在抓点处的切向而不是"鼠标 dx"—— 后者在正对相机看环时
+            // 完全没反应（环投影成一条线）。
+            ImVec2 sc;
+            glm::vec2 tang(1.0f, 0.0f);
+            if (proj(center, sc)) {
+                const glm::vec2 rad(mp.x - sc.x, mp.y - sc.y);
+                const float l = glm::length(rad);
+                if (l > 4.0f) tang = glm::vec2(-rad.y / l, rad.x / l);
+            }
+            m_boneDragTangent = tang;
+            m_gizmoConsumed = true;
+            VK_LOG_INFO("CHAR-POSE-GIZMO-BEGIN joint='%s' axis=%s",
+                        skel.joints[static_cast<size_t>(j)].name.c_str(),
+                        axisName(a));
+        }
+    } else {
+        const int a = m_boneDragAxis;
+        // 关掉动画播放，否则下一帧 samplePoseInto 会把旋转算回去
+        m_animPlaying = false;
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            m_gizmoConsumed = true;
+            const glm::vec2 d(mp.x - m_boneDragStart.x, mp.y - m_boneDragStart.y);
+            const float deg = glm::dot(d, m_boneDragTangent) * 0.45f;
+            m_boneDragAccum = glm::radians(deg);
+
+            // 绕**世界轴**转 Q，换算到局部：R' = P⁻¹·Q·P·R（P = 父骨世界旋转）。
+            // ⚠ 直接 `q * orig` 就是"绕本骨自己的轴转"，感觉上像在拧麻花 ——
+            //   这也是大多数手写 gizmo 看起来"方向不对"的原因。
+            const glm::vec3 axis = a == 0 ? ax : a == 1 ? ay : az;
+            const glm::quat q = glm::angleAxis(m_boneDragAccum, axis);
+            const glm::quat delta = glm::conjugate(m_boneDragParentWorld) * q *
+                                    m_boneDragParentWorld;
+            const size_t k = static_cast<size_t>(j);
+            touchBone(j);            // 先把三个通道抄一遍，再只改旋转
+            if (k < m_touchedR.size()) m_touchedR[k] = delta * m_boneDragOrig;
+        } else {
+            VK_LOG_INFO("CHAR-POSE-GIZMO-END joint='%s' axis=%s deg=%.2f",
+                        skel.joints[static_cast<size_t>(j)].name.c_str(),
+                        axisName(a),
+                        static_cast<double>(glm::degrees(m_boneDragAccum)));
+            m_boneDragAxis = -1;
+        }
+    }
+
+    // ---- 画 ----
+    for (int a = 0; a < 3; ++a) {
+        // ⚠ 这个局部标志叫 `hi` 不叫 `hot`：`hot` 是上面的颜色数组，
+        //   同名会把数组遮住，编译报 "invalid types 'const bool[int]'"。
+        const bool hi = (a == m_boneDragAxis) ||
+                        (m_boneDragAxis < 0 && a == m_gizmoHoverAxis);
+        ImVec2 prev;
+        bool havePrev = false;
+        for (int i = 0; i <= kGizmoSeg; ++i) {
+            const float t = 6.28318530718f * static_cast<float>(i) /
+                            static_cast<float>(kGizmoSeg);
+            const glm::vec3 p =
+                center + u[a] * (std::cos(t) * r) + v[a] * (std::sin(t) * r);
+            ImVec2 s;
+            if (!proj(p, s)) { havePrev = false; continue; }
+            if (havePrev) dl->AddLine(prev, s, hi ? hot[a] : base[a],
+                                      hi ? 2.6f : 1.6f);
+            prev = s;
+            havePrev = true;
+        }
+    }
+}
+
+void CharacterWindow::handlePoseKeys() {
+    if (!m_poseMode) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.WantTextInput) return;                         // 正在输入资产名
+    if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) return;
+    if (ImGui::IsKeyPressed(ImGuiKey_I, false)) keySelectedBone(true, true, true);
+    if (ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) clearTransient();
+}
+
+int CharacterWindow::keyJoint(const std::string& jointName,
+                              const animation::Pose& pose, int joint,
+                              float time, bool rot, bool loc, bool scale) {
+    if (jointName.empty() || joint < 0 || joint >= pose.count()) return 0;
+    const size_t k = static_cast<size_t>(joint);
+    int n = 0;
+    if (rot) {
+        const bool ins = m_edit.setKey(
+            jointName, assets::AnimTrack::Rotation, time,
+            glm::vec4(pose.rotation[k].x, pose.rotation[k].y, pose.rotation[k].z,
+                      pose.rotation[k].w));
+        VK_LOG_INFO("CHAR-POSE-KEY joint='%s' path=rot t=%.6f new=%d",
+                    jointName.c_str(), static_cast<double>(time), ins ? 1 : 0);
+        ++n;
+    }
+    if (loc) {
+        const bool ins = m_edit.setKey(
+            jointName, assets::AnimTrack::Translation, time,
+            glm::vec4(pose.translation[k], 0.0f));
+        VK_LOG_INFO("CHAR-POSE-KEY joint='%s' path=loc t=%.6f new=%d",
+                    jointName.c_str(), static_cast<double>(time), ins ? 1 : 0);
+        ++n;
+    }
+    if (scale) {
+        const bool ins = m_edit.setKey(
+            jointName, assets::AnimTrack::Scale, time,
+            glm::vec4(pose.scale[k], 0.0f));
+        VK_LOG_INFO("CHAR-POSE-KEY joint='%s' path=scale t=%.6f new=%d",
+                    jointName.c_str(), static_cast<double>(time), ins ? 1 : 0);
+        ++n;
+    }
+    // 打完帧之后由轨道驱动，瞬态要让位 —— 不然拖时间轴时这根骨会卡在
+    // 刚才那个角度上，看起来像"打帧没生效"。
+    if (k < m_touched.size()) m_touched[k] = 0;
+    m_editDirty = true;
+    return n;
+}
+
+void CharacterWindow::keySelectedBone(bool rot, bool loc, bool scale) {
+    if (!m_model || !m_model->skeleton) return;
+    const assets::Skeleton& skel = *m_model->skeleton;
+    if (m_selectedJoint < 0 || m_selectedJoint >= skel.jointCount()) return;
+    if (m_selectedJoint >= m_pose.count()) return;
+    const std::string& nm =
+        skel.joints[static_cast<size_t>(m_selectedJoint)].name;
+    const int n = keyJoint(nm, m_pose, m_selectedJoint, m_animTime, rot, loc,
+                           scale);
+    VK_LOG_INFO("CHAR-POSE-KEY-DONE joint='%s' channels=%d keys=%d",
+                nm.c_str(), n, m_edit.totalKeys());
+}
+
+
+// ---------------------------------------------------------------- Pose 页
+
+// 摄影表绑定（R8）。每帧调一次：Pose Mode 开着就推数据源，关了就解绑。
+// `bind()` 自己只在数据源变了的时候打日志，所以这里不做去重。
+void CharacterWindow::syncDopeSheet() {
+    if (!m_dope) return;
+    if (!m_poseMode) {
+        m_dope->unbind();
+        return;
+    }
+    DopeSheetWindow::Host h;
+    h.clip = &m_edit;
+    h.skel = (m_model && m_model->skeleton) ? m_model->skeleton.get() : nullptr;
+    h.head = &m_animTime;
+    h.dirty = &m_editDirty;
+    // 标题里显示"哪份片段"：优先编辑资产自己的名字，其次文件名，最后模型名。
+    // 空串会让标题变成 "Dope sheet —  (live)"，看着像坏掉。
+    if (!m_edit.name.empty()) m_dopeLabel = m_edit.name;
+    else if (!m_editPath.empty())
+        m_dopeLabel = animation::clipNameFromPath(m_editPath);
+    else
+        m_dopeLabel = m_modelPath.empty() ? std::string("Pose Mode") : m_modelPath;
+    h.label = m_dopeLabel.c_str();
+    m_dope->bind(h);
+}
+
+void CharacterWindow::drawPosePanel() {
+    const assets::Skeleton* skel =
+        (m_model && m_model->skeleton) ? m_model->skeleton.get() : nullptr;
+    if (!skel) {
+        ImGui::TextDisabled(TR("(no skeleton)"));
+        return;
+    }
+
+    // ---- 编辑资产（路径 / 存 / 读）----
+    ImGui::TextDisabled(TR("EDIT CLIP"));
+    ImGui::Separator();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TR("File"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputText("##pose_path", m_editPathBuf, sizeof(m_editPathBuf));
+    tip(TR("Where the .anim.json lives. The imported clip is never modified — "
+           "this asset only stores the keys you author here."));
+
+    if (ImGui::Button(TR("Save"))) saveEdit(m_editPathBuf);
+    logRect("CHAR-POSE-SAVE-BTN", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Load"))) loadEdit(m_editPathBuf);
+    logRect("CHAR-POSE-LOAD-BTN", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Clear all"))) {
+        m_edit.tracks.clear();
+        m_editDirty = true;
+        clearTransient();
+        VK_LOG_INFO("CHAR-POSE-CLEAR keys=0");
+    }
+    tip(TR("Throw away every key in this asset (the file on disk is untouched "
+           "until you press Save)"));
+
+    // ---- 摄影表（R8）----
+    // 只负责"把那张表调出来"：数据源已经由 syncDopeSheet() 每帧推过去了。
+    // 面板显隐的唯一真源是面板表，所以这里直接写表里那一格 —— 不另立开关
+    // （两个真相源会让"点了按钮窗口没出来"变成可能）。
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Dope sheet"))) {
+        panelOpenRef("dope") = true;
+        VK_LOG_INFO("CHAR-POSE-DOPE open=1");
+    }
+    logRect("CHAR-POSE-DOPE-BTN", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    tip(TR("Open the dope sheet on this clip — select, drag, mirror and align "
+           "the keys you just made. It edits this same in-memory clip."));
+
+    // ---- base clip / 时长 ----
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TR("Base clip"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::BeginCombo("##pose_base", m_edit.baseClip.empty()
+                                            ? TR("(rest pose)")
+                                            : m_edit.baseClip.c_str())) {
+        if (ImGui::Selectable(TR("(rest pose)"), m_edit.baseClip.empty())) {
+            m_edit.baseClip.clear();
+            m_editDirty = true;
+        }
+        // 同样用下标当 ID：这个模型的 clip 名字**会重**（见上方片段列表那段
+        // 注释）。名字重复时下拉里会有两条同 ID 的 Selectable，点哪条都跳
+        // 到后一条 —— 而且 ImGui 会为它弹冲突告警窗。
+        for (std::size_t ci = 0; ci < skel->clips.size(); ++ci) {
+            const auto& c = skel->clips[ci];
+            ImGui::PushID(static_cast<int>(ci));
+            if (ImGui::Selectable(c.name.c_str(), m_edit.baseClip == c.name)) {
+                m_edit.baseClip = c.name;
+                m_editDirty = true;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    tip(TR("Keys are layered on top of this clip. Bones you never key keep "
+           "playing it; '(rest pose)' means the unkeyed bones stay still."));
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TR("Duration"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90.0f);
+    ImGui::DragFloat("##pose_dur", &m_edit.duration, 0.01f, 0.01f, 600.0f,
+                     TR("%.2fs"));
+    ImGui::SameLine();
+    ImGui::Checkbox(TR("Loop"), &m_edit.loop);
+
+    // ---- 统计 ----
+    ImGui::Spacing();
+    ImGui::TextDisabled(TR("STATS"));
+    ImGui::Separator();
+    ImGui::Text(TR("Tracks"));
+    ImGui::SameLine(90.0f);
+    ImGui::TextDisabled("%d", static_cast<int>(m_edit.tracks.size()));
+    ImGui::Text(TR("Keys"));
+    ImGui::SameLine(90.0f);
+    ImGui::TextDisabled("%d", m_edit.totalKeys());
+    ImGui::Text(TR("Resolved"));
+    ImGui::SameLine(90.0f);
+    ImGui::TextDisabled("%d / %d", m_editStats.resolvedChannels,
+                        static_cast<int>(m_edit.tracks.size()));
+    tip(TR("How many of the stored tracks found their bone in this skeleton. "
+           "Keys are stored by bone NAME, so a re-import with shifted joint "
+           "indices still works."));
+    if (!m_editStats.missing.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1.0f), "%s",
+                           TR("Missing bones"));
+        for (const auto& m : m_editStats.missing)
+            ImGui::BulletText("%s", m.c_str());
+    }
+
+    // ---- 关键帧列表 ----
+    ImGui::Spacing();
+    ImGui::TextDisabled(TR("KEYS"));
+    ImGui::Separator();
+    const std::vector<std::string> joints = m_edit.keyedJoints();
+    if (joints.empty()) {
+        ImGui::TextDisabled(TR("(no keys yet — pick a bone and press I)"));
+    }
+    for (const auto& jn : joints) {
+        ImGui::PushID(jn.c_str());
+        const bool isSel =
+            (m_selectedJoint >= 0 && m_selectedJoint < skel->jointCount() &&
+             skel->joints[static_cast<size_t>(m_selectedJoint)].name == jn);
+        if (ImGui::TreeNodeEx("##jn",
+                              ImGuiTreeNodeFlags_SpanAvailWidth |
+                                  (isSel ? ImGuiTreeNodeFlags_Selected : 0),
+                              "%s", jn.c_str())) {
+            static const assets::AnimTrack::Path kPaths[3] = {
+                assets::AnimTrack::Rotation, assets::AnimTrack::Translation,
+                assets::AnimTrack::Scale};
+            static const char* kPathNames[3] = {"rot", "loc", "scale"};
+            for (int pi = 0; pi < 3; ++pi) {
+                const animation::EditTrack* tr = m_edit.track(jn, kPaths[pi]);
+                if (!tr) continue;
+                ImGui::TextDisabled("%s (%d)", kPathNames[pi], tr->keyCount());
+                // 帧表：时间 + 删。用 Selectable 让"点一下跳过去"成立。
+                std::vector<int> drop;
+                for (int ki = 0; ki < tr->keyCount(); ++ki) {
+                    ImGui::PushID(ki);
+                    char lbl[64];
+                    // ⚠ 格式串要包 TR()（i18n 的 D 组会红），而且**不要**再拼
+                    //   `##k` 做 ID：唯一性已经由外面的 PushID(ki) 给了，
+                    //   拼进去反而让"这一行显示的是不是时间"变得含糊。
+                    std::snprintf(lbl, sizeof(lbl), TR("%.3fs"),
+                                  static_cast<double>(tr->times[static_cast<size_t>(ki)]));
+                    if (ImGui::Selectable(lbl, false,
+                                          ImGuiSelectableFlags_AllowOverlap,
+                                          ImVec2(ImGui::GetContentRegionAvail().x -
+                                                     24.0f, 0.0f))) {
+                        m_animTime = tr->times[static_cast<size_t>(ki)];
+                        clearTransient();
+                        VK_LOG_INFO("CHAR-POSE-GOTO joint='%s' t=%.6f",
+                                    jn.c_str(),
+                                    static_cast<double>(m_animTime));
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("x")) drop.push_back(ki);
+                    ImGui::PopID();
+                }
+                // 倒序删：正序删会让后面的下标整体前移，删一个漏一个。
+                for (int i = static_cast<int>(drop.size()) - 1; i >= 0; --i) {
+                    m_edit.removeKey(jn, kPaths[pi], drop[static_cast<size_t>(i)]);
+                    m_editDirty = true;
+                    VK_LOG_INFO("CHAR-POSE-KEY-DEL joint='%s' path=%s idx=%d",
+                                jn.c_str(), kPathNames[pi],
+                                drop[static_cast<size_t>(i)]);
+                }
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+
+    // ---- 姿态库 ----
+    ImGui::Spacing();
+    ImGui::TextDisabled(TR("POSE LIBRARY"));
+    ImGui::Separator();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TR("Name"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputText("##pose_name", m_poseNameBuf, sizeof(m_poseNameBuf));
+    if (ImGui::Button(TR("Store"))) {
+        const std::string nm = m_poseNameBuf;
+        if (!nm.empty() && m_pose.count() > 0) {
+            animation::EditPose p = animation::capturePose(m_pose, *skel, nm);
+            const bool added = m_edit.storePose(p);
+            VK_LOG_INFO("CHAR-POSELIB op=store name='%s' bones=%d new=%d "
+                        "total=%d",
+                        nm.c_str(), static_cast<int>(p.bones.size()),
+                        added ? 1 : 0,
+                        static_cast<int>(m_edit.poses.size()));
+        }
+    }
+    logRect("CHAR-POSE-STORE-BTN", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    tip(TR("Save the pose currently on screen under this name (whole body)"));
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Apply"))) {
+        const animation::EditPose* p = m_edit.findPose(m_poseNameBuf);
+        if (p) {
+            const int n = animation::applyEditPose(*p, *skel, m_pose);
+            // 应用到**瞬态层**而不是直接写轨道：姿态库是"摆姿势的起点"，
+            // 还要接着转、接着打帧，直接落轨道等于偷偷帮你打了一帧。
+            for (const auto& b : p->bones) {
+                const int j = skel->findJoint(b.joint,
+                                              assets::kJointMatchCaseInsensitive);
+                if (j < 0 || j >= m_pose.count()) continue;
+                ensureTransient(m_pose.count());
+                if (static_cast<size_t>(j) >= m_touched.size()) continue;
+                m_touched[static_cast<size_t>(j)] = 1;
+                m_touchedT[static_cast<size_t>(j)] = b.translation;
+                m_touchedR[static_cast<size_t>(j)] = b.rotation;
+                m_touchedS[static_cast<size_t>(j)] = b.scale;
+            }
+            VK_LOG_INFO("CHAR-POSELIB-APPLIED name='%s' bones=%d", p->name.c_str(),
+                        n);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Delete"))) {
+        const std::string nm = m_poseNameBuf;
+        if (m_edit.removePose(nm))
+            VK_LOG_INFO("CHAR-POSELIB op=delete name='%s'", nm.c_str());
+    }
+    for (const auto& p : m_edit.poses) {
+        ImGui::Bullet();
+        ImGui::SameLine();
+        if (ImGui::SmallButton(p.name.c_str())) {
+            std::snprintf(m_poseNameBuf, sizeof(m_poseNameBuf), "%s",
+                          p.name.c_str());
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d", static_cast<int>(p.bones.size()));
+    }
+}
+
+void CharacterWindow::drawPoseDetails() {
+    if (!m_poseMode) return;
+    handlePoseKeys();
+
+    const assets::Skeleton* skel =
+        (m_model && m_model->skeleton) ? m_model->skeleton.get() : nullptr;
+    ImGui::Spacing();
+    ImGui::TextDisabled(TR("POSE"));
+    ImGui::Separator();
+    if (!skel || m_selectedJoint < 0 || m_selectedJoint >= skel->jointCount() ||
+        m_selectedJoint >= m_pose.count()) {
+        ImGui::TextDisabled(TR("(pick a bone in the Skeleton tab)"));
+        return;
+    }
+
+    const size_t k = static_cast<size_t>(m_selectedJoint);
+    const std::string& nm = skel->joints[k].name;
+
+    // 局部 TRS。改这里 = 写瞬态层（和拖 gizmo 等价），不会自动打帧。
+    // ⚠ 每次都是"先 touchBone（把三个通道抄一遍），再改其中一个" ——
+    //   顺序反过来就把另外两个通道清成默认值了（见 touchBone 的注释）。
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TR("Pos"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    {
+        float p[3] = {m_pose.translation[k].x, m_pose.translation[k].y,
+                      m_pose.translation[k].z};
+        if (ImGui::DragFloat3("##pose_t", p, 0.001f, -100.0f, 100.0f, "%.4f")) {
+            touchBone(m_selectedJoint);
+            if (k < m_touchedT.size())
+                m_touchedT[k] = glm::vec3(p[0], p[1], p[2]);
+        }
+    }
+    tip(TR("Bone translation relative to its parent (rest offset included)"));
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TR("Rot"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    {
+        const glm::vec3 e = glm::degrees(glm::eulerAngles(m_pose.rotation[k]));
+        float r[3] = {e.x, e.y, e.z};
+        if (ImGui::DragFloat3("##pose_r", r, 0.25f, -360.0f, 360.0f, "%.2f")) {
+            touchBone(m_selectedJoint);
+            if (k < m_touchedR.size())
+                m_touchedR[k] = glm::quat(glm::radians(glm::vec3(r[0], r[1], r[2])));
+        }
+    }
+    tip(TR("Bone rotation in degrees. Same convention as glm::eulerAngles, so "
+           "the numbers here and the script API agree."));
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TR("Scale"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    {
+        float s[3] = {m_pose.scale[k].x, m_pose.scale[k].y, m_pose.scale[k].z};
+        if (ImGui::DragFloat3("##pose_s", s, 0.002f, 0.001f, 10.0f, "%.4f")) {
+            touchBone(m_selectedJoint);
+            if (k < m_touchedS.size())
+                m_touchedS[k] = glm::vec3(s[0], s[1], s[2]);
+        }
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button(TR("Key (I)"))) keySelectedBone(true, true, true);
+    logRect("CHAR-POSE-KEY-BTN", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Rot only"))) keySelectedBone(true, false, false);
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Loc only"))) keySelectedBone(false, true, false);
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Scl only"))) keySelectedBone(false, false, true);
+    tip(TR("Write the current values as keys at the playhead. Only the bones "
+           "you key are stored — everything else keeps following the base "
+           "clip."));
+
+    if (ImGui::Button(TR("Revert bone"))) {
+        if (k < m_touched.size()) m_touched[k] = 0;
+        VK_LOG_INFO("CHAR-POSE-REVERT joint='%s'", nm.c_str());
+    }
+    tip(TR("Drop the un-keyed changes on this bone and fall back to the keys / "
+           "base clip"));
+
+    ImGui::Spacing();
+    ImGui::Text(TR("Keys on this bone"));
+    ImGui::SameLine();
+    {
+        int n = 0;
+        for (int pi = 0; pi < 3; ++pi) {
+            const auto path = pi == 0   ? assets::AnimTrack::Rotation
+                              : pi == 1 ? assets::AnimTrack::Translation
+                                        : assets::AnimTrack::Scale;
+            if (const animation::EditTrack* tr = m_edit.track(nm, path))
+                n += tr->keyCount();
+        }
+        ImGui::TextDisabled("%d", n);
+    }
+}
+
+// ---------------------------------------------------------------- 存读
+
+bool CharacterWindow::saveEdit(const std::string& path) {
+    if (path.empty()) {
+        VK_LOG_WARN("CHAR-POSE-SAVE-BLOCKED reason=no-path");
+        return false;
+    }
+    // 资产名跟文件名走：UI 上显示的名字和磁盘上的文件名不一致，
+    // 下一次"打开哪个文件"就要靠记忆了。
+    const std::string nm = animation::clipNameFromPath(path);
+    if (!nm.empty()) m_edit.name = nm;
+    std::string err;
+    if (!animation::saveEditClip(path, m_edit, err)) {
+        VK_LOG_ERROR("CHAR-POSE-SAVE-FAIL path=%s err=%s", path.c_str(),
+                     err.c_str());
+        return false;
+    }
+    m_editPath = path;
+    std::snprintf(m_editPathBuf, sizeof(m_editPathBuf), "%s", path.c_str());
+    return true;
+}
+
+bool CharacterWindow::loadEdit(const std::string& path) {
+    animation::EditClip c;
+    std::string err;
+    if (!animation::loadEditClip(path, c, err)) {
+        VK_LOG_WARN("CHAR-POSE-LOAD-FAIL path=%s err=%s", path.c_str(),
+                    err.c_str());
+        return false;
+    }
+    m_edit = std::move(c);
+    m_editPath = path;
+    std::snprintf(m_editPathBuf, sizeof(m_editPathBuf), "%s", path.c_str());
+    m_editDirty = true;
+    // base clip 存在就切过去：读进来的资产应该"一眼看到它自己的样子"，
+    // 而不是因为时间轴还停在上一段片段上而显示成别的东西。
+    if (!m_edit.baseClip.empty() && m_model && m_model->skeleton &&
+        m_model->skeleton->findClip(m_edit.baseClip)) {
+        m_currentClip = m_edit.baseClip;
+    }
+    clearTransient();
+    return true;
+}
+
+// ---------------------------------------------------------------- 脚本注入
+
+void CharacterWindow::runPoseScript() {
+    if (m_scriptRan) return;
+    const char* raw = std::getenv("MYVK_EDITOR_POSE_SCRIPT");
+    if (!raw || !raw[0]) {
+        m_scriptRan = true;
+        return;
+    }
+    // 等骨架：模型是异步加载的，脚本不能跑在"还没有 skeleton"的那一帧。
+    if (!m_model || !m_model->skeleton) return;
+    m_scriptRan = true;
+    const assets::Skeleton& skel = *m_model->skeleton;
+
+    int applied = 0;
+    int failed = 0;
+    auto split = [](const std::string& s, char sep) {
+        std::vector<std::string> out;
+        std::size_t pos = 0;
+        while (pos <= s.size()) {
+            const std::size_t p = s.find(sep, pos);
+            out.push_back(s.substr(pos, p == std::string::npos ? std::string::npos
+                                                               : p - pos));
+            if (p == std::string::npos) break;
+            pos = p + 1;
+        }
+        return out;
+    };
+
+    const std::string all(raw);
+    std::size_t pos = 0;
+    while (pos <= all.size()) {
+        std::size_t semi = all.find(';', pos);
+        std::string tok = all.substr(pos, semi == std::string::npos
+                                              ? std::string::npos
+                                              : semi - pos);
+        pos = (semi == std::string::npos) ? all.size() + 1 : semi + 1;
+        // 去空白
+        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+            tok.erase(tok.begin());
+        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+            tok.pop_back();
+        if (tok.empty()) continue;
+
+        const std::vector<std::string> a = split(tok, ':');
+        const std::string& cmd = a[0];
+        bool ok = false;
+
+        if (cmd == "list") {
+            // 把骨架的骨名全表打出来。验收脚本靠它**发现**这根模型上到底
+            // 有哪些骨，而不是把 `mixamorig:LeftArm` 写死在测试里 ——
+            // 换个模型就得改测试的用例不是验收，是负债。
+            VK_LOG_INFO("CHAR-POSE-JOINTS n=%d", skel.jointCount());
+            for (int i = 0; i < skel.jointCount(); ++i) {
+                VK_LOG_INFO("CHAR-POSE-JOINT i=%d name=%s parent=%d", i,
+                            skel.joints[static_cast<size_t>(i)].name.c_str(),
+                            skel.joints[static_cast<size_t>(i)].parent);
+            }
+            ok = true;
+        } else if (cmd == "mode" && a.size() >= 2) {
+            const bool on = (a[1] == "on" || a[1] == "1");
+            if (on && !m_poseMode) {
+                m_poseMode = true;
+                if (m_edit.baseClip.empty()) m_edit.baseClip = m_currentClip;
+                if (m_edit.name.empty())
+                    m_edit.name = m_currentClip.empty() ? std::string("custom")
+                                                        : m_currentClip;
+                m_editDirty = true;
+                m_focusPoseTab = true;
+            } else if (!on) {
+                m_poseMode = false;
+            }
+            VK_LOG_INFO("CHAR-POSE-MODE on=%d base='%s' tracks=%d keys=%d "
+                        "path=%s",
+                        m_poseMode ? 1 : 0, m_edit.baseClip.c_str(),
+                        static_cast<int>(m_edit.tracks.size()), m_edit.totalKeys(),
+                        m_editPath.c_str());
+            ok = true;
+        } else if (cmd == "select" && a.size() >= 2) {
+            const int j = skel.findJoint(a[1], assets::kJointMatchCaseInsensitive);
+            if (j >= 0) {
+                m_selectedJoint = j;
+                VK_LOG_INFO("CHAR-POSE-SELECT joint='%s' index=%d",
+                            skel.joints[static_cast<size_t>(j)].name.c_str(), j);
+                ok = true;
+            } else {
+                VK_LOG_WARN("CHAR-POSE-SELECT-MISS name='%s'", a[1].c_str());
+            }
+        } else if ((cmd == "setrot" || cmd == "setloc" || cmd == "setscale") &&
+                   a.size() >= 5) {
+            const int j = skel.findJoint(a[1], assets::kJointMatchCaseInsensitive);
+            if (j >= 0 && j < m_pose.count()) {
+                touchBone(j);   // 先把三个通道抄一遍，再只改其中一个
+                const size_t k = static_cast<size_t>(j);
+                const float x = std::strtof(a[2].c_str(), nullptr);
+                const float y = std::strtof(a[3].c_str(), nullptr);
+                const float z = std::strtof(a[4].c_str(), nullptr);
+                if (cmd == "setrot") {
+                    m_touchedR[k] = glm::quat(glm::radians(glm::vec3(x, y, z)));
+                } else if (cmd == "setloc") {
+                    m_touchedT[k] = glm::vec3(x, y, z);
+                } else {
+                    m_touchedS[k] = glm::vec3(x, y, z);
+                }
+                ok = true;
+            }
+        } else if (cmd == "key" && a.size() >= 4) {
+            const int j = skel.findJoint(a[1], assets::kJointMatchCaseInsensitive);
+            const std::string what = a[2];
+            const float t = std::strtof(a[3].c_str(), nullptr);
+            if (j >= 0) {
+                m_animTime = t;
+                samplePoseInto();
+                const bool rot = (what == "rot" || what == "all");
+                const bool loc = (what == "loc" || what == "all");
+                const bool scl = (what == "scale" || what == "all");
+                keyJoint(skel.joints[static_cast<size_t>(j)].name, m_pose, j, t,
+                         rot, loc, scl);
+                ok = true;
+            }
+        } else if (cmd == "sample" && a.size() >= 2) {
+            m_animTime = std::strtof(a[1].c_str(), nullptr);
+            samplePoseInto();
+            logPoseDigest("script");
+            ok = true;
+        } else if (cmd == "dump" && a.size() >= 2) {
+            const int j = skel.findJoint(a[1], assets::kJointMatchCaseInsensitive);
+            if (j >= 0 && j < m_pose.count()) {
+                const size_t k = static_cast<size_t>(j);
+                // 世界位置也打出来：局部 TRS 不变**不**代表外观没变 ——
+                // 父骨被改过的话子骨的局部不变、世界会跟着动。验收里那条
+                // "打帧不波及另一根骨"要同时钉住两样才成立。
+                glm::vec3 w(0.0f);
+                const bool haveW = (j < static_cast<int>(m_worldMats.size()));
+                if (haveW) w = glm::vec3(m_worldMats[k][3]);
+                // %a = 精确十六进制浮点：跨进程比对时逐位可比，不受
+                // printf 的十进制舍入影响。这是 A 组"存盘→重开→逐位一致"
+                // 能做成断言的前提。
+                VK_LOG_INFO("CHAR-POSE-DUMP joint='%s' t=%a,%a,%a "
+                            "r=%a,%a,%a,%a s=%a,%a,%a w=%a,%a,%a",
+                            skel.joints[k].name.c_str(),
+                            static_cast<double>(m_pose.translation[k].x),
+                            static_cast<double>(m_pose.translation[k].y),
+                            static_cast<double>(m_pose.translation[k].z),
+                            static_cast<double>(m_pose.rotation[k].x),
+                            static_cast<double>(m_pose.rotation[k].y),
+                            static_cast<double>(m_pose.rotation[k].z),
+                            static_cast<double>(m_pose.rotation[k].w),
+                            static_cast<double>(m_pose.scale[k].x),
+                            static_cast<double>(m_pose.scale[k].y),
+                            static_cast<double>(m_pose.scale[k].z),
+                            static_cast<double>(w.x), static_cast<double>(w.y),
+                            static_cast<double>(w.z));
+                ok = true;
+            }
+        } else if (cmd == "posestore" && a.size() >= 2) {
+            if (m_pose.count() > 0) {
+                animation::EditPose p = animation::capturePose(m_pose, skel, a[1]);
+                const bool added = m_edit.storePose(p);
+                VK_LOG_INFO("CHAR-POSELIB op=store name='%s' bones=%d new=%d "
+                            "total=%d", a[1].c_str(),
+                            static_cast<int>(p.bones.size()), added ? 1 : 0,
+                            static_cast<int>(m_edit.poses.size()));
+                ok = true;
+            }
+        } else if (cmd == "poseapply" && a.size() >= 2) {
+            const animation::EditPose* p = m_edit.findPose(a[1]);
+            if (p) {
+                const int n = animation::applyEditPose(*p, skel, m_pose);
+                for (const auto& b : p->bones) {
+                    const int j = skel.findJoint(
+                        b.joint, assets::kJointMatchCaseInsensitive);
+                    if (j < 0 || j >= m_pose.count()) continue;
+                    ensureTransient(m_pose.count());
+                    if (static_cast<size_t>(j) >= m_touched.size()) continue;
+                    m_touched[static_cast<size_t>(j)] = 1;
+                    m_touchedT[static_cast<size_t>(j)] = b.translation;
+                    m_touchedR[static_cast<size_t>(j)] = b.rotation;
+                    m_touchedS[static_cast<size_t>(j)] = b.scale;
+                }
+                VK_LOG_INFO("CHAR-POSELIB-APPLIED name='%s' bones=%d",
+                            p->name.c_str(), n);
+                ok = true;
+            }
+        } else if (cmd == "save" && a.size() >= 2) {
+            // 路径里可能带盘符冒号（C:\...），所以从第 2 段起全部拼回去。
+            std::string p = a[1];
+            for (std::size_t i = 2; i < a.size(); ++i) p += ":" + a[i];
+            ok = saveEdit(p);
+        } else if (cmd == "load" && a.size() >= 2) {
+            std::string p = a[1];
+            for (std::size_t i = 2; i < a.size(); ++i) p += ":" + a[i];
+            ok = loadEdit(p);
+        } else if (cmd == "clear") {
+            m_edit.tracks.clear();
+            m_editDirty = true;
+            clearTransient();
+            VK_LOG_INFO("CHAR-POSE-CLEAR keys=0");
+            ok = true;
+        }
+
+        if (ok) ++applied;
+        else {
+            ++failed;
+            VK_LOG_WARN("CHAR-POSE-SCRIPT-BAD tok='%s'", tok.c_str());
+        }
+    }
+    VK_LOG_INFO("CHAR-POSE-SCRIPT applied=%d failed=%d tracks=%d keys=%d "
+                "poses=%d", applied, failed,
+                static_cast<int>(m_edit.tracks.size()), m_edit.totalKeys(),
+                static_cast<int>(m_edit.poses.size()));
+}
+
+void CharacterWindow::logPoseDigest(const char* tag) {
+    // FNV-1a over 关节矩阵的**原始字节**。
+    //
+    // 为什么用字节摘要而不是"把位置加起来比"：求和会让两个不同的姿态
+    // 撞出同一个值（对称的左右臂互换正好抵消）。验收要的是"逐位一致"，
+    // 那就只能对着字节算。碰撞概率对一次断言来说可以忽略。
+    unsigned long long h = 1469598103934665603ull;
+    const unsigned char* p =
+        reinterpret_cast<const unsigned char*>(m_jointMats.data());
+    const std::size_t n = m_jointMats.size() * sizeof(glm::mat4);
+    for (std::size_t i = 0; i < n; ++i) {
+        h ^= static_cast<unsigned long long>(p[i]);
+        h *= 1099511628211ull;
+    }
+    VK_LOG_INFO("CHAR-POSE-DIGEST tag=%s t=%.6f joints=%d bytes=%d fnv=%016llx",
+                tag ? tag : "-", static_cast<double>(m_animTime),
+                static_cast<int>(m_jointMats.size()), static_cast<int>(n), h);
+}
+
 void CharacterWindow::draw() {
     if (!m_open) return;
     if (m_previewDirty) rebuildPreviewScene();
@@ -1764,32 +2858,42 @@ void CharacterWindow::draw() {
         (m_model && m_model->skeleton)
             ? m_model->skeleton->findClip(m_currentClip)
             : nullptr;
-    if (m_animPlaying && curClip) {
+    // Pose Mode 下时间轴的"长度"是**编辑资产自己的 duration**，不是当前
+    // 预览片段的：作者在这段时间里打帧，播放头就该在这段时间里循环。
+    // 拿 base clip 的长度会让"我明明在 3.2s 打了帧，播放头到 1.0s 就绕回 0"。
+    const float timelineLen =
+        m_poseMode ? std::max(m_edit.duration, 1.0e-3f)
+                   : (curClip ? curClip->duration : 0.0f);
+    if (m_animPlaying && timelineLen > 0.0f) {
         m_animTime += ImGui::GetIO().DeltaTime * m_animSpeed;
-        if (curClip->duration > 0.0f) {
-            if (m_animTime > curClip->duration) {
-                if (m_animLoop) {
-                    m_animTime = std::fmod(m_animTime, curClip->duration);
-                } else {
-                    m_animTime = curClip->duration;
-                    m_animPlaying = false;
-                }
+        if (m_animTime > timelineLen) {
+            if (m_animLoop) {
+                m_animTime = std::fmod(m_animTime, timelineLen);
+            } else {
+                m_animTime = timelineLen;
+                m_animPlaying = false;
             }
         }
     }
 
-    // 采样当前姿势 —— Details 的骨骼世界位置与"选中骨骼"高亮都靠它
-    if (m_model && m_model->skeleton) {
-        m_model->skeleton->sample(m_animPlaying || m_animTime > 0.0f
-                                      ? curClip
-                                      : nullptr,
-                                  m_animTime, m_jointMats);
-    } else {
-        m_jointMats.clear();
-    }
+    // 采样当前姿势 —— Details 的骨骼世界位置、gizmo、预览蒙皮都靠它。
+    //
+    // 2026-10-28（R7）：这里原来直接调 `Skeleton::sample(clip, t, out)`。
+    // 那是"采样 + FK + 乘 invBind"一步到底，**中间没有插入点**，所以没法
+    // 把打好的帧叠上去。改成三段式（samplePose → overlayEditPose →
+    // poseToJoints）之后，`sample()` 在数学上就是它的兼容壳，没编辑数据时
+    // 输出逐位相同（见 animation/Pose.h 的头注释与 MYVK_ANIM_TEST）。
+    samplePoseInto();
+    // 验收脚本（MYVK_EDITOR_POSE_SCRIPT）在采样之后跑：它要读 m_pose，
+    // 也会自己重新采样（`sample:` / `key:` 会改 m_animTime）。
+    runPoseScript();
 
     // 把动画状态同步给预览场景里的 SkinnedMeshComponent
     syncPreviewSkinning();
+
+    // 摄影表（R8）：Pose Mode 下把这份 m_edit 推过去，退出时解绑。
+    // 排在采样之后 —— 摄影表要在同一帧里读到刚打的帧。
+    syncDopeSheet();
 
     // ---- 窗口 ----
     // 默认尺寸按屏幕给：UE 的 Persona 面板是"越大越好"，760×560 那种尺寸
@@ -1885,6 +2989,22 @@ void CharacterWindow::draw() {
         }
         logRect("CHAR-TAB-Animation", ImGui::GetItemRectMin(),
                 ImGui::GetItemRectMax());
+        // Pose 页只在 Pose Mode 下出现：它不是"看资产"的一页，是"摆姿势"
+        // 的一页，关掉 Pose Mode 还留着一个空页会让左栏多一个点开没内容的坑。
+        if (m_poseMode) {
+            // 开 Pose Mode 的那一帧把页签切过来。用 SetSelected 而不是
+            // "记一个当前页索引"：页签的选中态归 ImGui 管，自己再存一份
+            // 就有了两个真相源（关掉再打开时对不上）。
+            const ImGuiTabItemFlags pf =
+                m_focusPoseTab ? ImGuiTabItemFlags_SetSelected : 0;
+            if (ImGui::BeginTabItem(TR("Pose"), nullptr, pf)) {
+                drawPosePanel();
+                ImGui::EndTabItem();
+            }
+            logRect("CHAR-TAB-Pose", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+            m_focusPoseTab = false;
+        }
         ImGui::EndTabBar();
     }
     ImGui::EndChild();

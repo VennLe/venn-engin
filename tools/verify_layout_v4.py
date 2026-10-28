@@ -19,7 +19,7 @@
 
   B. 左栏模式栏
      B1 LAYOUT-RECTS：modes 贴最左（x=0）、宽度 280..460
-     B2 9 行都在（MODE-RAIL-0..8 全有锚点）—— 一行都不能被裁掉
+     B2 10 行都在（MODE-RAIL-0..9 全有锚点）—— 一行都不能被裁掉
      B3 点第 5 行 → EDITMODE-PANELS mode=modeling
      B4 该模式的参数面板落在左栏里（TK-modeling 的 x/宽 与 modes 一致，
         且 y >= 列表底边）
@@ -171,9 +171,14 @@ def part_b():
         check(abs(mx) < 2.0 and 280.0 <= mw <= 520.0,
               "B1 模式栏贴最左且宽度合理 (x=%.0f w=%.0f)" % (mx, mw))
 
-        rows = [rect_of(tap, "MODE-RAIL-%d" % i, 4.0) for i in range(9)]
+        # ⚠ 行数必须跟 `editor::kEditModeCount` 对齐（现在是 10：Select /
+        #   Landscape / Foliage / MeshPaint / Modeling / Fracture / BrushEdit /
+        #   Animation / PCG / Water）。这里原来写死 `range(9)`，是 2026-10-21
+        #   加 Water 之前留下的 —— 于是 water 那一行从来没被 B2 检查过，
+        #   `rows[-1]` 也指着 Animation 而不是真正的最后一行。
+        rows = [rect_of(tap, "MODE-RAIL-%d" % i, 4.0) for i in range(10)]
         check(all(r is not None for r in rows),
-              "B2 9 行模式全部有锚点（没有被窗口裁掉）")
+              "B2 10 行模式全部有锚点（没有被窗口裁掉）")
 
         win = rect_of(tap, "MODE-RAIL-WIN", 4.0)
         if rows[-1] and win:
@@ -193,15 +198,28 @@ def part_b():
         check(ok, "B3 点左栏第 5 行 → EDITMODE-PANELS mode=modeling")
 
         # B4 建模面板落在左栏里
+        #
+        # ⚠ 基线必须**切到 Modeling 之后重新量**，不能拿 B1 那份。
+        #   B1 量的是 Select 下的模式栏（`editModeRailMinWidth(Select)` = 300），
+        #   而切到 Modeling 时模式栏会被顶到 460（`kMinModeRail`，见 #317）——
+        #   于是"面板宽 == B1 的量"这条断言必然失败，差 160。
+        #   原来这里拿的就是 B1 的 mx/mw，2026-10-28 改成按模式问最小宽度之后
+        #   它就一直是红的，只是没人跑这条脚本。
         tk = rect_of(tap, "TK-modeling", 6.0)
+        win_m = rect_of(tap, "MODE-RAIL-WIN", 6.0)   # 切模式后的当前值
         if not tk:
             check(False, "B4 找不到 TK-modeling 锚点")
+        elif not win_m:
+            check(False, "B4 找不到切换后的 MODE-RAIL-WIN 锚点")
         else:
-            sameCol = abs(tk[0] - mx) < 2.0 and abs((tk[2] - tk[0]) - mw) < 2.0
-            belowList = win is not None and tk[1] >= win[3] - 1.0
+            sameCol = (abs(tk[0] - win_m[0]) < 2.0
+                       and abs((tk[2] - tk[0]) - (win_m[2] - win_m[0])) < 2.0)
+            belowList = tk[1] >= win_m[3] - 1.0
             check(sameCol and belowList,
-                  "B4 建模面板长在左栏列表下方 (x=%.0f w=%.0f y=%.0f)"
-                  % (tk[0], tk[2] - tk[0], tk[1]))
+                  "B4 建模面板长在左栏列表下方 (x=%.0f w=%.0f y=%.0f；"
+                  "栏 x=%.0f w=%.0f 底=%.0f)"
+                  % (tk[0], tk[2] - tk[0], tk[1],
+                     win_m[0], win_m[2] - win_m[0], win_m[3]))
     finally:
         shutdown(proc, hwnd)
 

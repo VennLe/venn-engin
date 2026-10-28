@@ -592,7 +592,12 @@ int main(int argc, char** argv) {
         io.scale = a.scale;
         io.assetRoot = a.assetRoot.empty() ? guessAssetRoot(in) : a.assetRoot;
         io.verbose = !a.quiet;
-        assetio::SourceModel model = assetio::importFbx(in, io);
+        // 导入期的事件行（目前只有 clip 重名去重 `FBX-CLIPDUP`）。
+        // 这一层只收文本、自己打印：`VennAssetIO` 不链 engine 的 Logger，
+        // 见 `assetio/FbxImport.h` 里那段说明。
+        std::vector<std::string> importNotes;
+        assetio::SourceModel model = assetio::importFbx(in, io, &importNotes);
+        for (const std::string& line : importNotes) std::printf("%s\n", line.c_str());
 
         if (!model.ok) {
             std::printf("ASSETC FAIL %s reason=%s\n", in.c_str(),

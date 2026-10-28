@@ -322,6 +322,46 @@ def group_editor():
           "path=%s leaked=%s" % (sq.get("path"), runtime_only or "none"))
 
 
+def group_selftest():
+    """`Game.exe --selftest sequence` 的数值自检（无窗口、无 Vulkan，几百毫秒）。
+
+    ⚠⚠ 这一组是 2026-10-28（R5）才补的，补之前有一段**假绿**：
+      `SequenceSelfTest.cpp` 里的 73 条 `SEQ-TEST` 一直没人消费 —— 也就是说
+      "采样算错了"只在有人手动跑一遍时才会被发现。写路径（`sampleCamera`
+      的插值）刚被统一到 `animation::Curve`，如果连数值侧都不自动跑，
+      这一层就是**红着的闸门**（等于没有闸门）。
+
+    断三件事：
+      1. 进程 rc == 0（自检有失败项时返回项数）；
+      2. `SEQ-TOTAL fail=0`；
+      3. **每一条 R5 新增断言都出现过** —— 防止哪条被 `#if 0` 掉之后脚本还绿。
+    """
+    env = dict(os.environ)
+    argv = [GAME_EXE, "--selftest", "sequence"]
+    proc = subprocess.run(argv, cwd=os.path.dirname(GAME_EXE), env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          timeout=120)
+    txt = (proc.stdout or b"").decode("utf-8", "replace")
+    check("A0 · 过场数值自检 rc=0", proc.returncode == 0,
+          "rc=%d" % proc.returncode)
+
+    m = re.search(r"SEQ-TOTAL\s+pass=(\d+)\s+fail=(\d+)", txt)
+    check("A0 · SEQ-TOTAL fail=0", bool(m) and m.group(2) == "0",
+          m.group(0) if m else "没有 SEQ-TOTAL 行")
+
+    want = [
+        "seq_sample_legacy_bitwise",      # 三个老模式逐位不变（迁移锚）
+        "seq_step_keeps_a_time",          # step 是"选择"不是插值
+        "seq_bezier_default_quarter_x",   # bezier 落点对
+        "seq_bezier_handle_changes_shape",# 手柄真的改曲线（且方向对）
+        "seq_bezier_handle_clamped",      # 写反的 x 被钳回
+        "seq_bezier_roundtrip_handles",   # 手柄跟着资产往返
+    ]
+    missing = [w for w in want if w not in txt]
+    check("A0 · R5 六条曲线断言都在", not missing,
+          "missing=%s" % ",".join(missing))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", default=EDITOR_EXE)
@@ -329,6 +369,7 @@ def main():
     args = ap.parse_args()
 
     print("== 过场时间轴（C1）端到端 ==")
+    group_selftest()
     group_runtime()
     if not args.skip_editor:
         group_editor()

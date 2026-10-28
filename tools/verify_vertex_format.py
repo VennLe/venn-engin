@@ -45,8 +45,15 @@ MESH_VER = 2
 # 重烤前后的"账"必须完全一致。数字一旦变了，说明烤制参数用错了
 # （例如 default_character 少了 --strip-skin，joints 会从 23 变成 52）。
 #   submeshes, vertices, indices, joints, clips
+#
+# ⚠ `anime_girl` 的 clips 从 **4 变成 2**（2026-10-28，#329）：
+#   它的 FBX 里有 4 个 AnimationStack（`Rig|Idle` ×2 + `Rig|Walk` ×2 ——
+#   同一动作被导出了两遍），归一化掉 `|` 前缀后名字是 [Idle,Walk,Idle,Walk]。
+#   导入期现在按"同名 + 同时长 → 重复导出 → 丢弃"去重（`assetio/ClipDedup.h`），
+#   于是 `--info` 报 clips=2。**几何一个字节没动**：重烤前后 submeshes/vertices/
+#   indices/joints/materials 全等，sourceHash 也全等，只有动画段少了一段重复。
 BASE = {
-    "models/anime_girl.vmesh":                   (7, 11338, 65712, 21, 4),
+    "models/anime_girl.vmesh":                   (7, 11338, 65712, 21, 2),
     "models/characters/alicia.vmesh":            (20, 21310, 95394, 128, 4),
     "models/characters/animate_girl.vmesh":      (7, 25626, 101781, 65, 4),
     "models/characters/default_character.vmesh": (2, 35440, 165960, 23, 4),

@@ -40,12 +40,15 @@ constexpr float kRightSplit = 0.42f;
 // SameLine 硬排的，横向合计 400 出头，加上窗口内边距 446 —— 320 宽时右边
 // 那个 Delete 直接被窗口裁掉（点都点不到），400 宽也还差一点。
 //
-// ⚠ 2026-10-28：这个常量现在只当**首帧 / 窗口大幅缩放时的默认宽度下限**。
-//   真正参与拖动的是 `root.minA`，它由 `setLeftMinWidth()` 按当前编辑模式
-//   写进来（响应式的 Landscape / Foliage 报 300，硬排的 Modeling 报 460）。
-//   两者分开，是为了让"默认布局逐像素不动"（verify_viewport 里钉了
-//   CONVERGED_VP = (463,139,1241,778)，改默认宽度会让它和像素基线一起飘），
-//   同时又能让用户往下拖。
+// ⚠ 2026-10-28：这个常量已**不再**参与"默认宽度"与"拖动下限"的任何计算，
+//   只剩两处兜底语义：
+//     · `setLeftDefaultMinWidth()` 没被调用时的默认（= 老行为）；
+//     · `reset()` 之后第一帧（EditorApp 还没来得及按模式报数）。
+//   真正参与计算的都是**按当前编辑模式**问出来的：
+//     · 拖动下限 → `root.minA`，由 `setLeftMinWidth()` 写；
+//     · 默认宽度 → 由 `setLeftDefaultMinWidth()` 写进 `m_leftDefaultMin`。
+//   两者分开，是因为前者要读 m_dispW、必须排在 beginFrame 之后，而后者
+//   恰恰要在 beginFrame 之前就位（首帧的默认宽度就在那里算）。
 constexpr float kMinModeRail = 460.0f;
 // 拖动时**绝对**下限：再窄的话，左栏连"9 行列表 + 一列按钮"都放不下，
 // 而且模式列表的图标 + 文字（x+50 起）会被裁。
@@ -178,6 +181,13 @@ float SplitLayout::leftMinWidth() const {
     return m_nodes[static_cast<size_t>(m_root)].minA;
 }
 
+void SplitLayout::setLeftDefaultMinWidth(float px) {
+    // 夹在"绝对下限"与"自适应上限"之间：比 300 还窄连模式列表都放不下，
+    // 比 kLeftMax 还宽就没有意义（默认宽度会 clamp 到上限）。
+    m_leftDefaultMin = std::clamp(px, kMinModeRailDrag,
+                                  std::max(kLeftMax, kMinModeRailDrag));
+}
+
 void SplitLayout::beginFrame(float w, float h) {
     m_dispW = w;
     m_dispH = h;
@@ -201,9 +211,18 @@ void SplitLayout::beginFrame(float w, float h) {
 
     // 节点 0：模式栏 | 其余
     SplitNode& root = m_nodes[m_root];
+    // 默认宽度的下限 = **当前编辑模式的声明**（`setLeftDefaultMinWidth`），
+    // 没声明过才退回历史默认 460。
+    //
+    // ⚠ 这一行是 #317 的产品侧修复：原来下限恒为 460，而 `bodyW * kLeftFrac`
+    //   在 1600×900 下只有 280 —— 两者一夹，左栏永远是 460，视口只剩 778px，
+    //   右侧工具条 7 颗按钮只放得下 3 颗（尾巴 4 颗静默消失）。改成按模式
+    //   取之后，Select / Landscape / Foliage 默认就是 300，视口回到 936px。
+    const float leftFloor = m_leftDefaultMin > 0.0f ? m_leftDefaultMin
+                                                    : kMinModeRail;
     const float leftW = root.autoRatio
-                            ? std::clamp(bodyW * kLeftFrac, kMinModeRail,
-                                         std::max(kLeftMax, kMinModeRail))
+                            ? std::clamp(bodyW * kLeftFrac, leftFloor,
+                                         std::max(kLeftMax, leftFloor))
                             : bodyW * root.ratio;
     if (root.autoRatio) root.ratio = std::clamp(leftW / bodyW, 0.05f, 0.45f);
 

@@ -241,6 +241,115 @@ int runSequencerSelfTest() {
     }
 
     // ============================================================
+    // B7+ R5（2026-10-28）：插值统一到 `animation::Curve` 之后，
+    // **老三个模式必须逐位不变**；新增的 bezier 手柄必须真的改曲线。
+    // ============================================================
+
+    // B7 迁移锚：linear / smooth / step 在六个采样点上与本文件的
+    // 独立参考实现（`smoothstep01` 那份副本 + 逐字复述的老公式）**逐位**相同。
+    // ⚠ 这是"把三份插值合成一份"唯一可信的证据 —— 任何一条漂了 1e-7，
+    //   老资产的运镜就整体变形，而屏幕上看不出来。
+    {
+        // ⚠ 这个副本**故意**不调用 `SequenceAsset.cpp` 里那份（它是
+        //   anonymous namespace，本来就外部不可见）—— 参考实现必须独立，
+        //   拿新实现和新实现比是循环论证。
+        auto legacySmooth = [](float u) { return u * u * (3.0f - 2.0f * u); };
+
+        bool bitwise = true;
+        float worstU = 0.0f;
+        for (int i = 0; i <= 10; ++i) {
+            const float u = static_cast<float>(i) / 10.0f;
+            const float t = u * 2.0f;
+
+            SequenceAsset lin = twoKeys("linear");
+            SeqCameraKey k;
+            sampleCamera(lin, t, k);
+            if (k.position.x != 0.0f + (10.0f - 0.0f) * u) { bitwise = false; worstU = u; }
+
+            SequenceAsset sm = twoKeys("smooth");
+            sampleCamera(sm, t, k);
+            if (k.position.x != 0.0f + (10.0f - 0.0f) * legacySmooth(u)) {
+                bitwise = false; worstU = u;
+            }
+        }
+        reportFlag("seq_sample_legacy_bitwise", bitwise,
+                   "worst_u=" + std::to_string(worstU));
+
+        // step 的语义是"选择"：段内保持 a（连 `out.t` 也是 a.t）
+        SequenceAsset st = twoKeys("step");
+        SeqCameraKey k;
+        sampleCamera(st, 1.5f, k);
+        reportFlag("seq_step_keeps_a_time", k.t == 0.0f && k.position.x == 0.0f,
+                   "t=" + std::to_string(k.t));
+    }
+
+    // B8 默认手柄的 bezier ≈ ease-in-out：u=0.25 处 x=1.5625（与 smooth 同值）。
+    // 这一条同时说明"bezier 不是随便画一条线"—— 它落点对了。
+    {
+        SequenceAsset s = parse(R"({"camera":[
+            {"t":0,"pos":[0,0,3],"ease":"bezier"},
+            {"t":2,"pos":[10,0,3]}
+        ]})");
+        SeqCameraKey k;
+        sampleCamera(s, 0.5f, k);   // u = 0.25
+        report("seq_bezier_default_quarter_x", k.position.x, 1.5625, 1e-3);
+    }
+
+    // B9 手柄真的改曲线：把手柄拉平（y=0 → 起步更慢）之后，同一时刻的值
+    // 必须**更小**。否定测试的写法：只断"变了"是不够的，还要断方向对。
+    {
+        SequenceAsset fast = parse(R"({"camera":[
+            {"t":0,"pos":[0,0,3],"ease":"bezier",
+             "outHandle":[0.02,0.9],"inHandle":[-0.6,0.0]},
+            {"t":2,"pos":[10,0,3]}
+        ]})");
+        SequenceAsset slow = parse(R"({"camera":[
+            {"t":0,"pos":[0,0,3],"ease":"bezier",
+             "outHandle":[0.6,0.0],"inHandle":[-0.02,0.0]},
+            {"t":2,"pos":[10,0,3]}
+        ]})");
+        SeqCameraKey a, b;
+        sampleCamera(fast, 0.5f, a);
+        sampleCamera(slow, 0.5f, b);
+        reportFlag("seq_bezier_handle_changes_shape", a.position.x > b.position.x + 1.0f,
+                   "fast=" + std::to_string(a.position.x) +
+                       ",slow=" + std::to_string(b.position.x));
+    }
+
+    // B10 写反的手柄要**钳回**而不是让整份资产打不开（x 符号约束）。
+    {
+        SequenceAsset s = parse(R"({"camera":[
+            {"t":0,"pos":[0,0,3],"ease":"bezier",
+             "outHandle":[-0.5,0.0],"inHandle":[0.5,0.0]},
+            {"t":2,"pos":[10,0,3]}
+        ]})");
+        reportFlag("seq_bezier_handle_clamped",
+                   s.valid && s.cameraKeys[0].outHandle.x == 0.0f &&
+                       s.cameraKeys[0].inHandle.x == 0.0f,
+                   "out=" + std::to_string(s.cameraKeys.empty()
+                                               ? -1.0f
+                                               : s.cameraKeys[0].outHandle.x));
+    }
+
+    // B11 手柄只在 bezier 上写出；round-trip 之后逐字段相等。
+    {
+        SequenceAsset s = parse(R"({"camera":[
+            {"t":0,"pos":[0,0,3],"ease":"bezier",
+             "outHandle":[0.25,0.75],"inHandle":[-0.4,-0.2]},
+            {"t":2,"pos":[10,0,3],"ease":"smooth"}
+        ]})");
+        const std::string text = toJson(s);
+        SequenceAsset back = parse(text.c_str());
+        const bool handlesOk =
+            back.valid && back.cameraKeys.size() == 2 &&
+            back.cameraKeys[0].outHandle.x == 0.25f &&
+            back.cameraKeys[0].outHandle.y == 0.75f &&
+            back.cameraKeys[0].inHandle.x == -0.4f &&
+            back.cameraKeys[0].inHandle.y == -0.2f;
+        reportFlag("seq_bezier_roundtrip_handles", handlesOk, "ok=1");
+    }
+
+    // ============================================================
     // C. 事件区间
     // ============================================================
 

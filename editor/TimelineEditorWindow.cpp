@@ -566,6 +566,24 @@ bool TimelineEditorWindow::actSetEase(const std::string& name) {
     return true;
 }
 
+bool TimelineEditorWindow::actSetHandle(bool isOut, int axis, float v) {
+    sequence::SeqCameraKey* k = selKey();
+    if (!k) return reject("sethandle", TR("no camera key selected"));
+    glm::vec2& h = isOut ? k->outHandle : k->inHandle;
+    if (axis == 0) {
+        // ⚠ 符号约束（见 `SeqCameraKey` 的 ⚠⚠）：out.x >= 0、in.x <= 0。
+        //   允许拖到反面的话，这段贝塞尔在 x 上不再单调，求根会解出
+        //   两个 u —— 表现是"镜头在某一刻往回调了一下"。
+        h.x = isOut ? std::clamp(v, 0.0f, 1.0f) : std::clamp(v, -1.0f, 0.0f);
+    } else {
+        // y 不限符号：负值就是"先往回退再出发"（预备动作），这才是手柄的意义。
+        h.y = std::clamp(v, -2.0f, 3.0f);
+    }
+    markDirty();
+    revalidate();
+    return true;
+}
+
 bool TimelineEditorWindow::actSetEventKind(const std::string& kind) {
     sequence::SeqEvent* e = selEvent();
     if (!e) return reject("setkind", TR("no event selected"));
@@ -1134,7 +1152,12 @@ void TimelineEditorWindow::drawInspectorRow() {
     syncBuffers();
 
     ImGui::PushID("tled_prop");
-    const float propH = 116.0f;
+    // 高度：bezier 段多两行（说明 + 四个手柄）。用两个固定值而不是自适应，
+    // 是因为这是**属性栏** —— 高度随选择连续跳动比"多两行"更难用。
+    const sequence::SeqCameraKey* selK =
+        (m_track == Track::Camera) ? selKey() : nullptr;
+    const bool bezierRow = selK && selK->ease == sequence::Ease::Bezier;
+    const float propH = bezierRow ? 158.0f : 116.0f;
     ImGui::BeginChild("##tled_propbox", ImVec2(0.0f, propH),
                       ImGuiChildFlags_Borders);
     logRect("TLED-PROP", ImGui::GetWindowPos(),
@@ -1186,14 +1209,17 @@ void TimelineEditorWindow::drawInspectorRow() {
             }
 
             // ---- ease：这一段"怎么走" ----
-            // ⚠ 选项文字用 `easeName()` 的返回值而不是字面量：那三个词是
+            // ⚠ 选项文字用 `easeName()` 的返回值而不是字面量：那四个词是
             //   格式**关键字**（写进 JSON 的 `ease` 字段），翻了就对不上资产。
             ImGui::SameLine();
             ImGui::SetNextItemWidth(120.0f);
             if (ImGui::BeginCombo(TR("ease"), sequence::easeName(k->ease))) {
-                const sequence::Ease all[3] = {sequence::Ease::Linear,
+                // 2026-10-28（R5）：多了 bezier。顺序 = 从"最机械"到"最可调"，
+                // 和前三个的历史顺序一致（linear / smooth / step 不动）。
+                const sequence::Ease all[4] = {sequence::Ease::Linear,
                                                sequence::Ease::Smooth,
-                                               sequence::Ease::Step};
+                                               sequence::Ease::Step,
+                                               sequence::Ease::Bezier};
                 for (sequence::Ease e : all) {
                     const bool sel = (k->ease == e);
                     if (ImGui::Selectable(sequence::easeName(e), sel))
@@ -1203,6 +1229,46 @@ void TimelineEditorWindow::drawInspectorRow() {
                 ImGui::EndCombo();
             }
             logRect("TLED-PROP-EASE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+            // ---- 贝塞尔手柄（只有 bezier 段才画）----
+            // 归一化段内坐标（见 `SeqCameraKey`）：x = 这段时间的百分之几，
+            // y = 进度的百分之几。**四个通道共用同一组手柄**，因为这一段
+            // 只有一个标量时间重映射 w。
+            if (k->ease == sequence::Ease::Bezier) {
+                ImGui::TextDisabled("%s", TR("Bezier handles (normalised: x = 0..1 "
+                                             "of this segment, y = 0..1 of the value change)"));
+                auto handleDrag = [&](const char* label, bool isOut, int axis,
+                                      float speed, float lo, float hi) {
+                    float v = axis == 0 ? (isOut ? k->outHandle.x : k->inHandle.x)
+                                        : (isOut ? k->outHandle.y : k->inHandle.y);
+                    ImGui::SetNextItemWidth(96.0f);
+                    if (ImGui::DragFloat(label, &v, speed, lo, hi, "%.3f"))
+                        actSetHandle(isOut, axis, v);
+                    // 日志打在"松手"那一侧：拖一下会触发几十次 DragFloat，
+                    // 每次都打的话 `TLED-` 日志会被自己刷满。
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        sequence::SeqCameraKey* kk = selKey();
+                        if (kk) {
+                            VK_LOG_INFO(
+                                "TLED-BEZIER t=%.3f out=%.3f,%.3f in=%.3f,%.3f",
+                                static_cast<double>(kk->t),
+                                static_cast<double>(kk->outHandle.x),
+                                static_cast<double>(kk->outHandle.y),
+                                static_cast<double>(kk->inHandle.x),
+                                static_cast<double>(kk->inHandle.y));
+                        }
+                    }
+                };
+                handleDrag(TR("out x"), true, 0, 0.005f, 0.0f, 1.0f);
+                ImGui::SameLine();
+                handleDrag(TR("out y"), true, 1, 0.01f, -2.0f, 3.0f);
+                ImGui::SameLine();
+                handleDrag(TR("in x"), false, 0, 0.005f, -1.0f, 0.0f);
+                ImGui::SameLine();
+                handleDrag(TR("in y"), false, 1, 0.01f, -2.0f, 3.0f);
+                logRect("TLED-PROP-BEZIER", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+            }
 
             ImGui::TextDisabled(
                 TR("%d / %d  |  rad yaw=%.4f pitch=%.4f  |  ease applies to the "
@@ -1381,6 +1447,26 @@ void TimelineEditorWindow::runInjectedScript() {
         else if (name == "setpitch") ok = actSetPitchDeg(static_cast<float>(std::atof(arg.c_str())));
         else if (name == "setfov") ok = actSetFov(static_cast<float>(std::atof(arg.c_str())));
         else if (name == "setease") ok = actSetEase(arg);
+        else if (name == "sethandle") {
+            // `sethandle:<out|in>:<x|y>:<值>` —— 归一手柄的单位见
+            // `SeqCameraKey`（x 是段内时间比例，y 是进度比例）。
+            char side[8] = {0}, axisName[8] = {0};
+            float v = 0.0f;
+            if (std::sscanf(arg.c_str(), "%7[^:]:%7[^:]:%f", side, axisName, &v) == 3) {
+                const bool isOut = std::string(side) == "out";
+                const int axis = std::string(axisName) == "x" ? 0 : 1;
+                ok = actSetHandle(isOut, axis, v);
+                sequence::SeqCameraKey* kk = selKey();
+                if (kk) {
+                    VK_LOG_INFO("TLED-BEZIER t=%.3f out=%.3f,%.3f in=%.3f,%.3f",
+                                static_cast<double>(kk->t),
+                                static_cast<double>(kk->outHandle.x),
+                                static_cast<double>(kk->outHandle.y),
+                                static_cast<double>(kk->inHandle.x),
+                                static_cast<double>(kk->inHandle.y));
+                }
+            }
+        }
         else if (name == "setkind") ok = actSetEventKind(arg);
         else if (name == "setpayload") ok = actSetEventPayload(arg);
         else if (name == "setdur") ok = actSetDuration(static_cast<float>(std::atof(arg.c_str())));

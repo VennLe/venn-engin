@@ -6,6 +6,8 @@
 
 #include "animation/AnimatorSystem.h"
 #include "animation/AnimEvent.h"
+#include "animation/ClipEdit.h"
+#include "animation/Curve.h"
 #include "animation/RootMotion.h"
 #include "animation/BoneAttachment.h"
 #include "animation/Pose.h"
@@ -23,6 +25,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -2489,6 +2492,327 @@ int runAnimationSelfTest() {
         for (int i = 0; i < 5; ++i) sys.tick(f.scene, 0.0f);
         reportFlag("rm_editor_scrub_no_move", xf(f).position.x == 0.0f,
                    "x=" + std::to_string(xf(f).position.x));
+    }
+
+    // ============================================================
+    // R5（2026-10-28）：F-Curve 核心
+    //
+    // 这些断言有一个共同点：**每一条换一种实现都会给出不同的数**。
+    // 特别是 `curve_bezier_default_is_smoothstep` —— 默认手柄 (1/3,0)/(
+    // -1/3,0) 在 x 上恰好是均匀参数化，于是 y(u) = 3u²−2u³ 就是
+    // smoothstep 本尊；这条同时钉住了"贝塞尔求根没算错"和"默认手感
+    // 与老 smooth 一致"两件事。
+    // ============================================================
+    {
+        auto mk = [](float t0, float v0, float t1, float v1) {
+            Curve c;
+            CurveKey a;
+            a.time = t0; a.value = v0; a.interp = Interp::Linear;
+            CurveKey b;
+            b.time = t1; b.value = v1;
+            c.keys = {a, b};
+            return c;
+        };
+
+        // ---- 空 / 单帧 ----
+        {
+            Curve c;
+            report("curve_empty", evaluateCurve(c, 3.0f), 0.0, 1e-9);
+            Curve one;
+            one.keys.push_back(CurveKey{});
+            one.keys[0].time = 2.0f;
+            one.keys[0].value = 7.5f;
+            report("curve_single_key", evaluateCurve(one, 99.0f), 7.5, 1e-9);
+        }
+
+        // ---- Constant / Linear ----
+        {
+            Curve c = mk(0.0f, 0.0f, 1.0f, 10.0f);
+            report("curve_linear_mid", evaluateCurve(c, 0.5f), 5.0, 1e-6);
+            c.keys[0].interp = Interp::Constant;
+            // 0.99 仍在第一段里 → 必须还是 0（"保持"，不是"快到终点了"）
+            report("curve_constant_hold", evaluateCurve(c, 0.99f), 0.0, 1e-9);
+            report("curve_constant_at_end", evaluateCurve(c, 1.0f), 10.0, 1e-9);
+        }
+
+        // ---- 贝塞尔 ----
+        {
+            Curve c = mk(0.0f, 0.0f, 1.0f, 1.0f);
+            c.keys[0].interp = Interp::Bezier;
+            // ⚠⚠ 必须显式声明 Free：`CurveKey` 的默认手柄类型是
+            //    `AutoClamped`，那种手柄**会盖掉**你写进 `outHandle` 的值
+            //    （由邻居斜率现算）。2 帧 0→1 的自动斜率是 1，算出来的
+            //    手柄 (1/3, 1/3) 让这段退化成直线 —— 第一版就在这里红过一次，
+            //    而那恰恰是对的：Blender 里 Auto 手柄也不认你拖的值。
+            c.keys[0].handle = HandleType::Free;
+            c.keys[1].handle = HandleType::Free;
+            c.keys[0].outHandle = glm::vec2(1.0f / 3.0f, 0.0f);
+            c.keys[1].inHandle = glm::vec2(-1.0f / 3.0f, 0.0f);
+            // 显式手柄 (1/3,0)/(-1/3,0) 在 x 上恰好是均匀参数化，
+            // 于是 y(u) = 3u²−2u³ = smoothstep 本尊。这条同时钉住了
+            // "贝塞尔求根没算错"和"默认手感与老 smooth 一致"。
+            report("curve_bezier_free_is_smoothstep",
+                   evaluateCurve(c, 0.25f), 0.15625, 1e-6);
+            report("curve_bezier_mid", evaluateCurve(c, 0.5f), 0.5, 1e-6);
+
+            // 对照：同一组数值换成 AutoClamped → 退化成直线（0.25）。
+            // 这两条**必须分得开**，否则"手柄类型到底有没有生效"就测不出来。
+            c.keys[0].handle = HandleType::AutoClamped;
+            c.keys[1].handle = HandleType::AutoClamped;
+            report("curve_bezier_auto_is_line", evaluateCurve(c, 0.25f), 0.25, 1e-6);
+
+            // 手柄拉到对角 → 退化成直线
+            report("curve_bezier_straight_handles",
+                   bezierWeight(0.3f, glm::vec2(0.5f, 0.5f),
+                                glm::vec2(-0.5f, -0.5f)),
+                   0.3, 1e-6);
+
+            // x 单调性：默认手柄下扫 64 个采样点，值不许回头
+            bool monotonic = true;
+            float prev = -1.0f;
+            for (int i = 0; i <= 64; ++i) {
+                const float v = evaluateCurve(c, static_cast<float>(i) / 64.0f);
+                if (v < prev - 1e-6f) monotonic = false;
+                prev = v;
+            }
+            reportFlag("curve_bezier_monotonic", monotonic, "no_reversal");
+        }
+
+        // ---- 外推 ----
+        {
+            Curve c = mk(0.0f, 0.0f, 1.0f, 1.0f);
+            report("curve_extrap_hold_after", evaluateCurve(c, 5.0f), 1.0, 1e-9);
+            c.after = Extrapolate::Linear;
+            report("curve_extrap_linear", evaluateCurve(c, 1.5f), 1.5, 1e-6);
+            c.after = Extrapolate::Cycle;
+            report("curve_extrap_cycle", evaluateCurve(c, 1.25f), 0.25, 1e-6);
+            c.after = Extrapolate::CycleOffset;
+            report("curve_extrap_cycle_offset", evaluateCurve(c, 1.25f), 1.25, 1e-6);
+            c.after = Extrapolate::CycleFlipped;
+            // 奇数圈绕两端中点 (0.5) 镜像：0.5 - (0.25 - 0.5) = 0.75
+            report("curve_extrap_cycle_flipped", evaluateCurve(c, 1.25f), 0.75, 1e-6);
+        }
+
+        // ---- 缓动 ----
+        {
+            report("ease_smooth_inout", easeFn(EaseShape::Smooth, EaseMode::InOut,
+                                               0.25f),
+                   0.15625, 1e-6);
+            report("ease_quad_in", easeFn(EaseShape::Quad, EaseMode::In, 0.5f), 0.25,
+                   1e-6);
+            report("ease_quad_out", easeFn(EaseShape::Quad, EaseMode::Out, 0.5f),
+                   0.75, 1e-6);
+            report("ease_bounce_out_end",
+                   easeFn(EaseShape::Bounce, EaseMode::Out, 1.0f), 1.0, 1e-9);
+            // Back 的意义就是**过冲**：Out 在接近终点时会越过 1
+            reportFlag("ease_back_overshoot",
+                       easeFn(EaseShape::Back, EaseMode::Out, 0.9f) > 1.0f,
+                       "v=" + std::to_string(easeFn(EaseShape::Back,
+                                                    EaseMode::Out, 0.9f)));
+            // None 必须是**逐位恒等**（所有"没配缓动"的段都靠它）
+            reportFlag("ease_none_identity",
+                       easeFn(EaseShape::Cubic, EaseMode::None, 0.37f) == 0.37f,
+                       "bitwise_equal");
+        }
+
+        // ---- 自动手柄 ----
+        {
+            Curve c;
+            CurveKey a; a.time = 0.0f; a.value = 0.0f; a.handle = HandleType::AutoClamped;
+            CurveKey b; b.time = 1.0f; b.value = 10.0f; b.handle = HandleType::AutoClamped;
+            // ⚠ 第三个值取 5 而不是 0：**对称的峰连"Auto"的中心差分也是 0**，
+            //   那样这条断言就分不出 Auto 和 AutoClamped 了（第一版就栽在这）。
+            CurveKey d; d.time = 2.0f; d.value = 5.0f; d.handle = HandleType::AutoClamped;
+            c.keys = {a, b, d};
+            // 中间那个是局部极值（先上后下）→ AutoClamped 必须压平
+            report("handle_autoclamped_extremum_flat",
+                   resolveOutHandle(c, 1).y, 0.0, 1e-9);
+            c.keys[1].handle = HandleType::Auto;
+            // Auto 不压平：斜率 = (10 + (−5)) / 2 = 2.5，手柄 y = 2.5/3
+            report("handle_auto_extremum_not_flat",
+                   resolveOutHandle(c, 1).y, 2.5f / 3.0f, 1e-6);
+
+            // Vector 手柄指向下一帧 → 该段是直线
+            Curve line = mk(0.0f, 0.0f, 1.0f, 5.0f);
+            line.keys[0].handle = HandleType::Vector;
+            const glm::vec2 oh = resolveOutHandle(line, 0);
+            reportFlag("handle_vector_points_next",
+                       std::fabs(oh.x - 1.0f) < 1e-6f && std::fabs(oh.y - 5.0f) < 1e-6f,
+                       "h=" + std::to_string(oh.x) + "," + std::to_string(oh.y));
+        }
+
+        // ---- 段定位 ----
+        {
+            Curve c = mk(0.0f, 0.0f, 2.0f, 4.0f);
+            report("segment_index_before", segmentIndexAt(c, -1.0f), -1.0, 0.0);
+            report("segment_index_first", segmentIndexAt(c, 0.5f), 0.0, 0.0);
+            report("segment_index_last", segmentIndexAt(c, 9.0f), 1.0, 0.0);
+        }
+
+        // ---- 两条入口共用同一份段内求值 ----
+        // `sampleCamera` 走的是 `evaluateSegmentEase`（不分配容器），
+        // 图编辑器/骨骼轨道走的是 `evaluateCurve`（容器）。两者必须是
+        // **同一个结果**，否则同一段缓动在两个地方长得不一样。
+        {
+            Curve c = mk(0.0f, 0.0f, 1.0f, 1.0f);
+            c.keys[0].ease = EaseMode::InOut;
+            c.keys[0].shape = EaseShape::Smooth;
+            const float viaCurve = evaluateCurve(c, 0.25f);
+            const float viaSeg =
+                evaluateSegmentEase(Interp::Linear, EaseMode::InOut,
+                                    EaseShape::Smooth, glm::vec2(0.0f),
+                                    glm::vec2(0.0f), 0.25f);
+            reportFlag("curve_two_entries_agree", viaCurve == viaSeg,
+                       "a=" + std::to_string(viaCurve) +
+                           ",b=" + std::to_string(viaSeg));
+        }
+    }
+
+    // ============================================================
+    // Dope Sheet 批量操作（R8）
+    // ============================================================
+    //
+    // 这一组只测**纯数据**：挪 / 镜像 / 对齐循环的几何性质，外加"类型
+    // 不影响求值"。像素↔时间、命中判定、缩放锚点那些属 UI，由
+    // `tools/verify_dope_sheet.py` 验。
+    //
+    // ⚠ 为什么有些断言用 == 而有些只能用容差：float 加一个常数**不保
+    //   "间距不变"** —— `(a+d) − (b+d)` 与 `a − b` 在换指数时舍入不同。
+    //   所以这里挑的是二进制精确的数（0.125 的整数倍 + 0.25 的位移），
+    //   让"间距逐位不变"成为可断言的事实；真实资产的 1/30 秒时刻由
+    //   Python 侧按 1e-6 容差验。
+    {
+        // ---- 挪：10 帧整体 +0.25s ----
+        EditClip c;
+        c.duration = 1.2f;
+        std::vector<float> before;
+        for (int i = 0; i < 10; ++i) {
+            const float t = 0.125f * static_cast<float>(i);
+            before.push_back(t);
+            c.setKey("hips", assets::AnimTrack::Rotation, t,
+                     glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+        }
+        reportFlag("dope_setup_keys", c.totalKeys() == 10,
+                   "keys=" + std::to_string(c.totalKeys()));
+
+        std::vector<KeyRef> sel = allKeys(c);
+        const BatchStats mv = moveKeys(c, sel, 0.25f);
+        reportFlag("dope_move_count",
+                   mv.moved == 10 && mv.merged == 0 && mv.dropped == 0,
+                   "moved=" + std::to_string(mv.moved) +
+                       ",merged=" + std::to_string(mv.merged));
+
+        int shifted = 0;
+        for (std::size_t i = 0; i < before.size(); ++i) {
+            if (c.tracks[0].times[i] == before[i] + 0.25f) ++shifted;
+        }
+        reportFlag("dope_move_shift_bitwise", shifted == 10,
+                   "exact=" + std::to_string(shifted));
+
+        int spacing = 0;
+        for (std::size_t i = 1; i < before.size(); ++i) {
+            if ((c.tracks[0].times[i] - c.tracks[0].times[i - 1]) ==
+                (before[i] - before[i - 1]))
+                ++spacing;
+        }
+        reportFlag("dope_move_spacing_bitwise", spacing == 9,
+                   "pairs=" + std::to_string(spacing));
+
+        // 选中集必须被改写成**新下标** —— 否则"松手之后还选着那 10 帧"
+        // 就是假的，下一次 G 会挪到别的帧上。
+        const bool selOk =
+            sel.size() == 10 && sel[3].key >= 0 &&
+            sel[3].key < c.tracks[0].keyCount() &&
+            c.tracks[0].times[static_cast<std::size_t>(sel[3].key)] ==
+                before[3] + 0.25f;
+        reportFlag("dope_move_sel_refresh", selOk,
+                   "n=" + std::to_string(sel.size()));
+
+        // ---- 镜像：绕 1.0s ----
+        EditClip m;
+        for (int i = 0; i < 5; ++i)
+            m.setKey("hips", assets::AnimTrack::Rotation, 0.5f * i,
+                     glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+        std::vector<float> mb(m.tracks[0].times.begin(), m.tracks[0].times.end());
+        std::vector<KeyRef> ms = allKeys(m);
+        mirrorKeys(m, ms, 1.0f);
+        int sym = 0;
+        for (std::size_t i = 0; i < mb.size(); ++i) {
+            const float want =
+                static_cast<float>(2.0 * 1.0 - static_cast<double>(
+                                                     mb[mb.size() - 1 - i]));
+            if (m.tracks[0].times[i] == want) ++sym;
+        }
+        reportFlag("dope_mirror_symmetric", sym == 5,
+                   "match=" + std::to_string(sym));
+
+        // ---- 对齐循环：0/0.25/0.5/0.75 → 末帧 1.5 ----
+        EditClip a;
+        for (int i = 0; i < 4; ++i)
+            a.setKey("hips", assets::AnimTrack::Rotation, 0.25f * i,
+                     glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+        std::vector<KeyRef> as = allKeys(a);
+        alignCycle(a, as, 1.5f);
+        reportFlag("dope_align_last_exact", a.tracks[0].times.back() == 1.5f,
+                   "last=" + std::to_string(a.tracks[0].times.back()));
+        report("dope_align_first_kept", a.tracks[0].times.front(), 0.0, 0.0);
+        report("dope_align_mid", a.tracks[0].times[1], 0.5, 1e-7);
+
+        // ---- 类型：不影响求值 + 能存能读 ----
+        EditClip ty;
+        ty.setKey("hips", assets::AnimTrack::Rotation, 0.0f,
+                  glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+        ty.setKey("hips", assets::AnimTrack::Rotation, 0.5f,
+                  glm::vec4(0.0f, 0.3826834f, 0.0f, 0.9238795f));
+        ty.setKey("hips", assets::AnimTrack::Rotation, 1.0f,
+                  glm::vec4(0.0f, 0.7071068f, 0.0f, 0.7071068f));
+        assets::AnimTrack probe;
+        probe.joint = 0;
+        probe.path = assets::AnimTrack::Rotation;
+        probe.times = ty.tracks[0].times;
+        probe.values = ty.tracks[0].values;
+        const float kProbeT[4] = {0.1f, 0.3f, 0.55f, 0.9f};
+        glm::vec4 snap0[4];
+        for (int i = 0; i < 4; ++i) snap0[i] = assets::sampleTrack(probe, kProbeT[i]);
+        std::vector<KeyRef> ts = allKeys(ty);
+        setKeyTypes(ty, ts, KeyType::Extreme);
+        int sameSample = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (assets::sampleTrack(probe, kProbeT[i]) == snap0[i]) ++sameSample;
+        }
+        reportFlag("dope_types_do_not_change_sampling", sameSample == 4,
+                   "same=" + std::to_string(sameSample));
+        // 三次打帧之后再单独标一个：只有那一个变
+        ty.tracks[0].setTypeAt(1, KeyType::Breakdown);
+        reportFlag("dope_types_independent",
+                   ty.tracks[0].typeAt(0) == KeyType::Extreme &&
+                       ty.tracks[0].typeAt(1) == KeyType::Breakdown &&
+                       ty.tracks[0].typeAt(2) == KeyType::Extreme,
+                   "t0=" + std::to_string(static_cast<int>(ty.tracks[0].typeAt(0))) +
+                       ",t1=" + std::to_string(static_cast<int>(ty.tracks[0].typeAt(1))));
+
+        // 落盘往返（types 是**可选字段**，最容易被 save 漏掉）
+        {
+            std::string err;
+            const std::string path =
+                (std::filesystem::temp_directory_path() /
+                 "venn_dope_selftest.anim.json").string();
+            EditClip back;
+            const bool saved = saveEditClip(path, ty, err);
+            const bool loaded = saved && loadEditClip(path, back, err);
+            const bool same =
+                loaded && back.tracks.size() == ty.tracks.size() &&
+                back.tracks[0].keyCount() == 3 &&
+                back.tracks[0].typeAt(0) == KeyType::Extreme &&
+                back.tracks[0].typeAt(1) == KeyType::Breakdown &&
+                back.tracks[0].times == ty.tracks[0].times &&
+                back.tracks[0].values == ty.tracks[0].values;
+            reportFlag("dope_types_json_roundtrip", same,
+                       "saved=" + std::to_string(saved ? 1 : 0) +
+                           ",loaded=" + std::to_string(loaded ? 1 : 0));
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
     }
 
     const int failures = g_fail;

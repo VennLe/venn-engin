@@ -33,6 +33,9 @@
 
 #include "EditorContext.h"
 
+#include "animation/ClipEdit.h"
+#include "animation/Pose.h"
+
 #include "scene/Scene.h"
 
 #include "ecs/Entity.h"
@@ -56,6 +59,8 @@ class Renderer;
 
 namespace editor {
 
+class DopeSheetWindow;
+
 class CharacterWindow {
 public:
     CharacterWindow(EditorContext& ctx, render::Renderer& renderer);
@@ -68,6 +73,15 @@ public:
 
     bool isOpen() const { return m_open; }
     void close();
+
+    // 2026-10-28（R8）：把摄影表接到本窗口上。
+    //
+    // 为什么是"本窗口持有指针、每帧推数据"而不是摄影表自己去读文件：
+    // Pose Mode 里刚打的帧还没存盘，摄影表要调的就是**内存里那份**
+    // （"打完帧顺手调节奏"必须是无缝的）。反过来如果让摄影表自己读盘，
+    // 作者得先存一次再切窗口，而存盘会覆盖磁盘上的版本 —— 中间任何一步
+    // 出错都是不可逆的。
+    void attachDopeSheet(DopeSheetWindow* d) { m_dope = d; }
 
 private:
     // ---- 预览场景 ----
@@ -182,6 +196,105 @@ private:
 
     // 选中骨骼在**当前姿势**下的世界位置（预览场景的模型空间）
     bool jointWorldPosition(int joint, glm::vec3& out) const;
+    // 同上但给完整世界矩阵（gizmo 需要"骨在哪、朝向哪"两样）
+    bool jointWorldMatrix(int joint, glm::mat4& out) const;
+
+    // ------------------------------------------------------------
+    // Pose Mode（R7，2026-10-28）
+    // ------------------------------------------------------------
+    //
+    // 和 Animation 页的区别：Animation 页是"播导入的片段"，Pose Mode 是
+    // "自己摆姿势并打帧"。数据进 `animation::EditClip`（engine/animation/
+    // 下自建结构），**不碰 assets::Skeleton** —— 后者是导入产物，且
+    // engine/assets/** 在 GLOBAL_GLOBS 里，动它就是全量回归。
+
+    // 采样链：samplePose →（Pose Mode 时）overlayEditPose → poseToJoints。
+    // 结果写 m_pose / m_jointMats（+ Pose Mode 时多算一份 m_worldMats）。
+    void samplePoseInto();
+    // 骨架或编辑数据变过 → 重新把骨名解析成 joint 下标
+    void revalidateEdit();
+
+    void drawPosePanel();       // 左栏第 4 页：关键帧列表 + 姿态库 + 存读
+    void drawPoseDetails();     // 右栏 Details 的 POSE 段：选中骨的 TRS + 打帧
+    void drawBoneGizmo(const ImVec2& imgMin, const ImVec2& imgSz,
+                       const glm::mat4& viewProj);
+    // 返回 true = 这一下被 gizmo 吃掉了，调用方不要再做点选
+    bool handleBoneGizmoInput(const ImVec2& imgMin, const ImVec2& imgSz,
+                              const glm::mat4& viewProj);
+    void handlePoseKeys();
+
+    // 给选中骨打一帧（rot/loc/scale 三个通道分别可选）
+    void keySelectedBone(bool rot, bool loc, bool scale);
+    // 把某根骨的当前局部 TRS 写成关键帧（keySelectedBone 的实现体）
+    int  keyJoint(const std::string& jointName,
+                  const animation::Pose& pose, int joint, float time,
+                  bool rot, bool loc, bool scale);
+
+    // 把当前 m_jointMats 的原始字节压成一个 FNV-1a 摘要打进日志。
+    // 验收脚本靠它做"存盘前后 / 两个进程之间逐位一致"的比对 ——
+    // 63 根骨的矩阵逐个数出来是 4KB 日志，摘要是一行。
+    void logPoseDigest(const char* tag);
+
+    bool saveEdit(const std::string& path);
+    bool loadEdit(const std::string& path);
+
+    // 验收脚本注入（与 MYVK_EDITOR_CURVED_SCRIPT 同一个套路）：
+    // 走**和 UI 完全同一条**数据通路，不是另一套实现。
+    void runPoseScript();
+
+    // gizmo 拖拽状态
+    int m_boneDragAxis = -1;             // 0/1/2 = X/Y/Z；-1 = 空闲
+    glm::vec2 m_boneDragStart{0.0f, 0.0f};
+    glm::vec2 m_boneDragTangent{0.0f, 0.0f};
+    float m_boneDragAccum = 0.0f;        // 累计角度（弧度）
+    float m_boneDragApplied = 0.0f;      // 已经写进 pose 的角度
+    glm::quat m_boneDragOrig{1.0f, 0.0f, 0.0f, 0.0f};
+    glm::quat m_boneDragParentWorld{1.0f, 0.0f, 0.0f, 0.0f};
+    int m_gizmoHoverAxis = -1;           // 鼠标压着哪个环（画的时候高亮）
+    bool m_gizmoConsumed = false;        // 这一帧的左键被 gizmo 吃掉了吗
+    bool m_showBoneGizmo = true;         // 骨骼旋转环的显示开关
+    // 下一帧是否把左栏切到 Pose 页。开 Pose Mode 时置上 —— 用户按了
+    // "Pose Mode"，左栏还停在 Skeleton 页是很怪的（那一页跟摆姿势无关）。
+    bool m_focusPoseTab = false;
+
+    // 瞬态姿态：摆出来但**还没打帧**的那几根骨。
+    // 见 .cpp 里 Pose Mode 段头注释的"为什么要 ①"。
+    std::vector<char> m_touched;
+    std::vector<glm::vec3> m_touchedT;
+    std::vector<glm::quat> m_touchedR;
+    std::vector<glm::vec3> m_touchedS;
+    void clearTransient();
+    // 保证三个瞬态数组长度 == n（骨架/模型换过之后要对齐）
+    void ensureTransient(int n);
+    // 第一次碰第 j 根骨：先把**三个通道的当前值**都抄一份再交给调用方改。
+    //
+    // ⚠ 少了这一步就会出这个 bug（冒烟时实测到的）：`setrot` 只改旋转，
+    //   但"已触碰"是**按骨**记的、不是按通道记的 —— 于是平移/缩放被
+    //   初始值（0 / 1）顶掉，角色的右臂在 t=1.0 时整根缩到原点。
+    //   抄当前值之后，"没改的那两个通道"就等于它本来该有的样子。
+    void touchBone(int j);
+
+    bool m_poseMode = false;
+    animation::EditClip m_edit;
+    // 摄影表的绑定（R8）。为空 = 编辑器没建它（只在测试/裁剪构建里）。
+    DopeSheetWindow* m_dope = nullptr;
+    // 摄影表标题里显示的"哪份片段"（bind 时算一次，指针要活到 bind 之后）
+    std::string m_dopeLabel;
+    // 把 m_edit / 骨架 / 播放头 / 脏标记推给摄影表；退出 Pose Mode 时解绑。
+    // 每帧调用（在 draw 里），bind() 自己会去重，不会刷日志。
+    void syncDopeSheet();
+    // 名字→下标解析结果（只在 m_editDirty 时重算）
+    std::vector<assets::AnimTrack> m_editResolved;
+    animation::ResolveStats m_editStats;
+    bool m_editDirty = true;
+    std::string m_editPath;
+    char m_editPathBuf[512] = {0};
+    char m_poseNameBuf[64] = {0};
+    // 三段式的中间结果。Details 的 TRS 编辑器与 gizmo 都读它。
+    animation::Pose m_pose;
+    // 每骨世界矩阵（**只在 Pose Mode 下算**：多一次 FK，非 Pose Mode 不花）
+    std::vector<glm::mat4> m_worldMats;
+    bool m_scriptRan = false;
 
     EditorContext& m_ctx;
     render::Renderer& m_renderer;

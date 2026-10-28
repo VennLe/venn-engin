@@ -155,7 +155,13 @@ submit -4；**只读第一条**。`syncTerrains/syncWaters` **只对主场景**�
 
 ## 路线图（剩什么 → `docs/remaining_work_2026-10-27.md`；权威 → `docs/*_roadmap.md`）
 - 做完的：R0~R4·R5-1·R6-1·W0~W4·S0~S6·A1~A6·B1~B3·C1/C2·C6（除 `openUI`）·Prefab·多选·UI 编辑器·
-  **G16~G17-2 · 二次元 UI 主题 · P2 菜单接线 · J5 关节 · 植被第二轮 · G29/G30 出包**（判据 → 归档十三~十七）。
+  **G16~G17-2 · 二次元 UI 主题 · P2 菜单接线 · J5 关节 · 植被第二轮 · G29/G30 出包 · R7 骨骼打帧+Pose Mode**
+  （判据 → 归档十三~十七）。
+- **R7 ✅**（10-28）：`engine/animation/ClipEdit.{h,cpp}` = 可写回的 `EditClip`（`.animclip.json`），
+  `Skeleton` 仍只读 → **没动 `engine/assets/**`、不用跑全量**。采样三段式（基础片段→编辑层→瞬态层），
+  无编辑数据时逐位一致。⚠ **循环里 `PushID` 绝不能用名字**：`anime_girl.fbx` 归一化后是
+  `[Idle,Walk,Idle,Walk]`，同帧同 ID → ImGui 弹**模态**告警窗，之后所有点击全被吞（界面看着正常、
+  只是点不动）；一律用下标。⚠ `OK_RE/BAD_RE` 现认 `结果: N 通过 / M 失败`（此前这种收尾一律误判 FAIL）。
 - **植被第二轮 ✅**（10-28）：类型可绑自有模型 + 可设偏移/旋转/缩放区间，三路共用 `samplePlacement`
   （→ `foliage_mesh_2026-10-28.md` / `verify_foliage_mesh`）。**J5** ⚠⚠ `NOTIF-PUSH` 镜像每条 WARN →
   日志断言必须筛；`INS-JOINT-HEADER` 无条件画 → 看 `-KIND`（→ `verify_joints` A~H）。

@@ -30,6 +30,10 @@
 #include "rhi/Device.h"
 #include "rhi/CommandPool.h"
 
+// clip 名字归一化 + 重名去重：与 AssetC（`assetio/FbxImport.cpp`）**共用**
+// 同一份实现。两份拷贝各自为政正是这个 bug 的来源（见 ClipDedup.h 头注释）。
+#include "assetio/ClipDedup.h"
+
 #include "core/Logger.h"
 
 #include <chrono>
@@ -37,6 +41,8 @@
 #include <functional>
 #include <map>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <glm/gtx/matrix_decompose.hpp>
 
@@ -454,6 +460,9 @@ void extractAnimations(const ufbx_scene& scene, const ufbx_skin_deformer& skin,
                        Skeleton& sk) {
     const float kFps = 30.0f;
 
+    // 已收下 clip 的 (名字, 时长)，供重名去重判据用（见 assetio/ClipDedup.h）
+    std::vector<std::pair<std::string, float>> keptClips;
+
     // joint 下标 → bone node 指针
     const int nJoints = sk.jointCount();
     std::vector<const ufbx_node*> boneNode(nJoints, nullptr);
@@ -485,16 +494,34 @@ void extractAnimations(const ufbx_scene& scene, const ufbx_skin_deformer& skin,
         // 角色会**静默退回 rest 姿势**（画面是 T-pose，日志全绿）。
         // ⚠ 归一化只发生在**读资产**这一步；`findClip` 的逐字语义不变。
         //   只剥第一个 `|` 之前的部分，且 `|` 后面必须有内容才剥（`"A|"` 保留）。
-        {
-            const std::size_t bar = clip.name.find('|');
-            if (bar != std::string::npos && bar + 1 < clip.name.size())
-                clip.name = clip.name.substr(bar + 1);
-        }
+        const std::string takeName = clip.name;
+        clip.name = assetio::clipNameFromTake(clip.name);
         const double t0 = stack.time_begin;
         const double t1 = stack.time_end;
         const double dur = (t1 > t0) ? (t1 - t0) : 0.0;
         clip.duration = (float)dur;
         if (dur <= 0.0) continue;
+
+        // 重名去重（2026-10-28，#329）。和 `assetio/FbxImport.cpp` 同一套
+        // 规则、同一份实现（`assetio/ClipDedup.h`）—— 这两个提取器是同一段
+        // 逻辑的两份拷贝，重名去重两边都得有，否则"AssetC 烤出来的干净、
+        // 运行时直读 .fbx 还是脏的"。放在逐帧采样之前，丢掉的段不必再算。
+        {
+            const assetio::ClipNamePlan plan =
+                assetio::planClipName(keptClips, clip.name, clip.duration);
+            if (!plan.keep || plan.renamed) {
+                assetio::ClipDedupEvent ev;
+                ev.take = takeName;
+                ev.name = clip.name;
+                ev.duration = clip.duration;
+                ev.dropped = !plan.keep;
+                ev.finalName = plan.keep ? plan.name : std::string();
+                VK_LOG_INFO("%s", assetio::clipDedupLine(ev).c_str());
+            }
+            if (!plan.keep) continue;
+            clip.name = plan.name;
+            keptClips.emplace_back(clip.name, clip.duration);
+        }
 
         const int frames = (int)std::ceil(dur * kFps) + 1;
 
@@ -747,6 +774,20 @@ std::unique_ptr<Model> loadFBXModel(rhi::Device& device,
     if (skeleton) {
         model->skeleton = skeleton;
         if (skinForAnim) extractAnimations(*scene, *skinForAnim, *skeleton);
+        // 收尾一行"到底拿到了哪几段"（2026-10-28，#329）。
+        // 为什么要专门打：`FBX-CLIPDUP` 只证明"去重跑过了"，**不能**证明
+        // 结果对 —— 全丢光也是 2 条 drop。这一行是正面判据：段数 + 名字序列，
+        // 重名会直接看成一个名字出现两次（`Idle,Walk,Idle,Walk`）。
+        // 另外它是"运行时直读 .fbx"这条路上唯一的 clip 清单来源：
+        // `FBX loaded:` 那行只报 joints/耗时，不报 clip。
+        {
+            std::string names;
+            for (const auto& c : skeleton->clips)
+                names += (names.empty() ? "" : ",") + c.name;
+            VK_LOG_INFO("FBX clips count=%d names=[%s]",
+                        static_cast<int>(skeleton->clips.size()),
+                        names.c_str());
+        }
     }
 
     // ---------------- 模型归位（import pivot normalization）----------------

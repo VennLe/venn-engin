@@ -1,9 +1,9 @@
 #pragma once
 // ============================================================
-// editor/ToolkitEditors —— 编辑模式下拉里其余 6 个模式的实现
+// editor/ToolkitEditors —— 编辑模式下拉里中间那 6 个模式的实现
 //
-// 顶栏那颗下拉（UE5 的 Selection Mode）列了 9 个模式。Select / Landscape /
-// Foliage 各有自己的文件；本文件放剩下的 6 个：
+// 顶栏那颗下拉（UE5 的 Selection Mode）列了 10 个模式。Select / Landscape /
+// Foliage / Water 各有自己的文件；本文件放剩下的 6 个：
 //
 //   MeshPaint   网格体绘制   —— 往顶点色上刷（UE 的 Vertex Color 通道）
 //   Modeling    建模         —— 对选中网格做几何操作（细分/平滑/挤出/镜像…）

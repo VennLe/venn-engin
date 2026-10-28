@@ -146,6 +146,12 @@ class TimelineEditorWindow {
     bool actSetPitchDeg(float deg);
     bool actSetFov(float fov);
     bool actSetEase(const std::string& name);
+    // 贝塞尔手柄（2026-10-28 / R5）。`axis`：0 = x（时间比例，out ∈ [0,1]，
+    // in ∈ [-1,0]）、1 = y（进度比例，可负 → 允许过冲）。
+    // 与 `actSetEase` 分开，是因为它每拖一帧都会调用一次 —— 日志在
+    // `IsItemDeactivatedAfterEdit` 那一侧打，不在这个函数里打，否则拖
+    // 一下能刷出六十行。
+    bool actSetHandle(bool isOut, int axis, float v);
     bool actSetEventKind(const std::string& kind);
     bool actSetEventPayload(const std::string& payload);
     bool actSetDuration(float d);

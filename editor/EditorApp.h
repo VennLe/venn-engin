@@ -91,6 +91,8 @@ class MaterialLibraryPanel;   // 2026-10-24：材质仓库
 class DialogueEditorWindow;   // 2026-10-27：剧本编辑器（#310）
 class TimelineEditorWindow;   // 2026-10-27：时间轴轨道编辑器（#311）
 class UiEditorWindow;         // 2026-10-27：UI 编辑器（#312）
+class CurveEditorPanel;       // 2026-10-28（R6）：曲线编辑器（Graph Editor）
+class DopeSheetWindow;        // 2026-10-28（R8）：动画摄影表（Dope Sheet）
 class LandscapeEditor;        // 2026-10-20：地形编辑模式
 class FoliageEditor;          // 2026-10-20：植被编辑模式
 // 2026-10-20 晚：下拉里其余 6 个模式（ToolkitEditors.h / .cpp）
@@ -227,6 +229,12 @@ private:
     // UI 编辑器（#312）：与上面两个完全同构（窗口对象自己管 open/close，
     // 表项只做显隐同步），真正的 draw 在 drawUiEditorWindow。
     static void panelDrawUiEditor(EditorApp& a);
+    // 曲线编辑器（R6）：同上（窗口对象自己管 open/close），真正的 draw 在
+    // drawCurveEditorWindow。
+    static void panelDrawCurveEditor(EditorApp& a);
+    // 动画摄影表（R8）：与上面四格完全同构，真正的 draw 在
+    // drawDopeSheetWindow。
+    static void panelDrawDopeSheet(EditorApp& a);
 
     // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
     void drawPanels();
@@ -382,6 +390,17 @@ private:
     // 与另两个资产编辑器不同，它**没有** Inspector 入口 —— UI 文档不是
     // 场景里的组件，没有哪一行能挂一个 "Edit…" 按钮。
     void drawUiEditorWindow();
+    // 曲线编辑器（R6）：入口是 View 菜单 / 底栏托盘 / `MYVK_EDITOR_CURVED`。
+    // 它**没有** Inspector 入口 —— 曲线是"段的属性"，而 Inspector 的
+    // sequence 页签是按组件给的，挂不上"编辑第 2 段的手柄"这种粒度。
+    void drawCurveEditorWindow();
+    // 动画摄影表（R8）：入口是 View 菜单 / 底栏托盘 / `MYVK_EDITOR_DOPE`，
+    // 以及 Character 窗口 Pose 页的 "Dope sheet" 按钮。
+    //
+    // ⚠ 它比前几个资产编辑器多一个"绑定"形态：Pose Mode 打开时编辑的是
+    //   CharacterWindow 内存里那份 `EditClip`（见 DopeSheetWindow.h ⚠⑤），
+    //   这时面板表只是显隐开关，数据源由 CharacterWindow 每帧推过来。
+    void drawDopeSheetWindow();
     // 视口正下方那一行播放条（Run = 运行游戏；Play/Pause/Stop = 动画）。
     //
     // ⚠ 2026-10-17：UI 被用户要求移除，**这个函数不再被调用**（保留实现
@@ -517,6 +536,13 @@ private:
     std::unique_ptr<TimelineEditorWindow> m_tlEditor;
     // 2026-10-27（#312）：UI 编辑器。同样与上面两个同构。
     std::unique_ptr<UiEditorWindow> m_uiEditor;
+    // 2026-10-28（R6）：曲线编辑器。同样与上面三个同构。
+    std::unique_ptr<CurveEditorPanel> m_curveEditor;
+    // 2026-10-28（R8）：动画摄影表。生命周期与上面四个同构 —— 但**销毁次序
+    // 有要求**：绑定形态下它持有 CharacterWindow 的 `EditClip*`，
+    // 而 unique_ptr 成员按"声明的逆序"析构。所以它必须在 m_characterWindow
+    // **之后**声明（= 先析构），否则关窗口时 dope sheet 会拿着悬空指针。
+    std::unique_ptr<DopeSheetWindow> m_dopeSheet;
     // 2026-10-17 晚：底栏"+"托盘里的两张功能面板（Physics / Particles）
     std::unique_ptr<PhysicsPanel> m_physicsPanel;
     std::unique_ptr<ParticlesPanel> m_particlesPanel;

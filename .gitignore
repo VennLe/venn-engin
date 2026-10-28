@@ -56,3 +56,8 @@ assets/audio/_long_*.wav
 .DS_Store
 Thumbs.db
 _*.txt
+
+# Python 字节码缓存：tools/*.py 每跑一次验收就会生成一份，
+# 进 git status 只是噪音（2026-10-28 清三件时顺手补的）。
+__pycache__/
+*.py[cod]

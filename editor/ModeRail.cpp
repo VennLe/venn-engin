@@ -117,7 +117,7 @@ void drawModeRail(EditorContext& ctx) {
 
     // ---- 表头：折叠箭头 + 标题（+ 展开时的提示 / 折叠时的当前模式名）----
     //
-    // 2026-10-28：加这个箭头是因为**纵向空间不够**。9 行列表吃掉 ~310px，
+    // 2026-10-28：加这个箭头是因为**纵向空间不够**。10 行列表吃掉 ~310px，
     // 1600×900 下参数面板只剩 ~290px —— Landscape 那 8 个工具按钮 + 4 条
     // 滑条一屏放不下，用户报的"过于紧凑"有一半是这里来的。折叠后列表只剩
     // 表头一行，参数面板直接多拿 310px。
@@ -187,8 +187,8 @@ void drawModeRail(EditorContext& ctx) {
         return;
     }
 
-    // ---- 9 行单选 ----
-    // 行间距压到 3：默认 ItemSpacing.y（主题里是 7）会在 9 行上白吃 63px，
+    // ---- 10 行单选 ----
+    // 行间距压到 3：默认 ItemSpacing.y（主题里是 7）会在 10 行上白吃 70px，
     // 而左栏下半的参数面板正缺这几十像素（Modeling 面板一屏放不下）。
     // 行高仍是 28，和顶栏下拉的 `editModeRow` 保持一致，只是挨得紧一点。
     const EditMode cur = ctx.editMode();
@@ -246,7 +246,7 @@ void drawModeRail(EditorContext& ctx) {
         logRect(rectTag, p, ImVec2(p.x + rowW, p.y + kRowH));
         // 按 id 的锚点：验收脚本"切到某个模式"现在走这里（顶栏那颗下拉
         // 2026-10-21 删掉了，之前用的是 TB-EDITMODE-ITEM <id>）。下标锚点
-        // 留给"9 行是否齐全"这类布局断言，两者各管一头。
+        // 留给"10 行是否齐全"这类布局断言，两者各管一头。
         char idTag[64];
         std::snprintf(idTag, sizeof(idTag), "MODE-RAIL-ITEM %s",
                       editModeId(m));

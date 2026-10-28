@@ -476,6 +476,62 @@ DEFAULT = [
     # ⚠ F 用例会**临时改写** `assets/sequences/opening.seq.json`，
     #   跑完在 finally 里原样写回并校验哈希。
     "verify_timeline_editor",
+    # ---- #318：曲线编辑器（Graph Editor，R6）----
+    # 九组用例。核心是 A4：画布用 `evaluateCurve` 画、运行时走 `sampleCamera`，
+    # 两者**数学等价但不逐位相等**（glm::mix 是 a*(1-w)+b*w，evalSegment 是
+    # a+(b-a)*w），所以判据钉 1e-4 而不是 0；真分叉会差到 1e-1 量级。
+    # 其余验"改了数据真的改了"：拖帧改 t / 拖手柄让同一采样点单调变化 /
+    # T 切插值改曲线形状（step 保持前帧，差 > 0.5）/ V 切手柄类型的**语义**
+    # （vector 必须 (±1,±1) = 直线、auto_clamped 在极值处必须压平）/
+    # 框选批量拖**相对间距逐帧不变**（逐个累加实现会漂）/ 存盘不丢 `"//"` 注释 /
+    # 磁盘时间戳变了要拦（两个编辑器开同一份资产时唯一的护栏）。
+    # ⚠ 走的是 `act*` + `beginDrag/actDragKeysPx/endDrag` —— 和鼠标同一条路，
+    #   像素→值只有一个换算函数。脚本只把"按哪儿、拖多少像素"喂进去。
+    # ⚠ 资产全部**复制到临时目录**再改，原 `assets/sequences/opening.seq.json`
+    #   一个字节都不动（对比 verify_timeline_editor 的临时改写+哈希还原）。
+    "verify_curve_editor",
+    # ---- #319：骨骼关键帧编辑 + Pose Mode（R7）----
+    # 四次启动编辑器（动作 / 读回 / 无编辑基线 / 坏骨名），走
+    # `MYVK_EDITOR_POSE_SCRIPT` 注入 —— 和 UI **同一条**数据通路
+    # （setKey → overlayEditPose → poseToJoints），不是另写一套。
+    # 核心断言 A5：存盘 → 第二个进程读回 → 每个关节的局部 TRS 用 `%a`
+    # （精确十六进制浮点）打印后**逐字符相同**，A5b 再比关节矩阵的字节摘要。
+    # 用 %a 而不是 %.6f 是刻意的：十进制会掩盖 1 ulp 的差异，而这条要说的
+    # 正是"逐位"。B 组比 slerp 的实际角度（0/30/60°），C 组反向对照
+    # "没打帧的那根骨局部+世界都不变"，F 组验跨角色资产里的坏骨名被跳过
+    # 而好的轨道照样生效。
+    # ⚠ 只写 build/bin 下的临时 `.anim.json`，不碰 assets/ 下任何资产。
+    # ⚠ 日志锚点全在 `CHAR-POSE-*` / `POSE-*` 前缀下（`poseToJoints` 那份
+    #   在 animation/ClipEdit 里打的是 `POSE-RESOLVE` / `POSE-SAVE/LOAD`）。
+    "verify_pose_mode",
+    # ---- #320：动画摄影表（Dope Sheet，R8）----
+    # 五次启动编辑器（打开+通道树 / 框选批量挪 / 镜像 / 关键帧类型 / 缩放平移）。
+    # 两条验收是任务书原文，"逐位"不是"差得少"：
+    #   · B4/B5 框选 10 帧一起挪 0.25 秒 → 每个时间戳逐位等于 t+0.25，且 9 个
+    #     gap 逐位不变（逐个累加的实现会在这里漂）
+    #   · C3/C4 镜像 → 每帧落到 2·pivot−t 上（逐位），间距序列正好反序
+    # 夹具是脚本**现造**的（`engine/assets/**` 在 GLOBAL_GLOBS 里，而且"能被
+    # 框选成恰好 10 帧"这种要求本身很刻意），时间戳全取 2⁻⁴ 的整数倍 ——
+    # 这样 `(t+d)−t` 在 float32 上与 `d` 逐位相等，`==` 才敢直接用。
+    # D 组钉"类型不改数据"的落盘一半（times/values 逐位不动 → 求值不可能变），
+    # 求解器层面的等价在 `Game.exe --selftest anim` 的 `dope_types_*` 两条。
+    # ⚠ px 的判据只用同一批 `DOPE-DUMP` 头里的 t0/pps：脚本里的 `zoom`/`pan`
+    #   会立刻改视图，跨批配错的表现是"px 差几十像素"这种假失败。
+    "verify_dope_sheet",
+    # ---- 2026-10-28：FBX take 名归一化后的**重名去重**（#329）----
+    # `anime_girl.fbx` 里是 4 个 AnimationStack（`Rig|Idle` ×2 + `Rig|Walk` ×2），
+    # 归一化掉 `|` 前缀后变成 [Idle,Walk,Idle,Walk] —— 撞名的代价不是
+    # "列表难看"：`findClip` 只取第一个（第二段永远播不到），角色窗口里两行
+    # 同名 Selectable 同帧同 ID → ImGui 弹**模态**告警窗，之后**所有鼠标
+    # 点击全被它吃掉**（`verify_character_window` 的"点动画条目触发播放"
+    # 就是这么红的，界面看着完全正常）。
+    # 四组：A 离线烤（2 条 drop / clips=2 / 时长与轨道数不变 / 几何账目不动）、
+    # B **反例不误伤**（alicia 4 段名字本就不同 → 0 条 drop、clips=4）、
+    # C 运行时 FbxLoader 也必须治（收尾行 `FBX clips count=2 names=[Idle,Walk]`
+    # —— 只数 drop 条数是不够的，全丢光也是 2 条）、
+    # D 仓库里的 `anime_girl.vmesh` 已重烤（只改代码不重烤，读 .vmesh 的人照旧中招）。
+    # ⚠ 纯控制台，无 GUI；一遍约 10 秒。
+    "verify_clip_dedup",
     "verify_world_api",
     # ---- 2026-10-17：主题 / 语言 / 默认值 / 胶囊线框 / 启动露面 ----
     # 五套主题 + 中英映射替换 + 偏好存档 schema 门。判据只取 Preferences
@@ -924,9 +980,19 @@ DEFAULT = [
     "verify_multiselect",
 ]
 
-# 结果行：兼容四种写法。取**最后一条**，因为有的脚本会先打一堆中间断言。
-OK_RE = re.compile(r"(?:RESULT:\s*PASS|全部断言 PASS|^全部 PASS\b|结果:\s*PASS)")
-BAD_RE = re.compile(r"(?:RESULT:\s*FAIL|断言[^\n]*FAIL|结果:\s*FAIL)")
+# 结果行：兼容几种写法。取**最后一条**，因为有的脚本会先打一堆中间断言。
+#
+# ⚠ 2026-10-28 补第五种：`结果: 13 通过 / 0 失败`（`verify_char_preview` 等
+#   一批脚本是这种计数式收尾）。以前 OK_RE 只认字面 `结果: PASS`，于是那种
+#   脚本**哪怕 13 条断言全绿也判 FAIL** —— 而且红得"没道理"：日志里一条 FAIL
+#   都搜不到，`done` 计数还把"0 失败"读成了通过。这是回归体系自己的洞：
+#   一个用例的 13 条断言等于从没被执行器看见过。
+#   计数式必须**同时**进 OK 和 BAD，否则 `结果: 5 通过 / 3 失败` 会两头都不
+#   匹配、沿用上一行的判定（等于看运气）。
+OK_RE = re.compile(r"(?:RESULT:\s*PASS|全部断言 PASS|^全部 PASS\b|结果:\s*PASS"
+                   r"|结果:\s*\d+\s*通过\s*/\s*0\s*失败)")
+BAD_RE = re.compile(r"(?:RESULT:\s*FAIL|断言[^\n]*FAIL|结果:\s*FAIL"
+                    r"|结果:\s*\d+\s*通过\s*/\s*[1-9]\d*\s*失败)")
 # 资源泄漏：验证层在 vkDestroyDevice() 时点名没被销毁的子对象。
 LEAK_RE = re.compile(r"leaked objects that have not been destroyed")
 
@@ -1677,11 +1743,22 @@ TRIGGERS = {
                                   "editor/Localization.cpp"],
     # E14：四角浮层 / 书签 / 显隐全在 ViewportPanel；相机 yaw/pitch 存取走
     #      引擎的 scene::Camera（书签存的就是它）
+    # 2026-10-28（#317）：**分栏也点名** —— 视口的左右边界就是 SplitLayout
+    #   算出来的（CONVERGED_VP / V1d2 "左边界压在真实分隔线上" / V3 骨架全
+    #   跟着它走）。改默认左栏宽度不动 ViewportPanel 一个字，但这条用例会
+    #   红，所以在**改 SplitLayout 的那一侧**登记，别让 --narrow 漏跑。
     "verify_viewport":       ["editor/ViewportPanel.*",
+                              "editor/SplitLayout.*",
                               "engine/scene/Camera.*"],
     # 2026-10-17 晚：视口工具条（图标/下拉/吸附/视图菜单）+ 底栏面板托盘
     #   + 两张新面板。改动面横跨这几处，任何一个动了这一组都要重跑。
+    # 2026-10-28（#317）：工具条右组**放不放得下**取决于视口有多宽，而视口
+    #   宽度来自 SplitLayout 的默认左栏宽度（`editModeRailMinWidth`）——
+    #   7 颗按钮从"只画 3 颗"变成"7/7"就是这么来的。所以 SplitLayout 与
+    #   EditModes 都点名（EditModes 提供那个宽度表）。
     "verify_viewport_bar":   ["editor/ViewportPanel.*",
+                              "editor/SplitLayout.*",
+                              "editor/EditModes.*",
                               "editor/EditorApp.*",
                               "editor/EditorContext.h",
                               "editor/EditorContext.cpp",
@@ -1991,6 +2068,10 @@ TRIGGERS = {
     #       verify_runtime_* 名下（同一个文件挂两条是**故意**的，见 M1 那条注释）；
     #       这里再挂一遍只会让"改 runtime"变成两条一起红，信息量没增加
     "verify_sequencer": ["engine/sequence/**",
+                         # R5（2026-10-28）：`sampleCamera` 的插值权重统一到
+                         # `animation::Curve` 之后，相机段真的会因它而变 ——
+                         # 改贝塞尔求根/缓动公式必须重跑这一项。
+                         "engine/animation/Curve.*",
                          "engine/scene/CameraSystem.*",
                          "engine/scene/SceneSerializer.*",
                          "editor/InspectorPanel.*",
@@ -2146,13 +2227,70 @@ TRIGGERS = {
                                "editor/EditorApp.cpp",
                                "engine/sequence/SequenceAsset.*",
                                "engine/sequence/SequenceSelfTest.cpp",
+                               # R5：属性栏多了 bezier 手柄，采样走的是同一份
+                               # 曲线求值。
+                               "engine/animation/Curve.*",
                                "assets/sequences/**"],
+    # ---- #318：曲线编辑器 ----
+    # 登记五类**非横切**的实现主体：
+    #   · `editor/CurveEditorPanel.*` 面板本体（画布 / 手势 / 注入脚本）
+    #   · `editor/EditorApp.cpp` 面板表项 + 窗口生命周期 + `MYVK_EDITOR_CURVED`
+    #     钩子（钩子没了这一条根本开不了窗，症状是"等满超时全红"）
+    #   · `editor/PanelRegistry.*` 面板表 —— 多一条面板就多一格状态数组，
+    #     少一条就整个窗口不画
+    #   · `engine/animation/Curve.*` 采样与手柄语义（画布画的就是它）
+    #   · `engine/sequence/SequenceAsset.*` 含 ease→曲线字段的换算与写回
+    # ⚠ 刻意**不登记** `engine/i18n/**`：新增界面词不改行为，属横切
+    #   （见 verify_theme_language 的注释，那里才是该跑它的地方）；
+    #   `engine/ecs/**` 在 GLOBAL_GLOBS 里，登记了会命中"全横切登记"检查。
+    "verify_curve_editor": ["editor/CurveEditorPanel.*",
+                            "editor/EditorApp.cpp",
+                            "editor/PanelRegistry.*",
+                            "engine/animation/Curve.*",
+                            "engine/sequence/SequenceAsset.*",
+                            "assets/sequences/**"],
+    "verify_pose_mode": ["editor/CharacterWindow.*",
+                         "editor/EditorApp.cpp",
+                         "engine/animation/ClipEdit.*",
+                         "engine/animation/Pose.*",
+                         # Skeleton 只**读**（采样 + 骨名解析），但改它一定会
+                         # 影响"名字→下标"与采样语义，所以照登。
+                         "engine/assets/Skeleton.*",
+                         "assets/models/anime_girl.fbx"],
+    # ---- #320：动画摄影表 ----
+    # 登记五类实现主体，少一条就会出现"改了 A 只跑 B"的假跳过：
+    #   · `editor/DopeSheetWindow.*` 面板本体（通道树 / 铺点 / 手势 / 注入脚本）
+    #   · `editor/EditorApp.cpp` 面板表项 + 窗口生命周期 + `MYVK_EDITOR_DOPE`
+    #     钩子（钩子没了这一条根本开不了窗，症状是"等满超时全红"）
+    #   · `editor/PanelRegistry.*` 面板表 —— 多一条面板就多一格状态数组
+    #   · `editor/CharacterWindow.*` 绑定宿主（Pose Mode 期间数据源由它推过来，
+    #     翻译成"摄影表看的是哪份 clip"；它一改，绑定态的断言全不作数）
+    #   · `engine/animation/ClipEdit.*` 三个批量操作（move / mirror / align）
+    #     与类型表都在这里 —— 面板只负责"算出选哪些帧"
+    # ⚠ 刻意**不登记** `engine/i18n/**`：新增界面词不改行为，属横切
+    #   （见 verify_theme_language 的注释，那里才是该跑它的地方）；
+    #   `engine/ecs/**` / `engine/assets/**` 在 GLOBAL_GLOBS 里。
+    "verify_dope_sheet": ["editor/DopeSheetWindow.*",
+                          "editor/EditorApp.cpp",
+                          "editor/PanelRegistry.*",
+                          "editor/CharacterWindow.*",
+                          "engine/animation/ClipEdit.*"],
     "verify_world_api": ["engine/script/ScriptEngine.*",
                          "engine/script/ScriptSelfTest.cpp",
                          "runtime/RuntimeApp.cpp",
                          "runtime/GameFlags.h",
                          "assets/scenes/cutscene_demo.json",
                          "assets/models/anime_girl.fbx"],
+    # 重名去重（#329）：逻辑住在 `assetio/ClipDedup.h`，两个入口各接一次
+    # （AssetC 走 `assetio/FbxImport.cpp`，引擎走 `engine/assets/FbxLoader.cpp`），
+    # 产物是签入仓库的 `anime_girl.vmesh` —— 四条全登记，少一条就会出现
+    # "改了 A 只跑 B"的假跳过。
+    "verify_clip_dedup": ["assetio/ClipDedup.h",
+                          "assetio/FbxImport.*",
+                          "engine/assets/FbxLoader.*",
+                          "assetc/main.cpp",
+                          "assets/models/anime_girl.fbx",
+                          "assets/models/anime_girl.vmesh"],
     # ---- 阶段 M1：运行时骨架（G01~G05）----
     # 三条用例的实现主体全在 `runtime/**`（G01 拆出来的那个独立目标）。
     # 同一个 glob 挂到三条名下是**故意**的：改 runtime 的任何一行，

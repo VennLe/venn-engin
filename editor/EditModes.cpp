@@ -207,15 +207,17 @@ const char* editModeHint(EditMode m) {
     return "";
 }
 
-// 九项全部落地（2026-10-20）。这个函数**不是**"有没有代码"，而是"顶栏下拉
-// 里那一行能不能点 / 选到之后有没有面板" —— Toolbar.cpp 用它决定置灰，
-// EditorContext 用它写进 `EDITMODE ... implemented=` 日志（自动化按它断言）。
+// 十项全部落地（Select/Landscape/Foliage 三项 2026-10-20，ToolkitEditors 那
+// 六个模式同一批，Water 2026-10-21）。这个函数**不是**"有没有代码"，而是
+// "顶栏下拉里那一行能不能点 / 选到之后有没有面板" —— Toolbar.cpp 用它决定
+// 置灰，EditorContext 用它写进 `EDITMODE ... implemented=` 日志（自动化按它
+// 断言）。
 //
 // 所以只写 `return true` 是不够的：每个模式必须真的有一条
 //     切模式 → EditorApp::serviceEditMode 开面板 → 面板有 logRect 锚点 → 能改场景
 // 的链路，否则点进去就是一个空窗口 = 用户说的"没实现"。
 //
-// 九项现在都是 true，于是 switch 退化成"全部返回 true"。保留 switch 形式是
+// 十项现在都是 true，于是 switch 退化成"全部返回 true"。保留 switch 形式是
 // 为了留一个显式的落点：将来若某个模式要临时收回（比如重做），把对应 case
 // 挪到 return false 那一支即可，不用改调用方。
 bool editModeImplemented(EditMode m) {
@@ -241,13 +243,14 @@ bool editModeImplemented(EditMode m) {
 // 判据只有一条：**面板在 300 宽时按钮还点得到吗**。
 //   · Landscape / Foliage / Select —— 按钮按 `GetContentRegionAvail()` 换列，
 //     300 时退化成 1~2 列，全都还在窗口里 → 300。
-//   · 其余六项是一条 `SameLine` 硬排到底（建模面板那排合计 400 出头），
-//     300 宽时最右边那个按钮会被窗口裁掉 —— 裁掉的控件"有矩形但点不到"，
-//     比直接不给拖更糟 → 460。
+//   · 其余七项（ToolkitEditors 那六个 + Water）是一条 `SameLine` 硬排到底
+//     （建模面板那排合计 400 出头），300 宽时最右边那个按钮会被窗口裁掉
+//     —— 裁掉的控件"有矩形但点不到"，比直接不给拖更糟 → 460。
 //
-// ⚠ 这个数字**不是**"默认宽度"：默认宽度仍是 SplitLayout 里那句
-//   `clamp(bodyW * kLeftFrac, kMinModeRail, ...)`。分开是为了让默认布局
-//   逐像素不动（verify_viewport 的 CONVERGED_VP 与像素基线都钉着它）。
+// ⚠ 这个数字**同时**是默认宽度与拖动下限（2026-10-28 第二刀，见 #317）：
+//   SplitLayout 的默认宽度 = `clamp(bodyW * kLeftFrac, editModeRailMinWidth(m), …)`，
+//   拖动下限 = 同一个数。所以 Select 下默认左栏就是 300、视口 936px 宽，
+//   右侧工具条 7 颗按钮刚好放得下；切到 Modeling 会被顶到 460。
 float editModeRailMinWidth(EditMode m) {
     switch (m) {
         case EditMode::Select:

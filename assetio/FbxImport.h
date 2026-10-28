@@ -16,6 +16,7 @@
 #include "assetio/SourceModel.h"
 
 #include <string>
+#include <vector>
 
 namespace assetio {
 
@@ -33,7 +34,16 @@ struct ImportOptions {
 
 // 导入一个 FBX。失败时返回 `ok=false` 并用 `error` 说明原因
 // （**不抛异常**：批量转码时一个坏文件不该中断整批）。
-SourceModel importFbx(const std::string& absPath, const ImportOptions& opt);
+//
+// `notes`（可选，追加写入）：导入过程中"值得打一行日志"的事件。目前只有
+// clip 重名去重（`FBX-CLIPDUP`，见 `assetio/ClipDedup.h`）。
+// ⚠ 为什么**不在这一层直接打**：`VennAssetIO` 只链 glm + ufbx，刻意不带
+//   engine 的 Logger（要么把整个 engine 依赖拖进来，要么 AssetC 就得开
+//   Vulkan）；而 AssetC 侧只有 `std::printf`。所以这一层只产出**文本**，
+//   打印由调用方负责 —— 文字内容由 `clipDedupLine()` 统一生成，
+//   两个调用点打印方式不同、内容不会漂。
+SourceModel importFbx(const std::string& absPath, const ImportOptions& opt,
+                      std::vector<std::string>* notes = nullptr);
 
 // 把一个绝对/相对文件路径规范成"相对 assetRoot"的、分隔符为 '/' 的
 // 形式。不在 assetRoot 下（或无法求相对路径）时返回空串。
