@@ -310,10 +310,14 @@ run("editor/MultiEditMath.h → 批量数学", OLD,
 # 判据是"自己那条一定在"，不是"只有自己那条"（与 AutoRig / ProcAnim 同理）：
 # 换个角度说，`verify_ik` 单独挂在这三个名字旁边，价值在于**标明归属** ——
 # 一眼能看出"改求解器是为了验 IK 的像素"，而不是"又要跑四条动画用例"。
+# 2026-10-29（#336 S-C）：再加一条 verify_constraints —— 约束栈里的 IK 是
+# 这个 solver 的**薄包装**，改余弦定理/极向量必须重验"入栈后与直接调用逐位
+# 相同"（`constraint_ik_via_stack_bitwise`）。这条不是"顺手带上的"：它钉的是
+# 两条路径只有一份实现。
 run("engine/animation/TwoBoneIK.cpp → 两骨 IK", OLD,
     with_change("engine/animation/TwoBoneIK.cpp"),
     want={"verify_ik", "verify_anim_runtime", "verify_character_import",
-          "verify_player_character"})
+          "verify_player_character", "verify_constraints"})
 # `AnimatorSystem.*` 比上面多一个 owner：三层（LookAt → IK → 弹簧骨）的
 # **施加顺序**与"perform 结束时推进弹簧骨"都在这里，`verify_player_feel`
 # 的平滑过渡判据读的也是这条链 → 改它必须连它一起跑。
@@ -433,6 +437,38 @@ run("editor/CurveEditorPanel.cpp → 曲线编辑器 × 中文化", OLD,
 run("editor/DopeSheetWindow.cpp → 摄影表 × 中文化", OLD,
     with_change("editor/DopeSheetWindow.cpp"),
     want={"verify_dope_sheet", "verify_i18n_coverage"})
+# 2026-10-29（#334）：骨架编辑的数据层（`engine/animation/RigEdit.*`）。
+# 实际受影响的是四条：自己 + 三条按 `engine/animation/**` 整层登记的动画用例
+# （`verify_anim_runtime` / `verify_character_import` / `verify_player_character`
+# —— 它们采样的是同一具骨架，改烘焙就等于改它们的输入）。
+# ⚠ 期望里**没有** verify_pose_mode / verify_dope_sheet：那两条登记的是
+#   `engine/animation/ClipEdit.*` 这个**具体文件**，不是整层 —— 把 RigEdit
+#   塞进去会让"改骨架却要跑摄影表"变成假信号。这条 fixture 的价值正是把
+#   这个边界写下来。
+run("engine/animation/RigEdit.cpp → 骨架编辑 × 动画输入", OLD,
+    with_change("engine/animation/RigEdit.cpp"),
+    want={"verify_rig_edit", "verify_anim_runtime", "verify_character_import",
+          "verify_player_character"})
+# 2026-10-29（#335）：蒙皮权重本体（`engine/animation/WeightSet.*`）。
+# 期望形状与上面 RigEdit 那条**一模一样**：`engine/animation/**` 整层被三条
+# 动画用例登记着（`verify_anim_runtime` / `verify_character_import` /
+# `verify_player_character`），所以改权重一定会进它们的行列。
+# ⚠ 这条 fixture 的价值在把 `verify_weights` 标明归属：改的是"顶点组 / 自动
+#   权重 / 烘焙"，验的是 Weights 页那 41 项 —— 而不是"又要跑一遍角色导入"。
+run("engine/animation/WeightSet.cpp → 蒙皮权重 × 角色链", OLD,
+    with_change("engine/animation/WeightSet.cpp"),
+    want={"verify_weights", "verify_anim_runtime", "verify_character_import",
+          "verify_player_character"})
+# 2026-10-29（#336 S-C）：约束栈的求值核心（`engine/animation/Constraint.*`）。
+# 它同时是"数据层 + 求值"两份职责，所以两边都得跟着跑：
+#   · `verify_constraints` —— 自己那条（23 条 `constraint_*` + 8 组端到端）
+#   · `engine/animation/**` 整层被四条动画用例登记着（角色链的采样输入）
+# ⚠ `verify_rig_edit` 刻意**不**在这里：RigEdit 不读约束，两者只在
+#   CharacterWindow 的 UI 上相邻 —— 登记进来会让"改约束"白跑一遍骨架编辑。
+run("engine/animation/Constraint.cpp → 约束栈 × 角色链", OLD,
+    with_change("engine/animation/Constraint.cpp"),
+    want={"verify_constraints", "verify_anim_runtime", "verify_character_import",
+          "verify_player_character"})
 # 2026-10-28（#318）：曲线求值本体（`engine/animation/Curve.*`）。
 # 期望是"自己那条一定在"的大并集：`engine/animation/**` 整层被四条动画用例
 # 登记着（换求值 = 换它们的输入），而画布画的就是同一份采样。
@@ -565,12 +601,23 @@ run("editor/CharacterWindow.cpp → 预览与地形并存", OLD,
     # 姿态库、以及 `MYVK_EDITOR_POSE_SCRIPT` 的注入点全长在这个文件里。
     # R8（#320）再加 verify_dope_sheet：`syncDopeSheet()` 与 "Dope sheet" 按钮
     # 也长在这里 —— 它决定"摄影表看的是哪一份 clip"，改错了绑定态整张表是空的。
+    # S-A（#334）再加 verify_rig_edit：Rig 页、`MYVK_EDITOR_RIG_SCRIPT`、
+    # 以及 `bake → 换 m_model->skeleton` 的接线都在这里。少了它，"改骨架
+    # 却只跑角色窗口"会变成一条看不见的假跳过。
+    # S-B（#335）再加 verify_weights：权重页、笔刷命中测试、`drawWeightsOverlay`、
+    # 以及 `MYVK_EDITOR_WEIGHTS_SCRIPT` 的注入点全长在这里 —— 而且"重传顶点缓冲
+    # 之前必须 `waitIdle()`"这条约定就在 `applyWeights()` 里，改错了是删除在飞缓冲
+    # 的 VUID，只有 verify_weights 的 H 组会叫。
+    # S-C（#336）再加 verify_constraints：约束段画在 Rig 页里，而且预览的
+    # 采样链（`samplePoseInto`）里那一行 `m_constraints.evaluate(...)` 就在
+    # 这个文件 —— 删掉它，约束在画面上就"完全不生效"，但所有数值断言还绿
+    # （自检不走编辑器），只有 verify_constraints 的 B 组会红。
     want={"verify_character_import", "verify_character_window",
           "verify_i18n_coverage", "verify_preview_terrain",
           "verify_char_locomotion", "verify_char_preview",
-          "verify_pose_mode", "verify_dope_sheet"})
-run("engine/render/RenderTarget.cpp → 预览与地形并存", OLD,
-    with_change("engine/render/RenderTarget.cpp"),
+          "verify_pose_mode", "verify_dope_sheet", "verify_rig_edit",
+          "verify_weights", "verify_constraints"})
+run("engine/render/RenderTarget.cpp → 预览与地形并存", OLD,    with_change("engine/render/RenderTarget.cpp"),
     # 2026-10-25 加 verify_outline：描边的几何缓冲视图
     # （`HdrTarget::geometryView()`）就是在 RenderTarget::apply /
     # recreatePost 里跟着 recreate 传下去的 —— 漏传的表现是"第一帧有

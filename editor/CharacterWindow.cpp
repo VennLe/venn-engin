@@ -451,6 +451,10 @@ void CharacterWindow::samplePoseInto() {
             (m_animPlaying || m_animTime > 0.0f) ? skel.findClip(m_currentClip)
                                                  : nullptr;
         animation::samplePose(skel, clip, m_animTime, m_pose);
+        // S-C：约束栈在最上层。**空栈时 `evaluate` 立刻返回、一个字节都不写**，
+        // 所以"没有约束 = 逐位等于旧路径"这条老断言不受影响（自检里
+        // `constraint_*_bitwise` 那几条钉的就是短路本身）。
+        m_conStats = m_constraints.evaluate(skel, m_pose);
         animation::poseToJoints(skel, m_pose, m_jointMats);
         m_worldMats.clear();   // 非 Pose Mode 不算第二遍 FK
         return;
@@ -476,6 +480,10 @@ void CharacterWindow::samplePoseInto() {
             m_pose.scale[k] = m_touchedS[k];
         }
     }
+
+    // 约束栈（S-C）必须盖在**所有**姿态源之上：base clip → 编辑轨道 →
+    // 手摆的瞬态层 → 约束。顺序反过来就会"约束被下一帧的编辑轨道冲掉"。
+    m_conStats = m_constraints.evaluate(skel, m_pose);
 
     animation::poseToJoints(skel, m_pose, m_jointMats);
     // gizmo 要"骨在哪 + 朝向哪"，世界矩阵单独一遍（63 根骨，可忽略）。
@@ -667,6 +675,14 @@ void CharacterWindow::drawPreviewViewport() {
     // （m_capScrSegs），点选量的是"眼睛里看到的那几根线"。反过来的话
     // 量的是上一帧的几何，绕着模型转视角时点选会偏一帧。
     drawPreviewOverlay(imgMin, imgSz);
+
+    // 权重绘制（S-B）：只在 Weights 页被选中时生效。
+    // 顺序是"先刷、后画" —— 同一帧就能看到刷的结果，否则作者的观感是
+    // "画笔跟不上手"（权重带是上一帧的）。
+    if (m_weightsTabOpen) {
+        handleWeightsPaint(imgMin, imgSz, pvp, hovered);
+        drawWeightsOverlay(imgMin, imgSz, pvp, hovered);
+    }
 
     // ---- 点选（选中模型 / 胶囊）----
     // 只在**左键单击**（按下那一帧）时改选中：拖拽是导航（右键/中键），
@@ -894,6 +910,41 @@ void CharacterWindow::drawPreviewOverlay(const ImVec2& imgMin,
             dl->AddLine(f0, f1, IM_COL32(120, 235, 150, 120), 1.0f);
         // 奇数个点说明中途有一段投影失败（点在相机后面），丢掉尾巴保配对
         if (m_capScrSegs.size() & 1u) m_capScrSegs.pop_back();
+    }
+
+    // ---- ①b 骨架（S-A）：rest 骨线 + 选中骨的三轴 ----
+    //
+    // 为什么必须画三轴：`roll` 是"绕骨轴扭"，光看一根线**看不出任何变化**
+    // （线段本身旋转对称）。三轴一起画，roll 才有视觉反馈 —— 否则作者只能
+    // 靠"拧了之后手脚翻不翻"来猜，而这个猜法一次要摆十分钟 pose。
+    if (m_rigActive && m_showRigBones &&
+        m_rigWorld.size() == m_rig.bones.size()) {
+        for (std::size_t i = 0; i < m_rig.bones.size(); ++i) {
+            const animation::EditBone& b = m_rig.bones[i];
+            const glm::mat4& W = m_rigWorld[i];
+            const glm::vec3 h = glm::vec3(W[3]);
+            const glm::vec3 t = h + b.dir * b.length;
+            ImVec2 pa, pb;
+            if (!proj(h, pa) || !proj(t, pb)) continue;   // 有一端在相机后面
+            const bool sel = (static_cast<int>(i) == m_rigSel);
+            const ImU32 col = sel ? IM_COL32(255, 226, 96, 255)
+                                  : (b.deform ? IM_COL32(120, 200, 235, 200)
+                                              : IM_COL32(150, 150, 150, 130));
+            dl->AddLine(pa, pb, col, sel ? 2.6f : 1.6f);
+            dl->AddCircleFilled(pa, sel ? 3.4f : 2.2f, col);
+            if (!sel) continue;
+            const float al = glm::clamp(b.length * 0.5f, 0.02f, 0.10f);
+            const glm::vec3 ax[3] = {glm::normalize(glm::vec3(W[0])),
+                                     glm::normalize(glm::vec3(W[1])),
+                                     glm::normalize(glm::vec3(W[2]))};
+            const ImU32 ac[3] = {IM_COL32(235, 96, 96, 230),
+                                 IM_COL32(96, 208, 116, 230),
+                                 IM_COL32(96, 148, 235, 230)};
+            for (int k = 0; k < 3; ++k) {
+                ImVec2 pe;
+                if (proj(h + ax[k] * al, pe)) dl->AddLine(pa, pe, ac[k], 1.4f);
+            }
+        }
     }
 
     // ---- ② 坐标轴 gizmo ----
@@ -2849,8 +2900,1669 @@ void CharacterWindow::logPoseDigest(const char* tag) {
                 static_cast<int>(m_jointMats.size()), static_cast<int>(n), h);
 }
 
+// ============================================================
+// Rig 页（S-A，2026-10-29）—— 骨架编辑
+//
+// 这一页只做一件事：把 `animation::RigEdit` 摆出来，让作者能改
+// head / length / roll / deform / connected / inherit。
+//
+// 三条纪律（和 Dope Sheet 那边同源）：
+//   ① 改数据只走 `RigEdit::setXxx` 一族 —— 注入脚本与 UI 共用同一份实现，
+//      验收因此不依赖"把某个 DragFloat 拖到正确位置"；
+//   ② 烘焙**只**在 `m_rigDirty` 时做（拖滑条一帧一次就够，不要每个控件各烤一遍）；
+//   ③ `assets::Skeleton` 一个字节不改：`m_rigBase` 握着导入骨架，
+//      `applyRig` 生成**新的** Skeleton 换上 —— 改坏了 `Revert` 就回去。
+// ============================================================
+
+namespace {
+constexpr float kRigRad2Deg = 57.29577951308232f;
+constexpr float kRigDeg2Rad = 0.017453292519943295f;
+} // namespace
+
+void CharacterWindow::resetRigToCurrent() {
+    m_rigActive = false;
+    m_rigSel = -1;
+    m_rigWorld.clear();
+    m_rigSkel = assets::Skeleton{};
+    m_rig.bones.clear();
+    m_rigDirty = false;
+}
+
+void CharacterWindow::ensureRig() {
+    if (!m_model || !m_model->skeleton) return;
+    // 换了模型（或从没导入过）就以**当前**骨架为基准重新导入。
+    // 用 `m_rig.source` 而不是另立一个"上次的模型路径"：它本来就是干这个的。
+    if (m_rigActive && m_rig.source == m_modelPath) return;
+    resetRigToCurrent();
+
+    m_rigBase = m_model->skeleton;
+    m_rig = animation::RigEdit::fromSkeleton(*m_rigBase, m_modelPath);
+    m_rigActive = true;
+    m_rigSel = m_rig.boneCount() > 0 ? 0 : -1;
+    m_rigDirty = true;
+
+    if (m_rigPathBuf[0] == 0) {
+        std::string p = m_modelPath.empty() ? std::string("character") : m_modelPath;
+        const std::size_t dot = p.find_last_of('.');
+        const std::size_t slash = p.find_last_of("/\\");
+        if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+            p = p.substr(0, dot);
+        p += ".rig.json";
+        std::snprintf(m_rigPathBuf, sizeof(m_rigPathBuf), "%s", p.c_str());
+    }
+    m_rig.logSummary("import");
+    VK_LOG_INFO("CHAR-RIG-IMPORT bones=%d model='%s'", m_rig.boneCount(),
+                m_modelPath.c_str());
+}
+
+void CharacterWindow::applyRig() {
+    if (!m_rigActive || !m_rigBase || !m_model) return;
+    assets::Skeleton baked;
+    // 以**导入骨架**为基准烘焙：没动过的骨从它逐位照抄（约定 ①）。
+    // 拿上一次烘焙结果当基准会一代代漂 —— 每烤一次多一次舍入。
+    m_rig.bake(*m_rigBase, baked);
+    m_rigSkel = std::move(baked);
+    m_rig.restWorld(m_rigWorld);
+    m_model->skeleton = std::make_shared<assets::Skeleton>(m_rigSkel);
+    m_rigDirty = false;
+    // 加/删骨之后按名字解析的下标全变了，必须重解（不然帧会搬到别的骨上）
+    m_editDirty = true;
+    revalidateEdit();
+    VK_LOG_INFO("CHAR-RIG-APPLY bones=%d touched=%d", m_rigSkel.jointCount(),
+                m_rig.info().touched);
+}
+
+void CharacterWindow::revertRig() {
+    if (!m_rigBase) return;
+    VK_LOG_INFO("CHAR-RIG-REVERT bones=%d", m_rigBase->jointCount());
+    m_model->skeleton = m_rigBase;
+    m_rigActive = false;
+    ensureRig();   // 重新从导入骨架导入（等价于"丢掉所有编辑"）
+}
+
+void CharacterWindow::drawRigPanel() {
+    if (!m_model || !m_model->skeleton) {
+        ImGui::TextDisabled(TR("(no skeleton)"));
+        return;
+    }
+    ensureRig();
+
+    const animation::RigInfo st = m_rig.info();
+    ImGui::TextDisabled(TR("EDIT RIG"));
+    ImGui::Separator();
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(TR("File"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputText("##rig_path", m_rigPathBuf, sizeof(m_rigPathBuf));
+    tip(TR("Where the .rig.json lives. The imported skeleton is never modified."));
+
+    if (ImGui::Button(TR("Save"))) {
+        std::string err;
+        const bool ok = animation::saveRig(m_rigPathBuf, m_rig, err);
+        if (!ok) VK_LOG_WARN("CHAR-RIG-SAVE-FAIL err='%s'", err.c_str());
+    }
+    logRect("CHAR-RIG-SAVE-BTN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Load"))) {
+        animation::RigEdit tmp;
+        std::string err;
+        if (animation::loadRig(m_rigPathBuf, tmp, err)) {
+            // 只接受**同一副骨架**：骨名对不上的 rig 换上去，等于把角色换成
+            // 别人的骨架，模型会散成碎片而日志只有一行 SAVE-OK。
+            const bool sameRig = tmp.boneCount() == m_rig.boneCount();
+            if (sameRig) {
+                m_rig = std::move(tmp);
+                m_rig.source = m_modelPath;
+                m_rigSel = m_rig.boneCount() > 0 ? 0 : -1;
+                m_rigDirty = true;
+            } else {
+                VK_LOG_WARN("CHAR-RIG-LOAD-vs bones=%d vs %d（骨数不同，拒绝）",
+                            tmp.boneCount(), m_rig.boneCount());
+            }
+        } else {
+            VK_LOG_WARN("CHAR-RIG-LOAD-FAIL err='%s'", err.c_str());
+        }
+    }
+    logRect("CHAR-RIG-LOAD-BTN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Revert"))) revertRig();
+    logRect("CHAR-RIG-REVERT-BTN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    ImGui::Checkbox(TR("Show bones"), &m_showRigBones);
+    // 镜像轴：默认从骨名+位置认出来，允许覆盖（X/Y/Z 是轴名，不是人话，不翻）
+    const char* kAxes[] = {"X", "Y", "Z"};
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(70.0f);
+    if (ImGui::Combo("##rig_axis", &m_rig.mirrorAxis, kAxes, 3)) {
+        VK_LOG_INFO("CHAR-RIG-AXIS axis=%s",
+                    animation::RigEdit::axisName(m_rig.mirrorAxis));
+    }
+    tip(TR("Mirror plane. Detected from the left/right bone pairs — override it if "
+           "the mirrored side comes out twisted."));
+    ImGui::Text("%s %d  %s %d", TR("bones"), st.bones, TR("touched"), st.touched);
+    logRect("CHAR-RIG-STATS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    // ---- 骨树 ----
+    ImGui::Separator();
+    const float treeH = std::max(90.0f, ImGui::GetContentRegionAvail().y * 0.42f);
+    ImGui::BeginChild("##rig_tree", ImVec2(0.0f, treeH), ImGuiChildFlags_Borders);
+    std::function<void(int, int)> drawNode;
+    drawNode = [&](int i, int depth) {
+        if (i < 0 || i >= m_rig.boneCount()) return;
+        const animation::EditBone& b = m_rig.bones[static_cast<std::size_t>(i)];
+        ImGui::PushID(i);
+        if (depth > 0) ImGui::Indent(10.0f);
+        // `*` = 动过（与 Details 的"已改"角标同一口径）
+        char label[192];
+        std::snprintf(label, sizeof(label), "%s%s", b.touched() ? "* " : "",
+                      b.name.c_str());
+        if (ImGui::Selectable(label, m_rigSel == i)) m_rigSel = i;
+        if (!b.deform) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%s)", TR("no deform"));
+        }
+        std::vector<int> kids;
+        m_rig.childrenOf(i, kids);
+        for (int c : kids) drawNode(c, depth + 1);
+        if (depth > 0) ImGui::Unindent(10.0f);
+        ImGui::PopID();
+    };
+    for (int i = 0; i < m_rig.boneCount(); ++i)
+        if (m_rig.bones[static_cast<std::size_t>(i)].parent < 0) drawNode(i, 0);
+    ImGui::EndChild();
+
+    // ---- 选中骨 ----
+    if (m_rigSel < 0 || m_rigSel >= m_rig.boneCount()) return;
+    // ⚠ 这里**不能**缓存引用：下面的 Add / Delete 会让 bones 重新分配，
+    //   之后再读 `b` 就是悬空引用（症状是"改完加骨，界面上一堆随机名字"）。
+    {
+        const animation::EditBone& cb = m_rig.bones[static_cast<std::size_t>(m_rigSel)];
+        ImGui::Text("%s: %s", TR("Selected bone"), cb.name.c_str());
+    }
+
+    float head[3] = {m_rig.bones[static_cast<std::size_t>(m_rigSel)].head.x,
+                     m_rig.bones[static_cast<std::size_t>(m_rigSel)].head.y,
+                     m_rig.bones[static_cast<std::size_t>(m_rigSel)].head.z};
+    if (ImGui::DragFloat3(TR("Head"), head, 0.005f)) {
+        m_rig.setHead(m_rigSel, glm::vec3(head[0], head[1], head[2]));
+        m_rigDirty = true;
+    }
+    logRect("CHAR-RIG-HEAD", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    tip(TR("Where this bone's head sits in skeleton space. Connected children "
+           "follow it."));
+
+    float len = m_rig.bones[static_cast<std::size_t>(m_rigSel)].length;
+    if (ImGui::DragFloat(TR("Length"), &len, 0.002f, 0.001f, 20.0f, "%.4f")) {
+        m_rig.setLength(m_rigSel, len);
+        m_rigDirty = true;
+    }
+    logRect("CHAR-RIG-LEN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    float rollDeg = m_rig.bones[static_cast<std::size_t>(m_rigSel)].roll * kRigRad2Deg;
+    if (ImGui::DragFloat(TR("Roll (deg)"), &rollDeg, 0.5f, -360.0f, 360.0f, "%.2f")) {
+        m_rig.setRoll(m_rigSel, rollDeg * kRigDeg2Rad);
+        m_rigDirty = true;
+    }
+    logRect("CHAR-RIG-ROLL", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::SmallButton(TR("Reset"))) {
+        m_rig.setRoll(m_rigSel, 0.0f);
+        m_rigDirty = true;
+    }
+    tip(TR("Twist about the bone's own axis. 0 = keep the imported orientation — "
+           "so 'only fix the hand' never re-orients the whole skeleton."));
+
+    bool df = m_rig.bones[static_cast<std::size_t>(m_rigSel)].deform;
+    if (ImGui::Checkbox(TR("Deform"), &df)) {
+        m_rig.setDeform(m_rigSel, df);
+        m_rigDirty = true;
+    }
+    ImGui::SameLine();
+    bool cn = m_rig.bones[static_cast<std::size_t>(m_rigSel)].connected;
+    if (ImGui::Checkbox(TR("Connected"), &cn)) {
+        m_rig.setConnected(m_rigSel, cn);
+        m_rigDirty = true;
+    }
+    ImGui::SameLine();
+    bool ih = m_rig.bones[static_cast<std::size_t>(m_rigSel)].inheritRot;
+    if (ImGui::Checkbox(TR("Inherit rotation"), &ih)) {
+        m_rig.setInheritRot(m_rigSel, ih);
+        m_rigDirty = true;
+    }
+    logRect("CHAR-RIG-FLAGS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    if (ImGui::Button(TR("Align to child"))) {
+        std::vector<int> kids;
+        m_rig.childrenOf(m_rigSel, kids);
+        if (!kids.empty()) {
+            const glm::vec3 t =
+                m_rig.bones[static_cast<std::size_t>(kids.front())].head;
+            const glm::vec3 h = m_rig.bones[static_cast<std::size_t>(m_rigSel)].head;
+            const float d = glm::length(t - h);
+            if (m_rig.setDir(m_rigSel, t - h) && d > 1.0e-4f)
+                m_rig.setLength(m_rigSel, d);
+            m_rigDirty = true;
+        } else {
+            VK_LOG_WARN("CHAR-RIG-ALIGN 选中骨没有子骨（'%s'）",
+                        m_rig.bones[static_cast<std::size_t>(m_rigSel)].name.c_str());
+        }
+    }
+    logRect("CHAR-RIG-ALIGN-BTN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Mirror to opposite"))) {
+        m_rig.mirrorToOpposite(m_rigSel);
+        m_rigDirty = true;
+    }
+    logRect("CHAR-RIG-MIRROR-BTN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Add child bone"))) {
+        const animation::EditBone& cb = m_rig.bones[static_cast<std::size_t>(m_rigSel)];
+        const glm::vec3 at = cb.tail();
+        const glm::vec3 d = cb.dir;
+        const int par = m_rigSel;
+        std::string nm = cb.name + "_child";
+        for (int k = 2; m_rig.indexOf(nm) >= 0 && k < 100; ++k)
+            nm = cb.name + "_child" + std::to_string(k);
+        const int idx = m_rig.addBone(nm, par, at, d, 0.1f);
+        if (idx >= 0) {
+            m_rigSel = idx;
+            m_rigDirty = true;
+        }
+    }
+    logRect("CHAR-RIG-ADD-BTN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Delete bone"))) {
+        const int gone = m_rigSel;
+        const int n = m_rig.removeBone(gone);
+        if (n > 0) {
+            m_rigSel = m_rig.boneCount() > 0 ? std::min(gone, m_rig.boneCount() - 1) : -1;
+            m_rigDirty = true;
+        }
+    }
+    logRect("CHAR-RIG-DEL-BTN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    // 约束栈（S-C）跟着选中骨走 —— 它是"这根骨的属性"，和 Head/Roll 一样，
+    // 所以放在 Rig 页里而不是再开一个页签：左栏 380px 已经装不下第 6 个页签了
+    // （见 draw() 里 leftW 那段注释）。
+    drawConstraintsSection();
+
+    if (m_rigDirty) applyRig();
+}
+
+// ============================================================
+// 约束栈（S-C）
+// ============================================================
+
+int CharacterWindow::constraintBoneOfSel() const {
+    if (!m_model || !m_model->skeleton) return -1;
+    if (m_rigSel < 0 || m_rigSel >= m_rig.boneCount()) return -1;
+    const animation::EditBone& b = m_rig.bones[static_cast<std::size_t>(m_rigSel)];
+    const int n = m_model->skeleton->jointCount();
+    // `srcJoint` = 导入时的 joint 下标；Rig 页新加的骨没有它（-1），但
+    // `RigEdit::bake()` 之后 bones[i] → joints[i]，所以退回 bones 下标是对的。
+    const int j = b.srcJoint >= 0 ? b.srcJoint : m_rigSel;
+    return (j >= 0 && j < n) ? j : -1;
+}
+
+void CharacterWindow::pruneConstraints() {
+    if (!m_model || !m_model->skeleton) return;
+    const int n = m_model->skeleton->jointCount();
+    if (n == m_conBoundJoints) return;
+    m_conBoundJoints = n;
+    int dropped = 0;
+    for (int i = m_constraints.size() - 1; i >= 0; --i) {
+        const animation::Constraint* c = m_constraints.at(i);
+        if (!c) continue;
+        bool bad = (c->bone < 0 || c->bone >= n) || (c->target >= n);
+        if (c->type == animation::kConTwoBoneIK) {
+            bad = bad || c->ikRoot >= n || c->ikMid >= n || c->ikEnd >= n;
+        }
+        if (!bad) continue;
+        m_constraints.removeAt(i);
+        if (m_conSel == i) m_conSel = -1;
+        ++dropped;
+    }
+    if (dropped > 0) {
+        VK_LOG_WARN("CONSTRAINT-PRUNE joints=%d dropped=%d left=%d", n, dropped,
+                    m_constraints.size());
+    }
+}
+
+void CharacterWindow::drawConstraintTargetCombo(const char* id, int& joint,
+                                               float width) {
+    if (!m_model || !m_model->skeleton) return;
+    const assets::Skeleton& skel = *m_model->skeleton;
+    const int n = skel.jointCount();
+    const char* cur = (joint >= 0 && joint < n)
+                          ? skel.joints[static_cast<std::size_t>(joint)].name.c_str()
+                          : TR("(none)");
+    ImGui::SetNextItemWidth(width);
+    if (ImGui::BeginCombo(id, cur)) {
+        if (ImGui::Selectable(TR("(none)"), joint < 0)) {
+            joint = -1;
+            m_conDirty = true;
+        }
+        for (int j = 0; j < n; ++j) {
+            ImGui::PushID(j);
+            const bool sel = (j == joint);
+            if (ImGui::Selectable(
+                    skel.joints[static_cast<std::size_t>(j)].name.c_str(), sel)) {
+                joint = j;
+                m_conDirty = true;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+}
+
+void CharacterWindow::drawConstraintsSection() {
+    if (!m_model || !m_model->skeleton) return;
+    const assets::Skeleton& skel = *m_model->skeleton;
+    const int joints = skel.jointCount();
+    pruneConstraints();
+
+    ImGui::Separator();
+    // 折叠段：Rig 页本来就长（骨树 + 十来个控件），约束再铺开就顶到可见区
+    // 外面去了（实测默认窗口下锚点高度是 0）。有约束时默认展开，"有没有东西"
+    // 这件事一眼可见；空栈时收成一行，不占位置。
+    if (!m_constraints.empty()) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+    const bool conOpen = ImGui::CollapsingHeader(TR("CONSTRAINTS"));
+    logRect("CHAR-CON-TITLE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (!conOpen) return;
+
+    // 整个栈的账（不是只这一根骨的）：作者要知道"有没有条目在悄悄失败"。
+    ImGui::Text(TR("stack %d: applied %d / skipped %d / failed %d"),
+                m_constraints.size(), m_conStats.applied, m_conStats.skipped,
+                m_conStats.failed);
+    logRect("CHAR-CON-STATS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    const int bone = constraintBoneOfSel();
+    if (bone < 0) {
+        ImGui::TextDisabled(TR("(this bone has no joint yet — save the rig first)"));
+        logRect("CHAR-CON-NOBONE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        return;
+    }
+
+    // ---- 这一根骨的条目（**保持全局顺序**：跨骨顺序也参与求值）----
+    if (ImGui::BeginChild("##con_list", ImVec2(0.0f, 96.0f), ImGuiChildFlags_Borders)) {
+        bool any = false;
+        for (int i = 0; i < m_constraints.size(); ++i) {
+            const animation::Constraint* c = m_constraints.at(i);
+            if (!c || c->bone != bone) continue;
+            any = true;
+            char label[160];
+            std::snprintf(label, sizeof(label), "%d. %s  (%.2f)", i,
+                          animation::constraintTypeName(c->type),
+                          static_cast<double>(c->influence));
+            ImGui::PushID(i);
+            bool en = c->enabled;
+            if (ImGui::Checkbox("##en", &en)) {
+                m_constraints.items[static_cast<std::size_t>(i)].enabled = en;
+                m_conDirty = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Selectable(label, m_conSel == i)) m_conSel = i;
+            ImGui::PopID();
+        }
+        if (!any) ImGui::TextDisabled(TR("(no constraint on this bone)"));
+        ImGui::EndChild();
+    }
+    logRect("CHAR-CON-LIST", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    // ---- 增删移 ----
+    static int sNewType = animation::kConLimitRotation;
+    const char* kTypes[animation::kConTypeCount] = {
+        animation::constraintTypeName(animation::kConLimitRotation),
+        animation::constraintTypeName(animation::kConCopyRotation),
+        animation::constraintTypeName(animation::kConCopyLocation),
+        animation::constraintTypeName(animation::kConChildOf),
+        animation::constraintTypeName(animation::kConTwoBoneIK),
+    };
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::Combo("##con_newtype", &sNewType, kTypes, animation::kConTypeCount);
+    logRect("CHAR-CON-TYPE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Add"))) {
+        animation::Constraint c;
+        c.type = sNewType;
+        c.bone = bone;
+        if (sNewType == animation::kConTwoBoneIK) {
+            // 链从选中骨开始：root = 选中骨，mid/end 先留空（让 solver 自动挑
+            // 最长子骨），这样"加一条 IK 就能动"是默认体验。
+            c.ikRoot = bone;
+            c.ikMid = -1;
+            c.ikEnd = -1;
+            c.ikHasTarget = true;
+            c.ikTarget = glm::vec3(0.0f);
+        }
+        m_conSel = m_constraints.add(c);
+        m_conDirty = true;
+    }
+    logRect("CHAR-CON-ADD", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Delete"))) {
+        if (m_constraints.removeAt(m_conSel) > 0) {
+            m_conSel = -1;
+            m_conDirty = true;
+        }
+    }
+    logRect("CHAR-CON-DEL", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Move up"))) {
+        if (m_constraints.moveUp(m_conSel) > 0) {
+            --m_conSel;
+            m_conDirty = true;
+        }
+    }
+    logRect("CHAR-CON-UP", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Move down"))) {
+        if (m_constraints.moveDown(m_conSel) > 0) {
+            ++m_conSel;
+            m_conDirty = true;
+        }
+    }
+    logRect("CHAR-CON-DOWN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    // ---- 选中条目的参数 ----
+    animation::Constraint* c = m_constraints.at(m_conSel);
+    if (!c || c->bone != bone) return;
+
+    if (ImGui::SliderFloat(TR("Influence"), &c->influence, 0.0f, 1.0f)) m_conDirty = true;
+    logRect("CHAR-CON-INFL", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    tip(TR("Influence can be keyed: 0 → 1 over two frames is how FK switches to IK."));
+
+    switch (c->type) {
+    case animation::kConLimitRotation: {
+        for (int a = 0; a < 3; ++a) {
+            bool use = (c->limitMask & (1 << a)) != 0;
+            ImGui::PushID(a);
+            if (ImGui::Checkbox("##use", &use)) {
+                c->limitMask ^= (1 << a);
+                m_conDirty = true;
+            }
+            ImGui::SameLine();
+            float mm[2] = {c->minDeg[a], c->maxDeg[a]};
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::DragFloat2(TR("Min / Max"), mm, 0.5f, -360.0f, 360.0f,
+                                  "%.1f")) {
+                c->minDeg[a] = mm[0];
+                c->maxDeg[a] = mm[1];
+                m_conDirty = true;
+            }
+            ImGui::PopID();
+        }
+        logRect("CHAR-CON-LIMIT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        break;
+    }
+    case animation::kConCopyRotation:
+    case animation::kConChildOf: {
+        ImGui::TextUnformatted(TR("Target bone"));
+        drawConstraintTargetCombo("##con_tgt", c->target, 180.0f);
+        logRect("CHAR-CON-TARGET", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        if (c->type == animation::kConCopyRotation) {
+            int mask = c->axisMask;
+            const char* kAxes[3] = {"X", "Y", "Z"};
+            for (int a = 0; a < 3; ++a) {
+                bool on = (mask & (1 << a)) != 0;
+                ImGui::SameLine();
+                ImGui::PushID(100 + a);
+                if (ImGui::Checkbox(kAxes[a], &on)) {
+                    c->axisMask ^= (1 << a);
+                    m_conDirty = true;
+                }
+                ImGui::PopID();
+            }
+        }
+        break;
+    }
+    case animation::kConCopyLocation: {
+        ImGui::TextUnformatted(TR("Target bone"));
+        drawConstraintTargetCombo("##con_tgt", c->target, 180.0f);
+        logRect("CHAR-CON-TARGET", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        float off[3] = {c->offset.x, c->offset.y, c->offset.z};
+        ImGui::SetNextItemWidth(180.0f);
+        if (ImGui::DragFloat3(TR("Offset"), off, 0.01f, -10.0f, 10.0f, "%.3f")) {
+            c->offset = glm::vec3(off[0], off[1], off[2]);
+            m_conDirty = true;
+        }
+        logRect("CHAR-CON-OFFSET", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        break;
+    }
+    case animation::kConTwoBoneIK: {
+        ImGui::TextUnformatted(TR("Chain root"));
+        drawConstraintTargetCombo("##con_root", c->ikRoot, 180.0f);
+        logRect("CHAR-CON-IKROOT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        ImGui::TextUnformatted(TR("Chain mid"));
+        drawConstraintTargetCombo("##con_mid", c->ikMid, 180.0f);
+        logRect("CHAR-CON-IKMID", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        ImGui::TextUnformatted(TR("Chain end"));
+        drawConstraintTargetCombo("##con_end", c->ikEnd, 180.0f);
+        logRect("CHAR-CON-IKEND", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        bool has = c->ikHasTarget;
+        if (ImGui::Checkbox(TR("Has target"), &has)) {
+            c->ikHasTarget = has;
+            m_conDirty = true;
+        }
+        logRect("CHAR-CON-IKHAS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        float tp[3] = {c->ikTarget.x, c->ikTarget.y, c->ikTarget.z};
+        ImGui::SetNextItemWidth(180.0f);
+        if (ImGui::DragFloat3(TR("Target"), tp, 0.01f, -20.0f, 20.0f, "%.3f")) {
+            c->ikTarget = glm::vec3(tp[0], tp[1], tp[2]);
+            m_conDirty = true;
+        }
+        logRect("CHAR-CON-IKTGT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        if (ImGui::SliderFloat(TR("Stretch"), &c->stretch, 0.0f, 1.0f)) m_conDirty = true;
+        logRect("CHAR-CON-IKSTRETCH", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void CharacterWindow::runConstraintScript() {
+    if (m_conScriptRan) return;
+    const char* raw = std::getenv("MYVK_EDITOR_CONSTRAINT_SCRIPT");
+    if (!raw || !raw[0]) {
+        m_conScriptRan = true;
+        return;
+    }
+    if (!m_model || !m_model->skeleton) return;   // 模型异步加载：等
+    m_conScriptRan = true;
+    ensureRig();
+    m_focusRigTab = true;   // 页签不被选中就没有锚点
+
+    // 约束挂在**骨架 joint 下标**上，而 Rig 页选中的是 `EditBone`。脚本 `add`
+    // / `sel` 之后必须把 Rig 页的选择同步过去 —— 否则 `drawConstraintsSection`
+    // 里那句 `c->bone != bone` 会直接 return，类型参数一块锚点都不出现
+    // （第一版就是这样：TITLE/STATS 有、INFL 之后全无）。
+    const auto syncRigSel = [this](int joint) {
+        if (joint < 0) return;
+        for (int i = 0; i < m_rig.boneCount(); ++i) {
+            const animation::EditBone& b = m_rig.bones[static_cast<std::size_t>(i)];
+            const int j = b.srcJoint >= 0 ? b.srcJoint : i;
+            if (j == joint) {
+                m_rigSel = i;
+                return;
+            }
+        }
+    };
+
+    int applied = 0;
+    int failed = 0;
+    const auto split = [](const std::string& s) {
+        std::vector<std::string> out;
+        std::size_t pos = 0;
+        while (pos <= s.size()) {
+            const std::size_t p = s.find(':', pos);
+            out.push_back(s.substr(pos, p == std::string::npos ? std::string::npos
+                                                              : p - pos));
+            if (p == std::string::npos) break;
+            pos = p + 1;
+        }
+        return out;
+    };
+    const auto toF = [](const std::string& s, float def) {
+        try { return std::stof(s); } catch (...) { return def; }
+    };
+    const auto toI = [](const std::string& s, int def) {
+        try { return std::stoi(s); } catch (...) { return def; }
+    };
+
+    const std::string all(raw);
+    std::size_t pos = 0;
+    while (pos <= all.size()) {
+        const std::size_t semi = all.find(';', pos);
+        std::string tok = all.substr(pos, semi == std::string::npos
+                                              ? std::string::npos : semi - pos);
+        pos = (semi == std::string::npos) ? all.size() + 1 : semi + 1;
+        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+            tok.erase(tok.begin());
+        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+            tok.pop_back();
+        if (tok.empty()) continue;
+
+        const std::vector<std::string> a = split(tok);
+        const std::string& cmd = a[0];
+        bool ok = false;
+
+        if (cmd == "list") {
+            VK_LOG_INFO("CONSTRAINT-LIST n=%d joints=%d digest=%016llx",
+                        m_constraints.size(), m_model->skeleton->jointCount(),
+                        m_constraints.digest());
+            for (int i = 0; i < m_constraints.size(); ++i) {
+                const animation::Constraint& c =
+                    m_constraints.items[static_cast<std::size_t>(i)];
+                VK_LOG_INFO("CONSTRAINT-LIST-ITEM i=%d type=%s bone=%d target=%d "
+                            "inf=%.4f enabled=%d",
+                            i, animation::constraintTypeName(c.type), c.bone,
+                            c.target, static_cast<double>(c.influence),
+                            c.enabled ? 1 : 0);
+            }
+            ok = true;
+        } else if (cmd == "add" && a.size() >= 3) {
+            animation::Constraint c;
+            if (!animation::constraintTypeFromName(a[1], c.type)) {
+                // 允许直接写数字（脚本里更省事）
+                const int t = toI(a[1], -1);
+                if (t < 0 || t >= animation::kConTypeCount) { ++failed; continue; }
+                c.type = t;
+            }
+            c.bone = toI(a[2], -1);
+            if (c.type == animation::kConTwoBoneIK) {
+                c.ikRoot = c.bone;
+                c.ikHasTarget = true;
+            }
+            m_conSel = m_constraints.add(c);
+            syncRigSel(c.bone);
+            ok = true;
+        } else if (cmd == "sel" && a.size() >= 2) {
+            m_conSel = toI(a[1], -1);
+            ok = m_conSel >= -1 && m_conSel < m_constraints.size();
+            const animation::Constraint* c = m_constraints.at(m_conSel);
+            if (c) syncRigSel(c->bone);
+        } else if (cmd == "del" && a.size() >= 2) {
+            ok = m_constraints.removeAt(toI(a[1], -1)) > 0;
+        } else if (cmd == "move" && a.size() >= 3) {
+            const int i = toI(a[1], -1);
+            const int d = toI(a[2], 0);
+            ok = (d < 0) ? m_constraints.moveUp(i) > 0
+                         : m_constraints.moveDown(i) > 0;
+        } else if (cmd == "influence" && a.size() >= 3) {
+            animation::Constraint* c = m_constraints.at(toI(a[1], -1));
+            if (c) {
+                c->influence = toF(a[2], c->influence);
+                ok = true;
+            }
+        } else if (cmd == "enable" && a.size() >= 3) {
+            animation::Constraint* c = m_constraints.at(toI(a[1], -1));
+            if (c) {
+                c->enabled = toI(a[2], 1) != 0;
+                ok = true;
+            }
+        } else if (cmd == "target" && a.size() >= 3) {
+            animation::Constraint* c = m_constraints.at(toI(a[1], -1));
+            if (c) {
+                c->target = toI(a[2], -1);
+                ok = true;
+            }
+        } else if (cmd == "limit" && a.size() >= 5) {
+            animation::Constraint* c = m_constraints.at(toI(a[1], -1));
+            const int axis = toI(a[2], -1);
+            if (c && axis >= 0 && axis < 3) {
+                c->minDeg[axis] = toF(a[3], c->minDeg[axis]);
+                c->maxDeg[axis] = toF(a[4], c->maxDeg[axis]);
+                c->limitMask |= (1 << axis);
+                ok = true;
+            }
+        } else if (cmd == "mask" && a.size() >= 3) {
+            animation::Constraint* c = m_constraints.at(toI(a[1], -1));
+            if (c) {
+                c->limitMask = toI(a[2], 7);
+                c->axisMask = toI(a[2], 7);
+                ok = true;
+            }
+        } else if (cmd == "ik" && a.size() >= 5) {
+            animation::Constraint* c = m_constraints.at(toI(a[1], -1));
+            if (c) {
+                c->ikRoot = toI(a[2], c->ikRoot);
+                c->ikMid = toI(a[3], c->ikMid);
+                c->ikEnd = toI(a[4], c->ikEnd);
+                ok = true;
+            }
+        } else if (cmd == "iktarget" && a.size() >= 5) {
+            animation::Constraint* c = m_constraints.at(toI(a[1], -1));
+            if (c) {
+                c->ikTarget = glm::vec3(toF(a[2], 0.0f), toF(a[3], 0.0f),
+                                        toF(a[4], 0.0f));
+                c->ikHasTarget = true;
+                ok = true;
+            }
+        } else if (cmd == "stretch" && a.size() >= 3) {
+            animation::Constraint* c = m_constraints.at(toI(a[1], -1));
+            if (c) {
+                c->stretch = toF(a[2], 0.0f);
+                ok = true;
+            }
+        } else if (cmd == "clear") {
+            ok = m_constraints.clear() >= 0;
+            m_conSel = -1;
+        } else if (cmd == "digest") {
+            VK_LOG_INFO("CONSTRAINT-DIGEST n=%d h=%016llx", m_constraints.size(),
+                        m_constraints.digest());
+            ok = true;
+        } else if (cmd == "eval") {
+            // 手动求一次当前姿态（预览每帧也会求，这条是给"不看画面"的断言用）
+            if (m_pose.count() > 0) {
+                m_conStats = m_constraints.evaluate(*m_model->skeleton, m_pose);
+                animation::poseToJoints(*m_model->skeleton, m_pose, m_jointMats);
+            }
+            VK_LOG_INFO("CONSTRAINT-EVAL total=%d applied=%d skipped=%d failed=%d "
+                        "clamped=%d ik=%d",
+                        m_conStats.total, m_conStats.applied, m_conStats.skipped,
+                        m_conStats.failed, m_conStats.clamped, m_conStats.ikSolved);
+            ok = true;
+        } else if (cmd == "save" && a.size() >= 2) {
+            // 路径里可能有 `:`（`E:\...`）→ 把第 1 段之后的全拼回去
+            std::string path = a[1];
+            for (std::size_t k = 2; k < a.size(); ++k) path += ":" + a[k];
+            ok = saveConstraintsTo(path);
+        } else if (cmd == "load" && a.size() >= 2) {
+            std::string path = a[1];
+            for (std::size_t k = 2; k < a.size(); ++k) path += ":" + a[k];
+            ok = loadConstraintsFrom(path);
+        }
+
+        if (ok) ++applied;
+        else {
+            ++failed;
+            VK_LOG_WARN("CONSTRAINT-SCRIPT-FAIL cmd='%s'", tok.c_str());
+        }
+    }
+
+    m_constraints.logSummary("script");
+    VK_LOG_INFO("CONSTRAINT-SCRIPT applied=%d failed=%d n=%d sel=%d dirty=%d "
+                "joints=%d",
+                applied, failed, m_constraints.size(), m_conSel,
+                m_conDirty ? 1 : 0, m_model->skeleton->jointCount());
+}
+
+bool CharacterWindow::saveConstraintsTo(const std::string& path) {
+    if (!m_model || !m_model->skeleton) return false;
+    std::string err;
+    const bool ok =
+        animation::saveConstraints(path, m_constraints, *m_model->skeleton, err);
+    if (!ok) VK_LOG_WARN("CONSTRAINT-SAVE-FAIL path='%s' err='%s'", path.c_str(),
+                         err.c_str());
+    else m_conDirty = false;
+    return ok;
+}
+
+bool CharacterWindow::loadConstraintsFrom(const std::string& path) {
+    if (!m_model || !m_model->skeleton) return false;
+    std::string err;
+    int unresolved = 0;
+    animation::ConstraintStack st;
+    if (!animation::loadConstraints(path, *m_model->skeleton, st, err, &unresolved)) {
+        VK_LOG_WARN("CONSTRAINT-LOAD-FAIL path='%s' err='%s'", path.c_str(),
+                    err.c_str());
+        return false;
+    }
+    m_constraints = std::move(st);
+    m_conSel = m_constraints.size() > 0 ? 0 : -1;
+    m_conBoundJoints = m_model->skeleton->jointCount();
+    m_conDirty = false;
+    if (unresolved > 0) {
+        VK_LOG_WARN("CONSTRAINT-LOAD-UNRESOLVED n=%d", unresolved);
+    }
+    return true;
+}
+
+void CharacterWindow::runRigScript() {
+    if (m_rigScriptRan) return;
+    const char* raw = std::getenv("MYVK_EDITOR_RIG_SCRIPT");
+    if (!raw || !raw[0]) {
+        m_rigScriptRan = true;
+        return;
+    }
+    // 模型是异步加载的：没有骨架的那几帧要等，不能把脚本标记成"跑过了"。
+    if (!m_model || !m_model->skeleton) return;
+    m_rigScriptRan = true;
+    ensureRig();
+    m_focusRigTab = true;   // 让这一帧真的把 Rig 页画出来（锚点靠它）
+
+    int applied = 0;
+    int failed = 0;
+    const auto split = [](const std::string& s) {
+        std::vector<std::string> out;
+        std::size_t pos = 0;
+        while (pos <= s.size()) {
+            const std::size_t p = s.find(':', pos);
+            out.push_back(s.substr(pos, p == std::string::npos ? std::string::npos
+                                                              : p - pos));
+            if (p == std::string::npos) break;
+            pos = p + 1;
+        }
+        return out;
+    };
+    const auto toF = [](const std::string& s, float def) {
+        try { return std::stof(s); } catch (...) { return def; }
+    };
+
+    const std::string all(raw);
+    std::size_t pos = 0;
+    while (pos <= all.size()) {
+        const std::size_t semi = all.find(';', pos);
+        std::string tok = all.substr(pos, semi == std::string::npos
+                                              ? std::string::npos : semi - pos);
+        pos = (semi == std::string::npos) ? all.size() + 1 : semi + 1;
+        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+            tok.erase(tok.begin());
+        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+            tok.pop_back();
+        if (tok.empty()) continue;
+
+        const std::vector<std::string> a = split(tok);
+        const std::string& cmd = a[0];
+        bool ok = false;
+
+        // 骨名可能带 `.` `:`（`mixamorig:LeftArm`），所以命令里骨名放在**最后**
+        // 或**第一个参数之外**都不安全 —— 约定：`<cmd>:<bone>:<args…>`，
+        // 而 `mixamorig:LeftArm` 里的冒号会把 split 打碎。
+        // 因此骨名一律用**下标**（`list` 会打出来），这也让断言不依赖命名。
+        const auto boneArg = [&](std::size_t k, int& out) {
+            if (k >= a.size()) return false;
+            try {
+                out = std::stoi(a[k]);
+            } catch (...) {
+                return false;
+            }
+            return out >= 0 && out < m_rig.boneCount();
+        };
+
+        int bi = -1;
+        if (cmd == "list") {
+            VK_LOG_INFO("RIG-LIST n=%d axis=%s", m_rig.boneCount(),
+                        animation::RigEdit::axisName(m_rig.mirrorAxis));
+            for (int i = 0; i < m_rig.boneCount(); ++i) {
+                const animation::EditBone& b = m_rig.bones[static_cast<std::size_t>(i)];
+                VK_LOG_INFO("RIG-LIST-BONE i=%d name='%s' parent=%d src=%d len=%.6f",
+                            i, b.name.c_str(), b.parent, b.srcJoint,
+                            static_cast<double>(b.length));
+            }
+            ok = true;
+        } else if (cmd == "sel" && boneArg(1, bi)) {
+            m_rigSel = bi;
+            ok = true;
+        } else if (cmd == "roll" && boneArg(1, bi) && a.size() >= 3) {
+            ok = m_rig.setRoll(bi, toF(a[2], 0.0f) * kRigDeg2Rad);
+            if (ok) m_rigDirty = true;
+        } else if (cmd == "len" && boneArg(1, bi) && a.size() >= 3) {
+            ok = m_rig.setLength(bi, toF(a[2], 0.0f));
+            if (ok) m_rigDirty = true;
+        } else if (cmd == "head" && boneArg(1, bi) && a.size() >= 5) {
+            ok = m_rig.setHead(bi, glm::vec3(toF(a[2], 0.0f), toF(a[3], 0.0f),
+                                             toF(a[4], 0.0f)));
+            if (ok) m_rigDirty = true;
+        } else if (cmd == "dir" && boneArg(1, bi) && a.size() >= 5) {
+            ok = m_rig.setDir(bi, glm::vec3(toF(a[2], 0.0f), toF(a[3], 0.0f),
+                                            toF(a[4], 0.0f)));
+            if (ok) m_rigDirty = true;
+        } else if (cmd == "deform" && boneArg(1, bi) && a.size() >= 3) {
+            m_rig.setDeform(bi, a[2] != "0");
+            ok = true;
+        } else if (cmd == "conn" && boneArg(1, bi) && a.size() >= 3) {
+            m_rig.setConnected(bi, a[2] != "0");
+            ok = true;
+            m_rigDirty = true;
+        } else if (cmd == "inherit" && boneArg(1, bi) && a.size() >= 3) {
+            m_rig.setInheritRot(bi, a[2] != "0");
+            ok = true;
+        } else if (cmd == "mirror" && boneArg(1, bi)) {
+            ok = m_rig.mirrorToOpposite(bi) >= 0;
+            if (ok) m_rigDirty = true;
+        } else if (cmd == "add" && a.size() >= 5) {
+            // add:<name>:<parent>:<len>
+            const int par = std::stoi(a[2]);
+            if (par >= 0 && par < m_rig.boneCount()) {
+                const animation::EditBone pb = m_rig.bones[static_cast<std::size_t>(par)];
+                const int idx = m_rig.addBone(a[1], par, pb.tail(), pb.dir,
+                                              toF(a[3], 0.1f));
+                ok = idx >= 0;
+                if (ok) {
+                    m_rigSel = idx;
+                    m_rigDirty = true;
+                }
+            }
+        } else if (cmd == "del" && boneArg(1, bi)) {
+            ok = m_rig.removeBone(bi) > 0;
+            if (ok) {
+                m_rigSel = m_rig.boneCount() > 0 ? 0 : -1;
+                m_rigDirty = true;
+            }
+        } else if (cmd == "save" && a.size() >= 2) {
+            std::string err;
+            std::string path = tok.substr(5);   // "save:" 之后整段（路径里有冒号）
+            ok = animation::saveRig(path, m_rig, err);
+            if (!ok) VK_LOG_WARN("RIG-SCRIPT-SAVE-FAIL err='%s'", err.c_str());
+        } else if (cmd == "dump") {
+            m_rig.restWorld(m_rigWorld);
+            for (int i = 0; i < m_rig.boneCount(); ++i) {
+                const animation::EditBone& b = m_rig.bones[static_cast<std::size_t>(i)];
+                const glm::mat4& W = m_rigWorld[static_cast<std::size_t>(i)];
+                VK_LOG_INFO("RIG-DUMP i=%d name='%s' parent=%d t=(%a,%a,%a) len=%a "
+                            "roll=%a deform=%d conn=%d inh=%d d=(%a,%a,%a) ax=(%a,%a,%a)",
+                            i, b.name.c_str(), b.parent,
+                            static_cast<double>(W[3][0]), static_cast<double>(W[3][1]),
+                            static_cast<double>(W[3][2]),
+                            static_cast<double>(b.length),
+                            static_cast<double>(b.roll), b.deform ? 1 : 0,
+                            b.connected ? 1 : 0, b.inheritRot ? 1 : 0,
+                            static_cast<double>(b.dir.x), static_cast<double>(b.dir.y),
+                            static_cast<double>(b.dir.z),
+                            static_cast<double>(W[0][0]), static_cast<double>(W[0][1]),
+                            static_cast<double>(W[0][2]));
+            }
+            ok = true;
+        } else if (cmd == "apply") {
+            applyRig();
+            ok = true;
+        } else if (cmd == "revert") {
+            revertRig();
+            ok = true;
+        }
+
+        if (ok) ++applied; else ++failed;
+        if (!ok) VK_LOG_WARN("RIG-SCRIPT-FAIL cmd='%s'", tok.c_str());
+    }
+
+    if (m_rigDirty) applyRig();
+    const animation::RigInfo st = m_rig.info();
+    VK_LOG_INFO("RIG-SCRIPT applied=%d failed=%d bones=%d touched=%d sel=%d",
+                applied, failed, st.bones, st.touched, m_rigSel);
+}
+
+// ============================================================
+// Weights 页（S-B，2026-10-29）：顶点组 / 自动权重 / 权重绘制
+// ============================================================
+//
+// 和 Rig 页的三条纪律同源，但多一条**只有这一页才有的**：
+//
+//   ① 改数据只走 `animation::WeightSet` 那一族 —— UI、注入脚本、自检共用
+//      同一份实现，验收因此不依赖"把鼠标拖到正确的像素上"；
+//   ② 烘焙只在"脏了"的时候做（一笔刷完烤一次，不是每个顶点烤一次）；
+//   ③ `assets::Mesh` 的顶点数组仍然是**导入产物**：`WeightSet` 一直是权威，
+//      刷完才 `bake()` 写成四槽再重传；
+//   ④ **重传 = `waitIdle()` + `Mesh::upload()`**。`upload` 内部会
+//      `delete m_vertexBuffer`，而在飞的命令缓冲还引用着它 —— 不先等
+//      设备空闲就是"删掉一帧之前还在读的缓冲"，验证层报
+//      `VUID-vkDestroyBuffer-00867`，不报错时就是花屏。代价是一次全同步，
+//      但只在"作者松手/刷了一笔"时发生，不是每帧。
+namespace {
+constexpr float kWeightMirrorEps = 0.01f;   // 镜像配对的容差（米）
+
+// 权重色带：0 = 蓝、0.5 = 绿、1 = 红（Blender 的口径）。
+// 为什么不直接 HSV 扫一遍：HSV 从蓝到红要绕 240°，中间会经过紫 ——
+// 那一段和"零权重"的深色在灰背景上分不开。
+ImU32 weightColor(float w) {
+    if (w < 0.0f) w = 0.0f;
+    if (w > 1.0f) w = 1.0f;
+    const float r = w < 0.5f ? 0.0f : (w - 0.5f) * 2.0f;
+    const float g = (w < 0.5f ? w : (1.0f - w)) * 2.0f;
+    const float b = w < 0.5f ? (1.0f - w * 2.0f) : 0.0f;
+    return IM_COL32(static_cast<int>(r * 255.0f), static_cast<int>(g * 255.0f),
+                    static_cast<int>(b * 255.0f), 210);
+}
+} // namespace
+
+int CharacterWindow::weightSetCount() const {
+    return static_cast<int>(m_weights.size());
+}
+
+int CharacterWindow::activeWeightSet() const {
+    const int n = weightSetCount();
+    if (n <= 0) return -1;
+    if (m_weightSel >= 0 && m_weightSel < n && m_weightsActive[static_cast<std::size_t>(m_weightSel)])
+        return m_weightSel;
+    for (int i = 0; i < n; ++i)
+        if (m_weightsActive[static_cast<std::size_t>(i)]) return i;
+    return -1;
+}
+
+void CharacterWindow::ensureWeights() {
+    if (!m_model || !m_model->skeleton) return;
+    ensureRig();   // 权重里的"骨"编号以 RigEdit 为准（见头文件那段 ⚠）
+
+    const int subs = static_cast<int>(m_model->subMeshes.size());
+    const bool sameModel =
+        m_weightsInited && static_cast<int>(m_weights.size()) == subs &&
+        (m_weights.empty() || m_weights.front().source == m_modelPath);
+    if (sameModel) {
+        if (m_weightsRigBones == m_rig.boneCount()) return;
+        // 增/删骨之后 `bones[i]` 与 `joints[i]` 的对应关系整体挪位，权重里
+        // 存的骨下标会指到别的骨上 —— 没有崩溃、没有断言，只有"刷好的权重
+        // 跑到别处"。这里只能退回网格里的四槽（GPU 正在用的那份）。
+        VK_LOG_WARN("WEIGHTS-STALE bones %d -> %d（增删骨会让权重下标错位，"
+                    "重新从网格导入）", m_weightsRigBones, m_rig.boneCount());
+    }
+
+    m_weights.assign(static_cast<std::size_t>(subs), animation::WeightSet{});
+    m_weightsActive.assign(static_cast<std::size_t>(subs), 0);
+    m_weightsDirty.assign(static_cast<std::size_t>(subs), 0);
+    int skinned = 0;
+    int totalVerts = 0;
+    for (int i = 0; i < subs; ++i) {
+        assets::Mesh* mesh = m_model->subMeshes[static_cast<std::size_t>(i)].mesh;
+        if (mesh == nullptr || mesh->vertices().empty()) continue;
+        animation::WeightSet& ws = m_weights[static_cast<std::size_t>(i)];
+        ws = animation::WeightSet::fromMesh(*mesh, m_modelPath);
+        // 子网格没名字时给一个稳定的代名（日志/存盘都用它对齐）
+        if (m_model->subMeshes[static_cast<std::size_t>(i)].name.empty())
+            ws.mesh = "sub" + std::to_string(i);
+        bool any = false;
+        for (int v = 0; v < ws.vertexCount && !any; ++v)
+            any = ws.influenceCount(v) > 0;
+        m_weightsActive[static_cast<std::size_t>(i)] = any ? 1 : 0;
+        totalVerts += ws.vertexCount;
+        if (any) ++skinned;
+    }
+    m_weightsInited = true;
+    m_weightsRigBones = m_rig.boneCount();
+    m_weightCacheSet = -1;
+    m_weightSel = 0;
+    const int first = activeWeightSet();
+    if (first >= 0) m_weightSel = first;
+
+    m_deformMask.clear();
+    for (const animation::EditBone& b : m_rig.bones)
+        m_deformMask.push_back(b.deform ? 1 : 0);
+
+    if (m_weightsPathBuf[0] == 0) {
+        std::string p = m_modelPath.empty() ? std::string("character") : m_modelPath;
+        const std::size_t dot = p.find_last_of('.');
+        const std::size_t slash = p.find_last_of("/\\");
+        if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+            p = p.substr(0, dot);
+        p += ".weights.json";
+        std::snprintf(m_weightsPathBuf, sizeof(m_weightsPathBuf), "%s", p.c_str());
+    }
+    VK_LOG_INFO("WEIGHTS-IMPORT meshes=%d skinned=%d verts=%d bones=%d model='%s'",
+                subs, skinned, totalVerts, m_rig.boneCount(), m_modelPath.c_str());
+}
+
+void CharacterWindow::ensureWeightCaches() {
+    const int s = activeWeightSet();
+    if (s < 0 || m_weightCacheSet == s) return;
+    assets::Mesh* mesh = m_model->subMeshes[static_cast<std::size_t>(s)].mesh;
+    if (mesh == nullptr) return;
+    animation::meshVertexPositions(*mesh, m_weightPos);
+    const std::vector<assets::Vertex>& vs = mesh->vertices();
+    m_weightNrm.resize(vs.size());
+    for (std::size_t i = 0; i < vs.size(); ++i) m_weightNrm[i] = vs[i].normal;
+    animation::buildVertexRing(*mesh, m_weightRingOff, m_weightRingIdx);
+    m_weightCacheSet = s;
+    VK_LOG_INFO("WEIGHTS-CACHE mesh=%d vtx=%d ring=%d", s,
+                static_cast<int>(m_weightPos.size()),
+                static_cast<int>(m_weightRingIdx.size()));
+}
+
+void CharacterWindow::applyWeights() {
+    if (!m_model) return;
+    const assets::TextureContext tc = m_renderer.textureContext();
+    if (tc.device == nullptr || tc.cmdPool == nullptr) return;
+
+    // deform mask 与骨数**必须**对齐：短一截会让 mask 把后半段骨的权重
+    // 全砍掉（`bake` 里越界按"非 deform"处理），画面是"角色后半身不动"。
+    std::vector<char> mask;
+    mask.reserve(m_rig.bones.size());
+    for (const animation::EditBone& b : m_rig.bones)
+        mask.push_back(b.deform ? 1 : 0);
+
+    int baked = 0;
+    int reuploaded = 0;
+    int changedVerts = 0;
+    for (std::size_t i = 0; i < m_weights.size(); ++i) {
+        if (!m_weightsDirty[i]) continue;
+        m_weightsDirty[i] = 0;
+        assets::Mesh* mesh = m_model->subMeshes[i].mesh;
+        if (mesh == nullptr) continue;
+        std::vector<assets::Vertex> vs = mesh->vertices();
+        if (vs.size() != static_cast<std::size_t>(m_weights[i].vertexCount)) {
+            VK_LOG_WARN("WEIGHTS-BAKE-SKIP mesh=%d vtx %d != %d", static_cast<int>(i),
+                        m_weights[i].vertexCount, static_cast<int>(vs.size()));
+            continue;
+        }
+        const int c = m_weights[i].bake(vs.data(), mask.empty() ? nullptr : &mask);
+        ++baked;
+        changedVerts += c;
+        if (c > 0) {
+            // 约定 ④：先等设备空闲再让 `upload` 删旧缓冲
+            m_renderer.device().waitIdle();
+            mesh->upload(*tc.device, *tc.cmdPool, std::move(vs), mesh->indices());
+            ++reuploaded;
+        }
+        VK_LOG_INFO("WEIGHTS-BAKE mesh=%d vtx=%d changed=%d", static_cast<int>(i),
+                    m_weights[i].vertexCount, c);
+    }
+    if (baked > 0)
+        VK_LOG_INFO("WEIGHTS-BAKE-ALL meshes=%d reuploaded=%d changedVerts=%d",
+                    baked, reuploaded, changedVerts);
+}
+
+void CharacterWindow::revertWeights() {
+    VK_LOG_INFO("WEIGHTS-REVERT meshes=%d", weightSetCount());
+    m_weightsInited = false;
+    m_weightCacheSet = -1;
+    ensureWeights();
+    // 还原 = 把网格里的四槽重新写回去（`applyWeights` 走的是"脏了才烤"，
+    // 这里把所有都标脏，让每个网格都重传一次）
+    for (std::size_t i = 0; i < m_weightsDirty.size(); ++i)
+        m_weightsDirty[i] = m_weightsActive[i];
+    applyWeights();
+}
+
+void CharacterWindow::drawWeightsPanel() {
+    m_weightsTabOpen = true;
+    if (!m_model || !m_model->skeleton) {
+        ImGui::TextDisabled(TR("(no skeleton)"));
+        return;
+    }
+    ensureWeights();
+
+    const int s = activeWeightSet();
+    const int n = weightSetCount();
+    ImGui::TextDisabled(TR("PAINT WEIGHTS"));
+    ImGui::Separator();
+
+    // ---- 网格选择 ----
+    if (n > 0) {
+        if (m_weightSel < 0 || m_weightSel >= n) m_weightSel = 0;
+        const std::string& nm = m_weights[static_cast<std::size_t>(m_weightSel)].mesh;
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::BeginCombo("##wt_mesh", nm.c_str())) {
+            for (int i = 0; i < n; ++i) {
+                ImGui::PushID(i);
+                char label[192];
+                std::snprintf(label, sizeof(label), "%s%s",
+                              m_weightsActive[static_cast<std::size_t>(i)] ? "" : TR("(static) "),
+                              m_weights[static_cast<std::size_t>(i)].mesh.c_str());
+                if (ImGui::Selectable(label, m_weightSel == i)) {
+                    m_weightSel = i;
+                    m_weightCacheSet = -1;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        logRect("CHAR-WT-MESH", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        tip(TR("Which sub-mesh you are painting. One vertex group set per sub-mesh."));
+    }
+    if (s < 0) {
+        ImGui::TextDisabled(TR("(this mesh has no skin weights)"));
+        return;
+    }
+
+    animation::WeightSet& ws = m_weights[static_cast<std::size_t>(s)];
+    const animation::WeightStats st = ws.stats();
+    ImGui::Text("%s %d  %s %d  %s %d", TR("vertices"), st.vertices, TR("touched"),
+                st.touched, TR("no weights"), st.unweighted);
+    logRect("CHAR-WT-STATS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    // ---- 自动权重 ----
+    ImGui::Separator();
+    ImGui::TextDisabled(TR("AUTO WEIGHTS"));
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragFloat(TR("Radius"), &m_autoParams.radiusScale, 0.02f, 0.1f, 8.0f,
+                     "x%.2f");
+    logRect("CHAR-WT-RADIUS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    tip(TR("Envelope radius = bone length x this. Too small leaves the mesh "
+           "unskinned, too large smears one bone over the whole body."));
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragFloat(TR("Falloff"), &m_autoParams.falloff, 0.05f, 0.1f, 8.0f);
+    logRect("CHAR-WT-FALLOFF", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90.0f);
+    ImGui::DragInt(TR("Max infl"), &m_autoParams.maxInfluence, 0.1f, 1,
+                   animation::kMaxInfluence);
+    logRect("CHAR-WT-MAXINF", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::Checkbox(TR("Deform bones only"), &m_autoParams.deformOnly);
+    logRect("CHAR-WT-DEFORMONLY", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::Button(TR("Auto Weights (this mesh)"))) {
+        ensureWeightCaches();
+        const int got = ws.autoAssign(m_rig, m_weightPos,
+                                      glm::inverse(m_model->skeleton->invMeshNode),
+                                      m_autoParams);
+        m_weightsDirty[static_cast<std::size_t>(s)] = got > 0;
+        ws.logSummary("auto");
+        VK_LOG_INFO("WEIGHTS-AUTO mesh=%d assigned=%d", s, got);
+    }
+    logRect("CHAR-WT-AUTO", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Auto Weights (all)"))) {
+        int done = 0;
+        for (int i = 0; i < n; ++i) {
+            if (!m_weightsActive[static_cast<std::size_t>(i)]) continue;
+            assets::Mesh* mesh = m_model->subMeshes[static_cast<std::size_t>(i)].mesh;
+            if (mesh == nullptr) continue;
+            std::vector<glm::vec3> pos;
+            animation::meshVertexPositions(*mesh, pos);
+            const int got = m_weights[static_cast<std::size_t>(i)].autoAssign(
+                m_rig, pos, glm::inverse(m_model->skeleton->invMeshNode), m_autoParams);
+            m_weightsDirty[static_cast<std::size_t>(i)] = got > 0;
+            if (got > 0) ++done;
+        }
+        m_weightCacheSet = -1;
+        VK_LOG_INFO("WEIGHTS-AUTO-ALL meshes=%d", done);
+    }
+    logRect("CHAR-WT-AUTOALL", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    // ---- 刷子 ----
+    ImGui::Separator();
+    ImGui::TextDisabled(TR("BRUSH"));
+    const char* kModes[] = {TR("Add"), TR("Subtract"), TR("Set")};
+    ImGui::SetNextItemWidth(110.0f);
+    ImGui::Combo("##wt_mode", &m_brushMode, kModes, 3);
+    logRect("CHAR-WT-MODE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragFloat(TR("Weight"), &m_brushWeight, 0.005f, 0.0f, 1.0f, "%.3f");
+    logRect("CHAR-WT-WEIGHT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SetNextItemWidth(120.0f);
+    // ⚠ 格式串本身也要 TR()：i18n 覆盖率 E 组扫的就是这种"字面量不在 ImGui 调用
+    //   里、但屏幕上显示英文"的漏法（`DragFloat` 的 fmt 参数正是典型）。
+    ImGui::DragFloat(TR("Brush size"), &m_brushRadiusPx, 0.5f, 4.0f, 400.0f,
+                     TR("%.0f px"));
+    logRect("CHAR-WT-BRUSH", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110.0f);
+    ImGui::DragFloat(TR("Softness"), &m_strengthScale, 0.02f, 0.1f, 6.0f);
+    logRect("CHAR-WT-SOFT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    tip(TR("Softness: how fast the stroke fades from the brush centre to its edge."));
+    ImGui::Checkbox(TR("Auto normalize"), &m_brushAutoNormalize);
+    logRect("CHAR-WT-AUTONORM", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    ImGui::Checkbox(TR("X mirror"), &m_brushXMirror);
+    logRect("CHAR-WT-MIRROR", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    ImGui::Checkbox(TR("Front faces"), &m_brushFrontFaces);
+    logRect("CHAR-WT-FRONTFACE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    tip(TR("Paint on the vertex group of the bone selected in the Rig tab."));
+    ImGui::Text("%s: %s", TR("Target bone"),
+                (m_rigSel >= 0 && m_rigSel < m_rig.boneCount())
+                    ? m_rig.bones[static_cast<std::size_t>(m_rigSel)].name.c_str()
+                    : TR("(none)"));
+    logRect("CHAR-WT-BONE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    // ---- 工具 ----
+    ImGui::Separator();
+    if (ImGui::Button(TR("Normalize All"))) {
+        const int c = ws.normalizeAll();
+        if (c > 0) m_weightsDirty[static_cast<std::size_t>(s)] = 1;
+        VK_LOG_INFO("WEIGHTS-NORMALIZE mesh=%d fixed=%d", s, c);
+    }
+    logRect("CHAR-WT-NORMALIZE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Smooth"))) {
+        ensureWeightCaches();
+        const int c = ws.blur(m_weightRingOff, m_weightRingIdx, 1, 0.5f);
+        if (c > 0) m_weightsDirty[static_cast<std::size_t>(s)] = 1;
+        VK_LOG_INFO("WEIGHTS-BLUR mesh=%d affected=%d", s, c);
+    }
+    logRect("CHAR-WT-SMOOTH", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Bake to mesh"))) {
+        m_weightsDirty[static_cast<std::size_t>(s)] = 1;
+        applyWeights();
+    }
+    logRect("CHAR-WT-BAKE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    // ---- 文件 ----
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputText("##wt_path", m_weightsPathBuf, sizeof(m_weightsPathBuf));
+    if (ImGui::Button(TR("Save"))) {
+        std::string err;
+        if (!animation::saveWeights(m_weightsPathBuf, ws, err))
+            VK_LOG_WARN("CHAR-WT-SAVE-FAIL err='%s'", err.c_str());
+    }
+    logRect("CHAR-WT-SAVE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Load"))) {
+        animation::WeightSet tmp;
+        std::string err;
+        if (animation::loadWeights(m_weightsPathBuf, tmp, err)) {
+            // 只接受同一张网格（顶点数一致）：顶点数对不上的表换上去，
+            // 权重会整体错位，而画面上只是"角色有点怪"。
+            if (tmp.vertexCount == ws.vertexCount) {
+                const std::string keepMesh = ws.mesh;
+                ws = std::move(tmp);
+                ws.mesh = keepMesh;
+                m_weightsDirty[static_cast<std::size_t>(s)] = 1;
+                m_weightCacheSet = -1;
+            } else {
+                VK_LOG_WARN("CHAR-WT-LOAD-vs vtx=%d vs %d（顶点数不同，拒绝）",
+                            tmp.vertexCount, ws.vertexCount);
+            }
+        } else {
+            VK_LOG_WARN("CHAR-WT-LOAD-FAIL err='%s'", err.c_str());
+        }
+    }
+    logRect("CHAR-WT-LOAD", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    if (ImGui::Button(TR("Revert"))) revertWeights();
+    logRect("CHAR-WT-REVERT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    ImGui::Checkbox(TR("Show weights"), &m_showWeights);
+    logRect("CHAR-WT-SHOW", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+}
+
+// ---------------------------------------------------------------- 视口绘制
+
+bool CharacterWindow::projectWeightVertex(int v, const glm::mat4& viewProj,
+                                          const ImVec2& imgMin, const ImVec2& imgSz,
+                                          glm::vec2& out) const {
+    const int s = activeWeightSet();
+    if (s < 0 || v < 0 || v >= static_cast<int>(m_weightPos.size())) return false;
+    if (!m_model || s >= static_cast<int>(m_model->subMeshes.size())) return false;
+    // 顶点是**网格空间**的，子网格自带节点变换（见 assets/Model.h）
+    const glm::vec3 wp =
+        glm::vec3(m_model->subMeshes[static_cast<std::size_t>(s)].transform *
+                  glm::vec4(m_weightPos[static_cast<std::size_t>(v)], 1.0f));
+    return PickingSystem::worldToScreen(viewProj, glm::vec2(imgMin.x, imgMin.y),
+                                       glm::vec2(imgSz.x, imgSz.y), wp, out);
+}
+
+void CharacterWindow::drawWeightsOverlay(const ImVec2& imgMin, const ImVec2& imgSz,
+                                         const glm::mat4& viewProj, bool hovered) {
+    const int s = activeWeightSet();
+    if (s < 0 || !m_showWeights || m_model == nullptr) return;
+    if (m_rigSel < 0 || m_rigSel >= m_rig.boneCount()) return;
+    const animation::WeightSet& ws = m_weights[static_cast<std::size_t>(s)];
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->PushClipRect(imgMin, ImVec2(imgMin.x + imgSz.x, imgMin.y + imgSz.y), true);
+
+    // 只画"当前选中骨"的权重：全画一遍在多层衣服的网格上是一团糊。
+    // 上限 6000 个点 —— 再多的网格画点会把这帧的 draw call 拖到几十毫秒，
+    // 而权重绘制的用处是"看这块区域分给了谁"，不是"看每个顶点"。
+    constexpr int kMaxDots = 6000;
+    int drawn = 0;
+    int skipped = 0;
+    for (int v = 0; v < ws.vertexCount && drawn < kMaxDots; ++v) {
+        const float w = ws.weightOf(v, m_rigSel);
+        if (w <= 0.0f) continue;
+        glm::vec2 sp;
+        if (!projectWeightVertex(v, viewProj, imgMin, imgSz, sp)) continue;
+        dl->AddCircleFilled(ImVec2(sp.x, sp.y), 1.6f + 1.4f * w, weightColor(w), 8);
+        ++drawn;
+    }
+    for (int v = 0; v < ws.vertexCount; ++v)
+        if (ws.weightOf(v, m_rigSel) > 0.0f) ++skipped;
+    m_weightHudVerts = skipped;
+
+    if (hovered) {
+        const ImVec2 mp = ImGui::GetMousePos();
+        dl->AddCircle(mp, m_brushRadiusPx, IM_COL32(255, 236, 128, 210), 48, 1.6f);
+        dl->AddCircleFilled(mp, 2.2f, IM_COL32(255, 236, 128, 220));
+    }
+    dl->PopClipRect();
+}
+
+void CharacterWindow::handleWeightsPaint(const ImVec2& imgMin, const ImVec2& imgSz,
+                                         const glm::mat4& viewProj, bool hovered) {
+    if (!m_weightsTabOpen || !hovered) return;
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) return;
+    if (m_gizmoConsumed) return;             // 按在骨骼旋转环上时不算刷子
+    const int s = activeWeightSet();
+    if (s < 0) return;
+    if (m_rigSel < 0 || m_rigSel >= m_rig.boneCount()) return;
+    ensureWeightCaches();
+    animation::WeightSet& ws = m_weights[static_cast<std::size_t>(s)];
+    if (ws.vertexCount <= 0) return;
+
+    const ImVec2 mp = ImGui::GetMousePos();
+    const float r = std::max(m_brushRadiusPx, 1.0f);
+    const float r2 = r * r;
+    const float falloffPow = std::max(m_strengthScale, 0.05f);
+    const glm::vec3 eye = m_previewScene.camera().position();
+    const glm::mat4 xform = m_model->subMeshes[static_cast<std::size_t>(s)].transform;
+    const glm::mat3 nrmMat = glm::mat3(xform);
+    const animation::PaintMode mode = static_cast<animation::PaintMode>(m_brushMode);
+
+    int painted = 0;
+    int mirrored = 0;
+    for (int v = 0; v < ws.vertexCount; ++v) {
+        glm::vec2 sp;
+        if (!projectWeightVertex(v, viewProj, imgMin, imgSz, sp)) continue;
+        const float dx = sp.x - mp.x;
+        const float dy = sp.y - mp.y;
+        const float d2 = dx * dx + dy * dy;
+        if (d2 > r2) continue;
+        if (m_brushFrontFaces) {
+            const glm::vec3 wn = nrmMat * m_weightNrm[static_cast<std::size_t>(v)];
+            const glm::vec3 wp = glm::vec3(xform *
+                                           glm::vec4(m_weightPos[static_cast<std::size_t>(v)], 1.0f));
+            if (glm::dot(wn, eye - wp) <= 0.0f) continue;
+        }
+        const float fall = std::pow(std::max(0.0f, 1.0f - std::sqrt(d2) / r), falloffPow);
+        const float amt = m_brushWeight * fall;
+        if (amt <= 0.0f) continue;
+        painted += ws.paintVertex(v, m_rigSel, amt, mode, m_brushAutoNormalize);
+        if (m_brushXMirror) {
+            if (ws.mirrorVertex(m_rig, m_rig.mirrorAxis, m_weightPos, v,
+                                kWeightMirrorEps) >= 0)
+                ++mirrored;
+        }
+    }
+    m_brushHits = painted;
+    if (painted > 0) {
+        m_weightsDirty[static_cast<std::size_t>(s)] = 1;
+        applyWeights();   // 立即上屏：刷子看不到反馈等于没有刷子
+        if (mirrored > 0)
+            VK_LOG_INFO("WEIGHTS-PAINT-MIRROR verts=%d", mirrored);
+    }
+}
+
+void CharacterWindow::runWeightsScript() {
+    if (m_weightsScriptRan) return;
+    const char* raw = std::getenv("MYVK_EDITOR_WEIGHTS_SCRIPT");
+    if (!raw || !raw[0]) {
+        m_weightsScriptRan = true;
+        return;
+    }
+    // 模型异步加载：没有骨架的帧要等，不能把脚本标成"跑过了"
+    if (!m_model || !m_model->skeleton) return;
+    m_weightsScriptRan = true;
+    ensureWeights();
+    m_focusWeightsTab = true;   // 页签不被选中就没有锚点（F 组会整片红）
+
+    int applied = 0;
+    int failed = 0;
+    const auto split = [](const std::string& s) {
+        std::vector<std::string> out;
+        std::size_t pos = 0;
+        while (pos <= s.size()) {
+            const std::size_t p = s.find(':', pos);
+            out.push_back(s.substr(pos, p == std::string::npos ? std::string::npos
+                                                              : p - pos));
+            if (p == std::string::npos) break;
+            pos = p + 1;
+        }
+        return out;
+    };
+    const auto toF = [](const std::string& s, float def) {
+        try { return std::stof(s); } catch (...) { return def; }
+    };
+    const auto toI = [](const std::string& s, int def) {
+        try { return std::stoi(s); } catch (...) { return def; }
+    };
+
+    const std::string all(raw);
+    std::size_t pos = 0;
+    while (pos <= all.size()) {
+        const std::size_t semi = all.find(';', pos);
+        std::string tok = all.substr(pos, semi == std::string::npos
+                                              ? std::string::npos : semi - pos);
+        pos = (semi == std::string::npos) ? all.size() + 1 : semi + 1;
+        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+            tok.erase(tok.begin());
+        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+            tok.pop_back();
+        if (tok.empty()) continue;
+
+        const std::vector<std::string> a = split(tok);
+        const std::string& cmd = a[0];
+        bool ok = false;
+        const int s = activeWeightSet();
+
+        if (cmd == "list") {
+            VK_LOG_INFO("WEIGHTS-LIST meshes=%d active=%d bones=%d deformOn=%d",
+                        weightSetCount(), s, m_rig.boneCount(),
+                        static_cast<int>(m_rig.info().bones - m_rig.info().deformOff));
+            for (int i = 0; i < weightSetCount(); ++i) {
+                const animation::WeightSet& w = m_weights[static_cast<std::size_t>(i)];
+                const animation::WeightStats st2 = w.stats();
+                VK_LOG_INFO("WEIGHTS-LIST-MESH i=%d name='%s' active=%d vtx=%d "
+                            "touched=%d unweighted=%d",
+                            i, w.mesh.c_str(),
+                            static_cast<int>(m_weightsActive[static_cast<std::size_t>(i)]),
+                            st2.vertices, st2.touched, st2.unweighted);
+            }
+            ok = true;
+        } else if (cmd == "mesh" && a.size() >= 2) {
+            const int want = toI(a[1], -1);
+            if (want >= 0 && want < weightSetCount()) {
+                m_weightSel = want;
+                m_weightCacheSet = -1;
+                ok = true;
+            }
+        } else if (cmd == "sel" && a.size() >= 2) {
+            // 目标骨（刷子/色带都看它）
+            const int bi = toI(a[1], -1);
+            if (bi >= 0 && bi < m_rig.boneCount()) {
+                m_rigSel = bi;
+                ok = true;
+            }
+        } else if ((cmd == "auto" || cmd == "autoall")) {
+            if (a.size() >= 2) m_autoParams.radiusScale = toF(a[1], m_autoParams.radiusScale);
+            if (a.size() >= 3) m_autoParams.falloff = toF(a[2], m_autoParams.falloff);
+            if (a.size() >= 4) m_autoParams.maxInfluence = toI(a[3], m_autoParams.maxInfluence);
+            const glm::mat4 m2r = glm::inverse(m_model->skeleton->invMeshNode);
+            int done = 0;
+            for (int i = 0; i < weightSetCount(); ++i) {
+                if (cmd == "auto" && i != s) continue;
+                if (!m_weightsActive[static_cast<std::size_t>(i)]) continue;
+                assets::Mesh* mesh = m_model->subMeshes[static_cast<std::size_t>(i)].mesh;
+                if (mesh == nullptr) continue;
+                std::vector<glm::vec3> vp;
+                animation::meshVertexPositions(*mesh, vp);
+                const int got = m_weights[static_cast<std::size_t>(i)].autoAssign(
+                    m_rig, vp, m2r, m_autoParams);
+                if (got > 0) {
+                    m_weightsDirty[static_cast<std::size_t>(i)] = 1;
+                    ++done;
+                }
+                VK_LOG_INFO("WEIGHTS-AUTO mesh=%d assigned=%d", i, got);
+            }
+            m_weightCacheSet = -1;
+            ok = done > 0;
+        } else if (cmd == "paint" && a.size() >= 4 && s >= 0) {
+            // paint:<vertex>:<bone>:<weight>
+            const int v = toI(a[1], -1);
+            const int b = toI(a[2], -1);
+            const float w = toF(a[3], 0.0f);
+            if (v >= 0 && v < m_weights[static_cast<std::size_t>(s)].vertexCount &&
+                b >= 0 && b < m_rig.boneCount()) {
+                const int n = m_weights[static_cast<std::size_t>(s)].paintVertex(
+                    v, b, w, static_cast<animation::PaintMode>(m_brushMode),
+                    m_brushAutoNormalize);
+                if (n > 0) m_weightsDirty[static_cast<std::size_t>(s)] = 1;
+                ok = n > 0;
+            }
+        } else if (cmd == "mode" && a.size() >= 2) {
+            m_brushMode = std::max(0, std::min(2, toI(a[1], 0)));
+            ok = true;
+        } else if (cmd == "autonorm" && a.size() >= 2) {
+            // 对应 UI 的 Auto normalize 勾选框。关掉之后一次刷子只有
+            // "加/减/设"本身，权重和可以暂时不等于 1 —— 验收靠它把
+            // 三种模式的效果和"归一化"这件事分开测。
+            m_brushAutoNormalize = a[1] != "0";
+            ok = true;
+        } else if (cmd == "norm" && s >= 0) {
+            const int c = m_weights[static_cast<std::size_t>(s)].normalizeAll();
+            if (c > 0) m_weightsDirty[static_cast<std::size_t>(s)] = 1;
+            VK_LOG_INFO("WEIGHTS-NORMALIZE mesh=%d fixed=%d", s, c);
+            ok = true;
+        } else if (cmd == "blur" && s >= 0) {
+            ensureWeightCaches();
+            const int rounds = a.size() >= 2 ? toI(a[1], 1) : 1;
+            const float stg = a.size() >= 3 ? toF(a[2], 0.5f) : 0.5f;
+            const int c = m_weights[static_cast<std::size_t>(s)].blur(
+                m_weightRingOff, m_weightRingIdx, rounds, stg);
+            if (c > 0) m_weightsDirty[static_cast<std::size_t>(s)] = 1;
+            VK_LOG_INFO("WEIGHTS-BLUR mesh=%d affected=%d", s, c);
+            ok = c > 0;
+        } else if (cmd == "clear" && a.size() >= 2 && s >= 0) {
+            const int b = toI(a[1], -1);
+            const int c = m_weights[static_cast<std::size_t>(s)].clearBone(b);
+            if (c > 0) m_weightsDirty[static_cast<std::size_t>(s)] = 1;
+            VK_LOG_INFO("WEIGHTS-CLEARBONE mesh=%d bone=%d verts=%d", s, b, c);
+            ok = c > 0;
+        } else if (cmd == "mirror" && a.size() >= 2 && s >= 0) {
+            ensureWeightCaches();
+            const int v = toI(a[1], -1);
+            const int k = m_weights[static_cast<std::size_t>(s)].mirrorVertex(
+                m_rig, m_rig.mirrorAxis, m_weightPos, v, kWeightMirrorEps);
+            if (k >= 0) m_weightsDirty[static_cast<std::size_t>(s)] = 1;
+            VK_LOG_INFO("WEIGHTS-MIRROR from=%d to=%d axis=%s", v, k,
+                        animation::RigEdit::axisName(m_rig.mirrorAxis));
+            ok = k >= 0;
+        } else if (cmd == "bake") {
+            for (std::size_t i = 0; i < m_weightsDirty.size(); ++i)
+                if (m_weightsActive[i]) m_weightsDirty[i] = 1;
+            applyWeights();
+            ok = true;
+        } else if (cmd == "digest" && s >= 0) {
+            const animation::WeightSet& w = m_weights[static_cast<std::size_t>(s)];
+            VK_LOG_INFO("WEIGHTS-DIGEST mesh=%d name='%s' h=%llu vtx=%d", s,
+                        w.mesh.c_str(), w.digest(), w.vertexCount);
+            ok = true;
+        } else if (cmd == "dump" && a.size() >= 2 && s >= 0) {
+            m_weights[static_cast<std::size_t>(s)].dumpVertex(toI(a[1], -1), "script");
+            ok = true;
+        } else if (cmd == "stats" && s >= 0) {
+            m_weights[static_cast<std::size_t>(s)].logSummary("script");
+            ok = true;
+        } else if (cmd == "save" && a.size() >= 2) {
+            std::string err;
+            const std::string path = tok.substr(5);
+            ok = animation::saveWeights(path, m_weights[static_cast<std::size_t>(s)], err);
+            if (!ok) VK_LOG_WARN("WEIGHTS-SCRIPT-SAVE-FAIL err='%s'", err.c_str());
+        } else if (cmd == "load" && a.size() >= 2) {
+            std::string err;
+            const std::string path = tok.substr(5);
+            animation::WeightSet tmp;
+            ok = animation::loadWeights(path, tmp, err) && s >= 0 &&
+                 tmp.vertexCount == m_weights[static_cast<std::size_t>(s)].vertexCount;
+            if (ok) {
+                const std::string keep = m_weights[static_cast<std::size_t>(s)].mesh;
+                m_weights[static_cast<std::size_t>(s)] = std::move(tmp);
+                m_weights[static_cast<std::size_t>(s)].mesh = keep;
+                m_weightsDirty[static_cast<std::size_t>(s)] = 1;
+                m_weightCacheSet = -1;
+            } else {
+                VK_LOG_WARN("WEIGHTS-SCRIPT-LOAD-FAIL err='%s'", err.c_str());
+            }
+        } else if (cmd == "revert") {
+            revertWeights();
+            ok = true;
+        }
+
+        if (ok) ++applied; else ++failed;
+        if (!ok) VK_LOG_WARN("WEIGHTS-SCRIPT-FAIL cmd='%s'", tok.c_str());
+    }
+
+    // 收尾：把还有脏的一次烤完（脚本里没显式写 bake 也能上屏）
+    bool anyDirty = false;
+    for (char d : m_weightsDirty) if (d) anyDirty = true;
+    if (anyDirty) applyWeights();
+
+    int dirty = 0;
+    for (char d : m_weightsDirty) if (d) ++dirty;
+    VK_LOG_INFO("WEIGHTS-SCRIPT applied=%d failed=%d meshes=%d active=%d sel=%d "
+                "dirty=%d",
+                applied, failed, weightSetCount(), activeWeightSet(), m_rigSel, dirty);
+}
+
 void CharacterWindow::draw() {
     if (!m_open) return;
+    // Weights 页的"这一帧画过吗"：页签内容只在被选中时绘制，于是它天然
+    // 就是"当前页是不是 Weights"的信号 —— 不用再另存一个当前页下标，
+    // 那样会有两个真相源（关掉再打开时对不上）。
+    m_weightsTabOpen = false;
     if (m_previewDirty) rebuildPreviewScene();
 
     // 每帧推进动画时间（速度 / 循环都在这里）
@@ -2943,6 +4655,17 @@ void CharacterWindow::draw() {
             ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
                    ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
 
+    // 骨架编辑的验收注入（`MYVK_EDITOR_RIG_SCRIPT`）。放在**窗口最前**跑，
+    // 这样同一帧的采样/绘制就已经是新骨架 —— 否则脚本改了 rest，画面要等
+    // 下一帧才跟上，截图断言会拍到一个中间态。
+    runRigScript();
+    // 权重的验收注入（`MYVK_EDITOR_WEIGHTS_SCRIPT`）。同样放在最前 ——
+    // 脚本刷完权重要在同一帧上传，截图断言才拍得到。
+    runWeightsScript();
+    // 约束栈的验收注入（`MYVK_EDITOR_CONSTRAINT_SCRIPT`）。同样在最前 ——
+    // 脚本加的约束要在同一帧的采样里生效，否则断言拿到的是上一帧的姿态。
+    runConstraintScript();
+
     // ---- 标题行 ----
     ImGui::Text(TR("Character: %s"), m_playerName.c_str());
     ImGui::SameLine();
@@ -2962,7 +4685,21 @@ void CharacterWindow::draw() {
                              ImGui::GetStyle().ItemSpacing.y;
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const float bodyH = std::max(120.0f, avail.y - transportH);
-    const float leftW = 300.0f;
+    // ---- 左栏宽度 ----
+    // 300 是"刚好装下 Skeleton|Mesh|Rig|Animation"的数（自然宽 63+48+41+80 加
+    // 间距 = 253，看着还有余量，其实余量全在 ImGui 的 TabMinWidthShrink=80 里）。
+    // S-B 加进 Weights 之后总宽 316 > 300，第 5 个页签直接溢出到页签栏外面 ——
+    // 表现是"'Animation' 点了没反应"（矩形还在，但在栏外，鼠标点的是空白），
+    // 2026-10-29 被 verify_character_window 的 CHAR-CLIP 抓到。
+    // 340 让 5 个页签全部按自然宽显示，不靠截断"…"硬挤：截断的 "Skele…"
+    // 比多占 40px 难看得多。带骨架的模型才需要这几十 px（Weights 页只对有蒙皮
+    // 的模型出现），静态网格还是 300。
+    // ⚠ 380 而不是 340：实测 5 个页签的自然宽合计 365（Skeleton 79 / Mesh 57 /
+    //   Rig 41 / Weights 80 / Animation 80 加四个间距），340 的左栏只有 349，
+    //   还差 16px —— ImGui 的 `TabMinWidthShrink=80` 是**下限**，压不到 80 以下
+    //   就只能溢出，于是又变成"最后一个页签点不到"。多出来的 40px 从右栏（
+    //   rightW 296 → 由 avail 算出来 254）拿，预览宽度一点没变。
+    const float leftW = (m_model && m_model->skeleton) ? 380.0f : 300.0f;
     const float rW = std::min(rightW, std::max(220.0f, avail.x - leftW - 320.0f));
     const float previewW = std::max(240.0f, avail.x - leftW - rW -
                                              ImGui::GetStyle().ItemSpacing.x * 2.0f);
@@ -2983,6 +4720,34 @@ void CharacterWindow::draw() {
         }
         logRect("CHAR-TAB-Mesh", ImGui::GetItemRectMin(),
                 ImGui::GetItemRectMax());
+        // Rig 页（S-A）：只要模型带骨架就常驻 —— 它不是"某种模式"，而是
+        // "改这具骨架"的那一页，和 Skeleton 页（只读查看）是两件事。
+        if (m_model && m_model->skeleton) {
+            // 脚本注入时切过来：页签内容只在被选中时绘制，不切就没有锚点，
+            // 验收 F 组会整片红（而那是"测试看不见"，不是"功能没有"）。
+            const ImGuiTabItemFlags rf =
+                m_focusRigTab ? ImGuiTabItemFlags_SetSelected : 0;
+            if (ImGui::BeginTabItem(TR("Rig"), nullptr, rf)) {
+                drawRigPanel();
+                ImGui::EndTabItem();
+            }
+            logRect("CHAR-TAB-Rig", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+            m_focusRigTab = false;
+        }
+        // Weights 页（S-B）：只对**有蒙皮**的模型出现。权重绘制对静态网格
+        // 没有意义（没有骨可绑），留一个空页只会让人以为坏了。
+        if (m_model && m_model->skeleton) {
+            const ImGuiTabItemFlags wf =
+                m_focusWeightsTab ? ImGuiTabItemFlags_SetSelected : 0;
+            if (ImGui::BeginTabItem(TR("Weights"), nullptr, wf)) {
+                drawWeightsPanel();
+                ImGui::EndTabItem();
+            }
+            logRect("CHAR-TAB-Weights", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+            m_focusWeightsTab = false;
+        }
         if (ImGui::BeginTabItem(TR("Animation"))) {
             drawAnimationPanel();
             ImGui::EndTabItem();

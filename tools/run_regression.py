@@ -518,6 +518,28 @@ DEFAULT = [
     # ⚠ px 的判据只用同一批 `DOPE-DUMP` 头里的 t0/pps：脚本里的 `zoom`/`pan`
     #   会立刻改视图，跨批配错的表现是"px 差几十像素"这种假失败。
     "verify_dope_sheet",
+    # ---- 2026-10-29：骨架作者（S-A，#334）----
+    # 这一层是"模型 → 骨架 → 蒙皮"里的第一环，之前整环没有：骨架只能导入、
+    # 导入完只读。新加 `engine/animation/RigEdit.{h,cpp}` + Character 窗口的
+    # Rig 页。验收走 `MYVK_EDITOR_RIG_SCRIPT`（与 UI 同一条数据通路）。
+    # A 组的 `rig_*` 断言在 `MYVK_ANIM_TEST` 里（纯数值，不需要设备）。
+    "verify_rig_edit",
+    # ---- 2026-10-29：蒙皮与权重（S-B，#335）----
+    # "骨架 → 蒙皮"里的第二环：新加 `engine/animation/WeightSet.{h,cpp}`
+    # + Character 窗口的 Weights 页。验收走 `MYVK_EDITOR_WEIGHTS_SCRIPT`。
+    # 最要紧的一条是 E 组：**零编辑烘焙 ≡ 导入路径**（`changed=0`）——
+    # 没刷过的顶点组烘焙出去一个顶点都不许变，否则"打开权重页"本身
+    # 就会让角色的姿态在 1e-7 量级上漂，而画面完全看不出来。
+    "verify_weights",
+    # ---- 2026-10-29：约束栈（S-C，#336）----
+    # "骨架 → 蒙皮 → 约束"里的第三环：新加 `engine/animation/Constraint.{h,cpp}`
+    # （骨上一条按顺序求值的表）+ Character 窗口 Rig 页里的约束段。验收走
+    # `MYVK_EDITOR_CONSTRAINT_SCRIPT`，与 UI 同一条数据通路。
+    # 这一层唯一"截图看不出来"的性质是**顺序**：同两条约束，
+    # [限位 → 复制] 得 60°、[复制 → 限位] 得 20°（A3 点名 + C 组摘要往返）。
+    # 另外三条底线：influence/关掉时**一个字节都不写**（`memcmp`）、
+    # IK 入栈与直接调 `solveTwoBoneIK` **逐位相同**、存读往返摘要不变。
+    "verify_constraints",
     # ---- 2026-10-28：FBX take 名归一化后的**重名去重**（#329）----
     # `anime_girl.fbx` 里是 4 个 AnimationStack（`Rig|Idle` ×2 + `Rig|Walk` ×2），
     # 归一化掉 `|` 前缀后变成 [Idle,Walk,Idle,Walk] —— 撞名的代价不是
@@ -2289,6 +2311,39 @@ TRIGGERS = {
                           "editor/PanelRegistry.*",
                           "editor/CharacterWindow.*",
                           "engine/animation/ClipEdit.*"],
+    # ---- #334：骨架作者（S-A）----
+    # 三处实现主体 + 一个宿主：
+    #   · `engine/animation/RigEdit.*` —— 导入/几何推断/烘焙/镜像轴/JSON 全在这
+    #   · `editor/CharacterWindow.*` —— Rig 页、`MYVK_EDITOR_RIG_SCRIPT`、
+    #     `bake → 换 m_model->skeleton` 的接线（钩子断了就等满超时全红）
+    #   · `engine/animation/AnimationSelfTest.cpp` —— A 组 17 条 `rig_*` 断言
+    #   · `engine/i18n/ZhTable.cpp` 刻意**不登记**（新增词条不改行为，横切见
+    #     verify_theme_language 的注释）
+    "verify_rig_edit": ["engine/animation/RigEdit.*",
+                        "editor/CharacterWindow.*",
+                        "engine/animation/AnimationSelfTest.cpp"],
+    # ---- #335：蒙皮与权重（S-B）----
+    # 三处实现主体 + 一个宿主（和 S-A 同一套形状）：
+    #   · `engine/animation/WeightSet.*` —— 顶点组 / 自动权重 / 烘焙 / 镜像 / JSON
+    #   · `editor/CharacterWindow.*` —— Weights 页、`MYVK_EDITOR_WEIGHTS_SCRIPT`、
+    #     `bake → Mesh::upload` 的重传接线
+    #   · `engine/animation/AnimationSelfTest.cpp` —— 15 条 `weights_*` 断言
+    #   · `engine/i18n/ZhTable.cpp` 同样刻意**不登记**（同 S-A）
+    "verify_weights": ["engine/animation/WeightSet.*",
+                       "editor/CharacterWindow.*",
+                       "engine/animation/AnimationSelfTest.cpp"],
+    # 约束栈（S-C）：
+    #   · `engine/animation/Constraint.*` —— 五种约束 + 栈求值 + JSON
+    #   · `engine/animation/TwoBoneIK.*` —— 栈里的 IK 是它的**薄包装**：
+    #     改了余弦定理/极向量那套，栈里的 IK 必须跟着重验（逐位一致那条断言）
+    #   · `editor/CharacterWindow.*` —— Rig 页的约束段 + `MYVK_EDITOR_CONSTRAINT_SCRIPT`
+    #   · `engine/animation/AnimationSelfTest.cpp` —— 23 条 `constraint_*` 断言
+    #   · `engine/i18n/ZhTable.cpp` 同样刻意**不登记**（同 S-A / S-B：词条
+    #     增减由 verify_i18n_coverage 全量兜，登记进来只会制造假关联）
+    "verify_constraints": ["engine/animation/Constraint.*",
+                           "engine/animation/TwoBoneIK.*",
+                           "editor/CharacterWindow.*",
+                           "engine/animation/AnimationSelfTest.cpp"],
     "verify_world_api": ["engine/script/ScriptEngine.*",
                          "engine/script/ScriptSelfTest.cpp",
                          "runtime/RuntimeApp.cpp",

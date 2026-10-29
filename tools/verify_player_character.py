@@ -203,6 +203,22 @@ def key(hwnd, vk, down):
     user32.PostMessageW(hwnd, WM_KEYDOWN if down else WM_KEYUP, vk, 0)
 
 
+def click(hwnd, x, y):
+    """往客户区发一次左键（按下 + 抬起）。
+
+    ⚠ P5 之后玩家输入被"左键点视口才接管"这道闸门控着（见 RuntimeApp 的
+      `if (m_mouseCaptured) m_player->update(...)`）—— 不点这一下，
+      `GAME-MOUSE captured=0`，之后所有 WM_KEYDOWN 都被丢掉，表现是
+      "按住 W 位移 0.00 m"（V7b/V7c 从 P5 起一直是红的，跟按键注入无关）。
+      PostMessage 不走前台焦点，和 `key()` 是同一套路子。
+    """
+    WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
+    lp = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+    user32.PostMessageW(hwnd, WM_LBUTTONDOWN, 0x0001, lp)
+    time.sleep(0.06)
+    user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lp)
+
+
 # 虚拟键码（与 core/InputMap 的出厂绑定：WASD 移动、Space 跳、Shift 冲刺）
 VK_W, VK_SPACE, VK_SHIFT = 0x57, 0x20, 0x10
 
@@ -274,6 +290,12 @@ def main():
 
     s.wait_for(RE_VISUAL, timeout=15.0)
     time.sleep(2.2)
+
+    # ②b 先点一下视口把输入接管过来（P5 的闸，见 click() 的注释）。
+    #     截图放在点击之后：之前那张是"没接管"的静止态，两张一样没意义。
+    click(s.hwnd, 960 // 2, 600 // 2)
+    time.sleep(0.4)
+
     img_idle = s.shot()
     img_idle.save(os.path.join(OUT_DIR, "player_idle.png"))
 

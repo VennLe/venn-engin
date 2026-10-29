@@ -7,11 +7,15 @@
 #include "animation/AnimatorSystem.h"
 #include "animation/AnimEvent.h"
 #include "animation/ClipEdit.h"
+#include "animation/Constraint.h"
 #include "animation/Curve.h"
+#include "animation/RigEdit.h"
+#include "animation/WeightSet.h"
 #include "animation/RootMotion.h"
 #include "animation/BoneAttachment.h"
 #include "animation/Pose.h"
 #include "animation/TwoBoneIK.h"
+#include "assets/Mesh.h"
 #include "assets/Model.h"
 #include "assets/Skeleton.h"
 #include "core/Logger.h"
@@ -22,6 +26,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -2812,6 +2817,1083 @@ int runAnimationSelfTest() {
                            ",loaded=" + std::to_string(loaded ? 1 : 0));
             std::error_code ec;
             std::filesystem::remove(path, ec);
+        }
+    }
+
+    // ============================================================
+    // S-A：骨架作者（RigEdit）—— 2026-10-29
+    //
+    // 这几条钉的是**约定**，不是功能：
+    //   · `rig_bake_identity` —— 没动过的骨必须逐位照抄（约定 ①）。
+    //     这条一红，说明烘焙在"重建"矩阵，所有老资产都会以 1e-7 漂。
+    //   · `rig_invbind` / `rig_rest_no_deform` —— 改 rest 必须重算 invBind
+    //     （约定 ②），否则静止姿态下人就缩了，而日志一行都不报。
+    //   · `rig_roll_*` —— roll 是"绕骨轴扭"，不是"改朝向"（约定 ③）。
+    // ============================================================
+    {
+        // 夹具：5 根骨的半个上身。spine 的子骨 chest **正好在骨轴上**
+        // （+Z），这样"绕轴 roll 不该挪动子骨头"才是可断言的。
+        const auto makeRigSkel = []() {
+            assets::Skeleton s;
+            s.joints.resize(5);
+            const glm::vec3 pos[5] = {
+                {0.0f, 0.0f, 0.9f},    // hips（根）
+                {0.0f, 0.0f, 1.1f},    // spine
+                {0.0f, 0.0f, 1.3f},    // chest（在 spine 的轴上）
+                {0.20f, 0.0f, 1.3f},   // upperarm.L
+                {-0.20f, 0.0f, 1.3f},  // upperarm.R
+            };
+            const char* names[5] = {"hips", "spine", "chest", "upperarm.L",
+                                    "upperarm.R"};
+            const int parents[5] = {-1, 0, 1, 2, 2};
+            for (int i = 0; i < 5; ++i) {
+                s.joints[i].name = names[i];
+                s.joints[i].parent = parents[i];
+                const glm::vec3 local =
+                    (i == 0) ? pos[0] : (pos[i] - pos[parents[i]]);
+                s.joints[i].restLocal = glm::translate(glm::mat4(1.0f), local);
+            }
+            s.topoOrder = {0, 1, 2, 3, 4};
+            s.invMeshNode = glm::mat4(1.0f);
+            std::vector<glm::mat4> w(5, glm::mat4(1.0f));
+            for (int i : s.topoOrder) {
+                const glm::mat4 base = s.joints[i].parent >= 0
+                                           ? w[s.joints[i].parent]
+                                           : s.joints[i].externalChain;
+                w[i] = base * s.joints[i].restLocal;
+            }
+            for (int i = 0; i < 5; ++i) s.joints[i].invBind = glm::inverse(w[i]);
+            return s;
+        };
+
+        const auto nearV = [](const glm::vec3& a, const glm::vec3& b, float eps) {
+            return std::fabs(a.x - b.x) <= eps && std::fabs(a.y - b.y) <= eps &&
+                   std::fabs(a.z - b.z) <= eps;
+        };
+        const auto nearIdent = [](const glm::mat4& m, float eps) {
+            for (int c = 0; c < 4; ++c)
+                for (int r = 0; r < 4; ++r) {
+                    const float want = (c == r) ? 1.0f : 0.0f;
+                    if (std::fabs(m[c][r] - want) > eps) return false;
+                }
+            return true;
+        };
+        const auto sameMats = [](const assets::Skeleton& a, const assets::Skeleton& b) {
+            if (a.jointCount() != b.jointCount()) return false;
+            for (int i = 0; i < a.jointCount(); ++i) {
+                if (a.joints[i].name != b.joints[i].name) return false;
+                if (a.joints[i].parent != b.joints[i].parent) return false;
+                if (std::memcmp(&a.joints[i].restLocal, &b.joints[i].restLocal,
+                                sizeof(glm::mat4)) != 0) return false;
+                if (std::memcmp(&a.joints[i].invBind, &b.joints[i].invBind,
+                                sizeof(glm::mat4)) != 0) return false;
+            }
+            return true;
+        };
+
+        const assets::Skeleton skel = makeRigSkel();
+        const animation::RigEdit rig0 = animation::RigEdit::fromSkeleton(skel);
+
+        // ---- A1 导入：层级、头位置、几何推断 ----
+        reportFlag("rig_import_bones",
+                   rig0.boneCount() == 5 && rig0.bones[1].parent == 0 &&
+                       rig0.bones[2].parent == 1 && rig0.bones[3].parent == 2 &&
+                       rig0.bones[0].parent == -1,
+                   "n=" + std::to_string(rig0.boneCount()));
+        reportFlag("rig_import_heads",
+                   nearV(rig0.bones[0].head, glm::vec3(0, 0, 0.9f), 1e-6f) &&
+                       nearV(rig0.bones[2].head, glm::vec3(0, 0, 1.3f), 1e-6f) &&
+                       nearV(rig0.bones[3].head, glm::vec3(0.2f, 0, 1.3f), 1e-6f),
+                   "");
+        // spine 的子骨 chest 在 +Z 上：骨长 = 0.2、朝向 = +Z
+        reportFlag("rig_import_geometry",
+                   nearV(rig0.bones[1].dir, glm::vec3(0, 0, 1), 1e-6f) &&
+                       std::fabs(rig0.bones[1].length - 0.2f) < 1e-6f,
+                   "len=" + std::to_string(rig0.bones[1].length));
+        // 叶骨（upperarm）没有子骨：沿父→自己的方向，长度取一半
+        reportFlag("rig_import_leaf",
+                   nearV(rig0.bones[3].dir, glm::vec3(1, 0, 0), 1e-6f) &&
+                       std::fabs(rig0.bones[3].length - 0.1f) < 1e-6f,
+                   "len=" + std::to_string(rig0.bones[3].length));
+
+        // ---- A2 零编辑烘焙 = 逐位照抄（约定 ①）----
+        assets::Skeleton baked0;
+        rig0.bake(skel, baked0);
+        reportFlag("rig_bake_identity", sameMats(skel, baked0), "");
+
+        // ---- A3 JSON 往返之后仍然逐位一致（矩阵不能只存 4 位小数）----
+        {
+            const std::string path =
+                (std::filesystem::temp_directory_path() / "venn_rig_selftest.rig.json")
+                    .string();
+            std::string err;
+            const bool saved = animation::saveRig(path, rig0, err);
+            animation::RigEdit back;
+            const bool loaded = animation::loadRig(path, back, err);
+            assets::Skeleton bakedBack;
+            if (loaded) back.bake(skel, bakedBack);
+            reportFlag("rig_json_roundtrip",
+                       saved && loaded && sameMats(skel, bakedBack),
+                       "saved=" + std::to_string(saved ? 1 : 0) +
+                           ",loaded=" + std::to_string(loaded ? 1 : 0));
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+
+        // ---- A4 roll：绕骨轴扭，骨头不挪、子骨也不挪 ----
+        {
+            animation::RigEdit rig = rig0;
+            rig.setRoll(1, 1.5707963267948966f);   // spine 绕 +Z 扭 90°
+            std::vector<glm::mat4> w;
+            rig.restWorld(w);
+            const glm::vec3 ax = glm::normalize(glm::vec3(w[1][0]));   // 局部 X 轴
+            const bool axisOk = nearV(ax, glm::vec3(0, 1, 0), 1e-5f);
+            const bool headOk = nearV(glm::vec3(w[1][3]), glm::vec3(0, 0, 1.1f), 1e-5f);
+            // chest 在轴上 → 扭它不挪位置（这正是"roll 只改坐标系"的判据）
+            const bool childOk = nearV(glm::vec3(w[2][3]), glm::vec3(0, 0, 1.3f), 1e-5f);
+            reportFlag("rig_roll_twists_axis", axisOk && headOk && childOk,
+                       "ax=(" + std::to_string(ax.x) + "," + std::to_string(ax.y) +
+                           "," + std::to_string(ax.z) + ")");
+
+            // ---- A5 改 rest 之后 invBind 必须跟着变（约定 ②）----
+            assets::Skeleton baked;
+            rig.bake(skel, baked);
+            reportFlag("rig_invbind_recomputed",
+                       nearIdent(w[1] * baked.joints[1].invBind, 1e-5f) &&
+                           nearIdent(w[2] * baked.joints[2].invBind, 1e-5f),
+                       "");
+            // 静止姿态采样：jointMat = invMeshNode·world·invBind ≈ I
+            //（= 改了 rest 之后模型**不会**立刻缩/歪，只改变形坐标系）
+            std::vector<glm::mat4> joints;
+            baked.sample(nullptr, 0.0f, joints);
+            reportFlag("rig_rest_no_deform",
+                       joints.size() == 5 && nearIdent(joints[1], 1e-5f) &&
+                           nearIdent(joints[3], 1e-5f),
+                       "");
+            // 只重算脏子树：
+            //   · hips（roll 的**祖先**）整块逐位不动；
+            //   · chest（roll 的**子孙**）restLocal 不动（父子相对关系没改），
+            //     但 invBind 必须变（世界矩阵变了，约定 ②）。
+            const bool rootSame =
+                std::memcmp(&baked.joints[0].restLocal, &skel.joints[0].restLocal,
+                            sizeof(glm::mat4)) == 0 &&
+                std::memcmp(&baked.joints[0].invBind, &skel.joints[0].invBind,
+                            sizeof(glm::mat4)) == 0;
+            const bool childLocalSame =
+                std::memcmp(&baked.joints[2].restLocal, &skel.joints[2].restLocal,
+                            sizeof(glm::mat4)) == 0;
+            const bool childBindDiff =
+                std::memcmp(&baked.joints[2].invBind, &skel.joints[2].invBind,
+                            sizeof(glm::mat4)) != 0;
+            reportFlag("rig_bake_untouched_keeps",
+                       rootSame && childLocalSame && childBindDiff,
+                       "root=" + std::to_string(rootSame ? 1 : 0) +
+                           ",local=" + std::to_string(childLocalSame ? 1 : 0) +
+                           ",bind=" + std::to_string(childBindDiff ? 1 : 0));
+        }
+
+        // ---- A6 Connected：改父骨尾，子骨的头跟着走 ----
+        {
+            animation::RigEdit rig = rig0;
+            rig.setConnected(1, true);
+            rig.setTail(0, glm::vec3(0, 0, 1.15f));
+            reportFlag("rig_connected_follows",
+                       nearV(rig.bones[1].head, glm::vec3(0, 0, 1.15f), 1e-5f),
+                       "");
+            // 断开之后就不再跟着
+            rig.setConnected(1, false);
+            rig.setTail(0, glm::vec3(0, 0, 1.05f));
+            reportFlag("rig_connected_off",
+                       nearV(rig.bones[1].head, glm::vec3(0, 0, 1.15f), 1e-5f), "");
+        }
+
+        // ---- A7 加骨 / 删骨 / 重名 ----
+        {
+            animation::RigEdit rig = rig0;
+            const int idx = rig.addBone("weapon.R", 4, glm::vec3(-0.2f, 0.2f, 1.3f),
+                                        glm::vec3(0, 1, 0), 0.25f);
+            std::vector<glm::mat4> w;
+            rig.restWorld(w);
+            const bool placed = idx == 5 && w.size() == 6 &&
+                                nearV(glm::vec3(w[5][3]), glm::vec3(-0.2f, 0.2f, 1.3f), 1e-6f);
+            const bool dup = rig.addBone("hips", -1, glm::vec3(0), glm::vec3(0, 0, 1),
+                                         0.1f) == -1;
+            const int removed = rig.removeBone(5);
+            reportFlag("rig_add_remove",
+                       placed && dup && removed == 1 && rig.boneCount() == 5,
+                       "idx=" + std::to_string(idx) + ",rm=" + std::to_string(removed));
+            // 删父骨连带子孙：删 chest 应该带走两条手臂
+            animation::RigEdit rig2 = rig0;
+            const int n2 = rig2.removeBone(2);
+            reportFlag("rig_remove_subtree", n2 == 3 && rig2.boneCount() == 2,
+                       "removed=" + std::to_string(n2));
+        }
+
+        // ---- A8 左右镜像（关于 X=0 平面）----
+        {
+            animation::RigEdit rig = rig0;
+            rig.setRoll(3, 0.6f);
+            const int k = rig.mirrorToOpposite(3);
+            reportFlag("rig_mirror_symmetric",
+                       k == 4 && nearV(rig.bones[4].head, glm::vec3(-0.2f, 0, 1.3f), 1e-6f) &&
+                           nearV(rig.bones[4].dir, glm::vec3(-1, 0, 0), 1e-6f) &&
+                           rig.bones[4].roll == -0.6f,
+                       "k=" + std::to_string(k));
+            // 没有左右标记的骨不猜
+            reportFlag("rig_mirror_skips_unnamed",
+                       rig.mirrorToOpposite(1) == -1 &&
+                           animation::RigEdit::flipSide("spine").empty(),
+                       "");
+        }
+
+        // ---- A9 标志位 ----
+        {
+            animation::RigEdit rig = rig0;
+            rig.setDeform(2, false);
+            rig.setInheritRot(3, false);
+            const animation::RigInfo s = rig.info();
+            reportFlag("rig_flags", s.deformOff == 1 && !rig.bones[3].inheritRot &&
+                                        s.bones == 5 && s.roots == 1,
+                       "roots=" + std::to_string(s.roots));
+        }
+    }
+
+    // ============================================================
+    // 十、S-B 权重：顶点组 / 自动权重 / 烘焙 / 镜像 / 平滑
+    // ============================================================
+    //
+    // 与 A 组（骨架）的关系：这一组**只用** `deform` 标志，不碰 rest。
+    // 三条被钉住的不变量（见 WeightSet.h 头注释）：
+    //   ① 零编辑烘焙逐位一致  —— B2
+    //   ② 每顶点权重和恒为 1  —— B6 / B11
+    //   ③ 只给 deform 骨算权重 —— B7
+    // 这三条只要有一条松了，画面上都只是"角色动起来有点怪"，日志干净。
+    {
+        VK_LOG_INFO("--- S-B 权重：顶点组 / 自动权重 / 烘焙 / 镜像 ---");
+
+        // ---- 夹具一：4 根骨（含一对 .L/.R，用来验镜像）----
+        // 全都不从导入骨架来（srcJoint = -1）→ 恒 touched → restWorld 直接
+        // 由 head/dir/length 算，不依赖任何导入产物。
+        const auto makeWeightRig = []() {
+            animation::RigEdit rig;
+            rig.bones.resize(4);
+            const char* names[4] = {"spine", "chest", "arm.L", "arm.R"};
+            const int parents[4] = {-1, 0, 1, 1};
+            const glm::vec3 head[4] = {{0.0f, 0.0f, 0.0f},
+                                       {0.0f, 0.0f, 0.5f},
+                                       {0.02f, 0.0f, 1.0f},
+                                       {-0.02f, 0.0f, 1.0f}};
+            const float len[4] = {0.5f, 0.5f, 0.3f, 0.3f};
+            for (int i = 0; i < 4; ++i) {
+                animation::EditBone& b = rig.bones[static_cast<std::size_t>(i)];
+                b.name = names[i];
+                b.parent = parents[i];
+                b.srcJoint = -1;
+                b.head = head[i];
+                b.dir = glm::vec3(0.0f, 0.0f, 1.0f);
+                b.length = len[i];
+                b.deform = true;
+            }
+            return rig;
+        };
+
+        // ---- 夹具二：8 个顶点的"人形柱子" ----
+        //   v0..v5 沿骨轴从 0.10 排到 1.35（跨越三根骨的包络）
+        //   v6/v7 是关于 X 轴镜像的一对（±0.05），专门给镜像断言用
+        const auto makeWeightVerts = []() {
+            const float zs[6] = {0.10f, 0.35f, 0.60f, 0.85f, 1.10f, 1.35f};
+            std::vector<assets::Vertex> vs(8);
+            for (int i = 0; i < 6; ++i) vs[static_cast<std::size_t>(i)].pos =
+                glm::vec3(0.0f, 0.0f, zs[i]);
+            vs[6].pos = glm::vec3(0.05f, 0.0f, 0.60f);
+            vs[7].pos = glm::vec3(-0.05f, 0.0f, 0.60f);
+            return vs;
+        };
+        // 三角面（给邻接/平滑用）：0-1-2 / 2-3-4 / 4-5-6 / 1-6-7
+        const std::vector<uint32_t> wIdx = {0, 1, 2, 2, 3, 4, 4, 5, 6, 1, 6, 7};
+
+        const animation::RigEdit wrig = makeWeightRig();
+        std::vector<glm::mat4> wworld;
+        wrig.restWorld(wworld);
+        // A 组那个 nearV 在它自己的块里，这里要一份（块作用域不外泄）
+        const auto nearV = [](const glm::vec3& a, const glm::vec3& b, float eps) {
+            return std::fabs(a.x - b.x) <= eps && std::fabs(a.y - b.y) <= eps &&
+                   std::fabs(a.z - b.z) <= eps;
+        };
+        const bool wworldOk = wworld.size() == 4 &&
+                              nearV(glm::vec3(wworld[2][3]), glm::vec3(0.02f, 0, 1.0f), 1e-6f);
+
+        // ---- B1 导入：零权重尾巴不留 ----
+        {
+            std::vector<assets::Vertex> vs = makeWeightVerts();
+            // v0：导入器常见的"带三条零尾巴"写法
+            vs[0].joints = glm::uvec4(2u, 0u, 0u, 0u);
+            vs[0].weights = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+            // v1：两条真权重
+            vs[1].joints = glm::uvec4(0u, 1u, 0u, 0u);
+            vs[1].weights = glm::vec4(0.6f, 0.4f, 0.0f, 0.0f);
+            const animation::WeightSet ws =
+                animation::WeightSet::fromVertices(vs, "selftest");
+            reportFlag("weights_import_slots",
+                       ws.vertexCount == 8 && ws.influenceCount(0) == 1 &&
+                           ws.influenceCount(1) == 2 && ws.influenceCount(2) == 0 &&
+                           ws.weightOf(0, 2) == 1.0f && ws.weightOf(1, 1) == 0.4f,
+                       "n0=" + std::to_string(ws.influenceCount(0)) + ",n1=" +
+                           std::to_string(ws.influenceCount(1)));
+        }
+
+        // ---- B2 零编辑烘焙 ≡ 导入路径（约定 ①，逐位）----
+        {
+            std::vector<assets::Vertex> vs = makeWeightVerts();
+            vs[0].joints = glm::uvec4(2u, 0u, 0u, 0u);
+            vs[0].weights = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+            vs[1].joints = glm::uvec4(0u, 1u, 0u, 0u);
+            vs[1].weights = glm::vec4(0.6f, 0.4f, 0.0f, 0.0f);
+            const std::vector<assets::Vertex> orig = vs;
+            const animation::WeightSet ws =
+                animation::WeightSet::fromVertices(vs, "selftest");
+            // 先把槽位写成垃圾，再让 bake 恢复 —— 只断言"结果相同"会漏掉
+            // "bake 根本没写"这种情况（垃圾正好等于原值是不可能的，但如果
+            // bake 直接 early-out，槽位就保持垃圾，断言立刻红）。
+            for (assets::Vertex& v : vs) {
+                v.joints = glm::uvec4(9u, 9u, 9u, 9u);
+                v.weights = glm::vec4(-1.0f, -1.0f, -1.0f, -1.0f);
+            }
+            const int changed = ws.bake(vs.data(), nullptr);
+            bool same = true;
+            for (std::size_t i = 0; i < vs.size() && same; ++i) {
+                same = std::memcmp(&vs[i].joints, &orig[i].joints,
+                                   sizeof(glm::uvec4)) == 0 &&
+                       std::memcmp(&vs[i].weights, &orig[i].weights,
+                                   sizeof(glm::vec4)) == 0;
+            }
+            reportFlag("weights_bake_identity", same && changed == 8,
+                       "changed=" + std::to_string(changed) + ",same=" +
+                           std::to_string(same ? 1 : 0));
+        }
+
+        // ---- B3 动过的顶点：降序取前四 + 归一化 ----
+        {
+            animation::WeightSet ws =
+                animation::WeightSet::fromVertices(makeWeightVerts(), "selftest");
+            ws.setWeight(2, 1, 0.2f);
+            ws.setWeight(2, 3, 0.9f);
+            ws.setWeight(2, 0, 0.5f);
+            std::vector<assets::Vertex> vs = makeWeightVerts();
+            ws.bake(vs.data(), nullptr);
+            const float sum = vs[2].weights.x + vs[2].weights.y + vs[2].weights.z +
+                              vs[2].weights.w;
+            reportFlag("weights_bake_sorted",
+                       std::fabs(sum - 1.0f) <= 1e-6f &&
+                           vs[2].joints.x == 3u && vs[2].joints.y == 0u &&
+                           vs[2].joints.z == 1u && vs[2].weights.z > 0.0f,
+                       "sum=" + std::to_string(sum) + ",j0=" +
+                           std::to_string(vs[2].joints.x));
+        }
+
+        // ---- B4 刷子的三种模式 + 自动归一 ----
+        {
+            animation::WeightSet ws =
+                animation::WeightSet::fromVertices(makeWeightVerts(), "selftest");
+            const std::vector<int> hit = {0, 1, 2};
+            const int a = ws.paint(hit, 0, 0.6f, animation::kPaintAdd);
+            const float afterAdd = ws.weightOf(0, 0);
+            const int s2 = ws.paint(hit, 0, 0.25f, animation::kPaintSubtract);
+            const float afterSub = ws.weightOf(0, 0);
+            const int s3 = ws.paint(hit, 3, 0.75f, animation::kPaintSet);
+            const float sum0 = ws.weightOf(0, 0) + ws.weightOf(0, 3);
+            reportFlag("weights_paint_modes",
+                       a == 3 && s2 == 3 && s3 == 3 &&
+                           std::fabs(afterAdd - 1.0f) <= 1e-6f &&
+                           std::fabs(afterSub - 1.0f) <= 1e-6f &&
+                           std::fabs(sum0 - 1.0f) <= 1e-6f,
+                       "add=" + std::to_string(afterAdd) + ",sub=" +
+                           std::to_string(afterSub) + ",sum=" + std::to_string(sum0));
+        }
+
+        // ---- B5 同一批操作跑两遍 == 同一个摘要（全序排序的意义）----
+        {
+            const auto runOnce = [&]() {
+                animation::WeightSet ws =
+                    animation::WeightSet::fromVertices(makeWeightVerts(), "selftest");
+                ws.setWeight(3, 1, 0.5f);
+                ws.setWeight(3, 2, 0.5f);   // 与上一条**权重相等**：排序必须定序
+                ws.setWeight(3, 0, 0.25f);
+                ws.normalizeAll();
+                return ws.digest();
+            };
+            const unsigned long long h1 = runOnce();
+            const unsigned long long h2 = runOnce();
+            reportFlag("weights_digest_stable", h1 == h2,
+                       "h=" + std::to_string(h1));
+        }
+
+        // ---- B6 自动权重：和恒为 1、无孤立顶点（约定 ②）----
+        animation::WeightSet autoWs =
+            animation::WeightSet::fromVertices(makeWeightVerts(), "selftest");
+        {
+            std::vector<glm::vec3> pos;
+            for (const assets::Vertex& v : makeWeightVerts()) pos.push_back(v.pos);
+            animation::AutoWeightParams p;
+            const int assigned =
+                autoWs.autoAssign(wrig, pos, glm::mat4(1.0f), p);
+            const animation::WeightStats st = autoWs.stats();
+            reportFlag("weights_auto_sum_one",
+                       wworldOk && assigned == 8 && st.unweighted == 0 &&
+                           st.minSum >= 1.0f - 1e-5f && st.maxSum <= 1.0f + 1e-5f,
+                       "assigned=" + std::to_string(assigned) + ",unw=" +
+                           std::to_string(st.unweighted) + ",sum=[" +
+                           std::to_string(st.minSum) + "," +
+                           std::to_string(st.maxSum) + "]");
+        }
+
+        // ---- B7 只给 deform 骨算权重（约定 ③）----
+        {
+            animation::RigEdit rig = makeWeightRig();
+            rig.setDeform(1, false);   // chest 关掉
+            animation::WeightSet ws =
+                animation::WeightSet::fromVertices(makeWeightVerts(), "selftest");
+            std::vector<glm::vec3> pos;
+            for (const assets::Vertex& v : makeWeightVerts()) pos.push_back(v.pos);
+            animation::AutoWeightParams p;
+            ws.autoAssign(rig, pos, glm::mat4(1.0f), p);
+            float chestMax = 0.0f;
+            int verticesWithChest = 0;
+            for (int v = 0; v < ws.vertexCount; ++v) {
+                const float w = ws.weightOf(v, 1);
+                if (w > 0.0f) ++verticesWithChest;
+                chestMax = std::max(chestMax, w);
+            }
+            // 反向对照：不关的话它一定有权重（否则这条断言是空转）
+            float chestMaxOn = 0.0f;
+            for (int v = 0; v < autoWs.vertexCount; ++v)
+                chestMaxOn = std::max(chestMaxOn, autoWs.weightOf(v, 1));
+            reportFlag("weights_auto_only_deform",
+                       chestMax == 0.0f && verticesWithChest == 0 &&
+                           chestMaxOn > 0.1f,
+                       "off=" + std::to_string(chestMax) + ",on=" +
+                           std::to_string(chestMaxOn));
+        }
+
+        // ---- B8 最近的那根骨拿到的权重最大 ----
+        {
+            // v0 在 z=0.10（spine 的中段），v4 在 z=1.10（arm 的中段）
+            const bool lowOnSpine = autoWs.weightOf(0, 0) > autoWs.weightOf(0, 1);
+            const bool highOnArm = autoWs.weightOf(4, 2) + autoWs.weightOf(4, 3) > 0.5f;
+            reportFlag("weights_auto_nearest",
+                       lowOnSpine && highOnArm,
+                       "v0.spine=" + std::to_string(autoWs.weightOf(0, 0)) +
+                           ",v4.arms=" +
+                           std::to_string(autoWs.weightOf(4, 2) +
+                                          autoWs.weightOf(4, 3)));
+        }
+
+        // ---- B9 镜像：权重跟着骨名换边（用 S-A 认出来的镜像轴）----
+        {
+            animation::WeightSet ws =
+                animation::WeightSet::fromVertices(makeWeightVerts(), "selftest");
+            ws.setWeight(6, 2, 0.8f);   // v6(+x) → arm.L
+            ws.setWeight(6, 1, 0.2f);
+            std::vector<glm::vec3> pos;
+            for (const assets::Vertex& v : makeWeightVerts()) pos.push_back(v.pos);
+            // 镜像轴 X（这两个顶点只有 x 相反）
+            const int k = ws.mirrorVertex(wrig, 0, pos, 6, 0.01f);
+            const float mirrored = ws.weightOf(7, 3);
+            // 骨名没有 .L/.R → 对面那半边无从谈起，必须**拒绝**而不是猜。
+            // ⚠ 用 v6/v7 这对（它们是这具网格里唯一真对称的一对）：拿一个
+            //   本来就没有镜像伙伴的顶点去断言，返回 -1 是"没找到伙伴"，
+            //   和"骨名没标记"混在一起，断言就成了空转。
+            animation::WeightSet ws2 =
+                animation::WeightSet::fromVertices(makeWeightVerts(), "selftest");
+            ws2.setWeight(6, 1, 1.0f);   // chest：没有左右标记
+            const bool noSideNoMirror = ws2.mirrorVertex(wrig, 0, pos, 6, 0.01f) == -1;
+            reportFlag("weights_mirror_vertex",
+                       k == 7 && std::fabs(mirrored - ws.weightOf(6, 2)) <= 1e-6f &&
+                           ws.weightOf(7, 2) == 0.0f && noSideNoMirror,
+                       "k=" + std::to_string(k) + ",w=" + std::to_string(mirrored) +
+                           ",noSide=" + std::to_string(noSideNoMirror ? 1 : 0));
+        }
+
+        // ---- B10 平滑：权重扩散到 1-ring 邻居，且和仍是 1 ----
+        {
+            animation::WeightSet ws =
+                animation::WeightSet::fromVertices(makeWeightVerts(), "selftest");
+            // 种**两条**骨而不是一条：单条骨归一化之后恒等于 1.0，
+            // 那样"平滑有没有真的把两边的比例带过去"根本看不出来
+            //（第一版就是这么写的，断言只能证明"邻居多了一条骨"）。
+            ws.setWeight(2, 1, 0.6f);
+            ws.setWeight(2, 0, 0.4f);
+            std::vector<int> off;
+            std::vector<int> ring;
+            animation::buildVertexRing(wIdx, ws.vertexCount, off, ring);
+            const int before = ws.influenceCount(1);
+            const int n = ws.blur(off, ring, 1, 0.5f);
+            const float nb = ws.weightOf(1, 1);   // v1 的邻居里有 v2
+            const float ns = ws.weightOf(1, 0);
+            const animation::WeightStats st = ws.stats();
+            reportFlag("weights_blur_spreads",
+                       before == 0 && n >= 2 && ws.influenceCount(1) == 2 &&
+                           std::fabs(nb - 0.6f) <= 1e-4f &&
+                           std::fabs(ns - 0.4f) <= 1e-4f,
+                       "n=" + std::to_string(n) + ",nb=" + std::to_string(nb) +
+                           ",ns=" + std::to_string(ns));
+            reportFlag("weights_blur_keeps_sum",
+                       st.unweighted <= ws.vertexCount - 2 &&
+                           st.maxSum <= 1.0f + 1e-5f && st.minSum >= 1.0f - 1e-5f,
+                       "sum=[" + std::to_string(st.minSum) + "," +
+                           std::to_string(st.maxSum) + "]");
+        }
+
+        // ---- B11 摘骨之后剩下的重新归一化 ----
+        {
+            animation::WeightSet ws =
+                animation::WeightSet::fromVertices(makeWeightVerts(), "selftest");
+            ws.setWeight(0, 0, 0.5f);
+            ws.setWeight(0, 1, 0.5f);
+            const int cleared = ws.clearBone(0);
+            const animation::WeightStats st = ws.stats();
+            reportFlag("weights_clear_bone",
+                       cleared == 1 && ws.weightOf(0, 0) == 0.0f &&
+                           std::fabs(ws.weightOf(0, 1) - 1.0f) <= 1e-6f &&
+                           st.unweighted == ws.vertexCount - 1,
+                       "cleared=" + std::to_string(cleared) + ",sum=" +
+                           std::to_string(ws.weightOf(0, 1)));
+        }
+
+        // ---- B12 1-ring 邻接：对称、不自环 ----
+        {
+            std::vector<int> off;
+            std::vector<int> ring;
+            animation::buildVertexRing(wIdx, 8, off, ring);
+            const auto hasNb = [&](int a, int b) {
+                for (int k = off[static_cast<std::size_t>(a)];
+                     k < off[static_cast<std::size_t>(a) + 1]; ++k)
+                    if (ring[static_cast<std::size_t>(k)] == b) return true;
+                return false;
+            };
+            bool sym = true;
+            bool self = false;
+            for (int a = 0; a < 8; ++a)
+                for (int k = off[static_cast<std::size_t>(a)];
+                     k < off[static_cast<std::size_t>(a) + 1]; ++k) {
+                    const int b = ring[static_cast<std::size_t>(k)];
+                    if (b == a) self = true;
+                    if (!hasNb(b, a)) sym = false;
+                }
+            reportFlag("weights_ring_sym", sym && !self &&
+                                               off[8] > 8 && hasNb(0, 1) && hasNb(1, 0),
+                       "n=" + std::to_string(off[8]));
+        }
+
+        // ---- B14 mask 的作用范围：只重算"真的用到被关掉那根骨"的顶点 ----
+        {
+            std::vector<assets::Vertex> vs(2);
+            vs[0].joints = glm::uvec4(0u, 0u, 0u, 0u);
+            vs[0].weights = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+            vs[1].joints = glm::uvec4(0u, 1u, 0u, 0u);
+            vs[1].weights = glm::vec4(0.5f, 0.5f, 0.0f, 0.0f);
+            const animation::WeightSet ws =
+                animation::WeightSet::fromVertices(vs, "selftest");
+            const std::vector<char> mask = {1, 0};   // 骨 1 关掉
+            // 打乱，证明 bake 真的写了（不然"没变"也可能只是没写）
+            vs[0].joints = glm::uvec4(9u, 9u, 9u, 9u);
+            vs[0].weights = glm::vec4(9.0f, 9.0f, 9.0f, 9.0f);
+            const int c = ws.bake(vs.data(), &mask);
+            // v0 只用骨 0（没被 mask）→ 逐位还原成导入原样
+            const bool v0ok = vs[0].joints.x == 0u && vs[0].weights.x == 1.0f &&
+                              vs[0].weights.y == 0.0f;
+            // v1 用到骨 1（被 mask）→ 只剩骨 0 且归一
+            const bool v1ok = vs[1].joints.x == 0u &&
+                              std::fabs(vs[1].weights.x - 1.0f) <= 1e-6f &&
+                              vs[1].weights.y == 0.0f;
+            reportFlag("weights_bake_mask_scoped", v0ok && v1ok && c == 2,
+                       "changed=" + std::to_string(c) + ",v0=" +
+                           std::to_string(v0ok ? 1 : 0) + ",v1=" +
+                           std::to_string(v1ok ? 1 : 0));
+        }
+
+        // ---- B13 JSON 往返 → 摘要不变 ----
+        {
+            animation::WeightSet ws =
+                animation::WeightSet::fromVertices(makeWeightVerts(), "selftest");
+            ws.setWeight(1, 0, 0.3f);
+            ws.setWeight(1, 2, 0.7f);
+            ws.setWeight(4, 1, 1.0f);
+            const unsigned long long before = ws.digest();
+            const std::string path =
+                (std::filesystem::temp_directory_path() /
+                 "venn_weights_selftest.weights.json")
+                    .string();
+            std::string err;
+            const bool saved = animation::saveWeights(path, ws, err);
+            animation::WeightSet back;
+            const bool loaded = animation::loadWeights(path, back, err);
+            const unsigned long long after = back.digest();
+            reportFlag("weights_json_roundtrip",
+                       saved && loaded && before == after &&
+                           back.vertexCount == ws.vertexCount,
+                       "saved=" + std::to_string(saved ? 1 : 0) + ",eq=" +
+                           std::to_string(before == after ? 1 : 0));
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    }
+
+    // ================================================================
+    // 十一、S-C 约束栈：顺序 / Influence / 限幅 / 复制 / ChildOf / IK 入栈
+    // ================================================================
+    //
+    // 为什么这一组必须全是数值 + memcmp：
+    //   "约束生效了"在截图上分不出"转了 20°"和"转了 35°"，而**顺序**这种
+    //   语义连截图都看不出来 —— 两种顺序都"看起来像被约束了"。所以每条
+    //   既要钉"结果对"，也要钉"该不动的时候一个字节都不动"。
+    {
+        // 夹具：root → spine → {armR, armL → weapon}
+        // 两臂对称摆开，这样"复制旋转"与"镜像"能分开测（复制不该受对称性影响）。
+        const auto makeConRig = []() {
+            auto s = std::make_shared<assets::Skeleton>();
+            s->joints.resize(5);
+            const auto set = [&s](int i, const char* nm, int par, const glm::vec3& t) {
+                s->joints[static_cast<size_t>(i)].name = nm;
+                s->joints[static_cast<size_t>(i)].parent = par;
+                s->joints[static_cast<size_t>(i)].restLocal =
+                    glm::translate(glm::mat4(1.0f), t);
+                s->joints[static_cast<size_t>(i)].invBind = glm::mat4(1.0f);
+            };
+            set(0, "root", -1, glm::vec3(0.0f));
+            set(1, "spine", 0, glm::vec3(0.0f, 0.0f, 0.3f));
+            set(2, "armR", 1, glm::vec3(0.2f, 0.0f, 0.2f));
+            set(3, "armL", 1, glm::vec3(-0.2f, 0.0f, 0.2f));
+            set(4, "weapon", 3, glm::vec3(0.0f, -0.1f, 0.0f));
+            s->topoOrder = {0, 1, 2, 3, 4};
+            s->invMeshNode = glm::mat4(1.0f);
+            return s;
+        };
+        // 局部旋转 → 该骨 X 轴上的角度（度）。限幅的断言全用它。
+        const auto eulerXDeg = [](const Pose& p, int i) {
+            return static_cast<double>(glm::degrees(
+                glm::eulerAngles(glm::normalize(p.rotation[static_cast<size_t>(i)])).x));
+        };
+        const auto worldRotOf = [](const std::vector<glm::mat4>& w, int i) {
+            glm::mat3 r(w[static_cast<size_t>(i)]);
+            const float s = glm::length(r[0]);
+            if (s > 1.0e-8f) r /= s;
+            return glm::normalize(glm::quat_cast(r));
+        };
+        const auto quatAngleDeg = [](const glm::quat& a, const glm::quat& b) {
+            // glm 只有 `angle(q)`（单个四元数）→ 先取相对旋转再求角。
+            // `angle()` 对 q 和 -q 会给不同的值，所以先做 hemisphere 对齐。
+            glm::quat d = glm::normalize(glm::inverse(a) * b);
+            if (d.w < 0.0f) d = -d;
+            return static_cast<double>(glm::degrees(glm::angle(d)));
+        };
+
+        // ---- 类型名 / 摘要 ----
+        {
+            bool names = true;
+            for (int t = 0; t < kConTypeCount; ++t) {
+                int back = -1;
+                names = names &&
+                        constraintTypeFromName(constraintTypeName(t), back) &&
+                        back == t;
+            }
+            int dummy = -1;
+            // 打错一个字母不能"就近匹配"到某个类型上（那会静默变成另一种约束）
+            names = names && !constraintTypeFromName("LimitRotate", dummy) &&
+                    !constraintTypeFromName("", dummy);
+            reportFlag("constraint_type_names", names);
+
+            ConstraintStack a;
+            ConstraintStack b;
+            Constraint c;
+            c.type = kConLimitRotation;
+            c.bone = 3;
+            a.add(c);
+            b.add(c);
+            const bool same = a.digest() == b.digest();
+            b.items[0].influence = 0.5f;
+            reportFlag("constraint_digest_stable",
+                       same && a.digest() != b.digest(),
+                       "same=" + std::to_string(same ? 1 : 0) + ",diff=" +
+                           std::to_string(a.digest() != b.digest() ? 1 : 0));
+        }
+
+        // ---- JSON 往返 ----
+        {
+            const auto skel = makeConRig();
+            ConstraintStack st;
+            {
+                Constraint c;
+                c.type = kConLimitRotation;
+                c.bone = 3;
+                c.limitMask = 1;
+                c.minDeg[0] = 0.0f;
+                c.maxDeg[0] = 20.0f;
+                st.add(c);
+            }
+            {
+                Constraint c;
+                c.type = kConCopyRotation;
+                c.bone = 3;
+                c.target = 2;
+                c.influence = 0.75f;
+                c.axisMask = 5;
+                st.add(c);
+            }
+            {
+                Constraint c;
+                c.type = kConTwoBoneIK;
+                c.ikRoot = 0;
+                c.ikMid = 1;
+                c.ikEnd = 2;
+                c.ikHasTarget = true;
+                c.ikTarget = glm::vec3(0.1f, -0.7f, 0.0f);
+                c.stretch = 0.25f;
+                st.add(c);
+            }
+            const unsigned long long before = st.digest();
+            const std::string path =
+                (std::filesystem::temp_directory_path() /
+                 "venn_constraints_selftest.constraints.json")
+                    .string();
+            std::string err;
+            const bool saved = saveConstraints(path, st, *skel, err);
+            ConstraintStack back;
+            int unresolved = -1;
+            const bool loaded = loadConstraints(path, *skel, back, err, &unresolved);
+            const unsigned long long after = back.digest();
+            reportFlag("constraint_json_roundtrip",
+                       saved && loaded && before == after && back.size() == st.size() &&
+                           unresolved == 0,
+                       "saved=" + std::to_string(saved ? 1 : 0) + ",loaded=" +
+                           std::to_string(loaded ? 1 : 0) + ",eq=" +
+                           std::to_string(before == after ? 1 : 0) + ",bad=" +
+                           std::to_string(unresolved));
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+
+        // ---- LimitRotation：夹到边界 / 限幅内逐位不变 / influence / 关掉 ----
+        {
+            const auto skel = makeConRig();
+            Pose base;
+            base.setRest(*skel);
+            // armL 局部绕 X 转 60°，限位 0..20（肘不能反折的典型形状）
+            base.rotation[3] =
+                glm::normalize(glm::angleAxis(glm::radians(60.0f),
+                                              glm::vec3(1.0f, 0.0f, 0.0f)));
+            Constraint c;
+            c.type = kConLimitRotation;
+            c.bone = 3;
+            c.limitMask = 1;      // 只管 X
+            c.minDeg[0] = 0.0f;
+            c.maxDeg[0] = 20.0f;
+            ConstraintStack st;
+            st.add(c);
+
+            Pose q = base;
+            const ConstraintEvalResult r = st.evaluate(*skel, q);
+            report("constraint_limit_clamped_deg", eulerXDeg(q, 3), 20.0, 0.05);
+            reportFlag("constraint_limit_clamped_count",
+                       r.applied == 1 && r.clamped == 1 && r.failed == 0,
+                       "applied=" + std::to_string(r.applied) + ",clamped=" +
+                           std::to_string(r.clamped));
+
+            // 限幅**以内**：一个字节都不许写（约定 ①）。
+            // 这一条是"给没超限的骨加个约束 → 整条轨道开始漂"的唯一防线。
+            Pose inside;
+            inside.setRest(*skel);
+            inside.rotation[3] =
+                glm::normalize(glm::angleAxis(glm::radians(10.0f),
+                                              glm::vec3(1.0f, 0.0f, 0.0f)));
+            Pose q2 = inside;
+            const ConstraintEvalResult r2 = st.evaluate(*skel, q2);
+            const bool bitwise =
+                std::memcmp(&q2.rotation[3], &inside.rotation[3],
+                            sizeof(glm::quat)) == 0;
+            reportFlag("constraint_limit_inside_bitwise",
+                       bitwise && r2.applied == 0 && r2.skipped == 1,
+                       "bitwise=" + std::to_string(bitwise ? 1 : 0) + ",applied=" +
+                           std::to_string(r2.applied));
+
+            // influence 0.5：从 60° 往 20° 走一半 = 40°（slerp，不是线性缩放）
+            st.items[0].influence = 0.5f;
+            Pose q3 = base;
+            st.evaluate(*skel, q3);
+            report("constraint_limit_influence_half_deg", eulerXDeg(q3, 3), 40.0, 0.2);
+
+            // 关掉 = 没有（逐位）
+            st.items[0].influence = 1.0f;
+            st.items[0].enabled = false;
+            Pose q4 = base;
+            const ConstraintEvalResult r4 = st.evaluate(*skel, q4);
+            reportFlag("constraint_limit_disabled_bitwise",
+                       std::memcmp(&q4.rotation[3], &base.rotation[3],
+                                   sizeof(glm::quat)) == 0 &&
+                           r4.applied == 0,
+                       "applied=" + std::to_string(r4.applied));
+        }
+
+        // ---- CopyRotation / CopyLocation ----
+        {
+            const auto skel = makeConRig();
+            Pose base;
+            base.setRest(*skel);
+            base.rotation[2] = glm::normalize(glm::angleAxis(
+                glm::radians(35.0f), glm::vec3(0.0f, 0.0f, 1.0f)));   // armR
+            base.rotation[3] = glm::normalize(glm::angleAxis(
+                glm::radians(-70.0f), glm::vec3(0.0f, 1.0f, 0.0f)));  // armL
+
+            Constraint rot;
+            rot.type = kConCopyRotation;
+            rot.bone = 3;
+            rot.target = 2;
+            ConstraintStack st;
+            st.add(rot);
+            Pose q = base;
+            const ConstraintEvalResult r = st.evaluate(*skel, q);
+            std::vector<glm::mat4> w;
+            poseToWorld(*skel, q, w);
+            const double diff = quatAngleDeg(worldRotOf(w, 3), worldRotOf(w, 2));
+            report("constraint_copy_rotation_world_diff_deg", diff, 0.0, 1.0e-3);
+            reportFlag("constraint_copy_rotation_applied", r.applied == 1);
+
+            // influence 0 → 逐位不变
+            st.items[0].influence = 0.0f;
+            Pose q0 = base;
+            st.evaluate(*skel, q0);
+            reportFlag("constraint_copy_rotation_influence0",
+                       std::memcmp(&q0.rotation[3], &base.rotation[3],
+                                   sizeof(glm::quat)) == 0);
+
+            // CopyLocation：armL 的头跟到 armR 的头上（两臂对称摆开，
+            // 所以 X 差 0.4 —— 全轴复制之后必须相等）
+            Constraint loc;
+            loc.type = kConCopyLocation;
+            loc.bone = 3;
+            loc.target = 2;
+            ConstraintStack st2;
+            st2.add(loc);
+            Pose q5 = base;
+            st2.evaluate(*skel, q5);
+            std::vector<glm::mat4> w5;
+            poseToWorld(*skel, q5, w5);
+            const glm::vec3 pL = glm::vec3(w5[3][3]);
+            const glm::vec3 pR = glm::vec3(w5[2][3]);
+            report("constraint_copy_location_dist",
+                   static_cast<double>(glm::length(pL - pR)), 0.0, 1.0e-4);
+
+            // 轴掩码：只抄 X → Y/Z 必须还是原来的
+            std::vector<glm::mat4> w0m;
+            poseToWorld(*skel, base, w0m);
+            st2.items[0].axisMask = 1;
+            Pose q6 = base;
+            st2.evaluate(*skel, q6);
+            std::vector<glm::mat4> w6;
+            poseToWorld(*skel, q6, w6);
+            const glm::vec3 d = glm::vec3(w6[3][3]) - glm::vec3(w0m[3][3]);
+            reportFlag("constraint_copy_location_axis_mask",
+                       std::fabs(d.x) > 0.39f && std::fabs(d.y) < 1.0e-5f &&
+                           std::fabs(d.z) < 1.0e-5f,
+                       "dx=" + std::to_string(d.x) + ",dy=" + std::to_string(d.y));
+        }
+
+        // ---- ChildOf：像挂在目标骨下面一样跟着走 ----
+        //
+        // ⚠ 被测骨必须是**目标骨的非后代**。第一版拿 `weapon`（`armL` 的子骨）
+        //   来测，`constraint_childof_control` 直接空转：父子链本来就会带着
+        //   子骨转，所以"不做 ChildOf"和"做了 ChildOf"结果一样 —— 对照组
+        //   证明不了任何事。ChildOf 的真实用途恰恰是**跨层级**：另一条链上的
+        //   武器/道具骨要跟着这只手走（Blender 里也是这个用法）。
+        //   所以这里让 `armR`（spine 的子骨，与 armL 平级）去跟 `armL`。
+        {
+            const auto skel = makeConRig();
+            Pose base;
+            base.setRest(*skel);
+            std::vector<glm::mat4> restW;
+            poseToWorld(*skel, base, restW);
+            // rest 时 armR 相对 armL 的偏移 = (0.4, 0, 0)
+            const glm::vec3 restOff =
+                glm::vec3(restW[2][3]) - glm::vec3(restW[3][3]);
+
+            // armL 绕 Z 转 40°（armR 不受影响：它不在 armL 下面）
+            base.rotation[3] = glm::normalize(glm::angleAxis(
+                glm::radians(40.0f), glm::vec3(0.0f, 0.0f, 1.0f)));
+            std::vector<glm::mat4> naiveW;
+            poseToWorld(*skel, base, naiveW);
+            const glm::vec3 naiveOff =
+                glm::vec3(naiveW[2][3]) - glm::vec3(naiveW[3][3]);
+
+            Constraint c;
+            c.type = kConChildOf;
+            c.bone = 2;      // armR
+            c.target = 3;    // armL
+            ConstraintStack st;
+            st.add(c);
+            Pose q = base;
+            const ConstraintEvalResult r = st.evaluate(*skel, q);
+            std::vector<glm::mat4> w;
+            poseToWorld(*skel, q, w);
+            const glm::vec3 off = glm::vec3(w[2][3]) - glm::vec3(w[3][3]);
+
+            // 相对偏移应该整体转过 40°：Rz(40)·(0.4,0,0)
+            const glm::vec3 want =
+                glm::mat3(glm::rotate(glm::mat4(1.0f), glm::radians(40.0f),
+                                      glm::vec3(0.0f, 0.0f, 1.0f))) *
+                restOff;
+            report("constraint_childof_offset_err",
+                   static_cast<double>(glm::length(off - want)), 0.0, 1.0e-4);
+            // 对照组：不做 ChildOf 时偏移**没**跟着转（否则上面那条是空转）
+            reportFlag("constraint_childof_control",
+                       glm::length(naiveOff - want) > 0.05f,
+                       "naive=" + std::to_string(glm::length(naiveOff - want)));
+            reportFlag("constraint_childof_applied", r.applied == 1);
+        }
+
+        // ---- 顺序就是语义（"栈"与"三个特性"的根本区别）----
+        {
+            const auto skel = makeConRig();
+            Pose base;
+            base.setRest(*skel);
+            // 两根臂都 60°。限位 0..20 +
+            //   顺序 A【限位 → 复制】：先夹到 20，再被 armR 的 60 覆盖 → 60
+            //   顺序 B【复制 → 限位】：先变 60，再夹到 20        → 20
+            base.rotation[2] = glm::normalize(glm::angleAxis(
+                glm::radians(60.0f), glm::vec3(1.0f, 0.0f, 0.0f)));
+            base.rotation[3] = base.rotation[2];
+
+            Constraint lim;
+            lim.type = kConLimitRotation;
+            lim.bone = 3;
+            lim.limitMask = 1;
+            lim.minDeg[0] = 0.0f;
+            lim.maxDeg[0] = 20.0f;
+            Constraint cp;
+            cp.type = kConCopyRotation;
+            cp.bone = 3;
+            cp.target = 2;
+
+            ConstraintStack a;   // 限位 → 复制
+            a.add(lim);
+            a.add(cp);
+            ConstraintStack b;   // 复制 → 限位
+            b.add(cp);
+            b.add(lim);
+
+            Pose qa = base;
+            Pose qb = base;
+            a.evaluate(*skel, qa);
+            b.evaluate(*skel, qb);
+            const double ax = eulerXDeg(qa, 3);
+            const double bx = eulerXDeg(qb, 3);
+            report("constraint_order_limit_then_copy_deg", ax, 60.0, 0.05);
+            report("constraint_order_copy_then_limit_deg", bx, 20.0, 0.05);
+            // 两份栈内容一样、顺序不同 → 摘要必须不同（否则等于没顺序）
+            reportFlag("constraint_order_digest_differs", a.digest() != b.digest());
+        }
+
+        // ---- IK 进栈：与直接求解逐位一致 / influence 0 逐位 / 拉伸 ----
+        {
+            // 髋 → 膝 → 踝，每节 0.4，沿 -Y 伸直
+            auto skel = std::make_shared<assets::Skeleton>();
+            skel->joints.resize(3);
+            skel->joints[0].name = "thigh_l";
+            skel->joints[0].parent = -1;
+            skel->joints[0].restLocal = glm::mat4(1.0f);
+            skel->joints[0].invBind = glm::mat4(1.0f);
+            skel->joints[1].name = "calf_l";
+            skel->joints[1].parent = 0;
+            skel->joints[1].restLocal =
+                glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -0.4f, 0.0f));
+            skel->joints[1].invBind = glm::mat4(1.0f);
+            skel->joints[2].name = "foot_l";
+            skel->joints[2].parent = 1;
+            skel->joints[2].restLocal =
+                glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -0.4f, 0.0f));
+            skel->joints[2].invBind = glm::mat4(1.0f);
+            skel->topoOrder = {0, 1, 2};
+            skel->invMeshNode = glm::mat4(1.0f);
+
+            const glm::vec3 target(0.2f, -0.7f, 0.0f);   // |t| = 0.728 < 0.8
+
+            TwoBoneIKSettings cfg;
+            cfg.hasTarget = true;
+            cfg.target = target;
+            Pose direct;
+            direct.setRest(*skel);
+            solveTwoBoneIK(*skel, cfg, direct);
+
+            Constraint c;
+            c.type = kConTwoBoneIK;
+            c.ikRoot = 0;
+            c.ikMid = 1;
+            c.ikEnd = 2;
+            c.ikHasTarget = true;
+            c.ikTarget = target;
+            ConstraintStack st;
+            st.add(c);
+
+            Pose viaStack;
+            viaStack.setRest(*skel);
+            const ConstraintEvalResult r = st.evaluate(*skel, viaStack);
+            const bool bitwise =
+                std::memcmp(viaStack.rotation.data(), direct.rotation.data(),
+                            direct.rotation.size() * sizeof(glm::quat)) == 0;
+            reportFlag("constraint_ik_via_stack_bitwise",
+                       bitwise && r.ikSolved == 1 && r.applied == 1,
+                       "bitwise=" + std::to_string(bitwise ? 1 : 0) + ",ik=" +
+                           std::to_string(r.ikSolved));
+
+            // influence 0 → 逐位不变
+            st.items[0].influence = 0.0f;
+            Pose zero;
+            zero.setRest(*skel);
+            Pose zeroRef = zero;
+            st.evaluate(*skel, zero);
+            reportFlag("constraint_ik_influence0_bitwise",
+                       std::memcmp(zero.rotation.data(), zeroRef.rotation.data(),
+                                   zeroRef.rotation.size() * sizeof(glm::quat)) == 0);
+
+            // influence 0.5 的误差必须落在 [满权重, 不动] 之间（单调）
+            const auto endErr = [&](const Pose& p) {
+                std::vector<glm::mat4> w;
+                poseToWorld(*skel, p, w);
+                return glm::length(target - glm::vec3(w[2][3]));
+            };
+            st.items[0].influence = 1.0f;
+            Pose full;
+            full.setRest(*skel);
+            st.evaluate(*skel, full);
+            st.items[0].influence = 0.5f;
+            Pose half;
+            half.setRest(*skel);
+            st.evaluate(*skel, half);
+            const float eFull = endErr(full);
+            const float eHalf = endErr(half);
+            const float eNone = endErr(zeroRef);
+            reportFlag("constraint_ik_influence_half_between",
+                       eFull < 2.0e-3f && eHalf > eFull && eHalf < eNone,
+                       "full=" + std::to_string(eFull) + ",half=" +
+                           std::to_string(eHalf) + ",none=" + std::to_string(eNone));
+
+            // 拉伸：目标在 0.95 处（够不到 0.8），stretch 0.5 应该够得着
+            st.items[0].influence = 1.0f;
+            st.items[0].ikTarget = glm::vec3(0.0f, -0.95f, 0.0f);
+            Pose noStretch;
+            noStretch.setRest(*skel);
+            st.evaluate(*skel, noStretch);
+            st.items[0].stretch = 0.5f;
+            Pose stretched;
+            stretched.setRest(*skel);
+            st.evaluate(*skel, stretched);
+            std::vector<glm::mat4> ws;
+            poseToWorld(*skel, stretched, ws);
+            const float errStretch =
+                glm::length(st.items[0].ikTarget - glm::vec3(ws[2][3]));
+            reportFlag("constraint_ik_stretch_reaches",
+                       endErr(noStretch) > 0.10f && errStretch < 2.0e-2f,
+                       "before=" + std::to_string(endErr(noStretch)) + ",after=" +
+                           std::to_string(errStretch));
         }
     }
 

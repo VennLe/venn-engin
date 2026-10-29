@@ -34,8 +34,10 @@
 #include "EditorContext.h"
 
 #include "animation/ClipEdit.h"
+#include "animation/Constraint.h"
 #include "animation/Pose.h"
-
+#include "animation/RigEdit.h"
+#include "animation/WeightSet.h"
 #include "scene/Scene.h"
 
 #include "ecs/Entity.h"
@@ -216,9 +218,67 @@ private:
 
     void drawPosePanel();       // 左栏第 4 页：关键帧列表 + 姿态库 + 存读
     void drawPoseDetails();     // 右栏 Details 的 POSE 段：选中骨的 TRS + 打帧
+
+    // ------------------------------------------------------------
+    // Rig 页（S-A，2026-10-29）：骨架编辑（Blender 的 Armature + Edit Mode）
+    // ------------------------------------------------------------
+    //
+    // 数据在 `animation::RigEdit` 里（engine/animation 下自建结构），
+    // `assets::Skeleton` 仍然是**导入产物**、一个字节不改 —— 编辑结果是通过
+    // `bake()` 生成一份**新的** Skeleton 换给 `m_model->skeleton`。
+    // 这样"改坏了"随时能 revert 回导入态（`m_rigBase` 一直握着原始指针）。
+    void drawRigPanel();        // 左栏 Rig 页：骨树 + 选中骨的 head/len/roll/flags
+    void ensureRig();           // 懒初始化：模型/骨架换过就重新导入
+    void applyRig();            // 烘焙 + 换掉预览用的骨架（revalidate 编辑轨道）
+    void revertRig();           // 丢掉编辑，回到导入骨架
+    void runRigScript();        // `MYVK_EDITOR_RIG_SCRIPT` 注入（与 UI 同一条通路）
+    void resetRigToCurrent();   // 以**当前**骨架为基准重新导入（换模型时用）
+
+    // ------------------------------------------------------------
+    // Weights 页（S-B，2026-10-29）：顶点组 + 自动权重 + 权重绘制
+    // ------------------------------------------------------------
+    //
+    // 数据在 `animation::WeightSet` 里（每子网格一份），`assets::Mesh` 的
+    // 顶点数组仍然是**导入产物**：刷完权重才通过 `bake()` 写成四槽，再走
+    // `Mesh::upload()` 重新上传 —— 全仓库唯一的上传入口，不另开后门。
+    //
+    // ⚠ **骨下标 = `RigEdit` 的骨下标**。`RigEdit::bake()` 输出的 Skeleton
+    //   里 `joints[i]` 就是 `bones[i]`，所以两者在"没增删骨"时是同一套编号；
+    //   一旦在 Rig 页增删骨，权重里的下标就会指到别的骨上（没有编译期检查、
+    //   没有运行期崩溃，只有画面上"刷的权重跑到别处"）。`ensureWeights`
+    //   检测到骨数变化会打 `WEIGHTS-STALE` 并重新从网格导入 —— 这是唯一
+    //   能拿到的可信基线（网格里那四个槽就是 GPU 正在用的）。
+    void drawWeightsPanel();
+    void ensureWeights();        // 懒初始化：模型/骨架换过就重新从网格导入
+    void applyWeights();         // 烘焙脏的顶点组 + 重传顶点缓冲
+    void revertWeights();        // 丢掉编辑，回到网格里的原样
+    void runWeightsScript();     // `MYVK_EDITOR_WEIGHTS_SCRIPT` 注入
+    int  weightSetCount() const;
+    int  activeWeightSet() const;              // 当前子网格下标（越界 → -1）
+    void ensureWeightCaches();                 // 顶点位置 + 1-ring（选中网格变了才重建）
+    void handleWeightsPaint(const ImVec2& imgMin, const ImVec2& imgSz,
+                            const glm::mat4& viewProj, bool hovered);
+    void drawWeightsOverlay(const ImVec2& imgMin, const ImVec2& imgSz,
+                            const glm::mat4& viewProj, bool hovered);
+    // 把 mesh 空间的顶点投影到屏幕（笔刷、着色带、脚本 dump 共用）
+    bool projectWeightVertex(int v, const glm::mat4& viewProj,
+                             const ImVec2& imgMin, const ImVec2& imgSz,
+                             glm::vec2& out) const;
+
+    // ---- 约束栈（S-C）----
+    // 数据是 `animation::ConstraintStack`（骨下标 = **骨架 joint 下标**），
+    // Rig 页里挂在"当前选中骨"下面。这里只做编辑与存取，"顺序有意义"这件事
+    // 由 `ConstraintStack::evaluate` 负责，UI 不重复实现。
+    void drawConstraintsSection();
+    void runConstraintScript();          // `MYVK_EDITOR_CONSTRAINT_SCRIPT` 注入
+    void pruneConstraints();             // 换模型/改骨架之后丢掉越界条目
+    int  constraintBoneOfSel() const;    // 当前选中骨 → skeleton joint 下标（-1）
+    void drawConstraintTargetCombo(const char* id, int& joint, float width);
+    bool saveConstraintsTo(const std::string& path);
+    bool loadConstraintsFrom(const std::string& path);
+
     void drawBoneGizmo(const ImVec2& imgMin, const ImVec2& imgSz,
-                       const glm::mat4& viewProj);
-    // 返回 true = 这一下被 gizmo 吃掉了，调用方不要再做点选
+                       const glm::mat4& viewProj);    // 返回 true = 这一下被 gizmo 吃掉了，调用方不要再做点选
     bool handleBoneGizmoInput(const ImVec2& imgMin, const ImVec2& imgSz,
                               const glm::mat4& viewProj);
     void handlePoseKeys();
@@ -283,6 +343,67 @@ private:
     // 把 m_edit / 骨架 / 播放头 / 脏标记推给摄影表；退出 Pose Mode 时解绑。
     // 每帧调用（在 draw 里），bind() 自己会去重，不会刷日志。
     void syncDopeSheet();
+
+    // ---- Rig 页状态（S-A）----
+    animation::RigEdit m_rig;                        // 可编辑骨架（作者改的就是它）
+    std::shared_ptr<assets::Skeleton> m_rigBase;     // 导入骨架（烘焙基准 + revert 用）
+    assets::Skeleton m_rigSkel;                      // 最近一次烘焙结果
+    std::vector<glm::mat4> m_rigWorld;               // 静止世界矩阵（画骨用）
+    bool m_rigActive = false;    // 打开过 Rig 页（= m_rig 已经有内容）
+    bool m_rigDirty = false;     // 需要重烘焙
+    bool m_showRigBones = true;  // 视口里画骨
+    int m_rigSel = -1;           // 选中的骨下标（RigEdit 里的）
+    int m_rigPendingApply = 0;   // >0 = 这帧结束要 apply（UI 批量写时只烘焙一次）
+    // 下一帧是否把左栏切到 Rig 页。验收脚本一定要切 —— 页签内容只有在
+    // **被选中**时才走绘制，不切的话锚点一个都不会出现（R7 的 m_focusPoseTab
+    // 是同一个问题）。
+    bool m_focusRigTab = false;
+    char m_rigPathBuf[512] = {0};
+    bool m_rigScriptRan = false;
+
+    // ---- 约束栈状态（S-C）----
+    animation::ConstraintStack m_constraints;   // 骨下标 = 骨架 joint 下标
+    animation::ConstraintEvalResult m_conStats; // 上一帧求值的账（面板上显示）
+    int m_conSel = -1;                 // 选中的约束（栈里的全局下标）
+    bool m_conDirty = false;           // 有未落盘的编辑（标题上打个 *）
+    bool m_showConstraints = true;     // 视口里画"被约束的骨"高亮
+    char m_conPathBuf[512] = {0};
+    bool m_conScriptRan = false;
+    // 校验和：模型换了之后骨数/顺序可能变，用它决定要不要 prune
+    int m_conBoundJoints = -1;
+
+    // ---- Weights 页状态（S-B）----
+    // 每子网格一份顶点组；`m_weightsActive[i]` = 这一份有内容（网格非空）。
+    std::vector<animation::WeightSet> m_weights;
+    std::vector<char> m_weightsActive;
+    std::vector<char> m_weightsDirty;      // 这一份需要烘焙 + 重传
+    std::vector<glm::vec3> m_weightPos;    // 选中网格的顶点位置（**网格空间**）
+    std::vector<glm::vec3> m_weightNrm;    // 法线（Front Faces Only 用）
+    std::vector<int> m_weightRingOff;      // 1-ring（CSR），平滑用
+    std::vector<int> m_weightRingIdx;
+    int m_weightCacheSet = -1;             // 缓存对应哪个子网格（-1 = 无效）
+    std::vector<char> m_deformMask;        // 骨的 deform 标志（约 binding 用）
+    int m_weightsRigBones = -1;            // 导入时的骨数（检测增删骨后的错位）
+    bool m_weightsInited = false;
+    int m_weightSel = 0;                   // 当前子网格
+    bool m_showWeights = false;            // 视口里画权重色带
+    // 刷子（Blender 的 Weight Paint 那一排）
+    int m_brushMode = 0;                   // 0 Add / 1 Subtract / 2 Set
+    float m_brushWeight = 0.5f;            // 一次刷多少（Add/Subtract 是增量）
+    float m_brushRadiusPx = 46.0f;         // 屏幕像素半径（和 Blender 同口径）
+    float m_strengthScale = 1.0f;          // 中心 → 边缘的衰减强度
+    bool m_brushAutoNormalize = true;      // 刷完立刻归一化
+    bool m_brushXMirror = false;           // 镜像到对侧顶点（骨名 .L/.R 互换）
+    bool m_brushFrontFaces = true;         // 只刷朝向相机的面（免得刷到背面）
+    int m_brushHits = 0;                   // 上一笔刷到几个顶点（HUD 显示）
+    bool m_weightsTabOpen = false;         // 这一帧 Weights 页被绘制了吗
+    bool m_focusWeightsTab = false;
+    char m_weightsPathBuf[512] = {0};
+    bool m_weightsScriptRan = false;
+    // 自动权重参数（面板上可调）
+    animation::AutoWeightParams m_autoParams;
+    // 顶点色带的屏幕坐标缓存（每帧重算太贵；只算"有权重"的前 N 个）
+    int m_weightHudVerts = 0;
     // 名字→下标解析结果（只在 m_editDirty 时重算）
     std::vector<assets::AnimTrack> m_editResolved;
     animation::ResolveStats m_editStats;
