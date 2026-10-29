@@ -100,6 +100,17 @@ public:
     // **"提到了非零增量"**，不是"配了 rootMotion ≠ Off" —— 两者之差 =
     // 配了但一步没走（骨选错 / 动画是原地做的 / 第一帧）。
     int lastRootMotionCount() const { return m_lastRootMotion; }
+    // ---- NLA（R9，2026-10-29）----
+    // 本帧配了 NLA 轨的实体数 / 时间轴上**摆了几条** strip / 其中真的
+    // 混进姿势的 / 想混但混不进去的。
+    // `strips` 与 `applied` 之差**不是**错误：区间外的 strip 天然不生效。
+    // 真正要看的是 `skipped` —— 它只统计"落在区间内、却因为配置问题没生效"
+    // 的那些（clip 名找不到 / 遮罩一根骨没命中 / span 为 0）。
+    int lastNlaCount() const { return m_lastNla; }
+    int lastNlaStripCount() const { return m_lastNlaStrips; }
+    int lastNlaApplied() const { return m_lastNlaApplied; }
+    int lastNlaSkipped() const { return m_lastNlaSkipped; }
+    const std::string& lastNlaProblem() const { return m_lastNlaProblem; }
     // 本帧最近一次提取用的骨名 + 位移量（ANIM-ROOTMOTION 锚点用）。
     const std::string& lastRootBone() const { return m_lastRootBone; }
 
@@ -173,6 +184,20 @@ private:
                     ecs::AnimatorComponent& an, float dt, bool advance,
                     uint32_t entityId);
 
+    // ---- NLA（R9，2026-10-29）----
+    //
+    // 就地改 `pose`：推进 `an.nlaTime`，然后把时间轴上此刻有效的 strip
+    // 逐条盖上去。返回本帧真的混进去的 strip 数。
+    //
+    // ⚠ 位置是硬约束：**在底座之后、`applyLayers` 之前**。
+    //   理由是"谁盖住谁"：底座是玩法权威（idle/run/attack 由代码决定），
+    //   NLA 是作者排好的演出叠加，层（B1）是表演性质的覆盖（挥手/瞄准）。
+    //   三者从下往上的优先级正好是这个顺序。反过来的话，一条 weight=1 的
+    //   strip 会让角色**再也攻击不了**（状态机切了 clip，姿势被 NLA 盖回）。
+    // ⚠ 空 `nlaTracks` 时本函数立刻返回（**逐位不变**，老场景一帧不变）。
+    int applyNla(const assets::Skeleton& skel, Pose& pose,
+                 ecs::AnimatorComponent& an, float dt, bool advance);
+
     // ---- 动画事件分发（B2，2026-10-26）----
     //
     // 把 `track` 在 `[prevTime, newTime)` 里跨过的事件全部 push 进
@@ -212,6 +237,10 @@ private:
     const BoneMask& maskFor(const assets::Skeleton& skel,
                             const BoneMaskSpec& spec);
     std::map<std::string, BoneMask> m_maskCache;
+
+    // NLA 求值的临时缓冲（采样姿势 / rest 基准 / 遮罩缓存）。
+    // 由系统持有一份就够 —— 求值是逐实体串行的，不存在重入。
+    NlaScratch m_nlaScratch;
 
     // 弹簧拓扑缓存。key = (骨架, 前缀表) —— 同一角色实例化多次时共用一份，
     // 不然每个实例都要做一次静止姿势 FK。
@@ -268,6 +297,16 @@ private:
     int m_lastTransitions = 0;   // 本帧采纳的转移总数
     int m_lastLayers = 0;        // 本帧配了附加层的实体数
     int m_lastLayersApplied = 0; // 其中真的混进去至少一层的
+    // NLA（R9）：配了轨的实体数 / 本帧真的混进去的 strip 总数 /
+    // 想混但混不进去的（clip 名错、遮罩空、包络端点）。
+    // `strips` 与 `applied` **同时报**是刻意的：它们是"配了几条"和
+    // "几条真的生效"，两者相等才是正常的；`skipped` 单独一列而不并进
+    // `applied` 的反面 —— "区间外"的 strip 也不生效，但那是正常的。
+    int m_lastNla = 0;
+    int m_lastNlaStrips = 0;
+    int m_lastNlaApplied = 0;
+    int m_lastNlaSkipped = 0;
+    std::string m_lastNlaProblem;   // 本帧第一个问题（clip:xxx / mask:empty）
     int m_lastEvents = 0;        // 本帧发出的事件数（B2）
     std::vector<FiredAnimEvent> m_frameEvents;   // 本帧的事件（tick 开头清空）
     int m_lastRootMotion = 0;    // 本帧真的提到了非零根位移的实体数（B3）

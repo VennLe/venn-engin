@@ -7,6 +7,7 @@
 #include "CurveEditorPanel.h"
 #include "DopeSheetWindow.h"
 #include "BoneCurvePanel.h"
+#include "NlaPanel.h"
 #include "UiEditorWindow.h"
 #include "CommandRegistry.h"
 #include "ContentBrowser.h"
@@ -447,6 +448,13 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         // ⚠ 稳定 ID 必须写成 `###panel_bonecurv`（= trayWindowName 的结果）。
         {"bonecurv", "Bone curves", PanelGroup::Authoring, "", "curve",
          false, true, kSlotNone, &EditorApp::panelDrawBoneCurve},
+        // 2026-10-29（R9）：NLA 时间轴。与上面几格同构，但**数据不在面板里**
+        // —— strip 住在选中实体的 `AnimatorComponent::nlaTracks` 上，与场景
+        // 一起落盘。所以"打开面板"本身不读任何文件，它只是换个角度看场景。
+        // ⚠ 与 Character 窗口 Layers 段**不是**同一个功能（那边没有时间轴，
+        //   见 NlaPanel.h 开头）。
+        {"nla", "NLA", PanelGroup::Authoring, "", "nla", false, true,
+         kSlotNone, &EditorApp::panelDrawNla},
     };
 }
 
@@ -505,6 +513,8 @@ void EditorApp::panelDrawCurveEditor(EditorApp& a) { (void)a; }
 void EditorApp::panelDrawDopeSheet(EditorApp& a) { (void)a; }
 // 同上（S-D）：drawBoneCurveWindow 每帧无条件被调用。
 void EditorApp::panelDrawBoneCurve(EditorApp& a) { (void)a; }
+// 同上（R9）：drawNlaWindow 每帧无条件被调用。
+void EditorApp::panelDrawNla(EditorApp& a) { (void)a; }
 void EditorApp::panelDrawPhysics(EditorApp& a) {
     if (a.m_physicsPanel) a.m_physicsPanel->draw();
 }
@@ -1462,6 +1472,7 @@ void EditorApp::onInit() {
     // S-D 骨骼曲线编辑器（同上）。它**不**持有 CharacterWindow 的 EditClip：
     // 自己从 `.anim.json` 读一份，靠磁盘时间戳比对避免两个写者静默互相覆盖。
     m_boneCurve = std::make_unique<BoneCurvePanel>(*m_ctx);
+    m_nla = std::make_unique<NlaPanel>(*m_ctx);
 
     // E18：命令注册表（命令面板 / 快捷键表 / 总览共用）。必须在所有面板
     // 与 Renderer 都就绪之后 —— 命令的 handler 会摸它们。
@@ -1732,6 +1743,23 @@ void EditorApp::onInit() {
                 panelTrayHiddenRef(idx) = false;
             }
             VK_LOG_INFO("PANEL bonecurv open=1 reason=env path=%s", envBc);
+        }
+    }
+
+    // ---- MYVK_EDITOR_NLA=1：打开 NLA 时间轴面板 ----
+    // 与 BONEC 的区别：它**不需要路径**（strip 住在选中实体的组件上）。
+    // 目标解析顺序 = 当前选择 → 场景里第一个挂 AnimatorComponent 的实体。
+    // 后者是为自动化准备的：脚本没有"选中"这一步也能排出一条时间轴。
+    //   MYVK_EDITOR_NLA_SCRIPT="addstrip:Walk:0:1;weight:1"  注入命令
+    if (std::getenv("MYVK_EDITOR_NLA")) {
+        if (m_nla) {
+            m_nla->open(ecs::Entity{});
+            const int idx = panelIndexOf("nla");
+            if (idx >= 0) {
+                setPanelOpen(idx, true);
+                panelTrayHiddenRef(idx) = false;
+            }
+            VK_LOG_INFO("PANEL nla open=1 reason=env");
         }
     }
 
@@ -4285,6 +4313,7 @@ void EditorApp::onImGui() {
     drawCurveEditorWindow();
     drawDopeSheetWindow();
     drawBoneCurveWindow();
+    drawNlaWindow();
 
     // 浮动面板标题栏的"最小化"按钮。必须排在**所有窗口画完之后**：它要读
     // 每个窗口这一帧的 Pos/Size 才能把那一格摆到关闭 X 的左边（见函数注释）。
@@ -9311,6 +9340,46 @@ void EditorApp::drawBoneCurveWindow() {
     // ---- ③ 画 ----
     bool keep = true;
     m_boneCurve->draw(keep);
+    if (!keep) setPanelOpen(idx, false);
+}
+
+// ============================================================
+// NLA 时间轴（R9，2026-10-29）
+//
+// 与上面几个资产编辑器**逐行同构**，差别只有一处：它不绑定任何文件 ——
+// strip 住在选中实体的 `AnimatorComponent::nlaTracks` 上（与场景一起落盘），
+// 所以"打开"只是把面板显示出来，目标实体由面板自己去场景里解析。
+//
+// ⚠ 面板**每帧**都被调用（表里画过之后这里还要处理"托盘收起 / 关窗"），
+//   这与 BoneCurveWindow 一样，别改成"只在打开时调一次"。
+// ============================================================
+void EditorApp::drawNlaWindow() {
+    if (!m_nla) return;
+    const int idx = panelIndexOf("nla");
+    if (idx < 0) return;
+
+    // ---- ① 托盘收起：窗口对象保持打开，这一帧不提交 ----
+    if (panelTrayHiddenRef(idx) && panelOpen(idx)) return;
+
+    // ---- ② 表 → 窗口 ----
+    bool& open = panelOpenRef("nla");
+    if (!open) {
+        if (m_nla->isOpen()) {
+            m_nla->close();
+            VK_LOG_INFO("PANEL nla open=0");
+        }
+        return;
+    }
+    if (!m_nla->isOpen()) {
+        // 空手开窗：目标跟随当前选择（没有选择就什么都不编辑，
+        // 面板自己会把话说明白）
+        m_nla->open(ecs::Entity{});
+        VK_LOG_INFO("PANEL nla open=1 reason=menu");
+    }
+
+    // ---- ③ 画 ----
+    bool keep = true;
+    m_nla->draw(keep);
     if (!keep) setPanelOpen(idx, false);
 }
 

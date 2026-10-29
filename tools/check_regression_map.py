@@ -334,7 +334,12 @@ run("engine/animation/AnimatorSystem.cpp → 三层顺序", OLD,
           "verify_anim_events",
           # B3：`applyRootMotion` 的调用点也在这里（表演层之后、poseToJoints
           # 之前），`resolveRootBone` / 钳位 / 跨圈丢弃全在这一段里。
-          "verify_root_motion"})
+          "verify_root_motion",
+          # R9：`applyNla` 的调用点也在这里，而且**位置是语义** —— 它必须
+          # 在底座之后、`applyLayers` 之前。挪到后面（比如表演层之后）的
+          # 症状是"拖上片段，角色的头发不再跟着抖"；挪到前面则"一有 strip
+          # 角色就再也攻击不了"。两种都只有那条用例的上下带判据抓得住。
+          "verify_nla"})
 run("assets/shaders/fg_taa.frag → taa", OLD,
     with_change("assets/shaders/fg_taa.frag"), want={"verify_taa"})
 # 2026-10-26（B1）：遮罩解算 + 分层混合的原语（`engine/animation/BoneMask.*`）。
@@ -480,6 +485,18 @@ run("engine/animation/CurveBake.cpp → 骨骼曲线 × 角色链", OLD,
     with_change("engine/animation/CurveBake.cpp"),
     want={"verify_bone_curves", "verify_anim_runtime", "verify_character_import",
           "verify_player_character"})
+# 2026-10-29（R9）：NLA 求值器（`engine/animation/NlaTimeline.*`）。
+# 形状与上面两条一样（自己那条 + `engine/animation/**` 整层的三条），
+# 价值在于把 `verify_nla` **标明归属**：改时间映射是为了验时间轴，
+# 而不是"又要跑四条动画用例"。
+# ⚠ `verify_anim_layers` **不在**并集里，这是刻意的：层登记的是
+#   `engine/animation/BoneMask.*` 那一个文件，不是整层。而 NLA 的遮罩
+#   走的是同一个 `buildBoneMask` / `blendPoseMasked` —— 真改了遮罩语义，
+#   `BoneMask.*` 那条 fixture 会把层拉进来，两条用例各管各的一半。
+run("engine/animation/NlaTimeline.cpp → NLA × 角色链", OLD,
+    with_change("engine/animation/NlaTimeline.cpp"),
+    want={"verify_nla", "verify_anim_runtime", "verify_character_import",
+          "verify_player_character"})
 # 2026-10-28（#318）：曲线求值本体（`engine/animation/Curve.*`）。
 # 期望是"自己那条一定在"的大并集：`engine/animation/**` 整层被四条动画用例
 # 登记着（换求值 = 换它们的输入），而画布画的就是同一份采样。
@@ -517,10 +534,13 @@ run("engine/animation/ClipEdit.cpp → 骨骼打帧 × 姿势模式", OLD,
 # 上面的一层。⚠ 并集里没有 verify_curve_editor / verify_timeline_editor /
 #   verify_sequencer —— 它们登记的是 `engine/animation/Curve.*` 与
 #   `engine/sequence/**`，不是 `engine/animation/**` 整层；把它们写进来会红。
+# 2026-10-29（R9）加 `verify_nla`：`smoothFade`（淡入淡出的形状）在 R9 搬到了
+# `Pose.h/.cpp` —— 层的淡入与 strip 的淡入共用这一份。改它等于同时改两条
+# 淡入曲线，两边都得重验（这条 fixture 出现的理由就是"搬家也得登记"）。
 run("engine/animation/Pose.cpp → 采样地基 × 姿势模式", OLD,
     with_change("engine/animation/Pose.cpp"),
     want={"verify_pose_mode", "verify_anim_runtime", "verify_character_import",
-          "verify_player_character"})
+          "verify_player_character", "verify_nla"})
 # `SequencerSystem.cpp` 是 **C1 / C2 / C6 的交界**：
 #   · C1 组件路径（playhead / 关键帧 / 事件）
 #   · C2 `kind=Line` → 一次 `cue()`

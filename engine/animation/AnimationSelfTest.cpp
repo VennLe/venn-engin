@@ -10,6 +10,7 @@
 #include "animation/Constraint.h"
 #include "animation/Curve.h"
 #include "animation/CurveBake.h"
+#include "animation/NlaTimeline.h"
 #include "animation/RigEdit.h"
 #include "animation/WeightSet.h"
 #include "animation/RootMotion.h"
@@ -4323,6 +4324,497 @@ int runAnimationSelfTest() {
                            std::to_string(d0 == d1 ? 1 : 0));
             std::error_code ec;
             std::filesystem::remove(path, ec);
+        }
+    }
+
+    // ============================================================
+    // R9：NLA（时间轴片段）—— 2026-10-29
+    //
+    // 这一组的判据分两半，重要性差得很远：
+    //
+    //   **"没有 NLA 就等于没有这个功能"**（占一半以上）
+    //     · `nla_empty_bitwise` / `nla_no_active_strip_bitwise` —— 空轨列表、
+    //       或播放头落在所有 strip 之外时，`pose` 必须**逐位**不变。
+    //     · `nla_replace_w1_bitwise` —— 遮罩 All + 权重 1 的 Replace strip，
+    //       结果必须与"只播这条 strip"**逐位**相同（B1 的端点短路白送，
+    //       但得有人钉住"我们真的走了那条短路"）。
+    //
+    //   **"时间映射是可手算的"**
+    //     `sourceTime` 是这一层唯一的新数学（span / speed / loop /
+    //     clipStart..clipEnd 五个变量折成一个时刻）。全部断言都挑在
+    //     能口算的点上（0.25 / 0.5 / 0.75），因为"看起来在动"完全不能
+    //     证明映射是对的 —— 一段匀速直线在错误的映射下照样匀速。
+    // ============================================================
+    {
+        Fixture f;
+        buildLayerFixture(f);
+        const assets::Skeleton* skel = f.model.skeleton.get();
+        const assets::AnimationClip* baseClip = skel->findClip("base");
+        const assets::AnimationClip* upperClip = skel->findClip("upper");
+
+        // 逐位比两份姿势（三条通道全比）。容差会让"多混了 1e-7"混过去，
+        // 而这一组一半的断言就是要抓那 1e-7。
+        const auto poseBitEqual = [](const Pose& a, const Pose& b) {
+            if (a.count() != b.count()) return false;
+            for (int i = 0; i < a.count(); ++i) {
+                const size_t j = static_cast<size_t>(i);
+                if (std::memcmp(&a.translation[j], &b.translation[j],
+                                sizeof(glm::vec3)) != 0)
+                    return false;
+                if (std::memcmp(&a.rotation[j], &b.rotation[j],
+                                sizeof(glm::quat)) != 0)
+                    return false;
+                if (std::memcmp(&a.scale[j], &b.scale[j],
+                                sizeof(glm::vec3)) != 0)
+                    return false;
+            }
+            return true;
+        };
+        const auto sampleInto = [&](const assets::AnimationClip* c, float t,
+                                    Pose& out) {
+            out.setRest(*skel);
+            samplePose(*skel, c, t, out);
+        };
+        // hand 的世界 scale.x —— 这一组唯一的数值判别式（与 B1 同一个理由：
+        // 它是标量、与父骨旋转无关，读一个数就知道"这条 strip 有没有
+        // 覆盖到 hand"）。
+        const auto handScale = [&](const Pose& p) {
+            std::vector<glm::mat4> w;
+            poseToWorld(*skel, p, w);
+            return glm::length(glm::vec3(w[2][0]));
+        };
+        const auto makeStrip = [&](const std::string& clip, float s, float e) {
+            NlaStrip st;
+            st.name = "s";
+            st.clip = clip;
+            st.start = s;
+            st.end = e;
+            return st;
+        };
+        const auto makeTrack = [&](const std::string& name, NlaStrip st) {
+            NlaTrack T;
+            T.name = name;
+            T.strips.push_back(std::move(st));
+            return T;
+        };
+
+        // ---- ① 空轨列表 = 逐位不变（约定 ①）----
+        {
+            Pose p0;
+            sampleInto(baseClip, 0.5f, p0);
+            Pose p1 = p0;
+            NlaScratch sc;
+            const std::vector<NlaTrack> none;
+            const NlaEvalStats st = applyNlaTimeline(*skel, none, 0.5f, p1, sc);
+            reportFlag("nla_empty_bitwise",
+                       poseBitEqual(p0, p1) && st.applied == 0 &&
+                           st.tracks == 0,
+                       "applied=" + std::to_string(st.applied));
+        }
+
+        // ---- ② 播放头落在所有 strip 之外 = 逐位不变（约定 ③）----
+        {
+            Pose p0;
+            sampleInto(baseClip, 0.5f, p0);
+            Pose p1 = p0;
+            NlaScratch sc;
+            const std::vector<NlaTrack> tr{makeTrack(
+                "t", makeStrip("upper", 1.0f, 2.0f))};   // [1,2]，t=0.5 在区间外
+            const NlaEvalStats st = applyNlaTimeline(*skel, tr, 0.5f, p1, sc);
+            reportFlag("nla_no_active_strip_bitwise",
+                       poseBitEqual(p0, p1) && st.active == 0 &&
+                           st.applied == 0 && st.skipped == 0,
+                       "active=" + std::to_string(st.active) +
+                           ",skipped=" + std::to_string(st.skipped));
+        }
+
+        // ---- ③ 遮罩 All + 权重 1 的 Replace = 逐位等于只播那条 strip ----
+        {
+            Pose only;
+            sampleInto(upperClip, 0.5f, only);
+            Pose p;
+            sampleInto(baseClip, 0.5f, p);
+            NlaScratch sc;
+            const std::vector<NlaTrack> tr{
+                makeTrack("t", makeStrip("upper", 0.0f, 1.0f))};
+            const NlaEvalStats st = applyNlaTimeline(*skel, tr, 0.5f, p, sc);
+            reportFlag("nla_replace_w1_bitwise", poseBitEqual(only, p),
+                       "applied=" + std::to_string(st.applied));
+        }
+
+        // ---- ④ 权重 0 = 逐位不变（不是"算个 0"）----
+        {
+            Pose p0;
+            sampleInto(baseClip, 0.5f, p0);
+            Pose p = p0;
+            NlaStrip s = makeStrip("upper", 0.0f, 1.0f);
+            s.weight = 0.0f;
+            NlaScratch sc;
+            const std::vector<NlaTrack> tr{makeTrack("t", s)};
+            const NlaEvalStats st = applyNlaTimeline(*skel, tr, 0.5f, p, sc);
+            // weight 0 → `valid()` 为 false → 算 skipped（配置层面"这条不算"）
+            reportFlag("nla_w0_bitwise",
+                       poseBitEqual(p0, p) && st.applied == 0,
+                       "skipped=" + std::to_string(st.skipped));
+        }
+
+        // ---- ⑤ 时间映射：span / speed / loop（约定 ②）----
+        {
+            // strip [0,2] 映射 1.0 秒的 clip → t=1.0 是正中
+            NlaStrip s = makeStrip("upper", 0.0f, 2.0f);
+            report("nla_map_mid", static_cast<double>(s.sourceTime(1.0f, 1.0f)),
+                   0.5, 1e-6);
+
+            // span 里塞两遍（speed=2）用一条 **span=1** 的 strip 才手算得动：
+            // t=0.25 → u=0.25*2=0.5；t=0.75 → u=1.5 → 折回 0.5。
+            // ⚠ 别拿上面那条 span=2 的 `s` 来算 —— 它的 u 是一半
+            //   （0.25 → 0.125，×2 之后 0.25），第一版就是这么把三条断言
+            //   全算错的（实现是对的，是手算错了）。
+            NlaStrip w = makeStrip("upper", 0.0f, 1.0f);
+            w.speed = 2.0f;
+            report("nla_map_loop_fold",
+                   static_cast<double>(w.sourceTime(0.75f, 1.0f)), 0.5, 1e-6);
+            report("nla_map_loop_quarter",
+                   static_cast<double>(w.sourceTime(0.25f, 1.0f)), 0.5, 1e-6);
+
+            // **端点折回**：loop=true 时 t=end 映射到源区间**开头**。
+            // 这不是怪癖，是"首尾相接不留缝"的保证：接缝那一帧前后两条
+            // strip 给出同一个姿势，而不是"停在末帧 + 从头开始"叠一下。
+            report("nla_map_loop_end_wraps",
+                   static_cast<double>(w.sourceTime(1.0f, 1.0f)), 0.0, 1e-6);
+
+            // 不循环：u 夹到 1 → 停在源区间末尾
+            w.loop = false;
+            report("nla_map_once_clamp",
+                   static_cast<double>(w.sourceTime(0.75f, 1.0f)), 1.0, 1e-6);
+
+            // 截取源区间的一段：[0.25, 0.75] 铺满 strip。
+            // ⚠ 这里必须 `loop = false`：循环时 t=end 会折回 u=0（见上一条），
+            //   断言"末端 = 0.75"就永远不成立。第一版没设，红的正是它。
+            NlaStrip r = makeStrip("upper", 0.0f, 1.0f);
+            r.loop = false;
+            r.clipStart = 0.25f;
+            r.clipEnd = 0.75f;
+            report("nla_map_clip_range_start",
+                   static_cast<double>(r.sourceTime(0.0f, 1.0f)), 0.25, 1e-6);
+            report("nla_map_clip_range_mid",
+                   static_cast<double>(r.sourceTime(0.5f, 1.0f)), 0.5, 1e-6);
+            report("nla_map_clip_range_end",
+                   static_cast<double>(r.sourceTime(1.0f, 1.0f)), 0.75, 1e-6);
+
+            // clipEnd 留空（0/0）= 整段（新建 strip 的默认形态）
+            NlaStrip d = makeStrip("upper", 0.0f, 1.0f);
+            report("nla_map_default_whole",
+                   static_cast<double>(d.sourceTime(0.5f, 1.0f)), 0.5, 1e-6);
+
+            // 负 speed 也要能倒放（fract 必须用 u-floor(u)，fmod 会给负数）
+            NlaStrip n = makeStrip("upper", 0.0f, 1.0f);
+            n.speed = -1.0f;
+            const float neg = n.sourceTime(0.25f, 1.0f);
+            reportFlag("nla_map_negative_speed",
+                       neg >= -1e-6f && neg <= 1.0f + 1e-6f,
+                       "src=" + std::to_string(neg));
+        }
+
+        // ---- ⑥ 包络（淡入淡出）----
+        {
+            // 没有淡入淡出 → **恰好** 1.0（约定 ① 的逐位不变靠它）
+            NlaStrip s = makeStrip("upper", 0.0f, 1.0f);
+            reportFlag("nla_env_none_exact",
+                       s.envelope(0.0f) == 1.0f && s.envelope(0.5f) == 1.0f &&
+                           s.envelope(1.0f) == 1.0f,
+                       "e=" + std::to_string(s.envelope(0.5f)));
+
+            s.blendIn = 0.4f;
+            report("nla_env_in_start", static_cast<double>(s.envelope(0.0f)),
+                   0.0, 1e-6);
+            // smoothFade(0.5) = 0.5（手算：0.25*(3-1)）
+            report("nla_env_in_half", static_cast<double>(s.envelope(0.2f)),
+                   0.5, 1e-6);
+            report("nla_env_in_done", static_cast<double>(s.envelope(0.4f)),
+                   1.0, 1e-6);
+
+            // 两侧都设、且在中间**重叠**：包络 = smoothFade(1)*smoothFade(1)
+            NlaStrip b = makeStrip("upper", 0.0f, 1.0f);
+            b.blendIn = 0.5f;
+            b.blendOut = 0.5f;
+            report("nla_env_overlap_edge",
+                   static_cast<double>(b.envelope(0.5f)), 1.0, 1e-6);
+            // t=0.25：smoothFade(0.5) * smoothFade(1) = 0.5
+            report("nla_env_overlap_quarter",
+                   static_cast<double>(b.envelope(0.25f)), 0.5, 1e-6);
+            // t=0.125：**只有淡入那一侧在斜坡上**（淡出的斜坡从 0.5 才开始）。
+            // env = smoothFade(0.25) * smoothFade(1.75→夹到 1) = 0.15625
+            // ⚠ 第一版写成 0.15625² —— 那是"两侧同时斜坡"的情形，而两侧
+            //   在 t<0.5 时根本不重叠。
+            report("nla_env_overlap_eighth",
+                   static_cast<double>(b.envelope(0.125f)), 0.15625, 1e-6);
+        }
+
+        // ---- ⑦ 遮罩：Allow=hand 只动 hand ----
+        {
+            NlaStrip s = makeStrip("upper", 0.0f, 1.0f);
+            s.mask.mode = BoneMaskMode::Allow;
+            s.mask.roots = {"hand"};
+            Pose p0;
+            sampleInto(baseClip, 0.5f, p0);
+            Pose p = p0;
+            NlaScratch sc;
+            const std::vector<NlaTrack> tr{makeTrack("t", s)};
+            const NlaEvalStats st = applyNlaTimeline(*skel, tr, 0.5f, p, sc);
+            // base 在 0.5 s：hand scale = 1.5；upper 在 0.5 s：2.0
+            report("nla_mask_allow_hand_scale",
+                   static_cast<double>(handScale(p)), 2.0, 1e-5);
+            reportFlag("nla_mask_allow_root_untouched",
+                       std::memcmp(&p.rotation[0], &p0.rotation[0],
+                                   sizeof(glm::quat)) == 0 &&
+                           std::memcmp(&p.rotation[1], &p0.rotation[1],
+                                       sizeof(glm::quat)) == 0,
+                       "applied=" + std::to_string(st.applied));
+        }
+
+        // ---- ⑧ Add 模式：rest 相对增量（约定 ④）----
+        {
+            NlaStrip s = makeStrip("upper", 0.0f, 1.0f);
+            s.blend = NlaBlend::Add;
+            Pose p0;
+            sampleInto(baseClip, 0.5f, p0);
+            Pose p = p0;
+            NlaScratch sc;
+            const std::vector<NlaTrack> tr{makeTrack("t", s)};
+            applyNlaTimeline(*skel, tr, 0.5f, p, sc);
+            // hand：base 1.5 + (upper 2.0 - rest 1.0) = 2.5
+            // （Replace 会是 2.0 —— 两个数差得远，一眼能看出走错了路）
+            report("nla_add_hand_scale", static_cast<double>(handScale(p)),
+                   2.5, 1e-5);
+            // root：upper 根本没有 root 轨 → 增量 0 → 与 base 逐位相同
+            reportFlag("nla_add_untouched_bone_bitwise",
+                       std::memcmp(&p.rotation[0], &p0.rotation[0],
+                                   sizeof(glm::quat)) == 0 &&
+                           std::memcmp(&p.translation[0], &p0.translation[0],
+                                       sizeof(glm::vec3)) == 0,
+                       "ok");
+        }
+
+        // ---- ⑨ 权重 0.5 的 Add 落在"半幅度"上（不是"半姿态"）----
+        {
+            NlaStrip s = makeStrip("upper", 0.0f, 1.0f);
+            s.blend = NlaBlend::Add;
+            s.weight = 0.5f;
+            Pose p;
+            sampleInto(baseClip, 0.5f, p);
+            NlaScratch sc;
+            const std::vector<NlaTrack> tr{makeTrack("t", s)};
+            applyNlaTimeline(*skel, tr, 0.5f, p, sc);
+            // hand：1.5 + (2.0 - 1.0) * 0.5 = 2.0
+            report("nla_add_half_weight", static_cast<double>(handScale(p)),
+                   2.0, 1e-5);
+        }
+
+        // ---- ⑩ 轨顺序 = 求值顺序（下标大的胜出）----
+        {
+            const std::vector<NlaTrack> a{
+                makeTrack("bottom", makeStrip("upper", 0.0f, 1.0f)),
+                makeTrack("top", makeStrip("base", 0.0f, 1.0f))};
+            const std::vector<NlaTrack> b{
+                makeTrack("bottom", makeStrip("base", 0.0f, 1.0f)),
+                makeTrack("top", makeStrip("upper", 0.0f, 1.0f))};
+
+            Pose onlyBase, onlyUpper;
+            sampleInto(baseClip, 0.5f, onlyBase);
+            sampleInto(upperClip, 0.5f, onlyUpper);
+
+            Pose pa, pb;
+            sampleInto(baseClip, 0.5f, pa);
+            NlaScratch s1;
+            applyNlaTimeline(*skel, a, 0.5f, pa, s1);
+            sampleInto(baseClip, 0.5f, pb);
+            NlaScratch s2;
+            applyNlaTimeline(*skel, b, 0.5f, pb, s2);
+
+            reportFlag("nla_order_top_wins",
+                       poseBitEqual(onlyBase, pa) &&
+                           poseBitEqual(onlyUpper, pb),
+                       "ok");
+        }
+
+        // ---- ⑪ 静音 / solo ----
+        {
+            NlaTrack muted = makeTrack("m", makeStrip("upper", 0.0f, 1.0f));
+            muted.muted = true;
+            NlaTrack live = makeTrack("l", makeStrip("upper", 0.0f, 1.0f));
+            Pose p0;
+            sampleInto(baseClip, 0.5f, p0);
+            Pose p = p0;
+            NlaScratch sc;
+            const std::vector<NlaTrack> tr{muted, live};
+            const NlaEvalStats st = applyNlaTimeline(*skel, tr, 0.5f, p, sc);
+            // 静音轨的 strip **不进 active**（它在区间内，但整条轨被跳过）
+            reportFlag("nla_muted_track_skipped",
+                       st.tracksActive == 1 && st.applied == 1 &&
+                           st.active == 1,
+                       "activeTracks=" + std::to_string(st.tracksActive));
+
+            // solo：只有 solo 轨参与
+            NlaTrack soloTr = makeTrack("s", makeStrip("upper", 0.0f, 1.0f));
+            soloTr.solo = true;
+            NlaTrack other = makeTrack("o", makeStrip("base", 0.0f, 1.0f));
+            Pose q0;
+            sampleInto(baseClip, 0.5f, q0);
+            Pose q;
+            sampleInto(baseClip, 0.5f, q);
+            NlaScratch sc2;
+            const std::vector<NlaTrack> tr2{other, soloTr};
+            const NlaEvalStats st2 = applyNlaTimeline(*skel, tr2, 0.5f, q, sc2);
+            Pose onlyUpper;
+            sampleInto(upperClip, 0.5f, onlyUpper);
+            reportFlag("nla_solo_only",
+                       poseBitEqual(onlyUpper, q) && st2.tracksActive == 1,
+                       "activeTracks=" + std::to_string(st2.tracksActive));
+        }
+
+        // ---- ⑫ 配置坏了 = skipped + 报第一个问题（不是"全身覆盖"）----
+        {
+            NlaTrack miss = makeTrack("t", makeStrip("no_such_clip", 0.0f, 1.0f));
+            Pose p0;
+            sampleInto(baseClip, 0.5f, p0);
+            Pose p = p0;
+            NlaScratch sc;
+            const std::vector<NlaTrack> tr{miss};
+            const NlaEvalStats st = applyNlaTimeline(*skel, tr, 0.5f, p, sc);
+            reportFlag("nla_missing_clip_skipped",
+                       st.applied == 0 && st.skipped == 1 &&
+                           poseBitEqual(p0, p) &&
+                           st.firstProblem == "clip:no_such_clip",
+                       "problem=" + st.firstProblem);
+
+            // 遮罩一根骨都没命中 → 同样"这条不生效"，而不是全骨
+            NlaStrip s = makeStrip("upper", 0.0f, 1.0f);
+            s.mask.mode = BoneMaskMode::Allow;
+            s.mask.roots = {"no_such_bone"};
+            Pose r0;
+            sampleInto(baseClip, 0.5f, r0);
+            Pose r = r0;
+            NlaScratch sc2;
+            const std::vector<NlaTrack> tr2{makeTrack("t", s)};
+            const NlaEvalStats st2 = applyNlaTimeline(*skel, tr2, 0.5f, r, sc2);
+            reportFlag("nla_empty_mask_skipped",
+                       st2.applied == 0 && st2.masksUnresolved == 1 &&
+                           poseBitEqual(r0, r),
+                       "unresolved=" + std::to_string(st2.masksUnresolved));
+
+            // span 为 0（新建但还没拖过的 strip）→ 不算"问题"，直接跳过
+            NlaStrip z = makeStrip("upper", 0.5f, 0.5f);
+            Pose q0;
+            sampleInto(baseClip, 0.5f, q0);
+            Pose q = q0;
+            NlaScratch sc3;
+            const std::vector<NlaTrack> tr3{makeTrack("t", z)};
+            const NlaEvalStats st3 = applyNlaTimeline(*skel, tr3, 0.5f, q, sc3);
+            reportFlag("nla_zero_span_skipped",
+                       st3.applied == 0 && st3.skipped == 1 &&
+                           st3.firstProblem == "span:zero",
+                       "problem=" + st3.firstProblem);
+        }
+
+        // ---- ⑬ 交叉淡入：两条 strip 在同一时刻各贡献一半 ----
+        //
+        // 三条都挑成可手算的：
+        //   base 在 0.75 s 的 hand scale = 1.75（1→2 线性）
+        //   strip A = upper [0,1]，在 0.75 s 采到 2.5（1→3 线性）
+        //   strip B = upper [0.5,1.5]，在 0.75 s 采到 1.5（u=0.25）
+        //   两条包络都是 smoothFade(0.5) = 0.5
+        // 逐条盖上去：1.75 →(+0.5) 2.125 →(+0.5) 1.8125
+        {
+            NlaStrip a = makeStrip("upper", 0.0f, 1.0f);
+            a.blendOut = 0.5f;
+            NlaStrip b = makeStrip("upper", 0.5f, 1.5f);
+            b.blendIn = 0.5f;
+            NlaTrack T;
+            T.name = "xfade";
+            T.strips.push_back(a);
+            T.strips.push_back(b);
+
+            Pose p;
+            sampleInto(baseClip, 0.75f, p);
+            NlaScratch sc;
+            const std::vector<NlaTrack> tr{T};
+            const NlaEvalStats st = applyNlaTimeline(*skel, tr, 0.75f, p, sc);
+            report("nla_crossfade_hand_scale",
+                   static_cast<double>(handScale(p)), 1.8125, 1e-5);
+            reportFlag("nla_crossfade_both_applied",
+                       st.active == 2 && st.applied == 2 && st.skipped == 0,
+                       "active=" + std::to_string(st.active) + ",applied=" +
+                           std::to_string(st.applied));
+        }
+
+        // ---- ⑭ 摘要把顺序吃进去 ----
+        {
+            const std::vector<NlaTrack> a{
+                makeTrack("A", makeStrip("base", 0.0f, 1.0f)),
+                makeTrack("B", makeStrip("upper", 0.0f, 1.0f))};
+            const std::vector<NlaTrack> b{
+                makeTrack("B", makeStrip("upper", 0.0f, 1.0f)),
+                makeTrack("A", makeStrip("base", 0.0f, 1.0f))};
+            const unsigned long long da = nlaDigest(a);
+            const unsigned long long db = nlaDigest(b);
+            const unsigned long long da2 = nlaDigest(a);
+            reportFlag("nla_digest_order",
+                       da != db && da == da2,
+                       "same=" + std::to_string(da == da2 ? 1 : 0));
+            report("nla_duration", static_cast<double>(nlaTimelineDuration(a)),
+                   1.0, 1e-6);
+            report("nla_strip_count",
+                   static_cast<double>(nlaStripCount(a)), 2.0, 0.0);
+        }
+
+        // ---- ⑮ 运行时接线：播放头推进 / 回绕 / 暂停 ----
+        {
+            AnimatorSystem sys;
+            Fixture g;
+            buildLayerFixture(g);
+            ecs::AnimatorComponent& an = anim(g);
+            an.nlaTracks.push_back(
+                makeTrack("t", makeStrip("upper", 0.0f, 2.0f)));
+            an.nlaTime = 0.0f;
+            an.nlaSpeed = 1.0f;
+            an.nlaPlaying = true;
+            an.nlaLoop = true;
+
+            runFrames(sys, g, 5, 0.1f);
+            report("nla_runtime_advances", static_cast<double>(an.nlaTime), 0.5,
+                   1e-4);
+            // 真的混进去了（`ANIM-NLA` 的三个数）
+            reportFlag("nla_runtime_applied",
+                       sys.lastNlaCount() == 1 && sys.lastNlaApplied() == 1 &&
+                           sys.lastNlaSkipped() == 0,
+                       "strips=" + std::to_string(sys.lastNlaStripCount()) +
+                           ",applied=" +
+                           std::to_string(sys.lastNlaApplied()));
+
+            // 暂停：时间不动
+            an.nlaPlaying = false;
+            const float frozen = an.nlaTime;
+            runFrames(sys, g, 3, 0.1f);
+            report("nla_runtime_paused", static_cast<double>(an.nlaTime),
+                   static_cast<double>(frozen), 0.0);
+
+            // 回绕：strip 只到 1.0，跑 12 帧 × 0.1 → 1.2 → 0.2
+            an.nlaPlaying = true;
+            an.nlaTracks.clear();
+            an.nlaTracks.push_back(
+                makeTrack("t", makeStrip("upper", 0.0f, 1.0f)));
+            an.nlaTime = 0.0f;
+            runFrames(sys, g, 12, 0.1f);
+            report("nla_runtime_loop", static_cast<double>(an.nlaTime), 0.2,
+                   1e-4);
+
+            // 不循环 → 停在末端（`nlaLoop=false`）
+            an.nlaLoop = false;
+            an.nlaTime = 0.0f;
+            runFrames(sys, g, 20, 0.1f);
+            report("nla_runtime_no_loop_clamp",
+                   static_cast<double>(an.nlaTime), 1.0, 1e-4);
         }
     }
 

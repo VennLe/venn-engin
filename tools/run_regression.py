@@ -550,6 +550,23 @@ DEFAULT = [
     # 另三条底线：没改就写回 `changed=0`、曲线帧数与轨道不等时**整条拒绝**、
     # 存读往返摘要跨进程一致。
     "verify_bone_curves",
+    # ---- 2026-10-29：NLA 时间轴（R9）----
+    # "骨架 → 蒙皮 → 约束 → 曲线"之后的第五环：把片段排到**时间轴**上。
+    # 新加 `engine/animation/NlaTimeline.*`（纯求值）+ `editor/NlaPanel.*`
+    # （图画布）+ `AnimatorComponent::nlaTracks`（**动了 ecs/Components.h**）。
+    #
+    # ⚠ 与 `verify_anim_layers` 的分工（这两个最容易被当成重复用例）：
+    #   层验的是"**按骨覆盖**只动了该动的半边身体"（像素判据）；
+    #   NLA 验的是"**时间映射**是可手算的"（数值判据）—— span / speed /
+    #   loop / clipStart..clipEnd 五个变量折成一个时刻，错一个数在画面上
+    #   只是"节奏有点怪"，只有断言看得出来。
+    #   所以本用例**刻意不做像素判据**：NLA 的混合走的就是同一个
+    #   `blendPoseMasked`，遮罩语义一个字没改，"只动该动的骨"已经由层的
+    #   用例证明过了，再拍一遍只是把同一件事写成更慢更脆的版本。
+    # 五条底线：空轨 / 播放头在区间外 / 权重 0 时 `pose` **逐位**不变；
+    #   遮罩 All + 权重 1 的 Replace 与"只播那条 strip"逐位相同；
+    #   轨顺序即求值顺序（下标大的胜出）。
+    "verify_nla",
     # ---- 2026-10-28：FBX take 名归一化后的**重名去重**（#329）----
     # `anime_girl.fbx` 里是 4 个 AnimationStack（`Rig|Idle` ×2 + `Rig|Walk` ×2），
     # 归一化掉 `|` 前缀后变成 [Idle,Walk,Idle,Walk] —— 撞名的代价不是
@@ -2369,6 +2386,25 @@ TRIGGERS = {
                            "editor/BoneCurvePanel.*",
                            "editor/EditorApp.*",
                            "engine/animation/AnimationSelfTest.cpp"],
+    # NLA（R9）：
+    #   · `engine/animation/NlaTimeline.*` —— 求值器本体（时间映射 / 包络 /
+    #     遮罩 / Add 的 rest 相对增量）
+    #   · `engine/animation/AnimatorSystem.*` —— 接线点：`applyNla` 必须在
+    #     底座之后、`applyLayers` 之前（顺序换了就是"拖上片段角色不攻击了"）
+    #   · `engine/animation/Pose.*` —— `smoothFade` 在 R9搬到这里（层的淡入与
+    #     strip 的淡入共用一份）；改了它两条淡入曲线一起变
+    #   · `editor/NlaPanel.*` —— 画布 + `MYVK_EDITOR_NLA_SCRIPT`
+    #   · `engine/ecs/Components.h` / `engine/scene/SceneSerializer.cpp` ——
+    #     `nlaTracks` 的字段与落盘（两个都是横切，实际会跑全量，这里登记是
+    #     为了让"改 NLA 的数据形状"在影响分析里**指得出名字**）
+    "verify_nla": ["engine/animation/NlaTimeline.*",
+                   "engine/animation/AnimatorSystem.*",
+                   "engine/animation/Pose.*",
+                   "editor/NlaPanel.*",
+                   "editor/EditorApp.*",
+                   "engine/ecs/Components.h",
+                   "engine/scene/SceneSerializer.cpp",
+                   "engine/animation/AnimationSelfTest.cpp"],
     "verify_world_api": ["engine/script/ScriptEngine.*",
                          "engine/script/ScriptSelfTest.cpp",
                          "runtime/RuntimeApp.cpp",

@@ -21,6 +21,7 @@
 #include "animation/RootMotion.h" // RootMotionDelta（B3 根运动）
 // ⚠ 两个头都只依赖 assets/Skeleton.h，不反向依赖 ecs —— 不会成环。
 #include "animation/AnimEvent.h"  // AnimEventTrack（B2 动画事件）
+#include "animation/NlaTimeline.h" // NlaTrack / NlaStrip（R9 NLA）
 // C1 过场时间轴。**这不构成循环**：`sequence/SequenceAsset.h` 只依赖
 // glm / string / vector，它刻意不 include `scene/CameraSystem.h`（见那个
 // 文件头的说明），所以 ecs → sequence 是单向的。
@@ -337,6 +338,40 @@ struct AnimatorComponent {
     //   每次重载重新生成，写进去活不过一次重新导入（详见 `AnimEvent.h`
     //   文件头）。这里跟场景一起落盘，与 layers 同一套作者工作流。
     std::vector<animation::AnimEventTrack> eventTracks;
+
+    // ---- NLA：时间轴上排好的片段（R9，2026-10-29）----
+    //
+    // ⚠⚠ 它**不是** `layers` 的另一个名字。这个问题在 R9 的实现里被问了
+    //    很多遍，答案写在 `animation/NlaTimeline.h` 的开头，这里只留结论：
+    //
+    //      `layers`  = 按骨覆盖的**当前姿态**，没有时间轴位置，播放头自己跑
+    //      `nlaTracks` = 时间轴上排好的**片段**，有起止时刻，整条轴一个播放头
+    //
+    //    硬合并的下场是"我把片段拖上去，角色的上半身被整段替换了" ——
+    //    因为层的 `weight` 语义是"遮罩内换成这一层的姿态"，而 strip 的
+    //    `weight` 是"在这一刻按多少参与混合"。同一个字段名，两个意思。
+    //
+    // 求值顺序（`AnimatorSystem::tick` 里是硬约束，别调）：
+    //    底座 → **本字段的轨** → `layers` → 表演层（LookAt / IK / 弹簧骨）
+    // 空 = 没有 NLA（**与加这个字段之前逐位相同**，老场景不会飘）。
+    std::vector<animation::NlaTrack> nlaTracks;
+
+    // NLA 的播放头与播放控制。
+    //
+    // 为什么 NLA 有自己的一套 time/speed/playing/loop，而**不**复用下面那
+    // 四个：底座那四个决定"当前 clip 播到第几秒"，NLA 这四个决定"整条时间
+    // 轴演到第几秒"。两者是一对多的关系（时间轴上可以摆 8 段 clip），
+    // 合成一个字段就没法表达"底座跑到第 3 圈、NLA 还停在引言"。
+    //
+    // ⚠ `nlaTime` **落盘**（与 `time` 一样）。理由：作者摆好一条时间轴、
+    //   把播放头停在 3.2 s 存盘，下次打开要看到同一帧。运行时状态里只放
+    //   "这一局正在发生的事"（淡入进度之类），播放头是作者数据。
+    float nlaTime = 0.0f;
+    float nlaSpeed = 1.0f;
+    bool nlaPlaying = true;
+    // true = `nlaTime` 超过 `nlaTimelineDuration()` 就回绕到 0。
+    // 空轨时 duration = 0，回绕条件写成 `dur > 0` 才不会每帧把时间清零。
+    bool nlaLoop = true;
 
     // ---- 权威播放状态（有本组件时以这四个为准）----
     float time = 0.0f;      // 当前时刻（秒）

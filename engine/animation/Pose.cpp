@@ -173,4 +173,15 @@ void blendPose(const Pose& a, const Pose& b, float w, Pose& out) {
     }
 }
 
+// 淡入淡出的形状。见 Pose.h 里"为什么要有唯一一份"那段。
+//
+// 端点直接返回 0 / 1 而不是走一遍多项式：`x=1` 时 `1²(3-2)=1` 恰好是 1，
+// 但那是**碰巧**（换个形状就不是了），而"淡入结束 = 完全生效、与没有淡入
+// 逐位相同"是回归基线，不能靠碰巧。
+float smoothFade(float x) {
+    if (x <= 0.0f) return 0.0f;
+    if (x >= 1.0f) return 1.0f;
+    return x * x * (3.0f - 2.0f * x);
+}
+
 } // namespace animation

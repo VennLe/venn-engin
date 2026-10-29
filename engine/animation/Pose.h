@@ -94,4 +94,17 @@ glm::mat4 composeLocalTRS(const glm::vec3& translation,
 // 长度不等时遍历较短的那一侧，多出来的骨骼从 a 原样拷贝。
 void blendPose(const Pose& a, const Pose& b, float w, Pose& out);
 
+// 淡入淡出的形状：smoothstep（`x²(3-2x)`）。
+//
+// 为什么要有**唯一一份**（2026-10-29，R9）：
+//   这个三行式子原先只活在 `AnimatorSystem.cpp` 的匿名命名空间里（
+//   `fadeWeight`，B1 的层淡入用）。NLA 的 strip 交叉淡入是**同一件事**
+//   （"用一条从 0 到 1 的曲线把两份姿势推开"），再抄一份的下场是某天有人
+//   把其中一处换成 `x²` 或 `1-(1-x)²`，然后"层的淡入和片段的淡入手感
+//   不一样" —— 这种偏差没人会当成 bug 报，只会被当成"这功能就这德性"。
+//
+// 端点必须精确：x<=0 → 0、x>=1 → 1（连 `std::clamp` 都省了，直接比）。
+// 否则"淡入时长 0 就是硬切"这条语义会退化成 1e-7 的软切。
+float smoothFade(float x);
+
 } // namespace animation

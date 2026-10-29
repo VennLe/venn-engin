@@ -79,7 +79,7 @@ S-C 就是补这一段，见第 3 节。
 | Dope Sheet 调节奏 | R8 已落地 | ✅ |
 | Graph Editor 调曲线 | S-D：`BoneCurvePanel` 画的是骨骼（每个标量分量一条曲线，手柄 / 缓动 / 贝塞尔都在）；相机那条仍是 R6 的 `CurveEditorPanel`。**运行时还不读缓动表**（只影响预览） | 🟡 |
 | 约束（IK/FK/限位）+ 驱动 | S-C 有了约束栈（Limit / Copy / ChildOf / IK），**但预览之外还没接运行时**；驱动仍无 | 🟡 |
-| Action 复用 / NLA 混合 | Action 概念有（`EditClip`），NLA 无 | 🟡 |
+| Action 复用 / NLA 混合 | Action 概念有（`EditClip`）；R9 的 NLA 能把片段排到时间轴上（起止 / 缩放 / 叠 / 淡入淡出），**但 strip 里的事件与曲线还不进运行时** | 🟡 |
 
 一句话：**从"有一份动画"到"调一份动画"通了；从"有一个模型"到"有一份动画"
 这一段（1→2→3）仍然是断的。**
@@ -228,9 +228,11 @@ Deform / Inherit / 加删骨 / 左右镜像都有了数据通路与验收。
 |---|---|---|---|
 | Action（可复用动画） | 导入的只读 `assets::AnimationClip`（`Skeleton.h:43`）+ 可写回的 `animation::EditClip`（`ClipEdit.h`） | ✅ | — |
 | Action Editor（改名 / 切片段） | Character 窗口的 clip 列表（点击即播）+ Pose Mode 的基础片段选择 | 🟡 | `CharacterWindow.cpp:1170` |
-| NLA（片段当 strip 拼） | **无** | ❌ | `Components.h:241` 的 `layers` 是"按骨覆盖"，不是时间轴片段 |
+| NLA（片段当 strip 拼） | R9：`AnimatorComponent::nlaTracks` + `animation/NlaTimeline.*` + `editor/NlaPanel.*`。起止 / 缩放（`span`）/ 循环 / 错开 / 叠加都有 | ✅ | `NlaTimeline.h` |
 | 上层混合（走路 + 挥手） | 层 + 骨骼遮罩能做到 | ✅ | `AnimatorSystem.cpp:141` |
-| Blend Mode / 速度缩放 / 交叉淡入 | 无 | ❌ | — |
+| Blend Mode / 速度缩放 / 交叉淡入 | `Replace` / `Add`（rest 相对增量）；`speed` = "span 里塞几遍源动作"；`blendIn`/`blendOut` 交叉淡入（两侧重叠时取乘积） | ✅ | `NlaTimeline.h` 约定 ②④ |
+| NLA 里的**曲线**（看 strip 内部的曲线） | 要切到 S-D 的骨骼曲线面板（strip 引用一段 clip） | 🟡 | — |
+| NLA 里的**事件**（B2） | strip 上不发：事件表按 clip 名索引，与 strip 自己的时间映射对不上 | ❌ | `NlaTimeline.h` 的"还差" |
 
 ### 十 · 速查表 → 术语对照
 
@@ -370,7 +372,7 @@ const float w = animation::evaluateSegmentEase(ip, em, sh, a.outHandle,
 | **S-B** | **蒙皮与权重：顶点组 + 自动权重 + 权重绘制** | **L** | **✅ 已落地（2026-10-29）** |
 | **S-C** | **约束栈：Limit / Copy / Child Of + IK 迁入栈（Chain / Pole / Influence）** | **M/L** | **✅ 已落地（2026-10-29）** |
 | **S-D** | **骨骼曲线接入 Graph Editor（`EditTrack` ⇄ `Curve` 单向烘焙）** | **M** | **✅ 已落地（2026-10-29）** |
-| R9 | NLA | L | 待做 |
+| **R9** | **NLA（时间轴片段：起止 / 缩放 / 循环 / 错开 / 叠加 / Blend / 淡入淡出）** | **L** | **✅ 已落地（2026-10-29）** |
 | R10 | Drivers + Motion Paths + 序列帧导出 | M/L | 待做 |
 
 ### S-A · 骨架作者（Rig Edit）· 规模 L —— ✅ 已落地（2026-10-29）
@@ -783,7 +785,9 @@ const float w = animation::evaluateSegmentEase(ip, em, sh, a.outHandle,
   求解器层面"类型不影响采样"由 `MYVK_ANIM_TEST` 的 `dope_types_do_not_change_sampling`
   与 `dope_types_independent` 钉（`ANIM-TOTAL pass=221 fail=0`）。
 
-### R9 · NLA · 规模 L
+### R9 · NLA · 规模 L —— ✅ 已落地（2026-10-29）
+
+原任务书（保留，认领时按这个验收）：
 
 - 片段轨：一个 Action 落成 strip，可缩放/循环/错开/叠加。
 - **与现有 `AnimLayer` 的关系必须写清楚**：层是"按骨覆盖的当前姿态"，NLA 是
@@ -791,6 +795,117 @@ const float w = animation::evaluateSegmentEase(ip, em, sh, a.outHandle,
   "为什么我把片段拖上去，角色的上半身被整段替换了"）。
 - **验收**：Walk + 挥手 两段错开叠加，上下半身分别动（复用 `verify_anim_layers`
   的上下带判据）。
+
+**落地**：
+
+- **数据层**：`engine/animation/NlaTimeline.{h,cpp}`（新建，纯求值、不含 IO）。
+  - `NlaStrip { name, clip, start, end, clipStart, clipEnd, speed, loop,
+    weight, blendIn, blendOut, blend, mask, muted }`；
+  - `NlaTrack { name, muted, solo, strips }` —— **`strips` 的列表顺序就是
+    求值顺序**（与 `ConstraintStack::items` 同一个约定：顺序即语义，不按
+    `start` 排序。排序会让"我明明调过顺序"在松手那一刻被抹掉）；
+  - `NlaTimeline` 本身没有类：轨列表就放在 `AnimatorComponent::nlaTracks`
+    上，与 `layers` / `eventTracks` 同一套作者工作流（跟场景一起落盘）；
+  - 求值 `applyNlaTimeline(skel, tracks, time, pose, scratch)`：
+    轨按下标从 0 往上，轨内按列表顺序，逐条用 `blendPoseMasked`（Replace）
+    或 rest 相对增量（Add）盖上去 —— **下标大的胜出**；
+  - `nlaTimelineDuration` / `nlaStripCount` / `nlaDigest`（FNV-1a 64，
+    把顺序与每个字段都吃进去）。
+- **四条"省了就错"的约定**（写在 `NlaTimeline.h` 头注释里，每条都有断言）：
+  - ⚠⚠ ① **没有 `nlaTracks` = 逐位不变**：`applyNlaTimeline` 在空轨 / 全静音 /
+    solo 过滤后一条不剩时立刻返回，`pose` 一个分量都不碰；
+  - ⚠⚠ ② **`span` 决定"这一段占多久"，`speed` 决定"span 里塞几遍源动作"**
+    （Blender 的 Repeat/Scale 效果），**不是**"播放快多少"。让 strip 单独跑快
+    就得回答"它提前跑完了画什么"（停住？循环？拉伸到 end？），三种答案在
+    时间轴上看起来一样、画面上完全不同。要更快的动作就缩短 span；
+  - ⚠ ③ **strip 只在 `[start, end]` 内存在**。区间外既不"停在首帧"也不
+    "停在末帧" —— 后者会让首尾相接的两条 strip 在接缝处同时贡献姿势，
+    接缝位置出现一次没人要的混合；
+  - ⚠ ④ **`Add` 是"以 rest 为基准的增量"，不是"两个姿势相加"**。
+    直接相加的话静止姿势被数两遍（rest + rest），静态角色一开 NLA 就变形成
+    两倍大小。增量 = `rest⁻¹ * strip`（旋转）、`strip - rest`（平移/缩放），
+    乘权重后叠在底座上 —— 这才对得上"呼吸叠在走路上面"的直觉。
+- **为什么 NLA 在底座之上，而 Blender 恰好相反**（active action 在 NLA 栈上面）：
+  这里的状态机是**玩法权威**（idle/run/attack 由代码决定），让 NLA 盖住它等于
+  "一拖上片段角色就不攻击了"。要完全接管整具身体，放一条
+  `weight=1 + mask=All + blend=Replace` 的 strip 就等价 —— **主动选择比默认
+  行为安全**。求值顺序（`AnimatorSystem::tick` 里的硬约束）：
+  `底座 → NLA 轨 → AnimLayer[] → 表演层（LookAt / IK / 弹簧骨）`。
+- **与 `AnimLayer` 的关系**（任务书点名的那一条）：两者**共存，各走各的**。
+  差别不是命名问题而是语义：
+  | | `AnimLayer`（B1） | `NlaTrack`（R9） |
+  |---|---|---|
+  | 问的问题 | 此刻身上盖着哪几段动作 | 第 3.2 秒该演什么 |
+  | 有没有时间轴位置 | 没有（播放头自己跑） | 有（起止时刻 + 整条轴一个播放头） |
+  | `weight` 的意思 | 遮罩内**换成**这一层的姿态 | 这一刻按多少**参与混合** |
+  | 典型用途 | 挥手 + 走路 | 过场 / 演出 / 精确对时的连招 |
+  共用的是**遮罩解算**（`buildBoneMask`）与**混合原语**（`blendPoseMasked`）——
+  这一处共用是对的："哪些骨"与"这段动画怎么参与混合"本来就是两件事。
+- **`smoothFade` 搬了家**（`AnimatorSystem.cpp` 的匿名 `fadeWeight` →
+  `Pose.h/.cpp`）：层的淡入与 strip 的淡入是同一件事，两个三行式子迟早有人
+  只改一边，然后就变成"层的淡入和片段的淡入手感不一样"这种没人会报的偏差。
+  表达式一字未改，行为逐位不变。
+- **UI**：新建 `editor/NlaPanel.{h,cpp}`（左轨名 / 右时间轴 / 底部属性）。
+  - **面板不持有数据**：每次 `draw` 都去场景里取选中实体的
+    `AnimatorComponent` 直接改字段。好处是没有第二条 IO 通路、拖一下视口立刻动
+    （走的就是 `AnimatorSystem` 那条正常路径）、撤销/存盘/多场景全部免费继承；
+  - 三条约束：①拖动中不许重排（见上）；②**拖边=缩放、拖体=平移**，命中区按
+    像素算，意图在**按下那一帧**定死（每帧重判会让"从边上滑到体内"变成一次
+    误平移）；③**播放头归组件管**（`nlaTime`），面板只读写它 —— 面板自己再存
+    一份，进 Play 后画上的短线与画面上的动作就分叉了；
+  - 目标解析：当前选择 → （没有选择时）场景里第一个挂 `AnimatorComponent` 的
+    实体。**选中了一个没有动画器的实体时不会偷偷换人** —— 那会变成"我改的是 A、
+    动的是 B"，比面板空着糟得多；
+  - 注入脚本 `MYVK_EDITOR_NLA_SCRIPT`
+    （`ent / sel / addtrack / addstrip / select / clip / speed / weight /
+    blendin / blendout / clipstart / clipend / loop / mutedstrip / blend /
+    mask / move / resize / dup / del / trackmute / tracksolo / play / pause /
+    time / tspeed / tloop / zoom / digest / stat / save / sleep`）。
+- **验收**（`tools/verify_nla.py`，**结果: PASS（34 项）**）：八组 A~H。
+  - A 自检 42 条 `nla_*`（`ANIM-TOTAL pass=350 fail=0`，从 308 长上来），
+    点名五条底线：`nla_empty_bitwise` / `nla_no_active_strip_bitwise` /
+    `nla_replace_w1_bitwise`（遮罩 All + 权重 1 的 Replace 与"只播那条 strip"
+    **逐位**相同）/ `nla_w0_bitwise` / `nla_order_top_wins`；
+  - 时间映射全部挑在**能口算**的点上（0.25 / 0.5 / 0.75）：`nla_map_mid`（span
+    2 映射 1 秒 clip → t=1 是正中）、`nla_map_loop_fold` / `..._quarter`
+    （把同一个源时刻折两遍）、`nla_map_once_clamp`、`nla_map_clip_range_*`
+    （截取 0.25..0.75）、`nla_map_default_whole`（0/0 = 整段）、
+    `nla_map_negative_speed`（倒放，`fract` 必须用 `u-floor(u)`，
+    `fmod` 会给负数 → 采样到夹紧的端点 → 表现成"倒放一进去就定住"）；
+  - 包络：`nla_env_none_exact`（没有淡入淡出时**恰好** 1.0f）、
+    `nla_env_in_half`（`smoothFade(0.5)=0.5` 手算）、
+    `nla_env_overlap_eighth`（两侧重叠时乘起来 = `0.15625²`）；
+  - Add：`nla_add_hand_scale`（hand 1.5 + (2.0-1.0) = 2.5，而 Replace 是 2.0
+    —— 两个数差得远，走错路一眼能看出来）、`nla_add_half_weight`（2.0 而不是
+    1.75，"半幅度"与"半姿态"不是一回事）、`nla_add_untouched_bone_bitwise`
+    （没被碰过的骨**逐位**不变 —— 这条钉的是"Add 不许顺手 normalize"）；
+  - 交叉淡入 `nla_crossfade_hand_scale` = **1.8125**（三条 strip 各自可手算：
+    base 1.75 → 加 A 的 0.5 得 2.125 → 加 B 的 0.5 得 1.8125）；
+  - 配置坏了 = "这条不生效"而不是"全身覆盖"：`nla_missing_clip_skipped` /
+    `nla_empty_mask_skipped` / `nla_zero_span_skipped`；
+  - 运行时：`nla_runtime_advances` / `..._loop` / `..._no_loop_clamp` /
+    `..._paused` / `..._applied`（`ANIM-NLA` 的三个数）；
+  - B~H 端到端：目标解析 / 画布宽度 > 0 / 加轨加片段 / `move` 与 `resize`
+    落到 **1 ms** 量化后的值 / `ANIM-NLA applied=1 skipped=0`（播放头停在 0 时
+    区间内 1 条、区间外的**不算跳过**）/ 静音后 `applied=0` /
+    **跨进程**存读（存盘进程复用同一份脚本 —— 第一版在存盘进程里只跑 `save`，
+    于是存下去的是**空** NLA，而"文件里有 nlaTracks"照样成立：断言全绿、
+    什么都没验到）/ 零 VUID / 零 `[ERROR]`。
+- **刻意不做像素判据**：NLA 的混合走的就是同一个 `blendPoseMasked`（遮罩语义
+  一个字没改），"只动该动的半边身体"已经由 `verify_anim_layers` 的上下带
+  统计证明过。NLA 新增的风险全在**时间映射与包络**上，那是数值。再拍一遍
+  截图只是把同一个断言写成更慢、更脆的版本。
+- **还差**：
+  - **事件（B2）在 strip 上不发**：事件表挂在组件的 `eventTracks` 上按 clip 名
+    索引，而 strip 有自己的时间映射 —— 混在一起会让"截取的那一段"把原 clip
+    前半段的事件一起吐出来。做对要按 `[prevSrc, curSrc]` 派发，是下一步；
+  - **曲线（S-D）与约束（S-C）不进 strip**：它们住在 `EditClip` / 预览链上，
+    运行时仍是"只读 `assets::AnimationClip`"—— 和这两条各自记的"运行时没接"
+    是同一批活（都要动 `ecs/Components.h`，一起做）；
+  - `Multiply` / `Subtract` 之类混合模式：落到四元数上要先选插值路径，
+    在没人真的需要之前做出来只会让"为什么我的旋转不能乘"变成反复出现的问题；
+  - 时间轴的**曲线视图**（Blender 的 NLA 也能切到 Graph Editor 看 strip 内部的
+    曲线）：现在 strip 是"引用一段 clip"，看曲线要去 S-D 那个面板。
 
 ### R10 · Drivers + Motion Paths + 序列帧导出 · 规模 M/L
 
@@ -832,7 +947,7 @@ const float w = animation::evaluateSegmentEase(ip, em, sh, a.outHandle,
 
 ---
 
-## 5 · 八条硬约束（下一轮开工前先读这段）
+## 5 · 九条硬约束（下一轮开工前先读这段）
 
 1. **`engine/ecs/**` 与 `engine/assets/**` 在 `GLOBAL_GLOBS`**（`tools/run_regression.py:999`）。
    动 `Components.h` / `Skeleton.h` = 按项目纪律要跑全量。所以 R6 的"接实体 TRS"
@@ -873,3 +988,11 @@ const float w = animation::evaluateSegmentEase(ip, em, sh, a.outHandle,
    `changed=0`、曲线帧数与轨道不等时整条拒绝、`keyEase` 全默认时不落盘。
    断言：`curvebake_default_bitwise` / `curvebake_rotation_linear_bitwise` /
    `curvebake_writeback_identical` / `curvebake_writeback_refuse`。
+9. **同一个词在两个地方有两个意思时，不许合并成一个字段**（R9）。`AnimLayer`
+   与 `NlaStrip` 都有一个 `weight`，而它的意思不同：层是"遮罩内**换成**这一层
+   的姿态"，strip 是"这一刻按多少**参与混合**"。硬合并的下一站就是
+   "我把片段拖上去，角色的上半身被整段替换了" —— 而且**看着像 bug、其实
+   是两个语义撞在一个滑块上**。判据不是"代码能不能合并"（能），是"合并之后
+   那个字段还答不答得出一个明确的问题"。同源的还有 `AnimTrack` 的 `step`
+   与 `EditTrack::ease`（S-D）：能让它们互斥，是因为"这条轨道是常量还是
+   曲线"有唯一答案。

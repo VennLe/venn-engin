@@ -8,6 +8,7 @@
 
 #include "animation/AnimatorSystem.h"
 
+#include "animation/NlaTimeline.h"   // R9 NLA 求值器
 #include "assets/Model.h"
 #include "core/Logger.h"
 
@@ -35,10 +36,12 @@ float wrapTime(float t, float dur) {
 // 为什么不用线性：线性权重下**角速度在两端是突变的**，过渡的两头各有一个
 // 肉眼可见的"顿挫"（也就是做了过渡仍然显得僵硬）。smoothstep 的导数在
 // 0 与 1 处为 0，与两侧的稳态播放衔接得上 —— 这才是"看着顺"的关键。
-float fadeWeight(float t) {
-    const float x = std::clamp(t, 0.0f, 1.0f);
-    return x * x * (3.0f - 2.0f * x);
-}
+//
+// 2026-10-29（R9）：实现搬到 `animation::smoothFade`（Pose.h）—— NLA 的
+// strip 交叉淡入是同一件事，两处各写一个三行式子，迟早有人只改一边，
+// 然后就变成"层的淡入和片段的淡入手感不一样"这种没人会报的偏差。
+// 表达式一字未改，所以行为逐位不变。
+float fadeWeight(float t) { return smoothFade(t); }
 
 } // namespace
 
@@ -237,6 +240,43 @@ int AnimatorSystem::applyLayers(const assets::Skeleton& skel, Pose& pose,
         ++applied;
     }
     return applied;
+}
+
+int AnimatorSystem::applyNla(const assets::Skeleton& skel, Pose& pose,
+                             ecs::AnimatorComponent& an, float dt,
+                             bool advance) {
+    // 约定 ①：没有轨 = 什么都不做（`pose` 一个分量都不碰）
+    if (an.nlaTracks.empty()) return 0;
+
+    // ---- 播放头 ----
+    //
+    // 与底座同一个 `wrapTime` 语义（负 speed 也兜住、恰好整圈也归零）。
+    // ⚠ `!advance`（编辑器非 Play）时**不推进**：那时候时间轴由面板的
+    //   滑条 / 注入脚本控制，跟着 dt 走的话"拖到 3.2 s 松手就跳回去"。
+    if (advance && an.nlaPlaying) {
+        an.nlaTime += dt * an.nlaSpeed;
+        const float dur = nlaTimelineDuration(an.nlaTracks);
+        if (dur > 0.0f) {
+            if (an.nlaLoop) {
+                if (an.nlaTime >= dur || an.nlaTime < 0.0f)
+                    an.nlaTime = wrapTime(an.nlaTime, dur);
+            } else {
+                an.nlaTime = std::clamp(an.nlaTime, 0.0f, dur);
+            }
+        } else if (an.nlaTime < 0.0f) {
+            an.nlaTime = 0.0f;
+        }
+    }
+
+    const NlaEvalStats st = applyNlaTimeline(skel, an.nlaTracks, an.nlaTime,
+                                             pose, m_nlaScratch);
+    ++m_lastNla;
+    m_lastNlaStrips += st.strips;
+    m_lastNlaApplied += st.applied;
+    m_lastNlaSkipped += st.skipped;
+    if (!st.firstProblem.empty() && m_lastNlaProblem.empty())
+        m_lastNlaProblem = st.firstProblem;
+    return st.applied;
 }
 
 void AnimatorSystem::dispatchEvents(const AnimEventTrack& track, float prevTime,
@@ -470,6 +510,14 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     int fading = 0;   // 本帧处于过渡中的实体数（ANIM-FADE 用）
     int layersConfigured = 0;   // 配了附加层的实体数（B1）
     int layersApplied = 0;      // 其中真的混进去至少一层的
+    // NLA（R9）同理：这里清一次，`applyNla` 里面累加。
+    // ⚠ 清在这里而不是汇总区 —— 汇总区在 `applyNla` 之后，会把刚累加出来
+    //   的数抹成 0（`m_rootBoneMissing` 那条注释记着同一个坑）。
+    m_lastNla = 0;
+    m_lastNlaStrips = 0;
+    m_lastNlaApplied = 0;
+    m_lastNlaSkipped = 0;
+    m_lastNlaProblem.clear();
     int rootMotions = 0;        // 本帧真的提到了非零根位移的实体数（B3）
     int rootMotionCfg = 0;      // 本帧配了 rootMotion != Off 的实体数（B3）
     // 本帧的事件队列（B2）。**必须在遍历前清空**：消费方约定"同一帧读完"，
@@ -737,6 +785,17 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
                 samplePose(skel, clip, time, m_pose);
             }
 
+            // ---- 5.4) NLA（R9）----
+            //
+            // 就地叠在底座上：推进时间轴播放头 → 逐轨逐 strip 混合。
+            // ⚠ 位置是硬约束：**底座之后、`layers` 之前**（见头文件里
+            //   applyNla 的说明：三层从下往上的优先级）。
+            // ⚠ 空 `nlaTracks` 时 `applyNla` 立刻返回，`base` 一个分量
+            //   都不碰 —— 老场景与加了 NLA 之前逐位相同。
+            if (an && !an->nlaTracks.empty()) {
+                applyNla(skel, *base, *an, advance ? dt : 0.0f, advance);
+            }
+
             // ---- 5.5) 附加动画层（B1）----
             //
             // 就地叠在底座上：逐层采样 → 按骨骼遮罩混合。
@@ -864,6 +923,20 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
         if (m_lastLayers > 0) {
             VK_LOG_INFO("ANIM-LAYER configured=%d applied=%d", m_lastLayers,
                         m_lastLayersApplied);
+        }
+        // NLA（R9）：`strips` = 配了几条、`applied` = 本帧几条真的生效。
+        // ⚠ 两者**同时**报。只有 `applied` 的话，"一条都没摆"和"摆了但
+        //   全不生效"在日志上长得一样，而这两种情况的下一步动作完全不同
+        //   （去摆 strip / 去查 clip 名与遮罩）。
+        // `problem` 只报第一个：20 条 strip 全配错时，逐条打印会把日志读成
+        // "20 个不同的问题"，而它们往往是同一个（clip 名拼错 / 骨名片段错）。
+        if (m_lastNla > 0) {
+            VK_LOG_INFO("ANIM-NLA configured=%d strips=%d applied=%d "
+                        "skipped=%d problem=%s",
+                        m_lastNla, m_lastNlaStrips, m_lastNlaApplied,
+                        m_lastNlaSkipped,
+                        m_lastNlaProblem.empty() ? "(none)"
+                                                 : m_lastNlaProblem.c_str());
         }
         // 根运动（B3）：`cfg` = 配了的人，`n` = 本帧真的走动了的人。
         // ⚠ **`cfg > 0` 就打**，哪怕 `n == 0`。这是刻意的：最常见的两种

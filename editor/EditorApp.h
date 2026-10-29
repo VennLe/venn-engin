@@ -94,6 +94,7 @@ class UiEditorWindow;         // 2026-10-27：UI 编辑器（#312）
 class CurveEditorPanel;       // 2026-10-28（R6）：曲线编辑器（Graph Editor）
 class DopeSheetWindow;        // 2026-10-28（R8）：动画摄影表（Dope Sheet）
 class BoneCurvePanel;         // 2026-10-29（S-D）：骨骼曲线编辑器
+class NlaPanel;               // 2026-10-29（R9）：NLA 时间轴
 class LandscapeEditor;        // 2026-10-20：地形编辑模式
 class FoliageEditor;          // 2026-10-20：植被编辑模式
 // 2026-10-20 晚：下拉里其余 6 个模式（ToolkitEditors.h / .cpp）
@@ -238,6 +239,8 @@ private:
     static void panelDrawDopeSheet(EditorApp& a);
     // 骨骼曲线（S-D）：与上面几格同构，真正的 draw 在 drawBoneCurveWindow。
     static void panelDrawBoneCurve(EditorApp& a);
+    // NLA 时间轴（R9）：同样同构，真正的 draw 在 drawNlaWindow。
+    static void panelDrawNla(EditorApp& a);
 
     // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
     void drawPanels();
@@ -412,6 +415,8 @@ private:
     // 与相机曲线编辑器**不是同一个窗口**（见 BoneCurvePanel.h 开头那段：
     // 手柄归属的根本差别）。
     void drawBoneCurveWindow();
+    // NLA 时间轴（R9）：与上面同构。
+    void drawNlaWindow();
     // 视口正下方那一行播放条（Run = 运行游戏；Play/Pause/Stop = 动画）。
     //
     // ⚠ 2026-10-17：UI 被用户要求移除，**这个函数不再被调用**（保留实现
@@ -559,6 +564,10 @@ private:
     // （"一个文件一个写者"：Pose Mode 打开时两个窗口各自持副本，靠
     //  存盘前的磁盘时间戳比对来避免静默互相覆盖）。
     std::unique_ptr<BoneCurvePanel> m_boneCurve;
+    // 2026-10-29（R9）：NLA 时间轴面板。与上面几格最大的不同：它**不持有
+    // 数据** —— strip 住在选中实体的 `AnimatorComponent::nlaTracks` 上
+    // （跟场景一起落盘），面板每次 draw 都从场景里取，直接改字段。
+    std::unique_ptr<NlaPanel> m_nla;
     // 2026-10-17 晚：底栏"+"托盘里的两张功能面板（Physics / Particles）
     std::unique_ptr<PhysicsPanel> m_physicsPanel;
     std::unique_ptr<ParticlesPanel> m_particlesPanel;

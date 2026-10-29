@@ -1812,6 +1812,56 @@ json animatorToJson(const ecs::AnimatorComponent& an) {
         }
         if (!arr.empty()) j["events"] = std::move(arr);
     }
+
+    // ---- NLA（R9，2026-10-29）----
+    // 同一条纪律：**只在非空时写**（老场景逐字节不变）。
+    //
+    // 与 `layers` / `events` 的唯一区别：连**播放头**一起写。层的播放头是
+    // "这一帧正在发生的事"（进 Play 就重来），而 NLA 的播放头是作者摆好的
+    // 位置 —— 停在 3.2 s 存盘，下次打开必须看到同一帧。
+    if (!an.nlaTracks.empty()) {
+        json tracks = json::array();
+        for (const animation::NlaTrack& T : an.nlaTracks) {
+            json to;
+            to["name"] = T.name;
+            if (T.muted) to["muted"] = true;
+            if (T.solo) to["solo"] = true;
+            json strips = json::array();
+            for (const animation::NlaStrip& s : T.strips) {
+                json so;
+                so["name"] = s.name;
+                so["clip"] = s.clip;
+                so["start"] = s.start;
+                so["end"] = s.end;
+                // 默认值全部省掉（"最短可回读"）：一条刚建出来的 strip
+                // 只写 name/clip/start/end，读回来逐字段相同。
+                if (s.clipStart != 0.0f) so["clipStart"] = s.clipStart;
+                if (s.clipEnd != 0.0f) so["clipEnd"] = s.clipEnd;
+                if (s.speed != 1.0f) so["speed"] = s.speed;
+                if (!s.loop) so["loop"] = false;
+                if (s.weight != 1.0f) so["weight"] = s.weight;
+                if (s.blendIn != 0.0f) so["blendIn"] = s.blendIn;
+                if (s.blendOut != 0.0f) so["blendOut"] = s.blendOut;
+                if (s.blend != animation::NlaBlend::Replace)
+                    so["blend"] = static_cast<int>(s.blend);
+                if (s.muted) so["muted"] = true;
+                if (!s.mask.isAll()) {
+                    json m;
+                    m["mode"] = static_cast<int>(s.mask.mode);
+                    m["roots"] = s.mask.roots;
+                    so["mask"] = std::move(m);
+                }
+                strips.push_back(std::move(so));
+            }
+            to["strips"] = std::move(strips);
+            tracks.push_back(std::move(to));
+        }
+        j["nlaTracks"] = std::move(tracks);
+        j["nlaTime"] = an.nlaTime;
+        j["nlaSpeed"] = an.nlaSpeed;
+        j["nlaPlaying"] = an.nlaPlaying;
+        j["nlaLoop"] = an.nlaLoop;
+    }
     return j;
 }
 
@@ -1907,6 +1957,66 @@ bool animatorFromJson(assets::AssetManager& am, const json& j,
             out.eventTracks.push_back(std::move(tr));
         }
     }
+
+    // ---- NLA（R9，2026-10-29）----
+    // 容错纪律与 `layers` 一致：单条坏数据只丢**那一条**，不连累整块
+    // animator 配置（"少了半条时间轴"比"动画时间被重置"轻得多）。
+    out.nlaTracks.clear();
+    if (j.contains("nlaTracks") && j["nlaTracks"].is_array()) {
+        for (const json& to : j["nlaTracks"]) {
+            if (!to.is_object()) continue;
+            animation::NlaTrack T;
+            T.name = to.value("name", std::string("Track"));
+            T.muted = to.value("muted", false);
+            T.solo = to.value("solo", false);
+            if (to.contains("strips") && to["strips"].is_array()) {
+                for (const json& so : to["strips"]) {
+                    if (!so.is_object()) continue;
+                    animation::NlaStrip s;
+                    s.name = so.value("name", std::string("Strip"));
+                    s.clip = so.value("clip", std::string());
+                    s.start = so.value("start", 0.0f);
+                    s.end = so.value("end", 1.0f);
+                    s.clipStart = so.value("clipStart", 0.0f);
+                    s.clipEnd = so.value("clipEnd", 0.0f);
+                    s.speed = so.value("speed", 1.0f);
+                    s.loop = so.value("loop", true);
+                    s.weight = so.value("weight", 1.0f);
+                    s.blendIn = so.value("blendIn", 0.0f);
+                    s.blendOut = so.value("blendOut", 0.0f);
+                    s.muted = so.value("muted", false);
+                    animation::NlaBlend bl = animation::NlaBlend::Replace;
+                    // 越界 / 非整数 → 保持 Replace（= "换成这一段的姿势"），
+                    // 而不是"随便挑一个模式"：挑到 Add 的话角色的静止姿势
+                    // 会被叠两遍，整具身体变形。
+                    animation::nlaBlendFromInt(so.value("blend", 0), &bl);
+                    s.blend = bl;
+                    if (so.contains("mask") && so["mask"].is_object()) {
+                        const json& m = so["mask"];
+                        animation::BoneMaskMode mode =
+                            animation::BoneMaskMode::All;
+                        animation::boneMaskModeFromInt(m.value("mode", 0),
+                                                       &mode);
+                        s.mask.mode = mode;
+                        if (m.contains("roots") && m["roots"].is_array()) {
+                            for (const json& r : m["roots"]) {
+                                if (r.is_string())
+                                    s.mask.roots.push_back(r.get<std::string>());
+                            }
+                        }
+                    }
+                    T.strips.push_back(std::move(s));
+                }
+            }
+            out.nlaTracks.push_back(std::move(T));
+        }
+    }
+    // 播放头是**作者数据**（不是"这一局正在发生的事"），所以照读 ——
+    // 与上面 eventPrev / rootPrevValid 那两条相反，别顺手一起重置。
+    out.nlaTime = j.value("nlaTime", 0.0f);
+    out.nlaSpeed = j.value("nlaSpeed", 1.0f);
+    out.nlaPlaying = j.value("nlaPlaying", true);
+    out.nlaLoop = j.value("nlaLoop", true);
 
     // 运行时：一律重置（绝不能从文件里读回来，那会让"这一局"的状态
     // 跟着存档走）
