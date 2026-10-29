@@ -204,14 +204,17 @@ ecs::Entity createPrimitiveOnGround(scene::Scene& scene,
 // 离线管线见 `tools/blender_import_animategirl.py`（Blender 绑骨 + 烘帧）
 // 与 `docs/animate_girl_import.md`（含三个坑：坏 rest / 逐壳绑骨 / clip 名）。
 //
-// ⚠ **暂时没切成默认**（2026-10-23）：资产本身是干净的（GLB 里 26134 个顶点
-//   权重和精确为 1.000、65 关节、四段 clip 名不带前缀），在 Blender 里回读
-//   也完全正常；但引擎这边——不论走 `.vmesh`(AssetC/FBX) 还是原生 glTF——
-//   都在**静止姿势**就已经塌成一片（不是动画的问题：关掉 clip 一样塌）。
-//   说明 `invMeshNode · world · invBind` 这条链对"mesh 节点带非单位变换 /
-//   骨架在 Armature 子节点下"的资产算错了，与 65 骨无关（AutoRig 的 23 骨
-//   资产 `jointMat` 恰好恒等，所以从来没暴露）。根因没钉死之前不换默认，
-//   免得把一个坏角色推给所有人。详见 docs/animate_girl_import.md §5。
+// ⚠ **暂时没切成默认**（2026-10-23 的判断，2026-10-29 已推翻）：当年以为是
+//   引擎的蒙皮矩阵算错了（`invMeshNode · world · invBind` 这条链）。这个怀疑
+//   站不住 —— 静止时 `world_rest · inv(world_rest) = I` 是恒等式，那三个量
+//   必然互相抵消，取错也不会让**静止**的模型变形。真正的原因有两个，都在
+//   资产侧：① 这份 GLB 是 Y-up，而本仓库的约定是 glTF 自带 Z-up（蒙皮顶点
+//   只走 `jointMat`，`MeshLoader` 的 `kYupToZup` 会被 `invMeshNode · world`
+//   约掉）；② 骨热在 1181 个断壳上给出的权重是跨肢体混杂的（22.95% 的顶点
+//   有"手臂骨 + 腿骨同时拉"，16 根骨一个顶点都没绑到）。
+//   修好的产物是 `characters/animate_girl_rigged.glb`，见
+//   docs/animate_girl_import.md §5 与 tools/rebuild_skin_weights.py。
+//   默认角色仍是 alicia —— 换它要一起考虑胶囊尺寸与朝向补偿，是另一件事。
 //
 // 旧资产 `default_character.vmesh` **保留在盘上**：它是 23 骨、1.805 m，
 //   好几个物理用例（verify_player_feel / ground / jump）在自己的场景 JSON 里
