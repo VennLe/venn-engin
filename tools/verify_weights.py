@@ -53,7 +53,7 @@ BIN = os.path.join(ROOT, "build", "bin")
 EXE = os.path.join(BIN, "Editor.exe")
 OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify", "weights")
 
-MODEL = "assets/models/anime_girl.fbx"
+MODEL = "assets/models/characters/animate_girl.fbx"
 # 落在 build/bin 下（build/ 被 gitignore）。**相对路径是刻意的**：
 # `save:<path>` / `load:<path>` 按"第一个冒号之后整段"解析，路径里一旦
 # 出现盘符冒号，被测的就不是权重存盘而是那个解析补丁。
@@ -490,19 +490,40 @@ def case_f():
 # ================================================================== G 镜像
 
 def case_g(lines):
-    # 顶点下标从 `WEIGHTS-LIST-MESH` 拿顶点数，再从里面挑几个候选试镜像
-    vtx = 0
+    # 顶点下标从 `WEIGHTS-LIST-MESH` 拿顶点数，再从里面挑几个候选试镜像。
+    #
+    # ⚠ **别再写死 `mesh:0`**。旧资产只有一个子网格，0 号就是全身；新的
+    #   FAB 角色有 7 个子网格，0 号是头发/头部那片 —— 那片顶点几乎全挂在
+    #   `mixamorig:Head` / `Neck` 上，**没有左右标记**，`mirrorVertex` 的
+    #   `flipSide` 换不出对侧骨，必然返回 -1。于是"试 119 个、成 0 个"，
+    #   而镜像功能本身是好的。
+    #   改成挑**顶点最多**的那个子网格（躯干四肢一定在里面）。
+    meshes = []
     for l in lines:
         m = LISTMESH_RE.search(l)
-        if m and int(m.group(1)) == 0:
-            vtx = int(m.group(4))
-    if vtx <= 0:
-        skip("G1 镜像到对侧顶点", "拿不到 mesh 0 的顶点数")
+        if m:
+            meshes.append((int(m.group(4)), int(m.group(1))))
+    if not meshes:
+        skip("G1 镜像到对侧顶点", "拿不到任何子网格的顶点数")
         return
+    vtx, mi = max(meshes)
+    if vtx <= 0:
+        skip("G1 镜像到对侧顶点", "顶点最多的子网格也是 0 顶点")
+        return
+    print("      (镜像在子网格 %d 上做，vtx=%d，轴=X)" % (mi, vtx))
+    # ⚠ 必须显式 `axis:0`：`RigEdit::mirrorAxis` 的默认值是 1(Y)，那是按
+    #   老资产定的。新角色左右对称面在 X 上，不改轴的话 `mirror` 每次都是
+    #   `to=-1`，看着像"镜像功能坏了"，其实一个点都没找对地方。
 
-    # `anime_girl` 的蒙皮是左右对称的，中段顶点一定能配上对；一次试 6 个候选
-    cand = [vtx // 8, vtx // 6, vtx // 4, vtx // 3, vtx // 2, vtx - 1]
-    script = "list;mesh:0;autoall;" + ";".join("mirror:%d" % v for v in cand)
+    # 蒙皮是左右对称的，中段顶点一定能配上对。**不要只试 6 个固定位置**：
+    # 那是按旧资产（11338 顶点）的拓扑挑的，换成 25626 顶点的 FAB 角色后
+    # 6 个候选一个都没配上（`hits=[]`）。判据没错，是采样太稀 ——
+    # 引擎侧的配对容差是 1 cm，而头发/裙摆这些地方左右差得比 1 cm 多，
+    # 只有躯干四肢的顶点才稳定配对，所以按 1/120 的步长多撒一些点。
+    cand = sorted({vtx * k // 120 for k in range(1, 120)})
+    cand = [v for v in cand if 0 < v < vtx]
+    script = ("list;mesh:%d;autoall;axis:0;" % mi
+              + ";".join("mirror:%d" % v for v in cand))
     res = run_editor(script)
     found = []
     for l in res:
@@ -519,8 +540,8 @@ def case_g(lines):
     # 骨名要跟着换边：dump 源顶点与镜像顶点，逐条比对骨名与权重
     src = hits[0][0]
     dst = hits[0][1]
-    dump = run_editor("list;mesh:0;autoall;dump:%d;dump:%d;mirror:%d;dump:%d"
-                      % (src, dst, src, dst))
+    dump = run_editor("list;mesh:%d;autoall;axis:0;dump:%d;dump:%d;"
+                      "mirror:%d;dump:%d" % (mi, src, dst, src, dst))
     # 取**最后一轮**的 dst（镜像之后）
     last_dst = None
     for l in dump:

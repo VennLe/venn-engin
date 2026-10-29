@@ -119,7 +119,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", default=DEFAULT_EXE)
     ap.add_argument("--size", default="1600x900")
-    ap.add_argument("--model", default="assets/models/anime_girl.fbx",
+    ap.add_argument("--model", default="assets/models/characters/animate_girl.fbx",
                     help="自动化绑定的模型（MYVK_CHARACTER_MODEL）")
     ap.add_argument("--no-model", action="store_true",
                     help="不自动绑定模型（只测窗口打开）")

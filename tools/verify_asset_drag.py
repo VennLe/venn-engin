@@ -241,6 +241,24 @@ def main():
 
         vp = tap.wait_rect("VP-RECT", 10.0)
         cell = tap.wait_rect("CB-CELL " + args.asset, 15.0)
+        if not cell:
+            # 资产可能在可视区**下面**（`logRect` 只给画出来的格子打日志）。
+            # 2026-10-29 就是这么红的：`assets/models` 下多了一个 `_fixtures/`
+            # 和跑用例留下的 `.trash/`，目录从 3 个变 5 个 → 文件整体下沉
+            # 一行 → `box01.glb` 掉出面板。`_fixtures/` 已经删了，但
+            # `.trash/` 这种"跑一轮就冒一个"的东西还会回来，结论不变：
+            # 目录数量会随仓库变化，不能假设"文件在第一屏"，找不到就滚一滚再等。
+            items = tap.wait_rect("CB-ITEMS", 5.0)
+            if items:
+                cx = int((items[0] + items[2]) * 0.5)
+                cy = int((items[1] + items[3]) * 0.5)
+                for n in range(6):
+                    wheel_at(hwnd, cx, cy, 1)
+                    cell = tap.wait_rect("CB-CELL " + args.asset, 2.0)
+                    if cell:
+                        print("[info] 滚动 Content 后才看到 %s（滚了 %d 格）"
+                              % (args.asset, n + 1))
+                        break
         if not vp or not cell:
             print("拿不到坐标：VP-RECT=%s CB-CELL=%s" % (vp, cell))
             print("Content 里现有条目：",

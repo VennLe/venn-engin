@@ -7,7 +7,8 @@
 > 工具：`tools/blender_import_animategirl.py`（Blender 4.5.9）
 > 产物：`assets/models/characters/animate_girl.{fbx,vmesh,glb}`
 > 状态：离线管线打通、资产自检全绿；**2026-10-29 修好了蒙皮与轴向，
-> 产物是 `animate_girl_rigged.glb`（§5）**。演示场景的迁移还没做（§6）。
+> 产物是 `animate_girl_rigged.glb`（§5）**；**同日把四条产品场景全部切过去，
+> 旧资产连同它的生成器一起删除，测试夹具改指新角色（§6）**。
 
 ---
 
@@ -241,7 +242,65 @@ D 主导骨距离 / E 左右不串边 / F 静止 `jointMat ≈ I` / G 骨覆盖�
 是同一个事实，截图只是同一件事更慢更脆的版本。截图留给人工复核
 （`tools/_shot.py`，跑完的图在 `_venn_verify/probe_agirl/`）。
 
-### 5.4 · 还剩什么
+### 5.4 · 原地化：`Walk` 的 1.79 m 前进位移必须抹掉
+
+拿到"姿势像人"之后，演示场景里角色**斜着往画面外飘**。排查了一整轮才定位：
+不是权重、不是遮罩层、不是子网格的 π 绕 X 旋转，而是
+
+> **`Walk` 这一段 clip 自带 1.79 m 的根位移，而编辑器在非 Play 态不钳它。**
+
+`AnimatorSystem::applyRootMotion()` 只在 `!wrapped && advance` 时才
+`extractRootMotion`，而 `stripRootMotion` 又在 `d.valid` 之后才调用 ——
+编辑器不推进时间轴（`advance=false`），于是姿势里的根位移**原样留在
+pose 上**，每渲染一帧就把角色往前推一点。播放器里它会被钳回原位，所以
+"游戏里好好的，编辑器里飘走了"。
+
+修法在资产侧，`rebuild_skin_weights.py` 的 `make_inplace()`（默认开启，
+`--keep-root-motion` 关掉）：
+
+```
+v'(t) = v(t) − u(t) · (v_last − v_first)，  u = i/(n−1)，只作用在 x / z
+```
+
+三条约定，每一条都是踩过的：
+
+* **y 一分不动。** `Jump` 那一段 0.94 → 2.15 是**真的跳起高度**，线性削掉
+  它等于把跳跃删了。高度是 y，水平是 x/z —— 注意这是**文件原始空间
+  （Y-up）**，不是引擎的 Z-up。
+* **只削总位移，不改姿势。** 减的是"时间上的线性斜坡"，相对动作完全保留。
+* **实测只命中 `Walk`**（首末差 1.795 m），`Idle` / `Run` / `RigWalk` 首末
+  差 ≈ 0（循环闭合）→ 副作用为零。
+
+> 为什么不用 `RootMotionMode::DeltaOnly`：那是运行时的开关，管的是 Play 态，
+> 管不到"编辑器静态显示某一帧"。而且关掉根运动只会让它不走，不会让姿势
+> 回到原点 —— 编辑器里那 1.79 m 位移依然画在脸上。
+
+### 5.5 · 刚性件整壳绑单骨（靴子事故）
+
+原地化之后角色站住了，但**两只靴子从 t>0 起被拉长、躺在地上**。
+
+大壳报告直接点名：靴子是一个 **252 顶点、包围盒对角 0.26 m 的刚性壳**，
+质心 z=0.12，却被分给了 4 根骨（`LeftLeg` / `LeftFoot` / `LeftToeBase` /
+`LeftToe_End`）。它不是"该弯曲的皮肤"，是一块塑料 —— 四根骨一错开就把它
+扯成长条。
+
+修法是给 `rebuild_skin_weights.py` 加一条**按尺寸的刚性判据**（`--rigid`，
+默认对角阈值 `RIGID_DIAG = 0.35`）：对角小于阈值的壳，整壳 100% 绑给
+"离质心最近的那根骨段"的父关节。
+
+阈值 0.35 是**量出来的唯一一条干净的缝**（实测大壳对角）：
+
+| 壳 | 对角 | 该不该刚性 |
+|---|---|---|
+| 靴子 | 0.26 m | 是 |
+| 手 | 0.34 m | 是 |
+| 躯干主壳 | 0.52 m | 否（要弯） |
+| 小腿壳 | 0.76 m | 否 |
+
+221 个壳因此归入刚性。副作用：未绑骨 3 → 12 根，全在**右手中指指尖**
+的白名单里（握姿，指尖藏在掌心），判据 G 不受影响。
+
+### 5.6 · 还剩什么
 
 * 侧摆的小发饰（品红小珠）偶尔偏出几厘米；胸口/大腿上几片薄贴片有轻微错位。
   都是"小件继承"挑错了邻面，属于观感问题，不影响播放。
@@ -252,37 +311,198 @@ D 主导骨距离 / E 左右不串边 / F 静止 `jointMat ≈ I` / G 骨覆盖�
 
 ## 6 · 现在到哪一步了
 
-`docs/animate_girl_import.md` 这一版之前，默认角色是 `alicia.vmesh`，
-而粗糙的 `anime_girl` 是**动画演示场景**的主体 —— 用户看到"粗糙"的地方
-是 `assets/scenes/anime_demo.json` 那个演示，不是玩家角色。
+**2026-10-29 已全线切换完毕**，产品路径上再没有 `anime_girl` 这个名字。
 
-**2026-10-29 已经拿到一个可用的产物**：
-`assets/models/characters/animate_girl_rigged.glb`
+产物：`assets/models/characters/animate_girl_rigged.glb`
 （1.626 m / 65 骨 / 4 段 clip / 26134 顶点 / 权重七条判据全绿）。
-它和 `animate_girl.glb` 的关系只有两处差别：
+它和同目录 `animate_girl.glb` 的差别：
 
 | | `animate_girl.glb` | `animate_girl_rigged.glb` |
 |---|---|---|
 | 轴向 | Y-up（引擎里躺着） | 根节点 +90°X，Z-up（站着） |
-| 权重 | 22.95% 跨肢体混杂 | 0.00%，另 3 根指尖骨无顶点（握姿） |
-| 几何 / 骨架 / clip | —— | **逐字节相同**，只重写了两个 attribute |
+| 权重 | 22.95% 跨肢体混杂 | 0.00%，另 12 根指尖骨无顶点（握姿） |
+| 根位移 | `Walk` 带 1.79 m / `Jump` 带真跳高 | `Walk` 已原地化，`Jump` 的 y 一分没动 |
+| 刚性件 | 靴子被 4 根骨扯长 | 221 个壳整壳绑单骨 |
+| 几何 / 骨架 / clip | —— | **逐字节相同**，只重写了 attribute |
 
-### 还没做：把演示场景切过去
+### 6.1 · 切了哪四处
 
-这不是"改一行"。`assets/scenes/anime_demo.json` 是按**旧资产的具体形状**
-写的：7 个子网格实体、按 `#Skin` / `#Hair` / … 命名的材质 id、
-分层遮罩的根骨名（`chest` / `hips`，新资产是 `mixamorig:Spine2` / `Hips`）、
-事件表按 clip 名匹配。而 `tools/` 下另有 13 个 `verify_*.py` 的夹具与断言
-钉在旧资产的旋转/缩放/骨名/clip 名上。
+| 场景 | 怎么改的 |
+|---|---|
+| `assets/scenes/levels/first_level.json` | 改 `tools/gen_first_level.py` 里的 Player 实体再重新生成（`--check` PASS，373 实体）。**不能手改 json** —— 它由脚本生成，手改下次重新生成就没了。 |
+| `assets/scenes/anime_demo.json` | `python tools/make_anim_demo.py` 重烤（模板 `anim_demo_tpl.json`，机位 `5.5,-5.5,1.8,45,12`）。 |
+| `assets/scenes/cutscene_demo.json` | `python tools/make_sequencer_demo.py` 重烤（复用同一份模板与机位）。 |
+| `assets/scenes/runtime_test/mat_model_probe.json` | 直接改路径（这个文件是手写夹具，没有生成器）。 |
 
-一次全切会让十几条用例同时变红，分不清"新模型坏了"还是"夹具过期了"。
-所以正确的顺序是：
+重烤时改掉的三处**不能沿用旧值**的东西：
 
-1. 先切 `first_level.json` 里那一个用 `.glb` 的实体（结构最简单）；
-2. 再按 `tools/make_anim_demo.py` 重烤演示场景（要同时把 `LAYER_ROOTS`、
-   `BASE_CLIP`/`LAYER_CLIP` 换成新资产的骨名与 clip 名）；
-3. 最后才动那 13 个 verify 的夹具，一轮切一两个，切完立刻跑。
+* `LAYER_ROOTS = ["Spine2"]` —— 旧资产叫 `chest`。⚠ **不能写 `Spine`**：
+  `buildBoneMask` 是去大小写的**子串**匹配，`Spine` 会同时命中
+  `Spine` / `Spine1` / `Spine2` 三根，遮罩直接铺满整个上身。
+* `DEMO_CAM` —— `TPL_CAM`（`3,-3,1.5,45,19.5`）是按 1.556 m 的旧角色定的，
+  新角色 1.626 m，原机位会裁掉大半截。
+* 模板必须**另烤一份**（`anim_demo_tpl.json`），不能和 `verify_anim_layers`
+  共用 `anim_layers_tpl.json` —— 谁后跑谁覆盖，"验的是哪个模型"就取决于
+  执行顺序了。为此 `verify_anim_layers.bake_template()` 加了三个可选覆盖
+  参数（`model` / `tpl` / `cam`），默认仍是本文件的常量，行为逐位不变。
 
-玩家默认角色（`editor/EditorScene.h` 的 `kDefaultCharacterAsset`）仍是
-`alicia.vmesh`，本次没动 —— 换它要考虑胶囊尺寸（现有 0.260/0.553）与
-`ModelOrientation` 的朝向补偿，属于另一件事。
+### 6.2 · 旧资产彻底删除（不再当夹具）
+
+中途走过一段弯：先把三个文件 `git mv` 进 `assets/models/_fixtures/`，
+理由是"15 条 `verify_*.py` 的夹具钉在它们身上"。**这一步是错的**——
+它们还躺在一个叫 `anime_girl` 的目录里，内容还是那具粗糙模型，只是换了
+个位置，任何人打开仓库都还会以为它没退役。
+
+最终做法：**整个目录删掉，夹具全部改指产品角色**
+`models/characters/animate_girl.fbx`（65 骨 / 7 子网格 / 与
+`animate_girl_rigged.glb` 同一个模型）。改的时候有三件事必须一起动，
+否则会得到一堆"看着像资产坏了"的红：
+
+1. **实体名跟着资产名变**。`instantiateModel` 用文件名当实体名，于是
+   `anime_girl` → `animate_girl`。所有 `MYVK_EDITOR_SELECT` / `anim.time
+   <t> <name>` / `select=` 的实参都要改（4 个脚本）。
+2. **钉死的资产数字**。`verify_vertex_format` 的 `BASE` 表里那条
+   `(7, 11338, 65712, 21, 2)` 是旧资产的账（21 骨、无 UV2），换成
+   `(7, 25626, 101781, 65, 4)`；`RUNTIME_CASES` 里"无 UV2 的样本"换成
+   `samba_dancing`（不能拿 animate_girl 填两格，D1 的条数会对不上）。
+3. **机械替换会在同一张表里造出重复项**。`verify_morph` 的
+   `ASSETS_LIST` / `RUNTIME_CASES`、`verify_vertex_format` 的 `BASE`
+   都是"路径 → 数字"的字面表，替换后同一个 key 出现两次，
+   Python 静默取后者 —— 必须去重。
+
+只有一条用例不能靠换路径解决：`verify_clip_dedup` 要的是一份**take 名
+重复**的 FBX（`Rig|Idle` ×2 + `Rig|Walk` ×2）。全仓库只有那具粗糙角色
+有这性质。为两个撞名的 take 把 5.8 MB 的人物签进仓库不划算，所以现造了
+一个最小复现：`tools/export_clip_dup_fbx.py`（Blender）导出
+`assets/models/test_clip_dup.fbx` —— 1 根骨 + 1 个方块 + 2 个同长
+action，58 KB，去重日志与旧资产逐字一致。
+
+另外两个脚本一起删了：`blender_make_girl.py`（那具粗糙模型的生成器，
+留着就是"改天手滑又把它烤回来"的入口）与 `export_test_fbx.py`
+（它 exec 前者来出 FBX）。`test_cube.fbx` 已经签好了，不用重生成。
+
+### 6.3 · 换资产踩出来的三个连带 bug
+
+1. **按实体名找角色**（`verify_director_api` / `verify_world_api`）。
+   两条用例都从基底场景里"找到名叫 `anime_girl` 的实体"再挂探针脚本，
+   换资产后实体名跟着变成资产名 → 直接 `SystemExit`。
+   改成**按 `animator` 找**（"那个带 animator 的角色"才是它们真正要的），
+   以后再换资产就不用回来改。
+2. **sidecar 路径没跟着搬**（`verify_import_vmeta`）。
+   `.vmeta` 的路径规则是"资产路径**追加** `.vmeta`"，资产从 `models/` 根搬进
+   `models/characters/` 之后 `GLB_VMETA` / `FBX_VMETA` 还指着旧路径 ——
+   B2 那条「mtime 逐位不变」会去 stat 一个从不存在的文件。
+3. **`AssetSelfTest.cpp` 里写死的相对路径**。那支自检只走 `assetio::importFbx`，
+   不吃 glb，所以只能继续指一份**真实 FBX**：`models/characters/animate_girl.fbx`。
+
+### 6.4 · 回归体系的坑：收尾格式决定判定
+
+`verify_skin_weights` 自检 7/7 全绿，可 `run_regression` 判 `0/1 通过`。
+根因不在判据，在**收尾那一行**：执行器的 `OK_RE` / `BAD_RE` 只认
+`结果: PASS` / `结果: FAIL`（含几种计数式写法），而且取**最后一条**匹配。
+本脚本只打了 `合计 PASS=7 FAIL=0` + `全部通过` —— 两条正则都匹配不上，
+于是"沿用上一行的判定"，等于看运气。
+
+`verify_water` / `verify_particles` / `verify_editor_round4` 都踩过同一个坑，
+现在都留了注释。**新脚本一律以 `print("结果: PASS")` 收尾。**
+
+### 6.5 · 跑更大范围回归时挖出来的四个问题
+
+换完资产只跑"受影响的那几条"是不够的 —— 下面四个都是切完之后跑其它用例
+才暴露的，而且**没一个是新资产本身坏了**：
+
+**① 模板的"来源资产"没被记录**（`verify_anim_events` / `verify_root_motion`
+红成"模板里没有蒙皮实体"）。它们复用 `verify_anim_layers` 烤的
+`anim_layers_tpl.json`，判据只有 `os.path.isfile(TPL)`。资产一搬，模板里
+每条 `mesh.path` 都指空，可"文件在"这条判据照样为真。
+→ `bake_template()` 现在在模板旁边写一个 `.src.json` 记下"这份是按哪个资产
+烤的、从哪个机位"，`ensure_template()` 比对不上就重烤。
+**判"文件在不在"是不够的，得判"是不是按这份资产生成的"。**
+
+**② `.vmeta` 是测试之间的污染源**。`vmeshIsFresh()` 的判据是 mtime
+（`.vmeta` 比 `.vmesh` 新 → 缓存过期 → 回退 FBX 解析）。而任何用例只要
+加载一次 `characters/animate_girl.fbx`，`finishModelImport()` 就会**新建**一份
+`.vmeta`（新文件必然更新）→ 之后所有用例都悄悄走回退路径。
+`verify_morph` 的 E1 就是数 VFMT 行数才把这个抓出来的（回退路径不打印）。
+→ `verify_world_api` 里那条 `spawn()` 是源头，现在它收尾时负责删掉自己
+写出来的 sidecar。**谁写出来的，谁删掉。**
+
+**③ Content Browser 把 `.trash` 当内容显示了**。`tools/safe_fs.py` 的
+"同目录让位区"是删除工具的实现细节，却会出现在资源浏览器里；更糟的是它
+**每跑完一次用例就冒出来**，任何"这一层正好有 N 项"的断言都会随机变红。
+→ `ContentBrowser.cpp` 里以 `.` 开头的条目一律跳过（`.git` / `.vs` 同理）。
+
+**④ 拖拽用例钉死了"哪个文件在第几行"**。`verify_content_browser` 的
+③ 组拖 `anime_girl.fbx`，而它已经不在仓库里了。
+→ 把 Content 指到 `assets/models/characters`（`--env MYVK_CONTENT_DIR=...`，
+`--asset animate_girl.fbx`）。**没有换成拖 `WorldMap.glb`** —— 那条用例的
+本意里"被拖的是蒙皮 FBX"是有意义的（拖进来要建 `SkinnedMeshComponent` 并贴地），
+换个静态模型就悄悄丢了这一层。
+另外 `verify_asset_drag` 补了"找不到格子就滚一滚"的兜底：目录数量会随仓库
+变化，不能假设目标永远在第一屏。
+
+顺带一个与资产无关的老账：`runtime_test/mat_conflict_probe.json` 的两个箱体
+只有 `"primitive"`、没有 `"mesh"` 块。读端只在 `resolveMesh()` 拿到网格时才
+建 `MeshComponent`，`primitive` 只是**挂在已有网格上的意图** —— 所以那两个
+箱体一直是空物体，`verify_material_instances` 的 B1 长期拿 `A=None`。
+→ 夹具补上了 `"mesh": {"kind":"builtin","shape":"cube", ...}`。同时把
+`primitive` 加进序列化器"不算空壳"的名单（读写两份），因为**存盘不该顺手
+把读进来的字段抹掉**。
+
+### 6.6 · 像素用例为什么只能用 glb（以及"分带"必须重量）
+
+删除 `_fixtures/` 之后，比像素的那几条用例（`verify_anim_layers` 等）
+把夹具从旧角色换到了产品资产。这里有一条**不能偷懒的规则**：
+
+**① 用 `animate_girl_rigged.glb`，不要用 `animate_girl.fbx`。**
+
+FBX 与它烤出来的 `.vmesh` 是 2026-10-23 的**旧产物**：7 个子网格各带一份
+错的节点变换，渲出来头 / 躯干 / 鞋是散的（拼不回一个人）。
+
+静态尺寸看不出来 —— `verify_model_scale` 只量包围盒，它量到的
+"1.928 m" 是"最上那块到最下那块"的跨度，不是身高（真值 1.626 m，
+err=18.6%）。但只要判据比像素，画面一散就全废：`verify_anim_layers`
+换资产初期，上半带变化量一直卡在 7~14%，看起来像"遮罩没生效"，查了三轮
+才发现是**渲染出来的东西本身是碎的**。
+
+`animate_girl_rigged.glb` 是重写过的那份（根节点补了 +90°X，把手脚摆回
+一个人的位置），进场景 1.626 m 直立人形，7 个子网格的 node 变换都正确。
+
+**② 换资产 / 换机位之后，`UPPER_END` / `LOWER_START` 必须重量。**
+
+`verify_anim_layers` 的判据是"上半带一个像素不动、下半带动了很多"，
+而"上半 / 下半"是两条**相对视口高度的横线**。这两个常数是**机位的函数**：
+旧值 `0.28` / `0.52` 是照旧角色 1.556 m、旧机位 `2.10,-2.10,0.85,45,6`
+量的。换成 1.626 m 且**底面在 z=0.40** 的新角色后（glb 根节点补的那
++90°X 顺手把原点从脚底挪上去了），旧机位让角色被顶到画面顶边，两条线
+全落在身体外面 —— 判据会静默退化成"两边都算它一半"，红得莫名其妙。
+
+为此写了 `tools/_probe_anim_layers_bands.py`：出一张视口图 + 两条**逐行
+变化剖面**（Allow=upleg 打腿、Allow=spine2 打上半身），直接给区间：
+
+```
+[建议] 腿动区间   = 0.343 .. 0.936      → LOWER_START 取它的上界
+[建议] 上半动区间 = 0.143 .. 0.593      → UPPER_END   取它的下界
+```
+
+当前值 `UPPER_END=0.32` / `LOWER_START=0.64`（各留一格余量，剖面按
+1/50 分桶，边界会抖），机位 `1.96,-1.96,1.79,45,12`（沿视线 2.8 m、
+fovY=45° → 可见高 2.3 m，角色占视口 y=0.14~0.94）。
+
+**"画面分带"这类常量不该在没有量具的情况下手写。**
+
+### 6.7 · 还没做
+
+* `verify_character_import` 的 G1 组（"点完 Add Animator 之后 Animator 段
+  出现"）仍有一条红。窗口高度 / 按钮矩形那个老坑（见该文件 745 行附近的
+  长注释）已经修过一轮，需要重新分离"是夹具过期还是真回归"。
+* **`characters/animate_girl.fbx` 本身是碎的**（见 §6.6）。目前所有比像素的
+  用例都避开它，`verify_model_scale --model characters/animate_girl.fbx` 也
+  因此红（err=18.6%）。要么重导一份节点变换正确的 FBX，要么把它从
+  "可比像素的资产"名单里正式划掉 —— 现在只是绕开，没有结论。
+* 默认**玩家**角色（`editor/EditorScene.h` 的 `kDefaultCharacterAsset`）仍是
+  `alicia.vmesh`，本次没动 —— 换它要考虑胶囊尺寸（现有 0.260/0.553）与
+  `ModelOrientation` 的朝向补偿，属于另一件事。`animate_girl_rigged` 现在
+  只是**演示与过场**的主角。
+* 真正跟头走的长发需要给资产加发骨（现在按距离分给脊柱/腿），属资产升级。
+

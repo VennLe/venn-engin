@@ -210,10 +210,20 @@ def build():
             "material": vmat(M_SKIN),
         })
 
-    # ---- 角色（anime_girl.glb，播 Walk）----
+    # ---- 角色（animate_girl_rigged.glb，播 Walk）----
     # ⚠ 蒙皮实体**没有 mesh 块**：模型根实体只带 `skinned`，几何由它自己
     #   加载（`skinnedFromJson` 里 `am.loadGLTF`）。给个 `mesh` 反而会让
     #   序列化出两条互相打架的来源。
+    #
+    # 换掉了原来那个 1181 个断壳的低模 `models/anime_girl.glb`
+    # （2026-10-29）。新资产是 `E:\dev\UE-resources\Animate_Girl` 那个
+    # 27394 顶点的雕塑 + Mixamo 65 骨骨架，由 `tools/rebuild_skin_weights.py`
+    # 重写过权重并把根节点转成 Z-up。**`_rigged` 这个后缀不是可选的**：
+    # 同目录的 `animate_girl.glb` 是没修权重、没转轴的半成品，喂进来会是
+    # 一个躺在地上、四肢被拉长的角色。
+    #
+    # 四段 clip 名与 `LocomotionConfig` 逐字对齐（Idle/Walk/Run/Jump，
+    # 大小写敏感），所以 `clipName: Walk` 这条不用改。
     ents.append({
         "name": "Player",
         "transform": {"position": [0.0, 0.0, 0.0],
@@ -222,8 +232,9 @@ def build():
         "parent": -1, "visible": True, "castShadow": True,
         "mesh": None,
         "material": None,
-        "skinned": {"kind": "gltf", "path": "models/anime_girl.glb",
-                    "modelKey": "models/anime_girl.glb",
+        "skinned": {"kind": "gltf",
+                    "path": "models/characters/animate_girl_rigged.glb",
+                    "modelKey": "models/characters/animate_girl_rigged.glb",
                     "clipName": "Walk", "time": 0.0, "speed": 1.0,
                     "playing": True, "loop": True},
     })

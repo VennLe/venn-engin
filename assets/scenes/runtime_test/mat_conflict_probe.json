@@ -12,6 +12,12 @@
       "parent": -1,
       "visible": true,
       "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "conflict_a"
+      },
       "primitive": {
         "kind": "box",
         "size": 1.0
@@ -38,6 +44,12 @@
       "parent": -1,
       "visible": true,
       "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "conflict_b"
+      },
       "primitive": {
         "kind": "box",
         "size": 1.0

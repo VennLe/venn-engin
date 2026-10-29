@@ -36,8 +36,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from capture_window import find_window, user32                               # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors, wait_rect            # noqa: E402
-from verify_anim_layers import (CAM, DEFAULT_EXE, OUT_DIR, TPL, _base_env,  # noqa: E402
-                                _close, bake_template)
+from verify_anim_layers import (CAM, DEFAULT_EXE, OUT_DIR, SEL, TPL,      # noqa: E402
+                                _base_env, _close, bake_template,
+                                ensure_template)
 
 # 事件表：三件事落在 0.2 / 0.5 / 0.8 秒。三个都要比 Walk 的时长小。
 #
@@ -183,9 +184,9 @@ def main() -> int:
         print("结果: FAIL: 找不到 %s（先 ./make.cmd build）" % DEFAULT_EXE)
         return 1
     os.makedirs(OUT_DIR, exist_ok=True)
-    if not os.path.isfile(TPL):
-        print("     模板不在，先烤一份（约 20 秒）…")
-        bake_template(DEFAULT_EXE)
+    # ⚠ 用 `ensure_template` 而不是"文件在就复用"：资产一搬，旧模板里每条
+    #   `mesh.path` 都指空，表现成"模板里没有蒙皮实体"这种看不懂的红。
+    ensure_template()
 
     # ---- 1) 事件真的发了，且与配置逐条一致 ----
     v60 = build_variant("v60", EVENTS)
@@ -270,7 +271,10 @@ def main() -> int:
     env_ui = {
         "MYVK_EDITOR_PANELS": "inspector",
         "MYVK_EDITOR_INSP_TAB": "animation",
-        "MYVK_EDITOR_SELECT": "anime_girl",
+        # ⚠ 实体名 = 模板里那份资产的文件名（`instantiateModel` 的规则）。
+        #   写死 "animate_girl" 会在换资产后静默选不中 —— 选不中的症状是
+        #   "Inspector 里没有动画段"，看起来像面板坏了。所以从 SEL 取。
+        "MYVK_EDITOR_SELECT": SEL,
         # 编辑态（非 Play）：面板要能在**不跑**的时候编辑，这才是作者工作流
         "MYVK_EDITOR_PLAY": "0",
     }

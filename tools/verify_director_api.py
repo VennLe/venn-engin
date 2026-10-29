@@ -32,12 +32,13 @@
 ==============================================================================
 场景怎么造（不新增固定资产）
 ==============================================================================
-以 `cutscene_demo.json` 为基底（它有 `anime_girl`（带 animator+骨架）和
+以 `cutscene_demo.json` 为基底（它有带 animator+骨架的角色和
 `CutsceneCam`），在 `build/bin/` 里生成一份**探针场景**：
 
   · `Director` 的 `sequencer.enabled` 改成 false —— 否则它会自己播，
     日志里会混进第二段 `SEQ-CUE` 与 `DLG-START`，断言分不清是谁起的。
-  · `anime_girl` 加一个 `script` 组件指向探针脚本。
+  · **那个带 animator 的角色**（不按名字找，2026-10-29 换过资产）加一个
+    `script` 组件指向探针脚本。
 
 ⚠ 探针场景与脚本都写在 `build/bin/` 下（**不是** `assets/`）：Game.exe 的
   工作目录是 build/bin，`--scene` 与资产路径都相对它。跑完删掉，别污染仓库。
@@ -114,14 +115,18 @@ def build_probe():
         if name == "Director" and "sequencer" in e:
             e["sequencer"]["enabled"] = False
             hit_dir = True
-        if name == "anime_girl":
+        # 角色实体：**不钉名字**。2026-10-29 演示角色从 `anime_girl.fbx`
+        # 换成了 `animate_girl_rigged.glb`，实体名跟着变成资产名 ——
+        # 而这条用例真正要的只是"那个带 animator 的角色"。按名字找的话，
+        # 每换一次资产这里就要跟着改一次。
+        if not hit_girl and e.get("animator"):
             e["script"] = {"path": PROBE_SCRIPT, "enabled": True,
                            "timeScale": 1.0}
             hit_girl = True
 
     if not hit_dir or not hit_girl:
         raise SystemExit(
-            "基底场景结构变了：Director=%s anime_girl=%s。"
+            "基底场景结构变了：Director=%s 带 animator 的角色=%s。"
             "本脚本依赖这两个实体（见文件头'场景怎么造'）" % (hit_dir, hit_girl))
 
     scene_path = os.path.join(BIN, PROBE_SCENE)

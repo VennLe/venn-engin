@@ -14,7 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BAK = os.path.join(os.path.dirname(ROOT), "_venn_verify", "vmesh_bak")
 
 CASES = [
-    ("assets/models/anime_girl.vmesh", "assets_models_anime_girl.vmesh"),
+    ("assets/models/characters/animate_girl.vmesh", "assets_models_anime_girl.vmesh"),
     ("assets/models/characters/alicia.vmesh", "assets_models_characters_alicia.vmesh"),
     ("assets/models/characters/animate_girl.vmesh",
      "assets_models_characters_animate_girl.vmesh"),

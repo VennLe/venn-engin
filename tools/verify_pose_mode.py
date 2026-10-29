@@ -47,7 +47,7 @@ BIN = os.path.join(ROOT, "build", "bin")
 EXE = os.path.join(BIN, "Editor.exe")
 OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify", "pose_mode")
 
-MODEL = "assets/models/anime_girl.fbx"
+MODEL = "assets/models/characters/animate_girl.fbx"
 # 落在 build/bin 下（build/ 被 gitignore）。用相对路径是刻意的：路径里
 # 一旦出现盘符冒号，脚本那条 `save:<path>` 就要靠"从第 2 段起拼回去"的
 # 补丁来解析 —— 能避开就避开，别让被测的东西顺手测一下解析器的健壮性。
@@ -55,8 +55,12 @@ CLIP_FILE = "_verif_pose_t1.anim.json"
 
 # 打帧的骨 / 用来验"没被波及"的骨。选左右上臂：同一套骨架、分属不同肢体，
 # 谁都不是谁的祖先 —— 这样"局部 TRS 与世界位置都不该变"才是成立的断言。
-BONE_KEY = "upperarm.R"
-BONE_FREE = "upperarm.L"
+#
+# ⚠ 2026-10-29：资产换成 FAB 的 mixamo 骨架之后，骨名从 `upperarm.R`
+#   变成 `mixamorig:RightArm`（65 骨）。这里的匹配是**逐字**的
+#   （`EditorScene::findJoint` 不做去前缀），所以别只写 `RightArm`。
+BONE_KEY = "mixamorig:RightArm"
+BONE_FREE = "mixamorig:LeftArm"
 
 DUMP_RE = re.compile(r"CHAR-POSE-DUMP joint='([^']+)' (.*)$")
 DIGEST_RE = re.compile(r"CHAR-POSE-DIGEST tag=(\S+) t=([\d.]+) .*fnv=([0-9a-f]+)")
@@ -243,7 +247,7 @@ def main():
             check(n, False, "DUMP 条数不足")
 
     # ---- D1 姿态库 ----
-    check("D1 姿态库存下（POSELIB op=store bones=21）",
+    check("D1 姿态库存下（POSELIB op=store bones=65）",
           bool(re.search(r"CHAR-POSELIB op=store name='ArmUp' bones=(\d+)",
                          text1)))
 

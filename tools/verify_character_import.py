@@ -82,7 +82,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(ROOT, "build", "bin", "Editor.exe")
 OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify")
 
-MODEL = "assets/models/anime_girl.fbx"
+MODEL = "assets/models/characters/animate_girl.fbx"
 # 相机摆到 (3,-3,1.5) 看向原点（yaw=0 → 相机在 +X 侧，见 Camera::angleDir）。
 # E 组用更近的机位：Idle 是坐姿、模型只占屏 100 px 左右，姿势差在这么大的
 # 面积上会被背景稀释；Walk 站起来 + 腿在摆，拉近后差异才够硬。
@@ -453,7 +453,7 @@ def case_pose_pixels(exe: str, scene_path: str):
             #   SkinnedMeshComponent 上（与 Inspector 时间轴同一个目标）。
             #   少了这一行，命令会静默返回 "no SkinnedMeshComponent"，
             #   表现成"命令没执行"。
-            "MYVK_EDITOR_SELECT": "anime_girl",
+            "MYVK_EDITOR_SELECT": "animate_girl",
             # `;` 分隔多条：先切 clip，再钉时间（一个 env 只能传一串）。
             "MYVK_EDITOR_CONSOLE_CMD": "anim.clip %s;anim.time %s" % (CLIP, t),
         }
@@ -520,12 +520,12 @@ def case_multi_instance(exe: str):
     累加顺序决定，钉死具体数字会让这个用例因为无关的排序改动而红。
 
     顺手也验一下 `anim.time <t> <name>`：三个实例要能分别指名（名字靠
-    `EditorScene::instantiateModel` 的唯一化后缀 `anime_girl_1/_2`）。
+    `EditorScene::instantiateModel` 的唯一化后缀 `animate_girl_1/_2`）。
     """
     print("\n[F] 多实例：三个 ANIM-SKIN 的 jointBase 必须两两不等（A0-4）")
     tmpdir = tempfile.mkdtemp(prefix="anim_multi_")
     scene_path = os.path.join(tmpdir, "multi.json").replace("\\", "/")
-    names = ["anime_girl", "anime_girl_1", "anime_girl_2"]
+    names = ["animate_girl", "animate_girl_1", "animate_girl_2"]
     times = ["0.0", "0.35", "0.7"]
     cmds = ["anim.clip %s" % CLIP]
     cmds += ["anim.time %s %s" % (t, n) for t, n in zip(times, names)]
@@ -740,7 +740,7 @@ def case_animator(exe: str, scene_path: str):
     print("\n[G1] Add Animator：按钮建组件（A1 的 UI 面）")
     env1 = {
         "MYVK_EDITOR_SCENE": scene_path,
-        "MYVK_EDITOR_SELECT": "anime_girl",
+        "MYVK_EDITOR_SELECT": "animate_girl",
         "MYVK_EDITOR_INSP_TAB": "animation",
         "MYVK_EDITOR_CAM": CAM_CLOSE,
         "MYVK_EDITOR_NO_HUD": "1",
@@ -792,7 +792,7 @@ def case_animator(exe: str, scene_path: str):
     anim_scene = write_scene_with_animator(scene_path)
     env2 = {
         "MYVK_EDITOR_SCENE": anim_scene,
-        "MYVK_EDITOR_SELECT": "anime_girl",
+        "MYVK_EDITOR_SELECT": "animate_girl",
         "MYVK_EDITOR_CAM": CAM_CLOSE,
         "MYVK_EDITOR_NO_HUD": "1",
         "MYVK_EDITOR_CONSOLE_CMD": "anim.clip %s;anim.time 0.25;scene.save" % CLIP,
@@ -856,7 +856,7 @@ def case_animator(exe: str, scene_path: str):
     print("\n[G3] 重开：存盘的时间被读回来；时间→姿势→像素这条链通")
     env3 = {
         "MYVK_EDITOR_SCENE": anim_scene,
-        "MYVK_EDITOR_SELECT": "anime_girl",
+        "MYVK_EDITOR_SELECT": "animate_girl",
         "MYVK_EDITOR_CAM": CAM_CLOSE,
         "MYVK_EDITOR_NO_HUD": "1",
         "MYVK_EDITOR_CONSOLE_CMD": "anim.time 0.60",

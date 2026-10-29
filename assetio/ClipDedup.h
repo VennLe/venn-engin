@@ -13,9 +13,12 @@
 //   被 ImGui 判成 ID 冲突以后**点哪都没反应**）。逻辑一旦有两份，
 //   修一个漏一个几乎是必然的，所以这里抽出来给两边共用。
 //
-// 背景：`anime_girl.fbx`（2026-10-11 入库）里有 4 个 AnimationStack：
+// 背景：已退役的 `anime_girl.fbx`（2026-10-11 入库）里有 4 个 AnimationStack：
 //   `Rig|Idle` ×2 + `Rig|Walk` ×2 —— 同一个动作被导出了两遍。归一化
 //   掉 `<armature>|` 前缀之后名字变成 [Idle, Walk, Idle, Walk]。
+//   （那具模型已于 2026-10-29 删除；同样的形状现在由最小夹具
+//   `assets/models/test_clip_dup.fbx` 复现 —— 由 `tools/export_clip_dup_fbx.py`
+//   生成，1 骨 + 1 方块 + 2 个同名 take，58 KB。）
 //
 // 两条规则（都是"能证明才动手"，不做猜测）：
 //   · **同名 + 同时长** → 判定为同一个动作的重复导出 → **丢弃**后一段。

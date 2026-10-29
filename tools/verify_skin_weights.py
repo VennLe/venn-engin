@@ -352,8 +352,15 @@ def main():
     print("合计 PASS=%d FAIL=%d" % (len(PASS), len(FAIL)))
     if FAIL:
         print("FAILED: " + ", ".join(FAIL))
+        # ⚠ 结果行必须是 `结果: FAIL` 这四个字（ASCII 冒号）。run_regression
+        #   的 OK_RE/BAD_RE 只认 `结果: PASS|FAIL` 等几种字面写法，而且取
+        #   **最后一条**。本脚本原先只打 "合计 …/全部通过" —— 两种正则都
+        #   匹配不上 → 执行器"沿用上一行的判定" → 日志全绿却报 0/1 通过。
+        #   这不是判据的问题，是**收尾格式**的问题（`verify_water` 也踩过）。
+        print("结果: FAIL")
         return 1
     print("全部通过")
+    print("结果: PASS")
     return 0
 
 

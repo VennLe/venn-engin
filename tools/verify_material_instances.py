@@ -73,7 +73,35 @@ MAT_MISS_RE = re.compile(r"ASSET-MAT-MISS id=(\S*) name=(\S*) reason=(\S+)")
 MAT_INST_RE = re.compile(
     r"MATERIAL-INSTANCE action=make-unique entity=(\d+) parent=(\S+) name=(\S+)")
 
-GLTF_MAT_NAMES = ["Skin", "Hair", "Cloth", "EyeWhite", "Iris", "Shoe", "Lash"]
+def _glb_material_names(path):
+    """从 .glb 的 JSON chunk 里读材质名（含"第 0 个子网格用哪条"）。
+
+    ⚠ 原来是写死的 `["Skin","Hair","Cloth",...]` —— 那是
+    `blender_make_girl.py` 那批资产的命名。换成 FAB 角色之后材质叫
+    `材质` / `材质.001..006`，写死表会让 B3/B5 一起红，而这条用例要验的
+    是"材质 id 稳定、不是数组下标"，跟材质**叫什么**无关。
+    """
+    import struct
+    data = open(path, "rb").read()
+    _, _, total = struct.unpack_from("<III", data, 0)
+    off = 12
+    while off < total:
+        ln, ty = struct.unpack_from("<II", data, off)
+        if ty == 0x4E4F534A:
+            js = json.loads(data[off + 8: off + 8 + ln].decode("utf-8"))
+            names = [m.get("name", "") for m in js.get("materials", [])]
+            prim = (js.get("meshes") or [{}])[0].get("primitives") or [{}]
+            mi = prim[0].get("material")
+            first = names[mi] if isinstance(mi, int) and mi < len(names) else ""
+            return names, first
+        off += 8 + ln + ((4 - ln % 4) % 4 if ln % 4 else 0)
+    return [], ""
+
+
+GLTF_MAT_NAMES, MAT0_NAME = _glb_material_names(
+    os.path.join(ROOT, "assets", "models", "characters",
+                 "animate_girl_rigged.glb"))
+MAT0_NAME = MAT0_NAME or (GLTF_MAT_NAMES[0] if GLTF_MAT_NAMES else "Skin")
 
 g_pass = 0
 g_fail = 0
@@ -243,9 +271,9 @@ def group_b():
     ids = []
     for l in lines:
         m = MAT_ID_RE.search(l)
-        if m and m.group(1) == "models/anime_girl.glb":
+        if m and m.group(1) == "models/characters/animate_girl_rigged.glb":
             ids.append(m.group(3))
-    want = {"models/anime_girl.glb#" + n for n in GLTF_MAT_NAMES}
+    want = {"models/characters/animate_girl_rigged.glb#" + n for n in GLTF_MAT_NAMES}
     check("B3 7 个材质 id 与 glTF 材质名一一对应", set(ids) == want,
           "got=%d want=%d" % (len(set(ids)), len(want)))
     check("B4 材质 id 里没有数组下标的形状（#mat<数字>）",
@@ -259,7 +287,7 @@ def group_b():
     ov = g.get("overrides") or {}
     check("B5 模型材质的覆盖能存能读（kind=model + 两个覆盖字段）",
           g.get("kind") == "model"
-          and g.get("id") == "models/anime_girl.glb#Skin"
+          and g.get("id") == "models/characters/animate_girl_rigged.glb#" + MAT0_NAME
           and abs(ov.get("roughness", -1) - 0.05) < 1e-4
           and (ov.get("baseColor") or [0])[0] == 1.0,
           json.dumps(g, ensure_ascii=False)[:110])

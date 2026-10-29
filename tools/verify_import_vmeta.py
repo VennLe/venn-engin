@@ -3,8 +3,8 @@
 断言的六件事：
 
   A 组  首次导入生成 sidecar
-        `models/anime_girl.glb.vmeta` 出现，`materials` 里有 7 条、条条等于
-        `模型路径#glTF材质名`，`sourceHash` 是 `fnv1a:0x` 开头。
+        `models/characters/animate_girl_rigged.glb.vmeta` 出现，`materials` 里有 7 条、
+        条条等于 `模型路径#glTF材质名`，`sourceHash` 是 `fnv1a:0x` 开头。
         ⚠ 文件名是**追加** `.vmeta` 而不是替换扩展名 —— 否则 `.glb` 与 `.fbx`
           会抢同一个 sidecar（见 B3）。
 
@@ -41,6 +41,7 @@
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 from safe_fs import safe_remove
@@ -56,12 +57,41 @@ MODELS = os.path.join(BIN, "assets", "models")
 GLB_PROBE = "scenes/runtime_test/mat_model_probe.json"
 FBX_PROBE_REL = "scenes/_vmeta_fbx_probe.json"
 
-GLB_REL = "models/anime_girl.glb"
-FBX_REL = "models/anime_girl.fbx"
-GLB_VMETA = os.path.join(MODELS, "anime_girl.glb.vmeta")
-FBX_VMETA = os.path.join(MODELS, "anime_girl.fbx.vmeta")
+GLB_REL = "models/characters/animate_girl_rigged.glb"
+FBX_REL = "models/characters/animate_girl.fbx"
+# sidecar 的路径是**资产路径直接追加 `.vmeta`**（见下面的 A 组注释）。
+GLB_VMETA = os.path.join(MODELS, "characters", "animate_girl_rigged.glb.vmeta")
+FBX_VMETA = os.path.join(MODELS, "characters", "animate_girl.fbx.vmeta")
 
-GLTF_MAT_NAMES = ["Skin", "Hair", "Cloth", "EyeWhite", "Iris", "Shoe", "Lash"]
+def _glb_material_names(path):
+    """从 .glb 的 JSON chunk 里读材质名，外加"第 0 个子网格用的是哪一条"。
+
+    ⚠ 别在这里钉死名字表。原来是 `["Skin","Hair","Cloth",...]` —— 那是
+    `blender_make_girl.py` 那批资产的命名。换成 FAB 角色之后材质叫
+    `材质` / `材质.001..006`，写死表会让 A2/D4 一起红，而"红"的原因和
+    这条用例要验的东西（映射表 = 模型路径#材质名）毫无关系。
+    """
+    data = open(path, "rb").read()
+    _, _, total = struct.unpack_from("<III", data, 0)
+    off = 12
+    while off < total:
+        ln, ty = struct.unpack_from("<II", data, off)
+        if ty == 0x4E4F534A:
+            js = json.loads(data[off + 8: off + 8 + ln].decode("utf-8"))
+            names = [m.get("name", "") for m in js.get("materials", [])]
+            prim = (js.get("meshes") or [{}])[0].get("primitives") or [{}]
+            mi = prim[0].get("material")
+            first = names[mi] if isinstance(mi, int) and mi < len(names) else ""
+            return names, first
+        off += 8 + ln + ((4 - ln % 4) % 4 if ln % 4 else 0)
+    return [], ""
+
+
+GLTF_MAT_NAMES, MAT_KEY = _glb_material_names(
+    os.path.join(ROOT, "assets", "models", "characters",
+                 "animate_girl_rigged.glb"))
+# C/D 组"手改映射"用的那条：第 0 个子网格的材质名（id 里的 `/mat0`）。
+MAT_KEY = MAT_KEY or (GLTF_MAT_NAMES[0] if GLTF_MAT_NAMES else "Skin")
 
 VMETA_RE = re.compile(r"ASSET-VMETA path=(\S+) hash=(\S+) changed=(\d+) "
                       r"forced=(\d+) mats=(\d+)")
@@ -208,7 +238,7 @@ def group_c():
         check("C1 手改映射 → ASSET-MAT-ID 跟着改", False, "缺少 sidecar")
         return
     doc = read_meta(GLB_VMETA)
-    doc.setdefault("materials", {})["Skin"] = "custom/skin_v9"
+    doc.setdefault("materials", {})[MAT_KEY] = "custom/skin_v9"
     write_meta(GLB_VMETA, doc)
     lines = run_probe(GLB_PROBE)
     ids = find(MAT_ID_RE, lines)
@@ -242,9 +272,9 @@ def group_d():
     check("D3 陈旧的 Ghost 映射被删掉（不留永久假警报）",
           "Ghost" not in (after.get("materials") or {}),
           json.dumps(sorted(after.get("materials") or {}), ensure_ascii=False))
-    check("D4 已有映射保留（Skin 仍是 custom/skin_v9）",
-          (after.get("materials") or {}).get("Skin") == "custom/skin_v9",
-          (after.get("materials") or {}).get("Skin", "none"))
+    check("D4 已有映射保留（%s 仍是 custom/skin_v9）" % MAT_KEY,
+          (after.get("materials") or {}).get(MAT_KEY) == "custom/skin_v9",
+          (after.get("materials") or {}).get(MAT_KEY, "none"))
     check("D5 记下的 hash 被刷成当前值",
           after.get("sourceHash", "").startswith("fnv1a:0x")
           and after.get("sourceHash") != "fnv1a:0xDEADBEEFDEADBEEF",

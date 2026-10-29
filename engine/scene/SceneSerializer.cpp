@@ -3233,7 +3233,19 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
         je.contains("playerLimb") || je.contains("folder") ||
         // G18 预制体成员标记。prefab 里可以有"纯分组节点"（没有网格、
         // 只有 children），漏了它会被算进 skipped。
-        je.contains("prefab");
+        je.contains("prefab") ||
+        // 内置图元的生成参数（`MeshComponent::primitive`，2026-10-29）。
+        // 加它是因为"只写 primitive、没有 mesh"的实体确实存在（历史手写夹具
+        // 就是这种形状），而**丢弃它**等于把读进来的数据在存盘时抹掉 ——
+        // 存盘应该保真，不该顺手做语义裁剪。
+        // ⚠ 但别指望它能把这种实体"救活"：读端 `entityApplyComponentsImpl`
+        //   只在 `resolveMesh()` 拿到网格时才建 MeshComponent，`primitive`
+        //   是**挂在已有网格上的意图**。所以 primitive-only 的实体在运行时
+        //   仍然是空物体（`runtime_test/mat_conflict_probe.json` 当年就是这么
+        //   空了两年，`verify_material_instances` 的 B1 一直拿 A=None）。
+        //   那份夹具已经补上 `"mesh": {"kind":"builtin","shape":"cube"}`。
+        // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
+        je.contains("primitive");
     // ⚠ `includeEmpty` 只给**存档**用（G17-1）。场景文件要的是"不写空壳"，
     //   存档要的是"全量" —— 一个只挂 Transform 的空物体（玩家、出生点、
     //   纯分组节点）在场景里确实没什么好存的，但存档漏了它 = 读档后
@@ -3806,7 +3818,11 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
         je.contains("playerLimb") || je.contains("folder") ||
         // G18 预制体成员标记。prefab 里可以有"纯分组节点"（没有网格、
         // 只有 children），漏了它会被算进 skipped。
-        je.contains("prefab");
+        je.contains("prefab") ||
+        // 内置图元（`MeshComponent::primitive`）。与写端同一份名单、同一个
+        // 理由：程序化箱体没有 mesh，只有 primitive。漏了它 → 读端把这种
+        // 实体判成"空壳"丢掉（或者只留 Transform），表现成"存了读不回来"。
+        je.contains("primitive");
     return mesh || mat || hasNonMeshContent;
 }
 

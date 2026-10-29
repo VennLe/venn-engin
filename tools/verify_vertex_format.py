@@ -53,7 +53,6 @@ MESH_VER = 2
 #   于是 `--info` 报 clips=2。**几何一个字节没动**：重烤前后 submeshes/vertices/
 #   indices/joints/materials 全等，sourceHash 也全等，只有动画段少了一段重复。
 BASE = {
-    "models/anime_girl.vmesh":                   (7, 11338, 65712, 21, 2),
     "models/characters/alicia.vmesh":            (20, 21310, 95394, 128, 4),
     "models/characters/animate_girl.vmesh":      (7, 25626, 101781, 65, 4),
     "models/characters/default_character.vmesh": (2, 35440, 165960, 23, 4),
@@ -61,11 +60,16 @@ BASE = {
     "models/thirdparty/samba_dancing.vmesh":     (2, 35440, 165960, 52, 2),
 }
 
-# 运行期探针只用这三个：一个"没有 UV2"、一个"有 UV2"、一个最大的。
+# 运行期探针只用这三个：一个有 UV2、两个没有（一条大的、一条小的）。
+#
+# ⚠ 2026-10-29：第三条原本是那个已退役的 `_fixtures/anime_girl.fbx`（21 骨、
+#   无 UV2）。它被删掉之后换成了 `samba_dancing` —— 判据要的是"**没有** UV2
+#   的资产也不能读错"，不能拿同一个 animate_girl 填两格（D1 的数字对不上，
+#   D3 按文件名配对也会歧义）。
 RUNTIME_CASES = [
-    "models/anime_girl.fbx",
     "models/characters/animate_girl.fbx",
     "models/characters/alicia.fbx",
+    "models/thirdparty/samba_dancing.fbx",
 ]
 
 fails: list[str] = []
@@ -229,8 +233,11 @@ def main() -> int:
         if os.path.isfile(path):
             stats[rel] = vertex_stats(path)
 
-    check("B0 六个资产的 stride 都是 %d" % STRIDE,
-          all(s["stride"] == STRIDE for s in stats.values()) and len(stats) == 6,
+    # ⚠ 数量跟着 BASE 走，别钉死数字：2026-10-29 删掉那具退役的
+    #   `_fixtures/anime_girl.vmesh` 之后是 5 条，之前是 6 条。
+    check("B0 %d 个资产的 stride 都是 %d" % (len(BASE), STRIDE),
+          all(s["stride"] == STRIDE for s in stats.values())
+          and len(stats) == len(BASE),
           "/".join(sorted({str(s["stride"]) for s in stats.values()})))
     # §14：第 88 字节的 `morphCount` 与 `morphBase` 必须严格自洽。
     # "有 base 没 count"（或反过来）在写端是不可能出现的 ——
@@ -272,7 +279,7 @@ def main() -> int:
           not zeros, ", ".join(os.path.basename(z) for z in zeros))
 
     # ================= C. 确定性 =================
-    src_fbx = os.path.join(ASSETS, "models", "anime_girl.fbx")
+    src_fbx = os.path.join(ASSETS, "models", "characters", "animate_girl.fbx")
     if os.path.isfile(src_fbx):
         os.makedirs(WORK, exist_ok=True)
         a = os.path.join(WORK, "det_a.vmesh")

@@ -19,13 +19,18 @@
        - `--target vp`  → 视口落点，断言 `alignImportToGround`（贴地）
        - `--target hier`→ Hierarchy 树下方空白区，断言 `HIER-IMPORT`
 
-     注意两个既定条件（不是本脚本的假设，是可复现的现状）：
+     注意三个既定条件（不是本脚本的假设，是可复现的现状）：
        - 需要 --env MYVK_CONTENT_DIR=assets/models，否则 Content 停在
          assets 根，看不到网格模型；
-       - 需 --asset anime_girl.fbx。默认的 box01.glb 在 assets/models 里
-         排在**第三行**，而 Content 面板默认只有约 400px 高，第三行被网格
-         滚动区裁掉 → 脚本点不到它。改用第一/二行的模型
-         （WorldMap.glb / anime_girl.fbx / anime_girl.glb）即可稳定通过。
+       - 需 --asset 一个**能滚到的**文件：默认的 box01.glb 在
+         assets/models 里排在第三行，而 Content 面板默认只有约 400px 高，
+         第三行被网格滚动区裁掉 → 脚本点不到它。
+       - ⚠ 2026-10-29（二次）：那个粗糙的 `anime_girl.fbx` 已经**整个删掉**
+         了（连夹具身份都不留），现在拖的是产品角色
+         `characters/animate_girl.fbx`。它在 `characters/` 里排第五行左右，
+         靠 `verify_asset_drag` 的"找不到就滚一滚"兜底；不换去拖
+         WorldMap 或 test_cube —— 这条用例的本意里"被拖的是蒙皮 FBX"是
+         有意义的（拖进来要建 SkinnedMeshComponent 并贴地）。
 
 用法：
     python tools/verify_content_browser.py [--exe build/bin/Editor.exe]
@@ -165,8 +170,8 @@ def main():
             p = subprocess.run(
                 [py, os.path.join(ROOT, "tools", "verify_asset_drag.py"),
                  "--target", target,
-                 "--env", "MYVK_CONTENT_DIR=assets/models",
-                 "--asset", "anime_girl.fbx"],
+                 "--env", "MYVK_CONTENT_DIR=assets/models/characters",
+                 "--asset", "animate_girl.fbx"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", timeout=600)
             out = p.stdout or ""

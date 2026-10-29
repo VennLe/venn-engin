@@ -63,7 +63,7 @@ BIN = os.path.join(ROOT, "build", "bin")
 EXE = os.path.join(BIN, "Editor.exe")
 OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify", "constraints")
 
-MODEL = "assets/models/anime_girl.fbx"
+MODEL = "assets/models/characters/animate_girl.fbx"
 
 SCRIPT_RE = re.compile(
     r"CONSTRAINT-SCRIPT applied=(\d+) failed=(\d+) n=(\d+) sel=(-?\d+) "

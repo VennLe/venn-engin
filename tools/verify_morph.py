@@ -42,9 +42,12 @@ STRIDE = 112
 K_SECTION_MORPH = 6
 K_NO_MORPH_BASE = 0xFFFFFFFF
 
-# 六个资产：只有 alicia 的 FBX 带 blend shape（60 个 channel）。
+# 五个资产：只有 alicia 的 FBX 带 blend shape（60 个 channel）。
+# ⚠ 2026-10-29：原来这里还有一条已退役的 `_fixtures/anime_girl.vmesh`，
+#   删掉它之后**顺手去了重** —— 机械替换路径会让同一个
+#   `characters/animate_girl.vmesh` 在同一张表里出现两次，
+#   E 组按 rel 建字典时后一条会静默覆盖前一条。
 ASSETS_LIST = [
-    "models/anime_girl.vmesh",
     "models/characters/alicia.vmesh",
     "models/characters/animate_girl.vmesh",
     "models/characters/default_character.vmesh",
@@ -55,9 +58,9 @@ EXPECT_MORPH = {"models/characters/alicia.vmesh"}
 
 # 运行期探针（与 verify_vertex_format 的 D 组同一批）
 RUNTIME_CASES = [
-    "models/anime_girl.fbx",
     "models/characters/animate_girl.fbx",
     "models/characters/alicia.fbx",
+    "models/thirdparty/samba_dancing.fbx",
 ]
 
 _n = 0
@@ -460,7 +463,7 @@ def main():
     os.makedirs(os.path.join(root, "scenes"))
     ents = []
     old = 1_000_000_000
-    for i, rel in enumerate(("models/characters/alicia.fbx", "models/anime_girl.fbx")):
+    for i, rel in enumerate(("models/characters/alicia.fbx", "models/characters/animate_girl.fbx")):
         stem = os.path.splitext(rel)[0]
         d = os.path.join(root, os.path.dirname(rel))
         os.makedirs(d, exist_ok=True)
@@ -506,7 +509,7 @@ def main():
     if len(lines) == 2:
         by_verts = {int(x[1]): x for x in lines}
         for rel, want_has in (("models/characters/alicia.vmesh", True),
-                              ("models/anime_girl.vmesh", False)):
+                              ("models/characters/animate_girl.vmesh", False)):
             st = stats.get(rel)
             if not st:
                 continue

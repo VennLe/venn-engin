@@ -472,7 +472,7 @@ def main():
     #      与 UE5 对齐：骨骼网格体 LOD 走专门管线，不是自动减面能凑的。
     print("\n== 第 8 组：蒙皮网格不生成自动 LOD（2026-10-24 事故修复）==")
     girl = os.path.abspath(os.path.join(
-        ROOT, "assets", "models", "anime_girl.glb"))
+        ROOT, "assets", "models", "characters", "animate_girl_rigged.glb"))
     if not os.path.exists(girl):
         print("  跳过（找不到 %s）" % girl)
     else:

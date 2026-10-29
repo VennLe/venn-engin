@@ -34,7 +34,7 @@
 
 用法：
     python tools/verify_model_scale.py
-    python tools/verify_model_scale.py --model assets/models/anime_girl.fbx
+    python tools/verify_model_scale.py --model assets/models/characters/animate_girl.fbx
 """
 
 from __future__ import annotations

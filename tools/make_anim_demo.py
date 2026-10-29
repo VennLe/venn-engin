@@ -33,6 +33,29 @@ import verify_anim_layers as V                                  # noqa: E402
 
 OUT = os.path.join(V.ROOT, "assets", "scenes", "anime_demo.json")
 
+# ---- 演示用的角色资产 ----
+#
+# 2026-10-29 换掉了原来那个 `assets/models/characters/animate_girl.fbx`：那是 1181 个断壳
+# 拼出来的低模，用户的原话是"太粗糙了不能用"。
+#
+# 新资产 = `E:\dev\UE-resources\Animate_Girl` 那个 27394 顶点的雕塑
+# + Mixamo 65 骨骨架，由 `tools/rebuild_skin_weights.py` 重写了蒙皮权重、
+# 并把根节点转成 Z-up（引擎对蒙皮网格不吃 `kYupToZup`，见
+# `docs/animate_girl_import.md` §5）。
+#
+# ⚠ **`_rigged` 后缀不是可选的**：同目录的 `animate_girl.glb` 是没修权重、
+#   没转轴的半成品 —— 喂进来会得到一个躺在地上、四肢被拉长的角色。
+#
+# ⚠ 模板必须**独立一份**（`anim_demo_tpl.json`），不能和
+#   `verify_anim_layers.TPL` 共用：那条用例验的仍是旧资产，共用的话谁后跑
+#   谁把对方那份覆盖掉，"验的是哪个模型"就取决于执行顺序了。
+DEMO_MODEL = "assets/models/characters/animate_girl_rigged.glb"
+DEMO_TPL = os.path.join(V.OUT_DIR, "anim_demo_tpl.json")
+# 演示场景的机位。`verify_anim_layers.TPL_CAM`（"3,-3,1.5,45,19.5"）是按旧角色
+# 1.556 m 定的，换成 1.626 m 的新角色之后那个机位会把人大半截裁出画面。
+# 拉远到 5.5、俯角降到 12°，整个角色连脚下阴影一起框进来。
+DEMO_CAM = "5.5,-5.5,1.8,45,12"
+
 # ---- 演示内容（改这里就能改场景）----
 #
 # 底座相位 0.30 s、层相位 0 s：**这是刻意错开的**。层的 `time` 不落盘
@@ -49,21 +72,35 @@ BASE_CLIP = "Walk"
 BASE_TIME = 0.30
 LAYER_CLIP = "Idle"
 LAYER_WEIGHT = 0.75
-LAYER_ROOTS = ["chest"]        # 只接管胸腔以上（头 / 双臂 / 头发）
+# 只接管胸腔以上（头 / 双臂 / 头发）。
+#
+# ⚠ 骨名跟着资产走：旧资产叫 `chest`，Mixamo 骨架里同一根骨是
+#   `mixamorig:Spine2`。`buildBoneMask` 用的是**去大小写子串匹配**
+#   （`name.find(want)`），所以这里写 `Spine2` 就够 —— 但**不能**写
+#   `Spine`：那会同时命中 Spine / Spine1 / Spine2 三根，等于把半个躯干
+#   也算进"上半身"，遮罩就看不出边界了。
+LAYER_ROOTS = ["Spine2"]
 # 脚步事件：一左一右。t 必须**小于** clip 时长，否则永远不发。
+# （Walk 时长 1.0000 s，两个 t 都落在里面。）
 EVENTS = [(0.15, "Footstep", "left"), (0.65, "Footstep", "right")]
 # 根运动：Delta only = "只算位移给物理，引擎不替它移动"。
-# ⚠ 这份资产是**原地动画**，所以 delta 恒为 0 —— 打开它正好演示
-#   "配了根运动但角色不走"长什么样（日志：cfg=1 n=0 bone=hips）。
+#
+# ⚠ 这里的行为**换资产时就变了**，别照抄旧日志：
+#   · 旧 `anime_girl.fbx` 的 Walk 是原地动画 → delta 恒为 0，
+#     日志是 `cfg=1 n=0 bone=hips`（"配了根运动但角色不走"）。
+#   · 新资产的 Walk 带约 1.79 m 的前进位移（Mixamo `Walking` 烘帧时没做
+#     in-place）→ `n>0`，真的会算出行程。
+#   配置值仍是 2（Delta only），所以**引擎不会替它移动**这个前提没变：
+#   视觉上看到的是"骨骼带着身体在原地来回走"，实体本身留在原点。
 ROOT_MOTION = 2
 
 
 def build_demo():
-    if not os.path.isfile(V.TPL):
+    if not os.path.isfile(DEMO_TPL):
         print("模板不在，先烤一份（约 20 秒）…")
-        V.bake_template(V.DEFAULT_EXE)
+        V.bake_template(V.DEFAULT_EXE, DEMO_MODEL, DEMO_TPL, DEMO_CAM)
 
-    with open(V.TPL, encoding="utf-8") as f:
+    with open(DEMO_TPL, encoding="utf-8") as f:
         doc = json.load(f)
 
     root = None
@@ -134,8 +171,9 @@ def main():
     print("  ANIM-LAYER configured=1 applied=1        ← 遮罩真的混进去了")
     print("  ANIM-MASK mode=Allow                     ← 遮罩解算跑了")
     print("  ANIM-EVENT ... kind=Footstep t=0.1500    ← 脚步事件在发")
-    print("  ANIM-ROOTMOTION cfg=1 n=0 bone=hips      ← 配了根运动但不走")
-    print("                                             （这份资产是原地动画）")
+    print("  ANIM-ROOTMOTION cfg=1 n=>0 bone=hips     ← 配了 Delta only：")
+    print("                                             算出位移但引擎不替它走")
+    print("                                             （换资产前这里是 n=0）")
     return 0
 
 

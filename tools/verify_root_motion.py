@@ -51,8 +51,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from capture_window import find_window, user32                               # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors, wait_rect            # noqa: E402
-from verify_anim_layers import (CAM, DEFAULT_EXE, OUT_DIR, TPL, _base_env,  # noqa: E402
-                                _close, bake_template)
+from verify_anim_layers import (CAM, DEFAULT_EXE, OUT_DIR, SEL, TPL,      # noqa: E402
+                                _base_env, _close, bake_template,
+                                ensure_template)
 
 CLIP = "Walk"          # 有 4 段可用，挑最短的一段；反正都是原地动画
 FIXED_DT = "0.0166667"  # 1/60：仿真时间与墙钟解耦，日志条数才可数
@@ -154,9 +155,10 @@ def run_anim(scene, extra_env=None, needle="ANIM-ROOTMOTION ", want=2,
 
 
 def main():
-    if not os.path.isfile(TPL):
-        print("模板不在，先烤一次…")
-        bake_template(DEFAULT_EXE)
+    # ⚠ 用 `ensure_template`（判"是不是按这份资产生成的"），不是判文件在不在。
+    #   资产一搬，旧模板里每条 mesh.path 都指空 —— 症状是 ①/cfg=1 但 bone=-
+    #   和「模板里没有蒙皮实体」这种完全看不出因果的红。
+    ensure_template()
 
     # ---- ① 自动选骨 ----
     # 不看 `n` 是几（这份资产一律 0），只看 cfg 对了、骨名解出来了。
@@ -220,7 +222,8 @@ def main():
     lines_ui = run_anim(build_variant("ui", mode=1, bone=""),
                         extra_env=env_ui, needle="INS-ANIM-ROOT",
                         want=1, need_ticks=2, timeout=30.0,
-                        select="anime_girl")
+                        # 实体名跟模板里那份资产的文件名走（见 verify_anim_layers.SEL）
+                        select=SEL)
     txt_ui = "\n".join(lines_ui)
     has_combo = "INS-ANIM-ROOTMOTION" in txt_ui
     has_bone = "INS-ANIM-ROOTBONE" in txt_ui

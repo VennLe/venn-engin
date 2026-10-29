@@ -137,7 +137,7 @@ int runAssetSelfTest() {
     g_fail = 0;
 
     // ---------------- 选模型 ----------------
-    std::string rel = "models/anime_girl.fbx";
+    std::string rel = "models/characters/animate_girl.fbx";
     if (const char* env = std::getenv("MYVK_ASSET_TEST_MODEL")) {
         if (env[0]) rel = env;
     }

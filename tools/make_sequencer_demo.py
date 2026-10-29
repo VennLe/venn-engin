@@ -16,7 +16,9 @@
     # 然后（要看过场，必须进 Play）
     build/bin/Editor.exe            # 启动器里选 assets/scenes/cutscene_demo.json
 
-⚠ 需要先有 `anime_girl.fbx` 导入出来的模板（脚本会自己烤，约 20 秒）。
+⚠ 需要先有演示角色的模板（脚本会自己烤，约 20 秒）。角色资产与
+  `make_anim_demo.py` 共用同一份（`animate_girl_rigged.glb`，2026-10-29 起
+   换掉了原来那个 1181 个断壳的低模 `anime_girl.fbx`）。
    手写 `skinned` 实体在视口里一个像素都不画，必须走 `MYVK_EDITOR_IMPORT` +
    `scene.save` 这条路（原因见 B1 的落地记录）。
 """
@@ -28,6 +30,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import verify_anim_layers as V                                  # noqa: E402
+# 角色资产与机位直接复用动画演示场景那份 —— 两份剧本里的"同一个人"必须
+# 是同一个资产、同一个机位，否则切换场景时会有"换了个角色"的错觉。
+import make_anim_demo as D                                      # noqa: E402
 
 OUT = os.path.join(V.ROOT, "assets", "scenes", "cutscene_demo.json")
 
@@ -44,11 +49,11 @@ PRIORITY = 10
 
 
 def build_demo():
-    if not os.path.isfile(V.TPL):
+    if not os.path.isfile(D.DEMO_TPL):
         print("模板不在，先烤一份（约 20 秒）…")
-        V.bake_template(V.DEFAULT_EXE)
+        V.bake_template(V.DEFAULT_EXE, D.DEMO_MODEL, D.DEMO_TPL, D.DEMO_CAM)
 
-    with open(V.TPL, encoding="utf-8") as f:
+    with open(D.DEMO_TPL, encoding="utf-8") as f:
         doc = json.load(f)
 
     root = None

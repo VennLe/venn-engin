@@ -48,7 +48,7 @@ BIN = os.path.join(ROOT, "build", "bin")
 EXE = os.path.join(BIN, "Editor.exe")
 OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify", "rig_edit")
 
-MODEL = "assets/models/anime_girl.fbx"
+MODEL = "assets/models/characters/animate_girl.fbx"
 # 落在 build/bin 下（build/ 被 gitignore）。**相对路径是刻意的**：脚本里
 # `save:<path>` 是按"第一个冒号之后整段"解析的，路径里一旦出现盘符冒号，
 # 被测的就不是骨架编辑而是那个解析补丁了。

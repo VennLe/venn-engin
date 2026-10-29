@@ -8,7 +8,8 @@ Blender 的 `bake_anim_use_all_actions` 把 take 名写成 `<armature>|<action>`
 导入时一律剥掉 `|` 前缀（Unity / UE / glTF 转换器都这么做，否则
 `Skeleton::findClip("Idle")` 的逐字比较找不到 → 角色静默退回 T-pose）。
 
-剥完之后**会撞名**：`anime_girl.fbx` 里是 4 个 AnimationStack ——
+剥完之后**会撞名**：`bake_anim_use_all_actions` 会把每个 action 既当成
+AnimationStack 导一遍、又把 NLA 轨道再导一遍，于是同一份 FBX 里出现
 `Rig|Idle` ×2 + `Rig|Walk` ×2，归一化后 `[Idle, Walk, Idle, Walk]`。
 撞名的代价不是"列表难看"：
 
@@ -29,10 +30,20 @@ Blender 的 `bake_anim_use_all_actions` 把 take 名写成 `<armature>|<action>`
   C. 运行时（FbxLoader 直读 .fbx）—— 同样是 2 条 drop + 收尾行
      `FBX clips count=2 names=[Idle,Walk]`。⚠ C 不能只断言 drop 条数：
      全丢光也是 2 条 drop，必须看收尾行的**段数 + 名字序列**；
-  D. 仓库里的 `assets/models/anime_girl.vmesh` **已经重烤过** —— 它是签入
-     仓库的产物，只改导入代码不重烤，磁盘上那份还是 4 段（谁读 .vmesh
-     谁中招）；
+  D. 仓库里的 `assets/models/characters/animate_girl.vmesh` **已经重烤过** —— 它是签入
+     仓库的产物，只改导入代码不重烤，磁盘上那份还是旧的（谁读 .vmesh
+     谁中招）。这条与 A/B/C 无关，是"产物别忘同步"的哨兵；
   E. 全程零 `[ERROR]` / 零 Vulkan VUID。
+
+夹具
+--------------------------------------------------------------------------
+A/C 用的那份"撞名 FBX"是 `assets/models/test_clip_dup.fbx`，由
+`tools/export_clip_dup_fbx.py` 用 Blender 现造：1 根骨 + 1 个方块 +
+Walk/Idle 两个同长的 action，58 KB。
+
+⚠ 它原来是那具已经退役的粗糙角色（5.8 MB）。留着它是为了"撞名"这个
+性质，而"撞名"跟"人物长什么样"毫无关系 —— 为两个重复的 take 签一具
+人物进仓库不划算，换成最小复现之后用例判的东西一点没少。
 
 用法：
     python tools/verify_clip_dedup.py
@@ -51,9 +62,14 @@ EDITOR = os.path.join(BIN, "Editor.exe")
 ASSETS = os.path.join(ROOT, "assets")
 WORK = os.path.join(os.path.dirname(ROOT), "_venn_verify", "clipdedup")
 
-SRC_DUP = os.path.join(ASSETS, "models", "anime_girl.fbx")     # 有重名
+# 有重名的夹具：`tools/export_clip_dup_fbx.py` 用 Blender 现造的
+# 「1 骨 + 1 方块 + 2 个 action」，58 KB。
+# ⚠ 2026-10-29 之前这一格是那具粗糙的 `anime_girl.fbx`（5.8 MB）——
+#   它退役之后不能留，但**这条用例要的性质是"撞名"，不是"好看"**，
+#   所以用一个最小复现顶上来，别改成 alicia（那正好是 B 组的反例）。
+SRC_DUP = os.path.join(ASSETS, "models", "test_clip_dup.fbx")
 SRC_OK = os.path.join(ASSETS, "models", "characters", "alicia.fbx")  # 无重名
-COOK_DUP = os.path.join(WORK, "anime_girl.vmesh")
+COOK_DUP = os.path.join(WORK, "test_clip_dup.vmesh")
 COOK_OK = os.path.join(WORK, "alicia.vmesh")
 
 RE_DUP = re.compile(
@@ -146,7 +162,7 @@ def main():
         return 0
 
     # ================= A. 有重名的资产：去重 =================
-    print("\n== A 离线烤 anime_girl（4 个栈 / 2 个名字）==")
+    print("\n== A 离线烤 test_clip_dup（4 个栈 / 2 个名字）==")
     a, a_clips, a_dup, a_out = case_cook(
         "A", SRC_DUP, COOK_DUP, want_clips=2, want_dup=2)
     if a:
@@ -156,26 +172,27 @@ def main():
               abs(durs.get("Idle", -1) - 1.0) < 1e-6
               and abs(durs.get("Walk", -1) - 1.0) < 1e-6,
               " ".join("%s=%.2fs" % kv for kv in sorted(durs.items())))
-        # 轨道数不变：每段仍是 21 骨 × 3 通道 = 63
-        check("A 每段的轨道数仍是 63（21 骨 × 3 通道）",
-              all(c[2] == 63 for c in a_clips),
+        # 轨道数不变：每段仍是 1 骨 × 3 通道 = 3
+        check("A 每段的轨道数仍是 3（1 骨 × 3 通道）",
+              all(c[2] == 3 for c in a_clips),
               ",".join(str(c[2]) for c in a_clips))
-        # 几何一个字节没动：和仓库里那份 .vmesh 比 submeshes/vertices/indices
-        probe = os.path.join(ASSETS, "models", "anime_girl.vmesh")
-        _, pinfo = run([ASSETC, "--info", probe])
-        mp = re.search(r"submeshes=(\d+) vertices=(\d+) indices=(\d+)", pinfo)
-        mc = re.search(r"submeshes=(\d+) vertices=(\d+) indices=(\d+)",
+        # 几何账目：夹具只有一个子网格、一根骨。去重发生在动画段，
+        # 网格段一个字节都不该被碰 —— 这里钉住它的固定形状。
+        mg = re.search(r"submeshes=(\d+) vertices=(\d+) indices=(\d+)",
                        a_out)
-        check("A 几何账目与仓库 .vmesh 完全一致（只少了一段动画）",
-              bool(mp and mc) and mp.groups() == mc.groups(),
-              (mp.group(0) if mp else "-") + " vs " +
-              (mc.group(0) if mc else "-"))
-        # 仓库里那份也必须已经是 2 段（防止"只改代码不重烤"）
+        check("A 几何账目固定（1 子网格，顶点/索引非零）",
+              bool(mg) and mg.group(1) == "1" and int(mg.group(2)) > 0
+              and int(mg.group(3)) > 0,
+              mg.group(0) if mg else "没有 ASSETC 结果行")
+        # 产品资产那一份也必须已经重烤（防止"只改代码不重烤"：
+        # 谁读 .vmesh 谁中招，而那具角色正好是签入仓库的产物）
+        probe = os.path.join(ASSETS, "models", "characters", "animate_girl.vmesh")
+        _, pinfo = run([ASSETC, "--info", probe])
         mi = RE_INFO.search(pinfo)
-        check("D 仓库里的 anime_girl.vmesh 已重烤（clips=2）",
-              bool(mi) and int(mi.group(2)) == 2,
+        check("D 仓库里的 animate_girl.vmesh 已重烤（clips=4）",
+              bool(mi) and int(mi.group(2)) == 4,
               mi.group(0) if mi else "没有 joints= 行")
-        check("D 仓库里的 anime_girl.vmesh clips 名字唯一",
+        check("D 仓库里的 animate_girl.vmesh clips 名字唯一",
               len({c[0] for c in clips_of(pinfo)}) == len(clips_of(pinfo)),
               ",".join(c[0] for c in clips_of(pinfo)))
 
@@ -194,15 +211,20 @@ def main():
     if os.path.isdir(root):
         shutil.rmtree(root, ignore_errors=True)
     os.makedirs(os.path.join(root, "scenes"))
-    os.makedirs(os.path.join(root, "models"))
-    shutil.copyfile(SRC_DUP, os.path.join(root, "models", "anime_girl.fbx"))
+    # ⚠ `models/` 这一层必须显式建出来 —— 只建 `root/` 的话下面那行
+    #   copyfile 直接 FileNotFoundError，整条用例在 C 组开头就崩
+    #   （前两组还全是绿的，很容易误判成"资产坏了"）。
+    #   夹具本身在 `assets/models/test_clip_dup.fbx`（2026-10-29 现造的，
+    #   替代退役的粗糙角色），不在这个独立根里，所以要拷一份过来。
+    os.makedirs(os.path.join(root, "models"), exist_ok=True)
+    shutil.copyfile(SRC_DUP, os.path.join(root, "models", "test_clip_dup.fbx"))
     scene = {"version": 1, "generator": "verify_clip_dedup",
              "entities": [{
                  "name": "M0",
                  "transform": {"position": [0, 0, 0], "rotation": [0, 0, 0],
                                "scale": [1, 1, 1]},
                  "parent": -1, "visible": True, "castShadow": True,
-                 "mesh": {"kind": "fbx", "path": "models/anime_girl.fbx",
+                 "mesh": {"kind": "fbx", "path": "models/test_clip_dup.fbx",
                           "modelKey": "clipdedup#0", "subMeshIndex": 0}}]}
     import json
     with open(os.path.join(root, "scenes", "probe.json"), "w",

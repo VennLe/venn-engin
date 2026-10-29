@@ -59,6 +59,11 @@ SMOOTH_MIN_VERTS = 300
 # 包围盒对角小于这个值 = "小件"（纽扣 / 发饰 / 贴片），
 # 它们不走距离算权重，直接继承最近大壳顶点的权重。见 main() ②。
 TINY_DIAG = 0.12
+# 包围盒对角小于这个值 = "刚性件"（靴子 / 护腕 / 腰扣 / 手指段），
+# **整壳绑到同一根骨**。分档依据是实测的大壳对角：靴子 0.26、手 0.34、
+# 躯干主壳 0.52、小腿壳 0.76 —— 0.35 是它们之间唯一干净的一道缝。
+# 见 main() 里"刚性件"那一段。
+RIGID_DIAG = 0.35
 
 
 # ============================================================ GLB 读写
@@ -124,6 +129,79 @@ def append_acc(js, bins, values, ctype, atype, target=None):
                             "count": len(values),
                             "type": atype})
     return len(js["accessors"]) - 1
+
+
+# ============================================================ 原地化
+def make_inplace(js, bins):
+    """把根骨 translation 的**水平漂移**抹掉，保留垂直起伏与周期摆动。
+
+    为什么需要这一步（2026-10-29）：
+      新资产的四段 clip 是从 Mixamo 的 fbx 直接烘的，`Walk` 的 Hips 在
+      1 秒里往前走了 **1.79 m**（`resources/Walking.fbx` 没做 in-place），
+      而 `Idle` 只有 0.012 m、`Run` 0.073 m、`Jump` 的 y 跨度 1.21 m。
+      引擎的根运动在**编辑器非 Play 态不提取增量**
+      （`AnimatorSystem::applyRootMotion` 里 `!advance` 直接 return），
+      姿势里的位移因此不会被钳回基准 —— 于是演示场景把播放头放在
+      t=0.3 时，角色已经被推出画面，看起来像"斜着飘 + 腿被拉长"。
+
+    做法：`v'(t) = v(t) - u(t) · (v_last - v_first)`，**只作用在 x / z**。
+      · 首尾对齐 → 循环接缝不跳（这是"能不能循环"的前提）
+      · 减掉的是**线性漂移**，所以周期性的重心左右摆动原样保留
+      · **y 一分不动**：`Jump` 的 0.94 → 2.15 是真正的跳跃高度，
+        抹掉它角色就不跳了。这一条是这里最容易写错的地方 ——
+        把"原地化"理解成"把位移清零"就会顺手把 y 也杀掉。
+
+    ⚠ 坐标系：这是**文件原始空间**（glTF 是 Y-up），所以"高度"是 y、
+      "水平"是 x/z。不要按引擎的 Z-up 去抹 z —— 那会把跳跃高度抹掉、
+      把水平漂移留下，正好反过来。
+    """
+    if not js.get("skins"):
+        print("  原地化：没有 skin，跳过")
+        return 0
+
+    sk = js["skins"][0]
+    joints = sk["joints"]
+    parent_of = {}
+    for i, nd in enumerate(js["nodes"]):
+        for c in nd.get("children", []):
+            parent_of[c] = i
+    jset = set(joints)
+    roots = [j for j in joints if parent_of.get(j) not in jset]
+    if not roots:
+        roots = [joints[0]]
+    rnames = [js["nodes"][r].get("name", "?") for r in roots]
+
+    n_fixed = 0
+    for anim in js.get("animations", []):
+        for ch in anim["channels"]:
+            tgt = ch.get("target", {})
+            if tgt.get("node") not in roots:
+                continue
+            if tgt.get("path") != "translation":
+                continue
+            s = anim["samplers"][ch["sampler"]]
+            vals = read_acc(js, bins, s["output"])
+            n = len(vals)
+            if n < 2:
+                continue
+            dx = vals[-1][0] - vals[0][0]
+            dz = vals[-1][2] - vals[0][2]
+            if abs(dx) < 1e-6 and abs(dz) < 1e-6:
+                continue
+            out = []
+            for i, v in enumerate(vals):
+                u = i / float(n - 1)
+                out.append((v[0] - dx * u, v[1], v[2] - dz * u))
+            s["output"] = append_acc(js, bins, out, 5126, "VEC3")
+            ys = [v[1] for v in vals]
+            print("  原地化 %-6s %-16s 抹掉水平漂移 (%.3f, %.3f) m，"
+                  "高度 %.3f..%.3f 保留"
+                  % (anim.get("name", "?"), rnames[0], dx, dz, min(ys), max(ys)))
+            n_fixed += 1
+    if n_fixed == 0:
+        print("  原地化：四段 clip 的水平漂移都是 0（本来就是原地动画）")
+    return n_fixed
+
 
 
 # ============================================================ 矩阵
@@ -214,8 +292,12 @@ def main():
     ap.add_argument("--shell-radius", type=float, default=SHELL_RADIUS)
     ap.add_argument("--tiny", type=float, default=TINY_DIAG,
                     help="小件判据：包围盒对角小于此值就继承邻面权重")
+    ap.add_argument("--rigid", type=float, default=RIGID_DIAG,
+                    help="刚性件判据：包围盒对角小于此值就整壳绑一根骨")
     ap.add_argument("--no-smooth", action="store_true")
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--keep-root-motion", action="store_true",
+                    help="保留根骨的水平位移（默认抹掉：见 make_inplace）")
     args = ap.parse_args()
 
     js, bins = read_glb(args.src)
@@ -362,17 +444,45 @@ def main():
     donors = []        # (pos, prim_i, local_v)
     shell_report = []
     n_tiny = 0
+    n_rigid = 0
     for d in prims:
         P, shells = d["P"], d["shells"]
         for shell in shells:
             lo, hi = bbox(P, shell)
-            if diag(lo, hi) < args.tiny:
+            dg = diag(lo, hi)
+            if dg < args.tiny:
                 n_tiny += 1
                 continue
             cx = sum(P[v][0] for v in shell) / len(shell)
             cy = sum(P[v][1] for v in shell) / len(shell)
             cz = sum(P[v][2] for v in shell) / len(shell)
             c = (cx, cy, cz)
+
+            # ---- 刚性件：整壳绑到**同一根**骨 ----
+            #
+            # 靴子、护腕、腰扣这类零件是**刚性**的，它只该跟一根骨走。
+            # 逐顶点分配会把它们从关节处撕开：实测靴子（252 顶点、
+            # 质心 z=0.12、对角 0.26 m）被分给了 LeftLeg / LeftFoot /
+            # LeftToeBase / LeftToe_End 四根骨 —— 静止时看不出来，
+            # 一走起来脚踝弯 48°，靴子就被拉成一长条躺在地上。
+            #
+            # ⚠ 这条**只**认包围盒对角（`--rigid`，默认 0.35 m），不认
+            #   "看起来像鞋子"。分档依据来自实测的大壳尺寸：靴子 0.26、
+            #   手 0.34、躯干主壳 0.52、小腿壳 0.76 —— 0.35 是它们之间
+            #   唯一干净的缝。躯体和长发的逐顶点弯曲一点没受影响。
+            if dg < args.rigid:
+                n_rigid += 1
+                si = min(range(len(segs)), key=lambda k: bone_dist(c, k))
+                j = segs[si][0]
+                for v in shell:
+                    d["out_j"][v] = [j]
+                    d["out_w"][v] = [1.0]
+                if len(shell) >= 200:
+                    shell_report.append(
+                        (len(shell), c, (hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]),
+                         jname[j] if j < len(jname) else str(j), 1, d["pi"], True))
+                continue
+
             dmin = min(bone_dist(c, si) for si in range(len(segs)))
             limit = max(dmin * args.shell_radius, dmin + 0.05)
             cand = [si for si in range(len(segs)) if bone_dist(c, si) <= limit]
@@ -464,9 +574,11 @@ def main():
                     shell_report.append(
                         (len(shell), (cx, cy, cz),
                          (hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]),
-                         jname[dom], len(cnt), d["pi"], True))
+                         jname[dom], len(cnt), d["pi"], False))
     print("  小壳（对角 < %.2f m）%d 个 → 继承最近大壳顶点的权重"
           % (args.tiny, n_tiny))
+    print("  刚性件（对角 < %.2f m）%d 个 → 整壳绑到质心最近的**一根**骨"
+          % (args.rigid, n_rigid))
 
     # ---- ③ 壳内平滑（只对大壳，小壳是刚性继承）+ 写回 ----
     for d in prims:
@@ -545,10 +657,18 @@ def main():
         shell_report.sort(reverse=True)
         print("\n---- 大壳（≥200 顶点）绑骨报告 top 20 ----")
         print("%-6s %-6s %-26s   %s"
-              % ("顶点", "prim", "质心 (x,y,z)", "尺寸 -> 主导骨 (骨数)"))
-        for n, c, sz, dom, ni, pi, tiny in shell_report[:20]:
-            print("%-6d p%-5d (%6.3f,%6.3f,%6.3f)   %.3f×%.3f×%.3f -> %-22s (%d)"
-                  % (n, pi, c[0], c[1], c[2], sz[0], sz[1], sz[2], dom, ni))
+              % ("顶点", "prim", "质心 (x,y,z)", "尺寸 -> 主导骨 (骨数)  [单骨/逐点]"))
+        for n, c, sz, dom, ni, pi, single in shell_report[:20]:
+            print("%-6d p%-5d (%6.3f,%6.3f,%6.3f)   %.3f×%.3f×%.3f -> %-22s (%d) %s"
+                  % (n, pi, c[0], c[1], c[2], sz[0], sz[1], sz[2], dom, ni,
+                     "单骨" if single else "逐点"))
+
+    # ---- 原地化：抹掉根骨的水平漂移（见 make_inplace 的注释）----
+    if not args.keep_root_motion:
+        n_ip = make_inplace(js, bins)
+        if n_ip:
+            print("  （%d 条通道原地化；要保原始 root motion 加 --keep-root-motion）"
+                  % n_ip)
 
     # ---- 可选：Y-up → Z-up（引擎的 glTF 蒙皮路径不做这一步，见文档）----
     if args.zup:

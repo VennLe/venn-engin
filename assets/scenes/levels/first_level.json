@@ -15670,8 +15670,8 @@
       "material": null,
       "skinned": {
         "kind": "gltf",
-        "path": "models/anime_girl.glb",
-        "modelKey": "models/anime_girl.glb",
+        "path": "models/characters/animate_girl_rigged.glb",
+        "modelKey": "models/characters/animate_girl_rigged.glb",
         "clipName": "Walk",
         "time": 0.0,
         "speed": 1.0,

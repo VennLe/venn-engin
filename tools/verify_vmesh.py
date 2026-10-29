@@ -40,8 +40,8 @@ EDITOR = os.path.join(ROOT, "build", "bin", "Editor.exe")
 ASSETC = os.path.join(ROOT, "build", "bin", "AssetC.exe")
 WORK = os.path.join(os.path.dirname(ROOT), "_venn_verify", "vmesh")
 
-MODEL_REL = "models/anime_girl.fbx"
-VMESH_REL = "models/anime_girl.vmesh"
+MODEL_REL = "models/characters/animate_girl.fbx"
+VMESH_REL = "models/characters/animate_girl.vmesh"
 
 fails: list[str] = []
 
@@ -78,11 +78,15 @@ def prepare() -> str:
     os.makedirs(os.path.join(root, "models"), exist_ok=True)
     os.makedirs(os.path.join(root, "scenes"), exist_ok=True)
 
-    src = os.path.join(ROOT, "assets", "models", "anime_girl.fbx")
+    src = os.path.join(ROOT, "assets", "models", "characters", "animate_girl.fbx")
     if not os.path.isfile(src):
         log("SKIP 缺少 %s" % src)
         sys.exit(0)
-    shutil.copy2(src, os.path.join(root, MODEL_REL))
+    # ⚠ `MODEL_REL` 带一层 `characters/`，这一层必须显式建出来，
+    #   否则 copy2 抛 WinError 3。
+    dst = os.path.join(root, MODEL_REL)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src, dst)
 
     scene = {
         "version": 1,

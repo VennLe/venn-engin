@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generator": "mat model probe (W0-2/W0-3): one entity using anime_girl.glb submesh 0 (Skin), with two user overrides. Before W0 the overrides were dropped (dump gave material:null); after W0 they must round-trip. The ASSET-MAT-ID log lines must show 7 ids matching the 7 glTF material names (Skin/Hair/Cloth/EyeWhite/Iris/Shoe/Lash).",
+  "generator": "mat model probe (W0-2/W0-3): one entity using animate_girl_rigged.glb submesh 0 (材质.003), with two user overrides. Before W0 the overrides were dropped (dump gave material:null); after W0 they must round-trip. The ASSET-MAT-ID log lines must show 7 ids matching the 7 glTF material names (材质 / 材质.001..006).",
   "entities": [
     {
       "name": "Girl",
@@ -14,15 +14,15 @@
       "castShadow": true,
       "mesh": {
         "kind": "gltf",
-        "path": "models/anime_girl.glb",
-        "modelKey": "models/anime_girl.glb",
+        "path": "models/characters/animate_girl_rigged.glb",
+        "modelKey": "models/characters/animate_girl_rigged.glb",
         "subMeshIndex": 0
       },
       "material": {
         "kind": "model",
-        "name": "models/anime_girl.glb/mat0",
-        "modelKey": "models/anime_girl.glb",
-        "id": "models/anime_girl.glb#Skin",
+        "name": "models/characters/animate_girl_rigged.glb/mat0",
+        "modelKey": "models/characters/animate_girl_rigged.glb",
+        "id": "models/characters/animate_girl_rigged.glb#材质.003",
         "overrides": {
           "roughness": 0.05,
           "baseColor": [1.0, 0.0, 0.0, 1.0]

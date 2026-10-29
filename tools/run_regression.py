@@ -235,6 +235,22 @@ DEFAULT = [
     # E25 GPU 时戳时间轴：时间轴总长 == GPU-TIMING 帧总耗时（< 5%）/ 60 帧
     # 历史封顶 / 点段联动 Console 过滤 / 归入 Rendering 工作区 / 采样纯读
     "verify_gpu_timeline",
+    # ---- 蒙皮权重的数值验收（2026-10-29）----
+    # **纯 Python 直读 glb，不开窗口不开 Vulkan**，几百毫秒。放在这里是因为
+    # 它守的是"权重这组概率合不合理"—— 而这条线上的历史事故全是**看起来
+    # 全绿但角色被撕碎**：
+    #   · `docs/animate_girl_import.md` §4 当年判"权重和 == 1、outliers=0"，
+    #     全绿，可胸口的顶点是 Hips 31% + LeftUpLeg 29% + HeadTop_End 27%
+    #     + RightUpLeg 13% —— 四个方向同时拉，和照样是 1。
+    #   · 2026-10-29 那一版靴子（252 顶点、对角 0.26 m 的刚体壳）被分给
+    #     LeftLeg/LeftFoot/LeftToeBase/LeftToe_End 四根骨，t>0 起靴子被拉长
+    #     躺在地上。A/B/D 三条全过，只有"看得见"才报警。
+    # 七条判据：A 权重和 / B 影响数 ≤4 / C 跨肢体混杂率 / D 主导骨距离 p95 /
+    #          E 左右不串边 / F 静止 jointMat≈I（不塌）/ G 每骨都被用到。
+    # ⚠ C 与 E 是本刀的核心，也是**唯一能证伪上面两个事故**的两条。
+    # ⚠ 阈值是按这具资产定的（DOM_FAR=0.50 因为及膝长发、COVER_MIN 指尖
+    #   白名单），换资产必须重标，别当成通用常量抄走。
+    "verify_skin_weights",
     # ---- 角色表现链 A0（2026-10-18）----
     # 骨骼动画的无窗口数值自检：时间推进 / 循环回绕 / 采样拆分后的**逐位
     # 不变性**（对照一份拆分前的参考实现）/ 混合端点短路 / 拓扑序。
@@ -2087,6 +2103,16 @@ TRIGGERS = {
     #     · engine/ecs/Components.h（`ecs::AnimLayer` 的定义）—— 横切表里，
     #       改它本来就全量，写进来在 --narrow 下会假跳过。
     #     · engine/i18n/**（新增 11 条界面词）—— 同上，横切。
+    # 蒙皮权重数值验收（2026-10-29）。**只挂产物资产，不挂任何 .cpp**：
+    # 这条用例读的是 `animate_girl_rigged.glb` 的 JOINTS_0/WEIGHTS_0 原始
+    # 缓冲，跟引擎、跟编辑器、跟渲染一行业务代码都不发生关系 —— 换资产就
+    # 必须重跑，改引擎却未必（权重没变，判据就不会变）。
+    # ⚠ 权重是 `tools/rebuild_skin_weights.py` 生成的，但那支脚本本身不登记：
+    #   它是"离线烤资产"的一次性工具，改了它只有在重烤之后才会影响判据，
+    #   而重烤必然改写 glb → 上面这个 glob 自然会命中。
+    # ⚠ 同一份资产也被 anim_layers / anim_events / root_motion / sequencer
+    #   等一串 GUI 用例吃，改它本来就全量（那几条各自的 glob 里都有它）。
+    "verify_skin_weights": ["assets/models/characters/animate_girl_rigged.glb"],
     "verify_anim_layers": ["engine/animation/BoneMask.*",
                            "engine/animation/AnimatorSystem.*",
                            "engine/animation/AnimationSelfTest.cpp",
@@ -2319,7 +2345,7 @@ TRIGGERS = {
                          # Skeleton 只**读**（采样 + 骨名解析），但改它一定会
                          # 影响"名字→下标"与采样语义，所以照登。
                          "engine/assets/Skeleton.*",
-                         "assets/models/anime_girl.fbx"],
+                         "assets/models/characters/animate_girl.fbx"],
     # ---- #320：动画摄影表 ----
     # 登记五类实现主体，少一条就会出现"改了 A 只跑 B"的假跳过：
     #   · `editor/DopeSheetWindow.*` 面板本体（通道树 / 铺点 / 手势 / 注入脚本）
@@ -2410,7 +2436,7 @@ TRIGGERS = {
                          "runtime/RuntimeApp.cpp",
                          "runtime/GameFlags.h",
                          "assets/scenes/cutscene_demo.json",
-                         "assets/models/anime_girl.fbx"],
+                         "assets/models/characters/animate_girl.fbx"],
     # 重名去重（#329）：逻辑住在 `assetio/ClipDedup.h`，两个入口各接一次
     # （AssetC 走 `assetio/FbxImport.cpp`，引擎走 `engine/assets/FbxLoader.cpp`），
     # 产物是签入仓库的 `anime_girl.vmesh` —— 四条全登记，少一条就会出现
@@ -2419,8 +2445,8 @@ TRIGGERS = {
                           "assetio/FbxImport.*",
                           "engine/assets/FbxLoader.*",
                           "assetc/main.cpp",
-                          "assets/models/anime_girl.fbx",
-                          "assets/models/anime_girl.vmesh"],
+                          "assets/models/characters/animate_girl.fbx",
+                          "assets/models/characters/animate_girl.vmesh"],
     # ---- 阶段 M1：运行时骨架（G01~G05）----
     # 三条用例的实现主体全在 `runtime/**`（G01 拆出来的那个独立目标）。
     # 同一个 glob 挂到三条名下是**故意**的：改 runtime 的任何一行，
@@ -2522,7 +2548,7 @@ TRIGGERS = {
     # 换一个模型就得重跑；`.vmeta` 本身是运行时产物（build/bin 下），不进快照。
     # LOD（W2-3 顺带登记）：判据全在**蒙皮模型**上（第 8 组用它验"蒙皮也能
     # 减面"），换模型就得重跑。`engine/assets/Lod.cpp` 是横切，不写进来。
-    "verify_lod": ["assets/models/anime_girl.glb"],
+    "verify_lod": ["assets/models/characters/animate_girl_rigged.glb"],
     # W3：关卡的判据一半在生成器上（布局改了期望就得跟着改），一半在
     # 母材质上（改 .vmat 会直接改画面）。场景文件本身不进 WATCH_ROOTS
     # （编辑器会写它），所以这里显式点名。
@@ -2530,8 +2556,8 @@ TRIGGERS = {
                            "assets/scenes/levels/first_level.json",
                            "assets/materials/*.vmat",
                            "assets/scenes/sandbox.json"],
-    "verify_import_vmeta": ["assets/models/anime_girl.glb",
-                            "assets/models/anime_girl.fbx",
+    "verify_import_vmeta": ["assets/models/characters/animate_girl_rigged.glb",
+                            "assets/models/characters/animate_girl.fbx",
                             "assets/scenes/runtime_test/mat_model_probe.json"],
 
     # W4：地形。判据同时落在资产（生成器）、着色器、渲染 pass 与场景夹具上。

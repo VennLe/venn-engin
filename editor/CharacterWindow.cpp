@@ -1552,7 +1552,7 @@ void CharacterWindow::drawDetailsPanel() {
     ImGui::Text(TR("Source"));
     ImGui::SameLine(90.0f);
     // ⚠ 只显示**文件名**：完整路径动辄六七十字符，窄栏里会把右边缘撑破
-    //   （实测 "assets/models/anime_girl.fbx" 直接顶出面板）。全路径走 tooltip。
+    //   （实测 "assets/models/characters/animate_girl.fbx" 直接顶出面板）。全路径走 tooltip。
     {
         const std::string file = m_modelPath.empty()
                                      ? std::string("-")
@@ -2699,6 +2699,16 @@ void CharacterWindow::runPoseScript() {
 
     const std::string all(raw);
     std::size_t pos = 0;
+    // 骨名里**可能带冒号**（mixamo 全族：`mixamorig:RightArm`），而脚本的
+    // 分隔符也是冒号。"名字"这一段不能直接取 `a[1]` —— 必须按**尾部还剩
+    // 几段**拼：`setrot:<name>:x:y:z` 从尾部数 3 段是数字，前面全是名字。
+    // 2026-10-29 换资产时踩到：`a[1]` 拿到的是 `mixamorig`，9 条命令全部
+    // `CHAR-POSE-SCRIPT-BAD`，而报告只说"脚本没跑完"，根因藏在解析里。
+    auto jn = [](const std::vector<std::string>& v, std::size_t tail) {
+        std::string s = v[1];
+        for (std::size_t i = 2; i + tail < v.size(); ++i) s += ":" + v[i];
+        return s;
+    };
     while (pos <= all.size()) {
         std::size_t semi = all.find(';', pos);
         std::string tok = all.substr(pos, semi == std::string::npos
@@ -2747,24 +2757,27 @@ void CharacterWindow::runPoseScript() {
                         m_editPath.c_str());
             ok = true;
         } else if (cmd == "select" && a.size() >= 2) {
-            const int j = skel.findJoint(a[1], assets::kJointMatchCaseInsensitive);
+            const std::string nm = jn(a, 0);
+            const int j = skel.findJoint(nm, assets::kJointMatchCaseInsensitive);
             if (j >= 0) {
                 m_selectedJoint = j;
                 VK_LOG_INFO("CHAR-POSE-SELECT joint='%s' index=%d",
                             skel.joints[static_cast<size_t>(j)].name.c_str(), j);
                 ok = true;
             } else {
-                VK_LOG_WARN("CHAR-POSE-SELECT-MISS name='%s'", a[1].c_str());
+                VK_LOG_WARN("CHAR-POSE-SELECT-MISS name='%s'", nm.c_str());
             }
         } else if ((cmd == "setrot" || cmd == "setloc" || cmd == "setscale") &&
                    a.size() >= 5) {
-            const int j = skel.findJoint(a[1], assets::kJointMatchCaseInsensitive);
+            const std::string nm = jn(a, 3);
+            const int j = skel.findJoint(nm, assets::kJointMatchCaseInsensitive);
             if (j >= 0 && j < m_pose.count()) {
                 touchBone(j);   // 先把三个通道抄一遍，再只改其中一个
                 const size_t k = static_cast<size_t>(j);
-                const float x = std::strtof(a[2].c_str(), nullptr);
-                const float y = std::strtof(a[3].c_str(), nullptr);
-                const float z = std::strtof(a[4].c_str(), nullptr);
+                // 三个数字取**尾部**三段（原因见上面的 `jn`）。
+                const float x = std::strtof(a[a.size() - 3].c_str(), nullptr);
+                const float y = std::strtof(a[a.size() - 2].c_str(), nullptr);
+                const float z = std::strtof(a.back().c_str(), nullptr);
                 if (cmd == "setrot") {
                     m_touchedR[k] = glm::quat(glm::radians(glm::vec3(x, y, z)));
                 } else if (cmd == "setloc") {
@@ -2775,9 +2788,10 @@ void CharacterWindow::runPoseScript() {
                 ok = true;
             }
         } else if (cmd == "key" && a.size() >= 4) {
-            const int j = skel.findJoint(a[1], assets::kJointMatchCaseInsensitive);
-            const std::string what = a[2];
-            const float t = std::strtof(a[3].c_str(), nullptr);
+            const std::string nm = jn(a, 2);
+            const int j = skel.findJoint(nm, assets::kJointMatchCaseInsensitive);
+            const std::string what = a[a.size() - 2];
+            const float t = std::strtof(a.back().c_str(), nullptr);
             if (j >= 0) {
                 m_animTime = t;
                 samplePoseInto();
@@ -2794,7 +2808,8 @@ void CharacterWindow::runPoseScript() {
             logPoseDigest("script");
             ok = true;
         } else if (cmd == "dump" && a.size() >= 2) {
-            const int j = skel.findJoint(a[1], assets::kJointMatchCaseInsensitive);
+            const std::string nm = jn(a, 0);
+            const int j = skel.findJoint(nm, assets::kJointMatchCaseInsensitive);
             if (j >= 0 && j < m_pose.count()) {
                 const size_t k = static_cast<size_t>(j);
                 // 世界位置也打出来：局部 TRS 不变**不**代表外观没变 ——
@@ -2824,17 +2839,19 @@ void CharacterWindow::runPoseScript() {
                 ok = true;
             }
         } else if (cmd == "posestore" && a.size() >= 2) {
+            const std::string pn = jn(a, 0);
             if (m_pose.count() > 0) {
-                animation::EditPose p = animation::capturePose(m_pose, skel, a[1]);
+                animation::EditPose p = animation::capturePose(m_pose, skel, pn);
                 const bool added = m_edit.storePose(p);
                 VK_LOG_INFO("CHAR-POSELIB op=store name='%s' bones=%d new=%d "
-                            "total=%d", a[1].c_str(),
+                            "total=%d", pn.c_str(),
                             static_cast<int>(p.bones.size()), added ? 1 : 0,
                             static_cast<int>(m_edit.poses.size()));
                 ok = true;
             }
         } else if (cmd == "poseapply" && a.size() >= 2) {
-            const animation::EditPose* p = m_edit.findPose(a[1]);
+            const std::string pn = jn(a, 0);
+            const animation::EditPose* p = m_edit.findPose(pn);
             if (p) {
                 const int n = animation::applyEditPose(*p, skel, m_pose);
                 for (const auto& b : p->bones) {
@@ -4491,6 +4508,15 @@ void CharacterWindow::runWeightsScript() {
             if (c > 0) m_weightsDirty[static_cast<std::size_t>(s)] = 1;
             VK_LOG_INFO("WEIGHTS-CLEARBONE mesh=%d bone=%d verts=%d", s, b, c);
             ok = c > 0;
+        } else if (cmd == "axis" && a.size() >= 2) {
+            // 镜像轴的**正平面法线**（要取反的那个分量）。默认 1(Y) 是按
+            // 老资产定的；换成 FAB 角色（左/右 = X）之后 0 才对，而脚本
+            // 之前没有命令能改它 —— 于是 `mirror` 一路 `to=-1`，看起来
+            // 像"镜像功能坏了"。给脚本一个开关，别让轴只能靠 UI 拖。
+            m_rig.mirrorAxis = std::max(0, std::min(2, toI(a[1], 1)));
+            VK_LOG_INFO("WEIGHTS-MIRROR-AXIS axis=%s",
+                        animation::RigEdit::axisName(m_rig.mirrorAxis));
+            ok = true;
         } else if (cmd == "mirror" && a.size() >= 2 && s >= 0) {
             ensureWeightCaches();
             const int v = toI(a[1], -1);

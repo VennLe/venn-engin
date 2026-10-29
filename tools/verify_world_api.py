@@ -12,7 +12,7 @@
 所以本脚本验另外半条链：**宿主那边真的动了**。
 
   ① `setFlag("affection", 42)` → `RUNTIME-FLAG set name=affection value=42.0000`
-  ② `spawn("models/anime_girl.fbx", vec3(...))` → `RUNTIME-SPAWN ... skinned=1`
+  ② `spawn("models/characters/animate_girl.fbx", vec3(...))` → `RUNTIME-SPAWN ... skinned=1`
      （真的走了 FBX 装配，不是"回了个句柄"）
   ③ `loadScene("scenes/..._b.json")` → `RUNTIME-SCENE-REQ ...`（请求受理）
   ④ 下一帧真切换 → `RUNTIME-SCENE-SWITCH path=... entities=N`（N > 0）
@@ -28,8 +28,12 @@
 ==============================================================================
 以 `cutscene_demo.json` 为基底生成**两份**探针场景（都在 `build/bin/` 下）：
 
-  场景 A：`anime_girl` 挂探针脚本 A（做旗标 / 刷实体 / 换场景）
-  场景 B：`anime_girl` 挂探针脚本 B（读旗标 + 打一行标记）
+  场景 A：带 animator 的角色挂探针脚本 A（做旗标 / 刷实体 / 换场景）
+  场景 B：带 animator 的角色挂探针脚本 B（读旗标 + 打一行标记）
+
+  ⚠ 角色实体**按 `animator` 找，不按名字找**：2026-10-29 演示角色从
+    `anime_girl.fbx` 换成 `animate_girl_rigged.glb`，实体名跟着变成资产名。
+    按名字找等于每换一次资产这条用例就得回来改一次。
 
 两份都把 `Director.sequencer.enabled` 关掉 —— 否则它自己会播 opening，
 日志里混进 `SEQ-CUE` / `DLG-START`，排查时容易看错是谁起的。
@@ -69,7 +73,7 @@ SCRIPT_B_REL = "scripts/_verify_world_b.vks"
 #   拼错也能"跑过"——那一轮的日志里一条锚点都没有，只能靠断言全红发现。
 FRAMES = 120
 
-MODEL = "models/anime_girl.fbx"   # 基底场景里 anime_girl 用的就是这个
+MODEL = "models/characters/animate_girl.fbx"   # 基底场景里 anime_girl 用的就是这个
 FLAG_VALUE = 42
 
 # ⚠ `spawn` 的位置用**常量 vec3**，不用 `pos(player())`：探针场景里没有
@@ -115,13 +119,17 @@ def build_probes():
             if name == "Director" and "sequencer" in e:
                 e["sequencer"]["enabled"] = False
                 hit_dir = True
-            if name == "anime_girl":
+            if not hit_girl and e.get("animator"):
+                # 角色实体**不钉名字**：2026-10-29 演示角色从 `anime_girl.fbx`
+                # 换成 `animate_girl_rigged.glb`，实体名跟着变成资产名。这条
+                # 用例要的只是"那个带 animator 的角色"，按名字找等于每换一次
+                # 资产就得回来改一次（`verify_director_api` 同一个坑）。
                 e["script"] = {"path": script_rel, "enabled": True,
                                "timeScale": 1.0}
                 hit_girl = True
         if not hit_dir or not hit_girl:
             raise SystemExit(
-                "基底场景结构变了：Director=%s anime_girl=%s。"
+                "基底场景结构变了：Director=%s 带 animator 的角色=%s。"
                 "本脚本依赖这两个实体（见文件头'场景怎么造'）"
                 % (hit_dir, hit_girl))
         path = os.path.join(BIN, "assets", out_rel)
@@ -143,6 +151,30 @@ def build_probes():
 
 def cleanup(paths):
     for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def cleanup_sidecars():
+    """删掉本用例**副作用**造出来的 `.vmeta`（2026-10-29）。
+
+    探针 A 里 `spawn("models/characters/animate_girl.fbx")` 会走
+    `finishModelImport()`，顺带在资产旁边写一份 `.vmeta`。问题在于
+    `vmeshIsFresh()` 的判据是 **mtime**：新生的 sidecar 必然比签入仓库的
+    `.vmesh` 新 → 下一次加载判定"缓存过期" → **回退 FBX**。
+
+    症状不是崩溃，是"跑完这条用例之后，别的用例里那个模型不再是蒙皮网格
+    的字节缓存路径" —— `verify_morph` 的 E1 就是这么红的（它数 VFMT 行，
+    回退路径不打印）。而 DEFAULT 顺序里 world_api 在 morph **之后**，
+    所以这个洞平时看不见，只有手工挑一组跑才会冒出来。
+
+    约定：**谁把 sidecar 写出来，谁负责删掉。**
+    """
+    for rel in ("models/characters/animate_girl.fbx.vmeta",
+                "models/characters/animate_girl_rigged.glb.vmeta"):
+        p = os.path.join(BIN, "assets", rel)
         try:
             os.remove(p)
         except OSError:
@@ -223,6 +255,7 @@ def main():
             print("  （探针保留：%s）" % ", ".join(probes))
         else:
             cleanup(probes)
+        cleanup_sidecars()
 
     if args.dump:
         with open(args.dump, "w", encoding="utf-8") as f:

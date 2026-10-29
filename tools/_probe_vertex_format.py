@@ -11,7 +11,7 @@ EDITOR = os.path.join(ROOT, "build", "bin", "Editor.exe")
 WORK = os.path.join(os.path.dirname(ROOT), "_venn_verify", "vfmt_probe")
 
 CASES = [
-    ("models/anime_girl.fbx", "models/anime_girl"),
+    ("models/characters/animate_girl.fbx", "models/anime_girl"),
     ("models/characters/alicia.fbx", "models/characters/alicia"),
     ("models/characters/animate_girl.fbx", "models/characters/animate_girl"),
     ("models/thirdparty/samba_dancing.fbx", "models/thirdparty/samba_dancing"),

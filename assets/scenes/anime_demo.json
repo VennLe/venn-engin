@@ -2,17 +2,18 @@
  "camera": {
   "distance": 9.0,
   "fov": 45.0,
-  "pitch": 0.34033921360969543,
+  "pitch": 0.20943951606750488,
   "target": [
-   -2.998933792114258,
-   2.998933792114258,
-   -1.5042622089385986
+   -0.7248930931091309,
+   0.7248930931091309,
+   -0.07120537757873535
   ],
   "yaw": 0.7853981852531433
  },
  "entities": [
   {
    "castShadow": false,
+   "guid": "f96ec2cd2958028d",
    "locked": true,
    "material": {
     "albedo": {
@@ -104,16 +105,17 @@
   },
   {
    "castShadow": true,
+   "guid": "8e89eb90b724488b",
    "material": null,
    "mesh": null,
-   "name": "anime_girl",
+   "name": "animate_girl_rigged",
    "parent": -1,
    "skinned": {
     "clipName": "Walk",
-    "kind": "fbx",
+    "kind": "gltf",
     "loop": true,
-    "modelKey": "assets/models/anime_girl.fbx",
-    "path": "models/anime_girl.fbx",
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "path": "models/characters/animate_girl_rigged.glb",
     "playing": false,
     "speed": 1.0,
     "time": 0.3
@@ -122,7 +124,7 @@
     "position": [
      0.0,
      0.0,
-     0.7779995799064636
+     0.40046000480651855
     ],
     "rotation": [
      0.0,
@@ -156,7 +158,7 @@
       "mask": {
        "mode": 1,
        "roots": [
-        "chest"
+        "Spine2"
        ]
       }
      }
@@ -182,245 +184,252 @@
   },
   {
    "castShadow": true,
+   "guid": "bbe63ed1df1737d8",
    "material": {
-    "id": "assets/models/anime_girl.fbx#Skin",
+    "id": "models/characters/animate_girl_rigged.glb#材质.003",
     "kind": "model",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "name": "assets/models/anime_girl.fbx/mat0"
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "name": "assets/models/characters/animate_girl_rigged.glb/mat0"
    },
    "mesh": {
-    "kind": "fbx",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "path": "models/anime_girl.fbx",
+    "kind": "gltf",
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "path": "models/characters/animate_girl_rigged.glb",
     "subMeshIndex": 0
    },
-   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_0_inst",
+   "name": "assets/models/characters/animate_girl_rigged.glb/Yuzuha_Swimwear_Body_1_0_inst",
    "parent": 1,
    "transform": {
     "position": [
      0.0,
-     4.470348358154297e-08,
-     -0.7779995799064636
+     0.0,
+     0.0
     ],
     "rotation": [
-     0.0,
+     3.1415927410125732,
      -0.0,
      0.0
     ],
     "scale": [
-     1.0,
-     1.0,
-     1.0
+     0.9999999403953552,
+     0.9999999403953552,
+     0.9999999403953552
     ]
    },
    "visible": true
   },
   {
    "castShadow": true,
+   "guid": "99419ef3252e409d",
    "material": {
-    "id": "assets/models/anime_girl.fbx#Hair",
+    "id": "models/characters/animate_girl_rigged.glb#材质.002",
     "kind": "model",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "name": "assets/models/anime_girl.fbx/mat1"
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "name": "assets/models/characters/animate_girl_rigged.glb/mat1"
    },
    "mesh": {
-    "kind": "fbx",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "path": "models/anime_girl.fbx",
+    "kind": "gltf",
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "path": "models/characters/animate_girl_rigged.glb",
     "subMeshIndex": 1
    },
-   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_1_inst",
+   "name": "assets/models/characters/animate_girl_rigged.glb/Yuzuha_Swimwear_Body_1_1_inst",
    "parent": 1,
    "transform": {
     "position": [
      0.0,
-     4.470348358154297e-08,
-     -0.7779995799064636
+     0.0,
+     0.0
     ],
     "rotation": [
-     0.0,
+     3.1415927410125732,
      -0.0,
      0.0
     ],
     "scale": [
-     1.0,
-     1.0,
-     1.0
+     0.9999999403953552,
+     0.9999999403953552,
+     0.9999999403953552
     ]
    },
    "visible": true
   },
   {
    "castShadow": true,
+   "guid": "e3b61de87a70e0d5",
    "material": {
-    "id": "assets/models/anime_girl.fbx#Cloth",
+    "id": "models/characters/animate_girl_rigged.glb#材质.004",
     "kind": "model",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "name": "assets/models/anime_girl.fbx/mat2"
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "name": "assets/models/characters/animate_girl_rigged.glb/mat2"
    },
    "mesh": {
-    "kind": "fbx",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "path": "models/anime_girl.fbx",
+    "kind": "gltf",
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "path": "models/characters/animate_girl_rigged.glb",
     "subMeshIndex": 2
    },
-   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_2_inst",
+   "name": "assets/models/characters/animate_girl_rigged.glb/Yuzuha_Swimwear_Body_1_2_inst",
    "parent": 1,
    "transform": {
     "position": [
      0.0,
-     4.470348358154297e-08,
-     -0.7779995799064636
+     0.0,
+     0.0
     ],
     "rotation": [
-     0.0,
+     3.1415927410125732,
      -0.0,
      0.0
     ],
     "scale": [
-     1.0,
-     1.0,
-     1.0
+     0.9999999403953552,
+     0.9999999403953552,
+     0.9999999403953552
     ]
    },
    "visible": true
   },
   {
    "castShadow": true,
+   "guid": "2dce6889f3a1a415",
    "material": {
-    "id": "assets/models/anime_girl.fbx#EyeWhite",
+    "id": "models/characters/animate_girl_rigged.glb#材质.006",
     "kind": "model",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "name": "assets/models/anime_girl.fbx/mat3"
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "name": "assets/models/characters/animate_girl_rigged.glb/mat3"
    },
    "mesh": {
-    "kind": "fbx",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "path": "models/anime_girl.fbx",
+    "kind": "gltf",
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "path": "models/characters/animate_girl_rigged.glb",
     "subMeshIndex": 3
    },
-   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_3_inst",
+   "name": "assets/models/characters/animate_girl_rigged.glb/Yuzuha_Swimwear_Body_1_3_inst",
    "parent": 1,
    "transform": {
     "position": [
      0.0,
-     4.470348358154297e-08,
-     -0.7779995799064636
+     0.0,
+     0.0
     ],
     "rotation": [
-     0.0,
+     3.1415927410125732,
      -0.0,
      0.0
     ],
     "scale": [
-     1.0,
-     1.0,
-     1.0
+     0.9999999403953552,
+     0.9999999403953552,
+     0.9999999403953552
     ]
    },
    "visible": true
   },
   {
    "castShadow": true,
+   "guid": "1b60ed752996af75",
    "material": {
-    "id": "assets/models/anime_girl.fbx#Iris",
+    "id": "models/characters/animate_girl_rigged.glb#材质.001",
     "kind": "model",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "name": "assets/models/anime_girl.fbx/mat4"
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "name": "assets/models/characters/animate_girl_rigged.glb/mat4"
    },
    "mesh": {
-    "kind": "fbx",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "path": "models/anime_girl.fbx",
+    "kind": "gltf",
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "path": "models/characters/animate_girl_rigged.glb",
     "subMeshIndex": 4
    },
-   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_4_inst",
+   "name": "assets/models/characters/animate_girl_rigged.glb/Yuzuha_Swimwear_Body_1_4_inst",
    "parent": 1,
    "transform": {
     "position": [
      0.0,
-     4.470348358154297e-08,
-     -0.7779995799064636
+     0.0,
+     0.0
     ],
     "rotation": [
-     0.0,
+     3.1415927410125732,
      -0.0,
      0.0
     ],
     "scale": [
-     1.0,
-     1.0,
-     1.0
+     0.9999999403953552,
+     0.9999999403953552,
+     0.9999999403953552
     ]
    },
    "visible": true
   },
   {
    "castShadow": true,
+   "guid": "9c3b9d60109bdadb",
    "material": {
-    "id": "assets/models/anime_girl.fbx#Shoe",
+    "id": "models/characters/animate_girl_rigged.glb#材质",
     "kind": "model",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "name": "assets/models/anime_girl.fbx/mat5"
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "name": "assets/models/characters/animate_girl_rigged.glb/mat5"
    },
    "mesh": {
-    "kind": "fbx",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "path": "models/anime_girl.fbx",
+    "kind": "gltf",
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "path": "models/characters/animate_girl_rigged.glb",
     "subMeshIndex": 5
    },
-   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_5_inst",
+   "name": "assets/models/characters/animate_girl_rigged.glb/Yuzuha_Swimwear_Body_1_5_inst",
    "parent": 1,
    "transform": {
     "position": [
      0.0,
-     4.470348358154297e-08,
-     -0.7779995799064636
+     0.0,
+     0.0
     ],
     "rotation": [
-     0.0,
+     3.1415927410125732,
      -0.0,
      0.0
     ],
     "scale": [
-     1.0,
-     1.0,
-     1.0
+     0.9999999403953552,
+     0.9999999403953552,
+     0.9999999403953552
     ]
    },
    "visible": true
   },
   {
    "castShadow": true,
+   "guid": "e2687125e7776a76",
    "material": {
-    "id": "assets/models/anime_girl.fbx#Lash",
+    "id": "models/characters/animate_girl_rigged.glb#材质.005",
     "kind": "model",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "name": "assets/models/anime_girl.fbx/mat6"
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "name": "assets/models/characters/animate_girl_rigged.glb/mat6"
    },
    "mesh": {
-    "kind": "fbx",
-    "modelKey": "assets/models/anime_girl.fbx",
-    "path": "models/anime_girl.fbx",
+    "kind": "gltf",
+    "modelKey": "assets/models/characters/animate_girl_rigged.glb",
+    "path": "models/characters/animate_girl_rigged.glb",
     "subMeshIndex": 6
    },
-   "name": "assets/models/anime_girl.fbx/anime_girl/AnimeGirl_6_inst",
+   "name": "assets/models/characters/animate_girl_rigged.glb/Yuzuha_Swimwear_Body_1_6_inst",
    "parent": 1,
    "transform": {
     "position": [
      0.0,
-     4.470348358154297e-08,
-     -0.7779995799064636
+     0.0,
+     0.0
     ],
     "rotation": [
-     0.0,
+     3.1415927410125732,
      -0.0,
      0.0
     ],
     "scale": [
-     1.0,
-     1.0,
-     1.0
+     0.9999999403953552,
+     0.9999999403953552,
+     0.9999999403953552
     ]
    },
    "visible": true
@@ -442,5 +451,5 @@
   ],
   "intensity": 1.600000023841858
  },
- "version": 1
+ "version": 2
 }

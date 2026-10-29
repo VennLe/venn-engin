@@ -521,6 +521,14 @@ void ContentBrowser::refresh() {
         const fs::directory_entry& de = *it;
         DirEntry e;
         e.name = de.path().filename().string();
+        // 以 `.` 开头的条目一律不显示（2026-10-29）：
+        //   `.trash` 是 `tools/safe_fs.py` 的"同目录让位区" —— 删除工具写进去
+        //   的回收站，纯实现细节，不是内容。它出现在浏览器里有两个坏处：
+        //   ① 用户会点它、拖它；② 它**每次跑完验证用例都会冒出来**，于是任何
+        //   "目录里正好有 N 项"的断言都会随机变红（`verify_asset_drag` 就是这么
+        //   被它顶掉一格、把 `box01.glb` 挤到可视区外的）。
+        //   `.git` / `.vs` 同理。约定俗成：点号开头 = 隐式。
+        if (!e.name.empty() && e.name.front() == '.') continue;
         e.isDir = de.is_directory(ec);
         if (!e.isDir) e.size = de.file_size(ec);
 

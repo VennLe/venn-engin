@@ -816,7 +816,7 @@ SourceModel importFbx(const std::string& absPath, const ImportOptions& opt,
     ufbx_load_opts lo = {};
     lo.target_axes = ufbx_axes_right_handed_z_up;   // Y-up → Z-up
     // ⚠ 与 FbxLoader 逐字一致：target_unit_meters 与"尺寸倍数"是**倒数**。
-    //   实测（anime_girl.fbx）：target=1.0 → 归一化半径 0.822，
+    //   实测（已退役的 anime_girl.fbx）：target=1.0 → 归一化半径 0.822，
     //   target=0.5 → 1.644（放大两倍）。所以 scale=2 要写 1/2。
     lo.target_unit_meters = (opt.scale > 0.0f) ? (1.0f / opt.scale) : 1.0f;
     lo.generate_missing_normals = true;
