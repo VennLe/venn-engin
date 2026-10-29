@@ -9,6 +9,7 @@
 #include "animation/ClipEdit.h"
 #include "animation/Constraint.h"
 #include "animation/Curve.h"
+#include "animation/CurveBake.h"
 #include "animation/RigEdit.h"
 #include "animation/WeightSet.h"
 #include "animation/RootMotion.h"
@@ -3894,6 +3895,434 @@ int runAnimationSelfTest() {
                        endErr(noStretch) > 0.10f && errStretch < 2.0e-2f,
                        "before=" + std::to_string(endErr(noStretch)) + ",after=" +
                            std::to_string(errStretch));
+        }
+    }
+
+    // ============================================================
+    // S-D：骨骼曲线（CurveBake）—— 2026-10-29
+    //
+    // 这一组钉的是"接上曲线之后**什么都没变**"和"改了的那一处**确实**变了"。
+    // 前一半比后一半重要得多：
+    //   · `curvebake_default_bitwise` —— 缓动表全默认时，采样必须与
+    //     `assets::sampleTrack` **逐位**相同（T/S 靠同一个式子，
+    //     R 靠"恒等缓动就转发 sampleTrack"那句短路）。这条一红，所有
+    //     老资产的动画都会以 1e-7 量级漂，而画面上看不出来。
+    //   · `curvebake_writeback_identical` —— 没改就写回，`changed` 必须是 0。
+    //   · `curvebake_writeback_refuse` —— 关键帧数不等必须整条拒绝
+    //     （约定 ④），不许"尽力而为"地写一半。
+    // ============================================================
+    {
+        // 夹具：一条 3 帧的平移轨（x 0→1→2）+ 一条 3 帧的旋转轨。
+        const auto makeTrack = [](assets::AnimTrack::Path p) {
+            EditTrack tr;
+            tr.joint = "hips";
+            tr.path = p;
+            tr.times = {0.0f, 0.5f, 1.0f};
+            if (p == assets::AnimTrack::Rotation) {
+                const glm::quat a(1.0f, 0.0f, 0.0f, 0.0f);
+                const glm::quat b = glm::angleAxis(glm::radians(60.0f),
+                                                   glm::vec3(0.0f, 0.0f, 1.0f));
+                const glm::quat c = glm::angleAxis(glm::radians(120.0f),
+                                                   glm::vec3(0.0f, 0.0f, 1.0f));
+                tr.values = {glm::vec4(a.x, a.y, a.z, a.w),
+                             glm::vec4(b.x, b.y, b.z, b.w),
+                             glm::vec4(c.x, c.y, c.z, c.w)};
+            } else {
+                tr.values = {glm::vec4(0.0f, 0.0f, 0.0f, 0.0f),
+                             glm::vec4(1.0f, 2.0f, 4.0f, 0.0f),
+                             glm::vec4(2.0f, 4.0f, 8.0f, 0.0f)};
+            }
+            return tr;
+        };
+
+        report("curvebake_component_count_t",
+               static_cast<double>(pathComponentCount(assets::AnimTrack::Translation)),
+               3.0, 0.0);
+        report("curvebake_component_count_r",
+               static_cast<double>(pathComponentCount(assets::AnimTrack::Rotation)),
+               4.0, 0.0);
+        reportFlag("curvebake_component_name_w",
+                   std::string(pathComponentName(assets::AnimTrack::Rotation, 3)) == "w",
+                   std::string(pathComponentName(assets::AnimTrack::Rotation, 3)));
+
+        // ---- ① 没有缓动 = 逐位不变 ----
+        {
+            const EditTrack tr = makeTrack(assets::AnimTrack::Translation);
+            assets::AnimTrack rt;
+            rt.joint = 0;
+            rt.path = tr.path;
+            rt.times = tr.times;
+            rt.values = tr.values;
+            int sameNoTable = 0, sameDefaultTable = 0;
+            // (a) 表为空
+            for (int s = 0; s <= 20; ++s) {
+                const float t = 1.0f * static_cast<float>(s) / 20.0f;
+                if (sampleEditTrack(tr, t) == assets::sampleTrack(rt, t))
+                    ++sameNoTable;
+            }
+            // (b) 表**显式填满默认值** —— 这是"进过曲线编辑器但没有改缓动"
+            //     的状态，也是"打一圈再清回去"之后应该回到的状态。
+            EditTrack td = tr;
+            td.ease.resize(td.times.size(), KeyEase{});
+            for (int s = 0; s <= 20; ++s) {
+                const float t = 1.0f * static_cast<float>(s) / 20.0f;
+                if (sampleEditTrack(td, t) == assets::sampleTrack(rt, t))
+                    ++sameDefaultTable;
+            }
+            reportFlag("curvebake_no_ease_bitwise", sameNoTable == 21,
+                       "same=" + std::to_string(sameNoTable) + "/21");
+            reportFlag("curvebake_default_bitwise", sameDefaultTable == 21,
+                       "same=" + std::to_string(sameDefaultTable) + "/21");
+        }
+
+        // ---- ② 旋转：Linear 段必须走 slerp（不是 nlerp）----
+        {
+            const EditTrack tr = makeTrack(assets::AnimTrack::Rotation);
+            assets::AnimTrack rt;
+            rt.joint = 0;
+            rt.path = tr.path;
+            rt.times = tr.times;
+            rt.values = tr.values;
+            EditTrack td = tr;
+            td.ease.resize(td.times.size(), KeyEase{});
+            int same = 0;
+            for (int s = 0; s <= 20; ++s) {
+                const float t = 1.0f * static_cast<float>(s) / 20.0f;
+                if (sampleEditTrack(td, t) == assets::sampleTrack(rt, t)) ++same;
+            }
+            reportFlag("curvebake_rotation_linear_bitwise", same == 21,
+                       "same=" + std::to_string(same) + "/21");
+
+            // 反证：真的走 nlerp（分量各自线性）会与 slerp 不同 ——
+            // 这条是给"谁把 Linear 分支改成逐分量插值"准备的报警器。
+            //
+            // ⚠ 取样点必须是 **u=0.25 而不是 0.5**：nlerp 与 slerp 在正中
+            //   点**恰好相等**（两者都给出角平分线），在那里量差异只能量到
+            //   浮点噪声（实测 3e-6 度）。这是数学性质，不是实现问题 ——
+            //   第一版写 0.5，断言直接红了。
+            const float uProbe = 0.25f;
+            glm::vec4 nlerp(0.0f);
+            for (int c = 0; c < 4; ++c) {
+                const float a = rt.values[0][static_cast<glm::length_t>(c)];
+                const float b = rt.values[1][static_cast<glm::length_t>(c)];
+                nlerp[static_cast<glm::length_t>(c)] = a + (b - a) * uProbe;
+            }
+            const glm::quat qn = glm::normalize(
+                glm::quat(nlerp.w, nlerp.x, nlerp.y, nlerp.z));
+            const glm::quat qs = glm::slerp(
+                glm::quat(rt.values[0].w, rt.values[0].x, rt.values[0].y, rt.values[0].z),
+                glm::quat(rt.values[1].w, rt.values[1].x, rt.values[1].y, rt.values[1].z),
+                uProbe);
+            const float dn = glm::angle(glm::normalize(qn));
+            const float ds = glm::angle(glm::normalize(qs));
+            // 只报"两者不同"，不给绝对值断言（这个差随夹具角度变化，钉死
+            // 一个数字等于把夹具绑死）。真正要报警的是"哪天有人把 Linear
+            // 分支改成逐分量插值"—— 那时 `curvebake_rotation_linear_bitwise`
+            // 先红，这条是它的注解。
+            reportFlag("curvebake_slerp_nlerp_distinct",
+                       std::fabs(dn - ds) > 1.0e-6f,
+                       "deg=" + std::to_string(std::fabs(dn - ds) * 180.0 / 3.14159265));
+        }
+
+        // ---- ③ step 轨道 ----
+        {
+            EditTrack tr = makeTrack(assets::AnimTrack::Translation);
+            tr.step = true;
+            tr.ease.resize(tr.times.size(), KeyEase{});   // 空表也会被填成 Constant
+            assets::AnimTrack rt;
+            rt.joint = 0;
+            rt.path = tr.path;
+            rt.times = tr.times;
+            rt.values = tr.values;
+            rt.step = true;
+            int same = 0;
+            for (int s = 0; s <= 20; ++s) {
+                const float t = 1.0f * static_cast<float>(s) / 20.0f;
+                if (sampleEditTrack(tr, t) == assets::sampleTrack(rt, t)) ++same;
+            }
+            reportFlag("curvebake_step_bitwise", same == 21,
+                       "same=" + std::to_string(same) + "/21");
+            // 中间帧必须**恰好等于左端点**（阶跃），不是插出来的值
+            report("curvebake_step_mid_value",
+                   static_cast<double>(sampleEditTrack(tr, 0.4f).x), 0.0, 0.0);
+        }
+
+        // ---- ④ 缓动确实改变中间帧，端点不动 ----
+        {
+            EditTrack tr = makeTrack(assets::AnimTrack::Translation);
+            tr.ease.assign(tr.times.size(), KeyEase{});
+            KeyEase e;
+            e.interp = Interp::Linear;
+            e.ease = EaseMode::InOut;
+            e.shape = EaseShape::Smooth;
+            tr.ease[0] = e;                 // 只有第一段缓动
+            // u = 0.5 → smoothstep(0.5) = 0.5（对称），所以取 u=0.25：
+            // 0.25²(3-2·0.25) = 0.15625；线性是 0.25，值是 2.0 的 1/4 段
+            // （t=0.125 时 x 的线性值是 0.25）。
+            const float lin = 0.0f + (1.0f - 0.0f) * 0.25f;              // 0.25
+            const float eased = 0.0f + (1.0f - 0.0f) * 0.15625f;         // 0.15625
+            report("curvebake_ease_mid_value",
+                   static_cast<double>(sampleEditTrack(tr, 0.125f).x),
+                   static_cast<double>(eased), 1e-7);
+            reportFlag("curvebake_ease_differs_from_linear",
+                       std::fabs(sampleEditTrack(tr, 0.125f).x - lin) > 0.05f,
+                       "eased=" + std::to_string(sampleEditTrack(tr, 0.125f).x) +
+                           ",lin=" + std::to_string(lin));
+            // 端点逐位不动
+            reportFlag("curvebake_ease_endpoints_bitwise",
+                       sampleEditTrack(tr, 0.0f).x == 0.0f &&
+                           sampleEditTrack(tr, 1.0f).x == 2.0f,
+                       "a=" + std::to_string(sampleEditTrack(tr, 0.0f).x) +
+                           ",b=" + std::to_string(sampleEditTrack(tr, 1.0f).x));
+        }
+
+        // ---- ⑤ 贝塞尔：写回后逐位可还原 ----
+        {
+            EditTrack tr = makeTrack(assets::AnimTrack::Translation);
+            tr.ease.assign(tr.times.size(), KeyEase{});
+            KeyEase e;
+            e.interp = Interp::Bezier;
+            e.handle = HandleType::Free;
+            e.outHandle = glm::vec2(0.15f, 0.0f);     // 起手慢
+            e.inHandle = glm::vec2(-0.4f, 0.0f);
+            tr.ease[0] = e;
+
+            Curve c = bakeTrackCurve(tr, 0);
+            reportFlag("curvebake_bezier_baked",
+                       c.keys.size() == 3 &&
+                           c.keys[0].interp == Interp::Bezier &&
+                           c.keys[0].handle == HandleType::Free,
+                       "n=" + std::to_string(c.keys.size()));
+
+            const unsigned long long d0 = curveDigest(c);
+            EditTrack back = tr;
+            back.ease.clear();                        // 故意从空表开始
+            const CurveWriteStats st = applyCurveToTrack(back, 0, c);
+            reportFlag("curvebake_writeback_identical",
+                       st.changed == 0 && st.skipped == 0 && st.bitIdentical,
+                       "changed=" + std::to_string(st.changed) +
+                           ",worst=" + std::to_string(st.worstDeviation));
+
+            const Curve c2 = bakeTrackCurve(back, 0);
+            reportFlag("curvebake_roundtrip_digest", curveDigest(c2) == d0,
+                       "d0=" + std::to_string(d0) + ",d1=" + std::to_string(curveDigest(c2)));
+
+            // 中间帧确实早于线性（起手慢）
+            reportFlag("curvebake_bezier_ease_in",
+                       sampleEditTrack(back, 0.125f).x < 0.25f,
+                       "v=" + std::to_string(sampleEditTrack(back, 0.125f).x));
+        }
+
+        // ---- ⑥ 写回：只改本分量，其它分量逐位不变 ----
+        {
+            EditTrack tr = makeTrack(assets::AnimTrack::Translation);
+            Curve c = bakeTrackCurve(tr, 0);
+            c.keys[1].value = 9.5f;
+            const glm::vec4 beforeY = tr.values[1];
+            const CurveWriteStats st = applyCurveToTrack(tr, 0, c);
+            reportFlag("curvebake_write_component_isolated",
+                       st.changed == 1 && tr.values[1].x == 9.5f &&
+                           tr.values[1].y == beforeY.y && tr.values[1].z == beforeY.z,
+                       "changed=" + std::to_string(st.changed) + ",y=" +
+                           std::to_string(tr.values[1].y));
+        }
+
+        // ---- ⑦ 写回：关键帧数不等 → 整条拒绝 ----
+        {
+            EditTrack tr = makeTrack(assets::AnimTrack::Translation);
+            const std::vector<float> t0 = tr.times;
+            Curve c = bakeTrackCurve(tr, 0);
+            c.keys.pop_back();
+            const CurveWriteStats st = applyCurveToTrack(tr, 0, c);
+            reportFlag("curvebake_writeback_refuse",
+                       st.skipped == 1 && st.written == 0 && tr.times == t0,
+                       "skipped=" + std::to_string(st.skipped));
+        }
+
+        // ---- ⑧ 写回：拖时间 + 同刻合并 ----
+        {
+            EditTrack tr = makeTrack(assets::AnimTrack::Translation);
+            Curve c = bakeTrackCurve(tr, 0);
+            c.keys[2].time = 1.5f;
+            const CurveWriteStats st = applyCurveToTrack(tr, 0, c);
+            reportFlag("curvebake_write_time_moved",
+                       st.changed == 1 && tr.times.back() == 1.5f &&
+                           st.bitIdentical,
+                       "changed=" + std::to_string(st.changed) + ",last=" +
+                           std::to_string(tr.times.back()));
+
+            EditTrack td = makeTrack(assets::AnimTrack::Translation);
+            Curve cd = bakeTrackCurve(td, 0);
+            cd.keys[1].time = 0.0f;                 // 撞到第 0 帧
+            const CurveWriteStats sd = applyCurveToTrack(td, 0, cd);
+            reportFlag("curvebake_write_merge",
+                       sd.merged == 1 && td.keyCount() == 2,
+                       "merged=" + std::to_string(sd.merged) + ",n=" +
+                           std::to_string(td.keyCount()));
+        }
+
+        // ---- ⑨ step 与缓动互斥 ----
+        {
+            EditTrack tr = makeTrack(assets::AnimTrack::Translation);
+            tr.step = true;
+            Curve c = bakeTrackCurve(tr, 0);
+            c.keys[0].interp = Interp::Bezier;
+            applyCurveToTrack(tr, 0, c);
+            reportFlag("curvebake_step_off", tr.step == false,
+                       "step=" + std::to_string(tr.step ? 1 : 0));
+            reportFlag("curvebake_step_off_keeps_bezier",
+                       tr.easeAt(0).interp == Interp::Bezier,
+                       std::string(interpName(tr.easeAt(0).interp)));
+        }
+
+        // ---- ⑩ 全默认 → 抹平（回到"没有缓动"的路径）----
+        {
+            EditTrack tr = makeTrack(assets::AnimTrack::Translation);
+            tr.ease.assign(tr.times.size(), KeyEase{});
+            reportFlag("curvebake_default_table_present", !tr.ease.empty(),
+                       "n=" + std::to_string(tr.ease.size()));
+            const bool pruned = tr.pruneDefaultEase();
+            reportFlag("curvebake_prune", pruned && tr.ease.empty() && !tr.hasEasing(),
+                       "pruned=" + std::to_string(pruned ? 1 : 0));
+
+            // 打一帧之后表要跟着长一格，否则缓动会整体错位
+            EditTrack te = makeTrack(assets::AnimTrack::Translation);
+            te.ease.assign(te.times.size(), KeyEase{});
+            te.ease[0].interp = Interp::Bezier;
+            EditClip c;
+            c.tracks.push_back(te);
+            c.setKey("hips", assets::AnimTrack::Translation, 0.25f,
+                     glm::vec4(0.5f, 0.0f, 0.0f, 0.0f));
+            const EditTrack& grew = c.tracks[0];
+            reportFlag("curvebake_insert_keeps_ease_aligned",
+                       grew.keyCount() == 4 &&
+                           grew.ease.size() == grew.times.size() &&
+                           grew.easeAt(0).interp == Interp::Bezier,
+                       "keys=" + std::to_string(grew.keyCount()) + ",ease=" +
+                           std::to_string(grew.ease.size()));
+        }
+
+        // ---- ⑪ 旋转贝塞尔：归一化 ----
+        {
+            EditTrack tr = makeTrack(assets::AnimTrack::Rotation);
+            tr.ease.assign(tr.times.size(), KeyEase{});
+            KeyEase e;
+            e.interp = Interp::Bezier;
+            e.handle = HandleType::Free;
+            e.outHandle = glm::vec2(0.4f, 0.2f);    // 故意把 x 分量拽出去
+            tr.ease[0] = e;
+            ResolvedTrack rt;
+            rt.track.joint = 0;
+            rt.track.path = tr.path;
+            rt.track.times = tr.times;
+            rt.track.values = tr.values;
+            bakeResolvedTrack(tr, rt);
+            const glm::vec4 v = sampleResolvedTrack(rt, 0.25f);
+            const float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w);
+            report("curvebake_rotation_bezier_unit", static_cast<double>(len),
+                   1.0, 1e-6);
+        }
+
+        // ---- ⑫ 通道表 ----
+        {
+            EditClip c;
+            EditTrack t = makeTrack(assets::AnimTrack::Translation);
+            EditTrack r = makeTrack(assets::AnimTrack::Rotation);
+            c.tracks.push_back(t);
+            c.tracks.push_back(r);
+            const auto list = listBoneChannels(c);
+            report("curvebake_channel_count", static_cast<double>(list.size()), 7.0, 0.0);
+            reportFlag("curvebake_channel_id",
+                       boneChannelId(c, list[0]) == "hips/translation.x" &&
+                           boneChannelId(c, list[6]) == "hips/rotation.w",
+                       boneChannelId(c, list[0]) + "," + boneChannelId(c, list[6]));
+        }
+
+        // ---- ⑬ 整条叠加链：有缓动才改，没缓动逐位不变 ----
+        {
+            const auto mkSkel = []() {
+                assets::Skeleton s;
+                s.joints.resize(1);
+                s.joints[0].name = "hips";
+                s.joints[0].parent = -1;
+                s.topoOrder = {0};
+                return s;
+            };
+            const assets::Skeleton sk = mkSkel();
+            EditTrack tr = makeTrack(assets::AnimTrack::Translation);
+
+            EditClip c0;
+            c0.tracks.push_back(tr);
+            std::vector<ResolvedTrack> r0;
+            resolveEditTracks(sk, c0, r0);
+            Pose p0;
+            p0.setRest(sk);
+            overlayEditPose(r0, 0.2f, p0);
+            // 没缓动 → 与 sampleTrack 逐位相同
+            bool bit = true;
+            for (int k = 0; k < 3; ++k) {
+                if (p0.translation[0][static_cast<glm::length_t>(k)] !=
+                    assets::sampleTrack(r0[0].track, 0.2f)[static_cast<glm::length_t>(k)])
+                    bit = false;
+            }
+            reportFlag("curvebake_overlay_plain_bitwise", bit, "bit=" + std::to_string(bit ? 1 : 0));
+
+            EditTrack te = tr;
+            te.ease.assign(te.times.size(), KeyEase{});
+            KeyEase e;
+            e.interp = Interp::Linear;
+            e.ease = EaseMode::InOut;
+            e.shape = EaseShape::Smooth;
+            te.ease[0] = e;
+            EditClip c1;
+            c1.tracks.push_back(te);
+            std::vector<ResolvedTrack> r1;
+            resolveEditTracks(sk, c1, r1);
+            Pose p1;
+            p1.setRest(sk);
+            overlayEditPose(r1, 0.2f, p1);
+            reportFlag("curvebake_overlay_eased_resolved", r1[0].hasEase,
+                       "hasEase=" + std::to_string(r1[0].hasEase ? 1 : 0));
+            // ⚠ 取 t=0.2（u=0.4 < 0.5）：缓入缓出在**前半段**落后于线性，
+            //   后半段反超。第一版在 t=0.3（u=0.6）上断言"更小"，红了 ——
+            //   那是 smoothstep 的正确行为，不是实现错。
+            reportFlag("curvebake_overlay_eased_differs",
+                       p1.translation[0].x < p0.translation[0].x,
+                       "plain=" + std::to_string(p0.translation[0].x) +
+                           ",eased=" + std::to_string(p1.translation[0].x));
+        }
+
+        // ---- ⑭ 存读往返：缓动表 ----
+        {
+            EditTrack tr = makeTrack(assets::AnimTrack::Translation);
+            tr.ease.assign(tr.times.size(), KeyEase{});
+            KeyEase e;
+            e.interp = Interp::Bezier;
+            e.handle = HandleType::Aligned;
+            e.outHandle = glm::vec2(0.22f, 0.37f);
+            e.inHandle = glm::vec2(-0.11f, -0.19f);
+            tr.ease[0] = e;
+            EditClip c;
+            c.name = "curvetest";
+            c.tracks.push_back(tr);
+
+            std::string err;
+            const std::string path =
+                (std::filesystem::temp_directory_path() /
+                 "venn_curvebake_selftest.anim.json").string();
+            EditClip back;
+            const bool saved = saveEditClip(path, c, err);
+            const bool loaded = saved && loadEditClip(path, back, err);
+            const unsigned long long d0 = curveDigest(bakeTrackCurve(c.tracks[0], 0));
+            const unsigned long long d1 =
+                loaded ? curveDigest(bakeTrackCurve(back.tracks[0], 0)) : 0ull;
+            reportFlag("curvebake_json_roundtrip",
+                       loaded && d0 == d1 && back.tracks.size() == 1,
+                       "saved=" + std::to_string(saved ? 1 : 0) +
+                           ",loaded=" + std::to_string(loaded ? 1 : 0) + ",d=" +
+                           std::to_string(d0 == d1 ? 1 : 0));
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
         }
     }
 

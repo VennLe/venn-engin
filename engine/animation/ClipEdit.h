@@ -40,6 +40,7 @@
 // 一起钉住。
 // ============================================================
 
+#include "animation/Curve.h"
 #include "animation/Pose.h"
 
 #include "assets/Skeleton.h"   // 复用 assets::AnimTrack / Skeleton
@@ -74,6 +75,47 @@ enum class KeyType : unsigned char {
 const char* keyTypeName(KeyType t);                    // "key"/"extreme"/...
 bool parseKeyType(const std::string& s, KeyType& out);  // 大小写不敏感
 
+// ------------------------------------------------------------
+// 每键缓动（S-D，Graph Editor 接到骨骼上）
+// ------------------------------------------------------------
+// `assets::AnimTrack` 只有一个 `step` 布尔 —— 常量 / 线性两态，没有贝塞尔、
+// 没有缓动、没有手柄。那张表是**导入产物**（`engine/assets/**` 在
+// GLOBAL_GLOBS 里，动它就是全量回归），所以"动作有生命"的表达只能放在
+// **编辑层**：每个键一张 `KeyEase`，与 `times` 平行。
+//
+// ⚠⚠ 默认值必须**逐位等于** `assets::sampleTrack` 的行为，否则"打开曲线
+//     编辑器再关掉"会让所有人的动画悄悄变一遍：
+//       · 平移/缩放：`easeFn(Linear, None, u)` 恒等于 u（见 Curve.h 的
+//         承诺），而 `v0 + (v1-v0)*u` 与 `sampleTrack` 的 `a + (b-a)*u`
+//         **是同一个式子** —— 逐位相同，这一条由
+//         `curvebake_default_bitwise` 钉住；
+//       · 旋转：`sampleTrack` 走 slerp，而四个分量各自插值再归一（nlerp）
+//         与 slerp **不是**同一条路（同一条弧、不同速度）—— 所以
+//         "全 Linear 的旋转轨"必须仍走 slerp，见 CurveBake.cpp 里的
+//         `sampleRotationEased`。这条差别只在贝塞尔段上才允许出现。
+//
+// ⚠ 表**可以比 `times` 短**（同 `types`）：老文件没有这个字段，越界一律
+//   取默认值。全部是默认时整张表被 `pruneDefaultEase()` 抹平 → 回到
+//   "根本没有缓动"的路径（那条路径就是 `sampleTrack` 本身），于是
+//   "改一圈再清回去"能逐位还原，不是"看起来差不多"。
+struct KeyEase {
+    Interp interp = Interp::Linear;
+    EaseMode ease = EaseMode::None;
+    EaseShape shape = EaseShape::Linear;
+    HandleType handle = HandleType::AutoClamped;
+    // 相对本帧的偏移（`CurveKey` 同款：out.x >= 0、in.x <= 0）。
+    // ⚠ **绝对量**，不是相机那边的"段内归一化"—— 骨骼轨道一个分量一条
+    //   独立的 F-Curve，手柄没有"跨通道共用"的问题（见 CurveEditorPanel.h ②）。
+    glm::vec2 outHandle{1.0f / 3.0f, 0.0f};
+    glm::vec2 inHandle{-1.0f / 3.0f, 0.0f};
+
+    // 采样上与"没有缓动"完全等价 → 可以整条轨道退回 `sampleTrack`。
+    // `handle` 也算在内：Linear 段上它不参与求值，但它是作者按 V 存下的
+    // 意图，抹掉它等于"下次切到贝塞尔时手柄凭空复位"。
+    bool isDefault() const;
+};
+
+
 // 一条可编辑轨道。字段与 `assets::AnimTrack` 几乎同构，只有一处不同：
 // 目标不是 `int joint` 而是 `std::string joint`（见约定 ①）。
 //
@@ -92,6 +134,10 @@ struct EditTrack {
     // 三份平行数组已经够容易错了，再加一条"长度必须相等"的硬约束
     // 只会把坏数据变成打不开的文件。
     std::vector<unsigned char> types;
+    // 与 `times` 平行的缓动表（S-D）。同样允许更短，同样全默认即抹平。
+    // 空 = "这条轨道没进过曲线编辑器"，采样走 `sampleTrack`（逐位等于
+    // R7 之前的行为）。
+    std::vector<KeyEase> ease;
 
     int keyCount() const { return static_cast<int>(times.size()); }
     // 时间 → 关键帧下标；没命中返回 -1（容差 kKeyTimeEpsilon）
@@ -100,6 +146,13 @@ struct EditTrack {
     KeyType typeAt(int i) const;
     // 越界忽略；i 在范围内时按需把 types 撑到与 times 等长
     void setTypeAt(int i, KeyType t);
+    // 越界 / 缺项 → 默认 `KeyEase`（逐位等于 `sampleTrack`）
+    const KeyEase& easeAt(int i) const;
+    void setEaseAt(int i, const KeyEase& e);
+    // 有任何一键不是默认 → true（否则整条轨道不该付曲线的代价）
+    bool hasEasing() const;
+    // 全默认 → 清空表。返回是否动了。
+    bool pruneDefaultEase();
 };
 
 // 同帧判定容差（秒）。
@@ -253,16 +306,38 @@ struct ResolveStats {
     int droppedKeys = 0;                  // 因名字缺失被丢掉的帧总数
 };
 
+// 一条"已解析"的编辑轨道：运行时轨道 + 它的缓动表 + **预先烘好的曲线**。
+//
+// 为什么要烘在解析结果里，而不是每次采样现算：`CurveEditorPanel` 一帧要
+// 采样几十个通道 × 60 次，`evaluateCurve` 需要 `Curve`（手柄解析要邻居），
+// 现造一个容器就是每帧几百次堆分配。解析只在骨架/资产变化时做一次。
+//
+// `curves[comp]` 与 `track.values[i][comp]` 一一对应；`comps` 是这条路径
+// 的分量数（T/S = 3，R = 4）。`hasEase == false` 时 `curves` 为空，
+// 采样直接转发 `sampleTrack` —— 这就是"没进过曲线编辑器 = 逐位不变"。
+struct ResolvedTrack {
+    assets::AnimTrack track;
+    std::vector<KeyEase> ease;
+    std::vector<Curve> curves;
+    int comps = 3;
+    bool hasEase = false;
+};
+
 ResolveStats resolveEditTracks(const assets::Skeleton& skel,
                                const EditClip& clip,
-                               std::vector<assets::AnimTrack>& out);
+                               std::vector<ResolvedTrack>& out);
 
 // 叠加：把已解析的轨道在 time 处采到 pose 上。
 //
 // **只写有轨道的通道**（约定 ②）。`resolved` 为空时立刻返回 0，
 // pose 一个字节都不动 —— 这是"无编辑数据时逐位一致"的那条保证。
 // 返回写过的通道数。
-int overlayEditPose(const std::vector<assets::AnimTrack>& resolved, float time,
+//
+// ⚠ 约定 ③（"采样只走 assets::sampleTrack"）在 S-D 之后有了一个**受控的
+//   例外**：轨道带缓动时走 `sampleResolvedTrack`（内部是
+//   `animation::Curve`，全仓唯一的曲线求值器）。仍然不是"第三份插值"：
+//   没有缓动就转发 `sampleTrack`，有缓动就转发 `evaluateCurve`。
+int overlayEditPose(const std::vector<ResolvedTrack>& resolved, float time,
                     Pose& pose);
 
 // 姿态库应用：把一条 EditPose 写到 pose 上（同样是**只写它含的骨**）。

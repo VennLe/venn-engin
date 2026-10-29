@@ -469,6 +469,17 @@ run("engine/animation/Constraint.cpp → 约束栈 × 角色链", OLD,
     with_change("engine/animation/Constraint.cpp"),
     want={"verify_constraints", "verify_anim_runtime", "verify_character_import",
           "verify_player_character"})
+# 2026-10-29（#337 S-D）：骨骼曲线的投影/写回层（`engine/animation/CurveBake.*`）。
+# 这一条的**形状很特别** —— 它同时挂在三张网里：
+#   · `verify_bone_curves` —— 自己那条（32 条 `curvebake_*` + 9 组端到端）
+#   · `engine/animation/**` 整层 → 三条动画用例（采样输入换了）
+#   · `verify_curve_editor` **刻意不在**：相机曲线面板根本不知道 CurveBake
+#     存在（两者只是共用 `animation::Curve`）。登记进来会让"改骨骼曲线"白跑
+#     一遍过场相机的 73 项。
+run("engine/animation/CurveBake.cpp → 骨骼曲线 × 角色链", OLD,
+    with_change("engine/animation/CurveBake.cpp"),
+    want={"verify_bone_curves", "verify_anim_runtime", "verify_character_import",
+          "verify_player_character"})
 # 2026-10-28（#318）：曲线求值本体（`engine/animation/Curve.*`）。
 # 期望是"自己那条一定在"的大并集：`engine/animation/**` 整层被四条动画用例
 # 登记着（换求值 = 换它们的输入），而画布画的就是同一份采样。
@@ -477,11 +488,15 @@ run("engine/animation/Constraint.cpp → 约束栈 × 角色链", OLD,
 # ⚠ 并集里没有 verify_ik：它登记的是 `TwoBoneIK.*` 那一类具体文件，不是整层
 #   （上面那条 fixture 可以对照）。verify_sequencer 在是因为过场采样也走这份
 #   求值 —— 改它等于改过场播放器看到的值。
+# 2026-10-29（#337 S-D）再加 `verify_bone_curves`：骨骼那条"没缓动就逐位
+# 不变"的保证，正好压在 `evalSegment` 的 Linear 分支上 —— 只要有人把它改成
+# `glm::mix(v0,v1,w)`（= `a*(1-w)+b*w`），`sampleTrack` 的 `a+(b-a)*u` 就对不上，
+# 而**画面上一丝变化都没有**，只有那条断言会红。
 run("engine/animation/Curve.cpp → 曲线求值 × 画布", OLD,
     with_change("engine/animation/Curve.cpp"),
     want={"verify_curve_editor", "verify_timeline_editor", "verify_sequencer",
-          "verify_anim_runtime", "verify_character_import",
-          "verify_player_character"})
+          "verify_bone_curves", "verify_anim_runtime",
+          "verify_character_import", "verify_player_character"})
 # 2026-10-28（#319）：Pose Mode 的数据层（`engine/animation/ClipEdit.*`）。
 # `engine/animation/**` 整层被几条动画用例登记着，所以 affected 是四条并集；
 # 这条 fixture 的价值是把 `verify_pose_mode` **标明归属** —— 一眼能看出
@@ -489,10 +504,15 @@ run("engine/animation/Curve.cpp → 曲线求值 × 画布", OLD,
 # 2026-10-28（#320）起是**五条**：三个批量操作（move / mirror / align）与
 # 关键帧类型表都长在这个文件里，摄影表那条用例直接调它们 —— 改成逐帧累加
 # 实现会让"相对间距逐位不变"当场红，而那正是它存在的理由。
+# 2026-10-29（#337 S-D）起是**六条**：缓动表（`EditTrack::ease`）就长在这个
+# 文件里，`overlayEditPose` 的签名也从 `vector<AnimTrack>` 换成了
+# `vector<ResolvedTrack>`。两个直接消费者都得跟着跑 —— 姿势模式（同一条叠加链）
+# 与骨骼曲线（自己那条 9 组端到端）。
 run("engine/animation/ClipEdit.cpp → 骨骼打帧 × 姿势模式", OLD,
     with_change("engine/animation/ClipEdit.cpp"),
-    want={"verify_pose_mode", "verify_dope_sheet", "verify_anim_runtime",
-          "verify_character_import", "verify_player_character"})
+    want={"verify_pose_mode", "verify_dope_sheet", "verify_bone_curves",
+          "verify_anim_runtime", "verify_character_import",
+          "verify_player_character"})
 # `Pose.cpp` 是**全动画链的地基**（采样 / FK / 混合），ClipEdit 只是叠在它
 # 上面的一层。⚠ 并集里没有 verify_curve_editor / verify_timeline_editor /
 #   verify_sequencer —— 它们登记的是 `engine/animation/Curve.*` 与

@@ -405,7 +405,10 @@ private:
     // 顶点色带的屏幕坐标缓存（每帧重算太贵；只算"有权重"的前 N 个）
     int m_weightHudVerts = 0;
     // 名字→下标解析结果（只在 m_editDirty 时重算）
-    std::vector<assets::AnimTrack> m_editResolved;
+    // ⚠ S-D 起是 `ResolvedTrack`（轨道 + 缓动表 + 预烘曲线），不再是裸的
+    //   `assets::AnimTrack`。没有缓动的轨道内部 `hasEase == false`，
+    //   采样直接转发 `assets::sampleTrack` —— 行为与 R7 逐位相同。
+    std::vector<animation::ResolvedTrack> m_editResolved;
     animation::ResolveStats m_editStats;
     bool m_editDirty = true;
     std::string m_editPath;

@@ -77,7 +77,7 @@ S-C 就是补这一段，见第 3 节。
 | 蒙皮 / 权重绘制 | S-B：`WeightSet` 顶点组 + `Weights` 页 + 视口色带 / 笔刷 | ✅ |
 | 姿态模式摆姿势 + `I` 打帧 | R7 已落地 | ✅ |
 | Dope Sheet 调节奏 | R8 已落地 | ✅ |
-| Graph Editor 调曲线 | R5 数据层 + R6 视图，但**只接相机**，骨骼曲线画不了 | 🟡 |
+| Graph Editor 调曲线 | S-D：`BoneCurvePanel` 画的是骨骼（每个标量分量一条曲线，手柄 / 缓动 / 贝塞尔都在）；相机那条仍是 R6 的 `CurveEditorPanel`。**运行时还不读缓动表**（只影响预览） | 🟡 |
 | 约束（IK/FK/限位）+ 驱动 | S-C 有了约束栈（Limit / Copy / ChildOf / IK），**但预览之外还没接运行时**；驱动仍无 | 🟡 |
 | Action 复用 / NLA 混合 | Action 概念有（`EditClip`），NLA 无 | 🟡 |
 
@@ -197,16 +197,22 @@ Deform / Inherit / 加删骨 / 左右镜像都有了数据通路与验收。
 |---|---|---|---|
 | F-Curve（值随时间的曲线） | R5 落地 `animation::Curve`（`Interp` / `HandleType` / `Extrapolate` / 7 种 `EaseShape`） | ✅ 数据层 | `Curve.h:47,78,87` |
 | 曲线视图 | R6 落地 `editor/CurveEditorPanel.*` | ✅ 视图 | — |
-| **但它画的是相机，不是骨骼** | 数据源写死 `sequence::SequenceAsset`，通道是 `PosX/Y/Z / Yaw / Pitch / Fov` | ❌ | `CurveEditorPanel.h:107,116` |
-| 骨骼轨道的插值 | 仍是 `bool step`（常量 / 线性），**没有贝塞尔** | ❌ | `Skeleton.h:40`、`sampleTrack` |
-| 手柄（`V` 键切 5 种） | `HandleType` 有（Auto/AutoClamped/Vector/Aligned/Free），但只作用于相机 | 🟡 | `Curve.h:78` |
+| **相机那条曲线** | 数据源写死 `sequence::SequenceAsset`，通道是 `PosX/Y/Z / Yaw / Pitch / Fov` | ✅ | `CurveEditorPanel.h:107,116` |
+| **骨骼那条曲线** | S-D 落地 `editor/BoneCurvePanel.*` + `engine/animation/CurveBake.*`：`EditTrack` 的每个标量分量一条曲线 | ✅ | `CurveBake.h` |
+| 骨骼轨道的插值 | `EditTrack::ease`（每键 `interp / ease / shape / handle / 两根手柄`）；`assets::AnimTrack` 仍是 `bool step`，**一个字节没改** | ✅ | `ClipEdit.h` 的 `KeyEase` |
+| 手柄（`V` 键切 5 种） | 相机：V = 换算并写回（写完就是 Free）。骨骼：V = **存类型**，AutoClamped 会一直跟邻居重算 | ✅ | `BoneCurvePanel.cpp` |
+| 缓入缓出（Sine / Quad / Cubic / Back / Bounce / Elastic） | 7 种形状 × 4 种方向，两套曲线共用同一个 `easeFn` | ✅ | `Curve.h:64` |
 | 约束 `Influence` 能进曲线 | 无约束，自然也没有 | ❌ | — |
 | 曲线修改器（Cycle / Noise / Sine） | `Extrapolate::Cycle*` 三种有；Noise/Sine 无 | 🟡 | `Curve.h:87` |
 
-⚠ 一句话：**曲线核心与视图都齐了，但没接到骨骼上**。把 `AnimTrack` 换成
-`Curve` 是第七节唯一要做的事，也是"动作有生命"的前提（`Auto Clamped` 手柄 +
+⚠ 一句话（S-D 之前）：**曲线核心与视图都齐了，但没接到骨骼上**。把 `AnimTrack`
+换成 `Curve` 是第七节唯一要做的事，也是"动作有生命"的前提（`Auto Clamped` 手柄 +
 缓入缓出）。这件事的代价在于 `AnimTrack` 是导入产物、`Curve` 是编辑产物 ——
 跟 R7 一样，得**单向烘焙**（`EditClip` → `Curve`），不能就地改。
+
+✅ **S-D 已落地（2026-10-29）**，见下面的 S-D 章节。两条曲线**没有**合并成
+一个面板 —— 手柄的归属根本不同（相机是"一段一组归一化、四通道共用"，骨骼是
+"每键绝对偏移、分量独立"）。
 
 ### 八 · 姿态库（Pose Library）
 
@@ -363,7 +369,7 @@ const float w = animation::evaluateSegmentEase(ip, em, sh, a.outHandle,
 | **S-A** | **骨架作者：可编辑 Rig（骨长 / Roll / Connected / Deform / Inherit）+ Edit Mode** | **L** | **✅ 已落地（2026-10-29）** |
 | **S-B** | **蒙皮与权重：顶点组 + 自动权重 + 权重绘制** | **L** | **✅ 已落地（2026-10-29）** |
 | **S-C** | **约束栈：Limit / Copy / Child Of + IK 迁入栈（Chain / Pole / Influence）** | **M/L** | **✅ 已落地（2026-10-29）** |
-| S-D | 骨骼曲线接入 Graph Editor（`AnimTrack` → `Curve` 单向烘焙） | M | 待做 |
+| **S-D** | **骨骼曲线接入 Graph Editor（`EditTrack` ⇄ `Curve` 单向烘焙）** | **M** | **✅ 已落地（2026-10-29）** |
 | R9 | NLA | L | 待做 |
 | R10 | Drivers + Motion Paths + 序列帧导出 | M/L | 待做 |
 
@@ -553,6 +559,122 @@ const float w = animation::evaluateSegmentEase(ip, em, sh, a.outHandle,
     那种拉伸 IK 语义（Blender 的 `Stretch To` 是另一回事）。
 
 
+### S-D · 骨骼曲线（Graph Editor 接到骨骼上）· 规模 M —— ✅ 已落地（2026-10-29）
+
+**为什么排第四**：S-A/S-B/S-C 让"骨该怎么动"能改骨架、能画权重、能挂约束，
+但这三件事全都踩在**同一条匀速直线**上 —— `assets::AnimTrack` 只有 `bool step`
+（常量 / 线性）。所以一次"抬手"永远是两条匀速线段：起手和落手一个速度，
+谁看都是机器做的。曲线是把**节奏**变成数据的最后一环，也是"动作有生命"的前提。
+
+- **数据层**：`engine/animation/CurveBake.{h,cpp}`（新建）+ `ClipEdit.{h,cpp}`
+  加两个结构（**`assets/Skeleton.h` 与 `ecs/Components.h` 一个字节没改**，
+  守第 5 节约束 1）：
+  - `KeyEase { interp, ease, shape, handle, outHandle, inHandle }` —— 一个**键**
+    的插值口味。挂在 `EditTrack::ease` 上，与 `times` **平行、允许更短**、
+    全默认即视作没有（口径同 `types`），于是老文件读进来 `ease` 是空的、
+    一个字节都不用补；
+  - 手柄存**绝对偏移** `(秒, 值)`，不是相机那种归一化 `w`。这一条就是
+    "两条曲线不能合成一个面板"的全部理由（见下面 UI 那段）；
+  - `ResolvedTrack { track, ease, curves, comps, hasEase }` —— 解析后的
+    可采样单位：`curves` 是**预烘**的（translation / scale 各 3 条，
+    rotation 4 条）。烘一次、采多次，而不是每个采样点现算一遍切线；
+  - API：`bakeTrackCurve`（EditTrack → Curve）/ `applyCurveToTrack`
+    （Curve → EditTrack）/ `sampleEditTrack` / `sampleResolvedTrack` /
+    `listBoneChannels` / `boneChannelId` / `curveDigest`（FNV-1a 64，
+    与 R7 的 `clipDigest` 同族，用来证明"移过去再移回来必复原"）。
+- **四条"省了就错"的约定**（每条都写在 `CurveBake.h` 头注释里，每条都有断言）：
+  - ⚠⚠ ① **没有缓动 = 逐位不变**。`ease` 为空或全默认时
+    `sampleResolvedTrack` 直接 `return assets::sampleTrack(rt.track, time)`，
+    一个浮点运算都不多做。这是"打开一次曲线编辑器再关掉，所有老动画
+    不许有一丝变化"的依据 —— 少了这句，每次开关都以 1e-7 的量级漂，
+    长跑之后角色会慢慢转歪，而画面上完全看不出来（同约束 7 的坑）；
+  - ⚠⚠ ② **旋转的缓动分两条路**，因为两者数学上不是一回事：
+    `Linear + 缓动` 是 `slerp(qa, qb, easeFn(u))` —— 只重映射时间，走的还是
+    那条大圆弧，缓动恒等时**转发** `sampleTrack`（同一个 `glm::slerp`、
+    同一份 `u`）；`Bezier` 是四分量各自解再归一（**nlerp 语义**，同一条弧
+    另一种速度分配），也是唯一能手工塑造四元数速度的路子，Blender 的
+    四元数 F-Curve 同样是逐分量插值后归一。**合并成一条就错了**：拿 nlerp
+    实现 Linear，全部老旋转轨的中间帧都会变（肘部走弧线走扁了）；
+  - ⚠ ③ **插值与手柄属于"键"，不属于"分量"**。一个 `EditTrack` 就是一条
+    glTF channel，四个分量**共用关键帧**（`times` 只有一份）。给
+    `rotation.x` 设贝塞尔，y/z/w 也跟着贝塞尔 —— 分开设会让四分量用不同的
+    时间重映射，四元数离开单位球再被归一，表现成"转轴在中途晃了一下"。
+    **值**当然各分量独立。`AutoClamped` 手柄是按**本分量自己的邻居**现算的，
+    所以默认情况下每个分量的切线是对的；只有手拖过的手柄（Free / Aligned /
+    Vector）是四分量共用 —— 那也有道理：一根骨在某一时刻的节奏只有一个；
+  - ⚠ ④ **写回不增删帧**。`applyCurveToTrack` 第一件事是比较
+    `c.keys.size()` 与轨道帧数，不等就 `++st.skipped` 整条拒绝。曲线编辑器
+    改的是**形状**（时刻 / 值 / 插值 / 手柄），加删关键帧是 Dope Sheet 的活；
+    两边都能改帧数，`EditClip` 的 `findTrack` 不变量就该开始飘了。
+- **写回的自检**：`applyCurveToTrack` 写完立刻再烘一遍，与传入曲线在 33 个
+  采样点上比对，`worstDeviation` 正常**恰好 0.0**（同一份数据、同一个求值器）。
+  非 0 就说明写回漏了字段（手柄、`interp`、`ease` 三者之一）—— 这是"存了
+  但没影响结果"这类 bug 唯一便宜的探针。同时返回
+  `{keys, written, changed, merged, skipped, worstDeviation, bitIdentical}`：
+  **没改就写回时 `changed == 0`**，`merged > 0` 则是丢帧（被挪到同一时刻）。
+- **`step` 与现代插值互斥**：`EditTrack::step` 是老字段（`Interp::Constant`）。
+  写过任何非 Constant 的 `interp` 就把 `tr.step = false`，然后
+  `pruneDefaultEase()` 收掉全默认的尾巴；反过来，`step == true` 且该键没被
+  显式设过 `interp` 时，`resolveEaseTable` 兜底成 Constant —— 否则
+  "老文件里标了 step 的轨道打开曲线编辑器就变线性"。
+- **UI**：新建 `editor/BoneCurvePanel.{h,cpp}`，而**不是**给
+  `CurveEditorPanel` 加一个分支。理由写在头注释里：相机一条段只有**一组
+  归一化手柄**（四通道共用），骨骼**每键存绝对偏移**（分量独立）；靠 `if`
+  隔离的代价是每次改动都要重答"这个手柄归谁"，答错的症状是"拖了手柄
+  另一条通道跟着变"。共用只有 `animation::Curve` 求值器与几个 UI 习惯，
+  画布代码重复约 150 行 —— 但那是**两种不同东西**的画布。
+  五条面板自己的约束：①画布不另写求值（只调 `sampleResolvedTrack`）；
+  ②改形状不改帧数；③拖动中不重排（否则拖到邻居身上就跳出去）；
+  ④`V` **存类型**（与相机面板"V 换算并写回、写完就是 Free"正好相反 ——
+  AutoClamped 得一直跟着邻居重算）；⑤旋转 Linear 段运行时走 slerp、
+  画布上没有那条线 → `crossCheck()` 跳过并计数。
+- **注入脚本**：`MYVK_EDITOR_BONEC_SCRIPT`
+  （`sleep / path / reload / chan / sel / selall / setkey / dragkey / interp /
+  ease / shape / handle / sethandle / drag / head / fit / digest / check /
+  save / saveforce`），收尾打
+  `BONEC-SCRIPT applied=N failed=N`。与鼠标手势共用 `act*` 那一族，所以
+  "能不能自动验"不取决于把某个点的像素坐标算准没有。
+- **验收**（`tools/verify_bone_curves.py`，**结果: PASS（43 项）**）：
+  - A 组 32 条 `curvebake_*` 自检（`ANIM-TOTAL pass=308 fail=0`，从 276
+    长上来），并点名四条底线：`curvebake_default_bitwise` /
+    `curvebake_rotation_linear_bitwise` / `curvebake_writeback_identical`
+    （`changed=0`）/ `curvebake_writeback_refuse`（帧数不等拒绝）。
+    其余覆盖：分量数与分量名、无表逐位、默认表逐位、**slerp ≠ nlerp**
+    （探针必须取 `u=0.25`，见下）、`step` 逐位与 mid、缓动
+    `mid=0.15625`（smoothstep(0.5)×1.0 手算）、端点不动、贝塞尔烘焙、
+    摘要往返、分量隔离、拖时间、同刻合并、`step` 互斥、`prune`、
+    插帧时缓动表对齐、旋转贝塞尔归一、通道表 7 条、整条叠加链、JSON 往返；
+  - B 组 打开真片段：`tracks=2 keys=6 chans=7`，且**第一帧**的
+    `BONEC-CHECK samples>0` —— "绿灯挂在没跑上"是这类读数最危险的形态
+    （见下面那条事故）；
+  - C 组 七个通道挨个切：rotation 的 `skipped=63`、translation 的
+    `skipped=0`，`xcheck` 全 0。`skipped` 是**诚实读数不是遮掩**：
+    旋转 Linear 段运行时走 slerp，画布上是分量曲线（nlerp），两者本来就
+    该不一样；装作差 0 才是错的；
+  - D 组 缓动手算：`t=0.125` 处 `0.125 → 0.078125`（= smoothstep(0.25) ×
+    0.5），且端点逐位不动；
+  - E 组 `T` 切插值：linear → bezier → constant 摘要两两不同，回 linear
+    复原，**`keys` 恒为 3**（帧数一个都不许变）；
+  - F 组 手柄：`handle=vector` 落盘的是**类型**，拖 out 手柄后
+    `0.3878 → 变大`，类型翻成 `free`；
+  - G 组 跨进程摘要一致 + 文件里真的出现 `keyEase`（**稀疏写**：只写非默认，
+    带 `i` 下标）+ 未编辑过的轨道不写；
+  - H 组 只读护栏：文件打不开时 `Save` 被拒（`reason=read-only`）；
+  - I 组 20 个 UI 锚点（`BONEC-OPEN / VIEW / CHECK / MAP / SAMPLE / DIGEST /
+    CHANNEL / SEL / SETKEY / INTERP / EASE / HANDLETYPE / DRAG-END /
+    REORDER / SAVE / SAVE-BLOCKED / SCRIPT / REJECT / WIN / PATH / HEAD /
+    FIT / CANVAS / CURSOR / HANDLE-* / INSP-*`）+ 零 VUID + 零 `[ERROR]`。
+- **还差**（留给后面）：
+  - **运行时（`AnimatorSystem`）不读缓动表** —— 它吃的是
+    `assets::AnimationClip`，而缓动住在 `EditClip` 上。要搬过去同样得动
+    `ecs/Components.h`（GLOBAL_GLOBS → 全量回归），与 S-C 的"运行时读同一份
+    约束栈"是同一批活，一起做；
+  - 曲线修改器（Noise / Sine）与循环外推（`Extrapolate::Cycle*`）在骨骼轨
+    上**未接**：`Curve` 有，`bakeTrackCurve` 只是把区间内的键投影出来；
+  - Action 级曲线（一个曲线驱动多根骨）未做 —— 现在是"一条 channel 一个
+    分量一条曲线"，与 Blender 的 Action 层级还差一层；
+
+
 ### R6 · Graph Editor（曲线视图）· 规模 M —— ✅ 已落地（2026-10-28）
 
 把 R5 的数据层画出来。（落地证据：`editor/CurveEditorPanel.{h,cpp}` +
@@ -710,7 +832,7 @@ const float w = animation::evaluateSegmentEase(ip, em, sh, a.outHandle,
 
 ---
 
-## 5 · 七条硬约束（下一轮开工前先读这段）
+## 5 · 八条硬约束（下一轮开工前先读这段）
 
 1. **`engine/ecs/**` 与 `engine/assets/**` 在 `GLOBAL_GLOBS`**（`tools/run_regression.py:999`）。
    动 `Components.h` / `Skeleton.h` = 按项目纪律要跑全量。所以 R6 的"接实体 TRS"
@@ -742,3 +864,12 @@ const float w = animation::evaluateSegmentEase(ip, em, sh, a.outHandle,
    恒等，"乘个 0 再写回去"会以 1e-7 的量级漂，长跑之后角色会慢慢转歪，而画面上
    完全看不出来。断言：`constraint_limit_inside_bitwise` /
    `constraint_*_influence0` / `constraint_limit_disabled_bitwise`（全是 `memcmp`）。
+8. **"少了数据的那一路"不许多算一步**（S-D）。轨道没有缓动表时，采样必须
+   **转发** `assets::sampleTrack`，而不是"走一遍曲线、结果碰巧一样"：
+   平移/缩放确实逐位等价（`v0+(v1-v0)*w` 就是 `a+(b-a)*u`），但**旋转不等价**
+   —— 老路是 `slerp`，分量曲线是 nlerp（同弧不同速，正中点相同、其余差几个
+   百分点）。所以 `sampleRotationEased` 里那句 `if (w == u) return
+   sampleTrack(...)` 是**结构性**的，不是优化。同源的三条：写回没改时
+   `changed=0`、曲线帧数与轨道不等时整条拒绝、`keyEase` 全默认时不落盘。
+   断言：`curvebake_default_bitwise` / `curvebake_rotation_linear_bitwise` /
+   `curvebake_writeback_identical` / `curvebake_writeback_refuse`。

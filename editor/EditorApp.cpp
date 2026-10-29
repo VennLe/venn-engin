@@ -6,6 +6,7 @@
 #include "TimelineEditorWindow.h"
 #include "CurveEditorPanel.h"
 #include "DopeSheetWindow.h"
+#include "BoneCurvePanel.h"
 #include "UiEditorWindow.h"
 #include "CommandRegistry.h"
 #include "ContentBrowser.h"
@@ -438,6 +439,14 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         // ⚠ 稳定 ID 必须写成 `###panel_dope`（= trayWindowName("dope")）。
         {"dope", "Dope sheet", PanelGroup::Authoring, "", "timeline",
          false, true, kSlotNone, &EditorApp::panelDrawDopeSheet},
+        // 2026-10-29（S-D）：骨骼曲线编辑器。与上面五格**完全同构** ——
+        // 窗口对象自己管 open/close，表项只做显隐 / 快捷键 / 落盘三路。
+        // ⚠ 它**不是** `curveed` 的第二模式：相机曲线的手柄是"段内归一化、
+        //   四通道共用"，骨骼的是"每键绝对偏移、分量独立"，两种语义靠 if
+        //   分支挤在一个类里，每次改动都要重新回答"这个手柄归谁"。
+        // ⚠ 稳定 ID 必须写成 `###panel_bonecurv`（= trayWindowName 的结果）。
+        {"bonecurv", "Bone curves", PanelGroup::Authoring, "", "curve",
+         false, true, kSlotNone, &EditorApp::panelDrawBoneCurve},
     };
 }
 
@@ -494,6 +503,8 @@ void EditorApp::panelDrawUiEditor(EditorApp& a) { (void)a; }
 void EditorApp::panelDrawCurveEditor(EditorApp& a) { (void)a; }
 // 同上（R8）：drawDopeSheetWindow 每帧无条件被调用。
 void EditorApp::panelDrawDopeSheet(EditorApp& a) { (void)a; }
+// 同上（S-D）：drawBoneCurveWindow 每帧无条件被调用。
+void EditorApp::panelDrawBoneCurve(EditorApp& a) { (void)a; }
 void EditorApp::panelDrawPhysics(EditorApp& a) {
     if (a.m_physicsPanel) a.m_physicsPanel->draw();
 }
@@ -1448,6 +1459,9 @@ void EditorApp::onInit() {
     // 构造期互相引用是循环依赖的典型起点。
     m_dopeSheet = std::make_unique<DopeSheetWindow>(*m_ctx);
     if (m_characterWindow) m_characterWindow->attachDopeSheet(m_dopeSheet.get());
+    // S-D 骨骼曲线编辑器（同上）。它**不**持有 CharacterWindow 的 EditClip：
+    // 自己从 `.anim.json` 读一份，靠磁盘时间戳比对避免两个写者静默互相覆盖。
+    m_boneCurve = std::make_unique<BoneCurvePanel>(*m_ctx);
 
     // E18：命令注册表（命令面板 / 快捷键表 / 总览共用）。必须在所有面板
     // 与 Renderer 都就绪之后 —— 命令的 handler 会摸它们。
@@ -1702,6 +1716,22 @@ void EditorApp::onInit() {
                 panelTrayHiddenRef(idx) = false;
             }
             VK_LOG_INFO("PANEL dope open=1 reason=env path=%s", envDope);
+        }
+    }
+
+    // ---- MYVK_EDITOR_BONEC=<路径>：启动即打开骨骼曲线编辑器（S-D）----
+    // 与上面 CURVED / DOPE 同款。
+    //   MYVK_EDITOR_BONEC_SCRIPT="chan:5;sel:1;interp:1:bezier;save"  注入命令
+    // ⚠ 路径是 `.anim.json`（`animation::EditClip`），不是 `.seq.json`。
+    if (const char* envBc = std::getenv("MYVK_EDITOR_BONEC")) {
+        if (m_boneCurve) {
+            m_boneCurve->open(envBc);
+            const int idx = panelIndexOf("bonecurv");
+            if (idx >= 0) {
+                setPanelOpen(idx, true);
+                panelTrayHiddenRef(idx) = false;
+            }
+            VK_LOG_INFO("PANEL bonecurv open=1 reason=env path=%s", envBc);
         }
     }
 
@@ -4254,6 +4284,7 @@ void EditorApp::onImGui() {
     drawUiEditorWindow();
     drawCurveEditorWindow();
     drawDopeSheetWindow();
+    drawBoneCurveWindow();
 
     // 浮动面板标题栏的"最小化"按钮。必须排在**所有窗口画完之后**：它要读
     // 每个窗口这一帧的 Pos/Size 才能把那一格摆到关闭 X 的左边（见函数注释）。
@@ -9246,6 +9277,40 @@ void EditorApp::drawDopeSheetWindow() {
     // ---- ③ 画 ----
     bool keep = true;
     m_dopeSheet->draw(keep);
+    if (!keep) setPanelOpen(idx, false);
+}
+
+// ---------------------------------------------------------------- 骨骼曲线
+//
+// 与上面几个资产编辑器**逐行同构**（S-D）。差别只有一处：它不绑定
+// CharacterWindow 的 `EditClip`，永远自己持一份从磁盘读来的副本 ——
+// "一个文件一个写者"（BoneCurvePanel.h 的 ⑥）。
+void EditorApp::drawBoneCurveWindow() {
+    if (!m_boneCurve) return;
+    const int idx = panelIndexOf("bonecurv");
+    if (idx < 0) return;
+
+    // ---- ① 托盘收起：窗口对象保持打开，这一帧不提交 ----
+    if (panelTrayHiddenRef(idx) && panelOpen(idx)) return;
+
+    // ---- ② 表 → 窗口 ----
+    bool& open = panelOpenRef("bonecurv");
+    if (!open) {
+        if (m_boneCurve->isOpen()) {
+            m_boneCurve->close();
+            VK_LOG_INFO("PANEL bonecurv open=0");
+        }
+        return;
+    }
+    if (!m_boneCurve->isOpen()) {
+        // 空手开窗：只剩路径输入框。
+        m_boneCurve->open(std::string());
+        VK_LOG_INFO("PANEL bonecurv open=1 reason=menu");
+    }
+
+    // ---- ③ 画 ----
+    bool keep = true;
+    m_boneCurve->draw(keep);
     if (!keep) setPanelOpen(idx, false);
 }
 

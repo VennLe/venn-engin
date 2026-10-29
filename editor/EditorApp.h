@@ -93,6 +93,7 @@ class TimelineEditorWindow;   // 2026-10-27：时间轴轨道编辑器（#311）
 class UiEditorWindow;         // 2026-10-27：UI 编辑器（#312）
 class CurveEditorPanel;       // 2026-10-28（R6）：曲线编辑器（Graph Editor）
 class DopeSheetWindow;        // 2026-10-28（R8）：动画摄影表（Dope Sheet）
+class BoneCurvePanel;         // 2026-10-29（S-D）：骨骼曲线编辑器
 class LandscapeEditor;        // 2026-10-20：地形编辑模式
 class FoliageEditor;          // 2026-10-20：植被编辑模式
 // 2026-10-20 晚：下拉里其余 6 个模式（ToolkitEditors.h / .cpp）
@@ -235,6 +236,8 @@ private:
     // 动画摄影表（R8）：与上面四格完全同构，真正的 draw 在
     // drawDopeSheetWindow。
     static void panelDrawDopeSheet(EditorApp& a);
+    // 骨骼曲线（S-D）：与上面几格同构，真正的 draw 在 drawBoneCurveWindow。
+    static void panelDrawBoneCurve(EditorApp& a);
 
     // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
     void drawPanels();
@@ -405,6 +408,10 @@ private:
     //   CharacterWindow 内存里那份 `EditClip`（见 DopeSheetWindow.h ⚠⑤），
     //   这时面板表只是显隐开关，数据源由 CharacterWindow 每帧推过来。
     void drawDopeSheetWindow();
+    // 骨骼曲线（S-D）：入口是 View 菜单 / 底栏托盘 / `MYVK_EDITOR_BONEC`。
+    // 与相机曲线编辑器**不是同一个窗口**（见 BoneCurvePanel.h 开头那段：
+    // 手柄归属的根本差别）。
+    void drawBoneCurveWindow();
     // 视口正下方那一行播放条（Run = 运行游戏；Play/Pause/Stop = 动画）。
     //
     // ⚠ 2026-10-17：UI 被用户要求移除，**这个函数不再被调用**（保留实现
@@ -547,6 +554,11 @@ private:
     // 而 unique_ptr 成员按"声明的逆序"析构。所以它必须在 m_characterWindow
     // **之后**声明（= 先析构），否则关窗口时 dope sheet 会拿着悬空指针。
     std::unique_ptr<DopeSheetWindow> m_dopeSheet;
+    // 2026-10-29（S-D）：骨骼曲线编辑器。与上面几格同构，但它**不**持有
+    // CharacterWindow 的指针 —— 它自己从 `.anim.json` 读一份 `EditClip`
+    // （"一个文件一个写者"：Pose Mode 打开时两个窗口各自持副本，靠
+    //  存盘前的磁盘时间戳比对来避免静默互相覆盖）。
+    std::unique_ptr<BoneCurvePanel> m_boneCurve;
     // 2026-10-17 晚：底栏"+"托盘里的两张功能面板（Physics / Particles）
     std::unique_ptr<PhysicsPanel> m_physicsPanel;
     std::unique_ptr<ParticlesPanel> m_particlesPanel;

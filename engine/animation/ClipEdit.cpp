@@ -7,6 +7,7 @@
 
 #include "animation/ClipEdit.h"
 
+#include "animation/CurveBake.h"
 #include "core/Logger.h"
 
 #include <nlohmann/json.hpp>
@@ -24,14 +25,9 @@ namespace {
 
 using json = nlohmann::json;
 
-const char* pathName(assets::AnimTrack::Path p) {
-    switch (p) {
-        case assets::AnimTrack::Translation: return "translation";
-        case assets::AnimTrack::Rotation:    return "rotation";
-        case assets::AnimTrack::Scale:       return "scale";
-    }
-    return "rotation";
-}
+// `pathName()` 现在只有一份，在 CurveBake.cpp（`animation::pathName`）——
+// 序列化与曲线编辑器共用同一个字面表，省得"存的是 translation、曲线列表
+// 里显示的是 Translation"这种对不上的事。这里只留反解。
 
 bool pathFromName(const std::string& s, assets::AnimTrack::Path& out) {
     if (s == "translation" || s == "t" || s == "loc" || s == "0") {
@@ -99,6 +95,7 @@ struct KeyItem {
     float t = 0.0f;
     glm::vec4 v{0.0f};
     unsigned char type = 0;
+    KeyEase ease;
     bool sel = false;
 };
 
@@ -121,6 +118,7 @@ std::vector<int> rebuildTrack(EditTrack& tr, std::vector<KeyItem>& items,
     tr.times.clear();
     tr.values.clear();
     tr.types.clear();
+    tr.ease.clear();
     tr.times.reserve(items.size());
     tr.values.reserve(items.size());
 
@@ -133,6 +131,7 @@ std::vector<int> rebuildTrack(EditTrack& tr, std::vector<KeyItem>& items,
             if (it.sel) {                    // 选中的赢
                 tr.values.back() = it.v;
                 tr.types.back() = it.type;
+                tr.ease.back() = it.ease;
                 owner.back() = static_cast<int>(i);
             }
             continue;
@@ -140,6 +139,7 @@ std::vector<int> rebuildTrack(EditTrack& tr, std::vector<KeyItem>& items,
         tr.times.push_back(it.t);
         tr.values.push_back(it.v);
         tr.types.push_back(it.type);
+        tr.ease.push_back(it.ease);
         owner.push_back(static_cast<int>(i));
     }
     for (std::size_t k = 0; k < owner.size(); ++k)
@@ -152,6 +152,8 @@ std::vector<int> rebuildTrack(EditTrack& tr, std::vector<KeyItem>& items,
         if (t != static_cast<unsigned char>(KeyType::Key)) { anyType = true; break; }
     }
     if (!anyType) tr.types.clear();
+    // 缓动表同理：全默认就抹平（存盘时只有非默认才写）
+    tr.pruneDefaultEase();
     return map;
 }
 
@@ -188,6 +190,7 @@ BatchStats transformKeys(EditClip& clip, std::vector<KeyRef>& sel, Fn fn) {
             KeyItem it;
             it.v = tr.values[static_cast<std::size_t>(i)];
             it.type = static_cast<unsigned char>(tr.typeAt(i));
+            it.ease = tr.easeAt(i);
             it.sel = (std::find(idx.begin(), idx.end(), i) != idx.end());
             it.t = it.sel ? fn(tr.times[static_cast<std::size_t>(i)])
                           : tr.times[static_cast<std::size_t>(i)];
@@ -249,6 +252,17 @@ bool parseKeyType(const std::string& s, KeyType& out) {
 
 // ---------------------------------------------------------------- EditTrack
 
+bool KeyEase::isDefault() const {
+    // ⚠ 比的是**会进求值的字段**：Linear + None + Linear 时 `easeFn` 逐位
+    //   返回 u，整条轨道等价于 `sampleTrack`（见 CurveBake.h 约定 ①）。
+    //   `handle` 在 Linear 段上不参与求值，但它是作者按 V 存下的意图，
+    //   所以也计入 —— 抹掉它等于"下次切到贝塞尔时手柄凭空复位"。
+    return interp == Interp::Linear && ease == EaseMode::None &&
+           shape == EaseShape::Linear && handle == HandleType::AutoClamped &&
+           outHandle == glm::vec2(1.0f / 3.0f, 0.0f) &&
+           inHandle == glm::vec2(-1.0f / 3.0f, 0.0f);
+}
+
 int EditTrack::findKey(float time) const {
     for (size_t i = 0; i < times.size(); ++i) {
         if (std::fabs(times[i] - time) <= kKeyTimeEpsilon)
@@ -276,6 +290,36 @@ void EditTrack::setTypeAt(int i, KeyType t) {
         if (v != static_cast<unsigned char>(KeyType::Key)) { any = true; break; }
     }
     if (!any) types.clear();
+}
+
+// ---- 缓动表（S-D）。口径与 types 完全一致：可短、全默认即抹平。----
+
+const KeyEase& EditTrack::easeAt(int i) const {
+    // ⚠ 返回的是**静态默认值**的引用：调用方只读，不要拿它当"这一键存在"。
+    static const KeyEase kDef{};
+    if (i < 0 || static_cast<std::size_t>(i) >= ease.size()) return kDef;
+    return ease[static_cast<std::size_t>(i)];
+}
+
+void EditTrack::setEaseAt(int i, const KeyEase& e) {
+    if (i < 0 || i >= keyCount()) return;
+    if (ease.size() != times.size()) ease.resize(times.size(), KeyEase{});
+    ease[static_cast<std::size_t>(i)] = e;
+    pruneDefaultEase();
+}
+
+bool EditTrack::hasEasing() const {
+    for (const KeyEase& e : ease) {
+        if (!e.isDefault()) return true;
+    }
+    return false;
+}
+
+bool EditTrack::pruneDefaultEase() {
+    if (ease.empty()) return false;
+    if (hasEasing()) return false;
+    ease.clear();
+    return true;
 }
 
 // ---------------------------------------------------------------- EditClip
@@ -349,6 +393,14 @@ bool EditClip::setKey(const std::string& joint, assets::AnimTrack::Path p,
         } else if (!tr->types.empty()) {
             tr->types.insert(tr->types.begin() + static_cast<long>(idx), 0);
         }
+        // 缓动表同理：表为空就别管（省得"打一帧就多一张全默认的表"），
+        // 非空就按位置插一个默认项，否则后面的键会整体错位一格 ——
+        // 那在画面上是"从这一帧起所有切线都挪到下一帧去了"。
+        if (!tr->ease.empty()) {
+            if (tr->ease.size() != tr->times.size() - 1)
+                tr->ease.resize(tr->times.size() - 1, KeyEase{});
+            tr->ease.insert(tr->ease.begin() + static_cast<long>(idx), KeyEase{});
+        }
         inserted = true;
     }
 
@@ -367,6 +419,9 @@ bool EditClip::removeKey(const std::string& joint, assets::AnimTrack::Path p,
     tr.values.erase(tr.values.begin() + index);
     if (!tr.types.empty() && static_cast<size_t>(index) < tr.types.size())
         tr.types.erase(tr.types.begin() + index);
+    if (!tr.ease.empty() && static_cast<size_t>(index) < tr.ease.size())
+        tr.ease.erase(tr.ease.begin() + index);
+    tr.pruneDefaultEase();
     if (tr.times.empty()) tracks.erase(tracks.begin() + ti);
     return true;
 }
@@ -540,11 +595,12 @@ TypeCount countTypes(const EditClip& clip, const std::vector<KeyRef>& sel) {
 
 ResolveStats resolveEditTracks(const assets::Skeleton& skel,
                                const EditClip& clip,
-                               std::vector<assets::AnimTrack>& out) {
+                               std::vector<ResolvedTrack>& out) {
     ResolveStats st;
     out.clear();
     if (skel.jointCount() <= 0) return st;
 
+    int easedChannels = 0;
     for (const auto& et : clip.tracks) {
         const int j = skel.findJoint(et.joint, kResolveFlags);
         if (j < 0) {
@@ -560,12 +616,16 @@ ResolveStats resolveEditTracks(const assets::Skeleton& skel,
             st.droppedKeys += et.keyCount();
             continue;
         }
-        assets::AnimTrack rt;
-        rt.joint = j;
-        rt.path = et.path;
-        rt.times = et.times;
-        rt.values = et.values;
-        rt.step = et.step;
+        ResolvedTrack rt;
+        rt.track.joint = j;
+        rt.track.path = et.path;
+        rt.track.times = et.times;
+        rt.track.values = et.values;
+        rt.track.step = et.step;
+        // S-D：带上缓动（没有缓动的轨道 `hasEase == false`，采样直接转发
+        // `sampleTrack` —— 这就是"没进过曲线编辑器 = 逐位不变"）。
+        bakeResolvedTrack(et, rt);
+        if (rt.hasEase) ++easedChannels;
         out.push_back(std::move(rt));
         ++st.resolvedChannels;
     }
@@ -574,22 +634,22 @@ ResolveStats resolveEditTracks(const assets::Skeleton& skel,
     // 上层的"涉及几根骨"读数才和实际一致）
     std::vector<int> seen;
     for (const auto& t : out) {
-        if (std::find(seen.begin(), seen.end(), t.joint) == seen.end())
-            seen.push_back(t.joint);
+        if (std::find(seen.begin(), seen.end(), t.track.joint) == seen.end())
+            seen.push_back(t.track.joint);
     }
     st.resolvedJoints = static_cast<int>(seen.size());
 
     VK_LOG_INFO("POSE-RESOLVE clips=%d channels=%d joints=%d missing=%d "
-                "droppedKeys=%d",
+                "droppedKeys=%d eased=%d",
                 static_cast<int>(clip.tracks.size()), st.resolvedChannels,
                 st.resolvedJoints, static_cast<int>(st.missing.size()),
-                st.droppedKeys);
+                st.droppedKeys, easedChannels);
     return st;
 }
 
 // ---------------------------------------------------------------- 叠加
 
-int overlayEditPose(const std::vector<assets::AnimTrack>& resolved, float time,
+int overlayEditPose(const std::vector<ResolvedTrack>& resolved, float time,
                     Pose& pose) {
     // ⚠ 这里是"无编辑数据时逐位一致"的闸门：一个字节都不写。
     if (resolved.empty()) return 0;
@@ -597,10 +657,13 @@ int overlayEditPose(const std::vector<assets::AnimTrack>& resolved, float time,
     if (n <= 0) return 0;
 
     int written = 0;
-    for (const auto& tr : resolved) {
+    for (const auto& rt : resolved) {
+        const assets::AnimTrack& tr = rt.track;
         if (tr.joint < 0 || tr.joint >= n) continue;
-        // 求值只走这一个入口（约定 ③）
-        const glm::vec4 v = assets::sampleTrack(tr, time);
+        // 求值只走这两个入口（约定 ③ + S-D 的受控例外）：
+        //   没缓动 → `sampleTrack`；有缓动 → 预烘的 `animation::Curve`。
+        // 没有第三份插值。
+        const glm::vec4 v = sampleResolvedTrack(rt, time);
         const size_t k = static_cast<size_t>(tr.joint);
         switch (tr.path) {
             case assets::AnimTrack::Translation:
@@ -698,6 +761,26 @@ bool saveEditClip(const std::string& path, const EditClip& clip,
             for (std::size_t i = 0; i < t.times.size(); ++i)
                 types.push_back(static_cast<int>(t.typeAt(static_cast<int>(i))));
             o["types"] = std::move(types);
+        }
+        // 每键缓动（S-D）。**稀疏**写：只写非默认的键，带下标。
+        // 全默认（绝大多数老资产、以及"只打了帧没进曲线编辑器"的轨道）
+        // 一个字段都不出现 —— 与 types 同一口径，老文件重存还是老样子。
+        {
+            json arr = json::array();
+            for (std::size_t i = 0; i < t.times.size(); ++i) {
+                const KeyEase& e = t.easeAt(static_cast<int>(i));
+                if (e.isDefault()) continue;
+                json eo;
+                eo["i"] = static_cast<int>(i);
+                eo["interp"] = interpName(e.interp);
+                eo["easeMode"] = easeModeName(e.ease);
+                eo["shape"] = easeShapeName(e.shape);
+                eo["handle"] = handleTypeName(e.handle);
+                eo["out"] = json::array({e.outHandle.x, e.outHandle.y});
+                eo["in"] = json::array({e.inHandle.x, e.inHandle.y});
+                arr.push_back(std::move(eo));
+            }
+            if (!arr.empty()) o["keyEase"] = std::move(arr);
         }
         jt.push_back(std::move(o));
     }
@@ -841,6 +924,45 @@ bool loadEditClip(const std::string& path, EditClip& out, std::string& err) {
                 t.values.resize(n);
             }
             if (t.types.size() > t.times.size()) t.types.resize(t.times.size());
+            // 每键缓动（S-D）。稀疏表：`i` 越界 / 字段缺失 / 名字写错
+            // 一律**落在默认值**上（= 逐位等价于没有缓动），不丢整条轨道。
+            if (o.contains("keyEase") && o["keyEase"].is_array()) {
+                t.ease.resize(t.times.size(), KeyEase{});
+                for (const auto& eo : o["keyEase"]) {
+                    if (!eo.is_object()) continue;
+                    const int i = eo.value("i", -1);
+                    if (i < 0 || static_cast<std::size_t>(i) >= t.times.size())
+                        continue;
+                    KeyEase& e = t.ease[static_cast<std::size_t>(i)];
+                    Interp ip = Interp::Linear;
+                    EaseMode em = EaseMode::None;
+                    EaseShape sh = EaseShape::Linear;
+                    HandleType ht = HandleType::AutoClamped;
+                    if (eo.contains("interp") && eo["interp"].is_string())
+                        parseInterp(eo["interp"].get<std::string>(), ip);
+                    if (eo.contains("easeMode") && eo["easeMode"].is_string())
+                        parseEaseMode(eo["easeMode"].get<std::string>(), em);
+                    if (eo.contains("shape") && eo["shape"].is_string())
+                        parseEaseShape(eo["shape"].get<std::string>(), sh);
+                    if (eo.contains("handle") && eo["handle"].is_string())
+                        parseHandleType(eo["handle"].get<std::string>(), ht);
+                    e.interp = ip;
+                    e.ease = em;
+                    e.shape = sh;
+                    e.handle = ht;
+                    if (eo.contains("out") && eo["out"].is_array() &&
+                        eo["out"].size() >= 2) {
+                        e.outHandle.x = eo["out"][0].get<float>();
+                        e.outHandle.y = eo["out"][1].get<float>();
+                    }
+                    if (eo.contains("in") && eo["in"].is_array() &&
+                        eo["in"].size() >= 2) {
+                        e.inHandle.x = eo["in"][0].get<float>();
+                        e.inHandle.y = eo["in"][1].get<float>();
+                    }
+                }
+                t.pruneDefaultEase();
+            }
             if (t.times.empty()) continue;
             c.tracks.push_back(std::move(t));
         }

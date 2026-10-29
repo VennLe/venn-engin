@@ -540,6 +540,16 @@ DEFAULT = [
     # 另外三条底线：influence/关掉时**一个字节都不写**（`memcmp`）、
     # IK 入栈与直接调 `solveTwoBoneIK` **逐位相同**、存读往返摘要不变。
     "verify_constraints",
+    # ---- 2026-10-29：骨骼曲线（S-D，#337）----
+    # "骨架 → 蒙皮 → 约束 → 曲线"里的第四环：新加 `engine/animation/CurveBake.*`
+    # （EditTrack ⇄ animation::Curve 的单向烘焙）+ `editor/BoneCurvePanel.*`
+    # （骨骼曲线的图画布）。验收走 `MYVK_EDITOR_BONEC_SCRIPT`。
+    # 这一层最要紧的是**"接上曲线之后什么都没变"**：缓动表为空（或全默认）
+    # 时采样必须与 `assets::sampleTrack` **逐位**相同 —— 不然打开一次曲线
+    # 编辑器，所有老动画都会以 1e-7 漂，而画面上看不出来。
+    # 另三条底线：没改就写回 `changed=0`、曲线帧数与轨道不等时**整条拒绝**、
+    # 存读往返摘要跨进程一致。
+    "verify_bone_curves",
     # ---- 2026-10-28：FBX take 名归一化后的**重名去重**（#329）----
     # `anime_girl.fbx` 里是 4 个 AnimationStack（`Rig|Idle` ×2 + `Rig|Walk` ×2），
     # 归一化掉 `|` 前缀后变成 [Idle,Walk,Idle,Walk] —— 撞名的代价不是
@@ -2343,6 +2353,21 @@ TRIGGERS = {
     "verify_constraints": ["engine/animation/Constraint.*",
                            "engine/animation/TwoBoneIK.*",
                            "editor/CharacterWindow.*",
+                           "engine/animation/AnimationSelfTest.cpp"],
+    # 骨骼曲线（S-D）：
+    #   · `engine/animation/CurveBake.*` —— 投影 / 写回 / 采样短路
+    #   · `engine/animation/ClipEdit.*` —— 缓动表就住在 `EditTrack` 上，
+    #     连 `overlayEditPose` 的签名一起变了（`ResolvedTrack`）
+    #   · `engine/animation/Curve.*` —— 求值器：Linear 分支的表达式必须与
+    #     `sampleTrack` 逐位一致，改了它"没缓动 = 逐位不变"当场断掉
+    #   · `editor/BoneCurvePanel.*` —— 画布 + `MYVK_EDITOR_BONEC_SCRIPT`
+    #   · `editor/EditorApp.*` —— 面板表 / 托盘 / `MYVK_EDITOR_BONEC` 钩子
+    #   · `engine/animation/AnimationSelfTest.cpp` —— 32 条 `curvebake_*`
+    "verify_bone_curves": ["engine/animation/CurveBake.*",
+                           "engine/animation/ClipEdit.*",
+                           "engine/animation/Curve.*",
+                           "editor/BoneCurvePanel.*",
+                           "editor/EditorApp.*",
                            "engine/animation/AnimationSelfTest.cpp"],
     "verify_world_api": ["engine/script/ScriptEngine.*",
                          "engine/script/ScriptSelfTest.cpp",
