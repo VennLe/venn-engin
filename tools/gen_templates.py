@@ -743,6 +743,7 @@ def build_game_json(spec):
     return {
         "_comment": "__PROJECT_NAME__ 的运行时出厂配置。"
                     "优先级: 命令行 > 环境变量(MYVK_RUNTIME_*) > 本文件 > 内置默认。"
+                    "language: auto = 跟随系统界面语言（en / zh 可写死）。"
                     "画质不在这里 —— 见 config/render.json。",
         "scene": "scenes/main.json",
         "title": "__PROJECT_NAME__",
@@ -752,7 +753,10 @@ def build_game_json(spec):
         "maxFps": 60,
         "unfocusedFps": 15,
         "timeScale": 1.0,
-        "language": "zh",
+        # 2026-10-29：写 `auto` 而不是 `zh` —— 模板是给**别人**的起点，
+        # 写死中文等于让英文玩家装完就看到中文。`auto` 由运行时解析成
+        # 系统界面语言（见 RuntimeApp::onInit 的 I18N-KEY src=system）。
+        "language": "auto",
         "startState": "playing",
         "audio": {
             "enabled": True,

@@ -373,6 +373,13 @@ void LauncherApp::onInit() {
         VK_LOG_INFO("LAUNCHER-WIZARD code-root-seeded=%s", c.c_str());
     }
 
+    // 界面语言：启动器**没有**自己的设置存储，所以只有两档 ——
+    // 上面的下拉框选的（本次进程有效）、以及出厂默认。
+    // 出厂默认 = 当前电脑的系统语言（2026-10-29，见 i18n/I18n.h 文件头），
+    // 以前写死英文，中文机器上第一次打开是英文界面。
+    VK_LOG_INFO("LAUNCHER-LANG lang=%s src=system",
+                i18n::languageCode(i18n::language()));
+
     VK_LOG_INFO("LAUNCHER-READY version=%s gpu=%s", core::kVennVersion,
                 renderer().device().properties().deviceName);
     m_initialized = true;

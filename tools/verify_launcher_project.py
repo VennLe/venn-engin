@@ -226,15 +226,24 @@ def main():
     else:
         log("CHECK ② camera.distance=%s OK" % got_dist)
 
-    # player.mode 才是权威
-    player = next((e for e in scene.get("entities", [])
-                   if e.get("name") == "Player"), None)
+    # 类型标记（first / third）的权威。
+    #
+    # ⚠ 2026-10-29 改判据：以前读 `Player` 实体的 `player.mode`，可模板早就
+    #   不是"预放一个 Player 实体"了 —— 现在是 **Terrain + GameStart（出生点）**
+    #   （见 gen_templates.py 的场景注释："空场景：地形 + 出生点"），玩家实体
+    #   在 Play 时才由 GameStartComponent 生成。所以那段断言一直在找一个
+    #   不存在的实体（`player.mode=None`），红着但没人发现。
+    #   新的落点：`GameStart` 实体的 `gameStart.mode` —— 同一份类型信息，
+    #   只是跟着模板一起搬了家（`player.mode` 的替代者，仍是**场景内的**
+    #   权威，`venn.project.json` 的 gameType 依旧只做展示）。
+    start = next((e for e in scene.get("entities", [])
+                  if e.get("name") == "GameStart"), None)
     want_mode = "first" if args.type == "first_person" else "third"
-    got_mode = (player or {}).get("player", {}).get("mode")
+    got_mode = (start or {}).get("gameStart", {}).get("mode")
     if got_mode != want_mode:
-        fails.append("② player.mode=%s，期望 %s" % (got_mode, want_mode))
+        fails.append("② gameStart.mode=%s，期望 %s" % (got_mode, want_mode))
     else:
-        log("CHECK ② player.mode=%s OK" % got_mode)
+        log("CHECK ② gameStart.mode=%s OK" % got_mode)
 
     # ---- ③ 布局落在工程目录，而不是仓库根 ----
     layout = os.path.join(root, "config", "editor_layout.json")

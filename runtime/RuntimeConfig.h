@@ -54,7 +54,12 @@ struct RuntimeConfig {
     std::uint64_t maxFrames = 0;
 
     // ---- 内容 ----
-    std::string language = "en";
+    // 界面语言。**空串 = auto = 跟随系统**（2026-10-29）：
+    // 以前写死 "en"，中文 Windows 上的玩家一开游戏就是英文。
+    // 三种写法都算 auto：空串、`"auto"`、`"system"`（构建器给人看的写法）。
+    // ⚠ 真正解析成下标在 `RuntimeApp::onInit`，这里只存原值 ——
+    //   配置解析不该去问 Win32"这台机器装了什么语言"。
+    std::string language = "";
     std::string quality = "high";
 
     // ---- UI 文档（#312）----

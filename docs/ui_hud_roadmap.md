@@ -946,7 +946,7 @@ UI tick 在状态栈**之外**）→ U8（血条/准星/伤害数字/暂停菜�
 
 | 阶段 | 交付物 | 验收锚点 / 实测 |
 |---|---|---|
-| U7 | 词典 1559 条搬到 `engine/i18n/ZhTable.cpp`；`engine/i18n/I18n.{h,cpp}` 是唯一查表入口；`editor/Localization.cpp` 从 2104 行降到 **101 行**转发壳，`TR()` **792 处零改动** | `I18N-KEY lang=zh count=1559` · 不设语言 → `lang=en count=0`（**表不构造**，英文零开销） |
+| U7 | 词典 1559 条搬到 `engine/i18n/ZhTable.cpp`；`engine/i18n/I18n.{h,cpp}` 是唯一查表入口；`editor/Localization.cpp` 从 2104 行降到 **101 行**转发壳，`TR()` **792 处零改动** | `I18N-KEY lang=zh count=1559` · **2026-10-29 起"不设语言"= 跟随系统语言**（原来是 `lang=en`，见 `docs/system_language_2026-10-29.md`）；显式 `--language en` 才是 `lang=en count=0`（**表不构造**，英文零开销） |
 | U6 | `engine/ui2/UiFocus.{h,cpp}`（几何导航 `along + 2×lateral`、方向无候选**回绕**）、`UiCanvas::setGameUiBuilder/Active`、`tickUi` 挂在 `cb.pollInput`（早于 fixedUpdate、不受 `blocksUpdate`/`timeScale` 影响） | `UI2-FOCUS id=…`（**只在变化时**打）· `UI2-PAUSE open=1 context=Menu cursor=1` · `UI2-TOTAL pass=56 fail=0` |
 | U8 | `runtime/ui/{HudModel,Hud,PauseMenu,UiConfig,HudSelfTest}`、脚本内置 `setHealth/damage/popup`、`HUD-STATS` 锚点 | `HUD-TOTAL pass=22 fail=0` · `HUD-STATS … bar=15,638,221x11 fill=…` · `damage(30)` → `health=70.0 fill=168.0`（= 240×0.7） |
 

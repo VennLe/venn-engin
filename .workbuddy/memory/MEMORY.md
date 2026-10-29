@@ -1,7 +1,7 @@
 # venn —— 项目笔记
 
-> 只放 **纪律 + 速查 + 指针**。细则 → `editor_details_archive.md`（§十一）/
-> `render_details_archive.md`；流水 → `YYYY-MM-DD.md`；数字 → `roadmaps.md`。
+> 只放 **纪律 + 速查 + 指针**。细则 → `editor_details_archive.md` / `render_details_archive.md`；
+> 流水 → `YYYY-MM-DD.md`；数字 → `roadmaps.md`。
 > ⚠ **体积纪律**：14.5 KB 以上注入会被截尾 → 细则写归档，本页只留判据。
 > 仓库 `D:\A-VENN\code\cpp\venn-engin`（CMake `Venn`）。C++17 手写 Vulkan，**右手系 Z-up**；
 > `core→rhi→render→scene→assets`（另有 `ui`/`i18n`/`ecs`/`physics`/`script`/`audio`/`project`；
@@ -26,14 +26,14 @@
 **bindless**（`render/Bindless.h`，默认关）。
 Python 用 envs\default\Scripts\python.exe；⚠ **裸 `python` 不带 PIL** → 回归整批 FAIL。
 
-## 构建（原文 → 归档十一 A）
+## 构建（细则 → 归档十一 A）
 `./make.cmd build`（`TOOLCHAIN=auto` → **MSVC**；`Debug` → **性能数字是 Debug 的**）。
 ⚠⚠ **前向声明必须与定义同 struct/class**（按 TU 内首次声明 → `LNK2019`；**C4099 是前兆**）。
 ⚠⚠ **新加资产不会自动进 `build/bin/`** → 「加了完全没效果」先查这条。
 
 ## 环境变量
-⚠ 顺序固定：`MYVK_EDITOR_SCENE` → `EDITOR_CAM` → `MYVK_EDITOR_CLIP`（默认 `0.1/5000`），一律
-`MYVK_EDITOR_` 前缀。⚠ **落盘读/写不对称**：自动下默认不读、`MYVK_EDITOR_LAYOUT` 照读、**写一律拒**。
+⚠ 顺序固定：`MYVK_EDITOR_SCENE` → `EDITOR_CAM` → `MYVK_EDITOR_CLIP`，一律 `MYVK_EDITOR_` 前缀。
+⚠ **落盘读/写不对称**：自动下默认不读、`MYVK_EDITOR_LAYOUT` 照读、**写一律拒**。
 ⚠⚠ **改"全局默认"要 grep 依赖它的测试**（钉输入/升 fixture）。
 
 ## 契约速查（原文 → 归档十一 B）
@@ -67,22 +67,17 @@ submit -4；**只读第一条**。`syncTerrains/syncWaters` **只对主场景**�
 - ⚠⚠ 播放器只产出 `pose()`、**不持有 `CameraSystem*`**（传指针 = 视口变自由相机）；`tick` 在
   `CameraSystem::update` 之前；播完 `hasPose()==false`；`dt==0` 不推进；无 `CameraComponent` 时静默丢。
 
-## 序列化 / 存档 G16·G17-1·G17-2（10-27 ✅；原文 → 归档十三~十六；权威 → `persistence_roadmap.md` §12）
-- ⚠⚠ `setGuid` **先摘旧键**、`destroy` **先 erase 再清零**（写反 = 旧 guid 复活）；hex **补满 16 位**；
-  版本校验在 `scene.clear()` **之前**。⚠ **空实体不进场景文件**，但**存档必须全量**（`includeEmpty=true`）。
-- ⚠⚠ 三段 ①② **签名不许有 `AssetManager`**（`verify_sceneio.py` D 组静态盯）。存档原子写
-  tmp→fsync→bak→`MoveFileExW`（**顺序不能换**）；`sceneHash` = guid **排序后顺序**喂 FNV。
-- ⚠⚠ 父子写 `parentGuid`**不写下标**（下标会让"销毁一个实体"把别人的哈希带翻）；`World` 池子
-  **swap-and-pop** → 夹具不"把父排最后"时这 bug **测不出来**。
-- ⚠⚠ **「已销毁」粘性**：基线保留 guid 记 `kDeadHash`，**别 erase**（→ 打死的怪读档复活）。应用序
-  **销毁 → 覆盖 → 悬挂父（无条件跑）**；应用**复用** `entityApply*`（白名单=第二套解析，漏改不报错）。
+## 序列化 / 存档 G16·G17-1·G17-2（10-27 ✅；**逐条判据 → `persistence_roadmap.md` §12.9**）
+- ⚠⚠ `setGuid` **先摘旧键**、`destroy` **先 erase 再清零**（写反 = 旧 guid 复活）；hex 补满 16 位；版本
+  校验在 `scene.clear()` **之前**。⚠ **空实体不进场景文件**，但**存档必须全量**（`includeEmpty=true`）。
+- ⚠⚠ 父子写 `parentGuid`**不写下标**（下标会让"销毁一个实体"带翻别人的哈希）；**「已销毁」是粘性**的
+  （`kDeadHash`，别 erase → 打死的怪会读档复活）。应用序 **销毁 → 覆盖 → 悬挂父（无条件跑）**。
 
 ## 关节 J5（10-27 ✅；判据 → `verify_joints.py` A~H）
-- 拾取：self 过**本实体**逆、target 过 **target** 逆（写反=一 Play 拽飞）；点空退相机平面；**Esc 只退
-  拾取不清选中**。改关节 = 组件 + `rebuildJoints`，**绝不** `buildSceneWorld`。
+- 拾取：self 过**本实体**逆、target 过 **target** 逆（写反 = 一 Play 拽飞）；点空退相机平面；
+  **Esc 只退拾取不清选中**。改关节 = 组件 + `rebuildJoints`，**绝不** `buildSceneWorld`。
 - ⚠⚠ **`kBuiltins[]` 的 arity 就是公开签名**（写成标量 → 按 vec3 写的脚本**编译期** not runnable）；
-  位移判据用**末态−起点**。⚠ 可视化判据用 **verts 精确值**（竖直连杆 4／漏换向 3）：零尺寸立方体照样
-  计数 → 退化基必须 `return`。
+  位移判据用**末态−起点**。⚠ 可视化用 **verts 精确值**（竖直连杆 4／漏换向 3）；退化基必须 `return`。
 
 ## 对话 C2（10-26 ✅；权威 → `docs/dialogue.md`）
 - ⚠⚠ **`cue()` 绝不给场景加组件**（会被 `scene.save` 写盘）；**cue 优先于 `autoStart`**；起点
@@ -104,7 +99,13 @@ submit -4；**只读第一条**。`syncTerrains/syncWaters` **只对主场景**�
 ## 二次元UI主题（10-27✅；→ `docs/anime_ui_restyle.md`）
 - ⚠⚠ **`c^(1/2.2)`**：交换链把 ImGui 浮点色当线性值**又编码一次**；动漫档 `darkenThemeColors(1.45)`
   只对深色，**老 5 套系数一个都不许动**。⚠ 圆角进 `ThemeMetrics` 后 padding 一动**面板矩形全变**；
-  **主题下标只能追加**。E29-1~3 ✅；E29-5 角落抓手 ✅（角=合并/边=调大小）。
+  **主题下标只能追加**。E29-1~3 ✅（E29-5 角落抓手：角=合并/边=调大小）。
+
+## 界面语言默认 = 系统语言（10-29 ✅；→ `docs/system_language_2026-10-29.md`；判据 `verify_system_lang`）
+- 出厂 = **系统语言**（`i18n::systemLanguage()`，`g_lang` 用 `-1` 哨兵惰性求值）；env > 存档 > 系统。
+  ⚠ **自动化跑（`MYVK_FRAMES`/`MYVK_NO_WINDOW_SAVE`）默认英文**——判据要确定性文本。⚠ prefs **不写**
+  与出厂相同的 `language`（写了 = 钉死"跟随系统"）；`Reset All` 落点 = `factoryLanguage()`。
+- ⚠⚠ `it.id == "language"` 比的是**指针**（`const char*`）→ 必须 `strcmp`（10-29 静默踩过）。
 
 ## 断言纪律
 - ⚠⚠ 结尾必须是 `结果: PASS` / `结果: FAIL: ...`（ASCII 冒号）。
@@ -126,46 +127,39 @@ submit -4；**只读第一条**。`syncTerrains/syncWaters` **只对主场景**�
 - 设施：⚠ `capture_client` 返 **`(PIL.Image, ok)` 元组**；截图到 `<repo>/../_venn_verify`；禁硬编码盘符；
   键盘走 `PostMessage(WM_CHAR)`；加词条后重跑 `gen_sdf_atlas.py`。
 - ⚠⚠ `logRect` **不判可见性**（只去重）→ 滚出可视区的控件"有矩形却点不到"：`click_tag` 前**先滚**
-  （本机 Inspector 的固定落点是**死区** → 滚 `INS-PANEL` 中轴、离底 60px，90px/格）。
-- ⚠⚠ 分隔条遮挡裁切**不能含边界**：右边界压在线上 → 整线被裁光（`spans=0`），锚点却还在。
-- ⚠⚠ 面板往上加一行，下面的按钮网格会整排掉出面板；**Debug /RTC1 越界 = 断言框**
-  （进程活着、日志停在上行）→ 找 `#32770` 读原文。
+  （本机 Inspector 固定落点是**死区** → 滚 `INS-PANEL` 中轴、离底 60px，90px/格）。
+- ⚠⚠ 分隔条遮挡裁切**不能含边界**（压线 → `spans=0` 整线被裁光，锚点却还在）。⚠ 面板上加一行，
+  下面的按钮网格会整排掉出面板；**/RTC1 越界 = 断言框**（进程活着、日志停在上行）→ 找 `#32770`。
 
 ## 资产链 + 外部模型 → 角色（原文 → 归档十一 D；权威 → docs/fbx_asset_pipeline.md 等）
 - ⚠⚠ **新增顶层目录必须进 `WATCH_ROOTS`**；⚠⚠ **"写了容错分支" ≠ "容错生效"** —— 上游会 `throw` 的
   分支跑不到 → 贴图缺失必须走 `tryLoadTexture()`；造"缺贴图"现场要改路径下标 + **重算 MAT CRC32**。
 - ⚠⚠ **`.vmesh` 传给 `loadFBX` → 第二次起永远失败**（`.vmeta` 判过期后回退解析 .vmesh 抛异常；
   「第一次正常，删 `.vmeta` 又好一次」）。重烤后查 `.vmeta` 残留。
-- ⚠⚠ **`PostMessage` 合成的 Shift 会被 GLFW 撤销** → 修饰键必须 `keybd_event` + 先
-  `SetForegroundWindow`。⚠⚠ **`desc.maxSpeed` 截断冲刺** → 上限留余量。
-- 世界 = 米 / Z-up；玩家位置语义是**脚** → 挂模型 `lift = -boundsMin.z`；玩家实体必须挂
-  `CameraComponent`；`InputMap` **存档优先** → 老工程要"恢复默认"。P6 跳跃 v₀ 3.70 / `airControl
-  0.45`，**Play 手写同一条抛物线 → 改一处改两处**。
+- ⚠⚠ **`PostMessage` 的 Shift 会被 GLFW 撤销** → 修饰键必须 `keybd_event` + 先 `SetForegroundWindow`；
+  **`desc.maxSpeed` 截断冲刺** → 上限留余量。世界 = 米 / Z-up，玩家位置语义是**脚** → 挂模型
+  `lift = -boundsMin.z`；玩家实体必须挂 `CameraComponent`；`InputMap` **存档优先** → 老工程要"恢复默认"。
+- P6 跳跃 v₀ 3.70 / `airControl 0.45`，**Play 手写同一条抛物线 → 改一处改两处**。
 
-## 出包 E28/G29/G30（→ `docs/package_roadmap.md`；判据 `verify_package` 76 + `verify_shipping` 40）
-- 出包 = `Game.exe --package` / `File ▸ Package（as .pak）` → `<根>/dist/<Name>/`。
-- ⚠⚠ **引擎侧资产（shaders/fonts/ui/LUT）在 exeDir、不在工程里** → 打包必带（`kEngineAssetDirs`）。
-  漏了 = 「退出 24 条 VUID」或「字体断言卡死」，开发机复现不了。
-- **G29-a 闭包 ✅**：**任何 JSON 字符串**都是候选 + 三索引。⚠ 地形 `height/splat` 相对 **vterrain 自己**；
-  `_comment` 跳过；`continue` ≠ 剪枝（`.trash/` 照样递归）。
-- **G29-b/c/d ✅**（`Pak.*`+`AssetSource.*`）：`game.pak` 装 `assets/`+`shaders/` + 自带 LZ4；只拦
-  `resolveAssetPath`/`resolveShaderPath`，shader 走 `pak:` **直读内存**（`inline` 函数指针倒置）。⚠ 资产仍"落缓存"。
-- **G30 shipping ✅**：`make ship` → `build-ship/bin/Game.exe`；编辑器/启动器/AssetC **不声明**，开发命令
-  **编译期**剔除（判据按字节：出货 0 次 / dev >0）；出包用 dev 当工具 + `--engine` 指出货 exe。
+## 出包 E28/G29/G30（→ `docs/package_roadmap.md`；判据 `verify_package` 76 + `verify_shipping` 39）
+- `Game.exe --package` / `File ▸ Package（as .pak）` → `<根>/dist/<Name>/`；`--pak` = `game.pak`（assets+shaders，
+  自带 LZ4，shader 走 `pak:` **直读内存**）。闭包靠"**任何 JSON 字符串**都是候选"+三索引。
+  ⚠ `continue` ≠ 剪枝（`.trash/` 照样递归）；地形 `height/splat` 相对 **vterrain 自己**。
+- ⚠⚠ **引擎侧资产（shaders/fonts/ui/LUT）在 exeDir、不在工程里** → 打包必带（`kEngineAssetDirs`）：
+  漏了 = 退出 24 条 VUID / 字体断言卡死，**开发机复现不了**。
+- **G30 ✅**：`make ship` → `build-ship/bin/Game.exe`（Editor/Launcher/AssetC **不声明**、开发命令**编译期**
+  剔除、出货 0 次 / dev >0）；出包用 dev 当工具 + `--engine` 指出货 exe，pdb 进 `dist/<Name>/debug/`。
 
 ## 路线图（剩什么 → `docs/remaining_work_2026-10-27.md`；权威 → `docs/*_roadmap.md`）
 - 做完的：R0~R4·R5-1·R6-1·W0~W4·S0~S6·A1~A6·B1~B3·C1/C2·C6（除 `openUI`）·Prefab·多选·UI 编辑器·
   **G16~G17-2 · 二次元 UI 主题 · P2 菜单接线 · J5 关节 · 植被第二轮 · G29/G30 出包 · R7 骨骼打帧+Pose Mode**
   （判据 → 归档十三~十七）。
-- **R7 ✅**（10-28）：`engine/animation/ClipEdit.{h,cpp}` = 可写回的 `EditClip`（`.animclip.json`），
-  `Skeleton` 仍只读 → **没动 `engine/assets/**`、不用跑全量**。采样三段式（基础片段→编辑层→瞬态层），
-  无编辑数据时逐位一致。⚠ **循环里 `PushID` 绝不能用名字**：`anime_girl.fbx` 归一化后是
-  `[Idle,Walk,Idle,Walk]`，同帧同 ID → ImGui 弹**模态**告警窗，之后所有点击全被吞（界面看着正常、
-  只是点不动）；一律用下标。⚠ `OK_RE/BAD_RE` 现认 `结果: N 通过 / M 失败`（此前这种收尾一律误判 FAIL）。
-- **植被第二轮 ✅**（10-28）：类型可绑自有模型 + 可设偏移/旋转/缩放区间，三路共用 `samplePlacement`
-  （→ `foliage_mesh_2026-10-28.md` / `verify_foliage_mesh`）。**J5** ⚠⚠ `NOTIF-PUSH` 镜像每条 WARN →
-  日志断言必须筛；`INS-JOINT-HEADER` 无条件画 → 看 `-KIND`（→ `verify_joints` A~H）。
-- **三大缺口：C3 存档（G17-3）· E30 Shipping 剔除 · D1 语音 + B6 表情**。
+- **R7 ✅**（10-28）：`engine/animation/ClipEdit.*` = 可写回的 `EditClip`（`.animclip.json`）；采样三段式，
+  无编辑数据逐位一致。⚠ **循环里 `PushID` 绝不能用名字**（重名 → ImGui 弹**模态**告警窗，之后点击
+  全被吞）；一律用下标。⚠ `OK_RE/BAD_RE` 认 `结果: N 通过 / M 失败`。
+- **植被第二轮 ✅**（10-28）：类型可绑自有模型 + 偏移/旋转/缩放区间，三路共用 `samplePlacement`
+  （→ `foliage_mesh_2026-10-28.md`）。**J5** ⚠ `NOTIF-PUSH` 镜像每条 WARN → 日志断言必须筛；
+  `INS-JOINT-HEADER` 无条件画 → 看 `-KIND`（→ `verify_joints` A~H）。
+- **两大缺口：C3 存档（G17-3）· D1 语音 + B6 表情**。
 - ⚠ 材质位掩码到 **bit26**，只剩 5 位 → 加旋钮要换两个 u32。
-- ⚠ flaky：`bvh`/`csm`/`ibl`/`particles` 偶发全红 → 别补跑"凑干净"。
-- ⚠ "闸门红"先分 真漏/记账/夹具陈旧。
+- ⚠ flaky：`bvh`/`csm`/`ibl`/`particles` 偶发全红 → 别补跑"凑干净"；"闸门红"先分 真漏/记账/夹具陈旧。

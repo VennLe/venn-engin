@@ -1234,3 +1234,15 @@ check_regression_map.py      → PASS
 * ⚠ `HierarchyComponent::children` 存的是 `EntityId`（不带 generation）→ 槽位复用后
   "看起来还活着"。`fixOrphanParents` 里的 `alive()` 判据因此**可能漏判**；
   要彻底修得让 children 存 `{id, generation}`，那是 G16 的延伸，不在本轮。
+
+### 12.9 判据速查（2026-10-29 从项目笔记挪来，原文照抄）
+
+> 项目笔记（`.workbuddy/memory/MEMORY.md`）有体积上限，这一节的细则搬到这里，
+> 笔记里只留两条最高频的。**口径不变**，只是换了住处。
+
+* ⚠⚠ 三段 ①② **签名不许有 `AssetManager`**（`verify_sceneio.py` D 组静态盯着）。
+* 存档原子写 `tmp → fsync → bak → MoveFileExW`，**顺序不能换**（换一处就不是原子的了）。
+* `sceneHash` = guid **排序后**的顺序喂 FNV（不排序 = 加一个实体就全变）。
+* ⚠⚠ `World` 池子是 **swap-and-pop** → 夹具不"把父排最后"时，`parentGuid` 那个 bug
+  **测不出来**（这条本身就是"夹具设计决定能不能测出 bug"的样例）。
+* 应用存档**复用** `entityApply*`；另写一套白名单 = 第二套解析，**漏改不报错**。

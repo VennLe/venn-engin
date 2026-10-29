@@ -213,12 +213,16 @@ def check_project(root, name, kind, fails, prefix):
     with open(rj, encoding="utf-8") as f:
         r = json.load(f)
     keys = [k for k in r if not k.startswith("_") and k != "version"]
-    # 25 = 22 个 enable 参数（`render::enableParamCount()`）
+    # 27 = 24 个 enable 参数（`render::enableParamCount()`）
     #      + 3 个数值档位项（E26：shadow.cascades / shadow.distance /
     #        lshadow.maxLights，见 `render::qualityValueCount()`）。
     # ⚠ 这个数字会随特性增减而变 —— 变了测试就红，**这是有意的**：
     #   它的意思是"启动器写的键数已经和引擎对不上了，去核对一遍"。
-    want = 25
+    # 2026-10-29：22 → 24。核对过，多出来的两条是真实特性（角色光 /
+    #   自动曝光那一批 A 类着色特性），不是垃圾键 —— 引擎自己的
+    #   `verify_project`（J11）按 `enableParamCount()+qualityValueCount()`
+    #   动态算，一直是 PASS，所以是**这里记账过时**，不是引擎多写了。
+    want = 27
     if len(keys) != want:
         fails.append("%s9 render.json 写了 %d 个键，期望 %d（引擎 enable 参数数）"
                      % (prefix, len(keys), want))

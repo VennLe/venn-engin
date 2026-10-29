@@ -467,6 +467,11 @@ ALLOW_EXACT = {
     #      正式入口是 Inspector ▸ Joint 页签上的复选框；这条给
     #      `verify_joints` 做"开了才有 / 关了就没了"的对照。
     "MYVK_JOINT_GIZMOS",
+    #    · `MYVK_CHARACTER_WINDOW=1` —— 启动即打开角色详情窗口（Persona）。
+    #      正式入口是"右键视口 → Add → Player"，而 Pose Mode 的验收跟
+    #      "有没有先加过一个玩家"无关，脚本不该为开个窗口去点菜单。
+    #      （2026-10-29 补登记：这是 R8 / Pose Mode 留下的欠账，D 组一直红着。）
+    "MYVK_CHARACTER_WINDOW",
 }
 # ③ 诊断 dump（`*_DBG`）。`*_DUMP` 同义：只打日志、不改行为，
 #    与 `MYVK_PHYS_DUMP=<N>`（每 N 帧一行 `PHYS-BODY`）是同一类。

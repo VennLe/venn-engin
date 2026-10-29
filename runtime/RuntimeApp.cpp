@@ -564,7 +564,11 @@ void RuntimeApp::onInit() {
     // ---- 界面语言（U7）----
     // 词典与查表在 `engine/i18n/`（与编辑器**同一份**），这里只决定"用哪种"。
     //
-    // 优先级：`MYVK_LANG` > `--language` / `MYVK_RUNTIME_LANGUAGE` / game.json。
+    // 优先级：`MYVK_LANG` > `--language` / `MYVK_RUNTIME_LANGUAGE` / game.json
+    //         > **系统语言**（2026-10-29）。
+    // 最后一档是新的：`language` 字段缺省 / 空 / `auto` / `system` 时不再
+    // 掉到英文，而是问 `i18n::systemLanguage()` —— 中文 Windows 上装好就
+    // 是中文。原来写死 `"en"` 的那份默认值等于"默认值不对"。
     // ⚠ `MYVK_LANG` 不合 `MYVK_RUNTIME_*` 前缀纪律，是**唯一**的例外：
     //   路线图 U7 的验收条款就是按这个名字写的（`MYVK_LANG=zh`），
     //   它已在 `check_feature_surface.py` 的 ALLOW_EXACT 里显式登记。
@@ -572,22 +576,31 @@ void RuntimeApp::onInit() {
     //
     // ⚠ 认不出的值**不改语言**并打 WARN：静默回退英文会让"game.json 拼错"
     //   看起来像"配了但不生效"，那是最难查的一类。
+    //   （空 / auto 是**认得的**值，不走 WARN 那条路。）
     {
         const char* envLang = std::getenv("MYVK_LANG");
-        const char* effective =
-            (envLang && *envLang) ? envLang : m_cfg.language.c_str();
-        const int idx = i18n::languageFromCode(effective);
+        const std::string configured =
+            (envLang && *envLang) ? std::string(envLang) : m_cfg.language;
+        const char* src = (envLang && *envLang)          ? "env:MYVK_LANG"
+                          : configured.empty()           ? "system"
+                          : "config";
+        // "auto" / "system" 是给人写在 game.json 里的自动档
+        const bool autoLang =
+            configured.empty() || configured == "auto" || configured == "system";
+        const int idx = autoLang ? i18n::systemLanguage()
+                                 : i18n::languageFromCode(configured.c_str());
         if (idx < 0) {
-            VK_LOG_WARN("I18N-BADLANG value='%s' — 保留 %s（可用：en | zh）",
-                        effective, i18n::languageCode(i18n::language()));
+            VK_LOG_WARN("I18N-BADLANG value='%s' — 保留 %s（可用：en | zh | auto）",
+                        configured.c_str(), i18n::languageCode(i18n::language()));
         } else {
             i18n::setLanguage(idx);
         }
         // 锚点（U7 验收）：中文模式是真实条数，英文模式**必须是 0**
         // —— 表根本没构造，这就是"英文 = 零开销"的观测量。
-        VK_LOG_INFO("I18N-KEY lang=%s count=%zu",
+        // `src` 说明这一票是谁投的（system / config / env）。
+        VK_LOG_INFO("I18N-KEY lang=%s count=%zu src=%s",
                     i18n::languageCode(i18n::language()),
-                    i18n::translationCount());
+                    i18n::translationCount(), src);
     }
 
     // 全屏在这里切（窗口已经存在；setFullscreen 会记住窗口模式下的几何）

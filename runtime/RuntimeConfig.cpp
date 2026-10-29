@@ -418,13 +418,17 @@ RuntimeConfig parseRuntimeConfig(const std::vector<std::string>& args) {
                     cfg.audio.maxVoices, cfg.audio.retryOnFailure ? 1 : 0);
     }
 
+    // `language` 打的是**配置值**不是生效值：空 = auto（跟随系统）。
+    // 生效到哪一种语言由 `I18N-KEY lang=…` 那行回答 —— 两行各管一件事，
+    // 下次"我配了 auto 怎么还是英文"先看 I18N-KEY，再看这台机器的界面语言。
     VK_LOG_INFO("GAME-CONFIG scene='%s' window=%dx%d fullscreen=%d "
                 "maxFps=%d unfocusedFps=%d timeScale=%.2f language=%s "
                 "quality=%s startState=%s selftest='%s' verbose=%d "
                 "uiDoc='%s' source='%s'",
                 cfg.scenePath.c_str(), cfg.width, cfg.height,
                 cfg.fullscreen ? 1 : 0, cfg.maxFps, cfg.unfocusedFps,
-                static_cast<double>(cfg.timeScale), cfg.language.c_str(),
+                static_cast<double>(cfg.timeScale),
+                cfg.language.empty() ? "auto" : cfg.language.c_str(),
                 cfg.quality.c_str(), cfg.startState.c_str(),
                 cfg.selftest.empty() ? "-" : cfg.selftest.c_str(),
                 cfg.verbose ? 1 : 0, cfg.uiDoc.c_str(),
@@ -453,7 +457,7 @@ const char* runtimeHelpText() {
              "  --unlocked            等价于 --fps 0\n"
              "  --frames <n>          跑满 n 帧后退出（冒烟测试）\n"
              "  --time-scale <f>      时间缩放（0 = 停住，1 = 正常）\n"
-             "  --language <en|zh>    界面语言\n"
+             "  --language <en|zh>    界面语言（不给 = auto = 跟随系统语言）\n"
              "  --ui-doc <path>       UI 文档（.ui.json）；不给 = 不画界面层\n"
              "  --start-state <s>     boot | mainmenu | playing（默认 playing）\n"
              "  --verbose             每 60 帧打一行 GAME-LOOP\n"

@@ -1,5 +1,5 @@
 {
-  "_comment": "__PROJECT_NAME__ 的运行时出厂配置。优先级: 命令行 > 环境变量(MYVK_RUNTIME_*) > 本文件 > 内置默认。画质不在这里 —— 见 config/render.json。",
+  "_comment": "__PROJECT_NAME__ 的运行时出厂配置。优先级: 命令行 > 环境变量(MYVK_RUNTIME_*) > 本文件 > 内置默认。language: auto = 跟随系统界面语言（en / zh 可写死）。画质不在这里 —— 见 config/render.json。",
   "scene": "scenes/main.json",
   "title": "__PROJECT_NAME__",
   "width": 1280,
@@ -8,7 +8,7 @@
   "maxFps": 60,
   "unfocusedFps": 15,
   "timeScale": 1.0,
-  "language": "zh",
+  "language": "auto",
   "startState": "playing",
   "audio": {
     "enabled": true,

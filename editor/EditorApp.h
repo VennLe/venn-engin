@@ -367,6 +367,10 @@ private:
     // 把当前主题 / 语言真正应用下去（启动读盘后、以及下拉框改动后都要调）
     void applyAppearance();
     bool m_confirmResetAll = false;   // Reset All 的二次确认状态
+    // 界面语言是**谁定的**（"system" / "prefs" / "env" / "automation"）。
+    // 只给 `EDITOR-LANG lang=… src=…` 那行日志用：没有它，"为什么是中文"
+    // 与"为什么是英文"在日志里长得一模一样，而这两个结论的排查方向相反。
+    const char* m_langSrc = "system";
     // FeatureUIGen 的参数变更钩子（FTR-UI 日志 + 个别参数的副作用）。
     void onFeatureParamChanged(const char* paramId);
     // E03：用户改过渲染参数 → 需要落盘（"首次改参数时才写文件"）。

@@ -49,6 +49,30 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import launcher_kit as kit  # noqa: E402
 
 
+def launcher_expected_size():
+    """启动器的期望客户区尺寸 —— 与 `LauncherApp::onInit` 逐字同一条公式。
+
+        winW = min(1400, workW * 0.94)
+        winH = min(880,  workH * 0.90)
+
+    （常量见 `launcher/LauncherApp.cpp` 的 kWindowW/kWindowH/kWinWPct/kWinHPct。）
+    ⚠ 这是**唯一**该复写这个公式的地方：把 1400×880 写死在断言里，1366×768
+      的笔记本上必红 —— 那里会被工作区夹小，而夹取本身也是要验的行为。
+    """
+    import ctypes
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    r = RECT()
+    # SPI_GETWORKAREA = 0x0030（不含任务栏）
+    ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0)
+    ww, wh = r.right - r.left, r.bottom - r.top
+    want = (min(1400, int(ww * 0.94)), min(880, int(wh * 0.90)))
+    return want, (ww, wh)
+
+
 def main():
     if not os.path.isfile(kit.LAUNCHER) or not os.path.isfile(kit.EDITOR):
         kit.log("结果: FAIL: Launcher.exe / Editor.exe 不存在（先 make build）")
@@ -83,15 +107,25 @@ def main():
 
     editor_hwnd = 0
     try:
-        # ---- O0 窗口尺寸 = 1080×720（用户 2026-10-20 定的 16:9 版式）----
+        # ---- O0 窗口尺寸 = min(1400×880, 工作区 × 0.94 / 0.90) ----
         #
         # ⚠ 量的是**客户区**（`GetClientRect`），不是外框：外框含标题栏和
         #   边框，会随 DPI 缩放变化，拿它做断言在 125%/150% 缩放下必红。
+        #
+        # ⚠ 2026-10-29 改判据：2026-10-27 用户第 1 条把版式从 1080×720
+        #   改成 **1400×880**（见 LauncherApp.cpp 的 kWindowW/H），这条断言
+        #   一直停在 1080×720 上红着。现在按**同一条公式**算期望值：写死
+        #   1400×880 会在 1366×768 的笔记本上必红（那里会被工作区夹到
+        #   1284×691），而"夹取逻辑本身"也是要验的东西。
+        want_wh, work_wh = launcher_expected_size()
         cw, ch = kit.client_size(hwnd)
-        if (cw, ch) != (1080, 720):
-            fails.append("O0 启动器客户区 %dx%d，期望 1080x720" % (cw, ch))
+        if (cw, ch) != want_wh:
+            fails.append("O0 启动器客户区 %dx%d，期望 %dx%d（工作区 %dx%d）"
+                         % (cw, ch, want_wh[0], want_wh[1], work_wh[0],
+                            work_wh[1]))
         else:
-            kit.log("CHECK O0 launcher client size 1080x720 OK")
+            kit.log("CHECK O0 launcher client size %dx%d OK（工作区 %dx%d）"
+                    % (cw, ch, work_wh[0], work_wh[1]))
 
         # ---- 走完向导（与 M2 同一条路径，这里不重复断言，只推进）----
         if not kit.click_anchor(hwnd, tap, "LAUNCH-TYPE-1"):

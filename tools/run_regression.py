@@ -540,6 +540,13 @@ DEFAULT = [
     # 出厂默认值：吸附全开 / 栅格 1m 且放大 / 存档仍能覆盖默认。
     # 判据 = onInit 末尾那行 EDITOR-STATE（结构化，不数像素里的对勾）。
     "verify_editor_defaults",
+    # ---- 2026-10-29：出厂界面语言 = 系统语言 ----
+    # 「编辑器 / 启动器 / 游戏默认说什么语言」。这条最容易假绿：改了
+    # i18n 的初值却没人真跑过一次 —— 症状是"启动还是英文"，而所有
+    # 中英映射用例照样绿（它们都显式写了 language）。
+    # 判据 = I18N-KEY / EDITOR-LANG / LAUNCHER-LANG 三行日志里的 lang+src，
+    # 外加一个 Python 侧独立取的 GetUserDefaultUILanguage 当 oracle。
+    "verify_system_lang",
     # 胶囊线框的**形状规范性**：正对投影下量轮廓的宽高比 / 对称 / 桶身直段 /
     # 球冠收窄；副用例把"对 1m 立方体拟合出来的其实是球（halfHeight=0）"
     # 钉成事实。
@@ -1360,6 +1367,13 @@ TRIGGERS = {
     # 所以这里必须另有非全横切的登记）；存档覆盖走 EditorLayoutIO.*。
     "verify_editor_defaults": ["editor/EditorContext.h",
                                "editor/EditorLayoutIO.*"],
+    # 出厂语言：判定全在 i18n（初值）+ 三个入口各自那一段应用逻辑。
+    # ⚠ `editor/EditorApp.cpp` **故意不登记**（它是横切级的巨型文件，
+    #   本仓库的规矩是"改它全量"），所以那条路径靠全量兜底。
+    "verify_system_lang": ["engine/i18n/**",
+                           "runtime/RuntimeApp.cpp",
+                           "runtime/RuntimeConfig.*",
+                           "launcher/LauncherApp.cpp"],
     # 胶囊线框的顶点/边数组全部由 ColliderView.* 自己生成（点与边都在这里
     # 算完直接喂 AddLine）；拟合半径那一路在 engine/physics/**（= GLOBAL）。
     "verify_capsule_shape":  ["editor/ColliderView.*"],

@@ -108,6 +108,20 @@ namespace {
 // 它的 ImGui 窗口名；真正的定义在文件后半段（托盘那一节）。
 std::string trayWindowName(const char* id);
 
+// 出厂界面语言 = 当前电脑的**系统语言**（2026-10-29）。
+// 例外：自动化运行（`MYVK_FRAMES` / `MYVK_NO_WINDOW_SAVE`）返回英文 ——
+// 屏幕与像素判据要确定性文本，跑在中文 Windows 上的回归不该因为系统
+// 语言换词。`MYVK_EDITOR_LANG` 不在这里判：它比"出厂"更高一层，
+// 在 `applyAppearance()` 的末尾生效（那里已经压过存档值）。
+//
+// 只有两处用：启动时的初值、`Reset All` 的落点 —— 两处必须是同一个答案，
+// 否则"重置默认"会把语言重置到一个启动时根本不会出现的值。
+int factoryLanguage() {
+    if (editorLayoutAutomationRun() && !std::getenv("MYVK_EDITOR_LANG"))
+        return static_cast<int>(i18n::Language::English);
+    return i18n::systemLanguage();
+}
+
 // 布局常量（像素）。主体四个面板（Hierarchy/Content/Viewport/Inspector）
 // 已交给 SplitLayout 分栏树按比例自适应；这里只保留横贯全宽的固定条
 // 与浮动调试面板的尺寸常量。
@@ -1380,6 +1394,12 @@ void EditorApp::onInit() {
     core::setLogHook(&notificationLogHook);
     m_notifications->loadFromDisk();
     registerConsoleCommands();
+    // ---- 出厂界面语言 = 当前电脑的系统语言（2026-10-29）----
+    // 优先级全链在 `i18n/I18n.h` 文件头：env > 存档 > **系统**。
+    // ⚠ 放在 `applyPrefsFromDisk()` **之前**：下面那道读盘会把存档里
+    //   显式写下的 language 应用一遍，那是用户的选择，必须盖掉这里。
+    m_langSrc = editorLayoutAutomationRun() ? "automation" : "system";
+    setLanguage(factoryLanguage());
     // E17：偏好读盘（无存档 / 自动化 → 出厂值；见 EditorLayoutIO 的守卫）
     applyPrefsFromDisk();
     // 主题 / 语言读回来之后要**真应用一次** —— 窗口已经建好了，样式是
@@ -8564,7 +8584,11 @@ const std::vector<EditorApp::PrefItem>& EditorApp::prefsTable() {
              for (int i = 0; i < ui::themeCount(); ++i) o.push_back(ui::themeName(i));
              return o;
          }()},
-        {"language", "Language", "Appearance", false, 0.0f, 0.0f, 0.0f, nullptr,
+        // ⚠ `def` 不是 0：语言这一项的"默认"是**跟随系统**（`factoryLanguage`
+        //   与 onInit 的初值同一个答案）。写 0 的话 `Reset All` 会把人送回
+        //   英文，而下次冷启动又是中文 —— 重置到"一个启动时不会出现的值"。
+        {"language", "Language", "Appearance", false,
+         static_cast<float>(factoryLanguage()), 0.0f, 0.0f, nullptr,
          []() -> int { return language(); },
          [](int v) { setLanguage(v); }, nullptr,
          [] {
@@ -8843,14 +8867,23 @@ void EditorApp::applyAppearance() {
         const bool zh = (c == 'z' || c == 'Z' || c == 'c' || c == 'C' ||
                          c == '1');
         setLanguage(zh ? 1 : 0);
-        VK_LOG_INFO("EDITOR-LANG %s", zh ? "zh" : "en");
+        m_langSrc = "env";
     }
+    // 一行把"最后用的是哪种语言 + 谁定的"钉进日志。`src` 不能省：
+    // `lang=en` 在"系统是英文"和"自动化默认英文"两种情况下字面相同，
+    // 但排查方向完全相反。
+    VK_LOG_INFO("EDITOR-LANG lang=%s src=%s", i18n::languageCode(language()),
+                m_langSrc);
 }
 
 void EditorApp::applyPrefsFromDisk() {
     std::vector<std::pair<std::string, double>> kv;
     if (!loadEditorPrefs(kv)) return;   // 无存档 / 自动化 → 出厂值
     for (const auto& [key, val] : kv) {
+        // 语言是**用户的选择**，来源标成 prefs —— 否则日志里"跟随系统"
+        // 与"存档里选过"长得一样，而"我明明存了英文为什么还是中文"
+        // 这类问题的答案只在 `src` 上。
+        if (key == "language") m_langSrc = "prefs";
         for (const PrefItem& it : prefsTable()) {
             if (key != it.id) continue;
             if (!it.options.empty()) {
@@ -8879,6 +8912,19 @@ void EditorApp::savePrefsToDisk() {
     std::vector<std::pair<std::string, double>> kv;
     for (const PrefItem& it : prefsTable()) {
         if (!it.options.empty()) {
+            // ⚠ `language` 是**唯一**要"等于出厂默认就不写"的一项。
+            // 别的原因都对不上：其它选项的出厂默认是常数，写进去无害；
+            // 而语言的出厂默认是**系统语言** —— 写成具体下标等于把
+            // "跟随系统"变成"钉死当前这一个"，用户之后改系统语言不会再生效，
+            // 而这一切发生在他**没碰过**那个下拉框的情况下。跳过它，
+            // 存档里没有 `language` 键 = 下次启动继续跟随。
+            // ⚠ 必须 `strcmp`，不能 `it.id == "language"` —— `id` 是
+            //   `const char*`，那样写比的是**指针**。字符串池可能让它
+            //   偶然成立，也可能不成立（2026-10-29 第一版就是静默不成立，
+            //   症状：prefs 里照样写进了 language，把"跟随系统"钉死）。
+            if (std::strcmp(it.id, "language") == 0 && it.getChoice &&
+                it.getChoice() == factoryLanguage())
+                continue;
             kv.emplace_back(it.id,
                             it.getChoice ? static_cast<double>(it.getChoice())
                                          : 0.0);
