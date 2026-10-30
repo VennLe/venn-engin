@@ -238,6 +238,90 @@ EXPECTED = [
     "segment_index_first",
     "segment_index_last",
     "curve_two_entries_agree",          # 两个入口（带/不带容器）结果逐位相同
+    # ---- 步态生成器（2026-10-30）：一份手工 K 帧表 → 参数化函数 ----
+    # 这一组的判据全在**毫米**上：脚滑 3 mm 与滑 30 mm 在 1080p 里是同一只脚，
+    # 而后者毁掉整段走路。K 帧表那条"承重期脚掌 X/Z 完全不动"的硬规则，
+    # 手工 K 帧**做不到**（关键帧之间的插值不认约束），只能靠这里量出来。
+    "gait_rig_mixamo",          # Mixamo 骨名 → 19 个角色全解析出来
+    "gait_rig_rigify",          # Rigify 骨名（thigh.L / shin.L）→ 同样 19 个
+    "gait_rig_shin_idx",        # 小腿必须落到 shin.L，不是 thigh.L（包含匹配会错）
+    "gait_rig_foot_idx",        # 踝落到 foot.L
+    "gait_rig_rigify_ok",       # walkable 且没有缺失角色
+    "gait_rig_nonhuman",        # 只有手臂的骨架 → 明确不可走（不静默生成）
+    "gait_build_ok",            # 生成成功
+    "gait_duration",            # 48 帧 @24fps = 2.000 s
+    "gait_tracks",              # 17 根骨旋转 + 髋平移 = 18 条轨
+    "gait_keys",                # 18 × 49 = 882 个键（少一根骨就掉一截）
+    "gait_bob_range",           # 重心上下峰峰 = 2×bob = 0.06 m
+    "gait_sway_range",          # 左右峰峰 = 2×sway
+    "gait_foot_lift",           # 摆动相抬脚峰值 = footLift
+    "gait_slide_mm",            # 承重期**侧向**漂移（毫米）
+    "gait_vert_mm",             # 承重期**竖直**漂移（毫米）
+    "gait_line_mm",             # 承重期前向偏离匀速直线（毫米）
+    "gait_loop_mm",             # 闭合帧与首帧（无缝循环）
+    "gait_mirror_mm",           # 帧 25 = 帧 1 的左右镜像
+    "gait_speed_identity",      # 承重脚后退速率 == nominalSpeed（否则每步滑 1 cm）
+    "gait_reach",               # max|踝−髋| / 腿长 < 1（>1 就是"够不着 → 腿直 → 滑"）
+    "gait_leg_swing",           # 触地帧左脚在**前**（0.6 m，腿的相位对）
+    "gait_arm_counter",         # 同时左臂在**后**（反相）；两条符号一起才是判据
+    "gait_fwd_drift_mm",        # 原地走：髋前向零位移（treadmill）
+    "gait_arm_down",            # 夹具的手臂本来就垂着 → 中和修正量必须是 0
+    "gait_rest_mirror",         # 夹具静止姿势左右对称 → 镜像地板是 0
+    "gait_blocking_keys",       # blocking 模式只打 9 个关键姿态
+    "gait_blocking_extreme",    # 且全部标成 Extreme
+    "gait_blocking_bob",        # 9 帧也够走完两个波峰波谷
+    "gait_blocking_slides",     # **对照组**：只打关键帧时确实滑（8.8 mm）
+    "gait_invariance",          # 整具骨架转 37° + 平移 → 读数不变（没写死坐标轴）
+    "gait_invariance_mm",       # 毫米级读数同样不变
+    # ---- 步幅匹配（A4，2026-10-30）：移动速度 → 播放速率 ----
+    # 生成器解决了"这段动画自己多少速度"，这一组解决"播它的时候按几倍速"。
+    # 判据的核心是**两条独立采样路径给出同一个数**：生成器（EditClip +
+    # resolveEditTracks）报 0.5984，运行时（AnimationClip + samplePose）量
+    # 0.5984 —— 差 2e-5。它们一分开，症状是"生成报告说不滑、Play 里在滑"。
+    "stride_edit_ok",           # 刚生成的编辑片段能量出步速
+    "stride_edit_speed",        # 量出来的 == 生成器报的 nominalSpeed
+    "stride_edit_duty",         # 单脚承重占比 ≈ stanceFrac（0.62）
+    "stride_clip_ok",           # 转成运行时 clip 后同样能量
+    "stride_clip_speed",        # 且换一条采样路径数不变（判据的判据）
+    "stride_idle_rejected",     # 静止/挥手 clip 必须**明确拒绝**，不是量出 0
+    "stride_nonhuman_rejected", # 非人形骨架同样拒绝
+    "stride_rate_identity",     # 速度 == 自然步速 → 1.0 倍
+    "stride_residual_identity", # 且残差 0（真的不滑，不是"看起来不滑"）
+    "stride_identity_unclamped",# 1.0 不该被判成"夹住"
+    "stride_rate_1p5x",         # 1.5 倍速度 → 1.5 倍播放
+    "stride_residual_1p5x",     # 残差仍为 0
+    "stride_rate_clamped",      # 10 倍速度 → 夹到上限 1.7
+    "stride_residual_clamped",  # 残差 488%（夹住之后**必须**承认还在滑）
+    "stride_clamped_flag",      # 夹住标志位
+    "stride_rate_nospeed",      # 没量到步速 → 原样 1.0（行为与引入前一致）
+    "stride_loco_walk_state",   # 速度落在 walk 区间 → 状态机选 walk
+    "stride_loco_rate",         # 状态机算出的速率 == 1.5
+    "stride_loco_written",      # 并且**真的写进** sk.speed（接线接上了）
+    "stride_loco_matched",      # 本帧确实做了步幅匹配
+    "stride_loco_clamped_rate", # 3 倍速 → 速率夹在 1.7
+    "stride_loco_clamp_residual",# 残差 > 0.3：夹住时不许声称不滑
+    "stride_loco_off_rate",     # **对照组**：关掉开关 → 1× 播放
+    "stride_loco_off_written",  # 对照组的 speed 也是 1.0
+    "stride_loco_idle_state",   # 站着不动 → idle 态
+    "stride_loco_idle_rate",    # 播放速率**回落**到 1×（不然待机在快进）
+
+    # ---- A4b 相位速率曲线 / 斜坡（2026-10-30）----
+    # 曲线：均值 1（不改步频）、摆动区恒 1、整圈闭合、把起伏压平。
+    "stride_edit_air",          # 标准走路没有腾空（腾空判据的**阴性**对照）
+    "stride_edit_span",         # 摆幅法 × 2 / 周期 ≈ 承重期脚速（交叉校验）
+    "stride_curve_ok",
+    "stride_curve_bins",        # 承重 bin 够多（曲线才有意义）
+    "stride_curve_mean",        # gain 的时间平均 = 1（不改步频）
+    "stride_curve_swing_gain",  # 摆动区 gain 恒为 1
+    "stride_curve_loop",        # 整圈推进后相位回到起点（不漂）
+    "stride_curve_spread_off",  # **对照组**：不开曲线时起伏确实存在
+    "stride_curve_flattens",    # 开了之后起伏被压到 1/4 以下
+    # 斜坡：rate 的分子必须是水平投影；竖直残差只报不修。
+    "stride_slope_rate_ratio",  # 用 3D 模长 → 快 1/cosθ 倍（错的那个）
+    "stride_slope_vert",        # 竖直残差 = v·tanθ / nominal
+    "stride_slope_zero",        # 平地必须正好 0（否则警告没人看）
+    "stride_slope_cap",         # 坡角夹上限（80° 与 75° 同值）
+    "stride_slope_rate_same",   # 坡度**不改变** rate（不二次投影）
 ]
 
 TEST_RE = re.compile(r"ANIM-TEST\s+(\S+)\s+actual=(\S+)\s+expected=(\S+)\s+"

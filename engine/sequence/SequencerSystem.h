@@ -39,6 +39,7 @@
 #include "sequence/SequenceAsset.h"
 
 #include <memory>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -92,6 +93,23 @@ public:
     const std::string& lastSequenceName() const { return m_lastName; }
     ecs::Entity activeEntity() const { return m_active; }
 
+    // ---- 多机位切镜（2026-10-30；运镜体系 §七）----
+    //
+    // 本帧播放头落在哪个机位 marker 上。宿主拿这三样去驱动
+    // `CameraSystem::setDirectorCamera` / `blendCut`。
+    //
+    // ⚠⚠ **本类仍然不碰 CameraSystem**（见文件头那条"不持有 CameraSystem*"）。
+    //   它只说"该用哪台机位"，怎么切是宿主的事 —— 编辑器视口是自由相机，
+    //   同一条结论走另一条应用路径。
+    //
+    // ⚠ 没有 marker（老资产）时三个值恒为 `-1 / 0 / 0`，宿主不会做任何事 →
+    //   **老资产的行为逐位不变**。
+    int shotIndex() const { return m_shotIdx; }
+    // marker 绑定的相机 guid；0 = 这一段落回关键帧轨（或压根没有 marker）。
+    std::uint64_t shotCameraGuid() const { return m_shotCam; }
+    // 这次切换要混合多久（秒）；0 = 硬切。
+    float shotBlendSeconds() const { return m_shotBlend; }
+
     // 本帧派发出去的事件（`kind` / `payload` 的拷贝，供 UI 与将来的
     // C6 脚本导演 API 消费）。每帧开头清空。
     struct FiredEvent {
@@ -137,11 +155,22 @@ private:
 
     void fire(scene::Scene& scene, ecs::Entity e, const SeqEvent& ev);
 
+    // 按播放头算本帧的机位 marker。`logChange` 时在**下标变了**那一刻打一条
+    // `SEQ-SHOT`（每帧打会把日志刷死，而"切了没有"正是要看的）。
+    void resolveShot(const SequenceAsset& seq, float t);
+
     ecs::Entity m_active{};
     int m_lastRunning = 0;
     float m_lastPlayhead = 0.0f;
     std::string m_lastName;
     std::vector<FiredEvent> m_fired;
+
+    // 多机位（见 accessors 那一段）
+    int m_shotIdx = -1;
+    std::uint64_t m_shotCam = 0;
+    float m_shotBlend = 0.0f;
+    // 上一次打日志时的 marker 下标（−2 = 还没打过，用来保证首帧也打一条）
+    int m_shotLogged = -2;
 
     // 用 unique_ptr 存：`CameraPose` 需要完整定义，而头里只前向声明了它
     // （include `scene/CameraSystem.h` 会把 scene 头拖进每个用组件的地方）。

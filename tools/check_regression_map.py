@@ -382,9 +382,13 @@ run("engine/scene/Prefab.cpp → 预制体", OLD,
 # 等于运行时采样的那一份。
 # ⚠ 数值侧（`rt_*` 那 9 条往返断言）住在 `SequenceSelfTest.cpp`，跑
 #   `--selftest sequence` 才执行 —— 端到端那条**不能**替代它。
+# 2026-10-30 起是**四条**：多机位 marker（`shots` 数组）的解析 / 排序 /
+# 区间语义 / 写回往返全在这个文件里，`verify_multi_cam` 的 A 组
+# （`seq_shot_*` 24 条）和 B 组（存盘往返）都读它。
 run("engine/sequence/SequenceAsset.cpp → 过场时间轴 × 轨道编辑器", OLD,
     with_change("engine/sequence/SequenceAsset.cpp"),
-    want={"verify_sequencer", "verify_timeline_editor", "verify_curve_editor"})
+    want={"verify_sequencer", "verify_timeline_editor", "verify_curve_editor",
+          "verify_multi_cam"})
 # 2026-10-26（C2 第二步）：对话层（`engine/dialogue/**`）。
 # ⚠ 数值侧（97 条 `DLG-TEST`）住在 `DialogueSelfTest.cpp`，跑
 #   `--selftest dialogue` 才执行 —— 端到端那条**不能**替代它。
@@ -418,9 +422,13 @@ run("editor/DialogueEditorWindow.cpp → 剧本编辑器 × 中文化", OLD,
 # 期望两条：除了自己那条，还有 verify_i18n_coverage —— 它扫描 `editor/*.cpp`
 # 里的界面字面量，而新面板一口气加了 60 条 TR 词条（缺了就是"面板一半英文"）。
 # ⚠ 这条**必须**留着：新加面板最容易漏的就是词条，而漏了不崩。
+# 2026-10-30：多机位 marker 的**第三轨**（机位）`@Track::Shots`）
+# 和注入脚本 verbs（`addshot` / `setshotcam` / `setshotblend` /
+# `setshotlabel` / `sel:shots`）都在这个文件里 —— `verify_multi_cam`
+# 的 B 组就是驱动它们。所以现在是**三条**。
 run("editor/TimelineEditorWindow.cpp → 时间轴编辑器 × 中文化", OLD,
     with_change("editor/TimelineEditorWindow.cpp"),
-    want={"verify_timeline_editor", "verify_i18n_coverage"})
+    want={"verify_timeline_editor", "verify_i18n_coverage", "verify_multi_cam"})
 # 2026-10-28（#318）：曲线编辑器面板本体。
 # 期望两条：除了自己那条，还有 verify_i18n_coverage —— 它扫描 `editor/*.cpp`
 # 里的界面字面量，而新面板一口气加了 19 条 TR 词条（缺了就是"面板一半英文"）。
@@ -527,9 +535,12 @@ run("engine/animation/Curve.cpp → 曲线求值 × 画布", OLD,
 # 与骨骼曲线（自己那条 9 组端到端）。
 run("engine/animation/ClipEdit.cpp → 骨骼打帧 × 姿势模式", OLD,
     with_change("engine/animation/ClipEdit.cpp"),
+    # 2026-10-30 加 verify_gait_cycle：生成器把结果写进 `EditClip` 再落盘，
+    # 而那个脚本是**从盘上读回**来当独立 oracle 的 —— 存盘格式一变，
+    # "逐帧烘焙真的有 49 个键"这条判据读到的就不是同一份东西了。
     want={"verify_pose_mode", "verify_dope_sheet", "verify_bone_curves",
           "verify_anim_runtime", "verify_character_import",
-          "verify_player_character"})
+          "verify_player_character", "verify_gait_cycle"})
 # `Pose.cpp` 是**全动画链的地基**（采样 / FK / 混合），ClipEdit 只是叠在它
 # 上面的一层。⚠ 并集里没有 verify_curve_editor / verify_timeline_editor /
 #   verify_sequencer —— 它们登记的是 `engine/animation/Curve.*` 与
@@ -547,9 +558,13 @@ run("engine/animation/Pose.cpp → 采样地基 × 姿势模式", OLD,
 #   · C6 `cue()` 本身（脚本点播，与组件共用同一份 `tick`）
 # 所以它必须同时挂在三条用例名下 —— 期望恰好三条。哪天有人只留两条
 # （比如嫌"改时间轴为什么要跑脚本点播"），这条会红。
+# 2026-10-30 起是**四条**：`resolveShot()` 每帧把"这一帧该用哪台机位"
+# 报给宿主（`shotIndex()` / `shotCameraGuid()` / `shotBlendSeconds()`），
+# `verify_multi_cam` 的 C 组断言的 `SEQ-SHOT` 就是它打的。
 run("engine/sequence/SequencerSystem.cpp → 时间轴 × 对话 × 脚本导演", OLD,
     with_change("engine/sequence/SequencerSystem.cpp"),
-    want={"verify_sequencer", "verify_dialogue", "verify_director_api"})
+    want={"verify_sequencer", "verify_dialogue", "verify_director_api",
+          "verify_multi_cam"})
 run("删除 decal.frag → 也算变更", OLD,
     with_change(drop=("assets/shaders/decal.frag",)),
     want={"verify_decals"})
@@ -656,7 +671,12 @@ run("editor/CharacterWindow.cpp → 预览与地形并存", OLD,
           "verify_i18n_coverage", "verify_preview_terrain",
           "verify_char_locomotion", "verify_char_preview",
           "verify_pose_mode", "verify_dope_sheet", "verify_rig_edit",
-          "verify_weights", "verify_constraints"})
+          "verify_weights", "verify_constraints",
+          # GaitCycle（2026-10-30）：WALK CYCLE 那一段参数控件、生成按钮、
+          # 以及 `gait:` 脚本命令都长在这里，而它与按钮共用
+          # `CharacterWindow::generateWalk()` —— 接线断了就只剩自检那条
+          # 纯函数路径还在绿。
+          "verify_gait_cycle"})
 run("engine/render/RenderTarget.cpp → 预览与地形并存", OLD,    with_change("engine/render/RenderTarget.cpp"),
     # 2026-10-25 加 verify_outline：描边的几何缓冲视图
     # （`HdrTarget::geometryView()`）就是在 RenderTarget::apply /
@@ -676,9 +696,13 @@ run("engine/animation/Locomotion.cpp → 默认角色移动", OLD,
     # 记下旧播放头"都长在这个文件里，verify_player_feel 的 R7 盯的就是它。
     # P6 再加 verify_player_jump：jump 态的进入/退出与落地回 idle 也在这台
     # 状态机里（跳跃物理在别处，但"什么时候算跳"在这儿）。
+    # 2026-10-30 A4 再加 verify_gait_cycle：步幅匹配把"移动速度 → 播放速率"
+    # 写进 `sk.speed` 的那段代码就在本文件第 6 节，而那条链的验收（真实资产
+    # 上的自然步速 + UI 锚点）住在 gait 用例里。
     want={"verify_char_locomotion", "verify_anim_runtime",
-          "verify_character_import", "verify_player_character",
-          "verify_player_feel", "verify_player_jump"})
+          "verify_character_import", "verify_gait_cycle",
+          "verify_player_character", "verify_player_feel",
+          "verify_player_jump"})
 # 2026-10-23 P11：默认角色换成 Alicia Solid（128 骨 / 4 段 clip，见
 # docs/alicia_import.md）。**`kDefaultCharacterPath` 这个常量本身长在
 # editor/EditorScene.cpp 里** —— "换默认角色"完全可以只改这一个文件、一点

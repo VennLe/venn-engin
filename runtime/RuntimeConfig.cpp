@@ -159,6 +159,14 @@ void applyGameJson(RuntimeConfig& cfg) {
         pBool("restartOnSwitch", cfg.player.restartOnSwitch);
         pNum("idleTrigger", cfg.player.idleTriggerSec);
         pNum("modelYaw", cfg.player.modelYaw);
+        // A4 步幅匹配。键名刻意与 C++ 字段同名，省得"文档写 strideMatch、
+        // 代码读 stride"这种事（读不到不会报错，只会静默按默认值跑）。
+        pBool("strideMatch", cfg.player.strideMatch);
+        pNum("strideMinRate", cfg.player.strideMinRate);
+        pNum("strideMaxRate", cfg.player.strideMaxRate);
+        pNum("walkStrideSpeed", cfg.player.walkStrideSpeed);
+        pNum("runStrideSpeed", cfg.player.runStrideSpeed);
+        pBool("strideCurve", cfg.player.strideCurve);
     } else if (j.contains("player")) {
         VK_LOG_WARN("GAME-CONFIG game.json 的 player 不是对象，忽略（%s）",
                     path.c_str());

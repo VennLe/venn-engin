@@ -85,6 +85,7 @@ class ContentBrowser;
 class SplitLayout;
 class CharacterWindow;
 class PhysicsPanel;
+class CinematographyPanel;
 class ParticlesPanel;
 class QualitySettingsPanel;   // E26
 class MaterialLibraryPanel;   // 2026-10-24：材质仓库
@@ -211,6 +212,8 @@ private:
     static void panelDrawParticles(EditorApp& a);
     // E26：画质档位面板
     static void panelDrawQuality(EditorApp& a);
+    // 2026-10-30：运镜面板（Cinematography）
+    static void panelDrawCinematography(EditorApp& a);
     // 2026-10-20：编辑模式自带的两张面板（地形 / 植被）
     static void panelDrawLandscape(EditorApp& a);
     static void panelDrawFoliage(EditorApp& a);
@@ -572,6 +575,8 @@ private:
     std::unique_ptr<PhysicsPanel> m_physicsPanel;
     std::unique_ptr<ParticlesPanel> m_particlesPanel;
     std::unique_ptr<QualitySettingsPanel> m_qualityPanel;   // E26
+    // 2026-10-30：运镜面板。只拿 EditorContext（与 PhysicsPanel 同一条纪律）。
+    std::unique_ptr<CinematographyPanel> m_cinePanel;
     // 2026-10-24：材质仓库面板。它要能"把材质设成地形笔刷"，
     // 所以持有一个 LandscapeEditor 裸指针（在构造之后 attach）。
     std::unique_ptr<MaterialLibraryPanel> m_materialLib;

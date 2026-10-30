@@ -51,6 +51,7 @@
 #include "animation/LookAt.h"
 #include "animation/Pose.h"
 #include "animation/SpringBone.h"
+#include "animation/StrideMatch.h"
 #include "animation/TwoBoneIK.h"
 #include "scene/Scene.h"
 
@@ -113,6 +114,24 @@ public:
     const std::string& lastNlaProblem() const { return m_lastNlaProblem; }
     // 本帧最近一次提取用的骨名 + 位移量（ANIM-ROOTMOTION 锚点用）。
     const std::string& lastRootBone() const { return m_lastRootBone; }
+
+    // ---- 相位速率曲线（A4b，2026-10-30）----
+    //
+    // 开着的时候，**推进播放头**这一步不再是 `time += dt * speed`，而是
+    // "按相位积分"：承重期的播放速率按 `nominal / v(φ)` 微调，让脚在世界
+    // 里真的钉住（不只是**平均**不滑）。见 `StridePhaseCurve` 的注释。
+    //
+    // ⚠ 默认**关**。它改变的是所有循环 clip 的播放头轨迹，逐位基线会飘
+    //   （`verify_procanim` / `verify_anim_runtime` 的 time 断言都吃这个）。
+    //   所以它是一个**显式开关**，由应用层打开，而不是"默认更好就默认开"。
+    // ⚠ 与 `Locomotion` 的 `strideMatch` 是**两层**，不是二选一：
+    //   · `strideMatch` 决定 `speed`（常量倍率，收掉平均滑步）；
+    //   · 本开关决定 `speed` 在一圈内怎么分配（收掉残余起伏）。
+    //   只开本开关、不开 strideMatch 时，基准速率是 1× —— 不会被放大。
+    void setStrideCurve(bool on) { m_strideCurveOn = on; }
+    bool strideCurveOn() const { return m_strideCurveOn; }
+    // 本帧真的按相位曲线推进了播放头的实体数（0 而开关是开的 = 量不出曲线）
+    int lastStrideCurveCount() const { return m_lastStrideCurve; }
 
     // ---- 本帧发出的事件（B2，2026-10-26）----
     //
@@ -271,6 +290,23 @@ private:
     // 重新 fopen 一次，20 个角色 = 每秒 1200 次失败的磁盘访问。
     const AnimController* controllerFor(const std::string& path);
     std::map<std::string, std::shared_ptr<AnimController>> m_ctlCache;
+
+    // ---- 相位速率曲线的缓存（A4b）----
+    //
+    // key = 骨架地址 + clip 名 + **时长（毫秒）**。
+    //   带时长是必须的：同一个 clip 名被重新烤过（时长变了）还留旧曲线的话，
+    //   查表用的是旧相位 —— 症状是"改了动画，滑步忽然回来了"，而日志上
+    //   `ANIM-STRIDE-CURVE` 一切正常（它只报"量过"）。
+    // 量一次要采样 60~480 帧全身 FK，所以只在新 clip 时量。
+    // 量失败（不是步态 / 非人形）也**缓存**（存一条 invalid），否则那个实体
+    // 会每帧重量一次。
+    // ⚠ 用 `std::map`：与 maskFor / rigFor 同一个理由（返回引用，rehash 会
+    //   让引用失效）。不过这里返回的是 `const*` 且只在函数内用，风险更低。
+    const StridePhaseCurve* strideCurveFor(const assets::Skeleton& skel,
+                                           const assets::AnimationClip& clip);
+    std::map<std::string, StridePhaseCurve> m_strideCurves;
+    bool m_strideCurveOn = false;
+    int m_lastStrideCurve = 0;
 
     uint64_t m_frames = 0;
     // 真实帧间隔（秒）。**只给物理用**，见 tick 里的说明。

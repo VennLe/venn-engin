@@ -125,6 +125,10 @@ void applyPoseToSceneCamera(scene::Scene& scene, const scene::CameraPose& p) {
     cam.setYaw(p.yaw);
     cam.setPitch(p.pitch);
     cam.setPosition(p.position);
+    // 运镜三通道。⚠ 与 `CameraSystem::apply` 必须逐条同款 —— 时间轴预览
+    // 与运行时各差一行的经典症状是"编辑器里构图偏了一点，出包后正常"。
+    cam.setRoll(p.roll);
+    cam.setShift(p.shiftX, p.shiftY);
 }
 
 // ---------------------------------------------------------------- 选活跃
@@ -184,6 +188,12 @@ void SequencerSystem::tick(scene::Scene& scene, float dt) {
     m_lastPlayhead = 0.0f;
     m_lastName.clear();
     m_hasPose = false;      // 没在播的帧绝不能残留上一帧的姿态
+    // 多机位同理：没在播的帧必须回到"没有 marker"（−1 / 0 / 0）。
+    // ⚠ 不重置的话，过场播完之后宿主会一直把相机钉在最后一个机位上，
+    //   玩家相机永远抢不回来 —— 而日志里什么都看不到。
+    m_shotIdx = -1;
+    m_shotCam = 0;
+    m_shotBlend = 0.0f;
 
     int running = 0;
     ecs::Entity active{};
@@ -224,6 +234,9 @@ void SequencerSystem::tick(scene::Scene& scene, float dt) {
             m_hasPose = true;
         }
         m_lastPlayhead = sc->playhead;
+        // 编辑态也要算 marker：拖播放头时"这一段是哪台机位"必须跟着变，
+        // 否则时间轴编辑器里切镜点看不出效果（与姿态预览同一条道理）。
+        resolveShot(seq, sc->playhead);
         return;
     }
 
@@ -295,6 +308,7 @@ void SequencerSystem::tick(scene::Scene& scene, float dt) {
 
     sc->playhead = next;
     m_lastPlayhead = next;
+    resolveShot(seq, next);
 
     if (m_trace) {
         VK_LOG_INFO("SEQ-TICK seq=%s t=%.3f/%.3f keys=%d events=%d running=%d "
@@ -318,6 +332,37 @@ void SequencerSystem::tick(scene::Scene& scene, float dt) {
         VK_LOG_INFO("SEQ-CUE-END path=%s dur=%.3f",
                     sc->sequencePath.c_str(),
                     static_cast<double>(dur));
+    }
+}
+
+// ---------------------------------------------------------------- 多机位
+
+void SequencerSystem::resolveShot(const SequenceAsset& seq, float t) {
+    const int idx = shotIndexAt(seq, t);
+    m_shotIdx = idx;
+    if (idx < 0) {
+        m_shotCam = 0;
+        m_shotBlend = 0.0f;
+    } else {
+        const SeqShot& sh = seq.shots[static_cast<std::size_t>(idx)];
+        m_shotCam = sh.cameraGuid;
+        m_shotBlend = sh.blendSeconds;
+    }
+
+    // 只在下标**变了**那一刻打日志。每帧打的话，日志里一千行一样的
+    // `SEQ-SHOT i=1` 会把真正的那次切换埋掉，而"切了没有"才是要看的。
+    // ⚠ 初值 −2 保证第一帧（可能就一直落在 marker 0 上）也打一条。
+    if (idx != m_shotLogged) {
+        m_shotLogged = idx;
+        const std::string cam =
+            m_shotCam == 0 ? std::string("keytrack") : ecs::guidToHex(m_shotCam);
+        VK_LOG_INFO("SEQ-SHOT seq=%s t=%.3f i=%d/%d cam=%s blend=%.2f label=[%s]",
+                    seq.name.c_str(), static_cast<double>(t), idx,
+                    static_cast<int>(seq.shots.size()), cam.c_str(),
+                    static_cast<double>(m_shotBlend),
+                    idx >= 0
+                        ? seq.shots[static_cast<std::size_t>(idx)].label.c_str()
+                        : "");
     }
 }
 
@@ -364,6 +409,12 @@ void SequencerSystem::resetRuntime(scene::Scene& scene) {
     m_lastPlayhead = 0.0f;
     m_lastName.clear();
     m_fired.clear();
+    // 多机位也要归零：否则"上一局最后一段是 3 号机"会跨场景粘住，
+    // 而 `m_shotLogged` 不重置的话新场景第一帧的切换不会打日志（用例会红）。
+    m_shotIdx = -1;
+    m_shotCam = 0;
+    m_shotBlend = 0.0f;
+    m_shotLogged = -2;
     // 点播状态也要清：切场景后不该还记着"上一局那段的播放头"。
     // ⚠ 保留 `m_cue` 对象本身（省一次分配），只把播放状态归零 ——
     //   与下面组件"asset 缓存保留"同一条理由。

@@ -112,6 +112,28 @@ public:
         m_pitch = glm::clamp(p, -kPitchLimit, kPitchLimit);
         if (m_fly) syncFlyTarget();
     }
+    // ---- 运镜体系（2026-10-30）新增的三个自由度 ----
+    //
+    // ⚠⚠ 三者默认 0，且 0 时 `viewMatrix()` / `projMatrix()` **逐位回到
+    //   加它们之前的实现**（viewMatrix 在 roll==0 时原样走 kWorldUp 那条，
+    //   projMatrix 在 shift 全 0 时不来碰矩阵）。这是"新通道不许动老画面"
+    //   的唯一验收口径 —— 加了它们之后所有像素断言的基线都不许漂。
+    //
+    // `roll` 单位**弧度**、绕视线转。正 = 相机自身顺时针（画面地平线
+    // 右端下沉）。它不影响 position / target，只改 which-way-is-up。
+    void setRoll(float rad) { m_roll = rad; }
+    float roll() const { return m_roll; }
+
+    // 离轴偏移（单位：**传感器比例**，0.1 = 成像中心挪 10%）。
+    // 正 shiftX = 画面内容整体**向左**走（= 相机往右看却没转头）。
+    // 用在建筑摄影里"相机平视但把楼完整收进画面"，避免仰拍导致的
+    // 垂线汇聚。
+    void setShift(float x, float y) {
+        m_shiftX = x;
+        m_shiftY = y;
+    }
+    float shiftX() const { return m_shiftX; }
+    float shiftY() const { return m_shiftY; }
     float fov() const { return m_fovY; }
     float nearPlane() const { return m_zNear; }
     float farPlane() const { return m_zFar; }
@@ -146,6 +168,11 @@ private:
     float m_zFar = 200.0f;
     float m_moveSpeed = 4.0f;
     bool m_useGlobalInput = true;
+
+    // 运镜新增（默认 0，见上面 setRoll / setShift 的注释）
+    float m_roll = 0.0f;      // 弧度
+    float m_shiftX = 0.0f;    // 传感器比例
+    float m_shiftY = 0.0f;
 
     // ---- 自由飞行模式 ----
     bool m_fly = false;

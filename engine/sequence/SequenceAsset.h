@@ -34,6 +34,7 @@
 
 #include <glm/glm.hpp>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -87,6 +88,44 @@ struct SeqEvent {
     std::string payload;   // 自由文本：音效名 / 台词 id / 旗标名
 };
 
+// ============================================================
+// 多机位 Marker（2026-10-30，运镜体系 §七）
+// ============================================================
+//
+// Blender 的 **Marker Binding**：时间轴上每隔几个 marker 绑一台相机，
+// 播放头越过 marker 就换机位。这是"正打 / 反打 / 特写"唯一好用的做法 ——
+// 把三段运镜分别放在三台相机上各自 K 帧，比把三段塞进一条 key 轨里
+// 再靠 step 断开要清楚得多（也才能给每段配不同的镜头/手持/路径）。
+//
+// ------------------------------------------------------------
+// 三条语义
+// ------------------------------------------------------------
+// ⚠⚠ ① **区间半开 `[t_i, t_{i+1})`**，与 `AnimEvent` / `SeqEvent` 同一条纪律。
+//     闭区间会让"播放头正好压在 marker 上"这段时间每帧都算切换，而
+//     混合动画会被反复重置（表现是切过去的镜头永远在抖）。
+//
+// ⚠⚠ ② **`cameraGuid == 0` 是合法值**，含义是"这一段回到关键帧轨"。
+//     它让"两台实体机位 + 中间一段导演机位"能混排；也让作者删掉一台
+//     相机之后，那段退化成老行为而不是整份资产打不开。
+//
+// ⚠⚠ ③ **第一个 marker 之前（`t < shots[0].t`）不算任何 shot**，
+//     `shotIndexAt` 返回 −1，播放器保持原行为（用关键帧轨）。
+//     不能"取第 0 个 shot 兜住" —— 作者常把第一个 marker 放在 1s（留给
+//     黑场/标题），前面那 1 秒必须还是主轨的镜头。
+struct SeqShot {
+    float t = 0.0f;                 // 从这一时刻起生效（秒）
+    // 绑定的相机**实体 guid**（`ecs::guidToHex` 那个 64 位值）。
+    // ⚠ 存 guid 不存名字：名字可以改、可以重名；guid 在场景重建后仍唯一
+    //   （与 `CameraComponent::lookTargetGuid` 同一个理由）。
+    std::uint64_t cameraGuid = 0;   // 0 = 回落关键帧轨
+    // 从上一机位混到这一台用多久（秒）。0 = **硬切** —— 电影剪辑里
+    // 最常用的是硬切，默认值就该是它。
+    // ⚠ 这里只**声明意图**，真正的混合由 `CameraSystem::blendTo` 执行：
+    //   本文件是纯数据（不认识 Scene / CameraSystem）。
+    float blendSeconds = 0.0f;
+    std::string label;              // 面板与日志用（"A 机位 特写"）
+};
+
 struct SequenceAsset {
     std::string name;        // 诊断用；缺省取文件名
     std::string sourcePath;  // 解析时给的路径（相对或绝对）
@@ -104,14 +143,19 @@ struct SequenceAsset {
 
     std::vector<SeqCameraKey> cameraKeys;   // 已按 t 升序
     std::vector<SeqEvent> events;           // 已按 t 升序
+    // 多机位 marker（已按 t 升序）。**空 = 老行为**：整段只有一条关键帧轨
+    // 驱动一台相机。这是"加了功能但不改老资产"的硬约束所在。
+    std::vector<SeqShot> shots;
 
     bool valid = false;
     std::string error;                       // valid=false 时的原因
     std::vector<std::string> warnings;       // 不致命但要让人知道
 
     bool hasCamera() const { return !cameraKeys.empty(); }
+    bool hasShots() const { return !shots.empty(); }
     float lastCameraTime() const;
     float lastEventTime() const;
+    float lastShotTime() const;
 };
 
 // ---- 解析（纯文本 → 资产；不碰文件系统，自检可以直接喂字符串）----
@@ -167,6 +211,12 @@ bool sampleCamera(const SequenceAsset& seq, float t, SeqCameraKey& out);
 // t 时刻**生效中**的那一帧的下标（`t` 落在 [keys[i].t, keys[i+1].t) 里）。
 // 没有关键帧 → -1；t 早于第一帧 → 0。供 UI 高亮与日志用。
 int cameraKeyIndexAt(const SequenceAsset& seq, float t);
+
+// t 时刻**生效中**的那个机位 marker 的下标（半开 `[t_i, t_{i+1})`）。
+//   · 没有 marker       → −1
+//   · t 早于第一个 marker → −1（**不是** 0：见 `SeqShot` 的文件头 ③）
+//   · t 晚于最后一个     → 最后一个（机位一直保持到片尾，这是剪辑的常识）
+int shotIndexAt(const SequenceAsset& seq, float t);
 
 // 收集落在 `[from, to)` 里的事件下标，**按时间升序**写进 `out`。
 // from > to（跨圈那一段）请调用方拆成两次调用 —— 这里不自作聪明地

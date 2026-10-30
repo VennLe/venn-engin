@@ -2,7 +2,7 @@
 // editor/TimelineEditorWindow.cpp
 //
 // 结构：工具栏（路径 / Reload / Save / New / 时长 / 播放头）
-//      → 轨道区（标尺 + 相机轨 + 事件轨，全自绘）
+//      → 轨道区（标尺 + 相机轨 + 机位轨 + 事件轨，全自绘）
 //      → 属性栏（选中那一项的字段）
 //      → 校验栏。
 //
@@ -184,11 +184,16 @@ bool TimelineEditorWindow::open(const std::string& relPath) {
     m_readOnly = !ok;
     if (!ok) m_error = m_asset.error;
 
-    VK_LOG_INFO("TLED-OPEN path=%s ok=%d keys=%d events=%d dur=%.3f readOnly=%d",
+    // ⚠ `shots=%d` 只许**追加在行尾**：`verify_timeline_editor.py` 的
+    //   `OPEN_RE` 用 `readOnly=(\d+)` 收尾（没有 `$` 锚），追加安全；
+    //   插在中间会把那 5 组既有断言一起弄红。
+    VK_LOG_INFO("TLED-OPEN path=%s ok=%d keys=%d events=%d dur=%.3f readOnly=%d "
+                "shots=%d",
                 relPath.c_str(), ok ? 1 : 0,
                 static_cast<int>(m_asset.cameraKeys.size()),
                 static_cast<int>(m_asset.events.size()),
-                static_cast<double>(m_asset.duration), m_readOnly ? 1 : 0);
+                static_cast<double>(m_asset.duration), m_readOnly ? 1 : 0,
+                static_cast<int>(m_asset.shots.size()));
     revalidate();
     return ok;
 }
@@ -261,10 +266,35 @@ void TimelineEditorWindow::revalidate() {
 // 选择
 // ============================================================
 
+// 轨道的**显示顺序**（行号 → 轨道）。
+//
+// ⚠ 用一张表而不是"枚举值即行号"：枚举值要稳定（见 .h 的 ⚠⚠），显示顺序
+//   要随时能调。机位轨排在事件轨上面，因为它和相机轨是同一件事的两半
+//   （"这台怎么动" / "用哪台"），中间夹一行事件轨读起来是断的。
+const TimelineEditorWindow::Track kTrackOrder[] = {
+    TimelineEditorWindow::Track::Camera,
+    TimelineEditorWindow::Track::Shots,
+    TimelineEditorWindow::Track::Events,
+};
+constexpr int kTrackRows = static_cast<int>(sizeof(kTrackOrder) /
+                                            sizeof(kTrackOrder[0]));
+
+int TimelineEditorWindow::rowOf(Track t) {
+    for (int i = 0; i < kTrackRows; ++i)
+        if (kTrackOrder[i] == t) return i;
+    return 0;
+}
+
+TimelineEditorWindow::Track TimelineEditorWindow::trackAtRow(int row) {
+    if (row < 0 || row >= kTrackRows) return Track::Camera;
+    return kTrackOrder[row];
+}
+
 int TimelineEditorWindow::trackCount(Track t) const {
     switch (t) {
     case Track::Camera: return static_cast<int>(m_asset.cameraKeys.size());
     case Track::Events: return static_cast<int>(m_asset.events.size());
+    case Track::Shots: return static_cast<int>(m_asset.shots.size());
     default: return 0;
     }
 }
@@ -288,6 +318,12 @@ sequence::SeqEvent* TimelineEditorWindow::selEvent() {
     return &m_asset.events[static_cast<std::size_t>(m_sel)];
 }
 
+sequence::SeqShot* TimelineEditorWindow::selShot() {
+    if (m_track != Track::Shots) return nullptr;
+    if (m_sel < 0 || m_sel >= static_cast<int>(m_asset.shots.size())) return nullptr;
+    return &m_asset.shots[static_cast<std::size_t>(m_sel)];
+}
+
 // ============================================================
 // 编辑缓冲（只有事件轨需要：kind / payload 是字符串）
 // ============================================================
@@ -296,15 +332,30 @@ void TimelineEditorWindow::syncBuffers() {
     // 键 = 轨道 + 下标 + 该项的 t。加 t 是为了让"拖动之后"自动重建
     //（拖完 t 变了，缓冲里的字还是旧的，但显示的是同一项的内容，
     // 重建一次不影响正在输入的东西 —— 拖的时候鼠标在轨道上）。
+    //
+    // ⚠⚠ 键里**必须带轨道名**（`ev:` / `sh:`）。只按下标的话，从事件轨的
+    //   第 2 项切到机位轨的第 2 项，下标相同 → 键相同 → **不重建**，
+    //   于是机位栏里显示的是上一条事件的 kind 文本。这是加第三轨时最容易
+    //   踩的一脚（原先"只有两条轨"时，两个分支的 key 一个非空一个空，
+    //   恰好没暴露）。
     std::string key;
     if (m_track == Track::Events) {
         const sequence::SeqEvent* e = selEvent();
         key = e ? ("ev:" + std::to_string(m_sel) + ":" +
                    std::to_string(static_cast<int>(e->t * 1000.0f)))
                 : std::string();
+    } else if (m_track == Track::Shots) {
+        const sequence::SeqShot* s = selShot();
+        key = s ? ("sh:" + std::to_string(m_sel) + ":" +
+                   std::to_string(static_cast<int>(s->t * 1000.0f)))
+                : std::string();
     }
     if (key == m_bufKey) return;
     m_bufKey = key;
+
+    m_labelBuf[0] = '\0';
+    if (const sequence::SeqShot* s = selShot())
+        std::snprintf(m_labelBuf, sizeof(m_labelBuf), "%s", s->label.c_str());
 
     const sequence::SeqEvent* e = selEvent();
     if (!e) {
@@ -366,6 +417,156 @@ int TimelineEditorWindow::reorderEvent(int from) {
                 static_cast<double>(e.t));
     return to;
 }
+
+int TimelineEditorWindow::reorderShot(int from) {
+    auto& v = m_asset.shots;
+    if (from < 0 || from >= static_cast<int>(v.size())) return from;
+    sequence::SeqShot s = v[static_cast<std::size_t>(from)];
+    v.erase(v.begin() + from);
+    int to = 0;
+    while (to < static_cast<int>(v.size()) &&
+           v[static_cast<std::size_t>(to)].t <= s.t + 1.0e-6f)
+        ++to;
+    v.insert(v.begin() + to, s);
+    VK_LOG_INFO("TLED-REORDER track=shots from=%d to=%d t=%.3f", from, to,
+                static_cast<double>(s.t));
+    return to;
+}
+
+// ============================================================
+// 多机位 marker（第三轨，2026-10-30）
+// ============================================================
+//
+// 这一轨的语义与另外两轨**不同构**：相机轨与事件轨都是"某一瞬间发生的一件事"，
+// 而 marker 是"**从这时起**切到某台机位"—— 它划的是**区间**，一直有效到
+// 下一个 marker（或片尾）。所以：
+//   · 拖动它的 t 会改变**两段**的边界，而重排（按 t 升序）在语义上必须保持；
+//   · 它不参与 `sampleCamera`，姿态仍来自相机轨 —— marker 只说"用哪台"。
+
+bool TimelineEditorWindow::actAddShot() {
+    // 同一时刻已经有一个 marker → 拒绝（与 `actAddKey` 同一条理由：
+    // 两个同 t 的 marker 谁生效取决于排序的稳定性，作者看不出来）。
+    for (const auto& s : m_asset.shots) {
+        if (std::fabs(s.t - m_head) < 1.0e-3f) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          TR("a shot marker already exists at %.3f s"),
+                          static_cast<double>(s.t));
+            return reject("addshot", msg);
+        }
+    }
+    sequence::SeqShot s;
+    s.t = m_head;
+    // 默认绑"编辑器里当前选中的那个相机" —— 这是作者的心智模型：
+    // 在场景里点中 B 机位 → 时间轴上打个点 → 这一段就是 B。
+    s.cameraGuid = selectedCameraGuid();
+    m_asset.shots.push_back(s);
+    m_track = Track::Shots;
+    m_sel = reorderShot(static_cast<int>(m_asset.shots.size()) - 1);
+    m_bufKey.clear();
+    markDirty();
+    VK_LOG_INFO("TLED-ADDSHOT t=%.3f cam=%s shots=%d sel=%d",
+                static_cast<double>(m_head),
+                s.cameraGuid ? ecs::guidToHex(s.cameraGuid).c_str() : "(keys)",
+                static_cast<int>(m_asset.shots.size()), m_sel);
+    revalidate();
+    return true;
+}
+
+// `guid == 0` 是**合法值**（"这一段回落到相机轨"），所以这个函数不能用
+// "0 = 没选中"当错误条件。要拒绝的是"非 0 但场景里没有这台相机"。
+bool TimelineEditorWindow::actBindShotCam(std::uint64_t guid) {
+    sequence::SeqShot* s = selShot();
+    if (!s) return reject("setshotcam", TR("no shot marker selected"));
+    if (guid != 0) {
+        scene::Scene& sc = m_ctx.activeScene();
+        const ecs::Entity e = sc.world().find(guid);
+        if (!e.valid() || !sc.world().get<ecs::CameraComponent>(e)) {
+            // ⚠ 这里必须拒绝。放行的话文件里会留下一个指向"不存在的实体"的
+            //   guid，进 Play 后 `CameraSystem` 找不到它 → 导演覆盖被静默
+            //   释放（`CAM-CUT-MISS`），作者看到的是"这一段用的还是默认相机"，
+            //   而文件里明明写着 B 机位。
+            return reject("setshotcam",
+                          fmt1(TR("no enabled camera with guid %s in the scene"),
+                               ecs::guidToHex(guid).c_str()));
+        }
+    }
+    s->cameraGuid = guid;
+    markDirty();
+    VK_LOG_INFO("TLED-SETSHOTCAM t=%.3f cam=%s", static_cast<double>(s->t),
+                guid ? ecs::guidToHex(guid).c_str() : "(keys)");
+    revalidate();
+    return true;
+}
+
+bool TimelineEditorWindow::actBindShotToSelection() {
+    const std::uint64_t g = selectedCameraGuid();
+    if (g == 0)
+        return reject("bindsel",
+                      TR("nothing selected — pick a camera in the scene first"));
+    return actBindShotCam(g);
+}
+
+bool TimelineEditorWindow::actSetShotTime(float t) {
+    sequence::SeqShot* s = selShot();
+    if (!s) return reject("setshottime", TR("no shot marker selected"));
+    t = std::clamp(t, 0.0f, std::max(m_asset.duration, 0.0f));
+    s->t = t;
+    m_sel = reorderShot(m_sel);
+    markDirty();
+    VK_LOG_INFO("TLED-SETSHOTTIME t=%.3f sel=%d", static_cast<double>(t), m_sel);
+    revalidate();
+    return true;
+}
+
+bool TimelineEditorWindow::actSetShotBlend(float seconds) {
+    sequence::SeqShot* s = selShot();
+    if (!s) return reject("setshotblend", TR("no shot marker selected"));
+    // 上限 3 秒：混合是"推拉镜头"的时长，超过三秒就不像是切镜而像是
+    // 上一段运镜没停。下限 0 = 硬切（合法且默认）。
+    s->blendSeconds = std::clamp(seconds, 0.0f, 3.0f);
+    markDirty();
+    VK_LOG_INFO("TLED-SETSHOTBLEND t=%.3f blend=%.3f",
+                static_cast<double>(s->t), static_cast<double>(s->blendSeconds));
+    revalidate();
+    return true;
+}
+
+bool TimelineEditorWindow::actSetShotLabel(const std::string& label) {
+    sequence::SeqShot* s = selShot();
+    if (!s) return reject("setshotlabel", TR("no shot marker selected"));
+    s->label = label;
+    markDirty();
+    revalidate();
+    return true;
+}
+
+std::uint64_t TimelineEditorWindow::selectedCameraGuid() const {
+    scene::Scene& sc = m_ctx.activeScene();
+    ecs::World& w = sc.world();
+    ecs::Entity e = m_ctx.selection();
+    // 沿父链向上找。⚠ 必须有层数上限：父子关系是用户编辑出来的数据，
+    //   `parent` 指错方向（B 的父是 A、A 的父又是 B）时这个循环会转不出来，
+    //   而它跑在**点一下按钮**的路径上 —— 症状是整个编辑器卡死。
+    //
+    // ⚠ 父链用的是 `HierarchyComponent::parent`（EntityId 槽位），**不是 guid**。
+    //   两者不能混：id 在销毁后会被复用，这里只在"同一次加载内"用，正好适用。
+    for (int depth = 0; depth < 64 && e.valid(); ++depth) {
+        if (const auto* cc = w.get<ecs::CameraComponent>(e); cc && cc->enabled)
+            return w.guid(e);
+        const auto* hc = w.get<ecs::HierarchyComponent>(e);
+        if (!hc || hc->parent == ecs::kInvalidEntity) break;
+        ecs::Entity parent;
+        parent.id = hc->parent;
+        // 用 `alive()` 校验：层数上限挡的是环，挡不住"悬空的 parent id"
+        // （父被销毁后子节点的 parent 还指着老槽位 → 可能正好指到一个
+        // 复用了这个 id 的**别的**实体，于是我们"向上找到了"一台无关的相机）。
+        if (!w.alive(parent)) break;
+        e = parent;
+    }
+    return 0;
+}
+
 
 sequence::SeqCameraKey TimelineEditorWindow::poseAtHead() const {
     sequence::SeqCameraKey out;
@@ -474,6 +675,16 @@ bool TimelineEditorWindow::actDelete() {
         markDirty();
         VK_LOG_INFO("TLED-DEL track=camera t=%.3f keys=%d", static_cast<double>(t),
                     static_cast<int>(m_asset.cameraKeys.size()));
+    } else if (m_track == Track::Shots) {
+        if (m_sel < 0 || m_sel >= static_cast<int>(m_asset.shots.size()))
+            return reject("del", TR("no shot marker selected"));
+        const float t = m_asset.shots[static_cast<std::size_t>(m_sel)].t;
+        m_asset.shots.erase(m_asset.shots.begin() + m_sel);
+        clampSel();
+        m_bufKey.clear();
+        markDirty();
+        VK_LOG_INFO("TLED-DEL track=shots t=%.3f shots=%d", static_cast<double>(t),
+                    static_cast<int>(m_asset.shots.size()));
     } else {
         if (m_sel < 0 || m_sel >= static_cast<int>(m_asset.events.size()))
             return reject("del", TR("no event selected"));
@@ -497,6 +708,10 @@ bool TimelineEditorWindow::actSetTime(float t) {
         if (!k) return reject("settime", TR("no camera key selected"));
         k->t = t;
         m_sel = reorderKey(m_sel);      // ① 改完 t 必须重排，且跟着挪选中项
+    } else if (m_track == Track::Shots) {
+        // marker 的 t 走自己那一条（它有自己的日志名与重排），
+        // 但仍要经过 `actSetTime` 这个入口 —— 属性栏只有一个 t 输入框。
+        return actSetShotTime(t);
     } else {
         sequence::SeqEvent* e = selEvent();
         if (!e) return reject("settime", TR("no event selected"));
@@ -889,6 +1104,13 @@ void TimelineEditorWindow::drawToolbar(bool& open) {
     logRect("TLED-ADDEVENT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
 
     ImGui::SameLine();
+    if (ImGui::Button(TR("+ Shot"))) actAddShot();
+    logRect("TLED-ADDSHOT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", TR("Cut to the selected camera from the playhead "
+                                   "until the next marker."));
+
+    ImGui::SameLine();
     if (ImGui::Button(TR("Delete"))) actDelete();
     logRect("TLED-DEL-BTN", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
 
@@ -929,7 +1151,10 @@ void TimelineEditorWindow::drawTracks() {
 
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float h = kRulerH + kRowH * 2.0f + 4.0f;
+    // ⚠ 行数跟着 `kTrackOrder[]` 走，不写死 2。写死的话加一条轨的表现是
+    //   "最后一条轨被裁在控件外"——它照样画出来了，但点不到（InvisibleButton
+    //   的高度就是命中区）。
+    const float h = kRulerH + kRowH * static_cast<float>(kTrackRows) + 4.0f;
 
     ImGui::InvisibleButton("##tled_tracks", ImVec2(avail.x, h));
     logRect("TLED-TRACKS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
@@ -941,15 +1166,26 @@ void TimelineEditorWindow::drawTracks() {
     g.x1 = origin.x + avail.x - kPadR;
     g.dur = std::max(m_asset.duration, 0.1f);
     g.rowH = kRowH;
-    g.rowY[0] = origin.y + kRulerH + kRowH * 0.5f;
-    g.rowY[1] = g.rowY[0] + kRowH;
+    for (int r = 0; r < kTrackRows; ++r)
+        g.rowY[r] = origin.y + kRulerH + kRowH * (static_cast<float>(r) + 0.5f);
 
-    // 背景：两条轨道各一块，交替色让行边界看不出来也不至于糊成一片
+    // 行号 ↔ 轨道的唯一映射（命中测试、绘制、标签三处都从这里取）
+    const int rowCam = rowOf(Track::Camera);
+    const int rowShot = rowOf(Track::Shots);
+    const int rowEvt = rowOf(Track::Events);
+
+    // 背景：每条轨道一块，交替色让行边界看不出来也不至于糊成一片
     const ImU32 colRowA = ImGui::GetColorU32(ImGuiCol_ChildBg, 0.55f);
     const ImU32 colRowB = ImGui::GetColorU32(ImGuiCol_ChildBg, 0.30f);
-    dl->AddRectFilled(ImVec2(origin.x, origin.y + kRulerH), ImVec2(origin.x + avail.x, origin.y + kRulerH + kRowH), colRowA);
-    dl->AddRectFilled(ImVec2(origin.x, origin.y + kRulerH + kRowH), ImVec2(origin.x + avail.x, origin.y + kRulerH + kRowH * 2.0f), colRowB);
-    dl->AddRectFilled(ImVec2(origin.x, origin.y + kRulerH), ImVec2(origin.x + kLabelW, origin.y + kRulerH + kRowH * 2.0f),
+    for (int r = 0; r < kTrackRows; ++r) {
+        const float y0 = origin.y + kRulerH + kRowH * static_cast<float>(r);
+        dl->AddRectFilled(ImVec2(origin.x, y0),
+                          ImVec2(origin.x + avail.x, y0 + kRowH),
+                          (r % 2 == 0) ? colRowA : colRowB);
+    }
+    dl->AddRectFilled(ImVec2(origin.x, origin.y + kRulerH),
+                      ImVec2(origin.x + kLabelW,
+                             origin.y + kRulerH + kRowH * static_cast<float>(kTrackRows)),
                       ImGui::GetColorU32(ImGuiCol_MenuBarBg, 0.9f));
 
     // ---- 标尺 ----
@@ -972,16 +1208,18 @@ void TimelineEditorWindow::drawTracks() {
     // ---- 轨道标签 ----
     const ImU32 colTxt = ImGui::GetColorU32(ImGuiCol_Text);
     const ImU32 colDim = ImGui::GetColorU32(ImGuiCol_Text, 0.55f);
-    const float lblY0 = g.rowY[0] - ImGui::GetFontSize() * 0.5f;
-    const float lblY1 = g.rowY[1] - ImGui::GetFontSize() * 0.5f;
-    dl->AddText(ImVec2(origin.x + 10.0f, lblY0), colTxt, TR("Camera"));
-    dl->AddText(ImVec2(origin.x + 10.0f, lblY1), colTxt, TR("Events"));
-    {
+    for (int r = 0; r < kTrackRows; ++r) {
+        const Track tr = trackAtRow(r);
+        const char* nm = (tr == Track::Camera) ? TR("Camera")
+                       : (tr == Track::Shots)  ? TR("Shots")
+                                               : TR("Events");
+        const float ly = g.rowY[r] - ImGui::GetFontSize() * 0.5f;
+        dl->AddText(ImVec2(origin.x + 10.0f, ly), colTxt, nm);
         char n[32];
-        std::snprintf(n, sizeof(n), "%d", static_cast<int>(m_asset.cameraKeys.size()));
-        dl->AddText(ImVec2(origin.x + 10.0f, lblY0 + ImGui::GetFontSize() + 1.0f), colDim, n);
-        std::snprintf(n, sizeof(n), "%d", static_cast<int>(m_asset.events.size()));
-        dl->AddText(ImVec2(origin.x + 10.0f, lblY1 + ImGui::GetFontSize() + 1.0f), colDim, n);
+        std::snprintf(n, sizeof(n), "%d", trackCount(tr));
+        // 数量行压到名字下面一行；`*2` 是"名字 + 间距"，与行高 46 相称
+        dl->AddText(ImVec2(origin.x + 10.0f, ly + ImGui::GetFontSize() + 1.0f),
+                    colDim, n);
     }
 
     // ---- 相机轨：先画段（相邻两帧之间的连线），再画点 ----
@@ -989,6 +1227,7 @@ void TimelineEditorWindow::drawTracks() {
     const ImU32 colKey = IM_COL32(110, 190, 255, 255);
     const ImU32 colKeySel = IM_COL32(255, 210, 90, 255);
     const ImU32 colKeyOut = IM_COL32(255, 90, 70, 255);   // 超出 duration，永远播不到
+    const float camY = g.rowY[rowCam];
 
     for (std::size_t i = 0; i + 1 < m_asset.cameraKeys.size(); ++i) {
         const auto& a = m_asset.cameraKeys[i];
@@ -1001,10 +1240,10 @@ void TimelineEditorWindow::drawTracks() {
             const float dash = 5.0f;
             for (float x = xa; x < xb; x += dash * 2.0f) {
                 const float xe = std::min(x + dash, xb);
-                dl->AddLine(ImVec2(x, g.rowY[0]), ImVec2(xe, g.rowY[0]), colSeg, 1.5f);
+                dl->AddLine(ImVec2(x, camY), ImVec2(xe, camY), colSeg, 1.5f);
             }
         } else {
-            dl->AddLine(ImVec2(xa, g.rowY[0]), ImVec2(xb, g.rowY[0]), colSeg, 1.5f);
+            dl->AddLine(ImVec2(xa, camY), ImVec2(xb, camY), colSeg, 1.5f);
         }
     }
     for (std::size_t i = 0; i < m_asset.cameraKeys.size(); ++i) {
@@ -1015,28 +1254,93 @@ void TimelineEditorWindow::drawTracks() {
         const ImU32 c = (k.t > g.dur + 1.0e-3f) ? colKeyOut : (sel ? colKeySel : colKey);
         const float r = sel ? 7.0f : 5.5f;
         // 菱形：与事件的圆点在形状上就分得开（不用靠颜色记）
-        const ImVec2 p[4] = {ImVec2(x, g.rowY[0] - r), ImVec2(x + r, g.rowY[0]),
-                             ImVec2(x, g.rowY[0] + r), ImVec2(x - r, g.rowY[0])};
+        const ImVec2 p[4] = {ImVec2(x, camY - r), ImVec2(x + r, camY),
+                             ImVec2(x, camY + r), ImVec2(x - r, camY)};
         dl->AddConvexPolyFilled(p, 4, c);
         dl->AddPolyline(p, 4, IM_COL32(20, 20, 24, 220), ImDrawFlags_Closed, 1.2f);
     }
 
+    // ---- 机位轨（多机位 marker）----
+    //
+    // 与另外两轨的**视觉语义不同**：marker 划的是**区间**（"从这时起用这台"），
+    // 不是一个瞬间。所以画法也不同 —— 每个 marker 画一条**横条**延伸到下一个
+    // marker 的位置（最后一段延伸到片尾），横条上再插一面小旗。
+    // 一眼看过去就是"这几段分别由哪台机位在播"，而不是"这里有个点"。
+    const float shotY = g.rowY[rowShot];
+    const ImU32 colShotOff = IM_COL32(120, 120, 130, 200);   // 回落关键帧轨
+    for (std::size_t i = 0; i < m_asset.shots.size(); ++i) {
+        const auto& s = m_asset.shots[i];
+        const float xa = timeToX(g, std::min(s.t, g.dur));
+        const float xb = (i + 1 < m_asset.shots.size())
+                             ? timeToX(g, std::min(m_asset.shots[i + 1].t, g.dur))
+                             : g.x1;
+        const bool sel = (m_track == Track::Shots && static_cast<int>(i) == m_sel);
+        // 颜色由绑定机位的 guid 决定（同一台机位永远同一色）→ 扫一眼就知道
+        // "这两段是同一台"。回落关键帧轨（guid=0）用中性灰，避免和真机位撞色。
+        const ImU32 c = (s.cameraGuid == 0)
+                            ? colShotOff
+                            : colorForKind(ecs::guidToHex(s.cameraGuid));
+        const float bh = sel ? 10.0f : 7.0f;
+        if (xb > xa + 1.0f) {
+            dl->AddRectFilled(ImVec2(xa, shotY - bh * 0.5f),
+                              ImVec2(xb, shotY + bh * 0.5f), c, 2.0f);
+            // 混合时长 > 0 的那一段：左端画一小块渐变条，表示"这里是推过来的"。
+            // ⚠ 用**像素宽度**而不是秒数换算：0.2 秒在 8 秒的过场上只有几个像素，
+            //   按秒画等于看不见。这里只声明意图，不声称它是精确的时长。
+            if (s.blendSeconds > 0.0f && xb > xa + 8.0f) {
+                const float bw = std::min(18.0f, (xb - xa) * 0.25f);
+                dl->AddRectFilledMultiColor(
+                    ImVec2(xa, shotY - bh * 0.5f), ImVec2(xa + bw, shotY + bh * 0.5f),
+                    IM_COL32(0, 0, 0, 0), c, c, IM_COL32(0, 0, 0, 0));
+            }
+        }
+        // 小旗：竖杆 + 三角（旗朝右），位置 = marker 的 t
+        dl->AddLine(ImVec2(xa, shotY - bh * 0.5f), ImVec2(xa, shotY - bh * 0.5f - 9.0f),
+                    c, 1.6f);
+        const ImVec2 flag[3] = {ImVec2(xa, shotY - bh * 0.5f - 9.0f),
+                                ImVec2(xa + 7.0f, shotY - bh * 0.5f - 6.0f),
+                                ImVec2(xa, shotY - bh * 0.5f - 3.0f)};
+        dl->AddConvexPolyFilled(flag, 3, c);
+        if (sel) {
+            dl->AddRect(ImVec2(xa - 2.0f, shotY - bh * 0.5f - 11.0f),
+                        ImVec2(std::max(xb, xa + 4.0f) + 2.0f, shotY + bh * 0.5f + 2.0f),
+                        colKeySel, 3.0f, 0, 1.6f);
+        }
+        // 标签：作者写的 label，没写就显示机位的十六进制后四位（够区分，
+        // 又不至于把轨道糊满）。⚠ 按码点截断，理由同事件轨。
+        if (xb > xa + 16.0f) {
+            char lbl[48];
+            if (!s.label.empty()) {
+                std::snprintf(lbl, sizeof(lbl), "%s", utf8Prefix(s.label, 8).c_str());
+            } else if (s.cameraGuid != 0) {
+                const std::string h = ecs::guidToHex(s.cameraGuid);
+                std::snprintf(lbl, sizeof(lbl), "%s",
+                              h.size() > 4 ? h.substr(h.size() - 4).c_str() : h.c_str());
+            } else {
+                std::snprintf(lbl, sizeof(lbl), "%s", TR("keys"));
+            }
+            dl->AddText(ImVec2(xa + 4.0f, shotY - ImGui::GetFontSize() * 0.5f),
+                        IM_COL32(16, 16, 20, 235), lbl);
+        }
+    }
+
     // ---- 事件轨 ----
+    const float evtY = g.rowY[rowEvt];
     for (std::size_t i = 0; i < m_asset.events.size(); ++i) {
         const auto& e = m_asset.events[i];
         const float x = timeToX(g, std::min(e.t, g.dur));
         const bool sel = (m_track == Track::Events && static_cast<int>(i) == m_sel);
         const ImU32 c = colorForKind(e.kind);
         const float r = sel ? 7.0f : 5.0f;
-        dl->AddCircleFilled(ImVec2(x, g.rowY[1]), r, c);
+        dl->AddCircleFilled(ImVec2(x, evtY), r, c);
         if (sel)
-            dl->AddCircle(ImVec2(x, g.rowY[1]), r + 3.0f, colKeySel, 0, 1.6f);
+            dl->AddCircle(ImVec2(x, evtY), r + 3.0f, colKeySel, 0, 1.6f);
         // 标签：kind 的前几个码点。
         // ⚠ 不能 `substr(0, 9)`：那是按**字节**切，中文 kind 会被劈成半个
         //   汉字（渲染出来是一串方块）。跟着 UTF-8 的续字节边界走。
         char lbl[40];
         std::snprintf(lbl, sizeof(lbl), "%s", utf8Prefix(e.kind, 9).c_str());
-        dl->AddText(ImVec2(x + r + 3.0f, g.rowY[1] - ImGui::GetFontSize() * 0.5f),
+        dl->AddText(ImVec2(x + r + 3.0f, evtY - ImGui::GetFontSize() * 0.5f),
                     colDim, lbl);
     }
 
@@ -1050,17 +1354,26 @@ void TimelineEditorWindow::drawTracks() {
     dl->AddConvexPolyFilled(tri, 3, colHead);
 
     // ---- 交互 ----
-    // ⚠ 三种手势必须在**按下的那一帧**决定（`m_dragMode`），不能在按住期间
+    // ⚠ 四种手势必须在**按下的那一帧**决定（`m_dragMode`），不能在按住期间
     //   每帧重新判断：鼠标一动，命中测试的结果就变了，拖关键帧会中途变成
     //   拖播放头。
-    enum DragMode { kNone = 0, kDragKey = 1, kDragEvent = 2, kDragHead = 3 };
+    enum DragMode { kNone = 0, kDragKey = 1, kDragEvent = 2, kDragHead = 3,
+                    kDragShot = 4 };
     if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         const ImVec2 mp = ImGui::GetIO().MousePos;
         const float pickR = ImGui::GetFontSize() * 0.55f;
         m_dragMode = kNone;
 
-        // 先找相机轨上的点（y 在相机行内）
-        if (std::fabs(mp.y - g.rowY[0]) < g.rowH * 0.5f) {
+        // ⚠ 行号 → 轨道只走 `trackAtRow()`：命中测试、绘制、标签三处必须用
+        //   同一套映射，各写一份的话"点事件轨选中了机位"这种错会在调整
+        //   显示顺序时冒出来。
+        const int hoverRow = static_cast<int>((mp.y - origin.y - kRulerH) / kRowH);
+        const Track hover = (hoverRow >= 0 && hoverRow < kTrackRows)
+                                ? trackAtRow(hoverRow)
+                                : Track::Camera;
+        const bool inRows = hoverRow >= 0 && hoverRow < kTrackRows;
+
+        if (inRows && hover == Track::Camera) {
             int best = -1;
             float bestDx = pickR;
             for (std::size_t i = 0; i < m_asset.cameraKeys.size(); ++i) {
@@ -1075,8 +1388,35 @@ void TimelineEditorWindow::drawTracks() {
                             static_cast<double>(m_asset.cameraKeys[static_cast<std::size_t>(m_sel)].t));
             }
         }
-        // 再找事件轨上的点
-        if (m_dragMode == kNone && std::fabs(mp.y - g.rowY[1]) < g.rowH * 0.5f) {
+
+        // 机位轨：**整条横条**都是命中区（不是只有小旗附近）。
+        // ⚠ 用"区间"命中而不是"最近点"：横条有几秒宽，作者点在段中间
+        //   想的就是"我要这段"，要求精确点到旗子上是没道理的。
+        if (m_dragMode == kNone && inRows && hover == Track::Shots) {
+            int best = -1;
+            for (std::size_t i = 0; i < m_asset.shots.size(); ++i) {
+                const float xa = timeToX(g, std::min(m_asset.shots[i].t, g.dur));
+                const float xb = (i + 1 < m_asset.shots.size())
+                                     ? timeToX(g, std::min(m_asset.shots[i + 1].t, g.dur))
+                                     : g.x1;
+                // 右端留一点余量：最后一段的 xb 就是右边缘，点在线上也该中
+                if (mp.x >= xa - pickR && mp.x <= xb + 2.0f) {
+                    best = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (best >= 0) {
+                m_track = Track::Shots;
+                m_sel = best;
+                m_bufKey.clear();
+                m_dragMode = kDragShot;
+                VK_LOG_INFO("TLED-SEL track=shots i=%d t=%.3f", m_sel,
+                            static_cast<double>(m_asset.shots[static_cast<std::size_t>(m_sel)].t));
+            }
+        }
+
+        // 事件轨
+        if (m_dragMode == kNone && inRows && hover == Track::Events) {
             int best = -1;
             float bestDx = pickR;
             for (std::size_t i = 0; i < m_asset.events.size(); ++i) {
@@ -1114,6 +1454,12 @@ void TimelineEditorWindow::drawTracks() {
                 e->t = snapped;
                 m_dirty = true;
             }
+        } else if (m_dragMode == kDragShot && m_track == Track::Shots) {
+            sequence::SeqShot* s = selShot();
+            if (s) {
+                s->t = snapped;
+                m_dirty = true;
+            }
         } else {
             actSetHead(snapped);
         }
@@ -1141,6 +1487,16 @@ void TimelineEditorWindow::drawTracks() {
                                        ? 0.0f
                                        : m_asset.events[static_cast<std::size_t>(m_sel)].t));
             revalidate();
+        } else if (m_dragMode == kDragShot) {
+            const int before = m_sel;
+            m_sel = reorderShot(m_sel);
+            m_bufKey.clear();
+            VK_LOG_INFO("TLED-DRAG-END track=shots from=%d to=%d t=%.3f", before,
+                        m_sel, static_cast<double>(
+                                   m_asset.shots.empty()
+                                       ? 0.0f
+                                       : m_asset.shots[static_cast<std::size_t>(m_sel)].t));
+            revalidate();
         }
         m_dragMode = kNone;
     }
@@ -1152,12 +1508,16 @@ void TimelineEditorWindow::drawInspectorRow() {
     syncBuffers();
 
     ImGui::PushID("tled_prop");
-    // 高度：bezier 段多两行（说明 + 四个手柄）。用两个固定值而不是自适应，
-    // 是因为这是**属性栏** —— 高度随选择连续跳动比"多两行"更难用。
+    // 高度：bezier 段多两行（说明 + 四个手柄），机位 marker 是三条控件行。
+    // 用固定值而不是自适应，是因为这是**属性栏** —— 高度随选择连续跳动比
+    // "多两行"更难用。
+    // ⚠ 宁可按大给：给少了多出来的那一行会被裁在 Child 外，**按钮照样有矩形
+    //   却点不到**（本项目的标准坑，见 MEMORY 的 `logRect 不判可见性`）。
     const sequence::SeqCameraKey* selK =
         (m_track == Track::Camera) ? selKey() : nullptr;
     const bool bezierRow = selK && selK->ease == sequence::Ease::Bezier;
-    const float propH = bezierRow ? 158.0f : 116.0f;
+    const float propH = bezierRow ? 158.0f
+                      : (m_track == Track::Shots ? 148.0f : 116.0f);
     ImGui::BeginChild("##tled_propbox", ImVec2(0.0f, propH),
                       ImGuiChildFlags_Borders);
     logRect("TLED-PROP", ImGui::GetWindowPos(),
@@ -1276,6 +1636,77 @@ void TimelineEditorWindow::drawInspectorRow() {
                 m_sel + 1, static_cast<int>(m_asset.cameraKeys.size()),
                 static_cast<double>(k->yaw), static_cast<double>(k->pitch));
         }
+    } else if (m_track == Track::Shots) {
+        sequence::SeqShot* s = selShot();
+        if (!s) {
+            ImGui::TextDisabled("%s", TR("No shot marker selected — press + Shot "
+                                         "to cut to a camera at the playhead."));
+        } else {
+            float t = s->t;
+            ImGui::SetNextItemWidth(110.0f);
+            if (ImGui::DragFloat(TR("t"), &t, kTimeStep, 0.0f,
+                                 std::max(m_asset.duration, 0.1f), TR("%.3f s"))) {
+                actSetShotTime(t);
+            }
+            logRect("TLED-PROP-T", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+            ImGui::SameLine();
+            float blend = s->blendSeconds;
+            ImGui::SetNextItemWidth(120.0f);
+            if (ImGui::DragFloat(TR("blend"), &blend, 0.01f, 0.0f, 3.0f,
+                                 TR("%.2f s"))) {
+                actSetShotBlend(blend);
+            }
+            logRect("TLED-PROP-BLEND", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", TR("0 = hard cut. Anything above glides "
+                                           "from the previous shot's pose."));
+
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(200.0f);
+            if (ImGui::InputTextWithHint(TR("label"), TR("shot A — close-up"),
+                                         m_labelBuf, sizeof(m_labelBuf),
+                                         ImGuiInputTextFlags_EnterReturnsTrue)) {
+                actSetShotLabel(m_labelBuf);
+            }
+            logRect("TLED-PROP-LABEL", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+            // ---- 绑定的机位 ----
+            // 显示**名字**而不是十六进制：作者记不住 guid。名字查不到时
+            // 明确说"scene 里没有这台"——那是文件从别的场景拷过来时的典型状态。
+            ImGui::TextDisabled("%s", TR("Camera:"));
+            ImGui::SameLine();
+            std::string camName;
+            if (s->cameraGuid == 0) {
+                camName = TR("(falls back to the camera key track)");
+            } else {
+                scene::Scene& sc = m_ctx.activeScene();
+                const ecs::Entity e = sc.world().find(s->cameraGuid);
+                const std::string* nm = e.valid() ? sc.world().name(e) : nullptr;
+                camName = nm ? *nm : fmt1(TR("missing (%s)"),
+                                          ecs::guidToHex(s->cameraGuid).c_str());
+            }
+            ImGui::Text("%s", camName.c_str());
+            logRect("TLED-PROP-CAM", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+            ImGui::SameLine();
+            if (ImGui::Button(TR("Bind to selection"))) actBindShotToSelection();
+            logRect("TLED-BIND-SEL", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", TR("Point this marker at the camera that "
+                                           "is selected in the scene."));
+
+            ImGui::SameLine();
+            if (ImGui::Button(TR("Use keys"))) actBindShotCam(0);
+            logRect("TLED-BIND-KEYS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", TR("Release the override: this stretch is "
+                                           "driven by the camera key track again."));
+
+            ImGui::TextDisabled(
+                TR("%d / %d  |  active until the next marker (or the end)"),
+                m_sel + 1, static_cast<int>(m_asset.shots.size()));
+        }
     } else {
         sequence::SeqEvent* e = selEvent();
         if (!e) {
@@ -1328,9 +1759,10 @@ void TimelineEditorWindow::drawValidation() {
     if (m_checkValid) {
         ImGui::TextColored(kOkCol, "%s", TR("Load check: OK"));
         ImGui::SameLine();
-        ImGui::TextDisabled(TR("%d camera key(s), %d event(s), %.2f s"),
+        ImGui::TextDisabled(TR("%d camera key(s), %d event(s), %d shot(s), %.2f s"),
                             static_cast<int>(m_asset.cameraKeys.size()),
                             static_cast<int>(m_asset.events.size()),
+                            static_cast<int>(m_asset.shots.size()),
                             static_cast<double>(m_asset.duration));
     } else {
         ImGui::TextColored(kBadCol, "%s", TR("Load check: FAILED"));
@@ -1366,6 +1798,32 @@ void TimelineEditorWindow::drawValidation() {
             std::snprintf(msg, sizeof(msg),
                           TR("event '%s' never fires (the interval is [from, to))"),
                           e.kind.c_str());
+            advices.push_back(msg);
+        }
+    }
+    // 机位 marker 的两条常见失误。**都只是建议**：绑一台不在场景里的相机
+    // 在运行时是"静默回落到相机轨"（`CAM-CUT-MISS` 一条 WARN），文件本身
+    // 没坏 —— 从别的场景拷过来时很常见，所以不能拦着不让存。
+    for (const auto& s : m_asset.shots) {
+        if (s.cameraGuid == 0) {
+            char msg[192];
+            std::snprintf(msg, sizeof(msg),
+                          TR("shot at %.2f s has no camera — it falls back to the "
+                             "camera key track"), static_cast<double>(s.t));
+            advices.push_back(msg);
+        } else {
+            scene::Scene& sc = m_ctx.activeScene();
+            const ecs::Entity e = sc.world().find(s.cameraGuid);
+            if (!e.valid() || !sc.world().get<ecs::CameraComponent>(e)) {
+                advices.push_back(fmt1(TR("shot camera %s is not in this scene"),
+                                       ecs::guidToHex(s.cameraGuid).c_str()));
+            }
+        }
+        if (s.t >= m_asset.duration - 1.0e-4f) {
+            char msg[192];
+            std::snprintf(msg, sizeof(msg),
+                          TR("shot at %.2f s never plays (the interval is "
+                             "[from, to))"), static_cast<double>(s.t));
             advices.push_back(msg);
         }
     }
@@ -1417,14 +1875,16 @@ void TimelineEditorWindow::runInjectedScript() {
 
         bool ok = false;
         if (name == "sel") {
-            // `sel:<camera|events>:<i>`
+            // `sel:<camera|shots|events>:<i>`
             const std::size_t c2 = arg.find(':');
             const std::string trk = arg.substr(0, c2);
             const int i = std::atoi(c2 == std::string::npos
                                         ? "0"
                                         : arg.substr(c2 + 1).c_str());
-            const Track want = (trk == "events") ? Track::Events : Track::Camera;
-            if (trk == "camera" || trk == "events") {
+            const Track want = (trk == "events") ? Track::Events
+                             : (trk == "shots")  ? Track::Shots
+                                                 : Track::Camera;
+            if (trk == "camera" || trk == "events" || trk == "shots") {
                 m_track = want;
                 if (i >= 0 && i < trackCount(want)) {
                     m_sel = i;
@@ -1437,6 +1897,20 @@ void TimelineEditorWindow::runInjectedScript() {
         } else if (name == "addkey") ok = actAddKey();
         else if (name == "capture") ok = actCaptureKey();
         else if (name == "addevent") ok = actAddEvent(arg);
+        // ---- 多机位 marker ----
+        else if (name == "addshot") ok = actAddShot();
+        else if (name == "setshotcam") {
+            // `setshotcam:<hex guid>` / `setshotcam:0` = 回落到关键帧轨。
+            // ⚠ 走 `parseGuidHex` 而不是 `atoll`：它按 16 位十六进制解析，
+            //   `atoll` 会把 `00a1b2c3` 读成十进制 10123 …… 看着"绑上了"，
+            //   实际绑的是一个不存在的实体。
+            ok = actBindShotCam(ecs::parseGuidHex(arg));
+        } else if (name == "setshotcamsel") ok = actBindShotToSelection();
+        else if (name == "setshotblend") ok = actSetShotBlend(
+            static_cast<float>(std::atof(arg.c_str())));
+        else if (name == "setshotlabel") ok = actSetShotLabel(arg);
+        else if (name == "setshottime") ok = actSetShotTime(
+            static_cast<float>(std::atof(arg.c_str())));
         else if (name == "del") ok = actDelete();
         else if (name == "settime") ok = actSetTime(static_cast<float>(std::atof(arg.c_str())));
         else if (name == "setpos") {

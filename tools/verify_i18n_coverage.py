@@ -619,6 +619,12 @@ FMT_KEEP = (
     # 翻成中文反而会让 `verify_*.py` 里的 `has_line("MENU-GO-0")` 全部失效 ——
     # 这类"看着是英文、其实是断言契约"的格式串必须留白名单里。
     "MENU-GO-%d", "PHYS-JOINT-ROW-%d",
+    # 运镜面板的状态行：**机器解析的契约**（verify_camera_move.py 的 C 组
+    # 逐字段对夹具），翻了就断。屏幕上那一行是给作者看的调试读数，不是
+    # 界面文案 —— 与 `PHYS-JOINT-ROW-%d` 同一类。
+    "sel=%s focal=%.1f fov=%.1f fovEff=%.2f shift=(%.3f,%.3f) roll=%.1f "
+    "dof=%d fstop=%.1f shutter=%.0f look=%llx damp=%.2f hand=%.2f/%.2f "
+    "path=%llx",
 )
 
 

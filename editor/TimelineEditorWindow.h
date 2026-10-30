@@ -9,14 +9,15 @@
 //
 //   ┌ Timeline editor — opening *───────────────────────────────────────────┐
 //   │ [sequences/opening.seq.json] [Reload] [Save] [New]                    │
-//   │ dur [8.00]s  loop[ ]  head [1.234]s [Capture][+Key][+Event][Del]       │
+//   │ dur [8.00]s  loop[ ]  head [1.234]s [Capture][+Key][+Event][+Shot][Del]│
 //   ├────────┬──────────────────────────────────────────────────────────────┤
 //   │ Camera │ ◆────────◆──────◆────────────────◆                          │
+//   │ Shots  │ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬  ← 每个 marker 划一段区间         │
 //   │ Events │    ●      ●            ●                                     │
 //   ├────────┴──────────────────────────────────────────────────────────────┤
 //   │ t [1.234]  pos [5.5][-1.2][1.90]  yaw [11.5°] pitch [-6.9°] fov [45]  │
 //   │ ease [smooth ▾]                                                       │
-//   │ ── check ──  Load check: OK  |  4 keys, 3 events                      │
+//   │ ── check ──  Load check: OK  |  4 keys, 3 events, 2 shots             │
 //   └───────────────────────────────────────────────────────────────────────┘
 //
 // ------------------------------------------------------------
@@ -65,6 +66,7 @@
 
 #include "sequence/SequenceAsset.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -86,7 +88,13 @@ class TimelineEditorWindow {
     bool dirty() const { return m_dirty; }
 
     // 轨道种类。`Count` 只做数组大小，不是合法值。
-    enum class Track : int { Camera = 0, Events = 1, Count = 2 };
+    //
+    // ⚠⚠ **只准往末尾加**（`Shots` 是 2026-10-30 加的第三轨）。已有值不许
+    //   重排：`m_track` 会被注入脚本按名字选中、也会在拖拽状态里跨帧存活，
+    //   重排一次就变成"点了事件轨，选中了机位轨"。
+    // ⚠ 行的**显示顺序**不由枚举值决定，见 `.cpp` 里的 `kTrackOrder[]` ——
+    //   这两件事分开，才能做到"机位轨排在事件轨上面"而不动枚举。
+    enum class Track : int { Camera = 0, Events = 1, Shots = 2, Count = 3 };
 
   private:
     // ---------------------------------------------------------- 数据
@@ -121,6 +129,10 @@ class TimelineEditorWindow {
     void clampSel();
     sequence::SeqCameraKey* selKey();
     sequence::SeqEvent* selEvent();
+    sequence::SeqShot* selShot();
+    // 行号 ↔ 轨道（显示顺序见 .cpp 的 `kTrackOrder[]`）
+    static int rowOf(Track t);
+    static Track trackAtRow(int row);
 
     // ---------------------------------------------------------- 编辑缓冲
     //
@@ -131,6 +143,7 @@ class TimelineEditorWindow {
     std::string m_bufKey;
     char m_kindBuf[64] = {};
     char m_payloadBuf[512] = {};
+    char m_labelBuf[96] = {};   // 机位 marker 的标签（第三轨）
     char m_pathBuf[512] = {};
     void syncBuffers();
 
@@ -159,6 +172,28 @@ class TimelineEditorWindow {
     bool actSetLoop(bool loop);
     bool actNewSequence();                  // 一帧的骨架，duration=5
 
+    // ---- 多机位 marker（第三轨）----
+    // 在播放头处插一个 marker（默认绑定**当前选中的相机实体**，没有选中
+    // 就绑 0 = 回落关键帧轨）。
+    bool actAddShot();
+    bool actSetShotTime(float t);
+    bool actSetShotBlend(float seconds);
+    bool actSetShotLabel(const std::string& label);
+    // 绑定机位。`guid == 0` = 回落关键帧轨（合法值）。
+    // ⚠ 这里写 `std::uint64_t` 而不是 `ecs::EntityGuid`：本头只 include
+    //   `sequence/SequenceAsset.h`（它刻意不碰 ecs，见那份文件的文件头）。
+    //   为了一个 typedef 把 ecs 拉进来，正好踩到那条成环的坑。
+    bool actBindShotCam(std::uint64_t guid);
+    // 把 marker 绑到"场景里当前选中的那个带 CameraComponent 的实体"。
+    // ⚠ 编辑器里"选中"可能是一个子节点/网格，所以走"向上找最近的相机"
+    //   而不是要求用户先精确选中相机实体。
+    bool actBindShotToSelection();
+
+    // 场景里"当前选中项里最近的那台相机"的 guid；没有 → 0。
+    // ⚠ 会**沿父链向上找**：作者点中的经常是挂在相机下面的网格/空节点，
+    //   要求先精确选中相机实体会让这个按钮十次里八次报错。
+    std::uint64_t selectedCameraGuid() const;
+
     bool save(bool force);
     void reload();
     void refreshSceneComponents();
@@ -167,6 +202,7 @@ class TimelineEditorWindow {
     // ⚠ 只在"改完 t 之后"调用，而且必须把返回值写回 `m_sel`（见 ①）。
     int reorderKey(int from);
     int reorderEvent(int from);
+    int reorderShot(int from);
 
     // 在播放头处采样出来的相机姿态（没有关键帧时取视口相机）
     sequence::SeqCameraKey poseAtHead() const;
@@ -183,7 +219,10 @@ class TimelineEditorWindow {
     struct TrackGeom {
         float x0 = 0.0f;      // t=0 的像素 x
         float x1 = 0.0f;      // t=duration 的像素 x
-        float rowY[2] = {};   // 两条轨道的中心 y
+        // ⚠ 容量跟着 `kTrackOrder[]` 走（.cpp，现在是 3：相机 / 机位 / 事件）。
+        //   加轨道时这里和那张表**必须一起改** —— 少改这里的症状是
+        //   `rowY[3]` 写到结构体外面（Debug 下 /RTC1 直接弹断言框）。
+        float rowY[3] = {};   // 各轨道的中心 y
         float rowH = 0.0f;
         float dur = 1.0f;
     };

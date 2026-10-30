@@ -2859,8 +2859,14 @@ ecs::PhysicsMaterialComponent physicsMaterialFromJson(const json& j) {
 
 // ---------------- 相机组件（G09）----------------
 // `trauma` 是运行态（外部 addShake 累加、随时间衰减），不落盘。
+//
+// ⚠⚠ 2026-10-30 运镜体系加了一批字段，它们**只在非默认值时写出**。
+//   这不是洁癖：`sceneHash` 是把场景 JSON 喂 FNV 算出来的（G16），
+//   默认值也写出去 = 每个带相机的场景凭空多十几行 → 所有老场景的哈希
+//   全变 → "存两次哈希相同 / 老档能读"那批断言整片红。缺省值由
+//   `cameraComponentFromJson` 的 `j.value(k, 默认)` 兜住，老文件照读。
 json cameraComponentToJson(const ecs::CameraComponent& c) {
-    return json{
+    json j{
         {"fov", c.fov},
         {"priority", c.priority},
         {"enabled", c.enabled},
@@ -2871,6 +2877,41 @@ json cameraComponentToJson(const ecs::CameraComponent& c) {
         {"shakeAmplitude", c.shakeAmplitude},
         {"shakeFrequency", c.shakeFrequency},
     };
+
+    // ---- 镜头 ----
+    if (c.focal != 0.0f) j["focal"] = c.focal;
+    if (c.sensorHeight != 24.0f) j["sensorHeight"] = c.sensorHeight;
+    if (c.shiftX != 0.0f) j["shiftX"] = c.shiftX;
+    if (c.shiftY != 0.0f) j["shiftY"] = c.shiftY;
+    if (c.rollDeg != 0.0f) j["rollDeg"] = c.rollDeg;
+    if (c.clipNear > 0.0f) j["clipNear"] = c.clipNear;
+    if (c.clipFar > 0.0f) j["clipFar"] = c.clipFar;
+    if (c.shutterAngle != 0.0f) j["shutterAngle"] = c.shutterAngle;
+
+    // ---- rig：Follow Path ----
+    if (c.pathGuid != 0) j["pathGuid"] = ecs::guidToHex(c.pathGuid);
+
+    // ---- rig：注视 / 手持 ----
+    // guid 走 **hex 字符串**（与 `parentGuid` / 目标选择器同一口径）：
+    // 直接写 64 位整数会被 JSON 的 double 精度截断（Python json、JS 都是）。
+    if (c.lookTargetGuid != 0)
+        j["lookTargetGuid"] = ecs::guidToHex(c.lookTargetGuid);
+    if (c.lookDamping != 0.35f) j["lookDamping"] = c.lookDamping;
+    if (c.handheldDeg != 0.0f) j["handheldDeg"] = c.handheldDeg;
+    if (c.handheldHz != 1.6f) j["handheldHz"] = c.handheldHz;
+    if (c.handheldSeed != 0.0f) j["handheldSeed"] = c.handheldSeed;
+    if (c.handheldPosM != 0.0f) j["handheldPosM"] = c.handheldPosM;
+
+    // ---- 景深 ----
+    // 只写开关为真时的那一组：`dofEnabled=false` 时 fStop / focusDistance
+    // 是"上次调过的残留"，写进文件会让人以为它们正在生效。
+    if (c.dofEnabled) {
+        j["dofEnabled"] = true;
+        j["fStop"] = c.fStop;
+        j["focusDistance"] = c.focusDistance;
+        if (c.focusGuid != 0) j["focusGuid"] = ecs::guidToHex(c.focusGuid);
+    }
+    return j;
 }
 
 ecs::CameraComponent cameraComponentFromJson(const json& j) {
@@ -2886,7 +2927,85 @@ ecs::CameraComponent cameraComponentFromJson(const json& j) {
     c.collideWithWorld = j.value("collideWithWorld", c.collideWithWorld);
     c.shakeAmplitude = j.value("shakeAmplitude", c.shakeAmplitude);
     c.shakeFrequency = j.value("shakeFrequency", c.shakeFrequency);
+
+    // ---- 运镜体系（缺键 = 出厂默认，老场景一个字节都不用改）----
+    c.focal = j.value("focal", c.focal);
+    c.sensorHeight = j.value("sensorHeight", c.sensorHeight);
+    c.shiftX = j.value("shiftX", c.shiftX);
+    c.shiftY = j.value("shiftY", c.shiftY);
+    c.rollDeg = j.value("rollDeg", c.rollDeg);
+    c.clipNear = j.value("clipNear", c.clipNear);
+    c.clipFar = j.value("clipFar", c.clipFar);
+    c.shutterAngle = j.value("shutterAngle", c.shutterAngle);
+    if (j.contains("pathGuid") && j["pathGuid"].is_string()) {
+        c.pathGuid = ecs::parseGuidHex(j["pathGuid"].get<std::string>());
+    }
+
+    if (j.contains("lookTargetGuid") && j["lookTargetGuid"].is_string()) {
+        c.lookTargetGuid =
+            ecs::parseGuidHex(j["lookTargetGuid"].get<std::string>());
+    }
+    c.lookDamping = j.value("lookDamping", c.lookDamping);
+    c.handheldDeg = j.value("handheldDeg", c.handheldDeg);
+    c.handheldHz = j.value("handheldHz", c.handheldHz);
+    c.handheldSeed = j.value("handheldSeed", c.handheldSeed);
+    c.handheldPosM = j.value("handheldPosM", c.handheldPosM);
+
+    c.dofEnabled = j.value("dofEnabled", c.dofEnabled);
+    c.fStop = j.value("fStop", c.fStop);
+    c.focusDistance = j.value("focusDistance", c.focusDistance);
+    if (j.contains("focusGuid") && j["focusGuid"].is_string()) {
+        c.focusGuid = ecs::parseGuidHex(j["focusGuid"].get<std::string>());
+    }
     return c;
+}
+
+// ---------------- 运镜路径（Follow Path，2026-10-30）----------------
+//
+// 点位写成**扁平数组** `[x,y,z, x,y,z, …]` 而不是 `[{"x":…},…]`：一条路径
+// 动辄十几个点，对象形式会让场景文件膨胀三到五倍，diff 也没法看。
+// 非默认值才写的规矩与相机组件同一条（`sceneHash` 不能变）。
+json cameraPathToJson(const ecs::CameraPathComponent& p) {
+    json arr = json::array();
+    for (const glm::vec3& v : p.points) {
+        arr.push_back(v.x);
+        arr.push_back(v.y);
+        arr.push_back(v.z);
+    }
+    json j;
+    j["points"] = std::move(arr);
+    if (p.closed) j["closed"] = true;
+    if (p.progress != 0.0f) j["progress"] = p.progress;
+    if (p.speed != 0.0f) j["speed"] = p.speed;
+    if (!p.lookAlong) j["lookAlong"] = false;
+    if (p.yawOffsetDeg != 0.0f) j["yawOffsetDeg"] = p.yawOffsetDeg;
+    return j;
+}
+
+ecs::CameraPathComponent cameraPathFromJson(const json& j) {
+    ecs::CameraPathComponent p;
+    if (!j.is_object()) return p;
+    if (j.contains("points") && j["points"].is_array()) {
+        const json& a = j["points"];
+        // ⚠ 长度不是 3 的倍数 → **整条丢弃**并留一条 WARN。半条路径会让
+        //   相机停在一个没人摆过的位置，比"这台相机没有路径"难查得多。
+        if (a.size() % 3 == 0) {
+            p.points.reserve(a.size() / 3);
+            for (std::size_t i = 0; i + 2 < a.size(); i += 3) {
+                p.points.emplace_back(a[i].get<float>(), a[i + 1].get<float>(),
+                                      a[i + 2].get<float>());
+            }
+        } else {
+            VK_LOG_WARN("SCENE-PATH 点位数组长度 %zu 不是 3 的倍数 → 整条路径丢弃",
+                        a.size());
+        }
+    }
+    p.closed = j.value("closed", p.closed);
+    p.progress = j.value("progress", p.progress);
+    p.speed = j.value("speed", p.speed);
+    p.lookAlong = j.value("lookAlong", p.lookAlong);
+    p.yawOffsetDeg = j.value("yawOffsetDeg", p.yawOffsetDeg);
+    return p;
 }
 
 // ============================================================
@@ -3121,6 +3240,9 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
         je["physicsMaterial"] = physicsMaterialToJson(*pmat);
     if (const auto* cam = w.get<ecs::CameraComponent>(e))
         je["camera"] = cameraComponentToJson(*cam);
+    // 运镜路径（2026-10-30）。挂在**独立实体**上，由相机的 `pathGuid` 指过来。
+    if (const auto* cp = w.get<ecs::CameraPathComponent>(e))
+        je["cameraPath"] = cameraPathToJson(*cp);
 
     // 动画键盘映射（P4）。空表不写（理由见 animKeyMapToJson）。
     if (const auto* akm = w.get<ecs::AnimKeyMapComponent>(e)) {
@@ -3211,6 +3333,7 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
         je.contains("joint") ||
         je.contains("character") || je.contains("trigger") ||
         je.contains("physicsMaterial") || je.contains("camera") ||
+        je.contains("cameraPath") ||
         je.contains("skinned") || je.contains("animator") ||
         je.contains("morph") ||
         // 表演层三件套 + IK + 挂点。**必须在这里**：一个只挂 IK/挂点的
@@ -3752,6 +3875,13 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
         else
             w.add<ecs::PhysicsMaterialComponent>(e, pm);
     }
+    if (je.contains("cameraPath") && je["cameraPath"].is_object()) {
+        const ecs::CameraPathComponent cp = cameraPathFromJson(je["cameraPath"]);
+        if (auto* p = w.get<ecs::CameraPathComponent>(e))
+            *p = cp;
+        else
+            w.add<ecs::CameraPathComponent>(e, cp);
+    }
     if (je.contains("camera") && je["camera"].is_object()) {
         const ecs::CameraComponent cm =
             cameraComponentFromJson(je["camera"]);
@@ -3796,6 +3926,7 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
         je.contains("joint") ||
         je.contains("character") || je.contains("trigger") ||
         je.contains("physicsMaterial") || je.contains("camera") ||
+        je.contains("cameraPath") ||
         je.contains("skinned") || je.contains("animator") ||
         je.contains("morph") ||
         // 表演层三件套 + IK + 挂点。**必须在这里**：一个只挂 IK/挂点的

@@ -3,6 +3,7 @@
 #include "core/Logger.h"
 #include "ecs/Components.h"
 #include "scene/Camera.h"
+#include "scene/CameraMove.h"   // 运镜算子（aimAt / applyHandheld / 焦距换算）
 #include "scene/Scene.h"
 
 #include <algorithm>
@@ -12,6 +13,8 @@
 namespace scene {
 
 namespace {
+
+constexpr float kPi = 3.14159265358979f;
 
 // 角度插值走"最短弧"：yaw 从 179° 混到 -179° 应该转 2°，
 // 而不是 358°（否则一次切镜头看起来像原地甩了一圈）。
@@ -33,6 +36,12 @@ CameraPose lerpPose(const CameraPose& a, const CameraPose& b, float t) {
     p.yaw = lerpAngle(a.yaw, b.yaw, t);
     p.pitch = a.pitch + (b.pitch - a.pitch) * t;
     p.fov = a.fov + (b.fov - a.fov) * t;
+    // roll 与 yaw 同理走最短弧：179° 混到 -179° 该转 2°，不是 358°
+    // （否则混合一次镜头会原地翻一圈 —— 这是 roll 独有的坑，pitch 夹在
+    // ±89° 里永远不会碰到绕圈的问题）。
+    p.roll = lerpAngle(a.roll, b.roll, t);
+    p.shiftX = a.shiftX + (b.shiftX - a.shiftX) * t;
+    p.shiftY = a.shiftY + (b.shiftY - a.shiftY) * t;
     return p;
 }
 
@@ -55,19 +64,50 @@ void CameraSystem::selectActive(Scene& scene) {
     ecs::Entity best{};
     int bestPriority = -1000000;
     bool found = false;
+    // 本帧是不是"导演说了算"。只影响日志用的是哪一条（CAM-CUT / CAM-ACTIVE），
+    // 不改变后续处理 —— 切完之后的相机就是普通相机。
+    bool directed = false;
 
-    scene.world().each<ecs::CameraComponent>(
-        [&](ecs::Entity e, ecs::CameraComponent& cc) {
-            if (!cc.enabled) return;
-            // 优先级高者胜；**同分取实体 id 较小的** —— 遍历顺序一变就换
-            // 镜头是"偶发 bug"的典型来源，这里把它钉死成确定性的。
-            if (!found || cc.priority > bestPriority ||
-                (cc.priority == bestPriority && e.id < best.id)) {
-                best = e;
-                bestPriority = cc.priority;
-                found = true;
+    // ---- 导演覆盖（多机位切镜）先试 ----
+    // ⚠ 放在 priority 扫描**之前**：覆盖一旦生效，扫描根本不该跑（跑了也
+    //   只是白算一遍然后被丢弃，还会让"这台相机被选中过"的直觉落空）。
+    if (m_directorGuid != 0) {
+        const ecs::Entity de = scene.world().find(m_directorGuid);
+        const auto* dcc =
+            de.valid() ? scene.world().get<ecs::CameraComponent>(de) : nullptr;
+        if (dcc && dcc->enabled) {
+            best = de;
+            bestPriority = dcc->priority;
+            found = true;
+            directed = true;
+        } else {
+            // marker 指向的相机被删 / 被禁用。**必须回落到 priority**：
+            // 永久卡在"没有活跃相机"会让整个画面冻在上一帧，而且日志里
+            // 只有一条早已刷过去的 WARN。
+            if (!m_directorWarned) {
+                VK_LOG_WARN("CAM-CUT-MISS guid=%s (no enabled CameraComponent) — "
+                            "falling back to priority",
+                            ecs::guidToHex(m_directorGuid).c_str());
+                m_directorWarned = true;
             }
-        });
+            m_directorGuid = 0;
+        }
+    }
+
+    if (!found) {
+        scene.world().each<ecs::CameraComponent>(
+            [&](ecs::Entity e, ecs::CameraComponent& cc) {
+                if (!cc.enabled) return;
+                // 优先级高者胜；**同分取实体 id 较小的** —— 遍历顺序一变就换
+                // 镜头是"偶发 bug"的典型来源，这里把它钉死成确定性的。
+                if (!found || cc.priority > bestPriority ||
+                    (cc.priority == bestPriority && e.id < best.id)) {
+                    best = e;
+                    bestPriority = cc.priority;
+                    found = true;
+                }
+            });
+    }
 
     if (!found) {
         m_hasActive = false;
@@ -81,11 +121,47 @@ void CameraSystem::selectActive(Scene& scene) {
         m_hasActive = true;
         const std::string* nm = scene.world().name(best);
         m_activeName = nm ? *nm : "?";
-        VK_LOG_INFO("CAM-ACTIVE name=%s priority=%d", m_activeName.c_str(),
-                    bestPriority);
+        // 两条不同前缀是**故意**的：`CAM-CUT` 是"叙事切镜"（作者在时间轴上
+        // 决定的），`CAM-ACTIVE` 是"优先级扫描"（场景摆好就定了）。用例要能
+        // 分开数 —— 数 `CAM-ACTIVE` 数不出切镜有没有发生。
+        if (directed) {
+            VK_LOG_INFO("CAM-CUT name=%s guid=%s priority=%d",
+                        m_activeName.c_str(),
+                        ecs::guidToHex(m_directorGuid).c_str(), bestPriority);
+        } else {
+            VK_LOG_INFO("CAM-ACTIVE name=%s priority=%d", m_activeName.c_str(),
+                        bestPriority);
+        }
     }
     m_active = best;
     m_hasActive = true;
+}
+
+void CameraSystem::setDirectorCamera(std::uint64_t guid) {
+    if (m_directorGuid == guid) return;
+    m_directorGuid = guid;
+    // 换了目标就允许再喊一次"找不到" —— 否则第一条 MISS 之后，后面每一台
+    // 被删的相机都静默。
+    m_directorWarned = false;
+    if (guid == 0) VK_LOG_INFO("CAM-CUT clear (director released)");
+}
+
+void CameraSystem::clearDirectorCamera() { setDirectorCamera(0); }
+
+void CameraSystem::blendCut(float seconds) {
+    m_blendFrom = m_applied;   // 起点 = 这一帧画面上真实的姿态（含上一次混合）
+    m_blendDur = std::max(seconds, 0.0f);
+    m_blendT = 0.0f;
+    m_blendActive = m_blendDur > 1.0e-4f;
+    m_blendSmooth = true;
+    // ⚠ **不**碰 m_desired / m_hasDesired：目标要每帧现算（见 .h 里那一段）。
+    if (m_blendActive) {
+        VK_LOG_INFO("CAM-CUT blend dur=%.2fs from=(%.2f,%.2f,%.2f)",
+                    static_cast<double>(m_blendDur),
+                    static_cast<double>(m_blendFrom.position.x),
+                    static_cast<double>(m_blendFrom.position.y),
+                    static_cast<double>(m_blendFrom.position.z));
+    }
 }
 
 CameraPose CameraSystem::poseFromEntity(Scene& scene, ecs::Entity e) const {
@@ -95,8 +171,29 @@ CameraPose CameraSystem::poseFromEntity(Scene& scene, ecs::Entity e) const {
     const glm::vec3 fwd = glm::normalize(glm::vec3(w[0]));  // 实体局部 +X = 视线
     p.yaw = std::atan2(fwd.y, -fwd.x);
     p.pitch = std::asin(std::clamp(-fwd.z, -1.0f, 1.0f));
-    if (const auto* cc = scene.world().get<ecs::CameraComponent>(e))
-        p.fov = cc->fov;
+
+    // roll 从**实体自己的 up（局部 +Z）**读回来。
+    // ⚠ 不读这一条，`cameraEulerFor` 写出去的 roll 会在下一次 `poseFromEntity`
+    //   里被悄悄抹平 —— 表现是"实体在场景树里看着是歪的，一进 Play 就正了"，
+    //   而且只在有滚转的镜头上出现。
+    //   poseUp = u·cos(r) + right·sin(r) ⇒ r = atan2(dot(up,right), dot(up,u))。
+    {
+        const glm::vec3 up = glm::normalize(glm::vec3(w[2]));
+        const glm::vec3 r0 = poseRight(p);
+        const glm::vec3 u0 = poseUp(p);   // roll 还是 0，就是 tilt 之后的 up
+        if (std::fabs(glm::dot(up, r0)) > 1.0e-5f ||
+            std::fabs(glm::dot(up, u0)) > 1.0e-5f) {
+            p.roll = std::atan2(glm::dot(up, r0), glm::dot(up, u0));
+        }
+    }
+    if (const auto* cc = scene.world().get<ecs::CameraComponent>(e)) {
+        // 焦距优先：装了定焦镜头（focal > 0）就以镜头为准，fov 只是它算出来的
+        // 结果。⚠ 这里与 `apply` 里那次换算**必须一致**（同一个函数、同一组
+        // 参数），否则"从实体推姿态"和"外部给意图"两条路会得到两个 fov，
+        // 画面在混合的最后一帧跳一下。
+        p.fov = (cc->focal > 0.0f) ? focalToFovY(cc->focal, cc->sensorHeight)
+                                   : cc->fov;
+    }
     return p;
 }
 
@@ -173,16 +270,147 @@ void CameraSystem::update(Scene& scene, float dt) {
     // 震动衰减（1.8 = 约 0.55 秒从满到零）
     if (m_trauma > 0.0f) m_trauma = std::max(0.0f, m_trauma - dt * 1.8f);
 
-    apply(scene);
+    apply(scene, dt);
 }
 
-void CameraSystem::apply(Scene& scene) {
+void CameraSystem::apply(Scene& scene, float dt) {
     Camera& cam = scene.camera();
 
     CameraPose p = m_applied;
     float amp = 0.0f;
-    if (const auto* cc = scene.world().get<ecs::CameraComponent>(m_active))
+    if (const auto* cc = scene.world().get<ecs::CameraComponent>(m_active)) {
         amp = cc->shakeAmplitude;
+
+        // ============================================================
+        // 运镜体系（2026-10-30）—— 组件属性叠加到**已经是意图值**的姿态上
+        //
+        // ⚠⚠ 顺序是硬约束，从上到下都不能换：
+        //   ① 焦距 → 覆盖 fov（光学，最"物理"）
+        //   ② Track To → 覆盖 yaw/pitch（朝向层）
+        //   ③ roll / shift → **叠加**（镜头安装角，与运镜的 roll 是两回事：
+        //      过场关键帧可以让镜头歪一点，同时这颗镜头自己也歪 2°）
+        //   ④ 手持 → 最后叠（它是在一切之上的微抖）
+        //   把 ④ 放到 ② 前面，手持会被 aimAt 整个抹掉 —— 表现是"手持开了，
+        //   但一配注视目标就不抖了"，几乎没人会往这个方向想。
+        // ============================================================
+        if (cc->focal > 0.0f)
+            p.fov = focalToFovY(cc->focal, cc->sensorHeight);
+
+        // ---- Follow Path：位置由路径决定（**覆盖**关键帧给的位置）----
+        //
+        // ⚠ 必须在 Track To **之前**：Track To 是朝向层，它要覆盖"沿切线看"。
+        //   反过来写的话，"沿路径走 + 始终盯着主体"会退化成"沿切线看"。
+        if (cc->pathGuid != 0) {
+            const ecs::Entity pe = scene.world().find(cc->pathGuid);
+            const auto* pc = pe.valid()
+                                 ? scene.world().get<ecs::CameraPathComponent>(pe)
+                                 : nullptr;
+            if (pc && pc->points.size() >= 2) {
+                // 只在路径内容变了时重建弧长表（点位数量 + 首末点 + 闭合位
+                // 的粗略签名）。⚠ 不能每帧 `smoothHandles()`：它要分配，
+                // 而且"路径中途被拖动"本来就应该重建 —— 用签名判断两头都占。
+                const std::size_t np = pc->points.size();
+                const glm::vec3 a0 = pc->points.front();
+                const glm::vec3 a1 = pc->points.back();
+                if (m_pathGuid != cc->pathGuid || m_pathPts != np ||
+                    m_pathClosed != pc->closed || m_pathA0 != a0 ||
+                    m_pathA1 != a1) {
+                    m_path.points.clear();
+                    m_path.points.reserve(np);
+                    for (const glm::vec3& q : pc->points) {
+                        CameraPathPoint cp;
+                        cp.position = q;
+                        m_path.points.push_back(cp);
+                    }
+                    m_path.closed = pc->closed;
+                    m_path.smoothHandles();
+                    m_pathGuid = cc->pathGuid;
+                    m_pathPts = np;
+                    m_pathClosed = pc->closed;
+                    m_pathA0 = a0;
+                    m_pathA1 = a1;
+                    m_pathSeg = -1;
+                }
+
+                float u = pc->progress + m_time * pc->speed;
+                u = u - std::floor(u);   // 负数也要绕回 [0,1)
+
+                glm::vec3 tan(1.0f, 0.0f, 0.0f);
+                const glm::vec3 pos = m_path.sample(u, &tan);
+                p.position = pos;
+
+                if (pc->lookAlong) {
+                    const float tl = glm::length(tan);
+                    if (tl > 1.0e-5f) {
+                        aimAt(p, pos + tan / tl);
+                    }
+                    if (pc->yawOffsetDeg != 0.0f)
+                        p.yaw += pc->yawOffsetDeg * kPi / 180.0f;
+                }
+
+                if (m_trace) {
+                    const int seg = m_path.segmentAt(u);
+                    if (seg != m_pathSeg) {
+                        m_pathSeg = seg;
+                        VK_LOG_INFO("CAM-PATH name=%s u=%.3f seg=%d/%d len=%.2f "
+                                    "pos=(%.2f,%.2f,%.2f)",
+                                    m_activeName.c_str(), u, seg,
+                                    m_path.segmentCount(), m_path.length(),
+                                    pos.x, pos.y, pos.z);
+                    }
+                }
+            } else {
+                // 路径实体没了 / 点不够：保留关键帧的位置，**不清零**。
+                // 清零会把镜头拽到世界原点，而这多半只是路径被误删。
+                m_pathGuid = 0;
+                m_pathSeg = -1;
+            }
+        } else {
+            m_pathGuid = 0;
+            m_pathSeg = -1;
+        }
+
+        if (cc->lookTargetGuid != 0) {
+            const ecs::Entity te = scene.world().find(cc->lookTargetGuid);
+            if (te.valid()) {
+                const glm::vec3 tp = glm::vec3(scene.worldMatrix(te)[3]);
+                if (!m_lookValid) {
+                    // 首帧：直接落在目标上（不要从原点"飞过去"—— 那会在
+                    // 进 Play 的第一秒看到镜头从世界原点甩到人脸上）。
+                    m_lookPoint = tp;
+                    m_lookValid = true;
+                }
+                if (cc->lookDamping > 1.0e-3f) {
+                    // 指数逼近：`1 − exp(−dt/τ)` 与帧率**无关**
+                    // （线性插 `dt/τ` 会让 30fps 与 144fps 跟出两条不同轨迹，
+                    // 而"手感"这东西正是要跨帧率一致的）。
+                    const float k =
+                        1.0f - std::exp(-std::max(dt, 0.0f) / cc->lookDamping);
+                    m_lookPoint += (tp - m_lookPoint) * k;
+                } else {
+                    m_lookPoint = tp;
+                }
+                aimAt(p, m_lookPoint);
+            } else {
+                // 目标被销毁了：停在当前朝向，而不是保留一个幽灵注视点
+                m_lookValid = false;
+            }
+        } else {
+            m_lookValid = false;
+        }
+
+        if (cc->rollDeg != 0.0f) p.roll += cc->rollDeg * kPi / 180.0f;
+        p.shiftX += cc->shiftX;
+        p.shiftY += cc->shiftY;
+
+        applyHandheld(p, m_time, cc->handheldDeg, cc->handheldHz,
+                      cc->handheldSeed, cc->handheldPosM);
+    } else {
+        // 没有组件时不该走到这里（apply 只在 m_hasActive 时被调），
+        // 但注视点的黏性必须清掉 —— 否则下一次换回带 Track To 的相机会
+        // 从上一台的位置"飞"过来。
+        m_lookValid = false;
+    }
 
     // ⚠ 只有**两者都非零**才加偏移：amplitude 默认 0 → 关震动时写进相机的
     //   值与不震逐位相同（这是 G09 的验收条款）。
@@ -203,6 +431,22 @@ void CameraSystem::apply(Scene& scene) {
     cam.setYaw(p.yaw);
     cam.setPitch(p.pitch);
     cam.setPosition(p.position);
+    // ⚠ 运镜三通道（roll / shift）必须与 `applyPoseToSceneCamera` **同款**。
+    //   漏一处 = "过场里歪着、游玩时正的"或者反过来的鬼影 —— 而且那种
+    //   不一致只在**同时**用到时间轴与 CameraSystem 的工程里出现。
+    cam.setRoll(p.roll);
+    cam.setShift(p.shiftX, p.shiftY);
+
+    // 镜头裁剪面。0 = **不碰**（保持引擎全局默认 / 编辑器视口那一套）。
+    // ⚠ 这里必须"不设"而不是"设成默认值"：编辑器视口用的是另一套近远平面
+    //   （见 EditorContext::applyEditorCameraMode），无脑回写 0.1/200 会把
+    //   正在高空俯视的视口里那一片地面裁掉。
+    if (const auto* ccl = scene.world().get<ecs::CameraComponent>(m_active)) {
+        if (ccl->clipNear > 0.0f) {
+            cam.setClipPlanes(ccl->clipNear,
+                              ccl->clipFar > 0.0f ? ccl->clipFar : cam.farPlane());
+        }
+    }
 
     if (m_trace) {
         char buf[256];

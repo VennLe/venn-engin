@@ -11,6 +11,7 @@
 #include "ecs/Components.h"
 #include "i18n/I18n.h"
 #include "physics/PhysicsWorld.h"
+#include "scene/CameraMove.h"   // 镜头光学换算（fStop→光圈 / 快门角→模糊）
 #include "scene/CameraSystem.h"
 #include "scene/ModelInstance.h"
 #include "scene/Scene.h"
@@ -698,7 +699,13 @@ void RuntimeApp::onInit() {
         seq.tick(activeScene(), vdt);
         if (seq.hasPose())
             scene::activeCameraSystem().setDesiredPose(seq.pose());
+        // ---- 多机位切镜（运镜体系 §七）----
+        // ⚠⚠ 位置同样是硬约束：**seq.tick 之后、update 之前**（理由见
+        //   `syncDirectorCamera` 的注释）。它可能 `clearDesiredPose()`，
+        //   所以必须排在上面两行之后 —— 排在前面会被它们又覆盖回去。
+        syncDirectorCamera();
         scene::activeCameraSystem().update(activeScene(), vdt);
+        applyCameraLensEffects();
 
         // ---- 对话 / 字幕（C2）----
         // ⚠ 位置同样是硬约束：**时间轴之后**。`kind=Line` 的事件是在
@@ -984,6 +991,11 @@ void RuntimeApp::applyPendingSceneSwitch() {
     //      在新世界上了。
     sequence::activeSequencerSystem().resetRuntime(activeScene());
     dialogue::activeDialogueSystem().resetRuntime(activeScene());
+    // 导演覆盖也得撒手：它记着的是**旧世界**的 guid。不清的话新场景里
+    // 那一串 hex 找不到实体 → 每帧一条 `CAM-CUT-MISS`，然后回落到 priority
+    // （画面是对的，但日志被刷满，而且"新场景第一镜"要多等一帧）。
+    scene::activeCameraSystem().clearDirectorCamera();
+    m_cutSig.clear();
 
     // ② 玩家控制器握着实体句柄 + 物理世界指针，必须在新世界建好之前放掉。
     if (m_player) {
@@ -1519,6 +1531,105 @@ void RuntimeApp::tickUi(float dt) {
 //   ① 取"物理真值"（PlayerController 的水平速度 / 贴地标志）；
 //   ② 把 RuntimeConfig 的 player 块翻译成 LocomotionConfig；
 //   ③ 轮询 `AnimKeyMapComponent` 的按键映射（角色面板里绑的那几个键）。
+void RuntimeApp::syncDirectorCamera() {
+    sequence::SequencerSystem& seq = sequence::activeSequencerSystem();
+    scene::CameraSystem& cs = scene::activeCameraSystem();
+
+    const std::uint64_t want = seq.shotCameraGuid();
+
+    if (want == 0) {
+        // 没有 marker / 这一段是"回关键帧轨"。释放覆盖（幂等，同值不做事）。
+        cs.clearDirectorCamera();
+        return;
+    }
+
+    // ⚠⚠ 先清 desired。玩家控制器在 `updateVariable` 开头就喂过一次，
+    //   时间轴有 pose 时上面也喂过 —— 那份 desired 会让 CameraSystem 走
+    //   "用 desired"分支，marker 选中的机位**根本不动**（画面停在玩家视角
+    //   或导演轨上），而 `CAM-CUT` 日志照样打出来。表现是"切镜不生效，
+    //   但日志说切了"，极难查。
+    cs.clearDesiredPose();
+
+    const bool changed = (cs.directorCamera() != want);
+    cs.setDirectorCamera(want);
+
+    if (changed) {
+        // 混合时长是**这一次 marker** 的属性，不是相机的属性 —— 每次切换
+        // 都重新取。0 = 硬切（不调用 blendCut，姿态直接跳过去）。
+        const float b = seq.shotBlendSeconds();
+        if (b > 0.0f) cs.blendCut(b);
+
+        // 日志去重：只在"机位真的变了"打一条。`SEQ-SHOT` 已经打过一次
+        // （时间轴视角），这一条是**运行时视角**，用来证明那条结论真的
+        // 落到了相机上 —— 两条都要能单独数（用例分别断言）。
+        const std::string sig = std::to_string(seq.shotIndex()) + "|" +
+                                std::to_string(want) + "|" +
+                                std::to_string(static_cast<int>(b * 100.0f));
+        if (m_cutSig != sig) {
+            m_cutSig = sig;
+            VK_LOG_INFO("CAM-CUT-RT shot=%d cam=%s blend=%.2f",
+                        seq.shotIndex(), ecs::guidToHex(want).c_str(),
+                        static_cast<double>(b));
+        }
+    }
+}
+
+void RuntimeApp::applyCameraLensEffects() {
+    const ecs::Entity e = scene::activeCameraSystem().activeEntity();
+    ecs::World& w = activeScene().world();
+    const auto* cc = e.valid() ? w.get<ecs::CameraComponent>(e) : nullptr;
+    if (!cc) return;
+
+    const std::uint64_t guid = w.guid(e);
+    render::CameraEffectSettings& fx = renderer().cameraEffects();
+
+    // 换相机：把**上一次自己写进去的**两项复位。
+    // ⚠ 只复位这两项，别的（色差 / 暗角 / 体积覆盖）不碰 —— 那不是镜头
+    //   参数管的东西，顺手清掉会让"换相机 = 画面回暖"变成一个谜。
+    if (guid != m_lensCam) {
+        fx.dof = false;
+        fx.motionBlur = false;
+        m_lensCam = guid;
+    }
+
+    // ---- 景深 ----
+    float focus = 0.0f;
+    float aperture = 0.0f;
+    if (cc->dofEnabled) {
+        focus = cc->focusDistance;
+        if (cc->focusGuid != 0) {
+            const ecs::Entity te = w.find(cc->focusGuid);
+            if (te.valid()) {
+                const glm::vec3 tp = glm::vec3(activeScene().worldMatrix(te)[3]);
+                focus = glm::length(tp - activeScene().camera().position());
+            }
+        }
+        aperture = scene::fStopToDofAperture(
+            cc->fStop, cc->focal > 0.0f ? cc->focal : 50.0f);
+        fx.dof = true;
+        fx.dofFocus = focus;
+        fx.dofAperture = aperture;
+    }
+
+    // ---- 快门（运动模糊）----
+    float blur = 0.0f;
+    if (cc->shutterAngle > 0.0f) {
+        blur = scene::shutterToBlurStrength(cc->shutterAngle);
+        fx.motionBlur = true;
+        fx.motionBlurStrength = blur;
+    }
+
+    // ---- 日志（只在变化时打）----
+    char sig[256];
+    std::snprintf(sig, sizeof(sig), "cam=%llx dof=%d focus=%.2f ap=%.2f sh=%.0f blur=%.2f",
+                  static_cast<unsigned long long>(guid), cc->dofEnabled ? 1 : 0,
+                  focus, aperture, cc->shutterAngle, blur);
+    if (m_lensSig != sig) {
+        m_lensSig = sig;
+        VK_LOG_INFO("CAM-LENS %s", sig);
+    }
+}
+
 void RuntimeApp::tickPlayerAnimation(float dt) {
     if (!m_player || !m_player->attached()) return;
 
@@ -1543,6 +1654,13 @@ void RuntimeApp::tickPlayerAnimation(float dt) {
     cfg.runSpeed = pv.runSpeed;
     cfg.restartOnSwitch = pv.restartOnSwitch;
     cfg.idleTriggerSec = pv.idleTriggerSec;
+    // A4 步幅匹配（2026-10-30）：四个数全部来自 game.json 的 player 块。
+    cfg.strideMatch = pv.strideMatch;
+    cfg.strideMinRate = pv.strideMinRate;
+    cfg.strideMaxRate = pv.strideMaxRate;
+    cfg.walkStrideSpeed = pv.walkStrideSpeed;
+    cfg.runStrideSpeed = pv.runStrideSpeed;
+    cfg.strideCurve = pv.strideCurve;
 
     // 走 / 跑分界自动值的输入：控制器最大速度（没有就退回 4.5）
     const auto* cc = w.get<ecs::CharacterControllerComponent>(pe);
@@ -1635,6 +1753,8 @@ void RuntimeApp::simulate(float dt) {
     // ---- 骨骼动画（A0-3）----
     // 排在物理之前，与编辑器 Play 同位置：将来 A4 的根运动会把位移写进
     // TransformComponent，物理必须读到它这一帧的最终值。
+    // A4b：相位速率曲线是"一次 tick 全体生效"的开关，设在 tick **之前**。
+    m_animator.setStrideCurve(m_cfg.player.strideCurve);
     m_animator.tick(activeScene(), dt);
 
     if (m_binding.world) {

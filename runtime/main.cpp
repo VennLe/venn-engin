@@ -57,6 +57,7 @@
 
 #include "core/InputMap.h"
 #include "scene/CameraSystem.h"
+#include "scene/CameraMove.h"   // 运镜算子自检（--selftest cameramove）
 #include "scene/Prefab.h"
 #include "scene/PersistenceSelfTest.h"
 #include "scene/SceneIoSelfTest.h"
@@ -542,6 +543,12 @@ int main(int argc, char** argv) {
             return physics::runContactSelfTest() == 0 ? 0 : 1;
         if (cfg.selftest == "camera")
             return scene::runCameraSelfTest() == 0 ? 0 : 1;
+        // 运镜体系（2026-10-30）：九个动词是**增量算子**（推两次要能累加）、
+        // 镜头光学是纯换算（focal ⇄ fov ⇄ f-stop 的离焦量）、
+        // roll/shift 是**新加进老结构**的通道 —— 最后一组专门钉"默认 0 时
+        // 老画面逐位不变"。无窗口、无设备，几毫秒。
+        if (cfg.selftest == "cameramove")
+            return scene::runCameraMoveSelfTest() == 0 ? 0 : 1;
         // C1 过场时间轴：解析 / 采样（含 yaw 最短弧 + step）/ 事件半开区间 /
         // 播放器（首帧 t=0、起点晚播不补发、夹步长、循环回绕、编辑态）。
         // 全部是纯数值 —— 不建 Vulkan 设备，几毫秒跑完。

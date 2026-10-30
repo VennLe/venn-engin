@@ -7,6 +7,7 @@
 #include "animation/Curve.h"
 #include "assets/AssetPath.h"
 #include "core/Logger.h"
+#include "ecs/Entity.h"   // guidToHex / parseGuidHex（多机位 marker 绑实体）
 
 #include <nlohmann/json.hpp>
 
@@ -81,6 +82,10 @@ float SequenceAsset::lastCameraTime() const {
 
 float SequenceAsset::lastEventTime() const {
     return events.empty() ? 0.0f : events.back().t;
+}
+
+float SequenceAsset::lastShotTime() const {
+    return shots.empty() ? 0.0f : shots.back().t;
 }
 
 // ---------------------------------------------------------------- 解析
@@ -189,6 +194,40 @@ bool parseSequence(const std::string& text, const std::string& sourcePath,
         }
     }
 
+    // ---- 多机位 marker ----
+    //
+    // ⚠ 解析**不校验 guid 是否存在于场景**：资产不认识场景（可能先写资产再
+    //   摆相机，也可能换工程复用）。指向不存在的实体时由 `CameraSystem`
+    //   在运行时回落到"关键帧轨"并打一次 WARN —— 那里才有场景。
+    if (j.contains("shots") && j["shots"].is_array()) {
+        int idx = 0;
+        for (const auto& s : j["shots"]) {
+            SeqShot sh;
+            sh.t = s.value("t", 0.0f);
+            // `camera` 是十六进制字符串（与场景 JSON 的 `guid` 同一写法）。
+            // 缺省 / 空串 / 全零 → 0 = "回落到关键帧轨"（合法值，见 .h ②）。
+            const std::string cam = s.value("camera", std::string());
+            if (!cam.empty()) {
+                sh.cameraGuid = ecs::parseGuidHex(cam);
+                // ⚠⚠ `parseGuidHex` 要求**恰好 16 位**十六进制（低位要补零），
+                //   不满足时返回 0 = "回落关键帧轨"。于是"手写一个短 guid"
+                //   会静默退化成老行为 —— 画面照常动，只是不切机位，极难查。
+                //   这里把它显式记一条警告（非致命：整份资产仍可播）。
+                if (sh.cameraGuid == 0) {
+                    out.warnings.push_back(
+                        "shot #" + std::to_string(idx) + ": camera '" + cam +
+                        "' is not a 16-digit hex guid — falling back to the "
+                        "camera-key track");
+                }
+            }
+            sh.blendSeconds = std::max(0.0f, s.value("blend", 0.0f));
+            sh.label = s.value("label", std::string());
+            out.shots.push_back(std::move(sh));
+            ++idx;
+        }
+        (void)idx;
+    }
+
     // ---- 排序（见文件头 ②）----
     // ⚠ 用 stable_sort：同一 t 上的多个事件保持作者的书写顺序。
     //   普通 sort 会把它们换个位置，日志读起来跟资产对不上。
@@ -198,6 +237,8 @@ bool parseSequence(const std::string& text, const std::string& sourcePath,
                      });
     std::stable_sort(out.events.begin(), out.events.end(),
                      [](const SeqEvent& a, const SeqEvent& b) { return a.t < b.t; });
+    std::stable_sort(out.shots.begin(), out.shots.end(),
+                     [](const SeqShot& a, const SeqShot& b) { return a.t < b.t; });
 
     // 重复关键帧：不致命（退化成硬切），但要让人知道。
     for (std::size_t i = 1; i < out.cameraKeys.size(); ++i) {
@@ -216,11 +257,24 @@ bool parseSequence(const std::string& text, const std::string& sourcePath,
         if (e.t < -kTimeEps)
             out.warnings.push_back("event '" + e.kind + "' with negative t=" +
                                    std::to_string(e.t));
+    for (std::size_t i = 0; i < out.shots.size(); ++i) {
+        if (out.shots[i].t < -kTimeEps)
+            out.warnings.push_back("shot marker #" + std::to_string(i) +
+                                   " with negative t=" + std::to_string(out.shots[i].t));
+        // 两个 marker 落在同一时刻：后写的赢（stable_sort 保序），前面那个
+        // 区间长度为 0 —— 它永远不会被 `shotIndexAt` 选中。不致命，但作者
+        // 多半是拖重叠了，要说。
+        if (i > 0 && std::fabs(out.shots[i].t - out.shots[i - 1].t) < kTimeEps) {
+            out.warnings.push_back(
+                "duplicate shot marker time t=" + std::to_string(out.shots[i].t) +
+                "s (the earlier one never becomes active)");
+        }
+    }
 
     // ---- duration ----
     const float explicitDur = j.value("duration", 0.0f);
     const float derived =
-        std::max({out.lastCameraTime(), out.lastEventTime(), 0.0f});
+        std::max({out.lastCameraTime(), out.lastEventTime(), out.lastShotTime(), 0.0f});
     if (explicitDur > kTimeEps) {
         out.duration = explicitDur;
         // 显式 duration 比内容短 → 后半段被切掉。这在"我加了台词却不播"里
@@ -245,8 +299,8 @@ bool parseSequence(const std::string& text, const std::string& sourcePath,
         }
     }
 
-    if (out.cameraKeys.empty() && out.events.empty()) {
-        out.error = "no 'camera' keys and no 'events' — nothing to play";
+    if (out.cameraKeys.empty() && out.events.empty() && out.shots.empty()) {
+        out.error = "no 'camera' keys, no 'events' and no 'shots' — nothing to play";
         return false;
     }
 
@@ -255,10 +309,11 @@ bool parseSequence(const std::string& text, const std::string& sourcePath,
     for (const auto& w : out.warnings)
         VK_LOG_WARN("SEQ-ASSET-WARN name=%s %s", out.name.c_str(), w.c_str());
 
-    VK_LOG_INFO("SEQ-ASSET name=%s dur=%.3f loop=%d keys=%d events=%d path=%s",
+    VK_LOG_INFO("SEQ-ASSET name=%s dur=%.3f loop=%d keys=%d events=%d shots=%d path=%s",
                 out.name.c_str(), static_cast<double>(out.duration),
                 out.loop ? 1 : 0, static_cast<int>(out.cameraKeys.size()),
-                static_cast<int>(out.events.size()), sourcePath.c_str());
+                static_cast<int>(out.events.size()),
+                static_cast<int>(out.shots.size()), sourcePath.c_str());
     return true;
 }
 
@@ -331,6 +386,26 @@ std::string toJson(const SequenceAsset& a) {
     }
     doc["camera"] = std::move(keys);
 
+    // 多机位 marker。**只在非空时写出**：老资产（没有多机位）存一次盘不该
+    // 冒出一行 `"shots": []` —— 那会让所有既有 `.seq.json` 的 diff 变脏，
+    // 也会让 `rt_*` 那组"写回再读回"的字节对比失去意义。
+    if (!a.shots.empty()) {
+        nlohmann::ordered_json shots = nlohmann::ordered_json::array();
+        for (const auto& s : a.shots) {
+            nlohmann::ordered_json js = nlohmann::ordered_json::object();
+            js["t"] = s.t;
+            // `camera` 缺省 = 0 = "回落到关键帧轨"，此时**不写这个键**
+            // （省略与写 "" 是同一件事，但 diff 里少一行噪声）。
+            if (s.cameraGuid != 0) js["camera"] = ecs::guidToHex(s.cameraGuid);
+            // blend 只在非 0（非硬切）时写：硬切是默认语义，写 `"blend": 0.0`
+            // 会让"这是一次硬切"看起来像"作者特意调成了 0"。
+            if (s.blendSeconds > 0.0f) js["blend"] = s.blendSeconds;
+            if (!s.label.empty()) js["label"] = s.label;
+            shots.push_back(std::move(js));
+        }
+        doc["shots"] = std::move(shots);
+    }
+
     nlohmann::ordered_json evs = nlohmann::ordered_json::array();
     for (const auto& e : a.events) {
         nlohmann::ordered_json je = nlohmann::ordered_json::object();
@@ -381,10 +456,12 @@ bool saveSequence(const std::string& path, const SequenceAsset& a,
         return false;
     }
 
-    VK_LOG_INFO("SEQ-SAVE path=%s full=%s keys=%d events=%d dur=%.3f bytes=%zu",
+    VK_LOG_INFO("SEQ-SAVE path=%s full=%s keys=%d events=%d shots=%d dur=%.3f "
+                "bytes=%zu",
                 path.c_str(), full.c_str(),
                 static_cast<int>(a.cameraKeys.size()),
                 static_cast<int>(a.events.size()),
+                static_cast<int>(a.shots.size()),
                 static_cast<double>(a.duration), text.size());
     return true;
 }
@@ -408,6 +485,20 @@ int cameraKeyIndexAt(const SequenceAsset& seq, float t) {
         if (seq.cameraKeys[static_cast<std::size_t>(i)].t <= t + kTimeEps) return i;
     }
     return 0;
+}
+
+int shotIndexAt(const SequenceAsset& seq, float t) {
+    const int n = static_cast<int>(seq.shots.size());
+    if (n <= 0) return -1;
+    // ⚠⚠ 与 `cameraKeyIndexAt` **故意不同**：早于第一个 marker 返回 −1，
+    //   而不是 0（见 `SeqShot` 的文件头 ③）。照抄上面那个函数是这里最容易
+    //   犯的错，症状是"黑场那 1 秒突然变成第一个机位的画面"。
+    if (t < seq.shots[0].t - kTimeEps) return -1;
+
+    for (int i = n - 1; i >= 0; --i) {
+        if (seq.shots[static_cast<std::size_t>(i)].t <= t + kTimeEps) return i;
+    }
+    return -1;
 }
 
 bool sampleCamera(const SequenceAsset& seq, float t, SeqCameraKey& out) {

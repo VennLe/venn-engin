@@ -16,6 +16,9 @@
 #include "animation/RootMotion.h"
 #include "animation/BoneAttachment.h"
 #include "animation/Pose.h"
+#include "animation/GaitCycle.h"
+#include "animation/Locomotion.h"
+#include "animation/StrideMatch.h"
 #include "animation/TwoBoneIK.h"
 #include "assets/Mesh.h"
 #include "assets/Model.h"
@@ -453,6 +456,101 @@ void buildRootFixture(Fixture& f,
 
 ecs::TransformComponent& xf(Fixture& f) {
     return *f.scene.world().get<ecs::TransformComponent>(f.root);
+}
+
+// ============================================================
+// 步态夹具：手工搭一具 1.7 m 的人形骨架
+// ============================================================
+//
+// 为什么手搭而不是加载 fbx：这条链要断的是"K 帧表 → 数值"的换算，不是
+// 导入器。手搭骨架每个关节的**世界位置都是写死的常量**，于是
+//   · 腿长 / 髋高 / 踝距 全部能手算（断言的期望值才有出处）；
+//   · "整具骨架转 37° 后读数不变"这条不变性才有意义 —— 真实资产带 yaw，
+//     但那是导入器给的，改了不好对照。
+//
+// 姿态：Z-up、朝 −Y、左侧 +X（右手系里的一个人：fwd×up=left）。
+// ⚠ 命名**刻意分成两套**（Mixamo / Rigify）：角色表的价值全在"换一套命名
+//   还能认出腿"，只测一套等于把那张候选名表当装饰。
+struct HumanoidBoneDef {
+    const char* mixamo;
+    const char* rigify;
+    int parent;      // 本表里的下标（-1 = 根）
+    glm::vec3 pos;   // 静止世界位置（米）
+};
+
+const HumanoidBoneDef kHumanoidBones[] = {
+    //                        Mixamo 名               Rigify 名      父   世界位置
+    {"mixamorig:Hips",        "hips",                 -1, {0.00f,  0.00f, 0.95f}},
+    {"mixamorig:Spine",       "spine",                 0, {0.00f,  0.00f, 1.05f}},
+    {"mixamorig:Spine2",      "chest",                 1, {0.00f,  0.00f, 1.25f}},
+    {"mixamorig:Neck",        "neck",                  2, {0.00f,  0.00f, 1.48f}},
+    {"mixamorig:Head",        "head",                  3, {0.00f,  0.00f, 1.58f}},
+    {"mixamorig:LeftArm",     "upper_arm.L",           2, {0.20f,  0.00f, 1.42f}},
+    {"mixamorig:LeftForeArm", "forearm.L",             5, {0.20f,  0.00f, 1.15f}},
+    {"mixamorig:LeftHand",    "hand.L",                6, {0.20f,  0.00f, 0.90f}},
+    {"mixamorig:RightArm",    "upper_arm.R",           2, {-0.20f, 0.00f, 1.42f}},
+    {"mixamorig:RightForeArm","forearm.R",             8, {-0.20f, 0.00f, 1.15f}},
+    {"mixamorig:RightHand",   "hand.R",                9, {-0.20f, 0.00f, 0.90f}},
+    // 腿：大腿 0.4205 + 小腿 0.4205 = 0.8409，髋高 0.84 → 静止时**几乎
+    // 伸直**（真人站着就是这样）。膝往前偏 2 cm 只是为了让极向量有个符号，
+    // "要不要下蹲"由 GaitParams::maxCrouch 决定，不靠夹具预留。
+    {"mixamorig:LeftUpLeg",   "thigh.L",               0, {0.10f,  0.00f, 0.92f}},
+    {"mixamorig:LeftLeg",     "shin.L",               11, {0.10f, -0.02f, 0.50f}},
+    {"mixamorig:LeftFoot",    "foot.L",               12, {0.10f,  0.00f, 0.08f}},
+    {"mixamorig:LeftToeBase", "toe.L",                13, {0.10f, -0.12f, 0.03f}},
+    {"mixamorig:RightUpLeg",  "thigh.R",               0, {-0.10f, 0.00f, 0.92f}},
+    {"mixamorig:RightLeg",    "shin.R",               15, {-0.10f,-0.02f, 0.50f}},
+    {"mixamorig:RightFoot",   "foot.R",               16, {-0.10f, 0.00f, 0.08f}},
+    {"mixamorig:RightToeBase","toe.R",                17, {-0.10f,-0.12f, 0.03f}},
+};
+
+constexpr int kHumanoidBoneCount =
+    static_cast<int>(sizeof(kHumanoidBones) / sizeof(kHumanoidBones[0]));
+
+// `preRotateDeg` 绕 Z 转整具骨架（不变性用）。所有骨都是单位旋转，
+// 所以"父的世界位置"直接用表里的常量，restLocal 就是两者的差。
+std::shared_ptr<assets::Skeleton> makeHumanoidSkeleton(bool rigify,
+                                                      float preRotateDeg = 0.0f) {
+    auto skel = std::make_shared<assets::Skeleton>();
+    skel->joints.resize(static_cast<std::size_t>(kHumanoidBoneCount));
+    const glm::mat4 R =
+        glm::rotate(glm::mat4(1.0f), glm::radians(preRotateDeg),
+                    glm::vec3(0.0f, 0.0f, 1.0f));
+    const glm::vec3 shift(1.7f, -0.4f, 0.0f);   // 顺带挪开原点：平移也不该有影响
+    for (int i = 0; i < kHumanoidBoneCount; ++i) {
+        const HumanoidBoneDef& d = kHumanoidBones[i];
+        const glm::vec3 wp = glm::vec3(R * glm::vec4(d.pos, 1.0f)) + shift;
+        const glm::vec3 pp =
+            (d.parent >= 0)
+                ? (glm::vec3(R * glm::vec4(kHumanoidBones[d.parent].pos, 1.0f)) +
+                   shift)
+                : glm::vec3(0.0f);
+        assets::Skeleton::Joint& j = skel->joints[static_cast<std::size_t>(i)];
+        j.name = rigify ? d.rigify : d.mixamo;
+        j.parent = d.parent;
+        j.restLocal = glm::translate(glm::mat4(1.0f), wp - pp);
+        j.invBind = glm::mat4(1.0f);
+        skel->topoOrder.push_back(i);
+    }
+    skel->invMeshNode = glm::mat4(1.0f);
+    return skel;
+}
+
+// 一条只有腿的"非人形"：三根骨、名字对不上、结构也不成双足。
+std::shared_ptr<assets::Skeleton> makeArmChainSkeleton() {
+    auto skel = std::make_shared<assets::Skeleton>();
+    skel->joints.resize(3);
+    const char* names[3] = {"shoulder", "elbow", "wrist"};
+    for (int i = 0; i < 3; ++i) {
+        skel->joints[static_cast<std::size_t>(i)].name = names[i];
+        skel->joints[static_cast<std::size_t>(i)].parent = i - 1;
+        skel->joints[static_cast<std::size_t>(i)].restLocal =
+            glm::translate(glm::mat4(1.0f),
+                           glm::vec3(0.0f, 0.0f, i == 0 ? 0.0f : -0.3f));
+        skel->joints[static_cast<std::size_t>(i)].invBind = glm::mat4(1.0f);
+        skel->topoOrder.push_back(i);
+    }
+    return skel;
 }
 
 } // namespace
@@ -4815,6 +4913,529 @@ int runAnimationSelfTest() {
             runFrames(sys, g, 20, 0.1f);
             report("nla_runtime_no_loop_clamp",
                    static_cast<double>(an.nlaTime), 1.0, 1e-4);
+        }
+    }
+
+    // ================================================================
+    // 步态生成器（2026-10-30）：把一份手工 K 帧表变成参数化函数
+    // ================================================================
+    //
+    // 这一组要证明的四件事，全都不看画面：
+    //   ① **换命名还能认出腿** —— 同一具骨架用 Mixamo / Rigify 两套骨名，
+    //      解析出的角色下标必须指到同一根骨。候选名表写错一个字，
+    //      症状是"膝盖不弯"（小腿被解析成大腿），截图上看不出来。
+    //   ② **脚真的不滑** —— 承重期侧向 / 竖直 / 直线偏差都是毫米数，
+    //      直接断阈值。这是 K 帧表那条硬规则唯一能被机器验证的形态。
+    //   ③ **半周期镜像 + 闭合** —— 帧 25 = 帧 1 的镜像；帧 49 == 帧 1。
+    //   ④ **没有写死坐标轴** —— 整具骨架先绕 Z 转 37°、再挪开原点，
+    //      所有读数必须一模一样。这条是这组里最有价值的一条：写死 ±Y
+    //      的实现在前三条上可能全绿（夹具恰好就朝 −Y），只有它会红。
+    {
+        using animation::GaitRole;
+
+        // ---- ① 角色解析 ----
+        const auto skelM = makeHumanoidSkeleton(/*rigify=*/false);
+        const auto skelR = makeHumanoidSkeleton(/*rigify=*/true);
+        const animation::HumanoidRig rigM =
+            animation::resolveHumanoidRig(*skelM);
+        const animation::HumanoidRig rigR =
+            animation::resolveHumanoidRig(*skelR);
+
+        int resolvedM = 0, resolvedR = 0;
+        for (int i = 0; i < animation::kGaitRoleCount; ++i) {
+            if (rigM.joint[i] >= 0) ++resolvedM;
+            if (rigR.joint[i] >= 0) ++resolvedR;
+        }
+        // 19 个角色在夹具里全都有名字对得上的骨。
+        report("gait_rig_mixamo", static_cast<double>(resolvedM), 19.0, 0.0);
+        report("gait_rig_rigify", static_cast<double>(resolvedR), 19.0, 0.0);
+        // 小腿必须落到 `shin.L`（夹具下标 12），不是 `thigh.L`（11）——
+        // "包含匹配"那一派实现会在这里返回 11，然后 IK 把整条腿拉直。
+        report("gait_rig_shin_idx",
+               static_cast<double>(
+                   rigR.joint[static_cast<int>(GaitRole::LeftLowerLeg)]),
+               12.0, 0.0);
+        report("gait_rig_foot_idx",
+               static_cast<double>(
+                   rigR.joint[static_cast<int>(GaitRole::LeftFoot)]),
+               13.0, 0.0);
+        reportFlag("gait_rig_rigify_ok",
+                   rigR.walkable() && rigM.walkable() && rigR.missing.empty(),
+                   "missing=" + std::to_string(rigR.missing.size()));
+
+        // 只有手臂的骨架：不是双足 → 明确拒绝，不许"生成一份站着不动的"。
+        {
+            const auto arm = makeArmChainSkeleton();
+            const animation::HumanoidRig ra =
+                animation::resolveHumanoidRig(*arm);
+            reportFlag("gait_rig_nonhuman", !ra.walkable(),
+                       "roles=" + std::to_string(ra.missing.size()));
+        }
+
+        // ---- ② 生成 + 不滑步 ----
+        animation::GaitParams gp;   // 默认：48 帧 @24fps / 步长 0.6 / 62% 承重
+        animation::EditClip clip;
+        const animation::GaitReport r =
+            animation::buildWalkCycle(*skelR, gp, clip);
+
+        reportFlag("gait_build_ok", r.ok, "err=" + r.error);
+        // 2 秒周期、48 帧 → 49 个键
+        report("gait_duration", static_cast<double>(clip.duration), 2.0, 1e-6);
+        // 17 根骨各一条旋转轨 + 髋的平移 = 18 条；18×49 = 882 个键。
+        // 这两个数把"某根骨静默没写进去"直接钉住。
+        report("gait_tracks", static_cast<double>(r.tracks), 18.0, 0.0);
+        report("gait_keys", static_cast<double>(r.keys), 882.0, 0.0);
+
+        // 重心：表 §9 的 ±0.03 → 峰峰 0.06。bob 是**半振幅**，写的时候
+        // 最容易把峰峰当成半振幅填进去（差一倍，画面上只是"有点颠"）。
+        report("gait_bob_range", static_cast<double>(r.bobRange), 0.06, 0.002);
+        report("gait_sway_range", static_cast<double>(r.swayRange), 0.06, 0.002);
+        // 抬脚峰值：48 帧里最接近 sin 顶点的那一帧取到 0.09998。
+        report("gait_foot_lift", static_cast<double>(r.footLiftPeak), 0.10,
+               0.002);
+
+        // 承重期三个"不动"的量。表 §6 的硬规则：X/Z 完全不动，只动 toe。
+        // 阈值 0.5 mm 是肉眼绝对看不出、但"插值没管约束"会立刻超标一个
+        // 数量级的那个位置。
+        report("gait_slide_mm", static_cast<double>(r.stanceSlideMm), 0.0, 0.5);
+        report("gait_vert_mm", static_cast<double>(r.stanceVerticalMm), 0.0,
+               0.5);
+        report("gait_line_mm", static_cast<double>(r.stanceLineErrMm), 0.0, 0.5);
+
+        // 闭合与镜像：构造保证（末帧直接取相位 0），所以只留浮点余量。
+        report("gait_loop_mm", static_cast<double>(r.loopErrMm), 0.0, 0.05);
+        report("gait_mirror_mm", static_cast<double>(r.mirrorErrMm), 0.0, 0.05);
+
+        // 移动速度自洽：承重脚相对身体后退的速率 == nominalSpeed。
+        // 差 1% 就会"每步滑 1 厘米"——这种滑在 1080p 上是看不见的。
+        report("gait_speed_identity", static_cast<double>(r.stanceSpeed),
+               static_cast<double>(r.nominalSpeed),
+               static_cast<double>(r.nominalSpeed) * 0.01 + 1e-4);
+
+        // 腿够不够长（>1 = IK 够不着 → 腿拉直、脚离地 → 看起来在滑）
+        reportFlag("gait_reach", r.reachMargin > 0.0f && r.reachMargin < 1.0f,
+                   "reach=" + std::to_string(r.reachMargin));
+        // 触地帧到半周期后：左脚往前走 1.612A、左手往后走 2·臂长·sin(21°)
+        // ≈ 0.38。**两条符号一起看**才是反相的判据（腿在前 + 手在后）；
+        // 单看一条，"同手同脚"也能让其中一条为正。
+        report("gait_leg_swing", static_cast<double>(r.legSwingM), 0.598, 0.01);
+        reportFlag("gait_arm_counter", r.armCounterM > 0.3f,
+                   "arm=" + std::to_string(r.armCounterM));
+
+        // 原地走（treadmill）：髋在前向一动不动。表里唯一的根骨要求，
+        // 而"每帧往前挪 2 cm"在单帧截图里完全看不出来。
+        report("gait_fwd_drift_mm", static_cast<double>(r.fwdDriftMm), 0.0, 0.5);
+
+        // 夹具的手臂本来就是垂着、伸直的 → 两个"中和导入姿势"的修正量
+        // 都必须是 0。它们不是 0 就说明量错了（比如把向上当成了向下）。
+        report("gait_arm_down", static_cast<double>(r.armDownDeg), 0.0, 1.0);
+        // 夹具的静止姿势左右对称 → 镜像的"地板"是 0（见 GaitCycle.h）。
+        report("gait_rest_mirror", static_cast<double>(r.restMirrorMm), 0.0,
+               0.01);
+
+        // ---- ③ blocking 模式：只打 1/7/13/19/25 那几个关键姿态 ----
+        {
+            animation::GaitParams bp = gp;
+            bp.blocking = true;
+            animation::EditClip bc;
+            const animation::GaitReport br =
+                animation::buildWalkCycle(*skelR, bp, bc);
+            // 9 帧 × 18 轨 = 162 个键，且**全部**是 Extreme（表 §8 的
+            // Blocking 只用关键姿态，中间的补间交给曲线）。
+            report("gait_blocking_keys", static_cast<double>(br.keys), 162.0,
+                   0.0);
+            report("gait_blocking_extreme",
+                   static_cast<double>(br.extremeKeys), 162.0, 0.0);
+            // 关键姿态少了，重心曲线就变成"只有两个极值"——峰峰值掉一半。
+            report("gait_blocking_bob", static_cast<double>(br.bobRange), 0.06,
+                   0.002);
+            // **对照组**（没有它上面那三个毫米数等于没测）：blocking 只在
+            // 1/8 相位上打帧，中间靠曲线插值，承重期竖直漂移实测 8.8 mm。
+            // 这一条不红，就说明"不滑步"那三个数是**盲的**——它们在任何
+            // 输入下都报 0。这也是为什么最终交付走逐帧烘焙（`blocking`
+            // 默认 false），而不是直接打表里那五帧。
+            reportFlag("gait_blocking_slides", br.stanceVerticalMm > 2.0f,
+                       "vert=" + std::to_string(br.stanceVerticalMm));
+        }
+
+        // ---- ④ 不变性：整具骨架转 37° + 平移，读数必须逐位同量级 ----
+        {
+            const auto rot = makeHumanoidSkeleton(/*rigify=*/true,
+                                                  /*preRotateDeg=*/37.0f);
+            animation::EditClip rc;
+            const animation::GaitReport rr =
+                animation::buildWalkCycle(*rot, gp, rc);
+            float d = 0.0f;
+            d = std::max(d, std::fabs(rr.bobRange - r.bobRange));
+            d = std::max(d, std::fabs(rr.swayRange - r.swayRange));
+            d = std::max(d, std::fabs(rr.footLiftPeak - r.footLiftPeak));
+            d = std::max(d, std::fabs(rr.armCounterM - r.armCounterM));
+            d = std::max(d, std::fabs(rr.reachMargin - r.reachMargin));
+            report("gait_invariance", static_cast<double>(d), 0.0, 1e-4);
+
+            // 毫米级的那三个也一并钉：写死 ±Y 的实现会在这里出几厘米。
+            float dmm = 0.0f;
+            dmm = std::max(dmm, std::fabs(rr.stanceSlideMm - r.stanceSlideMm));
+            dmm = std::max(dmm, std::fabs(rr.stanceLineErrMm - r.stanceLineErrMm));
+            dmm = std::max(dmm, std::fabs(rr.mirrorErrMm - r.mirrorErrMm));
+            dmm = std::max(dmm, std::fabs(rr.loopErrMm - r.loopErrMm));
+            report("gait_invariance_mm", static_cast<double>(dmm), 0.0, 0.05);
+        }
+
+        // ---- ⑤ 步幅匹配（A4）：量出来的 == 生成时说的 ----
+        //
+        // 这一组存在的理由：生成器报 `nominalSpeed`、运行时拿它算播放速率，
+        // 中间隔着"存盘 → 读回 → 另一个结构体"。只要两边有一次实现分叉，
+        // 表现就是"生成报告说不滑、Play 里在滑"，而两边各自看都对。
+        {
+            // ① 编辑片段（刚生成、没盘上）→ 量出来必须等于生成器的数
+            const animation::StrideInfo se =
+                animation::measureEditClipStride(*skelR, clip);
+            reportFlag("stride_edit_ok", se.ok, "err=" + se.error);
+            report("stride_edit_speed", static_cast<double>(se.nominalSpeed),
+                   static_cast<double>(r.nominalSpeed),
+                   static_cast<double>(r.nominalSpeed) * 0.02);
+            // 贴地区间：生成参数是 stance=0.62，量出来 0.74（含脚跟/脚尖
+            // 滚动那一段 —— 见 StrideMatch.h 对 dutyFactor 的说明）。
+            // 判据用**区间**而不是点值：点值等于把实现里那个 50% 带宽
+            // 写进期望，改带宽就要改期望，等于没测。
+            // 它抓的是"参考系选错"这一类错（相对髋量 → 0.23）。
+            reportFlag("stride_edit_duty",
+                       se.dutyFactor > 0.55f && se.dutyFactor < 0.92f,
+                       "duty=" + std::to_string(se.dutyFactor));
+            // 夹具是**标准走路**（生成参数 stance=0.62、没有腾空）→
+            // 两只脚同时离地的帧必须一个都没有。这条是"腾空判据"的阴性
+            // 对照：跑段落上它必须变成非 0（见 verify_gait_cycle G 组）。
+            report("stride_edit_air",
+                   static_cast<double>(se.airborneFraction), 0.0, 0.0);
+            // 交叉校验：脚相对身体的摆幅 × 2 / 周期，与"承重期脚速"应当
+            // 同量级。容差给 30% 是因为**两者定义本来就不一样**：
+            //   · 承重期脚速  = 脚在地上后退的速率（一步的位移 / 承重时长）
+            //   · 摆幅法      = 脚前后总摆幅 × 2 / 整圈（含摆动期多走的）
+            // 夹具上实测 0.742 vs 0.598（差 24%），方向对、量级对 —— 那正是
+            // 这条断言要守的东西。它抓的是"中位数被离群速度带跑"这一类错
+            // （偏差会过倍），而不是两个量的口径差。
+            report("stride_edit_span", static_cast<double>(se.spanSpeed),
+                   static_cast<double>(r.nominalSpeed),
+                   static_cast<double>(r.nominalSpeed) * 0.30);
+
+            // ② 换成"运行时那份"（assets::AnimationClip）—— 走的是另一条
+            //    采样路径（samplePose），数必须一样。这是"存盘再读回"的
+            //    替身：两条路上的插值实现不同，只有真的量过才知道同不同。
+            assets::AnimationClip rt;
+            rt.name = "Walk";
+            rt.duration = clip.duration;
+            for (const auto& t : clip.tracks) {
+                const int j = skelR->findJoint(t.joint);
+                if (j < 0) continue;
+                assets::AnimTrack at;
+                at.joint = j;
+                at.path = t.path;
+                at.times = t.times;
+                at.values = t.values;
+                at.step = t.step;
+                rt.tracks.push_back(std::move(at));
+            }
+            const animation::StrideInfo sr =
+                animation::measureClipStride(*skelR, rt);
+            reportFlag("stride_clip_ok", sr.ok, "err=" + sr.error);
+            report("stride_clip_speed", static_cast<double>(sr.nominalSpeed),
+                   static_cast<double>(r.nominalSpeed),
+                   static_cast<double>(r.nominalSpeed) * 0.02);
+
+            // ③ 不是步态的东西必须**明确拒绝**（不是"量出 0.000"）。
+            //    idle / 挥手 / 坐下都会被这条挡住，Locomotion 那边于是
+            //    退回 1× 播放，与引入本功能之前一致。
+            {
+                assets::AnimationClip still;   // 空轨道 = 纯静止姿势
+                still.name = "Idle";
+                still.duration = 2.0f;
+                const animation::StrideInfo si =
+                    animation::measureClipStride(*skelR, still);
+                reportFlag("stride_idle_rejected", !si.ok,
+                           "speed=" + std::to_string(si.nominalSpeed));
+                // 非人形骨架（只有手臂）→ 不可走 → 拒绝
+                const auto arm = makeArmChainSkeleton();
+                assets::AnimationClip dummy;
+                dummy.duration = 1.0f;
+                const animation::StrideInfo na =
+                    animation::measureClipStride(*arm, dummy);
+                reportFlag("stride_nonhuman_rejected", !na.ok,
+                           "err=" + na.error);
+            }
+
+            // ④ 速率换算：速度 == 自然步速 → 1.0 倍、残差 0。
+            //    "残差"是**夹住之后**还剩多少滑步，0 才是不滑。
+            const float nom = r.nominalSpeed;
+            {
+                const animation::StrideRate same =
+                    animation::strideRateFor(nom, nom, 0.6f, 1.7f);
+                report("stride_rate_identity", static_cast<double>(same.rate),
+                       1.0, 1e-4);
+                report("stride_residual_identity",
+                       static_cast<double>(same.residual), 0.0, 1e-4);
+                reportFlag("stride_identity_unclamped", !same.clamped);
+
+                // 1.5 倍速 → 1.5 倍播放、仍然不滑（这是"接上速度"的核心断言）。
+                // ⚠ 用 1.5 不用 2：出厂上限就是 1.7，拿 2 去测会撞上限，
+                //   测出来的是"夹住"而不是"跟得上"——第一次就是写 2 红的。
+                const animation::StrideRate fast =
+                    animation::strideRateFor(nom * 1.5f, nom, 0.6f, 1.7f);
+                report("stride_rate_1p5x", static_cast<double>(fast.rate), 1.5,
+                       1e-4);
+                report("stride_residual_1p5x",
+                       static_cast<double>(fast.residual), 0.0, 1e-4);
+
+                // 10 倍速 → 夹到 1.7，残差 = 10/1.7 − 1 ≈ 4.88（还差 488%）
+                const animation::StrideRate over =
+                    animation::strideRateFor(nom * 10.0f, nom, 0.6f, 1.7f);
+                report("stride_rate_clamped", static_cast<double>(over.rate),
+                       1.7, 1e-4);
+                report("stride_residual_clamped",
+                       static_cast<double>(over.residual),
+                       static_cast<double>(10.0f / 1.7f - 1.0f), 1e-3);
+                reportFlag("stride_clamped_flag", over.clamped);
+
+                // 没量出步速（0）→ 原样返回，一个字节都不改
+                const animation::StrideRate none =
+                    animation::strideRateFor(3.0f, 0.0f, 0.6f, 1.7f);
+                report("stride_rate_nospeed", static_cast<double>(none.rate),
+                       1.0, 0.0);
+            }
+
+            // ⑤ 端到端：喂进状态机，看它**真的写了** speed。
+            //    夹具骨架只有这一段叫 "Walk" 的 clip → 速度 2× 自然步速时
+            //    `sk.speed` 必须是 2.0。这条是"接线接上了"唯一能被机器
+            //    看见的形态（前面四条都在函数层面，不碰组件）。
+            {
+                auto skelWalk = makeHumanoidSkeleton(/*rigify=*/true);
+                skelWalk->clips.push_back(rt);
+                // 还要一段 Idle：不然 idle 态会因为"clip 不存在"提前返回，
+                // 而那段提前返回**在步幅匹配之前** —— 断言会看到"速度还是
+                // 上一个值"，看起来像"没回落"，实际是压根没走到那一步。
+                {
+                    assets::AnimationClip idleRt;
+                    idleRt.name = "Idle";
+                    idleRt.duration = 2.0f;   // 空轨道 = 静止姿势
+                    skelWalk->clips.push_back(idleRt);
+                }
+
+                ecs::SkinnedMeshComponent sk;
+                sk.model = nullptr;          // 只用 speed 字段
+                animation::LocomotionConfig cfg;
+                animation::LocomotionRuntime lrt;
+                const float target = nom * 1.5f;
+                const animation::LocomotionFrame f =
+                    animation::updateLocomotion(lrt, sk, nullptr, *skelWalk,
+                                                target, true, 4.5f, 0.016f,
+                                                cfg, "TEST");
+                reportFlag("stride_loco_walk_state", f.state == 1,
+                           "state=" + std::to_string(f.state));
+                // 容差 6%：分母是**运行时量出来**的步速，它与生成器报的
+                // 那个数允许差 2%（两条采样路径），比值再放大一次。
+                report("stride_loco_rate", static_cast<double>(f.playbackRate),
+                       1.5, 0.06);
+                report("stride_loco_written", static_cast<double>(sk.speed), 1.5,
+                       0.06);
+                reportFlag("stride_loco_matched", f.strideMatched,
+                           "nominal=" + std::to_string(f.strideSpeed));
+
+                // 超出上限：3 倍自然步速而夹在 1.7 → 速率 1.7，且**残差
+                // 必须大于 0**。残差为 0 就说明"夹住了却声称不滑"，
+                // 那是最坏的一种绿（数字好看、脚在滑）。
+                {
+                    ecs::SkinnedMeshComponent skc;
+                    animation::LocomotionRuntime lrtc;
+                    const animation::LocomotionFrame fc =
+                        animation::updateLocomotion(lrtc, skc, nullptr,
+                                                    *skelWalk, nom * 3.0f,
+                                                    true, 4.5f, 0.016f, cfg,
+                                                    "TEST");
+                    report("stride_loco_clamped_rate",
+                           static_cast<double>(fc.playbackRate), 1.7, 0.02);
+                    reportFlag("stride_loco_clamp_residual",
+                               fc.strideClamped && fc.strideResidual > 0.3f,
+                               "residual=" + std::to_string(fc.strideResidual));
+                }
+
+                // 关掉开关 → 回到 1×（对照组）。同一帧、同一速度，
+                // 只改这一位：这就是"滑 / 不滑"的 A/B。
+                animation::LocomotionConfig off = cfg;
+                off.strideMatch = false;
+                ecs::SkinnedMeshComponent sk2;
+                animation::LocomotionRuntime lrt2;
+                const animation::LocomotionFrame f2 =
+                    animation::updateLocomotion(lrt2, sk2, nullptr, *skelWalk,
+                                                target, true, 4.5f, 0.016f,
+                                                off, "TEST");
+                report("stride_loco_off_rate",
+                       static_cast<double>(f2.playbackRate), 1.0, 0.0);
+                report("stride_loco_off_written",
+                       static_cast<double>(sk2.speed), 1.0, 0.0);
+
+                // 站着不动（速度低于 walkSpeed）→ idle 态，播放速率必须
+                // **回落到 1×**。不回落的症状是"停下后待机动作还在快进"。
+                ecs::SkinnedMeshComponent sk3;
+                sk3.speed = 1.7f;   // 模拟刚走完还留着 1.7 倍
+                animation::LocomotionRuntime lrt3;
+                const animation::LocomotionFrame f3 =
+                    animation::updateLocomotion(lrt3, sk3, nullptr, *skelWalk,
+                                                0.0f, true, 4.5f, 0.016f, cfg,
+                                                "TEST");
+                reportFlag("stride_loco_idle_state", f3.state == 0,
+                           "state=" + std::to_string(f3.state));
+                report("stride_loco_idle_rate", static_cast<double>(sk3.speed),
+                       1.0, 0.0);
+            }
+
+            // ⑥ 相位速率曲线（A4b）：一圈之内怎么分配播放速度
+            //
+            // 这一组要证明两件不同的事，分开测：
+            //   · 曲线**本身**的数学：均值 1（不改步频）、整圈闭合、摆动区
+            //     恒为 1。这三条任意一条坏了，"不滑"与"步频"就会互相打架。
+            //   · 曲线**真的抹平了起伏**：用一条人造的、故意不平整的曲线
+            //     测 —— 夹具上的步态是构造出来的匀速步态，起伏太小，
+            //     拿它当基准等于测了个寂寞（这正是"对照组"的意义）。
+            {
+                animation::StridePhaseCurve cv;
+                const animation::StrideInfo sc =
+                    animation::measureEditClipStride(*skelR, clip, &cv);
+                reportFlag("stride_curve_ok", sc.ok && cv.valid(),
+                           "bins=" + std::to_string(cv.bins) +
+                               " err=" + sc.error);
+
+                int stanceBins = 0;
+                for (float v : cv.speed)
+                    if (v > 0.0f) ++stanceBins;
+                // ⚠ 夹具上实测 **32/32**（每个 bin 都有承重样本），这不是
+                //   错：两只脚交替覆盖整圈，任意一个相位上总有一只脚在承重。
+                //   所以这条只要求"承重 bin 足够多"（曲线才有意义），
+                //   不要求"必须有摆动 bin"。
+                reportFlag("stride_curve_bins", stanceBins >= 8,
+                           "stance=" + std::to_string(stanceBins) + "/" +
+                               std::to_string(cv.bins));
+
+                float gMin = 0.0f, gMax = 0.0f, gMean = 0.0f;
+                cv.stats(gMin, gMax, gMean);
+                // 均值 = 1：这条曲线只**重新分配**一圈内的速度，不改变
+                // 一圈的总时长（否则步频会随曲线一起变，"不滑"就成了
+                // "用错的步频换来的不滑"）。
+                report("stride_curve_mean", static_cast<double>(gMean), 1.0,
+                       0.05);
+                // 摆动区（speed<=0 的 bin）的 gain 必须**正好**是 1。
+                float swingErr = 0.0f;
+                for (int b = 0; b < cv.bins; ++b) {
+                    if (cv.speed[static_cast<std::size_t>(b)] > 0.0f) continue;
+                    const float ph = (static_cast<float>(b) + 0.5f) /
+                                     static_cast<float>(cv.bins);
+                    swingErr = std::max(swingErr, std::fabs(cv.gain(ph) - 1.0f));
+                }
+                report("stride_curve_swing_gain",
+                       static_cast<double>(swingErr), 0.0, 0.02);
+
+                // 整圈闭合：按 60 步把一圈推完，相位必须回到起点。
+                // 不闭合的症状是"播放头每圈漂一点"，跑几分钟后脚相位与
+                // 世界位移错开 —— 那种错只在长时间运行里显形。
+                float p = 0.0f;
+                for (int k = 0; k < 60; ++k) p = cv.advance(p, 1.0f / 60.0f);
+                const float wrapErr =
+                    std::min(std::fabs(p), std::fabs(p - 1.0f));
+                report("stride_curve_loop", static_cast<double>(wrapErr), 0.0,
+                       0.01);
+
+                // 人造对照：承重期脚速有 ±30% 的正弦起伏。
+                // 不开曲线时世界脚速的**相对起伏**就是这 30%；开了之后
+                // 应当被压到 1/4 以下。
+                animation::StridePhaseCurve bump;
+                bump.bins = 16;
+                bump.nominalSpeed = 1.0f;
+                bump.speed.assign(16, 0.0f);
+                for (int b = 0; b < 8; ++b) {
+                    const float ph = (static_cast<float>(b) + 0.5f) / 16.0f;
+                    bump.speed[static_cast<std::size_t>(b)] =
+                        1.0f + 0.30f * std::sin(ph * 6.2831853f);
+                }
+                float loOn = 1.0e9f, hiOn = -1.0e9f;
+                float loOff = 1.0e9f, hiOff = -1.0e9f;
+                float sumOn = 0.0f;
+                int cnt = 0;
+                for (int b = 0; b < bump.bins; ++b) {
+                    const float v = bump.speed[static_cast<std::size_t>(b)];
+                    if (!(v > 0.0f)) continue;
+                    const float ph = (static_cast<float>(b) + 0.5f) / 16.0f;
+                    const float on = v * bump.gain(ph);
+                    loOn = std::min(loOn, on);
+                    hiOn = std::max(hiOn, on);
+                    loOff = std::min(loOff, v);
+                    hiOff = std::max(hiOff, v);
+                    sumOn += on;
+                    ++cnt;
+                }
+                // 相对起伏（峰峰 / 均值）—— 这样与速度单位无关。
+                const float meanOn = (cnt > 0) ? sumOn / static_cast<float>(cnt) : 1.0f;
+                const float spreadOn = (hiOn - loOn) / meanOn;
+                const float spreadOff = (hiOff - loOff) /
+                                        (0.5f * (hiOff + loOff));
+                // 对照组：不开曲线时确实有明显起伏（实测 0.20 —— 因为
+                // 正弦只铺在前 8 个 bin 上，峰峰 0.24 / 均值 1.15）。
+                // 它不为 0 才说明下面那条不是空断言。
+                reportFlag("stride_curve_spread_off", spreadOff > 0.15f,
+                           "spreadOff=" + std::to_string(spreadOff));
+                reportFlag("stride_curve_flattens", spreadOn < spreadOff * 0.25f,
+                           "on=" + std::to_string(spreadOn) +
+                               " off=" + std::to_string(spreadOff));
+            }
+
+            // ⑦ 斜坡：rate 的分子必须是**水平投影**
+            //
+            // 这一组不是"实现细节的测试"，而是把一条会静默出错 6~15% 的
+            // 约定钉住：`moveSpeed` 传 3D 模长时，20° 坡上脚会比身体快
+            // 6.4%，30° 快 15% —— 都还在"看着有点飘"的量级，不会有人报 bug。
+            {
+                const float nom = r.nominalSpeed;
+                const float ground = nom;     // 沿坡面速度 = 自然步速
+                const float deg = 20.0f;
+                const float rad = deg * 3.14159265f / 180.0f;
+                const float c = std::cos(rad);
+
+                // 水平投影（对）vs 3D 模长（错）
+                const animation::StrideRate right =
+                    animation::strideRateFor(ground * c, nom, 0.6f, 5.0f, deg);
+                const animation::StrideRate wrong =
+                    animation::strideRateFor(ground, nom, 0.6f, 5.0f, deg);
+                // 用错量 → 速率高 1/cos 倍；差 6.4%
+                report("stride_slope_rate_ratio",
+                       static_cast<double>(wrong.rate / right.rate),
+                       static_cast<double>(1.0f / c), 1e-3);
+                // 竖直残差 = 水平速度 × tanθ / nominal
+                report("stride_slope_vert",
+                       static_cast<double>(right.verticalResidual),
+                       static_cast<double>((ground * c) * std::tan(rad) / nom),
+                       1e-3);
+                // **平地必须正好是 0**：不然每一段走路都会被报"上下打滑"，
+                // 那个警告就没人看了。
+                const animation::StrideRate flat =
+                    animation::strideRateFor(ground, nom, 0.6f, 5.0f);
+                report("stride_slope_zero",
+                       static_cast<double>(flat.verticalResidual), 0.0, 0.0);
+                // 坡角夹上限：80° 与 75° 必须给出**同一个**残差
+                // （cos 在 80° 掉到 0.17，不夹的话残差会大得没有意义）。
+                const animation::StrideRate steep =
+                    animation::strideRateFor(ground, nom, 0.6f, 5.0f, 80.0f);
+                const animation::StrideRate cap =
+                    animation::strideRateFor(ground, nom, 0.6f, 5.0f, 75.0f);
+                report("stride_slope_cap",
+                       static_cast<double>(steep.verticalResidual),
+                       static_cast<double>(cap.verticalResidual), 1e-4);
+                // 坡度**不改变** rate（只报残差）—— 这是"不二次投影"的
+                // 判据：同一份水平速度，带不带 slopeDeg 必须给出同一个
+                // 速率。改了它，坡上会少播 6%。
+                const animation::StrideRate noSlope = animation::strideRateFor(
+                    ground * c, nom, 0.6f, 5.0f, 0.0f);
+                report("stride_slope_rate_same",
+                       static_cast<double>(right.rate),
+                       static_cast<double>(noSlope.rate), 1e-6);
+            }
         }
     }
 

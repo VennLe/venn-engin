@@ -243,13 +243,24 @@ def main():
     shot(hwnd, "j3_air_control.png")
 
     # ---- J7：右键长按跑步 ----
+    #
+    # ⚠ 只量**冲刺那一段**。旧实现把"先走 0.7 s + 冲刺 1.0 s + 松手后 0.5 s"
+    # 整个窗口一起平均，然后在 4.8 m/s 上判 —— 按名义速度算这个窗口的均值
+    # 只有 (3.0×0.7 + 6.0×1.0 + 3.0×0.5)/2.2 ≈ 4.36，**天生就在阈值下面**，
+    # 能过全靠帧计数与真实秒数对不上（`dt = 帧差/60`，掉帧时 dt 偏小 → 速度偏大）。
+    # 实测 2026-10-30 同一份代码连跑两次：3.97（红）/ 6.05（绿）。
+    # 现在窗口两端都卡在"手正按着"的时刻上，均值就是冲刺速度本身。
     pos_before_run = pos_samples(read_log(logp))
-    x_run0 = pos_before_run[-1][1] if pos_before_run else 0.0
-    f_run0 = pos_before_run[-1][0] if pos_before_run else 0
     key_down(hwnd, VK_W)                     # 先走起来
     time.sleep(0.7)
-    mouse_down(hwnd, 1)                      # 再按住右键冲刺
+    pos_walk = pos_samples(read_log(logp))   # 走稳了 → 冲刺窗口的起点
+    f_run0 = pos_walk[-1][0] if pos_walk else 0
+    x_run0 = pos_walk[-1][1] if pos_walk else 0.0
+    mouse_down(hwnd, 1)                      # 按住右键冲刺
     time.sleep(1.0)
+    pos_sprint = pos_samples(read_log(logp))  # 松手**之前**取终点
+    f_run1 = pos_sprint[-1][0] if pos_sprint else 0
+    x_run1 = pos_sprint[-1][1] if pos_sprint else 0.0
     shot(hwnd, "j4_running.png")
     mouse_up(hwnd, 1)
     key_up(hwnd, VK_W)
@@ -375,7 +386,7 @@ def main():
     v_avg = (x_run1 - x_run0) / dt if dt > 0.1 else 0.0
     # 走路 3.0 m/s、冲刺 ×2 = 6.0；这里只断言"明显快于走路"
     check("J7 按住右键明显加速（≥ 1.6 × 走路速度）", v_avg >= 4.8,
-          "平均 %.2f m/s（走路 3.0）" % v_avg)
+          "冲刺段平均 %.2f m/s（走路 3.0，帧差 %d）" % (v_avg, f_run1 - f_run0))
 
     # ---- J8 脚不陷入地面 ----
     grounded = [s for s in samples if s[4] == 1]

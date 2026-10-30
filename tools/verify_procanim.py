@@ -58,9 +58,16 @@ RE_INFO_CLIP = re.compile(r'ASSETC\s+clip "([^"]+)" ([\d.]+) s\s+tracks=(\d+)')
 RE_ANIM = re.compile(r"GAME-ANIM state=(\w+) clip=(\S+)")
 RE_MISS = re.compile(r"GAME-ANIM-MISSING state=(\w+) clip='([^']*)'")
 
-VK_W, VK_SHIFT, VK_SPACE = 0x57, 0x10, 0x20
+VK_W, VK_SPACE = 0x57, 0x20
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
-KEYEVENTF_KEYUP = 0x0002
+WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
+WM_RBUTTONDOWN, WM_RBUTTONUP = 0x0204, 0x0205
+RE_SPRINT_BIND = re.compile(r"Sprint=(\w+)")
+
+
+def _sc(vk):
+    """VK → 扫描码（MAPVK_VK_TO_VSC）。现算，不再维护第二张字典表。"""
+    return user32.MapVirtualKeyW(vk, 0) & 0xFF
 
 g_pass = 0
 g_fail = 0
@@ -113,13 +120,37 @@ class Session:
         with self._lock:
             return list(self.lines)
 
-    def states(self):
-        return {m.group(1) for m in (RE_ANIM.search(x) for x in self.text())
-                if m}
+    def state_seq(self):
+        """状态机**按日志顺序**走过的状态序列。
+
+        ⚠ 刻意**不**提供"状态集合"那种接口：B2/B3/B4 三条如果都读集合，它们
+        判的是同一个量（"三个状态名都出现过"），三条会一起红、一起绿 ——
+        那等于只写了一条断言。按顺序比才能分开"根本没切过去"和"切过去了
+        但顺序不对"（比如冲刺太快、walk 被直接跳过）。
+        """
+        out = []
+        for x in self.text():
+            m = RE_ANIM.search(x)
+            if m:
+                out.append(m.group(1))
+        return out
 
     def missing(self):
         return {m.group(1) for m in (RE_MISS.search(x) for x in self.text())
                 if m}
+
+    def sprint_bind(self):
+        """从 `GAME-INPUT … Sprint=Mouse1 / PadBtn4` 里把冲刺的**主**绑定读回来。
+
+        ⚠ 读它而不是写死"按右键"：出厂绑定改过一次（10-22 从 LShift 换成
+        鼠标右键），写死的夹具就是这么烂掉的 —— 而且烂掉时的现象是"run 切
+        不过去"，看起来像动画的锅。
+        """
+        for x in self.text():
+            m = RE_SPRINT_BIND.search(x)
+            if m:
+                return m.group(1)
+        return ""
 
     def stop(self):
         try:
@@ -133,38 +164,37 @@ class Session:
 
 
 def key(hwnd, vk, down):
-    user32.PostMessageW(hwnd, WM_KEYDOWN if down else WM_KEYUP, vk, 0)
+    """发一个键消息。
 
+    ⚠⚠ lParam **必须带扫描码**（`(扫描码 << 16) | 重复次数`）。
+    GLFW 的 Win32 后端在 `keyboardProc` 里是从 `(lParam >> 16) & 0x1FF`
+    取扫描码、再查 `keycodes[scancode]` 得到 GLFW 键值的；lParam 传 0
+    → 扫描码 0 → 查到 `GLFW_KEY_UNKNOWN` → `_glfwInputKey` 头一行就
+    `return`，**键盘回调一次都不会进**。
 
-def modifier(vk, down, scan=0x2A):
-    """按/放**修饰键**（Shift / Win）必须走真实键事件，不能 PostMessage。
-
-    为什么：GLFW 在每次 `glfwPollEvents` 的结尾都有一段"防 Shift 粘住"的补丁
-    （win32_window.c 里 `GetKeyState(vk) & 0x8000` 那段）—— 物理上没按着就把
-    Shift 强制 release。PostMessage 只改消息队列、不改物理键状态，于是合成出来
-    的按下**在同一次轮询里就被自己撤销了**，一帧都留不下。表现就是"Shift 好像
-    根本没按"，动画状态机的 run 永远切不过去（W / 空格这类普通键不受影响）。
+    这种失败特别能骗人：窗口活着、画面正常、日志里一条错都没有，
+    只有"状态机永远停在 idle"。它和"键绑错了"长得一模一样，区别只在
+    把绑定改成别的键也照样不动。2026-10-30 本用例 B2/B3/B4 三红就是它
+    （旧实现只 `PostMessageW(hwnd, msg, vk, 0)`）。
     """
-    user32.keybd_event(vk, scan, 0 if down else KEYEVENTF_KEYUP, None)
+    if down:
+        user32.PostMessageW(hwnd, WM_KEYDOWN, vk, (_sc(vk) << 16) | 1)
+    else:
+        user32.PostMessageW(hwnd, WM_KEYUP, vk, (_sc(vk) << 16) | 0xC0000001)
 
 
-def focus(hwnd):
-    """真实键事件只送到**前台**窗口，所以按修饰键之前先把它拉到前台。"""
-    user32.ShowWindow(hwnd, 9)               # SW_RESTORE
-    user32.SetForegroundWindow(hwnd)
-    time.sleep(0.15)
+def mouse(hwnd, button, down, x=480, y=300):
+    """按/放鼠标键。`button` 用 GLFW 的编号（0=左 1=右 2=中）。
 
-
-def clear_modifiers():
-    """清掉系统层残留的 Shift。
-
-    上一轮漏放 Shift 会让下一次启动的 GLFW 认为"开局就按着冲刺"，日志里凭空
-    冒出 run —— 这会把"跑通了"和"被污染了"混成一种现象。
+    ⚠ 鼠标消息走 `PostMessage` 是**可靠**的（GLFW 的 mouseProc 只看
+    wParam 的键位，不像 Shift 那样会被"防粘住"补丁撤销），所以冲刺
+    不需要 `keybd_event` + 抢前台的组合拳。
     """
-    for _ in range(3):
-        for vk in (VK_SHIFT, 0xA0, 0xA1):
-            user32.keybd_event(vk, 0x2A, KEYEVENTF_KEYUP, None)
-        time.sleep(0.05)
+    if button == 0:
+        msg, flag = (WM_LBUTTONDOWN, 1) if down else (WM_LBUTTONUP, 0)
+    else:
+        msg, flag = (WM_RBUTTONDOWN, 2) if down else (WM_RBUTTONUP, 0)
+    user32.PostMessageW(hwnd, msg, flag, ((y & 0xFFFF) << 16) | (x & 0xFFFF))
 
 
 def make_scene():
@@ -298,9 +328,6 @@ def main():
 
     # ---- B. 运行时四态切换 ----
     if not args.no_runtime:
-        # 起窗口**之前**先把系统层的 Shift 清干净：万一上一轮漏放，
-        # GLFW 会在建窗口时认为"开局就按着冲刺"，run 会凭空出现。
-        clear_modifiers()
         make_scene()
         env = clean_env(
             MYVK_RUNTIME_TITLE=TITLE,
@@ -318,18 +345,36 @@ def main():
             s.stop()
             return 1
         time.sleep(2.0)
-        img_idle = s.shot() if hasattr(s, "shot") else None
         img_idle = capture_client(s.hwnd)[0]
         img_idle.save(os.path.join(WORK, "b_idle.png"))
 
-        key(s.hwnd, VK_W, True)              # 走（普通键，PostMessage 够用）
+        # ⚠⚠ 先左键点一下视口 —— 运行时的"操作态"是**点出来的**。
+        #
+        # 不点的话：键事件照样进引擎（GLFW 回调、`Input` 里 `g_keyDown[W]`
+        # 都是 true），但 `PlayerController` 不收移动意图，位置一毫米都不动，
+        # 状态机一直停在 `state=idle speed=0.00`。
+        #
+        # 这个失败形态最难查 —— 日志里**一条错都没有**，看起来就像"W 没送到"。
+        # 2026-10-30 实测：同一份脚本，加这一行之前 ①PostMessage W / ④抢前台
+        # +keybd_event 全都不动；加这一行之后同一条 PostMessage 立刻 x=4.96。
+        # 位置见 `verify_player_jump.py` 的同一句 `click(hwnd, 640, 360)`。
+        mouse(s.hwnd, 0, True)
+        mouse(s.hwnd, 0, False)
+        time.sleep(0.15)
+
+        key(s.hwnd, VK_W, True)              # 走
         time.sleep(1.2)
         capture_client(s.hwnd)[0].save(os.path.join(WORK, "b_walk.png"))
-        focus(s.hwnd)                        # 真实键事件只认前台窗口
-        modifier(VK_SHIFT, True)             # 冲刺 → 跑
+
+        # 冲刺 → 跑。⚠ 出厂绑定是**鼠标右键**，不是 Shift：
+        # 2026-10-22 用户要求"run 动画一按住 Shift 就切"之后，Sprint 的
+        # 键盘位被整个摘掉了（`InputMap::makeDefault` 现在只绑 Mouse1 +
+        # PadBtn4）。本用例当时没跟着改，于是 B3 一直按着一个不存在的键。
+        sprint_bind = s.sprint_bind()
+        mouse(s.hwnd, 1, True)
         time.sleep(1.2)
         capture_client(s.hwnd)[0].save(os.path.join(WORK, "b_run.png"))
-        modifier(VK_SHIFT, False)
+        mouse(s.hwnd, 1, False)
         time.sleep(0.2)
         key(s.hwnd, VK_W, False)
 
@@ -340,16 +385,29 @@ def main():
         capture_client(s.hwnd)[0].save(os.path.join(WORK, "b_jump.png"))
         time.sleep(0.4)
         s.stop()
-        clear_modifiers()                    # 别把 Shift 留给下一个用例
 
         with open(os.path.join(WORK, "log.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(s.text()))
 
-        st = s.states()
-        check("B1 静置时切到 idle", "idle" in st, "states=%s" % (",".join(sorted(st)) or "-"))
-        check("B2 按 W 切到 walk", "walk" in st, "states=%s" % (",".join(sorted(st)) or "-"))
-        check("B3 按住 Shift 切到 run", "run" in st, "states=%s" % (",".join(sorted(st)) or "-"))
-        check("B4 空格切到 jump", "jump" in st, "states=%s" % (",".join(sorted(st)) or "-"))
+        # 按**顺序**判：走 → 跑 → 跳 必须依次发生过。集合判定分不开
+        # "三个都出现过"和"跳完才走"，见 `state_seq()` 的注释。
+        seq = s.state_seq()
+
+        def first(name):
+            return seq.index(name) if name in seq else -1
+
+        i_idle, i_walk, i_run, i_jump = (first("idle"), first("walk"),
+                                         first("run"), first("jump"))
+        tail = "seq=%s" % ("→".join(seq[:8]) or "-")
+        check("B1 静置时切到 idle", i_idle >= 0, tail)
+        check("B2 按 W 切到 walk（在 idle 之后）", i_walk > i_idle >= 0, tail)
+        # 先把"用例的按法还成立吗"单独判一条：它红了就是夹具陈旧，
+        # 不是 run 动画坏了 —— 这两种红要能一眼分开。
+        check("B3a 冲刺绑定仍是鼠标右键（用例按法依赖它）",
+              sprint_bind == "Mouse1", "Sprint=%s" % (sprint_bind or "-"))
+        check("B3 按住冲刺键切到 run（在 walk 之后，出厂 %s）" % (sprint_bind or "?"),
+              i_run > i_walk >= 0, tail)
+        check("B4 空格切到 jump（在 run 之后）", i_jump > i_run >= 0, tail)
         check("B5 没有缺片段（clip 名字与生成器一致）", not s.missing(),
               "missing=%s" % (",".join(sorted(s.missing())) or "-"))
 

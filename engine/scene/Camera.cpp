@@ -219,12 +219,50 @@ void Camera::moveLocal(const glm::vec3& delta) {
 }
 
 glm::mat4 Camera::viewMatrix() const {
-    return glm::lookAt(position(), m_target, kWorldUp);
+    // roll == 0 时**原样**走这条（一个字节都不碰）：所有既有像素基线、
+    // 相机自检的"逐位相同"条款都依赖它。
+    if (m_roll == 0.0f) return glm::lookAt(position(), m_target, kWorldUp);
+
+    // 有 roll：把 up 绕视线转 m_roll 再交给 lookAt。
+    //
+    // ⚠ 为什么不是"先算 roll 矩阵再乘"：lookAt 内部会对 up 做正交化，
+    //   于是传进去的 up 只需要"指向正确的方向"就够，长度和分量都不重要。
+    //   直接给旋转后的 up 好处是**视线方向绝对不变** —— 相乘的做法在
+    //   pitch 接近 ±89° 时会因为基矩阵自身的数值问题让视线漂一点点，
+    //   那种漂移在长焦下就是画面在轻微平移。
+    const glm::vec3 pos = position();
+    const glm::vec3 f = glm::normalize(m_target - pos);
+    glm::vec3 r = glm::cross(f, kWorldUp);
+    const float rl = glm::length(r);
+    if (rl < 1.0e-6f) return glm::lookAt(pos, m_target, kWorldUp);  // 正俯视兜底
+    r /= rl;
+    const glm::vec3 u = glm::cross(r, f);
+    const float c = std::cos(m_roll);
+    const float s = std::sin(m_roll);
+    const glm::vec3 up = u * c + r * s;
+    return glm::lookAt(pos, m_target, up);
 }
 
 glm::mat4 Camera::projMatrix(float aspect) const {
     glm::mat4 proj = glm::perspective(glm::radians(m_fovY), aspect, m_zNear, m_zFar);
     proj[1][1] *= -1.0f;  // Vulkan 裁剪空间 Y 翻转
+
+    // 离轴偏移（glm 是列主序：proj[col][row]，第 2 列是透视行）。
+    // `glm::perspective` 出来的 proj[2][0] / proj[2][1] 本来就是 0，所以
+    // 两个都等于 0 时这里**一个元素都不改** —— 老画面逐位不变。
+    //
+    // 符号（与 Blender 的 shift_x/shift_y 同口径，"成像中心挪多少"）：
+    //   shiftX > 0 = 成像中心右移 = 画面内容**左**移。
+    //   推导：view 空间里视线前方的点 z_v < 0；
+    //     clip.x = proj[2][0] · z_v  →  要 ndc.x 变负（左移），
+    //     proj[2][0] 必须为**正**。
+    //   shiftY > 0 = 成像中心上移 = 内容下移。上面 proj[1][1] 已经翻过 Y，
+    //     Vulkan 的 ndc +y 就是屏幕上方，于是 "内容下移" 同样要求
+    //     proj[2][1] 为**正** —— X/Y **同号**。
+    // ⚠ 这一条极易写反（直觉上会想"翻过 Y 了就该反号"），自检
+    //   `cameramove_shift_sign` 钉的就是 NDC 的实际位移量。
+    if (m_shiftX != 0.0f) proj[2][0] = 2.0f * m_shiftX;
+    if (m_shiftY != 0.0f) proj[2][1] = 2.0f * m_shiftY;
     return proj;
 }
 

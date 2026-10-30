@@ -520,6 +520,33 @@ DEFAULT = [
     # ⚠ 日志锚点全在 `CHAR-POSE-*` / `POSE-*` 前缀下（`poseToJoints` 那份
     #   在 animation/ClipEdit 里打的是 `POSE-RESOLVE` / `POSE-SAVE/LOAD`）。
     "verify_pose_mode",
+    # ---- 行走循环生成器（GaitCycle，2026-10-30）----
+    # 一次启动编辑器，跑两遍生成（逐帧烘焙 + blocking），两次落盘。
+    # 数值断言在 `MYVK_ANIM_TEST`（手搭的对称人形骨架，期望值能手算），
+    # 这一条补的是另外两件**只有真资产能验**的事：
+    #   · 换个骨架还能用（`anime_girl.fbx` 的骨名/朝向/导入姿势都与夹具不同）
+    #   · 面板那条路真的接了线（`gait:` 脚本与「生成行走循环」按钮共用
+    #     `CharacterWindow::generateWalk()`）
+    # 最后用 Python **直接读盘上的 .anim.json** 当独立 oracle：18 条轨、
+    # 49 个键且时间严格 = k/24（逐帧烘焙的定义）、髋没有净位移（原地走）。
+    # ⚠ 镜像那一项在这只资产上**没有判据资格**（静止姿势自带 580 mm 的
+    #   左右不对称），脚本里只记录不判红 —— 真正的判据在对称夹具那条
+    #   `gait_mirror_mm`。别把这条改成"红着也过"。
+    "verify_gait_cycle",
+    # ---- 运镜体系（2026-10-30）----
+    # 四组：A 内核自检 69 条（动词增量 / 镜头光学 / 新通道隔离 / 欧拉闭环 /
+    # 路径弧长 / 快门换算）；B 面板 GUI（点动词 yaw 真的 ±15°、Bake 生效）；
+    # C 序列化回路（焦距/快门/景深/路径 guid 读回来与文件一致，且 fovEff
+    # 由焦距算出）；D 运行时（CAM-PATH 求值 + CAM-LENS 接到渲染效果）。
+    # ⚠ 之所以 C/D 单独成组："算子算得对"和"存得住、运行时真的走"是三件事，
+    #   B 组全绿也可能进游戏路径不走。
+    "verify_camera_move",
+    # 多机位 marker 切镜（运镜体系 §七，2026-10-30）。
+    # 三组：A 内核（时间轴 shots 组 24 条 + 相机侧导演覆盖组 12 条）；
+    # B 编辑器（`+ Shot` 背后的 act* 能改能存能读回，且**拒绑**不存在的 guid）；
+    # C 运行时（场景里两台相机，marker 强制先用**低**优先级那台 →
+    #  `CAM-CUT name=CamLow` 出现本身就证明覆盖压过 priority）。
+    "verify_multi_cam",
     # ---- #320：动画摄影表（Dope Sheet，R8）----
     # 五次启动编辑器（打开+通道树 / 框选批量挪 / 镜像 / 关键帧类型 / 缩放平移）。
     # 两条验收是任务书原文，"逐位"不是"差得少"：
@@ -2346,6 +2373,58 @@ TRIGGERS = {
                          # 影响"名字→下标"与采样语义，所以照登。
                          "engine/assets/Skeleton.*",
                          "assets/models/characters/animate_girl.fbx"],
+    # ---- 行走循环生成器 ----
+    # 登记的是"生成器本体 + 面板接线 + 资产"：
+    #   · `engine/animation/GaitCycle.*` 相位求值 / 角色表 / IK 回填 / 判据
+    #   · `editor/CharacterWindow.*` 面板参数、按钮与 `gait:` 脚本命令
+    #   · `engine/animation/ClipEdit.*` 落盘格式与求值（脚本要从盘上读回）
+    # ⚠ 刻意**不登记** `engine/i18n/**`（新增界面词不改行为，属横切）。
+    # ---- 运镜体系（2026-10-30）----
+    # 登记的是"运镜算子 + 路径 + 面板 + 宿主接线"：
+    #   · `engine/scene/CameraMove*` 动词 / 光学 / 姿态基（纯函数）
+    #   · `engine/scene/CameraPath.*` 弧长参数化（E 组整组在验它）
+    #   · `engine/scene/CameraSystem.*` 每帧叠加顺序（②路径 → ③注视 → ⑤手持）
+    #   · `engine/scene/SceneSerializer.*` 相机新字段 + cameraPath 组件
+    #   · `editor/CinematographyPanel.*` 面板（B/C 组的锚点与状态行来自它）
+    #   · `editor/EditorApp.cpp` 面板表登记 + 每帧转发
+    #   · `runtime/RuntimeApp.cpp` `applyCameraLensEffects`（D2~D4 的来源）
+    # ⚠ 刻意**不**登记 `engine/ecs/Components.h`（横切，在 GLOBAL_GLOBS 里）。
+    "verify_camera_move": ["engine/scene/CameraMove.*",
+                           "engine/scene/CameraMoveKind.*",
+                           "engine/scene/CameraPath.*",
+                           "engine/scene/CameraSystem.*",
+                           "engine/scene/SceneSerializer.*",
+                           "editor/CinematographyPanel.*",
+                           "editor/EditorApp.cpp",
+                           "runtime/RuntimeApp.cpp"],
+    # 多机位切镜。触发面和运镜重叠，但**多出来**两块：
+    #   · `engine/sequence/SequenceAsset.*` —— marker 的解析 / 写回 / 区间语义
+    #     （C 组的 `shots` 数组与 A 组的 `seq_shot_*` 全部来自这里）
+    #   · `engine/sequence/SequencerSystem.*` —— 每帧把"该用哪台"报给宿主
+    #   · `editor/TimelineEditorWindow.*` —— 第三轨 + 注入脚本 verbs（B 组）
+    # ⚠ 刻意**不**登记 `engine/ecs/Components.h`（横切，在 GLOBAL_GLOBS 里）。
+    "verify_multi_cam": ["engine/sequence/SequenceAsset.*",
+                         "engine/sequence/SequencerSystem.*",
+                         "engine/sequence/SequenceSelfTest.cpp",
+                         "engine/scene/CameraSystem.*",
+                         "engine/scene/CameraMoveSelfTest.cpp",
+                         "editor/TimelineEditorWindow.*",
+                         "runtime/RuntimeApp.cpp"],
+    "verify_gait_cycle": ["engine/animation/GaitCycle.*",
+                          "editor/CharacterWindow.*",
+                          "engine/animation/ClipEdit.*",
+                          # A4 步幅匹配（2026-10-30）：F 组量的是"模型里那段
+                          # Walk 的自然步速"，而**量法与换算**在 StrideMatch、
+                          # **写进 speed 的地方**在 Locomotion、**两边都写**的
+                          # 保证在 ClipSwitch。少登记一条，改那处就不会重跑
+                          # 这里，症状是"面板读数变了但 F 组还绿"。
+                          "engine/animation/StrideMatch.*",
+                          "engine/animation/Locomotion.*",
+                          "engine/animation/ClipSwitch.*",
+                          # player 块的 strideMatch / strideMin/MaxRate /
+                          # walk|runStrideSpeed 五个键（Game.exe 侧的唯一入口）
+                          "runtime/RuntimeConfig.*",
+                          "assets/models/characters/animate_girl.fbx"],
     # ---- #320：动画摄影表 ----
     # 登记五类实现主体，少一条就会出现"改了 A 只跑 B"的假跳过：
     #   · `editor/DopeSheetWindow.*` 面板本体（通道树 / 铺点 / 手势 / 注入脚本）

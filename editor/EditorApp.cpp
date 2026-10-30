@@ -39,6 +39,7 @@
 #include "EditModes.h"
 #include "ViewportTabs.h"
 #include "ParticlesPanel.h"
+#include "CinematographyPanel.h"
 #include "PhysicsPanel.h"
 #include "QualitySettingsPanel.h"
 #include "MaterialLibraryPanel.h"
@@ -382,6 +383,13 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         // 偶尔打开的面板（跟 Physics / Particles 同款），不该占 Alt+N。
         {"quality", "Quality Settings", PanelGroup::Authoring, "", "sliders",
          false, true, kSlotNone, &EditorApp::panelDrawQuality},
+        // 2026-10-30：运镜面板。一张"偶尔打开但一开就要全"的面板 ——
+        // 镜头 / rig / 动词 / 定稿四段同屏，调镜头时不用在 Inspector、
+        // 时间轴、场景树之间跳。与 Physics / Quality 同款（无快捷键）。
+        // ⚠ 它作用在**选中实体的 CameraComponent** + **视口相机**上：
+        //   动词推的是视口相机（nudge-then-bake），参数写的是组件。
+        {"cine", "Cinematography", PanelGroup::Authoring, "", "camera",
+         false, true, kSlotNone, &EditorApp::panelDrawCinematography},
         // ---- 2026-10-20：编辑模式自带的两个编辑器 ----
         // 它们的显隐**跟顶栏的编辑模式走**（见 serviceEditMode），但仍然是
         // 普通面板表项 —— View 菜单、快捷键、布局持久化、底栏托盘自动跟上。
@@ -528,6 +536,9 @@ void EditorApp::panelDrawParticles(EditorApp& a) {
 // 于是它可以在没有设备的情况下被构造 —— 与 Physics/Particles 的差别仅此。
 void EditorApp::panelDrawQuality(EditorApp& a) {
     if (a.m_qualityPanel) a.m_qualityPanel->draw();
+}
+void EditorApp::panelDrawCinematography(EditorApp& a) {
+    if (a.m_cinePanel) a.m_cinePanel->draw();
 }
 
 // 2026-10-20：两个编辑模式各自的面板。它们自己判 panelOpenRef，所以这里
@@ -1403,6 +1414,8 @@ void EditorApp::onInit() {
     // E26：画质档位面板。构造无副作用（不碰设备），参数走 FeatureRegistry ——
     // 与启动器写进 `config/render.json` 的是同一份表（QualityPresets）。
     m_qualityPanel = std::make_unique<editor::QualitySettingsPanel>();
+    // 2026-10-30：运镜面板。构造无副作用（只绑 EditorContext）。
+    m_cinePanel = std::make_unique<editor::CinematographyPanel>(*m_ctx);
     // 2026-10-24：材质仓库面板。构造无副作用 —— 仓库本身是**惰性加载**的
     // （见 EditorContext::materialLibrary），没打开面板就一次磁盘都不读。
     // 地形编辑器的指针在它构造之后才 attach（此时 m_landscape 还没建）。
@@ -2182,6 +2195,10 @@ void EditorApp::onUpdate(float dt) {
         // ---- 骨骼动画（A0-3）----
         // 排在物理**之前**：A4 的根运动会把位移写进 TransformComponent，
         // 物理要读到它这一帧的最终位置（与"运动学平台先摆好再求解"同理）。
+        // A4b：相位速率曲线是"一次 tick 全体生效"的开关，所以设在 tick
+        // **之前**而不是在 `updateLocomotion` 那个逐实体循环里（放那里
+        // 会被调用 N 次，且第一个实体设的值会被第二个覆盖）。
+        m_animator.setStrideCurve(m_ctx->strideCurve());
         m_animator.tick(m_ctx->activeScene(), simDt);
         // ---- 过场时间轴（C1）----
         // 排在动画之后：运镜与姿势是两条独立的时间线，先后无所谓；放在
@@ -2842,6 +2859,12 @@ void EditorApp::runPlayers(float dt) {
             if (sk->model && sk->model->skeleton) {
                 animation::LocomotionConfig cfg;
                 cfg.runSpeed = 0.0f;   // 自动：moveSpeed × 1.15
+                // 步幅匹配（A4）：面板上的开关，默认开。关掉 = 1× 播放，
+                // 就是"滑步"那一版，用来当对照。
+                cfg.strideMatch = m_ctx->strideMatch();
+                cfg.strideMinRate = m_ctx->strideMinRate();
+                cfg.strideMaxRate = m_ctx->strideMaxRate();
+                cfg.strideCurve = m_ctx->strideCurve();
                 // 按键映射（角色面板里绑的键）。
                 // ⚠ 判定用 `ui_keys::pressed`（ImGui 原始键状态），
                 //   不能用 `core::Input` —— 后者被 `io.WantCaptureKeyboard`

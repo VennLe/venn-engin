@@ -35,8 +35,10 @@
 
 #include "animation/ClipEdit.h"
 #include "animation/Constraint.h"
+#include "animation/GaitCycle.h"
 #include "animation/Pose.h"
 #include "animation/RigEdit.h"
+#include "animation/StrideMatch.h"
 #include "animation/WeightSet.h"
 #include "scene/Scene.h"
 
@@ -336,6 +338,24 @@ private:
 
     bool m_poseMode = false;
     animation::EditClip m_edit;
+    // ---- 步态生成器（2026-10-30）----
+    // 参数与上一次的报告都留在窗口上：读者按「生成」之后要看到**毫米数**，
+    // 而不是"看起来像在走"。报告里的 rig 也留着 —— 面板要显示哪些角色
+    // 在这具骨架上没找到（缺 Neck / Toe 的骨架照样能生成，只是少一段动作）。
+    animation::GaitParams m_gait;
+    animation::GaitReport m_gaitReport;
+    bool m_gaitRan = false;
+    // 生成一次行走循环写进 m_edit。面板按钮与脚本 `gait:` 共用（见 .cpp）。
+    bool generateWalk();
+
+    // ---- 步幅匹配（A4，2026-10-30）----
+    // 量**模型里某一段**的自然步速，并打一行 `CHAR-STRIDE`。
+    // 面板的 STRIDE MATCH 段与脚本 `stride[:clip]` 共用这个入口 ——
+    // 量出来的数就是 `Locomotion` 每帧会用来算播放速率的那个数，
+    // 所以"面板上显示的 0.598"和"Play 里用的"不可能不是同一个。
+    bool measureStride(const std::string& clipName);
+    animation::StrideInfo m_strideInfo;
+    std::string m_strideClip;   // 上次量的是哪一段（空 = 还没量过）
     // 摄影表的绑定（R8）。为空 = 编辑器没建它（只在测试/裁剪构建里）。
     DopeSheetWindow* m_dope = nullptr;
     // 摄影表标题里显示的"哪份片段"（bind 时算一次，指针要活到 bind 之后）

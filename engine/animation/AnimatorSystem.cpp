@@ -69,6 +69,44 @@ const AnimController* AnimatorSystem::controllerFor(const std::string& path) {
     return it->second.get();
 }
 
+const StridePhaseCurve* AnimatorSystem::strideCurveFor(
+    const assets::Skeleton& skel, const assets::AnimationClip& clip) {
+    // key = 骨架地址 + clip 名 + 时长（毫秒）。见头文件里的说明：
+    // 不带时长的话，"同一个 clip 名被重新烤过"会留着旧相位的曲线。
+    std::string key = std::to_string(static_cast<unsigned long long>(
+        reinterpret_cast<uintptr_t>(&skel)));
+    key += '\x1f';
+    key += clip.name;
+    key += '\x1f';
+    key += std::to_string(static_cast<int>(std::lround(clip.duration * 1000.0f)));
+
+    const auto it = m_strideCurves.find(key);
+    if (it != m_strideCurves.end())
+        return it->second.valid() ? &it->second : nullptr;
+
+    StridePhaseCurve cv;
+    const StrideInfo si = measureClipStride(skel, clip, &cv);
+    float gMin = 1.0f, gMax = 1.0f, gMean = 1.0f;
+    cv.stats(gMin, gMax, gMean);
+    if (si.ok && cv.valid()) {
+        VK_LOG_INFO("ANIM-STRIDE-CURVE clip=%s nominal=%.3f bins=%d "
+                    "gain=[%.3f, %.3f] mean=%.3f",
+                    clip.name.c_str(), static_cast<double>(si.nominalSpeed),
+                    cv.bins, static_cast<double>(gMin),
+                    static_cast<double>(gMax), static_cast<double>(gMean));
+    } else {
+        // 量不出来不是错误（挥手 / idle / 非人形骨架）→ 存一条 invalid，
+        // 这条路径上 `time += dt * speed` 逐位不变。
+        VK_LOG_INFO("ANIM-STRIDE-CURVE-SKIP clip=%s reason='%s'",
+                    clip.name.c_str(),
+                    si.ok ? "曲线为空（承重 bin 太少）" : si.error.c_str());
+        cv = StridePhaseCurve{};
+    }
+    // 失败也缓存（见头文件的说明）：不缓存的话这个实体每帧重量一次。
+    const auto ins = m_strideCurves.emplace(std::move(key), std::move(cv));
+    return ins.first->second.valid() ? &ins.first->second : nullptr;
+}
+
 const SpringRig& AnimatorSystem::rigFor(const assets::Skeleton& skel,
                                         const std::vector<std::string>& prefixes) {
     RigKey key;
@@ -508,6 +546,7 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     int mismatched = 0;
     int wrapped = 0;
     int fading = 0;   // 本帧处于过渡中的实体数（ANIM-FADE 用）
+    int strideCurved = 0;   // 本帧按相位曲线推进了播放头的实体数（A4b）
     int layersConfigured = 0;   // 配了附加层的实体数（B1）
     int layersApplied = 0;      // 其中真的混进去至少一层的
     // NLA（R9）同理：这里清一次，`applyNla` 里面累加。
@@ -671,7 +710,41 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
             const float evPrev = clipChanged ? 0.0f : (an ? an->eventPrev : time);
             // B3：本帧播放头有没有回绕过（根运动增量要据此丢弃）
             bool wrappedThisFrame = false;
-            if (advance && playing) {
+
+            // ---- A4b 相位速率曲线（接触锁定 / 时间重映射）----
+            //
+            // 只对**循环** clip 生效：曲线描述的是"一圈之内怎么分配速度"，
+            // 不循环的 clip 没有"下一圈"可对齐，硬套会让末帧永远到不了
+            // （时间被折回 [0, dur)，is 单次动作就播不完了）。
+            // 量不出曲线（不是步态 / 非人形）→ pc 为空 → 下面走原路径，
+            // **逐位不变**。
+            const StridePhaseCurve* pc = nullptr;
+            if (advance && playing && m_strideCurveOn && clip && dur > 0.0f &&
+                loop) {
+                pc = strideCurveFor(skel, *clip);
+                if (pc) ++strideCurved;
+            }
+
+            if (advance && playing && pc) {
+                // 相位域推进：`dt × speed / dur` 是"按基准速率走了多少圈"，
+                // `advance` 在内部按相位对 gain 做 4~32 个子步积分。
+                // ⚠ 不能写成"每帧查一次 gain 再乘 dt"：那等于把曲线量化
+                //   到帧率，帧率一变实际播放速度就变。
+                const float phase = time / dur;
+                const float next = pc->advance(phase, dt * speed / dur);
+                time = next * dur;
+                // 相位跳过端点 = 这一帧跨过了循环点（`advance` 已折回
+                // [0,1)）。负 speed 时方向相反，按同一件事判。
+                const bool crossed =
+                    (speed >= 0.0f) ? (next < phase) : (next > phase);
+                if (crossed) {
+                    ++wrapped;
+                    wrappedThisFrame = true;
+                    wrapClip = sk.clipName;
+                    wrapT = time;
+                    wrapDur = dur;
+                }
+            } else if (advance && playing) {
                 time += dt * speed;
 
                 if (dur > 0.0f) {
@@ -839,6 +912,7 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     m_lastLayers = layersConfigured;
     m_lastLayersApplied = layersApplied;
     m_lastRootMotion = rootMotions;
+    m_lastStrideCurve = strideCurved;
     // 必须在遍历**之后**：seen 是这一帧真正处理过的实体。
     cleanupStates(seen);
 
@@ -884,6 +958,13 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
             VK_LOG_WARN("ANIM-MODEL-MISMATCH n=%d (animator->model 与 "
                         "skinned.model 不是同一份 → 姿势会对不上但不报错)",
                         mismatched);
+        }
+        // 相位速率曲线（A4b）：开关开着就报，**哪怕 n=0**。
+        // `on=1 n=0` 是"开了但一段都量不出曲线"（不是步态 clip / 非人形），
+        // 那与"没接线"是两件事，必须能分开。
+        if (m_strideCurveOn) {
+            VK_LOG_INFO("ANIM-STRIDE-CURVE-TICK on=1 curved=%d curves=%d",
+                        strideCurved, static_cast<int>(m_strideCurves.size()));
         }
         if (missing > 0) {
             VK_LOG_WARN("ANIM-CLIP-MISSING n=%d clipName=[%s] available=[%s] "

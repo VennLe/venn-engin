@@ -86,6 +86,48 @@ struct LocomotionConfig {
     // ⚠ 只对**换 clip** 生效，不作用于 idle 重放（同一段动画归零重播，
     //   淡入淡出只会让它看起来"卡一下"）。
     float blendSeconds = 0.20f;
+
+    // ---- A4 步幅匹配（2026-10-30）----
+    //
+    // 开着的时候，walk / run 两段按"移动速度 ÷ 这段 clip 的自然步速"
+    // 缩放播放速率，让脚步与位移对上（不滑步）。自然步速默认**从 clip 里
+    // 量**（`animation/measureClipStride`），所以换 Mixamo 的 Walk 也自动
+    // 生效；下面两个 `*StrideSpeed` 是"我知道这段是多少，别量"的覆盖。
+    //
+    // ⚠ 关掉它 = 退回 P4 的行为（1× 播放）。留着这个开关是因为它正是
+    //   "滑步 vs 不滑步"的**对照**：同一段动画、同一个速度，只改这一位。
+    bool strideMatch = true;
+    // 速率夹范围。上面写了"夹住 = 承认做不到"，而 0.6~1.7 大致是
+    // "还看得出是走路"的区间：0.6 以下像慢动作，1.7 以上像快进。
+    float strideMinRate = 0.6f;
+    float strideMaxRate = 1.7f;
+    // 覆盖量出来的自然步速（m/s）。0 = 自动量。
+    float walkStrideSpeed = 0.0f;
+    float runStrideSpeed = 0.0f;
+
+    // **脚下的坡度（度）**：0 = 平地，正 = 上坡，负 = 下坡。
+    //
+    // ⚠ 它**不参与** rate 的计算。rate 的分子永远是**水平速度**（调用方
+    //   给的就是水平投影，见 `StrideMatch.h`），再乘一次 cos 就是二次投影，
+    //   20° 坡上会少播 6%。
+    // 它只用来把一个数报出来：平地 clip 没有竖直分量，于是脚在竖直方向
+    // 落后身体 `v·tanθ` —— 那部分是 rate 修不了的（只能靠脚 IK 或换带
+    // 抬脚的 clip）。不报的话，"上坡看起来比平地滑"会被当成 rate 算错。
+    float slopeDeg = 0.0f;
+
+    // ---- 相位速率曲线（A4b，2026-10-30）----
+    //
+    // 上面那些决定**平均**播放速率（常量倍率）。这一位决定一圈之内怎么
+    // 分配它：开着时 `AnimatorSystem` 按相位查 `gain(φ)` 推进播放头，
+    // 把承重期的残余起伏也收掉（见 `StridePhaseCurve`）。
+    //
+    // ⚠ 默认**关**，两个理由：
+    //   ① 它改变所有循环 clip 的播放头轨迹 → 逐位基线会飘
+    //      （`verify_procanim` / `verify_anim_runtime` 的 time 断言吃这个）；
+    //   ② 它需要 `Locomotion` 已经把 `speed` 设成对的基准值才有效 ——
+    //      单独打开只是在 1× 上做微调，看不出效果。
+    // 所以它是"`strideMatch` 之上的第二层"，由应用层显式打开。
+    bool strideCurve = false;
 };
 
 // 每个角色一份的运行时游标（不序列化：场景一打开就该从 idle 起算）。
@@ -103,6 +145,13 @@ struct LocomotionRuntime {
     bool restoreLoop = true;   // 强播前 sk.loop 的值，结束时还原
     int triggerCount = 0;
     int idleRetriggers = 0;
+
+    // ---- 步幅匹配的缓存（A4）----
+    // 量一次要采样 60~120 帧 × 全身 FK，所以只在**换 clip** 时量。
+    std::string strideClip;      // 上一次量的是哪一段（空 = 还没量过）
+    float strideSpeed = 0.0f;    // 量出来 / 配置指定的自然步速（0 = 量失败）
+    int strideMeasured = 0;      // 成功量过几次（日志 / 自检用）
+    bool strideWarned = false;   // "夹住了"只喊一次（同一次夹持期内）
 };
 
 struct LocomotionFrame {
@@ -111,14 +160,28 @@ struct LocomotionFrame {
     bool switched = false;      // clip 真的换了
     bool retriggered = false;   // 本帧重放了 idle
     bool triggerActive = false; // 本帧处于按键强播中
+
+    // ---- 步幅匹配（A4）本帧的结果 ----
+    // `playbackRate` 是**这一帧真正写进** `speed` 的值（没匹配时 = 1）。
+    // 三个数一起看才有意义：`speed / (strideSpeed × rate)` 就是残差。
+    float playbackRate = 1.0f;
+    float strideSpeed = 0.0f;   // 用到的自然步速（0 = 没量出来 / 没开）
+    float strideResidual = 0.0f; // 夹住之后还剩多少滑步（0 = 完全不滑）
+    // 斜坡上 rate 修不了的**竖直**残差（`cfg.slopeDeg == 0` 时恒为 0）。
+    // 单位是"名义步速的几分之几"：0.57 = 竖直方向落后身体半个多步速。
+    float strideVertical = 0.0f;
+    bool strideMatched = false;
+    bool strideClamped = false;
 };
 
 // 每个**固定步**调一次。dt <= 0 时只按当前状态重算（不推进计时器）。
 //
-// 写入：`sk.clipName / time / playing / loop`；有 AnimatorComponent 时
-// 同步写它的四项（那是权威字段，见 Components.h 的"权威关系"）。
+// 写入：`sk.clipName / time / playing / loop`，以及（A4 起）walk / run 两态
+// 的 `speed`（步幅匹配）；有 AnimatorComponent 时同步写它的五项（那是权威
+// 字段，见 Components.h 的"权威关系"）。
 // 日志锚点：`<tag>-ANIM ...`（tag 传 "GAME" / "EDIT"），格式与 P3 逐字一致，
-// 老脚本的 `GAME-ANIM state=` 正则不用改。
+// 老脚本的 `GAME-ANIM state=` 正则不用改。步幅匹配另有
+// `<tag>-STRIDE ...` 一行（只在换 clip / 夹持状态变化时打，不逐帧刷）。
 LocomotionFrame updateLocomotion(LocomotionRuntime& rt,
                                  ecs::SkinnedMeshComponent& sk,
                                  ecs::AnimatorComponent* an,

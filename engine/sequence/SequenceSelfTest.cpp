@@ -698,6 +698,199 @@ int runSequencerSelfTest() {
                    toJson(noPayload).find("\"//\"") == std::string::npos, "");
     }
 
+    // ============================================================
+    // G. 多机位 marker（运镜体系 §七，2026-10-30）
+    // ============================================================
+    //
+    // 这一组钉的是**"加了功能但不改老资产"**。G2 用字节比对、G9 用访问器
+    // 比对：没有 `shots` 键的资产从解析 → 写回 → 播放，行为必须逐位不变。
+    // 换句话说，下面每一条都可能被"多加了一个默认分支"弄红。
+    {
+        // 16 位十六进制（`parseGuidHex` 的长度要求，见 G6 的反向用例）
+        const char* kGuidHex = "00000000000a1b2c";
+        const std::uint64_t kGuid = 0x0a1b2cull;
+
+        // G1 四个字段都解析出来。
+        {
+            SequenceAsset s = parse(R"({
+                "camera":[{"t":0,"pos":[0,0,3]}],
+                "shots":[{"t":1.0,"camera":"00000000000a1b2c",
+                          "blend":0.4,"label":"A 特写"}]
+            })");
+            char d[128];
+            std::snprintf(d, sizeof(d), "n=%d,guid=%s,blend=%.2f,label=%s",
+                          static_cast<int>(s.shots.size()),
+                          s.shots.empty()
+                              ? "-"
+                              : ecs::guidToHex(s.shots[0].cameraGuid).c_str(),
+                          s.shots.empty() ? -1.0
+                                          : static_cast<double>(s.shots[0].blendSeconds),
+                          s.shots.empty() ? "-" : s.shots[0].label.c_str());
+            reportFlag("seq_shot_parse_fields",
+                       s.valid && s.shots.size() == 1 &&
+                           s.shots[0].cameraGuid == kGuid &&
+                           std::fabs(s.shots[0].blendSeconds - 0.4f) < 1e-5f &&
+                           s.shots[0].label == "A 特写",
+                       d);
+            // 中文 label 写回时**不许**转义成 \uXXXX（转义之后 git diff 全废，
+            // 而且作者在文件里就看不懂自己的标签了）。
+            reportFlag("seq_shot_label_utf8",
+                       toJson(s).find("A 特写") != std::string::npos,
+                       "raw-utf8");
+        }
+
+        // G2 老资产（没有 shots 键）写回时**不许**长出 `"shots": []`。
+        // ⚠ 这条是"字节级"判据：一旦写出空数组，所有既有 .seq.json 的
+        //   diff 立刻变脏，而且 `rt_*` 那组"写回再读回"的比对也会失真。
+        {
+            SequenceAsset s = twoKeys("linear");
+            const std::string text = toJson(s);
+            reportFlag("seq_shot_absent_not_written",
+                       text.find("\"shots\"") == std::string::npos,
+                       "no-empty-array");
+            SequenceAsset back;
+            parseSequence(text, "t.seq.json", back);
+            reportFlag("seq_shot_absent_roundtrip",
+                       back.valid && back.shots.empty() &&
+                           std::fabs(back.duration - 2.0f) < 1e-5f,
+                       back.valid ? "valid" : "invalid");
+        }
+
+        // G3 duration 推算要把 marker 算进去。
+        // ⚠ 只看关键帧的话会得到 2.0，最后那个 marker（3.5）永远不生效 ——
+        //   而它恰恰是"切到片尾那台机位"的那一下。
+        {
+            SequenceAsset s = parse(R"({
+                "camera":[{"t":0,"pos":[0,0,3]},{"t":2,"pos":[5,0,3]}],
+                "shots":[{"t":1.0},{"t":3.5}]
+            })");
+            report("seq_shot_dur_derived", s.duration, 3.5, 1e-4);
+        }
+
+        // G4 乱序输入按 t 升序排好（作者手写 JSON 时很常见）。
+        {
+            SequenceAsset s = parse(R"({
+                "camera":[{"t":0,"pos":[0,0,3]}],
+                "shots":[{"t":2.0,"label":"B"},{"t":0.5,"label":"A"}]
+            })");
+            reportFlag("seq_shot_sorted",
+                       s.shots.size() == 2 && s.shots[0].t < s.shots[1].t &&
+                           s.shots[0].label == "A" && s.shots[1].label == "B",
+                       s.shots.size() == 2 ? s.shots[0].label.c_str() : "-");
+        }
+
+        // G5 `shotIndexAt` 的区间是 **[marker.t, 下一个 marker.t)**，
+        //    返回的是**0 基下标**（−1 专门留给"一个 marker 都不在生效"），
+        //    并且**早于第一个 marker 返回 −1**（不是 0）。
+        // ⚠⚠ 这两条是这一组最该测的：照抄 `cameraKeyIndexAt`（早于首帧返回 0）
+        //    的话，开场黑场那一秒会突然亮出第一个机位的画面。
+        // ⚠ 第一版这里把期望写成了 1/1/2/2（把"第几个"当成"下标"）→ 四条全红。
+        //   红的时候先怀疑期望：返回 0 表示"0 号 marker 生效"才是对的。
+        {
+            SequenceAsset s = parse(R"({
+                "camera":[{"t":0,"pos":[0,0,3]}],
+                "shots":[{"t":1.0},{"t":2.0}]
+            })");
+            report("seq_shot_idx_before_first", shotIndexAt(s, 0.4f), -1.0, 0.5);
+            report("seq_shot_idx_at_boundary", shotIndexAt(s, 1.0f), 0.0, 0.5);
+            report("seq_shot_idx_inside", shotIndexAt(s, 1.999f), 0.0, 0.5);
+            report("seq_shot_idx_at_second", shotIndexAt(s, 2.0f), 1.0, 0.5);
+            report("seq_shot_idx_past_end", shotIndexAt(s, 9.0f), 1.0, 0.5);
+        }
+
+        // G6 短 guid（手写成 `a1b2c`）→ **不崩**，回落 + 一条警告。
+        //    ⚠ 这条必须留：`parseGuidHex` 长度不足时返回 0，于是"手写一个
+        //      短 guid"会静默退化成老行为（画面照常动，只是不切机位）。
+        //      有警告才有人查得出来。
+        {
+            SequenceAsset s = parse(R"({
+                "camera":[{"t":0,"pos":[0,0,3]}],
+                "shots":[{"t":0.0,"camera":"a1b2c"}]
+            })");
+            reportFlag("seq_shot_bad_guid_warns",
+                       s.valid && s.shots.size() == 1 &&
+                           s.shots[0].cameraGuid == 0 && !s.warnings.empty(),
+                       s.warnings.empty() ? "no-warning" : "warned");
+        }
+
+        // G7 写回再读回：guid / blend / label 逐字段相等，且 guid 是
+        //    **16 位小写 hex 字符串**（不是 JSON number —— 中间任何工具都会
+        //    把 uint64 截成 float）。
+        {
+            SequenceAsset a;
+            a.duration = 4.0f;
+            a.cameraKeys.push_back(SeqCameraKey{});
+            SeqShot sh;
+            sh.t = 1.5f;
+            sh.cameraGuid = kGuid;
+            sh.blendSeconds = 0.25f;
+            sh.label = "B";
+            a.shots.push_back(sh);
+            const std::string text = toJson(a);
+            reportFlag("seq_shot_guid_is_hex_string",
+                       text.find(std::string("\"camera\": \"") + kGuidHex + "\"") !=
+                           std::string::npos,
+                       "hex16");
+            SequenceAsset b;
+            parseSequence(text, "rt.seq.json", b);
+            reportFlag("seq_shot_roundtrip",
+                       b.valid && b.shots.size() == 1 &&
+                           b.shots[0].cameraGuid == kGuid &&
+                           std::fabs(b.shots[0].blendSeconds - 0.25f) < 1e-5f &&
+                           b.shots[0].label == "B" &&
+                           std::fabs(b.shots[0].t - 1.5f) < 1e-5f,
+                       b.shots.empty() ? "n=0" : "ok");
+        }
+
+        // G8 播放器把"这一帧用哪台"报出来（宿主拿它去驱动导演覆盖）。
+        //    marker 在 0.5s 与 2.0s。
+        // ⚠⚠ **每帧最多走 `kMaxStep`=0.10 秒**（见 `SequencerSystem.cpp`），
+        //    所以这里必须用小步累加，不能 `tick(s, 0.6f)` 一把推到 0.7 ——
+        //    那样实际只到 0.2，断言会红在"根本没走到 marker"上，而人以为是
+        //    切镜逻辑坏了。
+        {
+            scene::Scene s;
+            addSeq(s, "Seq", parse(R"({
+                "duration":3.0,
+                "camera":[{"t":0,"pos":[0,0,3]},{"t":3,"pos":[9,0,3]}],
+                "shots":[{"t":0.5,"camera":"00000000000a1b2c","blend":0.3},
+                         {"t":2.0}]
+            })"));
+            SequencerSystem sys;
+            auto run = [&](int steps) {
+                for (int i = 0; i < steps; ++i) sys.tick(s, 0.1f);
+            };
+            run(4);                     // playhead 0.4 —— 早于第一个 marker
+            report("seq_shot_player_before", sys.shotIndex(), -1.0, 0.5);
+            report("seq_shot_player_cam_before",
+                   static_cast<double>(sys.shotCameraGuid()), 0.0, 0.5);
+
+            run(3);                     // 0.7 —— 落在 0 号上
+            report("seq_shot_player_idx0", sys.shotIndex(), 0.0, 0.5);
+            reportFlag("seq_shot_player_cam0", sys.shotCameraGuid() == kGuid,
+                       ecs::guidToHex(sys.shotCameraGuid()).c_str());
+            report("seq_shot_player_blend0", sys.shotBlendSeconds(), 0.3, 1e-4);
+
+            run(15);                    // 2.2 —— 1 号（没绑 → 0 = 回落关键帧轨）
+            report("seq_shot_player_idx1", sys.shotIndex(), 1.0, 0.5);
+            reportFlag("seq_shot_player_cam1_released", sys.shotCameraGuid() == 0,
+                       "keytrack");
+        }
+
+        // G9 老资产 tick 之后三个输出恒为 −1 / 0 / 0 → 宿主**一次事都不做**。
+        //    这是"多机位不影响既有过场"的运行时侧判据。
+        {
+            scene::Scene s;
+            addSeq(s, "Seq", twoKeys("linear"));
+            SequencerSystem sys;
+            sys.tick(s, 0.5f);
+            report("seq_shot_none_idx", sys.shotIndex(), -1.0, 0.5);
+            report("seq_shot_none_cam",
+                   static_cast<double>(sys.shotCameraGuid()), 0.0, 0.5);
+            report("seq_shot_none_blend", sys.shotBlendSeconds(), 0.0, 1e-6);
+        }
+    }
+
     const int failures = g_fail;
     VK_LOG_INFO("SEQ-TOTAL pass=%d fail=%d", g_pass, g_fail);
     return failures;

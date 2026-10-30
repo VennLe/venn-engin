@@ -10,6 +10,7 @@
 #include "animation/Locomotion.h"
 
 #include "animation/ClipSwitch.h"
+#include "animation/StrideMatch.h"
 #include "assets/Skeleton.h"
 #include "core/Logger.h"
 
@@ -30,6 +31,57 @@ constexpr unsigned kTriggerMissingBit = 1u << 4;
 // 但**必须与默认值相等**，否则同一台机器上"走路切换"和"按 K 起跳"的
 // 过渡手感会不一致。
 constexpr float kTriggerBlendSec = 0.20f;
+
+// 换 clip 时"量自然步速"的入口。
+//
+// 三级优先：配置覆盖（明确知道这段多少）→ 从 clip 里量 → 0（放弃匹配）。
+// 缓存键是**clip 名**：换回同一段就不用再量（一次量要 60~120 帧全身 FK）。
+float nominalSpeedFor(LocomotionRuntime& rt, const assets::Skeleton& skel,
+                      const std::string& clip, int state,
+                      const LocomotionConfig& cfg, const char* tag) {
+    const float override =
+        (state == 2) ? cfg.runStrideSpeed : cfg.walkStrideSpeed;
+    if (override > 0.0f) {
+        // 覆盖值也要进缓存，否则每帧都会走一遍上面的分支（无副作用，
+        // 但会让 `strideMeasured` 这个计数失去意义）。
+        if (rt.strideClip != clip) {
+            rt.strideClip = clip;
+            rt.strideSpeed = override;
+            rt.strideWarned = false;
+            ++rt.strideMeasured;
+        }
+        return rt.strideSpeed;
+    }
+    if (rt.strideClip == clip) return rt.strideSpeed;
+
+    rt.strideClip = clip;
+    rt.strideSpeed = 0.0f;
+    rt.strideWarned = false;
+    const assets::AnimationClip* c = skel.findClip(clip);
+    if (!c) return 0.0f;
+    const StrideInfo si = measureClipStride(skel, *c);
+    if (!si.ok) {
+        // 量不出来**不是错误**：这不是步态 clip（挥手 / 坐下 / idle），
+        // 或者骨架不是人形。退回 1× 播放，与引入本功能之前逐位一致。
+        VK_LOG_INFO("%s-STRIDE-SKIP clip=%s reason='%s'", tag, clip.c_str(),
+                    si.error.c_str());
+        return 0.0f;
+    }
+    rt.strideSpeed = si.nominalSpeed;
+    ++rt.strideMeasured;
+    // `air` = 两只脚同时离地的帧占比。0 = 走路（总有脚在地上），
+    // 非 0 = 跑步。它与 `duty` 一起才是"这段是走还是跑"的可靠判据
+    // （duty 单独看得不到结论 —— 见 StrideMatch.h 里记的那次实测）。
+    VK_LOG_INFO("%s-STRIDE-MEASURE clip=%s nominal=%.3f cycle=%.2fs "
+                "duty=%.2f air=%.2f samples=%d contact=%d span=%.3f/%.3f",
+                tag, clip.c_str(), static_cast<double>(si.nominalSpeed),
+                static_cast<double>(si.cycleSeconds),
+                static_cast<double>(si.dutyFactor),
+                static_cast<double>(si.airborneFraction), si.samples,
+                si.contactSamples, static_cast<double>(si.strideSpan),
+                static_cast<double>(si.spanSpeed));
+    return rt.strideSpeed;
+}
 
 } // namespace
 
@@ -148,6 +200,82 @@ LocomotionFrame updateLocomotion(LocomotionRuntime& rt,
                     t, rt.idleRetriggers,
                     static_cast<double>(rt.idleHold), want.c_str());
         f.retriggered = true;
+    }
+
+    // ---- 6) 步幅匹配（A4）：把移动速度翻译成播放速率 ----
+    //
+    // 到这一步为止，状态机只解决了"该播哪一段"；播多快从来没人管过，
+    // 于是 0.6 m/s 的走路动画配上 3 m/s 的移动速度 —— 脚在地上滑。
+    // 这里把 `速度 ÷ 这段 clip 的自然步速` 写进 `speed`，位移与脚步对上。
+    //
+    // 只有 walk / run 参与：
+    //   · idle 的"速度"是噪声（撞墙时可能是 0.01），不该被当成步频；
+    //   · jump 的位移是抛物线，与脚步无关。
+    // 这两态**显式写回 1×** —— 否则从 walk 切到 idle 之后会留着上一步的
+    // 1.6 倍速把待机动作播快（"待机在快进"这种错没人会往步幅匹配上想）。
+    const bool strideState = (state == 1 || state == 2);
+    if (!strideState || !cfg.strideMatch) {
+        setClipSpeed(sk, an, 1.0f);
+        rt.strideWarned = false;
+        return f;
+    }
+
+    const float nominal = nominalSpeedFor(rt, skel, want, state, cfg, t);
+    if (!(nominal > 0.0f)) {
+        // 量不出来（不是步态 clip / 非人形骨架）→ 1×，与引入本功能之前
+        // 逐位一致。`nominalSpeedFor` 已经打过 STRIDE-SKIP，不重复喊。
+        setClipSpeed(sk, an, 1.0f);
+        rt.strideWarned = false;
+        return f;
+    }
+
+    const StrideRate sr = strideRateFor(horizSpeed, nominal, cfg.strideMinRate,
+                                       cfg.strideMaxRate, cfg.slopeDeg);
+    setClipSpeed(sk, an, sr.rate);
+    f.playbackRate = sr.rate;
+    f.strideSpeed = nominal;
+    f.strideResidual = sr.residual;
+    f.strideVertical = sr.verticalResidual;
+    f.strideMatched = true;
+    f.strideClamped = sr.clamped;
+
+    // 只在"换了 clip"或"夹持状态翻转"时打一行：逐帧打会把日志冲掉
+    // （速度每帧都在变，一行一个数等于没有数）。
+    const bool wasClamped = rt.strideWarned;
+    if (f.switched || sr.clamped != wasClamped) {
+        VK_LOG_INFO("%s-STRIDE clip=%s nominal=%.3f speed=%.3f rate=%.3f "
+                    "residual=%+.1f%% vert=%.2f slope=%.1fdeg clamped=%d",
+                    t, want.c_str(), static_cast<double>(nominal),
+                    static_cast<double>(horizSpeed),
+                    static_cast<double>(sr.rate),
+                    static_cast<double>(sr.residual * 100.0f),
+                    static_cast<double>(sr.verticalResidual),
+                    static_cast<double>(cfg.slopeDeg), sr.clamped ? 1 : 0);
+        // 斜坡上 rate 只能对齐水平分量。竖直那一份是**平地 clip 表达不了**
+        // 的，报出来免得被当成"rate 算错了"（见 LocomotionConfig::slopeDeg）。
+        if (sr.verticalResidual > 0.10f && f.switched) {
+            VK_LOG_WARN("%s-STRIDE-SLOPE clip=%s slope=%.1fdeg 竖直方向落后"
+                        "身体 %.2f×名义步速 → 平地 clip 没有爬升，只能靠"
+                        "脚 IK（TwoBoneIKComponent）或换带抬脚的 clip",
+                        t, want.c_str(), static_cast<double>(cfg.slopeDeg),
+                        static_cast<double>(sr.verticalResidual));
+        }
+    }
+    if (sr.clamped && !wasClamped) {
+        rt.strideWarned = true;
+        // 夹住 = 变速救不回来。两条出路都写进日志，别让人去猜：
+        //   · 降移动速度（把 maxSpeed / moveSpeed 贴近自然步速）；
+        //   · 换一段更快的 clip（walk → run），或调大生成器的步幅 / 步频。
+        VK_LOG_WARN("%s-STRIDE-CLAMPED clip=%s 速度 %.2f m/s 超出这段动画"
+                    "能表达的范围（自然步速 %.2f × [%.2f, %.2f]），"
+                    "还剩 %.0f%% 滑步",
+                    t, want.c_str(), static_cast<double>(horizSpeed),
+                    static_cast<double>(nominal),
+                    static_cast<double>(cfg.strideMinRate),
+                    static_cast<double>(cfg.strideMaxRate),
+                    static_cast<double>(sr.residual * 100.0f));
+    } else if (!sr.clamped && wasClamped) {
+        rt.strideWarned = false;
     }
     return f;
 }

@@ -113,6 +113,35 @@ private:
     // 过渡"的项目留的。四段足够验证绑骨 + 动画生成这条链真的通了；
     // 想做混合，把这里换成控制器资产即可（clipName 的写入点还是同一个）。
     void tickPlayerAnimation(float dt);
+    // 镜头参数 → 渲染效果（2026-10-30 运镜体系）。
+    //
+    // 相机组件上的景深 / 快门角是**作者填的镜头参数**，而真正执行它们的是
+    // `render::CameraEffectSettings`（景深 pass / 运动模糊 pass）。engine 里
+    // `scene` 不认识 `render`（单向依赖），所以这一步只能由宿主做 ——
+    // 放在这里而不是 Renderer 里，因为只有宿主知道"当前活跃相机是哪台"。
+    //
+    // ⚠ 语义是**只在配了的时候写**：`dofEnabled == false && shutterAngle == 0`
+    //   的相机一个字节都不改 → `MYVK_DOF` / 后期体积的覆盖照旧生效。
+    //   相机切换时把**上一次写进去的**那两项复位（否则上一台的景深会粘住）。
+    void applyCameraLensEffects();
+
+    // 多机位切镜（2026-10-30；运镜体系 §七）。
+    //
+    // 把时间轴的 marker 结论翻译成相机系统的**导演覆盖**：
+    //   `shotCameraGuid() != 0` → 压过 priority 用那台机位；混合时长交给
+    //   `blendCut`（0 = 硬切）
+    //   `shotCameraGuid() == 0` → 释放覆盖，回落 priority / 关键帧轨
+    //
+    // ⚠⚠ 调用位置是硬约束：**`seq.tick()` 之后、`CameraSystem::update()` 之前**。
+    //   排在 tick 之前 → 用的是上一帧的 marker（切镜晚一帧，边界处会看到
+    //   上一机位的画面）；排在 update 之后 → 这一帧白算。
+    //
+    // ⚠⚠ 覆盖生效时必须 `clearDesiredPose()`：玩家控制器/时间轴本帧刚喂过
+    //   `setDesiredPose`，那份 desired 会让 `update()` 走"用 desired"分支，
+    //   于是 marker 选中的机位**根本不动**（画面还是玩家视角），而且日志里
+    //   `CAM-CUT` 明明打出来了 —— 这是这条线最容易踩的一个坑。
+    void syncDirectorCamera();
+
     // 音频每帧（G14-5）：listener = 相机；把场景里的 AudioSourceComponent
     // 收集成 SourceUpdate 喂给 AudioSystem。⚠ **只读世界**（§3.6）：
     // 这里一个 `world().get<T>()` 的非 const 引用都不许拿去写。
@@ -148,6 +177,17 @@ private:
     // 在 simulate() 里排在物理**之前**（A4 的根运动是物理的输入），
     // 与编辑器 Play 的顺序一致。
     animation::AnimatorSystem m_animator;
+
+    // 镜头效果接线（applyCameraLensEffects）的状态：
+    //   `m_lensCam` 记住上一次写效果的那台相机 —— 换相机时先把**自己写过**
+    //   的两项（dof / motionBlur）复位，不然上一台的景深会粘在画面上，
+    //   而作者只会看到"换了相机景深还在"，完全想不到是这里。
+    //   `m_lensSig` 是日志去重签名（每帧打会淹掉真正有用的行）。
+    std::uint64_t m_lensCam = 0;
+    std::string m_lensSig;
+
+    // 多机位切镜的日志去重签名（只在真的切了那一刻打一条 CAM-CUT-RT）。
+    std::string m_cutSig;
 
     // ---- M2：输入 / 角色 / 相机 / 接触事件 ----
     core::InputMap m_input;

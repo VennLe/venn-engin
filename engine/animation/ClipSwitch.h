@@ -44,4 +44,12 @@ void setClipPlaying(ecs::SkinnedMeshComponent& sk, ecs::AnimatorComponent* an,
 void setClipLoop(ecs::SkinnedMeshComponent& sk, ecs::AnimatorComponent* an,
                  bool loop);
 
+// 播放速率倍率。两边都写（理由同上）。
+//
+// A4 步幅匹配（2026-10-30）用它把"移动速度"翻译成"这段 clip 该播多快"，
+// 见 `animation/StrideMatch.h`。0 或负数会让播放头不动（等于定格）——
+// 调用方负责用 strideRateFor 的 min/max 决定范围。
+void setClipSpeed(ecs::SkinnedMeshComponent& sk, ecs::AnimatorComponent* an,
+                  float speed);
+
 } // namespace animation

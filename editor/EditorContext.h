@@ -251,6 +251,25 @@ public:
     void advancePlayTime(float dt) { m_playTime += dt; }
     void setPlayTime(float t) { m_playTime = t; }
 
+    // ---------------------------------------------------------- 步幅匹配（A4）
+    // Play 时的动画播放速率：`速度 ÷ clip 的自然步速`（见
+    // `animation/StrideMatch.h`）。放在 EditorContext 里而不是 EditorHost：
+    // 它不改任何引擎状态，只是"下次构造 LocomotionConfig 时填哪个数"，
+    // 而角色面板要能当场 A/B 它 —— 这正是"滑 / 不滑"的对照组。
+    bool strideMatch() const { return m_strideMatch; }
+    void setStrideMatch(bool on) { m_strideMatch = on; }
+    float strideMinRate() const { return m_strideMinRate; }
+    float strideMaxRate() const { return m_strideMaxRate; }
+    void setStrideRateRange(float lo, float hi) {
+        m_strideMinRate = lo;
+        m_strideMaxRate = hi;
+    }
+    // 相位速率曲线（A4b）：一圈之内按相位分配播放速度（接触锁定）。
+    // 与上面那个开关是**两层**：这个只改"怎么分配"，不改平均速率。
+    // 默认关（会改所有循环 clip 的播放头轨迹），面板上可当场 A/B。
+    bool strideCurve() const { return m_strideCurve; }
+    void setStrideCurve(bool on) { m_strideCurve = on; }
+
     // ---------------------------------------------------------- 游戏全屏
     // 只在 Play 期间有效：让视口独占整个编辑器窗口（F 键 / 右上角按钮切换），
     // 并且 EditorApp 会把 GLFW 顶层窗口一起切成真全屏。
@@ -933,6 +952,16 @@ private:
     scene::Scene m_runtimeScene;
     PlayState m_play = PlayState::Stopped;
     float m_playTime = 0.0f;
+
+    // 步幅匹配（A4，见上面的 strideMatch()）。默认开着 —— 它是"对的"那个
+    // 行为；关掉是为了对照（和运行时 game.json 的 strideMatch 同源语义）。
+    bool m_strideMatch = true;
+    float m_strideMinRate = 0.6f;
+    float m_strideMaxRate = 1.7f;
+    // A4b 相位速率曲线。默认**开**（它是"对的"那个行为：承重期脚掌钉住）。
+    // 它改的是播放头轨迹（不只是速度），所以如果某些逐位基线因此飘了，
+    // 就该把这里改回 false —— 那时曲线仍然由面板 / game.json 显式打开。
+    bool m_strideCurve = true;
 
     // R7-1：物理世界的运行态统计（由 EditorApp 每帧灌入，面板只读）
     PhysicsRuntimeInfo m_physicsRuntime;

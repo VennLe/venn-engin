@@ -71,18 +71,37 @@
     { "t": 1.2, "kind": "Footstep", "payload": "left"         },
     { "t": 4.0, "kind": "Line",     "payload": "ch01_open_01" },
     { "t": 6.5, "kind": "Music",    "payload": "calm_loop"    }
+  ],
+  "shots": [
+    { "t": 0.0, "camera": "c2a0000000000001", "label": "A 全景" },
+    { "t": 2.5, "camera": "c2a0000000000002", "blend": 0.4, "label": "B 特写" },
+    { "t": 5.0 }
   ]
 }
 ```
 
 | 字段 | 含义 | 缺省 |
 |---|---|---|
-| `duration` | 总长（秒）。不写就取"最后一个关键帧 / 最后一条事件"的时刻 | 自动推导 |
+| `duration` | 总长（秒）。不写就取"最后一个关键帧 / 最后一条事件 / 最后一个 marker"的时刻 | 自动推导 |
 | `loop` | 资产自己是循环的吗。**与组件上的 Loop 是"或"关系**，不是覆盖 | `false` |
 | `camera[]` | 相机关键帧。`pos`（也接受 `position`）/ `yaw` / `pitch` / `fov` / `ease` | — |
 | `events[]` | 事件表。`t` / `kind` / `payload` | — |
+| `shots[]` | 多机位 marker（2026-10-30）。`t` / `camera` / `blend` / `label` | 空 = 老行为 |
 
 **`yaw` / `pitch` 单位是弧度**（与场景 JSON 的 `camera` 块同一口径，不是度）。
+
+### `shots[]`：多机位切镜
+
+每个 marker 从 `t` 起生效，**一直到下一个 marker 或片尾**（区间半开）。
+`camera` 是相机实体的 guid，**16 位小写 hex**；省略（或写 `0`）= 这一段
+退回由上面的 `camera[]` 关键帧轨驱动。`blend` 是"从上一段混过来用几秒"，
+`0` = 硬切（电影剪辑里最常用的是硬切，所以它是默认值）。
+
+⚠ 早于第一个 marker 的时段**不用**第一个机位（`shotIndexAt` 返回 −1）——
+照抄关键帧轨的"早于首帧返回 0"会让开场黑场那一秒突然亮出画面。
+
+详细设计（导演覆盖为什么必须 `clearDesiredPose`、目标被删为什么必须回落）
+见 `docs/camera_move.md` §九。
 
 ### `ease` 三档
 

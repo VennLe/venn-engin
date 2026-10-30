@@ -2282,6 +2282,117 @@ void CharacterWindow::syncDopeSheet() {
     m_dope->bind(h);
 }
 
+// ---------------------------------------------------------------- 行走循环生成
+//
+// 面板按钮与脚本命令 `gait:` **共用这一个入口**。分两份实现的话，
+// "脚本能过"就不代表"按钮接了线" —— 而验收要看的是后者。
+//
+// 它只写 `m_edit`（内存里那份），落盘仍然由「保存」决定。
+bool CharacterWindow::generateWalk() {
+    const assets::Skeleton* skel =
+        (m_model && m_model->skeleton) ? m_model->skeleton.get() : nullptr;
+    if (!skel) {
+        m_gaitRan = false;
+        m_gaitReport = animation::GaitReport{};
+        m_gaitReport.error = "no skeleton";
+        VK_LOG_WARN("CHAR-GAIT op=generate ok=0 reason=noskeleton");
+        return false;
+    }
+
+    const animation::GaitReport rep =
+        animation::buildWalkCycle(*skel, m_gait, m_edit);
+    m_gaitReport = rep;
+    m_gaitRan = rep.ok;
+    if (rep.ok) {
+        m_editDirty = true;
+        m_animTime = 0.0f;
+        clearTransient();
+    } else {
+        VK_LOG_WARN("CHAR-GAIT-FAIL why='%s'", rep.error.c_str());
+    }
+    VK_LOG_INFO("CHAR-GAIT op=generate ok=%d tracks=%d keys=%d "
+                "step=%.3f speed=%.3f slide=%.2fmm vert=%.2fmm "
+                "mirror=%.2fmm loop=%.2fmm reach=%.3f arm=%.3f",
+                rep.ok ? 1 : 0, rep.tracks, rep.keys,
+                static_cast<double>(rep.effectiveStep),
+                static_cast<double>(rep.nominalSpeed),
+                static_cast<double>(rep.stanceSlideMm),
+                static_cast<double>(rep.stanceVerticalMm),
+                static_cast<double>(rep.mirrorErrMm),
+                static_cast<double>(rep.loopErrMm),
+                static_cast<double>(rep.reachMargin),
+                static_cast<double>(rep.armCounterM));
+    return rep.ok;
+}
+
+// ============================================================
+// 步幅匹配（A4）：量模型里某一段的自然步速
+// ============================================================
+// 面板读数与脚本 `stride:` 共用 —— 这一点很重要：`Locomotion` 每帧算播放
+// 速率用的就是「模型里这段 clip + 同一个 measureClipStride」，所以面板上
+// 显示的 0.598 和 Play 里真正用到的必然是同一个数。两处各写一份度量的话，
+// "面板说不滑、Play 里却滑"这种偏差根本无从查起。
+//
+// ⚠ 量的是**模型里的 clip**（骨骼上那段导入/保存好的动画），不是 `m_edit`
+//   里还没落盘的编辑片段。要看编辑片段自己的步速，走 `measureEditClipStride`
+//   （生成报告里的 `nominalSpeed` 就是它的结果）。
+bool CharacterWindow::measureStride(const std::string& clipName) {
+    m_strideInfo = animation::StrideInfo{};
+    m_strideClip = clipName;
+
+    // 每一条出口都打**同一行**结构化日志（含失败）。
+    // ⚠ 失败时只打一行 WARN 是不够的：验收脚本靠 `CHAR-STRIDE clip=...
+    //   ok=0` 来判"不存在的 clip 被拒绝了"，而没有这行时"命令没跑"与
+    //   "跑了但拒绝"在日志里长得一样。
+    auto emit = [&]() {
+        VK_LOG_INFO("CHAR-STRIDE clip=%s ok=%d nominal=%.3f cycle=%.2fs "
+                    "duty=%.2f air=%.2f samples=%d contact=%d missing=%d "
+                    "travel=%.3f/%.3f low=%.3f/%.3f rise=%.3f toe=%d abs=%d "
+                    "span=%.3f/%.3f err='%s'",
+                    m_strideClip.c_str(), m_strideInfo.ok ? 1 : 0,
+                    static_cast<double>(m_strideInfo.nominalSpeed),
+                    static_cast<double>(m_strideInfo.cycleSeconds),
+                    static_cast<double>(m_strideInfo.dutyFactor),
+                    static_cast<double>(m_strideInfo.airborneFraction),
+                    m_strideInfo.samples, m_strideInfo.contactSamples,
+                    m_strideInfo.missingRoles,
+                    static_cast<double>(m_strideInfo.footTravel[0]),
+                    static_cast<double>(m_strideInfo.footTravel[1]),
+                    static_cast<double>(m_strideInfo.footLow[0]),
+                    static_cast<double>(m_strideInfo.footLow[1]),
+                    static_cast<double>(m_strideInfo.hipRise),
+                    m_strideInfo.soleFromToe ? 1 : 0,
+                    m_strideInfo.soleAbsolute ? 1 : 0,
+                    static_cast<double>(m_strideInfo.strideSpan),
+                    static_cast<double>(m_strideInfo.spanSpeed),
+                    m_strideInfo.error.c_str());
+    };
+
+    const assets::Skeleton* skel =
+        (m_model && m_model->skeleton) ? m_model->skeleton.get() : nullptr;
+    if (!skel) {
+        m_strideInfo.error = "no skeleton";
+        emit();
+        VK_LOG_WARN("CHAR-STRIDE-MISS clip='%s' reason=noskeleton",
+                    clipName.c_str());
+        return false;
+    }
+    const assets::AnimationClip* clip = skel->findClip(clipName);
+    if (!clip) {
+        m_strideInfo.error = "clip not found";
+        emit();
+        VK_LOG_WARN("CHAR-STRIDE-MISS clip='%s' reason=noclip (共 %d 段)",
+                    clipName.c_str(), static_cast<int>(skel->clips.size()));
+        return false;
+    }
+    m_strideInfo = animation::measureClipStride(*skel, *clip);
+    emit();
+    if (!m_strideInfo.ok)
+        VK_LOG_WARN("CHAR-STRIDE-MISS clip='%s' why='%s'", clipName.c_str(),
+                    m_strideInfo.error.c_str());
+    return m_strideInfo.ok;
+}
+
 void CharacterWindow::drawPosePanel() {
     const assets::Skeleton* skel =
         (m_model && m_model->skeleton) ? m_model->skeleton.get() : nullptr;
@@ -2392,6 +2503,219 @@ void CharacterWindow::drawPosePanel() {
                            TR("Missing bones"));
         for (const auto& m : m_editStats.missing)
             ImGui::BulletText("%s", m.c_str());
+    }
+
+    // ---- 行走循环生成器（2026-10-30）----
+    //
+    // 为什么生成器要做在引擎里，而不是让人照着 K 帧表手动摆：
+    //   表 §6 那条"承重期脚掌 X/Z 完全不动"是**约束**，而关键帧之间的
+    //   插值不认约束 —— 手工摆出来的每一帧都对，中间的帧一定滑。这里的
+    //   做法反过来：先定脚的世界轨迹（承重期是一条直线、摆动期是抛物线），
+    //   再用两骨 IK 回填大腿 / 小腿，最后**逐帧烘焙**。于是"滑没滑"
+    //   变成下面那几个毫米数，而不是"看着还行"。
+    //
+    // ⚠ 它只写 `m_edit`（内存里的那份），落盘仍然走上面的「保存」——
+    //   "生成了但没存盘"和别的手工编辑一样能反悔。
+    ImGui::Spacing();
+    ImGui::TextDisabled(TR("WALK CYCLE"));
+    ImGui::Separator();
+
+    // 一行一个参数：左列固定 112px 让输入框对齐（和上面 STATS 的 90px
+    // 不同，这里的中文标签更长）。标签走 TextUnformatted(TR(...)) 而不是
+    // 当 ImGui 的 ID —— ID 跟着语言变会让"切语言后控件状态丢了"。
+    const float kWalkLabelW = 112.0f;
+    auto walkRow = [&](const char* id, const char* label) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine(kWalkLabelW);
+        ImGui::SetNextItemWidth(-1.0f);
+    };
+
+    walkRow("##gait_step", TR("Step length"));
+    ImGui::DragFloat("##gait_step", &m_gait.stepLength, 0.005f, 0.10f, 2.00f,
+                     TR("%.3f m"));
+    logRect("CHAR-GAIT-STEP", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    tip(TR("Distance one step covers. It gets clamped to what this leg can "
+           "reach — the report says so instead of silently sliding."));
+
+    walkRow("##gait_frames", TR("Cycle frames"));
+    // 不给格式串：DragInt 的默认就是 "%d"。写一个只为好看的字面量还要
+    // 进词典（E 组要求 DragFloat/DragInt 的显示格式串包 TR），不值得。
+    ImGui::DragInt("##gait_frames", &m_gait.cycleFrames, 1, 8, 240);
+    logRect("CHAR-GAIT-FRAMES", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    tip(TR("A full cycle is TWO steps. The table's 1/7/13/19/25 maps to the "
+           "first half, so 48 keeps the frame numbers identical."));
+
+    walkRow("##gait_stance", TR("Stance"));
+    ImGui::DragFloat("##gait_stance", &m_gait.stanceFrac, 0.005f, 0.35f, 0.85f);
+    logRect("CHAR-GAIT-STANCE", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    tip(TR("How much of the cycle one leg carries the weight. 0.62 walks, "
+           "0.8 is slow, 0.42 runs."));
+
+    walkRow("##gait_bob", TR("Bob / sway"));
+    // 两个数并排：先按剩余宽度算一半，第二个再吃剩下的（`-1`）。
+    const float halfW = (ImGui::GetContentRegionAvail().x -
+                         ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+    ImGui::SetNextItemWidth(halfW);
+    ImGui::DragFloat("##gait_bob", &m_gait.bob, 0.001f, 0.0f, 0.12f);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::DragFloat("##gait_sway", &m_gait.sway, 0.001f, 0.0f, 0.12f);
+    logRect("CHAR-GAIT-BOB", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    tip(TR("Half amplitudes of the body's up/down and left/right travel "
+           "(metres). The peak-to-peak is twice these."));
+
+    walkRow("##gait_lift", TR("Foot lift"));
+    ImGui::DragFloat("##gait_lift", &m_gait.footLift, 0.002f, 0.0f, 0.40f,
+                     TR("%.3f m"));
+    logRect("CHAR-GAIT-LIFT", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    tip(TR("Peak toe clearance during the swing phase. Below 2 cm the foot "
+           "scrapes the floor."));
+
+    walkRow("##gait_arm", TR("Arm swing"));
+    ImGui::DragFloat("##gait_arm", &m_gait.armSwingDeg, 0.5f, 0.0f, 60.0f,
+                     TR("%.1f deg"));
+    logRect("CHAR-GAIT-ARM", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    tip(TR("Arms swing opposite to the same-side leg and lag 2 frames behind "
+           "the shoulders — that lag is what stops it looking robotic."));
+
+    ImGui::Checkbox(TR("Blocking (key poses only)"), &m_gait.blocking);
+    logRect("CHAR-GAIT-BLOCKING", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    tip(TR("Only keys the 1/7/13/19/25 poses. Fast to tweak, but the "
+           "in-betweens slide — the foot-drift numbers below go up 30x."));
+
+    if (ImGui::Button(TR("Generate walk cycle"),
+                      ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
+        generateWalk();
+    }
+    logRect("CHAR-GAIT-BTN", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    tip(TR("Replaces the keys of this edit clip with a baked walk cycle. "
+           "Press Save to write it to the .anim.json."));
+
+    if (m_gaitRan) {
+        // 读数一律带单位。同一个 0.03 是「半振幅」还是「峰峰」差一倍 ——
+        // 面板上不写清楚，读者就会按错的那一半去调参数。
+        ImGui::TextDisabled(TR("Speed"));
+        ImGui::SameLine(kWalkLabelW);
+        ImGui::Text("%.3f m/s", static_cast<double>(m_gaitReport.nominalSpeed));
+        // 这三个是这一整块存在的理由：表 §6 的硬规则在数值上就是"约等于 0"。
+        ImGui::TextDisabled(TR("Foot drift (stance)"));
+        ImGui::TextWrapped(TR("slide %.2f / vertical %.2f / line %.2f mm"),
+                           static_cast<double>(m_gaitReport.stanceSlideMm),
+                           static_cast<double>(m_gaitReport.stanceVerticalMm),
+                           static_cast<double>(m_gaitReport.stanceLineErrMm));
+        ImGui::TextWrapped(TR("loop %.2f / mirror %.2f mm"),
+                           static_cast<double>(m_gaitReport.loopErrMm),
+                           static_cast<double>(m_gaitReport.mirrorErrMm));
+        ImGui::TextWrapped(TR("reach %.3f / arm %.3f m"),
+                           static_cast<double>(m_gaitReport.reachMargin),
+                           static_cast<double>(m_gaitReport.armCounterM));
+        if (m_gaitReport.strideLimited) {
+            ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.35f, 1.0f),
+                               TR("Step clamped to %.3f m by leg length"),
+                               static_cast<double>(m_gaitReport.effectiveStep));
+        }
+        if (!m_gaitReport.rig.missing.empty()) {
+            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1.0f), "%s",
+                               TR("Bones not found (those parts stay still)"));
+            for (const auto& m : m_gaitReport.rig.missing)
+                ImGui::BulletText("%s", m.c_str());
+        }
+    }
+    if (!m_gaitRan && !m_gaitReport.error.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.40f, 1.0f), "%s",
+                           m_gaitReport.error.c_str());
+    }
+
+    // ---- 步幅匹配（A4）----
+    //
+    // 这一段的三个数回答同一个问题："这段动画能表达多快的移动速度而不滑步"。
+    // 生成器给出 `nominalSpeed` 之后，剩下的接线在这里：开关（Play 里用不用）、
+    // 夹范围（变速最多到几倍）、以及**模型里那段 clip 的实测值**（不是
+    // 刚生成的编辑片段 —— Play 播的是模型里那段）。
+    ImGui::Spacing();
+    ImGui::TextDisabled(TR("STRIDE MATCH"));
+    ImGui::Separator();
+
+    bool strideOn = m_ctx.strideMatch();
+    if (ImGui::Checkbox(TR("Match stride in Play"), &strideOn)) {
+        m_ctx.setStrideMatch(strideOn);
+        VK_LOG_INFO("CHAR-STRIDE-SET match=%d min=%.2f max=%.2f",
+                    strideOn ? 1 : 0, static_cast<double>(m_ctx.strideMinRate()),
+                    static_cast<double>(m_ctx.strideMaxRate()));
+    }
+    logRect("CHAR-STRIDE-MATCH", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    tip(TR("Playback rate = move speed ÷ the clip's own ground speed, so the "
+           "feet stay planted. Off = 1x playback, which is the sliding "
+           "version — that is what makes it a control group."));
+
+    walkRow("##stride_range", TR("Rate range"));
+    float rateLo = m_ctx.strideMinRate();
+    float rateHi = m_ctx.strideMaxRate();
+    const float halfRateW =
+        (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) *
+        0.5f;
+    ImGui::SetNextItemWidth(halfRateW);
+    ImGui::DragFloat("##stride_lo", &rateLo, 0.01f, 0.10f, 3.00f);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::DragFloat("##stride_hi", &rateHi, 0.01f, 0.10f, 5.00f);
+    if (rateLo > rateHi) std::swap(rateLo, rateHi);   // 拖反了也认（别让速率倒着播）
+    if (rateLo != m_ctx.strideMinRate() || rateHi != m_ctx.strideMaxRate())
+        m_ctx.setStrideRateRange(rateLo, rateHi);
+    logRect("CHAR-STRIDE-RANGE", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    tip(TR("Clamping means the clip cannot express that speed: 0.6 is slow "
+           "motion, 1.7 is fast forward. Outside it you get residual sliding, "
+           "which Play reports as STRIDE-CLAMPED."));
+
+    // A4b 相位速率曲线：常量倍率收掉的是**平均**滑步；承重期脚速在 clip
+    // 内本身有起伏，这一层按相位把它压平（接触锁定）。
+    // ⚠ 它改的是**播放头轨迹**，不是平均速率 —— 所以面板上单独一行，
+    //   不该和上面那个开关合并成一个（合并之后就没法 A/B "是平均没对上
+    //   还是分配没对上"）。
+    bool curveOn = m_ctx.strideCurve();
+    if (ImGui::Checkbox(TR("Phase rate curve (foot lock)"), &curveOn)) {
+        m_ctx.setStrideCurve(curveOn);
+        VK_LOG_INFO("CHAR-STRIDE-CURVE-SET curve=%d", curveOn ? 1 : 0);
+    }
+    logRect("CHAR-STRIDE-CURVE", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    tip(TR("Keeps the rate constant where the foot is planted: the rest of the "
+           "cycle runs at 1x. Off = one constant rate for the whole cycle."));
+
+    if (ImGui::Button(TR("Measure clip stride"),
+                      ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
+        measureStride("Walk");
+    }
+    logRect("CHAR-STRIDE-BTN", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    tip(TR("Measures the 'Walk' clip of the model (the one Play uses), not "
+           "the edit clip above — those are different objects until you save."));
+
+    if (!m_strideClip.empty()) {
+        ImGui::TextDisabled(TR("Clip"));
+        ImGui::SameLine(kWalkLabelW);
+        if (m_strideInfo.ok) {
+            ImGui::Text(TR("%s · %.3f m/s"), m_strideClip.c_str(),
+                        static_cast<double>(m_strideInfo.nominalSpeed));
+            // 这段动画**能覆盖的移动速度区间** —— 夹范围乘出来的。
+            // 玩家的速度落在外面，剩下的就是滑步（数值上是多少，日志里喊）。
+            ImGui::TextWrapped(TR("expressible %.2f - %.2f m/s"),
+                               static_cast<double>(m_strideInfo.nominalSpeed *
+                                                   m_ctx.strideMinRate()),
+                               static_cast<double>(m_strideInfo.nominalSpeed *
+                                                   m_ctx.strideMaxRate()));
+        } else {
+            ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.40f, 1.0f), "%s",
+                               m_strideInfo.error.c_str());
+        }
     }
 
     // ---- 关键帧列表 ----
@@ -2519,6 +2843,7 @@ void CharacterWindow::drawPosePanel() {
         ImGui::SameLine();
         ImGui::TextDisabled("%d", static_cast<int>(p.bones.size()));
     }
+
 }
 
 void CharacterWindow::drawPoseDetails() {
@@ -2869,6 +3194,33 @@ void CharacterWindow::runPoseScript() {
                             p->name.c_str(), n);
                 ok = true;
             }
+        } else if (cmd == "gait") {
+            // `gait[:step[:frames[:blocking]]]` —— 生成器的**无头入口**。
+            // 走的是和面板上那个按钮同一个函数，所以"UI 真的接上了线"这件事
+            // 可以被机器验证（否则脚本能过、按钮却没接线，是两回事）。
+            if (a.size() >= 2)
+                m_gait.stepLength = std::strtof(a[1].c_str(), nullptr);
+            if (a.size() >= 3)
+                m_gait.cycleFrames =
+                    static_cast<int>(std::strtof(a[2].c_str(), nullptr));
+            if (a.size() >= 4) m_gait.blocking = (a[3] != "0");
+            ok = generateWalk();
+        } else if (cmd == "stride") {
+            // `stride[:clipName]` —— 步幅匹配的**无头入口**（A4）。
+            // 量的是**模型里**那段 clip（Play 会播的就是它），所以脚本能验
+            // "生成器说的步速"和"运行时量到的步速"是同一条路径上的数。
+            // 不给名字时量 "Walk"（LocomotionConfig 的默认走路段名）。
+            const std::string clipName = (a.size() >= 2) ? a[1] : "Walk";
+            ok = measureStride(clipName);
+        } else if (cmd == "stridecurve") {
+            // `stridecurve[:0|1]` —— A4b 相位速率曲线的开关（缺省 = 打开）。
+            // 与面板上那个复选框是**同一个** setter：脚本能开，界面也能开，
+            // 两条路各写一次状态的话，"脚本开了但面板显示关"会变成
+            // 一次盲查（而它只影响播放头轨迹，肉眼完全看不出来）。
+            const bool on = (a.size() < 2) ? true : (a[1] != "0");
+            m_ctx.setStrideCurve(on);
+            VK_LOG_INFO("CHAR-STRIDE-CURVE-SET curve=%d", on ? 1 : 0);
+            ok = true;
         } else if (cmd == "save" && a.size() >= 2) {
             // 路径里可能带盘符冒号（C:\...），所以从第 2 段起全部拼回去。
             std::string p = a[1];

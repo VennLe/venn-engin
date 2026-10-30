@@ -143,6 +143,32 @@ struct RuntimeConfig {
         // 不补偿的症状是**横着平移**（人朝 -Y、往 +X 走），而不是"稍微歪"。
         // 换成已经烤成 +X 正面的资产时，把它写 0。
         float modelYaw = 90.0f;
+
+        // ---- A4 步幅匹配（2026-10-30）----
+        // 按"移动速度 ÷ 这段 clip 的自然步速"缩放播放速率，让脚步与位移
+        // 对上（不滑步）。自然步速默认**从 clip 里量**，所以换 Walk 资产
+        // 不用改配置；下面两个 `*StrideSpeed` 是"我知道这段是多少"的覆盖。
+        //
+        // ⚠ 关掉 = 退回 1× 播放（P4 的行为）。留着这个位是因为它就是
+        //   "滑 / 不滑"的对照组。
+        bool strideMatch = true;
+        // 速率夹范围：0.6~1.7 大致是"还看得出是走路"的区间。
+        // 夹住说明这段动画表达不了那么快的速度（日志会喊 STRIDE-CLAMPED）。
+        float strideMinRate = 0.6f;
+        float strideMaxRate = 1.7f;
+        // 覆盖量出来的自然步速（m/s）。0 = 自动量。
+        float walkStrideSpeed = 0.0f;
+        float runStrideSpeed = 0.0f;
+
+        // ---- A4b 相位速率曲线（2026-10-30）----
+        // 一圈之内按相位分配播放速度（接触锁定）。与上面的 `strideMatch`
+        // 是**两层**：那个决定平均速率，这个决定一圈内怎么分配。
+        //
+        // ⚠ 默认**开**，必须与编辑器的 `EditorContext::m_strideCurve`
+        //   **一致** —— 否则会出现"编辑器里脚钉得住、出包后滑"，
+        //   而那是最难查的一类（两边的日志都正常）。
+        //   关掉它的唯一理由是 A/B 对照（播放头轨迹会变）。
+        bool strideCurve = true;
     };
     PlayerVisual player;
 

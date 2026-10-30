@@ -975,6 +975,120 @@ struct CameraComponent {
     float shakeFrequency = 24.0f;  // Hz
     // 运行态：外部通过 CameraSystem::addShake() 累加，随时间衰减
     float trauma = 0.0f;
+
+    // ================================================================
+    // 运镜体系（2026-10-30）
+    // ================================================================
+    //
+    // 分两组，**语义完全不同**，别混着调：
+    //   · 镜头（lens）：这台相机"是什么"—— 焦距、画幅、离轴、裁剪、景深。
+    //     不动位置也不动朝向，换一台相机才换镜头。
+    //   · rig：这台相机"怎么被开着"—— 注视目标、阻尼、手持。
+    //     它是**每帧求值**的，不是关键帧。
+    //
+    // ⚠⚠ 所有新字段的默认值都必须让 `CameraSystem::apply` 走回老分支，
+    //   且 `cameraComponentToJson` 在默认值下**一个键都不多写** ——
+    //   否则场景文件多几行、`sceneHash` 跟着变，G16 的存档兼容断言全红。
+
+    // ---- 镜头（焦距优先于 fov）----
+    // `focal > 0` 时视场角由 `focalToFovY(focal, sensorHeight)` 算出来，
+    // **覆盖** fov（含关键帧给的 fov）。0 = 不用焦距，照旧读 fov。
+    // 为什么要这个开关而不是"统一用焦距"：时间轴上的变焦镜头（Dolly Zoom）
+    // 本来就是给 fov 打关键帧的，装一个定焦镜头还要反算焦距纯属折腾。
+    float focal = 0.0f;           // mm
+    float sensorHeight = 24.0f;   // mm（全画幅 36×24；S35 ≈ 24.9×18.7）
+    // 离轴偏移（传感器比例，0.1 = 成像中心挪 10%）。建筑摄影用。
+    float shiftX = 0.0f;
+    float shiftY = 0.0f;
+    // 相机自身倾角（**度**）。与 `CameraPose::roll`（弧度）是同一个量，
+    // 这里存度是因为它要进面板与 JSON —— 与 fov 同一个惯例。
+    float rollDeg = 0.0f;
+
+    // 近 / 远裁剪面。**0 = 用全局默认**（引擎默认 0.1/200，编辑器视口另一套）。
+    // ⚠ 这个字段只在 >0 时生效：直接写 0 会把相机废掉（near=0 的投影矩阵
+    //   是奇异的），而"0 表示不设"比"0 表示无穷近"更安全。
+    float clipNear = 0.0f;
+    float clipFar = 0.0f;
+
+    // ---- 快门角（运动模糊，度）----
+    // 0 = 关（不动全局的 `CameraEffectSettings::motionBlur`）。
+    // 180° = 半个帧的曝光 = 电影标准 "180 degree rule"，映射到强度 1.0。
+    // ⚠ 单位是**度**，不是 Blender 那种"帧数"：两者差一个 fps 因子，而
+    //   本项目里 fps 是可变的（编辑器能跑 144），用帧数存会让同一个镜头
+    //   在玩家机器上时快时慢。
+    float shutterAngle = 0.0f;
+
+    // ---- rig：跟随路径（Follow Path）----
+    // 存路径**实体**的 guid（那台实体挂 `CameraPathComponent`）。0 = 不走路径。
+    // ⚠ 路径与关键帧同时存在时，**路径赢**（位置被覆盖）—— 这是 Blender
+    //   Follow Path 约束叠加在关键帧上的同一种语义，也让"先用关键帧摆好、
+    //   再挂路径"这种常见流程有一个确定的答案。要两段混着用，就分两台相机。
+    std::uint64_t pathGuid = 0;
+
+    // ---- rig：注视目标（Track To）----
+    // 存 **guid** 而不是 `ecs::Entity`：实体下标在 World 池子里是
+    // swap-and-pop 的（G16 那条），存下标会在别人销毁之后指向另一台机器。
+    // 0 = 不跟（相机朝向完全由关键帧 / PlayerController 决定）。
+    std::uint64_t lookTargetGuid = 0;
+    // 阻尼（秒）：0 = 硬跟（镜头瞬间对准），0.3 = 跟人视线时那种"稍微迟一点"。
+    // ⚠ 实现是**指数逼近**（每帧向目标插 `1−exp(−dt/τ)`），不是线性插值 ——
+    //   线性插值的结果会随帧率变（30fps 和 120fps 跟出来的轨迹不同）。
+    float lookDamping = 0.35f;
+
+    // ---- rig：手持（常驻微抖，与震动是两回事）----
+    // `handheldDeg = 0` → 关，且**逐位不影响相机**。
+    float handheldDeg = 0.0f;      // 振幅（度）
+    float handheldHz = 1.6f;       // 主频（Hz）
+    float handheldSeed = 0.0f;     // 相位种子：多机位不该同步抖
+    float handheldPosM = 0.0f;     // 位置抖动（米），默认 0 = 只抖朝向
+
+    // ---- 景深（喂 render::CameraEffectSettings，由宿主读出后应用）----
+    // ⚠ 本组件**不**持有渲染设置：`CameraSystem` 不认识 render 层（那是
+    //   一条单向依赖）。宿主（runtime / editor）每帧读这几个字段再写进
+    //   `CameraEffectSettings`，这样"景深"既跟着相机走，又不让 ecs 反过来
+    //   依赖渲染。
+    bool dofEnabled = false;
+    float fStop = 2.8f;
+    float focusDistance = 6.0f;    // 米（没有 focus 目标时用）
+    std::uint64_t focusGuid = 0;   // 自动对焦目标；0 = 用 focusDistance
+};
+
+// ---------------- 运镜路径（Follow Path，2026-10-30）----------------
+//
+// 一条**独立的实体**上挂这个组件，相机用 `CameraComponent::pathGuid` 指过来。
+// 为什么不把点位直接塞进 CameraComponent：
+//   · 一条路径常被多台相机共用（正打 / 反打 / 俯拍同一条轨迹）；
+//   · 路径要能在场景树里点选、拖拽、单独打关键帧 —— 塞进相机组件之后
+//     "选中路径"这件事就不存在了；
+//   · 相机组件的体积直接决定 `scene.save` 的行数，而 99% 的相机不走路径。
+//
+// ⚠ 点位是**世界坐标**（不乘路径实体自己的 Transform）。理由：路径是
+//   "空间里的一个形状"，挂在一个会动的父节点下会得到"路径跟着物体跑、
+//   摄影机追着物体"这种看着对但完全不是要的东西。要那样做请给路径实体
+//   自己打关键帧。
+struct CameraPathComponent {
+    std::vector<glm::vec3> points;
+
+    // 闭合：最后一段回到第一个点（环绕镜头 / 巡游）。开放路径到端点就停住
+    // （不是弹回起点 —— 弹回会让"落幅"那一下变成跳切）。
+    bool closed = false;
+
+    // 弧长比例 0..1。`speed == 0` 时由它**直接**决定位置（面板拖滑块 = 手
+    // 动推镜头，作者靠这个找构图）。
+    float progress = 0.0f;
+
+    // 每秒前进的弧长比例（1 = 1 秒走完全程，0.25 = 4 秒）。
+    // ⚠ 用它的时候 `progress` 变成**相位起点**，运行时间由 CameraSystem 的
+    //   时钟累计 —— 于是"同一时刻求值必然同一结果"，时间轴拖回去也对得上。
+    float speed = 0.0f;
+
+    // 朝向跟切线（Blender 的 Follow Curve）。关掉 = 只借位置，朝向仍归
+    // 关键帧 / Track To 管（"沿路径横移、始终看主体"就靠这一条）。
+    bool lookAlong = true;
+
+    // 朝向额外偏转（度）。沿切线看时镜头常常要"稍微往里拧一点"才对准主体；
+    // 正 = 向右转（与 `CameraPose::yaw` 同一符号）。
+    float yawOffsetDeg = 0.0f;
 };
 
 struct VisibilityComponent {

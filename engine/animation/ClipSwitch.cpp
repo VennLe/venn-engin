@@ -53,4 +53,16 @@ void setClipLoop(ecs::SkinnedMeshComponent& sk, ecs::AnimatorComponent* an,
     if (an) an->loop = loop;
 }
 
+void setClipSpeed(ecs::SkinnedMeshComponent& sk, ecs::AnimatorComponent* an,
+                  float speed) {
+    // 两份权威字段都要写（理由与 playing / loop 相同，见 Components.h 的
+    // "权威关系"）：只写一份则"有 AnimatorComponent 的实体按另一份播"，
+    // 症状是步幅匹配对某些角色生效、对另一些不生效。
+    //
+    // ⚠ 不夹到正数区间以外：0.01 倍速（几乎定格）与 3 倍速都是合法输入，
+    //   越界该由调用方用 strideRateFor 的 min/max 决定。
+    sk.speed = speed;
+    if (an) an->speed = speed;
+}
+
 } // namespace animation
