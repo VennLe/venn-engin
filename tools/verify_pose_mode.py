@@ -40,6 +40,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from prereq import skip_if_external_missing              # noqa: E402
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from verify_add_menu import LogTap, kill_stale_editors          # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -160,6 +162,9 @@ def main():
     ap.add_argument("--exe", default=EXE)
     args = ap.parse_args()
 
+    # 前置：模型贴图是外部绝对路径（见 tools/prereq.py）。
+    skip_if_external_missing(MODEL)
+
     os.makedirs(OUT_DIR, exist_ok=True)
     fails = []
 
@@ -178,7 +183,7 @@ def main():
     kill_stale_editors()
     clip_abs = os.path.join(BIN, CLIP_FILE)
     if os.path.exists(clip_abs):
-        os.remove(clip_abs)
+        safe_remove(clip_abs)
 
     # ============================================================ 进程 1
     # 打两帧 + 存一个姿态库 + 存盘。一并把骨名列表、UI 锚点也拿到。
@@ -340,7 +345,7 @@ def main():
           r4 is not None and abs(r4 - 60.0) < 0.5,
           "?" if r4 is None else "%.3f°" % r4)
     try:
-        os.remove(bad)
+        safe_remove(bad)
     except OSError:
         pass
 

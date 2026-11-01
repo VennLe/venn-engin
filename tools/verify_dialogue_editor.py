@@ -38,6 +38,7 @@ return**。症状是"全 False 但落盘是好的"，且等待会白等满超时
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -99,6 +100,27 @@ ASSET_RE = re.compile(
     r"INS-DLG-ASSET path=(\S+) ok=(\d+) lines=(\d+) choices=(\d+) start=(\S*)")
 
 
+def scene_has_dialogue():
+    """夹具前置：场景里**必须**真有一段 `dialogue` 块。
+
+    ⚠⚠ 2026-10-30 真实发生过一次：`cutscene_demo.json` 被某次场景存盘弄丢了
+      Director 上的 `dialogue` 块，于是本脚本 4 条一起红（锚点缺失 + ASSET 空），
+      而真正的信息（"夹具没了"）一条都没打出来 —— 第一反应会去查
+      `drawTabDialogue`，白查半天。宁可先在门口说清楚。
+    """
+    try:
+        with open(os.path.join(BIN, SCENE), encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception as e:                      # noqa: BLE001
+        return False, "读不到 %s（%s）" % (SCENE, e)
+    for e in doc.get("entities", []):
+        if e.get("name") == SELECT:
+            if "dialogue" in e:
+                return True, ""
+            return False, "%s 实体上没有 dialogue 块" % SELECT
+    return False, "场景里找不到实体 %s" % SELECT
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", default=EDITOR_EXE)
@@ -108,6 +130,10 @@ def main():
     print("== 对话组件的编辑器入口 ==")
     if not os.path.isfile(args.exe):
         check("0 找不到 Editor.exe", False, args.exe)
+        return 1
+    ok, why = scene_has_dialogue()
+    if not check("0 夹具前置：场景里 %s 上挂着 dialogue" % SELECT, ok, why):
+        print("    → 先修 assets/scenes/cutscene_demo.json，否则下面 5 条全是假红")
         return 1
 
     text = run_editor()

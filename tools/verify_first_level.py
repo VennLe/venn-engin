@@ -135,6 +135,28 @@ def group_b():
     a.pop("generator", None)
     b.pop("generator", None)
 
+    # ---- 先把 "v1 → v2 升级" 这件事**显式记账**，再逐字段比 ----
+    #
+    # 源关卡是生成出来的 v1（实体上没有 `guid`）；dump 走的是 **v2 写端**，
+    # 会给每个实体补一个 guid、把 version 提到 2。以前没管这一层，于是
+    # B1 报 **374 处不同、全是 `/entities[i]/guid`** —— 看上去像"往返丢
+    # 数据"，实际是 v1→v2 的正常升级（`verify_guid` 的 B/C 组就是专门测
+    # 这件事的）。这里把升级本身测掉，再剔掉 guid 做逐字段比较。
+    n_ents = len(b.get("entities") or [])
+    miss_guid = [i for i, e in enumerate(b.get("entities") or [])
+                 if not isinstance(e.get("guid"), str)]
+    check("B0 dump 给每个实体补了 guid（v2 写端真的在写）",
+          n_ents > 0 and not miss_guid,
+          "entities=%d 缺 guid=%d" % (n_ents, len(miss_guid)))
+    check("B0b dump 的 version 升到 2", b.get("version") == 2,
+          "version=%r（源 %r）" % (b.get("version"), a.get("version")))
+    a.pop("version", None)
+    b.pop("version", None)
+    for d in (a, b):
+        for e in d.get("entities") or []:
+            if isinstance(e, dict):
+                e.pop("guid", None)
+
     bad = []
 
     def walk(x, y, path=""):

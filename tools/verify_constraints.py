@@ -56,6 +56,8 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402
+from prereq import skip_if_external_missing              # noqa: E402
 
 from verify_add_menu import LogTap, kill_stale_editors          # noqa: E402
 
@@ -320,7 +322,7 @@ def case_d():
 def case_e():
     path = os.path.join(BIN, "_verif_con.constraints.json")
     try:
-        os.remove(path)
+        safe_remove(path)
     except OSError:
         pass
     script = ("add:LimitRotation:%d;limit:0:0:2:20;"
@@ -427,6 +429,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="保留每次的完整日志")
     args = ap.parse_args()
+    # 前置：模型贴图是外部绝对路径，资产根缺失时每条"零 [ERROR]"都会红
+    # （见 tools/prereq.py 的说明）—— 那是环境问题，不是约束系统的问题。
+    skip_if_external_missing(MODEL)
     os.makedirs(OUT_DIR, exist_ok=True)
     kill_stale_editors()
 

@@ -213,7 +213,7 @@ RUN_LAUNCHER = $(CMAKE) -E chdir $(BIN_DIR) $(CMAKE) -E env $(RUN_ENV) Launcher.
 
 .DEFAULT_GOAL := all
 
-.PHONY: all build configure editor game shaders ship run run-editor run-game \
+.PHONY: all build configure editor game shaders ship perf-build run run-editor run-game \
         run-launcher toolchain \
         smoke clean distclean rebuild package info help install-make-alias
 
@@ -311,6 +311,33 @@ else
 	$(CMAKE) --build $(SHIP_BUILD_DIR) $(PARALLEL)
 endif
 	@echo [ship] out=$(SHIP_BUILD_DIR)/bin/Game.exe
+
+# ------------------------------------------------------------------ 性能基线（P1）
+# 为什么单独一个目录：`build/` 是**回归用的 Debug**（带 /RTC1 断言/慢 10 倍），
+# 一切 verify_*.py 都指它。把 build/ 换成 RelWithDebInfo 会同时改掉两件事 ——
+# "断言在不在"和"帧率是多少" —— 于是回归与基线互相污染。基线落 build-rel/
+# （已被 .gitignore 的 `build-*/` 覆盖）。
+#
+#   make perf-build                       → build-rel/bin/{Editor,Game}.exe
+#   make perf-build PERF_BUILD_TYPE=Release
+PERF_BUILD_DIR  ?= build-rel
+PERF_BUILD_TYPE ?= RelWithDebInfo
+
+perf-build: export VENN_BUILD_DIR  := $(PERF_BUILD_DIR)
+perf-build: export VENN_BUILD_TYPE := $(PERF_BUILD_TYPE)
+perf-build:
+	@echo [perf] dir=$(PERF_BUILD_DIR) type=$(PERF_BUILD_TYPE)
+ifeq ($(TOOLCHAIN),msvc)
+	$(MSVC_BUILD) configure
+	$(MSVC_BUILD) build
+else
+	$(CMAKE) -S . -B $(PERF_BUILD_DIR) -G $(GENERATOR) \
+		-DCMAKE_BUILD_TYPE=$(PERF_BUILD_TYPE) \
+		"-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
+		$(CMAKE_ARGS)
+	$(CMAKE) --build $(PERF_BUILD_DIR) $(PARALLEL)
+endif
+	@echo [perf] out=$(PERF_BUILD_DIR)/bin
 
 # ============================================================================
 #  运行
@@ -467,6 +494,8 @@ help:
 	@echo   make distclean        remove build/ and dist/ entirely
 	@echo   ---
 	@echo   make package          build + zip into dist/
+	@echo   make ship             shipping build into build-ship/ (no editor/dev hooks)
+	@echo   make perf-build       RelWithDebInfo build into build-rel/ (perf baseline)
 	@echo   make info             print current build settings
 	@echo   make toolchain        report the detected toolchain
 	@echo   make install-make-alias  install a plain "make" command

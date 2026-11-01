@@ -402,7 +402,7 @@ def main():
         # E 反例：场景缺失
         # ============================================================
         proj2 = make_project(os.path.join(base, "Broken", "Broken"), "Broken")
-        os.remove(os.path.join(proj2, "assets", "scenes", "main.json"))
+        safe_remove(os.path.join(proj2, "assets", "scenes", "main.json"))
         rc, out = run([GAME, "--package", proj2], timeout=120)
         check("E1 场景缺失 → 退出码 2 且 PACKAGE-FAIL", rc == 2 and "PACKAGE-FAIL" in out,
               "rc=%d" % rc)

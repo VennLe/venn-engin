@@ -42,6 +42,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -431,7 +432,7 @@ def main():
         if args.keep:
             print("临时目录: %s" % tmp)
         else:
-            shutil.rmtree(tmp, ignore_errors=True)
+            safe_rmtree(tmp)
         try:
             subprocess.run(["taskkill", "/F", "/IM", "Editor.exe"],
                            capture_output=True, timeout=10)

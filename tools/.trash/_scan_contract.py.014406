@@ -1,0 +1,53 @@
+# -*- coding: utf-8 -*-
+"""一次性核查：DEFAULT 里每个脚本能不能打出闸门认得的收尾行。
+
+⚠⚠ 为什么用字面量而不是正则：本机 `bash heredoc` 会把 Python 正则里的
+   反斜杠吃掉（`\\s` -> `/s`、`\\n` -> `/n`），于是 `BAD_RE` 变成
+   `结果:/s*FAIL` —— 一条都匹配不上，扫描结果是**假的**（第一次跑就报了
+   45 个"无收尾"，实际没那么多）。所以这里只做纯字面量包含判断。
+
+闸门 `run_regression.OK_RE` 认这五种收尾：
+    RESULT: PASS / 全部断言 PASS / 全部 PASS（行首）/ 结果: PASS /
+    结果: N 通过 / 0 失败
+所以脚本源码里**至少**要出现 `结果` 或 `RESULT`（两种前缀），或者走
+`kit.finish()`（它内部打 `结果: PASS`）。
+"""
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+RR = ROOT / "tools" / "run_regression.py"
+
+
+def default_names():
+    src = RR.read_text(encoding="utf-8")
+    m = re.search(r"^DEFAULT\s*=\s*\[(.*?)^\]", src, re.S | re.M)
+    return re.findall(r'"(verify_[A-Za-z0-9_]+)"', m.group(1))
+
+
+MARKERS = ("结果", "RESULT", "全部断言 PASS", "全部 PASS", "kit.finish(")
+
+
+def main():
+    names = default_names()
+    print("DEFAULT 条数 = %d" % len(names))
+    bad = []
+    for n in names:
+        p = ROOT / "tools" / (n + ".py")
+        if not p.exists():
+            bad.append((n, "<文件不存在>"))
+            continue
+        t = p.read_text(encoding="utf-8", errors="replace")
+        if any(k in t for k in MARKERS):
+            continue
+        tail = [x.strip() for x in t.strip().splitlines()[-4:]]
+        bad.append((n, " / ".join(tail)[:140]))
+    print("缺收尾行 = %d" % len(bad))
+    for n, why in bad:
+        print("  - %-28s %s" % (n, why))
+    return 0 if not bad else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

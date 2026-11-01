@@ -585,6 +585,73 @@ void testBuses(const Loaded& tone44) {
     }
 }
 
+// 语音总线（D1，2026-10-31）：按 bus 统计活跃声部。
+//
+// 为什么需要这一组：`voicePlaying()` 的全部依据就是
+// `activeVoicesOnBus(Voice) > 0`。如果这个计数只按"全局"给（以前只有
+// `stats().voices`），那么"播放一首循环音乐"就会让语音那条判断**永远为真**
+// —— 于是"语音播完再进下一句"永远不推进，而且没有任何报错。
+void testVoiceBusCount(const Loaded& tone44) {
+    std::printf("-- 混音：按 bus 统计活跃声部（D1）\n");
+
+    Mixer m;
+    m.init(48000, 2);
+    m.setClip(1, tone44.view());
+
+    // 一首循环音乐 + 一句语音：两条同时在跑，分属不同总线
+    PlayDesc dm;
+    dm.clipId = 1;
+    dm.bus = static_cast<std::uint32_t>(BusId::Music);
+    dm.loop = true;
+    m.play(dm);
+
+    PlayDesc dv;
+    dv.clipId = 1;
+    dv.bus = static_cast<std::uint32_t>(BusId::Voice);
+    dv.volume = 1.0f;
+    m.play(dv);
+
+    std::vector<float> out;
+    renderSeconds(m, 0.1f, out);
+    check("voicebus_voice_one",
+          m.activeVoicesOnBus(static_cast<int>(BusId::Voice)) == 1,
+          fmt("voice=%.0f",
+              static_cast<double>(m.activeVoicesOnBus(
+                  static_cast<int>(BusId::Voice)))));
+    check("voicebus_music_one",
+          m.activeVoicesOnBus(static_cast<int>(BusId::Music)) == 1,
+          fmt("music=%.0f",
+              static_cast<double>(m.activeVoicesOnBus(
+                  static_cast<int>(BusId::Music)))));
+    // 关键对照：没有声部的总线必须是 0（不是"跟着全局一起涨"）
+    check("voicebus_sfx_zero",
+          m.activeVoicesOnBus(static_cast<int>(BusId::SFX)) == 0,
+          fmt("sfx=%.0f",
+              static_cast<double>(m.activeVoicesOnBus(
+                  static_cast<int>(BusId::SFX)))));
+    check("voicebus_global_counts_both", m.stats().voices == 2,
+          fmt("voices=%.0f", static_cast<double>(m.stats().voices)));
+    check("voicebus_matches_stats",
+          m.stats().busVoices[static_cast<int>(BusId::Voice)] == 1,
+          fmt("stats.busVoices[Voice]=%.0f",
+              static_cast<double>(
+                  m.stats().busVoices[static_cast<int>(BusId::Voice)])));
+
+    // 语音（1 s，不循环）播完之后 → Voice 归 0，而 Music 仍是 1。
+    // 这条是 `voicePlaying()` 从 true 变 false 的唯一机制，必须单独钉住。
+    renderSeconds(m, 1.2f, out);
+    check("voicebus_voice_finished",
+          m.activeVoicesOnBus(static_cast<int>(BusId::Voice)) == 0,
+          fmt("voice=%.0f",
+              static_cast<double>(m.activeVoicesOnBus(
+                  static_cast<int>(BusId::Voice)))));
+    check("voicebus_music_still_one",
+          m.activeVoicesOnBus(static_cast<int>(BusId::Music)) == 1,
+          fmt("music=%.0f",
+              static_cast<double>(m.activeVoicesOnBus(
+                  static_cast<int>(BusId::Music)))));
+}
+
 // 声部池：64 + 第 65 个 → 抢最旧，且不爆音
 void testVoicePool() {
     std::printf("-- 混音：声部池 64 / 抢最旧 / 削波保护\n");
@@ -1404,6 +1471,7 @@ int runAudioSelfTest() {
         testBuses(tone44);
         testVolumeSmoothing(nullptr, nullptr);
         testDucking(tone44);
+        testVoiceBusCount(tone44);
         testVoicePool();
         testSpatial();
         testStreaming();

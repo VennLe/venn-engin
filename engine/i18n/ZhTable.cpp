@@ -211,6 +211,14 @@ const Entry kZh[] = {
     {"Entities", "实体"},
     {"Selection", "选中项"},
     {"Gizmo state", "手柄状态"},
+    // H2 自动保存（偏好页 Scene 页）
+    {"Autosave interval (s, 0 = off)", "自动保存间隔（秒，0 = 关）"},
+    // ⚠ 末尾那个空格是原文的一部分（后面接相对路径），别"顺手"删掉
+    {"Recoverable autosave found: ", "发现可恢复的自动存档："},
+    // G16-4：`Select by GUID` 弹窗。带 `###guidquery` 的整串是 ImGui 的
+    // **窗口身份**（OpenPopup 与 BeginPopupModal 必须喂同一个串，否则弹窗
+    // 开了却不显示）。译文也保留 `###guidquery` —— 那一截是 ID，不能翻。
+    {"Select by GUID###guidquery", "按 GUID 选择###guidquery"},
     {"Entities / lights", "实体 / 光源"},
     {"Grid", "栅格"},
     {"Reference grid", "参考栅格"},
@@ -726,6 +734,13 @@ const Entry kZh[] = {
     {"Nothing to undo", "没有可撤销的操作"},
     {"Nothing to redo", "没有可重做的操作"},
     {"Resumed", "已恢复"},
+    // ---- 视口"以选中相机预览"（Cinematography）----
+    {"Look through selected camera", "以选中相机预览"},
+    {"Exit camera preview", "退出相机预览"},
+    {"Camera preview off", "相机预览已关闭"},
+    {"Looking through:", "正在查看："},
+    {"Looking through: ", "正在查看："},
+    {"(select a camera first)", "（先选中一台相机）"},
     {"Camera bookmark ", "相机书签 "},
     {"Saved camera bookmark ", "已保存相机书签 "},
     {"Rebuild ", "重建 "},
@@ -2808,14 +2823,16 @@ const Entry kZh[] = {
      "把出生点设为第一人称。\n视口里不会出现角色身体 —— 相机会在运行（Play）时\n于 GameStart 标记处生成。"},
     {"Sets the spawn point to third person.\nNo body is placed in the viewport — the character is\nspawned on the GameStart marker when you Run (Play).",
      "把出生点设为第三人称。\n视口里不会出现角色身体 —— 角色会在运行（Play）时\n于 GameStart 标记处生成。"},
-    {"Ctrl+. snaps the view back to the player at a normal working height.",
-     "Ctrl+. 把视角拉回玩家处的正常工作高度。"},
+    {"Ctrl+. or Home snaps the view back to the player at a normal working "
+     "height.",
+     "Ctrl+. 或 Home 把视角拉回玩家处的正常工作高度。"},
     // `Focus`（看整片地形全貌）之外的第二条取景按钮：平时干活用这条。
     // 中文 Windows 上 Ctrl+. 会被微软拼音的中英标点切换吃掉，所以按钮是
     // 那条快捷键的兜底入口（见 LandscapeEditor::drawStatsSection 的注释）。
+    // 2026-10-31：再补一条单键 `Home` —— 按钮之外、键盘也有兜底。
     {"Focus player", "聚焦玩家"},
-    {"Camera back to the player at working height (Ctrl+.)",
-     "把相机拉回玩家处的正常工作高度（Ctrl+.）"},
+    {"Camera back to the player at working height (Ctrl+. or Home)",
+     "把相机拉回玩家处的正常工作高度（Ctrl+. 或 Home）"},
     // ---- 地形层材质：材质包目录导入（2026-10-24 第六轮）----
     // 用户原话："那里的地形材质一般是指定一个目录里面 …… 这个通过一个
     // 刷新按钮去找到最新的材质信息"。下文里的 `venn-resource` 是**目录名**，
@@ -3335,6 +3352,25 @@ const Entry kZh[] = {
     {"Package failed: Game.exe not found next to the editor", "打包失败：编辑器旁边找不到 Game.exe"},
     {"Packaged %d files · %lld KB  →  %s", "已打包 %d 个文件 · %lld KB  →  %s"},
 
+    // ---- B6 表情预设 + 眨眼/口型（2026-11-01）----
+    {"Expression", "表情"},
+    {"Add expression driver", "添加表情驱动"},
+    {"Preset + automatic blink + lip sync.", "预设 + 自动眨眼 + 口型同步。"},
+    {"Preset asset", "预设资产"},
+    {"Cannot load this preset asset.", "预设资产加载失败。"},
+    {"%d preset(s), all channels found", "%d 个预设，通道全部匹配"},
+    {"%d channel(s) in this preset have no slider on this rig", "此预设中 %d 个通道在本模型上没有对应滑条"},
+    {"Expression intensity", "表情强度"},
+    {"0 = neutral face (manual sliders stay)", "0 = 中性脸（手动滑条不受影响）"},
+    {"Blink", "眨眼"},
+    {"Blink now", "立即眨眼"},
+    {"Blink channel", "眨眼通道"},
+    {"slider name in the rig", "模型里的滑条名"},
+    {"Lip sync", "口型同步"},
+    {"Mouth channel", "张嘴通道"},
+    {"level %.2f", "电平 %.2f"},
+    {"x%.2f", "×%.2f"},
+
     // ---- R6 曲线编辑器（Graph Editor，2026-10-28）----
     {"Curve editor", "曲线编辑器"},
     {"Channel", "通道"},
@@ -3555,6 +3591,8 @@ const Entry kZh[] = {
     {"Shutter", "快门"},
     {"0 = off. 180° is the film standard (half-frame exposure).", "0 = 关。180° 是电影标准（半个帧的曝光）。"},
     {"blur", "模糊"},
+    {"Shutter position", "快门开窗位置"},
+    {"-1 = end of frame (blur trails behind), 0 = centered, +1 = start of frame.", "-1 = 帧末开窗（拖尾在运动后方），0 = 居中，+1 = 帧首开窗。"},
     {"0 = snap. Uses exponential smoothing, so the feel does not depend on frame rate.", "0 = 硬跟。指数逼近，手感与帧率无关。"},
     {"Handheld", "手持"},
     {"Hz", "频率"},
@@ -3611,6 +3649,14 @@ const Entry kZh[] = {
     {"nothing selected — pick a camera in the scene first", "什么都没选中 —— 请先在场景里点中一台相机"},
     {"blend", "混合"},
     {"0 = hard cut. Anything above glides from the previous shot's pose.", "0 = 硬切。大于 0 则从上一段的姿态滑过来。"},
+    // ---- 混合曲线（2026-10-31）----
+    // ⚠ 五个曲线名（linear / smooth / easein / easeout / smoother）**故意
+    //   没有词条**：它们是写进 JSON 的关键字，界面直接显示原文，翻了就对不上
+    //   文件（与 `ease` 那四个词同一条纪律）。
+    {"curve", "曲线"},
+    {"How the blend gets there. Linear = constant speed, easein = slow start, easeout = fast start, smoother = softest at both ends.", "混合怎么走过去。linear = 匀速，easein = 起步慢，easeout = 起步快，smoother = 两头最软。"},
+    {"unknown blend curve '%s'", "不认识的混合曲线 '%s'"},
+    {"hard cut", "硬切"},
     {"label", "标签"},
     {"shot A — close-up", "A 机位 —— 特写"},
     {"Camera:", "机位相机："},
@@ -3626,6 +3672,32 @@ const Entry kZh[] = {
     {"shot at %.2f s has no camera — it falls back to the camera key track", "%.2f 秒处的机位没有绑相机 —— 它会回落到相机关键帧轨"},
     {"shot camera %s is not in this scene", "机位绑的相机 %s 不在这个场景里"},
     {"shot at %.2f s never plays (the interval is [from, to))", "%.2f 秒处的机位永远播不到（区间是 [起点, 终点)）"},
+    // ---- G16-4 尾巴：Hierarchy 的 guid 两项（2026-10-31）----
+    {"Copy GUID", "复制 GUID"},
+    {"Select by GUID...", "按 GUID 选择…"},
+    {"Select by GUID", "按 GUID 选择"},
+    {"16 hex digits (the same text Copy GUID puts on the clipboard)", "16 位十六进制（就是「复制 GUID」放进剪贴板的那串）"},
+    {"need exactly 16 hex digits", "需要恰好 16 位十六进制字符"},
+    {"an all-zero guid means 'no identity', not an entity", "全零 guid 表示「无身份」，不是一个实体"},
+    {"no entity in this scene has that guid", "这个场景里没有实体拥有该 guid"},
+    // ---- G17-3 尾巴：存档槽位面板（2026-10-31）----
+    {"Save slots", "存档槽位"},
+    {"dir:", "目录："},
+    {"empty", "空"},
+    {"unreadable (bad file)", "读不动（文件已损坏）"},
+    {"entities", "个实体"},
+    {"saved: ", "已保存："},
+    {"save failed: ", "保存失败："},
+    {"loaded: ", "已读取："},
+    {"load failed: ", "读取失败："},
+    {"deleted: ", "已删除："},
+    {"nothing to delete: ", "本来就没有："},
+    {"delete failed: ", "删除失败："},
+    {"Delete this save?", "删除这个存档？"},
+    // 2026-10-31：`verify_i18n_coverage` B2 的最后一条缺口（早就在源码里，
+    // 一直没人补）。顺手清掉之后 B2 = 0。
+    {"Ctrl+. or Home snaps the view back to the player at a normal working height.",
+     "Ctrl+. 或 Home 把视角瞬移回玩家身上（正常作业高度）。"},
 };
 
 // 跨 TU 拿不到 sizeof(kZh)（这里是不完整类型），所以长度单独导出。

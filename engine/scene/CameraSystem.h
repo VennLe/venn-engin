@@ -27,6 +27,7 @@
 // ============================================================
 
 #include "ecs/Entity.h"
+#include "scene/BlendCurve.h"   // m_blendCurve（切镜混合的形状，零依赖头）
 #include "scene/CameraPath.h"   // m_path（Follow Path 的缓存，见 CameraPath.h）
 
 #include <glm/glm.hpp>
@@ -124,7 +125,19 @@ public:
     //   之后再也不跟实体/路径/注视目标。切镜要的是"淡入到新机位，然后
     //   新机位继续按它自己的 rig 活着"（手持、Track To、路径都还要动）。
     //   所以这里只**捕获起点**，目标留空由 `update` 每帧现算。
-    void blendCut(float seconds);
+    //
+    // `blendSeconds` 只说"多久"，`curve` 说"这多久里怎么走"（见
+    // `scene/BlendCurve.h`）。默认 `Smooth` = 加曲线参数之前的行为。
+    void blendCut(float seconds, BlendCurve curve = BlendCurve::Smooth);
+    // 当前（或刚刚结束的）那次混合用的曲线。
+    // ⚠ 存在的唯一理由：**日志必须与执行同源**。调用方自己手上的那个
+    //   `curve` 变量只能证明"它知道曲线是什么"，不能证明"它把这个值交出去了"
+    //   —— 2026-10-31 的否定测试实测过：把 `blendCut(b, cv)` 改回
+    //   `blendCut(b)`，运行时日志照样打 `curve=easein`（因为它打的是 `cv`），
+    //   用例全绿而画面永远是 smooth。改从 `beganCurve()` 取值之后，
+    //   "没交出去"立刻表现为 `curve=smooth`。
+    BlendCurve beganCurve() const { return m_blendCurve; }
+    float beganSeconds() const { return m_blendDur; }
 
     // ---- 状态 ----
     ecs::Entity activeEntity() const { return m_active; }
@@ -184,7 +197,10 @@ private:
     float m_blendDur = 0.0f;
     float m_blendT = 0.0f;
     bool m_blendActive = false;
-    bool m_blendSmooth = true;
+    // 混合的**形状**（2026-10-31）。换掉原来的 `bool m_blendSmooth`：
+    // 那个布尔只能表达"线性 / smoothstep"两种，而切镜真正需要的是
+    // "这一段是猛地推过去还是缓缓贴上去" —— 多机位 marker 每条各选一种。
+    BlendCurve m_blendCurve = BlendCurve::Smooth;
 
     // 震动
     float m_trauma = 0.0f;
@@ -196,6 +212,20 @@ private:
 
 // 引擎层唯一一份 —— 编辑器与运行时共用（同一个场景只该有一个调度器）。
 CameraSystem& activeCameraSystem();
+
+// ------------------------------------------------------- 静态机位（编辑器预览）
+//
+// 把一台相机实体**整份**装到某个 `Camera` 上：机位（位置 / yaw / pitch /
+// roll）+ 镜头（fov 或焦距、离轴 shift）+ 裁剪面。返回 false = 这台实体上
+// 没有 `CameraComponent`（调用方应当据此退出预览，而不是继续用旧机位）。
+//
+// **不启动任何 rig**：Track To / Follow Path / 手持 / 震动都要每帧求值，
+// 那是运行时的事；编辑器预览要的是"这台相机的机位和镜头长什么样"。
+//
+// 调用方：`EditorApp::applyPreviewCamera`（Cinematography 面板的
+// "Look through"）。与 `applyPoseToSceneCamera` 用同一组 setter —— 两处
+// 写法不一致的症状是"编辑器里构图偏了一点，出包后正常"。
+bool applyCameraEntityTo(Scene& scene, ecs::Entity e, Camera& cam);
 
 // ------------------------------------------------------------ 自检
 // 无窗口：造两台相机 + 混合 + 震动零值逐位比较。

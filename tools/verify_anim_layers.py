@@ -90,6 +90,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from capture_window import capture_nonempty, find_window, user32      # noqa: E402
 from verify_add_menu import (LogTap, kill_stale_editors,               # noqa: E402
                              wait_rect)
@@ -220,7 +221,7 @@ def bake_template(exe, model=None, tpl=None, cam=None):
     tpl = tpl or TPL
     cam = cam or TPL_CAM
     if os.path.isfile(tpl):
-        os.remove(tpl)
+        safe_remove(tpl)
     os.makedirs(os.path.dirname(tpl), exist_ok=True)
     # ⚠ 清场必须在 find_window 之前：上一轮的 Editor.exe 只要还活着，
     #   find_window 就会摸到**那具尸体**（旧窗口），后面的截图全落在它身上，

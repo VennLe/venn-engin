@@ -6,17 +6,19 @@
 
 ---
 
-## 1 · 七个内建，两组用途
+## 1 · 八个内建，三组用途
 
 `.vks` 在 C6 之前只能"摆弄自己"：改位置、改颜色、放音效、扣血。
-一个能动的 demo，不是游戏。C6 补上两类能力：
+一个能动的 demo，不是游戏。C6 补上三类能力：
 
 | 组 | 内建 | 回答的问题 |
 |---|---|---|
 | **演出**（C6 第一批） | `playSequence` `showDialogue` `playAnim` | "把这段过场/对话/动作播出来" |
 | **世界**（C6 第二批） | `setFlag` `getFlag` `spawn` `loadScene` | "记住/刷出/换掉这一局游戏" |
+| **界面**（C6 第七件） | `openUI` | "让玩家看见哪块面板" |
 
-区别在于**副作用落在哪**：演出改的是"这一刻演什么"，世界改的是"这一局是什么"。
+区别在于**副作用落在哪**：演出改的是"这一刻演什么"，世界改的是"这一局是什么"，
+界面改的是"屏幕上摆什么"。
 
 ---
 
@@ -35,6 +37,25 @@
 | `getFlag(name)` | number | 读。**没设过 = 0，不报错**（"第 1 章没遇见的人，好感度就是 0"） |
 | `spawn(path, [pos])` | entity | 按模型路径刷一个实体，返回**可用句柄**（能立刻 `setPos(e,...)` / `playAnim(e,...)`）。不给 `pos` = 原点 |
 | `loadScene(path)` | bool | **请求**换场景。返回值 = "请求已受理"，真正的切换在**下一帧开头** |
+| `openUI(path)` | bool | 掀一块 `.ui.json` 界面（背包 / 结算 / 提示框）。**空串 = 关掉**当前那块 |
+
+### `openUI` 的四条语义
+
+```text
+openUI("ui/docs/hud_demo.ui.json")   # 切到这份文档
+openUI("")                           # 关掉（剧情演完收面板）
+```
+
+1. **路径相对 `assets/`**（内部走 `resolveAssetPath`），与 `spawn` / `loadScene` 同一条。
+2. **空串是合法用法，不是失败**：返回 `true`，日志打
+   `UIDOC-OPEN path='' (closed) had=1 src=script`。
+   ⚠ `had` 是"关之前那块在不在"——它是唯一能证明"前面那句真的开上了"的量。
+3. **失败时保住当前那块**，返回 `false` 并报错：
+   `UIDOC-OPEN path=... ok=0 err=... (keeping the current one)`。
+   ⚠ 实现**故意**不是"先清空再尝试加载"：那样路径拼错的表现会是
+   "屏幕忽然空了 + 一条 ERROR"，作者会以为界面被关掉了。
+4. **同一帧内 `openUI` 之后再报错？** 那块界面已经换了，不会回滚。
+   想"试一下能不能开"，请先确认路径真的存在（或读返回值）。
 
 ### `loadScene` 为什么是"下一帧"
 
@@ -151,13 +172,16 @@ on update {
 
 | 层 | 用例 | 验什么 |
 |---|---|---|
-| 接线（无窗口） | `Game.exe --selftest script` 的 **C13~C19** | 参数原样到宿主 / 失败必报错 / 类型纪律 / 旗标写读 / spawn 句柄可用 |
-| 端到端（真资产） | `tools/verify_director_api.py` | 演出三件**真的播出来了**（`SEQ-CUE` / `DLG-START` / `RUNTIME-SWITCH-ANIM`） |
+| 接线（无窗口） | `Game.exe --selftest script` 的 **C13~C20** | 参数原样到宿主 / 失败必报错 / 类型纪律 / 旗标写读 / spawn 句柄可用 / `openUI` 空串与宿主缺能力分开报 |
+| 端到端（真资产） | `tools/verify_director_api.py` | 演出三件**真的播出来了**（`SEQ-CUE` / `DLG-START` / `RUNTIME-SWITCH-ANIM`）；`openUI` **真的换/关/保住**了那块文档（`UIDOC-OPEN` / `UIDOC-STATS`） |
 | 端到端（真资产） | `tools/verify_world_api.py` | 旗标进宿主 / spawn 真装配 / 换场景真发生 / **旗标跨场景保留** |
 
 回归登记见 `tools/run_regression.py` 的 `TRIGGERS`：
 改 `ScriptEngine.*` / `SequencerSystem.*` / `runtime/RuntimeApp.cpp` /
 `runtime/GameFlags.h` 时这三条都会被拉起来。
+
+⚠ `engine/script/ScriptRuntime.cpp` **没登记**（它是唯一的 tick 内核，所有脚本
+用例都压在上面）→ 改它会按"未登记 = 全量 + 点名"处理，那是想要的。
 
 ---
 

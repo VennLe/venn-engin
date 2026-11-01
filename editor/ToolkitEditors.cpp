@@ -8,6 +8,7 @@
 #include "PickingSystem.h"
 
 #include "assets/AssetManager.h"
+#include "animation/TransformClip.h"   // C5：关键帧插值只有这一份实现
 #include "i18n/I18n.h"
 #include "scene/Scene.h"
 
@@ -3199,23 +3200,12 @@ void BrushEditor::drawPanel() {
 //
 // ⚠ 与 `AnimatorComponent` 的分工见 Components.h：那个播**骨骼片段**
 //   （导入的 clip / 状态机），这个动**实体自身的 TRS**。
+//
+// ⚠⚠ 关键帧插值**不在这里**：2026-10-31（C5）之后统一走
+//   `anim::sampleTransformClip`（`engine/animation/TransformClip.*`），
+//   因为运行时也要播同一条轨道。两份实现 = 编辑器调好的节奏一到
+//   Game.exe 就变。这里只留 UI 与播放头。
 namespace {
-
-// 关键帧之间用 smoothstep 缓入缓出。线性插值在每个关键帧处速度突变，
-// 看上去"顿一下"；Blender 的 Bezier 默认也是这个意图（这里不做切线，
-// 只做时间重映射 —— 效果足够，而且不会过冲）。
-float easeKey(float u) {
-    u = std::clamp(u, 0.0f, 1.0f);
-    return u * u * (3.0f - 2.0f * u);
-}
-
-void sampleInto(const ecs::TransformKey& a, const ecs::TransformKey& b, float u,
-                ecs::TransformComponent& out) {
-    const float k = easeKey(u);
-    out.position = glm::mix(a.position, b.position, k);
-    out.rotation = glm::mix(a.rotation, b.rotation, k);
-    out.scale = glm::mix(a.scale, b.scale, k);
-}
 
 void keyRowLabel(char* buf, std::size_t n, int i,
                  const ecs::TransformKey& k) {
@@ -3343,29 +3333,20 @@ void AnimationEditor::jumpToKey(int index) {
 
 void AnimationEditor::applyAt(float t) {
     ecs::AnimationClipComponent* c = clip();
-    if (!c || c->keys.empty() || !m_entity.valid()) return;
+    if (!c || !m_entity.valid()) return;
     ecs::World& w = m_ctx.editorScene().world();
     if (!w.alive(m_entity)) return;
     auto* tr = w.get<ecs::TransformComponent>(m_entity);
     if (!tr) return;
 
-    const ecs::TransformKey& first = c->keys.front();
-    const ecs::TransformKey& last = c->keys.back();
-    if (c->keys.size() == 1 || t <= first.t) {
-        sampleInto(first, first, 0.0f, *tr);
-    } else if (t >= last.t) {
-        sampleInto(last, last, 0.0f, *tr);
-    } else {
-        for (std::size_t i = 0; i + 1 < c->keys.size(); ++i) {
-            const ecs::TransformKey& a = c->keys[i];
-            const ecs::TransformKey& b = c->keys[i + 1];
-            if (t >= a.t && t <= b.t) {
-                const float u = (b.t > a.t) ? ((t - a.t) / (b.t - a.t)) : 0.0f;
-                sampleInto(a, b, u, *tr);
-                break;
-            }
-        }
-    }
+    // 采样走**引擎层那一份**（`anim::sampleTransformClip`），不再在这里
+    // 另写一遍分段 + smoothstep。
+    // ⚠ 2026-10-31（C5）：运行时新增了同一个轨道的消费者。两份插值各自
+    //   实现的话，编辑器里调好的节奏一到 Game.exe 就会变 —— 而且这种偏差
+    //   在静态截图上看不出来，只有"门到达终点的时间"差半拍。
+    //   现在只有一份实现，`verify_transform_clip.py` B 组用同一组关键帧
+    //   比对两边的采样值。
+    anim::sampleTransformClip(*c, t, *tr);
     m_ctx.dirty() = true;
 }
 

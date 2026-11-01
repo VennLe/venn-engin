@@ -41,6 +41,8 @@ SCENE_ABS = os.path.join(ROOT, "build", "bin", SCENE_REL)
 #   （每次开头都会重写整个文件）。
 V2_REL = "_verify_guid_v2.json"
 DUP_REL = "_verify_guid_dup.json"
+# v1 夹具：由 `write_v1_fixture()` 每次从演示场景剥出来（理由见那个函数）。
+V1_REL = "_verify_guid_v1.json"
 
 results = []
 
@@ -101,11 +103,42 @@ def group_selftest():
 
 # ---------------------------------------------------------------- B/C/D 场景
 
-def read_entities():
-    with open(SCENE_ABS, "r", encoding="utf-8") as f:
+def read_entities(path_rel=None):
+    """读场景里可迁移的实体列表。`path_rel` 为空 → 读演示场景本身。
+
+    ⚠ 路径口径是 **build/bin/**（Game.exe 的工作目录），不是仓库根 ——
+      夹具都落在那里，`--scene` 用裸文件名就能打开。
+    """
+    p = (os.path.join(ROOT, "build", "bin", path_rel)
+         if path_rel else SCENE_ABS)
+    with open(p, "r", encoding="utf-8") as f:
         doc = json.load(f)
     ents = doc.get("entities") or []
     return doc, [e for e in ents if isinstance(e, dict)]
+
+
+def write_v1_fixture():
+    """把演示场景**剥成 v1**，当作"升级前的老工程"夹具。
+
+    ⚠ 为什么不直接拿 `assets/scenes/cutscene_demo.json` 当 v1 夹具：它是
+      **活内容**，编辑器存一次就变成 v2（每个实体带 guid）。2026-10-31
+      全量回归实测：B0 报 `with_guid=9`、B1 拿到 `assigned=2`，而迁移代码
+      一行没错 —— 是夹具跟着演示场景一起"升级"了。
+      **用例读活内容 = 用例会随时间自己变红，而且红得看不出原因。**
+      这里保留"拿真实场景当素材"的好处（嵌套/材质/网格/父子都在），只用
+      两条规则把它还原成 v1 的样子：`version = 1`、去掉所有 guid 字段。
+    """
+    with open(SCENE_ABS, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+    doc["version"] = 1
+    for e in doc.get("entities") or []:
+        if isinstance(e, dict):
+            e.pop("guid", None)
+            e.pop("parentGuid", None)
+    with open(os.path.join(ROOT, "build", "bin", V1_REL), "w",
+              encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+    return V1_REL
 
 
 def write_variant(path_rel, mutate):
@@ -121,13 +154,14 @@ def write_variant(path_rel, mutate):
 
 
 def group_scene():
-    # ---- B：v1（源文件本身没有 guid，也要先确认这一点）----
-    _, ents = read_entities()
+    # ---- B：v1（夹具**由本脚本剥出来**，再确认它真的是 v1）----
+    v1_rel = write_v1_fixture()
+    _, ents = read_entities(v1_rel)
     already = sum(1 for e in ents if isinstance(e.get("guid"), str))
-    check("B0 源场景确实是 v1（没有 guid）", already == 0,
+    check("B0 v1 夹具确实没有 guid（剥演示场景这一步做对了）", already == 0,
           "entities=%d with_guid=%d" % (len(ents), already))
 
-    got, _ = load_scene(SCENE_REL)
+    got, _ = load_scene(v1_rel)
     check("B1 v1 场景 → 全部补发、无重复",
           got is not None and got[0] == len(ents) and got[1] == 0 and got[2] == len(ents),
           "got=%s expect=(%d,0,%d)" % (got, len(ents), len(ents)))

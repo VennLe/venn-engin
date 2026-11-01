@@ -1626,6 +1626,12 @@ void ViewportPanel::dropSelectionToGround() {
 // 否则 look() 会退化成"绕目标点打转"，手感完全不对。
 void ViewportPanel::handleNavigation(bool hovered) const {
     if (!hovered || m_gizmo.dragging()) return;
+    // ---- 预览态：导航整段关掉 ----
+    // 相机每帧被 `EditorApp::applyPreviewCamera` 重设到那台相机上，这里再让
+    // 鼠标 / WASD 去推它就是"推一下被弹回去" —— 手感像鼠标失灵。
+    // ⚠ 只关导航，**不关点选与 gizmo**：预览态下仍然要能选中场景里的东西
+    //   （"看着这台相机的画面调对面的灯"是真实用法）。
+    if (m_ctx.previewing()) return;
 
     const ImGuiIO& io = ImGui::GetIO();
     scene::Camera& cam = m_ctx.activeScene().camera();

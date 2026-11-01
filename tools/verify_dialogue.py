@@ -23,7 +23,9 @@
 【用例 B · 按键推进】不设 `MYVK_DLG_AUTO`，往窗口里 PostMessage 真按键，
 配 `MYVK_RUNTIME_TIMESCALE=0.5` 把打字窗口拉宽。
   ⑧ 两段式：打字中按一下 → `DLG-PRESS reveal`（**不是**"什么都没发生"）
-  ⑨ 打字中按的那一下**不会顺手把选项选掉**（q1 的 reveal 早于任何 `DLG-CHOICE`）
+  ⑨ 打字中按的那一下**不会顺手把选项选掉**：`DLG-KEY id=q1 atChoice=0`
+     （送到的当下不在选项上）+ `DLG-PRESS reveal id=q1`（只补完）
+     + 它早于任何 `DLG-CHOICE`（没有顺手选定）
   ⑩ ↓ 之后按空格 → 选中的是 **1 号**（走到 `sleep` 分支，不是 `roof`）
   ⑪ 换分支成功：日志里只有 `sleep`/`sleep_end`，没有 `roof`
 
@@ -64,6 +66,21 @@
 先置 PRESS 再置 RELEASE，引擎这一帧取边沿时已经是"没按下" → `wasPressed`
 **永远 false**。症状极具误导性：按键像是完全没送到（`taps=8` 却一句都没走），
 可窗口句柄是对的、`PostMessage` 也不报错。这里用 `hold=0.06`。
+
+**坑六：合成按键会静默丢失，"发了几次"和"收到几次"没有一一对应。**
+坑五的推论，但比坑五更隐蔽：单次按住 0.06 秒够了，可是**连着发的两发**里，
+后一发可能整个消失 —— 只要它和前一发的 up 挤进同一轮轮询，帧边界上
+"按下→松开→按下→松开"的净变化就是 0，`wasPressed` 一次不为真。
+
+实测证据（2026-10-31，`_venn_verify/dlg_keys.log`）：`DLG-LINE id=q1`
+（第 464 行）之后到 `SUB-BOX ... choices=2`（第 495 行）之间 30 帧，
+**一条 `DLG-PRESS` 都没有**；而脚本侧 `taps` 从 4 涨到 6，确实发了两下空格。
+那两下既没补完也没选掉 —— 它们压根没进引擎。
+
+→ 所以判据**不能**写成"按下第 N 下之后立刻断言"，那是在赌消息队列。
+现在的写法是①在打字窗口里多发几发、②一看见 `DLG-PRESS reveal` 或选项面板
+就撒手、③用 `DLG-KEY` 证明"至少有一发真的送到了"，而不是用 Python 侧的
+发送次数当证据。
 
 ==============================================================================
 两个"看起来该失败却过了"的判据（第一版踩过）
@@ -123,14 +140,21 @@ SUB_BOTTOM_REF = 96.0
 #   实测 ~39 fps → 660 帧刚好越过 `DLG-END`（520 帧时末句还在打字）。
 AUTO_SEC = 1.5
 FRAMES_AUTO = 700
-FRAMES_KEYS = 1000
+# ⚠ 键位组的帧数预算比自动组大一倍，原因见 `TIME_SCALE_KEYS`：慢放倍率
+#   越小，跑完同一段剧情要的**真实**帧越多。
+FRAMES_KEYS = 2000
 
 # 用例 B 的慢放倍率。理由：要按在"正文还没出完"的那段窗口里，而 `q1` 只有
-# 5 个字（24 cps → 0.21 秒），真实速度下"看见锚点 → PostMessage 送达 → 下一帧
+# 5 个字（24 cps → 0.21 秒）。真实速度下"看见锚点 → PostMessage 送达 → 下一帧
 # 处理"这一趟有 20%~40% 概率踏空，测出来就是**偶发红**。
-# 0.5 把它拉到 0.42 秒；ps：这个倍率也会把时间轴的播头一起放慢（`seq.tick`
-# 吃的是 `vdt`），所以整轮从 ~16 秒变 ~24 秒，帧数预算跟着放宽。
-TIME_SCALE_KEYS = 0.5
+#
+# 0.5 → 0.42 秒窗口，2026-10-31 全量回归实测**仍然踏空过一次**
+# （`reveal_q1@-1`：整个 q1 一个 reveal 事件都没有 → ⑨ 无从判定）。
+# 当时机器上同时跑着别的用例，Python 轮询线程被调度推迟了几百毫秒 ——
+# 也就是说这条判据的可靠性取决于"这一轮机器忙不忙"，那它就不算判据。
+# 0.25 → 0.84 秒窗口，给调度抖动留了一倍余量；代价是整轮从 ~25 秒变 ~50 秒，
+# 帧数预算跟着翻倍（见上面的 `FRAMES_KEYS`）。
+TIME_SCALE_KEYS = 0.25
 
 VK_SPACE = 0x20
 VK_DOWN = 0x28
@@ -147,6 +171,9 @@ BOX_RE = re.compile(r"SUB-BOX x=([-\d.]+) y=([-\d.]+) w=([-\d.]+) "
 CHC_RE = re.compile(r"SUB-CHOICE i=(\d+) focus=(\d+) "
                     r"rect=([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+) text=\[(.*)\]")
 PRESS_REVEAL_RE = re.compile(r"DLG-PRESS reveal id=(\S+) chars=(\d+)/(\d+) src=(\S+)")
+# 按键**到达**运行时的证据（`RuntimeApp` 在分发前打一条）。它和 `DLG-PRESS`
+# 是两件事：前者证明"空格送到了"，后者证明"送到了且状态允许补完/翻页"。
+KEY_RE = re.compile(r"DLG-KEY id=(\S+) atChoice=(\d+) focus=(\d+)")
 # ⚠ 这个锚点**故意不在断言里用**：`DLG-PRESS need-choice` 在运行时不可达
 #   （见 group_keys 的说明），留着是为了排查时能在日志里认出它。
 PRESS_CHOICE_RE = re.compile(r"DLG-PRESS need-choice id=(\S+) n=(\d+) src=(\S+)")
@@ -159,11 +186,40 @@ EVENT_RE = re.compile(r"SEQ-EVENT seq=(\S+) kind=(\S+) t=([\d.]+) payload=\[([^\
 
 results = []
 
+# 按键组跑出来的**原始日志**往哪儿落盘（`--dump` 才写）。
+# 为什么要留这个：⑨ 这类"某一下按在哪个状态上"的判据，只看 `reveals=[...]`
+# 根本分不清"没按到"和"按到了但走了别的分支" —— 必须把 DLG-LINE /
+# DLG-PRESS / DLG-CHOICE 按行号排一遍才看得出来。
+DUMP_PATH = None
+
 
 def check(name, ok, detail=""):
     results.append((name, ok, detail))
     print("[%s] %s  %s" % ("PASS" if ok else "FAIL", name, detail))
     return ok
+
+
+def dlg_timeline(lines):
+    """把对话相关的四类锚点按**行号**排成一条时间线。
+
+    ⚠ 只提单行文本（`DLG-LINE id=q1`），不带后面的字段：这里要回答的是
+      "谁先谁后"，字段留给各自的 check() 去打。
+    """
+    out = []
+    for i, l in enumerate(lines):
+        # 日志行带 `[INFO ] ` 前缀（`VK_LOG_INFO` 打的），先剥掉再认锚点。
+        body = l.split("] ", 1)[-1]
+        for tag in ("DLG-START", "DLG-LINE", "DLG-KEY", "DLG-PRESS",
+                    "DLG-CHOICE"):
+            if body.startswith(tag):
+                # 截到第二个空格：`DLG-PRESS reveal id=q1` 保留动作名，
+                # 其余截到 id 就够定位了。
+                parts = body.split()
+                keep = parts[:3] if tag in ("DLG-PRESS", "DLG-KEY") \
+                    else parts[:2]
+                out.append((i, " ".join(keep)))
+                break
+    return out
 
 
 # ---------------------------------------------------------------- 进程与窗口
@@ -435,22 +491,28 @@ def group_auto():
 
 # ---------------------------------------------------------------- 用例 B
 
-def wait_subbox_choices(tap, n=2, timeout=10.0):
-    """等 `SUB-BOX ... choices=N` 出现。
+def subbox_choices_seen(tap, n=2):
+    """**不等待**，只看一眼 `SUB-BOX ... choices=N` 在不在。
 
     ⚠ 不能拿 `"choices=2"` 当子串去等：`DLG-LINE id=q1 ... choices=2` 也含这个
       子串，于是"刚进这一句"就被判成"选项面板出来了"，后面那一下按空格的
       语义就错了（本来想测"打字中按=补完"，结果在正文已出完的节点上按成了
       选定）。
     """
-    needle = "SUB-BOX"
     tail = "choices=%d" % n
+    with tap.lock:
+        for l in tap.lines:
+            if "SUB-BOX" in l and tail in l:
+                return True
+    return False
+
+
+def wait_subbox_choices(tap, n=2, timeout=10.0):
+    """等 `SUB-BOX ... choices=N` 出现（语义见 `subbox_choices_seen`）。"""
     end = time.time() + timeout
     while time.time() < end:
-        with tap.lock:
-            for l in tap.lines:
-                if needle in l and tail in l:
-                    return True
+        if subbox_choices_seen(tap, n):
+            return True
         time.sleep(0.02)
     return False
 
@@ -509,9 +571,28 @@ def group_keys():
                 last = time.time()
                 state["taps"] += 1
             time.sleep(0.02)
-        # ③ q1 刚出现 → 立刻按 → 正文还没出完 → 只能是 reveal
-        tap_key(hwnd, VK_SPACE)
-        state["taps"] += 1
+        # ③ q1 刚出现 → 立刻按，然后**按到正文被补完为止**。
+        #    ⚠⚠ 为什么不是"按一下就完事"：合成按键会**静默丢失**。
+        #      实测（2026-10-31，`dlg_keys.log`）：`DLG-LINE id=q1` 之后
+        #      30 帧里**一条 `DLG-PRESS` 都没有**，可 Python 这边确实发了
+        #      两下空格（`taps` 计数从 4 涨到 6）—— 那两下的 down/up 落在
+        #      同一轮 `glfwPollEvents` 里，帧边界上的净变化是 0，`wasPressed`
+        #      从头到尾没为真过。于是"发了几次按键"和"对话收到几次"之间
+        #      没有一一对应关系，任何"按下即刻断言"的判据都是掷骰子。
+        #    → 对策：在打字窗口里**多打几发**，一旦看见 `DLG-PRESS reveal id=q1`
+        #      或选项面板出现就**立刻撒手**（正文已经补完了，再按就是选定）。
+        #      节拍 0.20 秒（hold 0.06 + 静默 0.14）：0.84 秒的窗口里约 4 发，
+        #      而两次按键之间留 0.14 秒静默（≥4 帧）正是为了让上一次的 KEYUP
+        #      先被吃进去 —— 否则两对 down/up 又挤到同一轮轮询里，白按。
+        key_end = time.time() + 12.0
+        while time.time() < key_end:
+            if tap.has_line("DLG-PRESS reveal id=q1"):
+                break
+            if subbox_choices_seen(tap, 2):
+                break
+            tap_key(hwnd, VK_SPACE)
+            state["taps"] += 1
+            time.sleep(0.14)
         # ④ 等选项面板（正文出完 && atChoice）
         if not wait_subbox_choices(tap, 2, timeout=10.0):
             return
@@ -524,7 +605,11 @@ def group_keys():
     # ⚠ 变量名带 `MYVK_RUNTIME_` 前缀（和 `MYVK_RUNTIME_TRACE_STATES` 一族），
     #   命令行那个则是 `--time-scale`（带连字符）—— 两处都容易写错。
     env = {"MYVK_RUNTIME_TIMESCALE": str(TIME_SCALE_KEYS)}
-    lines, _, _ = run_case(env, FRAMES_KEYS, script=script, wait_s=80.0)
+    lines, _, _ = run_case(env, FRAMES_KEYS, script=script, wait_s=130.0)
+    if DUMP_PATH:
+        with open(DUMP_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        print("  （原始日志 → %s，%d 行）" % (DUMP_PATH, len(lines)))
 
     reveals = [(m.group(1), m.group(2), m.group(3))
                for m in (PRESS_REVEAL_RE.search(l) for l in lines) if m]
@@ -532,14 +617,28 @@ def group_keys():
           and all(int(a) == int(b) for _, a, b in reveals),
           "reveals=%s taps=%d" % (reveals, state["taps"]))
 
-    # ⑨ reveal(q1) 的行号必须早于第一条 DLG-CHOICE
+    # ⑨ 三件事必须同时成立：
+    #    a) 空格**送到了**（`DLG-KEY id=q1`）—— 否则下面两条都是空谈
+    #    b) 送到那一刻运行时判定"不在选项上"（`atChoice=0`，即正文没出完）
+    #    c) 那一下只补完正文（`DLG-PRESS reveal id=q1`），且早于任何选定
+    keys_q1 = [(i, m.group(2)) for i, l in enumerate(lines)
+               for m in [KEY_RE.search(l)] if m and m.group(1) == "q1"]
+    press_q1 = [i for i, l in enumerate(lines)
+                for m in [KEY_RE.search(l)] if m and m.group(1) == "q1"
+                and m.group(2) == "0"]
     idx_reveal = next((i for i, l in enumerate(lines)
                        if (PRESS_REVEAL_RE.search(l) or [None])[0]
                        and PRESS_REVEAL_RE.search(l).group(1) == "q1"), -1)
     idx_pick = next((i for i, l in enumerate(lines) if PICK_RE.search(l)), -1)
-    check(names[1],
-          idx_reveal >= 0 and idx_pick > idx_reveal,
-          "reveal_q1@%d pick@%d" % (idx_reveal, idx_pick))
+    ok9 = (bool(press_q1) and idx_reveal >= 0 and idx_pick > idx_reveal)
+    check(names[1], ok9,
+          "keys_q1=%d(atChoice=0:%d) reveal_q1@%d pick@%d taps=%d" %
+          (len(keys_q1), len(press_q1), idx_reveal, idx_pick, state["taps"]))
+    if not ok9:
+        # 红的时候把时间线打出来：不看它就只能猜"是没按到还是按到了走别的分支"。
+        print("  ---- 对话时间线（行号 → 锚点）----")
+        for i, s in dlg_timeline(lines):
+            print("  %5d  %s" % (i, s))
 
     picks = [m for m in (PICK_RE.search(l) for l in lines) if m]
     focus1 = [l for l in lines if CHC_RE.search(l)
@@ -560,7 +659,12 @@ def main():
                     help="只跑自动推进那一组（调字幕框时用，快一半）")
     ap.add_argument("--skip-auto", action="store_true",
                     help="只跑按键那一组（调输入时序时用）")
+    ap.add_argument("--dump", metavar="PATH", default=None,
+                    help="把按键组的原始日志写到 PATH（查时序用；正常回归不写）")
     args = ap.parse_args()
+
+    if args.dump:
+        globals()["DUMP_PATH"] = args.dump
 
     print("== 对话（C2 第二步）端到端 ==")
     if not args.skip_auto:

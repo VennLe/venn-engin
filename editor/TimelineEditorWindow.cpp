@@ -532,6 +532,27 @@ bool TimelineEditorWindow::actSetShotBlend(float seconds) {
     return true;
 }
 
+// 曲线关键字是**格式**的一部分（写进 JSON 的 `blendCurve`），所以这里有
+// 一道"只接受已知关键字"的闸：面板用的是同一个列表，但脚本 op 能直接传
+// 字符串过来 —— 放行一个拼错的词，文件里会留下一个读回来就变成 smooth
+// 的值，作者在面板上看到的是"我选的还在"，实际播的是另一条曲线。
+bool TimelineEditorWindow::actSetShotCurve(const std::string& name) {
+    sequence::SeqShot* s = selShot();
+    if (!s) return reject("setshotcurve", TR("no shot marker selected"));
+    scene::BlendCurve cv = s->blendCurve;
+    if (!scene::blendCurveFromName(name.c_str(), cv)) {
+        return reject("setshotcurve",
+                      fmt1(TR("unknown blend curve '%s'"), name.c_str()));
+    }
+    s->blendCurve = cv;
+    markDirty();
+    VK_LOG_INFO("TLED-SETSHOTCURVE t=%.3f curve=%s blend=%.3f",
+                static_cast<double>(s->t), scene::blendCurveName(s->blendCurve),
+                static_cast<double>(s->blendSeconds));
+    revalidate();
+    return true;
+}
+
 bool TimelineEditorWindow::actSetShotLabel(const std::string& label) {
     sequence::SeqShot* s = selShot();
     if (!s) return reject("setshotlabel", TR("no shot marker selected"));
@@ -1284,14 +1305,38 @@ void TimelineEditorWindow::drawTracks() {
         if (xb > xa + 1.0f) {
             dl->AddRectFilled(ImVec2(xa, shotY - bh * 0.5f),
                               ImVec2(xb, shotY + bh * 0.5f), c, 2.0f);
-            // 混合时长 > 0 的那一段：左端画一小块渐变条，表示"这里是推过来的"。
-            // ⚠ 用**像素宽度**而不是秒数换算：0.2 秒在 8 秒的过场上只有几个像素，
-            //   按秒画等于看不见。这里只声明意图，不声称它是精确的时长。
-            if (s.blendSeconds > 0.0f && xb > xa + 8.0f) {
-                const float bw = std::min(18.0f, (xb - xa) * 0.25f);
+            // 混合段（2026-10-31 改）：以前是**固定 18 px** 的一块渐变，
+            // 只"声明意图"、不声称时长，也完全不反映曲线形状。现在两件事
+            // 一起修：
+            //   · 宽度按**真实秒数**换算（这样 0.2s 与 1.5s 在轨道上一眼
+            //     分得出），但给一个最小 8px —— 8 秒的过场上 0.2 秒只有
+            //     十来个像素，再短就看不见了；
+            //   · 里面画**曲线本身**（与运行时同一个 `blendCurveApply`），
+            //     所以"猛地推过去"和"缓缓贴上去"在轨道上形状就不一样。
+            // ⚠ 最小宽度是**显示**上的妥协，不是语义：判断"这段是否真的
+            //   在混"仍然只看 `blendSeconds > 0`。
+            if (s.blendSeconds > 0.0f && xb > xa + 6.0f) {
+                const float pxPerSec =
+                    (g.dur > 1.0e-3f) ? (g.x1 - g.x0) / g.dur : 0.0f;
+                const float wantW = (pxPerSec > 0.0f)
+                                        ? s.blendSeconds * pxPerSec
+                                        : (xb - xa) * 0.25f;
+                const float bw = std::clamp(wantW, 8.0f, (xb - xa) * 0.9f);
+                // 渐变底：从"无"到这一段机位的颜色，让人看出是淡入的
                 dl->AddRectFilledMultiColor(
                     ImVec2(xa, shotY - bh * 0.5f), ImVec2(xa + bw, shotY + bh * 0.5f),
                     IM_COL32(0, 0, 0, 0), c, c, IM_COL32(0, 0, 0, 0));
+                // 曲线折线：高 10 px 的一条，贴着横条上沿画
+                const int n = 12;
+                ImVec2 prevPt;
+                for (int k = 0; k <= n; ++k) {
+                    const float u = static_cast<float>(k) / static_cast<float>(n);
+                    const float w = scene::blendCurveApply(s.blendCurve, u);
+                    const ImVec2 pt(xa + u * bw,
+                                    shotY + bh * 0.5f - 1.0f - w * 8.0f);
+                    if (k > 0) dl->AddLine(prevPt, pt, IM_COL32(255, 240, 200, 235), 1.4f);
+                    prevPt = pt;
+                }
             }
         }
         // 小旗：竖杆 + 三角（旗朝右），位置 = marker 的 t
@@ -1508,16 +1553,17 @@ void TimelineEditorWindow::drawInspectorRow() {
     syncBuffers();
 
     ImGui::PushID("tled_prop");
-    // 高度：bezier 段多两行（说明 + 四个手柄），机位 marker 是三条控件行。
+    // 高度：bezier 段多两行（说明 + 四个手柄），机位 marker 多了"曲线下拉 +
+    // 形状预览图"（下拉与 blend 同一行、预览 56 px）。
     // 用固定值而不是自适应，是因为这是**属性栏** —— 高度随选择连续跳动比
-    // "多两行"更难用。
+    // "多几行"更难用。
     // ⚠ 宁可按大给：给少了多出来的那一行会被裁在 Child 外，**按钮照样有矩形
     //   却点不到**（本项目的标准坑，见 MEMORY 的 `logRect 不判可见性`）。
     const sequence::SeqCameraKey* selK =
         (m_track == Track::Camera) ? selKey() : nullptr;
     const bool bezierRow = selK && selK->ease == sequence::Ease::Bezier;
     const float propH = bezierRow ? 158.0f
-                      : (m_track == Track::Shots ? 148.0f : 116.0f);
+                      : (m_track == Track::Shots ? 214.0f : 116.0f);
     ImGui::BeginChild("##tled_propbox", ImVec2(0.0f, propH),
                       ImGuiChildFlags_Borders);
     logRect("TLED-PROP", ImGui::GetWindowPos(),
@@ -1662,6 +1708,40 @@ void TimelineEditorWindow::drawInspectorRow() {
                 ImGui::SetTooltip("%s", TR("0 = hard cut. Anything above glides "
                                            "from the previous shot's pose."));
 
+            // ---- 混合曲线的**形状**（2026-10-31）----
+            //
+            // 在此之前这一段只有"多久"，没有"怎么走"：写死 smoothstep，
+            // 时间轴上也只有一块固定 18px 的渐变条。于是三种在画面上
+            // 完全不同的运镜（匀速推 / 猛地起来再贴上去 / 两头都软）
+            // 在资产里是同一个东西 —— 作者没法表达，也没法对比。
+            //
+            // ⚠ 选项显示的是**关键字本身**（`blendCurveName`），不翻译：
+            //   那五个词直接写进 JSON，翻了就再也读不回来（与 ease 那条
+            //   同一个理由，见上面 camera 轨的 combo）。
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(110.0f);
+            if (ImGui::BeginCombo(TR("curve"),
+                                  scene::blendCurveName(s->blendCurve))) {
+                const scene::BlendCurve all[5] = {
+                    scene::BlendCurve::Linear, scene::BlendCurve::Smooth,
+                    scene::BlendCurve::EaseIn, scene::BlendCurve::EaseOut,
+                    scene::BlendCurve::Smoother};
+                for (scene::BlendCurve c : all) {
+                    const bool sel = (s->blendCurve == c);
+                    if (ImGui::Selectable(scene::blendCurveName(c), sel))
+                        actSetShotCurve(scene::blendCurveName(c));
+                    if (sel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            logRect("TLED-PROP-CURVE", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", TR("How the blend gets there. Linear = "
+                                           "constant speed, easein = slow start, "
+                                           "easeout = fast start, smoother = softest "
+                                           "at both ends."));
+
             ImGui::SameLine();
             ImGui::SetNextItemWidth(200.0f);
             if (ImGui::InputTextWithHint(TR("label"), TR("shot A — close-up"),
@@ -1670,6 +1750,56 @@ void TimelineEditorWindow::drawInspectorRow() {
                 actSetShotLabel(m_labelBuf);
             }
             logRect("TLED-PROP-LABEL", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+
+            // ⚠ 预览图必须排在 `label` **之后**：`label` 用的是 `SameLine()`，
+            //   把它放在预览图后面的话，输入框会挂到那张 56 px 高的图右边，
+            //   整行的基线跟着乱掉（表现是"标签框莫名其妙变高、后面挤成一团"）。
+            // ---- 形状预览：这一段的混合曲线长什么样 ----
+            // ⚠ 这张图**就是**运行时用的那条 `blendCurveApply`（同一个函数、
+            //   同一组采样点），不是照着画的示意图。写成两套的话，改了实现
+            //   之后预览会和画面分叉，而那是最难被发现的一类谎话。
+            {
+                const float ph = 56.0f;
+                const float pw = 150.0f;
+                const ImVec2 p0 = ImGui::GetCursorScreenPos();
+                ImGui::InvisibleButton("##curveplot", ImVec2(pw, ph));
+                logRect("TLED-SHOT-CURVE-PLOT", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddRectFilled(p0, ImVec2(p0.x + pw, p0.y + ph),
+                                  IM_COL32(24, 24, 30, 255), 3.0f);
+                dl->AddRect(p0, ImVec2(p0.x + pw, p0.y + ph),
+                            IM_COL32(90, 90, 100, 200), 3.0f);
+                const bool hardCut = (s->blendSeconds <= 0.0f);
+                // 硬切：画一条**竖直**台阶（0 → 1 一步到位），这也正是
+                // 时间轴上那一段的实际语义。画成一条 45° 线才是撒谎。
+                const int n = 32;
+                ImVec2 prev;
+                for (int i = 0; i <= n; ++i) {
+                    const float u = static_cast<float>(i) / static_cast<float>(n);
+                    const float w = hardCut
+                                        ? (u < 1.0f ? 0.0f : 1.0f)
+                                        : scene::blendCurveApply(s->blendCurve, u);
+                    const ImVec2 pt(p0.x + 4.0f + u * (pw - 8.0f),
+                                    p0.y + ph - 4.0f - w * (ph - 8.0f));
+                    if (i > 0) dl->AddLine(prev, pt, IM_COL32(120, 200, 255, 255), 1.6f);
+                    prev = pt;
+                }
+                char lbl[64];
+                if (hardCut) {
+                    std::snprintf(lbl, sizeof(lbl), "%s", TR("hard cut"));
+                } else {
+                    std::snprintf(lbl, sizeof(lbl), "%s · %.2fs",
+                                  scene::blendCurveName(s->blendCurve),
+                                  static_cast<double>(s->blendSeconds));
+                }
+                dl->AddText(ImVec2(p0.x + 6.0f, p0.y + 3.0f),
+                            IM_COL32(200, 200, 210, 220), lbl);
+                // 硬切时**不**再往右挂一行说明：属性栏本来就窄，多一段文字
+                // 会把下一行的按钮挤到 Child 外面（"有矩形却点不到"）。台阶
+                // 形状 + `hard cut` 两个字已经说完了。
+            }
 
             // ---- 绑定的机位 ----
             // 显示**名字**而不是十六进制：作者记不住 guid。名字查不到时
@@ -1908,6 +2038,8 @@ void TimelineEditorWindow::runInjectedScript() {
         } else if (name == "setshotcamsel") ok = actBindShotToSelection();
         else if (name == "setshotblend") ok = actSetShotBlend(
             static_cast<float>(std::atof(arg.c_str())));
+        // `setshotcurve:<linear|smooth|easein|easeout|smoother>`
+        else if (name == "setshotcurve") ok = actSetShotCurve(arg);
         else if (name == "setshotlabel") ok = actSetShotLabel(arg);
         else if (name == "setshottime") ok = actSetShotTime(
             static_cast<float>(std::atof(arg.c_str())));

@@ -46,6 +46,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from prereq import skip_if_external_missing              # noqa: E402
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from verify_add_menu import LogTap, kill_stale_editors          # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -439,7 +441,7 @@ def case_e():
 def case_f():
     path = os.path.join(BIN, WT_FILE)
     if os.path.exists(path):
-        os.remove(path)
+        safe_remove(path)
 
     before = digests_of(run_editor("list;mesh:0;autoall;save:%s;digest" % WT_FILE))
     ok_file = os.path.exists(path)
@@ -482,7 +484,7 @@ def case_f():
 
     if "--keep" not in sys.argv:
         try:
-            os.remove(path)
+            safe_remove(path)
         except OSError:
             pass
 
@@ -612,9 +614,13 @@ def main():
     ap.add_argument("--keep", action="store_true", help="保留日志与产物")
     args = ap.parse_args()
     only = args.only.strip().lower()
+    # 前置：这个模型是从外部工程导进来的，贴图引用是绝对路径。
+    # 资产根不在 → 引擎必打 [ERROR] → 末尾的"零 ERROR"必红；
+    # 那不是被测代码的问题，所以这里改成 SKIP（见 tools/prereq.py）。
+    skip_if_external_missing(MODEL)
 
     if os.path.isdir(OUT_DIR) and not args.keep:
-        shutil.rmtree(OUT_DIR, ignore_errors=True)
+        safe_rmtree(OUT_DIR)
     os.makedirs(OUT_DIR, exist_ok=True)
     kill_stale_editors()
 

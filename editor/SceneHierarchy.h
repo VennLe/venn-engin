@@ -130,6 +130,39 @@ private:
     // 记成 pending：拖放回调发生在遍历 ECS 的过程中，不能当场创建实体。
     std::string m_pendingImportRel;
     PickingSystem m_picking;
+
+    // ---- G16-4 尾巴：按 guid 选（2026-10-31）----
+    //
+    // 为什么要有：guid 是**唯一**跨会话稳定的身份，而树里显示的是名字 ——
+    // 名字可改、可重名、可以没有。排查"存档里那个 `…01` 到底是哪一根"
+    // 时，除了右键复制 guid，没有第二条路。
+    //
+    // ⚠ 这两项都**不能**记成 pending：`Copy GUID` 是只读（不碰 World），
+    //   `Select by GUID` 只改选中、不增删实体（`collectFlatOrder` 遍历的是
+    //   每帧重算的 DFS 表，不是组件数组）。而"选中"本身要立刻生效，
+    //   否则弹窗关掉的下一帧高亮才跳过去，看起来像点错了。
+    //
+    // ⚠ 弹窗**必须在 `draw()` 里画**，不能在右键 popup 里 `BeginPopupModal`
+    //   —— 菜单项的回调发生在 `BeginPopupContextItem` 的栈里，
+    //   在那儿开模态窗口会被外层 popup 的 focus 抢掉（点不中按钮）。
+    bool m_guidQueryOpen = false;
+    // ⚠⚠ 菜单项那一下**不能**当帧就 `OpenPopup`：那一帧正在关右键菜单，
+    //   ImGui 会把"这一帧新开的 popup"当成被同一次点击带开的窗口而立刻
+    //   关掉 —— 表现就是"菜单消失了、弹窗没出来"，而日志里一个错都不报
+    //   （2026-10-31 实测：点 `Select by GUID…` 后画面什么都不变）。所以
+    //   按下时只置 pending，下一帧在 `draw()` 里才真正 Open。
+    bool m_guidQueryPending = false;
+    char m_guidQuery[32] = {0};
+    // 回车/点 Select 判定失败之后要把焦点**还给输入框**：`EnterReturnsTrue`
+    // 会让 ImGui 在返回 true 的同时清掉 active id，不还焦点的话"发现打错了、
+    // 接着改"必须先拿鼠标点一下输入框 —— 一个纯手感的坑，但它会让
+    // "同一个弹窗里改成正确 guid"这件事变得做不到（C2 就是这么红的）。
+    bool m_guidRefocus = false;
+    // 0 = 还没试 / 1 = 格式不对 / 2 = 格式对但场景里没有这个 guid
+    int m_guidQueryBad = 0;
+    std::string m_guidQueryMsg;   // 弹窗里那句红字（已翻译）
+    void drawGuidQuery();
+
 };
 
 } // namespace editor

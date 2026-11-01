@@ -56,6 +56,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from capture_window import capture_client, find_window  # noqa: E402
 from verify_add_menu import LogTap, click, kill_stale_editors  # noqa: E402
 from verify_asset_drag import client_to_screen  # noqa: E402
@@ -382,7 +383,7 @@ def main():
     for f in ("terrain.vterrain", "height.r32", "splat.rgba8"):
         p = os.path.join(terrain_dir, f)
         if os.path.exists(p):
-            os.remove(p)
+            safe_remove(p)
 
     env = dict(os.environ)
     env.update({

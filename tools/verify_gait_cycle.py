@@ -47,6 +47,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from verify_add_menu import LogTap, kill_stale_editors          # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -152,7 +153,7 @@ def main() -> int:
 
     for f in (CLIP_BAKED, CLIP_BLOCK):
         try:
-            os.remove(os.path.join(BIN, f))
+            safe_remove(os.path.join(BIN, f))
         except OSError:
             pass
 
@@ -460,7 +461,7 @@ def main() -> int:
             if os.path.isfile(src):
                 dst = os.path.join(OUT_DIR, f)
                 if os.path.isfile(dst):
-                    os.remove(dst)
+                    safe_remove(dst)
                 os.replace(src, dst)
     except OSError as e:
         print("[WARN] 留档失败：%s" % e)

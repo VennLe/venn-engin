@@ -60,6 +60,7 @@ BIN = os.path.join(ROOT, "build", "bin")
 EDITOR_EXE = os.path.join(BIN, "Editor.exe")
 
 sys.path.insert(0, HERE)
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402
 from verify_add_menu import LogTap                      # noqa: E402
 
 # 被编辑的资产（相对 assets/）。5 帧、4 事件、duration=8。
@@ -747,7 +748,7 @@ def main():
         if args.keep:
             print("临时目录：%s" % tmp)
         else:
-            shutil.rmtree(tmp, ignore_errors=True)
+            safe_rmtree(tmp)
         try:
             subprocess.run(["taskkill", "/F", "/IM", "Editor.exe"],
                            capture_output=True, timeout=10)

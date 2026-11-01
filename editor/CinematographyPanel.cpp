@@ -79,7 +79,10 @@ void CinematographyPanel::drawCameraList() {
         if (rows[static_cast<std::size_t>(i)].enabled) { activeIdx = i; break; }
     }
 
-    ImGui::BeginChild("##cine_cams", ImVec2(0.0f, 96.0f), ImGuiChildFlags_Borders);
+    // ⚠ 宽度留 -190：右侧那一列是"以选中相机预览"。
+    // 这样布局是**零高度**的，理由见下面那段注释。
+    ImGui::BeginChild("##cine_cams", ImVec2(-190.0f, 96.0f),
+                      ImGuiChildFlags_Borders);
     for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
         const CamRow& r = rows[static_cast<std::size_t>(i)];
         char label[192];
@@ -107,6 +110,47 @@ void CinematographyPanel::drawCameraList() {
         }
     }
     ImGui::EndChild();
+
+    // ---------------------------------------------------- 以选中相机预览
+    //
+    // ⚠⚠ **必须与列表并列（SameLine），不能放在列表下面。**
+    //   放在下面 = 面板多一行 ≈ 30 px，而这一页的内容早就贴着面板下边缘了：
+    //   多一行就会把下面的动词按钮网格（`CINE-VERB-PAN` 那一排）整排推出
+    //   可视区 —— 而 `logRect` **不判可见性**，脚本照着那个矩形点，点在
+    //   面板外面，日志里一条错都没有。症状是"运镜用例的 B4/B5/B6 突然全红，
+    //   而 B7（自己会滚动）照样绿"。这个坑 2026-10-31 已经踩过一次。
+    //
+    // 语义就一条：预览的永远是**当前选中**的那台相机；选中没有
+    // `CameraComponent` 时按钮是灰的（而不是"点了没反应"）。
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    ImGui::PushID("cine_preview");
+    if (m_ctx.previewing()) {
+        if (ImGui::Button(TR("Exit camera preview")))
+            m_ctx.clearPreviewCamera();
+        logRect("CINE-PREVIEW-BTN", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        // 显示**锁定中的那台**（按 guid 反查名字），不是"当前选中"：
+        // 预览期间用户照样可以点别的相机去改它的参数，两件事不该混。
+        const ecs::Entity pe = w.find(m_ctx.previewCameraGuid());
+        const std::string* pn = pe.valid() ? w.name(pe) : nullptr;
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.78f, 0.35f, 1.0f));
+        ImGui::TextWrapped("%s %s", TR("Looking through:"),
+                           pn ? pn->c_str() : "<gone>");
+        ImGui::PopStyleColor();
+    } else {
+        const bool hasCam = (cur() != nullptr);
+        ImGui::BeginDisabled(!hasCam);
+        if (ImGui::Button(TR("Look through selected camera")) && hasCam)
+            m_ctx.previewCamera(m_ctx.selection());
+        ImGui::EndDisabled();
+        logRect("CINE-PREVIEW-BTN", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        if (!hasCam)
+            ImGui::TextDisabled("%s", TR("(select a camera first)"));
+    }
+    ImGui::PopID();
+    ImGui::EndGroup();
 }
 
 // ---------------------------------------------------------------- 镜头
@@ -201,6 +245,17 @@ void CinematographyPanel::drawLens(ecs::CameraComponent& cc) {
         ImGui::TextDisabled("%s %.2f", TR("blur"),
                             scene::shutterToBlurStrength(cc.shutterAngle));
     }
+
+    // 快门开窗位置。与角度正交：角度是"窗多长"，这里是"窗摆在哪一段"。
+    // ⚠ 不禁用也不隐藏 —— 关上快门时调它没有任何画面变化，但把控件藏起来
+    //   会让"我先摆好位置再开快门"这条编辑顺序做不了。
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SliderFloat(TR("Shutter position"), &cc.shutterPosition, -1.0f, 1.0f,
+                       "%.2f");
+    logRect("CINE-SHUTPOS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", TR("-1 = end of frame (blur trails behind), "
+                                   "0 = centered, +1 = start of frame."));
 }
 
 // ---------------------------------------------------------------- rig
@@ -561,13 +616,19 @@ void CinematographyPanel::draw() {
             cc->focal > 0.0f ? scene::focalToFovY(cc->focal, cc->sensorHeight)
                              : cc->fov;
         char buf[384];
+        // 下面这一行是**日志转储**（key=value 连写），不是界面文案：
+        // `verify_camera_move.py` / 面板自动化都按这些字段名解析，翻成中文
+        // 会让它们同时失联；真机上也一个像素都看不到。
+        // i18n-keep
         std::snprintf(buf, sizeof(buf),
                       "sel=%s focal=%.1f fov=%.1f fovEff=%.2f shift=(%.3f,%.3f) "
-                      "roll=%.1f dof=%d fstop=%.1f shutter=%.0f look=%llx "
+                      "roll=%.1f dof=%d fstop=%.1f shutter=%.0f shutpos=%.2f "
+                      "look=%llx "
                       "damp=%.2f hand=%.2f/%.2f path=%llx",
                       n ? n->c_str() : "-", cc->focal, cc->fov, fovEff,
                       cc->shiftX, cc->shiftY, cc->rollDeg,
                       cc->dofEnabled ? 1 : 0, cc->fStop, cc->shutterAngle,
+                      cc->shutterPosition,
                       static_cast<unsigned long long>(cc->lookTargetGuid),
                       cc->lookDamping, cc->handheldDeg, cc->handheldHz,
                       static_cast<unsigned long long>(cc->pathGuid));

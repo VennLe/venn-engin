@@ -285,6 +285,9 @@ def main():
         if not ok:
             failed += 1
     print("=== %d/%d PASS ===" % (len(checks) - failed, len(checks)))
+    # ⚠ 回归闸门只认 `结果: PASS` / `结果: FAIL: ...`（ASCII 冒号）—— 只打
+    #   `=== N/M PASS ===` 会让**全绿**被判成红（本项目反复踩的坑）。
+    print("结果: %s" % ("PASS" if failed == 0 else "FAIL: %d 项未通过" % failed))
     return 0 if failed == 0 else 1
 
 

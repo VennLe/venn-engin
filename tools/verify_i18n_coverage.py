@@ -640,6 +640,9 @@ def scan_bare_formats():
     ⚠ 判据用 needs_translation()（格式串走 format_has_text，剥掉 %d/%s
       之后还要剩 ≥2 个字母才算"有英文"），否则 "%s" / "%d" 会刷一片假阳性。
 
+    豁免：`FMT_KEEP`（全局精确匹配表）与**调用点注释 `// i18n-keep`**
+    （写在 snprintf 那一行或上一行）。后者给"日志锚点"用 —— 见下面注释。
+
     返回 (缺译文的命中列表, 检查总数)。
     """
     hits, total = [], 0
@@ -659,6 +662,21 @@ def scan_bare_formats():
                 continue                    # 格式串是变量，静态扫不到
             total += 1
             gstart, _gend, decoded = groups[0]
+            # ---- 调用点豁免：`// i18n-keep` ----
+            # 用在**纯日志锚点**上（`key=value` 连写的诊断转储行，例如相机
+            # 面板的 `CINE-STATE sel=… focal=…`）。这类串屏幕上根本看不到，
+            # 它是给回归脚本按字段名解析的 —— 翻成中文等于让所有脚本同时
+            # 失联。它们以前靠 `FMT_KEEP` 顶着，但那张表是**字符串精确
+            # 匹配**：日志行一加字段，表就失效，而失效的表现是"整个 D 组
+            # 变红"（错的是表，不是代码）。豁免写在 snprintf 旁边，改格式
+            # 串的人一定会看见它。
+            # ⚠ 只认 snprintf 调用（含格式串）跨的行 + 它的上一行，避免
+            #   用一个远处的注释把半屏代码都豁免掉。
+            _l0 = text.count("\n", 0, m.start())
+            _l1 = text.count("\n", 0, m.end() - 1 + len(args))
+            if "i18n-keep" in "".join(
+                    text.splitlines(True)[max(0, _l0 - 1):_l1 + 1]):
+                continue
             # 已经被 TR(...) 包住？（口径同 B 组：看前一个非空字符是不是 '('）
             # ⚠ engine/ 层的代码**不能**用 editor 的 `TR()` 宏（那是
             #   editor/Localization.h 里的），只能用 `i18n::tr(...)`。

@@ -264,6 +264,7 @@ yaw / pitch / fov）**共用同一个时间重映射**。这是对的抽象：�
 | `t` | **从这一秒起**生效，直到下一个 marker 或片尾 | 0 |
 | `camera` | 相机实体 guid，**16 位小写 hex** | 省略 = `0` = 回落关键帧轨 |
 | `blend` | 从上一段混过来用几秒。`0` = **硬切** | 0 |
+| `blendCurve` | 这 `blend` 秒里**怎么走**：`linear` / `smooth` / `easein` / `easeout` / `smoother` | `smooth`（= 加这字段之前写死的 smoothstep） |
 | `label` | 面板与日志用（"A 机位 特写"） | 空 |
 
 三条按设计钉死的语义：
@@ -310,8 +311,10 @@ seq.shotBlendSeconds()   // 0 = 硬切
 哪台在播"。
 
 注入脚本 verbs：`addshot` / `setshotcam:<hex 或 0>` / `setshotcamsel` /
-`setshotblend:<秒>` / `setshotlabel:<文本>` / `setshottime:<秒>` /
-`sel:shots:<i>`。
+`setshotblend:<秒>` / `setshotcurve:<linear|smooth|easein|easeout|smoother>` /
+`setshotlabel:<文本>` / `setshottime:<秒>` / `sel:shots:<i>`。
+⚠ `setshotcurve` 只接受**已知关键字**（`blendCurveFromName` 过闸）：放行一个
+拼错的词，文件里会留下一个读回来就变成 smooth 的值，而面板上看着"我选的还在"。
 
 ⚠ `setshotcam` 走 `parseGuidHex` 而**不是** `atoll`：后者会把 `00a1b2c3`
 读成十进制 10123 —— 看着"绑上了"，实际绑的是一个不存在的实体。绑非 0 但
@@ -333,12 +336,108 @@ marker 强制先用**低**优先级那台 —— 于是 `CAM-CUT name=CamLow` �
 
 ## 十、还没做
 
-- **手动贝塞尔手柄**：`CameraPathPoint` 有 `in/outHandle` 字段，但面板只暴露
-  "自动手柄"（Catmull-Rom）。要手调时直接改 JSON。
-- **编辑器视口的景深 / 运动模糊**：目前只有 `Game.exe` 侧接线（编辑器视口是
-  自由相机、走的不是 `CameraSystem`）。要补得先给编辑器一条"以选中相机预览"
-  的路径。
-- **Motion Blur 的 `Position` / `Steps`**：`CameraEffectSettings` 只有强度与
-  采样数，没有"帧开始/中间/结束开窗"。
-- **运镜曲线可视化**：marker 之间的混合只有一条小渐变块，没有"这条混合曲线
-  长什么样"的编辑入口。
+- ~~**手动贝塞尔手柄**~~ → **✅ 已做（复查于 2026-10-31，原文陈旧）**：
+  `CurveEditorPanel` 里既有**四个数值框**（`out.x/out.y/in.x/in.y`，落盘锚点
+  `CURVED-SETHANDLE`），也能在曲线图上**直接拖手柄**（`CURVED-DRAG-END kind=handle
+  side=…`），另有 `V: fit handle` 走自动规则（`CURVED-SETHANDLETYPE`）。
+  三条判据早就挂在 `tools/verify_curve_editor.py` 的 D/E 组里 —— 这一条之所以
+  一直留在"还没做"，是因为**文档没跟着改**，不是功能没做。
+- ~~**Motion Blur 的 `Position` / `Steps`**~~ → **✅ 已做（2026-10-31）**：
+  `Steps` 其实早就有了（`CameraEffectSettings::motionBlurSamples` ↔ 注册表
+  `mb.samples` ↔ `MYVK_MB_SAMPLES`）；真正缺的是 **Position**，现在整条竖切
+  都通了 ——
+  · 引擎：`CameraEffectSettings::motionBlurShutterPosition`（-1..+1，默认 0）
+    → `MotionBlurPush::params.w` → `fg_motionblur.frag` 的采样窗偏移
+    `t = i/(n−1) − 0.5 + pos*0.5`；
+  · 面板：Cinematography ▸ Lens ▸ **Shutter position** 滑条（写
+    `ecs::CameraComponent::shutterPosition`，锚点 `CINE-SHUTPOS`）；
+  · 注册表：`mb.position` / `MYVK_MB_POSITION`（**必须是 `PFloatAny`** ——
+    `PFloat` 的 env 语义是"拒绝负数"，`-1` 会被静默吃掉）；
+  · 序列化：`shutterPosition`（缺键 = 0，老工程一个字节不改）；
+  · 运行时：`RuntimeApp::applyCameraLensEffects` 只在 `shutterAngle > 0`
+    时写，避免关快门时把上一台相机的开窗位置继承过去；
+  · 判据：`verify_camfx.py` B5a~B5e 五条。
+  ⚠ 判据里 **B5c（-1 与 +1 必须互不相同）** 是这一条的核心：把偏移写成
+  `abs(pos)` 时，UI 滑条照样在动、画面照样变，只有"左右两档对称"这一个
+  事实会露出来。
+  实测（2026-10-31，1.5° 偏航 / 强度 1.0 / 8 采样，与 B2 同一场景）：
+
+  | 判据 | 落点 | 实测 |
+  |---|---|---|
+  | B5a | −1 与居中不同 | 差异像素 5312，最大差 81 |
+  | B5b | +1 与居中不同 | 差异像素 5341，最大差 79 |
+  | B5c | −1 与 +1 不同 | 差异像素 **8692**（> 单侧任一个） |
+  | B5d | 同档两次逐位相同 | 最大差 0 |
+  | B5e | 静止相机仍逐位回到基线 | 最大差 0 |
+
+  ⚠ B5c 那个 **8692 必须大于 5312/5341** 才有信息量：两档若只是"同一段
+  窗口换个名字"，互相之间的差异不会比各自与居中的差异更大。**否定测试**
+  （把 `off = pos*0.5` 改成 `abs(pos)*0.5` 重编重跑）实测：B5a/B5b 双双
+  变成同一个 **5341**、**只有 B5c 变红且塌成 0 像素** —— 这正是判据有
+  鉴别力的证据（"参数接上了但方向对称"这种半对不半错的状态，只有它能抓）。
+- ~~**编辑器视口的景深 / 运动模糊**~~ → **✅ 已做（2026-10-31，落点换了个名字：
+  "以选中相机预览"）**。原来那句"要补得先给编辑器一条『以选中相机预览』的
+  路径"是对的 —— 把这条路径建出来，景深/快门只是顺路。
+  整条竖切：
+  · 引擎：`scene::applyCameraEntityTo(scene, entity, cam)`（`CameraSystem.h`）——
+    把一台相机实体**整份**装到某个 `scene::Camera` 上：机位（含 roll）+ 镜头
+    （focal→fov、离轴 shift）+ 裁剪面。反解公式从 `poseFromEntity` 里抽成
+    `poseFromWorld()`，**只写这一处**（两处各写一遍的代价是"编辑器预览和进
+    Play 差半度"，没有任何日志能看出来）。
+  · 状态：`EditorContext::previewCameraGuid()`（存 **guid** 不存实体句柄 ——
+    进 Play 会把场景复制成运行态副本，guid 是跨副本稳定的那个键）。
+    **不进 `.scene.json` / 存档 / 撤销栈**：这是"我怎么看这个世界"，属于视图状态。
+  · 每帧应用：`EditorApp::applyPreviewCamera()`，位置是 `onUpdate` **最后**
+    一次碰相机的地方（放早了会被物理 / 碰撞 / 时间轴运镜覆盖，表现是
+    "点了 Look through，机位闪一下又回去了"）。
+  · 面板：Cinematography ▸ 列表下方 **Look through selected camera** 按钮
+    （锚点 `CINE-PREVIEW-BTN`），预览态变成 **Exit camera preview** + 橙字
+    "正在查看：<名字>"。按钮放在列表**下面**而不是每行右边，是因为行是
+    可点的 Selectable，切开行宽会让已有的相机列表用例**静默漂移**。
+  · 导航门禁：`ViewportPanel::handleNavigation` 在 `previewing()` 时整段
+    `return`。不关的话手感是"推一下被弹回去"（相机会在 onImGui 那一帧被
+    鼠标推动、渲染完又被下一帧抹掉）。
+  · 锚点：`CINE-PREVIEW on=1 guid= name=` / `CINE-PREVIEW-LENS guid= pos=
+    yaw= pitch= fov= dof= fstop= focus= ap= sh= blur= pos2=`
+    （只在签名变化时打）/ 退出时 `CINE-PREVIEW-LENS restored=1 dof= `。
+  · 判据：`tools/verify_camera_preview.py` A0~A5b 共 15 条。
+  ⚠⚠ **"预览态拖不动相机"故意没有判据**（第一版写过，被否定测试否掉）。
+  因为 `applyPreviewCamera()` 每帧重设机位，`scene.camera()` 的**帧末值**恒等于
+  实体姿态 —— "相机位置没变"这个量根本区分不了门禁在不在（把那行门禁注释掉，
+  那条断言照样绿）。真正会变的只有"onImGui 那一帧渲染用的中间值"，抓住它要靠
+  "拖拽中连拍多帧看有没有一帧偏了"，那是概率判据。所以门禁留着、判据不写，
+  理由写在这里。**一条永远为真的断言比没有断言更糟**。
+  ⚠⚠ **退出必须把镜头效果还回去**。预览会往全局 `CameraEffectSettings` 里写
+  景深/快门，而那是渲染器**唯一**的一份设置：不复原的话退出预览之后整个
+  编辑器视口永远带着那台相机的浅景深，重启才恢复（设置还可能被落盘）。
+  只存/还原**自己写过的**六个字段，别的（色差/暗角/体积）一律不碰。
+  ⚠ 两处换算会漂移：`RuntimeApp::applyCameraLensEffects` 与
+  `EditorApp::applyPreviewCamera` 是两份代码（runtime 不认识 editor）。共同的
+  判据是两个换算本身只有一份（`scene::fStopToDofAperture` /
+  `scene::shutterToBlurStrength`），改一边必须对照另一边。
+- ~~**运镜曲线可视化**~~ ✅ **2026-10-31 做完**：marker 之间的混合从
+  "一块固定 18 px 的渐变、形状写死 smoothstep"变成**可编辑的曲线**。
+  · 数据：`SeqShot::blendCurve`（`linear / smooth / easein / easeout /
+    smoother`），缺省 `smooth` = 加它之前的行为，所以老资产逐位不变；
+    写回**只在非默认时**写 `"blendCurve"` 键（同 `blend` / `camera` 的省略规则）。
+  · 执行：`scene::blendCurveApply`（`engine/scene/BlendCurve.h`，零依赖纯函数）。
+    `CameraSystem::blendCut(seconds, curve)` 把它带进每一帧插值；
+    老签名 `blendTo(target, s, bool smoothStep)` 继续可用（true/false 映射到
+    `Smooth`/`Linear`，不多造一条平行实现）。
+  · 面板：属性栏 `curve` 下拉（锚点 `TLED-PROP-CURVE`）+ **形状预览图**
+    （`TLED-SHOT-CURVE-PLOT`）。预览图调的就是运行时那条函数，**不是**照着
+    画的示意图 —— 两套实现的话，"改了实现预览还停在老形状"没法被发现。
+    硬切（`blend == 0`）画成竖直台阶，不是 45° 线：那才是真实语义。
+  · 轨道：混合区宽度按**真实秒数**换算（下限 8 px 只为可见），里面画曲线折线
+    —— "猛地推过去"和"缓缓贴上去"在轨道上形状就不一样。
+  · 判据：`verify_multi_cam` 共 57 条，新增 A 组 `seq_shot_curve_*`（默认 /
+    解析 / 拼错要警告 / 往返 / 两端精确）+ `G7a~G7d`（三条曲线在同一时刻
+    落到三个不同的数）、B 组 `B3c/B5e/B5f/B8`、C 组 `C5d`。
+- ⚠⚠ **两条否定测试换来的教训（都以实测为准）**：
+  ① 把 `blendCut(b, cv)` 改回 `blendCut(b)`，**57 条全绿** —— 因为日志打的是
+     调用方手上的 `cv`，不是相机真正用的那个。所以 `CAM-CUT-RT` 的
+     `curve=` 必须从 `CameraSystem::beganCurve()` 取；改完之后同一处否定
+     测试**只红 C5d 一条**。
+  ② 把执行侧改成恒走 `BlendCurve::Smooth`（曲线存了、日志也对、画面不对），
+     **G5（smooth 中点 0.5）照样绿**，只有 `G7b/G7c/G7d` 红。这就是
+     "只钉一个中点不够"的实证：`smooth` 在中点的值恰好等于 `linear`。

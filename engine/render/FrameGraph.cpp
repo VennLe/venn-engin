@@ -73,7 +73,7 @@ static_assert(sizeof(DofPush) == 32, "");
 struct MotionBlurPush {
     glm::vec4 cam;          // x=P00 y=P11 z=zn w=zf
     glm::mat4 clipFromView; // prevViewProj × inverse(view)
-    glm::vec4 params;       // x=强度 y=采样数 z=最大速度(uv) w=未用
+    glm::vec4 params;       // x=强度 y=采样数 z=最大速度(uv) w=快门开窗位置
 };
 static_assert(sizeof(MotionBlurPush) == 96, "");
 
@@ -514,8 +514,14 @@ void FrameGraph::execute(VkCommandBuffer cmd, uint32_t frameIndex,
                 int samples = fx.motionBlurSamples;
                 if (samples < 2) samples = 2;
                 if (samples > 16) samples = 16;
+                // w = 开窗位置。夹到 [-1,1] —— 越界会让采样窗整段跑到
+                // 当前帧之外，看起来像"整个画面平移了"，而不是模糊。
+                float shutter = fx.motionBlurShutterPosition;
+                if (shutter < -1.0f) shutter = -1.0f;
+                if (shutter > 1.0f) shutter = 1.0f;
                 u.params = glm::vec4(fx.motionBlurStrength,
-                                     static_cast<float>(samples), 0.25f, 0.0f);
+                                     static_cast<float>(samples), 0.25f,
+                                     shutter);
                 pushSize = sizeof(u);
                 std::memcpy(push, &u, sizeof(u));
                 break;

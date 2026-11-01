@@ -119,6 +119,14 @@ enum class Builtin : uint16_t {
     //   `core::Application::m_scene` 里 —— engine 两样都够不着。
     SetFlag, GetFlag, Spawn, LoadScene,
 
+    // ---- 界面（C6 第七件，2026-10-31）----
+    // `openUI(path)` 让脚本自己掀一块界面（背包 / 结算 / 提示框）。
+    // `openUI("")` = 关掉当前那块。
+    // ⚠ 它只切"显示哪份 `.ui.json`"，不创建控件 —— 控件在文档里。
+    //   脚本要改的是**显示哪一页**，那正是导演该管的事；逐控件改属性
+    //   属于 `setColor` 那一族，别混进来。
+    OpenUI,
+
     // ---- 关节（J5-4）----
     // `joint(e, other, kind)` 建/改；其余都是对**已有**关节的细调。
     // `jointKind` / `jointTarget` 是读（写玩法分支时要用：先看有没有
@@ -322,6 +330,8 @@ const BuiltinInfo kBuiltins[] = {
     {"playSequence", 1, 1}, {"showDialogue", 1, 1}, {"playAnim", 1, 2},
     // C6 第二批：世界四件。`spawn` 的位置可选（不给 = 原点）。
     {"setFlag", 2, 2}, {"getFlag", 1, 1}, {"spawn", 1, 2}, {"loadScene", 1, 1},
+    // C6 第七件：掀界面。空路径 = 关掉当前那块。
+    {"openUI", 1, 1},
     // J5-4：关节九件。全部要求**显式 self**（见 ScriptJointActions 的说明）。
     // ⚠ 这里是**公开签名**（编译期按它查 arity），改实现时必须同步改这里：
     //   对不上就是"整份脚本 not runnable"，一行日志都不像脚本的错。
@@ -2550,6 +2560,29 @@ Value Evaluator::call(Builtin b, const std::vector<Value>& a, int line) {
                     "loadScene('" + path +
                     "'): the scene file does not exist or cannot be read "
                     "(nothing was scheduled)";
+            }
+            return Value::boolean(ok);
+        }
+
+        case Builtin::OpenUI: {
+            const std::string path = strOf(a[0], line, "openUI(path)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!m_host.act.openUI) {
+                m_err.line = line;
+                m_err.message =
+                    "openUI() is not available in this host (no UI layer "
+                    "wired up)";
+                return Value::boolean(false);
+            }
+            // ⚠ 失败必须报错：静默返回 true 会让"我让它弹背包它没弹"
+            //   变成玄学（与 playSequence / showDialogue 同一条纪律）。
+            const bool ok = m_host.act.openUI(path);
+            if (!ok) {
+                m_err.line = line;
+                m_err.message =
+                    "openUI('" + path +
+                    "'): cannot load that UI document (see the UIDOC-OPEN "
+                    "log line for why)";
             }
             return Value::boolean(ok);
         }

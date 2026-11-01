@@ -193,6 +193,29 @@ struct RuntimeConfig {
     // 只测读、不测写，“存档丢了新字段”这种 bug 会一直躲着。回归脚本
     // `verify_runtime_scene.py` 用它做 读→写→再读 的闭环。
     std::string dumpScenePath;
+
+    // ---- 存档（G17-3）----
+    // 槽位名（`slot1..3` / `quick` / `auto`，大小写不敏感）。默认 `quick`：
+    // "按一下 F5 存到哪"和"`--slot` 不给时存到哪"该是同一个答案。
+    std::string saveSlot = "quick";
+    // 存档目录。**空 = 相对 CWD 的 `saves/`**（与 `config/` 同一个规矩：
+    // 引擎的用户状态都相对 CWD，不写死盘符）。验收脚本用
+    // `MYVK_RUNTIME_SAVE_DIR` 指到临时目录，互不干扰。
+    std::string saveDir;
+    // `--save`：**退出前**存一次。不是"启动就存" —— 启动那一刻世界刚加载，
+    // 存下来与关卡文件逐位相同，等于什么都没证明。跑几帧再存才看得出东西。
+    bool saveOnExit = false;
+    // `--load`：启动时读一次（世界 / 物理 / 玩家都建好之后）。
+    // `--scene` 没给时，先按存档里记的 `scenePath` 进那一关 ——
+    // "继续游戏"本来就该连关卡一起带回来。
+    bool loadOnStart = false;
+    // `--scene` 是否**显式**给过。
+    // ⚠ 不能用 `scenePath.empty()` 代替：`game.json` 里通常写着默认关卡，
+    //   于是 `scenePath` 永远不空 —— `--load` 就会去加载默认关卡，然后被
+    //   存档的结构指纹判成"不是同一个关卡"而拒读（`SAVE-DRIFT-REJECT`）。
+    //   症状看起来像"读档坏了"，其实是"进的不是那一关"。
+    bool sceneFromCli = false;
+
     // 键位绑定表路径（G06）。空 = 用相对资产根的默认 `input_map.json`。
     //
     // 与编辑器**同一份文件**：Preferences ▸ Bindings 写它，这里读它。

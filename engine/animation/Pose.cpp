@@ -58,12 +58,25 @@ void Pose::resize(int n) {
 void Pose::setRest(const assets::Skeleton& s) {
     const int n = s.jointCount();
     resize(n);
+    // P2（2026-10-31）：rest 分解结果缓存在 `Joint` 上（见 Skeleton.h 的
+    // `restT/restR/restS/restTRSReady`）。第一次采样实算一遍，之后全是拷贝。
+    //
+    // ⚠ 这里**必须**继续用上面那个 `decomposeTRS()`：A0-5 的验收是"重构前后
+    //   关节矩阵 memcmp 级相同"，换一条浮点路径就会红。缓存只是把**同一次**
+    //   计算的结果留下来复用，所以第一帧与第 N 帧逐位相同。
     for (int j = 0; j < n; ++j) {
-        const TRS t = decomposeTRS(s.joints[static_cast<size_t>(j)].restLocal);
+        assets::Skeleton::Joint& jt = s.restCache(j);
+        if (!jt.restTRSReady) {
+            const TRS t = decomposeTRS(jt.restLocal);
+            jt.restS = t.scale;
+            jt.restR = t.orient;
+            jt.restT = t.translation;
+            jt.restTRSReady = true;
+        }
         const size_t k = static_cast<size_t>(j);
-        scale[k] = t.scale;
-        rotation[k] = t.orient;
-        translation[k] = t.translation;
+        scale[k] = jt.restS;
+        rotation[k] = jt.restR;
+        translation[k] = jt.restT;
     }
 }
 

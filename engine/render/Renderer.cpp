@@ -293,6 +293,8 @@ void Renderer::bindFeatureParams() {
                       ParamKind::Float);
     render::bindParam("mb.samples", &m_cameraFx.motionBlurSamples,
                       ParamKind::Int);
+    render::bindParam("mb.position", &m_cameraFx.motionBlurShutterPosition,
+                      ParamKind::Float);
     render::bindParam("mb.simYaw", &m_mbSimYaw, ParamKind::Float);
 
     render::bindParam("chroma.enabled", &m_cameraFx.chromatic, ParamKind::Bool);
@@ -5837,6 +5839,45 @@ void Renderer::updateSkinning(scene::Scene& scene, bool resetOffset) {
     // 实例化两次时 `AssetManager` 返回同一个 `Model*`、同一批 `Mesh*`，
     // 第二个实体就会覆盖第一个 → 多个角色共享一份关节矩阵、全部显示同
     // 一个姿势。现在权威是 `SkinnedMeshComponent::jointBase`（逐实体）。
+    //
+    // ---- P3（2026-10-31）：先量总需求，再决定要不要扩 ----
+    //
+    // 以前是"边填边扩"：填到第 N 个角色时才发现容量不够，于是**当场**
+    // 重建 SSBO + 重写描述符 —— 那一帧就是一次卡顿尖刺（Vulkan 分配 +
+    // descriptor 写入 + 驱动重新绑定）。症状是"进出第 2 个角色时卡一下"，
+    // 而单角色测试**永远量不到**这个尖刺。
+    //
+    // 现在先把**本帧总共要用多少**加出来，一次扩到位并留 25% 余量。
+    // ⚠ 两遍 `each` 是安全的：中间没有任何东西改世界，而 `each` 扫的是
+    //   dense 数组（一次线性遍历），开销可以忽略。
+    // ⚠ 余量取 25% 而不是固定 +64：第三、第四个角色陆续进来时不该每来
+    //   一个就重建一次。
+    // ⚠ 扩容锚点 `ANIM-SKIN-CAP` 只在**真的长大**时打，判据是"多角色场景里
+    //   只出现 1 次" —— 出现 N 次就说明又退回"边填边扩"了。
+    const uint32_t capBase = m_skinJointOffset;
+    uint32_t capNeed = capBase;
+    scene.world().each<ecs::SkinnedMeshComponent>(
+        [&](ecs::Entity, ecs::SkinnedMeshComponent& sk) {
+            if (!sk.model || !sk.model->skeleton) return;
+            const int n = sk.model->skeleton->jointCount();
+            if (n > 0) capNeed += static_cast<uint32_t>(n);
+        });
+    if (capNeed > frame.jointCapacity) {
+        const uint32_t newCap = capNeed + capNeed / 4 + 64;
+        frame.jointMatrices = std::make_unique<rhi::Buffer>(
+            *m_device, newCap * sizeof(glm::mat4),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        frame.jointMapped = frame.jointMatrices->map();
+        const uint32_t prevCap = frame.jointCapacity;
+        frame.jointCapacity = newCap;
+        // 描述符要重写（buffer 换了）
+        writeGlobalDescriptors();
+        VK_LOG_INFO("ANIM-SKIN-CAP grow from=%u to=%u need=%u",
+                    prevCap, newCap, capNeed);
+    }
+
     uint32_t offset = m_skinJointOffset;
 
     scene.world().each<ecs::SkinnedMeshComponent>(
@@ -5857,20 +5898,19 @@ void Renderer::updateSkinning(scene::Scene& scene, bool resetOffset) {
                 animation::poseToJoints(skel, pose, sk.jointMatrices);
             }
 
-            // 容量不足则重建 buffer（稀有路径）
+            // 容量兜底：正常**走不到**（上面的 `capNeed` 已经把总量算进去了）。
+            // 真走到这里 = 两遍之间世界变了，或者 `capNeed` 漏算了一类实体。
+            // ⚠ 这里**必须**跳过这个实体而不是就地扩容：就地扩容会让我们
+            //   退回"边填边扩"，而且 `memcpy` 越界写会花屏 + 崩在别人的关节
+            //   矩阵上 —— 比少画一个角色难查一个数量级。
             if (offset + static_cast<uint32_t>(n) > frame.jointCapacity) {
-                const uint32_t newCap =
-                    std::max(frame.jointCapacity * 2,
-                             offset + static_cast<uint32_t>(n) + 64);
-                frame.jointMatrices = std::make_unique<rhi::Buffer>(
-                    *m_device, newCap * sizeof(glm::mat4),
-                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                frame.jointMapped = frame.jointMatrices->map();
-                frame.jointCapacity = newCap;
-                // 描述符要重写（buffer 换了）
-                writeGlobalDescriptors();
+                VK_LOG_WARN("ANIM-SKIN-OVERFLOW entity=%u offset=%u joints=%d "
+                            "cap=%u (skipped; capNeed was computed before "
+                            "the loop -- something changed the world in "
+                            "between)",
+                            static_cast<unsigned>(e.id), offset, n,
+                            frame.jointCapacity);
+                return;
             }
 
             std::memcpy(static_cast<glm::mat4*>(frame.jointMapped) + offset,

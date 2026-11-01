@@ -55,6 +55,7 @@ import os
 import re
 import subprocess
 import sys
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -152,7 +153,7 @@ def build_probes():
 def cleanup(paths):
     for p in paths:
         try:
-            os.remove(p)
+            safe_remove(p)
         except OSError:
             pass
 
@@ -176,7 +177,7 @@ def cleanup_sidecars():
                 "models/characters/animate_girl_rigged.glb.vmeta"):
         p = os.path.join(BIN, "assets", rel)
         try:
-            os.remove(p)
+            safe_remove(p)
         except OSError:
             pass
 

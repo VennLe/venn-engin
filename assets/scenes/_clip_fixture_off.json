@@ -1,0 +1,48 @@
+{
+  "_comment": "C5 否定测试夹具：与 _clip_fixture.json 逐字段相同，只有 autoplay=false。判据 tools/verify_transform_clip.py D 组 —— 一条 ANIMCLIP-TICK 都不许有（没在播就不许推进，更不许写 transform）。",
+  "version": 2,
+  "generator": "venn clip fixture (C5, autoplay off)",
+  "camera": {
+    "target": [0.0, 0.0, 1.0],
+    "yaw": 0.610865,
+    "pitch": 0.314159,
+    "distance": 16.0
+  },
+  "physics": {
+    "enabled": false,
+    "groundPlane": false,
+    "fixedTimeStep": 0.0166666675,
+    "maxSubSteps": 4
+  },
+  "entities": [
+    {
+      "name": "Lift",
+      "transform": {
+        "position": [0.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "animClip": {
+        "duration": 2.0,
+        "loop": true,
+        "autoplay": false,
+        "time": 0.0,
+        "keys": [
+          {
+            "t": 0.0,
+            "pos": [0.0, 0.0, 0.0],
+            "rot": [0.0, 0.0, 0.0],
+            "scale": [1.0, 1.0, 1.0]
+          },
+          {
+            "t": 2.0,
+            "pos": [0.0, 0.0, 4.0],
+            "rot": [0.0, 0.0, 0.0],
+            "scale": [1.0, 1.0, 1.0]
+          }
+        ]
+      }
+    }
+  ]
+}

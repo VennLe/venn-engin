@@ -298,6 +298,56 @@ def click_anchor(hwnd, tap, tag, timeout=15.0):
     return True
 
 
+def scroll_into_view(hwnd, tap, tag, win_tag, tries=14, step=120):
+    """把 `tag` 滚进 `win_tag` 的可视竖直范围，返回最终矩形（失败 None）。
+
+    ⚠⚠ 为什么必须有它：`logRect` **不判可见性**（只按坐标去重）。面板内容
+      比停靠后的窗口高时，滚出视野的控件**矩形照样会被打出来**，照着那个
+      坐标点 = 点在面板外面，而日志里一条错都没有。症状极具误导性：
+      "**第一行按钮能点、第二行开始全哑**"，断言只会报"没反应"
+      （`dyaw=0.00` / `n=0`），看着像产品 bug。2026-10-31 在运镜面板上
+      实测过：`CINE-VERB-PAN` y=844..874 在窗口内（能点），
+      `CINE-VERB-PAN-NEG` y=881..911 出界 5 px（点不动），
+      `CINE-BAKE` y=1037..1067 出界 150 px —— 滚动之后两者都能点。
+
+    返回 None 是"滚了 `tries` 次还没进视野"，此时**不要**硬点。
+    """
+    if not _user32.IsWindow(ctypes.c_void_p(hwnd)):
+        return None
+    wr = tap.last_rect(win_tag)
+    if not wr:
+        return None
+    cx = int((wr[0] + wr[2]) * 0.5)
+    cy = int((wr[1] + wr[3]) * 0.5)
+    sx, sy = client_to_screen(hwnd, cx, cy)
+    for _ in range(tries):
+        r = tap.last_rect(tag)
+        if r and r[1] >= wr[1] + 4 and r[3] <= wr[3] - 4:
+            return r
+        focus_window(hwnd)
+        _user32.SetCursorPos(int(sx), int(sy))
+        time.sleep(0.05)
+        # MOUSEEVENTF_WHEEL = 0x0800，负 delta = 向下滚
+        _user32.mouse_event(0x0800, 0, 0, -step, 0)
+        time.sleep(0.35)
+    return None
+
+
+def click_in_panel(hwnd, tap, tag, win_tag, tries=14, timeout=15.0):
+    """`scroll_into_view` + 点。返回 `(ok, rect)`。
+
+    面板类用例**一律用这个**，不要裸 `click_anchor` —— 裸调在"控件已经滚
+    出视野"时不会报错，只会静默地什么都没发生。
+    """
+    if not tap.wait_rect(tag, timeout=timeout):
+        return False, None
+    r = scroll_into_view(hwnd, tap, tag, win_tag, tries=tries)
+    if not r:
+        return False, None
+    click_rect(hwnd, r)
+    return True, r
+
+
 # ---------------------------------------------------------------- 键盘
 
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101

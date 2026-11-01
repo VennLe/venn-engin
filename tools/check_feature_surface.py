@@ -239,7 +239,8 @@ FEATURES = [
          ui=["dof."],
          env=["MYVK_DOF", "MYVK_DOF_FOCUS", "MYVK_DOF_APERTURE",
               "MYVK_DOF_RADIUS", "MYVK_MOTIONBLUR", "MYVK_MB_STRENGTH",
-              "MYVK_MB_SAMPLES", "MYVK_MB_SIM_YAW", "MYVK_CHROMA",
+              "MYVK_MB_SAMPLES", "MYVK_MB_POSITION", "MYVK_MB_SIM_YAW",
+              "MYVK_CHROMA",
               "MYVK_CHROMA_STRENGTH", "MYVK_VIGNETTE_STRENGTH",
               "MYVK_VIGNETTE_POWER", "MYVK_VIGNETTE_OFF"],
          test="verify_camfx", gpu="post"),
@@ -472,6 +473,24 @@ ALLOW_EXACT = {
     #      "有没有先加过一个玩家"无关，脚本不该为开个窗口去点菜单。
     #      （2026-10-29 补登记：这是 R8 / Pose Mode 留下的欠账，D 组一直红着。）
     "MYVK_CHARACTER_WINDOW",
+    # ① 2026-10-31 补：又是三条"只存在于自检 / 日志 / 注入"的变量。
+    #    和上一批同一个理由 —— D 组红着的时候，"新特性有没有 UI 面"这件事
+    #    就没人查了。
+    #    · `MYVK_ANIMCLIP_LOG=1` —— `TransformClip` 的逐帧日志探针，只打
+    #      日志不改行为（`docs/script_api.md` 里那组 `CLIP-SAMPLE` 断言靠它）。
+    #    · `MYVK_CAMERA_TEST=1` —— 运镜自检的**无窗口无 Vulkan** 入口
+    #      （`--selftest cameramove` 的 env 形态），与 `MYVK_ANIM_TEST` 同类。
+    #      用户面对的运镜开关是 Cinematography 面板与时间轴第三轨。
+    #    · `MYVK_DLG_VOICE_FAKE=<秒>` —— 对话语音时长的**伪造注入**。正式
+    #      入口是对话资产的 `voice` 字段；没有它就没法在没有音频设备的 CI
+    #      上测"语音播完 → 自动推进"那条分支（同 `MYVK_DLG_AUTO`）。
+    "MYVK_ANIMCLIP_LOG", "MYVK_CAMERA_TEST", "MYVK_DLG_VOICE_FAKE",
+    # ② 2026-11-01（B6 表情）：`MYVK_EXPR_LOG=1` —— 自动眨眼的逐次日志探针
+    #    （`EXPR-BLINK name=... count=...`）。它**只打日志、不改行为**，默认
+    #    关（一个静态 bool，零开销）。没有它就测不了"自动眨眼真的在发生"：
+    #    `EXPR-STATE` 只在手动敲命令时打一条，而眨眼是每 4 秒一次的背景行为。
+    #    用户面对的开关是 Inspector 的 Blink 复选框与间隔（`INS-EXPR-BLINK`）。
+    "MYVK_EXPR_LOG",
 }
 # ③ 诊断 dump（`*_DBG`）。`*_DUMP` 同义：只打日志、不改行为，
 #    与 `MYVK_PHYS_DUMP=<N>`（每 N 帧一行 `PHYS-BODY`）是同一类。

@@ -51,6 +51,8 @@
 #include "GameLoop.h"
 
 #include "ecs/GuidSelfTest.h"
+#include "animation/TransformClip.h"   // C5 自检（--selftest transformclip）
+#include "animation/ExpressionDriver.h" // B6 自检（--selftest expression）
 #include "physics/CharacterController.h"
 #include "physics/ContactEvents.h"
 #include "physics/PhysicsWorld.h"
@@ -559,6 +561,17 @@ int main(int argc, char** argv) {
         // （有选项时 advance 必须原地不动、越界选择不改状态、结束即撒手）。
         if (cfg.selftest == "dialogue")
             return dialogue::runDialogueSelfTest() == 0 ? 0 : 1;
+        // C5：实体 TRS 轨道的运行时消费者（2026-10-31）。
+        // 五组：采样（含"必须是 smoothstep 不是线性"）/ 推进（loop 的 fmod 与
+        // duration=0 的兜底）/ **没推进就不许写 transform** / 进入时的状态
+        // 同步 / 与编辑器同一套插值。纯数值，无窗口。
+        if (cfg.selftest == "transformclip")
+            return anim::runTransformClipSelfTest() == 0 ? 0 : 1;
+        // B6 表情预设 + 眨眼/口型（2026-11-01）：解析/往返/rig 适配/驱动。
+        // 全部是纯数值 + 一个空 Scene，不需要窗口或设备。核心是 E 组：
+        // **驱动只许写自己拥有的通道**（否则推滑条下一帧就被抹掉）。
+        if (cfg.selftest == "expression")
+            return anim::runExpressionSelfTest() == 0 ? 0 : 1;
         // G16-5 序列化器三段拆分：parse（纯 CPU）/ instantiate（纯 CPU）/
         // resolve（唯一要 AssetManager）。验收就是**这两段能在没有设备时跑完**，
         // 以及"三段加起来 == 原来那个一把梭的 sceneFromJson"。

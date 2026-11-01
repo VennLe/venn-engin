@@ -52,6 +52,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from capture_window import find_window, user32                        # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors               # noqa: E402
 
@@ -195,7 +196,7 @@ def main():
     print("-- B 编辑器（Editor.exe）")
     prefs = os.path.join(TMP_DIR, "b1_none.json")
     if os.path.exists(prefs):
-        os.remove(prefs)
+        safe_remove(prefs)
     m, _ = run_logged(editor, [],
                       {"MYVK_NO_WINDOW_SAVE": "1",
                        "MYVK_EDITOR_PREFS_PATH": prefs},
@@ -214,7 +215,7 @@ def main():
     layout = os.path.join(TMP_DIR, "b2_none.layout.json")
     for p in (prefs, layout):
         if os.path.exists(p):
-            os.remove(p)
+            safe_remove(p)
     m, _ = run_logged(editor, [],
                       {"MYVK_EDITOR_PREFS_PATH": prefs,
                        "MYVK_EDITOR_LAYOUT": layout},
@@ -258,7 +259,7 @@ def main():
     # B4 验收钩子仍然最高
     prefs = os.path.join(TMP_DIR, "b4_none.json")
     if os.path.exists(prefs):
-        os.remove(prefs)
+        safe_remove(prefs)
     m, _ = run_logged(editor, [],
                       {"MYVK_NO_WINDOW_SAVE": "1",
                        "MYVK_EDITOR_LANG": "zh",

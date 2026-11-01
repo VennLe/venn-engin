@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "name": "alicia_demo",
+  "_comment": "Alicia 的 blend shape 在 FBX 里叫 target_N（49 个唯一名），所以这里只能用 target_N。换成美术改过名的角色时，把 channel 名换成语义名即可，格式不变。",
+  "presets": [
+    {
+      "name": "calm",
+      "label": "平静",
+      "weights": {
+        "target_0": 0.15,
+        "target_1": 0.10
+      }
+    },
+    {
+      "name": "smile",
+      "label": "微笑",
+      "weights": {
+        "target_0": 0.60,
+        "target_1": 0.45,
+        "target_2": 0.25
+      }
+    },
+    {
+      "name": "surprise",
+      "label": "惊讶",
+      "weights": {
+        "target_2": 0.85,
+        "target_3": 0.70,
+        "target_4": 0.55
+      }
+    }
+  ]
+}

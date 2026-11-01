@@ -241,6 +241,33 @@ void EditorContext::applyEditorCameraMode() {
     cam.setClipPlanes(0.1f, 5000.0f);
 }
 
+// ------------------------------------------------------- 视口"以选中相机预览"
+//
+// 只存状态 + 打一条锚点。真正的"把机位写进相机"在 `EditorApp` 里做 ——
+// 那里才拿得到 renderer（景深 / 快门要写进 `CameraEffectSettings`），
+// 而 EditorContext 与渲染层之间没有依赖。
+//
+// ⚠ 锚点必须打"实际生效的那台"（名字 + guid），不是"你想要的那台"：
+//   自动化要断言的正是"点的是这一行，锁的是这一台"。
+void EditorContext::previewCamera(ecs::Entity e) {
+    const std::uint64_t g = e.valid() ? m_editorScene.world().guid(e) : 0;
+    if (g == m_previewCamGuid) return;          // 幂等：重复设同一台不刷日志
+
+    const std::string* nm = e.valid() ? m_editorScene.world().name(e) : nullptr;
+    m_previewCamGuid = g;
+    if (g == 0) {
+        VK_LOG_INFO("CINE-PREVIEW on=0 (free camera)");
+        setStatus(TR("Camera preview off"));
+        return;
+    }
+    VK_LOG_INFO("CINE-PREVIEW on=1 guid=%016llx name=%s",
+                static_cast<unsigned long long>(g),
+                nm ? nm->c_str() : "<unnamed>");
+    setStatus(TR("Looking through: ") + (nm ? *nm : std::string("<unnamed>")));
+}
+
+void EditorContext::clearPreviewCamera() { previewCamera(ecs::Entity{}); }
+
 // 编辑模式切换。**只存状态 + 打日志**：
 //   · 面板跟模式走由 EditorApp 每帧按差做（它才拿得到面板表 / 焦点）；
 //   · 视口的笔刷输入由 ViewportPanel 读本状态；

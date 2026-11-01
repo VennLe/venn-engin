@@ -1,0 +1,36 @@
+{
+  "_comment": "D1 否定测试夹具：老资产（ch01_open_01.dlg.json）**没有 voice 字段**。配 MYVK_DLG_VOICE_FAKE=999（钩子恒为「在播」）时，一条 DLG-PRESS waiting-voice 都不许出现 —— 否则就是「不管有没有语音都挡」，那会让所有老对话每句白等 3 秒。判据见 tools/verify_dialogue_voice.py C 组。",
+  "version": 2,
+  "generator": "venn dialogue voice fixture (D1, negative)",
+  "camera": {
+    "target": [0.0, 0.0, 1.0],
+    "yaw": 0.610865,
+    "pitch": 0.314159,
+    "distance": 6.0
+  },
+  "physics": {
+    "enabled": false,
+    "groundPlane": false,
+    "fixedTimeStep": 0.0166666675,
+    "maxSubSteps": 4
+  },
+  "entities": [
+    {
+      "name": "NPC",
+      "transform": {
+        "position": [0.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "dialogue": {
+        "path": "dialogues/ch01_open_01.dlg.json",
+        "enabled": true,
+        "autoStart": true,
+        "cps": 120.0,
+        "startNode": "",
+        "priority": 0
+      }
+    }
+  ]
+}

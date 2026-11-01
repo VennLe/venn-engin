@@ -45,6 +45,7 @@
 //                     setHealth damage popup      # HUD（U8）
 //                     playSequence showDialogue playAnim   # 演出（C6）
 //                     spawn setFlag getFlag loadScene      # 世界（C6 第二批）
+//                     openUI                              # 界面（C6 第七件）
 //                     print
 //
 //   数值一律是 double；角度（rotate）单位是**度**。
@@ -204,6 +205,16 @@ struct ScriptWorldActions {
     //   而不是等到下一帧黑屏。
     std::function<bool(const std::string&)> loadScene;
     std::function<ecs::Entity(const std::string&, glm::vec3)> spawn;
+
+    // `openUI(path)` → 掀一块界面（C6 第七件，2026-10-31）。
+    //   路径相对 assets/（`"ui/docs/inventory.ui.json"`）。**空串 = 关掉**
+    //   当前那块。
+    // ⚠ 语义是"切显示哪份文档"，不是"造控件"：控件在 `.ui.json` 里。
+    //   脚本管的是**演到哪一页**（导演的职责），逐控件改属性是 `setColor`
+    //   那一族的事。
+    // ⚠ 返回 false 时宿主**必须保住当前那块**（不许先清空再尝试加载）——
+    //   "路径写错"的表现该是"界面没变"，不是"屏幕忽然空了而且报错"。
+    std::function<bool(const std::string&)> openUI;
 
     // 剧情旗标（见 `runtime/GameFlags.h` 的头注释）。
     // 存在宿主那边，engine 只认这两次调用 —— 于是"旗标怎么存、进不进

@@ -96,6 +96,7 @@ class CurveEditorPanel;       // 2026-10-28（R6）：曲线编辑器（Graph Ed
 class DopeSheetWindow;        // 2026-10-28（R8）：动画摄影表（Dope Sheet）
 class BoneCurvePanel;         // 2026-10-29（S-D）：骨骼曲线编辑器
 class NlaPanel;               // 2026-10-29（R9）：NLA 时间轴
+class SaveSlotsPanel;         // 2026-10-31（G17-3 尾巴）：存档槽位面板
 class LandscapeEditor;        // 2026-10-20：地形编辑模式
 class FoliageEditor;          // 2026-10-20：植被编辑模式
 // 2026-10-20 晚：下拉里其余 6 个模式（ToolkitEditors.h / .cpp）
@@ -244,6 +245,8 @@ private:
     static void panelDrawBoneCurve(EditorApp& a);
     // NLA 时间轴（R9）：同样同构，真正的 draw 在 drawNlaWindow。
     static void panelDrawNla(EditorApp& a);
+    // 存档槽位（G17-3 尾巴）：同构，draw 在 SaveSlotsPanel 里。
+    static void panelDrawSaveSlots(EditorApp& a);
 
     // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
     void drawPanels();
@@ -276,6 +279,15 @@ private:
     // 把编辑场景立刻落盘到当前场景路径（Ctrl+S 与 Content 工具栏的
     // "Save All" 共用这一条路径 —— 两处各写一遍必然漂移）
     void saveSceneNow();
+    // H2（2026-10-31）：崩溃 / 断电自动保存。见 .cpp 里的取舍说明。
+    // ⚠ 它**不**覆盖用户的场景文件，只写同目录的 `.autosave.json`。
+    void tickAutoSave(float dt);
+    void detectStaleAutoSave();
+    // 视口"以选中相机预览"（Cinematography ▸ Look through）。
+    // 每帧把 `EditorContext::previewCameraGuid()` 指的相机装到视口相机上，
+    // 并把它的景深 / 快门写进渲染设置。退出预览时**恢复**进入前的渲染设置。
+    // 见 .cpp 里的"为什么必须恢复"。
+    void applyPreviewCamera();
     // 把编辑态场景引用到的脚本全部加载 + 编译一遍（只为在面板上暴露错误；
     // 真正执行它们的地方在下面的 runScriptsOn）
     void preloadScripts();
@@ -575,6 +587,8 @@ private:
     std::unique_ptr<PhysicsPanel> m_physicsPanel;
     std::unique_ptr<ParticlesPanel> m_particlesPanel;
     std::unique_ptr<QualitySettingsPanel> m_qualityPanel;   // E26
+    // 2026-10-31（G17-3 尾巴）：存档槽位面板。只拿 EditorContext。
+    std::unique_ptr<SaveSlotsPanel> m_saveSlotsPanel;
     // 2026-10-30：运镜面板。只拿 EditorContext（与 PhysicsPanel 同一条纪律）。
     std::unique_ptr<CinematographyPanel> m_cinePanel;
     // 2026-10-24：材质仓库面板。它要能"把材质设成地形笔刷"，
@@ -665,6 +679,12 @@ private:
     // 现在改成"进非运行态丢一次，然后按**编辑场景**同步一张 Idle 表"：
     // 面板在编辑态就有东西可看，按下 Play 才真正执行（S-D10）。
     bool m_scriptTableDropped = false;
+    // C5：实体 TRS 轨道的"本段 Play 已经对齐过播放状态"标记。
+    // ⚠ 不能用 `m_runtimeFrames == 0` 代替：那个计数在 **Pause 时也会归零**
+    //   （else 分支无条件清），于是"暂停 → 恢复"会被当成新的一段 Play，
+    //   机关的播放头被重置回 0 —— 表现是"暂停一下，电梯回到一楼"。
+    //   这里的判据是 `usingRuntime()` 的下降沿（真正 Stop 才清）。
+    bool m_clipPlaySynced = false;
     // 工程的起始场景（`venn.project.json` 的 `startScene`，资产相对路径）。
     //
     // 启动器 M1/D7：`MYVK_EDITOR_PROJECT` 只告诉我们"打开哪个工程"，工程里
@@ -746,6 +766,27 @@ private:
     // Dilation）。默认 1.0 —— 不碰它时逐帧行为与本功能引入前完全一致。
     float m_timeScale = 1.0f;
 
+    // ---- 视口"以选中相机预览"：进入前的那份镜头效果 ----
+    //
+    // ⚠⚠ **必须存一份并还原**。预览会往全局 `CameraEffectSettings` 里写
+    //   景深 / 快门，而那是渲染器**唯一**的一份设置：不复原的话，退出预览
+    //   之后编辑器视口会永远带着那台相机的浅景深 —— 用户的感受是"关掉预览
+    //   之后整个编辑器变模糊了"，且重启才恢复（因为设置还可能被落盘）。
+    //   只存**自己写过的**那六个字段，别的（色差 / 暗角 / 体积）一律不碰：
+    //   顺手清掉会让"退出预览 = 画面回暖"变成一个谜。
+    struct PreviewFxSaved {
+        bool valid = false;
+        bool dof = false;
+        float dofFocus = 6.0f;
+        float dofAperture = 1.2f;
+        bool motionBlur = false;
+        float motionBlurStrength = 1.0f;
+        float shutterPosition = 0.0f;
+    };
+    PreviewFxSaved m_previewFx;
+    // 镜头效果日志的签名（只在变化时打一条，与 RuntimeApp 的 `CAM-LENS` 同规矩）
+    std::string m_previewLensSig;
+
     // ---- E05：自动化用"按帧切工作区"序列 ----
     // MYVK_EDITOR_WORKSPACE 只能定"启动时是哪一套"；而 E05 的验收要求
     // "切过去 → 断言 → 切回来 → 复原"，那就得在**同一个会话内**切两次。
@@ -765,6 +806,17 @@ private:
 
     // 已经同步给 GLFW 窗口的全屏状态（边沿检测用，见 syncWindowFullscreen）
     bool m_appliedWindowFullscreen = false;
+
+    // ---- H2 自动保存（2026-10-31）----
+    // `m_autoSaveSec` 从 `MYVK_EDITOR_AUTOSAVE_SEC` 读，**0 = 关**。
+    // 默认 120 秒：比"一次想事情的停顿"长，比"一下午的编辑"短得多。
+    float m_autoSaveSec = 120.0f;
+    float m_autoSaveAccum = 0.0f;
+    // `MYVK_EDITOR_AUTOSAVE_FORCE=1`：无视 `dirty()` 强制写。
+    // ⚠ 这是**只为自动化存在的假钩子**（与 `MYVK_DLG_VOICE_FAKE` 同一条思路）：
+    //   无人值守的回归没法"真的去改一下场景"，而不判脏的话自动保存这条
+    //   路径就永远走不到 —— "接错了"测不出来。
+    bool m_autoSaveForce = false;
 };
 
 } // namespace editor

@@ -54,6 +54,7 @@ import re
 import shutil
 import subprocess
 import sys
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "build", "bin")
@@ -121,7 +122,7 @@ def case_cook(name, src, out_path, want_clips, want_dup):
     """烤一份，返回 (summary, clips, dup_lines, full_out)"""
     os.makedirs(WORK, exist_ok=True)
     if os.path.isfile(out_path):
-        os.remove(out_path)
+        safe_remove(out_path)
     code, out = run([ASSETC, src, "--asset-root", ASSETS, "-o", out_path])
     d = dups(out)
     check("%s AssetC 退出码 0" % name, code == 0, "rc=%d" % code)
@@ -209,7 +210,7 @@ def main():
     print("\n== C 运行时 FbxLoader（只放 .fbx，强制走回退路径）==")
     root = os.path.join(WORK, "root")
     if os.path.isdir(root):
-        shutil.rmtree(root, ignore_errors=True)
+        safe_rmtree(root)
     os.makedirs(os.path.join(root, "scenes"))
     # ⚠ `models/` 这一层必须显式建出来 —— 只建 `root/` 的话下面那行
     #   copyfile 直接 FileNotFoundError，整条用例在 C 组开头就崩

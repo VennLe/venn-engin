@@ -31,6 +31,7 @@ import re
 import struct
 import subprocess
 import sys
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS = os.path.join(ROOT, "assets")
@@ -458,7 +459,7 @@ def main():
     probe = os.path.join(WORK, "probe")
     if os.path.isdir(probe):
         import shutil
-        shutil.rmtree(probe)
+        safe_rmtree(probe)
     root = os.path.join(probe, "root")
     os.makedirs(os.path.join(root, "scenes"))
     ents = []

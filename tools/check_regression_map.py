@@ -12,6 +12,8 @@
   D. **死映射**：`TRIGGERS` 里写了不存在、且不带通配的文件路径
   E. **全横切登记**：某用例的 globs 全落在 `GLOBAL_GLOBS` 里 → 等于没登记，
      应移出 `TRIGGERS`（否则 `--narrow` 下会假跳过）
+  F. `RENDER_MODULES` 完整性（engine/render 下每个文件都得有人认领）
+  G. **报告契约**：每个 `DEFAULT` 脚本都得能打出闸门认得的收尾行
 
 用法：python tools/check_regression_map.py
 """
@@ -295,7 +297,12 @@ run("editor/EditorContext.cpp → 选择集（多选）", OLD,
           # 而且三个选择入口都要顺手取消拾取 —— 取消漏一处，表现是
           # "点了别的物体之后拾取还挂着，下一次点视口把锚点写到新物体上"。
           # verify_joints 的 G 组断的就是这条链路。
-          "verify_joints"})
+          "verify_joints",
+          # 2026-10-31（#150 尾巴）：视口"以选中相机预览"的状态本体
+          # （`m_previewCamGuid` + `previewCamera()` 的 CINE-PREVIEW 锚点）也在
+          # 这个文件里。它不改选中集，但改的是"视口拿哪台相机的机位"——
+          # 那条用例必须跟着重跑。
+          "verify_camera_preview"})
 # 2026-10-27（#316）：批量数学（`editor/MultiEditMath.h`）—— 一个**纯函数**头，
 # 只被 GizmoController 与 InspectorPanel 两处共用，所以 owner 应该**只有**
 # verify_multiselect（外加扫字面量的 i18n 覆盖面）。
@@ -399,18 +406,26 @@ run("engine/sequence/SequenceAsset.cpp → 过场时间轴 × 轨道编辑器", 
 # ⚠ 2026-10-26（C6 第三步）起是**两条**：`verify_dialogue_editor` 的页签懒加载
 #   走的也是 `DialogueAsset::load`，解析口径一变 `INS-DLG-ASSET` 那行的
 #   行数/选项数就变。哪天有人把编辑期那条摘掉，这条会红 —— 那是它在工作。
+# 2026-10-31（D1）起是**三条**：`verify_dialogue_voice` 也整目录挂在
+# `engine/dialogue/**` 上。它验的是"正文出完后语音没播完不许翻页"，而那条门
+# 就写在 `DialoguePlayer::pressAdvance` 里、由 `DialogueSystem` 转发钩子 ——
+# 调度层一动，`WaitingVoice` 那条路就得重跑。
 run("engine/dialogue/DialogueSystem.cpp → 对话 × 对话页签", OLD,
     with_change("engine/dialogue/DialogueSystem.cpp"),
-    want={"verify_dialogue", "verify_dialogue_editor"})
+    want={"verify_dialogue", "verify_dialogue_editor", "verify_dialogue_voice"})
 # 2026-10-27（#310）：剧本编辑器的**写回**（`toJson` / `saveDialogue`）。
 # 期望恰好三条 —— 这一层现在被三张网兜着：
 #   · `verify_dialogue`        解析口径（存出来的东西必须还能被它读回）
 #   · `verify_dialogue_editor` Inspector 页签那一行 `INS-DLG-ASSET`（行数/选项数）
 #   · `verify_dialogue_script` 编辑器面板自己（B/D 两组直接比对落盘 JSON）
 # 哪天有人把 `engine/dialogue/**` 从某条名下摘掉，这条会红 —— 那是它在工作。
+# 2026-10-31（D1）起是**四条**：`DlgNode::voice` 的解析与写回就在这个文件里，
+# 而 `verify_dialogue_voice` 的 A 组直接钉 `rt_voice_kept` /
+# `rt_voice_omits_empty`（老资产不许长出 `"voice": ""`）。
 run("engine/dialogue/DialogueAsset.cpp → 对话 × 两个编辑器入口", OLD,
     with_change("engine/dialogue/DialogueAsset.cpp"),
-    want={"verify_dialogue", "verify_dialogue_editor", "verify_dialogue_script"})
+    want={"verify_dialogue", "verify_dialogue_editor", "verify_dialogue_script",
+          "verify_dialogue_voice"})
 # 2026-10-27（#310）：剧本编辑器面板本体。
 # 期望两条：除了自己那条，还有 verify_i18n_coverage —— 它扫描 `editor/*.cpp`
 # 里的界面字面量，而新面板一口气加了 40 条 TR 词条（缺了就是"面板一半英文"）。
@@ -807,6 +822,32 @@ missing = [g for g in rr.RENDER_MODULES if g not in leakgate]
 if missing:
     print("  ⚠ 泄漏门没挂上这些模块：%s" % missing)
     fails.append("泄漏门漏挂模块")
+
+print("\n[G] 报告契约"
+      "（每个脚本都得能打出 `OK_RE` 认得的收尾行，否则全绿也判红）")
+# ⚠⚠ 这一段的由来：2026-10-31 全量回归 42 红里有一整类叫"报告契约不完整" ——
+#   脚本自己 13 条断言全过，却只打 `=== N/M PASS ===` / `全部通过。` /
+#   `==== 17 passed, 0 failed ====`，`OK_RE` 一条都扫不到 → `mark=FAIL`。
+#   从外面看和"真红"一模一样，历史上耗过很多次排查时间。
+#
+# ⚠ 判据故意用**字面量包含**而不是正则：本机 `bash heredoc` 会把正则里的
+#   反斜杠吃掉（`\s` -> `/s`），第一版扫描因此报了 39~45 个假的"缺收尾"。
+#   字面量没有这个风险，而它已经足够区分真伪：
+#   正规脚本源码里必然出现 `结果` 或 `RESULT` 前缀，或者走 `kit.finish(`
+#   （它内部负责打 `结果: PASS`）；缺的只有 `N/M PASS` / `全部通过。` 这类。
+CONTRACT_MARKERS = ("结果", "RESULT", "全部断言 PASS", "全部 PASS", "kit.finish(")
+no_contract = []
+for n in rr.DEFAULT:
+    p = os.path.join(TOOLS, n + ".py")
+    if not os.path.exists(p):
+        continue          # [C] 已经报过"脚本不存在"，别重复计
+    with open(p, "r", encoding="utf-8", errors="replace") as fh:
+        src = fh.read()
+    if not any(k in src for k in CONTRACT_MARKERS):
+        no_contract.append(n)
+print("  缺收尾行的用例：%s" % (", ".join(no_contract) or "（无）"))
+if no_contract:
+    fails.append("报告契约: " + ", ".join(no_contract))
 
 print("\n结果: %s" % ("PASS" if not fails else "FAIL: " + ", ".join(fails)))
 sys.exit(1 if fails else 0)

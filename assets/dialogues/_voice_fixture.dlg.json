@@ -1,0 +1,19 @@
+{
+  "name": "voice_fixture",
+  "start": "v1",
+  "_comment": "D1 语音挡翻页的夹具。v1 有 voice（20 个码点 → 超时上限 max(3, 20*0.35) = 7.00 s），v2 没有 voice（不许被挡）。逐字段改一个就会让 verify_dialogue_voice 的期望失效。",
+  "lines": [
+    {
+      "id": "v1",
+      "speaker": "测试",
+      "text": "这一句有语音，而且句子挺长的，二十个字。",
+      "voice": "audio/silence.wav",
+      "next": "v2"
+    },
+    {
+      "id": "v2",
+      "speaker": "测试",
+      "text": "这一句没有语音。"
+    }
+  ]
+}

@@ -30,6 +30,7 @@ import shutil
 import struct
 import subprocess
 import sys
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS = os.path.join(ROOT, "assets")
@@ -169,7 +170,7 @@ def prepare_runtime_root() -> str:
       这种"判据还在，被测对象换了"的失败最难发现，所以这里显式钉死。
     """
     if os.path.isdir(WORK):
-        shutil.rmtree(WORK)
+        safe_rmtree(WORK)
     root = os.path.join(WORK, "root")
     os.makedirs(os.path.join(root, "scenes"))
     ents = []

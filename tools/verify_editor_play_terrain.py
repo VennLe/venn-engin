@@ -45,6 +45,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from capture_window import find_window, user32                       # noqa: E402
 from verify_add_menu import (LogTap as _BaseLogTap, click,
                              kill_stale_editors, open_menu_and_click,
@@ -274,13 +275,22 @@ def main():
                     proc.kill()
         if not args.keep:
             try:
-                os.remove(SCENE_PATH)
+                safe_remove(SCENE_PATH)
             except OSError:
                 pass
 
     passed = sum(1 for r in results if r)
     print("\n%d/%d PASS" % (passed, len(results)))
-    return 0 if passed == len(results) else 1
+    # ⚠ 回归闸门只认 `结果: PASS` / `结果: FAIL: ...`（ASCII 冒号）。
+    #   只打 `N/M PASS` 会让**全绿**被判成红（`run_regression.OK_RE` 扫不到
+    #   → mark=FAIL，还会附一句"报告契约不完整，不是断言的错"）。
+    #   这条用例是 P7"编辑器进 Play 不崩"的唯一守门人，误判红的代价是每次
+    #   全量都要人工回忆它是不是又是假的。
+    if passed == len(results):
+        print("结果: PASS")
+        return 0
+    print("结果: FAIL: %d 项未通过" % (len(results) - passed))
+    return 1
 
 
 if __name__ == "__main__":

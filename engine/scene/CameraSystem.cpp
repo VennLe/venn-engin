@@ -25,10 +25,9 @@ float lerpAngle(float a, float b, float t) {
     return a + d * t;
 }
 
-float smoothStep(float t) {
-    t = std::clamp(t, 0.0f, 1.0f);
-    return t * t * (3.0f - 2.0f * t);
-}
+// ⚠ smoothstep 已搬到 `scene/BlendCurve.cpp`（`BlendCurve::Smooth` 就是原来
+//   那条 `t*t*(3-2t)`，逐位一致）。留在这里会变成"两份平滑曲线"，下次改
+//   其中一个就出现"预览图和实际画面不一样"——正是这次要消灭的那类问题。
 
 CameraPose lerpPose(const CameraPose& a, const CameraPose& b, float t) {
     CameraPose p;
@@ -49,6 +48,37 @@ CameraPose lerpPose(const CameraPose& a, const CameraPose& b, float t) {
 float shakeNoise(float t, float freq, float phase) {
     return std::sin(t * freq * 6.28318531f + phase) * 0.6f +
            std::sin(t * freq * 2.37f * 6.28318531f + phase * 1.7f) * 0.4f;
+}
+
+// ---------------------------------------------------------------- 世界 → 机位
+//
+// **反解公式只写这一处**。`poseFromEntity`（运行时）与 `applyCameraEntityTo`
+// （编辑器视口预览）都从世界矩阵出发，只要有一边把符号写反，症状就是
+// "编辑器里预览的机位和进 Play 差一点点/差一个方向"，而两边各自看起来都
+// 自洽 —— 这种偏差没有任何日志能看出来，只能靠"只有一份实现"来保证。
+//
+// 约定（与 `Camera::angleDir` 互为逆运算）：
+//   实体局部 **+X** = 视线方向；
+//   forward = -angleDir = (-cp·cos(yaw), +cp·sin(yaw), -sin(pitch))
+//   ⇒ pitch = asin(-fwd.z)，yaw = atan2(fwd.y, -fwd.x)
+void poseFromWorld(const glm::mat4& w, CameraPose& p) {
+    p.position = glm::vec3(w[3]);
+    const glm::vec3 fwd = glm::normalize(glm::vec3(w[0]));
+    p.yaw = std::atan2(fwd.y, -fwd.x);
+    p.pitch = std::asin(std::clamp(-fwd.z, -1.0f, 1.0f));
+
+    // roll 从**实体自己的 up（局部 +Z）**读回来。
+    // ⚠ 不读这一条，`cameraEulerFor` 写出去的 roll 会在下一次反解里被悄悄
+    //   抹平 —— 表现是"实体在场景树里看着是歪的，一进 Play 就正了"，
+    //   而且只在有滚转的镜头上出现。
+    //   poseUp = u·cos(r) + right·sin(r) ⇒ r = atan2(dot(up,right), dot(up,u))。
+    const glm::vec3 up = glm::normalize(glm::vec3(w[2]));
+    const glm::vec3 r0 = poseRight(p);
+    const glm::vec3 u0 = poseUp(p);   // roll 还是 0，就是 tilt 之后的 up
+    if (std::fabs(glm::dot(up, r0)) > 1.0e-5f ||
+        std::fabs(glm::dot(up, u0)) > 1.0e-5f) {
+        p.roll = std::atan2(glm::dot(up, r0), glm::dot(up, u0));
+    }
 }
 
 } // namespace
@@ -148,16 +178,18 @@ void CameraSystem::setDirectorCamera(std::uint64_t guid) {
 
 void CameraSystem::clearDirectorCamera() { setDirectorCamera(0); }
 
-void CameraSystem::blendCut(float seconds) {
+void CameraSystem::blendCut(float seconds, BlendCurve curve) {
     m_blendFrom = m_applied;   // 起点 = 这一帧画面上真实的姿态（含上一次混合）
     m_blendDur = std::max(seconds, 0.0f);
     m_blendT = 0.0f;
     m_blendActive = m_blendDur > 1.0e-4f;
-    m_blendSmooth = true;
+    m_blendCurve = curve;
     // ⚠ **不**碰 m_desired / m_hasDesired：目标要每帧现算（见 .h 里那一段）。
     if (m_blendActive) {
-        VK_LOG_INFO("CAM-CUT blend dur=%.2fs from=(%.2f,%.2f,%.2f)",
-                    static_cast<double>(m_blendDur),
+        // 曲线名也打出来：`blend=0.60 curve=easeout` 与 `curve=smooth` 在
+        // 日志里长得一样的话，"我明明改成 easeout 了"就没法从日志反驳。
+        VK_LOG_INFO("CAM-CUT blend dur=%.2fs curve=%s from=(%.2f,%.2f,%.2f)",
+                    static_cast<double>(m_blendDur), blendCurveName(m_blendCurve),
                     static_cast<double>(m_blendFrom.position.x),
                     static_cast<double>(m_blendFrom.position.y),
                     static_cast<double>(m_blendFrom.position.z));
@@ -166,26 +198,7 @@ void CameraSystem::blendCut(float seconds) {
 
 CameraPose CameraSystem::poseFromEntity(Scene& scene, ecs::Entity e) const {
     CameraPose p;
-    const glm::mat4 w = scene.worldMatrix(e);
-    p.position = glm::vec3(w[3]);
-    const glm::vec3 fwd = glm::normalize(glm::vec3(w[0]));  // 实体局部 +X = 视线
-    p.yaw = std::atan2(fwd.y, -fwd.x);
-    p.pitch = std::asin(std::clamp(-fwd.z, -1.0f, 1.0f));
-
-    // roll 从**实体自己的 up（局部 +Z）**读回来。
-    // ⚠ 不读这一条，`cameraEulerFor` 写出去的 roll 会在下一次 `poseFromEntity`
-    //   里被悄悄抹平 —— 表现是"实体在场景树里看着是歪的，一进 Play 就正了"，
-    //   而且只在有滚转的镜头上出现。
-    //   poseUp = u·cos(r) + right·sin(r) ⇒ r = atan2(dot(up,right), dot(up,u))。
-    {
-        const glm::vec3 up = glm::normalize(glm::vec3(w[2]));
-        const glm::vec3 r0 = poseRight(p);
-        const glm::vec3 u0 = poseUp(p);   // roll 还是 0，就是 tilt 之后的 up
-        if (std::fabs(glm::dot(up, r0)) > 1.0e-5f ||
-            std::fabs(glm::dot(up, u0)) > 1.0e-5f) {
-            p.roll = std::atan2(glm::dot(up, r0), glm::dot(up, u0));
-        }
-    }
+    poseFromWorld(scene.worldMatrix(e), p);
     if (const auto* cc = scene.world().get<ecs::CameraComponent>(e)) {
         // 焦距优先：装了定焦镜头（focal > 0）就以镜头为准，fov 只是它算出来的
         // 结果。⚠ 这里与 `apply` 里那次换算**必须一致**（同一个函数、同一组
@@ -197,6 +210,51 @@ CameraPose CameraSystem::poseFromEntity(Scene& scene, ecs::Entity e) const {
     return p;
 }
 
+// ---------------------------------------------------------------- 静态机位
+//
+// 把一台相机实体**整份**装到某个 `Camera` 上：机位（含 roll）+ 镜头
+// （fov/焦距、离轴 shift）+ 裁剪面。**不启动**任何 rig（Track To / 路径 /
+// 手持 / 震动）—— 那些要每帧求值，是运行时的事。
+//
+// 调用方：编辑器视口的"以选中相机预览"（`EditorApp::applyPreviewCamera`）。
+//
+// ⚠ 为什么不再走 `poseFromEntity`：它 private，而且**故意**不带 shift ——
+//   `apply()` 那边对 shift 是 `+= cc->shiftX`（"镜头安装角"要叠在运镜的
+//   roll 上），带进 pose 里就会叠两次。这里要的是"装一台相机"，语义是赋值。
+bool applyCameraEntityTo(Scene& scene, ecs::Entity e, Camera& cam) {
+    const auto* cc = scene.world().get<ecs::CameraComponent>(e);
+    if (!cc) return false;
+
+    CameraPose p;
+    poseFromWorld(scene.worldMatrix(e), p);
+    p.fov = (cc->focal > 0.0f) ? focalToFovY(cc->focal, cc->sensorHeight)
+                               : cc->fov;
+    p.shiftX = cc->shiftX;
+    p.shiftY = cc->shiftY;
+
+    // 与 `applyPoseToSceneCamera` / `CameraSystem::apply` 用**同一组 setter、
+    // 同一个顺序**。三处写法不一致的经典症状是"编辑器里构图偏了一点，
+    // 出包后正常"，而三处各自都通得过自己的用例。
+    cam.setFlyMode(true);
+    cam.setUseGlobalInput(false);
+    cam.setFov(p.fov);
+    cam.setYaw(p.yaw);
+    cam.setPitch(p.pitch);
+    cam.setPosition(p.position);
+    cam.setRoll(p.roll);
+    cam.setShift(p.shiftX, p.shiftY);
+
+    // 裁剪面：`0 = 用全局默认`（组件注释里的约定），于是预览时**不动**它 ——
+    // 编辑器视口的 0.1/5000 是专门为大场景给的，被一台没配裁剪面的相机
+    // 按回 0.1/200 会让远处地面整片消失，看起来像"一开预览地形就没了"。
+    if (cc->clipNear > 0.0f) {
+        cam.setClipPlanes(cc->clipNear,
+                          cc->clipFar > 0.0f ? cc->clipFar : cam.farPlane());
+    }
+    return true;
+}
+
+
 // ---------------------------------------------------------------- 混合 / 震动
 
 void CameraSystem::blendTo(const CameraPose& target, float seconds,
@@ -205,7 +263,9 @@ void CameraSystem::blendTo(const CameraPose& target, float seconds,
     m_blendDur = std::max(seconds, 0.0f);
     m_blendT = 0.0f;
     m_blendActive = m_blendDur > 1.0e-4f;
-    m_blendSmooth = smoothStep;
+    // 老签名（布尔）继续可用：true = smoothstep（历史默认），false = 线性。
+    // 这两种都是 `BlendCurve` 里的成员，所以不必再造一条平行的实现。
+    m_blendCurve = smoothStep ? BlendCurve::Smooth : BlendCurve::Linear;
     // 目标立刻成为"意图"，混合只是把它**渐进地**应用出来 —— 这样混合
     // 结束之后不需要再做一次跳变修正。
     m_desired = target;
@@ -256,7 +316,8 @@ void CameraSystem::update(Scene& scene, float dt) {
         m_blendT += std::max(dt, 0.0f);
         float a = m_blendDur <= 1.0e-4f ? 1.0f : m_blendT / m_blendDur;
         a = std::clamp(a, 0.0f, 1.0f);
-        m_applied = lerpPose(m_blendFrom, target, m_blendSmooth ? smoothStep(a) : a);
+        m_applied = lerpPose(m_blendFrom, target,
+                             blendCurveApply(m_blendCurve, a));
         // 留 1e-4 余量：60 次 1/60 秒累加不会是精确的 1.0（浮点），
         // 卡在 0.99999 会让"混合已结束"永远为假。
         if (a >= 1.0f - 1.0e-4f) {

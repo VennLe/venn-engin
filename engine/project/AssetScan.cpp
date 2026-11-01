@@ -73,6 +73,10 @@ const char* kIdDirs[] = {
     "scenes/",    "scripts/", "sequences/", "dialogues/", "animators/",
     "ui/",        "fonts/",   "ramps/",    "audio/",     "icons/",
     "prefabs/",
+    // B6（2026-11-01）：表情预设。它们总是带 `.expr.json` 全名出现，但这张表
+    // 的意义是"这些目录下可以写 id 形态"，漏了以后有人写 `expressions/face`
+    // 就会被当成找不到（而错误只报"资产缺失"，不报"这个目录没登记"）。
+    "expressions/",
 };
 
 bool endsWith(const std::string& s, const char* suffix) {

@@ -896,11 +896,11 @@ class PrefabApplyCommand : public Command {
 | **G16-1** ✅ | `World::Record.guid` + `m_byGuid` + `guid/find/setGuid/allocateGuid` + 三处生命周期同步 | S | `--selftest guid` 第 1~7 条绿 |
 | **G16-2** ✅ | 场景 JSON：写 `guid` / 读 `guid`(setGuid+dup+assigned) / `parentGuid` 双分支 / `kFormatVersion=2` + 读端版本校验 | M | 第 8~13 条绿；`verify_runtime_m2` C 组仍绿 |
 | **G16-3** ✅ | `--selftest guid` **26 条**（原计划 13 条，见 §12.1） | M | `GUID-TOTAL pass=26 fail=0` |
-| **G16-4** ◐ | `validateSelection` 改 **guid 优先**（逻辑抽成 `Scene::reconnectByGuidOrName`，可无窗口自检）· Hierarchy `Copy GUID` / `Select by GUID` **未做** | S | 同名实体重建后选中不错位（`selection_reconnect_by_guid` + 对照区 `selection_fixture_has_ambiguity`） |
+| **G16-4** ✅ | `validateSelection` 改 **guid 优先**（逻辑抽成 `Scene::reconnectByGuidOrName`，可无窗口自检）· Hierarchy `Copy GUID` / `Select by GUID…`（2026-10-31，见 §12.6） | S | 同名实体重建后选中不错位（`selection_reconnect_by_guid` + 对照区 `selection_fixture_has_ambiguity`） |
 | **G16-5** ✅ | 序列化器三段拆分（`SceneDocument` / `parseSceneDocument` / `instantiateDocument` / `resolveDocumentAssets`） | M | `verify_runtime_m2` C 组绿 + `--selftest save` 能无设备跑（**39 条**，见 §12.2） |
 | **G17-1** ✅ | `SaveGame.{h,cpp}`：格式 + 原子写 + 迁移表 + `readSaveGame/writeSaveGame` | L | 第 1、4、5、7 条绿（**33 条**，见 §12.3） |
 | **G17-2** ✅ | `SaveGameState.{h,cpp}`：基线哈希 + diff 生成 + `applySaveGame` + 悬挂父修正 | L | 第 1、2、3、9、10、11 条绿（**77 条**，见 §12.4） |
-| **G17-3** | 槽位（`slot1..3` / `quick` / `auto`）+ 目录 + CLI（`--save/--load/--slot`）+ 控制台 `save.*` | M | `SAVE-WRITE` / `SAVE-READ` 锚点出现 |
+| **G17-3** ✅ | 槽位（`slot1..3` / `quick` / `auto`）+ 目录 + CLI（`--save/--load/--slot/--save-dir`）+ 快捷键 F5/F9 + `captureBaseline` 接线 + **槽位面板**（2026-10-31，见 §12.6） | M | `SAVE-WRITE` / `SAVE-READ` 锚点出现；自检 K 组 **101 条** + `verify_save_slots.py` **31 条**（见 §12.5）+ `verify_save_panel.py` **8/8** |
 | **G17-4** | `verify_persistence.py` A~E 组 + 回归登记 | M | `结果: PASS` |
 | **G18-1** | `Prefab.{h,cpp}`：资产解析（复用 `parseSceneDocument`）+ `instantiatePrefab` + `remapEntityRefs` + 两个组件 | L | 验收 1、9 条绿 |
 | **G18-2** | 覆盖表（自动记录 / 加载叠加 / `PrefabApplyCommand` 含文件级撤销） | L | 验收 2~7 条绿 |
@@ -949,8 +949,8 @@ v2 夹具（第 2 个抄第 1 个） → SCENE-GUID assigned=0  dup=1 total=11
 4. 读端不 `setGuid` 覆盖 → 两条都红，且 `stable_twice` 的 `len=5082/5082` **相同**、
    内容不同 —— 只判长度会漏，逐字节判据是必要的。
 
-**未做（留给下一轮）**：G16-4 的 Hierarchy 右键 `Copy GUID` / `Select by GUID`（纯调试便利，
-不影响任何验收）。
+**未做（留给下一轮）**：~~G16-4 的 Hierarchy 右键 `Copy GUID` / `Select by GUID`~~
+→ **✅ 2026-10-31 落地**，见 §12.6。
 
 ### 12.2 G16-5 落地记录（2026-10-27）
 
@@ -1228,12 +1228,165 @@ check_regression_map.py      → PASS
 
 **未做（G17-2 的边界，留给后面）**
 
-* 槽位 / 目录 / CLI / 控制台命令 = **G17-3**；`SaveGameState` 的生命周期（关卡加载完成时
-  `captureBaseline`）也由 runtime 在那一步接上。
+* ~~槽位 / 目录 / CLI / 控制台命令 = **G17-3**~~ → ✅ 2026-10-31 已做，见 §12.5。
+  （运行时**没有控制台**，那一半改成快捷键 F5 / F9。）
 * `--selftest save-crash`（G17-1 的尾巴）仍未做。
 * ⚠ `HierarchyComponent::children` 存的是 `EntityId`（不带 generation）→ 槽位复用后
   "看起来还活着"。`fixOrphanParents` 里的 `alive()` 判据因此**可能漏判**；
   要彻底修得让 children 存 `{id, generation}`，那是 G16 的延伸，不在本轮。
+
+### 12.5 G17-3 落地记录（2026-10-31）
+
+**实测数字**
+
+```
+Game.exe --selftest save   → SAVE-TOTAL pass=101 fail=0（新增 K 组 24 条）
+tools/verify_save_slots.py → 31/31 PASS（结果: PASS）
+Game.exe --scene scenes/_save_fixture.json --frames 90 --save --slot quick
+  → SAVE-WRITE slot=quick entities=1 hash=a06ed3bf… playTime=4.0
+Game.exe --load --frames 2 --slot quick --save
+  → SAVE-LOAD-SCENE … (from save) / SAVE-READ … applied=1 drift=0
+  → 再存的 Mover z：0.03970 → 0.04041（2 帧的推进量）
+```
+
+**新增**
+
+| 文件 | 职责 |
+|---|---|
+| `engine/scene/SaveSlot.{h,cpp}` | 槽位白名单 + 路径拼接 + 一次完整的存 / 读动作 |
+| CLI | `--save`（**退出前**存）/ `--load` / `--slot` / `--save-dir` |
+| 快捷键 | F5 快速存档 / F9 快速读档（**不进 InputMap**，理由同对话方向键） |
+| `RuntimeApp::captureSaveBaseline` | 关卡加载完 + **每次换关之后**各抓一次 |
+
+**五条"看起来能省、省了就错"**
+
+1. ⚠⚠ **槽位非法绝不兜底**。`saveSlotPath("", "quik")` 返回**空串**，不是"退回 quick"。
+   静默把自动存档写进玩家手动槽位，比报错糟得多 —— 玩家的手动档被一个自己
+   没按过的操作覆盖掉，而且没有任何日志。
+2. ⚠⚠ **存档之后不刷基线**。增量是相对**关卡**（基线 = 关卡加载完成时），不是相对
+   "上一份档"。改成相对上一份档的话，"存档 A → 什么都没动 → 存档 B"会写出一份
+   **空档**（`entities: []`），它看起来完全合法；把空档读进新关卡 = 什么都没恢复。
+   ← `slot_save_repeat_keeps_entry` 钉着（第一版把它写成 `== 0`，是**期望错**）。
+3. ⚠⚠ **换关必须重抓基线**。不重抓的话，上一关的基线会留下来：新关卡里 guid 撞上的
+   实体被当成"没变"跳过（存档缺实体），撞不上的全被判"已销毁"（读档后新关卡的东西
+   被删光）—— 而日志里只有一条成功的 `SAVE-WRITE`。
+4. ⚠⚠ **玩家的 guid 必须是固定值**（`RuntimeApp.cpp` 的 `kPlayerGuid`）。玩家是运行时
+   生成的，随机 guid 带来两个后果：① `sceneHash` 每次运行都不同 → 同一关卡的存档
+   永远被判成"不是同一个关卡"；② 存档里那条玩家记录读档时找不到人 → **角色回到
+   出生点而其它东西都在原位**。
+5. ⚠⚠ **`--load` 判"给没给 --scene"要用 `sceneFromCli`，不能用 `scenePath.empty()`**。
+   `game.json` 里通常写着默认关卡，于是 `scenePath` 永远不空 → `--load` 会进默认关卡，
+   然后被结构指纹拒读（`SAVE-DRIFT-REJECT`）。症状看起来像"读档坏了"。
+
+**globals 里那两样 `captureDiff` 拿不到的东西**（只有调用方知道，`saveToSlot` 补上）：
+* `vars` ← `scene.scriptVars()`。不补的话档里 `vars` 永远是 `{}` —— 文件合法、
+  读档成功、**剧情从第一句重来**。
+* `playerGuid` ← 调用方给的玩家实体 guid（`RuntimeApp::quickSave` 传）。
+* 仍然空着的是 `playerHp` / `playerStamina` / `pickedUp`：**运行时根本没有这两个
+  状态**（`Inventory` 与血量还没实现）。留空而不是编一个数 —— 编了就是假绿。
+
+**夹具的一个坑**：`assets/scenes/_save_fixture.json` 里两个实体**必须**写显式 `guid`。
+不写的话每次加载随机分配 → `sceneHash` 每次不同 → 存档被判"不是同一个关卡"而拒读。
+（本仓库的 `cutscene_demo.json` 就是这种老文件，所以它的存档只会有 `SAVE-SCENE-DRIFT`
+警告；因为 `missing=0`，阈值 0.5 判它"还是同一个关卡"，读档照常。）
+
+**未做（G17-3 的边界）**
+
+* 存档 UI（槽位下拉 + 存/读/删三个按钮）—— 那是 G17-3 的**界面那一半**，
+  数据与动作已经就绪（`listSaveSlots` 就是给下拉用的）。
+* `--selftest save-crash`（G17-1 的尾巴）仍未做。
+* 「删档」动作没有 CLI（`listSaveSlots` 有了，删除留给 UI 层，避免给玩家一个
+  `--delete-slot` 这种一脚踩空的参数）。
+
+### 12.6 存档相关的三件尾巴落地记录（2026-10-31）
+
+这一轮把 G16-4 的 Hierarchy 右键两条、G17-3 的**界面那一半**（存档槽位面板）、
+以及 H2（崩溃 / 断电自动保存）一起做完。三件都在"存档"这条线上，但它们各自踩
+了**同一类**的坑：**"点了什么都不发生，而日志里一条错都没有"**。
+
+**实测数字**
+
+```
+tools/verify_hierarchy_guid.py → 10/10 PASS
+tools/verify_save_panel.py     →  8/8 PASS（含 Game.exe --slot auto --load 跨进程读档）
+tools/verify_autosave.py       →  9/9 PASS
+tools/check_regression_map.py  → 结果: PASS
+```
+
+**① G16-4 尾巴：`Copy GUID` / `Select by GUID…`**
+
+* `Copy GUID` 走 `ImGui::SetClipboardText` + `HIER-GUID copy=%016llx entity=%u`；
+  实体没有 guid 时菜单项是 `BeginDisabled` 而**不是隐藏**（隐藏会让人以为
+  "这个功能没了"，灰着才说明"这个对象没有身份"）。
+* `Select by GUID…` 是模态弹窗：16 位 hex 判定**分两层** —— 长度不对 / 解析成
+  `kInvalidGuid`（含全零串）分开报，因为作者要改的地方不在一处。
+* 验收 10 条：剪贴板**必须**与日志那串逐字符相同（`SetClipboardText` 被注释掉的
+  否定测试会红）、`entity` 必须与刚才点选那一行一致（否则"复制的是谁"无从判）、
+  不存在的 guid → `hit=0`、同一个弹窗里改对仍成功、`0x…` 不进 `find()`。
+* ⚠⚠ **真 bug（本机逮到）**：`OpenPopup("###guidquery")` 与
+  `BeginPopupModal(TRL("Select by GUID"))` 的 **ID 不一致** —— 前者哈希的是
+  `guidquery`，后者哈希的是整个标题字符串。结果 `BeginPopupModal` 永远返回
+  false：点菜单、菜单消失、**画面什么都不变、日志一个字都不报**。
+  修法：两边都用 `"Select by GUID###guidquery"`（`TRL` 会保留 `###` 之后那段）。
+* ⚠ 菜单项那一下**不能当帧就 `OpenPopup`**：那一帧正在关右键菜单，ImGui 会把
+  "这一帧新开的 popup"当成被同一次点击带开的窗口而立刻关掉。改成
+  `m_guidQueryPending` → 下一帧才 Open。
+* ⚠ `EnterReturnsTrue` 在返回 true 的同时会清掉 active id，判定失败后必须
+  `SetKeyboardFocusHere()` 还焦点（`m_guidRefocus`），否则"发现打错了接着改"
+  得先用鼠标点一下输入框 —— 这条不是手感问题，它会让"同一个弹窗里改对"
+  在自动化里做不到。
+
+**② G17-3 尾巴：存档槽位面板（`editor/SaveSlotsPanel.{h,cpp}`）**
+
+* `listSaveSlots()` 的第一个（也是唯一）消费者：下拉 + 两列表格（**空槽也列**，
+  否则"我存了没"看不出来）+ Save / Load / Delete + 删除二次确认 + 底部状态行。
+* ⚠⚠ **真 bug（会让存档静默变空）**：`doSave` 原来"先 `captureBaseline(当前场景)`
+  再算增量"，而 `captureDiff` 的结论必然是"什么都没变" → 存出来的 `.vsave`
+  是 `entities: []`：文件合法、`ok=1`、磁盘上真有 295 字节、读回来什么都恢复不了。
+  引擎里的"基线"语义是**关卡加载完成那一刻**，而编辑器这个按钮要做的是
+  **把整个关卡快照进槽位** → 基线**永远传空**（`SaveGameState` 的注释写着
+  "基线为空 → 等价于全量，第一次存档就该是这个行为"）。
+* ⚠⚠ **同一个 popup ID 坑，第二次**：`OpenPopup("###confirm_delete")` 对
+  `BeginPopupModal(trId("Delete this save?", "dlg_delete"))`（ID = `dlg_delete`）
+  → 删除确认框永远不出现，`Delete` 按钮看起来"没反应"。这一轮在同一个代码树上
+  逮到两次，说明它不是偶发，是**写法纪律**：`OpenPopup` 与 `BeginPopupModal`
+  必须喂**同一个字符串**。
+* 验收 8 条：面板打开 / Save 后磁盘真有文件（3502 字节，之前是 295 的空档）/
+  **跨进程** `Game.exe --slot auto --load` 读到 `applied=3 missing=0 drift=0` /
+  Load / 确认弹窗先出现（`SAVEPANEL-CONFIRM-DEL`）才真删 / 删完再存 `entities>0`。
+* ⚠ 用例**不写死槽位**：下拉默认选 `saveSlotNames()` 第一项（现在是 `auto`），
+  槽位从 `op=save slot=` 那行读出来再喂给磁盘断言和 `Game.exe --slot` —— 否则
+  一次无害的白名单重排就会让整条用例假红。
+
+**③ H2：崩溃 / 断电自动保存**
+
+* 语义（三条都是"不做什么"）：**不覆盖**用户的场景文件（写同目录
+  `<场景>.autosave.json`）、**不自动恢复**（启动只打 `EDIT-AUTOSAVE-STALE`，
+  由人决定）、**不清 `dirty()`**（它不是"存过盘了"）。
+* 只在**编辑态**累加；默认 120 秒；`MYVK_EDITOR_AUTOSAVE_SEC`（0 = 关）与
+  `MYVK_EDITOR_AUTOSAVE_FORCE=1`（无视 dirty 的假钩子，与 `MYVK_DLG_VOICE_FAKE`
+  同一条思路 —— 无人值守的回归没法"真的去改一下场景"）。
+* ⚠⚠ **真 bug**：`resolveAssetPath` 对**还不存在**的文件返回候选链第一项
+  （`<exeDir>/assets/` + 传入串）。`scenePath` 有两种写法（`scenes/a.json` 与
+  `assets/scenes/a.json`），后者会变成 `assets/assets/scenes/...` → 目录不存在
+  → 每一轮自动保存 `ok=0` 而画面一切正常。修法：写之前统一剥 `assets/` 前缀
+  （`saveSceneNow` 是**同一条路**，一起修了 —— "新文档存到 assets/ 前缀路径"
+  原来是静默失败的）。
+* 验收 9 条，核心两条是**负判据**：①场景没改过（`dirty=false`）时**一条都不许写**
+  （只测"会存"的话，"每 1.5 秒无脑存一次"照样全绿）；②正式档**逐字节**没变
+  （md5，`mtime` 不够）。E 组往 autosave 里埋一个标记实体再启动 → 打开后的
+  实体数必须与"干净打开"一致且日志里看不到标记（否则"没加载"和"加载了同样的
+  内容"分不开）。
+* 否定测试：去掉 dirty 门 → A1 红（`writes=2`）；把落点改成正式档 → B3 红
+  （`before/after` 两个 md5 不同）。
+
+**未做（仍是尾巴）**
+
+* `--selftest save-crash`（G17-1 的尾巴）：要真造一个半截文件，与 H2 的
+  "正常关闭不删 autosave"是两件事。
+* 自动保存**没有**"一键恢复"按钮：现在只提示路径，恢复靠人打开它另存。
+  这是刻意的（自动加载会在用户"故意不存"时反复弹回旧内容），但真用起来
+  大概会想要一个"打开 autosave"的菜单项。
 
 ### 12.9 判据速查（2026-10-29 从项目笔记挪来，原文照抄）
 

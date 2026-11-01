@@ -178,6 +178,10 @@ class TimelineEditorWindow {
     bool actAddShot();
     bool actSetShotTime(float t);
     bool actSetShotBlend(float seconds);
+    // 混合曲线的**形状**（linear / smooth / easein / easeout / smoother）。
+    // 传存档关键字而不是枚举：面板、脚本 op、文件三处共用同一串关键字，
+    // 少一层"枚举 ↔ 字符串"的翻译就不会出现两边对不上的情况。
+    bool actSetShotCurve(const std::string& name);
     bool actSetShotLabel(const std::string& label);
     // 绑定机位。`guid == 0` = 回落关键帧轨（合法值）。
     // ⚠ 这里写 `std::uint64_t` 而不是 `ecs::EntityGuid`：本头只 include

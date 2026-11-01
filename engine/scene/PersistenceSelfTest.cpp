@@ -12,6 +12,8 @@
 //   D 原子写       —— 写两次同一槽必须成功（Windows 上 `std::rename` 会失败）；
 //                     主档坏了必须能退 `.bak`。
 //   E 校验         —— 比我们新的档**拒读**；重复 guid **拒绝整份**。
+//   K 槽位（G17-3）—— 白名单 / 大小写 / 路径拼接 / 一次完整的存→读 /
+//                     非法槽位**绝不兜底** / 第二次存盘是增量的。
 //
 // ⚠ 所有断言都问过"别的实现会给出不同的数吗"。
 // ============================================================
@@ -25,6 +27,7 @@
 #include "ecs/World.h"
 #include "scene/SaveGame.h"
 #include "scene/SaveGameState.h"
+#include "scene/SaveSlot.h"
 #include "scene/Scene.h"
 
 #include <nlohmann/json.hpp>
@@ -902,10 +905,188 @@ void groupShape() {
     }
 }
 
+// ============================================================
+// K 组：槽位（G17-3）
+// ============================================================
+//
+// 这一组钉的是"槽位"这一层，不是文件层也不是应用层：
+//   · 白名单与大小写 —— 磁盘上只能有一个 `quick.vsave`；
+//   · 路径拼接 —— 非法槽位返回**空串**，绝不"退回 quick"；
+//   · 一次完整的 存→改→读 —— 三个接口串起来真的能把箱子放回去；
+//   · 第二次存盘是**增量**的 —— 只改了一个实体就该只写一条。
+void groupSlots() {
+    // ---- ① 白名单 ----
+    reportFlag("slot_known_names",
+               isValidSaveSlot("slot1") && isValidSaveSlot("slot2") &&
+                   isValidSaveSlot("slot3") && isValidSaveSlot("quick") &&
+                   isValidSaveSlot("auto"));
+    // `slot4` 是最容易"顺手支持"的一个 —— 支持了就要有人管目录增长。
+    reportFlag("slot_reject_unknown",
+               !isValidSaveSlot("slot4") && !isValidSaveSlot("") &&
+                   !isValidSaveSlot("quik") && !isValidSaveSlot("../quick"));
+
+    // ---- ② 大小写 / 空白归一 ----
+    reportFlag("slot_case_insensitive",
+               normalizeSaveSlot(" Quick ") == "quick" &&
+                   isValidSaveSlot("AUTO") &&
+                   saveSlotPath("d", "SLOT2") == saveSlotPath("d", "slot2"),
+               normalizeSaveSlot(" Quick "));
+
+    // ---- ③ 路径 ----
+    reportFlag("slot_path_default_dir",
+               saveSlotPath("", "quick") ==
+                   std::string(kSaveDirDefault) + "/quick" + kSaveExt,
+               saveSlotPath("", "quick"));
+    reportFlag("slot_path_custom_dir",
+               saveSlotPath("tmp/x", "slot2") ==
+                   "tmp/x/slot2" + std::string(kSaveExt),
+               saveSlotPath("tmp/x", "slot2"));
+    // ⚠⚠ 这一条是**安全**判据：非法槽位拼出来的路径如果非空，`"../quick"`
+    //   就能写到存档目录外面去。
+    reportFlag("slot_path_invalid_empty", saveSlotPath("d", "../x").empty() &&
+                                              saveSlotPath("d", "").empty());
+
+    // ---- ④ 一次完整的 存 → 改 → 读 ----
+    // 目录用自检专用的临时子目录（与别的用例隔离）。
+    const std::string dir = tempPath("slots");
+    {
+        Scene level;
+        buildLevel(level, {0xB800000000000001ull, 0xB800000000000002ull});
+        SaveGameState st;
+        st.captureBaseline(level);
+
+        // 改一个：从 0 挪到 z=3
+        if (auto* t = level.world().get<ecs::TransformComponent>(
+                level.world().find(0xB800000000000001ull)))
+            t->position.z = 3.0f;
+
+        const SaveToSlotResult w = saveToSlot(level, st, dir, "quick", "x.json", 12.0);
+        reportFlag("slot_save_ok", w.ok, w.error);
+        // 增量：只写改动的那一条
+        reportFlag("slot_save_incremental", w.entities == 1,
+                   std::to_string(w.entities));
+
+        // 同内容再存一次 → **仍然写那一条**（不是 0）。
+        // ⚠ 这一条一开始写成了 `== 0`（"存过了就不该再写"），是**期望错**：
+        //   增量是相对**关卡**（基线 = 关卡加载完成时的样子），不是相对
+        //   上一份档。改成相对上一份档的话，"存档 A → 什么都没动 → 存档 B"
+        //   会写出一个**空档**；把空档读进新关卡 = 什么都没恢复，而文件看起来
+        //   完全合法（`entities: []`）。那是真正的丢档，且没有任何报错。
+        const SaveToSlotResult w2 =
+            saveToSlot(level, st, dir, "quick", "x.json", 12.0);
+        reportFlag("slot_save_repeat_keeps_entry", w2.ok && w2.entities == 1,
+                   std::to_string(w2.entities));
+
+        // 新关卡（同一个 guid 表，变换是初始值）→ 读档应该把 z 放回 3
+        Scene fresh;
+        buildLevel(fresh, {0xB800000000000001ull, 0xB800000000000002ull});
+        SaveGameState st2;
+        st2.captureBaseline(fresh);
+
+        const LoadFromSlotResult r =
+            loadFromSlot(fresh, st2, nullAssets(), dir, "quick");
+        reportFlag("slot_load_ok", r.ok, r.error);
+        report("slot_load_applied", static_cast<double>(r.stats.applied), 1.0);
+        const auto* t2 = fresh.world().get<ecs::TransformComponent>(
+            fresh.world().find(0xB800000000000001ull));
+        report("slot_load_z", t2 ? static_cast<double>(t2->position.z) : -999.0,
+               3.0, 1.0e-6);
+
+        // 读档之后基线已刷新 → 立刻再存是空增量
+        const SaveGame diff = st2.captureDiff(fresh, "quick", "x.json", 12.0);
+        report("slot_load_refreshes_baseline",
+               static_cast<double>(diff.entities.size()), 0.0);
+    }
+
+    // ---- ⑧ globals：脚本变量与玩家 guid 必须真的进档 / 出档 ----
+    // ⚠ 这两样 `captureDiff` **拿不到**（只有调用方知道），所以要单独钉：
+    //   不补的话档里 `vars` 永远是 `{}`、`playerGuid` 永远是 0 —— 文件合法、
+    //   读档成功、剧情却从第一句重来，而没有任何报错。
+    {
+        Scene level;
+        buildLevel(level, {0xBB00000000000001ull});
+        level.scriptVars()["chapter"] = 3.0;
+        level.scriptVars()["hasKey"] = 1.0;
+        SaveGameState st;
+        st.captureBaseline(level);
+        constexpr ecs::EntityGuid kMe = 0xCC00000000000001ull;
+        const SaveToSlotResult w =
+            saveToSlot(level, st, dir, "auto", "y.json", 5.0, kMe);
+        reportFlag("slot_save_globals_ok", w.ok, w.error);
+
+        Scene fresh;
+        buildLevel(fresh, {0xBB00000000000001ull});
+        SaveGameState st2;
+        st2.captureBaseline(fresh);
+        const LoadFromSlotResult r =
+            loadFromSlot(fresh, st2, nullAssets(), dir, "auto");
+        reportFlag("slot_load_vars_restored",
+                   r.ok && fresh.scriptVars().size() == 2 &&
+                       r.save.globals.vars.size() == 2,
+                   std::to_string(fresh.scriptVars().size()));
+        report("slot_load_var_chapter",
+               fresh.scriptVars().count("chapter")
+                   ? fresh.scriptVars().at("chapter")
+                   : -1.0,
+               3.0, 1.0e-9);
+        reportFlag("slot_load_player_guid",
+                   r.ok && r.save.globals.playerGuid == kMe,
+                   ecs::guidToHex(r.save.globals.playerGuid));
+    }
+
+    // ---- ⑤ 非法槽位：写 / 读都要**当场拒绝**，而且不留文件 ----
+    {
+        Scene level;
+        buildLevel(level, {0xB900000000000001ull});
+        SaveGameState st;
+        st.captureBaseline(level);
+        const SaveToSlotResult w = saveToSlot(level, st, dir, "quik", "x.json", 0.0);
+        reportFlag("slot_save_bad_name_rejected", !w.ok && !w.error.empty(),
+                   w.error);
+        std::error_code ec;
+        const bool noFile =
+            !std::filesystem::exists(std::filesystem::u8path(dir + "/quik.vsave"), ec);
+        reportFlag("slot_save_bad_name_no_file", noFile);
+
+        Scene other;
+        SaveGameState st2;
+        const LoadFromSlotResult r = loadFromSlot(other, st2, nullAssets(), dir, "quik");
+        reportFlag("slot_load_bad_name_rejected", !r.ok && !r.error.empty(),
+                   r.error);
+    }
+
+    // ---- ⑥ 读一个不存在的槽位：报错、世界不动 ----
+    {
+        Scene level;
+        buildLevel(level, {0xBA00000000000001ull});
+        SaveGameState st;
+        st.captureBaseline(level);
+        const LoadFromSlotResult r =
+            loadFromSlot(level, st, nullAssets(), dir, "slot3");
+        reportFlag("slot_load_missing_fails", !r.ok && !r.error.empty(), r.error);
+        // 世界必须原样（读失败时一个实体都不许动）
+        report("slot_load_missing_keeps_world",
+               static_cast<double>(level.world().entityCount()), 1.0);
+    }
+
+    // ---- ⑦ 列出槽位：顺序 = 白名单顺序，且只报存在的 ----
+    {
+        const std::vector<SaveSlotInfo> list = listSaveSlots(dir);
+        const bool orderOk =
+            list.size() == saveSlotNames().size() && list.size() == 5 &&
+            list[0].slot == "slot1" && list[3].slot == "quick" &&
+            list[4].slot == "auto";
+        reportFlag("slot_list_order", orderOk, std::to_string(list.size()));
+        // quick 刚写过 → 存在；slot1 没写过 → 不存在
+        reportFlag("slot_list_exists_flag",
+                   list.size() == 5 && list[3].exists && !list[0].exists,
+                   list.size() == 5 ? (list[3].exists ? "quick=1" : "quick=0") : "?");
+    }
+}
+
 }  // namespace
 
-int runPersistenceSelfTest() {
-    g_pass = 0;
+int runPersistenceSelfTest() {    g_pass = 0;
     g_fail = 0;
 
     VK_LOG_INFO("== selftest: save (G17-1 file layer + G17-2 apply layer) ==");
@@ -916,6 +1097,7 @@ int runPersistenceSelfTest() {
     groupIncremental();
     groupApply();
     groupShape();
+    groupSlots();
 
     VK_LOG_INFO("SAVE-TOTAL pass=%d fail=%d", g_pass, g_fail);
     return g_fail;

@@ -36,7 +36,11 @@
   F. Ctrl+. 回到正常视角（2026-10-24）
      F0 面板上的 Focus player 按钮也能取景（键盘入口的兜底 —— 中文 Windows
         上 Ctrl+. 是微软拼音的"中英标点切换"热键，真实按键到不了应用）
-     F1 键真的收到了（LS-FRAME-PLAYER 递增）
+     F1 单键 `Home` 真的收到了（LS-FRAME-PLAYER 递增）。
+        2026-10-31 改：原来测的是 `Ctrl+.`，但**带修饰键的组合在本机自动化
+        下一条都验不了** —— 注入的 Ctrl 对 GLFW 的 `getMods()`（GetKeyState）
+        不可见，连 `Ctrl+Z` 都收不到。于是 F1 长期红着、报的话却与真因无关。
+        产品侧因此补了单键 `Home`（同一函数），这条才第一次真正能断言。
      F2 是"正常高度"那套常量（水平退 18 m / 俯角 0.49 rad）—— 有人把进入
         模式的取景改回"整片地形全貌"（视距 ~500 m）这条立刻红
      F3 几何自洽：相机在目标后方 back 米、抬高 back·tan(pitch) 米
@@ -58,6 +62,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from capture_window import capture_client, find_window  # noqa: E402
 from verify_add_menu import LogTap, click, kill_stale_editors  # noqa: E402
 from verify_asset_drag import client_to_screen  # noqa: E402
@@ -87,6 +92,7 @@ MOUSEEVENTF_WHEEL = 0x0800
 VK_SHIFT = 0x10
 VK_CONTROL = 0x11
 VK_OEM_PERIOD = 0xBE   # 主键盘区的 `.`
+VK_HOME = 0x24
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 
@@ -215,6 +221,31 @@ def shift_wheel(hwnd, pos, notches=20):
     time.sleep(0.5)
 
 
+def press_home(hwnd):
+    """发一次 `Home`（回到工作视角的单键入口，2026-10-31 加）。
+
+    ⚠ 为什么不用 `Ctrl+.`：见 `ctrl_period` 的注释 —— 真实按键被微软拼音的
+      "中英标点切换"吃掉，PostMessage 的 Ctrl 又不被 GLFW 的 `getMods()`
+      看见（它走 GetKeyState）。实测连 `Ctrl+Z` 都收不到，所以**任何带修饰
+      键的组合**在这个环境里都无法验证。`Home` 是单键，直投窗口 proc 就能到。
+
+    ⚠⚠ **lParam 必须带 extended 位（bit 24）**：Windows 上 Home 与"小键盘 7"
+      的扫描码**都是 0x47**，靠 KF_EXTENDED 区分。GLFW 的 keycodes 表是
+      512 项 —— `keycodes[0x47]` 是 `GLFW_KEY_KP_7`，`keycodes[0x147]` 才是
+      `GLFW_KEY_HOME`。不带这一位时 `ImGuiKey_Home` 永远等不到按下，
+      而日志里**一条报错都没有**（键被当成小键盘 7 悄悄吞掉）。
+      实测：不带 → `LS-HOME-KEY` 0 条；带上 → 立刻到。
+    """
+    focus_window(hwnd)
+    const_ext = 1 << 24
+    user32.PostMessageW(hwnd, WM_KEYDOWN, VK_HOME,
+                        (0x47 << 16) | const_ext | 1)
+    time.sleep(0.10)
+    user32.PostMessageW(hwnd, WM_KEYUP, VK_HOME,
+                        (0x47 << 16) | const_ext | 0xC0000001)
+    time.sleep(0.7)
+
+
 def ctrl_period(hwnd):
     """发一次 Ctrl+.（回到正常视角）。
 
@@ -299,7 +330,7 @@ def main():
     for f in ("terrain.vterrain", "height.r32", "splat.rgba8", "holes.r8"):
         p = os.path.join(TDIR, f)
         if os.path.exists(p):
-            os.remove(p)
+            safe_remove(p)
 
     env = dict(os.environ)
     env.update({
@@ -490,19 +521,30 @@ def main():
         # F0 先验按钮入口：`Ctrl+.` 在中文 Windows 上会被微软拼音的"中英标点
         # 切换"吃掉（真实按键到不了应用），所以面板上必须有一条不经过键盘的
         # 路；两条入口走的是同一个 focusCameraAtPlayer()。
-        fps = rect_of(tap, "LS-FOCUS-PLAYER", 2.0)
+        fps = reveal(hwnd, tap, "LS-FOCUS-PLAYER")
         if not fps:
             check(False, "F0 面板上没有 Focus player 按钮（LS-FOCUS-PLAYER）")
         else:
+            cx, cy = fps
+            # ⚠ 为什么用 `reveal()` 而不是裸 rect：用例前面的 B 组为了点
+            #   `LS-TOOL-7` 滚过面板，滚完之后 stats 段整体上移，按钮的
+            #   **虚拟矩形**可能已经在面板可视区之外 —— 矩形还在（ImGui 的
+            #   `GetItemRect` 不判裁剪），中心点却落在面板外面，点下去砸到
+            #   上面的 Hierarchy。`reveal()` 会先滚到完全可见再给中心点。
+            # 另外先"喂"两次鼠标位置：D 组的 Shift+滚轮常把光标甩到客户区外，
+            # 此时 ImGui 的 `MousePos` 是 `-FLT_MAX`，第一下只补状态不命中。
+            for _ in range(2):
+                user32.SetCursorPos(*client_to_screen(hwnd, cx, cy))
+                time.sleep(0.35)
             n_btn = count(tap, "LS-FRAME-PLAYER")
-            click(hwnd, (fps[0] + fps[2]) * 0.5, (fps[1] + fps[3]) * 0.5)
+            click(hwnd, cx, cy)
             time.sleep(0.6)
             check(count(tap, "LS-FRAME-PLAYER") > n_btn,
                   "F0 面板 Focus player 按钮也能取景（不依赖键盘）")
         n_frame = count(tap, "LS-FRAME-PLAYER")
-        ctrl_period(hwnd)
+        press_home(hwnd)
         check(count(tap, "LS-FRAME-PLAYER") > n_frame,
-              "F1 Ctrl+. 触发一次取景（LS-FRAME-PLAYER 递增）")
+              "F1 Home 触发一次取景（LS-FRAME-PLAYER 递增）")
         frame_lines = lines_with(tap, "LS-FRAME-PLAYER")
         line = frame_lines[-1] if frame_lines else ""
 

@@ -819,6 +819,46 @@ int runCameraMoveSelfTest() {
         chk("G6b 给够时间后落到 A", nearVec(s.camera().position(), glm::vec3(0, 0, 5), 1e-3f),
             v3(s.camera().position()));
 
+        // G7 混合**形状**真的接上了（2026-10-31）：同样的时长、同样的中点，
+        //    不同曲线必须给出不同的位置。
+        //
+        //    从 B(10,0,20) 混到 A(0,0,5)，1 秒，走 0.5 秒（a = 0.5）：
+        //      linear  → w=0.500 → x = 10 + (0-10)*0.5  = 5.0
+        //      easein  → w=0.250 → x = 10 + (-10)*0.25  = 7.5
+        //      easeout → w=0.750 → x = 2.5
+        //    ⚠ 只在 0.5 处比：smoother 与 linear 在这里都是 0.5，分不开，
+        //      所以 G7 只盯 easein / easeout 这两个"两侧对称"的极端。
+        //    ⚠⚠ 这条断言的价值在于"三种曲线落到三个不同的数" —— 如果
+        //      `blendCut` 把 curve 参数丢了（永远走 smooth），三个数会一样，
+        //      而 G5 那条（smooth 的中点恰好也是 0.5）照样是绿的。
+        auto midX = [&](BlendCurve c) {
+            cs.setDirectorCamera(gB);
+            cs.blendCut(0.0f);          // 硬切到 B，建立确定的起点
+            cs.update(s, 0.0f);
+            cs.setDirectorCamera(gA);
+            cs.blendCut(1.0f, c);
+            cs.update(s, 0.5f);
+            return s.camera().position().x;
+        };
+        cs.clearDirectorCamera();
+        cs.update(s, 0.0f);
+        cs.setDirectorCamera(gB);
+        cs.blendCut(0.0f);
+        cs.update(s, 1.0f);             // 稳定落在 B
+        const float xLin = midX(BlendCurve::Linear);
+        const float xIn = midX(BlendCurve::EaseIn);
+        const float xOut = midX(BlendCurve::EaseOut);
+        chk("G7a linear 在 0.5 处走一半（x≈5.0）", near(xLin, 5.0f, 0.1f),
+            "x=" + std::to_string(xLin));
+        chk("G7b easein 在 0.5 处只走了 1/4（x≈7.5）", near(xIn, 7.5f, 0.1f),
+            "x=" + std::to_string(xIn));
+        chk("G7c easeout 在 0.5 处已走 3/4（x≈2.5）", near(xOut, 2.5f, 0.1f),
+            "x=" + std::to_string(xOut));
+        chk("G7d 三条曲线在同一时刻互不相同（参数没被丢掉）",
+            std::fabs(xLin - xIn) > 1.0f && std::fabs(xLin - xOut) > 1.0f,
+            "lin=" + std::to_string(xLin) + " in=" + std::to_string(xIn) +
+                " out=" + std::to_string(xOut));
+
         cs.clearDirectorCamera();
         cs.clearDesiredPose();
     }

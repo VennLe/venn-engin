@@ -36,8 +36,10 @@
 #include "dialogue/DialogueAsset.h"
 #include "dialogue/DialogueRunner.h"
 
+#include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace dialogue {
 
@@ -48,6 +50,24 @@ enum class Press {
     Moved,       // 真的走到了下一句
     NeedChoice,  // 当前这行有选项，等 `choose()`
     Finished,    // 说完最后一句
+    // D1（2026-10-31）：正文已经全出，但**这句的语音还在播** → 不翻页。
+    // 为什么不做成"自动推进"：那会让"点得快"的玩家说不出话也得等；
+    // 也不做成静默返回 `Revealed` —— 那与"刚补完打字机"是两种不同的画面
+    // （前者要提示"还在播"，后者不用），合并掉之后 UI 无从区分。
+    WaitingVoice,
+};
+
+// 语音钩子（D1）。**默认不设 = 老行为逐位不变**。
+//
+// 为什么不让 DialoguePlayer 直接持有 AudioSystem：与
+// `SequencerSystem` 不持有 `CameraSystem*` 是同一条纪律 —— 引擎的表现层
+// 只产出"意图"，接不接、怎么接由宿主决定。这里更进一步：连"播"这个动作
+// 都是宿主给的，因为 editor 与 runtime 的音频实例本来就不同。
+struct VoiceHooks {
+    // 播一句语音，返回 false = 没播（设备没开 / 素材缺）。失败不阻塞对话。
+    std::function<bool(const std::string&)> play;
+    // 这一句还在响吗。**必须有超时兜底** —— 见 `beginNodeVoice()`。
+    std::function<bool()> playing;
 };
 
 class DialoguePlayer {
@@ -92,8 +112,28 @@ class DialoguePlayer {
     int choiceCount() const { return m_runner.choiceCount(); }
     int steps() const { return m_runner.steps(); }
 
+    // ---- 语音（D1）----
+    // 由宿主注入（RuntimeApp / EditorApp）。传空 `VoiceHooks{}` = 关掉语音。
+    void setVoiceHooks(VoiceHooks h) {
+        m_voice = std::move(h);
+        ++m_hookGen;
+    }
+    const VoiceHooks& voiceHooks() const { return m_voice; }
+    // 钩子代数：每 `setVoiceHooks` 一次 +1。`DialogueSystem` 靠它判断
+    // "这个组件上的播放器要不要重装" —— 见 `DialogueSystem::tick` 里那段。
+    unsigned hookGen() const { return m_hookGen; }
+    // 这一句等了多久（秒）与它的上限。日志/断言用。
+    // ⚠ `limit == 0` 表示"这句没有语音（或钩子没装）"，不是在等。
+    float voiceWait() const { return m_voiceWait; }
+    float voiceWaitLimit() const { return m_voiceLimit; }
+    // 因为语音没播完而被挡下的推进次数。**它是"卡住"的唯一早期信号**：
+    // 钩子恒为 true 时这个数会一直涨到超时，日志里能看出来。
+    int voiceStalls() const { return m_voiceStalls; }
+
   private:
     void resetTypewriter();
+    // 进入一个新节点时调用：复位等待计时、按 `DlgNode::voice` 起播、算超时。
+    void beginNodeVoice();
 
     std::string m_path;
     std::shared_ptr<const DialogueAsset> m_asset;
@@ -106,6 +146,13 @@ class DialoguePlayer {
     int m_revealed = 0;
     bool m_finished = false;
     std::string m_error;
+
+    // ---- 语音（D1）----
+    VoiceHooks m_voice;
+    unsigned m_hookGen = 0;      // 见 `hookGen()`
+    float m_voiceWait = 0.0f;    // 这一句已经等了多久（tick 累加）
+    float m_voiceLimit = 0.0f;   // 0 = 这句没有语音，不设门
+    int m_voiceStalls = 0;
 };
 
 } // namespace dialogue

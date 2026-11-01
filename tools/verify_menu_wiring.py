@@ -33,6 +33,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from capture_window import find_window, user32  # noqa: E402
 from verify_asset_drag import force_foreground  # noqa: E402
 from verify_nav_gizmo import MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP  # noqa: E402
@@ -212,7 +213,7 @@ def main():
     # 目标路径走环境变量（脚本点不了系统对话框）。
     save_as_abs = os.path.join(scenes_dir, "_menu_saveas.json")
     if os.path.exists(save_as_abs):
-        os.remove(save_as_abs)
+        safe_remove(save_as_abs)
 
     # 诱饵：旧实现把 Save As 写死成 `assets/scenes/scene.json`，只要这个
     # 文件存在就会被冲掉（这正是"另存为丢数据"的现场）。造一份已知内容

@@ -5439,6 +5439,42 @@ int runAnimationSelfTest() {
         }
     }
 
+    // ---- P2 `restLocal` 的 TRS 分解缓存（2026-10-31）----
+    //
+    // 为什么要缓存：`samplePose` 每帧都从 `setRest()` 起步，而 rest 分解走
+    // `glm::decompose`（一次 4×4 求逆 + 四元数提取）。100 骨 × 60 fps =
+    // 6000 次/秒的纯重复计算 —— rest 是加载完就不变的常量。
+    //
+    // ⚠ 判据必须是**成对**的，缺一条另一边就假绿：
+    //   ① `rest_cache_hit`：采过一次后**就地改 restLocal 但不置脏**，再采
+    //      必须拿到**旧值**。如果实现是每帧实算，这里立刻变成新值 → 红。
+    //   ② `rest_cache_invalidate`：把 `restTRSReady` 置 false 之后，同一份
+    //      restLocal 必须**重新算**（变回新值）。只做 ① 的话，"缓存坏了
+    //      但恰好没人改 restLocal" 会一直绿。
+    //   ③ 两条 `restTRSReady` 把"懒填充"本身钉住（不是构造时就填 —— 那样
+    //      RigEdit 重建骨架之后会拿到别的骨架的缓存）。
+    {
+        assets::Skeleton sk = makeChainSkeleton();
+        Pose p;
+        samplePose(sk, nullptr, 0.0f, p);
+        const glm::vec3 before = p.translation[1];
+        reportFlag("rest_cache_filled", sk.joints[1].restTRSReady);
+
+        // 就地改一根骨，**故意不置脏** —— 这是唯二能让缓存露馅的手法。
+        sk.joints[1].restLocal =
+            glm::translate(glm::mat4(1.0f), glm::vec3(9.0f, 0.0f, 0.0f));
+        samplePose(sk, nullptr, 0.0f, p);
+        report("rest_cache_hit", static_cast<double>(p.translation[1].x),
+               static_cast<double>(before.x), 0.0);
+
+        // 置脏 → 必须重算。
+        sk.joints[1].restTRSReady = false;
+        samplePose(sk, nullptr, 0.0f, p);
+        report("rest_cache_invalidate",
+               static_cast<double>(p.translation[1].x), 9.0, 0.0);
+        reportFlag("rest_cache_refilled", sk.joints[1].restTRSReady);
+    }
+
     const int failures = g_fail;
     VK_LOG_INFO("ANIM-TOTAL pass=%d fail=%d", g_pass, g_fail);
     return failures;

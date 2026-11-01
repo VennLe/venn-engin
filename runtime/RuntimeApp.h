@@ -44,7 +44,9 @@
 #include "audio/AudioSystem.h"        // G14-5：整条音频链的门面
 #include "physics/ContactEvents.h"
 #include "physics/ScenePhysics.h"   // SceneBinding（按值持有，需要完整类型）
+#include "scene/SaveGameState.h"    // 存档基线（G17-3，按值持有）
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -81,6 +83,21 @@ protected:
 
 private:
     void loadStartScene();
+
+    // ---- 存档（G17-3）----
+    // 关卡**加载/切换完之后**调一次：把当时活着的每个实体的内容哈希记成基线。
+    // 不抓的话第一次存档就是全量（不致命），第二次起也永远是全量 ——
+    // 因为"基线为空 = 全量"，而增量正是靠它算出来的。
+    void captureSaveBaseline(const char* reason);
+    // 存到 `--slot` 指定的槽位（F5 与 `--save` 都走这里）。
+    bool quickSave(const char* why);
+    // 从 `--slot` 读回来（F9 与 `--load` 都走这里）。
+    bool quickLoad(const char* why);
+
+    // `openUI(path)` 的落点（C6 第七件）：切"显示哪一份 `.ui.json`"。
+    // **空串 = 关掉**；失败时保住当前那块并返回 false。
+    bool openUiDocument(const std::string& path);
+
     // 脚本点播的换场景（C6 第二批）。
     //   ① `requestSceneSwitch` 只**验路径 + 记下请求**，当场返回；
     //   ② `applyPendingSceneSwitch` 在每帧**最开头**执行真正的切换。
@@ -173,6 +190,11 @@ private:
     // 本局换过几次场景（GAME-SCENE-SWITCH 的计数，也给将来"回到标题"用）
     int m_sceneSwitches = 0;
 
+    // ---- 存档（G17-3）----
+    // 基线。一个会话一份，跟着"关卡加载"走 —— 所以放这里而不是 `Scene` 里
+    // （塞进场景的话 `scene.save` 会把它写进文件，而它是运行时状态）。
+    scene::SaveGameState m_saveState;
+
     // 骨骼动画（A0-3）：推进 SkinnedMeshComponent::time 并重算关节矩阵。
     // 在 simulate() 里排在物理**之前**（A4 的根运动是物理的输入），
     // 与编辑器 Play 的顺序一致。
@@ -241,6 +263,17 @@ private:
     // 0 = 关（正式运行的默认值）。
     float m_dlgAutoSec = 0.0f;
     float m_dlgAutoTimer = 0.0f;
+
+    // 语音钩子的**假**实现（`MYVK_DLG_VOICE_FAKE=<秒>`，0 = 关）。
+    //
+    // 为什么需要它：`DLG-PRESS waiting-voice` 这条日志只有在"这句语音还在响"
+    // 的时候才会出现，而 CI / 无声卡机器上 `playVoice()` 必然失败 → 对话侧
+    // 不设门 → 那条路**永远走不到**。没有这个口子，"钩子接错了"这类 bug
+    // （比如装在 `autoStart` 之后、或者压根没接）在自动化里完全看不出来。
+    // 假钩子只替换"播没播、播完没"，`pressAdvance` / 打字机 / 翻页全部还是
+    // 玩家真正走的那条路。
+    float m_dlgVoiceFakeSec = 0.0f;
+    std::chrono::steady_clock::time_point m_dlgVoiceFakeStart{};
 
     // ---- 鼠标捕获 / 操作态（P5，2026-10-22）----
     //

@@ -185,6 +185,26 @@ def group_b():
     a.pop("generator", None)
     b.pop("generator", None)
 
+    # ⚠ v1 源场景没有 `guid`，dump 走 **v2 写端**会逐实体补上并把 version
+    #   提到 2 —— 不记账的话 B1 只会报一串 `/entities[i]/guid`，看着像
+    #   "往返丢字段"，其实是正常升级（guid 的往返由 `verify_guid` 的 C/D 组
+    #   与 `--selftest guid` 专门覆盖）。这里把升级本身断言掉，再剔除 guid
+    #   做逐字段比较 —— 这样"两端都没 guid"也过不了。
+    miss_guid = [i for i, e in enumerate(b.get("entities") or [])
+                 if not isinstance(e.get("guid"), str)]
+    check("B0 dump 给每个实体补了 guid（v2 写端真的在写）",
+          bool(b.get("entities")) and not miss_guid,
+          "entities=%d 缺 guid=%d"
+          % (len(b.get("entities") or []), len(miss_guid)))
+    check("B0b dump 的 version 升到 2", b.get("version") == 2,
+          "version=%r（源 %r）" % (b.get("version"), a.get("version")))
+    a.pop("version", None)
+    b.pop("version", None)
+    for d in (a, b):
+        for e in d.get("entities") or []:
+            if isinstance(e, dict):
+                e.pop("guid", None)
+
     bad = []
 
     def walk(x, y, path=""):

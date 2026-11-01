@@ -37,6 +37,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from capture_window import capture_client, find_window, user32       # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -412,7 +413,7 @@ if __name__ == "__main__":
     rc = main()
     for f in (SCENE_ABS, GAMEJSON):
         try:
-            os.remove(f)
+            safe_remove(f)
         except OSError:
             pass
     sys.exit(rc)

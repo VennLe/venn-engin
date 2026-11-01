@@ -1857,6 +1857,32 @@ bool LandscapeEditor::handleShortcuts() {
     }
     if (io.KeyCtrl || io.KeyAlt) return false;
 
+    // ---- `Home` 是同一个取景的**单键**入口（2026-10-31）----
+    // ⚠ 为什么还要第三条路：`Ctrl+.` 在中文 Windows 上会被微软拼音的"中英标点
+    //   切换"吃掉；而**任何带修饰键的组合**在自动化注入下都验不了 —— 实测
+    //   `keybd_event(VK_CONTROL)` 之后 `io.KeyCtrl` 依然是 false（GLFW 的
+    //   `getMods()` 走 GetKeyState，注入的修饰键在它眼里不存在），连 `Ctrl+Z`
+    //   都收不到。于是"回到工作视角"这条功能在用例里**没有任何可断言的人工入口**，
+    //   一条都没法证明它还活着。
+    //   单键无修饰符 → 灌进窗口就能到 ImGui，也不经过 IME 的标点切换。
+    //   键位选 Home 而不是 F：`F` 已经给了"聚焦选中"（EditorApp），在 Landscape
+    //   模式下选中的往往就是地形本身，按 F 会把镜头贴着地面拉过去，语义打架。
+    //   Home 在多数 DCC 里就是"回到整体/默认视图"，与这里的含义一致。
+    // ⚠ `WantTextInput` 必须在：`Home` 在文本框里是"光标到行首"，而这条
+    //   快捷键链**没有**全局的 WantTextInput 守卫（EditorApp::handleShortcuts
+    //   里那一串 F / F2 / 数字键同样裸跑）—— 这里至少别把新加的键也裸着。
+    // ⚠ 诊断放在守卫**外面**：在守卫里面的话，"被 WantTextInput 挡住"和
+    //   "键根本没到 ImGui"两种情形都看不到日志，查不出来。
+    if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
+        VK_LOG_INFO("LS-HOME-KEY wantText=%d wantKb=%d navActive=%d",
+                    io.WantTextInput ? 1 : 0, io.WantCaptureKeyboard ? 1 : 0,
+                    ImGui::GetIO().NavActive ? 1 : 0);
+        if (!io.WantTextInput) {
+            focusCameraAtPlayer();
+            return true;
+        }
+    }
+
     // `[` / `]` 调半径、`,` / `.` 调强度 —— 与 UE 一致（那里是 [ ] 调刷子大小）。
     //
     // ⚠ 这几个都是 OEM 键：中文键盘布局下 GLFW 可能把它们翻译成
@@ -2437,7 +2463,7 @@ void LandscapeEditor::drawStatsSection() {
             ImGui::GetItemRectMax());
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("%s", TR("Camera back to the player at working "
-                                   "height (Ctrl+.)"));
+                                   "height (Ctrl+. or Home)"));
     }
     if (panelGridButton(TR("Save now"), 2, cols, bw, kBtnRowH)) saveAssets(true);
     logRect("LS-SAVE-NOW", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
@@ -2783,8 +2809,10 @@ void LandscapeEditor::drawBrushSection() {
                            "Right-drag moves the camera. Scroll = radius, "
                            "Shift+scroll = strength."));
     // 取景提示（2026-10-24）：进模式时镜头贴着角色，飞远了按这个回来。
-    ImGui::TextDisabled("%s", TR("Ctrl+. snaps the view back to the player "
-                                 "at a normal working height."));
+    // 2026-10-31：补上 `Home` —— 中文 Windows 上 `Ctrl+.` 会被拼音的"中英
+    // 标点切换"吃掉，只写组合键等于告诉用户一个按了没反应的键。
+    ImGui::TextDisabled("%s", TR("Ctrl+. or Home snaps the view back to the "
+                                 "player at a normal working height."));
     if (m_stroking) {
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "%s",
                            TR("painting..."));

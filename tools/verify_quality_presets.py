@@ -25,10 +25,11 @@ Low~Cinematic 了 —— 进编辑器之后反而没有对应入口。本任务�
        **验收原文**："切到 Low 后断言 SSR 生效值为 0"
     B4 Apply 之后自检 `mismatches=0`（应用结果与档位定义逐项一致）
     B5 点 Epic → Apply → `ssao=1 ssr=1 taa=1 lshadow=1`、cascades=4
-    B6 点 Save → `QUALITY-UI save ... keys=25`，且文件内容与档位逐项一致
-       （22 个 enable + 3 个数值；Low 的 cascades 是 1、Cinematic 是 4）
+    B6 点 Save → `QUALITY-UI save ... keys=N`，且文件内容与档位逐项一致
+       （N = enable 数 + 3 个数值，**由引擎自检报的 enable 数推出**，
+        不写死：Low 的 cascades 是 1、Cinematic 是 4）
     B7 退出码 0、无 VUID / VALIDATION
-  C 组（GUI，第二次启动）读回落盘文件 → `RENDER-SET chain=project=25`
+  C 组（GUI，第二次启动）读回落盘文件 → `RENDER-SET chain=project=N`
       且 `QUALITY-UI check preset=Epic mismatches=0`（**档位能被读回来**）
 
 用法：
@@ -59,6 +60,18 @@ SNAP_RE = re.compile(
 CHECK_RE = re.compile(r"QUALITY-UI check preset=(\S+) mismatches=(\d+)")
 
 FAILS = []
+
+# 引擎自检报出来的"有 enable 参数的特性数"。**不写死** —— 它是从
+# `kFeatures[]` 派生出来的（`enableTable()`），每加一个带 `x.enabled`
+# 的特性就 +1。写死的那版（22/25）就是这样烂掉的：2026-10-31 实测
+# 引擎报 enable=24 → 落盘 27 键，而用例还在等 25，红得跟代码无关。
+# 现在 B12 / C2 都用它当尺子：两条路径（自检计数 vs 落盘文件）必须自洽。
+N_ENABLE = [None]      # 用 list 当可变单元素盒（比 global 好查）
+
+
+def expected_keys():
+    """落盘应有的键数 = enable 数 + 3 个数值项（cascades/dist/lights）。"""
+    return (N_ENABLE[0] + 3) if N_ENABLE[0] else None
 
 
 def check(name, cond, detail=""):
@@ -109,9 +122,11 @@ def run_selftest():
     m = re.search(r"QUALITY-TEST begin presets=(\d+) values=(\d+) "
                   r"platforms=(\d+) enable=(\d+)", out)
     if m:
-        check("A4 表规模 5 档 / 3 数值 / 5 平台 / 22 开关",
+        N_ENABLE[0] = int(m.group(4))
+        check("A4 表规模 5 档 / 3 数值 / 5 平台", 
               (m.group(1), m.group(2), m.group(3)) == ("5", "3", "5"),
-              "presets=%s values=%s platforms=%s enable=%s"
+              "presets=%s values=%s platforms=%s enable=%s（enable 数不写死，"
+              "B12/C2 拿它当尺子）"
               % (m.group(1), m.group(2), m.group(3), m.group(4)))
     else:
         check("A4 表规模", False, "没找到 QUALITY-TEST begin 行")
@@ -261,8 +276,9 @@ def verify_file(cfg_path, expect_preset="Epic"):
     with open(cfg_path, encoding="utf-8") as f:
         r = json.load(f)
     keys = [k for k in r if not k.startswith("_") and k != "version"]
-    check("B12 落盘 25 个键（22 开关 + 3 数值）", len(keys) == 25,
-          "keys=%d" % len(keys))
+    want_n = expected_keys()
+    check("B12 落盘键数 = enable 数 + 3 数值项", want_n is not None and len(keys) == want_n,
+          "keys=%d want=%s（enable=%s）" % (len(keys), want_n, N_ENABLE[0]))
     # Epic：数值项 = cascades 4 / dist 120 / lights 8
     want = {"shadow.cascades": 4, "shadow.distance": 120.0,
             "lshadow.maxLights": 8}
@@ -292,9 +308,10 @@ def run_gui_reload(work):
         if not tap.wait_rect("QUAL-RECT", 30.0):
             FAILS.append("C1 画质面板没打开（第二轮）")
             return
-        # 读盘：22 个 enable + 3 个数值 = 25
-        ok = tap.wait_line("RENDER-SET chain=project=25", 25.0)
-        check("C2 读回 25 个覆盖项", ok,
+        # 读盘：enable 个开关 + 3 个数值 = expected_keys()
+        want_n = expected_keys() or 25
+        ok = tap.wait_line("RENDER-SET chain=project=%d" % want_n, 25.0)
+        check("C2 读回 %d 个覆盖项" % want_n, ok,
               next((l for l in tap.text().splitlines() if "RENDER-SET chain=" in l), ""))
         # 面板打开时会自检一次（mismatches 应为 0，因为落盘就是 Epic）
         end = time.time() + 15.0

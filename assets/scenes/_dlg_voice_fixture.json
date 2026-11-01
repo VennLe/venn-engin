@@ -1,0 +1,36 @@
+{
+  "_comment": "D1 夹具：语音挡翻页的端到端现场。NPC 上挂 dialogues/_voice_fixture.dlg.json（autoStart），cps 拉高到 120 让正文一帧就出完，于是剩下的事只有一件：语音还在响的时候按推进必须被挡（DLG-PRESS waiting-voice）。判据见 tools/verify_dialogue_voice.py B 组。",
+  "version": 2,
+  "generator": "venn dialogue voice fixture (D1)",
+  "camera": {
+    "target": [0.0, 0.0, 1.0],
+    "yaw": 0.610865,
+    "pitch": 0.314159,
+    "distance": 6.0
+  },
+  "physics": {
+    "enabled": false,
+    "groundPlane": false,
+    "fixedTimeStep": 0.0166666675,
+    "maxSubSteps": 4
+  },
+  "entities": [
+    {
+      "name": "NPC",
+      "transform": {
+        "position": [0.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "dialogue": {
+        "path": "dialogues/_voice_fixture.dlg.json",
+        "enabled": true,
+        "autoStart": true,
+        "cps": 120.0,
+        "startNode": "",
+        "priority": 0
+      }
+    }
+  ]
+}

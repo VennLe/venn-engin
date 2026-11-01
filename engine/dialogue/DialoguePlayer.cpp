@@ -70,6 +70,7 @@ bool DialoguePlayer::start(const std::string& startNode) {
     m_error.clear();
     m_finished = false;
     resetTypewriter();
+    beginNodeVoice();
     return true;
 }
 
@@ -77,6 +78,34 @@ void DialoguePlayer::stop() {
     m_runner.reset();
     m_finished = false;
     resetTypewriter();
+    // ⚠ 停下来要**清掉**语音等待状态：不清的话，下一次 start 到另一个节点时
+    //   如果那句没有语音，`m_voiceLimit` 还留着上一句的值 —— 而
+    //   `pressAdvance` 的判据是"limit > 0 且还在播"，于是会去问一个早就
+    //   不存在的音频状态。
+    m_voiceWait = 0.0f;
+    m_voiceLimit = 0.0f;
+}
+
+// D1：进入新节点时起播语音 + 算超时上限。
+void DialoguePlayer::beginNodeVoice() {
+    m_voiceWait = 0.0f;
+    m_voiceLimit = 0.0f;
+    if (!m_voice.play || !m_voice.playing) return;   // 钩子没装 → 老行为
+    const DlgNode* n = m_runner.current();
+    if (!n || n->voice.empty()) return;
+
+    // 起播失败（设备没开 / 素材缺）→ **不设门**。设了门就会卡在这里等超时，
+    // 而"没声卡"是正常工况（CI 机），不该让所有对话变成"每句等 3 秒"。
+    if (!m_voice.play(n->voice)) return;
+
+    // ⚠⚠ 超时上限**必须有**：`playing()` 是宿主给的，"恒为 true"（音频线程
+    //   挂了 / 声部漏标 active / 素材是 10 分钟的 BGM）都会让对话**永久卡死**
+    //   在某一页，而日志里一条错都没有。按字数估：0.35 s/字 ≈ 慢速朗读；
+    //   下界 3 s 是为了短句（"嗯。"）不被立刻跳过。
+    m_voiceLimit =
+        std::max(3.0f, static_cast<float>(utf8Count(n->text)) * 0.35f);
+    VK_LOG_INFO("DLG-VOICE node=%s voice=%s limit=%.2f", n->id.c_str(),
+                n->voice.c_str(), static_cast<double>(m_voiceLimit));
 }
 
 void DialoguePlayer::resetTypewriter() {
@@ -96,6 +125,13 @@ void DialoguePlayer::tick(float dt, float cps) {
     if (dt > 0.0f) m_elapsed = std::min(m_elapsed + dt, kMaxElapsed);
     const int total = utf8Count(n->text);
     m_revealed = revealedChars(m_elapsed, cps, total);
+    // D1：语音等待计时。用真实 dt（不是填充打字机的那一次跳跃）。
+    // ⚠ 用 `min` **硬钳**在 `m_voiceLimit`：只写 `if (wait < limit) wait += dt`
+    //   也能让门开（判据只看大小），但最后一步会冲过上限一个 dt —— 日志里
+    //   打成 `wait=7.10/7.00`，"上限"这个数就成了摆设，而对拍日志的用例
+    //   只能去猜"过冲到多少算正常"。
+    if (dt > 0.0f && m_voiceLimit > 0.0f)
+        m_voiceWait = std::min(m_voiceWait + dt, m_voiceLimit);
 }
 
 Press DialoguePlayer::pressAdvance(float cps) {
@@ -115,11 +151,24 @@ Press DialoguePlayer::pressAdvance(float cps) {
         return Press::Revealed;
     }
 
+    // ---- ①½ 语音还没播完 → 不翻页（D1）----
+    // ⚠ 位置是硬约束：**在"补完打字机"之后、翻页之前**。
+    //   · 放到 ① 之前 → 玩家想跳字也跳不了（语音一响就锁键盘，手感很差）
+    //   · 放到 ② 之后 → 已经翻页了，这句语音还在响，与下一句叠在一起
+    // ⚠ `m_voiceLimit > 0` 是"这句确实起了语音"的标记；钩子没装 / 起播失败 /
+    //   这句没有 voice 字段时都是 0，此时**一步都不许挡**（老行为逐位不变）。
+    if (m_voiceLimit > 0.0f && m_voice.playing && m_voiceWait < m_voiceLimit &&
+        m_voice.playing()) {
+        ++m_voiceStalls;
+        return Press::WaitingVoice;
+    }
+
     // ---- ② 翻页 ----
     const Advance a = m_runner.advance();
     switch (a) {
         case Advance::Moved:
             resetTypewriter();
+            beginNodeVoice();   // D1：新的一句，换语音
             return Press::Moved;
         case Advance::NeedChoice:
             return Press::NeedChoice;
@@ -139,6 +188,7 @@ bool DialoguePlayer::choose(int index) {
         return false;
     }
     resetTypewriter();
+    beginNodeVoice();   // D1：选项也会跳到新节点，照样换语音
     return true;
 }
 

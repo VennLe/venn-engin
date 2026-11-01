@@ -1730,6 +1730,99 @@ bool morphFromJson(assets::AssetManager& am, const json& j,
 }
 
 // ------------------------------------------------------------
+// 表情预设（B6，2026-11-01）
+// ------------------------------------------------------------
+//
+// 存的是**配置**，不是权重：` ExpressionComponent` 自己不含权重（权重在
+// `morph` 块里）。所以这里只写"挂哪份预设资产、选了哪个表情、眨眼与口型
+// 怎么配"。
+//
+// ⚠ 与 `morph` 的关系：`expression` **必须**写在 `morph` 之后读 —— 它不
+//   需要 MorphComponent，但"Inspector 上先有滑条才有表情"这条对读端没意义；
+//   真正的原因是组件块顺序是既有约定（见 `entityApplyComponentsImpl` 上方
+//   那段注释），插在中间会让老场景与 Prefab 的加载路径出现"两种顺序"。
+//
+// ⚠ 全部字段都是**非默认才写**。一只已经手动调过滑条的角色，加了这个
+//   组件但不改任何设置时，存回去**不许长出一行** `"expression": {...}` ——
+//   否则整个资产库一存盘就是一片脏 diff（与 `blend` / `blendCurve` /
+//   `camera` / `shots` 同一条纪律）。
+//
+// ⚠ `set`（预设资产内容）**不写进场景**：它是资产，不是实例数据。
+//   写进去会让"改了一次预设"只在改了的那张场景里生效。
+json expressionToJson(const ecs::ExpressionComponent& xc) {
+    json j = json::object();
+    if (!xc.presetPath.empty()) j["preset"] = xc.presetPath;
+    if (!xc.presetName.empty()) j["current"] = xc.presetName;
+    if (xc.intensity != 1.0f) j["intensity"] = xc.intensity;
+    // 眨眼默认开 → 只有**关掉**时才写 `blink:false`，
+    // 或者参数被改过时写整块（读端缺键 = 上面那组默认值）。
+    const bool blinkDefault = xc.blinkEnabled && xc.blinkChannel == "blink" &&
+                              xc.blinkInterval == 4.0f && xc.blinkClose == 0.07f &&
+                              xc.blinkHold == 0.03f && xc.blinkOpen == 0.13f;
+    if (!blinkDefault) {
+        json b = json::object();
+        b["enabled"] = xc.blinkEnabled;
+        if (xc.blinkChannel != "blink") b["channel"] = xc.blinkChannel;
+        if (xc.blinkInterval != 4.0f) b["interval"] = xc.blinkInterval;
+        if (xc.blinkClose != 0.07f) b["close"] = xc.blinkClose;
+        if (xc.blinkHold != 0.03f) b["hold"] = xc.blinkHold;
+        if (xc.blinkOpen != 0.13f) b["open"] = xc.blinkOpen;
+        j["blink"] = std::move(b);
+    }
+    const bool lipDefault = !xc.lipSyncEnabled && xc.mouthChannel == "mouth_open" &&
+                            xc.mouthGain == 1.0f;
+    if (!lipDefault) {
+        json l = json::object();
+        l["enabled"] = xc.lipSyncEnabled;
+        if (xc.mouthChannel != "mouth_open") l["channel"] = xc.mouthChannel;
+        if (xc.mouthGain != 1.0f) l["gain"] = xc.mouthGain;
+        j["lipSync"] = std::move(l);
+    }
+    // 一个字段都没写 → 返回 null，调用方不落键。
+    return j.empty() ? json(nullptr) : j;
+}
+
+// 返回 false = 没有任何有效配置（调用方不建组件）。
+// ⚠ 这里**不加载**预设资产：那是 `assets::resolveAssetPath` + 读盘，
+//   属于运行时懒加载（见 `ExpressionDriver`）。读场景时做 IO 会让
+//   "打开一个别人的工程"变成几十次磁盘探测。
+bool expressionFromJson(const json& j, ecs::ExpressionComponent& out) {
+    if (!j.is_object() || j.empty()) return false;
+    out = ecs::ExpressionComponent{};
+    if (j.contains("preset") && j["preset"].is_string())
+        out.presetPath = j["preset"].get<std::string>();
+    if (j.contains("current") && j["current"].is_string())
+        out.presetName = j["current"].get<std::string>();
+    if (j.contains("intensity") && j["intensity"].is_number())
+        out.intensity = j["intensity"].get<float>();
+    if (j.contains("blink") && j["blink"].is_object()) {
+        const json& b = j["blink"];
+        if (b.contains("enabled") && b["enabled"].is_boolean())
+            out.blinkEnabled = b["enabled"].get<bool>();
+        if (b.contains("channel") && b["channel"].is_string())
+            out.blinkChannel = b["channel"].get<std::string>();
+        if (b.contains("interval") && b["interval"].is_number())
+            out.blinkInterval = b["interval"].get<float>();
+        if (b.contains("close") && b["close"].is_number())
+            out.blinkClose = b["close"].get<float>();
+        if (b.contains("hold") && b["hold"].is_number())
+            out.blinkHold = b["hold"].get<float>();
+        if (b.contains("open") && b["open"].is_number())
+            out.blinkOpen = b["open"].get<float>();
+    }
+    if (j.contains("lipSync") && j["lipSync"].is_object()) {
+        const json& l = j["lipSync"];
+        if (l.contains("enabled") && l["enabled"].is_boolean())
+            out.lipSyncEnabled = l["enabled"].get<bool>();
+        if (l.contains("channel") && l["channel"].is_string())
+            out.mouthChannel = l["channel"].get<std::string>();
+        if (l.contains("gain") && l["gain"].is_number())
+            out.mouthGain = l["gain"].get<float>();
+    }
+    return true;
+}
+
+// ------------------------------------------------------------
 // 动画器（角色链 A1，2026-10-19）
 // ------------------------------------------------------------
 //
@@ -2887,6 +2980,10 @@ json cameraComponentToJson(const ecs::CameraComponent& c) {
     if (c.clipNear > 0.0f) j["clipNear"] = c.clipNear;
     if (c.clipFar > 0.0f) j["clipFar"] = c.clipFar;
     if (c.shutterAngle != 0.0f) j["shutterAngle"] = c.shutterAngle;
+    // 默认 0（居中）不写盘 —— 与"没有这一项"逐位等价，老工程读进来
+    // 得到的也是 0。⚠ 只在 `shutterAngle > 0` 时写更"干净"，但那样
+    // "先调位置再开快门"的编辑顺序会把刚调的值丢掉，所以按值判断。
+    if (c.shutterPosition != 0.0f) j["shutterPosition"] = c.shutterPosition;
 
     // ---- rig：Follow Path ----
     if (c.pathGuid != 0) j["pathGuid"] = ecs::guidToHex(c.pathGuid);
@@ -2937,6 +3034,10 @@ ecs::CameraComponent cameraComponentFromJson(const json& j) {
     c.clipNear = j.value("clipNear", c.clipNear);
     c.clipFar = j.value("clipFar", c.clipFar);
     c.shutterAngle = j.value("shutterAngle", c.shutterAngle);
+    // ⚠ 读回来**不夹** [-1,1]：夹了会让"存→读→存"不再逐字节相同
+    //   （手改过的越界值被静默改写）。夹紧只放在唯一的消费点
+    //   `FrameGraph::record`，那里是漏斗口，只用守一次。
+    c.shutterPosition = j.value("shutterPosition", c.shutterPosition);
     if (j.contains("pathGuid") && j["pathGuid"].is_string()) {
         c.pathGuid = ecs::parseGuidHex(j["pathGuid"].get<std::string>());
     }
@@ -3146,8 +3247,13 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
                         : 0);
     }
 
-    // GPU 粒子发射器（R6-1）。与贴花 / 探针同理：发射器**没有网格**
-    //（几何是顶点着色器现拼的 billboard），同样不适用 skipped++ 那句。
+    // 表情预设 + 眨眼/口型配置（B6）。写在 `morph` 之后（见上面那段说明）。
+    if (const auto* xc = w.get<ecs::ExpressionComponent>(e)) {
+        json jx = expressionToJson(*xc);
+        if (!jx.is_null()) je["expression"] = std::move(jx);
+    }
+
+    // GPU 粒子发射器（R6-1）。与贴花 / 探针同理：发射器**没有网格**    //（几何是顶点着色器现拼的 billboard），同样不适用 skipped++ 那句。
     if (const auto* fx = w.get<ecs::ParticleEmitterComponent>(e))
         je["particleEmitter"] = particleEmitterToJson(*fx);
 
@@ -3336,6 +3442,10 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
         je.contains("cameraPath") ||
         je.contains("skinned") || je.contains("animator") ||
         je.contains("morph") ||
+        // B6 表情预设。它与 `morph` 一般同在，但单独列出来的理由与别的
+        // 几条一样：出现"只有表情配置、没有 morph 组件"的实体（资产暂时
+        // 缺 blend shape）时不能算 skipped。⚠ 写端与读端各一份，改一处改两处。
+        je.contains("expression") ||
         // 表演层三件套 + IK + 挂点。**必须在这里**：一个只挂 IK/挂点的
         // 实体可以没有网格（挂点是"钉在别人骨头上的空物体"就是典型），
         // 漏了它会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
@@ -3391,8 +3501,9 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
 //      沿着父链找骨架）。
 //   2. `created` 是"文件下标 → 实体"的映射，父引用（`parent`）靠它解析。
 //      写子树时传"子树内的下标表"，跨集合的父引用**不支持**（Roadmap D3）。
-//   3. 组件块顺序不能换：mesh → material → skinned → morph → animator →
-//      表演层。`modelFromSource` 命中 AssetManager 缓存靠的就是这个顺序。
+//   3. 组件块顺序不能换：mesh → material → skinned → morph → expression →
+//      animator → 表演层。`modelFromSource` 命中 AssetManager 缓存靠的就是
+//      这个顺序。
 //
 // 返回 true = 这个实体"有内容"（有网格/材质，或挂着任一非网格组件）。
 // ============================================================
@@ -3511,6 +3622,27 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
         } else {
             VK_LOG_INFO("SCENE-MORPH entity=%u ok=0",
                         static_cast<unsigned>(e.id));
+        }
+    }
+
+    // ---- 表情预设（B6）----
+    // 与 `morph` 分开两次解析：`expression` 不需要 MorphComponent，
+    // 而 `morph` 的失败（资产没有 blend shape）不该连累表情配置丢掉。
+    if (je.contains("expression")) {
+        ecs::ExpressionComponent xc;
+        if (expressionFromJson(je["expression"], xc)) {
+            if (auto* p = w.get<ecs::ExpressionComponent>(e))
+                *p = xc;
+            else
+                w.add<ecs::ExpressionComponent>(e, xc);
+            VK_LOG_INFO("SCENE-EXPR entity=%u preset=%s current=%s "
+                        "intensity=%.2f blink=%d lip=%d ok=1",
+                        static_cast<unsigned>(e.id), xc.presetPath.c_str(),
+                        xc.presetName.c_str(),
+                        static_cast<double>(xc.intensity),
+                        xc.blinkEnabled ? 1 : 0, xc.lipSyncEnabled ? 1 : 0);
+        } else {
+            VK_LOG_INFO("SCENE-EXPR entity=%u ok=0", static_cast<unsigned>(e.id));
         }
     }
 
@@ -3929,6 +4061,10 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
         je.contains("cameraPath") ||
         je.contains("skinned") || je.contains("animator") ||
         je.contains("morph") ||
+        // B6 表情预设。它与 `morph` 一般同在，但单独列出来的理由与别的
+        // 几条一样：出现"只有表情配置、没有 morph 组件"的实体（资产暂时
+        // 缺 blend shape）时不能算 skipped。⚠ 写端与读端各一份，改一处改两处。
+        je.contains("expression") ||
         // 表演层三件套 + IK + 挂点。**必须在这里**：一个只挂 IK/挂点的
         // 实体可以没有网格（挂点是"钉在别人骨头上的空物体"就是典型），
         // 漏了它会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。

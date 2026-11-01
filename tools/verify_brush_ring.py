@@ -363,4 +363,8 @@ def main():
 if __name__ == "__main__":
     rc = main()
     print("\n==== %d passed, %d failed ====" % (g_pass, g_fail))
+    # ⚠ 回归闸门只认 `结果: PASS` / `结果: FAIL: ...`（ASCII 冒号）。
+    #   只打 `==== N passed ====` 会让**全绿**被判成红 —— 这是本项目
+    #   反复踩过的坑（"日志里全是 OK，run_regression 报 FAIL"）。
+    print("结果: %s" % ("PASS" if g_fail == 0 else "FAIL: %d 项未通过" % g_fail))
     sys.exit(0 if g_fail == 0 else 1)

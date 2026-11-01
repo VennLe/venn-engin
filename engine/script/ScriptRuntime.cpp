@@ -393,6 +393,15 @@ void ScriptRuntime::tick(scene::Scene& sc, double simTime, float dt,
         }
 
         ScriptError err;
+        // ⚠ print 的排空必须抽成一个**两处都调**的小函数：报错那条
+        //   `continue` 会跳过循环末尾的排空，于是"同一帧里先 print 再报错"
+        //   的那句 print 直接消失 —— 而那恰恰是排查现场时最想要的一行
+        //   （`print("到了第 5 行")`，第 6 行炸了）。
+        //   `verify_director_api.py` 的 ⑨ 就是被这个吞掉的。
+        auto flushPrints = [&]() {
+            if (!m_printSink) return;
+            for (const std::string& line : inst.prints) m_printSink(inst, line);
+        };
         const bool ok = prog->runFrame(host, ctx, *inst.coro, in, err);
         inst.stepsLastFrame = ctx.steps;
         st.steps += ctx.steps;
@@ -408,6 +417,8 @@ void ScriptRuntime::tick(scene::Scene& sc, double simTime, float dt,
             // ⚠ Failed 这一行必须在这里打：下一个 `continue` 一走，
             //   循环末尾那段日志就永远到不了。
             noteState(*this, inst, sc.world());
+            // 报错前已经 `print` 过的东西也要吐出去（见 flushPrints 的注释）。
+            flushPrints();
             continue;
         }
 
@@ -431,9 +442,7 @@ void ScriptRuntime::tick(scene::Scene& sc, double simTime, float dt,
         // 自动化唯一能"文本双证"的东西（另一证是面板像素）。
         noteState(*this, inst, sc.world());
 
-        if (m_printSink) {
-            for (const std::string& line : inst.prints) m_printSink(inst, line);
-        }
+        flushPrints();
     }
 
     m_stats = st;

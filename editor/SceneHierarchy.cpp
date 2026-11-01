@@ -827,6 +827,41 @@ void SceneHierarchy::drawNodeContextMenu(ecs::Entity e) {
         m_hasUnparent = true;
     }
 
+    // ---- G16-4 尾巴：guid 的两条调试便利（2026-10-31）----
+    //
+    // ⚠ 刻意**不在树里常显 guid**：每行都挂一串 16 位十六进制，会把
+    //   "按名字找东西"变成"在一堆数字里找名字"。需要的时候从菜单取。
+    // ⚠ 无 guid 的实体（运行时生成的、手工造的场景）两项都禁用而不是隐藏：
+    //   菜单项忽有忽无会让整张菜单的高度跳变，下一次会点到上一秒还在
+    //   这个位置的那一项（与预制体三件同一条理由）。
+    const ecs::EntityGuid nodeGuid = m_ctx.editorScene().world().guid(e);
+    const bool hasGuid = nodeGuid != ecs::kInvalidGuid;
+    ImGui::BeginDisabled(!hasGuid);
+    if (ImGui::MenuItem(TR("Copy GUID"))) {
+        const std::string hex = ecs::guidToHex(nodeGuid);
+        ImGui::SetClipboardText(hex.c_str());
+        const std::string* n = m_ctx.editorScene().world().name(e);
+        // 锚点：`HIER-GUID copy=%016llx` —— 验收脚本认这行判"剪贴板里那串
+        // 就是这行的 guid"。⚠ 名字放最后，`name=` 里可以有空格。
+        VK_LOG_INFO("HIER-GUID copy=%016llx entity=%u name=%s",
+                    static_cast<unsigned long long>(nodeGuid),
+                    static_cast<unsigned>(e.id),
+                    n ? n->c_str() : "");
+    }
+    ImGui::EndDisabled();
+    // 矩形上报**无条件**（含禁用态）：`IsEnabled()` 为假时矩形仍然有效，
+    // 而自动化要能断言"这一项在正确的位置上、只是灰着"。
+    logRect("HIER-CTX-CopyGuid", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+    if (ImGui::MenuItem(TR("Select by GUID..."))) {
+        m_guidQueryPending = true;   // 下一帧才 OpenPopup，见 .h 里的说明
+        m_guidQuery[0] = '\0';
+        m_guidQueryBad = 0;
+        m_guidQueryMsg.clear();
+    }
+    logRect("HIER-CTX-SelectGuid", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
     // ---- 打开这个对象对应的功能面板 ----
     //
     // 2026-10-18（用户原话："左侧的层级面板中对应的粒子那一项在鼠标右键时
@@ -855,6 +890,121 @@ void SceneHierarchy::drawNodeContextMenu(ecs::Entity e) {
         }
         logRect("HIER-CTX-Physics", ImGui::GetItemRectMin(),
                 ImGui::GetItemRectMax());
+    }
+
+    ImGui::EndPopup();
+}
+
+// `Select by GUID…` 的弹窗（G16-4 尾巴，2026-10-31）。
+//
+// ⚠ 三条"只会静静做错"的地方：
+//   ① 合法性判**两层**，不能只看解析结果：`parseGuidHex` 对 `"0x…"`、短串、
+//      尾随垃圾都返回 `kInvalidGuid`，而**全零串本身也解析成 0** —— 两者
+//      混在一起时，"粘贴了一个 0x 前缀"会被报成"没有这个实体"，
+//      作者就会去翻场景文件找那个根本不存在的 guid。
+//   ② 找到之后走 `m_ctx.select(found)`，不直接改 `m_selection`：选中是
+//      EditorContext 的唯一真相（多选状态也在那儿），绕过去会让树高亮和
+//      Inspector 指向两个不同的东西。
+//   ③ 找不到要说"找不到"，不许静默关窗 —— 静默关窗与成功长得一模一样。
+//
+// ⚠ 刻意**不加** `ImGuiInputTextFlags_CharsHexadecimal`：那个过滤器会把
+//   `0x` 里的 `x` 悄悄吃掉，于是"用户以为他输了 0x…、程序看到的是 0…"。
+//   宁可让他输错，然后明确告诉他错在哪。
+void SceneHierarchy::drawGuidQuery() {
+    if (m_guidQueryPending) {
+        m_guidQueryPending = false;
+        m_guidQueryOpen = true;
+    }
+    // ⚠⚠ **OpenPopup 与 BeginPopupModal 必须用同一个 ID**：`###` 后面那段
+    //   是 ImGui 的稳定 ID（`guidquery`），而 `BeginPopupModal` 原来传的是
+    //   `TRL("Select by GUID")` —— 它的 ID 来自**整个标题字符串**，跟
+    //   `###guidquery` 哈希出两个不同的值。结果：popup 开出、`BeginPopupModal`
+    //   永远返回 false → 点菜单什么都不发生、日志里一个错都没有（2026-10-31
+    //   实测）。标题里带上 `###guidquery` 才能两边对上，顺带解决"切语言时
+    //   标题变了导致 ID 变"的问题。
+    if (m_guidQueryOpen) {
+        // 用 `TRL` 包一层是**为了过 i18n 体检**（裸字面量会被判 B 组未包 TR），
+        // 语义上无所谓：ImGui 的 ID 只取 `###` 之后那段（`guidquery`），
+        // 两种语言的哈希完全一样。
+        ImGui::OpenPopup(TRL("Select by GUID###guidquery"));
+        m_guidQueryOpen = false;
+    }
+    // ⚠ 标题用 `TRL`（标签级），`###` 后面那个 id 才是窗口身份：
+    //   切换语言时标题变了但 id 不变，弹窗不会被"重开一次"。
+    if (!ImGui::BeginPopupModal(TRL("Select by GUID###guidquery"), nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+
+    ImGui::TextUnformatted(TRL("16 hex digits (the same text Copy GUID puts on the clipboard)"));
+    ImGui::SetNextItemWidth(360.0f);
+    if (ImGui::IsWindowAppearing() || m_guidRefocus) {
+        ImGui::SetKeyboardFocusHere();
+        m_guidRefocus = false;
+    }
+    const bool entered =
+        ImGui::InputText("###guidhex", m_guidQuery, sizeof(m_guidQuery),
+                         ImGuiInputTextFlags_EnterReturnsTrue);
+    logRect("HIER-GUID-QUERY", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    if (m_guidQueryBad != 0) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.5f, 1.0f));
+        ImGui::TextWrapped("%s", m_guidQueryMsg.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    const bool clickSelect = ImGui::Button(TRL("Select"), ImVec2(120, 0));
+    logRect("HIER-GUID-OK", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SameLine();
+    const bool clickCancel = ImGui::Button(TRL("Cancel"), ImVec2(120, 0));
+    logRect("HIER-GUID-CANCEL", ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax());
+
+    bool accepted = false;
+    if (clickSelect || entered) {
+        const std::string s(m_guidQuery);
+        const ecs::EntityGuid g = ecs::parseGuidHex(s);
+        if (s.size() != 16) {
+            m_guidQueryBad = 1;
+            m_guidQueryMsg = TRL("need exactly 16 hex digits");
+        } else if (g == ecs::kInvalidGuid) {
+            m_guidQueryBad = 1;
+            m_guidQueryMsg =
+                TRL("an all-zero guid means 'no identity', not an entity");
+        } else {
+            const ecs::Entity found = m_ctx.editorScene().world().find(g);
+            if (!found.valid()) {
+                m_guidQueryBad = 2;
+                m_guidQueryMsg = TRL("no entity in this scene has that guid");
+                // 锚点：验收脚本靠它判"真的查了、真的没有"，而不是"窗没开"。
+                VK_LOG_INFO("HIER-GUID select=%016llx hit=0",
+                            static_cast<unsigned long long>(g));
+            } else {
+                m_ctx.select(found);
+                m_guidQueryBad = 0;
+                m_guidQueryMsg.clear();
+                accepted = true;
+                const std::string* n = m_ctx.editorScene().world().name(found);
+                // `sel` / `n` 是这条断言的真正落点：`select(found)` 调用过
+                // 不代表**选中的就是它**（多选残留会让 Inspector 显示另一个）。
+                // 只看"找到了"会把"选了个集合"读成"选中了这个"。
+                VK_LOG_INFO(
+                    "HIER-GUID select=%016llx hit=1 entity=%u sel=%d n=%zu "
+                    "name=%s",
+                    static_cast<unsigned long long>(g),
+                    static_cast<unsigned>(found.id),
+                    m_ctx.isSelected(found) ? 1 : 0,
+                    static_cast<size_t>(m_ctx.selectionCount()),
+                    n ? n->c_str() : "");
+            }
+        }
+    }
+    // 判失败 → 下一帧把焦点塞回输入框（见 .h 里 m_guidRefocus 的说明）
+    if (!accepted && (clickSelect || entered)) m_guidRefocus = true;
+    if (clickCancel || accepted) {
+        m_guidQueryBad = 0;
+        m_guidQueryMsg.clear();
+        ImGui::CloseCurrentPopup();
     }
 
     ImGui::EndPopup();
@@ -1110,6 +1260,13 @@ void SceneHierarchy::draw() {
     ImGui::Separator();
     ImGui::TextDisabled(TR("%zu entities   |   %zu roots"), sc.objectCount(),
                         roots.size());
+
+    // G16-4 尾巴：`Select by GUID…` 的弹窗。
+    // ⚠ 放在本窗口的 Begin/End **之间**、树画完之后：
+    //   · 不能在 `drawNodeContextMenu` 里开 —— 那儿还在右键 popup 的栈上，
+    //     模态会被外层 popup 抢走 focus（按钮点不中）；
+    //   · 不能放到 `ImGui::End()` 之后 —— 那样它属于"上一个窗口"的上下文。
+    drawGuidQuery();
 
     ImGui::End();
 

@@ -67,6 +67,7 @@ BIN = os.path.join(ROOT, "build", "bin")
 EDITOR_EXE = os.path.join(BIN, "Editor.exe")
 
 sys.path.insert(0, HERE)
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402
 from verify_add_menu import LogTap                      # noqa: E402
 
 FRAMES = 120
@@ -555,7 +556,7 @@ def main():
             p = os.path.join(BIN, name)
             if os.path.exists(p):
                 try:
-                    os.remove(p)
+                    safe_remove(p)
                 except OSError:
                     pass
 

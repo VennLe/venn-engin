@@ -2602,7 +2602,7 @@ void CharacterWindow::drawPosePanel() {
         // 面板上不写清楚，读者就会按错的那一半去调参数。
         ImGui::TextDisabled(TR("Speed"));
         ImGui::SameLine(kWalkLabelW);
-        ImGui::Text("%.3f m/s", static_cast<double>(m_gaitReport.nominalSpeed));
+        ImGui::Text(TRL("%.3f m/s"), static_cast<double>(m_gaitReport.nominalSpeed));
         // 这三个是这一整块存在的理由：表 §6 的硬规则在数值上就是"约等于 0"。
         ImGui::TextDisabled(TR("Foot drift (stance)"));
         ImGui::TextWrapped(TR("slide %.2f / vertical %.2f / line %.2f mm"),

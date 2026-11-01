@@ -52,6 +52,21 @@ STATE_RE = re.compile(
     r"PLAYER-STATE '([^']*)' mode=(\S+) "
     r"pos=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\) "
     r"yaw=(-?[\d.]+) pitch=(-?[\d.]+)"
+    # ⚠⚠ `arm=` / `cam=` 是 2026-10-24 加进引擎的（"贴墙时镜头钻进墙体"的
+    #   证据：弹簧臂长 + 相机世界位置）。它们**插在 pitch 和 miv 之间**，
+    #   而这两个字段又都是可选的 —— 老正则 `pitch=..(?: miv=)?(?: cap=)?`
+    #   因此**一条都匹配不上 cap**，`group(9)` 恒为 None。
+    #
+    #   症状：`capture_ready()` 等 8 秒拿不到 cap=1 → `enter_play()` 返回
+    #   `vp=None` → `verify_frame_pacing` 报 `[FAIL] 进 Play + 点视口接管`
+    #   然后 rc=3 提前退出，`verify_player` 报"探针 cap=1 拿不到"。看起来
+    #   像 P8 的鼠标接管坏了，实际是**夹具陈旧**，产品一行没错。
+    #
+    #   修法刻意用**非捕获组**：分组编号 1~9 保持原样（8=miv、9=cap），
+    #   下面几十处 `group(2/3/4/8/9)` 一个都不用改。谁要用 arm/cam 再加
+    #   具名组，别往中间插捕获组 —— 那会把 8/9 顶到 10/11。
+    r"(?: arm=[\d.]+)?"
+    r"(?: cam=\([^)]*\))?"
     r"(?: miv=(\d))?(?: cap=(\d))?")
 
 
@@ -212,10 +227,22 @@ def capture_ready(tap, hwnd, vp, timeout=8.0):
     才能交互"）。所以任何"注入键鼠然后断言角色动了"的用例，都必须先过这
     一道 —— 以前只等 `miv=1`（鼠标在视口矩形内）就开打了，现在不够。
 
+    ⚠⚠ 2026-11-01 改：原来这里走 `click_client()`（PostMessage 合成
+    WM_LBUTTONDOWN）。P8 的接管是 **GLFW** 在看真实按键/光标状态，合成
+    消息它不认 —— 于是 8 秒里怎么补点都拿不到 cap=1，整条用例在
+    `enter_play` 就返回 `vp=None`，而外部看到的是"[FAIL] 进 Play + 点视口
+    接管 / rc=3"，看起来像 P8 功能坏了。实测同一个二进制：连跑 5 次全过，
+    紧接着连跑 3 次全挂 —— 典型的"窗口不在前台"。
+    改成 ①`force_foreground`（attach-thread-input + ALT 兜底，见
+    `verify_asset_drag.py` 的说明）②真实 `mouse_event` ③光标预热（两次
+    MOVE + 静置，上一动作常把光标甩出客户区）。
     返回 True 表示 cap=1。
     """
+    from verify_asset_drag import force_foreground, move_to, press, release
     end = time.time() + timeout
     clicked = 0.0
+    if not force_foreground(hwnd):
+        print("  ⚠ capture_ready：force_foreground 失败（窗口可能不在前台）")
     while time.time() < end:
         ss = all_states(tap)
         if ss and ss[-1].group(9) == "1":
@@ -225,7 +252,13 @@ def capture_ready(tap, hwnd, vp, timeout=8.0):
         if time.time() - clicked > 1.5:
             clicked = time.time()
             cx, cy = center(vp)
-            click_client(hwnd, cx, cy)
+            move_to(hwnd, cx, cy)
+            time.sleep(0.15)
+            move_to(hwnd, cx, cy)
+            time.sleep(0.2)
+            press()
+            time.sleep(0.06)
+            release()
         time.sleep(0.2)
     return False
 

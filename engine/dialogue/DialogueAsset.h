@@ -50,6 +50,9 @@ struct DlgNode {
     std::string speaker;  // 说话人**显示名**（同一个人多处写同一个名字）
     std::string text;     // 台词本体（可以含 `\n`）
     std::string nextId;   // 说完去哪；空 = 结束（有 choices 时必须为空）
+    // 这句的语音（音频路径，走 `assets/` 根）。空 = 这句没有语音（老资产）。
+    // D1：`DialoguePlayer` 通过宿主注入的钩子播它，并在"还没播完"时不翻页。
+    std::string voice;
     std::vector<DlgChoice> choices;
 };
 

@@ -24,6 +24,7 @@
 #include "audio/Mixer.h"
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -105,6 +106,46 @@ public:
     double musicPositionSeconds() const;
     bool musicPlaying() const { return m_stream.active; }
     void stopAll();
+
+    // ---- 语音（D1，2026-10-31）----
+    //
+    // 缺口原话（`docs/remaining_work_2026-10-27.md` §2.4 D1）：
+    //   "`startVoice` 返回句柄，但**无「播完了」查询/回调**"
+    //   → "语音播完再进下一句"做不了 → 卡住 C2 的语音版。
+    //
+    // 为什么不是"给个回调"：这一层的调用方是 `DialogueSystem` / 脚本，
+    // 它们都是**每帧轮询**的推进模型（没有事件总线）。回调会把
+    // "音频线程何时结束"变成"主线程要重入剧本推进"—— 那是最容易出
+    // 重入 bug 的形状。所以给的是**两个可轮询的量**：
+    //   `voicePlaying()` 播没播完
+    //   `voiceSerial()`  换没换句（宿主据此知道"该等的是新那一句"）
+    //
+    // 播一句语音（`BusId::Voice`）。返回 false = 设备没开 / 素材读不出来
+    // —— 与 `playOneShot` 同语义，**不抛异常**。
+    bool playVoice(const std::string& clipPath, float volume = 1.0f);
+
+    // 语音还在播吗。
+    // ⚠⚠ 刚 `playVoice()` 之后的约一个 mix block 里，音频线程还没把声部
+    //   标成 active —— 直接读 `activeVoicesOnBus` 会得到 0，宿主会在
+    //   **第一帧**就判定"播完了"然后立刻跳到下一句（整段语音听不见）。
+    //   所以这里带一个宽限期：最近 `kVoiceGraceMs` 内发起过就算在播。
+    bool voicePlaying() const;
+
+    // 语音串号：每成功发起一句 +1。宿主记下"我等的第 N 句"，
+    // `voiceSerial() != N` 说明已经换了（被打断 / 又有新的一句）。
+    // 0 = 这一段会话里从来没播过语音。
+    std::uint64_t voiceSerial() const { return m_voiceSerial; }
+
+    // 语音总线当前的 **RMS 电平**（0..1 量级）。B6 口型驱动的唯一输入。
+    //
+    // 为什么要真电平而不是"在播就张 0.8 的嘴"：嘴型与音量脱钩之后，
+    // 一句拖长的元音和一句急促的爆破音会得到**一模一样**的嘴 ——
+    // 那比不做口型更出戏（观众能立刻看出是随机动画）。
+    //
+    // ⚠ 没有语音在播时返回 0（读的就是混音器那一块的能量）；
+    //   设备没开（null 后端）时也返回 0 —— 此时口型会停在闭嘴上，
+    //   这是对的：没有声音就不该有嘴型。
+    float voiceLevel() const;
 
     // ---- 音量 ----
     void setBusGain(BusId bus, float gain);
@@ -191,6 +232,14 @@ private:
     std::uint64_t m_statsLines = 0;
     float m_retryTimer = 0.0f;
     bool m_devfailLogged = false;
+
+    // ---- 语音（D1）----
+    // ⚠ `m_voiceSerial` 是**主线程独占**的（`playVoice` 里 ++，`voiceSerial()`
+    //   里读）。不用 atomic：这一层所有的调用方都在主线程，加 atomic 只会
+    //   让"它被别的线程写过"这件事看起来像真的。
+    std::uint64_t m_voiceSerial = 0;
+    std::chrono::steady_clock::time_point m_voiceStart{};
+    static constexpr int kVoiceGraceMs = 120;
 
     // cpu 占比（音频线程写、主线程读）
     std::atomic<float> m_cpuRatio{0.0f};

@@ -245,6 +245,10 @@ void applyEnv(RuntimeConfig& cfg) {
 #endif
 
     cfg.inputMapPath = envStr("MYVK_RUNTIME_INPUT_MAP", cfg.inputMapPath);
+    // 存档（G17-3）。目录口子只给自动化用：UI / 快捷键走默认 `saves/`，
+    // 验收脚本指到临时目录才能互不干扰、跑完不留垃圾。
+    cfg.saveSlot = envStr("MYVK_RUNTIME_SLOT", cfg.saveSlot);
+    cfg.saveDir = envStr("MYVK_RUNTIME_SAVE_DIR", cfg.saveDir);
     cfg.startState = envStr("MYVK_RUNTIME_START_STATE", cfg.startState);
     // 玩家外观：自动化只有一个"换成这个模型"的诉求，所以只开两个口子
     // （模型 / clip）。其余字段是美术与手感参数，属于 game.json 的范畴。
@@ -298,6 +302,7 @@ void applyCli(RuntimeConfig& cfg, const std::vector<std::string>& args) {
 
         if (matchKey(a, "--scene", val, inlineSet)) {
             takeValue("--scene", cfg.scenePath);
+            cfg.sceneFromCli = !cfg.scenePath.empty();
         } else if (matchKey(a, "--title", val, inlineSet)) {
             takeValue("--title", cfg.title);
         } else if (matchKey(a, "--width", val, inlineSet)) {
@@ -329,6 +334,17 @@ void applyCli(RuntimeConfig& cfg, const std::vector<std::string>& args) {
         } else if (matchKey(a, "--dump-scene", val, inlineSet)) {
             takeValue("--dump-scene", cfg.dumpScenePath);
 #endif
+        // ---- 存档（G17-3）----
+        // ⚠ 这三条**不在** `#if !VENN_SHIPPING` 里：存档是玩家功能，不是
+        //   开发钩子。出货版把它去掉 = "游戏里不能读档"，那是个 bug 不是精简。
+        } else if (a == "--save") {
+            cfg.saveOnExit = true;
+        } else if (a == "--load") {
+            cfg.loadOnStart = true;
+        } else if (matchKey(a, "--slot", val, inlineSet)) {
+            takeValue("--slot", cfg.saveSlot);
+        } else if (matchKey(a, "--save-dir", val, inlineSet)) {
+            takeValue("--save-dir", cfg.saveDir);
         } else if (matchKey(a, "--input-map", val, inlineSet)) {
             takeValue("--input-map", cfg.inputMapPath);
         } else if (matchKey(a, "--language", val, inlineSet)) {
@@ -469,7 +485,15 @@ const char* runtimeHelpText() {
              "  --ui-doc <path>       UI 文档（.ui.json）；不给 = 不画界面层\n"
              "  --start-state <s>     boot | mainmenu | playing（默认 playing）\n"
              "  --verbose             每 60 帧打一行 GAME-LOOP\n"
-             "  --version             打印版本 / 构建风味 / git 号后退出\n";
+             "  --version             打印版本 / 构建风味 / git 号后退出\n"
+             "\n"
+             "存档:\n"
+             "  --save                退出前存一次（跑满 --frames 之后）\n"
+             "  --load                启动时读档（不给 --scene 时用存档里记的关卡）\n"
+             "  --slot <name>         槽位: slot1|slot2|slot3|quick|auto（默认 quick）\n"
+             "  --save-dir <path>     存档目录（默认相对 CWD 的 saves/）\n"
+             "\n"
+             "快捷键: F5 快速存档 / F9 快速读档（都落 --slot 指定的槽位）\n";
 #if !VENN_SHIPPING
         s +=
             "  --trace-states        每次状态迁移打一行 GAME-STATE\n"

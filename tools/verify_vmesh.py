@@ -34,6 +34,7 @@ import struct
 import subprocess
 import sys
 import zlib
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EDITOR = os.path.join(ROOT, "build", "bin", "Editor.exe")
@@ -73,7 +74,7 @@ def prepare() -> str:
       FBX 解析出来的）。测试之间的相互影响，比测试本身更容易埋雷。
     """
     if os.path.isdir(WORK):
-        shutil.rmtree(WORK)
+        safe_rmtree(WORK)
     root = os.path.join(WORK, "root")
     os.makedirs(os.path.join(root, "models"), exist_ok=True)
     os.makedirs(os.path.join(root, "scenes"), exist_ok=True)

@@ -7,6 +7,8 @@
 #include "InspectorIcons.h"
 #include "MultiEditMath.h"
 #include "sequence/SequencerSystem.h"
+#include "animation/ExpressionDriver.h"   // B6：预设切换必须与命令同一条路
+#include "animation/ExpressionPreset.h"   // B6：下拉要列预设、要查 rig 适配度
 #include "PrimitiveBuilder.h"
 
 #include "ui/ImGuiTheme.h"
@@ -2246,6 +2248,233 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
     }
 
     // ================================================================
+    // B6 表情驱动（预设 + 眨眼 + 口型）
+    // ================================================================
+    //
+    // 位置：**在 49 根原始滑条之前**。第一版放在滑条之后，实测这一段落在
+    // y≈2793（窗口只有 900 高）—— 要滚过 49 行滑条才够得着，等于藏起来了。
+    // 而用户日常要的是"给这张脸选个表情"，推单根 `target_17` 是少数场景。
+    //
+    // ⚠⚠ 为什么**不自动挂**组件：默认 `blinkEnabled = true`，自动挂上的话
+    //   老场景里所有带 blend shape 的角色会立刻开始眨眼 —— 那是**可见的
+    //   行为变化**，而"打开一份旧场景，画面逐像素不变"是这条工程的硬约束
+    //   （与 A0/A1 那条"老场景没有这个键就不建组件"同一条）。所以给一个
+    //   显式按钮：点了才动，点了就进场景文件。
+    if (auto* mpM = w.get<ecs::MorphComponent>(e)) {
+        if (mpM->model && !mpM->model->morphRig.empty()) {
+            ImGui::Separator();
+            ImGui::TextUnformatted(TR("Expression"));
+            logRect("INS-EXPR-HEADER", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+
+            auto* xc = w.get<ecs::ExpressionComponent>(e);
+            if (!xc) {
+                if (ImGui::Button(TR("Add expression driver"))) {
+                    m_ctx.structuralEdit("Add Expression", [&]() {
+                        w.add<ecs::ExpressionComponent>(
+                            e, ecs::ExpressionComponent{});
+                    });
+                    m_ctx.dirty() = true;
+                    xc = w.get<ecs::ExpressionComponent>(e);
+                    VK_LOG_INFO("INS-EXPR-ADD entity=%u ok=%d",
+                                static_cast<unsigned>(e.id), xc ? 1 : 0);
+                }
+                logRect("INS-EXPR-ADD", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s",
+                                    TR("Preset + automatic blink + lip sync."));
+            }
+
+            if (xc) {
+                ImGui::PushID("expr");
+
+                // ---- 预设资产路径 ----
+                // 与 `m_seqPathBuf` 同一套：编辑缓冲按实体懒同步，直接
+                // EditText 到 std::string 上会让"输入到一半"被每帧覆盖。
+                if (m_exprPathBufFor != e) {
+                    m_exprPathBufFor = e;
+                    std::snprintf(m_exprPathBuf, sizeof(m_exprPathBuf), "%s",
+                                  xc->presetPath.c_str());
+                }
+                ImGui::TextUnformatted(TR("Preset asset"));
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::InputTextWithHint("##exprpath",
+                                             "expressions/face.expr.json",
+                                             m_exprPathBuf,
+                                             sizeof(m_exprPathBuf))) {
+                    xc->presetPath = m_exprPathBuf;
+                    // 路径一改就作废缓存：否则填了新路径、下拉里还是旧资产
+                    // 的名字，看起来像"路径没生效"。
+                    xc->setLoaded = false;
+                    xc->loadFailedLogged = false;
+                    xc->set = anim::ExpressionSet{};
+                    xc->presetName.clear();
+                }
+                logRect("INS-EXPR-PATH", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+
+                // 懒加载一次：编辑态下 tick 可能没被调（与 sequencer 同一理由），
+                // 否则"下拉是空的"要等到进 Play 才有内容。
+                if (!xc->setLoaded && !xc->presetPath.empty()) {
+                    xc->setLoaded = true;
+                    anim::loadExpressionSet(xc->presetPath, xc->set);
+                }
+
+                // ---- 预设下拉 ----
+                const char* curLabel = TR("(none)");
+                if (xc->set.valid && !xc->presetName.empty()) {
+                    const anim::ExpressionPreset* pr =
+                        xc->set.preset(xc->presetName);
+                    if (pr) curLabel = pr->label.empty() ? pr->name.c_str()
+                                                         : pr->label.c_str();
+                }
+                ImGui::SetNextItemWidth(kPhysParamW);
+                if (ImGui::BeginCombo("##preset", curLabel)) {
+                    if (ImGui::Selectable(TR("(none)"),
+                                          xc->presetName.empty())) {
+                        std::string err;
+                        anim::setExpressionPreset(w, e, "", &err);
+                    }
+                    if (xc->set.valid) {
+                        for (const anim::ExpressionPreset& pr :
+                             xc->set.presets) {
+                            const bool sel = (pr.name == xc->presetName);
+                            const char* lbl = pr.label.empty()
+                                                  ? pr.name.c_str()
+                                                  : pr.label.c_str();
+                            if (ImGui::Selectable(lbl, sel)) {
+                                std::string err;
+                                // ⚠ 走 `setExpressionPreset` 而不是直接
+                                //   赋值：命令与面板必须**同一条路**，否则
+                                //   "面板切了没有 EXPR-SET 日志"意味着判据
+                                //   只能覆盖到其中一条（见 MEMORY 的
+                                //   "日志必须与执行同源"）。
+                                if (!anim::setExpressionPreset(w, e, pr.name,
+                                                               &err))
+                                    VK_LOG_WARN("INS-EXPR-SET ok=0 name=%s err=%s",
+                                                pr.name.c_str(), err.c_str());
+                            }
+                            if (sel) ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                logRect("INS-EXPR-PRESET", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", TR("Preset"));
+                if (!xc->presetPath.empty() && !xc->set.valid) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s",
+                                       TR("Cannot load this preset asset."));
+                    if (!xc->set.error.empty())
+                        ImGui::TextDisabled("%s", xc->set.error.c_str());
+                } else if (xc->set.valid) {
+                    // 预设里有多少通道在本 rig 上找不到。这是挂错资产最常见
+                    // 的表现（"笑起来只有嘴动"），必须显式说而不是静默跳过。
+                    std::vector<std::string> rigNames;
+                    rigNames.reserve(mpM->model->morphRig.channelCount());
+                    for (const auto& ch : mpM->model->morphRig.channels())
+                        rigNames.push_back(ch.name);
+                    std::vector<std::string> missing;
+                    anim::checkAgainstRig(xc->set, rigNames, missing);
+                    if (missing.empty())
+                        ImGui::TextDisabled(TR("%d preset(s), all channels found"),
+                                            static_cast<int>(xc->set.presets.size()));
+                    else
+                        ImGui::TextColored(
+                            ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
+                            TR("%d channel(s) in this preset have no slider on this rig"),
+                            static_cast<int>(missing.size()));
+                }
+
+                // ---- 强度 ----
+                ImGui::SetNextItemWidth(kPhysParamW);
+                const float i0 = xc->intensity;
+                if (ImGui::DragFloat(TR("Expression intensity"), &xc->intensity,
+                                     0.01f, 0.0f, 1.0f, "%.2f")) {
+                    fieldEdit(m_ctx, "Expression Intensity", &xc->intensity, i0);
+                }
+                logRect("INS-EXPR-INTENSITY", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s",
+                                    TR("0 = neutral face (manual sliders stay)"));
+
+                // ---- 眨眼 ----
+                if (ImGui::Checkbox(TR("Blink"), &xc->blinkEnabled))
+                    m_ctx.dirty() = true;
+                logRect("INS-EXPR-BLINK", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(90.0f);
+                // ⚠ 格式串也要 TR()：`%.2f s` 里的 "s" 在中日文界面下同样
+                //   是"要翻的字"（i18n 闸门 E 组就盯这一条）。
+                ImGui::DragFloat("##blinkint", &xc->blinkInterval, 0.05f,
+                                 0.05f, 30.0f, TR("%.2f s"));
+                logRect("INS-EXPR-BLINK-INTERVAL", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+                ImGui::SameLine();
+                if (ImGui::Button(TR("Blink now"))) {
+                    xc->blinkRequest = true;
+                    VK_LOG_INFO("INS-EXPR-BLINK-NOW entity=%u",
+                                static_cast<unsigned>(e.id));
+                }
+                logRect("INS-EXPR-BLINK-NOW", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+                // 通道名可以改：不同 rig 里闭眼滑条可能叫 `blink` / `eye_close` /
+                // 甚至 `target_1`（alicia 就是这种 —— FBX 里没改过名）。
+                //
+                // ⚠⚠ 不要写成 `if (cond || ImGui::TreeNode(...)) { ...; if (cond)
+                //   ImGui::TreePop(); }`：短路时 TreeNode **没被调用**，而
+                //   TreePop 照样执行 → ImGui 的 ID 栈当场失衡，报
+                //   `Calling PopID() too many times!`，**同一帧之后的所有控件
+                //   ID 全部错位**（本条实测：整段 Inspector 的锚点集体消失，
+                //   而日志里只有一条 imgui-error，看起来像"UI 没画"）。
+                ImGui::SetNextItemWidth(kPhysParamW);
+                {
+                    char buf[64];
+                    std::snprintf(buf, sizeof(buf), "%s",
+                                  xc->blinkChannel.c_str());
+                    if (ImGui::InputText(TR("Blink channel"), buf, sizeof(buf)))
+                        xc->blinkChannel = buf;
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", TR("slider name in the rig"));
+
+                // ---- 口型 ----
+                if (ImGui::Checkbox(TR("Lip sync"), &xc->lipSyncEnabled))
+                    m_ctx.dirty() = true;
+                logRect("INS-EXPR-LIP", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(90.0f);
+                ImGui::DragFloat("##mouthgain", &xc->mouthGain, 0.01f, 0.0f,
+                                 8.0f, TR("x%.2f"));
+                ImGui::SameLine();
+                // 电平读的是**驱动内部**那个平滑后的包络，不是音频系统的
+                // 瞬时值 —— 两者差一次攻击/释放，看到的数应当就是嘴张的
+                // 幅度，否则"电平跳到 0.9 但嘴没动"会让人怀疑整条链。
+                ImGui::TextDisabled(TR("level %.2f"),
+                                    static_cast<double>(xc->level));
+                logRect("INS-EXPR-LEVEL", ImGui::GetItemRectMin(),
+                        ImGui::GetItemRectMax());
+                if (xc->lipSyncEnabled) {
+                    ImGui::SetNextItemWidth(kPhysParamW);
+                    char mbuf[64];
+                    std::snprintf(mbuf, sizeof(mbuf), "%s",
+                                  xc->mouthChannel.c_str());
+                    if (ImGui::InputText(TR("Mouth channel"), mbuf,
+                                         sizeof(mbuf)))
+                        xc->mouthChannel = mbuf;
+                }
+
+                ImGui::PopID();
+            }
+        }
+    }
+
+    // ================================================================
     // Morph 段（§15，GPU 形变）
     // ================================================================
     //
@@ -2473,7 +2702,7 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
         // 这是"配了但一步都不走"唯一能自查的地方（骨名填错时画面
         // 与 Off 完全一样）。
         const float dist = glm::length(an->rootDelta.position);
-        ImGui::TextDisabled("root: %s  |Δ| = %.4f m / frame, Δyaw = %.2f°",
+        ImGui::TextDisabled(TRL("root: %s  |Δ| = %.4f m / frame, Δyaw = %.2f°"),
                             an->rootDelta.valid ? "(extracted)" : "(no delta)",
                             static_cast<double>(dist),
                             static_cast<double>(glm::degrees(an->rootDelta.yaw)));

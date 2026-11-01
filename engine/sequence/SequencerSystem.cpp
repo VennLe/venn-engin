@@ -343,10 +343,12 @@ void SequencerSystem::resolveShot(const SequenceAsset& seq, float t) {
     if (idx < 0) {
         m_shotCam = 0;
         m_shotBlend = 0.0f;
+        m_shotCurve = scene::BlendCurve::Smooth;
     } else {
         const SeqShot& sh = seq.shots[static_cast<std::size_t>(idx)];
         m_shotCam = sh.cameraGuid;
         m_shotBlend = sh.blendSeconds;
+        m_shotCurve = sh.blendCurve;
     }
 
     // 只在下标**变了**那一刻打日志。每帧打的话，日志里一千行一样的
@@ -356,10 +358,12 @@ void SequencerSystem::resolveShot(const SequenceAsset& seq, float t) {
         m_shotLogged = idx;
         const std::string cam =
             m_shotCam == 0 ? std::string("keytrack") : ecs::guidToHex(m_shotCam);
-        VK_LOG_INFO("SEQ-SHOT seq=%s t=%.3f i=%d/%d cam=%s blend=%.2f label=[%s]",
+        VK_LOG_INFO("SEQ-SHOT seq=%s t=%.3f i=%d/%d cam=%s blend=%.2f curve=%s "
+                    "label=[%s]",
                     seq.name.c_str(), static_cast<double>(t), idx,
                     static_cast<int>(seq.shots.size()), cam.c_str(),
                     static_cast<double>(m_shotBlend),
+                    scene::blendCurveName(m_shotCurve),
                     idx >= 0
                         ? seq.shots[static_cast<std::size_t>(idx)].label.c_str()
                         : "");

@@ -88,6 +88,7 @@
 #include "assets/MaterialLibrary.h"
 
 #include <memory>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -353,6 +354,23 @@ public:
     // 新建 / 打开（都走 onSceneReplaced）以及 undo / redo（整场景快照恢复）
     // 之后。漏掉的话表现为"视口导航突然变回老式轨道相机"。
     void applyEditorCameraMode();
+
+    // ------------------------------------------------- 视口"以选中相机预览"
+    //
+    // 非 0 = 视口锁在这台相机上：机位、镜头（fov/焦距/shift/roll/裁剪面）、
+    // 景深与快门都按这台相机来，自由飞行输入被关掉。0 = 自由相机（默认）。
+    //
+    // 为什么存 **guid** 而不是 `ecs::Entity`：进 Play 会把编辑场景整份复制成
+    // 运行态副本（G16 之后 guid 是跨副本稳定的那个键）。存实体句柄的话，
+    // "点 Play 时正好开着预览"会锁到运行态里另一个下标不同的实体上 ——
+    // 而画面上看起来只是"镜头跳到别处了"。
+    //
+    // ⚠ 这**不是场景数据**：不进 `.scene.json`、不进存档、不进撤销栈。
+    //   它是"我现在怎么看这个世界"，和布局一样属于视图状态。
+    std::uint64_t previewCameraGuid() const { return m_previewCamGuid; }
+    bool previewing() const { return m_previewCamGuid != 0; }
+    void previewCamera(ecs::Entity e);   // 传无效实体 = 退出预览
+    void clearPreviewCamera();
 
     // ---------------------------------------------------------- 选择
     ecs::Entity selection() const { return m_selection; }
@@ -980,6 +998,9 @@ private:
     float m_navSensitivity = 1.0f;
     // 见 navSpeedScalesWithDistance()。默认关 = 行为与改动前完全一致。
     bool m_navSpeedByDistance = false;
+
+    // 视口"以选中相机预览"（见 public 说明）。0 = 自由相机。
+    std::uint64_t m_previewCamGuid = 0;
 
     // 选中项的两个参数版本（select / selectFromViewport 都转发到它）——
     // 只有它能改 m_selectionFromViewport，所以放在私有区。

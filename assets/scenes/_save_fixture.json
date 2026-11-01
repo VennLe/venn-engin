@@ -1,0 +1,66 @@
+{
+  "_comment": "G17-3 夹具：存档槽位 / CLI 的端到端现场。Spawn 提供出生点（玩家由运行时生成），Mover 有一条 100 秒的 TRS 轨道（autoplay），所以跑几帧之后它就离开了关卡初始位置 —— 这正是'存档里有东西可存'的前提。判据见 tools/verify_save_slots.py B 组：读档后**再存一次**，Mover 的位置必须与第一次存档里的一致。",
+  "version": 2,
+  "generator": "venn save slot fixture (G17-3)",
+  "camera": {
+    "target": [0.0, 0.0, 1.0],
+    "yaw": 0.610865,
+    "pitch": 0.314159,
+    "distance": 10.0
+  },
+  "physics": {
+    "enabled": false,
+    "groundPlane": false,
+    "fixedTimeStep": 0.0166666675,
+    "maxSubSteps": 4
+  },
+  "entities": [
+    {
+      "name": "Spawn",
+      "_guidWhy": "显式 guid：不给的话每次加载都随机分配 → sceneStructureHash 每次都变 → 存档被判成\"不是同一个关卡\"而拒读（SAVE-DRIFT-REJECT）。",
+      "guid": "5a1e000000000001",
+      "transform": {
+        "position": [0.0, 0.0, 0.1],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "gameStart": {
+        "yaw": 0.0,
+        "enabled": true,
+        "mode": "third",
+        "spawnOnRun": true
+      }
+    },
+    {
+      "name": "Mover",
+      "guid": "5a1e000000000002",
+      "transform": {
+        "position": [2.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "animClip": {
+        "duration": 100.0,
+        "loop": false,
+        "autoplay": true,
+        "time": 0.0,
+        "keys": [
+          {
+            "t": 0.0,
+            "pos": [2.0, 0.0, 0.0],
+            "rot": [0.0, 0.0, 0.0],
+            "scale": [1.0, 1.0, 1.0]
+          },
+          {
+            "t": 100.0,
+            "pos": [2.0, 0.0, 10.0],
+            "rot": [0.0, 0.0, 0.0],
+            "scale": [1.0, 1.0, 1.0]
+          }
+        ]
+      }
+    }
+  ]
+}

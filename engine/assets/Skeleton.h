@@ -86,6 +86,32 @@ struct Skeleton {
         // glTF 场景根 → 本 joint 之外那条祖先链的静止世界矩阵
         //（骨架通常挂在 armature 节点下，这一两层"外链"不在 joints 里）
         glm::mat4 externalChain{1.0f};
+
+        // ---- `restLocal` 的 TRS 分解缓存（P2，2026-10-31）----
+        //
+        // 为什么要缓存：`samplePose` 每帧都从 `setRest()` 开始，而
+        // rest 分解走的是 `glm::decompose`（里面有一次 4×4 求逆 + 四元数
+        // 提取）。100 根骨 × 60 fps = 6000 次/秒的**纯重复计算** ——
+        // rest 是加载完就再也不变的常量，这个量本该只算一次。
+        //
+        // ⚠⚠ **懒填充**，而且填充点在 `animation/Pose.cpp`：那里用的是与
+        //   拆分前逐字符一致的 `decomposeTRS()`。搬到这里自己写一份
+        //   `glm::decompose` 会让 A0-5 的「重构前后关节矩阵 memcmp 级相同」
+        //   因为浮点路径不同而变红 —— 而这正是"顺手优化"最容易踩的那颗雷。
+        // ⚠ `restLocal` 一旦被改，`restTRSReady` 必须跟着失效。三条界线：
+        //     · 加载器：`Joint` 默认 `restTRSReady == false` → 首次采样时算，
+        //       天然正确，**不用管**。
+        //     · `RigEdit::bake()`：走 `joints.assign(n, Joint{})` 整体重建，
+        //       标志位被重置，也天然正确。
+        //     · 其它任何"就地改一根骨的 restLocal"：必须手动
+        //       `jt.restTRSReady = false`，否则那根骨会定在旧的静止姿势上。
+        //   `mutable` 的理由：`setRest` 收的是 `const Skeleton&`，而缓存是
+        //   **逻辑 const**（只由 restLocal 决定）。引擎目前单线程渲染，
+        //   没有并发采样同一具骨架的路径。
+        mutable glm::vec3 restT{0.0f};
+        mutable glm::quat restR{1.0f, 0.0f, 0.0f, 0.0f};
+        mutable glm::vec3 restS{1.0f};
+        mutable bool restTRSReady = false;
     };
 
     std::vector<Joint> joints;
@@ -116,6 +142,15 @@ struct Skeleton {
     std::vector<AnimationClip> clips;
 
     int jointCount() const { return static_cast<int>(joints.size()); }
+    // 拿一根骨的**可写**引用，即使骨架本身是 const。
+    //
+    // 只为一件事存在：`restT/restR/restS/restTRSReady` 那组缓存是
+    // **逻辑 const**（完全由 `restLocal` 决定），而 `Pose::setRest` 收的是
+    // `const Skeleton&`。除了这四个字段，别的字段一律不许通过它写 ——
+    // 想改 `restLocal` / `invBind` 请走非 const 路径，否则缓存与真值会脱钩。
+    Joint& restCache(int i) const {
+        return const_cast<Joint&>(joints[static_cast<size_t>(i)]);
+    }
     int nodeToJoint(int nodeIdx) const {
         const auto it = nodeMap.find(nodeIdx);
         return it == nodeMap.end() ? -1 : it->second;

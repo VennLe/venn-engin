@@ -1,7 +1,7 @@
 // ============================================================
 // dialogue/DialogueSelfTest.cpp
 //
-// C2 对话系统的无窗口自检。分六组：
+// C2 对话系统的无窗口自检。分八组：
 //   A 解析（节点数 / 起点推导 / 自动 id）
 //   B 校验（重复 id / 跳转缺失 / next 与 choices 并存 / 选项缺字段 / 空表）
 //   C 打字机（cps=0 立刻全出 / 夹取 / elapsed 超长）
@@ -10,6 +10,8 @@
 //   F 调度层（cue 的路径解析 / **不给场景加组件** / 组件自动起播 / 重置）
 //   G 写回（toJson / saveDialogue 的往返：节点 / 中文原样 / 选项 / 起点
 //      不丢 / 缓存不落盘 / 真写盘的临时文件能读回）
+//   H 语音门控（D1：正文出完后语音没播完不翻页 / 超时兜底 / 钩子不装或
+//      起播失败时退化成老行为）
 //
 // ⚠ E/F 是第二步（接 UI 与时间轴）才加的两组。E 只碰 `DialoguePlayer`，
 //   F 需要真的建一个 `scene::Scene`（`DialogueSystem::tick` 的签名就是它），
@@ -432,6 +434,175 @@ void groupSystem() {
     reportFlag("sys_reset", !sys2.active(sc2));
 }
 
+// ---------------------------------------------------------------- H 语音门控
+//
+// D1：**正文全出之后**，这句的语音还在响就不许翻页。
+//
+// 为什么这一组全用**假钩子**（两个 lambda）而不是真的 `AudioSystem`：
+// ① 自检要在**无声卡**的机器上跑（CI、容器），真音频在那里一律 Failed；
+// ② 这里要钉的是"**门什么时候开**"这条逻辑，不是"WAV 能不能解码"——后者
+//    在 `--selftest audio` 的 `voice_*` 那几条里已经管了。
+// `AudioSystem::voicePlaying()` 的正确性由 audio 自检的 `voice_finished` /
+// `music_still_one` 两条负责；本组只假装它有返回值。
+void groupVoice() {
+    const char* kPath = "dialogues/_voice_fixture.dlg.json";
+
+    // ---- A 有语音 → 补完字之后被挡 ----
+    {
+        DialoguePlayer p;
+        bool playing = true;
+        int plays = 0;
+        p.setVoiceHooks({[&](const std::string&) { ++plays; return true; },
+                         [&] { return playing; }});
+        reportFlag("voice_load", p.load(kPath), p.error());
+        p.start();
+        report("voice_plays_first", static_cast<double>(plays), 1.0, 0.0);
+        // v1 正文 20 个码点 → max(3, 20*0.35) = 7.00。
+        // ⚠ 取 7.0 而不是 3.0：夹具正文特意写到 20 字，就是为了让"只取下界"
+        //   和"按字数算"给出**不同**的数。8 字以内两者都给 3.0，测不出区别。
+        report("voice_limit_v1", static_cast<double>(p.voiceWaitLimit()), 7.0,
+               1e-4);
+
+        // 第一下只补字（Revealed），**不受语音影响** —— 玩家想跳字必须能跳。
+        reportFlag("voice_reveal_not_blocked",
+                   p.pressAdvance(30.0f) == Press::Revealed);
+        reportFlag("voice_full", p.fullyRevealed());
+        // 第二下才被语音挡。
+        reportFlag("voice_blocked",
+                   p.pressAdvance(30.0f) == Press::WaitingVoice);
+        report("voice_stalls_1", static_cast<double>(p.voiceStalls()), 1.0, 0.0);
+        reportFlag("voice_still_v1", p.currentId() == "v1", p.currentId());
+
+        // 语音播完 → 放行，并起播下一句（v2 没有 voice，一次 `play` 都不该多）
+        playing = false;
+        reportFlag("voice_released", p.pressAdvance(30.0f) == Press::Moved);
+        reportFlag("voice_at_v2", p.currentId() == "v2", p.currentId());
+        report("voice_plays_after_v2", static_cast<double>(plays), 1.0, 0.0);
+        report("voice_limit_v2", static_cast<double>(p.voiceWaitLimit()), 0.0,
+               0.0);
+
+        // ⚠ 反向：v2 没有 voice 时，**即使钩子恒为真**也不许挡。
+        //   不写这一条的话，"每句都挡 3 秒"的实现照样全绿。
+        playing = true;
+        p.pressAdvance(30.0f);   // Revealed
+        reportFlag("voice_v2_not_blocked",
+                   p.pressAdvance(30.0f) == Press::Finished);
+        report("voice_stalls_2", static_cast<double>(p.voiceStalls()), 1.0, 0.0);
+    }
+
+    // ---- B 超时兜底（钩子恒为真也必须能走出去）----
+    {
+        DialoguePlayer q;
+        bool always = true;
+        q.setVoiceHooks({[](const std::string&) { return true; },
+                         [&] { return always; }});
+        q.load(kPath);
+        q.start();
+        q.pressAdvance(30.0f);   // Revealed
+        for (int i = 0; i < 69; ++i) q.tick(0.1f, 30.0f);
+        report("voice_wait_6p9", static_cast<double>(q.voiceWait()), 6.9, 1e-3);
+        reportFlag("voice_blocked_before_limit",
+                   q.pressAdvance(30.0f) == Press::WaitingVoice);
+        // 越过上限 → 计时**钳在**上限（不无限涨，日志里 `wait=7.00/7.00`）
+        for (int i = 0; i < 2; ++i) q.tick(0.1f, 30.0f);
+        report("voice_wait_clamped", static_cast<double>(q.voiceWait()), 7.0,
+               1e-3);
+        reportFlag("voice_timeout_releases",
+                   q.pressAdvance(30.0f) == Press::Moved);
+        reportFlag("voice_timeout_v2", q.currentId() == "v2", q.currentId());
+    }
+
+    // ---- C 否定测试：钩子不装 = 老行为逐位不变 ----
+    {
+        DialoguePlayer r;
+        r.load(kPath);
+        r.start();
+        report("voice_nohook_limit", static_cast<double>(r.voiceWaitLimit()), 0.0,
+               0.0);
+        r.pressAdvance(30.0f);   // Revealed
+        reportFlag("voice_nohook_moves",
+                   r.pressAdvance(30.0f) == Press::Moved);
+        report("voice_nohook_stalls", static_cast<double>(r.voiceStalls()), 0.0,
+               0.0);
+    }
+
+    // ---- D 起播失败不设门（无声卡 / 素材缺的退化路径）----
+    {
+        DialoguePlayer s;
+        s.setVoiceHooks({[](const std::string&) { return false; },
+                         [] { return true; }});
+        s.load(kPath);
+        s.start();
+        report("voice_playfail_limit", static_cast<double>(s.voiceWaitLimit()),
+               0.0, 0.0);
+        s.pressAdvance(30.0f);
+        reportFlag("voice_playfail_moves",
+                   s.pressAdvance(30.0f) == Press::Moved);
+    }
+
+    // ---- E `stop()` 清等待状态（不许漏给下一段对话）----
+    {
+        DialoguePlayer t;
+        bool tp = true;
+        t.setVoiceHooks({[](const std::string&) { return true; },
+                         [&] { return tp; }});
+        t.load(kPath);
+        t.start();
+        t.pressAdvance(30.0f);
+        for (int i = 0; i < 10; ++i) t.tick(0.1f, 30.0f);
+        report("voice_wait_1s", static_cast<double>(t.voiceWait()), 1.0, 1e-3);
+        t.stop();
+        report("voice_stop_wait", static_cast<double>(t.voiceWait()), 0.0, 0.0);
+        report("voice_stop_limit", static_cast<double>(t.voiceWaitLimit()), 0.0,
+               0.0);
+    }
+
+    // ---- F 调度层转发：组件驱动 + cue 两条路都要拿到钩子 ----
+    {
+        scene::Scene sc;
+        const ecs::Entity npc = sc.createObject("NPC");
+        ecs::DialogueComponent dc;
+        dc.dialoguePath = kPath;
+        dc.autoStart = true;
+        dc.cps = 30.0f;
+        sc.world().add<ecs::DialogueComponent>(npc, dc);
+
+        DialogueSystem sys;
+        bool sysPlaying = true;
+        int sysPlays = 0;
+        sys.setVoiceHooks({[&](const std::string&) { ++sysPlays; return true; },
+                           [&] { return sysPlaying; }});
+        // ⚠ 只 tick 一次就要看到 `play` —— 钩子在 `autoStart` **之前**装。
+        //   顺序写反的实现（tick 末尾才装）在这里红，而日志里一条错都没有。
+        sys.tick(sc, 0.016f);
+        report("sys_voice_plays", static_cast<double>(sysPlays), 1.0, 0.0);
+        {
+            const DialoguePlayer* p = sys.activePlayer(sc);
+            report("sys_voice_limit",
+                   p ? static_cast<double>(p->voiceWaitLimit()) : -1.0, 7.0,
+                   1e-4);
+        }
+        reportFlag("sys_voice_reveal", sys.pressAdvance(sc) == Press::Revealed);
+        reportFlag("sys_voice_waiting",
+                   sys.pressAdvance(sc) == Press::WaitingVoice);
+        sysPlaying = false;
+        reportFlag("sys_voice_released", sys.pressAdvance(sc) == Press::Moved);
+    }
+    {
+        scene::Scene sc;
+        const ecs::Entity dir = sc.createObject("Director");
+        DialogueSystem sys;
+        int cuePlays = 0;
+        sys.setVoiceHooks({[&](const std::string&) { ++cuePlays; return true; },
+                           [] { return true; }});
+        // ⚠ cue 走的是系统自己的槽位，`setVoiceHooks` 必须**当场**装到它上面：
+        //   `cue()` 里就会 `start()`，等不到下一次 tick。
+        reportFlag("sys_voice_cue", sys.cue(sc, dir, "_voice_fixture"),
+                   sys.error());
+        report("sys_voice_cue_plays", static_cast<double>(cuePlays), 1.0, 0.0);
+    }
+}
+
 // ---------------------------------------------------------------- G 写回
 //
 // 剧本编辑器（`editor/DialogueEditorWindow`）的存盘就走这一组。
@@ -505,6 +676,32 @@ void groupRoundTrip() {
     // `index` 是缓存，**不许**落盘（写进去等于把身份写死成下标）
     reportFlag("rt_no_index_key", text.find("\"index\"") == std::string::npos);
 
+    // ---- D1：`voice` 的往返 ----
+    // ⚠ 两件事一起钉：① 有 voice 的节点存回去还在；② **没有 voice 的节点
+    //   不许长出 `"voice": ""`** —— 后者会让"打开老资产按一次保存"就把它
+    //   改写成新版，diff 里全是噪音。
+    {
+        DialogueAsset va;
+        parseDialogue(R"({"name":"v","start":"a","lines":[
+            {"id":"a","text":"x","voice":"audio/silence.wav","next":"b"},
+            {"id":"b","text":"y"}]})",
+                      "v.dlg.json", va);
+        const std::string vt = toJson(va);
+        DialogueAsset vb;
+        parseDialogue(vt, "v.dlg.json", vb);
+        const bool kept = vb.valid && vb.nodes.size() == 2 &&
+                          vb.nodes[0].voice == "audio/silence.wav" &&
+                          vb.nodes[1].voice.empty();
+        reportFlag("rt_voice_kept", kept,
+                   "n=" + std::to_string(vb.nodes.size()));
+        int voiceKeys = 0;
+        for (size_t p = vt.find("\"voice\""); p != std::string::npos;
+             p = vt.find("\"voice\"", p + 1))
+            ++voiceKeys;
+        reportFlag("rt_voice_omits_empty", voiceKeys == 1,
+                   "voice_keys=" + std::to_string(voiceKeys));
+    }
+
     // 真写盘再读回（临时文件，跑完删）
     std::error_code ec;
     const std::filesystem::path tmp =
@@ -534,6 +731,7 @@ int runDialogueSelfTest() {
     groupPlayer();
     groupSystem();
     groupRoundTrip();
+    groupVoice();
     VK_LOG_INFO("DLG-TOTAL pass=%d fail=%d", g_pass, g_fail);
     return g_fail;
 }

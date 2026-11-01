@@ -429,6 +429,16 @@ DEFAULT = [
     # ⚠ 待补：`--selftest save-crash`（写到一半 `_exit(3)`，父进程断言旧档仍可读）
     #   需要脚本起子进程 + C++ 侧加一个专门的 CLI 子模式，留给 G17-1 的尾巴。
     "verify_persistence",
+    # ---- 存档**槽位 + CLI**（2026-10-31，G17-3）----
+    # 四组：A 内核（`--selftest save` 的 K 组，101 条）/ B 一次真实的
+    # 存 → 读 → 再存（读档后位置与第一次存档一致）/ C 边界（非法槽位当场拒绝
+    # 且不留文件 / 空槽位报错不崩 / 槽位名大小写不敏感）/ D 零 ERROR。
+    # ⚠ B5 那一条才是"真的恢复了吗"：只验 `SAVE-READ applied=1` 的话，
+    #   "应用了但没有覆盖 transform"照样绿。
+    # ⚠ 夹具 `_save_fixture.json` 里**必须**给两个实体显式 guid：不给的话
+    #   每次加载都随机分配 → `sceneHash` 每次不同 → 存档被判成"不是同一个
+    #   关卡"而拒读（`SAVE-DRIFT-REJECT`）。这一条踩过。
+    "verify_save_slots",
     # 对话（2026-10-26，C2 第二步）。数值层（解析 / 校验 / 打字机 / 播放头 /
     # 选项 / 调度优先级）在 `Game.exe --selftest dialogue` 的 97 条 `DLG-TEST`；
     # 这里只验"接到一起之后还对不对"，两个用例：
@@ -476,6 +486,18 @@ DEFAULT = [
     # ⚠ G 用例会**临时改写** `assets/dialogues/ch01_open_01.dlg.json`，
     #   跑完在 finally 里原样写回并校验哈希。
     "verify_dialogue_script",
+    # ---- D1：语音能不能"播完再进下一句"（2026-10-31）----
+    # 四组：A 内核（`--selftest dialogue` 语音组 38 条）/ B 有语音 → 正文出完后
+    # 被挡、播完才放行 / C 否定（老资产没有 voice 字段，钩子恒为「在播」也不许
+    # 挡）/ D 超时兜底（钩子恒真也必须自己走出去）。
+    # ⚠ 判据来自 `DLG-VOICE` / `DLG-PRESS waiting-voice` / `AUDIO-VOICE`
+    #   三条日志。`MYVK_DLG_VOICE_FAKE=<秒>` 是**验收专用**的假钩子：CI 与
+    #   无声卡机器上 `playVoice()` 必然失败 → 对话侧不设门 → 那条路永远走不到，
+    #   于是"钩子接错了"这类 bug 在自动化里完全看不出来。它只替换
+    #   "播没播 / 播完没"，`pressAdvance` / 打字机 / 翻页仍是玩家那条路。
+    # ⚠ D 组要跑满 7 秒（上限 = max(3, 字数*0.35)，夹具 20 字 → 7.0），
+    #   是本脚本最慢的一组（约 10 s），别当成卡死。
+    "verify_dialogue_voice",
     # ---- C6 第二批：脚本世界控制 API（旗标 / 刷实体 / 换场景）----
     # 七条断言：旗标写进宿主 / spawn 走真 FBX 装配 / 换场景请求受理 /
     # 下一帧真切换 / **旗标跨场景保留** / 五步顺序 / 没有失败锚点。
@@ -541,12 +563,32 @@ DEFAULT = [
     # ⚠ 之所以 C/D 单独成组："算子算得对"和"存得住、运行时真的走"是三件事，
     #   B 组全绿也可能进游戏路径不走。
     "verify_camera_move",
+    # 编辑器视口"以选中相机预览"（#150 尾巴，2026-10-31）。
+    # 六条：点得到按钮 / 锁的是选中那台 / 机位来自实体世界变换 / 镜头
+    # （focal→fov、fstop→aperture、快门→强度）接上了 / 预览态拖不动相机 /
+    # 退出后把进入前的镜头效果还回去。
+    # ⚠ 最后两条是"看起来没事其实是 bug"的两类：导航没关 = 拖一下弹回去；
+    #   不还原 = 退出预览后整个编辑器一直糊着，重启才恢复。
+    "verify_camera_preview",
     # 多机位 marker 切镜（运镜体系 §七，2026-10-30）。
     # 三组：A 内核（时间轴 shots 组 24 条 + 相机侧导演覆盖组 12 条）；
     # B 编辑器（`+ Shot` 背后的 act* 能改能存能读回，且**拒绑**不存在的 guid）；
     # C 运行时（场景里两台相机，marker 强制先用**低**优先级那台 →
     #  `CAM-CUT name=CamLow` 出现本身就证明覆盖压过 priority）。
     "verify_multi_cam",
+    # C5：实体 TRS 轨道的运行时消费者（2026-10-31）。
+    # 四组：A 内核（`--selftest transformclip` 35 条）；B **编辑器 Play**
+    # （与 Game.exe 是两套接线，只测一边会漏）；C Game.exe（推进 + 回绕 +
+    # 零 VUID）；D **否定测试**（`autoplay=false` → 一条推进都不许有）。
+    # ⚠ D 组不能省："无论 autoplay 都播"是"多的行为"，只测 B/C 测不出来。
+    "verify_transform_clip",
+    # B6 表情预设 + 眨眼/口型（2026-11-01）。
+    # A 内核（`--selftest expression` 49 条）；B 编辑器（读场景 / UI 锚点 /
+    # 命令 / 存盘只写非默认）；C **进 Play**（驱动真的在跑：owned>0、眨眼计数）；
+    # D 老场景（没有 expression 块）不许建组件。
+    # ⚠ C 组不能省：A 组是手动调 `tickExpressions`，那一条路径上"Play 每帧
+    #   会不会调它"一行都没测到。
+    "verify_expression",
     # ---- #320：动画摄影表（Dope Sheet，R8）----
     # 五次启动编辑器（打开+通道树 / 框选批量挪 / 镜像 / 关键帧类型 / 缩放平移）。
     # 两条验收是任务书原文，"逐位"不是"差得少"：
@@ -681,6 +723,31 @@ DEFAULT = [
     "verify_startup_show",
     # Hierarchy 行尾 🔒/👁 两个图标按钮（E12 的修补）。
     "verify_hierarchy_status",
+    # G16-4 尾巴：Hierarchy 右键的 `Copy GUID` / `Select by GUID…`。
+    # 与上一条同挂 `SceneHierarchy.*`，但**测的是另半张菜单**：那条用像素判
+    # 图标状态，这条全是文本锚点（`HIER-GUID copy=` / `select=`）+ 剪贴板。
+    # ⚠ 剪贴板是全局独占资源：它会读／写系统剪贴板，**必须串行跑**。
+    "verify_hierarchy_guid",
+    # P3（2026-10-31）：蒙皮关节 SSBO 的扩容策略 —— 多角色场景里
+    # `ANIM-SKIN-CAP` 必须**只出现 1 次**（边填边扩的话是 N 次，而画面完全
+    # 正常，所以只有这条能看出来）。
+    # ⚠ **故意不登记 TRIGGERS**：它唯一的代码落点是 `engine/render/Renderer.cpp`
+    #   —— 那在 `GLOBAL_GLOBS` 里。登记了会命中 check_regression_map 的 E 项
+    #   （"整条都指向横切文件"= 等于没登记）。不登记 = 每轮无条件重跑，
+    #   正是想要的（它要烤模板 + 跑 16 个角色，慢，但比漏掉好）。
+    "verify_skin_capacity",
+    # G17-3 尾巴：编辑器里的存档槽位面板。`listSaveSlots` 的**唯一消费者**。
+    # 核心判据是 C 组 —— 编辑器存的档 `Game.exe --load` 读得到（跨进程，
+    # 证明两边路径口径一致）。它会写／删 `build/bin/saves/` 里的 `quick.vsave`。
+    "verify_save_panel",
+    # H2（2026-10-31）：崩溃 / 断电自动保存。核心判据是 **B3「正式档逐字节
+    # 没变」** —— 自动保存的全部风险都压在"写到哪个文件"这一个决定上，而
+    # 它写对了是静默的、写错了也是静默的（用户过一阵子才发现好档变旧）。
+    # ⚠ 它是**按时间**驱动的（`MYVK_EDITOR_AUTOSAVE_SEC=1.5`），所以不用
+    #   `MYVK_FRAMES`，改成"起进程 → sleep → terminate"。
+    # ⚠ A1 是**负判据**（场景没改过就一条都不许写）。只测"会存"的话，
+    #   "每 1.5 秒无脑存一次"照样全绿。
+    "verify_autosave",
     # ---- 阶段 M1：运行时骨架（G01~G05，2026-10-17）----
     # G01+G02 结构验证：两个 exe 并存 / VennEngine 里零 editor+runtime 源文件 /
     # 两个 exe 都链接同一个 VennEngine.lib / 脚本引擎已在 engine/script 且
@@ -1092,6 +1159,13 @@ OK_RE = re.compile(r"(?:RESULT:\s*PASS|全部断言 PASS|^全部 PASS\b|结果:\
                    r"|结果:\s*\d+\s*通过\s*/\s*0\s*失败)")
 BAD_RE = re.compile(r"(?:RESULT:\s*FAIL|断言[^\n]*FAIL|结果:\s*FAIL"
                     r"|结果:\s*\d+\s*通过\s*/\s*[1-9]\d*\s*失败)")
+# 前置缺失（`结果: SKIP: 原因`）：**既不算通过也不算失败**。
+#
+# 存在的理由见 `tools/prereq.py`：有几条角色用例依赖一个从外部工程导进来的
+# 模型，贴图引用是绝对路径，资产根一挪就必然红，而代码一行没错。把它们硬
+# 判成 FAIL 的代价是"每次全量都要人工回忆这四条是不是又是贴图"；判成 PASS
+# 又是在撒谎。所以单列一档，汇总里点名，但**不阻塞**。
+SKIP_RE = re.compile(r"结果:\s*SKIP\b")
 # 资源泄漏：验证层在 vkDestroyDevice() 时点名没被销毁的子对象。
 LEAK_RE = re.compile(r"leaked objects that have not been destroyed")
 
@@ -1524,6 +1598,25 @@ TRIGGERS = {
     # 可见性组件的语义在 engine/scene/Scene.cpp（= GLOBAL）。
     "verify_hierarchy_status": ["editor/SceneHierarchy.*",
                                 "editor/InspectorIcons.h"],
+    # G16-4 尾巴：两项都画在 SceneHierarchy 的右键菜单里；锚点与剪贴板写入
+    # 也都在那儿。judge 用的那串 guid 来自 `_save_fixture.json`（显式写死的
+    # 两个 guid）—— 夹具一改，这条就该红。
+    "verify_hierarchy_guid": ["editor/SceneHierarchy.*",
+                              "engine/ecs/Entity.h",
+                              "engine/i18n/ZhTable.cpp",
+                              "assets/scenes/_save_fixture.json"],
+    # G17-3 尾巴：面板本体 + 它调的那三个函数（`SaveSlot.*`）。
+    # ⚠ 三个函数自己已有 `verify_save_slots` 守着，但"面板有没有把它们接上"
+    #   是另一件事 —— 那条用例全程不碰 UI。
+    "verify_save_panel": ["editor/SaveSlotsPanel.*",
+                          "editor/EditorApp.cpp",
+                          "engine/scene/SaveSlot.*"],
+    # H2 自动保存：全部代码都在 EditorApp（`tickAutoSave` / `detectStaleAutoSave`
+    # / `assetRelative` 剥前缀 + `saveSceneNow` 共用那一条）。
+    # ⚠ 与别处一样登记 `editor/EditorApp.*`：这一列的语义是**并集**
+    #   （改了它 → 所有登记它的用例都跑），不是"独占"。
+    "verify_autosave": ["editor/EditorApp.*",
+                        "engine/scene/SceneIo.*"],
     "verify_nav_gizmo":      ["editor/ViewportPanel.*",
                               "editor/GizmoController.*",
                               "engine/scene/Camera.*"],
@@ -2238,6 +2331,23 @@ TRIGGERS = {
     # ⚠ `engine/ecs/Components.h`（World/组件定义）在 `GLOBAL_GLOBS` 里 → 改动本来
     #   全量，**刻意不登记**（登记了在 `--narrow` 下会变假跳过）。
     # ⚠ `engine/scene/Scene.{h,cpp}` 同样在 `GLOBAL_GLOBS` 里 → 也刻意不写。
+    # ---- 存档槽位 / CLI（G17-3，2026-10-31）----
+    # 断言落点：
+    #   · 槽位白名单 / 路径拼接 / 存读动作        → engine/scene/SaveSlot.*
+    #   · 底下的文件层与应用层                    → SaveGame.* / SaveGameState.*
+    #   · 101 条数值断言                          → PersistenceSelfTest.cpp
+    #   · `captureBaseline` 接线 / F5 F9 / `--save --load` → runtime/RuntimeApp.cpp
+    #   · `--slot` / `--save-dir` 的解析与默认值   → runtime/RuntimeConfig.*
+    #   · 夹具（Mover 的轨道 + 显式 guid）         → assets/scenes/_save_fixture.json
+    # ⚠ 与 verify_persistence 重挂 SaveGame.* / SaveGameState.* 是**故意**的：
+    #   只挂一处会让 `--narrow` 把另一条判成不受影响（假跳过）。
+    "verify_save_slots": ["engine/scene/SaveSlot.*",
+                          "engine/scene/SaveGame.*",
+                          "engine/scene/SaveGameState.*",
+                          "engine/scene/PersistenceSelfTest.cpp",
+                          "runtime/RuntimeApp.cpp",
+                          "runtime/RuntimeConfig.*",
+                          "assets/scenes/_save_fixture.json"],
     "verify_persistence": ["engine/scene/SaveGame.*",
                            "engine/scene/SaveGameState.*",
                            "engine/scene/PersistenceSelfTest.cpp",
@@ -2266,19 +2376,41 @@ TRIGGERS = {
                         "runtime/RuntimeApp.cpp",
                         "runtime/PlayerController.*",
                         "assets/dialogues/**"],
-    # C6 脚本导演 API。挂在三组人身上：
+    # D1 语音。挂两半：
+    #   · 引擎侧（`audio/Mixer.*` + `AudioSystem.*`）—— `voicePlaying()` 的正确性
+    #     靠 `mixBlock` 的分总线计数；`busVoices[]` 一改，门就跟着错。
+    #   · 对话侧（`engine/dialogue/**`）—— `VoiceHooks` / `WaitingVoice` /
+    #     `beginNodeVoice` 的落点。⚠ 这条与 verify_dialogue 重挂是**故意**的
+    #     （同 `runtime/RuntimeApp.cpp` 那条注释）：只挂一处会让 `--narrow` 把
+    #     另一条判成"不受影响"，那就是假跳过。
+    #   · `runtime/RuntimeApp.cpp` —— 钩子的注入点与顺序（必须在 autoStart 前）。
+    "verify_dialogue_voice": ["engine/dialogue/**",
+                              "engine/audio/Mixer.*",
+                              "engine/audio/AudioSystem.*",
+                              "engine/audio/AudioSelfTest.cpp",
+                              "runtime/RuntimeApp.cpp",
+                              "assets/dialogues/_voice_fixture.dlg.json",
+                              "assets/scenes/_dlg_voice_fixture.json",
+                              "assets/scenes/_dlg_novoice_fixture.json"],
+    # C6 脚本导演 API（演出三件 + `openUI`）。挂在四组人身上：
     #   · `ScriptEngine.*` —— 内建表 / 分发 / 参数类型纪律（三处同步硬要求）
     #   · `SequencerSystem.*` —— `cue()` 是点播的落地，组件路径与它共用一份
     #     `tick`（改一处两边都要重跑）
-    #   · `RuntimeApp.cpp` —— 三个窄动作的注入 + `switchAnimClip` 的写入点
-    # 资产三角（sequence / dialogue / 基底场景）也要挂：这条用例断的是
-    # "真的播出来了"，资产改名或结构变动会让它红，那是**对的**。
+    #   · `RuntimeApp.cpp` —— 四个窄动作的注入 + `switchAnimClip` 的写入点
+    #     + `openUiDocument`（`UIDOC-OPEN` 三条锚点的唯一产处）
+    # 资产三角（sequence / dialogue / 基底场景 + `openUI` 用的那份 `.ui.json`）
+    # 也要挂：这条用例断的是"真的播出来了/真的画出来了"，资产改名或结构
+    # 变动会让它红，那是**对的**。
+    # ⚠ `engine/script/ScriptRuntime.cpp` **不挂在这里**：它是唯一的 tick
+    #   内核（所有脚本用例都压在上面），属于横切 —— 没登记就按"全量 + 点名"
+    #   处理，那正是想要的。
     "verify_director_api": ["engine/script/ScriptEngine.*",
                             "engine/script/ScriptSelfTest.cpp",
                             "engine/sequence/SequencerSystem.*",
                             "runtime/RuntimeApp.cpp",
                             "assets/sequences/**",
                             "assets/dialogues/**",
+                            "assets/ui/docs/**",
                             "assets/scenes/cutscene_demo.json"],
     # C6 第三步：`DialogueComponent` 的编辑期入口（第 13 个页签）。四个落点：
     #   · `editor/InspectorPanel.*`  —— `kTabs[]` 那一行 + `drawTabDialogue` 整段
@@ -2397,6 +2529,17 @@ TRIGGERS = {
                            "editor/CinematographyPanel.*",
                            "editor/EditorApp.cpp",
                            "runtime/RuntimeApp.cpp"],
+    # 编辑器视口"以选中相机预览"。
+    # 触发面：机位反解 + 装相机（CameraSystem）、预览状态（EditorContext）、
+    # 每帧应用 + 镜头效果还原（EditorApp）、导航门禁（ViewportPanel）、
+    # 按钮与锚点（CinematographyPanel）。
+    # ⚠ `runtime/RuntimeApp.cpp` **故意不登记**：它不含预览逻辑，登记进来
+    #   只会让这条 GUI 用例在纯运行时改动上白跑一轮（约 40 秒）。
+    "verify_camera_preview": ["engine/scene/CameraSystem.*",
+                              "editor/EditorContext.*",
+                              "editor/EditorApp.cpp",
+                              "editor/ViewportPanel.*",
+                              "editor/CinematographyPanel.*"],
     # 多机位切镜。触发面和运镜重叠，但**多出来**两块：
     #   · `engine/sequence/SequenceAsset.*` —— marker 的解析 / 写回 / 区间语义
     #     （C 组的 `shots` 数组与 A 组的 `seq_shot_*` 全部来自这里）
@@ -2406,10 +2549,37 @@ TRIGGERS = {
     "verify_multi_cam": ["engine/sequence/SequenceAsset.*",
                          "engine/sequence/SequencerSystem.*",
                          "engine/sequence/SequenceSelfTest.cpp",
+                         # 切镜混合的**形状**（linear / smooth / easein /
+                         # easeout / smoother）。数据层、执行层、面板、预览图
+                         # 四处共用同一份 `blendCurveApply`，改它就等于改画面。
+                         "engine/scene/BlendCurve.*",
                          "engine/scene/CameraSystem.*",
                          "engine/scene/CameraMoveSelfTest.cpp",
                          "editor/TimelineEditorWindow.*",
                          "runtime/RuntimeApp.cpp"],
+    # C5 实体 TRS 轨道。
+    #   · `engine/animation/TransformClip.*` —— 采样 / 推进 / 每帧纪律（A 组全部）
+    #   · `editor/ToolkitEditors.cpp` —— 编辑器那份插值已被删掉、改调引擎层，
+    #     所以它一变就必须重验（否则编辑器与运行时又各说各话）
+    #   · `editor/EditorApp.cpp` / `runtime/RuntimeApp.cpp` —— **两套接线**，
+    #     B 组与 C 组分别盯一条
+    # ⚠ 刻意**不**登记 `engine/ecs/Components.h`（横切，在 GLOBAL_GLOBS 里）。
+    # B6 表情：数据层 / 驱动 / 自检 / 两套接线（编辑器 + 运行时）/ 音频电平。
+    # ⚠ 刻意**不**登记 `engine/ecs/Components.h`、`engine/scene/SceneSerializer.cpp`
+    #   （横切，在 GLOBAL_GLOBS 里）；`editor/InspectorPanel.cpp` 同理。
+    "verify_expression": ["engine/animation/Expression*",
+                          "engine/audio/Mixer.*",
+                          "engine/audio/AudioSystem.*",
+                          "assets/expressions/**",
+                          "editor/EditorApp.cpp",
+                          "runtime/RuntimeApp.cpp",
+                          "runtime/main.cpp"],
+    "verify_transform_clip": ["engine/animation/TransformClip.*",
+                              "engine/animation/TransformClipSelfTest.cpp",
+                              "editor/ToolkitEditors.cpp",
+                              "editor/EditorApp.cpp",
+                              "runtime/RuntimeApp.cpp",
+                              "runtime/main.cpp"],
     "verify_gait_cycle": ["engine/animation/GaitCycle.*",
                           "editor/CharacterWindow.*",
                           "engine/animation/ClipEdit.*",
@@ -2994,25 +3164,69 @@ def impact_analysis(old_snap, new_snap, narrow=False):
     }
 
 
-def stale_build_warning(hits):
-    """源码比 Editor.exe 还新 → 大概率忘了重建。早提醒，省下整轮白跑。"""
-    exe = os.path.join(BIN_DIR, "Editor.exe")
+def _shader_artifacts_mtime():
+    """`build/bin/shaders/*.spv` 里最新的一份。着色器"重建完"的标志看它。
+
+    ⚠ 为什么不能拿 `Editor.exe` 当尺子：**着色器不参与链接**。只改一个
+      `.frag` 时构建只重编 `.spv`，exe 的 mtime 一动不动 —— 于是
+      "改完着色器 → 构建 → 跑回归"会永远收到"大概率没重新构建"的假警报。
+      `.glsl` 那种被 include 的公共片段也一样：它一变，所有 spv 都会重编。
+    """
+    d = os.path.join(BIN_DIR, "shaders")
+    newest = 0.0
     try:
-        exe_t = os.stat(exe).st_mtime
+        for n in os.listdir(d):
+            if n.endswith(".spv"):
+                newest = max(newest, os.stat(os.path.join(d, n)).st_mtime)
     except OSError:
-        return "找不到 %s（是不是还没构建过？）" % exe
-    newest, newest_f = 0.0, ""
+        pass
+    return newest
+
+
+def _artifact_mtime(name):
+    """`build/bin/<name>` 的 mtime；没有返回 0。"""
+    try:
+        return os.stat(os.path.join(BIN_DIR, name)).st_mtime
+    except OSError:
+        return 0.0
+
+
+def _owner_artifact(src):
+    """一条源码路径 → 它**真正链接进**的那个产物的 mtime。
+
+    ⚠⚠ 不能一律拿 `Editor.exe` 当尺子。`runtime/*.cpp` 只进 `Game.exe`、
+      `editor/*.cpp` 只进 `Editor.exe`，而增量构建只重链受影响的那个目标 ——
+      于是"改了 `RuntimeApp.cpp` → 构建（只重链 Game.exe）→ 跑回归"会让
+      `RuntimeApp.cpp` 永远比 `Editor.exe` 新，每次都弹一条"大概率没重新构建"。
+      一条**永远为真**的告警等于没有告警，只会训练人忽略它。
+    """
+    if src.startswith("assets/shaders/"):
+        return _shader_artifacts_mtime() or _artifact_mtime("Editor.exe")
+    if src.startswith("runtime/") or src.startswith("runtime\\"):
+        return _artifact_mtime("Game.exe")
+    return _artifact_mtime("Editor.exe")
+
+
+def stale_build_warning(hits):
+    """源码比它的**构建产物**还新 → 大概率忘了重建。早提醒，省下整轮白跑。"""
+    if not _artifact_mtime("Editor.exe"):
+        return "找不到 %s（是不是还没构建过？）" % os.path.join(BIN_DIR,
+                                                              "Editor.exe")
+    worst, worst_f = -1.0, ""
     for _tag, f in hits:
         p = os.path.join(ROOT, f.replace("/", os.sep))
         try:
             t = os.stat(p).st_mtime
         except OSError:
             continue
-        if t > newest:
-            newest, newest_f = t, f
-    if newest > exe_t + 1.0:
-        return ("`%s` 比 Editor.exe 还新 → 大概率**没重新构建**，"
-                "这一轮跑的是旧二进制" % newest_f)
+        base = _owner_artifact(f)
+        if not base:
+            continue          # 产物本身不存在：另有人会喊，别在这儿编一条
+        if t - base > worst:
+            worst, worst_f = t - base, f
+    if worst > 1.0:
+        return ("`%s` 比它的构建产物还新 → 大概率**没重新构建**，"
+                "这一轮跑的是旧二进制/旧 .spv" % worst_f)
     return ""
 
 
@@ -3137,12 +3351,29 @@ def main():
                            encoding="utf-8", errors="replace")
         out = p.stdout or ""
         ok = False
+        # ⚠⚠ 名字**不能**叫 `skipped`：上面 `rows, skipped, ran = [], [], 0` 里
+        #   那个 `skipped` 是**跳过用例的列表**（汇总段要 `len()` / `", ".join()`）。
+        #   同名会让第一次进循环就把列表覆盖成 bool → 汇总时
+        #   `TypeError: object of type 'bool' has no len()`，整个闸门在
+        #   **最后一步**崩掉（前面几十个用例的结果全部白跑，而且看起来像
+        #   "脚本自己坏了"）。这条是 SKIP 档引入时踩到的真实坑。
+        was_skip = False
         for line in out.splitlines():
-            if BAD_RE.search(line):
+            if SKIP_RE.search(line):
+                was_skip = True
+            elif BAD_RE.search(line):
                 ok = False
             elif OK_RE.search(line):
                 ok = True
-        mark = "PASS" if (p.returncode == 0 and ok) else "FAIL"
+        # ⚠ rc=0 却一条 OK_RE 都没扫到 → 这不是"断言红了"，是**脚本没按
+        #   报告契约收尾**（只打 `=== N/M PASS ===` 之类）。这种情况从外面
+        #   看和"真红"一模一样，历史上耗掉过很多次排查时间 —— 必须点名。
+        no_verdict = (p.returncode == 0 and not ok and not was_skip and
+                      not any(BAD_RE.search(line)
+                              for line in out.splitlines()))
+        # SKIP 优先于一切：它是脚本自己宣布"前置不齐，我没测"，与断言无关。
+        mark = ("SKIP" if was_skip else
+                ("PASS" if (p.returncode == 0 and ok) else "FAIL"))
         rows.append((n, p.returncode, mark, out))
         # 每个用例的**完整**输出都落盘。失败时只打尾部 N 行，光靠它没法定位
         # 问题（比如"手柄目标是碰撞体"挂了，但尾部看到的已经是几行之后的连锁
@@ -3151,8 +3382,10 @@ def main():
         with open(os.path.join(LOG_DIR, n + ".log"), "w",
                   encoding="utf-8") as fh:
             fh.write(out)
-        print("%-26s %-4s rc=%-3d %5.1fs" % (n, mark, p.returncode,
-                                             time.time() - t0))
+        print("%-26s %-4s rc=%-3d %5.1fs%s"
+              % (n, mark, p.returncode, time.time() - t0,
+                 "   ← rc=0 但没有 `结果:` 行（报告契约不完整，不是断言的错）"
+                 if no_verdict else ""))
         if mark == "FAIL":
             tail = out.splitlines()[-args.tail:]
             for line in tail:
@@ -3179,10 +3412,16 @@ def main():
                 keep_tests.pop(n, None)
         save_cache(cur_snap, keep, keep_tests)
 
-    bad = [r for r in rows if r[2] != "PASS"]
+    skips = [r for r in rows if r[2] == "SKIP"]
+    bad = [r for r in rows if r[2] not in ("PASS", "SKIP")]
     total = len(rows) + len(skipped)
-    done = total - len(bad)
+    done = total - len(bad) - len(skips)
     print("\n%d/%d 通过" % (done, total))
+    if skips:
+        # ⚠ 单独一档，**不进失败列表也凑不进通过数** —— 分母保持不变，
+        #   一眼就能看出"分母里有几条根本没测"。
+        print("跳过 %d 例（前置不齐：外部资产缺失，见 `tools/prereq.py`）：%s"
+              % (len(skips), ", ".join(r[0] for r in skips)))
     if skipped:
         print("（其中 %d 例与本轮改动无关，沿用上次 PASS 未重跑：%s）"
               % (len(skipped), ", ".join(skipped)))

@@ -43,6 +43,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from capture_window import capture_client, find_window, user32       # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -414,13 +415,13 @@ def main():
 if __name__ == "__main__":
     for f in ("_p5_feel.json", "_p5_feel_game.json"):
         try:
-            os.remove(os.path.join(ASSETS, f))
+            safe_remove(os.path.join(ASSETS, f))
         except OSError:
             pass
     rc = main()
     for f in ("_p5_feel.json", "_p5_feel_game.json"):
         try:
-            os.remove(os.path.join(ASSETS, f))
+            safe_remove(os.path.join(ASSETS, f))
         except OSError:
             pass
     sys.exit(rc)

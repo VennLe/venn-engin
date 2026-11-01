@@ -157,6 +157,9 @@ bool parseDialogue(const std::string& text, const std::string& sourcePath,
             n.text = jn["text"].get<std::string>();
         if (jn.contains("next") && jn["next"].is_string())
             n.nextId = jn["next"].get<std::string>();
+        // D1：语音路径。缺省空 = 这句没有语音（老资产逐位不变）。
+        if (jn.contains("voice") && jn["voice"].is_string())
+            n.voice = jn["voice"].get<std::string>();
 
         if (jn.contains("choices")) {
             if (!jn["choices"].is_array()) {
@@ -272,6 +275,8 @@ std::string toJson(const DialogueAsset& a) {
         if (!n.speaker.empty()) jn["speaker"] = n.speaker;
         jn["text"] = n.text;
         if (!n.nextId.empty()) jn["next"] = n.nextId;
+        // D1：只在有语音时写 —— 老资产存回去**不许长出** `"voice": ""`。
+        if (!n.voice.empty()) jn["voice"] = n.voice;
         if (!n.choices.empty()) {
             nlohmann::ordered_json jc = nlohmann::ordered_json::array();
             for (const auto& c : n.choices) {

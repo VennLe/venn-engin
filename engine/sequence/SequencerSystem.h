@@ -109,6 +109,8 @@ public:
     std::uint64_t shotCameraGuid() const { return m_shotCam; }
     // 这次切换要混合多久（秒）；0 = 硬切。
     float shotBlendSeconds() const { return m_shotBlend; }
+    // 这 `shotBlendSeconds()` 秒里**怎么走**。硬切时无意义（但照样有值）。
+    scene::BlendCurve shotBlendCurve() const { return m_shotCurve; }
 
     // 本帧派发出去的事件（`kind` / `payload` 的拷贝，供 UI 与将来的
     // C6 脚本导演 API 消费）。每帧开头清空。
@@ -169,6 +171,7 @@ private:
     int m_shotIdx = -1;
     std::uint64_t m_shotCam = 0;
     float m_shotBlend = 0.0f;
+    scene::BlendCurve m_shotCurve = scene::BlendCurve::Smooth;
     // 上一次打日志时的 marker 下标（−2 = 还没打过，用来保证首帧也打一条）
     int m_shotLogged = -2;
 

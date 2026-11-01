@@ -32,6 +32,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from capture_window import find_window                                # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors               # noqa: E402
 
@@ -222,7 +223,7 @@ def main():
         group_persist()
     finally:
         if os.path.exists(FIXTURE):
-            os.remove(FIXTURE)
+            safe_remove(FIXTURE)
 
     fails = [n for n, ok, _ in results if not ok]
     if fails:

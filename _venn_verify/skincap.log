@@ -1,0 +1,161 @@
+[INFO ] === Venn Engine - Runtime (Game.exe) ===
+[INFO ] GAME-LOG path=C:\Users\wumen\AppData\Local\Venn\venn\logs\runtime-20261031-160425.log
+[INFO ] GAME-BUILD venn 0.2.0 dev git=ab300d5-dirty
+[INFO ] GAME-CONFIG loaded D:\A-VENN\code\cpp\venn-engin\build\bin\assets\game.json
+[INFO ] AUDIO-CONFIG enabled=0 device=default null=0 master=1.00 music=0.70 sfx=1.00 voice=1.00 mute=0 duck=0.75 maxvoices=64 retry=0
+[INFO ] GAME-CONFIG scene='..\..\..\_venn_verify\skin_capacity_scene.json' window=1280x720 fullscreen=0 maxFps=60 unfocusedFps=15 timeScale=1.00 language=en quality=high startState=playing selftest='-' verbose=0 uiDoc='' source='D:\A-VENN\code\cpp\venn-engin\build\bin\assets\game.json'
+[INFO ] AppUserModelID set (taskbar identity)
+[INFO ] Window icon from exe resource #1: big 48x48, small 24x24
+[INFO ] Window created: Venn Game (1280 x 720)
+[INFO ] Application starting...
+[INFO ] Window icon: keeping the exe-embedded multi-size icon (png 'D:\A-VENN\code\cpp\venn-engin\build\bin\assets\icons/venn_icon.png' not needed)
+[INFO ] Vulkan instance created (validation: ON)
+[INFO ] INSTANCE build=dev git=ab300d5-dirty validation=on
+[INFO ] Device: descriptor indexing available (bindless usable)
+[INFO ] Device created: Intel(R) Iris(R) Xe Graphics (graphics family 0)
+[INFO ] Swapchain present mode = FIFO (vsync=0)
+[INFO ] Swapchain created: 1280 x 720, 3 images
+[INFO ] Texture(DDS) loaded: D:\A-VENN\code\cpp\venn-engin\build\bin\assets\textures/sss_lut.dds format=BC1 256x256 levels=9
+[INFO ] SSS: LUT loaded (D:\A-VENN\code\cpp\venn-engin\build\bin\assets\textures/sss_lut.dds)
+[INFO ] POM: scale=1.000 fade=10.0..26.0 m layers=32
+[INFO ] DECALS: off (dbuffer x3 RGBA8, max 64 decals/slot)
+[INFO ] MdiDraw: mdi_compact.comp.spv 已就绪（storage image 0 / SSBO 5）
+[INFO ] LightTextureLibrary: 7 layers (256x256), 7 builtin
+[INFO ] HiZOcclusion: 1280x720, 11 mips, depth format MSAA (4 samples)
+[INFO ] VolumetricFog: froxel grid 80x45x64 (screen 1280x720, msaa=1)
+[INFO ] MdiDraw: inputs ready (2 slots)
+[INFO ] ClusteredLighting: 40x23 clusters (tile 32, 16 slices) = 14720 clusters, light index 7360 KB/frame
+[INFO ] Environment: sky=128 irr=32 pref=128x5 mips lut=256
+[INFO ] ENV-DBG sky=128 irr=32 pref=128 mips=5 lut=256
+[INFO ] ENV-READBACK up=(0.4630,0.5820,0.7836) side=(0.2328,0.2700,0.3438) down=(0.1059,0.0981,0.1013) lutA10=1.0000 lutB10=0.0000 lutA55=0.7334 lutB55=0.0183
+[INFO ] PROBE: created (enabled=0 capture=128 prefilter=64 mips=5 max=4 ssp=256)
+[INFO ] FX: created (enabled=0 cap=512 emitters=8 simHz=60 poolMB=0.31)
+[INFO ] TERRAIN-PIPELINE vert=terrain.vert.spv frag=terrain.frag.spv sets=2 cull=none
+[INFO ] WATER-INIT colorFormat=97 frames=2 maxBodies=32
+[INFO ] WATER-TARGETS 1280x720 frames=2 samples=4
+[INFO ] VIEW-MODE wireframe=available
+[INFO ] UI2-PIPE pass=E4607E00000000A4 count=1
+[INFO ] UI2-ATLAS swizzled=0 view=5DA140000000037F
+[INFO ] UI2-FONT face=Noto Sans SC license=OFL-1.1 glyphs=1253 size=48 spread=6.0 atlas=2048x4096 ascent=48 descent=10 top=1 json=D:\A-VENN\code\cpp\venn-engin\build\bin\assets\ui\fonts/noto_sc_sdf.json
+[INFO ] UI2-INIT frames=2 vbo=1152KB/frame atlas=2048x4096
+[INFO ] UI2: renderer ready (independent 1-set pipeline)
+[INFO ] GPU-TIMER ready: 2 frames x 11 sections, period 52.083 ns, valid bits 36
+[INFO ] ImGui settings persistence disabled (automation run)
+[INFO ] ImGui font loaded: D:\A-VENN\code\cpp\venn-engin\build\bin\assets\fonts/DroidSans.ttf (18px)
+[INFO ] ImGui CJK font merged: C:/Windows/Fonts/msyh.ttc (18px)
+[INFO ] RT-TARGETS count=1 [main] viewCam=0 extra=0
+[INFO ] VIEW-MODE init mode=lit
+[INFO ] FEATURES: 36 groups, 136 params registered, 136 bound, 0 unbound
+[INFO ] UI2-CAPS maxBoundDescriptorSets=32 maxPerStageDescSamplers=64 swapFormat=50 outExtent=1280x720 enabled=1
+[INFO ] Renderer initialized (GPU: Intel(R) Iris(R) Xe Graphics, MSAA 4x, shadow 2048, HDR 1280x720, clusters 0x0x0 = 0)
+[INFO ] GAME-INIT runtime booting (scene='..\..\..\_venn_verify\skin_capacity_scene.json')
+[INFO ] I18N-KEY lang=en count=0 src=config
+[INFO ] GAME-INPUT source=factory path=D:\A-VENN\code\cpp\venn-engin\build\bin\assets\input_map.json
+[INFO ] GAME-INPUT Jump=Space / PadBtn0 Sprint=Mouse1 / PadBtn4 Interact=E / PadBtn2
+[INFO ] GAME-INPUT Gameplay=12, Menu=7 stack=Gameplay
+[INFO ] SCENE-CAMERA eye=(0.00,0.00,6.00) target=(-9.00,0.00,6.00) yaw=0.00 pitch=0.00 dist=9.00
+[INFO ] SCENE-GUID assigned=120 dup=0 total=129 path=..\..\..\_venn_verify\skin_capacity_scene.json
+[INFO ] ASSET-MAT-ID model=assets/models/characters/animate_girl_rigged.glb key=assets/models/characters/animate_girl_rigged.glb/mat0 id=models/characters/animate_girl_rigged.glb#材质.003
+[INFO ] ASSET-MAT-ID model=assets/models/characters/animate_girl_rigged.glb key=assets/models/characters/animate_girl_rigged.glb/mat1 id=models/characters/animate_girl_rigged.glb#材质.002
+[INFO ] ASSET-MAT-ID model=assets/models/characters/animate_girl_rigged.glb key=assets/models/characters/animate_girl_rigged.glb/mat2 id=models/characters/animate_girl_rigged.glb#材质.004
+[INFO ] ASSET-MAT-ID model=assets/models/characters/animate_girl_rigged.glb key=assets/models/characters/animate_girl_rigged.glb/mat3 id=models/characters/animate_girl_rigged.glb#材质.006
+[INFO ] ASSET-MAT-ID model=assets/models/characters/animate_girl_rigged.glb key=assets/models/characters/animate_girl_rigged.glb/mat4 id=models/characters/animate_girl_rigged.glb#材质.001
+[INFO ] ASSET-MAT-ID model=assets/models/characters/animate_girl_rigged.glb key=assets/models/characters/animate_girl_rigged.glb/mat5 id=models/characters/animate_girl_rigged.glb#材质
+[INFO ] ASSET-MAT-ID model=assets/models/characters/animate_girl_rigged.glb key=assets/models/characters/animate_girl_rigged.glb/mat6 id=models/characters/animate_girl_rigged.glb#材质.005
+[INFO ] glTF: skinned model, 65 joints, 4 clips
+[INFO ] ASSET-VMETA path=assets/models/characters/animate_girl_rigged.glb.vmeta hash=fnv1a:0x1D8AA83AE9D90893 changed=0 forced=0 mats=7
+[INFO ] glTF loaded: D:\A-VENN\code\cpp\venn-engin\build\bin\assets\models/characters/animate_girl_rigged.glb (7 submeshes, 7 materials)
+[INFO ] SCENE-SKINNED entity=2 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=10 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=18 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=26 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=34 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=42 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=50 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=58 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=66 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=74 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=82 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=90 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=98 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=106 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=114 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] SCENE-SKINNED entity=122 clip=Idle speed=1.00 playing=1 loop=1 time=0.000 joints=65 ok=1
+[INFO ] Scene loaded: ..\..\..\_venn_verify\skin_capacity_scene.json (129 entities, 0 skipped)
+[INFO ] GAME-SCENE path=..\..\..\_venn_verify\skin_capacity_scene.json entities=129 skipped=0
+[INFO ] GAME-PHYS world built — 1 body(ies) (ground=1 triggers=0 materials=0) from 0 rigid entities
+[INFO ] GAME-PLAYER skipped found=0 spawnOnRun=1
+[INFO ] GAME-PLAYER none (no CharacterControllerComponent)
+[INFO ] SCENE-SKINNED entity=2 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=10 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=18 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=26 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=34 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=42 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=50 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=58 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=66 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=74 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=82 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=90 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=98 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=106 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=114 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SCENE-SKINNED entity=122 clip=Idle speed=1.00 playing=1 loop=1 stored=1
+[INFO ] SAVE-BASELINE entities=129 sceneHash=53fb97d16f9a16b7
+[INFO ] SAVE-BASELINE entities=129 reason=level-load
+[INFO ] AUDIO-INIT enabled=0 backend=none device=- sr=0 ch=0 fallback=0
+[INFO ] GAME-INIT ready — state=Playing entities=130 bodies=1 scripts=0
+[INFO ] LOD-BUILD 'editor_ground' kind=1 levels=1 tris=2
+[INFO ] LOD-SKIP-SKIN 'assets/models/characters/animate_girl_rigged.glb'（蒙皮网格不做自动减面，见 ensureLod 注释）
+[INFO ] LOD-BUILD 'assets/models/characters/animate_girl_rigged.glb' kind=3 levels=1 tris=14528
+[INFO ] LOD-SKIP-SKIN 'assets/models/characters/animate_girl_rigged.glb'（蒙皮网格不做自动减面，见 ensureLod 注释）
+[INFO ] LOD-BUILD 'assets/models/characters/animate_girl_rigged.glb' kind=3 levels=1 tris=3516
+[INFO ] LOD-SKIP-SKIN 'assets/models/characters/animate_girl_rigged.glb'（蒙皮网格不做自动减面，见 ensureLod 注释）
+[INFO ] LOD-BUILD 'assets/models/characters/animate_girl_rigged.glb' kind=3 levels=1 tris=2931
+[INFO ] LOD-SKIP-SKIN 'assets/models/characters/animate_girl_rigged.glb'（蒙皮网格不做自动减面，见 ensureLod 注释）
+[INFO ] LOD-BUILD 'assets/models/characters/animate_girl_rigged.glb' kind=3 levels=1 tris=288
+[INFO ] LOD-SKIP-SKIN 'assets/models/characters/animate_girl_rigged.glb'（蒙皮网格不做自动减面，见 ensureLod 注释）
+[INFO ] LOD-BUILD 'assets/models/characters/animate_girl_rigged.glb' kind=3 levels=1 tris=1301
+[INFO ] LOD-SKIP-SKIN 'assets/models/characters/animate_girl_rigged.glb'（蒙皮网格不做自动减面，见 ensureLod 注释）
+[INFO ] LOD-BUILD 'assets/models/characters/animate_girl_rigged.glb' kind=3 levels=1 tris=6021
+[INFO ] LOD-SKIP-SKIN 'assets/models/characters/animate_girl_rigged.glb'（蒙皮网格不做自动减面，见 ensureLod 注释）
+[INFO ] LOD-BUILD 'assets/models/characters/animate_girl_rigged.glb' kind=3 levels=1 tris=5342
+[INFO ] UI2-PAUSE open=0 context=Gameplay cursor=1
+[INFO ] ANIM-SKIN-CAP grow from=256 to=1364 need=1040
+[INFO ] ANIM-SKIN entity=2 jointBase=0 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=10 jointBase=65 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=18 jointBase=130 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=26 jointBase=195 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=34 jointBase=260 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=42 jointBase=325 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=50 jointBase=390 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=58 jointBase=455 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=66 jointBase=520 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=74 jointBase=585 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=82 jointBase=650 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=90 jointBase=715 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=98 jointBase=780 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=106 jointBase=845 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=114 jointBase=910 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] ANIM-SKIN entity=122 jointBase=975 time=0.000 clip=[Idle] play=1 joints=65
+[INFO ] Window shown (first frame is on screen)
+[INFO ] ANIM-STRIDE-CURVE-SKIP clip=Idle reason='两只脚都没抬起来（不是步态 clip？）'
+[INFO ] ANIM-TICK f=1 entities=16 animators=0 dt=0.01667 fading=0 lastclip=[Idle] lasttime=0.000
+[INFO ] ANIM-STRIDE-CURVE-TICK on=1 curved=0 curves=1
+[ERROR] [validation] Validation Error: [ VUID-vkUpdateDescriptorSets-None-03047 ] Object 0: handle = 0xa25b9c0000000392, type = VK_OBJECT_TYPE_DESCRIPTOR_SET; Object 1: handle = 0x967dd1000000000e, type = VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT; | MessageID = 0x35d7ea98 | vkUpdateDescriptorSets(): pDescriptorWrites[0].dstBinding (0) was created with VkDescriptorBindingFlags(0), but VkDescriptorSet 0xa25b9c0000000392[] is in use by VkCommandBuffer 0x1f6a2bb6c78[].
+The Vulkan spec states: The dstSet member of each element of pDescriptorWrites or pDescriptorCopies for bindings which were created without the VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT or VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT bits set must not be used by any command that was recorded to a command buffer which is in the pending state (https://vulkan.lunarg.com/doc/view/1.3.296.0/windows/1.3-extensions/vkspec.html#VUID-vkUpdateDescriptorSets-None-03047)
+[INFO ] ANIM-SKIN-CAP grow from=256 to=1364 need=1040
+[INFO ] UI2-STATS draws=1 verts=102 out=1280x720
+[INFO ] ANIM-TICK f=61 entities=16 animators=0 dt=0.01667 fading=0 lastclip=[Idle] lasttime=1.000
+[INFO ] ANIM-STRIDE-CURVE-TICK on=1 curved=0 curves=1
+[INFO ] HUD-STATS popups=0 health=100.0 shown=100.0 trail=100.0 bar=16,692,240x12 fill=16,692,240x12 out=1280x720 scale=0.6667
+[INFO ] Auto-exit after 60 frames (smoke test)
+[INFO ] AUDIO-SUMMARY backend=none device=(none) running=0 voices=0 sr=48000 ch=2 mem=0
+[INFO ] GAME-LOOP tick=60 fixed=100 var=60 render=60 acc=0.0164 alpha=0.984 sim=1.667s scale=1.00 dropped=4
+[INFO ] GAME-LOOP-SUMMARY ticks=60 fixed=100 var=60 render=60 sim=1.667s dropped=4
+[INFO ] GAME-STATE-SEQ Boot>Loading>MainMenu>Playing
+[INFO ] GAME-PLAYER-SUMMARY none
+[INFO ] GAME-PHYS-SUMMARY steps=100 sim=1.667s bodies=1 dyn=0 manifolds=0
+[INFO ] Application shutdown. Total frames: 60
+[INFO ] GAME-EXIT code=0 log=C:\Users\wumen\AppData\Local\Venn\venn\logs\runtime-20261031-160425.log

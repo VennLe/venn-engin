@@ -6,6 +6,11 @@
 // 一串事件"，并且能在任意时刻 `t` 上采样出相机姿态、查出该发哪些事件。
 // 播放器（`SequencerSystem`）只负责推进 `t`，不负责决策。
 //
+// ⚠ `scene/BlendCurve.h` 是唯一允许从 scene/ 拉进来的头：它是纯枚举 +
+//   纯函数、一个 include 都没有，拉进来不会把 `CameraSystem.h` 带进来，
+//   下面那段"不能 include CameraSystem"的约束依然成立。
+#include "scene/BlendCurve.h"
+//
 // ------------------------------------------------------------
 // 为什么这里**不** include `scene/CameraSystem.h`
 // ------------------------------------------------------------
@@ -120,9 +125,15 @@ struct SeqShot {
     std::uint64_t cameraGuid = 0;   // 0 = 回落关键帧轨
     // 从上一机位混到这一台用多久（秒）。0 = **硬切** —— 电影剪辑里
     // 最常用的是硬切，默认值就该是它。
-    // ⚠ 这里只**声明意图**，真正的混合由 `CameraSystem::blendTo` 执行：
+    // ⚠ 这里只**声明意图**，真正的混合由 `CameraSystem::blendCut` 执行：
     //   本文件是纯数据（不认识 Scene / CameraSystem）。
     float blendSeconds = 0.0f;
+    // 这 `blendSeconds` 秒里**怎么走**（2026-10-31）。只有 `blendSeconds > 0`
+    // 才有意义；硬切时它被忽略（但**照样存盘**：作者先把曲线调好、再把
+    // 时长从 0 拉到 0.4，不该还要回来重选一次）。
+    // ⚠ 默认 `Smooth` = 加这个字段之前的行为（那时写死 smoothstep），
+    //   所以老资产读进来、写回去都逐字段不变。
+    scene::BlendCurve blendCurve = scene::BlendCurve::Smooth;
     std::string label;              // 面板与日志用（"A 机位 特写"）
 };
 

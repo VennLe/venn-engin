@@ -19,6 +19,16 @@
         强制先用**低**优先级那台 —— 于是"`CAM-CUT` 出现"这件事本身
         就证明了覆盖压过 priority，不需要额外造条件。
 
+混合曲线（2026-10-31，运镜体系 §十尾巴）
+    以前 marker 只有"混多久"，没有"中间怎么走"：一律 smoothstep，时间轴上
+    也只有一块固定 18 px 的渐变。现在每条 marker 各带一条曲线
+    （linear / smooth / easein / easeout / smoother），四处共用同一个
+    `scene::blendCurveApply`：数据层、运行时、面板预览图、轨道上的折线。
+    判据分布：A 组 `seq_shot_curve_*`（解析/写回/两端精确）+ `G7*`（三种曲线
+    在同一时刻落到三个不同的数）；B 组 `B3c/B5e/B5f`（改得动、写得出、默认
+    不弄脏文件）+ `B8`（下拉与**预览图**都有锚点）；C 组 `C5d`（文件 → 运行时）。
+    ⚠ 只钉 `G5`（smooth 中点 0.5）是不够的：把 curve 参数丢掉之后它照样绿。
+
 ==============================================================================
 三条刻意的取舍
 ==============================================================================
@@ -98,7 +108,8 @@ def run_kernel():
         return
     passed, failed = int(m.group(1)), int(m.group(2))
     check("A1 时间轴自检无失败项", failed == 0, "pass=%d fail=%d" % (passed, failed))
-    check("A1b 条目数 >= 97（含 24 条 shots 组）", passed >= 97, "pass=%d" % passed)
+    check("A1b 条目数 >= 108（含 24 条 shots 组 + 8 条混合曲线组）",
+          passed >= 108, "pass=%d" % passed)
 
     # 只数总数会让"某一组整段没跑"看不出来 —— 点名代表条目。
     must = [
@@ -111,6 +122,13 @@ def run_kernel():
         "seq_shot_roundtrip",
         "seq_shot_player_blend0",
         "seq_shot_none_idx",               # 老资产：一个 marker 都没有
+        # 混合曲线（2026-10-31）：默认 / 解析 / 认不出要警告 / 往返 / 两端精确
+        "seq_shot_curve_default",          # 缺键 → smooth（= 加曲线前的行为）
+        "seq_shot_curve_parse",
+        "seq_shot_curve_unknown_warns",    # 拼错不许致命，但必须说
+        "seq_shot_curve_roundtrip",
+        "seq_shot_curve_endpoints",        # f(0)=0 f(1)=1，否则混合两端跳一下
+        "seq_shot_player_curve0",          # 曲线真的跟着 marker 走
     ]
     for name in must:
         mm = last(re.compile(r"SEQ-TEST %s .*result=(\w+)" % re.escape(name)), out)
@@ -124,7 +142,8 @@ def run_kernel():
         return
     passed, failed = int(m.group(1)), int(m.group(2))
     check("A5 运镜自检无失败项", failed == 0, "pass=%d fail=%d" % (passed, failed))
-    check("A5b 条目数 >= 81（含 12 条导演覆盖组）", passed >= 81, "pass=%d" % passed)
+    check("A5b 条目数 >= 85（含 12 条导演覆盖组 + 4 条混合曲线组）",
+          passed >= 85, "pass=%d" % passed)
 
     must = [
         "G1 无导演时按 priority 选中 B",
@@ -134,6 +153,12 @@ def run_kernel():
         "G4 导演 guid 被清零",
         "G5 blend 走到一半时 x 在中点",
         "G6 dt==0 时 blend 不推进（还在 B）",
+        # 混合曲线（2026-10-31）：三条曲线在同一时刻必须落到三个不同的数。
+        # ⚠ 只钉"G5（smooth 中点 0.5）"是不够的 —— 把 curve 参数丢掉之后
+        #   G5 照样绿，因为 smooth 在中点恰好也是 0.5。
+        "G7b easein 在 0.5 处只走了 1/4（x≈7.5）",
+        "G7c easeout 在 0.5 处已走 3/4（x≈2.5）",
+        "G7d 三条曲线在同一时刻互不相同（参数没被丢掉）",
     ]
     for name in must:
         mm = last(re.compile(r"CAMMOVE-TEST (\w+) %s" % re.escape(name)), out)
@@ -147,6 +172,13 @@ OPEN_RE = re.compile(r"TLED-OPEN path=(\S+) ok=(\d+) keys=(\d+) events=(\d+) "
                      r"dur=([\d.]+) readOnly=(\d+) shots=(\d+)")
 ADDSHOT_RE = re.compile(r"TLED-ADDSHOT t=([\d.]+) cam=(\S+) shots=(\d+) sel=(\d+)")
 BLEND_RE = re.compile(r"TLED-SETSHOTBLEND t=([\d.]+) blend=([\d.]+)")
+CURVE_RE = re.compile(r"TLED-SETSHOTCURVE t=([\d.]+) curve=(\S+) blend=([\d.]+)")
+# `logRect` 的真实格式（`engine/ui/DebugRects.h`）：
+#   TAG=(x0,y0)-(x1,y1) center=(cx,cy)
+# ⚠ 两组括号之间是 `-(`，不是逗号；也没有空格。写成 ", " 四元组会**一条都
+#   匹配不到**，而 `"TAG" in text` 那种存在性断言照样绿 —— 正是 B8b 要防的
+#   那种"看起来测了"。
+RECT_RE = re.compile(r"\((-?[\d.]+),(-?[\d.]+)\)-\((-?[\d.]+),(-?[\d.]+)\)")
 CAM_RE = re.compile(r"TLED-SETSHOTCAM t=([\d.]+) cam=(\S+)")
 SAVE_RE = re.compile(r"SEQ-SAVE path=(\S+) full=(\S+) keys=(\d+) events=(\d+) "
                      r"shots=(\d+)")
@@ -182,6 +214,7 @@ def run_editor_group(tmp):
 
     # ---- B1 两个 marker + 字段 + 存到临时文件 ----
     script = ("head:2.0;addshot;setshotlabel:A cam;setshotblend:0.5;"
+              "setshotcurve:easeout;"          # ← 只改第 0 条，第 1 条保持默认
               "head:5.0;addshot;sel:shots:0;setshotlabel:A cam;setshotcam:0;"
               "saveas:" + saved)
     text = run_editor({"MYVK_EDITOR_TLED": SRC_ASSET,
@@ -205,6 +238,11 @@ def run_editor_group(tmp):
     check("B3 setshotblend 生效（blend=0.50）",
           mb is not None and abs(float(mb.group(2)) - 0.5) < 1e-6,
           "none" if mb is None else mb.group(0))
+    mg = last(CURVE_RE, text)
+    check("B3c setshotcurve:easeout 生效（curve=easeout）",
+          mg is not None and mg.group(2) == "easeout",
+          "none" if mg is None else mg.group(0))
+
     mc = last(CAM_RE, text)
     check("B3b setshotcam:0 = 显式回落到关键帧轨（合法，不是拒绝）",
           mc is not None and mc.group(2) == "(keys)",
@@ -232,6 +270,15 @@ def run_editor_group(tmp):
               json.dumps(shots[0], ensure_ascii=False))
         check("B5c 第二条 t=5.0（升序）", abs(shots[1].get("t", -1) - 5.0) < 1e-3,
               json.dumps(shots[1], ensure_ascii=False))
+        # 曲线：第 0 条写了 easeout，第 1 条是默认 smooth → **不许**写这个键。
+        # ⚠ 两条都要断：只断"写了"的话，`toJson` 无条件写 smooth 也能过，
+        #   而那会让每一份老 `.seq.json` 一存盘就多一行脏 diff。
+        check("B5e 第 0 条写下了 blendCurve=easeout",
+              shots[0].get("blendCurve") == "easeout",
+              json.dumps(shots[0], ensure_ascii=False))
+        check("B5f 第 1 条是默认 smooth → 文件里没有 blendCurve 键",
+              "blendCurve" not in shots[1],
+              json.dumps(shots[1], ensure_ascii=False))
         # 绑 0 时**不写** camera 键（省略与写 "" 是一回事，但 diff 少一行噪声）
         check("B5d 绑 0 时文件里没有 camera 键",
               all("camera" not in s for s in shots),
@@ -253,17 +300,47 @@ def run_editor_group(tmp):
     check("B6b 被拒之后文件里依然没有 camera 键", same)
 
     # ---- B7 重开：往返读回 ----
-    text3 = run_editor({"MYVK_EDITOR_TLED": saved})
+    # ⚠ 必须**顺带选中一条 marker**：曲线下拉与形状预览图都画在"已选中"
+    #   的分支里，不选中的话属性栏只有一句"请先选一条机位标记"——锚点当然
+    #   不会出现。少了这几句，B8 会红成"面板没画曲线控件"，而其实只是没选。
+    text3 = run_editor({"MYVK_EDITOR_TLED": saved,
+                        "MYVK_EDITOR_TLED_SCRIPT": "sel:shots:0"})
     mo3 = last(OPEN_RE, text3)
     check("B7 重开后 shots=2（存盘内容读得回来）",
           mo3 is not None and mo3.group(7) == "2" and mo3.group(2) == "1",
           "none" if mo3 is None else mo3.group(0)[:110])
 
     # ---- B8 锚点：面板真的把第三行画出来了 ----
-    got = ["TLED-ADDSHOT", "TLED-TRACKS", "TLED-PROP"]
+    # ⚠ 曲线下拉与**形状预览图**都必须有锚点：预览图是这次"可视化"的正身，
+    #   只断下拉的话，"下拉能改、图没画"照样全绿。
+    got = ["TLED-ADDSHOT", "TLED-TRACKS", "TLED-PROP",
+           "TLED-PROP-CURVE", "TLED-SHOT-CURVE-PLOT"]
     missing = [a for a in got if a not in text3]
-    check("B8 面板锚点齐（+Shot 按钮 / 轨道区 / 属性栏）", not missing,
-          "缺=%s" % (missing or "-"))
+    check("B8 面板锚点齐（+Shot 按钮 / 轨道区 / 属性栏 / 曲线下拉 / 形状预览图）",
+          not missing, "缺=%s" % (missing or "-"))
+
+    # ---- B8b 曲线那块**真的在属性栏里面**（不是被裁到 Child 外）----
+    #
+    # ⚠⚠ 只断"锚点存在"是不够的：`logRect` 不判可见性，被裁掉的控件照样
+    #   有矩形。属性栏高度是**写死的**（`propH`，Shots 轨 214 px），加了
+    #   56 px 的预览图之后如果没跟着调大，按钮就落在 Child 外面 ——
+    #   自动化拿到矩形照样能"点"（点在别的窗口上），人肉点不到。
+    #   所以这里比的是**矩形包含关系**：预览图和最后一个交互控件（Use keys）
+    #   的下沿都必须在属性栏的下沿之内。
+    def _rect(tag):
+        i = text3.find(tag + "=(")
+        if i < 0:
+            return None
+        m = RECT_RE.search(text3, i)
+        return tuple(float(m.group(k)) for k in range(1, 5)) if m else None
+
+    prop = _rect("TLED-PROP")
+    plot = _rect("TLED-SHOT-CURVE-PLOT")
+    bind = _rect("TLED-BIND-KEYS")
+    ok8b = bool(prop and plot and bind) and plot[3] <= prop[3] + 0.5 \
+        and bind[3] <= prop[3] + 0.5
+    check("B8b 预览图与 Use keys 都在属性栏内（没被 Child 裁掉）", ok8b,
+          "prop=%s plot=%s bind=%s" % (prop, plot, bind))
 
 
 # ================================================================ C 组
@@ -291,7 +368,10 @@ def write_fixtures():
         ],
         "shots": [
             {"t": 0.0, "camera": GUID_LOW, "label": "low"},
-            {"t": 0.05, "camera": GUID_HIGH, "blend": 0.2, "label": "high"},
+            # 第二段带**非默认**曲线：这是"曲线真的走到了运行时"的唯一证据
+            # —— 时长是 0.2 秒（C5c 已经在钉），曲线是 easein（C5d）。
+            {"t": 0.05, "camera": GUID_HIGH, "blend": 0.2,
+             "blendCurve": "easein", "label": "high"},
         ],
     }
     with open(SEQ_ABS, "w", encoding="utf-8") as f:
@@ -336,7 +416,8 @@ def write_fixtures():
 SEQSHOT_RE = re.compile(r"SEQ-SHOT seq=(\S+) t=([\d.]+) i=(-?\d+)/(\d+) "
                         r"cam=(\S+) blend=([\d.]+)")
 CUT_RE = re.compile(r"CAM-CUT name=(\S+) guid=(\S+) priority=(-?\d+)")
-CUTRT_RE = re.compile(r"CAM-CUT-RT shot=(-?\d+) cam=(\S+) blend=([\d.]+)")
+CUTRT_RE = re.compile(r"CAM-CUT-RT shot=(-?\d+) cam=(\S+) blend=([\d.]+)"
+                      r"(?: curve=(\S+))?")
 
 
 def run_runtime():
@@ -386,6 +467,11 @@ def run_runtime():
         check("C5c 第二段 blend=0.20（文件里写的）",
               abs(float(rts[-1].group(3)) - 0.2) < 1e-6,
               "blend=%s" % rts[-1].group(3))
+        # 曲线：`RuntimeApp` 少接一次 `shotBlendCurve()` 的话，这里会是
+        # smooth（或者压根没有 curve= 字段），而面板与文件都是 easein。
+        check("C5d 第二段的混合曲线 = easein（文件 → 运行时没丢）",
+              rts[-1].group(4) == "easein",
+              "curve=%s" % (rts[-1].group(4) or "none"))
 
     bad = [x for x in out.splitlines() if "VUID" in x or "VALIDATION" in x]
     check("C6 无 VUID / VALIDATION 报错", not bad,
@@ -403,7 +489,7 @@ def main():
     finally:
         try:
             import shutil
-            shutil.rmtree(tmp, ignore_errors=True)
+            safe_rmtree(tmp)
         except Exception:                                        # noqa: BLE001
             pass
 

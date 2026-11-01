@@ -42,6 +42,7 @@
 #include "CinematographyPanel.h"
 #include "PhysicsPanel.h"
 #include "QualitySettingsPanel.h"
+#include "SaveSlotsPanel.h"
 #include "MaterialLibraryPanel.h"
 #include "SceneHierarchy.h"
 #include "SplitLayout.h"
@@ -51,8 +52,13 @@
 #include "script/ScriptEngine.h"
 // 四态 locomotion：与运行时共用同一份实现（P4）
 #include "animation/Locomotion.h"
+#include "animation/TransformClip.h"   // C5：实体 TRS 轨道的运行时消费者
+#include "animation/ExpressionDriver.h" // B6：表情预设 + 眨眼/口型驱动
 // 过场时间轴（C1）：编辑器侧走"直接写 scene::Camera"这条路
 #include "sequence/SequencerSystem.h"
+// 视口"以选中相机预览"：机位由引擎侧那一份反解装上去（反解只写一次）
+#include "scene/CameraSystem.h"
+#include "scene/CameraMove.h"   // fStopToDofAperture / shutterToBlurStrength
 // 键码换算（编辑器侧判定走 ImGui 原始键状态，见 ui/KeyCodes.h）
 #include "ui/KeyCodes.h"
 
@@ -463,6 +469,12 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         //   见 NlaPanel.h 开头）。
         {"nla", "NLA", PanelGroup::Authoring, "", "nla", false, true,
          kSlotNone, &EditorApp::panelDrawNla},
+        // 2026-10-31（G17-3 尾巴）：存档槽位面板。与上面几格同构 ——
+        // 窗口对象自己管 open/close，表项只做显隐 / 落盘三路。
+        // ⚠ 稳定 ID 必须写成 `###panel_save`（= trayWindowName("save")），
+        //   否则底栏托盘的最小化 / 置顶按 id 找不到这个窗口。
+        {"save", "Save slots", PanelGroup::Authoring, "", "disk", false, true,
+         kSlotNone, &EditorApp::panelDrawSaveSlots},
     };
 }
 
@@ -531,6 +543,9 @@ void EditorApp::panelDrawMaterialLibrary(EditorApp& a) {
 }
 void EditorApp::panelDrawParticles(EditorApp& a) {
     if (a.m_particlesPanel) a.m_particlesPanel->draw();
+}
+void EditorApp::panelDrawSaveSlots(EditorApp& a) {
+    if (a.m_saveSlotsPanel) a.m_saveSlotsPanel->draw();
 }
 // E26：画质档位。面板自己不持任何引擎引用（参数在 FeatureRegistry 里），
 // 于是它可以在没有设备的情况下被构造 —— 与 Physics/Particles 的差别仅此。
@@ -1414,6 +1429,9 @@ void EditorApp::onInit() {
     // E26：画质档位面板。构造无副作用（不碰设备），参数走 FeatureRegistry ——
     // 与启动器写进 `config/render.json` 的是同一份表（QualityPresets）。
     m_qualityPanel = std::make_unique<editor::QualitySettingsPanel>();
+    // 2026-10-31（G17-3 尾巴）：存档槽位面板。构造无副作用 —— 它一个字节
+    // 都不读盘，`listSaveSlots()` 只在 draw 时调（面板没打开就零 IO）。
+    m_saveSlotsPanel = std::make_unique<editor::SaveSlotsPanel>(*m_ctx);
     // 2026-10-30：运镜面板。构造无副作用（只绑 EditorContext）。
     m_cinePanel = std::make_unique<editor::CinematographyPanel>(*m_ctx);
     // 2026-10-24：材质仓库面板。构造无副作用 —— 仓库本身是**惰性加载**的
@@ -1619,6 +1637,10 @@ void EditorApp::onInit() {
             }
         }
     }
+    // H2：上次是不是没走到正常关闭（同目录留着一份 `.autosave.json`）。
+    // 只提示、不加载 —— 见 tickAutoSave 头顶的取舍说明。
+    detectStaleAutoSave();
+
     // ---- MYVK_EDITOR_IMPORT=相对路径：启动即导入一个模型 ----
     // 等价于"从 Content 面板把它拖进视口"。给自动化用：ImGui 的拖拽载荷
     // 没法从外部模拟，而"拖进来会建 SkinnedMeshComponent"正是角色链
@@ -1823,6 +1845,21 @@ void EditorApp::onInit() {
                         envClip);
         }
     }
+
+    // ---- MYVK_EDITOR_AUTOSAVE_SEC=秒：H2 自动保存的间隔 ----
+    // 默认 120 s。判据要能把它压到 1~2 s（否则一个用例得跑两分钟），
+    // 也要能设 0 把它整个关掉（像素 / 截图类用例不该在跑的途中往
+    // assets/scenes/ 里落文件）。
+    // ⚠ 位置有意排在 `applyPrefsFromDisk()`（第 1452 行）**之后**：偏好页的
+    //   `autosave.sec` 会读盘覆盖同一个成员，而环境变量必须在它之上 ——
+    //   否则自动化设的 1.5 s 会被某个用户存档里的 120 悄悄顶掉。
+    if (const char* envAs = std::getenv("MYVK_EDITOR_AUTOSAVE_SEC")) {
+        const double v = std::atof(envAs);
+        m_autoSaveSec = v > 0.0 ? static_cast<float>(v) : 0.0f;
+        VK_LOG_INFO("EDIT-AUTOSAVE config sec=%.1f (MYVK_EDITOR_AUTOSAVE_SEC)",
+                    static_cast<double>(m_autoSaveSec));
+    }
+    if (std::getenv("MYVK_EDITOR_AUTOSAVE_FORCE")) m_autoSaveForce = true;
 
     // MYVK_EDITOR_GIZMO=move|rotate|scale：启动就把手柄切到某个模式，
     // 这样三种粒度的界面（轴向 / 平面 / 整体）都能被截图覆盖到。
@@ -2187,6 +2224,19 @@ void EditorApp::onUpdate(float dt) {
         // 或者这是启动即 Play、计数器还是初值）→ 把详细日志预算灌满。
         if (m_collisionFrames == 0) m_collisionLogBudget = 240;
         m_scriptTableDropped = false;   // 下一段非运行态要重新丢一次
+        // ---- 实体 TRS 轨道（C5）：本段 Play 的第一帧对齐一次 ----
+        // `resetTime=true`：点 Play 是"从头试玩"，机关的播放头该回 0
+        // （读档语义的 `resetTime=false` 在 RuntimeApp 那边）。
+        // 同时会**采样一次**，进入的第一帧画面就对。
+        if (!m_clipPlaySynced) {
+            anim::syncTransformClipPlayState(m_ctx->activeScene(), true);
+            // B6：表情状态对齐。`reseed=true` —— 每次点 Play 都重抽眨眼
+            // 种子，否则"试玩三次，三次都在同一秒眨眼"会被当成系统时间
+            // 出问题。清相位同样必须有：不清的话上一段 Play 的闭眼相位
+            // 会带进新一段，看起来像"一开播就眨到一半停住"。
+            anim::syncExpressionPlayState(m_ctx->activeScene().world(), true);
+            m_clipPlaySynced = true;
+        }
         m_ctx->advancePlayTime(simDt);
         runRuntimeScripts(simDt);
         // 玩家在脚本之后 / 碰撞之前：脚本可能挪物体，玩家再动自己，
@@ -2200,6 +2250,16 @@ void EditorApp::onUpdate(float dt) {
         // 会被调用 N 次，且第一个实体设的值会被第二个覆盖）。
         m_animator.setStrideCurve(m_ctx->strideCurve());
         m_animator.tick(m_ctx->activeScene(), simDt);
+        // ---- 实体 TRS 轨道（C5）----
+        // 门 / 电梯 / 机关。与 RuntimeApp 同位置：**物理之前**（运动学体
+        // 要从 TransformComponent 读目标位置）。
+        anim::tickTransformClips(m_ctx->activeScene(), simDt);
+        // ---- 表情驱动（B6）----
+        // 与 RuntimeApp 同位置、同一条输入（`m_audio.voiceLevel()`）。
+        // ⚠ 编辑器里播放语音的是 `m_audio`（同一个实例），所以 Play 中
+        //   对话驱动口型与 Game.exe 走的是**同一份电平** —— 两边不一致的话，
+        //   "编辑器里看是对的、出包后嘴不动"这类问题会查很久。
+        anim::tickExpressions(m_ctx->activeScene().world(), simDt, m_audio.voiceLevel());
         // ---- 过场时间轴（C1）----
         // 排在动画之后：运镜与姿势是两条独立的时间线，先后无所谓；放在
         // 这里是因为它必须早于本帧的渲染，且要拿到**本帧最终**的物体位置
@@ -2259,6 +2319,8 @@ void EditorApp::onUpdate(float dt) {
         if (!m_ctx->usingRuntime()) {
             destroyPhysicsWorld();
             m_physicsFrames = 0;
+            // C5：真正 Stop 才允许下一段 Play 重新对齐轨道的播放头。
+            m_clipPlaySynced = false;
             // 停止后四态动画的游标一并丢掉：下一次 Play 从头起算
             // （留着的话"上次 Play 停在第 16 秒 idle"会带着走 —— 一按 Play
             //   就立刻重放一次 idle，看起来像"刚进游戏人自己抖了一下"）。
@@ -2311,6 +2373,136 @@ void EditorApp::onUpdate(float dt) {
                     static_cast<unsigned long long>(m_editorFrames),
                     static_cast<double>(dt), m_ctx->isPlaying() ? 1 : 0,
                     m_ctx->playMouseCaptured() ? 1 : 0, px, py, pz, animT);
+    }
+
+    // ---- 视口"以选中相机预览"（Cinematography ▸ Look through）----
+    // 位置是硬约束：**本帧最后一次**碰相机的地方。它前面是物理 / 碰撞 /
+    // 时间轴运镜（都会挪相机），后面是 onImGui 里的视口渲染。放早了会被
+    // 后面那几条覆盖掉，表现成"点了 Look through，机位闪一下又回去了"。
+    applyPreviewCamera();
+
+    // H2 自动保存：放在 onUpdate 末尾（所有会因为这一帧的编辑改动场景的
+    // 逻辑都跑完之后），否则存下来的永远是"上一次"的状态。
+    tickAutoSave(dt);
+}
+
+// ------------------------------------------------------- 视口"以选中相机预览"
+//
+// 每帧把 `EditorContext::previewCameraGuid()` 指的那台相机装到视口相机上。
+//
+// 为什么在 EditorApp 而不是 EditorContext：镜头的另一半（景深 / 快门）要写进
+// `render::CameraEffectSettings`，而那是渲染层的东西 —— EditorContext 与
+// render 之间没有依赖，也不该有。
+void EditorApp::applyPreviewCamera() {
+    const std::uint64_t guid = m_ctx->previewCameraGuid();
+    render::CameraEffectSettings& fx = renderer().cameraEffects();
+
+    // ---- 没有预览：把进入前那一份镜头效果还原（见 EditorApp.h 的说明）----
+    if (guid == 0) {
+        if (m_previewFx.valid) {
+            fx.dof = m_previewFx.dof;
+            fx.dofFocus = m_previewFx.dofFocus;
+            fx.dofAperture = m_previewFx.dofAperture;
+            fx.motionBlur = m_previewFx.motionBlur;
+            fx.motionBlurStrength = m_previewFx.motionBlurStrength;
+            fx.motionBlurShutterPosition = m_previewFx.shutterPosition;
+            m_previewFx.valid = false;
+            m_previewLensSig.clear();
+            VK_LOG_INFO("CINE-PREVIEW-LENS restored=1 dof=%d blur=%d",
+                        fx.dof ? 1 : 0, fx.motionBlur ? 1 : 0);
+        }
+        return;
+    }
+
+    scene::Scene& sc = m_ctx->activeScene();
+    ecs::World& w = sc.world();
+    const ecs::Entity e = w.find(guid);
+
+    // ---- 相机没了 → 自动退出 ----
+    // 三种来路：被删掉 / 被改成非相机 / 场景整个换了（打开新场景、退 Play）。
+    // ⚠ 必须自动退，而且**要打一条带原因的 WARN**：留着一个指不到的预览
+    //   状态，视口会永远钉在最后一帧的机位上，而自由相机输入又是关的 ——
+    //   用户的感受是"编辑器卡死了"，日志里却一条都没有。
+    if (!e.valid() || !w.get<ecs::CameraComponent>(e)) {
+        VK_LOG_WARN("CINE-PREVIEW-EXIT guid=%016llx reason=%s",
+                    static_cast<unsigned long long>(guid),
+                    e.valid() ? "no-camera-component" : "entity-gone");
+        m_ctx->clearPreviewCamera();
+        return;
+    }
+    scene::applyCameraEntityTo(sc, e, sc.camera());
+    const auto* cc = w.get<ecs::CameraComponent>(e);
+
+    // ---- 进入预览的第一帧：存一份原样 ----
+    if (!m_previewFx.valid) {
+        m_previewFx.valid = true;
+        m_previewFx.dof = fx.dof;
+        m_previewFx.dofFocus = fx.dofFocus;
+        m_previewFx.dofAperture = fx.dofAperture;
+        m_previewFx.motionBlur = fx.motionBlur;
+        m_previewFx.motionBlurStrength = fx.motionBlurStrength;
+        m_previewFx.shutterPosition = fx.motionBlurShutterPosition;
+    }
+
+    // ---- 景深 / 快门：与 `RuntimeApp::applyCameraLensEffects` 同一套换算 ----
+    // ⚠ 两处**会**漂移（runtime 不认识 editor，没法共用函数），所以两边改动
+    //   必须对照着改。共同的判据是两个换算本身只有一份
+    //   （`scene::fStopToDofAperture` / `scene::shutterToBlurStrength`）。
+    float focus = cc->focusDistance;
+    float aperture = 0.0f;
+    if (cc->dofEnabled) {
+        if (cc->focusGuid != 0) {
+            const ecs::Entity te = w.find(cc->focusGuid);
+            if (te.valid()) {
+                focus = glm::length(glm::vec3(sc.worldMatrix(te)[3]) -
+                                    sc.camera().position());
+            }
+        }
+        aperture = scene::fStopToDofAperture(
+            cc->fStop, cc->focal > 0.0f ? cc->focal : 50.0f);
+    }
+    fx.dof = cc->dofEnabled;
+    if (cc->dofEnabled) {
+        fx.dofFocus = focus;
+        fx.dofAperture = aperture;
+    }
+
+    float blur = 0.0f;
+    if (cc->shutterAngle > 0.0f) {
+        blur = scene::shutterToBlurStrength(cc->shutterAngle);
+        fx.motionBlur = true;
+        fx.motionBlurStrength = blur;
+        fx.motionBlurShutterPosition = cc->shutterPosition;
+    } else {
+        fx.motionBlur = false;
+    }
+
+    // ---- 锚点（只在变化时打）----
+    // 自动化要断言的两件事都在这一行里：机位**真的**来自这台相机
+    // （pos/yaw/pitch 与实体世界变换一致），以及镜头参数真的接上了
+    // （dof/fstop/focus/shutter）。
+    char sig[320];
+    // i18n-keep
+    std::snprintf(sig, sizeof(sig),
+                  "guid=%016llx name=%s pos=(%.3f,%.3f,%.3f) yaw=%.4f "
+                  "pitch=%.4f fov=%.2f dof=%d fstop=%.1f focus=%.2f ap=%.3f "
+                  "sh=%.0f blur=%.2f pos2=%.2f",
+                  static_cast<unsigned long long>(guid),
+                  w.name(e) ? w.name(e)->c_str() : "<unnamed>",
+                  static_cast<double>(sc.camera().position().x),
+                  static_cast<double>(sc.camera().position().y),
+                  static_cast<double>(sc.camera().position().z),
+                  static_cast<double>(sc.camera().yaw()),
+                  static_cast<double>(sc.camera().pitch()),
+                  static_cast<double>(sc.camera().fov()),
+                  cc->dofEnabled ? 1 : 0, static_cast<double>(cc->fStop),
+                  static_cast<double>(focus), static_cast<double>(aperture),
+                  static_cast<double>(cc->shutterAngle),
+                  static_cast<double>(blur),
+                  static_cast<double>(fx.motionBlurShutterPosition));
+    if (m_previewLensSig != sig) {
+        m_previewLensSig = sig;
+        VK_LOG_INFO("CINE-PREVIEW-LENS %s", sig);
     }
 }
 
@@ -2489,10 +2681,29 @@ void EditorApp::toggleWindowFullscreen() {
     m_appliedWindowFullscreen = true;
 }
 
+// ⚠ `scenePath` 有两种写法并存：`scenes/a.json`（Content 面板双击出来的，
+//   相对资产根）与 `assets/scenes/a.json`（自动化夹具习惯这么写）。**读**
+//   的时侯两种都能 `resolveAssetPath` 到同一个文件（前者命中候选①，后者
+//   命中候选③），所以一直没人注意它们的区别 —— 但**写**一个还不存在的
+//   文件就露馅了：`resolveAssetPath` 找不到时会返回候选链**第一项**，
+//   也就是 `<exeDir>/assets/` + 传入串，于是 `assets/scenes/x` 变成
+//   `assets/assets/scenes/x`，目录不存在 → 保存静默失败，而画面一切正常
+//   （2026-10-31 自动保存真踩过；Ctrl+S 存"新文档"是同一条路）。
+//   所以凡是要**写**的场景路径，先过这一道剥前缀。
+static std::string assetRelative(const std::string& p) {
+    static const std::string kPrefix = "assets/";
+    if (p.size() > kPrefix.size() &&
+        p.compare(0, kPrefix.size(), kPrefix) == 0) {
+        return p.substr(kPrefix.size());
+    }
+    return p;
+}
+
 // 场景落盘。抽成函数是因为它现在有**两个**入口：Ctrl+S 和 Content 工具栏
 // 的 "Save All"。两处各写一遍必然漂移（改了一处忘了另一处）。
 void EditorApp::saveSceneNow() {
-    const std::string abs = assets::resolveAssetPath(m_ctx->scenePath());
+    const std::string abs =
+        assets::resolveAssetPath(assetRelative(m_ctx->scenePath()));
     const scene::SceneIoResult r = scene::saveScene(m_ctx->editorScene(), abs);
     if (r.ok) {
         m_ctx->dirty() = false;
@@ -2504,6 +2715,93 @@ void EditorApp::saveSceneNow() {
         VK_LOG_WARN("Scene save failed for '%s': %s", abs.c_str(),
                     r.error.c_str());
     }
+}
+
+// ---------------------------------------------------------------- H2 自动保存
+//
+// 「崩溃 / 断电自动保存」先说清它**不是**什么，因为它和 Ctrl+S 只差一个
+// 文件名，误解的代价却是一份好档：
+//
+//   · **不覆盖用户的场景文件**。写的是 `<场景名>.autosave.json`，与正式档
+//     同目录。自动保存一旦直接写正式文件，一次误操作（误删一批实体之后
+//     恰好等满 120 秒）就把好档顶掉了 —— 自动保存的收益是"少丢活"，不该
+//     顺带把"手滑"升级成"不可恢复"。
+//   · **不自动恢复**。启动时只打一行 WARN 指出它存在（`detectStaleAutoSave`），
+//     由人决定要不要开。自动加载会在用户"故意不存"（试验性改动）时反复
+//     把旧内容弹回来，比丢活更难用。
+//   · **不清 dirty**。它不是"存过盘了"，只是"另存了一份"。清掉 dirty 会让
+//     窗口标题的未保存标记消失，作者以为存过。
+//
+// 时机：编辑态累加 `m_autoSaveSec` 秒（默认 120）。Play 期间不累加 ——
+// 运行态改的是副本，编辑场景一个字节都没动，存了也是白存。
+// 判脏：默认只有 `dirty()` 为真才写。`MYVK_EDITOR_AUTOSAVE_FORCE=1` 无视它：
+// 无人值守的回归没法"真的去改一下场景"，不强制的话写入分支永远走不到 ——
+// "接错了"就测不出来（与 `MYVK_DLG_VOICE_FAKE` 同一条思路的假钩子）。
+// ⚠ `scenePath` 有两种写法并存：`scenes/a.json`（Content 面板双击出来的，
+//   相对资产根）与 `assets/scenes/a.json`（自动化夹具习惯这么写）。**读**
+//   的时侯两种都能 `resolveAssetPath` 到同一个文件（前者命中候选①，后者
+//   命中候选③），所以一直没人注意它们的区别 —— 但**写**一个还不存在的
+//   文件就露馅了：`resolveAssetPath` 找不到时会返回候选链**第一项**，
+//   也就是 `<exeDir>/assets/` + 传入串，于是 `assets/scenes/x` 变成
+//   `assets/assets/scenes/x`，目录不存在 → 每一轮自动保存都 `ok=0`，
+//   而画面一切正常（2026-10-31 真踩过）。先统一剥掉 `assets/` 前缀。
+static std::string autosavePathFor(const std::string& sceneRel) {
+    if (sceneRel.empty()) return {};
+    std::string p = assetRelative(sceneRel);
+    static const std::string kExt = ".json";
+    if (p.size() > kExt.size() &&
+        p.compare(p.size() - kExt.size(), kExt.size(), kExt) == 0) {
+        p.erase(p.size() - kExt.size());
+    }
+    return p + ".autosave.json";
+}
+
+void EditorApp::tickAutoSave(float dt) {
+    if (m_autoSaveSec <= 0.0f) return;
+    // 非编辑态：计时归零。Play 里待了 5 分钟再回编辑态，不该立刻存一次。
+    if (!m_ctx->isEditing()) {
+        m_autoSaveAccum = 0.0f;
+        return;
+    }
+    if (!m_ctx->dirty() && !m_autoSaveForce) {
+        m_autoSaveAccum = 0.0f;
+        return;
+    }
+    m_autoSaveAccum += dt;
+    if (m_autoSaveAccum < m_autoSaveSec) return;
+    m_autoSaveAccum = 0.0f;
+
+    const std::string rel = autosavePathFor(m_ctx->scenePath());
+    // 空文档（还没 Save As 过）没有"同目录"可言 —— 唯一的落点会是
+    // assets/scenes/ 根上的一个孤儿文件，不写。
+    if (rel.empty()) {
+        VK_LOG_WARN("EDIT-AUTOSAVE skip=no-scene");
+        return;
+    }
+    const std::string abs = assets::resolveAssetPath(rel);
+    const scene::SceneIoResult r = scene::saveScene(m_ctx->editorScene(), abs);
+    if (r.ok) {
+        // `ok` 两种值都要能看见：失败只打 WARN 的话，"自动保存其实一直在
+        // 静默失败"与"一直没到时间"在日志上长得一模一样。
+        VK_LOG_INFO("EDIT-AUTOSAVE path=%s ok=1 sec=%.1f entities=%zu",
+                    rel.c_str(), static_cast<double>(m_autoSaveSec),
+                    m_ctx->editorScene().objectCount());
+    } else {
+        VK_LOG_WARN("EDIT-AUTOSAVE path=%s ok=0 sec=%.1f err=%s", rel.c_str(),
+                    static_cast<double>(m_autoSaveSec), r.error.c_str());
+    }
+}
+
+void EditorApp::detectStaleAutoSave() {
+    const std::string rel = autosavePathFor(m_ctx->scenePath());
+    if (rel.empty()) return;
+    const std::string abs = assets::resolveAssetPath(rel);
+    std::error_code ec;
+    if (!std::filesystem::exists(abs, ec) || ec) return;
+    const auto sz = std::filesystem::file_size(abs, ec);
+    VK_LOG_WARN("EDIT-AUTOSAVE-STALE path=%s size=%llu", rel.c_str(),
+                ec ? 0ULL : static_cast<unsigned long long>(sz));
+    m_ctx->notify(TR("Recoverable autosave found: ") + rel);
 }
 
 // ---------------------------------------------------------------- 脚本执行
@@ -7449,6 +7747,113 @@ void EditorApp::registerConsoleCommands() {
             return out;
         });
 
+    // ---- 表情驱动（B6，2026-11-01）----
+    //
+    // 与 Inspector 上那些控件**同一条路**（都走 `anim::setExpressionPreset`
+    // / 直接改组件字段），所以命令跑通 = 面板控件跑通。
+    //
+    // 为什么这几条命令必须有："表情生效了"在截图上根本不可见 —— 一张
+    // 脸到底是在笑还是在等，隔着像素差看不出"嘴角抬了 0.02"。自动化
+    // 只能靠 `EXPR-SET` / `EXPR-STATE` / `EXPR-BLINK` 这些数值锚点。
+    con->addCommand("expr.setpreset",
+        "expr.setpreset <preset|none> [name]  switch the expression preset",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: expr.setpreset <preset|none> [name]";
+            ecs::Entity e = (args.size() > 2)
+                                ? m_ctx->activeScene().find(args[2])
+                                : m_ctx->selection();
+            if (!e.valid()) {
+                VK_LOG_WARN("EXPR-SET ok=0 reason=no-entity");
+                return "no entity";
+            }
+            const std::string name = (args[1] == "none") ? "" : args[1];
+            std::string err;
+            if (!anim::setExpressionPreset(m_ctx->activeScene().world(), e,
+                                           name, &err)) {
+                VK_LOG_WARN("EXPR-SET ok=0 name=%s err=%s",
+                            name.empty() ? "none" : name.c_str(), err.c_str());
+                return err;
+            }
+            m_ctx->dirty() = true;
+            return name.empty() ? "none" : name;
+        });
+    con->addCommand("expr.list",
+        "expr.list [name]  print the presets available on a character",
+        [this](const std::vector<std::string>& args) -> std::string {
+            ecs::Entity e = (args.size() > 1)
+                                ? m_ctx->activeScene().find(args[1])
+                                : m_ctx->selection();
+            if (!e.valid()) return "no entity";
+            auto* xc = m_ctx->activeScene().world().get<ecs::ExpressionComponent>(e);
+            if (!xc) return "no ExpressionComponent";
+            if (!xc->setLoaded && !xc->presetPath.empty()) {
+                xc->setLoaded = true;
+                anim::loadExpressionSet(xc->presetPath, xc->set);
+            }
+            std::string out;
+            if (!xc->set.valid) {
+                VK_LOG_INFO("EXPR-LIST entity=%u ok=0 err=%s",
+                            static_cast<unsigned>(e.id), xc->set.error.c_str());
+                return xc->set.error.empty() ? "no preset asset" : xc->set.error;
+            }
+            for (const auto& pr : xc->set.presets) {
+                if (!out.empty()) out += " ";
+                out += pr.name;
+            }
+            VK_LOG_INFO("EXPR-LIST entity=%u n=%zu %s",
+                        static_cast<unsigned>(e.id), xc->set.presets.size(),
+                        out.c_str());
+            return out;
+        });
+    con->addCommand("expr.blink",
+        "expr.blink [name]  force one blink right now",
+        [this](const std::vector<std::string>& args) -> std::string {
+            ecs::Entity e = (args.size() > 1)
+                                ? m_ctx->activeScene().find(args[1])
+                                : m_ctx->selection();
+            if (!e.valid()) return "no entity";
+            auto* xc = m_ctx->activeScene().world().get<ecs::ExpressionComponent>(e);
+            if (!xc) return "no ExpressionComponent";
+            xc->blinkRequest = true;
+            VK_LOG_INFO("EXPR-BLINK-REQ entity=%u enabled=%d",
+                        static_cast<unsigned>(e.id), xc->blinkEnabled ? 1 : 0);
+            return "requested";
+        });
+    con->addCommand("expr.state",
+        "expr.state [name]  print the live expression state of a character",
+        [this](const std::vector<std::string>& args) -> std::string {
+            ecs::Entity e = (args.size() > 1)
+                                ? m_ctx->activeScene().find(args[1])
+                                : m_ctx->selection();
+            if (!e.valid()) return "no entity";
+            auto* xc = m_ctx->activeScene().world().get<ecs::ExpressionComponent>(e);
+            if (!xc) {
+                VK_LOG_INFO("EXPR-STATE entity=%u ok=0 reason=no-component",
+                            static_cast<unsigned>(e.id));
+                return "no ExpressionComponent";
+            }
+            std::string owned;
+            for (const std::string& s : xc->ownedChannels) {
+                if (!owned.empty()) owned += ",";
+                owned += s;
+            }
+            VK_LOG_INFO("EXPR-STATE entity=%u preset=%s intensity=%.2f "
+                        "blink=%d phase=%.3f timer=%.3f count=%d lip=%d "
+                        "level=%.3f owned=%d [%s]",
+                        static_cast<unsigned>(e.id),
+                        xc->presetName.empty() ? "-" : xc->presetName.c_str(),
+                        static_cast<double>(xc->intensity),
+                        xc->blinkEnabled ? 1 : 0,
+                        static_cast<double>(xc->blinkPhase),
+                        static_cast<double>(xc->blinkTimer), xc->blinkCount,
+                        xc->lipSyncEnabled ? 1 : 0,
+                        static_cast<double>(xc->level),
+                        static_cast<int>(xc->ownedChannels.size()),
+                        owned.c_str());
+            return "preset=" + (xc->presetName.empty() ? std::string("none")
+                                                       : xc->presetName);
+        });
+
     // ---- 两骨 IK / 骨骼挂点（第八刀，2026-10-25）----
     //
     // 为什么这两个功能**必须**有控制台入口："IK 生效了"在截图上不可见
@@ -8611,8 +9016,11 @@ void EditorApp::drawSettingsPanel() {
         // ---- G06：游戏动作键位重绑定 ----
         drawKeyBindingsPage(*m_ctx, window().handle());
     } else if (page == 5) {
-        // ---- Scene（信息页）----
-        ImGui::SeparatorText(TR("Scene"));
+        // ---- Scene（表里的设置项 + 信息）----
+        // 设置项（H2 的自动保存间隔）与"信息"同页：两者都回答"这个文档现在
+        // 怎么样"。`drawCategory` 自己会画 `Scene` 这个标题，所以下面那段
+        // 信息不再重复一个 SeparatorText。
+        drawCategory("Scene");
         ImGui::Text(TR("Path: %s%s"), m_ctx->scenePath().c_str(),
                     m_ctx->dirty() ? TR("  (unsaved changes)") : "");
         if (m_ctx->dirty())
@@ -8816,6 +9224,15 @@ const std::vector<EditorApp::PrefItem>& EditorApp::prefsTable() {
          [](EditorApp& a) -> void* {
              return &a.m_ctx->statsHudRef().gizmo;
          }},
+        // ---- Scene（H2 自动保存，2026-10-31）----
+        // 为什么它必须进这张表（而不是只留环境变量）："界面点不到 = 没交付"。
+        // 进了表就同时拿到三样东西 —— 偏好页上的滑条、`Reset All` 的出厂值
+        // （120 s）、以及**落盘**（`EditorLayoutIO::applyPrefs` 按本表的 id
+        // 逐项查 JSON，所以不需要在别处再写一遍读写）。
+        // 0 = 关：这是"我就是要它别动我的文件"的合法选择，不是非法值。
+        {"autosave.sec", "Autosave interval (s, 0 = off)", "Scene", false,
+         120.0f, 0.0f, 600.0f,
+         [](EditorApp& a) -> void* { return &a.m_autoSaveSec; }},
     };
     return kTable;
 }

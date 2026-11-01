@@ -4,6 +4,8 @@
 #include "assets/ModelOrientation.h"
 #include "assets/AssetPath.h"
 #include "assets/Model.h"
+#include "animation/TransformClip.h"   // C5：实体 TRS 轨道的运行时消费者
+#include "animation/ExpressionDriver.h" // B6：表情预设 + 眨眼/口型驱动
 #include "core/Build.h"
 #include "core/Input.h"
 #include "core/Logger.h"
@@ -15,6 +17,7 @@
 #include "scene/CameraSystem.h"
 #include "scene/ModelInstance.h"
 #include "scene/Scene.h"
+#include "scene/SaveSlot.h"
 #include "scene/SceneSerializer.h"
 #include "script/ScriptEngine.h"
 #include "script/ScriptRuntime.h"
@@ -443,6 +446,27 @@ ecs::Entity spawnPlayerFromGameStart(scene::Scene& scene,
     }
 
     const ecs::Entity e = scene.createObject("Player");
+
+    // ---- 玩家实体的 guid 是**固定值**（G17-3）----
+    // ⚠⚠ 为什么不能随机：玩家是**运行时生成**的（出生点只标位置、不落盘），
+    //   随机 guid 会带来两个后果，而且都很隐蔽：
+    //   ① `sceneHash` 是 guid 集合的结构指纹 —— 玩家 guid 每次都不同，于是
+    //      **同一个关卡**的存档永远被判成"不是同一个关卡"（`SAVE-SCENE-DRIFT`
+    //      刷屏，严重时 drist 阈值一过直接拒读）；
+    //   ② 存档里那条玩家记录读档时找不到人 → **读档后角色回到出生点**，
+    //      而其它东西都在原位。看起来像"只有角色没恢复"，没人会想到是 guid。
+    //   固定之后两者都成立：hash 稳定、玩家位置能被恢复。
+    // ⚠ 值刻意写成可读的 ASCII（"PLAYER" + 01），且末位非零 —— 与场景里
+    //   随机分发的 guid 撞上的概率可以忽略，真撞了会打 WARN（见下）。
+    // ⚠ 只在**运行时**固定。编辑器的 `createPlayer` 不碰 guid：编辑器不存档，
+    //   而改它会让编辑器场景文件的 diff 里多出一行莫名其妙的 guid。
+    {
+        constexpr ecs::EntityGuid kPlayerGuid = 0x504C415945520001ull;
+        if (!w.setGuid(e, kPlayerGuid)) {
+            VK_LOG_WARN("GAME-PLAYER guid-clash want=%s (storage keeps a random one)",
+                        ecs::guidToHex(kPlayerGuid).c_str());
+        }
+    }
     if (!e.valid()) return {};
     if (auto* tf = w.get<ecs::TransformComponent>(e)) {
         tf->position = feet;
@@ -553,6 +577,12 @@ RuntimeApp::RuntimeApp(const RuntimeConfig& cfg)
         const double v = std::atof(a);
         if (v > 0.0) m_dlgAutoSec = static_cast<float>(v);
     }
+    // 语音钩子的假实现（D1 验收用）。`MYVK_DLG_VOICE_FAKE=<秒>`：每句语音
+    // "播" `<秒>` 这么久，期间 `playing()` 恒为真。见 RuntimeApp.h 的说明。
+    if (const char* v = std::getenv("MYVK_DLG_VOICE_FAKE")) {
+        const double s = std::atof(v);
+        if (s > 0.0) m_dlgVoiceFakeSec = static_cast<float>(s);
+    }
 }
 
 RuntimeApp::~RuntimeApp() = default;
@@ -642,7 +672,39 @@ void RuntimeApp::onInit() {
     m_stateStack.push(makeBuiltinState(StateId::Boot), m_svc);
     m_stateStack.replace(makeBuiltinState(StateId::Loading), m_svc);
 
+    // ---- `--load` 且没给 `--scene`：先进存档里记的那一关 ----
+    // "继续游戏"本来就该连关卡一起带回来；先加载默认关再切成存档的关，
+    // 会多一次完整加载 + 一次物理重建，而且第一帧会闪一个错误的画面。
+    // ⚠ 只在**没显式给 `--scene`** 时这么做：显式给了场景就以它为准
+    //   （"把这份档放进这个关里看看"是个合理诉求）。
+    // ⚠ 判据是 `sceneFromCli` 而不是 `scenePath.empty()`：`game.json` 里
+    //   通常写着默认关卡，用 empty() 判的话永远走不到这一支 —— 于是
+    //   `--load` 会进默认关卡，然后被存档的结构指纹拒读（看着像"读档坏了"）。
+    // ⚠ 这里**允许**读失败什么都不做：真正的报错由下面的 `quickLoad` 打
+    //   （只打一次，不重复刷屏）。
+    if (m_cfg.loadOnStart && !m_cfg.sceneFromCli) {
+        scene::SaveGame peek;
+        const std::string p = scene::saveSlotPath(m_cfg.saveDir, m_cfg.saveSlot);
+        const scene::SaveIoResult pr = scene::readSaveGame(p, peek);
+        if (pr.ok && !peek.scenePath.empty()) {
+            m_cfg.scenePath = peek.scenePath;
+            VK_LOG_INFO("SAVE-LOAD-SCENE slot=%s scene=%s (from save)",
+                        m_cfg.saveSlot.c_str(), peek.scenePath.c_str());
+        }
+    }
+
     loadStartScene();
+    // ⚠ 必须在 `buildPhysics()` **之前**：物理体是按 TransformComponent 的
+    //   当前位置建的。排在后面的话，电梯的物理体会建在轨道第 0 帧之外的地方
+    //   （= 场景里手摆的那个位置），之后每帧被 `syncKinematicFromScene` 拽着走
+    //   一段冤枉路 —— 第一帧就能看见它"跳一下"。
+    // `resetTime=false`：开 Game.exe 打开场景 = 读档语义，播放头该接上存盘的
+    // 那个时刻（`playing` 由序列化里的 `autoplay` 决定，这里再对齐一次）。
+    anim::syncTransformClipPlayState(activeScene(), false);
+    // B6：表情状态对齐。`reseed=false` —— 读档/开局**不改**"接下来什么时候
+    // 眨眼"的种子，观感连续；清掉相位与包络则必须做（否则上一段的闭眼
+    // 相位会带进来，看起来像"一进游戏就眨到一半停住"）。
+    anim::syncExpressionPlayState(activeScene().world(), false);
     buildPhysics();
     preloadScripts();
 
@@ -670,6 +732,16 @@ void RuntimeApp::onInit() {
     }
     scene::activeCameraSystem().setTrace(m_cfg.traceStates);
 
+    // ---- 存档（G17-3）：基线 + 启动读档 ----
+    //
+    // ⚠⚠ 位置是硬约束：**物理 / 脚本 / 玩家都建好之后**。
+    //   · 基线要在玩家实体存在之后抓 —— 否则玩家每次都是"运行时新增"，
+    //     每份档都会把玩家整条重写一遍（增量白做，档越存越大）；
+    //   · 读档也要在这之后：存档里 `globals.playerGuid` 指向的是玩家实体，
+    //     先读档再生成玩家的话，读到手的是一个当时还不存在的 guid。
+    captureSaveBaseline("level-load");
+    if (m_cfg.loadOnStart) quickLoad("startup");
+
     // ---- 音频（G14-5）----
     //
     // ⚠ 位置有讲究：必须在 `loadStartScene()` 之后（要读场景里的
@@ -677,6 +749,45 @@ void RuntimeApp::onInit() {
     //   设备打开是同步的，所以第一帧就有正确的格式供 Mixer init。
     //   设备打不开**不是错误**：`init` 内部进 Failed，所有 API 变空操作。
     m_audio.init(m_cfg.audio);
+
+    // ---- 语音钩子（D1）----
+    //
+    // 为什么方向是"宿主把两个 lambda 塞给对话系统"，而不是对话系统持有
+    // `AudioSystem*`：与 `SequencerSystem` 不持有 `CameraSystem*` 同一条纪律
+    // —— 引擎的表现层只产出意图，接不接由宿主决定（editor 与 runtime 的音频
+    // 实例本来就不是同一个）。
+    //
+    // ⚠ 必须装在这里（`m_audio.init` 之后、任何 `start()` 之前）：对话第一句
+    //   是在 `simulate()` 里 `dlg.tick()` 起播的，那时钩子已经要在位。
+    // ⚠ `playVoice` 在无声卡 / 素材缺时返回 false → 对话侧**不设门**，行为与
+    //   加语音之前逐位相同。这条是"CI 无声卡也能跑"的全部依仗。
+    {
+        dialogue::DialogueSystem& dlg = dialogue::activeDialogueSystem();
+        if (m_dlgVoiceFakeSec > 0.0f) {
+            // 验收专用：不管有没有声卡都"播得响"。只替换这两个问题
+            // （播没播 / 播完没），推进逻辑仍是玩家那条路。
+            VK_LOG_INFO("DLG-VOICE-FAKE sec=%.2f",
+                        static_cast<double>(m_dlgVoiceFakeSec));
+            dlg.setVoiceHooks(
+                {[this](const std::string& p) {
+                     m_dlgVoiceFakeStart = std::chrono::steady_clock::now();
+                     VK_LOG_INFO("AUDIO-VOICE fake serial=0 path=%s",
+                                 p.c_str());
+                     return true;
+                 },
+                 [this] {
+                     const double s = std::chrono::duration<double>(
+                                          std::chrono::steady_clock::now() -
+                                          m_dlgVoiceFakeStart)
+                                          .count();
+                     return s < static_cast<double>(m_dlgVoiceFakeSec);
+                 }});
+        } else {
+            dlg.setVoiceHooks(
+                {[this](const std::string& p) { return m_audio.playVoice(p); },
+                 [this] { return m_audio.voicePlaying(); }});
+        }
+    }
 
     // ---- 服务面接线 ----
     m_svc.simulate = [this](float dt) { simulate(dt); };
@@ -940,6 +1051,87 @@ void RuntimeApp::loadStartScene() {
     }
 }
 
+// ---------------------------------------------------------------- UI 文档
+
+// `openUI(path)`（C6 第七件）：切"显示哪一份 `.ui.json`"。
+//
+// ⚠⚠ 失败时**保住当前那块**。写成"先 `m_uiDoc = {}` 再尝试加载"的话，
+//   路径拼错的表现是"屏幕忽然空了 + 一条 ERROR"，作者会以为界面被关掉了；
+//   而他要的是"界面没变，报错告诉我是哪写错了"。
+// ⚠ **空串 = 关掉**，这是正常用法不是失败：剧情演完要收面板。
+bool RuntimeApp::openUiDocument(const std::string& path) {
+    if (path.empty()) {
+        const bool had = m_uiDoc.valid;
+        m_uiDoc = ui2::UiDocument{};
+        m_uiDocFrames = 0;
+        VK_LOG_INFO("UIDOC-OPEN path='' (closed) had=%d src=script",
+                    had ? 1 : 0);
+        return true;
+    }
+    ui2::UiDocument doc;
+    if (!ui2::loadUiDocument(path, doc)) {
+        VK_LOG_WARN("UIDOC-OPEN path=%s ok=0 err=%s (keeping the current one)",
+                    path.c_str(), doc.error.c_str());
+        return false;
+    }
+    m_uiDoc = std::move(doc);
+    // 锚点节流重新从"第 1 帧"开始：换了一份文档，`UIDOC-BOUNDS` 的那些 id
+    // 全变了 —— 不重置的话验收脚本要等最多 60 帧才看得到新文档的锚点。
+    m_uiDocFrames = 0;
+    VK_LOG_INFO("UIDOC-OPEN path=%s ok=1 widgets=%d name=%s ref=%dx%d src=script",
+                path.c_str(), ui2::countWidgets(m_uiDoc.widgets),
+                m_uiDoc.name.c_str(), m_uiDoc.refW, m_uiDoc.refH);
+    for (const auto& w : m_uiDoc.warnings) VK_LOG_WARN("UIDOC-WARN %s", w.c_str());
+    return true;
+}
+
+// ---------------------------------------------------------------- 存档（G17-3）
+void RuntimeApp::captureSaveBaseline(const char* reason) {
+    m_saveState.captureBaseline(activeScene());
+    // 锚点固定成一行：验收脚本用它判"基线真的抓在关卡加载之后"。
+    // ⚠ `entities=0` 是**合法**的（空世界 / 纯菜单场景），别把它当失败。
+    VK_LOG_INFO("SAVE-BASELINE entities=%zu reason=%s", m_saveState.size(),
+                reason ? reason : "?");
+}
+
+bool RuntimeApp::quickSave(const char* why) {
+    // 玩家 guid：玩家是运行时生成的，只有这里知道它是谁。
+    ecs::EntityGuid pg = ecs::kInvalidGuid;
+    if (m_player) pg = activeScene().world().guid(m_player->entity());
+    const scene::SaveToSlotResult r =
+        scene::saveToSlot(activeScene(), m_saveState, m_cfg.saveDir,
+                          m_cfg.saveSlot, m_cfg.scenePath,
+                          static_cast<double>(time().elapsed()), pg);
+    VK_LOG_INFO("SAVE-SLOT-ACTION op=save slot=%s ok=%d why=%s",
+                scene::normalizeSaveSlot(m_cfg.saveSlot).c_str(), r.ok ? 1 : 0,
+                why ? why : "?");
+    return r.ok;
+}
+
+bool RuntimeApp::quickLoad(const char* why) {
+    const scene::LoadFromSlotResult r =
+        scene::loadFromSlot(activeScene(), m_saveState, assets(),
+                            m_cfg.saveDir, m_cfg.saveSlot);
+    // 存档里的玩家 guid 与当前玩家对不上 → 这一局的角色不是存档里的那个。
+    // ⚠ 不是错误（玩家都是运行时生成的，换一关、换一次出生点就会变），
+    //   但必须留一行：否则"读档后角色站在出生点"会被当成存档 bug 查半天。
+    if (r.ok && r.save.globals.playerGuid != ecs::kInvalidGuid && m_player) {
+        const ecs::EntityGuid now = activeScene().world().guid(m_player->entity());
+        if (now != r.save.globals.playerGuid) {
+            VK_LOG_INFO("SAVE-PLAYER-DIFF want=%s got=%s (transform kept as-is)",
+                        ecs::guidToHex(r.save.globals.playerGuid).c_str(),
+                        ecs::guidToHex(now).c_str());
+        }
+    }
+    VK_LOG_INFO("SAVE-SLOT-ACTION op=load slot=%s ok=%d why=%s",
+                scene::normalizeSaveSlot(m_cfg.saveSlot).c_str(), r.ok ? 1 : 0,
+                why ? why : "?");
+    // ⚠ 读档之后**不再抓基线**：`applySaveGame` 已经把这份档里提到的 guid
+    //   重算成"刚读完的样子"，其余没提到的本来就与基线一致。这里再全量抓一遍
+    //   的话，"读档 → 再存档" 会变成全量（增量白做）。
+    return r.ok;
+}
+
 // ---------------------------------------------------------------- 世界控制
 // （C6 第二批：`spawn` / `loadScene` / 剧情旗标）
 
@@ -1045,6 +1237,12 @@ void RuntimeApp::applyPendingSceneSwitch() {
                 resolved.c_str(), r.entities, r.skipped, m_binding.bodies,
                 m_scripts ? m_scripts->scriptCount() : 0, attached ? 1 : 0,
                 m_sceneSwitches);
+
+    // ⚠⚠ 换了关卡 = 换了一套实体，**基线必须重抓**。不重抓的话，上一关的
+    //   基线会留下来：新关卡里 guid 撞上的实体被当成"没变"跳过（存档缺实体），
+    //   guid 撞不上的全被判"已销毁"（读档后新关卡的东西被删光）——
+    //   而日志里只有一条成功的 `SAVE-WRITE`，看不出任何异常。
+    captureSaveBaseline("scene-switch");
 }
 
 ecs::Entity RuntimeApp::spawnModelEntity(const std::string& relPath,
@@ -1192,6 +1390,17 @@ void RuntimeApp::onUpdate(float dt) {
     // 输入采样每帧一次（在固定步之前）。鼠标位移在这里被消费 ——
     // 之后任何地方再读 Input::mouseDelta 都会拿到 0。
     m_input.poll();
+
+    // ---- 快捷存 / 读档（G17-3）----
+    // ⚠ F5 / F9**不进 InputMap**：它们是"开发/调试期的手边功能"，重绑没有
+    //   意义（没人会把快速存档绑到 W 上），却会在"绑定"界面里多出两行永远
+    //   用不到的条目。与对话选项的方向键同一条判断。
+    // ⚠ 只在 `focused` 时响应：切出去在别的窗口里按 F5，回来发现档被覆盖了
+    //   是很糟的体验（`Input::keyPressed` 不看焦点）。
+    if (focused) {
+        if (core::Input::keyPressed(GLFW_KEY_F5)) quickSave("hotkey");
+        if (core::Input::keyPressed(GLFW_KEY_F9)) quickLoad("hotkey");
+    }
 
     LoopCallbacks cb;
     // ① 事件泵：Application::run 里已经 pollEvents 过，这里不重复。
@@ -1452,6 +1661,14 @@ void RuntimeApp::tickUi(float dt) {
                 if (m_dlgFocus < 0 || m_dlgFocus >= n) m_dlgFocus = 0;
             }
             if (m_input.wasPressed("Jump")) {
+                // ⚠ 这一条是**唯一**能区分"按键没送到"和"送到了但状态不对"的
+                //   锚点。`DLG-PRESS *` 只在 `pressAdvance` 真被调时才打，而
+                //   "`wasPressed` 恒为 false"（合成按键的两对 down/up 落在同一
+                //   轮 `glfwPollEvents` 里 → 帧边界上净变化为 0）与"对话没在
+                //   播"从日志上看长得一模一样：都是**一条都不打**。
+                VK_LOG_INFO("DLG-KEY id=%s atChoice=%d focus=%d",
+                            p->currentId().c_str(), atChoice ? 1 : 0,
+                            m_dlgFocus);
                 if (atChoice)
                     dlg.choose(activeScene(), m_dlgFocus);
                 else
@@ -1554,22 +1771,34 @@ void RuntimeApp::syncDirectorCamera() {
     cs.setDirectorCamera(want);
 
     if (changed) {
-        // 混合时长是**这一次 marker** 的属性，不是相机的属性 —— 每次切换
-        // 都重新取。0 = 硬切（不调用 blendCut，姿态直接跳过去）。
+        // 混合时长**和形状**都是**这一次 marker** 的属性，不是相机的属性 ——
+        // 每次切换都重新取。0 = 硬切（不调用 blendCut，姿态直接跳过去）。
         const float b = seq.shotBlendSeconds();
-        if (b > 0.0f) cs.blendCut(b);
+        const scene::BlendCurve cv = seq.shotBlendCurve();
+        if (b > 0.0f) cs.blendCut(b, cv);
 
         // 日志去重：只在"机位真的变了"打一条。`SEQ-SHOT` 已经打过一次
         // （时间轴视角），这一条是**运行时视角**，用来证明那条结论真的
         // 落到了相机上 —— 两条都要能单独数（用例分别断言）。
+        //
+        // ⚠⚠ 曲线名必须从 **`cs`** 取（`beganCurve()`），不能打上面那个 `cv`。
+        //   打 `cv` 的话，即使 `blendCut` 根本没收到曲线参数，这里照样
+        //   打出正确的名字 —— 用例全绿、画面永远是 smooth。这是"日志和
+        //   执行不是同一个来源"的典型后果，2026-10-31 的否定测试实测到过
+        //   （把 `blendCut(b, cv)` 改回 `blendCut(b)`，57 项照样 PASS）。
+        const scene::BlendCurve used = cs.beganCurve();
+        // 硬切（b == 0）时根本不调 `blendCut`，`beganCurve()` 还留着上一段的
+        // 值 —— 打出来就是谎话（"硬切，曲线 easein"）。这里显式打成 `-`。
+        const char* usedName = (b > 0.0f) ? scene::blendCurveName(used) : "-";
         const std::string sig = std::to_string(seq.shotIndex()) + "|" +
                                 std::to_string(want) + "|" +
-                                std::to_string(static_cast<int>(b * 100.0f));
+                                std::to_string(static_cast<int>(b * 100.0f)) +
+                                "|" + usedName;
         if (m_cutSig != sig) {
             m_cutSig = sig;
-            VK_LOG_INFO("CAM-CUT-RT shot=%d cam=%s blend=%.2f",
+            VK_LOG_INFO("CAM-CUT-RT shot=%d cam=%s blend=%.2f curve=%s",
                         seq.shotIndex(), ecs::guidToHex(want).c_str(),
-                        static_cast<double>(b));
+                        static_cast<double>(b), usedName);
         }
     }
 }
@@ -1613,17 +1842,24 @@ void RuntimeApp::applyCameraLensEffects() {
 
     // ---- 快门（运动模糊）----
     float blur = 0.0f;
+    float shutterPos = 0.0f;
     if (cc->shutterAngle > 0.0f) {
         blur = scene::shutterToBlurStrength(cc->shutterAngle);
+        shutterPos = cc->shutterPosition;
         fx.motionBlur = true;
         fx.motionBlurStrength = blur;
+        // ⚠ 只在开着的时候写：关快门时留着上一台相机的开窗位置，等下一台
+        //   相机"只填了角度没填位置"就会继承一个它自己没设过的值 ——
+        //   而画面上表现为"这台机器的拖尾方向不对"，极难定位。
+        fx.motionBlurShutterPosition = shutterPos;
     }
 
     // ---- 日志（只在变化时打）----
     char sig[256];
-    std::snprintf(sig, sizeof(sig), "cam=%llx dof=%d focus=%.2f ap=%.2f sh=%.0f blur=%.2f",
+    std::snprintf(sig, sizeof(sig),
+                  "cam=%llx dof=%d focus=%.2f ap=%.2f sh=%.0f blur=%.2f pos=%.2f",
                   static_cast<unsigned long long>(guid), cc->dofEnabled ? 1 : 0,
-                  focus, aperture, cc->shutterAngle, blur);
+                  focus, aperture, cc->shutterAngle, blur, shutterPos);
     if (m_lensSig != sig) {
         m_lensSig = sig;
         VK_LOG_INFO("CAM-LENS %s", sig);
@@ -1756,6 +1992,29 @@ void RuntimeApp::simulate(float dt) {
     // A4b：相位速率曲线是"一次 tick 全体生效"的开关，设在 tick **之前**。
     m_animator.setStrideCurve(m_cfg.player.strideCurve);
     m_animator.tick(activeScene(), dt);
+
+    // ---- 实体 TRS 轨道（C5，2026-10-31）----
+    // 门 / 电梯 / 升降平台 / 旋转机关。数据一直在场景里（`animClip` 段 +
+    // `autoplay`），但**运行时从来没有消费者** —— 只有编辑器在选中该项、
+    // 处于 Animation 模式时才推进 `time`。所以过去"编辑器里拖时间轴能看见
+    // 门在动，一进游戏全都不动"。
+    //
+    // ⚠ 必须在**物理之前**：`syncKinematicFromScene` 是从 TransformComponent
+    //   读运动学体的目标位置的。排在物理之后的话，物理永远晚一帧，电梯上
+    //   站着的角色会被平台甩下。
+    // ⚠ 与 `m_animator` 顺序无关（一个动 joints、一个动 TRS，字段不重叠）。
+    anim::tickTransformClips(activeScene(), dt);
+
+    // ---- 表情驱动（B6，2026-11-01）----
+    // 排在动画之后：它写的是 `MorphComponent::weights`（形变目标权重），
+    // 与骨骼姿势是两套数据，先后不影响正确性；放这里是为了让"本帧的口型"
+    // 用上**本帧**的语音电平（`m_audio.voiceLevel()` 读的是刚混完那一块的
+    // 能量 —— 早一帧就会让嘴比声音慢一个 block）。
+    //
+    // ⚠ `voiceLevel()` 在没有语音时返回 0，所以这里的口型会自动闭嘴；
+    //   不需要额外判断 `voicePlaying()`（那个还带一个宽限期，专门用来
+    //   避免"第一帧就判定播完"，用在嘴型上反而会先张一下）。
+    anim::tickExpressions(activeScene().world(), dt, m_audio.voiceLevel());
 
     if (m_binding.world) {
         // 顺序与编辑器 Play 一致：脚本 → 物理（M2 会在中间插入"玩家"，
@@ -1911,6 +2170,8 @@ void RuntimeApp::installScriptServices() {
     svc.act.loadScene = [this](const std::string& path) {
         return requestSceneSwitch(path);
     };
+    // 掀界面（C6 第七件）：切"显示哪一份 `.ui.json`"。空串 = 关掉。
+    svc.act.openUI = [this](const std::string& path) { return openUiDocument(path); };
 
     // ---- 关节（J5-4）----
     //
@@ -2194,6 +2455,14 @@ void RuntimeApp::dumpPhysicsBodies(const char* tag) {
 // ---------------------------------------------------------------- 收尾
 
 void RuntimeApp::onShutdown() {
+    // ---- G17-3：`--save` = 退出前存一次 ----
+    // 为什么不"启动就存"：启动那一刻世界刚加载完，存下来与关卡文件逐位相同，
+    // 等于什么都没证明。跑完 `--frames` 再存，才看得出"这一局真的变了"。
+    // ⚠ 排在 `MYVK_RUNTIME_SAVE_SCENE`（写场景）**之前**：场景写盘会改
+    //   实体的 guid/结构，先存场景再存档的话，档里的 sceneHash 与磁盘上的
+    //   关卡就对不上了。
+    if (m_cfg.saveOnExit) quickSave("exit");
+
     // ---- S6 / G5：退出时把**运行态**场景写一份 ----
     //
     // `--dump-scene` 是"读进来立刻再写一份"，它证明的是**读盘的规范化形状**；
@@ -2231,6 +2500,11 @@ void RuntimeApp::onShutdown() {
     }
     m_audio.shutdown();
     m_audioSrcs.clear();
+
+    // ⚠ 钩子捕获的是 `this`。`DialogueSystem` 是进程级单例，比本对象活得久 ——
+    //   不摘掉的话，之后任何一次 `dlg.tick()` 都会经由 `m_voice.playing()`
+    //   调进一个已析构的 `AudioSystem`（悬垂 this，段错误且难定位）。
+    dialogue::activeDialogueSystem().setVoiceHooks({});
 
     m_loop.logNow();
     VK_LOG_INFO("GAME-LOOP-SUMMARY ticks=%llu fixed=%llu var=%llu render=%llu "

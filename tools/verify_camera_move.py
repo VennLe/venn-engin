@@ -10,6 +10,9 @@
     B 组（面板，GUI）     运镜面板真的能打开、能选中相机、**点动词画面真的动**
                           （两次点击的 yaw 差 = ±15°，这两条一起才排除
                            "按钮有矩形但没连上"）。
+                          ⚠ 每次点击前都要 `kit.click_in_panel` 先滚进可视区：
+                            `logRect` 不判可见性，滚出视野的按钮**有矩形却点
+                            不到**，失败表现是 `dyaw=0.00`（酷似产品 bug）。
     C 组（序列化回路）    场景 JSON 里的 `camera` / `cameraPath` 读回来后，
                           面板状态行 `CINE-STATE` 里的数字必须与文件一致
                           （focal=35 / shutter=180 / dof=1 / path≠0）。
@@ -93,6 +96,8 @@ def write_fixture():
                         # 镜头段：这一组是 C 组要逐项核对的东西
                         "focal": 35.0, "sensorHeight": 24.0,
                         "shutterAngle": 180.0,
+                        # 负值：见 C7 —— "负号被 env 语义吃掉"是这条的老坑
+                        "shutterPosition": -0.5,
                         "dofEnabled": True, "fStop": 2.0,
                         "focusDistance": 6.0,
                         "lookTargetGuid": GUID_SUBJ,
@@ -168,8 +173,18 @@ VERB_RE = re.compile(
 STATE_RE = re.compile(
     r"CINE-STATE sel=(\S+) focal=(-?[\d.]+) fov=(-?[\d.]+) "
     r"fovEff=(-?[\d.]+) shift=\((-?[\d.]+),(-?[\d.]+)\) roll=(-?[\d.]+) "
-    r"dof=(\d) fstop=(-?[\d.]+) shutter=(-?[\d.]+) look=(\S+) "
+    r"dof=(\d) fstop=(-?[\d.]+) shutter=(-?[\d.]+) "
+    # ⚠⚠ `shutpos=` 是**非捕获**插入（2026-10-31，Motion Blur 快门开窗位置）：
+    #   状态行多了这一个字段之后，老正则要求 `shutter=<num> look=` 紧挨着，
+    #   于是整条 `CINE-STATE` 一条都匹配不上 —— 症状是"点相机行后状态行缺失"，
+    #   看着像选中坏了，其实是正则跟不上格式。
+    #   写成非捕获是刻意的：下面的 group(11..15) 都在它后面，一旦改成捕获，
+    #   所有下标要同时 +1，漏一处就是"look 读成了 shutpos"这种静默错位。
+    r"shutpos=-?[\d.]+ "
+    r"look=(\S+) "
     r"damp=(-?[\d.]+) hand=(-?[\d.]+)/(-?[\d.]+) path=(\S+)")
+# 单独一条只为断言新字段（见 C 组 C7）—— 不并进上面那行，理由同上。
+SHUTPOS_RE = re.compile(r"CINE-STATE .*? shutpos=(-?[\d.]+) ")
 
 
 def last_match(tap, rx):
@@ -178,34 +193,6 @@ def last_match(tap, rx):
             m = rx.search(line)
             if m:
                 return m
-    return None
-
-
-def scroll_into_view(hwnd, tap, tag, win_tag, tries=14, step=120):
-    """把 `tag` 滚进 `win_tag` 的可视竖直范围，返回最终矩形（失败 None）。
-
-    ⚠ 为什么必须做：ImGui 的折叠区一多，面板内容就比停靠后的窗口高。滚出
-      可视区的控件 **矩形照样会被 logRect 打出来**（它只按坐标去重，不判
-      可见性）—— 照着那个坐标点，点到的是窗口外面/别的控件，而日志里
-      一条错都不会有。
-    """
-    from capture_window import user32
-    wr = tap.last_rect(win_tag)
-    if not wr:
-        return None
-    cx = int((wr[0] + wr[2]) * 0.5)
-    cy = int((wr[1] + wr[3]) * 0.5)
-    for _ in range(tries):
-        r = tap.last_rect(tag)
-        if r and r[1] >= wr[1] + 4 and r[3] <= wr[3] - 4:
-            return r
-        kit.focus_window(hwnd)
-        screen = kit.client_to_screen(hwnd, cx, cy)
-        user32.SetCursorPos(screen[0], screen[1])
-        time.sleep(0.05)
-        # MOUSEEVENTF_WHEEL = 0x0800，负 delta = 向下滚
-        user32.mouse_event(0x0800, 0, 0, -step, 0)
-        time.sleep(0.35)
     return None
 
 
@@ -304,14 +291,31 @@ def run_gui():
             # ⚠ 别拿 `fov` 那个字段判：装了定焦镜头之后它是**残留值**。
             check("C6 fovEff 由焦距算出（≈37.8°，不是文件里的 50）",
                   abs(fov_eff - 37.8) < 1.5, "fovEff=%.2f" % fov_eff)
+            # C7（2026-10-31）：快门**开窗位置**（Motion Blur Position，-1..+1）
+            # 也要能存能读。夹具里给的是 -0.5，而**负值**正是这一条的关键：
+            # 它对应的 env 参数曾经用 `PFloat`（语义是 FloatNonNeg）来登记，
+            # 于是 `-1` 会被静默吃掉 —— 面板能拖、画面会变、只有"负值"这一档
+            # 永远到不了实现。断言一个负数，就是在断言那条路真的通。
+            sp = last_match(tap, SHUTPOS_RE)
+            check("C7 shutterPosition 读回 = -0.5（负值没被吞）",
+                  sp is not None and abs(float(sp.group(1)) + 0.5) < 0.011,
+                  "shutpos=%s" % (sp.group(1) if sp else "-"))
         else:
-            for tag in ("C1", "C2", "C3", "C4", "C5", "C6"):
+            for tag in ("C1", "C2", "C3", "C4", "C5", "C6", "C7"):
                 check("%s 状态行缺失无法核对" % tag, False)
 
         # ---- B4/B5：点动词，画面真的动（两次增量 + 符号）----
+        #
+        # ⚠⚠ 两个动词按钮都走 `kit.click_in_panel`（先滚进视野再点）。裸
+        #   `click_anchor` 在控件滚出视野时**不报错**，只会静默失败 —— 实测
+        #   本机 1600×1000 下 `CINE-VERB-PAN` 恰好压在窗口下边缘（y=874 vs
+        #   窗口底 886，能点），`CINE-VERB-PAN-NEG` 出界 5 px（点不动），
+        #   `CINE-BAKE` 出界 150 px。症状是 B4 绿、B6 报 `dyaw=0.00`，
+        #   极像"增量不是相对的"这个产品 bug。
         n_verb = tap.count_line("CINE-VERB action=")
-        if not kit.click_anchor(hwnd, tap, "CINE-VERB-PAN"):
-            check("B4 点得到 Pan + 按钮", False)
+        ok4, r4 = kit.click_in_panel(hwnd, tap, "CINE-VERB-PAN", "CINE-WIN")
+        if not ok4:
+            check("B4 点得到 Pan + 按钮（且已滚进可视区）", False)
             return
         deadline = time.time() + 8.0
         while tap.count_line("CINE-VERB action=") <= n_verb and time.time() < deadline:
@@ -326,7 +330,12 @@ def run_gui():
               "amount=%.2f" % amt1)
 
         n_verb2 = tap.count_line("CINE-VERB action=")
-        kit.click_anchor(hwnd, tap, "CINE-VERB-PAN-NEG")
+        ok6, r6 = kit.click_in_panel(hwnd, tap, "CINE-VERB-PAN-NEG", "CINE-WIN")
+        # 单独一条：把"点不到"和"点了没效果"分开。没有这一条的话，滚动失灵
+        # 和"增量算错"会报成同一句话（`dyaw=0.00`）。
+        check("B6a Pan − 按钮滚进可视区后才点", ok6,
+              "" if ok6 else "滚动 14 次仍未进视野（rect=%s win=%s）"
+              % (tap.last_rect("CINE-VERB-PAN-NEG"), tap.last_rect("CINE-WIN")))
         deadline = time.time() + 8.0
         while tap.count_line("CINE-VERB action=") <= n_verb2 and time.time() < deadline:
             time.sleep(0.1)
@@ -338,19 +347,15 @@ def run_gui():
         while dy < -180.0:
             dy += 360.0
         check("B6 Pan − 让 yaw 回去 15°（增量是相对当前姿态，不是绝对值）",
-              abs(dy + 15.0) < 0.6, "dyaw=%.2f" % dy)
+              tap.count_line("CINE-VERB action=") > n_verb2 and abs(dy + 15.0) < 0.6,
+              "dyaw=%.2f n=%d" % (dy, tap.count_line("CINE-VERB action=")))
 
         # ---- B7：Bake 写回实体 ----
         #
-        # ⚠ 必须先把按钮滚进可视区：面板内容比停靠后的窗口高，按钮在折叠区
-        #   下面时**矩形照样存在**，点下去却点到别处（记忆里那条"有矩形却
-        #   点不到"）。判据用"滚动之后矩形真的落进窗口 y 范围"来确认。
+        # ⚠ 同样必须先滚进可视区（见 B4 上面那段）。
         n_bake = tap.count_line("CINE-BAKE pos=")
-        if not scroll_into_view(hwnd, tap, "CINE-BAKE", "CINE-WIN"):
-            check("B7a 能把 Bake 按钮滚进可视区", False)
-        else:
-            check("B7a 能把 Bake 按钮滚进可视区", True)
-        kit.click_anchor(hwnd, tap, "CINE-BAKE")
+        ok7, _r7 = kit.click_in_panel(hwnd, tap, "CINE-BAKE", "CINE-WIN")
+        check("B7a 能把 Bake 按钮滚进可视区", ok7)
         deadline = time.time() + 8.0
         while tap.count_line("CINE-BAKE pos=") <= n_bake and time.time() < deadline:
             time.sleep(0.1)

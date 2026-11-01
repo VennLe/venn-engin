@@ -853,7 +853,8 @@ int runSequencerSelfTest() {
             addSeq(s, "Seq", parse(R"({
                 "duration":3.0,
                 "camera":[{"t":0,"pos":[0,0,3]},{"t":3,"pos":[9,0,3]}],
-                "shots":[{"t":0.5,"camera":"00000000000a1b2c","blend":0.3},
+                "shots":[{"t":0.5,"camera":"00000000000a1b2c","blend":0.3,
+                          "blendCurve":"easeout"},
                          {"t":2.0}]
             })"));
             SequencerSystem sys;
@@ -870,11 +871,20 @@ int runSequencerSelfTest() {
             reportFlag("seq_shot_player_cam0", sys.shotCameraGuid() == kGuid,
                        ecs::guidToHex(sys.shotCameraGuid()).c_str());
             report("seq_shot_player_blend0", sys.shotBlendSeconds(), 0.3, 1e-4);
+            // 曲线也要**跟着 marker 走**：`resolveShot` 少接这一行的话，
+            // 时长对了、形状永远是 smooth，而面板上明明写着 easeout。
+            reportFlag("seq_shot_player_curve0",
+                       sys.shotBlendCurve() == scene::BlendCurve::EaseOut,
+                       scene::blendCurveName(sys.shotBlendCurve()));
 
             run(15);                    // 2.2 —— 1 号（没绑 → 0 = 回落关键帧轨）
             report("seq_shot_player_idx1", sys.shotIndex(), 1.0, 0.5);
             reportFlag("seq_shot_player_cam1_released", sys.shotCameraGuid() == 0,
                        "keytrack");
+            // 1 号没写 `blendCurve` → 必须回到默认（不是"沿用上一段的"）。
+            reportFlag("seq_shot_player_curve1_default",
+                       sys.shotBlendCurve() == scene::BlendCurve::Smooth,
+                       scene::blendCurveName(sys.shotBlendCurve()));
         }
 
         // G9 老资产 tick 之后三个输出恒为 −1 / 0 / 0 → 宿主**一次事都不做**。
@@ -888,6 +898,111 @@ int runSequencerSelfTest() {
             report("seq_shot_none_cam",
                    static_cast<double>(sys.shotCameraGuid()), 0.0, 0.5);
             report("seq_shot_none_blend", sys.shotBlendSeconds(), 0.0, 1e-6);
+        }
+
+        // G10 混合曲线（2026-10-31）：关键字 ←→ 枚举、默认值、写回省略。
+        //
+        // ⚠ 三条纪律：
+        //   ① 老资产（没有 `blendCurve` 键）必须读成 Smooth —— 它是"加曲线
+        //      之前写死的 smoothstep"，只有这样既有过场的画面才逐位不变；
+        //   ② 默认值**不写回**（否则老 `.seq.json` 一存盘就多一行脏 diff）；
+        //   ③ 认不出的关键字**不致命**，退回 Smooth 并留一条警告 —— 整份资产
+        //      因为一个拼错的曲线名打不开，比曲线不对更糟。
+        {
+            // ① 缺键 → 默认 Smooth
+            SequenceAsset a;
+            parseSequence("{\"camera\":[{\"t\":0},{\"t\":2}],"
+                          "\"shots\":[{\"t\":0.5,\"blend\":0.4}]}", "t.seq.json", a);
+            reportFlag("seq_shot_curve_default",
+                       a.valid && !a.shots.empty() &&
+                           a.shots[0].blendCurve == scene::BlendCurve::Smooth,
+                       a.shots.empty() ? "n=0"
+                                       : scene::blendCurveName(a.shots[0].blendCurve));
+
+            // ② 显式写 easeout → 读得回来
+            SequenceAsset b;
+            parseSequence("{\"camera\":[{\"t\":0},{\"t\":2}],"
+                          "\"shots\":[{\"t\":0.5,\"blend\":0.4,"
+                          "\"blendCurve\":\"easeout\"}]}", "t.seq.json", b);
+            reportFlag("seq_shot_curve_parse",
+                       b.valid && !b.shots.empty() &&
+                           b.shots[0].blendCurve == scene::BlendCurve::EaseOut,
+                       b.shots.empty() ? "n=0"
+                                       : scene::blendCurveName(b.shots[0].blendCurve));
+
+            // ③ 大小写 / 连字符也能认（`Ease_Out` 是作者手写时最常见的写法）
+            scene::BlendCurve tmp = scene::BlendCurve::Linear;
+            reportFlag("seq_shot_curve_lenient",
+                       scene::blendCurveFromName("Ease_Out", tmp) &&
+                           tmp == scene::BlendCurve::EaseOut,
+                       "Ease_Out");
+
+            // ④ 认不出 → 保持默认 + 有警告
+            SequenceAsset c;
+            parseSequence("{\"camera\":[{\"t\":0},{\"t\":2}],"
+                          "\"shots\":[{\"t\":0.5,\"blendCurve\":\"wobble\"}]}",
+                          "t.seq.json", c);
+            reportFlag("seq_shot_curve_unknown_warns",
+                       c.valid && !c.shots.empty() &&
+                           c.shots[0].blendCurve == scene::BlendCurve::Smooth &&
+                           !c.warnings.empty(),
+                       c.warnings.empty() ? "no warning" : c.warnings[0].c_str());
+
+            // ⑤ 写回：非默认才写，默认一个键都不多
+            SequenceAsset d;
+            parseSequence("{\"camera\":[{\"t\":0},{\"t\":2}],"
+                          "\"shots\":[{\"t\":0.5,\"blend\":0.4}]}", "t.seq.json", d);
+            const std::string ds = toJson(d);
+            reportFlag("seq_shot_curve_default_not_written",
+                       ds.find("blendCurve") == std::string::npos, "omitted");
+
+            d.shots[0].blendCurve = scene::BlendCurve::Smoother;
+            const std::string ds2 = toJson(d);
+            SequenceAsset e;
+            parseSequence(ds2, "t.seq.json", e);
+            reportFlag("seq_shot_curve_roundtrip",
+                       e.valid && !e.shots.empty() &&
+                           e.shots[0].blendCurve == scene::BlendCurve::Smoother,
+                       ds2.find("blendCurve") == std::string::npos ? "not written"
+                                                                  : "written");
+
+            // ⑥ 曲线数学：两端必须精确落在 0 / 1（否则混合开始/结束那帧跳一下）
+            float worst0 = 0.0f;
+            float worst1 = 0.0f;
+            const scene::BlendCurve allc[5] = {
+                scene::BlendCurve::Linear, scene::BlendCurve::Smooth,
+                scene::BlendCurve::EaseIn, scene::BlendCurve::EaseOut,
+                scene::BlendCurve::Smoother};
+            for (scene::BlendCurve cc : allc) {
+                worst0 = std::max(worst0, std::fabs(scene::blendCurveApply(cc, 0.0f)));
+                worst1 = std::max(worst1, std::fabs(scene::blendCurveApply(cc, 1.0f) - 1.0f));
+            }
+            report("seq_shot_curve_endpoints", static_cast<double>(worst0 + worst1),
+                   0.0, 1e-7);
+
+            // ⑦ `smooth` 必须与加曲线之前那条 smoothstep **逐位相同**。
+            //    这条是"老资产画面不变"的数值侧证据：0.25 → 0.15625。
+            report("seq_shot_curve_smooth_is_legacy",
+                   static_cast<double>(scene::blendCurveApply(
+                       scene::BlendCurve::Smooth, 0.25f)),
+                   0.15625, 1e-7);
+            // ⑧ 四类曲线在 1/4 处互不相同（否则"选了曲线"和"没选"是一回事）。
+            //    ⚠ 不能在 0.5 处比：smoother 与 linear 在中点**都恰好是 0.5**
+            //      （quintic 是对称的），那条断言会在实现完全正确时红。
+            //      1/4 处：linear 0.250 / smooth 0.156 / easein 0.063 /
+            //      easeout 0.438 / smoother 0.104 —— 五个都分得开。
+            reportFlag("seq_shot_curve_distinct_at_quarter",
+                       std::fabs(scene::blendCurveApply(scene::BlendCurve::EaseIn, 0.25f) -
+                                 scene::blendCurveApply(scene::BlendCurve::EaseOut, 0.25f)) >
+                               0.3f &&
+                           std::fabs(scene::blendCurveApply(scene::BlendCurve::Linear, 0.25f) -
+                                     scene::blendCurveApply(scene::BlendCurve::Smoother,
+                                                            0.25f)) > 0.1f &&
+                           std::fabs(scene::blendCurveApply(scene::BlendCurve::Smooth, 0.25f) -
+                                     scene::blendCurveApply(scene::BlendCurve::EaseIn, 0.25f)) >
+                               0.05f,
+                       "easein=0.063 easeout=0.438 linear=0.250 smoother=0.104 "
+                       "smooth=0.156");
         }
     }
 

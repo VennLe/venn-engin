@@ -424,6 +424,14 @@ static const ParamDesc kParamsMotionBlur[] = {
     mkParam("mb.samples", "Samples", "MYVK_MB_SAMPLES", ParamKind::Int,
             ParamTier::Advanced, 2.0f, 16.0f, EnvMode::IntFromFloat,
             "沿速度方向的采样数（2..16）。"),
+    // ⚠ 必须 PFloatAny（允许负值）：PFloat 的 env 语义是 FloatNonNeg，
+    //   `MYVK_MB_POSITION=-1` 会被**静默拒绝**保持默认 0 —— 于是验证脚本
+    //   跑 "-1" 那一轮时画面和"居中"逐像素相同，"参数没接上"和"接上了
+    //   但值被吃掉"两种病因会表现成同一个红。
+    PFloatAny("mb.position", "Shutter position", "MYVK_MB_POSITION", -1.0f,
+              1.0f, ParamTier::Advanced,
+              "快门开窗位置：-1 = 帧末（只糊来路）/ 0 = 居中 / +1 = 帧首。"
+              "与 Shutter angle 正交：那个决定窗口多长，这个决定窗口摆在哪。"),
     PFloat("mb.simYaw", "Sim yaw (deg)", "MYVK_MB_SIM_YAW", 0.0f, 360.0f,
            ParamTier::Debug,
            "验证钩子：静态相机下人为制造偏航角速度（正常使用 = 0）。"),

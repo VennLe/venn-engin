@@ -34,6 +34,10 @@
 #include "animation/LookAt.h"
 #include "animation/SpringBone.h"
 #include "animation/TwoBoneIK.h"
+// B6 表情预设。与上面几个同一条理由：`ExpressionSet` 是**值成员**（资产小，
+// 由组件拥有所有权 → 组件里不必塞 AssetManager 指针），所以必须有完整类型；
+// 而 `animation/ExpressionPreset.h` 只依赖 string / vector，不反向依赖 ecs。
+#include "animation/ExpressionPreset.h"
 #include "water/WaterBody.h"
 
 #include <glm/glm.hpp>
@@ -209,6 +213,66 @@ struct SkinnedMeshComponent {
 struct MorphComponent {
     assets::Model* model = nullptr;      // 提供 MorphRig（可空 = 解析不了名字）
     std::vector<float> weights;          // 下标 = MorphRig 的通道下标
+};
+
+// ---------------- B6 表情预设 + 眨眼/口型（2026-11-01）----------------
+//
+// 与 `MorphComponent` 的分工（**两个组件、两件事，不要合并**）：
+//   * `MorphComponent` = **当前帧的原始权重表**。它是"脸此刻长什么样"，
+//     谁都可以写（Inspector 滑条、脚本 `morph.set`、本组件）。它不需要
+//     知道"为什么是这些数"。
+//   * `ExpressionComponent` = **怎么算出这些数**：挂哪份预设资产、当前是
+//     哪个表情、晃眼怎么眨、口型怎么跟音量。它自己不存权重。
+//
+// 为什么合并成一个会坏：滑条是"手动覆盖"的入口，驱动是"每帧重算"的
+// 入口。合成一个组件之后，"驱动每帧把整张表写满"和"用户推了一下滑条"
+// 就变成同一块内存上的两种写入，谁后写谁赢 —— 症状是**推滑条没反应**
+// （下一帧被驱动抹掉），而那是最常见的手测动作。
+//
+// ------------------------------------------------------------
+// ⚠⚠ 驱动只写"自己拥有的通道"（`ownedChannels`）
+// ------------------------------------------------------------
+// 每帧驱动只碰三类通道：① 当前预设里列出的 ② 眨眼通道 ③ 口型通道。
+// 其余通道**原样不动** —— 手动推的 `head_tilt` 不会被抹成 0。
+// 反过来，**上一帧拥有、这一帧不再拥有的通道必须显式写 0**（换预设时
+// 旧表情的通道要归零），所以运行时多存一份 `ownedChannels`（不存盘）。
+// 少了这一步的症状：从"笑"切到"怒"，嘴角仍然扬着。
+struct ExpressionComponent {
+    // ---- 预设资产（懒加载，见 driver 里的说明）----
+    std::string presetPath;              // 相对 assets/ 的路径（空 = 没挂资产）
+    anim::ExpressionSet set;             // 按值持有（体积小，省掉一层间接）
+    bool setLoaded = false;              // "试过了"，失败不再每帧重试
+    bool loadFailedLogged = false;       // 失败日志只打一次
+
+    // ---- 当前表情 ----
+    std::string presetName;              // 预设的 `name` 键（不翻译）
+    float intensity = 1.0f;              // 整体缩放 [0,1]（0 = 回到中性）
+
+    // ---- 眨眼 ----
+    bool blinkEnabled = true;
+    std::string blinkChannel = "blink";  // 闭眼滑条名（rig 里叫什么由美术定）
+    float blinkInterval = 4.0f;          // 平均间隔（秒），实际带 ±15% 抖动
+    float blinkClose = 0.07f;            // 闭眼用时
+    float blinkHold = 0.03f;             // 闭合保持
+    float blinkOpen = 0.13f;             // 睁眼用时
+    // 立刻眨一次（UI 按钮 / `expr.blink` 用）。驱动读到 true 就会把
+    // `blinkPhase` 归零重新起一次，然后自己清掉这一位。
+    bool blinkRequest = false;
+
+    // ---- 口型 ----
+    bool lipSyncEnabled = false;
+    std::string mouthChannel = "mouth_open";
+    float mouthGain = 1.0f;              // 包络 → 张嘴幅度的倍率
+
+    // ---- 运行时状态（**不存盘**）----
+    // `<0` = 还没初始化：首帧按实体 id 抽一个相位，否则同一个场景里所有
+    // 角色会**同时眨眼**（一眼就看出是程序）。
+    float blinkTimer = -1.0f;            // 距下一次眨眼的剩余秒数
+    float blinkPhase = -1.0f;            // <0 = 不在眨；>=0 = 已经眨了多久
+    std::uint32_t blinkSeed = 1u;        // 抖动用的确定性种子（见 driver）
+    int blinkCount = 0;                  // 已眨次数（只给日志/自检看）
+    float level = 0.0f;                  // 口型包络（攻击快 / 释放慢）
+    std::vector<std::string> ownedChannels;  // 上一帧写过的通道（换预设要归零）
 };
 
 // ---------------- 动画层（B1，2026-10-26）----------------
@@ -1017,6 +1081,14 @@ struct CameraComponent {
     //   本项目里 fps 是可变的（编辑器能跑 144），用帧数存会让同一个镜头
     //   在玩家机器上时快时慢。
     float shutterAngle = 0.0f;
+
+    // ---- 快门**开窗位置**（-1 .. +1）----
+    // 快门角决定"曝光窗多长"，这一项决定"窗摆在帧的哪一段"：
+    //   -1 = 帧末开窗（只糊来路，画面的拖尾在运动**前方**）
+    //    0 = 居中（默认，与没有这一项时的画面逐像素一致）
+    //   +1 = 帧首开窗（只糊去路）
+    // ⚠ 只有 `shutterAngle > 0` 时才有意义 —— 没有曝光就没有窗。
+    float shutterPosition = 0.0f;
 
     // ---- rig：跟随路径（Follow Path）----
     // 存路径**实体**的 guid（那台实体挂 `CameraPathComponent`）。0 = 不走路径。

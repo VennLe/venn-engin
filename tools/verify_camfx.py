@@ -23,6 +23,10 @@
      B2 人为角速度（MYVK_MB_SIM_YAW）→ 显著差异；
      B3 强度单调：0.5 < 2.0 的差异像素数递增（强度真的在起作用）；
      B4 MSAA=1 形态同样工作。
+     B5 快门**开窗位置**（MYVK_MB_POSITION）：a) -1 与居中不同；
+        b) +1 与居中不同；c) -1 与 +1 互不相同（钉"偏移带符号"，
+        abs() 的实现会让它红）；d) 同档两次逐位相同；
+        e) 静止相机下仍与基线逐位一致（不能绕过速度 0 短路）。
   C. 色差
      C1 开/关差异显著，且差异**集中在画面外围**（径向分离的必然结果：
         中心处 RGB 三个采样点几乎重合）。中心区差异像素数必须远小于外圈。
@@ -267,6 +271,60 @@ def main():
                                       "MYVK_MB_SIM_YAW": "1.5"})
     diff("B4 运动模糊（MSAA=1 单采样深度形态）", vpC, imgC, vpI, imgI, 3000)
     check("B4 运动模糊 MSAA=1 轮零 VUID / 零 Fatal", not eI, eI[:2])
+
+    # ------------------------------------------------------------------
+    # B5 快门开窗位置（MYVK_MB_POSITION，2026-10-31）
+    #
+    # 为什么必须三条一起判：单看"±1 与居中不同"只能证明**参数接上了**，
+    # 而两种很自然的错误实现照样全绿 ——
+    #   · 写成 `abs(pos)`：±1 落到同一个窗口（只有 B5c 会红）；
+    #   · 把位置折进 strength：画面确实变了，但变的是"糊多长"而不是
+    #     "糊在哪一段"，拖尾方向仍然是错的（只有 B5d 会红）。
+    # 所以判据是「两档各自明显偏离居中」+「两档彼此明显不同」+
+    # 「同一档可复现」三件事，各自钉一种失败模式。
+    # 对照基准用 B2 那一轮（同一场景 / 同一角速度 / 同一强度），
+    # 唯一的自变量就是开窗位置 —— 这样差异不可能来自别处。
+    # ------------------------------------------------------------------
+    _, vpM, imgM, eM = run("mb_pos_neg", on={"MYVK_MOTIONBLUR": "1"},
+                           env_extra={"MYVK_MB_SIM_YAW": "1.5",
+                                      "MYVK_MB_STRENGTH": "1.0",
+                                      "MYVK_MB_POSITION": "-1"})
+    nMN, _, _ = diff("B5a 开窗位置 -1（帧末）vs 居中 → 差异显著",
+                     vpG, imgG, vpM, imgM, 400)
+    check("B5a 帧末开窗轮零 VUID / 零 Fatal", not eM, eM[:2])
+
+    _, vpP, imgP, eP = run("mb_pos_pos", on={"MYVK_MOTIONBLUR": "1"},
+                           env_extra={"MYVK_MB_SIM_YAW": "1.5",
+                                      "MYVK_MB_STRENGTH": "1.0",
+                                      "MYVK_MB_POSITION": "1"})
+    nPN, _, _ = diff("B5b 开窗位置 +1（帧首）vs 居中 → 差异显著",
+                     vpG, imgG, vpP, imgP, 400)
+    check("B5b 帧首开窗轮零 VUID / 零 Fatal", not eP, eP[:2])
+
+    # ★ 关键一条：偏移必须**带符号**。abs(pos) 的实现会让这一条红。
+    nMP, _, _ = diff("B5c -1 与 +1 必须互不相同（偏移带符号）",
+                     vpM, imgM, vpP, imgP, 400)
+    print("     B5 偏离量：|-1|=%d  |+1|=%d  |(-1)-(+1)|=%d" % (nMN, nPN, nMP))
+
+    # 可复现：同一档跑两次必须逐位相同。没有这条，前面三条都可能只是
+    # "同一条链路上两次不同的抖动"（TAA 相位 / 异步时序）凑出来的差异。
+    _, vpM2, imgM2, eM2 = run("mb_pos_neg2", on={"MYVK_MOTIONBLUR": "1"},
+                              env_extra={"MYVK_MB_SIM_YAW": "1.5",
+                                         "MYVK_MB_STRENGTH": "1.0",
+                                         "MYVK_MB_POSITION": "-1"})
+    same("B5d 同一开窗位置两次运行逐位相同（差异不是噪声）",
+         vpM, imgM, vpM2, imgM2)
+    check("B5d 复跑轮零 VUID / 零 Fatal", not eM2, eM2[:2])
+
+    # 负向恒等：相机静止时速度恒 0，开窗位置**不能**绕过那个短路。
+    # （如果实现改成"用 pos 直接平移 uv"，静止画面会被整体挪一小段 ——
+    #   画面上像"画面被挤了一下"，而这条断言会立刻红。）
+    _, vpQ2, imgQ2, eQ2 = run("mb_pos_static",
+                              on={"MYVK_MOTIONBLUR": "1"},
+                              env_extra={"MYVK_MB_POSITION": "-1"})
+    same("B5e 相机静止 + 开窗位置 -1 → 仍与基线逐像素一致（速度 0 短路）",
+         vpA, imgA, vpQ2, imgQ2)
+    check("B5e 静止 + 开窗轮零 VUID / 零 Fatal", not eQ2, eQ2[:2])
 
     # ================================================================
     # C. 色差

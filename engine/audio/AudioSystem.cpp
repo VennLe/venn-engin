@@ -287,6 +287,43 @@ bool AudioSystem::playOneShot(const std::string& clipPath, BusId bus,
 }
 
 // ------------------------------------------------------------
+// 语音（D1）
+// ------------------------------------------------------------
+bool AudioSystem::playVoice(const std::string& clipPath, float volume) {
+    const bool ok = playOneShot(clipPath, BusId::Voice, nullptr, volume);
+    if (ok) {
+        ++m_voiceSerial;
+        m_voiceStart = std::chrono::steady_clock::now();
+        VK_LOG_INFO("AUDIO-VOICE play serial=%llu path=%s",
+                    static_cast<unsigned long long>(m_voiceSerial),
+                    clipPath.c_str());
+    } else {
+        // ⚠ 失败也要打一条：不然宿主"播了语音但听不见、而且 voicePlaying()
+        //   一直是 false"会看起来像剧本推进逻辑坏了。
+        VK_LOG_WARN("AUDIO-VOICE failed path=%s (device=%s)", clipPath.c_str(),
+                    running() ? "running" : "closed");
+    }
+    return ok;
+}
+
+bool AudioSystem::voicePlaying() const {
+    if (m_mixer.activeVoicesOnBus(static_cast<int>(BusId::Voice)) > 0)
+        return true;
+    if (m_voiceSerial == 0) return false;
+    // 宽限期：见头文件里那条注释（发起后的一个 block 内声部还没标活）。
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - m_voiceStart)
+                        .count();
+    return ms < kVoiceGraceMs;
+}
+
+float AudioSystem::voiceLevel() const {
+    // 直接读混音器那一块的能量。**不做宽限期**：与 `voicePlaying()` 相反，
+    // 这里"刚发起还没有声音"就该返回 0 —— 嘴先张开再出声是穿帮。
+    return m_mixer.busLevel(static_cast<int>(BusId::Voice));
+}
+
+// ------------------------------------------------------------
 // 流式音乐
 // ------------------------------------------------------------
 void AudioSystem::fillStream(Stream& s) {

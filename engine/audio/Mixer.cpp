@@ -92,6 +92,11 @@ Mixer::Mixer() {
     //   `m_queue[head % kQueueSize]` 就是越界写 —— 现象是"自检跑到设备
     //   那一组就没输出了"（进程被打穿）。实测踩过一次。
     m_queue.resize(kQueueSize);
+    // `std::atomic<int>` 的默认构造**不置 0**（C++17 里 `atomic<int> a;` 是
+    // 未初始化的）。`m_statBusVoices[]` 是数组，靠构造函数体显式清一遍 ——
+    // 漏了的话"每总线活跃数"读到的是栈上的垃圾，`voicePlaying()` 会随机为真。
+    for (int b = 0; b < kBusCount; ++b)
+        m_statBusVoices[b].store(0, std::memory_order_relaxed);
 }
 Mixer::~Mixer() = default;
 
@@ -112,6 +117,7 @@ void Mixer::init(std::uint32_t outSampleRate, std::uint32_t outChannels) {
     for (int i = 0; i < kBusCount; ++i) {
         m_busCur[i] = 1.0f;
         m_busTarget[i] = 1.0f;
+        m_statBusRms[i].store(0.0f);
     }
     m_head.store(0);
     m_tail.store(0);
@@ -716,6 +722,9 @@ void Mixer::mixBlock(float* out, std::uint32_t frames) {
 
     float peak = 0.0f;
     double acc = 0.0;
+    // 每总线能量累加（B6 口型）。`double` 而不是 `float`：1 万帧量级的
+    // 平方和用 float 累加会丢有效位，长句子的尾音电平会掉。
+    double busAcc[kBusCount] = {};
     const std::uint32_t outCh = m_outCh;
 
     for (std::uint32_t i = 0; i < frames; ++i) {
@@ -728,8 +737,12 @@ void Mixer::mixBlock(float* out, std::uint32_t frames) {
             if (b == static_cast<int>(BusId::Music)) g *= musicScale;
             const float* base = m_busBuf.data() +
                                 static_cast<std::size_t>(b) * kMaxBlockFrames * 2;
-            l += base[i * 2 + 0] * g;
-            r += base[i * 2 + 1] * g;
+            const float bl = base[i * 2 + 0] * g;
+            const float br = base[i * 2 + 1] * g;
+            l += bl;
+            r += br;
+            busAcc[b] += static_cast<double>(bl) * bl +
+                         static_cast<double>(br) * br;
         }
         // 主总线
         const float tm = m_busTarget[0];
@@ -761,10 +774,27 @@ void Mixer::mixBlock(float* out, std::uint32_t frames) {
     for (int b = 0; b < kBusCount; ++b) m_busCur[b] = cur[b];
 
     int voices = 0;
-    for (int i = 0; i < kMaxVoices; ++i)
-        if (m_voices[i].active) ++voices;
+    int busVoices[kBusCount] = {};
+    for (int i = 0; i < kMaxVoices; ++i) {
+        if (!m_voices[i].active) continue;
+        ++voices;
+        const int b = m_voices[i].bus;
+        if (b >= 0 && b < kBusCount) ++busVoices[b];
+    }
 
     m_statVoices.store(voices, std::memory_order_relaxed);
+    for (int b = 0; b < kBusCount; ++b)
+        m_statBusVoices[b].store(busVoices[b], std::memory_order_relaxed);
+
+    // 每总线 RMS（B6）。`frames == 0` 时**不写**：除以 0 会把电平变成 inf，
+    // 而 inf 一旦进了权重表就是一张 NaN 的脸。
+    if (frames > 0) {
+        const double denom = 2.0 * static_cast<double>(frames);
+        for (int b = 0; b < kBusCount; ++b) {
+            const float lv = static_cast<float>(std::sqrt(busAcc[b] / denom));
+            m_statBusRms[b].store(lv, std::memory_order_relaxed);
+        }
+    }
     m_statPeak.store(peak, std::memory_order_relaxed);
     m_statRms.store(
         static_cast<float>(std::sqrt(acc / (2.0 * static_cast<double>(frames)))),
@@ -793,6 +823,10 @@ MixStats Mixer::stats() const {
     s.musicGain = m_statMusicGain.load(std::memory_order_relaxed);
     s.underruns = m_underruns.load(std::memory_order_relaxed);
     s.stolen = m_stolen.load(std::memory_order_relaxed);
+    for (int b = 0; b < kBusCount; ++b)
+        s.busVoices[b] = m_statBusVoices[b].load(std::memory_order_relaxed);
+    for (int b = 0; b < kBusCount; ++b)
+        s.busRms[b] = m_statBusRms[b].load(std::memory_order_relaxed);
     return s;
 }
 

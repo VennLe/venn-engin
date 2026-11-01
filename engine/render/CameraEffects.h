@@ -15,7 +15,7 @@
 //
 // 环境变量初值（Renderer 构造函数读；验证脚本靠它们做对照）：
 //   MYVK_DOF=1  MYVK_DOF_FOCUS=米  MYVK_DOF_APERTURE  MYVK_DOF_RADIUS=像素
-//   MYVK_MOTIONBLUR=1  MYVK_MB_STRENGTH  MYVK_MB_SAMPLES
+//   MYVK_MOTIONBLUR=1  MYVK_MB_STRENGTH  MYVK_MB_SAMPLES  MYVK_MB_POSITION
 //   MYVK_CHROMA=1  MYVK_CHROMA_STRENGTH
 //   MYVK_VIGNETTE_STRENGTH
 // ============================================================
@@ -35,6 +35,15 @@ struct CameraEffectSettings {
     bool motionBlur = false;
     float motionBlurStrength = 1.0f;  // 速度缩放（>1 更夸张）
     int motionBlurSamples = 8;        // 沿速度方向的采样数（2..16）
+    // 快门**开窗位置**（-1 .. +1）。它和 strength 是两个正交的自由度：
+    //   strength 决定"窗口多长"（≈ 快门角），这里决定"窗口摆在哪"。
+    //     -1 → 窗口 = [uvPrev, vUv]     只糊"来路"（帧末曝光）
+    //      0 → 窗口 = 关于 vUv 居中     ← **默认，与引入本参数前逐像素一致**
+    //     +1 → 窗口 = [vUv, 2vUv-uvPrev] 只糊"去路"（帧首曝光）
+    // 为什么默认必须是 0：着色器原先采样 t ∈ [-0.5, 0.5]，等价于居中；
+    // 把默认改成别的值等于**悄悄改掉所有既有工程的画面**，而这类改动
+    // 在像素回归里只会表现为"运动模糊用例莫名其妙全红"。
+    float motionBlurShutterPosition = 0.0f;
 
     // ---- 色差（径向 RGB 分离）----
     bool chromatic = false;

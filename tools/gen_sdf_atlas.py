@@ -172,6 +172,30 @@ def pick_font(explicit: str | None) -> str:
     raise SystemExit("找不到 OFL 字体（NotoSansSC）。用 --font 指定。")
 
 
+def shelf_pack(packed, glyphs, atlas_w, atlas_h):
+    """按 shelf 规则排一遍。返回 (placed, used_h, 溢出字符 or None, 已用%)。
+
+    抽成函数只为一件事：**装不下要能重排**（见 main 里的自动长高）。
+    """
+    x = y = 0
+    row_h = 0
+    placed = {}
+    for ch in packed:
+        g = glyphs[ch]
+        w, h = g["w"], g["h"]
+        if x + w > atlas_w:
+            x = 0
+            y += row_h
+            row_h = 0
+        if y + h > atlas_h:
+            return {}, 0, ch, 100.0 * (y * atlas_w) / (atlas_w * atlas_h)
+        placed[ch] = (x, y)
+        x += w
+        row_h = max(row_h, h)
+    used_h = y + row_h
+    return placed, used_h, None, 100.0 * used_h / atlas_h
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="TTF → SDF 图集（R8）+ JSON")
     ap.add_argument("--font", default=None)
@@ -235,27 +259,35 @@ def main() -> int:
         packed.append(ch)
 
     # ---- 2) shelf packing ----
+    #
+    # ⚠ 高度**不默认成正方形**：词典是跟着功能一起长的（每加一个面板、每补
+    #   一条译文就多几个汉字），而 2048² 在 1059 字时就已经"在 '瞬' 处溢出
+    #   97.6%"。写死正方形的结果是：文档里那条
+    #     python tools/gen_sdf_atlas.py
+    #   会在某个提交之后突然失败，而失败信息只说"在 '瞬' 处溢出" —— 看着
+    #   像字体缺字，实际是版面不够。
+    #   所以：给了 `--atlas-h` 就按它（装不下直接报错，让人显式调大），
+    #   没给就**自动翻倍重排**，并把每次长高的原因打出来。
     atlas_w = args.atlas
     atlas_h = args.atlas_h or args.atlas
-    x = y = 0
-    row_h = 0
-    placed = {}
-    for ch in packed:
-        g = glyphs[ch]
-        w, h = g["w"], g["h"]
-        if x + w > atlas_w:
-            x = 0
-            y += row_h
-            row_h = 0
-        if y + h > atlas_h:
-            print("!! 图集装不下：在 '%s' 处溢出（%.1f%% 已用）"
-                  % (ch, 100.0 * (y * atlas_w) / (atlas_w * atlas_h)))
+    while True:
+        placed, used_h, overflow, used_ratio = shelf_pack(
+            packed, glyphs, atlas_w, atlas_h)
+        if overflow is None:
+            break
+        if args.atlas_h:
+            print("!! 图集装不下：在 '%s' 处溢出（%.1f%% 已用）。"
+                  "显式指定了 --atlas-h %d → 请调大高度或降 --size。"
+                  % (overflow, used_ratio, args.atlas_h))
             return 1
-        placed[ch] = (x, y)
-        x += w
-        row_h = max(row_h, h)
+        atlas_h *= 2
+        print("… %dx%d 装不下（在 '%s' 处溢出，已用 %.1f%%）→ 高度自动加到 %d"
+              % (atlas_w, atlas_h // 2, overflow, used_ratio, atlas_h))
+        if atlas_h > 8192:
+            print("!! 高度加到 8192 仍装不下 —— 词典规模已经超出单页图集，"
+                  "该考虑分页（或降 --size）。")
+            return 1
 
-    used_h = y + row_h
     print("图集占用: %dx%d / %d（高度利用率 %.1f%%）"
           % (atlas_w, used_h, atlas_h, 100.0 * used_h / atlas_h))
 

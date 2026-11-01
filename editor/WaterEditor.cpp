@@ -841,8 +841,8 @@ void WaterEditor::drawShapeButtons(water::WaterBody& b, const char* tag,
         const bool active = (b.shape == shape);
         if (s > 0) ImGui::SameLine();
         beginActiveButton(active);
-        if (ImGui::Button(TR(shape == water::Shape::Circle ? "Circle"
-                                                          : "Rectangle"),
+        if (ImGui::Button(TR(shape == water::Shape::Circle ? TRL("Circle")
+                                                          : TRL("Rectangle")),
                           ImVec2(w, 0.0f))) {
             b.shape = shape;
             // 圆形只认 x；切过来时把 y 拉齐，免得面板显示一个用不到的半长

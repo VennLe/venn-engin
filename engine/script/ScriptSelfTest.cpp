@@ -113,6 +113,14 @@ struct MockHost {
     // loadScene：只记请求，真切换由 verify_world_api.py 验（那边有真文件）
     std::vector<std::string> sceneRequests;
     bool loadSceneOk = true;
+
+    // ---- C6 第七件：openUI（记录器）----
+    // ⚠ 路径**原样**记账，包括空串 —— 空串是"关掉当前那块"的合法用法，
+    //   写成"空串就不记账"会让 C20c 变成假绿（分不清"没调"和"调了空串"）。
+    std::vector<std::string> uiRequests;
+    bool openUiOk = true;
+    // 故意只在 `installMock` 里装、`installEmptyHost` 里不装：
+    // "没装"那条路必须能测到，否则"钩子接丢了"永远表现为静默 false。
 };
 
 void installMock(ScriptRuntime& rt, MockHost& mh) {
@@ -200,6 +208,10 @@ void installMock(ScriptRuntime& rt, MockHost& mh) {
     svc.act.loadScene = [&mh](const std::string& path) {
         mh.sceneRequests.push_back(path);
         return mh.loadSceneOk;
+    };
+    svc.act.openUI = [&mh](const std::string& path) {
+        mh.uiRequests.push_back(path);
+        return mh.openUiOk;
     };
     rt.setServices(std::move(svc));
     rt.setErrorSink([&mh](const ScriptInstance& inst, const std::string& msg) {
@@ -1371,9 +1383,92 @@ let a = loadScene("scenes/nope.json")
     }
 }
 
+// C20 openUI（C6 第七件）：脚本自己掀一块界面（背包 / 结算 / 提示框）。
+//
+// ⚠ 每个分支盯的都是"两种实现会不一样"的那个量：
+//   a 路径**原样**到宿主（有没有被拼成 `assets/...` 或小写化 / 补扩展名）；
+//   b 空串是**合法用法**（关掉当前那块）→ 必须真的送到宿主，不许被本地
+//     短路成"什么都不做"（那样 `openUI("")` 会变成一句没人执行的空话）；
+//   c 宿主说"加载不了"时脚本拿到 false **并且报错**（静默 true 会让
+//     "我让它弹背包它没弹"变成玄学，同 C14）；
+//   d 宿主**没装** UI 层 → 报错要说清是宿主缺能力，不是资产坏了：这两种
+//     错法作者要改的地方完全不在一处。
+void testC20() {
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        installMock(rt, mh);
+        const ecs::Entity e = runScript(sc, rt, "C20A", R"VKS(
+let a = openUI("ui/docs/hud_demo.ui.json")
+)VKS", 1);
+        const ScriptInstance* inst = rt.find(e);
+        check("C20a openUI 正向：路径原样到宿主、脚本拿到 true",
+              inst && varBool(inst, "a") && mh.uiRequests.size() == 1 &&
+                  mh.uiRequests[0] == "ui/docs/hud_demo.ui.json",
+              fmt("reqs=%zu first=[%s]", mh.uiRequests.size(),
+                  mh.uiRequests.empty() ? "" : mh.uiRequests[0].c_str()));
+    }
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        installMock(rt, mh);
+        const ecs::Entity e = runScript(sc, rt, "C20B", R"VKS(
+let a = openUI("")
+)VKS", 1);
+        const ScriptInstance* inst = rt.find(e);
+        const bool noError = inst && !inst->failed;
+        check("C20b openUI(\"\") 空串合法：送到宿主、返回 true、不报错",
+              inst && varBool(inst, "a") && mh.uiRequests.size() == 1 &&
+                  mh.uiRequests[0].empty() && noError,
+              inst ? fmt("reqs=%zu err=%s", mh.uiRequests.size(),
+                         inst->lastError.c_str())
+                   : std::string("<no instance>"));
+    }
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        installMock(rt, mh);
+        mh.openUiOk = false;   // 宿主：文档不存在 / 解析失败
+        const ecs::Entity e = runScript(sc, rt, "C20C", R"VKS(
+let a = openUI("ui/docs/nope.ui.json")
+)VKS", 2);
+        const ScriptInstance* inst = rt.find(e);
+        const bool errored =
+            inst && (inst->failed ||
+                     inst->lastError.find("openUI") != std::string::npos);
+        // ⚠ 默认值给 false：运行期错误会**中止**那条语句，`let a = ...`
+        //   根本没赋值 —— 默认给 true 会把"没赋值"读成"成功了"（C14 踩过）。
+        check("C20c openUI 失败必须报错并返回 false（不许静默成功）",
+              !varBool(inst, "a", false) && errored && mh.uiRequests.size() == 1,
+              inst ? fmt("reqs=%zu err=%s", mh.uiRequests.size(),
+                         inst->lastError.c_str())
+                   : std::string("<no instance>"));
+    }
+    {
+        // ⚠ 故意**什么都不装**：只有这里能证明"宿主缺能力"与"资产坏了"
+        //   被分成了两条不同的错误。
+        scene::Scene sc;
+        ScriptRuntime rt;
+        rt.setServices(ScriptServices{});
+        const ecs::Entity e = runScript(sc, rt, "C20D", R"VKS(
+let a = openUI("ui/docs/hud_demo.ui.json")
+)VKS", 2);
+        const ScriptInstance* inst = rt.find(e);
+        const bool errored =
+            inst && inst->lastError.find("not available in this host") !=
+                        std::string::npos;
+        check("C20d 宿主没装 UI 层：报错说清是宿主缺能力、不假装成功",
+              !varBool(inst, "a", false) && errored,
+              inst ? fmt("err=%s", inst->lastError.c_str())
+                   : std::string("<no instance>"));
+    }
+}
+
 // ============================================================ D 组（S3）
 // 事件与输入：脚本从"每帧跑一遍"变成"能响应"。
-
 // 取已编译的 Program（钩子表在里面）
 const ScriptProgram* progOf(ScriptRuntime& rt, const ScriptInstance* inst) {
     if (!inst) return nullptr;
@@ -2182,6 +2277,7 @@ int runScriptSelfTest() {
     testC17();
     testC18();
     testC19();
+    testC20();
     VK_LOG_INFO("--- S3 事件与输入 ---");
     testD0();
     testD1();

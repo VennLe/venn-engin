@@ -61,6 +61,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from capture_window import capture_client, find_window, user32  # noqa: E402
 from verify_add_menu import LogTap, kill_stale_editors  # noqa: E402
 
@@ -108,7 +109,7 @@ def run_once(exe, tag, extra_env, wait=WAIT_SEC):
     """
     shot = os.path.join(OUT_DIR, "outline_%s.png" % tag)
     if os.path.exists(shot):
-        os.remove(shot)
+        safe_remove(shot)
 
     proc = subprocess.Popen(
         [exe, "--title", TITLE, "--scene", SCENE],

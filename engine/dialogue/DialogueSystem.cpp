@@ -10,6 +10,7 @@
 
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace dialogue {
 
@@ -112,6 +113,18 @@ bool DialogueSystem::cue(scene::Scene& scene, ecs::Entity host,
     return true;
 }
 
+// ---------------------------------------------------------------- 语音钩子
+
+void DialogueSystem::setVoiceHooks(VoiceHooks h) {
+    m_voice = std::move(h);
+    ++m_voiceGen;
+    // cue 槽位是系统自己的成员，这里当场装好 —— `cue()` 会立刻 `start()`，
+    // 等不到下一次 tick。
+    m_cue.setVoiceHooks(m_voice);
+    // ⚠ 组件上的播放器**不在这里遍历**：本接口没有 `Scene&`，宿主调它时
+    //   场景可能还没建。改由 `tick()` 每帧对齐（见那里）。
+}
+
 // ---------------------------------------------------------------- 每帧
 
 void DialogueSystem::tick(scene::Scene& scene, float dt) {
@@ -122,6 +135,16 @@ void DialogueSystem::tick(scene::Scene& scene, float dt) {
     scene.world().each<ecs::DialogueComponent>(
         [&](ecs::Entity e, ecs::DialogueComponent& dc) {
             if (!dc.enabled || dc.dialoguePath.empty()) return;
+
+            // ---- 语音钩子对齐（D1）----
+            // ⚠ 位置是硬约束：**必须在下面的 `autoStart` 之前**。`start()`
+            //   当场就 `beginNodeVoice()` 起播第一句，装晚了这一句永远没声音，
+            //   而日志里一条错都没有。
+            // ⚠ 用代数判等而不是无条件 `setVoiceHooks`：`VoiceHooks` 里是两个
+            //   `std::function`，每次拷贝都可能分配 —— 400 fps × N 个组件
+            //   每秒上千次分配，纯属白烧。
+            if (dc.player.hookGen() != m_voiceGen)
+                dc.player.setVoiceHooks(m_voice);
 
             // ---- 路径被改过 → 换一份台词（并让 autoStart 重新起播）----
             // 不这么做的话，Inspector 里改完路径画面毫无变化，而日志里
@@ -250,6 +273,17 @@ Press DialogueSystem::pressAdvance(scene::Scene& scene) {
         case Press::NeedChoice:
             VK_LOG_INFO("DLG-PRESS need-choice id=%s n=%d src=%s",
                         p->currentId().c_str(), p->choiceCount(), src);
+            break;
+        // D1：正文出完了，但这句的语音还在播 —— 不放行。
+        // 单独打一条（不并进 `reveal`）：`voiceStalls` 会一直涨，
+        // 是"卡住"的唯一早期信号（钩子恒为 true 时对话停在这一页不动）。
+        case Press::WaitingVoice:
+            VK_LOG_INFO("DLG-PRESS waiting-voice id=%s wait=%.2f/%.2f "
+                        "stalls=%d src=%s",
+                        p->currentId().c_str(),
+                        static_cast<double>(p->voiceWait()),
+                        static_cast<double>(p->voiceWaitLimit()),
+                        p->voiceStalls(), src);
             break;
         case Press::Inactive:
             break;

@@ -1,0 +1,57 @@
+{
+  "_comment": "C5 夹具：实体 TRS 轨道的运行时消费者。Lift 从 (0,0,0) 匀速升到 (0,0,4)，2 秒一圈，autoplay=true。判据见 tools/verify_transform_clip.py C 组 —— 读 ANIMCLIP-TICK 的 pos.z 必须单调上升（而不是一直 0）。",
+  "version": 2,
+  "generator": "venn clip fixture (C5)",
+  "camera": {
+    "target": [0.0, 0.0, 1.0],
+    "yaw": 0.610865,
+    "pitch": 0.314159,
+    "distance": 16.0
+  },
+  "physics": {
+    "enabled": false,
+    "groundPlane": false,
+    "fixedTimeStep": 0.0166666675,
+    "maxSubSteps": 4
+  },
+  "entities": [
+    {
+      "name": "Lift",
+      "transform": {
+        "position": [0.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1,
+      "animClip": {
+        "duration": 2.0,
+        "loop": true,
+        "autoplay": true,
+        "time": 0.0,
+        "keys": [
+          {
+            "t": 0.0,
+            "pos": [0.0, 0.0, 0.0],
+            "rot": [0.0, 0.0, 0.0],
+            "scale": [1.0, 1.0, 1.0]
+          },
+          {
+            "t": 2.0,
+            "pos": [0.0, 0.0, 4.0],
+            "rot": [0.0, 0.0, 0.0],
+            "scale": [1.0, 1.0, 1.0]
+          }
+        ]
+      }
+    },
+    {
+      "name": "Static",
+      "transform": {
+        "position": [3.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "parent": -1
+    }
+  ]
+}

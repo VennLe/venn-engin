@@ -221,6 +221,16 @@ bool parseSequence(const std::string& text, const std::string& sourcePath,
                 }
             }
             sh.blendSeconds = std::max(0.0f, s.value("blend", 0.0f));
+            // 曲线关键字认不出时**保持默认（smooth）并记警告** —— 不要整份
+            // 资产加载失败：画面照样能播，只是形状不是作者想要的。而"静默
+            // 退回默认"是最难查的一类（文件里明明写着 easeout）。
+            const std::string curve = s.value("blendCurve", std::string());
+            if (!curve.empty() && !scene::blendCurveFromName(curve.c_str(),
+                                                             sh.blendCurve)) {
+                out.warnings.push_back(
+                    "shot #" + std::to_string(idx) + ": unknown blendCurve '" +
+                    curve + "' — using 'smooth'");
+            }
             sh.label = s.value("label", std::string());
             out.shots.push_back(std::move(sh));
             ++idx;
@@ -400,6 +410,11 @@ std::string toJson(const SequenceAsset& a) {
             // blend 只在非 0（非硬切）时写：硬切是默认语义，写 `"blend": 0.0`
             // 会让"这是一次硬切"看起来像"作者特意调成了 0"。
             if (s.blendSeconds > 0.0f) js["blend"] = s.blendSeconds;
+            // blendCurve 同理只在**非默认**（非 smooth）时写。老资产一条
+            // `blendCurve` 都不会多出来 —— 这是"写回不弄脏既有文件"那条
+            // 纪律的直接后果（与上面 `shots` 空数组不写同一个理由）。
+            if (s.blendCurve != scene::BlendCurve::Smooth)
+                js["blendCurve"] = scene::blendCurveName(s.blendCurve);
             if (!s.label.empty()) js["label"] = s.label;
             shots.push_back(std::move(js));
         }

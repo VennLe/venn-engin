@@ -4,6 +4,7 @@
 #include "core/RunMode.h"
 
 #include <algorithm>
+#include <string>   // present mode 可用列表拼串
 
 namespace rhi {
 
@@ -80,18 +81,59 @@ void Swapchain::create(uint32_t width, uint32_t height, VkSwapchainKHR old) {
     const bool wantVsync = core::vsyncEnabled();
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     if (!wantVsync) {
-        // 不锁的时候优先 MAILBOX（不撕裂的"尽快呈现"）；没有就退到 FIFO
-        // —— FIFO 是规范保证一定存在的模式，退过去只是变回锁帧，不会失败。
+        // 不锁的时候要真的"不锁"。三级优先：
+        //   ① MAILBOX    —— 不撕裂的"尽快呈现"，最好；
+        //   ② IMMEDIATE  —— 会撕裂，但**确实**不受刷新率约束；
+        //   ③ FIFO       —— 规范保证一定存在，但等于又锁上了。
+        //
+        // ⚠⚠ 2026-11-01 补的 ②：原来只试 MAILBOX，没有就一路退到 FIFO。
+        //   本机（Intel Iris Xe + 当前驱动）的 surface **不提供 MAILBOX**，
+        //   于是 `MYVK_VSYNC=0` 打出 `present mode = FIFO (vsync=0)` ——
+        //   开关"看着生效了"（日志里 vsync=0），实际帧率还是锁在 56 fps。
+        //   `verify_frame_pacing` 的 C 组（"不锁时应当跑满 >200 fps"）就是
+        //   这么红的，而且红了很久，因为**锁帧组和不锁组的数字几乎一样**，
+        //   看起来像"机器就这样"，其实是这一行少了一个分支。
+        bool hasMailbox = false, hasImmediate = false;
         for (auto m : modes) {
-            if (m == VK_PRESENT_MODE_MAILBOX_KHR) {
-                presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-                break;
+            if (m == VK_PRESENT_MODE_MAILBOX_KHR) hasMailbox = true;
+            else if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) hasImmediate = true;
+        }
+        if (hasMailbox) presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+        else if (hasImmediate) presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+    // ⚠ 必须打**真实**模式名 + 可用列表：原来那行是
+    //   `presentMode == FIFO ? "FIFO" : "MAILBOX"` 的二选一，一旦选了
+    //   IMMEDIATE 就会**谎报成 MAILBOX** —— 而这一行正是判据唯一的数据源。
+    {
+        std::string avail;
+        for (auto m : modes) {
+            if (!avail.empty()) avail += ",";
+            switch (m) {
+                case VK_PRESENT_MODE_IMMEDIATE_KHR:    avail += "IMMEDIATE"; break;
+                case VK_PRESENT_MODE_MAILBOX_KHR:      avail += "MAILBOX"; break;
+                case VK_PRESENT_MODE_FIFO_KHR:         avail += "FIFO"; break;
+                case VK_PRESENT_MODE_FIFO_RELAXED_KHR: avail += "FIFO_RELAXED"; break;
+                default:                               avail += "?"; break;
             }
         }
+        const char* chosen = "?";
+        switch (presentMode) {
+            case VK_PRESENT_MODE_IMMEDIATE_KHR: chosen = "IMMEDIATE"; break;
+            case VK_PRESENT_MODE_MAILBOX_KHR:   chosen = "MAILBOX"; break;
+            case VK_PRESENT_MODE_FIFO_KHR:      chosen = "FIFO"; break;
+            default: break;
+        }
+        VK_LOG_INFO("Swapchain present mode = %s (vsync=%d)",
+                    chosen, wantVsync ? 1 : 0);
+        // 不锁却还是 FIFO = 这台机器给不了非阻塞模式。**必须单独说一句**，
+        // 否则"vsync=0 但只有 56 fps"会被当成性能问题查很久。
+        if (!wantVsync && presentMode == VK_PRESENT_MODE_FIFO_KHR) {
+            VK_LOG_WARN("Swapchain 无法解除锁帧：surface 只提供 [%s]，"
+                        "没有 MAILBOX / IMMEDIATE → MYVK_VSYNC=0 无效",
+                        avail.c_str());
+        }
+        VK_LOG_INFO("Swapchain present modes available = [%s]", avail.c_str());
     }
-    VK_LOG_INFO("Swapchain present mode = %s (vsync=%d)",
-                presentMode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO" : "MAILBOX",
-                wantVsync ? 1 : 0);
 
     // ---- 图像数量：min + 1，不超上限 ----
     uint32_t imageCount = caps.minImageCount + 1;

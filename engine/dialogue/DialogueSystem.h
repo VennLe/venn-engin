@@ -71,6 +71,17 @@ class DialogueSystem {
     // **不动组件的纯数据**（路径 / cps 是作者写的）。
     void resetRuntime(scene::Scene& scene);
 
+    // ---- 语音（D1）----
+    // 宿主注入一次即可（`RuntimeApp::init` 里，`m_audio.init` 之后）。
+    // ⚠ 必须在**任何 `start()` 之前**装：`DialoguePlayer::start()` 当场就
+    //   `beginNodeVoice()` 起播第一句，装晚了第一句永远没声音，而日志里
+    //   一条错都没有（只有 `DLG-VOICE` 缺失）。
+    // ⚠ 本接口**不带 `Scene&`** —— 宿主调它时场景可能还没建。组件上的播放器
+    //   由 `tick()` 每帧对齐（靠 `DialoguePlayer::hookGen()` 判等，O(1)）。
+    // 传空 `VoiceHooks{}` = 关掉语音（老行为逐位不变）。
+    void setVoiceHooks(VoiceHooks h);
+    const VoiceHooks& voiceHooks() const { return m_voice; }
+
     void setTrace(bool on) { m_trace = on; }
 
   private:
@@ -82,6 +93,11 @@ class DialogueSystem {
     DialoguePlayer m_cue;
     float m_cueCps = 30.0f;
     ecs::Entity m_cueHost{};
+
+    // 语音钩子（D1）。`m_voiceGen` 随每次 `setVoiceHooks` +1，
+    // 组件上的播放器靠 `hookGen()` 与之比对决定要不要重装。
+    VoiceHooks m_voice;
+    unsigned m_voiceGen = 0;
 
     ecs::Entity m_active{};
     int m_lastRunning = 0;

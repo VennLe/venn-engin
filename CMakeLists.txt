@@ -944,6 +944,11 @@ function(myvk_copy_runtime_assets target)
             # C2（2026-10-26）：对话资产（`.dlg.json`）。写台词是**最高频**的
             # 迭代动作（改一个字就要看效果），必须每次都拷。
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/dialogues|assets/dialogues"
+            # B6（2026-11-01）：表情预设（`.expr.json`）。美术调一次"微笑"的
+            # 权重比例要立刻在脸上看到，所以同属"每次都拷"这一档。
+            # ⚠ 漏了这一行 = 编辑器里下拉永远是空的，而且 `EXPR-LOAD-FAIL`
+            #   报的是 build/bin 下的绝对路径 —— 症状看起来像"资产格式写错了"。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/expressions|assets/expressions"
         )
         set(always_asset_cmds "")
         foreach(item IN LISTS VENN_ALWAYS_ASSET_DIRS)

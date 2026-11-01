@@ -41,6 +41,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from prereq import skip_if_external_missing              # noqa: E402
+from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与下方 verify_* 导入同一批）
 from verify_add_menu import LogTap, kill_stale_editors          # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -325,7 +327,7 @@ def case_d(tmp, picked):
     pb = os.path.join(BIN, RIG_B)
     for p in (pa, pb):
         if os.path.exists(p):
-            os.remove(p)
+            safe_remove(p)
 
     run_editor("list;save:%s" % RIG_A)
     run_editor("list;roll:%d:33.75;save:%s;dump" % (i, RIG_B))
@@ -376,7 +378,7 @@ def case_d(tmp, picked):
     if "--keep" not in sys.argv:
         for p in (pa, pb):
             try:
-                os.remove(p)
+                safe_remove(p)
             except OSError:
                 pass
 
@@ -525,9 +527,12 @@ def main():
     ap.add_argument("--keep", action="store_true", help="保留日志与产物")
     args = ap.parse_args()
     only = args.only.strip().lower()
+    # 前置：模型贴图是外部绝对路径，资产根缺失时整片红得没道理。
+    # 见 tools/prereq.py 的说明。
+    skip_if_external_missing(MODEL)
 
     if os.path.isdir(OUT_DIR) and not args.keep:
-        shutil.rmtree(OUT_DIR, ignore_errors=True)
+        safe_rmtree(OUT_DIR)
     os.makedirs(OUT_DIR, exist_ok=True)
     kill_stale_editors()
 

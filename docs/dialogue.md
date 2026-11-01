@@ -85,6 +85,7 @@
 | `text` | ✅ | 台词本体，可以含 `\n` 换行（字幕框按行数长高） |
 | `next` | ⬜ | 说完去哪。**空 = 这一段结束** |
 | `choices` | ⬜ | 有它就是分支节点；**此时不能再写 `next`**（加载判错） |
+| `voice` | ⬜ | 这句的语音（音频路径）。**空 = 没有语音**（老资产原样有效） |
 
 ### 四条"看起来能省、省了就错"的语义
 
@@ -94,6 +95,35 @@
 | ② | `goto` / `next` 指向不存在的 id = **整份加载失败** | 留到运行期查的症状是"前 20 句都好，第 21 句突然没了" —— 作者得重播整段才复现 |
 | ③ | **有选项时 `advance()` 一步都不走** | 写成"可以继续"的话，玩家看到的是"选项闪现一下然后自动选了第一个" |
 | ④ | 打字机 `cps <= 0` = **立刻全出**，不是"永远不显示" | `floor(elapsed × 0)` 恒为 0 → 字幕永远是空的，而日志里一切正常 |
+
+### 语音（`voice`）—— D1，2026-10-31
+
+```json
+{ "id": "l1", "speaker": "千夏", "text": "……又是这个梦。",
+  "voice": "audio/voice/ch01_01.ogg", "next": "l2" }
+```
+
+| 语义 | 说明 |
+|---|---|
+| 什么时候起播 | 进入这个节点时（`start` / `next` / `goto` / `choose` 都算），由 `DialoguePlayer::beginNodeVoice()` 起 |
+| 什么时候挡 | **正文全出之后**、翻页之前。补字那一下**不挡**（玩家想跳字必须能跳） |
+| 挡多久 | `max(3.0, 字数 × 0.35)` 秒。到点无条件放行 |
+| 谁提供"播完了吗" | 宿主注入的 `VoiceHooks`（`RuntimeApp` 里接 `AudioSystem::playVoice` / `voicePlaying`） |
+| 起播失败 / 没装钩子 | **不设门**，退化成老行为 —— 无声卡机器上每句白等 3 秒才是灾难 |
+
+⚠⚠ **超时兜底不是可选项**：`playing()` 是宿主给的，"恒为 true"（音频线程挂了 /
+声部漏标 active / 素材误配成 10 分钟 BGM）会让对话**永久卡死在一页**，而日志里
+一条错都没有。`voiceStalls` 会一直涨 —— 那是唯一的早期信号。
+
+⚠ **按总线统计，不是全局声部数**：后台循环音乐会让"这一句播完了吗"永远为真。
+判据在 `MixStats::busVoices[]`（`Mixer::activeVoicesOnBus(BusId::Voice)`）。
+
+⚠ **120 ms 宽限期**：`playVoice()` 之后约一个 mix block 内音频线程还没标 active，
+直接查会得 0 → 宿主会在第一帧就判"播完了"。这是 `AudioSystem::voicePlaying()`
+里 `kVoiceGraceMs` 的全部理由。
+
+⚠ 编辑器**不 tick 对话系统**（`editor/DialogueEditorWindow.h` ⑤），所以钩子只在
+`RuntimeApp` 注入一处。别在编辑器里找 `DLG-VOICE`。
 
 ---
 
@@ -194,6 +224,7 @@ Inspector → Tool → **Dialogue**，或直接写场景 JSON 的 `dialogue` 块
 DLG-ASSET  name= lines= start= warns=
 DLG-START  asset= path= node= cps= host= src=cue|component
 DLG-LINE   id= speaker= chars= shown= choices= asset= src=
+DLG-KEY    id= atChoice= focus=                     ← 空格**送到了**运行时
 DLG-PRESS  reveal id= chars=shown/total src=        ← 打字中按了一下，补完了
 DLG-PRESS  need-choice id= n= src=                  ← 见下方说明，运行时不可达
 DLG-CHOICE i= id= asset=
@@ -213,6 +244,13 @@ SUB-TYPE   id= shown= total=                        ← 每 30 帧；两个数�
 > 时被调 —— 那时要么不在选项节点，要么正文没出完，两条路都只可能返回
 > `Revealed` / `Moved`。这个返回值留给外部直接调 API 的调用方，数值侧
 > `player_q1_needchoice` 覆盖它。
+>
+> **`DLG-KEY` 和 `DLG-PRESS` 是两件事，别混**：前者证明"这一下空格**真的
+> 进引擎了**"，后者证明"进来了并且状态允许补完/翻页/选定"。分开的理由是
+> **合成按键会静默丢失**（两对 down/up 挤进同一轮 `glfwPollEvents`，帧边界
+> 净变化为 0 → `wasPressed` 从不为真），所以"Python 发了 6 下"和"对话收到
+> 几下"之间**没有一一对应关系**。排查"按了没反应"时先看有没有 `DLG-KEY`：
+> 有 → 问题在状态机；没有 → 问题在输入层（窗口句柄 / `hold` 太短 / 两发太密）。
 
 ---
 
@@ -226,6 +264,9 @@ SUB-TYPE   id= shown= total=                        ← 每 30 帧；两个数�
 python tools/verify_dialogue.py
 python tools/verify_dialogue.py --skip-keys   # 只跑自动推进那一组
 python tools/verify_dialogue.py --skip-auto   # 只跑按键那一组
+
+# 语音（D1）：30 条，约 30 秒（D 组要真跑满 7 秒）
+python tools/verify_dialogue_voice.py
 ```
 
 端到端分两个用例：
@@ -243,7 +284,8 @@ python tools/verify_dialogue.py --skip-auto   # 只跑按键那一组
 |---|---|
 | 文本里插变量 `{player}` | ✗ 需要黑板 / 存档，`DialogueAsset` 明确不做 |
 | 条件分支（按 flag 走线） | ✗ 同上，要等任务标记 |
-| 立绘 / 表情 / 语音 | ✗ 资产里没这些字段（加了没人消费 = 永远为空的必填项） |
+| 立绘 / 表情 | ✗ 资产里没这些字段（加了没人消费 = 永远为空的必填项） |
+| 语音 | ✅ **D1（2026-10-31）**：`voice` 字段 + 播完再翻页。见 §2 语音小节 |
 | 对话历史回看 | ✗ 只保留"当前这一句" |
 | 多人同时说话 / 旁白分栏 | ✗ 只有一个字幕框 |
 | 跳过整段（Fast-forward） | ✗ 只能一句一句按 |

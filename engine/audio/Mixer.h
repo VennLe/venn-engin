@@ -131,6 +131,17 @@ struct MixStats {
     float musicGain = 1.0f; // ducking 之后 Music 总线实际增益（dB 断言用）
     std::uint64_t underruns = 0;
     std::uint64_t stolen = 0;
+    // 每个总线各自的活跃声部数（D1，2026-10-31）。
+    // 为什么不能只给全局 `voices`：语音那一路的唯一问题是"**这一句**播完了吗"。
+    // 全局计数里还有音乐 / 音效，永远是正的 —— 拿它当判据等于没判。
+    int busVoices[kBusCount] = {};
+    // 每个总线各自的 **RMS 电平**（B6 口型驱动，2026-11-01）。
+    // 为什么要按总线而不是只用上面的全局 `rms`：口型要跟的是"这一句台词
+    // 有多响"，而全局 RMS 里混着 BGM 与音效 —— 一句轻声台词配一段响 BGM，
+    // 全局 RMS 照样很大，嘴会一直张着。
+    // ⚠ 与 `busVoices` 同一条滞后：快照最多差一个 block（≈10 ms）。
+    //   对嘴型无所谓（人眼分辨不了 10 ms），对"精确到采样点"的需求不够。
+    float busRms[kBusCount] = {};
 };
 
 class Mixer {
@@ -187,6 +198,18 @@ public:
 
     // 当前活跃声部（音频线程写、主线程读的镜像；仅用于日志/断言）
     int activeVoices() const { return m_statVoices.load(std::memory_order_relaxed); }
+    // 某个总线上还有几路在播（D1）。`bus` 越界 → 0。
+    // ⚠ 快照最多滞后一个 block（≈10 ms）。判"这一句播完了吗"足够；
+    //   判"第 1.000 秒采样点"不够 —— 那种需求得看 `pos`。
+    int activeVoicesOnBus(int bus) const {
+        if (bus < 0 || bus >= kBusCount) return 0;
+        return m_statBusVoices[bus].load(std::memory_order_relaxed);
+    }
+    // 某个总线上一块的 RMS 电平（0..1 量级，B6 口型用）。越界 → 0。
+    float busLevel(int bus) const {
+        if (bus < 0 || bus >= kBusCount) return 0.0f;
+        return m_statBusRms[bus].load(std::memory_order_relaxed);
+    }
 
 private:
     struct Voice {
@@ -258,6 +281,10 @@ private:
     std::vector<float> m_dryBuf;
 
     std::atomic<int> m_statVoices{0};
+    std::atomic<int> m_statBusVoices[kBusCount];
+    // 每总线 RMS（B6）。⚠ 必须与 `m_statBusVoices` 同批更新 —— 只更新
+    // 声部数不更新电平时，"播完了但电平还停在上一次的值"会让嘴一直张着。
+    std::atomic<float> m_statBusRms[kBusCount];
     std::atomic<float> m_statRms{0.0f};
     std::atomic<float> m_statPeak{0.0f};
     std::atomic<float> m_statMusicGain{1.0f};

@@ -364,6 +364,11 @@ private:
     // 写法，直接在组件字符串上 EditText 会让"输入到一半"被每帧覆盖）
     ecs::Entity m_seqPathBufFor{};
     char m_seqPathBuf[192] = {};
+    // B6 表情：预设资产路径的编辑缓冲。与 m_seqPathBuf 同一纪律 ——
+    // 直接在组件字符串上 EditText，第二帧就被组件里的旧值覆盖回去
+    // （打一个字消失一个）。
+    ecs::Entity m_exprPathBufFor{};
+    char m_exprPathBuf[192] = {};
     // C2 对话：两个输入框（资产路径 / 起始节点 id）的编辑缓冲。
     // 与 m_seqPathBuf 同一纪律：按实体懒同步，不直接 EditText 组件字符串。
     ecs::Entity m_dlgBufFor{};

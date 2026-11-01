@@ -25,6 +25,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from prereq import skip_if_external_missing              # noqa: E402
 from capture_window import capture_client, find_window, user32        # noqa: E402
 from verify_add_menu import (LogTap, click, kill_stale_editors,
                              open_menu_and_click, region_diff,
@@ -124,6 +125,8 @@ def main():
     ap.add_argument("--no-model", action="store_true",
                     help="不自动绑定模型（只测窗口打开）")
     args = ap.parse_args()
+    # 前置：默认模型贴图是外部绝对路径（见 tools/prereq.py）。
+    skip_if_external_missing(args.model)
 
     os.makedirs(OUT_DIR, exist_ok=True)
     fails = []
