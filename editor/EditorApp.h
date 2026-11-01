@@ -88,6 +88,7 @@ class PhysicsPanel;
 class CinematographyPanel;
 class ParticlesPanel;
 class QualitySettingsPanel;   // E26
+class EnvironmentPanel;       // 2026-11-01：Sky & Atmosphere
 class MaterialLibraryPanel;   // 2026-10-24：材质仓库
 class DialogueEditorWindow;   // 2026-10-27：剧本编辑器（#310）
 class TimelineEditorWindow;   // 2026-10-27：时间轴轨道编辑器（#311）
@@ -97,6 +98,8 @@ class DopeSheetWindow;        // 2026-10-28（R8）：动画摄影表（Dope She
 class BoneCurvePanel;         // 2026-10-29（S-D）：骨骼曲线编辑器
 class NlaPanel;               // 2026-10-29（R9）：NLA 时间轴
 class SaveSlotsPanel;         // 2026-10-31（G17-3 尾巴）：存档槽位面板
+class AnimatorGraphPanel;     // 2026-11-01：动画状态机图编辑器
+class CharacterStudioPanel;   // 2026-11-01：角色制作流程壳
 class LandscapeEditor;        // 2026-10-20：地形编辑模式
 class FoliageEditor;          // 2026-10-20：植被编辑模式
 // 2026-10-20 晚：下拉里其余 6 个模式（ToolkitEditors.h / .cpp）
@@ -247,6 +250,13 @@ private:
     static void panelDrawNla(EditorApp& a);
     // 存档槽位（G17-3 尾巴）：同构，draw 在 SaveSlotsPanel 里。
     static void panelDrawSaveSlots(EditorApp& a);
+    // 2026-11-01：Sky & Atmosphere（天空 / 云 / 星空）。
+    // 与 Quality / Physics 同款：浮动窗口、无快捷键、偶尔打开一次就要看全。
+    static void panelDrawEnvironment(EditorApp& a);
+    // 2026-11-01：动画状态机图编辑器（`.anim.json` 的唯一 GUI 入口）。
+    static void panelDrawAnimGraph(EditorApp& a);
+    // 2026-11-01：角色流程壳（步骤条 + 各步状态 + 就地跳转）。
+    static void panelDrawCharacterStudio(EditorApp& a);
 
     // 表驱动派发：遍历表，画所有"开着 + 该画"的面板
     void drawPanels();
@@ -587,6 +597,12 @@ private:
     std::unique_ptr<PhysicsPanel> m_physicsPanel;
     std::unique_ptr<ParticlesPanel> m_particlesPanel;
     std::unique_ptr<QualitySettingsPanel> m_qualityPanel;   // E26
+    // 2026-11-01：天空 / 云 / 星空。构造无副作用，draw 时才读 Renderer。
+    std::unique_ptr<EnvironmentPanel> m_envPanel;
+    // 2026-11-01：状态机图编辑器。构造无副作用（不读盘）——
+    // 只有 `open(路径)` 才会触发一次加载。
+    std::unique_ptr<AnimatorGraphPanel> m_animGraph;
+    std::unique_ptr<CharacterStudioPanel> m_charStudio;
     // 2026-10-31（G17-3 尾巴）：存档槽位面板。只拿 EditorContext。
     std::unique_ptr<SaveSlotsPanel> m_saveSlotsPanel;
     // 2026-10-30：运镜面板。只拿 EditorContext（与 PhysicsPanel 同一条纪律）。

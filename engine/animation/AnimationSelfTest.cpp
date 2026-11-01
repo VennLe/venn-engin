@@ -5,6 +5,7 @@
 #include "animation/AnimationSelfTest.h"
 
 #include "animation/AnimatorSystem.h"
+#include "animation/AnimController.h"
 #include "animation/AnimEvent.h"
 #include "animation/ClipEdit.h"
 #include "animation/Constraint.h"
@@ -5473,6 +5474,110 @@ int runAnimationSelfTest() {
         report("rest_cache_invalidate",
                static_cast<double>(p.translation[1].x), 9.0, 0.0);
         reportFlag("rest_cache_refilled", sk.joints[1].restTRSReady);
+    }
+
+    // ---- 状态机序列化往返（2026-11-01，配 editor/AnimatorGraphPanel）----
+    //
+    // 图编辑器是"读文件 → 改内存 → 写回文件"，所以这条链的**唯一**正确性
+    // 判据是往返：`parse(serialize(x))` 必须与 `x` 逐字段相同，且再序列化
+    // 一次要**逐字节**相同（幂等）。
+    //
+    // 只验"能 parse"是不够的：一个把 `restart:false` 写成 `restart:true`
+    // 的 serialize 照样 parse 得通，只是用户的相位连续设置在保存那一下
+    // 被静默改掉了 —— 而这种 bug 只有在"改一下、存一下、看行为变了"
+    // 的时候才会被发现，测试里必须当场抓住。
+    {
+        const char* kSrc = R"({
+  "version": 1,
+  "defaultState": "Idle",
+  "parameters": [
+    { "name": "Speed",    "type": "float", "default": 0.0 },
+    { "name": "Grounded", "type": "bool",  "default": true },
+    { "name": "Jump",     "type": "trigger" }
+  ],
+  "states": [
+    { "name": "Idle", "clip": "Idle", "speed": 1.0, "loop": true },
+    { "name": "Walk", "clip": "Walk", "speed": 1.25, "loop": true },
+    { "name": "Jump", "clip": "Jump", "speed": 1.0, "loop": false }
+  ],
+  "transitions": [
+    { "from": "Any",  "to": "Jump", "duration": 0.1,
+      "conditions": [ { "param": "Jump", "op": "trigger" } ] },
+    { "from": "Jump", "to": "Idle", "duration": 0.15, "hasExitTime": true,
+      "exitTime": 0.8, "restart": false,
+      "conditions": [ { "param": "Grounded", "op": "==", "value": true },
+                      { "param": "Speed",    "op": "<",  "value": 0.15 } ] }
+  ]
+})";
+        auto a = parseAnimController(kSrc);
+        reportFlag("ctl_parse", a->error.empty(), a->error);
+
+        if (a->error.empty()) {
+            // 给两个节点写上坐标，验证 `editor.nodes` 也能往返。
+            a->nodePos = {{-120.0f, 0.0f}, {120.0f, 0.0f}, {0.0f, 160.0f}};
+
+            const std::string t1 = serializeAnimController(*a);
+            auto b = parseAnimController(t1);
+            reportFlag("ctl_roundtrip_parse", b->error.empty(), b->error);
+
+            bool same = b->error.empty() &&
+                        b->states.size() == a->states.size() &&
+                        b->transitions.size() == a->transitions.size() &&
+                        b->params.size() == a->params.size() &&
+                        b->defaultState == a->defaultState;
+            if (same) {
+                for (size_t i = 0; i < a->states.size(); ++i) {
+                    const auto& s = a->states[i];
+                    const auto& d = b->states[i];
+                    if (s.name != d.name || s.clip != d.clip ||
+                        std::abs(s.speed - d.speed) > 1e-5f ||
+                        s.loop != d.loop)
+                        same = false;
+                }
+                for (size_t i = 0; i < a->transitions.size(); ++i) {
+                    const auto& t = a->transitions[i];
+                    const auto& u = b->transitions[i];
+                    if (t.from != u.from || t.to != u.to ||
+                        std::abs(t.duration - u.duration) > 1e-5f ||
+                        t.hasExitTime != u.hasExitTime ||
+                        std::abs(t.exitTime - u.exitTime) > 1e-5f ||
+                        t.restart != u.restart ||
+                        t.conditions.size() != u.conditions.size())
+                        same = false;
+                }
+                // 参数类型与默认值
+                for (size_t i = 0; i < a->params.size(); ++i) {
+                    const auto& p = a->params[i];
+                    const auto& q = b->params[i];
+                    if (p.name != q.name || p.type != q.type ||
+                        std::abs(p.defaultValue - q.defaultValue) > 1e-5f)
+                        same = false;
+                }
+                // 画布坐标
+                if (b->nodePos.size() == a->nodePos.size()) {
+                    for (size_t i = 0; i < a->nodePos.size(); ++i) {
+                        if (std::abs(b->nodePos[i][0] - a->nodePos[i][0]) >
+                                1e-3f ||
+                            std::abs(b->nodePos[i][1] - a->nodePos[i][1]) >
+                                1e-3f)
+                            same = false;
+                    }
+                } else {
+                    same = false;
+                }
+            }
+            reportFlag("ctl_roundtrip_fields", same);
+
+            // 幂等：第二次序列化必须与第一次逐字节相同。
+            // 它抓的是"写出去的东西自己都读不全"这类不对称 ——
+            // 比如某个字段只写不读，第二次写就会带上默认值。
+            const std::string t2 = serializeAnimController(*b);
+            reportFlag("ctl_serialize_idempotent", t1 == t2,
+                       t1 == t2 ? std::string()
+                                : std::string("bytes differ: ") +
+                                      std::to_string(t1.size()) + " vs " +
+                                      std::to_string(t2.size()));
+        }
     }
 
     const int failures = g_fail;

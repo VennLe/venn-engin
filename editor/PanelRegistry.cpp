@@ -36,10 +36,27 @@ void ensureInit() {
 
 } // namespace
 
-// 表里的面板数夹到状态数组容量（表加了条目但忘了抬 kMaxPanels 时兜底）
+// 表里的面板数夹到状态数组容量。
+//
+// ⚠ 这个"兜底"本身是个陷阱：它让**超出上限**表现为"最后几个面板
+//   静默不显示"，而不是崩溃或报错。夹断是真的会发生的（2026-11-01
+//   加了第 35 条面板），所以这里把话说出来 —— 一次进程只会打一次，
+//   但日志里能看见，就不必靠"新面板怎么不出现"去反推。
 static int panelCountImpl() {
     const int n = panelCount();
-    return n < kMaxPanels ? n : kMaxPanels;
+    if (n > kMaxPanels) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            // 这里不能 include Logger 之外的东西（本文件是"无依赖"的
+            // 注册表），Logger 已经在用了，直接打。
+            VK_LOG_ERROR("PANEL-OVERFLOW count=%d capacity=%d — %d 个面板"
+                         "的状态位丢失（抬 PanelRegistry.h 的 kMaxPanels）",
+                         n, kMaxPanels, n - kMaxPanels);
+        }
+        return kMaxPanels;
+    }
+    return n;
 }
 
 bool* panelOpenSlot(int index) {

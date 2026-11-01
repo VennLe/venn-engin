@@ -42,6 +42,9 @@
 #include "CinematographyPanel.h"
 #include "PhysicsPanel.h"
 #include "QualitySettingsPanel.h"
+#include "EnvironmentPanel.h"
+#include "AnimatorGraphPanel.h"
+#include "CharacterStudioPanel.h"
 #include "SaveSlotsPanel.h"
 #include "MaterialLibraryPanel.h"
 #include "SceneHierarchy.h"
@@ -475,6 +478,24 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         //   否则底栏托盘的最小化 / 置顶按 id 找不到这个窗口。
         {"save", "Save slots", PanelGroup::Authoring, "", "disk", false, true,
          kSlotNone, &EditorApp::panelDrawSaveSlots},
+        // 2026-11-01：Sky & Atmosphere（天空 / 云 / 星空）。
+        // 归 Authoring（"调参类"），浮动窗口、无快捷键 —— 与 Physics /
+        // Particles / Quality 同款：偶尔打开一次，一开就要看全。
+        // 它作用于 Renderer 的 Environment（**不是**选中实体），所以
+        // 不需要任何选中上下文，空场景里也能调。
+        {"environment", "Sky & Atmosphere", PanelGroup::Authoring, "", "sun",
+         false, true, kSlotNone, &EditorApp::panelDrawEnvironment},
+        // 2026-11-01：动画状态机图编辑器。它是 `.anim.json` 的**唯一 GUI
+        // 入口** —— 在这之前只能在 Inspector 里手填一个路径，然后去文本
+        // 编辑器改文件。归 Authoring、浮动、无快捷键（同 Physics/Quality：
+        // 一开就要看全的一张图，不该占 Alt+N）。
+        {"animgraph", "State machine", PanelGroup::Authoring, "", "nodes",
+         false, true, kSlotNone, &EditorApp::panelDrawAnimGraph},
+        // 2026-11-01：角色制作流程壳。把散在七个窗口里的动画/角色步骤
+        // 串成一条从上到下的流程，并内嵌状态机编辑器。它**不替代**任何
+        // 已有窗口 —— 每一步都指回原来那个。
+        {"charstudio", "Character Studio", PanelGroup::Authoring, "", "user",
+         false, true, kSlotNone, &EditorApp::panelDrawCharacterStudio},
     };
 }
 
@@ -551,6 +572,46 @@ void EditorApp::panelDrawSaveSlots(EditorApp& a) {
 // 于是它可以在没有设备的情况下被构造 —— 与 Physics/Particles 的差别仅此。
 void EditorApp::panelDrawQuality(EditorApp& a) {
     if (a.m_qualityPanel) a.m_qualityPanel->draw();
+}
+// 2026-11-01：天空面板。它需要 Renderer（读/写 SkyParams），
+// 所以走 a.renderer() 而不是像 Quality 那样读全局特性表。
+void EditorApp::panelDrawEnvironment(EditorApp& a) {
+    if (!a.m_envPanel) return;
+    // 真值是场景里那份（天气随场景序列化）；Renderer 只负责消费。
+    a.m_envPanel->draw(a.m_ctx->editorScene().environment(), a.renderer());
+}
+// 2026-11-01：状态机编辑器。它自己管 open/close（还要带一个资产路径），
+// 表项只做"显隐 + 落盘"——与 dialogueed / timelineed 同款。
+void EditorApp::panelDrawAnimGraph(EditorApp& a) {
+    if (!a.m_animGraph) return;
+    // 表项的显隐位与窗口对象的 `m_open` 是两份状态（这是本仓库里资产
+    // 编辑器窗口的既有约定）。表项刚被点开时对象还闭着，于是这里要
+    // 补一次"首次打开"：路径优先跟随选中角色挂的那份控制器，
+    // 没有就落到仓库里唯一那支 humanoid —— 空图编辑器什么都教不会人。
+    if (!a.m_animGraph->isOpen()) {
+        std::string p;
+        const ecs::Entity sel = a.m_ctx->selection();
+        ecs::World& w = a.m_ctx->editorScene().world();
+        if (sel.valid() && w.alive(sel)) {
+            if (const auto* an = w.get<ecs::AnimatorComponent>(sel))
+                p = an->controllerPath;
+        }
+        if (p.empty()) p = "animators/humanoid.anim.json";
+        a.m_animGraph->open(p);
+        VK_LOG_INFO("PANEL animgraph open=1 path=%s", p.c_str());
+    }
+    a.m_animGraph->draw(*a.m_ctx);
+}
+
+// 2026-11-01：角色流程壳。它每帧从场景现算每一步的状态，不缓存 ——
+// 见 CharacterStudioPanel.h 第 ② 条。
+void EditorApp::panelDrawCharacterStudio(EditorApp& a) {
+    if (!a.m_charStudio) return;
+    if (!a.m_charStudio->isOpen()) {
+        a.m_charStudio->setOpen(true);
+        VK_LOG_INFO("PANEL charstudio open=1");
+    }
+    a.m_charStudio->draw();
 }
 void EditorApp::panelDrawCinematography(EditorApp& a) {
     if (a.m_cinePanel) a.m_cinePanel->draw();
@@ -1429,6 +1490,15 @@ void EditorApp::onInit() {
     // E26：画质档位面板。构造无副作用（不碰设备），参数走 FeatureRegistry ——
     // 与启动器写进 `config/render.json` 的是同一份表（QualityPresets）。
     m_qualityPanel = std::make_unique<editor::QualitySettingsPanel>();
+    // 2026-11-01：天空面板。构造完全无副作用（一个字节都不读），
+    // 真正的读写都发生在 draw 里 —— 面板没打开就不会碰 Renderer。
+    m_envPanel = std::make_unique<editor::EnvironmentPanel>();
+    // 2026-11-01：状态机图编辑器。构造零 IO —— 只有 `open()` 才读盘。
+    m_animGraph = std::make_unique<editor::AnimatorGraphPanel>();
+    // 流程壳持有**同一个** `m_animGraph`，不是另一个实例：内嵌的状态机
+    // 与独立打开的那张必须是同一份未保存改动，否则改一半去别处看是旧版本。
+    m_charStudio =
+        std::make_unique<editor::CharacterStudioPanel>(*m_ctx, *m_animGraph);
     // 2026-10-31（G17-3 尾巴）：存档槽位面板。构造无副作用 —— 它一个字节
     // 都不读盘，`listSaveSlots()` 只在 draw 时调（面板没打开就零 IO）。
     m_saveSlotsPanel = std::make_unique<editor::SaveSlotsPanel>(*m_ctx);
@@ -1587,6 +1657,7 @@ void EditorApp::onInit() {
         logPanelStates();
     }
 
+
     // 启动场景 = **一张白纸**：一块不透明地面 + 一盏方向光 + 一个默认机位。
     // 这里以前会搭出一整套内置演示内容，2026-10-09 按用户要求连同独立的
     // Sandbox 示例程序一起删掉了 —— venn 启动不再加载任何样例。
@@ -1607,6 +1678,13 @@ void EditorApp::onInit() {
     //       自动化截图的像素断言需要"同一配置两次运行背景逐像素相同"，而
     //       叠加层里的 FPS / 帧时间每次都不同，会在背景上留下几阶噪声。
     if (std::getenv("MYVK_EDITOR_NO_HUD")) m_viewport->setHudVisible(false);
+    //   MYVK_EDITOR_NO_GRID=1    关掉视口地面栅格（截图比像素时需要）。
+    //       栅格是**编辑器叠加层**，不属于场景：它盖在草地上，做"这张图里
+    //       草地是什么颜色"这类断言时会把整片地染成网格线。
+    //       与 NO_HUD 分开是因为两者用途不同：NO_HUD 去掉的是会浮动的
+    //       数字（FPS），NO_GRID 去掉的是不浮动的几何 —— 有些用例需要
+    //       保留几何参照，只关数字。
+    if (std::getenv("MYVK_EDITOR_NO_GRID")) m_ctx->showGridRef() = false;
     // 场景来源的优先级：显式 `MYVK_EDITOR_SCENE` > 工程的 `venn.project.json`
     // 里声明的 `startScene`（启动器拉起时很常见：它只传工程根）。
     // ⚠ 别把工程的 startScene **写回环境变量** —— 那是"改自己的环境去当
@@ -1635,6 +1713,36 @@ void EditorApp::onInit() {
                             "a new document at that path)",
                             envScene, r.error.c_str());
             }
+        }
+    }
+    // ---- 没有任何显式场景时：打开默认的二次元小镇 ----
+    //
+    // 2026-11-01（用户要求"游戏初始化打开的场景要改成完整的二次元风格"）：
+    // 在这之前，不设 `MYVK_EDITOR_SCENE`、也没有工程 startScene 时，
+    // 编辑器停在 `resetToEmptyScene()` 的"一张白纸"上 —— 一块地面加一盏
+    // 方向光。新用户的第一眼是纯粹的灰，与这个引擎"二次元 3D"的定位
+    // 毫无关系。
+    //
+    // 现在默认打开 `assets/scenes/anime_town.json`（由
+    // `tools/make_anime_town.py` 生成）：蓝天白云 + 草地小路 + 十二栋
+    // 错落的房子。**找不到文件就静默退回白纸** —— 模板工程 / 精简包
+    // 里可能没有这张图，那不是错误。
+    //
+    // ⚠ 只有"完全没指定"才走这里。显式 `MYVK_EDITOR_SCENE` 或工程的
+    //   `startScene` 优先级更高，所以 100+ 条自动化用例的行为不受影响。
+    if (!envScene || envScene[0] == '\0') {
+        static const char* kDefaultScene = "assets/scenes/anime_town.json";
+        const std::string abs = assets::resolveAssetPath(kDefaultScene);
+        const scene::SceneIoResult r =
+            scene::loadScene(m_ctx->editorScene(), am, abs);
+        if (r.ok) {
+            m_ctx->scenePath() = kDefaultScene;
+            m_ctx->onSceneReplaced();
+            VK_LOG_INFO("Editor: opened default scene '%s' (%zu entities)",
+                        kDefaultScene, m_ctx->editorScene().objectCount());
+        } else {
+            VK_LOG_INFO("Editor: no default scene (%s) — starting on a blank "
+                        "document", r.error.c_str());
         }
     }
     // H2：上次是不是没走到正常关闭（同目录留着一份 `.autosave.json`）。
@@ -2063,8 +2171,37 @@ void EditorApp::onInit() {
     }
 }
 
-void EditorApp::onUpdate(float dt) {
-    if (m_ctx->quitRequested()) {
+// 天空的"调试覆盖"是不是来自环境变量。
+//
+// `Renderer::createEnvironment()` 在启动时读一次 `MYVK_SKY_PRESET` /
+// `MYVK_SKY_*`，而下面每帧还会把**场景**里的天色推给渲染器 —— 两者相撞时
+// 必须让环境变量赢。
+//
+// 2026-11-01 踩过：`verify_ibl` 的红蓝因果实验里，`ENV-READBACK` 明明读出
+// `up=(1.0000,0.0000,0.0000)` 的纯红（IBL 用的就是这份），画面上却是一片
+// 灰白 —— 因为背景每帧都被场景里的默认天色盖回去了。当时的第一反应是
+// "shader 没读到 push constant"，白查了一轮。
+//
+// 判据用"这类变量里有没有任何一个被设置"，而不是逐个比对值：值可以恰好
+// 等于默认值，那时"没生效"与"生效了但值相同"无法区分，也不值得区分。
+namespace {
+
+bool skyEnvOverridePresent() {
+    static const char* kNames[] = {
+        "MYVK_SKY_PRESET",  "MYVK_SKY_ZENITH",   "MYVK_SKY_HORIZON",
+        "MYVK_SKY_GROUND",  "MYVK_SKY_CLOUD",    "MYVK_SKY_CLOUD_SCALE",
+        "MYVK_SKY_CLOUD_COLOR", "MYVK_SKY_STAR", "MYVK_SKY_SUN",
+    };
+    for (const char* n : kNames) {
+        const char* v = std::getenv(n);
+        if (v && v[0]) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+void EditorApp::onUpdate(float dt) {    if (m_ctx->quitRequested()) {
         window().invalidate();
         return;
     }
@@ -2073,6 +2210,42 @@ void EditorApp::onUpdate(float dt) {
     // 放在 onUpdate 的最前面：切完当帧生效，剩下的帧都处于稳定状态 ——
     // 截图脚本不需要猜"等几帧才稳定"。
     ++m_editorFrames;
+
+    // ---- 天气：场景 → 渲染器（每帧）----
+    // 真值是 `Scene::environment()`（随场景序列化，见 SceneSerializer 的
+    // "environment" 块），Renderer 只是消费者。
+    //
+    // 为什么每帧推而不是"改了才推"：产生变化的路径有三条（面板、
+    // 加载场景、脚本/控制台改值），逐条挂钩子必然漏一条。而
+    // `Renderer::setSkyParams` 内部按字节比较、内容相同时直接返回，
+    // 每帧调用是零成本的。
+    //
+    // 用 activeScene() 而不是 editorScene()：Play 态下天气应该跟
+    // 运行态那份走（它与编辑态是两份数据），否则按 Run 之后天会跳一下。
+    //
+    // ⚠ 有环境变量覆盖时**整块跳过**（见 skyEnvOverridePresent 那段）。
+    //   `static` 只求值一次：环境变量在进程生命周期里不会变。
+    static const bool kSkyFromEnv = skyEnvOverridePresent();
+    if (!kSkyFromEnv)
+        renderer().setSkyParams(m_ctx->activeScene().environment());
+
+    // ---- 面板打开请求（Character Studio 的步骤条 / 外部调用）----
+    // 与 `MYVK_EDITOR_PANEL` 走同一个落点（`setPanelOpen`），只是来源不同：
+    // 那条是启动期一次性，这条是运行期随时。**只处理一个** —— 见
+    // `EditorContext::requestPanelOpen` 的说明。
+    if (const std::string want = m_ctx->takePanelOpenRequest();
+        !want.empty()) {
+        const int idx = panelIndexOf(want.c_str());
+        if (idx >= 0) {
+            // 同 `MYVK_EDITOR_PANELS`：kSlotNone 面板"开着"还不够，
+            // 得成为当前标签页才会被提交。见那段注释。
+            focusPanel(want.c_str());
+            VK_LOG_INFO("PANEL-OPEN id=%s reason=request", want.c_str());
+        } else {
+            VK_LOG_WARN("PANEL-OPEN unknown panel '%s' (requestPanelOpen)",
+                        want.c_str());
+        }
+    }
     if (!m_wsSwitch.empty() && m_editorFrames >= m_wsSwitch.front().frame) {
         const int idx = m_wsSwitch.front().index;
         m_wsSwitch.erase(m_wsSwitch.begin());
@@ -2111,11 +2284,30 @@ void EditorApp::onUpdate(float dt) {
                         // 收进托盘的话，面板"开着"却一帧都不画 —— 锚点
                         // 全都不出现。自动化要的是"看得见"。
                         panelTrayHiddenRef(idx) = 0;
+                        // ⚠ 这里**不调** `focusPanel`。它会把面板设成当前
+                        //   标签页（从而 dock 进视口内容区），而验收脚本
+                        //   是按 SAVEPANEL-WIN 那类矩形算点击坐标的 ——
+                        //   窗口从"浮动"变"铺满内容区"，坐标全偏，表现是
+                        //   "点了 Save 但什么都没发生"（2026-11-01 试过，
+                        //   verify_save_panel 当场 7 条红）。
+                        //   只要 `kMaxPanels` 够大，`syncViewportTabs()` 会
+                        //   把"刚打开的可托管面板"自动设为当前页 —— 那才是
+                        //   本函数原本依赖的机制。
                         VK_LOG_INFO("PANEL %s open=1 reason=env", one.c_str());
                     }
                 }
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
+            }
+        }
+        // ---- MYVK_EDITOR_STUDIO_STEP=<步骤 id>：流程壳直接落到某一步 ----
+        // 验收脚本要截"第 8 步（状态机）"的画面，而它默认停在第 1 步。
+        // 用鼠标点步骤条在自动化里既慢又脆（矩形随窗口尺寸变），
+        // 这条与环境变量同款的钩子把"跳到哪一步"变成可确定的。
+        if (const char* step = std::getenv("MYVK_EDITOR_STUDIO_STEP")) {
+            if (m_charStudio) {
+                m_charStudio->goTo(step);
+                VK_LOG_INFO("CHARSTUDIO-GOTO step=%s", step);
             }
         }
     }

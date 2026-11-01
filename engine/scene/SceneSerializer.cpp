@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <string>
@@ -4154,6 +4155,47 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
             ps.sleepTime != def.sleepTime)
             root["physics"] = physicsToJson(ps);
     }
+
+    // ---- 天空 / 天气（2026-11-01）----
+    // 与 physics 同一条规矩：**只有非默认才写**。默认值是"无云、无星、
+    // 不画太阳"—— 也就是这块功能上线前的纯渐变天空，于是老场景文件的
+    // 读写结果与改动前逐位相同。
+    //
+    // 为什么用 memcmp 而不是逐字段比较：SkyParams 有 20 个字段，逐个写
+    // 一遍必然出现"加字段忘了同步"，而那种漏写不会报错，只会让"改了云色
+    // 却没存进文件"。memcmp 不会漏。
+    {
+        static const render::SkyParams kDefaultSky;
+        const render::SkyParams& s = scene.environment();
+        if (std::memcmp(&s, &kDefaultSky, sizeof(s)) != 0) {
+            nlohmann::json j;
+            auto putV3 = [&j](const char* k, const glm::vec3& v) {
+                j[k] = {v.x, v.y, v.z};
+            };
+            putV3("zenith", s.zenith);
+            putV3("horizon", s.horizon);
+            putV3("ground", s.ground);
+            putV3("cloudColor", s.cloudColor);
+            putV3("starColor", s.starColor);
+            putV3("sunDirection", s.sunDirection);
+            j["exposure"] = s.exposure;
+            j["sunAngularRadius"] = s.sunAngularRadius;
+            j["cloudCoverage"] = s.cloudCoverage;
+            j["cloudThickness"] = s.cloudThickness;
+            j["cloudScale"] = s.cloudScale;
+            j["cloudHeight"] = s.cloudHeight;
+            j["cloudSpeed"] = s.cloudSpeed;
+            j["cloudShadow"] = s.cloudShadow;
+            j["starAmount"] = s.starAmount;
+            j["sunIntensity"] = s.sunIntensity;
+            j["starBrightness"] = s.starBrightness;
+            j["cloudEdgeSharpness"] = s.cloudEdgeSharpness;
+            j["horizonGlow"] = s.horizonGlow;
+            // ⚠ `time` 刻意不存：它是"云飘到哪了 / 星星闪到第几拍"的
+            //   运行时相位，存下来只会让每次读档的云都停在同一个位置。
+            root["environment"] = j;
+        }
+    }
     // 脚本世界黑板（S2）。只有存在时才写 —— 与 physics 同款：老场景文件
     // 里没有这段，读的时候自然落到空表。
     // ⚠ 与 `ecs::ScriptVarsComponent`（逐实体、不存盘）**刻意分开**：
@@ -4263,8 +4305,9 @@ bool parseSceneDocument(const nlohmann::json& root, SceneDocument& out, std::str
     // 白名单是刻意的（列出"认识的"，而不是"排除 entities"）：漏掉一个 key =
     // 读档后那个设置静默回到默认值，而画面上未必看得出来；反过来用排除法，
     // 将来的未知块也会被搬进来，`documentToJson` 写回时就变成垃圾。
-    static const char* kGlobalKeys[] = {"camera", "cameras",     "light",
-                                        "physics", "scriptVars", "postVolumes"};
+    static const char* kGlobalKeys[] = {"camera",     "cameras",     "light",
+                                        "physics",    "scriptVars",  "postVolumes",
+                                        "environment"};
     for (const char* k : kGlobalKeys) {
         if (root.contains(k)) out.globals[k] = root[k];
     }
@@ -4333,6 +4376,45 @@ void instantiateDocument(Scene& scene, const SceneDocument& doc,
     // 所以"老场景没有 physics 字段"这条路径**什么都不用做**就是对的。
     physicsFromJson(scene.physicsSettings(),
                     has("physics") ? g["physics"] : nlohmann::json(nullptr));
+
+    // ---- 天空 / 天气（2026-11-01）----
+    // scene.clear() 已经把 m_sky 复位成默认值，所以"老场景没有 environment
+    // 字段"这条路径什么都不用做就是对的 —— 与上面 physics 同一条规矩。
+    //
+    // 逐字段读而不是整块拷：缺字段时**保留默认值**，于是手写一个
+    // 只有三行的 environment（比如只写 cloudCoverage）也能加到调好的
+    // 默认天空上，而不是把没写的字段全清成 0（那会得到一片全黑）。
+    if (has("environment") && g["environment"].is_object()) {
+        const nlohmann::json& e = g["environment"];
+        render::SkyParams& s = scene.environment();
+        auto getV3 = [&e](const char* k, glm::vec3& out) {
+            if (!e.contains(k) || !e[k].is_array() || e[k].size() != 3) return;
+            out = glm::vec3(e[k][0].get<float>(), e[k][1].get<float>(),
+                            e[k][2].get<float>());
+        };
+        auto getF = [&e](const char* k, float& out) {
+            if (e.contains(k) && e[k].is_number()) out = e[k].get<float>();
+        };
+        getV3("zenith", s.zenith);
+        getV3("horizon", s.horizon);
+        getV3("ground", s.ground);
+        getV3("cloudColor", s.cloudColor);
+        getV3("starColor", s.starColor);
+        getV3("sunDirection", s.sunDirection);
+        getF("exposure", s.exposure);
+        getF("sunAngularRadius", s.sunAngularRadius);
+        getF("cloudCoverage", s.cloudCoverage);
+        getF("cloudThickness", s.cloudThickness);
+        getF("cloudScale", s.cloudScale);
+        getF("cloudHeight", s.cloudHeight);
+        getF("cloudSpeed", s.cloudSpeed);
+        getF("cloudShadow", s.cloudShadow);
+        getF("starAmount", s.starAmount);
+        getF("sunIntensity", s.sunIntensity);
+        getF("starBrightness", s.starBrightness);
+        getF("cloudEdgeSharpness", s.cloudEdgeSharpness);
+        getF("horizonGlow", s.horizonGlow);
+    }
 
     // 脚本世界黑板（S2）+ 后处理体积
     scene.scriptVars().clear();

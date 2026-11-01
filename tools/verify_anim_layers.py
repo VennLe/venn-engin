@@ -44,6 +44,9 @@
 
   ① **同一场景跑两次**：显著变化 < 0.15%（噪声地板，逐像素抖动来自
      轮廓抗锯齿，**不能写 0**）。
+     ⚠ 这条和 ⑥ 的第一小条都曾被**鼠标**打红（0.319%，`SetTooltip` 的悬停
+     提示落在视口左上角内）。每次截图前 `park_pointer()` 把光标停到菜单栏，
+     理由与复现方法见那个函数的注释。
   ② **层（Allow=upleg）把腿换成另一个相位**：下半带显著变化 > 0.5%。
   ③ **同一帧里上半带一个像素都不动**：< 噪声地板。②③ 是主判据 ——
      "只换该换的骨"在屏幕上就长这样；遮罩要是被忽略（整具身体都被覆盖），
@@ -94,6 +97,7 @@ from safe_fs import safe_remove, safe_rmtree               # noqa: E402  （与�
 from capture_window import capture_nonempty, find_window, user32      # noqa: E402
 from verify_add_menu import (LogTap, kill_stale_editors,               # noqa: E402
                              wait_rect)
+from verify_asset_drag import client_to_screen, force_foreground       # noqa: E402
 from verify_local_shadow import crop_pair                              # noqa: E402
 from verify_shader_variants import OUT_DIR, ROOT                       # noqa: E402
 
@@ -146,6 +150,7 @@ ENV = {
 PIX_THR = 8
 # 噪声地板上限：同一份场景跑两次实测 0.0x%（轮廓抗锯齿的亚像素抖动）。
 # **不能写 0** —— 那等于要求两次进程的渲染逐字节一致，历史上从没成立过。
+# ⚠ 光标没停靠时这条会被 tooltip 顶到 0.319%（见 `park_pointer`）。
 NOISE_MAX = 0.0015
 # "变了很多"的下限
 CHANGED_MIN = 0.005
@@ -170,6 +175,15 @@ CHANGED_MIN = 0.005
 #   否则判据会静默退化成"两边都算它一半"（每个都 5%，红得莫名其妙）。
 UPPER_END = 0.32
 LOWER_START = 0.64
+
+# 每次截图前把真实光标停到哪（**客户区**坐标）。
+#
+# 选菜单栏左上角 (2,2)，不是视口里的空地，两条理由：
+#   · 菜单栏**没有任何 tooltip**。视口里的地块虽然没有 widget，但离角色、
+#     离坐标轴都近，任何一次 hover 高亮都会落进被判据统计的像素里；
+#   · (2,2) 在视口矩形（310,147)-(918,678) **外面** —— 就算那行菜单真被
+#     hover 高亮，也改不到被统计的那块。
+PARK_XY = (2, 2)
 
 GENERATOR = "verify_anim_layers"
 
@@ -391,6 +405,39 @@ def _base_env():
     return env
 
 
+def park_pointer(hwnd):
+    """把真实光标挪到菜单栏空白处，让视口工具栏的悬停提示（tooltip）消失。
+
+    ⚠ 为什么必须有（2026-11-01 定位）：视口顶部那排 transform 工具
+      （`ViewportPanel.cpp` 的 `vpt_move` / `vpt_rot` / `vpt_scale` …）挂了
+      `ImGui::SetTooltip(TR("Move  (W)"))`。窗口被 `SetWindowPos` 挪到 (0,0)
+      之后，**物理光标**可能正好压在其中一个按钮上 —— 那一轮截图里就多一块
+      tooltip，下一轮光标偏一格又没有。它画在视口左上角**内部**
+      （实测 bbox x=419..508 / y=147..158，1030 px = 视口 608x531 的 **0.319%**），
+      比噪声地板 0.15% 高一倍多。于是下面两条会**随机**变红，而且红的数值
+      一模一样都是 0.319%：
+        · ①「同一场景跑两次：噪声地板」
+        · ⑥「权重 0 ≈ 基线」
+      看着像"遮罩没关掉 / 权重 0 还在生效"，其实那个数**不是动画，是鼠标**。
+      定性办法（也是当时用的）：拿四张截图两两比对 —— `base_a` 与 `noclip`
+      在**视口内逐像素为 0**，而 `base_a` / `base_b` / `w0` / `unres` 分成
+      {有 tooltip} 与 {没 tooltip} 两组，差异全部落在上面那个 bbox 里。
+      反过来把光标**故意压到** `VP-TOOL move` 按钮上再截，那块 RGB 从
+      背景的 (184,194,206) 变成暗色 (110,110,120)，一按一放就复现。
+
+    ⚠ 还有一层：ImGui 的 GLFW 后端在窗口**没有焦点**时不更新鼠标位置
+      （`imgui_impl_glfw` 的 `if (is_app_focused) { glfwGetCursorPos(...) }`），
+      只调 `SetCursorPos` 而窗口不在前台，`io.MousePos` 会一直停在旧值上，
+      tooltip 也就一直画在上一帧的位置 —— 所以必须**先置前再挪**。
+    """
+    try:
+        force_foreground(hwnd)
+    except Exception:                                   # noqa: BLE001
+        pass                                            # 置前失败不致命：下面照挪
+    user32.SetCursorPos(*client_to_screen(hwnd, *PARK_XY))
+    time.sleep(0.45)   # 至少两帧：hover 一断，tooltip 当帧就不画了，留余量
+
+
 def run_shot(exe, scene, extra_env, shot_path, cam, wait=40.0, select=None):
     env = _base_env()
     env["MYVK_EDITOR_SCENE"] = scene
@@ -416,6 +463,10 @@ def run_shot(exe, scene, extra_env, shot_path, cam, wait=40.0, select=None):
         time.sleep(2.5)
 
         vp = wait_rect(tap, "VP-RECT", 12.0)
+        # ⚠ 挪光标必须在这里（拿到 VP-RECT 之后、等 ANIM-TICK 之前）：那时窗口
+        #   尺寸已经定下来、位置不会再动，而后面还要等几十帧，tooltip 有充足
+        #   时间消失。放到"截图前一刻"也能用，但会和白帧重试抢时间。
+        park_pointer(hwnd)
         end = time.time() + wait
         while time.time() < end:
             with tap.lock:

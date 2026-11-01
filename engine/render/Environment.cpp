@@ -343,7 +343,10 @@ void Environment::createPipelines() {
     VkPushConstantRange skyPc{};
     skyPc.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     skyPc.offset = 0;
-    skyPc.size = 2 * sizeof(glm::vec4);   // zenith + ground
+    // 2026-11-01：从 "zenith + ground"（2 个 vec4）扩成完整的 SkyParams。
+    // 用 sizeof(Gpu) 而不是写死的 128 —— 结构体一改这里自动跟上，
+    // 忘了同步 `SkyParams.h` 的 static_assert 会在编译期拦住。
+    skyPc.size = static_cast<uint32_t>(sizeof(SkyParams::Gpu));
 
     VkPushConstantRange pc{};
     pc.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -382,12 +385,10 @@ void Environment::recordBuild(VkCommandBuffer cmd, VkBuffer skyReadback,
                     VK_IMAGE_LAYOUT_GENERAL, kTop, 0, kCompute,
                     VK_ACCESS_SHADER_WRITE_BIT);
     {
-        struct {
-            glm::vec4 zenith;
-            glm::vec4 ground;
-        } push;
-        push.zenith = glm::vec4(m_settings.zenith, 1.0f);
-        push.ground = glm::vec4(m_settings.ground, 1.0f);
+        // 天空参数整份推过去（128 字节）。compute 与 frag 两处读的是
+        // sky_model.glsl 里同一个 `VennSkyPush` —— 字段错位不会编译报错，
+        // 但 `SkyParams.h` 末尾的 static_assert 会先拦住结构体本身。
+        const SkyParams::Gpu push = m_settings.sky.toGpu();
         const uint32_t g = groupCount(m_settings.skySize);
         m_skyPipe->dispatch(cmd, g, g, kCubeFaces, &m_skySet, 1, &push,
                             sizeof(push));
@@ -620,6 +621,48 @@ void Environment::build() {
     m_stats.prefilterMips = m_settings.prefilterMips;
     m_stats.lutSize = m_settings.lutSize;
     m_valid = true;
+}
+
+// ============================================================
+// 运行时重烘（天气 / 云 / 星参数改了之后）
+//
+// 与 build() 的唯一区别：**不重建任何资源**（图 / 采样器 / 描述符 /
+// 管线全留着），只把 compute 链重跑一遍并把回读自检刷新。
+// 之所以能这样，是因为这四张图是"同一组固定尺寸的渲染目标"，
+// 参数只影响**写进去的内容**，不影响**写进哪里**。
+//
+// 回读缓冲每次重建都重新分配：它只在最后拷贝一次，几 MB，
+// 与"重跑三条卷积"（几十毫秒）相比可以忽略 —— 换成成员缓存反而
+// 要管生命周期（resize 时尺寸会变）。
+// ============================================================
+void Environment::rebuild() {
+    if (!m_valid) return;
+
+    const VkDeviceSize skyBytes = static_cast<VkDeviceSize>(m_settings.skySize) *
+                                  m_settings.skySize * kCubeFaces * 4 *
+                                  sizeof(float);
+    const VkDeviceSize lutBytes = static_cast<VkDeviceSize>(m_settings.lutSize) *
+                                  m_settings.lutSize * 2 * sizeof(float);
+    rhi::Buffer skyRb(m_device, skyBytes,
+                      VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    rhi::Buffer lutRb(m_device, lutBytes,
+                      VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    {
+        VkCommandBuffer cmd = m_cmdPool.beginOneTime();
+        // recordBuild 每次都从 UNDEFINED 起转布局，所以对**已经用过**的
+        // 图像重跑是安全的：UNDEFINED 表示"内容不保留"，这正是我们要的。
+        recordBuild(cmd, skyRb.get(), lutRb.get());
+        m_cmdPool.endAndSubmit(cmd);   // 内部 vkQueueWaitIdle，之后回读安全
+    }
+
+    fillProbe(skyRb.map(), lutRb.map());
+    skyRb.unmap();
+    lutRb.unmap();
 }
 
 } // namespace render

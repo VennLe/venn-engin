@@ -38,6 +38,8 @@
 //   没必要去挤那个池。
 // ============================================================
 
+#include "render/SkyParams.h"
+
 #include "rhi/VulkanCommon.h"
 
 #include <array>
@@ -65,9 +67,11 @@ struct EnvSettings {
     uint32_t prefilterSamples = 512;
     uint32_t brdfSamples = 512;
 
-    // 天空模型（与 common.glsl 的 vennSkyColor 对应）
-    glm::vec3 zenith{0.55f, 0.70f, 0.95f};
-    glm::vec3 ground{0.10f, 0.09f, 0.09f};
+    // 天空模型（与 sky_model.glsl 的 vennSkyRadiance 对应）。
+    // 2026-11-01 之前这里只有 zenith / ground 两粒颜色；现在是一整份
+    // SkyParams（颜色 / 云 / 星 / 太阳），默认值刻意保持"无云无星无太阳"
+    // —— 于是没配过天空的老场景与改动前逐像素一致。
+    SkyParams sky;
 };
 
 class Environment {
@@ -81,6 +85,27 @@ public:
 
     // 生成四张图（一次性的：建图 → 跑 4 个 compute → 转布局 → 回读自检）
     void build();
+
+    // ---- 运行时改天空（2026-11-01）----
+    //
+    // 面板拖一下滑条就调一次。**只改参数不立即重烘** —— 调用方决定
+    // 什么时候 `rebuild()`（编辑器是"距上次 150 ms 且松手"，见
+    // EnvironmentPanel 的说明）。分开两个调用是因为重烘一次要几十
+    // 毫秒，拖动时每帧都烘会把编辑器拖成幻灯片。
+    //
+    // 为什么改天空必须重烘：IBL 的三张图（天空 / 辐照度 / 预过滤）
+    // 是**同一个函数在不同方向上的积分**，参数一变它们就都过期了。
+    // 背景（sky.frag）不吃这张图，所以背景是**立刻**变的 ——
+    // 重烘只影响球面反射与环境光，晚几帧没人能发现。
+    void setSky(const SkyParams& sky) { m_settings.sky = sky; }
+
+    // 用当前 `m_settings.sky` 重跑一遍烘焙链（天空 → 辐照度 → 预过滤）。
+    // BRDF LUT 与天空无关，但这里一并重跑 —— 它只占整体耗时的 5%，
+    // 拆开会让 recordBuild 多一个分支参数，不值得。
+    // 未 build() 过时是空操作。
+    void rebuild();
+
+    const SkyParams& sky() const { return m_settings.sky; }
 
     bool valid() const { return m_valid; }
 

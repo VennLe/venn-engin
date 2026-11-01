@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <type_traits>
 #include <utility>
 
 namespace render {
@@ -1353,14 +1354,45 @@ void Renderer::createShadowPass() {
 void Renderer::createEnvironment() {
     render::EnvSettings es;
 
+    // ---- 先落预设，再让单项变量覆盖 ----
+    // 顺序是刻意的：`MYVK_SKY_PRESET=night` + `MYVK_SKY_CLOUD=0.9` 表示
+    // "夜空的配色，但云加满"。反过来的话预设会把单项盖掉，
+    // 那种"两个变量一起设、只有一个生效"的行为最难查。
+    if (const char* preset = std::getenv("MYVK_SKY_PRESET")) {
+        // 用 strcmp 而不是 std::string：本文件没有直接 include <string>
+        // （它靠 Renderer.h 间接带进来），依赖间接包含是很脆的写法。
+        if (std::strcmp(preset, "day") == 0)
+            es.sky = render::SkyParams::clearDay();
+        else if (std::strcmp(preset, "overcast") == 0 ||
+                 std::strcmp(preset, "rain") == 0)
+            es.sky = render::SkyParams::overcast();
+        else if (std::strcmp(preset, "night") == 0)
+            es.sky = render::SkyParams::night();
+        else if (std::strcmp(preset, "dusk") == 0)
+            es.sky = render::SkyParams::dusk();
+        else
+            VK_LOG_WARN("MYVK_SKY_PRESET='%s' 不认识（day/overcast/night/dusk）",
+                        preset);
+    }
+
     // 天空模型：默认值与 pbr.frag 的 kFallbackZenith/Ground 一致，
     // 这样"IBL 开/关"两次渲染的天空是同一个，画面差异只来自着色数学。
     // 验证脚本用这两个变量来构造**可判定的因果实验**：
     // 把天顶设成纯红、地面设成纯蓝，一个金属镜面球的上半必然偏红、
     // 下半必然偏蓝 —— 这同时证明了天空生成、面号映射、预过滤、
     // BRDF 表整条链路都在真的生效（任一处错都会让颜色对不上）。
-    envVec3("MYVK_SKY_ZENITH", es.zenith);
-    envVec3("MYVK_SKY_GROUND", es.ground);
+    //
+    // 2026-11-01：天空从"两粒颜色"扩成完整的 SkyParams（云 / 星 / 太阳），
+    // 这两个变量仍然只覆盖底色两粒 —— 老脚本的因果实验原样成立。
+    // 完整参数的入口在 Sky & Atmosphere 面板（→ setSkyParams）。
+    envVec3("MYVK_SKY_ZENITH", es.sky.zenith);
+    envVec3("MYVK_SKY_GROUND", es.sky.ground);
+    envVec3("MYVK_SKY_HORIZON", es.sky.horizon);
+    envVec3("MYVK_SKY_CLOUD_COLOR", es.sky.cloudColor);
+    envFloat("MYVK_SKY_CLOUD", es.sky.cloudCoverage);
+    envFloat("MYVK_SKY_CLOUD_SCALE", es.sky.cloudScale);
+    envFloat("MYVK_SKY_STAR", es.sky.starAmount);
+    envFloat("MYVK_SKY_SUN", es.sky.sunIntensity);
 
     // 尺寸/质量覆盖（缩小可以让验证跑得快，放大用于目视）
     envUint("MYVK_SKY_RES", 16, es.skySize);
@@ -1411,6 +1443,12 @@ void Renderer::createEnvironment() {
             static_cast<double>(p.lutA_at_half),
             static_cast<double>(p.lutB_at_half));
     }
+
+    // 面板读写的"当前天空"以 Environment 里那份为准 —— 它是真正被
+    // 烘进 IBL 的那一份，副本多了就会出现"面板显示晴天、反射还是黄昏"。
+    m_skyParams = m_environment->sky();
+    m_skyDirty = false;
+    m_skyRebuildWait = 0;
 }
 
 // ---------------------------------------------------------------- 通用离屏目标
@@ -5469,9 +5507,89 @@ void Renderer::recordSkyBackground(VkCommandBuffer cmd) {
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       m_pipelineSky->get());
+
+    // 天空参数（128 字节）走推常量。
+    //
+    // ⚠ 这里推的是 **m_skyParams**（面板想让它是什么），不是
+    //   m_environment 里那份（已经烘进 IBL 的是什么）。差别正是设计
+    //   意图：背景是实时解析计算的，拖滑条下一帧就该变；IBL 的
+    //   三张图由 tickSkyRebuild() 节流重烘，晚几十毫秒。
+    //   如果这里改成读 Environment 的那份，拖动时画面会"一顿一顿"地
+    //   跟着 6 帧一次的重建跳，手感很差。
+    //
+    // ⚠ 阶段位必须写成 VERTEX | FRAGMENT，**不能只写 FRAGMENT**。
+    //   规范（VUID-vkCmdPushConstants-offset-01795）要求"管线布局里与该
+    //   字节范围重叠的每条 push constant range 的 stageFlags，都必须被
+    //   本次调用的 stageFlags 覆盖"。而天空管线的 range 是 VERT|FRAG
+    //   （与大管线共用同一条布局约束）。只写 FRAGMENT 会刷屏报
+    //   "stageFlags must include VK_SHADER_STAGE_VERTEX_BIT"。
+    //   sky.vert 自己不读这个块，多推一份给顶点阶段没有任何副作用。
+    {
+        const render::SkyParams::Gpu push = m_skyParams.toGpu();
+        vkCmdPushConstants(cmd, m_pipelineSky->layout(),
+                           VK_SHADER_STAGE_VERTEX_BIT |
+                               VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, static_cast<uint32_t>(sizeof(push)), &push);
+    }
+
     // 顶点由 gl_VertexIndex 现算（一个覆盖全屏的大三角形），无顶点缓冲
     vkCmdDraw(cmd, 3, 1, 0, 0);
     ++m_stats.drawCalls;
+}
+
+// ---------------------------------------------------------------- 天空参数
+
+void Renderer::setSkyParams(const render::SkyParams& p) {
+    // 逐字段比较太脆（加一个字段就会漏），直接比 memcmp —— SkyParams
+    // 是纯 POD（glm::vec3/float，无指针无 padding 之外的填充），
+    // 字节相同就代表内容相同。
+    static_assert(std::is_trivially_copyable<render::SkyParams>::value,
+                  "SkyParams 必须是可逐字节比较的 POD");
+    if (std::memcmp(&p, &m_skyParams, sizeof(m_skyParams)) == 0) return;
+
+    m_skyParams = p;
+    m_skyDirty = true;
+    // 第一次改动之后要等几帧才真正重建 —— 否则拖动滑条时每帧都
+    // 重烘（含一次 vkQueueWaitIdle），编辑器会卡成幻灯片。
+    if (m_skyRebuildWait <= 0) m_skyRebuildWait = kSkyRebuildCooldownFrames;
+}
+
+void Renderer::tickSkyRebuild() {
+    if (!m_skyDirty) return;
+    if (!m_environment || !m_environment->valid()) return;
+
+    if (m_skyRebuildWait > 0) {
+        --m_skyRebuildWait;
+        return;
+    }
+
+    m_environment->setSky(m_skyParams);
+    m_environment->rebuild();
+    m_skyDirty = false;
+
+    // 打完这条日志就能在截图里判断"这次画面用的是哪套参数" ——
+    // 验证脚本靠它区分"参数没生效"和"参数生效了但看不出差别"。
+    VK_LOG_INFO("SKY-REBUILD zenith=(%.3f,%.3f,%.3f) horizon=(%.3f,%.3f,%.3f) "
+                "cloud=%.3f scale=%.2f thick=%.2f star=%.3f sun=%.2f",
+                static_cast<double>(m_skyParams.zenith.x),
+                static_cast<double>(m_skyParams.zenith.y),
+                static_cast<double>(m_skyParams.zenith.z),
+                static_cast<double>(m_skyParams.horizon.x),
+                static_cast<double>(m_skyParams.horizon.y),
+                static_cast<double>(m_skyParams.horizon.z),
+                static_cast<double>(m_skyParams.cloudCoverage),
+                static_cast<double>(m_skyParams.cloudScale),
+                static_cast<double>(m_skyParams.cloudThickness),
+                static_cast<double>(m_skyParams.starAmount),
+                static_cast<double>(m_skyParams.sunIntensity));
+}
+
+void Renderer::rebuildSkyNow() {
+    if (!m_environment || !m_environment->valid()) return;
+    m_environment->setSky(m_skyParams);
+    m_environment->rebuild();
+    m_skyDirty = false;
+    m_skyRebuildWait = 0;
 }
 
 void Renderer::recordShadowPasses(VkCommandBuffer cmd, scene::Scene& scene,
@@ -6924,6 +7042,12 @@ void Renderer::drawFrame(scene::Scene& scene) {
     //   PostProcess 的输入接到哪（链输出 / HDR 本尊），而 dof / motionBlur
     //   可能被后处理体积打开 —— 用上一帧的生效值会漏接一次。
     updateCameraEffects(scene);
+
+    // ---- 天空参数改动 → 节流重烘 IBL ----
+    // 必须排在下面所有录制之前：rebuild() 内部要提交一次性命令缓冲并
+    // vkQueueWaitIdle，正在录制的东西会被打断。
+    // 节流逻辑见 setSkyParams / tickSkyRebuild 的说明：背景实时、IBL 6 帧。
+    tickSkyRebuild();
 
     if (m_window.takeResizeFlag()) {
         recreateSwapchain();

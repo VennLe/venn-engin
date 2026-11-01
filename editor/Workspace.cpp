@@ -33,8 +33,18 @@ const char* const kCharClose[] = {"stats", "scripts", "engine", "console",
                                   nullptr};
 
 // Animation：脚本 + 时间轴。Hierarchy 要开（选骨骼/节点）。
+//
+// 2026-11-01：补上 `charstudio`。**在这之前这里只有 hierarchy/viewport/
+// inspector/scripts** —— 切到 "Animation" 工作区，摄影表、NLA、骨骼曲线
+// 一个都没打开，用户还得自己去 View 菜单里点四个窗口。这是"动画操作太
+// 分散"最直接的一条证据（见 CharacterStudioPanel.h 的文件头）。
+//
+// 只加**一个**入口，而不是把 dope/nla/bonecurv 一起塞进来：那几个面板
+// 各自的窗口是"自己管 open/close"的浮动窗口，同时打开会互相叠（第一版
+// 试过 5 个，截图上两三个窗口压在一起）。而流程壳的每一步都有"Open …"
+// 按钮直达它们 —— 那才是"集中"该有的形态：一个入口，按需展开。
 const char* const kAnimOpen[] = {"hierarchy", "viewport", "inspector", "scripts",
-                                 nullptr};
+                                 "charstudio", nullptr};
 const char* const kAnimClose[] = {"engine", "console", nullptr};
 
 // Cinematic：几乎只剩视口 —— 看构图。

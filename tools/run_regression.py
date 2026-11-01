@@ -379,6 +379,24 @@ DEFAULT = [
     #   verify_anim_runtime 的 27 条 `rm_*` 里 —— 三条做过否定测试。两条互补，
     #   别只跑一条（"只跑这条"的话把 strip 改成减增量也照样全绿）。
     "verify_root_motion",
+    # 状态机图编辑器 + 角色流程壳（2026-11-01）。三组：
+    #   ① **`.anim.json` 序列化往返**（`MYVK_ANIM_TEST=1` 的 `ctl_parse` /
+    #      `ctl_roundtrip_parse` / `ctl_roundtrip_fields` /
+    #      `ctl_serialize_idempotent` 四条 + `ANIM-TOTAL pass/fail`）：
+    #      读→写→再读逐字段相等、第二次序列化**逐字节相同**、`editor.nodes`
+    #      的画布坐标也往返（那是编辑器里"节点摆在哪"，丢了就等于每次打开
+    #      都要重新排一遍图）。
+    #   ② **节点真的画在画布上**：视口像素里数 `kColNode`(58,62,74) 的占比。
+    #      只判日志不够 —— 节点曾经因为环形布点半径算错全跑到画布外，
+    #      日志一切正常、画面空白。
+    #   ③ **流程壳能跳步并把请求送出去**：`MYVK_EDITOR_STUDIO_STEP=statemachine`
+    #      → 第 8 步内嵌那张图，像素里同样数得到节点色。
+    # ⚠ 顺带守着一条踩过的坑：`kSlotNone` 面板只设 open 位**不会显示**
+    #   （它不是当前标签页），必须走 `focusPanel`；那次的表现正是
+    #   "日志写着 open=1、画面什么都没有"。
+    # ⚠ ① 为什么挂在自检而不是脚本里自己 parse 一遍：序列化函数在 `.cpp` 里，
+    #   判据必须跟着代码走。脚本另写一份 JSON 模板 = 造第二份真相。
+    "verify_anim_graph",
     # 过场时间轴（2026-10-26，C1）。**只验"接到一起之后还对不对"** —— 解析 /
     # 采样 / yaw 最短弧 / step 硬切 / 半开区间 / 跨圈 / 夹步长全在数值侧
     # （`Game.exe --selftest sequence` 的 48 条 `SEQ-TEST`）。
@@ -2238,6 +2256,18 @@ TRIGGERS = {
                            "engine/animation/AnimationSelfTest.cpp",
                            "engine/scene/SceneSerializer.*",
                            "editor/InspectorPanel.*"],
+    # 状态机图编辑器 + 角色流程壳（2026-11-01）。落点**刻意只写这几处**：
+    # 这两块是"新长出来的一层 UI"，不碰运行时混合/事件，所以不与 B1/B2/B3
+    # 互相牵连。改 `AnimController.*` 时两边都要跑（读端/写端都在那儿）。
+    # ⚠ `PanelRegistry.h` 的 `kMaxPanels` 也在这里：把容量调小会让新面板
+    #   的 open 位**越界且静默失效**（`setPanelOpen` 一个字节都不写），
+    #   症状是"日志 open=1、画面空白"，只有 GUI 用例能看出来。
+    "verify_anim_graph": ["engine/animation/AnimController.*",
+                          "engine/animation/AnimationSelfTest.cpp",
+                          "editor/AnimatorGraphPanel.*",
+                          "editor/CharacterStudioPanel.*",
+                          "editor/PanelRegistry.*",
+                          "editor/Workspace.cpp"],
     # 动画事件 / Notify（B2，2026-10-26）。落点与上面那条**大量重叠是故意的**：
     # `AnimatorSystem.*` 里同时住着"分层混合"和"事件分发"，改哪一半两边都得
     # 重跑。B2 独有的落点是 `AnimEvent.*`（含头文件里那段"为什么半开区间"）。

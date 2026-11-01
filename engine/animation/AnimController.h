@@ -75,6 +75,7 @@
 
 #include "ecs/Components.h"
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -144,6 +145,17 @@ struct AnimController {
     std::vector<ControllerTransition> transitions;
     int defaultState = -1;
 
+    // 编辑器画布上的节点坐标（与 `states` 同序同长）。
+    //
+    // **不参与运行时**：状态机的语义完全由上面的字段决定，删掉这个数组
+    // 引擎照样跑。它存在这里而不是 sidecar 文件，是因为一个状态机该只有
+    // 一个文件 —— 两份文件必然出现"改了 A 忘了存 B"，而且 B 丢了以后
+    // 图编辑器会静默重排，用户会以为"我的布局被吃了"。
+    //
+    // 没写过坐标的状态留 (0,0)，由编辑器按环形自动布点（见
+    // `editor/AnimatorGraphPanel.cpp` 的 `autoLayout()`）。
+    std::vector<std::array<float, 2>> nodePos;
+
     // 非空 = 加载 / 校验失败。**此时整个控制器不接管**（见文件头）。
     std::string error;
 
@@ -161,6 +173,24 @@ std::shared_ptr<AnimController> parseAnimController(const std::string& json);
 // 从磁盘加载。内部用 `assets::resolveAssetPath`，所以传相对路径
 // （`animators/humanoid.anim.json`）或绝对路径都行。
 std::shared_ptr<AnimController> loadAnimController(const std::string& path);
+
+// 序列化成 `.anim.json` 文本（不落盘，供"保存前先看"和自检用）。
+//
+// 往返契约：`parseAnimController(serializeAnimController(c))` 必须得到
+// 与 `c` **语义等价**的一份（状态/参数/转移条件逐条相同）。顺序按
+// 数组原序写，不排序 —— 转移的优先级就是数组顺序（见文件头第 3 条），
+// 排序会静默改掉 "Any → Jump 先于 Idle → Walk" 这种刻意安排。
+std::string serializeAnimController(const AnimController& ctl);
+
+// 存盘。路径同样走 `resolveAssetPath`（相对路径落到资产根）。
+// 返回空字符串 = 成功；非空 = 错误说明（调用方直接显示/打日志）。
+//
+// **不做校验**：调用方可以在 `error` 非空时也照存（用户在编辑中途
+// 想留个草稿是合理需求）。但存之前最好自己 `validate` 一次 —— 见
+// `AnimatorGraphPanel` 的保存路径：它把校验结果当**警告**打在面板上，
+// 而不是拒绝写盘。
+std::string saveAnimController(const AnimController& ctl,
+                               const std::string& path);
 
 // 按控制器声明初始化参数黑板。**只在第一次**（由 `an.paramsInitialized`
 // 守）—— 每帧重置会把用户/脚本写进去的值抹掉。

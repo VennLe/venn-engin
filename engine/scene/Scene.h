@@ -10,6 +10,7 @@
 
 #include "ecs/Components.h"
 #include "ecs/World.h"
+#include "render/SkyParams.h"   // 纯数据头（只依赖 glm），不是渲染实现
 #include "scene/Bvh.h"
 #include "scene/Camera.h"
 #include "scene/Light.h"
@@ -242,6 +243,18 @@ public:
     PhysicsSettings& physicsSettings() { return m_physics; }
     const PhysicsSettings& physicsSettings() const { return m_physics; }
 
+    // ---- 天空 / 天气（2026-11-01）----
+    // 与 physicsSettings 同一个理由：天气是**这一关长什么样**的一部分，
+    // 不是全局渲染设置。随场景一起序列化，换场景就换天气。
+    //
+    // 为什么 Scene 直接持有 render::SkyParams：
+    //   SkyParams.h 只 include <glm/glm.hpp> + 三个标准头，是纯数据；
+    //   它的命名空间挂在 render 下只是因为"它描述的是渲染输入"。
+    //   真正会违反依赖方向的（Renderer / Environment）没有被碰 ——
+    //   scene 不认识 render::Renderer。
+    render::SkyParams& environment() { return m_sky; }
+    const render::SkyParams& environment() const { return m_sky; }
+
     // ---- 方向光（懒创建：首次调用时自动建实体）----
     Light& light();
     const Light& light() const;
@@ -312,6 +325,7 @@ private:
     std::vector<Camera> m_cameras{1};
     PostVolumeSet m_postVolumes;
     PhysicsSettings m_physics;
+    render::SkyParams m_sky;
     ecs::Entity m_lightEntity;
     // 脚本世界黑板（S2）：进存档
     std::unordered_map<std::string, double> m_scriptVars;

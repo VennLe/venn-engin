@@ -215,6 +215,26 @@ std::shared_ptr<AnimController> parseAnimController(const std::string& text) {
         }
     }
 
+    // ---- 编辑器画布坐标（可选，纯显示用）----
+    //
+    // 缺失 / 类型不对时**全部留 (0,0)** 而不是报错：老资产文件没有这一段，
+    // 而"图编辑器第一次打开时自动布点"是完全可接受的降级。
+    // 反过来说，如果这里报错，一个手写的 .anim.json 在重新保存前就再也
+    // 加载不了 —— 编辑器加的一个装饰字段不该有这种否决权。
+    ctl->nodePos.assign(ctl->states.size(), {0.0f, 0.0f});
+    if (j.contains("editor") && j["editor"].is_object()) {
+        const auto& ed = j["editor"];
+        if (ed.contains("nodes") && ed["nodes"].is_object()) {
+            for (size_t i = 0; i < ctl->states.size(); ++i) {
+                const auto it = ed["nodes"].find(ctl->states[i].name);
+                if (it == ed["nodes"].end()) continue;
+                if (!it->is_array() || it->size() < 2) continue;
+                ctl->nodePos[i] = {(*it)[0].get<float>(),
+                                   (*it)[1].get<float>()};
+            }
+        }
+    }
+
     // ---- 转移 ----
     if (j.contains("transitions") && j["transitions"].is_array()) {
         for (const auto& t : j["transitions"]) {
@@ -328,9 +348,118 @@ std::shared_ptr<AnimController> loadAnimController(const std::string& path) {
     return parsed;
 }
 
-void initControllerParams(const AnimController& ctl,
-                          ecs::AnimatorComponent& an) {
+// ---------------------------------------------------------------- 序列化
+//
+// 写出去的东西必须能被上面的 parseAnimController 原样读回来 —— 这是一条
+// **双向契约**，只写不读的字段（那三个浮点在编辑器里加过又忘了解析）会
+// 让"保存 → 重开 → 值变回去"变成一类查不到源头的怪 bug。
+//
+// 两个刻意的取舍：
+//   ① **不排序**。转移的优先级是数组顺序（文件头第 3 条），排序会静默
+//      改掉 "Any → Jump 先于 Idle → Walk" 这种刻意安排。
+//   ② 浮点先量化到 1e-6 再写。`0.15f` 的精确值是 0.1500000059604645，
+//      直接交给 nlohmann 会写出 17 位小数，人看着像被谁改过。
+namespace {
+
+double f6(float v) { return std::round(static_cast<double>(v) * 1e6) / 1e6; }
+
+}  // namespace
+
+std::string serializeAnimController(const AnimController& ctl) {
+    json j;
+    j["version"] = 1;
+
+    // defaultState 按**名字**写（schema 用的是名字，不是下标）。下标
+    // 越界时写空串 —— 这样重新加载会落到 states[0]，比留一个错名字好查：
+    // 错名字会撞上"引用了未知状态"的校验，而用户的意图多半就是第一个。
+    j["defaultState"] = ctl.defaultState >= 0
+                            ? std::string(ctl.stateName(ctl.defaultState))
+                            : std::string();
+
+    json jp = json::array();
     for (const ControllerParam& p : ctl.params) {
+        json e;
+        e["name"] = p.name;
+        e["type"] = paramTypeName(p.type);
+        // trigger 没有默认值（恒为 false），写出来反而让人以为可以设。
+        if (p.type == ParamType::Float) e["default"] = f6(p.defaultValue);
+        else if (p.type == ParamType::Bool) e["default"] = p.defaultValue != 0.0f;
+        jp.push_back(std::move(e));
+    }
+    j["parameters"] = std::move(jp);
+
+    json js = json::array();
+    for (const ControllerState& s : ctl.states) {
+        json e;
+        e["name"] = s.name;
+        e["clip"] = s.clip;
+        e["speed"] = f6(s.speed);
+        e["loop"] = s.loop;
+        js.push_back(std::move(e));
+    }
+    j["states"] = std::move(js);
+
+    json jt = json::array();
+    for (const ControllerTransition& t : ctl.transitions) {
+        json e;
+        e["from"] = t.from < 0 ? std::string("Any")
+                               : std::string(ctl.stateName(t.from));
+        e["to"] = std::string(ctl.stateName(t.to));
+        e["duration"] = f6(t.duration);
+        // 只有非默认值才写 —— hasExitTime=false / exitTime=0 / restart=true
+        // 是三份占位噪音，一份状态机里 8 条边就是 24 行垃圾。
+        if (t.hasExitTime) {
+            e["hasExitTime"] = true;
+            e["exitTime"] = f6(t.exitTime);
+        }
+        if (!t.restart) e["restart"] = false;
+
+        json jc = json::array();
+        for (const TransitionCondition& c : t.conditions) {
+            json ce;
+            ce["param"] = c.param;
+            ce["op"] = condOpName(c.op);
+            if (c.op != CondOp::Trigger) ce["value"] = f6(c.value);
+            jc.push_back(std::move(ce));
+        }
+        if (!jc.empty()) e["conditions"] = std::move(jc);
+        jt.push_back(std::move(e));
+    }
+    j["transitions"] = std::move(jt);
+
+    // 画布坐标。按名字存（删一个状态不会让别的错位）。
+    // 只有**每个**状态都有坐标时才写，否则整段省略、由编辑器重排 ——
+    // 半份坐标比没有更难解释（一半节点在原位、一半堆在原点）。
+    if (ctl.nodePos.size() == ctl.states.size()) {
+        json nodes = json::object();
+        bool any = false;
+        for (size_t i = 0; i < ctl.states.size(); ++i) {
+            const auto& p = ctl.nodePos[i];
+            nodes[ctl.states[i].name] = json::array({f6(p[0]), f6(p[1])});
+            if (p[0] != 0.0f || p[1] != 0.0f) any = true;
+        }
+        if (any) j["editor"] = json{{"nodes", std::move(nodes)}};
+    }
+
+    return j.dump(2) + "\n";
+}
+
+std::string saveAnimController(const AnimController& ctl,
+                               const std::string& path) {
+    if (path.empty()) return "路径为空";
+    const std::string abs = assets::resolveAssetPath(path);
+    FILE* fp = std::fopen(abs.c_str(), "wb");
+    if (!fp) return "写不了文件: " + abs;
+    const std::string text = serializeAnimController(ctl);
+    const size_t n = std::fwrite(text.data(), 1, text.size(), fp);
+    std::fclose(fp);
+    if (n != text.size()) return "写入不完整（" + std::to_string(n) + "/" +
+                                     std::to_string(text.size()) + "）: " + abs;
+    return std::string();
+}
+
+void initControllerParams(const AnimController& ctl,
+                          ecs::AnimatorComponent& an) {    for (const ControllerParam& p : ctl.params) {
         switch (p.type) {
             case ParamType::Float:
                 // **只填缺失的**：脚本可能已经在 setFloat 里写过值了，

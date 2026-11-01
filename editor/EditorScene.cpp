@@ -766,10 +766,24 @@ void resetToEmptyScene(scene::Scene& scene, assets::AssetManager& assets) {
     scene.light().castsShadow = true;
     scene.light().ambientScale = 0.55f;   // 开阔场景，环境光给足
 
-    scene.camera().setTarget(glm::vec3(0.0f, 0.0f, 0.5f));
-    scene.camera().setDistance(9.0f);
-    scene.camera().setYaw(0.62f);
-    scene.camera().setPitch(0.30f);
+    // 初始机位：退到 -Y 方向 30 m、抬高约 8 m、略俯视（pitch 0.26 rad ≈ 15°）。
+    //
+    // 2026-11-01 改的。原来的 (target 原点, distance 9, yaw 0.62) 是给
+    // "一张白纸看地板"配的 —— 站在 9 m 外看一个空原点。现在默认打开的
+    // 是 `anime_town.json`（街道沿 +Y 铺 52 m、两侧各 6 栋房子），
+    // 9 m 的机位会把相机塞进某栋房子里，第一眼看到的是"两堵墙"。
+    //
+    // 所有显式传 `MYVK_EDITOR_CAM` 的自动化用例不受影响 —— 它们在加载
+    // 之后把这个位姿整个覆盖掉。
+    scene.camera().setTarget(glm::vec3(0.0f, 2.0f, 2.5f));
+    scene.camera().setDistance(30.0f);
+    scene.camera().setYaw(1.5707963f);   // 正对 +Y（街道纵深方向）
+    scene.camera().setPitch(0.26f);
+    // ⚠ 编辑态相机是 **fly 模式**（applyEditorCameraMode 里设的），
+    //   target / distance 只在 orbit 模式有意义 —— 光设上面三行，位置仍然
+    //   停在 Camera 的默认值 (0,0,3)，第一眼还是"站在房子中间"。
+    //   必须显式给位置。
+    scene.camera().setPosition(glm::vec3(0.0f, -28.0f, 8.0f));
 
     // ---- 自带地面（UE5 手感的不透明平面）----
     // 尺寸与栅格的 extent（半边长 60 → 120×120）对齐：栅格正好铺满整块地面，

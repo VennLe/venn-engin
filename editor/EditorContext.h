@@ -898,6 +898,24 @@ public:
         return true;
     }
 
+    // ---------------------------------------------------------- 通用"打开某面板"
+    //
+    // Character Studio 的步骤条要能把人送到别的面板去（"曲线 → 打开
+    // 骨骼曲线编辑器"）。它自己不认识那些窗口、也不该认识 —— 于是和上面
+    // 三个请求同一个套路：置一个 id，EditorApp 每帧取走并 `setPanelOpen`。
+    //
+    // 用**面板 id 字符串**（与 `PanelDesc::id` 同一套），不用枚举：
+    // 面板表是这层唯一的名字来源，多一份枚举就多一处会忘记同步的清单。
+    //
+    // 只保留**最后一个**请求：用户一帧里连点三个步骤是不可能的，
+    // 而队列会让"点了但没反应"变成"过两帧突然连开三个窗口"。
+    void requestPanelOpen(const std::string& id) { m_pendingPanelOpen = id; }
+    std::string takePanelOpenRequest() {
+        std::string id;
+        id.swap(m_pendingPanelOpen);
+        return id;
+    }
+
     // ---------------------------------------------------------- UI 编辑器（#312）
     // ⚠ 它**没有 Inspector 入口**（UI 文档不是场景组件），但通道照样走
     //   `EditorContext`：`MYVK_EDITOR_UIED` 与"从菜单空手开窗"要落到同一个
@@ -1138,6 +1156,10 @@ private:
     // 待打开时间轴编辑器的资产路径（见 requestTimelineEditor）
     bool m_tlEditorRequest = false;
     std::string m_tlEditorPath;
+
+    // Character Studio 的"打开某面板"请求（空 = 没有请求）。
+    // 面板 id，不是枚举 —— 见 `requestPanelOpen()` 的说明。
+    std::string m_pendingPanelOpen;
 
     // 待打开 UI 编辑器的资产路径（见 requestUiEditor）
     bool m_uiEditorRequest = false;

@@ -436,6 +436,37 @@ public:
     }
 
     // ============================================================
+    // 天空参数（2026-11-01，见 render/SkyParams.h）
+    //
+    // ---- 为什么"改参数"和"重烘"是两个动作 ----
+    //   面板上拖一下滑条会连续产生几十次改动。每次都重跑一遍
+    //   compute 链（天空立方体 → 辐照度 → 预过滤 → BRDF 表，含一次
+    //   vkQueueWaitIdle）要几十毫秒，拖着走就是幻灯片。
+    //
+    //   于是：setSkyParams() 只**记下来并标脏**，背景（sky.frag）下一
+    //   帧就是新的（它实时解析计算，不吃烘焙图）；IBL 的三张图由
+    //   tickSkyRebuild() 节流重建 —— 距上次至少 6 帧，也就是拖动时
+    //   大约 10 Hz 刷新反射，松手后一次补齐。
+    //
+    //   ⚠ 这不会造成"背景与反射不一致"的可见错误：反射晚几十毫秒，
+    //     且云/星的细节在预过滤后本来就糊成低频。
+    // ============================================================
+    const render::SkyParams& skyParams() const { return m_skyParams; }
+
+    // 提交新参数（不立即重烘）。编辑器每帧把面板结果丢进来即可 ——
+    // 内容没变时内部直接返回，不做无谓的重建。
+    void setSkyParams(const render::SkyParams& p);
+
+    // 推进节流重建。Renderer::render 每帧调一次（见 .cpp 里的调用点）。
+    void tickSkyRebuild();
+
+    // 强制立刻重烘（面板上的 "Rebuild now" / 脚本里改完要马上截图）。
+    void rebuildSkyNow();
+
+    // 有多少次重建还没落地（面板用来显示"待应用"提示）。
+    bool skyRebuildPending() const { return m_skyDirty; }
+
+    // ============================================================
     // 反射探针（R5-1，见 render/ReflectionProbe.h）
     //
     // 探针本体（盒体 / 强度 / 是否盒投影）是 ECS 组件，由编辑器创建；
@@ -1257,6 +1288,15 @@ private:
     std::unique_ptr<ui2::UiRenderer> m_uiRenderer;
     std::unique_ptr<render::ClusteredLighting> m_lighting;
     std::unique_ptr<render::Environment> m_environment;
+    // ---- 天空参数（2026-11-01，见 render/SkyParams.h）----
+    // m_skyParams 是"面板想让它是什么"，Environment 里那份是"已经烘进
+    // IBL 的是什么"。两者在重建后同步 —— 面板显示永远以 m_skyParams
+    // 为准（否则拖动时滑条会跳回去）。
+    render::SkyParams m_skyParams;
+    bool m_skyDirty = false;
+    // 距离上一次重建还要等几帧（节流）。0 = 可以立刻重建。
+    int m_skyRebuildWait = 0;
+    static constexpr int kSkyRebuildCooldownFrames = 6;
     // ---- R5-1 反射探针（见 render/ReflectionProbe.h）----
     // 懒建：只有 m_probeSettings.enabled 为真时才分配 GPU 资源。
     // m_probeCaptureRequested 是"这一帧重捕一次"的一次性请求（Inspector
