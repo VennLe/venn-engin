@@ -1,21 +1,30 @@
-"""端到端验证：新工程初始场景 = 空场景 + 土黄地形 + GameStart 出生点。
+"""端到端验证：新工程初始场景 = 二次元小镇 + 出生点。
 
-对应 2026-10-21 第八轮的三条产品要求里后两条：
+2026-11-01 换的判据。在此之前这条用例守的是 2026-10-21 那轮的要求
+（"游戏创建成功后初始化的场景不需要摆放任何物体，但地面要初始化一个完整
+的地形，颜色是土黄色"）。用户看过小镇之后改主意了，原话是：
 
-  2. "游戏创建成功后初始化的场景不需要摆放任何物体，但地面要初始化一个
-     完整的地形，颜色是土黄色。"
-  3. "场景中心摆放一个 GameStart 组件，标记玩家初始化位置；视口里用简单
-     粗糙的 Q 版人物模型呈现。"
+    "把原来的那个游戏初始化场景移除掉，用这个新的替代"
+
+于是现在：`assets/scenes/main.json` = 小镇（街道 / 12 栋房子 / 树 / 灌木 /
+草地）+ `GameStart`；原来那张空地形场景降级成 `assets/scenes/terrain.json`，
+只作为地形特性的夹具与用法样例存在。
 
 断言分五组：
 
-  [1] 场景结构：从模板建工程 → 场景 JSON 里**只有** Terrain + GameStart
-      两个实体（没有任何道具），两者都没有 mesh。
-  [2] 地形：vterrain 引用的资产存在、二进制尺寸对、4 层都指向土黄材质，
-      且该材质 baseColor 是"土黄"（R>G>B 且 R 明显占优）。
-  [3] 编辑器：地形真的被加载（TERRAIN-LOAD + 4 条 TERRAIN-LAYER），
-      且出生点标记被画出来（GAMESTART-MARK 矩形落在视口内）。
-  [4] 运行时：Game.exe 打出 `GAME-PLAYER spawned at GameStart found=1`，
+  [1] 初始场景结构（`main.json`）：实体数够多、五类东西都在（Ground / Road /
+      House / Tree / Bush）、GameStart 在街心且 `mode` 跟模板类型走、
+      `environment` 块完整、**零外部资产引用**。
+      ⚠ 最后那条守的是 D6 纪律"模板不允许引用 build/bin/assets 里的模型/
+        材质"：小镇的房子是 `kind: builtin` 的 cube 拼的、材质是
+        `kind: procedural` 内联的 —— 所以模板工程**一个路径都不用带**。
+        哪天有人把房子换成真实 .glb，这条会红，那正是它存在的意义。
+  [2] 地形样例还在（`terrain.json`）：vterrain 存在、257x257、四层土黄材质、
+      出生点处地表高度为 0。这条同时是"地形特性用例的夹具没被删"的哨
+      （`verify_terrain_renorm` 直接打开这份场景）。
+  [3] 编辑器：打开工程 → 场景真的加载（实体数与 JSON 对得上，不是空场景
+      兜底）+ 出生点标记画在视口内。
+  [4] 运行时：`Game.exe` 打出 `GAME-PLAYER spawned at GameStart found=1`，
       并且玩家位置 == GameStart 位置（不是回落到原点）。
   [5] 干净：编辑器与运行时都没有 VUID / ERROR。
 
@@ -40,7 +49,18 @@ from verify_add_menu import LogTap, kill_stale_editors        # noqa: E402
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(REPO, "..", "_venn_verify")
 KIND = "third_person"
-CAM = "0,-7,4,90,14"      # 能同时看到地形起伏与出生点小人
+# 客户区坐标 + 角度：站在街心南侧 12 m、抬高 4 m，正对 +Y（街道纵深）。
+# 这样一条街、两侧房子、天和街心那个出生点小人同时在画面里。
+CAM = "0,-12,4,90,12"
+
+# `environment` 块必须带全的字段（`SkyParams::FromJson` 认这些名字）。
+ENV_KEYS = [
+    "zenith", "horizon", "ground", "cloudColor", "cloudCoverage",
+    "cloudThickness", "cloudScale", "cloudHeight", "cloudSpeed",
+    "cloudShadow", "cloudEdgeSharpness", "exposure", "starAmount",
+    "starBrightness", "sunDirection", "sunIntensity", "sunAngularRadius",
+    "horizonGlow",
+]
 
 
 def parse_rect(line):
@@ -48,7 +68,7 @@ def parse_rect(line):
                   line)
     if not m:
         return None
-    return tuple(float(v) for v in m.groups())
+    return tuple(float(m.group(i)) for i in (1, 2, 3, 4))
 
 
 def main():
@@ -70,49 +90,97 @@ def main():
             fails.append(label)
 
     print("=" * 68)
-    print("新工程初始场景：空场景 + 土黄地形 + GameStart")
+    print("新工程初始场景：二次元小镇 + GameStart 出生点")
     print("=" * 68)
 
-    # ================= 1) 建工程 + 场景结构 =================
+    # ================= 1) 建工程 + 初始场景结构 =================
     root = os.path.join(kit.WORK_ROOT, "template_scene", KIND)
     name = "SceneCheck"
     kit.make_project(root, KIND, name=name)
     assets = os.path.join(root, "assets")
     scene_path = os.path.join(assets, "scenes", "main.json")
 
-    print("\n[1] 场景结构（不应摆放任何物体）")
+    print("\n[1] 初始场景结构（小镇 + 出生点）")
     if not os.path.isfile(scene_path):
         print("  [FAIL] 场景没生成：%s" % scene_path)
         return 1
     doc = json.load(open(scene_path, encoding="utf-8"))
     ents = doc.get("entities", [])
-    names = [e.get("name") for e in ents]
-    check("场景只有 2 个实体（地形 + 出生点）", len(ents) == 2,
-          "实际: %s" % names)
-    kinds = []
-    for e in ents:
-        if "terrain" in e:
-            kinds.append("terrain")
-        elif "gameStart" in e:
-            kinds.append("gameStart")
-        elif "mesh" in e:
-            kinds.append("mesh")
-        else:
-            kinds.append("other")
-    check("实体是 terrain + gameStart", sorted(kinds) == ["gameStart", "terrain"],
-          "实际: %s" % kinds)
-    check("场景里没有任何网格物体（无道具）", "mesh" not in kinds)
-    gs = next((e for e in ents if "gameStart" in e), None)
-    check("GameStart 在场景中心 (0,0,0)",
-          gs is not None and
-          [round(v, 3) for v in gs["transform"]["position"]] == [0, 0, 0],
-          "" if gs is None else str(gs["transform"]["position"]))
-    check("GameStart 默认启用",
-          gs is not None and gs["gameStart"].get("enabled", True) is True)
+    names = [e.get("name", "") for e in ents]
 
-    # ================= 2) 地形资产 + 土黄色 =================
-    print("\n[2] 地形资产")
-    ter = next((e for e in ents if "terrain" in e), None)
+    # 157 = 1 地面 + 26 路砖 + 12 栋 × 6 件 + 12 树 + 24 灌木 + 1 出生点。
+    # 只判"≥ 100"：以后加几栋房子不该让这条用例红。
+    check("实体数够多（不是空场景）", len(ents) >= 100, "实际 %d" % len(ents))
+
+    def count_prefix(p):
+        return sum(1 for n in names if n.startswith(p))
+
+    houses = set()
+    for n in names:
+        m = re.match(r"House(\d+)_", n)
+        if m:
+            houses.add(m.group(1))
+    check("有 12 栋房子", len(houses) == 12, "House* 实体 %d 件 / 房子 %d 栋"
+          % (count_prefix("House"), len(houses)))
+    check("有主路（Road*）", count_prefix("Road") >= 20,
+          "%d 块路砖" % count_prefix("Road"))
+    check("有地面（Ground）", "Ground" in names)
+    check("有植被（Tree* / Bush*）",
+          count_prefix("Tree") >= 5 and count_prefix("Bush") >= 10,
+          "树 %d / 灌木 %d" % (count_prefix("Tree"), count_prefix("Bush")))
+
+    gs = next((e for e in ents if "gameStart" in e), None)
+    check("有出生点（GameStart）", gs is not None)
+    if gs:
+        check("出生点在街心 (0,0,0)",
+              [round(v, 3) for v in gs["transform"]["position"]] == [0, 0, 0],
+              str(gs["transform"]["position"]))
+        check("GameStart 默认启用",
+              gs["gameStart"].get("enabled", True) is True)
+        # ⚠ mode 写错不会报错，只会"一按 Play 就变第三人称"（2026-10-24 踩过）
+        want = "first" if KIND.startswith("first") else "third"
+        check("GameStart.mode 跟模板类型走", gs["gameStart"].get("mode") == want,
+              "%s（期望 %s）" % (gs["gameStart"].get("mode"), want))
+        check("出生点挂了世界逻辑脚本",
+              gs.get("script", {}).get("path") == "scripts/main.vks",
+              str(gs.get("script", {}).get("path")))
+
+    env = doc.get("environment")
+    check("有 environment 块（天空不再是引擎默认）", isinstance(env, dict))
+    if isinstance(env, dict):
+        miss = [k for k in ENV_KEYS if k not in env]
+        check("environment 18 个字段齐全", not miss, "缺 %s" % miss if miss else "")
+        cov = env.get("cloudCoverage", 0.0)
+        check("云量 > 0（天上真的有云）", cov > 0.1, "cloudCoverage=%.2f" % cov)
+
+    # ---- 零外部资产引用（D6 纪律）----
+    bad_ref = []
+    for e in ents:
+        mesh = e.get("mesh")
+        if isinstance(mesh, dict) and mesh.get("kind") != "builtin":
+            bad_ref.append("%s.mesh=%s" % (e.get("name"), mesh.get("kind")))
+        matr = e.get("material")
+        if isinstance(matr, dict) and matr.get("kind") != "procedural":
+            bad_ref.append("%s.material=%s" % (e.get("name"), matr.get("kind")))
+    check("场景自包含：mesh 全是 builtin、material 全是 procedural",
+          not bad_ref, bad_ref[0] if bad_ref else "156 件全是内联图元")
+
+    check("初始场景里没有地形实体（小镇用的是 Ground 平面）",
+          not any("terrain" in e for e in ents))
+    check("物理开着（groundPlane）",
+          doc.get("physics", {}).get("enabled") is True and
+          doc.get("physics", {}).get("groundPlane") is True)
+
+    # ================= 2) 地形样例还在（不是初始场景）=================
+    print("\n[2] 地形样例场景（scenes/terrain.json）")
+    tpath = os.path.join(assets, "scenes", "terrain.json")
+    check("terrain.json 存在", os.path.isfile(tpath))
+    tdoc = json.load(open(tpath, encoding="utf-8")) \
+        if os.path.isfile(tpath) else {}
+    tents = tdoc.get("entities", [])
+    ter = next((e for e in tents if "terrain" in e), None)
+    check("terrain.json 里有地形实体", ter is not None,
+          "实体 %s" % [e.get("name") for e in tents])
     src = ter["terrain"]["source"] if ter else ""
     vpath = os.path.join(assets, src.replace("/", os.sep))
     check("vterrain 存在", os.path.isfile(vpath), src)
@@ -135,12 +203,11 @@ def main():
     #   写的是 z=0，人就直接站在土里了。
     #   契约：**原点处的归一化值恰好是 0**，且 `maxHeight` 等于地形真正的
     #   最高点（值域 [0, hi] 才自洽，否则坡度全都虚高）。
-    import struct as _struct
     hp = os.path.join(os.path.dirname(vpath), vj.get("height", "height.r32"))
     if os.path.isfile(hp):
         n = cols * rows
         with open(hp, "rb") as f:
-            hs = _struct.unpack("<%df" % n, f.read(4 * n))
+            hs = struct.unpack("<%df" % n, f.read(4 * n))
         mpp = vj.get("metersPerPixel", 0.0)
         maxh = vj.get("maxHeight", 0.0)
         # 与 C++ `physics::heightAt` 同源：世界原点 → 列主序纹素下标
@@ -181,17 +248,19 @@ def main():
         check("材质带 %s 贴图且文件存在" % slot, ok,
               tp if tp else "（缺 %s 槽）" % slot)
 
-    # ================= 3) 编辑器：地形 + 标记 =================
+    # ================= 3) 编辑器：场景真的加载 =================
     print("\n[3] 编辑器加载")
     kill_stale_editors()
-    env = kit.clean_env({
+    env_vars = kit.clean_env({
         "MYVK_ASSET_DIR": assets,
         "MYVK_EDITOR_SCENE": "scenes/main.json",
         "MYVK_NO_WINDOW_SAVE": "1",
         "MYVK_LOG_RECTS": "1",
         "MYVK_EDITOR_CAM": CAM,
+        # 关掉栅格与 HUD：小镇本身就有 26 块路砖，叠一层栅格看不出路
+        "MYVK_EDITOR_NO_GRID": "1",
     })
-    proc = subprocess.Popen([kit.EDITOR], cwd=root, env=env,
+    proc = subprocess.Popen([kit.EDITOR], cwd=root, env=env_vars,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, encoding="utf-8", errors="replace",
                             bufsize=1)
@@ -208,11 +277,20 @@ def main():
             with tap.lock:
                 lines = list(tap.lines)
             txt = "\n".join(lines)
-            check("地形被加载（TERRAIN-LOAD）", "TERRAIN-LOAD" in txt)
-            n_layer = len(re.findall(r"TERRAIN-LAYER idx=", txt))
-            check("4 层地形材质都解析到了", n_layer == 4, "n=%d" % n_layer)
-            check("场景里没有光球/传送门（无 PICKUP/PORTAL 实体）",
-                  "Pickup_" not in txt and "Portal" not in txt)
+
+            # "Editor: auto-opened scene '<path>' (N entities)" —— 实体数
+            # 是最硬的证据：空场景兜底时会打另一条日志（"no default scene"）。
+            #
+            # ⚠ 期望是 **JSON 实体数 + 1**：`Scene::lightEntity()` 会把场景的
+            #   `light` 块懒创建成一个**实体**，而它不在 `entities[]` 里。
+            #   写成"≥ N"就成了永远为真的假绿 —— 这里刻意写死等号
+            #   （同一条纪律见 `verify_launcher_project` 的 ①）。
+            m = re.search(r"auto-opened scene '.*?' \((\d+) entities\)", txt)
+            want_n = len(ents) + 1
+            check("初始场景被打开且实体数对得上",
+                  m is not None and int(m.group(1)) == want_n,
+                  "日志 %s / 期望 %d（JSON %d + 场景太阳 1）"
+                  % (m.group(1) if m else "（没有这行）", want_n, len(ents)))
 
             mark = None
             for l in reversed(lines):

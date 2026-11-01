@@ -1,42 +1,64 @@
 {
   "version": 1,
-  "generator": "gen_templates.py (third_person) —— 空场景：地形 + 出生点",
+  "generator": "gen_templates.py (third_person) —— 二次元小镇 + 出生点",
   "camera": {
     "target": [
       0.0,
       0.0,
-      1.2
+      1.6
     ],
-    "yaw": 3.141592653589793,
-    "pitch": 0.35,
-    "distance": 4.5,
+    "yaw": 1.5707963267948966,
+    "pitch": 0.26,
+    "distance": 14.0,
     "fov": 55.0
-  },
-  "light": {
-    "direction": [
-      0.42,
-      0.66,
-      -0.62
-    ],
-    "color": [
-      1.0,
-      0.96,
-      0.9
-    ],
-    "intensity": 3.2,
-    "castsShadow": true,
-    "ambientScale": 1.0
   },
   "physics": {
     "enabled": true,
-    "groundPlane": true,
-    "fixedTimeStep": 0.0166666675,
-    "maxSubSteps": 4,
-    "allowSleep": true
+    "groundPlane": true
+  },
+  "environment": {
+    "zenith": [
+      0.16,
+      0.36,
+      0.82
+    ],
+    "horizon": [
+      0.6,
+      0.76,
+      0.93
+    ],
+    "ground": [
+      0.4,
+      0.48,
+      0.36
+    ],
+    "cloudColor": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "cloudCoverage": 0.52,
+    "cloudThickness": 0.94,
+    "cloudScale": 1.25,
+    "cloudHeight": 900.0,
+    "cloudSpeed": 0.012,
+    "cloudShadow": 0.58,
+    "cloudEdgeSharpness": 0.6,
+    "exposure": 0.92,
+    "starAmount": 0.0,
+    "starBrightness": 0.0,
+    "sunDirection": [
+      0.522,
+      -0.326,
+      0.788
+    ],
+    "sunIntensity": 1.0,
+    "sunAngularRadius": 0.017,
+    "horizonGlow": 0.3
   },
   "entities": [
     {
-      "name": "Terrain",
+      "name": "Ground",
       "transform": {
         "position": [
           0.0,
@@ -56,18 +78,7783 @@
       },
       "parent": -1,
       "visible": true,
-      "castShadow": false,
-      "locked": true,
-      "terrain": {
-        "source": "terrain/ground/terrain.vterrain",
-        "visible": true,
-        "heightScale": 1.0,
-        "layers": [
-          "",
-          "",
-          "",
-          ""
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "plane",
+        "size": 260.0,
+        "name": "anime_town_ground"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_ground_mat",
+        "baseColor": [
+          0.34,
+          0.48,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.92,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road00",
+      "transform": {
+        "position": [
+          0.0,
+          -26.0,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.06
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
         ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road01",
+      "transform": {
+        "position": [
+          0.38505072974560733,
+          -23.92,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.058803994670474494
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road02",
+      "transform": {
+        "position": [
+          0.7582144309839376,
+          -21.84,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0552636596401731
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road03",
+      "transform": {
+        "position": [
+          1.1079710435986738,
+          -19.759999999999998,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0495201368945807
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road04",
+      "transform": {
+        "position": [
+          1.4235231154527774,
+          -17.68,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.04180240256082992
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road05",
+      "transform": {
+        "position": [
+          1.6951291341067363,
+          -15.6,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.032418138352088385
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road06",
+      "transform": {
+        "position": [
+          1.9144042602729565,
+          -13.52,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.021741465268600418
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road07",
+      "transform": {
+        "position": [
+          2.074579178964302,
+          -11.439999999999998,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.010198028574014448
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road08",
+      "transform": {
+        "position": [
+          2.17070907725731,
+          -9.36,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.0017519713380773289
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road09",
+      "transform": {
+        "position": [
+          2.1998262972483955,
+          -7.280000000000001,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.013632125681585212
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road10",
+      "transform": {
+        "position": [
+          2.1610319516031153,
+          -5.199999999999999,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.024968810192828542
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road11",
+      "transform": {
+        "position": [
+          2.055523673404547,
+          -3.120000000000001,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.03531006703532075
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road12",
+      "transform": {
+        "position": [
+          1.8865586436260355,
+          -1.0399999999999991,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.044243622932474726
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road13",
+      "transform": {
+        "position": [
+          1.659353037619429,
+          1.0399999999999991,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.05141332520213684
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road14",
+      "transform": {
+        "position": [
+          1.3809209948395413,
+          3.1200000000000045,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.0565333404401195
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road15",
+      "transform": {
+        "position": [
+          1.0598580830237745,
+          5.199999999999999,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.05939954979602672
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road16",
+      "transform": {
+        "position": [
+          0.7060759415758614,
+          7.280000000000001,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.05989768654768519
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road17",
+      "transform": {
+        "position": [
+          0.3304962960656647,
+          9.36,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.05800789155476765
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road18",
+      "transform": {
+        "position": [
+          -0.05528620997534168,
+          11.439999999999998,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.05380550498004883
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road19",
+      "transform": {
+        "position": [
+          -0.43936195713169407,
+          13.520000000000003,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.04745806271486501
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road20",
+      "transform": {
+        "position": [
+          -0.8098740159062905,
+          15.600000000000001,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.03921861725181672
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road21",
+      "transform": {
+        "position": [
+          -1.1553841859148493,
+          17.68,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.029415649280441963
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road22",
+      "transform": {
+        "position": [
+          -1.4652261083553526,
+          19.759999999999998,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.01843997219870516
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road23",
+      "transform": {
+        "position": [
+          -1.729834550700561,
+          21.840000000000003,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.006729151616103239
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road24",
+      "transform": {
+        "position": [
+          -1.9410406981568966,
+          23.92,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.005249939006366783
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Road25",
+      "transform": {
+        "position": [
+          -2.0923243358493377,
+          26.0,
+          0.012
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.017019731127793574
+        ],
+        "scale": [
+          3.2,
+          1.9,
+          0.02
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "anime_town_road_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_road_mat",
+        "baseColor": [
+          0.42,
+          0.4,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.95,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House00_wall",
+      "transform": {
+        "position": [
+          -7.2,
+          -19.0,
+          1.7
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.1
+        ],
+        "scale": [
+          3.6,
+          3.2,
+          3.4
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House00_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House00_wall_mat",
+        "baseColor": [
+          0.74,
+          0.68,
+          0.6,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House00_roof_L",
+      "transform": {
+        "position": [
+          -8.234804331889148,
+          -19.103826753312703,
+          4.099048574594121
+        ],
+        "rotation": [
+          0.0,
+          -0.5917974846468985,
+          0.1
+        ],
+        "scale": [
+          2.5562074212978247,
+          3.7600000000000002,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House00_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House00_roof_mat",
+        "baseColor": [
+          0.62,
+          0.24,
+          0.22,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House00_roof_R",
+      "transform": {
+        "position": [
+          -6.1651956681108535,
+          -18.896173246687297,
+          4.099048574594121
+        ],
+        "rotation": [
+          0.0,
+          0.5917974846468985,
+          0.1
+        ],
+        "scale": [
+          2.5562074212978247,
+          3.7600000000000002,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House00_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House00_roof_mat",
+        "baseColor": [
+          0.62,
+          0.24,
+          0.22,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House00_door",
+      "transform": {
+        "position": [
+          -8.150771768034526,
+          -17.457211276581106,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.1
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House00_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House00_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House00_win_01",
+      "transform": {
+        "position": [
+          -6.432402904600566,
+          -17.274749090962608,
+          1.02
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.1
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House00_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House00_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House00_win_10",
+      "transform": {
+        "position": [
+          -8.295050702001031,
+          -17.46163724692547,
+          2.448
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.1
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House00_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House00_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House00_win_11",
+      "transform": {
+        "position": [
+          -6.432402904600566,
+          -17.274749090962608,
+          2.448
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.1
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House00_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House00_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House00_chimney",
+      "transform": {
+        "position": [
+          -6.254539849388323,
+          -18.326245516819853,
+          4.448572861891182
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.1
+        ],
+        "scale": [
+          0.3,
+          0.3,
+          1.6078117215664793
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House00_chimney_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House00_chimney_mat",
+        "baseColor": [
+          0.62,
+          0.24,
+          0.22,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.8,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House01_wall",
+      "transform": {
+        "position": [
+          -8.4,
+          -12.0,
+          1.35
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.06
+        ],
+        "scale": [
+          2.9,
+          3.6,
+          2.7
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House01_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House01_wall_mat",
+        "baseColor": [
+          0.8,
+          0.62,
+          0.65,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House01_roof_L",
+      "transform": {
+        "position": [
+          -9.263443467043952,
+          -11.94813113439528,
+          3.203570398125004
+        ],
+        "rotation": [
+          0.0,
+          -0.5272002862034746,
+          -0.06
+        ],
+        "scale": [
+          2.051807329258013,
+          4.16,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House01_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House01_roof_mat",
+        "baseColor": [
+          0.2,
+          0.26,
+          0.42,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House01_roof_R",
+      "transform": {
+        "position": [
+          -7.536556532956049,
+          -12.05186886560472,
+          3.203570398125004
+        ],
+        "rotation": [
+          0.0,
+          0.5272002862034746,
+          -0.06
+        ],
+        "scale": [
+          2.051807329258013,
+          4.16,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House01_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House01_roof_mat",
+        "baseColor": [
+          0.2,
+          0.26,
+          0.42,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House01_door",
+      "transform": {
+        "position": [
+          -8.927117812621278,
+          -10.13503597578469,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.06
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House01_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House01_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House01_win_01",
+      "transform": {
+        "position": [
+          -7.537023020966678,
+          -10.208523867404725,
+          0.81
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.06
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House01_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House01_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House01_win_10",
+      "transform": {
+        "position": [
+          -9.042309435188965,
+          -10.118098145633724,
+          1.944
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.06
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House01_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House01_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House01_win_11",
+      "transform": {
+        "position": [
+          -7.537023020966678,
+          -10.208523867404725,
+          1.944
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.06
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House01_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House01_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House01_chimney",
+      "transform": {
+        "position": [
+          -7.550604485373935,
+          -11.401856823383298,
+          3.455355597187506
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.06
+        ],
+        "scale": [
+          0.3,
+          0.3,
+          1.158211915687509
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House01_chimney_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House01_chimney_mat",
+        "baseColor": [
+          0.2,
+          0.26,
+          0.42,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.8,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House02_wall",
+      "transform": {
+        "position": [
+          -6.6,
+          -6.0,
+          2.1
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.04
+        ],
+        "scale": [
+          4.2,
+          3.0,
+          4.2
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House02_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House02_wall_mat",
+        "baseColor": [
+          0.6,
+          0.7,
+          0.82,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House02_roof_L",
+      "transform": {
+        "position": [
+          -7.789048126926563,
+          -6.047587307682095,
+          4.842707294733195
+        ],
+        "rotation": [
+          0.0,
+          -0.4952030685493106,
+          0.04
+        ],
+        "scale": [
+          2.7549382001837026,
+          3.56,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House02_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House02_roof_mat",
+        "baseColor": [
+          0.24,
+          0.36,
+          0.3,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House02_roof_R",
+      "transform": {
+        "position": [
+          -5.4109518730734365,
+          -5.952412692317905,
+          4.842707294733195
+        ],
+        "rotation": [
+          0.0,
+          0.4952030685493106,
+          0.04
+        ],
+        "scale": [
+          2.7549382001837026,
+          3.56,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House02_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House02_roof_mat",
+        "baseColor": [
+          0.24,
+          0.36,
+          0.3,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House02_door",
+      "transform": {
+        "position": [
+          -7.5844445798602935,
+          -4.508173981597153,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.04
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House02_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House02_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House02_win_01",
+      "transform": {
+        "position": [
+          -5.570457058173628,
+          -4.417563482810289,
+          1.26
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.04
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House02_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House02_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House02_win_10",
+      "transform": {
+        "position": [
+          -7.752710091121204,
+          -4.504900188673899,
+          3.024
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.04
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House02_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House02_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House02_win_11",
+      "transform": {
+        "position": [
+          -5.570457058173628,
+          -4.417563482810289,
+          3.024
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.04
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House02_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House02_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House02_chimney",
+      "transform": {
+        "position": [
+          -5.446534915027472,
+          -5.41340448539959,
+          5.164060942099793
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.04
+        ],
+        "scale": [
+          0.3,
+          0.3,
+          1.4782267778863492
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House02_chimney_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House02_chimney_mat",
+        "baseColor": [
+          0.24,
+          0.36,
+          0.3,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.8,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House03_wall",
+      "transform": {
+        "position": [
+          -9.0,
+          0.5,
+          1.5
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.14
+        ],
+        "scale": [
+          3.1,
+          3.1,
+          3.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House03_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House03_wall_mat",
+        "baseColor": [
+          0.66,
+          0.78,
+          0.66,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House03_roof_L",
+      "transform": {
+        "position": [
+          -9.906047636534563,
+          0.3723180501005236,
+          3.526259129668038
+        ],
+        "rotation": [
+          0.0,
+          -0.52194443896167,
+          0.14
+        ],
+        "scale": [
+          2.1610885074377726,
+          3.66,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House03_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House03_roof_mat",
+        "baseColor": [
+          0.46,
+          0.3,
+          0.2,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House03_roof_R",
+      "transform": {
+        "position": [
+          -8.093952363465437,
+          0.6276819498994763,
+          3.526259129668038
+        ],
+        "rotation": [
+          0.0,
+          0.52194443896167,
+          0.14
+        ],
+        "scale": [
+          2.1610885074377726,
+          3.66,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House03_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House03_roof_mat",
+        "baseColor": [
+          0.46,
+          0.3,
+          0.2,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House03_door",
+      "transform": {
+        "position": [
+          -9.895805430554914,
+          1.9693728698285975,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.14
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House03_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House03_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House03_win_01",
+      "transform": {
+        "position": [
+          -8.423759459336951,
+          2.1869151843813475,
+          0.8999999999999999
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.14
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House03_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House03_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House03_win_10",
+      "transform": {
+        "position": [
+          -10.019987645231721,
+          1.9619716835748384,
+          2.16
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.14
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House03_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House03_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House03_win_11",
+      "transform": {
+        "position": [
+          -8.423759459336951,
+          2.1869151843813475,
+          2.16
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.14
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House03_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House03_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House03_chimney",
+      "transform": {
+        "position": [
+          -8.218357573258915,
+          1.1736639493978487,
+          3.7893886945020574
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.14
+        ],
+        "scale": [
+          0.3,
+          0.3,
+          1.2103959982364876
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House03_chimney_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House03_chimney_mat",
+        "baseColor": [
+          0.46,
+          0.3,
+          0.2,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.8,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House04_wall",
+      "transform": {
+        "position": [
+          -6.9,
+          7.0,
+          1.9
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.1
+        ],
+        "scale": [
+          3.8,
+          3.4,
+          3.8
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House04_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House04_wall_mat",
+        "baseColor": [
+          0.82,
+          0.75,
+          0.54,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House04_roof_L",
+      "transform": {
+        "position": [
+          -7.984554540153049,
+          7.108818424145043,
+          4.589890721438486
+        ],
+        "rotation": [
+          0.0,
+          -0.6270921070701125,
+          -0.1
+        ],
+        "scale": [
+          2.7422313064182373,
+          3.96,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House04_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House04_roof_mat",
+        "baseColor": [
+          0.34,
+          0.22,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House04_roof_R",
+      "transform": {
+        "position": [
+          -5.815445459846952,
+          6.891181575854957,
+          4.589890721438486
+        ],
+        "rotation": [
+          0.0,
+          0.6270921070701125,
+          -0.1
+        ],
+        "scale": [
+          2.7422313064182373,
+          3.96,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House04_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House04_roof_mat",
+        "baseColor": [
+          0.34,
+          0.22,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House04_door",
+      "transform": {
+        "position": [
+          -7.559111671373418,
+          8.804817942247734,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.1
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House04_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House04_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House04_win_01",
+      "transform": {
+        "position": [
+          -5.743225739739829,
+          8.6326718319367,
+          1.14
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.1
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House04_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House04_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House04_win_10",
+      "transform": {
+        "position": [
+          -7.709353970329209,
+          8.829942663230831,
+          2.7359999999999998
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.1
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House04_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House04_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House04_win_11",
+      "transform": {
+        "position": [
+          -5.743225739739829,
+          8.6326718319367,
+          2.7359999999999998
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.1
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House04_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House04_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House05_wall",
+      "transform": {
+        "position": [
+          -8.2,
+          14.0,
+          1.45
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.07
+        ],
+        "scale": [
+          3.3,
+          3.0,
+          2.9
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House05_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House05_wall_mat",
+        "baseColor": [
+          0.7,
+          0.64,
+          0.78,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House05_roof_L",
+      "transform": {
+        "position": [
+          -9.162636715244414,
+          13.932505152319282,
+          3.560784172376484
+        ],
+        "rotation": [
+          0.0,
+          -0.6004178718341718,
+          0.07
+        ],
+        "scale": [
+          2.3891115599417443,
+          3.56,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House05_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House05_roof_mat",
+        "baseColor": [
+          0.62,
+          0.24,
+          0.22,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House05_roof_R",
+      "transform": {
+        "position": [
+          -7.237363284755585,
+          14.067494847680718,
+          3.560784172376484
+        ],
+        "rotation": [
+          0.0,
+          0.6004178718341718,
+          0.07
+        ],
+        "scale": [
+          2.3891115599417443,
+          3.56,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House05_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House05_roof_mat",
+        "baseColor": [
+          0.62,
+          0.24,
+          0.22,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House05_door",
+      "transform": {
+        "position": [
+          -9.031234582610306,
+          15.475474523220468,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.07
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House05_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House05_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House05_win_01",
+      "transform": {
+        "position": [
+          -7.451813226682486,
+          15.596239503405654,
+          0.87
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.07
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House05_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House05_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House05_win_10",
+      "transform": {
+        "position": [
+          -9.163610743117115,
+          15.476217577374447,
+          2.088
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.07
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House05_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House05_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House05_win_11",
+      "transform": {
+        "position": [
+          -7.451813226682486,
+          15.596239503405654,
+          2.088
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.07
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House05_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House05_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House05_chimney",
+      "transform": {
+        "position": [
+          -7.316032013328236,
+          14.603304731076651,
+          3.8911762585647267
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.07
+        ],
+        "scale": [
+          0.3,
+          0.3,
+          1.5198035964659138
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House05_chimney_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House05_chimney_mat",
+        "baseColor": [
+          0.62,
+          0.24,
+          0.22,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.8,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House06_wall",
+      "transform": {
+        "position": [
+          7.0,
+          -16.0,
+          1.6
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.12
+        ],
+        "scale": [
+          3.4,
+          3.3,
+          3.2
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House06_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House06_wall_mat",
+        "baseColor": [
+          0.74,
+          0.68,
+          0.6,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House06_roof_L",
+      "transform": {
+        "position": [
+          6.017119450504673,
+          -15.88148491478397,
+          3.8955900177011267
+        ],
+        "rotation": [
+          0.0,
+          -0.6124796323603926,
+          -0.12
+        ],
+        "scale": [
+          2.4698722881387383,
+          3.86,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House06_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House06_roof_mat",
+        "baseColor": [
+          0.2,
+          0.26,
+          0.42,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House06_roof_R",
+      "transform": {
+        "position": [
+          7.982880549495327,
+          -16.118515085216032,
+          3.8955900177011267
+        ],
+        "rotation": [
+          0.0,
+          0.6124796323603926,
+          -0.12
+        ],
+        "scale": [
+          2.4698722881387383,
+          3.86,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House06_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House06_roof_mat",
+        "baseColor": [
+          0.2,
+          0.26,
+          0.42,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House06_door",
+      "transform": {
+        "position": [
+          6.458495648626692,
+          -14.242536760713394,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.12
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House06_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House06_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House06_win_01",
+      "transform": {
+        "position": [
+          8.079956464413092,
+          -14.427978996650372,
+          0.96
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.12
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House06_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House06_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House06_win_10",
+      "transform": {
+        "position": [
+          6.324670796223455,
+          -14.216327814163563,
+          2.304
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.12
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House06_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House06_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House06_win_11",
+      "transform": {
+        "position": [
+          8.079956464413092,
+          -14.427978996650372,
+          2.304
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.12
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House06_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House06_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House06_chimney",
+      "transform": {
+        "position": [
+          8.016262872462498,
+          -15.524237691641856,
+          4.243385026551691
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.12
+        ],
+        "scale": [
+          0.3,
+          0.3,
+          1.5998570407125912
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House06_chimney_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House06_chimney_mat",
+        "baseColor": [
+          0.2,
+          0.26,
+          0.42,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.8,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House07_wall",
+      "transform": {
+        "position": [
+          8.8,
+          -9.5,
+          2.3
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.05
+        ],
+        "scale": [
+          4.5,
+          3.5,
+          4.6
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House07_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House07_wall_mat",
+        "baseColor": [
+          0.8,
+          0.62,
+          0.65,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House07_roof_L",
+      "transform": {
+        "position": [
+          7.536580920600368,
+          -9.563223649127409,
+          5.282117463892512
+        ],
+        "rotation": [
+          0.0,
+          -0.49453171454083333,
+          0.05
+        ],
+        "scale": [
+          2.924375921515593,
+          4.0600000000000005,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House07_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House07_roof_mat",
+        "baseColor": [
+          0.24,
+          0.36,
+          0.3,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House07_roof_R",
+      "transform": {
+        "position": [
+          10.063419079399633,
+          -9.436776350872591,
+          5.282117463892512
+        ],
+        "rotation": [
+          0.0,
+          0.49453171454083333,
+          0.05
+        ],
+        "scale": [
+          2.924375921515593,
+          4.0600000000000005,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House07_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House07_roof_mat",
+        "baseColor": [
+          0.24,
+          0.36,
+          0.3,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House07_door",
+      "transform": {
+        "position": [
+          7.722274320907176,
+          -7.771703914074932,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.05
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House07_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House07_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House07_win_01",
+      "transform": {
+        "position": [
+          9.879075091667596,
+          -7.653761405846317,
+          1.38
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.05
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House07_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House07_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House07_win_10",
+      "transform": {
+        "position": [
+          7.5419994823433765,
+          -7.770712661939704,
+          3.312
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.05
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House07_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House07_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House07_win_11",
+      "transform": {
+        "position": [
+          9.879075091667596,
+          -7.653761405846317,
+          3.312
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.05
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House07_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House07_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House07_chimney",
+      "transform": {
+        "position": [
+          10.026938451457132,
+          -8.807813582670116,
+          5.623176195838769
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.05
+        ],
+        "scale": [
+          0.3,
+          0.3,
+          1.5688701669527796
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House07_chimney_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House07_chimney_mat",
+        "baseColor": [
+          0.24,
+          0.36,
+          0.3,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.8,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House08_wall",
+      "transform": {
+        "position": [
+          6.4,
+          -3.0,
+          1.4
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.11
+        ],
+        "scale": [
+          3.0,
+          3.6,
+          2.8
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House08_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House08_wall_mat",
+        "baseColor": [
+          0.6,
+          0.7,
+          0.82,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House08_roof_L",
+      "transform": {
+        "position": [
+          5.51537907281854,
+          -3.0977026877450857,
+          3.339275508532139
+        ],
+        "rotation": [
+          0.0,
+          -0.5447665883746255,
+          0.11
+        ],
+        "scale": [
+          2.131266993062252,
+          4.16,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House08_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House08_roof_mat",
+        "baseColor": [
+          0.46,
+          0.3,
+          0.2,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House08_roof_R",
+      "transform": {
+        "position": [
+          7.284620927181461,
+          -2.9022973122549143,
+          3.339275508532139
+        ],
+        "rotation": [
+          0.0,
+          0.5447665883746255,
+          0.11
+        ],
+        "scale": [
+          2.131266993062252,
+          4.16,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House08_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House08_roof_mat",
+        "baseColor": [
+          0.46,
+          0.3,
+          0.2,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House08_door",
+      "transform": {
+        "position": [
+          5.54309468481655,
+          -1.2535140192917802,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.11
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House08_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House08_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House08_win_01",
+      "transform": {
+        "position": [
+          6.973293682865822,
+          -1.0854937051066815,
+          0.84
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.11
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House08_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House08_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House08_win_10",
+      "transform": {
+        "position": [
+          5.422722170053375,
+          -1.2567478544126742,
+          2.016
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.11
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House08_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House08_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House08_win_11",
+      "transform": {
+        "position": [
+          6.973293682865822,
+          -1.0854937051066815,
+          2.016
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.11
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House08_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House08_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House09_wall",
+      "transform": {
+        "position": [
+          9.4,
+          3.5,
+          1.8
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.04
+        ],
+        "scale": [
+          3.7,
+          3.2,
+          3.6
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House09_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House09_wall_mat",
+        "baseColor": [
+          0.66,
+          0.78,
+          0.66,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House09_roof_L",
+      "transform": {
+        "position": [
+          8.33585188640606,
+          3.5425886409087655,
+          4.306829578801378
+        ],
+        "rotation": [
+          0.0,
+          -0.5859388253927486,
+          -0.04
+        ],
+        "scale": [
+          2.6064295832027393,
+          3.7600000000000002,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House09_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House09_roof_mat",
+        "baseColor": [
+          0.34,
+          0.22,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House09_roof_R",
+      "transform": {
+        "position": [
+          10.464148113593941,
+          3.4574113590912345,
+          4.306829578801378
+        ],
+        "rotation": [
+          0.0,
+          0.5859388253927486,
+          -0.04
+        ],
+        "scale": [
+          2.6064295832027393,
+          3.7600000000000002,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House09_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House09_roof_mat",
+        "baseColor": [
+          0.34,
+          0.22,
+          0.38,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House09_door",
+      "transform": {
+        "position": [
+          8.651833727902178,
+          5.161247491885314,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.04
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House09_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House09_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House09_win_01",
+      "transform": {
+        "position": [
+          10.426813010673943,
+          5.100218435436462,
+          1.08
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.04
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House09_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House09_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House09_win_10",
+      "transform": {
+        "position": [
+          8.50435200545822,
+          5.177157914411546,
+          2.592
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.04
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House09_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House09_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House09_win_11",
+      "transform": {
+        "position": [
+          10.426813010673943,
+          5.100218435436462,
+          2.592
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.04
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House09_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House09_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House10_wall",
+      "transform": {
+        "position": [
+          6.8,
+          10.0,
+          2.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.08
+        ],
+        "scale": [
+          4.0,
+          3.4,
+          4.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House10_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House10_wall_mat",
+        "baseColor": [
+          0.82,
+          0.75,
+          0.54,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House10_roof_L",
+      "transform": {
+        "position": [
+          5.663646054815014,
+          9.908897248875142,
+          4.6261396800803585
+        ],
+        "rotation": [
+          0.0,
+          -0.5022636277591037,
+          0.08
+        ],
+        "scale": [
+          2.651269612301758,
+          3.96,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House10_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House10_roof_mat",
+        "baseColor": [
+          0.62,
+          0.24,
+          0.22,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House10_roof_R",
+      "transform": {
+        "position": [
+          7.936353945184986,
+          10.091102751124858,
+          4.6261396800803585
+        ],
+        "rotation": [
+          0.0,
+          0.5022636277591037,
+          0.08
+        ],
+        "scale": [
+          2.651269612301758,
+          3.96,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House10_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House10_roof_mat",
+        "baseColor": [
+          0.62,
+          0.24,
+          0.22,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House10_door",
+      "transform": {
+        "position": [
+          5.784562077887026,
+          11.65414202121066,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.08
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House10_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House10_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House10_win_01",
+      "transform": {
+        "position": [
+          7.697622207048363,
+          11.817546250694498,
+          1.2
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.08
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House10_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House10_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House10_win_10",
+      "transform": {
+        "position": [
+          5.624274657938916,
+          11.65132368723862,
+          2.88
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.08
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House10_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House10_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House10_win_11",
+      "transform": {
+        "position": [
+          7.697622207048363,
+          11.817546250694498,
+          2.88
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.08
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House10_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House10_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House10_chimney",
+      "transform": {
+        "position": [
+          7.8675101183498,
+          10.699547101502677,
+          4.939209520120539
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.08
+        ],
+        "scale": [
+          0.3,
+          0.3,
+          1.4401212641848253
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House10_chimney_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House10_chimney_mat",
+        "baseColor": [
+          0.62,
+          0.24,
+          0.22,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.8,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House11_wall",
+      "transform": {
+        "position": [
+          8.6,
+          17.5,
+          1.55
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.09
+        ],
+        "scale": [
+          3.2,
+          3.0,
+          3.1
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House11_wall_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House11_wall_mat",
+        "baseColor": [
+          0.7,
+          0.64,
+          0.78,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.75,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House11_roof_L",
+      "transform": {
+        "position": [
+          7.6638044309687245,
+          17.58448583624613,
+          3.7445292648035684
+        ],
+        "rotation": [
+          0.0,
+          -0.6010432444405679,
+          -0.09
+        ],
+        "scale": [
+          2.3294893929897795,
+          3.56,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House11_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House11_roof_mat",
+        "baseColor": [
+          0.2,
+          0.26,
+          0.42,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House11_roof_R",
+      "transform": {
+        "position": [
+          9.536195569031275,
+          17.41551416375387,
+          3.7445292648035684
+        ],
+        "rotation": [
+          0.0,
+          0.6010432444405679,
+          -0.09
+        ],
+        "scale": [
+          2.3294893929897795,
+          3.56,
+          0.16
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House11_roof_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House11_roof_mat",
+        "baseColor": [
+          0.2,
+          0.26,
+          0.42,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.68,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House11_door",
+      "transform": {
+        "position": [
+          8.036363456232513,
+          19.087082180143753,
+          0.775
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.09
+        ],
+        "scale": [
+          0.72,
+          0.08,
+          1.55
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House11_door_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House11_door_mat",
+        "baseColor": [
+          0.55,
+          0.44,
+          0.34,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House11_win_01",
+      "transform": {
+        "position": [
+          9.567045639630916,
+          18.958988255905727,
+          0.9299999999999999
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.09
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House11_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House11_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House11_win_10",
+      "transform": {
+        "position": [
+          7.909780291898958,
+          19.10854616177122,
+          2.2319999999999998
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.09
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House11_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House11_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House11_win_11",
+      "transform": {
+        "position": [
+          9.567045639630916,
+          18.958988255905727,
+          2.2319999999999998
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.09
+        ],
+        "scale": [
+          0.62,
+          0.06,
+          0.72
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House11_win_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House11_win_mat",
+        "baseColor": [
+          1.0,
+          0.86,
+          0.55,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.25,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.3,
+          0.24,
+          0.12
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "House11_chimney",
+      "transform": {
+        "position": [
+          9.540908065345674,
+          17.957283295745057,
+          4.066793897205352
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.09
+        ],
+        "scale": [
+          0.3,
+          0.3,
+          1.4824173090482073
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "cube",
+        "size": 1.0,
+        "name": "House11_chimney_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "House11_chimney_mat",
+        "baseColor": [
+          0.2,
+          0.26,
+          0.42,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.8,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree00",
+      "transform": {
+        "position": [
+          -11.5,
+          -15.5,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.1832186229721163
+        ],
+        "scale": [
+          2.59063703507209,
+          2.59063703507209,
+          2.59063703507209
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree00_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree0_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree01",
+      "transform": {
+        "position": [
+          -12.0,
+          -3.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          2.5923866286070694
+        ],
+        "scale": [
+          3.117334600439408,
+          3.117334600439408,
+          3.117334600439408
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree01_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree1_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree02",
+      "transform": {
+        "position": [
+          -11.0,
+          10.5,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          2.8844458057538125
+        ],
+        "scale": [
+          2.609104450781219,
+          2.609104450781219,
+          2.609104450781219
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree02_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree2_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree03",
+      "transform": {
+        "position": [
+          -3.2,
+          -22.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          3.238563374442207
+        ],
+        "scale": [
+          3.238168359474538,
+          3.238168359474538,
+          3.238168359474538
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree03_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree3_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree04",
+      "transform": {
+        "position": [
+          11.6,
+          -12.5,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          2.807726389987812
+        ],
+        "scale": [
+          2.921243823123568,
+          2.921243823123568,
+          2.921243823123568
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree04_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree4_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree05",
+      "transform": {
+        "position": [
+          12.4,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          4.081621672344439
+        ],
+        "scale": [
+          2.3917341828422876,
+          2.3917341828422876,
+          2.3917341828422876
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree05_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree5_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree06",
+      "transform": {
+        "position": [
+          11.2,
+          13.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          3.1203122604853464
+        ],
+        "scale": [
+          3.1590022878443937,
+          3.1590022878443937,
+          3.1590022878443937
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree06_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree6_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree07",
+      "transform": {
+        "position": [
+          3.0,
+          21.5,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          2.363330983003823
+        ],
+        "scale": [
+          2.748919932018716,
+          2.748919932018716,
+          2.748919932018716
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree07_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree7_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree08",
+      "transform": {
+        "position": [
+          -3.5,
+          3.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          3.472679990575797
+        ],
+        "scale": [
+          2.3711917102587035,
+          2.3711917102587035,
+          2.3711917102587035
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree08_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree8_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree09",
+      "transform": {
+        "position": [
+          3.8,
+          -8.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          3.0894619691149683
+        ],
+        "scale": [
+          3.151589996999176,
+          3.151589996999176,
+          3.151589996999176
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree09_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree9_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree10",
+      "transform": {
+        "position": [
+          -4.0,
+          18.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          5.5559278838535295
+        ],
+        "scale": [
+          2.963916039946837,
+          2.963916039946837,
+          2.963916039946837
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree10_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree10_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Tree11",
+      "transform": {
+        "position": [
+          4.2,
+          12.5,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.025506565683487203
+        ],
+        "scale": [
+          3.051966776047486,
+          3.051966776047486,
+          3.051966776047486
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "tree",
+        "size": 1.0,
+        "name": "anime_town_tree11_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_tree11_mat",
+        "baseColor": [
+          0.3,
+          0.48,
+          0.26,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.85,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush00_0",
+      "transform": {
+        "position": [
+          -8.966741719954712,
+          -17.866217590541076,
+          0.23373734714369185
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.9364926556588302
+        ],
+        "scale": [
+          0.5843433678592296,
+          0.5843433678592296,
+          0.5843433678592296
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush00_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush0_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush00_1",
+      "transform": {
+        "position": [
+          -7.350035318604645,
+          -19.073039172873273,
+          0.33466442965661614
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          1.119140630193517
+        ],
+        "scale": [
+          0.8366610741415403,
+          0.8366610741415403,
+          0.8366610741415403
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush00_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush0_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush01_0",
+      "transform": {
+        "position": [
+          -8.292497806481661,
+          -13.6796299988449,
+          0.2457974378316528
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          5.483430899185843
+        ],
+        "scale": [
+          0.614493594579132,
+          0.614493594579132,
+          0.614493594579132
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush01_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush1_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush01_1",
+      "transform": {
+        "position": [
+          -8.29898757386246,
+          -12.4135628188282,
+          0.2672420576002201
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          4.876634149305228
+        ],
+        "scale": [
+          0.6681051440005501,
+          0.6681051440005501,
+          0.6681051440005501
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush01_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush1_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush02_0",
+      "transform": {
+        "position": [
+          -8.820439305636073,
+          -7.039827288134633,
+          0.2607993603278678
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          5.58915553959364
+        ],
+        "scale": [
+          0.6519984008196695,
+          0.6519984008196695,
+          0.6519984008196695
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush02_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush2_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush02_1",
+      "transform": {
+        "position": [
+          -6.222781876011908,
+          -6.6540681102353325,
+          0.25882461519340055
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          2.1708776643241183
+        ],
+        "scale": [
+          0.6470615379835013,
+          0.6470615379835013,
+          0.6470615379835013
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush02_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush2_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush03_0",
+      "transform": {
+        "position": [
+          -9.28803697965698,
+          2.043525593958939,
+          0.33150670367981727
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          2.4184151154750313
+        ],
+        "scale": [
+          0.8287667591995431,
+          0.8287667591995431,
+          0.8287667591995431
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush03_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush3_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush03_1",
+      "transform": {
+        "position": [
+          -7.881652450936662,
+          0.7013366465395072,
+          0.2630171574919829
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          2.7411799412018225
+        ],
+        "scale": [
+          0.6575428937299572,
+          0.6575428937299572,
+          0.6575428937299572
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush03_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush3_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush04_0",
+      "transform": {
+        "position": [
+          -6.101705499739799,
+          7.028266037894355,
+          0.2731363460041116
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          5.2804843507201165
+        ],
+        "scale": [
+          0.682840865010279,
+          0.682840865010279,
+          0.682840865010279
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush04_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush4_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush04_1",
+      "transform": {
+        "position": [
+          -6.798385525436668,
+          5.3654053363796645,
+          0.28116889841141435
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          5.115410242859104
+        ],
+        "scale": [
+          0.7029222460285358,
+          0.7029222460285358,
+          0.7029222460285358
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush04_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush4_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush05_0",
+      "transform": {
+        "position": [
+          -7.5962250131217335,
+          15.723636312957533,
+          0.30085875458792116
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          4.388405194196949
+        ],
+        "scale": [
+          0.7521468864698029,
+          0.7521468864698029,
+          0.7521468864698029
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush05_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush5_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush05_1",
+      "transform": {
+        "position": [
+          -10.19217768823349,
+          14.464012548540012,
+          0.23993195441854398
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          5.829135403549048
+        ],
+        "scale": [
+          0.5998298860463599,
+          0.5998298860463599,
+          0.5998298860463599
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush05_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush5_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush06_0",
+      "transform": {
+        "position": [
+          6.86218183486437,
+          -15.684904308182727,
+          0.2603984362979965
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          1.137474152326502
+        ],
+        "scale": [
+          0.6509960907449913,
+          0.6509960907449913,
+          0.6509960907449913
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush06_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush6_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush06_1",
+      "transform": {
+        "position": [
+          9.269684654009502,
+          -14.012221445205297,
+          0.24206346566427533
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          2.508718928219985
+        ],
+        "scale": [
+          0.6051586641606883,
+          0.6051586641606883,
+          0.6051586641606883
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush06_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush6_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush07_0",
+      "transform": {
+        "position": [
+          9.336134124013055,
+          -7.30807746743981,
+          0.23981430236701962
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          4.517763548268223
+        ],
+        "scale": [
+          0.599535755917549,
+          0.599535755917549,
+          0.599535755917549
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush07_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush7_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush07_1",
+      "transform": {
+        "position": [
+          11.77017976044411,
+          -8.983369108404371,
+          0.33604383718872566
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          4.385338261385707
+        ],
+        "scale": [
+          0.8401095929718141,
+          0.8401095929718141,
+          0.8401095929718141
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush07_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush7_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush08_0",
+      "transform": {
+        "position": [
+          6.2640985498733945,
+          -0.7561996985393749,
+          0.27081997590642076
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          3.2350486348079412
+        ],
+        "scale": [
+          0.6770499397660519,
+          0.6770499397660519,
+          0.6770499397660519
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush08_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush8_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush08_1",
+      "transform": {
+        "position": [
+          7.017614635543655,
+          -5.372702216130012,
+          0.2370823786268077
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          2.376943464440012
+        ],
+        "scale": [
+          0.5927059465670192,
+          0.5927059465670192,
+          0.5927059465670192
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush08_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush8_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush09_0",
+      "transform": {
+        "position": [
+          8.83976147671811,
+          1.2829634603877444,
+          0.33050522688337153
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          4.330315253754703
+        ],
+        "scale": [
+          0.8262630672084288,
+          0.8262630672084288,
+          0.8262630672084288
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush09_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush9_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush09_1",
+      "transform": {
+        "position": [
+          7.190627615467798,
+          4.172309173228797,
+          0.30905392986633146
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          2.99150021571182
+        ],
+        "scale": [
+          0.7726348246658286,
+          0.7726348246658286,
+          0.7726348246658286
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush09_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush9_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush10_0",
+      "transform": {
+        "position": [
+          7.5219805133330935,
+          10.712476197345186,
+          0.3209076297467874
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          4.102352307229286
+        ],
+        "scale": [
+          0.8022690743669684,
+          0.8022690743669684,
+          0.8022690743669684
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush10_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush10_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush10_1",
+      "transform": {
+        "position": [
+          5.563892065641518,
+          10.191077518541032,
+          0.3045588358629073
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          5.987466909365562
+        ],
+        "scale": [
+          0.7613970896572682,
+          0.7613970896572682,
+          0.7613970896572682
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush10_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush10_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush11_0",
+      "transform": {
+        "position": [
+          6.699237697083617,
+          16.365189991186114,
+          0.26593715688032543
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          5.148614359232312
+        ],
+        "scale": [
+          0.6648428922008135,
+          0.6648428922008135,
+          0.6648428922008135
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush11_0_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush11_0_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
+      }
+    },
+    {
+      "name": "Bush11_1",
+      "transform": {
+        "position": [
+          6.402643104889275,
+          16.296640078381845,
+          0.2782757308814857
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.9225514409813385
+        ],
+        "scale": [
+          0.6956893272037142,
+          0.6956893272037142,
+          0.6956893272037142
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": true,
+      "mesh": {
+        "kind": "builtin",
+        "shape": "rock",
+        "size": 1.0,
+        "name": "anime_town_bush11_1_mesh"
+      },
+      "material": {
+        "kind": "procedural",
+        "name": "anime_town_bush11_1_mat",
+        "baseColor": [
+          0.34,
+          0.52,
+          0.28,
+          1.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "normalScale": 0.0,
+        "ao": 1.0,
+        "emissive": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "doubleSided": false,
+        "alphaBlend": false
       }
     },
     {

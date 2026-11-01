@@ -48,6 +48,15 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_ROOT = os.path.join(REPO, "templates")
 
+# 天空参数与示例小镇（`assets/scenes/anime_town.json`）共用一份，
+# 见 `tools/anime_style.py` 的文件头 —— 两边各抄一套就会出现
+# "示例场景云很多、新建工程还是老样子"。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from anime_style import anime_day_env                        # noqa: E402
+# 小镇本体和引擎自带的 `assets/scenes/anime_town.json` 是同一个生成函数 ——
+# 两份场景的差别只有一个 `GameStart`。改房子摆放只改那边。
+from make_anime_town import build_doc as build_town          # noqa: E402
+
 # ============================================================
 # 两种游戏类型的差异——每一行都能在 PlayerComponent 里找到依据
 # ============================================================
@@ -427,18 +436,86 @@ TEMPLATE_GROUND_MAT = {
 
 
 def build_scene(kind, spec):
-    """起始场景：**只有地形 + 出生点**（2026-10-21 第八轮，用户要求）。
+    """**新建工程的初始场景**：二次元小镇 + 出生点。
 
-    之前这里是"Ground 平面 + 5 个光球 + 传送门 + 玩家胶囊"（一套能通关的
-    小游戏）。用户要的是"新建工程进来是一张干净的地"：
+    2026-11-01 换的（用户原话："把原来的那个游戏初始化场景移除掉，用这个
+    新的替代"）。在此之前这里是一张"空场景：地形 + 出生点"，那是 10-21
+    那轮的要求（"初始化的场景不需要摆放任何物体"）；用户看过小镇之后
+    改主意了 —— 新工程一打开就该是一眼能看出"这是二次元"的地方。
+
+    于是现在：
+      · `scenes/main.json` = 小镇（12 栋房子 / 主路 / 树 / 灌木 / 草地）
+        + `GameStart`（出生点在街心原点，运行时按它生成玩家）；
+      · `scenes/terrain.json` = 原来那张空地形场景，**降级**成普通场景。
+        留着有两个用处：地形特性（`verify_terrain_physics` /
+        `verify_terrain_renorm`）拿它当夹具；用户想知道"地形怎么用"也有
+        一份能打开的样例。
+
+    ⚠ 小镇本体来自 `tools/make_anime_town.py` 的 `build_doc()` —— 和引擎
+      自带示例场景 `assets/scenes/anime_town.json` 是**同一个函数**生出来的，
+      两者的差别只有这个 `GameStart`。别在这儿复制一份房子摆放代码。
+    """
+    doc = build_town(game_start=build_game_start(kind))
+    # 相机：小镇自带的那台是"退到 -Y 26 m 看整条街"的展示机位；新工程里
+    # 要能看清街心那个出生点小人在哪，所以拉近到 14 m（同一朝向）。
+    doc["camera"] = {
+        "target": [0.0, 0.0, 1.6],
+        "yaw": math.pi / 2.0,      # 正对 +Y（街道纵深）
+        "pitch": 0.26,             # 略俯视，能看到地面与两侧房子
+        "distance": 14.0,
+        "fov": 55.0,
+    }
+    doc["generator"] = "gen_templates.py (%s) —— 二次元小镇 + 出生点" % kind
+    return doc
+
+
+def build_game_start(kind):
+    """出生点实体（`GameStart`）。
+
+    ⚠ `mode` 必须跟着模板类型走：不写的话解析出来是 third，
+      **first_person 模板会一按 Play 就变第三人称**（2026-10-24 踩过）。
+    ⚠ 位置必须在街心原点：小镇的主路是沿 +Y 从 -26 铺到 +26 的一块块方砖，
+      原点正在路中间，玩家落在这里不会插进房子也不会掉出地面。
+    """
+    return {
+        "name": "GameStart",
+        "transform": transform((0.0, 0.0, 0.0)),
+        "parent": -1,
+        "visible": True,
+        "castShadow": False,
+        "gameStart": {
+            "yaw": 0.0,
+            "enabled": True,
+            "mode": "first" if kind == "first_person" else "third",
+            "spawnOnRun": True,
+        },
+        "script": {"path": "scripts/main.vks", "enabled": True,
+                   "timeScale": 1.0},
+    }
+
+
+def build_terrain_scene(kind, spec):
+    """地形样例场景（`scenes/terrain.json`）—— **不是**初始场景。
+
+    2026-10-21 到 2026-11-01 之间它是初始场景（"空场景：地形 + 出生点"），
+    后来被小镇顶替。现在它只剩两个身份：
+      · 地形特性用例的夹具（`verify_terrain_physics` 自己造场景，但
+        `verify_terrain_renorm` 直接打开这一份）；
+      · "引擎自带地形怎么用"的活文档。
+
+    ⚠ 别把它当成"新建工程看到的东西"去改 —— 那是 `build_scene()`。
+
+    ---- 下面是它当初始场景时的原始说明（保留）----
+    用户要的是"新建工程进来是一张干净的地"：
       · 地面换成**真地形**（高度图 + splat，土黄色），不再是 20 m 平面；
-      · 场上的道具全部取消；
+      · 场上的道具全部取消（之前是 Ground + 5 个光球 + 传送门 + 玩家胶囊，
+        一套能通关的小游戏）；
       · 玩家不再作为实体存在 —— 由 `GameStart` 标位置，运行时生成
         （见 `RuntimeApp` 的 `spawnPlayerFromGameStart`）。
 
     ⚠ `GameStart` 上挂 `main.vks`：它是**世界逻辑**脚本（打印 GAME-READY /
-    GAME-MODE / SCORE），不依赖某个道具实体。挂在这里而不是"没有挂载点"，
-    模板自带的脚本示例才还能跑、还能热重载。
+      GAME-MODE / SCORE），不依赖某个道具实体。挂在这里而不是"没有挂载点"，
+      模板自带的脚本示例才还能跑、还能热重载。
     """
     cam = spec["camera"]
 
@@ -462,29 +539,15 @@ def build_scene(kind, spec):
     # 不会滑；朝向 0 = +X（与 third_person 的相机构图一致）。
     #
     # 2026-10-24：`gameStart` 多两个字段 —— `mode` / `spawnOnRun`。
-    #   · `mode` 决定运行时生成第几人称的玩家（以前这条信息挂在"场上那个
-    #     Player 实体"的 PlayerComponent 上，而场上的玩家已经取消了）；
+    #   · `mode` 决定运行时生成第几人称的玩家；
     #   · 不写的话解析出来是 third，**first_person 模板会一按 Play 就变第三
-    #     人称**，所以这里必须跟着 kind 走。
-    game_start = {
-        "name": "GameStart",
-        "transform": transform((0.0, 0.0, 0.0)),
-        "parent": -1,
-        "visible": True,
-        "castShadow": False,
-        "gameStart": {
-            "yaw": 0.0,
-            "enabled": True,
-            "mode": "first" if kind == "first_person" else "third",
-            "spawnOnRun": True,
-        },
-        "script": {"path": "scripts/main.vks", "enabled": True,
-                   "timeScale": 1.0},
-    }
+    #     人称**，所以必须跟着 kind 走。
+    # 2026-11-01：实体本身抽成 `build_game_start()`，小镇场景共用同一份。
+    game_start = build_game_start(kind)
 
     return {
         "version": 1,
-        "generator": "gen_templates.py (%s) —— 空场景：地形 + 出生点" % kind,
+        "generator": "gen_templates.py (%s) —— 地形样例（非初始场景）" % kind,
         # ------------------------------------------------------------
         # 场景相机（编辑器第一次打开这个场景时的取景）
         # ------------------------------------------------------------
@@ -508,6 +571,13 @@ def build_scene(kind, spec):
             "castsShadow": True,
             "ambientScale": 1.0,
         },
+        # ------------------------------------------------------------
+        # 天空（`environment` 全局块）
+        # ------------------------------------------------------------
+        # 2026-11-01 补的。在此之前模板里**没有** `environment` 块 → 走引擎
+        # 默认天空，一打开是一块平铺的蓝天，跟"二次元风格"无关。
+        # 小镇场景（`build_scene`）用的是同一个函数取参数，两边一致。
+        "environment": anime_day_env(),
         "physics": {
             "enabled": True,
             "groundPlane": True,
@@ -822,22 +892,23 @@ README_TEMPLATE = '''\
 
 在启动器里打开这个工程（或直接打开 `venn.project.json`），按 Play：
 
-1. `WASD` 移动，`Shift` 疾跑，`Space` 跳跃，`E` 交互（这是默认绑定）
-2. 场上 5 个金色光球，走近 1.6 m 自动收集
-3. 收齐 5 个 → Console 打印 `GAME-COMPLETE`，场地一端的传送门同时由暗青变亮
-   青绿并加速自转（这一下是 `portal.vks` 干的，用来演示"两个脚本靠世界黑板
-   通信"）
-4. 120 秒内没收齐 → `GAME-TIMEOUT`（把 `main.vks` 的 `TIME_LIMIT` 改 0 可取消）
+1. `WASD` 移动，`Shift` 疾跑，`Space` 跳跃（这是默认绑定）
+2. 出生点在**街心**：引擎按场景里的 `GameStart` 生成玩家，Console 打印
+   `GAME-READY` / `GAME-MODE`
+3. 这一版**没有**摆玩法道具 —— 起始场景是一条街 + 12 栋房子 + 树。
+   想加东西直接拖进视口；`scripts/pickup.vks` / `scripts/portal.vks` 是
+   现成可抄的示例（收集物 / 终点），挂到新实体上就会跑
 
 ## 目录结构
 
 | 路径 | 作用 |
 |---|---|
 | `venn.project.json` | 工程身份（名字 / 类型 / 起始场景 / 代码模式），启动器写，别手改 |
-| `assets/scenes/main.json` | 起始场景：地面 / 玩家 / 5 个光球 / 传送门 |
-| `assets/scripts/main.vks` | **游戏逻辑主脚本**（挂在 Player 上，管流程与胜负） |
-| `assets/scripts/pickup.vks` | 光球逻辑（挂在每个 Pickup_* 上，5 个实例各一份状态） |
-| `assets/scripts/portal.vks` | 终点逻辑（挂在 Portal 上，收齐后点亮自己） |
+| `assets/scenes/main.json` | **初始场景**：二次元小镇（街道 / 12 栋房子 / 树 / 灌木）+ `GameStart` 出生点 |
+| `assets/scenes/terrain.json` | 地形样例：一块 257×257 的土黄地形 + 出生点，想看"地形怎么用"就打开它 |
+| `assets/scripts/main.vks` | **游戏逻辑主脚本**（挂在 `GameStart` 上，管流程与世界状态） |
+| `assets/scripts/pickup.vks` | 收集物逻辑（挂到任意实体上即生效，可多份实例各自持状态） |
+| `assets/scripts/portal.vks` | 终点逻辑（收齐后点亮自己，演示两个脚本靠世界黑板通信） |
 | `assets/game.json` | 运行时出厂配置（窗口尺寸、限帧、音频） |
 | `config/render.json` | 画质开关（创建向导写入；删成 `{}` = 全部默认） |
 
@@ -857,8 +928,11 @@ README_TEMPLATE = '''\
 
 ## 常见的下一步
 
-- **加一个可拾取物**：场景里复制任意 `Pickup_*`，它的 `script.path` 已经是
-  `scripts/pickup.vks`，复制即生效；再把 `main.vks` 的 `TOTAL` 改成新总数。
+- **加一个可拾取物**：随便放一个实体（Cube/球都行），把 Inspector ▸ Script
+  指向 `scripts/pickup.vks`；再把 `main.vks` 的 `TOTAL` 改成你要的总数。
+- **搬房子 / 加一栋**：`assets/scenes/main.json` 里的房子是**内联图元**
+  （`kind: builtin` 的 cube / plane + 内联材质），在视口里复制一栋再摆位置
+  就行，不依赖任何外部模型文件。
 - **加自己的逻辑**：新建 `assets/scripts/my_game.vks`，在实体的
   Inspector ▸ Script 里指向它。一个实体一份实例，变量互不干扰。
 - **读输入**：`pressed("Jump")` / `held("Sprint")` / `axis("MoveForward")`，
@@ -907,7 +981,11 @@ def generate_texts():
     for kind, spec in TYPES.items():
         base = kind
         files[base + "/template.json"] = dump_json(build_template_json(kind, spec))
+        # 初始场景 = 二次元小镇（2026-11-01 起）。`terrain.json` 是原来那张
+        # 空地形场景，降级成普通场景保留（地形特性的夹具 + 用法样例）。
         files[base + "/assets/scenes/main.json"] = dump_json(build_scene(kind, spec))
+        files[base + "/assets/scenes/terrain.json"] = \
+            dump_json(build_terrain_scene(kind, spec))
         files[base + "/assets/game.json"] = dump_json(build_game_json(spec))
         files[base + "/config/render.json"] = "{}\n"
         # ⚠ 两个类型的脚本内容**逐字相同**（差异在场景的 player/camera 段）：

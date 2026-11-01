@@ -35,6 +35,9 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "assets", "scenes", "anime_town.json")
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from anime_style import anime_day_env                        # noqa: E402
+
 # 固定种子：错落感要，但不能"每次生成都不一样"。
 SEED = 20261101
 
@@ -190,11 +193,17 @@ def add_house(out, idx, x, y, w, d, h, rot_z, wall, roof, rng):
                        mat(p + "_chimney_mat", roof, rough=0.8)))
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--check", action="store_true", help="只统计，不写文件")
-    args = ap.parse_args()
+def build_entities():
+    """镇子里的全部实体（地面 / 主路 / 12 栋房子 / 树 / 灌木）。
 
+    确定性：固定 `SEED`，同样的代码跑两次字节相同（`--check` 靠这条）。
+
+    ⚠ 返回的列表**顺序就是文件里的顺序**。要往里插东西（比如模板工程用的
+      `GameStart`）请走 `build_doc(game_start=...)`，别在这里插 —— 那会让
+      `assets/scenes/anime_town.json` 的字节跟着变，白白多一次 diff，
+      而这个函数的两份产物（示例场景 / 新建工程初始场景）本该只差一个
+      出生点。
+    """
     rng = random.Random(SEED)
     out = []
 
@@ -265,7 +274,26 @@ def main():
                 mat("anime_town_bush%d_%d_mat" % (i, k),
                     (0.34, 0.52, 0.28), rough=0.9)))
 
-    doc = {
+    return out, plots, tree_spots
+
+
+def build_doc(game_start=None):
+    """整份场景 dict。`game_start` 非空时**追加到实体表末尾**。
+
+    两个消费方：
+      · `tools/make_anime_town.py` 自己 → `assets/scenes/anime_town.json`
+        （引擎默认打开的示例场景，不带出生点 —— 它是给人看的）；
+      · `tools/gen_templates.py` → `templates/*/assets/scenes/main.json`
+        （**新建工程的初始场景**，必须带 GameStart，否则一按 Play 没人）。
+
+    ⚠ 出生点追加在**末尾**是刻意的：`anime_town.json` 的字节不因此改变，
+      两份产物在 diff 里就只差那一个实体。
+    """
+    out, plots, tree_spots = build_entities()
+    if game_start is not None:
+        out.append(game_start)
+
+    return {
         "version": 1,
         "generator": "make_anime_town.py —— 二次元小镇（启动场景）",
         "camera": {
@@ -277,33 +305,23 @@ def main():
             "distance": 30.0,
         },
         "physics": {"enabled": True, "groundPlane": True},
-        # 晴天 + 略多云。数值与 SkyParams::clearDay() 同源，只把云量调高
-        # 一点 —— 空场上云的占比更大，少了会显得天空很空。
-        "environment": {
-            "zenith": [0.16, 0.36, 0.82],
-            "horizon": [0.60, 0.76, 0.93],
-            "ground": [0.40, 0.48, 0.36],
-            "cloudColor": [1.0, 1.0, 1.0],
-            "cloudCoverage": 0.52,
-            "cloudThickness": 0.94,
-            "cloudScale": 1.25,
-            "cloudHeight": 900.0,
-            "cloudSpeed": 0.012,
-            "cloudShadow": 0.58,
-            "cloudEdgeSharpness": 0.60,
-            "exposure": 0.92,
-            "starAmount": 0.0,
-            "starBrightness": 0.0,
-            "sunDirection": [0.522, -0.326, 0.788],
-            "sunIntensity": 1.0,
-            "sunAngularRadius": 0.017,
-            "horizonGlow": 0.30,
-        },
+        # 天空参数来自 `tools/anime_style.py` —— 新建工程的模板场景用的是
+        # **同一份**（2026-11-01 抽出去的）。别在这儿重新抄一遍数字：
+        # 抄了就会出现"示例场景云很多、新建工程还是老样子"。
+        "environment": anime_day_env(),
         "entities": out,
     }
 
-    print("实体数 = %d（房子 %d 栋、树 %d、灌木 %d）"
-          % (len(out), len(plots), len(tree_spots), len(plots) * 2))
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true", help="只统计，不写文件")
+    args = ap.parse_args()
+
+    doc = build_doc()
+    n = len(doc["entities"])
+
+    print("实体数 = %d（房子 12 栋、树 12、灌木 24）" % n)
     if args.check:
         return 0
 

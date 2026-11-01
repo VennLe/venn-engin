@@ -6,22 +6,23 @@
 
 在启动器里打开这个工程（或直接打开 `venn.project.json`），按 Play：
 
-1. `WASD` 移动，`Shift` 疾跑，`Space` 跳跃，`E` 交互（这是默认绑定）
-2. 场上 5 个金色光球，走近 1.6 m 自动收集
-3. 收齐 5 个 → Console 打印 `GAME-COMPLETE`，场地一端的传送门同时由暗青变亮
-   青绿并加速自转（这一下是 `portal.vks` 干的，用来演示"两个脚本靠世界黑板
-   通信"）
-4. 120 秒内没收齐 → `GAME-TIMEOUT`（把 `main.vks` 的 `TIME_LIMIT` 改 0 可取消）
+1. `WASD` 移动，`Shift` 疾跑，`Space` 跳跃（这是默认绑定）
+2. 出生点在**街心**：引擎按场景里的 `GameStart` 生成玩家，Console 打印
+   `GAME-READY` / `GAME-MODE`
+3. 这一版**没有**摆玩法道具 —— 起始场景是一条街 + 12 栋房子 + 树。
+   想加东西直接拖进视口；`scripts/pickup.vks` / `scripts/portal.vks` 是
+   现成可抄的示例（收集物 / 终点），挂到新实体上就会跑
 
 ## 目录结构
 
 | 路径 | 作用 |
 |---|---|
 | `venn.project.json` | 工程身份（名字 / 类型 / 起始场景 / 代码模式），启动器写，别手改 |
-| `assets/scenes/main.json` | 起始场景：地面 / 玩家 / 5 个光球 / 传送门 |
-| `assets/scripts/main.vks` | **游戏逻辑主脚本**（挂在 Player 上，管流程与胜负） |
-| `assets/scripts/pickup.vks` | 光球逻辑（挂在每个 Pickup_* 上，5 个实例各一份状态） |
-| `assets/scripts/portal.vks` | 终点逻辑（挂在 Portal 上，收齐后点亮自己） |
+| `assets/scenes/main.json` | **初始场景**：二次元小镇（街道 / 12 栋房子 / 树 / 灌木）+ `GameStart` 出生点 |
+| `assets/scenes/terrain.json` | 地形样例：一块 257×257 的土黄地形 + 出生点，想看"地形怎么用"就打开它 |
+| `assets/scripts/main.vks` | **游戏逻辑主脚本**（挂在 `GameStart` 上，管流程与世界状态） |
+| `assets/scripts/pickup.vks` | 收集物逻辑（挂到任意实体上即生效，可多份实例各自持状态） |
+| `assets/scripts/portal.vks` | 终点逻辑（收齐后点亮自己，演示两个脚本靠世界黑板通信） |
 | `assets/game.json` | 运行时出厂配置（窗口尺寸、限帧、音频） |
 | `config/render.json` | 画质开关（创建向导写入；删成 `{}` = 全部默认） |
 
@@ -41,8 +42,11 @@
 
 ## 常见的下一步
 
-- **加一个可拾取物**：场景里复制任意 `Pickup_*`，它的 `script.path` 已经是
-  `scripts/pickup.vks`，复制即生效；再把 `main.vks` 的 `TOTAL` 改成新总数。
+- **加一个可拾取物**：随便放一个实体（Cube/球都行），把 Inspector ▸ Script
+  指向 `scripts/pickup.vks`；再把 `main.vks` 的 `TOTAL` 改成你要的总数。
+- **搬房子 / 加一栋**：`assets/scenes/main.json` 里的房子是**内联图元**
+  （`kind: builtin` 的 cube / plane + 内联材质），在视口里复制一栋再摆位置
+  就行，不依赖任何外部模型文件。
 - **加自己的逻辑**：新建 `assets/scripts/my_game.vks`，在实体的
   Inspector ▸ Script 里指向它。一个实体一份实例，变量互不干扰。
 - **读输入**：`pressed("Jump")` / `held("Sprint")` / `axis("MoveForward")`，

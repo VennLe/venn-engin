@@ -219,7 +219,13 @@ def main():
     # ⚠ 断言的是**模板产物**里的 camera.distance 与 player.mode，
     #   而不是运行期相机位置 —— 后者在 edit 态是导航相机（用户随时会动），
     #   拿它做断言等于"用实现验证实现"。
-    want_dist = 8.0 if args.type == "first_person" else 4.5
+    #
+    # 2026-11-01：初始场景换成二次元小镇之后，两个类型的取景距离统一成
+    # **14 m**（站在街道南侧 12 m、抬高 4 m，正对 +Y 看整条街）。旧值
+    # 8.0 / 4.5 是照着"空地形 + 一个玩家胶囊"定的 —— 在小镇里 4.5 m
+    # 会贴在某一栋房子的墙上。距离不再随类型变，因为差异体现在
+    # 运行时相机（PlayerController），不在编辑器初始取景。
+    want_dist = 14.0
     got_dist = scene.get("camera", {}).get("distance")
     if abs(float(got_dist or -1) - want_dist) > 1e-6:
         fails.append("② camera.distance=%s，期望 %s" % (got_dist, want_dist))

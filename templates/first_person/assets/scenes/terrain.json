@@ -1,0 +1,148 @@
+{
+  "version": 1,
+  "generator": "gen_templates.py (first_person) —— 地形样例（非初始场景）",
+  "camera": {
+    "target": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "yaw": 3.141592653589793,
+    "pitch": 0.2,
+    "distance": 8.0,
+    "fov": 55.0
+  },
+  "light": {
+    "direction": [
+      0.42,
+      0.66,
+      -0.62
+    ],
+    "color": [
+      1.0,
+      0.96,
+      0.9
+    ],
+    "intensity": 3.2,
+    "castsShadow": true,
+    "ambientScale": 1.0
+  },
+  "environment": {
+    "zenith": [
+      0.16,
+      0.36,
+      0.82
+    ],
+    "horizon": [
+      0.6,
+      0.76,
+      0.93
+    ],
+    "ground": [
+      0.4,
+      0.48,
+      0.36
+    ],
+    "cloudColor": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "cloudCoverage": 0.52,
+    "cloudThickness": 0.94,
+    "cloudScale": 1.25,
+    "cloudHeight": 900.0,
+    "cloudSpeed": 0.012,
+    "cloudShadow": 0.58,
+    "cloudEdgeSharpness": 0.6,
+    "exposure": 0.92,
+    "starAmount": 0.0,
+    "starBrightness": 0.0,
+    "sunDirection": [
+      0.522,
+      -0.326,
+      0.788
+    ],
+    "sunIntensity": 1.0,
+    "sunAngularRadius": 0.017,
+    "horizonGlow": 0.3
+  },
+  "physics": {
+    "enabled": true,
+    "groundPlane": true,
+    "fixedTimeStep": 0.0166666675,
+    "maxSubSteps": 4,
+    "allowSleep": true
+  },
+  "entities": [
+    {
+      "name": "Terrain",
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": false,
+      "locked": true,
+      "terrain": {
+        "source": "terrain/ground/terrain.vterrain",
+        "visible": true,
+        "heightScale": 1.0,
+        "layers": [
+          "",
+          "",
+          "",
+          ""
+        ]
+      }
+    },
+    {
+      "name": "GameStart",
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "parent": -1,
+      "visible": true,
+      "castShadow": false,
+      "gameStart": {
+        "yaw": 0.0,
+        "enabled": true,
+        "mode": "first",
+        "spawnOnRun": true
+      },
+      "script": {
+        "path": "scripts/main.vks",
+        "enabled": true,
+        "timeScale": 1.0
+      }
+    }
+  ]
+}

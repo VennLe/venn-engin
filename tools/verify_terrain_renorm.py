@@ -105,7 +105,13 @@ def make_project(work, name):
 def run(assets, root, work, tag):
     env = kit.clean_env({
         "MYVK_ASSET_DIR": assets,
-        "MYVK_EDITOR_SCENE": "scenes/main.json",
+        # ⚠ 2026-11-01：模板的初始场景（`scenes/main.json`）换成了二次元
+        #   小镇，**里面没有地形实体**。这条用例要的是"带 vterrain 的场景"，
+        #   所以改指模板里的地形样例 `scenes/terrain.json`（原来那个空地形
+        #   场景，被小镇顶替后降级成普通场景保留，主要就是给它当夹具）。
+        #   写死成 main.json 的话，症状会是"TERRAIN-LOAD 一条都没有"，
+        #   看起来像地形加载坏了。
+        "MYVK_EDITOR_SCENE": "scenes/terrain.json",
         "MYVK_FRAMES": str(FRAMES),
         "MYVK_NO_WINDOW_SAVE": "1",
         "MYVK_VALIDATION": "1",
