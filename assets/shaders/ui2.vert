@@ -7,6 +7,15 @@
 //   1 = 贴图四边形    inPos = 顶点本身，inUv = 图集 uv
 //   2 = SDF 字形      inPos = 顶点本身，inUv = 图集 uv，inHalf.x = 平滑宽度
 //   3 = SDF 圆角矩形  inPos = 中心，inUv = 角点符号，inRadius = 半径
+//   4 = 旋转圆角矩形  inPos = **顶点本身**（CPU 已转好），
+//                     inUv 仍是角点符号 → vLocal 仍在未旋转的局部系里
+//
+// ⚠ mode 4 为什么存在（P3-2，2026-11-04）：mode 0/3 的顶点只存"中心 +
+//   半宽"，四个角由着色器按轴对齐展开 —— 旋转无法表达。给顶点加一个 2×2
+//   矩阵要把 36 字节撑到 52、改顶点属性布局、改 6 个 input；而"画一个转了
+//   角度的圆角框"只需要把四个角在 CPU 上算好，着色器多一个分支即可。
+//   **关键是 vLocal 仍然按 `inUv * inHalf` 算**，所以 frag 里的 sdRoundBox
+//   还在未旋转的局部坐标系里求距离 —— 圆角转过去还是正圆角，不会变成椭圆。
 //
 // 为什么"矩形只传中心 + 半宽"而不是传四个角点：
 //   SDF 距离场需要在**片元里知道相对中心的偏移**（sdRoundBox 的输入）。
@@ -43,9 +52,15 @@ void main() {
 
     // mode 0 / 3：inPos 是中心，按角点符号展开
     // （用 `inMode < 0.5 || inMode > 2.5` 而不是两次 if，省一次比较）
-    if (inMode < 0.5 || inMode > 2.5) {
+    // ⚠ 4 是"旋转圆角矩形"：**坐标已经给了**，但 local 仍要算（frag 要用），
+    //   所以它走 else 分支。原来的条件 `inMode > 2.5` 会把 4 也吃进去 ——
+    //   那样旋转后的框会被"中心 + 半宽"再展开一次，画出来是**两倍大且
+    //   位置错**的框（看着像顶点算错了，实际是这里多吃了一个 mode）。
+    if (inMode < 0.5 || (inMode > 2.5 && inMode < 3.5)) {
         local = inUv * inHalf;
         px = inPos + local;
+    } else if (inMode > 3.5) {
+        local = inUv * inHalf;   // 只给 frag 求距离场，不用来展开位置
     }
 
     // ⚠⚠ **Vulkan 的 NDC y 轴是向下的**（+1 在屏幕底部），与 OpenGL 相反。

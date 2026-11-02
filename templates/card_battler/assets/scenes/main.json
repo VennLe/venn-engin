@@ -1,0 +1,436 @@
+{
+ "version": 1,
+ "generator": "venn template card_battler",
+ "camera": {
+  "target": [
+   0.0,
+   0.0,
+   0.45
+  ],
+  "yaw": 0.0,
+  "pitch": 0.5,
+  "distance": 9.0,
+  "fov": 50.0
+ },
+ "physics": {
+  "enabled": true,
+  "groundPlane": true
+ },
+ "environment": {
+  "zenith": [
+   0.16,
+   0.36,
+   0.82
+  ],
+  "horizon": [
+   0.6,
+   0.76,
+   0.93
+  ],
+  "ground": [
+   0.4,
+   0.48,
+   0.36
+  ],
+  "cloudColor": [
+   1.0,
+   1.0,
+   1.0
+  ],
+  "cloudCoverage": 0.52,
+  "cloudThickness": 0.94,
+  "cloudScale": 1.25,
+  "cloudHeight": 900.0,
+  "cloudSpeed": 0.012,
+  "cloudShadow": 0.58,
+  "cloudEdgeSharpness": 0.6,
+  "exposure": 0.92,
+  "starAmount": 0.0,
+  "starBrightness": 0.0,
+  "sunDirection": [
+   0.522,
+   -0.326,
+   0.788
+  ],
+  "sunIntensity": 1.0,
+  "sunAngularRadius": 0.017,
+  "horizonGlow": 0.3
+ },
+ "entities": [
+  {
+   "name": "Table",
+   "transform": {
+    "position": [
+     0.0,
+     0.0,
+     -0.02
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": true,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "plane",
+    "size": 9.0,
+    "name": "battle_table"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "battle_table_mat",
+    "baseColor": [
+     0.14,
+     0.16,
+     0.22,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.7,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Card_A",
+   "transform": {
+    "position": [
+     -0.9,
+     -0.2,
+     0.02
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     0.62,
+     0.9,
+     0.02
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 1.0,
+    "name": "battle_card"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "battle_card_face",
+    "baseColor": [
+     0.96,
+     0.82,
+     0.42,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.45,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Card_B",
+   "transform": {
+    "position": [
+     0.0,
+     -0.15,
+     0.02
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     0.62,
+     0.9,
+     0.02
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 1.0,
+    "name": "battle_card"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "battle_card_face",
+    "baseColor": [
+     0.96,
+     0.82,
+     0.42,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.45,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Card_C",
+   "transform": {
+    "position": [
+     0.9,
+     -0.1,
+     0.02
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     0.62,
+     0.9,
+     0.02
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 1.0,
+    "name": "battle_card"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "battle_card_face",
+    "baseColor": [
+     0.96,
+     0.82,
+     0.42,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.45,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Battle",
+   "transform": {
+    "position": [
+     0.0,
+     -1.6,
+     0.0
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": true,
+   "gameplay": {
+    "attrs": [
+     {
+      "n": "hp",
+      "b": 70.0,
+      "min": 0.0,
+      "max": 70.0
+     },
+     {
+      "n": "attack",
+      "b": 10.0,
+      "min": 0.0,
+      "max": 1000000000.0
+     },
+     {
+      "n": "armor",
+      "b": 0.0,
+      "min": 0.0,
+      "max": 1000000000.0
+     }
+    ]
+   },
+   "cards": {
+    "label": "Player deck",
+    "handLimit": 10,
+    "nextUid": 11,
+    "reshuffles": 0,
+    "plays": 0,
+    "piles": {
+     "draw": [
+      {
+       "u": 1,
+       "d": "strike"
+      },
+      {
+       "u": 2,
+       "d": "strike"
+      },
+      {
+       "u": 3,
+       "d": "strike"
+      },
+      {
+       "u": 4,
+       "d": "strike"
+      },
+      {
+       "u": 5,
+       "d": "strike"
+      },
+      {
+       "u": 6,
+       "d": "defend"
+      },
+      {
+       "u": 7,
+       "d": "defend"
+      },
+      {
+       "u": 8,
+       "d": "defend"
+      },
+      {
+       "u": 9,
+       "d": "defend"
+      },
+      {
+       "u": 10,
+       "d": "bash"
+      }
+     ]
+    }
+   },
+   "script": {
+    "path": "scripts/battle.vks",
+    "enabled": true,
+    "timeScale": 1.0
+   }
+  },
+  {
+   "name": "Enemy",
+   "transform": {
+    "position": [
+     0.0,
+     2.0,
+     0.0
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": true,
+   "gameplay": {
+    "attrs": [
+     {
+      "n": "hp",
+      "b": 45.0,
+      "min": 0.0,
+      "max": 45.0
+     },
+     {
+      "n": "attack",
+      "b": 6.0,
+      "min": 0.0,
+      "max": 1000000000.0
+     },
+     {
+      "n": "armor",
+      "b": 0.0,
+      "min": 0.0,
+      "max": 1000000000.0
+     }
+    ]
+   }
+  },
+  {
+   "name": "GameStart",
+   "transform": {
+    "position": [
+     0.0,
+     0.0,
+     -60.0
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": true,
+   "gameStart": {
+    "yaw": 0.0,
+    "enabled": true,
+    "mode": "third",
+    "spawnOnRun": false
+   }
+  }
+ ]
+}

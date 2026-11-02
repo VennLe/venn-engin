@@ -18,6 +18,7 @@
 
 #include "assets/AssetPath.h"
 #include "core/Logger.h"
+#include "ui2/UiAction.h"   // 动作文本的实时校验（面板要在打字时就报错）
 
 #include <imgui.h>
 
@@ -99,6 +100,8 @@ const char* typeLabel(ui2::UiWidgetType t) {
         case ui2::UiWidgetType::Text: return "text";
         case ui2::UiWidgetType::Button: return "button";
         case ui2::UiWidgetType::Progress: return "progress";
+        case ui2::UiWidgetType::Scroll: return "scroll";
+        case ui2::UiWidgetType::Grid: return "grid";
         default: return "?";
     }
 }
@@ -112,6 +115,8 @@ const char* slotALabel(ui2::UiWidgetType t) {
         case ui2::UiWidgetType::Text: return "Text";
         case ui2::UiWidgetType::Button: return "Fill";
         case ui2::UiWidgetType::Progress: return "Fill";
+        // Scroll 自己也画一块底（见 drawDocument），所以它的 color 是"底色"
+        case ui2::UiWidgetType::Scroll: return "Fill";
         default: return "Fill";
     }
 }
@@ -287,7 +292,12 @@ std::vector<ui2::UiDocPlaced> UiEditorWindow::designRects() const {
     canvas.h = static_cast<float>(m_doc.refH);
     // ⚠ 绑定表给空表：设计视图上 `{health}` 保持原样（见 .h ⑤）。
     //   真实数值是运行时的责任，编辑器里"预览假数据"会把作者骗得更惨。
-    return ui2::placeDocumentAt(m_doc, ui2::UiBindings{}, canvas, 1.0f);
+    // ⚠ `honorVisibleBind = false`：**必须**。空绑定表里查不到
+    //   `visibleBind` 那个键 → 判为不可见 → 作者一配"按旗标隐藏"，这个控件
+    //   就在设计视图里消失，连选都选不到（鼠标框选不到它，属性面板也
+    //   无从进入）。设计稿只认 `visible` 这个静态开关。
+    return ui2::placeDocumentAt(m_doc, ui2::UiBindings{}, canvas, 1.0f,
+                                false);
 }
 
 ui2::UiRect UiEditorWindow::parentRectOf(const std::string& path) const {
@@ -335,12 +345,23 @@ void UiEditorWindow::syncBuffers() {
     m_bufKey = key;
     if (!w) {
         m_idBuf[0] = m_textBuf[0] = m_bindBuf[0] = m_bindMaxBuf[0] = '\0';
+        m_actionBuf[0] = m_visBindBuf[0] = '\0';
+        m_dragTagBuf[0] = m_dropAcceptBuf[0] = '\0';
         return;
     }
     std::snprintf(m_idBuf, sizeof(m_idBuf), "%s", w->id.c_str());
     std::snprintf(m_textBuf, sizeof(m_textBuf), "%s", w->text.c_str());
     std::snprintf(m_bindBuf, sizeof(m_bindBuf), "%s", w->bind.c_str());
     std::snprintf(m_bindMaxBuf, sizeof(m_bindMaxBuf), "%s", w->bindMax.c_str());
+    std::snprintf(m_actionBuf, sizeof(m_actionBuf), "%s", w->action.c_str());
+    std::snprintf(m_visBindBuf, sizeof(m_visBindBuf), "%s",
+                  w->visibleBind.c_str());
+    // ⚠ 拖放两个框**必须**跟着选中一起换：它们是可编辑的 InputText，
+    //   ImGui 不会替你重新取初值。不同步的症状是"选中 A 填 card，再点 B，
+    //   B 的框里还是 card，接着一编辑就把两张牌配成同一个 tag"。
+    std::snprintf(m_dragTagBuf, sizeof(m_dragTagBuf), "%s", w->dragTag.c_str());
+    std::snprintf(m_dropAcceptBuf, sizeof(m_dropAcceptBuf), "%s",
+                  w->dropAccept.c_str());
 }
 
 // ============================================================
@@ -763,6 +784,103 @@ bool UiEditorWindow::actSetInset(float v) {
     return true;
 }
 
+// ---- P3-2：变换 / 滚动 / 网格 / 拖放 ----
+//
+// ⚠ 四组都走同一条"改成员 → markDirty → revalidate"的路，不另开机制。
+//   另开一条的后果是"改了参数但校验条不更新 / 存盘按钮不亮"，而那种
+//   不一致在界面上只表现为"按钮是灰的"，看不出为什么。
+
+bool UiEditorWindow::actSetRot(float deg) {
+    if (m_readOnly) return reject("rot", "the file did not load (read-only)");
+    ui2::UiWidget* w = sel();
+    if (!w) return reject("rot", "nothing is selected");
+    // 夹到 ±180：作者把角度拖到 1000° 时，包围盒/命中判定都会绕回同一个
+    // 姿态，但**存盘里的数字**会变成一个没人看得懂的值。
+    while (deg > 180.0f) deg -= 360.0f;
+    while (deg < -180.0f) deg += 360.0f;
+    w->rot = deg;
+    markDirty();
+    revalidate();
+    VK_LOG_INFO("UIED-ROT id=%s deg=%.2f", w->id.c_str(),
+                static_cast<double>(deg));
+    return true;
+}
+
+bool UiEditorWindow::actSetScale(float s) {
+    if (m_readOnly) return reject("scale", "the file did not load (read-only)");
+    ui2::UiWidget* w = sel();
+    if (!w) return reject("scale", "nothing is selected");
+    // ⚠ 下界 0.01 而不是 0：`scale == 0` 让变换矩阵不可逆，命中测试的
+    //   逆变换会整条失效（`toLocal` 判行列式 → 永远不命中），于是
+    //   "缩到 0 藏起来"的控件连自己都点不到，"放回来"就没法用鼠标做。
+    if (s < 0.01f) s = 0.01f;
+    if (s > 20.0f) s = 20.0f;
+    w->scale = s;
+    markDirty();
+    revalidate();
+    VK_LOG_INFO("UIED-SCALE id=%s scale=%.3f", w->id.c_str(),
+                static_cast<double>(s));
+    return true;
+}
+
+bool UiEditorWindow::actSetOpacity(float o) {
+    if (m_readOnly) return reject("opacity", "the file did not load (read-only)");
+    ui2::UiWidget* w = sel();
+    if (!w) return reject("opacity", "nothing is selected");
+    w->opacity = o < 0.0f ? 0.0f : (o > 1.0f ? 1.0f : o);
+    markDirty();
+    revalidate();
+    VK_LOG_INFO("UIED-OPACITY id=%s opacity=%.3f", w->id.c_str(),
+                static_cast<double>(w->opacity));
+    return true;
+}
+
+bool UiEditorWindow::actSetScroll(float sx, float sy) {
+    if (m_readOnly) return reject("scroll", "the file did not load (read-only)");
+    ui2::UiWidget* w = sel();
+    if (!w) return reject("scroll", "nothing is selected");
+    if (w->type != ui2::UiWidgetType::Scroll)
+        return reject("scroll", "only a scroll widget can scroll");
+    w->scrollX = sx;
+    w->scrollY = sy;
+    markDirty();
+    revalidate();
+    VK_LOG_INFO("UIED-SCROLL id=%s x=%.1f y=%.1f", w->id.c_str(),
+                static_cast<double>(sx), static_cast<double>(sy));
+    return true;
+}
+
+bool UiEditorWindow::actSetGrid(int cols, float gapX, float gapY) {
+    if (m_readOnly) return reject("grid", "the file did not load (read-only)");
+    ui2::UiWidget* w = sel();
+    if (!w) return reject("grid", "nothing is selected");
+    if (w->type != ui2::UiWidgetType::Grid)
+        return reject("grid", "only a grid widget has columns");
+    w->cols = cols < 1 ? 1 : cols;
+    w->gapX = gapX < 0.0f ? 0.0f : gapX;
+    w->gapY = gapY < 0.0f ? 0.0f : gapY;
+    markDirty();
+    revalidate();
+    VK_LOG_INFO("UIED-GRID id=%s cols=%d gap=%.1f/%.1f", w->id.c_str(), w->cols,
+                static_cast<double>(w->gapX), static_cast<double>(w->gapY));
+    return true;
+}
+
+bool UiEditorWindow::actSetDragDrop(const std::string& dragTag,
+                                    const std::string& accept) {
+    if (m_readOnly) return reject("drag", "the file did not load (read-only)");
+    ui2::UiWidget* w = sel();
+    if (!w) return reject("drag", "nothing is selected");
+    w->dragTag = dragTag;
+    w->dropAccept = accept;
+    markDirty();
+    revalidate();
+    VK_LOG_INFO("UIED-DRAG id=%s tag=%s accept=%s", w->id.c_str(),
+                dragTag.empty() ? "(none)" : dragTag.c_str(),
+                accept.empty() ? "(none)" : accept.c_str());
+    return true;
+}
+
 bool UiEditorWindow::actSetText(const std::string& t) {
     if (m_readOnly) return reject("text", "the file did not load (read-only)");
     ui2::UiWidget* w = sel();
@@ -833,6 +951,54 @@ bool UiEditorWindow::actSetVisible(bool v) {
     w->visible = v;
     markDirty();
     revalidate();
+    return true;
+}
+
+bool UiEditorWindow::actSetAction(const std::string& text) {
+    if (m_readOnly) return reject("action", "the file did not load (read-only)");
+    ui2::UiWidget* w = sel();
+    if (!w) return reject("action", "nothing is selected");
+    // 空串 = 清掉动作（合法：装饰性控件）。
+    ui2::UiAction parsed;
+    std::string err;
+    if (!ui2::parseUiAction(text, parsed, &err)) {
+        // 编辑器里**当场拒绝**：作者正在打字，立刻看到原因比"存盘后点不动"
+        // 便宜得多。加载路径则只降级成 warning（见 parseUiDocument）。
+        return reject("action", err);
+    }
+    w->action = text;
+    markDirty();
+    revalidate();
+    VK_LOG_INFO("UIED-ACTION id=%s action=%s", w->id.c_str(),
+                text.empty() ? "(none)" : text.c_str());
+    return true;
+}
+
+bool UiEditorWindow::actSetEnabled(bool v) {
+    if (m_readOnly) return reject("enabled", "the file did not load (read-only)");
+    ui2::UiWidget* w = sel();
+    if (!w) return reject("enabled", "nothing is selected");
+    w->enabled = v;
+    markDirty();
+    revalidate();
+    VK_LOG_INFO("UIED-ENABLED id=%s enabled=%d", w->id.c_str(), v ? 1 : 0);
+    return true;
+}
+
+bool UiEditorWindow::actSetVisibleBind(const std::string& key) {
+    if (m_readOnly)
+        return reject("visiblebind", "the file did not load (read-only)");
+    ui2::UiWidget* w = sel();
+    if (!w) return reject("visiblebind", "nothing is selected");
+    // 键里不许有空格：绑定表按 `unordered_map` 的整串匹配，空格不会报错，
+    // 只会让"为什么这个控件永远不显示"变成一个谜。
+    if (key.find(' ') != std::string::npos)
+        return reject("visiblebind", "the key must not contain spaces");
+    w->visibleBind = key;
+    markDirty();
+    revalidate();
+    VK_LOG_INFO("UIED-VISBIND id=%s key=%s", w->id.c_str(),
+                key.empty() ? "(none)" : key.c_str());
     return true;
 }
 
@@ -1007,7 +1173,12 @@ void UiEditorWindow::drawTreePanel(float height) {
     ImGui::Text(TR("Widgets (%d)"), ui2::countWidgets(m_doc.widgets));
     logRect("UIED-TREE-HDR", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
 
-    // 两个按钮一行，摆两行 —— 一行六个在 230px 里必然被裁掉一半。
+    // 两个按钮一行，摆**四行**（6 → 8 个：加了 Scroll / Grid 两个容器）。
+    // ⚠ 230px 的栏宽一行只放得下两个；一行六个会被裁掉一半。
+    // ⚠⚠ 加行之后**下面的 Duplicate/Delete/Up/Down 会整排下移** —— 面板高度
+    //   不够时它们会掉出可视区，而 `logRect` 不判可见性 → 用例"有矩形
+    //   却点不到"。2026-11-04 加 Scroll/Grid 时实测过：树区域是
+    //   `BeginChild` 固定高的，多出的一行由它吸收（按钮区仍是 4 行 × 30px）。
     const struct {
         const char* label;
         ui2::UiWidgetType type;
@@ -1019,8 +1190,12 @@ void UiEditorWindow::drawTreePanel(float height) {
         {"+ Progress", ui2::UiWidgetType::Progress, "UIED-ADD-PROGRESS"},
         {"+ Nine", ui2::UiWidgetType::Nine, "UIED-ADD-NINE"},
         {"+ Image", ui2::UiWidgetType::Image, "UIED-ADD-IMAGE"},
+        // P3-2：两个容器。Scroll = 裁剪 + 滚动；Grid = 等分格子。
+        {"+ Scroll", ui2::UiWidgetType::Scroll, "UIED-ADD-SCROLL"},
+        {"+ Grid", ui2::UiWidgetType::Grid, "UIED-ADD-GRID"},
     };
-    for (int i = 0; i < 6; ++i) {
+    const int kAddCount = static_cast<int>(sizeof(kAdd) / sizeof(kAdd[0]));
+    for (int i = 0; i < kAddCount; ++i) {
         if (i % 2) ImGui::SameLine();
         if (ImGui::Button(TR(kAdd[i].label))) actAdd(kAdd[i].type);
         logRect(kAdd[i].anchor, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
@@ -1252,10 +1427,35 @@ void UiEditorWindow::drawCanvas(float height) {
                 const ImVec2 b(m_canvas.x0 + r.right() * m_canvas.scale,
                                m_canvas.y0 + r.bottom() * m_canvas.scale);
                 const bool selected = (path == m_sel);
-                const ImU32 fillCol = imCol(w.color, selected ? 235 : 180);
+                // 透明度进设计视图：作者在属性栏把 opacity 拖到 0.3，画布里
+                // 就该淡下去。不显示的话"我调了它没反应"会变成一条反复
+                // 排查的假 bug（真正的效果要到 Play 才看得到）。
+                const int alphaScale = static_cast<int>(
+                    255.0f * std::max(0.0f, std::min(1.0f, w.opacity)));
+                const ImU32 fillCol = imCol(
+                    w.color, static_cast<int>((selected ? 235 : 180) *
+                                              w.opacity));
 
-                dl->AddRectFilled(a, b, fillCol,
-                                  w.radius * m_canvas.scale);
+                // 旋转：ImGui 的 AddRect 只能画轴对齐框，所以自己算四个角
+                // 走 AddQuad。**只算旋转、不算缩放** —— 缩放由 rect 本身
+                // 反映不了（rect 是锚点算出来的），但旋转不改 rect，
+                // 不额外画的话作者完全看不见它转了没有。
+                const float rotRad = w.rot * 3.14159265358979f / 180.0f;
+                const float cx = (a.x + b.x) * 0.5f;
+                const float cy = (a.y + b.y) * 0.5f;
+                const float cs = std::cos(rotRad);
+                const float sn = std::sin(rotRad);
+                auto ro = [&](float px, float py) {
+                    const float dx = px - cx, dy = py - cy;
+                    return ImVec2(cx + dx * cs - dy * sn, cy + dx * sn + dy * cs);
+                };
+                const ImVec2 q0 = ro(a.x, a.y), q1 = ro(b.x, a.y);
+                const ImVec2 q2 = ro(b.x, b.y), q3 = ro(a.x, b.y);
+                if (w.rot != 0.0f) {
+                    dl->AddQuadFilled(q0, q1, q2, q3, fillCol);
+                } else {
+                    dl->AddRectFilled(a, b, fillCol, w.radius * m_canvas.scale);
+                }
                 if (w.type == ui2::UiWidgetType::Progress && fill.w > 0.5f) {
                     const ImVec2 fa(m_canvas.x0 + fill.x * m_canvas.scale,
                                     m_canvas.y0 + fill.y * m_canvas.scale);
@@ -1267,6 +1467,25 @@ void UiEditorWindow::drawCanvas(float height) {
                 dl->AddRect(a, b,
                             selected ? IM_COL32(255, 214, 92, 255)
                                      : IM_COL32(120, 128, 142, 180));
+                if (w.rot != 0.0f) {
+                    // 旋转后的**外框**（虚线感靠暗色描边表示）。框仍画在
+                    // 未旋转的 rect 上：那是命中/锚点的真实依据，作者调 X/Y
+                    // 时看的就是它。
+                    dl->AddQuad(q0, q1, q2, q3,
+                                selected ? IM_COL32(255, 214, 92, 255)
+                                         : IM_COL32(120, 128, 142, 180));
+                }
+                if (alphaScale < 250) {
+                    // 半透明的控件加一行小字，免得作者以为是颜色调浅了
+                    char ob[32];
+                    // ⚠ 格式串也要包 TR()：`verify_i18n_coverage` 的 D 组
+                    //   专门盯这一条 —— 只翻前缀、格式串留英文，中文界面上
+                    //   就会出现"不透明 op 0.30"这种半截话。
+                    std::snprintf(ob, sizeof(ob), TR("op %.2f"),
+                                  static_cast<double>(w.opacity));
+                    dl->AddText(ImVec2(a.x + 4.0f, a.y + 2.0f),
+                                IM_COL32(255, 255, 255, 160), ob);
+                }
 
                 // 文字：设计视图里用 ImGui 的字（与运行时字体不同，这没
                 // 关系 —— 这里看的是"位置与对齐"，字形的最终效果在 Play 里看）。
@@ -1429,6 +1648,88 @@ void UiEditorWindow::drawInspector(float height) {
         ImGui::SetTooltip("%s", TR("Border width (nine) or inner padding "
                                    "(progress)."));
 
+    // ---- 变换（P3-2）----
+    //
+    // ⚠ 三个滑条**永远显示**（不按类型藏）：作者第一件事往往是把一个
+    //   面板转一下试试，发现没有这个滑条就会以为引擎不支持。
+    //   代价是属性面板多三行 —— 而面板是可滚的（见 UIED-PANEL）。
+    ImGui::SeparatorText(TR("Transform"));
+    ImGui::SetNextItemWidth(120.0f);
+    float rot = w->rot;
+    if (ImGui::DragFloat(TR("Rotation"), &rot, 0.5f, -180.0f, 180.0f, "%.0f"))
+        actSetRot(rot);
+    logRect("UIED-ROT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", TR("Degrees, around the widget's own centre. "
+                                   "Positive is clockwise on screen."));
+    ImGui::SetNextItemWidth(120.0f);
+    float scl = w->scale;
+    if (ImGui::DragFloat(TR("Scale"), &scl, 0.01f, 0.01f, 20.0f, "%.2f"))
+        actSetScale(scl);
+    logRect("UIED-SCALE", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImGui::SetNextItemWidth(120.0f);
+    float opa = w->opacity;
+    if (ImGui::DragFloat(TR("Opacity"), &opa, 0.01f, 0.0f, 1.0f, "%.2f"))
+        actSetOpacity(opa);
+    logRect("UIED-OPACITY", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", TR("Multiplies into children — a panel at 0.5 "
+                                   "fades its own text too."));
+
+    // ---- Scroll ----
+    if (w->type == ui2::UiWidgetType::Scroll) {
+        ImGui::SeparatorText(TR("Scroll"));
+        float sc[2] = {w->scrollX, w->scrollY};
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::DragFloat2(TR("Offset"), sc, 1.0f, -4000.0f, 4000.0f,
+                              "%.0f"))
+            actSetScroll(sc[0], sc[1]);
+        logRect("UIED-SCROLL", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", TR("Positive Y moves the content up "
+                                       "(scrolls down). Children are clipped "
+                                       "to this widget's rect."));
+    }
+
+    // ---- Grid ----
+    if (w->type == ui2::UiWidgetType::Grid) {
+        ImGui::SeparatorText(TR("Grid"));
+        int cols = w->cols;
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::DragInt(TR("Columns"), &cols, 0.2f, 1, 32))
+            actSetGrid(cols, w->gapX, w->gapY);
+        logRect("UIED-GRID-COLS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        float gap[2] = {w->gapX, w->gapY};
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::DragFloat2(TR("Gap"), gap, 0.5f, 0.0f, 400.0f, "%.0f"))
+            actSetGrid(w->cols, gap[0], gap[1]);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", TR("Children are placed into equal cells — "
+                                       "their own X/Y/W/H are ignored."));
+    }
+
+    // ---- 拖放 ----
+    //
+    // ⚠ 两个框都**始终可见**：只在 Scroll/Grid 上显示的话，作者给一张牌
+    //   配 `card` 时根本找不到输入框（牌是 Image 或 Button）。
+    ImGui::SeparatorText(TR("Drag & drop"));
+    ImGui::SetNextItemWidth(120.0f);
+    // ⚠ 缓冲区要**每次选中时同步**（见 m_dragTagBuf 的注释），否则切控件
+    //   会把上一个控件的 tag 带过来，一保存就把两张牌配成同一个 tag。
+    if (ImGui::InputText(TR("Drag tag"), m_dragTagBuf, sizeof(m_dragTagBuf)))
+        actSetDragDrop(m_dragTagBuf, w->dropAccept);
+    logRect("UIED-DRAGTAG", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", TR("Non-empty = this widget can be dragged. "
+                                   "The value is its payload type, e.g. card."));
+    ImGui::SetNextItemWidth(120.0f);
+    if (ImGui::InputText(TR("Accept"), m_dropAcceptBuf, sizeof(m_dropAcceptBuf)))
+        actSetDragDrop(w->dragTag, m_dropAcceptBuf);
+    logRect("UIED-DROPACCEPT", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", TR("Comma separated tags this widget accepts, "
+                                   "e.g. card,item. * accepts anything."));
+
     // ---- 文本 ----
     if (w->type == ui2::UiWidgetType::Text ||
         w->type == ui2::UiWidgetType::Button) {
@@ -1469,6 +1770,54 @@ void UiEditorWindow::drawInspector(float height) {
         if (ImGui::DragFloat(TR("Value"), &v, 0.01f, 0.0f, 1000.0f, "%.2f"))
             actSetValue(v);
     }
+
+    // ---- 交互（2026-11-02）----
+    //
+    // 在它之前，这里摆出来的按钮在运行时**点不动**：`UiDocument` 里根本
+    // 没有"点了做什么"这个概念。现在三件在这一屏里配。
+    ImGui::Separator();
+    ImGui::TextDisabled("%s", TR("Interaction"));
+
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint(TR("Action"), "flag:menuStart=1", m_actionBuf,
+                                 sizeof(m_actionBuf),
+                                 ImGuiInputTextFlags_EnterReturnsTrue)) {
+        actSetAction(m_actionBuf);
+    }
+    logRect("UIED-ACTION", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s",
+                          TR("What a click does: flag:key=1 / toggle:key / "
+                             "sound:path / quit. Empty = decorative."));
+    {
+        // 打字时就校验 —— 回车提交才报错的话，作者要先把错的存进去才知道。
+        ui2::UiAction preview;
+        std::string perr;
+        if (!ui2::parseUiAction(m_actionBuf, preview, &perr)) {
+            ImGui::TextColored(kBadCol, "%s", perr.c_str());
+        } else if (preview.kind != ui2::UiActionKind::None) {
+            ImGui::TextColored(kOkCol, "%s",
+                               ui2::uiActionDescribe(preview).c_str());
+        }
+    }
+
+    bool en = w->enabled;
+    if (ImGui::Checkbox(TR("Enabled"), &en)) actSetEnabled(en);
+    logRect("UIED-ENABLED", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", TR("Still drawn, but clicks are ignored "
+                                   "(dimmed)."));
+
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint(TR("Visible when flag"), "menuOpen",
+                                 m_visBindBuf, sizeof(m_visBindBuf),
+                                 ImGuiInputTextFlags_EnterReturnsTrue)) {
+        actSetVisibleBind(m_visBindBuf);
+    }
+    logRect("UIED-VISBIND", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", TR("Empty = always visible. Otherwise shown "
+                                   "only while the flag is non-zero."));
 
     ImGui::Separator();
     bool vis = w->visible;
@@ -1557,7 +1906,35 @@ void UiEditorWindow::runInjectedScript() {
                 ok = (name == "setcolor") ? actSetColor(c) : actSetColor2(c);
         } else if (name == "setradius") ok = actSetRadius(static_cast<float>(std::atof(arg.c_str())));
         else if (name == "setinset") ok = actSetInset(static_cast<float>(std::atof(arg.c_str())));
-        else if (name == "settext") ok = actSetText(arg);
+        // ---- P3-2 ----
+        else if (name == "setrot") ok = actSetRot(static_cast<float>(std::atof(arg.c_str())));
+        else if (name == "setscale") ok = actSetScale(static_cast<float>(std::atof(arg.c_str())));
+        else if (name == "setopacity") ok = actSetOpacity(static_cast<float>(std::atof(arg.c_str())));
+        else if (name == "setscroll") {
+            float sx = 0, sy = 0;
+            if (std::sscanf(arg.c_str(), "%f,%f", &sx, &sy) == 2)
+                ok = actSetScroll(sx, sy);
+        } else if (name == "setgrid") {
+            int c = 2;
+            float gx = 8, gy = 8;
+            const int n = std::sscanf(arg.c_str(), "%d,%f,%f", &c, &gx, &gy);
+            if (n >= 1) {
+                if (n < 3) { gx = 8.0f; gy = 8.0f; }
+                if (n < 2) gx = 8.0f;
+                ok = actSetGrid(c, gx, gy);
+            }
+        } else if (name == "setdrag") {
+            // `setdrag <tag> [<accept>]`；`-` 表示清空
+            std::string a = arg, b;
+            const std::size_t sp = arg.find(' ');
+            if (sp != std::string::npos) {
+                a = arg.substr(0, sp);
+                b = arg.substr(sp + 1);
+            }
+            if (a == "-") a.clear();
+            if (b == "-") b.clear();
+            ok = actSetDragDrop(a, b);
+        } else if (name == "settext") ok = actSetText(arg);
         else if (name == "setfont") ok = actSetFontSize(static_cast<float>(std::atof(arg.c_str())));
         else if (name == "setalign") {
             const int a = (arg == "center") ? 1 : (arg == "right" ? 2 : 0);

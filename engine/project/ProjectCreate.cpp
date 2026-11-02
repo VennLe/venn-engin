@@ -859,6 +859,39 @@ int runCreateSelfTest() {
 #endif
     }
 
+    // ---- K33 每个"游戏类型"都必须有一个能用的模板 ----
+    //
+    // 启动器向导上的一张卡片 = 一次 `createFromTemplate`。卡片画出来了、
+    // 点下去也"选中了"，但模板不存在 / 清单里的 gameType 与卡片不一致时，
+    // 失败发生在**点了创建之后**（"Template 'card_battler' not found"），
+    // 而用户刚填了名字、选了目录 —— 一次创建白费。
+    //
+    // 所以这里逐个把 `kGameTypeCount` 个 id 都读一遍清单：
+    //   · 模板目录能找到；
+    //   · 清单里声明的 gameType 就是这张卡片的类型（不能张冠李戴）；
+    //   · 起始场景在模板里**真的存在**（丢失 = 建出来的工程一开就黑屏）。
+    for (int i = 0; i < kGameTypeCount; ++i) {
+        const GameType t = gameTypeAt(i);
+        const std::string id = gameTypeId(t);
+        const std::string tag = "K33[" + id + "]";
+        TemplateManifest tm;
+        std::string terr;
+        const bool ok = loadTemplateManifest(id, tm, &terr).ok;
+        check(ok, (tag + " manifest-load").c_str(), terr);
+        if (!ok) continue;
+        check(tm.gameType == t, (tag + " manifest-gametype").c_str(),
+              gameTypeId(tm.gameType));
+        check(!tm.startScene.empty(), (tag + " start-scene-declared").c_str(), "");
+        if (!tm.startScene.empty()) {
+            std::error_code sec;
+            const fs::path scenePath = fs::path(tm.dir) / "assets" /
+                                       fs::path(tm.startScene);
+            check(fs::is_regular_file(scenePath, sec),
+                  (tag + " start-scene-exists").c_str(),
+                  scenePath.generic_string());
+        }
+    }
+
 #if defined(_WIN32)
     _putenv_s("MYVK_LAUNCHER_RECENT", "");
 #else

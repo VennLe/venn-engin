@@ -125,8 +125,30 @@ void DialogueSystem::setVoiceHooks(VoiceHooks h) {
     //   场景可能还没建。改由 `tick()` 每帧对齐（见那里）。
 }
 
-// ---------------------------------------------------------------- 每帧
+void DialogueSystem::setFlagStore(DlgFlagStore* store) {
+    m_flags = store;
+    // cue 槽位是系统自己的成员，当场装好（`cue()` 会立刻 `start()`）。
+    // 组件上的由 `tick()` 对齐。
+    m_cue.setFlagStore(store);
+    VK_LOG_INFO("DLG-FLAGS installed=%d", store ? 1 : 0);
+}
 
+void DialogueSystem::setFlagStore(std::function<double(const std::string&)> get,
+                                  std::function<void(const std::string&, double)> set) {
+    // ⚠ 先造桥再调上面那版：桥一旦析构而 `m_flags` 还指着它，就是悬垂。
+    //   `m_cue` 里的指针也一起悬垂 —— 所以只有赋值成功后才更新。
+    m_bridge = std::make_unique<FlagStoreBridge>(std::move(get), std::move(set));
+    if (!m_bridge->usable()) {
+        // 只给一半 = 与没装等价。别让它"看着装上了"。
+        m_bridge.reset();
+        setFlagStore(nullptr);
+        VK_LOG_WARN("DLG-FLAGS bridge rejected (need both get and set)");
+        return;
+    }
+    setFlagStore(m_bridge.get());
+}
+
+// ---------------------------------------------------------------- 每帧
 void DialogueSystem::tick(scene::Scene& scene, float dt) {
     m_lastRunning = 0;
     ecs::Entity best{};
@@ -145,6 +167,13 @@ void DialogueSystem::tick(scene::Scene& scene, float dt) {
             //   每秒上千次分配，纯属白烧。
             if (dc.player.hookGen() != m_voiceGen)
                 dc.player.setVoiceHooks(m_voice);
+
+            // C7：旗标仓库对齐。与上面同理，**必须在 `autoStart` 之前** ——
+            // 起播那句可能就是一句带条件的台词，装晚了它会走 else。
+            // ⚠ 这里可以直接 `!=` 比指针（比语音那套的代数简单）：裸指针
+            //   的复制没有分配成本，比一次 `std::function` 拷贝便宜得多。
+            if (dc.player.flagStore() != m_flags)
+                dc.player.setFlagStore(m_flags);
 
             // ---- 路径被改过 → 换一份台词（并让 autoStart 重新起播）----
             // 不这么做的话，Inspector 里改完路径画面毫无变化，而日志里

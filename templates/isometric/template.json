@@ -1,0 +1,20 @@
+{
+ "format": 1,
+ "id": "isometric",
+ "label": "Isometric",
+ "summary": "相机从斜上方俯视一块棋盘，适合回合制策略 / 战棋；没有玩家角色，靠相机与脚本驱动。",
+ "gameType": "isometric",
+ "startScene": "scenes/main.json",
+ "placeholders": [
+  "__PROJECT_NAME__",
+  "__TEMPLATE_ID__"
+ ],
+ "files": [
+  "README.md",
+  "assets/game.json",
+  "assets/scenes/main.json",
+  "assets/scripts/main.vks",
+  "assets/data/cards.csv",
+  "config/render.json"
+ ]
+}

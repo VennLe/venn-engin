@@ -17,6 +17,8 @@
 // 少任何一个都会让血条变成"跳一下就没了"——玩家来不及读到"我掉了 30"。
 // ============================================================
 
+#include "gameplay/DamageNumbers.h"
+
 #include <glm/glm.hpp>
 
 #include <cmath>
@@ -26,17 +28,18 @@
 
 namespace runtime {
 
-// 一条伤害数字。`t` 是**归一化寿命**：0 = 刚出现，1 = 该消失。
-struct DamagePopup {
-    glm::vec3 worldPos{0.0f};
-    float amount = 0.0f;
-    float t = 0.0f;
-};
-
 struct HudModel {
-    // 对象池容量。固定 32 而不是 vector 无限增长：一片 AoE 打中二十个敌人
-    // 时，屏幕上同时出现上百个数字既看不清也没有信息量。
-    static constexpr std::size_t kMaxPopups = 32;
+    // ---- 伤害数字（P3-4：搬进 `gameplay::DamageNumberLayer`）----
+    //
+    // ⚠ 这一格原来是 `std::vector<DamagePopup>`（一条 = 位置 + 数字 + 年龄）。
+    //   P3-4 把它换成了真正的层：合并（"37 x3"）、五种样式（暴击/治疗/护盾/
+    //   状态/MISS）、确定性的漂移、以及"上浮 / 弹一下 / 淡出"三条曲线。
+    //   换掉的理由很实在：卡牌游戏里一个目标一回合挨三下，三条"37"会互相
+    //   盖住，而"合并"这件事**必须有地方记得住连击数** —— 那不是绘制侧的活。
+    gameplay::DamageNumberLayer popups;
+
+    // 兼容别名：老调用方（与自检）用这个名字表示池容量。
+    static constexpr std::size_t kMaxPopups = gameplay::DamageNumberLayer::kMax;
 
     float maxHealth = 100.0f;
     float health = 100.0f;
@@ -46,8 +49,6 @@ struct HudModel {
     bool showCrosshair = true;
     int ammo = -1;            // < 0 = 不显示
     std::string hint;         // 交互提示（"[E] 开门"），空 = 不显示
-
-    std::vector<DamagePopup> popups;
 
     // 血量百分比（夹到 0..1）。maxHealth <= 0 时返回 0 —— 不做除零。
     float healthRatio() const {
@@ -63,21 +64,21 @@ struct HudModel {
         health = v < 0.0f ? 0.0f : (v > maxHealth ? maxHealth : v);
     }
 
-    // 加一条伤害数字。池满时**替换最老的那条**（t 最大的）——
-    // 挤掉最新的会让"刚打中的那一击"看不见，正好反了。
-    void addPopup(const glm::vec3& worldPos, float amount) {
-        if (popups.size() < kMaxPopups) {
-            popups.push_back({worldPos, amount, 0.0f});
-            return;
-        }
-        std::size_t oldest = 0;
-        for (std::size_t i = 1; i < popups.size(); ++i)
-            if (popups[i].t > popups[oldest].t) oldest = i;
-        popups[oldest] = {worldPos, amount, 0.0f};
+    // 弹一条伤害数字。`merge` 默认 true：同一目标半秒内连续挨打会合并成
+    // "37 x3"（见 DamageNumbers.h 头注释第 1 条）。
+    void addPopup(const glm::vec3& worldPos, float amount,
+                  gameplay::PopupKind kind = gameplay::PopupKind::Damage,
+                  bool merge = true) {
+        gameplay::PopupSpawn s;
+        s.worldPos = worldPos;
+        s.amount = amount;
+        s.kind = kind;
+        s.merge = merge;
+        popups.spawn(s);
     }
 
-    // 推进一帧。`kPopupLife` 秒的寿命；掉血的残影比显示值慢半拍。
-    static constexpr float kPopupLife = 1.0f;
+    // 推进一帧。掉血的残影比显示值慢半拍（伤害数字的寿命在
+    // `popupStyle(kind).life` 里，默认 Damage 0.85s）。
     static constexpr float kShownRate = 8.0f;    // 显示值追赶速度（1/s）
     static constexpr float kTrailDelay = 0.35f;  // 残影开始回落前的停顿
     static constexpr float kTrailRate = 1.6f;
@@ -85,16 +86,7 @@ struct HudModel {
     void tick(float dt) {
         if (dt < 0.0f) dt = 0.0f;
 
-        // 伤害数字
-        for (std::size_t i = 0; i < popups.size();) {
-            popups[i].t += dt / kPopupLife;
-            if (popups[i].t >= 1.0f) {
-                popups[i] = popups.back();
-                popups.pop_back();
-            } else {
-                ++i;
-            }
-        }
+        popups.tick(dt);
 
         // 显示值：指数追随（掉血与回血都平滑，回血也不该瞬间跳满）
         const float k = 1.0f - std::exp(-kShownRate * dt);

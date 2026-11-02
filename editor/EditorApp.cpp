@@ -43,6 +43,22 @@
 #include "PhysicsPanel.h"
 #include "QualitySettingsPanel.h"
 #include "EnvironmentPanel.h"
+#include "PostVolumePanel.h"
+#include "FlagTablePanel.h"     // A4：剧情旗标
+#include "LevelPanel.h"         // G19：关卡流送
+#include "fx/AnimEventRouter.h" // P1-3：动画事件 → 特效
+#include "fx/EffectService.h"   // P1：特效调度
+#include "dialogue/DialogueSystem.h" // C7：对话条件分支的旗标仓库
+#include "FxPanel.h"            // P1：特效面板
+#include "CardsPanel.h"           // P3-3：牌堆操作台
+#include "NavPanel.h"            // C8：导航操作台
+#include "nav/NavBake.h"         // C8：网格烘焙（要射线）
+#include "nav/NavSerialize.h"    // C8：`.vnav.json` 读写
+#include "GameplayPanel.h"      // P2：玩法面板（回合队列）
+#include "ScriptDebugPanel.h"   // C8：脚本断点
+#include "AudioMixerPanel.h"
+#include "ProjectSettingsPanel.h"
+#include "TablePanels.h"
 #include "AnimatorGraphPanel.h"
 #include "CharacterStudioPanel.h"
 #include "SaveSlotsPanel.h"
@@ -66,7 +82,14 @@
 #include "ui/KeyCodes.h"
 
 #include "assets/AssetPath.h"
+
+#include <nlohmann/json.hpp>
+
+#include <filesystem>
+#include <fstream>
 #include "core/Logger.h"
+#include "core/CpuProfiler.h"   // Stats 面板的 CPU 分段（C9）
+#include "core/ProcStats.h"     // Stats 面板的内存一节
 #include "core/Input.h"       // Play 态的原始鼠标位移 / 右键（P8）
 #include "core/Version.h"
 #include "core/WindowGeometry.h"
@@ -83,6 +106,8 @@
 #include "scene/SpringArm.h"
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
+#include "project/CardSource.h"
+#include "project/DataTable.h"
 #include "project/ProjectCreate.h"
 #include "project/ProjectFile.h"
 #include "ui/ImGuiManager.h"
@@ -115,6 +140,13 @@
 namespace editor {
 
 namespace {
+
+// P1（2026-11-02）：顿帧期间的仿真倍率。
+//
+// ⚠ 定义在 `fx/EffectAsset.h`（engine 侧）—— **出包运行时用的是同一个数**。
+//   两边各写一份的话，"编辑器手感对、出包变样"这种问题只能靠感觉描述。
+//   这里只做个别名，方便阅读本文件的表达式。
+constexpr float kHitstopScale = fx::kHitstopScale;
 
 // 早期声明：drawPanels（本文件前部）要给浮动面板抢层级，需要按 id 拿到
 // 它的 ImGui 窗口名；真正的定义在文件后半段（托盘那一节）。
@@ -167,7 +199,7 @@ constexpr float kPlayCameraRadius = 0.25f;
 constexpr float kFloatW = 360.0f;
 constexpr float kFloatMargin = 12.0f;
 constexpr float kScriptsH = 300.0f;
-constexpr float kStatsH = 230.0f;
+constexpr float kStatsH = 300.0f;
 constexpr float kFloatGap = 8.0f;
 
 // ---------------------------------------------------------------- 窗口几何
@@ -485,6 +517,60 @@ std::vector<PanelDesc> EditorApp::buildPanelTable() {
         // 不需要任何选中上下文，空场景里也能调。
         {"environment", "Sky & Atmosphere", PanelGroup::Authoring, "", "sun",
          false, true, kSlotNone, &EditorApp::panelDrawEnvironment},
+        // 2026-11-02：后处理体积。**引擎侧早就全了**（PostVolume + 落盘 +
+        // Renderer 每帧求值），唯独 editor 里零入口 —— 它不是实体，
+        // Hierarchy 也看不见。归 Authoring、浮动、无快捷键（同 Physics /
+        // Quality / Environment：一开就要看全的一张表）。
+        {"postvol", "Post-process volumes", PanelGroup::Authoring, "", "camera",
+         false, true, kSlotNone, &EditorApp::panelDrawPostVolume},
+        // 2026-11-02：音频混音台。与上面同款（Authoring / 浮动 / 无快捷键）。
+        // 它补的是同一个形状的洞：`Mixer` + `AudioSystem` 从 10 月就完整，
+        // 唯独 Master / 静音 / duck 深度**编辑器里没有任何入口**（只有
+        // 控制台 `audio.bus`，而且只覆盖三条总线）。
+        {"audio", "Audio mixer", PanelGroup::Authoring, "", "volume", false, true,
+         kSlotNone, &EditorApp::panelDrawAudioMixer},
+        // 2026-11-02：项目设置。`game.json` 在 11-02 之前**只能手改**，
+        // 而 `Edit ▸ Project Settings...` 打开的是画质档位那张面板 ——
+        // "项目设置"这四个字指向错了地方。现在它指向这里。
+        {"projectsettings", "Project settings", PanelGroup::Authoring, "",
+         "gear", false, true, kSlotNone, &EditorApp::panelDrawProjectSettings},
+        // 2026-11-02：配表（C1）与本地化（C2）。两个都是**文件**的 UI，
+        // 与 Project settings 同归 Authoring —— 它们改的是 `assets/` 下的
+        // 数据文件，不是场景状态，所以同样不进场景脏标记。
+        {"datatable", "Data tables", PanelGroup::Authoring, "", "grid",
+         false, true, kSlotNone, &EditorApp::panelDrawDataTable},
+        {"localization", "Localization", PanelGroup::Authoring, "", "text",
+         false, true, kSlotNone, &EditorApp::panelDrawLocalization},
+        // 2026-11-02（A4）：剧情旗标。归 **Debug** 组（不是 Authoring）——
+        // 它读的是"这一局游戏现在的状态"，与配表/本地化那种"改文件"的
+        // 面板不是一类东西；调试时要在 Play 里开着看它实时变。
+        {"flags", "Flags", PanelGroup::Debug, "", "bookmark",
+         false, true, kSlotNone, &EditorApp::panelDrawFlags},
+        // 2026-11-02（P1）：特效面板。归 Debug —— 它是"调参 + 看池子"的
+        // 工具，不是玩法面板。
+        {"fx", "Effects", PanelGroup::Debug, "", "bolt",
+         false, true, kSlotNone, &EditorApp::panelDrawFx},
+        // 2026-11-03（P2）：玩法面板。归 Debug —— 它是"看局况 + 推一回合"的
+        // 工具。与 Inspector 的 Gameplay 页签分工：那边管**一个实体**，
+        // 这边管**整个遭遇**（回合队列是跨实体的）。
+        {"gameplay", "Gameplay", PanelGroup::Debug, "", "heart",
+         false, true, kSlotNone, &EditorApp::panelDrawGameplay},
+        // 2026-11-03（P3-3）：牌堆操作台。与 Gameplay 面板同一组（Debug）：
+        // 卡牌流程的六个动词塞进 Gameplay 面板会把"接下来谁先动"挤出半屏。
+        {"cards", "Cards", PanelGroup::Debug, "", "cards",
+         false, true, kSlotNone, &EditorApp::panelDrawCards},
+        // 2026-11-04（C8 导航）：导航操作台。归 **Authoring** —— 它的产出是
+        // "这一关哪儿能走"，是内容；调试（看网格形状、试一条路）只是用法之一。
+        {"navigation", "Navigation", PanelGroup::Authoring, "", "route",
+         false, true, kSlotNone, &EditorApp::panelDrawNavigation},
+        // 2026-11-02（C8）：脚本断点调试。同样归 Debug —— 它是"停住看状态"
+        // 的工具，与 Scripts 面板（看实例表）互补：那边看全局，这边看一行。
+        {"scriptdbg", "Script debug", PanelGroup::Debug, "", "code",
+         false, true, kSlotNone, &EditorApp::panelDrawScriptDebug},
+        // 2026-11-02（G19）：关卡流送。归 **Authoring** —— 它的产出是
+        // "这个世界的组成"，是内容而不是调试状态（调试只是它的用法之一）。
+        {"levels", "Levels", PanelGroup::Authoring, "", "map",
+         false, true, kSlotNone, &EditorApp::panelDrawLevels},
         // 2026-11-01：动画状态机图编辑器。它是 `.anim.json` 的**唯一 GUI
         // 入口** —— 在这之前只能在 Inspector 里手填一个路径，然后去文本
         // 编辑器改文件。归 Authoring、浮动、无快捷键（同 Physics/Quality：
@@ -579,6 +665,217 @@ void EditorApp::panelDrawEnvironment(EditorApp& a) {
     if (!a.m_envPanel) return;
     // 真值是场景里那份（天气随场景序列化）；Renderer 只负责消费。
     a.m_envPanel->draw(a.m_ctx->editorScene().environment(), a.renderer());
+}
+// 2026-11-02：后处理体积。真值同样在场景里（`scene.postVolumes()`，
+// Renderer 每帧自己取），面板只读改写字段。
+//
+// ⚠ 相机位置取自**视口相机**（`editorScene().camera()`），不是选中实体：
+//   体积的生效条件就是"相机在不在盒子里"，跟当前选谁无关。
+void EditorApp::panelDrawFlags(EditorApp& a) {
+    if (!a.m_flagPanel) return;
+    a.m_flagPanel->draw();
+}
+
+// P2：拿到"已经挂在当前场景上"的玩法运行时。
+//
+// ⚠ 换场景时必须**重建队列**：`GameplayRuntime` 里的 actor id 是实体 id，
+//   换个世界之后那些 id 要么指向别人、要么根本不存在。症状是"读了个新
+//   场景，面板里显示的出手顺序还是上一个关卡的"。
+//
+// ⚠ 判等用**场景指针**而不是"每帧重建"：重建会把所有人的行动条清零（
+//   `TurnQueue::clear`），每次打开面板都重置进度。
+scene::GameplayRuntime& EditorApp::gp() {
+    scene::Scene* s = &m_ctx->activeScene();
+    if (m_gpScene != s) {
+        m_gpScene = s;
+        m_gameplay.attach(s);
+        // ---- P3-1：配表 → 牌堆定义 ----
+        // 与 RuntimeApp::gp() 同一段逻辑：定义表是**内容**，不进场景文件，
+        // 换场景（含打开工程 / 读档 / 撤销到另一个场景）时都要重新灌。
+        if (!m_cardDefsLoaded) {
+            m_cardDefsLoaded = true;
+            project::loadCardDefs(m_cardDefs);
+        }
+        if (!m_cardDefs.empty()) m_gameplay.setCardDefs(m_cardDefs);
+        m_gameplay.rebuildQueue();
+    }
+    return m_gameplay;
+}
+
+void EditorApp::panelDrawFx(EditorApp& a) {
+    if (!a.m_fxPanel) return;
+    a.m_fxPanel->draw();
+}
+
+// P2：玩法面板。选中实体从 `EditorContext` 取（面板自己不持有选中态）——
+// 与 FxPanel 的差别只有这一点：这一页要显示"选中单位"的数值。
+void EditorApp::panelDrawGameplay(EditorApp& a) {
+    if (!a.m_gpPanel) return;
+    a.m_gpPanel->draw(a.m_ctx->selection());
+}
+
+void EditorApp::panelDrawCards(EditorApp& a) {
+    if (!a.m_cardsPanel) return;
+    a.m_cardsPanel->draw(a.m_ctx->selection());
+}
+
+// C8 导航。面板拿不到 Scene、也拿不到物理世界：
+//   · 场景从 `m_ctx->activeScene()` 现取（Play 时就是运行态副本）；
+//   · 烘网格走 `bakeNav()`，因为射线来自一个**临时建的**物理世界 ——
+//     编辑态根本没有常驻的 `m_physics`。
+void EditorApp::panelDrawNavigation(EditorApp& a) {
+    if (!a.m_navPanel) return;
+    a.m_navPanel->draw(
+        a.m_nav, a.m_ctx->activeScene(), a.m_ctx->selection(),
+        [&a](const nav::NavGridDesc& d, nav::NavSystem& sys) { return a.bakeNav(d, sys); },
+        [&a](bool save, const std::string& rel, nav::NavSystem& sys) {
+            return a.navGridIo(save, rel, sys);
+        });
+}
+
+// 网格资产存/取（`assets/<rel>`）。
+//
+// ⚠ 写盘失败要**报出来**：`ofstream` 打开失败时 `is_open()` 是唯一线索，
+//   直接 `<<` 会静默写进一个坏流，"存了但文件没有"这种症状最难查。
+std::string EditorApp::navGridIo(bool save, const std::string& rel, nav::NavSystem& sys) {
+    const std::string full = assets::resolveAssetPath(rel);
+    if (!save) {
+        std::ifstream in(full);
+        if (!in.is_open()) {
+            char buf[300];
+            // i18n-keep —— 纯日志锚点（回归脚本按字段名解析，翻成中文等于让脚本失联）
+            std::snprintf(buf, sizeof(buf), "NAV-GRID load=0 reason=open-failed path=%s",
+                          full.c_str());
+            return std::string(buf);
+        }
+        nlohmann::json j;
+        try {
+            in >> j;
+        } catch (const std::exception& e) {
+            return std::string("NAV-GRID load=0 reason=parse ") + e.what();
+        }
+        nav::NavGrid g;
+        std::string err;
+        if (!nav::navGridFromJson(j, g, err)) {
+            // ⚠ 读失败**保留旧网格**：清掉会让"路径写错一个字母"变成
+            //   "这一关突然哪儿都不能走"，而 20 个代理集体静止更难归因。
+            return std::string("NAV-GRID load=0 reason=") + err;
+        }
+        const std::size_t walk = g.walkableCount();
+        sys.setGrid(std::move(g));
+        char buf[300];
+        // i18n-keep —— 纯日志锚点（回归脚本按字段名解析，翻成中文等于让脚本失联）
+        std::snprintf(buf, sizeof(buf), "NAV-GRID load=1 walk=%zu path=%s", walk, full.c_str());
+        return std::string(buf);
+    }
+
+    if (!sys.hasGrid()) return std::string("NAV-GRID save=0 reason=no-grid");
+    // ⚠ 先建父目录：`assets/nav/` 第一次存盘时**不存在**，而 `ofstream`
+    //   不会替你建 —— 症状是 `save=0 reason=open-failed`，看起来像权限问题。
+    {
+        const std::size_t slash = full.find_last_of("/\\");
+        if (slash != std::string::npos && slash > 1) {
+            std::error_code ec;
+            std::filesystem::create_directories(full.substr(0, slash), ec);
+            if (ec) {
+                return std::string("NAV-GRID save=0 reason=mkdir ") + ec.message();
+            }
+        }
+    }
+    std::ofstream out(full, std::ios::trunc);
+    if (!out.is_open()) {
+        char buf[300];
+        // i18n-keep —— 纯日志锚点（回归脚本按字段名解析，翻成中文等于让脚本失联）
+        std::snprintf(buf, sizeof(buf), "NAV-GRID save=0 reason=open-failed path=%s", full.c_str());
+        return std::string(buf);
+    }
+    out << nav::navGridToJson(sys.grid()).dump(0) << "\n";
+    if (!out.good()) return std::string("NAV-GRID save=0 reason=write-failed");
+    char buf[300];
+    // i18n-keep —— 纯日志锚点（回归脚本按字段名解析，翻成中文等于让脚本失联）
+    std::snprintf(buf, sizeof(buf), "NAV-GRID save=1 walk=%zu path=%s",
+                  sys.grid().walkableCount(), full.c_str());
+    return std::string(buf);
+}
+
+// 烘一张网格。**编辑态与 Play 的区别只有物理世界从哪来**，其余（采样参数、
+// 判据、装进 sys 的动作）完全一致 —— 所以面板按钮、`nav.bake` 命令、将来
+// 的"进 Play 自动烘"都调这一个函数。
+std::string EditorApp::bakeNav(const nav::NavGridDesc& d, nav::NavSystem& sys) {
+    // ⚠ 强制打开物理：作者常常还没在场景设置里勾"启用物理"，而"烘一张
+    //   网格看看"不该被那个开关挡住（烘焙只读几何，不推进模拟）。
+    physics::SceneBuildOptions opts;
+    opts.enabledOverride = 1;
+    physics::SceneBinding binding = physics::buildSceneWorld(m_ctx->activeScene(), opts);
+
+    nav::NavGrid grid;
+    const nav::NavBakeStats st = nav::bakeFromPhysics(d, binding.world.get(), grid);
+    if (st.usable()) {
+        sys.setGrid(std::move(grid));
+    } else {
+        // ⚠ 一定**清掉**旧网格：留着上一关的网格，症状是"这一关没烘成功
+        //   但代理照样在走"，日志里一行错都没有。
+        sys.clearGrid();
+        VK_LOG_WARN("[nav] bake found 0 walkable cells (bodies=%d) — check the bounds "
+                    "and that the scene has colliders",
+                    binding.bodies);
+    }
+    char buf[420];
+    // i18n-keep —— 纯日志锚点（回归脚本按字段名解析，翻成中文等于让脚本失联）
+    std::snprintf(buf, sizeof(buf), "NAV-BAKE walk=%d bodies=%d %s", st.walk, binding.bodies,
+                  nav::bakeSummary(st).c_str());
+    return std::string(buf);
+}
+
+void EditorApp::panelDrawScriptDebug(EditorApp& a) {
+    if (!a.m_scriptDbg) return;
+    a.m_scriptDbg->draw();
+}
+
+// G19：关卡流送。面板只读流送器状态，动词由 `applyLevelAction` 统一处理 ——
+// 命令与按钮走的是**同一条路**（"能点不能存"这类缺陷就是从两条路分叉开始的）。
+void EditorApp::panelDrawLevels(EditorApp& a) {
+    if (!a.m_levelPanel) return;
+    a.m_levelPanel->draw();
+}
+
+void EditorApp::panelDrawPostVolume(EditorApp& a) {
+    if (!a.m_pvPanel) return;
+    a.m_pvPanel->draw(*a.m_ctx, a.m_ctx->editorScene().camera().position());
+}
+// 2026-11-02：混音台。**三段式**（填快照 → 面板画 → 落地意图），
+// 因为音频的真值在 `m_audio` 里而不在场景里 —— 面板拿不到它（也不该拿）。
+// 顺序上"落地"必须紧跟 draw：晚一帧的话拖推子会有 16 ms 的黏滞感。
+// 2026-11-02：项目设置（`assets/game.json`）。
+//
+// 面板自己管"读盘 / 改 / 写盘"（它是**文件**的 UI，不是场景状态的 UI），
+// 这里只负责画 + 把面板报上来的结果变成一条通知。
+void EditorApp::panelDrawProjectSettings(EditorApp& a) {
+    if (!a.m_projectSettings) return;
+    a.m_projectSettings->draw();
+    const editor::ProjectSettingsPanel::Result r =
+        a.m_projectSettings->takeResult();
+    // ⚠ 落盘 ≠ 场景变脏：`markDirty()` 管的是"场景要不要提示保存"。
+    //   game.json 写完就是写完了，把它绑进场景脏标记会让"关编辑器提示
+    //   保存场景"莫名其妙地弹出来。
+    if (!r.message.empty()) a.m_ctx->notify(r.message);
+}
+
+void EditorApp::panelDrawDataTable(EditorApp& a) {
+    if (a.m_dataTablePanel) a.m_dataTablePanel->draw();
+}
+
+void EditorApp::panelDrawLocalization(EditorApp& a) {
+    if (a.m_localizationPanel) a.m_localizationPanel->draw();
+}
+
+void EditorApp::panelDrawAudioMixer(EditorApp& a) {
+    if (!a.m_audioPanel) return;
+    editor::AudioMixerIO io;
+    a.fillAudioMixerIO(io);
+    a.m_audioPanel->draw(io);
+    for (int i = 0; i < io.editCount; ++i)
+        a.applyAudioKnob(io.edits[i].knob, io.edits[i].value);
 }
 // 2026-11-01：状态机编辑器。它自己管 open/close（还要带一个资产路径），
 // 表项只做"显隐 + 落盘"——与 dialogueed / timelineed 同款。
@@ -1179,6 +1476,12 @@ void EditorApp::onInit() {
     // S0 之前编辑器这份循环压根没接 HUD/音频，同一个脚本在编辑器 Play
     // 里 `playSound` 静默不响（P2）。
     {
+        // ---- 配表（P3-1 / G5）----
+        // ⚠⚠ 必须在装服务**之前**扫一次。脚本第一帧就会调 `tableNum`，
+        //   晚一步 = 开局头几帧配表全是 0；而"表没加载"与"那格就是 0"在
+        //   脚本里长得一模一样（`tableHas` 是唯一的诊断入口）。
+        project::ensureTablesLoaded();
+
         vks::ScriptServices svc;
         svc.setHealth = [this](float v) { m_hudMirror.health = v; };
         svc.damage = [this](float v) {
@@ -1427,6 +1730,217 @@ void EditorApp::onInit() {
             return m_ctx->runtimeScene().world().find(jc->target);
         };
 
+        // ---- 剧情旗标（A4）----
+        //
+        // ⚠⚠ 这两行接上之前，编辑器 Play 里 `setFlag("x",1)` 报的是
+        //   "not available in this host" —— 剧本里的分支在编辑器里等于
+        //   不存在，只能出包才能试。A4 的核心就是这一个洞（面板是第二半：
+        //   就算能写，看不见也调不了）。
+        //
+        // writer 取"当前正在执行的脚本路径"：那是**只能**在写入这一刻
+        // 拿到的信息（事后推断不出来），面板上"谁写的"那一列全靠它。
+        svc.act.setFlag = [this](const std::string& name, double v) -> bool {
+            const char* src = m_scriptRuntime
+                                  ? m_scriptRuntime->currentScriptPath()
+                                  : "";
+            const std::string writer =
+                (src && src[0]) ? std::string("script:") + src
+                                : std::string("editor");
+            m_flags.set(name, v, writer);
+            // ⚠ 每帧写同一个旗标是常态（`setFlag("ticks", ticks)`）——
+            //   这行日志在 Play 里会把日志刷爆。所以默认**不打**，
+            //   只在 `MYVK_LOG_FLAGS=1` 时打。
+            static const bool logWrites = [] {
+                const char* e = std::getenv("MYVK_LOG_FLAGS");
+                return e && e[0] == '1';
+            }();
+            if (logWrites)
+                VK_LOG_INFO("EDITOR-FLAG set name=%s value=%.4f writer=%s "
+                            "total=%zu",
+                            name.c_str(), v, writer.c_str(), m_flags.size());
+            return true;
+        };
+        svc.act.getFlag = [this](const std::string& name) -> double {
+            return m_flags.get(name);
+        };
+
+        // ---- C7：对话的条件分支也要读同一张旗标表 ----
+        //
+        // ⚠ 编辑器里 `DialogueSystem` **根本不 tick**（见 InspectorPanel 里
+        //   那句注释），所以这几行今天没有消费者 —— 但必须装：一旦有人给
+        //   编辑器加对话预览，缺了它就是"条件永远走 else"，而且一行错都没有。
+        //   代价只有一次装配。
+        dialogue::activeDialogueSystem().setFlagStore(
+            [this](const std::string& n) { return m_flags.get(n); },
+            [this](const std::string& n, double v) {
+                m_flags.set(n, v, "dialogue");
+            });
+
+        // ---- P1-4：特效五件 ----
+        //
+        // ⚠ 与 A4 的 setFlag 是同一个教训：**引擎里有、宿主没接，脚本就
+        //   报 "not available in this host"**，而这个错误不崩不中断，
+        //   剧本静默走 else。所以这五个必须在编辑器这一侧也接上
+        //   （以前 `playAnim` 就漏在这里，编辑器的 Play 里根本调不了）。
+        svc.act.playEffect = [this](ecs::Entity e, const std::string& path) {
+            fx::EffectRequest r;
+            r.asset = path;
+            if (m_ctx->activeScene().world().alive(e)) {
+                const glm::mat4 w = m_ctx->activeScene().worldMatrix(e);
+                r.position = glm::vec3(w[3]);
+                const glm::vec3 z(w[2]);
+                if (glm::length(z) > 1.0e-6f) r.forward = glm::normalize(z);
+            }
+            return m_fx.play(r);
+        };
+        svc.act.playEffectAt = [this](const std::string& path, glm::vec3 p) {
+            fx::EffectRequest r;
+            r.asset = path;
+            r.position = p;
+            return m_fx.play(r);
+        };
+        svc.act.stopEffect = [this](uint32_t id) -> bool {
+            if (id == 0) return false;
+            const std::size_t before = m_fx.activeCount();
+            m_fx.stop(id);
+            return m_fx.activeCount() < before;
+        };
+        svc.act.shake = [](float trauma, ecs::Entity e) {
+            // 位置由 `dispatchAnimEvents` 之外这条路径自己取 —— 但这里只有
+            // 实体句柄，取世界坐标需要场景，所以走 addShake（无衰减）。
+            // ⚠ 这是脚本动词与动画事件**唯一**的行为差异：动画事件那条路
+            //   拿得到世界坐标（Router 里取），能享受距离衰减；脚本这条路
+            //   为了不让 `ScriptWorldActions` 依赖 Scene，退化成全局抖。
+            (void)e;
+            scene::activeCameraSystem().addShake(trauma);
+        };
+        svc.act.hitstop = [this](float seconds) {
+            m_hitstopLeft = std::max(m_hitstopLeft, seconds);
+        };
+        svc.act.setTimeScale = [this](float scale) {
+            m_timeScale = scale;
+        };
+
+        // ---- P2-6：玩法四件 ----
+        //
+        // ⚠ 全部走 `gp()`（它会 attach 当前场景并在换场景时重建队列）。
+        //   直接用 `m_gameplay` 而不经过 gp() 的话，换过场景之后脚本会往
+        //   **上一个世界**的实体 id 上打伤害 —— 而那一侧 `comp()` 找不到
+        //   组件，于是静默返回 0（"脚本调了 damage 但不掉血"）。
+        svc.act.getAttr = [this](ecs::Entity e, const std::string& name) {
+            return gp().attr(e, name, 0.0f);
+        };
+        svc.act.gameplayHasAttr = [this](ecs::Entity e, const std::string& name) {
+            scene::GameplayRuntime& rt = gp();
+            if (!rt.scene()) return false;
+            const ecs::GameplayComponent* c =
+                rt.scene()->world().get<ecs::GameplayComponent>(e);
+            if (!c) return false;
+            for (const gameplay::AttrState& a : c->attributes) {
+                if (a.name == name) return true;
+            }
+            return false;
+        };
+        svc.act.addStatus = [this](ecs::Entity e, const std::string& which) {
+            return gp().addPresetStatus(e, which);
+        };
+        svc.act.damage = [this](ecs::Entity e, float amount, const std::string& type) {
+            scene::GameplayRuntime& rt = gp();
+            // ⚠ 没有玩法组件必须返回 **-1**（脚本层据此回退到 HUD 扣血）。
+            //   返回 0 会被当成"打不动"；返回 lastDamage() 会拿到上一次的旧值。
+            if (!rt.scene()) return -1.0f;
+            if (!rt.scene()->world().get<ecs::GameplayComponent>(e)) return -1.0f;
+            gameplay::DamageSpec spec;
+            spec.amount = amount;
+            spec.type = gameplay::DamageType::Physical;
+            if (!type.empty()) gameplay::parseDamageType(type, spec.type);
+            spec.source = "script";
+            rt.damage(e, e, spec);
+            return rt.lastDamage().dealt;
+        };
+        svc.act.tickRound = [this]() {
+            scene::GameplayRuntime& rt = gp();
+            rt.tickTurn();
+            return rt.lastDotCount();
+        };
+
+        // ---- 卡牌两件（P3-4）----
+        //
+        // ⚠ 编辑器里也必须接：不接的话脚本会走进
+        //   "castCard() is not available in this host"，而**卡牌模板的
+        //   主脚本就是靠它出牌的** —— 症状是"在编辑器里按交互键什么也
+        //   不发生，出包却正常"（或者反过来，取决于哪边漏接）。
+        //
+        // 表现：编辑器 Play **没有 HUD 层**（只有出包运行时才有 `HudModel`），
+        // 所以事件取出来直接丢掉 —— 但日志要留一行，否则"编辑器里没有
+        // 飘字"会被当成 bug 查半天。
+        svc.act.castCard = [this](ecs::Entity e, int idx) -> float {
+            scene::GameplayRuntime& rt = gp();
+            if (!rt.ready() || !rt.deck(e)) return 0.0f;
+            rt.clearCardFxEvents();
+            const ecs::Entity target = rt.firstOtherGameplayEntity(e);
+            rt.castCard(e, idx, target);
+            const std::vector<scene::CardFxEvent> evs = rt.takeCardFxEvents();
+            VK_LOG_INFO("ED-CARD-FX events=%d (editor play has no HUD layer, "
+                        "events are dropped)",
+                        static_cast<int>(evs.size()));
+            return rt.lastDamage().dealt;
+        };
+        svc.act.drawCards = [this](ecs::Entity e, int n) -> int {
+            scene::GameplayRuntime& rt = gp();
+            if (!rt.ready() || !rt.deck(e)) return 0;
+            const int before = rt.cardCount(e, gameplay::CardPile::Hand);
+            rt.cardDraw(e, n < 1 ? 1 : n);
+            return rt.cardCount(e, gameplay::CardPile::Hand) - before;
+        };
+
+        // ---- 导航四动词（C8-2）----
+        //
+        // 与 `RuntimeApp` 同一个实现口径（`m_nav` + self 的
+        // `NavAgentComponent`），差别只有一处：编辑器里 **`m_nav` 不一定
+        // 烘过网格**（网格是作者在 Navigation 面板里手动烘 / 读资产的）。
+        // 没烘时 `gotoPoint` 返回 false、`failed` 常驻 1 —— 脚本因此能
+        // 分辨"没网格"和"路线不通"，而不是"点了没反应"。
+        //
+        // ⚠ Play 里必须真的 tick（见 `runRuntimeScripts` 之后的
+        //   `m_nav.tick`），否则"编辑器里 navGoto 受理了、NPC 永远不动"
+        //   —— 那种症状会被当成 `navGoto` 写坏了。
+        svc.act.navGoto = [this](ecs::Entity e, glm::vec3 p) {
+            return m_nav.gotoPoint(activeScene(), e, p);
+        };
+        svc.act.navArrived = [this](ecs::Entity e) {
+            const auto* a = activeScene().world().get<ecs::NavAgentComponent>(e);
+            return a && a->reached;
+        };
+        svc.act.navFailed = [this](ecs::Entity e) {
+            const auto* a = activeScene().world().get<ecs::NavAgentComponent>(e);
+            return a && a->failed;
+        };
+        svc.act.navStop = [this](ecs::Entity e) {
+            m_nav.stop(activeScene(), e);
+            return true;
+        };
+
+        // ---- 配表四动词（P3-1 / G5）----
+        //
+        // 一条 `"表.行.列"` 字符串寻址（切分规则在 `project::splitTableKey`）。
+        // ⚠ 四个都要接，缺一个的后果不是报错而是**静默走 else**：
+        //   · 缺 `tableHas` → 作者没法区分"查不到"与"值就是 0"，只能瞎猜；
+        //   · 缺 `tableRows` → 遍历整张表（"给每个敌人套一遍数值"）写不出来。
+        // 引擎侧 `DataTable.cpp` 已经在这里之前被 `ensureTablesLoaded()` 扫过。
+        svc.act.tableNum = [](const std::string& key) {
+            return project::tableNum(key);
+        };
+        svc.act.tableStr = [](const std::string& key) {
+            return project::tableStr(key);
+        };
+        svc.act.tableHas = [](const std::string& key) {
+            return project::tableHas(key);
+        };
+        svc.act.tableRows = [](const std::string& name) {
+            return project::tableRows(name);
+        };
+
         m_scriptRuntime->setServices(std::move(svc));
 
         m_scriptRuntime->setPrintSink(
@@ -1493,6 +2007,55 @@ void EditorApp::onInit() {
     // 2026-11-01：天空面板。构造完全无副作用（一个字节都不读），
     // 真正的读写都发生在 draw 里 —— 面板没打开就不会碰 Renderer。
     m_envPanel = std::make_unique<editor::EnvironmentPanel>();
+    // 2026-11-02：后处理体积面板。构造零副作用（不读场景、不读盘）。
+    m_pvPanel = std::make_unique<editor::PostVolumePanel>();
+    // A4：旗标表。attach 的是 EditorApp 自己的表（指针，不拥有）——
+    // 面板关掉不该把游戏状态一起关掉。
+    m_flagPanel = std::make_unique<editor::FlagTablePanel>();
+    m_flagPanel->attach(&m_flags);
+    // C8：断点面板。断点表在 ScriptRuntime 里（跨实例共享、活过热重载）。
+    m_scriptDbg = std::make_unique<editor::ScriptDebugPanel>();
+    m_scriptDbg->attach(m_scriptRuntime.get());
+    // P1：特效的四个出口（震屏 / 音效 / 闪白 / 顿帧）接到编辑器自己的
+    // 那些实例上。⚠ 只接**一次**（构造里），换场景不需要重接 ——
+    // sink 里取的是 `m_...` 成员，不是某个场景的指针。
+    setupFxSinks();
+    // P1：特效面板（Debug 组）。它只转发给 m_fx —— 特效的状态全在
+    // EffectService 里，面板不复制一份。
+    m_fxPanel = std::make_unique<editor::FxPanel>();
+    m_fxPanel->attach(&m_fx);
+    m_gpPanel = std::make_unique<editor::GameplayPanel>();
+    m_gpPanel->attach(&m_gameplay);
+    m_cardsPanel = std::make_unique<editor::CardsPanel>();
+    m_cardsPanel->attach(&m_gameplay);
+    // C8：导航面板。它**不** attach 场景 —— 场景每帧由
+    // `panelDrawNavigation` 现传（Play 期间要换成运行态副本）。
+    m_navPanel = std::make_unique<editor::NavPanel>();
+    // 种子先定下来：不设的话是构造默认值，而"默认种子是什么"必须写死
+    // （否则不同构建的默认抽牌顺序可能不一样）。
+    m_gameplay.setSeed(20261103u);
+    // G19：关卡流送面板。**动词走回调**（面板拿不到 Scene，也不该拿）——
+    // 与 `level.*` 命令最终落到同一个 `applyLevelAction()`。
+    m_levelPanel = std::make_unique<editor::LevelPanel>();
+    m_levelPanel->attach(&m_levels);
+    {
+        auto* self = this;
+        m_levelPanel->setActions(
+            [self](const std::string& n) { self->applyLevelAction("load", n); },
+            [self](const std::string& n) { self->applyLevelAction("unload", n); },
+            [self]() { self->applyLevelAction("unloadall", std::string()); },
+            [self]() {
+                // Reload 用的路径 = 最近一次 `level.manifest` 加载的那份。
+                // 没加载过就什么都不做（按钮此时是灰的？不 —— 这里保持
+                // 可用，因为它也可能是"第一次加载"，见下面的默认路径）。
+                self->reloadLevelManifest(self->m_levelManifestPath);
+            });
+    }
+    m_audioPanel = std::make_unique<editor::AudioMixerPanel>();
+    // 2026-11-02：项目设置。构造零 IO（读盘延到第一次 draw / 命令）。
+    m_projectSettings = std::make_unique<editor::ProjectSettingsPanel>();
+    m_dataTablePanel = std::make_unique<editor::DataTablePanel>();
+    m_localizationPanel = std::make_unique<editor::LocalizationPanel>();
     // 2026-11-01：状态机图编辑器。构造零 IO —— 只有 `open()` 才读盘。
     m_animGraph = std::make_unique<editor::AnimatorGraphPanel>();
     // 流程壳持有**同一个** `m_animGraph`，不是另一个实例：内嵌的状态机
@@ -2321,26 +2884,59 @@ void EditorApp::onUpdate(float dt) {    if (m_ctx->quitRequested()) {
         }
         return 40L;
     }();
-    if (!m_consoleCmdDone &&
-        static_cast<long>(m_editorFrames) >= kConsoleCmdFrame) {
-        m_consoleCmdDone = true;
-        if (const char* cmd = std::getenv("MYVK_EDITOR_CONSOLE_CMD")) {
-            std::string all(cmd);
-            size_t pos = 0;
-            while (pos <= all.size()) {
-                const size_t semi = all.find(';', pos);
-                std::string one = all.substr(
-                    pos,
-                    semi == std::string::npos ? std::string::npos : semi - pos);
-                const size_t b = one.find_first_not_of(" \t");
-                const size_t e2 = one.find_last_not_of(" \t");
-                one = (b == std::string::npos) ? std::string()
-                                               : one.substr(b, e2 - b + 1);
-                if (!one.empty()) m_console->execute(one);
-                if (semi == std::string::npos) break;
-                pos = semi + 1;
+    // ---- 命令队列（C8 起支持"分批"）----
+    //
+    // 2026-11-02 之前这里只有**一次性**执行：一个 `;` 分隔的串，全在第
+    // `kConsoleCmdFrame` 帧跑完。断点调试打破了这个假设：
+    //   "加断点"必须在**暂停之前**，而"继续 / 单步"必须在**暂停之后** ——
+    //   同一帧里做不到（命令在 `onUpdate` 头部跑，脚本在同一帧末尾才 tick）。
+    //
+    // 于是给每条命令一个可选的前缀 `@<帧号>`：
+    //     MYVK_EDITOR_CONSOLE_CMD="@40 script.bp add a.vks 25; @200 script.at"
+    // ⚠ **完全向后兼容**：没有 `@` 前缀的命令照旧在 `kConsoleCmdFrame`
+    //   那一帧跑（现有 20 多个验收脚本一个字都不用改）。
+    // ⚠ 队列按帧号**排序**后执行，所以同一个串里写反了顺序也不会卡住
+    //   （否则第一条 frame 大的会堵住后面全部）。
+    static const std::vector<std::pair<long, std::string>> kCmdQueue = [] {
+        std::vector<std::pair<long, std::string>> out;
+        const char* cmd = std::getenv("MYVK_EDITOR_CONSOLE_CMD");
+        if (!cmd) return out;
+        std::string all(cmd);
+        size_t pos = 0;
+        while (pos <= all.size()) {
+            const size_t semi = all.find(';', pos);
+            std::string one = all.substr(
+                pos, semi == std::string::npos ? std::string::npos : semi - pos);
+            const size_t b = one.find_first_not_of(" \t");
+            const size_t e2 = one.find_last_not_of(" \t");
+            one = (b == std::string::npos) ? std::string()
+                                           : one.substr(b, e2 - b + 1);
+            long frame = kConsoleCmdFrame;
+            if (!one.empty() && one[0] == '@') {
+                const size_t sp = one.find(' ');
+                if (sp != std::string::npos) {
+                    const long n = std::atol(one.c_str() + 1);
+                    if (n > 0) frame = n;
+                    const size_t b2 = one.find_first_not_of(" \t", sp);
+                    one = (b2 == std::string::npos) ? std::string()
+                                                    : one.substr(b2);
+                }
             }
+            if (!one.empty()) out.emplace_back(frame, one);
+            if (semi == std::string::npos) break;
+            pos = semi + 1;
         }
+        std::stable_sort(out.begin(), out.end(),
+                         [](const std::pair<long, std::string>& a,
+                            const std::pair<long, std::string>& b) {
+                             return a.first < b.first;
+                         });
+        return out;
+    }();
+    while (m_consoleCmdNext < kCmdQueue.size() &&
+           static_cast<long>(m_editorFrames) >= kCmdQueue[m_consoleCmdNext].first) {
+        m_console->execute(kCmdQueue[m_consoleCmdNext].second);
+        ++m_consoleCmdNext;
     }
 
     // 视口接管了相机输入 —— Camera::update 里会直接 return
@@ -2396,7 +2992,45 @@ void EditorApp::onUpdate(float dt) {    if (m_ctx->quitRequested()) {
     // 夹到 [0.05, 4]：0 会让脚本时间冻住（看起来像卡死），负数会让物理
     // 反向积分。倍速只乘在**仿真** dt 上，渲染帧率不受影响。
     m_timeScale = std::clamp(m_timeScale, 0.05f, 4.0f);
-    const float simDt = dt * m_timeScale;
+
+    // ---- P1：顿帧（hitstop）----
+    //
+    // ⚠⚠ 三条纪律，每条都对应一种"看起来像掉帧/卡死"的故障：
+    //   ① 计时器用**真实 dt** 递减。用 `dt * timeScale` 会形成正反馈：
+    //      倍速被自己压低 → 计时器跟着变慢 → 停顿拖长 20 倍。
+    //   ② **不**把 `m_timeScale` 改成 0。0 会让计时器永远走不完
+    //      （游戏卡死、渲染正常），而且 m_timeScale 是用户设的倍速，
+    //      改它之后恢复不了原值。
+    //   ③ 顿帧量**取 max 而不是累加**：5 连击各 0.09 秒，累加变成
+    //      0.45 秒的"卡"；取 max 才是"每一下都顿一下"。
+    float fxScale = m_timeScale;
+    if (m_hitstopLeft > 0.0f) {
+        fxScale = std::min(fxScale, kHitstopScale);
+        // ⚠ 三个累计量都按**真实 dt** 走：它们的全部意义就是判断
+        //   "计时器用的是不是真实时间"。跟着 `simDt` 走的话，
+        //   被压低的那段自己会变慢 → elapsed 与 total 差 16 倍，
+        //   而判据看的就是这个倍差。
+        m_hitstopElapsed += dt;
+        ++m_hitstopFrames;
+        m_hitstopLeft = std::max(0.0f, m_hitstopLeft - dt);   // ← 真实 dt
+        if (m_hitstopLeft <= 0.0f) {
+            VK_LOG_INFO("FX-HITSTOP end total=%.3f elapsed=%.3f frames=%d "
+                        "reqs=%d minScale=%.3f",
+                        static_cast<double>(m_hitstopTotal),
+                        static_cast<double>(m_hitstopElapsed), m_hitstopFrames,
+                        m_hitstopReqs, static_cast<double>(kHitstopScale));
+            m_hitstopTotal = 0.0f;
+            m_hitstopElapsed = 0.0f;
+            m_hitstopFrames = 0;
+            m_hitstopReqs = 0;
+        }
+    }
+    const float simDt = dt * fxScale;
+
+    // P1：特效池随场景同步 + 回收过期实例 + 递减闪白。
+    // ⚠ 传**真实 dt**：特效的"播完没有"是墙上时间，顿帧/慢放不该让
+    //   火花在屏幕上多待 20 倍时长。
+    tickFx(dt);
 
     // ---- Play 态鼠标捕获（P8）：必须在 runPlayers 之前 ----
     // runPlayers 按 `playMouseCaptured()` 门控键鼠；晚一帧就会出现"点了
@@ -2414,7 +3048,24 @@ void EditorApp::onUpdate(float dt) {    if (m_ctx->quitRequested()) {
     if (m_ctx->isPlaying()) {
         // 一次新的 Play 开始（上一段 Play 的帧计数已被下面的 else 归零，
         // 或者这是启动即 Play、计数器还是初值）→ 把详细日志预算灌满。
-        if (m_collisionFrames == 0) m_collisionLogBudget = 240;
+        if (m_collisionFrames == 0) {
+            m_collisionLogBudget = 240;
+            // ---- A4：新一局 = 空旗标表 ----
+            //
+            // 为什么必须清：旗标是"这一局游戏的记忆"。上一段 Play 设的
+            // `met_alice=1` 留在表里，下一段 Play 一开始就"已经见过她"了
+            // —— 而这个错误**不会报错**，只会让分支剧情莫名其妙走错。
+            //
+            // ⚠ 停止 Play 时**不**清（那次清的是实例表，旗标表刻意留着）：
+            //   "刚才那一局到底设了哪些旗标"是调试时最想事后翻的东西，
+            //   一按 Stop 就清空等于把证物销毁。这条规则与 `verify_flags.py`
+            //   B/C 组的断言绑定，改动要同步。
+            if (!m_flags.empty()) {
+                VK_LOG_INFO("EDITOR-FLAG new-session cleared=%zu",
+                            m_flags.size());
+                m_flags.clear();
+            }
+        }
         m_scriptTableDropped = false;   // 下一段非运行态要重新丢一次
         // ---- 实体 TRS 轨道（C5）：本段 Play 的第一帧对齐一次 ----
         // `resetTime=true`：点 Play 是"从头试玩"，机关的播放头该回 0
@@ -2431,6 +3082,25 @@ void EditorApp::onUpdate(float dt) {    if (m_ctx->quitRequested()) {
         }
         m_ctx->advancePlayTime(simDt);
         runRuntimeScripts(simDt);
+        // ---- 导航（C8）----
+        // 排在脚本**之后**：本帧 `navGoto` 记下的目标当场求路，代理不会
+        //   白等一帧；排在物理之前：无胶囊的代理写的是 `TransformComponent`，
+        //   物理的 `syncKinematicFromScene` 要读到它这一帧的最终位置
+        //   （排后面 = 永远晚一帧，看起来像"跟着自己的影子走"）。
+        // ⚠ 只在 Play 里 tick：编辑态推进代理会**改编辑场景的 Transform**
+        //   并进 undo 栈 —— 作者只想看网格，不想让巡逻兵把场景挪了。
+        //   编辑态要验走路请用 `nav.tick` 命令（它不改场景就不会发生这件事，
+        //   因为那时是作者自己要求的）。
+        if (m_nav.hasGrid()) m_nav.tick(m_ctx->activeScene(), simDt);
+        // ---- 关卡流送（G19）----
+        // 排在脚本**之后**、玩家**之前**：
+        //   · 在脚本之后 —— 脚本可能瞬移玩家（过场 / 传送门），流送要按
+        //     **瞬移后的**位置判定，否则玩家会先在空世界里站一帧；
+        //   · 在玩家之前 —— 新流送进来的地面必须先存在，玩家这一帧的
+        //     重力/碰撞才有东西可站（否则会掉穿一帧再被弹回来）。
+        // ⚠ 只在 Play 里调：编辑态流送会把副关卡实体写进**编辑场景**，
+        //   下一次 `scene.save` 就把它们固化进主场景文件了。
+        updateLevelStreaming();
         // 玩家在脚本之后 / 碰撞之前：脚本可能挪物体，玩家再动自己，
         // 碰撞最后保证谁都不穿谁（玩家也被墙挡）。
         runPlayers(simDt);
@@ -2442,6 +3112,10 @@ void EditorApp::onUpdate(float dt) {    if (m_ctx->quitRequested()) {
         // 会被调用 N 次，且第一个实体设的值会被第二个覆盖）。
         m_animator.setStrideCurve(m_ctx->strideCurve());
         m_animator.tick(m_ctx->activeScene(), simDt);
+        // ---- P1-3：动画事件 → 特效 / 音效 / 震屏 / 顿帧 ----
+        // 必须紧跟 `tick` 之后：`eventsThisFrame()` 只保存**本帧**的结果，
+        // 下一帧 tick 开头就清空。晚一帧读就是"一次都不发"。
+        dispatchAnimEventsThisFrame();
         // ---- 实体 TRS 轨道（C5）----
         // 门 / 电梯 / 机关。与 RuntimeApp 同位置：**物理之前**（运动学体
         // 要从 TransformComponent 读目标位置）。
@@ -2847,6 +3521,104 @@ void EditorApp::syncEditorAudio(float dt) {
     m_audio.update(dt);
 }
 
+// ---------------------------------------------------------------- 混音台（A2）
+
+// 从 `m_audio` 现取一份快照。**每帧重建**，不缓存。
+// 缓存就要管"什么时候失效"，而失效点散在 `setBusGain` / `setMuted` /
+// `setDuckDepth` / 脚本 `setBusVolume` / 运行时 game.json 五处 ——
+// 漏一处的症状是"面板显示 0.70、实际是 0.30"，而两边都不觉得自己错。
+void EditorApp::fillAudioMixerIO(editor::AudioMixerIO& io) {
+    editor::AudioMixerState& st = io.st;
+    const audio::MixStats ms = m_audio.stats();
+
+    st.running = m_audio.running();
+    st.backend = m_audio.backendName() ? m_audio.backendName() : "none";
+    st.device = m_audio.deviceName();
+    st.sampleRate = static_cast<int>(m_audio.deviceFormat().sampleRate);
+    st.channels = static_cast<int>(m_audio.deviceFormat().channels);
+    st.playing = m_ctx->isPlaying();
+
+    for (int b = 0; b < audio::kBusCount; ++b) {
+        // ⚠ 用 `busGain()` 而不是 `settings().master/music/...`：
+        //   后者是 init 时的**出厂值**，`setBusGain` 不回写它 ——
+        //   读它的症状是"推子拖完弹回原位"。
+        st.gain[b] = m_audio.busGain(static_cast<audio::BusId>(b));
+        st.busVoices[b] = ms.busVoices[b];
+        st.busLevel[b] = ms.busRms[b];
+    }
+    st.mute = m_audio.muted();
+    st.duckDepth = m_audio.settings().duckDepth;
+    st.muteOnFocusLost = m_audio.settings().muteOnFocusLost;
+
+    st.voices = ms.voices;
+    st.maxVoices = m_audio.settings().maxVoices;
+    st.rms = ms.rms;
+    st.peak = ms.peak;
+    st.musicGain = ms.musicGain;
+    st.underruns = ms.underruns;
+    st.stolen = ms.stolen;
+
+    st.voicePlaying = m_audio.voicePlaying();
+    st.voiceSerial = m_audio.voiceSerial();
+    st.voiceLevel = m_audio.voiceLevel();
+
+    st.musicPlaying = m_audio.musicPlaying();
+    st.musicPos = m_audio.musicPositionSeconds();
+
+    st.cacheBytes = m_audio.cacheResidentBytes();
+    st.streamBytes = m_audio.streamResidentBytes();
+
+    // ⚠ 用 `m_audioSrcs`（Play 态每帧就是喂给 AudioSystem 的那一份），
+    //   不再遍历一次场景：遍历两次会得到"面板列的是 A、实际在播的是 B"
+    //   这类幽灵差异，而且只在场景刚改过的那一帧出现。
+    st.sources.clear();
+    st.sources.reserve(m_audioSrcs.size());
+    for (const audio::SourceUpdate& s : m_audioSrcs) {
+        editor::AudioMixerSource row;
+        row.clip = s.clip;
+        row.bus = s.bus;
+        row.volume = s.volume;
+        row.spatial = s.spatial;
+        row.loop = s.loop;
+        row.playing = s.playing;
+        st.sources.push_back(row);
+    }
+}
+
+// 一条"旋钮意图"落到 AudioSystem。**面板与命令共用这一个**。
+// 不在这里打日志：面板在松手时打一行 `AUDIO-MIX`，命令自己打
+// `AUDIO-CMD` —— 打在这儿会变成"拖一次推子刷几十行"。
+void EditorApp::applyAudioKnob(editor::AudioKnob knob, float value) {
+    const float v = std::clamp(value, 0.0f, 1.0f);
+    switch (knob) {
+        case editor::AudioKnob::Master:
+            m_audio.setMasterGain(v);
+            break;
+        case editor::AudioKnob::Music:
+            m_audio.setBusGain(audio::BusId::Music, v);
+            break;
+        case editor::AudioKnob::Sfx:
+            m_audio.setBusGain(audio::BusId::SFX, v);
+            break;
+        case editor::AudioKnob::Voice:
+            m_audio.setBusGain(audio::BusId::Voice, v);
+            break;
+        case editor::AudioKnob::Duck:
+            m_audio.setDuckDepth(v);
+            break;
+        case editor::AudioKnob::Mute:
+            // 不 clamp 到 0..1 再比：Mute 传的是 0/1 语义值，
+            // 但面板万一传 0.4 也该算"关"而不是"开一半"（没有这一档）。
+            m_audio.setMuted(value >= 0.5f);
+            break;
+        case editor::AudioKnob::StopAll:
+            m_audio.stopAll();
+            break;
+        default:
+            return;
+    }
+}
+
 void EditorApp::syncWindowFullscreen() {
     const bool want = !m_ctx->isEditing() && m_ctx->gameFullscreen();
     if (want == m_appliedWindowFullscreen) return;
@@ -3025,6 +3797,234 @@ void EditorApp::runRuntimeScripts(float dt) {
     //   脚本看到的 `time` 会倒退一半 —— 子弹时间一上来就踩。
     tickScripts(m_ctx->runtimeScene(), vks::ScriptRuntime::kSelfTimed, dt,
                 "Runtime", m_runtimeFrames);
+}
+
+// ---------------------------------------------------------------- P1 特效
+
+void EditorApp::setupFxSinks() {
+    fx::EffectSinks sinks;
+
+    // ① 震屏：走**全局** CameraSystem（与 RuntimeApp 同一个单例）。
+    //    `shakeAt` 自带距离衰减 —— 远处爆炸只轻轻晃，这是"手感"的一半。
+    sinks.shake = [](float trauma, const glm::vec3& at, float radius) {
+        scene::activeCameraSystem().shakeAt(at, trauma, radius);
+    };
+
+    // ② 音效：3D 位置 = 命中点。编辑器里 Play 的音频与试听共用 `m_audio`
+    //    实例，所以"编辑器里听着对"与出包后一致。
+    sinks.sound = [this](const std::string& clip, float volume, float pitch,
+                         const glm::vec3& at) {
+        glm::vec3 p = at;
+        m_audio.playOneShot(clip, audio::BusId::SFX, &p.x, volume, pitch);
+    };
+
+    // ③ 顿帧：**取 max 不累加**（连击时累加会变成"卡 0.5 秒"）。
+    //
+    // ⚠ `begin=` 打的是**本次被接受的那个时长**，而 `reqs=` 是**收到几次**。
+    //   两个数必须都打：连击累加写成 `m_hitstopLeft += seconds` 时
+    //   `begin=0.030` 照样成立（每次都打），只有 `reqs=3` + 后面 `end total=`
+    //   能证明它是取 max 还是求和。
+    sinks.hitstop = [this](float seconds) {
+        if (!(seconds > 0.0f)) return;   // 0 或负数 = 不退（不是"立即结束"）
+        ++m_hitstopReqs;
+        const float before = m_hitstopLeft;
+        m_hitstopLeft = std::max(m_hitstopLeft, seconds);
+        if (m_hitstopLeft > before) {
+            m_hitstopTotal = m_hitstopLeft;   // = max(旧, 新)，不是累加
+            VK_LOG_INFO("FX-HITSTOP begin=%.3f reqs=%d left=%.3f",
+                        static_cast<double>(seconds), m_hitstopReqs,
+                        static_cast<double>(m_hitstopLeft));
+        }
+    };
+
+    // ④ 闪白：同样取更强的那次，时长取更长。
+    //    ⚠ 不新开渲染 pass —— 见 drawFxOverlay 的注释。
+    sinks.flash = [this](float strength, const glm::vec3& color, float seconds) {
+        if (!(seconds > 0.0f) || !(strength > 0.0f)) return;  // 0 秒 = 不闪
+        if (strength >= m_flashStrength) {
+            m_flashStrength = strength;
+            m_flashColor = color;
+        }
+        m_flashLeft = std::max(m_flashLeft, seconds);
+        m_flashTotal = std::max(m_flashTotal, seconds);
+        VK_LOG_INFO("FX-FLASH begin=%.3f strength=%.3f",
+                    static_cast<double>(seconds), static_cast<double>(strength));
+    };
+
+    m_fx.setSinks(sinks);
+}
+
+void EditorApp::tickFx(float realDt) {
+    // 场景可能换过（进 / 出 Play、File ▸ Open）。`attach` 内部按
+    // 「场景指针 + 资产库指针」判等，没变就立刻返回，代价可以忽略。
+    //
+    // ⚠ 换场景时旧宿主实体已经跟着旧场景一起没了，`attach` 会重建池 ——
+    //   正在播的特效会断，这是换场景该有的行为。
+    m_fx.attach(&m_ctx->activeScene(), &m_ctx->assets());
+    m_fx.update(realDt);
+
+    if (m_flashLeft > 0.0f) {
+        m_flashElapsed += realDt;
+        m_flashLeft = std::max(0.0f, m_flashLeft - realDt);
+        if (m_flashLeft <= 0.0f) {
+            // `elapsed` 与 `begin=` 应该对得上。对不上只有两种原因：
+            // 递减用了被压低的 dt（比 begin 大很多），或者根本没在递减
+            // （那一帧就永远不结束，这条永远不会打）。
+            VK_LOG_INFO("FX-FLASH end total=%.3f elapsed=%.3f",
+                        static_cast<double>(m_flashTotal),
+                        static_cast<double>(m_flashElapsed));
+            m_flashStrength = 0.0f;
+            m_flashTotal = 0.0f;
+            m_flashElapsed = 0.0f;
+        }
+    }
+}
+
+void EditorApp::dispatchAnimEventsThisFrame() {
+    // ⚠⚠ 全仓**只有这一处**读 `eventsThisFrame()`。再开一处（比如运行时那边
+    //   也读一遍）会让同一条事件播两遍 —— 表现是命中特效"双重曝光"，
+    //   而且两处都觉得自己对。
+    const std::vector<animation::FiredAnimEvent>& evs = m_animator.eventsThisFrame();
+    if (evs.empty()) return;
+
+    const fx::AnimEventStats st = fx::dispatchAnimEvents(
+        evs, m_ctx->activeScene(), m_fx, m_fx.sinks());
+
+    // 只在"有事件"时打一行，且带汇总 —— 每事件一行会把日志刷爆。
+    VK_LOG_INFO("FX-DISPATCH total=%d fx=%d sound=%d shake=%d hitstop=%d ignored=%d failed=%d",
+                st.total, st.effects, st.sounds, st.shakes, st.hitstops, st.ignored,
+                st.failed);
+}
+
+void EditorApp::drawFxOverlay() {
+    if (m_flashLeft <= 0.0f || m_flashStrength <= 0.0f) return;
+    // 线性衰减到 0：命中瞬间最亮、之后线性暗下去。
+    // ⚠ 不做 ease-out —— 0.08 秒的窗口里曲线形状看不出来，而线性让
+    //   "闪了多久"与 `flashDuration` 严格对应（判据好写）。
+    const float k = (m_flashTotal > 0.0f) ? (m_flashLeft / m_flashTotal) : 0.0f;
+    const float a = std::clamp(m_flashStrength * k, 0.0f, 1.0f);
+
+    // 背景层 = 3D 之上、所有 ImGui 窗口之下。
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const ImVec2 sz = ImGui::GetIO().DisplaySize;
+    dl->AddRectFilled(ImVec2(0.0f, 0.0f), sz,
+                      ImGui::GetColorU32(ImVec4(m_flashColor.r, m_flashColor.g,
+                                                m_flashColor.b, a)));
+}
+
+// ---------------------------------------------------------------- 关卡流送（G19）
+
+// viewer = "玩家的脚"（与玩家位置语义一致，见 CLAUDE 里的资产链纪律）。
+//
+// 三级回退，每一级失败都退到下一级而不是返回 0：
+//   ① 运行态里带 `CameraComponent` 的实体（玩家实体必须挂它 —— 这是
+//      P6 定下的规矩，所以它是**最准**的那个）；
+//   ② 出生点实体（`GameStartComponent`，它不挂网格，所以 ① 找不到时它最像玩家）；
+//   ③ 场景相机（编辑器里没有玩家，但"我看的是哪儿"就是它）。
+//
+// ⚠ 三级都退不到才用原点 —— 用原点会让原点附近那张关卡被无故加载，
+//   表现成"一进 Play 就多了一堆实体"，查起来非常费时。
+glm::vec3 EditorApp::levelViewerPosition() const {
+    const scene::Scene& sc = m_ctx->isPlaying() ? m_ctx->runtimeScene()
+                                                : m_ctx->editorScene();
+    ecs::World& w = const_cast<scene::Scene&>(sc).world();
+
+    glm::vec3 best(0.0f);
+    bool found = false;
+    w.each<ecs::CameraComponent>([&](ecs::Entity e, ecs::CameraComponent&) {
+        if (found) return;
+        if (const auto* tr = w.get<ecs::TransformComponent>(e)) {
+            best = tr->position;
+            found = true;
+        }
+    });
+    if (!found) {
+        w.each<ecs::GameStartComponent>(
+            [&](ecs::Entity e, ecs::GameStartComponent&) {
+                if (found) return;
+                if (const auto* tr = w.get<ecs::TransformComponent>(e)) {
+                    best = tr->position;
+                    found = true;
+                }
+            });
+    }
+    if (!found) best = sc.camera().position();
+    return best;
+}
+
+// 每帧（只在 Play 里调，见 EditorApp.h 上为什么）。
+void EditorApp::updateLevelStreaming() {
+    if (m_levels.slots().empty()) return;
+    // ⚠ 只对**运行态副本**流送。编辑场景加进去的实体会被 `scene.save`
+    //   写进主场景文件 —— 副关卡会从此粘在主场景里（"怎么删都删不掉"）。
+    scene::Scene& sc = m_ctx->runtimeScene();
+    if (!m_ctx->usingRuntime()) return;   // Stop 之后副本已经作废
+    const auto st = m_levels.update(sc, m_ctx->assets(), levelViewerPosition());
+    // 只在**有请求**的那一帧打，不是每帧：一次流送已经各自打了
+    // LEVELS load / unload，这行是"这一帧一共算了什么"的汇总，
+    // 每帧打会把日志刷爆（而在正常游戏里它 99.9% 的帧都是 0/0）。
+    if (st.loadRequests > 0 || st.unloadRequests > 0) {
+        VK_LOG_INFO("LEVELS tick loaded=%d wanted=%d +%d -%d entities=%d",
+                    st.loaded, st.wanted, st.loadRequests, st.unloadRequests,
+                    st.entities);
+    }
+}
+
+void EditorApp::reloadLevelManifest(const std::string& path) {
+    const std::string full = assets::resolveAssetPath(path);
+    scene::LevelManifest m;
+    const auto io = scene::loadLevelManifest(full, m);
+    if (!io.ok) {
+        if (m_levelPanel) m_levelPanel->setStatus(io.error);
+        VK_LOG_WARN("LEVELS manifest-failed path=%s err=%s", path.c_str(),
+                    io.error.c_str());
+        return;
+    }
+    // ⚠ 换清单时**保留**已加载的关卡（同路径的接管）：换清单是"改配置"，
+    //   不是"换世界"。真正换世界走 `level.unloadall`。
+    m_levels.setManifest(std::move(m));
+    m_levels.rebuildSlots(m_ctx->runtimeScene(), true);
+    if (m_levelPanel) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), TR("Loaded %zu level(s) from %s"),
+                      m_levels.slots().size(), path.c_str());
+        m_levelPanel->setStatus(buf);
+    }
+    VK_LOG_INFO("LEVELS manifest-ok path=%s levels=%zu", path.c_str(),
+                m_levels.slots().size());
+}
+
+// 面板按钮与 `level.*` 命令的**唯一**入口。
+//
+// ⚠ 面板从不自己调 `loadLevel`：它拿不到 Scene（也不该拿）。两条路写两份
+//   的后果是"命令能加载、按钮不能"，而判据只覆盖其中一条。
+void EditorApp::applyLevelAction(const char* verb, const std::string& name) {
+    const std::string v = verb ? verb : "";
+    scene::Scene& sc = m_ctx->runtimeScene();
+    std::string err;
+    if (v == "load") {
+        if (m_levels.loadLevel(sc, m_ctx->assets(), name, &err)) {
+            if (m_levelPanel) m_levelPanel->setStatus(TR("Level loaded."));
+            VK_LOG_INFO("LEVELS-CMD load name=%s ok=1", name.c_str());
+        } else {
+            if (m_levelPanel) m_levelPanel->setStatus(err);
+            VK_LOG_WARN("LEVELS-CMD load name=%s ok=0 err=%s", name.c_str(),
+                        err.c_str());
+        }
+    } else if (v == "unload") {
+        if (m_levels.unloadLevel(sc, name, &err)) {
+            if (m_levelPanel) m_levelPanel->setStatus(TR("Level unloaded."));
+            VK_LOG_INFO("LEVELS-CMD unload name=%s ok=1", name.c_str());
+        } else {
+            if (m_levelPanel) m_levelPanel->setStatus(err);
+            VK_LOG_WARN("LEVELS-CMD unload name=%s ok=0 err=%s", name.c_str(),
+                        err.c_str());
+        }
+    } else if (v == "unloadall") {
+        const int n = m_levels.unloadAll(sc);
+        if (m_levelPanel) m_levelPanel->setStatus(TR("All levels unloaded."));
+        VK_LOG_INFO("LEVELS-CMD unloadall removed=%d", n);
+    }
 }
 
 // ---------------------------------------------------------------- 运行态碰撞
@@ -4732,6 +5732,10 @@ void EditorApp::onImGui() {
     // 而 UI 里 ImGui::Image 抓到的必须是重建**之后**的句柄（详见
     // Renderer::applyPendingResizes 的注释：放晚一步就是拖窗口边框崩溃）。
     renderer().applyPendingResizes();
+
+    // P1：闪白叠加。画在**背景层**（3D 之上、所有窗口之下）——
+    // 这样命中闪白不会盖住面板文字，也不新开渲染 pass。
+    drawFxOverlay();
 
     // E18：命令面板开着时**不让快捷键穿透** —— 那时面板的输入框在收字，
     // 若照跑 handleShortcuts，敲 "s" 会顺手触发吸附、敲数字会切视角。
@@ -6654,6 +7658,158 @@ void EditorApp::drawStatsPanel() {
     ImGui::PlotLines("##fps-hist", fpsHist, 120, 0, "fps / 120f", 0.0f, 240.0f,
                      ImVec2(-1.0f, 40.0f));
 
+    // ---- CPU 分段（C9）：通栏两条堆叠条，与右栏那条 GPU 条**对称** ----
+    //
+    // 上条 = 帧的分区（events / scene / logic / ui / assets / render）；
+    // 下条 = `kRender` 的细分（wait / sync / record / submit / present）。
+    // 两条要一起看才有意义：上条回答"时间花在哪个阶段"，下条回答"渲染
+    // 那一段里 CPU 到底在干活，还是在等 GPU"。
+    //
+    // 为什么通栏而不是塞进左栏：12 段挤在 370px 里全都糊在一起，而这条
+    // 图的价值恰恰是"哪一段占得多"能一眼看出来。
+    {
+        const core::CpuProfiler& cp = core::CpuProfiler::get();
+        const float fMs = cp.lastMs(core::CpuProfiler::kFrame);
+        const float rMs = cp.lastMs(core::CpuProfiler::kRender);
+
+        struct Seg {
+            core::CpuProfiler::Scope s;
+            ImVec4 col;
+        };
+        static const Seg kTopSegs[] = {
+            {core::CpuProfiler::kEvents, ImVec4(0.55f, 0.58f, 0.63f, 1.0f)},
+            {core::CpuProfiler::kScene, ImVec4(0.35f, 0.86f, 0.67f, 1.0f)},
+            {core::CpuProfiler::kLogic, ImVec4(0.47f, 0.71f, 1.00f, 1.0f)},
+            {core::CpuProfiler::kUi, ImVec4(0.94f, 0.78f, 0.31f, 1.0f)},
+            {core::CpuProfiler::kAssets, ImVec4(0.63f, 0.47f, 1.00f, 1.0f)},
+            {core::CpuProfiler::kRender, ImVec4(1.00f, 0.55f, 0.15f, 1.0f)},
+        };
+        static const Seg kDetSegs[] = {
+            {core::CpuProfiler::kRenderWait,
+             ImVec4(0.55f, 0.58f, 0.63f, 1.0f)},
+            {core::CpuProfiler::kSceneSync, ImVec4(0.35f, 0.86f, 0.67f, 1.0f)},
+            {core::CpuProfiler::kRecord, ImVec4(1.00f, 0.55f, 0.15f, 1.0f)},
+            {core::CpuProfiler::kSubmit, ImVec4(0.47f, 0.71f, 1.00f, 1.0f)},
+            {core::CpuProfiler::kPresent, ImVec4(0.86f, 0.31f, 0.63f, 1.0f)},
+        };
+
+        auto cpuBar = [&](const Seg* segs, int n, float tot, float h,
+                          const char* tag) {
+            const float w = ImGui::GetContentRegionAvail().x;
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            float acc = 0.0f;
+            for (int i = 0; i < n; ++i) {
+                const float ms = cp.lastMs(segs[i].s);
+                const float frac = (tot > 0.01f) ? ms / tot : 0.0f;
+                // 不足 0.75px 的段不画 —— 画出来是一条几乎看不见的竖线，
+                // 反而让人以为那里有个 bug（与 GPU 条同一条阈值）。
+                if (w * frac >= 0.75f) {
+                    dl->AddRectFilled(
+                        ImVec2(p0.x + w * acc, p0.y),
+                        ImVec2(p0.x + w * (acc + frac), p0.y + h),
+                        ImGui::ColorConvertFloat4ToU32(segs[i].col));
+                }
+                acc += frac;
+            }
+            // 没铺满的部分 = kFrame（或 kRender）里不属于任何已打点段的余量。
+            // 只画边框不画底：那部分本来就没有名字，给它填色会让人以为
+            // 它属于某一段。
+            dl->AddRect(p0, ImVec2(p0.x + w, p0.y + h), IM_COL32(0, 0, 0, 120));
+            logRect(tag, p0, ImVec2(p0.x + w, p0.y + h));
+            ImGui::Dummy(ImVec2(w, h));
+            if (ImGui::IsItemHovered() && tot > 0.01f) {
+                // 与 GPU 条同一套"按累计占比反查"的悬停读数。
+                const float rel = (io.MousePos.x - p0.x) / std::max(w, 1.0f);
+                float a = 0.0f;
+                for (int i = 0; i < n; ++i) {
+                    const float ms = cp.lastMs(segs[i].s);
+                    a += ms / tot;
+                    if (rel <= a) {
+                        ImGui::SetTooltip(
+                            "%s  %.3f ms  (%.1f%%)",
+                            core::CpuProfiler::scopeName(segs[i].s),
+                            static_cast<double>(ms),
+                            static_cast<double>(100.0f * ms / tot));
+                        break;
+                    }
+                }
+            }
+        };
+
+        ImGui::Text(TR("CPU: %.2f ms  (events / scene / logic / ui / assets / "
+                       "render)"),
+                    static_cast<double>(fMs));
+        cpuBar(kTopSegs, 6, fMs, 16.0f, "STATS-CPU-BAR");
+        ImGui::TextDisabled(
+            TR("render %.2f ms -- below: record vs waiting for the gpu"),
+            static_cast<double>(rMs));
+        cpuBar(kDetSegs, 5, rMs, 10.0f, "STATS-CPU-DETAIL");
+
+        // ---- 12 段精确读数 ----
+        // 堆叠条回答"哪段占得多"，这张表回答"到底多少毫秒 / 抖不抖"。
+        // max 是这里最有用的那一列：avg 正常而 max 有一个尖峰，说明某条
+        // 路径在**偶发**重建资源（每帧重建的路径 avg 也会大，两者不同）。
+        // ⚠ 默认**收起**：这张表有 12 行，展开就吃掉 260px，把整块浮动
+        //   面板撑到和上面的 Scripts 面板重叠。而那两条堆叠条已经把
+        //   "哪段占得多"说完了 —— 表是给"要精确到 0.01ms"的人准备的。
+        const bool cpuOpen =
+            ImGui::TreeNodeEx(TR("CPU breakdown (last / avg / max ms)"),
+                              ImGuiTreeNodeFlags_None);
+        // 锚点在收起状态也必须打 —— 否则自动化"先点开再说"的第一步就
+        // 找不到可点的矩形（收起时它仍然是一个可点的一行）。
+        logRect("STATS-CPU-TREE", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        if (cpuOpen) {
+            if (ImGui::BeginTable("##cputab", 4,
+                                  ImGuiTableFlags_SizingFixedFit |
+                                      ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn(TR("section"));
+                ImGui::TableSetupColumn(TR("last"));
+                ImGui::TableSetupColumn(TR("avg"));
+                ImGui::TableSetupColumn(TR("max"));
+                ImGui::TableHeadersRow();
+                for (uint32_t i = 0; i < core::CpuProfiler::kCount; ++i) {
+                    const auto s = static_cast<core::CpuProfiler::Scope>(i);
+                    const bool det = core::CpuProfiler::isRenderDetail(s);
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    // 细分靠**缩进**表达层级，不再套一层 TreeNode ——
+                    // 多一层就多一份展开状态要管（且默认展开与否都会
+                    // 有人不满意）。
+                    if (det) ImGui::Indent(12.0f);
+                    ImGui::TextUnformatted(core::CpuProfiler::scopeName(s));
+                    if (det) ImGui::Unindent(12.0f);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.2f", static_cast<double>(cp.lastMs(s)));
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.2f", static_cast<double>(cp.avgMs(s)));
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.2f", static_cast<double>(cp.maxMs(s)));
+                }
+                ImGui::EndTable();
+            }
+            ImGui::TextDisabled(TR("samples: %u frames"), cp.samples());
+            ImGui::TreePop();
+        }
+
+        // ---- 进程内存 ----
+        // 三个数各自回答一个问题（见 core/ProcStats.h）。peak 比当前值
+        // 有用：一次性的巨大分配（重建交换链 / 载入大场景）在瞬时值上
+        // 抓不到。
+        const core::ProcMemory mem = core::queryProcessMemory();
+        if (mem.valid) {
+            ImGui::Text(TR("Memory: working set %.1f MB (peak %.1f MB), "
+                           "private %.1f MB"),
+                        mem.workingSetMB, mem.peakWorkingSetMB, mem.privateMB);
+        } else {
+            ImGui::TextDisabled("%s", TR("Memory: not available on this platform"));
+        }
+        logRect("STATS-MEM", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        ImGui::Separator();
+    }
+
     // ---- E15 CPU / GPU 双栏 ----
     ImGui::Columns(2, "statscols", false);
     ImGui::SetColumnWidth(0, w660 * 0.56f);
@@ -8046,6 +9202,101 @@ void EditorApp::registerConsoleCommands() {
                                                        : xc->presetName);
         });
 
+    // ---- 后处理体积（2026-11-02）----
+    //
+    // 为什么这几条命令必须有：体积是否生效**在画面上很难判断** ——
+    // "景深没出来"可能是没开、可能是相机不在盒子里、也可能是优先级被
+    // 另一个体积压掉了。像素判据在这里等于掷骰子，只能靠数值锚点。
+    //
+    // ⚠ 面板与命令**共用 `postVolumeAdd/Remove`**（PostVolumePanel.h）。
+    //   各写一套的后果是"命令能建、按钮建不出来"，而判据只覆盖其中一条。
+    // ⚠ 它们都作用在 `editorScene()`（编辑中的那份），与面板一致。
+    //   Play 期间改的是编辑态场景，Stop 之后才看得到 —— 这是编辑器的
+    //   既有语义（不是新引入的特例）。
+    con->addCommand("pv.list",
+        "pv.list  list the post-process volumes in the edited scene",
+        [this](const std::vector<std::string>&) -> std::string {
+            const auto& set = m_ctx->editorScene().postVolumes();
+            VK_LOG_INFO("PV-LIST n=%d", static_cast<int>(set.volumes().size()));
+            int i = 0;
+            for (const scene::PostVolume& v : set.volumes()) {
+                VK_LOG_INFO("PV-LIST i=%d %s", i++, postVolumeDescribe(v).c_str());
+            }
+            return std::to_string(set.volumes().size());
+        });
+    con->addCommand("pv.eval",
+        "pv.eval [x y z]  evaluate the blended overrides at a point (default: camera)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            glm::vec3 p = m_ctx->editorScene().camera().position();
+            if (args.size() >= 4) {
+                p = glm::vec3(static_cast<float>(std::atof(args[1].c_str())),
+                              static_cast<float>(std::atof(args[2].c_str())),
+                              static_cast<float>(std::atof(args[3].c_str())));
+            }
+            const auto& set = m_ctx->editorScene().postVolumes();
+            const scene::PostVolumeSet::Blended b = set.evaluate(p);
+            int active = 0;
+            for (const scene::PostVolume& v : set.volumes())
+                if (set.weightAt(v, p) > 0.0f) ++active;
+            VK_LOG_INFO("PV-EVAL cam=(%.2f,%.2f,%.2f) total=%d active=%d "
+                        "dof=%d focus=%.3f ap=%.3f maxr=%.3f "
+                        "mb=%d mbstr=%.3f chr=%d chrstr=%.3f "
+                        "vig=%d vigstr=%.3f lut=%.3f exp=%.3f",
+                        static_cast<double>(p.x), static_cast<double>(p.y),
+                        static_cast<double>(p.z),
+                        static_cast<int>(set.volumes().size()), active, b.dof,
+                        static_cast<double>(b.dofFocus),
+                        static_cast<double>(b.dofAperture),
+                        static_cast<double>(b.dofMaxRadius), b.motionBlur,
+                        static_cast<double>(b.motionBlurStrength), b.chromatic,
+                        static_cast<double>(b.chromaStrength), b.vignette,
+                        static_cast<double>(b.vignetteStrength),
+                        static_cast<double>(b.cgLutBlend),
+                        static_cast<double>(b.autoExposureBias));
+            return "active=" + std::to_string(active);
+        });
+    con->addCommand("pv.add",
+        "pv.add <name> [x y z]  add a volume (centre = camera, half-size 4 m)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: pv.add <name> [x y z]";
+            glm::vec3 c = m_ctx->editorScene().camera().position();
+            if (args.size() >= 5) {
+                c = glm::vec3(static_cast<float>(std::atof(args[2].c_str())),
+                              static_cast<float>(std::atof(args[3].c_str())),
+                              static_cast<float>(std::atof(args[4].c_str())));
+            }
+            const std::string name = args[1];
+            int at = -1;
+            m_ctx->structuralEdit(TR("Add Post-Process Volume"), [&] {
+                at = postVolumeAdd(m_ctx->editorScene(), name, c, glm::vec3(4.0f));
+            });
+            const auto& vols = m_ctx->editorScene().postVolumes().volumes();
+            const std::string got = (at >= 0 && at < static_cast<int>(vols.size()))
+                                        ? vols[static_cast<size_t>(at)].name
+                                        : name;
+            VK_LOG_INFO("PV-CREATE name=%s count=%d via=cmd", got.c_str(),
+                        static_cast<int>(vols.size()));
+            return got;
+        });
+    con->addCommand("pv.remove",
+        "pv.remove <index>  remove a volume by index (see pv.list)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: pv.remove <index>";
+            const int idx = std::atoi(args[1].c_str());
+            const auto& vols = m_ctx->editorScene().postVolumes().volumes();
+            if (idx < 0 || idx >= static_cast<int>(vols.size())) return "bad index";
+            const std::string gone = vols[static_cast<size_t>(idx)].name;
+            m_ctx->structuralEdit(TR("Delete Post-Process Volume"), [&] {
+                postVolumeRemove(m_ctx->editorScene(), idx);
+            });
+            VK_LOG_INFO("PV-DELETE name=%s count=%d via=cmd", gone.c_str(),
+                        static_cast<int>(m_ctx->editorScene()
+                                             .postVolumes()
+                                             .volumes()
+                                             .size()));
+            return gone;
+        });
+
     // ---- 两骨 IK / 骨骼挂点（第八刀，2026-10-25）----
     //
     // 为什么这两个功能**必须**有控制台入口："IK 生效了"在截图上不可见
@@ -8384,6 +9635,1100 @@ void EditorApp::registerConsoleCommands() {
                         static_cast<double>(m_audio.cacheResidentBytes() +
                                             m_audio.streamResidentBytes()));
             return "voices=" + std::to_string(st.voices);
+        });
+
+    // ---- 项目设置（B3，2026-11-02）----
+    //
+    // ⚠ 四条命令走的是**面板的同一条路**（`save` / `reload` / `setField`），
+    //   不是另一套写盘逻辑。分开写的后果是"命令能改、按钮改不动"或反过来，
+    //   而判据只覆盖其中一条（`audio.gain` 与推子是同一条教训）。
+    con->addCommand("project.settings",
+        "project.settings  print every assets/game.json field (readback anchor)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_projectSettings) return "project panel not ready";
+            int n = 0;
+            const char* const* keys =
+                editor::ProjectSettingsPanel::fieldNames(&n);
+            // 一行一条：`PROJ-SETTINGS key=width value=1600`
+            // 一条一行而不是挤成一行，是为了让判据能按 key 精确取。
+            for (int i = 0; i < n; ++i) {
+                VK_LOG_INFO("PROJ-SETTINGS key=%s value=%s", keys[i],
+                            m_projectSettings->fieldValue(keys[i]).c_str());
+            }
+            VK_LOG_INFO("PROJ-SETTINGS path=%s dirty=%d n=%d",
+                        m_projectSettings->path().c_str(),
+                        m_projectSettings->dirty() ? 1 : 0, n);
+            return std::string("n=") + std::to_string(n);
+        });
+    con->addCommand("project.set",
+        "project.set <key> <value>  change one field (not saved yet)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_projectSettings) return "project panel not ready";
+            if (args.size() < 3) return "usage: project.set <key> <value>";
+            // 值里允许有空格（标题）→ 从第 3 个参数起整段拼回去
+            std::string value = args[2];
+            for (std::size_t i = 3; i < args.size(); ++i) {
+                value += " ";
+                value += args[i];
+            }
+            std::string msg;
+            if (!m_projectSettings->setField(args[1], value, &msg)) {
+                return "project.set failed: " + msg;
+            }
+            VK_LOG_INFO("PROJ-CMD set key=%s value=%s", args[1].c_str(),
+                        value.c_str());
+            return args[1] + "=" + value;
+        });
+    con->addCommand("project.save",
+        "project.save  write assets/game.json (merges unknown keys)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_projectSettings) return "project panel not ready";
+            std::string msg;
+            const bool ok = m_projectSettings->save(&msg);
+            VK_LOG_INFO("PROJ-CMD save ok=%d msg=%s", ok ? 1 : 0, msg.c_str());
+            return msg;
+        });
+    con->addCommand("project.reload",
+        "project.reload  re-read assets/game.json (drops unsaved changes)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_projectSettings) return "project panel not ready";
+            std::string msg;
+            const bool ok = m_projectSettings->reload(&msg);
+            VK_LOG_INFO("PROJ-CMD reload ok=%d msg=%s", ok ? 1 : 0, msg.c_str());
+            return msg;
+        });
+
+    // ---- 配表（C1，2026-11-02）----
+    //
+    // ⚠ 全部走 **panel 的方法**（`selectTable` / `setCell` / `saveCurrent`），
+    //   不是直接操作 `TableStore`。理由与 project.* / audio.gain 同一条：
+    //   分开写两套一定漂成"命令能改、界面不认"。
+    con->addCommand("table.list",
+        "table.list  print every loaded data table (TABLE-LIST name= rows= cols=)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_dataTablePanel) return "table panel not ready";
+            const auto& all = m_dataTablePanel->tables();
+            for (const auto& t : all) {
+                VK_LOG_INFO("TABLE-LIST name=%s rows=%zu cols=%zu",
+                            t.name.c_str(), t.rows(), t.cols());
+            }
+            VK_LOG_INFO("TABLE-LIST-TOTAL count=%zu",
+                        static_cast<size_t>(all.size()));
+            return std::to_string(all.size());
+        });
+    con->addCommand("table.select",
+        "table.select <name>  switch the panel to a table",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_dataTablePanel) return "table panel not ready";
+            if (args.size() < 2) return "usage: table.select <name>";
+            const bool ok = m_dataTablePanel->selectTable(args[1]);
+            VK_LOG_INFO("TABLE-CMD select name=%s ok=%d", args[1].c_str(),
+                        ok ? 1 : 0);
+            return ok ? "ok" : "no such table";
+        });
+    con->addCommand("table.cell",
+        "table.cell <row> <col>  read one cell of the selected table",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_dataTablePanel) return "table panel not ready";
+            if (args.size() < 3) return "usage: table.cell <row> <col>";
+            const std::string v = m_dataTablePanel->cellText(
+                std::atoi(args[1].c_str()), std::atoi(args[2].c_str()));
+            VK_LOG_INFO("TABLE-CELL row=%s col=%s value=%s", args[1].c_str(),
+                        args[2].c_str(), v.c_str());
+            return v;
+        });
+    con->addCommand("table.set",
+        "table.set <row> <col> <value>  change one cell (not saved yet)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_dataTablePanel) return "table panel not ready";
+            if (args.size() < 4) return "usage: table.set <row> <col> <value>";
+            // 值里允许空格 / 逗号（台词、名字）→ 从第 4 个参数起整段拼回
+            std::string value = args[3];
+            for (std::size_t i = 4; i < args.size(); ++i) {
+                value += " ";
+                value += args[i];
+            }
+            std::string msg;
+            const bool ok = m_dataTablePanel->setCell(
+                std::atoi(args[1].c_str()), std::atoi(args[2].c_str()), value,
+                &msg);
+            VK_LOG_INFO("TABLE-CMD set row=%s col=%s ok=%d", args[1].c_str(),
+                        args[2].c_str(), ok ? 1 : 0);
+            return msg;
+        });
+    con->addCommand("table.save",
+        "table.save  write the selected table back to its .csv",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_dataTablePanel) return "table panel not ready";
+            std::string msg;
+            const bool ok = m_dataTablePanel->saveCurrent(&msg);
+            VK_LOG_INFO("TABLE-CMD save ok=%d msg=%s", ok ? 1 : 0, msg.c_str());
+            return msg;
+        });
+    con->addCommand("table.reload",
+        "table.reload  re-scan assets/data/*.csv",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_dataTablePanel) return "table panel not ready";
+            std::string msg;
+            m_dataTablePanel->reloadAll(&msg);
+            VK_LOG_INFO("TABLE-CMD reload msg=%s", msg.c_str());
+            return msg;
+        });
+
+    // ---- 本地化编辑（C2，2026-11-02）----
+    //
+    // `i18n.find` 是给判据用的：键里常有空格与标点，写死下标会随静态表
+    // 增删而漂 —— 先找再改才是稳的。
+    con->addCommand("i18n.count",
+        "i18n.count  print key / missing / changed counters",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_localizationPanel) return "i18n panel not ready";
+            auto& ed = m_localizationPanel->editor();
+            VK_LOG_INFO("I18N-UI count=%zu missing=%zu dirty=%zu", ed.count(),
+                        ed.missingCount(), ed.dirtyCount());
+            return std::to_string(ed.count());
+        });
+    con->addCommand("i18n.find",
+        "i18n.find <text>  print indices whose English key contains text",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_localizationPanel) return "i18n panel not ready";
+            if (args.size() < 2) return "usage: i18n.find <text>";
+            std::string needle = args[1];
+            for (std::size_t i = 2; i < args.size(); ++i) {
+                needle += " ";
+                needle += args[i];
+            }
+            auto& ed = m_localizationPanel->editor();
+            int hits = 0;
+            for (std::size_t i = 0; i < ed.count(); ++i) {
+                if (ed.row(i).en == needle) {
+                    VK_LOG_INFO("I18N-FIND idx=%zu exact=1", i);
+                    ++hits;
+                } else if (ed.row(i).en.find(needle) != std::string::npos &&
+                           hits < 20) {
+                    VK_LOG_INFO("I18N-FIND idx=%zu exact=0", i);
+                    ++hits;
+                }
+            }
+            VK_LOG_INFO("I18N-FIND-TOTAL hits=%d", hits);
+            return std::to_string(hits);
+        });
+    con->addCommand("i18n.row",
+        "i18n.row <index>  print one row (I18N-ROW + I18N-EN on two lines)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_localizationPanel) return "i18n panel not ready";
+            if (args.size() < 2) return "usage: i18n.row <index>";
+            auto& ed = m_localizationPanel->editor();
+            const int idx = std::atoi(args[1].c_str());
+            if (idx < 0 || static_cast<std::size_t>(idx) >= ed.count())
+                return "index out of range";
+            const auto& r = ed.row(static_cast<std::size_t>(idx));
+            // ⚠ 英文键里可能有空格与 `=`，所以**单独一行**原样输出，
+            //   不跟字段挤在一起（挤在一起就没法可靠地反解）。
+            VK_LOG_INFO("I18N-EN idx=%d %s", idx, r.en.c_str());
+            VK_LOG_INFO("I18N-ROW idx=%d builtin=%d dirty=%d zh=%s", idx,
+                        r.builtin ? 1 : 0, r.dirty ? 1 : 0, r.zh.c_str());
+            return std::to_string(idx);
+        });
+    con->addCommand("i18n.set",
+        "i18n.set <index> <zh>  change one translation (not saved yet)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_localizationPanel) return "i18n panel not ready";
+            if (args.size() < 3) return "usage: i18n.set <index> <zh>";
+            std::string zh = args[2];
+            for (std::size_t i = 3; i < args.size(); ++i) {
+                zh += " ";
+                zh += args[i];
+            }
+            std::string msg;
+            const bool ok =
+                m_localizationPanel->setRow(std::atoi(args[1].c_str()), zh, &msg);
+            return ok ? msg : std::string("set failed");
+        });
+    con->addCommand("i18n.save",
+        "i18n.save  write overrides to assets/i18n/zh.csv",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_localizationPanel) return "i18n panel not ready";
+            std::string msg;
+            const bool ok = m_localizationPanel->save(&msg);
+            VK_LOG_INFO("I18N-CMD save ok=%d msg=%s", ok ? 1 : 0, msg.c_str());
+            return msg;
+        });
+    con->addCommand("i18n.reload",
+        "i18n.reload  re-read assets/i18n/zh.csv",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_localizationPanel) return "i18n panel not ready";
+            std::string msg;
+            m_localizationPanel->reload(&msg);
+            VK_LOG_INFO("I18N-CMD reload msg=%s", msg.c_str());
+            return msg;
+        });
+
+    // ---- 剧情旗标（A4，2026-11-02）----
+    //
+    // ⚠ 全部走**面板的方法**（`m_flagPanel->set(...)`），与按钮与
+    //   `setFlag` 内置写的是同一张表。分开写两套的后果是"命令能改、
+    //   面板看不见"，而判据只覆盖其中一条 —— 这类分叉在 A2 吃过一次。
+    con->addCommand("flags.count",
+        "flags.count  how many flags are set (FLAG-COUNT total=)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_flagPanel) return "flag panel not ready";
+            VK_LOG_INFO("FLAG-COUNT total=%zu", m_flagPanel->count());
+            return std::to_string(m_flagPanel->count());
+        });
+    con->addCommand("flags.list",
+        "flags.list [filter]  dump flags (FLAG-ROW name= value= kind= writer=)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_flagPanel) return "flag panel not ready";
+            std::string filter;
+            for (size_t i = 1; i < args.size(); ++i) {
+                if (!filter.empty()) filter += " ";
+                filter += args[i];
+            }
+            const auto rows = m_flagPanel->rows(filter);
+            for (const auto& r : rows)
+                VK_LOG_INFO("FLAG-ROW %s",
+                            m_flagPanel->rowText(r).c_str());
+            VK_LOG_INFO("FLAG-LIST-TOTAL count=%zu", rows.size());
+            return std::to_string(rows.size());
+        });
+    con->addCommand("flags.get",
+        "flags.get <name>  read one flag (FLAG-GET name= value= set=)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_flagPanel) return "flag panel not ready";
+            if (args.size() < 2) return "usage: flags.get <name>";
+            const double v = m_flagPanel->get(args[1]);
+            // ⚠ `set=` 单独报：`getFlag` 未设过返回 0 是**正确语义**，
+            //   而"设过但就是 0"与"从没设过"在面板上必须能分开 ——
+            //   这正是 `GameFlags::has()` 存在的理由。
+            const bool present = m_flags.has(args[1]);
+            VK_LOG_INFO("FLAG-GET name=%s value=%.4f set=%d", args[1].c_str(), v,
+                        present ? 1 : 0);
+            return std::to_string(v);
+        });
+    con->addCommand("flags.set",
+        "flags.set <name> <value>  write a flag (writer=console)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_flagPanel) return "flag panel not ready";
+            if (args.size() < 3) return "usage: flags.set <name> <value>";
+            const double v = std::atof(args[2].c_str());
+            // writer 写 `console`：面板改的写 `editor`、脚本写的写
+            // `script:<path>` —— 三个来源在"谁写的"那一列必须分得开，
+            // 否则调试时会把"我自己在命令行改的"认成"某个脚本改的"。
+            const bool ok = m_flagPanel->set(args[1], v, "console");
+            VK_LOG_INFO("FLAG-SET name=%s value=%.4f ok=%d", args[1].c_str(), v,
+                        ok ? 1 : 0);
+            return ok ? "ok" : "failed";
+        });
+    con->addCommand("flags.erase",
+        "flags.erase <name>  remove one flag entirely",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_flagPanel) return "flag panel not ready";
+            if (args.size() < 2) return "usage: flags.erase <name>";
+            const bool ok = m_flagPanel->erase(args[1]);
+            VK_LOG_INFO("FLAG-ERASE name=%s ok=%d", args[1].c_str(),
+                        ok ? 1 : 0);
+            return ok ? "ok" : "no such flag";
+        });
+    con->addCommand("flags.clear",
+        "flags.clear  remove every flag",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_flagPanel) return "flag panel not ready";
+            const size_t n = m_flagPanel->wipe();
+            VK_LOG_INFO("FLAG-CLEAR removed=%zu", n);
+            return std::to_string(n);
+        });
+    con->addCommand("flags.snap",
+        "flags.snap  remember the current flag set (for 'back to chapter N')",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_flagPanel) return "flag panel not ready";
+            const bool ok = m_flagPanel->snapshot();
+            VK_LOG_INFO("FLAG-SNAP ok=%d count=%zu", ok ? 1 : 0,
+                        m_flagPanel->count());
+            return ok ? "ok" : "failed";
+        });
+    con->addCommand("flags.restore",
+        "flags.restore  put the flag set back to the last snapshot",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_flagPanel) return "flag panel not ready";
+            const size_t n = m_flagPanel->restore();
+            VK_LOG_INFO("FLAG-RESTORE count=%zu", n);
+            return std::to_string(n);
+        });
+
+    // ---- 脚本断点（C8，2026-11-02）----
+    //
+    // ⚠ 行号**校验**在 `ScriptRuntime::addBreakpoint` 里（必须命中一条
+    //   语句）。这里再校验一遍等于两套判断，迟早分叉。
+    con->addCommand("script.bp",
+        "script.bp <add|remove|list|clear> [path] [line]  breakpoints",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_scriptDbg) return "script debug panel not ready";
+            if (args.size() < 2) return "usage: script.bp <add|remove|list|clear>";
+            const std::string& verb = args[1];
+            if (verb == "list") {
+                for (const auto& kv : m_scriptRuntime->breakpoints().list()) {
+                    VK_LOG_INFO("SCR-BP-LIST path=%s line=%d", kv.first.c_str(),
+                                kv.second);
+                }
+                VK_LOG_INFO("SCR-BP-TOTAL count=%zu",
+                            m_scriptRuntime->breakpoints().size());
+                return std::to_string(m_scriptRuntime->breakpoints().size());
+            }
+            if (verb == "clear") {
+                const int n = m_scriptDbg->clearBreakpoints();
+                VK_LOG_INFO("SCR-BP-CLEAR removed=%d", n);
+                return std::to_string(n);
+            }
+            if (args.size() < 4) return "usage: script.bp <add|remove> <path> <line>";
+            const int line = std::atoi(args[3].c_str());
+            if (verb == "add") {
+                std::string msg;
+                if (!m_scriptDbg->addBreakpoint(args[2], line, &msg)) {
+                    VK_LOG_WARN("SCR-BP-ADD-FAIL path=%s line=%d err=%s",
+                                args[2].c_str(), line, msg.c_str());
+                    return msg;
+                }
+                VK_LOG_INFO("SCR-BP-ADD path=%s line=%d", args[2].c_str(), line);
+                return "ok";
+            }
+            if (verb == "remove") {
+                const int n = m_scriptDbg->removeBreakpoint(args[2], line);
+                VK_LOG_INFO("SCR-BP-REMOVE path=%s line=%d removed=%d",
+                            args[2].c_str(), line, n);
+                return std::to_string(n);
+            }
+            return "unknown verb: " + verb;
+        });
+    con->addCommand("script.at",
+        "script.at  where are the paused instances (SCR-AT paused= ...)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_scriptDbg) return "script debug panel not ready";
+            const std::string line = m_scriptDbg->stateLine();
+            VK_LOG_INFO("SCR-AT %s", line.c_str());
+            for (const std::string& l : m_scriptDbg->pausedLines())
+                VK_LOG_INFO("SCR-AT-ROW %s", l.c_str());
+            // 变量快照单独一组行：暂停那一刻的 vars 就是"协程里的状态"，
+            // 这是 `print` 永远看不见的那一半（print 只看得见"走过的路"）。
+            for (const std::string& v : m_scriptDbg->pausedVarLines())
+                VK_LOG_INFO("SCR-AT-VAR %s", v.c_str());
+            return line;
+        });
+    con->addCommand("script.cont",
+        "script.cont  resume every paused instance",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_scriptDbg) return "script debug panel not ready";
+            const int n = m_scriptDbg->resumeAll();
+            VK_LOG_INFO("SCR-CONT resumed=%d", n);
+            return std::to_string(n);
+        });
+    con->addCommand("script.step",
+        "script.step  run each paused instance by one statement",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_scriptDbg) return "script debug panel not ready";
+            const int n = m_scriptDbg->stepAll();
+            VK_LOG_INFO("SCR-STEP-CMD stepped=%d", n);
+            return std::to_string(n);
+        });
+    con->addCommand("script.select",
+        "script.select <path>  pick which script the debug panel shows",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_scriptDbg) return "script debug panel not ready";
+            if (args.size() < 2) return "usage: script.select <path>";
+            const bool ok = m_scriptDbg->selectPath(args[1]);
+            VK_LOG_INFO("SCR-SELECT path=%s ok=%d", args[1].c_str(),
+                        ok ? 1 : 0);
+            return ok ? "ok" : "not loaded";
+        });
+
+    // ---- 关卡流送（G19，2026-11-02）----
+    //
+    // ⚠ 全部走 `applyLevelAction()`（与面板按钮同一条路）。分成两套的后果是
+    //   "命令能加载、按钮不能"，而判据只覆盖其中一条。
+    con->addCommand("level.manifest",
+        "level.manifest <path>  load a level manifest (.vlevels) from assets",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: level.manifest <path>";
+            m_levelManifestPath = args[1];
+            reloadLevelManifest(args[1]);
+            VK_LOG_INFO("LEVELS-CMD manifest path=%s levels=%zu",
+                        args[1].c_str(), m_levels.slots().size());
+            return std::to_string(m_levels.slots().size());
+        });
+    con->addCommand("level.list",
+        "level.list  dump every level with its load state",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_levelPanel) return "level panel not ready";
+            const auto rows = m_levelPanel->rowsText();
+            for (const std::string& r : rows)
+                VK_LOG_INFO("LEVEL-ROW %s", r.c_str());
+            VK_LOG_INFO("LEVEL-COUNT total=%zu loaded=%zu", rows.size(),
+                        m_levelPanel->loadedCount());
+            return std::to_string(rows.size());
+        });
+    con->addCommand("level.count",
+        "level.count  print how many levels exist / are loaded",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_levelPanel) return "level panel not ready";
+            VK_LOG_INFO("LEVEL-COUNT total=%zu loaded=%zu",
+                        m_levelPanel->count(), m_levelPanel->loadedCount());
+            return std::to_string(m_levelPanel->count());
+        });
+    con->addCommand("level.state",
+        "level.state  print the streamer state line (levels/loaded/wanted)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_levelPanel) return "level panel not ready";
+            const std::string s = m_levelPanel->stateLine();
+            // `world=` 是**流送的正确性判据**，不是诊断装饰：
+            // 叠加加载之后，整个场景的实体数必须**只增不减**；整份替换
+            // （误用 `loadScene`）会把它压成副关卡自己的数量 —— 而
+            // "加载成功了"这条断言对那个错误完全无效。
+            VK_LOG_INFO("LEVEL-STATE %s world=%zu", s.c_str(),
+                        m_ctx->runtimeScene().world().entityCount());
+            return s;
+        });
+    // ---- P1：特效（4 条）。全部走**面板的方法**，与按钮同一条路 ----
+    con->addCommand("fx.state",
+        "fx.state  print the effect pool state (FX-STATE ...)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_fxPanel) return "fx panel not ready";
+            const std::string s = m_fxPanel->stateLine();
+            VK_LOG_INFO("FX-STATE %s", s.c_str());
+            return s;
+        });
+    con->addCommand("fx.play",
+        "fx.play <path>  play a .veffect at the origin",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_fxPanel) return "fx panel not ready";
+            if (args.size() < 2) return "usage: fx.play <path>";
+            std::string err;
+            const uint32_t id =
+                m_fxPanel->playPath(args[1], glm::vec3(0.0f, 0.0f, 1.0f), &err);
+            // 打 id 与当前活跃数：`FX-PLAY id=N active=M` 是自动化判据
+            // （只有 `id>0` 才能证明"真的占到了槽"，而不是"调用没报错"）。
+            VK_LOG_INFO("FX-PLAY path=%s id=%u active=%zu dropped=%llu",
+                        args[1].c_str(), id, m_fx.activeCount(),
+                        static_cast<unsigned long long>(m_fx.dropped()));
+            return id ? ("id=" + std::to_string(id)) : err;
+        });
+    con->addCommand("fx.stopall", "fx.stopall  silence every live effect",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_fxPanel) return "fx panel not ready";
+            m_fxPanel->stopAll();
+            VK_LOG_INFO("FX-STOPALL active=%zu", m_fx.activeCount());
+            return std::to_string(m_fx.activeCount());
+        });
+    con->addCommand("fx.budget", "fx.budget <n>  resize the particle host pool",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_fxPanel) return "fx panel not ready";
+            if (args.size() < 2) return "usage: fx.budget <n>";
+            std::string err;
+            const int n = std::atoi(args[1].c_str());
+            if (!m_fxPanel->setBudget(n, &err)) return err;
+            VK_LOG_INFO("FX-BUDGET budget=%d", m_fx.budget());
+            return std::to_string(m_fx.budget());
+        });
+    // `entity.select <name>`：按名字选中一个实体。
+    //
+    // 存在的理由：选中实体在界面上只有**点 Hierarchy / 视口**一条路，而
+    // 那两处都是"按像素点"，布局一变锚点就漂（本仓踩过好几轮）。凡是
+    // "需要先选中才能验"的用例（Inspector 各页签、玩法数值、伤害预览）
+    // 都要一个**不依赖像素**的入口，否则它们只能靠截图断言。
+    //
+    // ⚠ 名字重复时选**第一个**（按实体 id 升序），并回一行 `candidates=N`
+    //   —— "选错了那个同名的"是这种入口最容易出的错。
+    con->addCommand("entity.select",
+        "entity.select <name>  select the first entity with this name",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: entity.select <name>";
+            ecs::World& w = m_ctx->activeScene().world();
+            ecs::Entity best{};
+            int n = 0;
+            w.each<ecs::NameComponent>([&](ecs::Entity e, ecs::NameComponent& nc) {
+                if (nc.name != args[1]) return;
+                ++n;
+                if (!best.valid() || e.id < best.id) best = e;
+            });
+            if (!best.valid()) {
+                VK_LOG_WARN("ENTITY-SELECT name=%s found=0", args[1].c_str());
+                return "not found";
+            }
+            m_ctx->select(best);
+            VK_LOG_INFO("ENTITY-SELECT name=%s id=%u candidates=%d", args[1].c_str(),
+                        static_cast<unsigned>(best.id), n);
+            return "id=" + std::to_string(best.id) + " candidates=" + std::to_string(n);
+        });
+
+    // ---- P2：玩法状态（11 条）。与面板按钮同一条路 ----
+    //
+    // ⚠ 这些命令**全部**打到"当前选中实体"上（addstatus / hit / reset），
+    //   所以自动化必须先选中。这是有意的：把实体 id 作为参数会让脚本里
+    //   出现一堆运行时序号，而序号换一次加载就变。
+    con->addCommand("gameplay.state",
+        "gameplay.state  print unit count / queue / seed (GP-STATE ...)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_gpPanel) return "gameplay panel not ready";
+            gp();
+            const std::string s = m_gpPanel->stateLine();
+            VK_LOG_INFO("GP-STATE %s", s.c_str());
+            return s;
+        });
+    con->addCommand("gameplay.order",
+        "gameplay.order [n]  next n actors (default 6)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_gpPanel) return "gameplay panel not ready";
+            gp();
+            const int n = args.size() >= 2 ? std::atoi(args[1].c_str()) : 6;
+            const std::string s = m_gpPanel->orderLine(n > 0 ? n : 6);
+            VK_LOG_INFO("GP-ORDER %s", s.c_str());
+            return s;
+        });
+    con->addCommand("gameplay.advance",
+        "gameplay.advance [dt]  advance the action gauge by dt seconds",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_gpPanel) return "gameplay panel not ready";
+            gp();
+            const float dt = args.size() >= 2
+                                 ? static_cast<float>(std::atof(args[1].c_str()))
+                                 : 1.0f;
+            const std::string s = m_gpPanel->advance(dt);
+            VK_LOG_INFO("GP-ADVANCE %s", s.c_str());
+            return s;
+        });
+    con->addCommand("gameplay.endturn", "gameplay.endturn  reset the acting gauge",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_gpPanel) return "gameplay panel not ready";
+            gp();
+            return m_gpPanel->endTurn();
+        });
+    con->addCommand("gameplay.tick",
+        "gameplay.tick  end-of-round: dots + status expiry for every unit",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_gpPanel) return "gameplay panel not ready";
+            gp();
+            const std::string s = m_gpPanel->tickRound();
+            VK_LOG_INFO("GP-TICK-CMD %s", s.c_str());
+            return s;
+        });
+    con->addCommand("gameplay.rebuild",
+        "gameplay.rebuild  rebuild the turn queue from components",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_gpPanel) return "gameplay panel not ready";
+            // 强制重建（不走 gp() 的指针判等）：这条命令的用途就是
+            // "我改了 speed / 加了个实体，重建一下看看"。
+            m_gameplay.attach(&m_ctx->activeScene());
+            m_gpScene = &m_ctx->activeScene();
+            const std::string s = m_gpPanel->rebuild();
+            VK_LOG_INFO("GP-REBUILD %s", s.c_str());
+            return s;
+        });
+    con->addCommand("gameplay.seed",
+        "gameplay.seed <n>  reseed the gameplay stream (0 is rejected)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_gpPanel) return "gameplay panel not ready";
+            if (args.size() < 2) return "usage: gameplay.seed <n>";
+            unsigned long long n =
+                std::strtoull(args[1].c_str(), nullptr, 10);
+            std::string err;
+            if (!m_gpPanel->setSeed(n, &err)) return err;
+            VK_LOG_INFO("GP-SEED seed=%llu", n);
+            return std::to_string(m_gameplay.seed());
+        });
+    con->addCommand("gameplay.roundtrip",
+        "gameplay.roundtrip  serialize the queue and parse it back",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_gpPanel) return "gameplay panel not ready";
+            gp();
+            const std::string s = m_gpPanel->roundTrip();
+            VK_LOG_INFO("GP-ROUNDTRIP %s", s.c_str());
+            return s;
+        });
+    con->addCommand("gameplay.addstatus",
+        "gameplay.addstatus <poison|shield|vuln>  add a preset to the selection",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_gpPanel) return "gameplay panel not ready";
+            if (args.size() < 2) return "usage: gameplay.addstatus <poison|shield|vuln>";
+            gp();
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            const std::string s = m_gpPanel->addPreset(e, args[1]);
+            VK_LOG_INFO("GP-ADDSTATUS which=%s %s", args[1].c_str(), s.c_str());
+            return s;
+        });
+    con->addCommand("gameplay.hit",
+        "gameplay.hit <amount> [type]  hit the selection with itself (detail log)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_gpPanel) return "gameplay panel not ready";
+            if (args.size() < 2) return "usage: gameplay.hit <amount> [type]";
+            gp();
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            const float amount = static_cast<float>(std::atof(args[1].c_str()));
+            const std::string type = args.size() >= 3 ? args[2] : std::string("physical");
+            const std::string s = m_gpPanel->hit(e, e, amount, type);
+            VK_LOG_INFO("GP-HIT amount=%.1f type=%s %s", static_cast<double>(amount),
+                        type.c_str(), s.c_str());
+            return s;
+        });
+    con->addCommand("gameplay.reset",
+        "gameplay.reset  restore default attributes and clear statuses",
+        [this](const std::vector<std::string>&) -> std::string {
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            ecs::World& w = m_ctx->activeScene().world();
+            ecs::GameplayComponent* c = w.get<ecs::GameplayComponent>(e);
+            if (!c) return "selection has no Gameplay component";
+            c->attributes = gameplay::defaultAttributes();
+            c->statuses.clear();
+            c->gauge = 0.0f;
+            gp().rebuildQueue();
+            VK_LOG_INFO("GP-RESET entity=%u attrs=%d", static_cast<unsigned>(e.id),
+                        static_cast<int>(c->attributes.size()));
+            return "reset";
+        });
+
+    // ---- 牌堆（P3-3）----
+    //
+    // 十四条，与 Cards 面板的按钮**一一对应**（面板上点得到的，命令里一定有）。
+    // 判据不需要点像素就能把整条卡牌流程走完，而"流程"恰恰是最容易出
+    // 静默错的地方（打出的牌没进 Limbo / 洗回没计数）。
+    //
+    // ⚠ 全部回显成 `GP-CARDS-CMD name=<动词> <明细>`：判据用一个正则就能
+    //   捞到任意一条，不用为每个动词写一条匹配规则。
+    con->addCommand("cards.state", "cards.state  show the selection's card piles",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->stateLine(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=state %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.detail", "cards.detail  list every card in every pile",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->detail(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=detail %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.ensure", "cards.ensure  attach an (empty) deck to the selection",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->ensure(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=ensure %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.defs", "cards.defs  load the preset card definitions",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->loadPresetDefs(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=defs %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.defstable",
+        "cards.defstable  load card definitions from assets/data/cards.csv",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->loadTableDefs(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=defstable %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.cast",
+        "cards.cast <handIndex>  play a card AND apply its effects (to self)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            if (args.size() < 2) return "usage: cards.cast <handIndex>";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->cast(e, std::atoi(args[1].c_str()));
+            VK_LOG_INFO("GP-CARDS-CMD name=cast %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.add", "cards.add <defId> [n]  put cards on top of the draw pile",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            if (args.size() < 2) return "usage: cards.add <defId> [n]";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const int n = args.size() >= 3 ? std::atoi(args[2].c_str()) : 1;
+            const std::string s = m_cardsPanel->addCards(e, args[1], n);
+            VK_LOG_INFO("GP-CARDS-CMD name=add %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.deck", "cards.deck  build the fixed test deck (5/4/1/1, unshuffled)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->buildTestDeck(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=deck %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.draw", "cards.draw <n>  draw n cards (gameplay stream)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            if (args.size() < 2) return "usage: cards.draw <n>";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->drawCards(e, std::atoi(args[1].c_str()));
+            VK_LOG_INFO("GP-CARDS-CMD name=draw %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.play", "cards.play <handIndex>  play a card by hand position",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            if (args.size() < 2) return "usage: cards.play <handIndex>";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->play(e, std::atoi(args[1].c_str()));
+            VK_LOG_INFO("GP-CARDS-CMD name=play %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.resolve", "cards.resolve  move the last played card out of Limbo",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->resolveLast(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=resolve %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.discardhand", "cards.discardhand  discard the whole hand",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->discardHand(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=discardhand %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.shuffle", "cards.shuffle  shuffle the draw pile (gameplay stream)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->shuffle(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=shuffle %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.sweep", "cards.sweep  settle every card left in Limbo",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->sweep(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=sweep %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.roundtrip", "cards.roundtrip  serialize the deck and parse it back",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->roundTrip(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=roundtrip %s", s.c_str());
+            return s;
+        });
+    con->addCommand("cards.reset", "cards.reset  clear every pile (keeps the component)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_cardsPanel) return "cards panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            gp();
+            const std::string s = m_cardsPanel->reset(e);
+            VK_LOG_INFO("GP-CARDS-CMD name=reset %s", s.c_str());
+            return s;
+        });
+
+    // ---- 导航（C8）----
+    // ⚠ 每条命令都走面板上的**同一个**方法（`NavPanel::bakeInto` /
+    //   `pathTest` / `attachAgent`）：按钮与命令分叉过一次，结果是"能点不能
+    //   脚本化"，自动化一条都验不到。
+    con->addCommand("nav.bake", "nav.bake  bake a nav grid from the current scene's physics",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_navPanel) return "nav panel not ready";
+            const std::string s =
+                m_navPanel->bakeInto(m_nav, [this](const nav::NavGridDesc& d, nav::NavSystem& sys) {
+                    return bakeNav(d, sys);
+                });
+            VK_LOG_INFO("GP-NAV-CMD name=bake %s", s.c_str());
+            return s;
+        });
+    con->addCommand("nav.clear", "nav.clear  drop the baked grid",
+        [this](const std::vector<std::string>&) -> std::string {
+            m_nav.clearGrid();
+            VK_LOG_INFO("GP-NAV-CMD name=clear grid=0");
+            return std::string("nav.clear grid=0");
+        });
+    con->addCommand("nav.state", "nav.state  grid size + agent counts",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_navPanel) return "nav panel not ready";
+            const std::string s = m_navPanel->stateLine(m_nav);
+            VK_LOG_INFO("GP-NAV-CMD name=state %s", s.c_str());
+            return s;
+        });
+    con->addCommand("nav.ascii", "nav.ascii  print the grid as ASCII (Y up)",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_navPanel) return "nav panel not ready";
+            const std::string s = m_navPanel->ascii(m_nav);
+            VK_LOG_INFO("GP-NAV-CMD name=ascii\n%s", s.c_str());
+            return s;
+        });
+    con->addCommand("nav.path", "nav.path <x1> <y1> <x2> <y2>  plan a path (no agent needed)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_navPanel) return "nav panel not ready";
+            if (args.size() < 5) return "usage: nav.path <x1> <y1> <x2> <y2>";
+            const glm::vec3 a(static_cast<float>(std::atof(args[1].c_str())),
+                              static_cast<float>(std::atof(args[2].c_str())), 0.0f);
+            const glm::vec3 b(static_cast<float>(std::atof(args[3].c_str())),
+                              static_cast<float>(std::atof(args[4].c_str())), 0.0f);
+            const std::string s = m_navPanel->pathTest(m_nav, a, b);
+            VK_LOG_INFO("GP-NAV-CMD name=path %s", s.c_str());
+            return s;
+        });
+    con->addCommand("nav.agent", "nav.agent [x y z]  attach an agent to the selection",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (!m_navPanel) return "nav panel not ready";
+            const ecs::Entity e = m_ctx->selection();
+            if (!e.valid()) return "no selection";
+            glm::vec3 goal(0.0f);
+            if (args.size() >= 4) {
+                goal = glm::vec3(static_cast<float>(std::atof(args[1].c_str())),
+                                 static_cast<float>(std::atof(args[2].c_str())),
+                                 static_cast<float>(std::atof(args[3].c_str())));
+            } else if (auto* tr = m_ctx->activeScene().world().get<ecs::TransformComponent>(e)) {
+                goal = tr->position;
+            }
+            const std::string s = m_navPanel->attachAgent(m_ctx->activeScene(), e, goal);
+            VK_LOG_INFO("GP-NAV-CMD name=agent %s", s.c_str());
+            return s;
+        });
+    con->addCommand("nav.stop", "nav.stop  clear the selection's goal",
+        [this](const std::vector<std::string>&) -> std::string {
+            if (!m_navPanel) return "nav panel not ready";
+            const std::string s = m_navPanel->stopAgent(m_ctx->activeScene(), m_nav,
+                                                       m_ctx->selection());
+            VK_LOG_INFO("GP-NAV-CMD name=stop %s", s.c_str());
+            return s;
+        });
+    // `nav.tick <n>` —— 编辑态**手动推进**代理。
+    // ⚠ 为什么需要它：编辑器不跑 Play 就没有主循环，代理永远不会动；
+    //   而"挂上代理之后它到底会不会走过去"是这一步唯一的验收方式。
+    con->addCommand("nav.save", "nav.save <assets/rel/path>  write the baked grid as an asset",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: nav.save <assets/rel/path>";
+            const std::string s = navGridIo(true, args[1], m_nav);
+            VK_LOG_INFO("GP-NAV-CMD name=save %s", s.c_str());
+            return s;
+        });
+    con->addCommand("nav.load", "nav.load <assets/rel/path>  load a baked grid asset",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: nav.load <assets/rel/path>";
+            const std::string s = navGridIo(false, args[1], m_nav);
+            VK_LOG_INFO("GP-NAV-CMD name=load %s", s.c_str());
+            return s;
+        });
+    con->addCommand("nav.tick", "nav.tick [n]  step agents n times (0.05 s each)",
+        [this](const std::vector<std::string>& args) -> std::string {
+            int n = 20;
+            if (args.size() >= 2) {
+                n = std::atoi(args[1].c_str());
+                if (n < 0) n = 0;
+                if (n > 4000) n = 4000;
+            }
+            int moved = 0;
+            for (int i = 0; i < n; ++i) moved = m_nav.tick(m_ctx->activeScene(), 0.05f);
+            const nav::NavSystem::Stats& st = m_nav.stats();
+            char buf[220];
+            // i18n-keep —— 纯日志锚点（回归脚本按字段名解析，翻成中文等于让脚本失联）
+            std::snprintf(buf, sizeof(buf),
+                          "nav.tick n=%d moving=%d agents=%d arrived=%d failed=%d expanded=%d",
+                          n, moved, st.agents, st.arrived, st.failed, st.expanded);
+            VK_LOG_INFO("GP-NAV-CMD name=tick %s", buf);
+            return std::string(buf);
+        });
+
+    // 打击感三件（P1-5）。**必须能单独触发**：顿帧 / 闪白 / 震屏的效果
+    // 都是"看起来很主观"的东西，靠 `fx.play` 间接触发的话，判据得先
+    // 相信 `.veffect` 里的字段被读对了 —— 那是另一件事（P1-1 已经单独验了）。
+    // 走 sink 而不是成员直写：与动画事件、脚本动词**同一条路**，
+    // 三处行为一致（取 max / 不累加 / 真实 dt）只在一个地方实现。
+    con->addCommand("fx.hitstop", "fx.hitstop <seconds>  trigger hit-stop",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: fx.hitstop <seconds>";
+            const float s = static_cast<float>(std::atof(args[1].c_str()));
+            if (!(s > 0.0f)) return "seconds must be > 0";
+            if (m_fx.sinks().hitstop) m_fx.sinks().hitstop(s);
+            return std::to_string(m_hitstopLeft);
+        });
+    con->addCommand("fx.flash", "fx.flash <strength> <seconds>  trigger a screen flash",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 3) return "usage: fx.flash <strength> <seconds>";
+            const float k = static_cast<float>(std::atof(args[1].c_str()));
+            const float s = static_cast<float>(std::atof(args[2].c_str()));
+            if (!(s > 0.0f)) return "seconds must be > 0";
+            if (m_fx.sinks().flash)
+                m_fx.sinks().flash(std::clamp(k, 0.0f, 1.0f),
+                                   glm::vec3(1.0f), s);
+            return std::to_string(m_flashLeft);
+        });
+    con->addCommand("fx.shake", "fx.shake <trauma>  shake the active camera",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: fx.shake <trauma>";
+            const float t = static_cast<float>(std::atof(args[1].c_str()));
+            if (!(t > 0.0f)) return "trauma must be > 0";
+            if (m_fx.sinks().shake)
+                m_fx.sinks().shake(std::clamp(t, 0.0f, 1.0f),
+                                   glm::vec3(0.0f, 0.0f, 0.0f), 12.0f);
+            VK_LOG_INFO("FX-SHAKE trauma=%.3f", static_cast<double>(t));
+            return std::to_string(t);
+        });
+
+    con->addCommand("level.load",
+        "level.load <name>  additively load one level",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: level.load <name>";
+            applyLevelAction("load", args[1]);
+            return std::to_string(m_levels.stats().loaded);
+        });
+    con->addCommand("level.unload",
+        "level.unload <name>  destroy the entities that level brought in",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: level.unload <name>";
+            applyLevelAction("unload", args[1]);
+            return std::to_string(m_levels.stats().loaded);
+        });
+    con->addCommand("level.unloadall",
+        "level.unloadall  unload every level",
+        [this](const std::vector<std::string>&) -> std::string {
+            applyLevelAction("unloadall", std::string());
+            return std::to_string(m_levels.stats().loaded);
+        });
+    // 模拟一次流送判定（不起 Play 也能验"进盒加载 / 出盒卸载"）。
+    // ⚠ 走的是 `m_levels.update()` 本体，不是"按坐标直接 load" —— 后者
+    //   能过判据却证明不了距离/滞回那段逻辑。
+    con->addCommand("level.stream",
+        "level.stream <x> <y> <z>  run one streaming pass at a viewer position",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 4) return "usage: level.stream <x> <y> <z>";
+            const glm::vec3 v(std::strtof(args[1].c_str(), nullptr),
+                              std::strtof(args[2].c_str(), nullptr),
+                              std::strtof(args[3].c_str(), nullptr));
+            const auto st = m_levels.update(m_ctx->runtimeScene(),
+                                            m_ctx->assets(), v);
+            VK_LOG_INFO("LEVEL-STREAM viewer=%.1f,%.1f,%.1f loaded=%d wanted=%d "
+                        "+%d -%d entities=%d",
+                        v.x, v.y, v.z, st.loaded, st.wanted, st.loadRequests,
+                        st.unloadRequests, st.entities);
+            return std::to_string(st.loaded);
+        });
+
+    // ---- 混音台（A2，2026-11-02）----
+    //
+    // ⚠ `audio.gain` 走的是 **`applyAudioKnob`**，与混音台的推子同一条路
+    //   （同 `pv.add` 与 New volume 按钮的关系）。分开写两套的后果是
+    //   "命令能改、推子改不动"，而判据只覆盖其中一条。
+    con->addCommand("audio.gain",
+        "audio.gain <master|music|sfx|voice|duck> <0..1>  set a mixer knob",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 3) return "usage: audio.gain <knob> <0..1>";
+            editor::AudioKnob knob = editor::AudioKnob::None;
+            for (int i = 1; i <= editor::kAudioKnobCount; ++i) {
+                const auto k = static_cast<editor::AudioKnob>(i);
+                if (args[1] == editor::audioKnobName(k)) {
+                    knob = k;
+                    break;
+                }
+            }
+            if (knob == editor::AudioKnob::None) {
+                // 与 `audio.bus` 同一条纪律：认不出必须留痕
+                VK_LOG_WARN("AUDIO-CMD gain=unknown knob=%s", args[1].c_str());
+                return "unknown knob: " + args[1];
+            }
+            const float v = static_cast<float>(std::atof(args[2].c_str()));
+            applyAudioKnob(knob, v);
+            VK_LOG_INFO("AUDIO-CMD knob=%s value=%.3f", args[1].c_str(),
+                        static_cast<double>(v));
+            return std::string(editor::audioKnobName(knob)) + "=" + args[2];
+        });
+    con->addCommand("audio.mute",
+        "audio.mute <0|1>  mute / unmute every bus",
+        [this](const std::vector<std::string>& args) -> std::string {
+            if (args.size() < 2) return "usage: audio.mute <0|1>";
+            const bool on = args[1] != "0";
+            applyAudioKnob(editor::AudioKnob::Mute, on ? 1.0f : 0.0f);
+            VK_LOG_INFO("AUDIO-CMD knob=mute value=%d", on ? 1 : 0);
+            return on ? "muted" : "unmuted";
+        });
+    // 混音器**当前真值**的一行快照。
+    //
+    // ⚠ 这条命令存在的唯一理由是**判据要能读回末态**：只有
+    //   `AUDIO-CMD knob=music value=0.30` 的话，"参数收到了但没落到
+    //   AudioSystem"与"真的改了"在日志里长得一模一样。
+    //   而且它读的是 `busGain()` —— 与混音台推子同一个访问器，
+    //   所以"推子拖不动"（读 settings() 的出厂值）会被这条直接抓出来。
+    con->addCommand("audio.state",
+        "audio.state  print the live mixer state (readback anchor)",
+        [this](const std::vector<std::string>&) -> std::string {
+            char buf[256];
+            // 这是**日志锚点**（`key=value` 连写），屏幕上根本看不到；翻成
+            // 中文等于让回归脚本按字段名解析的那一条同时失联。
+            // i18n-keep
+            std::snprintf(buf, sizeof(buf),
+                          "master=%.3f music=%.3f sfx=%.3f voice=%.3f "
+                          "duck=%.3f mute=%d running=%d",
+                          static_cast<double>(
+                              m_audio.busGain(audio::BusId::Master)),
+                          static_cast<double>(
+                              m_audio.busGain(audio::BusId::Music)),
+                          static_cast<double>(m_audio.busGain(audio::BusId::SFX)),
+                          static_cast<double>(
+                              m_audio.busGain(audio::BusId::Voice)),
+                          static_cast<double>(m_audio.settings().duckDepth),
+                          m_audio.muted() ? 1 : 0, m_audio.running() ? 1 : 0);
+            VK_LOG_INFO("AUDIO-STATE %s", buf);
+            return buf;
+        });
+    // 为什么需要这条命令：混音台面板要等 UI 起来才看得到，而"这一声到底
+    // 挂在哪条总线、是不是 3D"是无窗口自动化唯一能问出来的东西。
+    con->addCommand("audio.sources",
+        "audio.sources  list the scene audio sources fed to the mixer",
+        [this](const std::vector<std::string>&) -> std::string {
+            VK_LOG_INFO("AUDIO-SOURCES n=%d playing=%d",
+                        static_cast<int>(m_audioSrcs.size()),
+                        m_ctx->isPlaying() ? 1 : 0);
+            for (int i = 0; i < static_cast<int>(m_audioSrcs.size()); ++i) {
+                const audio::SourceUpdate& s = m_audioSrcs[static_cast<size_t>(i)];
+                VK_LOG_INFO("AUDIO-SOURCES i=%d clip=%s bus=%d vol=%.2f 3d=%d "
+                            "loop=%d playing=%d",
+                            i, s.clip.c_str(), s.bus,
+                            static_cast<double>(s.volume), s.spatial ? 1 : 0,
+                            s.loop ? 1 : 0, s.playing ? 1 : 0);
+            }
+            return "sources=" + std::to_string(m_audioSrcs.size());
         });
 
     // ---- U2：游戏 UI 的"Hello World" ----

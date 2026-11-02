@@ -1,4 +1,5 @@
 #include "core/Application.h"
+#include "core/CpuProfiler.h"
 #include "core/Input.h"
 #include "core/Logger.h"
 #include "assets/AssetManager.h"
@@ -94,8 +95,21 @@ int Application::run(uint64_t maxFrames) {
 
     // ================= 主循环 =================
     while (!m_window->shouldClose()) {
-        m_window->pollEvents();
-        m_time.update();
+        // CPU 分段计时的帧边界（见 core/CpuProfiler.h）。
+        // ⚠ 位置：`shouldClose()` 之后、`pollEvents()` 之前。
+        //   放在 pollEvents 之后的话，"等 vsync 醒过来"那段会被记进
+        //   `kEvents` —— 而那恰恰是"CPU 空闲"最该被单独看见的一段。
+        core::CpuProfiler::get().beginFrame();
+        VK_CPU_SCOPE(core::CpuProfiler::kFrame);
+        // 诊断（MYVK_CPU_STATS=1）：每 30 帧一行，与 GPU-TIMING / CULL-STATS
+        // 同频同格式（key=value），验证脚本直接正则截取。
+        // ⚠ 这一行必须在 kFrame 的**作用域之外**打不出去，所以放到帧末
+        //   （见循环体最后那段）—— 那里读到的 kFrame 是**上一帧**的值。
+        {
+            VK_CPU_SCOPE(core::CpuProfiler::kEvents);
+            m_window->pollEvents();
+            m_time.update();
+        }
 
         // 最小化：等待事件，跳过渲染
         if (m_window->iconified()) {
@@ -104,18 +118,26 @@ int Application::run(uint64_t maxFrames) {
         }
 
         // ImGui 新帧 + 输入捕获状态同步
-        m_renderer->ui().beginFrame();
+        {
+            // `beginFrame()` 会构建整棵 UI 树的状态机（含 ini 读取），
+            // 与下面 onImGui 的"填内容"同属 UI 一段 —— 两处都打 kUi，
+            // CpuProfiler 的累加会合并它们（这也是它按累加而不是按
+            // 单次赋值实现的原因）。
+            VK_CPU_SCOPE(core::CpuProfiler::kUi);
+            m_renderer->ui().beginFrame();
+        }
         Input::setUiCapturing(m_renderer->ui().wantCaptureMouse(),
                               m_renderer->ui().wantCaptureKeyboard());
 
-        // 场景逻辑更新（相机 + 对象动画）
-        activeScene().update(m_time.deltaTime());
-
-        // LOD 层级惰性生成：只给"当前场景里实际用到、且还没建链"的网格
-        // 建一次。放在这里而不是网格创建时，是为了不给内容浏览器里预览
-        // 一下就丢掉的临时网格白造几份 GPU 缓冲；ensureLod 幂等，反复调
-        // 的代价只是一次哈希查找。
         {
+            // 场景逻辑更新（相机 + 对象动画）+ LOD 惰性生成，同属"场景"一段。
+            VK_CPU_SCOPE(core::CpuProfiler::kScene);
+            activeScene().update(m_time.deltaTime());
+
+            // LOD 层级惰性生成：只给"当前场景里实际用到、且还没建链"的网格
+            // 建一次。放在这里而不是网格创建时，是为了不给内容浏览器里预览
+            // 一下就丢掉的临时网格白造几份 GPU 缓冲；ensureLod 幂等，反复调
+            // 的代价只是一次哈希查找。
             scene::Scene& s = activeScene();
             s.forEachRenderable([this](ecs::Entity, ecs::MeshComponent& mc,
                                        ecs::MaterialComponent&) {
@@ -124,22 +146,45 @@ int Application::run(uint64_t maxFrames) {
         }
 
         // 游戏逻辑更新
-        onUpdate(m_time.deltaTime());
+        //
+        // ⚠ 分段打点**故意分两条路**：运行时（ownsFrameRendering()）的
+        //   `onUpdate` 是**整个 GameLoop::tick**（固定步 + 变量步 + 渲染），
+        //   在外面套一层 kLogic 会把渲染那一段也算进"逻辑"，堆叠条于是
+        //   重复计数、两段加起来超过 100%。所以那种情况由 GameLoop 的
+        //   回调自己打（见 RuntimeApp::onUpdate 里的两次 VK_CPU_SCOPE）。
+        if (!ownsFrameRendering()) {
+            VK_CPU_SCOPE(core::CpuProfiler::kLogic);
+            onUpdate(m_time.deltaTime());
+        } else {
+            onUpdate(m_time.deltaTime());
+        }
 
         // 游戏层 ImGui UI
         // MYVK_HIDE_UI=1：完全跳过 UI 绘制 —— 截图对比时任何随帧变化的
         // 文字（FPS 等）都会破坏"逐像素一致"的前提，UI 必须消失。
-        if (!hideUi) onImGui();
+        if (!hideUi) {
+            VK_CPU_SCOPE(core::CpuProfiler::kUi);
+            onImGui();
+        }
 
         // 纹理流驱动：流式中的 DDS 每帧补一个 mip 层（无流式纹理时
         // 零开销）。放在渲染提交前 —— 补传的层同帧即可被采样。
-        if (m_assets) m_assets->tickTextureStreaming();
+        if (m_assets) {
+            // ⚠ 单独一段而不是并进 kScene：它做的是"每帧补一个 mip 层"的
+            //   资产管理活，与场景遍历无关；并进去之后"载入大贴图时掉帧"
+            //   会被读成"场景更新变慢了"。
+            VK_CPU_SCOPE(core::CpuProfiler::kAssets);
+            m_assets->tickTextureStreaming();
+        }
 
         // 渲染一帧
         // ⚠ 默认由这里画；运行时（ownsFrameRendering()==true）自己在
         //   GameLoop 的 render 相位里画（见 Application.h 的说明）。
         //   两种情况都是**每帧恰好一次**。
-        if (!ownsFrameRendering()) m_renderer->drawFrame(activeScene());
+        if (!ownsFrameRendering()) {
+            VK_CPU_SCOPE(core::CpuProfiler::kRender);
+            m_renderer->drawFrame(activeScene());
+        }
 
         // ---- 首帧已呈现 → 决定要不要让窗口露面（见上面那段注释）----
         // 顺序：要缓冲就**必须**等满 kStartupShowDelay（哪怕在自动化跑里，
@@ -156,6 +201,37 @@ int Application::run(uint64_t maxFrames) {
 
         // 帧末：按键边沿状态推移
         Input::endFrame();
+
+        // ---- CPU 分段诊断行（MYVK_CPU_STATS=1，每 30 帧一条）----
+        // 位置：帧末。读的是 CpuProfiler 的**历史**（= 上一帧的完整值），
+        // 因为本帧的 kFrame 作用域要到循环体末尾才析构 —— 在这里读 m_cur
+        // 会漏掉"帧末到读完"那一小段（也包括这一行本身的格式化时间）。
+        // 预热 32 帧再打：前几帧历史环是空的，全 0 的行会把"没接上"与
+        // "第一帧"混为一谈。
+        {
+            static const bool cpuStatsDbg = std::getenv("MYVK_CPU_STATS") != nullptr;
+            static uint32_t cpuTick = 0;
+            if (cpuStatsDbg && frameCounter >= 32 && (cpuTick++ % 30) == 0) {
+                const core::CpuProfiler& p = core::CpuProfiler::get();
+                VK_LOG_INFO(
+                    "CPU-STATS frame=%.2f events=%.2f scene=%.2f logic=%.2f "
+                    "ui=%.2f assets=%.2f render=%.2f wait=%.2f sync=%.2f "
+                    "record=%.2f submit=%.2f present=%.2f",
+                    static_cast<double>(p.lastMs(core::CpuProfiler::kFrame)),
+                    static_cast<double>(p.lastMs(core::CpuProfiler::kEvents)),
+                    static_cast<double>(p.lastMs(core::CpuProfiler::kScene)),
+                    static_cast<double>(p.lastMs(core::CpuProfiler::kLogic)),
+                    static_cast<double>(p.lastMs(core::CpuProfiler::kUi)),
+                    static_cast<double>(p.lastMs(core::CpuProfiler::kAssets)),
+                    static_cast<double>(p.lastMs(core::CpuProfiler::kRender)),
+                    static_cast<double>(
+                        p.lastMs(core::CpuProfiler::kRenderWait)),
+                    static_cast<double>(p.lastMs(core::CpuProfiler::kSceneSync)),
+                    static_cast<double>(p.lastMs(core::CpuProfiler::kRecord)),
+                    static_cast<double>(p.lastMs(core::CpuProfiler::kSubmit)),
+                    static_cast<double>(p.lastMs(core::CpuProfiler::kPresent)));
+            }
+        }
 
         ++frameCounter;
         if (maxFrames > 0 && frameCounter >= maxFrames) {

@@ -7,6 +7,60 @@
 > **2026-11-01 更新**：第一档"收口闭环"三件（C3 存档 / E28 打包 / B6 表情）**已全部完成**。
 > 下方 §0 与 §2 的相关行已就地改成现状，~~删除线~~ 表示该条已结。
 >
+> **2026-11-03 更新**：另开了一条**不在本文 40 项里**的线 ——
+> 「玩法类型 × 打击特效」的能力评估（`docs/gameplay_fx_readiness.md`）分了三期：
+> - **P1 打击链闭环 ✅** —— `.veffect` 资产 / 宿主池 / 动画事件路由 / 打击感五旋钮 /
+>   6 个脚本动词 / `Effects` 面板。判据 `verify_fx` **52 条**（权威 → `docs/fx_system.md`）。
+> - **P2 玩法数值与回合调度 ✅** —— 属性求值 / 状态三规则 / 伤害五步明细 / PCG32 三流 /
+>   行动条（CTB）/ 存档往返 / 4 个脚本动词 / Inspector 第 14 页签 + `Debug ▸ Gameplay`。
+>   判据 `--selftest gameplay` **191 条** + `verify_gameplay` **A~F**（权威 → `docs/gameplay_stats.md`）。
+> - **P3-3 牌堆 ✅** —— 五区（抽牌/手牌/弃牌/消耗/**结算区 Limbo**）/ uid 身份 /
+>   自动洗回 + 计数 / 手牌上限不烧牌 / 存档含 Limbo / `Debug ▸ Cards` 面板 +
+>   14 条 `cards.*` 命令 + Inspector 第 ⑤ 段。判据 `verify_cards` **A~E 33 条** +
+>   自检 M 组 **80 条**（权威 → `docs/cards.md`）。
+> - **P3-1 配表进运行时 ✅**（2026-11-04）—— `assets/data/cards.csv` →
+>   `core::CsvTable` → `gameplay::cardsFromCsv()` → `GameplayRuntime::setCardDefs()`
+>   → 场景里每个 `CardDeckComponent`。脚本四动词 `tableNum/tableStr/tableHas/tableRows`
+>   （键 `"表.行.列"`）。出包两道闸门：`sopt.alwaysInclude` 加 `"data/"`、
+>   `kEngineAssetDirs[]` 加 `"assets/data"`。判据 `--selftest gameplay` N 组 **19 条**
+>   + `verify_cards` **F 组 17 条**（权威 → `docs/cards.md` §十）。
+>   ⚠ **定义是"内容"、不进存档**：读档/换场景必须重新灌定义，漏了每张牌 `known=0`
+>   ——打出去什么都不发生，日志一行错都没有。
+> - **游戏类型 4 种 ✅**（2026-11-04）—— 用户："游戏类型的设置应该是在启动器创建游戏
+>   的时候去设置的"。启动器向导第 1 步扩到 `first_person / third_person / isometric /
+>   card_battler` 2×2 四张卡，配两个新模板（8×8 棋盘 / 牌桌）。判据 `--selftest project`
+>   K33 16 条 + `verify_launcher_create` **四种类型各跑一整轮**（权威 →
+>   `docs/launcher_roadmap.md` §13）。
+> - **P3-2 `ui2` 变换 / Scroll / Grid / 拖放 ✅**（2026-11-04）—— `Ui2Prim::RoundBoxRotated`
+>   + `Ui2Xform` 三条状态栈（变换/透明度/裁剪走 scissor run）、`Scroll`/`Grid` 两个容器、
+>   `dragTag`/`dropAccept` + 合法目标高亮（判据只有 `dropAccepts()` 一处）。
+>   判据 UI2 自检 **132 条**（+23）+ `verify_ui_editor --only i` **10 条**（全量 56）
+>   （权威 → `docs/ui_hud_roadmap.md` §17）。
+> - **P3-4 伤害数字层 + 卡牌表现模板 ✅**（2026-11-04）—— `gameplay/DamageNumberLayer`
+>   （池 + 合并 `37 x3` + 五种样式 + 确定性漂移，独立于 `UiDocument`）+ `gameplay/CardFx`
+>   默认表 + 三个 `.veffect` + 两个新脚本动词 `castCard/drawCards`。判据
+>   `--selftest gameplay` **243 条**（O 26 / P 7）、`--selftest script` 99、
+>   `verify_cards` **G 组**（权威 → `docs/cards.md` §十一）。
+> - **P3 全清 🎉** —— 卡牌专供四项（P3-1 配表 / P3-2 变换拖放 / P3-3 牌堆 /
+>   P3-4 表现层）全部落地。**下一个大缺口 = §2 那两条硬缺口（流送 / 导航 AI）**
+>   —— 注意 E30（Shipping 剔除）/ D1（语音）**早已结清**（见 §2 对应行），
+>   别把它们当待办再排一遍。
+>
+> **2026-11-05 更新：§0 说的"2 项硬缺口"已经全部结清，本文现在没有 XL 级欠账。**
+> - **G19 关卡流送 ✅**（2026-11-02，早于本日）—— `scene/LevelManifest.*` +
+>   `scene/LevelStreamer.*`（`setManifest` / `attach` / `detach` / 距离驱动 /
+>   卸载预算）+ 场景 `levels` 块 + `Streaming` 面板。权威 → `docs/level_streaming.md`。
+> - **C8 导航 / 寻路 / AI ✅**（2026-11-05，本轮）—— `engine/nav/` 六个文件
+>   （`NavGrid` 格子网 + `NavBake` 射线烘焙 + `NavSystem` 代理调度 + `NavSerialize`
+>   `.vnav.json` + `NavSelfTest`）+ `NavAgentComponent` + `editor/NavPanel` +
+>   九条 `nav.*` 命令 + 运行时 `setupNav/tickNav`。
+>   判据 `--selftest nav` **94 条** + `tools/verify_nav.py` **66 条**
+>   + `--selftest script` **C22 组 5 条**（脚本四动词）
+>   （权威 → `docs/navigation.md`）。
+> - 因此 §0 的"2 项硬缺口"、§2.3 的 C8 行、§2.6 的 G19 行、§6.1 的 #21、
+>   §6.3 的 G19 依赖锁、附录 grep 表都已就地改成现状。**剩下的是打磨型能力
+>   （A7/A8/B4/B5/B7/B8/B9/C2 残留/C5/C7/D2/D3/E27/W5/W7）。**
+>
 > **核对方式**：全仓 grep + 三段工具实跑（`check_feature_surface` /
 > `verify_i18n_coverage` / `verify_viewport`）+ 逐份路线图状态表。**未跑全量回归**
 > （项目纪律：只有明确下令才 `--all`）。
@@ -21,10 +75,11 @@
 
 ## 0 · 一句话
 
-**"存得住、发得出"两件已经补上了，"跑得动"（性能）还欠着。**
+**"存得住、发得出、跑得起来一点了"——"跑得动"（性能）还欠着。**
 
 具体到数字（下面每条都有出处）：**约 40 项**待办，其中
-**2 项是硬缺口**（流送 / 导航 AI；~~存档~~、~~打包~~、~~GUID~~、~~Release 基线~~ 已于 10-27 ~ 11-01 结清），
+**0 项是硬缺口**（~~流送~~、~~导航 AI~~、~~存档~~、~~打包~~、~~GUID~~、~~Release 基线~~
+已于 10-27 ~ 11-05 结清 —— 流送 11-02、导航 11-05），
 **9 项是性能与工程健康**，**7 项是验收与文档债**，
 其余 21 项是"打磨型"能力（表情残留 D2 音素级、脚 IK、光照图、RenderGraph…）。
 
@@ -79,10 +134,10 @@ engine/ecs/Components.h`）、**37 个已注册特性**（`check_feature_surface
 
 | # | 项 | 现状 / 依据 | 后果 |
 |---|---|---|---|
-| **C3** | **存档系统** | **0**。`engine/scene/SaveGame.*` 不存在；场景 `version` **只写不读**（`SceneSerializer.cpp`） | **一切游戏性都是一次性的**。这是当前最大的单点缺口 |
+| ~~**C3**~~ | ~~**存档系统**~~ | ✅ **已做（2026-10-31 ~ 11-01，G17-1~3）**：`engine/scene/SaveGame.*` + `SaveSlots` 槽位面板 + H2 自动保存 + 场景 `version` 校验（在读入**之前**）。判据 `--selftest save` **101 条** + `verify_save_slots` 31 条 | 已可存读；**G17-4 用例补组仍在**（见 §2.6） |
 | C5 | 实体关键帧在 Game.exe 里"活起来" | `autoplay` 字段有并落盘（`Components.h:586` / `SceneSerializer.cpp:2157`），但**运行时无消费者** | 门 / 电梯 / 机关在游戏里全是死的 |
 | C7 | 剧情旗标 → 任务 | `setFlag/getFlag` 内建已有（#309，`verify_world_api` ⑤ 证明跨场景保留），但**无编辑器面板、无任务系统、对话选项改不了 flag** | 分支剧情只能"演一次"，玩家选的不算数 |
-| C8 | NPC / 寻路 / AI | 0（`NavMesh` 全仓 0 命中） | 街上走动的 NPC、巡逻、靠近触发对话 —— 二次元最低档的"活世界"做不到 |
+| ~~C8~~ | ~~NPC / 寻路 / AI~~ | ✅ **已做（2026-11-05）**：`engine/nav/` 五件（`NavGrid` 格子网 + `NavBake` 射线烘焙 + `NavSystem` 代理调度 + `NavSerialize` `.vnav.json` + `NavSelfTest`）+ `NavAgentComponent` + `nav/Navigation` 面板 + 九条 `nav.*` 命令 + 运行时 `setupNav/tickNav` + **脚本四动词**（`navGoto/navArrived/navFailed/navStop`）。判据 `--selftest nav` **94 条** + `tools/verify_nav.py` **66 条** + `--selftest script` C22 5 条（权威 → `docs/navigation.md`） | 街上走动的 NPC / 巡逻 / 追玩家**已可**（局部避障与动态障碍仍未做，见 `navigation.md` §十） |
 | C2 残留 | 对话的六件 | 见 `docs/dialogue.md` §9：立绘 / 表情 / 语音 / 条件分支 / 历史回看 / 编辑器内预览 全 ✗ | 现在能做"有字幕的线性对话"，做不了 AVG 的"立绘 + 表情 + 语音"三件套 |
 
 > C1 的残留较小：实体/特效轨道、视口内拖关键帧、贝塞尔曲线（`cutscene_sequencer.md` §8）。
@@ -116,7 +171,7 @@ engine/ecs/Components.h`）、**37 个已注册特性**（`check_feature_surface
 |---|---|---|---|
 | **G16** | 稳定 GUID | **✅ 已完成 1~5（10-27）**：`World::Record.guid` + `m_byGuid` + 场景 `guid`/`parentGuid`/`v2` + `Scene::reconnectByGuidOrName` + **G16-5 三段拆分**（`SceneDocument` / `parseSceneDocument` / `instantiateDocument` / `resolveDocumentAssets`）。自检 26 条 + 39 条 + 端到端 8 组 + 14 组全绿 | **G17/G18/G19 的共同前置** —— 已解锁 |
 | **G17** | 存档（增量 + 槽位 + 迁移 + 原子写） | **◑ G17-1~3 完成（10-27 / 10-31）**：文件层（格式 / 原子写 / v1→v2 迁移）＋**应用层**（基线哈希 / 增量 diff / `applySaveGame` / 悬挂父修正 / 漂移拒读）。自检 **101 条** + 端到端 **31 项**全绿。G17-3（槽位 + CLI + `captureBaseline` + F5/F9 + **存档槽位面板**）**10-31 全部落**；剩 G17-4（用例补组） | 与 C3 同一件事。**G17-3 是下一个能直接开工的点** —— `--save/--load/--slot` 一接上，C3 就从「库」变成「玩家能按的功能」 |
-| G19 | 关卡流送 | 0（`LevelStreaming` / `LevelManifest` 0 命中） | 只能"一次加载整个世界"；大关卡内存与加载时间线性涨 |
+| ~~G19~~ | ~~关卡流送~~ | ✅ **已做（2026-11-02）**：`scene/LevelManifest.*` + `scene/LevelStreamer.*`（距离驱动挂载/卸载 + 每帧卸载预算）+ 场景 `levels` 块 + `Streaming` 面板。判据 `tools/verify_levels.py`（31 条内核 + 6 组界面）（权威 → `docs/level_streaming.md`） | 大关卡可分段加载；**跨段导航网格尚未拼接**（每段各烘各的，见 `navigation.md` §十） |
 
 ### 2.7 编辑器与工具链（6 项）
 
@@ -456,7 +511,7 @@ A4 6.2% 绿 / 20.3% 红；A5 持平绿 / 4-vs-12 红。
 ### 第三档 · 能力打磨（有真实资产之后再谈）
 
 8. A8（NPR×CSM 台阶）→ A7（描边遮罩）→ B4（脚 IK）→ B5（弹簧骨碰撞）
-9. C8（NavMesh + 巡逻）· W5（植被）· W7（动态天空）
+9. C8（NavMesh + 巡逻）· W5（植被）· W7（动态天空）  ← **C8 已于 11-05 结清（格子导航）**
 10. E22 残留（对齐/分布）· 立绘系统 · UI 控件扩充
 
 ### 6.1 可执行排名（1~21）
@@ -493,7 +548,7 @@ A4 6.2% 绿 / 20.3% 红；A5 持平绿 / 4-vs-12 红。
 | 18 | **B5 弹簧骨碰撞** | M | 头发穿肩、裙摆穿胸，**近景必穿帮** | 真实角色资产 → 特写可用 |
 | 19 | **W7 动态天空（Hillaire + 昼夜）** | L | 二次元的"黄昏/清晨氛围镜头"全靠它 | — → 氛围演出 |
 | 20 | **A8 NPR×CSM 的 PCF 台阶** | M | A 组**唯一已知缺陷**，脸上 ~8 px 锯齿，现有夹具能复现 —— "想再挖一刀就挖它" | 真实角色资产 → 脸部干净 |
-| 21 | **C8 NavMesh + 巡逻** | XL | "活世界"最低档（走动 NPC / 靠近触发对话）。**成本最高、收益最远**，所以排最后而不是不做 | #2 → NPC / 战斗 AI |
+| ~~21~~ | ~~**C8 NavMesh + 巡逻**~~ | ~~XL~~ | ✅ **2026-11-05 结清**（格子导航，不是 NavMesh）。成本确实最高，但收益兑现了：`engine/nav/` 五件 + 面板 + 九条命令 + 脚本四动词 + 94/66/5 条判据 | 已完成 → 后续只挂"局部避障 / 动态障碍"（`navigation.md` §十） |
 
 ### 6.2 波次建议（三波 + 两条并行轨）
 
@@ -512,7 +567,7 @@ A4 6.2% 绿 / 20.3% 红；A5 持平绿 / 4-vs-12 红。
 |---|---|---|
 | **E27 RenderGraph 可视化** | R7-1 | 依赖链最末端；**R7-1 本身也先不做**（工程性收益、不可感知） |
 | **E29 烘焙 UI** | R5-2（光照图那半） | 反射探针那半已可用 |
-| **G19 关卡流送** | #2（存档格式定稿） | 格式定稿前做流送 = 搬家搬一半 |
+| ~~**G19 关卡流送**~~ | ~~#2（存档格式定稿）~~ | ✅ **2026-11-02 结清** —— 存档格式 11-01 定稿后按期解锁 |
 | **R7-2 细粒度同步 / 异步 compute** | R7-1 | — |
 | **D2 口型同步（音素级）** | 音轨对齐 / viseme 表 | 包络级已随 B6 落地（`AudioSystem::voiceLevel()` → `tickExpressions`） |
 | **B7 混合树进阶** | 真实角色资产 + 动作素材 | 线性 Demo 只有 crossfade 就够 |
@@ -549,12 +604,12 @@ check_regression_map.py      → 结果: PASS
 
 | 关键词 | 命中 | 含义 |
 |---|---|---|
-| `NavMesh` / `DataTable` / `.csv` | 0 / 0 / 0 | 无寻路、无配表 |
-| `SaveGame` / `EntityGuid` | 0 / 0 | 无存档、无 GUID（`guid` 10 处命中全是 prefab `localId` 的注释词） |
+| `NavMesh` / `DataTable` / `.csv` | 0 / ~~0~~ / ~~0~~ | 无三角网 NavMesh（**已用格子法替代**，见 `navigation.md`）；配表 ✅ 11-04 落地 |
+| `SaveGame` / `EntityGuid` | ~~0~~ / ~~0~~ | ✅ 两者均已落地（`scene/SaveGame.*` 10-31；`World::Record.guid` 10-27） |
 | `lightmap` / `Reverb` | 0 / 0 | 无光照图、无混响 |
 | `ExpressionPreset` | ~~0~~ → **有** | ✅ 2026-11-01 落地（`engine/animation/ExpressionPreset.*` + `ExpressionDriver.*`），判据 `verify_expression` 41 条 |
 | `BlendTree` / `footIk` | 0 / 0 | 无混合树、无脚 IK |
-| `LevelStreaming` / `LevelManifest` | 0 | 无流送 |
+| `LevelStreaming` / `LevelManifest` | ~~0~~ → **30+** | ✅ 2026-11-02 落地（`scene/LevelStreamer.*`），判据 `verify_levels` 31 条 |
 | `openUI` | ~~0~~ → **5** | ~~7 个导演 API 里唯一缺的~~ → **✅ 2026-10-31 落地**，7/7 齐 |
 | `playSequence` / `showDialogue` / `playAnim` | 6~7 | 已实现（#307/#309） |
 

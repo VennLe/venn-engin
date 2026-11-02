@@ -254,7 +254,18 @@ run("editor/InspectorPanel.cpp → 面板块全家族", OLD,
           # （`INS-JOINT-HEADER/ADD/ENABLED/KIND/TARGET/LIMIT/MOTOR` 七个锚点）。
           # 它是**作者侧唯一**能配关节的地方 —— verify_joints 的 D 组验的就是
           # 这段画出来没有、以及"没有关节时是 Add、有了之后才是字段"这个分叉。
-          "verify_joints"})
+          "verify_joints",
+          # 2026-11-03（P2）：第 13 个页签 `Gameplay`
+          # （`INS-GP-HEADER/STATS/ATTRS/STATUSES/PRESET-*` + `INS-GP-DMGPREV`）。
+          # 它是**作者侧唯一**能改属性白值、加状态、看伤害五步明细的地方 ——
+          # verify_gameplay 的 C 组验的就是"这一页画出来了，而且读到的数
+          # 真是 100/97/100"（少挂一条状态修正器会得到 100，钉得住）。
+          "verify_gameplay",
+          # 2026-11-03（P3-3）：Gameplay 页签里加了第 ⑤ 段 `Cards`
+          # （`INS-CARD-ADD/STATS/HAND/DISCARD/DEFS`）。它是作者侧看"这个实体
+          # 的牌堆现在有什么"的唯一地方 —— verify_cards 的 C 组验的就是
+          # "这一行画出来了，而且读到的数是 draw=11 hand=2"。
+          "verify_cards"})
 # 2026-10-28（#317）：分栏 → 视口几何。
 # `editor/SplitLayout.*` 管的是"左栏多宽"，而视口的左右边界就是它算出来的：
 #   · verify_viewport      —— CONVERGED_VP / V1d2 / V3 骨架全跟着分栏走；
@@ -374,6 +385,15 @@ run("engine/animation/AnimEvent.cpp → 事件边界", OLD,
 #   `verify_*` 的 SceneSerializer 登记），拿它当输入只会得到一大片无关名字。
 run("engine/scene/Prefab.cpp → 预制体", OLD,
     with_change("engine/scene/Prefab.cpp"), want={"verify_prefab"})
+# 2026-11-02（P1）：特效调度的三个新模块
+# （`engine/fx/EffectAsset|EffectService|AnimEventRouter`）。
+# 期望是**恰好一条** —— 这一层只有 verify_fx 一条端到端用例，数值侧
+# （17+12+11 条 `FX-*`）住在各自的 `runXxxSelfTest()` 里，跑
+# `--selftest project` 才执行。`verify_particles` 那条**不能**替代它：
+# 它看的是"一个发射器画得对不对"，这里看的是"占了几个槽、丢了几次"。
+run("engine/fx/AnimEventRouter.cpp → 特效调度", OLD,
+    with_change("engine/fx/AnimEventRouter.cpp"),
+    want={"verify_fx"})
 # 2026-10-26（C1）：过场时间轴的解析 / 采样 / 播放器本体
 # （`engine/sequence/**`）。这一层只有 verify_sequencer 一条用例登记，
 # 所以期望是**恰好一条**（别的 fixture 都是"自己那条一定在"）—— 哪天有人

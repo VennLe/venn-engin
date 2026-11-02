@@ -3,6 +3,7 @@
 #include "animation/Pose.h"
 #include "core/Window.h"
 #include "core/Logger.h"
+#include "core/CpuProfiler.h"
 #include "scene/Scene.h"
 #include "ecs/Components.h"
 #include "assets/Mesh.h"
@@ -7101,7 +7102,15 @@ void Renderer::drawFrame(scene::Scene& scene) {
     auto& frame = m_frames[m_currentFrame];
     VkDevice dev = m_device->get();
 
-    vkWaitForFences(dev, 1, &frame.inFlightFence, VK_TRUE, UINT64_MAX);
+    // ---- 等本 slot 的上一帧跑完 ----
+    // ⚠ 这是 CPU 侧最容易看错的一段：数值大**不代表我们在干活**，恰恰相反
+    //   ——它说明 CPU 已经把该提交的都提交完了，正在等 GPU（vsync 打开时
+    //   还会被呈现节流）。所以它必须与 `record` 分开记，否则"渲染很慢"
+    //   永远分不清是"录制太重"还是"GPU 跑不动"。
+    {
+        VK_CPU_SCOPE(core::CpuProfiler::kRenderWait);
+        vkWaitForFences(dev, 1, &frame.inFlightFence, VK_TRUE, UINT64_MAX);
+    }
 
     // ---- GPU 时戳读回（R0-1）----
     // fence 已过 → 本 slot 上一轮的 20 个 query 一定已写入。结果留在
@@ -7396,7 +7405,13 @@ void Renderer::drawFrame(scene::Scene& scene) {
         (m_viewCameraIndex > 0 && m_viewCameraIndex < scene.cameraCount())
             ? &scene.camera(m_viewCameraIndex)
             : nullptr;
-    uploadSceneState(scene, renderExtent(), true, viewCam);
+    {
+        // 物体级视锥剔除 / Hi-Z 过滤 / 蒙皮 / FrameUBO 全在这一段里发生 ——
+        // 它是"CPU 每帧随物体数增长的那部分"，与下面"随 draw call 数增长"
+        // 的 record 段分开看，才知道加物体和加绘制各自贵在哪。
+        VK_CPU_SCOPE(core::CpuProfiler::kSceneSync);
+        uploadSceneState(scene, renderExtent(), true, viewCam);
+    }
 
     // ---- UI 通道的懒建（`set ui.enabled 1` 之后第一次生效的点）----
     // 位置必须在**录制命令之前**：创建要 waitIdle + 传图元，不能夹在
@@ -7404,7 +7419,10 @@ void Renderer::drawFrame(scene::Scene& scene) {
     if (ui2::settings().enabled && !m_uiRenderer) ensureUiRenderer();
 
     // 录制命令
-    recordFrame(frame.commandBuffer, imageIndex, scene);
+    {
+        VK_CPU_SCOPE(core::CpuProfiler::kRecord);
+        recordFrame(frame.commandBuffer, imageIndex, scene);
+    }
 
     // ---- Bindless 统计（R2-3）----
     // 与 CULL-STATS / MDI-STATS 同一条约定：**只在真的开着**的时候打，
@@ -7562,8 +7580,11 @@ void Renderer::drawFrame(scene::Scene& scene) {
     si.pCommandBuffers = &frame.commandBuffer;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &renderFinished;
-    VK_CHECK(vkQueueSubmit(m_device->graphicsQueue(), 1, &si,
-                           frame.inFlightFence));
+    {
+        VK_CPU_SCOPE(core::CpuProfiler::kSubmit);
+        VK_CHECK(vkQueueSubmit(m_device->graphicsQueue(), 1, &si,
+                               frame.inFlightFence));
+    }
 
     // 该 slot 的时戳 query 从这一刻起才保证"已提交"——下一次轮到本
     // slot 时（fence 等待之后）允许 readFrame 读它。
@@ -7579,7 +7600,14 @@ void Renderer::drawFrame(scene::Scene& scene) {
     pi.pSwapchains = &swap;
     pi.pImageIndices = &imageIndex;
 
-    VkResult pres = vkQueuePresentKHR(m_device->graphicsQueue(), &pi);
+    // ⚠ present 单独一段：vsync 打开时它会把整帧节流到刷新率，读数直接
+    //   等于"我被 vsync 关在外面等了多久"。与 renderWait 一起看才完整 ——
+    //   两者都大而 record 很小 = CPU 有空闲，瓶颈在 GPU 或刷新率。
+    VkResult pres = VK_SUCCESS;
+    {
+        VK_CPU_SCOPE(core::CpuProfiler::kPresent);
+        pres = vkQueuePresentKHR(m_device->graphicsQueue(), &pi);
+    }
     if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR) {
         recreateSwapchain();
     } else if (pres != VK_SUCCESS) {

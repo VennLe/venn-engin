@@ -12,6 +12,7 @@
 #include <stb_image.h>
 
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -340,8 +341,6 @@ void UiRenderer::record(VkCommandBuffer cmd, uint32_t frameIndex,
     vp.minDepth = 0.0f;
     vp.maxDepth = 1.0f;
     vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{VkOffset2D{0, 0}, outExtent};
-    vkCmdSetScissor(cmd, 0, 1, &sc);
 
     VkBuffer vb = m_vbo->get();
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
@@ -353,9 +352,65 @@ void UiRenderer::record(VkCommandBuffer cmd, uint32_t frameIndex,
     VkDescriptorSet set = m_sets[fi];
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
                             &set, 0, nullptr);
-    vkCmdDraw(cmd, count, 1, 0, 0);
 
-    m_stats.draws = 1;
+    // ---- 按 scissor 切 run（P3-2）----
+    //
+    // 没有裁剪时整帧只有 1 个 run（与 U2 以来逐位相同，`draws=1`）。
+    // 用了裁剪（滚动容器）才会有多个 run，每个 run 一次 SetScissor + Draw。
+    //
+    // ⚠⚠ 为什么不在 CPU 上"把超出容器的几何剪掉"：mode 0/3 的顶点只存
+    //   "中心 + 半宽"，剪角点等于改中心/半宽，而 frag 用 `vLocal` 求
+    //   圆角距离场 —— 剪完圆角会跑到错误的位置（框看起来还是那个框，
+    //   但四个角变成直角、边缘出现一条硬线）。scissor 是像素级精确的。
+    //
+    // ⚠ scissor 有两条 Vulkan 硬约束：offset 必须 >= 0、x+w <= 附件宽度。
+    //   裁剪矩形是从"参考像素 × ui.scale"算出来的浮点，很容易越界几个像素；
+    //   越界会被验证层报 `VUID-vkCmdDraw-None-07845`（整条命令作废 →
+    //   那一帧 UI 整块消失）。所以这里必须夹进 [0, outExtent]。
+    const std::vector<Ui2Scissor>& sc = canvas.scissors();
+    const uint32_t quadCount = count / 6u;   // 每 quad 6 个顶点
+    uint32_t runs = 0;
+    uint32_t q = 0;
+    while (q < quadCount) {
+        const Ui2Scissor s = (q < sc.size()) ? sc[q] : Ui2Scissor{};
+        // 尽可能长的同 scissor 段
+        uint32_t end = q + 1;
+        while (end < quadCount) {
+            const Ui2Scissor n = (end < sc.size()) ? sc[end] : Ui2Scissor{};
+            if (!n.same(s)) break;
+            ++end;
+        }
+        VkRect2D r{VkOffset2D{0, 0}, outExtent};
+        bool skip = false;
+        if (s.any) {
+            int32_t x0 = static_cast<int32_t>(std::floor(s.x));
+            int32_t y0 = static_cast<int32_t>(std::floor(s.y));
+            int32_t x1 = static_cast<int32_t>(std::ceil(s.x + s.w));
+            int32_t y1 = static_cast<int32_t>(std::ceil(s.y + s.h));
+            if (x0 < 0) x0 = 0;
+            if (y0 < 0) y0 = 0;
+            if (x1 > static_cast<int32_t>(outExtent.width))
+                x1 = static_cast<int32_t>(outExtent.width);
+            if (y1 > static_cast<int32_t>(outExtent.height))
+                y1 = static_cast<int32_t>(outExtent.height);
+            if (x1 <= x0 || y1 <= y0) {
+                skip = true;
+            } else {
+                r.offset = VkOffset2D{x0, y0};
+                r.extent = VkExtent2D{static_cast<uint32_t>(x1 - x0),
+                                      static_cast<uint32_t>(y1 - y0)};
+            }
+        }
+        if (!skip) {
+            vkCmdSetScissor(cmd, 0, 1, &r);
+            vkCmdDraw(cmd, (end - q) * 6u, 1, q * 6u, 0);
+            ++runs;
+        }
+        q = end;
+    }
+    // 全部被裁掉（滚动列表滚到底）时 runs==0 是**正常现象**，不是错误。
+
+    m_stats.draws = runs;
     m_stats.verts = count;
 }
 

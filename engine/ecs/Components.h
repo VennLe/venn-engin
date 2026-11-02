@@ -39,6 +39,18 @@
 // 而 `animation/ExpressionPreset.h` 只依赖 string / vector，不反向依赖 ecs。
 #include "animation/ExpressionPreset.h"
 #include "water/WaterBody.h"
+// P2 玩法状态层。`AttrState` / `StatusState` 是**值成员**（组件拥有全部
+// 数据），所以必须有完整类型；而 `gameplay/GameplayTypes.h` 只依赖
+// `gameplay/Stats.h`（再往下只依赖 `<string>` / `<vector>`），不反向依赖
+// ecs —— 与 `water/WaterBody.h` / `animation/SpringBone.h` 同一条先例。
+//
+// ⚠ `AttributeSet` / `StatusSet` **不在这里**：它们是运行时视图（带
+//   `source` 字符串与中间量），住进组件就会变成"两份真值"。
+//   见 `gameplay/GameplayTypes.h` 文件头。
+#include "gameplay/GameplayTypes.h"
+// P3-3 牌堆。`CardZones` 只再依赖 `GameRandom`（PCG32），仍然不反向依赖
+// ECS —— 与上面同一条分层纪律。
+#include "gameplay/CardZones.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -961,6 +973,47 @@ struct CharacterControllerComponent {
     bool started = false;         // 本轮 Play 的第一帧（初始化 bodyYaw）
 };
 
+// ---------------- 导航代理（C8）----------------
+//
+// 一个实体"会寻路走路"。语义刻意做得**极窄**：
+//   · 它只负责"朝 target 走"，不负责决策（打谁、去哪由脚本/行为树决定）；
+//   · 它不接管物理：有 `CharacterControllerComponent` 时仍然由那一套推胶囊
+//     （见 docs/navigation.md §4 的两条路），没有就**直接写 Transform**
+//     （kinematic，适合 NPC/巡逻兵/棋盘单位）。
+//   · 它不存网格：网格住在 `nav::NavSystem`（全局一份，换场景才重烘）。
+//
+// ⚠ `goal` 是**序列化**的（关卡作者摆好巡逻点就能直接跑），
+//   `path` / `next` / `repathTimer` 是**运行态**（不进存档、不进场景文件）。
+//   把 path 存下来会让"读档后沿着上一次的路径走"，而那时世界已经变了。
+struct NavAgentComponent {
+    // ---- 运动 ----
+    float speed = 2.0f;            // m/s
+    float turnSpeed = 8.0f;        // 转身插值（1/s），0 = 立刻转向
+    float arriveDist = 0.30f;      // 到点判定（米）；太小会绕着目标打转
+    float repathInterval = 0.5f;   // 重新求路的最小间隔（秒）
+    // ⚠ 这个间隔不是性能优化，是**防抖**：目标每帧微动（追玩家）时，
+    //   不设下限会每帧跑一次 A*，几十个代理就是每帧几毫秒的纯浪费。
+
+    // ---- 行为 ----
+    bool enabled = true;
+    bool faceMoveDir = true;       // 朝着移动方向转身（关掉 = 保持朝向，如侧步）
+    bool smooth = true;            // 路径做视线平滑（关掉能看到 A* 的锯齿）
+    // 进场景/读档就朝 `goal` 走，不用等脚本喊。巡逻兵用这个最省事。
+    bool autoStart = false;
+
+    // ---- 目标（序列化）----
+    glm::vec3 goal{0.0f};
+    bool hasGoal = false;
+
+    // ---- 运行态（**不序列化**）----
+    std::vector<glm::vec3> path;
+    std::size_t next = 0;
+    float repathTimer = 0.0f;
+    bool reached = false;          // 上一帧是否已经到点（脚本 navArrived 用）
+    bool failed = false;           // 上一轮求路失败（没有网格 / 目标不可达）
+    int lastExpanded = 0;          // 上次 A* 展开节点数（调参/用例判据）
+};
+
 // ---------------- 触发体（G08）----------------
 //
 // 挂在**已经有 CollisionComponent** 的实体上：那个碰撞体的几何就是触发
@@ -1295,6 +1348,24 @@ struct PlayerLimbComponent {
 //
 // 只影响编辑器交互：渲染、脚本、将来的物理都不看它。
 struct LockedComponent {};
+
+// ---------------- 特效宿主（P1-2）----------------
+//
+// `fx::EffectService` 为了**不反复增删实体**（踩资源生命周期铁律），
+// 会在场景里预先建一批"特效宿主"，每个挂一个 `ParticleEmitterComponent`，
+// 靠改参数来"播/静音"。这些实体：
+//   · 是**运行时派生对象**，不是作者放的 → 不进场景文件、也不进存档
+//     （存进去之后读档会多出 N 个空发射器，而玩家根本没放它们）
+//   · 由 EffectService 管生死，别的地方不该删
+//
+// 所以需要一个标记。序列化那一侧看到它就直接跳过（两处：
+// `entityToJsonImpl` 的 includeEmpty=false / true 都跳过）。
+//
+// ⚠ 标记必须放在 `ecs/` 而不是 `fx/`：`fx/EffectAsset.h` 已经 include
+//   了本文件，把标记放 fx 会造成头文件循环。
+struct FxHostComponent {
+    int slot = -1;   // 对应 EffectService 池里的第几个槽（-1 = 未分配）
+};
 
 // ---------------- 光照 ----------------
 struct DirectionalLightComponent {
@@ -1991,5 +2062,61 @@ struct PrefabLinkComponent {
     bool root = false;           // 是不是实例根
     std::vector<std::string> overrides;  // 覆盖路径（只在 root 上有意义）
 };
+
+// ---------------- 玩法状态（P2，2026-11-03）----------------
+//
+// 「这个角色/这张卡现在是什么样」：一组命名属性的白值 + 一串状态。
+// 回合制（含卡牌）需要的全部数值都在这里；伤害公式、回合调度在
+// `gameplay/Stats.h` / `gameplay/TurnQueue.h` 里，属于**纯函数**。
+//
+// ⚠⚠ **组件是权威数据，`AttributeSet` 是派生视图**。
+//   任何读取都要先 `gameplay::buildAttributes()`；任何修改都是
+//   "build → 改 → storeBases 写回"。**不要**在组件里再缓存一份算好的值
+//   —— 两份真值的症状是"面板显示 94、实际扣血按 100 算"，而所有人都会
+//   去查面板的刷新逻辑，不会怀疑到序列化身上。
+//
+// ⚠ `hp` 的白值就是**当前血量**（不是最大血量）。`consume()` 改的正是
+//   base，所以"存档里存的 hp"天然就是当前值，不需要额外字段。
+//   最大血量 = 上限 `maxValue`（`defaultAttributes(hp)` 把它设成 hp 本身；
+//   想做"升级涨上限"就同时改 base 与 maxValue）。
+//
+// ⚠ `gauge` 是行动条（0..队伍 gaugeMax）。它随组件落盘，于是"存档 → 读档"
+//   之后出手顺序不变；不存的话读档会把所有人的行动条清零，
+//   表现是"读档之后敌人总是先手"。
+struct GameplayComponent {
+    std::vector<gameplay::AttrState> attributes;
+    std::vector<gameplay::StatusState> statuses;
+
+    // 行动条速度（越大出手越频繁，见 `gameplay/TurnQueue.h`）。
+    float speed = 100.0f;
+    // 行动条当前值。运行时由 `GameplayRuntime::rebuildQueue/advance` 维护。
+    float gauge = 0.0f;
+    // 队伍（0 = 己方，1 = 敌方）。只用于显示分组，不影响数值。
+    int team = 0;
+    // 是否参与回合调度（陷阱/道具这种不行动的单位挂组件但设 false）。
+    bool inTurnQueue = true;
+};
+
+// ---------------------------------------------------------------- 牌堆（P3-3）
+//
+// 挂在一个实体身上 = "这个单位有一副牌"。通常是玩家，也可以是敌人
+// （"Boss 有自己的一套技能牌"在卡牌 roguelike 里很常见）。
+//
+// ⚠ **牌堆是组件、不是单例**：做成 `GameplayRuntime` 里的成员就只有一副牌，
+//   而"敌方也用牌"和"战斗中换角色"两条需求一来，单例就得推倒重做。
+//   牌堆本身的所有权在实体上，`GameplayRuntime` 只提供访问（它管随机流）。
+//
+// ⚠ **`zones` 里不含定义表**：`CardZones::m_defs` 是内容（配表），
+//   不属于这一局的进度，**不进场景文件**。读档的顺序是
+//   `clear() → setDefs(从配表读) → deserialize(存档里的区)`。
+//   只存 defId 的好处是：作者调完平衡，老存档自动用新数值（与状态/loot
+//   的取舍相反 —— 状态是"这一局正在发生的效果"要冻结，卡牌是"内容"要跟随）。
+struct CardDeckComponent {
+    gameplay::CardZones zones;
+
+    // 面板显示用的人话名字（"玩家牌组" / "Boss 牌组"）。空 = 用实体名。
+    std::string label;
+};
+
 
 } // namespace ecs

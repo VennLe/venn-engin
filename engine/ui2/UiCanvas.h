@@ -54,6 +54,59 @@ enum class Ui2Prim : int {
     Texture = 1,
     SdfText = 2,
     RoundBox = 3,
+    // ---- P3-2（2026-11-04）----
+    // 4 = **旋转后**的圆角矩形：`pos` 是顶点本身（不像 mode 3 那样由
+    //   "中心 + 角点符号 × 半宽" 展开），但 `local` 仍然是 `角点符号 × 半宽`
+    //   —— 于是 frag 里的 sdRoundBox 还在**未旋转的局部坐标系**里算，
+    //   圆角在旋转之后依然是正圆角（这正是"只把顶点转过去、SDF 照旧"的
+    //   全部意义）。
+    // ⚠ 为什么不给 mode 0/3 直接加一个 2×2 旋转矩阵到顶点里：那要把
+    //   顶点从 36 字节撑到 52 字节、改 `static_assert`、改顶点属性布局、
+    //   改 ui2.vert 的 6 个 input —— 而剩下的需求（只有"画一个转了角度的
+    //   圆角框"）用"CPU 算四个角"就能满足，着色器只多一个分支。
+    RoundBoxRotated = 4,
+};
+
+// ---- 2×3 仿射变换（P3-2）----
+//
+//   x' = m00 * x + m01 * y + tx
+//   y' = m10 * x + m11 * y + ty
+//
+// 只用一个 2×3 而不是 3×3：UI 不需要透视，第三行永远是 (0,0,1)。
+// ⚠ 坐标系与画布一致（y 向下）。所以"顺时针 10°"在屏幕上看起来是顺时针，
+//   而数学上的正角在 y 向下的坐标系里是**顺时针** —— 别在这里翻符号，
+//   翻了之后"旋转 10°"和"旋转 -10°"会长得一样，测起来极其费劲。
+struct Ui2Xform {
+    float m00 = 1.0f, m01 = 0.0f;
+    float m10 = 0.0f, m11 = 1.0f;
+    float tx = 0.0f, ty = 0.0f;
+
+    bool identity() const {
+        return m00 == 1.0f && m01 == 0.0f && m10 == 0.0f && m11 == 1.0f &&
+               tx == 0.0f && ty == 0.0f;
+    }
+    // 没有旋转（只有缩放 + 平移）。命中的快速路径与"圆角能保持精确"都靠它。
+    bool axisAligned() const { return m01 == 0.0f && m10 == 0.0f; }
+
+    void mapPoint(float x, float y, float& ox, float& oy) const {
+        ox = m00 * x + m01 * y + tx;
+        oy = m10 * x + m11 * y + ty;
+    }
+    // 绕 (px,py) 旋转 `rad`（y 向下 = 视觉顺时针）再缩放 `s`。
+    static Ui2Xform rotateScaleAbout(float rad, float s, float px, float py);
+    // 复合：先应用 `a`，再应用 `b`（`b * a` 的矩阵乘）。
+    static Ui2Xform concat(const Ui2Xform& b, const Ui2Xform& a);
+};
+
+// 一个 quad 的裁剪矩形（输出像素）。`w <= 0 || h <= 0` 的 quad 在画布层
+// 就被丢掉，不会出现在顶点缓冲里。
+struct Ui2Scissor {
+    float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
+    bool any = false;               // false = 不裁（整屏）
+    bool same(const Ui2Scissor& o) const {
+        return any == o.any && (!any || (x == o.x && y == o.y && w == o.w &&
+                                         h == o.h));
+    }
 };
 
 // RGBA8 打包成 `uint32_t`。
@@ -80,7 +133,38 @@ constexpr uint32_t rgbA(uint32_t rrggbb, int a = 255) {
 
 class UiCanvas {
 public:
-    void begin() { m_verts.clear(); m_draws = 0; }
+    void begin() {
+        m_verts.clear();
+        m_scissors.clear();
+        m_draws = 0;
+        // 栈必须**重置成基准项**而不是清空：清空之后 `pushOpacity(0.5)`
+        // 会以"栈空"为基准 0，整块 UI 直接消失（而且 begin 之后第一帧才
+        // 显形，看起来像"偶发不画"）。
+        m_xf.assign(1, Ui2Xform{});
+        m_op.assign(1, 1.0f);
+        m_clip.assign(1, Ui2Scissor{});
+        m_curXf = Ui2Xform{};
+        m_curOp = 1.0f;
+        m_curClip = Ui2Scissor{};
+    }
+
+    // ---- 状态栈（P3-2）----
+    //
+    // 三条栈都**乘/交**进当前状态，不是覆盖：
+    //   · 变换：子控件跟着父控件一起转（"面板转了，里面的字也要转"）；
+    //   · 透明度：嵌套的 0.5 是两个半透（乘起来 0.25），不是 0.5；
+    //   · 裁剪：滚动容器套滚动容器时取**交集**。
+    // ⚠ 覆盖式实现的第一批症状：卡片扇形展开时文字不跟着转、淡出面板里
+    //   的文字不淡、嵌套滚动列表里的第二层溢出不裁剪。
+    void pushTransform(const Ui2Xform& x);
+    void popTransform();
+    void pushOpacity(float mul);          // 0..1
+    void popOpacity();
+    void pushClip(float x, float y, float w, float h);   // 输出像素
+    void popClip();
+
+    const Ui2Xform& transform() const { return m_curXf; }
+    float opacity() const { return m_curOp; }
 
     // 纯色矩形（左上角 + 宽高）。矩形永远 4 个顶点、2 个三角形。
     void rect(float x, float y, float w, float h, uint32_t color);
@@ -111,16 +195,42 @@ public:
               const Ui2Vertex& v2, const Ui2Vertex& v3);
 
     const std::vector<Ui2Vertex>& vertices() const { return m_verts; }
-    // 合批后的 draw call 数：单图集、无 scissor 变化 → 永远 1（空画布 = 0）。
-    uint32_t drawCalls() const { return m_verts.empty() ? 0u : 1u; }
+    // 每个 quad 一个裁剪矩形，长度 == vertices().size() / 6（与顶点同步增长）。
+    // `UiRenderer::record` 按"相邻且裁剪相同"切 run，每个 run 一次
+    // `vkCmdSetScissor` + 一次 `vkCmdDraw`。**只有真的用了裁剪才会 > 1**。
+    const std::vector<Ui2Scissor>& scissors() const { return m_scissors; }
+    // 合批后的 draw call 数：不裁剪时恒为 1（空画布 = 0）。
+    // ⚠ P3-2 起它是"scissor run 数"，不再是无条件 1 —— 裁剪一旦用上，
+    //   `UI2-STATS draws=` 就应该跟着涨。旧断言"必须是 1"的前提是
+    //   "UI 里没有裁剪"，那个前提在滚动容器出现之后不成立了。
+    uint32_t drawCalls() const;
     bool empty() const { return m_verts.empty(); }
 
 private:
+    // "中心 + 半宽"形式的矩形/圆角框（mode 0/3）。旋转时由 `emitQuad`
+    // 自动改写成 mode 4（顶点坐标自己给）。
     void pushModeQuad(float cx, float cy, float hx, float hy, float radius,
                       Ui2Prim mode, uint32_t color);
 
+    // 四条通路最终都走这里：`lp` 是**本地**（变换前）角点，顺序固定
+    // {左上, 右上, 右下, 左下}，与 `quad(v0,v1,v2,v3)` 的两个三角形一致。
+    // 它负责：过变换 → 乘透明度 → 按裁剪丢弃/记 scissor → 推 6 个顶点。
+    void emitQuad(const float lx[4], const float ly[4],
+                  const Ui2Vertex proto[4]);
+    void recomputeState();
+
     std::vector<Ui2Vertex> m_verts;
+    std::vector<Ui2Scissor> m_scissors;
     uint32_t m_draws = 0;
+
+    // 状态栈（索引 0 是"没 push 过"的基准项）
+    std::vector<Ui2Xform> m_xf{Ui2Xform{}};
+    std::vector<float> m_op{1.0f};
+    std::vector<Ui2Scissor> m_clip{Ui2Scissor{}};
+    // 当前生效值（每次 push/pop 重算，避免"乘进去容易、退出来难"）
+    Ui2Xform m_curXf{};
+    float m_curOp = 1.0f;
+    Ui2Scissor m_curClip{};
 };
 
 // ---- 调试图元（U2 的 "Hello World"，也是控制台 `ui.rect` 的存储）----

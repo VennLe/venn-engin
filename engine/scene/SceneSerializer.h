@@ -15,7 +15,12 @@
 //       二进制资源（.glb/.png）仍留在 assets 目录里，不必内嵌 base64。
 // ============================================================
 
+#include "ecs/Entity.h"
+
+#include <nlohmann/json.hpp>
+
 #include <string>
+#include <vector>
 
 namespace assets {
 class AssetManager;
@@ -45,6 +50,25 @@ SceneIoResult saveScene(const Scene& scene, const std::string& path);
 // 从 JSON 文件恢复场景（会先清空当前世界；AssetManager 缓存保留）
 SceneIoResult loadScene(Scene& scene, assets::AssetManager& assets,
                         const std::string& path);
+
+// ============================================================
+// G19 关卡流送：**叠加**加载（不清空世界）
+//
+// 把 `path` 里的实体并进当前世界，不动相机 / 光照 / 物理 / 天空 /
+// scriptVars / 后处理体积（它们属于"这一份世界"，不属于"世界的这一部分"）。
+//
+// `createdOut` 收"这次加载真的建出来的实体"（**只含有效实体**，文件里解析
+// 失败的槽位不会进来）。调用方拿这份列表就是卸载的依据 —— 逐个
+// `scene.world().destroy(e)` 即可。
+//
+// ⚠ 与 `loadScene` 共用 ①②③ 三段实现，只差 `additive` 一个参数。
+//   分成两份的话，以后加组件只改一处，而漏改的那处**不报错**。
+// ⚠ 跨文件的 `parentGuid` 引用**不会**生效（层级只在本次 `created` 里查）。
+//   要跨关卡挂父子得在加载完之后手动 `setParent`。
+// ============================================================
+SceneIoResult loadSceneAdditive(Scene& scene, assets::AssetManager& assets,
+                                const std::string& path,
+                                std::vector<ecs::Entity>* createdOut = nullptr);
 
 // ============================================================
 // 内存态往返（编辑器用）

@@ -21,6 +21,9 @@
 //   mode 1 贴图           alpha 取自贴图
 //   mode 2 SDF 字形       距离 → smoothstep（宽度随字号缩放）
 //   mode 3 SDF 圆角矩形   sdRoundBox，1px 抗锯齿带
+//   mode 4 旋转圆角矩形   **与 mode 3 完全同一条分支**：vLocal 仍是未旋转的
+//                          局部坐标（见 ui2.vert），所以 sdRoundBox 照旧 ——
+//                          这里不需要为它多写一行，多写反而会分叉出两份规则
 // ============================================================
 
 layout(location = 0) in vec2 vUv;

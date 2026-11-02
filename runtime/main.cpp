@@ -51,6 +51,11 @@
 #include "GameLoop.h"
 
 #include "ecs/GuidSelfTest.h"
+// P2 玩法状态层（--selftest gameplay）：属性 / 状态 / 伤害 / 随机 / 回合。
+// ⚠ 这一层**不碰 ECS 也不碰 Vulkan**，所以和上面那批一样能在建窗口之前跑。
+#include "gameplay/GameplaySelfTest.h"
+#include "i18n/LocaleFile.h"        // C2 自检（--selftest locale）
+#include "nav/NavSelfTest.h"        // C8 导航自检（--selftest nav）
 #include "animation/TransformClip.h"   // C5 自检（--selftest transformclip）
 #include "animation/ExpressionDriver.h" // B6 自检（--selftest expression）
 #include "physics/CharacterController.h"
@@ -671,12 +676,34 @@ int main(int argc, char** argv) {
         if (cfg.selftest == "scan") return project::runScanSelfTest() == 0 ? 0 : 1;
         // G29-b pak 容器（K 组）：编解码往返 / 容器往返 / 三种坏包必须拒绝。
         if (cfg.selftest == "pak") return assets::runPakSelfTest() == 0 ? 0 : 1;
+        // C2 本地化编辑（L 组）：外部覆盖层只写"改过"的行 / 撤销回到内置值 /
+        // 新增键能持久化。纯文件 IO。
+        // ⚠ 它**必须**在中文语言状态下跑（`tr()` 的覆盖只在中文表里生效），
+        //   自检内部自己 `setLanguage(1)` / 结束后恢复 0，不依赖外部环境。
+        if (cfg.selftest == "locale")
+            return i18n::runLocaleSelfTest() == 0 ? 0 : 1;
+
+        // P2 玩法状态层（G~K 六组）：
+        //   G 属性求值顺序 / Override / clamp 位置 / 两种百分比 / 三种摘除
+        //   H 状态三条叠加规则 / 重建而不是增量 / 装备不被洗 / dot / 到期
+        //   I 伤害五步明细 / 护甲曲线 / 穿透 / 易伤 / 护盾 / 真伤 / 过量 / 暴击
+        //   J 随机可复现 / 三流不串 / 存档往返 / 边界不消耗 / 洗牌
+        //   K 回合行动条 / tie-break / 插队 / 取消 / 阵亡 / 预读一致 / 存档
+        // ⚠ 与 `script` / `theme` 同一位置：纯数值 + 内存字符串，不开窗口
+        //   也不要 GPU。所以这套是"玩法逻辑能不能交付"的地基闸门。
+        if (cfg.selftest == "gameplay")
+            return gameplay::runGameplaySelfTest() == 0 ? 0 : 1;
+
+        // C8 导航（A 网格 / B A* / C 视线 / D 吸附 / E 代理 / F 存盘 / G ASCII）：
+        // 纯 CPU + 一个空 `scene::Scene`（不建设备、不上传资产）。
+        if (cfg.selftest == "nav") return nav::runNavSelfTest() == 0 ? 0 : 1;
 
         if (!cfg.selftest.empty()) {
             VK_LOG_WARN("未知自检项 '%s'（可用：states | determinism | input | "
                         "character | contact | camera | player | hud | audio |\n"
                         "                        audio-config | material | lod | "
-                        "terrain | script | scriptbench | project | package | scan | pak）",
+                        "terrain | script | scriptbench | gameplay | nav | project | "
+                        "package | scan | pak | locale）",
                         cfg.selftest.c_str());
         }
 #endif   // !VENN_SHIPPING（无窗口自检区）

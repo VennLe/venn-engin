@@ -658,10 +658,19 @@ void AudioSystem::update(float dt) {
 void AudioSystem::setBusGain(BusId bus, float gain) {
     const int b = static_cast<int>(bus);
     if (b < 0 || b >= kBusCount) return;
+    // Master 的**唯一真值**是 `m_master`（`init` 时 m_busGain[0] 被写死
+    // 成 1.0，注释就写着"Master 走 m_master"）。
+    // ⚠ 2026-11-02 修：以前这里一律写 `m_busGain[b]`，于是
+    //   `audio.bus master 0.5` 之后 `m_busGain[0]=0.5` 而 `m_master` 还是
+    //   1.0 —— 两个真值分叉，读哪个都只对一半（混音台加 `busGain()`
+    //   访问器时才暴露出来：推子拖着不动）。
+    if (bus == BusId::Master) {
+        setMasterGain(gain);
+        return;
+    }
     m_busGain[b] = gain;
     if (m_state != State::Running) return;
-    if (bus == BusId::Master) m_mixer.setMasterGain(gain);
-    else m_mixer.setBusGain(b, gain);
+    m_mixer.setBusGain(b, gain);
 }
 
 void AudioSystem::setMasterGain(float gain) {

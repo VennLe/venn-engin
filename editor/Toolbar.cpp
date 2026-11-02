@@ -561,12 +561,13 @@ void Toolbar::drawMenuBar() {
         tagMenu("MENU-EDIT-INVERT");
 
         ImGui::Separator();
-        // E26 落地的是**画质档位**面板（`quality`）。这一项当时是占位提示
-        // （"lands with E26"），现在直接接到那张面板上 —— 编辑器里现存的
-        // 项目级设置就是画质档位；输入映射在 Preferences ▸ Keymap 页。
+        // 2026-11-02：**指向项目设置面板**（`assets/game.json`）。
+        // 原来这一项接的是 `quality` —— 那是"编辑器里唯一现存的项目级设置"，
+        // 是个占位。现在真的项目设置有了：标题 / 分辨率 / 语言 / 音频出厂值
+        // 全在 `game.json` 里，画质档位在那张面板里有一个直达按钮。
         if (ImGui::MenuItem(TR("Project Settings..."))) {
-            panelOpenRef("quality") = true;
-            m_ctx.notify(TR("Project settings: quality tiers"));
+            panelOpenRef("projectsettings") = true;
+            m_ctx.notify(TR("Project settings: assets/game.json"));
         }
         tagMenu("MENU-EDIT-PROJSET");
         if (ImGui::MenuItem(TR("Editor Preferences..."))) m_ctx.showSettings() = true;

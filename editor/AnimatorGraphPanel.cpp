@@ -432,7 +432,7 @@ void AnimatorGraphPanel::draw(EditorContext& ctx) {
 
     // 稳定 ID 必须与 `trayWindowName("animgraph")` 一致，否则底栏托盘的
     // 最小化 / 置顶按 id 找不到这个窗口。
-    if (!ImGui::Begin("State machine###panel_animgraph",
+    if (!ImGui::Begin(trId("State machine", "panel_animgraph"),
                       docked ? nullptr : &m_open, wf)) {
         ImGui::End();
         return;
@@ -981,7 +981,7 @@ void AnimatorGraphPanel::drawInspector() {
         }
 
         if (ImGui::DragFloat(TR("Duration"), &t.duration, 0.005f, 0.0f, 2.0f,
-                             "%.3f s"))
+                             TR("%.3f s")))
             markDirty();
         if (ImGui::Checkbox(TR("Has exit time"), &t.hasExitTime)) markDirty();
         if (t.hasExitTime) {

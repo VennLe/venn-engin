@@ -214,6 +214,18 @@ inline void iconDialogue(ImDrawList* dl, ImVec2 p, float s, ImU32 col) {
     k.line(0.74f, 0.72f, 0.74f, 0.90f);              // 继续箭头（尾巴）
 }
 
+// 玩法状态（P2）：一条血条 + 一枚状态点。
+// 读法是"数值 + 挂在上面的东西" —— 这正是这一页管的两件事
+// （属性白值 / 状态列表）。
+inline void iconGameplay(ImDrawList* dl, ImVec2 p, float s, ImU32 col) {
+    const IconPen k(dl, p, s, col);
+    k.rectFill(0.10f, 0.26f, 0.90f, 0.44f, 0.05f);   // 血条底
+    k.rectFill(0.12f, 0.28f, 0.62f, 0.42f, 0.03f);   // 已填充段
+    k.rectFill(0.10f, 0.58f, 0.26f, 0.74f, 0.06f);   // 状态点 1
+    k.rectFill(0.36f, 0.58f, 0.52f, 0.74f, 0.06f);   // 状态点 2
+    k.rectFill(0.62f, 0.58f, 0.78f, 0.74f, 0.06f);   // 状态点 3
+}
+
 // 全部：三条横杠（列表 = "把上面所有页签摊平"）
 inline void iconAll(ImDrawList* dl, ImVec2 p, float s, ImU32 col) {
     const IconPen k(dl, p, s, col);

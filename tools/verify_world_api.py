@@ -206,7 +206,14 @@ def run_game(scene_rel, wait_s=90.0):
 
 # ---------------------------------------------------------------- 判定
 
-FLAG_RE = re.compile(r"RUNTIME-FLAG set name=(\S+) value=(-?[\d.]+) total=(\d+)")
+# ⚠ 这行**多了一个 `writer=`**（C8）：`RUNTIME-FLAG set name=X value=Y
+#   writer=script:scripts/xxx.vks total=N`。它是旗标面板"谁写的"那一列
+#   的唯一来源，只能在写入这一刻拿到。
+#   正则不跟着改的后果不是"少一条判据"，而是 **①⑤⑥ 三条一起红** ——
+#   三条全都靠这个正则捞行，一条匹配不上就全判"没有这一行"。
+#   （2026-11-03 分诊：这是夹具陈旧，不是功能回归。）
+FLAG_RE = re.compile(r"RUNTIME-FLAG set name=(\S+) value=(-?[\d.]+)"
+                     r"(?: writer=\S+)? total=(\d+)")
 SPAWN_RE = re.compile(r"RUNTIME-SPAWN entity=(\d+) path=(\S+) "
                       r"pos=\(([-\d.]+),([-\d.]+),([-\d.]+)\) skinned=(\d+)")
 REQ_RE = re.compile(r"RUNTIME-SCENE-REQ path=(\S+) \(applies at the next frame")

@@ -148,10 +148,10 @@ void EnvironmentPanel::draw(render::SkyParams& sky, render::Renderer& renderer) 
         render::SkyParams::anglesFromDirection(p.sunDirection, az, el);
         bool sunMoved = false;
         sunMoved |= ImGui::SliderFloat(TR("Azimuth"), &az, 0.0f, 360.0f,
-                                       "%.0f deg");
+                                       TR("%.0f deg"));
         paramHint("0 deg = +X, counter-clockwise seen from above");
         sunMoved |= ImGui::SliderFloat(TR("Elevation"), &el, -10.0f, 90.0f,
-                                       "%.0f deg");
+                                       TR("%.0f deg"));
         paramHint("0 deg = horizon, 90 deg = straight up");
         if (sunMoved) {
             p.sunDirection = render::SkyParams::directionFromAngles(az, el);
@@ -160,7 +160,7 @@ void EnvironmentPanel::draw(render::SkyParams& sky, render::Renderer& renderer) 
         ImGui::SliderFloat(TR("Intensity"), &p.sunIntensity, 0.0f, 8.0f, "%.2f");
         paramHint("0 removes the disk entirely");
         ImGui::SliderFloat(TR("Angular size"), &p.sunAngularRadius, 0.002f,
-                           0.12f, "%.3f rad");
+                           0.12f, TR("%.3f rad"));
         paramHint("bigger = a softer, storybook sun");
         ImGui::SliderFloat(TR("Halo"), &p.horizonGlow, 0.0f, 2.0f, "%.2f");
         paramHint("how far the glare bleeds into the sky");

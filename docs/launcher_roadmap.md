@@ -860,3 +860,108 @@ T2 生成物 `cmake --build` 产出 exe 并 `--selftest` 通过。
 **P12 · 启动器是新的 GUI 用例** —— 与既有纪律同一条：**GUI 用例同时只能跑一个**
 （`kill_stale_editors` 无差别杀 `Editor.exe`/`Game.exe`，将来也得杀 `Launcher.exe`）；
 锚点统一 `LAUNCH-*` 前缀；断言前先确认窗口已显示（P10 修好之前它两秒才出现）。
+
+---
+
+## 13 · 游戏类型 = 4 种（2026-11-04）
+
+> **用户原话**：「游戏类型的设置应该是在启动器创建游戏的时候去设置的，」
+>
+> 背景：P3-1 / P3-3 之后，引擎的**玩法层**（属性 / 状态 / 伤害 / 回合 / 牌堆 / 配表）
+> 已经做完了。于是"这个工程是做哪种游戏"不再只有"第一/第三人称"两个答案，而这个
+> 答案必须落在**新建工程向导的第 1 步**上 —— 那是用户唯一一次"声明意图"的机会。
+
+### 13.1 一根轴，四种类型
+
+| # | id | 相机 | 玩法 | 模板 |
+|---|---|---|---|---|
+| 0 | `first_person` | 眼位 | 角色控制器 | `templates/first_person/` |
+| 1 | `third_person` | 斜后方环绕 | 角色控制器 | `templates/third_person/` |
+| 2 | `isometric` | 斜上方俯视 24 m / pitch 0.98 | 回合制战棋（点格子） | `templates/isometric/` |
+| 3 | `card_battler` | 牌桌视平线 9 m / pitch 0.50 | 卡牌（UI 驱动，无角色相机） | `templates/card_battler/` |
+
+**为什么是一根轴而不是"相机类型 × 玩法类型"两根**：两根轴就是 4×3 种组合，而其中
+一半组合**没有模板**。用户会在"选完、填完名字、点了创建"之后才发现打不开 —— 那一次
+创建白费。一根轴 = 一个单选项 = 一套模板，**每个选项都保证能开**。
+代价是"相机"与"玩法"耦合在同一张表里；但模板本来提供的正是"一键给一套能跑的东西"，
+这个耦合是它的定义，不是它的缺陷。
+
+### 13.2 只能追加
+
+`ProjectFile.h`：
+
+```cpp
+enum class GameType : int {
+    FirstPerson = 0, ThirdPerson = 1, Isometric = 2, CardBattler = 3,
+};
+constexpr int kGameTypeCount = 4;
+GameType gameTypeAt(int index);   // 越界 → ThirdPerson
+```
+
+⚠⚠ **中间插一条会静默改语义**：`LAUNCH-TYPE-<i>` 锚点的下标、`gGameTypeArt[i]` 的
+插图缓存、以及"老判据点的第 2 张卡"全都按顺序对齐。插一条 = 老用例点到的卡片换了
+类型，而它只会去比对 `venn.project.json` 里的 `gameType` —— 于是**要么红得莫名其妙，
+要么绿得毫无意义**（取决于两边一起漂）。新类型一律追加。
+
+### 13.3 一份真值，三处读它
+
+| 谁 | 怎么拿 |
+|---|---|
+| 向导卡片 | `cards[]` 只存**文案**；`GameType` 由 `gameTypeAt(i)` 反查 |
+| 插图缓存 | `m_typeArt[kGameTypeCount]`，**按 id 命名**的缓存键（不是"第几张"） |
+| 验收脚本 | `read_game_type_ids()` 从 `kGameTypes[]` **解析** id 顺序 |
+
+⚠ 第三行是重点：`verify_launcher_create.py` 里**不许**再写一份 id 数组。写了之后
+"加了第 5 种类型、测试还在点前 4 张"就永远测不出来 —— 界面上点不到等于没交付，
+而测试全绿。（真加了第 5 种，`Z1` 会红并指名"ROUNDS 表要与 ProjectFile.cpp 同步"。）
+
+### 13.4 布局：2×2，卡宽上限 380
+
+`cardW` 从 **452 收到 380**。452 时两行合计 614 px，而向导内容区只有约 560 px ——
+第二行**掉到窗外**。而 `logRect` **不判可见性**（只按坐标去重），于是卡片"有矩形、
+日志有锚点、点下去什么都没发生"。这正是 §11.3 P14 那条的同类。
+
+实测（客户区 1400×880）：卡片 380×258，第一行 y=171..429，第二行 y=435..693，
+`LAUNCH-BTN-next` 在 y=771 —— 都在里面。用例 `C1 all N type cards on screen` 显式
+比客户区，**不再只 `wait_rect`**。
+
+### 13.5 两个新模板的构图
+
+`templates/isometric/`（67 KB）：8×8 = 64 个 `Tile_ix_iy`（cube 0.94，亮/暗棋盘格）
++ `Ground`(plane 40) + `Ally`(蓝) / `Enemy`(红) + `GameStart`(spawnOnRun=false)
++ `scripts/main.vks`（`Interact` → `tickRound()`）+ 自带一份 `assets/data/cards.csv`。
+
+`templates/card_battler/`（19 KB）：`Table`(plane 9.0，深色) + `Card_A/B/C`（薄立方体，
+`castShadow=false`）+ `Battle`（`gameplay hp70/atk10` + `cards` 组件：`handLimit 10`、
+`nextUid 11`、牌库 5×strike + 4×defend + 1×bash）+ `Enemy` + `GameStart`。
+
+⚠⚠ **卡牌模板的 `GameStart` 摆在 `z = -60`（画面外）**：`spawnOnRun=false` 只关掉
+**运行时**生成，编辑器仍会在出生点位置画一个**预览角色**，正好挡在牌桌前面 ——
+"模板打开是一坨人形挡住桌子"，而运行时又是好的，最容易误判成渲染 bug。
+
+⚠ 两个模板全部用**内置网格**（plane / cube），不依赖任何外部模型 ——"打开就能看见
+构图"，改颜色只改 JSON。
+
+### 13.6 验收
+
+| 用例 | 结果 |
+|---|---|
+| `Game.exe --selftest project` → **K33** | 每个 id 四条（`manifest-load` / `manifest-gametype` / `start-scene-declared` / `start-scene-exists`）；`CREATE-TEST SUMMARY pass=48 fail=0` |
+| `verify_launcher_create.py` | 每种类型各跑一整轮四步向导（4 轮）+ 重名被拒 + 默认目录，**全绿** |
+
+⚠ 两处"记账过时"在这一轮被抓出来（都是**测试错了，不是产品错了**）：
+
+**① C16 的相机期望是硬编码的。** 原样 `first_person=(8.0,0.20)` /
+`third_person=(4.5,0.35)`；提交 49efa67 把初始场景换成二次元小镇后两份模板的相机被
+统一成 `14.0 / 0.26`，那次只同步了 `verify_launcher_project.py`，**漏了本脚本**。
+现在改成「**创建出来的相机 == 模板场景的相机**」逐字段比（distance / pitch / yaw / fov）：
+模板调参它自动跟随，"创建流程写了个默认相机 / 拷错模板"照样抓得住，而且一次管住
+**全部**类型而不是两种。
+
+**② `build/bin/templates/` 是旧版。** 启动器读的是 `<exe>/templates`，不是仓库里的
+`templates/`。改完模板不 `make build`（`VennTemplatesCopy` 没跑），新建出来的工程就是
+**上一版场景**。症状是 `I16` 报"相机距离 26.0 期望 24.0"——看着像引擎把相机改坏了
+（`ProjectCreate.cpp` 里**根本没有** `camera` 这个词，翻它是白费）。
+自检 K33 读的是仓库 `templates/`，所以**照样全绿**。
+→ 新增前置检查 **Z2**：比 `templates/<id>` 与 `build/bin/templates/<id>` 的 mtime，
+不一致就直接红并写明"先 make build"，不再让人从"相机不对"倒推。

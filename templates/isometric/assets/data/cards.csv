@@ -1,0 +1,8 @@
+﻿id,#note,name,kind,target,cost,exhaust,unplayable,upgradedCost,text,effects
+strike,基础攻击,Strike,attack,enemy,1,0,0,,"造成 6 点伤害。",damage::6:physical
+defend,基础防御,Defend,skill,self,1,0,0,,"获得 5 点护盾。",shield::5
+bash,升级后 1 费；打出后消耗,Bash,attack,enemy,2,1,0,1,"造成 8 点伤害 并施加 2 层易伤。",damage::8:physical|status::2:vulnerable
+slimed,占手牌且打不出去的诅咒,Slime,status,none,1,0,1,,"这张牌打不出去。",
+cleave,全体攻击（验证 AllEnemies 目标）,Cleave,attack,allEnemies,1,0,0,,"对所有敌人造成 8 点伤害。",damage::8:physical
+quickdraw,纯抽牌（验证 draw 效果）,Quickdraw,skill,none,1,0,0,,"抽 2 张牌。",draw::2
+focus,能量（验证 energy 属性按需创建）,Focus,power,self,0,0,0,,"获得 1 点能量。",energy::1

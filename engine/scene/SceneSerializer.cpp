@@ -9,8 +9,10 @@
 #include "core/Logger.h"
 #include "ecs/Components.h"
 #include "physics/CollisionWorld.h"
+#include "scene/ParticleJson.h"   // 粒子组件的 JSON 读写（搬出去了，唯一一份）
 #include "scene/Scene.h"
 #include "scene/SceneDocument.h"
+#include "nav/NavSerialize.h"   // C8：导航代理组件的存盘形态
 #include "scene/SceneEntityIO.h"
 
 #include <nlohmann/json.hpp>
@@ -1135,6 +1137,13 @@ json postVolumeToJson(const PostVolume& v) {
         {"motionBlur", v.motionBlur},
         {"chromatic", v.chromatic},
         {"vignette", v.vignette},
+        // ⚠ R1-2 / R1-3 追加的两个字段一度**只进了结构体、没进落盘**：
+        //   `PostVolumeSet::evaluate` 会求它们、`Renderer` 会消费它们，
+        //   于是"面板上设了 LUT 混合 0.7、存盘再打开变回 0.0"——而且
+        //   完全没有报错。2026-11-02 补面板时发现的（往返用例当场红）。
+        //   以后给这个结构体加字段，**先在 toJson/fromJson 各加一行**。
+        {"cgLutBlend", v.cgLutBlend},
+        {"autoExposureBias", v.autoExposureBias},
     };
 }
 
@@ -1163,6 +1172,8 @@ PostVolume postVolumeFromJson(const json& j) {
     v.motionBlur = j.value("motionBlur", v.motionBlur);
     v.chromatic = j.value("chromatic", v.chromatic);
     v.vignette = j.value("vignette", v.vignette);
+    v.cgLutBlend = j.value("cgLutBlend", v.cgLutBlend);
+    v.autoExposureBias = j.value("autoExposureBias", v.autoExposureBias);
     return v;
 }
 
@@ -2180,6 +2191,202 @@ bool sequencerFromJson(const json& j, ecs::SequencerComponent& out) {
 //   `player` 里有播放头、资产缓存与打字机进度，写进去等于把"演到第几句"
 //   变成场景的一部分 —— 下次开门那张场景会从中途开始说话。
 //   这也是 C1 那条"`playhead` 不落盘"的同一个判断。
+// ---------------------------------------------------------------- 玩法状态（P2）
+//
+// 形状刻意写得很短（`n`/`b`/`min`/`max`、`a`/`op`/`v`）：一个角色可能挂十几个
+// 属性 + 三四个状态，全写全名会让场景文件里这一块比整个 Transform 大三倍。
+//
+// ⚠ **状态存完整定义**（不只是 id）：只存 id 的话，作者调完平衡（毒 2 → 3）
+//   之后老存档里的毒会悄悄变成新数值，"这场战斗的毒比上一场疼" —— 既不能
+//   复现也不能解释。代价是文件大一点。
+// ⚠ 属性的 `min`/`max` **必须一起存**：只存 base 会让读档之后闪避率变 350%。
+json gameplayToJson(const ecs::GameplayComponent& g) {
+    json j;
+    j["speed"] = g.speed;
+    j["gauge"] = g.gauge;
+    j["team"] = g.team;
+    // ⚠ 只在**非默认值**时写 `inQueue`：绝大多数单位都参与回合，
+    //   每个实体都写一个 `"inQueue": true` 是纯噪音。
+    if (!g.inTurnQueue) j["inQueue"] = false;
+
+    json ja = json::array();
+    for (const gameplay::AttrState& a : g.attributes) {
+        if (a.name.empty()) continue;
+        json e;
+        e["n"] = a.name;
+        e["b"] = a.base;
+        e["min"] = a.minValue;
+        e["max"] = a.maxValue;
+        ja.push_back(std::move(e));
+    }
+    if (!ja.empty()) j["attrs"] = std::move(ja);
+
+    json js = json::array();
+    for (const gameplay::StatusState& s : g.statuses) {
+        if (s.id.empty()) continue;
+        json e;
+        e["id"] = s.id;
+        if (!s.name.empty() && s.name != s.id) e["name"] = s.name;
+        e["turns"] = s.turnsLeft;
+        e["stacks"] = s.stacks;
+        e["max"] = s.maxStacks;
+        e["rule"] = gameplay::stackRuleName(s.rule);
+        if (s.dotPerTurn > 0.0f) {
+            e["dot"] = s.dotPerTurn;
+            e["dotAttr"] = s.dotAttribute;
+            if (!s.dotElement.empty()) e["dotEl"] = s.dotElement;
+        }
+        json jm = json::array();
+        for (const gameplay::StatusModState& m : s.mods) {
+            if (m.attribute.empty()) continue;
+            json me;
+            me["a"] = m.attribute;
+            me["op"] = gameplay::modOpName(m.op);
+            me["v"] = m.value;
+            jm.push_back(std::move(me));
+        }
+        if (!jm.empty()) e["mods"] = std::move(jm);
+        js.push_back(std::move(e));
+    }
+    if (!js.empty()) j["statuses"] = std::move(js);
+    return j;
+}
+
+bool gameplayFromJson(const json& j, ecs::GameplayComponent& out) {
+    out = ecs::GameplayComponent{};
+    out.speed = j.value("speed", 100.0f);
+    // ⚠ 速度 0 是"永不行动"，会让 `TurnQueue::add` 把它钳到 1 之后**永远
+    //   卡在队尾**。当成坏档修成 100 更好 —— 至少它还能动。
+    if (!(out.speed > 0.0f)) out.speed = 100.0f;
+    out.gauge = j.value("gauge", 0.0f);
+    out.team = j.value("team", 0);
+    out.inTurnQueue = j.value("inQueue", true);
+
+    if (j.contains("attrs") && j["attrs"].is_array()) {
+        for (const json& e : j["attrs"]) {
+            gameplay::AttrState a;
+            a.name = e.value("n", std::string());
+            if (a.name.empty()) continue;
+            a.base = e.value("b", 0.0f);
+            a.minValue = e.value("min", 0.0f);
+            a.maxValue = e.value("max", 1.0e9f);
+            if (a.minValue > a.maxValue) std::swap(a.minValue, a.maxValue);
+            out.attributes.push_back(std::move(a));
+        }
+    }
+    if (j.contains("statuses") && j["statuses"].is_array()) {
+        for (const json& e : j["statuses"]) {
+            gameplay::StatusState s;
+            s.id = e.value("id", std::string());
+            if (s.id.empty()) continue;
+            s.name = e.value("name", s.id);
+            s.turnsLeft = e.value("turns", 1);
+            s.stacks = e.value("stacks", 1);
+            s.maxStacks = e.value("max", 1);
+            gameplay::parseStackRule(e.value("rule", std::string("refresh")), s.rule);
+            s.dotPerTurn = e.value("dot", 0.0f);
+            s.dotAttribute = e.value("dotAttr", std::string("hp"));
+            s.dotElement = e.value("dotEl", std::string());
+            if (e.contains("mods") && e["mods"].is_array()) {
+                for (const json& me : e["mods"]) {
+                    gameplay::StatusModState m;
+                    m.attribute = me.value("a", std::string());
+                    if (m.attribute.empty()) continue;
+                    gameplay::parseModOp(me.value("op", std::string("flat")), m.op);
+                    m.value = me.value("v", 0.0f);
+                    s.mods.push_back(std::move(m));
+                }
+            }
+            // `turnsLeft <= 0` 是坏档：留着它就是一个"永不 tick 的幽灵状态"，
+            // 而且它会一直往属性上挂修正器。直接丢。
+            if (s.turnsLeft <= 0) continue;
+            if (s.stacks < 1) s.stacks = 1;
+            if (s.maxStacks < 1) s.maxStacks = 1;
+            out.statuses.push_back(std::move(s));
+        }
+    }
+    // 有属性或有状态才算"有玩法数据"。只有 speed/team 的组件也算 —— 它参与
+    // 回合调度，所以返回 true（否则读端不会 add 组件，队列里就少一个人）。
+    return !out.attributes.empty() || !out.statuses.empty() || j.contains("speed");
+}
+
+// ---------------------------------------------------------------- 牌堆（P3-3）
+//
+// ⚠ **只存 `defId`，不存卡牌定义** —— 与上面"状态存完整定义"**正好相反**，
+//   而这个相反是有意的：
+//     · 状态是"这一局正在发生的效果"。冻住它的数值才是对的，否则作者把毒
+//       从 2 改成 3 之后，玩家在战斗中途读档会发现毒忽然变疼。
+//     · 卡牌是**内容**。玩家期望"我把这张卡改强了，读档之后它就该更强"，
+//       而且卡的数值本来就该由配表统一管（P3-1）。
+//   两处的取舍相反，所以两边都必须写明 —— 否则后来的人一定会把其中一处
+//   "统一"成另一处，而统一之后出错的表现是"读档后伤害不对"，没人会怀疑到
+//   序列化身上。
+//
+// ⚠ 只写**非空的区**：卡组的 20 张牌要写 20 行，但空区不该占位。
+// ⚠ `piles` 的键名就是 `CardPile` 的枚举顺序（`CardZones.h` 里说过顺序是
+//   格式的一部分，只能在末尾追加）。
+json cardsToJson(const ecs::CardDeckComponent& c) {
+    json j;
+    const gameplay::CardZones& z = c.zones;
+    if (!c.label.empty()) j["label"] = c.label;
+    j["handLimit"] = z.handLimit();
+    j["nextUid"] = z.nextUid();
+    j["reshuffles"] = z.reshuffles();
+    j["plays"] = z.plays();
+
+    json piles = json::object();
+    for (int i = 0; i < gameplay::kCardPileCount; ++i) {
+        const gameplay::CardPile p = static_cast<gameplay::CardPile>(i);
+        const std::vector<gameplay::CardInstance>& v = z.pile(p);
+        if (v.empty()) continue;
+        json ja = json::array();
+        for (const gameplay::CardInstance& card : v) {
+            json e;
+            e["u"] = card.uid;
+            e["d"] = card.defId;
+            // 未升级不写：一副 20 张牌里绝大多数是 0。
+            if (card.upgrade != 0) e["up"] = card.upgrade;
+            ja.push_back(std::move(e));
+        }
+        piles[gameplay::cardPileName(p)] = std::move(ja);
+    }
+    if (!piles.empty()) j["piles"] = std::move(piles);
+    return j;
+}
+
+bool cardsFromJson(const json& j, ecs::CardDeckComponent& out) {
+    out = ecs::CardDeckComponent{};
+    if (!j.is_object()) return false;
+    out.label = j.value("label", std::string());
+
+    gameplay::CardZones& z = out.zones;
+    // ⚠ 走 `clear()` 而不是"就地覆盖"：`out` 是刚默认构造的，但这条纪律
+    //   要一致（"读档 = clear → setDefs → 填区"），否则将来有人在已存在的
+    //   组件上调用它就会叠加上去。
+    z.clear();
+    z.setHandLimit(j.value("handLimit", 10));
+    z.reserveUid(j.value("nextUid", 1u));
+    z.setCounters(j.value("reshuffles", 0), j.value("plays", 0));
+
+    int loaded = 0;
+    if (j.contains("piles") && j["piles"].is_object()) {
+        for (auto it = j["piles"].begin(); it != j["piles"].end(); ++it) {
+            gameplay::CardPile p = gameplay::CardPile::Draw;
+            if (!gameplay::parseCardPile(it.key(), p)) continue;   // 未知区：跳过，不整体失败
+            if (!it.value().is_array()) continue;
+            for (const json& e : it.value()) {
+                gameplay::CardInstance c;
+                c.uid = e.value("u", 0u);
+                c.defId = e.value("d", std::string());
+                c.upgrade = e.value("up", 0);
+                // `put()` 自己会挡 uid=0 / 空 defId / uid 重复。
+                if (z.put(p, c)) ++loaded;
+            }
+        }
+    }
+    return loaded > 0;
+}
+
 json dialogueToJson(const ecs::DialogueComponent& dc) {
     json j;
     j["path"] = dc.dialoguePath;
@@ -2411,267 +2618,6 @@ ecs::AnimationClipComponent animClipFromJson(const json& j) {
     c.time = std::clamp(c.time, 0.0f, c.duration);
     c.playing = c.autoplay;
     return c;
-}
-
-json particleEmitterToJson(const ecs::ParticleEmitterComponent& p) {
-    json j;
-    // ---- Main / Playback ----
-    j["rate"] = p.rate;
-    j["rateOverDistance"] = p.rateOverDistance;
-    j["duration"] = p.duration;
-    j["looping"] = p.looping;
-    j["prewarm"] = p.prewarm;
-    j["startDelay"] = p.startDelay;
-    j["lifetime"] = p.lifetime;
-    j["lifetimeVariance"] = p.lifetimeVariance;
-    j["startSpeed"] = p.startSpeed;
-    j["speedVariance"] = p.speedVariance;
-    j["spread"] = p.spread;
-    // ---- Emission（bursts 是数组；burns[0] 同时也写成 "burst" 作为
-    //      老读法 / 老写法的兼容入口）----
-    {
-        json arr = json::array();
-        for (int b = 0; b < ecs::kMaxBursts; ++b) {
-            const ecs::ParticleBurst& s = p.bursts[b];
-            json e;
-            e["time"] = s.time;
-            e["count"] = s.count;
-            e["cycles"] = s.cycles;
-            e["interval"] = s.interval;
-            arr.push_back(e);
-        }
-        j["bursts"] = arr;
-        j["burst"] = p.bursts[0].count;
-    }
-    // ---- Shape ----
-    j["shape"] = static_cast<int>(p.shape);
-    j["shapeExtents"] = vec3ToJson(p.shapeExtents);
-    j["shapeRadius"] = p.shapeRadius;
-    j["radiusThickness"] = p.radiusThickness;
-    j["arc"] = p.arc;
-    j["shapeRotation"] = p.shapeRotation;
-    j["emitFrom"] = static_cast<int>(p.emitFrom);
-    // ---- Velocity over Lifetime ----
-    j["velOverLifeEnabled"] = p.velOverLifeEnabled;
-    j["velOverLifeX"] = vec4ToJson(p.velOverLifeX);
-    j["velOverLifeY"] = vec4ToJson(p.velOverLifeY);
-    j["velOverLifeZ"] = vec4ToJson(p.velOverLifeZ);
-    j["velOverLifeWorldSpace"] = p.velOverLifeWorldSpace;
-    j["orbital"] = vec3ToJson(p.orbital);
-    j["orbitalOffset"] = p.orbitalOffset;
-    j["radial"] = p.radial;
-    j["speedModifier"] = vec4ToJson(p.speedModifier);
-    // ---- Limit Velocity ----
-    j["limitVelEnabled"] = p.limitVelEnabled;
-    j["limitSpeed"] = p.limitSpeed;
-    j["limitDampen"] = p.limitDampen;
-    // ---- Force ----
-    j["forceEnabled"] = p.forceEnabled;
-    j["force"] = vec3ToJson(p.force);
-    j["forceRandomize"] = p.forceRandomize;
-    // ---- Rotation over Lifetime ----
-    j["startRotation"] = p.startRotation;
-    j["startRotationVariance"] = p.startRotationVariance;
-    j["angularVelocity"] = p.angularVelocity;
-    j["angularVelocityVariance"] = p.angularVelocityVariance;
-    // ---- Noise ----
-    j["noiseEnabled"] = p.noiseEnabled;
-    j["noiseStrength"] = p.noiseStrength;
-    j["noiseFrequency"] = p.noiseFrequency;
-    j["noiseScrollSpeed"] = p.noiseScrollSpeed;
-    j["noiseDamping"] = p.noiseDamping;
-    j["noiseOctaves"] = p.noiseOctaves;
-    // ---- Physics ----
-    j["gravity"] = vec3ToJson(p.gravity);
-    j["drag"] = p.drag;
-    j["simulationSpace"] = static_cast<int>(p.simulationSpace);
-    // ---- Size / Color over Lifetime ----
-    j["sizeOverLife"] = vec4ToJson(p.sizeOverLife);
-    j["alphaOverLife"] = vec4ToJson(p.alphaOverLife);
-    {
-        json ramp = json::array();
-        for (int s = 0; s < p.colorRamp.count && s < ecs::kMaxColorStops; ++s) {
-            json e;
-            e["t"] = p.colorRamp.stops[s].w;
-            e["color"] = vec3ToJson(glm::vec3(p.colorRamp.stops[s]));
-            ramp.push_back(e);
-        }
-        j["colorRamp"] = ramp;
-        j["colorRampCount"] = p.colorRamp.count;
-        // 老的三个字段继续写（外部工具 / 老版本的读取路径），
-        // 取渐变带上 t = 0 / 0.5 / 1 的采样值。
-        j["colorStart"] = vec3ToJson(p.colorRamp.eval(0.0f));
-        j["colorMid"] = vec3ToJson(p.colorRamp.eval(0.5f));
-        j["colorEnd"] = vec3ToJson(p.colorRamp.eval(1.0f));
-    }
-    // ---- Renderer ----
-    j["startSize"] = p.startSize;
-    j["sprite"] = static_cast<int>(p.sprite);
-    j["blend"] = static_cast<int>(p.blend);
-    j["renderMode"] = static_cast<int>(p.renderMode);
-    j["sortMode"] = static_cast<int>(p.sortMode);
-    j["stretchScale"] = p.stretchScale;
-    j["emissive"] = p.emissive;
-    j["softParticles"] = p.softParticles;
-    j["softDistance"] = p.softDistance;
-    j["enabled"] = p.enabled;
-    return j;
-}
-
-ecs::ParticleEmitterComponent particleEmitterFromJson(const json& j) {
-    ecs::ParticleEmitterComponent p;
-    if (!j.is_object()) return p;
-    const json null;
-    // ---- Main / Playback ----
-    p.rate = j.value("rate", p.rate);
-    p.rateOverDistance = j.value("rateOverDistance", p.rateOverDistance);
-    p.duration = j.value("duration", p.duration);
-    p.looping = j.value("looping", p.looping);
-    p.prewarm = j.value("prewarm", p.prewarm);
-    p.startDelay = j.value("startDelay", p.startDelay);
-    p.lifetime = j.value("lifetime", p.lifetime);
-    p.lifetimeVariance = j.value("lifetimeVariance", p.lifetimeVariance);
-    p.startSpeed = j.value("startSpeed", p.startSpeed);
-    p.speedVariance = j.value("speedVariance", p.speedVariance);
-    p.spread = j.value("spread", p.spread);
-    // ---- Emission ----
-    // 新格式：bursts 数组。老格式：单个 "burst"（= 时刻 0 的一次爆发）。
-    // 两条都认，这样老场景能原样打开。
-    if (j.contains("bursts") && j["bursts"].is_array()) {
-        const json& arr = j["bursts"];
-        for (int b = 0; b < ecs::kMaxBursts && b < static_cast<int>(arr.size());
-             ++b) {
-            const json& e = arr[static_cast<size_t>(b)];
-            if (!e.is_object()) continue;
-            p.bursts[b].time = e.value("time", p.bursts[b].time);
-            p.bursts[b].count = e.value("count", p.bursts[b].count);
-            p.bursts[b].cycles = e.value("cycles", p.bursts[b].cycles);
-            p.bursts[b].interval = e.value("interval", p.bursts[b].interval);
-        }
-    } else if (j.contains("burst")) {
-        p.bursts[0].time = 0.0f;
-        p.bursts[0].count = j.value("burst", 0);
-        p.bursts[0].cycles = 1;
-        p.bursts[0].interval = 0.0f;
-    }
-    // ---- Shape ----
-    p.shape = static_cast<ecs::ParticleShape>(
-        j.value("shape", static_cast<int>(p.shape)));
-    p.shapeExtents = vec3FromJson(j.contains("shapeExtents")
-                                      ? j["shapeExtents"] : null,
-                                  p.shapeExtents);
-    p.shapeRadius = j.value("shapeRadius", p.shapeRadius);
-    p.radiusThickness = j.value("radiusThickness", p.radiusThickness);
-    p.arc = j.value("arc", p.arc);
-    p.shapeRotation = j.value("shapeRotation", p.shapeRotation);
-    p.emitFrom = static_cast<ecs::ParticleEmitFrom>(
-        j.value("emitFrom", static_cast<int>(p.emitFrom)));
-    // ---- Velocity over Lifetime ----
-    p.velOverLifeEnabled = j.value("velOverLifeEnabled", p.velOverLifeEnabled);
-    p.velOverLifeX = vec4FromJson(
-        j.contains("velOverLifeX") ? j["velOverLifeX"] : null, p.velOverLifeX);
-    p.velOverLifeY = vec4FromJson(
-        j.contains("velOverLifeY") ? j["velOverLifeY"] : null, p.velOverLifeY);
-    p.velOverLifeZ = vec4FromJson(
-        j.contains("velOverLifeZ") ? j["velOverLifeZ"] : null, p.velOverLifeZ);
-    p.velOverLifeWorldSpace =
-        j.value("velOverLifeWorldSpace", p.velOverLifeWorldSpace);
-    p.orbital = vec3FromJson(j.contains("orbital") ? j["orbital"] : null,
-                             p.orbital);
-    p.orbitalOffset = j.value("orbitalOffset", p.orbitalOffset);
-    p.radial = j.value("radial", p.radial);
-    p.speedModifier = vec4FromJson(
-        j.contains("speedModifier") ? j["speedModifier"] : null,
-        p.speedModifier);
-    // ---- Limit Velocity ----
-    p.limitVelEnabled = j.value("limitVelEnabled", p.limitVelEnabled);
-    p.limitSpeed = j.value("limitSpeed", p.limitSpeed);
-    p.limitDampen = j.value("limitDampen", p.limitDampen);
-    // ---- Force ----
-    p.forceEnabled = j.value("forceEnabled", p.forceEnabled);
-    p.force = vec3FromJson(j.contains("force") ? j["force"] : null, p.force);
-    p.forceRandomize = j.value("forceRandomize", p.forceRandomize);
-    // ---- Rotation over Lifetime ----
-    p.startRotation = j.value("startRotation", p.startRotation);
-    p.startRotationVariance =
-        j.value("startRotationVariance", p.startRotationVariance);
-    p.angularVelocity = j.value("angularVelocity", p.angularVelocity);
-    p.angularVelocityVariance =
-        j.value("angularVelocityVariance", p.angularVelocityVariance);
-    // ---- Noise ----
-    p.noiseEnabled = j.value("noiseEnabled", p.noiseEnabled);
-    p.noiseStrength = j.value("noiseStrength", p.noiseStrength);
-    p.noiseFrequency = j.value("noiseFrequency", p.noiseFrequency);
-    p.noiseScrollSpeed = j.value("noiseScrollSpeed", p.noiseScrollSpeed);
-    p.noiseDamping = j.value("noiseDamping", p.noiseDamping);
-    p.noiseOctaves = j.value("noiseOctaves", p.noiseOctaves);
-    // ---- Physics ----
-    p.gravity = vec3FromJson(j.contains("gravity") ? j["gravity"] : null,
-                             p.gravity);
-    p.drag = j.value("drag", p.drag);
-    p.simulationSpace = static_cast<ecs::ParticleSimulationSpace>(
-        j.value("simulationSpace", static_cast<int>(p.simulationSpace)));
-    // ---- Size / Color over Lifetime ----
-    p.sizeOverLife = vec4FromJson(
-        j.contains("sizeOverLife") ? j["sizeOverLife"] : null, p.sizeOverLife);
-    p.alphaOverLife = vec4FromJson(
-        j.contains("alphaOverLife") ? j["alphaOverLife"] : null,
-        p.alphaOverLife);
-    if (j.contains("colorRamp") && j["colorRamp"].is_array() &&
-        !j["colorRamp"].empty()) {
-        const json& ramp = j["colorRamp"];
-        const int n = glm::clamp(
-            j.value("colorRampCount", static_cast<int>(ramp.size())), 1,
-            ecs::kMaxColorStops);
-        for (int s = 0; s < n; ++s) {
-            const size_t idx = static_cast<size_t>(
-                s < static_cast<int>(ramp.size()) ? s : ramp.size() - 1);
-            const json& e = ramp[idx];
-            glm::vec3 c(1.0f);
-            if (e.is_object()) {
-                c = vec3FromJson(e.contains("color") ? e["color"] : null, c);
-                p.colorRamp.stops[s].w =
-                    e.value("t", p.colorRamp.stops[s].w);
-            }
-            p.colorRamp.stops[s] = glm::vec4(c, p.colorRamp.stops[s].w);
-        }
-        p.colorRamp.count = n;
-    } else {
-        // 老格式：三段固定颜色 → 塞进渐变带（t = 0 / 0.5 / 1）
-        const glm::vec3 c0 = vec3FromJson(
-            j.contains("colorStart") ? j["colorStart"] : null,
-            glm::vec3(1.0f, 0.75f, 0.25f));
-        const glm::vec3 c1 = vec3FromJson(
-            j.contains("colorMid") ? j["colorMid"] : null,
-            glm::vec3(1.0f, 0.35f, 0.05f));
-        const glm::vec3 c2 = vec3FromJson(
-            j.contains("colorEnd") ? j["colorEnd"] : null,
-            glm::vec3(0.25f, 0.04f, 0.02f));
-        p.colorRamp.count = 3;
-        p.colorRamp.stops[0] = glm::vec4(c0, 0.0f);
-        p.colorRamp.stops[1] = glm::vec4(c1, 0.5f);
-        p.colorRamp.stops[2] = glm::vec4(c2, 1.0f);
-    }
-    p.colorRamp.sort();
-    // ---- Renderer ----
-    p.startSize = j.value("startSize", p.startSize);
-    // 贴图形状（ParticleSprite）。老场景没有这个键 → 保持默认 Disc，
-    // 也就是**逐像素不变**。
-    p.sprite = static_cast<ecs::ParticleSprite>(
-        glm::clamp(j.value("sprite", 0), 0,
-                   static_cast<int>(ecs::ParticleSprite::Count) - 1));
-    p.blend = static_cast<ecs::ParticleBlend>(
-        j.value("blend", static_cast<int>(p.blend)));
-    p.renderMode = static_cast<ecs::ParticleRenderMode>(
-        j.value("renderMode", static_cast<int>(p.renderMode)));
-    p.sortMode = static_cast<ecs::ParticleSortMode>(
-        j.value("sortMode", static_cast<int>(p.sortMode)));
-    p.stretchScale = j.value("stretchScale", p.stretchScale);
-    p.emissive = j.value("emissive", p.emissive);
-    p.softParticles = j.value("softParticles", p.softParticles);
-    p.softDistance = j.value("softDistance", p.softDistance);
-    p.enabled = j.value("enabled", true);
-    return p;
 }
 
 // ---------------------------------------------------------------- 物理（R7-1）
@@ -3130,6 +3076,13 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
                       const ecs::TransformComponent& tr,
                       const std::unordered_map<ecs::EntityId, int>& indexOf,
                       json& out, bool includeEmpty) {
+    // ⚠⚠ 特效宿主（P1-2）**两条路都跳过**：场景文件与存档。
+    //   它是 `fx::EffectService` 为"不反复增删实体"而预建的池子，
+    //   属于运行时派生对象。存进去的后果是读档后场景里多出 N 个
+    //   空发射器（玩家根本没放），而且它们的 slot 编号与新的池对不上。
+    //   返回 false 的语义是"这个实体不参与序列化"，与"空实体"同一条路。
+    if (w.has<ecs::FxHostComponent>(e)) return false;
+
     json je;
     const std::string* nm = w.name(e);
     je["name"] = nm ? *nm : std::string("Entity");
@@ -3270,6 +3223,14 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
     if (const auto* jt = w.get<ecs::JointComponent>(e))
         je["joint"] = jointToJson(*jt);
 
+    // 导航代理（C8）。只写**配置**（速度/到点距离/目标），运行态（路径、
+    // 下一个路点、重求计时）一律不写 —— 写进去会让"读档后沿着上一次的
+    // 路径走"，而那时世界已经变了。
+    // ⚠ 这个块与 `rigidbody` 不同：代理**通常有网格**（NPC 模型），所以
+    //   它在 `hasNonMeshContent` 里只是"保险"，理由见那一行注释。
+    if (const auto* na = w.get<ecs::NavAgentComponent>(e))
+        je["nav"] = nav::navAgentToJson(*na);
+
     // 动画器（角色链 A1）。挂在同一个模型根实体上，紧跟 skinned 之后。
     // 存盘顺序 = 读档顺序，所以 animatorFromJson 里的 modelFromSource
     // 一定能命中 AssetManager 缓存（键 = modelKey）。
@@ -3322,6 +3283,39 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
                         static_cast<unsigned>(e.id),
                         dlg->dialoguePath.c_str(), dlg->autoStart ? 1 : 0,
                         static_cast<double>(dlg->cps), dlg->priority);
+        }
+    }
+
+
+    // 玩法状态（P2）。**只要组件在就写** —— 与上面几个"空就跳过"的不同：
+    // 一个只有 `speed`/`team` 的 GameplayComponent 是**有意义的**
+    // （它决定这个人参不参与回合调度），跳过它就等于把这个人从队列里删掉。
+    if (const auto* gp = w.get<ecs::GameplayComponent>(e)) {
+        je["gameplay"] = gameplayToJson(*gp);
+        VK_LOG_INFO("SCENE-GAMEPLAY entity=%u attrs=%d statuses=%d speed=%.1f "
+                    "gauge=%.1f queue=%d",
+                    static_cast<unsigned>(e.id),
+                    static_cast<int>(gp->attributes.size()),
+                    static_cast<int>(gp->statuses.size()),
+                    static_cast<double>(gp->speed),
+                    static_cast<double>(gp->gauge), gp->inTurnQueue ? 1 : 0);
+    }
+
+    // 牌堆（P3-3）。**有牌才写** —— 挂了个空 CardDeckComponent 不算内容
+    // （`hasNonMeshContent` 那边也是同一条判断，两边必须一致，否则会出现
+    // "写了但读端不认"或者"空实体被塞进场景文件"）。
+    if (const auto* cd = w.get<ecs::CardDeckComponent>(e)) {
+        if (cd->zones.total() > 0) {
+            je["cards"] = cardsToJson(*cd);
+            VK_LOG_INFO("SCENE-CARDS entity=%u draw=%d hand=%d discard=%d "
+                        "exhaust=%d limbo=%d uid=%u",
+                        static_cast<unsigned>(e.id),
+                        static_cast<int>(cd->zones.count(gameplay::CardPile::Draw)),
+                        static_cast<int>(cd->zones.count(gameplay::CardPile::Hand)),
+                        static_cast<int>(cd->zones.count(gameplay::CardPile::Discard)),
+                        static_cast<int>(cd->zones.count(gameplay::CardPile::Exhaust)),
+                        static_cast<int>(cd->zones.count(gameplay::CardPile::Limbo)),
+                        cd->zones.nextUid());
         }
     }
 
@@ -3455,6 +3449,10 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
         je.contains("ik") || je.contains("attach") ||
         je.contains("animClip") || je.contains("gameStart") ||
         je.contains("animKeys") ||
+        // C8 导航代理。NPC 通常有网格，所以它多半不影响 skipped；但
+        // "只有代理、没有网格"的实体（棋盘单位 / 隐形巡逻点）是合法用法，
+        // 漏了会被算成 skipped，而回归拿 skipped=0 断言"没丢东西"。
+        je.contains("nav") ||
         // C1 过场时间轴。挂它的实体**通常没有网格**（就是一根"导演轨"），
         // 漏在这里会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
         // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
@@ -3479,7 +3477,14 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
         //   空了两年，`verify_material_instances` 的 B1 一直拿 A=None）。
         //   那份夹具已经补上 `"mesh": {"kind":"builtin","shape":"cube"}`。
         // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
-        je.contains("primitive");
+        je.contains("primitive") ||
+        // P2 玩法状态。**必须在这里**：回合制里"只有数值、没有网格"的单位
+        // 完全合法（一个技能触发器、一个看不见的 buff 载体）。漏了它会被
+        // 算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+        // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
+        je.contains("gameplay") ||
+        // 牌堆（P3-3）：有牌才算内容。空 CardDeckComponent 与写端同一条判断。
+        je.contains("cards");
     // ⚠ `includeEmpty` 只给**存档**用（G17-1）。场景文件要的是"不写空壳"，
     //   存档要的是"全量" —— 一个只挂 Transform 的空物体（玩家、出生点、
     //   纯分组节点）在场景里确实没什么好存的，但存档漏了它 = 读档后
@@ -3626,6 +3631,26 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
         }
     }
 
+    // ---- 导航代理（C8）----
+    // 缺字段 = 用默认值（`navAgentFromJson` 的语义）；`{}` 是合法的
+    // "挂一个全默认的代理"。⚠ 不是 object 时**不建组件** —— 但那样就等于
+    // "作者的代理没读进来"，所以打一行 WARN（否则症状只是 NPC 站着不动）。
+    if (je.contains("nav")) {
+        ecs::NavAgentComponent na;
+        if (nav::navAgentFromJson(je["nav"], na)) {
+            if (auto* p = w.get<ecs::NavAgentComponent>(e))
+                *p = na;
+            else
+                w.add<ecs::NavAgentComponent>(e, na);
+            VK_LOG_INFO("SCENE-NAV entity=%u speed=%.2f goal=%d ok=1",
+                        static_cast<unsigned>(e.id), static_cast<double>(na.speed),
+                        na.hasGoal ? 1 : 0);
+        } else {
+            VK_LOG_WARN("SCENE-NAV entity=%u ok=0 reason=not-an-object",
+                        static_cast<unsigned>(e.id));
+        }
+    }
+
     // ---- 表情预设（B6）----
     // 与 `morph` 分开两次解析：`expression` 不需要 MorphComponent，
     // 而 `morph` 的失败（资产没有 blend shape）不该连累表情配置丢掉。
@@ -3706,6 +3731,53 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
                         dlg.priority);
         } else {
             VK_LOG_INFO("SCENE-DIALOGUE entity=%u ok=0", static_cast<unsigned>(e.id));
+        }
+    }
+
+    // 玩法状态（P2）。读端不重算任何数值 —— `attributes` 里存的就是
+    // 白值（含"当前 hp"），`statuses` 里存的是完整定义 + 层数/回合。
+    // 于是"读档之后面板显示的数"与"存盘那一刻"逐位相同。
+    if (je.contains("gameplay")) {
+        ecs::GameplayComponent gp;
+        if (gameplayFromJson(je["gameplay"], gp)) {
+            if (auto* p = w.get<ecs::GameplayComponent>(e))
+                *p = gp;
+            else
+                w.add<ecs::GameplayComponent>(e, gp);
+            VK_LOG_INFO("SCENE-GAMEPLAY entity=%u attrs=%d statuses=%d speed=%.1f "
+                        "gauge=%.1f queue=%d ok=1",
+                        static_cast<unsigned>(e.id),
+                        static_cast<int>(gp.attributes.size()),
+                        static_cast<int>(gp.statuses.size()),
+                        static_cast<double>(gp.speed),
+                        static_cast<double>(gp.gauge), gp.inTurnQueue ? 1 : 0);
+        } else {
+            VK_LOG_INFO("SCENE-GAMEPLAY entity=%u ok=0", static_cast<unsigned>(e.id));
+        }
+    }
+
+    // 牌堆（P3-3）。读回来的只有"哪张牌在哪一区"，定义表由配表补
+    // （`CardZones::setDefs`）—— 所以读档之后**立刻**能看到 `def()==nullptr`
+    // 的牌，那是正常的，不是坏档。
+    if (je.contains("cards")) {
+        ecs::CardDeckComponent cd;
+        if (cardsFromJson(je["cards"], cd)) {
+            if (auto* p = w.get<ecs::CardDeckComponent>(e))
+                *p = cd;
+            else
+                w.add<ecs::CardDeckComponent>(e, std::move(cd));
+            const auto& z = w.get<ecs::CardDeckComponent>(e)->zones;
+            VK_LOG_INFO("SCENE-CARDS entity=%u draw=%d hand=%d discard=%d "
+                        "exhaust=%d limbo=%d uid=%u ok=1",
+                        static_cast<unsigned>(e.id),
+                        static_cast<int>(z.count(gameplay::CardPile::Draw)),
+                        static_cast<int>(z.count(gameplay::CardPile::Hand)),
+                        static_cast<int>(z.count(gameplay::CardPile::Discard)),
+                        static_cast<int>(z.count(gameplay::CardPile::Exhaust)),
+                        static_cast<int>(z.count(gameplay::CardPile::Limbo)),
+                        z.nextUid());
+        } else {
+            VK_LOG_INFO("SCENE-CARDS entity=%u ok=0", static_cast<unsigned>(e.id));
         }
     }
 
@@ -4074,6 +4146,10 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
         je.contains("ik") || je.contains("attach") ||
         je.contains("animClip") || je.contains("gameStart") ||
         je.contains("animKeys") ||
+        // C8 导航代理。NPC 通常有网格，所以它多半不影响 skipped；但
+        // "只有代理、没有网格"的实体（棋盘单位 / 隐形巡逻点）是合法用法，
+        // 漏了会被算成 skipped，而回归拿 skipped=0 断言"没丢东西"。
+        je.contains("nav") ||
         // C1 过场时间轴。挂它的实体**通常没有网格**（就是一根"导演轨"），
         // 漏在这里会被算进 skipped，而回归拿 skipped=0 断"没丢东西"。
         // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
@@ -4090,7 +4166,14 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
         // 内置图元（`MeshComponent::primitive`）。与写端同一份名单、同一个
         // 理由：程序化箱体没有 mesh，只有 primitive。漏了它 → 读端把这种
         // 实体判成"空壳"丢掉（或者只留 Transform），表现成"存了读不回来"。
-        je.contains("primitive");
+        je.contains("primitive") ||
+        // P2 玩法状态。**必须在这里**：回合制里"只有数值、没有网格"的单位
+        // 完全合法（一个技能触发器、一个看不见的 buff 载体）。漏了它会被
+        // 算进 skipped，而回归拿 skipped=0 断"没丢东西"。
+        // ⚠ 写端与读端各有一份同样名单，改一处必须改两处。
+        je.contains("gameplay") ||
+        // 牌堆（P3-3）：有牌才算内容。空 CardDeckComponent 与写端同一条判断。
+        je.contains("cards");
     return mesh || mat || hasNonMeshContent;
 }
 
@@ -4236,7 +4319,9 @@ json buildSceneJson(const Scene& scene, SceneIoResult& r) {
 // ---- G16-5：这里现在是三段的**组合**，不再是三件事的混合体 ----
 // 想"后台解析 / 主线程上传"的话，把 ① ② 搬到工作线程、只把 ③ 留在这里即可。
 SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets, const json& root,
-                                const std::string& path = "<memory>") {
+                                const std::string& path = "<memory>",
+                                bool additive = false,
+                                std::vector<ecs::Entity>* createdOut = nullptr) {
     SceneIoResult r;
 
     // ① 解析（版本校验在里，早于任何 `clear`）
@@ -4251,14 +4336,24 @@ SceneIoResult loadSceneFromJson(Scene& scene, assets::AssetManager& assets, cons
     std::vector<ecs::Entity> created;
     std::unordered_map<ecs::EntityGuid, ecs::Entity> guidMap;
     DocumentStats st;
-    instantiateDocument(scene, doc, created, guidMap, st);
+    // G19：additive 时不 clear、不应用 globals（见 SceneDocument.h）
+    instantiateDocument(scene, doc, created, guidMap, st, additive);
 
     // 一条汇总，不是每实体一条 —— 42 个实体刷 42 行会把真正的问题淹没。
-    VK_LOG_INFO("SCENE-GUID assigned=%d dup=%d total=%d path=%s", st.guidAssigned, st.guidDup,
-                st.entities, path.c_str());
+    VK_LOG_INFO("SCENE-GUID assigned=%d dup=%d total=%d path=%s",
+                st.guidAssigned, st.guidDup, st.entities, path.c_str());
 
     // ③ 资产（唯一要设备的一句）
     resolveDocumentAssets(scene, assets, doc, created, st);
+
+    // 流送要把"这一批实体"记下来才能卸载。只填有效槽位：`created` 里的
+    // invalid 占位是"文件里那一块解析失败"，它没有实体可销毁。
+    if (createdOut) {
+        createdOut->clear();
+        createdOut->reserve(created.size());
+        for (const ecs::Entity& e : created)
+            if (e.valid()) createdOut->push_back(e);
+    }
 
     r.ok = true;
     r.entities = st.entities;
@@ -4350,82 +4445,86 @@ bool parseSceneDocument(const nlohmann::json& root, SceneDocument& out, std::str
 void instantiateDocument(Scene& scene, const SceneDocument& doc,
                          std::vector<ecs::Entity>& created,
                          std::unordered_map<ecs::EntityGuid, ecs::Entity>& guidMap,
-                         DocumentStats& stats) {
+                         DocumentStats& stats, bool additive) {
     created.clear();
     guidMap.clear();
 
-    // 清空旧场景（AssetManager 的网格/材质/纹理缓存保留并可复用）
-    scene.clear();
+    // ---- G19：additive 时**只**建实体，不动这个世界的全局 ----
+    // 见 SceneDocument.h 上的长注释（为什么 globals 要整块跳过）。
+    if (!additive) {
+        // 清空旧场景（AssetManager 的网格/材质/纹理缓存保留并可复用）
+        scene.clear();
 
-    const nlohmann::json& g = doc.globals;
-    auto has = [&g](const char* k) { return g.contains(k); };
+        const nlohmann::json& g = doc.globals;
+        auto has = [&g](const char* k) { return g.contains(k); };
 
-    applyCamera(scene.camera(), has("camera") ? g["camera"] : nlohmann::json(nullptr));
-    // 额外相机（多相机）。顶层 "camera" 已经钉好 0 号，这里从 1 号起补。
-    if (has("cameras") && g["cameras"].is_array()) {
-        const nlohmann::json& cams = g["cameras"];
-        for (size_t i = 0; i < cams.size(); ++i) {
-            Camera& cam = (scene.cameraCount() > i + 1) ? scene.camera(i + 1)
-                                                        : scene.camera(scene.addCamera());
-            applyCamera(cam, cams[i]);
+        applyCamera(scene.camera(), has("camera") ? g["camera"] : nlohmann::json(nullptr));
+        // 额外相机（多相机）。顶层 "camera" 已经钉好 0 号，这里从 1 号起补。
+        if (has("cameras") && g["cameras"].is_array()) {
+            const nlohmann::json& cams = g["cameras"];
+            for (size_t i = 0; i < cams.size(); ++i) {
+                Camera& cam = (scene.cameraCount() > i + 1) ? scene.camera(i + 1)
+                                                            : scene.camera(scene.addCamera());
+                applyCamera(cam, cams[i]);
+            }
         }
-    }
-    applyLight(scene.light(), has("light") ? g["light"] : nlohmann::json(nullptr));
+        applyLight(scene.light(), has("light") ? g["light"] : nlohmann::json(nullptr));
 
-    // 物理世界（R7-1）。scene.clear() 已经把 m_physics 复位成默认值，
-    // 所以"老场景没有 physics 字段"这条路径**什么都不用做**就是对的。
-    physicsFromJson(scene.physicsSettings(),
-                    has("physics") ? g["physics"] : nlohmann::json(nullptr));
+        // 物理世界（R7-1）。scene.clear() 已经把 m_physics 复位成默认值，
+        // 所以"老场景没有 physics 字段"这条路径**什么都不用做**就是对的。
+        physicsFromJson(scene.physicsSettings(),
+                        has("physics") ? g["physics"] : nlohmann::json(nullptr));
 
-    // ---- 天空 / 天气（2026-11-01）----
-    // scene.clear() 已经把 m_sky 复位成默认值，所以"老场景没有 environment
-    // 字段"这条路径什么都不用做就是对的 —— 与上面 physics 同一条规矩。
-    //
-    // 逐字段读而不是整块拷：缺字段时**保留默认值**，于是手写一个
-    // 只有三行的 environment（比如只写 cloudCoverage）也能加到调好的
-    // 默认天空上，而不是把没写的字段全清成 0（那会得到一片全黑）。
-    if (has("environment") && g["environment"].is_object()) {
-        const nlohmann::json& e = g["environment"];
-        render::SkyParams& s = scene.environment();
-        auto getV3 = [&e](const char* k, glm::vec3& out) {
-            if (!e.contains(k) || !e[k].is_array() || e[k].size() != 3) return;
-            out = glm::vec3(e[k][0].get<float>(), e[k][1].get<float>(),
-                            e[k][2].get<float>());
-        };
-        auto getF = [&e](const char* k, float& out) {
-            if (e.contains(k) && e[k].is_number()) out = e[k].get<float>();
-        };
-        getV3("zenith", s.zenith);
-        getV3("horizon", s.horizon);
-        getV3("ground", s.ground);
-        getV3("cloudColor", s.cloudColor);
-        getV3("starColor", s.starColor);
-        getV3("sunDirection", s.sunDirection);
-        getF("exposure", s.exposure);
-        getF("sunAngularRadius", s.sunAngularRadius);
-        getF("cloudCoverage", s.cloudCoverage);
-        getF("cloudThickness", s.cloudThickness);
-        getF("cloudScale", s.cloudScale);
-        getF("cloudHeight", s.cloudHeight);
-        getF("cloudSpeed", s.cloudSpeed);
-        getF("cloudShadow", s.cloudShadow);
-        getF("starAmount", s.starAmount);
-        getF("sunIntensity", s.sunIntensity);
-        getF("starBrightness", s.starBrightness);
-        getF("cloudEdgeSharpness", s.cloudEdgeSharpness);
-        getF("horizonGlow", s.horizonGlow);
-    }
-
-    // 脚本世界黑板（S2）+ 后处理体积
-    scene.scriptVars().clear();
-    if (has("scriptVars") && g["scriptVars"].is_object()) {
-        for (auto it = g["scriptVars"].begin(); it != g["scriptVars"].end(); ++it) {
-            if (it.value().is_number()) scene.scriptVars()[it.key()] = it.value().get<double>();
+        // ---- 天空 / 天气（2026-11-01）----
+        // scene.clear() 已经把 m_sky 复位成默认值，所以"老场景没有 environment
+        // 字段"这条路径什么都不用做就是对的 —— 与上面 physics 同一条规矩。
+        //
+        // 逐字段读而不是整块拷：缺字段时**保留默认值**，于是手写一个
+        // 只有三行的 environment（比如只写 cloudCoverage）也能加到调好的
+        // 默认天空上，而不是把没写的字段全清成 0（那会得到一片全黑）。
+        if (has("environment") && g["environment"].is_object()) {
+            const nlohmann::json& e = g["environment"];
+            render::SkyParams& s = scene.environment();
+            auto getV3 = [&e](const char* k, glm::vec3& out) {
+                if (!e.contains(k) || !e[k].is_array() || e[k].size() != 3) return;
+                out = glm::vec3(e[k][0].get<float>(), e[k][1].get<float>(),
+                                e[k][2].get<float>());
+            };
+            auto getF = [&e](const char* k, float& out) {
+                if (e.contains(k) && e[k].is_number()) out = e[k].get<float>();
+            };
+            getV3("zenith", s.zenith);
+            getV3("horizon", s.horizon);
+            getV3("ground", s.ground);
+            getV3("cloudColor", s.cloudColor);
+            getV3("starColor", s.starColor);
+            getV3("sunDirection", s.sunDirection);
+            getF("exposure", s.exposure);
+            getF("sunAngularRadius", s.sunAngularRadius);
+            getF("cloudCoverage", s.cloudCoverage);
+            getF("cloudThickness", s.cloudThickness);
+            getF("cloudScale", s.cloudScale);
+            getF("cloudHeight", s.cloudHeight);
+            getF("cloudSpeed", s.cloudSpeed);
+            getF("cloudShadow", s.cloudShadow);
+            getF("starAmount", s.starAmount);
+            getF("sunIntensity", s.sunIntensity);
+            getF("starBrightness", s.starBrightness);
+            getF("cloudEdgeSharpness", s.cloudEdgeSharpness);
+            getF("horizonGlow", s.horizonGlow);
         }
-    }
-    if (has("postVolumes") && g["postVolumes"].is_array()) {
-        for (const nlohmann::json& jv : g["postVolumes"])
-            scene.postVolumes().add(postVolumeFromJson(jv));
+
+        // 脚本世界黑板（S2）+ 后处理体积
+        scene.scriptVars().clear();
+        if (has("scriptVars") && g["scriptVars"].is_object()) {
+            for (auto it = g["scriptVars"].begin(); it != g["scriptVars"].end(); ++it) {
+                if (it.value().is_number()) scene.scriptVars()[it.key()] = it.value().get<double>();
+            }
+        }
+        if (has("postVolumes") && g["postVolumes"].is_array()) {
+            for (const nlohmann::json& jv : g["postVolumes"])
+                scene.postVolumes().add(postVolumeFromJson(jv));
+        }
     }
 
     created.reserve(doc.entities.size());
@@ -4619,6 +4718,42 @@ SceneIoResult loadScene(Scene& scene, assets::AssetManager& assets,
     if (r.ok) {
         VK_LOG_INFO("Scene loaded: %s (%d entities, %d skipped)", path.c_str(),
                     r.entities, r.skipped);
+    }
+    return r;
+}
+
+// ============================================================
+// G19：叠加加载（关卡流送）
+//
+// 与 `loadScene` 只差一件事：**不清空世界、不应用 globals**。
+// 其余（① 解析 / ② 建实体 / ③ 资产）走的是**同一条**实现 —— 分成两份的话
+// "以后加组件"就要改两处，而漏改的那一处不报错。
+// ============================================================
+SceneIoResult loadSceneAdditive(Scene& scene, assets::AssetManager& assets,
+                                const std::string& path,
+                                std::vector<ecs::Entity>* createdOut) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        SceneIoResult r;
+        r.error = "cannot open: " + path;
+        return r;
+    }
+
+    json root;
+    try {
+        in >> root;
+    } catch (const std::exception& ex) {
+        SceneIoResult r;
+        r.error = std::string("JSON parse error: ") + ex.what();
+        return r;
+    }
+
+    SceneIoResult r = loadSceneFromJson(scene, assets, root, path, true, createdOut);
+    if (r.ok) {
+        // 单独一条日志：`Scene loaded` 是"换了一张场景"，这一条是"并进来一批
+        // 实体"。混用的话，看日志分不出"关卡被切了"和"副关卡流送进来了"。
+        VK_LOG_INFO("SCENE-STREAM load path=%s entities=%d skipped=%d",
+                    path.c_str(), r.entities, r.skipped);
     }
     return r;
 }

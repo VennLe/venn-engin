@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "name": "action_demo",
+  "canvas": [1920, 1080],
+  "//": "UI 事件回调（UiWidget::action）的验收夹具（2026-11-02），配套 tools/verify_ui_actions.py。每个按钮对应一种动词：flag / toggle / sound / quit，另有「没配 action」与「visibleBind 条件可见」各一个。⚠ 坐标是**参考像素**（1920x1080），注入点击用的也是参考像素，所以改这里的 rect 必须同步改脚本里的 BtnRect / CLICKS，否则命中会整体漂到邻居身上。手动看效果：Game.exe --ui-doc ui/docs/action_demo.ui.json",
+  "widgets": [
+    {
+      "id": "btn_flag",
+      "type": "button",
+      "anchor": "top-left",
+      "rect": [100, 100, 240, 64],
+      "color": "#2A2E36F2",
+      "color2": "#FFFFFFFF",
+      "radius": 10,
+      "text": "flag:menuStart=1",
+      "size": 18,
+      "align": "center",
+      "action": "flag:menuStart=1"
+    },
+    {
+      "id": "btn_toggle",
+      "type": "button",
+      "anchor": "top-left",
+      "rect": [100, 200, 240, 64],
+      "color": "#2A2E36F2",
+      "color2": "#FFFFFFFF",
+      "radius": 10,
+      "text": "toggle:musicOn",
+      "size": 18,
+      "align": "center",
+      "action": "toggle:musicOn"
+    },
+    {
+      "id": "btn_none",
+      "type": "button",
+      "anchor": "top-left",
+      "rect": [100, 300, 240, 64],
+      "color": "#3A2E36F2",
+      "color2": "#FFFFFFFF",
+      "radius": 10,
+      "text": "no action",
+      "size": 18,
+      "align": "center"
+    },
+    {
+      "id": "btn_secret",
+      "type": "button",
+      "anchor": "top-left",
+      "rect": [100, 400, 240, 64],
+      "color": "#2A2E36F2",
+      "color2": "#FFFFFFFF",
+      "radius": 10,
+      "text": "reveal",
+      "size": 18,
+      "align": "center",
+      "action": "flag:secret=1"
+    },
+    {
+      "id": "panel_secret",
+      "type": "nine",
+      "anchor": "top-left",
+      "rect": [100, 500, 480, 140],
+      "color": "#0E1116E6",
+      "color2": "#7F5AF0FF",
+      "radius": 8,
+      "inset": 2,
+      "visibleBind": "secret",
+      "//": "visibleBind=secret：旗标没置起来时**这条记录根本不产出**（连 UIDOC-BOUNDS 都没有），置起来之后才出现。点 btn_secret 之前它不在，之后它在 —— 这就是条件可见的判据。",
+      "children": [
+        {
+          "id": "secret_text",
+          "type": "text",
+          "rect": [16, 16, 448, 40],
+          "color": "#F2F5FAFF",
+          "text": "secret revealed",
+          "size": 22,
+          "align": "left"
+        }
+      ]
+    },
+    {
+      "id": "btn_sound",
+      "type": "button",
+      "anchor": "top-left",
+      "rect": [700, 100, 240, 64],
+      "color": "#2A2E36F2",
+      "color2": "#FFFFFFFF",
+      "radius": 10,
+      "text": "sound:click",
+      "size": 18,
+      "align": "center",
+      "action": "sound:audio/click.wav"
+    },
+    {
+      "id": "btn_quit",
+      "type": "button",
+      "anchor": "top-left",
+      "rect": [700, 200, 240, 64],
+      "color": "#3A2A2AF2",
+      "color2": "#FFFFFFFF",
+      "radius": 10,
+      "text": "quit",
+      "size": 18,
+      "align": "center",
+      "action": "quit"
+    },
+    {
+      "id": "btn_disabled",
+      "type": "button",
+      "anchor": "top-left",
+      "rect": [700, 300, 240, 64],
+      "color": "#2A2E36F2",
+      "color2": "#FFFFFFFF",
+      "radius": 10,
+      "text": "disabled",
+      "size": 18,
+      "align": "center",
+      "enabled": false,
+      "action": "flag:shouldNotFire=1"
+    }
+  ]
+}

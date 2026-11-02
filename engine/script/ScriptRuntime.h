@@ -116,6 +116,10 @@ struct ScriptInstance {
     // 面板 / Inspector / 控制台三个地方都要读它，而 ScriptCoroutine 的
     // 布局不对外（在 ScriptRuntime.cpp 里根本看不见）。
     bool waitingNow = false;
+    // C8：断点把它摁住了吗 / 摁在哪一行。与 `waitingNow` 同一条理由镜像在
+    // 实例上：面板要画"停在第 12 行"，而协程布局不对外。
+    bool paused = false;
+    int pauseLine = 0;
     // S5：上一次打进日志的状态。**只在变化时打** —— 面板要"状态列"，
     // 但每帧一行会把日志冲干净。自动化读 `SCR-STATE` 这一行。
     std::string stateLogged; // 上一步消耗的步数（预算诊断）
@@ -196,12 +200,51 @@ public:
     std::vector<std::pair<std::string, std::string>> sortedVars(
         const ScriptInstance& inst) const;
 
+    // ---- 断点调试（C8，2026-11-02）----
+    //
+    // 分工很清楚：**断点表住这里**（跨实例共享、活过热重载），**暂停态住
+    // 实例上**（每个实体各自停在自己的行）。宿主只需要调三个动词：
+    // 加断点 / 继续 / 单步。
+    BreakpointSet& breakpoints() { return m_bps; }
+    const BreakpointSet& breakpoints() const { return m_bps; }
+
+    // 校验并加一条断点：`line` 必须真的落在该脚本的某条语句上
+    // （`ScriptProgram::executableLines()`），否则返回 false 且 `err` 说明
+    // 原因 —— "在空行上点了个断点，然后永远不命中"是最难自证的那种失败。
+    bool addBreakpoint(const std::string& path, int line, std::string* err);
+    // 去掉一条 / 全部。返回真的删掉了几条。
+    int removeBreakpoint(const std::string& path, int line);
+    int clearBreakpoints();
+    // 某个脚本的可打断行（面板画源码视图用）。脚本没加载 / 编译失败 → 空。
+    const std::vector<int>* executableLines(const std::string& path);
+
+    // 继续 / 单步。**作用在全部处于暂停的实例上** —— 三个敌人被同一个
+    // 断点停住时，"继续"当然该一次放行三个（逐个点才是奇怪的那个）。
+    // 返回被放行的实例数。
+    int resumeAll();
+    int stepAll();
+    // 暂停中的实例（面板 / `script.at` 用；按实体 id 升序，确定性）
+    std::vector<const ScriptInstance*> pausedInstances() const;
+
+    // **当前正在执行**哪个实例的脚本（C8 顺带补上的一格）。
+    //
+    // 谁用它：宿主的 `svc.act.setFlag` 要记"谁写的"。那是**只能在写入
+    // 那一刻知道**的信息（事后推断不出来），而 `setFlag` 的签名里没有
+    // 实例 —— 于是从 tick 内核这里借一个"现在轮到谁"。
+    // ⚠ 只在 `runFrame` 那一行之内有效；宿主回调是同步调进来的，所以
+    //   拿得到。空串 = 当前不在任何脚本里（命令行、自检）。
+    const ScriptInstance* currentInstance() const { return m_current; }
+    const char* currentScriptPath() const {
+        return m_current ? m_current->path.c_str() : "";
+    }
+
     // 上一步的统计（日志汇总 / Instances 面板 / 基准都读它）
     struct Stats {
         uint32_t total = 0;      // 场景里有几个 ScriptComponent（含 disabled）
         uint32_t executed = 0;   // 本步真的跑了几个
         uint32_t failed = 0;     // 本步因为熔断/编译错被跳过的
         uint32_t skipped = 0;    // disabled / 空路径
+        uint32_t paused = 0;     // C8：本步被断点摁住的
         uint64_t steps = 0;      // 本步总步数
     };
     const Stats& lastStats() const { return m_stats; }
@@ -230,6 +273,10 @@ private:
                      ScriptInstance::ErrorKind kind);
 
     ScriptEngine m_engine;
+    // C8：断点表（跨实例、活过热重载 —— 见 `BreakpointSet` 的注释）
+    BreakpointSet m_bps;
+    // C8：正在 runFrame 的那个实例（`setFlag` 记 writer 用）
+    const ScriptInstance* m_current = nullptr;
     // 本步待派发的接触事件（tick 末尾清空）
     std::vector<ScriptContact> m_contacts;
     // 上一步派发了多少条（只给 trace 统计行用）

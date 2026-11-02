@@ -192,6 +192,32 @@ DEFAULT = [
     # 冻结帧（MYVK_FX_FREEZE）同配置两次逐像素一致是"确定性"的硬证据；
     # 面板结构与 12 个模块的字段清单走 FX-PARAMS 断言。
     "verify_particles",
+    # 特效调度（P1）：.veffect 打包 / 宿主池（上限 + 抢占确定性）/
+    # 动画事件路由（`Hit|fx/xxx` → 特效）/ 6 个脚本动词 / 打击感三件。
+    # 判据是计数而不是像素：`FX-PLAY id>0`（真占到槽）、`dropped=3`
+    # （池满的确定性丢弃）、`FX-HITSTOP end elapsed≈total`（真实 dt）。
+    "verify_fx",
+    # 玩法状态层（P2）：`AttributeSet` 求值顺序（Override→Flat→AddPct→MulPct
+    # →clamp）/ 状态叠加三规则 / 伤害**五步明细**（护甲·易伤·护盾·真伤）/
+    # PCG32 三流分离 / 行动条（CTB）/ 存档往返 / 四个脚本动词。
+    # 判据读**明细**与**具体数字**而不是"页签在"：只读最终血量的话
+    # "护甲没生效"和"易伤没生效"能给出完全一样的数。
+    "verify_gameplay",
+    # 牌堆（P3-3）：uid 身份 / 队首抽牌 / 洗回计数 / 手牌上限不烧牌 /
+    # **打出的牌进 Limbo 不进弃牌堆** / 消耗区 / 存档含 Limbo / uid 不复用。
+    # 判据断言 `discard=0`（只验"手上少了一张"的话，两种实现都是绿的）。
+    # A~G **七组**：A 自检计数 / B 自动灌定义（P3-1）/ C 配表往返 / D 越界
+    # / E 存档 / F 明细表 / **G 表现层模板（P3-4：.veffect 资产 + 模板脚本
+    # 真跑 60 帧）**。⚠ G 组会起一个 Game.exe（GUI 独占）→ 与别的 GUI 用例串行。
+    "verify_cards",
+    # 导航（C8）：格子网烘焙 / A* / 视线平滑 / 代理跟随 / `.vnav.json` 资产。
+    # A 自检（`--selftest nav` 94 条）/ B 编辑器命令链 / C 面板锚点 /
+    # D **真跑 Game.exe**（证明运行时接上了，不是"引擎里有个类"）/
+    # E 资产往返 + **故意破坏一次**（位图截短必须被拒）/
+    # F **真跑一份 `.vks`**（`navGoto/navArrived/navFailed/navStop` 四个脚本
+    #   动词 —— 断言到达点 x > 3，因为"arrived 恒返回 1"也能打出那行日志）。
+    # ⚠ B/C/E 各起一次编辑器、D/F 各起一次游戏 —— 都是 GUI 独占，串行。
+    "verify_nav",
     # ---- 阶段 C：核心面板（E11 / E13 / E14）----
     # E11 Inspector：分区折叠**跨实体**保持 / 组件搜索过滤 / Copy-Paste-Reset
     # 往返（POD 字节快照经可撤销命令写回）
@@ -516,6 +542,14 @@ DEFAULT = [
     # ⚠ D 组要跑满 7 秒（上限 = max(3, 字数*0.35)，夹具 20 字 → 7.0），
     #   是本脚本最慢的一组（约 10 s），别当成卡死。
     "verify_dialogue_voice",
+    # ---- C7（2026-11-05）：对话的条件分支 + 选项写旗标 ----
+    # A 自检（`--selftest dialogue` I 组 24 条 `bc_*`）/ B **真跑 Game.exe
+    # 两趟**（0 号选项写 3 → 落在 if 那条线；写 1 → 落在 else 那条线）/
+    # C 剧本编辑器（注入脚本建条件 + 设 else + 挂副作用，再 dump 出 JSON 验）。
+    # ⚠ B 组必须跑两趟：一趟走线证明不了 else 分叉 —— 两种实现（永远走 if /
+    #   永远走 else）各自能过掉其中一趟。
+    # ⚠ 起一个 Game.exe（约 30 s，两趟）+ 一个编辑器。
+    "verify_dialogue_branch",
     # ---- C6 第二批：脚本世界控制 API（旗标 / 刷实体 / 换场景）----
     # 七条断言：旗标写进宿主 / spawn 走真 FBX 装配 / 换场景请求受理 /
     # 下一帧真切换 / **旗标跨场景保留** / 五步顺序 / 没有失败锚点。
@@ -607,6 +641,103 @@ DEFAULT = [
     # ⚠ C 组不能省：A 组是手动调 `tickExpressions`，那一条路径上"Play 每帧
     #   会不会调它"一行都没测到。
     "verify_expression",
+    # 后处理体积（Post-Process Volume，2026-11-02）。
+    # A 读场景 / 求值（盒内 active=1、盒外全 kNoOverride）/ **落盘往返**
+    #   （这条当场抓到 `cgLutBlend` / `autoExposureBias` 没进 toJson 的真 bug）；
+    # B 面板锚点 + "未覆盖的项不画滑条"（kNoOverride 语义在 UI 上唯一的证据）；
+    # C **点 New volume 按钮**真的能建（不是只有命令能建）；
+    # D 老场景（没有 postVolumes 键）不许出事。
+    # ⚠ C 组不能省：面板与命令共用 `postVolumeAdd`，只测命令测不出
+    #   "按钮点不到"——而"界面点不到 = 没交付"。
+    "verify_post_volume",
+    # ---- 2026-11-02：音频混音台（A2）----
+    # 五次启动（命令读回 / 面板锚点 / 点按钮 / 老 audio.bus 路径 / null 后端）。
+    # ⚠ A 组必须含 `audio.state` 读回：只有 `AUDIO-CMD knob=music value=0.30`
+    #   的话，"参数收到了但没落到 AudioSystem"与"真的改了"长得一模一样。
+    # ⚠ D 组是**回归判据**：`setBusGain(Master)` 曾只写 `m_busGain[0]`
+    #   而不写 `m_master`，两个真值各对一半（推子读不到命令改的值）。
+    "verify_audio_mixer",
+    # ---- 2026-11-02：UI 文档的按钮真的能点（审计 B1，`UiWidget::action`）----
+    # 五组：A 无窗口自检 23 条 `uiint_*`；B 注入点击（flag/toggle/sound/禁用/
+    # 点歪/NOACTION 不刷屏）；C 条件可见（visibleBind）；D quit 动词；
+    # E **真鼠标**。
+    # ⚠ B 组里 `toggle` 必须连点两次并断言 1 → 0：只断言"打出了 toggle"的话，
+    #   "每次翻成 1"的实现也绿。
+    # ⚠ C 组的判据是 `UIDOC-STATS widgets=7 skipped=1` → `9/0`，不是"最后有
+    #   panel_secret"——后者对"永远显示"的实现同样成立。
+    # ⚠⚠ E 组守的是**另一条代码路径**：真鼠标要先过 `tickUi` 的"点击视口 →
+    #   进入操作态"，那里原来是**无条件捕获**的（`m_mouseCaptured = true`），
+    #   于是 Playing 下点文档按钮永远点不到，而注入点击照样能点 —— 正是
+    #   `UiDocInput.h` 警告的那种分叉。只有 E 组能抓到。
+    "verify_ui_actions",
+    # ---- 2026-11-02：Project Settings 真面板（审计 B3）----
+    # 六组：A 引擎自检 29 条 `PROJ-TEST`；B 面板 15 锚点 + 22 字段；
+    # C 合并语义（未知键保留）；D 点 PROJ-SAVE 真的落盘；E 端到端启动读到
+    # 新分辨率；F 坏 JSON 拒绝覆盖。
+    # ⚠⚠ C 组必须先往 game.json **注入** `player` 与 `zzUnknownKey` 再存：
+    #   出厂文件里本来没这两个键，不注入就是假绿（整份重写的实现照样通过）。
+    # ⚠⚠ E 组必须换**非默认**值（1280x720 是出厂默认，读没读盘看起来一样）。
+    # ⚠ F 组查的是"文件一字未变"，不是"函数返回 false"。
+    # 全程 copy2 快照 game.json + finally 还原 —— 它会真的写工程配置文件。
+    "verify_project_settings",
+    # ---- 2026-11-02：Stats 的 CPU 分段 + 进程内存（审计 B2 / C9）----
+    # 两次 Game.exe（开/不开 MYVK_CPU_STATS）+ 一次编辑器（锚点 + 展开表）。
+    # ⚠⚠ 最贵的三条：
+    #   · `render >= wait+sync+record+submit+present` —— 唯一能证明五段确实
+    #     是 drawFrame 的**细分**（而不是五个各自独立的计数器）的判据；
+    #     接错嵌套位置会让这条红。
+    #   · `顶层五段之和 <= frame` —— 抓"重复计数"：运行时的 onUpdate 是
+    #     整个 GameLoop::tick（含渲染），在它外面整体套 kLogic 就会让
+    #     logic+render 超过 frame。这类错**单个数字看起来全对**，只有
+    #     堆叠条会冲出 100%。
+    #   · A2 阴性对照：不开 env 时**一行 CPU-STATS 都不许有**。
+    "verify_stats_cpu",
+    # ---- 2026-11-02：配表（C1）+ 本地化编辑（C2）----
+    # 两次无窗口自检（TABLE 18 条 / LOCALE 18 条）+ 三次编辑器（配表两次、
+    # 本地化三次）。
+    # ⚠⚠ 判据的核心都不是"面板画出来了"，而是**磁盘真的变了**：
+    #   · C 组改一格 → 存 → `enemies.csv` 里那一格变、其它行原样保留
+    #     （整表重写会丢注释列/引号，那条会红）；
+    #   · D 组改一条译文 → 存 → `zh.csv` 只有**表头 + 1 行**（把 2900 多条
+    #     内置译文都写进去 = "静态表以后再改永远被旧 CSV 掩盖"）。
+    # ⚠ 会用 `MYVK_EDITOR_CONSOLE_CMD` 传参，而 Windows 的环境变量是 ANSI
+    #   代码页 —— 所以测试值必须是纯 ASCII（中文在里面就已经乱了，那是
+    #   自动化钩子的限制，不是本地化功能的限制）。
+    # ⚠ 全程 copy 快照 + finally 还原两个 csv。
+    "verify_data_tables",
+    # ---- 2026-11-02：剧情旗标（A4）----
+    # 一次 `Game.exe --selftest project`（FLAG 组 23 条）+ 四次编辑器。
+    # ⚠⚠ 这一条真正在守的不是面板，是**编辑器 Play 里 `svc.act.setFlag`
+    #   接上了** —— 之前 Play 里调它只会打 "setFlag() is not available
+    #   in this host"，而剧情分支静默全走 else（不报错，只表现得像"剧本
+    #   没写对"）。C 组就是拿这句话当**反向判据**：它出现即红。
+    # ⚠ D 组钉"进 Play = 新一局"（旗标必须清），断言的是 `set=0`
+    #   而不是 `value=0` —— 只比 value 的话，"把值清零但键留着"照样绿。
+    # ⚠ B 组按**顺序**比整串计数 [2,3,1,0]，不是"某处出现过某个数"。
+    "verify_flags",
+    # ---- 2026-11-02：脚本断点（C8）----
+    # 五次编辑器（编辑态 2 次 + Play 3 次）。
+    # ⚠⚠ 三条最贵的判据：
+    #   · 注释行上点断点必须**被拒收**（静默收下一个永不命中的断点，
+    #     表现成"断点功能坏了"，而日志一条错都没有）；
+    #   · "继续"之后 `ticks` 必须**变大**（唯一能区分"执行一次"与
+    #     "只清了暂停位 / 执行了两次"的量）；
+    #   · "单步"之后行号必须**变**（不变 = 单步等于继续，且不报错）。
+    # ⚠ F 组是阴性对照：不加断点时 `SCR-PAUSE` 必须是 0 条 ——
+    #   没有它，C/D/E 的"有暂停"可能来自熔断路径。
+    # ⚠ G 组要滚到目标行再点：`logRect` 不判可见性，被 `BeginChild`
+    #   裁掉的行有矩形但点不到（细节见 `verify_script_debug.py` 的注释）。
+    "verify_script_debug",
+    # ---- 2026-11-02：关卡流送（G19）----
+    # 一次 `--selftest project`（LEVEL 组 31 条）+ 四次编辑器。
+    # ⚠⚠ 这一条最贵的是 C 组：**叠加加载不能毁掉已有实体**。
+    #   判据是 `world=`（整个场景的实体数）在加载前后**只增不减** ——
+    #   误用 `loadScene`（整份替换）时它会回落成副关卡的实体数，
+    #   而"加载成功了"这条断言对那个错误**完全无效**。
+    # ⚠ D 组按**顺序**比 `loaded` 序列 2→2→1→2→1：同一个盒做加载与卸载时
+    #   中间那步会变 1（滞回失效），序列会红。
+    # ⚠ E 组钉"常驻永不自动卸载"；F 组钉"11 米（缓冲带内）不许卸"。
+    "verify_levels",
     # ---- #320：动画摄影表（Dope Sheet，R8）----
     # 五次启动编辑器（打开+通道树 / 框选批量挪 / 镜像 / 关键帧类型 / 缩放平移）。
     # 两条验收是任务书原文，"逐位"不是"差得少"：
@@ -1317,6 +1448,10 @@ RENDER_MODULES = [
     "engine/render/ShaderHotReload.*",
     "engine/render/ShadowCull.h",
     "engine/render/ShadowPass.*",
+    # 2026-11-02：11-01 的天空参数表漏登记（`check_regression_map` 的 F 组
+    # 当场查出来）。它决定天空/云/星空的**几何与光照输入**，
+    # 改了就要跑 `verify_sky`。
+    "engine/render/SkyParams.*",
     "engine/render/TerrainPass.*",
     "engine/render/VolumetricFog.*",
     # 水体：几何现生成 + 自己的 RenderPass/颜色拷贝图，是"泄漏"高发区
@@ -1367,7 +1502,17 @@ TRIGGERS = {
                               "assets/shaders/ibl_brdf.comp",
                               "assets/shaders/ibl_irradiance.comp",
                               "assets/shaders/ibl_prefilter.comp",
-                              "assets/shaders/sky_cube.comp"],
+                              "assets/shaders/sky_cube.comp",
+                              # 2026-11-03 补：天空模型从 sky.frag 抽成
+                              # `sky_model.glsl`（唯一一份程序化天空）。
+                              # verify_ibl 的判据直接压在它上面 ——
+                              # "四角背景必须逐像素相同"、"天顶色见
+                              # sky_model.glsl"、"IBL 关了背景也不变色"。
+                              # 之前漏登记 → 改这两个文件会触发全量兜底。
+                              # ⚠ 注释里提过的 `verify_sky` **不存在**，
+                              #   别照着它登记。
+                              "assets/shaders/sky.frag",
+                              "assets/shaders/sky_model.glsl"],
     "verify_volumetric_fog": ["engine/render/VolumetricFog.*",
                               "assets/shaders/fog_inject.comp",
                               "assets/shaders/fog_integrate.comp"],
@@ -1529,6 +1674,77 @@ TRIGGERS = {
                               # 这里两个都不是，所以可以登记。）
                               "editor/ParticlesPanel.*",
                               "editor/SceneHierarchy.*"],
+    # P1 特效调度（2026-11-02）：`.veffect` 解析 / 宿主池 / 动画事件路由 /
+    # 6 个脚本动词 / 顿帧闪白震屏。判据全是**计数**（FX-PLAY id / dropped /
+    # FX-HITSTOP elapsed·frames），截一张图证明不了任何一条。
+    # ⚠ `engine/ecs/**`、`engine/scene/Scene.*` 在 GLOBAL_GLOBS 里 ——
+    #   宿主组件（`FxHostComponent`）和场景指针就在那两个文件，所以这里
+    #   **不写它们**（写了会被"全横切登记"判成假跳过）。
+    "verify_fx":             ["engine/fx/EffectAsset.*",
+                              "engine/fx/EffectService.*",
+                              "engine/fx/AnimEventRouter.*",
+                              "engine/scene/ParticleJson.*",
+                              "engine/script/ScriptEngine.*",
+                              "editor/FxPanel.*",
+                              "editor/EditorApp.*"],
+    # 玩法状态层（P2）。看守对象是"数值怎么算"与"界面读到的数对不对"。
+    # ⚠ `engine/ecs/**`（`GameplayComponent` 就在里面）和
+    #   `engine/scene/Scene.{h,cpp}` 在 GLOBAL_GLOBS 里 —— 这里**不写它们**，
+    #   写了会被"全横切登记"判成假跳过。
+    # ⚠ `engine/gameplay/**` 刻意**逐个列**而不是通配：新增一个 gameplay 文件
+    #   本该走"未登记 → 全量"的兜底，通配会把这个洞堵上。
+    "verify_gameplay":       ["engine/gameplay/GameRandom.*",
+                              "engine/gameplay/Stats.*",
+                              "engine/gameplay/GameplayTypes.*",
+                              "engine/gameplay/TurnQueue.*",
+                              "engine/gameplay/GameplaySelfTest.*",
+                              "engine/scene/GameplayRuntime.*",
+                              "engine/scene/SceneSerializer.*",
+                              "engine/script/ScriptEngine.*",
+                              "editor/GameplayPanel.*",
+                              "editor/InspectorPanel.*",
+                              "editor/InspectorIcons.h",
+                              "editor/EditorApp.*",
+                              "runtime/RuntimeApp.cpp"],
+    # P3-3 牌堆。⚠ 与 `verify_gameplay` **故意重叠**：两者都依赖
+    #   `CardZones` 的下游（`GameplayRuntime` / `SceneSerializer` /
+    #   `InspectorPanel`）。重叠不是浪费 —— 改坏一处时两条用例都会红，
+    #   而只有一条红的情况恰恰说明"另一条没覆盖到"。
+    # 导航（C8）。⚠ 除了 nav/ 自己，**必须**点名这几处：
+    #   · `SceneSerializer.*` —— `nav` 组件块的读写在这里（漏了它，"改了
+    #     存盘格式但没跑导航用例"会静默通过）；
+    #   · `ecs/Components.h` —— 组件定义本身；
+    #   · `editor/EditorApp.*` / `editor/NavPanel.*` —— 面板与 `nav.*` 命令；
+    #   · `runtime/RuntimeApp.*` —— 资产优先级 + 每帧 tick；
+    #   · `engine/script/ScriptEngine.*` —— F 组跑的是 `navGoto/navArrived/
+    #     navFailed/navStop` 四个内建（枚举 / `kBuiltins[]` / 分发 switch
+    #     三处同步，改一处断的是整条链）。A 组的 `--selftest script` C22 由
+    #     `verify_script` 覆盖，这里只需要 F 组那一半。
+    "verify_nav":             ["engine/nav/.*",
+                              "engine/scene/SceneSerializer.*",
+                              "engine/scene/SceneDocument.*",
+                              "engine/ecs/Components.h",
+                              "engine/physics/ScenePhysics.*",
+                              "editor/NavPanel.*",
+                              "editor/EditorApp.*",
+                              "editor/PanelRegistry.h",
+                              "runtime/RuntimeApp.*",
+                              "engine/script/ScriptEngine.*",
+                              "tools/verify_nav.py"],
+    "verify_cards":           ["engine/gameplay/CardZones.*",
+                              "engine/gameplay/GameplaySelfTest.*",
+                              # P3-4：伤害数字层（O 组）+ 卡牌表现模板（P 组）。
+                              # ⚠ 这两个文件一改，`--selftest gameplay` 的条数
+                              #   就会变 —— 而 A 组断言的是 `pass=243`，
+                              #   所以必须点名（否则"少跑一组"看不出来）。
+                              "engine/gameplay/DamageNumbers.*",
+                              "engine/gameplay/CardFx.*",
+                              "engine/scene/GameplayRuntime.*",
+                              "engine/scene/SceneSerializer.*",
+                              "editor/CardsPanel.*",
+                              "editor/InspectorPanel.*",
+                              "editor/EditorApp.*",
+                              "engine/ecs/Components.h"],
     # ---- 编辑器 / UI ----
     # 主题表 / applyTheme 本体在 engine/ui/ImGuiTheme.*（新文件）——
     # ⚠ 但 `engine/ui/**` 是 GLOBAL_GLOBS，所以这条**不能只写它**，否则会被
@@ -1869,9 +2085,14 @@ TRIGGERS = {
     #   `check_regression_map.py` 的 D/E 项报"冗余横切"吗？不会 —— 那张表只
     #   查"某用例的 globs 全落在 GLOBAL_GLOBS 里"，跨用例重复是允许的（同一
     #   文件影响多个用例本来就正常）。这里仍然只写独占的，是为了让人读得动。
+    #   P3-2（变换/Scroll/Grid/拖放）新增的 `UiCanvas.*` / `UiDocInput.*` /
+    #   `assets/shaders/ui2.*` 同理 —— 它们落在 verify_ui2 的 `engine/ui2/**`
+    #   与 `assets/shaders/ui2.*` 里，改它们会点名 verify_ui2（那边跑 132 条自检，
+    #   比 case_i 的 10 条硬得多）。这里只补 `editor/UiEditorWindow.*` 已覆盖的
+    #   "面板能把字段写进去"那一半。
     "verify_ui_editor":      ["engine/ui2/UiDocument.*",    # 文档格式 + 放置 + 绘制
                               "engine/ui2/UiLayout.*",      # placeRectIn（锚点唯一实现）
-                              "engine/ui2/Ui2SelfTest.cpp",  # `--selftest ui2` 那 86 条
+                              "engine/ui2/Ui2SelfTest.cpp",  # `--selftest ui2` 那 132 条
                               "editor/UiEditorWindow.*",    # 面板本体
                               "editor/EditorContext.*",     # 三入口同构的请求通道
                               "editor/EditorApp.cpp",       # 面板表项 + 窗口调度
@@ -2482,6 +2703,14 @@ TRIGGERS = {
     #   · `editor/EditorContext.h` 的一次性请求（Inspector → 窗口那条线）
     #   · `editor/InspectorPanel.*` 的 "Edit script..." 按钮
     # ⚠ 刻意**不登记** `engine/ecs/Components.h`：它在 `GLOBAL_GLOBS` 里。
+    # C7 分支：`DialogueAsset` / `DialogueRunner` 是求值与解析的两处；
+    # `DialogueSystem.*` 是旗标仓库的注入点；两个宿主各一处装配
+    # （`RuntimeApp` 必须装、`EditorApp` 装了但今天还没有消费者）。
+    "verify_dialogue_branch": ["engine/dialogue/**",
+                               "runtime/RuntimeApp.cpp",
+                               "editor/EditorApp.cpp",
+                               "editor/DialogueEditorWindow.*",
+                               "tools/verify_dialogue_branch.py"],
     "verify_dialogue_script": ["editor/DialogueEditorWindow.*",
                                "editor/EditorContext.h",
                                "editor/InspectorPanel.*",
@@ -2597,6 +2826,86 @@ TRIGGERS = {
     # B6 表情：数据层 / 驱动 / 自检 / 两套接线（编辑器 + 运行时）/ 音频电平。
     # ⚠ 刻意**不**登记 `engine/ecs/Components.h`、`engine/scene/SceneSerializer.cpp`
     #   （横切，在 GLOBAL_GLOBS 里）；`editor/InspectorPanel.cpp` 同理。
+    # ⚠ `PostVolumePanel.*` 在面板里，但**能力面**在 engine/scene/PostVolume.*
+    #   与 SceneSerializer 的 postVolumes 段 —— 两条都要跟。
+    "verify_post_volume": ["engine/scene/PostVolume.*",
+                           "engine/scene/SceneSerializer.cpp",
+                           "editor/PostVolumePanel.*",
+                           "editor/EditorApp.cpp"],
+    # 混音台：能力面在 engine/audio（AudioSystem 的增益访问器 + 总线真值），
+    # 入口在 AudioMixerPanel。两边改一处就要重跑。
+    "verify_audio_mixer": ["engine/audio/AudioSystem.*",
+                           "editor/AudioMixerPanel.*",
+                           "editor/EditorApp.cpp"],
+    # UI 文档交互（B3）：能力面在 `ui2/UiAction`（动词表 + 解析）与
+    # `ui2/UiDocInput`（命中 / 按下松开），执行点在 RuntimeApp；夹具在
+    # `assets/ui/docs/action_demo.ui.json`（改 rect 会挪点击落点）。
+    # ⚠ `UiDocument.*` 没列：它在 verify_ui_editor 名下，而且这里的用例
+    #   只在**字段**层面依赖它（action/visibleBind/enabled）—— 列进去会让
+    #   "改一个颜色解析的默认值"也触发这条要起三个进程的用例。
+    "verify_ui_actions": ["engine/ui2/UiAction.*",
+                          "engine/ui2/UiDocInput.*",
+                          "runtime/RuntimeApp.cpp",
+                          "assets/ui/docs/action_demo.ui.json",
+                          "tools/verify_ui_actions.py"],
+    # Project Settings（B3）。⚠ 不列 `editor/Toolbar.cpp` / `editor/EditorApp.cpp`
+    # 之类横切文件：面板接线在它们里面只占几行，列进来会让"改一条菜单"也起
+    # 三个进程跑一遍；真改坏了，`verify_editor_menu` / `check_feature_surface`
+    # 会先红。
+    # ⚠⚠ **不列 `assets/game.json`**（与 verify_runtime_states / verify_audio
+    #   那两条不同）：它们读的是文件的**内容**（`music=0.70` 之类），而这条
+    #   用例先快照、再写自己的值、最后还原 —— 它对文件里原本写着什么一无所知
+    #   （B 组只查 22 个键**齐不齐**，不查值）。列进来会让"改一格出厂分辨率"
+    #   也起一次会真的写工程配置的进程，白付钱。
+    "verify_project_settings": ["engine/project/GameFile.*",
+                                "engine/project/ProjectFile.cpp",
+                                "editor/ProjectSettingsPanel.*",
+                                "tools/verify_project_settings.py"],
+    # Stats 的 CPU 分段。⚠ `engine/core/Application.cpp` 是横切文件（所有
+    # 可执行文件的帧循环），但它**不在 GLOBAL_GLOBS** 里 —— 所以这里必须
+    # 显式登记：改帧循环的分段位置正是这条用例唯一会红的地方。
+    # `Renderer.cpp` 反过来不能列（它在 GLOBAL_GLOBS，一改就全跑）。
+    "verify_data_tables": ["engine/core/Csv.*",
+                           "engine/project/DataTable.*",
+                           "engine/i18n/LocaleFile.*",
+                           "editor/TablePanels.*",
+                           "assets/data/**",
+                           "assets/i18n/**",
+                           "tools/verify_data_tables.py"],
+    "verify_stats_cpu": ["engine/core/CpuProfiler.*",
+                         "engine/core/ProcStats.*",
+                         "engine/core/Application.cpp",
+                         "runtime/RuntimeApp.cpp",
+                         "editor/EditorApp.cpp",
+                         "tools/verify_stats_cpu.py"],
+    # ⚠ A4 把 `GameFlags` 从 `runtime/` 搬到了 `engine/scene/` —— 这几条
+    #   路径任何一处变了都要重跑（旗标是"剧本分支"的唯一持久状态）。
+    # `EditorApp.cpp` 不在里面（它在 `GLOBAL_GLOBS`，一改就全跑）。
+    "verify_flags": ["engine/scene/GameFlags.*",
+                     "engine/project/ProjectFile.cpp",
+                     "runtime/GameFlags.h",
+                     "runtime/RuntimeApp.cpp",
+                     "editor/FlagTablePanel.*",
+                     "assets/scripts/**",
+                     "tools/verify_flags.py"],
+    # ⚠ 断点住在 `engine/script/` 的三层里：`ScriptEngine`（`drive()` 的
+    #   暂停链）、`ScriptRuntime`（实例镜像 + API）、`ScriptProgram`
+    #   （`executableLines()` 校验行号）。任何一层改了都要重跑 ——
+    #   "断点不命中"这类回归不会报错，只会静默地不停。
+    "verify_script_debug": ["engine/script/ScriptEngine.*",
+                            "engine/script/ScriptRuntime.*",
+                            "editor/ScriptDebugPanel.*",
+                            "tools/verify_script_debug.py"],
+    # ⚠ G19 的 additve 参数加在 `instantiateDocument` 上 —— 那是**场景加载
+    #   的唯一实现**，所以 `SceneDocument.*` / `SceneSerializer.*` 任一改动
+    #   都要重跑（改坏了表现成"场景加载少了一半实体"或"副关卡覆盖了光照"）。
+    "verify_levels": ["engine/scene/LevelManifest.*",
+                      "engine/scene/LevelStreamer.*",
+                      "engine/scene/SceneDocument.h",
+                      "engine/scene/SceneSerializer.*",
+                      "editor/LevelPanel.*",
+                      "assets/levels/**",
+                      "tools/verify_levels.py"],
     "verify_expression": ["engine/animation/Expression*",
                           "engine/audio/Mixer.*",
                           "engine/audio/AudioSystem.*",

@@ -79,6 +79,7 @@ public:
         Animation,   // 动画：蒙皮与片段播放
         Sequence,    // 过场时间轴（C1）：相机关键帧与事件
         Dialogue,    // 对话（C2）：剧本资产 / 打字速度 / 起播方式
+        Gameplay,    // 玩法状态（P2）：属性白值 / 状态列表 / 伤害预览
         All,         // 全部：旧的"一长条堆叠"视图
         Count,
     };
@@ -117,6 +118,10 @@ private:
     void drawTabAnimation(ecs::Entity e);
     void drawTabSequence(ecs::Entity e);
     void drawTabDialogue(ecs::Entity e);
+    // P2 玩法状态页。⚠ 它**不持有** `GameplayRuntime`：数值的真值在组件里，
+    // 面板只读改写字段；"打一下试试"这种动词走 `EditorApp` 的命令，
+    // 保证按钮与 `gameplay.damage` 命令是同一条路。
+    void drawTabGameplay(ecs::Entity e);
     void drawTabAll(ecs::Entity e);
 
     // 该页签需要的组件在这个实体上没有 → 画一行"这里为什么是空的"。
@@ -377,6 +382,14 @@ private:
     // `INS-DLG-ASSET` 的去重键：只在"挂的资产 / 解析结果"变化时打一行。
     // 每帧打会把日志刷死 —— 等于没有日志。
     std::string m_dlgLogKey;
+    // P2 玩法页的两个去重键（`INS-GP-STATS` / `INS-GP-DMGPREV`）。
+    // 与 m_dlgLogKey 同一条纪律：每帧打日志等于没有日志；而不去抖的话
+    // "改了一个数"这件事在日志里根本看不出来。
+    std::string m_gpStatsSig;
+    std::string m_gpDmgSig;
+    // P3-3：牌堆读数的去抖签（`INS-CARD-STATS` 只在数值变了时打日志，
+    // 否则每帧一条会把日志刷成一片）。
+    std::string m_cardStatsSig;
     ecs::Entity m_rootBoneBufFor{};
     char m_rootBoneBuf[96] = {};
     ecs::Entity m_layerBufFor{};

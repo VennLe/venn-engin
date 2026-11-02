@@ -1,0 +1,20 @@
+{
+ "format": 1,
+ "id": "card_battler",
+ "label": "Card battler",
+ "summary": "牌桌视角的卡牌对战：手牌 / 牌库 / 弃牌堆 + 配表驱动的卡牌定义，没有角色控制器。",
+ "gameType": "card_battler",
+ "startScene": "scenes/main.json",
+ "placeholders": [
+  "__PROJECT_NAME__",
+  "__TEMPLATE_ID__"
+ ],
+ "files": [
+  "README.md",
+  "assets/game.json",
+  "assets/scenes/main.json",
+  "assets/scripts/battle.vks",
+  "assets/data/cards.csv",
+  "config/render.json"
+ ]
+}

@@ -155,6 +155,19 @@ public:
     // 运行期改 ducking 深度（0 = 关），同时也记进 settings()。
     void setDuckDepth(float depth);
 
+    // 当前**实际**增益（0..1）。`BusId::Master` 返回 m_master。
+    //
+    // ⚠⚠ 为什么不能拿 `settings()` 当读回来的路：`settings().master/music/
+    //   sfx/voice` 是 `init()` 时那份**出厂值**，`setBusGain` / `setMasterGain`
+    //   只改 `m_master` / `m_busGain[]`，**不回写** settings。
+    //   编辑器混音台若读 settings() 画推子位置，拖完下一帧会弹回原位 ——
+    //   症状是"推子拖不动"，而不是"数字不对"（2026-11-02 做混音台时补上）。
+    float busGain(BusId bus) const {
+        const int b = static_cast<int>(bus);
+        if (b < 0 || b >= kBusCount) return 0.0f;
+        return (bus == BusId::Master) ? m_master : m_busGain[b];
+    }
+
     // ---- 统计 / 自检 ----
     MixStats stats() const { return m_mixer.stats(); }
     std::uint64_t streamResidentBytes() const;

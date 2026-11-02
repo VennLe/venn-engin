@@ -122,6 +122,14 @@ class UiEditorWindow {
     char m_textBuf[512] = {};
     char m_bindBuf[128] = {};
     char m_bindMaxBuf[128] = {};
+    // 2026-11-02：交互三件。`action` 走的是"回车才提交"，所以缓冲必须
+    // 独立 —— 边打字边提交会让作者输到一半就被判成"动作非法"。
+    char m_actionBuf[192] = {};
+    char m_visBindBuf[128] = {};
+    // 2026-11-04（P3-2）：拖放两个 tag。同样必须跟着选中重建，否则
+    // 会把上一个控件的 tag 带过来（见 syncBuffers 里的注释）。
+    char m_dragTagBuf[64] = {};
+    char m_dropAcceptBuf[128] = {};
     char m_pathBuf[512] = {};
     void syncBuffers();
 
@@ -168,6 +176,14 @@ class UiEditorWindow {
     bool actSetColor2(uint32_t c);           // 副色
     bool actSetRadius(float r);
     bool actSetInset(float v);
+
+    // ---- P3-2：变换 / 滚动 / 网格 / 拖放 ----
+    bool actSetRot(float deg);                       // 度，绕自身中心
+    bool actSetScale(float s);                       // 0.01..20（0 会让逆变换失效）
+    bool actSetOpacity(float o);                     // 0..1，乘进子树
+    bool actSetScroll(float sx, float sy);           // 只对 Scroll
+    bool actSetGrid(int cols, float gapX, float gapY);// 只对 Grid
+    bool actSetDragDrop(const std::string& dragTag, const std::string& accept);
     bool actSetText(const std::string& t);
     bool actSetFontSize(float s);
     bool actSetAlign(int a);
@@ -175,6 +191,13 @@ class UiEditorWindow {
     bool actSetBindMax(const std::string& key);
     bool actSetValue(float v);
     bool actSetVisible(bool v);
+    // 2026-11-02：交互三件。
+    // ⚠ `actSetAction` **比加载路径严格**：这里拼错就拒绝并报原因（作者
+    //   正在编辑，立刻知道）；而 `parseUiDocument` 只降级成 warning ——
+    //   一条写错的动作不该让整份界面加载失败。
+    bool actSetAction(const std::string& text);
+    bool actSetEnabled(bool v);
+    bool actSetVisibleBind(const std::string& key);
     // 拖动（画布）：把选中控件挪到参考像素 (x,y)
     bool actDragTo(float x, float y);
 

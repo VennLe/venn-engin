@@ -104,10 +104,28 @@ bool parseSceneDocument(const nlohmann::json& root, SceneDocument& out, std::str
 //
 // ⚠ 父子必须等**所有**实体建完再做第二遍：`parentGuid` 要按 guid 反查，
 //   而 `parent` 下标可能指向文件里靠后的实体。
+//
+// ---- `additive`（G19 关卡流送，2026-11-02）----
+//
+// `additive = true` 时**不做 `scene.clear()`、也不应用 globals**
+// （相机 / 光照 / 物理 / 环境 / scriptVars / 后处理体积），只把实体**并进**
+// 当前世界，并把它们按文件顺序填进 `created` —— 调用方拿这份列表就是
+// "这个关卡在这个世界里占的那些实体"，卸载时逐个 `destroy`。
+//
+// ⚠ 为什么 globals 必须整块跳过（不是"只跳过相机"）：
+//   流送一张副关卡时，如果它带着自己的 `light` / `environment` /
+//   `postVolumes` 被应用上去，**主关卡刚调好的光照与天空会被静默覆盖**，
+//   而且看起来像"流送之后画面变了" —— 一个很难归因的 bug。
+//   副关卡的 globals 在流送语义里**没有意义**：它们是"这一份世界"的全局
+//   设置，而流送进来的是世界的一部分。
+// ⚠ `scriptVars` 也跳过：它是主关卡的黑板，副关卡往里写等于偷改剧情状态。
+// ⚠ guid 撞车是**正常**的（两张关卡各带一个 guid=0 的老实体）：`setGuid`
+//   失败会保留随机值并打 `SCENE-GUID-DUP`，不中断加载。
 void instantiateDocument(Scene& scene, const SceneDocument& doc,
                          std::vector<ecs::Entity>& created,
                          std::unordered_map<ecs::EntityGuid, ecs::Entity>& guidMap,
-                         DocumentStats& stats);
+                         DocumentStats& stats,
+                         bool additive = false);
 
 // ③ 解析资产与其余组件。**唯一要 AssetManager 的一段**（可能要上传 GPU）。
 //

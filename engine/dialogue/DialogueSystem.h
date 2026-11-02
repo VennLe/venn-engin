@@ -32,6 +32,8 @@
 
 #include "ecs/Entity.h"
 
+#include <functional>
+#include <memory>
 #include <string>
 
 namespace scene {
@@ -84,10 +86,28 @@ class DialogueSystem {
 
     void setTrace(bool on) { m_trace = on; }
 
+    // ---- C7：旗标仓库 ----
+    // 与 `setVoiceHooks` 同一位置注入（宿主 `init` 里）。它让节点的 `if`
+    // 与选项的 `set` 真的生效。
+    // ⚠ 指针不拥有，宿主保证它活得比本系统长（`scene::GameFlags` 成员）。
+    // ⚠ 组件上的播放器不在这里遍历（本接口没有 `Scene&`），改由 `tick()`
+    //   每帧对齐 —— 与语音那套同一条理由。
+    void setFlagStore(DlgFlagStore* store);
+    DlgFlagStore* flagStore() const { return m_flags; }
+    // 便捷重载：宿主只有一张"名字 → 数"的表时不用自己写类（见
+    // `FlagStoreBridge`）。**两个函数必须都给**（只给一半 = 与没装等价）。
+    void setFlagStore(std::function<double(const std::string&)> get,
+                      std::function<void(const std::string&, double)> set);
+
   private:
     DialoguePlayer* activeMut(scene::Scene& scene);
     // 换行 / 结束的日志去重（只在变化时打）。
     void noteLine(const DialoguePlayer* p, const char* src);
+
+    // 旗标仓库（C7）。nullptr = 宿主没装 → 用了条件的剧本会报错并停下。
+    DlgFlagStore* m_flags = nullptr;
+    // 便捷重载造出来的桥（宿主传 lambda 那一版）。本系统拥有它。
+    std::unique_ptr<FlagStoreBridge> m_bridge;
 
     // cue 槽位：只在这条路径上存在，不落盘。
     DialoguePlayer m_cue;

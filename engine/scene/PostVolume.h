@@ -97,6 +97,15 @@ public:
     // camPos：相机世界位置。返回叠加后的覆盖值。
     Blended evaluate(const glm::vec3& camPos) const;
 
+    // 单个体积在 camPos 处的权重（1 = 在盒内，0 = 过渡带外）。
+    //
+    // 给编辑器面板和调试用。**直接转发 weightOf**，绝不在这里重写一套
+    // 距离/过渡带公式 —— 两套实现的典型症状是"面板写着 0.40、渲染按 0.60"，
+    // 而两边都觉得自己对（与对话/UI 文档"校验只有一份"同一条纪律）。
+    float weightAt(const PostVolume& v, const glm::vec3& p) const {
+        return weightOf(v, p);
+    }
+
 private:
     // 点到 AABB 的权重（1 = 内部，0 = 过渡带外）
     static float weightOf(const PostVolume& v, const glm::vec3& p);

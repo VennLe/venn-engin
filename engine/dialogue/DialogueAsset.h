@@ -27,22 +27,57 @@
 // ------------------------------------------------------------
 // 不做什么（刻意的）
 // ------------------------------------------------------------
-// · **不做变量替换**（`{player}` 之类）：那需要黑板/存档（C3/C6），现在做
-//   等于先造一个用不上的求值器。文本原样交给 UI。
-// · **不做条件分支**（`if flag`）：同上，要 C7 的任务标记。
-// · **不做立绘/表情/语音字段**：等资产真的有了再加 —— 加了没人消费的字段，
+// · **不做变量替换**（`{player}` 之类）：那需要黑板/存档，现在做等于先造
+//   一个用不上的求值器。文本原样交给 UI。
+// · **不做立绘/表情字段**：等资产真的有了再加 —— 加了没人消费的字段，
 //   序列化与校验会立刻变成"永远为空的必填项"。
+//
+// ------------------------------------------------------------
+// C7（2026-11-05）：条件分支 + 选项写旗标
+// ------------------------------------------------------------
+// 这一版补的正是上面"不做变量替换 / 不做条件分支"里被推迟的那半：
+//   · `DlgNode::conds`（JSON 的 `if`）+ `DlgNode::elseId`（`else`）——
+//     "条件不满足就跳到另一句"；
+//   · `DlgChoice::writes`（`set`)—— 选了就写旗标。
+// 变量替换仍然不做（文本里插值要格式串求值器，那是另一件事）。
+//
+// ⚠⚠ **条件只读、不写**。写只发生在"选了某个选项"这一处 —— 于是一条分支
+//   的副作用永远能在一个地方读完（选项列表），而不是散落在节点上。
+// ⚠⚠ **`else` 为空 = 这段对话到此结束**，不是"顺着 next 走"。后者看起来
+//   更"顺"，但会让作者分不清"条件句"和"分支句"，而两种写法都合法时
+//   总有人写出自己不想要的那一种。要"跳过这句继续"就显式写 `"else": "下一句"`。
 // ============================================================
 
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace dialogue {
 
+// 一条旗标条件。多条之间是 **AND**（全部成立才进这句）。
+//
+// `op` 只认六种：`>=` `<=` `>` `<` `==` `!=`（也接受写法 `=`）。
+// ⚠ 不做 `&&` / `||` 嵌套表达式：那需要一个求值器，而剧本作者要的
+//   "好感度 ≥ 2 且 见过她" 用**多条条件**就表达了。OR 用两个节点 +
+//   `else` 拼，读起来更清楚。
+struct DlgCond {
+    std::string flag;
+    std::string op = ">=";
+    double value = 0.0;
+};
+
+// 一条旗标写入（选项的副作用）。
+struct DlgWrite {
+    std::string flag;
+    double value = 0.0;
+};
+
 struct DlgChoice {
     std::string text;    // 按钮上显示的字
     std::string gotoId;  // 选了之后跳到哪（必须是存在的 id）
+    // 选了之后写哪些旗标。空 = 什么都不写（老资产逐位不变）。
+    std::vector<DlgWrite> writes;
 };
 
 struct DlgNode {
@@ -53,7 +88,59 @@ struct DlgNode {
     // 这句的语音（音频路径，走 `assets/` 根）。空 = 这句没有语音（老资产）。
     // D1：`DialoguePlayer` 通过宿主注入的钩子播它，并在"还没播完"时不翻页。
     std::string voice;
+    // C7：进入这句之前要成立的条件（空 = 无条件，老资产逐位不变）。
+    // 不成立时跳到 `elseId`；`elseId` 空 → **结束**。
+    std::vector<DlgCond> conds;
+    std::string elseId;
     std::vector<DlgChoice> choices;
+};
+
+// 旗标仓库的**接口**（宿主实现，引擎只认这三个方法）。
+//
+// 为什么是纯虚接口而不是 `std::function` 三件套：条件求值要**同时**读
+// 多个旗标（AND 链），而 `std::function<double(const std::string&)>` 那样
+// 也行 —— 但"写"必须和"读"落在同一张表上，两个独立 std::function 没法
+// 保证这件事（宿主完全可能把它们接到两个不同的 map 上，而症状是
+// "选了选项、条件没变"，一路无错）。一个接口把这条约束表达在类型里。
+//
+// ⚠ 未设过 = 0（与 `scene::GameFlags` 同一条语义）。
+class DlgFlagStore {
+  public:
+    virtual ~DlgFlagStore() = default;
+    virtual double get(const std::string& name) const = 0;
+    virtual void set(const std::string& name, double value) = 0;
+};
+
+// 条件求值（`conds` 为空 → true）。**纯函数**，所以自检不需要任何宿主。
+bool evalConds(const std::vector<DlgCond>& conds, const DlgFlagStore* store);
+
+// `op` 合法性（解析期用）。返回 nullptr = 合法。
+const char* condOpError(const std::string& op);
+
+// 把"两个 std::function"包成 `DlgFlagStore` 的桥。
+//
+// 为什么需要它：两个宿主（`Game.exe` / 编辑器）各有一张
+// `scene::GameFlags`，而 `engine/scene` **不能** include `engine/dialogue`
+// （依赖方向反了，而且 `DialogueSystem` 只是前向声明 `scene::Scene`）。
+// 于是桥放在 dialogue 这一侧、只认两个函数 —— 宿主各写两行 lambda 即可，
+// 不必各自复制一个 class（复制两份 = 改一处漏一处）。
+class FlagStoreBridge final : public DlgFlagStore {
+  public:
+    FlagStoreBridge(std::function<double(const std::string&)> getter,
+                    std::function<void(const std::string&, double)> setter)
+        : m_get(std::move(getter)), m_set(std::move(setter)) {}
+    double get(const std::string& name) const override {
+        return m_get ? m_get(name) : 0.0;
+    }
+    void set(const std::string& name, double value) override {
+        if (m_set) m_set(name, value);
+    }
+    // 两个函数都在才算"可用"：只装一半的桥写进去没效果，与没装一样危险。
+    bool usable() const { return m_get && m_set; }
+
+  private:
+    std::function<double(const std::string&)> m_get;
+    std::function<void(const std::string&, double)> m_set;
 };
 
 struct DialogueAsset {

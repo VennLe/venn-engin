@@ -265,6 +265,10 @@ const char* kEngineAssetDirs[] = {
     "assets/icons",      // 运行时 HUD / 启动器图标
     "assets/materials",  // 默认母材质（很小，项目有则项目优先）
     "assets/textures",   // SSS / BRDF 之类查找表（5 MB 量级）
+    // P3-1：配表（`assets/data/*.csv`）。代码按**目录**扫它，不是按文件名，
+    // 所以"项目里没配表"时这里必须能兜住引擎自带的示例表 —— 否则
+    // 打开编辑器看到的是"一张表都没有"，而那与"表被剪掉了"无法区分。
+    "assets/data",
 };
 
 // 把 `<engineDir>/<rel>` 下的文件补进 dist，**项目已有的不覆盖**。
@@ -543,7 +547,11 @@ BuildResult buildProject(const BuildSpec& spec, const BuildProgressFn& progress)
         ScanOptions sopt;
         // `ui/` 与 `fonts/` 是"运行时按固定名字打开"的目录，没有引用者 ——
         // 靠闭包永远扫不到，而少了就是字体断言框（见 docs/package_roadmap §4）。
-        sopt.alwaysInclude = {"ui/", "fonts/"};
+        // `data/` 同一条道理（P3-1）：配表是 `TableStore::loadAll()` **扫目录**
+        // 读进来的，没有任何 JSON 字符串指向某个 `.csv` → 闭包必然把它们当
+        // 无人引用的垃圾剪掉，而症状是"出包之后所有卡牌都变成未知卡"
+        // （打出去什么也不发生、一行错都没有）。开发机上永远复现不了。
+        sopt.alwaysInclude = {"ui/", "fonts/", "data/"};
         const ScanResult sc = scanAssetClosure(
             slash(assetsDir.string()), {"game.json", slash(pf.startScene)}, sopt);
         for (const auto& w : sc.warnings) r.warnings.push_back(w);

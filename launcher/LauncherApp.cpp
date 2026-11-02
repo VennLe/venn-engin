@@ -986,16 +986,27 @@ void LauncherApp::ensureTypeArt() {
     if (m_typeArtTried) return;
     m_typeArtTried = true;
 
-    const char* files[2] = {"launcher/type_first_person.png",
-                            "launcher/type_third_person.png"};
-    for (int i = 0; i < 2; ++i) {
+    // 顺序 = `project::gameTypeAt()` 的顺序（第一人称 / 第三人称 /
+    // 等距俯视 / 卡牌对战）。文件名与枚举 id 对应，别按"第几张"命名 ——
+    // 那样在中间插一种类型时，图会整体错位一格（且不报错）。
+    const char* files[project::kGameTypeCount] = {
+        "launcher/type_first_person.png",
+        "launcher/type_third_person.png",
+        "launcher/type_isometric.png",
+        "launcher/type_card_battler.png",
+    };
+    const char* keys[project::kGameTypeCount] = {
+        "launcher:type:first_person", "launcher:type:third_person",
+        "launcher:type:isometric", "launcher:type:card_battler",
+    };
+    for (int i = 0; i < project::kGameTypeCount; ++i) {
         const std::string abs = assets::resolveAssetPath(files[i]);
         assets::Texture* tex = nullptr;
         try {
             // 缓存键单独给：`loadTexture(path, name)` 的 name 就是缓存键。
             // 不传的话键=路径，"以后换了插图文件名"会命中旧纹理 —— 症状是
             // "我明明换了图，界面还是老图"，而日志里一行提示都没有。
-            const std::string key = std::string("launcher:type") + (i == 0 ? "fp" : "tp");
+            const std::string key = keys[i];
             tex = assets().loadTexture(abs, key, true);
         } catch (const std::exception& ex) {
             VK_LOG_WARN("LAUNCHER-ART load failed (%s): %s", abs.c_str(), ex.what());
@@ -1019,19 +1030,24 @@ void LauncherApp::drawWizardType() {
     ImGui::Spacing();
 
     struct Card {
-        GameType type;
         const char* title;
         const char* line1;
         const char* line2;
-        const char* tag;
     };
-    const Card cards[] = {
-        {project::GameType::FirstPerson, "First person",
-         "Camera sits at eye level", "The mouse turns the view directly",
-         "LAUNCH-TYPE-0"},
-        {project::GameType::ThirdPerson, "Third person",
-         "Camera sits behind and above", "Mouse orbits, character turns",
-         "LAUNCH-TYPE-1"},
+    // ⚠ **表顺序就是 `project::gameTypeAt()` 的顺序**，`GameType` 由下标反查。
+    //   这里再写一遍 `GameType::XXX` 就是第二份真值：加一种类型时只改一处、
+    //   漏改另一处不报错 —— 卡片画出来了、点下去选的是**另一个**类型。
+    const Card cards[project::kGameTypeCount] = {
+        {"First person", "Camera sits at eye level",
+         "The mouse turns the view directly"},
+        {"Third person", "Camera sits behind and above",
+         "Mouse orbits, character turns"},
+        // 2026-11-04：玩法层（属性/状态/伤害/回合/牌堆/配表）做完之后，
+        // "游戏类型"就不该只问相机在哪 —— 这两张才是回合制/卡牌的入口。
+        {"Isometric", "Camera looks down at an angle",
+         "Turn-based tactics: pick a tile, then act"},
+        {"Card battler", "Camera is a card table",
+         "Hand, deck and discard drive the fight"},
     };
 
     // 卡片 = 16:9 插图 + 底部标题条。宽度随可用宽度收口（最宽 452），
@@ -1039,16 +1055,21 @@ void LauncherApp::drawWizardType() {
     const float gap = 18.0f;
     const float availW = ImGui::GetContentRegionAvail().x;
     float cardW = (availW - gap - 8.0f) * 0.5f;
-    if (cardW > 452.0f) cardW = 452.0f;
+    // 4 张卡 = 2 行 × 2 列。上限从 452 收到 380：452 时两行加起来 614px，
+    // 而向导内容区只有 ~560px —— 第二行会掉到窗外（"第 3、4 张点不到"，
+    // 而它们 `GetItemRect` 依然返回真实坐标，判据照样"有矩形"）。
+    if (cardW > 380.0f) cardW = 380.0f;
     if (cardW < 240.0f) cardW = 240.0f;
     const float imgH = cardW * 9.0f / 16.0f;
     const float textH = 44.0f;
     const float cardH = imgH + textH;
 
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < project::kGameTypeCount; ++i) {
         const Card& c = cards[i];
-        const bool sel = (m_wizType == c.type);
-        if (i > 0) ImGui::SameLine(0.0f, gap);
+        const project::GameType type = project::gameTypeAt(i);
+        const bool sel = (m_wizType == type);
+        // 每行 2 张：偶数位另起一行（不调 SameLine 就是换行）。
+        if (i % 2 == 1) ImGui::SameLine(0.0f, gap);
         ImGui::PushID(i);
 
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -1059,7 +1080,10 @@ void LauncherApp::drawWizardType() {
         //   历史上为此丢过三轮向导）。InvisibleButton 什么都不画，正好。
         const bool clicked = ImGui::InvisibleButton("##type", ImVec2(cardW, cardH));
         const bool hov = ImGui::IsItemHovered();
-        anchor(c.tag);   // 必须在 item 之后立刻取矩形
+        // 锚点编号 = 卡片下标 = `gameTypeAt()` 的顺序（判据按它点卡片）。
+        char tag[32];
+        std::snprintf(tag, sizeof(tag), "LAUNCH-TYPE-%d", i);
+        anchor(tag);   // 必须在 item 之后立刻取矩形
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p1(p0.x + cardW, p0.y + cardH);
@@ -1101,8 +1125,9 @@ void LauncherApp::drawWizardType() {
                     rounding, 0, sel ? 2.0f : 1.0f);
 
         if (clicked) {
-            m_wizType = c.type;
-            VK_LOG_INFO("LAUNCHER-WIZARD type=%s", project::gameTypeId(c.type));
+            m_wizType = type;
+            VK_LOG_INFO("LAUNCHER-WIZARD type=%s index=%d",
+                        project::gameTypeId(type), i);
         }
         // 注释文字**只在悬浮时**出现（用户要求：卡面保持干净）。
         if (hov) ImGui::SetTooltip("%s\n%s", TR(c.line1), TR(c.line2));

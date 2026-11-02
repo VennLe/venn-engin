@@ -1,0 +1,4 @@
+id,#note,name,hp,atk,speed,elite
+slime,"starter, 一级就出现",Slime,12,3,1.2,0
+bat,,Bat,8,2,2.4,0
+boss,,Big Boss,900,40,0.9,1

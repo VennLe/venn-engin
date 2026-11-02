@@ -1,0 +1,23 @@
+{
+  "_comment": "关卡清单示例（G19）。`path` 是**相对资产根**的场景文件；`alwaysLoaded` = 常驻；写了 center 就必须写 halfExtent（世界坐标，米，Z-up）。这份文件可以直接改 —— 编辑器 Authoring ▸ Levels 面板读的就是它。",
+  "name": "world",
+  "levels": [
+    {
+      "name": "main",
+      "path": "scenes/levels/first_level.json",
+      "alwaysLoaded": true
+    },
+    {
+      "name": "script_demo",
+      "path": "scenes/levels/script_demo.json",
+      "center": [40, 0, 0],
+      "halfExtent": [32, 32, 24]
+    },
+    {
+      "name": "terrain_probe",
+      "path": "scenes/levels/terrain_probe.json",
+      "center": [120, 0, 0],
+      "halfExtent": [48, 48, 32]
+    }
+  ]
+}

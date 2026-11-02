@@ -137,6 +137,20 @@ class DialogueEditorWindow {
     bool actDelChoice(int i);
     bool actSetChoiceText(int i, const std::string& t);
     bool actSetChoiceGoto(int i, const std::string& id);
+    // ---- C7：条件分支 ----
+    // 条件行（`if` 数组）与 `else` 目标。全部走"序列化 → 重新解析"校验，
+    // 所以这里**不自己判**"op 合法吗"（那一份规则只在 `parseDialogue` 里）。
+    bool actAddCond();
+    bool actDelCond(int i);
+    bool actSetCondFlag(int i, const std::string& flag);
+    bool actSetCondOp(int i, const std::string& op);
+    bool actSetCondValue(int i, double v);
+    bool actSetElse(const std::string& id);   // "" = 条件不成立就结束
+    // ---- C7：选项副作用（`set`）----
+    bool actAddWrite(int ci);
+    bool actDelWrite(int ci, int wi);
+    bool actSetWriteFlag(int ci, int wi, const std::string& flag);
+    bool actSetWriteValue(int ci, int wi, double v);
     bool actNewScript();                           // 从零建一份两行的骨架
 
     bool save(bool force);
@@ -166,6 +180,9 @@ class DialogueEditorWindow {
     // `MYVK_EDITOR_DLGED_SCRIPT="sel:2;settext:你好;new:l9;save"`，
     // 分号分隔、冒号分隔参数。**只跑一次**（与 MYVK_EDITOR_REBIND 同纪律）。
     // ⚠ 参数里不能再出现 `;` / `:` —— 它是个测试钩子，不是脚本语言。
+    // C7 新增：`addcond` / `delcond:i` / `condflag:i:名字` / `condop:i:op` /
+    // `condval:i:数` / `setelse:id`（`-` = 清空）/ `addwrite:ci` /
+    // `delwrite:ci:wi` / `wset:ci:名字:数`（**追加**一条副作用）。
     void runInjectedScript();
 
     EditorContext& m_ctx;

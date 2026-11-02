@@ -3,7 +3,9 @@
 #include "core/Logger.h"
 #include "ui2/SdfFont.h"
 #include "ui2/Ui2Settings.h"
+#include "ui2/UiAction.h"
 #include "ui2/UiCanvas.h"
+#include "ui2/UiDocInput.h"
 #include "ui2/UiDocument.h"
 #include "ui2/UiFocus.h"
 #include "ui2/UiLayout.h"
@@ -703,6 +705,212 @@ void testDocument(const SdfFont& f) {
     }
 }
 
+
+// ---- 文档层交互（2026-11-02）----
+//
+// 这一组替代不了运行期的端到端（那是 `tools/verify_ui_actions.py` 的事），
+// 但它能在**无窗口、无 Vulkan** 的机器上把三条最容易写错的语义钉住：
+// ① 最上面的赢（DFS 倒序）② 按下与松开必须同一个控件 ③ 禁用/不可见不命中。
+void testInteraction() {
+    // ---- 动作解析 ----
+    UiAction a;
+    std::string err;
+    bool ok = parseUiAction("", a, &err);
+    report("uiint_parse_empty", ok ? "ok" : "bad", "ok", 0,
+           ok && a.kind == UiActionKind::None);
+
+    ok = parseUiAction("flag:hp=10", a, &err);
+    report("uiint_parse_flag", ok ? "ok" : "bad", "ok", 0,
+           ok && a.kind == UiActionKind::Flag && a.key == "hp" &&
+               std::fabs(a.value - 10.0) < 1e-9);
+
+    // 省略 `=n` 等价于 1（"记住点了"最常用的写法）
+    ok = parseUiAction("flag:seen", a, &err);
+    report("uiint_parse_flag_bare_value", f2s(a.value), "1.0000", 0,
+           ok && std::fabs(a.value - 1.0) < 1e-9);
+
+    ok = parseUiAction("toggle:menu", a, &err);
+    report("uiint_parse_toggle", ok ? "ok" : "bad", "ok", 0,
+           ok && a.kind == UiActionKind::Toggle && a.key == "menu");
+
+    ok = parseUiAction("sound:ui/click.wav", a, &err);
+    report("uiint_parse_sound", ok ? "ok" : "bad", "ok", 0,
+           ok && a.kind == UiActionKind::Sound &&
+               a.key == "ui/click.wav");
+
+    ok = parseUiAction("quit", a, &err);
+    report("uiint_parse_quit", ok ? "ok" : "bad", "ok", 0,
+           ok && a.kind == UiActionKind::Quit);
+
+    // 认不出的动词 / 数字尾巴有垃圾：必须**报错**而不是静默取前几位
+    ok = parseUiAction("jump:high", a, &err);
+    report("uiint_parse_bad_verb", ok ? "accepted" : "rejected", "rejected", 0,
+           !ok);
+    ok = parseUiAction("flag:hp=10abc", a, &err);
+    report("uiint_parse_bad_number", ok ? "accepted" : "rejected", "rejected", 0,
+           !ok);
+    ok = parseUiAction("flag:a b=3", a, &err);
+    report("uiint_parse_space_in_key", ok ? "accepted" : "rejected", "rejected",
+           0, !ok);
+
+    // ---- 命中测试 ----
+    // 一份 4 个控件的文档：底面板（大）+ 可点按钮 + 禁用按钮 + 无动作按钮。
+    //
+    // ⚠ 输出尺寸必须写成 **1920x1080**：`computeScale` 除的是**全局参考
+    //   分辨率**（`kRefWidth/kRefHeight`），不是文档自己的 `canvas`。
+    //   这一点与直觉不同 —— 第一版这里写 1000x1000，算出来 scale≈0.52，
+    //   于是所有命中点都落到了别的控件上（三条断言红，而产品是对的）。
+    const char* json =
+        R"({"name":"t","canvas":[1920,1080],"widgets":[
+             {"id":"base","type":"panel","rect":[0,0,600,600]},
+             {"id":"ok","type":"button","rect":[10,10,100,40],
+              "action":"flag:a=1"},
+             {"id":"off","type":"button","rect":[10,100,100,40],
+              "action":"flag:b=1","enabled":false},
+             {"id":"deco","type":"button","rect":[10,200,100,40]}]})";
+    UiDocument d;
+    if (!parseUiDocument(json, "uiint", d)) {
+        report("uiint_doc_load", "failed", "ok", 0, false);
+        return;
+    }
+    report("uiint_doc_load", "ok", "ok", 0, true);
+
+    const UiBindings b;
+    const auto placed = placeDocument(d, b, 1920, 1080);
+
+    // 点在按钮上 → 命中 ok
+    const std::string h1 = hitTestDocument(placed, 50.0f, 25.0f);
+    report("uiint_hit_button", h1, "ok", 0, h1 == "ok");
+
+    // 点在面板空白处 → 面板**不可交互**（没 action、不是 button）→ 不命中。
+    // ⚠ 这条是"面板底下的按钮抢点击"那个 bug 的反面判据。
+    const std::string h2 = hitTestDocument(placed, 300.0f, 300.0f);
+    report("uiint_hit_panel_not_interactive", h2.empty() ? "(none)" : h2,
+           "(none)", 0, h2.empty());
+
+    // 禁用按钮不命中
+    const std::string h3 = hitTestDocument(placed, 50.0f, 115.0f);
+    report("uiint_hit_disabled", h3.empty() ? "(none)" : h3, "(none)", 0,
+           h3.empty());
+
+    // 没配 action 的 button **仍然可交互**（这样点上去能打一条
+    // UIDOC-NOACTION，而不是让一个看起来能按的按钮静默吃掉点击）
+    const std::string h4 = hitTestDocument(placed, 50.0f, 215.0f);
+    report("uiint_hit_button_without_action", h4, "deco", 0, h4 == "deco");
+
+    // ---- 按下 / 松开语义 ----
+    {
+        UiDocInput in;
+        // 按下在 ok 上、松开也在 ok 上 → 点击成立
+        in.update(d, placed, 50.0f, 25.0f, true, true, false);
+        const auto r = in.update(d, placed, 50.0f, 25.0f, false, false, true);
+        report("uiint_click_same_widget", r.id.empty() ? "(none)" : r.id, "ok",
+               0, r.id == "ok" && r.action == "flag:a=1");
+    }
+    {
+        UiDocInput in;
+        // 按下在 ok、松开时已经拖到面板空白处 → **不算点击**
+        in.update(d, placed, 50.0f, 25.0f, true, true, false);
+        const auto r = in.update(d, placed, 300.0f, 300.0f, false, false, true);
+        report("uiint_click_drag_out", r.id.empty() ? "(none)" : r.id, "(none)",
+               0, r.id.empty());
+    }
+    {
+        UiDocInput in;
+        // 注入的点击：压入参考像素坐标，下一次 update 消费。
+        // ⚠ 注入走的是与真鼠标**完全相同**的下游 —— 否则会出现
+        //   "自动化能点、人手点不动"这种只在验收里绿的假绿。
+        in.requestClickRef(50.0f, 25.0f, 1920, 1080);
+        const auto r = in.update(d, placed, 0.0f, 0.0f, false, false, false);
+        report("uiint_click_injected", r.id.empty() ? "(none)" : r.id, "ok", 0,
+               r.id == "ok" && r.action == "flag:a=1");
+    }
+
+    // ---- 条件可见 ----
+    // `visibleBind` 生效时布局与绘制必须同时跳过（共用 widgetVisible）——
+    // 只跳一边会让后面所有控件错位一格。
+    {
+        const char* vjson =
+            R"({"name":"v","canvas":[1920,1080],"widgets":[
+                 {"id":"hidden","type":"panel","rect":[0,0,100,100],
+                  "visibleBind":"menuOpen"},
+                 {"id":"after","type":"panel","rect":[0,200,100,100]}]})";
+        UiDocument vd;
+        if (!parseUiDocument(vjson, "uiint-v", vd)) {
+            report("uiint_visbind_load", "failed", "ok", 0, false);
+        } else {
+            UiBindings vb;                     // menuOpen 未设 → 0 → 隐藏
+            const auto p0 = placeDocument(vd, vb, 1920, 1080);
+            report("uiint_visbind_hidden", std::to_string(p0.size()), "1", 0,
+                   p0.size() == 1 && p0[0].id == "after");
+
+            vb.setNumber("menuOpen", 1.0f);
+            const auto p1 = placeDocument(vd, vb, 1920, 1080);
+            report("uiint_visbind_shown", std::to_string(p1.size()), "2", 0,
+                   p1.size() == 2 && p1[0].id == "hidden");
+
+            // 设计画布口径：忽略 visibleBind，两个都在（否则一配就消失）
+            UiRect canvas;
+            canvas.w = 1920.0f;
+            canvas.h = 1080.0f;
+            const auto pd = placeDocumentAt(vd, UiBindings{}, canvas, 1.0f,
+                                            false);
+            report("uiint_visbind_design_ignores", std::to_string(pd.size()),
+                   "2", 0, pd.size() == 2);
+        }
+    }
+
+    // ---- 序列化往返 ----
+    {
+        const char* rjson =
+            R"({"name":"r","canvas":[1000,1000],"widgets":[
+                 {"id":"btn","type":"button","rect":[0,0,100,40],
+                  "action":"toggle:menu","visibleBind":"menuOpen",
+                  "enabled":false}]})";
+        UiDocument rd;
+        if (!parseUiDocument(rjson, "uiint-r", rd)) {
+            report("uiint_roundtrip_load", "failed", "ok", 0, false);
+        } else {
+            const UiWidget& w = rd.widgets[0];
+            const bool parsedOk = w.action == "toggle:menu" &&
+                                  w.visibleBind == "menuOpen" && !w.enabled;
+            report("uiint_roundtrip_parse", parsedOk ? "ok" : "bad", "ok", 0,
+                   parsedOk);
+
+            UiDocument back;
+            const bool reloaded = parseUiDocument(toJson(rd), "uiint-r2", back);
+            const UiWidget& w2 = back.widgets.empty() ? UiWidget{}
+                                                      : back.widgets[0];
+            const bool same = reloaded && w2.action == "toggle:menu" &&
+                              w2.visibleBind == "menuOpen" && !w2.enabled;
+            report("uiint_roundtrip_write", same ? "ok" : "lost", "ok", 0, same);
+        }
+    }
+
+    // ---- 写错的动作不让整份文档加载失败 ----
+    {
+        const char* bjson =
+            R"({"name":"b","canvas":[1000,1000],"widgets":[
+                 {"id":"x","type":"button","rect":[0,0,100,40],
+                  "action":"nonsense"}]})";
+        UiDocument bd;
+        const bool loaded = parseUiDocument(bjson, "uiint-b", bd);
+        const bool warned = loaded && !bd.warnings.empty();
+        report("uiint_bad_action_warns_not_fails",
+               loaded ? (warned ? "warned" : "silent") : "failed", "warned", 0,
+               loaded && warned);
+    }
+}
+
+}  // namespace
+
+// P3-2 的三组用例定义在文件尾部（它们要用到一组局部辅助类型）。
+// ⚠ 这里前置声明，而不是把入口也挪到最后：入口留在中间，
+//   "跑了哪几组"一眼能看全；用例实现集中在尾部。
+namespace {
+void testTransform(const SdfFont& font);
+void testScrollGrid();
+void testDrag();
 }  // namespace
 
 int runUi2SelfTest() {
@@ -721,9 +929,519 @@ int runUi2SelfTest() {
     testWidget(font);
     testFocus();
     testDocument(font);
+    testInteraction();
+
+    // P3-2：变换 / 滚动 / 网格 / 拖放
+    testTransform(font);
+    testScrollGrid();
+    testDrag();
 
     VK_LOG_INFO("UI2-TOTAL pass=%d fail=%d", g_pass, g_fail);
     return g_fail;
 }
+
+// ============================================================
+// P3-2：变换 / 滚动 / 网格 / 拖放（2026-11-04）
+//
+// 这一组的判据全部落在"**两种实现会不一样**"的量上：
+//   · 转了 90° 的 100×50 矩形，包围盒必须是 50×100（不是 100×50）；
+//   · 转了角度的框必须走 mode 4（不切换就是把框按"中心±半宽"再放大一遍）；
+//   · 滚动出可视区的子控件必须**不产出顶点**（不裁就会画在容器外面）；
+//   · 拖拽松手时**不许**同时产出点击（同时产出 = 一次拖拽结算两次）。
+// 只断言"没崩 / 顶点数 > 0"的用例，在这些点上一个都拦不住。
+// ============================================================
+
+namespace {
+
+struct Aabb {
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    float w() const { return x1 - x0; }
+    float h() const { return y1 - y0; }
+    bool empty() const { return x1 < x0; }
+};
+
+// 顶点包围盒。⚠ 只对 **pos = 顶点** 的图元有意义（mode 1/2/4）；
+//   mode 0/3 的 pos 是"中心"，四个顶点重合 —— 那正是
+//   `xform_rot_uses_mode4` 要抓的东西。
+Aabb vertsAabb(const UiCanvas& c) {
+    Aabb b;
+    for (const auto& v : c.vertices()) {
+        if (v.x < b.x0) b.x0 = v.x;
+        if (v.y < b.y0) b.y0 = v.y;
+        if (v.x > b.x1) b.x1 = v.x;
+        if (v.y > b.y1) b.y1 = v.y;
+    }
+    return b;
+}
+
+UiWidget mkPanel(const std::string& id, float x, float y, float w, float h) {
+    UiWidget p;
+    p.id = id;
+    p.type = UiWidgetType::Panel;
+    p.anchor = UiAnchor::TopLeft;
+    p.x = x; p.y = y; p.w = w; p.h = h;
+    return p;
+}
+
+UiDocument mkDoc(std::vector<UiWidget> ws) {
+    UiDocument d;
+    d.valid = true;
+    d.widgets = std::move(ws);
+    return d;
+}
+
+// ---- 变换 ----
+void testTransform(const SdfFont& font) {
+    const double kTol = 1e-3;
+
+    // ① 绕中心转 90°：100×50 的框包围盒变成 50×100。
+    //    ⚠ 忽略 rot 的实现会得到 100×50 —— 一眼可判。
+    {
+        UiCanvas c;
+        c.begin();
+        const float cx = 150.0f, cy = 125.0f;
+        c.pushTransform(Ui2Xform::rotateScaleAbout(1.57079632679f, 1.0f, cx, cy));
+        c.roundRect(100.0f, 100.0f, 100.0f, 50.0f, 8.0f, rgba(255, 255, 255));
+        c.popTransform();
+        const Aabb b = vertsAabb(c);
+        const bool ok = std::fabs(b.w() - 50.0) < 0.01 &&
+                        std::fabs(b.h() - 100.0) < 0.01;
+        report("xform_rot90_aabb", f2s(b.w()) + "x" + f2s(b.h()), "50x100", kTol,
+               ok);
+        // ② 旋转后的框必须走 mode 4。不切换的话着色器会按"中心 ± 半宽"
+        //    把四个顶点再展开一次 → 画出一个 200×100 的轴对齐大框。
+        bool allMode4 = !c.vertices().empty();
+        for (const auto& v : c.vertices())
+            if (v.mode != static_cast<float>(Ui2Prim::RoundBoxRotated))
+                allMode4 = false;
+        report("xform_rot_uses_mode4",
+               allMode4 ? "RoundBoxRotated" : "other", "RoundBoxRotated", 0,
+               allMode4);
+        // ③ 但 vLocal 的输入（uv / half）必须**保持未旋转**，否则 frag 里
+        //    的 sdRoundBox 会在一个错位的局部系里求距离（圆角变歪）。
+        bool localOk = true;
+        for (const auto& v : c.vertices()) {
+            if (std::fabs(v.hx - 50.0f) > 1e-3f) localOk = false;
+            if (std::fabs(v.hy - 25.0f) > 1e-3f) localOk = false;
+            if (std::fabs(std::fabs(v.u) - 1.0f) > 1e-3f) localOk = false;
+        }
+        report("xform_rot_keeps_local", localOk ? "half=50x25" : "broken",
+               "half=50x25", 0, localOk);
+    }
+
+    // ④ 缩放（无旋转）走 mode 0/3 快路径，半宽翻倍。
+    {
+        UiCanvas c;
+        c.begin();
+        c.pushTransform(Ui2Xform::rotateScaleAbout(0.0f, 2.0f, 150.0f, 125.0f));
+        c.roundRect(100.0f, 100.0f, 100.0f, 50.0f, 8.0f, rgba(255, 255, 255));
+        c.popTransform();
+        bool mode0or3 = !c.vertices().empty();
+        bool halfOk = true;
+        for (const auto& v : c.vertices()) {
+            if (v.mode == static_cast<float>(Ui2Prim::RoundBoxRotated))
+                mode0or3 = false;
+            if (std::fabs(v.hx - 100.0f) > 1e-3f) halfOk = false;
+            if (std::fabs(v.hy - 50.0f) > 1e-3f) halfOk = false;
+        }
+        report("xform_scale2_fastpath",
+               (mode0or3 && halfOk) ? "mode3+half=100x50" : "broken",
+               "mode3+half=100x50", kTol, mode0or3 && halfOk);
+    }
+
+    // ⑤ 文字跟着父控件转（**最容易漏的一条**：只转面板不转文字，
+    //    截图里一眼能看出，但"父控件旋转"的断言照样绿）。
+    {
+        if (!font.valid()) {
+            report("xform_text_follows", "no-font", "rotated", 0, false);
+        } else {
+            UiCanvas a;
+            a.begin();
+            a.text(font, 100.0f, 200.0f, "Rotation", rgba(255, 255, 255), 32.0f);
+            const Aabb flat = vertsAabb(a);
+
+            UiCanvas b;
+            b.begin();
+            b.pushTransform(
+                Ui2Xform::rotateScaleAbout(1.57079632679f, 1.0f, 150.0f, 190.0f));
+            b.text(font, 100.0f, 200.0f, "Rotation", rgba(255, 255, 255), 32.0f);
+            b.popTransform();
+            const Aabb rot = vertsAabb(b);
+            // 横排文字转 90° 之后：宽度方向 → 高度方向
+            const bool ok = std::fabs(rot.w() - flat.h()) < 2.0f &&
+                            std::fabs(rot.h() - flat.w()) < 2.0f &&
+                            flat.w() > flat.h();   // 前提：横排确实比高宽
+            report("xform_text_follows",
+                   f2s(rot.w()) + "x" + f2s(rot.h()),
+                   f2s(flat.h()) + "x" + f2s(flat.w()), 2.0, ok);
+        }
+    }
+
+    // ⑥ 透明度：乘进子树、可嵌套、弹出后复原。
+    {
+        UiCanvas c;
+        c.begin();
+        c.pushOpacity(0.5f);
+        c.rect(0.0f, 0.0f, 10.0f, 10.0f, rgba(255, 255, 255, 255));
+        c.pushOpacity(0.5f);
+        c.rect(0.0f, 0.0f, 10.0f, 10.0f, rgba(255, 255, 255, 255));
+        c.popOpacity();
+        c.popOpacity();
+        c.rect(0.0f, 0.0f, 10.0f, 10.0f, rgba(255, 255, 255, 255));
+        // 三块各 6 顶点
+        const auto& v = c.vertices();
+        const int a1 = (v.size() >= 18) ? static_cast<int>((v[0].color >> 24) & 0xFF)
+                                        : -1;
+        const int a2 = (v.size() >= 18) ? static_cast<int>((v[6].color >> 24) & 0xFF)
+                                        : -2;
+        const int a3 = (v.size() >= 18) ? static_cast<int>((v[12].color >> 24) & 0xFF)
+                                        : -3;
+        const bool ok = (a1 == 128 || a1 == 127) &&
+                        (a2 == 64 || a2 == 63) && a3 == 255;
+        report("xform_opacity_nested",
+               std::to_string(a1) + "/" + std::to_string(a2) + "/" +
+                   std::to_string(a3),
+               "127/63/255", 1, ok);
+
+        // ⑦ 全透明 → **一个顶点都不产生**（不是"画成全透明"：
+        //    后者仍然占顶点、仍然进 draw，而且 alpha=0 的混合在某些
+        //    驱动上会与"没画"表现不同）。
+        UiCanvas z;
+        z.begin();
+        z.pushOpacity(0.0f);
+        z.roundRect(0.0f, 0.0f, 100.0f, 100.0f, 8.0f, rgba(255, 255, 255));
+        z.popOpacity();
+        report("xform_opacity_zero_no_verts", std::to_string(z.vertices().size()),
+               "0", 0, z.vertices().empty());
+    }
+}
+
+// ---- Scroll / Grid ----
+void testScrollGrid() {
+    // ① Grid：3 列等分，子控件自己的 rect **被忽略**。
+    {
+        UiWidget g = mkPanel("grid", 0.0f, 0.0f, 300.0f, 100.0f);
+        g.type = UiWidgetType::Grid;
+        g.cols = 3;
+        g.gapX = 0.0f;
+        g.gapY = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            UiWidget k = mkPanel("cell" + std::to_string(i), 999.0f, 999.0f,
+                                 7.0f, 7.0f);   // 故意填垃圾值
+            g.children.push_back(k);
+        }
+        const UiDocument d = mkDoc({g});
+        UiBindings b;
+        const auto placed = placeDocumentAt(d, b, UiRect{0, 0, 300, 100}, 1.0f);
+        // placed[0] = grid，后面 3 个 cell
+        bool ok = placed.size() == 4;
+        if (ok) {
+            for (int i = 0; i < 3; ++i) {
+                const UiRect& r = placed[static_cast<std::size_t>(i) + 1].rect;
+                if (std::fabs(r.x - static_cast<float>(i) * 100.0f) > 0.01f)
+                    ok = false;
+                if (std::fabs(r.w - 100.0f) > 0.01f) ok = false;
+                if (std::fabs(r.h - 100.0f) > 0.01f) ok = false;
+            }
+        }
+        report("grid_cells_3col",
+               ok ? "x=0,100,200 w=100" : "wrong", "x=0,100,200 w=100", 0, ok);
+    }
+
+    // ② Grid 两行：4 个子控件 3 列 → 第二行 1 个，行高 = (100-gap)/2。
+    {
+        UiWidget g = mkPanel("grid", 0.0f, 0.0f, 300.0f, 100.0f);
+        g.type = UiWidgetType::Grid;
+        g.cols = 3;
+        g.gapX = 0.0f;
+        g.gapY = 0.0f;
+        for (int i = 0; i < 4; ++i) g.children.push_back(mkPanel("c" + std::to_string(i), 0, 0, 1, 1));
+        const UiDocument d = mkDoc({g});
+        UiBindings b;
+        const auto placed = placeDocumentAt(d, b, UiRect{0, 0, 300, 100}, 1.0f);
+        bool ok = placed.size() == 5;
+        if (ok) {
+            const UiRect& r3 = placed[4].rect;   // 第 4 个 = 第二行第一个
+            ok = std::fabs(r3.x) < 0.01f && std::fabs(r3.y - 50.0f) < 0.01f &&
+                 std::fabs(r3.h - 50.0f) < 0.01f;
+        }
+        report("grid_rows_2", ok ? "c3=(0,50) h=50" : "wrong", "c3=(0,50) h=50",
+               0, ok);
+    }
+
+    // ③ Scroll：scrollY=50 把子控件上移 50。
+    {
+        UiWidget s = mkPanel("scroll", 0.0f, 0.0f, 200.0f, 100.0f);
+        s.type = UiWidgetType::Scroll;
+        s.scrollY = 50.0f;
+        s.children.push_back(mkPanel("row", 0.0f, 0.0f, 200.0f, 40.0f));
+        const UiDocument d = mkDoc({s});
+        UiBindings b;
+        const auto placed = placeDocumentAt(d, b, UiRect{0, 0, 200, 100}, 1.0f);
+        const bool ok = placed.size() == 2 &&
+                        std::fabs(placed[1].rect.y + 50.0f) < 0.01f;
+        report("scroll_offset", ok ? f2s(placed.back().rect.y) : "wrong", "-50",
+               0.01, ok);
+        // ④ 子控件被标记"有裁剪"，且裁剪矩形 = 容器矩形
+        const bool clipOk = placed.size() == 2 && placed[1].hasClip &&
+                            std::fabs(placed[1].clip.h - 100.0f) < 0.01f;
+        report("scroll_child_clipped", clipOk ? "clip=container" : "no-clip",
+               "clip=container", 0, clipOk);
+    }
+
+    // ⑤ 滚出可视区的子控件：**画不出顶点**，也**点不中**。
+    //    ⚠ 不裁的话它会被画在容器外面（叠在牌桌上），而"点不中"这条
+    //      是最容易被忽略的 —— 滚出列表的行矩形还在，命中测试照样会中。
+    //
+    //    ⚠⚠ 判据**不能**写成"顶点数 == 0"：Scroll 容器自己就是个面板，
+    //      它自己要画 6 个顶点。写成 0 会被这个 6 绊住（而且看起来像
+    //      "裁剪没生效"，实际是容器底）。正确的对照量是
+    //      "把唯一的孩子滚出视野之后，顶点数与**没有孩子时**一样"。
+    {
+        auto scrollDoc = [](bool withChild, float scrollY) {
+            UiWidget s = mkPanel("scroll", 0.0f, 0.0f, 200.0f, 100.0f);
+            s.type = UiWidgetType::Scroll;
+            s.scrollY = scrollY;
+            if (withChild) {
+                UiWidget row = mkPanel("row", 0.0f, 0.0f, 200.0f, 40.0f);
+                row.action = "quit";   // 让它"可交互"，才测得到命中
+                s.children.push_back(row);
+            }
+            return mkDoc({s});
+        };
+        UiBindings b;
+        UiCanvas empty;
+        empty.begin();
+        drawDocument(empty, scrollDoc(false, 500.0f), b, 200, 100, nullptr,
+                     nullptr);
+
+        UiCanvas out;
+        out.begin();
+        const auto st = drawDocument(out, scrollDoc(true, 500.0f), b, 200, 100,
+                                     nullptr, nullptr);
+        report("scroll_out_of_view_no_verts",
+               std::to_string(out.vertices().size()) + " vs bare " +
+                   std::to_string(empty.vertices().size()),
+               "same", 0,
+               out.vertices().size() == empty.vertices().size() &&
+                   empty.vertices().size() == 6);
+
+        const auto placed =
+            placeDocumentAt(scrollDoc(true, 500.0f), b, UiRect{0, 0, 200, 100},
+                            1.0f);
+        // row 的真实矩形是 y = -500..-460，容器外 —— 直接点在容器里不该命中
+        const std::string hit = hitTestDocument(placed, 100.0f, 20.0f);
+        report("scroll_out_of_view_no_hit", hit.empty() ? "(none)" : hit,
+               "(none)", 0, hit.empty());
+        (void)st;
+    }
+
+    // ⑥ 部分可见 → 有顶点 + **只有被裁的那一个**记 scissor，
+    //    且 drawCalls 按"裁剪相同"切成 3 段（容器 / 子 / 容器外）。
+    //
+    //    ⚠ 3 段而不是 2 段是对的：两个不裁的控件被中间那个带裁的隔开，
+    //      scissor 变了两次。想压成 2 段就得重排绘制顺序 —— 那是另一件事
+    //      （而且会改变叠放次序）。
+    {
+        UiWidget s = mkPanel("scroll", 0.0f, 0.0f, 200.0f, 100.0f);
+        s.type = UiWidgetType::Scroll;
+        s.scrollY = 20.0f;
+        s.children.push_back(mkPanel("row", 0.0f, 0.0f, 200.0f, 40.0f));
+        UiWidget out = mkPanel("outside", 0.0f, 150.0f, 50.0f, 20.0f);
+        const UiDocument d = mkDoc({s, out});
+        UiBindings b;
+        UiCanvas c;
+        c.begin();
+        drawDocument(c, d, b, 200, 100, nullptr, nullptr);
+        int clipped = 0;
+        for (const auto& sc : c.scissors())
+            if (sc.any) ++clipped;
+        const uint32_t calls = c.drawCalls();
+        const bool ok = clipped == 1 && calls == 3;
+        report("scroll_partial_scissor",
+               std::to_string(clipped) + " clipped / draws=" +
+                   std::to_string(calls),
+               "1 clipped / draws=3", 0, ok);
+    }
+}
+
+// ---- 拖放 ----
+void testDrag() {
+    // ① 判据本身：整词匹配 + 通配 + 空格容错。
+    {
+        const bool a = dropAccepts("card", "card");
+        const bool b = dropAccepts("card, item", "item");
+        const bool c = dropAccepts("card", "cardboard");   // 不许命中
+        const bool d = dropAccepts("*", "anything");
+        const bool e = !dropAccepts("", "card");
+        const std::string got = std::string(a ? "1" : "0") + (b ? "1" : "0") +
+                                (c ? "1" : "0") + (d ? "1" : "0") +
+                                (e ? "1" : "0");
+        report("drag_accepts_word", got, "11011", 0,
+               a && b && !c && d && e);
+    }
+
+    // 造一份"手上两张牌 + 一个接卡牌的槽 + 一个只接道具的槽"的文档。
+    auto build = [](UiDocument& d) {
+        UiWidget card = mkPanel("card0", 0.0f, 0.0f, 100.0f, 140.0f);
+        card.dragTag = "card";
+        UiWidget slotA = mkPanel("slotA", 300.0f, 0.0f, 120.0f, 140.0f);
+        slotA.dropAccept = "card";
+        UiWidget slotB = mkPanel("slotB", 500.0f, 0.0f, 120.0f, 140.0f);
+        slotB.dropAccept = "item";
+        d = mkDoc({card, slotA, slotB});
+    };
+
+    // ② 按下就进拖拽，并记下 tag。
+    {
+        UiDocument d;
+        build(d);
+        UiBindings b;
+        const auto placed = placeDocumentAt(d, b, UiRect{0, 0, 800, 200}, 1.0f);
+        UiDocInput in;
+        const auto r = in.update(d, placed, 50.0f, 70.0f, true, true, false);
+        const bool ok = r.dragBegan && r.dragId == "card0" && r.dragTag == "card";
+        report("drag_begin", ok ? r.dragId + "/" + r.dragTag : "no", "card0/card",
+               0, ok);
+    }
+
+    // ③ 拖动时**只有合法目标**被高亮。
+    {
+        UiDocument d;
+        build(d);
+        UiBindings b;
+        const auto placed = placeDocumentAt(d, b, UiRect{0, 0, 800, 200}, 1.0f);
+        UiDocInput in;
+        in.update(d, placed, 50.0f, 70.0f, true, true, false);
+        // 指针移到 slotA 上方（合法）
+        in.update(d, placed, 360.0f, 70.0f, true, false, false);
+        const auto& st = in.state();
+        UiCanvas c;
+        c.begin();
+        const auto ds = drawDocument(c, d, b, 800, 200, nullptr, &st);
+        const bool ok = ds.highlights == 1 && st.dropTarget == "slotA";
+        report("drag_highlight_legal_only",
+               std::to_string(ds.highlights) + "/" +
+                   (st.dropTarget.empty() ? "(none)" : st.dropTarget),
+               "1/slotA", 0, ok);
+    }
+
+    // ④ 指针在**不合法**目标上 → 高亮 0 个（但合法目标仍应高亮？不 ——
+    //    P3-2 的约定是"拖动期间所有合法目标都淡高亮，指针底下的那个亮"）。
+    //    所以这里验的是"只接 item 的槽不算合法目标"：高亮总数仍是 1。
+    {
+        UiDocument d;
+        build(d);
+        UiBindings b;
+        const auto placed = placeDocumentAt(d, b, UiRect{0, 0, 800, 200}, 1.0f);
+        UiDocInput in;
+        in.update(d, placed, 50.0f, 70.0f, true, true, false);
+        in.update(d, placed, 560.0f, 70.0f, true, false, false);   // slotB
+        const auto& st = in.state();
+        UiCanvas c;
+        c.begin();
+        const auto ds = drawDocument(c, d, b, 800, 200, nullptr, &st);
+        const bool ok = ds.highlights == 1 && st.dropTarget.empty();
+        report("drag_highlight_skips_illegal",
+               std::to_string(ds.highlights) + "/" +
+                   (st.dropTarget.empty() ? "(none)" : st.dropTarget),
+               "1/(none)", 0, ok);
+    }
+
+    // ⑤ 松手落在合法目标上 → 有 dropId、**且没有点击**。
+    {
+        UiDocument d;
+        build(d);
+        UiBindings b;
+        const auto placed = placeDocumentAt(d, b, UiRect{0, 0, 800, 200}, 1.0f);
+        UiDocInput in;
+        in.update(d, placed, 50.0f, 70.0f, true, true, false);
+        in.update(d, placed, 360.0f, 70.0f, true, false, false);
+        const auto r = in.update(d, placed, 360.0f, 70.0f, false, false, true);
+        const bool ok = r.dragEnded && r.dropId == "slotA" && r.id.empty();
+        report("drag_drop_no_click",
+               (r.dropId.empty() ? "no-drop" : r.dropId) +
+                   (r.id.empty() ? "/no-click" : "/CLICKED"),
+               "slotA/no-click", 0, ok);
+    }
+
+    // ⑥ 松手落在空白 / 非法目标上 → 取消，且没有点击。
+    {
+        UiDocument d;
+        build(d);
+        UiBindings b;
+        const auto placed = placeDocumentAt(d, b, UiRect{0, 0, 800, 200}, 1.0f);
+        UiDocInput in;
+        in.update(d, placed, 50.0f, 70.0f, true, true, false);
+        const auto r = in.update(d, placed, 700.0f, 190.0f, false, false, true);
+        const bool ok = r.dragEnded && r.dropId.empty() && r.id.empty();
+        report("drag_cancel_no_target",
+               (r.dropId.empty() ? "(none)" : r.dropId) +
+                   (r.id.empty() ? "/no-click" : "/CLICKED"),
+               "(none)/no-click", 0, ok);
+    }
+
+    // ⑦ 落在自己身上 → 不算放下（否则拖起来又松手 = 一次自我转移）。
+    {
+        UiDocument d = mkDoc({[] {
+            UiWidget c = mkPanel("self", 0.0f, 0.0f, 100.0f, 100.0f);
+            c.dragTag = "card";
+            c.dropAccept = "card";     // 自己也能接
+            return c;
+        }()});
+        UiBindings b;
+        const auto placed = placeDocumentAt(d, b, UiRect{0, 0, 400, 200}, 1.0f);
+        UiDocInput in;
+        in.update(d, placed, 50.0f, 50.0f, true, true, false);
+        const auto r = in.update(d, placed, 50.0f, 50.0f, false, false, true);
+        const bool ok = r.dragEnded && r.dropId.empty() && r.id.empty();
+        report("drag_self_no_drop", r.dropId.empty() ? "(none)" : r.dropId,
+               "(none)", 0, ok);
+    }
+
+    // ⑧ 旋转后的命中：100×20 的牌子转 90° 变成竖条，原来的 AABB 两侧
+    //    **不该**命中，竖条两端**该**命中。
+    {
+        UiDocument d;
+        UiWidget w0 = mkPanel("bar", 100.0f, 100.0f, 100.0f, 20.0f);
+        w0.action = "quit";
+        w0.rot = 90.0f;            // 绕中心 (150,110)
+        d = mkDoc({w0});
+        UiBindings b;
+        const auto placed = placeDocumentAt(d, b, UiRect{0, 0, 400, 300}, 1.0f);
+        // 竖条范围约 x∈[140,160], y∈[60,160]
+        const std::string inBody = hitTestDocument(placed, 150.0f, 150.0f);
+        const std::string inAabbOnly = hitTestDocument(placed, 200.0f, 110.0f);
+        const bool ok = inBody == "bar" && inAabbOnly.empty();
+        report("drag_hit_rotated",
+               (inBody.empty() ? "(none)" : inBody) + "/" +
+                   (inAabbOnly.empty() ? "(none)" : inAabbOnly),
+               "bar/(none)", 0, ok);
+    }
+
+    // ⑨ 拖拽幽灵：拖动期间顶点数明显多于静态绘制。
+    {
+        UiDocument d;
+        build(d);
+        UiBindings b;
+        const auto placed = placeDocumentAt(d, b, UiRect{0, 0, 800, 200}, 1.0f);
+        UiDocInput in;
+        in.update(d, placed, 50.0f, 70.0f, true, true, false);
+        const auto& st = in.state();
+        UiCanvas still;
+        still.begin();
+        drawDocument(still, d, b, 800, 200, nullptr, nullptr);
+        UiCanvas drag;
+        drag.begin();
+        drawDocument(drag, d, b, 800, 200, nullptr, &st);
+        const bool ok = drag.vertices().size() > still.vertices().size();
+        report("drag_ghost_draws",
+               std::to_string(drag.vertices().size()) + ">" +
+                   std::to_string(still.vertices().size()),
+               "more", 0, ok);
+    }
+}
+
+}  // namespace
 
 }  // namespace ui2

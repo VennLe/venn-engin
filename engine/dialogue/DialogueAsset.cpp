@@ -48,6 +48,45 @@ int findNode(const DialogueAsset& a, const std::string& id) {
     return (it == a.index.end()) ? -1 : it->second;
 }
 
+// ---------------------------------------------------------------- C7 条件
+
+const char* condOpError(const std::string& op) {
+    if (op == ">=" || op == "<=" || op == ">" || op == "<" || op == "==" ||
+        op == "!=" || op == "=")
+        return nullptr;
+    return "has an unknown op (use >= <= > < == != )";
+}
+
+namespace {
+// `=` 是 `==` 的同义词（作者常写 `"op": "="`）。归一化只在这里做一次，
+// 求值路径上不再判断 —— 两处判断就会有两处不一致。
+bool compareFlag(double a, const std::string& op, double b) {
+    if (op == ">=") return a >= b;
+    if (op == "<=") return a <= b;
+    if (op == ">") return a > b;
+    if (op == "<") return a < b;
+    if (op == "==" || op == "=") return a == b;
+    if (op == "!=") return a != b;
+    // 走到这里说明 op 没经过 `condOpError` 检查（作者绕过了 parse 直接拼
+    // 结构体）。**返回 false**：不认识的运算符不能当"恒真"—— 那会让
+    // 一整段条件被静默忽略，而剧本看着完全正常。
+    return false;
+}
+} // namespace
+
+bool evalConds(const std::vector<DlgCond>& conds, const DlgFlagStore* store) {
+    if (conds.empty()) return true;
+    // ⚠ 没有 store 时**恒假**，而且是调用方（runner）负责报错。
+    //   在这里返回 false 而不是 true：条件不成立会跳到 else，走线是
+    //   "最保守"的那条，而 runner 会把 `no flag store` 写进 error ——
+    //   两个信号一起出现，排查时不会误判成"剧本写错了"。
+    if (!store) return false;
+    for (const auto& c : conds) {
+        if (!compareFlag(store->get(c.flag), c.op, c.value)) return false;
+    }
+    return true;
+}
+
 int revealedChars(float elapsed, float cps, int total) {
     if (total <= 0) return 0;
     // ⚠ `cps <= 0` = **关掉打字机**（立刻全出），不是"永远显示 0 个字"。
@@ -161,6 +200,54 @@ bool parseDialogue(const std::string& text, const std::string& sourcePath,
         if (jn.contains("voice") && jn["voice"].is_string())
             n.voice = jn["voice"].get<std::string>();
 
+        // ---- C7：条件（`if`）----
+        // 命名取 `if` 而不是 `when`/`cond`：剧作者读 JSON 时最认这个词。
+        // ⚠ `if` 是 JSON 键，不是关键字 —— 不冲突。
+        if (jn.contains("if")) {
+            if (!jn["if"].is_array()) {
+                out.error = "line \"" + n.id + "\": if must be an array";
+                return false;
+            }
+            for (const auto& jc : jn["if"]) {
+                if (!jc.is_object()) {
+                    out.error = "line \"" + n.id +
+                                "\": every if entry must be an object";
+                    return false;
+                }
+                DlgCond c;
+                if (jc.contains("flag") && jc["flag"].is_string())
+                    c.flag = jc["flag"].get<std::string>();
+                if (jc.contains("op") && jc["op"].is_string())
+                    c.op = jc["op"].get<std::string>();
+                if (jc.contains("value") && jc["value"].is_number())
+                    c.value = jc["value"].get<double>();
+                if (c.flag.empty()) {
+                    out.error = "line \"" + n.id + "\": if entry needs flag";
+                    return false;
+                }
+                // ⚠ 运算符拼错必须在**加载期**炸掉。留到运行期的话，
+                //   一个不认识的 op 会被某个实现当"恒真"、另一个当"恒假"，
+                //   而两边都"能跑"—— 剧本走线却对不上，谁也没错。
+                if (const char* why = condOpError(c.op)) {
+                    out.error = "line \"" + n.id + "\": if \"" + c.flag +
+                                "\" " + why;
+                    return false;
+                }
+                n.conds.push_back(std::move(c));
+            }
+            if (jn.contains("else") && jn["else"].is_string())
+                n.elseId = jn["else"].get<std::string>();
+            // `if` 为空数组等于无条件 —— 那是作者在删条件时留下的壳，
+            // 不是错误，但要提醒一句（`else` 会永远走不到）。
+            if (n.conds.empty())
+                out.warnings.push_back("line \"" + n.id +
+                                       "\" has an empty if (never skips)");
+        } else if (jn.contains("else")) {
+            // 没有 `if` 却写了 `else`：这条线永远走不到，几乎肯定是笔误。
+            out.warnings.push_back("line \"" + n.id +
+                                   "\" has else without if (ignored)");
+        }
+
         if (jn.contains("choices")) {
             if (!jn["choices"].is_array()) {
                 out.error = "line \"" + n.id + "\": choices must be an array";
@@ -184,6 +271,32 @@ bool parseDialogue(const std::string& text, const std::string& sourcePath,
                     out.error = "line \"" + n.id + "\": choice \"" + c.text +
                                 "\" needs goto";
                     return false;
+                }
+                // C7：选项的副作用（`set`）。
+                if (jc.contains("set")) {
+                    if (!jc["set"].is_array()) {
+                        out.error = "line \"" + n.id + "\": choice \"" + c.text +
+                                    "\" set must be an array";
+                        return false;
+                    }
+                    for (const auto& js : jc["set"]) {
+                        if (!js.is_object()) {
+                            out.error = "line \"" + n.id + "\": choice \"" +
+                                        c.text + "\" set entries must be objects";
+                            return false;
+                        }
+                        DlgWrite w;
+                        if (js.contains("flag") && js["flag"].is_string())
+                            w.flag = js["flag"].get<std::string>();
+                        if (js.contains("value") && js["value"].is_number())
+                            w.value = js["value"].get<double>();
+                        if (w.flag.empty()) {
+                            out.error = "line \"" + n.id + "\": choice \"" +
+                                        c.text + "\" set entry needs flag";
+                            return false;
+                        }
+                        c.writes.push_back(std::move(w));
+                    }
                 }
                 n.choices.push_back(std::move(c));
             }
@@ -231,6 +344,12 @@ bool parseDialogue(const std::string& text, const std::string& sourcePath,
                         "\" is not a line id";
             return false;
         }
+        // C7：`else` 与 next 一样，在加载期就查完。
+        if (!n.elseId.empty() && findNode(out, n.elseId) < 0) {
+            out.error = "line \"" + n.id + "\": else \"" + n.elseId +
+                        "\" is not a line id";
+            return false;
+        }
         for (const auto& c : n.choices) {
             if (findNode(out, c.gotoId) < 0) {
                 out.error = "line \"" + n.id + "\": choice \"" + c.text +
@@ -241,9 +360,18 @@ bool parseDialogue(const std::string& text, const std::string& sourcePath,
     }
 
     out.valid = true;
-    VK_LOG_INFO("DLG-ASSET name=%s lines=%d start=%s warns=%d",
+    // C7：`conds` / `writes` 是"这份剧本用了分支"的机器可读证据。
+    // 追加在**行尾**：验收脚本按 `next=` 之类前缀取值，加在末尾最安全。
+    int conds = 0, writes = 0;
+    for (const auto& n : out.nodes) {
+        conds += static_cast<int>(n.conds.size());
+        for (const auto& c : n.choices)
+            writes += static_cast<int>(c.writes.size());
+    }
+    VK_LOG_INFO("DLG-ASSET name=%s lines=%d start=%s warns=%d conds=%d writes=%d",
                 out.name.c_str(), static_cast<int>(out.nodes.size()),
-                out.startId.c_str(), static_cast<int>(out.warnings.size()));
+                out.startId.c_str(), static_cast<int>(out.warnings.size()), conds,
+                writes);
     for (const auto& w : out.warnings) VK_LOG_WARN("DLG-WARN %s", w.c_str());
     return true;
 }
@@ -277,12 +405,36 @@ std::string toJson(const DialogueAsset& a) {
         if (!n.nextId.empty()) jn["next"] = n.nextId;
         // D1：只在有语音时写 —— 老资产存回去**不许长出** `"voice": ""`。
         if (!n.voice.empty()) jn["voice"] = n.voice;
+        // C7：条件与 else。同样只在有内容时写（老资产存回去逐位不变）。
+        // ⚠ `if` 在前、`else` 在后 —— 读起来就是"如果…否则…"。
+        if (!n.conds.empty()) {
+            nlohmann::ordered_json jf = nlohmann::ordered_json::array();
+            for (const auto& c : n.conds) {
+                nlohmann::ordered_json o = nlohmann::ordered_json::object();
+                o["flag"] = c.flag;
+                o["op"] = c.op;
+                o["value"] = c.value;
+                jf.push_back(std::move(o));
+            }
+            jn["if"] = std::move(jf);
+            if (!n.elseId.empty()) jn["else"] = n.elseId;
+        }
         if (!n.choices.empty()) {
             nlohmann::ordered_json jc = nlohmann::ordered_json::array();
             for (const auto& c : n.choices) {
                 nlohmann::ordered_json o = nlohmann::ordered_json::object();
                 o["text"] = c.text;
                 o["goto"] = c.gotoId;
+                if (!c.writes.empty()) {
+                    nlohmann::ordered_json js = nlohmann::ordered_json::array();
+                    for (const auto& w : c.writes) {
+                        nlohmann::ordered_json wo = nlohmann::ordered_json::object();
+                        wo["flag"] = w.flag;
+                        wo["value"] = w.value;
+                        js.push_back(std::move(wo));
+                    }
+                    o["set"] = std::move(js);
+                }
                 jc.push_back(std::move(o));
             }
             jn["choices"] = std::move(jc);

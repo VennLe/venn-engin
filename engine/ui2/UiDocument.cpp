@@ -13,6 +13,8 @@
 #include "assets/AssetPath.h"
 #include "core/Logger.h"
 #include "ui2/SdfFont.h"
+#include "ui2/UiAction.h"     // 加载时校验 action 文本（只为产出 warning）
+#include "ui2/UiDocInput.h"   // UiDocInteraction（绘制调色）
 
 #include <nlohmann/json.hpp>
 
@@ -39,8 +41,8 @@ constexpr int kMaxDepth = 8;
 
 // ---------------------------------------------------------------- 名字表
 
-const char* const kTypeNames[] = {"panel", "nine", "image",
-                                  "text",  "button", "progress"};
+const char* const kTypeNames[] = {"panel", "nine", "image",   "text",
+                                  "button", "progress", "scroll", "grid"};
 static_assert(sizeof(kTypeNames) / sizeof(kTypeNames[0]) ==
                   static_cast<std::size_t>(UiWidgetType::Count),
               "typeName 的字符串表必须与 UiWidgetType 一一对应");
@@ -212,6 +214,38 @@ bool Parser::parseWidget(const nlohmann::json& j, const std::string& whereBase,
     if (out.inset < 0.0f) out.inset = 0.0f;
     if (out.size <= 0.0f) out.size = 20.0f;
 
+    // ---- 变换 / 滚动 / 网格（P3-2）----
+    num("rot", out.rot);
+    num("scale", out.scale);
+    num("opacity", out.opacity);
+    num("scrollX", out.scrollX);
+    num("scrollY", out.scrollY);
+    num("gapX", out.gapX);
+    num("gapY", out.gapY);
+    // ⚠ 这三条**夹而不报错**：数值越界是"作者手滑"，把他整份 UI 加载失败
+    //   比画得难看严重得多。但夹的时候要留 warning，否则"我写了 scale=0
+    //   想让它消失，结果它还在"会变成一条查不出来的 bug。
+    if (out.scale <= 0.0f) {
+        warn(where, "\"scale\" must be > 0 — clamped to 1");
+        out.scale = 1.0f;
+    }
+    if (out.opacity < 0.0f) out.opacity = 0.0f;
+    if (out.opacity > 1.0f) out.opacity = 1.0f;
+    if (out.gapX < 0.0f) out.gapX = 0.0f;
+    if (out.gapY < 0.0f) out.gapY = 0.0f;
+    {
+        const auto itCols = j.find("cols");
+        if (itCols != j.end()) {
+            if (!itCols->is_number_integer())
+                return fail(where, "\"cols\" must be an integer");
+            out.cols = itCols->get<int>();
+            if (out.cols < 1) {
+                warn(where, "\"cols\" must be >= 1 — clamped to 1");
+                out.cols = 1;
+            }
+        }
+    }
+
     // ---- 字符串 ----
     auto str = [&](const char* key, std::string& dst) {
         const auto it = j.find(key);
@@ -220,6 +254,32 @@ bool Parser::parseWidget(const nlohmann::json& j, const std::string& whereBase,
     str("text", out.text);
     str("bind", out.bind);
     str("bindMax", out.bindMax);
+    str("dragTag", out.dragTag);
+    str("dropAccept", out.dropAccept);
+
+    // ---- 交互（2026-11-02）----
+    str("action", out.action);
+    str("visibleBind", out.visibleBind);
+    {
+        const auto itEn = j.find("enabled");
+        if (itEn != j.end()) {
+            if (!itEn->is_boolean())
+                return fail(where, "\"enabled\" must be bool");
+            out.enabled = itEn->get<bool>();
+        }
+    }
+    // ⚠ 动作写错**不让整份文档加载失败**，只留一条 warning：
+    //   一个按钮的 action 拼错不该把"某个按钮点不动"升级成"进游戏一片黑"。
+    //   运行时那条路会表现为"点得中、但什么也没发生"+ 一条 UIDOC-NOACTION。
+    if (!out.action.empty()) {
+        UiAction parsed;
+        std::string aerr;
+        if (!parseUiAction(out.action, parsed, &aerr)) {
+            warn(where, "action ignored (" + aerr +
+                            ") — the widget will not respond to clicks");
+            out.action.clear();
+        }
+    }
 
     // ---- align ----
     const auto itAlign = j.find("align");
@@ -419,6 +479,12 @@ std::string toJson(const UiDocument& d) {
         if (w.radius != 0.0f) jw["radius"] = w.radius;
         if (w.inset != 0.0f) jw["inset"] = w.inset;
         if (!w.visible) jw["visible"] = false;
+        // 交互三件（只写非默认）。⚠ 加字段时**两处都要改**：这里与
+        // `Parser::parseWidget` —— 只写不读等于存盘即丢（PostVolume 那边
+        // 的 `cgLutBlend` 就是这么丢的，而且一句报错都没有）。
+        if (!w.enabled) jw["enabled"] = false;
+        if (!w.action.empty()) jw["action"] = w.action;
+        if (!w.visibleBind.empty()) jw["visibleBind"] = w.visibleBind;
         if (!w.text.empty()) jw["text"] = w.text;
         if (w.size != 20.0f) jw["size"] = w.size;
         if (w.align != 0) jw["align"] = kAlignNames[w.align];
@@ -427,6 +493,20 @@ std::string toJson(const UiDocument& d) {
         if (w.value != 1.0f) jw["value"] = w.value;
         if (w.u0 != 0.0f || w.v0 != 0.0f || w.u1 != 1.0f || w.v1 != 1.0f)
             jw["uv"] = ojson::array({w.u0, w.v0, w.u1, w.v1});
+        // 变换 / 滚动 / 网格 / 拖放（P3-2）。同样只写非默认值。
+        // ⚠ 这七行与 `parseWidget` 里那一段是**一对**：只加一边就等于
+        //   "存盘即丢"，而丢的是"这张牌转了 8°"这种一眼能看见的东西，
+        //   下次打开却什么都没有，作者会以为编辑器没保存。
+        if (w.rot != 0.0f) jw["rot"] = w.rot;
+        if (w.scale != 1.0f) jw["scale"] = w.scale;
+        if (w.opacity != 1.0f) jw["opacity"] = w.opacity;
+        if (w.scrollX != 0.0f) jw["scrollX"] = w.scrollX;
+        if (w.scrollY != 0.0f) jw["scrollY"] = w.scrollY;
+        if (w.cols != 2) jw["cols"] = w.cols;
+        if (w.gapX != 8.0f) jw["gapX"] = w.gapX;
+        if (w.gapY != 8.0f) jw["gapY"] = w.gapY;
+        if (!w.dragTag.empty()) jw["dragTag"] = w.dragTag;
+        if (!w.dropAccept.empty()) jw["dropAccept"] = w.dropAccept;
         if (!w.children.empty()) {
             ojson kids = ojson::array();
             for (const auto& k : w.children) kids.push_back(dump(k));
@@ -537,6 +617,30 @@ UiWidget* findWidget(UiDocument& d, const std::string& path) {
     return const_cast<UiWidget*>(findInChildren(d.widgets, path));
 }
 
+namespace {
+
+// 按 id 全树递归。深度很浅（kMaxDepth = 8），不需要 map 索引 ——
+// 命中测试每帧最多查一次，建索引的收益是负的。
+const UiWidget* findByIdRec(const std::vector<UiWidget>& ws,
+                            const std::string& id) {
+    for (const auto& w : ws) {
+        if (w.id == id) return &w;
+        if (const UiWidget* k = findByIdRec(w.children, id)) return k;
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+const UiWidget* findWidgetById(const UiDocument& d, const std::string& id) {
+    if (id.empty()) return nullptr;
+    return findByIdRec(d.widgets, id);
+}
+
+UiWidget* findWidgetById(UiDocument& d, const std::string& id) {
+    return const_cast<UiWidget*>(findByIdRec(d.widgets, id));
+}
+
 int countWidgets(const std::vector<UiWidget>& ws) {
     int n = 0;
     for (const auto& w : ws) n += 1 + countWidgets(w.children);
@@ -626,6 +730,30 @@ std::string formatBound(const std::string& tpl, const UiBindings& b) {
 
 // ---------------------------------------------------------------- 布局
 
+// ⚠ `dropAccepts` 必须**在匿名命名空间之外**：它是 `UiDocument.h` 里声明的
+//   公开函数，`UiDocInput.cpp` 要链它。放进匿名命名空间会变成内部链接 ——
+//   症状是 LNK2019 指向 `findDropTarget`，看着像那边的错，其实是这里
+//   少了一层缩进。（2026-11-04 实际踩到。）
+bool dropAccepts(const std::string& acceptList, const std::string& tag) {
+    if (acceptList.empty() || tag.empty()) return false;
+    // 通配 `*`：接任何东西（"背包格子"这类）。
+    if (acceptList == "*") return true;
+    std::size_t i = 0;
+    while (i <= acceptList.size()) {
+        const std::size_t comma = acceptList.find(',', i);
+        const std::size_t end = (comma == std::string::npos) ? acceptList.size()
+                                                             : comma;
+        std::size_t b = i, e = end;
+        while (b < e && (acceptList[b] == ' ' || acceptList[b] == '\t')) ++b;
+        while (e > b && (acceptList[e - 1] == ' ' || acceptList[e - 1] == '\t'))
+            --e;
+        if (e > b && acceptList.compare(b, e - b, tag) == 0) return true;
+        if (comma == std::string::npos) break;
+        i = comma + 1;
+    }
+    return false;
+}
+
 namespace {
 
 // Progress 的归一化比值（夹到 0..1，除零返回 0）。
@@ -640,10 +768,30 @@ float progressRatio(const UiWidget& w, const UiBindings& b) {
     return r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
 }
 
+// 「这个控件这一帧画不画」的**唯一判据**（布局与绘制共用）。
+//
+// ⚠⚠ 两边各写一份的后果不是"少画一个"，而是**整棵树错位一格**：
+//   `drawRec` 靠"记录序号"与树同步推进（见下面那段注释），布局侧多跳过一个
+//   节点、绘制侧没跳过，后面所有控件都会画到邻居的矩形上。
+//   `visibleBind` 是 2026-11-02 加的，所以这个判据从"读一个 bool"变成了
+//   "读一个 bool + 查一次绑定表" —— 正是最容易写岔的时候。
+bool widgetVisible(const UiWidget& w, const UiBindings& b,
+                   bool honorBind = true) {
+    if (!w.visible) return false;
+    if (!honorBind || w.visibleBind.empty()) return true;
+    return b.number(w.visibleBind, 0.0f) != 0.0f;
+}
+
 void placeRec(const std::vector<UiWidget>& ws, const UiRect& parent,
-              const UiBindings& b, float scale, std::vector<UiDocPlaced>& out) {
-    for (const auto& w : ws) {
-        if (!w.visible) continue;
+              const UiBindings& b, float scale, bool honorBind,
+              const Ui2Xform& parentXf, const UiRect* parentClip,
+              std::vector<UiDocPlaced>& out) {
+    // 以**自身中心**为轴心。为什么不是左上角：作者拖一个"旋转 10°"的卡牌时，
+    // 直觉是"它原地转"，绕左上角转会让卡片甩出去半个身位。
+    const std::size_t n = ws.size();
+    for (std::size_t wi = 0; wi < n; ++wi) {
+        const UiWidget& w = ws[wi];
+        if (!widgetVisible(w, b, honorBind)) continue;
 
         UiPlacement p;
         p.anchor = w.anchor;
@@ -657,6 +805,15 @@ void placeRec(const std::vector<UiWidget>& ws, const UiRect& parent,
         rec.type = w.type;
         rec.rect = placeRectIn(parent, p, scale);
         rec.fill = rec.rect;
+        // 可交互 = 配了 action，或者**本身就是按钮**。
+        // 后者为什么也算：Button 没配 action 是作者最常犯的错，把它算作
+        // 可交互才能在点上去的时候打一条"这个按钮没有动作"，而不是让一个
+        // 看起来能按的按钮静默吃掉点击。
+        // ⚠ P3-2：可拖的控件也算"可交互" —— 否则"拖一张牌"这个动作在
+        //   命中测试那儿就过不去（`interactive==false` 直接被跳过）。
+        rec.interactive = !w.action.empty() || w.type == UiWidgetType::Button ||
+                          !w.dragTag.empty() || !w.dropAccept.empty();
+        rec.enabled = w.enabled;
         if (w.type == UiWidgetType::Progress) {
             const float inset = w.inset * scale;
             const float innerW = rec.rect.w - inset * 2.0f;
@@ -665,12 +822,67 @@ void placeRec(const std::vector<UiWidget>& ws, const UiRect& parent,
             rec.fill.w = innerW * progressRatio(w, b);
             rec.fill.h = rec.rect.h - inset * 2.0f;
         }
+
+        // 自身变换（绕自身中心，输出像素）→ 累积
+        Ui2Xform own;
+        if (w.rot != 0.0f || w.scale != 1.0f) {
+            const float cx = rec.rect.x + rec.rect.w * 0.5f;
+            const float cy = rec.rect.y + rec.rect.h * 0.5f;
+            own = Ui2Xform::rotateScaleAbout(w.rot * 3.14159265358979f / 180.0f,
+                                             w.scale, cx, cy);
+        }
+        rec.xform = Ui2Xform::concat(parentXf, own);
+        if (parentClip) {
+            rec.clip = *parentClip;
+            rec.hasClip = true;
+        }
+
         // ⚠ **每个可见控件都要出一条记录**，哪怕矩形退化了。绘制侧靠
         //   "记录序号"与树同步推进；这里漏一条，后面所有控件都会画到
         //   邻居的位置上（而这种错看起来像"锚点算错了"，极难定位）。
         out.push_back(rec);
 
-        if (!w.children.empty()) placeRec(w.children, rec.rect, b, scale, out);
+        if (w.children.empty()) continue;
+
+        if (w.type == UiWidgetType::Grid) {
+            // 等分格子：子控件的 x/y/w/h **被忽略**，由格子算。
+            const int cols = w.cols < 1 ? 1 : w.cols;
+            const int kids = static_cast<int>(w.children.size());
+            const int rows = (kids + cols - 1) / cols;
+            const float gx = w.gapX * scale;
+            const float gy = w.gapY * scale;
+            const float cellW =
+                (rec.rect.w - gx * static_cast<float>(cols - 1)) /
+                static_cast<float>(cols);
+            const float cellH =
+                (rec.rect.h - gy * static_cast<float>(rows - 1)) /
+                static_cast<float>(rows);
+            for (std::size_t k = 0; k < w.children.size(); ++k) {
+                const int ci = static_cast<int>(k) % cols;
+                const int ri = static_cast<int>(k) / cols;
+                std::vector<UiWidget> one{w.children[k]};
+                // 用绝对矩形当"父" → 锚点用 top-left 就等价于"直接给这个格"
+                UiWidget& cw = one[0];
+                cw.anchor = UiAnchor::TopLeft;
+                cw.x = rec.rect.x + static_cast<float>(ci) * (cellW + gx);
+                cw.y = rec.rect.y + static_cast<float>(ri) * (cellH + gy);
+                cw.w = cellW;
+                cw.h = cellH;
+                placeRec(one, rec.rect, b, scale, honorBind, rec.xform,
+                         parentClip, out);
+            }
+        } else if (w.type == UiWidgetType::Scroll) {
+            // 子控件相对"被滚过的内容区"摆放；裁剪用容器**自身**矩形。
+            UiRect inner = rec.rect;
+            inner.x -= w.scrollX * scale;
+            inner.y -= w.scrollY * scale;
+            const UiRect clip = rec.rect;
+            placeRec(w.children, inner, b, scale, honorBind, rec.xform, &clip,
+                     out);
+        } else {
+            placeRec(w.children, rec.rect, b, scale, honorBind, rec.xform,
+                     parentClip, out);
+        }
     }
 }
 
@@ -678,11 +890,13 @@ void placeRec(const std::vector<UiWidget>& ws, const UiRect& parent,
 
 std::vector<UiDocPlaced> placeDocumentAt(const UiDocument& d,
                                          const UiBindings& b,
-                                         const UiRect& canvas, float scale) {
+                                         const UiRect& canvas, float scale,
+                                         bool honorVisibleBind) {
     std::vector<UiDocPlaced> out;
     if (!d.valid || canvas.w <= 0.0f || canvas.h <= 0.0f || scale <= 0.0f)
         return out;
-    placeRec(d.widgets, canvas, b, scale, out);
+    placeRec(d.widgets, canvas, b, scale, honorVisibleBind, Ui2Xform{}, nullptr,
+             out);
     return out;
 }
 
@@ -692,12 +906,24 @@ std::vector<UiDocPlaced> placeDocument(const UiDocument& d,
     UiRect screen;
     screen.w = static_cast<float>(outW);
     screen.h = static_cast<float>(outH);
-    return placeDocumentAt(d, b, screen, computeScale(outW, outH));
+    return placeDocumentAt(d, b, screen, computeScale(outW, outH), true);
 }
 
 // ---------------------------------------------------------------- 绘制
 
 namespace {
+
+// 颜色乘一个系数（只动 RGB，A 原样保留）。
+// ⚠ 字节序：`rgba()` 是 `R | G<<8 | B<<16 | A<<24`（见 UiCanvas.h 的
+//   "字节序陷阱"）。按直觉的 0xRRGGBBAA 去乘会得到一个"颜色不对劲但亮度
+//   看着还行"的结果 —— 最容易被当成"调色不好看"而不是"通道读错了"。
+uint32_t tintColor(uint32_t c, float f) {
+    auto ch = [&](int shift) {
+        const int v = static_cast<int>(((c >> shift) & 0xFF) * f);
+        return v < 0 ? 0 : (v > 255 ? 255 : v);
+    };
+    return rgba(ch(0), ch(8), ch(16), static_cast<int>((c >> 24) & 0xFF));
+}
 
 void drawText(UiCanvas& c, const SdfFont& font, const UiWidget& w,
               const UiRect& r, const std::string& utf8, uint32_t color,
@@ -739,12 +965,12 @@ void drawText(UiCanvas& c, const SdfFont& font, const UiWidget& w,
 void drawRec(UiCanvas& c, const std::vector<UiWidget>& ws,
              const std::vector<UiDocPlaced>& placed, std::size_t& cursor,
              const UiBindings& b, const SdfFont* font, float scale,
-             UiDocDrawStats& st) {
+             const UiDocInteraction* ia, UiDocDrawStats& st) {
     // ⚠ `placed` 与树的遍历顺序**必须**一致（都是"父在前、子在后、DFS"）。
     //   两边各自递归会写两遍树，而"少跳过一个 invisible 节点"这种错会让
     //   整棵树的矩形错位一格 —— 症状是"控件全画在别人的位置上"。
     for (const auto& w : ws) {
-        if (!w.visible) {
+        if (!widgetVisible(w, b)) {
             // 不可见：`placeDocument` 也不为它出记录 → 序号**不推进**，
             // 整棵子树一起跳过（与布局侧完全一致）。
             ++st.skipped;
@@ -755,60 +981,130 @@ void drawRec(UiCanvas& c, const std::vector<UiWidget>& ws,
         const UiRect r = placed[cursor].rect;
         const UiRect fill = placed[cursor].fill;
         ++cursor;
-
+        const bool dragging = ia && !ia->dragging.empty();
         const bool degenerate = (r.w <= 0.5f || r.h <= 0.5f);
-        if (degenerate) {
+
+        // ---- 变换 + 透明度（P3-2）----
+        // ⚠ 必须在**退化检查之前** push：退化的是本控件自己的矩形，子控件
+        //   仍可能是有尺寸的（Grid 里某个空格 + 一个正常子控件）。
+        //   先 push 后判退化，才能保证 pop 与 push 一定成对。
+        const bool hasXf = (w.rot != 0.0f || w.scale != 1.0f);
+        if (hasXf) {
+            const float cx = r.x + r.w * 0.5f;
+            const float cy = r.y + r.h * 0.5f;
+            c.pushTransform(Ui2Xform::rotateScaleAbout(
+                w.rot * 3.14159265358979f / 180.0f, w.scale, cx, cy));
+        }
+        if (w.opacity != 1.0f) c.pushOpacity(w.opacity);
+
+        if (!degenerate) {
+            // 交互调色：pressed 压暗 / hovered 提亮 / disabled 灰化。
+            // ⚠ 只影响**本控件**，不传给子节点：按钮灰化不该把里面的文字也
+            //   压暗（文字是子控件，它有自己的 enabled）。
+            uint32_t col = w.color;
+            uint32_t col2 = w.color2;
+            if (ia) {
+                float f = 1.0f;
+                if (ia->pressed == w.id) f = 0.72f;
+                else if (ia->hovered == w.id) f = 1.22f;
+                if (!w.enabled) f *= 0.55f;
+                if (f != 1.0f) {
+                    col = tintColor(w.color, f);
+                    col2 = tintColor(w.color2, f);
+                }
+            } else if (!w.enabled) {
+                // 静态绘制（编辑器设计画布 / 自检）也要看得出"这是禁用的"。
+                col = tintColor(w.color, 0.55f);
+                col2 = tintColor(w.color2, 0.55f);
+            }
+
+            switch (w.type) {
+                case UiWidgetType::Panel:
+                case UiWidgetType::Scroll:
+                    // Scroll 自己就是个面板：作者要一个背景/边框时不用再
+                    // 套一层（套一层的话裁剪会落在里面那层，很容易配错）。
+                    c.roundRect(r.x, r.y, r.w, r.h, w.radius * scale, col);
+                    break;
+                case UiWidgetType::Grid:
+                    // 纯布局容器，默认**不画** —— 一个看不见的网格比一个
+                    // "忘了关背景色"的灰块更难误判。
+                    break;
+                case UiWidgetType::Nine: {
+                    const float rad = w.radius * scale;
+                    c.roundRect(r.x, r.y, r.w, r.h, rad, col);
+                    const float in = w.inset * scale;
+                    if (r.w > in * 2.0f && r.h > in * 2.0f) {
+                        c.roundRect(r.x + in, r.y + in, r.w - in * 2.0f,
+                                    r.h - in * 2.0f, std::max(0.0f, rad - in),
+                                    col2);
+                    }
+                    break;
+                }
+                case UiWidgetType::Image:
+                    c.image(r.x, r.y, r.w, r.h, w.u0, w.v0, w.u1, w.v1, col);
+                    break;
+                case UiWidgetType::Text:
+                    if (font && font->valid())
+                        drawText(c, *font, w, r, formatBound(w.text, b), col,
+                                 scale, st);
+                    break;
+                case UiWidgetType::Button: {
+                    c.roundRect(r.x, r.y, r.w, r.h, w.radius * scale, col);
+                    if (font && font->valid())
+                        drawText(c, *font, w, r, formatBound(w.text, b), col2,
+                                 scale, st);
+                    break;
+                }
+                case UiWidgetType::Progress: {
+                    const float rad = std::max(0.0f, w.radius * scale);
+                    c.roundRect(r.x, r.y, r.w, r.h, rad, col2);
+                    if (fill.w > 0.5f && fill.h > 0.5f)
+                        c.roundRect(fill.x, fill.y, fill.w, fill.h, rad, col);
+                    break;
+                }
+                default:
+                    break;
+            }
+
+            // ---- 拖放：合法目标高亮（P3-2）----
+            //
+            // 判据只有一处：`dropAccepts()`。运行时松手时**也**用它 ——
+            // 两处各写一份必然出现"高亮了却放不进去"，而那种不一致会被
+            // 分别当成渲染 bug 和逻辑 bug 去修。
+            if (dragging && dropAccepts(w.dropAccept, ia->draggingTag)) {
+                const bool hot = (ia->dropTarget == w.id);
+                // 外圈描边 + 半透明填充：只描边在深色牌桌上几乎看不见，
+                // 只填充又会把牌面本身糊掉。
+                const float band = std::max(2.0f, 2.0f * scale);
+                const uint32_t ring = hot ? rgba(255, 214, 96, 255)
+                                          : rgba(255, 214, 96, 150);
+                const uint32_t wash = hot ? rgba(255, 214, 96, 60)
+                                          : rgba(255, 214, 96, 26);
+                c.roundRect(r.x, r.y, r.w, r.h, w.radius * scale + band, wash);
+                // 四条边（内缩半个 band，避免描边跑到格子外面）
+                c.rect(r.x - band * 0.5f, r.y - band * 0.5f, r.w + band, band,
+                       ring);
+                c.rect(r.x - band * 0.5f, r.bottom() - band * 0.5f,
+                       r.w + band, band, ring);
+                c.rect(r.x - band * 0.5f, r.y, band, r.h, ring);
+                c.rect(r.right() - band * 0.5f, r.y, band, r.h, ring);
+                ++st.highlights;
+            }
+        } else {
             // 父矩形为空（窗口最小化等）→ 不画，但**序号必须继续推进**，
             // 否则后面所有控件都会错位一格。
             ++st.skipped;
-            if (!w.children.empty())
-                drawRec(c, w.children, placed, cursor, b, font, scale, st);
-            continue;
         }
 
-        switch (w.type) {
-            case UiWidgetType::Panel:
-                c.roundRect(r.x, r.y, r.w, r.h, w.radius * scale, w.color);
-                break;
-            case UiWidgetType::Nine: {
-                const float rad = w.radius * scale;
-                c.roundRect(r.x, r.y, r.w, r.h, rad, w.color);
-                const float in = w.inset * scale;
-                if (r.w > in * 2.0f && r.h > in * 2.0f) {
-                    c.roundRect(r.x + in, r.y + in, r.w - in * 2.0f,
-                                r.h - in * 2.0f, std::max(0.0f, rad - in),
-                                w.color2);
-                }
-                break;
-            }
-            case UiWidgetType::Image:
-                c.image(r.x, r.y, r.w, r.h, w.u0, w.v0, w.u1, w.v1, w.color);
-                break;
-            case UiWidgetType::Text:
-                if (font && font->valid())
-                    drawText(c, *font, w, r, formatBound(w.text, b), w.color,
-                             scale, st);
-                break;
-            case UiWidgetType::Button: {
-                c.roundRect(r.x, r.y, r.w, r.h, w.radius * scale, w.color);
-                if (font && font->valid())
-                    drawText(c, *font, w, r, formatBound(w.text, b), w.color2,
-                             scale, st);
-                break;
-            }
-            case UiWidgetType::Progress: {
-                const float rad = std::max(0.0f, w.radius * scale);
-                c.roundRect(r.x, r.y, r.w, r.h, rad, w.color2);
-                if (fill.w > 0.5f && fill.h > 0.5f)
-                    c.roundRect(fill.x, fill.y, fill.w, fill.h, rad, w.color);
-                break;
-            }
-            default:
-                break;
-        }
-
+        // ---- 子树 ----
+        const bool clipKids = (w.type == UiWidgetType::Scroll);
+        if (clipKids) c.pushClip(r.x, r.y, r.w, r.h);
         if (!w.children.empty())
-            drawRec(c, w.children, placed, cursor, b, font, scale, st);
+            drawRec(c, w.children, placed, cursor, b, font, scale, ia, st);
+        if (clipKids) c.popClip();
+
+        if (w.opacity != 1.0f) c.popOpacity();
+        if (hasXf) c.popTransform();
     }
 }
 
@@ -816,7 +1112,7 @@ void drawRec(UiCanvas& c, const std::vector<UiWidget>& ws,
 
 UiDocDrawStats drawDocument(UiCanvas& c, const UiDocument& d,
                             const UiBindings& b, uint32_t outW, uint32_t outH,
-                            const SdfFont* font) {
+                            const SdfFont* font, const UiDocInteraction* ia) {
     UiDocDrawStats st;
     if (!d.valid || outW == 0 || outH == 0) return st;
     const float scale = computeScale(outW, outH);
@@ -824,7 +1120,41 @@ UiDocDrawStats drawDocument(UiCanvas& c, const UiDocument& d,
 
     const std::vector<UiDocPlaced> placed = placeDocument(d, b, outW, outH);
     std::size_t cursor = 0;
-    drawRec(c, d.widgets, placed, cursor, b, font, scale, st);
+    drawRec(c, d.widgets, placed, cursor, b, font, scale, ia, st);
+
+    // ---- 拖拽中的"幽灵"（P3-2）----
+    //
+    // 画在**最后**（所有控件之上），因为它是"跟着手走的那个东西"，被任何
+    // 面板盖住都会让玩家以为拖丢了。
+    // ⚠ 幽灵画的是被拖控件**自己的样子**（同尺寸、同颜色、同圆角），
+    //   不是一个小方块：小方块能通过"存在"的断言，但玩家看不出
+    //   "我拖的是哪张牌" —— 手牌一多就完了。
+    if (ia && !ia->dragging.empty()) {
+        const UiWidget* w = findWidgetById(d, ia->dragging);
+        const UiDocPlaced* src = nullptr;
+        for (const auto& p : placed)
+            if (p.id == ia->dragging) { src = &p; break; }
+        if (w && src) {
+            const float gw = src->rect.w;
+            const float gh = src->rect.h;
+            const float gx = ia->pointerX - gw * 0.5f;
+            const float gy = ia->pointerY - gh * 0.5f;
+            // 半透明 + 一圈亮边：半透明表示"还没放下"，亮边让它从牌桌里
+            // 跳出来（纯半透明的牌贴在深色桌面上几乎看不见）。
+            c.pushOpacity(0.85f);
+            c.roundRect(gx, gy, gw, gh, w->radius * scale, tintColor(w->color, 1.15f));
+            if (w->type == UiWidgetType::Button || w->type == UiWidgetType::Text) {
+                if (font && font->valid())
+                    drawText(c, *font, *w, UiRect{gx, gy, gw, gh},
+                             formatBound(w->text, b), w->color2, scale, st);
+            }
+            c.popOpacity();
+            const float band = std::max(2.0f, 2.0f * scale);
+            c.roundRect(gx - band * 0.5f, gy - band * 0.5f, gw + band,
+                        gh + band, w->radius * scale + band,
+                        rgba(255, 255, 255, 90));
+        }
+    }
     return st;
 }
 

@@ -40,10 +40,15 @@
 #include "ui/PauseMenu.h"
 #include "ui/Subtitle.h"
 #include "ui2/UiDocument.h"
+#include "ui2/UiDocInput.h"   // 文档层交互（命中 / 派发）
 #include "ui2/UiFocus.h"
 #include "audio/AudioSystem.h"        // G14-5：整条音频链的门面
+#include "fx/EffectService.h"
+#include "scene/GameplayRuntime.h"         // P1：特效池（按值持有，需要完整类型）
 #include "physics/ContactEvents.h"
 #include "physics/ScenePhysics.h"   // SceneBinding（按值持有，需要完整类型）
+// C8 导航：`nav::NavSystem m_nav;` 按值成员 → 需要完整类型。
+#include "nav/NavSystem.h"
 #include "scene/SaveGameState.h"    // 存档基线（G17-3，按值持有）
 
 #include <chrono>
@@ -114,6 +119,11 @@ private:
     // 按模型路径装配一个实体（`spawn` 的实现）。失败返回无效句柄。
     ecs::Entity spawnModelEntity(const std::string& relPath, glm::vec3 pos);
     void buildPhysics();
+    // C8 导航：优先读 `assets/nav/<场景名>.vnav.json`，读不到就现场烘一份
+    // （以玩家为中心）。两条路都打一行 `GAME-NAV` 说明走的是哪条。
+    void setupNav();
+    // 每帧推进代理（排在物理**之前**：它写 Transform / 期望速度）。
+    void tickNav(float dt);
     void preloadScripts();
     void simulate(float dt);
     int runScripts(float dt);
@@ -180,6 +190,9 @@ private:
     std::unique_ptr<vks::ScriptRuntime> m_scriptRuntime;
     vks::ScriptEngine* m_scripts = nullptr;  // = &m_scriptRuntime->engine()
     physics::SceneBinding m_binding;
+    // C8 导航：网格 + 代理推进。**没有网格**时 `tick` 是空转（不会崩、
+    // 也不会把代理拽到原点）—— 所以"这关没烘导航"只表现为"NPC 站着不动"。
+    nav::NavSystem m_nav;
 
     // ---- C6 第二批：世界控制 ----
     // 剧情旗标。**不进 ECS**：它是"一局游戏"的状态，不是"一个实体"的状态
@@ -199,6 +212,62 @@ private:
     // 在 simulate() 里排在物理**之前**（A4 的根运动是物理的输入），
     // 与编辑器 Play 的顺序一致。
     animation::AnimatorSystem m_animator;
+
+    // ---- P1 特效（2026-11-02）----
+    //
+    // 出包之后**打怪必须有刀光**，所以运行时要自己接一条：动画事件 →
+    // `EffectService` → 粒子 / 音效 / 震屏 / 顿帧 / 闪白。
+    // ⚠ 与编辑器 Play 共用同一套 engine 侧的三个模块，但**两个宿主各持一份
+    //   实例**（`m_fx` 一个进程一个）：编辑器里 Play 用的池不会跟游戏抢槽位。
+    // ⚠ 与编辑器 `dispatchAnimEventsThisFrame` 是两份**独立**的消费者：
+    //   同一个进程里只有其中一方在跑（编辑器 = Play 态，这里 = 出包运行时），
+    //   所以不会"双重曝光"。同一进程里两边同时跑才是灾难。
+    fx::EffectService m_fx;
+    void setupFxSinks();
+    // 每帧：同步场景 / 推进回收 / 递减闪白。传**真实 dt**。
+    void tickFx(float realDt);
+    // 把本帧动画事件分派成特效/音效/震屏/顿帧。
+    void dispatchAnimEventsThisFrame();
+
+    // ---- P3-4：卡牌表现（2026-11-04）----
+    //
+    // `GameplayRuntime::castCard` 只**记账**（`CardFxEvent` 队列），这里每帧
+    // 取走、按 `gameplay::cardFxPreset()` 播粒子 + 弹飘字。
+    // ⚠ 排在 `runScripts` 之后（脚本这一帧才 cast），否则飘字慢半拍。
+    void dispatchCardFx();
+
+    // ---- P2：玩法状态（2026-11-03）----
+    //
+    // 与编辑器那边是**独立的一份**：编辑器的 Play 是一局临时游戏，运行时的
+    // 这一份才是玩家真的在跑的那局。共用一份的话"编辑器里试了一下"会改掉
+    // 运行时的数据（而这条路径在自动化里根本不会同时开）。
+    //
+    // ⚠ 它**不负责推进回合** —— 什么时候该 `advance` / `tick` 是玩法决定
+    //   的（脚本 / 未来的回合系统），运行时只提供能力。
+    scene::GameplayRuntime m_gameplay;
+    scene::Scene* m_gpScene = nullptr;
+    scene::GameplayRuntime& gp();
+
+    // P3-1：配表里的卡牌定义（**内容**，不进场景文件）。
+    // `gp()` 在换场景时把它们灌进新场景的所有牌堆 —— 读档之后牌堆里只有
+    // `defId`，没有定义表；不灌的话每张牌都 `known=0`（打出去什么都不发生）。
+    std::vector<gameplay::CardDef> m_cardDefs;
+    bool m_cardDefsLoaded = false;
+
+    // 顿帧（真实秒）。⚠ 三个累计量与编辑器那一份同义：
+    //   `total` 抓累加、`elapsed` 抓 scaled dt、`frames` 抓 timeScale=0 死锁。
+    float m_hitstopLeft = 0.0f;
+    float m_hitstopTotal = 0.0f;
+    float m_hitstopElapsed = 0.0f;
+    int m_hitstopFrames = 0;
+    int m_hitstopReqs = 0;
+    // 闪白：走 `ui2::UiCanvas` 的一层满屏矩形（在 HUD/字幕/菜单之**上**，
+    // 因为命中反馈该盖住 HUD；但仍在 UI pass 内，不新开渲染 pass）。
+    float m_fxFlashStrength = 0.0f;
+    float m_fxFlashLeft = 0.0f;
+    float m_fxFlashTotal = 0.0f;
+    float m_fxFlashElapsed = 0.0f;
+    glm::vec3 m_fxFlashColor{1.0f, 1.0f, 1.0f};
 
     // 镜头效果接线（applyCameraLensEffects）的状态：
     //   `m_lensCam` 记住上一次写效果的那台相机 —— 换相机时先把**自己写过**
@@ -245,6 +314,40 @@ private:
     int m_uiDocFrames = 0;    // UIDOC-BOUNDS / UIDOC-STATS 的节流计数
     // 每帧把 HudModel + GameFlags 抄成绑定表（见 .cpp 的注释）
     void buildUiBindings();
+
+    // ---- 文档层的交互（2026-11-02）----
+    //
+    // 在这之前 `.ui.json` 里的按钮是**纯装饰**：`drawDocument` 会画，
+    // 但没有任何命中测试（`grep -rn action engine/ui2/` → 0）。
+    // 现在这条链是：UiDocInput 命中 → 产出 action 字符串 →
+    // **在这里**执行（引擎只解析，`ui2::parseUiAction` 不碰旗标表）。
+    ui2::UiDocInput m_uiDocInput;
+    // 上一帧左键是否按着。用来合成"松开沿" —— `core::Input` 只给
+    // `mouseDown` / `mousePressed` 两个查询，没有 released，而"按下与松开
+    // 必须落在同一个控件上"这条语义非要它不可。
+    bool m_uiDocMouseDownPrev = false;
+    int m_uiDocInputFrames = 0;
+    // `MYVK_RUNTIME_UICLICK="x,y;x2,y2"`（**参考像素**）。解析结果留在
+    // 这里，按帧间隔逐发注入 —— 为什么不在 init 里点：那时还没有输出
+    // 尺寸，命中测试必然 miss，而 miss 会被误读成"按钮没画上"。
+    std::vector<std::pair<float, float>> m_uiDocClicks;
+    bool m_uiDocClicksParsed = false;
+    int m_uiDocClickNext = 0;
+    // 执行一条动作。⚠ 唯一的执行点 —— 命令 / 注入 / 真点击都走这里，
+    // 否则"点得动但命令改不了"这类分叉迟早出现。
+    void dispatchUiAction(const std::string& text);
+    // 每帧的文档交互 tick（在绘制回调里调用，那里才知道输出尺寸）。
+    void tickUiDocInput(uint32_t outW, uint32_t outH);
+    // 指针（窗口客户区坐标）→ **输出像素**。
+    //
+    // ⚠ 两处要用同一份换算：`tickUiDocInput`（真鼠标点击）与 `tickUi`
+    //   的"点击视口 → 进入操作态"（①b 要先问文档层有没有命中）。
+    //   各写一份的后果不是"差几像素"，而是**一条路径点得中、另一条点不中**
+    //   —— 而这两条路径的判据都由同一批日志锚点覆盖，红了也分不清是谁。
+    bool cursorToOutput(float& px, float& py, uint32_t outW, uint32_t outH);
+    // 输出像素 (px,py) 落在某个**可交互且 enabled** 的文档控件上吗。
+    // 顺带把 id 写进 `idOut`（命中测试与绘制用同一份 bindings）。
+    bool uiDocHitAt(float px, float py, std::string* idOut = nullptr);
 
     // ---- 字幕框（C2，2026-10-26）----
     // 与 HUD 同一条分工：`dialogue::DialogueSystem` 在 engine（推进状态），

@@ -55,11 +55,18 @@ constexpr const char* kProjectFileName = "venn.project.json";
 // （见 docs/launcher_roadmap.md §4）。两者不一致只打 WARN，不改场景 ——
 // 用户可能在编辑器里手动把第一人称改成了第三人称，那才是他的真实意图。
 enum class GameType : int {
-    FirstPerson = 0,
-    ThirdPerson = 1,
+    FirstPerson = 0,    // 第一人称：探险 / 射击 / 恐怖
+    ThirdPerson = 1,    // 第三人称：动作 / 开放世界
+    Isometric = 2,      // 俯视等距：回合制策略 / 战棋
+    CardBattler = 3,    // 卡牌对战：UI 驱动（没有角色相机）
 };
-const char* gameTypeId(GameType t);          // "first_person" / "third_person"
-const char* gameTypeLabel(GameType t);       // "First person" / "Third person"（过 TR）
+// ⚠ **只能追加**：`gameType` 以 id 字符串落盘（`game.json` / recents.json），
+//   枚举值本身不进存档，但启动器卡片的顺序（`LAUNCH-TYPE-<index>`）就是这张表
+//   的顺序 —— 在中间插一条会让"老判据点的第 1 张卡"变成另一种类型。
+constexpr int kGameTypeCount = 4;            // 与上面枚举同步
+GameType gameTypeAt(int index);              // 越界 → ThirdPerson
+const char* gameTypeId(GameType t);          // "first_person" / "third_person" / ...
+const char* gameTypeLabel(GameType t);       // 英文标签（过 TR）
 bool parseGameTypeId(const std::string& s, GameType& out);
 
 // 代码方案（路线图 D8 的三档里，启动器只管前两档）

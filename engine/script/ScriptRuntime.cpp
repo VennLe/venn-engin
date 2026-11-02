@@ -70,6 +70,10 @@ bool ScriptRuntime::resetInstance(ecs::Entity e) {
     //   换一个空协程就等于"回到从未执行过的状态"。
     inst->coro = m_engine.makeCoroutine();
     inst->waitingNow = false;
+    // C8：新协程的 pause 位是干净的，镜像也要清 —— 否则面板上"停在第 5 行"
+    // 会留在一个已经重置过的实例上，而它其实早就不在那行了。
+    inst->paused = false;
+    inst->pauseLine = 0;
     // ⚠ stateLogged 故意**不清**：Reset 后状态若仍是 Running，就没必要再打
     //   一行；若从 Failed 变回 Running，变化本身会让 next tick 打印出来。
     return true;
@@ -88,6 +92,105 @@ ScriptInstance* ScriptRuntime::find(ecs::Entity e) {
 
 const ScriptInstance* ScriptRuntime::find(ecs::Entity e) const {
     return const_cast<ScriptRuntime*>(this)->find(e);
+}
+
+// ---------------------------------------------------------------- 断点（C8）
+
+bool ScriptRuntime::addBreakpoint(const std::string& path, int line,
+                                  std::string* err) {
+    auto bad = [&](const std::string& m) {
+        if (err) *err = m;
+        return false;
+    };
+    if (path.empty()) return bad("empty script path");
+    if (line <= 0) return bad("line must be >= 1");
+    const std::vector<int>* lines = executableLines(path);
+    if (!lines || lines->empty())
+        return bad("script '" + path + "' has no executable statement (not "
+                   "loaded, or it failed to compile)");
+    // ⚠ 校验行号真的落在一条语句上：在空行/注释行上点断点**永远不会命中**，
+    //   而"点了没反应"是最难自证的那种失败（症状是"断点功能坏了"）。
+    if (std::find(lines->begin(), lines->end(), line) == lines->end()) {
+        return bad("line " + std::to_string(line) + " has no statement in '" +
+                   path + "'");
+    }
+    m_bps.add(path, line);
+    VK_LOG_INFO("SCR-BP add path=%s line=%d total=%zu", path.c_str(), line,
+                m_bps.size());
+    return true;
+}
+
+int ScriptRuntime::removeBreakpoint(const std::string& path, int line) {
+    if (!m_bps.has(path, line)) return 0;
+    m_bps.remove(path, line);
+    VK_LOG_INFO("SCR-BP remove path=%s line=%d total=%zu", path.c_str(), line,
+                m_bps.size());
+    return 1;
+}
+
+int ScriptRuntime::clearBreakpoints() {
+    const int n = static_cast<int>(m_bps.size());
+    m_bps.clear();
+    if (n > 0) VK_LOG_INFO("SCR-BP clear removed=%d", n);
+    return n;
+}
+
+const std::vector<int>* ScriptRuntime::executableLines(const std::string& path) {
+    if (path.empty()) return nullptr;
+    // ⚠ 用 `get()` 会把脚本加载进来；面板的选择列表来自 `loadedPaths()`，
+    //   所以这里不会"点一下面板就多加载一堆脚本"。`get()` 返回的资产
+    //   不搬（map 里的 unique_ptr），指针下一次 pollHotReload 之后仍有效。
+    ScriptAsset* a = m_engine.get(path);
+    if (!a) return nullptr;
+    ScriptProgram* prog = a->program();
+    if (!prog || !prog->valid()) return nullptr;
+    return &prog->executableLines();
+}
+
+int ScriptRuntime::resumeAll() {
+    int n = 0;
+    for (auto& up : m_instances) {
+        ScriptInstance& inst = *up;
+        // ⚠ 协程的布局在 `ScriptEngine.cpp` 里才完整，所以放行只能走
+        //   `resumeCoroutine()`（自由函数，见 ScriptEngine.h 的注释）。
+        if (!inst.paused || !inst.coro) continue;
+        if (!resumeCoroutine(*inst.coro)) continue;
+        inst.paused = false;
+        inst.pauseLine = 0;
+        ++n;
+        VK_LOG_INFO("SCR-RESUME entity=%u path=%s", inst.entity.id,
+                    inst.path.c_str());
+    }
+    return n;
+}
+
+int ScriptRuntime::stepAll() {
+    int n = 0;
+    for (auto& up : m_instances) {
+        ScriptInstance& inst = *up;
+        if (!inst.paused || !inst.coro) continue;
+        // 单步：放行当前行之后，在**下一条**语句前再停（见 drive() 的注释）。
+        if (!stepCoroutine(*inst.coro)) continue;
+        inst.paused = false;
+        inst.pauseLine = 0;
+        ++n;
+        VK_LOG_INFO("SCR-STEP entity=%u path=%s", inst.entity.id,
+                    inst.path.c_str());
+    }
+    return n;
+}
+
+std::vector<const ScriptInstance*> ScriptRuntime::pausedInstances() const {
+    std::vector<const ScriptInstance*> out;
+    for (const auto& up : m_instances)
+        if (up->paused) out.push_back(up.get());
+    // m_instances 的追加顺序就是场景遍历顺序（不稳定）；按实体 id 排一下
+    // 让控制台输出与面板顺序一致，自动化断言才不会随机红。
+    std::sort(out.begin(), out.end(),
+              [](const ScriptInstance* a, const ScriptInstance* b) {
+                  return a->entity.id < b->entity.id;
+              });
+    return out;
 }
 
 void ScriptRuntime::reportError(ScriptInstance& inst, const std::string& msg,
@@ -207,6 +310,10 @@ const char* ScriptRuntime::stateOf(const ScriptInstance& inst) const {
     if (inst.failed) return "Failed";
     // ⚠ Waiting 必须在 Running 之前判 —— 挂起的实例"跑过"，但这一刻它在等。
     if (inst.waitingNow) return "Waiting";
+    // C8：Paused 在 Idle 之前判。停在 `on start` 里的实例 `started` 仍是
+    // false（见 tick 里的注释），若按 Idle 报，面板会显示"没跑过"，
+    // 而它其实正停在第一行上。
+    if (inst.paused) return "Paused";
     if (!inst.started) return "Idle";
     return "Running";
 }
@@ -352,6 +459,8 @@ void ScriptRuntime::tick(scene::Scene& sc, double simTime, float dt,
         ctx.dt = stepDt;
         ctx.frame = renderFrame;
         ctx.simFrame = inst.simFrames;
+        // C8：断点表。指针传下去 —— 空表时求值器那两行检查会短路。
+        ctx.breakpoints = &m_bps;
 
         // ---- 本帧要喂给这个实例的东西（S3）----
         ScriptFrameInput in;
@@ -402,13 +511,45 @@ void ScriptRuntime::tick(scene::Scene& sc, double simTime, float dt,
             if (!m_printSink) return;
             for (const std::string& line : inst.prints) m_printSink(inst, line);
         };
+        // C8：告诉宿主"现在轮到谁"。`svc.act.setFlag` 靠它记 writer ——
+        // 那是只能在写入这一刻拿到的信息（见 `currentScriptPath()`）。
+        m_current = &inst;
         const bool ok = prog->runFrame(host, ctx, *inst.coro, in, err);
+        m_current = nullptr;
         inst.stepsLastFrame = ctx.steps;
         st.steps += ctx.steps;
+        // ⚠ 先记住"上一帧是不是已经停着"：暂停中的实例下一帧会在
+        //   `runFrame` 开头直接早退并**照样**把 `ctx.paused` 置真，不区分
+        //   "刚停住"与"还停着"的话，日志会每帧刷一条（而这条日志正是
+        //   自动化唯一能读到行号的地方）。
+        const bool wasPaused = inst.paused;
+        inst.paused = ctx.paused;
+        inst.pauseLine = ctx.paused ? ctx.pauseLine : 0;
 
         // `on start` 跑过就置位。⚠ 失败时也置位：不然熔断解除后它会重跑
         // start，而"重跑 start"= 把出生点/血量重置 —— S-D7 明确禁止。
-        inst.started = true;
+        //
+        // ⚠⚠ C8 的唯一例外：**暂停时不能置位**。若断点落在 `on start` 里，
+        //   置位之后 `in.runStart` 变假，恢复时 `case 1` 会整段跳过 ——
+        //   "停在 start 第 3 行"于是变成"start 剩下几行再也不跑"，而且
+        //   一条错都不报。保持 false 才能让恢复时从协程栈原处继续。
+        if (!ctx.paused) inst.started = true;
+
+        if (ok && ctx.paused) {
+            // 被摁住了：不算执行、不算等待，单独计一档。
+            ++st.paused;
+            inst.waitingNow = false;
+            // ⚠ 单独打一行带行号的日志：`SCR-STATE` 只说"Paused"，而调试
+            //   时**唯一**真正要读的是"停在第几行"。一帧至多一行
+            //   （暂停的实例下一帧直接早退，不会重复打）。
+            if (!wasPaused)
+                VK_LOG_INFO("SCR-PAUSE entity=%u path=%s line=%d steps=%llu",
+                            inst.entity.id, inst.path.c_str(), inst.pauseLine,
+                            static_cast<unsigned long long>(ctx.steps));
+            noteState(*this, inst, sc.world());
+            flushPrints();
+            continue;
+        }
 
         if (!ok) {
             inst.failed = true;  // ★ 熔断

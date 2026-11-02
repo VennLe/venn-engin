@@ -547,8 +547,160 @@ bool DialogueEditorWindow::actSetChoiceGoto(int i, const std::string& id) {
     return true;
 }
 
-bool DialogueEditorWindow::actNewScript() {
-    m_asset = dialogue::DialogueAsset{};
+// ---------------------------------------------------------------- C7 条件
+//
+// 六个动作 + 四个选项副作用动作。共同的三条纪律：
+// ⚠ ① 一律走 `revalidate()`（序列化 → 丢回 `parseDialogue`），不在这里
+//     自己判"op 合不合法" —— 两套规则等于两套结论（见 .h 的 ①）。
+// ⚠ ② 改完就 `markDirty()`，包括"条件数组被清空"这种看着像删了东西的操作。
+// ⚠ ③ **`else` 指向不存在的 id 立刻拒**。允许写坏的话，`parseDialogue`
+//     会让整份剧本 not valid —— 而作者只是在下拉框里点错了。
+
+bool DialogueEditorWindow::actAddCond() {
+    dialogue::DlgNode* n = selNode();
+    if (!n) return reject("addcond", "no line selected");
+    dialogue::DlgCond c;
+    // 默认值刻意选"门槛为 1、op 是 >="：写 `met_alice >= 1` 是最常见的
+    // 用法（布尔旗标），作者多数情况下只需要改名字。
+    c.flag = "flag";
+    c.op = ">=";
+    c.value = 1.0;
+    n->conds.push_back(std::move(c));
+    markDirty();
+    VK_LOG_INFO("DLGED-ADDCOND id=%s n=%d", n->id.c_str(),
+                static_cast<int>(n->conds.size()));
+    revalidate();
+    return true;
+}
+
+bool DialogueEditorWindow::actDelCond(int i) {
+    dialogue::DlgNode* n = selNode();
+    if (!n || i < 0 || i >= static_cast<int>(n->conds.size())) return false;
+    n->conds.erase(n->conds.begin() + i);
+    // ⚠ 最后一个条件被删掉时 `else` 变成"永远走不到"的死字段。这里
+    //   **不静默清掉**（作者可能只是想改条件顺序），只记一行日志 ——
+    //   界面会把 else 那一行灰掉。
+    markDirty();
+    VK_LOG_INFO("DLGED-DELCOND id=%s i=%d n=%d", n->id.c_str(), i,
+                static_cast<int>(n->conds.size()));
+    revalidate();
+    return true;
+}
+
+bool DialogueEditorWindow::actSetCondFlag(int i, const std::string& flag) {
+    dialogue::DlgNode* n = selNode();
+    if (!n || i < 0 || i >= static_cast<int>(n->conds.size())) return false;
+    if (n->conds[static_cast<std::size_t>(i)].flag == flag) return true;
+    n->conds[static_cast<std::size_t>(i)].flag = flag;
+    markDirty();
+    VK_LOG_INFO("DLGED-CONDFLAG id=%s i=%d flag=%s", n->id.c_str(), i,
+                flag.c_str());
+    revalidate();
+    return true;
+}
+
+bool DialogueEditorWindow::actSetCondOp(int i, const std::string& op) {
+    dialogue::DlgNode* n = selNode();
+    if (!n || i < 0 || i >= static_cast<int>(n->conds.size())) return false;
+    // ⚠ 先查再写：写进去之后 `parseDialogue` 会让**整份**剧本 not valid，
+    //   而作者只是点错了一个下拉项。界面上那个 op 只从固定六项里选，
+    //   这条检查是给注入脚本用的。
+    if (const char* why = dialogue::condOpError(op))
+        return reject("setcondop", std::string(op) + " " + why);
+    if (n->conds[static_cast<std::size_t>(i)].op == op) return true;
+    n->conds[static_cast<std::size_t>(i)].op = op;
+    markDirty();
+    VK_LOG_INFO("DLGED-CONDOP id=%s i=%d op=%s", n->id.c_str(), i, op.c_str());
+    revalidate();
+    return true;
+}
+
+bool DialogueEditorWindow::actSetCondValue(int i, double v) {
+    dialogue::DlgNode* n = selNode();
+    if (!n || i < 0 || i >= static_cast<int>(n->conds.size())) return false;
+    if (n->conds[static_cast<std::size_t>(i)].value == v) return true;
+    n->conds[static_cast<std::size_t>(i)].value = v;
+    markDirty();
+    VK_LOG_INFO("DLGED-CONDVALUE id=%s i=%d value=%g", n->id.c_str(), i, v);
+    revalidate();
+    return true;
+}
+
+bool DialogueEditorWindow::actSetElse(const std::string& id) {
+    dialogue::DlgNode* n = selNode();
+    if (!n) return reject("setelse", "no line selected");
+    if (n->conds.empty())
+        // 没有条件却设 else：`parseDialogue` 只给 WARN（那条线永远走不到）。
+        // 这里直接拒 —— 比"存盘后看到一条警告"更早、更清楚。
+        return reject("setelse", "this line has no condition (add one first)");
+    if (!id.empty() && dialogue::findNode(m_asset, id) < 0)
+        return reject("setelse", "no line with id \"" + id + "\"");
+    if (n->elseId == id) return true;
+    n->elseId = id;
+    markDirty();
+    VK_LOG_INFO("DLGED-ELSE id=%s else=%s", n->id.c_str(), id.c_str());
+    revalidate();
+    return true;
+}
+
+bool DialogueEditorWindow::actAddWrite(int ci) {
+    dialogue::DlgNode* n = selNode();
+    if (!n || ci < 0 || ci >= static_cast<int>(n->choices.size()))
+        return reject("addwrite", "no choice selected");
+    dialogue::DlgWrite w;
+    w.flag = "flag";
+    w.value = 1.0;
+    n->choices[static_cast<std::size_t>(ci)].writes.push_back(std::move(w));
+    markDirty();
+    VK_LOG_INFO("DLGED-ADDWRITE id=%s ci=%d n=%d", n->id.c_str(), ci,
+                static_cast<int>(
+                    n->choices[static_cast<std::size_t>(ci)].writes.size()));
+    revalidate();
+    return true;
+}
+
+bool DialogueEditorWindow::actDelWrite(int ci, int wi) {
+    dialogue::DlgNode* n = selNode();
+    if (!n || ci < 0 || ci >= static_cast<int>(n->choices.size())) return false;
+    auto& ws = n->choices[static_cast<std::size_t>(ci)].writes;
+    if (wi < 0 || wi >= static_cast<int>(ws.size())) return false;
+    ws.erase(ws.begin() + wi);
+    markDirty();
+    VK_LOG_INFO("DLGED-DELWRITE id=%s ci=%d wi=%d n=%d", n->id.c_str(), ci, wi,
+                static_cast<int>(ws.size()));
+    revalidate();
+    return true;
+}
+
+bool DialogueEditorWindow::actSetWriteFlag(int ci, int wi, const std::string& f) {
+    dialogue::DlgNode* n = selNode();
+    if (!n || ci < 0 || ci >= static_cast<int>(n->choices.size())) return false;
+    auto& ws = n->choices[static_cast<std::size_t>(ci)].writes;
+    if (wi < 0 || wi >= static_cast<int>(ws.size())) return false;
+    if (ws[static_cast<std::size_t>(wi)].flag == f) return true;
+    ws[static_cast<std::size_t>(wi)].flag = f;
+    markDirty();
+    VK_LOG_INFO("DLGED-WRITEFLAG id=%s ci=%d wi=%d flag=%s", n->id.c_str(), ci, wi,
+                f.c_str());
+    revalidate();
+    return true;
+}
+
+bool DialogueEditorWindow::actSetWriteValue(int ci, int wi, double v) {
+    dialogue::DlgNode* n = selNode();
+    if (!n || ci < 0 || ci >= static_cast<int>(n->choices.size())) return false;
+    auto& ws = n->choices[static_cast<std::size_t>(ci)].writes;
+    if (wi < 0 || wi >= static_cast<int>(ws.size())) return false;
+    if (ws[static_cast<std::size_t>(wi)].value == v) return true;
+    ws[static_cast<std::size_t>(wi)].value = v;
+    markDirty();
+    VK_LOG_INFO("DLGED-WRITEVALUE id=%s ci=%d wi=%d value=%g", n->id.c_str(), ci,
+                wi, v);
+    revalidate();
+    return true;
+}
+
+bool DialogueEditorWindow::actNewScript() {    m_asset = dialogue::DialogueAsset{};
     // 名字先给个占位：真正的名字由 `parseDialogue` 从**路径**推（存盘后
     // Reload 就会变成文件名）。这里留着 "untitled" 是为了标题栏不空。
     m_asset.name = "untitled";
@@ -926,6 +1078,8 @@ void DialogueEditorWindow::drawNodeEditor(float height) {
     // ---- 选项 ----
     ImGui::SeparatorText(TR("Choices"));
     int eraseAt = -1;
+    int addWriteAt = -1;
+    int delWriteCi = -1, delWriteWi = -1;
     for (int ci = 0; ci < static_cast<int>(n->choices.size()); ++ci) {
         ImGui::PushID(9000 + ci);
         char cbuf[256];
@@ -946,10 +1100,107 @@ void DialogueEditorWindow::drawNodeEditor(float height) {
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("x")) eraseAt = ci;
+
+        // ---- 这个选项的副作用（C7 的 `set`）----
+        //
+        // 摆在选项**自己那一行下面**：一个选项写哪些旗标，是和它绑在一起的
+        // 语义。放到面板别处（比如"节点级"）就分不清"选 A 写这条、选 B 写
+        // 那条"。
+        auto& ws = n->choices[static_cast<std::size_t>(ci)].writes;
+        for (int wi = 0; wi < static_cast<int>(ws.size()); ++wi) {
+            ImGui::PushID(7200 + wi);
+            ImGui::Indent(24.0f);
+            char wbuf[128];
+            std::snprintf(wbuf, sizeof(wbuf), "%s",
+                          ws[static_cast<std::size_t>(wi)].flag.c_str());
+            ImGui::SetNextItemWidth(180.0f);
+            if (ImGui::InputTextWithHint("##wflag", TR("flag"), wbuf,
+                                         sizeof(wbuf)))
+                actSetWriteFlag(ci, wi, wbuf);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(90.0f);
+            float wv = static_cast<float>(ws[static_cast<std::size_t>(wi)].value);
+            if (ImGui::InputFloat("##wval", &wv, 1.0f, 5.0f, "%.3f"))
+                actSetWriteValue(ci, wi, static_cast<double>(wv));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) { delWriteCi = ci; delWriteWi = wi; }
+            ImGui::Unindent(24.0f);
+            ImGui::PopID();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(TR("+ set"))) addWriteAt = ci;
+        logRect("DLGED-CHOICE-SET", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
         ImGui::PopID();
     }
     if (eraseAt >= 0) actDelChoice(eraseAt);
+    else if (addWriteAt >= 0) actAddWrite(addWriteAt);
+    else if (delWriteCi >= 0) actDelWrite(delWriteCi, delWriteWi);
     else if (ImGui::SmallButton(TR("+ choice"))) actAddChoice({});
+
+    // ---- 条件（C7）----
+    //
+    // 位置在选项**之后**：条件是"这句进不进得来"，选项是"这句怎么出去"，
+    // 阅读顺序与执行顺序一致。
+    ImGui::SeparatorText(TR("Condition"));
+    logRect("DLGED-COND", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    {
+        int delCond = -1;
+        for (int ci = 0; ci < static_cast<int>(n->conds.size()); ++ci) {
+            ImGui::PushID(7100 + ci);
+            char fbuf[128];
+            std::snprintf(fbuf, sizeof(fbuf), "%s",
+                          n->conds[static_cast<std::size_t>(ci)].flag.c_str());
+            ImGui::SetNextItemWidth(180.0f);
+            if (ImGui::InputTextWithHint("##cflag", TR("flag"), fbuf, sizeof(fbuf)))
+                actSetCondFlag(ci, fbuf);
+            ImGui::SameLine();
+            // op 只能从固定六项里选 —— 拼错一个运算符会让**整份**剧本
+            // 加载失败（`parseDialogue` 挡在加载期），而下拉框根本给不出
+            // 拼错的机会。
+            ImGui::SetNextItemWidth(70.0f);
+            const std::string& curOp =
+                n->conds[static_cast<std::size_t>(ci)].op;
+            if (ImGui::BeginCombo("##cop", curOp.c_str())) {
+                for (const char* op : {">=", "<=", ">", "<", "==", "!="})
+                    if (ImGui::Selectable(op, curOp == op)) actSetCondOp(ci, op);
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(90.0f);
+            float cv = static_cast<float>(
+                n->conds[static_cast<std::size_t>(ci)].value);
+            if (ImGui::InputFloat("##cval", &cv, 1.0f, 5.0f, "%.3f"))
+                actSetCondValue(ci, static_cast<double>(cv));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) delCond = ci;
+            ImGui::PopID();
+        }
+        if (delCond >= 0) actDelCond(delCond);
+        else if (ImGui::SmallButton(TR("+ condition"))) actAddCond();
+
+        // else 只在有条件时才有意义（`actSetElse` 会拒掉无条件的情况）。
+        if (!n->conds.empty()) {
+            ImGui::TextDisabled("%s", TR("else"));
+            ImGui::SameLine(64.0f);
+            ImGui::SetNextItemWidth(190.0f);
+            const std::string curElse =
+                n->elseId.empty() ? std::string(TR("(end)")) : n->elseId;
+            if (ImGui::BeginCombo("##dlged_else", curElse.c_str())) {
+                if (ImGui::Selectable(TR("(end)"), n->elseId.empty()))
+                    actSetElse("");
+                for (int i = 0; i < nodeCount(); ++i) {
+                    const std::string id =
+                        m_asset.nodes[static_cast<std::size_t>(i)].id;
+                    if (ImGui::Selectable(id.c_str(), id == n->elseId))
+                        actSetElse(id);
+                }
+                ImGui::EndCombo();
+            }
+            logRect("DLGED-ELSE", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+        }
+    }
 
     ImGui::PopID();
     ImGui::EndChild();
@@ -1060,6 +1311,60 @@ void DialogueEditorWindow::runInjectedScript() {
         else if (name == "start") ok = actSetStart();
         else if (name == "addchoice") ok = actAddChoice(arg);
         else if (name == "delchoice") ok = actDelChoice(std::atoi(arg.c_str()));
+        // ---- C7：条件与副作用 ----
+        // `addcond` / `delcond:0` / `condflag:0:trust` / `condop:0:>=` /
+        // `condval:0:2` / `setelse:l3` / `addwrite:0` /
+        // `wset:0:trust:1`（ci:flag:value，**只切两刀**，flag 里允许冒号）
+        else if (name == "addcond") ok = actAddCond();
+        else if (name == "delcond") ok = actDelCond(std::atoi(arg.c_str()));
+        else if (name == "condflag") {
+            const std::size_t c1 = arg.find(':');
+            ok = c1 != std::string::npos &&
+                 actSetCondFlag(std::atoi(arg.substr(0, c1).c_str()),
+                                arg.substr(c1 + 1));
+        } else if (name == "condop") {
+            const std::size_t c1 = arg.find(':');
+            ok = c1 != std::string::npos &&
+                 actSetCondOp(std::atoi(arg.substr(0, c1).c_str()),
+                              arg.substr(c1 + 1));
+        } else if (name == "condval") {
+            const std::size_t c1 = arg.find(':');
+            ok = c1 != std::string::npos &&
+                 actSetCondValue(std::atoi(arg.substr(0, c1).c_str()),
+                                 std::atof(arg.substr(c1 + 1).c_str()));
+        } else if (name == "setelse") ok = actSetElse(arg == "-" ? std::string() : arg);
+        else if (name == "addwrite") ok = actAddWrite(std::atoi(arg.c_str()));
+        else if (name == "delwrite") {
+            const std::size_t c1 = arg.find(':');
+            ok = c1 != std::string::npos &&
+                 actDelWrite(std::atoi(arg.substr(0, c1).c_str()),
+                             std::atoi(arg.substr(c1 + 1).c_str()));
+        } else if (name == "wset") {
+            const std::size_t c1 = arg.find(':');
+            const std::size_t c2 = (c1 == std::string::npos)
+                                       ? std::string::npos
+                                       : arg.find(':', c1 + 1);
+            ok = c1 != std::string::npos && c2 != std::string::npos;
+            if (ok) {
+                const int wci = std::atoi(arg.substr(0, c1).c_str());
+                const std::string wflag = arg.substr(c1 + 1, c2 - c1 - 1);
+                const double wval = std::atof(arg.substr(c2 + 1).c_str());
+                // ⚠ 追加一条再改**最后那条**（不是下标 0）：一个选项可以写
+                //   多个旗标，写死 0 会让第二次 `wset` 把第一条改掉。
+                ok = actAddWrite(wci);
+                if (ok) {
+                    dialogue::DlgNode* sn = selNode();
+                    const int wi =
+                        sn ? static_cast<int>(
+                                 sn->choices[static_cast<std::size_t>(wci)]
+                                     .writes.size()) -
+                                 1
+                           : -1;
+                    ok = wi >= 0 && actSetWriteFlag(wci, wi, wflag) &&
+                         actSetWriteValue(wci, wi, wval);
+                }
+            }
+        }
         else if (name == "newscript") ok = actNewScript();
         else if (name == "save") ok = save(false);
         else if (name == "saveforce") ok = save(true);

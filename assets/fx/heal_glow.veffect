@@ -1,0 +1,52 @@
+{
+  "_comment": [
+    "治疗光柱 —— 演示'持续型'用法（rate 驱动 + looping）。",
+    "⚠ 与打击特效的区别就在 rate：打击是 bursts（一次性爆发），",
+    "  持续型是 rate（每秒多少颗）。两者可以同时用（爆发 + 余韵）。"
+  ],
+  "name": "heal_glow",
+  "duration": 1.4,
+
+  "shake": 0.0,
+  "flash": 0.05,
+  "flashDuration": 0.25,
+  "flashColor": [0.7, 1.0, 0.75],
+
+  "particles": [
+    {
+      "enabled": true,
+      "rate": 46.0,
+      "duration": 1.1,
+      "looping": true,
+      "prewarm": false,
+
+      "lifetime": 0.75,
+      "lifetimeVariance": 0.35,
+      "startSpeed": 0.9,
+      "speedVariance": 0.4,
+      "spread": 18.0,
+
+      "shape": 5,
+      "shapeRadius": 0.5,
+      "radiusThickness": 1.0,
+
+      "gravity": [0.0, 0.0, 1.6],
+      "drag": 0.4,
+
+      "sizeOverLife": [0.5, 1.0, 0.8, 0.0],
+      "alphaOverLife": [0.0, 0.8, 0.6, 0.0],
+      "startSize": 0.16,
+      "colorRamp": [
+        { "t": 0.0, "color": [0.6, 1.0, 0.7] },
+        { "t": 1.0, "color": [0.9, 1.0, 0.55] }
+      ],
+      "colorRampCount": 2,
+
+      "sprite": 1,
+      "blend": 0,
+      "emissive": 3.5,
+      "softParticles": true,
+      "softDistance": 0.4
+    }
+  ]
+}

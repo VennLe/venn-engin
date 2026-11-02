@@ -1,0 +1,38 @@
+# ============================================================
+# main.vks --- __PROJECT_NAME__ 的回合流程（模板: __TEMPLATE_ID__）
+# ============================================================
+# 【这个模板和第三人称模板的区别】
+#   没有玩家角色：出生点 `spawnOnRun = false`，相机就是一块俯视棋盘。
+#   行动单位由你自己摆（现在场景里有一个 Ally / 一个 Enemy，各带一份
+#   玩法组件：hp / attack / armor）。
+#
+# 【回合怎么推进】
+#   tickRound() 让**场上所有带玩法组件的单位**结算一次回合末
+#   （持续伤害、状态到期），返回这一轮结算了几条 dot。
+#   ⚠ 它是"结算"，不是"结束当前单位的回合" —— 谁先动由行动条
+#     （gameplay 的 TurnQueue）决定。
+#
+# 【脚本能干什么】
+#   damage(e, 数值, "fire")   造成伤害（走护甲/易伤/护盾的完整公式）
+#   addStatus(e, "poison")    挂状态（poison / shield / vulnerable）
+#   attr(e, "hp")             读当前属性（含状态加成）
+#   tableNum("cards.strike.cost")   读配表（见 assets/data/）
+# ============================================================
+
+let round = 0
+
+on start {
+    print("GAME-READY", "__PROJECT_NAME__")
+    print("GAME-MODE", "__TEMPLATE_ID__")
+    setWorldAttr("round", 0)
+}
+
+on update {
+    # 按一次交互键推进一回合（参数是 InputMap 里的动作名，不是键码）。
+    if (pressed("Interact")) {
+        round = round + 1
+        let dots = tickRound()
+        setWorldAttr("round", round)
+        print("ROUND", round, "dot =", dots)
+    }
+}

@@ -161,7 +161,7 @@ void CharacterStudioPanel::draw() {
     }
 
     // 稳定 ID 必须 = trayWindowName("charstudio")
-    if (!ImGui::Begin("Character Studio###panel_charstudio",
+    if (!ImGui::Begin(trId("Character Studio", "panel_charstudio"),
                       docked ? nullptr : &m_open, wf)) {
         ImGui::End();
         return;
@@ -518,7 +518,7 @@ void CharacterStudioPanel::drawLayersStep() {
     ImGui::Text("%s: %d", TR("Layers"),
                 static_cast<int>(t.an->layers.size()));
     for (const auto& l : t.an->layers) {
-        ImGui::BulletText("%s  (clip: %s, %d %s)", l.name.c_str(),
+        ImGui::BulletText(TR("%s  (clip: %s, %d %s)"), l.name.c_str(),
                           l.clip.empty() ? "-" : l.clip.c_str(),
                           static_cast<int>(l.mask.roots.size()), TR("mask"));
     }

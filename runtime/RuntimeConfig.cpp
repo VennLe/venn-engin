@@ -501,6 +501,7 @@ const char* runtimeHelpText() {
             "                        character | contact | camera | player |\n"
             "                        springarm | hud | audio |\n"
             "                        material | lod | terrain | script | scriptbench |\n"
+            "                        gameplay（属性/状态/伤害/随机/回合）|\n"
             "                        project（工程数据模型）| audio-config（只打印音频配置）\n"
             "  --dump-scene <path>   把读进来的场景再写一份（读→写往返自检）\n";
 #endif

@@ -1,0 +1,63 @@
+{
+  "_comment": [
+    "打击火花 —— P1 的基准特效。",
+    "40 行以内的 JSON：作者可以直接抄这个当模板，改 rate/bursts/颜色就成新特效。",
+    "⚠ duration 只写 0.12（本体几乎瞬间），真正占用池子的时长由",
+    "  引擎按 lifetime x (1+variance) 算出来（约 0.5 秒），这样火花能飞完",
+    "  而不是被截断在半空中。",
+    "⚠ particles 里的字段与场景 Inspector 里那个粒子组件**完全同构** ——",
+    "  可以把调好的发射器整个拷进来。"
+  ],
+  "name": "hit_spark",
+  "duration": 0.12,
+
+  "hitstop": 0.05,
+  "shake": 0.18,
+  "shakeRadius": 10.0,
+  "flash": 0.12,
+  "flashDuration": 0.05,
+  "flashColor": [1.0, 0.96, 0.86],
+
+  "particles": [
+    {
+      "enabled": true,
+      "rate": 0.0,
+      "duration": 0.1,
+      "looping": false,
+      "prewarm": false,
+
+      "lifetime": 0.32,
+      "lifetimeVariance": 0.45,
+      "startSpeed": 6.0,
+      "speedVariance": 0.6,
+      "spread": 55.0,
+
+      "shape": 4,
+      "shapeRadius": 0.06,
+      "shapeExtents": [0.05, 0.05, 0.05],
+
+      "bursts": [
+        { "time": 0.0, "count": 22, "cycles": 1, "interval": 0.0 }
+      ],
+
+      "gravity": [0.0, 0.0, -14.0],
+      "drag": 0.6,
+
+      "sizeOverLife": [0.35, 1.0, 0.5, 0.0],
+      "alphaOverLife": [1.0, 1.0, 0.55, 0.0],
+      "startSize": 0.1,
+      "colorRamp": [
+        { "t": 0.0, "color": [1.0, 0.95, 0.6] },
+        { "t": 0.4, "color": [1.0, 0.55, 0.1] },
+        { "t": 1.0, "color": [0.55, 0.1, 0.02] }
+      ],
+      "colorRampCount": 3,
+
+      "sprite": 2,
+      "blend": 0,
+      "emissive": 7.0,
+      "softParticles": true,
+      "softDistance": 0.25
+    }
+  ]
+}

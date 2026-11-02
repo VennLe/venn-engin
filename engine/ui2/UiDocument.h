@@ -73,7 +73,16 @@ enum class UiWidgetType : int {
     Text = 3,      // 文本（可带 {key} 绑定）
     Button = 4,    // 九宫格框 + 居中文字
     Progress = 5,  // 进度条（槽 + 按绑定值缩放的填充）
-    Count = 6,
+    // ---- P3-2（2026-11-04）两个**容器** ----
+    // Scroll = 裁剪 + 滚动偏移：子控件超出自身矩形的部分被裁掉，可以用
+    //   `scrollX/scrollY`（或滚轮）平移。**手牌 / 牌库列表 / 战斗日志**都要它。
+    Scroll = 6,
+    // Grid = 等分格子：子控件按 `cols` 列自动排行列，**子控件自己的
+    //   x/y/w/h 被忽略**（由格子和 gap 算）。**手牌扇形 / 卡组网格**要它。
+    //   ⚠ "忽略子控件的 rect" 是有意的：让作者既按格排又各自微调，等于
+    //     两套几何来源，调不出来的时候分不清是谁在起作用。
+    Grid = 7,
+    Count = 8,
 };
 
 const char* typeName(UiWidgetType t);
@@ -101,6 +110,25 @@ struct UiWidget {
     float size = 20.0f;       // 字号（参考像素）
     int align = 0;            // 0 左 / 1 中 / 2 右
 
+    // -- 交互（2026-11-02）--
+    //
+    // `action`：点一下要做什么。语法见 `UiAction.h`（`flag:hp=10` /
+    //   `toggle:menu` / `sound:ui/click.wav` / `quit`）。
+    //   空 = **装饰性控件，点不动**（`Button` 类型但没配 action 是作者最常
+    //   犯的错，运行时会打一条 `UIDOC-NOACTION` 而不是静默）。
+    std::string action;
+    // 不可交互（灰化）。⚠ 与 `visible` 正交：仍然画出来，只是点不动 +
+    //   配色压暗。禁用还能命中是最糟的一种 —— "点了没反应"会被误判成
+    //   "按钮坏了"。
+    bool enabled = true;
+    // 条件可见的绑定键。非空时"可见 = 该键的值 != 0"，与 `visible` 是
+    // **与**关系（作者关掉 visible 之后旗标再真也不显示 —— 那正是
+    // "临时藏起来调布局"需要的）。
+    // ⚠ 为什么要它：没有条件可见，"点开始按钮 → 菜单消失"就做不了，
+    //   于是 action 只能改一些屏幕上根本看不见的数。布局与绘制两处必须
+    //   用**同一个**判据（`widgetVisible`），否则子控件会整体错位一格。
+    std::string visibleBind;
+
     // -- Progress --
     // `bind` 为空 → 用 `value`（0..1，静值，设计期预览用）。
     // `bind` 非空 → 用绑定值；**键缺失按 0 画**（空槽），不是满值 ——
@@ -112,8 +140,56 @@ struct UiWidget {
     // -- Image --
     float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
 
+    // ---- 变换（P3-2）----
+    //
+    // 三者都**乘进子树**（不是只作用于本控件）：面板转了，里面的字要跟着转；
+    // 面板淡出了，里面的字也要淡。
+    //
+    // `rot`：度，绕**自身中心**。正 = 视觉顺时针（y 向下的坐标系里，数学
+    //   正角就是顺时针，别在这里翻符号 —— 翻了之后 ±10° 长得一样）。
+    // `scale`：绕自身中心缩放。
+    // `opacity`：0..1，与祖先**相乘**。
+    //
+    // ⚠⚠ 为什么必须乘进子树而不是各管各的：扇形展开的手牌（每张转 8°）里
+    //   还有牌名文字。文字是**子控件**，只转父控件的话牌面转了、字没转 ——
+    //   在截图里非常明显，但"父控件旋转"这条断言照样绿。
+    float rot = 0.0f;
+    float scale = 1.0f;
+    float opacity = 1.0f;
+
+    // ---- Scroll ----
+    // 滚动偏移（**参考像素**，不是输出像素）。只对 Scroll 生效。
+    // ⚠ 符号约定：`scrollY = 100` 表示"内容整体上移 100"（往下翻）。
+    //   写成反过来会让滚轮方向与直觉相反，而那种 bug 只有人眼能发现。
+    float scrollX = 0.0f;
+    float scrollY = 0.0f;
+
+    // ---- Grid ----
+    int cols = 2;              // 列数（<1 按 1 处理）
+    float gapX = 8.0f;         // 列间距（参考像素）
+    float gapY = 8.0f;         // 行间距
+
+    // ---- 拖放（P3-2）----
+    //
+    // `dragTag` 非空 = **本控件可以被拖**，值为它携带的"类型"字符串
+    //   （卡牌用 `"card"`，道具用 `"item"`…）。
+    // `dropAccept` 非空 = 本控件**接受**被拖放，值是逗号分隔的可接受 tag
+    //   （`"card"` 或 `"card,item"`）。空字符串 = 什么都不接。
+    //
+    // ⚠⚠ "合法目标高亮"的判据只能有一处（`dropAccepts()`）。绘制侧要它来
+    //   决定画不画高亮，松手时要它来决定**放不放**。两处各写一份的经典
+    //   后果：高亮了但放不进去（或者没高亮却能放）—— 前者被认为是渲染
+    //   bug，后者被认为是逻辑 bug，于是两边各自去修，越修越远。
+    std::string dragTag;
+    std::string dropAccept;
+
     std::vector<UiWidget> children;
 };
+
+// `acceptList` 里有没有 `tag`（逗号分隔，两端空白忽略）。
+// ⚠ 用**整词**比较而不是 `substr` 查找：`"card"` 不能命中 `"cardboard"`，
+//   否则"我明明只让它接卡牌，它连纸板都接了"。
+bool dropAccepts(const std::string& acceptList, const std::string& tag);
 
 struct UiDocument {
     std::string name;
@@ -145,6 +221,11 @@ bool saveUiDocument(const std::string& path, const UiDocument& d,
 // 按路径找（`hud/hpbar`，顶层也接受裸 id）。找不到返回 nullptr。
 UiWidget* findWidget(UiDocument& d, const std::string& path);
 const UiWidget* findWidget(const UiDocument& d, const std::string& path);
+// 按 **id** 找（全树递归）。id 的唯一性由 `idsUnique` 保证，所以 id 是
+// 一个合法的全局键 —— 命中测试拿到的是 id 而不是路径，只能这么反查。
+// 找不到返回 nullptr。
+const UiWidget* findWidgetById(const UiDocument& d, const std::string& id);
+UiWidget* findWidgetById(UiDocument& d, const std::string& id);
 // 全树控件数（不含自身不计：根层每个算 1）
 int countWidgets(const std::vector<UiWidget>& ws);
 // 全树 id 是否唯一（含跨层）。重复时 `dup` 拿到第一个重复的 id。
@@ -186,6 +267,24 @@ struct UiDocPlaced {
     UiWidgetType type = UiWidgetType::Panel;
     UiRect rect;        // 输出像素
     UiRect fill;        // Progress 的填充矩形（其它类型与 rect 相同）
+    // 能不能被点中。`action` 非空、或是 Button 类型（Button 没配 action
+    // 也算"可交互"：这样点上去能打出一条"这个按钮没有动作"的日志，
+    // 而不是让作者对着一个毫无反应的按钮猜）。
+    bool interactive = false;
+    // 是否可用（`enabled`）。命中测试要跳过 false 的。
+    bool enabled = true;
+
+    // ---- 变换（P3-2）----
+    // 祖先 + 自身的累积变换（输出像素）。命中测试把鼠标点**逆变换**回去
+    // 再判矩形 —— 转了 12° 的卡牌用未旋转的 AABB 判定，会出现"点卡片外面
+    // 也能选中 / 点卡片角上反而选不中"，而截图完全看不出来。
+    Ui2Xform xform{};
+    // ---- 裁剪（P3-2）----
+    // 最近的 Scroll 祖先的矩形（输出像素）。`hasClip == false` = 不被裁。
+    // 命中测试必须跳过"画在裁剪切外但在 rect 内"的控件 —— 滚动列表滚出
+    // 可视区的行，矩形还在（`logRect` 也不判可见性），点上去照样会中。
+    UiRect clip{};
+    bool hasClip = false;
 };
 
 // 纯几何：输出像素下每个控件的矩形，**深度优先**（父在前、子在后）。
@@ -200,20 +299,34 @@ std::vector<UiDocPlaced> placeDocument(const UiDocument& d,
 //   与 `ui.scale` 无关。用 `placeDocument` 的话，作者在 Inspector 里调了
 //   全局 UI 缩放，设计视图里的控件会跟着动 —— 那不是"设计稿"。
 //   `scale = 1` 时返回的就是**参考像素**坐标（换锚点保位置靠它算）。
+// `honorVisibleBind = false`：**忽略 `visibleBind`**，只看 `visible`。
+// 设计画布必须用它 —— 否则作者一给控件配上"按旗标隐藏"，那个控件就在
+// 设计视图里**消失**（空绑定表里查不到键 → 判为不可见），连点都点不到。
 std::vector<UiDocPlaced> placeDocumentAt(const UiDocument& d,
                                          const UiBindings& b,
-                                         const UiRect& canvas, float scale);
+                                         const UiRect& canvas, float scale,
+                                         bool honorVisibleBind = true);
 
 struct UiDocDrawStats {
     int widgets = 0;   // 画出来的
     int skipped = 0;   // visible=false 或因尺寸为 0 跳过的
     int texts = 0;     // 画了几段文字
+    // 画了几个"合法拖放目标"的高亮框（P3-2）。拖动牌子时它应该 > 0 ——
+    // 这是"高亮真的画了"的**唯一**无窗口证据（像素留给截图）。
+    int highlights = 0;
 };
 
 // 往画布上画整份文档。`font` 为空时**不画文字但其它照画**（与
 // `UiCanvas::text` 的"字体缺失只是数据缺失"同一条：不画方块）。
+//
+// `ia` 非空时按交互状态给**当前控件**调色：pressed 压暗、hovered 提亮、
+// disabled 灰化。传空 = 纯静态绘制（编辑器设计画布、自检都走这条）。
+// ⚠ 调色只影响**本控件**，不会传染子树：按钮的灰化不该把里面的文字也
+//   压暗两次（文字是子控件，它有自己的 enabled）。
+struct UiDocInteraction;
 UiDocDrawStats drawDocument(UiCanvas& c, const UiDocument& d,
                             const UiBindings& b, uint32_t outW, uint32_t outH,
-                            const SdfFont* font);
+                            const SdfFont* font,
+                            const UiDocInteraction* ia = nullptr);
 
 }  // namespace ui2

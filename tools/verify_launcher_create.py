@@ -7,37 +7,43 @@
     分辨率/标题、重复创建被拒、失败无残留。」
 
 这个脚本**全程点按钮**，不绕过 UI：
-  ① 进新建向导（`MYVK_LAUNCHER_PAGE=new`），点"第三人称"卡片 → 断言日志里
-     出现 `LAUNCHER-WIZARD type=third_person`（证明这一下真的点到了）；
+  ① 进新建向导（`MYVK_LAUNCHER_PAGE=new`），点类型卡片 → 断言日志里
+     出现 `LAUNCHER-WIZARD type=<id>`（证明这一下真的点到了）；
   ② 下一步到"位置"，再下一步到"画面"；
   ③ 点"创建" → 停在"完成"页；
   ④ 关掉启动器，对着磁盘一条条对账。
 
-第二轮换成第一人称，第三轮**故意重名**（必须被拒、且不留残留）。
+**每种游戏类型各跑一整轮** —— `kGameTypes[]` 里有几种就跑几轮，数量由
+`read_game_type_ids()` 从源码读出来（不在测试里再写一份）。之后补两轮：
+故意重名（必须被拒、且不留残留）、不给 TEST_ROOT（应当默认用上次那个目录）。
 
 ⚠ `MYVK_LAUNCHER_TEST_ROOT` / `TEST_NAME` 只填向导的**初值** ——
   四步一步不少，按钮一个不落地真点。不这么做的话，测试得去模拟
   "往系统文件夹对话框里敲一串带中文的临时路径"，那件事在 CI 上做不可靠。
 
-覆盖（C1~C16）：
-  C1  卡片点击生效（日志有 type=）
+覆盖（每轮 1~11 与 16；前缀按类型分：C=third_person / F=first_person /
+I=isometric / B=card_battler —— 编号不撞。12~17 只在第一轮和尾部出现）：
+  ?1  类型卡片**全部画在客户区里**、点哪张就报哪个 type、表里没有的不许画
   C2  下一步确实换页（换页后才出现 `LAUNCH-INPUT-root`）
   C3  再下一步出现分辨率/画质/将写入清单（`LAUNCH-COMBO-res` / `-quality` / `LAUNCH-WRITES`）
   C4  创建成功 → 出现 `LAUNCH-DONE`
-  C5  `venn.project.json` 存在且 name/gameType/template 都对
-  C6  `template.json.files[]` 里每个文件都在（**用清单对账**，不手写文件名）
-  C7  `assets/game.json` 的 title == 工程名
-  C8  `assets/game.json` 的 width/height == 1920x1080（向导默认档）
-  C9  `config/render.json` 的 enable 键**全量**（= 引擎的 enable 参数个数）
-  C10 High 档真的打开 ssao/taa、关掉 dof
-  C11 场景里**没有** Player 实体、只有 GameStart 出生点（第八轮起的契约：
+  ?5  `venn.project.json` 存在且 name/gameType/template 都对
+  ?6  `template.json.files[]` 里每个文件都在（**用清单对账**，不手写文件名）
+  ?7  `assets/game.json` 的 title == 工程名
+  ?8  `assets/game.json` 的 width/height == 1920x1080（向导默认档）
+  ?9  `config/render.json` 的 enable 键**全量**（= 引擎的 enable 参数个数）
+  ?10 High 档真的打开 ssao/taa、关掉 dof
+  ?11 场景里**没有** Player 实体、只有 GameStart 出生点（第八轮起的契约：
       玩家是运行时产物；2026-10-22 改写，原来查的是 player.mode）
+  ?16 场景相机与**模板场景**逐字段一致（distance/pitch/yaw/fov）
+      —— 2026-11-04 重写：原先按类型硬编码 TP 4.5/0.35、FP 8.0/0.20，
+         49efa67 把模板相机统一成 14.0/0.26 之后就变成过时记账了。
+         详见 check_project 里 C16 上方那段。
   C12 新工程进了 recent.json
   C13 重名创建被拒（日志 `PROJ-CREATE FAILED at Validate`）
   C14 被拒后**没有** `<name>.tmp` 残留
   C15 被拒后原工程的文件没被改动（mtime 不变）
-  C16 相机取景随类型不同（TP distance 4.5 / pitch 0.35；FP 8.0 / 0.20）
-       —— 第一人称那轮的同类断言前缀是 `F`（F5~F16），两轮编号不撞。
+  C17 第二次新建默认用上次那个目录（不是回落 C 盘 Documents）
 
 用法：
     python tools/verify_launcher_create.py
@@ -45,6 +51,7 @@
 
 import json
 import os
+import re
 import shutil
 import sys
 
@@ -53,6 +60,86 @@ import launcher_kit as kit  # noqa: E402
 
 # 截图落点（`run_wizard` 里用；主流程会把它指到本次的 work 目录）
 WORK_FOR_SHOTS = os.path.join(kit.WORK_ROOT, "launcher_create")
+
+# `engine/project/ProjectFile.cpp` 里的 `kGameTypes[]` —— 类型 id 的**唯一**来源。
+PROJECTFILE_CPP = os.path.join(kit.REPO, "engine", "project", "ProjectFile.cpp")
+
+# 兜底表（顺序必须与 `kGameTypes[]` 一致）。正常情况下不走到这里 ——
+# 见 `read_game_type_ids()`。
+GAME_TYPE_IDS_FALLBACK = ["first_person", "third_person",
+                          "isometric", "card_battler"]
+
+_GAME_TYPE_RE = re.compile(r'\{\s*GameType::\w+\s*,\s*"([a-z_]+)"')
+
+
+def read_game_type_ids():
+    """按 `kGameTypes[]` 的**顺序**返回类型 id 列表（= 向导卡片的下标顺序）。
+
+    ⚠⚠ 为什么不在这里再写一份硬编码表：`LAUNCH-TYPE-<i>` 锚点的下标就是
+      这张表的顺序。写两份必然出现"加了第 5 种游戏类型、测试还在点前 4 张"，
+      而那种情况下**第 5 张卡没有任何用例点过** —— 界面上点不到就等于没交
+      付，可测试是全绿的。
+
+    读不到（文件挪位置 / 改写法）时退回 `GAME_TYPE_IDS_FALLBACK` 并**打出
+    一行 WARN** —— 静默退回等于把"这条检查已经失效"藏起来。
+    """
+    try:
+        with open(PROJECTFILE_CPP, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        kit.log("WARN 读不到 %s（%s），类型 id 用兜底表" % (PROJECTFILE_CPP, e))
+        return list(GAME_TYPE_IDS_FALLBACK)
+    parts = src.split("kGameTypes[]")
+    if len(parts) < 2:
+        kit.log("WARN %s 里找不到 kGameTypes[]，类型 id 用兜底表"
+                % PROJECTFILE_CPP)
+        return list(GAME_TYPE_IDS_FALLBACK)
+    body = parts[1].split("};")[0]
+    ids = _GAME_TYPE_RE.findall(body)
+    if not ids:
+        kit.log("WARN kGameTypes[] 里没解析出 id，类型 id 用兜底表")
+        return list(GAME_TYPE_IDS_FALLBACK)
+    if ids != GAME_TYPE_IDS_FALLBACK:
+        kit.log("WARN kGameTypes[] = %s，与兜底表 %s 不同 —— 兜底表该跟着更新了"
+                % (ids, GAME_TYPE_IDS_FALLBACK))
+    return ids
+
+
+def check_templates_fresh(type_ids):
+    """`build/bin/templates/` 必须不旧于仓库里的 `templates/`。
+
+    ⚠⚠ 为什么单开一条前置检查（2026-11-04 实测踩到）：**启动器读的是
+      `<exe>/templates`**（`project::templatesRoot()` 的候选链），不是仓库
+      里的 `templates/`。改完模板不重新 `make build`，`VennTemplatesCopy`
+      就没跑 —— 新建出来的工程是**上一版**的场景。
+
+      症状极具误导性：C16 报"场景相机与模板不一致: distance=6.0(期望 9.0)"
+      ，看着像引擎把相机改坏了（我第一反应就是去翻 `ProjectCreate` 有没有
+      重写相机 —— 没有）。真因是那次拷的是 6 分钟前的模板。
+      本项目的自检（K33）读的是仓库 `templates/`，所以它**照样全绿**。
+
+    返回失败信息列表（空 = 新鲜）。
+    """
+    fails = []
+    for tid in type_ids:
+        repo = os.path.join(kit.TEMPLATES, tid, "template.json")
+        built = os.path.join(kit.BIN, "templates", tid, "template.json")
+        if not os.path.isfile(built):
+            fails.append("Z2 build/bin/templates/%s 不存在（先 make build，"
+                         "模板由 VennTemplatesCopy 拷过去）" % tid)
+            continue
+        # 比的是**整个目录**里最新的那个文件 vs 被拷过去的同名文件 ——
+        # 只比 template.json 会漏掉"只改了场景/脚本"的情况（最常见）。
+        for sub in ("template.json", "assets/scenes/main.json"):
+            rp = os.path.join(kit.TEMPLATES, tid, sub)
+            bp = os.path.join(kit.BIN, "templates", tid, sub)
+            if not os.path.isfile(rp):
+                continue
+            if not os.path.isfile(bp) or \
+                    os.path.getmtime(rp) > os.path.getmtime(bp) + 1e-6:
+                fails.append("Z2 build/bin/templates/%s/%s 比仓库旧 —— 启动器"
+                             "会用旧模板建工程。先 make build。" % (tid, sub))
+    return fails
 
 
 def run_wizard(work, name, type_index, recent_path, expect_ok=True):
@@ -76,17 +163,52 @@ def run_wizard(work, name, type_index, recent_path, expect_ok=True):
         return False, ["启动器窗口没出现（向导跑不了）"], tap.text(), False
 
     shot_ok = False
+    type_ids = read_game_type_ids()
     try:
         # ---- ① Step1 类型 ----
         if not tap.wait_rect("LAUNCH-TYPE-0", timeout=25.0):
             fails.append("C1 向导 Step1 没画出类型卡片（缺 LAUNCH-TYPE-0）")
             return False, fails, tap.text(), False
+
+        # ①-a **每一张**类型卡片都必须画出来，而且**落在客户区里**。
+        #
+        # ⚠⚠ 为什么"有矩形"不够：`logRect` 不判可见性（只按坐标去重）。卡片
+        #   被挤出窗口时矩形照样打得出来，照着那个坐标点 = 点在窗口外面，
+        #   日志里一条错都没有。症状是"点了第 3 张卡没反应"，而这里如果只
+        #   `wait_rect` 就会一路绿到底。2026-10-31 在面板滚出视野的按钮上
+        #   踩过同一类坑（"有矩形却点不到"）。
+        #
+        # 这张表从 2 张扩到 4 张时（2×2 布局）实测过：卡片 380×258，
+        # 第二行 y=435..693，客户区 1400×880，`LAUNCH-BTN-next` 在 771 ——
+        # 都在里面。这条断言就是钉住这件事的。
+        cw, ch = kit.client_size(hwnd)
+        for i in range(len(type_ids)):
+            tag = "LAUNCH-TYPE-%d" % i
+            r = tap.last_rect(tag)
+            if not r:
+                fails.append("C1 缺类型卡片 %s（向导只画了 %d 张，"
+                             "kGameTypes[] 有 %d 种）" % (tag, i, len(type_ids)))
+                continue
+            if r[0] < 0 or r[1] < 0 or r[2] > cw or r[3] > ch:
+                fails.append("C1 %s 出界 %s（客户区 %dx%d）—— 卡片排到窗口外面，"
+                             "点它等于点空气" % (tag, r, cw, ch))
+        # 表里没有的类型不许画出来（画了说明卡片表比枚举长，多出来的那张
+        # 没有 kGameTypes[] 兜底，`gameTypeAt()` 会越界退化成 third_person）。
+        if tap.last_rect("LAUNCH-TYPE-%d" % len(type_ids)) is not None:
+            fails.append("C1 向导画出了第 %d 张类型卡片，但 kGameTypes[] 只有 %d 种"
+                         " —— 多出来那张会被 gameTypeAt() 静默退化成 third_person"
+                         % (len(type_ids) + 1, len(type_ids)))
+        if fails:
+            return False, fails, tap.text(), False
+        kit.log("CHECK C1 all %d type cards on screen (client %dx%d) OK"
+                % (len(type_ids), cw, ch))
+
         tag = "LAUNCH-TYPE-%d" % type_index
         if not kit.click_anchor(hwnd, tap, tag):
             fails.append("C1 点不到 %s" % tag)
             return False, fails, tap.text(), False
         kit.capture(hwnd, os.path.join(WORK_FOR_SHOTS, "step1_%s.png" % name))
-        want_type = "first_person" if type_index == 0 else "third_person"
+        want_type = type_ids[type_index]
         # ⚠ 断言"这一下真的被吃到了"：只断言"页面还在 Step1" 是不够的 ——
         #   吞掉全部点击也能通过（本项目的输入类断言踩过这个坑）。
         if not tap.wait_line("LAUNCHER-WIZARD type=" + want_type, timeout=8.0):
@@ -157,7 +279,7 @@ def run_wizard(work, name, type_index, recent_path, expect_ok=True):
 
 
 def check_project(root, name, kind, fails, prefix):
-    """对着磁盘对账。`kind` = first_person / third_person。"""
+    """对着磁盘对账。`kind` 是 `kGameTypes[]` 里的类型 id（4 种都适用）。"""
     # ---- C5 身份文件 ----
     pj = os.path.join(root, "venn.project.json")
     if not os.path.isfile(pj):
@@ -252,7 +374,13 @@ def check_project(root, name, kind, fails, prefix):
     #   "红"变成噪音，真出现 Player 时反而没人看见。
     #
     #   两种类型的差异现在全在 `camera` 段（C16 查 distance / pitch）。
-    with open(os.path.join(root, "assets", "scenes", "main.json"),
+    #   ⚠ 2026-11-04 补：**这句话对 first_person / third_person 已经不成立了**
+    #     —— 49efa67 之后两份模板共用同一个相机（14.0 / 0.26）。真正的类型
+    #     差异载体变成了"拷了哪套模板"（C6 用 files[] 对账：小镇 vs 8×8 棋盘
+    #     vs 牌桌；脚本分别是 main.vks / main.vks / battle.vks）与 C16 的
+    #     "相机 == 模板相机"。别再假设 FP 和 TP 的相机不一样。
+    start_scene = manifest.get("startScene", "scenes/main.json")
+    with open(os.path.join(root, "assets", start_scene),
               encoding="utf-8") as f:
         scene = json.load(f)
     names = [e.get("name") for e in scene.get("entities", [])]
@@ -262,27 +390,60 @@ def check_project(root, name, kind, fails, prefix):
     elif "GameStart" not in names:
         fails.append("%s11 场景里没有 GameStart（玩家没有出生点）" % prefix)
     else:
-        kit.log("CHECK %s11 scene entities=%s (no Player, has GameStart) OK"
-                % (prefix, names))
+        # ⚠ 只打**条数 + 前几个名字**：小镇模板有 157 个实体，整行打出来会
+        #   把同一轮的其它 CHECK 挤出屏幕，而真正要看的信息只有两个
+        #   —— "没有 Player" 和 "有 GameStart"，它们已经在句子后半段了。
+        kit.log("CHECK %s11 scene entities=%d %s... (no Player, has GameStart) OK"
+                % (prefix, len(names), names[:4]))
 
-    # ---- C16 相机取景随类型不同（现在**唯一**的类型差异载体）----
-    want_dist, want_pitch = {"first_person": (8.0, 0.20),
-                             "third_person": (4.5, 0.35)}[kind]
-    cam = scene.get("camera", {})
-    got_dist = cam.get("distance")
-    if abs(float(got_dist or -1) - want_dist) > 1e-6:
-        fails.append("%s16 camera.distance=%s，期望 %s"
-                     % (prefix, got_dist, want_dist))
+    # ---- C16 相机取景 ----
+    #
+    # ⚠⚠ 这条断言被**推翻重写**过两次，把来龙去脉记在这里免得又写回硬编码：
+    #
+    #   ① 最初按类型硬编码：first_person=(8.0, 0.20)、third_person=(4.5, 0.35)。
+    #   ② 提交 49efa67 把新建工程的初始场景换成"二次元小镇"，两份模板的相机
+    #      被统一成 target(0,0,1.6) / yaw π/2 / pitch 0.26 / distance 14.0
+    #      （理由是 30 m 视距下 GameStart 标记只有 14×38 px，"标记有可读大小"
+    #      会判红）。那次只同步了 `verify_launcher_project.py`，**漏了本脚本**
+    #      → 于是 C16 / F16 长期是一条"记账过时"的红，不是真 bug。
+    #   ③ 现在改成「**创建出来的相机 == 模板场景的相机**」：
+    #      · 模板以后调参它自动跟随，不会再变成过时记账；
+    #      · "创建流程往场景里写了个默认相机 / 拷错了模板"照样会被抓住；
+    #      · 它一次管住 `kGameTypes[]` 里的**全部**类型，不是只有 2 种。
+    #
+    # ⚠ 只比 `distance` 就够了吗：不够。等距（24.0 / 0.98）和牌桌
+    #   （9.0 / 0.50）**恰好**是 distance 不同，但真正区分"俯视棋盘"和
+    #   "牌桌视平线"的是 pitch，所以两个都查，顺带查 yaw/fov。
+    tpl_scene_path = os.path.join(kit.TEMPLATES, kind, "assets",
+                                  manifest.get("startScene", "scenes/main.json"))
+    try:
+        with open(tpl_scene_path, encoding="utf-8") as f:
+            tpl_cam = (json.load(f).get("camera") or {})
+    except OSError as e:
+        fails.append("%s16 读不到模板场景 %s（%s）" % (prefix, tpl_scene_path, e))
+        return
+    cam = scene.get("camera") or {}
+    cam_bad = []
+    for key in ("distance", "pitch", "yaw", "fov"):
+        want_v = tpl_cam.get(key)
+        if want_v is None:
+            continue
+        got_v = cam.get(key)
+        if got_v is None or abs(float(got_v) - float(want_v)) > 1e-6:
+            cam_bad.append("%s=%s(期望 %s)" % (key, got_v, want_v))
+    if cam_bad:
+        fails.append("%s16 场景相机与模板不一致: %s（模板 %s）"
+                     % (prefix, ", ".join(cam_bad), tpl_scene_path))
     else:
-        kit.log("CHECK %s16 camera.distance=%s OK" % (prefix, got_dist))
-    # ⚠ pitch 是**弧度**、正数 = 相机在目标上方（2026-10-21 踩过一次
-    #   度/弧度混用：写成 -12.0 会被夹到 -89°，相机沉到地面以下朝天看）。
+        kit.log("CHECK %s16 camera matches template (distance=%s pitch=%s) OK"
+                % (prefix, cam.get("distance"), cam.get("pitch")))
+    # ⚠ pitch 是**弧度**、正数 = 相机在目标上方（2026-10-21 踩过一次度/弧度
+    #   混用：写成 -12.0 会被夹到 -89°，相机沉到地面以下朝天看）。这条与
+    #   "跟模板一致"正交 —— 模板自己写错也要拦。
     got_pitch = cam.get("pitch")
-    if abs(float(got_pitch if got_pitch is not None else -99.0) - want_pitch) > 1e-6:
-        fails.append("%s16 camera.pitch=%s，期望 %s rad（正数 = 相机在目标上方）"
-                     % (prefix, got_pitch, want_pitch))
-    else:
-        kit.log("CHECK %s16 camera.pitch=%.2f rad OK" % (prefix, want_pitch))
+    if got_pitch is None or not (-1.5533 < float(got_pitch) < 1.5533):
+        fails.append("%s16 camera.pitch=%s 不在 ±89° 内（单位应为弧度）"
+                     % (prefix, got_pitch))
 
 
 def main():
@@ -297,40 +458,76 @@ def main():
     kit.log("PROBE work=%s" % work)
 
     fails = []
+    type_ids = read_game_type_ids()
+    kit.log("PROBE game-types=%d %s" % (len(type_ids), type_ids))
 
-    # ================= 第一轮：第三人称 =================
-    name1 = "TpGame"
-    ok, f, log1, shot_ok = run_wizard(work, name1, 1, recent_path, expect_ok=True)
-    fails += f
-    root1 = os.path.join(work, name1)
-    if ok and not f:
-        with open(os.path.join(work, "create_tp.log"), "w", encoding="utf-8") as fh:
-            fh.write(log1)
-        check_project(root1, name1, "third_person", fails, "C")
+    # ⚠ 先验"启动器会读到哪一版模板"，再验"建出来的对不对" —— 顺序反了的话
+    #   模板是旧的会产生一堆**看起来像引擎坏了**的红（见 check_templates_fresh）。
+    stale = check_templates_fresh(type_ids)
+    if stale:
+        for s in stale:
+            kit.log("CHECK FAIL " + s)
+        return kit.finish(stale)
 
-        # ---- C12 进了最近列表 ----
+    # ================= 每种游戏类型各跑一整轮 =================
+    #
+    # 用户要求（2026-11-04）："游戏类型的设置应该是在启动器创建游戏的时候
+    # 去设置的"。所以验收也不能只验两种类型 —— **每一种**都要真的点卡片、
+    # 走完四步、落到磁盘，并且对出来的 `venn.project.json` 里
+    # `gameType` / `template` 都等于那个 id。
+    #
+    # ⚠ 文件名用类型 id 拼，不按下标 —— "第 3 轮"在表变长之后指的就不是
+    #   同一个东西了，而 `create_3.log` 这种名字会让人翻错日志。
+    # 前缀按类型固定分配（不是按下标），这样增删类型时老判据的编号不漂。
+    ROUNDS = [
+        ("third_person", "TpGame",   "C", "create_third_person.log"),
+        ("first_person", "FpGame",   "F", "create_first_person.log"),
+        ("isometric",    "IsoGame",  "I", "create_isometric.log"),
+        ("card_battler", "CardGame", "B", "create_card_battler.log"),
+    ]
+    # 只在 `kGameTypes[]` 里真的存在时才跑那一轮 —— 少一种类型时是"表变了"，
+    # 不该变成"这四条断言全红"，但**也必须留一条红**说明有人改了枚举：
+    known = {tid for tid, _, _, _ in ROUNDS}
+    for tid in type_ids:
+        if tid not in known:
+            fails.append("Z1 kGameTypes[] 里有类型 %r 但没有对应的向导用例"
+                         "（ROUNDS 表要与 ProjectFile.cpp 同步）" % tid)
+
+    rounds = [(tid, nm, px, lf) for tid, nm, px, lf in ROUNDS
+              if tid in type_ids]
+    roots = {}
+    for tid, nm, px, lf in rounds:
+        idx = type_ids.index(tid)
+        ok, f, log_text, _ = run_wizard(work, nm, idx, recent_path,
+                                        expect_ok=True)
+        fails += f
+        root = os.path.join(work, nm)
+        roots[tid] = root
+        with open(os.path.join(work, lf), "w", encoding="utf-8") as fh:
+            fh.write(log_text)
+        if not ok or f:
+            continue            # 向导本身就没走完，往下对账只会产生噪音
+        check_project(root, nm, tid, fails, px)
+
+    # ---- C12 进了最近列表（用第一个成功建出来的工程查一次就够）----
+    root1 = roots.get("third_person") or next(
+        (r for r in roots.values() if os.path.isdir(r)), None)
+    if root1 and os.path.isdir(root1):
         paths = [it.get("path") for it in kit.read_recent(recent_path)]
         if kit.project_key(root1) not in [kit.project_key(p or "") for p in paths]:
             fails.append("C12 新工程没进 recent.json（现有 %s）" % paths)
         else:
-            kit.log("CHECK C12 recent.json has %s OK" % name1)
+            kit.log("CHECK C12 recent.json has %s OK" % os.path.basename(root1))
 
-    # ================= 第二轮：第一人称 =================
-    name2 = "FpGame"
-    ok, f, log2, _ = run_wizard(work, name2, 0, recent_path, expect_ok=True)
-    fails += f
-    root2 = os.path.join(work, name2)
-    if ok and not f:
-        with open(os.path.join(work, "create_fp.log"), "w", encoding="utf-8") as fh:
-            fh.write(log2)
-        check_project(root2, name2, "first_person", fails, "F")
-
-    # ================= 第三轮：重名必须被拒 =================
-    if os.path.isdir(root1):
+    # ================= 重名必须被拒 =================
+    name1 = "TpGame"
+    if os.path.isdir(os.path.join(work, name1)):
+        root1 = os.path.join(work, name1)
         # 记下 mtime，事后证明"被拒"没有碰过原工程
         before = {n: os.path.getmtime(os.path.join(root1, n))
                   for n in ("venn.project.json", "assets/game.json")}
-        ok, f, log3, _ = run_wizard(work, name1, 1, recent_path, expect_ok=False)
+        ok, f, log3, _ = run_wizard(work, name1, type_ids.index("third_person"),
+                                    recent_path, expect_ok=False)
         fails += f
         with open(os.path.join(work, "create_dup.log"), "w", encoding="utf-8") as fh:
             fh.write(log3)
@@ -352,13 +549,13 @@ def main():
     else:
         fails.append("C15 第一轮没建出工程，重名用例没法跑")
 
-    # ================= 第四轮：下次新建默认用"上次那个目录" =================
+    # ================= 最后：下次新建默认用"上次那个目录" =================
     #
     # 需求（2026-10-24 用户原话）："创建新游戏会设置游戏目录时不要每次都是
     # C 盘的目录，如果之前有创建过的游戏目录，默认会以之前的目录为准。"
     #
     # 复现方式必须**不**给 TEST_ROOT —— 给了就等于绕过了这条需求本身。
-    # 前三轮已经成功建过两个工程，`newproject.json` 里应该记着 work。
+    # 前面已经成功建过好几个工程，`newproject.json` 里应该记着 work。
     saved = os.path.join(work, "newproject.json")
     if not os.path.isfile(saved):
         fails.append("C17 创建成功后没有写出 newproject.json（%s）" % saved)

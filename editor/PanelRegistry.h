@@ -91,7 +91,12 @@ struct PanelDesc {
 //   再加 2~3 条，一次抬够）。
 // 2026-11-01：34 → 40（状态机编辑器 + Character Studio 是第 34/35 条，
 //   34 已经装不下了）。
-constexpr int kMaxPanels = 40;
+// 2026-11-02：40 → 48（旗标表 A4 + 脚本断点调试 C8 是第 40/41 条 ——
+//   上一版**正好爆了**：日志打 `PANEL-OVERFLOW count=42 capacity=40`，
+//   2 个面板的状态位丢进越界区，进程起来几帧后直接段错误。
+//   ⚠ 这就是"越界不是不显示，是会崩"的活样本 —— 只信"面板打不开"
+//     这个症状会查很久。一次抬够 8 格。
+constexpr int kMaxPanels = 48;
 
 // 表本体定义在 EditorApp.cpp（draw 指针要访问 EditorApp 的私有成员，
 // 只能在那里定义）。这里只给只读访问。

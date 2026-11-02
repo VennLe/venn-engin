@@ -72,6 +72,42 @@ FEATURES = [
          panel="Stats ▸ GPU timing", ui=["ms/frame", "GPU:"],
          env=["MYVK_GPU_TIMER", "MYVK_GPU_TIMING"],
          test="verify_gpu_timing", gpu=None),
+    # 2026-11-02（C9）：CPU 侧的对称物。12 段 + 两条堆叠条 + 一次可展开的
+    # 分段表。⚠ `ui` 里的 token 必须是**在 editor/ 里能 grep 到的字符串** ——
+    # `STATS-CPU-BAR` 是 logRect 的锚点名，删掉它这条特性就"点不到了"。
+    # 2026-11-02（C1/C2）：配表与本地化编辑。`ui` 的 token 都是**能在
+    # editor/ 里 grep 到**的字符串（面板锚点 / 界面文字），删 UI 时这里会红。
+    dict(id="datatable", name="配表（CSV 数据表）", roadmap="C1",
+         scope="Editor", panel="Authoring ▸ Data tables",
+         ui=["Data tables", "DT-GRID", "TABLE-LIST"],
+         env=[], test="verify_data_tables", gpu=None),
+    dict(id="localization_edit", name="本地化编辑（外部覆盖层）", roadmap="C2",
+         scope="Editor", panel="Authoring ▸ Localization",
+         ui=["Localization", "LOC-LIST", "I18N-UI"],
+         env=[], test="verify_data_tables", gpu=None),
+    dict(id="cpu_profiler", name="CPU 分段剖析", roadmap="C9", scope="Editor",
+         panel="Stats ▸ CPU", ui=["CPU breakdown", "STATS-CPU-BAR"],
+         env=["MYVK_CPU_STATS"], test="verify_stats_cpu", gpu=None),
+    # 2026-11-02（A4/C8）：剧情调试的两半。`ui` 的 token 都在
+    # `editor/FlagTablePanel.cpp` / `editor/ScriptDebugPanel.cpp` 里能 grep 到；
+    # 删掉面板就等于把这两条特性打回"没交付"（这条检查的用途）。
+    # ⚠ A4 的**核心**不是面板，是把 `svc.act.setFlag` 接进编辑器 Play
+    #   （之前 Play 里调它只会说 "not available in this host"）；
+    #   C8 的核心是"停住 + 带行号"，判据在 `verify_script_debug.py` 的 C 组。
+    dict(id="flag_table", name="剧情旗标表", roadmap="A4", scope="Editor",
+         panel="Debug ▸ Flags", ui=["Flags", "FLAG-LIST", "FLAG-COUNT"],
+         env=["MYVK_LOG_FLAGS"], test="verify_flags", gpu=None),
+    dict(id="script_breakpoints", name="脚本断点调试", roadmap="C8",
+         scope="Editor", panel="Debug ▸ Script debug",
+         ui=["Script debug", "SCRDBG-SRC", "SCRDBG-CONT"],
+         env=[], test="verify_script_debug", gpu=None),
+    # 2026-11-02（G19）：关卡流送。这是"大世界"的第一个前置 —— 之前只有
+    # "一次加载整个世界"。判据在 `verify_levels.py`（叠加加载不毁已有实体 /
+    # 进盒加载出盒卸载 / 常驻不卸 / 滞回）。
+    dict(id="level_streaming", name="关卡流送", roadmap="G19", scope="Editor",
+         panel="Authoring ▸ Levels",
+         ui=["Levels", "LVL-ROW-", "LVL-SRC"],
+         env=[], test="verify_levels", gpu=None),
     dict(id="view_modes", name="调试视图模式", roadmap="R0-2", scope="Editor",
          panel="Engine ▸ Viewport", ui=["View mode", "VIEW-MODE"],
          env=["MYVK_VIEW_MODE"], test="verify_viewmodes", gpu=None),
@@ -187,6 +223,47 @@ FEATURES = [
               "MYVK_FX_SIZE", "MYVK_FX_SOFTNESS", "MYVK_FX_INTENSITY",
               "MYVK_FX_FREEZE", "MYVK_FX_DBG"],
          test="verify_particles", gpu="particles"),
+
+    # ---------------- P1 特效调度 ----------------
+    # ⚠ 与上面那条 `fx`（R6-1 GPU 粒子）**不是同一个特性**：
+    #   `fx`        = "一个发射器怎么画"（Inspector 的 12 个模块）
+    #   `fx_system` = "一次命中要出什么"（`.veffect` 打包 + 宿主池 + 动画事件
+    #                 路由 + 6 个脚本动词 + 打击感三件：顿帧/闪白/震屏）
+    #   两条判据也分开：`verify_particles` 看画面对不对，`verify_fx` 看
+    #   "占了几个槽、丢了几次、顿了几帧"——后者全是计数，不截一张图。
+    dict(id="fx_system", name="特效调度与打击感", roadmap="P1", scope="Scene",
+         panel="Debug ▸ Effects",
+         ui=["FX-RECT", "FX-STATE", "FX-PLAY-hit_spark", "FX-STOPALL",
+             "FX-BUDGET"],
+         # `MYVK_LOG_FX` 是**日志探针**：`EffectService::play` 默认不打日志
+         # （每次命中一行会淹掉日志），而 `FX-PLAY ... id=N` 正是"真的占到
+         # 了槽"的唯一证据。正式入口是面板/事件表，这条只给自动化用。
+         env=["MYVK_LOG_FX"], test="verify_fx", gpu=None),
+
+    # ---------------- P2 玩法状态 ----------------
+    # 属性(AttributeSet) / 状态(StatusEffect) / 伤害(DamageResult) /
+    # 确定性随机(三条流) / 回合调度(行动条)。三处 UI 面缺一不可：
+    #   · Inspector ▸ Gameplay：一个实体的白值 / 状态 / 伤害预览
+    #   · Debug ▸ Gameplay     ：整个遭遇的行动顺序 / 推进 / 回合结算 / 种子
+    #   · 11 条 `gameplay.*` 命令（按钮与命令同一条路）
+    #
+    # ⚠ 它**没有** env：这一层的入口就是面板与脚本，没有"特性开关"。
+    #   （随机种子走 `gameplay.seed` 而不是环境变量 —— 种子要能在一局中间改。）
+    dict(id="gameplay_status", name="玩法数值与回合调度", roadmap="P2",
+         scope="Scene", panel="Debug ▸ Gameplay",
+         ui=["GP-RECT", "GP-STATE", "GP-ORDER", "GP-ADVANCE", "GP-TICK",
+             "GP-SEEDAPPLY", "GP-ROUNDTRIP", "INS-GP-HEADER"],
+         env=[], test="verify_gameplay", gpu=None),
+
+    # 牌堆（P3-3）。⚠ `ui` 名单里**同时**要有 Cards 面板的锚点与 Inspector
+    # 那一段的锚点：两个入口各有一部分能力（面板能抽/洗，页签只能看与弃手），
+    # 少登记一边就等于允许"那一侧悄悄消失"。
+    dict(id="card_zones", name="牌堆（牌库/手牌/弃牌/消耗/结算）", roadmap="P3",
+         scope="Scene", panel="Debug ▸ Cards",
+         ui=["CP-RECT", "CP-STATE", "CP-ENSURE", "CP-TESTDECK", "CP-DRAW",
+             "CP-HAND0", "CP-RESOLVE", "CP-SWEEP", "CP-ROUNDTRIP",
+             "INS-CARD-STATS", "INS-CARD-HAND"],
+         env=[], test="verify_cards", gpu=None),
 
     # ---------------- 屏幕空间效果（ScreenSpaceSettings）----------------
     # ⚠ 这四组一度**完全没有 UI** —— 是 E1 阶段要清零的头号欠账。
@@ -491,6 +568,14 @@ ALLOW_EXACT = {
     #    `EXPR-STATE` 只在手动敲命令时打一条，而眨眼是每 4 秒一次的背景行为。
     #    用户面对的开关是 Inspector 的 Blink 复选框与间隔（`INS-EXPR-BLINK`）。
     "MYVK_EXPR_LOG",
+    # ③ 2026-11-02：11-01 的天空面板漏登记的 7 条 `MYVK_SKY_*`。
+    #    它们全都是**同一块能力的自动化入口**：把 `SkyParams` 从外部灌进去，
+    #    好在无窗口 / 无美术的情况下复现"某一天的天空"。用户面对的正式入口
+    #    是 Sky & Atmosphere 面板（`SKY-PRESET-*` 四套预设 + 折叠段滑条）。
+    #    ⚠ 这类"面板做了、env 却忘了登记"的漏网只有这道闸门能查出来 ——
+    #      而它红着的时候，所有人都不查"新特性有没有 UI 面"了（见 ① 的注释）。
+    "MYVK_SKY_CLOUD", "MYVK_SKY_CLOUD_COLOR", "MYVK_SKY_CLOUD_SCALE",
+    "MYVK_SKY_HORIZON", "MYVK_SKY_PRESET", "MYVK_SKY_STAR", "MYVK_SKY_SUN",
 }
 # ③ 诊断 dump（`*_DBG`）。`*_DUMP` 同义：只打日志、不改行为，
 #    与 `MYVK_PHYS_DUMP=<N>`（每 N 帧一行 `PHYS-BODY`）是同一类。

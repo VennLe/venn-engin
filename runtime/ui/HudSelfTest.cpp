@@ -119,7 +119,7 @@ void testHealthNumeric() {
 // ---------------------------------------------------------------- 伤害数字
 
 void testPopups() {
-    std::printf("-- 伤害数字：寿命 / 对象池\n");
+    std::printf("-- 伤害数字：寿命 / 合并 / 对象池\n");
 
     {
         HudModel m;
@@ -127,20 +127,51 @@ void testPopups() {
         const bool born = m.popups.size() == 1;
         advance(&m, 0.5f);
         const bool aliveMid = m.popups.size() == 1;
-        advance(&m, 0.6f);   // 合计 1.1s > kPopupLife(1.0)
+        // Damage 的寿命在 `popupStyle(Damage).life`（0.85s），不是写死的 1.0
+        advance(&m, 0.4f);   // 合计 0.9s > 0.85
         check("hud_popup_life", born && aliveMid && m.popups.empty(),
               fmt("mid=%.0f end=%.0f", aliveMid ? 1.0 : 0.0,
                   static_cast<double>(m.popups.size())));
     }
 
     {
+        // 合并：同一点、同一瞬间的多次伤害 → 一条 "37 x3"。
+        // ⚠ 这是 P3-4 的**新语义**（老版本会得到三条互相盖住的数字）。
+        HudModel m;
+        m.addPopup(glm::vec3(0.0f), 12.0f);
+        m.addPopup(glm::vec3(0.0f), 12.0f);
+        m.addPopup(glm::vec3(0.0f), 13.0f);
+        const bool one = m.popups.size() == 1;
+        const bool combo = one && m.popups.items()[0].combo == 3 &&
+                           std::fabs(m.popups.items()[0].amount - 37.0f) < 1e-3f;
+        const std::string txt =
+            one ? gameplay::DamageNumberLayer::formatText(m.popups.items()[0])
+                : std::string("?");
+        check("hud_popup_merge", one && combo && txt == "37 x3",
+              std::string("size=") + std::to_string(m.popups.size()) +
+                  " txt=" + txt);
+    }
+
+    {
+        // 不合并（`merge=false`）：调试/自检需要"每次都单独一条"。
+        HudModel m;
+        m.addPopup(glm::vec3(0.0f), 5.0f, gameplay::PopupKind::Damage, false);
+        m.addPopup(glm::vec3(0.0f), 5.0f, gameplay::PopupKind::Damage, false);
+        check("hud_popup_no_merge", m.popups.size() == 2,
+              fmt("size=%.0f", static_cast<double>(m.popups.size())));
+    }
+
+    {
         // 池满：替换而不是无限增长，且**最新的那条一定在**。
+        // ⚠ 位置必须错开：同一位置同一瞬间会合并成一条（见上一条），
+        //   那样这里测的是"合并"而不是"池子"。
         HudModel m;
         for (int i = 1; i <= 40; ++i)
-            m.addPopup(glm::vec3(0.0f), static_cast<float>(i));
+            m.addPopup(glm::vec3(static_cast<float>(i) * 3.0f, 0.0f, 0.0f),
+                       static_cast<float>(i));
         bool newest = false;
         bool oldest = false;
-        for (const auto& p : m.popups) {
+        for (const auto& p : m.popups.items()) {
             if (std::fabs(p.amount - 40.0f) < 1e-3f) newest = true;
             if (std::fabs(p.amount - 1.0f) < 1e-3f) oldest = true;
         }

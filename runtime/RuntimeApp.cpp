@@ -3,16 +3,21 @@
 #include "assets/AssetManager.h"
 #include "assets/ModelOrientation.h"
 #include "assets/AssetPath.h"
+#include "nav/NavBake.h"        // C8：导航网格烘焙
+#include "nav/NavSerialize.h"   // C8：`.vnav.json` 读写
 #include "assets/Model.h"
 #include "animation/TransformClip.h"   // C5：实体 TRS 轨道的运行时消费者
 #include "animation/ExpressionDriver.h" // B6：表情预设 + 眨眼/口型驱动
 #include "core/Build.h"
+#include "core/CpuProfiler.h"
 #include "core/Input.h"
 #include "core/Logger.h"
 #include "dialogue/DialogueSystem.h"
 #include "ecs/Components.h"
 #include "i18n/I18n.h"
 #include "physics/PhysicsWorld.h"
+#include "project/CardSource.h"   // P3-1：配表 → 卡牌定义（换场景时灌进牌堆）
+#include "project/DataTable.h"    // P3-1：配表四动词（script 的 tableNum/…）
 #include "scene/CameraMove.h"   // 镜头光学换算（fStop→光圈 / 快门角→模糊）
 #include "scene/CameraSystem.h"
 #include "scene/ModelInstance.h"
@@ -22,7 +27,10 @@
 #include "script/ScriptEngine.h"
 #include "script/ScriptRuntime.h"
 #include "sequence/SequencerSystem.h"
+#include "fx/AnimEventRouter.h"   // P1：动画事件 → 特效（与编辑器同一份路由）
 #include "ui2/UiCanvas.h"
+#include "ui2/UiAction.h"     // 文档层动作：解析（纯函数）
+#include "ui2/UiDocInput.h"  // 文档层动作：命中 / 按下松开
 
 #include <GLFW/glfw3.h>
 
@@ -638,6 +646,13 @@ void RuntimeApp::onInit() {
     if (m_cfg.fullscreen) window().setFullscreen(true);
 
     // ---- 脚本运行时（S0）----
+    //
+    // ⚠ P1：`setupFxSinks()` 必须排在 `installScriptServices()` **之前**。
+    //   脚本那几条动作（`shake` / `hitstop`）是**调用时**转调
+    //   `m_fx.sinks()`，所以顺序本身不致命；但"先装 sink 再接线"能让
+    //   "sink 是空的"这种状态根本不存在 —— 有些宿主是把 sink 引用
+    //   拷进去的，那时顺序就是致命的，别赌。
+    setupFxSinks();
     m_scriptRuntime = std::make_unique<vks::ScriptRuntime>();
     m_scripts = &m_scriptRuntime->engine();
     installScriptServices();
@@ -715,6 +730,10 @@ void RuntimeApp::onInit() {
     spawnPlayerFromGameStart(activeScene(), assets(), m_cfg.player,
                              m_binding.world ? m_binding.world->heightfield()
                                              : nullptr);
+    // C8：装配导航（读资产 → 读不到就现场烘）。必须在玩家**建好之后**
+    // （兜底范围以玩家为中心）、在 `attach` **之前**（attach 要 heightfield，
+    // 顺序不能倒）。
+    setupNav();
 
     // ---- 玩家（G10）：场景里有角色控制器才接管 ----
     m_player = std::make_unique<PlayerController>(m_input);
@@ -787,6 +806,17 @@ void RuntimeApp::onInit() {
                 {[this](const std::string& p) { return m_audio.playVoice(p); },
                  [this] { return m_audio.voicePlaying(); }});
         }
+
+        // ---- C7：旗标仓库 ----
+        // 剧情分支与"选项写旗标"都要读写宿主那张 `m_flags`。
+        // `writer` 记 `"dialogue"` —— 调旗标表时能一眼看出这一项是剧本
+        // 写进去的（与 `"ui"` / 脚本路径并列）。
+        // ⚠ 装在这里与语音同一条理由：必须早于任何 `start()`。
+        dlg.setFlagStore(
+            [this](const std::string& n) { return m_flags.get(n); },
+            [this](const std::string& n, double v) {
+                m_flags.set(n, v, "dialogue");
+            });
     }
 
     // ---- 服务面接线 ----
@@ -851,6 +881,11 @@ void RuntimeApp::onInit() {
     };
     m_svc.renderWorld = [this] {
         m_renderedWorldThisFrame = true;
+        // 运行时自己画帧（ownsFrameRendering()==true），Application 那层的
+        // `kRender` 作用域套不到这里 —— 所以这条路径必须自己打，否则
+        // `Game.exe` 的 CPU-STATS 里 render 恒为 0，而 wait/record 却有数，
+        // 看起来像"渲染不花时间但录制很贵"。
+        VK_CPU_SCOPE(core::CpuProfiler::kRender);
         renderer().drawFrame(activeScene());
     };
     m_svc.timeScale = m_cfg.timeScale;
@@ -896,6 +931,10 @@ void RuntimeApp::onInit() {
         }
     }
 
+    // ---- P1：特效的四条出口（震屏 / 音效 / 闪白 / 顿帧）----
+    // 在 `onInit` 里、`installScriptServices()` 之前装好（见那里的注释）。
+    // 这里只管绘制侧的最后一层：命中闪白（见下面的 ④）。
+
     // ---- 游戏 UI 的绘制挂点（U6/U8）----
     // `engine` 不认识 `runtime`（分层是 runtime → engine），所以由这里把
     // "画什么"注进去。回调在 Post 输出 pass 内、ImGui 之前被调用。
@@ -919,9 +958,14 @@ void RuntimeApp::onInit() {
         // 是**交互层**，永远压在它上面（否则文档里一个满屏面板会把菜单吞掉）。
         if (m_uiDoc.valid) {
             buildUiBindings();
+            // 交互**先于**绘制：命中测试要用的矩形与绘制用的是同一份
+            // bindings，所以两边算出来的 `placed` 逐条相同。
+            // ⚠ 派发在这里（而不是 onUpdate 里）：只有这里知道输出尺寸，
+            //   而命中测试在"参考像素 → 输出像素"上做，没有尺寸就没法判。
+            tickUiDocInput(w, h);
             const ui2::UiDocDrawStats docStats =
                 ui2::drawDocument(c, m_uiDoc, m_uiBindings, w, h,
-                                  ui2::frameFont());
+                                  ui2::frameFont(), &m_uiDocInput.state());
             // 锚点节流：**第 1 帧** + 之后每 60 帧一行 `UIDOC-BOUNDS` 加一行
             // `UIDOC-STATS`。
             //
@@ -984,6 +1028,28 @@ void RuntimeApp::onInit() {
         // ③ 暂停菜单盖在最上面
         if (m_lastUiState > 0)
             m_pause.build(c, w, h, ui2::frameFont(), m_focus.focusId());
+
+        // ④ 命中闪白（P1）—— 画在**所有 UI 之上**。
+        //
+        // ⚠ 为什么不新开一个渲染 pass：一次"闪一下"只需要一层半透明矩形，
+        //   而新 pass 意味着描述符集 / 顺序 / 帧资源三处要同步改（老坑）。
+        //   UI canvas 的最后一次 draw 天然就是"盖住一切"。
+        // ⚠ 强度**线性**衰减：`flashDuration` 与"闪了多久"严格对应，
+        //   判据（`FX-RT-FLASH end`）才有意义。加 ease-out 会让判据只能
+        //   靠肉眼。
+        if (m_fxFlashLeft > 0.0f && m_fxFlashStrength > 0.0f) {
+            const float k = (m_fxFlashTotal > 0.0f)
+                                ? (m_fxFlashLeft / m_fxFlashTotal) : 0.0f;
+            const int a = static_cast<int>(
+                std::clamp(m_fxFlashStrength * k, 0.0f, 1.0f) * 255.0f);
+            if (a > 0) {
+                c.rect(0.0f, 0.0f, static_cast<float>(w),
+                       static_cast<float>(h),
+                       ui2::rgba(static_cast<int>(m_fxFlashColor.x * 255.0f),
+                                 static_cast<int>(m_fxFlashColor.y * 255.0f),
+                                 static_cast<int>(m_fxFlashColor.z * 255.0f), a));
+            }
+        }
     });
 
     VK_LOG_INFO("GAME-INIT ready — state=%s entities=%zu bodies=%d scripts=%zu",
@@ -1003,8 +1069,11 @@ void RuntimeApp::onInit() {
 //   与一次 `std::map` 遍历同量级。
 void RuntimeApp::buildUiBindings() {
     m_uiBindings.clear();
+    // ⚠ 值是 `scene::FlagEntry`（值 + 谁写的），不是裸 double ——
+    //   写 `kv.second` 会静默走 `FlagEntry` 的隐式转换（不存在）而报错，
+    //   所以这里显式取 `.value`。
     for (const auto& kv : m_flags.entries())
-        m_uiBindings.setNumber(kv.first, static_cast<float>(kv.second));
+        m_uiBindings.setNumber(kv.first, static_cast<float>(kv.second.value));
 
     // 保留名放最后 = **HUD 口径优先**：旗标里也可以叫 `health`（某些玩法会这么
     // 写），但界面上的 `{health}` 必须是血条那个数 —— 否则血条与数字不一致，
@@ -1015,6 +1084,148 @@ void RuntimeApp::buildUiBindings() {
     m_uiBindings.setNumber("healthRatio", m_hudModel.healthRatio());
     m_uiBindings.setNumber("ammo", static_cast<float>(m_hudModel.ammo));
     m_uiBindings.setText("hint", m_hudModel.hint);
+}
+
+// ---------------------------------------------------------------- 文档层交互
+//
+// 这一段的来由：在 2026-11-02 之前 `.ui.json` 的按钮是**纯装饰** ——
+// `drawDocument` 会画，但没有任何命中测试，`UiWidget` 里也没有 `action`
+// 这个字段（`grep -rn action engine/ui2/` → 0）。作者摆出来的按钮点不动，
+// 而唯一能点的 `UiButton` 是暂停菜单那条硬编码路径，两者不通。
+//
+// 分工（与 `UiAction.h` 一致）：
+//   `ui2::UiDocInput`  —— 命中 / 按下 / 松开 → 产出 action **字符串**
+//   `ui2::parseUiAction` —— 字符串 → 动词（纯函数，能自检）
+//   **这里**            —— 动词 → 真效果（旗标表 / 音频 / 退出）
+// 引擎不认识旗标表（它在 runtime），所以执行只能落在这里。
+
+void RuntimeApp::dispatchUiAction(const std::string& text) {
+    ui2::UiAction a;
+    std::string err;
+    if (!ui2::parseUiAction(text, a, &err)) {
+        // 写错的 action 在加载时已经被降级成 warning（见 parseUiDocument），
+        // 走到这里说明是运行期才拼出来的串 —— 同样只留痕，不中断。
+        VK_LOG_WARN("UIDOC-ACTION bad=%s err=%s", text.c_str(), err.c_str());
+        return;
+    }
+    switch (a.kind) {
+        case ui2::UiActionKind::None:
+            VK_LOG_INFO("UIDOC-ACTION kind=none text=%s", text.c_str());
+            break;
+        case ui2::UiActionKind::Flag:
+            m_flags.set(a.key, a.value, "ui");
+            VK_LOG_INFO("UIDOC-ACTION kind=flag key=%s value=%.4f flags=%d",
+                        a.key.c_str(), a.value,
+                        static_cast<int>(m_flags.size()));
+            break;
+        case ui2::UiActionKind::Toggle: {
+            const double cur = m_flags.get(a.key);
+            const double next = (cur != 0.0) ? 0.0 : 1.0;
+            m_flags.set(a.key, next, "ui");
+            VK_LOG_INFO("UIDOC-ACTION kind=toggle key=%s value=%.0f", a.key.c_str(),
+                        next);
+            break;
+        }
+        case ui2::UiActionKind::Sound: {
+            const bool ok = m_audio.playOneShot(a.key, audio::BusId::SFX,
+                                                nullptr, 1.0f);
+            VK_LOG_INFO("UIDOC-ACTION kind=sound clip=%s ok=%d", a.key.c_str(),
+                        ok ? 1 : 0);
+            break;
+        }
+        case ui2::UiActionKind::Quit:
+            // ⚠ 只置**意图位**：真正退出由 loop 在 tick 之后执行
+            //   （与 `popRequested` 同一条约定 —— 不在回调里改栈 / 关窗口）。
+            m_svc.quitRequested = true;
+            VK_LOG_INFO("UIDOC-ACTION kind=quit");
+            break;
+        default:
+            break;
+    }
+}
+
+bool RuntimeApp::cursorToOutput(float& px, float& py, uint32_t outW,
+                                uint32_t outH) {
+    if (outW == 0 || outH == 0) return false;
+    double cx = 0.0, cy = 0.0;
+    core::Input::cursorPos(&cx, &cy);
+    int winW = 1, winH = 1;
+    window().windowSize(&winW, &winH);
+    if (winW <= 0 || winH <= 0) return false;
+    px = static_cast<float>(cx * static_cast<double>(outW) / winW);
+    py = static_cast<float>(cy * static_cast<double>(outH) / winH);
+    return true;
+}
+
+bool RuntimeApp::uiDocHitAt(float px, float py, std::string* idOut) {
+    if (!m_uiDoc.valid) return false;
+    const VkExtent2D out = renderer().uiOutputExtent();
+    if (out.width == 0 || out.height == 0) return false;
+    const std::vector<ui2::UiDocPlaced> placed =
+        ui2::placeDocument(m_uiDoc, m_uiBindings, out.width, out.height);
+    const std::string id = ui2::hitTestDocument(placed, px, py);
+    if (id.empty()) return false;
+    if (idOut) *idOut = id;
+    return true;
+}
+
+void RuntimeApp::tickUiDocInput(uint32_t outW, uint32_t outH) {
+    if (!m_uiDoc.valid || outW == 0 || outH == 0) return;
+    ++m_uiDocInputFrames;
+
+    // ---- 注入的点击（自动化）----
+    // 每 30 帧一发，第 20 帧起 —— 给字体图集 / 首帧布局留出余量，也让
+    // 多点点击在日志里分得开（同一帧连点两个位置只能有一个生效，而那
+    // 种"最后一个赢"的行为与真实鼠标不符）。
+    if (!m_uiDocClicksParsed) {
+        m_uiDocClicksParsed = true;
+        if (const char* env = std::getenv("MYVK_RUNTIME_UICLICK")) {
+            const std::string all(env);
+            std::size_t pos = 0;
+            while (pos < all.size()) {
+                const std::size_t semi = all.find(';', pos);
+                const std::string one =
+                    all.substr(pos, semi == std::string::npos ? std::string::npos
+                                                              : semi - pos);
+                double rx = 0.0, ry = 0.0;
+                if (std::sscanf(one.c_str(), "%lf,%lf", &rx, &ry) == 2) {
+                    m_uiDocClicks.emplace_back(static_cast<float>(rx),
+                                               static_cast<float>(ry));
+                }
+                if (semi == std::string::npos) break;
+                pos = semi + 1;
+            }
+        }
+    }
+    if (m_uiDocClickNext < static_cast<int>(m_uiDocClicks.size()) &&
+        m_uiDocInputFrames >= 20 + 30 * m_uiDocClickNext) {
+        const auto& c = m_uiDocClicks[static_cast<std::size_t>(m_uiDocClickNext)];
+        ++m_uiDocClickNext;
+        m_uiDocInput.requestClickRef(c.first, c.second, outW, outH);
+    }
+
+    // ---- 真鼠标 ----
+    // ⚠ 鼠标被捕获（第一人称）时不参与：那时指针是"准星"，点左键是开枪，
+    //   顺手把界面按钮按掉是最糟的一种交互 bug。
+    float px = 0.0f;
+    float py = 0.0f;
+    bool down = false;
+    bool pressed = false;
+    bool released = false;
+    if (!m_uiDocInput.hasPendingClick() && !m_mouseCaptured) {
+        if (cursorToOutput(px, py, outW, outH)) {
+            down = core::Input::mouseDown(GLFW_MOUSE_BUTTON_LEFT);
+            pressed = core::Input::mousePressed(GLFW_MOUSE_BUTTON_LEFT);
+            released = m_uiDocMouseDownPrev && !down;
+        }
+        m_uiDocMouseDownPrev = down;
+    }
+
+    const std::vector<ui2::UiDocPlaced> placed =
+        ui2::placeDocument(m_uiDoc, m_uiBindings, outW, outH);
+    const ui2::UiDocInput::Result r =
+        m_uiDocInput.update(m_uiDoc, placed, px, py, down, pressed, released);
+    if (!r.id.empty() && !r.action.empty()) dispatchUiAction(r.action);
 }
 
 void RuntimeApp::loadStartScene() {
@@ -1220,6 +1431,10 @@ void RuntimeApp::applyPendingSceneSwitch() {
     spawnPlayerFromGameStart(activeScene(), assets(), m_cfg.player,
                              m_binding.world ? m_binding.world->heightfield()
                                              : nullptr);
+    // C8：装配导航（读资产 → 读不到就现场烘）。必须在玩家**建好之后**
+    // （兜底范围以玩家为中心）、在 `attach` **之前**（attach 要 heightfield，
+    // 顺序不能倒）。
+    setupNav();
     m_player = std::make_unique<PlayerController>(m_input);
     const bool attached =
         m_player->attach(activeScene(), m_binding.world.get());
@@ -1347,6 +1562,108 @@ void RuntimeApp::buildPhysics() {    // 与编辑器**同一份**绑定逻辑（
                 m_binding.materials, m_binding.rigidEntities);
 }
 
+// ============================================================
+// C8 导航
+// ============================================================
+
+void RuntimeApp::setupNav() {
+    m_nav.clearGrid();
+
+    // ① 作者烘好的网格资产优先。命名约定与场景文件同名：
+    //    `scenes/main.json` → `nav/main.vnav.json`。
+    //    ⚠ 用**资产**而不是每次现场烘：烘焙要射线，射线要物理世界，而
+    //      物理的开关/地面参数都是场景设置 —— 现场烘的话"作者机器上能过去
+    //      的路"在玩家机器上可能不通，那种 bug 没法复现。
+    std::string stem;
+    {
+        const std::string& sp = m_cfg.scenePath;
+        const std::size_t slash = sp.find_last_of("/\\");
+        const std::string file = (slash == std::string::npos) ? sp : sp.substr(slash + 1);
+        const std::size_t dot = file.find_last_of('.');
+        stem = (dot == std::string::npos) ? file : file.substr(0, dot);
+    }
+    if (!stem.empty()) {
+        const std::string rel = "nav/" + stem + ".vnav.json";
+        const std::string full = assets::resolveAssetPath(rel);
+        std::ifstream in(full);
+        if (in.is_open()) {
+            nlohmann::json j;
+            std::string err;
+            nav::NavGrid g;
+            bool ok = false;
+            try {
+                in >> j;
+                ok = nav::navGridFromJson(j, g, err);
+            } catch (const std::exception& e) {
+                err = e.what();
+            }
+            if (ok) {
+                const std::size_t walk = g.walkableCount();
+                const int cols = g.cols;
+                const int rows = g.rows;
+                m_nav.setGrid(std::move(g));
+                VK_LOG_INFO("GAME-NAV source=asset path=%s cols=%d rows=%d walk=%zu", rel.c_str(),
+                            cols, rows, walk);
+                return;
+            }
+            // 资产坏了**继续走兜底**（而不是留一张空网）：坏文件不该让整关
+            // 的 NPC 集体静止，日志里已经说清了。
+            VK_LOG_WARN("GAME-NAV asset-invalid path=%s error=%s (falling back to bake)",
+                        rel.c_str(), err.c_str());
+        }
+    }
+
+    // ② 兜底：现场烘。范围以**玩家**为中心。
+    //
+    // ⚠ 这里扫的是"第一个带 `CharacterControllerComponent` 的实体"，不是
+    //   `m_player->entity()` —— `setupNav()` 排在 `PlayerController::attach`
+    //   **之前**（attach 要读物理世界的 heightfield，顺序不能倒），那时
+    //   `m_player` 还是空指针。而玩家实体本身在 `spawnPlayerFromGameStart`
+    //   里就已经建好了，所以扫得到。
+    glm::vec3 center(0.0f);
+    bool foundCenter = false;
+    activeScene().world().each<ecs::CharacterControllerComponent, ecs::TransformComponent>(
+        [&](ecs::Entity, ecs::CharacterControllerComponent& cc, ecs::TransformComponent& tr) {
+            if (foundCenter || !cc.enabled) return;
+            center = tr.position;
+            foundCenter = true;
+        });
+    nav::NavGridDesc d;
+    d.cellSize = 0.5f;
+    d.min = glm::vec3(center.x - 24.0f, center.y - 24.0f, center.z - 4.0f);
+    d.max = glm::vec3(center.x + 24.0f, center.y + 24.0f, center.z + 24.0f);
+    if (const char* cells = std::getenv("MYVK_NAV_CELL")) {
+        const float c = static_cast<float>(std::atof(cells));
+        if (c > 0.05f) d.cellSize = c;
+    }
+    nav::NavGrid g;
+    const nav::NavBakeStats st = nav::bakeFromPhysics(d, m_binding.world.get(), g);
+    if (!st.usable()) {
+        // 没有物理世界（场景关了物理）或一格都站不住 —— 都不是错误，
+        // 但**必须说出来**：否则症状是"NPC 一动不动"，一路无错。
+        VK_LOG_INFO("GAME-NAV source=none walk=0 bodies=%d (agents will idle)", m_binding.bodies);
+        return;
+    }
+    m_nav.setGrid(std::move(g));
+    VK_LOG_INFO("GAME-NAV source=bake walk=%d %s", st.walk, nav::bakeSummary(st).c_str());
+}
+
+void RuntimeApp::tickNav(float dt) {
+    if (!m_nav.hasGrid()) return;
+    const int moved = m_nav.tick(activeScene(), dt);
+    // 每帧一行会把日志刷爆；只在"这一帧有代理真的动了"且跨过 1 秒时打。
+    static float acc = 0.0f;
+    acc += dt;
+    if (acc >= 1.0f) {
+        acc = 0.0f;
+        const nav::NavSystem::Stats& s = m_nav.stats();
+        if (s.agents > 0) {
+            VK_LOG_INFO("GAME-NAV tick agents=%d moving=%d arrived=%d failed=%d expanded=%d",
+                        s.agents, moved, s.arrived, s.failed, s.expanded);
+        }
+    }
+}
+
 void RuntimeApp::preloadScripts() {
     if (!m_scripts) return;
     m_scripts->clear();
@@ -1413,12 +1730,22 @@ void RuntimeApp::onUpdate(float dt) {
     cb.pollInput = [this] { tickUi(1.0f / 60.0f); };
     // ② 固定步：状态栈按 blocksUpdate 决定谁收到
     cb.fixedUpdate = [this](float step) {
+        // ⚠ 这两个回调才是"游戏逻辑"。**不能**在 Application 那层对
+        //   `onUpdate` 整体打一个 kLogic：运行时的 `onUpdate` 是**整个
+        //   GameLoop::tick**（含下面的 ④ 渲染），那样 logic 会把 render
+        //   也算进去 —— 堆叠条重复计数，两段加起来超过 100%。
+        VK_CPU_SCOPE(core::CpuProfiler::kLogic);
         m_svc.frame = time().frameCount();
         m_stateStack.update(m_svc, step);
     };
     // ③ 变量更新
     cb.variableUpdate = [this](float vdt) {
+        VK_CPU_SCOPE(core::CpuProfiler::kLogic);
         if (m_svc.updateVariable) m_svc.updateVariable(vdt);
+        // P1：特效池推进 + 闪白递减。放在这里（每帧一次、**真实** vdt）：
+        // 特效的"播完没有"是墙上时间，被 timeScale / 顿帧压低的那个 dt
+        // 会让火花在屏幕上多待 16 倍时长。
+        tickFx(vdt);
     };
     // ④ 渲染
     cb.render = [this] {
@@ -1426,8 +1753,10 @@ void RuntimeApp::onUpdate(float dt) {
         // 本帧没有任何状态画世界（例如不透明的 MainMenu 在栈顶）→ 仍然
         // 提交一帧空场景：ImGui 的帧必须闭环，交换链也要推进，
         // 否则窗口会一直停在上一帧（甚至第一帧都没呈现过）。
-        if (!m_renderedWorldThisFrame && m_menuScene)
+        if (!m_renderedWorldThisFrame && m_menuScene) {
+            VK_CPU_SCOPE(core::CpuProfiler::kRender);
             renderer().drawFrame(*m_menuScene);
+        }
     };
 
     m_loop.tick(dt, focused, cb);
@@ -1608,14 +1937,35 @@ void RuntimeApp::tickUi(float dt) {
     // ---- ①b 点击视口 → 进入操作态（P5）----
     //
     // 只有 Gameplay 且未捕获时才收这个左键：暂停菜单里的点击属于 UI。
-    // 命中区域就是整个客户区 —— 游戏态没有吃点击的 UI（HUD 的血条只是
-    // 绘制，没有交互）。将来加可点击 HUD 时，这里要换成 ui2 的 hit test。
+    //
+    // ⚠⚠ 加 UI 文档交互（2026-11-02）之后，这里**必须先问文档层**。
+    //   原来注释写的是"游戏态没有吃点击的 UI"，而 `.ui.json` 一出现这个
+    //   前提就不成立了：不定这一条的话，Playing 下的左键**先**被这里吃成
+    //   `m_mouseCaptured = true`（顺手把光标藏了），下一帧 `tickUiDocInput`
+    //   看到 `m_mouseCaptured` 就整段跳过真鼠标 —— 于是"文档里的按钮点了
+    //   没反应"，而**注入点击照样能点**（它走的是排队那条路，不看捕获位）。
+    //   这正是 `UiDocInput.h` 里警告的那种分叉，且只有真鼠标能暴露出来。
+    //
+    // 判据用"这一帧的指针是否落在可交互控件上"，与绘制/命中同源
+    // （同一个 `uiDocHitAt`）。点在空白处 = 玩家的意图仍是"进入操作态"。
     if (!paused && !m_mouseCaptured && core::Input::mousePressed(0)) {
-        m_mouseCaptured = true;
-        m_mouseIdleLogged = false;          // 下次退出操作时再提示一次
-        window().setCursorVisible(false);   // DISABLED = 隐藏 + 锁定 + 无限转
-        VK_LOG_INFO("GAME-MOUSE captured=1 reason=click "
-                    "(WASD on / cursor hidden; Esc releases)");
+        float hx = 0.0f;
+        float hy = 0.0f;
+        std::string hitId;
+        const bool onUi = cursorToOutput(hx, hy, outW, outH) &&
+                          uiDocHitAt(hx, hy, &hitId);
+        if (onUi) {
+            // 不捕获、不藏光标：这一下属于界面。放过它，让文档层的
+            // 按下/松开沿去处理（同帧的 `tickUiDocInput` 会看到 press 沿）。
+            VK_LOG_INFO("GAME-MOUSE captured=0 reason=ui-doc id=%s",
+                        hitId.c_str());
+        } else {
+            m_mouseCaptured = true;
+            m_mouseIdleLogged = false;      // 下次退出操作时再提示一次
+            window().setCursorVisible(false);  // DISABLED = 隐藏 + 锁定 + 无限转
+            VK_LOG_INFO("GAME-MOUSE captured=1 reason=click "
+                        "(WASD on / cursor hidden; Esc releases)");
+        }
     }
     if (paused && m_mouseCaptured) {
         // 兜底：任何绕过 state 变化的路径（脚本强切状态栈）都不该留在捕获态
@@ -1955,6 +2305,36 @@ void RuntimeApp::tickPlayerAnimation(float dt) {
 void RuntimeApp::simulate(float dt) {
     ++m_simFrames;
 
+    // ---- 顿帧（P1）----
+    //
+    // 位置在**所有仿真之前**：顿帧的语义是"整个世界慢下来"，脚本、玩家、
+    // 物理、动画都该吃这一刀。
+    //
+    // ⚠ 计时器用 `rawDt`（= 进函数时的固定步，已含 timeScale），**不是**
+    //   被压低的 `dt`。用压低的那个会形成正反馈：倍速被自己压低 → 计时器
+    //   变慢 → 0.15 秒的停顿拖成 2.5 秒；写成 `dt = 0` 则永远走不完
+    //   （固定步不推进、渲染照常 = 卡死）。
+    // ⚠ 这里是**固定步**内部：一帧可能跑多个 step，每个 step 减一次 rawDt，
+    //   总和正好等于真实经过的仿真时间。
+    const float rawDt = dt;
+    if (m_hitstopLeft > 0.0f) {
+        dt *= fx::kHitstopScale;   // 与编辑器同一个系数（0.06，不是 0）
+        m_hitstopElapsed += rawDt;
+        ++m_hitstopFrames;
+        m_hitstopLeft = std::max(0.0f, m_hitstopLeft - rawDt);
+        if (m_hitstopLeft <= 0.0f) {
+            VK_LOG_INFO("FX-RT-HITSTOP end total=%.3f elapsed=%.3f frames=%d "
+                        "reqs=%d minScale=%.3f",
+                        static_cast<double>(m_hitstopTotal),
+                        static_cast<double>(m_hitstopElapsed), m_hitstopFrames,
+                        m_hitstopReqs, static_cast<double>(fx::kHitstopScale));
+            m_hitstopTotal = 0.0f;
+            m_hitstopElapsed = 0.0f;
+            m_hitstopFrames = 0;
+            m_hitstopReqs = 0;
+        }
+    }
+
     // HUD 数据跟着**游戏时间**走（不是真实帧时长）：暂停时 Paused 截断
     // 下层 update → simulate 不跑 → 伤害数字冻在屏幕上，那是对的
     // （画面定住了，数字还在往上飘会很怪）。
@@ -1993,6 +2373,16 @@ void RuntimeApp::simulate(float dt) {
     m_animator.setStrideCurve(m_cfg.player.strideCurve);
     m_animator.tick(activeScene(), dt);
 
+    // ---- 动画事件 → 特效（P1）----
+    // 紧跟 `m_animator.tick`：事件只在**这一帧**有效（下一帧 tick 开头就清空），
+    // 隔一帧读就是"永远读到空" —— 而症状是"事件表配了但没反应"。
+    dispatchAnimEventsThisFrame();
+
+    // ---- 卡牌表现（P3-4）----
+    // ⚠ 必须排在 `runScripts` **之后**：`castCard` 是脚本调的，事件在这一帧
+    //   才进队列；排前面就要等下一帧，症状是"打完牌的飘字慢半拍"。
+    dispatchCardFx();
+
     // ---- 实体 TRS 轨道（C5，2026-10-31）----
     // 门 / 电梯 / 升降平台 / 旋转机关。数据一直在场景里（`animClip` 段 +
     // `autoplay`），但**运行时从来没有消费者** —— 只有编辑器在选中该项、
@@ -2004,6 +2394,13 @@ void RuntimeApp::simulate(float dt) {
     //   站着的角色会被平台甩下。
     // ⚠ 与 `m_animator` 顺序无关（一个动 joints、一个动 TRS，字段不重叠）。
     anim::tickTransformClips(activeScene(), dt);
+
+    // ---- 导航代理（C8）----
+    // ⚠ 必须排在**物理之前**：无胶囊的代理直接写 Transform（物理的
+    //   `syncKinematicFromScene` 会读它），有胶囊的代理写的是**期望速度**
+    //   （物理这一步才积分）。排在物理之后 = 代理永远晚一帧，追赶玩家时
+    //   会看到明显的"跟着影子走"。
+    tickNav(dt);
 
     // ---- 表情驱动（B6，2026-11-01）----
     // 排在动画之后：它写的是 `MorphComponent::weights`（形变目标权重），
@@ -2080,9 +2477,171 @@ int RuntimeApp::runScripts(float dt) {
     return static_cast<int>(m_scriptRuntime->lastStats().executed);
 }
 
+// ---------------------------------------------------------------- P1 特效
+//
+// 出包之后的打击链。三条入口里运行时只接**动画事件**这一条 ——
+// 脚本动词在 engine 侧的 `ScriptWorldActions` 已经通用了，只要宿主把
+// `playEffect` 那几个 std::function 接上（`installScriptServices` 里接）。
+
+void RuntimeApp::setupFxSinks() {
+    fx::EffectSinks s;
+
+    // ① 震屏：与编辑器同一个全局 `CameraSystem`（它自带距离衰减）
+    s.shake = [](float trauma, const glm::vec3& at, float radius) {
+        scene::activeCameraSystem().shakeAt(at, trauma, radius);
+    };
+
+    // ② 音效：3D 位置 = 命中点。走 SFX 总线，玩家在混音设置里能单独拉它。
+    s.sound = [this](const std::string& clip, float volume, float pitch,
+                     const glm::vec3& at) {
+        glm::vec3 p = at;
+        m_audio.playOneShot(clip, audio::BusId::SFX, &p.x, volume, pitch);
+    };
+
+    // ③ 闪白：一层满屏矩形，画在 UI canvas 的最后（见 game ui builder）。
+    s.flash = [this](float strength, const glm::vec3& color, float seconds) {
+        if (!(seconds > 0.0f) || !(strength > 0.0f)) return;
+        if (strength >= m_fxFlashStrength) {
+            m_fxFlashStrength = strength;
+            m_fxFlashColor = color;
+        }
+        m_fxFlashLeft = std::max(m_fxFlashLeft, seconds);
+        m_fxFlashTotal = std::max(m_fxFlashTotal, seconds);
+        VK_LOG_INFO("FX-RT-FLASH begin=%.3f strength=%.3f",
+                    static_cast<double>(seconds), static_cast<double>(strength));
+    };
+
+    // ④ 顿帧：取 max 不累加（与编辑器逐条同义，注释见 editor 那一份）
+    s.hitstop = [this](float seconds) {
+        if (!(seconds > 0.0f)) return;
+        ++m_hitstopReqs;
+        const float before = m_hitstopLeft;
+        m_hitstopLeft = std::max(m_hitstopLeft, seconds);
+        if (m_hitstopLeft > before) {
+            m_hitstopTotal = m_hitstopLeft;
+            VK_LOG_INFO("FX-RT-HITSTOP begin=%.3f reqs=%d left=%.3f",
+                        static_cast<double>(seconds), m_hitstopReqs,
+                        static_cast<double>(m_hitstopLeft));
+        }
+    };
+
+    m_fx.setSinks(s);
+}
+
+// P2：拿到挂在当前场景上的玩法运行时（换场景时重建队列）。
+scene::GameplayRuntime& RuntimeApp::gp() {
+    scene::Scene* s = &activeScene();
+    if (m_gpScene != s) {
+        m_gpScene = s;
+        m_gameplay.attach(s);
+        // ---- P3-1：配表 → 牌堆定义 ----
+        // 换场景（含读档）时新场景的牌堆里只有 `defId`。定义表是**内容**，
+        // 不进场景文件，所以必须在这里补；补完 `known=0` 才会变成 1。
+        // 只解析一次（CSV 表在整个进程里不变），换场景只做一次拷贝。
+        if (!m_cardDefsLoaded) {
+            m_cardDefsLoaded = true;
+            project::loadCardDefs(m_cardDefs);
+        }
+        if (!m_cardDefs.empty()) m_gameplay.setCardDefs(m_cardDefs);
+        m_gameplay.rebuildQueue();
+    }
+    return m_gameplay;
+}
+
+void RuntimeApp::tickFx(float realDt) {
+    // 场景可能换过（`loadScene` / 换关）→ 旧宿主实体跟着旧场景没了，
+    // `attach` 会重建池（正在播的会断，这是换场景该有的行为）。
+    m_fx.attach(&activeScene(), &assets());
+    m_fx.update(realDt);
+
+    if (m_fxFlashLeft > 0.0f) {
+        m_fxFlashElapsed += realDt;
+        m_fxFlashLeft = std::max(0.0f, m_fxFlashLeft - realDt);
+        if (m_fxFlashLeft <= 0.0f) {
+            VK_LOG_INFO("FX-RT-FLASH end total=%.3f elapsed=%.3f",
+                        static_cast<double>(m_fxFlashTotal),
+                        static_cast<double>(m_fxFlashElapsed));
+            m_fxFlashStrength = 0.0f;
+            m_fxFlashTotal = 0.0f;
+            m_fxFlashElapsed = 0.0f;
+        }
+    }
+}
+
+// 卡牌表现：把 `GameplayRuntime` 里记下的动作变成"粒子 + 震屏 + 飘字"。
+//
+// 三条必须一起做的事（少一条就是"有粒子没字"或反过来）：
+//   ① 按 `gameplay::cardFxPreset(kind)` 找到 .veffect 与飘字样式；
+//   ② 位置取**实体**的 Transform（`atTarget ? 目标 : 持牌者`），
+//      查不到就跳过整条（目标这一帧刚被销毁是常态，不能画到原点去）；
+//   ③ 飘字高度用模板里的 `height`（米），不是"头顶" —— 引擎没有头颅包围盒，
+//      而写死 1.7 在矮怪身上会飘进身体里。
+//
+// ⚠ 为什么站在这里发而 `castCard` 里不发：`GameplayRuntime` 编辑器与运行时
+//   共用，编辑器里点一下 `cards.cast` 就在场景里喷火是错的（那里没有粒子
+//   宿主，也关不掉）。
+void RuntimeApp::dispatchCardFx() {
+    std::vector<scene::CardFxEvent> evs = gp().takeCardFxEvents();
+    if (evs.empty()) return;
+
+    ecs::World& w = activeScene().world();
+    int played = 0;
+    int popped = 0;
+    int skipped = 0;
+
+    for (const scene::CardFxEvent& ev : evs) {
+        const gameplay::CardFxPreset& pre = gameplay::cardFxPreset(ev.kind);
+        const ecs::Entity who = pre.atTarget ? ev.target : ev.owner;
+        const auto* tc = who.valid() ? w.get<ecs::TransformComponent>(who)
+                                     : nullptr;
+        if (!tc) {
+            // 目标没了（或者压根没有目标）→ 这条只剩飘字也没地方落。
+            ++skipped;
+            continue;
+        }
+        const glm::vec3 at = tc->position;
+
+        if (pre.effect && pre.effect[0]) {
+            fx::EffectRequest r;
+            r.asset = pre.effect;
+            r.position = at;
+            if (m_fx.play(r) != 0) ++played;
+        }
+        if (pre.popup != gameplay::PopupKind::Count) {
+            m_hudModel.addPopup(at + glm::vec3(0.0f, 0.0f, pre.height),
+                                ev.amount, pre.popup);
+            ++popped;
+        }
+    }
+
+    // 每帧一行会把日志刷爆（一场战斗几十张牌 × 60 帧），所以只在**真的
+    // 有事件**时打，而且带上三个计数 —— "有事件但 popped=0" 正是
+    // "模板表把 popup 写成 Count 了"的唯一线索。
+    VK_LOG_INFO("GAME-CARD-FX events=%d played=%d popped=%d skipped=%d",
+                static_cast<int>(evs.size()), played, popped, skipped);
+}
+
+void RuntimeApp::dispatchAnimEventsThisFrame() {
+    const std::vector<animation::FiredAnimEvent>& evs = m_animator.eventsThisFrame();
+    if (evs.empty()) return;
+
+    const fx::AnimEventStats st = fx::dispatchAnimEvents(
+        evs, activeScene(), m_fx, m_fx.sinks());
+    VK_LOG_INFO("FX-RT-DISPATCH total=%d fx=%d sound=%d shake=%d hitstop=%d "
+                "ignored=%d failed=%d",
+                st.total, st.effects, st.sounds, st.shakes, st.hitstops,
+                st.ignored, st.failed);
+}
+
 // 宿主能力只填**一次**（S0 之前是每帧每个实体重建六个 std::function ——
 // 那是纯浪费，而且把"结构"藏进了循环里）。
 void RuntimeApp::installScriptServices() {
+    // ---- 配表（P3-1 / G5）----
+    // ⚠⚠ 必须在装服务**之前**扫一次。脚本第一帧就会调 `tableNum`，
+    //   晚一步 = 开局头几帧配表全是 0；而"表没加载"与"那格就是 0"在
+    //   脚本里长得一模一样（`tableHas` 是唯一的诊断入口）。
+    project::ensureTablesLoaded();
+
     vks::ScriptServices svc;
 
     // ---- HUD（U8）----
@@ -2152,9 +2711,17 @@ void RuntimeApp::installScriptServices() {
     // （读太频繁，每帧打会把日志淹掉）；坏情况是"脚本设的键名拼错、
     // 另一处读不到"，而那条线索正好在这行里。
     svc.act.setFlag = [this](const std::string& name, double v) {
-        m_flags.set(name, v);
-        VK_LOG_INFO("RUNTIME-FLAG set name=%s value=%.4f total=%zu",
-                    name.c_str(), v, m_flags.size());
+        // writer = 哪个脚本写的。这是旗标面板上"谁写的"那一列的唯一来源，
+        // 而它只能在写入这一刻知道（事后推断不出来）。
+        // ⚠ 命名空间要写全：`ScriptRuntime::currentScriptPath()` 返回空串
+        //   表示"当前不在任何脚本里"（宿主自检、命令行走另一条路）。
+        const char* src =
+            m_scriptRuntime ? m_scriptRuntime->currentScriptPath() : "";
+        const std::string writer =
+            (src && src[0]) ? std::string("script:") + src : std::string("host");
+        m_flags.set(name, v, writer);
+        VK_LOG_INFO("RUNTIME-FLAG set name=%s value=%.4f writer=%s total=%zu",
+                    name.c_str(), v, writer.c_str(), m_flags.size());
         return true;
     };
     svc.act.getFlag = [this](const std::string& name) {
@@ -2172,6 +2739,171 @@ void RuntimeApp::installScriptServices() {
     };
     // 掀界面（C6 第七件）：切"显示哪一份 `.ui.json`"。空串 = 关掉。
     svc.act.openUI = [this](const std::string& path) { return openUiDocument(path); };
+
+    // ---- P1 特效（运行时侧）----
+    //
+    // ⚠ 与编辑器 Play 走**同一组** engine 侧实现（`.veffect` 解析 / 宿主池 /
+    //   事件路由），但宿主各持一份 `m_fx` —— 池是"这个进程里同时在飞几个
+    //   特效"的资源，编辑器的试放不该跟游戏抢槽位。
+    // ⚠ 脚本拿到的 id 必须能 `stopEffect`：`EffectPool::clearActive()` 保留
+    //   id 计数就是为了这个（归零会让旧 id 误杀新特效）。
+    svc.act.playEffect = [this](ecs::Entity e, const std::string& path) -> uint32_t {
+        fx::EffectRequest r;
+        r.asset = path;
+        if (e.valid() && activeScene().world().alive(e)) {
+            const glm::mat4 wm = activeScene().worldMatrix(e);
+            r.position = glm::vec3(wm[3]);
+            const glm::vec3 z(wm[2]);   // Z-up：实体的"前"是局部 +Z
+            if (glm::length(z) > 1.0e-6f) r.forward = glm::normalize(z);
+        }
+        return m_fx.play(r);
+    };
+    svc.act.playEffectAt = [this](const std::string& path, glm::vec3 at) -> uint32_t {
+        fx::EffectRequest r;
+        r.asset = path;
+        r.position = at;
+        return m_fx.play(r);
+    };
+    svc.act.stopEffect = [this](uint32_t id) {
+        if (id == 0) return false;
+        m_fx.stop(id);
+        return true;
+    };
+    svc.act.shake = [this](float amount, ecs::Entity e) {
+        glm::vec3 at(0.0f);
+        if (e.valid() && activeScene().world().alive(e))
+            at = glm::vec3(activeScene().worldMatrix(e)[3]);
+        if (m_fx.sinks().shake)
+            m_fx.sinks().shake(std::clamp(amount, 0.0f, 1.0f), at, 12.0f);
+    };
+    svc.act.hitstop = [this](float seconds) {
+        if (m_fx.sinks().hitstop) m_fx.sinks().hitstop(seconds);
+    };
+    // ---- P2-6：玩法四件 ----
+    // 与编辑器同一套语义（见 EditorApp 的同一段），唯一差别是这一侧用的是
+    // **运行时的**那一份 `m_gameplay`。
+    svc.act.getAttr = [this](ecs::Entity e, const std::string& name) {
+        return gp().attr(e, name, 0.0f);
+    };
+    svc.act.gameplayHasAttr = [this](ecs::Entity e, const std::string& name) {
+        scene::GameplayRuntime& rt = gp();
+        if (!rt.scene()) return false;
+        const ecs::GameplayComponent* c =
+            rt.scene()->world().get<ecs::GameplayComponent>(e);
+        if (!c) return false;
+        for (const gameplay::AttrState& a : c->attributes) {
+            if (a.name == name) return true;
+        }
+        return false;
+    };
+    svc.act.addStatus = [this](ecs::Entity e, const std::string& which) {
+        return gp().addPresetStatus(e, which);
+    };
+    svc.act.damage = [this](ecs::Entity e, float amount, const std::string& type) {
+        scene::GameplayRuntime& rt = gp();
+        // ⚠ 没有玩法组件必须返回 **-1**，让脚本层回退到老的 HUD 扣血；
+        //   返回 0 会被当成"打不动"，老脚本（打木桶）就完全没伤害了。
+        //   也不能直接返回 `rt.lastDamage().dealt` —— 那可能是上一次的旧值。
+        if (!rt.scene()) return -1.0f;
+        if (!rt.scene()->world().get<ecs::GameplayComponent>(e)) return -1.0f;
+        gameplay::DamageSpec spec;
+        spec.amount = amount;
+        spec.type = gameplay::DamageType::Physical;
+        if (!type.empty()) gameplay::parseDamageType(type, spec.type);
+        spec.source = "script";
+        rt.damage(e, e, spec);
+        return rt.lastDamage().dealt;
+    };
+    svc.act.tickRound = [this]() {
+        scene::GameplayRuntime& rt = gp();
+        rt.tickTurn();
+        return rt.lastDotCount();
+    };
+
+    // ---- 卡牌（P3-4）----
+    //
+    // `castCard` 只记账（`GameplayRuntime` 里 push 事件），表现由
+    // `dispatchCardFx()` 在这一帧末尾统一播 —— 那条路同时负责粒子、
+    // 震屏和飘字，三样必须**从同一份事件**出发（各写一份必然
+    // "有粒子没字"或反过来）。
+    svc.act.castCard = [this](ecs::Entity e, int idx) -> float {
+        scene::GameplayRuntime& rt = gp();
+        if (!rt.ready()) return 0.0f;
+        if (!rt.deck(e)) return 0.0f;   // 没有牌组：静默返回 0（见头注释）
+        rt.clearCardFxEvents();         // 丢掉上一帧没消费的残渣
+        const ecs::Entity target = rt.firstOtherGameplayEntity(e);
+        rt.castCard(e, idx, target);
+        return rt.lastDamage().dealt;
+    };
+    svc.act.drawCards = [this](ecs::Entity e, int n) -> int {
+        scene::GameplayRuntime& rt = gp();
+        if (!rt.ready()) return 0;
+        if (!rt.deck(e)) return 0;
+        // ⚠ 返回值必须是"**实际抽到**几张"：`cardDraw` 返回的是给人看的一行
+        //   （`draw=… hand=…`），脚本要数字。解析那行字符串是本仓明确反对的
+        //   做法（格式一改就静默错），所以用牌堆计数差分 —— 手牌上限满了
+        //   抽不进去时返回 0，正是脚本要判断的那种情况。
+        const int before = rt.cardCount(e, gameplay::CardPile::Hand);
+        rt.cardDraw(e, n < 1 ? 1 : n);
+        return rt.cardCount(e, gameplay::CardPile::Hand) - before;
+    };
+
+    // ---- 导航四动词（C8-2）----
+    //
+    // 四个都直接落到 `m_nav` + self 的 `NavAgentComponent` 上。
+    //
+    // ⚠ `navGoto` 走 `m_nav.gotoPoint()`，它只**记目标 + 把 repathTimer 归零**
+    //   （下一帧强制求路）。所以这里返回的是"受理"，不是"走到了" ——
+    //   真正的进展由 `tickNav()` 在物理之前推进，脚本靠
+    //   `navArrived()` / `navFailed()` 轮询。
+    // ⚠⚠ 没有网格时 `gotoPoint` 返回 **false**（目标仍然记下了，只是永远
+    //   走不动，`failed` 会一直为 1）。这条正是"脚本能分辨出是网格问题
+    //   还是路线问题"的入口 —— 传 true 会让 GAME-NAV source=none 那种
+    //   现场变成"脚本一切正常但人不动"。
+    svc.act.navGoto = [this](ecs::Entity e, glm::vec3 p) {
+        return m_nav.gotoPoint(activeScene(), e, p);
+    };
+    svc.act.navArrived = [this](ecs::Entity e) {
+        const auto* a = activeScene().world().get<ecs::NavAgentComponent>(e);
+        return a && a->reached;
+    };
+    svc.act.navFailed = [this](ecs::Entity e) {
+        const auto* a = activeScene().world().get<ecs::NavAgentComponent>(e);
+        return a && a->failed;
+    };
+    svc.act.navStop = [this](ecs::Entity e) {
+        // 没有代理组件也算"停着" —— 脚本写 `navStop()` 的本意是"别再走了"，
+        // 而不是"我要知道它有没有走路能力"。
+        m_nav.stop(activeScene(), e);
+        return true;
+    };
+
+    // ---- 配表四动词（P3-1 / G5）----
+    //
+    // 一条 `"表.行.列"` 字符串寻址（切分规则在 `project::splitTableKey`）。
+    // ⚠ 四个都要接，缺一个的后果不是报错而是**静默走 else**：
+    //   · 缺 `tableHas` → 作者没法区分"查不到"与"值就是 0"，只能瞎猜；
+    //   · 缺 `tableRows` → 遍历整张表（"给每个敌人套一遍数值"）写不出来。
+    // 引擎侧 `DataTable.cpp` 已经在这里之前被 `ensureTablesLoaded()` 扫过。
+    svc.act.tableNum = [](const std::string& key) {
+        return project::tableNum(key);
+    };
+    svc.act.tableStr = [](const std::string& key) {
+        return project::tableStr(key);
+    };
+    svc.act.tableHas = [](const std::string& key) {
+        return project::tableHas(key);
+    };
+    svc.act.tableRows = [](const std::string& name) {
+        return project::tableRows(name);
+    };
+
+    svc.act.setTimeScale = [this](float scale) -> bool {
+        // 0 是死锁（固定步永远不推进，但渲染照常）—— 与编辑器同一道门。
+        if (!(scale > 0.0f)) return false;
+        m_svc.timeScale = std::clamp(scale, 0.05f, 4.0f);
+        return true;
+    };
 
     // ---- 关节（J5-4）----
     //

@@ -134,6 +134,40 @@ enum class Builtin : uint16_t {
     Joint, JointAnchors, JointAxis, JointLimit, JointMotor,
     JointOn, JointRemove, JointKindOf, JointTargetOf,
 
+    // ---- 特效（P1-4，2026-11-02）----
+    // 五个动词，全部走 `fx::EffectService`（池化，不增删实体）。
+    //
+    // ⚠ 顺序与下面 `kBuiltins[]` 逐项对齐 —— 下标就是 enum 值，
+    //   漏一行不是"少一个能用的函数"，是**整张表错位**（`setFlag` 变成
+    //   `playEffect`），下面有 static_assert 兜住。
+    PlayEffect, StopEffect, Shake, Hitstop, SetTimeScale,
+
+    // ---- 玩法状态（P2-6，2026-11-03）----
+    // 四个动词，全部作用于 **self**：脚本里没有"选中"这个概念，把实体
+    // 当参数传会逼作者手写运行时序号（换一次加载就失效）。
+    // ⚠ 顺序必须与 `kBuiltins[]` 逐项对齐（下标就是 enum 值）。
+    GetAttr, AddStatus, TickRound,
+    // P3-1：配表四件。⚠ 同样必须与 `kBuiltins[]` **逐项对齐**，且只能在
+    // `Count_` 之前**追加** —— 在中间插一条会让后面所有动词整体错位一格
+    // （`static_assert` 只比长度，拦不住）。
+    TableNum, TableStr, TableHas, TableRows,
+
+    // ---- 卡牌（P3-4，2026-11-04）----
+    // 两件：`castCard(idx)` 打出手牌第 idx 张并**结算**（目标自动选
+    // "第一个别人"），`drawCards(n)` 抽牌。
+    //
+    // ⚠⚠ 没有这两个，"牌库 + 配表 + 表现模板"在**出包的游戏里**就没有
+    //   任何入口 —— 只有编辑器的 Debug ▸ Cards 面板能动它。而"面板点得到、
+    //   游戏里点不到"正是本项目定义的"没交付"。
+    // ⚠ 同样只能在 `Count_` 之前追加（见上一条注释）。
+    CastCard, DrawCards,
+
+    // ---- 导航（C8-2，2026-11-05）----
+    // 三件 + 一个 `navFailed`。`navArrived` 单独一个不够用：
+    // 目标在墙外时它永远是 0，`while (!navArrived())` 会永远转。
+    // ⚠ 只能在 `Count_` 之前**追加**（中间插一条会让后面整体错位一格）。
+    NavGoto, NavArrived, NavFailed, NavStop,
+
     Count_
 };
 
@@ -242,6 +276,22 @@ public:
     size_t contactIndex = 0;
     size_t hookIndex = 0;
 
+    // ---- 断点（C8）----
+    //
+    // `paused` 是**独立的**一位，不是 `State` 的新枚举值：`State` 描述的是
+    // "协程自己在等什么"（`wait` 的唤醒条件住在 `wake/wakeAt/cond` 里），
+    // 而暂停是"外面把它摁住了"。两者能同时成立（在 `wait` 里被单步？不会
+    // —— 单步停在语句之前，而 `wait` 语句自己会先推进 ip，所以暂停时
+    // 一定不在 Waiting）。做成两个枚举值反而要回答"Paused+Waiting 谁优先"。
+    bool paused = false;
+    int pauseLine = 0;
+    // 刚刚 resume 过的那一行：放行一次，避免"点继续 → 立刻又停在原地"。
+    // ⚠ 用**行号**而不是 ip：`while` 体里同一行会反复执行，ip 每次不同，
+    //   而"放行一次"的语义恰好是"下一次经过这一行时别停"。
+    int pauseSkipLine = 0;
+    // 单步：放行当前行之后，在**下一条语句**前停住。
+    bool stepPause = false;
+
     void clear() {
         state = State::Idle;
         wake = Wake::None;
@@ -254,6 +304,12 @@ public:
         phase = 0;
         contactIndex = 0;
         hookIndex = 0;
+        // ⚠ 断点**不在** clear() 里清：它在断点表里，属于用户设置，
+        //   不属于这一局执行状态。这里只清"暂停"这一状态位。
+        paused = false;
+        pauseLine = 0;
+        pauseSkipLine = 0;
+        stepPause = false;
     }
     bool waiting() const { return state == State::Waiting; }
     // 有没跑完的东西（挂起中）—— 热重载要不要对账看这个
@@ -321,7 +377,12 @@ const BuiltinInfo kBuiltins[] = {
     {"pressed", 1, 1}, {"held", 1, 1}, {"released", 1, 1}, {"axis", 1, 1},
     // S4 协程（只能单独成句）
     {"wait", 1, 1}, {"waitFrames", 1, 1}, {"waitUntil", 1, 1},
-    {"setHealth", 1, 1}, {"damage", 1, 1}, {"popup", 1, 1},
+    // ⚠⚠ `damage` 的 arity 从 1 改成 1..2（P2-6）：它仍然是 U8 的 HUD 扣血
+    //   那个动词，只是多了可选的伤害类型。**位置不许动** ——
+    //   `kBuiltins[]` 是**按位置**对应 `enum class Builtin` 的，删一条再在
+    //   末尾补一条会让从这一位起的所有内建整体错位一格（`getAttr` 会跑到
+    //   `setTimeScale` 的分支里执行），而 `static_assert` 只比长度，拦不住。
+    {"setHealth", 1, 1}, {"damage", 1, 2}, {"popup", 1, 1},
     {"playSound", 1, 1}, {"stopAllSounds", 0, 0}, {"setBusVolume", 2, 2},
     {"setColor", 3, 3}, {"setIntensity", 1, 1}, {"setRange", 1, 1},
     {"setDirection", 3, 3},
@@ -338,6 +399,28 @@ const BuiltinInfo kBuiltins[] = {
     {"joint", 3, 3}, {"jointAnchors", 3, 3}, {"jointAxis", 2, 2},
     {"jointLimit", 4, 4}, {"jointMotor", 3, 3}, {"jointOn", 2, 2},
     {"jointRemove", 1, 1}, {"jointKind", 1, 1}, {"jointTarget", 1, 1},
+    // P1-4：特效五件。`playEffect` 的位置可选（不给 = self 的位置）。
+    {"playEffect", 1, 4}, {"stopEffect", 1, 1}, {"shake", 1, 1},
+    {"hitstop", 1, 1}, {"setTimeScale", 1, 1},
+    // P2-6：玩法三件（`damage` 不在这里 —— 它与 U8 那个同名，见上面 HUD 组，
+    // 靠 arity 1..2 + 宿主返回 -1 分流出"走属性"和"走 HUD"两条路）。
+    // ⚠ 加内建动词前必须 `grep '"名字",'` 一次：同名两条的后果是查表先命中
+    //   前面那条，`damage(100,"physical")` 在**编译期**报
+    //   "expects 1 argument(s), got 2"，整份脚本 not runnable。
+    {"getAttr", 1, 1}, {"addStatus", 1, 1}, {"tickRound", 0, 0},
+    // P3-1：配表四件。key 是 `表.行.列` 的字符串（不是三个参数）——
+    // 一个字符串在脚本里更好拼（`"cards." + id + ".cost"`），也少一处
+    // "第几个参数是行"的记忆负担。
+    {"tableNum", 1, 1}, {"tableStr", 1, 1},
+    {"tableHas", 1, 1}, {"tableRows", 1, 1},
+    // P3-4：卡牌两件。`castCard(idx)` / `drawCards(n)`，都作用于 self。
+    // ⚠ 加内建动词前先 `grep '"名字",'` —— 同名两条会让**编译期**就报
+    //   arity 错误（见上面 getAttr 那段注释）。
+    {"castCard", 1, 1}, {"drawCards", 1, 1},
+    // C8-2：导航四件。`navGoto` 收三个数（与 `setDirection` 同一种写法，
+    // 不用 `vec3(...)` —— 巡逻点通常是字面量，少一层包装）。
+    {"navGoto", 3, 3}, {"navArrived", 0, 0},
+    {"navFailed", 0, 0}, {"navStop", 0, 0},
 };
 
 static_assert(sizeof(kBuiltins) / sizeof(kBuiltins[0]) ==
@@ -1124,6 +1207,7 @@ public:
     enum class Step : uint8_t {
         Continue,  // 这一条跑完了，继续
         Suspend,   // 挂起了（wait），栈留着
+        Paused,    // 断点 / 单步停住了（C8）：栈留着，ip **没有**前进
         Done,      // 栈空了（这段跑完）
         Error      // 出错
     };
@@ -1158,6 +1242,14 @@ public:
     // 绑定一个变量（钩子参数用：`on collide(other)` 的 other）
     void bind(const std::string& name, Value v) {
         m_vars[name] = std::move(v);
+    }
+
+    // 断点（C8）。空指针 = 没有断点表，`drive()` 里那两行检查直接短路。
+    // `path` 必须与断点表里存的口径一致（= `ScriptProgram::debugName()`，
+    // 也就是 `ScriptAsset` 交给 compile() 的那个相对路径）。
+    void setBreakpoints(const BreakpointSet* bp, const std::string& path) {
+        m_bps = bp;
+        m_bpPath = path;
     }
 
     // ★ S4：一段语句的执行入口。**栈里已经有东西时不再压新帧** ——
@@ -1533,6 +1625,33 @@ private:
             }
             const Stmt& st0 = *(*f.list)[f.ip];
 
+            // ---- 断点 / 单步（C8）----
+            //
+            // ⚠ 检查放在**执行之前、ip 未动之前**：于是"停住"= 什么都不做，
+            //   下一次进来还是这条语句。这是整个断点功能唯一能成立的前提 ——
+            //   任何"先执行再停"的写法都会让被停住的那条语句执行两次
+            //   （`setFlag("x", getFlag("x")+1)` 变成 +2）。
+            //
+            // ⚠⚠ 结构必须是"先判放行、再判要不要停"。写成两段独立的 if
+            //   （放行一个、再检查另一个）的话：
+            //     · 继续 → 放行标记被消费掉，紧接着断点检查又命中原行
+            //       → "点继续"原地不动，永远走不出断点；
+            //     · 单步 → 单步标记在同一行立刻生效 → 同上。
+            //   两个 bug 都表现成"按钮没反应"，而且都不会报错。
+            if (m_coro.pauseSkipLine == st0.line) {
+                m_coro.pauseSkipLine = 0;   // 放行这一次
+            } else if (m_coro.stepPause) {
+                m_coro.stepPause = false;
+                m_coro.paused = true;
+                m_coro.pauseLine = st0.line;
+                return Step::Paused;
+            } else if (m_bps && !m_bps->empty() &&
+                       m_bps->has(m_bpPath, st0.line)) {
+                m_coro.paused = true;
+                m_coro.pauseLine = st0.line;
+                return Step::Paused;
+            }
+
             switch (st0.kind) {
                 case Stmt::Kind::Block: {
                     ++f.ip;   // ⚠ 先越过自己
@@ -1811,6 +1930,9 @@ private:
     //      否则"循环里查 near"会变成"循环里 refit 全场景"。
     bool m_indexFresh = false;
     scene::Bvh* m_bvh = nullptr;
+    // C8：断点表（可空）+ 本程序在断点表里的路径口径
+    const BreakpointSet* m_bps = nullptr;
+    std::string m_bpPath;
 };
 
 // ---------------------------------------------------------------- near（S2）
@@ -2289,17 +2411,49 @@ Value Evaluator::call(Builtin b, const std::vector<Value>& a, int line) {
             return Value::number(0.0);
         }
         case Builtin::Damage: {
-            const float v = f(0, "damage");
-            if (m_host.damage) m_host.damage(v);
+            const double amount = numOf(a[0], line, "damage(amount)");
+            if (!m_err.ok()) return Value::number(0.0);
+            if (amount < 0.0) {
+                m_err.line = line;
+                m_err.message = "damage(): amount must be >= 0 (use heal for the other way)";
+                return Value::number(0.0);
+            }
+            std::string type = "physical";
+            if (a.size() >= 2) {
+                type = strOf(a[1], line, "damage(type)");
+                if (!m_err.ok()) return Value::number(0.0);
+            }
+            // ① 有玩法数值 → 走五步结算（护甲/易伤/护盾/真伤都生效），
+            //    返回**真正扣掉的血**（过量伤害不虚高）。宿主用 `-1` 表示
+            //    "目标身上没有 GameplayComponent"（0 是合法的"打不动"，
+            //    不能拿来当哨兵）。
+            if (m_host.act.damage) {
+                const float dealt = m_host.act.damage(
+                    m_host.entity, static_cast<float>(amount), type);
+                if (dealt >= 0.0f) {
+                    if (m_host.popup) {
+                        if (ecs::TransformComponent* t = xform()) {
+                            m_host.popup(t->position.x, t->position.y,
+                                         t->position.z + 1.6f, dealt);
+                        }
+                    }
+                    return Value::number(static_cast<double>(dealt));
+                }
+            }
+            // ② 回退：U8 的老行为（HUD 扣当前生命 + 头顶弹数字）。
+            //    走到这里说明目标没有玩法组件 —— 老的打木桶脚本不受影响。
+            if (m_host.damage) m_host.damage(static_cast<float>(amount));
             // 扣血默认在**当前实体头顶**弹一条数字（"击杀木桶 → 数字在
             // 木桶上方"是 U8 的验收条款）。没有 Transform 的实体只扣血。
             if (m_host.popup) {
                 if (ecs::TransformComponent* t = xform()) {
                     m_host.popup(t->position.x, t->position.y,
-                                 t->position.z + 1.6f, v);
+                                 t->position.z + 1.6f,
+                                 static_cast<float>(amount));
                 }
             }
-            return Value::number(0.0);
+            // 没有属性体系时"扣掉的"就等于 amount。
+            return Value::number(amount);
         }
         case Builtin::Popup: {
             const float v = f(0, "popup");
@@ -2585,6 +2739,335 @@ Value Evaluator::call(Builtin b, const std::vector<Value>& a, int line) {
                     "log line for why)";
             }
             return Value::boolean(ok);
+        }
+
+        // ============================================================
+        // P1-4：特效五件（2026-11-02）
+        // ============================================================
+        //
+        // 为什么这些要报错而不是静默返回 0：`playEffect` 返回 0 有两种原因
+        // （资产缺失 / 池满），脚本必须能区分"没播成"与"播了" —— 否则
+        // "我加了特效怎么没反应"只能靠翻日志。
+        case Builtin::PlayEffect: {
+            const std::string path = strOf(a[0], line, "playEffect(path)");
+            if (!m_err.ok()) return Value::number(0.0);
+            if (path.empty()) {
+                m_err.line = line;
+                m_err.message = "playEffect(): the asset path is empty";
+                return Value::number(0.0);
+            }
+            // 公开签名是 1~4 个参数，但**只有 1 和 4 是合法形态**。
+            // 2 / 3 个参数是"想给位置但少写了分量"，必须当场报错 ——
+            // 静默当成 self 位置会让"特效出现在脚下"变成玄学。
+            if (a.size() != 1 && a.size() != 4) {
+                m_err.line = line;
+                m_err.message =
+                    "playEffect() takes either (path) or (path, x, y, z)";
+                return Value::number(0.0);
+            }
+
+            uint32_t id = 0;
+            if (a.size() == 4) {
+                if (!m_host.act.playEffectAt) {
+                    m_err.line = line;
+                    m_err.message =
+                        "playEffect() is not available in this host (no effect "
+                        "service wired up)";
+                    return Value::number(0.0);
+                }
+                const double x = numOf(a[1], line, "playEffect(x)");
+                const double y = numOf(a[2], line, "playEffect(y)");
+                const double z = numOf(a[3], line, "playEffect(z)");
+                if (!m_err.ok()) return Value::number(0.0);
+                id = m_host.act.playEffectAt(
+                    path, glm::vec3(static_cast<float>(x),
+                                    static_cast<float>(y),
+                                    static_cast<float>(z)));
+            } else {
+                if (!m_host.act.playEffect) {
+                    m_err.line = line;
+                    m_err.message =
+                        "playEffect() is not available in this host (no effect "
+                        "service wired up)";
+                    return Value::number(0.0);
+                }
+                id = m_host.act.playEffect(m_host.entity, path);
+            }
+
+            // 0 = 没播成。**报错但不中止脚本**（一个火花放不出来不该让
+            // 整段剧情停下）—— 与 `setVel` 缺失时报告同一条取舍。
+            if (id == 0) {
+                m_err.line = line;
+                m_err.message = "playEffect('" + path +
+                                "'): the asset is missing or all effect slots "
+                                "are busy (see FX-PLAY / FX-POOL in the log)";
+            }
+            return Value::number(static_cast<double>(id));
+        }
+
+        case Builtin::StopEffect: {
+            const double v = numOf(a[0], line, "stopEffect(id)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!m_host.act.stopEffect) {
+                m_err.line = line;
+                m_err.message = "stopEffect() is not available in this host";
+                return Value::boolean(false);
+            }
+            const bool ok = m_host.act.stopEffect(static_cast<uint32_t>(v));
+            if (!ok) {
+                m_err.line = line;
+                m_err.message = "stopEffect(): no live effect with that id";
+            }
+            return Value::boolean(ok);
+        }
+
+        case Builtin::Shake: {
+            const double v = numOf(a[0], line, "shake(amount)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!m_host.act.shake) {
+                m_err.line = line;
+                m_err.message =
+                    "shake() is not available in this host (no camera system)";
+                return Value::boolean(false);
+            }
+            // 负数 / 超过 1 一律夹住（trauma 是 0..1 的量，传 5 也不会更抖）。
+            m_host.act.shake(static_cast<float>(std::clamp(v, 0.0, 1.0)),
+                             m_host.entity);
+            return Value::boolean(true);
+        }
+
+        case Builtin::Hitstop: {
+            const double v = numOf(a[0], line, "hitstop(seconds)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (v < 0.0) {
+                m_err.line = line;
+                m_err.message = "hitstop(): seconds must be >= 0";
+                return Value::boolean(false);
+            }
+            if (!m_host.act.hitstop) {
+                m_err.line = line;
+                m_err.message = "hitstop() is not available in this host";
+                return Value::boolean(false);
+            }
+            m_host.act.hitstop(static_cast<float>(std::min(v, 0.5)));
+            return Value::boolean(true);
+        }
+
+        case Builtin::SetTimeScale: {
+            const double v = numOf(a[0], line, "setTimeScale(scale)");
+            if (!m_err.ok()) return Value::boolean(false);
+            // ⚠ 0 会冻住仿真但"多久恢复"没人管（除非脚本自己再设回来）——
+            //   这是脚本作者最常写的死锁。要求 > 0，并且夹到与 UI 同一个
+            //   区间 [0.05, 4]（两边不一样的话"脚本设 10 倍速"会让物理炸开）。
+            if (v <= 0.0) {
+                m_err.line = line;
+                m_err.message =
+                    "setTimeScale(): scale must be > 0 (use 0.05 for freeze)";
+                return Value::boolean(false);
+            }
+            if (!m_host.act.setTimeScale) {
+                m_err.line = line;
+                m_err.message = "setTimeScale() is not available in this host";
+                return Value::boolean(false);
+            }
+            m_host.act.setTimeScale(
+                static_cast<float>(std::clamp(v, 0.05, 4.0)));
+            return Value::boolean(true);
+        }
+
+        // ============================================================
+        // P2-6：玩法四件（2026-11-03）
+        // ============================================================
+        //
+        // 全部作用于 **self**。四个都**必须**区分"宿主没装"与"算出来是 0"：
+        // `getAttr` 返回 0 有两种含义（属性不存在 / 值就是 0），所以宿主
+        // 没装时必须报错；而属性不存在本身是**作者写错名字**，也要报错 ——
+        // 否则 `getAttr("atk")` 拼错会静默返回 0，战斗里表现为"攻击力永远 0"。
+        case Builtin::GetAttr: {
+            const std::string name = strOf(a[0], line, "getAttr(name)");
+            if (!m_err.ok()) return Value::number(0.0);
+            if (!m_host.act.getAttr) {
+                m_err.line = line;
+                m_err.message =
+                    "getAttr() is not available in this host (no gameplay "
+                    "runtime wired up)";
+                return Value::number(0.0);
+            }
+            if (!m_host.act.gameplayHasAttr ||
+                !m_host.act.gameplayHasAttr(m_host.entity, name)) {
+                m_err.line = line;
+                m_err.message = "getAttr('" + name +
+                                "'): this entity has no such attribute (check "
+                                "the Inspector's Gameplay tab)";
+                return Value::number(0.0);
+            }
+            return Value::number(static_cast<double>(
+                m_host.act.getAttr(m_host.entity, name)));
+        }
+
+        case Builtin::AddStatus: {
+            const std::string which = strOf(a[0], line, "addStatus(id)");
+            if (!m_err.ok()) return Value::number(0.0);
+            if (!m_host.act.addStatus) {
+                m_err.line = line;
+                m_err.message =
+                    "addStatus() is not available in this host (no gameplay "
+                    "runtime wired up)";
+                return Value::number(0.0);
+            }
+            const int stacks = m_host.act.addStatus(m_host.entity, which);
+            if (stacks < 0) {
+                m_err.line = line;
+                m_err.message = "addStatus('" + which +
+                                "'): unknown preset or the entity has no "
+                                "Gameplay component";
+            }
+            return Value::number(static_cast<double>(stacks < 0 ? 0 : stacks));
+        }
+
+        case Builtin::TickRound: {
+            if (!m_host.act.tickRound) {
+                m_err.line = line;
+                m_err.message =
+                    "tickRound() is not available in this host (no gameplay "
+                    "runtime wired up)";
+                return Value::number(0.0);
+            }
+            return Value::number(static_cast<double>(m_host.act.tickRound()));
+        }
+
+        // ---- 卡牌（P3-4）----
+        //
+        // 返回**实际造成的伤害**（`castCard`）/ 实际抽到的张数（`drawCards`）。
+        // ⚠ 拿不到牌组 / 下标越界一律返回 0 并**落一条 WARN**，不抛：
+        //   卡牌脚本常在 `on update` 里按按键调用，抛异常会让整份脚本停摆
+        //   —— 而"手牌空了还按了一下"是完全正常的使用方式。
+        case Builtin::CastCard: {
+            if (!m_host.act.castCard) {
+                m_err.line = line;
+                m_err.message =
+                    "castCard() is not available in this host (no card decks "
+                    "wired up)";
+                return Value::number(0.0);
+            }
+            const int idx = static_cast<int>(numOf(a[0], line, "castCard(idx)"));
+            return Value::number(
+                static_cast<double>(m_host.act.castCard(m_host.entity, idx)));
+        }
+        case Builtin::DrawCards: {
+            if (!m_host.act.drawCards) {
+                m_err.line = line;
+                m_err.message =
+                    "drawCards() is not available in this host (no card decks "
+                    "wired up)";
+                return Value::number(0.0);
+            }
+            const int n = static_cast<int>(numOf(a[0], line, "drawCards(n)"));
+            return Value::number(
+                static_cast<double>(m_host.act.drawCards(m_host.entity, n)));
+        }
+
+        // ---- 配表（P3-1）----
+        //
+        // 四个都是"查一格"。共同的前置：宿主要装了那一件。
+        // ⚠ 没装时报错**而不是**返回 0 / ""：脚本看到 0 会以为"表里就是 0"，
+        //   而真正的原因是"这台宿主没有配表能力"（Game.exe 与编辑器各自
+        //   注入，见各自动的 `installScriptServices`）。
+        case Builtin::TableNum: {
+            const std::string key = strOf(a[0], line, "tableNum(key)");
+            if (!m_err.ok()) return Value::number(0.0);
+            if (!m_host.act.tableNum) {
+                m_err.line = line;
+                m_err.message = "tableNum() is not available in this host (no data tables)";
+                return Value::number(0.0);
+            }
+            return Value::number(m_host.act.tableNum(key));
+        }
+        case Builtin::TableStr: {
+            const std::string key = strOf(a[0], line, "tableStr(key)");
+            if (!m_err.ok()) return Value::str(std::string());
+            if (!m_host.act.tableStr) {
+                m_err.line = line;
+                m_err.message = "tableStr() is not available in this host (no data tables)";
+                return Value::str(std::string());
+            }
+            return Value::str(m_host.act.tableStr(key));
+        }
+        case Builtin::TableHas: {
+            const std::string key = strOf(a[0], line, "tableHas(key)");
+            if (!m_err.ok()) return Value::boolean(false);
+            if (!m_host.act.tableHas) {
+                m_err.line = line;
+                m_err.message = "tableHas() is not available in this host (no data tables)";
+                return Value::boolean(false);
+            }
+            return Value::boolean(m_host.act.tableHas(key));
+        }
+        case Builtin::TableRows: {
+            const std::string name = strOf(a[0], line, "tableRows(table)");
+            if (!m_err.ok()) return Value::number(-1.0);
+            if (!m_host.act.tableRows) {
+                m_err.line = line;
+                m_err.message = "tableRows() is not available in this host (no data tables)";
+                return Value::number(-1.0);
+            }
+            return Value::number(static_cast<double>(m_host.act.tableRows(name)));
+        }
+
+        // ---- 导航（C8-2，2026-11-05）----
+        //
+        // 四个动词全部作用于 self。共同的前置：宿主装了导航系统
+        // （`Game.exe` 与编辑器 Play 各自注入，见各自的
+        // `installScriptServices`）。
+        //
+        // ⚠ 没装时报错**而不是**返回 0：脚本看到 0 会以为"网格没烘好"，
+        //   而真实原因是"这台宿主没有导航能力"。与 `tableNum` 同一条纪律。
+        // ⚠⚠ `navGoto` 返回 1 只代表**受理**（目标已记下、网格在场），
+        //   不代表走到了 —— 求路在下一帧 `NavSystem::tick` 里做。
+        case Builtin::NavGoto: {
+            const glm::vec3 p = glm::vec3(f(0, "navGoto(x, y, z)"),
+                                          f(1, "navGoto(x, y, z)"),
+                                          f(2, "navGoto(x, y, z)"));
+            if (!m_err.ok()) return Value::number(0.0);
+            if (!m_host.act.navGoto) {
+                m_err.line = line;
+                m_err.message =
+                    "navGoto() is not available in this host (no navigation "
+                    "system wired up)";
+                return Value::number(0.0);
+            }
+            return Value::number(
+                m_host.act.navGoto(m_host.entity, p) ? 1.0 : 0.0);
+        }
+        case Builtin::NavArrived: {
+            if (!m_host.act.navArrived) {
+                m_err.line = line;
+                m_err.message =
+                    "navArrived() is not available in this host (no navigation "
+                    "system wired up)";
+                return Value::number(0.0);
+            }
+            return Value::number(m_host.act.navArrived(m_host.entity) ? 1.0 : 0.0);
+        }
+        case Builtin::NavFailed: {
+            if (!m_host.act.navFailed) {
+                m_err.line = line;
+                m_err.message =
+                    "navFailed() is not available in this host (no navigation "
+                    "system wired up)";
+                return Value::number(0.0);
+            }
+            return Value::number(m_host.act.navFailed(m_host.entity) ? 1.0 : 0.0);
+        }
+        case Builtin::NavStop: {
+            if (!m_host.act.navStop) {
+                m_err.line = line;
+                m_err.message =
+                    "navStop() is not available in this host (no navigation "
+                    "system wired up)";
+                return Value::number(0.0);
+            }
+            return Value::number(m_host.act.navStop(m_host.entity) ? 1.0 : 0.0);
         }
 
         // ---- 关节九件（J5-4）----
@@ -3008,12 +3491,35 @@ bool ScriptProgram::run(const ScriptHost& host, ScriptRunContext& ctx,
     return err.ok();
 }
 
+// C8：协程暂停位的放行（布局在这里才完整，见头文件的注释）。
+bool resumeCoroutine(ScriptCoroutine& coro) {
+    if (!coro.paused) return false;
+    coro.paused = false;
+    // 放行**这一行**一次 —— 不放行的话下一次 drive() 立刻停在原地，
+    // 表现成"点了继续没反应"。
+    coro.pauseSkipLine = coro.pauseLine;
+    coro.stepPause = false;
+    // ⚠ `pauseLine` **不清**：调用方（ScriptRuntime）要用它去填日志，
+    //   而实例上的镜像会在这之后被清掉。
+    return true;
+}
+
+bool stepCoroutine(ScriptCoroutine& coro) {
+    if (!coro.paused) return false;
+    coro.paused = false;
+    coro.pauseSkipLine = coro.pauseLine;
+    coro.stepPause = true;   // 放行这一行之后，在下一条语句前停
+    return true;
+}
+
 bool ScriptProgram::runFrame(const ScriptHost& host, ScriptRunContext& ctx,
                              ScriptCoroutine& coro, const ScriptFrameInput& in,
                              ScriptError& err) {
     err = ScriptError{};
     ctx.steps = 0;
     ctx.executed = false;
+    ctx.paused = false;
+    ctx.pauseLine = 0;
 
     if (!m_valid) {
         err.message = "program not compiled";
@@ -3025,9 +3531,23 @@ bool ScriptProgram::runFrame(const ScriptHost& host, ScriptRunContext& ctx,
     }
     if (ctx.prints) ctx.prints->clear();
 
+    // ⓪-pre 断点摁住 → 本帧**什么都不做**。
+    //
+    // ⚠ 这里必须早于 `tryWake()`：暂停中的实例既不该跑语句，也不该因为
+    //   "时间到了"从 wait 里醒过来 —— 那会让"停在第 12 行"在下一次
+    //   wake 时静默前进一帧。
+    if (coro.paused) {
+        ctx.paused = true;
+        ctx.pauseLine = coro.pauseLine;
+        return true;
+    }
+
     // ⚠ 全帧**一个** Evaluator：配额是按"每帧每实例"算的。
     Evaluator eval(host, *this, err, *ctx.vars, ctx.prints, coro);
     eval.beginFrame(ctx.time, ctx.dt, ctx.frame, ctx.simFrame);
+    // C8：断点表与"本程序叫什么"。路径口径 = debugName（= 资产相对路径），
+    // 与 BreakpointSet 里存的那份一致。
+    eval.setBreakpoints(ctx.breakpoints, m_debugName);
 
     // 一个钩子的执行（S4）。`hookIndex` 让"第 2 个 on collide 挂起"这件事
     // 能正确恢复：已跑完的钩子不重跑，挂起的那一个从栈里继续。
@@ -3107,6 +3627,15 @@ bool ScriptProgram::runFrame(const ScriptHost& host, ScriptRunContext& ctx,
             ctx.steps = eval.steps();
             return false;
         }
+        if (st == Evaluator::Step::Paused) {
+            // C8：停在语句之前。`phase` 与 `ip` 都**不动** —— 恢复时接着
+            // 跑同一条语句。`executed` 保持 false（本步没推进任何东西），
+            // 与 `Suspend`（wait，也是"没跑完"但确实动了）区分开。
+            ctx.steps = eval.steps();
+            ctx.paused = true;
+            ctx.pauseLine = coro.pauseLine;
+            return true;
+        }
         if (st == Evaluator::Step::Suspend) {
             ctx.steps = eval.steps();
             ctx.executed = true;   // 挂起也是"动了"（跟"空转"是两回事）
@@ -3138,6 +3667,16 @@ void indexStmts(const std::vector<StmtPtr>& list,
         indexStmts(sp->elseBody, out);
     }
 }
+
+// C8：收集"有语句落上去"的行号（断点的合法行）。
+void collectLines(const std::vector<StmtPtr>& list, std::set<int>& out) {
+    for (const auto& sp : list) {
+        if (!sp) continue;
+        out.insert(sp->line);
+        collectLines(sp->body, out);
+        collectLines(sp->elseBody, out);
+    }
+}
 }  // namespace
 
 void ScriptProgram::indexAst() {
@@ -3149,6 +3688,13 @@ void ScriptProgram::indexAst() {
         m_hookById[hb->id] = hb.get();
         indexStmts(hb->body, m_byId);
     }
+    // C8：顺手收"可打断点的行"。用 `std::set` 去重排序 —— 同一行上
+    // 落着两条语句是常态（`if (x) y = 1` 写在一行里）。
+    std::set<int> lines;
+    collectLines(m_ast, lines);
+    for (const auto& hb : m_hooks)
+        if (hb) collectLines(hb->body, lines);
+    m_lines.assign(lines.begin(), lines.end());
 }
 
 const Stmt* ScriptProgram::stmtById(uint32_t id) const {

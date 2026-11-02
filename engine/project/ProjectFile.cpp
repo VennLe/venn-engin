@@ -2,6 +2,13 @@
 
 // `runAllProjectSelfTests` 要把另外三组的自检函数调起来 —— 只有 .cpp 需要
 // 这三个头（头文件仍然互不依赖，`ProjectFile.h` 是它们共同的地基）。
+#include "project/DataTable.h"
+#include "scene/GameFlags.h"
+#include "fx/EffectAsset.h"
+#include "fx/AnimEventRouter.h"
+#include "fx/EffectService.h"
+#include "scene/LevelManifest.h"
+#include "project/GameFile.h"
 #include "project/ProjectCreate.h"
 #include "project/ProjectDisplay.h"
 #include "project/RecentList.h"
@@ -42,6 +49,14 @@ struct GameTypeEntry {
 const GameTypeEntry kGameTypes[] = {
     {GameType::FirstPerson, "first_person", "First person"},
     {GameType::ThirdPerson, "third_person", "Third person"},
+    // 2026-11-04（P3-1 之后）：引擎已经把玩法层（属性 / 状态 / 伤害 / 回合 /
+    // 牌堆 / 配表）做完了，**"游戏类型"就不该只有相机视角这一个维度**。
+    // 这两种是"相机 + 扫描方式"都不同的类型，所以仍然放在同一根轴上
+    // （一个单选项 = 一套模板），而不是再拆一个"玩法类型"下拉：
+    // 拆两轴的话就有 4×3 种组合，而其中一半组合没有模板 —— 用户会在
+    // "选完发现打不开"上浪费一次创建。
+    {GameType::Isometric, "isometric", "Isometric"},
+    {GameType::CardBattler, "card_battler", "Card battler"},
 };
 
 struct CodeModeEntry {
@@ -152,6 +167,13 @@ bool roundTripEqual(const ProjectFile& a, const ProjectFile& b,
 } // namespace
 
 // ---------------------------------------------------------------- 枚举
+
+GameType gameTypeAt(int index) {
+    // 按**表顺序**而不是枚举值：两者现在一致，但表才是启动器卡片的真值。
+    const int n = static_cast<int>(sizeof(kGameTypes) / sizeof(kGameTypes[0]));
+    if (index < 0 || index >= n) return GameType::ThirdPerson;
+    return kGameTypes[index].type;
+}
 
 const char* gameTypeId(GameType t) {
     for (const auto& e : kGameTypes)
@@ -719,6 +741,33 @@ int runAllProjectSelfTests() {
     failures += runRecentListSelfTest();
     failures += runDisplaySelfTest();
     failures += runCreateSelfTest();
+    // 2026-11-02：`assets/game.json` 的读写（编辑器 Project Settings 面板的
+    // 底座）。放在最后 —— 它只依赖文件系统，与上面四组的目录操作同层。
+    failures += runGameFileSelfTest();
+    // 2026-11-02：配表（C1）的 CSV 解析与取值。放在 game.json 之后 ——
+    // 它同时依赖 `core/Csv`（格式本体）与文件系统，是这一层的最后一块。
+    failures += runDataTableSelfTest();
+    // 2026-11-02：剧情旗标（A4）。**零依赖的纯数据语义**（未设过 = 0 /
+    // 同名覆盖 / 快照恢复），放最后是因为它不需要任何文件系统操作。
+    failures += scene::runGameFlagsSelfTest();
+    // 2026-11-02：关卡清单（G19）。也是纯数据 —— 解析 / 校验 / 距离判定 /
+    // 滞回全部不需要设备、也不需要场景。流送本体的判据在
+    // `tools/verify_levels.py`（那边才真的加载两张场景）。
+    failures += scene::runLevelManifestSelfTest();
+    // 2026-11-02：特效资产（P1-1）。同样是纯数据 —— `.veffect` 的解析、
+    // 层数截断、时长夹取、以及 `effectiveDuration()` 这条"余韵必须罩住
+    // 粒子寿命"的判据，全都不需要设备与场景。
+    failures += fx::runEffectAssetSelfTest();
+    // 2026-11-02：特效池调度（P1-2）。抢占 / 回收 / 确定性全是纯逻辑，
+    // **不需要场景也不需要设备** —— 所以能在 `--selftest project` 里跑。
+    // 需要进 Play 才能验的那部分（动画事件 → 出特效）在 `verify_fx.py`。
+    {
+        fx::EffectService svc;
+        failures += svc.runSelfTest();
+    }
+    // 2026-11-02：动画事件路由（P1-3）。**纯解析** —— kind 大小写、
+    // payload 兜底写法、数值夹取、空路径拒绝，全都不需要场景。
+    failures += fx::runAnimEventRouterSelfTest();
     std::printf("PROJECT-ALL-TOTAL failures=%d\n", failures);
     return failures;
 }

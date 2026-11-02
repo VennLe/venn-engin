@@ -16,6 +16,9 @@
   F 运行时按文档画：`Game.exe --ui-doc` 真的读了它，几何与锚点对得上
   G 数据绑定：脚本 damage(30) → 文档里的血条填充缩到 70%（量几何）
   H 截图 diff：改一个控件位置 → 画布区域显著变化，且**不是整图平移**
+  I 变换/滚动/网格/拖放（P3-2）：rot/scale/opacity 进 JSON、Scroll 能设偏移、
+    Grid 能设列、`dropAccept` 能存；非 Scroll/非 Grid 上设这两项**必须被拒**
+    （不然"我改了但没效果"会变成调试噩梦 —— 编辑器和运行时各读一半字段）
 
 ==============================================================================
 三个刻意的取舍
@@ -654,9 +657,134 @@ class Ctx:
         self.h_c = os.path.join(tmp, "h_c.png")
 
 
+# ------------------------------------------------------------------ I 变换/容器/拖放
+def case_i(ctx):
+    """P3-2：变换（旋转/缩放/透明度）+ Scroll/Grid 容器 + 拖放标签。
+
+    ⚠ 这一组**不点按钮**（同取舍 ②），注入的正是属性栏那几个控件调的函数
+      （`actSetRot` / `actSetScroll` / `actSetGrid` / `actSetDragDrop`）。
+      但**锚点仍要验**：`UIED-ADD-SCROLL` / `UIED-ROT` 这些矩形不出现，
+      就说明属性栏那条路在屏幕上根本不存在 —— 而"注入能改、界面点不到"
+      正是本项目定义里的"没交付"。
+    """
+    dump = os.path.join(ctx.tmp, "i_dump.json")
+    # ⚠ 计数的期望值**从脚本自己推导**（`len(steps)`），不写死 12/2。
+    #   写死的那一份在"改脚本忘了改期望"时会把 FAIL 说得像实现坏了 ——
+    #   这一轮就是这么踩到的（原脚本引用了示例文档里根本没有的 `hud/slot`，
+    #   于是 `sel` 失败、后面两条跟着失败，而期望还硬挺在 12/2）。
+    steps = [
+        # ① 两个容器能建出来（add 插在选中项之后，root 下就是顺序追加）
+        "add:scroll", "setid:hand", "setpos:600,700", "setsize:320,200",
+        "setscroll:0,80",
+        "add:grid", "setid:cards", "setpos:60,700", "setsize:480,200",
+        "setgrid:3,6,6",
+        # ② 变换三件 + 拖拽载荷
+        "sel:hud/hpbar", "setrot:30", "setscale:1.2", "setopacity:0.5",
+        # ③ 拖放标签：手牌可拖、hint 当"槽"只接不拖
+        #    ⚠ 示例文档里只有 hud/{hpbar,hpnum,hint}、title、resume、topline
+        "setdrag:card",
+        "sel:hud/hint", "setdrag:- card",
+    ]
+    # ④ 反向：非 Scroll 不能设滚动；非 Grid 不能设列（这两条**必须**被拒）
+    rejects = ["setscroll:0,10", "setgrid:4"]
+    script = ";".join(steps + ["sel:hud/hpbar"] + rejects + ["dump"])
+    want_applied = len(steps) + 1 + 1          # + 一次 sel、+ 一次 dump
+    want_failed = len(rejects)
+    text = run_editor({"MYVK_EDITOR_UIED": ASSET,
+                       "MYVK_EDITOR_UIED_DUMP": dump,
+                       "MYVK_EDITOR_UIED_SCRIPT": script})
+
+    # ---- ① 属性栏那些控件真的画出来了 ----
+    need = ["UIED-ADD-SCROLL", "UIED-ADD-GRID", "UIED-ROT", "UIED-SCALE",
+            "UIED-OPACITY", "UIED-DRAGTAG", "UIED-DROPACCEPT"]
+    missing = [t for t in need if t not in text]
+    check("I1 变换/拖放控件的锚点都在（属性栏真的画了）", not missing,
+          "missing=%s" % missing)
+
+    # ---- ② 脚本跑完没有失败（最后那两条反向命令**应当**失败，
+    #          所以这里只查前面成功的那几条有没有把 applied 计数推进）----
+    m = last(re.compile(r"UIED-SCRIPT applied=(\d+) failed=(\d+)"), text)
+    applied = int(m.group(1)) if m else -1
+    failed = int(m.group(2)) if m else -1
+    check("I2 脚本 applied=%d failed=%d（两条反向命令必须被拒）"
+          % (want_applied, want_failed),
+          m is not None and applied == want_applied and failed == want_failed,
+          "applied=%d failed=%d" % (applied, failed))
+
+    # ---- ③ 反向命令要说出**为什么**拒 ----
+    check("I3 非 Scroll 上设滚动被拒（only a scroll widget can scroll）",
+          "only a scroll widget can scroll" in text, "")
+    check("I4 非 Grid 上设列数被拒（only a grid widget has columns）",
+          "only a grid widget has columns" in text, "")
+
+    # ---- ④ 内存里的文档真的带着这些字段（dump 就是 save 会写的内容）----
+    if not os.path.isfile(dump):
+        check("I5 dump 写出来了", False, "没有 %s" % dump)
+        return
+    with open(dump, encoding="utf-8") as f:
+        doc = json.load(f)
+
+    def find(ws, wid):
+        for w in ws:
+            if w.get("id") == wid:
+                return w
+            got = find(w.get("children") or [], wid)
+            if got:
+                return got
+        return None
+
+    ws = doc.get("widgets") or []
+    hand = find(ws, "hand")
+    cards = find(ws, "cards")
+    bar = find(ws, "hpbar")
+    slot = find(ws, "hint")
+
+    check("I5 scroll 控件带 type/scrollY",
+          hand is not None and hand.get("type") == "scroll" and
+          abs(float(hand.get("scrollY", 0)) - 80.0) < 1e-6,
+          "hand=%s" % (hand,))
+    check("I6 grid 控件带 type/cols/gap",
+          cards is not None and cards.get("type") == "grid" and
+          int(cards.get("cols", 0)) == 3 and
+          abs(float(cards.get("gapX", 0)) - 6.0) < 1e-6,
+          "cards=%s" % (cards,))
+    check("I7 血条带 rot/scale/opacity/dragTag",
+          bar is not None and abs(float(bar.get("rot", 0)) - 30.0) < 1e-6 and
+          abs(float(bar.get("scale", 0)) - 1.2) < 1e-6 and
+          abs(float(bar.get("opacity", 0)) - 0.5) < 1e-6 and
+          bar.get("dragTag") == "card",
+          "bar=%s" % (bar,))
+    check("I8 接受卡牌的槽带 dropAccept=card",
+          slot is not None and slot.get("dropAccept") == "card",
+          "slot=%s" % (slot,))
+
+    # ---- ⑤ 默认值不落盘（`toJson` 只写非默认）----
+    # ⚠ 判据落在**动过的那个控件没碰过的字段**上：cards 只设了 cols/gap，
+    #   于是 rot/scale/opacity 必须**整个键都不出现**（出现 = 默认值判断写反，
+    #   存盘会越长越大，而且"我明明没动它"这件事在 diff 里看不出来）。
+    if cards is not None:
+        leftover = [k for k in ("rot", "scale", "opacity", "scrollX", "scrollY")
+                    if k in cards]
+        check("I9 默认值不写进 JSON（grid 没碰过 rot/scale/opacity/scroll*）",
+              not leftover, "多出来的键=%s keys=%s" % (leftover, sorted(cards)))
+    else:
+        check("I9 默认值不写进 JSON", False, "cards 不存在")
+
+    # ---- ⑥ 往返：dump 出来的 JSON 能原样解析回去，字段不丢 ----
+    rt = ui2_roundtrip(dump)
+    check("I10 dump → parse 往返后 rot/scale/opacity 都还在", rt, "")
+
+
+def ui2_roundtrip(path):
+    """借编辑器自己的 `check` 命令验往返（校验只有一份，见 UiDocument.h ①）。"""
+    text = run_editor({"MYVK_EDITOR_UIED": path})
+    m = last(CHECK_RE, text)
+    return m is not None and m.group(1) == "1"
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", default="", help="只跑某个用例（a/b/c/d/e/fg/h）")
+    ap.add_argument("--only", default="", help="只跑某个用例（a/b/c/d/e/fg/h/i）")
     ap.add_argument("--keep", action="store_true", help="保留临时目录")
     ap.add_argument("--dump", default="", help="把 A 用例的完整日志写到这个文件")
     args = ap.parse_args()
@@ -683,6 +811,8 @@ def main():
             case_fg(ctx)
         if only in ("", "h"):
             case_h(ctx)
+        if only in ("", "i"):
+            case_i(ctx)
     finally:
         if args.keep:
             print("临时目录：%s" % tmp)

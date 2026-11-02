@@ -1016,17 +1016,22 @@ def main():
             check("E14 Distance 的绳长恒为 2.0 m",
                   max(dd) < 2.05 and spread(dd) < 0.06,
                   "max=%.4f spread=%.4f" % (max(dd), spread(dd)))
-            last = kdist[-1][1]
-            # 从 (2,24,6) 摆到 (0,24,4) —— 原地不动说明切向被锁死（= 退化成
-            # Fixed）。这一条是 Distance 与 Fixed 的分界。
+            xs = [p[0] for _, p in kdist]
+            zs = [p[2] for _, p in kdist]
+            # 从 (2,24,6) 摆过锚点下方 —— 原地不动说明切向被锁死（= 退化
+            # 成 Fixed）。这一条是 Distance 与 Fixed 的分界。
             #
-            # ⚠ 阈值给到 0.7 而不是 0.35：这条绳子的阻尼来自线速度阻尼，
-            #   不像铰链那样有强角阻尼，900 帧后还在 ±0.4 m 的小幅摆动
-            #   （实测末态 x=-0.377）。判据要的是"从 x=2 摆到了 x≈0"，
-            #   不是"收敛到毫米级" —— 把阈值卡在 ±0.35 会随相位偶发变红。
-            check("E15 Distance 切向自由（摆到锚点正下方 2 m）",
-                  abs(last[0]) < 0.7 and 3.6 < last[2] < 4.4,
-                  "last=(%.3f,%.3f,%.3f)" % last)
+            # ⚠⚠ **不能拿"末态位置"当判据**。第一版是
+            #   `abs(last[0]) < 0.7`，两次跑出 -1.033 / -1.180 —— 单摆的末态
+            #   是"900 帧那一刻的**瞬时相位**"，而相位取决于帧时序（机器负载
+            #   一变就变）。这条绳子阻尼只有线速度阻尼，900 帧后还在 ±1.2 m
+            #   摆，永远收敛不到 ±0.7。**偶发红**正是这么来的。
+            #   与 E12 同一条教训：用**跟采样相位无关的量**（跨度 / 极值）。
+            #   `max(xs)-min(xs)` 是"摆动了多大幅度"，Fixed 对照恒为 0。
+            check("E15 Distance 切向自由（从 x=2 摆过锚点下方）",
+                  min(xs) < 0.0 and (max(xs) - min(xs)) > 2.0 and min(zs) < 4.6,
+                  "x∈[%.3f,%.3f] span=%.3f zmin=%.3f"
+                  % (min(xs), max(xs), max(xs) - min(xs), min(zs)))
         kdf = body_samples(lines_e, "KDistFree")
         check("E16 KDistFree 对照有轨迹采样", len(kdf) >= 5, "n=%d" % len(kdf))
         if len(kdf) >= 5:

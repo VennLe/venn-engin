@@ -37,6 +37,18 @@ class DialogueRunner {
     bool start(const DialogueAsset& asset, const std::string& startOverride = {});
     void reset();
 
+    // ---- C7：旗标仓库（宿主注入）----
+    //
+    // 装它之后：节点的 `if` 会真的被求值、选项的 `set` 会真的写进去。
+    // ⚠⚠ **没装时若剧本用了条件**，`start()` / 前进都会把
+    //   `"conditions need a flag store"` 写进 `error()` 并且**停在原地**
+    //   （不是静默走 else）。静默的后果是"分支永远走另一条"，而日志一行
+    //   错都没有 —— 与 `tableNum` / `getAttr` 是同一条纪律。
+    // ⚠ 指针不拥有；宿主必须保证它活得比 runner 长（`class::GameFlags`
+    //   成员，两者同寿命）。
+    void setFlagStore(DlgFlagStore* store) { m_store = store; }
+    DlgFlagStore* flagStore() const { return m_store; }
+
     bool active() const { return m_active; }
     bool finished() const { return !m_active && m_steps > 0; }
 
@@ -57,11 +69,21 @@ class DialogueRunner {
     const std::string& currentId() const { return m_currentId; }
 
   private:
+    // 把 `m_currentId` 推到 `id`，**沿途解析条件**：
+    //   · 条件成立 → 落在这句
+    //   · 不成立   → 跳到 `elseId`（空 = 结束），再对新目标重复
+    // 返回 false = 走进了死路（条件链成环 / 目标不存在 / 没装 store）。
+    //
+    // ⚠ 每次跳转都 `++m_steps` 并受 `kMaxSteps` 保护：两个节点互相指向对方
+    //   的 else 是合法数据（`parseDialogue` 查不出环），但运行期会无限跳。
+    bool enterNode(const std::string& id);
+
     const DialogueAsset* m_asset = nullptr;
     std::string m_currentId;
     bool m_active = false;
     int m_steps = 0;
     std::string m_error;
+    DlgFlagStore* m_store = nullptr;
 
     // 防"数据合法但永远出不来"的死循环：`goto` 指回自己不会报错
     // （剧情里"再问一次"是合法写法），但一个纯粹的自环会让自动推进

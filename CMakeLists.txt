@@ -272,7 +272,9 @@ target_link_libraries(VennEngine PUBLIC
 #   MinGW 的 libpropsys.a **不导出**这些数据符号 → 那边由
 #   WasapiBackend.cpp 里的本地定义兜底（见该文件）。
 if(WIN32)
-    target_link_libraries(VennEngine PUBLIC ole32 avrt ksuser winmm propsys)
+    # psapi：`core/ProcStats.cpp` 的 `GetProcessMemoryInfo`（Stats 面板的内存一节）。
+    # MinGW 侧同名的 `libpsapi.a` 也导出这个符号，两个工具链都不用兜底。
+    target_link_libraries(VennEngine PUBLIC ole32 avrt ksuser winmm propsys psapi)
 endif()
 if(NOT MSVC)
     target_compile_options(VennEngine PRIVATE -Wall -Wextra -Wno-unused-parameter)
@@ -919,6 +921,12 @@ function(myvk_copy_runtime_assets target)
             # **构建期离线生成**并提交进仓库。运行时不读系统字体 —— 否则
             # 打包到玩家机器上中文全是方块，且系统字体不可再分发。
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/ui|assets/ui"
+            # P1（2026-11-02）：特效资产 `.veffect`。
+            # ⚠⚠ 忘了这一行的症状是"加了特效完全没效果" —— 编辑器和运行时
+            #   都读 `build/bin/assets/fx/`，而源码侧的文件从来没被拷过去。
+            #   `FX-PLAY id=0` + 一条 `FX-PLAY failed` WARN 是唯一的提示。
+            #   与 `WATCH_ROOTS` 是同一类纪律：**新增资产目录必须登记**。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/fx|assets/fx"
             # G14：音频素材。⚠ 必须进"每次都拷"这一档 —— `POST_BUILD` 只在
             # 重新链接时跑，改了 wav 却不重新链接时，运行时读到的还是旧素材
             # （表现是"我明明换了音效，听起来没变"）。
@@ -1035,6 +1043,38 @@ function(myvk_copy_runtime_assets target)
     endif()
     if(TARGET VennScriptsCopy)
         add_dependencies(${target} VennScriptsCopy)
+    endif()
+    # C1/C2（2026-11-02）：配表（`assets/data/*.csv`）与本地化覆盖层
+    # （`assets/i18n/zh.csv`）。与 scenes/scripts 同一档 —— 它们都是
+    # **编辑器会写回**的目录，所以用 `copy_directory` 而不是 `copy_if_different`：
+    # 少一次 stat，且目录形态（新增/删除表文件）能整体同步。
+    #
+    # ⚠⚠ 不拷的后果与 `assets/expressions` 那条一模一样：面板里"没有表"，
+    #   而日志报的是 `build/bin/assets/data` 这个**不存在**的路径 ——
+    #   看起来像"解析器坏了"，其实是构建没带资产。
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets/data AND NOT TARGET VennDataCopy)
+        add_custom_target(VennDataCopy ALL
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                ${CMAKE_CURRENT_SOURCE_DIR}/assets/data
+                ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/data
+            COMMENT "Copying data tables to binary dir"
+            VERBATIM
+        )
+    endif()
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets/i18n AND NOT TARGET VennI18nCopy)
+        add_custom_target(VennI18nCopy ALL
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                ${CMAKE_CURRENT_SOURCE_DIR}/assets/i18n
+                ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/i18n
+            COMMENT "Copying locale overrides to binary dir"
+            VERBATIM
+        )
+    endif()
+    if(TARGET VennDataCopy)
+        add_dependencies(${target} VennDataCopy)
+    endif()
+    if(TARGET VennI18nCopy)
+        add_dependencies(${target} VennI18nCopy)
     endif()
 
     # ------------------------------------------------------------

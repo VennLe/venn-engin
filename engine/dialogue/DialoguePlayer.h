@@ -100,6 +100,14 @@ class DialoguePlayer {
     Press pressAdvance(float cps);
     bool choose(int index);
 
+    // ---- C7：旗标仓库 ----
+    // 宿主注入一次即可（与 `setVoiceHooks` 同一个位置：`RuntimeApp::init` /
+    // `EditorApp` 的脚本服务安装处）。传 nullptr = 没有旗标能力。
+    // ⚠ 它**不是运行态**：`stop()` / `start()` 都不清它，否则每段对话开头
+    //   都要重新注入，漏一处就静默走 else。
+    void setFlagStore(DlgFlagStore* store) { m_runner.setFlagStore(store); }
+    DlgFlagStore* flagStore() const { return m_runner.flagStore(); }
+
     // ---- 读（UI 只读这些）----
     const DlgNode* current() const { return m_runner.current(); }
     const std::string& currentId() const { return m_runner.currentId(); }

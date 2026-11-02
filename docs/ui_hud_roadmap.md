@@ -1065,3 +1065,158 @@ UI tick 在状态栈**之外**）→ U8（血条/准星/伤害数字/暂停菜�
 加的，这次直接复用 —— 字号 48 / spread 6 / ascent 48 三个数**一个都没动**，
 所以字形位图逐位相同，只有打包位置变了：`verify_hud`（白字墨迹 ≥ 1%）与
 `verify_dialogue`（字幕底边对齐）复跑都 PASS，证明文本像素没有漂移。
+
+---
+
+## 16 · 执行进度（2026-11-02：文档层交互，B1）
+
+权威说明 → `docs/ui_actions.md`；审计条目 → `panel_gap_review_2026-11-02.md` B1；
+判据 → `tools/verify_ui_actions.py`（五组）。
+
+### 补的是什么
+
+`#312` 让作者能在 `.ui.json` 里摆控件，但 **`UiWidget` 里没有 `action`**
+（`grep -rn "action" engine/ui2/` → 0），按钮画得出、点下去什么也不发生。
+这一轮把"文档层"接到交互上：
+
+| 层 | 文件 | 干什么 |
+|---|---|---|
+| 数据 | `ui2/UiDocument.h` | `UiWidget` 加 `action` / `enabled` / `visibleBind` |
+| 解析 | `ui2/UiAction.*` | 字符串 → 动词（`flag: / toggle: / sound: / quit`），纯函数可自检 |
+| 命中 | `ui2/UiDocInput.*` | 按下/松开 → 产出 `action` 原文（**不执行**） |
+| 执行 | `runtime/RuntimeApp.cpp` | 动词 → 旗标表 / 音频 / 退出（引擎不认识旗标表） |
+| 编辑 | `editor/UiEditorWindow.cpp` | 属性面板 `Interaction` 段，写错**当场拒** |
+
+`UITOTAL` 从 86 条涨到 109 条，其中 23 条是 `uiint_*`。
+
+### 这一轮踩到的四个坑
+
+1. **真鼠标与注入点击是两条路**。`tickUi` 的"点击视口 → 进入操作态"原来
+   **无条件** `m_mouseCaptured = true`，于是 Playing 下点文档按钮：
+   ①b 先捕获 → 渲染回调里的 `tickUiDocInput` 看到捕获位就整段跳过。
+   **注入点击照样能点，鼠标点不动** —— 正是 `UiDocInput.h` 警告的那种分叉。
+   现在 ①b 先问文档层（同一个 `uiDocHitAt`），命中就 `captured=0 reason=ui-doc`。
+2. **`computeScale` 除的是全局参考分辨率（1920×1080），不是文档自己的 `canvas`**。
+   自检第一版用 `canvas: [1000, 1000]` + 输出 1000×1000，scale 算成 0.52，
+   所有命中点都缩到邻居身上 —— **三条假红，产品是对的**。
+3. **按下必须在松开之前处理**。注入点击同一帧 press+release 都置位，
+   反序会读到已清空的 `m_pressId` → "只有自动化里点了没反应"。
+4. **设计画布必须忽略 `visibleBind`**。空绑定表查不到键 → 判为不可见 →
+   作者一配"按旗标隐藏"，控件在设计视图里消失，连选都选不到。
+
+### 连带的两处
+
+- **`UiAction` 的错误提示原来还写着 `emit`**（评估过但砍掉的动词）。作者
+  照着提示写 `emit:xxx` 会再吃一次同样的错 —— 错误提示本身不能骗人。
+- **字体图集重烤**：1304 字形 / 2048×2960（72.3% of 4096）/ 0.67 MB。
+  上一轮混音台那 29 条词条之后没重烤，少 104 个字形（会渲染成空白，
+  跑起来有字、看不出来）。`verify_ui2` 的"词典非 ASCII 字符全在图集里"
+  这一条是唯一的闸门。
+
+---
+
+## 17 · 执行进度（2026-11-04：变换 / Scroll / Grid / 拖放，P3-2）
+
+上一轮（§16）把"按钮点下去有反应"接上了，但 **`UiCanvas` 只会画轴对齐的矩形**：
+`pushModeQuad` 的顶点永远是"中心 + 半宽"，转不了、缩不了、也裁不了。
+卡牌游戏要的手牌扇形（旋转）、手牌滚动（Scroll）、牌桌网格（Grid）、
+"把牌拖到敌人身上"（拖放 + 合法目标高亮），这四件事一件都做不了。
+
+这一轮补的就是这四件。
+
+### 17.1 三层各加了什么
+
+| 层 | 文件 | 干什么 |
+|---|---|---|
+| 顶点 | `ui2/UiCanvas.{h,cpp}` + `shaders/ui2.vert` | `Ui2Prim::RoundBoxRotated = 4`；`Ui2Xform`（2×3 仿射）；三条状态栈（变换 / 透明度 / 裁剪） |
+| 文档 | `ui2/UiDocument.{h,cpp}` | `UiWidgetType::Scroll = 6` / `Grid = 7`；`rot/scale/opacity/scrollX/scrollY/cols/gapX/gapY/dragTag/dropAccept` |
+| 交互 | `ui2/UiDocInput.{h,cpp}` | 拖拽状态机 + `findDropTarget()`；**拖过就不再产出点击** |
+| 编辑器 | `editor/UiEditorWindow.{h,cpp}` | 六条新命令 + 属性栏四段（Transform / Scroll / Grid / Drag & drop）+ 两个新按钮 |
+| 判据 | `Ui2SelfTest.cpp` / `verify_ui_editor.py --only i` | 自检 109 → **132 条**；case_i **10 条** |
+
+### 17.2 为什么旋转是"新 mode"而不是给顶点加矩阵
+
+顶点现在是 36 字节（`pos/half/uv/color/mode`）。加 2×2 矩阵要动
+`static_assert`、顶点属性布局、6 个 input、`ui2.vert` 的展开式 ——
+而需求只是"画一个转了角度的圆角框"。
+
+所以 mode 4 的约定是：**CPU 把四角算好当 `inPos` 直接输出**，但 `inHalf` /
+`inUv` 仍是**未旋转的局部系**，frag 里的 `sdRoundBox` 照旧求距离场。
+结果：位置转过去了，圆角还是正圆角（没有因为旋转被拉成椭圆）。
+
+⚠ `ui2.vert` 的分支原来写的是 `inMode > 2.5`，它会把 mode 4 也吃进去 →
+旋转后的框被"中心 + 半宽"再展开一次，画成两倍大且位置错。现在是
+`inMode > 3.5` 单独一支。
+
+### 17.3 三条栈：push/pop 都从索引 0 重算
+
+`m_xf` / `m_op` / `m_clip` 每次变化都**从头累一遍**，不是"乘进去、pop 时除回来"。
+除回去在 `opacity == 0` 时会得到 `0/0`，裁剪求交也没法逆。
+三条栈各自的语义：变换 `concat(child, parent)`、透明度相乘、裁剪求交
+（任一层 `w/h <= 0` → 空裁剪，整个子树一个顶点都不产出）。
+
+### 17.4 裁剪为什么用 scissor 而不是剪几何
+
+mode 0/3 的顶点只存"中心 + 半宽"，剪角点等于改中心/半宽；而 frag 用
+`vLocal` 求圆角距离场 —— 剪完四个角变直角、边缘出硬线。
+`vkCmdSetScissor` 是像素级精确的，代价只是 draw call 变多
+（`UiDocDrawStats::draws` = scissor run 数）。
+
+⚠ 两条 Vulkan 硬约束：`offset >= 0`、`x + w <= 附件宽`。裁剪矩形是
+"参考像素 × `ui.scale`"的浮点，很容易越界几个像素 → 触发
+`VUID-vkCmdDraw-None-07845`，**整帧 UI 消失**。所以 floor/ceil 之后必须夹进
+`[0, outExtent]`。
+
+### 17.5 拖放：判据只写一处
+
+`dragTag` 非空 = 可拖（值 = 载荷类型，如 `"card"`）；`dropAccept` 非空 = 可接
+（逗号分隔，`*` 通配）。**合法性判断只有 `dropAccepts()` 一份**：绘制侧用它决定
+要不要画高亮框，松手时用它决定放不放。
+
+两处各写一份的后果是"高亮了却放不进去"（渲染 bug）和"没高亮却能放"（逻辑 bug），
+必修两遍。
+
+另外三条刻意语义：
+
+- **拖过就不再产出点击**。否则"把牌拖到敌人身上"同时触发"点了一下这张牌"——
+  卡牌里那通常就是"打出去"，一次拖拽结算两次。
+- **落点是自己不算放下**（否则拖起来又松手 = 一次自我转移）。
+- **不设移动阈值**，按下即进拖拽。阈值会让"按下 → 立刻甩出去"退化成一次点击。
+
+### 17.6 命中测试的三道修正
+
+`hits()` 依次：① 逆变换（`toLocal` 解 2×3，行列式近 0 判不命中）；
+② 被 Scroll 祖先裁掉（`hasClip && !inside(clip)`）不命中；
+③ 滚出可视区的行**矩形还在**（`logRect` 不判可见性），必须靠 ② 拦。
+
+⚠ 所以编辑器里 `scale` 下界是 **0.01 而不是 0**：`scale == 0` 让逆变换失效，
+"缩到 0 藏起来"的控件连自己都点不到，"放回来"就没法用鼠标做。
+
+### 17.7 回归
+
+- `MYVK_UI2_TEST=1 Editor.exe` → `UI2-TOTAL pass=132 fail=0`（新增 23 条：
+  `xform_*` 7 / `grid_*`+`scroll_*` 7 / `drag_*` 9）
+- `verify_ui_editor.py` → **56/56 PASS**（A~I 九组，含 `kAdd[]` 6 → 8 之后
+  A4 那 13 个锚点仍在可视区）
+- `verify_ui2.py` → PASS（图集重烤到 **1326 字形 / 2048×4096 / 0.68 MB**）
+- `verify_i18n_coverage.py` → PASS（新增 21 条词条）
+
+### 17.8 这一轮踩到的五个坑
+
+1. **两条自检的"期望"是我写错的，实现是对的**：
+   `scroll_out_of_view_no_verts` 期望 0 顶点，实际 6 —— Scroll 容器自己就是
+   一个面板，它自己要画；`scroll_partial_scissor` 期望 2 段，实际 3 段 ——
+   只有被裁的那**一个** quad 记 scissor，"不裁 / 裁 / 不裁"被中间那个切开。
+   改成"有孩子滚出视野后的顶点数 == 没孩子时的顶点数"和"1 clipped / draws=3"。
+2. **`dropAccepts` 写进匿名命名空间 → `LNK2019`**。症状看着像
+   `findDropTarget` 的错，其实是那里少了一层缩进（内部链接）。
+3. **`"op %.2f"` 的格式串没包 `TR()`** → `verify_i18n_coverage` D 组红。
+   只翻前缀会得到"不透明 op 0.30"这种半截话；`%` 后写成 `2f` 会让占位符漂移
+   （F 组崩溃级）。
+4. **验收脚本引用了示例文档里不存在的控件**（`sel:hud/slot`）。于是
+   `sel` 失败 → 后面两条跟着失败，而期望计数还硬挺在 `12/2` ——
+   **FAIL 说得像实现坏了**。现在计数从 `len(steps)` 推导，改脚本自动跟随。
+5. **`kAdd[]` 从 6 加到 8** 会不会把那排按钮挤出可视区（本项目高频坑：
+   `logRect` 不判可见性）。A4 那 13 个锚点全在，这次没踩到 —— 但每次加按钮
+   都要重跑一遍 A。
+

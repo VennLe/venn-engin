@@ -141,7 +141,10 @@ private:
     // ImGui 的纹理句柄（VkDescriptorSet 转成的整数），0 = 还没有 / 加载失败。
     // 懒加载：只有真的进到 Type 页才建，且失败一次就不重试（否则日志每帧
     // 刷一行 WARN）。句柄必须在 ImGui 后端 shutdown 之前注销 —— 见 onShutdown。
-    std::uint64_t m_typeArt[2] = {0, 0};
+    // 4 张卡片的插图（顺序 = `project::gameTypeAt()` 的顺序）。
+    // ⚠ 尺寸跟着 `kGameTypeCount` 走：加类型时这里不改会**越界读**，
+    //   而症状是"第 4 张卡片画成上一张的图"（不是崩溃）。
+    std::uint64_t m_typeArt[project::kGameTypeCount] = {};
     bool m_typeArtTried = false;
     void ensureTypeArt();
 

@@ -1,0 +1,65 @@
+# ============================================================
+# battle.vks --- __PROJECT_NAME__ 的卡牌对战主脚本（模板: __TEMPLATE_ID__）
+# ============================================================
+# 【这个场景里有什么】
+#   Battle  一张 10 张牌的牌库（5 打击 / 4 防御 / 1 重击）+ 玩法组件
+#   Enemy   45 血、6 攻的行动单位
+#   相机    牌桌视角（没有玩家角色：出生点的 spawnOnRun = false）
+#
+# 【卡牌在哪里编辑】
+#   assets/data/cards.csv   ← 卡牌定义（费用/效果/是否消耗）。
+#   改这个文件不用重编译引擎，**重启游戏就生效**（读表在进场景时做）。
+#   格式见 docs/cards.md；效果串形如 `damage::6:physical|status::2:vulnerable`。
+#
+# 【牌库 / 手牌 / 弃牌堆在哪里看】
+#   编辑器：Debug ▸ Cards 面板（选中 Battle 实体）。
+#   出包后：**右键 = 打出第一张手牌**（见下面 on update），伤害数字会飘出来。
+#           "把整副手牌摆成扇形"那种 HUD 还是你的内容 —— 数据层与
+#           变换/Scroll/Grid/拖放（P3-2）都已经齐了，差的是排版。
+# ============================================================
+
+let turn = 0
+# ⚠⚠ **`let` 只允许在顶层**（钩子/if 块里会报 "let is only allowed at the
+#   top level"，整份脚本 not runnable —— 而且症状是"脚本一行都没跑"）。
+#   块里要改值就用普通赋值。这个坑在模板里踩过一次：`let dots = tickRound()`
+#   写在 `if` 里，于是这张卡牌模板的脚本从诞生起就没跑过。
+let dots = 0
+let dmg = 0
+let got = 0
+
+on start {
+    print("GAME-READY", "__PROJECT_NAME__")
+    print("GAME-MODE", "__TEMPLATE_ID__")
+
+    # 配表（P3-1）：数值与文案都在 CSV 里，脚本直接读。
+    if (tableHas("cards.strike.cost")) {
+        print("CARD strike cost =", tableNum("cards.strike.cost"))
+        print("CARD strike text =", tableStr("cards.strike.text"))
+    } else {
+        # 走到这里 = 配表没被加载（目录 / 打包漏了）。留一行明确的日志，
+        # 否则症状只是"所有卡牌数值都是 0"。
+        print("CARD table missing: assets/data/cards.csv")
+    }
+    setWorldAttr("turn", 0)
+}
+
+on update {
+    # 按一次交互键 = 过一回合（回合末结算持续伤害与状态到期）。
+    if (pressed("Interact")) {
+        turn = turn + 1
+        dots = tickRound()
+        setWorldAttr("turn", turn)
+        print("TURN", turn, "dot =", dots)
+    }
+
+    # 【P3-4】打出第一张手牌（右键 / 手柄 LB），然后补抽一张。
+    #   目标自动选"场上第一个别的单位"（引擎还没有阵营概念，见 docs/cards.md）。
+    #   返回值是**实际造成的伤害**：0 有两种含义 —— 手牌空了，或者这张牌
+    #   本来就不打伤害（防御/抽牌）。分清它们看日志里 GP-CARD-CAST 那一行。
+    #   表现（粒子 + 飘字 + "37 x3" 合并）由出包运行时自动播，脚本不用管。
+    if (pressed("Sprint")) {
+        dmg = castCard(0)
+        got = drawCards(1)
+        print("PLAY-CARD dmg =", dmg, "drawn =", got)
+    }
+}

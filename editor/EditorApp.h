@@ -40,6 +40,19 @@
 #include "animation/Locomotion.h"
 #include "audio/AudioSystem.h"
 #include "script/ScriptRuntime.h"
+// A4：`scene::GameFlags m_flags;` 是**按值成员** → 需要完整类型
+// （不是 unique_ptr，前向声明不够）。
+#include "scene/GameFlags.h"
+// P1：特效调度是**按值成员**（`fx::EffectService m_fx;`）→ 需要完整类型。
+#include "fx/EffectService.h"
+// G19：`scene::LevelStreamer m_levels;` 同上（按值成员）。
+#include "scene/LevelStreamer.h"
+// C8 导航：`nav::NavSystem m_nav;` 按值成员 → 需要完整类型。
+#include "nav/NavSystem.h"
+// P2：`scene::GameplayRuntime m_gameplay;` 同上（按值成员）。
+// ⚠ 这个头会把 `gameplay/Stats.h` / `TurnQueue.h` 带进来 —— 它们只依赖
+//   `<string>` / `<vector>`，所以编辑器这边没有额外的编译代价。
+#include "scene/GameplayRuntime.h"
 
 #include "ConsolePanel.h"    // E16：m_console 成员需要完整类型（unique_ptr 析构）
 #include "NotificationCenter.h"  // E21：m_notifications（同上，unique_ptr 析构）
@@ -89,6 +102,23 @@ class CinematographyPanel;
 class ParticlesPanel;
 class QualitySettingsPanel;   // E26
 class EnvironmentPanel;       // 2026-11-01：Sky & Atmosphere
+class PostVolumePanel;        // 2026-11-02：后处理体积（能力早就有了，缺的是入口）
+class AudioMixerPanel;         // 2026-11-02：音频混音台（同上：Mixer 全在，零入口）
+class ProjectSettingsPanel;    // 2026-11-02：`game.json` → UI（B3）
+class DataTablePanel;          // 2026-11-02：配表（C1）
+class LocalizationPanel;       // 2026-11-02：本地化编辑（C2）
+class FlagTablePanel;          // 2026-11-02：剧情旗标（A4）
+class FxPanel;                 // 2026-11-02：特效面板（P1）
+class ScriptDebugPanel;        // 2026-11-02：脚本断点调试（C8）
+class LevelPanel;              // 2026-11-02：关卡流送（G19）
+class GameplayPanel;           // 2026-11-03：玩法面板（P2，回合队列）
+class CardsPanel;              // 2026-11-03：牌堆操作台（P3-3）
+class NavPanel;                // 2026-11-04：导航操作台（C8）
+// ⚠ 必须是 `struct`（与定义一致）：`class`/`struct` 不一致在 MSVC 上是
+//   C4099 警告 + 某些 TU 里直接 LNK2019 —— 本仓踩过。
+struct AudioMixerIO;
+// 底层类型必须与定义一致（`enum class AudioKnob : int`）。
+enum class AudioKnob : int;
 class MaterialLibraryPanel;   // 2026-10-24：材质仓库
 class DialogueEditorWindow;   // 2026-10-27：剧本编辑器（#310）
 class TimelineEditorWindow;   // 2026-10-27：时间轴轨道编辑器（#311）
@@ -253,6 +283,33 @@ private:
     // 2026-11-01：Sky & Atmosphere（天空 / 云 / 星空）。
     // 与 Quality / Physics 同款：浮动窗口、无快捷键、偶尔打开一次就要看全。
     static void panelDrawEnvironment(EditorApp& a);
+    // 2026-11-02：后处理体积。同款浮动面板；相机位置从视口相机取
+    // （权重是"相机在不在盒子里"，不是"选中实体"）。
+    static void panelDrawPostVolume(EditorApp& a);
+    // 2026-11-02：音频混音台。面板不认识 AudioSystem —— EditorApp 每帧
+    // 填一份快照进去，面板把"想改哪个旋钮"压回来，这里落到引擎。
+    static void panelDrawAudioMixer(EditorApp& a);
+    static void panelDrawProjectSettings(EditorApp& a);
+    static void panelDrawDataTable(EditorApp& a);
+    static void panelDrawLocalization(EditorApp& a);
+    // 2026-11-02：剧情旗标（A4）。数据**不住面板里** —— `scene::GameFlags`
+    // 是 `m_flags`（与 Game.exe 同一个类），面板只 attach 一个指针。
+    static void panelDrawFlags(EditorApp& a);
+    static void panelDrawFx(EditorApp& a);
+    static void panelDrawGameplay(EditorApp& a);
+    static void panelDrawCards(EditorApp& a);
+    // 玩法运行时的"拿到就是最新的"入口：attach + 换场景时重建队列。
+    scene::GameplayRuntime& gp();
+    // 2026-11-02：脚本断点调试（C8）。断点表住在 `ScriptRuntime`，
+    // 暂停态住在实例上 —— 面板只显示与转发。
+    static void panelDrawScriptDebug(EditorApp& a);
+    // 2026-11-02：关卡流送（G19）。流送器住在 EditorApp（它要按 Play 的
+    // **运行态副本**加载/卸载），面板只读它的 slot 表。
+    static void panelDrawLevels(EditorApp& a);
+    // 2026-11-04：导航（C8 · remaining_work §2.3）。网格与代理都住在
+    // `m_nav`，面板只读写它；烘网格要射线，所以走 `bakeNav()` 注入 ——
+    // 按钮与 `nav.bake` 命令落到**同一个**函数。
+    static void panelDrawNavigation(EditorApp& a);
     // 2026-11-01：动画状态机图编辑器（`.anim.json` 的唯一 GUI 入口）。
     static void panelDrawAnimGraph(EditorApp& a);
     // 2026-11-01：角色流程壳（步骤条 + 各步状态 + 就地跳转）。
@@ -284,6 +341,14 @@ private:
     void syncWindowFullscreen();
     // G14-7/8：每帧喂音频 —— 取走试听请求、同步 Play 态声源、推进设备侧。
     void syncEditorAudio(float dt);
+    // 2026-11-02（混音台）：
+    //   fillAudioMixerIO —— 从 `m_audio` 现取一份快照（增益 / 总线电平 /
+    //                       声部数 / 语音串号 / 在播声源），不留状态
+    //   applyAudioKnob   —— 把一条"旋钮意图"落到 AudioSystem。**面板与
+    //                       控制台命令共用这一个**：分开写两套的后果是
+    //                       "命令能改、推子改不动"，而判据只覆盖其中一条
+    void fillAudioMixerIO(editor::AudioMixerIO& io);
+    void applyAudioKnob(editor::AudioKnob knob, float value);
     // F11：只切窗口全屏（面板照旧），编辑态也能用
     void toggleWindowFullscreen();
     // 把编辑场景立刻落盘到当前场景路径（Ctrl+S 与 Content 工具栏的
@@ -599,6 +664,71 @@ private:
     std::unique_ptr<QualitySettingsPanel> m_qualityPanel;   // E26
     // 2026-11-01：天空 / 云 / 星空。构造无副作用，draw 时才读 Renderer。
     std::unique_ptr<EnvironmentPanel> m_envPanel;
+    // 2026-11-02：后处理体积。构造无副作用（不读写场景）。
+    std::unique_ptr<PostVolumePanel> m_pvPanel;
+    // 2026-11-02：音频混音台。构造无副作用（不碰设备）。
+    std::unique_ptr<AudioMixerPanel> m_audioPanel;
+    // 2026-11-02：项目设置（`assets/game.json`）。构造零 IO ——
+    // 读盘发生在第一次 draw（`loadIfNeeded`）或第一条命令里。
+    std::unique_ptr<ProjectSettingsPanel> m_projectSettings;
+    std::unique_ptr<DataTablePanel> m_dataTablePanel;
+    std::unique_ptr<LocalizationPanel> m_localizationPanel;
+    // 2026-11-02：旗标表（A4）与脚本断点调试（C8）。构造无副作用 ——
+    // 两个面板都是"attach 一个指针"，真正的数据住在下面 m_flags 与
+    // m_scriptRuntime 里。
+    std::unique_ptr<FlagTablePanel> m_flagPanel;
+    std::unique_ptr<FxPanel> m_fxPanel;
+    std::unique_ptr<ScriptDebugPanel> m_scriptDbg;
+    // 2026-11-02：关卡流送（G19）。面板不拥有流送器 —— 流送要写进"运行态
+    // 副本"，而玩家位置只有 EditorApp 知道，所以动词走 `applyLevelAction()`。
+    std::unique_ptr<LevelPanel> m_levelPanel;
+    // 2026-11-03：玩法面板（P2）。面板不持有场景，只拿 `&m_gameplay`；
+    // 队列的 gauge 回填走组件，所以"读档后出手顺序不变"能成立。
+    std::unique_ptr<GameplayPanel> m_gpPanel;
+    // 2026-11-03：牌堆操作台（P3-3）。与 `m_gpPanel` 同一套路：不持有
+    // 场景，只拿 `&m_gameplay`（随机流住在那里 —— 抽牌必须走 gameplay 流，
+    // 否则多放一个粒子就会改变下一张抽到的牌）。
+    std::unique_ptr<CardsPanel> m_cardsPanel;
+
+    // ---- 剧情旗标（A4）----
+    //
+    // ⚠ 它与 Game.exe 里的 `m_flags` 是**同一个类**（`scene::GameFlags`），
+    //   但在编辑器里是**独立的一份**：编辑器的 Play 是一局临时游戏，
+    //   不该与出包后的存档有任何牵连。
+    // ⚠ 进入 Play 时清空（= 新开一局），停止后**保留**（可以事后翻看
+    //   "刚才那一局到底设了哪些旗标"）。这条规则写在 `verify_flags.py`
+    //   B/C 组里，改动要同步。
+    scene::GameFlags m_flags;
+    // ---- 关卡流送（G19）----
+    //
+    // 按值成员（与 `m_flags` 同一条理由：它是"这一局"的状态，不是外部服务）。
+    // ⚠ 它**只**在 Play 时驱动（`updateLevelStreaming`），编辑态调用
+    //   `update()` 会把副关卡的实体加进**编辑场景** —— 而编辑场景一旦加了
+    //   东西，`scene.save` 就会把它们写进主场景文件（副关卡从此粘在主场景里）。
+    //   所以编辑态只允许"手动 Load/Unload"（那也是加到运行态副本上）。
+    scene::LevelStreamer m_levels;
+    // 最近一次 `level.manifest` 读的那份清单（面板的 Reload 用它）。
+    // 空 = 还没加载过（Reload 按钮点了等于加载默认路径）。
+    std::string m_levelManifestPath = "levels/world.vlevels";
+    glm::vec3 levelViewerPosition() const;
+    void updateLevelStreaming();
+    // 动词统一入口（面板按钮与 `level.*` 命令都走它）。
+    void applyLevelAction(const char* verb, const std::string& name);
+    void reloadLevelManifest(const std::string& path);
+    // ---- 导航（C8 · NPC 寻路）----
+    //
+    // 网格与代理状态都在这里（按值成员，与 `m_levels` 同一条理由：它是
+    // "这一局/这一次编辑"的状态，不是外部服务）。
+    // ⚠ 编辑态烘网格用的是**当前编辑场景临时建的物理世界**（`bakeNav`），
+    //   不是 `m_physics` —— 后者只在 Play 里存在，而"烘一张网格看看形状"
+    //   恰恰是编辑时最需要的事。所以编辑态烘焙每次都会建一次世界（几十
+    //   毫秒，按钮/命令触发，不在每帧路径上）。
+    nav::NavSystem m_nav;
+    std::unique_ptr<NavPanel> m_navPanel;
+    // 烘一张网格并装进 `sys`。返回一行 `NAV-BAKE …`（面板状态栏与命令回显共用）。
+    std::string bakeNav(const nav::NavGridDesc& d, nav::NavSystem& sys);
+    // 网格资产存/取（`assets/<rel>`）。返回一行 `NAV-GRID …`。
+    std::string navGridIo(bool save, const std::string& rel, nav::NavSystem& sys);
     // 2026-11-01：状态机图编辑器。构造无副作用（不读盘）——
     // 只有 `open(路径)` 才会触发一次加载。
     std::unique_ptr<AnimatorGraphPanel> m_animGraph;
@@ -629,7 +759,10 @@ private:
     std::unique_ptr<WaterEditor> m_water;
     std::unique_ptr<ConsolePanel> m_console;
     // E16：MYVK_EDITOR_CONSOLE_CMD 注入命令只执行一次的哨兵。
-    bool m_consoleCmdDone = false;
+    // 控制台命令队列的游标（C8 起支持 `@帧号` 分批；见 .cpp 的注释）。
+    // ⚠ 以前的 `m_consoleCmdDone`（一次性布尔）已经承载不了"加断点"与
+    //   "继续"必须跨帧这件事，换成一个下标。
+    std::size_t m_consoleCmdNext = 0;
     bool m_panelsOpenedOnce = false;
     bool m_scriptTabForced = false;
     // E18：命令面板开合位（Ctrl+Shift+P / Help 菜单）
@@ -781,6 +914,64 @@ private:
     // 乘在 dt 上（等价于 Unity 的 Time.timeScale / UE 的 Global Time
     // Dilation）。默认 1.0 —— 不碰它时逐帧行为与本功能引入前完全一致。
     float m_timeScale = 1.0f;
+
+    // ---- P1：特效调度 + 打击感（2026-11-02）----
+    //
+    // `m_fx` 是**唯一**的特效入口：动画事件、脚本动词、面板按钮三者都走它。
+    // 宿主实体由它自己建（带 `FxHostComponent`，不进场景文件）。
+    fx::EffectService m_fx;
+
+    // ---- P2：玩法状态（2026-11-03）----
+    //
+    // 与 `m_fx` 同一条纪律：**唯一**入口。Inspector 的 Gameplay 页签改的是
+    // 组件字段（真值），这个对象负责"组件 ↔ 数值视图"的往返与回合队列。
+    //
+    // ⚠ 它**不缓存**任何算好的数值（见 GameplayRuntime.h 文件头）：属性
+    //   每帧现算，代价是个位数次乘法，换来的是"面板显示的数"永远等于
+    //   "伤害真正用的数"。
+    scene::GameplayRuntime m_gameplay;
+    // attach 过的场景指针。换场景（进/出 Play、File ▸ Open）时队列要从
+    // 新场景的组件重建 —— 不重建的话队列里全是上一个世界的实体 id。
+    scene::Scene* m_gpScene = nullptr;
+
+    // P3-1：配表里的卡牌定义（**内容**，不进场景文件）。`gp()` 在换场景时
+    // 把它们灌进新场景的所有牌堆。⚠ 它只解析一次 CSV：配表在进程内不变，
+    // 而换场景是高频动作（撤销 / 进出 Play）。
+    std::vector<gameplay::CardDef> m_cardDefs;
+    bool m_cardDefsLoaded = false;
+
+    // 顿帧剩余（**真实秒**）。⚠ 必须用真实 dt 递减 —— 用 `dt * timeScale`
+    // 的话自己把倍速压低之后计时器跟着变慢，0.09 秒的停顿会拖到 1.8 秒；
+    // 更糟的是写成 `timeScale = 0` 就永远走不完（游戏卡死但渲染正常）。
+    float m_hitstopLeft = 0.0f;
+    // 顿帧的**可观测状态**（P1-5 的判据全靠这几个数）。
+    //
+    // ⚠ 为什么必须留这几个计数器：顿帧的三个失败形态在画面上都**长得像正常**
+    //   —— ①用 `dt*timeScale` 递减（0.09 秒拖成 1.5 秒）、②写成
+    //   `timeScale=0`（永远走不完 = 卡死但渲染正常）、③连击累加（5 连击
+    //   = 0.45 秒的卡）。这三种只有"打了多久 / 几帧结束 / 累计请求几次"
+    //   这三个数能区分，日志里没有它们就只能靠肉眼感觉"好像有点卡"。
+    float m_hitstopTotal = 0.0f;    // 本次顿帧的**请求时长**（取 max，不累加）
+    float m_hitstopElapsed = 0.0f;  // 真实累计秒（与 total 比 → 抓 16 倍拖长）
+    int m_hitstopFrames = 0;        // 真实帧数（与 90 比 → 抓死锁）
+    int m_hitstopReqs = 0;          // 本次窗口内收到几次请求（抓累加）
+    // 闪白（强度 0..1 / 剩余 / 总时长 / 颜色）。走 ImGui 背景层叠加，
+    // 不新开渲染 pass（见 drawFxOverlay 的注释）。
+    float m_flashStrength = 0.0f;
+    float m_flashLeft = 0.0f;
+    float m_flashTotal = 0.0f;
+    glm::vec3 m_flashColor{1.0f, 1.0f, 1.0f};
+    // 闪白的真实累计秒（判据用：`end elapsed=` 与 `begin=` 应该对得上）。
+    float m_flashElapsed = 0.0f;
+
+    void setupFxSinks();
+    // 每帧：同步场景 / 推进回收 / 递减顿帧与闪白。用**真实** dt。
+    void tickFx(float realDt);
+    // Play 中：把本帧动画事件分派成特效/音效/震屏/顿帧。
+    // ⚠ 全仓**只有这一处**消费 `eventsThisFrame()` —— 两处会双重播放。
+    void dispatchAnimEventsThisFrame();
+    // 闪白叠加（在 3D 之上、ImGui 窗口之下）。
+    void drawFxOverlay();
 
     // ---- 视口"以选中相机预览"：进入前的那份镜头效果 ----
     //

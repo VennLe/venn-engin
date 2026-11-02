@@ -99,6 +99,16 @@ struct MockHost {
     bool showDialogueOk = true;
     bool playAnimOk = true;
 
+    // ---- P3-4：卡牌两件（记录器）----
+    // `wireCards = false` = 宿主**没接**这两个动作（负向用例走它）。
+    // 正/负两向都要测：只测正向的话，"宿主没接 → 静默返回 0"照样绿，
+    // 而那正是 C14 记过的那条纪律（没钱就说没钱）。
+    bool wireCards = true;
+    std::vector<int> castIdx;
+    std::vector<int> drawn;
+    float castDamage = 7.0f;   // castCard 的返回值 = "实际造成的伤害"
+    int drawReturn = 1;
+
     // ---- C6 第二批：世界控制（记录器）----
     // 旗标故意用**真的一张 map**而不是计数器：要验的是"写进去的能被读
     // 回来"，不是"调用发生了"。
@@ -121,6 +131,16 @@ struct MockHost {
     bool openUiOk = true;
     // 故意只在 `installMock` 里装、`installEmptyHost` 里不装：
     // "没装"那条路必须能测到，否则"钩子接丢了"永远表现为静默 false。
+
+    // ---- C8-2：导航四件（记录器）----
+    // `wireNav = false` = 宿主没接导航（负向用例走它）。
+    bool wireNav = true;
+    // `navGotoOk` 就是"网格在不在"：真实宿主在没有网格时返回 false。
+    bool navGotoOk = true;
+    std::vector<glm::vec3> navGoals;
+    bool navReached = false;
+    bool navFailedFlag = false;
+    int navStopCalls = 0;
 };
 
 void installMock(ScriptRuntime& rt, MockHost& mh) {
@@ -213,6 +233,30 @@ void installMock(ScriptRuntime& rt, MockHost& mh) {
         mh.uiRequests.push_back(path);
         return mh.openUiOk;
     };
+    // P3-4：卡牌两件。⚠ 用 `if` 而不是默认接上 —— 负向用例要先把它关掉。
+    if (mh.wireCards) {
+        svc.act.castCard = [&mh](ecs::Entity, int idx) {
+            mh.castIdx.push_back(idx);
+            return mh.castDamage;
+        };
+        svc.act.drawCards = [&mh](ecs::Entity, int n) {
+            mh.drawn.push_back(n);
+            return mh.drawReturn;
+        };
+    }
+    // C8-2：导航四件。同样可以整组关掉（负向用例）。
+    if (mh.wireNav) {
+        svc.act.navGoto = [&mh](ecs::Entity, glm::vec3 p) {
+            mh.navGoals.push_back(p);
+            return mh.navGotoOk;
+        };
+        svc.act.navArrived = [&mh](ecs::Entity) { return mh.navReached; };
+        svc.act.navFailed = [&mh](ecs::Entity) { return mh.navFailedFlag; };
+        svc.act.navStop = [&mh](ecs::Entity) {
+            ++mh.navStopCalls;
+            return true;
+        };
+    }
     rt.setServices(std::move(svc));
     rt.setErrorSink([&mh](const ScriptInstance& inst, const std::string& msg) {
         ++mh.errorReports;
@@ -1315,6 +1359,161 @@ let p = pos(s)
                : std::string("<no instance>"));
 }
 
+// C21 卡牌两件（P3-4）：参数送到宿主、返回值带回脚本、宿主没接时必须报错。
+//
+// ⚠ 返回值是**实际造成的伤害**（不是 1/0）：判据用 `castDamage = 7` 这种
+//   "不可能被意外满足"的值 —— 用 1 的话，"返回值恒为 1"的实现照样绿。
+void testC21() {
+    // ---- 正向 ----
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        mh.castDamage = 7.0f;
+        mh.drawReturn = 2;
+        installMock(rt, mh);
+        const ecs::Entity e = runScript(sc, rt, "C21", R"VKS(
+let d = castCard(2)
+let g = drawCards(3)
+)VKS", 3);
+        const ScriptInstance* inst = rt.find(e);
+        const bool args = mh.castIdx.size() == 1 && mh.castIdx[0] == 2 &&
+                          mh.drawn.size() == 1 && mh.drawn[0] == 3;
+        const bool rets = inst && std::fabs(varNum(inst, "d") - 7.0) < 1e-6 &&
+                          std::fabs(varNum(inst, "g") - 2.0) < 1e-6;
+        check("C21 castCard/drawCards 参数到宿主、返回值回脚本", args && rets,
+              inst ? fmt("idx=%.0f n=%.0f d=%.0f g=%.0f",
+                         mh.castIdx.empty() ? -1.0 : mh.castIdx[0],
+                         mh.drawn.empty() ? -1.0 : mh.drawn[0],
+                         varNum(inst, "d"), varNum(inst, "g"))
+                   : std::string("<no instance>"));
+    }
+
+    // ---- 负向：宿主没接 → 报错（不许静默返回 0）----
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        mh.wireCards = false;
+        installMock(rt, mh);
+        const ecs::Entity e = runScript(sc, rt, "C21b", R"VKS(
+let d = castCard(0)
+)VKS", 2);
+        const ScriptInstance* inst = rt.find(e);
+        const bool errored =
+            inst && inst->lastError.find("castCard() is not available") !=
+                        std::string::npos;
+        check("C21b 宿主没接 castCard 时必须报错（不许静默返回 0）", errored,
+              inst ? fmt("d=%.0f err=%s", varNum(inst, "d"),
+                         inst->lastError.c_str())
+                   : std::string("<no instance>"));
+    }
+}
+
+// C22 导航四动词（C8-2）：参数到宿主、三个返回值的语义、没接必报错。
+//
+// ⚠ 这一组钉的是**语义分叉**，不是"函数能调通"：
+//   · `navGoto` 返回 0 ≠ 报错。0 的含义是"受理失败（没有网格）"，
+//     属于**运行时状态**，脚本要能读到它自己决定（`if (navGoto(...))`）；
+//     报错的话整份脚本 not runnable，而"这一关没烘网格"不是脚本的错。
+//   · `navArrived` / `navFailed` 必须能同时为 0（正在走），否则
+//     `while (!navArrived())` 与 `if (navFailed())` 会有一个永远骗人。
+void testC22() {
+    // ---- 正向：三个返回值的四种状态 ----
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        mh.navGotoOk = true;
+        mh.navReached = false;      // 正在走
+        mh.navFailedFlag = false;
+        installMock(rt, mh);
+        const ecs::Entity e = runScript(sc, rt, "C22", R"VKS(
+let ok = navGoto(1, 0, -2)
+let at = navArrived()
+let bad = navFailed()
+let st = navStop()
+)VKS", 2);
+        const ScriptInstance* inst = rt.find(e);
+        const bool goal = mh.navGoals.size() == 1 &&
+                          std::fabs(mh.navGoals[0].x - 1.0f) < 1e-5f &&
+                          std::fabs(mh.navGoals[0].y - 0.0f) < 1e-5f &&
+                          std::fabs(mh.navGoals[0].z + 2.0f) < 1e-5f;
+        const bool rets = inst && std::fabs(varNum(inst, "ok") - 1.0) < 1e-6 &&
+                          std::fabs(varNum(inst, "at") - 0.0) < 1e-6 &&
+                          std::fabs(varNum(inst, "bad") - 0.0) < 1e-6 &&
+                          std::fabs(varNum(inst, "st") - 1.0) < 1e-6 &&
+                          mh.navStopCalls == 1;
+        check("C22a navGoto 坐标到宿主、walking 时 arrived/failed 都是 0", goal && rets,
+              inst ? fmt("goals=%d ok=%.0f at=%.0f bad=%.0f st=%.0f stops=%d",
+                         static_cast<int>(mh.navGoals.size()), varNum(inst, "ok"),
+                         varNum(inst, "at"), varNum(inst, "bad"),
+                         varNum(inst, "st"), mh.navStopCalls)
+                   : std::string("<no instance>"));
+    }
+    // ---- arrived / failed 各自能翻上去（两个标志不是同一个量）----
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        mh.navReached = true;       // 到了
+        mh.navFailedFlag = false;
+        installMock(rt, mh);
+        const ecs::Entity e = runScript(sc, rt, "C22b", "let at = navArrived()\n", 2);
+        const ScriptInstance* inst = rt.find(e);
+        check("C22b navArrived 到了 = 1（到点不等于失败）",
+              inst && std::fabs(varNum(inst, "at") - 1.0) < 1e-6,
+              inst ? fmt("at=%.0f", varNum(inst, "at")) : std::string("<no instance>"));
+    }
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        mh.navReached = false;
+        mh.navFailedFlag = true;    // 走不过去
+        installMock(rt, mh);
+        const ecs::Entity e = runScript(sc, rt, "C22c", "let bad = navFailed()\n", 2);
+        const ScriptInstance* inst = rt.find(e);
+        check("C22c navFailed 不可达 = 1（失败不等于到达）",
+              inst && std::fabs(varNum(inst, "bad") - 1.0) < 1e-6,
+              inst ? fmt("bad=%.0f", varNum(inst, "bad")) : std::string("<no instance>"));
+    }
+    // ---- 没有网格：返回 0 但**不报错**（运行时状态 ≠ 脚本错误）----
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        mh.navGotoOk = false;       // 宿主：网格不在
+        installMock(rt, mh);
+        const ecs::Entity e = runScript(sc, rt, "C22d", R"VKS(
+let ok = navGoto(0, 0, 0)
+)VKS", 2);
+        const ScriptInstance* inst = rt.find(e);
+        const bool good = inst && std::fabs(varNum(inst, "ok") - 0.0) < 1e-6 &&
+                          inst->lastError.empty() && mh.navGoals.size() == 1;
+        check("C22d 没有网格时 navGoto 返回 0 且不报错（目标仍记账）", good,
+              inst ? fmt("ok=%.0f goals=%d err=%s", varNum(inst, "ok"),
+                         static_cast<int>(mh.navGoals.size()),
+                         inst->lastError.c_str())
+                   : std::string("<no instance>"));
+    }
+    // ---- 负向：宿主没接 → 报错说清是宿主缺能力 ----
+    {
+        scene::Scene sc;
+        ScriptRuntime rt;
+        MockHost mh;
+        mh.wireNav = false;
+        installMock(rt, mh);
+        const ecs::Entity e = runScript(sc, rt, "C22e", "let ok = navGoto(0, 0, 0)\n", 2);
+        const ScriptInstance* inst = rt.find(e);
+        const bool errored =
+            inst && inst->lastError.find("navGoto() is not available") !=
+                        std::string::npos;
+        check("C22e 宿主没接 navGoto 时必须报错（不许静默返回 0）", errored,
+              inst ? fmt("err=%s", inst->lastError.c_str()) : std::string("<no instance>"));
+    }
+}
+
 // C18 spawn 失败：宿主返回无效句柄时必须报错。
 //
 // ⚠ 静默返回一个无效句柄的后果：下一句 `setPos(s, ...)` 只会说"实体无效"，
@@ -2276,6 +2475,8 @@ int runScriptSelfTest() {
     testC16();
     testC17();
     testC18();
+    testC21();   // P3-4：卡牌两件
+    testC22();   // C8-2：导航四件
     testC19();
     testC20();
     VK_LOG_INFO("--- S3 事件与输入 ---");

@@ -5,6 +5,8 @@
 #include "ui2/SdfFont.h"
 #include "ui2/Ui2Settings.h"
 
+#include <vector>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -47,21 +49,10 @@ ui2::UiRect Hud::healthFillRect(const HudModel& m, uint32_t outW,
 
 bool Hud::worldToScreen(const glm::mat4& viewProj, const glm::vec3& world,
                         uint32_t outW, uint32_t outH, glm::vec2* out) {
-    if (!out || outW == 0 || outH == 0) return false;
-    const glm::vec4 clip = viewProj * glm::vec4(world, 1.0f);
-    // ① 相机背后：**整体丢弃**。w 接近 0 时 ndc 会炸到极大值，
-    //    钳到边框上会得到一个"永远贴在屏幕边上的数字"。
-    if (clip.w <= 1e-5f) return false;
-    const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-    // ② Y 只翻**一次**：投影矩阵里已经翻过（见头文件）。
-    const float sx = (ndc.x * 0.5f + 0.5f) * static_cast<float>(outW);
-    const float sy = (ndc.y * 0.5f + 0.5f) * static_cast<float>(outH);
-    // ③ 屏幕外 → 不画
-    if (sx < 0.0f || sx > static_cast<float>(outW)) return false;
-    if (sy < 0.0f || sy > static_cast<float>(outH)) return false;
-    out->x = sx;
-    out->y = sy;
-    return true;
+    // ⚠ 实现只有一份，在 `gameplay/DamageNumbers.cpp` 里 —— 伤害数字层也要
+    //   投影，两处各写一份必然有一处多翻一次 Y（症状是"数字上下镜像但还在
+    //   屏幕附近"，最难发现）。这里保留这个函数是为了不改老调用点。
+    return gameplay::projectToScreen(viewProj, world, outW, outH, out);
 }
 
 void Hud::build(ui2::UiCanvas& c, const HudModel& m,
@@ -141,32 +132,40 @@ void Hud::build(ui2::UiCanvas& c, const HudModel& m,
     }
 
     // ---- 伤害数字（世界 → 屏幕，上浮 + 淡出）----
-    for (const DamagePopup& p : m.popups) {
-        glm::vec2 sp;
-        if (!worldToScreen(viewProj, p.worldPos, outW, outH, &sp)) continue;
-        const float t = std::max(0.0f, std::min(1.0f, p.t));
-        const float alpha = 1.0f - t;
-        if (alpha <= 0.02f) continue;
-
-        // 上浮 60 参考像素 + 字号从大变小（打击感：先"炸"出来再稳住）
-        const float rise = 60.0f * s * t;
-        const float size = (28.0f - 6.0f * t) * s;
-
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%d",
-                      static_cast<int>(std::lround(p.amount)));
-
-        const int a = static_cast<int>(alpha * 255.0f);
-        const uint32_t col = ui2::rgba(255, 92, 72, a);
-
+    //
+    // P3-4 起曲线（上浮 / 弹一下 / 淡出 / 漂移）都在
+    // `gameplay::DamageNumberLayer::layout()` 里算好，这里只负责
+    // "给我一串 `PopupLayout`，我照着画"。
+    // ⚠ 那不是多余的间接层：绘制侧若自己算曲线，就会与自检里断言的
+    //   那一套（同样是 layout 的输出）分成两条路，"自检全绿但画面上
+    //   数字不动"是这条分叉唯一的表现形式。
+    std::vector<gameplay::PopupLayout> lays;
+    m.popups.layout(viewProj, outW, outH, s, lays);
+    for (const gameplay::PopupLayout& L : lays) {
         if (font && font->valid()) {
-            const float tw = c.measure(*font, buf, size);
-            c.text(*font, sp.x - tw * 0.5f, sp.y - rise, buf, col, size);
+            const float tw = c.measure(*font, L.text.c_str(), L.sizePx);
+            const float x = L.centerX - tw * 0.5f;
+            // 描边：先画四个方向上 1px 的深色副本，再画本体。
+            // （不做出面（outline）通道：一组 UI 顶点里加描边模式要动
+            //   `ui2.vert` 与顶点布局，而"压在亮背景上读不清"用四份便宜。）
+            if (L.outline) {
+                const float o = std::max(1.0f, 1.5f * s);
+                const uint32_t oc = ui2::rgba(12, 14, 18,
+                                              static_cast<int>(190.0f * L.alpha));
+                c.text(*font, x - o, L.baselineY, L.text.c_str(), oc, L.sizePx);
+                c.text(*font, x + o, L.baselineY, L.text.c_str(), oc, L.sizePx);
+                c.text(*font, x, L.baselineY - o, L.text.c_str(), oc, L.sizePx);
+                c.text(*font, x, L.baselineY + o, L.text.c_str(), oc, L.sizePx);
+            }
+            c.text(*font, x, L.baselineY, L.text.c_str(), L.color, L.sizePx);
         } else {
             // 没有字体时画一个小方块（至少能证明"位置对了"）——
             // 这不是兜底美化，是让无字体环境下的验收也能量到东西。
             const float q = 4.0f * s;
-            c.rect(sp.x - q, sp.y - rise - q, q * 2.0f, q * 2.0f, col);
+            const uint32_t col = ui2::rgba(255, 92, 72,
+                                           static_cast<int>(255.0f * L.alpha));
+            c.rect(L.centerX - q, L.baselineY - q - L.sizePx * 0.5f - q,
+                   q * 2.0f, q * 2.0f, col);
         }
     }
 

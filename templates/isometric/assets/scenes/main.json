@@ -1,0 +1,3489 @@
+{
+ "version": 1,
+ "generator": "venn template isometric",
+ "camera": {
+  "target": [
+   0.0,
+   0.0,
+   0.6
+  ],
+  "yaw": 0.7853981633974483,
+  "pitch": 0.98,
+  "distance": 24.0,
+  "fov": 40.0
+ },
+ "physics": {
+  "enabled": true,
+  "groundPlane": true
+ },
+ "environment": {
+  "zenith": [
+   0.16,
+   0.36,
+   0.82
+  ],
+  "horizon": [
+   0.6,
+   0.76,
+   0.93
+  ],
+  "ground": [
+   0.4,
+   0.48,
+   0.36
+  ],
+  "cloudColor": [
+   1.0,
+   1.0,
+   1.0
+  ],
+  "cloudCoverage": 0.52,
+  "cloudThickness": 0.94,
+  "cloudScale": 1.25,
+  "cloudHeight": 900.0,
+  "cloudSpeed": 0.012,
+  "cloudShadow": 0.58,
+  "cloudEdgeSharpness": 0.6,
+  "exposure": 0.92,
+  "starAmount": 0.0,
+  "starBrightness": 0.0,
+  "sunDirection": [
+   0.522,
+   -0.326,
+   0.788
+  ],
+  "sunIntensity": 1.0,
+  "sunAngularRadius": 0.017,
+  "horizonGlow": 0.3
+ },
+ "entities": [
+  {
+   "name": "Ground",
+   "transform": {
+    "position": [
+     0,
+     0,
+     -0.12
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": true,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "plane",
+    "size": 40.0,
+    "name": "board_ground"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_ground_mat",
+    "baseColor": [
+     0.12,
+     0.13,
+     0.16,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.92,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_0_0",
+   "transform": {
+    "position": [
+     -3.5,
+     -3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_0_1",
+   "transform": {
+    "position": [
+     -3.5,
+     -2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_0_2",
+   "transform": {
+    "position": [
+     -3.5,
+     -1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_0_3",
+   "transform": {
+    "position": [
+     -3.5,
+     -0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_0_4",
+   "transform": {
+    "position": [
+     -3.5,
+     0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_0_5",
+   "transform": {
+    "position": [
+     -3.5,
+     1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_0_6",
+   "transform": {
+    "position": [
+     -3.5,
+     2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_0_7",
+   "transform": {
+    "position": [
+     -3.5,
+     3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_1_0",
+   "transform": {
+    "position": [
+     -2.5,
+     -3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_1_1",
+   "transform": {
+    "position": [
+     -2.5,
+     -2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_1_2",
+   "transform": {
+    "position": [
+     -2.5,
+     -1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_1_3",
+   "transform": {
+    "position": [
+     -2.5,
+     -0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_1_4",
+   "transform": {
+    "position": [
+     -2.5,
+     0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_1_5",
+   "transform": {
+    "position": [
+     -2.5,
+     1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_1_6",
+   "transform": {
+    "position": [
+     -2.5,
+     2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_1_7",
+   "transform": {
+    "position": [
+     -2.5,
+     3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_2_0",
+   "transform": {
+    "position": [
+     -1.5,
+     -3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_2_1",
+   "transform": {
+    "position": [
+     -1.5,
+     -2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_2_2",
+   "transform": {
+    "position": [
+     -1.5,
+     -1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_2_3",
+   "transform": {
+    "position": [
+     -1.5,
+     -0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_2_4",
+   "transform": {
+    "position": [
+     -1.5,
+     0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_2_5",
+   "transform": {
+    "position": [
+     -1.5,
+     1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_2_6",
+   "transform": {
+    "position": [
+     -1.5,
+     2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_2_7",
+   "transform": {
+    "position": [
+     -1.5,
+     3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_3_0",
+   "transform": {
+    "position": [
+     -0.5,
+     -3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_3_1",
+   "transform": {
+    "position": [
+     -0.5,
+     -2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_3_2",
+   "transform": {
+    "position": [
+     -0.5,
+     -1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_3_3",
+   "transform": {
+    "position": [
+     -0.5,
+     -0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_3_4",
+   "transform": {
+    "position": [
+     -0.5,
+     0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_3_5",
+   "transform": {
+    "position": [
+     -0.5,
+     1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_3_6",
+   "transform": {
+    "position": [
+     -0.5,
+     2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_3_7",
+   "transform": {
+    "position": [
+     -0.5,
+     3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_4_0",
+   "transform": {
+    "position": [
+     0.5,
+     -3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_4_1",
+   "transform": {
+    "position": [
+     0.5,
+     -2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_4_2",
+   "transform": {
+    "position": [
+     0.5,
+     -1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_4_3",
+   "transform": {
+    "position": [
+     0.5,
+     -0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_4_4",
+   "transform": {
+    "position": [
+     0.5,
+     0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_4_5",
+   "transform": {
+    "position": [
+     0.5,
+     1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_4_6",
+   "transform": {
+    "position": [
+     0.5,
+     2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_4_7",
+   "transform": {
+    "position": [
+     0.5,
+     3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_5_0",
+   "transform": {
+    "position": [
+     1.5,
+     -3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_5_1",
+   "transform": {
+    "position": [
+     1.5,
+     -2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_5_2",
+   "transform": {
+    "position": [
+     1.5,
+     -1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_5_3",
+   "transform": {
+    "position": [
+     1.5,
+     -0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_5_4",
+   "transform": {
+    "position": [
+     1.5,
+     0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_5_5",
+   "transform": {
+    "position": [
+     1.5,
+     1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_5_6",
+   "transform": {
+    "position": [
+     1.5,
+     2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_5_7",
+   "transform": {
+    "position": [
+     1.5,
+     3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_6_0",
+   "transform": {
+    "position": [
+     2.5,
+     -3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_6_1",
+   "transform": {
+    "position": [
+     2.5,
+     -2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_6_2",
+   "transform": {
+    "position": [
+     2.5,
+     -1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_6_3",
+   "transform": {
+    "position": [
+     2.5,
+     -0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_6_4",
+   "transform": {
+    "position": [
+     2.5,
+     0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_6_5",
+   "transform": {
+    "position": [
+     2.5,
+     1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_6_6",
+   "transform": {
+    "position": [
+     2.5,
+     2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_6_7",
+   "transform": {
+    "position": [
+     2.5,
+     3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_7_0",
+   "transform": {
+    "position": [
+     3.5,
+     -3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_7_1",
+   "transform": {
+    "position": [
+     3.5,
+     -2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_7_2",
+   "transform": {
+    "position": [
+     3.5,
+     -1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_7_3",
+   "transform": {
+    "position": [
+     3.5,
+     -0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_7_4",
+   "transform": {
+    "position": [
+     3.5,
+     0.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_7_5",
+   "transform": {
+    "position": [
+     3.5,
+     1.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_7_6",
+   "transform": {
+    "position": [
+     3.5,
+     2.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_dark",
+    "baseColor": [
+     0.24,
+     0.27,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Tile_7_7",
+   "transform": {
+    "position": [
+     3.5,
+     3.5,
+     -0.05
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": false,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.94,
+    "name": "board_tile"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_tile_light",
+    "baseColor": [
+     0.46,
+     0.5,
+     0.6,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   }
+  },
+  {
+   "name": "Ally",
+   "transform": {
+    "position": [
+     -2.5,
+     -0.5,
+     0.42
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": true,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.85,
+    "name": "board_unit"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_unit_ally",
+    "baseColor": [
+     0.36,
+     0.62,
+     0.95,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   },
+   "gameplay": {
+    "attrs": [
+     {
+      "n": "hp",
+      "b": 30.0,
+      "min": 0.0,
+      "max": 30.0
+     },
+     {
+      "n": "attack",
+      "b": 8.0,
+      "min": 0.0,
+      "max": 1000000000.0
+     },
+     {
+      "n": "armor",
+      "b": 0.0,
+      "min": 0.0,
+      "max": 1000000000.0
+     }
+    ]
+   }
+  },
+  {
+   "name": "Enemy",
+   "transform": {
+    "position": [
+     2.5,
+     0.5,
+     0.42
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": true,
+   "mesh": {
+    "kind": "builtin",
+    "shape": "cube",
+    "size": 0.85,
+    "name": "board_unit"
+   },
+   "material": {
+    "kind": "procedural",
+    "name": "board_unit_enemy",
+    "baseColor": [
+     0.88,
+     0.36,
+     0.34,
+     1.0
+    ],
+    "metallic": 0.0,
+    "roughness": 0.8,
+    "normalScale": 0.0,
+    "ao": 1.0,
+    "emissive": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "doubleSided": false,
+    "alphaBlend": false
+   },
+   "gameplay": {
+    "attrs": [
+     {
+      "n": "hp",
+      "b": 24.0,
+      "min": 0.0,
+      "max": 24.0
+     },
+     {
+      "n": "attack",
+      "b": 6.0,
+      "min": 0.0,
+      "max": 1000000000.0
+     },
+     {
+      "n": "armor",
+      "b": 0.0,
+      "min": 0.0,
+      "max": 1000000000.0
+     }
+    ]
+   }
+  },
+  {
+   "name": "GameStart",
+   "transform": {
+    "position": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "rotation": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "parent": -1,
+   "visible": true,
+   "castShadow": true,
+   "gameStart": {
+    "yaw": 0.0,
+    "enabled": true,
+    "mode": "third",
+    "spawnOnRun": false
+   },
+   "script": {
+    "path": "scripts/main.vks",
+    "enabled": true,
+    "timeScale": 1.0
+   }
+  }
+ ]
+}

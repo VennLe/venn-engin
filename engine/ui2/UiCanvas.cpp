@@ -8,26 +8,205 @@
 
 namespace ui2 {
 
+// ---------------------------------------------------------------- 变换栈
+
+Ui2Xform Ui2Xform::rotateScaleAbout(float rad, float s, float px, float py) {
+    const float c = std::cos(rad) * s;
+    const float n = std::sin(rad) * s;
+    // 绕 pivot：T(p)·R·S·T(-p)
+    Ui2Xform x;
+    x.m00 = c;   x.m01 = -n;
+    x.m10 = n;   x.m11 = c;
+    x.tx = px - (c * px - n * py);
+    x.ty = py - (n * px + c * py);
+    return x;
+}
+
+Ui2Xform Ui2Xform::concat(const Ui2Xform& b, const Ui2Xform& a) {
+    Ui2Xform r;
+    r.m00 = b.m00 * a.m00 + b.m01 * a.m10;
+    r.m01 = b.m00 * a.m01 + b.m01 * a.m11;
+    r.m10 = b.m10 * a.m00 + b.m11 * a.m10;
+    r.m11 = b.m10 * a.m01 + b.m11 * a.m11;
+    r.tx = b.m00 * a.tx + b.m01 * a.ty + b.tx;
+    r.ty = b.m10 * a.tx + b.m11 * a.ty + b.ty;
+    return r;
+}
+
+void UiCanvas::recomputeState() {
+    // 三条栈都从索引 0 重新累一遍。**每次 push/pop 重算**而不是"弹出时
+    // 除回去"：除回去遇到 opacity=0 会变成 NaN，而 NaN 的颜色在屏幕上
+    // 是"随机变成某个颜色"，比不画难查得多。
+    m_curXf = Ui2Xform{};
+    for (size_t i = 1; i < m_xf.size(); ++i)
+        m_curXf = Ui2Xform::concat(m_xf[i], m_curXf);
+
+    m_curOp = 1.0f;
+    for (size_t i = 1; i < m_op.size(); ++i) m_curOp *= m_op[i];
+    if (m_curOp < 0.0f) m_curOp = 0.0f;
+    if (m_curOp > 1.0f) m_curOp = 1.0f;
+
+    m_curClip = Ui2Scissor{};
+    for (size_t i = 1; i < m_clip.size(); ++i) {
+        const Ui2Scissor& s = m_clip[i];
+        if (!s.any || s.w <= 0.0f || s.h <= 0.0f) {
+            m_curClip = Ui2Scissor{0.0f, 0.0f, 0.0f, 0.0f, true};
+            continue;
+        }
+        if (!m_curClip.any) { m_curClip = s; continue; }
+        const float x0 = std::fmax(m_curClip.x, s.x);
+        const float y0 = std::fmax(m_curClip.y, s.y);
+        const float x1 = std::fmin(m_curClip.x + m_curClip.w, s.x + s.w);
+        const float y1 = std::fmin(m_curClip.y + m_curClip.h, s.y + s.h);
+        m_curClip.x = x0; m_curClip.y = y0;
+        m_curClip.w = x1 - x0; m_curClip.h = y1 - y0;
+        m_curClip.any = true;
+    }
+}
+
+void UiCanvas::pushTransform(const Ui2Xform& x) {
+    m_xf.push_back(x);
+    recomputeState();
+}
+void UiCanvas::popTransform() {
+    if (m_xf.size() > 1) m_xf.pop_back();
+    recomputeState();
+}
+void UiCanvas::pushOpacity(float mul) {
+    m_op.push_back(mul);
+    recomputeState();
+}
+void UiCanvas::popOpacity() {
+    if (m_op.size() > 1) m_op.pop_back();
+    recomputeState();
+}
+void UiCanvas::pushClip(float x, float y, float w, float h) {
+    m_clip.push_back(Ui2Scissor{x, y, w, h, true});
+    recomputeState();
+}
+void UiCanvas::popClip() {
+    if (m_clip.size() > 1) m_clip.pop_back();
+    recomputeState();
+}
+
+uint32_t UiCanvas::drawCalls() const {
+    if (m_verts.empty()) return 0u;
+    // 按 scissor 切 run（相邻且相同算一个）。没裁剪时恒 1。
+    uint32_t n = 0;
+    Ui2Scissor prev{};
+    bool first = true;
+    for (const Ui2Scissor& s : m_scissors) {
+        if (first || !s.same(prev)) { ++n; prev = s; first = false; }
+    }
+    return n == 0u ? 1u : n;
+}
+
+namespace {
+// 乘透明度（只动 alpha 字节；颜色本身是 sRGB 编码值，**不是**线性值，
+// 所以这里绝不能做"先反编码再乘再编码"—— 那会把半透黑变成中灰）。
+inline uint32_t mulAlpha(uint32_t c, float mul) {
+    const uint32_t a = (c >> 24) & 0xFFu;
+    const uint32_t na = static_cast<uint32_t>(a * mul + 0.5f);
+    return (c & 0x00FFFFFFu) | (na << 24);
+}
+}  // namespace
+
+void UiCanvas::emitQuad(const float lx[4], const float ly[4],
+                        const Ui2Vertex proto[4]) {
+    if (m_curOp <= 0.0009f) return;                 // 全透明 → 一个顶点都不要
+
+    // 本地 → 输出像素
+    float px[4], py[4];
+    float minX = 1e30f, minY = 1e30f, maxX = -1e30f, maxY = -1e30f;
+    for (int i = 0; i < 4; ++i) {
+        m_curXf.mapPoint(lx[i], ly[i], px[i], py[i]);
+        minX = std::fmin(minX, px[i]); maxX = std::fmax(maxX, px[i]);
+        minY = std::fmin(minY, py[i]); maxY = std::fmax(maxY, py[i]);
+    }
+
+    Ui2Scissor sc{};
+    if (m_curClip.any) {
+        if (m_curClip.w <= 0.0f || m_curClip.h <= 0.0f) return;
+        // 完全在外 → 丢掉（不进顶点缓冲，也就不占 draw）
+        if (maxX <= m_curClip.x || minX >= m_curClip.x + m_curClip.w ||
+            maxY <= m_curClip.y || minY >= m_curClip.y + m_curClip.h) {
+            return;
+        }
+        // ⚠ 部分在外的 quad **不裁几何**，只记 scissor 让 GPU 裁。
+        //   在 CPU 上裁会把 mode 0/3 的"中心 + 半宽"语义剪坏（圆角跑到
+        //   错误的位置），而 scissor 是像素级精确的。
+        sc = m_curClip;
+    }
+
+    Ui2Vertex v[4];
+    const bool xformRot = !m_curXf.axisAligned();
+    for (int i = 0; i < 4; ++i) {
+        v[i] = proto[i];
+        if (v[i].mode == static_cast<float>(Ui2Prim::Solid) ||
+            v[i].mode == static_cast<float>(Ui2Prim::RoundBox)) {
+            // mode 0/3 的顶点里存的是"中心 + 角点符号"，顶点坐标由着色器
+            // 展开；这里只在**没有旋转**时改中心/半宽（缩放可交换），
+            // 有旋转时调用方会改用 mode 4（顶点自己给坐标）。
+            if (xformRot) {
+                v[i].x = px[i];
+                v[i].y = py[i];
+                v[i].mode = static_cast<float>(Ui2Prim::RoundBoxRotated);
+            } else {
+                float cx, cy;
+                m_curXf.mapPoint(proto[i].x, proto[i].y, cx, cy);
+                v[i].x = cx;
+                v[i].y = cy;
+                v[i].hx = proto[i].hx * std::fabs(m_curXf.m00);
+                v[i].hy = proto[i].hy * std::fabs(m_curXf.m11);
+                v[i].radius = proto[i].radius *
+                              (std::fabs(m_curXf.m00) + std::fabs(m_curXf.m11)) *
+                              0.5f;
+            }
+        } else {
+            // mode 1/2：pos 本来就是顶点
+            v[i].x = px[i];
+            v[i].y = py[i];
+            // 平滑宽度随缩放走，否则放大后的字边缘会变硬（SDF 的前提是
+            // "过渡带在屏幕空间里恒为 ~1px"，缩放后它得跟着缩）
+            if (v[i].mode == static_cast<float>(Ui2Prim::SdfText) &&
+                m_curXf.axisAligned()) {
+                const float sx = std::fabs(m_curXf.m00);
+                const float sy = std::fabs(m_curXf.m11);
+                v[i].hx *= 0.5f * (sx + sy);
+            }
+        }
+        v[i].color = mulAlpha(proto[i].color, m_curOp);
+    }
+
+    // 两个三角形：(0,1,2) + (0,2,3)
+    const int idx[6] = {0, 1, 2, 0, 2, 3};
+    for (int k = 0; k < 6; ++k) m_verts.push_back(v[idx[k]]);
+    m_scissors.push_back(sc);
+    m_draws = 1;
+}
+
 void UiCanvas::pushModeQuad(float cx, float cy, float hx, float hy,
                             float radius, Ui2Prim mode, uint32_t color) {
     // 角点符号（与 ui2.vert 的约定：inUv 是 ±1，inPos 是中心）
     const float sx[4] = {-1.0f, 1.0f, 1.0f, -1.0f};
     const float sy[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
 
-    Ui2Vertex v[4];
+    Ui2Vertex proto[4];
+    float lx[4], ly[4];
     for (int i = 0; i < 4; ++i) {
-        v[i].x = cx;
-        v[i].y = cy;
-        v[i].u = sx[i];
-        v[i].v = sy[i];
-        v[i].color = color;
-        v[i].hx = hx;
-        v[i].hy = hy;
-        v[i].radius = radius;
-        v[i].mode = static_cast<float>(mode);
+        proto[i].x = cx;
+        proto[i].y = cy;
+        proto[i].u = sx[i];
+        proto[i].v = sy[i];
+        proto[i].color = color;
+        proto[i].hx = hx;
+        proto[i].hy = hy;
+        proto[i].radius = radius;
+        proto[i].mode = static_cast<float>(mode);
+        lx[i] = cx + sx[i] * hx;
+        ly[i] = cy + sy[i] * hy;
     }
-    // 两个三角形：(0,1,2) + (0,2,3)，三角形列表拓扑
-    quad(v[0], v[1], v[2], v[3]);
+    emitQuad(lx, ly, proto);
 }
 
 void UiCanvas::rect(float x, float y, float w, float h, uint32_t color) {
@@ -51,33 +230,37 @@ void UiCanvas::image(float x, float y, float w, float h,
                      float u0, float v0, float u1, float v1, uint32_t tint) {
     if (w <= 0.0f || h <= 0.0f) return;
     // 贴图是"顶点 = 实际位置"的路径（mode 1），所以四个角直接展开。
-    Ui2Vertex v[4];
-    const float px[4] = {x, x + w, x + w, x};
-    const float py[4] = {y, y, y + h, y + h};
+    Ui2Vertex proto[4];
+    const float lx[4] = {x, x + w, x + w, x};
+    const float ly[4] = {y, y, y + h, y + h};
     const float uu[4] = {u0, u1, u1, u0};
     const float vv[4] = {v0, v0, v1, v1};
     for (int i = 0; i < 4; ++i) {
-        v[i].x = px[i];
-        v[i].y = py[i];
-        v[i].u = uu[i];
-        v[i].v = vv[i];
-        v[i].color = tint;
-        v[i].hx = 0.0f;
-        v[i].hy = 0.0f;
-        v[i].radius = 0.0f;
-        v[i].mode = static_cast<float>(Ui2Prim::Texture);
+        proto[i].x = lx[i];
+        proto[i].y = ly[i];
+        proto[i].u = uu[i];
+        proto[i].v = vv[i];
+        proto[i].color = tint;
+        proto[i].hx = 0.0f;
+        proto[i].hy = 0.0f;
+        proto[i].radius = 0.0f;
+        proto[i].mode = static_cast<float>(Ui2Prim::Texture);
     }
-    quad(v[0], v[1], v[2], v[3]);
+    emitQuad(lx, ly, proto);
 }
 
 void UiCanvas::quad(const Ui2Vertex& v0, const Ui2Vertex& v1,
                     const Ui2Vertex& v2, const Ui2Vertex& v3) {
+    // ⚠ 这个入口是"调用方已经算好顶点"的逃生口（自检与调试图元用）。
+    //   它**不走**变换栈 —— 顶点已经是输出像素了。要变换请用 rect /
+    //   roundRect / image / text，那四个走 `emitQuad`。
     m_verts.push_back(v0);
     m_verts.push_back(v1);
     m_verts.push_back(v2);
     m_verts.push_back(v0);
     m_verts.push_back(v2);
     m_verts.push_back(v3);
+    m_scissors.push_back(Ui2Scissor{});
     m_draws = 1;
 }
 
@@ -122,23 +305,23 @@ void UiCanvas::text(const SdfFont& font, float x, float baselineY,
         const float x1 = x0 + g->w * scale;
         const float y1 = y0 + g->h * scale;
 
-        Ui2Vertex v[4];
-        const float px[4] = {x0, x1, x1, x0};
-        const float py[4] = {y0, y0, y1, y1};
+        Ui2Vertex proto[4];
+        const float lx[4] = {x0, x1, x1, x0};
+        const float ly[4] = {y0, y0, y1, y1};
         const float uu[4] = {g->u0, g->u1, g->u1, g->u0};
         const float vv[4] = {g->v0, g->v0, g->v1, g->v1};
         for (int i = 0; i < 4; ++i) {
-            v[i].x = px[i];
-            v[i].y = py[i];
-            v[i].u = uu[i];
-            v[i].v = vv[i];
-            v[i].color = color;
-            v[i].hx = w;        // mode 2：hx = 平滑宽度
-            v[i].hy = 0.0f;
-            v[i].radius = 0.0f;
-            v[i].mode = static_cast<float>(Ui2Prim::SdfText);
+            proto[i].x = lx[i];
+            proto[i].y = ly[i];
+            proto[i].u = uu[i];
+            proto[i].v = vv[i];
+            proto[i].color = color;
+            proto[i].hx = w;        // mode 2：hx = 平滑宽度
+            proto[i].hy = 0.0f;
+            proto[i].radius = 0.0f;
+            proto[i].mode = static_cast<float>(Ui2Prim::SdfText);
         }
-        quad(v[0], v[1], v[2], v[3]);
+        emitQuad(lx, ly, proto);
 
         // 推进按**真实 adv**，不是格子宽度（格子左右各含 spread+2 的边，
         // 用它推进会让 48 号字每字宽多 16px，整句字距散开）。

@@ -99,8 +99,16 @@
 
 ## 路线图（剩什么 → `docs/remaining_work_2026-10-27.md`；权威 → `docs/*_roadmap.md`）
 - 已做完的**全清单**只维护在 `remaining_work` §1（本页不重复）；近期：G29/G30 出包·E28/E29 主题·J5 关节·
-  P2/P6·Prefab·多选·UI 编辑器·植被两轮·步态 A4/A4b·运镜 CINE + 多机位·R7 ClipEdit·10-31 红清零·**11-01 B6 表情 + P1 基线**。
+  P2/P6·Prefab·多选·UI 编辑器·植被两轮·步态 A4/A4b·运镜 CINE + 多机位·R7 ClipEdit·10-31 红清零·**11-01 B6 表情 + P1 基线**·
+  **11-03 P2 玩法状态层 + P3-3 牌堆**（明细 → `FEATURES.md`；权威 → `docs/gameplay_stats.md` / `docs/cards.md`）。
+- **P3 卡牌专供**：P3-3 ✅；剩 **P3-1 配表进运行时（`assets/tables/cards.csv` → `CardDef` + 结算器 `CardResolver`）**、
+  P3-2 `ui2` 拖拽/Grid、P3-4 伤害数字层。⚠ 卡牌**只存 defId 不存定义**（与状态相反），别"统一"成一处。
 - **剩余硬缺口：流送 / 导航 AI**（C3 存档 · E28 打包 · B6 表情 · P1 基线已结）；打磨型仍有
   立绘 C2 / 脚 IK B4 / 弹簧骨 B5 / lightmap R5-2 / 植被 W5 / 音素级口型 D2。
+- **面板/操作体系缺口 → `docs/panel_gap_review_2026-11-02.md`**（10-27 那两份**已过期**，头部已封口）。
+  ⚠ 口径：**先答"A 类 = 能力→入口的差集"，再答"真没有"** —— 本仓缺的多数是"实现了但只对引擎作者
+  可见"：PostVolume 全链在（落盘+Renderer 求值）editor **0 命中**；混音 duckDepth/busVolume
+  editor **0 引用**；`.vmeta` / `setFlag` 同样 0。最贵四条：**PostVolume 面板 · 音频混音台 ·
+  UI 事件回调 · Project Settings（`game.json` 全手改）**，都不动渲染管线。
 - ⚠ 材质位掩码到 **bit26**，只剩 5 位 → 加旋钮要换两个 u32。
 - ⚠ flaky：`bvh`/`csm`/`ibl`/`particles` 偶发全红 → 别补跑"凑干净"；"闸门红"先分 真漏/记账/夹具陈旧。

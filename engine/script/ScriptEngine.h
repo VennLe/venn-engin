@@ -46,6 +46,7 @@
 //                     playSequence showDialogue playAnim   # 演出（C6）
 //                     spawn setFlag getFlag loadScene      # 世界（C6 第二批）
 //                     openUI                              # 界面（C6 第七件）
+//                     navGoto navArrived navFailed navStop  # 导航（C8-2）
 //                     print
 //
 //   数值一律是 double；角度（rotate）单位是**度**。
@@ -68,6 +69,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -206,6 +208,131 @@ struct ScriptWorldActions {
     std::function<bool(const std::string&)> loadScene;
     std::function<ecs::Entity(const std::string&, glm::vec3)> spawn;
 
+    // ---- 特效（P1-4，2026-11-02）----
+    //
+    // 补的是"脚本想出一发火花，只能 `spawn` 一个实体再销毁"这条歪路 ——
+    // 那会反复增删实体，踩 `render_resource_lifetime` 铁律（CB 录制中
+    // 引用过的对象不能销毁 → submit -4），而且没有池。
+    //
+    // `playEffect(path)`           在 **self 的世界坐标**出特效
+    // `playEffect(path, x, y, z)`  在指定位置出（爆炸点、法阵中心）
+    // 返回实例 id（>0 = 真的播了；0 = 资产缺失或池满）。**必须回传**：
+    // 脚本可能要 `stopEffect(id)`（打断一个持续型特效）。
+    //
+    // `shake(amount)`              trauma 0..1，位置取 self（远处自动更轻）
+    // `hitstop(seconds)`           顿帧（宿主用真实时间递减）
+    // `setTimeScale(scale)`        全局倍速（子弹时间）；<0 一律拒收
+    //
+    // ⚠ `playSound` **不在这里** —— 它早就有了（`ScriptHost::playSound`，
+    //   不依赖任何 engine 子系统）。当初以为缺是因为只 grep 了 `act.` 前缀。
+    std::function<uint32_t(ecs::Entity, const std::string&)> playEffect;
+    std::function<uint32_t(const std::string&, glm::vec3)> playEffectAt;
+    std::function<bool(uint32_t)> stopEffect;
+    std::function<void(float, ecs::Entity)> shake;
+    std::function<void(float)> hitstop;
+    std::function<void(float)> setTimeScale;
+
+    // ---- 玩法状态（P2-6，2026-11-03）----
+    //
+    // 四个动词，全部作用于 **self**。它们把"回合制逻辑"从脚本里能碰到：
+    //   `getAttr("attack")`      → 当前值（含状态加成）
+    //   `addStatus("poison")`    → 加一层之后的层数（-1 = 失败）
+    //   `damage(10, "fire")`     → **真正扣掉的血**（过量伤害不虚高）
+    //   `tickRound()`            → 回合末结算的 dot 条数
+    //
+    // ⚠ `gameplayHasAttr` 单独一个函数：`getAttr` 返回 0 有两种含义
+    //   （属性不存在 / 值就是 0），不区分的话 `getAttr("atk")` 拼错会
+    //   静默返回 0 —— 战斗里表现为"攻击力永远是 0"，而日志一行错都没有。
+    //
+    // ⚠ `damage` 返回的是**扣掉的血**而不是 `amount`：脚本要用它判死亡
+    //   （`if (damage(1000) >= hp)`），拿 amount 判会在过量伤害时判错。
+    //
+    // ⚠⚠ `damage` **和 U8 那个 HUD 扣血是同一个动词**（`damage(n)` /
+    //   `damage(n, type)`，arity 1..2）。曾经在 kBuiltins 里登记了两条同名
+    //   条目，查表先命中老的那条 `{1,1}` → `damage(100,"physical")` 在
+    //   **编译期**报 "expects 1 argument(s), got 2"，整份脚本 not runnable，
+    //   而错误行长得完全不像 arity 的问题。同名动词**只能有一条登记**。
+    //
+    //   两条路径的判定靠返回值：宿主**没有挂 GameplayComponent** 时必须返回
+    //   `-1`（`0` 是合法的"打不动"，不能当哨兵）→ 引擎回退到老的 HUD 扣血。
+    //   于是老脚本（打木桶）行为不变，新脚本自动吃护甲/易伤/护盾。
+    std::function<float(ecs::Entity, const std::string&)> getAttr;
+    std::function<bool(ecs::Entity, const std::string&)> gameplayHasAttr;
+    std::function<int(ecs::Entity, const std::string&)> addStatus;
+    // 返回**真正扣掉的血**；`-1` = 目标没有玩法组件（引擎会回退）。
+    std::function<float(ecs::Entity, float, const std::string&)> damage;
+    std::function<int()> tickRound;
+
+    // ---- 卡牌（P3-4，2026-11-04）----
+    //
+    //   `castCard(idx)` → 打出手牌第 idx 张并**结算**，返回实际造成的伤害
+    //   `drawCards(n)`  → 抽 n 张，返回实际抽到几张
+    //
+    // 目标由宿主解析（"第一个别人"，见 `GameplayRuntime::firstOtherGameplayEntity`），
+    // 因为脚本层没有"选中"这个概念 —— 让脚本传实体参数会逼作者手写运行时
+    // 序号，换一次加载就失效。
+    //
+    // ⚠ 没有牌组 / 下标越界返回 **0** 而不是报错：卡牌脚本通常在 `on update`
+    //   里按按键调用，"手牌空了还按了一下"是完全正常的使用方式，抛异常会让
+    //   整份脚本停摆。诊断靠宿主自己的 `GP-CARD-CAST ... ok=0` 日志行。
+    std::function<float(ecs::Entity, int)> castCard;
+    std::function<int(ecs::Entity, int)> drawCards;
+
+    // ---- 导航（C8-2，2026-11-05）----
+    //
+    // 补的是"剧情要 NPC 走到某处"这条最基础的演出需求。在它们之前，
+    // NPC 的目标只能靠在场景文件里摆一个 `goal` —— 一局只能去一个地方，
+    // 而且改路线要重开场景。
+    //
+    //   `navGoto(x, y, z)` → 1 = 受理（网格在、实体有代理组件）；0 = 没受理
+    //   `navArrived()`     → 1 = 到点（`NavAgentComponent::reached`）
+    //   `navFailed()`      → 1 = 走不过去（`NavAgentComponent::failed`）
+    //   `navStop()`        → 1 = 停下（有没有代理组件都算成功：脚本写
+    //                        "停"的时候，本来就没在走也是对的）
+    //
+    // ⚠ `navGoto` 返回的是"受理"而不是"走到了"：求路发生在**下一帧**的
+    //   `NavSystem::tick` 里（`repathInterval` 那条防抖链），当场返回
+    //   "到了"是不可能的。所以它只回答"这次请求被记下了吗" ——
+    //   真正的进展靠 `navArrived()` / `navFailed()` 轮询。
+    //
+    // ⚠⚠ `navArrived()` **必须**和 `navFailed()` 成对使用。目标在墙外 /
+    //   网格外时 `arrived` 永远是 0，只等 `navArrived()` 的
+    //   `while (!navArrived()) wait(0.1)` 会**永远转**（而脚本配额不报错，
+    //   只是那一帧什么都不做）。
+    //
+    // ⚠ 全部作用于 **self**（与 `getAttr` / `castCard` 一致）：脚本没有
+    //   "选中"这个概念，让作者手写运行时序号换一次加载就失效。
+    //   代价是**"一个导演实体指挥一堆 NPC"现在做不到** —— 那需要
+    //   `navGoto(e, x, y, z)` 那种显式实体重载，而 `kBuiltins[]` 的
+    //   arity 只能表达"3 个还是 4 个参数"，表达不了"第 0 个参数换类型"，
+    //   所以宁可先不做，也不做一个"传错了不报错"的重载。
+    //   当前的解法：脚本挂在 NPC 自己身上（巡逻、跟随都是这么写的）。
+    std::function<bool(ecs::Entity, glm::vec3)> navGoto;
+    std::function<bool(ecs::Entity)> navArrived;
+    std::function<bool(ecs::Entity)> navFailed;
+    std::function<bool(ecs::Entity)> navStop;
+
+    // ---- 配表（P3-1，G5 的 `svc.table.get` 条款）----
+    //
+    // 四个动词，`key` 一律写成 `表.行.列`（`"cards.strike.cost"`）：
+    //   `tableNum(key)`   → 数字（列不存在 / 值不是数 → 0）
+    //   `tableStr(key)`   → 字符串（同上 → ""）
+    //   `tableHas(key)`   → 1 = 这一格存在
+    //   `tableRows("表")` → 行数（表不存在 → **-1**）
+    //
+    // ⚠⚠ `tableHas` **必须**单独一个：`tableNum` 返回 0 有三种含义
+    //   （表没加载 / 行不存在 / 值真的是 0），而"表没加载"恰好是最常见的
+    //   那一种 —— 不区分的话症状是"配表里的数值全是 0"，而日志一行错都没有。
+    //   与 `getAttr` / `gameplayHasAttr` 是同一条纪律。
+    //
+    // ⚠ 切分规则：**第一个点**切表名、**最后一个点**切列名，中间全是行 id。
+    //   行 id 里带点是常态（`"goblin.chief"`），表名/列名带点才是异常。
+    //   宿主各自实现切分（编辑器与运行时共用 `project::TableStore`）。
+    std::function<double(const std::string&)> tableNum;
+    std::function<std::string(const std::string&)> tableStr;
+    std::function<bool(const std::string&)> tableHas;
+    std::function<int(const std::string&)> tableRows;
+
     // `openUI(path)` → 掀一块界面（C6 第七件，2026-10-31）。
     //   路径相对 assets/（`"ui/docs/inventory.ui.json"`）。**空串 = 关掉**
     //   当前那块。
@@ -342,6 +469,59 @@ struct Value {
     const char* typeName() const;
 };
 
+// ---------------------------------------------------------------- 断点（C8）
+//
+// 断点的最小定义：**(脚本路径, 行号)**。没有"条件断点 / 命中计数 / 日志点"
+// —— 那些都要在求值器里多加一层判断，而它们的九成用途是
+// `if (hp < 10) print(...)`，脚本自己就能写。断点解决的是脚本**写不出来**
+// 的那件事：在引擎把控制权拿走之前停住，看清 `vars` 里是什么。
+//
+// ⚠ 为什么按**路径**而不是按 `ScriptProgram*`：热重载会重建 program
+//   （`ScriptEngine::clear()` 后地址可能复用），而"第 12 行"这件事在
+//   作者眼里从来是相对文件的。按路径存的断点能活过热重载 —— 这也正是
+//   调脚本时最需要的（改一行、存盘、断点还在原处）。
+class BreakpointSet {
+public:
+    void add(const std::string& path, int line) {
+        if (path.empty() || line <= 0) return;
+        m_bp[path].insert(line);
+    }
+    void remove(const std::string& path, int line) {
+        auto it = m_bp.find(path);
+        if (it == m_bp.end()) return;
+        it->second.erase(line);
+        if (it->second.empty()) m_bp.erase(it);
+    }
+    bool has(const std::string& path, int line) const {
+        auto it = m_bp.find(path);
+        if (it == m_bp.end()) return false;
+        return it->second.find(line) != it->second.end();
+    }
+    // 某个脚本上的全部断点（升序）
+    const std::set<int>* linesOf(const std::string& path) const {
+        auto it = m_bp.find(path);
+        return it == m_bp.end() ? nullptr : &it->second;
+    }
+    void clear() { m_bp.clear(); }
+    std::size_t size() const {
+        std::size_t n = 0;
+        for (const auto& kv : m_bp) n += kv.second.size();
+        return n;
+    }
+    // 扁平视图（面板 / 控制台共用）。按路径字典序、行号升序 ——
+    // 自动化断言才不会随机红。
+    std::vector<std::pair<std::string, int>> list() const {
+        std::vector<std::pair<std::string, int>> out;
+        for (const auto& kv : m_bp)
+            for (int l : kv.second) out.emplace_back(kv.first, l);
+        return out;
+    }
+    bool empty() const { return m_bp.empty(); }
+
+private:
+    std::map<std::string, std::set<int>> m_bp;
+};
+
 // 一次求值需要从外面拿到的全部东西（S0）。
 //
 // ⚠ 这个结构存在的唯一理由是 **P1**：`vars` 与 `prints` 从"求值器私有"
@@ -360,6 +540,20 @@ struct ScriptRunContext {
     // out（S4）：这一帧**真的执行了**吗。挂起未唤醒时为 false ——
     // ScriptRuntime 用它统计 skipped，宿主据此判断"这个实例本帧是空转"。
     bool executed = false;
+
+    // ---- 断点（C8，2026-11-02）----
+    //
+    // `breakpoints` 可空（= 没有断点，走原来那条路）。**指针而不是值**：
+    // 一张断点表要跨"很多程序 × 很多实例"共享，按值传会让热重载之后
+    // 每个实例各持一份副本，改一个断点要遍历全部实例去同步。
+    const BreakpointSet* breakpoints = nullptr;
+    // out：本步是不是**因为断点/单步停下**的（`executed` 为 false）。
+    // ⚠ 与 `Suspend`（wait）分开报：wait 是"脚本自己要等"，
+    //   paused 是"调试器把它摁住了" —— ScriptRuntime 对两者的处理不同
+    //   （暂停**不能**置 `started`，否则 `on start` 的后半段会被吞掉，
+    //   见 ScriptRuntime.cpp 的注释）。
+    bool paused = false;
+    int pauseLine = 0;       // out：停在哪一行（0 = 没停）
 };
 
 // ---------------------------------------------------------------- AST（内部）
@@ -380,6 +574,18 @@ using StmtPtr = std::unique_ptr<Stmt>;
 //   shared_ptr 的删除器在**构造时**就绑定了完整类型，所以头文件里只需要
 //   一个不完整类型。
 class ScriptCoroutine;
+
+// C8：协程的"暂停位"操作。
+//
+// ⚠ 为什么是自由函数而不是 `ScriptCoroutine` 的成员：它的布局只在
+//   `ScriptEngine.cpp` 里完整（持有 `const Stmt*`），头文件只见到一个
+//   前向声明。`ScriptRuntime` 要放行暂停的实例，但它同样看不见布局 ——
+//   于是把这两个动作开成自由函数，实现在 `ScriptEngine.cpp` 里。
+//   （与 `ScriptEngine::makeCoroutine()` 同一条理由。）
+//
+// 返回值 `false` = 它本来就没暂停（调用方不必区分，做统计用）。
+bool resumeCoroutine(ScriptCoroutine& coro);
+bool stepCoroutine(ScriptCoroutine& coro);
 
 // ---------------------------------------------------------------- 钩子（S3）
 
@@ -463,9 +669,20 @@ public:
     // 一帧的完整执行（S3/S4）：相位顺序在这里，宿主只管把事件排好。
     // `coro` 是该实例**私有**的执行状态（帧栈 + 等待条件）。多个实例可以
     // 共享同一个 ScriptProgram（编译产物），但绝不能共享协程。
+    //
+    // C8：`ctx.breakpoints` 非空时，执行到断点行会**停在那条语句之前** ——
+    // 直接返回 true（不是错误），并把 `ctx.paused` 置真、`ctx.pauseLine`
+    // 填上停住的行号。下一帧若还是暂停态则什么都不做（宿主先 `resume`）。
     bool runFrame(const ScriptHost& host, ScriptRunContext& ctx,
                   ScriptCoroutine& coro, const ScriptFrameInput& in,
                   ScriptError& err);
+
+    // 本脚本里**有语句落在**哪些行（升序去重）。
+    //
+    // 面板拿它给断点的可选项打对勾 —— 在空行/注释行上点一个断点永远不会
+    // 命中，而"点了没反应"是最难自证的那种失败。控制台 `script.bp` 也用
+    // 它做行号校验（写错行号当场报错，不是静默接受）。
+    const std::vector<int>& executableLines() const { return m_lines; }
 
     // ★ 热重载对账（S4 / S-D7 第 3 条）：把 `coro` 里指向**旧 AST** 的帧
     // 翻译到本程序上。全部帧都按 `Stmt::id` 对上 → true（从原位置继续）；
@@ -504,6 +721,9 @@ private:
     //   这样"先赋值后 let"这种少见写法也不会因分区而改语义。
     std::size_t m_declCount = 0;
     std::vector<std::unique_ptr<HookBlock>> m_hooks;
+    // C8：可打断点的行（`executableLines()` 的存储）。编译成功后由
+    // `indexAst()` 顺手收集 —— 它已经在遍历全部语句，再走一遍没意义。
+    std::vector<int> m_lines;
     std::string m_source;
     std::string m_debugName;
     bool m_valid = false;

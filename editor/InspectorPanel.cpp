@@ -289,6 +289,8 @@ const TabDesc kTabs[] = {
     {"animation", "Animation", "Skinning and animation clips", iconAnimation},
     {"sequence", "Sequence", "Cutscene timeline: camera moves and events", iconSequence},
     {"dialogue", "Dialogue", "Dialogue asset: typing speed / auto start / start node", iconDialogue},
+    // P2 玩法状态。归在"实体属性"这一类里，所以多选时也走批量编辑页。
+    {"gameplay", "Gameplay", "Attributes / statuses / damage preview", iconGameplay},
     {"all", "All", "Everything (the old stacked view)", iconAll},
 };
 constexpr int kTabCount = static_cast<int>(sizeof(kTabs) / sizeof(kTabs[0]));
@@ -633,7 +635,8 @@ void InspectorPanel::drawTabContent(ecs::Entity e) {
                                   t == InspTab::Material ||
                                   t == InspTab::Animation ||
                                   t == InspTab::Sequence ||
-                                  t == InspTab::Dialogue || t == InspTab::All;
+                                  t == InspTab::Dialogue ||
+                                  t == InspTab::Gameplay || t == InspTab::All;
         if (entityScoped) {
             ImGui::TextDisabled(TR("(multi-selection)"));
             drawMultiPanel();
@@ -659,6 +662,7 @@ void InspectorPanel::drawTabContent(ecs::Entity e) {
         case InspTab::Animation: drawTabAnimation(e); break;
         case InspTab::Sequence:  drawTabSequence(e); break;
         case InspTab::Dialogue:  drawTabDialogue(e); break;
+        case InspTab::Gameplay:  drawTabGameplay(e); break;
         case InspTab::All:       drawTabAll(e); break;
         case InspTab::Count:     break;
     }
@@ -3914,6 +3918,348 @@ void InspectorPanel::drawTabDialogue(ecs::Entity e) {
     ImGui::PopID();
 }
 
+// ------------------------------------------------------------ P2 玩法状态页
+//
+// 这一页管三件事，**都是"看得见才算交付"的东西**：
+//   ① 白值：每条属性的 base + 上下限（改完立刻生效，不需要点应用）
+//   ② 状态：当前挂着的状态（层数 / 剩余回合）+ 一键施加预设
+//   ③ 伤害预览：按当前数值走一遍 `resolveDamage`，把**五步明细**摊出来
+//
+// ⚠ 预览**不改任何数据**（在副本上算）：否则"看一眼会掉多少血"就真的掉血了。
+// ⚠ 预览**不消耗玩法随机流**（用一个固定种子的本地 Random、且 `canCrit=false`）：
+//   预览按钮被点两下就改变下一张抽到的牌，是最难查的一类 bug。
+void InspectorPanel::drawTabGameplay(ecs::Entity e) {
+    if (!e.valid()) {
+        tabEmptyHint("an object");
+        return;
+    }
+    ecs::World& w = m_ctx.activeScene().world();
+    auto* gp = w.get<ecs::GameplayComponent>(e);
+    if (!gp) {
+        tabEmptyHint("gameplay values");
+        hint("A turn-based unit (or a card) needs this component: it holds the\n"
+             "attribute values and the status list.");
+        if (ImGui::Button(TRL("Add Gameplay Component"))) {
+            ecs::GameplayComponent fresh;
+            fresh.attributes = gameplay::defaultAttributes();
+            w.add<ecs::GameplayComponent>(e, fresh);
+            // 日志锚点：`verify_gameplay` 靠它断"这个按钮真的挂了组件"。
+            core::logMessage(core::LogLevel::Info,
+                             "INS-GP-ADD entity=%u attrs=%d",
+                             static_cast<unsigned>(e.id),
+                             static_cast<int>(fresh.attributes.size()));
+            gp = w.get<ecs::GameplayComponent>(e);
+        }
+        if (!gp) return;
+    }
+
+    const bool open = sectionHeader("Gameplay", true, e);
+    logRect("INS-GP-HEADER", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (!open) return;
+
+    ImGui::PushID("gp");
+
+    // 现算一份视图（组件是权威数据，见 gameplay/GameplayTypes.h 文件头）。
+    gameplay::AttributeSet view;
+    gameplay::buildAttributes(gp->attributes, gp->statuses, view);
+
+    // ---- 一行总览。锚点带数值：脚本靠这一行断言"值真的是这个数"，
+    //      而不是只断言"页签在"。去抖键含数值，所以改值会再打一行。
+    {
+        char buf[256];
+        // 属性名是**数据**（作者自己起的），译成中文就与配表和脚本
+        // `getAttr("hp")` 对不上了 —— 这一行是数值读数的固定形状。
+        // i18n-keep
+        std::snprintf(buf, sizeof(buf), "hp=%.1f/%.0f atk=%.1f armor=%.1f",
+                      static_cast<double>(view.get("hp", 0.0f)),
+                      static_cast<double>(view.maxValue("hp")),
+                      static_cast<double>(view.get("attack", 0.0f)),
+                      static_cast<double>(view.get("armor", 0.0f)));
+        ImGui::TextUnformatted(buf);
+        logRect("INS-GP-STATS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        if (m_gpStatsSig != buf) {
+            m_gpStatsSig = buf;
+            core::logMessage(core::LogLevel::Info, "INS-GP-STATS entity=%u %s",
+                             static_cast<unsigned>(e.id), buf);
+        }
+    }
+
+    // ---- ① 白值 ----
+    if (sectionHeader("Attributes", true, e, "gp_attrs")) {
+        logRect("INS-GP-ATTRS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        int removeAt = -1;
+        for (std::size_t i = 0; i < gp->attributes.size(); ++i) {
+            gameplay::AttrState& a = gp->attributes[i];
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::SetNextItemWidth(110.0f);
+            float b = a.base;
+            // ⚠ 滑块范围用 min/max，但**不能在拖的时候夹** —— 夹了就没法把
+            //   上限往上调（HP 上限涨了但 base 停在上限上，拖不上去）。
+            ImGui::DragFloat("##base", &b, 1.0f, -1.0e6f, 1.0e6f, "%.1f");
+            if (ImGui::IsItemDeactivatedAfterEdit()) a.base = b;
+            ImGui::SameLine();
+            ImGui::TextUnformatted(a.name.empty() ? "?" : a.name.c_str());
+            ImGui::SameLine();
+            ImGui::TextDisabled("=%.1f", static_cast<double>(a.base));
+            ImGui::SameLine();
+            if (ImGui::SmallButton(TRL("x"))) removeAt = static_cast<int>(i);
+            ImGui::PopID();
+        }
+        if (removeAt >= 0) {
+            // hp 不允许被删掉：伤害/治疗/死亡判定全要它，删了就变成
+            // "打不死也活不了"（`consume("hp")` 找不到属性返回 0）。
+            const std::string name = gp->attributes[static_cast<std::size_t>(removeAt)].name;
+            if (name == "hp") {
+                core::logMessage(core::LogLevel::Warn, "INS-GP-DEL-REFUSED name=hp");
+            } else {
+                gp->attributes.erase(gp->attributes.begin() + removeAt);
+            }
+        }
+        if (ImGui::Button(TRL("+ Attribute"))) {
+            ImGui::OpenPopup("##addattr");
+        }
+        if (ImGui::BeginPopup("##addattr")) {
+            static char nameBuf[64] = "attack";
+            ImGui::SetNextItemWidth(140.0f);
+            ImGui::InputText("##name", nameBuf, sizeof(nameBuf));
+            if (ImGui::Button(TRL("Add"))) {
+                if (nameBuf[0] != '\0') {
+                    gameplay::ensureAttr(gp->attributes, nameBuf);
+                    core::logMessage(core::LogLevel::Info, "INS-GP-ATTR-ADD name=%s",
+                                     nameBuf);
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::EndPopup();
+        }
+        logRect("INS-GP-ATTR-ADD", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    }
+
+    // ---- ② 状态 ----
+    if (sectionHeader("Statuses", true, e, "gp_status")) {
+        logRect("INS-GP-STATUSES", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        if (gp->statuses.empty()) {
+            ImGui::TextDisabled("%s", TR("(none)"));
+            logRect("INS-GP-STATUS-EMPTY", ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax());
+        }
+        int drop = -1;
+        for (std::size_t i = 0; i < gp->statuses.size(); ++i) {
+            gameplay::StatusState& st = gp->statuses[i];
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::Text("%s  x%d  (%d)", st.name.empty() ? st.id.c_str() : st.name.c_str(),
+                        st.stacks, st.turnsLeft);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(TRL("clear"))) drop = static_cast<int>(i);
+            ImGui::PopID();
+        }
+        if (drop >= 0) {
+            gp->statuses.erase(gp->statuses.begin() + drop);
+        }
+        // 三个预设按钮：它们**不是**"示例"而已 —— 三条叠加规则各一个
+        // （Stack / Independent / Stack），点几下就能看出"层数怎么涨、
+        // 回合怎么刷新、属性跟着怎么变"。
+        //
+        // ⚠ 走的是 `gameplay` 里的同一份预设（不是这里手搓一份）：面板与
+        //   脚本动词、自检用的必须是同一个定义，否则"面板加的中毒"和
+        //   "脚本加的中毒"数值会悄悄不一样。
+        const auto applyPreset = [&](const gameplay::StatusDef& def, const char* anchor) {
+            gameplay::StatusSet live;
+            for (const gameplay::StatusState& st : gp->statuses) {
+                live.restore(gameplay::toStatusDef(st), st.turnsLeft, st.stacks);
+            }
+            const gameplay::StatusAddResult r = live.add(def);
+            std::vector<gameplay::StatusState> out;
+            out.reserve(live.size());
+            for (std::size_t k = 0; k < live.size(); ++k) {
+                out.push_back(gameplay::toStatusState(live.at(k).def, live.at(k).turnsLeft,
+                                                      live.at(k).stacks));
+            }
+            gp->statuses = std::move(out);
+            core::logMessage(core::LogLevel::Info,
+                             "INS-GP-PRESET status=%s added=%d stacks=%d turns=%d",
+                             def.id.c_str(), r.added ? 1 : 0, r.stacks,
+                             live.turnsLeft(def.id));
+            (void)anchor;
+        };
+        if (ImGui::Button(TRL("+ poison"))) applyPreset(gameplay::presetPoison(), "poison");
+        logRect("INS-GP-PRESET-poison", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        ImGui::SameLine();
+        if (ImGui::Button(TRL("+ shield"))) applyPreset(gameplay::presetShield(), "shield");
+        logRect("INS-GP-PRESET-shield", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        ImGui::SameLine();
+        if (ImGui::Button(TRL("+ vuln"))) applyPreset(gameplay::presetVulnerable(), "vuln");
+        logRect("INS-GP-PRESET-vuln", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        hint("poison stacks (x5 max) / shield is independent (2 copies = 2 shields)\n"
+             "/ vuln stacks (+25% taken each).");
+    }
+
+    // ---- ③ 回合参数 ----
+    if (sectionHeader("Turn", true, e, "gp_turn")) {
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::DragFloat(TRL("speed##gp_speed"), &gp->speed, 1.0f, 1.0f, 1000.0f,
+                         "%.1f");
+        logRect("INS-GP-SPEED", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        ImGui::SetNextItemWidth(120.0f);
+        int team = gp->team;
+        if (ImGui::DragInt(TRL("team##gp_team"), &team, 0.1f, 0, 1)) {
+            gp->team = team;
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox(TRL("in queue##gp_inqueue"), &gp->inTurnQueue);
+        ImGui::TextDisabled("%s %.1f", TR("gauge:"), static_cast<double>(gp->gauge));
+        hint("Speed is a **rate**, not a rank: 200 acts twice as often as 100.");
+    }
+
+    // ---- ④ 伤害预览（只算不改）----
+    // ⚠ 默认**展开**。这里 `defaultOpen=false` 过一次是错的：伤害五步明细是
+    //   P2 的核心产物（`DamageResult::steps`），折叠起来等于用户永远看不到
+    //   "护甲到底减了多少"—— 违反「界面点不到 = 没交付」。
+    if (sectionHeader("Damage preview", true, e, "gp_dmg")) {
+        static float amount = 100.0f;
+        static int typeIdx = 0;
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::DragFloat(TRL("amount##gp_amt"), &amount, 1.0f, 0.0f, 1.0e6f,
+                         "%.1f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::Combo(TRL("type##gp_type"), &typeIdx,
+                     "physical\0magic\0fire\0ice\0poison\0true\0");
+        logRect("INS-GP-DMGPREV", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+        gameplay::AttributeSet copy;
+        gameplay::buildAttributes(gp->attributes, gp->statuses, copy);
+        gameplay::DamageSpec spec;
+        spec.amount = amount;
+        spec.type = static_cast<gameplay::DamageType>(typeIdx);
+        // ⚠ 不暴击、不消耗任何随机：预览必须是纯函数，点两次结果一样。
+        spec.canCrit = false;
+        gameplay::Random rng;
+        rng.seed(0x5eedu, 7u);
+        const gameplay::DamageResult r = gameplay::resolveDamage(copy, copy, spec, rng);
+
+        ImGui::TextUnformatted(r.summary().c_str());
+        for (const gameplay::DamageStep& s : r.steps) {
+            ImGui::TextDisabled("  %s  %.1f -> %.1f", s.label.c_str(),
+                                static_cast<double>(s.before),
+                                static_cast<double>(s.after));
+        }
+        // 明细的锚点日志：`TextDisabled` 不落日志，所以"五步真的都在"
+        // 只能靠这一行断言。
+        {
+            char key[256];
+            std::snprintf(key, sizeof(key), "%.1f|%d|%.2f|%.2f|%.2f",
+                          static_cast<double>(amount), typeIdx,
+                          static_cast<double>(r.afterArmor),
+                          static_cast<double>(r.afterVuln),
+                          static_cast<double>(r.dealt));
+            if (m_gpDmgSig != key) {
+                m_gpDmgSig = key;
+                core::logMessage(core::LogLevel::Info,
+                                 "INS-GP-DMGPREV entity=%u steps=%d %s",
+                                 static_cast<unsigned>(e.id),
+                                 static_cast<int>(r.steps.size()), r.summary().c_str());
+            }
+        }
+    }
+
+    // ---- ⑤ 牌堆（P3-3）----
+    //
+    // 这一段**只做不需要随机的事**（看 / 挂牌组 / 加牌 / 弃手）。抽牌与洗牌
+    // 要随机流，它们留在 `Debug ▸ Cards` 面板 —— 那边走 `GameplayRuntime`
+    // 的 gameplay 流，与运行时是同一条。
+    // ⚠ 在这里再开一个 `Random` 会让"面板抽过的牌"与"游戏里抽到的牌"分叉，
+    //   而分叉的表现只是"抽牌顺序不一样" —— 没人会想到是面板动了序列。
+    if (sectionHeader("Cards", true, e, "gp_cards")) {
+        ecs::World& w = m_ctx.activeScene().world();
+        ecs::CardDeckComponent* cd = w.get<ecs::CardDeckComponent>(e);
+        if (!cd) {
+            ImGui::TextDisabled("%s", TR("No deck on this entity."));
+            if (ImGui::Button(TR("Add deck"))) {
+                w.add<ecs::CardDeckComponent>(e, ecs::CardDeckComponent{});
+                cd = w.get<ecs::CardDeckComponent>(e);
+                core::logMessage(core::LogLevel::Info, "INS-CARD-ADD entity=%u ok=1",
+                                 static_cast<unsigned>(e.id));
+            }
+            logRect("INS-CARD-ADD", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        } else {
+            gameplay::CardZones& z = cd->zones;
+            {
+                char buf[192];
+                // 区名是**数据**（与 `CardZones::serialize()` 的键一一对应），
+                // 译成中文之后就与存档对不上了 —— 这一行是固定形状的读数。
+                // ⚠ 字段名必须与 `GameplayRuntime::cardLine()` **逐字相同**
+                //   （`discard=` / `exhaust=`，不是 `disc=` / `exh=`）：
+                //   两处写两套形状的后果是判据要记两份正则，而记错的那份
+                //   会让"这一行断了"看起来像"数值错了"。
+                // i18n-keep
+                std::snprintf(buf, sizeof(buf),
+                              "draw=%d hand=%d discard=%d exhaust=%d limbo=%d uid=%u",
+                              static_cast<int>(z.count(gameplay::CardPile::Draw)),
+                              static_cast<int>(z.count(gameplay::CardPile::Hand)),
+                              static_cast<int>(z.count(gameplay::CardPile::Discard)),
+                              static_cast<int>(z.count(gameplay::CardPile::Exhaust)),
+                              static_cast<int>(z.count(gameplay::CardPile::Limbo)),
+                              z.nextUid());
+                ImGui::TextUnformatted(buf);
+                logRect("INS-CARD-STATS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+                if (m_cardStatsSig != buf) {
+                    m_cardStatsSig = buf;
+                    core::logMessage(core::LogLevel::Info, "INS-CARD-STATS entity=%u %s",
+                                     static_cast<unsigned>(e.id), buf);
+                }
+            }
+
+            // 定义表是内容（不属于存档），必须显示张数 —— 否则"读档之后每张牌
+            // 都没有名字/费用"会被当成 bug，而不是"还没载入配表"。
+            ImGui::TextDisabled("%s: %d", TR("Card defs loaded"),
+                                static_cast<int>(z.defs().size()));
+
+            // 手牌：一列里最多 10 张（再多的部分只报数）。超过 10 张时
+            // "把 Inspector 撑长"会让下面所有页签的内容被推到屏幕外，
+            // 而屏幕外的控件 `GetItemRect` 照样返回真实坐标。
+            const std::vector<gameplay::CardInstance>& hand = z.pile(gameplay::CardPile::Hand);
+            for (std::size_t i = 0; i < hand.size() && i < 10; ++i) {
+                const gameplay::CardDef* def = z.def(hand[i].defId);
+                char line[160];
+                // i18n-keep：牌实例读数（id 与数值，不翻译）
+                std::snprintf(line, sizeof(line), "#%zu uid=%u %s%s cost=%d", i,
+                              hand[i].uid, hand[i].defId.c_str(),
+                              def ? "" : " (no def)",
+                              def ? z.costOf(hand[i]) : -1);
+                ImGui::TextDisabled("  %s", line);
+            }
+            if (hand.size() > 10) {
+                ImGui::TextDisabled("  ... +%d", static_cast<int>(hand.size() - 10));
+            }
+            logRect("INS-CARD-HAND", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+            if (ImGui::Button(TR("Discard hand"))) {
+                const int n = z.discardHand();
+                core::logMessage(core::LogLevel::Info,
+                                 "INS-CARD-DISCARD entity=%u n=%d hand=%d disc=%d",
+                                 static_cast<unsigned>(e.id), n,
+                                 static_cast<int>(z.count(gameplay::CardPile::Hand)),
+                                 static_cast<int>(z.count(gameplay::CardPile::Discard)));
+            }
+            logRect("INS-CARD-DISCARD", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+            ImGui::SameLine();
+            if (ImGui::Button(TR("Load card defs"))) {
+                // ⚠ 定义表**不进存档**，所以读档之后必须重新载入。P3-1 会把
+                //   这一步换成"进战斗时从配表读"，这条手动入口退化为调试工具。
+                if (z.defs().empty()) z.setDefs(gameplay::presetCardDefs());
+                core::logMessage(core::LogLevel::Info, "INS-CARD-DEFS entity=%u n=%d",
+                                 static_cast<unsigned>(e.id),
+                                 static_cast<int>(z.defs().size()));
+            }
+            logRect("INS-CARD-DEFS", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        }
+    }
+
+    ImGui::PopID();
+}
+
 void InspectorPanel::drawTabAll(ecs::Entity e) {
     if (!e.valid()) {
         drawSceneryFallback();
@@ -3927,6 +4273,9 @@ void InspectorPanel::drawTabAll(ecs::Entity e) {
     // C1：All 视图也要有这一段 —— `All` 是自动化默认页签（见文件头），
     // 漏了它，"All 里能配时间轴"这件事就断言不到。
     drawTabSequence(e);
+    // P2：All 是自动化默认页签（见文件头），漏了它"玩法数值在 All 里能看到"
+    // 就断言不到 —— 而这一页正是最需要被"看不见"抓到的（数值全在组件里）。
+    drawTabGameplay(e);
     drawAddRemove(e);
 }
 

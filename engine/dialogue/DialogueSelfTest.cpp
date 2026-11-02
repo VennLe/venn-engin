@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <system_error>
 
@@ -444,6 +445,269 @@ void groupSystem() {
 //    在 `--selftest audio` 的 `voice_*` 那几条里已经管了。
 // `AudioSystem::voicePlaying()` 的正确性由 audio 自检的 `voice_finished` /
 // `music_still_one` 两条负责；本组只假装它有返回值。
+// ---------------------------------------------------------------- I 分支
+//
+// C7（2026-11-05）：条件分支 + 选项写旗标。
+//
+// ⚠ 这一组**不用任何宿主**：`DlgFlagStore` 是纯虚接口，这里造一张
+//   `std::map` 就够。所以整组是微秒级，且不依赖 `scene::GameFlags`。
+// ⚠ 每条断言都要能分出"两种实现"：
+//   · `cond_true` / `cond_false` 两次**走线不同**才是证据（同一份资产，
+//     只改 store 里的值）；
+//   · `write_then_branch` 是**顺序**的证据 —— 先写再跳 vs 先跳再写，
+//     两者都会"写成功"，只有下一句读到新值才能分开。
+namespace {
+
+class MapStore final : public DlgFlagStore {
+  public:
+    double get(const std::string& n) const override {
+        auto it = v.find(n);
+        return it == v.end() ? 0.0 : it->second;
+    }
+    void set(const std::string& n, double val) override { v[n] = val; }
+    std::map<std::string, double> v;
+};
+
+// a → g（条件句）→ 真:done / 假:h → done；另有一条带选项的 q。
+//
+// 走 `q` 那条是"选项写旗标 + 立刻读"的检查点：选"信她"写 trust=1，
+// 而 `g` 要求 trust >= 2 → 落到 h。选"全信"写 trust=3 → 落在 g。
+const char* kBranch = R"({
+  "name": "branch",
+  "start": "a",
+  "lines": [
+    { "id": "a", "text": "A", "next": "g" },
+    { "id": "g", "text": "G", "if": [{ "flag": "trust", "op": ">=", "value": 2 }],
+      "else": "h", "next": "done" },
+    { "id": "h", "text": "H", "next": "done" },
+    { "id": "q", "text": "Q",
+      "choices": [
+        { "text": "信她", "goto": "g", "set": [{ "flag": "trust", "value": 1 }] },
+        { "text": "全信", "goto": "g",
+          "set": [{ "flag": "trust", "value": 3 }, { "flag": "route", "value": 2 }] }
+      ] },
+    { "id": "done", "text": "E" }
+  ]
+})";
+
+} // namespace
+
+void groupBranch() {
+    // ---- 求值器（纯函数）----
+    {
+        MapStore st;
+        reportFlag("bc_empty_true", evalConds({}, nullptr));   // 无条件 → 真
+        DlgCond c;
+        c.flag = "trust";
+        c.op = ">=";
+        c.value = 2.0;
+        st.v["trust"] = 3.0;
+        reportFlag("bc_true", evalConds({c}, &st));
+        st.v["trust"] = 1.0;
+        reportFlag("bc_false", !evalConds({c}, &st));
+        // 没有 store + 有条件 = **假**（保守），不是真
+        reportFlag("bc_no_store_false", !evalConds({c}, nullptr));
+
+        // AND：一条假就假
+        DlgCond c2;
+        c2.flag = "route";
+        c2.op = "==";
+        c2.value = 2.0;
+        st.v["trust"] = 5.0;
+        st.v["route"] = 2.0;
+        const bool bothTrue = evalConds({c, c2}, &st);
+        st.v["route"] = 0.0;
+        const bool oneFalse = evalConds({c, c2}, &st);
+        reportFlag("bc_and", bothTrue && !oneFalse,
+                   "t=" + std::to_string(bothTrue) + "/f=" +
+                       std::to_string(oneFalse));
+
+        // `=` 与 `==` 同义；`!=` 是反向
+        DlgCond eq;
+        eq.flag = "route";
+        eq.op = "=";
+        eq.value = 0.0;
+        DlgCond ne;
+        ne.flag = "route";
+        ne.op = "!=";
+        ne.value = 0.0;
+        reportFlag("bc_ops_alias", evalConds({eq}, &st) && !evalConds({ne}, &st));
+        // 不认识的运算符 → 假（不是"恒真"）
+        DlgCond bad;
+        bad.flag = "route";
+        bad.op = "=>";
+        reportFlag("bc_unknown_op_false", !evalConds({bad}, &st));
+        reportFlag("bc_op_validator", condOpError(">=") == nullptr &&
+                                          condOpError("=>") != nullptr);
+    }
+
+    // ---- 解析：字段落地 ----
+    const DialogueAsset a = parseIt(kBranch, "branch.dlg.json");
+    reportFlag("bc_parse_ok", a.valid, "err=" + a.error);
+    {
+        const int gi = findNode(a, "g");
+        const bool condOk = gi >= 0 && a.nodes[static_cast<size_t>(gi)].conds.size() == 1 &&
+                            a.nodes[static_cast<size_t>(gi)].conds[0].flag == "trust" &&
+                            a.nodes[static_cast<size_t>(gi)].conds[0].op == ">=" &&
+                            std::fabs(a.nodes[static_cast<size_t>(gi)].conds[0].value - 2.0) < 1e-9 &&
+                            a.nodes[static_cast<size_t>(gi)].elseId == "h";
+        reportFlag("bc_parse_cond", condOk);
+        const int qi = findNode(a, "q");
+        const bool wOk = qi >= 0 &&
+                         a.nodes[static_cast<size_t>(qi)].choices.size() == 2 &&
+                         a.nodes[static_cast<size_t>(qi)].choices[0].writes.size() == 1 &&
+                         a.nodes[static_cast<size_t>(qi)].choices[1].writes.size() == 2;
+        reportFlag("bc_parse_writes", wOk);
+    }
+
+    // ---- 解析期的四种拒收（都是"能跑但走错线"的来路）----
+    {
+        DialogueAsset b;
+        parseDialogue(R"({"lines":[{"id":"a","text":"x","if":[{"flag":"f","op":"=>","value":1}]}]})",
+                      "b1.dlg.json", b);
+        reportFlag("bc_reject_bad_op", !b.valid && errorMentions(b, "unknown op"),
+                   b.error);
+        DialogueAsset c;
+        parseDialogue(R"({"lines":[{"id":"a","text":"x","if":[{"flag":"f"}],"else":"zz"}]})",
+                      "b2.dlg.json", c);
+        reportFlag("bc_reject_else_missing", !c.valid && errorMentions(c, "else"),
+                   c.error);
+        DialogueAsset d;
+        parseDialogue(R"({"lines":[{"id":"a","text":"x","choices":[{"text":"t","goto":"a","set":[{"value":1}]}]}]})",
+                      "b3.dlg.json", d);
+        reportFlag("bc_reject_set_no_flag", !d.valid && errorMentions(d, "flag"),
+                   d.error);
+        // `if` 不是数组 / 缺 flag
+        DialogueAsset e;
+        parseDialogue(R"({"lines":[{"id":"a","text":"x","if":{"flag":"f"}}]})",
+                      "b4.dlg.json", e);
+        reportFlag("bc_reject_if_not_array", !e.valid && errorMentions(e, "array"),
+                   e.error);
+    }
+
+    // ---- 写回：if / else / set 一个都不许丢，老资产不许长出新键 ----
+    {
+        const std::string js = toJson(a);
+        DialogueAsset rt;
+        parseDialogue(js, "rt.dlg.json", rt);
+        const int gi = findNode(rt, "g");
+        const bool kept = rt.valid && gi >= 0 &&
+                          rt.nodes[static_cast<size_t>(gi)].conds.size() == 1 &&
+                          rt.nodes[static_cast<size_t>(gi)].elseId == "h";
+        reportFlag("bc_rt_cond", kept, "err=" + rt.error);
+        // 只在有内容时写：老夹具 kMain 不该出现 "if" / "else"
+        const std::string old = toJson(parseIt(kMain));
+        reportFlag("bc_rt_omits_empty",
+                   old.find("\"if\"") == std::string::npos &&
+                       old.find("\"else\"") == std::string::npos &&
+                       old.find("\"set\"") == std::string::npos);
+    }
+
+    // ---- 播放头：条件真 / 假 走两条线 ----
+    {
+        DialogueRunner r;
+        MapStore st;
+        st.v["trust"] = 5.0;   // 条件成立
+        r.setFlagStore(&st);
+        // ⚠ `start()` 只进**起点那一行**；条件写在下一行上，所以要先
+        //   `advance()` 一次 —— 这一步正是"条件在进入时求值"的验法。
+        const bool started = r.start(a) && r.advance() == Advance::Moved;
+        const bool onG = started && r.currentId() == "g";
+        reportFlag("bc_run_true", onG, r.currentId() + "/" + r.error());
+    }
+    {
+        DialogueRunner r;
+        MapStore st;
+        st.v["trust"] = 0.0;   // 条件不成立 → 落到 else = h
+        r.setFlagStore(&st);
+        const bool started = r.start(a) && r.advance() == Advance::Moved;
+        const bool onH = started && r.currentId() == "h";
+        reportFlag("bc_run_false_else", onH, r.currentId() + "/" + r.error());
+    }
+
+    // ---- else 为空 = 结束（不是"顺着 next 走"）----
+    {
+        DialogueAsset b;
+        parseDialogue(R"({"lines":[
+            {"id":"a","text":"A","next":"g"},
+            {"id":"g","text":"G","if":[{"flag":"ok","op":">=","value":1}],"next":"z"},
+            {"id":"z","text":"Z"}]})",
+                      "c1.dlg.json", b);
+        DialogueRunner r;
+        MapStore st;   // ok 未设过 = 0 → 条件假
+        r.setFlagStore(&st);
+        // ⚠ 条件假 + 没写 else → **当场收摊**：`advance()` 返回 Finished，
+        //   `active()` 变 false。若实现改成"顺着 next 继续"，这里会得到
+        //   `currentId()=="z"` 且 `active()==true` —— 两种行为差别很大。
+        const bool started = r.start(b) && r.advance() == Advance::Finished;
+        const bool ended = started && !r.active() && r.currentId() == "g";
+        reportFlag("bc_else_empty_ends", ended,
+                   "active=" + std::to_string(r.active() ? 1 : 0) + "/" +
+                       r.currentId());
+    }
+
+    // ---- 选项写旗标：**先写再跳**（顺序的证据在下一句读到新值）----
+    {
+        DialogueRunner r;
+        MapStore st;
+        r.setFlagStore(&st);
+        const bool started = r.start(a, "q");   // 从选项那行开始
+        const bool chose = started && r.choose(1);   // "全信" → trust=3, route=2
+        const bool landed = chose && r.currentId() == "g";
+        const bool wrote = st.get("trust") == 3.0 && st.get("route") == 2.0;
+        reportFlag("bc_write_then_branch", landed && wrote,
+                   "id=" + r.currentId() + " trust=" + std::to_string(st.get("trust")) +
+                       " route=" + std::to_string(st.get("route")));
+    }
+    {
+        // 选"信她"（trust=1 < 2）→ 本该落到 h。先跳后写的话这一句会读到
+        // 旧值（0）也落到 h，所以再补一条 trust=1 **恰好**小于门槛的例子
+        // 不够；用 trust=1 且初始 store 里 trust=9 → 先写后跳会落到 h，
+        // 先跳后写会落在 g。这才是能分开两种实现的构造。
+        DialogueRunner r;
+        MapStore st;
+        st.v["trust"] = 9.0;
+        r.setFlagStore(&st);
+        const bool started = r.start(a, "q");
+        const bool chose = started && r.choose(0);   // 信她 → trust 从 9 改成 1
+        const bool onH = chose && r.currentId() == "h";
+        reportFlag("bc_write_before_jump", onH, r.currentId());
+    }
+
+    // ---- 没装 store 而剧本有分支 → 报错并停住（不许静默走 else）----
+    {
+        DialogueRunner r;
+        // 起点那行没条件 → `start()` 成功；**推进到条件行**时才报错。
+        const bool started = r.start(a);
+        const Advance adv = r.advance();
+        reportFlag("bc_no_store_errors",
+                   started && adv == Advance::Finished && !r.active() &&
+                       r.error().find("flag store") != std::string::npos,
+                   r.error());
+    }
+
+    // ---- else 互相指 → 跳数上限，不是死循环 ----
+    {
+        DialogueAsset b;
+        parseDialogue(R"({"lines":[
+            {"id":"a","text":"A","next":"x"},
+            {"id":"x","text":"X","if":[{"flag":"never","op":">=","value":1}],"else":"y"},
+            {"id":"y","text":"Y","if":[{"flag":"never","op":">=","value":1}],"else":"x"}]})",
+                      "c2.dlg.json", b);
+        DialogueRunner r;
+        MapStore st;
+        r.setFlagStore(&st);
+        const bool started = r.start(b);
+        const Advance adv = r.advance();
+        reportFlag("bc_chain_guard",
+                   started && adv == Advance::Finished && !r.active() &&
+                       r.error().find("chain too deep") != std::string::npos,
+                   r.error());
+    }
+}
+
+// ---------------------------------------------------------------- H 语音
+
 void groupVoice() {
     const char* kPath = "dialogues/_voice_fixture.dlg.json";
 
@@ -732,6 +996,7 @@ int runDialogueSelfTest() {
     groupSystem();
     groupRoundTrip();
     groupVoice();
+    groupBranch();   // C7：条件分支 + 选项写旗标
     VK_LOG_INFO("DLG-TOTAL pass=%d fail=%d", g_pass, g_fail);
     return g_fail;
 }
