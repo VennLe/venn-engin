@@ -3559,6 +3559,59 @@ void entityApplyHierarchyImpl(Scene& scene, const json& je, ecs::Entity e,
 }
 
 // ③ 段：组件值与资产。**这里才开始碰 AssetManager**。
+// ---------------------------------------------------------------- 键覆盖
+//
+// 读端**认识**的实体键。与写端 `entityToJsonImpl` 写出的键一一对应。
+//
+// ⚠⚠ 为什么要有这张表：写端加了 `je["xxx"]` 而读端忘了读，后果是**静默**
+//   丢组件 —— 场景文件里明明有这一段，读进来却什么都没建，日志一片正常。
+//   C8 的导航第一次就是这么丢的（写端有 `nav`、读端没有，症状是"Play 里
+//   代理一动不动"），当时靠人肉二分才找到。
+//
+// ⚠ 加了新的读端分支 → 必须同时在这里加一条。漏加只会多一条 WARN
+//   （`SCENE-LOST … reason=reader-ignores`），不会误伤数据 —— 误报方向
+//   是安全的那一侧，这是刻意的。
+static const char* const kEntityKeys[] = {
+    // 元数据
+    "name", "guid", "parent", "parentGuid", "children", "visible",
+    "castShadow", "locked", "folder",
+    // 变换与外观
+    "transform", "mesh", "material", "primitive",
+    // 渲染附属
+    "terrain", "water", "decal", "probe", "particleEmitter",
+    "pointLight", "spotLight", "directionalLight",
+    // 物理
+    "rigidbody", "collision", "trigger", "physicsMaterial", "joint",
+    // 角色与动画
+    "character", "skinned", "animator", "animClip", "animKeys", "morph",
+    "expression", "springBone", "lookAt", "ik", "attach",
+    // 相机与演出
+    "camera", "cameraPath", "sequencer", "dialogue",
+    // 玩法
+    "gameStart", "player", "playerLimb", "gameplay", "cards", "nav",
+    // 音频 / 脚本 / 预制体
+    "audio", "audioListener", "script", "prefab",
+};
+
+// 读端不认识就**说出来**。`_comment` / `//` 这类注释键不算（它们是给人读的）。
+void warnUnknownEntityKeys(const json& je, ecs::Entity e) {
+    for (auto it = je.begin(); it != je.end(); ++it) {
+        const std::string& k = it.key();
+        if (k.empty() || k[0] == '_' || k[0] == '/') continue;
+        bool known = false;
+        for (const char* c : kEntityKeys) {
+            if (k == c) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            VK_LOG_WARN("SCENE-LOST entity=%u key=%s reason=reader-ignores",
+                        static_cast<unsigned>(e.id), k.c_str());
+        }
+    }
+}
+
 bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
                                const json& je, ecs::Entity e) {
     ecs::World& w = scene.world();
@@ -4174,6 +4227,9 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
         je.contains("gameplay") ||
         // 牌堆（P3-3）：有牌才算内容。空 CardDeckComponent 与写端同一条判断。
         je.contains("cards");
+    // ⚠ 放在**最后**：上面所有分支都跑完了，"哪些键被消费了"才有意义。
+    warnUnknownEntityKeys(je, e);
+
     return mesh || mat || hasNonMeshContent;
 }
 

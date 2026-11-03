@@ -9,6 +9,7 @@
 #include "core/Version.h"
 #include "core/Window.h"
 #include "i18n/I18n.h"
+#include "project/GameCodeGen.h"
 #include "render/QualityPresets.h"
 #include "ui/DebugRects.h"
 #include "ui/ImGuiTheme.h"
@@ -503,6 +504,7 @@ void LauncherApp::commitWizard() {
     spec.root = m_wizRoot;
     spec.codeExternal = m_wizExternal;
     spec.externalCodeRoot = m_wizCodeRoot;
+    spec.generateCode = m_wizCpp;
     spec.display.width = (m_wizRes == kResCount - 1) ? m_wizCustomW
                                                      : kResPresets[m_wizRes].w;
     spec.display.height = (m_wizRes == kResCount - 1) ? m_wizCustomH
@@ -544,6 +546,26 @@ void LauncherApp::commitWizard() {
             }
         VK_LOG_INFO("LAUNCHER-WIZARD created root=%s files=%d", m_create.root.c_str(),
                     m_create.filesCopied);
+
+        // ---- C++ 代码工程：按用户选择拉起 Visual Studio ----
+        //
+        // ⚠ 放在 `requestSpawn` **之前**：spawn 是下一帧才发生的事，而
+        //   打开 IDE 是同步的 CreateProcess（几十毫秒）。反过来也能跑，但
+        //   "刚建好的东西先给你看"更符合直觉。
+        // ⚠ `slnPath` 为空**不是**创建失败：源码与 CMakeLists 都在，
+        //   用户仍能在 VS 里打开文件夹。
+        if (m_wizCpp) {
+            if (m_create.slnPath.empty()) {
+                toast(m_create.codeNote.empty()
+                          ? TR("Code project created, but no solution was generated.")
+                          : m_create.codeNote,
+                      true);
+            } else if (m_wizOpenIde) {
+                std::string ideErr;
+                if (!project::openInVisualStudio(m_create.slnPath, &ideErr))
+                    toast(ideErr, true);
+            }
+        }
 
         // ---- 建完**直接进编辑器**（2026-10-22 用户要求）----
         // 用户原话："当操作到第三步的时候点击创建的时候，就直接进入引擎编辑器
@@ -1226,6 +1248,31 @@ void LauncherApp::drawWizardLocation() {
         ImGui::TextWrapped("%s", TR("Scripts live in assets/scripts (*.vks) and are "
                                     "hot-reloaded by the editor."));
         ImGui::PopStyleColor();
+    }
+
+    // ---- C++ 游戏模块（M5-c）----
+    //
+    // ⚠ 这一项**默认关**，并且措辞里要写明代价（重编译）。它的定位是
+    //   "要接第三方 C++ 库 / 需要原生性能时才开"，不是默认开发方式。
+    ImGui::Spacing();
+    if (ImGui::Checkbox(
+            TRL("Also generate a C++ game module (Visual Studio project)##wizcpp"),
+            &m_wizCpp)) {
+        VK_LOG_INFO("LAUNCHER-WIZARD code-cpp=%d", m_wizCpp ? 1 : 0);
+    }
+    anchor("LAUNCH-CHK-cpp");
+    if (m_wizCpp) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.66f, 1.0f));
+        ImGui::TextWrapped(
+            "%s", TR("A standalone Visual Studio project is created in code/ "
+                     "(no cmake needed). Gameplay written there needs a rebuild, "
+                     "so keep decisions in Lua and only put heavy work here."));
+        ImGui::PopStyleColor();
+        if (ImGui::Checkbox(TRL("Open Visual Studio after creating##wizide"),
+                            &m_wizOpenIde)) {
+            VK_LOG_INFO("LAUNCHER-WIZARD open-ide=%d", m_wizOpenIde ? 1 : 0);
+        }
+        anchor("LAUNCH-CHK-openide");
     }
 }
 

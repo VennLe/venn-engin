@@ -5,6 +5,7 @@
 #include "Localization.h"
 #include "assets/AssetManager.h"
 #include "core/Logger.h"
+#include "game/GameModule.h"
 #include "scene/Prefab.h"
 #include "scene/Scene.h"
 #include "scene/SceneSerializer.h"
@@ -353,6 +354,14 @@ void EditorContext::play() {
     VK_LOG_INFO("Editor: PLAY in viewport (runtime scene = %zu entities, "
                 "editor untouched)",
                 m_runtimeScene.objectCount());
+
+    // ---- M5-c：C++ 游戏模块 ----
+    //
+    // ⚠ 传**运行态场景**，不是编辑场景：模块的 `onTick` 会改位置 / 可见性，
+    //   指到编辑场景就等于"Play 一下把用户的东西永久挪了"（而且撤销不了）。
+    //   没加载模块时这里是空操作。
+    game::GameModule::instance().beginPlay(&m_runtimeScene);
+
     setStatus(TR("Playing in viewport (F = fullscreen)"));
     notify(TR("Playing in viewport (F = fullscreen)"));
 }
@@ -367,6 +376,10 @@ void EditorContext::pause() {
 
 void EditorContext::stop() {
     if (m_play == PlayState::Stopped) return;
+
+    // ⚠ 必须在 `m_runtimeScene.clear()` **之前**：`onEndPlay` 里如果
+    //   还要读场景（存盘 / 清理引用），clear 之后读到的就是空世界。
+    game::GameModule::instance().endPlay();
 
     // 直接丢弃运行态，并退出全屏。编辑态从 Play 到现在一个字节都没动过 ——
     // "停止后回到播放前"是结构上保证的，不需要任何回滚逻辑。

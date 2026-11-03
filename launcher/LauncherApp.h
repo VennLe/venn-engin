@@ -117,6 +117,11 @@ private:
     bool m_wizRootTouched = false;
     bool m_wizExternal = false;
     std::string m_wizCodeRoot;
+    // M5-c：生成 C++ 游戏代码工程（`<工程>/code/`，独立 CMake + VS 工程）。
+    // ⚠ 默认**关**：它意味着改玩法要重编译，"改一行热重载"的优势没了。
+    bool m_wizCpp = false;
+    // 创建完成后直接拉起 Visual Studio。只在 `m_wizCpp` 有意义。
+    bool m_wizOpenIde = true;
     int m_wizRes = 1;            // 0=1280x720 1=1920x1080 2=2560x1440 3=自定义
                                  // （onInit 会按本机桌面分辨率改写推荐值）
     int m_wizCustomW = 1280;

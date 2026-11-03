@@ -16,6 +16,8 @@
     "assets/scripts/main.vks",
     "assets/scripts/pickup.vks",
     "assets/scripts/portal.vks",
+    "assets/models/characters/default_character.vmesh",
+    "assets/animators/humanoid.anim.json",
     "assets/terrain/ground/terrain.vterrain",
     "assets/terrain/ground/height.r32",
     "assets/terrain/ground/splat.rgba8",

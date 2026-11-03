@@ -184,6 +184,21 @@ private:
     std::string m_rel;     // 相对根的当前目录
     std::string m_filter;  // 名字过滤（大小写不敏感）
 
+    // 显示测试夹具（2026-11-03）。**默认关**。
+    //
+    // 为什么要这条：`build/bin/assets/scenes` 里 62 个文件中有 51 个是
+    // 验收脚本的夹具（`_` 前缀）、27 个是 `tools/safe_fs.py` 的
+    // `.trash-201620` 残留。新人打开 Content Browser 看到的第一个目录
+    // 是**测试中转站**，而"读一个能跑的示例"本该是最有效的学习路径。
+    //
+    // ⚠ 过滤发生在 `refresh()` 里（扫描时跳过），不是画的时候才跳过 ——
+    //   后者会让"列表里明明没有、却占了排序/滚动的位置"。
+    // ⚠ 这个开关**不落盘**（与会话同寿命）。落盘要动 `EditorLayoutIO` 的
+    //   格式，而这一版先把"默认看不见垃圾"做掉；每次启动重置成"藏起来"
+    //   恰好也是想要的方向。
+    bool m_showTestAssets = false;
+    int m_hiddenTestAssets = 0;   // 上一次扫描藏了几个（状态行显示）
+
     // ---- E13 视图状态 ----
     ViewMode m_view = ViewMode::Grid;
     ThumbSize m_thumb = ThumbSize::Medium;

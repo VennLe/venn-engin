@@ -537,9 +537,9 @@ Idle ──选中+打开──► Spawning ──ok──► 最小化到任务�
 
 > 铁律：**每个阶段结束时都能手工验收，且不依赖后一个阶段。**
 >
-> **状态（2026-10-19）：M0 ~ M5-b 全部 ✅ 落地，M5-c（T2 C++ 模块）未做，
-> M6 收口 ✅。** 逐项实测数字与踩到的坑 → §11 台账；仍未做的两项是
-> M5-c（§6.2 的前置条件还没到）与 §9 里明确不做的 7 条。
+> **状态（2026-11-03）：M0 ~ M5-c 全部 ✅ 落地，M6 收口 ✅。**
+> M5-c 权威文档 → `docs/game_code_project.md`（生成 / 编译 / 加载全链路实测）。
+> 逐项实测数字与踩到的坑 → §11 台账；仍未做的只有 §9 里明确不做的 7 条。
 
 ### M0 · 地基：工程能被"手动"打开（规模 S，编辑器**零改动**）✅
 
@@ -628,16 +628,23 @@ set MYVK_EDITOR_SCENE=scenes/main.json
 **验收**：`verify_launcher_display.py` —— 改分辨率后 `Game.exe` 窗口客户区尺寸；
 改画质后渲染截图**显著变化像素占比** > 0.5% 且 > 10× 基线（判据见记忆"断言纪律"）。
 
-### M5 · 代码解决方案（规模 L，可选，先决条件在 §6.2）· M5-b ✅ / M5-c 未做
+### M5 · 代码解决方案（规模 L，可选，先决条件在 §6.2）· M5-b ✅ / M5-c ✅
 
 - **M5-a（必须先做）**：`engine/**` → `venn_engine` STATIC 库；两个 exe 只留
   `main.cpp` + 应用层。⚠ 改 `CMakeLists.txt` = 横切 = **全量回归 + 用户明确下令**。
 - **M5-b**：T1 外置代码根（junction）+ 编辑器侧一致性校验（`code.linked`
   与真实 junction 指向不符 → 打 WARN 并降级为"只读提示"）。
-- **M5-c**：T2 生成 `code/`（CMake + 骨架 + 可选 `cmake -G` 出 sln）。
+- **M5-c ✅（2026-11-03）**：T2 生成 `code/` —— 一个**独立的 VS 工程**
+  （`.sln` + `.vcxproj` 直接写盘，不依赖 cmake）+ C ABI 函数表 + 骨架 + 按
+  游戏类型的示例；创建完成后自动打开本机 VS。
+  ⚠ 关键取舍：**DLL 不链接引擎**（STATIC 库会被复制一份，进程里出现两份
+  全局对象）、**ABI 版本不匹配就拒载**、**`OutDir` 必须显式
+  `$(ProjectDir)bin\`**。
+  ⚠ 唯一未闭环：`registerFunction` 注册的函数在 Lua 里还看不见（等阶段 D）。
 
 **验收**：外置后改一行 `.vks` → 编辑器热重载生效（`VKS-RELOAD-*`）；
-T2 生成物 `cmake --build` 产出 exe 并 `--selftest` 通过。
+T2 生成物跑 `msbuild` 产出 DLL、`--selftest game` + `--selftest project` 全绿
+（含 E1 真编一次、A9~A12 真加载一次）。
 
 ### M6 · 收口（规模 S）✅
 
@@ -817,9 +824,10 @@ T2 生成物 `cmake --build` 产出 exe 并 `--selftest` 通过。
 3. **外置代码根只填路径、不代勾复选框**：勾选本身是被测行为。
 4. **`--selftest` 走 argv 不走 `MYVK_FRAMES`**：`renderSettingsAutomationRun()` 见到
    `MYVK_FRAMES` 会**跳过**项目层 `render.json` 的读写，自检就白测了。
-5. **M5-c（T2 C++ 游戏模块）没做**：§6.2 的前置条件（工程内独立 CMake 与
-   `Runtime.exe` 的启动契约）还没到；T1（`.vks` + junction）已经能覆盖"改代码
-   → 热重载"这条主线。
+5. ~~**M5-c（T2 C++ 游戏模块）没做**~~ → **已落地（2026-11-03）**，
+   见 `docs/game_code_project.md`。残留一条：注册的 C++ 函数在 Lua 里还看不见
+   （Lua 后端接进 `ScriptRuntime` 属阶段 D）。在那之前 C++ 模块只能靠
+   `onTick` + ABI 场景读写干活。
 
 ---
 

@@ -47,6 +47,7 @@
 #include "FlagTablePanel.h"     // A4：剧情旗标
 #include "LevelPanel.h"         // G19：关卡流送
 #include "fx/AnimEventRouter.h" // P1-3：动画事件 → 特效
+#include "game/GameModule.h"    // M5-c：C++ 游戏模块加载
 #include "fx/EffectService.h"   // P1：特效调度
 #include "dialogue/DialogueSystem.h" // C7：对话条件分支的旗标仓库
 #include "FxPanel.h"            // P1：特效面板
@@ -1373,6 +1374,23 @@ void EditorApp::onInit() {
                 // 标题栏挂工程名 —— 自动化靠它断言"编辑器打开的确实是我
                 // 刚建的那个工程"（`Venn Editor - MyGame`）。
                 window().setTitle("Venn Editor - " + pf.name);
+
+                // ---- M5-c：C++ 游戏模块 ----
+                //
+                // `venn.project.json` 里声明了 `code.module` 就试着加载。
+                // ⚠ 加载失败**不算**打开工程失败：用户可能还没编译，
+                //   或者刚把 DLL 删了。打一条 WARN 就走下去 —— 把整个工程
+                //   拦在门外是更糟的结果。
+                // ⚠ 场景传 nullptr：此刻场景还没加载。ABI 里那几个场景
+                //   函数在"没有场景"时是安全空操作，tick 时才带上场景。
+                if (!pf.codeModule.empty()) {
+                    const std::string dll =
+                        project::normalizePath(root + "/" + pf.codeModule);
+                    std::string merr;
+                    if (!game::GameModule::instance().load(dll, nullptr, &merr)) {
+                        VK_LOG_WARN("EDITOR-GAMEMODULE not loaded: %s", merr.c_str());
+                    }
+                }
 
                 // ---- M5-b：外置代码根的一致性校验 ----
                 //
@@ -3797,6 +3815,14 @@ void EditorApp::runRuntimeScripts(float dt) {
     //   脚本看到的 `time` 会倒退一半 —— 子弹时间一上来就踩。
     tickScripts(m_ctx->runtimeScene(), vks::ScriptRuntime::kSelfTimed, dt,
                 "Runtime", m_runtimeFrames);
+
+    // ---- M5-c：C++ 游戏模块 ----
+    //
+    // ⚠ 只在这里（**Run**）tick，不在 `tickScripts` 里：那个函数同时被
+    //   "动画"路径用着（直接跑编辑场景），在那里 tick 会让模块改到
+    //   用户的编辑场景 —— 而且没有撤销。
+    // 开始播放是在 `EditorContext::play()` 里调 `beginPlay` 的。
+    game::GameModule::instance().tick(dt, &m_ctx->runtimeScene());
 }
 
 // ---------------------------------------------------------------- P1 特效
@@ -7399,9 +7425,14 @@ void EditorApp::drawTransportBar() {
     const ImVec4 kPauseCol = tk.warn;
     const ImVec4 kStopCol = tk.error;
 
+    // 2026-11-03：改名。原来并排写着 `Run` 和 `Play` —— 两个词在中文语义里
+    // 都是"运行"，而它们做的事**完全不同**（Run = 整场景复制一份跑游戏；
+    // Play = 直接在编辑场景上跑脚本，Stop 用快照回滚）。新人按错一个，
+    // 症状是"我的改动被引擎吃了"，且没有任何提示能把他拉回来。
+    // 改后：`Run Game`（跑游戏）｜`Preview`（预览动作，不动场景）。
     const bool runActive = m_ctx->isPlaying();
-    const char* runLabel = runActive ? "Exit Run" : "Run";
-    const char* labels[4] = {runLabel, "Play", "Pause", "Stop"};
+    const char* runLabel = runActive ? "Exit Game" : "Run Game";
+    const char* labels[4] = {runLabel, "Preview", "Pause", "Stop"};
 
     const ImGuiStyle& st = ImGui::GetStyle();
     auto btnW = [&](const char* s) {
@@ -7440,7 +7471,8 @@ void EditorApp::drawTransportBar() {
     ImGui::SameLine();
     ImGui::BeginDisabled(runActive || m_ctx->animPlaying());
     ImGui::PushStyleColor(ImGuiCol_Button, kPlayCol);
-    if (ImGui::Button(TR("Play"), ImVec2(btnW("Play"), 28.0f))) m_ctx->animPlay();
+    if (ImGui::Button(TR("Preview"), ImVec2(btnW("Preview"), 28.0f)))
+        m_ctx->animPlay();
     ImGui::PopStyleColor();
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered() && !runActive) {
@@ -11281,7 +11313,7 @@ void EditorApp::registerEditorCommands() {
     {
         CommandDesc c;
         c.id = "play.toggle";
-        c.label = "Play / Pause";
+        c.label = "Run Game / Pause";
         c.category = "Playback";
         c.shortcut = "Space";
         c.run = [this]() { m_ctx->togglePlayPause(); };

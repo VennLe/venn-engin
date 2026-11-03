@@ -47,6 +47,10 @@
 //   PROJ-STEP-%s         数值行的 - / + 微调按钮（"-" 在后，"+"/"-" 各带后缀）
 //   PROJ-FULLSCREEN / PROJ-LANG / PROJ-QUALITY
 //   PROJ-AUDIO-%s        音频出厂值的每一行
+//   PROJ-PLAYER-MODEL / -PICK / -CTRL / -CTRLPICK / -FITBODY
+//   PROJ-PLAYER-IDLE / -WALK / -RUN / -JUMP / -NOTE
+//                        玩家外观（2026-11-03）。`-PICK` / `-CTRLPICK` 是
+//                        "从盘上挑一个"的按钮（下拉里第 0 项 = 清空）。
 //   PROJ-NOTE            夹取 / 错误的提示行
 //   PROJ-PUBLISH         发布摘要（只读）
 // 日志锚点：
@@ -57,6 +61,7 @@
 #include "project/GameFile.h"
 
 #include <string>
+#include <vector>
 
 namespace editor {
 
@@ -119,6 +124,20 @@ private:
     char m_sceneBuf[192] = {};
     char m_uiDocBuf[192] = {};
     char m_deviceBuf[96] = {};
+
+    // ---- 玩家外观（2026-11-03）----
+    // 模型 / 动画器两条路径允许**手填**（资产可能不在被扫描的那几个目录里），
+    // 同时给一个下拉列出盘上真实存在的选项 —— 只给输入框的话，作者仍然得
+    // 先知道 `assets/` 下面的相对路径怎么拼。
+    char m_modelBuf[192] = {};
+    char m_ctrlBuf[192] = {};
+    char m_idleBuf[48] = {};
+    char m_walkBuf[48] = {};
+    char m_runBuf[48] = {};
+    char m_jumpBuf[48] = {};
+    std::vector<std::string> m_modelChoices;   // 相对 assets 根
+    std::vector<std::string> m_animChoices;    // 相对 assets 根
+    bool m_choicesScanned = false;
 };
 
 } // namespace editor

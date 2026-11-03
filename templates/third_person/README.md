@@ -12,6 +12,8 @@
 3. 这一版**没有**摆玩法道具 —— 起始场景是一条街 + 12 栋房子 + 树。
    想加东西直接拖进视口；`scripts/pickup.vks` / `scripts/portal.vks` 是
    现成可抄的示例（收集物 / 终点），挂到新实体上就会跑
+4. **你能看见自己**：这个工程带了一个角色模型 + 走路状态机
+   （见下面的「你的角色」一节）
 
 ## 目录结构
 
@@ -23,8 +25,22 @@
 | `assets/scripts/main.vks` | **游戏逻辑主脚本**（挂在 `GameStart` 上，管流程与世界状态） |
 | `assets/scripts/pickup.vks` | 收集物逻辑（挂到任意实体上即生效，可多份实例各自持状态） |
 | `assets/scripts/portal.vks` | 终点逻辑（收齐后点亮自己，演示两个脚本靠世界黑板通信） |
-| `assets/game.json` | 运行时出厂配置（窗口尺寸、限帧、音频） |
+| `assets/game.json` | 运行时出厂配置（窗口尺寸、限帧、音频、**玩家外观**） |
+| `assets/models/characters/default_character.vmesh` | 玩家角色（片段名 Idle / Walk / Run / Jump） |
+| `assets/animators/humanoid.anim.json` | 走路状态机（Idle ↔ Walk ↔ Run + 跳跃） |
 | `config/render.json` | 画质开关（创建向导写入；删成 `{}` = 全部默认） |
+
+## 你的角色
+
+出生时引擎会按 `GameStart` 生成玩家，并把 `assets/game.json` 的
+`player` 块挂上去：模型 `default_character.vmesh` + 状态机
+`humanoid.anim.json`。**这两项在界面上就能换**：
+`Edit ▸ Project Settings...` → **Player** 段 → 点 `Pick...` 挑
+`assets/models/` 下的任意 `.vmesh`、`assets/animators/` 下的任意
+`.anim.json`。清空模型 = 回到胶囊占位体。
+
+⚠ 换模型之后如果走路变成滑行，先看新模型的片段名是不是
+`Idle` / `Walk` / `Run` / `Jump` —— 状态机里写的就是这四个名字。
 
 ## 游戏逻辑写在哪
 

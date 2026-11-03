@@ -3,6 +3,7 @@
 #include "assets/Mesh.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace scene {
 
@@ -59,6 +60,33 @@ glm::mat4 Scene::worldMatrix(ecs::Entity e) const {
         p = ph ? ph->parent : ecs::kInvalidEntity;
     }
     return m;
+}
+
+void Scene::setWorldPos(ecs::Entity e, const glm::vec3& p) {
+    auto* t = m_world.get<ecs::TransformComponent>(e);
+    if (!t) return;
+
+    const auto* h = m_world.get<ecs::HierarchyComponent>(e);
+    if (!h || h->parent == ecs::kInvalidEntity) {
+        t->position = p;   // 根节点：局部就是世界
+        return;
+    }
+
+    // 有父节点：`world = Mp * local`，其中 `Mp = world * inverse(local)`
+    // 就是父链的累积矩阵。先解出 Mp，再求 `local = inverse(Mp) * world`。
+    //
+    // ⚠ 不能直接 `world * inverse(local)` 当 Mp 用（那是 `world = Mp * local`
+    //   两边同乘，只在 local 可逆时成立；缩放为 0 的实体就会炸出 NaN。
+    //   这里把"不可逆 → 退回局部赋值"显式处理掉。
+    const glm::mat4 local = t->localMatrix();
+    const glm::mat4 world = worldMatrix(e);
+    const glm::mat4 parentM = world * glm::inverse(local);
+    const glm::mat4 invParent = glm::inverse(parentM);
+    const glm::vec4 lp = invParent * glm::vec4(p, 1.0f);
+    if (std::isfinite(lp.x) && std::isfinite(lp.y) && std::isfinite(lp.z))
+        t->position = glm::vec3(lp);
+    else
+        t->position = p;
 }
 
 void Scene::update(float dt) {

@@ -47,6 +47,13 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_ROOT = os.path.join(REPO, "templates")
+# `read_repo_text()` / 二进制拷贝都以它为准（= `gen_templates.py` 的上一级）。
+REPO_ROOT = REPO
+# 模板自带的角色模型（2026-11-03）。选 `default_character` 的理由：
+# 它的片段名**正好**是 Idle / Walk / Run / Jump，与 `humanoid.anim.json`
+# 的状态机逐字对上 —— 换一个模型（alicia 的片段叫别的）就要连带改
+# 状态机，模板里那叫"开箱不能跑"。
+PLAYER_MODEL_REL = "assets/models/characters/default_character.vmesh"
 
 # 天空参数与示例小镇（`assets/scenes/anime_town.json`）共用一份，
 # 见 `tools/anime_style.py` 的文件头 —— 两边各抄一套就会出现
@@ -799,7 +806,7 @@ on update {
 # ============================================================
 # game.json / render.json / template.json
 # ============================================================
-def build_game_json(spec):
+def build_game_json(kind, spec):
     """运行时出厂配置。
 
     ⚠ **不写 `quality`**。路线图 P4 实测：`RuntimeConfig::quality` 是空挂
@@ -810,7 +817,7 @@ def build_game_json(spec):
     ⚠ `title` 用占位符，创建时替换成工程名。
     ⚠ `scene` 是**资产相对路径**（与 project.startScene 同一个值）。
     """
-    return {
+    out = {
         "_comment": "__PROJECT_NAME__ 的运行时出厂配置。"
                     "优先级: 命令行 > 环境变量(MYVK_RUNTIME_*) > 本文件 > 内置默认。"
                     "language: auto = 跟随系统界面语言（en / zh 可写死）。"
@@ -841,6 +848,21 @@ def build_game_json(spec):
             "maxVoices": 64,
         },
     }
+    # ---- 玩家外观（2026-11-03）----
+    # 只有第三人称写它：第一人称相机就在眼睛位置，给玩家挂一个完整角色
+    # 模型会看到自己的脖子内壁（而且 FP 的意义本就是"看不见自己"）。
+    #
+    # ⚠ 这一段补的是"新工程打开能看到角色"——在此之前四个模板**一个都
+    #   没有可见角色**，新人建完工程看到的是空气中的胶囊体，而"让它变成
+    #   一个人"要求手改 game.json 的 player 块（面板当时不编辑它）。
+    if kind == "third_person":
+        out["player"] = {
+            "model": "models/characters/default_character.vmesh",
+            "clip": "Idle",
+            "fitBody": True,
+            "controller": "animators/humanoid.anim.json",
+        }
+    return out
 
 
 def build_template_json(kind, spec):
@@ -865,6 +887,14 @@ def build_template_json(kind, spec):
             "assets/scripts/main.vks",
             "assets/scripts/pickup.vks",
             "assets/scripts/portal.vks",
+        ]
+        # 2026-11-03：第三人称自带一个**能看见的角色**（模型 + 动画器）。
+        # ⚠ 只列进清单、不在这里造内容 —— 模型是二进制，由 main() 拷；
+        #   动画器是文本，由 generate_texts() 从 assets/animators 原样搬。
+        + (["assets/models/characters/default_character.vmesh",
+            "assets/animators/humanoid.anim.json"]
+           if kind == "third_person" else [])
+        + [
             # 地形：vterrain + 两张二进制 + 默认材质
             "assets/terrain/ground/terrain.vterrain",
             "assets/terrain/ground/height.r32",
@@ -898,6 +928,7 @@ README_TEMPLATE = '''\
 3. 这一版**没有**摆玩法道具 —— 起始场景是一条街 + 12 栋房子 + 树。
    想加东西直接拖进视口；`scripts/pickup.vks` / `scripts/portal.vks` 是
    现成可抄的示例（收集物 / 终点），挂到新实体上就会跑
+{{PLAYER_PLAY}}
 
 ## 目录结构
 
@@ -909,10 +940,11 @@ README_TEMPLATE = '''\
 | `assets/scripts/main.vks` | **游戏逻辑主脚本**（挂在 `GameStart` 上，管流程与世界状态） |
 | `assets/scripts/pickup.vks` | 收集物逻辑（挂到任意实体上即生效，可多份实例各自持状态） |
 | `assets/scripts/portal.vks` | 终点逻辑（收齐后点亮自己，演示两个脚本靠世界黑板通信） |
-| `assets/game.json` | 运行时出厂配置（窗口尺寸、限帧、音频） |
+| `assets/game.json` | 运行时出厂配置（窗口尺寸、限帧、音频、**玩家外观**） |
+{{PLAYER_ROW}}
 | `config/render.json` | 画质开关（创建向导写入；删成 `{}` = 全部默认） |
 
-## 游戏逻辑写在哪
+{{PLAYER_SECTION}}## 游戏逻辑写在哪
 
 **写在 `.vks` 脚本里，不写 C++。** 引擎的 C++ 提供能力（渲染 / 物理 /
 角色控制器 / 输入采集），脚本提供玩法。好处是：改完保存就生效，不用编译。
@@ -957,6 +989,34 @@ def build_readme(kind, spec):
     text = text.replace("{{KIND}}", kind)
     text = text.replace("{{LABEL}}", spec["label"])
     text = text.replace("{{SUMMARY}}", spec["summary"])
+    # 2026-11-03：第三人称模板自带可见角色。README 里必须**说清楚它在哪、
+    # 怎么换** —— 否则"我的工程里有个黑色小人"会被当成 bug。
+    if kind == "third_person":
+        text = text.replace(
+            "{{PLAYER_SECTION}}",
+            "## 你的角色\n\n"
+            "出生时引擎会按 `GameStart` 生成玩家，并把 `assets/game.json` 的\n"
+            "`player` 块挂上去：模型 `default_character.vmesh` + 状态机\n"
+            "`humanoid.anim.json`。**这两项在界面上就能换**：\n"
+            "`Edit ▸ Project Settings...` → **Player** 段 → 点 `Pick...` 挑\n"
+            "`assets/models/` 下的任意 `.vmesh`、`assets/animators/` 下的任意\n"
+            "`.anim.json`。清空模型 = 回到胶囊占位体。\n\n"
+            "⚠ 换模型之后如果走路变成滑行，先看新模型的片段名是不是\n"
+            "`Idle` / `Walk` / `Run` / `Jump` —— 状态机里写的就是这四个名字。\n\n")
+        text = text.replace(
+            "{{PLAYER_PLAY}}",
+            "4. **你能看见自己**：这个工程带了一个角色模型 + 走路状态机\n"
+            "   （见下面的「你的角色」一节）")
+        text = text.replace(
+            "{{PLAYER_ROW}}",
+            "| `assets/models/characters/default_character.vmesh` | 玩家角色"
+            "（片段名 Idle / Walk / Run / Jump） |\n"
+            "| `assets/animators/humanoid.anim.json` | 走路状态机"
+            "（Idle ↔ Walk ↔ Run + 跳跃） |")
+    else:
+        text = text.replace("{{PLAYER_SECTION}}", "")
+        text = text.replace("{{PLAYER_PLAY}}", "")
+        text = text.replace("{{PLAYER_ROW}}", "")
     return text
 
 
@@ -965,6 +1025,19 @@ def build_readme(kind, spec):
 # ============================================================
 def dump_json(obj):
     return json.dumps(obj, ensure_ascii=False, indent=2) + "\n"
+
+
+def read_repo_text(rel):
+    """读仓库里的一个文本资产（相对仓库根）。
+
+    ⚠ 模板**生成**时依赖它，所以 `--check` 也会跟着它变 —— 这正是想要的：
+    改了 `assets/animators/humanoid.anim.json` 之后，模板里那份旧拷贝
+    必须被判成漂移，而不是两边各自安静地活着。
+    """
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(here, rel), "r", encoding="utf-8",
+              newline="") as f:
+        return f.read()
 
 
 def write_text(path, text):
@@ -986,7 +1059,7 @@ def generate_texts():
         files[base + "/assets/scenes/main.json"] = dump_json(build_scene(kind, spec))
         files[base + "/assets/scenes/terrain.json"] = \
             dump_json(build_terrain_scene(kind, spec))
-        files[base + "/assets/game.json"] = dump_json(build_game_json(spec))
+        files[base + "/assets/game.json"] = dump_json(build_game_json(kind, spec))
         files[base + "/config/render.json"] = "{}\n"
         # ⚠ 两个类型的脚本内容**逐字相同**（差异在场景的 player/camera 段）：
         #   玩法不该因为"第一人称"就分叉成两份要各自维护的源码。
@@ -1000,6 +1073,12 @@ def generate_texts():
             dump_json(build_terrain_json())
         files[base + "/assets/materials/template_ground.vmat"] = \
             dump_json(TEMPLATE_GROUND_MAT)
+        # 动画器：**原样**搬 `assets/animators/humanoid.anim.json`。
+        # 不在这里内联一份 JSON —— 那样"模板里的状态机"与"引擎自带的
+        # 状态机"会各改各的，而症状是模板工程里走路变成了滑步。
+        if kind == "third_person":
+            files[base + "/assets/animators/humanoid.anim.json"] = \
+                read_repo_text("assets/animators/humanoid.anim.json")
         files[base + "/README.md"] = build_readme(kind, spec)
     return files
 
@@ -1027,6 +1106,20 @@ def main():
         else:
             write_text(abs_path, text)
             written += 1
+
+    # ---- 角色模型（二进制，与地形同一条理由不进 generate_texts）----
+    # ⚠ 只拷**已烤制**的 `.vmesh`，不拷 `.fbx` / `.fbm`：模板要的是
+    #   "打开就能跑"，不是"给美术二次编辑的源文件"。
+    if not args.check:
+        src = os.path.join(REPO_ROOT, PLAYER_MODEL_REL)
+        if os.path.isfile(src):
+            p = os.path.join(OUT_ROOT, "third_person", "assets", "models",
+                             "characters", os.path.basename(PLAYER_MODEL_REL))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(src, "rb") as f:
+                data = f.read()
+            with open(p, "wb") as f:
+                f.write(data)
 
     # ---- 地形二进制（不进 generate_texts：`--check` 走的是文本比对）----
     if not args.check:

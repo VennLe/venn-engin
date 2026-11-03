@@ -1,0 +1,37 @@
+
+=============== [rel] /MD /O2 ===============
+[probe] version = Lua 5.4.7
+[probe] pcall      rc=0 got=42
+[probe] newthread  co=000001C63CFF6718 status=0
+[probe] loaded    co=000001C63CFF6718 top=1
+[probe] about to resume
+[probe] resume     rc=0 nres=1 got=42
+[probe] yield#1    rc=1(status=1) got=1
+[probe] yield#2    rc=1 got=2
+[probe] done OK
+
+=============== [dbg1] /MDd /Od /RTC1 ===============
+[probe] version = Lua 5.4.7
+[probe] pcall      rc=0 got=42
+[probe] newthread  co=000001F08CB28B38 status=0
+[probe] loaded    co=000001F08CB28B38 top=1
+[probe] about to resume
+[probe] resume     rc=0 nres=1 got=42
+[probe] yield#1    rc=1(status=1) got=1
+[probe] yield#2    rc=1 got=2
+[probe] done OK
+
+=============== [dbg2] /MDd /O2  (RTC1 removed) ===============
+[probe] version = Lua 5.4.7
+[probe] pcall      rc=0 got=42
+[probe] newthread  co=000001C765B89A98 status=0
+[probe] loaded    co=000001C765B89A98 top=1
+[probe] about to resume
+[probe] resume     rc=0 nres=1 got=42
+[probe] yield#1    rc=1(status=1) got=1
+[probe] yield#2    rc=1 got=2
+[probe] done OK
+
+=============== [dbg3] /MDd /Od /RTC1 /O2  (expect D8016) ===============
+BUILD-FAIL dbg3 EXPECTED 
+cl: 命令行 error D8016 :“/RTC1”和“/O2”命令行选项不兼容

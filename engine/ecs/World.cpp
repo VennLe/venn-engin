@@ -135,8 +135,17 @@ const std::string* World::name(Entity e) const {
 void World::setName(Entity e, const std::string& n) {
     if (!alive(e)) return;
     m_records[e.id].name = n;
+    // ⚠ 名字有**两处**存储，两处都要写：
+    //     · `Record::name`  —— `World::name()` 读它（脚本 `engine.name`）；
+    //     · `NameComponent` —— `Scene::find` / 编辑器层级树 / 序列化读它。
+    //   只写其中一处**不报错**，症状是"改完名 `world.find` 还是找不到"或
+    //   "存盘再读名字变回去了"。组件缺了就补 —— 这一步只发生在**显式改名**
+    //   时；`create()` 里不补（那会给每个实体都加一个组件，存档与
+    //   `sceneHash` 跟着变，G16 的兼容断言会整片红）。
     if (auto* nc = get<NameComponent>(e)) {
         nc->name = n;
+    } else {
+        add<NameComponent>(e, NameComponent{n});
     }
 }
 

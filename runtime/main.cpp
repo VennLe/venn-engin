@@ -87,8 +87,10 @@
 #include "project/ProjectCreate.h"
 #include "project/ProjectDisplay.h"
 #include "project/ProjectFile.h"
+#include "game/GameModule.h"
 #include "project/RecentList.h"
 #include "script/ScriptSelfTest.h"
+#include "script/LuaSelfTest.h"
 #include "terrain/TerrainSelfTest.h"
 #endif
 
@@ -652,6 +654,18 @@ int main(int argc, char** argv) {
         // 它是性能判据（比整套 A~E 组慢一个量级），混进去会让人不想跑自检。
         if (cfg.selftest == "scriptbench")
             return vks::runScriptBench() == 0 ? 0 : 1;
+        // Lua 后端：白名单 / 编译 / 执行 / 协程 / 熔断 / 热重载。
+        // 与 `script` 分开跑，理由同上 + 它验的是 **VM 层面**的事
+        // （os 库在不在、hook 有没有打断死循环），与语言语义无关。
+        if (cfg.selftest == "lua")
+            return vks::runLuaSelfTest() == 0 ? 0 : 1;
+        // `--selftest api`：把 ApiTable **原样**打成 markdown。
+        // 存在的意义：文档不是手写的第二份真相。改 API → 重跑这条 →
+        // `docs/script_api_reference.md` 自动跟上，不可能"文档里有、代码里没有"。
+        if (cfg.selftest == "api") {
+            vks::dumpApiMarkdown();
+            return 0;
+        }
         // 启动器 M2：工程数据模型（路径规则 / 逃逸拒绝 / 序列化往返 /
         // 版本拒绝 / 名称消毒 / 目标目录冲突）。纯数值 + 临时目录 IO，
         // 不开窗口也不要 GPU —— 与上面全部同一条"Vulkan 之前返回"的路。
@@ -663,6 +677,13 @@ int main(int argc, char** argv) {
         //   全绿、其实那一组从没跑过"。
         if (cfg.selftest == "project")
             return project::runAllProjectSelfTests() == 0 ? 0 : 1;
+
+        // `--selftest game`：C++ 游戏模块（M5-c）的 ABI 表完整性 /
+        // 注册窗口纪律。**不依赖磁盘上有没有 DLL** —— 真加载的用例要
+        // 有工程才有意义（那部分在 `--selftest project` 的 GC 组里，
+        // 会真生成一套并尝试 cmake）。
+        if (cfg.selftest == "game")
+            return game::runGameModuleSelfTest() == 0 ? 0 : 1;
 
         // E28-1 出包（P 组）：临时造一个工程 → 打包 → 清单对账 / 缺入口必须
         // 失败 / 目标非空必须拒绝 / Debug 引擎必须带 WARNING。纯文件 IO。

@@ -222,6 +222,47 @@ endif()
 add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
+# ---- Lua 5.4（脚本后端：`LuaBackend`）----
+#
+# 与 ufbx / stb_vorbis 同款：vendored 纯 C 源码，作为**独立静态库**编译。
+# 不能混进 VennEngine 的 C++ GLOB —— 那一批是按 C++ 编译的，而 Lua 是
+# ANSI C（C89 风格声明、有 longjmp），混编会出跨语言异常边界的隐患。
+#
+# ⚠ 只编 32 个库文件；`lua.c` / `luac.c` 是独立解释器与编译器，
+#   在装进 third_party 时就已删掉 —— 留着会各带一个 `main()`，
+#   link 进 Editor.exe 直接重定义。
+#
+# ⚠ `LUA_USE_POSIX` / `LUA_USE_WINDOWS` 都**不定义**：它们会拉进
+#   popen / tmpfile / signal 这些"脚本不该有的能力"。
+#   标准库白名单是 `engine/script/LuaBackend.cpp` 里的 `kAllowedLibs`
+#   （只开 base/coroutine/table/string/math/utf8；**不开 io/os/debug**）。
+file(GLOB LUA_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua/*.c
+)
+add_library(lua_static STATIC ${LUA_SOURCES})
+target_include_directories(lua_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua)
+# Lua 是纯 C，但整套工程按 C++ 链接 —— 必须显式钉住，否则 MSVC 会去找 C 运行库的符号。
+set_target_properties(lua_static PROPERTIES LINKER_LANGUAGE CXX)
+if(MSVC)
+    # 纯 C 源码按 MSVC 的 C 模式编译会刷一堆"有符号/无符号比较"警告，降到 /W0。
+    target_compile_options(lua_static PRIVATE /utf-8 /wd4819 /W0)
+    # ⚠⚠ 这里曾经加过 `/RTC- /GS-` 和 `/O2 /Ob2`，**都不要加**，实测结论：
+    #
+    #   ① `/RTC-` 根本不是一个合法选项 —— cl 只给一句
+    #      `warning D9002: 忽略未知选项"/RTC-"` 就跳过了。MSVC 只有
+    #      `/RTC1 /RTCc /RTCs /RTCu`，**没有负形式**。想关掉 Debug 默认的
+    #      /RTC1 只能把它从 CMAKE_C_FLAGS_DEBUG 里删掉，追加是无效的。
+    #      当时以为"已经关掉了"，实际一行都没变 —— 排查因此多绕了一轮。
+    #
+    #   ② `/O2` 紧跟 `/RTC1` 会直接 `error D8016: 命令行选项不兼容`，
+    #      整个库编不出来。要开优化只能在**不含 /RTC1** 的前提下开。
+    #
+    #   ③ 真正重要的是：`lua_resume` 崩溃**与这两组开关都无关**。
+    #      用同一份源码、同一批开关（含 /RTC1 /Od /Zi /GS-）编出的
+    #      独立探针里，协程 yield/resume 全部正常。
+    #      所以 Lua 一律跟随工程的 Debug/Release 配置，不单独调开关。
+endif()
+
 add_library(vma INTERFACE)
 target_include_directories(vma INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/VulkanMemoryAllocator/include)
 
@@ -245,6 +286,11 @@ add_library(venn ALIAS VennEngine)
 target_include_directories(VennEngine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/engine
 )
+# Lua 头文件（`<lua.hpp>`）。虽然 `lua_static` 是 PUBLIC 链接、include 会传播，
+# 但引擎自己的**源文件**编译时也要能看到 —— 显式写一遍，别赌传播规则。
+target_include_directories(VennEngine PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua
+)
 # git 号透传（`core/Build.h` 的 `kGitDescribe`）。PUBLIC：三个应用层都要能
 # 打出一行相同的 `GAME-BUILD` / `EDITOR-BUILD`。
 target_compile_definitions(VennEngine PUBLIC
@@ -263,6 +309,9 @@ target_link_libraries(VennEngine PUBLIC
     vma
     stb_vorbis
     VennAssetIO
+    # Lua 5.4：脚本后端 `LuaBackend` 的 VM。PUBLIC 是因为
+    # `engine/script/LuaBackend.h` 若对外暴露 `lua_State*`，宿主也要能 include lua.h。
+    lua_static
 )
 # G14-3：WASAPI 后端要 COM（ole32）+ 多媒体线程提升（avrt）+ 内核流（ksuser）
 # 与 waveOut 兜底的 winmm。全部只在 Windows 上存在；engine/audio/WasapiBackend.cpp
@@ -1144,3 +1193,24 @@ if(NOT MSVC)
     target_compile_options(VennAssetC PRIVATE -Wall -Wextra)
 endif()
 endif()   # if(NOT VENN_SHIPPING)  ← AssetC
+
+# ============================================================
+# M5-c：把游戏模块的 ABI 头装到 exe 旁边
+#
+# 建工程时要往 `<工程>/code/include/venn/VennAbi.h` 写一份快照。开发机上
+# 生成器能按 `__FILE__` 找到源码里的那份；但**发布版没有源码树**，所以
+# 构建时在这里拷一份到 `<bin>/include/venn/`，作为第二候选。
+#
+# ⚠ 不装的话，发布版 Launcher 建"带 C++ 模块"的工程会报
+#   "cannot locate engine's VennAbi.h" —— 功能在开发机好用、发出去就不能用，
+#   正是本项目最忌讳的那类"只在别人机器上坏"。
+# ============================================================
+add_custom_target(venn_abi_header ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/include/venn
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/engine/game/VennAbi.h
+            ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/include/venn/VennAbi.h
+    COMMENT "Installing VennAbi.h next to the executables"
+    VERBATIM
+)

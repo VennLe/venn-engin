@@ -74,6 +74,28 @@ struct GameAudio {
     int maxVoices = 64;
 };
 
+// `game.json` 的 `player` 块里**面板编辑的那一部分**（2026-11-03）。
+//
+// ⚠ 这**不是** player 的全集：真实字段有 25+ 个（步幅匹配 / 相位曲线 /
+//   走跑速度 / 模型朝向 / 弹簧骨……）。这里只挑"让一个角色第一次出现在
+//   场景里"必需的六项。其余字段靠 `saveGameFile` 的**合并写回**原样保留
+//   （见本文件头注释 ①）—— 所以这个结构体小一点是安全的，多一点是危险。
+//
+// ⚠ `present = false` = "这个工程没配过角色"。此时保存**不会凭空长出**
+//   `player` 块：老工程存一次盘就多一段配置，属于"不出错但 diff 很脏"的
+//   改动，而且会让"这个工程到底配没配角色"变得无法从磁盘判断。
+struct GamePlayer {
+    bool present = false;
+    std::string model;       // 相对 assets/；空 = 胶囊占位体（引擎默认）
+    std::string clip;        // 默认 clip；空 = 模型的第一段
+    bool fitBody = true;     // 胶囊按模型高度反推（1:1 真实尺度）
+    std::string controller;  // `assets/animators/*.anim.json`；空 = 四态硬编码
+    std::string idleClip = "Idle";
+    std::string walkClip = "Walk";
+    std::string runClip = "Run";
+    std::string jumpClip = "Jump";
+};
+
 // 面板编辑的那一部分（**不是** game.json 的全集，见头注释）。
 struct GameSettings {
     // ---- 通用 ----
@@ -98,6 +120,9 @@ struct GameSettings {
 
     // ---- 音频出厂值 ----
     GameAudio audio;
+
+    // ---- 玩家外观（P1 / 2026-11-03 起可在面板里改）----
+    GamePlayer player;
 };
 
 struct GameFileIo {

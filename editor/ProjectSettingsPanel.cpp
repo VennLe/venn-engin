@@ -12,12 +12,15 @@
 
 #include <imgui.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <vector>
 
 namespace editor {
 
@@ -72,11 +75,61 @@ bool sameSettings(const project::GameSettings& a,
     if (!base) return false;
     const project::GameAudio& x = a.audio;
     const project::GameAudio& y = b.audio;
-    return x.enabled == y.enabled && x.device == y.device &&
-           fe(x.master, y.master) && fe(x.music, y.music) &&
-           fe(x.sfx, y.sfx) && fe(x.voice, y.voice) && x.mute == y.mute &&
-           x.muteOnFocusLost == y.muteOnFocusLost &&
-           fe(x.duckDepth, y.duckDepth) && x.maxVoices == y.maxVoices;
+    if (!(x.enabled == y.enabled && x.device == y.device &&
+          fe(x.master, y.master) && fe(x.music, y.music) && fe(x.sfx, y.sfx) &&
+          fe(x.voice, y.voice) && x.mute == y.mute &&
+          x.muteOnFocusLost == y.muteOnFocusLost &&
+          fe(x.duckDepth, y.duckDepth) && x.maxVoices == y.maxVoices))
+        return false;
+    const project::GamePlayer& p = a.player;
+    const project::GamePlayer& q = b.player;
+    return p.present == q.present && p.model == q.model && p.clip == q.clip &&
+           p.fitBody == q.fitBody && p.controller == q.controller &&
+           p.idleClip == q.idleClip && p.walkClip == q.walkClip &&
+           p.runClip == q.runClip && p.jumpClip == q.jumpClip;
+}
+
+// 扫 `assets/<sub>/` 下指定后缀的资产，返回**相对 assets 根**的路径。
+//
+// 为什么扫盘而不是写死清单：工程里的角色/动画器是用户自己导进来的，
+// 写死的清单会在第二个工程里就过期。为什么限制深度：`assets/models`
+// 下面有 `.fbm` 贴图目录，递归进去会扫出几千个 png。
+std::vector<std::string> scanAssets(const std::string& assetsRoot,
+                                    const char* sub, const char* ext,
+                                    int maxDepth = 3) {
+    namespace fs = std::filesystem;
+    std::vector<std::string> out;
+    const fs::path root = fs::path(assetsRoot) / sub;
+    std::error_code ec;
+    if (!fs::is_directory(root, ec)) return out;
+    const std::string want = ext;
+    auto walk = [&](const fs::path& dir, int depth) {
+        auto rec = [&](auto&& self, const fs::path& d, int dep) -> void {
+            std::error_code e2;
+            fs::directory_iterator it(d, fs::directory_options::skip_permission_denied,
+                                      e2);
+            if (e2) return;
+            for (const auto& ent : it) {
+                std::error_code e3;
+                if (ent.is_directory(e3)) {
+                    if (dep < maxDepth) self(self, ent.path(), dep + 1);
+                    continue;
+                }
+                const std::string name = ent.path().filename().string();
+                if (name.size() <= want.size()) continue;
+                if (name.compare(name.size() - want.size(), want.size(), want) != 0)
+                    continue;
+                // 相对 assets 根（`models/characters/x.vmesh`）—— 这正是
+                // `game.json` 里 `player.model` 要写的口径。
+                out.push_back((fs::path(sub) / fs::relative(ent.path(), root, e3))
+                                  .generic_string());
+            }
+        };
+        rec(rec, dir, depth);
+    };
+    walk(root, 0);
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 // 数值行：Input + 两个微调按钮。
@@ -249,6 +302,15 @@ void ProjectSettingsPanel::syncBuffers() {
     std::snprintf(m_sceneBuf, sizeof(m_sceneBuf), "%s", m_st.scene.c_str());
     std::snprintf(m_uiDocBuf, sizeof(m_uiDocBuf), "%s", m_st.uiDoc.c_str());
     std::snprintf(m_deviceBuf, sizeof(m_deviceBuf), "%s", m_st.audio.device.c_str());
+    std::snprintf(m_modelBuf, sizeof(m_modelBuf), "%s", m_st.player.model.c_str());
+    std::snprintf(m_ctrlBuf, sizeof(m_ctrlBuf), "%s", m_st.player.controller.c_str());
+    std::snprintf(m_idleBuf, sizeof(m_idleBuf), "%s", m_st.player.idleClip.c_str());
+    std::snprintf(m_walkBuf, sizeof(m_walkBuf), "%s", m_st.player.walkClip.c_str());
+    std::snprintf(m_runBuf, sizeof(m_runBuf), "%s", m_st.player.runClip.c_str());
+    std::snprintf(m_jumpBuf, sizeof(m_jumpBuf), "%s", m_st.player.jumpClip.c_str());
+    // 换工程 / 重读之后**重新扫盘**：新导进来的角色必须立刻出现在下拉里，
+    // 否则"我刚导入的模型挑不到"会变成一个必须重启编辑器的诡异 bug。
+    m_choicesScanned = false;
 }
 
 bool ProjectSettingsPanel::setField(const std::string& key,
@@ -550,6 +612,138 @@ void ProjectSettingsPanel::draw() {
         ImGui::TextDisabled("%s", TR("auto = follow the system language"));
     }
 
+    // ---------------------------------------------------------- 玩家外观
+    //
+    // 2026-11-03：这一段补的是"让一个角色走起来"路径上**唯一必须手改 JSON**
+    // 的地方。在此之前 `player` 块有 25 个字段、面板一个都不编辑，于是
+    // "新工程能看到自己的角色"这件事要求作者知道 `assets/game.json` 在哪、
+    // 键叫什么、路径相对谁。
+    //
+    // ⚠ 只暴露六项（见 GamePlayer 的注释），其余靠合并写回原样保留。
+    // ⚠ 首次打开（没配过角色）时这一段**默认折叠**：不配角色的工程
+    //   （卡牌 / 纯 UI 演示）不该被一段用不上的控件占掉半屏。
+    if (ImGui::CollapsingHeader(
+            idLabel(TR("Player"), "##PROJ-SEC-PLAYER").c_str(),
+            m_st.player.present ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+        if (!m_choicesScanned) {
+            namespace fs = std::filesystem;
+            // `m_path` = `<project>/assets/game.json` → 资产根是它的父目录。
+            const std::string assetsRoot =
+                fs::path(m_path).parent_path().generic_string();
+            m_modelChoices = scanAssets(assetsRoot, "models", ".vmesh");
+            m_animChoices = scanAssets(assetsRoot, "animators", ".anim.json");
+            m_choicesScanned = true;
+        }
+
+        // ---- 模型 ----
+        ImGui::TextUnformatted(TR("Character model"));
+        ImGui::SameLine(190.0f);
+        ImGui::SetNextItemWidth(280.0f);
+        if (ImGui::InputText(idLabel("##v", "##PROJ-PLAYER-MODEL").c_str(),
+                             m_modelBuf, sizeof(m_modelBuf)))
+            changed = true;
+        tagItem("PROJ-PLAYER-MODEL");
+        ImGui::SameLine();
+        if (ImGui::Button(idLabel(TR("Pick..."), "##PROJ-PLAYER-PICK").c_str()))
+            ImGui::OpenPopup("##PROJ-PLAYER-POPUP");
+        tagItem("PROJ-PLAYER-PICK");
+        if (ImGui::BeginPopup("##PROJ-PLAYER-POPUP")) {
+            if (m_modelChoices.empty()) {
+                ImGui::TextDisabled("%s", TR("No .vmesh under assets/models"));
+            }
+            // 第 0 项 = 清空（回到胶囊占位体）。**必须**有这一项，否则
+            // "把角色撤掉"只能靠手改 JSON —— 又回到这条路要消灭的问题。
+            if (ImGui::Selectable(TR("(placeholder capsule)"))) {
+                std::snprintf(m_modelBuf, sizeof(m_modelBuf), "%s", "");
+                changed = true;
+            }
+            for (const std::string& m : m_modelChoices) {
+                if (ImGui::Selectable(m.c_str())) {
+                    std::snprintf(m_modelBuf, sizeof(m_modelBuf), "%s",
+                                  m.c_str());
+                    changed = true;
+                }
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", TR("(empty = capsule placeholder)"));
+
+        // ---- 动画器 ----
+        ImGui::TextUnformatted(TR("Animator"));
+        ImGui::SameLine(190.0f);
+        ImGui::SetNextItemWidth(280.0f);
+        if (ImGui::InputText(idLabel("##v", "##PROJ-PLAYER-CTRL").c_str(),
+                             m_ctrlBuf, sizeof(m_ctrlBuf)))
+            changed = true;
+        tagItem("PROJ-PLAYER-CTRL");
+        ImGui::SameLine();
+        if (ImGui::Button(idLabel(TR("Pick..."), "##PROJ-PLAYER-CTRLPICK")
+                              .c_str()))
+            ImGui::OpenPopup("##PROJ-PLAYER-CTRLPOP");
+        tagItem("PROJ-PLAYER-CTRLPICK");
+        if (ImGui::BeginPopup("##PROJ-PLAYER-CTRLPOP")) {
+            if (ImGui::Selectable(TR("(four-state hardcoded)"))) {
+                std::snprintf(m_ctrlBuf, sizeof(m_ctrlBuf), "%s", "");
+                changed = true;
+            }
+            if (m_animChoices.empty()) {
+                ImGui::TextDisabled("%s", TR("No .anim.json under assets/animators"));
+            }
+            for (const std::string& a : m_animChoices) {
+                if (ImGui::Selectable(a.c_str())) {
+                    std::snprintf(m_ctrlBuf, sizeof(m_ctrlBuf), "%s", a.c_str());
+                    changed = true;
+                }
+            }
+            ImGui::EndPopup();
+        }
+
+        changed |= boolRow(TR("Fit body"), "PROJ-PLAYER-FITBODY",
+                           m_st.player.fitBody);
+
+        // ---- 四段 clip 名 ----
+        // 只在**没有**动画器时生效（控制器接管后"哪段动画归哪个状态"
+        // 写在控制器里）。灰掉比藏掉好：作者能看到"这里本来有四个名字"。
+        ImGui::BeginDisabled(!m_st.player.controller.empty());
+        ImGui::TextUnformatted(TR("Idle / Walk / Run / Jump clips"));
+        ImGui::SameLine(190.0f);
+        ImGui::SetNextItemWidth(84.0f);
+        if (ImGui::InputText(idLabel("##v", "##PROJ-PLAYER-IDLE").c_str(),
+                             m_idleBuf, sizeof(m_idleBuf)))
+            changed = true;
+        tagItem("PROJ-PLAYER-IDLE");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(84.0f);
+        if (ImGui::InputText(idLabel("##v", "##PROJ-PLAYER-WALK").c_str(),
+                             m_walkBuf, sizeof(m_walkBuf)))
+            changed = true;
+        tagItem("PROJ-PLAYER-WALK");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(84.0f);
+        if (ImGui::InputText(idLabel("##v", "##PROJ-PLAYER-RUN").c_str(),
+                             m_runBuf, sizeof(m_runBuf)))
+            changed = true;
+        tagItem("PROJ-PLAYER-RUN");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(84.0f);
+        if (ImGui::InputText(idLabel("##v", "##PROJ-PLAYER-JUMP").c_str(),
+                             m_jumpBuf, sizeof(m_jumpBuf)))
+            changed = true;
+        tagItem("PROJ-PLAYER-JUMP");
+        ImGui::EndDisabled();
+        if (!m_st.player.controller.empty())
+            ImGui::TextDisabled("%s",
+                                TR("Ignored: the animator decides which clip "
+                                   "belongs to which state."));
+
+        ImGui::TextWrapped("%s",
+                           TR("The player is spawned from the scene's GameStart "
+                              "point at play time. Paths are relative to the "
+                              "project's assets folder."));
+        tagItem("PROJ-PLAYER-NOTE");
+    }
+
     // ---------------------------------------------------------- 画质标签
     if (ImGui::CollapsingHeader(idLabel(TR("Render defaults"),
                                         "##PROJ-SEC-RENDER").c_str(),
@@ -642,6 +836,23 @@ void ProjectSettingsPanel::draw() {
         m_st.scene = m_sceneBuf;
         m_st.uiDoc = m_uiDocBuf;
         m_st.audio.device = m_deviceBuf;
+        // 玩家外观：**任何一项被改就置 present**。这不是"顺手"，它表达的
+        // 是"这个工程现在有角色配置了"—— 不置的话面板改了、存盘却没写出去，
+        // 症状是"我明明选了模型，重新打开面板又变回空的"。
+        if (m_st.player.model != m_modelBuf ||
+            m_st.player.controller != m_ctrlBuf ||
+            m_st.player.idleClip != m_idleBuf ||
+            m_st.player.walkClip != m_walkBuf ||
+            m_st.player.runClip != m_runBuf ||
+            m_st.player.jumpClip != m_jumpBuf) {
+            m_st.player.present = true;
+        }
+        m_st.player.model = m_modelBuf;
+        m_st.player.controller = m_ctrlBuf;
+        m_st.player.idleClip = m_idleBuf;
+        m_st.player.walkClip = m_walkBuf;
+        m_st.player.runClip = m_runBuf;
+        m_st.player.jumpClip = m_jumpBuf;
         m_dirty = !sameSettings(m_st, m_saved);
     }
 

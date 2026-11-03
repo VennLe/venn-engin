@@ -163,6 +163,12 @@ const Entry kZh[] = {
     {"Play", "播放"},
     {"Pause", "暂停"},
     {"Stop", "停止"},
+    // 2026-11-03：播放条改名。`Run` 与 `Play` 在中文里都是"运行"，而它们
+    // 做的事完全不同（前者复制整场景跑游戏、后者直接在编辑场景上跑并回滚），
+    // 所以界面上必须用两个**不会混**的词。
+    {"Preview", "预览"},
+    {"Run Game", "运行游戏"},
+    {"Exit Game", "退出游戏"},
     {"Step", "单步"},
     {"Run", "运行"},
     {"Tasks", "任务"},
@@ -2335,6 +2341,16 @@ const Entry kZh[] = {
     {"External script folder", "外部脚本文件夹"},
     {"A directory junction is created at assets/scripts. No admin rights needed.",
      "会在 assets/scripts 建一个目录联接。不需要管理员权限。"},
+    {"Also generate a C++ game module (Visual Studio project)",
+     "同时生成 C++ 游戏代码工程（Visual Studio 工程）"},
+    {"A standalone Visual Studio project is created in code/ "
+     "(no cmake needed). Gameplay written there needs a rebuild, so keep decisions "
+     "in Lua and only put heavy work here.",
+     "会在 code/ 下建一个独立的 Visual Studio 工程（不需要 cmake）。"
+     "写在这里的玩法要重编译才生效 —— 决策留在 Lua，只把重活放这里。"},
+    {"Open Visual Studio after creating", "创建完成后打开 Visual Studio"},
+    {"Code project created, but no solution was generated.",
+     "代码工程已创建，但没能生成 .sln（可在 VS 里直接打开 code 文件夹）。"},
     {"Scripts live in assets/scripts (*.vks) and are hot-reloaded by the editor.",
      "脚本放在 assets/scripts（*.vks），编辑器里改完即热重载。"},
     {"Display and quality", "画面与画质"},
@@ -3966,6 +3982,24 @@ const Entry kZh[] = {
      "产物目录（File > Package 写在这里）："},
     {"Engine assets (shaders / fonts / ui / LUT) are packed automatically — they live next to the exe, not in the project.",
      "引擎侧资产（shaders / fonts / ui / LUT）会自动打包 —— 它们在 exe 旁边，不在工程里。"},
+    // 2026-11-03：玩家外观段（`game.json.player` 的 UI 子集）。
+    // 这一段的存在理由就是"让角色出现"不该要求手改 JSON。
+    {"Player", "玩家"},
+    {"Character model", "角色模型"},
+    {"Pick...", "选择..."},
+    {"(placeholder capsule)", "（占位胶囊体）"},
+    {"(empty = capsule placeholder)", "（留空 = 胶囊占位体）"},
+    {"No .vmesh under assets/models", "assets/models 下没有 .vmesh"},
+    {"Animator", "动画器"},
+    {"(four-state hardcoded)", "（四态硬编码）"},
+    {"No .anim.json under assets/animators",
+     "assets/animators 下没有 .anim.json"},
+    {"Fit body", "按体型自适应"},
+    {"Idle / Walk / Run / Jump clips", "待机 / 走 / 跑 / 跳 片段名"},
+    {"Ignored: the animator decides which clip belongs to which state.",
+     "已忽略：哪段动画归哪个状态由动画器决定。"},
+    {"The player is spawned from the scene's GameStart point at play time. Paths are relative to the project's assets folder.",
+     "玩家在运行时按场景里的 GameStart 出生点生成。路径相对工程的 assets 目录。"},
 
     // ---- Stats 面板的 CPU 分段 + 内存（C9）----
     {"CPU: %.2f ms  (events / scene / logic / ui / assets / render)",

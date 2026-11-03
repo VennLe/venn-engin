@@ -472,9 +472,31 @@ void paintChevronRight(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c) {
 
 // ---------------------------------------------------------------- 目录
 
+// 这个文件名是不是"测试夹具"（2026-11-03）。
+//
+// 三条判据，全部来自既有约定，不是新发明的命名规则：
+//   · `_` 开头 —— 全仓 `verify_*.py` 造的夹具都这样（`_am_bus.json` /
+//     `_dlg_voice_fixture.json` / `_save_fixture.json`）；
+//   · 含 `.trash-` —— `tools/safe_fs.py` 的"同目录让位区"（删除工具不真删，
+//     改个名），跑完用例必然留下；
+//   · 以 `.trash` 结尾 —— 老式残留。
+//
+// ⚠ 只过滤**文件**，不过滤目录：`_fixtures/` 这种目录里可能整整齐齐全是
+//   有用的东西，而且把目录藏起来会让"为什么我建的文件夹不见了"变成一个
+//   没法自证的谜。
+bool looksLikeTestAsset(const std::string& name) {
+    if (name.empty()) return false;
+    if (name.front() == '_') return true;
+    if (name.find(".trash-") != std::string::npos) return true;
+    if (name.size() >= 6 && name.compare(name.size() - 6, 6, ".trash") == 0)
+        return true;
+    return false;
+}
+
 void ContentBrowser::refresh() {
     m_entries.clear();
     m_dirty = false;
+    m_hiddenTestAssets = 0;
     // 目录树缓存与新的一次扫描同寿命：文件系统可能刚被新建/改名/删除过。
     m_dirCache.clear();
 
@@ -531,6 +553,14 @@ void ContentBrowser::refresh() {
         if (!e.name.empty() && e.name.front() == '.') continue;
         e.isDir = de.is_directory(ec);
         if (!e.isDir) e.size = de.file_size(ec);
+
+        // 2026-11-03：测试夹具默认不显示（见头文件 m_showTestAssets）。
+        // ⚠ 放在**名字过滤之前**：搜索"fixture"时也不该把它们捞回来 ——
+        //   除非用户显式打开了"显示测试资产"。
+        if (!e.isDir && !m_showTestAssets && looksLikeTestAsset(e.name)) {
+            ++m_hiddenTestAssets;
+            continue;
+        }
 
         if (!m_filter.empty() && !containsFold(e.name, m_filter)) continue;
 

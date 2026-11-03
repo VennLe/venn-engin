@@ -1,17 +1,15 @@
 # venn —— 项目笔记
 
-> 只放 **跨体系的纪律 + 速查 + 指针**：细则 → `*_details_archive.md`（editor / render / verify 三册），
-> 流水 → `YYYY-MM-DD.md`，数字 → `roadmaps.md`。
-> ⚠ **体积纪律**：14.5 KB 以上注入会被**截尾** → 11-01 把"已完成体系"的判据整体拆到 **`FEATURES.md`**
-> （本页 8.5 KB / 续册 8.3 KB，两边都不截尾）。**碰某个已完成的体系之前，先读 `FEATURES.md` 那一节。**
-> 仓库 `D:\A-VENN\code\cpp\venn-engin`（CMake `Venn`）。C++17 手写 Vulkan，**右手系 Z-up**；
+> 只放 **纪律 + 速查 + 指针**：细则 → `*_details_archive.md`（三册）/ 流水 → `YYYY-MM-DD.md` /
+> 数字 → `roadmaps.md`。⚠ **14.5 KB 以上注入会被截尾** → "做完的体系"判据已拆到
+> **`FEATURES.md`**（碰某体系前先读那一节）。仓库 `D:\A-VENN\code\cpp\venn-engin`（CMake `Venn`）。C++17 手写 Vulkan，**右手系 Z-up**；
 > `core→rhi→render→scene→assets`（另有 `ui`/`i18n`/`ecs`/`physics`/`script`/`audio`/`project`；
 > 应用层 `launcher`/`editor`/`runtime`，**engine/ 不认识后三个**）。改名后删 `build/` 重 configure。
 
 ## 已完成体系的判据 → `FEATURES.md`（11-01 拆出，**碰之前必读**）
 - 着色 A1~A6 + 动画 B1~B3 · 过场时间轴 C1 · 相机运镜 CINE + 多机位 · 序列化/存档 G16·G17 ·
   关节 J5 · 对话 C2 · 步态 A4·A4b · **表情 B6** · 脚本/编辑器 · 二次元 UI 主题 · 界面语言默认。
-- ⚠ 为什么拆：本页超 14.5 KB 会被**截尾注入**，尾部「路线图」最先丢 → 把"做完的东西"挪出去。
+- ⚠ 拆分原因：超 14.5 KB 会**截尾注入**，"做完的"挪出去。
 
 ## ⚠⚠ 第 0 条：动手前重读磁盘版
 快照**可能截断/陈旧** → 跑回归/改契约前先读磁盘；`docs/` 历史数字**要标口径**。⚠⚠ **先 stat 二进制 vs
@@ -34,6 +32,9 @@
 `./make.cmd build`（`TOOLCHAIN=auto` → **MSVC**；`Debug` → **性能数字是 Debug 的**）。
 ⚠⚠ **前向声明必须与定义同 struct/class**（TU 内首次声明 → `LNK2019`；**C4099 是前兆**）。
 ⚠⚠ **新加资产/新目录不会自动进 `build/bin/`** →「加了完全没效果」先查这条（含 CMake 拷贝档）。
+⚠⚠ **编译代价看扇出、不看文件大小**：改 `Components.h`（75 个 TU）= **67.8 s**，改
+`ScriptEngine.cpp`（3888 行 / 只 6 个 TU）= **15.4 s**（11-03 实测，差 **4.4 倍**）
+→ 玩法代码写进 `engine/` 就是「改一行泡杯茶」。
 
 ## 环境变量
 ⚠ 顺序固定：`MYVK_EDITOR_SCENE` → `EDITOR_CAM` → `MYVK_EDITOR_CLIP`，一律 `MYVK_EDITOR_` 前缀。
@@ -89,26 +90,72 @@
 - **G30 ✅**：`make ship` → `build-ship/bin/Game.exe`（开发命令**编译期**剔除）。
 
 ## 性能基线 P1（11-01 ✅；表 → `docs/perf_baseline.md`；采集 → `tools/bench_baseline.py`）
-- `make perf-build` → **`build-rel/`**，与回归用的 Debug `build/` **分开**（换掉 `build/` = 同时改掉
-  "断言在不在"与"帧率是多少"，回归和基线互相污染）。
-- ⚠⚠ 量法：丢预热帧 · **中位数不用均值** · GPU 取 `GPU-TIMING` 不用 `1/fps` ·
-  `MYVK_RUNTIME_MAXFPS=0`（`game.json` 有 `maxFps=60`，否则量的是上限）· `--frames 900`（每 30 帧一条）。
-- ⚠⚠ **实测三条**：① `forward` 占 **50%** 且随像素**线性**涨（= 填充率，改 CPU 无用）；② `shadows`
-  **不随分辨率动**（跟光源数/级联图走）；③ **Debug↔Rel 只差 8%** → 这两份场景**不是 CPU 受限**，
-  只动 CPU 的项（P2/P3）不会体现在帧率上，**别拿 Debug 数字判性能退步**。
+- `make perf-build` → **`build-rel/`**，与回归的 Debug `build/` **分开**（否则"断言"与"帧率"互相污染）。
+- ⚠⚠ 量法：丢预热 · **中位数**不用均值 · 取 `GPU-TIMING` 不用 `1/fps` · `MYVK_RUNTIME_MAXFPS=0` ·
+  `--frames 900`。⚠⚠ 实测：`forward` 占 **50%** 且随像素线性涨（填充率，改 CPU 无用）；
+  **Debug↔Rel 只差 8%** → **别拿 Debug 数字判性能退步**。
 
 ## 路线图（剩什么 → `docs/remaining_work_2026-10-27.md`；权威 → `docs/*_roadmap.md`）
-- 已做完的**全清单**只维护在 `remaining_work` §1（本页不重复）；近期：G29/G30 出包·E28/E29 主题·J5 关节·
-  P2/P6·Prefab·多选·UI 编辑器·植被两轮·步态 A4/A4b·运镜 CINE + 多机位·R7 ClipEdit·10-31 红清零·**11-01 B6 表情 + P1 基线**·
-  **11-03 P2 玩法状态层 + P3-3 牌堆**（明细 → `FEATURES.md`；权威 → `docs/gameplay_stats.md` / `docs/cards.md`）。
-- **P3 卡牌专供**：P3-3 ✅；剩 **P3-1 配表进运行时（`assets/tables/cards.csv` → `CardDef` + 结算器 `CardResolver`）**、
+- 已做完的**全清单**只维护在 `remaining_work` §1（本页不重复）；近期：出包 G29/G30·主题 E28/E29·
+  J5 关节·Prefab/多选/UI 编辑器·植被两轮·步态 A4·运镜 CINE+R7·**11-01 B6 表情 + P1 基线**·
+  **11-03 Lua 后端 + 游戏 C++ 模块 M5-c + P3-3 牌堆**（→ `FEATURES.md` / `docs/gameplay_stats.md`）。
+- **P3 卡牌专供**：P3-3 ✅；剩 **P3-1 配表进运行时（cards.csv → `CardDef` + `CardResolver`）**、
   P3-2 `ui2` 拖拽/Grid、P3-4 伤害数字层。⚠ 卡牌**只存 defId 不存定义**（与状态相反），别"统一"成一处。
-- **剩余硬缺口：流送 / 导航 AI**（C3 存档 · E28 打包 · B6 表情 · P1 基线已结）；打磨型仍有
-  立绘 C2 / 脚 IK B4 / 弹簧骨 B5 / lightmap R5-2 / 植被 W5 / 音素级口型 D2。
-- **面板/操作体系缺口 → `docs/panel_gap_review_2026-11-02.md`**（10-27 那两份**已过期**，头部已封口）。
-  ⚠ 口径：**先答"A 类 = 能力→入口的差集"，再答"真没有"** —— 本仓缺的多数是"实现了但只对引擎作者
-  可见"：PostVolume 全链在（落盘+Renderer 求值）editor **0 命中**；混音 duckDepth/busVolume
-  editor **0 引用**；`.vmeta` / `setFlag` 同样 0。最贵四条：**PostVolume 面板 · 音频混音台 ·
-  UI 事件回调 · Project Settings（`game.json` 全手改）**，都不动渲染管线。
+- **剩余硬缺口：流送 / 导航 AI**；打磨型仍有 立绘 C2 / 脚 IK B4 / 弹簧骨 B5 / lightmap R5-2 /
+  植被 W5 / 音素级口型 D2。
+- **面板/操作体系缺口 → `docs/panel_gap_review_2026-11-02.md`**（10-27 两份**已过期**）。
+  ⚠ 口径：**先答"能力→入口的差集"再答"真没有"** —— 本仓缺的多数是"实现了但只对引擎作者可见"
+  （PostVolume / duckDepth / `.vmeta` / `setFlag` 全在，editor 0 命中）。最贵四条：
+  **PostVolume 面板 · 音频混音台 · UI 事件回调 · Project Settings**，都不动渲染管线。
 - ⚠ 材质位掩码到 **bit26**，只剩 5 位 → 加旋钮要换两个 u32。
 - ⚠ flaky：`bvh`/`csm`/`ibl`/`particles` 偶发全红 → 别补跑"凑干净"；"闸门红"先分 真漏/记账/夹具陈旧。
+
+## ⚠⚠ 可上手性（`docs/usability_2026-11-03.md`）—— 别再当"缺功能"报
+- 判据：374 环境变量 > 137 命令 > 47 面板（默认开 3）> 4 模板；验收 = **41%**。能力顺序与
+  人能用的顺序**正相反** ——**症结不在能力，在"谁被当成用户"** → **别再提议加面板**。
+- 最便宜三补丁：**任务坐标文档 + 首次运行向导 + 面板按任务分组**；硬伤：**`Play` 一词三语义**。
+
+## 代码环境 / 语言选型（已定案；评估 → `docs/code_env_2026-11-03.md`）
+- **已选 C++ + Lua**：判据「**Lua 做决策 / C++ 做执行**」（分工 → `docs/lua_cpp_split.md`）。
+  ⚠ 旧 `.vks` 天花板是**结构性**的（`Stmt::Kind` 无 Function/Return → 逻辑不能复用），而
+  **换语言本身涨不了覆盖率**（绑定表是人写的）；C++ 缺的是**分层**（→ `game/GameModule`，
+  **不做 DLL 热重载**：`FreeLibrary` 脆 + 崩溃带走编辑器 + 毁确定性）。
+
+## Lua 后端（11-03 ✅ B/C/C+；权威 → `docs/script_framework.md`）
+- 判据：`--selftest lua` **44/44**（A5/A 白名单/B 编译/C 执行/D 协程/E 熔断/F 热重载/
+  G **106 全调**/H 时钟/I 组件写入/**J 句柄·实参**）。`lua_static` **跟随工程配置，不调开关**。
+- **交付 106 个函数 / 12 命名空间**。表驱动：改 `ApiTable.cpp`（事实源，不认识 Lua）+
+  `LuaBackend.cpp` 的 `kImpls[]` **两处**；缺实现启动即报 `LUA-API missing`。
+  文档 `docs/script_api.md`（手写指南）+ `script_api_reference.md`（`--selftest api` 生成）。
+  ⚠ `.vks` 的 `kBuiltins` **不是**从表生成（按位置对齐 `Builtin`）。
+- **组件覆盖矩阵 → `docs/script_framework.md` §2.2**（47 个组件逐条：✅15 ◐10 ✕18 🚧4）。
+- ⚠⚠⚠ **`lua_resume` 第 4 参数不能传 `nullptr`**（`ldo.c:863` 无条件写 → `0xC0000005`；
+  特征："`pcall` 正常、一 resume 就崩"）→ 细则 §9.1。⚠ `/RTC-` **不是合法选项**（`D9002`）。
+- ⚠⚠ **`luaL_error` 不支持 `%u`** → **报错本身报错**；已全换 `%d`。
+- ⚠⚠ **实体名两处存储**（`Record::name` 给 `find`；`NameComponent` 给序列化）→
+  只写组件**不生效也不报错**，必须走 `World::setName`。
+- ⚠⚠ **动画权威字段双组件**：`AnimatorSystem` 是 `an ? an->time : sk.time` →
+  `anim.*` 必须两个都认（`AnimFields`），只认 Animator 会"能 play 却 pause 报错"。
+  `anim.time` 跳帧**必须同步 `eventPrev`**（事件区间半开 `(prev,time]`，否则一次性全炸）。
+- ⚠⚠ **API 名别撞 Lua 保留字**：`nav.goto` 是**语法错** → `nav.moveTo`。
+- ⚠⚠ **`engine.dt/time/frame` 曾是死字段** → 已修 + `H1`。**"API 存在但没用"不报错不崩，
+  比崩溃难发现**。同理**钩子名大小写**（`beginPlay` 合法但永不调用）→ 现打 `LUA-NOHOOK`。
+- ⚠⚠ **chunk 的 `_ENV` 不能直接用 `_G`**（裸赋值全局共享 + `world=nil` 抹掉 API 表）
+  → 每脚本一张 `{__index=_G}`。⚠ 自检读变量写 `self.x`（`snapshotVars` 只读实例 env）。
+- ⚠⚠ **物理是构建期一次性烘焙**（`bodyType/useGravity/solid/Trigger.enabled` 写进刚体后
+  无人再读组件）→ **故意不开放** `actor.setKinematic/setGravity/trigger`；要开先给
+  `PhysicsWorld` 加 `setMotionType/setGravityFactor/setSensor`。
+- ⚠⚠ **句柄 = `((gen<<32)|id)+1`，`0` 是唯一空句柄**（编码统一在 `ecs/EntityHandle.h`，
+  Lua 与 C++ 模块共用）。⚠ **取句柄一律 `aHandle()` 不用 `aInt()`**（`int` 截掉
+  generation → **只在槽位复用后才错**）。实参个数由 `dispatch` **按表核**；熔断钩子提到
+  文件级（`luaL_error` 是 longjmp，**不能 RAII**）。`camera.fov` 遇 `focal>0` → 写清 focal。
+- ⚠ 判据：**I 组从 C++ 读组件**、**J 组造"槽位复用"现场** —— 写错字段/单位错/句柄截断都不报错。
+  ⚠ 空句柄两半（`+1` / 空分支）**分开断言**（J7/J8），合并就分不清哪半坏；J8 取值**前置**。
+
+## 游戏 C++ 模块 / VS 工程（11-03 ✅ M5-c；权威 → `docs/game_code_project.md`）
+- 建工程勾一项 → `code/` 一个独立 VS 工程（`.sln`+`.vcxproj` 直写，**不用 cmake**），自动开 VS。
+  判据：`--selftest project` GC 48 + CREATE 54；`--selftest game` 12（需 `MYVK_GAME_DLL`）。
+- ⚠⚠ **DLL 绝不链接引擎**（STATIC → 全局对象两份），能力全走 `VennAbi.h`。
+  ⚠ `OutDir` 必须 `$(ProjectDir)bin\`，否则 Debug 落 `bin/Debug/` → 编成功、游戏里没反应。
+- ⚠⚠ **`CreateProcessW` 传环境块必须带 `CREATE_UNICODE_ENVIRONMENT`**，不带就 87，与块大小无关。
+- ⚠⚠ **MSBuild 环境变量大小写重复 → 报成 `MSB6001` 编译器开关无效**（传前忽略大小写去重）。

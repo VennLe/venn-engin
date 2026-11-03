@@ -21,5 +21,11 @@
     "muteOnFocusLost": false,
     "duckDepth": 0.75,
     "maxVoices": 64
+  },
+  "player": {
+    "model": "models/characters/default_character.vmesh",
+    "clip": "Idle",
+    "fitBody": true,
+    "controller": "animators/humanoid.anim.json"
   }
 }

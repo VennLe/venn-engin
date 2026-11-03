@@ -40,6 +40,18 @@ public:
     // 世界矩阵 = 沿父链累乘各层 localMatrix
     glm::mat4 worldMatrix(ecs::Entity e) const;
 
+    // 按**世界坐标**摆一个实体（有父节点时自动换算回局部）。
+    //
+    // 为什么这是 `Scene` 的方法而不是调用方各写一份：脚本 `world.setPos`
+    // 与 C++ 游戏模块（`venn_abi.entitySetPos`）用的是**同一个语义**，
+    // 两份实现漂移的表现是"Lua 摆对了、C++ 摆偏了一层父变换"，
+    // 而且只在这个实体有父节点时才错 —— 平铺场景里一次都复现不出来。
+    //
+    // 矩阵不可逆 / 结果非有限时**退回当地局部坐标**（宁可偏，也不写 NaN：
+    // NaN 一旦进 `TransformComponent`，整个世界矩阵链连带整棵子树都坏掉，
+    // 且没有任何报错）。
+    void setWorldPos(ecs::Entity e, const glm::vec3& p);
+
     // 沿父链向上找第一个带组件 T 的祖先（**含自己**）。找不到 → nullptr。
     //
     // 用来回答"这个网格属于哪具骨架"：`SkinnedMeshComponent` 挂在**模型根**

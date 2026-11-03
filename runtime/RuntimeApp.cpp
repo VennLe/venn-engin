@@ -18,6 +18,8 @@
 #include "physics/PhysicsWorld.h"
 #include "project/CardSource.h"   // P3-1：配表 → 卡牌定义（换场景时灌进牌堆）
 #include "project/DataTable.h"    // P3-1：配表四动词（script 的 tableNum/…）
+#include "project/ProjectFile.h"  // M5-c：读工程声明（code.module）
+#include "game/GameModule.h"      // M5-c：C++ 游戏模块
 #include "scene/CameraMove.h"   // 镜头光学换算（fStop→光圈 / 快门角→模糊）
 #include "scene/CameraSystem.h"
 #include "scene/ModelInstance.h"
@@ -657,6 +659,23 @@ void RuntimeApp::onInit() {
     m_scripts = &m_scriptRuntime->engine();
     installScriptServices();
     m_menuScene = std::make_unique<scene::Scene>();
+
+    // ---- M5-c：C++ 游戏模块 ----
+    //
+    // 运行时的当前目录就是工程根（启动器用 `lpCurrentDirectory` 设好；
+    // 出包版是 dist 根，那里没有 `venn.project.json` → 直接跳过）。
+    // ⚠ 失败只 WARN：DLL 没编出来的工程照样能跑，Lua 那套不受影响。
+    {
+        project::ProjectFile pf;
+        std::string perr;
+        if (project::loadProject(".", pf, &perr) && !pf.codeModule.empty()) {
+            const std::string dll =
+                project::normalizePath(pf.root + "/" + pf.codeModule);
+            std::string merr;
+            if (!game::GameModule::instance().load(dll, nullptr, &merr))
+                VK_LOG_WARN("GAME-GAMEMODULE not loaded: %s", merr.c_str());
+        }
+    }
 
     // 输入映射：出厂绑定 + 压一层 Gameplay（菜单进栈时会再压 Menu）
     //
@@ -2474,6 +2493,20 @@ int RuntimeApp::runScripts(float dt) {
     //   瞬间，脚本看到的 `time` 会倒退一半。
     m_scriptRuntime->tick(activeScene(), vks::ScriptRuntime::kSelfTimed, dt,
                           time().frameCount());
+
+    // ---- M5-c：C++ 游戏模块 ----
+    //
+    // 懒开始：初始化早期还没有场景，所以 `beginPlay` 放到第一次 tick ——
+    // 此刻 `activeScene()` 一定已经就位（模块的 onBeginPlay 里如果读场景，
+    // 拿到的是真实的那一份，不是空指针）。
+    {
+        game::GameModule& gm = game::GameModule::instance();
+        if (gm.loaded()) {
+            scene::Scene* sc = &activeScene();
+            if (!gm.playing()) gm.beginPlay(sc);
+            gm.tick(dt, sc);
+        }
+    }
     return static_cast<int>(m_scriptRuntime->lastStats().executed);
 }
 

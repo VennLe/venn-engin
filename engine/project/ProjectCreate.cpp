@@ -1,6 +1,7 @@
 #include "project/ProjectCreate.h"
 
 #include "project/RecentList.h"
+#include "project/GameCodeGen.h"
 
 #include "core/Logger.h"
 
@@ -121,6 +122,7 @@ const char* createStepLabel(CreateStep s) {
     case CreateStep::Validate:      return "Validate";
     case CreateStep::CopyTemplate:  return "Copy template";
     case CreateStep::ReplaceAndWrite: return "Write project files";
+    case CreateStep::WriteGameCode: return "Generate game code project";
     case CreateStep::Commit:        return "Commit";
     case CreateStep::Count:         break;
     }
@@ -510,6 +512,16 @@ CreateResult createFromTemplate(const CreateSpec& spec, const ProgressFn& progre
     pf.codeMode = CodeMode::Vks;
     pf.codeRoot = "scripts";
     pf.codeLinked = spec.codeExternal;
+    // M5-c：选了"生成 C++ 代码工程"时，代码方案切到 cpp 并记下 DLL 位置。
+    // ⚠ `codeMode` 只是**展示/加载器线索**：权威仍然是"目录里有没有那个
+    //   DLL"。DLL 没编出来时加载器打一行 WARN 就跳过，不会因为 JSON 里
+    //   写了 cpp 就崩。
+    std::string codeModuleId;
+    if (spec.generateCode) {
+        codeModuleId = moduleIdFromName(name);
+        pf.codeMode = CodeMode::Cpp;
+        pf.codeModule = "code/bin/" + codeModuleId + ".dll";
+    }
     pf.createdAt = nowIso8601();
     pf.engineName = "venn";
 #ifdef NDEBUG
@@ -580,6 +592,31 @@ CreateResult createFromTemplate(const CreateSpec& spec, const ProgressFn& progre
         }
     }
 
+    // 3d) C++ 游戏代码工程（M5-c）
+    //
+    // 这一步只**写文件**：源码 + `VennAbi.h` + `.sln` / `.vcxproj` /
+    // `CMakeLists.txt`。全部内容里**没有一个绝对路径** —— `$(ProjectDir)`
+    // 是 MSBuild 在编译时才展开的，所以下一步把整个目录 rename 掉也不会失效。
+    //
+    // ⚠ 这条约束是刻意维持的：早先的设计是在这里跑 `cmake -S <tmp>/code`，
+    //   而 cmake 会把 tmp 的**绝对路径**写进 `.vcxproj` / `CMakeCache.txt`，
+    //   rename 之后打开 sln 就报"找不到项目文件"，工程本身却是完好的。
+    //   现在不调 cmake 了，但"生成物不带绝对路径"这条不能松（自检 D5 盯着）。
+    if (spec.generateCode) {
+        report(CreateStep::WriteGameCode, "generating game code");
+        GameCodeSpec cs;
+        cs.gameType = pf.gameType;
+        cs.projectName = name;
+        cs.moduleId = codeModuleId;
+        cs.codeDir = (fs::path(tmp) / "code").generic_string();
+        const GameCodeResult cr = writeGameCode(cs);
+        if (!cr.ok) {
+            std::error_code ec;
+            fs::remove_all(tmp, ec);
+            return fail(CreateStep::WriteGameCode, cr.error);
+        }
+    }
+
     // ================= ④ commit =================
     report(CreateStep::Commit, "finalizing");
 
@@ -627,6 +664,31 @@ CreateResult createFromTemplate(const CreateSpec& spec, const ProgressFn& progre
     r.root = root;
     r.filesCopied = copied;
     r.failedAt = CreateStep::Count;
+
+    // 4c) C++ 代码工程：把 `.sln` 的**最终**路径填进结果。
+    //
+    // `.sln` / `.vcxproj` 在 3d 就已经写好了（内容里没有绝对路径，所以
+    // rename 不影响它们）；这里要做的只是把 `slnPath` 从 tmp 里的位置
+    // 换成 rename 之后的真实位置 —— launcher 拿它去开 VS。
+    if (spec.generateCode && !codeModuleId.empty()) {
+        const fs::path codeDir = fs::path(root) / "code";
+        r.codeDir = normalizePath(codeDir.generic_string());
+
+        std::error_code sec;
+        const fs::path sln = codeDir / (codeModuleId + ".sln");
+        if (fs::is_regular_file(sln, sec)) {
+            r.slnPath = sln.generic_string();
+            r.codeNote = "Visual Studio solution ready";
+            VK_LOG_INFO("PROJ-CREATE code sln=%s", r.slnPath.c_str());
+        } else {
+            // 不判死整次创建：源码与 CMakeLists 都在，用户仍可在 VS 里
+            // "打开文件夹"或自己跑 cmake。
+            r.codeNote = "solution file missing - open the code folder instead";
+            VK_LOG_WARN("PROJ-CREATE sln not found at %s",
+                        sln.generic_string().c_str());
+        }
+    }
+
     VK_LOG_INFO("PROJ-CREATE ok root=%s template=%s files=%d linked=%d", root.c_str(),
                 tpl.id.c_str(), copied, spec.codeExternal ? 1 : 0);
     return r;
@@ -798,6 +860,49 @@ int runCreateSelfTest() {
             std::string err3;
             loadProject(r3.root, back, &err3);
             check(back.name == "Bad_Name", "K25 create-sanitized-value", back.name);
+        }
+    }
+
+    // ---- K26b C++ 代码工程：`.sln` 必须落在 **rename 之后**的最终目录 ----
+    //
+    // ⚠ 这条盯的是一个**看不见的**失误：3d 写文件时目录还叫 `<root>.tmp`，
+    //   4c 要把 `slnPath` 换成最终路径。换漏了（或者忘了覆盖 `codeDir`），
+    //   表现是"创建成功、打开 VS 时说不存在的路径"，而工程本身完好 ——
+    //   launcher 那边只会 toast 一句，用户完全不知道是谁的锅。
+    {
+        CreateSpec cs2 = spec;
+        cs2.name = "CodeGame";
+        cs2.root = (base / "CodeGame").generic_string();
+        cs2.generateCode = true;
+        cs2.addToRecent = false;
+        const CreateResult rc = createFromTemplate(cs2, nullptr);
+        check(rc.ok, "K26b code-create-ok", rc.error);
+
+        const std::string expectMod = moduleIdFromName("CodeGame");
+        if (rc.ok) {
+            // 路径必须在**最终**根下，且不含 ".tmp"
+            const bool finalDir = rc.codeDir.find(".tmp") == std::string::npos &&
+                                  rc.codeDir.rfind(cs2.root, 0) == 0;
+            check(finalDir, "K26c code-dir-final", rc.codeDir);
+
+            const bool slnFinal = rc.slnPath.find(".tmp") == std::string::npos &&
+                                  rc.slnPath.rfind(cs2.root, 0) == 0;
+            check(slnFinal && fs::is_regular_file(fs::path(rc.slnPath), ec),
+                  "K26d code-sln-final-exists", rc.slnPath);
+
+            // `venn.project.json` 里必须登记 DLL（引擎靠它加载）
+            ProjectFile back;
+            std::string err4;
+            loadProject(rc.root, back, &err4);
+            check(back.codeModule == "code/bin/" + expectMod + ".dll",
+                  "K26e code-module-recorded", back.codeModule);
+
+            // .vcxproj 也在，且没留下 .tmp 残骸
+            check(fs::is_regular_file(
+                      fs::path(rc.codeDir) / (expectMod + ".vcxproj"), ec),
+                  "K26f code-vcxproj-present", expectMod + ".vcxproj");
+            check(!fs::exists(fs::path(cs2.root + ".tmp"), ec),
+                  "K26g code-no-tmp-residue", "left .tmp behind");
         }
     }
 

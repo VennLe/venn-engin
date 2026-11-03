@@ -193,6 +193,30 @@ GameFileIo loadGameFile(const std::string& path, GameSettings& out) {
             out.audio.maxVoices = a["maxVoices"].get<int>();
     }
 
+    // ---- player：只读我们管的六项，其余键留在文档里不动 ----
+    //
+    // ⚠ `present` 的判据是"盘上有 player 对象"，**不是**"model 非空"：
+    //   有人可能只配了 controller 而故意用胶囊占位体。用 model 判会让
+    //   "我明明配了动画器"变成"面板说这个工程没配角色"。
+    if (j.contains("player") && j["player"].is_object()) {
+        out.player.present = true;
+        const json& p = j["player"];
+        auto pStr = [&](const char* k, std::string& dst) {
+            if (p.contains(k) && p[k].is_string()) dst = p[k].get<std::string>();
+        };
+        auto pBool = [&](const char* k, bool& dst) {
+            if (p.contains(k) && p[k].is_boolean()) dst = p[k].get<bool>();
+        };
+        pStr("model", out.player.model);
+        pStr("clip", out.player.clip);
+        pBool("fitBody", out.player.fitBody);
+        pStr("controller", out.player.controller);
+        pStr("idleClip", out.player.idleClip);
+        pStr("walkClip", out.player.walkClip);
+        pStr("runClip", out.player.runClip);
+        pStr("jumpClip", out.player.jumpClip);
+    }
+
     clampGameSettings(out, nullptr);
     io.ok = true;
     VK_LOG_INFO("PROJ-GAME-LOAD path=%s ok=1 created=0 title=%s w=%d h=%d",
@@ -264,6 +288,25 @@ GameFileIo saveGameFile(const std::string& path, const GameSettings& in) {
     a["muteOnFocusLost"] = s.audio.muteOnFocusLost;
     a["duckDepth"] = s.audio.duckDepth;
     a["maxVoices"] = s.audio.maxVoices;
+
+    // ---- player：**只在工程配过角色时写** ----
+    // ⚠ 不配角色 = 不碰这个键。凭空长出一段 `"player": {…默认值}` 会让
+    //   "这个工程到底配没配角色"在磁盘上无法判断，也会让每个老工程存一次
+    //   盘就多一坨 diff。作者要清掉角色时面板把 model 写成空串（= 回到
+    //   胶囊占位体），而不是删掉整块 —— 后者会连带丢掉步幅匹配那些
+    //   面板管不着的字段。
+    if (s.player.present) {
+        json& p = j["player"];
+        if (!p.is_object()) p = json::object();
+        p["model"] = s.player.model;
+        p["clip"] = s.player.clip;
+        p["fitBody"] = s.player.fitBody;
+        p["controller"] = s.player.controller;
+        p["idleClip"] = s.player.idleClip;
+        p["walkClip"] = s.player.walkClip;
+        p["runClip"] = s.player.runClip;
+        p["jumpClip"] = s.player.jumpClip;
+    }
 
     const std::string text = j.dump(2) + "\n";
     io.bytes = static_cast<int>(text.size());

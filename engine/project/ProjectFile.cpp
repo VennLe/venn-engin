@@ -10,6 +10,7 @@
 #include "scene/LevelManifest.h"
 #include "project/GameFile.h"
 #include "project/ProjectCreate.h"
+#include "project/GameCodeGen.h"
 #include "project/ProjectDisplay.h"
 #include "project/RecentList.h"
 
@@ -105,6 +106,8 @@ void fromJson(const json& j, ProjectFile& p, std::vector<std::string>& issues) {
         readString(c, "root", p.codeRoot);
         if (c.contains("linked") && c["linked"].is_boolean())
             p.codeLinked = c["linked"].get<bool>();
+        // 可选键（format 仍是 1）：没有 = 这个工程没有 C++ 模块。
+        readString(c, "module", p.codeModule);
     } else {
         issues.push_back("missing key: code");
     }
@@ -123,9 +126,14 @@ json toJson(const ProjectFile& p) {
     j["template"] = p.templateId;
     j["gameType"] = gameTypeId(p.gameType);
     j["startScene"] = p.startScene;
-    j["code"] = json{{"mode", codeModeId(p.codeMode)},
-                     {"root", p.codeRoot},
-                     {"linked", p.codeLinked}};
+    // ⚠ `module` **只在有值时才写**：没有 C++ 模块的工程（绝大多数）
+    //   不该多出一个空键 —— 空键会让"往返读写的文本比对"用例红一片，
+    //   也会让用户以为那里该填点什么。
+    json codeObj = json{{"mode", codeModeId(p.codeMode)},
+                        {"root", p.codeRoot},
+                        {"linked", p.codeLinked}};
+    if (!p.codeModule.empty()) codeObj["module"] = p.codeModule;
+    j["code"] = codeObj;
     j["createdAt"] = p.createdAt;
     j["engine"] = json{{"name", p.engineName}, {"config", p.engineConfig}};
     return j;
@@ -467,6 +475,16 @@ bool validate(const ProjectFile& p, std::string* err) {
                     "权威是场景里的 player.mode)",
                     p.templateId.c_str(), gameTypeId(p.gameType));
     }
+
+    // C++ 模块：可空；非空时必须是**相对工程根**的安全路径。
+    // ⚠ 与 `codeRoot` 的规则不同（那条相对 `assets/`）—— 见头文件的解释。
+    if (!p.codeModule.empty()) {
+        if (!isSafeRelative(p.codeModule))
+            return fail("code.module must be a safe path relative to the project "
+                        "root: '" + p.codeModule + "'");
+        if (p.codeModule.rfind("code/", 0) != 0)
+            return fail("code.module must live under code/: '" + p.codeModule + "'");
+    }
     return true;
 }
 
@@ -741,6 +759,10 @@ int runAllProjectSelfTests() {
     failures += runRecentListSelfTest();
     failures += runDisplaySelfTest();
     failures += runCreateSelfTest();
+    // 2026-11-03：C++ 游戏代码工程（M5-c）。放在创建之后 —— 它验的是
+    // `createFromTemplate` 那一步写出来的东西（模板 / 占位符 / CMake 结构），
+    // 与创建流程同层。会真跑一次 `cmake`，没装就 SKIP（不算失败）。
+    failures += runGameCodeSelfTest();
     // 2026-11-02：`assets/game.json` 的读写（编辑器 Project Settings 面板的
     // 底座）。放在最后 —— 它只依赖文件系统，与上面四组的目录操作同层。
     failures += runGameFileSelfTest();

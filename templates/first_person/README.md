@@ -13,6 +13,7 @@
    想加东西直接拖进视口；`scripts/pickup.vks` / `scripts/portal.vks` 是
    现成可抄的示例（收集物 / 终点），挂到新实体上就会跑
 
+
 ## 目录结构
 
 | 路径 | 作用 |
@@ -23,7 +24,8 @@
 | `assets/scripts/main.vks` | **游戏逻辑主脚本**（挂在 `GameStart` 上，管流程与世界状态） |
 | `assets/scripts/pickup.vks` | 收集物逻辑（挂到任意实体上即生效，可多份实例各自持状态） |
 | `assets/scripts/portal.vks` | 终点逻辑（收齐后点亮自己，演示两个脚本靠世界黑板通信） |
-| `assets/game.json` | 运行时出厂配置（窗口尺寸、限帧、音频） |
+| `assets/game.json` | 运行时出厂配置（窗口尺寸、限帧、音频、**玩家外观**） |
+
 | `config/render.json` | 画质开关（创建向导写入；删成 `{}` = 全部默认） |
 
 ## 游戏逻辑写在哪

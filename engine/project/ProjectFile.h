@@ -96,6 +96,18 @@ struct ProjectFile {
     // true = `<root>/assets/scripts` 是指向外面 `codeRoot` 的目录联接
     bool codeLinked = false;
 
+    // C++ 游戏模块（M5-c）。**相对工程根**的 DLL 路径，空 = 没有模块。
+    // 例："code/bin/MyGameGame.dll"
+    //
+    // ⚠ 为什么相对**工程根**而不是 `assets/`：这个 DLL 不是资产，它是
+    //   编译产物，跟 `assets/` 那套 `resolveAssetPath` 无关。写进 assets
+    //   会导致"打包时被当资产塞进 pak"（1 MB 的 DLL 进 pak 毫无意义，
+    //   而且加载时还要从内存映射 DLL —— Windows 做不到）。
+    //
+    // ⚠ 这个键是**可选的**（format 仍然是 1）：老工程读出来是空 = 没有模块，
+    //   加载器直接跳过。加可选键不动版本号，是本文件头部那条"只增不改"。
+    std::string codeModule;
+
     // ISO8601 UTC（"2026-10-19T14:00:00Z"）。只展示，不参与任何决策。
     std::string createdAt;
 

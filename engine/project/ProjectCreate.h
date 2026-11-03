@@ -34,11 +34,16 @@
 
 namespace project {
 
-// 创建的四个阶段（UI 的进度条 + 失败时"停在哪一步"都用它）。
+// 创建的阶段（UI 的进度条 + 失败时"停在哪一步"都用它）。
+//
+// ⚠ **顺序就是枚举值**（进度条按 `int` 排）。`WriteGameCode` 必须夹在
+//   `ReplaceAndWrite` 与 `Commit` 之间：它写的是工程目录里的文件，
+//   而 `Commit` 是 rename —— 顺序反了就会被 rename 盖掉或漏掉。
 enum class CreateStep : int {
     Validate = 0,      // 校验名字 / 目标目录 / 模板完整性
     CopyTemplate,      // 复制到 <root>.tmp
     ReplaceAndWrite,   // 占位符替换 + venn.project.json + 画面设置
+    WriteGameCode,     // 生成 <root>.tmp/code/（C++ 游戏模块，可选）
     Commit,            // rename .tmp → root + 记入 recents
     Count
 };
@@ -53,6 +58,9 @@ struct CreateSpec {
     // 外置代码根（M5-b）。true 时 `externalCodeRoot` 必须绝对。
     bool codeExternal = false;
     std::string externalCodeRoot;
+    // 生成 C++ 游戏代码工程（M5-c）。默认**关**：它需要重编译才能改玩法，
+    // 这个引擎的默认迭代方式是 Lua 热重载。
+    bool generateCode = false;
     // 画面（M4）：写 assets/game.json + config/render.json
     DisplaySpec display;
     bool addToRecent = true;
@@ -64,6 +72,15 @@ struct CreateResult {
     std::string root;         // 成功时的工程根（正斜杠）
     int filesCopied = 0;
     CreateStep failedAt = CreateStep::Validate;
+
+    // ---- M5-c（只有 `generateCode == true` 时才有值）----
+    // `code/` 目录（绝对）。生成失败时为空。
+    std::string codeDir;
+    // CMake 生成的 `.sln`（绝对）。**空不等于创建失败** —— 见下。
+    std::string slnPath;
+    // 给用户看的一句话（UI 在收尾页/提示条上显示）。例如
+    // "solution generated" / "cmake not found — open the folder in VS instead"。
+    std::string codeNote;
 };
 
 // `progress` 可为空。每进入一个阶段调一次（UI 画进度条用）。
