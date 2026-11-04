@@ -89,6 +89,10 @@ Window::Window(const std::string& title, int width, int height, bool resizable)
     // ⚠ 这里**不再** glfwShowWindow —— 窗口交给 Application::run() 在首帧
     //   呈现之后显示。原因见 Window::show() 的注释（启动闪白）。
     applyDarkBackgroundBrush();
+    // 系统标题栏也刷深色 —— 否则客户区是深色、头顶顶着一条纯白横条。
+    // 必须在 show() 之前：DWM 每帧按属性重画，但隐藏期设置能让"第一眼"
+    // 就是深色，不会闪一下白。
+    applyDarkTitleBar();
 
     // 绑定回调
     glfwSetFramebufferSizeCallback(m_window, Window::framebufferResizeCallback);
@@ -242,6 +246,67 @@ bool Window::applyDarkBackgroundBrush() {
     SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND,
                      reinterpret_cast<LONG_PTR>(s_darkBrush));
     return true;
+#else
+    return false;
+#endif
+}
+
+bool Window::applyDarkTitleBar() {
+#if defined(_WIN32)
+    if (!m_window) return false;
+    HWND hwnd = glfwGetWin32Window(m_window);
+    if (!hwnd) return false;
+
+    // ------------------------------------------------------------
+    // 为什么要有这一步（用户 2026-11-04 第 1 条："窗口的顶部总有一个
+    // 白色横杠条，这个就很丑"）
+    // ------------------------------------------------------------
+    // 客户区是深色主题（ImGui 画的），但窗口**标题栏**不归我们画 —— 它是
+    // DWM 按**系统**主题刷的。系统是浅色时，窗口顶部就顶着一条 30~45px 的
+    // 纯白横条：截图实测 (243,243,243)，比客户区亮了十倍，观感极割裂。
+    //
+    // Win10 20H1 起 DWM 给了 `DWMWA_USE_IMMERSIVE_DARK_MODE`（20；
+    // 1809~1909 是 19，两个都试一遍），Win11 再叠三级配色：
+    //   DWMWA_BORDER_COLOR / DWMWA_CAPTION_COLOR / DWMWA_TEXT_COLOR。
+    // 老系统上后面三个返回 E_INVALIDARG —— 无害，忽略即可。
+    //
+    // ⚠ 走 GetProcAddress 而不是链接 dwmapi：
+    //   · 只是三个可选属性，缺了就是"标题栏不黑"，不该为它引入链接依赖；
+    //   · MinGW / MSVC 两套工具链都要能过，动态取最省事（本项目已经因为
+    //     `#pragma comment(lib, ...)` 只有 MSVC 认而在 MinGW 上炸过一次）。
+    using DwmSetWindowAttributeFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    static DwmSetWindowAttributeFn s_setAttr = []() -> DwmSetWindowAttributeFn {
+        HMODULE dll = LoadLibraryW(L"dwmapi.dll");
+        if (!dll) return nullptr;
+        return reinterpret_cast<DwmSetWindowAttributeFn>(
+            reinterpret_cast<void*>(
+                GetProcAddress(dll, "DwmSetWindowAttribute")));
+    }();
+    if (!s_setAttr) return false;
+
+    constexpr DWORD kDarkMode = 20;        // Win10 20H1+
+    constexpr DWORD kDarkModeLegacy = 19;  // Win10 1809~1909
+    constexpr DWORD kBorderColor = 34;     // Win11+
+    constexpr DWORD kCaptionColor = 35;    // Win11+
+    constexpr DWORD kTextColor = 36;       // Win11+
+
+    BOOL on = TRUE;
+    HRESULT hr = s_setAttr(hwnd, kDarkMode, &on, sizeof(on));
+    if (FAILED(hr))
+        hr = s_setAttr(hwnd, kDarkModeLegacy, &on, sizeof(on));
+
+    // 与编辑器底色（本文件 applyDarkBackgroundBrush 的 RGB(27,28,30)）同一
+    // 档，但标题栏需要比客户区**略亮**一点点才分得清边界 —— 纯同色会糊成
+    // 一整块，看起来像"没有标题栏"。
+    const COLORREF caption = RGB(24, 25, 28);
+    const COLORREF border = RGB(52, 54, 62);
+    const COLORREF text = RGB(224, 226, 233);
+    s_setAttr(hwnd, kCaptionColor, &caption, sizeof(caption));
+    s_setAttr(hwnd, kBorderColor, &border, sizeof(border));
+    s_setAttr(hwnd, kTextColor, &text, sizeof(text));
+
+    VK_LOG_INFO("Window dark title bar: %s", SUCCEEDED(hr) ? "ok" : "unsupported");
+    return SUCCEEDED(hr);
 #else
     return false;
 #endif

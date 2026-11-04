@@ -139,6 +139,12 @@ private:
     // 把窗口类的背景刷换成深灰（消除"显示前的白色客户区"）。Windows 专用。
     bool applyDarkBackgroundBrush();
 
+    // 把**系统标题栏**刷成深色（Win10 20H1+ 的 immersive dark mode，
+    // Win11 再叠一层 caption/border/text 配色）。Windows 专用。
+    // 为什么必须有：客户区是深色主题，而标题栏由 DWM 按**系统**主题画 ——
+    // 系统是浅色时，窗口顶部就顶着一条 30~45px 的纯白横条，非常割裂。
+    bool applyDarkTitleBar();
+
     // 进程级的任务栏身份（AppUserModelID）。必须在**任何窗口创建之前**
     // 调用；Windows 专用。
     void applyAppUserModelId();
