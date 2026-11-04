@@ -2305,7 +2305,20 @@ const Entry kZh[] = {
     {"Remove from list", "移出列表"},
     {"+ New game", "＋ 新建游戏"},
 
+    // ---- 启动器 2026-11-04 版式重排新增 ----
+    {"New game", "新建游戏"},
+    {"Start here", "从这里开始"},
+    {"Create a new project from a template, or open one you already have.",
+     "从模板新建一个工程，或者打开已有的工程。"},
+    {"Anime-style 3D game engine", "二次元风格 3D 游戏引擎"},
+    {"Create and open editor", "创建并进入编辑器"},
+    {"Pick a template, then set where it lives and how it looks.",
+     "选一个模板，再定下位置与画面 —— 一页填完。"},
+
     // ---- 新建向导 ----
+    // ⚠ 三步已并成一页（2026-11-04），`< Back` / `Next >` 两条留着无害：
+    //   词典是"多一条不报错、少一条回退英文"，而删掉它们要同步扫一遍
+    //   历史截图与文档。
     {"Location", "位置"},
     {"Display", "画面"},
     {"< Back", "< 上一步"},
@@ -2343,11 +2356,10 @@ const Entry kZh[] = {
      "会在 assets/scripts 建一个目录联接。不需要管理员权限。"},
     {"Also generate a C++ game module (Visual Studio project)",
      "同时生成 C++ 游戏代码工程（Visual Studio 工程）"},
-    {"A standalone Visual Studio project is created in code/ "
-     "(no cmake needed). Gameplay written there needs a rebuild, so keep decisions "
-     "in Lua and only put heavy work here.",
-     "会在 code/ 下建一个独立的 Visual Studio 工程（不需要 cmake）。"
-     "写在这里的玩法要重编译才生效 —— 决策留在 Lua，只把重活放这里。"},
+    {"A ready-to-build VS project is created in code/. "
+     "Changing it needs a rebuild - keep gameplay in Lua.",
+     "会在 code/ 下建一个可直接编译的 VS 工程。改它要重编译 —— "
+     "玩法尽量留在 Lua。"},
     {"Open Visual Studio after creating", "创建完成后打开 Visual Studio"},
     {"(opens in Visual Studio after creating)", "（创建后自动用 Visual Studio 打开）"},
     {"(Visual Studio not opened automatically)", "（不会自动打开 Visual Studio）"},

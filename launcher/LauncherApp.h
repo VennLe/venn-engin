@@ -12,10 +12,10 @@
 // 都不用，直接走 `i18n::tr` —— 那才是唯一权威，编辑器那边只是转发壳）。
 //
 // ------------------------------------------------------------
-// 页面状态机（路线图 §5.4）
+// 页面状态机（路线图 §5.4，2026-11-04 简化为两页）
 // ------------------------------------------------------------
-//   Idle ──新建──► Type ─► Location ─► Display ──创建──► Done
-//     ▲                └──取消─────────────────────┘
+//   Idle ──新建──► New（类型/位置/画面 三段同屏）──创建──► Done
+//     ▲                          └──取消──────────────────┘
 //   Idle ──选中+打开──► (拉起编辑器) → 退出
 //
 // ⚠ 创建**不是**异步的：四个阶段（校验 / 复制 / 替换 / 提交）都在同一个
@@ -27,19 +27,19 @@
 // 自动化钩子（全部 `MYVK_LAUNCHER_*`）
 // ------------------------------------------------------------
 //   MYVK_LAUNCHER_RECENT=<path>   最近列表落点（默认 %LOCALAPPDATA%/Venn/launcher/recent.json）
-//   MYVK_LAUNCHER_TEST_ROOT=<dir> 新建向导 Step2 的父目录初值（省掉"点浏览…"）
-//   MYVK_LAUNCHER_TEST_NAME=<name> 新建向导 Step2 的工程名初值
-//   MYVK_LAUNCHER_PAGE=new        启动直接进新建向导 Step1
-//   MYVK_LAUNCHER_TEST_RES=<i>    新建向导 Step3 的分辨率档初值（0/1/2/3）
-//   MYVK_LAUNCHER_TEST_QUALITY=<i> 新建向导 Step3 的画质档初值（0..4）
+//   MYVK_LAUNCHER_TEST_ROOT=<dir> 新建页"父目录"的初值（省掉"点浏览…"）
+//   MYVK_LAUNCHER_TEST_NAME=<name> 新建页"工程名"的初值
+//   MYVK_LAUNCHER_PAGE=new        启动直接进新建页
+//   MYVK_LAUNCHER_TEST_RES=<i>    新建页的分辨率档初值（0/1/2/3）
+//   MYVK_LAUNCHER_TEST_QUALITY=<i> 新建页的画质档初值（0..4）
 //   MYVK_LAUNCHER_TEST_CODE_EXTERNAL=<dir> 外置代码根的**路径初值**
 //                                 （⚠ 复选框仍需真点，不代勾）
 //   MYVK_LAUNCHER_NO_PRUNE=1      启动时**不**剔除失效条目（"空列表"用例要用）
 //
-// ⚠ 这几条**不是**"绕过 UI 的后门**：它们只填初值，四步向导仍然一步不少
-//   地走完、按钮仍然要真点。区别只是不用在测试里模拟"往系统文件对话框
-//   里敲一串带中文的临时路径"或"点开 Combo 的弹出项再选第 N 行"——
-//   那两件事在 CI 上根本没法可靠地做（弹出项没有锚点，位置随内容浮动）。
+// ⚠ 这几条**不是**"绕过 UI 的后门**：它们只填初值，向导仍然要真点
+//   "创建"。区别只是不用在测试里模拟"往系统文件对话框里敲一串带中文的
+//   临时路径"或"点开 Combo 的弹出项再选第 N 行"—— 那两件事在 CI 上根本
+//   没法可靠地做（弹出项没有锚点，位置随内容浮动）。
 // ============================================================
 
 #include "core/Application.h"
@@ -71,7 +71,11 @@ protected:
 
 private:
     // ---- 页面 ----
-    enum class Page { Idle, Type, Location, Display, Done };
+    // ⚠ 2026-11-04 用户第 2 条把三步向导并成了**一页**：原来的
+    //   Type → Location → Display 三个 Page 现在只剩一个 `New`。
+    //   不是"三个页面画在一起"，是真的没有翻页这件事了 —— 所以
+    //   `drawWizard` 里也没有"上一步/下一步"，只有"取消/创建"。
+    enum class Page { Idle, New, Done };
     enum class SpawnKind { None, Editor, Game };
 
     // ---- 绘制 ----
