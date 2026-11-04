@@ -180,7 +180,30 @@ Theme finalize(Theme t, bool anime) {
         // 深色动漫档压暗一次（见 darkenThemeColors 的注释：这台机器的
         // 交换链会把 0.106 显示成 RGB 92，"深色主题"其实一直是中灰）。
         // 浅色档不压 —— 它要的是"奶油白"，压下去会变成脏灰。
-        if (!t.tok.isLight) darkenThemeColors(t, 1.45f);
+        //
+        // ⚠ 2026-11-04：那个"显示成 92"的**根因已经修掉了**（ImGui 那条
+        //   路径漏了 sRGB 反编码，见 assets/shaders/imgui.frag）。这里保留
+        //   压暗是因为"夜樱"这套观感本来就要求真正深的底，屏幕 RGB 9~24
+        //   正好；但**压暗之后必须重排一次层次** —— 理由见下面那段。
+        if (!t.tok.isLight) {
+            darkenThemeColors(t, 1.45f);
+
+            // 为什么压暗之后要重排：
+            //   `pow(c, 1.45)` 对"暗部"是**乘性**压缩 —— windowBg 0.036 与
+            //   frameBg 0.070 上屏只差 9 级（实测输入框底 18 / 面板底 17，
+            //   差 1 级），于是输入框、下拉框、**未勾选的勾选框**全都成了
+            //   "只有字没有框"。这正是用户说的"不美观"里最扎眼的一处。
+            //   所以按**加法**重新铺一遍控件层的明度阶梯：加法在深底上给
+            //   出的绝对差是恒定的，不会被幂函数吃掉。
+            //   锚点是 `tok.cardBg`（控件实际坐的那一层 = 子窗口底），
+            //   不是 windowBg —— 面板里嵌子窗口时差一层就会偏亮/偏暗。
+            const ImVec4 base = t.tok.cardBg;
+            t.frameBg = shift(base, 0.070f);
+            t.frameBgHovered = shift(base, 0.110f);
+            t.frameBgActive = shift(base, 0.150f);
+            t.border = withAlpha(shift(base, 0.170f), 0.85f);
+            t.tok.borderSoft = withAlpha(t.border, 0.55f);
+        }
     } else {
         // 工程档：保留原来的 1px 底边与 4px 圆角体系，只是把圆角
         // 统一提到 8（原来 4 太"方"，是用户说的"硬朗"来源之一）。

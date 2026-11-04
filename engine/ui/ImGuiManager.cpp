@@ -2,6 +2,8 @@
 #include "ui/ImGuiTheme.h"
 #include "rhi/Instance.h"
 #include "rhi/Device.h"
+#include "rhi/VulkanCommon.h"
+#include "render/ShaderPath.h"
 
 #include "assets/AssetPath.h"
 #include "core/Logger.h"
@@ -15,6 +17,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 
 namespace ui {
 
@@ -22,6 +26,42 @@ namespace {
 // 默认字号（加载 TTF 时用的基础像素尺寸）。比 ImGui 内置位图字体(13px)
 // 大、且是矢量字体，缩放后更清晰。
 constexpr float kBaseFontSize = 18.0f;
+
+// ---- ImGui 片元着色器的替换品（assets/shaders/imgui.frag.spv）----
+//
+// 后端自带的那份写的是 `fColor = In.Color * texture(...)`，把 sRGB 顶点色
+// **原样**写进 sRGB 交换链 —— 硬件于是再编码一次，整个 UI 亮一大截
+// （设计色 #1D1E20 显示成 #5F6063）。替换掉这份片元着色器、在里头做一次
+// srgbToLinear 之后，屏幕上才正好是设计色。完整推导见 imgui.frag 顶部注释。
+//
+// 为什么是**静态**：`VkShaderModuleCreateInfo::pCode` 指向这块内存，后端在
+// init 里 vkCreateShaderModule 之后就不再读它了 —— 但"不再读"是后端的实现
+// 细节，把生命周期绑到进程上最省心（只有几十 KB）。
+// 为什么允许为空：读不到 .spv 时**必须能退回去**（老版本包里没这个文件），
+// 退回去的效果是"颜色偏亮"，不是崩溃。空 = 用后端默认着色器。
+std::vector<uint32_t> g_imguiFragSpv;
+
+// 返回 true 表示成功装上自定义片元着色器。
+bool loadImGuiFragShader() {
+    if (!g_imguiFragSpv.empty()) return true;
+
+    std::vector<char> bytes;
+    try {
+        bytes = vkutil::readFile(render::resolveShaderPath("imgui.frag.spv"));
+    } catch (const std::exception& e) {
+        VK_LOG_WARN("ImGui: %s", e.what());
+        return false;
+    }
+    // SPIR-V 是 uint32_t 序列：长度必须是 4 的倍数，否则后端读越界。
+    if (bytes.size() < 4 || (bytes.size() % 4) != 0) {
+        VK_LOG_WARN("ImGui: imgui.frag.spv has bad size (%zu) - ignored",
+                    bytes.size());
+        return false;
+    }
+    g_imguiFragSpv.resize(bytes.size() / 4);
+    std::memcpy(g_imguiFragSpv.data(), bytes.data(), bytes.size());
+    return true;
+}
 
 } // namespace
 
@@ -147,6 +187,22 @@ void ImGuiManager::init(GLFWwindow* window, rhi::Instance& instance,
     info.PipelineInfoMain.RenderPass = renderPass;
     info.PipelineInfoMain.Subpass = 0;
     info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // 片元着色器替换（sRGB 反编码）。装不上就静默退回后端默认那份 ——
+    // 现象是"UI 整体偏亮发灰"，不是崩溃。日志里留一条便于定位。
+    if (loadImGuiFragShader()) {
+        info.CustomShaderFragCreateInfo.sType =
+            VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        info.CustomShaderFragCreateInfo.codeSize =
+            g_imguiFragSpv.size() * sizeof(uint32_t);
+        info.CustomShaderFragCreateInfo.pCode = g_imguiFragSpv.data();
+        VK_LOG_INFO("ImGui fragment shader: imgui.frag.spv (%zu bytes, "
+                    "sRGB reverse-encode ON)",
+                    g_imguiFragSpv.size() * sizeof(uint32_t));
+    } else {
+        VK_LOG_WARN("ImGui: custom frag shader unavailable - UI colours will "
+                    "be sRGB double-encoded (washed out)");
+    }
 
     if (!ImGui_ImplVulkan_Init(&info)) {
         throw std::runtime_error("ImGui_ImplVulkan_Init failed");
