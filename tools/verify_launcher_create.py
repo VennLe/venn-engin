@@ -44,6 +44,11 @@ I=isometric / B=card_battler —— 编号不撞。12~17 只在第一轮和尾�
   C14 被拒后**没有** `<name>.tmp` 残留
   C15 被拒后原工程的文件没被改动（mtime 不变）
   C17 第二次新建默认用上次那个目录（不是回落 C 盘 Documents）
+  ?18 建出来的工程里有 `code/<Module>.sln` / `.vcxproj` / `CMakeLists.txt`
+      —— 2026-11-04 起"生成 C++ 代码工程"默认开（原先默认关、藏在 Step2，
+        用户反馈"创建出来没有代码工程、也没自动打开 VS"）。
+        ⚠ 这里只验**产物**；"打开 VS"那一脚由 `MYVK_LAUNCHER_TEST_NO_IDE`
+        关掉，否则一轮 4~5 个工程会弹一堆 devenv。
 
 用法：
     python tools/verify_launcher_create.py
@@ -157,6 +162,12 @@ def run_wizard(work, name, type_index, recent_path, expect_ok=True):
             # 3840x2160 完全正确。本用例验的是"创建流程写出的工程"，不是
             # "分辨率推荐值"，后者由 verify_launcher_display.py 覆盖。
             "MYVK_LAUNCHER_TEST_RES": "1",
+            # 2026-11-04：`m_wizCpp` 默认开 → 每次创建都会生成 code/ 并
+            # **拉起 Visual Studio**。本用例一轮要建 4~5 个工程，不关那一脚
+            # 会在桌面上堆一排 devenv，还会把每轮拖慢好几秒。
+            # ⚠ 关的只是"打开 IDE"，`code/*.sln` 照旧生成 —— `?18` 正是在
+            #   磁盘上验它，所以这条特性的产物仍然被真实验证。
+            "MYVK_LAUNCHER_TEST_NO_IDE": "1",
         })
     if not hwnd:
         proc.kill()
@@ -311,6 +322,37 @@ def check_project(root, name, kind, fails, prefix):
     else:
         kit.log("CHECK %s6 template files[] all present (%d) OK"
                 % (prefix, len(manifest.get("files", []))))
+
+    # ---- ?18 C++ 代码工程（2026-11-04 起默认生成）----
+    # 用户反馈原文："创建游戏项目的时候，似乎对应的代码工程没有创建出来并用
+    # VS 自动打开"。根因不是没有这个功能（`GameCodeGen` 一直在），而是
+    # 勾选框**默认关**、并且藏在 Step2（位置）的 Code 分节底部，而"创建"
+    # 按钮在 Step3 —— 等于看不见。现在默认开，所以"建出来的工程里必须有
+    # code/<Module>.sln"这条要从磁盘上验，不能只看默认值改没改。
+    #
+    # ⚠ 模块名不在这里重新算：`venn.project.json` 的 `code.module`
+    #   （`code/bin/<Module>.dll`）就是创建器自己记下的那份，拆出来用。
+    #   在这边重算一遍 `moduleIdFromName()` 等于写第二份真值。
+    code_obj = p.get("code") or {}
+    code_mod = code_obj.get("module", "")
+    if code_obj.get("mode") != "cpp" or not code_mod.startswith("code/bin/") \
+            or not code_mod.endswith(".dll"):
+        fails.append("%s18 code.mode/module 不对（默认应生成 C++ 工程）: mode=%r "
+                     "module=%r" % (prefix, code_obj.get("mode"), code_mod))
+    else:
+        mod = code_mod[len("code/bin/"):-len(".dll")]
+        sln = os.path.join(root, "code", mod + ".sln")
+        vcx = os.path.join(root, "code", mod + ".vcxproj")
+        cmk = os.path.join(root, "code", "CMakeLists.txt")
+        if not (os.path.isfile(sln) and os.path.isfile(vcx)):
+            fails.append("%s18 缺 code/%s.sln 或 .vcxproj（默认生成代码工程）"
+                         % (prefix, mod))
+        elif not os.path.isfile(cmk):
+            # CMakeLists 是"不开 VS 也能编"的退路，GameCodeGen 的 D 组盯着
+            fails.append("%s18 缺 code/CMakeLists.txt" % prefix)
+        else:
+            kit.log("CHECK %s18 code project %s.sln + .vcxproj + CMakeLists OK"
+                    % (prefix, mod))
 
     # ---- C7/C8 game.json ----
     gj = os.path.join(root, "assets", "game.json")

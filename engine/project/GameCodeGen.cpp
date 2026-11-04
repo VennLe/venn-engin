@@ -1169,10 +1169,31 @@ bool openInVisualStudio(const std::string& slnPath, std::string* err) {
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
-        // ⚠ 这里**继承父进程环境**（env 传 nullptr）：devenv 不需要那份去重
-        //   过的环境块，而且 UI 进程要能看到用户完整的环境（代理、SDK 路径等）。
-        if (::CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE, 0,
-                             nullptr, nullptr, &si, &pi)) {
+        // ⚠⚠ 环境块**必须去重后再传**（2026-11-04 实测：传 nullptr 会让 VS
+        //   起来又立刻死掉）。
+        //
+        //   这里原先写的是"继承父进程环境（env 传 nullptr）"，理由看着很合理：
+        //   UI 进程要能看到用户完整的环境（代理、SDK 路径）。但 VS 2022 的
+        //   ServiceHub 和 MSBuild 是**同一个毛病** —— 拿大小写敏感的字典装环境
+        //   变量，遇到 `HTTPS_PROXY` + `https_proxy` 两条就抛
+        //   `ArgumentException: 已添加项。字典中的关键字:"HTTPS_PROXY" 所添加
+        //   的关键字:"https_proxy"`。
+        //
+        //   症状极难猜：日志里明明白白写着 `GAMECODE opened devenv`（CreateProcess
+        //   确实成功了），桌面上什么都没有 —— devenv 建完主窗口就销毁自己，
+        //   **退出码还是 0**。证据在
+        //   `%APPDATA%\Microsoft\VisualStudio\17.0_*\ActivityLog.xml`（`/log` 启动）
+        //   里 GetIdeUserContextAsync 那条 ArgumentException。
+        //
+        //   去重不改变语义（Windows 的环境变量名大小写不敏感，见
+        //   `buildDedupEnvBlock` 上方那段注释），用户环境依然完整可见。
+        //   `CREATE_UNICODE_ENVIRONMENT` 不能省：传的是 UTF-16 块，不带这个
+        //   flag 系统会按 ANSI 解析 → ERROR_INVALID_PARAMETER (87)。
+        std::wstring envBlock = buildDedupEnvBlock();
+        LPVOID envPtr = envBlock.empty() ? nullptr : &envBlock[0];
+        const DWORD flags = envBlock.empty() ? 0 : CREATE_UNICODE_ENVIRONMENT;
+        if (::CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
+                             flags, envPtr, nullptr, &si, &pi)) {
             ::CloseHandle(pi.hThread);
             ::CloseHandle(pi.hProcess);   // 不等它 —— VS 是长驻 GUI，等就卡死了
             VK_LOG_INFO("GAMECODE opened devenv: %s", slnPath.c_str());

@@ -168,7 +168,18 @@ def launch(recent_path=None, env_extra=None, cwd=None, timeout=45.0):
         # 露面的那一帧控件还在结算布局。不置前的话第一次 `click()` 会撞上
         # "只激活窗口"的老毛病（见 focus_window）。
         focus_window(hwnd)
-        time.sleep(0.6)
+        # ⚠⚠ 句柄出现 ≠ 第一帧已经上屏。
+        #   锚点（`ui::logRect`）是在**那一帧渲染之前**打出来的，所以"拿得到
+        #   矩形"完全可能落在一个还没开始吃输入的窗口上 —— 症状是点了没反应，
+        #   而且**每次失败的轮次都不一样**。
+        #   2026-11-04 连跑两次 `verify_launcher_create`：第一次红在
+        #   third_person（C4 "点了创建但没有 LAUNCH-DONE"），第二次红在
+        #   card_battler（C2 "点了下一步但没出现 Step2"）—— 两次都是点击丢了，
+        #   不是被测功能坏了。
+        #   `core/Window.cpp` 在首帧真正呈现后打 "Window shown (first frame is
+        #   on screen)"，等它出现再点，这条竞态就没了。
+        tap.wait_line("first frame is on screen", 15.0)
+        time.sleep(0.3)
     return proc, tap, hwnd
 
 

@@ -265,6 +265,42 @@ std::string directoryLinkTarget(const std::string& path) {
 #endif
 }
 
+// 递归删除 `p`，**不进入**后代里的目录联接 / 符号链接。
+//
+// ⚠⚠ 为什么不能直接用 `fs::remove_all`：Windows 的 junction 在
+//   `is_directory()` 眼里就是"目录"，`remove_all` 会**递归进目标**，删掉的是
+//   别人目录里的真文件。
+//   `createFromTemplate` 的 `codeExternal` 分支会把 `<tmp>/assets/scripts`
+//   换成一个指向**用户外部脚本目录**的 junction（见下面第 566 行附近）；
+//   从那之后，任何一步失败触发的回滚（本文件里十几处）都会穿过那个链接，
+//   把用户真实的脚本目录清空。工程建失败是小事，删掉用户文件是灾难。
+//
+//   2026-11-04 是从自检残留上撞见这个性质：`venn_create_test` 里的
+//   `LinkedGame/assets/scripts` 也是 junction，`remove_all` 删不干净 →
+//   目录残留 → 下一次自检 K9 直接红在 "Folder is not empty"，而报错文本
+//   跟 junction 毫无关系。
+namespace {
+void removeTreeImpl(const fs::path& p) {
+    std::error_code ec;
+    // 先判链接：断链（目标已不在）时 `exists()` 是 false，但链接本身还得删
+    if (isDirectoryLink(p.generic_string())) {
+        fs::remove(p, ec);   // 只摘链接，目标一个字节都不动
+        return;
+    }
+    if (!fs::exists(p, ec)) return;
+    if (fs::is_directory(p, ec)) {
+        for (const auto& e : fs::directory_iterator(p, ec)) removeTreeImpl(e.path());
+    }
+    fs::remove_all(p, ec);
+}
+
+// 与 `fs::remove_all(p, ec)` **同签名**，好让现场调用就地替换（`ec` 保持有用）。
+void removeTree(const fs::path& p, std::error_code& ec) {
+    ec.clear();
+    removeTreeImpl(p);
+}
+}  // namespace
+
 bool createDirectoryJunction(const std::string& linkPath,
                              const std::string& targetPath, std::string* err) {
     std::error_code ec;
@@ -459,7 +495,7 @@ CreateResult createFromTemplate(const CreateSpec& spec, const ProgressFn& progre
         // 上次崩溃留下的残留：**它是我们的**（名字是我们定的），可以删。
         // ⚠ 绝不对 `root` 做这件事 —— 那可能是用户自己的目录。
         if (fs::exists(tmp, ec)) {
-            fs::remove_all(tmp, ec);
+            removeTree(tmp, ec);
             VK_LOG_INFO("PROJ-CREATE removed stale tmp=%s", tmp.c_str());
         }
     }
@@ -471,7 +507,7 @@ CreateResult createFromTemplate(const CreateSpec& spec, const ProgressFn& progre
         copied = copyTree(fs::path(tpl.dir), fs::path(tmp), &err);
         if (copied < 0) {
             std::error_code ec;
-            fs::remove_all(tmp, ec);
+            removeTree(tmp, ec);
             return fail(CreateStep::CopyTemplate, err);
         }
     }
@@ -490,7 +526,7 @@ CreateResult createFromTemplate(const CreateSpec& spec, const ProgressFn& progre
                                                 subs, &err);
         if (changed < 0) {
             std::error_code ec;
-            fs::remove_all(tmp, ec);
+            removeTree(tmp, ec);
             return fail(CreateStep::ReplaceAndWrite, err);
         }
         if (changed == 0) {
@@ -541,7 +577,7 @@ CreateResult createFromTemplate(const CreateSpec& spec, const ProgressFn& progre
         const IoResult w = saveProject(pf, &err);
         if (!w.ok) {
             std::error_code ec;
-            fs::remove_all(tmp, ec);
+            removeTree(tmp, ec);
             return fail(CreateStep::ReplaceAndWrite, err);
         }
     }
@@ -557,15 +593,15 @@ CreateResult createFromTemplate(const CreateSpec& spec, const ProgressFn& progre
         if (fs::exists(tmpScripts, ec)) {
             const int n = copyTree(tmpScripts, ext, &err);
             if (n < 0) {
-                fs::remove_all(tmp, ec);
+                removeTree(tmp, ec);
                 return fail(CreateStep::ReplaceAndWrite,
                             "Cannot seed external code folder: " + err);
             }
-            fs::remove_all(tmpScripts, ec);
+            removeTree(tmpScripts, ec);
         }
         if (!createDirectoryJunction(tmpScripts.generic_string(),
                                      ext.generic_string(), &err)) {
-            fs::remove_all(tmp, ec);
+            removeTree(tmp, ec);
             return fail(CreateStep::ReplaceAndWrite,
                         "Cannot link code folder: " + err);
         }
@@ -579,14 +615,14 @@ CreateResult createFromTemplate(const CreateSpec& spec, const ProgressFn& progre
         const IoResult w = writeDisplay(tmp, d, &err);
         if (!w.ok) {
             std::error_code ec;
-            fs::remove_all(tmp, ec);
+            removeTree(tmp, ec);
             return fail(CreateStep::ReplaceAndWrite, err);
         }
         if (d.qualityPreset >= 0) {
             const IoResult q = writeQuality(tmp, d.qualityPreset, &err);
             if (!q.ok) {
                 std::error_code ec;
-                fs::remove_all(tmp, ec);
+                removeTree(tmp, ec);
                 return fail(CreateStep::ReplaceAndWrite, err);
             }
         }
@@ -612,7 +648,7 @@ CreateResult createFromTemplate(const CreateSpec& spec, const ProgressFn& progre
         const GameCodeResult cr = writeGameCode(cs);
         if (!cr.ok) {
             std::error_code ec;
-            fs::remove_all(tmp, ec);
+            removeTree(tmp, ec);
             return fail(CreateStep::WriteGameCode, cr.error);
         }
     }
@@ -628,20 +664,20 @@ CreateResult createFromTemplate(const CreateSpec& spec, const ProgressFn& progre
             // 再确认一次（TOCTOU 防护）：这次非空就**放弃**，不删。
             const IoResult t = checkTargetDirUsable(root);
             if (!t.ok) {
-                fs::remove_all(tmp, ec);
+                removeTree(tmp, ec);
                 return fail(CreateStep::Commit,
                             "Target folder became non-empty: " + t.error);
             }
             fs::remove(root, ec);
             if (ec) {
-                fs::remove_all(tmp, ec);
+                removeTree(tmp, ec);
                 return fail(CreateStep::Commit,
                             "Cannot clear empty target folder: " + ec.message());
             }
         }
         fs::rename(fs::path(tmp), fs::path(root), ec);
         if (ec) {
-            fs::remove_all(tmp, ec);
+            removeTree(tmp, ec);
             return fail(CreateStep::Commit,
                         "Cannot move project into place: " + ec.message());
         }
@@ -732,7 +768,7 @@ int runCreateSelfTest() {
 
     // ---- K9 创建成功 + 结构对账 ----
     const fs::path base = fs::temp_directory_path(ec) / "venn_create_test";
-    fs::remove_all(base, ec);
+    removeTree(base, ec);
     fs::create_directories(base, ec);
 
     // 最近列表重定向到临时目录（不碰用户真实列表）
@@ -919,9 +955,24 @@ int runCreateSelfTest() {
         if (ok) {
             check(isDirectoryLink(linkP.generic_string()), "K27 junction-detect", "");
             const std::string t = directoryLinkTarget(linkP.generic_string());
-            check(!t.empty() && normalizePath(t) == normalizePath(
-                                    targetP.generic_string()),
-                  "K28 junction-target", t);
+            // ⚠ 不能直接拿 `targetP` 比字符串：junction 里存的是**解析后的长名**，
+            //   而 `%TEMP%` 在用户名较长时是 8.3 短名（本机是
+            //   `C:\Users\V_LWEI~1\AppData\Local\Temp\...`）。
+            //   于是"短名建的路径 vs 长名读回来的 target"必然不等 ——
+            //   2026-11-04 之前 K28 在本机一直红，看起来像 junction 坏了，
+            //   其实只是两种等价的路径写法。
+            //   ⚠ `fs::canonical` **不展开 8.3**（实测仍返回 `V_LWEI~1`），
+            //   所以只能走 Win32 的 `GetLongPathNameW`（父目录存在，能展开）。
+            wchar_t lbuf[1024] = {};
+            const std::wstring wparent =
+                utf8ToWide(linkP.parent_path().generic_string());
+            const DWORD ln = ::GetLongPathNameW(wparent.c_str(), lbuf, 1024);
+            const fs::path jtDir = (ln > 0 && ln < 1024) ? fs::path(lbuf)
+                                                         : linkP.parent_path();
+            const fs::path want = jtDir / targetP.filename();
+            check(!t.empty() &&
+                      normalizePath(t) == normalizePath(want.generic_string()),
+                  "K28 junction-target", t + " vs " + want.generic_string());
         }
 #else
         check(true, "K26 junction-create (skipped: non-Windows)", "");
@@ -1002,7 +1053,7 @@ int runCreateSelfTest() {
 #else
     unsetenv("MYVK_LAUNCHER_RECENT");
 #endif
-    fs::remove_all(base, ec);
+    removeTree(base, ec);
 
     std::printf("CREATE-TEST SUMMARY pass=%d fail=%d\n", pass, fail);
     return fail;

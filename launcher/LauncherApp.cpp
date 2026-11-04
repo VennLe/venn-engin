@@ -373,6 +373,17 @@ void LauncherApp::onInit() {
         m_wizCodeRoot = c;
         VK_LOG_INFO("LAUNCHER-WIZARD code-root-seeded=%s", c.c_str());
     }
+    // 自动化口子：**只关"拉起 VS"这一步**，不关"生成代码工程"。
+    //
+    // ⚠ 自从 `m_wizCpp` 默认开（2026-11-04），`verify_launcher_create.py`
+    //   一轮要建 4~5 个工程 —— 不关这个，每建一个就弹一个 Visual Studio，
+    //   桌面上会堆一排 devenv，而且每个都要加载几秒，把用例拖到超时。
+    //   生成物（code/*.sln）照旧写，所以"建出来的工程带代码工程"这条
+    //   判据仍然是被真实验证过的，只是不点那一下"打开"。
+    if (envStr("MYVK_LAUNCHER_TEST_NO_IDE") == "1") {
+        m_wizOpenIde = false;
+        VK_LOG_INFO("LAUNCHER-WIZARD open-ide=0 (MYVK_LAUNCHER_TEST_NO_IDE)");
+    }
 
     // 界面语言：启动器**没有**自己的设置存储，所以只有两档 ——
     // 上面的下拉框选的（本次进程有效）、以及出厂默认。
@@ -1252,8 +1263,11 @@ void LauncherApp::drawWizardLocation() {
 
     // ---- C++ 游戏模块（M5-c）----
     //
-    // ⚠ 这一项**默认关**，并且措辞里要写明代价（重编译）。它的定位是
-    //   "要接第三方 C++ 库 / 需要原生性能时才开"，不是默认开发方式。
+    // **默认开**（2026-11-04 改）。之前默认关，而且这一节在第 2 步（位置）页，
+    // 创建按钮在第 3 步 —— 用户的反馈正是"创建出来的工程没有代码工程、也没
+    // 自动开 VS"，因为那个勾选框他一次都没看见过。
+    // 现在：默认开 + 第 3 步的"将写入"清单里列出 `code/<Module>.sln`（见
+    // drawWizardDisplay），代价（改 C++ 要重编译）写在勾选框下面。
     ImGui::Spacing();
     if (ImGui::Checkbox(
             TRL("Also generate a C++ game module (Visual Studio project)##wizcpp"),
@@ -1332,6 +1346,25 @@ void LauncherApp::drawWizardDisplay() {
         ImGui::Bullet();
         ImGui::SameLine();
         ImGui::TextUnformatted(TR(line.c_str()));
+    }
+    // 代码工程**不在** game.json / render.json 里，所以 describeWrites 列不到它
+    // —— 但它确实是"点创建会被写出来的东西"，必须在同一份清单里出现。
+    // 这一行的存在本身就是修一个可见性 bug：勾选框在第 2 步的 Code 分节底部，
+    // 而创建按钮在第 3 步（这一页），两者之间没有任何反馈，于是"建完没有
+    // code/、也没开 VS"看起来像功能缺失，其实只是没勾。
+    if (m_wizCpp) {
+        ImGui::Bullet();
+        ImGui::SameLine();
+        // 路径 + 产品名，不需要翻译；后面那句提示才进词典。
+        ImGui::Text("code/%s.sln", project::moduleIdFromName(m_wizName).c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", m_wizOpenIde
+                                      ? TR("(opens in Visual Studio after creating)")
+                                      : TR("(Visual Studio not opened automatically)"));
+    } else {
+        ImGui::Bullet();
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", TR("code/ skipped - scripts only"));
     }
     anchor("LAUNCH-WRITES");
 

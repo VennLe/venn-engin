@@ -2349,6 +2349,9 @@ const Entry kZh[] = {
      "会在 code/ 下建一个独立的 Visual Studio 工程（不需要 cmake）。"
      "写在这里的玩法要重编译才生效 —— 决策留在 Lua，只把重活放这里。"},
     {"Open Visual Studio after creating", "创建完成后打开 Visual Studio"},
+    {"(opens in Visual Studio after creating)", "（创建后自动用 Visual Studio 打开）"},
+    {"(Visual Studio not opened automatically)", "（不会自动打开 Visual Studio）"},
+    {"code/ skipped - scripts only", "不生成 code/（只用 Lua 脚本）"},
     {"Code project created, but no solution was generated.",
      "代码工程已创建，但没能生成 .sln（可在 VS 里直接打开 code 文件夹）。"},
     {"Scripts live in assets/scripts (*.vks) and are hot-reloaded by the editor.",
