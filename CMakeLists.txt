@@ -323,7 +323,16 @@ target_link_libraries(VennEngine PUBLIC
 if(WIN32)
     # psapi：`core/ProcStats.cpp` 的 `GetProcessMemoryInfo`（Stats 面板的内存一节）。
     # MinGW 侧同名的 `libpsapi.a` 也导出这个符号，两个工具链都不用兜底。
-    target_link_libraries(VennEngine PUBLIC ole32 avrt ksuser winmm propsys psapi)
+    #
+    # dbghelp：`script/LuaSelfTest.cpp` 崩溃处理器把地址翻成"函数名 + 行号"
+    # 要用 Sym* / StackWalk64。**必须写在这里**，不能只靠源文件里的
+    # `#pragma comment(lib, "dbghelp.lib")` —— 那条只有 MSVC 认，g++ 会
+    # 直接忽略，于是 MinGW 构建在链接 Game.exe 时才炸：
+    #   libVennEngine.a(LuaSelfTest.cpp.obj): undefined reference to `__imp_SymFromAddr'
+    # 而且**只有 Game 炸、Editor 不炸**：LuaSelfTest.cpp.obj 在静态库里，
+    # 只有 `runtime/main.cpp`（--selftest lua）引用了 runLuaSelfTest，
+    # 链接 Editor 时这个 obj 压根没被拉出来。所以"Editor 过了"不代表没问题。
+    target_link_libraries(VennEngine PUBLIC ole32 avrt ksuser winmm propsys psapi dbghelp)
 endif()
 if(NOT MSVC)
     target_compile_options(VennEngine PRIVATE -Wall -Wextra -Wno-unused-parameter)

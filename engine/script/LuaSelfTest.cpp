@@ -40,8 +40,13 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <dbghelp.h>
-#include <cstdlib>
+// MSVC 侧靠这条自动带上 dbghelp.lib；g++（MinGW）**不认识** #pragma comment，
+// 会静默忽略 → 链接期报 `undefined reference to __imp_SymFromAddr` 等一串。
+// MinGW 的依赖由 CMakeLists.txt 的 `target_link_libraries(... dbghelp)` 提供，
+// 两边都必须留：删了这里 MSVC 会断，删了那里 MinGW 会断。
+#if defined(_MSC_VER)
 #pragma comment(lib, "dbghelp.lib")
+#endif
 namespace {
 // 崩溃时把异常码和地址打出来 —— 段错误只说"崩了"，异常码才说"为什么崩"：
 //   0xC0000005 访问冲突 / 0xC0000409 __fastfail（栈破坏）/ 0xC00000FD 栈溢出
