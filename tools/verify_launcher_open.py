@@ -52,12 +52,14 @@ import launcher_kit as kit  # noqa: E402
 def launcher_expected_size():
     """启动器的期望客户区尺寸 —— 与 `LauncherApp::onInit` 逐字同一条公式。
 
-        winW = min(1400, workW * 0.94)
-        winH = min(880,  workH * 0.90)
+        winW = min(1560, workW * 0.94)
+        winH = min(960,  workH * 0.90)
 
     （常量见 `launcher/LauncherApp.cpp` 的 kWindowW/kWindowH/kWinWPct/kWinHPct。）
-    ⚠ 这是**唯一**该复写这个公式的地方：把 1400×880 写死在断言里，1366×768
+    ⚠ 这是**唯一**该复写这个公式的地方：把 1560×960 写死在断言里，1366×768
       的笔记本上必红 —— 那里会被工作区夹小，而夹取本身也是要验的行为。
+    ⚠ 2026-11-04：1400×880 → 1560×960（"三块并一屏"要多出横向空间放四张
+      类型卡；纵向也要让位置/画面两栏的 checkbox 全露出来）。
     """
     import ctypes
 
@@ -69,7 +71,7 @@ def launcher_expected_size():
     # SPI_GETWORKAREA = 0x0030（不含任务栏）
     ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0)
     ww, wh = r.right - r.left, r.bottom - r.top
-    want = (min(1400, int(ww * 0.94)), min(880, int(wh * 0.90)))
+    want = (min(1560, int(ww * 0.94)), min(960, int(wh * 0.90)))
     return want, (ww, wh)
 
 
@@ -128,19 +130,21 @@ def main():
                     % (cw, ch, work_wh[0], work_wh[1]))
 
         # ---- 走完向导（与 M2 同一条路径，这里不重复断言，只推进）----
+        #
+        # 2026-11-04：三步换页拆了 → 类型 / 位置 / 画面在同一屏，点完卡片
+        # 直接点"创建"。所以这里不再有"下一步"，只剩两次等待（等位置块、
+        # 等画面块画出锚点，证明那一屏确实拼齐了）。
         if not kit.click_anchor(hwnd, tap, "LAUNCH-TYPE-1"):
-            fails.append("向导 Step1 点不到第三人称卡片")
+            fails.append("向导点不到第三人称卡片")
             return kit.finish(fails)
-        if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-next"):
-            fails.append("向导 Step1 点不到下一步")
+        if not tap.wait_rect("LAUNCH-INPUT-root", timeout=15.0):
+            fails.append("单页向导里没有位置块（缺 LAUNCH-INPUT-root）")
             return kit.finish(fails)
-        tap.wait_rect("LAUNCH-INPUT-root", timeout=15.0)
-        if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-next"):
-            fails.append("向导 Step2 点不到下一步")
+        if not tap.wait_rect("LAUNCH-COMBO-res", timeout=15.0):
+            fails.append("单页向导里没有画面块（缺 LAUNCH-COMBO-res）")
             return kit.finish(fails)
-        tap.wait_rect("LAUNCH-COMBO-res", timeout=15.0)
         if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-create"):
-            fails.append("向导 Step3 点不到创建")
+            fails.append("向导点不到创建")
             return kit.finish(fails)
 
         # ---- O1 创建成功 → **自动**进编辑器（2026-10-22 需求 A）----

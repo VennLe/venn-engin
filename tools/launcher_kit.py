@@ -589,30 +589,30 @@ def dismiss_spawned(tap, wait=30.0):
 
 
 def drive_wizard(hwnd, tap, type_index=1, timeout=40.0):
-    """把四步向导点完，停在「创建」之前，返回失败描述列表（空 = 一路顺）。
+    """把新建向导点完（单页，2026-11-04 起三步合一），停在「创建」之前，
+    返回失败描述列表（空 = 一路顺）。
 
     ⚠ `verify_launcher_create.py` **不用**这个函数：它要逐步断言
-      （点卡片之后必须看到 `LAUNCHER-WIZARD type=...`、换页之后必须出现
-      新锚点）。这里只负责"推进"，给不需要中间断言的用例用。
+      （点卡片之后必须看到 `LAUNCHER-WIZARD type=...`、三块必须同屏且
+      不出界）。这里只负责"推进"，给不需要中间断言的用例用。
+
+    ⚠ 为什么不再点"下一步"：那套三步换页（`LAUNCH-BTN-next`）已经拆了，
+      类型 / 位置 / 画面并成同一屏。点一颗不存在的按钮只会让每个用例都
+      报"点不到 LAUNCH-BTN-next"，而真因是**用例过时**，不是产品坏了。
     """
     fails = []
     if not tap.wait_rect("LAUNCH-TYPE-%d" % type_index, timeout=25.0):
-        fails.append("向导 Step1 没画出类型卡片")
+        fails.append("向导没画出类型卡片")
         return fails
     if not click_anchor(hwnd, tap, "LAUNCH-TYPE-%d" % type_index):
         fails.append("点不到 LAUNCH-TYPE-%d" % type_index)
         return fails
-    if not click_anchor(hwnd, tap, "LAUNCH-BTN-next"):
-        fails.append("点不到 LAUNCH-BTN-next（Step1）")
-        return fails
+    # 位置块与画面块在同一屏，直接等锚点即可（顺序无所谓）。
     if not tap.wait_rect("LAUNCH-INPUT-root", timeout=20.0):
-        fails.append("没有进入 Step2（缺 LAUNCH-INPUT-root）")
-        return fails
-    if not click_anchor(hwnd, tap, "LAUNCH-BTN-next"):
-        fails.append("点不到 LAUNCH-BTN-next（Step2）")
+        fails.append("单页向导里没有 LAUNCH-INPUT-root（位置块缺失）")
         return fails
     if not tap.wait_rect("LAUNCH-COMBO-res", timeout=20.0):
-        fails.append("没有进入 Step3（缺 LAUNCH-COMBO-res）")
+        fails.append("单页向导里没有 LAUNCH-COMBO-res（画面块缺失）")
         return fails
     if not click_anchor(hwnd, tap, "LAUNCH-BTN-create"):
         fails.append("点不到 LAUNCH-BTN-create")

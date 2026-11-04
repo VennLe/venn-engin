@@ -12,7 +12,7 @@
 验什么：
   A  `Game.exe --selftest theme` 22 条 + **分组存在性**
      （只数总数的话"整组被删掉"也能靠别组凑够）
-  B  启动器：客户区尺寸 == 1400x880、窗口底是"深紫"而不是中灰、
+  B  启动器：客户区尺寸 == 1560x960、窗口底是"深紫"而不是中灰、
      顶栏是**左亮右暗的渐变**（用户第 2 条要的"不呆板"就是它）
   C  编辑器 Preferences：10 枚主题色卡都在（锚点 PREFS-THEMECHIP-0..9），
      点第 6 枚（Matcha Mint）之后 Preferences 窗口内**绿色分量抬起来** ——
@@ -45,8 +45,9 @@ LAUNCHER = os.path.join(BIN, "Launcher.exe")
 OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify")
 
 # 启动器目标尺寸（engine 侧 kWindowW / kWindowH）。屏幕工作区更小时会被夹，
-# 所以断言是"**不超过** 1400x880 且 **明显大于**旧值 1080x720"。
-WANT_W, WANT_H = 1400, 880
+# 所以断言是"**不超过** 1560x960 且 **明显大于**旧值 1080x720"。
+# 2026-11-04：1400x880 → 1560x960（三步向导并成一屏，要多出横向/纵向空间）。
+WANT_W, WANT_H = 1560, 960
 OLD_W, OLD_H = 1080, 720
 
 results = []

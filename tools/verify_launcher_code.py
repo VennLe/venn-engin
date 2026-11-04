@@ -78,14 +78,13 @@ def main():
 
     editor_hwnd = 0
     try:
-        # ---- 推进到 Step2 ----
+        # ---- 进向导（2026-11-04 起是**单页**：类型/位置/画面同屏）----
         if not tap.wait_rect("LAUNCH-TYPE-1", timeout=25.0):
-            fails.append("向导 Step1 没出现")
+            fails.append("向导没出现")
             return kit.finish(fails)
         kit.click_anchor(hwnd, tap, "LAUNCH-TYPE-1")
-        kit.click_anchor(hwnd, tap, "LAUNCH-BTN-next")
         if not tap.wait_rect("LAUNCH-INPUT-root", timeout=20.0):
-            fails.append("没有进入 Step2")
+            fails.append("单页向导里没有位置块（缺 LAUNCH-INPUT-root）")
             return kit.finish(fails)
 
         # ---- D1 真点复选框 ----
@@ -97,12 +96,9 @@ def main():
         else:
             kit.log("CHECK D1 external checkbox toggled OK")
 
-        # ---- 继续到 Step3 并创建 ----
-        if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-next"):
-            fails.append("点不到 Step2 的下一步")
-            return kit.finish(fails)
+        # ---- 创建（画面块与位置块同屏，只等它画出来即可）----
         if not tap.wait_rect("LAUNCH-COMBO-res", timeout=20.0):
-            fails.append("没有进入 Step3")
+            fails.append("单页向导里没有画面块（缺 LAUNCH-COMBO-res）")
             return kit.finish(fails)
         if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-create"):
             fails.append("点不到创建")

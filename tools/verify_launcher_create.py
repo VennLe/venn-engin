@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""tools/verify_launcher_create.py —— 启动器 M2 验收：四步向导 + 创建引擎
+"""tools/verify_launcher_create.py —— 启动器 M2 验收：新建向导 + 创建引擎
 
 路线图 §7-M2 的验收条款：
   「新建后目录结构对账（用 `template.json` 的 `files[]`）、`game.json` 的
@@ -9,7 +9,7 @@
 这个脚本**全程点按钮**，不绕过 UI：
   ① 进新建向导（`MYVK_LAUNCHER_PAGE=new`），点类型卡片 → 断言日志里
      出现 `LAUNCHER-WIZARD type=<id>`（证明这一下真的点到了）；
-  ② 下一步到"位置"，再下一步到"画面"；
+  ② 类型 / 位置 / 画面三块**在同一屏上**（2026-11-04 起不再是三步换页）；
   ③ 点"创建" → 停在"完成"页；
   ④ 关掉启动器，对着磁盘一条条对账。
 
@@ -18,14 +18,15 @@
 故意重名（必须被拒、且不留残留）、不给 TEST_ROOT（应当默认用上次那个目录）。
 
 ⚠ `MYVK_LAUNCHER_TEST_ROOT` / `TEST_NAME` 只填向导的**初值** ——
-  四步一步不少，按钮一个不落地真点。不这么做的话，测试得去模拟
+  输入框、勾选框、按钮一个不落地真点。不这么做的话，测试得去模拟
   "往系统文件夹对话框里敲一串带中文的临时路径"，那件事在 CI 上做不可靠。
 
 覆盖（每轮 1~11 与 16；前缀按类型分：C=third_person / F=first_person /
 I=isometric / B=card_battler —— 编号不撞。12~17 只在第一轮和尾部出现）：
   ?1  类型卡片**全部画在客户区里**、点哪张就报哪个 type、表里没有的不许画
-  C2  下一步确实换页（换页后才出现 `LAUNCH-INPUT-root`）
-  C3  再下一步出现分辨率/画质/将写入清单（`LAUNCH-COMBO-res` / `-quality` / `LAUNCH-WRITES`）
+  C2  类型/位置/画面三块**并存在同一屏**，且锚点全部落在客户区里
+      （2026-11-04 改：原先验的是"下一步确实换页"，那套三步向导已经删了 ——
+        用户要求三步合一屏，见 CHANGELOG / LauncherApp 的 Page 枚举）
   C4  创建成功 → 出现 `LAUNCH-DONE`
   ?5  `venn.project.json` 存在且 name/gameType/template 都对
   ?6  `template.json.files[]` 里每个文件都在（**用清单对账**，不手写文件名）
@@ -148,7 +149,7 @@ def check_templates_fresh(type_ids):
 
 
 def run_wizard(work, name, type_index, recent_path, expect_ok=True):
-    """跑一遍四步向导。返回 (ok, fails, log_text, screenshot_ok)。"""
+    """跑一遍新建向导（单页）。返回 (ok, fails, log_text, screenshot_ok)。"""
     fails = []
     proc, tap, hwnd = kit.launch(
         recent_path=recent_path,
@@ -176,9 +177,9 @@ def run_wizard(work, name, type_index, recent_path, expect_ok=True):
     shot_ok = False
     type_ids = read_game_type_ids()
     try:
-        # ---- ① Step1 类型 ----
+        # ---- ① 类型卡（单页向导的第一区）----
         if not tap.wait_rect("LAUNCH-TYPE-0", timeout=25.0):
-            fails.append("C1 向导 Step1 没画出类型卡片（缺 LAUNCH-TYPE-0）")
+            fails.append("C1 向导没画出类型卡片（缺 LAUNCH-TYPE-0）")
             return False, fails, tap.text(), False
 
         # ①-a **每一张**类型卡片都必须画出来，而且**落在客户区里**。
@@ -189,9 +190,9 @@ def run_wizard(work, name, type_index, recent_path, expect_ok=True):
         #   `wait_rect` 就会一路绿到底。2026-10-31 在面板滚出视野的按钮上
         #   踩过同一类坑（"有矩形却点不到"）。
         #
-        # 这张表从 2 张扩到 4 张时（2×2 布局）实测过：卡片 380×258，
-        # 第二行 y=435..693，客户区 1400×880，`LAUNCH-BTN-next` 在 771 ——
-        # 都在里面。这条断言就是钉住这件事的。
+        # 4 张卡从 2×2 改成**横排一行**（2026-11-04 单页向导）、窗口同时放大到
+        # 1560×960 时实测过：卡片约 300×130，全部在类型行里，底栏的
+        # `LAUNCH-BTN-create` 也在客户区内。这条断言就是钉住这件事的。
         cw, ch = kit.client_size(hwnd)
         for i in range(len(type_ids)):
             tag = "LAUNCH-TYPE-%d" % i
@@ -227,33 +228,44 @@ def run_wizard(work, name, type_index, recent_path, expect_ok=True):
         else:
             kit.log("CHECK C1 click %s -> type=%s OK" % (tag, want_type))
 
-        # ---- ② Step2 位置 ----
-        if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-next"):
-            fails.append("C2 找不到 / 点不到 LAUNCH-BTN-next（Step1）")
+        # ---- ② 同一屏里的位置 / 画面两块 ----
+        #
+        # 2026-11-04：三步向导改成单页（用户原话：「1.类型，2.位置，3.画面，
+        # 这三步完全可以放在一个画面里啊，不需要三个子画面去分开逐步点击」）。
+        # 所以这里**不再点"下一步"**（那颗按钮连同 `LAUNCH-BTN-next` 锚点一起
+        # 删了），改成断言位置块、画面块、创建按钮在**点开向导的第一屏**上
+        # 就已经全在 —— 这正是那条需求的可执行形式。
+        #
+        # ⚠ 两层断言缺一不可：`wait_rect` 只证明"画了"（logRect 不判可见性），
+        #   出界的锚点照样打得出来，用户却看不见也点不到。C1 上面那段长注释
+        #   记的就是这个坑（"有矩形却点不到"）。
+        cw, ch = kit.client_size(hwnd)
+        same_page = ("LAUNCH-INPUT-root", "LAUNCH-INPUT-name",
+                     "LAUNCH-COMBO-res", "LAUNCH-COMBO-quality",
+                     "LAUNCH-WRITES", "LAUNCH-BTN-create")
+        ok2 = True
+        for tag in same_page:
+            if not tap.wait_rect(tag, timeout=8.0):
+                fails.append("C2 单页向导里没有 %s —— 类型/位置/画面没并到"
+                             "同一屏" % tag)
+                ok2 = False
+                continue
+            r = tap.last_rect(tag)
+            if r[0] < 0 or r[1] < 0 or r[2] > cw or r[3] > ch:
+                fails.append("C2 %s 出界 %s（客户区 %dx%d）—— 一屏装不下，"
+                             "等于还得滚动才看得见" % (tag, r, cw, ch))
+                ok2 = False
+        if not ok2:
             return False, fails, tap.text(), False
-        if not tap.wait_rect("LAUNCH-INPUT-root", timeout=15.0):
-            fails.append("C2 点下一步后没有出现 Step2（缺 LAUNCH-INPUT-root）")
+        # 旧三步向导的"下一步"必须彻底消失：还在的话说明页面没真的合并。
+        if tap.last_rect("LAUNCH-BTN-next") is not None:
+            fails.append("C2 仍然画出了 LAUNCH-BTN-next —— 三步换页没拆干净")
             return False, fails, tap.text(), False
-        kit.log("CHECK C2 step2 reached (LAUNCH-INPUT-root) OK")
-        kit.capture(hwnd, os.path.join(WORK_FOR_SHOTS, "step2_%s.png" % name))
+        kit.log("CHECK C2 type/location/display on one page (client %dx%d) OK"
+                % (cw, ch))
+        kit.capture(hwnd, os.path.join(WORK_FOR_SHOTS, "single_%s.png" % name))
 
-        # ---- ③ Step3 画面 ----
-        if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-next"):
-            fails.append("C3 找不到 / 点不到 LAUNCH-BTN-next（Step2）")
-            return False, fails, tap.text(), False
-        ok3 = True
-        for tag in ("LAUNCH-COMBO-res", "LAUNCH-COMBO-quality", "LAUNCH-WRITES"):
-            if not tap.wait_rect(tag, timeout=15.0):
-                fails.append("C3 Step3 缺锚点 %s" % tag)
-                ok3 = False
-        if ok3:
-            kit.log("CHECK C3 step3 reached (res/quality/writes) OK")
-            kit.capture(hwnd, os.path.join(WORK_FOR_SHOTS,
-                                          "step3_%s.png" % name))
-        else:
-            return False, fails, tap.text(), False
-
-        # ---- ④ 创建 ----
+        # ---- ③ 创建 ----
         if not kit.click_anchor(hwnd, tap, "LAUNCH-BTN-create"):
             fails.append("C4 找不到 / 点不到 LAUNCH-BTN-create")
             return False, fails, tap.text(), False
