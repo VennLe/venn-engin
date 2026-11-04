@@ -11630,7 +11630,8 @@ const std::vector<EditorApp::PrefItem>& EditorApp::prefsTable() {
     // （E03 落地后默认值应从设置层级拿，届时这里只是一份投影。）
     static const std::vector<PrefItem> kTable = {
         // ---- Interface ----
-        {"fontScale", "Font scale", "Interface", false, 1.0f, 0.75f, 2.0f,
+        {"fontScale", "Font scale", "Interface", false,
+         EditorContext::kDefaultFontScale, 0.75f, 2.0f,
          [](EditorApp& a) -> void* { return &a.m_ctx->fontScale(); }},
         // ---- Appearance（主题 / 语言）----
         // 这两项是"选项型"：落盘存下标，取值走 getChoice/setChoice。
@@ -11948,7 +11949,26 @@ void EditorApp::applyAppearance() {
 void EditorApp::applyPrefsFromDisk() {
     std::vector<std::pair<std::string, double>> kv;
     if (!loadEditorPrefs(kv)) return;   // 无存档 / 自动化 → 出厂值
-    for (const auto& [key, val] : kv) {
+    for (auto& [key, val] : kv) {
+        // ---- 一次性迁移：fontScale 的旧出厂值 1.0 → 1.2 ----
+        //
+        // 2026-11-04 用户第 1 条把出厂比例从 1.0 抬到 1.2（"面板中的文字
+        // 大小和界面的面板之间的比例协调性需要加强"）。问题是老用户的
+        // `editor_prefs.json` 里几乎一定写着 1.0 —— 那是"从来没动过"，
+        // 不是"特意调小"。不迁移的话，改出厂值对他们等于没改：界面上
+        // 那行字还是 1.00，看起来像这次改动根本没生效。
+        //
+        // ⚠ 只抬**恰好等于旧出厂值**的那一档（1e-3 容差）：0.9 / 1.1 / 1.5
+        //   这些是用户真的调过的，原样保留。宁可这一档偶尔"多改一次"，
+        //   也不要把所有人手动调过的字号冲掉。
+        if (key == "fontScale" &&
+            std::fabs(val - static_cast<double>(EditorContext::kLegacyFontScale)) <
+                1e-3) {
+            val = static_cast<double>(EditorContext::kDefaultFontScale);
+            VK_LOG_INFO("Editor prefs: fontScale %.2f → %.2f（迁到新出厂值）",
+                        static_cast<double>(EditorContext::kLegacyFontScale),
+                        val);
+        }
         // 语言是**用户的选择**，来源标成 prefs —— 否则日志里"跟随系统"
         // 与"存档里选过"长得一样，而"我明明存了英文为什么还是中文"
         // 这类问题的答案只在 `src` 上。

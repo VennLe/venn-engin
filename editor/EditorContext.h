@@ -838,8 +838,15 @@ public:
     bool& saveAllRequest() { return m_saveAllRequest; }
 
     // ---------------------------------------------------------- 界面设置
-    // 字体缩放（全局，1.0 = 默认字号）。放在 EditorContext 里是为了让
+    // 字体缩放（全局，1.0 = 原始字号）。放在 EditorContext 里是为了让
     // Settings 弹窗、工具栏高度、分栏布局共用同一份状态。
+    //
+    // kDefaultFontScale：出厂比例。kLegacyFontScale 是**上一版**的出厂值，
+    // 只用于偏好读盘时的一次性迁移（存档里恰好等于它的值几乎一定是"从没
+    // 动过"，而不是"特意调到 1.0"）—— 不迁移的话，改默认值对老用户等于
+    // 没改，因为他们盘里躺着 1.0。见 EditorApp::applyPrefsFromDisk。
+    static constexpr float kDefaultFontScale = 1.2f;
+    static constexpr float kLegacyFontScale = 1.0f;
     float& fontScale() { return m_fontScale; }
     float fontScale() const { return m_fontScale; }
 
@@ -1141,8 +1148,14 @@ private:
     bool m_windowFsRequest = false;
     bool m_saveAllRequest = false;
 
-    // 界面设置（默认值：字体 1.0、工具栏高 48 —— 比旧的 40 更宽松）
-    float m_fontScale = 1.0f;
+    // 界面设置（默认值：字体 1.2、工具栏高 48 —— 比旧的 40 更宽松）
+    //
+    // 2026-11-04 用户第 1 条："面板中的文字大小和界面的面板之间的比例协调性
+    // 需要加强，原本默认的参数值是 1，改成 1.2"。1.0 时 18px 的基础字号落在
+    // 一大片 9px 内边距的面板里，字像是"贴"在角落；1.2 之后行高、控件高、
+    // 图标间距才和面板尺度对得上（ImGui 的 GetFrameHeight 由字号推出来，
+    // 所以调这一个数，行高会自己跟上）。
+    float m_fontScale = kDefaultFontScale;
     float m_toolbarH = 48.0f;
     bool m_showSettings = false;
 

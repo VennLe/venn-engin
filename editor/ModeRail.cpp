@@ -165,13 +165,20 @@ void drawModeRail(EditorContext& ctx) {
                 ImGui::TextUnformatted(TR(editModeName(ctx.editMode())));
                 ImGui::PopStyleColor();
             }
-        } else if (right > 190.0f) {
-            ImGui::SameLine(right - 92.0f);
-            ImGui::PushStyleColor(ImGuiCol_Text, tk.textFaint);
-            ImGui::TextUnformatted(TR("click to switch"));
-            ImGui::PopStyleColor();
         } else {
-            ImGui::NewLine();
+            // ⚠ 宽度必须**量出来**，不能写死 92：字体缩放 1.2（新出厂值）下
+            //   这行提示比 92px 宽，写死的话它会被面板右边缘切掉半截
+            //   （实测 "click to switc"）。同时还得保证它不压到左边的 "Modes"
+            //   标题 —— 两者冲突时宁可整条不画（换行），也不叠字。
+            const float tw = ImGui::CalcTextSize(TR("click to switch")).x;
+            if (right - tw > ImGui::GetCursorPosX() + 12.0f) {
+                ImGui::SameLine(right - tw);
+                ImGui::PushStyleColor(ImGuiCol_Text, tk.textFaint);
+                ImGui::TextUnformatted(TR("click to switch"));
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::NewLine();
+            }
         }
         // 表头下面一条细线：把"列表"和"参数区"划开（参数区是另一个窗口，
         // 那条线正好落在两个窗口的接缝上）

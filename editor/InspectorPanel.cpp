@@ -462,8 +462,12 @@ void InspectorPanel::draw() {
     } else {
         // 没选中物体时**不再整页退出**：World / Scene / Output 三页与
         // "选中谁"无关，仍然该能看。其余页签各自会画一行"先选个物体"。
+        //
+        // ⚠ 两段**必须各占一行**：原先用 SameLine 拼成一行，字体缩放 1.2
+        //   （新出厂值）之后整行比面板宽，后半句被裁成 "(World / Scene / Ou"
+        //   —— 实测截图里就是这个样子。面板宽度还会被用户拖窄，写死一行
+        //   宽度救不回来，分行才是稳的。
         ImGui::TextDisabled(TR("Nothing selected"));
-        ImGui::SameLine();
         ImGui::TextDisabled(TR("(World / Scene / Output still work)"));
     }
     ImGui::Separator();
