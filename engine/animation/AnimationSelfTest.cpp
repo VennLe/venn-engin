@@ -5580,6 +5580,167 @@ int runAnimationSelfTest() {
         }
     }
 
+    // ================================================================
+    // 骨名索引（2026-11-05）—— 抄 UE `FReferenceSkeleton` 的建表思路
+    // ================================================================
+    //
+    // 这一组盯的**不是"更快"**，是语义没变：旧实现是线性扫描，新实现在
+    // 第一次调用时建哈希表。改法只要错一处（重复名取最后一个、大小写变
+    // 敏感、精确轮被跳过），症状全是"某个角色某根骨挂错/IK 转错轴"，
+    // 而不是崩溃 —— 所以每条语义都得单独钉一遍。
+    {
+        assets::Skeleton d;
+        d.joints.resize(4);
+        const char* dn[4] = {"root", "hand", "hand", "hand_end"};
+        for (int i = 0; i < 4; ++i) {
+            d.joints[static_cast<size_t>(i)].name = dn[i];
+            d.joints[static_cast<size_t>(i)].parent = i - 1;
+            d.joints[static_cast<size_t>(i)].restLocal = glm::mat4(1.0f);
+            d.joints[static_cast<size_t>(i)].invBind = glm::mat4(1.0f);
+        }
+        d.topoOrder = {0, 1, 2, 3};
+
+        // 重复名取**数组里第一个**（1，不是 2）—— 旧线性实现的语义。
+        // 建表用的是 insert-if-absent，正是为了保住这一条。
+        report("find_dupe_first", static_cast<double>(d.findJoint("HAND")),
+               1.0, 0.0);
+        // 索引里只该有 3 个键（hand 重了一次）
+        report("find_index_entries",
+               static_cast<double>(d.nameIndexEntryCount()), 3.0, 0.0);
+        // 精确轮永远压过包含轮：`hand_end` 精确存在时不许退到 `hand`
+        report("find_exact_beats_sub",
+               static_cast<double>(d.findJoint("hand_end")), 3.0, 0.0);
+
+        // 就地改名 + 显式失效。
+        // ⚠ 这条是**唯一**的静默坑：`RigEdit::bake` 是从旧骨架拷出来的，
+        //   骨数没变时"长度变了才重建"的兜底不会触发 —— 不显式失效的话，
+        //   按新名字查不到、按旧名字反而查得到。
+        d.joints[1].name = "palm";
+        d.invalidateNameIndex();
+        report("find_rename_new", static_cast<double>(d.findJoint("palm")),
+               1.0, 0.0);
+        report("find_rename_old", static_cast<double>(d.findJoint("hand")),
+               2.0, 0.0);
+    }
+
+    // ================================================================
+    // 主姿势（Leader pose，2026-11-05）—— 抄 UE `LeaderPoseComponent`
+    // ================================================================
+    //
+    // 场景：身体 + 头发两份资产，同一套三根骨，头发**多一根** hair（挂在
+    // hand 下面）。身体转 45°，头发这边：
+    //   · 三根同名骨必须与身体逐位相同（证明映射对）；
+    //   · 多出来的 hair 必须跟着 hand 走（证明"按局部姿态搬运"对多出的骨
+    //     天然成立 —— 不是靠 UE 那段沿父链上溯拼相对变换的代码）；
+    //   · 头发自己的 clip 是空的：如果它偷偷采了自己的，位置会停在 (1,0,0)。
+    {
+        assets::AnimationClip swing;
+        swing.name = "swing";
+        swing.duration = 1.0f;
+        {
+            assets::AnimTrack rot;
+            rot.joint = 0;   // root
+            rot.path = assets::AnimTrack::Rotation;
+            rot.times = {0.0f, 1.0f};
+            const glm::quat q0(1.0f, 0.0f, 0.0f, 0.0f);
+            const glm::quat q1 = glm::angleAxis(glm::radians(90.0f),
+                                                glm::vec3(0.0f, 0.0f, 1.0f));
+            rot.values = {glm::vec4(q0.x, q0.y, q0.z, q0.w),
+                          glm::vec4(q1.x, q1.y, q1.z, q1.w)};
+            swing.tracks.push_back(rot);
+        }
+
+        auto bodySkel = std::make_shared<assets::Skeleton>(makeChainSkeleton());
+        bodySkel->clips.push_back(swing);
+
+        auto hairSkel = std::make_shared<assets::Skeleton>(makeChainSkeleton());
+        hairSkel->joints.push_back(assets::Skeleton::Joint{});
+        {
+            auto& hj = hairSkel->joints[3];
+            hj.name = "hair";
+            hj.parent = 2;   // 挂在 hand 下
+            hj.restLocal = glm::translate(glm::mat4(1.0f),
+                                          glm::vec3(0.0f, 0.0f, 0.2f));
+            hj.invBind = glm::mat4(1.0f);
+        }
+        hairSkel->topoOrder = {0, 1, 2, 3};
+
+        assets::Model bodyModel;
+        bodyModel.skeleton = bodySkel;
+        assets::Model hairModel;
+        hairModel.skeleton = hairSkel;
+
+        scene::Scene sc;
+        const ecs::Entity eBody = sc.createObject("body");
+        const ecs::Entity eHair = sc.createObject("hair");
+
+        {
+            ecs::SkinnedMeshComponent sb;
+            sb.model = &bodyModel;
+            sb.clipName = "swing";
+            sb.time = 0.5f;          // 45°
+            sc.world().add<ecs::SkinnedMeshComponent>(eBody, sb);
+        }
+        {
+            ecs::SkinnedMeshComponent sh;
+            sh.model = &hairModel;
+            sh.leaderName = "body";
+            // 故意留空：它自己的 clip 是"静止"，一旦被采到就会露馅
+            sh.clipName = "";
+            sc.world().add<ecs::SkinnedMeshComponent>(eHair, sh);
+        }
+
+        AnimatorSystem sys;
+        sys.tick(sc, 0.0f);   // dt=0：只按当前 time 重算，不推进时间
+
+        report("leader_applied", static_cast<double>(sys.lastLeaderApplied()),
+               1.0, 0.0);
+        report("leader_missing_count",
+               static_cast<double>(sys.lastLeaderMissing()), 0.0, 0.0);
+
+        const auto* mb = sc.world().get<ecs::SkinnedMeshComponent>(eBody);
+        const auto* mh = sc.world().get<ecs::SkinnedMeshComponent>(eHair);
+        bool have = mb && mh && mb->jointMatrices.size() == 3 &&
+                    mh->jointMatrices.size() == 4;
+        reportFlag("leader_matrix_size", have);
+
+        if (have) {
+            // ① 同名骨逐位相同（三根都断，不是只看末端）
+            double diff = 0.0;
+            for (int j = 0; j < 3; ++j) {
+                diff = std::max(diff, static_cast<double>(glm::length(
+                                          glm::vec3(mb->jointMatrices[j][3]) -
+                                          glm::vec3(mh->jointMatrices[j][3]))));
+            }
+            report("leader_shared_bones", diff, 0.0, 1e-6);
+
+            // ② 多出来的 hair 跟着 hand 走：hand 世界 (0.7071,0.7071,0)，
+            //    hair 再往 +Z 0.2 → (0.7071,0.7071,0.2)。
+            report("leader_extra_bone",
+                   static_cast<double>(glm::length(
+                       glm::vec3(mh->jointMatrices[3][3]) -
+                       glm::vec3(0.70710678f, 0.70710678f, 0.2f))),
+                   0.0, 1e-4);
+        }
+
+        // ③ leader 名字打错 → **回退成自己采样**（不是定在上一帧）。
+        //    hair 自己的 clip 是空的 → 静止姿势：hand 回到 (1,0,0)。
+        sc.world().get<ecs::SkinnedMeshComponent>(eHair)->leaderName = "nope";
+        sys.tick(sc, 0.0f);
+        report("leader_missing_fallback",
+               static_cast<double>(sys.lastLeaderMissing()), 1.0, 0.0);
+        const auto* mh2 = sc.world().get<ecs::SkinnedMeshComponent>(eHair);
+        if (mh2 && mh2->jointMatrices.size() == 4) {
+            report("leader_fallback_rest",
+                   static_cast<double>(glm::length(
+                       glm::vec3(mh2->jointMatrices[2][3]) -
+                       glm::vec3(1.0f, 0.0f, 0.0f))),
+                   0.0, 1e-4);
+        } else {
+            reportFlag("leader_fallback_rest", false);
+        }
+    }
+
     const int failures = g_fail;
     VK_LOG_INFO("ANIM-TOTAL pass=%d fail=%d", g_pass, g_fail);
     return failures;

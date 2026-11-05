@@ -2169,6 +2169,37 @@ void InspectorPanel::drawTabAnimation(ecs::Entity e) {
     }
     ImGui::Text(TR("joint base index: %d"), sk->jointBase);
 
+    // ---- 主姿势（Leader pose，2026-11-05）----
+    //
+    // 模块化角色的另一半：身体跑动画，头发/衣服/鞋填上身体的**实体名**，
+    // 每帧按骨名把姿势搬过去（见 `animation/LeaderPose.h`）。
+    //
+    // 填名字而不是下拉：引擎还没有"列出场景里所有蒙皮实体"的组件浏览器，
+    // 而现在和 `BoneAttachment` 的 hostName、动画 controller 的路径一样是
+    // 文本输入 —— 三处口径统一，用户学一次就够。
+    if (m_leaderBufFor != e) {
+        std::snprintf(m_leaderBuf, sizeof(m_leaderBuf), "%s",
+                      sk->leaderName.c_str());
+        m_leaderBufFor = e;
+    }
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint(
+        "##skinlineader", TRL("leader entity (empty = play own clips)"),
+        m_leaderBuf, sizeof(m_leaderBuf));
+    if (ImGui::IsItemDeactivatedAfterEdit() && m_ctx.isEditing()) {
+        const std::string newLeader = m_leaderBuf;
+        if (newLeader != sk->leaderName) {
+            m_ctx.structuralEdit("Set Leader Pose", [&]() {
+                sk->leaderName = newLeader;
+                // 映射缓存必须跟着失效：换了 leader，骨名映射可能完全不同，
+                // 而缓存键是两侧骨架指针 —— 同一对骨架换了配置也得重建。
+                sk->leaderBoneMap.clear();
+                sk->leaderMapFollower = nullptr;
+                sk->leaderMapLeader = nullptr;
+            });
+        }
+    }
+
     // ---- 权威字段（A1）----
     // 有 AnimatorComponent → 绑它的那四项（它是权威，AnimatorSystem 每帧
     // 把它们镜像回 sk）；没有 → 绑 sk 的那四项（A0 老路径，行为逐位不变）。

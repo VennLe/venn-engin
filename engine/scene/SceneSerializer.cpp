@@ -1626,6 +1626,9 @@ json skinnedToJson(const ecs::SkinnedMeshComponent& sk) {
     j["speed"] = sk.speed;
     j["playing"] = sk.playing;
     j["loop"] = sk.loop;
+    // 主姿势（2026-11-05）。空串**不写** —— 老场景的 JSON 逐字节不变，
+    // 而"没有 leader"是绝大多数情况，写一堆 `"leaderName":""` 只是噪音。
+    if (!sk.leaderName.empty()) j["leaderName"] = sk.leaderName;
     return j;
 }
 
@@ -1677,9 +1680,14 @@ bool skinnedFromJson(assets::AssetManager& am, const json& j,
     out.speed = j.value("speed", 1.0f);
     out.playing = j.value("playing", true);
     out.loop = j.value("loop", true);
+    // 主姿势（2026-11-05）。老场景没有这个键 → 空串 = 自己采样（老行为）。
+    out.leaderName = j.value("leaderName", std::string());
     // 派生数据：由 AnimatorSystem / Renderer 每帧重算，绝不落盘
     out.jointBase = -1;
     out.jointMatrices.clear();
+    out.leaderBoneMap.clear();
+    out.leaderMapFollower = nullptr;
+    out.leaderMapLeader = nullptr;
     return true;
 }
 

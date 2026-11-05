@@ -322,6 +322,23 @@ EXPECTED = [
     "stride_slope_zero",        # 平地必须正好 0（否则警告没人看）
     "stride_slope_cap",         # 坡角夹上限（80° 与 75° 同值）
     "stride_slope_rate_same",   # 坡度**不改变** rate（不二次投影）
+
+    # ---- 骨名索引（2026-11-05，抄 UE FReferenceSkeleton）----
+    # 语义保持：改哈希表之后这五条必须和线性扫描时代一模一样。
+    "find_dupe_first",          # 重名取数组里第一个（不是最后一个）
+    "find_index_entries",       # 索引键数 = 去重后的名字数
+    "find_exact_beats_sub",     # 精确轮压过包含轮（hand_end 不许退到 hand）
+    "find_rename_new",          # 就地改名 + 失效后：新名字立刻能查到
+    "find_rename_old",          # 旧名字不再指向原来那根骨
+
+    # ---- 主姿势 / 模块化角色（2026-11-05，抄 UE LeaderPoseComponent）----
+    "leader_applied",           # follower 真的按 leader 摆好了
+    "leader_missing_count",     # 正常场景 missing 必须是 0
+    "leader_matrix_size",       # follower 的矩阵按**自己**的骨数产出（含多出的骨）
+    "leader_shared_bones",      # 同名骨与 leader 逐位相同
+    "leader_extra_bone",        # leader 没有的骨（头发）跟着祖先走
+    "leader_missing_fallback",  # leader 名字打错 → 回退自己采样（计数）
+    "leader_fallback_rest",     # 回退后确实按自己的 clip 摆（不是定在上一帧）
 ]
 
 TEST_RE = re.compile(r"ANIM-TEST\s+(\S+)\s+actual=(\S+)\s+expected=(\S+)\s+"

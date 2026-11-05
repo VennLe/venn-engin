@@ -204,6 +204,29 @@ struct SkinnedMeshComponent {
     float fadeDur = 0.0f;
 
     bool fading() const { return fadeDur > 0.0f && !fadeFromClip.empty(); }
+
+    // ---------------- 主姿势（Leader pose，2026-11-05）----------------
+    //
+    // 模块化角色：身体 / 头发 / 衣服是**几个独立的 Model**，各带一份同名
+    // 骨架。只有身体真的跑动画，其余的都从这里指过去 —— 每帧按骨名把
+    // 身体的局部姿态搬过来（见 `animation/LeaderPose.h` 的一段长注释：
+    // 为什么搬局部而不是 UE 的 component-space，两者为什么等价）。
+    //
+    // 空 = 自己采样（老行为，逐位不变）。写的是**实体名**而不是实体 id：
+    // id 会随删除/加载重排，名字在场景 JSON 里才是稳定的（与
+    // `BoneAttachmentComponent::hostName` 同一条理由）。
+    //
+    // ⚠ 名字解析失败 / leader 没有骨架 → **回退成自己采样**，并计入
+    //   `ANIM-LEADER` 的 missing 字段。不回退的话，改名一次整撮头发就定在
+    //   上一帧的姿势上，而日志里一条错都没有。
+    std::string leaderName;
+
+    // 派生缓存：joint → leader 的 joint（-1 = leader 没有同名骨）。
+    // 缓存键是**两侧骨架的地址** —— 换资产 / 重新导入（地址变了）就重建。
+    // 不进存档：它是名字映射的产物，读档后由 AnimatorSystem 第一次用到时建。
+    std::vector<int> leaderBoneMap;
+    const assets::Skeleton* leaderMapFollower = nullptr;
+    const assets::Skeleton* leaderMapLeader = nullptr;
 };
 
 // ---------------- 表情 / 形变滑条（§15）----------------

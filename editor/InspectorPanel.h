@@ -348,6 +348,10 @@ private:
     // clipName 是 std::string，InputText 不能直接绑它，必须有个 char 缓冲。
     ecs::Entity m_skinnedBufFor{};
     char m_skinnedBuf[128] = {0};
+    // 主姿势（leader entity 名）的编辑缓冲。与上面同一个套路：按实体
+    // 缓存，切选中时重新灌入，避免"在 A 上打了一半的字跳到 B"。
+    ecs::Entity m_leaderBufFor{};
+    char m_leaderBuf[128] = {0};
 
     // Animator 的两个路径输入缓冲（A1）：`controllerPath` / `defaultClip`
     // 同样是 std::string。分两个 For 而不是共用一个 —— 同一个实体上两个

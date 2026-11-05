@@ -509,6 +509,131 @@ void AnimatorSystem::cleanupStates(const std::vector<uint32_t>& seen) {
     }
 }
 
+LeaderPoseStats AnimatorSystem::applyLeaderPoses(scene::Scene& scene,
+                                                 int followersPlanned,
+                                                 int preMissed,
+                                                 const std::string& preProblem) {
+    LeaderPoseStats st;
+    st.followers = followersPlanned;
+    // 预扫描就没解析出来的（名字打错 / 目标不是蒙皮实体）在主遍历里按老行为
+    // 自己采样了 —— 它们**也是**回退，必须计进 missing，否则
+    // `followers=1 applied=0 missing=0` 读起来像"什么都没发生"。
+    st.missingLeader = preMissed;
+    st.firstProblem = preProblem;
+    if (m_leaderOf.empty()) return st;
+
+    ecs::World& w = scene.world();
+
+    // 待解决队列。**链式**模块化角色（头发挂在帽子上那种嵌套）需要多轮：
+    // 第一轮只有"leader 本身是普通蒙皮"的能解开，解开的 follower 又可能
+    // 成为别人的 leader。上限 4 轮 —— 真有 5 层嵌套是资产结构出了问题，
+    // 与其在这里转圈，不如让它回退自采样并把原因打出来。
+    std::vector<uint32_t> pending;
+    pending.reserve(m_leaderOf.size());
+    for (const auto& kv : m_leaderOf) pending.push_back(kv.first);
+
+    // 确定解决不了的（实体被删 / 骨架没加载）—— 不进下一轮，直接进回退。
+    std::vector<uint32_t> unresolved;
+
+    for (int round = 0; round < 4 && !pending.empty(); ++round) {
+        std::vector<uint32_t> next;
+        next.reserve(pending.size());
+        bool progress = false;
+
+        for (uint32_t fid : pending) {
+            const auto lit = m_leaderOf.find(fid);
+            if (lit == m_leaderOf.end()) continue;
+            const uint32_t lid = lit->second;
+
+            const ecs::Entity fe = w.handle(fid);
+            const ecs::Entity le = w.handle(lid);
+            auto* fsk = w.get<ecs::SkinnedMeshComponent>(fe);
+            auto* lsk = w.get<ecs::SkinnedMeshComponent>(le);
+            if (!fsk || !lsk || !fsk->model || !fsk->model->skeleton ||
+                !lsk->model || !lsk->model->skeleton) {
+                unresolved.push_back(fid);
+                continue;
+            }
+
+            const auto pit = m_leaderPoses.find(lid);
+            if (pit == m_leaderPoses.end()) {
+                // leader 这一帧还没产出姿势（它自己也是 follower）→ 下一轮。
+                next.push_back(fid);
+                continue;
+            }
+
+            const assets::Skeleton& fSkel = *fsk->model->skeleton;
+            const assets::Skeleton& lSkel = *lsk->model->skeleton;
+
+            // 映射缓存：两侧骨架的**地址**变了才重建（换资产 / 重新导入）。
+            if (fsk->leaderMapFollower != &fSkel || fsk->leaderMapLeader != &lSkel) {
+                int miss = 0;
+                buildLeaderBoneMap(fSkel, lSkel, fsk->leaderBoneMap, &miss);
+                fsk->leaderMapFollower = &fSkel;
+                fsk->leaderMapLeader = &lSkel;
+                if (miss > 0) {
+                    // 这一条**不是错误**：头发多几根发骨、衣服多几根裙摆骨
+                    // 是正常的。但"全部对不上"（miss == follower 骨数）说明
+                    // 两份资产根本不是同一套 rig，那才是错的 —— 两种都报出来，
+                    // 让人一眼能分辨。
+                    VK_LOG_INFO("ANIM-LEADER-MAP bone=[%s] joints=%d unmatched=%d "
+                                "%s",
+                                fsk->leaderName.c_str(), fSkel.jointCount(), miss,
+                                (miss >= fSkel.jointCount())
+                                    ? "→ **全部对不上**，两份资产不是同一套 rig"
+                                    : "→ 这些骨按自己的静止姿势摆");
+                }
+            }
+
+            // ⚠ `pit->second` 是 `m_leaderPoses` 里的引用，下面会往同一个
+            //   容器里插元素（链式）→ 必须**先用完再插**。这里先 remap，
+            //   之后才可能 rehash。
+            remapPose(fSkel, pit->second, fsk->leaderBoneMap, m_pose);
+            poseToJoints(fSkel, m_pose, fsk->jointMatrices);
+
+            int missNow = 0;
+            for (int v : fsk->leaderBoneMap)
+                if (v < 0) ++missNow;
+            st.missingBones += missNow;
+
+            if (m_leadersWanted.find(fid) != m_leadersWanted.end()) {
+                m_leaderPoses[fid] = m_pose;   // 链式：留给下一轮
+            }
+            ++st.applied;
+            progress = true;
+        }
+
+        pending.swap(next);
+        if (!progress) break;
+    }
+
+    unresolved.insert(unresolved.end(), pending.begin(), pending.end());
+
+    // ---- 回退：leader 不可用 → 按自己的 clip 采样 ----
+    //
+    // 这里**只做采样**（不跑 NLA / 分层 / IK / 弹簧）：那几样都要读
+    // `AnimatorComponent` 与运行时状态，而主遍历已经跳过了这个实体，
+    // 在这里再补一套等于把主遍历复制一遍。回退的目的是"别定在上一帧"，
+    // 不是"功能完整" —— 日志会说明它在回退。
+    for (uint32_t fid : unresolved) {
+        const ecs::Entity fe = w.handle(fid);
+        auto* fsk = w.get<ecs::SkinnedMeshComponent>(fe);
+        if (!fsk || !fsk->model || !fsk->model->skeleton) continue;
+        const assets::Skeleton& fSkel = *fsk->model->skeleton;
+        if (fSkel.jointCount() <= 0) continue;
+
+        const assets::AnimationClip* clip =
+            fsk->clipName.empty() ? nullptr : fSkel.findClip(fsk->clipName);
+        samplePose(fSkel, clip, fsk->time, m_pose);
+        poseToJoints(fSkel, m_pose, fsk->jointMatrices);
+
+        ++st.missingLeader;
+        if (st.firstProblem.empty())
+            st.firstProblem = "no-leader:" + fsk->leaderName;
+    }
+    return st;
+}
+
 int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     ++m_frames;
 
@@ -604,6 +729,46 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
 
     const bool advance = dt > 0.0f;
 
+    // ---- 主姿势（Leader pose）预扫描 ----
+    //
+    // 必须在主遍历**之前**跑完，理由有两条，都不是洁癖：
+    //   ① follower 要在主遍历里就"让位"（跳过整套采样/分层/IK）。不预扫描
+    //      的话只能在遍历中现查 —— 而"leader 排在这个 follower 后面"时，
+    //      同一帧里 leader 的姿势还没算出来；
+    //   ② ECS 的遍历顺序不是用户能控制的。把顺序问题变成"两趟"是唯一
+    //      不依赖运气解法。
+    //
+    // 解析失败的 follower **不进** `m_leaderOf` → 它留在主遍历里按老行为
+    // 自己采样（改个名字就整撮头发定住不动，比不生效难查得多）。
+    m_leaderOf.clear();
+    m_leadersWanted.clear();
+    m_leaderPoses.clear();
+    int followersPlanned = 0;
+    int preMissed = 0;              // 预扫描阶段就解析不出来的（会计进 missing）
+    std::string preProblem;
+    w.each<ecs::SkinnedMeshComponent>(
+        [&](ecs::Entity e, ecs::SkinnedMeshComponent& sk) {
+            if (sk.leaderName.empty()) return;
+            ++followersPlanned;
+            // 自指 = 配置错误，按"没有 leader"处理（不当成环）。
+            const ecs::Entity led = scene.find(sk.leaderName);
+            if (!led.valid() || led.id == e.id) {
+                ++preMissed;
+                if (preProblem.empty())
+                    preProblem = "no-leader:" + sk.leaderName;
+                return;
+            }
+            const auto* lsk = w.get<ecs::SkinnedMeshComponent>(led);
+            if (!lsk || !lsk->model || !lsk->model->skeleton) {
+                ++preMissed;
+                if (preProblem.empty())
+                    preProblem = "leader-not-skinned:" + sk.leaderName;
+                return;
+            }
+            m_leaderOf[e.id] = led.id;
+            m_leadersWanted.insert(led.id);
+        });
+
     w.each<ecs::SkinnedMeshComponent>(
         [&](ecs::Entity ent, ecs::SkinnedMeshComponent& sk) {
             ecs::AnimatorComponent* an = w.get<ecs::AnimatorComponent>(ent);
@@ -622,6 +787,15 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
             const int n = skel.jointCount();
             if (n <= 0) return;
             ++count;
+
+            // ---- 主姿势的 follower：这一帧的整套采样都跳过 ----
+            //
+            // 它的姿势源是 leader，自己采样出来的东西**一定会被覆盖** ——
+            // 白算一遍采样 + NLA + 分层 + IK + 弹簧，而且弹簧还会把质点
+            // 状态推进两次（第一次是假的），下次真用的时候已经漂了。
+            // 所以不是"算完再覆盖"，是**不开始**。
+            // 缺席的回退（leader 中途被删 / 改名）在 `applyLeaderPoses` 里。
+            if (m_leaderOf.find(ent.id) != m_leaderOf.end()) return;
 
             // ---- 表演层后处理（L2 LookAt / L1 IK / L4 弹簧骨）----
             // 三个组件都是**可选**的：没挂 → applyPerformance 直接 return，
@@ -905,6 +1079,18 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
             }
 
             poseToJoints(skel, *base, sk.jointMatrices);
+
+            // ---- 6.9) 给 follower 留一份局部姿态（主姿势）----
+            //
+            // 留**局部**而不是 jointMatrices：jointMatrices 里已经乘过
+            // 本资产的 `invMeshNode` / `invBind`，直接抄给另一份资产的话，
+            // 两份绑定姿势不同时整只角色会歪（而骨骼名字、层级完全一样，
+            // 从日志上看不出任何异常）。局部姿态是**与资产无关**的量。
+            //
+            // ⚠ 只有真被 follower 指到的实体才留副本：老场景零开销。
+            if (m_leadersWanted.find(ent.id) != m_leadersWanted.end()) {
+                m_leaderPoses[ent.id] = *base;
+            }
         });
 
     m_lastEntities = count;
@@ -915,6 +1101,11 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     m_lastStrideCurve = strideCurved;
     // 必须在遍历**之后**：seen 是这一帧真正处理过的实体。
     cleanupStates(seen);
+
+    // ---- 主姿势：把 leader 的姿态搬到 follower 上 ----
+    // 位置是硬约束：**主遍历之后、骨骼挂点之前**（见头文件里那条注释）。
+    m_lastLeader = applyLeaderPoses(scene, followersPlanned, preMissed,
+                                    preProblem);
 
     // ---- 骨骼挂点（第八刀）----
     //
@@ -991,6 +1182,21 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
         }
         if (m_lastAttach.placed > 0) {
             VK_LOG_INFO("ANIM-ATTACH placed=%d", m_lastAttach.placed);
+        }
+        // 主姿势：只在有人配了 leaderName 时打（老场景零噪音）。
+        // 三个数的关系就是判据，**恒等式是 followers = applied + missing**：
+        //   followers = 配了的实体数
+        //   applied   = 真的按 leader 摆好的
+        //   missing   = 回退成自己采样的（名字打错 / 目标不是蒙皮 / 链断了）
+        // 出现 `followers > applied + missing` 说明有实体在预扫描之后才消失
+        // （同一帧里删实体），这是允许的，但不该出现在稳态。
+        if (m_lastLeader.followers > 0) {
+            VK_LOG_INFO("ANIM-LEADER followers=%d applied=%d missing=%d "
+                        "unmatched_bones=%d first=[%s]",
+                        m_lastLeader.followers, m_lastLeader.applied,
+                        m_lastLeader.missingLeader,
+                        m_lastLeader.missingBones,
+                        m_lastLeader.firstProblem.c_str());
         }
         // 状态机：只在真有人配了控制器时打。`trans` 是**本帧**采纳的转移数，
         // 60 帧一条 → 稳态下几乎恒为 0（那是正常的，不是没生效）：

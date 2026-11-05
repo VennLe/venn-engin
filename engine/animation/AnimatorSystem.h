@@ -48,6 +48,7 @@
 #include "animation/AnimEvent.h"
 #include "animation/BoneAttachment.h"
 #include "animation/BoneMask.h"
+#include "animation/LeaderPose.h"
 #include "animation/LookAt.h"
 #include "animation/Pose.h"
 #include "animation/SpringBone.h"
@@ -61,6 +62,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace animation {
@@ -85,6 +87,15 @@ public:
     // 本帧摆好的骨骼挂点数 / 解析失败的（宿主或骨名对不上）
     int lastAttachCount() const { return m_lastAttach.placed; }
     int lastAttachUnresolved() const { return m_lastAttach.unresolved; }
+
+    // ---- 主姿势（Leader pose，2026-11-05）----
+    // 本帧配了 leaderName 的实体数 / 其中真的按 leader 摆好的 /
+    // 找不到 leader（回退成自己采样）的。
+    // `followers - applied - missing` 只会是"骨架还没加载完"，稳态下必须是 0。
+    int lastLeaderFollowers() const { return m_lastLeader.followers; }
+    int lastLeaderApplied() const { return m_lastLeader.applied; }
+    int lastLeaderMissing() const { return m_lastLeader.missingLeader; }
+    int lastLeaderMissingBones() const { return m_lastLeader.missingBones; }
     // 本帧真的由状态机驱动的实体数（A2b）
     int lastControllerCount() const { return m_lastControllers; }
     // 本帧状态机采纳的转移总数
@@ -274,6 +285,30 @@ private:
     const SpringRig& rigFor(const assets::Skeleton& skel,
                             const std::vector<std::string>& prefixes);
     std::map<RigKey, SpringRig> m_rigCache;
+
+    // ---- 主姿势（Leader pose，2026-11-05）----
+    //
+    // 把本帧 leader 产出的**局部姿态**按骨名搬到 follower 上，再算 follower
+    // 自己的关节矩阵（见 `animation/LeaderPose.h` 的完整说明）。
+    //
+    // ⚠ 位置是硬约束：**在主遍历之后、骨骼挂点之前**。
+    //   · 在遍历之后：follower 的姿势源是 leader **这一帧**刚算出来的结果，
+    //     不能反过来（那要么差一帧，要么依赖实体顺序）；
+    //   · 在挂点之前：挂点读的是 `jointMatrices`，晚一步就是"帽子跟着
+    //     上一帧的头走"。
+    LeaderPoseStats applyLeaderPoses(scene::Scene& scene, int followersPlanned,
+                                     int preMissed,
+                                     const std::string& preProblem);
+
+    // follower 实体 id → leader 实体 id（每帧由预扫描重建）。
+    std::unordered_map<uint32_t, uint32_t> m_leaderOf;
+    // 本帧**被指为 leader** 的实体。只有它们需要在算完姿势后留一份副本
+    // —— 没有 follower 指过来时零拷贝，老场景的开销严格为 0。
+    std::unordered_set<uint32_t> m_leadersWanted;
+    // 本帧主遍历留下的姿态副本。**只在内存里**：姿势是"这一帧正在发生的
+    // 事"，读档时不该恢复。
+    std::unordered_map<uint32_t, Pose> m_leaderPoses;
+    LeaderPoseStats m_lastLeader;
 
     // 每角色运行时状态。按 `Entity::id` 索引（**只在内存里**）：
     // 质点位置与"上一帧施加的偏转"都是"这一帧正在发生的事"，不进存档。

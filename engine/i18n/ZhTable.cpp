@@ -2027,6 +2027,8 @@ const Entry kZh[] = {
     {"clip: %s  (%.3f s)", "片段：%s（%.3f 秒）"},
     {"clip: '%s' NOT FOUND in this skeleton", "片段：'%s' 在这具骨架里找不到"},
     {"clip name (empty = rest pose)", "片段名（留空 = 静止姿势）"},
+    {"leader entity (empty = play own clips)",
+     "主姿势实体（留空 = 播自己的片段）"},
     {"viewport: %.0f x %.0f px", "视口：%.0f × %.0f 像素"},
     {"%.0f px", "%.0f 像素"},
     {"pos    %.2f %.2f %.2f", "位置   %.2f %.2f %.2f"},
