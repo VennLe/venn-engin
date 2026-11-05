@@ -363,6 +363,10 @@ void RigEdit::bake(const assets::Skeleton& src, assets::Skeleton& out) const {
     // nodeMap 是**导入期**的产物（glTF node 下标 → joint 下标）。加/删骨之后
     // 下标已经不对应了，留着只会让某个后续按 node 找 joint 的代码静默错位。
     r.nodeMap.clear();
+    // 骨名索引同理，而且更隐蔽：`r` 是从 `base` 拷来的，索引状态也一起
+    // 拷了过来 —— 骨数没变（改名 / 换父）时"长度变了才重建"那条兜底**不会
+    // 触发**，于是按新名字查不到、按旧名字反而查得到。必须显式失效。
+    r.invalidateNameIndex();
     out = std::move(r);
 
     VK_LOG_INFO("RIG-BAKE bones=%d copied=%d recomputed=%d", n, copied, recomputed);

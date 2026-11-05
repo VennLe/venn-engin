@@ -24,6 +24,7 @@
 
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace assets {
@@ -141,6 +142,18 @@ struct Skeleton {
 
     std::vector<AnimationClip> clips;
 
+    // ---- 骨名索引的存储（见 findJoint 上方那段注释）----
+    //
+    // `mutable` = 逻辑 const：完全由 `joints` 决定，懒建一次之后只读。
+    // 分散在三个容器里而不是一个 map<string, idx>，是为了让**包含匹配**
+    // 那一轮也不必现造小写串 —— 那一轮本来就要按数组序扫。
+    // 索引本身不参与序列化（骨架是从资产重建的，重建即重建索引）。
+    mutable std::vector<std::string> m_lowerNames;    // 小写名，下标 = joint
+    mutable std::unordered_map<std::string, int> m_exactByName;  // 原样名 → joint
+    mutable std::unordered_map<std::string, int> m_lowerByName;  // 小写名 → joint
+    mutable std::size_t m_nameIndexSize = static_cast<std::size_t>(-1);
+    mutable bool m_nameIndexReady = false;
+
     int jointCount() const { return static_cast<int>(joints.size()); }
     // 拿一根骨的**可写**引用，即使骨架本身是 const。
     //
@@ -181,6 +194,37 @@ struct Skeleton {
     // 而弹簧骨那里"空前缀"的语义是"用默认前缀表"，不是"整具骨架"）。
     void findJointsWithPrefix(const std::string& prefix,
                               std::vector<int>& out) const;
+
+    // ---- 骨名索引（2026-11-05，抄 UE 的 FReferenceSkeleton）----
+    //
+    // 抄的是这个思路：UE 的 `FReferenceSkeleton` 在**建骨架时**建一张
+    // `BoneNameToIndexMap`，之后 `FindBoneIndex(name)` 是一次哈希查找。
+    // 我们原来是每次调用都线性扫一遍、而且**每根骨都复制一个小写字符串**
+    // （`asciiLower(joints[i].name)`）—— 100 根骨 × 每帧十几次调用
+    // = 每帧上千次堆分配，纯属自己给自己制造碎片。
+    //
+    // 语义**逐位保持**（这条是硬要求，`find_joint_*` 那组自检盯着）：
+    //   · 精确轮先走、包含轮后走；
+    //   · **重复名取数组里第一个**（建表时 insert-if-absent 就是为这个）；
+    //   · 大小写不敏感只影响比较，不影响返回。
+    //
+    // ⚠ 失效口径：索引由 `joints` 决定，所以
+    //     · `joints` 的**长度**变了 → 自动重建（`m_nameIndexSize` 兜底）；
+    //     · 长度没变但**名字改了**（`RigEdit::bake` 之后）→ 必须显式
+    //       `invalidateNameIndex()`。两条都要有：前者防"loader 换了资产"，
+    //       后者防"同一具骨架改骨名"——后者只靠长度是查不出来的，
+    //       而症状是"改名之后按新名字找不到、旧名字还能找到"。
+    void invalidateNameIndex() const {
+        m_nameIndexReady = false;
+        m_nameIndexSize = static_cast<std::size_t>(-1);
+    }
+    bool nameIndexReady() const { return m_nameIndexReady; }
+    // 自检用：索引里记了多少个不同的名字（重复名会少几个）。
+    int nameIndexEntryCount() const;
+
+    // 内部用：懒建。`joints` 长度变了就重建（见上面失效口径）。
+    void ensureNameIndex() const;
+    void buildNameIndex() const;
 
     // 采样出 jointCount() 个 joint 矩阵（invMeshNode * world * invBind）。
     // clip 传 nullptr → 静止姿势（rest pose）。out 会被 resize 到关节数。

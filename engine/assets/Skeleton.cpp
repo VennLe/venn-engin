@@ -46,6 +46,50 @@ bool isEndTip(const std::string& lowered) {
 
 } // namespace
 
+// ============================================================
+// 骨名索引 —— 抄 UE `FReferenceSkeleton::BoneNameToIndexMap` 的建表思路
+//
+// 旧实现（2026-11-05 之前）每次 `findJoint` 都：
+//     for 每根骨 { 复制一份小写串; 比较 }
+// 100 根骨 × 每帧十几次调用 = 每帧上千次 std::string 构造 + 释放。
+// 这不是"理论上慢"，而是把一块**常量数据**反复算成了临时对象。
+//
+// 现在：第一次调用建一次表，之后精确轮是 O(1) 哈希、包含轮只读现成的小写
+// 数组（仍然是 O(n) 扫描 —— 那一轮本质上就是扫描，没有更快的正确做法）。
+// ============================================================
+void Skeleton::buildNameIndex() const {
+    const int n = jointCount();
+    m_lowerNames.resize(static_cast<size_t>(n));
+    m_exactByName.clear();
+    m_lowerByName.clear();
+    // 重复名很少见，按骨数 reserve 就够（多了会 rehash，不如一次留够）。
+    m_exactByName.reserve(static_cast<size_t>(n) * 2);
+    m_lowerByName.reserve(static_cast<size_t>(n) * 2);
+
+    for (int i = 0; i < n; ++i) {
+        const std::string& nm = joints[static_cast<size_t>(i)].name;
+        m_lowerNames[static_cast<size_t>(i)] = asciiLower(nm);
+        // ⚠ `emplace` 在键已存在时**不覆盖** —— 这正是旧线性实现"重复名
+        //   返回数组里第一个"的语义。改成 `insert_or_assign` 就会变成
+        //   "返回最后一个"，而 `head` / `head_01` 这类重名在合并过的骨架里
+        //   是真实存在的，症状是"挂点挂到了另一根骨上"。
+        m_exactByName.emplace(nm, i);
+        m_lowerByName.emplace(m_lowerNames[static_cast<size_t>(i)], i);
+    }
+    m_nameIndexSize = joints.size();
+    m_nameIndexReady = true;
+}
+
+void Skeleton::ensureNameIndex() const {
+    if (m_nameIndexReady && m_nameIndexSize == joints.size()) return;
+    buildNameIndex();
+}
+
+int Skeleton::nameIndexEntryCount() const {
+    ensureNameIndex();
+    return static_cast<int>(m_lowerByName.size());
+}
+
 int Skeleton::findJoint(const std::string& name, unsigned flags) const {
     const int n = jointCount();
     if (n <= 0) return -1;
@@ -58,7 +102,7 @@ int Skeleton::findJoint(const std::string& name, unsigned flags) const {
     const bool sub = (flags & kJointMatchSubstring) != 0u;
     const bool skipTips = (flags & kJointMatchSkipEndTips) != 0u;
 
-    const std::string want = ci ? asciiLower(name) : name;
+    ensureNameIndex();
 
     // ---- 第一轮：精确 ----
     // 精确优先是硬要求：`hand_l` 用包含匹配会先撞上 `hand_l_end`（如果它在
@@ -67,17 +111,20 @@ int Skeleton::findJoint(const std::string& name, unsigned flags) const {
     // ⚠ 这一轮**不过滤** end/tip：显式写出了骨骼全名的人要的就是那一根。
     //   过滤掉等于"精确匹配返回 -1"，比匹配错更难查 —— 调用方会以为
     //   资产里没有这根骨。
-    for (int i = 0; i < n; ++i) {
-        const std::string& nm = joints[static_cast<size_t>(i)].name;
-        const std::string cur = ci ? asciiLower(nm) : nm;
-        if (cur == want) return i;
+    if (ci) {
+        const auto it = m_lowerByName.find(asciiLower(name));
+        if (it != m_lowerByName.end()) return it->second;
+    } else {
+        const auto it = m_exactByName.find(name);
+        if (it != m_exactByName.end()) return it->second;
     }
 
     // ---- 第二轮：包含（这一轮才跳末端辅助骨）----
     if (!sub) return -1;
+    const std::string want = ci ? asciiLower(name) : name;
     for (int i = 0; i < n; ++i) {
-        const std::string& nm = joints[static_cast<size_t>(i)].name;
-        const std::string cur = ci ? asciiLower(nm) : nm;
+        const std::string& cur = ci ? m_lowerNames[static_cast<size_t>(i)]
+                                    : joints[static_cast<size_t>(i)].name;
         if (skipTips && isEndTip(cur)) continue;
         if (cur.find(want) != std::string::npos) return i;
     }
@@ -87,10 +134,11 @@ int Skeleton::findJoint(const std::string& name, unsigned flags) const {
 void Skeleton::findJointsWithPrefix(const std::string& prefix,
                                     std::vector<int>& out) const {
     if (prefix.empty()) return;
+    ensureNameIndex();
     const int n = jointCount();
     const std::string want = asciiLower(prefix);
     for (int i = 0; i < n; ++i)
-        if (startsWith(asciiLower(joints[static_cast<size_t>(i)].name), want))
+        if (startsWith(m_lowerNames[static_cast<size_t>(i)], want))
             out.push_back(i);
 }
 
