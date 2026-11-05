@@ -415,10 +415,38 @@ void PlayerController::update(scene::Scene& scene, physics::PhysicsWorld* world,
                                glm::vec2(m_lastCenter.x, m_lastCenter.y));
     m_lastCenter = m_state.position;
 
-    // 平滑转身：直接瞬转看着像机器人
-    if (dl > 0.05f) {
+    // ---------------- 朝向：UE 的两条互斥口径 ----------------
+    //
+    // 2026-11-06：这一段以前是"有输入就朝移动方向转"，两种视角共用。
+    // 那不是 UE 的做法 —— UE5 的两个模板各用一条：
+    //   · ThirdPerson `bOrientRotationToMovement = true`  + RotationRate
+    //   · FirstPerson  `bOrientRotationToMovement = false` + bUseControllerRotationYaw
+    //
+    // 第一人称必须走第二条：眼睛挂在头骨上，身体按移动方向转 = 侧步时
+    // 头骨绕中线横移，画面跟着平移一下（"镜头晃"的真实来源之一，与
+    // 阻尼无关）。第三人称走第一条：身体朝移动方向，镜头独立绕圈。
+    const ecs::PlayerComponent* pcTurn = w.get<ecs::PlayerComponent>(m_entity);
+    const bool orientToMove = !pcTurn || pcTurn->orientToMovement;
+    if (!orientToMove) {
+        // 身体锁在控制器的 yaw 上。**不做插值**：转得比镜头慢就等于
+        // 眼位拖在镜头后面，抖得比硬跟更厉害。
+        m_bodyYaw = m_yaw;
+        tc->rotation.z = m_bodyYaw;
+    } else if (dl > 0.05f) {
         const float targetYaw = std::atan2(dir.y, dir.x);
-        const float t = 1.0f - std::exp(-std::max(cc->turnSpeed, 0.0f) * dt);
+        const float rateDeg = pcTurn ? pcTurn->rotationRateDeg : 0.0f;
+        float t;
+        if (rateDeg > 0.0f) {
+            // UE 的 `RotationRate`：**匀速**转（度/秒），不是指数插值。
+            // 转过的角度被本帧的预算钳住，所以帧率无关。
+            const float budget = glm::radians(rateDeg) * dt;
+            const float diff = wrapPi(targetYaw - m_bodyYaw);
+            const float mag = std::fabs(diff);
+            t = (mag <= budget || mag < 1.0e-6f) ? 1.0f : budget / mag;
+        } else {
+            // 0 = 退回旧的指数插值（老场景逐位不变）。
+            t = 1.0f - std::exp(-std::max(cc->turnSpeed, 0.0f) * dt);
+        }
         m_bodyYaw = lerpAngle(m_bodyYaw, targetYaw, t);
         tc->rotation.z = m_bodyYaw;
     }

@@ -671,6 +671,15 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     int mismatched = 0;
     int wrapped = 0;
     int fading = 0;   // 本帧处于过渡中的实体数（ANIM-FADE 用）
+    // 本帧处于**混合空间**中的实体数（2026-11-06）。与 `fading` 分开计数：
+    // 两者是不同机制，"混着"和"在过渡"不该共用一个数（排查时第一个问题
+    // 就是"现在到底是哪一条在生效"）。
+    int blending = 0;
+    // `ANIM-BLEND begin` 只在**开始**混合那一帧打一条（不是每帧一条 ——
+    // 走路时混合空间一直在跑，每帧一次 I/O 会把帧节奏拖出尖刺）。
+    // 判据是"上一帧有没有在混"，所以先按上一帧的状态上膛，再复位计数。
+    m_blendLogArmed = !m_blendedThisTick;
+    m_blendedThisTick = false;
     int strideCurved = 0;   // 本帧按相位曲线推进了播放头的实体数（A4b）
     int layersConfigured = 0;   // 配了附加层的实体数（B1）
     int layersApplied = 0;      // 其中真的混进去至少一层的
@@ -943,6 +952,33 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
                 }
             }
 
+            // ---- 3.4) 从属段的播放头（混合空间，2026-11-06）----
+            //
+            // 与主段**用同一个 `speed`**推进：两段是同一个角色的两条腿，
+            // 播快播慢必须一致，否则相位会漂（`blendSyncPhase` 每帧还会
+            // 再按相位对齐一次，但那只在换主导段时兜底 —— 常态靠这里）。
+            //
+            // 绕圈语义固定为"绕"：参与混合的段一定是循环步态。真要不循环
+            // 的一段，调用方应当走 fade（一次性过渡），不该进混合。
+            //
+            // ⚠ 放在推进主段**之后**、采样**之前**，与 `time` 同一段时序。
+            if (sk.blending()) {
+                const assets::AnimationClip* bc = skel.findClip(sk.blendClip);
+                const float bdur = bc ? bc->duration : 0.0f;
+                // 上层（相位同步）这一帧写过 → 别再加一次 dt：加了就是从属
+                // 段比主段快一帧，混出来的两条腿永远差半步。
+                if (!sk.blendTimeLocked) {
+                    if (advance && playing) sk.blendTime += dt * speed;
+                    if (bdur > 0.0f) {
+                        if (sk.blendTime >= bdur || sk.blendTime < 0.0f)
+                            sk.blendTime = wrapTime(sk.blendTime, bdur);
+                    } else if (sk.blendTime < 0.0f) {
+                        sk.blendTime = 0.0f;
+                    }
+                }
+                sk.blendTimeLocked = false;
+            }
+
             // ---- 3.5) 底座 clip 的事件（B2）----
             //
             // 位置在"推进时间之后、采样之前"。采样要在事件**之后**也无所谓
@@ -994,7 +1030,49 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
             // 矩阵"在两个分支里各写一遍，加第三件事（附加层）时必然只改
             // 到其中一条 —— 症状是"只有过渡的时候层不生效"。
             Pose* base = &m_pose;
-            if (sk.fading()) {
+
+            // ---- 5.0) 混合空间（BlendSpace，2026-11-06）----
+            //
+            // 优先于 fade（理由见 `SkinnedMeshComponent::blendClip` 的注释：
+            // 同时做等于三段混合，不值得）。这一支是 `BS_Locomotion` 的
+            // 落地处：权重来自速度，不是时间。
+            //
+            // ⚠ 与 fade 一样，混合发生在**局部 TRS**（`blendPose` 内部走
+            //   slerp + lerp），不是对 mat4 插值 —— 后者会插出缩放与剪切，
+            //   肉眼是"角色混合时变瘦"。
+            if (sk.blending()) {
+                const assets::AnimationClip* other = skel.findClip(sk.blendClip);
+                if (other && other != clip) {
+                    // 只在"从纯单段变成两段"的那一帧打一条，且两次之间至少
+                    // 隔 30 帧（0.5 s）。速度在混合区边缘抖动时开关会每几帧
+                    // 翻一次，不节流的话日志本身会把帧拖出尖刺（实测尖刺
+                    // 间隔 = 日志间隔）。
+                    if (m_blendLogArmed &&
+                        (m_frames - m_lastBlendLogFrame) >= 30) {
+                        VK_LOG_INFO("ANIM-BLEND begin main=%s other=%s w=%.2f "
+                                    "speed=%.2f",
+                                    sk.clipName.c_str(), sk.blendClip.c_str(),
+                                    static_cast<double>(sk.blendWeight),
+                                    static_cast<double>(speed));
+                        m_lastBlendLogFrame = m_frames;
+                        m_blendLogArmed = false;
+                    }
+                    m_blendedThisTick = true;
+                    samplePose(skel, clip, time, m_pose);
+                    samplePose(skel, other, sk.blendTime, m_poseFrom);
+                    // w=1 → 纯主段（`blendPose(a,b,w)` 的 w 是朝 b 的权重，
+                    // 这里 b = 主段）。
+                    blendPose(m_poseFrom, m_pose, sk.blendWeight, m_poseMix);
+                    base = &m_poseMix;
+                    ++blending;
+                } else {
+                    // 从属段被删了 / 与主段同名 → 退回单段，并且把权重
+                    // 复位，免得下一帧再进这条分支白采一次。
+                    sk.blendClip.clear();
+                    sk.blendWeight = 1.0f;
+                    samplePose(skel, clip, time, m_pose);
+                }
+            } else if (sk.fading()) {
                 // 过渡的**第一帧**（fadeT 还是 0）打一条锚点。
                 // ⚠ 不要靠 `ANIM-TICK ... fading=` 来断言"真的在混"：
                 //   ANIM-TICK 每 60 帧才打一行，而一次过渡只有 0.2 s（12 帧）
@@ -1130,9 +1208,9 @@ int AnimatorSystem::tick(scene::Scene& scene, float dt) {
     // 每 60 帧一条：证明"系统真的在跑"（而不是每帧都要看到它）。
     if ((m_frames % 60) == 1) {
         VK_LOG_INFO("ANIM-TICK f=%llu entities=%d animators=%d dt=%.5f "
-                    "fading=%d lastclip=[%s] lasttime=%.3f",
+                    "fading=%d blending=%d lastclip=[%s] lasttime=%.3f",
                     static_cast<unsigned long long>(m_frames), count, animators,
-                    static_cast<double>(dt), fading,
+                    static_cast<double>(dt), fading, blending,
                     lastAnimClip.c_str(),
                     static_cast<double>(lastAnimTime));
         // 走 Animator 路径的那一份（time 每帧都在变，只按 60 帧的节奏报）。

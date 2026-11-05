@@ -531,6 +531,10 @@ ecs::Entity spawnPlayerFromGameStart(scene::Scene& scene,
         pcC.eyeOffset = gsCfg.eyeOffset;
         pcC.hideBodyFirstPerson = gsCfg.hideBodyInFirstPerson;
         pcC.viewBlendSeconds = gsCfg.viewBlendSeconds;
+        // 朝向口径按出生视角定（UE：两个模板各一个 Pawn 类，各写各的）。
+        // 第一人称锁控制器 yaw，第三人称朝移动方向。换视角时由
+        // `character::setViewMode` 同步这一位。
+        pcC.orientToMovement = !firstPerson;
         w.add<ecs::PlayerComponent>(e, pcC);
         pc2 = w.get<ecs::PlayerComponent>(e);
     }
@@ -2328,6 +2332,16 @@ void RuntimeApp::tickPlayerAnimation(float dt) {
     cfg.runStrideSpeed = pv.runStrideSpeed;
     cfg.strideCurve = pv.strideCurve;
 
+    // 地面混合空间 + 空中三态（2026-11-06）。全部来自 game.json 的 player
+    // 块，缺键 = 出厂值（`RuntimeConfig::PlayerVisual`）。
+    cfg.blendSpace = pv.blendSpace;
+    cfg.walkAt = pv.blendWalkAt;
+    cfg.runAt = pv.blendRunAt;
+    cfg.blendSyncPhase = pv.blendSyncPhase;
+    cfg.fallClip = pv.fallClip;
+    cfg.landClip = pv.landClip;
+    cfg.landRecoverSec = pv.landRecoverSec;
+
     // 走 / 跑分界自动值的输入：控制器最大速度（没有就退回 4.5）
     const auto* cc = w.get<ecs::CharacterControllerComponent>(pe);
     const float maxSpeedHint = (cc && cc->maxSpeed > 0.0f) ? cc->maxSpeed : 4.5f;
@@ -2379,7 +2393,7 @@ void RuntimeApp::tickPlayerAnimation(float dt) {
     }
 
     animation::updateLocomotion(m_playerAnim, *sk, an, skel, hs, onGround,
-                                maxSpeedHint, dt, cfg, "GAME");
+                                v.z, maxSpeedHint, dt, cfg, "GAME");
 }
 
 void RuntimeApp::simulate(float dt) {

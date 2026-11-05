@@ -169,6 +169,36 @@ struct RuntimeConfig {
         //   而那是最难查的一类（两边的日志都正常）。
         //   关掉它的唯一理由是 A/B 对照（播放头轨迹会变）。
         bool strideCurve = true;
+
+        // ---- 地面混合空间（2026-11-06）----
+        // UE `BS_Locomotion` 的等价物：idle / walk / run 不再是"选一段播"，
+        // 而是按速度在相邻两段之间加权（见 `animation/Locomotion.h`）。
+        // **关掉 = 退回三态硬切**（P4 的行为），留作 A/B 对照。
+        bool blendSpace = true;
+        // 两个样本位置（m/s）。0 = 自动：walkAt = 控制器最大速度、
+        // runAt = walkAt × 1.15。
+        float blendWalkAt = 0.0f;
+        float blendRunAt = 0.0f;
+        // 混合时两段共享相位（UE Sync Group），只在 walk↔run 之间生效。
+        bool blendSyncPhase = true;
+
+        // ---- 空中三态（2026-11-06）----
+        // UE 的 ABP 把"离地"分成 Jump（上升）/ Fall（下降）/ Land（落地）。
+        // `fallClip` 空 = 沿用 `jumpClip`；`landClip` 空 = 不启用落地缓冲。
+        // ⚠ 三段都**不循环**（UE 也是）：从高处掉落时循环起跳动作会让人
+        //   在空中反复蹬腿。
+        std::string fallClip;
+        std::string landClip;
+        // 落地后保持 Land 段的秒数（UE `LandRecovery` 的最小版）。
+        float landRecoverSec = 0.15f;
+
+        // ---- 朝向口径（2026-11-06）----
+        // UE 的 `bOrientRotationToMovement`：
+        //   · true（第三人称）= 身体朝着**移动方向**转；
+        //   · false（第一人称）= 身体跟着**控制器的 yaw**（`bUseControllerRotationYaw`）。
+        // 第一人称开成 true 的后果是：侧步时身体转过去 → 头骨 socket 跟着
+        // 横移 → 眼位甩到耳朵边，镜头左右晃一下。这是"晃"的一个真实来源。
+        bool orientToMovement = true;
     };
     PlayerVisual player;
 

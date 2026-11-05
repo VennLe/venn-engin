@@ -395,6 +395,8 @@ void bindDefaultCharacter(scene::Scene& scene, assets::AssetManager& am,
         // 第一人称一进 Play 就平视（-0.35 是第三人称"相机在上方俯视"
         // 的初始值，搬到第一人称就是"一开局低着头看自己脚"）。
         if (pc->mode == ecs::PlayerMode::FirstPerson) pc->pitch = 0.0f;
+        // 朝向口径跟着当前模式（第一人称锁镜头 yaw，第三人称朝移动方向）。
+        pc->orientToMovement = (pc->mode != ecs::PlayerMode::FirstPerson);
     }
 
     // 运行时 PlayerController 的弹簧臂参数（没有它镜头不跟随）
@@ -534,6 +536,10 @@ ecs::Entity spawnPlayerAtGameStart(scene::Scene& scene,
             pc.viewBlendSeconds = g->viewBlendSeconds;
         }
     }
+    // 朝向口径（UE：两个模板各一个 Pawn 类，各写各的）。与
+    // `spawnPlayerFromGameStart` 同一条规矩，换视角时由
+    // `character::setViewMode` 继续同步。
+    pc.orientToMovement = (mode != ecs::PlayerMode::FirstPerson);
     w.add<ecs::PlayerComponent>(e, pc);
 
     constexpr float kFallbackHeight = 1.8f;

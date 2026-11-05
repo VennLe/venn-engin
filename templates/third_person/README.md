@@ -18,7 +18,10 @@
    身体**看不见了但影子还在**（`bOwnerNoSee` + `bCastHiddenShadow`），
    眼位挂在骨架的 `head` 骨上。五个视角参数都在 `GameStart` 的
    Inspector 段（Eye bone / Eye offset / First person FOV /
-   Hide own body / View blend），改完要重新 Play 才生效
+   Hide own body / View blend），改完要重新 Play 才生效。
+   切过去之后**身体不再跟着移动方向转**（`bUseControllerRotationYaw`
+   接管）：侧步时人还是朝前，否则头骨会绕中线横移几厘米，配 80° 视场
+   就是画面平移一下
 
 ## 目录结构
 
@@ -32,7 +35,7 @@
 | `assets/scripts/portal.vks` | 终点逻辑（收齐后点亮自己，演示两个脚本靠世界黑板通信） |
 | `assets/game.json` | 运行时出厂配置（窗口尺寸、限帧、音频、**玩家外观**） |
 | `assets/models/characters/default_character.vmesh` | 玩家角色（片段名 Idle / Walk / Run / Jump） |
-| `assets/animators/humanoid.anim.json` | 走路状态机（Idle ↔ Walk ↔ Run + 跳跃） |
+| `assets/animators/humanoid.anim.json` | 走路状态机（地面 Idle↔Walk↔Run **混合**、空中 Jump/Fall/Land） |
 | `config/render.json` | 画质开关（创建向导写入；删成 `{}` = 全部默认） |
 
 ## 你的角色
@@ -46,6 +49,45 @@
 
 ⚠ 换模型之后如果走路变成滑行，先看新模型的片段名是不是
 `Idle` / `Walk` / `Run` / `Jump` —— 状态机里写的就是这四个名字。
+
+## 动画怎么动（对标 UE5 源码）
+
+地面和空中是两套逻辑，别用一套思路去调。
+
+**地面 `Idle ↔ Walk ↔ Run` 是混合的，不是切换的。** 引擎里没有"Walk 播完播 Run"
+这回事，等价于 UE 的 `UBlendSpace1D`（`BS_Locomotion`）：横轴是**移动速度**，
+按速度落在**相邻两段**之间做线性加权。差别不在"有没有过渡"，而在过渡期腿在
+干什么 —— 硬切是两个完整姿势整身平均（两条腿各走各的相位，看起来像腿打结），
+混合空间是"3/4 步 + 1/4 步"，仍然是一个连续步态。
+
+两个数决定它怎么分：
+
+- `blendWalkAt`（默认 1.2 m/s）—— 走满权重对应的速度
+- `blendRunAt`（默认 5.0 m/s）—— 跑满权重对应的速度
+
+> 注意这两个数按**移动速度**放，不是按动画的自然步速放。UE 里 Walk@200 是因为
+> 它 `MaxWalkSpeed=500`；这里的走路满速是 4.5，所以 `blendWalkAt` 得落在
+> 走路区间里，否则一按 `W` 就直接整段落到 Run 上（"人一按 W 就在跑"）。
+> 步幅不匹配另外由**步幅匹配**（`strideMatch`）负责，两件事分工，别混。
+
+**空中分三段，都不循环。** 对应 UE 动画蓝图里的三态：
+
+| 段 | 判据 | 循环 |
+|---|---|---|
+| `Jump` | 离地且竖直速度 **> 0**（还在上升） | 否，只播一遍 |
+| `Fall` | 离地且竖直速度 **≤ 0**（开始下落） | 否 |
+| `Land` | 落地后 `landRecoverSec`（默认 0.12 s）内 | 否 |
+
+判据只能用竖直速度的**方向**，不能用大小 —— 起跳那一瞬间速度最大但在上升，
+抛物线顶点速度为零却已经在下降。
+
+**转身由"移动方向"决定，不是由"相机朝向"（`bOrientRotationToMovement`）。**
+按 `W` 往背后跑，角色会以 `rotationRateDeg`（默认 500°/s）匀速转过去；
+转的是角色的 yaw，相机不跟着转。这和第一人称是两条互斥的路线 —— 切到第一
+人称时引擎会自动把 `orientToMovement` 关掉（详见下面第 5 条）。
+
+想让动画退回老的三态硬切做对照，把 `assets/game.json` 的 `player` 块里
+`blendSpace` 改成 `false` 即可（`fadeSeconds` 会重新接管过渡）。
 
 ## 游戏逻辑写在哪
 

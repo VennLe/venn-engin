@@ -39,6 +39,50 @@
 跟着头骨走，但过了一道阻尼（`0.045 s`）—— 呼吸和迈步带来的那点抖动
 不会 1:1 放大到全屏，否则看久了会晕。
 
+## 身体为什么不跟着移动转（`bUseControllerRotationYaw`）
+
+UE 的两个角色模板在这一点上**互斥**，别把第三人称的手感搬过来：
+
+| | 第三人称（`third_person`） | 第一人称（本模板） |
+|---|---|---|
+| 角色 yaw | 跟**移动方向**转（`bOrientRotationToMovement`） | 跟**控制器**转（`bUseControllerRotationYaw`） |
+| 按 `A` 侧步时 | 人会转过去朝左走 | 人不转，横着走 |
+| 引擎里的开关 | `orientToMovement = true` | `orientToMovement = false` |
+
+这个不只是手感偏好，是**几何后果**：第一人称的眼位挂在 `head` 骨上，头骨
+不在身体中线上（侧偏约 9 cm）。要是身体跟着移动方向转，侧步时头骨会绕中线
+横移那 9 cm，配 80° 视场就是整个画面平移一下 —— 那才是"第一人称发晃"的
+真实来源，跟镜头阻尼没关系。
+
+切到第三人称时引擎会自动把 `orientToMovement` 打开，切回来再关掉，
+这个覆盖写在做视角切换的那一处（`ViewMode`）。想自己改就改
+`assets/game.json` 的 `player.orientToMovement`。
+
+## 动画怎么动
+
+**这个模板默认没有角色模型** —— 第一人称看不见自己，出厂就是胶囊占位体
+（`assets/game.json` 里没有 `player` 块，`assets/models/` 下也没有角色资产）。
+身体虽然看不见，但**影子还在**，所以一旦你给它挂上模型就会露馅。
+
+想让影子有个人形，`Edit ▸ Project Settings...` → **Player** 段 →
+`Pick...` 挑一个 `.vmesh` + `.anim.json`。挂上之后就与第三人称共用同一套
+状态机，四条口径完全一致：
+
+- **地面 `Idle ↔ Walk ↔ Run` 是混合的**（等价 `UBlendSpace1D` / `BS_Locomotion`），
+  按速度在相邻两段间线性加权。硬切是两个完整姿势整身平均，两条腿各走各的
+  相位，看起来像腿打结；混合是"3/4 步 + 1/4 步"，还是连续步态。
+  分界点是 `blendWalkAt`（默认 1.2 m/s）与 `blendRunAt`（默认 5.0 m/s），
+  按**移动速度**放，不是按动画自然步速放。
+- **空中分 `Jump` / `Fall` / `Land` 三段，都不循环**。判据只看竖直速度的
+  **方向**：离地且 `vz > 0` = `Jump`，离地且 `vz ≤ 0` = `Fall`，
+  落地后 `landRecoverSec` 内 = `Land`。
+- **身体不跟着移动方向转**（上一节的 `bUseControllerRotationYaw`）。
+  这一条挂了模型之后才是"看得见"的：侧步时身体的朝向不变。
+- 想退回老的三态硬切做对照：`player.blendSpace` 改成 `false`。
+
+⚠ 挂模型之后如果走路变成滑行，先看片段名是不是
+`Idle` / `Walk` / `Run` / `Jump` —— 状态机里写的就是这四个名字。
+
 
 ## 目录结构
 

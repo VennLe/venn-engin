@@ -117,6 +117,82 @@ AssetC.exe samba_dancing.fbx --strip-skin --autorig --procanim \
 所以状态机里改 clip 时两边都写。只写一边的表现是"改了但没生效"，而且
 编辑器 Play 与 Game.exe 的失败方式还不一样（一个有 Animator 一个没有）。
 
+### 3.5 地面三态 = 混合空间（2026-11-06）
+
+到 2026-11-05 为止 idle / walk / run 是**三态硬切**（换 clip + 0.2 s 交叉
+淡入）。能跑，但那不是 UE 的做法。UE5 的 ThirdPerson 模板里 `BS_Locomotion`
+是一张**混合空间**：横轴 = Speed，样本 Idle@0 / Walk@200 / Run@500，速度一变
+权重连续滑动。
+
+两者的差别不在"有没有过渡"，而在**过渡期间腿在干什么**：
+
+| | 硬切 | 混合空间 |
+|---|---|---|
+| 过渡期的姿态 | 两个**完整**姿势整身平均 → 两条腿各走各的相位 | 相邻两段按权重混合 → 仍是**一个**步态 |
+| 速度小幅波动 | 权重跨阈值就换 clip，每次都重来一遍淡入 | 权重晃一下，看不出在切 |
+
+实现：`animation/BlendSpace.h`（`UBlendSpace1D` 的 1D 线性插值 + 两端钳制），
+采样走 `SkinnedMeshComponent::blendClip / blendWeight / blendTime`
+（`AnimatorSystem` 在 fade 之外新增的一条二元混合路径，优先于 fade）。
+
+三个容易踩的点：
+
+1. **样本位置按"移动速度"放，不按"动画的自然步速"。** UE 的 Walk@200 是
+   因为它的 `MaxWalkSpeed` 就是 500；本工程走路满速 4.5、冲刺 9，而 Walk
+   clip 的自然步速只有 1.9 —— 按自然步速放的话，4.5 m/s 会整段落到 Run 上
+   （"一按 W 就在跑"）。步幅不匹配那部分交给 `strideMatch`（调播放速率），
+   两件事分工不同。
+2. **换主段时保相位**（`blendSyncPhase`，UE 的 Sync Group）。walk↔run 都是
+   循环步态，相位一断就是"迈到一半突然换腿"。换算用**归一化相位**而不是
+   秒数 —— 两段时长不同（Walk 1.03 s / Run 0.63 s），直接对齐秒数会永远差
+   一圈。idle **不参与**同步：待机没有步态相位。
+3. **混合开关要迟滞**（进入 3% / 退出 0.5%）。速度正好停在样本点上时
+   （编辑器 Play 的 `moveSpeed` 就是 `walkAt` 的自动值），实测速度的抖动会
+   让另一段的权重在 0~2% 之间来回跳，于是 `blending()` 隔几帧翻转一次、
+   采样路径跟着切、日志跟着打 —— 实测把 `verify_frame_pacing` 的尖刺从
+   0 帧顶到 50/129 帧。
+
+`blendSpace = false` 保留了三态硬切那条路，用于 A/B 对照（同一段动画、同
+一个速度，只改这一位，"腿打结"就能被单独看见）。
+
+### 3.6 空中三态：Jump / Fall / Land（2026-11-06）
+
+旧版只有一个 jump 态：`!onGround` → 播 Jump，而且**循环**。按 UE 的 ABP 该
+分成三段：
+
+| 段 | 判据 | clip | 循环 |
+|---|---|---|---|
+| Jump（rising） | `!onGround && velocity.z > 0` | `jumpClip` | 否 |
+| Fall（falling） | `!onGround && velocity.z <= 0` | `fallClip`（空则沿用 `jumpClip`） | 否 |
+| Land | 落地后的 `landRecoverSec` 内 | `landClip`（空则不启用） | 否 |
+
+**"不循环"是硬修正**：从 20 m 掉下来要 2 s，而 Jump clip 只有 1.0 s ——
+循环逻辑会让人在空中**反复蹬腿**。
+
+判据只能用竖直速度的**方向**，不能用"滞空时长"或"速度大小"：起跳瞬间竖直
+速度最大但正在上升，抛物线顶点速度为零却在下降。
+
+缺 clip 时的退化（`alicia.vmesh` 只有 Idle/Walk/Run/Jump）：无 `fallClip`
+沿用 `jumpClip`（仍然不循环）；无 `landClip` 不启用 Land 段。退化**不报错**，
+`-ANIM-AIR` 里报的是实际挂的 clip，一眼看得出是"资产没有这一段"还是
+"配置写错了"。
+
+### 3.7 朝向口径：`bOrientRotationToMovement` vs `bUseControllerRotationYaw`
+
+UE 的两个模板各用一条，而且**互斥**：
+
+- 第三人称 `bOrientRotationToMovement = true` + `RotationRate = 500°/s`：
+  身体朝**移动方向**转，镜头独立绕圈（按 S 后退时人转身往回走）。
+- 第一人称 `bOrientRotationToMovement = false` + `bUseControllerRotationYaw`：
+  身体锁在**控制器 yaw** 上，侧步时横着挪、身体不转。
+
+第一人称必须走第二条：眼睛（相机）就挂在头骨 socket 上，身体一按移动方向
+转，侧步时头骨绕中线横移 0.09 m，配 80° 视场就是画面近景平移一下 ——
+那是"第一人称晃"的一个真实来源，**与眼位阻尼无关**。
+
+`PlayerComponent::orientToMovement` 是这一位，由 `character::setViewMode`
+在换视角时按目标模式**覆盖**（不是可选项：它是几何后果，不是手感偏好）。
+
 ---
 
 ## 4 · 按键映射（`AnimKeyMapComponent`）
@@ -233,7 +309,8 @@ python tools/verify_char_locomotion.py     # 15 条，约 35 秒
 
 | 项 | 现状 | 归属 |
 |---|---|---|
-| crossfade | **已做（P5，2026-10-22）**：0.2 s smoothstep 双采样混合，见 `docs/player_feel.md` §4 | A2a |
+| crossfade | **已做（P5，2026-10-22）**：0.2 s smoothstep 双采样混合，见 `docs/player_feel.md` §4。**2026-11-06 起地面三态改用混合空间（§3.5），fade 只留给"进/出空中态"这种没有中间样本的跳转** | A2a |
+| 空中三态 | **已做（2026-11-06）**：Jump / Fall / Land 分相，三段都不循环（§3.6）。缺 `fallClip` / `landClip` 的资产自动退化 | — |
 | 控制器资产 `.anim.json` | 配置是 C++ 结构体，不能可视化搭状态机 | A2b |
 | 根运动 | **滑步已解决（A4，2026-10-30）**：播放速率 = 移动速度 ÷ clip 自己的地面速度，夹在 [0.6, 1.7] 并报残差。见 `docs/gait_cycle.md` 的「步幅匹配」；真正的根运动（位移由动画驱动）仍未做 | A4 |
 | IK | 无。斜坡上脚会穿地 | A6 |

@@ -135,11 +135,30 @@ void Swapchain::create(uint32_t width, uint32_t height, VkSwapchainKHR old) {
         VK_LOG_INFO("Swapchain present modes available = [%s]", avail.c_str());
     }
 
-    // ---- 图像数量：min + 1，不超上限 ----
-    uint32_t imageCount = caps.minImageCount + 1;
+    // ---- 图像数量 ----
+    //
+    // ⚠ 这一个数决定**帧节奏**，不只是缓冲深度，踩过一次（2026-11-06 实测）：
+    //   锁帧时给 `minImageCount + 1`（= 3）张，`vkQueuePresentKHR` 可以连续
+    //   收下 2 个 present 才阻塞。于是主循环能**跑到显示器前面一帧**，落进的
+    //   稳态是：
+    //       dt:  8.6  24.9   8.6  24.9  …（严格交替，均值 16.7 = 名义 60 fps）
+    //       等 fence:  0.05  16.0   0.05  16.0
+    //   平均帧率是"对"的（探针 A2 的均值看不出问题），但**每两帧一个快-慢**，
+    //   肉眼就是"动作一顿一顿、步伐僵硬" —— 正是用户报的那个症状。
+    //   图像数收到 `minImageCount`（这台机器是 2）之后，present 队列只能压一帧，
+    //   CPU 自然被 vblank 咬住，dt 全程 16.5~16.9，`rw` 稳定在 ~8 ms。
+    //
+    // ⚠ 但**不锁帧时正好相反**：多余的图像存在的意义就是让 CPU 不排队等显示
+    //   器（MAILBOX 要靠 3 张才能跑满）。所以按呈现模式分开取，不是一刀切。
+    const uint32_t minImages = caps.minImageCount;
+    const bool synced = (presentMode == VK_PRESENT_MODE_FIFO_KHR ||
+                         presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR);
+    uint32_t imageCount = synced ? minImages : (minImages + 1);
     if (caps.maxImageCount > 0 && imageCount > caps.maxImageCount) {
         imageCount = caps.maxImageCount;
     }
+    VK_LOG_INFO("Swapchain imageCount = %u (min=%u max=%u synced=%d)",
+                imageCount, minImages, caps.maxImageCount, synced ? 1 : 0);
 
     // ---- 尺寸 ----
     if (caps.currentExtent.width != UINT32_MAX) {

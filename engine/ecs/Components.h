@@ -205,6 +205,44 @@ struct SkinnedMeshComponent {
 
     bool fading() const { return fadeDur > 0.0f && !fadeFromClip.empty(); }
 
+    // ---------------- 混合空间（BlendSpace，2026-11-06）----------------
+    //
+    // 与上面的 `fadeFrom*` 是**两件不同的事**，别混用：
+    //   · fade：一次性的"从旧 clip 过渡到新 clip"，权重随**时间** 0→1，
+    //     到点就结束（`fading()` 变 false）；
+    //   · blend：持续性的"两段按**参数**加权"，权重随时可变、永不结束。
+    //     UE 的 `BS_Locomotion`（Idle↔Walk↔Run 由 Speed 驱动）就是这一种。
+    //
+    // 语义：`blending()` 时采样阶段同时取 `clipName`（权重 `blendWeight`）
+    // 与 `blendClip`（权重 `1 - blendWeight`），在**局部 TRS** 空间混合。
+    //
+    // ⚠ `blendWeight` 是 **`clipName` 的权重**（不是 `blendClip` 的）。
+    //   反过来定义的话，`blendPose` 的实参顺序就得跟着反，一不留神就
+    //   混出一个"主段被压到 0.1"的姿势 —— 而那个症状是"走路时人几乎是
+    //   站着平移"，很难联想到权重符号。
+    // ⚠ 两者同时成立时 **blend 优先、fade 被跳过**：fade 的终点是"纯
+    //   clipName"，而 blend 的终点是"两段加权"，同时做等于三段混合，
+    //   收益远小于复杂度。状态机那边保证"混合空间内部不发起 fade"。
+    // ⚠ 不进存档（与 fadeFrom* 同理：这是"这一帧正在发生的事"）。
+    std::string blendClip;
+    float blendWeight = 1.0f;   // `clipName` 的权重；1 = 纯主段
+    // 从属段的播放头。由 Locomotion 每帧按**相位**写（两段都是步态时
+    // 与主段同相，见 `LocomotionConfig::blendSyncPhase`），AnimatorSystem
+    // 负责在没人写它时自己推进 —— 否则"从属段冻在第一帧"，混合出来
+    // 的腿会像踩在冰上。
+    float blendTime = 0.0f;
+
+    // `blendTime` 是否被**上层**（`animation/Locomotion` 的相位同步）在
+    // 这一帧写过。写过 → 采样层不再自己推进（否则相位被加了两次 dt，
+    // 从属段会比主段快一帧，混出来的腿永远差半步）。
+    // 采样层推进完自己清回 false。
+    bool blendTimeLocked = false;
+
+    bool blending() const {
+        return !blendClip.empty() && blendClip != clipName &&
+               blendWeight > 1.0e-4f && blendWeight < 1.0f - 1.0e-4f;
+    }
+
     // ---------------- 主姿势（Leader pose，2026-11-05）----------------
     //
     // 模块化角色：身体 / 头发 / 衣服是**几个独立的 Model**，各带一份同名
@@ -1381,6 +1419,32 @@ struct PlayerComponent {
     // 呼吸 / 迈步 / 眨眼都会让画面微抖；0.045 s 刚好把抖压下去，
     // 又不至于"转头慢半拍"。
     float eyeLagSeconds = 0.045f;
+
+    // ================================================================
+    // 朝向口径（2026-11-06）：UE 的 `bOrientRotationToMovement` 与
+    // `bUseControllerRotationYaw` 是**互斥**的两条路，按视角切换。
+    // ================================================================
+    //
+    // UE5 的两个模板各用一条：
+    //   · ThirdPerson —— `bOrientRotationToMovement = true`，
+    //     `RotationRate = (0, 500, 0)`：身体朝着**移动方向**转，镜头
+    //     独立绕圈。按 S 后退时人转身往回走。
+    //   · FirstPerson —— `bOrientRotationToMovement = false` +
+    //     `bUseControllerRotationYaw = true`：身体锁在**控制器的 yaw** 上。
+    //     侧步时人横着挪，身体不转 —— 因为眼睛（= 相机）就在头上，
+    //     身体一转，头骨 socket 就横移，画面会跟着甩一下。
+    //
+    // 这条位**不是手感偏好，是正确性**：第一人称如果按移动方向转身，
+    // 侧步 / 后退时眼位会绕身体中线转圈。实测 1.8 m 的人、头骨半径
+    // 0.09 m，侧步时眼位横移 0.09 m 再配 80° 视场，画面里近景会明显
+    // 平移一次 —— 那是"第一人称晃"的一个真实来源，与阻尼无关。
+    //
+    // 旧场景没有这个键 → 默认 true（第三人称的语义）。老工程多数是
+    // 第三人称，且第一人称那批本来就该重新点一次视角。
+    bool orientToMovement = true;
+    // 朝移动方向转身时的角速度上限（度/秒）。UE ThirdPerson 模板是 500。
+    // 0 = 用 `CharacterControllerComponent::turnSpeed`（指数插值）。
+    float rotationRateDeg = 500.0f;
 
     float moveSpeed = 3.0f;     // m/s（按住鼠标右键 ×sprintMultiplier）
     float lookSpeed = 0.0025f;  // 鼠标灵敏度：弧度/像素

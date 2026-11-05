@@ -167,6 +167,15 @@ void applyGameJson(RuntimeConfig& cfg) {
         pNum("walkStrideSpeed", cfg.player.walkStrideSpeed);
         pNum("runStrideSpeed", cfg.player.runStrideSpeed);
         pBool("strideCurve", cfg.player.strideCurve);
+        // 地面混合空间 + 空中三态（2026-11-06）。键名与 C++ 字段一致。
+        pBool("blendSpace", cfg.player.blendSpace);
+        pNum("blendWalkAt", cfg.player.blendWalkAt);
+        pNum("blendRunAt", cfg.player.blendRunAt);
+        pBool("blendSyncPhase", cfg.player.blendSyncPhase);
+        pStr("fallClip", cfg.player.fallClip);
+        pStr("landClip", cfg.player.landClip);
+        pNum("landRecover", cfg.player.landRecoverSec);
+        pBool("orientToMovement", cfg.player.orientToMovement);
     } else if (j.contains("player")) {
         VK_LOG_WARN("GAME-CONFIG game.json 的 player 不是对象，忽略（%s）",
                     path.c_str());

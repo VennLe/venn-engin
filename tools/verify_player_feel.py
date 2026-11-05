@@ -367,22 +367,37 @@ def main():
     #
     # ⚠ 判据不能只看 `blend=0.20s`（那只是"配置读进来了"），也不能靠
     #   `ANIM-TICK fading=`（每 60 帧一行，一次过渡只有 12 帧，几乎采不到）。
-    #   `ANIM-FADE begin` 是过渡第一帧打的一条，两者都出现才算数。
+    #
+    # 2026-11-06 起"平滑"有**两条**来源，任一条成立都算：
+    #   · `ANIM-FADE begin` —— 状态**跳转**（进/出空中态）的交叉淡入，
+    #     第一帧打一条；
+    #   · `ANIM-BLEND begin` —— 地面态之间（idle↔walk↔run）进入**混合空间**，
+    #     UE 的 `BS_Locomotion` 就是这一种，权重按速度滑、不换 clip。
+    #   只认 fade 的话，混合空间接管后这条会**假红**（现象：日志里明明
+    #   在连续混，用例却说"没有交叉淡入"）。
     blend_val = ""
     for line in lines:
         m = RE_ANIM.search(line)
-        if m and float(m.group(3)) > 0.0:
+        if m:
             blend_val = m.group(3)
             break
-    fade_begin = ""
+    smooth = ""
     for line in lines:
         m = re.search(r"ANIM-FADE begin from=(\S+) to=(\S+) dur=([\d.]+)s", line)
         if m:
-            fade_begin = "%s->%s %ss" % (m.group(1), m.group(2), m.group(3))
+            smooth = "fade %s->%s %ss" % (m.group(1), m.group(2), m.group(3))
             break
-    check("R7 状态切换有交叉淡入（blend>0 且真的开始了混合）",
-          bool(blend_val) and bool(fade_begin),
-          "blend=%ss fade=%s" % (blend_val or "-", fade_begin or "-"))
+    if not smooth:
+        for line in lines:
+            m = re.search(r"ANIM-BLEND begin main=(\S+) other=(\S+) w=([\d.]+)",
+                          line)
+            if m:
+                smooth = "blend %s+%s w=%s" % (m.group(1), m.group(2),
+                                               m.group(3))
+                break
+    check("R7 状态切换有平滑混合（fade 或混合空间真的开始了）",
+          bool(blend_val) and bool(smooth),
+          "blend=%ss smooth=%s" % (blend_val or "-", smooth or "-"))
 
     # ---- R8 Esc 退出操作态 ----
     i_esc, m_esc = -1, None

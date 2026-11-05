@@ -160,13 +160,30 @@ public:
 private:
     // 采样缓冲（复用，避免每帧分配）。
     //   m_pose      = 目标 clip 的姿势（每帧都采）
-    //   m_poseFrom  = 过渡时旧 clip 的姿势（只在 fading() 时采）
-    //   m_poseMix   = blendPose 的输出（只在 fading() 时用）
+    //   m_poseFrom  = 过渡 / 混合空间里**另一段**的姿势（fading 或
+    //                 blending 时采；两者互斥，共用一份缓冲）
+    //   m_poseMix   = blendPose 的输出（同样两者共用）
     // 三份都要**成员**而不是局部变量：blendPose 的输出不能与输入同址，
     // 而每帧构造 Pose 会反复分配 3 × jointCount 个向量。
     Pose m_pose;
     Pose m_poseFrom;
     Pose m_poseMix;
+    // `ANIM-BLEND begin` 的节流（2026-11-06）。
+    //
+    // 语义是"**开始**混合的那一帧打一条"，不是"每帧一条"：走路时混合空间
+    // 一直在跑，每帧一条日志等于每帧一次 I/O，而 I/O 会把帧节奏拖出尖刺
+    // （实测 `verify_frame_pacing` 的 p90 直接翻倍、不锁 vsync 的对照从
+    // 200+ fps 掉到 104）。这两个位配合来判"上一次有没有在混"。
+    bool m_blendedThisTick = false;   // 本帧有实体在混
+    bool m_blendLogArmed = false;     // 本帧允许打一条 begin（上一帧没混）
+    // 上一次打 `ANIM-BLEND begin` 的帧号。
+    //
+    // 光靠"上一帧没混"还不够：速度在混合区边缘抖动时，混合开关会**每
+    // 几帧翻转一次**，于是 begin 也跟着每几帧打一条 —— 实测 40 ms 的帧
+    // 尖刺中位间隔正好等于日志间隔（`verify_frame_pacing` 的 A4 从 0/128
+    // 涨到 52/126）。0.5 s 的最短间隔把 I/O 挡在帧节奏之外：这条锚点是
+    // "混合真的发生过"的证据，不是逐帧遥测。
+    unsigned long long m_lastBlendLogFrame = 0;
     // 附加层采样缓冲（B1）。与上面三份同理：**成员**而不是局部变量，
     // 否则每帧每层都要分配 3 × jointCount 个向量（4 层 × 63 骨 × 60 fps
     // = 每秒 4.5 万次分配）。

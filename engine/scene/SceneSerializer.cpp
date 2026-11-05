@@ -3444,6 +3444,12 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
             jp["viewBlendSeconds"] = pc->viewBlendSeconds;
         if (pc->eyeLagSeconds != def.eyeLagSeconds)
             jp["eyeLagSeconds"] = pc->eyeLagSeconds;
+        // 朝向口径（2026-11-06）：`bOrientRotationToMovement` /
+        // `RotationRate`。同样只写非默认值 —— 老场景逐字节不变。
+        if (pc->orientToMovement != def.orientToMovement)
+            jp["orientToMovement"] = pc->orientToMovement;
+        if (pc->rotationRateDeg != def.rotationRateDeg)
+            jp["rotationRateDeg"] = pc->rotationRateDeg;
         je["player"] = std::move(jp);
     }
     if (const auto* limb = w.get<ecs::PlayerLimbComponent>(e))
@@ -4061,6 +4067,8 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
             jp.value("bodyShadowWhenHidden", pc.bodyShadowWhenHidden);
         pc.viewBlendSeconds = jp.value("viewBlendSeconds", pc.viewBlendSeconds);
         pc.eyeLagSeconds = jp.value("eyeLagSeconds", pc.eyeLagSeconds);
+        pc.orientToMovement = jp.value("orientToMovement", pc.orientToMovement);
+        pc.rotationRateDeg = jp.value("rotationRateDeg", pc.rotationRateDeg);
         if (auto* p = w.get<ecs::PlayerComponent>(e))
             *p = pc;
         else

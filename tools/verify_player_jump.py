@@ -312,6 +312,19 @@ def main():
           ("clip=%s ground=%s" % (jumped.group(2), jumped.group(3)))
           if jumped else "没有 state=jump")
 
+    # ---- J1b 空中三态：上升 / 下降分开（UE 的 Jump / Fall）----
+    #
+    # 2026-11-06 之前只有一个 jump 态：一离地就播 Jump 并且**循环**。
+    # 按 UE 的 ABP，离地要分成 `Velocity.Z > 0` 的 Jump 和 `<= 0` 的 Fall。
+    # 判据用 `GAME-ANIM-AIR`（只在相位翻转的那一帧打一条，不逐帧刷），
+    # 采样不到就说明"两态并成了一态"。
+    seen_phases = [m.group(1) for m in
+                   (re.search(r"GAME-ANIM-AIR phase=(\w+)", l) for l in lines)
+                   if m]
+    check("J1b 空中分成 rising / falling（UE 的 Jump / Fall 两态）",
+          "rising" in seen_phases and "falling" in seen_phases,
+          "phases=%s" % (seen_phases or "-"))
+
     # ---- J2/J3/J5：从采样里找第一段"离地"的弧 ----
     samples = pos_samples(lines)
     seg = []

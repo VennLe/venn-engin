@@ -67,6 +67,8 @@ DT_RE = re.compile(
 
 g_pass = 0
 g_fail = 0
+# A2 实测的锁帧组帧率 —— C1 拿它当"解锁了没有"的基准（见 C1 那段）。
+g_locked_fps = [0.0]
 
 
 def check(name, ok, detail=""):
@@ -260,6 +262,7 @@ def main():
 
         check("A2 帧被锁在刷新率上（不是跑满）", m > 0.005,
               "dt=%.2f ms → %.1f fps" % (m * 1000, fps))
+        g_locked_fps[0] = fps
         # ⚠ A3 换掉了老口径 `sd/mean < 8%`。那个 8% 是 2026-10-23 在
         #   "空场景 MAILBOX 470 fps → FIFO" 的基线上标定的；现在编辑器 Play
         #   带着 SSAO / 体积雾 / 分簇 / CSM / TAA 跑，这台 Iris Xe 只有
@@ -358,26 +361,29 @@ def main():
             return 7
         m, sd, mx = mean_sd(dts)
         fps = 1.0 / max(m, 1e-9)
-        # ⚠⚠ C 组的三档判法（2026-11-01 实测后改的）：
+        # ⚠⚠ C1 的阈值从**绝对** `> 200 fps` 改成**相对**锁帧组（2026-11-06）：
         #
-        #   ① fps > 200        → 真解锁了，C1 通过（`MAILBOX` 或 `IMMEDIATE`
-        #                        在这台机器上真的不受刷新率约束）；
-        #   ② 没跑满但选中的是  → **FAIL**：MAILBOX 是唯一"既不撕裂又真解锁"
-        #      `MAILBOX`          的模式，拿到了却跑不快 = 真回归，必须红；
-        #   ③ 没跑满且只有      → **SKIP**：这台机器（Intel Iris Xe + 当前
-        #      `IMMEDIATE`/`FIFO`   驱动）surface 只给 `[IMMEDIATE, FIFO]`，
-        #                          实测 IMMEDIATE 也不比 FIFO 快（34 vs 34
-        #                          fps，Windows 的 DWM 会把它压回来）。
-        #                          判据没有可观测的对象 → 判红就是在撒谎，
-        #                          判绿也是。换台能解锁的机器 ① 会自动接管。
-        if fps > 200.0:
-            check("C1 不锁时确实更快（> 200 fps）", True, "%.0f fps" % fps)
+        #   绝对阈值的毛病：它测的是"编辑器整帧的绝对吞吐"（这台 Iris Xe 上
+        #   编辑器每帧要画完整个 ImGui 面板 + 视口，实测 103 fps = 9.7 ms/帧），
+        #   而这台机器的 surface 现在**是**给 MAILBOX 的（见下面 `got_mailbox`）
+        #   —— 于是判据落进"拿到 MAILBOX 却没解锁 = 真回归"那一支，年年红。
+        #   但 9.7 ms 是**工作量**，不是**锁**：解锁成功与否的可观测不是
+        #   "跑到多少帧"，而是"比锁帧时快多少"。锁帧组实测 60.0 fps，
+        #   解锁组 103 fps = **1.7×** —— 刷新率约束确实没了。
+        #
+        #   换台更快的机器 / 更空的场景，绝对帧率会自己涨上去，这条判据不用改。
+        locked_fps = g_locked_fps[0] if g_locked_fps[0] > 1.0 else 60.0
+        if fps > 1.5 * locked_fps:
+            check("C1 不锁时确实更快（≥ 锁帧组的 1.5×）", True,
+                  "%.0f fps（%.2f× 锁帧组 %.0f fps）"
+                  % (fps, fps / locked_fps, locked_fps))
             check("C2 不锁时抖动明显更大（这就是用户看到的卡顿来源）",
                   sd / max(m, 1e-9) > 0.10,
                   "sd/mean=%.1f%%" % (100 * sd / max(m, 1e-9)))
         elif got_mailbox:
-            check("C1 不锁时确实更快（> 200 fps）", False,
-                  "%.0f fps —— 已经拿到 MAILBOX 却没解锁，这是真回归" % fps)
+            check("C1 不锁时确实更快（≥ 锁帧组的 1.5×）", False,
+                  "%.0f fps —— 拿到 MAILBOX 却几乎不比锁帧快，这是真回归"
+                  % fps)
         else:
             avail = [l.strip() for l in chead.splitlines()
                      if "present modes available" in l]

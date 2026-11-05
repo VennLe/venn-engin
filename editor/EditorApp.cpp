@@ -3349,11 +3349,24 @@ void EditorApp::onUpdate(float dt) {    if (m_ctx->quitRequested()) {
                         animT = s->time;
                 });
         }
+        // ⚠ 后半段是 `CpuProfiler` 的**上一帧**分段读数，加它的理由（2026-11-06
+        //   实测）：只有 dt 时，"24.9 ms 的帧"看起来像"渲染变重了"，实际读数
+        //   是 `rw=16.0`（`vkWaitForFences` 在等 vblank）而 `rec=5.0` 没变 ——
+        //   是**节拍**问题不是**工作量**问题。没有这三个数就得靠猜，而猜错过
+        //   一整轮（先怀疑日志 I/O，又怀疑动画采样，都不是）。
+        //   读数差一帧（`beginFrame()` 推进历史后才可见），归因时按相邻帧看。
+        const core::CpuProfiler& cp = core::CpuProfiler::get();
         VK_LOG_INFO("FRAME-DT f=%llu dt=%.5f play=%d cap=%d "
-                    "pos=(%.4f,%.4f,%.4f) animT=%.4f",
+                    "pos=(%.4f,%.4f,%.4f) animT=%.4f "
+                    "cpu rend=%.2f rw=%.2f rec=%.2f pres=%.2f logic=%.2f",
                     static_cast<unsigned long long>(m_editorFrames),
                     static_cast<double>(dt), m_ctx->isPlaying() ? 1 : 0,
-                    m_ctx->playMouseCaptured() ? 1 : 0, px, py, pz, animT);
+                    m_ctx->playMouseCaptured() ? 1 : 0, px, py, pz, animT,
+                    static_cast<double>(cp.lastMs(core::CpuProfiler::kRender)),
+                    static_cast<double>(cp.lastMs(core::CpuProfiler::kRenderWait)),
+                    static_cast<double>(cp.lastMs(core::CpuProfiler::kRecord)),
+                    static_cast<double>(cp.lastMs(core::CpuProfiler::kPresent)),
+                    static_cast<double>(cp.lastMs(core::CpuProfiler::kLogic)));
     }
 
     // ---- 视口"以选中相机预览"（Cinematography ▸ Look through）----
@@ -4464,8 +4477,18 @@ void EditorApp::runPlayers(float dt) {
             tc->position.z = groundZ;      // 微差：贴住
         }
 
-        // ---- 第三人称：转身 + walk 摆腿 ----
-        if (!firstPerson) {
+        // ---- 朝向：UE 的两条互斥口径（2026-11-06）----
+        //
+        // 第三人称 = `bOrientRotationToMovement`（身体朝移动方向）；
+        // 第一人称 = `bUseControllerRotationYaw`（身体锁在镜头 yaw 上）。
+        //
+        // 以前这里是 `if (!firstPerson)` 整段跳过 —— 第一人称身体**永远**
+        // 朝着出生方向。藏了身体时看不出，但影子还在（`bCastHiddenShadow`），
+        // 于是"人在侧步、影子在原地不动"会露馅。
+        if (firstPerson) {
+            pc->bodyYaw = pc->yaw;
+            tc->rotation.z = -pc->bodyYaw;
+        } else {
             if (!pc->started) {
                 // 出生朝向：**背对相机**。
                 //
@@ -4588,9 +4611,12 @@ void EditorApp::runPlayers(float dt) {
                     an2->floatParams["Speed"] = hs;
                     an2->boolParams["Grounded"] = pc->onGround;
                 } else {
+                    // 竖直速度：空中相位（Jump / Fall / Land）靠它的符号分。
+                    // 落地后 `velocityZ` 是 0 → 归 ground，不会误报成 falling。
                     animation::updateLocomotion(
                         m_playerLoco[e.id], *sk, an2, *sk->model->skeleton, hs,
-                        pc->onGround, pc->moveSpeed, dt, cfg, "EDIT");
+                        pc->onGround, pc->velocityZ, pc->moveSpeed, dt, cfg,
+                        "EDIT");
                 }
             }
         }

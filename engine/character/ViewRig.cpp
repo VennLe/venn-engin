@@ -287,6 +287,18 @@ bool setViewMode(scene::Scene& scene, ecs::Entity player,
                       pc->hideBodyFirstPerson;
     const int n = applyBodyVisibility(scene, player, !hide,
                                       pc->bodyShadowWhenHidden);
+    // ---- 朝向口径跟着视角走（2026-11-06）----
+    //
+    // UE 里"第一人称"和"第三人称"是**两个 Pawn 类**，各自把
+    // `bOrientRotationToMovement` 写在构造里：第三人称 true、第一人称
+    // false（改用 `bUseControllerRotationYaw`）。本工程是同一个玩家实体
+    // 在两种视角间切，所以这一位必须在切换时跟着口径走 —— 否则切到第一
+    // 人称后身体仍按移动方向转，侧步时头骨横移、画面平移一下。
+    //
+    // ⚠ 这里**覆盖**作者的设置。因为它不是手感偏好，是"眼睛长在头上"的
+    //   几何后果（见 PlayerComponent::orientToMovement 的注释）。要保留
+    //   手动值就得连带改相机口径，那不在本机制的范围内。
+    pc->orientToMovement = (mode != ecs::PlayerMode::FirstPerson);
     if (outMeshes) *outMeshes = n;
     return true;
 }

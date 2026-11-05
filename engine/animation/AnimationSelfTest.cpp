@@ -5224,11 +5224,22 @@ int runAnimationSelfTest() {
                 ecs::SkinnedMeshComponent sk;
                 sk.model = nullptr;          // 只用 speed 字段
                 animation::LocomotionConfig cfg;
+                // ⚠ 这一组必须**关掉混合空间**（2026-11-06）：
+                //
+                // 混合空间按速度在 Idle（0）与 Walk（walkAt = 最大速度）
+                // 之间线性加权，而这里喂的 `nom × 1.5`（约 2.1 m/s）正好
+                // 落在两者的中点 —— 主段是 Idle，`state` 是 0 而不是 1。
+                // 那是**对的**行为（UE 的 BS_Locomotion 在 210 cm/s 处也是
+                // 一半待机一半走路），但这一组测的是"步幅匹配有没有把速度
+                // 写进 `speed`"，不该被混合空间的权重分配搅进来。
+                //
+                // 混合空间本身的行为由下面 ⑥ 单独断言。
+                cfg.blendSpace = false;
                 animation::LocomotionRuntime lrt;
                 const float target = nom * 1.5f;
                 const animation::LocomotionFrame f =
                     animation::updateLocomotion(lrt, sk, nullptr, *skelWalk,
-                                                target, true, 4.5f, 0.016f,
+                                                target, true, 0.0f, 4.5f, 0.016f,
                                                 cfg, "TEST");
                 reportFlag("stride_loco_walk_state", f.state == 1,
                            "state=" + std::to_string(f.state));
@@ -5250,7 +5261,7 @@ int runAnimationSelfTest() {
                     const animation::LocomotionFrame fc =
                         animation::updateLocomotion(lrtc, skc, nullptr,
                                                     *skelWalk, nom * 3.0f,
-                                                    true, 4.5f, 0.016f, cfg,
+                                                    true, 0.0f, 4.5f, 0.016f, cfg,
                                                     "TEST");
                     report("stride_loco_clamped_rate",
                            static_cast<double>(fc.playbackRate), 1.7, 0.02);
@@ -5267,7 +5278,7 @@ int runAnimationSelfTest() {
                 animation::LocomotionRuntime lrt2;
                 const animation::LocomotionFrame f2 =
                     animation::updateLocomotion(lrt2, sk2, nullptr, *skelWalk,
-                                                target, true, 4.5f, 0.016f,
+                                                target, true, 0.0f, 4.5f, 0.016f,
                                                 off, "TEST");
                 report("stride_loco_off_rate",
                        static_cast<double>(f2.playbackRate), 1.0, 0.0);
@@ -5281,12 +5292,201 @@ int runAnimationSelfTest() {
                 animation::LocomotionRuntime lrt3;
                 const animation::LocomotionFrame f3 =
                     animation::updateLocomotion(lrt3, sk3, nullptr, *skelWalk,
-                                                0.0f, true, 4.5f, 0.016f, cfg,
+                                                0.0f, true, 0.0f, 4.5f, 0.016f, cfg,
                                                 "TEST");
                 reportFlag("stride_loco_idle_state", f3.state == 0,
                            "state=" + std::to_string(f3.state));
                 report("stride_loco_idle_rate", static_cast<double>(sk3.speed),
                        1.0, 0.0);
+            }
+
+            // ⑤b 混合空间（BlendSpace，2026-11-06）：UE `BS_Locomotion`
+            //
+            // 这一组断言的是"**权重随速度连续滑动**"，不是"换了哪段 clip"。
+            // 判据刻意不用 `state`（那是离散的语义槽名，只在跨过半时变），
+            // 而用 `f.blendWeight`（主段的权重）—— 它必须随速度**单调**变，
+            // 且两份样本的中点恰好 0.5。
+            //
+            // 为什么这条值得单独立一组：硬切（`blendSpace = false`）在
+            // 任何速度下 `blendWeight` 恒为 1，也就是说**这一组全红**——
+            // 它证的就是"真的在按权重混合"。
+            {
+                auto skelBS = makeHumanoidSkeleton(/*rigify=*/true);
+                // 三段齐备。`rt` 是调用方建好的步态 clip，复制成 Walk / Run
+                // 两份；Idle 用空轨道（静止姿势），与真实资产的 Idle 同构。
+                assets::AnimationClip idleBS;
+                idleBS.name = "Idle";
+                idleBS.duration = 2.0f;
+                assets::AnimationClip walkBS = rt;
+                walkBS.name = "Walk";
+                assets::AnimationClip runBS = rt;
+                runBS.name = "Run";
+                runBS.duration = rt.duration * 0.6f;
+                skelBS->clips.push_back(idleBS);
+                skelBS->clips.push_back(walkBS);
+                skelBS->clips.push_back(runBS);
+
+                animation::LocomotionConfig bcfg;
+                bcfg.blendSpace = true;
+                bcfg.strideMatch = false;   // 这一组只看混合，不看播放速率
+                bcfg.idleTriggerSec = 0.0f; // 别让 8 秒重触发搅进来
+                // 样本位置写死在 4 / 8：2 m/s 正好落在 Idle↔Walk 的中点，
+                // 6 m/s 落在 Walk↔Run 的中点 —— 判据可以手算。
+                bcfg.walkAt = 4.0f;
+                bcfg.runAt = 8.0f;
+
+                auto frameAt = [&](float v) {
+                    struct Out {
+                        animation::LocomotionFrame f;
+                        ecs::SkinnedMeshComponent sk;
+                    };
+                    Out o;
+                    animation::LocomotionRuntime lr;
+                    o.f = animation::updateLocomotion(lr, o.sk, nullptr, *skelBS,
+                                                      v, true, 0.0f, 4.5f,
+                                                      0.016f, bcfg, "TEST");
+                    return o;
+                };
+
+                // v = 0 → 纯 Idle，没有第二段
+                {
+                    const auto o = frameAt(0.0f);
+                    reportFlag("blend_at_0_idle", o.f.state == 0, o.f.stateName);
+                    report("blend_at_0_weight",
+                           static_cast<double>(o.f.blendWeight), 1.0, 1e-4);
+                    reportFlag("blend_at_0_single", !o.f.blended);
+                    reportFlag("blend_at_0_clip",
+                               o.sk.clipName == "Idle", o.sk.clipName);
+                }
+                // v = 2 → Idle 0.5 + Walk 0.5。主段仍是 Idle（权重相等时
+                // 偏低的那一段当主段），另一段必须是 Walk。
+                {
+                    const auto o = frameAt(2.0f);
+                    reportFlag("blend_at_half_blended", o.f.blended,
+                               o.f.blendClipName);
+                    report("blend_at_half_weight",
+                           static_cast<double>(o.f.blendWeight), 0.5, 1e-4);
+                    reportFlag("blend_at_half_other",
+                               o.f.blendClipName == "Walk", o.f.blendClipName);
+                    reportFlag("blend_at_half_state_idle",
+                               std::string(o.f.stateName) == "idle",
+                               o.f.stateName);
+                    // 从属段的播放头被写成了"主段相位 × 从属段时长"，
+                    // 且打了 locked 标记（采样层不再加一次 dt）。
+                    reportFlag("blend_at_half_time_locked", o.sk.blendTimeLocked);
+                    reportFlag("blend_at_half_time_phase",
+                               o.sk.blendTime >= 0.0f &&
+                                   o.sk.blendTime <= walkBS.duration,
+                               "t=" + std::to_string(o.sk.blendTime));
+                }
+                // Idle 的权重必须随速度**单调下降**（1 → 0）。
+                //
+                // ⚠ 不能直接看 `f.blendWeight`：那是**主段**的权重，按定义
+                //   恒 >= 0.5，中间段最小、两端回到 1（V 形）。要断言"随速度
+                //   单调"就必须换算成"Idle 段占多少"，主段是谁决定了要不要取反。
+                auto idleWeight = [](const animation::LocomotionFrame& fr) {
+                    const bool mainIsIdle =
+                        std::string(fr.stateName) == "idle";
+                    return mainIsIdle ? fr.blendWeight : (1.0f - fr.blendWeight);
+                };
+                {
+                    const auto a = frameAt(1.0f);
+                    const auto b = frameAt(2.0f);
+                    const auto c = frameAt(3.0f);
+                    const float wa = idleWeight(a.f);
+                    const float wb = idleWeight(b.f);
+                    const float wc = idleWeight(c.f);
+                    reportFlag("blend_weight_monotonic", wa > wb && wb > wc,
+                               std::to_string(wa) + " " + std::to_string(wb) +
+                                   " " + std::to_string(wc));
+                    // 中点必须恰好一半 —— 线性插值的定义，不是"差不多"。
+                    report("blend_idle_weight_half", static_cast<double>(wb),
+                           0.5, 1e-4);
+                }
+                // v = 4 → 纯 Walk（样本点上另一段权重为 0）
+                {
+                    const auto o = frameAt(4.0f);
+                    reportFlag("blend_at_walk_state",
+                               std::string(o.f.stateName) == "walk",
+                               o.f.stateName);
+                    report("blend_at_walk_weight",
+                           static_cast<double>(o.f.blendWeight), 1.0, 1e-4);
+                }
+                // v = 6 → Walk 0.5 + Run 0.5，主段是 Walk
+                {
+                    const auto o = frameAt(6.0f);
+                    reportFlag("blend_at_run_half_other",
+                               o.f.blendClipName == "Run", o.f.blendClipName);
+                    report("blend_at_run_half_weight",
+                           static_cast<double>(o.f.blendWeight), 0.5, 1e-4);
+                }
+                // 迟滞（2026-11-06）：进入混合要 3%，退出只要 0.5%。
+                //
+                // 这条不是"可省的优化"，它挡的是一个实际踩到的坑：速度正好
+                // 停在样本点上时（编辑器 Play 的 `moveSpeed` 就是 `walkAt`
+                // 的自动值），实测速度的抖动让另一段权重在 0 与 0.02 之间
+                // 来回跳，于是 `blending()` 隔几帧翻转、采样路径跟着切、
+                // `ANIM-BLEND begin` 跟着打 —— `verify_frame_pacing` 的
+                // 尖刺从 0 帧涨到 50/129 帧（中位间隔 4 帧）。
+                {
+                    const auto near1 = frameAt(3.99f);   // 另一段只有 0.25%
+                    reportFlag("blend_deadzone_skip", !near1.f.blended,
+                               "w=" + std::to_string(near1.f.blendWeight));
+                    const auto inzone = frameAt(3.8f);   // 另一段 5% > 3%
+                    reportFlag("blend_deadzone_edge_blend", inzone.f.blended,
+                               "w=" + std::to_string(inzone.f.blendWeight));
+                }
+                // v = 20 → 钳到 Run 端（**不外插**）。外插会把 Walk 的权重
+                // 算成负数，混出反相姿势 —— 比不混合更糟。
+                {
+                    const auto o = frameAt(20.0f);
+                    reportFlag("blend_clamped_run",
+                               std::string(o.f.stateName) == "run",
+                               o.f.stateName);
+                    report("blend_clamped_weight",
+                           static_cast<double>(o.f.blendWeight), 1.0, 1e-4);
+                    reportFlag("blend_clamped_single", !o.f.blended,
+                               o.f.blendClipName);
+                }
+                // 走 ↔ 跑换主段时**相位必须连续**（UE 的 Sync Group）。
+                // 判据：从 6 m/s（Walk 主段）走到 9 m/s（Run 主段），
+                // 换段那一帧的 `time` 应当是"旧相位 × 新时长"，而不是 0。
+                {
+                    animation::LocomotionRuntime lr;
+                    ecs::SkinnedMeshComponent sm;
+                    // 先在 6 m/s 建立 Walk 主段（此时另一段是 Run）
+                    animation::updateLocomotion(lr, sm, nullptr, *skelBS, 6.0f,
+                                                true, 0.0f, 4.5f, 0.016f, bcfg,
+                                                "TEST");
+                    const float walkDur = walkBS.duration;
+                    sm.time = walkDur * 0.25f;   // 人为摆到 1/4 圈
+                    const auto o = animation::updateLocomotion(
+                        lr, sm, nullptr, *skelBS, 9.0f, true, 0.0f, 4.5f,
+                        0.016f, bcfg, "TEST");
+                    reportFlag("blend_sync_switched",
+                               o.switched && sm.clipName == "Run",
+                               sm.clipName);
+                    // Run 的时长是 Walk 的 0.6 倍 → 相位 0.25 对应 0.15 s。
+                    // 写成 0 就说明"换段时把播放头归零了"，也就是腿会
+                    // 顿一下再迈（跌回硬切的手感）。
+                    report("blend_sync_time", static_cast<double>(sm.time),
+                           runBS.duration * 0.25f, 1e-3);
+                }
+                // 关掉混合空间 → 回到硬切（任何速度都不再混）
+                {
+                    animation::LocomotionConfig off = bcfg;
+                    off.blendSpace = false;
+                    animation::LocomotionRuntime lr;
+                    ecs::SkinnedMeshComponent sm;
+                    const auto o = animation::updateLocomotion(
+                        lr, sm, nullptr, *skelBS, 2.0f, true, 0.0f, 4.5f,
+                        0.016f, off, "TEST");
+                    reportFlag("blend_off_no_blend", !o.blended);
+                    // 硬切的判据是 `horizSpeed > walkSpeed` → walk
+                    reportFlag("blend_off_walk_state",
+                               std::string(o.stateName) == "walk",
+                               o.stateName);
+                }
             }
 
             // ⑥ 相位速率曲线（A4b）：一圈之内怎么分配播放速度
