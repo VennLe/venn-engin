@@ -6186,6 +6186,17 @@ void EditorApp::drawStatusBar() {
         return;
     }
 
+    // 顶边 1px 分隔线 —— UE 的 SStatusBar 是独立的一块"板"（Background=Panel），
+    // 上面还有一条 DrawerShadow 压住面板。我们这条状态栏与面板同色，不加线
+    // 就只剩"内容长得不一样"这一个区别，深色主题下几乎看不出来。
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p = ImGui::GetWindowPos();
+        dl->AddLine(ImVec2(p.x, p.y + 0.5f),
+                    ImVec2(p.x + ImGui::GetWindowWidth(), p.y + 0.5f),
+                    ImGui::GetColorU32(ui::tokens().outlineStrong), 1.0f);
+    }
+
     // ⚠ 状态串要在**显示时**过一遍 TR，而不是在 setStatus / 构造时。
     //   原因：初始值 `m_status = "Ready"` 是成员默认初始化，那一刻界面语言
     //   还没从存档 / MYVK_EDITOR_LANG 应用（applyAppearance 在后面跑），

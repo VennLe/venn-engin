@@ -116,6 +116,31 @@ struct ThemeTokens {
     ImVec4 titleBarActive;// 标题栏底（激活）—— 掺了强调色，不再是"白框"
     ImVec4 glow;          // 强调光晕（已带 alpha，直接当填充色用）
     ImVec4 trackBg;       // 滑轨 / 进度槽底
+
+    // ---- 2026-11-05：UE5 的「高度阶梯」（借鉴 EStyleColor）----
+    //
+    // 读 UE 5.8 的 `Runtime/SlateCore/Private/Styling/StyleColors.cpp` 会发现
+    // 它的深色主题不是"一个深灰 + 一圈描边"，而是**五档明度**：
+    //
+    //     Background #151515  <  Panel #242424  <  Header #2F2F2F
+    //     Recessed   #1A1A1A  （面板**里面**的容器，比窗口底更深）
+    //     Input      #0F0F0F + InputOutline #383838（控件内芯反而最暗 + 亮描边）
+    //
+    // 也就是说：窗口是一块**浮起来的板**，标题条再亮一档，而输入框是
+    // 板子上**挖下去的坑**。这三句话就把 UE 编辑器的"层次感"讲完了 ——
+    // 我们原来面板、标题条、底色三者几乎同值（27/29/29），所以整屏糊成
+    // 一片，只能靠 1px 描边硬分，这正是"看起来不专业"的直接来源。
+    //
+    // 用法纪律：
+    //   · 画**窗口最底**（页签条、分栏缝、视口外的空处）→ bgBase
+    //   · 画**面板标题条**（含分类条）→ panelHeader / panelHeaderActive
+    //   · 画**面板里的内嵌容器**（分组、列表底）→ 仍然用 panelBg（更深）
+    //   · 面板之间那条 1px 线 → outlineStrong（不要用 borderSoft，太淡）
+    ImVec4 bgBase;             // 最底层（比窗口底再暗一档）
+    ImVec4 panelHeader;        // 面板标题条 / 分类条（未激活）
+    ImVec4 panelHeaderActive;  // 面板标题条（本帧有焦点）
+    ImVec4 outlineStrong;      // 强分隔线（1px，不透明）
+
     float radiusLg = 4.0f; // 大圆角（窗口）
     float radiusMd = 4.0f; // 中圆角（卡片 / 控件）
     float radiusSm = 4.0f; // 小圆角（标签 / 小徽章）

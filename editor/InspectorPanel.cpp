@@ -688,7 +688,10 @@ void InspectorPanel::tabEmptyHint(const char* what) {
         }
     }
     if (!m_ctx.hasSelection()) {
-        ImGui::TextDisabled(TR("Nothing selected."));
+        // ⚠ 2026-11-05：这里**不再**重复一句 "Nothing selected." ——
+        //   头部（m_hasSel 的 else 分支）刚刚写过同一句话，两行之间只隔
+        //   40px，看起来像界面出了两次错。UE 的 Details 面板在没有选中时
+        //   只有一行提示，用来告诉人"下一步该做什么"，而不是复述状态。
         hint("Click an object in the viewport (or in the Hierarchy) to edit it.");
     } else {
         ImGui::TextDisabled(TR("This object has no %s."), what);
@@ -4304,7 +4307,19 @@ bool InspectorPanel::sectionHeader(const char* name, bool defaultOpen,
     // ⚠ 标题同时是 ImGui 的窗口内 ID：直接换成译文会让折叠状态在切语言时
     //   全部失忆（m_sectionOpen 是按 k 记的，但 ImGui 自己的存储按 label 哈希）。
     //   trId 返回 "译文###稳定 key"，显示中文、ID 永远是英文。
+    //
+    // 2026-11-05（借鉴 UE 的 SDetailCategoryTableRow）：
+    //   分区条原来直接吃 ImGuiCol_Header —— 而那个槽位同时也是**列表选中行**
+    //   的底色（Hierarchy / Content 都在用）。结果要么分区条是蓝块、要么
+    //   选中行变灰，二选一。UE 把这两件事拆成两个 token（Header #2F2F2F /
+    //   Select #0070E0）。ImGui 只有一个槽，所以在**这里**临时换掉：
+    //   分区条走中性 panelHeader，选中行留给 Header 本色。
+    const ui::ThemeTokens& tk = ui::tokens();
+    ImGui::PushStyleColor(ImGuiCol_Header, tk.panelHeader);
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, tk.panelHeaderActive);
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, tk.panelHeaderActive);
     const bool open = ImGui::CollapsingHeader(trId(name, k));
+    ImGui::PopStyleColor(3);
     m_sectionOpen[k] = open;
     ++m_sectionsDrawn;
 

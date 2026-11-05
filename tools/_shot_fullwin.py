@@ -31,7 +31,13 @@ def main():
         proc, tap, hwnd = launcher_kit.launch(env_extra={})
     else:
         import subprocess
-        env = launcher_kit.clean_env({})
+        # MYVK_SHOT_SELECT=<实体名> → 转发成 MYVK_EDITOR_SELECT，让编辑器
+        # 启动后自动选中一个实体（不然 Inspector 永远是空态，看不到分区条）。
+        extra = {}
+        sel = os.environ.get("MYVK_SHOT_SELECT")
+        if sel:
+            extra["MYVK_EDITOR_SELECT"] = sel
+        env = launcher_kit.clean_env(extra)
         proc = subprocess.Popen([launcher_kit.EDITOR], cwd=launcher_kit.BIN, env=env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         hwnd = 0

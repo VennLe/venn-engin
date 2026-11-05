@@ -236,15 +236,18 @@ void drawModeRail(EditorContext& ctx) {
         const float cy = p.y + kRowH * 0.5f;
         const ui::ThemeTokens& tk = ui::tokens();
 
-        // 单选圆点（与顶栏下拉同一套语义：圆点 = 单选，对勾 = 开关）
+        // ---- 选中态：左侧 2px 指示条（UE 的 ActiveTabIndicator 同款）----
+        //
+        // 2026-11-05（借鉴 UE 的 SDockTab / 模式切换）：
+        //   原来每行最前面还有一个 ○ 单选圆点 —— "底色已经高亮了"和"圆点填了"
+        //   在同一行里表达同一件事，而且 ○ 这一列白占 26px，把图标和文字全
+        //   往右挤。UE 的模式/页签切换只有"整行高亮 + 左侧一条强调竖线"，
+        //   没有额外的单选符（那是老式工具栏的写法）。
+        //   去掉圆点后图标左移到 12，文字左移到 36，一行多出 14px 给名字。
         if (active) {
-            dl->AddCircleFilled(ImVec2(p.x + 11.0f, cy), 4.2f,
-                                ImGui::GetColorU32(tk.accent), 12);
-        } else {
-            ImVec4 dc = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-            if (!impl) dc.w *= 0.55f;
-            dl->AddCircle(ImVec2(p.x + 11.0f, cy), 4.2f,
-                          ImGui::GetColorU32(dc), 12, 1.2f);
+            dl->AddRectFilled(ImVec2(p.x + 1.0f, p.y + 3.0f),
+                              ImVec2(p.x + 3.0f, p.y + kRowH - 3.0f),
+                              ImGui::GetColorU32(tk.accent), 1.0f);
         }
 
         // 图标 + 名字
@@ -252,8 +255,8 @@ void drawModeRail(EditorContext& ctx) {
         if (!impl) tc.w *= 0.45f;
         else if (!active && !hovered) tc.w *= 0.88f;
         const ImU32 col = ImGui::GetColorU32(tc);
-        paintEditModeIcon(dl, ImVec2(p.x + 26.0f, cy - 8.0f), 16.0f, m, col);
-        dl->AddText(ImVec2(p.x + 50.0f, cy - ImGui::GetTextLineHeight() * 0.5f),
+        paintEditModeIcon(dl, ImVec2(p.x + 12.0f, cy - 8.0f), 16.0f, m, col);
+        dl->AddText(ImVec2(p.x + 36.0f, cy - ImGui::GetTextLineHeight() * 0.5f),
                     col, TR(editModeName(m)));
 
         if (!impl) {

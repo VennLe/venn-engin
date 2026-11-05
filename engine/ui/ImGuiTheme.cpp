@@ -121,11 +121,30 @@ Theme finalize(Theme t, bool anime) {
                                   : shift(t.tok.panelBg, -0.018f);
     t.tok.glow = withAlpha(a, t.tok.isLight ? 0.22f : 0.30f);
 
+    // ---- UE5 高度阶梯（见 ImGuiTheme.h 里那四行 token 的注释）----
+    //
+    // 窗口是一块浮起来的板 → 板下还有更深的一层（bgBase），板上再压一条
+    // 更亮的标题带（panelHeader）。两边的落差都取 0.04~0.05：再小看不见
+    // （人眼在深底上要 ~8 级 RGB 才分得清），再大就变成"贴纸"了。
+    //
+    // ⚠ 浅色主题方向相反：板 = 更白，标题带反而**压灰**（Windows 11 的
+    //   卡片头就是浅灰，不是纯白）。所以两个分支不能共用一个符号。
+    t.tok.bgBase = shift(t.windowBg, t.tok.isLight ? -0.070f : -0.048f);
+    t.tok.panelHeader = shift(t.windowBg, t.tok.isLight ? -0.045f : 0.043f);
+    t.tok.panelHeaderActive = shift(t.windowBg, t.tok.isLight ? -0.062f : 0.058f);
+    // 面板之间那条缝：原来用 borderSoft（42% alpha）几乎看不见，面板之间
+    // 全靠"内容自己长得不一样"才分得出来。这里给一条真正能看见的线。
+    t.tok.outlineStrong = withAlpha(t.border, t.tok.isLight ? 0.80f : 0.95f);
+
     // ---- 标题栏（用户第 2 条："窗口顶部的白框显得很呆板"）----
-    // 激活态掺强调色：不再是"底色 + 一条线"，而是**有颜色倾向的一块带**。
-    t.tok.titleBar = t.titleBg;
-    t.tok.titleBarActive = mix(t.titleBgActive, a,
-                               t.tok.isLight ? 0.14f : 0.20f);
+    // 2026-11-05：改成**固定的标题带**（panelHeader），不再是"底色 + 一条线"。
+    //   UE 的 SDockTab 就是这样：未激活也是一条明确的带，激活只再亮一档 ——
+    //   这样"这个面板叫什么"在任何时候都读得出来，而不是只有聚焦时才浮出来。
+    //   动漫档仍然掺强调色（那是它的固有风格，见下面 anime 分支的重铺）。
+    t.tok.titleBar = t.tok.panelHeader;
+    t.tok.titleBarActive = anime
+        ? mix(t.tok.panelHeaderActive, a, t.tok.isLight ? 0.12f : 0.16f)
+        : t.tok.panelHeaderActive;
 
     // ---- 圆角与边框（用户第 2 条："窗口本身应该做成圆角边框"）----
     t.tok.isAnime = anime;
@@ -203,6 +222,16 @@ Theme finalize(Theme t, bool anime) {
             t.frameBgActive = shift(base, 0.150f);
             t.border = withAlpha(shift(base, 0.170f), 0.85f);
             t.tok.borderSoft = withAlpha(t.border, 0.55f);
+
+            // 标题带同理（2026-11-05）：pow 是乘性压缩，压完之后 panelHeader
+            // 与 windowBg 只差 1~2 级 —— "面板标题"这一层等于又没了。按加法
+            // 重铺一次，锚点还是 cardBg（控件实际坐的那一层）。
+            t.tok.panelHeader = shift(base, 0.052f);
+            t.tok.panelHeaderActive = shift(base, 0.078f);
+            t.tok.titleBar = t.tok.panelHeader;
+            t.tok.titleBarActive = mix(t.tok.panelHeaderActive, a, 0.16f);
+            t.tok.bgBase = shift(base, -0.014f);
+            t.tok.outlineStrong = withAlpha(shift(base, 0.120f), 0.90f);
         }
     } else {
         // 工程档：保留原来的 1px 底边与 4px 圆角体系，只是把圆角
@@ -454,13 +483,117 @@ Theme deriveLight(const ImVec4& bg, const ImVec4& accent,
     return finalize(t, anime);
 }
 
+// ---------------------------------------------------------------- UE5.8 复刻
+//
+// 逐字段抄 `Runtime/SlateCore/Private/Styling/StyleColors.cpp` 里的
+// `USlateThemeManager::InitializeDefaults()`（UE 5.8 的深色出厂主题）。
+// 行末注释标的是 UE 那边的 **token 名 + 原文色值** —— 以后想核对，直接去
+// 那个文件里按色值搜即可，不用猜"这个 0.14 是拍脑袋还是抄的"。
+//
+// 为什么不复用 deriveDark：
+//   deriveDark 是"从底色往上逐档推"（板比底亮、卡片比板亮……），而 UE 的
+//   板级关系里有一条是**反的** —— 控件内芯（Input #0F0F0F）比板更暗、
+//   靠 1px 亮描边（InputOutline #383838）把它"挖"出来。混在一条推导链里
+//   会互相打架，索性各写各的；deriveDark 服务其余 6 套风格主题。
+Theme themeUeDark() {
+    Theme t;
+    const ImVec4 accent = rgb(0.000f, 0.439f, 0.878f);    // #0070E0 Primary
+    const ImVec4 panel = rgb(0.141f, 0.141f, 0.141f);     // #242424 Panel
+
+    t.accent = accent;
+    t.text = rgb(0.753f, 0.753f, 0.753f);                 // #C0C0C0 Foreground
+    t.textDisabled = rgb(0.420f, 0.420f, 0.420f);
+
+    t.windowBg = panel;
+    t.childBg = rgb(0.102f, 0.102f, 0.102f);              // #1A1A1A Recessed
+    t.popupBg = rgb(0.102f, 0.102f, 0.102f, 0.99f);
+    t.border = rgb(0.220f, 0.220f, 0.220f);               // #383838 InputOutline
+
+    // 控件：内芯比板**更暗** + 1px 亮描边 = UE 输入框那个"坑"的观感
+    t.frameBg = rgb(0.059f, 0.059f, 0.059f);              // #0F0F0F Input
+    t.frameBgHovered = rgb(0.122f, 0.122f, 0.122f);       // #1F1F1F
+    t.frameBgActive = rgb(0.149f, 0.149f, 0.149f);        // #262626
+
+    t.titleBg = rgb(0.118f, 0.118f, 0.118f);              // #1E1E1E
+    t.titleBgActive = rgb(0.184f, 0.184f, 0.184f);        // #2F2F2F Header
+    t.menuBarBg = panel;
+
+    t.scrollbarBg = rgb(0.059f, 0.059f, 0.059f);
+    t.scrollGrab = rgb(0.298f, 0.298f, 0.298f);           // #4C4C4C DropdownOutline
+    t.scrollGrabHovered = rgb(0.341f, 0.341f, 0.341f);    // #575757 Hover
+    t.scrollGrabActive = rgb(0.502f, 0.502f, 0.502f);     // #808080 Hover2
+
+    t.sliderGrab = rgb(0.298f, 0.298f, 0.298f);
+    t.sliderGrabActive = accent;
+
+    t.button = rgb(0.184f, 0.184f, 0.184f);               // #2F2F2F
+    t.buttonHovered = rgb(0.227f, 0.227f, 0.227f);        // #3A3A3A
+    t.buttonActive = rgb(0.298f, 0.298f, 0.298f);         // #4C4C4C
+
+    // 分类条 / 列表选中：UE 的 Header 是**中性** #2F2F2F，不是一个蓝块；
+    // 真正"选中"的蓝在 Select = Primary，由面板代码在选中行上单独用。
+    t.header = rgb(0.184f, 0.184f, 0.184f);
+    t.headerHovered = rgb(0.235f, 0.235f, 0.235f);        // #3C3C3C
+    t.headerActive = rgb(0.271f, 0.271f, 0.271f);         // #454545
+
+    t.separator = rgb(0.220f, 0.220f, 0.220f);
+    t.separatorHovered = rgb(0.341f, 0.341f, 0.341f);
+    t.resizeGrip = rgb(0.220f, 0.220f, 0.220f, 0.60f);
+    t.resizeGripHovered = rgb(0.341f, 0.341f, 0.341f, 0.80f);
+
+    t.tab = rgb(0.118f, 0.118f, 0.118f);                  // 未选中页 = 底色
+    t.tabHovered = rgb(0.184f, 0.184f, 0.184f);
+    t.tabSelected = panel;                                // 选中页 = 板
+
+    t.plotLines = rgb(0.600f, 0.600f, 0.600f);
+    t.textSelectedBg = withAlpha(accent, 0.35f);
+
+    t.tableHeaderBg = rgb(0.118f, 0.118f, 0.118f);
+    t.tableBorderStrong = rgb(0.220f, 0.220f, 0.220f);
+    t.tableBorderLight = rgb(0.165f, 0.165f, 0.165f);
+    t.tableRowBgAlt = rgb(1.0f, 1.0f, 1.0f, 0.02f);
+
+    t.tok.panelBg = rgb(0.102f, 0.102f, 0.102f);          // #1A1A1A Recessed
+    t.tok.panelBgAlt = rgb(0.184f, 0.184f, 0.184f);       // #2F2F2F Header
+    t.tok.accent = accent;
+    t.tok.accentSoft = rgb(0.251f, 0.341f, 0.435f);       // #40576F SelectInactive
+    t.tok.textDim = rgb(0.502f, 0.502f, 0.502f);          // #808080 AccentGray
+    t.tok.textFaint = rgb(0.400f, 0.400f, 0.400f);
+    t.tok.ok = rgb(0.122f, 0.894f, 0.294f);               // #1FE44B Success
+    t.tok.warn = rgb(1.000f, 0.722f, 0.000f);             // #FFB800 Warning
+    t.tok.error = rgb(0.937f, 0.208f, 0.208f);            // #EF3535 Error
+    t.tok.info = accent;
+    t.tok.axisX = rgb(1.000f, 0.251f, 0.251f);            // #FF4040 AccentRed
+    t.tok.axisY = rgb(0.545f, 0.761f, 0.290f);            // #8BC24A AccentGreen
+    t.tok.axisZ = rgb(0.149f, 0.733f, 1.000f);            // #26BBFF AccentBlue
+    t.tok.barBg = panel;
+    t.tok.isLight = false;
+
+    t = finalize(t, /*anime=*/false);
+
+    // finalize 给的是"通用好看值"；这里按 UE 原文把四档高度钉死。
+    t.tok.bgBase = rgb(0.082f, 0.082f, 0.082f);           // #151515 Background
+    t.tok.panelHeader = rgb(0.184f, 0.184f, 0.184f);      // #2F2F2F Header
+    t.tok.panelHeaderActive = rgb(0.196f, 0.196f, 0.196f);
+    t.tok.titleBar = t.tok.panelHeader;
+    t.tok.titleBarActive = t.tok.panelHeaderActive;
+    t.tok.cardBg = rgb(0.169f, 0.169f, 0.169f);           // #2B2B2B 板上的卡片
+    t.tok.cardBgHover = rgb(0.208f, 0.208f, 0.208f);
+    t.tok.trackBg = rgb(0.059f, 0.059f, 0.059f);
+    t.tok.borderSoft = rgb(0.220f, 0.220f, 0.220f, 0.55f);
+    t.tok.outlineStrong = rgb(0.220f, 0.220f, 0.220f, 0.95f);
+
+    // UE 的输入框/下拉框都有 1px 描边（InputOutline）。这也是"控件看得见"
+    // 的关键 —— 深色主题里只靠填充色差，输入框会像一个空档。
+    t.met.frameBorder = 1.0f;
+    return t;
+}
+
 Theme themeAt(int index) {
     switch (static_cast<ThemeId>(index)) {
     case ThemeId::UeDark:
-        // UE5 编辑器：接近纯黑的底 + 冷蓝强调
-        return deriveDark(rgb(0.071f, 0.071f, 0.078f),
-                          rgb(0.184f, 0.510f, 0.906f),
-                          rgb(0.878f, 0.886f, 0.898f));
+        // UE5 编辑器：直接复刻 5.8 的深色出厂主题（见上面 themeUeDark）
+        return themeUeDark();
     case ThemeId::BlenderDark:
         // Blender：中性中灰 + 橙色强调（一眼就和蓝色系区分开）
         return deriveDark(rgb(0.176f, 0.176f, 0.180f),

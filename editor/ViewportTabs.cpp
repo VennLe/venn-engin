@@ -141,9 +141,14 @@ void drawViewportTabBar(const Rect& bar) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ui::ThemeTokens& tk = ui::tokens();
 
-    // 整条底边（内容区顶边）—— 让标签条与内容区在视觉上连成一片
+    // 整条底边（标签槽）—— 用 bgBase，比内容区**更深一档**。
+    //   UE 的 SDockTab 就是这么分的（DockTabStyle.SetTabWellBrush(Background)、
+    //   ContentAreaBrush(Panel)）：槽是"凹进去"的那一条，当前页与内容区同色
+    //   连成一片，于是"我在哪一页"不用看文字也知道。
+    //   原来这里用的 WindowBg = 内容区同色，整条标签栏就像"贴在面板顶部
+    //   的一行字"，没有槽的概念。
     dl->AddRectFilled(ImVec2(bar.x, bar.y), ImVec2(bar.x + bar.w, bar.y + bar.h),
-                      ImGui::GetColorU32(ImGuiCol_WindowBg));
+                      ImGui::GetColorU32(tk.bgBase));
 
     int tabs[kMaxPanels + 1];
     const int n = collectTabs(tabs, kMaxPanels + 1);
