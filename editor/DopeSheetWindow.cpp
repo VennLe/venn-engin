@@ -35,8 +35,11 @@ namespace {
 
 // 命中半径（像素）。菱形本身只有 3~5px，手指按不了那么准。
 constexpr float kHitPx = 7.0f;
-// 时间标尺条的高度（顶部那条，点它拖播放头）
-constexpr float kRulerH = 18.0f;
+// 时间标尺条的高度（顶部那条，点它拖播放头）。
+// ⚠ **跟字号算，别写死 18**：字号 22px 时 18 高放不下一行数字，标签会掉到
+//   网格第一行上，被 `PushClipRect(plotMin, ...)` 从中间切一刀 ——
+//   截图上看着像"0.05s 被划了一道横线"。坞里（内容区只有 ~230px）尤其明显。
+inline float rulerH() { return ImGui::GetFontSize() + 4.0f; }
 
 const ImVec4 kBadCol(1.00f, 0.45f, 0.35f, 1.0f);
 const ImVec4 kWarnCol(1.00f, 0.75f, 0.30f, 1.0f);
@@ -848,8 +851,15 @@ void DopeSheetWindow::drawBody() {
 
     const float reserve = 2.4f * ImGui::GetFrameHeightWithSpacing();
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    const ImVec2 size(std::max(avail.x, 320.0f),
-                      std::max(avail.y - reserve, 200.0f));
+    // ⚠ 画布高度**不许有硬下限**：原来是 `max(avail.y - reserve, 200)`，
+    //   坞的内容区一矮（把 header/ruler 改成跟字号走之后少了 6px），画布就
+    //   顶出窗口底 15px —— ImGui 会把它裁掉，但 `DOPE-CANVAS` 锚点留在窗外，
+    //   `verify_dope_sheet` 的 F2（"画布在窗口内"）当场红。
+    //   矮窗口先保"不出窗"，200 只是**舒适上限**，不是下限。
+    float bodyH = avail.y - reserve;
+    if (bodyH < 40.0f) bodyH = 40.0f;
+    if (avail.y > 40.0f && bodyH > avail.y) bodyH = avail.y;
+    const ImVec2 size(std::max(avail.x, 320.0f), bodyH);
     ImGui::InvisibleButton("##dope_body", size);
     const ImVec2 itemMin = ImGui::GetItemRectMin();
     const ImVec2 itemMax = ImGui::GetItemRectMax();
@@ -858,7 +868,7 @@ void DopeSheetWindow::drawBody() {
     // ---- 几何 ----
     m_rowH = std::max(ImGui::GetFontSize() * 1.15f, 16.0f);
     m_treeW = glm::clamp(size.x * 0.22f, 120.0f, 240.0f);
-    const ImVec2 plotMin(itemMin.x + m_treeW, itemMin.y + kRulerH);
+    const ImVec2 plotMin(itemMin.x + m_treeW, itemMin.y + rulerH());
     const ImVec2 plotMax(itemMax.x - 6.0f, itemMax.y - 4.0f);
     const float viewH = std::max(plotMax.y - plotMin.y, m_rowH);
     const float contentH = static_cast<float>(m_rows.size()) * m_rowH;

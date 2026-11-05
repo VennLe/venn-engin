@@ -684,14 +684,26 @@ def case_f(text):
 
     win = rects(text, "DOPE-WIN")
     cv = rects(text, "DOPE-CANVAS")
+    body = rects(text, "ANIMDOCK-BODY")
     ok_geo = False
-    if win and cv:
-        w, c = win[-1], cv[-1]
-        ok_geo = (w[2] - w[0] > 600.0 and w[3] - w[1] > 300.0 and
-                  c[0] >= w[0] - 1.0 and c[2] <= w[2] + 1.0 and
-                  c[1] >= w[1] - 1.0 and c[3] <= w[3] + 1.0)
-    check("F2 窗口尺寸合理且画布在窗口内", ok_geo,
-          "win=%s canvas=%s" % (win[-1] if win else None, cv[-1] if cv else None))
+    # 2026-11-05：摄影表从"视口标签页 / 浮动窗口"搬进**底部动画坞**
+    # （见 editor/AnimationDock.h）。它不再有自己的标题栏和 820×460 的默认
+    # 尺寸 —— 窗口矩形恒等于坞的内容区。判据因此改成"两者逐边重合，画布
+    # 在窗口内"，而不是旧版的"窗口 > 600×300"（坞高 300 − 标题 30 −
+    # 标尺 22 = 248，那条旧阈值永远过不了，而这**不是**回归）。
+    if win and cv and body:
+        w, c, b = win[-1], cv[-1], body[-1]
+        same_rect = (abs(w[0] - b[0]) <= 2.0 and abs(w[1] - b[1]) <= 2.0 and
+                     abs((w[2] - w[0]) - (b[2] - b[0])) <= 2.0 and
+                     abs((w[3] - w[1]) - (b[3] - b[1])) <= 2.0)
+        inside = (c[0] >= w[0] - 1.0 and c[2] <= w[2] + 1.0 and
+                  c[1] >= w[1] - 1.0 and c[3] <= w[3] + 1.0 and
+                  c[2] - c[0] > 400.0)
+        ok_geo = same_rect and inside
+    check("F2 窗口正好是动画坞的内容区，且画布在窗口内", ok_geo,
+          "win=%s canvas=%s body=%s" % (win[-1] if win else None,
+                                        cv[-1] if cv else None,
+                                        body[-1] if body else None))
 
     bad = [l for l in text.splitlines()
            if re.search(BAD_RE, l)]

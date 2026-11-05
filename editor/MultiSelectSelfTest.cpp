@@ -22,6 +22,7 @@
 #include "Command.h"
 #include "EditorContext.h"
 #include "MultiEditMath.h"
+#include "SelectionModes.h"
 
 #include "assets/AssetManager.h"
 #include "assets/Texture.h"
@@ -232,6 +233,41 @@ int runMultiSelectSelfTest() {
         const glm::vec3 o = orbitPosition(glm::vec3(0.0f), glm::vec3(5.0f, 0, 0), D);
         report("orbit_180", near(o.x, 10.0f) && near(o.y, 0.0f),
                "x=" + std::to_string(o.x));
+    }
+
+    // ---------------------------------------------------------- G 选择准入
+    //
+    // 2026-11-04 用户要求："所有的选择类型只能对场景中天空 / 地面 / 云层 /
+    // 星空之外的物体对象操作生效"。
+    //
+    // 天空 / 云层 / 星空是 `SkyParams` 的程序化绘制，**根本没有实体** ——
+    // 没有句柄就无从选中（那一条靠 verify_selection_modes 的 C6 在天空区域
+    // 拖框得到 n=0 来证明）。能落成断言的只有两条：上锁的（地面 / 地形）
+    // 不算物体；没有 Transform 的纯逻辑节点也不算法物体。
+    //
+    // ⚠ 每条都问过"别的实现会给出不同的数吗"：
+    //   · 写成"永远 true" → locked_ground_not_selectable 红；
+    //   · 写成"永远 false" → normal_object_is_selectable 红；
+    //   · 漏掉 Transform 检查 → no_transform_not_selectable 红。
+    {
+        report("normal_object_is_selectable", isSelectableObject(w, a),
+               "A");
+        w.add<ecs::LockedComponent>(d);
+        report("locked_ground_not_selectable", !isSelectableObject(w, d),
+               "D_locked");
+        // 解锁之后又能选了：否则"地面不可选"会变成"凡是曾经锁过的都不可选"
+        w.remove<ecs::LockedComponent>(d);
+        report("unlocked_is_selectable_again", isSelectableObject(w, d), "D");
+
+        const ecs::Entity noTr = sc.createObject("NoTransform");
+        w.remove<ecs::TransformComponent>(noTr);
+        report("no_transform_not_selectable", !isSelectableObject(w, noTr),
+               "no_transform");
+        w.destroy(noTr);
+
+        // 空句柄（0）永远不算物体 —— 防"忘了先判 valid 就取组件"
+        report("invalid_handle_not_selectable",
+               !isSelectableObject(w, ecs::Entity{}), "invalid");
     }
 
     // ---------------------------------------------------------- C 不变式修补

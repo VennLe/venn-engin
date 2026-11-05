@@ -176,15 +176,25 @@ struct SkyParams {
     }
 
     // 夜晚：深蓝渐变 + 星场 + 一轮冷月。
+    //
+    // ⚠ 三处刻意的"暗"（2026-11-05）：旧值天顶 (0.012,0.022,0.070) 的
+    //   B/R ≈ 5.8、地平线 (0.055,0.080,0.145) 亮度也偏高，上屏后是
+    //   一片**饱和的宝蓝**，看着像"蓝调摄影"而不是夜。现在：
+    //     · 天顶 / 地平线的 B/R 收到 ≈2.8 / 2.0（去饱和），绝对值各降一半；
+    //     · 云色 0.16→0.08 量级：夜里的云是被月光照亮的灰，不该比天还亮两档；
+    //     · 月亮盘与光晕**不吃 exposure**（sky_model.glsl 里太阳项在曝光
+    //       之后相加），所以压亮度只能调 sunIntensity / horizonGlow ——
+    //       0.55/0.55 会让月亮周围一大片天被"洗"亮，现在是 0.42/0.22。
+    //   星空的量两个不动：天暗下去之后星星的对比反而更好。
     static SkyParams night() {
         SkyParams p;
-        p.zenith  = {0.012f, 0.022f, 0.070f};
-        p.horizon = {0.055f, 0.080f, 0.145f};
-        p.ground  = {0.012f, 0.014f, 0.020f};
-        p.exposure = 1.0f;
-        p.cloudColor = {0.16f, 0.18f, 0.26f};
-        p.cloudCoverage = 0.26f;
-        p.cloudThickness = 0.70f;
+        p.zenith  = {0.010f, 0.013f, 0.028f};
+        p.horizon = {0.024f, 0.030f, 0.048f};
+        p.ground  = {0.007f, 0.008f, 0.011f};
+        p.exposure = 0.90f;
+        p.cloudColor = {0.075f, 0.085f, 0.110f};
+        p.cloudCoverage = 0.24f;
+        p.cloudThickness = 0.66f;
         p.cloudScale = 1.1f;
         p.cloudHeight = 800.0f;
         p.cloudSpeed = 0.008f;
@@ -194,9 +204,9 @@ struct SkyParams {
         p.starAmount = 0.85f;
         p.starBrightness = 1.0f;
         p.sunDirection = directionFromAngles(120.0f, 42.0f);   // 月亮
-        p.sunIntensity = 0.55f;
+        p.sunIntensity = 0.42f;
         p.sunAngularRadius = 0.013f;
-        p.horizonGlow = 0.55f;
+        p.horizonGlow = 0.22f;
         return p;
     }
 

@@ -1328,9 +1328,16 @@ void CurveEditorPanel::drawToolbar() {
 
 void CurveEditorPanel::drawBody() {
     const float listW = 150.0f;
-    // 侧栏 3 行 + 校验 1 行 ≈ 5 个行高。留够，别让画布被挤成一条。
-    const float reserve = 5.2f * ImGui::GetFrameHeightWithSpacing();
-    const float bodyH = std::max(ImGui::GetContentRegionAvail().y - reserve, 180.0f);
+    // ⚠⚠ 这里**不许再减一遍 reserve，也不许设 180 下限**（原来两样都有）。
+    //   ① 双倍预留：上面那些 header 行是在**同一个窗口**里先画的，
+    //      `GetContentRegionAvail()` 已经是"剩下的高度"，再减 5.2 行
+    //      等于预留两遍 —— 坞的内容区只有 ~230px，减完只剩 60，
+    //      画布被压成一条 32px 的缝（A7 判 "py1 > py0 + 50" 当场红）。
+    //   ② 硬下限：短窗口里硬撑 180 会把画布顶出坞底 36px，锚点落在窗外，
+    //      最高那个键只剩 1.3px 在画里（A8 红）。
+    //   正确做法就是"剩下多少用多少"，最小 60 只为不让它塌成负数。
+    const float availH = ImGui::GetContentRegionAvail().y;
+    const float bodyH = std::max(availH, 60.0f);
 
     ImGui::BeginChild("##curved_list", ImVec2(listW, bodyH), ImGuiChildFlags_Borders);
     drawChannelList();
@@ -1374,7 +1381,11 @@ void CurveEditorPanel::drawCanvas() {
     rebuildCurve();
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    const ImVec2 size(std::max(avail.x, 240.0f), std::max(avail.y, 160.0f));
+    // 同上：160 是**舒适下限**，不是"至少占这么高"。矮窗口里硬撑 160 会让
+    // 画布伸出子窗口（父级会裁掉，但锚点留在窗外，拖拽换算也跟着错位）。
+    float canvasH = avail.y;
+    if (canvasH < 60.0f) canvasH = std::min(avail.y, 60.0f);
+    const ImVec2 size(std::max(avail.x, 240.0f), canvasH);
     ImGui::InvisibleButton("##curved_canvas", size);
     const ImVec2 itemMin = ImGui::GetItemRectMin();
     const ImVec2 itemMax = ImGui::GetItemRectMax();
@@ -1545,9 +1556,15 @@ void CurveEditorPanel::drawCanvas() {
         dl->AddCircleFilled(ImVec2(x, y), r, sel ? colKeySel : colKey);
         dl->AddCircle(ImVec2(x, y), r, IM_COL32(20, 20, 24, 220), 0, 1.2f);
         char b[96];
-        std::snprintf(b, sizeof(b), "%d:%.4f:%.4f:%d;", i,
+        // ⚠ 去重键里**必须带 px/py**：这个锚点是被脚本当坐标用的
+        //   （`verify_curve_editor` A8 判"键在绘图区内"、B 组按 px/py 换算拖动）。
+        //   原来只带 `t/v/sel` —— 画布一挪（坞高度变、窗口换位）而键值没变，
+        //   这一行就再也不重打，脚本读到的是**上一帧的矩形**：数值全对、
+        //   坐标整体偏 14px，看着像"键画歪了"，其实是锚点陈旧。
+        std::snprintf(b, sizeof(b), "%d:%.4f:%.4f:%d:%.1f:%.1f;", i,
                       static_cast<double>(k.t),
-                      static_cast<double>(keyValue(i)), sel ? 1 : 0);
+                      static_cast<double>(keyValue(i)), sel ? 1 : 0,
+                      static_cast<double>(x), static_cast<double>(y));
         ksk += b;
     }
     // `logRect` 的格式带不了 t/v，所以关键帧点自己打 —— 但同样要**变了才打**，

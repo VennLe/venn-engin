@@ -73,8 +73,9 @@
 // ============================================================
 
 #include "Command.h"
-#include "EditModes.h"      // 编辑模式（顶栏下拉：选择 / 地形 / 植被 / ...）
+#include "EditModes.h"      // 编辑模式（左栏列表：地形 / 植被 / ...）
 #include "PanelRegistry.h"  // 面板显隐的权威存储 + panelOpenRef
+#include "SelectionModes.h" // 选择方式（Tab 径向菜单：点选 / 框选 / 套索 / 刷选）
 #include "Workspace.h"      // WorkspaceManager / ViewportLayout
 
 #include "core/InputMap.h"
@@ -623,6 +624,20 @@ public:
     EditMode editMode() const { return m_editMode; }
     void setEditMode(EditMode m);
 
+    // ---------------------------------------------------------- 选择方式（2026-11-04）
+    //
+    // 视口里左键"画什么"：点选 / 框选 / 套索 / 刷选。只在**没有专属工具**
+    // 的常态下有意义（地形 / 植被 / 建模那几个模式各有自己的左键语义），
+    // 但状态本身一直保留 —— 从地形模式切回来时用户上次的手感还在。
+    //
+    // 切换入口是**视口里按住 Tab 的径向菜单**（ViewportPanel::drawSelectionRadial），
+    // 左栏"选择"面板里也能点（那是同一份状态的第二个入口，不是另一份）。
+    // 之所以把"选择"从模式列表摘掉：它不是一套工具，是四个手感 —— 详见
+    // SelectionModes.h 开头。
+    SelectionMode selectionMode() const { return m_selectionMode; }
+    void setSelectionMode(SelectionMode m);
+    SelectionMode& selectionModeRef() { return m_selectionMode; }
+
     // ---------------------------------------------------------- 吸附
     // 平移 / 旋转 / 缩放**各有一套独立的开关 + 步长** —— 这就是 UE5
     // 视口工具条上的模型（勾选框 + 数值 + 下拉预设，三种变换互不影响）。
@@ -1097,6 +1112,10 @@ private:
     // 当前编辑模式。默认 Select = 编辑器开门时的老行为（点选 + 手柄），
     // 所以"从没碰过这颗下拉"的会话与引入本功能前逐帧一致。
     EditMode m_editMode = EditMode::Select;
+
+    // 选择方式。默认 Pick = 引入本功能之前的唯一行为（左键点选），
+    // 所以"从没按过 Tab"的会话与上一版逐帧一致。
+    SelectionMode m_selectionMode = SelectionMode::Pick;
 
     // 吸附：三套独立（平移 / 旋转 / 缩放）。
     //

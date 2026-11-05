@@ -313,7 +313,12 @@ run("editor/EditorContext.cpp → 选择集（多选）", OLD,
           # （`m_previewCamGuid` + `previewCamera()` 的 CINE-PREVIEW 锚点）也在
           # 这个文件里。它不改选中集，但改的是"视口拿哪台相机的机位"——
           # 那条用例必须跟着重跑。
-          "verify_camera_preview"})
+          "verify_camera_preview",
+          # 2026-11-04：`selectionMode`（点选/框选/套索/刷选）的状态本体
+          # 也在 EditorContext 里 —— setSelectionMode 打的那行 `SELMODE <id>`
+          # 就是那条用例的判据。它改的是"左键在视口里画什么"，
+          # 与选择集共用 `selectMany`，两边必须一起验。
+          "verify_selection_modes"})
 # 2026-10-27（#316）：批量数学（`editor/MultiEditMath.h`）—— 一个**纯函数**头，
 # 只被 GizmoController 与 InspectorPanel 两处共用，所以 owner 应该**只有**
 # verify_multiselect（外加扫字面量的 i18n 覆盖面）。

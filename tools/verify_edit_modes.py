@@ -9,7 +9,8 @@
   A. 模式切换的入口（2026-10-21 改过）
      A0 顶栏那颗"模式下拉"已经**删掉**（TB-EDITMODE 不该再出现）
      A0b 顶栏也不该再有 "+ Add"（搬到视口工具条了，锚点 TB-ADD 换了位置）
-     A1 左栏模式栏出 10 行（MODE-RAIL-ITEM select…water 全在）
+     A1 左栏模式栏出 9 行（MODE-RAIL-ITEM landscape…water 全在）
+     A1b 左栏**不该**再有 select 行（2026-11-04 起归 Tab 径向菜单）
      A3 点左栏 Modeling → 已实现，模式真的切过去 + 面板自动打开
        （2026-10-20 晚六个模式全部落地；逐模式动作见 verify_toolkit_modes.py）
   B. 地形编辑器
@@ -22,7 +23,7 @@
      C2 视口里点一下 → FOLIAGE-SPAWN + FOLIAGE-COUNT total>0
      C3 撒点落在 Foliage 分组下（层级里能看到，存盘不会丢）
   D. 回到选择模式
-     D1 点 Select → EDITMODE select，两个编辑器面板都关掉
+     D1 视口里按住 Tab 甩到右扇区 → SELMODE box，两个编辑器面板都关掉
   E. 全程零 Vulkan 验证层报错 / 零 ERROR
 
 用法：python tools/verify_edit_modes.py
@@ -276,15 +277,22 @@ def main():
             check(False, "A0b 拿不到 TB-ADD / VP-RECT / TB-BAR")
 
         # ⚠ 这一串必须跟 `editor::EditMode` 的枚举顺序 / `editModeId()` 对齐。
-        #   原来是 9 个（到 pcg 为止），2026-10-21 加了 Water 之后漏更新 ——
-        #   于是"模式栏齐全"这个断言从来没看过 water 那一行。
-        ids = ["select", "landscape", "foliage", "mesh_paint", "modeling",
+        #
+        # 2026-11-04：**select 从列表里摘掉了**（用户要求"模式类型中的选择
+        # 这项移除掉"）。它不是一套编辑工具，而是"左键在视口里怎么选"的四个
+        # 手感，现在归按住 Tab 的径向菜单。枚举值 Select=0 仍然存在（默认
+        # 状态 + 落盘的 mode id），所以 A1 只查剩下 9 个 id。
+        ids = ["landscape", "foliage", "mesh_paint", "modeling",
                "fracture", "brush_edit", "animation", "pcg", "water"]
         rects = {}
         for i in ids:
             rects[i] = rect_of(tap, "MODE-RAIL-ITEM " + i, 2.0)
         missing = [i for i in ids if not rects[i]]
-        check(not missing, "A1 左栏 10 行模式齐全（缺: %s）" % (missing or "无"))
+        check(not missing, "A1 左栏 9 行模式齐全（缺: %s）" % (missing or "无"))
+        # 反证：Select 那一行**不该**再有锚点。少了这条，"移除"这件事
+        # 一旦被别人加回来，脚本会静静地继续绿。
+        check(rect_of(tap, "MODE-RAIL-ITEM select", 0.6) is None,
+              "A1b 左栏不再有 select 行（已改为 Tab 径向菜单）")
         shoot(hwnd, "editmode_rail.png")
 
         # 点 Modeling：2026-10-20 晚这一项已经落地（六个模式全部实现），
@@ -379,9 +387,29 @@ def main():
         shoot(hwnd, "foliage_after_scatter.png")
 
         # ================================================== D 回到选择
-        print("\n[D] 回到选择模式")
-        check(switch_mode(tap, hwnd, "select"), "D0 点左栏切回 Select")
+        print("\n[D] 回到选择模式（Tab 径向菜单）")
+        #
+        # ⚠ 2026-11-04：左栏不再有 "select" 那一行，`switch_mode(..., "select")`
+        #   会找不到锚点直接返回 False。现在的路径是视口里**按住 Tab**：
+        #   圆盘打开后鼠标甩到正右方（框选）再松开 —— 移上去就切，松手即用。
+        vp = rect_of(tap, "VP-RECT")
+        cx = vp[0] + (vp[2] - vp[0]) * 0.5
+        cy = vp[1] + (vp[3] - vp[1]) * 0.5
+        focus_window(hwnd)
+        # ⚠ 合成鼠标要"起手预热"：上一动作常把光标甩出客户区，第一次
+        #   SetCursorPos 之后立刻按 Tab 会被判成"鼠标不在视口"。
+        user32.SetCursorPos(*client_to_screen(hwnd, cx, cy))
+        time.sleep(0.35)
+        user32.SetCursorPos(*client_to_screen(hwnd, cx, cy))
         time.sleep(0.2)
+        user32.keybd_event(0x09, 0, 0, 0)                  # Tab 按下
+        time.sleep(0.3)
+        user32.SetCursorPos(*client_to_screen(hwnd, cx + 70, cy))  # 正右 = 框选
+        time.sleep(0.45)
+        user32.keybd_event(0x09, 0, 2, 0)                  # Tab 松开
+        time.sleep(0.6)
+        check(count(tap, "SEL-RADIAL open") > 0, "D0 Tab 在视口里打开了圆盘")
+        check(count(tap, "SELMODE box") > 0, "D0b 鼠标移到右扇区 → SELMODE box")
         check(count(tap, "EDITMODE select") > 0, "D1a EDITMODE select")
         check(wait_re(tap, r"EDITMODE-PANELS mode=select .*landscape=0 foliage=0",
                       5.0), "D1b 两个编辑器面板都关掉")

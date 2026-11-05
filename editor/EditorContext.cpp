@@ -283,6 +283,13 @@ void EditorContext::setEditMode(EditMode m) {
                 editModeImplemented(m) ? 1 : 0);
 }
 
+void EditorContext::setSelectionMode(SelectionMode m) {
+    if (m == m_selectionMode) return;
+    m_selectionMode = m;
+    // 打 id 不打下标：将来加第五种时，日志里的历史记录不会整体错位。
+    VK_LOG_INFO("SELMODE %s", selectionModeId(m));
+}
+
 void EditorContext::play() {
     if (m_play == PlayState::Playing) return;
 

@@ -58,6 +58,9 @@
 #include "NotificationCenter.h"  // E21：m_notifications（同上，unique_ptr 析构）
 #include "GpuTimelinePanel.h"    // E25：m_gpuTimeline（同上）
 #include "PanelRegistry.h"   // PanelDesc（面板表是 EditorApp 的静态成员）
+// 2026-11-05：底部动画坞（摄影表 / 曲线 / 骨骼曲线 / NLA / 时间轴 / 运镜）。
+// 头文件刻意不含 imgui.h，所以按值持有它不会把 imgui 拖进每个 TU。
+#include "AnimationDock.h"
 // E29-2：面板拖拽换位。只放**纯数据**结构（DragInput / PanelDragState），
 // 这个头文件仍然不 include imgui.h —— 拖拽的 ImGui 读取全在 .cpp 里。
 #include "PanelDragDrop.h"
@@ -196,6 +199,19 @@ public:
     // 那种"两处同步"是编译期查不出来的坑。静态成员天然有访问权。
     static const std::vector<PanelDesc>& panelTableVec();
     static std::vector<PanelDesc> buildPanelTable();
+
+    // ---------------------------------------------------------- 底部动画坞
+    // 2026-11-05（用户要求）：动画 / 骨骼 / 运镜六张面板合并成编辑器底部
+    // 的一条通栏（UE5 Sequencer / Blender Graph Editor 那种摆法），3D 视口
+    // 始终完整可见 —— "对着场景调动画"在布局上本来就该成立。
+    //
+    // 由 `AnimationDock::draw` 调：把第 `tab` 页（AnimationDock 的下标）的
+    // 面板画进坞的内容矩形。矩形走 `pushDockHint`（见 PanelDock.h），
+    // 所以六张面板自己的代码一行都没改。
+    //
+    // 为什么是公有：AnimationDock 是"壳"，它认识面板表但不认识本类的成员
+    // 对象（m_dopeSheet / m_cinePanel …）。把派发放在这里，壳就不用 friend。
+    void drawAnimationDockContent(int tab);
 
 protected:
     void onInit() override;
@@ -513,6 +529,23 @@ private:
     //   是为了将来恢复时不用从 git 里翻）。computeLayout 里 transport 矩形
     //   恒为 0×0，即使误调也画不出来。
     void drawTransportBar();
+
+    // 画底部动画坞。显隐 = 六张面板里有没有一张开着（见 AnimationDock.h），
+    // 所以这里没有独立的开关位：面板表的 open 位就是唯一真源。
+    void drawAnimationDock();
+    // 消费"打开某张动画面板"的一次性请求（Inspector 的 Edit timeline… /
+    // `MYVK_EDITOR_TLED`）。**必须排在 computeLayout 之前**：坞的高度是布局
+    // 输入，晚一帧就"开了但看不见"；而且坞只画当前那一页，请求留在面板自己
+    // 的 draw 里就永远没人取（"此刻没翻到那一页"时）。
+    void serviceAnimationDockRequests();
+
+    // ---- 选中轮廓高光（2026-11-05）----
+    // 每帧把"当前该描边的实体"写进渲染器。只有**普通选择**方式下才写，
+    // 框选 / 套索 / 刷选过程中写空 —— 那三种手势每拖一下都会改选中集合，
+    // 描边会跟着闪成一片；而且它们本来就有矩形/套索/刷痕作为可视反馈。
+    // 判据与 `editor::isSelectableObject` 无关：这里只回答"描哪些"，
+    // 圈得到谁由选择路径负责（见 SelectionModes.h）。
+    void syncSelectionOutline();
 
     // ---- 底部通栏 + Content 抽屉（2026-10-17 布局改造）----
     // 底栏：左侧三个带图标的按钮（内容 / 输出日志 / CMD），右侧资源统计。
@@ -914,6 +947,20 @@ private:
     // 乘在 dt 上（等价于 Unity 的 Time.timeScale / UE 的 Global Time
     // Dilation）。默认 1.0 —— 不碰它时逐帧行为与本功能引入前完全一致。
     float m_timeScale = 1.0f;
+
+    // ---- 底部动画坞（2026-11-05）----
+    AnimationDock m_animDock;
+    // 坞的高度（**引用**传给 AnimationDock::draw，拖动上边缘会就地改它）。
+    // computeLayout 要用它把主体整体让上去 —— 所以它是"布局输入"，
+    // 每帧在 computeLayout 里被夹到"主体至少还剩 kMinViewport"。
+    float m_animDockH = 300.0f;
+    // 坞的矩形（computeLayout 算出，drawAnimationDock 使用）
+    Rect m_animDockRect{0.0f, 0.0f, 0.0f, 0.0f};
+
+    // ---- 选中轮廓（2026-11-05）----
+    // 上一帧真的喂给渲染器的 id 集合。只用来"变化时打一行日志"
+    // （每帧打 SEL-OUTLINE 会把日志刷爆，而自动化脚本只需要知道"变了"）。
+    std::vector<std::uint32_t> m_outlineIdsLogged;
 
     // ---- P1：特效调度 + 打击感（2026-11-02）----
     //

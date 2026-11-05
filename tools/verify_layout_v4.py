@@ -171,14 +171,17 @@ def part_b():
         check(abs(mx) < 2.0 and 280.0 <= mw <= 520.0,
               "B1 模式栏贴最左且宽度合理 (x=%.0f w=%.0f)" % (mx, mw))
 
-        # ⚠ 行数必须跟 `editor::kEditModeCount` 对齐（现在是 10：Select /
+        # ⚠ 行数必须跟 `editor::kModeRailRows` 对齐（2026-11-04 起是 9：
         #   Landscape / Foliage / MeshPaint / Modeling / Fracture / BrushEdit /
-        #   Animation / PCG / Water）。这里原来写死 `range(9)`，是 2026-10-21
-        #   加 Water 之前留下的 —— 于是 water 那一行从来没被 B2 检查过，
-        #   `rows[-1]` 也指着 Animation 而不是真正的最后一行。
-        rows = [rect_of(tap, "MODE-RAIL-%d" % i, 4.0) for i in range(10)]
+        #   Animation / PCG / Water）。
+        #
+        #   **Select 已经不在列表里** —— 用户要求"模式类型中的选择这项移除掉"，
+        #   它现在归视口里按住 Tab 的径向菜单（点选/框选/套索/刷选）。
+        #   枚举值 Select=0 保留（默认状态 + 落盘的 mode id），所以行锚点
+        #   `MODE-RAIL-<枚举值>` 是 1..9，不是 0..8。
+        rows = [rect_of(tap, "MODE-RAIL-%d" % i, 4.0) for i in range(1, 10)]
         check(all(r is not None for r in rows),
-              "B2 10 行模式全部有锚点（没有被窗口裁掉）")
+              "B2 9 行模式全部有锚点（没有被窗口裁掉）")
 
         win = rect_of(tap, "MODE-RAIL-WIN", 4.0)
         if rows[-1] and win:
@@ -186,16 +189,16 @@ def part_b():
                   "B2b 最后一行底边 %.0f <= 列表底边 %.0f（没溢出）"
                   % (rows[-1][3], win[3]))
 
-        # B3 点第 5 行 = Modeling
+        # B3 点 Modeling 那一行
         n0 = events(tap, r"EDITMODE-PANELS mode=modeling")
-        click(hwnd, *center(rows[4]))
+        click(hwnd, *center(rows[3]))          # 0..8 → Modeling 是枚举 4
         time.sleep(0.9)
         ok = events(tap, r"EDITMODE-PANELS mode=modeling") > n0
         if not ok:
-            click(hwnd, *center(rect_of(tap, "MODE-RAIL-4", 3.0)))
+            click(hwnd, *center(rect_of(tap, "MODE-RAIL-ITEM modeling", 3.0)))
             time.sleep(0.9)
             ok = events(tap, r"EDITMODE-PANELS mode=modeling") > n0
-        check(ok, "B3 点左栏第 5 行 → EDITMODE-PANELS mode=modeling")
+        check(ok, "B3 点左侧第 4 行（Modeling）→ EDITMODE-PANELS mode=modeling")
 
         # B4 建模面板落在左栏里
         #

@@ -839,18 +839,24 @@ void PostProcess::recordComposite(
                                m_geoSets.empty() ? VK_NULL_HANDLE
                                                  : m_geoSets[fi]};
     // 96B 推常量：vec4 params（曝光 / 强度 / tonemap / 暗角）
-    //            + vec4 camFx（色差 / 暗角幂 / 保留）
+    //            + vec4 camFx（色差 / 暗角幂 / 选中描边开关 / 选中描边线宽）
     //            + vec4 lut（缩放 / 偏置 / 开关 / 混合权重）
     //            + vec4 ups（源纹素 x,y / 升采样开关 / 锐度）
     //            + vec4 outline（开关 / 宽度 / 深度阈值 / 法线阈值）
     //            + vec4 outlineRgb（rgb = 线颜色，a = 强度）
     // 曝光用 effectiveExposure()：自动曝光开着时是自适应值，
     // 关着时**精确等于** m_settings.exposure（逐像素回到基线）。
+    // 选中轮廓高光（2026-11-05）：camfx.z = 开关、camfx.w = 线宽（像素）。
+    // 这两个通道原本是"保留"，现在有主了 —— 不新增推常量字段，
+    // 因此 push 范围仍是 96B（见 post.frag 的 PC 声明）。
+    // 与 NPR 描边共用同一个"几何缓冲是否就绪"的前置条件：没有几何缓冲
+    // （关掉深度预通道 / 预览目标）时整段跳过，不会去采一张无意义的图。
+    const float selOn = (m_selOutlineMask && outlineReady()) ? 1.0f : 0.0f;
     const float post[8] = {effectiveExposure(), m_settings.bloomStrength,
                            static_cast<float>(m_settings.tonemapMode),
                            m_cameraFx.vignette,
-                           m_cameraFx.chroma, m_cameraFx.vignettePower, 0.0f,
-                           0.0f};
+                           m_cameraFx.chroma, m_cameraFx.vignettePower,
+                           selOn, m_selOutlineWidth};
     // LUT 采样坐标：c*(N-1)/N + 1/(2N)。恒等 LUT 在仿射函数上可被硬件
     // 三线性精确重建 → 开着但参数默认时画面几乎不变（回归对照组）。
     const float lutScale =

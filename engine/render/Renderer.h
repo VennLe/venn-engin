@@ -695,6 +695,35 @@ public:
     //   正好是调试几何该待的位置（被墙挡住、能叠在玻璃下面）。
     //   ImGui 叠加层做不到深度，穿墙可见会让用户误判"这个锚点在墙外"。
     //   `RP-DRAW` 用的细长立方体在视觉上与线等价，成本却只有一次 draw。
+    // ============================================================
+    // 选中轮廓高光（2026-11-05）
+    //
+    // 编辑器每帧把"当前选中的实体 id"写进来（普通选择方式才写，其余
+    // 手势方式传空 —— 框选/套索/刷选过程中描一堆边反而看不清）。
+    //
+    // 实现分两段，都不新增渲染目标：
+    //   ① 深度预通道：选中物体的片元把几何缓冲的 alpha 写成**负距离**
+    //      （正常是正的视图距离）。几何缓冲是现成的，这一笔零成本。
+    //   ② 后处理合成：对几何缓冲做一次"负值扩张"检测，把负值像素的边缘
+    //      画成高亮色（见 post.frag 的 selectionOutline）。
+    // 为什么不用"反向外壳"（把选中网格再画一遍并沿法线外扩）：
+    //   硬边网格的法线是逐面分裂的，外扩时棱角处会裂开（实测是虚线描边）；
+    //   而且单面网格（薄片屋顶）根本没有背面可画。几何缓冲这条路不受这两
+    //   个限制，还顺带免费拿到正确的遮挡关系（被挡住的物体不会描边）。
+    //
+    // 空列表 = 一条都不画（与"这个开关不存在"逐像素等价）。
+    // ============================================================
+    void setSelectionOutline(std::vector<std::uint32_t> entityIds) {
+        m_outlineIds = std::move(entityIds);
+    }
+    // 上一帧被标记的绘制项数（0 = 没有选中物）。验证脚本据此断言
+    // "选中才有描边、清空就消失"，不必去比对 2px 细线的像素。
+    std::uint32_t outlineDrawn() const { return m_outlineDrawn; }
+    // 后处理要用它决定"这一帧开不开描边检测"（省掉全屏 12 次采样）。
+    bool selectionOutlineActive() const {
+        return !m_outlineIds.empty() && m_outlineDrawn > 0;
+    }
+
     bool& jointGizmosEnabled() { return m_showJointGizmos; }
     // 锚点小球的半径（米）。关节的尺度差别很大（门铰链 2 cm / 起重机 2 m），
     // 固定值总有一半场景看不清，所以留一个可调的。
@@ -1057,6 +1086,14 @@ private:
 
     struct DrawItem {
         const assets::Mesh* mesh = nullptr;
+        // 实体 id（选中描边用）。0 = 未知 / 不该被描边。
+        // 加这个字段而不是"按 mesh 反查"：同一个网格会被多个实体复用，
+        // 反查会把整个场景里所有长这样的物体一起描上。
+        std::uint32_t entityId = 0;
+        // 本项是否被编辑器选中（每帧由 setSelectionOutline 决定）。
+        // 深度预通道据此把几何缓冲的 alpha 写成**负距离**，后处理描边
+        // 靠符号区分"选中物体的像素"（见 depth_only.frag）。
+        bool selected = false;
         const assets::Material* material = nullptr;  // 可能为空（走缺省材质）
         glm::mat4 model{1.0f};
         float viewDepthSq = 0.0f;  // 到相机的距离平方（透明排序用）
@@ -1136,6 +1173,9 @@ private:
     // 深度预通道的几何提交（遍历本帧不透明绘制列表）。
     // 调用方负责 RenderPass 的 begin/end 与 set 0 的绑定。
     void recordOpaqueDepthGeometry(VkCommandBuffer cmd);
+
+    // 该实体这一帧要不要被描边（线性查找 m_outlineIds —— 选中项是个位数）。
+    bool isOutlined(std::uint32_t entityId) const;
 
     // ------------------------------------------------------------
     // Shader 变体的绑定（前向 Pass 用）
@@ -1262,6 +1302,12 @@ private:
     // ---- 天空盒背景管线（前向 Pass 内，全屏三角形 3 顶点，无顶点缓冲）----
     // 推常量范围与主前向管线一致，理由同栅格管线（见 createPipelines）。
     std::unique_ptr<rhi::Pipeline> m_pipelineSky;
+
+    // ---- 选中描边标记（深度预通道写几何缓冲的 alpha 符号）----
+    // 编辑器写进来的选中实体 id（每帧覆盖一次，不跨帧累积）
+    std::vector<std::uint32_t> m_outlineIds;
+    // 上一帧被标记的绘制项数（日志 / 统计 / 自动化断言用）
+    std::uint32_t m_outlineDrawn = 0;
 
     std::unique_ptr<rhi::DescriptorAllocator> m_descriptors;
     VkDescriptorSetLayout m_globalSetLayout = VK_NULL_HANDLE;
@@ -1690,6 +1736,10 @@ private:
         int32_t jointBase = -1;
         uint32_t firstInstance = 0;  // 全局 SSBO 槽基址
         uint32_t count = 0;          // 实例数
+        // 这一批是不是"编辑器选中的物体"。进聚合键：深度预通道只能每批
+        // 推一次 push.pbr.x，混在一起就没法只标记其中几个（见选中描边）。
+        // 常态全 false，批的切分与引入前完全一致。
+        bool selected = false;
     };
     std::vector<DrawBatch> m_opaqueBatches;
     bool m_instancingEnabled = false;

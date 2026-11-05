@@ -35,6 +35,21 @@
 // pbr.vert 的输出（世界空间法线；pbr.inst.vert / pbr.mdi.vert 同 layout）
 layout(location = 1) in vec3 vNormal;
 
+// ---- 2026-11-05：选中描边的标记位 ----
+// 推常量的布局与 pbr.vert 完全一致（同一个 VkPipelineLayout，范围 128B、
+// 阶段 VERTEX | FRAGMENT）。这里只读 pbr.x：
+//   0 = 普通物体，1 = 编辑器选中的物体
+// 标记方式：把 alpha 写成**负的**视图距离。正负号就是"是不是选中物"，
+// 绝对值和原来逐位相同 —— 所以描边（NPR）那边的深度差值判据只要取 abs()
+// 就一点也不受影响（见 post.frag 的 geoEdge）。
+layout(push_constant) uniform Push {
+    mat4 model;
+    vec4 baseColorFactor;
+    vec4 pbr;
+    vec4 emissive;
+    vec4 skin;
+} push;
+
 layout(location = 0) out vec4 outGeo;
 
 void main() {
@@ -43,5 +58,6 @@ void main() {
     // 除零保护：理论上 w 不会为 0（意味着点在相机平面上），但退化三角形
     // 上驱动给出 0 是有先例的，一个 max 换确定性。
     const float viewDist = 1.0 / max(gl_FragCoord.w, 1e-8);
-    outGeo = vec4(n, viewDist);
+    const float signedDist = push.pbr.x > 0.5 ? -viewDist : viewDist;
+    outGeo = vec4(n, signedDist);
 }

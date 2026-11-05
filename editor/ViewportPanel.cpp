@@ -586,11 +586,20 @@ void ViewportPanel::drawToolbar() {
             dl->AddRectFilled(p, q, IM_COL32(255, 255, 255, 30), 3.0f);
         }
         const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
-        const int curIcon = mode == GizmoMode::Select      ? kVpIconSelect
-                            : mode == GizmoMode::Translate ? kVpIconMove
-                            : mode == GizmoMode::Rotate    ? kVpIconRotate
-                                                           : kVpIconScale;
-        paintVpIcon(dl, ImVec2(p.x + 5.0f, p.y + 4.0f), 16.0f, curIcon, col);
+        // 按钮图标 = **当前选择方式**（2026-11-04 用户要求把选择方式列表
+        // 挂到这颗按钮上，图标就得跟着变，否则"点开才知道现在是框选"）。
+        //
+        // 只在 Select 态这么做：Move / Rotate / Scale 时用户关心的是"手柄是
+        // 哪个"，显示套索图标会让人以为变换工具丢了。
+        if (mode == GizmoMode::Select) {
+            paintSelectionModeIcon(dl, ImVec2(p.x + 5.0f, p.y + 4.0f), 16.0f,
+                                   c.selectionMode(), col);
+        } else {
+            const int curIcon = mode == GizmoMode::Translate ? kVpIconMove
+                                : mode == GizmoMode::Rotate  ? kVpIconRotate
+                                                             : kVpIconScale;
+            paintVpIcon(dl, ImVec2(p.x + 5.0f, p.y + 4.0f), 16.0f, curIcon, col);
+        }
         paintVpIcon(dl, ImVec2(p.x + 26.0f, p.y + 7.0f), 11.0f, kVpIconCaret,
                     ImGui::GetColorU32(ImGuiCol_TextDisabled));
         logRect("VP-TOOLBTN", p, q);
@@ -834,7 +843,15 @@ void ViewportPanel::drawToolbar() {
                     ImVec2(ImGui::GetCursorScreenPos().x + need,
                            ImGui::GetCursorScreenPos().y + 24.0f));
             // 自动化：这一帧实际画出了哪几颗（taken）与被丢掉的是谁（budget 不够）
-            if (std::getenv("MYVK_LOG_RECTS")) {
+            //
+            // ⚠ 这行**不受 `MYVK_LOG_RECTS` 控制**（2026-11-04）：
+            //   它是"某个控件根本没被画出来"的**唯一**证据。`logRect` 只
+            //   去重、不判可见性，所以被丢掉的那颗会**保留上一次的矩形** ——
+            //   自动化照着那个矩形点下去，点中的是现在压在那儿的别的按钮，
+            //   然后弹出别人的菜单，后面几条断言连锁全红（`verify_viewport_bar`
+            //   V3a→V1→V2a 就是这么来的，第一版判据还以为"速度滑条坏了"）。
+            //   只在变更时打一行，音量可以忽略。
+            {
                 static int lastTaken = -1;
                 if (taken != lastTaken) {
                     lastTaken = taken;
@@ -993,6 +1010,52 @@ static bool vpToolRow(const char* id, int icon, const char* label, const char* k
     return clicked;
 }
 
+// 一行**选择方式**：排版与 `vpToolRow` 同一套（单选圆点 + 图标 + 名字 +
+// 右对齐快捷键），只是图标是手绘的矢量字形而不是 `kVpIcon*` 枚举。
+//
+// 为什么不复用 `vpToolRow`：那张表按 `int icon` 走 `paintVpIcon`，而四张
+// 选择方式图在 `SelectionModes.cpp` 里（径向菜单也用它）。把 int 编码
+// 成"负数表示选择方式"能省一次重载 —— 省下的那点行数换来的是一处需要
+// 注释解释的魔法值，不值。
+static bool vpSelModeRow(const char* id, SelectionMode m, const char* label,
+                         bool active, const char* filter, const char* rectTag) {
+    if (!vpToolMatch(label, filter)) return false;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float h = 26.0f;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+
+    ImGui::PushID(id);
+    const bool clicked = ImGui::Selectable("##row", false,
+                                           ImGuiSelectableFlags_None,
+                                           ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+    ImGui::PopID();
+
+    const float cy = p.y + h * 0.5f;
+    if (active) {
+        dl->AddCircleFilled(ImVec2(p.x + 10.0f, cy), 4.2f,
+                            ImGui::GetColorU32(ui::tokens().accent), 12);
+    } else {
+        dl->AddCircle(ImVec2(p.x + 10.0f, cy), 4.2f,
+                      ImGui::GetColorU32(ImGuiCol_TextDisabled), 12, 1.2f);
+    }
+    ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    if (!active && !hovered) tc.w *= 0.86f;
+    const ImU32 col = ImGui::GetColorU32(tc);
+    paintSelectionModeIcon(dl, ImVec2(p.x + 22.0f, cy - 8.0f), 16.0f, m, col);
+    dl->AddText(ImVec2(p.x + 46.0f, cy - ImGui::GetTextLineHeight() * 0.5f), col,
+                label);
+    const char* key = "Tab";
+    const ImVec2 kw = ImGui::CalcTextSize(key);
+    dl->AddText(ImVec2(p.x + w - kw.x - 10.0f, cy - kw.y * 0.5f),
+                ImGui::GetColorU32(ImGuiCol_TextDisabled), key);
+
+    if (rectTag) logRect(rectTag, p, ImVec2(p.x + w, p.y + h));
+    return clicked;
+}
+
 void ViewportPanel::drawToolMenu() {
     placeDropdown();
     if (!ImGui::BeginPopup("##vp_tool_menu")) return;
@@ -1001,18 +1064,53 @@ void ViewportPanel::drawToolMenu() {
             ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(),
                    ImGui::GetWindowPos().y + ImGui::GetWindowHeight()));
 
+    // ---------------- 选择方式（2026-11-04 从右栏面板搬到这里）----------------
+    //
+    // 用户原话：「这个选择方式列表可以放在视口顶部左侧的选择图标那里，
+    // 点击箭头选择图标的时候展开这个方式列表。」
+    //
+    // 放在**最上面**而不是塞在变换工具下面：工具条最左那颗按钮的图标在
+    // Select 态下画的就是当前选择方式（见 drawToolbar ①），用户点它时想
+    // 找的第一件事就是"换成框选"。放在 8 行变换工具之后等于藏在折页里。
+    //
+    // ⚠ **不受搜索框过滤**：搜索框是给变换工具那张表用的（它会被打字时
+    //   逐行过滤），而这里只有四行固定项。让它们跟着过滤会出现"打了 rot，
+    //   选择方式整段消失"——那不像过滤，像坏了。
+    ImGui::SeparatorText(TR("Selection Mode"));
+    {
+        const SelectionMode curs = m_ctx.selectionMode();
+        for (int i = 0; i < kSelectionModeCount; ++i) {
+            const SelectionMode sm = static_cast<SelectionMode>(i);
+            // ⚠ `i18n-keep`：锚点 tag，屏幕不显示；脚本按 id 定位
+            //   （verify_selection_modes 的 A3 / A4）。
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "SELMODE-ITEM %s",
+                          selectionModeId(sm));  // i18n-keep
+            if (vpSelModeRow(selectionModeId(sm), sm, TR(selectionModeName(sm)),
+                             curs == sm, nullptr, tag)) {
+                // 点一行 = 换成这个手感。**不改** EditMode：这个下拉是
+                //  "怎么用左键"，和左栏那 9 行"用哪套工具"是两个轴。
+                m_ctx.setSelectionMode(sm);
+                VK_LOG_INFO("VP-SELMODE %s", selectionModeId(sm));
+                ImGui::CloseCurrentPopup();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", TR(selectionModeHint(sm)));
+            }
+        }
+    }
+
     // 搜索框宽度**固定**，不要用 GetWindowWidth() 推。
     //
     // 踩过的坑：`SetNextItemWidth(max(230, GetWindowWidth()-16))` 在弹层
     // 第一帧拿到的是父窗口宽度（≈1570），于是搜索框被撑到 1554px、把
     // 整个弹层拉成一条横贯屏幕的带子。弹层是 auto-resize 的 —— 内容的
     // 宽度**决定**窗口宽度，从窗口宽度反推内容宽度是个死循环。
+    ImGui::SeparatorText(TR("Transform tools"));
     ImGui::SetNextItemWidth(kToolMenuW - 16.0f);
     ImGui::InputTextWithHint("##vp_tool_search", TR("Start typing to search"),
                              m_toolSearch, sizeof(m_toolSearch));
     logRect("VP-TOOLSEARCH", ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-
-    ImGui::SeparatorText(TR("Transform tools"));
 
     struct Row { GizmoMode m; int icon; const char* label; const char* key;
                  const char* id; };
@@ -1474,20 +1572,21 @@ void ViewportPanel::focusEntity(ecs::Entity e) const {
 // 有网格的用世界 AABB 的 8 个角投影（旋转过的物体用点做包含判定会漏掉它
 // 的"角"伸进框里的情况）；点光源 / 空节点这类没有包围盒的，退化成"投影
 // 点落在框里"。
-bool ViewportPanel::entityInsideBox(ecs::Entity e, const glm::mat4& viewProj,
-                                    const glm::vec2& vpPos,
-                                    const glm::vec2& vpSize,
-                                    const glm::vec2& a, const glm::vec2& b) {
-    const auto inBox = [&](const glm::vec2& p) {
-        return p.x >= a.x && p.x <= b.x && p.y >= a.y && p.y <= b.y;
-    };
-
+//
+// 2026-11-04：把"投影成矩形"这一步抽成 `entityScreenRect`，给框选 / 套索 /
+// 刷选共用（三者的差别只在"鼠标轨迹怎么判"，不在"物体占哪块屏幕"）。
+bool ViewportPanel::entityScreenRect(ecs::Entity e, const glm::mat4& viewProj,
+                                     const glm::vec2& vpPos,
+                                     const glm::vec2& vpSize,
+                                     glm::vec2& lo, glm::vec2& hi) {
     scene::Scene& sc = m_ctx.activeScene();
     const Aabb box = m_picking.worldAabb(sc, e);
+
+    lo = glm::vec2(1e30f);
+    hi = glm::vec2(-1e30f);
+    bool any = false;
+
     if (box.valid) {
-        bool anyIn = false;
-        glm::vec2 lo(1e30f);
-        glm::vec2 hi(-1e30f);
         for (int i = 0; i < 8; ++i) {
             const glm::vec3 c((i & 1) ? box.max.x : box.min.x,
                               (i & 2) ? box.max.y : box.min.y,
@@ -1497,14 +1596,9 @@ bool ViewportPanel::entityInsideBox(ecs::Entity e, const glm::mat4& viewProj,
                 continue;   // 在相机背后：这个角不参与判定
             lo = glm::min(lo, p);
             hi = glm::max(hi, p);
-            if (inBox(p)) anyIn = true;
+            any = true;
         }
-        if (anyIn) return true;
-        // 没有角落进框，但框**整个落在**它的投影矩形里（贴脸看一面墙时
-        // 就是这样）—— 也算碰到。
-        const bool overlap =
-            hi.x >= a.x && lo.x <= b.x && hi.y >= a.y && lo.y <= b.y;
-        return overlap;
+        return any;
     }
 
     // 没有网格（点光 / 空节点 / 太阳）：用世界位置一个点。
@@ -1514,8 +1608,234 @@ bool ViewportPanel::entityInsideBox(ecs::Entity e, const glm::mat4& viewProj,
     if (!PickingSystem::worldToScreen(viewProj, vpPos, vpSize,
                                       glm::vec3(sc.worldMatrix(e)[3]), p))
         return false;
-    return inBox(p);
+    lo = hi = p;
+    return true;
 }
+
+bool ViewportPanel::entityInsideBox(ecs::Entity e, const glm::mat4& viewProj,
+                                    const glm::vec2& vpPos,
+                                    const glm::vec2& vpSize,
+                                    const glm::vec2& a, const glm::vec2& b) {
+    glm::vec2 lo, hi;
+    if (!entityScreenRect(e, viewProj, vpPos, vpSize, lo, hi)) return false;
+
+    // 投影矩形与框相交就算碰到。这一条同时覆盖了"某个角落在框里"
+    // （那时矩形必然与框相交）和"框整个落在它的投影矩形里"（贴脸看一面
+    // 墙时就是这样）—— 原来那段 `anyIn || overlap` 的写法是等价的，
+    // 只是把同一个判据写了两遍。
+    return hi.x >= a.x && lo.x <= b.x && hi.y >= a.y && lo.y <= b.y;
+}
+
+// 射线穿越法（even-odd）。容差 0：轨迹点是我们自己按鼠标位置采的，
+// 不需要"点在边上算不算"的小数抖动保护 —— 真落在边上时两种答案都能接受。
+bool ViewportPanel::pointInPolygon(const std::vector<glm::vec2>& poly,
+                                   float px, float py) {
+    if (poly.size() < 3) return false;
+    bool inside = false;
+    for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++) {
+        const glm::vec2& pi = poly[i];
+        const glm::vec2& pj = poly[j];
+        // 水平射线向右穿这条边？
+        if ((pi.y > py) != (pj.y > py)) {
+            const float xCross =
+                pi.x + (py - pi.y) * (pj.x - pi.x) / (pj.y - pi.y);
+            if (px < xCross) inside = !inside;
+        }
+    }
+    return inside;
+}
+
+// 矩形到圆心的最短距离 <= r。把矩形夹到离圆心最近的那个点上算距离，
+// 比"矩形四角/圆心互查"少一半分支，也不会有"圆包住矩形"的漏判。
+bool ViewportPanel::rectHitsCircle(const glm::vec2& lo, const glm::vec2& hi,
+                                   const glm::vec2& c, float r) {
+    const float nx = std::max(lo.x, std::min(c.x, hi.x));
+    const float ny = std::max(lo.y, std::min(c.y, hi.y));
+    const float dx = c.x - nx;
+    const float dy = c.y - ny;
+    return dx * dx + dy * dy <= r * r;
+}
+
+// ---------------------------------------------------------------- Tab 径向菜单
+//
+// 用户要的形状（2026-11-04 原话）：
+//   「当鼠标在视口范围中时，鼠标按下 tab 键不动时可以打开一个圆盘选项，
+//     分别有普通选择，框选，套索选择，刷选，然后鼠标移动到哪个区域对应的
+//     选项就直接切换到对应的选择方式。」
+//
+// 三个刻意的取舍：
+//
+// ① **按下即开，不需要"按住不动"的计时**。用户的"不动"描述的是手势
+//    （按住 + 别松手），不是"必须静止 200ms"。加计时会让"按 Tab 立刻甩
+//    到右边"这种熟练操作慢半拍，而误触的代价只是屏幕上多一块饼。
+//
+// ② **移动即切换，不设"确认"**。整块饼是四个互斥的手感，切错了再甩回去
+//    就行 —— 它不改变场景、不进撤销栈，代价为零。需要二次确认的菜单是
+//    "要执行破坏性动作"的菜单，这里不是。
+//
+// ③ **死区内不动手**。中心留 34px 的空档：按 Tab 时鼠标常常在原地抖两下，
+//    没有死区的话四个扇区之间会来回跳，日志刷屏、用户也看不出当前选了啥。
+//    死区**不重置**已经切过的模式 —— 手滑回中间不该把刚选的框选撤掉。
+void ViewportPanel::drawSelectionRadial(const glm::vec2& vpPos,
+                                        const glm::vec2& vpSize,
+                                        bool hovered) {
+    ImGuiIO& io = ImGui::GetIO();
+    const glm::vec2 mouse(io.MousePos.x, io.MousePos.y);
+
+    // ---- 打开：Tab 在视口里按下 ----
+    //
+    // `!io.WantTextInput` 是必须的：Console 的输入框、Inspector 的数字框
+    // 里按 Tab 是"跳到下一个字段"，不该弹饼。
+    if (!m_radialOpen && hovered && !io.WantTextInput &&
+        ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
+        m_radialOpen = true;
+        m_radialHover = -1;
+        // 中心夹到视口里：鼠标贴在右边缘按 Tab 时，饼的一半会画到视口外，
+        // 被窗口裁掉后扇区看起来是"缺了两块"。
+        const float m = 124.0f;   // = 外圈 112 + 背板 10 + 2 的余量
+        m_radialCenter = glm::vec2(
+            std::max(vpPos.x + m, std::min(mouse.x, vpPos.x + vpSize.x - m)),
+            std::max(vpPos.y + m, std::min(mouse.y, vpPos.y + vpSize.y - m)));
+        VK_LOG_INFO("SEL-RADIAL open mode=%s",
+                    selectionModeId(m_ctx.selectionMode()));
+    }
+
+    if (!m_radialOpen) return;
+
+    // ---- 关闭：Tab 松开（或被 Play / 切面板打断）----
+    if (!ImGui::IsKeyDown(ImGuiKey_Tab) || !m_ctx.isEditing()) {
+        m_radialOpen = false;
+        m_radialHover = -1;
+        VK_LOG_INFO("SEL-RADIAL close mode=%s",
+                    selectionModeId(m_ctx.selectionMode()));
+        return;
+    }
+
+    // ---- 指向哪一块 ----
+    const float dx = mouse.x - m_radialCenter.x;
+    const float dy = mouse.y - m_radialCenter.y;
+    const float dist = std::sqrt(dx * dx + dy * dy);
+    constexpr float kInner = 38.0f;    // 死区半径
+    constexpr float kOuter = 112.0f;   // 外圈半径（纯视觉，判定不限外半径）
+    int hover = -1;
+    if (dist > kInner) {
+        // 角度 → 扇区：0 = 上，顺时针。四块各 90°。
+        float deg = std::atan2(dy, dx) * 57.29577951f + 90.0f;
+        while (deg < 0.0f) deg += 360.0f;
+        while (deg >= 360.0f) deg -= 360.0f;
+        hover = static_cast<int>(deg / 90.0f) % kSelectionModeCount;
+    }
+
+    if (hover != m_radialHover) {
+        m_radialHover = hover;
+        if (hover >= 0) {
+            const SelectionMode sm = static_cast<SelectionMode>(hover);
+            // **切到手感的同时离开专属工具**：用户按 Tab 想要的是"换个选法"，
+            // 不是在植被模式里换个画笔 —— 不切回 Select 的话，左键仍然被
+            // FoliageEditor 吃掉，换了个寂寞。
+            if (m_ctx.editMode() != EditMode::Select) {
+                m_ctx.setEditMode(EditMode::Select);
+                VK_LOG_INFO("SEL-RADIAL exit-to-select");
+            }
+            m_ctx.setSelectionMode(sm);
+        }
+    }
+
+    // ---- 画 ----
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 c(m_radialCenter.x, m_radialCenter.y);
+    const ui::ThemeTokens& tk = ui::tokens();
+    const ImU32 accent = ImGui::GetColorU32(tk.accent);
+    const ImU32 textCol = ImGui::GetColorU32(ImGuiCol_Text);
+
+    // 环形扇区：逐段四边形拼。`PathFillConvex` 对环形不成立（凹），
+    // 用中心扇形再盖背景也不行（底下是 3D 画面，盖不住）。
+    const auto ringSector = [&](float r0, float r1, float a0, float a1,
+                                ImU32 col) {
+        constexpr int seg = 20;
+        for (int i = 0; i < seg; ++i) {
+            const float t0 = a0 + (a1 - a0) * (float(i) / seg);
+            const float t1 = a0 + (a1 - a0) * (float(i + 1) / seg);
+            const ImVec2 p00(c.x + std::cos(t0) * r0, c.y + std::sin(t0) * r0);
+            const ImVec2 p01(c.x + std::cos(t0) * r1, c.y + std::sin(t0) * r1);
+            const ImVec2 p11(c.x + std::cos(t1) * r1, c.y + std::sin(t1) * r1);
+            const ImVec2 p10(c.x + std::cos(t1) * r0, c.y + std::sin(t1) * r0);
+            dl->AddQuadFilled(p00, p01, p11, p10, col);
+        }
+    };
+
+    // 背板：一圈很淡的暗底，让白字在亮场景（雪地 / 天空）上也能读。
+    dl->AddCircleFilled(c, kOuter + 10.0f, IM_COL32(14, 16, 20, 165), 64);
+
+    for (int i = 0; i < kSelectionModeCount; ++i) {
+        const SelectionMode sm = static_cast<SelectionMode>(i);
+        const bool on = (i == m_radialHover);
+        const bool cur = (sm == m_ctx.selectionMode());
+        // 扇区 i 的角度范围：0 在上，顺时针 90°。
+        const float a0 = (-90.0f + i * 90.0f - 45.0f) * 0.0174532925f;
+        const float a1 = a0 + 90.0f * 0.0174532925f;
+
+        ImU32 fill;
+        if (on) {
+            fill = accent;
+        } else if (cur) {
+            // 当前方式常亮一档：菜单一打开就能看出"我现在是哪种"，
+            // 不用先甩到那一块上。
+            ImVec4 a = tk.accent;
+            a.w = 0.32f;
+            fill = ImGui::GetColorU32(a);
+        } else {
+            fill = IM_COL32(38, 42, 50, 200);
+        }
+        ringSector(kInner, kOuter, a0, a1, fill);
+        // 扇区之间的缝：画一条从内圈到外圈的细线，四块才分得开。
+        // 用「先画一条深色、再压一条浅色」的两条线：3D 画面在背后时
+        // 单条深色线会和阴影糊在一起（第一版就是这样，四块看着连成一片）。
+        dl->AddLine(ImVec2(c.x + std::cos(a0) * kInner,
+                           c.y + std::sin(a0) * kInner),
+                    ImVec2(c.x + std::cos(a0) * kOuter,
+                           c.y + std::sin(a0) * kOuter),
+                    IM_COL32(12, 14, 18, 230), 2.6f);
+        dl->AddLine(ImVec2(c.x + std::cos(a0) * (kInner + 2.0f),
+                           c.y + std::sin(a0) * (kInner + 2.0f)),
+                    ImVec2(c.x + std::cos(a0) * (kOuter - 2.0f),
+                           c.y + std::sin(a0) * (kOuter - 2.0f)),
+                    IM_COL32(150, 162, 180, 90), 1.0f);
+
+        // 图标 + 文字：沿扇区中线，图标在上、名字在下。
+        // 名字**缩小到 0.82 倍**：扇区水平可用宽度约 106px，而
+        // "Lasso Select" 在默认字号下就是 110px —— 第一版四个标签糊成
+        // 一片（截图确认）。用 `AddText(font,size,...)` 而不是改全局字号，
+        // 免得把左栏面板里同一串字也缩小。
+        const float mid = (a0 + a1) * 0.5f;
+        const float rr = (kInner + kOuter) * 0.5f;
+        const ImVec2 ic(c.x + std::cos(mid) * rr, c.y + std::sin(mid) * rr);
+        const ImU32 fg = on ? IM_COL32(16, 18, 22, 255) : textCol;
+        paintSelectionModeIcon(dl, ImVec2(ic.x - 11.0f, ic.y - 25.0f), 22.0f,
+                                sm, fg);
+        const char* nm = TR(selectionModeName(sm));
+        const float fs = ImGui::GetFontSize() * 0.82f;
+        const float tw = ImGui::CalcTextSize(nm).x * 0.82f;
+        dl->AddText(ImGui::GetFont(), fs,
+                    ImVec2(ic.x - tw * 0.5f, ic.y + 3.0f), fg, nm);
+    }
+
+    // 中心：**画图标不画字**。
+    //
+    // 第一版中心写的是当前方式的名字，于是"上扇区"和中心同时出现两个
+    // "Select"，看起来像重影（截图确认）。图标既省空间又能和扇区里的
+    // 图标对上号 —— 悬停时显示"将要切到哪个"，没悬停时显示"现在是哪个"。
+    {
+        const SelectionMode shown = m_radialHover >= 0
+                                        ? static_cast<SelectionMode>(m_radialHover)
+                                        : m_ctx.selectionMode();
+        dl->AddCircleFilled(c, kInner - 4.0f, IM_COL32(20, 23, 28, 210), 40);
+        paintSelectionModeIcon(dl, ImVec2(c.x - 11.0f, c.y - 11.0f), 22.0f,
+                                shown, textCol);
+    }
+    dl->AddCircle(c, kOuter, IM_COL32(140, 150, 165, 170), 64, 1.4f);
+}
+
 
 // ---------------------------------------------------------------- 落地（数字键 0）
 //
@@ -2897,11 +3217,17 @@ void ViewportPanel::draw() {
         !m_gizmo.dragging() &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         const glm::vec2 mouse(io.MousePos.x, io.MousePos.y);
+        const SelectionMode sm = m_ctx.selectionMode();
+        const bool additive = io.KeyCtrl || io.KeyShift;
+
         // 先问"是不是点在**选中物体的碰撞框**那圈线上"。
         //
         // 语义：点在框的**轮廓**上 = "我要调这个碰撞框"；点在物体**中间** =
         // 常规点选（手柄回到实体）。这个区分很自然 —— 碰撞框默认贴着模型，
         // 只有轮廓附近才可能命中，所以"点中心回到编辑物体"永远可用。
+        //
+        // ⚠ 这一条排在四种方式**之前**：调碰撞框是"改数据"，不是"选东西"，
+        //   框选模式下点碰撞框线也该进编辑态，否则用户得先切回点选才能调。
         if (m_ctx.hasSelection() &&
             m_colliders.hitSelectedWireframe(m_ctx, vpPos, vpSize, mouse)) {
             if (!m_ctx.colliderEdit()) {
@@ -2910,6 +3236,34 @@ void ViewportPanel::draw() {
                             "collider");
                 m_ctx.setStatus(TR("Editing collision body (W/E/R)"));
             }
+        } else if (sm == SelectionMode::Box) {
+            // 框选：**不论起点有没有点中物体**都开始拉框 —— 这正是它与
+            // 点选的分工。之前只有"点在空白处"才起框，想在模型堆里框住
+            // 一片就得先找个缝按下去。
+            m_boxActive = true;
+            m_boxStart = mouse;
+            m_boxCurrent = mouse;
+            m_boxAdditive = additive;
+            VK_LOG_INFO("pick: box select start (mode=box)");
+        } else if (sm == SelectionMode::Lasso) {
+            m_lassoActive = true;
+            m_lassoAdditive = additive;
+            m_lassoPts.clear();
+            m_lassoPts.push_back(mouse);
+            VK_LOG_INFO("pick: lasso select start");
+        } else if (sm == SelectionMode::Brush) {
+            m_brushActive = true;
+            m_brushAdditive = additive;
+            m_brushHits.clear();
+            // 不叠加时立刻清空：否则"刚才选的那一堆"会一直混在刷选结果里，
+            // 用户看着像刷子把旧东西也"刷"到了。
+            //
+            // 叠加时先把当前选择集**拷一份**当底：后面每帧要把 hits merge
+            // 回它，直接读 selectionSet() 会读到上一帧自己写进去的结果。
+            m_brushBase = additive ? m_ctx.selectionSet()
+                                   : std::vector<ecs::Entity>{};
+            if (!additive) m_ctx.clearSelection();
+            VK_LOG_INFO("pick: brush select start");
         } else {
             const Ray ray =
                 PickingSystem::rayFromViewport(cam, vpPos, vpSize, mouse);
@@ -2918,7 +3272,7 @@ void ViewportPanel::draw() {
                 // 视口里的 Ctrl / Shift + 左键 = 往选择集里加 / 减一个，
                 // 与层级树里的点法一致（#316）。Shift 也认 —— "Shift 加选"
                 // 在资源管理器那类界面里同样是肌肉记忆。
-                if (io.KeyCtrl || io.KeyShift) {
+                if (additive) {
                     m_ctx.selectToggle(hit.entity);
                     const std::string* n2 =
                         m_ctx.activeScene().world().name(hit.entity);
@@ -2946,10 +3300,16 @@ void ViewportPanel::draw() {
                 // 这里**不再立刻清空**选中：一次"按下 → 松开"如果没怎么动，
                 // 松开时才当成"点空白 → 清空"；动了就是在拉框。两者的差别
                 // 只在松手那一刻由位移阈值决定，按下时先按"可能要拉框"记账。
+                //
+                // 2026-11-04：普通点选模式下**保留**这条。主流编辑器（UE /
+                // Blender）的"选择"工具也是点空白起框 —— 把它去掉会让
+                // "想框一片但起点正好在物体上"变得无解，而且这一条是引入
+                // 四种选择方式之前就有的行为，改了等于给老用户换手感。
+                // 框选模式的增量只是"起点在物体上也起框"，见上面那支。
                 m_boxActive = true;
                 m_boxStart = mouse;
                 m_boxCurrent = mouse;
-                m_boxAdditive = io.KeyShift || io.KeyCtrl;
+                m_boxAdditive = additive;
                 VK_LOG_INFO("pick: nothing hit -> box select start");
             }
         }
@@ -2988,11 +3348,20 @@ void ViewportPanel::draw() {
                 ecs::World& w2 = m_ctx.activeScene().world();
                 w2.each<ecs::TransformComponent>(
                     [&](ecs::Entity e, ecs::TransformComponent&) {
-                        // 上锁的（自带地面）永远不参与框选 —— 一次拖框把
-                        // 地面选中，接下来随便拖个手柄就把整个场景的参照系
-                        // 挪走了。
-                        if (w2.has<ecs::LockedComponent>(e)) return;
-                        if (m_ctx.isSelected(e)) return;   // 已有 + 叠加模式
+                        // 上锁的（自带地面 / 地形）永远不参与框选 —— 一次拖框
+                        // 把地面选中，接下来随便拖个手柄就把整个场景的参照系
+                        // 挪走了。判据本体在 `isSelectableObject`（四种方式
+                        // 共用一条），这里只是"这个实体算不算物体"。
+                        if (!isSelectableObject(w2, e)) return;
+                        // ⚠ 这里**不能**跳过 `isSelected(e)`。
+                        //
+                        //   原来的写法是"已有的不再收"，看起来只是去重，
+                        //   实际会毁掉整次框选：连着框同一片区域两次时，
+                        //   第二次全员命中却全员被跳过 → `found` 空 →
+                        //   走 else 分支 `clearSelection()` —— 用户看到的
+                        //   是"再框一次，选中全没了"。
+                        //   去重由 `selectMany` 自己做（它先清空再重建），
+                        //   这里只负责"这次框到了谁"。
                         if (entityInsideBox(e, vp, vpPos, vpSize, a, b))
                             found.push_back(e);
                     });
@@ -3014,6 +3383,125 @@ void ViewportPanel::draw() {
         }
     } else if (m_boxActive) {
         m_boxActive = false;   // 掉到运行态 / 面板切走时别留一个半截的框
+    }
+
+    // 2.92) 套索选择（2026-11-04）
+    //
+    // 轨迹点按 `kLassoMinStepPx` 抽稀后存着，松手时**闭合**做点包含。
+    //
+    // ⚠ 判据用"实体的屏幕矩形中心落在多边形里"，而不是"矩形与多边形相交"。
+    //   后者要算 8 条边 × N 条轨迹边的相交，代价是这里的两百倍，而收益只是
+    //   "圈住物体一角也选中" —— 套索在用户心里本来就是"圈住"而不是"碰到"，
+    //   这与框选刻意相反（框选是扫一片，套索是画个圈）。两者的语义差异写在
+    //   这里，免得以后有人"统一"成一套。
+    if (m_lassoActive && m_ctx.isEditing()) {
+        const glm::vec2 cur(io.MousePos.x, io.MousePos.y);
+        if (m_lassoPts.empty() ||
+            glm::length(cur - m_lassoPts.back()) >= kLassoMinStepPx) {
+            m_lassoPts.push_back(cur);
+        }
+
+        if (m_lassoPts.size() >= 2) {
+            std::vector<ImVec2> poly;
+            poly.reserve(m_lassoPts.size());
+            for (const glm::vec2& p : m_lassoPts)
+                poly.emplace_back(p.x, p.y);
+            dl->AddPolyline(poly.data(), static_cast<int>(poly.size()),
+                            IM_COL32(120, 175, 255, 230), ImDrawFlags_None, 2.0f);
+            // 从当前点到起点的一段"还没画上去"的预览：用户松开手它就会
+            // 自动闭合，提前看见这条线才能判断"会不会把旁边的也圈进来"。
+            dl->AddLine(ImVec2(cur.x, cur.y), poly.front(),
+                        IM_COL32(120, 175, 255, 110), 1.2f);
+            dl->AddCircleFilled(poly.front(), 3.0f, IM_COL32(170, 210, 255, 255),
+                                8);
+        }
+
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            m_lassoActive = false;
+            const glm::mat4 vp = PickingSystem::viewProj(cam, vpSize);
+            std::vector<ecs::Entity> found;
+            if (m_lassoPts.size() >= 3) {
+                ecs::World& wl = m_ctx.activeScene().world();
+                wl.each<ecs::TransformComponent>(
+                    [&](ecs::Entity e, ecs::TransformComponent&) {
+                        if (!isSelectableObject(wl, e)) return;
+                        // 同框选那段：**不跳过已选中**，否则"先框一片再套同一片"
+                        // 会得到空集，然后被当成"圈空了"清掉全部选中。
+                        glm::vec2 lo, hi;
+                        if (!entityScreenRect(e, vp, vpPos, vpSize, lo, hi))
+                            return;
+                        const glm::vec2 mid = (lo + hi) * 0.5f;
+                        if (pointInPolygon(m_lassoPts, mid.x, mid.y))
+                            found.push_back(e);
+                    });
+            }
+            if (m_lassoAdditive && m_ctx.multiSelected()) {
+                std::vector<ecs::Entity> merged = m_ctx.selectionSet();
+                merged.insert(merged.end(), found.begin(), found.end());
+                m_ctx.selectMany(merged);
+            } else if (!found.empty()) {
+                m_ctx.selectMany(found);
+            } else {
+                m_ctx.clearSelection();
+            }
+            VK_LOG_INFO("LASSO-SELECT n=%zu pts=%zu additive=%d",
+                        m_ctx.selectionCount(), m_lassoPts.size(),
+                        m_lassoAdditive ? 1 : 0);
+            m_lassoPts.clear();
+            m_lassoAdditive = false;
+        }
+    } else if (m_lassoActive) {
+        m_lassoActive = false;
+        m_lassoPts.clear();
+    }
+
+    // 2.93) 刷选（2026-11-04）
+    //
+    // 按住左键涂，圆形笔刷**扫过就加**（不做"涂满才算"）。每帧把圆内的
+    // 新实体追加进 `m_brushHits`，然后 merge 到选择集 —— 用户能实时看到
+    // 选中的东西一个个亮起来，而不是松手才出结果。
+    if (m_brushActive && m_ctx.isEditing()) {
+        const glm::vec2 cur(io.MousePos.x, io.MousePos.y);
+        dl->AddCircleFilled(ImVec2(cur.x, cur.y), kBrushRadiusPx,
+                            IM_COL32(90, 150, 235, 34), 40);
+        dl->AddCircle(ImVec2(cur.x, cur.y), kBrushRadiusPx,
+                      IM_COL32(120, 175, 255, 210), 40, 2.0f);
+
+        const glm::mat4 vp = PickingSystem::viewProj(cam, vpSize);
+        ecs::World& wb = m_ctx.activeScene().world();
+        bool grew = false;
+        wb.each<ecs::TransformComponent>([&](ecs::Entity e,
+                                             ecs::TransformComponent&) {
+            if (!isSelectableObject(wb, e)) return;
+            if (std::find(m_brushHits.begin(), m_brushHits.end(), e) !=
+                m_brushHits.end())
+                return;
+            glm::vec2 lo, hi;
+            if (!entityScreenRect(e, vp, vpPos, vpSize, lo, hi)) return;
+            if (!rectHitsCircle(lo, hi, cur, kBrushRadiusPx)) return;
+            m_brushHits.push_back(e);
+            grew = true;
+        });
+
+        if (grew) {
+            std::vector<ecs::Entity> merged = m_brushBase;
+            merged.insert(merged.end(), m_brushHits.begin(), m_brushHits.end());
+            m_ctx.selectMany(merged);
+        }
+
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            m_brushActive = false;
+            VK_LOG_INFO("BRUSH-SELECT n=%zu hits=%zu additive=%d",
+                        m_ctx.selectionCount(), m_brushHits.size(),
+                        m_brushAdditive ? 1 : 0);
+            m_brushHits.clear();
+            m_brushBase.clear();
+            m_brushAdditive = false;
+        }
+    } else if (m_brushActive) {
+        m_brushActive = false;
+        m_brushHits.clear();
+        m_brushBase.clear();
     }
 
     // 3.5) Shift+A 添加菜单（仅编辑态；每帧无条件提交 popup）
@@ -3126,6 +3614,11 @@ void ViewportPanel::draw() {
     } else {
         drawPlayHud(vpPos, vpSize);
     }
+
+    // 3.9) Tab 径向菜单：**必须画在最后**。
+    //      ImGui 的 draw list 是按调用顺序上的，放在中间会被后面的 HUD /
+    //      统计胶囊盖住一角。它只在按住 Tab 的那一小段时间里有内容。
+    drawSelectionRadial(vpPos, vpSize, hovered);
 
     ImGui::End();
     if (gameFullscreen) ImGui::PopStyleVar();

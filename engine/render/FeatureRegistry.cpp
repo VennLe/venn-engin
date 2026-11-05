@@ -216,6 +216,11 @@ static const ParamDesc kParamsSsr[] = {
           "屏幕空间反射。"),
     PFloat("ssr.strength", "Strength", "MYVK_SSR_STRENGTH", 0.0f, 1.5f,
            ParamTier::Basic, "反射叠加强度（菲涅尔再乘一层）。", 0.0f),
+    PFloat("ssr.roughness", "Surface roughness", "MYVK_SSR_ROUGHNESS", 0.0f,
+           1.0f, ParamTier::Advanced,
+           "反射表面的假定粗糙度：掠射角的反射上限 = 1 - 该值。"
+           "调低 → 地面更像镜面；默认 0.72 让草地/砖地不再反射出树影。",
+           0.0f),
 };
 static const ParamDesc kParamsGodrays[] = {
     PBool("godrays.enabled", "God rays", "MYVK_GODRAYS", ParamTier::Basic,

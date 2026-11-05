@@ -39,6 +39,7 @@
       },
       "parent": -1,
       "visible": true,
+      "locked": true,
       "castShadow": true,
       "terrain": {
         "source": "terrain/water_bowl/terrain.vterrain",

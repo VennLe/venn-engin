@@ -56,6 +56,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 struct ImDrawList;
 
@@ -219,6 +220,59 @@ private:
     bool entityInsideBox(ecs::Entity e, const glm::mat4& viewProj,
                          const glm::vec2& vpPos, const glm::vec2& vpSize,
                          const glm::vec2& a, const glm::vec2& b);
+
+    // ---------------------------------------------------------- 选择方式（2026-11-04）
+    //
+    // 点选 / 框选 / 套索 / 刷选这四种手感由**按住 Tab 的径向菜单**切换，
+    // 状态本身存在 EditorContext::selectionMode()（左栏面板也要读它）。
+    // 下面这些只是**这次按键手势**的中间量，松手就没意义 —— 所以不进
+    // 全局状态，也不落盘。
+    bool m_radialOpen = false;          // Tab 按住期间为 true
+    int m_radialHover = -1;             // 当前指向的扇区（-1 = 死区）
+    glm::vec2 m_radialCenter{0.0f};     // 圆盘中心 = 按下 Tab 时的鼠标位置
+
+    // 套索：按下后的轨迹点（屏幕坐标）。松手时闭合做点包含。
+    bool m_lassoActive = false;
+    bool m_lassoAdditive = false;
+    std::vector<glm::vec2> m_lassoPts;
+
+    // 刷选：已经刷到的实体（去重，松手时结算）
+    bool m_brushActive = false;
+    bool m_brushAdditive = false;
+    std::vector<ecs::Entity> m_brushHits;
+    // 按下时的选择集快照（叠加模式下每帧都要和它合并 —— 直接读
+    // `ctx.selectionSet()` 不行：上一帧已经把它改成本帧的结果了，
+    // 于是"刷过的"会指数级复制一份又一份）
+    std::vector<ecs::Entity> m_brushBase;
+
+    // 刷选半径（像素）。26 是在 1600×900 下调出来的：再小要反复涂，
+    // 再大会把旁边的物体一把带进来。
+    static constexpr float kBrushRadiusPx = 26.0f;
+    // 套索相邻采样点的最小距离：不抽稀的话快速甩手会得到几十个几乎重合的
+    // 点，判定里的射线穿越次数会翻倍（还更容易在多边形边界上抖动）。
+    static constexpr float kLassoMinStepPx = 6.0f;
+
+    // 覆盖在视口上的径向菜单。`hovered` = 鼠标在视口第一格里。
+    void drawSelectionRadial(const glm::vec2& vpPos, const glm::vec2& vpSize,
+                             bool hovered);
+
+    // 实体的**屏幕包围矩形**（世界 AABB 八个角投影出来）。
+    // 返回 false = 一个角都没投影成功（整只物体在相机背后）。
+    //
+    // 框选 / 套索 / 刷选三者共用它：三套手势的差别只在"怎么拿鼠标轨迹
+    // 去判"，而"物体在屏幕上占哪块"是同一个问题。各写一份必然漂移
+    // （改一处忘了另一处，症状是"框选能选到、套索选不到同一个物体"）。
+    bool entityScreenRect(ecs::Entity e, const glm::mat4& viewProj,
+                          const glm::vec2& vpPos, const glm::vec2& vpSize,
+                          glm::vec2& lo, glm::vec2& hi);
+
+    // 点 (px,py) 是否落在多边形里（射线穿越法，含边界容差）。
+    static bool pointInPolygon(const std::vector<glm::vec2>& poly, float px,
+                               float py);
+
+    // 矩形 [lo,hi] 到点 c 的距离是否 <= r（刷选的圆形笔刷判定）。
+    static bool rectHitsCircle(const glm::vec2& lo, const glm::vec2& hi,
+                               const glm::vec2& c, float r);
 
     // 编辑模式工具（**不拥有**；生命周期归 EditorApp）。
     // 见 attachModeTools：视口只负责把射线与键鼠状态发过去。

@@ -1192,6 +1192,96 @@ void EditorApp::serviceEditMode() {
                 (curIdx >= 0 && panelOpen(curIdx)) ? 1 : 0);
 }
 
+void EditorApp::syncSelectionOutline() {
+    // 判据只有两条，且都必须在**这一帧**回答：
+    //   · 编辑态（Play / Run 时不该出现编辑器标记，它会被拍进截图和录像）
+    //   · 普通选择方式（框/套索/刷选过程里选中集合每帧都变，描边会闪；
+    //     它们各自已有矩形 / 套索线 / 刷痕作为反馈）
+    // 其余情况一律传空列表 —— 空列表 = 一条都不画（见 Renderer 的说明）。
+    std::vector<std::uint32_t> ids;
+    if (m_ctx->isEditing() && m_ctx->selectionMode() == SelectionMode::Pick) {
+        ids.reserve(m_ctx->selectionCount());
+        for (const ecs::Entity e : m_ctx->selectionSet()) {
+            if (e.valid()) ids.push_back(static_cast<std::uint32_t>(e.id));
+        }
+    }
+
+    // 只在集合变化时打一行：自动化据此断言"选中才有描边、清空就消失"，
+    // 而不用去比对像素（像素判据在描边这种 2px 的细边上非常脆）。
+    if (ids != m_outlineIdsLogged) {
+        m_outlineIdsLogged = ids;
+        VK_LOG_INFO("SEL-OUTLINE ids=%d mode=%s edit=%d",
+                    static_cast<int>(ids.size()),
+                    selectionModeId(m_ctx->selectionMode()),
+                    m_ctx->isEditing() ? 1 : 0);
+    }
+    renderer().setSelectionOutline(std::move(ids));
+}
+
+void EditorApp::serviceAnimationDockRequests() {
+    // 坞里的面板大多"由窗口对象自己管 open/close"，打开请求是在各自的
+    // drawXxxWindow() 里消费的 —— 而坞只画**当前那一页**，于是"请求开 A 页、
+    // 当前是 B 页"时那份请求永远没人取，面板一辈子不出现（实测：
+    // `verify_timeline_editor` 的 A 组 15 条全红，`TLED-*` 一个锚点都没有）。
+    //
+    // 所以请求的消费必须**提前到画之前、且与当前页无关**：
+    //   · 排在 computeLayout 之前 —— 否则这一帧坞还是 0 高，开了也看不见；
+    //   · 取到请求后顺手 `selectTab`，把坞抢到那一页（Inspector 点
+    //     "Edit timeline…" 的期待是"我看见它了"）。
+    std::string reqPath;
+    if (m_ctx->takeTimelineEditorRequest(reqPath)) {
+        if (m_tlEditor) m_tlEditor->open(reqPath);
+        const int tab = AnimationDock::tabOfPanel("timelineed");
+        if (tab >= 0) {
+            AnimationDock::selectTab(tab);
+            VK_LOG_INFO("PANEL timelineed open=1 reason=edit-request path=%s",
+                        reqPath.c_str());
+        }
+    }
+}
+
+void EditorApp::drawAnimationDockContent(int tab) {
+    // 派发表：坞的下标 → 真正的面板。
+    //
+    // ⚠ 为什么按 **id** 分派而不是按下标 switch：
+    //   下标定义在 AnimationDock.cpp（kTabIds），两处写死数字迟早会错位，
+    //   而错位在这里的症状是"点摄影表出来的是 NLA"——很难往回追。
+    const char* id = AnimationDock::tabId(tab);
+    if (!id || !*id) return;
+    auto is = [id](const char* s) {
+        const char* a = id;   // 局部副本：默认捕获的 id 是 const 的，不能走
+        while (*a && *a == *s) { ++a; ++s; }
+        return *a == '\0' && *s == '\0';
+    };
+    // 前五张与后面 onImGui 里那串"每帧无条件调用"逐字一致 —— 它们自己
+    // 判 panelOpen / trayHidden，这里只负责"钉进坞的矩形"。
+    if (is("dope")) {
+        drawDopeSheetWindow();
+    } else if (is("curveed")) {
+        drawCurveEditorWindow();
+    } else if (is("bonecurv")) {
+        drawBoneCurveWindow();
+    } else if (is("nla")) {
+        drawNlaWindow();
+    } else if (is("timelineed")) {
+        drawTimelineEditorWindow();
+    } else if (is("cine")) {
+        // 运镜面板走面板表的 draw 指针（它不是"窗口对象自己管 open"那一类）
+        if (m_cinePanel) m_cinePanel->draw();
+    }
+}
+
+void EditorApp::drawAnimationDock() {
+    const Rect& r = m_animDockRect;
+    if (r.w < 80.0f || r.h < 40.0f) return;
+    // 传的是**局部副本**：坞只在用户拖上边缘时改它，改到了才回写到
+    // m_animDockH（偏好高度）。一直回写会把"空间不足时被夹过的值"记成偏好，
+    // 窗口放大的时候坞不会自己长回去。
+    float h = r.h;
+    m_animDock.draw(*this, *m_ctx, r.x, r.y, r.w, h);
+    if (h != r.h) m_animDockH = h;
+}
+
 void EditorApp::drawPanels() {
     const std::vector<PanelDesc>& t = panelTableVec();
     // 2026-10-21：视口上方多了一条标签条，浮动面板全部变成它的标签页。
@@ -1211,6 +1301,11 @@ void EditorApp::drawPanels() {
         // 所以按钮还在，再点一下就回来。
         if (panelTrayHiddenRef(i)) continue;
         const PanelDesc& p = t[i];
+        // ---- 底部动画坞接管的那六张（2026-11-05）----
+        // 它们不再走"视口标签页 / 浮动窗口"这条路：坞是唯一入口（见
+        // AnimationDock.h）。这里必须 continue —— 否则 cine（表里有真实
+        // draw 指针）会被画两次：一次浮在屏幕中央、一次钉在坞里。
+        if (AnimationDock::ownsPanel(p.id)) continue;
         // Content 是"底栏抽屉"，不走表驱动绘制（它要盖在所有面板之上，
         // 而这里的顺序是表顺序 → 会被后画的视口盖住）。见 drawContentDrawer。
         if (p.layoutSlot == kSlotContent) continue;
@@ -4885,8 +4980,35 @@ void EditorApp::computeLayout() {
         std::clamp(m_contentDrawerH, kContentDrawerMin, maxDrawerH);
 
     const float dockH = (drawerOpen && m_contentDock) ? m_contentDrawerH : 0.0f;
-    if (dockH > 0.0f) {
-        m_split->setBottomInset(kBottomBarH + dockH);
+
+    // ============================================================
+    // 底部动画坞（2026-11-05）
+    // ============================================================
+    //
+    // 六张动画面板从"视口标签页"搬到这条通栏里（见 AnimationDock.h）。
+    // 它与底栏、Content 抽屉是**三条互不重叠的横条**，自下而上的顺序固定：
+    //     状态栏 → 底栏 → 动画坞 → Content 抽屉（停靠时）→ 主体
+    // 于是"打开摄影表"只让主体变矮，视口 / 层级 / Inspector 全都在原处 ——
+    // 用户要的正是"上下对照"，任何一块被顶掉都不成立。
+    //
+    // ⚠ 必须和抽屉**一起**塞进同一次 setBottomInset：分两次 apply 的话
+    //   第二次会用"只含抽屉"的 inset 覆盖掉坞，表现是坞画在主体上面、
+    //   视口却没变矮（重叠 300px）。
+    // ⚠ 夹高度：坞最多占到底边还剩 kMinViewport 为止。用户把上边缘拖到
+    //   底也不会把视口压没；矩形一直在，拖回去还拖得动。
+    m_animDockRect = {0.0f, 0.0f, 0.0f, 0.0f};
+    float animDockH = 0.0f;
+    if (AnimationDock::anyOpen()) {
+        const float maxDockH = std::max(bodyH - kMinViewport - dockH, 0.0f);
+        m_animDockH =
+            std::clamp(m_animDockH, 160.0f, std::max(maxDockH, 160.0f));
+        animDockH = std::min(m_animDockH, maxDockH);
+        // 空间实在不够（窗口被压得很小）→ 让位给视口，坞这一帧不出现。
+        if (animDockH < 160.0f) animDockH = 0.0f;
+    }
+
+    if (kBottomBarH + dockH + animDockH > kBottomBarH) {
+        m_split->setBottomInset(kBottomBarH + dockH + animDockH);
         m_split->apply(L);
     }
 
@@ -4895,6 +5017,11 @@ void EditorApp::computeLayout() {
     //   SplitLayout 的 bottomInset 负责 —— 两边算的必须是同一件事。）
     L.bottom = {0.0f, io.DisplaySize.y - kStatusH - kBottomBarH,
                 io.DisplaySize.x, kBottomBarH};
+
+    if (animDockH > 0.0f) {
+        m_animDockRect = {0.0f, L.bottom.y - animDockH, io.DisplaySize.x,
+                          animDockH};
+    }
 
     // 抽屉矩形：贴着底栏上沿往上长。停靠形态横跨整窗；**浮层形态让出右栏**。
     //
@@ -4924,7 +5051,10 @@ void EditorApp::computeLayout() {
             // 会被挤成一条缝，用户反而找不到它。
             if (rightColX > 160.0f && rightColX < drawerW) drawerW = rightColX;
         }
-        L.content = {0.0f, L.bottom.y - m_contentDrawerH, drawerW,
+        // 抽屉的底边 = 坞的上沿（坞开着时）。否则抽屉会压在坞上，
+        // 而坞是"常驻的操作面"，被盖住就等于没打开。
+        const float drawerBaseY = L.bottom.y - animDockH;
+        L.content = {0.0f, drawerBaseY - m_contentDrawerH, drawerW,
                      m_contentDrawerH};
     } else {
         L.content = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -5809,6 +5939,9 @@ void EditorApp::onImGui() {
         return;
     }
 
+    // 底部动画坞的"打开"请求：必须排在 computeLayout **之前**（见函数注释）。
+    serviceAnimationDockRequests();
+
     computeLayout();
 
     // E05：当前布局是否偏离了该工作区的出厂预设（标题栏 / 菜单里的 * 号）。
@@ -5832,6 +5965,10 @@ void EditorApp::onImGui() {
     syncViewportTabs();
     drawViewportTabBar(m_tabBarRect);
 
+    // 选中轮廓：必须在 drawFrame 之前写进渲染器（onImGui 整段都在
+    // drawFrame 之前），越靠近绘制越好 —— 选中状态就在这一帧的 UI 里变。
+    syncSelectionOutline();
+
     // E04：所有面板**表驱动**绘制。顺序 = 表里的顺序（主面板在前、
     // 浮动调试面板在后），与改造前逐条一致。
     // Content 已改成抽屉（见 drawContentDrawer），这里跳过它。
@@ -5851,12 +5988,11 @@ void EditorApp::onImGui() {
     if (m_ctx->showSettings()) drawSettingsPanel();
     drawCharacterWindow();
     drawDialogueEditorWindow();
-    drawTimelineEditorWindow();
     drawUiEditorWindow();
-    drawCurveEditorWindow();
-    drawDopeSheetWindow();
-    drawBoneCurveWindow();
-    drawNlaWindow();
+    // 2026-11-05：Timeline / Curve / Dope / BoneCurve / NLA 五张搬进底部
+    // 动画坞（drawAnimationDock），不再在这里每帧无条件画 —— 坞只画"当前
+    // 那一页"，而这五张各自都是独立窗口对象，同时提交会重叠在坞的矩形上。
+    drawAnimationDock();
 
     // 浮动面板标题栏的"最小化"按钮。必须排在**所有窗口画完之后**：它要读
     // 每个窗口这一帧的 Pos/Size 才能把那一格摆到关闭 X 的左边（见函数注释）。
@@ -12171,14 +12307,9 @@ void EditorApp::drawTimelineEditorWindow() {
     if (idx < 0) return;
 
     // ---- ① 请求：Inspector 点了 "Edit timeline…" ----
-    std::string reqPath;
-    if (m_ctx->takeTimelineEditorRequest(reqPath)) {
-        m_tlEditor->open(reqPath);
-        setPanelOpen(idx, true);
-        panelTrayHiddenRef(idx) = false;
-        VK_LOG_INFO("PANEL timelineed open=1 reason=edit-request path=%s",
-                    reqPath.c_str());
-    }
+    // 2026-11-05：**不在这里消费**。它已经被 `serviceAnimationDockRequests()`
+    // 在 computeLayout 之前取走了 —— 坞只画当前那一页，请求若留在这里，
+    // "此刻没显示时间轴那一页"时它就永远没人取（面板一辈子不出现）。
 
     // ---- ② 托盘收起：窗口对象保持打开，这一帧不提交 ----
     if (panelTrayHiddenRef(idx) && panelOpen(idx)) return;

@@ -1293,6 +1293,27 @@ DEFAULT = [
     #   （D 组的 WARN 里能看到"前台被抢走"）。现在每次发事件前都会重新确认
     #   前台，被抢就抢回来并把那一下点击重试一次；跑这条时别去动鼠标。
     "verify_multiselect",
+    # ---- 视口选择方式（2026-11-04）----
+    # 用户要求把"选择"从模式列表里摘掉，改由视口里**按住 Tab 的径向菜单**
+    # 切四种手感（点选 / 框选 / 套索 / 刷选）。判据分三块：
+    #   A 左栏 9 行 + **没有** select 行 + 选择方式面板四行齐全
+    #   B Tab 圆盘：打开 / 四个扇区各自的 SELMODE / 松开关闭
+    #   C 三种手势真选一次（BOX/LASSO/BRUSH-SELECT 的 n）+ 点空白清空
+    # ⚠ 真鼠标 + 真键盘（keybd_event(VK_TAB)），一次一个，跑时别碰鼠标。
+    "verify_selection_modes",
+    # ---- 底部动画坞（2026-11-05）----
+    # 用户要求把动画 / 骨骼 / 运镜六张面板浓缩成编辑器底部的一条通栏，
+    # 让 3D 视口始终完整可见（"对着场景调动画"）。判据：
+    #   A 打开摄影表 → 坞出现在底部、视口**不与坞重叠**、标签条上不再有 dope
+    #   B 六张全关 → 坞消失、视口长回来（与 A 同一台机器上比高度）
+    #   C/D/E 真鼠标：点标签换页 / 播放暂停 / 拖播放头（播放头矩形跟着右移）
+    "verify_anim_dock",
+    # ---- 普通选择的轮廓高光（2026-11-05）----
+    # "点中场景物体要出现轮廓边缘高光"。实现是几何缓冲 alpha 取负 +
+    # 后处理扩张（不是反向外壳 —— 硬边网格会裂）。判据两条腿：
+    #   A 日志：点中物体 SEL-OUTLINE ids>=1 / 点天空回到 0
+    #   B 像素：视口内新增暖橙像素 >=120，取消后回落基线，对照区 <1%
+    "verify_selection_outline",
 ]
 
 # 结果行：兼容几种写法。取**最后一条**，因为有的脚本会先打一堆中间断言。
@@ -2364,6 +2385,21 @@ TRIGGERS = {
                            "editor/InspectorPanel.*",
                            "editor/Command.*",
                            "editor/EditorApp.*"],
+    # ---- 视口选择方式（2026-11-04）----
+    #   · SelectionModes.*  —— 枚举 / id / 提示 / 四个图标（判据的常量源）
+    #   · ViewportPanel.*   —— 径向菜单 + 框/套索/刷的三套手势与几何判定
+    #   · ModeRail.*        —— 模式列表少了一行、多了"选择方式"面板
+    #   · EditorContext.*   —— selectionMode 状态本体
+    # ⚠ ModeRail 也被 `verify_layout_v4` / `verify_edit_modes` 覆盖（那两条
+    #   没进 DEFAULT，按原样单独跑）。
+    "verify_selection_modes": ["editor/SelectionModes.*",
+                               "editor/ViewportPanel.*",
+                               "editor/ModeRail.*",
+                               "editor/EditorContext.*",
+                               # 夹具 = 第三人称模板；而且 C6/C1b 的期望值
+                               # 直接依赖"模板里的 Ground 带 locked"（地面被
+                               # 框进来会让 n 从 91 变成 92，天上看不出来）。
+                               "templates/**"],
     # ---- 自研二进制资产链（阶段六/七，2026-10-22）----
     # 只登记**非横切**的两块，都是新顶层目录：
     #   · assetio/** —— 格式本体（MeshFormat / VertexOps / AnimOps /
@@ -2947,6 +2983,27 @@ TRIGGERS = {
     # ⚠ 刻意**不登记** `engine/i18n/**`：新增界面词不改行为，属横切
     #   （见 verify_theme_language 的注释，那里才是该跑它的地方）；
     #   `engine/ecs/**` / `engine/assets/**` 在 GLOBAL_GLOBS 里。
+    # ---- 底部动画坞（2026-11-05）----
+    # 坞是"壳"，它改的是**面板的容器**：谁被托管（AnimationDock::ownsPanel）、
+    # 布局让出多少（computeLayout 的 bottomInset）、以及视口标签条把六张摘掉
+    # （ViewportTabs::isTabHosted）。五张窗口自己一行没改（NLA 只补了
+    # applyDockHint），所以它们各自的用例不在这个触发面上。
+    "verify_anim_dock": ["editor/AnimationDock.*",
+                         "editor/EditorApp.cpp",
+                         "editor/ViewportTabs.*",
+                         "editor/PanelDock.*",
+                         "editor/NlaPanel.*"],
+    # ---- 普通选择的轮廓高光（2026-11-05）----
+    # 两段实现跨了四个地方：深度预通道写标记（`depth_only.frag` + Renderer
+    # 的选中集合）、后处理扩张（`post.frag` + PostProcess 的 camfx.zw）、
+    # 编辑器每帧喂 id（EditorApp::syncSelectionOutline）。
+    # ⚠ `assets/shaders/**` 在 GLOBAL_GLOBS 里（改任何一个着色器都跑全量），
+    #   所以那两条**刻意不登记** —— 写了只会被 check_regression_map 的 E 组
+    #   判成"冗余的横切 glob"。
+    "verify_selection_outline": ["engine/render/Renderer.*",
+                                 "engine/render/PostProcess.*",
+                                 "editor/EditorApp.cpp",
+                                 "editor/SelectionModes.*"],
     "verify_dope_sheet": ["editor/DopeSheetWindow.*",
                           "editor/EditorApp.cpp",
                           "editor/PanelRegistry.*",

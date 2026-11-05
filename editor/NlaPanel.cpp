@@ -17,6 +17,7 @@
 
 #include "EditorContext.h"
 #include "Localization.h"
+#include "PanelDock.h"   // 2026-11-05：底部动画坞的矩形托管
 
 #include "animation/NlaTimeline.h"
 #include "core/Logger.h"
@@ -165,9 +166,20 @@ bool NlaPanel::haveSelection() const {
 void NlaPanel::draw(bool& keepOpen) {
     if (!m_open) return;
 
-    ImGui::SetNextWindowSize(ImVec2(820, 460), ImGuiCond_FirstUseEver);
+    // 2026-11-05：底部动画坞（见 AnimationDock.h）。坞开着时窗口被钉进坞的
+    // 内容矩形 —— 与另外五张面板同一套写法（applyDockHint + `docked ? nullptr
+    // : &open`，理由见 PanelDock.h）。
+    ImGuiWindowFlags wf = 0;
+    const bool docked = applyDockHint(wf);
+    if (!docked) {
+        ImGui::SetNextWindowSize(ImVec2(820, 460), ImGuiCond_FirstUseEver);
+    }
     bool open = true;
-    if (!ImGui::Begin(TR("NLA"), &open)) {
+    // ⚠ 稳定 ID 必须等于 `trayWindowName("nla")` = `###panel_nla`，否则底栏
+    //   托盘的最小化 / 置顶按 id 找不到这个窗口（本仓 #311 踩过）。
+    std::string title = TR("NLA");
+    title += "###panel_nla";
+    if (!ImGui::Begin(title.c_str(), docked ? nullptr : &open, wf)) {
         ImGui::End();
         if (!open) {
             close();

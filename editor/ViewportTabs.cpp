@@ -12,6 +12,7 @@
 
 #include "ViewportTabs.h"
 
+#include "AnimationDock.h"
 #include "DebugRects.h"
 #include "Localization.h"
 #include "PanelRegistry.h"
@@ -43,7 +44,12 @@ bool* seenOpen() {
 bool isTabHosted(int index) {
     const PanelDesc* t = panelTable();
     if (!t || index < 0 || index >= panelCount()) return false;
-    return t[index].layoutSlot == kSlotNone;
+    if (t[index].layoutSlot != kSlotNone) return false;
+    // 2026-11-05：动画 / 骨骼 / 运镜六张搬到**底部动画坞**了（见
+    // AnimationDock.h）。它们必须从标签条上消失 —— 否则点开摄影表会把
+    // 3D 视口整块顶掉，"对着场景调动画"在布局上又不成立了。
+    if (AnimationDock::ownsPanel(t[index].id)) return false;
+    return true;
 }
 
 const char* tabLabel(int index) {

@@ -109,6 +109,29 @@ def check(ok, msg):
     return ok
 
 
+def skip(msg):
+    """判据在这台机器上**不成立**（不是坏了）。
+
+    目前只有一个用途：工具条右组的 7 颗按钮放不下时，`take[]` 会把尾部
+    （相机速度）整颗**不画出来**。那是设计（"后面的更不重要，直接停"），
+    不是缺陷 —— 但它会让 `VP-SPEED` 保留一个**上一次的矩形**，照着点下去
+    命中的是现在压在那儿的"视口设置"，弹出别人的菜单，V1/V2a 连锁全红。
+    所以先读 `VP-BAR-FIT taken=n/7`，放不下就 SKIP 这一条。
+    """
+    print("    %-72s %s" % (msg, "SKIP"))
+
+
+def bar_fit(tap):
+    """工具条右组这一帧实际画出了几颗（读 `VP-BAR-FIT taken=n/7`）。"""
+    rx = re.compile(r"VP-BAR-FIT taken=(\d+)/(\d+)")
+    with tap.lock:
+        for line in reversed(tap.lines):
+            m = rx.search(line)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+    return None
+
+
 def center(r):
     return (r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5
 
@@ -204,6 +227,20 @@ def ensure_foreground(hwnd):
 
 def click(hwnd, cx, cy):
     ensure_foreground(hwnd)
+    # 起手预热（2026-11-04）：两次 SetCursorPos + 0.3s。
+    #
+    # ⚠ 一次移动不够 —— 上一动作常常把光标甩到客户区外（或者窗口刚被激活，
+    #   第一下 MOVE 被吞），那几帧 ImGui 读到的 `io.MousePos` 是
+    #   (-FLT_MAX,-FLT_MAX)，`IsItemHovered` 判 false，按下就被丢掉了。
+    #   症状是**分组轮流红**：这次 R 组"吸附弹层没出现"，上次 V 组
+    #   "相机速度滑条没矩形"，每次都不一样 —— 看着像 UI 坏了，其实是
+    #   探针自己没站稳。这条纪律记在 MEMORY.md 里（"合成鼠标起手要预热"）。
+    from verify_asset_drag import client_to_screen
+    sx, sy = client_to_screen(hwnd, int(cx), int(cy))
+    user32.SetCursorPos(sx, sy)
+    time.sleep(0.30)
+    user32.SetCursorPos(sx, sy)
+    time.sleep(0.12)
     _click_raw(hwnd, cx, cy)
 
 
@@ -525,7 +562,15 @@ def part_v(hwnd, tap):
     #   是测试把一个真实的两步操作压成了一步（探针里单独点第一次就开）。
     #   排到最前面之后，这里没有任何未关的弹层。
     speed = rect_of(tap, "VP-SPEED")
-    if speed:
+    fit = bar_fit(tap)
+    if fit and fit[0] < fit[1]:
+        # 右组放不下第 7 颗（相机速度）→ 它**没被画出来**，`VP-SPEED`
+        # 那个矩形是上一帧的残留（logRect 只去重、不判可见性）。
+        # 这时点击会落到压在那儿别的按钮上，把整段 V 带红 —— 所以 SKIP。
+        skip("V3a 工具条放不下相机速度按钮（taken=%d/%d），跳过速度菜单"
+             % fit)
+        speed = None
+    elif speed:
         sl = None
         n = count(tap, "VP-SPEED ")
         for _ in range(2):

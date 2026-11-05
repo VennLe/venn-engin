@@ -79,6 +79,7 @@
    "parent": -1,
    "visible": true,
    "castShadow": true,
+   "locked": true,
    "mesh": {
     "kind": "builtin",
     "shape": "plane",

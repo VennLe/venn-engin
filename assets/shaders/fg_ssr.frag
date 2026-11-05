@@ -11,9 +11,10 @@
 //   · 线性步进 24 步，无二分细化 → 反射边缘可能有轻微错位；
 //   · 法线用深度导数重建（vennNormalFromViewPos，逐图元平面），
 //     曲面上的反射方向会偏"平"；
-//   · 不区分材质粗糙度（全屏 pass 拿不到 push 材质参数），
-//     用菲涅尔 + 全局强度控制 —— 粗糙表面也会有一层"清漆"式
-//     反射。物理上不严格，但视觉上立得住。
+//   · 不区分材质粗糙度（全屏 pass 拿不到 push 材质参数）——
+//     改为吃一个**全局假定粗糙度** `pc.surface.x`（面板 `ssr.roughness`，
+//     默认 0.72）：菲涅尔的掠射上限按它收敛，粗糙地面不再出现"镜子"
+//     式的强倒影。真正的逐像素材质粗糙度要等 G-buffer 加通道。
 //
 // 命中不了（走出屏幕 / 步进用尽）就返回原色 —— 反射只在
 // "屏幕里真的有东西可以照出来"的地方出现，这正是 SSR 的语义。
@@ -36,6 +37,8 @@ layout(push_constant) uniform PC {
     // x=zNear y=zFar —— 深度线性化（vennViewDepthFromNdc）必需，
     // 与 cluster_build.comp 用同一组值，不能拍常数
     vec4 camera;
+    // x = 反射表面假定粗糙度（0..1，见下面 fresnelRoughness 的长注释）
+    vec4 surface;
 } pc;
 
 layout(location = 0) in vec2 vUv;
@@ -71,9 +74,25 @@ void main() {
         return;
     }
 
-    // 菲涅尔权重（F0 = 0.04 电介质近似）：掠射角反射最强
+    // 菲涅尔权重（电介质 F0 = 0.04）。
+    //
+    // ⚠ **必须按粗糙度收敛**，不能直接用光滑表面的 Schlick。理由：
+    //   SSR 是全屏 pass，拿不到逐像素材质（v1 的已知限制，见文件头），
+    //   于是第一版写的是标准 Schlick `0.04 + 0.96*(1-NdotV)^5`。
+    //   对**地面**这类几乎水平的表面，相机俯视时 NdotV 只有 0.05~0.15
+    //   （15 m 外的地面 ≈ atan(1.6/15)），(1-NdotV)^5 ≈ 0.5~0.77
+    //   → 反射率 0.5 以上，还再乘一次强度。结果草地/泥地/砖地一概被
+    //   糊上一层 30%+ 的树影和屋檐倒影，看起来是"湿地面 / 镜子"。
+    //   实测截图里地面明显泛出树冠的绿斑，就是这一项。
+    // 粗糙度 > 0.7 的微表面，掠射角的反射被法线扰动打散，反射率上限
+    //   远低于 1 —— 用 `max(1 - roughness, F0)` 当上限即可（与
+    //   common.glsl 的 vennFresnelSchlickRoughness 同一条公式）。
+    //   这里不复用那个函数：space.glsl 不依赖 common.glsl，为了一个 pow
+    //   把 common 整份拖进两份 MSAA 变体不划算。
     const float ndotv = max(dot(N, V), 0.0);
-    const float fres = 0.04 + 0.96 * pow(1.0 - ndotv, 5.0);
+    const float reflRough = clamp(pc.surface.x, 0.0, 1.0);
+    const float fresMax = max(1.0 - reflRough, 0.04);
+    const float fres = 0.04 + (fresMax - 0.04) * pow(1.0 - ndotv, 5.0);
 
     const float thickness = max(pc.params.y, 1e-3);
     const float stepLen = max(pc.params.z, 1e-3);

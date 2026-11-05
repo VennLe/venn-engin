@@ -76,6 +76,12 @@ struct ScreenSpaceSettings {
     // ---- SSR（屏幕空间反射）----
     bool ssr = false;
     float ssrStrength = 0.6f;     // 反射叠加强度（菲涅尔再乘一层）
+    // 反射表面的**假定粗糙度**（0..1）。SSR 是全屏 pass，看不到逐像素
+    // 材质，所以只能用这一个全局值参与菲涅尔：掠射角的反射上限被收到
+    // `1 - roughness`。默认 0.72 = "大部分是粗糙表面"（地面 / 墙 / 道具），
+    // 这样水平的草地、砖地不会反射出半透明的树影 —— 见 fg_ssr.frag。
+    // 想要镜面般的地板就把它调到 0.1 左右。
+    float ssrSurfaceRoughness = 0.72f;
 
     // ---- God rays（屏幕空间径向体积光）----
     bool godrays = false;

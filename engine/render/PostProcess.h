@@ -190,6 +190,17 @@ public:
     // 诊断用：面板上画着"描边已开"但这条是 false 的话，说明几何缓冲没接上
     // —— 那是最难查的一类（开关亮着、画面没线、日志无错）。
     bool outlineReady() const { return !m_geoSets.empty() && m_geoSets[0] != VK_NULL_HANDLE; }
+
+    // 选中轮廓高光（2026-11-05）：几何缓冲的 alpha 为负的像素 = 编辑器
+    // 选中的物体（见 depth_only.frag / Renderer::setSelectionOutline）。
+    // 这里只决定"合成时跑不跑那段全屏检测"：
+    //   · 关着 → 合成里整段跳过，逐像素与引入前相同（回归基线）；
+    //   · 开着但没有任何负值像素 → 检测跑完什么都不画（代价是 8 次采样）。
+    // 与 NPR 描边（m_settings.outline）互相独立，两者的线色 / 线宽不同。
+    void setSelectionOutlineMask(bool on) { m_selOutlineMask = on; }
+    bool selectionOutlineMask() const { return m_selOutlineMask; }
+    // 线宽（像素）。2.0 在 100% / 200% DPI 下都是一条看得见又不吵的细边。
+    void setSelectionOutlineWidth(float px) { m_selOutlineWidth = px; }
     // 场景渲染分辨率（**缩放后**；模式 A = 交换链尺寸 × renderScale，
     // 模式 B = 视口尺寸 × renderScale）。HdrTarget / 链 / bloom 都用它。
     VkExtent2D sceneExtent() const { return m_sceneExtent; }
@@ -501,6 +512,9 @@ private:
     std::unique_ptr<rhi::DescriptorAllocator> m_descriptors;
 
     bool m_splitOutput = false;         // 模式 B
+    // 选中轮廓高光（2026-11-05）：见 setSelectionOutlineMask。
+    bool m_selOutlineMask = false;
+    float m_selOutlineWidth = 2.0f;
     VkExtent2D m_swapExtent{0, 0};      // 交换链尺寸
     VkExtent2D m_outExtent{0, 0};       // 全分辨率输出（视口 / 交换链）
     VkExtent2D m_sceneExtent{0, 0};     // 场景渲染尺寸 = m_outExtent × renderScale

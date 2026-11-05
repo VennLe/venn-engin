@@ -280,7 +280,7 @@ FEATURES = [
     dict(id="ssr", name="SSR 屏幕空间反射", roadmap="—", scope="Scene",
          panel="Engine ▸ Scene/Reflections",
          ui=["ssr."],
-         env=["MYVK_SSR", "MYVK_SSR_STRENGTH"],
+         env=["MYVK_SSR", "MYVK_SSR_STRENGTH", "MYVK_SSR_ROUGHNESS"],
          test="verify_screenspace", gpu="framegraph"),
     dict(id="godrays", name="God rays 径向体积光", roadmap="—", scope="Scene",
          panel="Engine ▸ Scene/Atmosphere",

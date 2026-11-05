@@ -1777,7 +1777,11 @@ void main() {
     float NDF = distributionGGX(N, H, roughness);
     float G = geometrySmith(N, V, Ld, roughness);
     vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
-    vec3 specular = (NDF * G * F) / max(4.0 * NdotV * NdotL, 1e-4);
+    // 掠射软钳（与 terrain.frag 同一条）：远处水平面 NdotV → 0 时
+    // 1/(4·NdotV·NdotL) 会发散，屏幕上是地平线附近一条刺眼的白带。
+    // 只影响直接光高光的分母，IBL 那边仍用真实 NdotV。
+    const float NdotV_s = max(NdotV, 0.08);
+    vec3 specular = (NDF * G * F) / max(4.0 * NdotV_s * NdotL, 1e-4);
 
     vec3 kS = F;
     vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);

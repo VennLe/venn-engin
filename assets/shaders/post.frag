@@ -69,12 +69,18 @@ layout(push_constant) uniform PC {
 //   "近处过敏感（皮肤纹理都成边）、远处完全失灵（人物没有描边）"。
 //   除以 min(a) 之后，1 米处 2cm 的台阶与 50 米处 1m 的台阶同量级。
 float geoEdge(vec4 gc, vec4 gn) {
-    const bool vc = gc.a > 1e-4;
-    const bool vn = gn.a > 1e-4;
+    // ⚠ a 通道是**带符号**的视图距离（2026-11-05 起）：负 = 编辑器选中的
+    //   物体。描边检测只关心"差多少"，所以这里一律取绝对值 —— 符号留给
+    //   下面的选中高光用。不取绝对值的话，选中物会被当成"深度为负"，
+    //   与旁边物体的相对差爆掉，整片区域被描成一团黑。
+    const float ac = abs(gc.a);
+    const float an = abs(gn.a);
+    const bool vc = ac > 1e-4;
+    const bool vn = an > 1e-4;
     if (!vc && !vn) return 0.0;   // 两边都是天空
     if (vc != vn) return 1.0;     // 物体 vs 天空 → 轮廓（天空 a 被清成 0）
 
-    const float dRel = abs(gc.a - gn.a) / max(min(gc.a, gn.a), 1e-3);
+    const float dRel = abs(ac - an) / max(min(ac, an), 1e-3);
     // 1-dot：0 = 同向、1 = 垂直、2 = 反向。用 1-dot 而非 acos 是因为
     // 它单调、无超越函数，且阈值可以直接表达成"夹角多少度"。
     const float nRel = 1.0 - dot(gc.rgb, gn.rgb);
@@ -208,6 +214,42 @@ void main() {
         }
         color = mix(color, pc.outlineRgb.rgb,
                     clamp(e, 0.0, 1.0) * pc.outlineRgb.a);
+    }
+
+    // ---- 选中轮廓高光（2026-11-05）----
+    // 几何缓冲的 alpha 是**带符号**的视图距离：负 = 该像素属于编辑器
+    // 选中的物体（见 depth_only.frag 与 Renderer::setSelectionOutline）。
+    // 这里做一次"负值向外扩张"：
+    //   · 中心本身是选中物 → 不画（线贴在物体外侧，不吃掉物体本身）；
+    //   · 中心不是、但半径 w 像素内有选中物 → 画。
+    // 为什么不用反向外壳（把选中网格再画一遍并沿法线外扩）：
+    //   硬边网格的法线逐面分裂，外扩时棱角处会裂开（实测是虚线描边）；
+    //   薄片网格（屋顶 / 墙面）根本没有背面可画。
+    // 遮挡关系是免费正确的：深度预通道只保留最近的那个表面，被挡住的
+    // 选中物压根不会出现在几何缓冲里。
+    // 开关与线宽走 pc.camfx.zw（这两个通道此前是"保留"，见 PostProcess
+    // 的 recordComposite：z = 开关，w = 像素宽度）。
+    if (pc.camfx.z > 0.5) {
+        const vec4 gc = texture(geoTex, vUv);
+        if (gc.a >= 0.0) {   // 中心不是选中物（可能干脆没有几何 = 天空）
+            const vec2 tx = pc.ups.xy * max(pc.camfx.w, 1.0);
+            vec2 kOff8[8] = vec2[8](
+                vec2( 1.0,  0.0), vec2(-1.0,  0.0),
+                vec2( 0.0,  1.0), vec2( 0.0, -1.0),
+                vec2( 0.7,  0.7), vec2(-0.7,  0.7),
+                vec2( 0.7, -0.7), vec2(-0.7, -0.7));
+            float hit = 0.0;
+            for (int i = 0; i < 8; ++i) {
+                const vec2 uv =
+                    clamp(vUv + kOff8[i] * tx, vec2(0.0), vec2(1.0));
+                if (texture(geoTex, uv).a < 0.0) hit = 1.0;
+            }
+            if (hit > 0.5) {
+                // 暖橙（显示域）。0.92 的不透明度而不是 1.0：让底下的
+                // 明暗保留一点，细线压在亮天空上才不会糊成一片。
+                color = mix(color, vec3(1.0, 0.46, 0.12), 0.92);
+            }
+        }
     }
 
     outColor = vec4(color, 1.0);

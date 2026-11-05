@@ -15,6 +15,7 @@
 #include "DebugRects.h"
 #include "EditModes.h"
 #include "Localization.h"
+#include "SelectionModes.h"
 
 #include "ui/ImGuiTheme.h"
 #include "core/Logger.h"
@@ -33,6 +34,21 @@ constexpr float kRowH = 28.0f;
 // 必须和这里**逐像素**对上（差 1px 就有一条缝或最后一行被切），读主题的话
 // 字号一变两边就对不上。
 constexpr float kRowGap = 3.0f;
+
+// 列表里画几行。
+//
+// 2026-11-04：`EditMode::Select` **不再是一行** —— 用户的原话是"模式类型
+// 中的选择这项移除掉"。它不是一套编辑工具，而是"左键在视口里画成什么"
+// 的四个手感，现在归视口工具条左上那颗下拉 + Tab 径向菜单（见
+// SelectionModes.h）。其余 9 项照旧。
+//
+// ⚠ 枚举值不能删：`EditMode::Select` 是**默认状态**（编辑器开门时的老
+//   行为），也是从任何专属工具"退出来"的落点。这里只是不画它。删除枚举值
+//   会连带把落盘的 mode id、`clampEditMode` 的范围、以及所有 `switch` 的
+//   语义全改一遍，收益为零。
+constexpr int kModeRailRows = kEditModeCount - 1;   // 9
+// 列表里第一行的枚举值（Select 是 0，所以从 1 开始）
+constexpr int kModeRailFirst = 1;
 
 // 折叠态（2026-10-28）。为什么用文件级静态而不是参数：
 // `modeRailListHeight()` / `modeRailListRect()` / `modeRailBodyRect()` 是
@@ -57,7 +73,7 @@ float modeRailListHeight() {
     if (g_modeRailCollapsed) {
         return header + st.WindowPadding.y * 2.0f;
     }
-    const float rows = static_cast<float>(kEditModeCount) * (kRowH + kRowGap);
+    const float rows = static_cast<float>(kModeRailRows) * (kRowH + kRowGap);
     return header + rows + st.WindowPadding.y * 2.0f;
 }
 
@@ -194,7 +210,7 @@ void drawModeRail(EditorContext& ctx) {
         return;
     }
 
-    // ---- 10 行单选 ----
+    // ---- 9 行单选（Select 不在其中，见 kModeRailRows 的说明）----
     // 行间距压到 3：默认 ItemSpacing.y（主题里是 7）会在 10 行上白吃 70px，
     // 而左栏下半的参数面板正缺这几十像素（Modeling 面板一屏放不下）。
     // 行高仍是 28，和顶栏下拉的 `editModeRow` 保持一致，只是挨得紧一点。
@@ -202,7 +218,8 @@ void drawModeRail(EditorContext& ctx) {
     const float rowW = std::max(R.w - 12.0f, 60.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(ImGui::GetStyle().ItemSpacing.x, kRowGap));
-    for (int i = 0; i < kEditModeCount; ++i) {
+    for (int n = 0; n < kModeRailRows; ++n) {
+        const int i = kModeRailFirst + n;
         const EditMode m = static_cast<EditMode>(i);
         const bool active = (m == cur);
         const bool impl = editModeImplemented(m);
@@ -269,10 +286,18 @@ void drawModeRail(EditorContext& ctx) {
 
     ImGui::End();
 
-    // ---- 参数区：Select 模式下是空的，别留一大块纯底色 ----
-    // Select 没有自己的面板（它就是"点一下选中 + W/E/R 变换"，参数都在
-    // 右侧 Inspector 里）。这里给一张说明卡，把常用键写清楚 —— 否则左栏
-    // 下半是一整块空灰，看起来像界面没加载完。
+    // ---- 参数区 ----
+    //
+    // Select 已经从模式列表里摘掉（2026-11-04），于是"没有专属工具"这个
+    // 常态在左栏需要一个落点 —— 否则列表里 9 行全不亮，下半又空着一大块，
+    // 看起来像界面没加载完。
+    //
+    // ⚠ 2026-11-04 二次调整：**四个选择方式那几行搬去视口工具条了**。
+    //   用户原话：「这个选择方式列表可以放在视口顶部左侧的选择图标那里，
+    //   点击箭头选择图标的时候展开这个方式列表。」左栏这里只留一张说明卡
+    //   —— 把入口指出来（工具条那颗箭头 / 视口里按住 Tab），不再重复一遍
+    //   单选列表。两处各放一份单选，用户改了这边那边的圆点不亮，就会以为
+    //   "没切过去"。
     if (ctx.editMode() == EditMode::Select) {
         const Rect body = modeRailBodyRect(L);
         if (body.w < 60.0f || body.h < 60.0f) return;
@@ -295,9 +320,10 @@ void drawModeRail(EditorContext& ctx) {
             ImGui::PushStyleColor(ImGuiCol_Text, tk.textFaint);
             ImGui::TextWrapped(
                 "%s",
-                TR("Select mode has no parameters of its own: click to pick, "
-                   "W/E/R for move/rotate/scale, Q for the selector, F to "
-                   "focus the selection. Everything else lives in Inspector."));
+                TR("Selection method lives in the viewport's tool menu "
+                   "(the arrow at its top-left) or the Tab wheel. "
+                   "W/E/R move, rotate and scale; Q returns the selector. "
+                   "Everything else is in Inspector."));
             ImGui::PopStyleColor();
         }
         ImGui::End();

@@ -243,6 +243,8 @@ void Renderer::bindFeatureParams() {
     render::bindParam("ssr.enabled", &m_screenSpace.ssr, ParamKind::Bool);
     render::bindParam("ssr.strength", &m_screenSpace.ssrStrength,
                       ParamKind::Float);
+    render::bindParam("ssr.roughness", &m_screenSpace.ssrSurfaceRoughness,
+                      ParamKind::Float);
 
     render::bindParam("godrays.enabled", &m_screenSpace.godrays, ParamKind::Bool);
     render::bindParam("godrays.strength", &m_screenSpace.godraysStrength,
@@ -3701,6 +3703,9 @@ void Renderer::buildDrawLists(scene::Scene& scene, const glm::vec3& camPos,
         it.lodLevel = lodLevel;        const auto* matc = w.get<ecs::MaterialComponent>(e);
         it.material = matc ? matc->material : nullptr;
         it.model = model;
+        // 选中描边按实体 id 匹配（见 DrawItem::entityId）。
+        it.entityId = e.id;
+        it.selected = isOutlined(e.id);
 
         // 无 LOD 的物体也要参与"如果全用 0 级会提交多少"的对照
         it.baseTriangles = static_cast<uint32_t>(
@@ -4080,7 +4085,11 @@ void Renderer::buildOpaqueBatches() {
                m_opaqueDraws[j + 1].material == m_opaqueDraws[i].material &&
                m_opaqueDraws[j + 1].mesh == m_opaqueDraws[i].mesh &&
                m_opaqueDraws[j + 1].jointBase ==
-                   m_opaqueDraws[i].jointBase) {
+                   m_opaqueDraws[i].jointBase &&
+               // 选中态也进聚合键（2026-11-05）：深度预通道每批只能推一次
+               // push.pbr.x，把选中项和未选中项混在一批里就没法只标记其中
+               // 几个。未选中场景下这一条恒 false，批的切分不变。
+               m_opaqueDraws[j + 1].selected == m_opaqueDraws[i].selected) {
             ++j;
         }
         DrawBatch batch;
@@ -4088,6 +4097,7 @@ void Renderer::buildOpaqueBatches() {
         batch.material = m_opaqueDraws[i].material;
         batch.keywords = m_opaqueDraws[i].keywords;
         batch.jointBase = m_opaqueDraws[i].jointBase;
+        batch.selected = m_opaqueDraws[i].selected;
         batch.firstInstance = m_instanceOffset;
         batch.count = static_cast<uint32_t>(j - i + 1);
         for (size_t k = i; k <= j; ++k) {
@@ -4633,7 +4643,12 @@ void Renderer::createPipelines() {
         desc.vertexBindings.push_back(assets::Vertex::bindingDescription());
         desc.vertexAttributes = assets::Vertex::attributeDescriptions();
         desc.setLayouts = {m_globalSetLayout};
-        desc.pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        // ⚠ 阶段位从 VERTEX 扩到 VERTEX | FRAGMENT（2026-11-05）：选中描边
+        //   要读 push.pbr.x 决定几何缓冲 alpha 的正负（见 depth_only.frag）。
+        //   范围一改，下面所有 vkCmdPushConstants 的 stageFlags 也必须跟着
+        //   覆盖这两个阶段，否则刷 VUID-vkCmdPushConstants-offset-01795。
+        desc.pushConstant.stageFlags =
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         desc.pushConstant.offset = 0;
         desc.pushConstant.size = sizeof(PushConstants);
         desc.renderPass = m_hdrTarget->depthPrePass();
@@ -5538,7 +5553,20 @@ void Renderer::recordSkyBackground(VkCommandBuffer cmd) {
     ++m_stats.drawCalls;
 }
 
-// ---------------------------------------------------------------- 天空参数
+// ---------------------------------------------------------------- 选中描边
+//
+// 实现分两段（见 Renderer.h 的 setSelectionOutline 说明）：
+//   · 深度预通道把选中物体的几何缓冲 alpha 写成负距离（本文件的
+//     recordOpaqueDepthGeometry）；
+//   · 后处理合成做边缘检测（post.frag 的 selectionOutline）。
+// 这里只负责"哪些绘制项算选中"，以及把它换算成 push.pbr.x。
+bool Renderer::isOutlined(std::uint32_t entityId) const {
+    if (m_outlineIds.empty() || entityId == 0) return false;
+    for (const std::uint32_t id : m_outlineIds) {
+        if (id == entityId) return true;
+    }
+    return false;
+}
 
 void Renderer::setSkyParams(const render::SkyParams& p) {
     // 逐字段比较太脆（加一个字段就会漏），直接比 memcmp —— SkyParams
@@ -6089,9 +6117,13 @@ void Renderer::recordOpaqueDepthGeometry(VkCommandBuffer cmd) {
                 push.skin = glm::vec4(static_cast<float>(b.jointBase), 0.0f,
                                       1.0f, 0.0f);
             }
+            // 选中标记（batch.selected 也进了聚合键 → 批内必然一致）。
+            push.pbr.x = b.selected ? 1.0f : 0.0f;
+            if (b.selected) m_outlineDrawn += b.count;
             vkCmdPushConstants(cmd, m_depthPrePipelines.layout(),
-                               VK_SHADER_STAGE_VERTEX_BIT, 0,
-                               sizeof(PushConstants), &push);
+                               VK_SHADER_STAGE_VERTEX_BIT |
+                                   VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(PushConstants), &push);
             b.mesh->drawInstanced(cmd, b.count, b.firstInstance);
         }
         return;
@@ -6115,9 +6147,14 @@ void Renderer::recordOpaqueDepthGeometry(VkCommandBuffer cmd) {
             push.skin = glm::vec4(static_cast<float>(it.jointBase), 0.0f, 1.0f,
                                   0.0f);
         }
+        // 选中标记：depth_only.frag 把它翻译成"几何缓冲 a 通道取负"，
+        // 后处理的描边检测靠这个符号找出选中物体的像素。
+        push.pbr.x = it.selected ? 1.0f : 0.0f;
+        if (it.selected) ++m_outlineDrawn;
         vkCmdPushConstants(cmd, m_depthPrePipelines.layout(),
-                           VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(PushConstants),
-                           &push);
+                           VK_SHADER_STAGE_VERTEX_BIT |
+                               VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(PushConstants), &push);
         // firstInstance = morph 槽位（§15）：预通道与前向共用同一份顶点
         // 着色器，形变位置必须**逐位一致**，否则 early-Z 会按静止姿势的
         // 深度剔掉真正该画的片元（症状是表形变处的边缘闪烁）。
@@ -6171,6 +6208,9 @@ void Renderer::recordDepthPrePass(VkCommandBuffer cmd, scene::Scene& scene) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 m_depthPrePipelines.layout(), 0, 1,
                                 &globalSet, 0, nullptr);
+        // 选中标记的计数在这里归零：只有真的画了预通道，几何缓冲才会带上
+        // "谁是选中物"的符号，后处理描边也才有东西可检测。
+        m_outlineDrawn = 0;
         recordOpaqueDepthGeometry(cmd);
     }  // if (m_depthPrePassEnabled)
 
@@ -7049,6 +7089,12 @@ void Renderer::drawFrame(scene::Scene& scene) {
     // vkQueueWaitIdle，正在录制的东西会被打断。
     // 节流逻辑见 setSkyParams / tickSkyRebuild 的说明：背景实时、IBL 6 帧。
     tickSkyRebuild();
+
+    // ---- 选中轮廓高光：告诉后处理这一帧跑不跑检测 ----
+    // 判据只看"编辑器有没有交选中集合"，不看 m_outlineDrawn ——
+    // 那个数是**本帧**深度预通道跑完之后才有的（见 recordDepthPrePass），
+    // 拿它当门闸会永远慢一帧。没有选中物时这里直接关掉，合成里整段跳过。
+    if (m_post) m_post->setSelectionOutlineMask(!m_outlineIds.empty());
 
     if (m_window.takeResizeFlag()) {
         recreateSwapchain();

@@ -287,8 +287,15 @@ void main() {
     const vec3 radiance = ubo.lightColor.rgb * ubo.lightDir.w;
 
     const vec3 F0 = mix(vec3(0.04), albedo, metallic);
-    const vec3 F = F0 + (vec3(1.0) - F0) * pow(clamp(1.0 - max(dot(H, V), 0.0),
-                                                    0.0, 1.0), 5.0);
+    // 菲涅尔**必须按粗糙度收敛**。这里原来用光滑表面的 Schlick
+    // （上限 1.0），而地形是一个几乎水平的连续曲面：越远 NdotV 越小，
+    // 掠射角的反射率被推到 1.0 —— 于是几十米外的草地/泥地整片泛白，
+    // 看起来像"结冰的湖面"。上限取 `max(1 - roughness, F0)` 后，
+    // 粗糙度 0.96 的草皮最多只剩 4% 反射（与 pbr.frag 的
+    // vennFresnelSchlickRoughness 同一条公式，两处必须一致）。
+    const vec3 Fmax = max(vec3(1.0 - roughness), F0);
+    const vec3 F = F0 + (Fmax - F0) *
+        pow(clamp(1.0 - max(dot(H, V), 0.0), 0.0, 1.0), 5.0);
     // 地形基本都是粗糙表面：用"GGX 形状 + Schlick 菲涅尔"的简化镜面，
     // 不用完整 split-sum（那需要 brdfLut，而地形没有逐层粗糙度贴图）。
     const float a = max(roughness * roughness, 1e-3);
@@ -297,7 +304,11 @@ void main() {
     const float k = a * 0.5;
     const float gSmith = (NdotL / (NdotL * (1.0 - k) + k)) *
                          (NdotV / (NdotV * (1.0 - k) + k));
-    const vec3 specular = (dGGX * gSmith * F) / max(4.0 * NdotV * NdotL, 1e-4);
+    // 掠射软钳：分母里 NdotV 趋 0 时（贴地平视的远处地面）这一项会爆，
+    // 表现为地平线附近一条刺眼的白色亮带。0.08 之后完全看不出来，
+    // 但它把 1/NdotV 的增长封住了。
+    const float NdotV_s = max(NdotV, 0.08);
+    const vec3 specular = (dGGX * gSmith * F) / max(4.0 * NdotV_s * NdotL, 1e-4);
     const vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
 
     const float shadow = shadowFactor(vWorld, NdotL);

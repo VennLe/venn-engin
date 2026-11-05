@@ -204,6 +204,23 @@ def px_per_sec(mp):
     return (mp["px1"] - mp["px0"]) / max(mp["t1"] - mp["t0"], 1e-6)
 
 
+def map_at(text, needle):
+    """**动作发生那一刻**的映射：截到 `needle` 最后一次出现为止，再取最后一条 MAP。
+
+    ⚠ 为什么不能直接用 `map_of()`（= 全文最后一条 MAP）：
+      `actDragKeysPx` 的换算用 `m_plot` —— 那是**上一帧画布**的矩形。面板刚
+      从浮动窗被钉进动画坞的那一两帧里，窗口还在收位（实测画布上沿 690 → 706，
+      宽 1590 → 1577），于是"拖动当时的 px/单位"与"拖完之后的"不是同一个数。
+      拿后者的期望去判前者，差值（B3 曾经 0.29）会被记到"值没跟着像素走"头上 ——
+      而产品行为其实是对的（用户在稳定布局里拖动时两者一致）。
+      所以判据必须用**拖动那一刻**生效的那张映射表。
+    """
+    cut = text.rfind(needle)
+    if cut > 0:
+        text = text[:cut]
+    return map_of(text)
+
+
 def px_per_unit(mp):
     return (mp["py1"] - mp["py0"]) / max(mp["v1"] - mp["v0"], 1e-6)
 
@@ -322,10 +339,12 @@ def case_b(ctx):
         "MYVK_EDITOR_CURVED_SCRIPT":
             "chan:position.x;sel:1;dragkey:1:60:0;sel:2;dragkey:2:0:-40;dump",
     })
+    # ⚠ 用"拖动那一刻"的映射，不是全文最后一条（见 map_at 的注释）。
     mp = map_of(text)
+    mp_drag = map_at(text, "CURVED-DRAG-END") or mp
     if not check("B0 拿到画布映射", mp is not None, "%s" % (mp,)):
         return
-    pps, ppu = px_per_sec(mp), px_per_unit(mp)
+    pps, ppu = px_per_sec(mp_drag), px_per_unit(mp_drag)
 
     m = last(DRAGKEY_RE, text)
     check("B1 拖完打了 CURVED-DRAG-END kind=key", m is not None,

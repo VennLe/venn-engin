@@ -791,6 +791,27 @@ const Entry kZh[] = {
     {"Rotate", "旋转"},
     {"Scale", "缩放"},
 
+    // ---- 选择方式（2026-11-04：Tab 径向菜单 + 左栏面板）----
+    // 注意这四个是**手感**不是工具：它们和上面那颗 GizmoMode 的 "Select"
+    // 是两个轴。术语统一成"选择 / 框选 / 套索选择 / 刷选"。
+    {"Selection Mode", "选择方式"},
+    {"Box Select", "框选"},
+    {"Lasso Select", "套索选择"},
+    {"Brush Select", "刷选"},
+    {"Hold Tab in the viewport to pick a mode. Release to keep it.",
+     "在视口里按住 Tab 打开圆盘选方式，移上去就切换、松开即用。"},
+    {"Click an object to select it, click empty space to clear.",
+     "左键点物体选中，点空白处取消选中。"},
+    {"Drag a rectangle; everything it touches gets selected.",
+     "按住左键拖出一个矩形，碰到的东西都会被选中。"},
+    {"Draw a freehand outline; objects inside it get selected.",
+     "按住左键手绘一圈，圈住的东西会被选中。"},
+    {"Hold the left button and paint over objects to select them.",
+     "按住左键当刷子涂，涂到的东西都会被选中。"},
+    {"Selection method lives in the viewport's tool menu (the arrow at its top-left) or the Tab wheel. W/E/R move, rotate and scale; Q returns the selector. Everything else is in Inspector.",
+     "选择方式在视口工具条（左上那颗箭头）的下拉里，也可以在视口里按住 Tab "
+     "打开圆盘。W/E/R 平移 / 旋转 / 缩放，Q 回到选择；其余参数都在 Inspector。"},
+
     // ============================================================ 编辑模式
     // 顶栏那颗下拉（UE 的 Selection Mode 位）。未实现的几项在 UI 上压暗 +
     // 标 TODO，但名字仍然要翻译 —— 否则同一个下拉里中英混排更难看。
@@ -1043,6 +1064,7 @@ const Entry kZh[] = {
     {"Phase g", "相位 g"},
     {"SSGI", "SSGI"},
     {"SSR", "SSR"},
+    {"Surface roughness", "表面粗糙度"},
     {"God rays", "体积光（神光）"},
     {"Decals (DBuffer)", "贴花（DBuffer）"},
     {"Reflection Probes", "反射探针"},
@@ -4216,6 +4238,15 @@ const Entry kZh[] = {
     {"Save grid", "存网格"},
     {"Load grid", "读网格"},
     {"cols=%d rows=%d cell=%.2f walk=%zu", "列 %d 行 %d 格 %.2f 可走 %zu"},
+
+    // ---- 底部动画坞（editor/AnimationDock，2026-11-05）----
+    // ⚠ 这条是本轮被 D 组（裸格式串）逼出来的：坞的传输条原来写
+    //   `snprintf(buf, ..., "F %d  %.2fs", ...)` —— "F" 是英文词，剥掉
+    //   占位符后还剩字母，判据当场红。改法不是豁免，而是**真的翻**：
+    //   中文界面下那一格现在是「帧 12  1.20s」。
+    // ⚠ 占位符顺序必须与英文一致（`%d` 在 `%.2fs` 之前）；末尾的 `s` 是
+    //   单位缩写，按 `CharacterWindow` 的 `%.3fs` 惯例保留，不要翻成"秒"。
+    {"Frame %d  %.2fs", "帧 %d  %.2fs"},
 };
 
 // 跨 TU 拿不到 sizeof(kZh)（这里是不完整类型），所以长度单独导出。

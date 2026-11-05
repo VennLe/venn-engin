@@ -52,8 +52,12 @@ struct SsrPush {
     glm::vec4 projCoefs;
     glm::vec4 params;  // x=强度 y=厚度 z=步长 w=最大距离
     glm::vec4 camera;  // x=zn y=zf
+    // x = 反射表面假定粗糙度（0..1）。全屏 pass 拿不到逐像素材质，
+    // 用一个全局值让菲涅尔的掠射上限收敛 —— 否则水平地面（NdotV 很小）
+    // 会被糊上一层 30%+ 的倒影，见 fg_ssr.frag 里 fresnel 的注释。
+    glm::vec4 surface;
 };
-static_assert(sizeof(SsrPush) == 112, "");
+static_assert(sizeof(SsrPush) == 128, "");
 
 struct GodraysPush {
     glm::vec4 sun;      // xy=屏幕uv z=可见 w=未用
@@ -484,6 +488,7 @@ void FrameGraph::execute(VkCommandBuffer cmd, uint32_t frameIndex,
                 u.projCoefs = in.projCoefs;
                 u.params = glm::vec4(s.ssrStrength, 0.35f, 0.35f, 30.0f);
                 u.camera = in.camera;
+                u.surface = glm::vec4(s.ssrSurfaceRoughness, 0.0f, 0.0f, 0.0f);
                 pushSize = sizeof(u);
                 std::memcpy(push, &u, sizeof(u));
                 break;
