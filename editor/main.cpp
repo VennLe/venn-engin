@@ -31,6 +31,7 @@
 
 #include "core/Logger.h"
 #include "animation/AnimationSelfTest.h"
+#include "character/ViewRigSelfTest.h"
 #include "assets/AssetSelfTest.h"
 #include "physics/PhysicsSelfTest.h"
 #include "project/ProjectFile.h"
@@ -85,6 +86,14 @@ int main(int argc, char** argv) {
         // Renderer 里、必须开 GUI 才能验证。见 animation/AnimationSelfTest.h。
         if (std::getenv("MYVK_ANIM_TEST") != nullptr) {
             const int failures = animation::runAnimationSelfTest();
+            return failures == 0 ? 0 : 1;
+        }
+
+        // 第一 / 第三人称装配自检（2026-11-06）：同一条"Vulkan 之前返回"
+        // 的路。盖眼位（骨架头骨）/ 帧率无关的阻尼 / 换视角过渡 / 可见性。
+        // 这三类问题在截图里只表现成"看着有点怪"，必须用数值钉住。
+        if (std::getenv("MYVK_VIEWRIG_TEST") != nullptr) {
+            const int failures = character::runViewRigSelfTest();
             return failures == 0 ? 0 : 1;
         }
 

@@ -175,6 +175,19 @@ InputMap InputMap::makeDefault() {
     m.bindKey("Gameplay", "Pause", GLFW_KEY_ESCAPE);
     m.bindGamepadButton("Gameplay", "Pause", GLFW_GAMEPAD_BUTTON_START);
 
+    // ---- 换视角（第一人称 ⇄ 第三人称，2026-11-06）----
+    //
+    // UE 的编辑器里是 `Toggle View`（默认没有绑键，走控制台命令）；这里给
+    // 一个 V —— 玩家在游戏里想看清楚"自己的角色长什么样"是高频需求，
+    // 而 V 在现有绑定里是空的（WASD / Space / E / 右键 / Esc 都占了）。
+    //
+    // ⚠ 老工程的 `config/input.json`（作者改过键位的那份）里没有这个动作，
+    //   载入后它是**未绑定**状态 —— 那种情况下按 V 不生效，去绑定表里绑一次
+    //   即可。这是"存档优先于出厂值"那条规矩的正常结果，不是 bug。
+    m.defineAction("Gameplay", "ToggleView");
+    m.bindKey("Gameplay", "ToggleView", GLFW_KEY_V);
+    m.bindGamepadButton("Gameplay", "ToggleView", GLFW_GAMEPAD_BUTTON_Y);
+
     // ---- 菜单（压栈后 Gameplay 整组失效）----
     m.defineAction("Menu", "MenuUp");
     m.defineAction("Menu", "MenuDown");

@@ -5659,6 +5659,92 @@ void InspectorPanel::drawGameStartSection(ecs::Entity e) {
                           "top of the object's own rotation."));
     }
 
+    // ---- 视角装配（2026-11-06）----
+    //
+    // 四行都只在"第一人称可能被用到"时才有意义，但**不折叠**：
+    // 折起来之后作者永远不知道有这些参数（项目里"界面能调、实际没接线"
+    // 比"没有界面"更糟，反过来"有接口但没人看得见"也一样）。
+    //
+    // ⚠ 这里的值是**出生配置**，改了要重新 Run 才生效 —— 与上面的
+    //   Player view / Spawn yaw 同一条规矩。
+    {
+        if (m_eyeBoneBufFor != e) {
+            m_eyeBoneBufFor = e;
+            std::snprintf(m_eyeBoneBuf, sizeof(m_eyeBoneBuf), "%s",
+                          g->eyeBone.c_str());
+        }
+        ImGui::SetNextItemWidth(-110.0f);
+        if (ImGui::InputTextWithHint(TRL("Eye bone"), TRL("empty = eyeHeight"),
+                                     m_eyeBoneBuf, sizeof(m_eyeBoneBuf))) {
+            g->eyeBone = m_eyeBoneBuf;
+        }
+        logRect("INS-GAMESTART-EYEBONE", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(TR("First person eye anchor = this bone's world "
+                              "position (head).\nMatching ignores case and "
+                              "allows the mixamorig: prefix."));
+        }
+
+        ImGui::SetNextItemWidth(-110.0f);
+        if (ImGui::DragFloat3(TRL("Eye offset##gamestart"), &g->eyeOffset.x,
+                              0.005f, -1.0f, 1.0f, "%.3f")) {
+            VK_LOG_INFO("INS-GAMESTART eyeOffset=(%.3f,%.3f,%.3f)",
+                        static_cast<double>(g->eyeOffset.x),
+                        static_cast<double>(g->eyeOffset.y),
+                        static_cast<double>(g->eyeOffset.z));
+        }
+        logRect("INS-GAMESTART-EYEOFFSET", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(TR("Offset from the eye bone, in metres along "
+                              "the character's own axes.\nThis is UE's socket "
+                              "relative transform: the head bone sits at the "
+                              "base of\nthe skull, the eyes are ~4 cm above it "
+                              "— that gap is authored data."));
+        }
+
+        ImGui::SetNextItemWidth(-110.0f);
+        if (ImGui::DragFloat(TRL("First person FOV##gamestart"), &g->fovFirst,
+                             0.5f, 40.0f, 120.0f, "%.1f")) {
+            VK_LOG_INFO("INS-GAMESTART fovFirst=%.1f",
+                        static_cast<double>(g->fovFirst));
+        }
+        logRect("INS-GAMESTART-FOV", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(TR("UE5's first-person template uses 90.\n"
+                              "80 keeps the edges from stretching."));
+        }
+
+        bool hide = g->hideBodyInFirstPerson;
+        if (ImGui::Checkbox(TRL("Hide own body in first person##gamestart"),
+                            &hide)) {
+            g->hideBodyInFirstPerson = hide;
+            VK_LOG_INFO("INS-GAMESTART hideBody=%d", hide ? 1 : 0);
+        }
+        logRect("INS-GAMESTART-HIDEBODY", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(TR("UE's bOwnerNoSee. The shadow still renders "
+                              "(bCastHiddenShadow),\nso looking down shows "
+                              "your own silhouette."));
+        }
+
+        ImGui::SetNextItemWidth(-110.0f);
+        if (ImGui::DragFloat(TRL("View blend##gamestart"),
+                             &g->viewBlendSeconds, 0.01f, 0.0f, 1.0f, "%.2fs")) {
+            VK_LOG_INFO("INS-GAMESTART viewBlend=%.2f",
+                        static_cast<double>(g->viewBlendSeconds));
+        }
+        logRect("INS-GAMESTART-BLEND", ImGui::GetItemRectMin(),
+                ImGui::GetItemRectMax());
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(TR("Camera transition when toggling first/third "
+                              "person (V).\n0 = hard cut."));
+        }
+    }
+
     bool en = g->enabled;
     if (ImGui::Checkbox(TRL("Enabled##gamestart"), &en)) {
         g->enabled = en;

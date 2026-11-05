@@ -26,6 +26,8 @@
 #include "render/FeatureRegistry.h"
 #include "render/RenderSettingsIO.h"
 #include "EditorScene.h"
+#include "character/ViewRig.h"      // 第一/第三人称：眼位、过渡、可见性（唯一一份）
+#include "scene/CameraSystem.h"    // scene::CameraPose
 #include "InputMapIO.h"
 #include "InspectorPanel.h"
 #include "LandscapeEditor.h"
@@ -4204,6 +4206,30 @@ float EditorApp::editorGroundHeight(float x, float y, float radius) const {
     return 0.0f;
 }
 
+namespace {
+
+// 把一组"意图值"精确写进 `scene::Camera`。
+//
+// Camera 的不变式是 `position = target + angleDir(yaw,pitch) * distance`，
+// 而且 `setDistance` 有 **0.5 m 的下限**。所以"让相机落在某点"必须反解：
+// target = position - angleDir * 1，distance = 1。
+//
+// ⚠ 这段推导以前在第一人称那条路上写反过一次（`setTarget(eye+dir)` +
+//   `setDistance(1)`），相机实际落在 `eye + 2·dir`，也就是**眼前两米**。
+//   现在全仓只有这一份，写错也只能写错一次。
+void applyPlayCameraPose(scene::Camera& cam, const scene::CameraPose& p) {
+    const float cp = std::cos(p.pitch);
+    const glm::vec3 angleDir(cp * std::cos(p.yaw), -cp * std::sin(p.yaw),
+                             std::sin(p.pitch));
+    cam.setTarget(p.position - angleDir);
+    cam.setDistance(1.0f);
+    cam.setYaw(p.yaw);
+    cam.setPitch(p.pitch);
+    if (p.fov > 0.0f) cam.setFov(p.fov);
+}
+
+} // namespace
+
 void EditorApp::runPlayers(float dt) {
     scene::Scene& sc = m_ctx->runtimeScene();
     ecs::World& w = sc.world();
@@ -4212,6 +4238,23 @@ void EditorApp::runPlayers(float dt) {
     w.each<ecs::PlayerComponent>(
         [&](ecs::Entity e, ecs::PlayerComponent&) { players.push_back(e); });
     if (players.empty()) return;
+
+    // ---- 跨帧的视角状态：只属于**这一轮 Play** ----
+    //
+    // 眼位阻尼 / 弹簧臂长 / 换视角过渡都是跨帧状态。上一轮 Play 留下的
+    // 值会让新镜头从旧位置慢慢滑过来（进 Play 的头 0.2 秒像在坐电梯），
+    // 而这时候玩家本该"凭空出现"在出生点、镜头一步到位。
+    //
+    // 判定用 `playTime` **倒回去了**，而不是玩家实体 id 变了：EntityId
+    // 会被回收重用，新一轮 Play 大概率拿到同一个 id —— 靠 id 猜"换了
+    // 个人"会漏，漏掉的表现是"第二次按 Play，镜头从上次退出的地方滑过来"。
+    const float playNow = m_ctx->playTime();
+    if (playNow < m_lastPlayTime) {
+        m_playEyeDamp.reset();
+        m_playViewBlend.cancel();
+        m_playArmLen = 0.0f;
+    }
+    m_lastPlayTime = playNow;
 
     const ImGuiIO& io = ImGui::GetIO();
     const bool keysActive = !io.WantTextInput;
@@ -4231,6 +4274,39 @@ void EditorApp::runPlayers(float dt) {
         auto* pc = w.get<ecs::PlayerComponent>(e);
         auto* tc = w.get<ecs::TransformComponent>(e);
         if (!pc || !tc) continue;
+
+        // ---- 换视角（V，UE 的 `Toggle View`）----
+        //
+        // 顺序放在"读 mode"之前：切换后本帧的移动/相机都直接按新模式算，
+        // 不会出现"这一帧还在用旧模式走、下一帧才换镜头"的半帧错位。
+        //
+        // 与运行时那条链**同一个函数**（`character::setViewMode`）：写 mode、
+        // 套"藏身体但留影子"、返回有没有真的换。过渡的起点取**画面上当前
+        // 的相机**，不是重新算一遍上个视角 —— 弹簧臂被墙压短的那一帧，
+        // 两者能差半米，过渡第一帧就会跳。
+        if (keysActive && active && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+            scene::CameraPose before;
+            int meshes = 0;
+            before.position = sc.camera().position();
+            before.yaw = sc.camera().yaw();
+            before.pitch = sc.camera().pitch();
+            before.fov = sc.camera().fov();
+            const ecs::PlayerMode want =
+                (pc->mode == ecs::PlayerMode::FirstPerson)
+                    ? ecs::PlayerMode::ThirdPerson
+                    : ecs::PlayerMode::FirstPerson;
+            if (character::setViewMode(sc, e, want, &meshes)) {
+                m_playViewBlend.begin(before, pc->viewBlendSeconds);
+                if (want == ecs::PlayerMode::FirstPerson) m_playEyeDamp.reset();
+                const character::EyeAnchor eye =
+                    character::resolveEye(sc, e, *pc);
+                VK_LOG_INFO("EDIT-VIEW switched %s camFrom=(%.2f,%.2f,%.2f)",
+                            character::describeView(*pc, eye, meshes).c_str(),
+                            static_cast<double>(before.position.x),
+                            static_cast<double>(before.position.y),
+                            static_cast<double>(before.position.z));
+            }
+        }
 
         const bool firstPerson =
             pc->mode == ecs::PlayerMode::FirstPerson;
@@ -4521,20 +4597,39 @@ void EditorApp::runPlayers(float dt) {
 
         // ---- 相机 ----
         // Camera 不变式：position = target + angleDir * distance。
-        // 把 target / distance / yaw / pitch 全部显式设置，
-        // 相机就精确落在我们要的位置（不依赖上一帧状态）。
+        // 两条腿（第一/第三人称）都产出同一个 `scene::CameraPose`，
+        // 再过一层过渡（换视角时才有），最后统一写进相机。
         scene::Camera& cam = sc.camera();
+        scene::CameraPose targetPose;
         if (firstPerson) {
-            const float cp = std::cos(pc->pitch);
-            const glm::vec3 dir(std::cos(pc->yaw) * cp,
-                                -std::sin(pc->yaw) * cp,
-                                std::sin(pc->pitch));
-            const glm::vec3 eye =
-                tc->position + glm::vec3(0.0f, 0.0f, pc->eyeHeight);
-            cam.setTarget(eye + dir);   // 看向眼前 1m → 相机正好在眼睛
-            cam.setDistance(1.0f);
-            cam.setYaw(pc->yaw);
-            cam.setPitch(pc->pitch);
+            // ---- 第一人称：相机就在眼睛里 ----
+            //
+            // 眼位 = 骨架的**头骨**（`character::resolveEye`），不是
+            // "脚 + eyeHeight"：后者对 1.8 m 的人算出 1.656 m，看着像对的，
+            // 但模型一换（1.5 m 的萝莉 / 2.1 m 的壮汉）就全靠作者手调。
+            //
+            // ⚠ 旧实现还有个更硬的 bug：`setTarget(eye + dir) +
+            //   setDistance(1)` 让相机落在 **eye + 2·dir**（`Camera::position`
+            //   = target + angleDir·distance，而 angleDir 与 dir 同向）——
+            //   玩家其实是从"眼前两米"的地方看世界。这条在截图里像"视野
+            //   有点怪"，日志里一个数都没有。
+            const character::EyeAnchor anchor =
+                character::resolveEye(sc, e, *pc);
+            glm::vec3 eye = anchor.valid
+                                ? anchor.position
+                                : tc->position +
+                                      glm::vec3(0.0f, 0.0f, pc->eyeHeight);
+            // 阻尼：头骨的呼吸 / 迈步 / 眨眼不该 1:1 放大到全屏。
+            eye = m_playEyeDamp.step(eye, dt, pc->eyeLagSeconds);
+
+            float camYaw = 0.0f;
+            float camPitch = 0.0f;
+            character::cameraAnglesFromLook(pc->yaw, pc->pitch, &camYaw,
+                                            &camPitch);
+            targetPose.position = eye;
+            targetPose.yaw = camYaw;
+            targetPose.pitch = camPitch;
+            targetPose.fov = pc->fovFirst > 0.0f ? pc->fovFirst : cam.fov();
         } else {
             // ---- 第三人称：弹簧臂（2026-10-24 第二轮补上）----
             //
@@ -4636,6 +4731,21 @@ void EditorApp::runPlayers(float dt) {
             // 仰角反号 —— 不取负的话"鼠标往上"会变成"相机升得更高、看得
             // 更低"（这正是 2026-10-11 修掉的那个上下颠倒）。
             cam.setPitch(effPitch);
+
+            // 回读成"目标姿态"：过渡层需要每帧现算的目标（换视角时
+            // 相机一边飞过去、角色一边还在走）。
+            targetPose.position = cam.position();
+            targetPose.yaw = cam.yaw();
+            targetPose.pitch = cam.pitch();
+            targetPose.fov = cam.fov();
+        }
+
+        // ---- 换视角的过渡（UE 的 SetViewTargetWithBlend）----
+        //
+        // 第一人称**每帧**都要写（相机由眼位算出来）；第三人称只在过渡
+        // 期间覆盖 —— 不覆盖时相机一个字都不动，TP 的截图基线因此不受影响。
+        if (firstPerson || m_playViewBlend.running()) {
+            applyPlayCameraPose(cam, m_playViewBlend.step(targetPose, dt));
         }
     }
 

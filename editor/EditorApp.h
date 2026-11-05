@@ -36,6 +36,7 @@
 
 #include "core/Application.h"
 #include "animation/AnimatorSystem.h"
+#include "character/ViewRig.h"      // m_playEyeDamp / m_playViewBlend（成员需要完整类型）
 // 四态 locomotion（P4）：编辑器 Play 与运行时共用同一份实现
 #include "animation/Locomotion.h"
 #include "audio/AudioSystem.h"
@@ -403,9 +404,17 @@ private:
     float editorGroundHeight(float x, float y, float radius = 0.35f) const;
     // 玩家状态探针的分帧计数（PLAYER-STATE 每 30 帧一条，防刷屏）
     int m_playerLogTick = 0;
+    // 上一帧的 Play 时间。**只用来判"这是不是新一轮 Play"**（时间倒流
+    // = 重新开始），见 runPlayers 开头那段的理由。
+    float m_lastPlayTime = 0.0f;
     // Play 态第三人称的平滑臂长（缩短立刻、伸长限速）。跨帧状态，
     // 所以要挂成员而不是局部变量 —— 见 runPlayers 的相机段。
     float m_playArmLen = 0.0f;
+    // ---- 视角（2026-11-06）----
+    // 眼位阻尼（第一人称跟头骨，压掉动画抖动）与换视角的镜头过渡。
+    // 两者都是"这一帧正在发生的事"，只活在内存里。
+    character::EyeDamp m_playEyeDamp;
+    character::ViewTransition m_playViewBlend;
     // 每帧在**运行态副本**上做碰撞求解（只在 Run 态、脚本之后调用）：
     //   1) 带碰撞体的实体两两分离 —— "不能互相穿过"
     //   2) 相机当成一个球推出碰撞体 —— "相机视角也不允许穿过"

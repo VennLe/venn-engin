@@ -10,6 +10,7 @@
 #include "assets/Model.h"
 #include "assets/ModelOrientation.h"
 #include "core/Logger.h"
+#include "character/ViewRig.h"   // 眼位 / 藏身体 / 身体度量（与运行时同一份）
 #include "ecs/Components.h"
 #include "scene/Camera.h"
 #include "scene/ModelInstance.h"
@@ -359,22 +360,23 @@ void bindDefaultCharacter(scene::Scene& scene, assets::AssetManager& am,
         }
     }
 
-    // ---- 解剖比例（与 CharacterWindow::generateSkeletonBinding、
-    //      RuntimeApp::attachPlayerModel 同一套）：人形高 h →
-    //      半径 ≈ 0.16h，胶囊总高 = 2 × (halfHeight + radius) = h ----
-    const float radius = glm::clamp(height * 0.16f, 0.15f, 0.60f);
-    const float halfHeight = std::max(0.10f, height * 0.5f - radius);
+    // ---- 解剖比例（与 CharacterWindow / RuntimeApp 同一套）----
+    // 2026-11-06：系数收进 `character::fitBody`，三处装配共用一份 ——
+    // 抄多份的下场不是"某天有人改错"，而是**它已经错了**（半径系数
+    // 曾经是 0.16 / 0.18，同一个角色在两处胖瘦不同）。
+    const character::BodyMetrics bm = character::fitBody(height);
+    const float radius = bm.radius;
+    const float halfHeight = bm.halfHeight;
 
     ecs::CharacterControllerComponent ctrl;
     ctrl.radius = radius;
     ctrl.halfHeight = halfHeight;
-    ctrl.stepHeight = glm::clamp(height * 0.20f, 0.20f, 0.50f);
+    ctrl.stepHeight = bm.stepHeight;
     // ---- 跳跃：按身高缩放（2026-10-22）----
     // 目标是"跳起 0.39 × 身高"：1.8 m 的人 → 0.70 m，这是普通人立定跳的
     // 竖直高度（不是"游戏里好看"的 1.2 m）。v₀ = √(2gh) 反算初速，于是
     // 跳得高的角色滞空也更长 —— 与 Jump clip 的 0.75 s 对齐。
-    ctrl.jumpSpeed = glm::clamp(std::sqrt(2.0f * 9.81f * 0.39f * height),
-                                3.0f, 5.0f);
+    ctrl.jumpSpeed = bm.jumpSpeed;
     ctrl.airControl = 0.45f;
     w.add<ecs::CharacterControllerComponent>(player, ctrl);
 
@@ -388,14 +390,17 @@ void bindDefaultCharacter(scene::Scene& scene, assets::AssetManager& am,
 
     // 编辑器 Play 的"便携移动"（runPlayers）读这三个数
     if (auto* pc = w.get<ecs::PlayerComponent>(player)) {
-        pc->eyeHeight = height * 0.92f;
-        pc->camDistance = glm::clamp(height * 2.0f, 2.5f, 6.5f);
+        pc->eyeHeight = bm.eyeHeight;
+        pc->camDistance = bm.camDistance;
+        // 第一人称一进 Play 就平视（-0.35 是第三人称"相机在上方俯视"
+        // 的初始值，搬到第一人称就是"一开局低着头看自己脚"）。
+        if (pc->mode == ecs::PlayerMode::FirstPerson) pc->pitch = 0.0f;
     }
 
     // 运行时 PlayerController 的弹簧臂参数（没有它镜头不跟随）
     ecs::CameraComponent camC;
-    camC.targetOffset = glm::vec3(0.0f, 0.0f, height * 0.42f);
-    camC.distance = glm::clamp(height * 2.0f, 2.5f, 6.5f);
+    camC.targetOffset = glm::vec3(0.0f, 0.0f, bm.focusHeight);
+    camC.distance = bm.camDistance;
     camC.minDistance = 0.6f;
     w.add<ecs::CameraComponent>(player, camC);
 
@@ -517,6 +522,18 @@ ecs::Entity spawnPlayerAtGameStart(scene::Scene& scene,
     pc.bodyYaw = yaw;
     // 第三人称初始略微低头 → 相机落在角色斜上方俯视（与老 createPlayer 同）
     if (mode == ecs::PlayerMode::ThirdPerson) pc.pitch = -0.35f;
+    // 视角装配：从出生点抄过来（眼位骨名 / 视场角 / 藏身体 / 过渡时长）。
+    // 与运行时 `spawnPlayerFromGameStart` 同一组字段 —— 两边各写一遍字段名
+    // 是这份代码里最后一次重复：再多的字段就该搬进一个共享的结构体了。
+    if (configFrom.valid()) {
+        if (const auto* g = w.get<ecs::GameStartComponent>(configFrom)) {
+            pc.fovFirst = g->fovFirst;
+            pc.eyeBone = g->eyeBone;
+            pc.eyeOffset = g->eyeOffset;
+            pc.hideBodyFirstPerson = g->hideBodyInFirstPerson;
+            pc.viewBlendSeconds = g->viewBlendSeconds;
+        }
+    }
     w.add<ecs::PlayerComponent>(e, pc);
 
     constexpr float kFallbackHeight = 1.8f;
@@ -537,16 +554,38 @@ ecs::Entity spawnPlayerAtGameStart(scene::Scene& scene,
         w.add<ecs::CameraComponent>(e, camC);
     }
 
-    if (mode == ecs::PlayerMode::ThirdPerson)
-        bindDefaultCharacter(scene, assets, e);
+    // 2026-11-06：第一人称**也装配角色**。旧版本这里是
+    // `if (mode == ThirdPerson)`，于是编辑器 Play 的第一人称没有身体、
+    // 没有动画、没有影子，按 V 切到第三人称时人凭空出现。UE5 的
+    // FirstPerson 模板是"身体一直在、只是 bOwnerNoSee"。
+    bindDefaultCharacter(scene, assets, e);
+
+    // 套可见性：第一人称藏身体、留影子（bCastHiddenShadow）。
+    {
+        auto* pc = w.get<ecs::PlayerComponent>(e);
+        const int hidden =
+            pc ? character::applyBodyVisibility(
+                     scene, e, !(mode == ecs::PlayerMode::FirstPerson &&
+                                 pc->hideBodyFirstPerson),
+                     pc->bodyShadowWhenHidden)
+               : 0;
+        if (pc) {
+            const character::EyeAnchor eye =
+                character::resolveEye(scene, e, *pc);
+            VK_LOG_INFO("PLAYER-SPAWN view %s fromBone=%d eyeZ=%.3f",
+                        character::describeView(*pc, eye, hidden).c_str(),
+                        eye.fromBone ? 1 : 0,
+                        static_cast<double>(eye.position.z));
+        }
+    }
 
     VK_LOG_INFO("PLAYER-SPAWN at GameStart feet=(%.2f,%.2f,%.2f) yaw=%.3f "
                 "mode=%s visual=%s",
                 static_cast<double>(feet.x), static_cast<double>(feet.y),
                 static_cast<double>(feet.z), static_cast<double>(yaw),
                 mode == ecs::PlayerMode::FirstPerson ? "first" : "third",
-                mode == ecs::PlayerMode::FirstPerson ? "none(first-person)"
-                                                    : "default");
+                mode == ecs::PlayerMode::FirstPerson ? "model(owner-no-see)"
+                                                     : "default");
     return e;
 }
 

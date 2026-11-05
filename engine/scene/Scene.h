@@ -104,12 +104,19 @@ public:
     }
 
     // 所有"投射阴影"的实体（可见 + castShadow + 有网格）
+    //
+    // `castShadowHidden`（2026-11-06）：第一人称把身体藏起来之后，影子仍要
+    // 画（UE 的 `bCastHiddenShadow`）。默认 false → 老场景（visible=true）
+    // 走的分支与改动前逐字节相同。
     template <typename Fn>
     void forEachShadowCaster(Fn&& fn) {
         m_world.each<ecs::MeshComponent>(
             [&](ecs::Entity e, ecs::MeshComponent& mc) {
                 const auto* vis = m_world.get<ecs::VisibilityComponent>(e);
-                if (vis && (!vis->visible || !vis->castShadow)) return;
+                if (vis) {
+                    if (!vis->castShadow) return;
+                    if (!vis->visible && !vis->castShadowHidden) return;
+                }
                 fn(e, mc);
             });
     }

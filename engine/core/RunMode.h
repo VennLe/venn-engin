@@ -39,6 +39,7 @@ inline bool automationRun() {
         "MYVK_RUNTIME_SCENE",
         "MYVK_ASSET_DIR",
         "MYVK_ANIM_TEST",
+        "MYVK_VIEWRIG_TEST",    // 第一/第三人称装配自检（无窗口）
         "MYVK_VIEW_MODE",
         "MYVK_ENGINE_PANEL",
         "MYVK_EDITMODE",

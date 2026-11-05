@@ -25,6 +25,7 @@
 // ============================================================
 
 #include "core/InputMap.h"
+#include "character/ViewRig.h"
 #include "ecs/Entity.h"
 #include "physics/CharacterController.h"
 #include "physics/RigidBody.h"
@@ -136,6 +137,14 @@ private:
     float m_camPitchEff = 0.0f;
     // 本帧的枢轴（见 cameraPivot()）
     glm::vec3 m_posePivot{0.0f};
+
+    // ---- 视角（2026-11-06）----
+    // 眼位阻尼：第一人称跟头骨，抖动压到"看得出在呼吸、看不出在抖"。
+    // 换视角的过渡：`m_viewBlend` 从上一帧画面混到新姿态（UE 的
+    // SetViewTargetWithBlend）。两者都**只在内存里**，不进存档 ——
+    // 它们是"这一帧正在发生的事"。
+    character::EyeDamp m_eyeDamp;
+    character::ViewTransition m_viewBlend;
 
     float m_travelled = 0.0f;
     glm::vec3 m_lastCenter{0.0f};

@@ -396,6 +396,10 @@ private:
     std::string m_cardStatsSig;
     ecs::Entity m_rootBoneBufFor{};
     char m_rootBoneBuf[96] = {};
+    // 眼位骨名的输入缓冲（与上面同一个写法：按实体做"换选中才刷新"，
+    // 否则每帧回写会把用户正在敲的字吃掉）。
+    ecs::Entity m_eyeBoneBufFor{};
+    char m_eyeBoneBuf[96] = {};
     ecs::Entity m_layerBufFor{};
     int m_layerBufCount = -1;   // 回填时的层数快照
     char m_layerNameBuf[kMaxLayerBufs][64] = {};

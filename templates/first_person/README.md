@@ -12,6 +12,32 @@
 3. 这一版**没有**摆玩法道具 —— 起始场景是一条街 + 12 栋房子 + 树。
    想加东西直接拖进视口；`scripts/pickup.vks` / `scripts/portal.vks` 是
    现成可抄的示例（收集物 / 终点），挂到新实体上就会跑
+4. `V` 键切到第三人称再切回来（`ToggleView`，手柄是 Y），镜头是一段
+   **过渡**不是硬切 —— 见下面「视角与眼位」
+
+## 视角与眼位（对标 UE5 的 FirstPerson 模板）
+
+这一版的第一人称不是"相机贴脸"，四条口径都对着 UE 的源码走：
+
+| UE 里的东西 | 这里对应 |
+|---|---|
+| `ACharacter::GetActorEyesViewPoint` 用 `GetMesh()->GetSocketLocation("head")` | 眼位 = 骨架 **head 骨**在世界里的位置，不是"脚 + 一个常数" |
+| socket 的**相对变换**（美术在骨架资产里摆的那 4~5 cm） | Inspector ▸ `GameStart` ▸ **Eye offset**（米，玩家局部轴） |
+| `bUsePawnControlRotation` | 相机朝向**永远来自输入**，只借骨骼的位置。头骨怎么转都不甩镜头 |
+| `bOwnerNoSee` + `bCastHiddenShadow` | 第一人称看不见自己的身体，**但影子还在** —— 低头能看见自己的影子 |
+| `SetViewTargetWithBlend(..., BlendTime)` | 换视角是一段平滑过渡（`View blend`，0 = 硬切） |
+
+五个参数都在场景里 `GameStart` 的 Inspector 段：
+
+- **Eye bone** —— 眼位骨名（默认 `head`；匹配不分大小写、允许 `mixamorig:` 前缀，会跳过 `Head_end`/`*_tip` 这类末端辅助骨）
+- **Eye offset** —— 相对头骨的偏移。头骨在**颅底**，眼睛还在它上方几厘米，这段差要作者给（UE 里就是 socket）
+- **First person FOV** —— 默认 80（UE 模板用 90；80 边缘拉伸小一点）
+- **Hide own body in first person** —— 就是 `bOwnerNoSee`
+- **View blend** —— 换视角过渡时长，默认 0.22 s
+
+⚠ 这些都是**出生配置**：改完要重新 Play 才生效。第一人称的镜头**每帧**
+跟着头骨走，但过了一道阻尼（`0.045 s`）—— 呼吸和迈步带来的那点抖动
+不会 1:1 放大到全屏，否则看久了会晕。
 
 
 ## 目录结构

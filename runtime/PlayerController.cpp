@@ -156,6 +156,26 @@ bool PlayerController::attach(scene::Scene& scene, physics::PhysicsWorld* world)
     cc->bodyYaw = m_bodyYaw;
     cc->started = true;
 
+    // ---- 视角装配（2026-11-06）----
+    //
+    // 按组件里的 mode 套一次可见性，不依赖"生成玩家的时候刚好调过" ——
+    // 场景文件里作者直接摆的 Player 走的是这条路。
+    if (auto* pc = scene.world().get<ecs::PlayerComponent>(m_entity)) {
+        const bool hide = (pc->mode == ecs::PlayerMode::FirstPerson) &&
+                          pc->hideBodyFirstPerson;
+        const int meshes = character::applyBodyVisibility(
+            scene, m_entity, !hide, pc->bodyShadowWhenHidden);
+        // 第一人称一进游戏就平视（0.30 rad 是第三人称"相机在上方"的默认
+        // 仰角，搬到第一人称就是"一直低着头看地面"）。
+        if (pc->mode == ecs::PlayerMode::FirstPerson) m_pitch = 0.0f;
+        const character::EyeAnchor eye =
+            character::resolveEye(scene, m_entity, *pc);
+        VK_LOG_INFO("PLAYER view %s fromBone=%d eyeZ=%.3f",
+                    character::describeView(*pc, eye, meshes).c_str(),
+                    eye.fromBone ? 1 : 0,
+                    static_cast<double>(eye.position.z));
+    }
+
     const auto* initialCam =
         scene.world().get<ecs::CameraComponent>(m_entity);
     if (initialCam) {
@@ -412,9 +432,46 @@ void PlayerController::update(scene::Scene& scene, physics::PhysicsWorld* world,
     syncProxy(world, dt);
 
     // ---------------- 相机 ----------------
+    //
+    // 2026-11-06：这一段按 UE5 的 FirstPerson / ThirdPerson 模板拆成两条腿。
+    // 共同点只有一处 —— 都产出**一个 `scene::CameraPose`**，然后交给
+    // `character::ViewTransition` 混合。以前两条链各写各的（第一人称靠
+    // "把臂长设成 0"来假装），结果是相机飘在头顶上方半米处，而日志里
+    // 一切正常（`PLAYER pos=...` 只报角色，不报相机该在哪）。
+    const auto* cam = w.get<ecs::CameraComponent>(m_entity);
+    ecs::PlayerComponent* pc = w.get<ecs::PlayerComponent>(m_entity);
+
+    // ---- 换视角（V 键，UE 里是 `Toggle View`）----
+    //
+    // 起点取 `m_pose`（= 上一帧真正画出来的姿态），不是"重新算一遍上个
+    // 视角的姿态" —— 后者在弹簧臂被墙压短的那一帧会差出半米，过渡开始
+    // 的第一帧就跳一下。
+    if (pc && m_input.wasPressed("ToggleView")) {
+        const ecs::PlayerMode want =
+            pc->mode == ecs::PlayerMode::ThirdPerson
+                ? ecs::PlayerMode::FirstPerson
+                : ecs::PlayerMode::ThirdPerson;
+        const scene::CameraPose before = m_pose;
+        int meshes = 0;
+        if (character::setViewMode(scene, m_entity, want, &meshes)) {
+            m_viewBlend.begin(before, pc->viewBlendSeconds);
+            // 切到第一人称时把眼位阻尼复位：不复位的话，前 0.1 秒镜头
+            // 会从"上一次第一人称时眼睛在的地方"一路飞过来。
+            if (want == ecs::PlayerMode::FirstPerson) m_eyeDamp.reset();
+            const character::EyeAnchor eye =
+                character::resolveEye(scene, m_entity, *pc);
+            VK_LOG_INFO("GAME-VIEW switched %s",
+                        character::describeView(*pc, eye, meshes).c_str());
+        }
+    }
+
+    const bool firstPerson =
+        pc && pc->mode == ecs::PlayerMode::FirstPerson;
+    scene::CameraPose targetPose;
+
+    if (!firstPerson) {
     // 枢轴 = 胶囊中心 + CameraComponent::targetOffset（默认落在头肩之间）。
     // 没有相机组件时退回老常数（与 G09 之前逐位一致）。
-    const auto* cam = w.get<ecs::CameraComponent>(m_entity);
     const glm::vec3 pivot =
         cam ? m_state.position + cam->targetOffset
             : m_state.position +
@@ -503,11 +560,60 @@ void PlayerController::update(scene::Scene& scene, physics::PhysicsWorld* world,
 
     m_armDistance = arm.distance;
     m_armBlocked = arm.blocked;
-    m_pose.position = arm.position;
-    // 由 back 反解 Camera 的 (yaw, pitch)：见 Camera.h 里 angleDir 的公式
-    m_pose.yaw = kPi - m_yaw;
-    m_pose.pitch = m_camPitchEff;
-    if (cam) m_pose.fov = cam->fov;
+    targetPose.position = arm.position;
+    // 由 back 反解 Camera 的 (yaw, pitch)：见 Camera.h 里 angleDir 的公式。
+    // ⚠ 这一行与 `character::cameraAnglesFromLook(-m_yaw, ...)` 是同一个
+    //   结果（canonical viewYaw = -m_yaw），第一人称那边走的就是那个函数 ——
+    //   两种模式因此不可能"同一个 yaw 看向两个方向"。
+    targetPose.yaw = kPi - m_yaw;
+    targetPose.pitch = m_camPitchEff;
+    if (cam) targetPose.fov = cam->fov;
+
+    } else {
+        // ---------------- 第一人称：相机就在眼睛里 ----------------
+        //
+        // 眼位来自骨架头骨（`character::resolveEye`），不是"胶囊中心 + 常数"。
+        // 那一版把 1.8 m 的人眼算到 2.36 m（头顶上方半米），而**画面看起来
+        // 只是"有点高"** —— 这种错不会有人报 bug，只会被说成"手感怪"。
+        //
+        // ⚠ 朝向仍然**只来自输入**（UE 的 `bUsePawnControlRotation` 同理）：
+        //   把朝向交给头骨，LookAt / 弹簧骨一转，镜头就跟着甩。
+        glm::vec3 eyePos;
+        character::EyeAnchor anchor;
+        if (pc) anchor = character::resolveEye(scene, m_entity, *pc);
+        if (anchor.valid) {
+            eyePos = anchor.position;
+        } else {
+            eyePos = m_state.position +
+                     glm::vec3(0.0f, 0.0f, cc->halfHeight + cc->radius * 0.6f);
+        }
+        // 阻尼：头骨的呼吸 / 迈步 / 眨眼不该被 1:1 放大到全屏。
+        eyePos = m_eyeDamp.step(eyePos, dt,
+                                pc ? pc->eyeLagSeconds : 0.0f);
+
+        float camYaw = kPi - m_yaw;
+        float camPitch = m_pitch;
+        // m_pitch 在本模块里是"相机在上方俯视"（正 = 往下看），视线仰角
+        // 要取反 —— `cameraAnglesFromLook` 收的是"正 = 抬头"。
+        character::cameraAnglesFromLook(-m_yaw, -m_pitch, &camYaw, &camPitch);
+
+        targetPose.position = eyePos;
+        targetPose.yaw = camYaw;
+        targetPose.pitch = camPitch;
+        targetPose.fov = (pc && pc->fovFirst > 0.0f)
+                             ? pc->fovFirst
+                             : (cam ? cam->fov : m_pose.fov);
+
+        // 供调试探针读（`PLAYER-STATE arm=...`）：第一人称没有臂。
+        m_armDistance = 0.0f;
+        m_armBlocked = false;
+        m_camPitchEff = camPitch;
+        m_posePivot = eyePos;
+    }
+
+    // 换视角的过渡：起点快照 + 目标每帧现算（见 ViewRig.h 的 ViewTransition）。
+    // 没在过渡时它**原样返回** targetPose，所以稳态下逐位等于上一版。
+    m_pose = m_viewBlend.step(targetPose, dt);
 
     if (m_trace) {
         VK_LOG_INFO("PLAYER pos=(%.3f,%.3f,%.3f) vel=(%.2f,%.2f,%.2f) ground=%d "

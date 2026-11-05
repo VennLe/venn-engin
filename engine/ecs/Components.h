@@ -1242,6 +1242,17 @@ struct CameraPathComponent {
 struct VisibilityComponent {
     bool visible = true;      // 参与主渲染
     bool castShadow = true;   // 参与阴影贴图渲染
+
+    // ---- 藏起来之后还要不要影子（UE 的 `bCastHiddenShadow`）----
+    //
+    // 第一人称把身体藏掉（`bOwnerNoSee`）之后，如果影子也跟着没了，低头
+    // 就是干干净净一片地 —— 玩家会觉得自己是台悬浮摄像机。UE 的第一人称
+    // 模板给 Mesh1P 打开的就是这个位，本引擎照抄。
+    //
+    // ⚠ 默认 **false**，而且只有 `visible == false` 时才有意义：老场景
+    //   （没有这个字段）的 `visible=true` 实体行为逐位不变；关掉"隐藏身体"
+    //   时它也不起作用 —— 所以"没配过 = 基线不动"这条硬约束成立。
+    bool castShadowHidden = false;
 };
 
 // ---------------- 延迟贴花（DBuffer，R4-4）----------------
@@ -1300,20 +1311,77 @@ struct DecalComponent {
 
 // ---------------- 玩家（运行态由 WASD + 鼠标驱动）----------------
 //
-// Player 实体 = 玩家的"脚"。第一人称只是一个空节点（+ 胶囊碰撞体，
-// 编辑态能看见占位线框，运行态不穿墙）；第三人称在它下面挂一套程序化
-// 卡通小人（见 EditorScene::createPlayer 的 rig）。
+// Player 实体 = 玩家的"脚"。它的子级是模型的 SubMesh（`instantiateModel`
+// 建的），蒙皮组件挂在玩家自己身上。
 //
-// 相机语义（对齐市面游戏的手感差异）：
-//   第一人称 —— 鼠标 = 转动**视野**（yaw/pitch），WASD 沿视线走；
+// 相机语义（对齐 UE5 的 FirstPerson / ThirdPerson 模板）：
+//   第一人称 —— 鼠标 = 转动**视野**（yaw/pitch），WASD 沿视线走，
+//               相机**挂在骨架头骨上**（`character::resolveEye`），
+//               自己的身体 `bOwnerNoSee`、影子照旧（`bCastHiddenShadow`）；
 //   第三人称 —— 鼠标 = **环绕角色**的轨道相机（camYaw/camPitch），
 //               WASD 沿相机朝向走、角色平滑转身朝移动方向。
+//
+// ⚠ 两套口径的换算**只有一份**：`engine/character/ViewRig.h`。
+//   以前编辑器 Play 与运行时各写一套，症状是"第一人称相机不在眼睛里"
+//   与"按 W 往镜头的反方向走"——两者都只在一边错，日志里一条都看不出来。
 enum class PlayerMode : int { FirstPerson = 0, ThirdPerson = 1 };
 
 struct PlayerComponent {
     PlayerMode mode = PlayerMode::FirstPerson;
 
-    float eyeHeight = 1.7f;     // 第一人称眼睛离"脚"的高度
+    float eyeHeight = 1.7f;     // 第一人称眼睛离"脚"的高度（**没有头骨时的兜底**）
+
+    // ================================================================
+    // 视角装配（2026-11-06，对齐 UE5 的 FirstPerson / ThirdPerson 模板）
+    // ================================================================
+    //
+    // 在这组字段之前，"第一人称"其实只是一句 `mode = FirstPerson`：
+    // 眼睛在"脚 + 1.7 m"（与角色实际身高无关）、身体**根本不建**、
+    // 换视角是一帧硬切。UE 的做法是：眼位挂在骨架的**头骨**上
+    // （`FirstPersonCamera` 绑 Mesh1P 的 socket）、身体照常存在但
+    // `bOwnerNoSee`、换视角走 `SetViewTargetWithBlend`。
+    //
+    // ⚠ 全部默认值 = "引擎出厂手感"，且**旧场景文件里不会多出任何键**
+    //   （序列化只写非默认值，见 SceneSerializer 的 `player` 块）。
+    //   少写一个键 → `sceneHash` 不变 → G16 的存档兼容断言不会红。
+
+    // 眼位骨名。空 = 不用骨骼（= 老行为，脚 + eyeHeight）。
+    // 匹配规则是 `assets::kJointMatchDefault`（不分大小写 + 允许包含 +
+    // 跳过 `*_end/_tip` 末端辅助骨），所以 `head` 能命中
+    // `mixamorig:Head` / `Head` / `Bip01 Head`。
+    std::string eyeBone = "head";
+
+    // 眼位微调（**玩家局部**，米）。默认往后上方 2 cm 是给"身体可见的
+    // 第一人称"留的余量：相机贴在头骨原点上会看到口腔内侧。
+    // 藏掉身体时它几乎不起作用（0.02 m 在 1.66 m 高的眼位上无感）。
+    glm::vec3 eyeOffset{0.0f, 0.0f, 0.02f};
+
+    // 第一人称视场角（度）。UE5 FirstPerson 模板是 90；这里给 80 ——
+    // 同样的转身速度下 90° 的横向拉伸更明显（边角上的人脸会变形），
+    // 80 是"看得见手边的同时不畸变"的常见折中。
+    float fovFirst = 80.0f;
+    // 第三人称视场角。**0 = 不接管**，用 `CameraComponent::fov`
+    // （老场景就是这么配的；写死一个数会让作者调过的镜头被覆盖）。
+    float fovThird = 0.0f;
+
+    // 第一人称是否藏掉自己的身体（UE 的 `bOwnerNoSee`）。
+    // 关掉 = "看得见自己的身体"（VR 风格），此时 eyeOffset 必须往外推，
+    // 否则相机在颅骨里。
+    bool hideBodyFirstPerson = true;
+    // 藏起来之后影子还要不要（UE 的 `bCastHiddenShadow`）。见
+    // `VisibilityComponent::castShadowHidden`。
+    bool bodyShadowWhenHidden = true;
+
+    // 换视角的镜头过渡时长（秒）。0 = 硬切。
+    // 0.22 s 是"能感觉到顺"与"不觉得反应慢"的交界（与 Locomotion 的
+    // `blendSeconds = 0.20` 同一档，两处过渡的手感因此一致）。
+    float viewBlendSeconds = 0.22f;
+
+    // 眼位阻尼时间常数（秒），0 = 硬跟。第一人称镜头跟着头骨走时，
+    // 呼吸 / 迈步 / 眨眼都会让画面微抖；0.045 s 刚好把抖压下去，
+    // 又不至于"转头慢半拍"。
+    float eyeLagSeconds = 0.045f;
+
     float moveSpeed = 3.0f;     // m/s（按住鼠标右键 ×sprintMultiplier）
     float lookSpeed = 0.0025f;  // 鼠标灵敏度：弧度/像素
 
@@ -1985,6 +2053,32 @@ struct GameStartComponent {
 
     // 运行时是否按本点生成玩家。关掉 = 这个场景没有玩家（纯观览/过场场景）。
     bool spawnOnRun = true;
+
+    // ---- 视角装配（2026-11-06，与 `PlayerComponent` 同名字段一一对应）----
+    //
+    // 为什么这些参数长在**出生点**而不是玩家身上：玩家是运行时才生成的，
+    // 作者在编辑态根本没有它可点。这与 `mode` / `yaw` 是同一条理由 ——
+    // 出生点是"这个场景怎么开局"的唯一可编辑落点。
+    // 生成玩家时整组抄进 `PlayerComponent`（两个宿主各一处，见
+    // `spawnPlayerFromGameStart` / `spawnPlayerAtGameStart`）。
+    //
+    // ⚠ 序列化**只写非默认值**（见 SceneSerializer 的 `gameStartToJson`）：
+    //   老场景文件必须逐字节不变 —— 上面那四个键是 2026-10 就全写的，
+    //   再加"全写"会让所有历史场景 diff 一片红。
+    float fovFirst = 80.0f;          // 第一人称视场角（度）
+    std::string eyeBone = "head";    // 眼位骨名（空 = 脚 + eyeHeight）
+    bool hideBodyInFirstPerson = true;  // 第一人称藏身体（bOwnerNoSee）
+    float viewBlendSeconds = 0.22f;  // 换视角的镜头过渡（秒，0 = 硬切）
+    // 眼位相对头骨的偏移（米，玩家局部轴）。
+    //
+    // 这就是 UE 里那个 **socket 的相对变换**：`ACharacter::GetActorEyesViewPoint`
+    // 的 `GetSocketLocation("head")` 拿到的是**头骨原点**，而头骨在颅底 ——
+    // 眼睛还在它上方 4~5 cm，这 4~5 cm 在 UE 里是美术在骨架资产里摆的
+    // socket（或相机组件的 relative location），**不是引擎猜的**。
+    //
+    // 我们没有 socket 资产，所以这个偏移先落在出生点上给作者填。
+    // 默认 +2 cm 是"防止第一人称在身体可见时看到口腔内侧"的余量。
+    glm::vec3 eyeOffset{0.0f, 0.0f, 0.02f};
 };
 
 // ---------------- 弹簧骨（L4 表演层，2026-10-25）----------------

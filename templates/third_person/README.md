@@ -14,6 +14,11 @@
    现成可抄的示例（收集物 / 终点），挂到新实体上就会跑
 4. **你能看见自己**：这个工程带了一个角色模型 + 走路状态机
    （见下面的「你的角色」一节）
+5. `V` 键切到第一人称再切回来（`ToggleView`，手柄是 Y）：切过去之后
+   身体**看不见了但影子还在**（`bOwnerNoSee` + `bCastHiddenShadow`），
+   眼位挂在骨架的 `head` 骨上。五个视角参数都在 `GameStart` 的
+   Inspector 段（Eye bone / Eye offset / First person FOV /
+   Hide own body / View blend），改完要重新 Play 才生效
 
 ## 目录结构
 

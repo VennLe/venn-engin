@@ -1525,6 +1525,18 @@ json gameStartToJson(const ecs::GameStartComponent& g) {
     j["enabled"] = g.enabled;
     j["mode"] = g.mode == ecs::PlayerMode::FirstPerson ? "first" : "third";
     j["spawnOnRun"] = g.spawnOnRun;
+    // 视角装配（2026-11-06）：**只写非默认值**。上面四个键是历史遗留的
+    // "全写"（2026-10 之前就那样），这组新键不能再跟 —— 会让所有历史场景
+    // 多出四行、diff 全红。缺键读端有默认，语义等价。
+    const ecs::GameStartComponent def;
+    if (g.fovFirst != def.fovFirst) j["fovFirst"] = g.fovFirst;
+    if (g.eyeBone != def.eyeBone) j["eyeBone"] = g.eyeBone;
+    if (g.hideBodyInFirstPerson != def.hideBodyInFirstPerson)
+        j["hideBodyInFirstPerson"] = g.hideBodyInFirstPerson;
+    if (g.viewBlendSeconds != def.viewBlendSeconds)
+        j["viewBlendSeconds"] = g.viewBlendSeconds;
+    // 眼位偏移（socket 的相对变换，见 GameStartComponent 的注释）
+    if (g.eyeOffset != def.eyeOffset) j["eyeOffset"] = vec3ToJson(g.eyeOffset);
     return j;
 }
 
@@ -1547,6 +1559,14 @@ ecs::GameStartComponent gameStartFromJson(const json& j) {
                                        : ecs::PlayerMode::ThirdPerson;
         }
     }
+    // 视角装配（缺键 = 出厂值）
+    g.fovFirst = j.value("fovFirst", g.fovFirst);
+    g.eyeBone = j.value("eyeBone", g.eyeBone);
+    g.hideBodyInFirstPerson =
+        j.value("hideBodyInFirstPerson", g.hideBodyInFirstPerson);
+    g.viewBlendSeconds = j.value("viewBlendSeconds", g.viewBlendSeconds);
+    if (j.contains("eyeOffset"))
+        g.eyeOffset = vec3FromJson(j["eyeOffset"], g.eyeOffset);
     return g;
 }
 
@@ -3391,7 +3411,7 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
 
     // 玩家（walkPhase/bodyYaw/started 是运行态派生值，不存）
     if (const auto* pc = w.get<ecs::PlayerComponent>(e)) {
-        je["player"] = json{
+        json jp = json{
             {"mode", pc->mode == ecs::PlayerMode::ThirdPerson
                          ? "third"
                          : "first"},
@@ -3403,6 +3423,28 @@ bool entityToJsonImpl(const ecs::World& w, ecs::Entity e,
             {"camDistance", pc->camDistance},
             {"turnSpeed", pc->turnSpeed},
         };
+        // ---- 视角装配（2026-11-06）----
+        //
+        // ⚠ **只写非默认值**。这一段与上面那八个"全写"字段不同，理由是
+        //   硬约束：老场景文件必须是**逐字节不变**的（G16 的存档兼容断言
+        //   拿 `sceneHash` 比，多一个键就会让它变）。上面那批是 2026-10
+        //   之前就全写的，改它反而会动到所有历史基线。
+        const ecs::PlayerComponent def;
+        if (pc->eyeBone != def.eyeBone) jp["eyeBone"] = pc->eyeBone;
+        if (pc->eyeOffset != def.eyeOffset)
+            jp["eyeOffset"] = json::array({pc->eyeOffset.x, pc->eyeOffset.y,
+                                           pc->eyeOffset.z});
+        if (pc->fovFirst != def.fovFirst) jp["fovFirst"] = pc->fovFirst;
+        if (pc->fovThird != def.fovThird) jp["fovThird"] = pc->fovThird;
+        if (pc->hideBodyFirstPerson != def.hideBodyFirstPerson)
+            jp["hideBodyFirstPerson"] = pc->hideBodyFirstPerson;
+        if (pc->bodyShadowWhenHidden != def.bodyShadowWhenHidden)
+            jp["bodyShadowWhenHidden"] = pc->bodyShadowWhenHidden;
+        if (pc->viewBlendSeconds != def.viewBlendSeconds)
+            jp["viewBlendSeconds"] = pc->viewBlendSeconds;
+        if (pc->eyeLagSeconds != def.eyeLagSeconds)
+            jp["eyeLagSeconds"] = pc->eyeLagSeconds;
+        je["player"] = std::move(jp);
     }
     if (const auto* limb = w.get<ecs::PlayerLimbComponent>(e))
         je["playerLimb"] = limb->kind;
@@ -4003,6 +4045,22 @@ bool entityApplyComponentsImpl(Scene& scene, assets::AssetManager& assets,
         pc.pitch = jp.value("pitch", pc.pitch);
         pc.camDistance = jp.value("camDistance", pc.camDistance);
         pc.turnSpeed = jp.value("turnSpeed", pc.turnSpeed);
+        // 视角装配（2026-11-06）：缺键 = 出厂值（老场景走这条）。
+        pc.eyeBone = jp.value("eyeBone", pc.eyeBone);
+        if (jp.contains("eyeOffset") && jp["eyeOffset"].is_array() &&
+            jp["eyeOffset"].size() == 3) {
+            pc.eyeOffset = glm::vec3(jp["eyeOffset"][0].get<float>(),
+                                     jp["eyeOffset"][1].get<float>(),
+                                     jp["eyeOffset"][2].get<float>());
+        }
+        pc.fovFirst = jp.value("fovFirst", pc.fovFirst);
+        pc.fovThird = jp.value("fovThird", pc.fovThird);
+        pc.hideBodyFirstPerson =
+            jp.value("hideBodyFirstPerson", pc.hideBodyFirstPerson);
+        pc.bodyShadowWhenHidden =
+            jp.value("bodyShadowWhenHidden", pc.bodyShadowWhenHidden);
+        pc.viewBlendSeconds = jp.value("viewBlendSeconds", pc.viewBlendSeconds);
+        pc.eyeLagSeconds = jp.value("eyeLagSeconds", pc.eyeLagSeconds);
         if (auto* p = w.get<ecs::PlayerComponent>(e))
             *p = pc;
         else
