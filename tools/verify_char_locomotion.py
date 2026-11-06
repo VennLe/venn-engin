@@ -65,6 +65,9 @@ OUT_DIR = os.path.join(os.path.dirname(ROOT), "_venn_verify", "char_locomotion")
 SCENE_NAME = "_p4_char_loco.json"
 SCENE_PATH = os.path.join(ASSETS, "scenes", SCENE_NAME)
 DEFAULT_CHAR = os.path.join(ASSETS, "models", "characters", "alicia.vmesh")
+# 独立骨架资产（2026-11-06）。与 DEFAULT_CHAR **同目录、同 stem** 是刻意的：
+# `AssetC --extract-skel` 默认就写这里，引用路径也按这个相对名写进 .vmesh。
+DEFAULT_SKEL = os.path.join(ASSETS, "models", "characters", "alicia.vskel")
 # 默认角色的身份指纹（C0 用）。改默认角色时**这两行必须一起改** —— 否则
 # C0 会继续对旧文件做体检、然后在"默认角色坏了"的情况下报绿。
 DEFAULT_JOINTS = 128
@@ -78,6 +81,9 @@ VK_SPACE = 0x20
 RE_DEFAULT = re.compile(
     r"PLAYER-DEFAULT bound path=(\S+) meshes=(\d+) skinned=(\d+) joints=(\d+) "
     r"clips=(\d+) height=([\d.]+) capsule=([\d.]+)/([\d.]+)")
+RE_MANNEQUIN = re.compile(
+    r"MANNEQUIN retarget ok=1 bones=(\d+) ue=(\d+) copy=(\d+) "
+    r"synth=(\d+) aux=(\d+) missing=(\d+)")
 RE_ADOPT = re.compile(r"CharacterWindow: adopted bound model '([^']*)' "
                       r"\(joints=(\d+) clips=(\d+)\)")
 # 2026-10-24：添加人称角色 = 配置出生点（角色运行时才生成）。
@@ -92,6 +98,18 @@ RE_KEYTRIG = re.compile(r"EDIT-ANIM-KEY-TRIGGER clip=(\S+) key=(\d+)")
 # 没有它就没有"点了才能交互"—— 下面的 W 会一帧都推不动。
 RE_EDIT_MOUSE = re.compile(r"EDIT-MOUSE captured=(\d)")
 RE_INFO_CLIP = re.compile(r'clip "([^"]+)" ([\d.]+) s')
+# 独立骨架资产（C0c）。`AssetC --info x.vskel` 的两行锚点。
+#   ASSETC   joints=128 topo=128 sockets=3 engineXform=0
+#   ASSETC   boneDigest=f918ced8aeadedd7 sourceHash=7a9f359f05efdc61
+RE_SKELINFO = re.compile(
+    r"joints=(\d+) topo=(\d+) sockets=(\d+) engineXform=(\d)")
+RE_SKELINFO2 = re.compile(r"boneDigest=([0-9a-f]{16})")
+# `AssetC --info x.vmesh` 里的骨架引用行（空引用是 `-`）。
+RE_SKELREF = re.compile(r"skelRef=(\S+)")
+# 加载期锚点：真的从 `.vskel` 取骨表，且摘要与 mesh 内嵌那份一致。
+RE_SKELSRC = re.compile(
+    r"VMESH-SKEL source=asset ref=(\S+) bones=(\d+) sockets=(\d+) "
+    r"digest=([0-9a-f]{16})")
 
 
 # ---------------------------------------------------------------- 场景
@@ -349,6 +367,35 @@ def main():
     if p.returncode != 0:
         print("  AssetC --info 失败:", info[-3:])
 
+    # ---- C0c 独立骨架资产（`models/characters/alicia.vskel`）----
+    #
+    # 2026-11-06：骨架从"内嵌在 .vmesh 里"改成 UE 的 Skeleton 资产模型。
+    # 这一条钉两件事：
+    #   ① 那个 `.vskel` **在盘上**、骨数与 mesh 一致、带 3 个挂点；
+    #   ② `.vmesh` 里真的写了引用（`skelRef=`）。
+    # 少了 ②，"独立骨架"就只是多了一个没人引用的文件。
+    p_skel = subprocess.run([ASSETC, "--info", DEFAULT_SKEL],
+                            cwd=BIN, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            encoding="utf-8", errors="replace", timeout=120)
+    skel_info = p_skel.stdout.splitlines()
+    m_sk = next((m for m in (RE_SKELINFO.search(l) for l in skel_info) if m), None)
+    m_skd = next((m for m in (RE_SKELINFO2.search(l) for l in skel_info) if m), None)
+    m_sref = next((m for m in (RE_SKELREF.search(l) for l in info) if m), None)
+    skel_digest = m_skd.group(1) if m_skd else ""
+    check("C0c 骨架独立成资产（%s 骨数对齐 + 3 个挂点 + vmesh 有引用）"
+          % os.path.basename(DEFAULT_SKEL),
+          p_skel.returncode == 0 and m_sk is not None
+          and int(m_sk.group(1)) == DEFAULT_JOINTS
+          and int(m_sk.group(3)) == 3
+          and m_sref is not None
+          and m_sref.group(1) == "models/characters/alicia.vskel",
+          "skel=j%d sockets=%s digest=%s ref=%s" %
+          (int(m_sk.group(1)) if m_sk else -1,
+           m_sk.group(3) if m_sk else "?",
+           skel_digest or "?",
+           (m_sref.group(1) if m_sref else "-")))
+
     proc, hwnd, tap = launch()
     if not hwnd:
         check("编辑器起得来", False, "exit=%s" % proc.poll())
@@ -468,14 +515,45 @@ def main():
         check("C5d Play 后装配默认角色（PLAYER-DEFAULT bound）", m is not None,
               m.group(0)[:120] if m else "没有 PLAYER-DEFAULT bound")
         if m:
+            # ⚠ 骨数判据从"==128"改成">=128"（2026-11-06）：UE5 Mannequin
+            #   重定向会在末尾追加 13 根 UE 骨（spine_04/05、neck_02、
+            #   ik_*/weapon_*），装配后是 141。写死 141 同样不行 —— 资产一换
+            #   就假红。资产本身的 128 由 C0 单独钉住（那条走离线探针，不受
+            #   重定向影响），这里只判"蒙皮模型 + clip 齐 + 骨数没变少"。
             check("C5e 装的是蒙皮模型且 clip 齐（skinned=1 / clips=4 / "
-                  "joints=%d）" % DEFAULT_JOINTS,
+                  "joints>=%d）" % DEFAULT_JOINTS,
                   m.group(1) in (DEFAULT_CHAR.replace(os.sep, "/"),
                                  "models/characters/alicia.vmesh")
                   and m.group(3) == "1" and m.group(5) == "4"
-                  and int(m.group(4)) == DEFAULT_JOINTS,
+                  and int(m.group(4)) >= DEFAULT_JOINTS,
                   "path=%s skinned=%s joints=%s clips=%s height=%s" %
                   (m.group(1), m.group(3), m.group(4), m.group(5), m.group(6)))
+
+            # C5e2：重定向**真的跑了**，而且 35 根 UE 骨全在。
+            # 只判骨数 >=128 的话，"重定向没生效"照样绿 —— 而那是这个功能
+            # 唯一会静默失效的方式（图照样出，只是骨名还是 Mixamo 的）。
+            mq, _ = wait_regex_after(tap, RE_MANNEQUIN, 0, 3.0)
+            check("C5e2 骨架已重定向成 UE5 Mannequin（MANNEQUIN retarget "
+                  "ue=35）",
+                  mq is not None and int(mq.group(2)) == 35
+                  and int(mq.group(6)) == 0,
+                  mq.group(0)[:110] if mq else "没有 MANNEQUIN retarget")
+
+            # C5e3：骨架真的**从独立资产**装的，而且摘要与 mesh 内嵌那份一致。
+            #
+            # 为什么必须有这条：`loadVMeshModel` 在"引用为空 / 文件读不出来 /
+            # 摘要不等"三种情况下都会**静默退回内嵌骨架**（故意的，一条坏引用
+            # 不该让角色消失）。既然失败是静默的，判据就必须盯住成功那一行 ——
+            # 否则 C0c（文件层面）绿着，运行时其实一直吃的是内嵌那份。
+            ms3, _ = wait_regex_after(tap, RE_SKELSRC, 0, 3.0)
+            check("C5e3 骨表取自独立骨架资产（VMESH-SKEL source=asset，"
+                  "digest 与 .vskel 一致）",
+                  ms3 is not None
+                  and ms3.group(1) == "models/characters/alicia.vskel"
+                  and int(ms3.group(2)) == DEFAULT_JOINTS
+                  and int(ms3.group(3)) == 3
+                  and (not skel_digest or ms3.group(4) == skel_digest),
+                  ms3.group(0)[:110] if ms3 else "没有 VMESH-SKEL source=asset")
 
         # ---- C5c 主视口里那个人到底动没动（T-pose 陷阱的正式判据）----
         # `createPlayer` 成功后会**自动打开 Character 预览窗口**。那是一份

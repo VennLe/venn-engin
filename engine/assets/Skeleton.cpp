@@ -183,4 +183,54 @@ void Skeleton::sample(const AnimationClip* clip, float time,
     animation::poseToJoints(*this, pose, out);
 }
 
+// ============================================================
+// 挂点
+// ============================================================
+int Skeleton::findSocket(const std::string& name) const {
+    // 与 `findJoint` 同一口径：先精确、不分大小写。搬过来只为让
+    // "查挂点"和"查骨"的手感一致（写 `Weapon_R` 也能找到 `weapon_r`）。
+    auto lower = [](const std::string& s) {
+        std::string o = s;
+        for (char& c : o)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return o;
+    };
+    const std::string want = lower(name);
+    for (std::size_t i = 0; i < sockets.size(); ++i)
+        if (lower(sockets[i].name) == want) return static_cast<int>(i);
+    return -1;
+}
+
+const Skeleton::Socket* Skeleton::socket(const std::string& name) const {
+    const int i = findSocket(name);
+    if (i < 0) return nullptr;
+    const Socket& s = sockets[static_cast<std::size_t>(i)];
+    // 名字在但骨没解析出来 —— 这**不是**"挂点存在"。返回 nullptr，
+    // 让调用方走"没有这个挂点"的分支，而不是拿到一个指向 -1 号骨的
+    // 挂点然后在别处越界。
+    return s.bone >= 0 ? &s : nullptr;
+}
+
+int Skeleton::resolveSockets() {
+    int bad = 0;
+    for (Socket& s : sockets) {
+        // 走 `findJoint` 的全套退化（不分大小写 + 允许包含 + 跳末端骨）：
+        // 资产里的骨名和运行时骨名在重定向/改名之后可能只差前半段。
+        s.bone = findJoint(s.boneName);
+        if (s.bone < 0) ++bad;
+    }
+    return bad;
+}
+
+bool Skeleton::socketWorld(const std::string& name,
+                           const std::vector<glm::mat4>& world,
+                           glm::mat4& out) const {
+    const Socket* s = socket(name);
+    if (s == nullptr) return false;
+    if (s->bone < 0 || static_cast<std::size_t>(s->bone) >= world.size())
+        return false;
+    out = world[static_cast<std::size_t>(s->bone)] * s->local;
+    return true;
+}
+
 } // namespace assets

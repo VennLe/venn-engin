@@ -969,6 +969,13 @@ function(myvk_copy_runtime_assets target)
     if(NOT TARGET VennAssetsCopy)
         set(VENN_ALWAYS_ASSET_DIRS
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/models|assets/models"
+            # 2026-11-06：独立骨架资产 `.vskel`（对标 UE 的 Skeleton 资产
+            # `SK_Mannequin`）。目录结构照抄 UE：
+            #     assets/characters/mannequin/{Meshes,Rigs,Anims}
+            # ⚠ 必须登记在这里 —— 忘了这一行的症状是"导出了 .vskel、也写了
+            #   `skelRef=`，但运行时永远报引用读不出来、静默退回内嵌骨架"
+            #   （因为 `build/bin/assets/characters/` 根本不存在）。
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/characters|assets/characters"
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/textures|assets/textures"
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons|assets/icons"
             # 启动器新建向导的类型卡片插图（第一/第三人称，动漫风格）。

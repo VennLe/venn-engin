@@ -2,6 +2,7 @@
 
 #include "assetio/AnimOps.h"
 #include "assetio/Binary.h"
+#include "assetio/ChunkFile.h"
 #include "assetio/VertexOps.h"
 
 #include <algorithm>
@@ -12,50 +13,8 @@
 namespace assetio {
 
 namespace {
-
-// ------------------------------------------------------------ 字符串表
-//
-// 为什么要单独一个区块而不是"每个名字就地写一遍"：
-//   骨骼名在 joint 里出现 1 次、在动画轨道里却要按 joint 引用；
-//   材质名在 submesh 里出现。重复写不但浪费，更要命的是**没法按名字
-//   对齐**（比如 `.vmeta` 的材质映射表要按名字查）。
-// 去重之后，同名一定是同一个下标，比较成本从 strcmp 降到比整数。
-class StringTable {
-public:
-    std::uint32_t add(const std::string& s) {
-        const auto it = m_map.find(s);
-        if (it != m_map.end()) return it->second;
-        const std::uint32_t idx = static_cast<std::uint32_t>(m_strs.size());
-        m_strs.push_back(s);
-        m_map.emplace(s, idx);
-        return idx;
-    }
-    const std::vector<std::string>& all() const { return m_strs; }
-    std::size_t size() const { return m_strs.size(); }
-
-private:
-    std::vector<std::string> m_strs;
-    std::unordered_map<std::string, std::uint32_t> m_map;
-};
-
-constexpr std::uint32_t kNoString = 0xFFFFFFFFu;
-constexpr std::size_t kFileHeaderSize = 32;
-constexpr std::size_t kSectionHeaderSize = 32;
-
-void writeMat4(Writer& w, const glm::mat4& m) {
-    // glm::mat4 是**列主序**，直接按 [col][row] 顺序写 16 个 float。
-    // 读端按同样顺序填回 —— 中间不做转置，否则往返一次模型就镜像了。
-    for (int c = 0; c < 4; ++c)
-        for (int r = 0; r < 4; ++r) w.f32(m[c][r]);
-}
-
-glm::mat4 readMat4(Reader& r) {
-    glm::mat4 m(1.0f);
-    for (int c = 0; c < 4; ++c)
-        for (int row = 0; row < 4; ++row) m[c][row] = r.f32();
-    return m;
-}
-
+// 容器层（文件头 / 区块表 / CRC / 字符串表 / mat4）已搬到 `assetio/ChunkFile.h`
+// —— `.vskel` 也要用同一份。这里只保留 `.vmesh` 自己的区块语义。
 } // namespace
 
 const char* sectionName(std::uint32_t id) {
@@ -65,6 +24,7 @@ const char* sectionName(std::uint32_t id) {
         case kSectionAnimation: return "ANIM";
         case kSectionMaterial: return "MAT";
         case kSectionMorph: return "MORPH";
+        case kSectionSkeletonRef: return "SKELREF";
         case kSectionString: return "STR";
         default: return "?";
     }
@@ -337,6 +297,15 @@ std::vector<std::uint8_t> writeMeshFile(SourceModel model,
         }
     }
 
+    // ---- SKELREF 区块（2026-11-06，独立骨架资产）----
+    //
+    // 只在真的引用了 `.vskel` 时才写。**不写空区块**：老资产（没重烤的）
+    // 一个字节都不变，`sections=` 也还是 6 —— 回归脚本里的判据不会因为
+    // "多了一条可选能力"集体变红。
+    Writer skelRefW;
+    const bool hasSkelRef = !model.skeletonPath.empty();
+    if (hasSkelRef) skelRefW.u32(strs.add(model.skeletonPath));
+
     Writer strW;
     {
         strW.u32(static_cast<std::uint32_t>(strs.size()));
@@ -344,17 +313,17 @@ std::vector<std::uint8_t> writeMeshFile(SourceModel model,
     }
 
     // ---------- 3. 组装容器 ----------
-    struct Sec {
-        std::uint32_t id;
-        std::vector<std::uint8_t> payload;
-    };
-    std::vector<Sec> secs;
-    secs.push_back({kSectionMesh, meshW.take()});
-    if (!model.joints.empty()) secs.push_back({kSectionSkeleton, skelW.take()});
-    if (!model.clips.empty()) secs.push_back({kSectionAnimation, animW.take()});
-    if (!model.materials.empty()) secs.push_back({kSectionMaterial, matW.take()});
-    if (anyMorph) secs.push_back({kSectionMorph, morphW.take()});
-    secs.push_back({kSectionString, strW.take()});
+    std::vector<Chunk> secs;
+    secs.push_back({kSectionMesh, 1, meshW.take()});
+    if (!model.joints.empty()) secs.push_back({kSectionSkeleton, 1, skelW.take()});
+    if (!model.clips.empty()) secs.push_back({kSectionAnimation, 1, animW.take()});
+    if (!model.materials.empty()) secs.push_back({kSectionMaterial, 1, matW.take()});
+    if (anyMorph) secs.push_back({kSectionMorph, 1, morphW.take()});
+    if (hasSkelRef) secs.push_back({kSectionSkeletonRef, 1, skelRefW.take()});
+    secs.push_back({kSectionString, 1, strW.take()});
+    // 在 move 之前数：`--verbose` 与回归脚本会拿它断言"morph 区块确实
+    // 写进去了"，事后重算一次等于把那行逻辑写两遍。
+    const std::size_t chunkCount = secs.size();
 
     std::uint32_t flags = 0;
     if (!model.joints.empty()) flags |= kFlagSkinned;
@@ -362,41 +331,13 @@ std::vector<std::uint8_t> writeMeshFile(SourceModel model,
     if (opt.weld || opt.optimizeCache) flags |= kFlagOptimized;
     if (all16) flags |= kFlagIndex16;
 
-    Writer w;
-    w.bytes(kMeshFileMagic, 8);
-    w.u32(kMeshFileVersion);
-    w.u32(flags);
-    w.u64(model.sourceHash);
-    w.u32(static_cast<std::uint32_t>(secs.size()));
-    w.u32(0);   // reserved（将来可能放"编译器版本"）
+    std::vector<std::uint8_t> out = writeChunkFile(
+        kMeshFileMagic, kMeshFileVersion, flags, model.sourceHash, std::move(secs));
 
-    const std::size_t tableStart = w.size();
-    for (std::size_t i = 0; i < secs.size(); ++i) {
-        w.u32(secs[i].id);
-        w.u32(1);          // 区块版本
-        w.u32(0);          // crc（回填）
-        w.u32(0);          // reserved
-        w.u64(0);          // offset（回填）
-        w.u64(0);          // size（回填）
-    }
-
-    for (std::size_t i = 0; i < secs.size(); ++i) {
-        w.align(8);
-        const std::uint64_t off = w.size();
-        w.bytes(secs[i].payload.data(), secs[i].payload.size());
-        const std::uint64_t sz = w.size() - off;
-        const std::uint32_t crc =
-            crc32(secs[i].payload.data(), secs[i].payload.size());
-        const std::size_t e = tableStart + i * kSectionHeaderSize;
-        w.patchU32(e + 8, crc);
-        w.patchU64(e + 16, off);
-        w.patchU64(e + 24, sz);
-    }
-
-    st.bytes = w.size();
-    st.sections = secs.size();
+    st.bytes = out.size();
+    st.sections = chunkCount;
     if (statsOut) *statsOut = st;
-    return w.take();
+    return out;
 }
 
 // ============================================================
@@ -404,78 +345,65 @@ std::vector<std::uint8_t> writeMeshFile(SourceModel model,
 // ============================================================
 namespace {
 
-struct SecRef {
-    std::uint64_t offset = 0;
-    std::uint64_t size = 0;
-    std::uint32_t crc = 0;
-};
+// 区块引用直接用容器层的 `ChunkEntry`（多了个 version 字段，无害）。
+using SecRef = ChunkEntry;
 
+// 把容器的表搬成 MeshFileInfo + (id → 引用) 列表。
+//
+// 文件头 / 区块表 / 边界检查 / 版本拒绝**全部**在
+// `readChunkTable`（ChunkFile.cpp）里 —— 这里只做 `.vmesh` 特有的
+// 字段搬运。这么拆的理由：`.vskel` 也要走同样的表，两份实现的差异
+// 会从"排版不同"长成"一个能跳过未知区块、一个不能"。
 bool parseTable(const void* data, std::size_t size, MeshFileInfo& info,
                 std::vector<std::pair<std::uint32_t, SecRef>>& out,
                 std::string* err) {
-    if (size < kFileHeaderSize) {
-        if (err) *err = "file too small for header";
+    ChunkFileHeader hdr;
+    std::vector<ChunkEntry> entries;
+    if (!readChunkTable(data, size, kMeshFileMagic, ".vmesh", kMeshFileVersion,
+                        hdr, entries, &sectionName, err)) {
         return false;
     }
-    Reader r(data, size);
-    char magic[8] = {};
-    if (!r.bytes(magic, 8)) {
-        if (err) *err = "truncated magic";
-        return false;
-    }
-    if (std::memcmp(magic, kMeshFileMagic, 8) != 0) {
-        if (err) *err = "bad magic (not a .vmesh file)";
-        return false;
-    }
-    info.version = r.u32();
-    info.flags = r.u32();
-    info.sourceHash = r.u64();
-    info.sectionCount = r.u32();
-    r.u32();   // reserved
-
-    if (info.version != kMeshFileVersion) {
-        if (err) {
-            *err = "unsupported container version " +
-                   std::to_string(info.version) + " (expect " +
-                   std::to_string(kMeshFileVersion) + ")";
-        }
-        return false;
-    }
-    // 区块数上限：32 字节一个区块头，再多的文件一定是坏的（或恶意）。
-    if (info.sectionCount == 0 || info.sectionCount > 64) {
-        if (err) *err = "bad section count";
-        return false;
-    }
-    const std::size_t need =
-        kFileHeaderSize + static_cast<std::size_t>(info.sectionCount) * kSectionHeaderSize;
-    if (need > size) {
-        if (err) *err = "truncated section table";
-        return false;
-    }
-
-    for (std::uint32_t i = 0; i < info.sectionCount; ++i) {
-        const std::uint32_t id = r.u32();
-        r.u32();   // 区块版本（当前都读 1；将来按需判）
-        const std::uint32_t crc = r.u32();
-        r.u32();   // reserved
-        const std::uint64_t off = r.u64();
-        const std::uint64_t len = r.u64();
-        if (off > size || len > size - off) {
-            if (err) {
-                *err = std::string("section ") + sectionName(id) +
-                       " out of bounds";
-            }
-            return false;
-        }
-        out.emplace_back(id, SecRef{off, len, crc});
-    }
-    info.bytes = size;
+    info.version = hdr.version;
+    info.flags = hdr.flags;
+    info.sourceHash = hdr.sourceHash;
+    info.sectionCount = hdr.chunkCount;
+    info.bytes = hdr.bytes;
+    out.reserve(entries.size());
+    for (const ChunkEntry& e : entries) out.emplace_back(e.id, e);
     return true;
 }
 
-std::string resolveString(const std::vector<std::string>& strs, std::uint32_t idx) {
-    if (idx == kNoString || idx >= strs.size()) return std::string();
-    return strs[idx];
+// STR 区块的解析（`readMeshFile` 与 `inspectMeshFile` 共用）。
+//
+// 为什么体检也要解它：`--info` 得能报出 `skeleton=models/.../alicia.vskel`。
+// 没有这一行，"这个资产到底引用没引用独立骨架"就只能靠加载一次模型去猜 ——
+// 而 `--info` 存在的意义正是**不加载**就把这件事查清楚。
+bool readStringTable(const void* data,
+                     const std::vector<std::pair<std::uint32_t, SecRef>>& secs,
+                     std::vector<std::string>& out, std::string* err,
+                     bool required) {
+    for (const auto& [id, ref] : secs) {
+        if (id != kSectionString) continue;
+        Reader r(static_cast<const std::uint8_t*>(data) + ref.offset, ref.size);
+        const std::uint32_t n = r.u32();
+        // 上限保护：一个字符串表条目至少 4 字节，n 超过剩余字节数就是坏文件
+        if (n > ref.size) {
+            if (err) *err = "STR: bad string count";
+            return false;
+        }
+        out.reserve(n);
+        for (std::uint32_t i = 0; i < n && r.ok(); ++i) out.push_back(r.str());
+        if (!r.ok()) {
+            if (err) *err = "STR: truncated";
+            return false;
+        }
+        return true;
+    }
+    if (required) {
+        if (err) *err = "STR: missing section";
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -487,6 +415,10 @@ bool inspectMeshFile(const void* data, std::size_t size, MeshFileInfo& info,
     if (!parseTable(data, size, info, secs, err)) return false;
 
     info.index16 = (info.flags & kFlagIndex16) != 0;
+
+    std::vector<std::string> strs;
+    // 体检不因缺 STR 就失败（坏文件也应该能报结构），所以 required=false。
+    if (!readStringTable(data, secs, strs, err, false)) return false;
 
     for (const auto& [id, ref] : secs) {
         Reader r(static_cast<const std::uint8_t*>(data) + ref.offset, ref.size);
@@ -544,6 +476,8 @@ bool inspectMeshFile(const void* data, std::size_t size, MeshFileInfo& info,
                     info.morphChannelCount += tc;
                 }
             }
+        } else if (id == kSectionSkeletonRef) {
+            info.skeletonPath = resolveString(strs, r.u32());
         }
     }
     return true;
@@ -569,40 +503,16 @@ bool readMeshFile(const void* data, std::size_t size, SourceModel& out,
     // ⚠ 只校验 CRC 不算完：CRC 只能说明"字节没坏"，不能说明"内容合法"
     //   （有人拿 v1 的写端配 v2 的读端，CRC 一样是对的）。所以下面每个
     //   区块仍然要逐字段做范围检查。
-    for (const auto& [id, ref] : secs) {
-        const std::uint32_t crc =
-            crc32(static_cast<const std::uint8_t*>(data) + ref.offset,
-                  static_cast<std::size_t>(ref.size));
-        if (crc != ref.crc) {
-            if (err) {
-                char buf[128];
-                std::snprintf(buf, sizeof(buf),
-                              "section %s crc mismatch (file corrupt)",
-                              sectionName(id));
-                *err = buf;
-            }
-            return false;
-        }
+    {
+        std::vector<ChunkEntry> entries;
+        entries.reserve(secs.size());
+        for (const auto& [id, ref] : secs) entries.push_back(ref);
+        if (!verifyChunkCrc(data, size, entries, &sectionName, err)) return false;
     }
 
     std::vector<std::string> strs;
     // STR 必须**先**解：其余区块里的名字都是它的下标。
-    for (const auto& [id, ref] : secs) {
-        if (id != kSectionString) continue;
-        Reader r(static_cast<const std::uint8_t*>(data) + ref.offset, ref.size);
-        const std::uint32_t n = r.u32();
-        // 上限保护：一个字符串表条目至少 4 字节，n 超过剩余字节数就是坏文件
-        if (n > ref.size) {
-            if (err) *err = "STR: bad string count";
-            return false;
-        }
-        strs.reserve(n);
-        for (std::uint32_t i = 0; i < n && r.ok(); ++i) strs.push_back(r.str());
-        if (!r.ok()) {
-            if (err) *err = "STR: truncated";
-            return false;
-        }
-    }
+    if (!readStringTable(data, secs, strs, err, true)) return false;
 
     // MORPH 区块先暂存、循环结束后再合并到 subMeshes 上。
     // 不直接按顺序写进去的理由：区块顺序是**写端**的实现细节，
@@ -888,6 +798,15 @@ bool readMeshFile(const void* data, std::size_t size, SourceModel& out,
             }
             if (!r.ok()) {
                 if (err) *err = "ANIM: truncated";
+                return false;
+            }
+        } else if (id == kSectionSkeletonRef) {
+            // 独立骨架资产的引用。路径为空 = 写了区块但内容坏，
+            // 明确报出来比"静默退回内嵌"好 —— 后者会让"我明明链接了
+            // 独立骨架，怎么骨架面板里还是内嵌那份"变成一个谜。
+            out.skeletonPath = resolveString(strs, r.u32());
+            if (out.skeletonPath.empty()) {
+                if (err) *err = "SKELREF: empty skeleton path";
                 return false;
             }
         }

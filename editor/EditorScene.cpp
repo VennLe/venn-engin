@@ -10,6 +10,7 @@
 #include "assets/Model.h"
 #include "assets/ModelOrientation.h"
 #include "core/Logger.h"
+#include "character/MannequinSkeleton.h"  // UE5 标准骨架（35 根骨）
 #include "character/ViewRig.h"   // 眼位 / 藏身体 / 身体度量（与运行时同一份）
 #include "ecs/Components.h"
 #include "scene/Camera.h"
@@ -315,6 +316,9 @@ void bindDefaultCharacter(scene::Scene& scene, assets::AssetManager& am,
                     kDefaultCharacterPath);
         return;
     }
+    // UE5 Mannequin 骨架：把资产的骨名/层级重定向成 UE 的 35 根骨
+    // （顶点下标与动画轨道下标都不动，见 character/MannequinSkeleton.cpp）。
+    character::upgradeModelSkeletonForPlay(*model);
 
     scene::ModelInstanceOptions opt;
     opt.parent = player;

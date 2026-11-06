@@ -1124,6 +1124,15 @@ DEFAULT = [
     # C9 还顺带守 `animKeys` 的存读闭环（Play 副本是重新反序列化的）。
     "verify_char_locomotion",
 
+    # ---- 骨架独立成资产（2026-11-06，对标 UE 的 Skeleton 资产）----
+    # 用户要求"按 ue5 的 Mannequins 结构改造骨骼绑定"。这一刀把骨表从
+    # `.vmesh` 内嵌搬到独立资产 `.vskel`，`.vmesh` 只留一条引用。
+    # 全部走离线 `AssetC`（不起窗口 / 不建 Vulkan）：提取、引用写盘、
+    # 坏文件拒绝、目录结构、`--info` 按扩展名分流。
+    # ⚠ 与 `verify_char_locomotion` 的 C0c/C5e3 是一对：那边验"运行时真的
+    #   用了独立骨架"，这边验"工具链能正确地生产它"。
+    "verify_skeleton_asset",
+
     # ---- 运行时"手感四件事"（P5，2026-10-22）----
     # 用户报障四条：①脚陷地 + 出生点不是 GameStart；②必须点视口才能操作、
     # 操作时隐藏鼠标、Esc 退出；③移动没朝视线方向（**最关键**）；④状态切换
@@ -3337,6 +3346,19 @@ TRIGGERS = {
                         # 四态判据（run 阈值 / 冲刺倍率）跑在玩家控制器上
                         "runtime/PlayerController.*",
                         "runtime/RuntimeApp.*"],
+
+    # 独立骨架资产（2026-11-06）。判据全在离线层，所以登记的都是
+    # "会改变 `.vskel` 字节或 CLI 契约"的文件。
+    "verify_skeleton_asset": ["assetio/ChunkFile.*",       # 容器层（两个格式共用）
+                              "assetio/SkelFormat.*",      # .vskel 读写
+                              "assetio/MeshFormat.*",      # SKELREF 区块
+                              "assetio/SourceModel.h",     # skeletonPath 字段
+                              "assetc/main.cpp",           # --extract-skel / --skel-ref
+                              # 出厂资产本身就是判据（S0 直接读它们）
+                              "assets/characters/**",
+                              "assets/models/characters/alicia.vskel"],
+                              # ⚠ `CMakeLists.txt` **不写**：它在横切表里，
+                              #   写了会被 check_regression_map 判红。
 
     # 角色预览 / 主场景地形并存。⚠ `engine/render/Renderer.cpp` 不在这里 ——
     # 它是 GLOBAL_GLOBS，改它本来就全量重跑。这里登记的是"改了就会让

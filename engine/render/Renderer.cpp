@@ -4898,9 +4898,24 @@ void Renderer::createFrameResources() {
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         f.uboMapped = f.globalUBO->map();
 
-        // 骨骼矩阵 SSBO：初始 256 个 mat4（够几个角色），不够时 updateSkinning
+        // 骨骼矩阵 SSBO：初始 4096 个 mat4（256 KB），不够时 updateSkinning
         // 里按需重建。HOST_VISIBLE + 持久映射。
-        const uint32_t kInitialJoints = 256;
+        //
+        // ⚠ 这个常数必须覆盖 **2 × Σ(角色骨数)**，不是 1 倍（2026-11-06 实测）：
+        //   `updateSkinning` 每帧被调用两次 —— 主场景一次（`resetSkinning=true`，
+        //   偏移归零）、离屏目标一次（`false`，偏移**累加**）。第二次的
+        //   `capNeed` 是 `Σjoints + Σjoints`。
+        //   原来写 256，而引擎自带角色的 alicia 是 **128 根骨** → 128+128 = 256，
+        //   恰好不触发 `>`；一旦骨数变成 141（UE5 Mannequin 重定向后的值）
+        //   就是 282 → 当场扩容 → 扩容里 `writeGlobalDescriptors()` 在
+        //   **录制中途**重写描述符，validation 报 "descriptorSet is in use by
+        //   VkCommandBuffer"，之后整帧的命令缓冲进入 invalid state、画面全黑。
+        //   所以这不是"调大一点的性能选择"，是**正确性下限**：4096 够 14 个
+        //   141 骨的角色同时在场景里。
+        // ⚠ 扩容路径本身仍然只适用于"帧边界之外"：它会把所有 frame slot 的
+        //   描述符一起重写，包括 GPU 上还在跑的那些。真要根治得把扩容挪到
+        //   录制之前。这里先把它压到不会触发的量级。
+        const uint32_t kInitialJoints = 4096;
         f.jointMatrices = std::make_unique<rhi::Buffer>(
             *m_device, kInitialJoints * sizeof(glm::mat4),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,

@@ -8,6 +8,7 @@
 #include "assets/Model.h"
 #include "animation/TransformClip.h"   // C5：实体 TRS 轨道的运行时消费者
 #include "animation/ExpressionDriver.h" // B6：表情预设 + 眨眼/口型驱动
+#include "character/MannequinSkeleton.h"  // UE5 标准骨架（35 根骨）
 #include "character/ViewRig.h"   // 第一/第三人称的装配与相机口径（唯一一份）
 #include "core/Build.h"
 #include "core/CpuProfiler.h"
@@ -225,6 +226,9 @@ bool attachPlayerModel(scene::Scene& scene, assets::AssetManager& am,
         VK_LOG_ERROR("GAME-PLAYER model invalid path='%s'", v.model.c_str());
         return false;
     }
+    // UE5 Mannequin 骨架（与编辑器 Play 同一个入口，别在两边各判一次
+    // 环境变量 —— 那会导致"编辑器里是 UE 骨名、Game.exe 里不是"）。
+    character::upgradeModelSkeletonForPlay(*model);
 
     glm::vec3 lo(0.0f), hi(0.0f);
     const bool hasBounds = modelWorldBounds(*model, &lo, &hi);

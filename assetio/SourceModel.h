@@ -237,6 +237,19 @@ struct SourceModel {
     glm::mat4 invMeshNode{1.0f};
     std::vector<SourceClip> clips;
 
+    // 独立骨架资产的引用（**相对资产根**的 `.vskel` 路径）。
+    //
+    // 抄 UE 的 SkeletalMesh → Skeleton 引用：骨名/层级/挂点归属骨架资产，
+    // mesh 只是引用它。空 = 用上面内嵌的那份 `joints`（改造前的行为）。
+    //
+    // ⚠ 内嵌的那份**不删**。理由是三条：
+    //   ① 老资产（没重烤的）还能加载，不需要一次性重烤全库；
+    //   ② `.vskel` 丢了/坏了的时候能退回内嵌，角色不会变成一堆散三角形；
+    //   ③ 加载期可以拿两边算出的 `boneDigest` 互相比对 —— 这是"这个 mesh
+    //      和这个骨架是不是同一套"的唯一可检查判据（UE 靠资产身份，
+    //      我们靠摘要）。只存一份就没有可比的东西了。
+    std::string skeletonPath;
+
     // 模型包围：pivot 归位后 center 恒为 0，bounds 是"世界空间"的
     // 归一化包围盒（米）。radius 给相机取景 / 光源范围用。
     glm::vec3 boundsMin{0.0f};

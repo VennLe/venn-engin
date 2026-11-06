@@ -23,6 +23,7 @@
 #include "assetio/FbxImport.h"
 #include "assetio/MeshFormat.h"
 #include "assetio/ProcAnim.h"
+#include "assetio/SkelFormat.h"
 
 #include <algorithm>
 #include <cctype>
@@ -80,6 +81,9 @@ struct Args {
     // ---- 程序化动画（P3）----
     bool procAnim = false;
     float animFps = 30.0f;
+    // ---- 独立骨架资产（UE 的 Skeleton 资产模型，2026-11-06）----
+    std::string extractSkel;   // --extract-skel：把骨架另存成 .vskel
+    std::string skelRef;       // --skel-ref：写进 .vmesh 的骨架引用
 };
 
 void usage() {
@@ -97,8 +101,8 @@ void usage() {
         "  --no-anim-reduce 不做动画抽帧\n"
         "  --rot-tol <deg>  旋转抽帧容差（默认 0.1 度）\n"
         "  -r, --recursive  目录递归\n"
-        "  --info           只打印 .vmesh 的体检信息\n"
-        "  --check          校验 .vmesh 完整性（CRC/越界），不写任何东西\n"
+        "  --info           只打印体检信息（.vmesh 与 .vskel 都认）\n"
+        "  --check          校验完整性（CRC/越界），不写任何东西\n"
         "  -q, --quiet      安静模式（只输出 ASSETC 结果行）\n"
         "  -h, --help       这条帮助\n"
         "\n"
@@ -111,7 +115,14 @@ void usage() {
         "程序化动画（P3）：\n"
         "  --procanim       生成 idle / walk / run / jump 四段基础动画\n"
         "                   （需要骨架；可跟在 --autorig 后面一次做完）\n"
-        "  --anim-fps <n>   关键帧采样率（默认 30）\n");
+        "  --anim-fps <n>   关键帧采样率（默认 30）\n"
+        "\n"
+        "独立骨架资产（对标 UE 的 Skeleton 资产 SK_Mannequin）：\n"
+        "  --extract-skel <out.vskel>  把 .vmesh（或 .fbx）里的骨架另存成\n"
+        "                              独立骨架资产，并写入默认挂点\n"
+        "                              （weapon_r / weapon_l / eye）\n"
+        "  --skel-ref <relpath>        把骨架引用写进 .vmesh（相对资产根），\n"
+        "                              加载器会优先用那个 .vskel 的骨表\n");
 }
 
 bool isFbx(const fs::path& p) {
@@ -126,6 +137,13 @@ bool isVmesh(const fs::path& p) {
     std::transform(ext.begin(), ext.end(), ext.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return ext == ".vmesh";
+}
+
+bool isVskel(const fs::path& p) {
+    std::string ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext == ".vskel";
 }
 
 std::vector<std::uint8_t> readFile(const fs::path& p, bool& ok) {
@@ -195,6 +213,10 @@ int doInfo(const Args& a) {
         std::printf("ASSETC   joints=%u clips=%u materials=%u sourceHash=%016llx\n",
                     info.jointCount, info.clipCount, info.materialCount,
                     static_cast<unsigned long long>(info.sourceHash));
+        // 独立骨架引用（2026-11-06）。空也要打 —— "查过了，没有"和
+        // "忘了查"在验收脚本里是两件事（同 morph 那一行的理由）。
+        std::printf("ASSETC   skelRef=%s\n",
+                    info.skeletonPath.empty() ? "-" : info.skeletonPath.c_str());
         // morph 单独一行（§14）：0 也要打 —— "查过了，没有"和"忘了查"
         // 在验收脚本里是两件事。
         std::printf("ASSETC   morph targets=%u deltas=%llu channels=%u\n",
@@ -414,6 +436,21 @@ int doCheck(const Args& a) {
         }
         assetio::SourceModel m;
         std::string err;
+        if (isVskel(fs::path(in))) {
+            // 骨架资产在 `--check` 下也走一遍完整读取：`readSkelFile` 自带
+            // 骨表自洽校验（摘要 vs 内容、父下标越界、topo 下标越界），
+            // 这些是 CRC 查不出来的。
+            assetio::SourceSkeletonAsset sk;
+            if (!assetio::readSkelFile(bytes.data(), bytes.size(), sk, &err)) {
+                std::printf("ASSETC FAIL %s reason=%s\n", in.c_str(), err.c_str());
+                ++fails;
+                continue;
+            }
+            std::printf("ASSETC OK %s joints=%d sockets=%zu digest=%016llx\n",
+                        in.c_str(), sk.jointCount(), sk.sockets.size(),
+                        static_cast<unsigned long long>(sk.boneDigest));
+            continue;
+        }
         if (!assetio::readMeshFile(bytes.data(), bytes.size(), m, &err)) {
             std::printf("ASSETC FAIL %s reason=%s\n", in.c_str(), err.c_str());
             ++fails;
@@ -437,6 +474,115 @@ int doCheck(const Args& a) {
                     m.triangleCount(), m.joints.size(), m.clips.size());
     }
     return fails ? 1 : 0;
+}
+
+// ------------------------------------------------------------ 独立骨架资产
+//
+// `--extract-skel`：把已经烤好的模型里的骨架**另存**成一个 `.vskel`。
+//
+// 为什么是"从 .vmesh 提取"而不是"从 FBX 直接生成"：走同一条读取路径，
+// 得到的骨表与运行时看到的那份**逐位相同**（包括提取时若用过 `--autorig`
+// 新长出来的骨）。从 FBX 再解析一遍就有两份骨表，迟早对不上。
+bool writeSkeletonAsset(const assetio::SourceModel& m, const std::string& outPath,
+                        std::string* err) {
+    if (m.joints.empty()) {
+        if (err) *err = "no_skeleton";
+        return false;
+    }
+    assetio::SourceSkeletonAsset sk;
+    sk.name = fs::path(outPath).stem().string();
+    sk.joints = m.joints;
+    sk.topoOrder = m.topoOrder;
+    sk.invMeshNode = m.invMeshNode;
+    sk.sourceHash = m.sourceHash;
+    sk.boneDigest = assetio::skeletonBoneDigest(sk.joints);
+    // 默认挂点（UE 的 weapon_r / weapon_l + 我们的 eye）。
+    // 骨名按候选表解析，解析不到就不建那个挂点 —— 见 SkelFormat.h。
+    assetio::applyDefaultSockets(sk.joints, sk.sockets);
+
+    const std::vector<std::uint8_t> bytes = assetio::writeSkelFile(sk);
+    if (bytes.empty() || !writeFile(outPath, bytes)) {
+        if (err) *err = "write_error";
+        return false;
+    }
+    std::printf("ASSETC SKEL OK %s joints=%zu sockets=%zu digest=%016llx "
+                "bytes=%zu\n",
+                outPath.c_str(), sk.joints.size(), sk.sockets.size(),
+                static_cast<unsigned long long>(sk.boneDigest), bytes.size());
+    for (const assetio::SourceSocket& s : sk.sockets) {
+        std::printf("ASSETC   socket \"%s\" -> \"%s\"\n", s.name.c_str(),
+                    s.boneName.c_str());
+    }
+    return true;
+}
+
+int doSkelInfo(const Args& a) {
+    int fails = 0;
+    for (const std::string& in : a.inputs) {
+        bool ok = false;
+        const std::vector<std::uint8_t> bytes = readFile(in, ok);
+        if (!ok) {
+            std::printf("ASSETC FAIL %s reason=read_error\n", in.c_str());
+            ++fails;
+            continue;
+        }
+        assetio::SkelFileInfo info;
+        std::string err;
+        if (!assetio::inspectSkelFile(bytes.data(), bytes.size(), info, &err)) {
+            std::printf("ASSETC FAIL %s reason=%s\n", in.c_str(), err.c_str());
+            ++fails;
+            continue;
+        }
+        std::printf("ASSETC SKELINFO %s\n", in.c_str());
+        std::printf("ASSETC   version=%u flags=0x%x sections=%u bytes=%s\n",
+                    info.version, info.flags, info.chunkCount,
+                    humanBytes(info.bytes).c_str());
+        std::printf("ASSETC   joints=%u topo=%u sockets=%u engineXform=%d\n",
+                    info.jointCount, info.topoCount, info.socketCount,
+                    info.hasEngineXform ? 1 : 0);
+        std::printf("ASSETC   boneDigest=%016llx sourceHash=%016llx\n",
+                    static_cast<unsigned long long>(info.boneDigest),
+                    static_cast<unsigned long long>(info.sourceHash));
+
+        // 完整读一遍：`--info` 要能报出"挂点挂在哪根骨"，只读头是报不出来的。
+        assetio::SourceSkeletonAsset sk;
+        if (assetio::readSkelFile(bytes.data(), bytes.size(), sk, &err)) {
+            for (const assetio::SourceSocket& s : sk.sockets) {
+                const int bone = sk.findJoint(s.boneName);
+                std::printf("ASSETC   socket \"%s\" bone=\"%s\" index=%d\n",
+                            s.name.c_str(), s.boneName.c_str(), bone);
+            }
+            std::size_t shown = 0;
+            for (const assetio::SourceJoint& j : sk.joints) {
+                if (shown++ >= 8) { std::printf("ASSETC   joint ...\n"); break; }
+                std::printf("ASSETC   joint \"%s\" parent=%d\n", j.name.c_str(),
+                            j.parent);
+            }
+        } else {
+            std::printf("ASSETC FAIL %s reason=%s\n", in.c_str(), err.c_str());
+            ++fails;
+        }
+    }
+    return fails ? 1 : 0;
+}
+
+// `--info` 按扩展名分工：`.vskel` 走骨架体检，其余走网格体检。
+//
+// 为什么不分两个开关：`AssetC --info assets` 这种目录批处理会同时碰到
+// 两种文件，分成两个开关就得跑两遍、还得各写一个 `-r` 过滤条件。
+// 让工具自己看扩展名，比让脚本记得"先筛 .vskel 再筛 .vmesh"可靠。
+int doInfoDispatch(const Args& a) {
+    Args mesh = a;
+    Args skel = a;
+    mesh.inputs.clear();
+    skel.inputs.clear();
+    for (const std::string& in : a.inputs)
+        (isVskel(fs::path(in)) ? skel : mesh).inputs.push_back(in);
+
+    int rc = 0;
+    if (!mesh.inputs.empty() && doInfo(mesh) != 0) rc = 1;
+    if (!skel.inputs.empty() && doSkelInfo(skel) != 0) rc = 1;
+    return rc;
 }
 
 } // namespace
@@ -469,6 +615,8 @@ int main(int argc, char** argv) {
         else if (s == "--strip-skin") a.stripSkin = true;
         else if (s == "--procanim") a.procAnim = true;
         else if (s == "--anim-fps") a.animFps = std::stof(next("--anim-fps"));
+        else if (s == "--extract-skel") a.extractSkel = next("--extract-skel");
+        else if (s == "--skel-ref") a.skelRef = next("--skel-ref");
         else if (!s.empty() && s[0] == '-') {
             std::printf("ASSETC FAIL reason=unknown_option option=%s\n", s.c_str());
             return 2;
@@ -488,7 +636,8 @@ int main(int argc, char** argv) {
         const bool wantVmesh = a.info || a.check;
         auto take = [&](const fs::directory_entry& e) {
             if (!e.is_regular_file(ec) || ec) return;
-            if (wantVmesh ? isVmesh(e.path()) : isFbx(e.path()))
+            if (wantVmesh ? (isVmesh(e.path()) || isVskel(e.path()))
+                          : isFbx(e.path()))
                 files.push_back(e.path().string());
         };
         if (a.recursive) {
@@ -515,7 +664,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if (a.info) return doInfo(a);
+    if (a.info) return doInfoDispatch(a);
     if (a.check) return doCheck(a);
 
     const bool outIsDir = !a.output.empty() &&
@@ -530,7 +679,13 @@ int main(int argc, char** argv) {
         // 烤制会做顶点合并与缓存重排，绑骨前顶点已经是最终拓扑，权重
         // 不会因为合并而丢失（合并是**按全属性**比较的，权重也参与比较，
         // 所以合并后再算是最安全的顺序）。
-        if (isVmesh(in) && (a.autRig || a.stripSkin || a.procAnim)) {
+        // `.vmesh` 输入：只有"再加工"这一种用法（绑骨 / 剥骨架 / 提取骨架）
+        // 从 FBX 直接烤 + 绑骨也行（下面那条路），但"先烤再绑"更可控：
+        // 烤制会做顶点合并与缓存重排，绑骨前顶点已经是最终拓扑，权重
+        // 不会因为合并而丢失（合并是**按全属性**比较的，权重也参与比较，
+        // 所以合并后再算是最安全的顺序）。
+        const bool skelWork = !a.extractSkel.empty() || !a.skelRef.empty();
+        if (isVmesh(in) && (a.autRig || a.stripSkin || a.procAnim || skelWork)) {
             bool ok = false;
             const std::vector<std::uint8_t> bytes = readFile(in, ok);
             if (!ok) {
@@ -556,11 +711,47 @@ int main(int argc, char** argv) {
                 ++fails;
                 continue;
             }
+            // ---- 独立骨架资产 ----
+            // 提取用**剥离过/绑过骨之后**的 m：`--autorig --extract-skel`
+            // 一次跑完时，`.vskel` 里必须是新长出来的那套骨，不是原来的。
+            if (!a.extractSkel.empty()) {
+                std::string skErr;
+                if (!writeSkeletonAsset(m, a.extractSkel, &skErr)) {
+                    std::printf("ASSETC FAIL %s reason=%s\n", in.c_str(),
+                                skErr.c_str());
+                    ++fails;
+                    continue;
+                }
+            }
+            // 引用写进 .vmesh：从这一步起，运行时优先用 .vskel 的骨表。
+            if (!a.skelRef.empty()) m.skeletonPath = a.skelRef;
+
+            // 没有任何"会改模型"的活儿（纯粹只想导一份 .vskel）→ **不重写
+            // `.vmesh`**。理由是实测出来的：`writeMeshFile` 对同一份数据
+            // 再跑一遍**不是逐字节幂等**的 —— 动画抽帧（`reduceClip`）在
+            // 已经抽过的关键帧上再按容差过一遍，还会再掉几帧
+            // （alicia 实测 3285226 → 3284930 字节，少 296 B）。
+            // "只想导骨架，结果角色的动画被重新压了一次"是不能接受的副作用。
+            const bool mutatesModel =
+                a.stripSkin || a.autRig || a.procAnim || !a.skelRef.empty();
+            if (!mutatesModel) {
+                std::printf("ASSETC   vmesh untouched（只导骨架，不改模型）\n");
+                continue;
+            }
+
             assetio::WriteOptions wo;
             wo.weld = a.weld;
             wo.optimizeCache = a.optimize;
             wo.reduceAnimation = a.reduceAnim;
             wo.rotationTolDeg = a.rotTolDeg;
+            // 纯 relink（只加骨架引用）只关**抽帧**这一项。
+            //
+            // 为什么不把焊接/重排也关掉：那两个是**幂等**的（已经焊过的顶点
+            // 再焊一次不会少、已经重排过的索引再排一次不变），而 `reduceClip`
+            // 不幂等 —— 它按容差丢帧，再跑一遍会在已经丢过的曲线上又丢几帧
+            // （alicia 实测少 296 B）。关掉它，几何仍然走正常路径（文件标志位
+            // 里的 `optimized` 也才是真话），动画则原样带过。
+            if (!(a.stripSkin || a.autRig || a.procAnim)) wo.reduceAnimation = false;
             assetio::WriteStats st;
             const std::vector<std::uint8_t> out = assetio::writeMeshFile(m, wo, &st);
             fs::path outPath;
@@ -578,6 +769,8 @@ int main(int argc, char** argv) {
             }
             std::printf("ASSETC   submeshes=%u joints=%u clips=%u materials=%u\n",
                         st.subMeshes, st.joints, st.clips, st.materials);
+            if (!m.skeletonPath.empty())
+                std::printf("ASSETC   skelRef=%s\n", m.skeletonPath.c_str());
             std::printf("ASSETC   wrote %s\n", outPath.string().c_str());
             continue;
         }

@@ -19,10 +19,12 @@
 
 #include "assets/AssetManager.h"
 #include "assets/AssetPath.h"
+#include "assets/SkeletonAsset.h"
 #include "assets/Vmeta.h"
 #include "core/Logger.h"
 
 #include "assetio/MeshFormat.h"
+#include "assetio/SkelFormat.h"
 #include "assetio/Vertex.h"
 
 #include <chrono>
@@ -342,8 +344,62 @@ std::unique_ptr<Model> loadVMeshModel(rhi::Device& device,
         }
         sk->topoOrder = src.topoOrder;
         sk->invMeshNode = src.invMeshNode;
+        // 骨表身份（见 Skeleton.h 的 `boneDigest`）。**在这里算**，
+        // 用的是文件侧那个唯一实现 —— 运行时不再自己算一遍。
+        sk->boneDigest = assetio::skeletonBoneDigest(src.joints);
         // nodeMap 是 glTF 的 node→joint 映射；FBX 没有这个概念，
         // 留空（`nodeToJoint` 对空 map 返回 -1，调用方已经处理）。
+
+        // ---- 独立骨架资产优先（2026-11-06）----
+        //
+        // 抄 UE：mesh 引用 Skeleton 资产，骨名/层级/挂点归骨架所有。
+        // 三个判据都必须满足才采用：
+        //   ① 引用路径非空；
+        //   ② 那个 `.vskel` 读得出来；
+        //   ③ `boneDigest` 与内嵌骨表**相等**。
+        // 任一条不满足就退回内嵌那份，并打一行警告 —— 一条坏引用不该
+        // 让角色消失（这条取舍与贴图丢失退化成默认材质是同一个口径）。
+        bool usedExternal = false;
+        if (!src.skeletonPath.empty()) {
+            const std::string abs = assets::resolveAssetPath(src.skeletonPath);
+            Skeleton ext;
+            std::string skErr;
+            if (!loadSkeletonAsset(abs, ext, &skErr)) {
+                VK_LOG_WARN("VMESH-SKEL ref failed model=%s ref=%s reason=%s "
+                            "（退回内嵌骨架）",
+                            assetLogSafe(name).c_str(),
+                            assetLogSafe(src.skeletonPath).c_str(),
+                            skErr.c_str());
+            } else if (ext.boneDigest != sk->boneDigest) {
+                // 摘要不等 = 这个 mesh 和这具骨架不是同一套骨。
+                // 静默采用会让顶点的关节下标指向别的骨 —— 画面上是
+                // "人扭成一团"，而日志里什么都没有。这才是必须警告的场景。
+                VK_LOG_WARN("VMESH-SKEL digest mismatch model=%s ref=%s "
+                            "mesh=%016llx asset=%016llx（退回内嵌骨架）",
+                            assetLogSafe(name).c_str(),
+                            assetLogSafe(src.skeletonPath).c_str(),
+                            static_cast<unsigned long long>(sk->boneDigest),
+                            static_cast<unsigned long long>(ext.boneDigest));
+            } else {
+                // 骨表用独立资产那份，**动画仍取本文件的** —— 这一刀不拆
+                // AnimSequence（见 assetio/SkelFormat.h 头）。
+                ext.clips = std::move(sk->clips);
+                *sk = std::move(ext);
+                usedExternal = true;
+                VK_LOG_INFO("VMESH-SKEL source=asset ref=%s bones=%d "
+                            "sockets=%zu digest=%016llx",
+                            assetLogSafe(src.skeletonPath).c_str(),
+                            sk->jointCount(), sk->sockets.size(),
+                            static_cast<unsigned long long>(sk->boneDigest));
+            }
+        }
+
+        // 没有独立引用 / 用不上 → 内嵌骨表，挂点从零开始（老资产就是这么
+        // 来的）。有引用并采用成功时，挂点已经由 `.vskel` 带来。
+        if (!usedExternal && sk->sockets.empty()) {
+            VK_LOG_INFO("VMESH-SKEL source=embedded model=%s bones=%d",
+                        assetLogSafe(name).c_str(), sk->jointCount());
+        }
 
         sk->clips.resize(src.clips.size());
         for (std::size_t c = 0; c < src.clips.size(); ++c) {

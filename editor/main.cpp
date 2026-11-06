@@ -31,6 +31,8 @@
 
 #include "core/Logger.h"
 #include "animation/AnimationSelfTest.h"
+#include "character/MannequinSkeleton.h"
+#include "character/MannequinSelfTest.h"
 #include "character/ViewRigSelfTest.h"
 #include "assets/AssetSelfTest.h"
 #include "physics/PhysicsSelfTest.h"
@@ -95,6 +97,38 @@ int main(int argc, char** argv) {
         if (std::getenv("MYVK_VIEWRIG_TEST") != nullptr) {
             const int failures = character::runViewRigSelfTest();
             return failures == 0 ? 0 : 1;
+        }
+
+        // UE5 Mannequin 骨架自检（2026-11-06）：骨表（35 根）/ 重定向后
+        // **世界姿势逐位不变** / ik_* 与 weapon_* 是非形变骨 / 动画轨道
+        // 下标重映射 / 对 UE 骨架再跑一遍的幂等性。
+        // 这个用例存在的理由：重定向错了不会报错，只会"人歪了一点、动画扭
+        // 错一根骨"，截图里全是"看着还行"。
+        if (std::getenv("MYVK_MANNEQUIN_TEST") != nullptr) {
+            const int failures = character::runMannequinSelfTest();
+            return failures == 0 ? 0 : 1;
+        }
+
+        // `MYVK_MANNEQUIN_EMIT=<path>`：把 UE 标准骨表导出成独立骨架资产
+        // `.vskel`（`assets/characters/mannequin/Rigs/SK_Mannequin.vskel`）。
+        //
+        // 为什么是 env 而不是 AssetC 的子命令：骨表在 **engine/character**
+        // （`MannequinBoneDef`），而 `assetio` 按设计不认识 engine/ ——
+        // 把表抄一份到 assetc 就是"两份骨表"，改了漏一处那种。所以让唯一
+        // 能看到两边的那一层（Editor 的启动钩子）做这一次性导出，
+        // 产物落在 assets 里之后，AssetC 只负责读它。
+        if (const char* emitPath = std::getenv("MYVK_MANNEQUIN_EMIT")) {
+            if (emitPath[0] == '\0') {
+                std::fprintf(stderr, "MYVK_MANNEQUIN_EMIT needs a path\n");
+                return 2;
+            }
+            std::string err;
+            if (!character::writeMannequinSkeletonAsset(emitPath, &err)) {
+                std::fprintf(stderr, "MANNEQUIN-SKEL FAIL %s (%s)\n", emitPath,
+                             err.c_str());
+                return 1;
+            }
+            return 0;
         }
 
         // 离线资产链自检（.vmesh）：FBX 导入 → 几何修正 → 写盘 → 读盘

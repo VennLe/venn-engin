@@ -120,6 +120,46 @@ struct Skeleton {
     glm::mat4 invMeshNode{1.0f};
     std::map<int, int> nodeMap;      // glTF node 下标 → joint 下标
 
+    // ---- 挂点（2026-11-06，抄 UE 的 `USkeletalMeshSocket`）----
+    //
+    // 名字 + 挂在哪根骨 + 相对那根骨的变换。运行时"把武器放到 weapon_r"
+    // 就是查这张表 —— 写死骨名的后果是"换一个角色模型，武器就掉在地上"。
+    //
+    // 归属：**骨架**，不是 mesh。UE 里 socket 定义在 Skeleton 资产上，
+    // 所以同一套骨架的所有 mesh 共享挂点。我们照抄这个归属（存在
+    // `Skeleton` 里而不是 `Model` 里）。
+    struct Socket {
+        std::string name;      // 挂点名（weapon_r / eye ...）
+        std::string boneName;  // 资产里写的骨名 —— 重定向改骨名后靠它重解析
+        int bone = -1;         // 解析出的 joint 下标；-1 = 这具骨架上没有
+        glm::mat4 local{1.0f}; // 相对该骨的变换
+    };
+    std::vector<Socket> sockets;
+
+    // 骨表摘要（名字 + 父下标）。由加载器从文件侧算好带进来 ——
+    // 运行时**不重算**，所以只有一份算法（`assetio::skeletonBoneDigest`），
+    // 不会出现"文件说一套、内存里算一套"。0 = 未知（直连 FBX 导入路径）。
+    //
+    // 用途唯一：判"mesh 引用的 .vskel 和 mesh 内嵌的骨表是不是同一份"。
+    std::uint64_t boneDigest = 0;
+
+    // 挂点下标；-1 = 没有这个挂点。
+    int findSocket(const std::string& name) const;
+    const Socket* socket(const std::string& name) const;
+
+    // 按 `boneName` 重新解析每个挂点的 `bone` 下标，返回解析失败的个数。
+    //
+    // ⚠ 改过骨名之后**必须**调：重定向（Mannequin）与 `RigEdit::bake` 都会
+    //   换掉骨名，不重解析的话挂点会静默指向 -1，表现为"武器不跟手"。
+    int resolveSockets();
+
+    // 挂点在**骨架空间**的世界矩阵 = world[bone] * local。
+    // `world` 是 `animation::Pose::worldMatrices` 那一份（与骨同序）。
+    // 挂点不存在 / 骨没解析出来 → 返回 false（不写 out）。
+    bool socketWorld(const std::string& name,
+                     const std::vector<glm::mat4>& world,
+                     glm::mat4& out) const;
+
     // 骨架空间 → 引擎世界空间（Z-up）的变换。**默认恒等**。
     //
     // 为什么需要这个字段（2026-10-26，B3 根运动）：

@@ -437,7 +437,11 @@ run("engine/sequence/SequenceAsset.cpp → 过场时间轴 × 轨道编辑器", 
 # 调度层一动，`WaitingVoice` 那条路就得重跑。
 run("engine/dialogue/DialogueSystem.cpp → 对话 × 对话页签", OLD,
     with_change("engine/dialogue/DialogueSystem.cpp"),
-    want={"verify_dialogue", "verify_dialogue_editor", "verify_dialogue_voice"})
+    # ⚠ 2026-11-06 同步：`verify_dialogue_branch` 登记了 `engine/dialogue/**`
+    #   整层（分支/选项那一刀），夹在期望里没跟上 → 这条夹具红了整整一轮
+    #   而没人发现。判据是"恰好这些"，加一条新用例就必须回来补。
+    want={"verify_dialogue", "verify_dialogue_branch",
+          "verify_dialogue_editor", "verify_dialogue_voice"})
 # 2026-10-27（#310）：剧本编辑器的**写回**（`toJson` / `saveDialogue`）。
 # 期望恰好三条 —— 这一层现在被三张网兜着：
 #   · `verify_dialogue`        解析口径（存出来的东西必须还能被它读回）
@@ -449,7 +453,9 @@ run("engine/dialogue/DialogueSystem.cpp → 对话 × 对话页签", OLD,
 # `rt_voice_omits_empty`（老资产不许长出 `"voice": ""`）。
 run("engine/dialogue/DialogueAsset.cpp → 对话 × 两个编辑器入口", OLD,
     with_change("engine/dialogue/DialogueAsset.cpp"),
-    want={"verify_dialogue", "verify_dialogue_editor", "verify_dialogue_script",
+    # 2026-11-06 同步 `verify_dialogue_branch`（同 DialogueSystem 那一条）。
+    want={"verify_dialogue", "verify_dialogue_branch",
+          "verify_dialogue_editor", "verify_dialogue_script",
           "verify_dialogue_voice"})
 # 2026-10-27（#310）：剧本编辑器面板本体。
 # 期望两条：除了自己那条，还有 verify_i18n_coverage —— 它扫描 `editor/*.cpp`
@@ -457,7 +463,9 @@ run("engine/dialogue/DialogueAsset.cpp → 对话 × 两个编辑器入口", OLD
 # ⚠ 这条**必须**留着：新加面板最容易漏的就是词条，而漏了不崩。
 run("editor/DialogueEditorWindow.cpp → 剧本编辑器 × 中文化", OLD,
     with_change("editor/DialogueEditorWindow.cpp"),
-    want={"verify_dialogue_script", "verify_i18n_coverage"})
+    # 2026-11-06 同步 `verify_dialogue_branch`：分支/选项编辑器也在本文件里。
+    want={"verify_dialogue_branch", "verify_dialogue_script",
+          "verify_i18n_coverage"})
 # 2026-10-27（#311）：时间轴编辑器面板本体。
 # 期望两条：除了自己那条，还有 verify_i18n_coverage —— 它扫描 `editor/*.cpp`
 # 里的界面字面量，而新面板一口气加了 60 条 TR 词条（缺了就是"面板一半英文"）。
@@ -641,8 +649,10 @@ run("assetio/MeshFormat.cpp → verify_vmesh", OLD,
     # §15 加了**第四个**：GPU 形变的 MORPH 区块 v2（channel 表 + offset_weights
     # 预乘）也落在这里。像素用例看起来"只关心渲染"，但它读的那份 .vmesh
     # 就是这里写出来的 —— 格式坏了它是第一个受害者（角色加载失败 = 视口空白）。
+    # 2026-11-06 再加**第五个**：SKELREF 区块（独立骨架资产的引用）也在这里。
+    # verify_skeleton_asset 的 S3 就是断"写了引用之后 sections 6→7、--check 仍过"。
     want={"verify_vmesh", "verify_vertex_format", "verify_morph",
-          "verify_morph_gpu"})
+          "verify_morph_gpu", "verify_skeleton_asset"})
 # §13 的正主：顶点布局本身的改动只该惊动顶点格式那条。但 `assetio/**`
 # 被 verify_vmesh 整层登记着（格式总主），所以期望里必然带它 ——
 # 判据是"自己那条一定在"，不是"只有自己那条"（与下面 AutoRig/ProcAnim 同理）。
@@ -661,8 +671,10 @@ run("assetc/main.cpp → verify_vmesh", OLD,
     # 2026-10-28（#329）再加 verify_clip_dedup：take 名去重后的
     # `FBX-CLIPDUP` 行是由 assetc/main.cpp **打印**的（assetio 不链 Logger，
     # 只产出文本），格式改了只有那条用例会红。
+    # 2026-11-06 再加 verify_skeleton_asset：`--extract-skel` / `--skel-ref`
+    # 两个开关长在这个文件（以及 vmesh 分支里"只导骨架不改写模型"那道闸门）。
     want={"verify_vmesh", "verify_autorig", "verify_procanim",
-          "verify_clip_dedup"})
+          "verify_clip_dedup", "verify_skeleton_asset"})
 # 2026-10-22：自动绑骨 / 程序化动画是两条**独立**的离线链，各自只被自己的
 # 用例读。合成一条的话，"把 AutoRig 的比例表改坏"会让 procanim 也重跑，
 # 反过来一样 —— 跑得多但没人对结果负责，等于没登记。

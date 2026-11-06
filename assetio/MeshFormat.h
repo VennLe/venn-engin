@@ -55,6 +55,11 @@ enum SectionId : std::uint32_t {
     //   所以"MESH 里有非哨兵 morphBase 但 MORPH 区块缺失"是矛盾状态，
     //   读端必须报错而不是静默当成"没有 morph"。
     kSectionMorph = 6,
+    // 独立骨架资产的引用（2026-11-06，UE 的 Skeleton 资产模型）。
+    // 载荷就一个字符串下标：**相对资产根**的 `.vskel` 路径。
+    // 为空 / 区块不存在 = 用本文件内嵌的 SKEL（改造前的行为，逐位不变）。
+    // 见 assetio/SkelFormat.h 顶部为什么要有这一步。
+    kSectionSkeletonRef = 7,
 };
 
 // 文件级标志
@@ -130,6 +135,8 @@ struct MeshFileInfo {
     std::uint64_t indexCount = 0;
     std::uint64_t bytes = 0;
     bool index16 = false;
+    // SKELREF 区块里的路径（空 = 这个资产用内嵌骨架）。
+    std::string skeletonPath;
 };
 
 // 序列化。**按值传** `model`：优化会就地改几何/关键帧，传引用的话
