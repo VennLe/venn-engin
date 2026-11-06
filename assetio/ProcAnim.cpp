@@ -205,6 +205,15 @@ struct SampleProbe {
     // 横向最远距离（相对 Hips 沿 left 轴）。抓"手往两边撇"用：
     // 摆臂是绕**竖直轴前后**转，横向应该基本不动；横向一大就说明关节转错了轴。
     float latAbsMax = 0.0f;
+    // 横向（`f.left` 投影）的**带符号**范围，以及摆动相的平均横向速度。
+    // 这两个数与 `fwd*` 那组一起，才能把"脚往哪个方向飞"还原成一个角度
+    // （`travelDeg`）—— 8 方向集唯一的可观测判据。
+    float latMin = 1.0e9f, latMax = -1.0e9f;
+    float swingLatVel = 0.0f;
+    float travelDeg = 0.0f;
+    // 沿**期望行进方向**（`dirAxis`）的位移范围。方向集的自检用：
+    // 侧移段在 `f.left` 上应当有 15 cm 以上、在 `f.fwd` 上不到 3 cm。
+    float dirMin = 1.0e9f, dirMax = -1.0e9f;
     // p=0 时的相对高度 —— 也就是**静止姿势**的参考值。
     // 有了它，"抬离地面多少"才能直接算：zMax - zAtStart。
     // （直接比 zMax - zMin 只能说明"腿动了"，说明不了"脚离地了"：蹲下去
@@ -214,7 +223,8 @@ struct SampleProbe {
 
 SampleProbe probeClip(SourceModel& model, const Frame& f, const Joints& J,
                       const ClipSpec& spec, const ProcAnimOptions& opt,
-                      PoseFn fn, void* user, const char* jointName) {
+                      PoseFn fn, void* user, const char* jointName,
+                      const glm::vec3& dirAxis = glm::vec3(0.0f)) {
     SampleProbe pr;
     Skel skel;
     skel.m = &model;
@@ -226,6 +236,7 @@ SampleProbe probeClip(SourceModel& model, const Frame& f, const Joints& J,
     std::vector<glm::quat> rot(model.joints.size());
     std::vector<glm::vec3> trans(model.joints.size());
     std::vector<float> fw(static_cast<std::size_t>(frames));
+    std::vector<float> la(static_cast<std::size_t>(frames));
     std::vector<float> zz(static_cast<std::size_t>(frames));
 
     for (int i = 0; i < frames; ++i) {
@@ -243,7 +254,9 @@ SampleProbe probeClip(SourceModel& model, const Frame& f, const Joints& J,
 
         const glm::vec3 rel = skel.pos(j) - skel.pos(hips);
         const float v = glm::dot(rel, f.fwd);
+        const float u = glm::dot(rel, f.left);
         fw[static_cast<std::size_t>(i)] = v;
+        la[static_cast<std::size_t>(i)] = u;
         zz[static_cast<std::size_t>(i)] = rel.z;
         if (i == 0) pr.zAtStart = rel.z;
         if (v > pr.fwdMax) {
@@ -251,9 +264,16 @@ SampleProbe probeClip(SourceModel& model, const Frame& f, const Joints& J,
             pr.phaseAtFwdMax = phase;
         }
         pr.fwdMin = std::min(pr.fwdMin, v);
+        pr.latMin = std::min(pr.latMin, u);
+        pr.latMax = std::max(pr.latMax, u);
         pr.zMin = std::min(pr.zMin, rel.z);
         pr.zMax = std::max(pr.zMax, rel.z);
-        pr.latAbsMax = std::max(pr.latAbsMax, std::fabs(glm::dot(rel, f.left)));
+        pr.latAbsMax = std::max(pr.latAbsMax, std::fabs(u));
+        if (glm::length(dirAxis) > 1.0e-6f) {
+            const float p2 = glm::dot(rel, glm::normalize(dirAxis));
+            pr.dirMin = std::min(pr.dirMin, p2);
+            pr.dirMax = std::max(pr.dirMax, p2);
+        }
     }
 
     // 摆动相 / 支撑相的平均前向速度。
@@ -265,19 +285,30 @@ SampleProbe probeClip(SourceModel& model, const Frame& f, const Joints& J,
         const float zMid = (pr.zMin + pr.zMax) * 0.5f;
         const float dtFrame = spec.duration / static_cast<float>(frames);
         float swingSum = 0.0f;
+        float swingLatSum = 0.0f;
         int swingN = 0;
         for (int i = 0; i < frames; ++i) {
             const int i1 = (i + 1) % frames;
             const float v =
                 (fw[static_cast<std::size_t>(i1)] -
                  fw[static_cast<std::size_t>(i)]) / dtFrame;
+            const float vLat =
+                (la[static_cast<std::size_t>(i1)] -
+                 la[static_cast<std::size_t>(i)]) / dtFrame;
             if (zz[static_cast<std::size_t>(i)] > zMid) {
                 swingSum += v;
+                swingLatSum += vLat;
                 ++swingN;
             }
         }
-        pr.swingFwdVel = swingN > 0 ? swingSum / static_cast<float>(swingN)
-                                    : 0.0f;
+        const float inv = swingN > 0 ? 1.0f / static_cast<float>(swingN) : 0.0f;
+        pr.swingFwdVel = swingSum * inv;
+        pr.swingLatVel = swingLatSum * inv;
+        // 摆动相脚掌的行进方向（度，正 = 朝身体左侧）。
+        // 用 atan2(横向, 前向)：两者都是"脚相对髋"的速度分量，所以这个角
+        // 与 clip 自己的朝向完全无关，只反映"脚真的往哪飞"。
+        pr.travelDeg =
+            std::atan2(pr.swingLatVel, pr.swingFwdVel) * 180.0f / kPi;
     }
     return pr;
 }
@@ -406,6 +437,60 @@ const GaitKey kRun[4] = {
     {26.0f, -84.0f, 12.0f, 0.0f, 6.0f, 78.0f},
 };
 
+// 一条腿 / 一条手臂要往哪个方向迈。
+//
+// `deg` = 相对身体正前方的角度，**正 = 左**（解剖学左，与 `f.left` 同号）。
+// 三件事跟着一起变，缺一件就会露出"整体转了个 yaw"的马脚：
+//   · `swing`  —— 腿部摆动的轴。`cross(down, dir)` 保证"绕它正转 = 肢体
+//                  朝 dir 摆"这条性质不丢（与 `f.swing` 的定义同源）；
+//   · `hipsYaw` —— 髋转**一部分**（0.30×角度）。UE 的侧移段也是这个口径：
+//                  髋进方向、胸基本还朝前。全转 = 横着滑，不转 = 腿往侧边
+//                  劈叉；
+//   · `armScale` —— 侧移时手臂的前后摆幅收窄（人不会横着走还大甩手）。
+struct GaitDir {
+    float deg = 0.0f;
+    glm::vec3 dir{0.0f, -1.0f, 0.0f};   // 行进方向（水平）
+    glm::vec3 lat{1.0f, 0.0f, 0.0f};    // 行进方向的左侧 = 髋的横向摇摆轴
+    glm::vec3 swing{1.0f, 0.0f, 0.0f};
+    float hipsYaw = 0.0f;
+    float armScale = 1.0f;
+};
+
+GaitDir gaitDir(const Frame& f, float deg) {
+    GaitDir g;
+    g.deg = deg;
+    // deg == 0 走**原样复用**这条路，不是省事 —— 是老 `Walk` / `Run` 两段
+    // 必须与改动前**逐位相同**（既有验收脚本与已烤好的资产都按这个基线）。
+    // 走下面的通用式会经过 angleAxis/normalize，差 1 ulp 就换了基线。
+    if (std::fabs(deg) < 1.0e-6f) {
+        g.dir = f.fwd;
+        g.lat = f.left;
+        g.swing = f.swing;
+        return g;
+    }
+    const float rad = deg * kPi / 180.0f;
+    const glm::quat yaw = glm::angleAxis(rad, f.up);
+    g.dir = glm::normalize(glm::mat3_cast(yaw) * f.fwd);
+    g.lat = glm::normalize(glm::cross(f.up, g.dir));
+    g.hipsYaw = deg * 0.30f;
+    // ⚠ 腿的摆动轴要**减掉髋的偏置**。
+    //
+    // 腿是 Hips 的子节点，轴却按"局部系"给（`axisDeg` 作用在静止局部系
+    // 里）—— 髋转了 `hipsYaw` 之后，整条腿连同它的摆动轴一起被带走。
+    // 于是"轴按 deg 给"的结果是脚实际沿 `1.3 × deg` 飞（90° 侧移量出来
+    // 121°、180° 倒退量出来 -112°，2026-11-06 实测）。
+    // 预补偿之后：髋仍进方向（好看），脚真的沿 `deg` 迈（可测）。
+    {
+        const float legDeg = deg - g.hipsYaw;
+        const glm::quat legYaw = glm::angleAxis(legDeg * kPi / 180.0f, f.up);
+        const glm::vec3 legDir = glm::normalize(glm::mat3_cast(legYaw) * f.fwd);
+        g.swing = glm::normalize(glm::cross(f.down, legDir));
+    }
+    // 45° 时 0.85、90° 时 0.5、180°（倒退）时 1.0 —— 倒退的大臂照样前后甩。
+    g.armScale = 0.5f + 0.5f * std::fabs(std::cos(rad));
+    return g;
+}
+
 // 把一条腿 + 一条手臂的姿势套到骨架上。side: +1 = 左
 //
 // armDown = 从 T-pose 往下压的角度，**这是最容易调错的一个数**：
@@ -415,8 +500,11 @@ const GaitKey kRun[4] = {
 // 80°；跑步时手臂略收但不外张，也用 80°。判据见 ProcAnimReport 的
 // walkHandLateral / runHandLateral（肩宽 0.19 m + 上臂 0.55 m，压在 80° 时
 // 手应在 0.28 m 以内）。
+//
+// ⚠ 腿用 `d.swing`（跟着移动方向转），手臂用**身体**的 `f.swing`：人侧移
+//   时手仍然是沿身体前后摆的，跟着腿一起转过去看着像在"划水"。
 void applyGaitSide(const Frame& f, const Joints& J, PoseFrame& out, int side,
-                   const GaitKey& g, float armDown) {
+                   const GaitKey& g, float armDown, const GaitDir& d) {
     const int upLeg = side > 0 ? J["LeftUpLeg"] : J["RightUpLeg"];
     const int leg = side > 0 ? J["LeftLeg"] : J["RightLeg"];
     const int foot = side > 0 ? J["LeftFoot"] : J["RightFoot"];
@@ -425,26 +513,32 @@ void applyGaitSide(const Frame& f, const Joints& J, PoseFrame& out, int side,
     const int fore = side > 0 ? J["LeftForeArm"] : J["RightForeArm"];
 
     if (upLeg >= 0)
-        out.rot[static_cast<std::size_t>(upLeg)] = axisDeg(f.swing, g.thigh);
+        out.rot[static_cast<std::size_t>(upLeg)] = axisDeg(d.swing, g.thigh);
     if (leg >= 0)
-        out.rot[static_cast<std::size_t>(leg)] = axisDeg(f.swing, g.knee);
+        out.rot[static_cast<std::size_t>(leg)] = axisDeg(d.swing, g.knee);
     if (foot >= 0)
-        out.rot[static_cast<std::size_t>(foot)] = axisDeg(f.swing, g.ankle);
+        out.rot[static_cast<std::size_t>(foot)] = axisDeg(d.swing, g.ankle);
     if (toe >= 0)
-        out.rot[static_cast<std::size_t>(toe)] = axisDeg(f.swing, g.toe);
+        out.rot[static_cast<std::size_t>(toe)] = axisDeg(d.swing, g.toe);
 
     // 手臂：先下垂，再绕 swing 前后摆（两个旋转都在**静止局部系**里给，
     // 所以 q = q_swing · q_down 的顺序是对的：先把手放下来，再前后摆）
     if (arm >= 0)
         out.rot[static_cast<std::size_t>(arm)] =
-            axisDeg(f.swing, g.arm) * axisDeg(f.armDownAxis(side), armDown);
+            axisDeg(f.swing, g.arm * d.armScale) *
+            axisDeg(f.armDownAxis(side), armDown);
     if (fore >= 0)
         out.rot[static_cast<std::size_t>(fore)] =
             axisDeg(f.up, -g.elbow * static_cast<float>(side));
 }
 
+
 // ------- walk：一个周期两步 -------
-void poseWalk(float p, const Frame& f, const Joints& J, PoseFrame& out, void*) {
+void poseWalk(float p, const Frame& f, const Joints& J, PoseFrame& out,
+              void* user) {
+    // user = `const GaitDir*`（8 方向集）；空 = 正前方 —— 逐位等于旧行为。
+    const GaitDir d =
+        user ? *static_cast<const GaitDir*>(user) : gaitDir(f, 0.0f);
     const float w = 2.0f * kPi * p;
 
     // 上下颠：每周期两次（左右脚各落地一次），最低点在脚跟着地后一点。
@@ -454,33 +548,42 @@ void poseWalk(float p, const Frame& f, const Joints& J, PoseFrame& out, void*) {
     //   静止姿势低 32 mm"。而最低点恰好是支撑腿接近伸直的那一帧 → 腿长不变、
     //   髋却往下走，脚只能往地里去。玩家看到的就是"走路时脚陷进地面"。
     //   改成 [0, +16 mm] 的同振幅起伏：支撑相髋不下沉，脚自然贴地。
+    //
+    // 横向摇摆沿 `d.lat`（= 行进方向的左向）。deg==0 时它就是老的
+    // `f.left`，逐位相同。
     out.hipsOffset = f.up * (0.016f * (1.0f - std::cos(2.0f * w)) * 0.5f) +
-                     f.left * (0.013f * std::sin(w));
+                     d.lat * (0.013f * std::sin(w));
 
-    // 骨盆绕竖直轴转：迈左腿时左侧髋向前
+    // 骨盆绕竖直轴转：迈左腿时左侧髋向前；侧移时再叠一个"髋进方向"的
+    // 偏置（`d.hipsYaw`，45° 时约 13°、90° 时 27°）。
     const int hips = J["Hips"];
     if (hips >= 0)
         out.rot[static_cast<std::size_t>(hips)] =
-            axisDeg(f.up, 3.0f * std::sin(w));
+            axisDeg(f.up, d.hipsYaw + 3.0f * std::sin(w));
 
-    // 脊柱反向旋转（抵消骨盆，肩膀与腿反向摆）
+    // 脊柱反向旋转（抵消骨盆，肩膀与腿反向摆）。这里的抵消量把
+    // `d.hipsYaw` 一起抵掉（两节各一半）—— 于是**胸仍然朝身体正前方**，
+    // 这正是 UE 侧移段的读法：下半身进了方向，上半身留着。
     const int sp1 = J["Spine1"];
     const int sp2 = J["Spine2"];
     if (sp1 >= 0)
         out.rot[static_cast<std::size_t>(sp1)] =
-            axisDeg(f.up, -2.2f * std::sin(w));
+            axisDeg(f.up, -d.hipsYaw * 0.5f - 2.2f * std::sin(w));
     if (sp2 >= 0)
         out.rot[static_cast<std::size_t>(sp2)] =
-            axisDeg(f.up, -1.8f * std::sin(w));
+            axisDeg(f.up, -d.hipsYaw * 0.5f - 1.8f * std::sin(w));
 
     const GaitKey l = sampleGait(kWalk, 4, p);
     const GaitKey r = sampleGait(kWalk, 4, p + 0.5f);
-    applyGaitSide(f, J, out, 1, l, 80.0f);
-    applyGaitSide(f, J, out, -1, r, 80.0f);
+    applyGaitSide(f, J, out, 1, l, 80.0f, d);
+    applyGaitSide(f, J, out, -1, r, 80.0f, d);
 }
 
 // ------- run：更大的摆幅 + 前倾 + 手臂大摆 -------
-void poseRun(float p, const Frame& f, const Joints& J, PoseFrame& out, void*) {
+void poseRun(float p, const Frame& f, const Joints& J, PoseFrame& out,
+             void* user) {
+    const GaitDir d =
+        user ? *static_cast<const GaitDir*>(user) : gaitDir(f, 0.0f);
     const float w = 2.0f * kPi * p;
 
     // 跑步有"腾空相"：整体重心在双脚离地时最高。用 2w 的余弦，
@@ -489,32 +592,37 @@ void poseRun(float p, const Frame& f, const Joints& J, PoseFrame& out, void*) {
     //   [-0.056, +0.028]，最低点比静止低 56 mm —— 跑步的支撑相比走路更接近
     //   单腿伸直，脚陷得更明显。改成 [0, +42 mm]。
     out.hipsOffset = f.up * (0.042f * (1.0f - std::cos(2.0f * w)) * 0.5f) +
-                     f.left * (0.009f * std::sin(w));
+                     d.lat * (0.009f * std::sin(w));
 
     const int hips = J["Hips"];
     if (hips >= 0)
         out.rot[static_cast<std::size_t>(hips)] =
-            axisDeg(f.up, 5.0f * std::sin(w)) * axisDeg(f.swing, -3.0f);
+            axisDeg(f.up, d.hipsYaw + 5.0f * std::sin(w)) *
+            axisDeg(d.swing, -3.0f);
 
-    // 上身前倾 12°（脊柱三节分摊），头抬起来看前方
+    // 上身前倾 12°（脊柱三节分摊），头抬起来看前方。
+    // 前倾的轴跟着**移动方向**转（`d.swing`）：侧移时上身该朝"前进方向"
+    // 倾，不是朝身体正前方倾 —— 后者在 90° 侧移时看着像人往斜前方栽。
     const int sp0 = J["Spine"];
     const int sp1 = J["Spine1"];
     const int sp2 = J["Spine2"];
     const int neck = J["Neck"];
-    if (sp0 >= 0) out.rot[static_cast<std::size_t>(sp0)] = axisDeg(f.swing, -5.0f);
+    if (sp0 >= 0) out.rot[static_cast<std::size_t>(sp0)] = axisDeg(d.swing, -5.0f);
     if (sp1 >= 0)
         out.rot[static_cast<std::size_t>(sp1)] =
-            axisDeg(f.swing, -4.0f) * axisDeg(f.up, -4.0f * std::sin(w));
+            axisDeg(d.swing, -4.0f) *
+            axisDeg(f.up, -d.hipsYaw * 0.5f - 4.0f * std::sin(w));
     if (sp2 >= 0)
         out.rot[static_cast<std::size_t>(sp2)] =
-            axisDeg(f.swing, -3.0f) * axisDeg(f.up, -3.0f * std::sin(w));
+            axisDeg(d.swing, -3.0f) *
+            axisDeg(f.up, -d.hipsYaw * 0.5f - 3.0f * std::sin(w));
     if (neck >= 0)
-        out.rot[static_cast<std::size_t>(neck)] = axisDeg(f.swing, 9.0f);
+        out.rot[static_cast<std::size_t>(neck)] = axisDeg(d.swing, 9.0f);
 
     const GaitKey l = sampleGait(kRun, 4, p);
     const GaitKey r = sampleGait(kRun, 4, p + 0.5f);
-    applyGaitSide(f, J, out, 1, l, 80.0f);
-    applyGaitSide(f, J, out, -1, r, 80.0f);
+    applyGaitSide(f, J, out, 1, l, 80.0f, d);
+    applyGaitSide(f, J, out, -1, r, 80.0f, d);
 }
 
 // ------- jump：蹬伸离地 → 空中双脚收起 → 伸腿 → 落地缓冲 -------
@@ -667,6 +775,7 @@ bool generateLocomotionClips(SourceModel& model, const ProcAnimOptions& opt,
     report->totalKeys = 0;
     report->clipNames.clear();
     report->durations.clear();
+    report->dirs.clear();
 
     const ClipSpec idleSpec{"Idle", 2.4f, true};
     const ClipSpec walkSpec{"Walk", 1.0f, true};
@@ -684,6 +793,61 @@ bool generateLocomotionClips(SourceModel& model, const ProcAnimOptions& opt,
         buildClip(model, skel, f, J, runSpec, opt, &poseRun, nullptr, report);
     if (opt.generateJump)
         buildClip(model, skel, f, J, jumpSpec, opt, &poseJump, nullptr, report);
+
+    // ---- 8 方向移动集（对齐 UE 的 Anims/Unarmed/{Walk,Jog}）----
+    //
+    // 后缀逐字照抄 UE：`_Fwd _Fwd_Left _Left _Bwd_Left _Bwd _Bwd_Right
+    // _Right _Fwd_Right`。角度是"相对身体正前方"，**正 = 左**。
+    //
+    // 注意 `Walk` / `Run` 这两段**不删**（它们是 Fwd 的历史别名，逐位等于
+    // `Walk_Fwd` / `Run_Fwd`）：`LocomotionConfig` 的默认值、F34 之后的一堆
+    // 既有验收脚本、编辑器里存过的 animKeys 全都指着这两个名字。多花两段
+    // 的字节换"改名不动任何人"，值。
+    struct DirSuffix {
+        const char* suffix;
+        float deg;
+    };
+    static const DirSuffix kDirs[8] = {
+        {"_Fwd", 0.0f},        {"_Fwd_Left", 45.0f},
+        {"_Left", 90.0f},      {"_Bwd_Left", 135.0f},
+        {"_Bwd", 180.0f},      {"_Bwd_Right", -135.0f},
+        {"_Right", -90.0f},    {"_Fwd_Right", -45.0f},
+    };
+
+    auto emitDirections = [&](const char* prefix, float duration, PoseFn fn) {
+        for (const DirSuffix& ds : kDirs) {
+            GaitDir d = gaitDir(f, ds.deg);
+            const std::string nm = std::string(prefix) + ds.suffix;
+            const ClipSpec spec{nm.c_str(), duration, true};
+            buildClip(model, skel, f, J, spec, opt, fn, &d, report);
+
+            // ---- 自检：脚真的往这个方向迈吗 ----
+            const glm::quat yawQ = glm::angleAxis(ds.deg * kPi / 180.0f, f.up);
+            const glm::vec3 axis = glm::mat3_cast(yawQ) * f.fwd;
+            const SampleProbe p =
+                probeClip(model, f, J, spec, opt, fn, &d, "LeftToeBase", axis);
+
+            ProcAnimReport::DirProbe dp;
+            dp.clip = nm;
+            dp.wantDeg = ds.deg;
+            dp.travelDeg = p.travelDeg;
+            dp.footRange = p.dirMax > p.dirMin ? p.dirMax - p.dirMin : 0.0f;
+            // 判据两条，缺一条都能骗过人眼：
+            //   ① 方向对 —— 摆动相脚掌的行进角与期望角差 ≤ 30°；
+            //   ② 真的迈了 —— 沿期望方向的位移 ≥ 8 cm（walk 一段的典型值
+            //      约 0.5 m，8 cm 只排除"根本没动"）。
+            float diff = dp.travelDeg - ds.deg;
+            while (diff > 180.0f) diff -= 360.0f;
+            while (diff < -180.0f) diff += 360.0f;
+            dp.ok = std::fabs(diff) <= 30.0f && dp.footRange >= 0.08f;
+            report->dirs.push_back(dp);
+        }
+    };
+    if (opt.generateDirectional && opt.directionalWalk)
+        emitDirections("Walk", walkSpec.duration, &poseWalk);
+    if (opt.generateDirectional && opt.directionalRun)
+        emitDirections("Run", runSpec.duration, &poseRun);
+
 
     // ---- 自检量 ----
     if (opt.generateWalk) {

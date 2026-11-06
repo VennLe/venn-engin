@@ -55,6 +55,8 @@ RE_PROBE = re.compile(
 RE_SUM = re.compile(r"ASSETC PROCANIM ok=1 clips=(\d+) tracks=(\d+) keys=(\d+)")
 RE_CLIP = re.compile(r"ASSETC PROCANIM-CLIP (\S+) dur=([\d.]+)")
 RE_INFO_CLIP = re.compile(r'ASSETC\s+clip "([^"]+)" ([\d.]+) s\s+tracks=(\d+)')
+RE_DIRS = re.compile(r"ASSETC PROCANIM-DIRS n=(\d+) ok=(\d+)")
+RE_DIR = re.compile(r"ASSETC PROCANIM-DIR (\S+) want=([-\d.]+) travel=([-\d.]+) range=([\d.]+) ok=(\d)")
 RE_ANIM = re.compile(r"GAME-ANIM state=(\w+) clip=(\S+)")
 RE_MISS = re.compile(r"GAME-ANIM-MISSING state=(\w+) clip='([^']*)'")
 
@@ -268,8 +270,11 @@ def main():
         if m:
             clips.append((m.group(1), float(m.group(2))))
 
-    check("A1 生成 4 段、每段都有轨道与关键帧",
-          summary is not None and summary[0] == 4 and summary[2] > 500,
+    lines_all = list(lines)   # A11 之后 `lines` 会被 --info 覆盖，这里留一份
+    # 20 = 4 段基础（Idle/Walk/Run/Jump）+ 8 段方向走 + 8 段方向跑。
+    # 2026-11-06 起方向集默认开（对齐 UE 的 Anims/Unarmed/{Walk,Jog}）。
+    check("A1 生成 20 段（4 基础 + 8 方向走 + 8 方向跑）、每段都有轨道与关键帧",
+          summary is not None and summary[0] == 20 and summary[2] > 500,
           "" if summary is None else
           "clips=%d tracks=%d keys=%d" % tuple(summary))
 
@@ -319,12 +324,52 @@ def main():
         if m:
             info_clips[m.group(1)] = (float(m.group(2)), int(m.group(3)))
     min_tracks = {"Idle": 6, "Walk": 10, "Run": 12, "Jump": 10}
-    ok_info = (len(info_clips) == 4 and
+    ok_info = (len(info_clips) == 20 and
                all(n in info_clips and info_clips[n][0] > 0.3 and
                    info_clips[n][1] >= min_tracks[n] for n in want))
     check("A11 四段都落进了 .vmesh 并能读回（名字/时长/轨道数）", ok_info,
-          " ".join("%s=%.2fs/%dtrk(≥%d)" % (k, v[0], v[1], min_tracks[k])
-                   for k, v in sorted(info_clips.items())))
+          " ".join("%s=%.2fs/%dtrk(≥%d)"
+                   % (k, info_clips[k][0], info_clips[k][1], min_tracks[k])
+                   for k in want if k in info_clips) +
+          " 另有方向集 %d 段" % (len(info_clips) - len(want)))
+
+    # ---- A13 8 方向集：脚真的往那个方向迈 ----
+    dirs = []
+    dirs_sum = None
+    for ln in lines_all:
+        m = RE_DIRS.search(ln)
+        if m:
+            dirs_sum = (int(m.group(1)), int(m.group(2)))
+        m = RE_DIR.search(ln)
+        if m:
+            dirs.append((m.group(1), float(m.group(2)), float(m.group(3)),
+                         float(m.group(4)), m.group(5) == "1"))
+    check("A13 8 方向各 8 段都在（walk 8 + run 8）",
+          dirs_sum is not None and dirs_sum[0] == 16,
+          "" if dirs_sum is None else "n=%d ok=%d" % dirs_sum)
+    bad = [d for d in dirs if not d[4]]
+    check("A14 每段方向都对（摆动相脚掌行进角与期望差 ≤30°、位移 ≥8 cm）",
+          len(dirs) == 16 and not bad,
+          "; ".join("%s want%+.0f got%+.0f (%.2fm)" % (d[0], d[1], d[2], d[3])
+                    for d in bad) or
+          (" ".join("%s%+.0f→%+.0f" % (d[0].split("_", 1)[1], d[1], d[2])
+                    for d in dirs)))
+    # 逐对检查：左 / 右 应当镜像（行进角反号），且 Fwd_Left 在 Fwd 与 Left 之间
+    def _deg(name):
+        for d in dirs:
+            if d[0] == name:
+                return d[2]
+        return None
+    lr = [(_deg("Walk_Left"), _deg("Walk_Right")),
+          (_deg("Run_Left"), _deg("Run_Right"))]
+    check("A15 左/右是镜像的（行进角反号，差 < 15°）",
+          all(a is not None and b is not None and abs(a + b) < 15.0
+              for a, b in lr),
+          " ".join("%+.0f/%+.0f" % (a, b) for a, b in lr if a is not None))
+    fl, f0, lft = _deg("Walk_Fwd_Left"), _deg("Walk_Fwd"), _deg("Walk_Left")
+    check("A16 45° 落在 0° 与 90° 中间（方向是连续的，不是四档硬切）",
+          None not in (fl, f0, lft) and f0 + 10.0 < fl < lft - 5.0,
+          "Fwd%+.0f < Fwd_Left%+.0f < Left%+.0f" % (f0, fl, lft))
 
     # ---- B. 运行时四态切换 ----
     if not args.no_runtime:

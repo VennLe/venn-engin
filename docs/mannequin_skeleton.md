@@ -161,8 +161,8 @@ vkUpdateDescriptorSets(): dstBinding (0) ... but VkDescriptorSet ... is in use b
 | 项 | 状态 | 说明 |
 |---|---|---|
 | 动画拆成独立序列（`Anims/Unarmed/...`） | **未做** | 现在 clip 还在 vmesh 里，名字是 `Idle/Walk/Run/Jump`（骨架已独立，动画还没） |
-| 8 方向移动集 | **未做** | UE 是 `_Fwd/_Bwd/_Left/_Right` + 4 对角；现有资产只有朝前 |
-| `BS_Idle_Walk_Run` 二维（Speed × Direction） | **未做** | 现在是 1D，只有 Speed 轴 |
+| 8 方向移动集 | **做了**（见 §8） | 生成器 + 验收已完成；`BS` 侧还没消费 |
+| `BS_Idle_Walk_Run` 二维（Speed × Direction） | **未做** | 现在是 1D，只有 Speed 轴。消费方向集要在这一层升二维，且运行时的混合槽要从 2 段扩到 N 段 |
 | `ABP_Unarmed` 命名与资产化 | **未做** | 现在叫 `humanoid.anim.json` |
 | A-pose 参考姿势 | **未做** | 现有资产是 T-pose 绑定；改成 A-pose 要同时平移所有 clip 的关键帧才不破坏动画 |
 | socket 的实际消费者 | **半做** | 数据层做完（§7）；`weapon_r` 挂武器/`eye` 挂相机的装配还没接 |
@@ -295,3 +295,97 @@ AssetC --check characters/mannequin/Rigs/SK_Mannequin.vskel
 # UE 标准骨表 → 资产（一次性导出；骨表在 engine/character，assetio 不认识它）
 MYVK_MANNEQUIN_EMIT=assets/characters/mannequin/Rigs/SK_Mannequin.vskel Editor.exe
 ```
+
+## 8 · 8 方向移动集（`Anims/Unarmed/{Walk,Jog}` 的 `_Fwd/_Bwd/_Left/_Right`）
+
+### 8.1 UE 那边到底是什么
+
+参考目录里 `Anims/Unarmed/Walk` 有 **8 个文件**，不是 1 个：
+
+```
+MF_Unarmed_Walk_Fwd        MF_Unarmed_Walk_Fwd_Left
+MF_Unarmed_Walk_Left       MF_Unarmed_Walk_Bwd_Left
+MF_Unarmed_Walk_Bwd        MF_Unarmed_Walk_Bwd_Right
+MF_Unarmed_Walk_Right      MF_Unarmed_Walk_Fwd_Right
+```
+
+`Jog/` 目录同样 8 个。它们被 `BS_Idle_Walk_Run`（二维混合空间）消费：
+横轴速度、纵轴方向。
+
+**为什么不能拿 Fwd 那段转个 yaw 播**：人体的侧移是"髋进方向、胸基本朝前、
+腿往侧向迈"。整体转 yaw 的结果是角色**面朝平移方向横着滑**；而不转 yaw
+直接播 Fwd 的结果是侧移时腿还在前后迈（"踩着跑步机往左挪"）。两件事都
+不是侧移，而且从斜后方截一张静帧都看不出来。
+
+### 8.2 本工程的做法（`assetio/ProcAnim.cpp`）
+
+一段步态（`kWalk` / `kRun` 的四个关键姿势）套 8 个方向，改的只有三处：
+
+| 量 | 改法 | 不改会怎样 |
+|---|---|---|
+| `d.swing`：腿部摆动轴 | `cross(down, dir)`，`dir` = 绕 `up` 转 `deg` 后的 `fwd` | 腿还是前后迈（跑步机效应） |
+| `d.hipsYaw`：髋的偏置 | `0.30 × deg`，脊柱两节各抵掉一半 | 全转 = 横着滑；不转 = 腿往侧边劈叉 |
+| `d.armScale`：手臂摆幅 | `0.5 + 0.5·|cos deg|`（90° 时 0.5，180° 时 1.0） | 侧移还大甩手，像在划水 |
+
+一个**必须预补偿**的坑（实测抓到的）：腿是 `Hips` 的子节点，摆动轴却按
+"静止局部系"给 —— 髋转了 `hipsYaw` 之后整条腿连同轴一起被带走，于是
+"轴按 `deg` 给"的结果是脚实际沿 `1.3 × deg` 飞：90° 侧移量出来 **121°**、
+180° 倒退量出来 **-112°**。所以 `swing` 用的是 `deg - hipsYaw`，
+髋仍然进方向（好看的），脚真的沿 `deg` 迈（可测的）。
+
+`deg == 0` 走**原样复用 `Frame` 基向量**那条分支，不是图省事：老的
+`Walk` / `Run` 两段必须与改动前逐位相同（既有验收脚本和已烤好的资产
+都按这个基线）。
+
+### 8.3 产物与命名
+
+`--procanim` 现在出 **20 段**：`Idle / Walk / Run / Jump` + `Walk_*` 8 段 +
+`Run_*` 8 段。后缀逐字照抄 UE（含下划线位置），将来从 UE 导出的真动画
+可以直接覆盖同名片段，不用改代码。
+
+`Walk` / `Run` 是 `Walk_Fwd` / `Run_Fwd` 的**历史别名**（同一次生成、
+同一份参数，逐位相同）。留着的理由很实际：`LocomotionConfig` 的默认值、
+`animKeys` 存进场景的键值、F34 之后的一批验收脚本全都指着这两个名字。
+
+UE 那边行走叫 `Jog`、跑步叫 `Run`（两档速度）；本工程只有 `Walk` /
+`Run` 两档，所以方向集分别挂在 `Walk_` / `Run_` 前缀上 —— 语义对得上，
+名字不硬套。
+
+### 8.4 判据（`PROCANIM-DIR`）
+
+`ASSETC PROCANIM-DIR <clip> want=<度> travel=<度> range=<米> ok=<0|1>`
+
+`travel` 是**摆动相脚掌相对髋的水平速度方向**（FK 出来的 Δ/Δt 再
+`atan2(横向, 前向)`），与 clip 自己的朝向无关 —— 这是唯一能证明"这段
+真的往那个方向迈"的数量。判据两条，缺一条都能骗过人眼：
+
+1. `|travel - want| <= 30°`（留 30° 是因为髋转了 0.30×角度本来就是设计）；
+2. 沿期望方向的位移 `range >= 8 cm`（walk 典型 0.5 m，8 cm 只排除"没动"）。
+
+实测（2026-11-06，`verify_procanim.py` A14）：
+
+```
+Fwd+0→+7   Fwd_Left+45→+48  Left+90→+94   Bwd_Left+135→+139
+Bwd+180→-170  Bwd_Right-135→-126  Right-90→-83  Fwd_Right-45→-39
+```
+
+A15 再验一次"左/右是镜像的"（`+94/-83`、`+94/-84`），A16 验"45° 落在
+0° 与 90° 中间"——这条是防"退化成四档硬切"的唯一办法：四档的话
+`Fwd_Left` 会等于 `Fwd` 或 `Left`，`travel` 一模一样。
+
+### 8.5 还没接的下一刀
+
+生成器出了 16 段，但**运行时还没消费**：`Locomotion` 的地面空间仍是
+一维（只有 Speed 轴），`BS_Idle_Walk_Run` 的二维化要同时改两处 ——
+
+* `animation::BlendSpace1D` → 2D（UE 的 `UBlendSpace` 是三角剖分；
+  本工程的样本正好是"极点 + 8 个方向"，可以直接按角度插值相邻两段）；
+* `ecs::SkinnedMeshComponent` 的混合槽只有 `clipName + blendClip` **两段**
+  （`blendWeight` 是主段的权重）。二维混合在三角形内部要 3 段权重，
+  现在的实现只能截断成 top-2 再归一化 —— 真要做得把混合改成 N 段权重表，
+  那会同时动 `AnimatorSystem` 的采样路径与离屏目标那一份。
+
+顺带说清楚一个**不需要**方向集的场合：本工程默认是"角色面朝移动方向"
+（UE 的 `bOrientRotationToMovement=true`），这时相对方向恒为 0，永远播
+`_Fwd`。8 方向集只在"锁视角 / 侧移"模式下才有意义 —— 所以二维混合空间
+该和侧移模式一起做，单独做出来看不到任何变化。

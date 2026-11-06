@@ -422,6 +422,29 @@ bool runProcAnim(assetio::SourceModel& m, const Args& a) {
     std::printf("ASSETC PROCANIM-JUMP jumpFootLift=%.4f jumpFootPeakZ=%.4f\n",
                 static_cast<double>(rep.jumpFootLift),
                 static_cast<double>(rep.jumpFootPeakZ));
+
+    // ---- 8 方向移动集 ----
+    //
+    // `want=` / `travel=` 这一对是唯一能证明"这段真的是往那个方向迈"的
+    // 证据：`travel` 是摆动相脚掌相对髋的速度方向（FK 出来的 Δ/Δt 再
+    // atan2），与 clip 自己的朝向无关。两者差太远 = 方向集放错了轴，
+    // 在二维混合空间里的表现是"侧移时人在原地蹭腿"，而单看某一段
+    // 静帧完全正常。
+    int dirOk = 0;
+    for (const auto& d : rep.dirs) {
+        if (d.ok) ++dirOk;
+    }
+    if (!rep.dirs.empty()) {
+        std::printf("ASSETC PROCANIM-DIRS n=%d ok=%d\n",
+                    static_cast<int>(rep.dirs.size()), dirOk);
+        for (const auto& d : rep.dirs) {
+            std::printf("ASSETC PROCANIM-DIR %s want=%.1f travel=%.1f "
+                        "range=%.4f ok=%d\n",
+                        d.clip.c_str(), static_cast<double>(d.wantDeg),
+                        static_cast<double>(d.travelDeg),
+                        static_cast<double>(d.footRange), d.ok ? 1 : 0);
+        }
+    }
     return true;
 }
 

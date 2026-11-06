@@ -43,6 +43,23 @@ struct ProcAnimOptions {
     bool generateJump = true;
     // 已有同名 clip 时是否覆盖
     bool overwriteExisting = true;
+
+    // ---- 8 方向移动集（2026-11-06，对齐 UE 的 Anims/Unarmed/{Walk,Jog}）----
+    //
+    // UE 的行走不是一段，是**八个方向各一段**：
+    //     MF_Unarmed_Walk_{Fwd, Fwd_Left, Left, Bwd_Left,
+    //                      Bwd, Bwd_Right, Right, Fwd_Right}
+    // 因为 `BS_Idle_Walk_Run` 是二维混合空间（横轴速度、纵轴方向），
+    // 侧移/倒退时播放的必须是"脚朝那个方向迈"的动画 —— 把 Fwd 那段转个
+    // yaw 播是不行的：人体的侧移是**髋转一部分、胸基本朝前、腿往侧向迈**，
+    // 整体转 yaw 会让角色看起来"面朝平移方向横着滑"。
+    //
+    // 这里生成的后缀与 UE 逐字一致（大小写、下划线位置），这样将来从
+    // UE 导出的真动画可以直接覆盖同名片段，不用改代码。
+    bool generateDirectional = true;
+    // 生成方向集的步态：walk 用在低速，run 用在冲刺。两者各 8 段。
+    bool directionalWalk = true;
+    bool directionalRun = true;
 };
 
 struct ProcAnimReport {
@@ -78,6 +95,25 @@ struct ProcAnimReport {
     float runHandLateral = 0.0f;
     // idle：整体位移应该很小（否则"站着不动也在飘"）
     float idleRootDrift = 0.0f;
+
+    // ---- 8 方向集的自检（2026-11-06）----
+    //
+    // `travelDeg` = **摆动相脚掌的运动方向**（相对身体正前方，正 = 左），
+    // 由 FK 出来的水平速度向量 atan2 得到。这是唯一能证明"这段动画真的是
+    // 往左迈"的数量 —— 截图里"腿在动"和"脚朝左飞"几乎分不出来，而在
+    // 混合空间里放错方向的表现是"侧移时人在原地蹭腿"。
+    //
+    // 判据：|wantDeg - travelDeg| <= 30°。留 30° 是因为髋转了一部分
+    // （`hipsYaw = 0.30 × 角度`）本来就是设计的一部分，脚不必严格沿
+    // 几何方向飞。
+    struct DirProbe {
+        std::string clip;
+        float wantDeg = 0.0f;
+        float travelDeg = 0.0f;
+        float footRange = 0.0f;   // 沿 want 方向的位移范围（米）
+        bool ok = false;
+    };
+    std::vector<DirProbe> dirs;
 
     // jump：**空中相**脚底相对静止姿势抬高了多少米（P6，2026-10-22）。
     //
